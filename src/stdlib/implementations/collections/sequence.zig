@@ -1,5 +1,5 @@
-//! Lazy `Sequence` materialisation: the pump, the streaming and
-//! buffering drivers, the op pipeline, and the builder-cursor helpers.
+//! Lazy `Sequence` materialisation: the pump, the streaming and buffering
+//! drivers, the op pipeline and the builder-cursor helpers.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -24,10 +24,6 @@ const makeException = common_mod.makeException;
 const makePair = common_mod.makePair;
 const reverseOrder = common_mod.reverseOrder;
 
-// =====================================================================
-// Sequence materialisation
-// =====================================================================
-
 const SeqOutcome = union(enum) { items: []Value, err: RuntimeError };
 
 fn seqCall(host: IntrinsicHost, f: *const Value, args: []const Value, out: Output) Error!union(enum) { value: Value, err: RuntimeError } {
@@ -38,9 +34,8 @@ fn seqCall(host: IntrinsicHost, f: *const Value, args: []const Value, out: Outpu
     };
 }
 
-/// A one-shot sequence (`generateSequence { … }`) consumes once; the
-/// second iteration throws, matching the source's `.constrainOnce()`.
-/// Marks the sequence consumed on first use.
+/// A one-shot sequence consumes once; a second iteration throws, matching the
+/// source's `.constrainOnce()`. Marks the sequence consumed on first use.
 pub fn oneShotConsumeCheck(a: Allocator, seq_val: Value) Error!?RuntimeError {
     {
         const g = seq_val.Sequence.borrow();
@@ -95,8 +90,6 @@ const PumpState = struct {
     indices: []usize,
 };
 
-/// Returns true to keep pulling source items, false when a Take cap was
-/// reached (pipeline exhausted). On a callback error returns the error.
 fn pumpItem(
     a: Allocator,
     host: IntrinsicHost,
@@ -107,12 +100,9 @@ fn pumpItem(
     output: *std.ArrayList(Value),
 ) Error!union(enum) { cont: bool, err: RuntimeError } {
     var current = start_value;
-    // Pin the values the GC cannot otherwise reach across the re-entrant lambda
-    // invocations below: the accumulated results so far (`output`, stable for
-    // this pump — it is only appended to at the end) and the in-flight `current`
-    // value threading through the ops. Without this, a collection during a later
-    // element's `map`/`filter` lambda sweeps the earlier elements (e.g. the
-    // `RoutingPathSegment`s a `splitToSequence().map{}.toList()` accumulates).
+    // Pin what the GC cannot otherwise reach across the re-entrant lambda calls:
+    // the results accumulated so far and the in-flight `current` value. Without
+    // it, a collection inside a later element's lambda sweeps the earlier ones.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePushSlice(output.items);
@@ -209,10 +199,9 @@ fn takeCapReached(ops: []const SeqOp, taken: []const usize) bool {
     return false;
 }
 
-/// One pull from a `Merged` (zip) source: advance the left iterator, then
-/// the right, one element each; either side exhausting ends the merge. The
-/// child iterators are created together on the first pull, so a
-/// shared-state generator observes `MergingSequence`'s strict interleave.
+/// A zip pull advances the left iterator then the right. The child iterators
+/// are created together on the first pull, so a shared-state generator observes
+/// `MergingSequence`'s strict interleave.
 pub fn mergedPullOne(
     a: Allocator,
     host: IntrinsicHost,
@@ -304,7 +293,6 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
         .Items => |v| {
             const g = v.borrow();
             defer g.deinit();
-            // Pin the not-yet-processed source items across the per-item pumps.
             runtime.keepalivePushSlice(g.get().*);
             for (g.get().*) |item| {
                 if (takeCapReached(seq.ops, st.taken)) break;
@@ -319,8 +307,8 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             }
         },
         .Builder => |bstate0| {
-            // Drive a FRESH cursor so this materialisation is independent of any
-            // other consumption of the same (re-iterable) Sequence.
+            // Drive a fresh cursor so this materialisation is independent of
+            // any other consumption of the same re-iterable Sequence.
             const bstate = try freshBuilderState(host, a, bstate0);
             try pinBuilderState(a, bstate);
             // Pull from the lazy builder one element at a time so an infinite
@@ -593,8 +581,7 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
         .Map => |f| {
             var nx = try a.alloc(Value, items.len);
             // Pin the source and the already-mapped prefix across the lambda
-            // calls (the GC cannot reach these host-locals); only `nx[0..i]` is
-            // initialized, so never pin the undefined tail.
+            // calls; only `nx[0..i]` is initialized, so never pin the tail.
             const ka = runtime.keepaliveMark();
             defer runtime.keepaliveRestore(ka);
             runtime.keepalivePushSlice(items);
@@ -718,10 +705,6 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
                         };
                         try nx.appendSlice(a, sub);
                     },
-                    // Every other iterable transform result (Array, Range, Map,
-                    // a user `Instance` Iterable) is flattened through the
-                    // shared extractor; a non-iterable result degrades to a
-                    // single element as before.
                     else => {
                         var ctx = runtime.CallCtx{ .args = &.{}, .out = out, .host = host, .allocator = a };
                         switch (try iterableItemsCtx(&ctx, mapped, "flatMap")) {
@@ -774,7 +757,6 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
                     .err => |e| return .{ .err = e },
                 };
             }
-            // Insertion sort keyed pairs, moving items in lockstep.
             var i: usize = 1;
             while (i < items.len) : (i += 1) {
                 var j = i;
@@ -834,32 +816,20 @@ fn sortValuesNaturalDescErr(a: Allocator, items: []Value, descending: bool) Erro
     return null;
 }
 
-// =====================================================================
-// Public re-exports for the interpreter's higher-order ops
-// =====================================================================
-
-/// Natural-order comparison. Returns an ordering or a `RuntimeError` (as
-/// data) for incomparable values.
 pub fn compare_values(a: Allocator, x: Value, y: Value) Error!OrderResult {
     return compareValuesPublic(a, x, y);
 }
 
-// `SequenceScope` field names (kept in sync with coroutines.zig's canonical
-// copy, which lives in a higher module the stdlib cannot import).
+// `SequenceScope` field names, kept in sync with the canonical copy in
+// coroutines.zig, which lives in a module the stdlib cannot import.
 pub const seq_has_value_field = "__seq_has_value";
 pub const seq_value_field = "__seq_value";
 pub const seq_yield_iter_field = "__seq_yield_iter";
 
-/// A FRESH builder cursor cloned from `template`: a new `SequenceScope` and
-/// reset flags, sharing the template's block closure. Kotlin's `sequence { }`
-/// is re-iterable (a fresh coroutine per `iterator()`); klio embeds one cursor
-/// in the Sequence, so each new consumption drives a clone, leaving the
-/// embedded template pristine.
-/// Pin a host-local fresh builder cursor for a drive loop: under the
-/// tracing GC the state cell's ONLY reference is a Zig local (invisible
-/// to the mark), so a collection during a pull would sweep it — and its
-/// scope — out from under the loop. The keepalive wrapper makes it a
-/// root for the enclosing mark/restore window.
+/// A fresh builder cursor cloned from `template`, sharing its block closure:
+/// Kotlin's `sequence { }` is re-iterable, so each consumption drives a clone
+/// and the embedded template stays pristine. The cursor is pinned because the
+/// state cell's only reference is a Zig local the GC mark cannot see.
 pub fn pinBuilderState(a: Allocator, state: runtime.BuilderStateRef) Allocator.Error!void {
     if (!runtime.gc.gc_enabled) return;
     const data = try ObjRef(runtime.SequenceData).init(a, .{ .source = .{ .Builder = state.clone() }, .ops = &.{} });
@@ -887,8 +857,6 @@ pub fn freshBuilderState(host: IntrinsicHost, a: Allocator, template: runtime.Bu
     return try runtime.BuilderStateRef.init(a, .{ .block = block_box, .scope = scope_box });
 }
 
-/// If `seq` is a `Builder`-source Sequence, a fresh Sequence with a cloned
-/// cursor (sharing the op pipeline) for independent iteration; else null.
 pub fn freshBuilderSeq(host: IntrinsicHost, a: Allocator, seq: Value) Allocator.Error!?Value {
     if (seq != .Sequence) return null;
     const sg = seq.Sequence.borrow();
@@ -904,14 +872,10 @@ pub fn freshBuilderSeq(host: IntrinsicHost, a: Allocator, seq: Value) Allocator.
     return .{ .Sequence = data };
 }
 
-/// Drive a lazy `Value::Sequence` to completion. Returns the produced
-/// items or a `RuntimeError` (as data).
 pub fn materialise_sequence(a: Allocator, host: IntrinsicHost, out: Output, seq_val: Value) Error!SeqOutcome {
     return materialiseSequence(a, host, out, seq_val);
 }
 
-/// Bounded sequence materialisation (stops after `max` items on the
-/// streaming fast path).
 pub fn materialise_sequence_bounded(a: Allocator, host: IntrinsicHost, out: Output, seq_val: Value, max: ?usize) Error!SeqOutcome {
     return materialiseSequenceBounded(a, host, out, seq_val, max);
 }

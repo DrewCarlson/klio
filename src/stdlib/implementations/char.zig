@@ -1,12 +1,8 @@
 //! Char stdlib intrinsics.
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. For member access the
-//! receiver is `args[0]`, with any further user arguments following.
-//!
-//! Char predicates follow kotlinc-native 2.3.21 semantics, driven by
-//! Unicode general categories rather than ASCII shortcuts. The category
-//! and case-mapping tables embedded at the bottom of this file are the
-//! `unicode_general_category` 1.1.0 data and generated char case mappings.
+//! Char predicates follow kotlinc-native semantics, driven by Unicode general
+//! categories rather than ASCII shortcuts. The tables at the bottom of this file
+//! are `unicode_general_category` 1.1.0 data plus generated case mappings.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -27,12 +23,6 @@ fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
 
-// ============================================================
-// Char members
-// ============================================================
-
-/// `Result<u16, RuntimeError>` for receiver extraction: the receiver code
-/// unit, or a typed `RuntimeError` describing the wrong/absent receiver.
 const RecvChar = union(enum) {
     unit: u16,
     err: RuntimeError,
@@ -48,9 +38,8 @@ fn recvChar(args: []const Value, comptime what: []const u8) RecvChar {
     };
 }
 
-/// Decode a `Char` code unit to a Unicode scalar for category/case
-/// queries. A lone surrogate has no scalar value (`null`): such chars are
-/// not letters/digits/whitespace and have no case mapping.
+/// Decode a `Char` code unit to a Unicode scalar. A lone surrogate yields null:
+/// it is no letter, digit or whitespace, and has no case mapping.
 pub fn charUnitToScalar(unit: u16) ?u21 {
     if (unit >= 0xD800 and unit <= 0xDFFF) return null;
     return unit;
@@ -64,9 +53,6 @@ pub fn char_code(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 }
 
-/// `Char.toLong()` / `Char.toShort()` / `Char.toByte()` / `Char.toDouble()`
-/// / `Char.toFloat()` — the receiver's code as the target numeric type
-/// (`toShort`/`toByte` truncate like kotlinc).
 pub fn char_to_long(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const r = recvChar(ctx.args, "Char.toLong");
     return switch (r) {
@@ -107,8 +93,6 @@ pub fn char_to_float(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 }
 
-/// `Char.getCategoryValue()` — the Unicode general-category code, from the
-/// compiled-in table (see `unicode_category.zig`).
 pub fn char_get_category_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const r = recvChar(ctx.args, "Char.getCategoryValue");
     return switch (r) {
@@ -122,10 +106,6 @@ fn imod(a: i64, b: i64) i64 {
     return if (m >= 0) m else m + b;
 }
 
-/// `kotlin.internal.getProgressionLastElement(start, end, step)`.
-///
-/// Result narrows back to a Kotlin Int when the progression was Int-typed.
-/// A progression step value as an i64, regardless of its int kind.
 fn stepAsI64(v: Value) i64 {
     return switch (v) {
         .Int => |x| @as(i64, x),
@@ -167,7 +147,6 @@ pub fn internal_get_progression_last_element(ctx: *CallCtx) std.mem.Allocator.Er
     var end: i64 = undefined;
     var step: i64 = undefined;
     var is_long: bool = undefined;
-    // Unsigned progressions use unsigned modular arithmetic (UProgressionUtil).
     if (args[0] == .UInt and args[1] == .UInt) {
         const s: u32 = args[0].UInt;
         const e: u32 = args[1].UInt;
@@ -216,10 +195,6 @@ pub fn internal_get_progression_last_element(ctx: *CallCtx) std.mem.Allocator.Er
     return ok(if (is_long) .{ .Long = last } else Value.newInt(last));
 }
 
-// ============================================================
-// Char predicates
-// ============================================================
-
 pub fn ktIsLetter(c: u21) bool {
     return rangeContains(c, &letter_table);
 }
@@ -228,9 +203,8 @@ pub fn ktIsDigit(c: u21) bool {
     return rangeContains(c, &decimal_number_table);
 }
 
-// kotlinc-native 2.3.21 whitespace table (from stdlib/native-wasm
-// _WhitespaceChars.kt). A fixed enumerated set -- not Java's
-// Character.isWhitespace (which excludes NBSP).
+// The kotlinc-native whitespace table from `_WhitespaceChars.kt`: a fixed
+// enumerated set, not Java's `Character.isWhitespace`, which excludes NBSP.
 pub fn ktIsWhitespace(c: u21) bool {
     const code: u32 = c;
     return (code >= 0x0009 and code <= 0x000D) or
@@ -253,8 +227,6 @@ pub fn isOtherUppercase(code: u32) bool {
         (code >= 0x1F170 and code <= 0x1F189);
 }
 
-// Other_Lowercase contributory property (Unicode 15.x snapshot used by
-// kotlinc-native 2.3.21).
 pub fn isOtherLowercase(code: u32) bool {
     const ranges = [_][2]u32{
         .{ 0x00AA, 0x00AA },
@@ -328,9 +300,6 @@ pub fn char_is_lowercase(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return boolPredicate(ctx, "Char.isLowerCase", ktIsLowerCase);
 }
 
-/// `Char.compareTo(other)` -- the sign of the UTF-16 code-unit ordering
-/// (-1 / 0 / 1), matching kotlinc and the other primitive `compareTo`
-/// intrinsics.
 pub fn char_compare_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const r = recvChar(ctx.args, "Char.compareTo");
     const a = switch (r) {
@@ -341,16 +310,12 @@ pub fn char_compare_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Char.compareTo requires a Char");
     }
     const b = ctx.args[1].Char;
-    // kotlinc compiles `Char.compareTo` to `Character.compare`, which is the
-    // CODE DIFFERENCE, not a sign: `'a'.compareTo('c')` is -2 on the JVM.
-    // `Comparable` only requires the sign, but a program that prints the
-    // result sees the difference, so klio matches it.
+    // kotlinc compiles `Char.compareTo` to `Character.compare`, which returns the
+    // code difference, not a sign: `'a'.compareTo('c')` is -2 on the JVM.
     const result: i32 = @as(i32, @intCast(a)) - @as(i32, @intCast(b));
     return ok(.{ .Int = result });
 }
 
-/// `Char.isISOControl()` -- a C0 (`0x00..=0x1F`) or C1 (`0x7F..=0x9F`)
-/// control code unit.
 pub fn char_is_iso_control(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const r = recvChar(ctx.args, "Char.isISOControl");
     return switch (r) {
@@ -359,7 +324,6 @@ pub fn char_is_iso_control(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 }
 
-/// Collect the full case mapping of a scalar into an owned UTF-8 string.
 fn caseString(allocator: std.mem.Allocator, c: u21, map: []const CaseEntry) std.mem.Allocator.Error![]u8 {
     if (lookupCase(c, map)) |scalars| {
         var buf: std.ArrayList(u8) = .empty;
@@ -371,7 +335,6 @@ fn caseString(allocator: std.mem.Allocator, c: u21, map: []const CaseEntry) std.
         }
         return buf.toOwnedSlice(allocator);
     }
-    // No special mapping: the scalar maps to itself.
     var tmp: [4]u8 = undefined;
     const n = std.unicode.utf8Encode(c, &tmp) catch unreachable;
     return allocator.dupe(u8, tmp[0..n]);
@@ -408,15 +371,13 @@ pub fn char_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
-/// `Result<u32, RuntimeError>` for the validated `digitToInt` radix.
 const RadixResult = union(enum) {
     radix: u32,
     err: RuntimeError,
 };
 
-/// The radix argument of `digitToInt(radix)` / `digitToIntOrNull(radix)`,
-/// validated to Kotlin's 2..36 range (default 10). Returns the radix or an
-/// `IllegalArgumentException`.
+/// The radix argument of `digitToInt`, validated against Kotlin's 2..36 range
+/// and defaulting to 10. Returns the radix or an `IllegalArgumentException`.
 fn charDigitRadix(allocator: std.mem.Allocator, args: []const Value) std.mem.Allocator.Error!RadixResult {
     const radix: i64 = if (args.len > 1) (args[1].asI64() orelse 10) else 10;
     if (radix < 2 or radix > 36) {
@@ -430,14 +391,11 @@ fn charDigitRadix(allocator: std.mem.Allocator, args: []const Value) std.mem.All
     return .{ .radix = @intCast(radix) };
 }
 
-/// Digit value of an ASCII alphanumeric (or its fullwidth form) under
-/// `radix`.
 fn toDigit(c: u21, radix: u32) ?u32 {
     const digit: u32 = switch (c) {
         '0'...'9' => c - '0',
         'a'...'z' => c - 'a' + 10,
         'A'...'Z' => c - 'A' + 10,
-        // Fullwidth forms (U+FF10.. digits, U+FF21.. upper, U+FF41.. lower).
         0xFF10...0xFF19 => c - 0xFF10,
         0xFF21...0xFF3A => c - 0xFF21 + 10,
         0xFF41...0xFF5A => c - 0xFF41 + 10,
@@ -514,9 +472,8 @@ pub fn char_is_surrogate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 }
 
-/// `Char(code: Int)` / `Char(code: UShort)` constructors. The `Int` overload
-/// requires `code in 0..0xFFFF` and throws `IllegalArgumentException`
-/// otherwise; the unsigned overload is always in range (a `u16`-wide value).
+/// The `Char(code)` constructors. The `Int` overload requires `code in
+/// 0..0xFFFF` and throws `IllegalArgumentException` otherwise.
 pub fn char_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1) return typeErr("Char requires a code argument");
     switch (ctx.args[0]) {
@@ -539,14 +496,9 @@ pub fn char_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 }
 
-// ============================================================
-// Additional Char
-// ============================================================
-
-/// Single-Char case mapping: Kotlin's `uppercaseChar()/lowercaseChar()`
-/// return the original char when the full case mapping isn't a single
-/// character (e.g. 'ß'.`uppercaseChar()` == 'ß', not 'S' -- only the
-/// multi-char `uppercase()` yields "SS").
+/// Single-Char case mapping. Kotlin's `uppercaseChar()` returns the original
+/// char when the full mapping is not a single character: `'ß'.uppercaseChar()`
+/// is 'ß', and only `uppercase()` yields "SS".
 pub fn singleCaseChar(c: u21, map: []const CaseEntry) u21 {
     if (lookupCase(c, map)) |scalars| {
         if (scalars.len == 1) return scalars[0];
@@ -555,35 +507,30 @@ pub fn singleCaseChar(c: u21, map: []const CaseEntry) u21 {
     return c;
 }
 
-/// The 1:1 lower-case of a Unicode scalar (full case table, not just ASCII).
-/// Used by the regex engine's case-insensitive matching to fold beyond ASCII.
 pub fn lowerScalar(c: u21) u21 {
     return singleCaseChar(c, &lowercase_map);
 }
 
-/// The 1:1 upper-case of a Unicode scalar (full case table).
 pub fn upperScalar(c: u21) u21 {
     return singleCaseChar(c, &uppercase_map);
 }
 
-/// Canonical case fold: lowercase(uppercase(c)) with the İ -> 'i' step —
-/// the same equivalence `charEqIgnoreCase` applies. Used by the regex
-/// engine so IGNORE_CASE matches the Char/String ignoreCase paths
-/// (ſ ~ S ~ s, ϴ ~ θ, µ ~ Μ ~ μ).
+/// Canonical case fold, `lowercase(uppercase(c))` with the İ to 'i' step, so the
+/// regex engine's IGNORE_CASE matches the Char and String ignoreCase paths.
 pub fn foldScalar(c: u21) u21 {
     return lowerScalarSingle(singleCaseChar(c, &uppercase_map));
 }
 
-/// `Char.equals(other, ignoreCase = true)`: equal if the upper-cased units
-/// match, or failing that the lower-cased upper-cased units match (Kotlin's
-/// rule, which also pairs characters that share a lowercase form).
-/// The single-char lowercase of `c`, honoring the İ (U+0130) -> 'i' special
-/// mapping that `char_lowercase_char` applies but the raw lowercase_map omits.
+/// The single-char lowercase of `c`, honoring the İ (U+0130) to 'i' mapping the
+/// raw lowercase map omits.
 fn lowerScalarSingle(c: u21) u21 {
     if (c == 0x0130) return 0x69;
     return singleCaseChar(c, &lowercase_map);
 }
 
+/// `Char.equals(other, ignoreCase = true)`: equal when the upper-cased units
+/// match, or failing that their lower-cased forms, which also pairs characters
+/// sharing a lowercase form.
 pub fn charEqIgnoreCase(a_unit: u16, b_unit: u16) bool {
     if (a_unit == b_unit) return true;
     const a = charUnitToScalar(a_unit) orelse return false;
@@ -591,8 +538,7 @@ pub fn charEqIgnoreCase(a_unit: u16, b_unit: u16) bool {
     const a_up = singleCaseChar(a, &uppercase_map);
     const b_up = singleCaseChar(b, &uppercase_map);
     if (a_up == b_up) return true;
-    // Kotlin's Char.equals(ignoreCase) compares lowercase(uppercase(x)); the
-    // İ -> 'i' step makes {I, i, İ, ı} one case-insensitive group.
+    // The İ to 'i' step makes {I, i, İ, ı} one case-insensitive group.
     return lowerScalarSingle(a_up) == lowerScalarSingle(b_up);
 }
 
@@ -612,9 +558,6 @@ pub fn char_uppercase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn char_lowercase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // `lowercaseChar()` is the SIMPLE one-to-one mapping; where the full
-    // mapping is multi-scalar Kotlin still yields a single char (İ U+0130 ->
-    // 'i', not 'i' + combining dot). The full map would return the original.
     const unit = switch (recvChar(ctx.args, "Char.lowercaseChar")) {
         .err => |e| return .{ .err = e },
         .unit => |u| u,
@@ -626,14 +569,9 @@ pub fn char_lowercase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Char = unit });
 }
 
-// ============================================================
-// Char title-case
-// ============================================================
-
-/// The dedicated titlecase (Lt) form of the `DŽ/LJ/NJ/DZ` digraph letters,
-/// whose titlecase differs from their uppercase (e.g. `Ǆ` U+01C4 titlecases
-/// to `ǅ` U+01C5, not to itself). Null for every other char (titlecase ==
-/// uppercase there).
+/// The dedicated titlecase (Lt) form of the DŽ, LJ, NJ and DZ digraphs, whose
+/// titlecase differs from their uppercase: `Ǆ` titlecases to `ǅ`. Null for every
+/// other char, whose titlecase is its uppercase.
 fn titlecaseSingle(c: u21) ?u21 {
     return switch (c) {
         0x01C4, 0x01C5, 0x01C6 => 0x01C5,
@@ -650,19 +588,17 @@ pub fn char_titlecase(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .unit => |u| u,
     };
     if (charUnitToScalar(unit)) |c| {
-        // U+0149 (ŉ) has a multi-char title mapping "ʼN" (U+02BC U+004E) whose
-        // second unit is upper — not its uppercase-then-titlecase-first form
-        // ("ʼn"). Use the SpecialCasing title form directly.
+        // U+0149 (ŉ) has the multi-char title mapping "ʼN", whose second unit is
+        // upper, so the SpecialCasing title form is used directly.
         if (c == 0x0149) {
             return ok(.{ .String = try runtime.strInit(ctx.allocator, "\u{02BC}N") });
         }
-        // A Lt digraph letter titlecases to its single title form.
         if (titlecaseSingle(c)) |t| {
             const s = try charUnitToString(ctx.allocator, @truncate(t));
             return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
         }
-        // Every other char: the uppercase expansion with only the first unit
-        // kept upper (e.g. 'ß' -> "Ss", not "SS").
+        // Every other char takes the uppercase expansion with only the first unit
+        // left upper, so 'ß' gives "Ss", not "SS".
         const up = try caseString(ctx.allocator, c, &uppercase_map);
         defer ctx.allocator.free(up);
         const titled = try titlecaseFirst(ctx.allocator, up);
@@ -672,8 +608,6 @@ pub fn char_titlecase(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
-/// Lowercase every codepoint of `s` except the first (so an all-uppercase
-/// multi-char case expansion like "SS" becomes the title form "Ss").
 fn titlecaseFirst(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -695,8 +629,6 @@ fn titlecaseFirst(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator
 }
 
 pub fn char_titlecase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // The dedicated Lt title form when one exists; otherwise the uppercase
-    // 1:1 mapping (and the original char when uppercase isn't single, 'ß').
     const unit = switch (recvChar(ctx.args, "Char.titlecaseChar")) {
         .err => |e| return .{ .err = e },
         .unit => |u| u,
@@ -708,10 +640,8 @@ pub fn char_titlecase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Char = unit });
 }
 
-/// Render a UTF-8 string as a double-quoted debug form: wrapped in double
-/// quotes with `"`, `\`, and the C0/C1 control codes escaped (`\t`/`\n`/`\r`
-/// specially, the rest as `\u{..}`). Every other scalar is passed through
-/// verbatim. Caller owns the returned slice.
+/// Render a UTF-8 string in double-quoted debug form, escaping `"`, `\` and the
+/// C0 and C1 controls, `\t`, `\n` and `\r` spelled out and the rest `\u{..}`.
 fn rustDebugString(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -741,10 +671,6 @@ fn rustDebugString(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocato
     return buf.toOwnedSlice(allocator);
 }
 
-// ============================================================
-// Unicode tables and lookup
-// ============================================================
-
 const Range = struct { u32, u32 };
 
 const CaseEntry = struct {
@@ -752,7 +678,6 @@ const CaseEntry = struct {
     scalars: []const u21,
 };
 
-/// Binary search an ascending, non-overlapping inclusive range table.
 fn rangeContains(c: u32, table: []const Range) bool {
     var lo: usize = 0;
     var hi: usize = table.len;
@@ -770,7 +695,6 @@ fn rangeContains(c: u32, table: []const Range) bool {
     return false;
 }
 
-/// Binary search an ascending case-mapping table keyed by code point.
 fn lookupCase(c: u21, map: []const CaseEntry) ?[]const u21 {
     var lo: usize = 0;
     var hi: usize = map.len;
@@ -787,10 +711,6 @@ fn lookupCase(c: u21, map: []const CaseEntry) ?[]const u21 {
     }
     return null;
 }
-
-// ============================================================
-// Tests
-// ============================================================
 
 const testing = std.testing;
 
@@ -829,7 +749,6 @@ test "category predicates follow unicode general categories" {
     try testing.expect(!ktIsUpperCase('q'));
     try testing.expect(ktIsLowerCase('q'));
     try testing.expect(!ktIsLowerCase('Q'));
-    // Roman numerals are Other_Uppercase / Other_Lowercase.
     try testing.expect(ktIsUpperCase(0x2160));
     try testing.expect(ktIsLowerCase(0x2170));
 }
@@ -934,8 +853,6 @@ test "lowercaseChar maps a regular letter" {
 }
 
 test "lowercaseChar uses the single-char simple mapping (U+0130 -> i)" {
-    // İ (U+0130) has a multi-scalar FULL lowercase, but `lowercaseChar()` yields
-    // the single-char simple mapping 'i' (matching `Character.toLowerCase`).
     const args = [_]Value{.{ .Char = 0x0130 }};
     var ctx = noopCtx(&args);
     const r = try char_lowercase_char(&ctx);
@@ -1058,7 +975,7 @@ test "getProgressionLastElement rejects a zero step" {
 }
 
 
-// ----- Generated Unicode tables (unicode_general_category 1.1.0 + char case maps) -----
+// Generated Unicode tables: unicode_general_category 1.1.0 plus case maps.
 
 const letter_table = [_]Range{
     .{ 0x41, 0x5A }, .{ 0x61, 0x7A }, .{ 0xAA, 0xAA }, .{ 0xB5, 0xB5 }, 

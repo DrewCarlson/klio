@@ -1,15 +1,10 @@
-//! The stdlib source manifest: which Kotlin files the stdlib pack is built
-//! from and where they live in the repo. Dependency-free on purpose so the
-//! top-level build.zig can import it directly and declare the same files as
-//! inputs of the build-time pack embed step. `pack_builder.zig` re-exports
-//! everything here for runtime consumers.
+//! The stdlib source manifest: which Kotlin files the stdlib pack is built from
+//! and where they live. Dependency-free so the top-level build.zig can import it
+//! and declare the same files as inputs of the pack embed step.
 
-/// Curated set of upstream stdlib commonMain `.kt` files the embedded stdlib
-/// pack ships verbatim as a `SOURCES` section, so the interpreter consumes
-/// the real upstream Kotlin instead of (or alongside) the mined surface.
-///
-/// Each entry is a path relative to `kotlin/libraries/stdlib` in the local
-/// upstream Kotlin checkout.
+/// Curated upstream stdlib commonMain `.kt` files the embedded pack ships
+/// verbatim as a `SOURCES` section, each path relative to
+/// `kotlin/libraries/stdlib` in the local upstream checkout.
 pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/time/Duration.kt",
     "src/kotlin/time/DurationUnit.kt",
@@ -150,12 +145,9 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "unsigned/src/kotlin/UIntRange.kt",
     "unsigned/src/kotlin/ULongRange.kt",
     "unsigned/src/kotlin/UMath.kt",
-    // The unsigned value-class declarations. Execution stays host-repr
-    // end to end: the `kotlin.U*` constructor intrinsics reinterpret the
-    // signed payload as the host value (so the companion constants and
-    // the source bodies' `UInt(...)` wraps never build an interpreted
-    // instance), and `data`/`storage` reads on host values are served by
-    // the host field path.
+    // The unsigned value-class declarations. Execution stays host-repr end to
+    // end: the `kotlin.U*` constructor intrinsics reinterpret the signed payload
+    // as the host value, so no interpreted instance is ever built.
     "unsigned/src/kotlin/UnsignedCommon.kt",
     "unsigned/src/kotlin/UByte.kt",
     "unsigned/src/kotlin/UShort.kt",
@@ -172,11 +164,9 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "common/src/kotlin/JvmAnnotationsH.kt",
     "src/kotlin/annotations/NativeAnnotations.kt",
     "src/kotlin/annotations/NativeConcurrentAnnotations.kt",
-    // kotlin.concurrent.atomics: the common `expect`s carry the size+init
-    // factories; the klio-authored `actual`s (KLIO_STDLIB_ACTUAL_FILES) carry
-    // the cell/array-backing class shapes with thread-correct CAS-loop inline
-    // extensions. Non-inline RMW methods are made atomic by host bindings
-    // (see implementations/atomics.zig).
+    // The `kotlin.concurrent.atomics` `expect`s carry the factories and the
+    // klio-authored `actual`s the class shapes; non-inline RMW methods are made
+    // atomic by implementations/atomics.zig.
     "src/kotlin/concurrent/atomics/Atomics.common.kt",
     "src/kotlin/concurrent/atomics/AtomicArrays.common.kt",
     "src/kotlin/util/Lazy.kt",
@@ -223,8 +213,6 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/experimental/inferenceMarker.kt",
 };
 
-/// klio-authored platform `actual` source files shipped in the same `SOURCES`
-/// section, paths relative to the `kotlin-klio` directory.
 pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-time/Actuals.kt",
     "kotlin-coroutines/Actuals.kt",
@@ -257,19 +245,14 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-reflect/ReflectActuals.kt",
 };
 
-/// The local upstream Kotlin checkout's `libraries/stdlib` directory, relative
-/// to the workspace root (the process cwd when the pack is built).
 pub const UPSTREAM_STDLIB_ROOT = "kotlin/libraries/stdlib";
-/// The `kotlin-klio` directory holding the klio-authored actuals.
 pub const KLIO_STDLIB_DIR = "kotlin-klio";
 
 /// The pinned upstream Kotlin release. The in-tree stdlib source carries a
-/// placeholder patch component (`KotlinVersion(major, minor, 255)`) that
-/// kotlinc's own build rewrites to the release version; the pack builder
-/// applies the same rewrite so `KotlinVersion.CURRENT` matches kotlinc.
+/// placeholder patch component that kotlinc's own build rewrites to the release
+/// version, and the pack builder applies the same rewrite so
+/// `KotlinVersion.CURRENT` matches kotlinc.
 pub const KOTLIN_RELEASE = .{ .major = 2, .minor = 4, .patch = 0 };
-/// The placeholder expression as it appears in
-/// `src/kotlin/util/KotlinVersion.kt`, and the release value it becomes.
 pub const KOTLIN_VERSION_FILE = "src/kotlin/util/KotlinVersion.kt";
 pub const KOTLIN_VERSION_PLACEHOLDER = std.fmt.comptimePrint(
     "KotlinVersion({d}, {d}, 255)",

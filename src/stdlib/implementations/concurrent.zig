@@ -9,43 +9,31 @@ const EvalResult = runtime.EvalResult;
 const RuntimeError = runtime.RuntimeError;
 const Value = runtime.Value;
 
-/// Spin mutex for the monitor table and each monitor's state, shared
-/// with the rest of the runtime (`runtime.objcell`). Zig 0.16's std has
-/// no blocking `Thread.Mutex` (it moved behind the `Io` interface), so
-/// synchronization follows the same atomic spin/yield discipline.
+/// Spin mutex for the monitor table and each monitor's state. Zig 0.16's std has
+/// no blocking `Thread.Mutex`, so synchronization is atomic spin and yield.
 const SpinMutex = runtime.SpinMutex;
 
-/// State of one reentrant monitor: which thread (if any) currently
-/// owns it and how deep its nesting is.
 const MonitorState = struct {
     owner: ?std.Thread.Id,
     depth: usize,
 };
 
-/// One reentrant monitor: a spin mutex guarding its ownership state.
-/// A waiter that finds the monitor owned by another thread drops the
-/// guard and yields, then re-checks — the spin equivalent of a
-/// condition-variable wait.
 const Monitor = struct {
     mutex: SpinMutex = .{},
     state: MonitorState = .{ .owner = null, .depth = 0 },
 };
 
-/// Process-wide monitor table keyed by the lock value's object
-/// identity. Value-type locks (no identity) all share a single
-/// monitor under the sentinel key `0`. The registry and its monitors
-/// live for the whole process and are never freed.
+/// Process-wide monitor table keyed by the lock value's object identity;
+/// identity-less value-type locks share the sentinel key 0. Never freed.
 const Registry = struct {
     var mutex: SpinMutex = .{};
     var map: ?std.AutoHashMap(usize, *Monitor) = null;
 
-    /// Allocator backing the process-global registry; never freed.
     fn allocator() std.mem.Allocator {
         return std.heap.page_allocator;
     }
 };
 
-/// Fetch (creating on first use) the monitor for `key`.
 fn monitorFor(key: usize) std.mem.Allocator.Error!*Monitor {
     Registry.mutex.lock();
     defer Registry.mutex.unlock();
@@ -61,14 +49,10 @@ fn monitorFor(key: usize) std.mem.Allocator.Error!*Monitor {
     return gop.value_ptr.*;
 }
 
-/// Acquire (reentrant) the monitor for `key`: block until the monitor
-/// is free or already owned by the calling thread, then take/deepen
-/// ownership. The enter ordering is carried by the monitor's own
-/// `SpinMutex` acquire.
-/// Returns false when the wait was abandoned at a run boundary: the owner
-/// may never release (it can itself have been abandoned while holding the
-/// monitor), so a boundary drain must not wait it out. The caller must not
-/// treat the monitor as held on a false return.
+/// Reentrant acquire of the monitor for `key`; the enter ordering rides on the
+/// monitor's own `SpinMutex`. False when the wait was abandoned at a run
+/// boundary, since the owner may itself have been abandoned while holding the
+/// monitor; the caller must then not treat the monitor as held.
 pub fn monitorEnter(key: usize) std.mem.Allocator.Error!bool {
     const mon = try monitorFor(key);
     const me = std.Thread.getCurrentId();
@@ -81,26 +65,17 @@ pub fn monitorEnter(key: usize) std.mem.Allocator.Error!bool {
                 mon.mutex.unlock();
                 return true;
             }
-            // Held by another thread. The owner is running an arbitrary
-            // interpreted `synchronized` body, so the wait is unbounded:
-            // spin briefly for short sections, then yield, then park at a
-            // millisecond cadence. A pure spin/yield loop here saturated
-            // every core whenever many dispatcher workers contended on one
-            // hot lock (the SnapshotStateMap concurrent tests drove the
-            // whole machine to 100% doing no useful work). The sleep
-            // brackets the GC blocking-safe region, so a parked waiter
-            // never stalls a collection.
+            // The owner runs an arbitrary interpreted body, so the wait is
+            // unbounded: spin briefly, then yield, then park at a millisecond
+            // cadence. A pure spin loop saturates every core under contention,
+            // and the sleep brackets the GC blocking-safe region.
             mon.mutex.unlock();
             if (runtime.shouldAbandon()) return false;
             rounds +|= 1;
             if (rounds <= 512) {
-                // A snapshot-write critical section runs a few microseconds
-                // of interpreted code; 64 hints (~sub-µs) never bridged one,
-                // so every contended handoff fell to the 100µs park — the
-                // concurrent snapshot tests spent >90% of their wall in
-                // exactly that dead time. ~512 hints spans the common
-                // section; the sleep tail still guards long holds from
-                // saturating cores.
+                // A snapshot-write critical section runs a few microseconds of
+                // interpreted code, which 64 hints never bridges, so ~512 spans
+                // the common section before the park.
                 std.atomic.spinLoopHint();
             } else if (rounds <= 4096) {
                 std.Thread.yield() catch {};
@@ -118,9 +93,6 @@ pub fn monitorEnter(key: usize) std.mem.Allocator.Error!bool {
     }
 }
 
-/// Non-blocking monitor acquire for `key`. Returns true when the
-/// calling thread now owns the monitor (a fresh take or a reentrant
-/// deepen), false when another thread holds it.
 pub fn monitorTryEnter(key: usize) std.mem.Allocator.Error!bool {
     const mon = try monitorFor(key);
     const me = std.Thread.getCurrentId();
@@ -138,11 +110,8 @@ pub fn monitorTryEnter(key: usize) std.mem.Allocator.Error!bool {
     return true;
 }
 
-/// Release one level of the monitor for `key`; clear ownership when
-/// fully released so a waiter can acquire. Returns false when the
-/// calling thread does not own the monitor (the caller decides whether
-/// that is an error — JVM monitors throw IllegalMonitorStateException).
-/// The exit ordering is carried by the monitor's `SpinMutex` release.
+/// Release one level of the monitor for `key`. False when the calling thread
+/// does not own it, which the JVM reports as IllegalMonitorStateException.
 pub fn monitorExit(key: usize) std.mem.Allocator.Error!bool {
     const mon = try monitorFor(key);
     const me = std.Thread.getCurrentId();
@@ -157,15 +126,9 @@ pub fn monitorExit(key: usize) std.mem.Allocator.Error!bool {
     return true;
 }
 
-/// `synchronized(lock) { body }` / `synchronized(lock, { body })`.
-///
-/// A real reentrant monitor keyed by the `lock` argument's object
-/// identity: distinct locks run concurrently, the same lock
-/// serializes, and the same thread re-entering the same lock does
-/// not self-deadlock (Kotlin/JVM monitors are reentrant). The body
-/// runs with the monitor held; it is released (even on a thrown
-/// exception) before returning. The monitor enter/exit ordering is
-/// carried by the monitor's own `SpinMutex` acquire/release.
+/// A reentrant monitor keyed by the `lock` argument's object identity, so
+/// distinct locks run concurrently and a thread re-entering its own does not
+/// self-deadlock. The body runs with the monitor held, released even on a throw.
 pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const lock: Value = if (ctx.args.len > 0) ctx.args[0] else .Unit;
     const block: Value = if (ctx.args.len > 0)
@@ -191,9 +154,6 @@ pub fn concurrent_monitor_exit(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     return .{ .ok = .Unit };
 }
 
-/// Monitor key for a lock-object receiver: its object identity, or the
-/// shared sentinel `0` for identity-less values (mirrors
-/// `concurrent_synchronized`).
 fn receiverLockKey(ctx: *const CallCtx) usize {
     if (ctx.args.len > 0) {
         if (ctx.args[0].lockIdentity()) |k| return k;
@@ -201,24 +161,18 @@ fn receiverLockKey(ctx: *const CallCtx) usize {
     return 0;
 }
 
-/// `ReentrantLock.lock()` (and the other bare lock-class acquires the
-/// packs bind: `kotlinx.atomicfu.locks`, `io.ktor.utils.io.locks`).
-/// Blocks until the receiver's monitor is owned; reentrant.
 pub fn concurrent_lock_enter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (!try monitorEnter(receiverLockKey(ctx))) return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
     return .{ .ok = .Unit };
 }
 
-/// `ReentrantLock.tryLock()` — non-blocking acquire of the receiver's
-/// monitor; reports whether the calling thread now owns it.
 pub fn concurrent_lock_try_enter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const got = try monitorTryEnter(receiverLockKey(ctx));
     return .{ .ok = .{ .Bool = got } };
 }
 
-/// `ReentrantLock.unlock()` — release one level of the receiver's
-/// monitor. Unlocking a monitor the calling thread does not own is an
-/// error (the JVM throws IllegalMonitorStateException here).
+/// Unlocking a monitor the calling thread does not own is the JVM's
+/// IllegalMonitorStateException.
 pub fn concurrent_lock_exit(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const released = try monitorExit(receiverLockKey(ctx));
     if (!released) {
@@ -227,7 +181,6 @@ pub fn concurrent_lock_exit(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .Unit };
 }
 
-/// Whether a value is something we can invoke as a thread body.
 fn isCallable(v: Value) bool {
     return switch (v) {
         .IrClosure, .Intrinsic, .BoundMethod => true,
@@ -235,19 +188,11 @@ fn isCallable(v: Value) bool {
     };
 }
 
-/// `kotlin.concurrent.thread(start, isDaemon, contextClassLoader,
-/// name, priority) { block }`.
-///
-/// On a single serialized interpreter a started thread's body runs to
-/// completion immediately on the calling stack: the body's every
-/// action happens-before the call returns, which is exactly the
-/// happens-before edge `Thread.start` would give, only stronger
-/// (total order). The returned handle is a `Thread` sentinel whose
-/// `join()` is a no-op (the body already completed, so its writes are
-/// already visible — join-happens-before holds trivially), `isAlive`
-/// is `false`, and `name` is a stable string. This is observably
-/// correct for every race-free program, which is the only class
-/// Kotlin defines behaviour for.
+/// `kotlin.concurrent.thread(...) { block }`. A started body runs to completion
+/// immediately on the calling stack, so every action in it happens-before the
+/// call returns: the edge `Thread.start` gives, under a stronger total order.
+/// The returned `Thread` sentinel has a no-op `join()`, `isAlive` false and a
+/// stable `name`.
 pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var block: ?Value = null;
     var i: usize = ctx.args.len;
@@ -259,19 +204,14 @@ pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     const body = block orelse return .{ .err = .{ .Arity = "thread expects a block" } };
-    // `thread(start = false) { … }` — leading boolean positional /
-    // named arg of `false` means the caller will `.start()` it
-    // explicitly. Without a real deferred-start handle we still spawn
-    // (the body runs concurrently regardless); a later `.start()` is
-    // a no-op. Defaulting to start=true matches the common case.
-    // Thread start: happens-before is carried by Thread.spawn inside
-    // spawnOsThread plus each shared cell's reader/writer lock.
+    // A leading positional or named `false` means the caller will `.start()` it
+    // explicitly; with no deferred-start handle the body spawns anyway and the
+    // later `.start()` is a no-op.
     const spawned = try ctx.host.spawnOsThread(&body, ctx.out);
     const id: u64 = switch (spawned) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    // The OS thread id is carried as a Kotlin Long via a bit reinterpretation.
     const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
     return .{ .ok = try Value.newBoundMethod(ctx.allocator, .{
         .fqn = "kotlin.concurrent.Thread",
@@ -280,12 +220,8 @@ pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }) };
 }
 
-/// `Thread.sleep(millis: Long)` / `Thread.sleep(millis: Int)`.
-///
-/// A real OS sleep: the calling thread blocks for the requested
-/// duration. Combined with `kotlin.concurrent.thread`'s real thread
-/// spawn, N threads each sleeping for D run in ~D wall time, not ~N·D —
-/// genuine parallel suspension, not a busy spin.
+/// A real OS sleep, so with `kotlin.concurrent.thread`'s real spawn, N threads
+/// each sleeping for D take about D of wall time.
 pub fn concurrent_thread_sleep(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const millis: i64 = if (ctx.args.len > 0) switch (ctx.args[0]) {
         .Long => |v| v,
@@ -295,16 +231,13 @@ pub fn concurrent_thread_sleep(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
         else => return .{ .err = .{ .Type = "Thread.sleep expects a Long or Int millisecond argument" } },
     } else return .{ .err = .{ .Type = "Thread.sleep expects a Long or Int millisecond argument" } };
     if (millis > 0) {
-        // A dispatched pool task entering a real wall sleep is not advancing
-        // the cooperative virtual clock; tell the coroutine layer so a
-        // top-level driver waiting on this task's virtual-clock "settle" does
-        // not block out the whole wall sleep.
+        // A dispatched pool task in a real wall sleep advances no cooperative
+        // virtual clock, so the coroutine layer is told; otherwise a driver
+        // waiting for it to settle blocks out the whole sleep.
         runtime.notifyWallBlock();
         sleepMillis(@intCast(millis));
-        // A daemon pool task asked to abandon itself at the run boundary
-        // wakes from the sliced sleep early and aborts here, before the
-        // body can run any further instruction (the block-level abandon
-        // check in the evaluator only fires at the next block edge).
+        // A daemon pool task asked to abandon itself aborts here, the evaluator's
+        // abandon check firing only at the next block edge.
         if (runtime.shouldAbandon()) {
             return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
         }
@@ -312,19 +245,14 @@ pub fn concurrent_thread_sleep(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     return .{ .ok = .Unit };
 }
 
-/// Block the calling thread for `millis` milliseconds.
 fn sleepMillis(millis: u64) void {
     runtime.clockSleepMillis(@intCast(@min(millis, @as(u64, std.math.maxInt(i64)))));
 }
 
-/// `Thread.currentThread()` — a `Thread` sentinel for the calling OS
-/// thread. Its `.name` is a stable per-thread string derived from the
-/// OS thread id, so two calls on the same thread report the same name
-/// and distinct threads report distinct names; `.isAlive` is `true`
-/// (the calling thread is, by definition, running).
+/// A `Thread` sentinel for the calling OS thread, whose `.name` is a stable
+/// per-thread string derived from the OS thread id.
 pub fn concurrent_thread_current(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const id: u64 = std.Thread.getCurrentId();
-    // The thread id is carried as a Kotlin Long via a bit reinterpretation.
     const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
     return .{ .ok = try Value.newBoundMethod(ctx.allocator, .{
         .fqn = "kotlin.concurrent.Thread",
@@ -333,18 +261,10 @@ pub fn concurrent_thread_current(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
     }) };
 }
 
-/// Placeholder dispatch for a bare `Thread` sentinel value. Member
-/// access (`join`, `name`, `isAlive`) is intercepted by the
-/// interpreter before this is ever called; invoking the handle itself
-/// is not a valid Kotlin operation.
 fn threadHandleStub(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     _ = ctx;
     return .{ .err = .{ .Type = "Thread handle is not callable; use .join() / .name / .isAlive" } };
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -384,7 +304,6 @@ test "monitor enter is reentrant and exit releases by depth" {
     try testing.expect(try monitorExit(key));
     try testing.expect(try monitorExit(key));
     try testing.expect(try monitorExit(key));
-    // Fully released: exit without ownership reports failure.
     try testing.expect(!(try monitorExit(key)));
 }
 
@@ -397,8 +316,6 @@ const MonitorWorker = struct {
         var i: usize = 0;
         while (i < self.iters) : (i += 1) {
             if (!(monitorEnter(self.key) catch unreachable)) return;
-            // Unsynchronized read-modify-write; only the monitor makes
-            // it exact across the workers.
             self.counter.* += 1;
             _ = monitorExit(self.key) catch unreachable;
         }
@@ -450,7 +367,6 @@ test "tryEnter fails while another thread holds the monitor" {
     try testing.expect(!(try monitorTryEnter(key)));
     release.store(true, .release);
     holder.join();
-    // Released by the holder: this thread can now take and release it.
     try testing.expect(try monitorTryEnter(key));
     try testing.expect(try monitorExit(key));
 }
@@ -460,8 +376,6 @@ test "lock bindings acquire and release through the receiver identity" {
     defer h.deinit();
     var cap = runtime.CaptureOutput.init(testing.allocator);
     defer cap.deinit();
-    // Identity-less receiver falls back to the shared sentinel key; the
-    // enter/exit pairing must still balance.
     var args = [_]Value{.{ .Int = 1 }};
     var ctx = makeCtx(h.host(), cap.output(), &args);
     const l = try concurrent_lock_enter(&ctx);
@@ -472,7 +386,6 @@ test "lock bindings acquire and release through the receiver identity" {
     try testing.expect(rel_a == .ok);
     const rel_b = try concurrent_lock_exit(&ctx);
     try testing.expect(rel_b == .ok);
-    // Over-unlock is the JVM's IllegalMonitorStateException shape.
     const rel_c = try concurrent_lock_exit(&ctx);
     try testing.expect(rel_c == .err and rel_c.err == .Type);
 }

@@ -1,6 +1,6 @@
-//! List sorting and transforms: sorted/reversed, sum/average,
-//! min/max, toMap, distinct, take/drop, slice/subList, plus/minus,
-//! chunked/windowed/zip.
+//! List sorting and transforms: sorted, reversed, sum, average, min and max,
+//! toMap, distinct, take, drop, slice, subList, plus, minus, chunked, windowed
+//! and zip.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -72,11 +72,6 @@ const views_mod = @import("views.zig");
 const counterNowOf = views_mod.counterNowOf;
 const sublistBackingOf = views_mod.sublistBackingOf;
 
-// =====================================================================
-// List sorting / transforms
-// =====================================================================
-
-/// host-aware comparison: defers to a user `compareTo` for Instance items.
 fn compareHostAware(ctx: *CallCtx, x: Value, y: Value) Error!CompareOutcome {
     if (x == .Instance) {
         if (try ctx.host.invokeMethod(&x, "compareTo", &.{y}, ctx.out)) |m| {
@@ -86,15 +81,12 @@ fn compareHostAware(ctx: *CallCtx, x: Value, y: Value) Error!CompareOutcome {
     return compareValues(ctx.allocator, x, y);
 }
 
-/// Sort with optional host-aware compareTo for Instance items. Stable.
 pub fn sortListHostAware(ctx: *CallCtx, items: []Value) Error!?EvalResult {
     return sortListHostAwareDesc(ctx, items, false);
 }
 
-/// `sortListHostAware` with a natural-order direction: `descending`
-/// flips the comparison (the empty-step `reverseOrder()` comparator over
-/// host-comparable elements), keeping the sort stable — equal elements
-/// hold their original order in both directions, matching kotlinc.
+/// Natural-order sort; `descending` flips the comparison. Stable both ways, so
+/// equal elements keep their original order, as in kotlinc.
 pub fn sortListHostAwareDesc(ctx: *CallCtx, items: []Value, descending: bool) Error!?EvalResult {
     const a = ctx.allocator;
     var needs_host = false;
@@ -105,8 +97,6 @@ pub fn sortListHostAwareDesc(ctx: *CallCtx, items: []Value, descending: bool) Er
         }
     }
     if (!needs_host) return sortValuesNaturalDesc(a, items, descending);
-    // Stable bottom-up merge sort: O(n log n) host comparisons. An insertion
-    // sort here is O(n²) and times out on large host-comparable lists.
     const n = items.len;
     if (n < 2) return null;
     const buf = try a.alloc(Value, n);
@@ -212,9 +202,8 @@ pub fn coll_list_sum(ctx: *CallCtx) Error!EvalResult {
     return sumValues(a, items, "Iterable.sum");
 }
 
-/// Sum a numeric element slice, returning the Kotlin result type for the
-/// element type: `Long` -> Long, `Double` -> Double, `Float` -> Float, and
-/// Int/Short/Byte -> Int (wrapping, like Kotlin).
+/// Sum in Kotlin's result type: Long, Double and Float keep their type, while
+/// Int, Short and Byte sum to a wrapping Int.
 pub fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalResult {
     var acc_i: i64 = 0;
     var acc_u: u64 = 0;
@@ -222,8 +211,8 @@ pub fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!Eva
     var any_long = false;
     var any_float = false;
     var any_double = false;
-    // Unsigned sums keep their unsigned width (`Iterable<UInt>.sum()` is
-    // UInt with u32 wrap; UByte/UShort widen to UInt; ULong stays ULong).
+    // Unsigned sums keep their width: UInt wraps at u32, UByte and UShort widen
+    // to UInt, ULong stays ULong.
     var any_unsigned = false;
     var any_ulong = false;
     for (items) |v| {
@@ -305,8 +294,6 @@ pub fn coll_list_min(ctx: *CallCtx) Error!EvalResult {
 
 fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
-    // Iterable-generic: the erased receiver-type-arg decline routes
-    // Set/Array receivers here through the Iterable/Set-form probes.
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
     const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |x| x,
@@ -320,8 +307,8 @@ fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []cons
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
-    // Floating-point elements follow `Math.min`/`Math.max` (NaN propagates,
-    // `-0.0 < 0.0`); the natural order cannot express either.
+    // Floating-point elements follow `Math.min`/`Math.max`, where NaN propagates
+    // and `-0.0 < 0.0`; the natural order expresses neither.
     if (items[0] == .Double or items[0] == .Float) {
         const is_float = items[0] == .Float;
         var acc: f64 = floatVal(items[0]) orelse return floatFallback(a, items, want_max);
@@ -343,8 +330,6 @@ fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []cons
     return ok(best);
 }
 
-/// Collect (key, value) entries from a slice of Pair values; last write
-/// wins on duplicate keys.
 pub fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Error!union(enum) { entries: std.ArrayList(MapPair), err: EvalResult } {
     var entries: std.ArrayList(MapPair) = .empty;
     for (items) |v| {
@@ -360,11 +345,8 @@ pub fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Erro
     return .{ .entries = entries };
 }
 
-/// Read a user `Map` implementation (a `.Instance` whose class implements
-/// `kotlin.collections.Map`) into a slice of `MapPair`. Drains the instance's
-/// `entries` view, then extracts `key`/`value` from each entry through host
-/// member dispatch (entries may be `Map.Entry` instances, builtin `MapEntry`
-/// values, or `Pair`s). Returns an error EvalResult on a non-map instance.
+/// Read a user `Map` implementation into `MapPair`s through its `entries` view;
+/// an entry may be a `Map.Entry` instance, a builtin `MapEntry` or a `Pair`.
 pub fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) { entries: []MapPair, err: EvalResult } {
     const a = ctx.allocator;
     const keepalive = runtime.keepaliveMark();
@@ -399,7 +381,6 @@ pub fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enu
                 key = p.first.asPtr().*;
                 val = p.second.asPtr().*;
             },
-            // A user `Map.Entry` instance: read its `key`/`value` properties.
             else => {
                 const kr = (try ctx.host.getProperty(&entry, "key", ctx.out)) orelse
                     return .{ .err = typeErr(try fmt(a, "{s} entry is missing key", .{who})) };
@@ -432,7 +413,6 @@ pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
     const recv = if (ctx.args.len > 0) ctx.args[0] else Value.Null;
     const items = switch (recv) {
         .Array => |arr| try arr.snapshot(a),
-        // List/Set/Sequence and any user `.Instance` exposing `iterator()`.
         else => switch (try iterableItemsCtx(ctx, recv, "toMap")) {
             .items => |x| x,
             .err => |e| return e,
@@ -443,8 +423,6 @@ pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
         .entries => |x| x,
         .err => |e| return e,
     };
-    // `toMap(destination)`: write the pairs into the supplied mutable map and
-    // return it, rather than building a fresh read-only map.
     if (ctx.args.len >= 2 and ctx.args[1] == .Map) {
         const dest = ctx.args[1];
         const g = dest.Map.entries.borrowMut();
@@ -537,9 +515,6 @@ pub fn coll_list_drop_last(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items[0..end], false));
 }
 
-/// True when a `plusAssign`/`minusAssign` argument is a multi-element
-/// collection (so it flattens via addAll/removeAll) rather than a single
-/// element to add/remove.
 fn isMultiElementArg(v: Value) bool {
     return switch (v) {
         .List, .Set, .Range, .Sequence, .Array => true,
@@ -547,8 +522,6 @@ fn isMultiElementArg(v: Value) bool {
     };
 }
 
-/// `MutableCollection += elements` — addAll for a collection argument, add
-/// for a single element; mutates the receiver in place.
 pub fn coll_mut_collection_plus_assign(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("plusAssign requires an argument");
     const multi = isMultiElementArg(ctx.args[1]);
@@ -559,8 +532,6 @@ pub fn coll_mut_collection_plus_assign(ctx: *CallCtx) Error!EvalResult {
     };
 }
 
-/// `MutableCollection -= elements` — removeAll for a collection argument,
-/// remove for a single element; mutates the receiver in place.
 pub fn coll_mut_collection_minus_assign(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("minusAssign requires an argument");
     const multi = isMultiElementArg(ctx.args[1]);
@@ -621,9 +592,6 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     recv.refreshSublistView();
     const from = if (ctx.args.len > 1) (ctx.args[1].asI64() orelse return typeErr("subList requires Int fromIndex")) else return typeErr("subList requires Int fromIndex");
     const to = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse return typeErr("subList requires Int toIndex")) else return typeErr("subList requires Int toIndex");
-    // A subList over a subList CHAINS: the new view's parent is the
-    // receiver view itself, so growth through the child splices into every
-    // ancestor window on the way to the root (Java's `SubList(parent)`).
     const parent_items = recv.List.items;
     const parent_backing = sublistBackingOf(recv);
     const recv_len: usize = listLen(recv.List.items);
@@ -657,9 +625,9 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
         .len = win_len,
         .exp_mod = counterNowOf(recv.List.mod_count),
     } });
-    // Share the root list's structural counter so a modification of the parent
-    // (not through this view) is observed as a ConcurrentModification by this
-    // subList's iterators — matching Kotlin's SubList, which tracks root.modCount.
+    // Share the root list's structural counter, so a modification of the parent
+    // not made through this view trips this subList's iterators, as Kotlin's
+    // SubList does by tracking root.modCount.
     const shared_mc = if (recv.List.mod_count.get()) |mc| runtime.OptRef(u64).from(mc.clone()) else try modCountFor(a, mutable);
     return ok(try Value.newList(a, .{
         .items = try ValueList.init(a, window),
@@ -696,9 +664,8 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeListBorrowed(a, out, false));
 }
 
-/// `Collection.plusElement(element)` always appends `element` as a single
-/// element, even when it is itself a collection — unlike `plus`, which flattens
-/// an Iterable/Array/Sequence argument.
+/// `plusElement` appends its argument as one element even when it is a
+/// collection, unlike `plus`, which flattens one.
 pub fn coll_list_plus_element(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "List.plusElement")) {
@@ -712,10 +679,8 @@ pub fn coll_list_plus_element(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeListBorrowed(a, out, false));
 }
 
-/// `Iterable<T>.minus` / `plus` — the STATIC-Iterable surface (returns a
-/// List regardless of the runtime collection kind, as kotlinc resolves
-/// for a receiver whose declared type is Iterable). Reads the receiver
-/// through `iterableItems` and reuses the List core.
+/// The static-Iterable surface: returns a List whatever the runtime collection
+/// kind, as kotlinc resolves for an Iterable-typed receiver.
 pub fn coll_iterable_minus(ctx: *CallCtx) Error!EvalResult {
     return iterableListOpAdapter(ctx, coll_list_minus, "Iterable.minus");
 }
@@ -724,9 +689,6 @@ pub fn coll_iterable_plus(ctx: *CallCtx) Error!EvalResult {
     return iterableListOpAdapter(ctx, coll_list_plus, "Iterable.plus");
 }
 
-/// Adapt an arbitrary iterable receiver to the List-receiver core: the
-/// receiver materializes to a fresh builtin List value, the remaining
-/// args pass through.
 fn iterableListOpAdapter(ctx: *CallCtx, comptime core: fn (*CallCtx) Error!EvalResult, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
@@ -757,9 +719,8 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("minus requires an argument");
     const arg = ctx.args[1];
     var removals: std.ArrayList(Value) = .empty;
-    // `minus(elements: Collection/Array/Sequence)` removes every element that
-    // is a member of `elements`; `minus(element)` removes only the first
-    // occurrence of that single element.
+    // `minus(elements)` removes every member of `elements`, while
+    // `minus(element)` removes only the first occurrence.
     var is_collection = true;
     switch (arg) {
         .List => |l| try appendVL(&removals, a, l.items),
@@ -835,10 +796,9 @@ pub fn coll_list_windowed(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    // Peel a trailing callable as the `transform` (the `windowed(size, step,
-    // partialWindows, transform)` overload). The scalar size/step/partialWindows
-    // are then read positionally from the remaining args, so omitted middle
-    // defaults (`windowed(2) { ... }`) bind correctly.
+    // Peel a trailing callable as the `transform` of the
+    // `windowed(size, step, partialWindows, transform)` overload, so the scalar
+    // args read positionally and omitted middle defaults still bind.
     var n = ctx.args.len;
     const transform: ?Value = if (n > 2 and isCallable(ctx.args[n - 1])) blk: {
         n -= 1;
@@ -937,9 +897,6 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
 
 fn isZipTransform(v: Value) bool {
     return switch (v) {
-        // Any callable third argument is the transform: a lambda, a bound or
-        // user method, a function/intrinsic reference, a constructor reference
-        // (`::SomeClass` evaluates to a `.Class`), or a functional Instance.
         .IrClosure, .BoundMethod, .Instance, .Class, .Intrinsic => true,
         else => false,
     };

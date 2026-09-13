@@ -1,7 +1,6 @@
-//! Shared helpers for the collection intrinsics: result/error wrappers,
-//! value construction, borrow helpers, equality and search, host calls,
-//! natural-order comparison, receiver accessors, range views and
-//! `iterableItems`.
+//! Shared helpers for the collection intrinsics: result wrappers, value
+//! construction, borrows, equality and search, natural-order comparison,
+//! receiver accessors, range views and `iterableItems`.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -32,20 +31,12 @@ const materialiseSequence = sequence_mod.materialiseSequence;
 const views_mod = @import("views.zig");
 const sublistComodGuard = views_mod.sublistComodGuard;
 
-// =====================================================================
-// Result/error helpers
-// =====================================================================
-
 pub fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
-/// Return a value that the accessor *borrowed* from its receiver (a stored
-/// list/array element or map entry value, not a freshly built result). Host
-/// calls return owned values — the dispatch writes the result into a register
-/// that takes ownership — so a borrowed element must be retained first or it is
-/// released one time too many when the register is overwritten/torn down. The
-/// retain is a no-op under the arena fast path.
+/// Return a value borrowed from the receiver (a stored element or entry value).
+/// Dispatch takes ownership of a host result, so the borrow is retained first.
 pub fn okElem(v: Value) EvalResult {
     v.retain();
     return .{ .ok = v };
@@ -59,35 +50,25 @@ pub fn arityErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Arity = msg } };
 }
 
-/// Build an owned, formatted message slice from the ctx allocator.
 pub fn fmt(a: Allocator, comptime spec: []const u8, args: anytype) Error![]u8 {
     return std.fmt.allocPrint(a, spec, args);
 }
 
-/// Render a value the way Kotlin `toString` does, owned by `a`.
 pub fn display(a: Allocator, v: Value) Error![]u8 {
     return v.display(a);
 }
 
-// =====================================================================
-// Value construction helpers (Arc / ObjRef equivalents)
-// =====================================================================
-
-/// `Arc::new(string)` — wrap an already-owned slice in a `StringRef`.
 pub fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
     return .{ .String = try runtime.strInit(a, s) };
 }
 
-/// `make_list(items, mutable)` — wrap a slice of values into a `List`.
-/// A fresh structural-modification counter for a mutable list (so its
-/// iterators can fail-fast), or null for a read-only list.
+/// Wrap a slice of values into a `List`. A mutable list gets a fresh
+/// structural-modification counter so its iterators fail fast.
 pub fn modCountFor(a: Allocator, mutable: bool) Error!runtime.OptRef(u64) {
     if (!mutable) return .{};
     return .from(try ObjRef(u64).init(a, 0));
 }
 
-/// A `List`/`Set` element count, or 0 for anything else — for the
-/// structural-bump diff. (`Map` fail-fast is handled via its own counter.)
 pub fn listLenOf(v: *const Value) usize {
     return switch (v.*) {
         .List => |l| listLen(l.items),
@@ -96,7 +77,6 @@ pub fn listLenOf(v: *const Value) usize {
     };
 }
 
-/// The shared `mod_count` of a `List`/`Set` value, if any.
 fn modCountOf(v: *const Value) runtime.OptRef(u64) {
     return switch (v.*) {
         .List => |l| l.mod_count,
@@ -105,8 +85,8 @@ fn modCountOf(v: *const Value) runtime.OptRef(u64) {
     };
 }
 
-/// Increment a collection's `mod_count` (no-op when absent). Use directly for a
-/// structural op that does not change length (`trimToSize`/`ensureCapacity`).
+/// Increment a collection's `mod_count`. Called directly for a structural op
+/// that leaves the length unchanged (`trimToSize`, `ensureCapacity`).
 pub fn bumpModCount(v: *const Value) void {
     if (modCountOf(v).get()) |mc| {
         const g = mc.borrowMut();
@@ -115,24 +95,21 @@ pub fn bumpModCount(v: *const Value) void {
     }
 }
 
-/// `defer structuralBump(&ctx.args[0], before)`: bump `mod_count` only when the
-/// length actually changed, so `remove(absent)` / `removeAll([])` / `retainAll`
-/// of an unchanged collection register no modification (Kotlin's contract).
+/// Bumps `mod_count` only when the length changed, so `remove(absent)` and
+/// `retainAll` of an unchanged collection register no modification.
 pub fn structuralBump(v: *const Value, before: usize) void {
     if (listLenOf(v) != before) bumpModCount(v);
 }
 
-/// `entries.pairs.len` — captured before a map mutation for the size diff.
 pub fn mapEntriesLen(entries: MapEntries) usize {
     const g = entries.borrow();
     defer g.deinit();
     return g.get().pairs.items.len;
 }
 
-/// `defer mapStructuralBump(entries, before)`: bump the map's `mod_count` only
-/// when the entry count changed, so `put(existing)`/`putAll([])` register no
-/// modification while a fresh key / `remove`/`clear` fail a concurrent view
-/// iterator (which shares this counter).
+/// Bumps the map's `mod_count` only when the entry count changed, so
+/// `put(existing)` registers no modification while a fresh key or `remove`
+/// fails a concurrent view iterator sharing this counter.
 pub fn mapStructuralBump(entries: MapEntries, before: usize) void {
     const g = entries.borrowMut();
     defer g.deinit();
@@ -144,9 +121,8 @@ pub fn mapStructuralBump(entries: MapEntries, before: usize) void {
     }
 }
 
-/// A new handle on the map's shared `mod_count`, for a `keys`/`values`/`entries`
-/// view so its iterator fails fast when the source map mutates structurally.
-/// Current structural counter of an entries store (0 when uncounted).
+/// A new handle on the map's shared `mod_count` for a view, so the view's
+/// iterator fails fast when the source map mutates structurally.
 pub fn entriesCounterNow(entries: MapEntries) u64 {
     const g = entries.borrow();
     defer g.deinit();
@@ -165,8 +141,7 @@ pub fn entriesModCountClone(entries: MapEntries) runtime.OptRef(u64) {
 pub fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
-    // `items` is a borrowed slice (call args, or a `snapshotItems`/`dupe` copy
-    // that did not bump counts); the list owns one ref per element, so retain.
+    // `items` is borrowed; the list owns one ref per element, so retain.
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     return try Value.newList(a, .{
         .items = try ValueList.init(a, list),
@@ -177,7 +152,6 @@ pub fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     });
 }
 
-/// `make_list` consuming an already-built ArrayList (no copy).
 pub fn makeListFromArrayList(a: Allocator, list: std.ArrayList(Value), mutable: bool) Error!Value {
     return try Value.newList(a, .{
         .items = try ValueList.init(a, list),
@@ -188,53 +162,39 @@ pub fn makeListFromArrayList(a: Allocator, list: std.ArrayList(Value), mutable: 
     });
 }
 
-/// Like `makeListFromArrayList`, but for a backing whose elements are *borrowed*
-/// (copied in from `snapshotItems`/`iterableItems`/call args without bumping
-/// counts). The new list owns one reference per element, so retain each before
-/// adopting the backing — exactly as `makeList` does for a borrowed slice.
-/// Callers that build the backing from freshly *owned* elements (a `makePair`
-/// result, a block-invocation result, an explicitly pre-retained value) use
-/// `makeListFromArrayList` instead so ownership transfers without a leak.
+/// As `makeListFromArrayList`, for a backing whose elements are borrowed: the
+/// new list retains each before adopting it. Callers whose backing holds freshly
+/// owned elements use `makeListFromArrayList` so ownership transfers instead.
 pub fn makeListBorrowed(a: Allocator, list: std.ArrayList(Value), mutable: bool) Error!Value {
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     return makeListFromArrayList(a, list, mutable);
 }
 
-/// Build a new List from the live contents of a `ValueList`, copying under the
-/// borrow. Replaces `makeList(a, try snapshotItems(a, vl), m)`: that idiom
-/// allocates a `snapshotItems` dupe, has `makeList` copy it again, then orphans
-/// the dupe (a per-call raw-temp leak under a freeing/gc backend — the arena
-/// reclaimed it for free). One copy, no dangling intermediate.
 pub fn makeListVL(a: Allocator, vl: ValueList, mutable: bool) Error!Value {
     const g = vl.borrow();
     defer g.deinit();
     return makeList(a, g.get().items, mutable);
 }
 
-/// `makeListVL` for sets.
 pub fn makeSetVL(a: Allocator, vl: ValueList, mutable: bool) Error!Value {
     const g = vl.borrow();
     defer g.deinit();
     return makeSet(a, g.get().items, mutable);
 }
 
-/// Append a `ValueList`'s live elements to `dst`, copying under the borrow.
-/// Replaces `dst.appendSlice(a, try snapshotItems(a, vl))`, which leaked the
-/// `snapshotItems` dupe (the arena reclaimed it; a freeing/gc backend does not).
 pub fn appendVL(dst: *std.ArrayList(Value), a: Allocator, vl: ValueList) Error!void {
     const g = vl.borrow();
     defer g.deinit();
     try dst.appendSlice(a, g.get().items);
 }
 
-/// `appendVL` for an `Array` receiver (boxed or packed).
 pub fn appendArrItems(dst: *std.ArrayList(Value), a: Allocator, arr: runtime.ArrayData) Error!void {
     const snap = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(snap);
     try dst.appendSlice(a, snap);
 }
 
-/// `make_set(items, mutable)` — dedupe by boxed structural equality.
+/// Build a `Set`, deduping by boxed structural equality.
 pub fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
     for (items) |v| {
@@ -273,18 +233,12 @@ pub fn makeArrayFromArrayList(a: Allocator, list_in: std.ArrayList(Value), prim:
     return runtime.ArrayData.fromBoxedList(try ValueList.init(a, list_in));
 }
 
-/// `makeArrayFromArrayList` for a backing whose elements are *borrowed* (see
-/// `makeListBorrowed`): the new array owns one ref per element, so retain each.
+/// As `makeListBorrowed`, for an array: the new array retains each element.
 pub fn makeArrayBorrowed(a: Allocator, list: std.ArrayList(Value), prim: ?PrimitiveArrayKind) Error!Value {
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     return makeArrayFromArrayList(a, list, prim);
 }
 
-/// `make_map(entries, mutable)` — dedupe keys, last write wins. The input
-/// entries are BORROWED (snapshotEntries copies / Pair-arg reads): the new map
-/// owns one ref for each kept key and value, so retain them; on a last-write
-/// overwrite release the dropped value (the key keeps its existing ref). Every
-/// `makeMap` caller passes borrowed (or empty) entries. No-op under the arena.
 pub fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
     var out: std.ArrayList(MapPair) = .empty;
     for (entries) |kv| {
@@ -309,9 +263,6 @@ pub fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutab
     return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .pairs = entries, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
 }
 
-/// `makeMapFromArrayList` for entries whose key+value are *borrowed*: the new
-/// map owns one ref for each key and value, so retain both. Mirrors
-/// `makeListBorrowed` for map entries.
 pub fn makeMapBorrowed(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
     if (runtime.reclaimEnabled()) for (entries.items) |kv| {
         kv.key.retain();
@@ -332,26 +283,19 @@ pub fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error
     });
 }
 
-/// `make_exception(fqn, message)` -> a thrown-ready `Value::Exception`.
 pub fn makeException(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!Value {
     const fqn_ref = try runtime.strInit(a, fqn);
     const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(a, m) else null;
     return try Value.newException(a, .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null });
 }
 
-/// `Err(RuntimeError::Thrown(make_exception(...)))` as an EvalResult.
 pub fn thrown(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!EvalResult {
     return .{ .err = .{ .Thrown = try makeException(a, fqn, message) } };
 }
 
 /// A structural mutation on a read-only collection throws
-/// `UnsupportedOperationException` (Kotlin: a `List`/`Set`/`Map` built read-only
-/// rejects `add`/`remove`/`set`/`put`/`clear`). Returns the thrown result when
-/// `args[0]` is an immutable collection, else null so the caller proceeds.
-/// High bit of a shared `mod_count`: the builder that owned this counter
-/// froze (`build*` returned), so every VIEW sharing the cell is
-/// read-only from now on even though its own `mutable` flag was minted
-/// while the builder was live.
+/// `UnsupportedOperationException`, as Kotlin does for a read-only
+/// `List`/`Set`/`Map`. Null when `args[0]` is mutable.
 pub const FROZEN_MOD_BIT: u64 = runtime.FROZEN_MOD_BIT;
 
 pub fn modCountFrozen(mc: runtime.OptRef(u64)) bool {
@@ -361,9 +305,8 @@ pub fn modCountFrozen(mc: runtime.OptRef(u64)) bool {
     return (g.get().* & FROZEN_MOD_BIT) != 0;
 }
 
-/// A live `MutableMap` view (`keys` / `values` / `entries`) supports
-/// write-through removal but never insertion -- Kotlin's map views throw
-/// UnsupportedOperationException from `add` / `addAll`.
+/// A live `MutableMap` view supports write-through removal but never insertion:
+/// Kotlin's map views throw from `add` and `addAll`.
 pub fn mapViewAddGuard(a: Allocator, args: []const Value) Error!?EvalResult {
     if (args.len == 0) return null;
     const backing: ?*CollBackingRef.Cell = switch (args[0]) {
@@ -398,11 +341,6 @@ pub fn readOnlyMutationGuard(a: Allocator, args: []const Value) Error!?EvalResul
     return try thrown(a, "kotlin.UnsupportedOperationException", null);
 }
 
-// =====================================================================
-// Borrow helpers over ObjRef containers
-// =====================================================================
-
-/// Snapshot the items of a `ValueList` into a freshly allocated slice.
 pub fn snapshotItems(a: Allocator, items: ValueList) Error![]Value {
     const g = items.borrow();
     defer g.deinit();
@@ -421,34 +359,27 @@ pub fn mapLen(entries: MapEntries) usize {
     return g.get().pairs.items.len;
 }
 
-/// Snapshot a `MapEntries` into a freshly allocated slice of pairs.
 pub fn snapshotEntries(a: Allocator, entries: MapEntries) Error![]MapPair {
     const g = entries.borrow();
     defer g.deinit();
     return a.dupe(MapPair, g.get().pairs.items);
 }
 
-// =====================================================================
-// Equality / search helpers
-// =====================================================================
-
 pub fn eqBoxed(x: *const Value, y: *const Value) bool {
     return Value.structuralEqBoxed(x, y);
 }
 
-/// Value equality that honours a user `equals` override: when either side is a
-/// class Instance, dispatch `x.equals(y)` through the VM (as Kotlin's
-/// membership/dedup do); otherwise structural equality. A non-data class with a
-/// custom `equals` (e.g. klio's `LocalDate`) compares by value, not identity.
+/// Value equality honouring a user `equals` override: with an Instance on
+/// either side the VM dispatches `x.equals(y)`, as Kotlin's membership and dedup
+/// do; otherwise structural equality.
 pub fn eqBoxedH(host: IntrinsicHost, out: Output, x: *const Value, y: *const Value) Error!bool {
     if (x.* == .Instance or y.* == .Instance) {
         if (try host.invokeMethod(x, "equals", &.{y.*}, out)) |m| {
             if (m == .ok and m.ok == .Bool) return m.ok.Bool;
         }
     }
-    // Tuple shapes compare component-wise THROUGH the host so an Instance
-    // component's user `equals` dispatches — `mimes.contains("txt" to
-    // contentType)` compares Pair<String, ContentType> elements.
+    // Tuple shapes compare component-wise through the host so an Instance
+    // component's user `equals` dispatches.
     if (x.* == .Pair and y.* == .Pair) {
         return (try eqBoxedH(host, out, x.Pair.first.asPtr(), y.Pair.first.asPtr())) and
             (try eqBoxedH(host, out, x.Pair.second.asPtr(), y.Pair.second.asPtr()));
@@ -493,7 +424,6 @@ pub fn findKeyIndexBoxedH(host: IntrinsicHost, out: Output, entries: []const Map
     return null;
 }
 
-/// `makeMap` honouring a user `equals` for key dedup (last write wins).
 pub fn makeMapH(host: IntrinsicHost, out: Output, a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
     var o: std.ArrayList(MapPair) = .empty;
     for (entries) |kv| {
@@ -514,7 +444,6 @@ pub fn makeMapH(host: IntrinsicHost, out: Output, a: Allocator, entries: []const
     return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .pairs = o, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
 }
 
-/// Dedup `items` honouring user `equals` (for setOf/toSet over user objects).
 pub fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
     for (items) |v| {
@@ -531,11 +460,9 @@ pub fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const V
     });
 }
 
-/// Reinterpret a numeric `needle` into the element kind of a primitive
-/// array, mirroring the call-site coercion Kotlin applies to a `contains`
-/// argument typed as the array's element type (`uintArrayOf(...).contains(5u)`
-/// passes a `UInt`, not the bare literal's default kind). Non-numeric needles
-/// (objects, null) pass through so an `Any?` probe still compares as-is.
+/// Reinterpret a numeric `needle` into a primitive array's element kind, the
+/// coercion Kotlin applies to a `contains` argument typed as the element type.
+/// A non-numeric needle passes through so an `Any?` probe compares as-is.
 pub fn coerceNeedleToArrayKind(needle: Value, kind: ?PrimitiveArrayKind) Value {
     const k = kind orelse return needle;
     const bits: u64 = switch (needle) {
@@ -579,7 +506,6 @@ pub fn isCallable(v: Value) bool {
     };
 }
 
-/// Match the trailing-lambda detection the join/zip ops use.
 pub fn isTransformCallable(v: Value) bool {
     return switch (v) {
         .IrClosure, .BoundMethod => true,
@@ -594,12 +520,7 @@ pub fn isTransformCallable(v: Value) bool {
     };
 }
 
-// =====================================================================
-// Host call helper: thread a RuntimeError through as data
-// =====================================================================
-
-/// Invoke a callable; on a `RuntimeError` short-circuit by returning the
-/// `EvalResult.err` to the caller. On success returns the produced Value.
+/// Invoke a callable, short-circuiting a `RuntimeError` back to the caller.
 const CallOutcome = union(enum) { value: Value, err: EvalResult };
 
 pub fn invoke(ctx: *CallCtx, callable: *const Value, args: []const Value) Error!CallOutcome {
@@ -610,16 +531,10 @@ pub fn invoke(ctx: *CallCtx, callable: *const Value, args: []const Value) Error!
     };
 }
 
-// =====================================================================
-// Natural-order comparison
-// =====================================================================
-
-/// Either an ordering or a short-circuit error EvalResult.
 pub const CompareOutcome = union(enum) { order: Order, err: EvalResult };
 
-/// Kotlin's `Double`/`Float` total order (`java.lang.Double.compare`):
-/// every `NaN` is greater than all other values, all `NaN`s equal, and
-/// `-0.0 < 0.0`.
+/// Kotlin's `Double`/`Float` total order: every NaN is greater than every other
+/// value, all NaNs are equal, and `-0.0 < 0.0`.
 fn kotlinFloatTotalCmp(x: f64, y: f64) Order {
     if (x < y) return .lt;
     if (x > y) return .gt;
@@ -632,19 +547,15 @@ fn kotlinFloatTotalCmp(x: f64, y: f64) Order {
     return std.math.order(bits(x), bits(y));
 }
 
-/// Compare two values by Kotlin's natural ordering.
 pub fn compareValues(a: Allocator, x: Value, y: Value) Error!CompareOutcome {
-    // Nullable ordering (Kotlin `compareValues`): null sorts before any
-    // non-null value; two nulls are equal. A nullable selector
-    // (`sortedBy { if (...) null else it.length }`) relies on this.
+    // Kotlin's `compareValues` sorts null before any non-null value.
     if (x == .Null or y == .Null) {
         if (x == .Null and y == .Null) return .{ .order = .eq };
         return .{ .order = if (x == .Null) .lt else .gt };
     }
     if (x.isNumeric() and y.isNumeric()) {
         if (x.isIntegral() and y.isIntegral()) {
-            // Unsigned operands compare by magnitude; reading them as i64 would
-            // wrap (UInt.MAX -> -1) and misorder the sort.
+            // Unsigned operands compare by magnitude; read as i64 they wrap.
             if (x.isUnsigned() and y.isUnsigned()) {
                 return .{ .order = std.math.order(x.asU64().?, y.asU64().?) };
             }
@@ -681,8 +592,8 @@ pub fn i32ToOrdering(n: i32) Order {
     return std.math.order(n, 0);
 }
 
-/// Stable natural-order sort over a slice. Returns a short-circuit
-/// EvalResult when two elements are incomparable.
+/// Stable natural-order sort. Returns a short-circuit EvalResult when two
+/// elements are incomparable.
 fn sortValuesNatural(a: Allocator, items: []Value) Error!?EvalResult {
     return sortValuesNaturalDesc(a, items, false);
 }
@@ -706,7 +617,6 @@ pub fn sortValuesNaturalDesc(a: Allocator, items: []Value, descending: bool) Err
     return null;
 }
 
-/// Replace a `ValueList`'s backing storage with a fresh slice's contents.
 pub fn writeBackItems(items: ValueList, a: Allocator, src: []const Value) Error!void {
     const g = items.borrowMut();
     defer g.deinit();
@@ -714,19 +624,15 @@ pub fn writeBackItems(items: ValueList, a: Allocator, src: []const Value) Error!
     try g.get().appendSlice(a, src);
 }
 
-// =====================================================================
-// Receiver accessors
-// =====================================================================
-
 const ListItemsOutcome = union(enum) { items: ValueList, err: EvalResult };
 
 pub fn recvListItems(a: Allocator, args: []const Value, what: []const u8) Error!ListItemsOutcome {
     if (args.len > 0 and args[0] == .List) {
-        // A live subList view fails fast when its backing changed
-        // structurally not through the view.
+        // A live subList view fails fast when its backing changed structurally
+        // other than through the view.
         if (try sublistComodGuard(a, &args[0])) |e| return .{ .err = e };
-        // An array `.asList()` view re-reads its scalar source so later array
-        // writes show through before any read of `items`.
+        // An array `.asList()` view re-reads its scalar source, so a later array
+        // write shows through.
         args[0].refreshArrayView();
         args[0].refreshSublistView();
         return .{ .items = args[0].List.items };
@@ -746,11 +652,8 @@ pub fn recvMapEntries(a: Allocator, args: []const Value, what: []const u8) Error
     return .{ .err = typeErr(try fmt(a, "{s} requires a Map receiver", .{what})) };
 }
 
-// =====================================================================
-// Range iteration (local copy of ranges helpers; ranges.zig is not imported here)
-// =====================================================================
+// Range iteration, a local copy since ranges.zig is not imported here.
 
-/// Inclusive integer progression iterator state.
 pub const RangeIter = struct {
     cur: i64,
     end: i64,
@@ -758,12 +661,12 @@ pub const RangeIter = struct {
     kind: RangeKind,
     done: bool,
 
-    fn init(start: i64, end: i64, step: i64, kind: RangeKind) RangeIter {
+    pub fn init(start: i64, end: i64, step: i64, kind: RangeKind) RangeIter {
         const empty = step == 0 or !kind.inBounds(start, end, step);
         return .{ .cur = start, .end = end, .step = step, .kind = kind, .done = empty };
     }
 
-    fn next(self: *RangeIter) ?i64 {
+    pub fn next(self: *RangeIter) ?i64 {
         if (self.done) return null;
         // `inBounds` compares unsigned for ULong (`MaxUL..MinUL` is empty).
         if (!self.kind.inBounds(self.cur, self.end, self.step)) {
@@ -771,8 +674,8 @@ pub const RangeIter = struct {
             return null;
         }
         const v = self.cur;
-        // `end` is the exact final element; stop once yielded so the cursor
-        // never advances past it (Long.MAX overflow, or a ULong wrap past MaxUL).
+        // `end` is the exact final element, so stop once it is yielded and the
+        // cursor never overflows past it.
         if (self.cur == self.end) {
             self.done = true;
             return v;
@@ -783,7 +686,6 @@ pub const RangeIter = struct {
     }
 };
 
-/// `range_endpoint(kind, v)` — narrow/reinterpret an i64 endpoint.
 fn rangeEndpoint(kind: RangeKind, v: i64) Value {
     return switch (kind) {
         .Long => .{ .Long = v },
@@ -794,7 +696,6 @@ fn rangeEndpoint(kind: RangeKind, v: i64) Value {
     };
 }
 
-/// `as_range_view(v)` — view a Range value or a `kotlin.ranges.*` Instance.
 const RangeView = struct { start: i64, end: i64, step: i64, kind: RangeKind };
 
 pub fn asRangeView(v: Value) ?RangeView {
@@ -835,16 +736,10 @@ fn instNum(inst: *const InstanceData, names: []const []const u8) ?i64 {
     return null;
 }
 
-// =====================================================================
-// iterable_items: collect an iterable receiver into a fresh []Value
-// =====================================================================
-
-/// Either a collected slice of items or a short-circuit error EvalResult.
 pub const ItemsOutcome = union(enum) { items: []Value, err: EvalResult };
 
-/// Collect a List/Set/Array/Map/Range receiver into a freshly allocated
-/// slice. Map yields `MapEntry` values. Returns an error EvalResult when
-/// the receiver is not iterable.
+/// Collect a List/Set/Array/Map/Range receiver into a fresh slice; a Map yields
+/// `MapEntry` values. An error EvalResult when the receiver is not iterable.
 pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
     switch (v) {
         .List, .Set, .Array => {
@@ -887,9 +782,8 @@ pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcom
     }
 }
 
-/// As `iterableItems`, but also materialises a (possibly lazy) `Sequence`
-/// argument, which needs the host to run its pipeline. Use this wherever a
-/// bulk op accepts a `Sequence` operand (`list + aSequence`, `list - aSequence`).
+/// As `iterableItems`, but also materialises a lazy `Sequence` argument through
+/// the host, for any bulk op that accepts one.
 pub fn iterableItemsCtx(ctx: *CallCtx, v: Value, what: []const u8) Error!ItemsOutcome {
     if (v == .Sequence) {
         return switch (try materialiseSequence(ctx.allocator, ctx.host, ctx.out, v)) {
@@ -897,17 +791,15 @@ pub fn iterableItemsCtx(ctx: *CallCtx, v: Value, what: []const u8) Error!ItemsOu
             .err => |e| .{ .err = .{ .err = e } },
         };
     }
-    // A user/anonymous `Iterable` (e.g. the object `CharSequence.asIterable()`
-    // returns) has no built-in backing; drain it through its `iterator()`.
+    // A user `Iterable` has no built-in backing; drain its `iterator()`.
     if (v == .Instance) {
         if (try drainViaIterator(ctx, v)) |r| return r;
     }
     return iterableItems(ctx.allocator, v, what);
 }
 
-/// Drain any value that exposes `iterator()` / `hasNext()` / `next()` into a
-/// flat element slice. Returns null when the value has no `iterator()` (so the
-/// caller can fall back to the built-in extractor or a type error).
+/// Drain any value exposing `iterator()`, `hasNext()` and `next()` into a flat
+/// slice. Null when it has no `iterator()`, so the caller can fall back.
 fn drainViaIterator(ctx: *CallCtx, v: Value) Error!?ItemsOutcome {
     const a = ctx.allocator;
     const iter_opt = try ctx.host.invokeMethod(&v, "iterator", &.{}, ctx.out);
@@ -933,16 +825,8 @@ fn drainViaIterator(ctx: *CallCtx, v: Value) Error!?ItemsOutcome {
     return ItemsOutcome{ .items = try out.toOwnedSlice(a) };
 }
 
-// =====================================================================
-// Companion constants & public comparison/sequence helpers
-// =====================================================================
-
-/// Result of the public natural-order comparison: an ordering or a
-/// `RuntimeError` (as data).
 pub const OrderResult = union(enum) { order: Order, err: RuntimeError };
 
-/// Natural-order comparison exposed to the interpreter's higher-order
-/// ops. Returns an ordering or a `RuntimeError` as data.
 pub fn compareValuesPublic(a: Allocator, x: Value, y: Value) Error!OrderResult {
     return switch (try compareValues(a, x, y)) {
         .order => |o| .{ .order = o },
@@ -950,8 +834,6 @@ pub fn compareValuesPublic(a: Allocator, x: Value, y: Value) Error!OrderResult {
     };
 }
 
-/// `primitive_companion_const(ty, name)` — companion constants for the
-/// built-in numeric/char primitive types.
 pub fn primitive_companion_const(ty: []const u8, name: []const u8) ?Value {
     const T = struct {
         fn eq(x: []const u8, y: []const u8) bool {

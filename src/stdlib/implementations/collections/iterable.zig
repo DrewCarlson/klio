@@ -1,4 +1,4 @@
-//! Iterable-wide intrinsics: random/shuffle, filterNotNull, sumOf,
+//! Iterable-wide intrinsics: random and shuffle, filterNotNull, sumOf,
 //! max/min-of, distinctBy, grouping, association and sorted-by.
 
 const std = @import("std");
@@ -47,18 +47,12 @@ const views_mod = @import("views.zig");
 const sublistComodGuard = views_mod.sublistComodGuard;
 const syncSublist = views_mod.syncSublist;
 
-// =====================================================================
-// random / randomOrNull / shuffled
-// =====================================================================
-
 var random_state: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0x2545F4914F6CDD1D);
 
 const IndexOutcome = union(enum) { idx: usize, err: RuntimeError };
 
-/// A uniform index in `[0, n)`. When a `Random` argument was supplied (the
-/// `random(Random)` / `shuffled(Random)` overloads, where it sits at
-/// `args[1]`), draw from it through the host so a seeded source stays
-/// deterministic; otherwise use the process RNG.
+/// A uniform index in `[0, n)`. A supplied `Random` argument is drawn through
+/// the host so a seeded source stays deterministic.
 fn pickIndex(ctx: *CallCtx, n: usize) Error!IndexOutcome {
     if (n <= 1) return .{ .idx = 0 };
     if (ctx.args.len > 1 and ctx.args[1] == .Instance) {
@@ -112,7 +106,6 @@ pub fn coll_random_or_null(ctx: *CallCtx) Error!EvalResult {
     return ok(v);
 }
 
-/// Fisher-Yates shuffle of `slice` in place, drawing indices via `pickIndex`.
 fn shuffleInPlace(ctx: *CallCtx, slice: []Value) Error!?RuntimeError {
     var i: usize = slice.len;
     while (i > 1) {
@@ -140,8 +133,6 @@ pub fn coll_shuffled(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items, false));
 }
 
-/// `Array.shuffle()` (and the primitive/unsigned array variants) —
-/// Fisher-Yates in place, optionally seeded by a `Random` argument.
 pub fn array_shuffle(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("shuffle requires an array receiver");
@@ -153,7 +144,6 @@ pub fn array_shuffle(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 
-/// `MutableList.shuffle()` — shuffle in place.
 pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
@@ -169,11 +159,6 @@ pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
     return ok(.Unit);
 }
 
-// =====================================================================
-// Iterable transforms (filterNotNull, sumOf, max/min of, distinctBy,
-// groupBy, groupingBy + terminals, associate*, sorted*, onEach, mapNotNull)
-// =====================================================================
-
 pub fn coll_iter_filter_not_null(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "filterNotNull")) {
@@ -188,10 +173,8 @@ pub fn coll_iter_filter_not_null(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeListBorrowed(a, result, false));
 }
 
-/// Accumulator kind of a `sumOf` fold — mirrors the Kotlin overload set
-/// (Int, Long, UInt, ULong, Double). The sum keeps the selector's kind:
-/// Int wraps at 32 bits, UInt sums stay UInt, an empty receiver yields
-/// the zero of the selector's declared return type.
+/// Accumulator kind of a `sumOf` fold. The sum keeps the selector's kind, so an
+/// Int sum wraps at 32 bits and an empty receiver yields that kind's zero.
 const SumKind = enum { int, long, uint, ulong, double };
 
 fn sumKindFromTyName(name: []const u8) ?SumKind {
@@ -313,8 +296,8 @@ fn iterMaxMinOfOrNull(ctx: *CallCtx, want_max: bool, what: []const u8) Error!Eva
             .err => |e| return e,
         };
         if (best) |b| {
-            // A Double/Float selector uses Math.min/Math.max semantics (NaN
-            // propagates, -0.0 < 0.0), NOT the generic Comparable total order.
+            // A Double or Float selector uses Math.min/max semantics, where NaN
+            // propagates and `-0.0 < 0.0`, not the Comparable total order.
             if (r == .Double and b == .Double) {
                 const m = if (want_max) kotlinFloatMax(r.Double, b.Double) else kotlinFloatMin(r.Double, b.Double);
                 best = .{ .Double = m };
@@ -373,7 +356,6 @@ pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    // `groupBy(keySelector)` or `groupBy(keySelector, valueTransform)`.
     if (ctx.args.len != 2 and ctx.args.len != 3) return arityErr("groupBy expects (receiver, keySelector[, valueTransform])");
     const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "groupBy")) {
         .items => |xs| xs,
@@ -411,8 +393,6 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
             try groups.append(a, .{ .key = key, .vs = vs });
         }
     }
-    // The `groups` spine is scratch — each `vs` is adopted by `makeListBorrowed`
-    // and each `key` moves into `entries`, but the `Group` array itself is freed.
     defer if (runtime.freeScratch()) groups.deinit(a);
     var entries: std.ArrayList(MapPair) = .empty;
     for (groups.items) |g| {
@@ -424,8 +404,6 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("groupingBy expects (receiver, keySelector)");
-    // `iterableItemsCtx` drains a Sequence / CharSequence / user Iterable too,
-    // so Array/Sequence/CharSequence.groupingBy share this synth shape.
     const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "groupingBy")) {
         .items => |xs| xs,
         .err => |e| return e,
@@ -441,8 +419,6 @@ pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
     return ok(try ctx.host.newSynthInstance("kotlin.collections.Grouping", id, &fields));
 }
 
-/// `Grouping.sourceIterator()` — the iterator over the captured source, used
-/// by the upstream `foldTo`/`reduceTo`/`eachCountTo`/`aggregate` terminals.
 pub fn coll_grouping_source_iterator(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .Instance) return typeErr("sourceIterator expects a Grouping receiver");
     const src: Value = blk: {
@@ -454,7 +430,6 @@ pub fn coll_grouping_source_iterator(ctx: *CallCtx) Error!EvalResult {
         typeErr("Grouping source is not iterable");
 }
 
-/// `Grouping.keyOf(element)` — applies the captured key selector.
 pub fn coll_grouping_key_of(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[0] != .Instance) return arityErr("keyOf expects (Grouping, element)");
     const key: Value = blk: {
@@ -468,20 +443,16 @@ pub fn coll_grouping_key_of(ctx: *CallCtx) Error!EvalResult {
     };
 }
 
-/// A `Grouping` reduced to what the terminals need: its elements, and a way to
-/// key one. `key` is the captured selector for klio's own representation; when
-/// it is null the receiver is an ordinary `Grouping` implementation and the
-/// key comes from its `keyOf` method.
+/// A `Grouping` reduced to its elements plus a way to key one. A null `key`
+/// means the receiver's own `keyOf` method supplies it.
 const GroupingParts = union(enum) {
     parts: struct { items: []Value, key: ?Value, receiver: Value },
     err: EvalResult,
 };
 
-/// Drain a `Grouping` written in Kotlin through the interface's own protocol:
-/// `sourceIterator()`, then `hasNext`/`next`. `groupingBy` is an inline
-/// extension returning `object : Grouping<T, K>`, so a statically bound call
-/// splices that body and produces a genuine implementation rather than the
-/// `__grouping_src` instance klio builds for the same source.
+/// Drain a Kotlin-written `Grouping` through the interface protocol: a
+/// statically bound `groupingBy` splices its inline body instead of building
+/// `__grouping_src`.
 fn groupingItemsViaProtocol(ctx: *CallCtx, recv: Value) Error!?[]Value {
     const it = switch ((try ctx.host.invokeMethod(&recv, "sourceIterator", &.{}, ctx.out)) orelse return null) {
         .ok => |v| v,
@@ -517,7 +488,6 @@ fn groupingParts(ctx: *CallCtx, v: Value) Error!GroupingParts {
             break :blk .{ .src = src, .key = key };
         };
         if (captured) |c| {
-            // Escapes to the caller via `parts.items`; freed there.
             const items = try snapshotItems(a, c.src.List.items);
             return .{ .parts = .{ .items = items, .key = c.key, .receiver = v } };
         }
@@ -599,7 +569,7 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
                 };
             } else break :blk initial;
         };
-        // The computed-initial overload's operation is keyed:
+        // The computed-initial overload keys its operation:
         // `fold(initialValueSelector: (K, T) -> R, operation: (K, R, T) -> R)`.
         const next = switch (if (isCallable(initial))
             try invoke(ctx, &op, &.{ k, cur, v })
@@ -637,11 +607,9 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
                 .value => |val| val,
                 .err => |e| return e,
             };
-            // The reduced result is owned (invoke); drop the displaced value.
             if (runtime.reclaimEnabled()) cur.release(a);
             acc.items[p].value = next;
         } else {
-            // k is owned (invoke); v is a borrowed source element, so retain it.
             if (runtime.reclaimEnabled()) v.retain();
             try acc.append(a, .{ .key = k, .value = v });
         }
@@ -670,8 +638,8 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
         }
         const key = r.Pair.first.asPtr().*;
         const val = r.Pair.second.asPtr().*;
-        // key/val are borrowed reads of the owned Pair `r`'s boxes; the map owns
-        // its own ref to each, so retain before storing, then release `r`.
+        // key and val are borrowed reads of the owned Pair, so retain before
+        // storing, then release `r`.
         if (runtime.reclaimEnabled()) {
             key.retain();
             val.retain();
@@ -692,7 +660,6 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    // `associateBy(keySelector)` or `associateBy(keySelector, valueTransform)`.
     if (ctx.args.len != 2 and ctx.args.len != 3) return arityErr("associateBy expects (receiver, keySelector[, valueTransform])");
     const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "associateBy")) {
         .items => |xs| xs,
@@ -714,8 +681,6 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
             .err => |e| return e,
         };
         runtime.keepalivePush(key);
-        // The value is `valueTransform(v)` (owned) or the element itself
-        // (borrowed — the map takes its own ref). key is owned either way.
         var value = v;
         var value_owned = false;
         if (has_value_transform) {
@@ -757,8 +722,6 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
             .value => |x| x,
             .err => |e| return e,
         };
-        // val is owned (invoke result); v is a borrowed receiver element used as
-        // the key, so the map owns its own ref to it.
         if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &v)) |i| {
             if (runtime.reclaimEnabled()) entries.items[i].value.release(a);
             entries.items[i].value = val;
@@ -770,13 +733,8 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeMapFromArrayList(a, entries, false));
 }
 
-/// Insertion sort over a slice using a host-driven key comparison. The
-/// callback maps each element to a key, then keys compare by natural
-/// order (optionally reversed). On error short-circuits with the
-/// EvalResult.
 fn sortByKeyInsertion(ctx: *CallCtx, items: []Value, block: Value, descending: bool) Error!?EvalResult {
     const a = ctx.allocator;
-    // Precompute keys.
     const keys = try a.alloc(Value, items.len);
     const keepalive = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(keepalive);
@@ -878,9 +836,6 @@ pub fn coll_iter_min_by_or_null(ctx: *CallCtx) Error!EvalResult {
     return iterMaxMinByImpl(ctx, true, "minByOrNull");
 }
 
-/// Dispatch `comparator.compare(a, b)` for a non-intrinsic Comparator
-/// value (interpreted object / SAM / bare callable). Returns the i64
-/// result or a short-circuit EvalResult.
 const CmpResult = union(enum) { n: i64, err: EvalResult };
 
 pub fn invokeComparatorCompare(ctx: *CallCtx, comparator: Value, x: Value, y: Value) Error!CmpResult {
@@ -906,15 +861,14 @@ pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
     };
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
-    // Host-aware so a list of user `Comparable` instances sorts through their
-    // `compareTo` (sortValuesNatural only handles builtin scalars).
+    // Host-aware so user `Comparable` instances sort through their `compareTo`.
     if (try sortListHostAware(ctx, copy)) |e| return e;
     writeBackItems(it, a, copy) catch return error.OutOfMemory;
     return ok(Value.Unit);
 }
 
-/// Stable bottom-up merge sort driven by a Kotlin `Comparator` value: O(n log n)
-/// comparator callbacks. An insertion sort is O(n²) and times out on large lists.
+/// Stable bottom-up merge sort driven by a Kotlin `Comparator`: an insertion
+/// sort's O(n²) comparator callbacks time out on large lists.
 pub fn mergeSortComparator(ctx: *CallCtx, cmp: Value, items: []Value) Error!?EvalResult {
     const a = ctx.allocator;
     const n = items.len;
@@ -1017,7 +971,6 @@ pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     const comparator = ctx.args[1];
-    // An empty-steps natural Comparator sorts builtin scalars directly.
     if (comparator == .Comparator) {
         const descending = comparator.Comparator.descending;
         const empty = blk: {
@@ -1030,8 +983,6 @@ pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
             return ok(try makeList(a, items, false));
         }
     }
-    // Everything else (a `compare(a,b)` object or a multi-step Comparator, whose
-    // `compare` the host evaluates) goes through the stable merge sort.
     if (try mergeSortComparator(ctx, comparator, items)) |e| return e;
     return ok(try makeList(a, items, false));
 }

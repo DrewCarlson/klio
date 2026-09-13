@@ -1,18 +1,14 @@
-//! Process-global resource table for bundle mode: the `--include` files
-//! embedded in a bundle, served to the `klio.bundle.Resources` host
-//! bindings straight from the executable's mmap (entries decompress on
-//! read; uncompressed entries are zero-copy borrows).
-//!
-//! Set-up-time configuration like `ExtraKnownPackages`: written once by
-//! bundle boot before the program runs, read-only during execution.
+//! Process-global resource table for bundle mode: the `--include` files embedded
+//! in a bundle, served to the `klio.bundle.Resources` bindings straight from the
+//! executable's mmap. Written once by bundle boot before the program runs, and
+//! read-only during execution.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const pack = @import("pack");
 
-/// One embedded resource. `stored` borrows the bundle mmap for the
-/// process lifetime.
+/// One embedded resource; `stored` borrows the bundle mmap for the process.
 pub const Entry = struct {
     mount: []const u8,
     stored: []const u8,
@@ -23,15 +19,13 @@ pub const Entry = struct {
 var entries: []const Entry = &.{};
 var active = false;
 
-/// Install the table. Called once by bundle boot; `list` and everything
-/// it references must live for the process.
+/// Install the table. Called once by bundle boot; `list` and everything it
+/// references must live for the process.
 pub fn installEntries(list: []const Entry) void {
     entries = list;
     active = true;
 }
 
-/// Whether the process runs in bundle mode with a resource table (even
-/// an empty one).
 pub fn isActive() bool {
     return active;
 }
@@ -47,8 +41,8 @@ pub fn find(mount: []const u8) ?*const Entry {
     return null;
 }
 
-/// Materialize an entry's bytes. Uncompressed entries borrow the mmap;
-/// compressed entries allocate. Null on a corrupt frame.
+/// Materialize an entry's bytes: an uncompressed entry borrows the mmap, a
+/// compressed one allocates. Null on a corrupt frame.
 pub fn read(gpa: Allocator, e: *const Entry) Allocator.Error!?[]const u8 {
     if (!e.compressed) return e.stored;
     return pack.zstd.decompress(gpa, e.stored, e.uncompressed_len) catch |err| switch (err) {

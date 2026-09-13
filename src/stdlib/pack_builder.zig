@@ -1,10 +1,9 @@
-//! Build a `.klio-pack` byte stream describing the stdlib surface. Used by
-//! `klio pack stdlib` and by the embedded-pack build path.
+//! Build a `.klio-pack` byte stream describing the stdlib surface, for
+//! `klio pack stdlib` and the embedded-pack build path.
 //!
-//! Emits `manifest`, `symbols`, `bindings`, and `sources` sections. The
-//! Zig std has no zstd encoder, so every section is stored uncompressed; the
-//! `compress_symbols` flag is accepted for source compatibility but has no
-//! effect.
+//! Emits `manifest`, `symbols`, `bindings` and `sources` sections. The Zig std
+//! has no zstd encoder, so every section is stored uncompressed and the
+//! `compress_symbols` flag has no effect.
 
 const std = @import("std");
 const pack = @import("pack");
@@ -15,24 +14,15 @@ const PackError = pack.PackError;
 const PackWriter = pack.PackWriter;
 const section_names = pack.section_names;
 
-/// The library version embedded in the pack manifest: the in-tree stdlib
-/// version.
 pub const LIBRARY_VERSION: []const u8 = "0.1.0";
-
-/// The stdlib source manifest (curated upstream files, klio actuals, and
-/// their repo-relative roots) lives in `stdlib_sources.zig` so the top-level
-/// build.zig can import the same lists; re-exported here for consumers.
+/// The stdlib source manifest, re-exported for consumers.
 pub const stdlib_sources = @import("stdlib_sources.zig");
 pub const CURATED_UPSTREAM_SOURCES = stdlib_sources.CURATED_UPSTREAM_SOURCES;
 pub const KLIO_STDLIB_ACTUAL_FILES = stdlib_sources.KLIO_STDLIB_ACTUAL_FILES;
 pub const UPSTREAM_STDLIB_ROOT = stdlib_sources.UPSTREAM_STDLIB_ROOT;
 pub const KLIO_STDLIB_DIR = stdlib_sources.KLIO_STDLIB_DIR;
-
-/// Build a deterministic pack for the in-process Kotlin standard library.
-///
-/// `compress_symbols` is accepted for source compatibility, but this build
-/// has no zstd encoder so every section is stored uncompressed. On failure
-/// `result` is set and `null` is returned.
+/// Build a deterministic pack for the in-process Kotlin standard library. On
+/// failure `result` is set and null is returned.
 pub fn buildStdlibPack(
     allocator: std.mem.Allocator,
     compress_symbols: bool,
@@ -43,7 +33,6 @@ pub fn buildStdlibPack(
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // -- manifest --
     var implicit = try a.alloc([]const u8, root.IMPLICITLY_IMPORTED_PACKAGES.len);
     for (root.IMPLICITLY_IMPORTED_PACKAGES, 0..) |p, i| implicit[i] = p;
     const manifest = schema.PackManifest{
@@ -57,7 +46,6 @@ pub fn buildStdlibPack(
     };
     const manifest_bytes = (try schema.encode(schema.PackManifest, a, &manifest, result)) orelse return null;
 
-    // -- symbols --
     const syms = root.generated.stdlibSymbols();
     var sym_entries = try a.alloc(schema.SymbolRecord, syms.len);
     for (syms, 0..) |*e, i| sym_entries[i] = symbolEntryToRecord(e);
@@ -65,7 +53,6 @@ pub fn buildStdlibPack(
     const symbol_index = schema.SymbolIndex{ .entries = sym_entries };
     const symbol_bytes = (try schema.encode(schema.SymbolIndex, a, &symbol_index, result)) orelse return null;
 
-    // -- bindings --
     var bindings: std.ArrayList(schema.Binding) = .empty;
     var seen = std.StringHashMap(void).init(a);
     var names = root.allSymbolNames();
@@ -90,11 +77,9 @@ pub fn buildStdlibPack(
     const binding_manifest = schema.BindingManifest{ .bindings = bindings.items };
     const binding_bytes = (try schema.encode(schema.BindingManifest, a, &binding_manifest, result)) orelse return null;
 
-    // -- sources --
     const sources = (try buildCuratedSources(a, result)) orelse return null;
     const sources_bytes = (try schema.encode(schema.SourceBundle, a, &sources, result)) orelse return null;
 
-    // -- assemble --
     var writer = PackWriter.init(allocator);
     defer writer.deinit();
     _ = try writer.addRaw(section_names.MANIFEST, manifest_bytes.items);
@@ -104,8 +89,8 @@ pub fn buildStdlibPack(
     return try writer.finish(result);
 }
 
-/// Read the curated upstream commonMain files plus the klio-authored `actual`
-/// files into a `SourceBundle`. Fails as data when an expected file is absent.
+/// Read the curated upstream files plus the klio-authored `actual`s into a
+/// `SourceBundle`. Fails as data when an expected file is absent.
 fn buildCuratedSources(a: std.mem.Allocator, result: *PackError) std.mem.Allocator.Error!?schema.SourceBundle {
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -158,10 +143,9 @@ fn buildCuratedSources(a: std.mem.Allocator, result: *PackError) std.mem.Allocat
     return .{ .files = files.items };
 }
 
-/// Rewrites the `KotlinVersion(major, minor, 255)` build placeholder in
-/// `KotlinVersion.kt` to the pinned release triple, mirroring the rewrite
-/// kotlinc's build performs on the same source. Returns null when the
-/// placeholder is absent (a version bump changed the file shape).
+/// Rewrite the `KotlinVersion(major, minor, 255)` build placeholder to the
+/// pinned release triple, as kotlinc's build does on the same source. Null when
+/// the placeholder is absent.
 fn stampKotlinVersion(a: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!?[]const u8 {
     const needle = stdlib_sources.KOTLIN_VERSION_PLACEHOLDER;
     const idx = std.mem.indexOf(u8, bytes, needle) orelse return null;

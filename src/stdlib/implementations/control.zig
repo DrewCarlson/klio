@@ -1,7 +1,5 @@
 //! Control-flow / builder / contract stdlib intrinsics.
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. For member access the
-//! receiver is `args[0]`, with any further user arguments following.
 
 const std = @import("std");
 const stringbuilder_impl = @import("stringbuilder.zig");
@@ -25,10 +23,8 @@ fn arityErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Arity = msg } };
 }
 
-/// `buildList`/`buildSet`/`buildMap` with an explicit capacity throw
-/// `IllegalArgumentException` for a negative capacity, before running the
-/// builder block. Returns the thrown result, or null when the capacity is
-/// absent/valid.
+/// An explicit negative capacity throws `IllegalArgumentException` before the
+/// builder block runs. Null when the capacity is absent or valid.
 fn negativeCapacity(ctx: *CallCtx) std.mem.Allocator.Error!?EvalResult {
     if (ctx.args.len < 2) return null;
     const cap = ctx.args[0].asI64() orelse return null;
@@ -53,8 +49,6 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .mutable = true,
         .enum_entries = false,
         .backing = null,
-        // The builder is a live `MutableList` the block iterates + mutates;
-        // give it a structural counter so a concurrent iterator fails-fast.
         .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)),
     });
     {
@@ -65,14 +59,12 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     if (buildable.List.mod_count.get()) |mc| {
-        // Freeze every live view sharing this counter (a subList leaked
-        // out of the builder must reject mutation after build()).
         const g = mc.borrowMut();
         g.get().* |= collections.FROZEN_MOD_BIT;
         g.deinit();
     }
-    // An empty build result IS the shared empty singleton (Kotlin's
-    // buildList returns EmptyList for size 0; assertSame holds).
+    // An empty build result is the shared empty singleton, as Kotlin's
+    // `buildList` returns EmptyList for size 0.
     const list_empty = blk: {
         const g = buildable.List.items.borrow();
         defer g.deinit();
@@ -82,17 +74,13 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         buildable.release(ctx.allocator);
         return ok(try collections.sharedEmptyList(ctx.allocator));
     }
-    // Reuse the builder's box as the result, flipped read-only.
     buildable.List.mutable = false;
     return ok(buildable);
 }
 
-/// `__klio_freezeList(list)` — flip an already-built list read-only in
-/// place: the frozen counter rejects mutation through every leaked view,
-/// and an empty result collapses to the shared empty singleton. The
-/// suspension-safe `buildListInternal` builds through interpreted
-/// `ArrayList().apply(builderAction)` (so a suspending builder parks
-/// normally) and freezes here — no lambda ever crosses this boundary.
+/// Flip an already-built list read-only in place: the frozen counter rejects
+/// mutation through every leaked view, and an empty result collapses to the
+/// shared empty singleton.
 pub fn builders_freeze_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 1 or ctx.args[0] != .List) {
         return .{ .err = .{ .Type = "__klio_freezeList expects a List" } };
@@ -116,7 +104,6 @@ pub fn builders_freeze_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(buildable);
 }
 
-/// `__klio_freezeSet(set)` — as `__klio_freezeList` for `buildSet`.
 pub fn builders_freeze_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 1 or ctx.args[0] != .Set) {
         return .{ .err = .{ .Type = "__klio_freezeSet expects a Set" } };
@@ -140,7 +127,6 @@ pub fn builders_freeze_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(buildable);
 }
 
-/// `__klio_freezeMap(map)` — as `__klio_freezeList` for `buildMap`.
 pub fn builders_freeze_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 1 or ctx.args[0] != .Map) {
         return .{ .err = .{ .Type = "__klio_freezeMap expects a Map" } };
@@ -175,10 +161,8 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
-    // A genuine mutable SET builder (not a list): `add`/`addAll` dedupe under
-    // the block, so a builder iterator observes `add(existing)` as a no-op
-    // (Kotlin's `buildSet` exposes a `MutableSet`). A shared counter lets a
-    // concurrent iterator fail-fast.
+    // A genuine mutable Set builder: `add` dedupes under the block, so a builder
+    // iterator sees `add(existing)` as a no-op.
     const buildable = try Value.newSet(ctx.allocator, .{
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
@@ -206,9 +190,6 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         buildable.release(ctx.allocator);
         return ok(try collections.sharedEmptySet(ctx.allocator));
     }
-    // Reuse the builder's box as the result: flip it read-only (the frozen
-    // counter already rejects mutation through leaked views) and hand the
-    // creation reference to the caller.
     buildable.Set.mutable = false;
     return ok(buildable);
 }
@@ -219,8 +200,6 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
-    // The builder is a live `MutableMap` the block can iterate (via keys/values/
-    // entries) and mutate; give it a structural counter for fail-fast iteration.
     const buildable = try Value.newMap(ctx.allocator, .{
         .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)) }),
         .mutable = true,
@@ -233,8 +212,6 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     {
-        // Freeze every live view sharing this counter (a keys/values/entries
-        // view leaked out of the builder must reject mutation after build()).
         const g = buildable.Map.entries.borrow();
         const mc = g.get().mod_count;
         g.deinit();
@@ -253,15 +230,13 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         buildable.release(ctx.allocator);
         return ok(try collections.sharedEmptyMap(ctx.allocator));
     }
-    // Reuse the builder's box as the result, flipped read-only.
     buildable.Map.mutable = false;
     return ok(buildable);
 }
 
 pub fn builders_build_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // `buildString(builderAction)` or `buildString(capacity,
-    // builderAction)`. The capacity is only a sizing hint here, so the
-    // builder lambda is always the last argument.
+    // The capacity is only a sizing hint here, so the builder lambda is always
+    // the last argument.
     const block = switch (ctx.args.len) {
         1 => ctx.args[0],
         2 => ctx.args[1],
@@ -324,23 +299,12 @@ pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }) } };
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 const testing = std.testing;
 
-/// Host that records `invoke_callable_with_this` calls and, when armed,
-/// mutates the supplied `this` buildable so the builder intrinsics have an
-/// effect to observe.
 const RecordingHost = struct {
-    /// Values appended to a `List`/`Set` buildable on invocation.
     append_values: []const Value = &.{},
-    /// Bytes appended to a `StringBuilder` buildable on invocation.
     append_bytes: []const u8 = "",
-    /// Entries inserted into a `Map` buildable on invocation.
     append_entries: []const runtime.MapPair = &.{},
-    /// When set, the invocation reports this error instead of running.
     fail_with: ?RuntimeError = null,
     allocator: std.mem.Allocator,
     invoked: usize = 0,
@@ -372,8 +336,6 @@ const RecordingHost = struct {
                 defer g.deinit();
                 for (self.append_values) |v| try g.get().append(self.allocator, v);
             },
-            // `buildSet` builds a genuine mutable Set, so the mock's `add`
-            // dedups structurally-equal elements just like the real set.
             .Set => |s| {
                 const g = s.items.borrowMut();
                 defer g.deinit();
@@ -418,11 +380,8 @@ const RecordingHost = struct {
 };
 
 fn freeListResult(v: Value) void {
-    // The element/entry storage is an `ObjRef` over an `ArrayList`; releasing
-    // the final handle runs the list's own `deinit`, so no manual clear here.
-    // A boxed payload (Set/Map) drops its box, whose teardown releases what
-    // the collection owns — including the mod_count the inline form had no
-    // handle for here.
+    // The storage is an `ObjRef` over an `ArrayList`, so releasing the final
+    // handle runs the list's own `deinit`; a boxed payload drops its box.
     switch (v) {
         .List => |l| runtime.listRefOf(l).deinit(),
         .Set => |s| runtime.setRefOf(s).deinit(),
@@ -432,7 +391,6 @@ fn freeListResult(v: Value) void {
 }
 
 fn freeException(e: anytype) void {
-    // Boxed payload: dropping the box releases everything it owns.
     runtime.exceptionRefOf(e).deinit();
 }
 
@@ -537,8 +495,6 @@ test "buildString returns the accumulated buffer" {
     try testing.expect(r == .ok);
     const g = r.ok.String.borrow();
     defer {
-        // The String cell owns its bytes (built via `initOwned`) and frees
-        // them on the final `deinit`; do not free the bytes manually.
         g.deinit();
         r.ok.String.deinit();
     }

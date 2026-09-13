@@ -1,8 +1,6 @@
-//! Native XorWowRandom core. The Kotlin source implementation runs the xorwow
-//! step and the `nextInt(bound)` rejection loop through the interpreter, which
-//! makes RNG-heavy programs pathologically slow (~tens of microseconds per
-//! draw). These bindings run the same algorithm in Zig against the receiver's
-//! instance fields, keeping bit-for-bit parity with `XorWowRandom`.
+//! Native XorWowRandom core, bit-for-bit identical to the Kotlin `XorWowRandom`
+//! source but running the xorwow step and the `nextInt(bound)` rejection loop in
+//! Zig against the receiver's instance fields.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -24,8 +22,7 @@ fn fieldI32(inst: *const InstanceData, name: []const u8) i32 {
     return 0;
 }
 
-/// One xorwow step: mutates the six state fields in place and returns the draw,
-/// identical to `XorWowRandom.nextInt()`.
+/// One xorwow step: mutates the six state fields in place and returns the draw.
 fn xorwowStep(inst: *InstanceData) i32 {
     var x: u32 = @bitCast(fieldI32(inst, "x"));
     const y: u32 = @bitCast(fieldI32(inst, "y"));
@@ -55,7 +52,6 @@ fn xorwowStep(inst: *InstanceData) i32 {
     return @bitCast(t +% addend);
 }
 
-/// `Int.takeUpperBits(bitCount)` — the high `bitCount` bits, 0 when bitCount is 0.
 fn takeUpperBits(value: i32, bit_count: i32) i32 {
     if (bit_count <= 0) return 0;
     if (bit_count >= 32) return value;
@@ -69,7 +65,7 @@ fn nextBitsFor(inst: *InstanceData, bit_count: i32) i32 {
 }
 
 /// `nextInt(from, until)` over the live instance, mirroring kotlin-stdlib's
-/// power-of-two / rejection-sampling split.
+/// power-of-two and rejection-sampling split.
 fn nextIntRange(inst: *InstanceData, from: i32, until: i32) i32 {
     const n: i32 = until -% from;
     if (n > 0 or n == std.math.minInt(i32)) {
@@ -104,8 +100,8 @@ pub fn random_next_int(ctx: *CallCtx) Allocator.Error!EvalResult {
     const rest = ctx.args[1..];
     if (rest.len == 0) return ok(.{ .Int = xorwowStep(inst) });
     if (rest.len == 1 and rest[0] == .Range) {
-        // `nextInt(range: IntRange)` — `range.last + 1` can overflow, so split
-        // the boundary cases exactly as kotlin-stdlib does.
+        // In `nextInt(range: IntRange)` the `range.last + 1` can overflow, so the
+        // boundary cases split exactly as kotlin-stdlib does.
         const r = rest[0].Range;
         const first: i32 = @truncate(r.start);
         const last: i32 = @truncate(r.end);

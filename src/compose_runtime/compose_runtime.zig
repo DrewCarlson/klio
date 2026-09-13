@@ -1,16 +1,12 @@
 //! Native bindings for `androidx.compose.runtime`.
 //!
-//! Compose's compiler plugin normally synthesizes the `$composer` threading
-//! and slot-table bookkeeping for every `@Composable` function. klio has no
-//! compiler plugin: the interpreter maintains an implicit current-composer +
-//! positional group-key stack (see `src/interp_ir/vm/compose.zig`) and the
-//! klio-authored `klioMain` layer reimplements the composer / composition /
-//! recomposer / snapshot-state engine in plain Kotlin.
-//!
-//! This module supplies the small set of host intrinsics that klioMain's
-//! `expect`/`actual` actuals route to — operations the interpreter alone can
-//! answer (object identity, a process-global id counter, a monotonic clock,
-//! stderr logging). Everything else in the runtime is pure Kotlin.
+//! Compose's compiler plugin normally synthesizes the `$composer` threading and
+//! slot-table bookkeeping for every `@Composable` function. klio has no such
+//! plugin: the interpreter maintains an implicit current-composer and
+//! positional group-key stack (`src/interp_ir/vm/compose.zig`), and `klioMain`
+//! reimplements the composer, composition, recomposer and snapshot-state engine
+//! in plain Kotlin. This module supplies the host intrinsics those actuals route
+//! to: object identity, an id counter, a monotonic clock and stderr logging.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -29,14 +25,9 @@ fn ok(v: Value) EvalResult {
 
 const unit: Value = .{ .Unit = {} };
 
-/// Process-global monotonic counters. The interpreter is single-threaded for
-/// the synchronous composition core, but keep these atomic so the auxiliary
-/// (coroutine-driven) recomposition phase stays correct under the worker pool.
 var state_id_counter: std.atomic.Value(i64) = .init(0);
 var mono_counter: std.atomic.Value(i64) = .init(0);
 
-/// Build the registry of native bindings this crate supplies, mapping each
-/// host symbol to its implementing intrinsic.
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("androidx.compose.runtime.__compose_identityHashCode", identityHashCode);
@@ -44,14 +35,9 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.runtime.__compose_monotonicNanos", monotonicNanos);
     try b.register("androidx.compose.runtime.__compose_logError", logError);
     try b.register("androidx.compose.runtime.internal.__compose_currentThreadId", currentThreadId);
-    // The real androidx.compose.ui engine needs the same identity hash for its
-    // node/coordinator caches; expose it under the ui package's own symbol.
     try b.register("androidx.compose.ui.internal.__composeui_identityHashCode", identityHashCode);
-    // Gap-buffer group-field accessors: one-line IntArray arithmetic the JVM
-    // inlines away entirely, but the interpreter pays a full frame per call —
-    // together they are the hottest functions in a recompose-heavy census.
-    // Layout mirrors SlotTable.kt: 5 ints per group
-    // (key, groupInfo, parentAnchor, size, dataAnchor).
+    // Gap-buffer group-field accessors. Layout mirrors SlotTable.kt: 5 ints per
+    // group (key, groupInfo, parentAnchor, size, dataAnchor).
     try b.register("androidx.compose.runtime.composer.gapbuffer.parentAnchor", gapParentAnchor);
     try b.register("androidx.compose.runtime.composer.gapbuffer.updateParentAnchor", gapUpdateParentAnchor);
     try b.register("androidx.compose.runtime.composer.gapbuffer.dataAnchor", gapDataAnchor);
@@ -77,8 +63,6 @@ fn asIndex(v: Value) ?i64 {
     };
 }
 
-/// `IntArray.<field>(address)` — read `this[address * 5 + offset]`. Falls to a
-/// Type error only on a shape the interpreted original could not run either.
 fn gapFieldGet(ctx: *CallCtx, offset: i64) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[0] != .Array) return .{ .err = .{ .Type = "IntArray group-field read" } };
     const addr = asIndex(ctx.args[1]) orelse return .{ .err = .{ .Type = "IntArray group-field read" } };
@@ -124,17 +108,14 @@ fn gapHasObjectKey(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Bool = (r.ok.Int & object_key_mask) != 0 });
 }
 
-/// `countOneBits(value: Int): Int` — plain popcount.
 fn gapCountOneBits(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return .{ .err = .{ .Type = "countOneBits" } };
     const v = asIndex(ctx.args[0]) orelse return .{ .err = .{ .Type = "countOneBits" } };
     return ok(Value.newInt(@popCount(@as(u32, @bitCast(@as(i32, @truncate(v)))))));
 }
 
-/// `identityHashCode(instance: Any?): Int` — a stable per-object hash for the
-/// JVM `System.identityHashCode`. Reference types use their address-stable
-/// runtime identity; boxed scalars fall back to a value-derived hash (identity
-/// hashing only needs stability + reasonable spread, not uniqueness).
+/// A stable per-object hash, as JVM `System.identityHashCode`. A boxed scalar
+/// falls back to a value-derived hash, identity hashing needing spread only.
 fn identityHashCode(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(Value.newInt(0));
     const v = ctx.args[0];
@@ -149,7 +130,6 @@ fn identityHashCode(ctx: *CallCtx) Error!EvalResult {
         .Bool => |bb| return ok(Value.newInt(if (bb) 1231 else 1237)),
         else => {
             if (v.lockIdentity()) |id| {
-                // Fold the 64-bit identity into a positive 31-bit hash.
                 const h: i32 = @truncate(@as(i64, @bitCast(@as(u64, id) *% 0x9E3779B97F4A7C15)));
                 return ok(Value.newInt(@as(i64, h & 0x7FFFFFFF)));
             }
@@ -158,33 +138,28 @@ fn identityHashCode(ctx: *CallCtx) Error!EvalResult {
     }
 }
 
-/// `__compose_nextStateId(): Long` — next value from a process-global counter.
-/// Backs snapshot/state-record id allocation without exposing atomics to
-/// klioMain.
 fn nextStateId(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     const id = state_id_counter.fetchAdd(1, .monotonic) + 1;
     return ok(Value.newLong(id));
 }
 
-/// `__compose_monotonicNanos(): Long` — a strictly increasing time source for
-/// the frame clock. Returns a counter rather than wall-clock so deterministic
-/// tests stay reproducible; the recomposer only needs monotonicity.
+/// A strictly increasing time source for the frame clock: a counter rather than
+/// wall-clock, so deterministic tests stay reproducible.
 fn monotonicNanos(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     const t = mono_counter.fetchAdd(1, .monotonic) + 1;
     return ok(Value.newLong(t));
 }
 
-/// `__compose_logError(message: String, error: Throwable?): Unit` — Compose's
-/// internal error sink. Writes to stderr so it never pollutes program stdout.
-/// `__compose_currentThreadId(): Long` — the calling OS thread's id. The snapshot
-/// core keys its per-thread state on this.
+/// The calling OS thread's id, which the snapshot core keys per-thread state on.
 fn currentThreadId(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     return ok(Value.newLong(@bitCast(@as(u64, std.Thread.getCurrentId()))));
 }
 
+/// Compose's internal error sink, writing to stderr so it never pollutes program
+/// stdout.
 fn logError(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len >= 1) {
         if (ctx.args[0] == .String) {
@@ -215,7 +190,6 @@ test "hostBindings registers every compose symbol" {
 
 test "gap-buffer field accessors read and write the 5-int group layout" {
     var host: TestHost = .{};
-    // Two groups: fields [key, info, parentAnchor, size, dataAnchor].
     var backing = [_]Value{
         Value.newInt(11), Value.newInt(0x2000_0000), Value.newInt(-1), Value.newInt(4), Value.newInt(7),
         Value.newInt(22), Value.newInt(0),           Value.newInt(0),  Value.newInt(1), Value.newInt(9),
@@ -264,8 +238,6 @@ test "identityHashCode is stable for scalars and 0 for null" {
     }
 }
 
-/// Minimal `CallCtx` builder for unit tests: the compose intrinsics never use
-/// the host vtable, so a stub is sufficient.
 const TestHost = struct {
     fn ctx(self: *TestHost, args: []const Value) CallCtx {
         _ = self;

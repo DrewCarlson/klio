@@ -1,19 +1,12 @@
 //! Native bindings for `kotlinx-serialization-core`.
 //!
-//! kotlinx-serialization's compiler plugin synthesizes a `KSerializer` for
-//! every `@Serializable` class; klio's `serialization_pass` generates the
-//! same declarations as ordinary Kotlin before lowering. The only host help
-//! left is the LOOKUP the platform actuals need — the equivalent of
-//! Kotlin/Native's `findAssociatedObject` / the JVM's reflective
-//! `Companion.serializer()` call:
-//!
-//! - `__klsx_companionSerializer(kClass, args)` — invoke the class's
-//!   companion `serializer(args...)` (the generated member), or null when
-//!   the class has no companion serializer.
-//! - `__klsx_isInterfaceClass(kClass)` — the `KClass.isInterface()` actual.
-//!
-//! Everything else in serialization-core (and the JSON format) is pure
-//! Kotlin consumed straight from the upstream submodule.
+//! kotlinx-serialization's compiler plugin synthesizes a `KSerializer` for every
+//! `@Serializable` class; klio's `serialization_pass` generates the same
+//! declarations as ordinary Kotlin before lowering. The only host help left is
+//! the lookup the platform actuals need, the equivalent of Kotlin/Native's
+//! `findAssociatedObject`: `__klsx_companionSerializer(kClass, args)` invokes the
+//! class's generated companion `serializer(args...)`, and
+//! `__klsx_isInterfaceClass(kClass)` is the `KClass.isInterface()` actual.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -52,10 +45,9 @@ fn classOf(v: *const Value) ?ObjRef(ClassDef) {
     };
 }
 
-/// `__klsx_companionSerializer(kClass, args: List<KSerializer<*>>)`: read
-/// the class's `Companion` (initializing it) and call its generated
-/// `serializer(...)` with the type-argument serializers. An `object`
-/// carries `serializer()` on itself. Null when neither resolves.
+/// Read the class's `Companion`, initializing it, and call its generated
+/// `serializer(...)` with the type-argument serializers. An `object` carries
+/// `serializer()` on itself. Null when neither resolves.
 fn companionSerializer(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(.Null);
     const cls_val = ctx.args[0];

@@ -1,7 +1,5 @@
 //! io stdlib intrinsics (print / println / readLine / readln / readlnOrNull).
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. For member access the
-//! receiver is `args[0]`, with any further user arguments following.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -16,26 +14,13 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
-// ============================================================
-// io
-// ============================================================
-
-/// Render a value via its user-overridden `toString()` when one
-/// exists, falling back to the runtime's structural Display
-/// rendering. Used by `println` / `print` so plain-class instances
-/// pick up `override fun toString()` rather than always landing on
-/// the default `ClassName@<hex>` shape.
-///
-/// The returned bytes are owned by `ctx.allocator`; the caller frees them.
+/// Render a value through its user-overridden `toString()` when one exists,
+/// falling back to the structural Display rendering, so a plain class picks up
+/// `override fun toString()`. The bytes are owned by `ctx.allocator`.
 pub fn renderViaUserToString(ctx: *CallCtx, v: *const Value) std.mem.Allocator.Error![]u8 {
-    // A host `Result` renders through its `toString` intrinsic rather than
-    // the structural Display shape: the intrinsic interpolates the payload
-    // via ITS overridden `toString()`, so `Failure($exception)` shows a
-    // custom exception rendering exactly as Kotlin prints it.
-    // Containers route the same way: the member-dispatch toString renders
-    // ELEMENTS through their own overrides (`listOf(5.seconds)` prints
-    // `[5s]`), where the structural Display walker cannot dispatch and
-    // printed `[Duration(rawValue=…)]`.
+    // A host `Result` and every container render through their `toString`
+    // intrinsic rather than the structural Display walker, which cannot dispatch
+    // elements' own overrides: `listOf(5.seconds)` must print `[5s]`.
     if (v.* == .Instance or v.* == .Result or
         v.* == .List or v.* == .Set or v.* == .Map or
         v.* == .Pair or v.* == .Triple or v.* == .MapEntry)
@@ -104,8 +89,8 @@ pub fn io_read_line(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // A single-byte buffer keeps the reader from consuming past the newline,
-    // so a later `readLine()` call still sees the rest of the input.
+    // A single-byte buffer keeps the reader from consuming past the newline, so
+    // a later `readLine()` still sees the rest of the input.
     var read_buf: [1]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
     const r = &stdin_reader.interface;
@@ -130,8 +115,7 @@ pub fn io_read_line(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return ok(.Null);
     }
 
-    // `read_line` keeps the trailing `\n`; we already stop before storing it,
-    // so only a trailing `\r` (CRLF) remains to strip.
+    // The loop stops before storing the `\n`, so only a trailing `\r` remains.
     if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\r') {
         _ = buf.pop();
     }
@@ -140,12 +124,11 @@ pub fn io_read_line(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
 }
 
-/// `readlnOrNull()` — identical to `readLine()` (String, or null at EOF).
 pub fn io_readln_or_null(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return io_read_line(ctx);
 }
 
-/// `readln()` — `readLine()` but throwing `RuntimeException` at EOF.
+/// `readln()`: `readLine()` but throwing `RuntimeException` at EOF.
 pub fn io_readln(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const r = try io_read_line(ctx);
     switch (r) {
@@ -162,10 +145,6 @@ pub fn io_readln(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .err => return r,
     }
 }
-
-// ============================================================
-// Tests
-// ============================================================
 
 const testing = std.testing;
 const CaptureOutput = runtime.CaptureOutput;
@@ -230,7 +209,6 @@ test "print writes without a trailing newline" {
     var ctx = noopCtx(&args, cap.output());
     const r = try io_print(&ctx);
     try testing.expect(r.ok == .Unit);
-    // No full line recorded; the text sits in the pending partial.
     try testing.expectEqual(@as(usize, 0), cap.lines.items.len);
     try testing.expectEqualStrings("true", cap.partial.items);
 }

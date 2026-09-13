@@ -1,9 +1,8 @@
 //! StringBuilder stdlib intrinsics.
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. A `StringBuilder` value
-//! is an `ObjRef(std.ArrayList(u8))` holding the buffer as UTF-8 bytes; the
-//! range/index operations that Kotlin defines over UTF-16 code units convert
-//! between the UTF-8 buffer and a `[]u16` view as needed.
+//! A `StringBuilder` value is an `ObjRef(std.ArrayList(u8))` holding the buffer
+//! as UTF-8 bytes; the range and index operations Kotlin defines over UTF-16
+//! code units convert between that buffer and a `[]u16` view as needed.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -22,19 +21,13 @@ const StringBuilderRef = ObjRef(Buffer);
 
 const Allocator = std.mem.Allocator;
 
-// ============================================================
-// Shared helpers
-// ============================================================
-
 fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
-/// Return the *receiver* StringBuilder (the fluent `append`/`insert`/… methods
-/// hand `this` back for chaining). Host calls return owned values and the
-/// dispatch writes the result into a register that takes ownership, so retain
-/// the borrowed receiver first or it is released one time too many when that
-/// register is overwritten/torn down. No-op under the arena fast path.
+/// Return the receiver StringBuilder, since the fluent methods hand `this` back
+/// for chaining. Dispatch writes the host result into a register that takes
+/// ownership, so the borrowed receiver is retained first.
 fn okSb(sb: StringBuilderRef) EvalResult {
     const v = Value{ .StringBuilder = sb };
     v.retain();
@@ -45,8 +38,6 @@ fn errResult(e: RuntimeError) EvalResult {
     return .{ .err = e };
 }
 
-/// `make_exception(fqn, message)` — build a thrown Kotlin Throwable value.
-/// `fqn` is a static slice; `message`, when present, is owned by `allocator`.
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, fqn),
@@ -55,13 +46,10 @@ fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Al
     });
 }
 
-/// `RuntimeError::Thrown(make_exception(...))` as an `EvalResult` error.
 fn thrown(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!EvalResult {
     return errResult(.{ .Thrown = try makeException(allocator, fqn, message) });
 }
 
-/// The `StringBuilder` receiver in `args[0]`, or `null`; the caller turns
-/// `null` into a `Type` error via `sbTypeError`.
 fn sbArg(args: []const Value) ?StringBuilderRef {
     if (args.len > 0) {
         if (args[0] == .StringBuilder) return args[0].StringBuilder;
@@ -73,14 +61,11 @@ fn sbTypeError(comptime what: []const u8) RuntimeError {
     return .{ .Type = what ++ " requires a StringBuilder receiver" };
 }
 
-/// Overwrite the builder's UTF-8 bytes with `bytes`.
 fn setBuf(buf: *Buffer, allocator: Allocator, bytes: []const u8) Allocator.Error!void {
     buf.clearRetainingCapacity();
     try buf.appendSlice(allocator, bytes);
 }
 
-/// The UTF-16 code units of `s` as Kotlin would iterate/index its chars.
-/// Caller owns the result.
 fn encodeUtf16(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
     var out: std.ArrayList(u16) = .empty;
     errdefer out.deinit(allocator);
@@ -106,30 +91,18 @@ fn encodeUtf16(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
     return out.toOwnedSlice(allocator);
 }
 
-/// `String::from_utf16_lossy` — fold UTF-16 units back into a UTF-8 string,
-/// reconstructing surrogate pairs (unpaired surrogates become U+FFFD).
-/// Caller owns the result.
 fn fromUtf16Lossy(allocator: Allocator, units: []const u16) Allocator.Error![]u8 {
     return runtime.charUnitsToString(allocator, units);
 }
 
-/// Render a single UTF-16 code unit (a Kotlin `Char`) as a UTF-8 string.
-/// Caller owns the result.
 fn charUnitToString(allocator: Allocator, unit: u16) Allocator.Error![]u8 {
     return runtime.charUnitToString(allocator, unit);
 }
 
-/// Number of Kotlin `Char`s = UTF-16 code units: an astral scalar is two units
-/// (a surrogate pair), a lone WTF-8 surrogate and any BMP scalar are one. For a
-/// surrogate-free string this equals the scalar count, so normal text is
-/// unaffected.
-/// Reader-side memo for ONE builder: ASCII-ness, UTF-16 length, and a
-/// UTF-16/byte cursor, keyed by the builder's cell and its buffer identity.
-/// Every mutating builtin (through `sbMut`) and every construction of a
-/// builder invalidates a memo on that cell, so a read-only phase — the okio
-/// shim's reader doing `sb[pos++]` and `sb.length` per code point over a
-/// 150 KB JSON buffer — costs O(1) per read instead of re-encoding the
-/// whole buffer, while any write simply recomputes on the next read.
+/// Reader-side memo for one builder: ASCII-ness, UTF-16 length and a cursor,
+/// keyed by the builder's cell and buffer identity. Every mutating builtin and
+/// every construction invalidates it, so a read-only phase costs O(1) per read
+/// instead of re-encoding the whole buffer.
 const SbMemo = struct {
     cell: usize = 0,
     ptr: [*]const u8 = undefined,
@@ -170,9 +143,6 @@ fn sbMemoFor(sb: anytype, items: []const u8) *SbMemo {
     return &sb_memo;
 }
 
-/// The UTF-16 unit at index `idx` of a non-ASCII buffer, resuming from the
-/// memo's cursor when it is at or before the target and leaving the cursor
-/// on the character found, so a sequential read stays linear.
 fn sbUnitAt(m: *SbMemo, s: []const u8, idx: usize) ?u16 {
     var n: usize = 0;
     var i: usize = 0;
@@ -227,27 +197,20 @@ fn charCount(s: []const u8) usize {
     return n;
 }
 
-/// Decode `s` to UTF-16 code units (WTF-8 lone surrogates kept as their unit).
-/// Caller owns the result.
 fn bufUnits(a: Allocator, s: []const u8) Allocator.Error![]u16 {
     return encodeUtf16(a, s);
 }
 
-/// Re-encode UTF-16 `units` to a WTF-8 byte buffer (surrogate pairs coalesced
-/// into astral scalars, lone surrogates kept as WTF-8) and install it as the
-/// builder's contents.
 fn setBufUnits(buf: *Buffer, a: Allocator, units: []const u16) Allocator.Error!void {
     const bytes = try runtime.charUnitsToString(a, units);
     defer a.free(bytes);
     try setBuf(buf, a, bytes);
 }
 
-/// Render `v` the way Kotlin's `toString` / templates do. Caller owns it.
 fn displayValue(allocator: Allocator, v: Value) Allocator.Error![]u8 {
     return v.display(allocator);
 }
 
-/// Append `v` to a UTF-8 buffer.
 fn appendValue(buf: *Buffer, allocator: Allocator, v: Value) Allocator.Error!void {
     switch (v) {
         .Null => try buf.appendSlice(allocator, "null"),
@@ -269,9 +232,6 @@ fn appendValue(buf: *Buffer, allocator: Allocator, v: Value) Allocator.Error!voi
     }
 }
 
-/// Whether an instance's class directly declares `CharSequence` among its
-/// supertypes — the shapes whose `length` the append/insert overflow guard
-/// consults before materialising any content.
 fn instanceIsCharSequence(v: *const Value) bool {
     if (v.* != .Instance) return false;
     const g = v.Instance.borrow();
@@ -284,12 +244,10 @@ fn instanceIsCharSequence(v: *const Value) bool {
     return false;
 }
 
-/// Guard an append/insert of `v` onto `sb`: when the argument's length is
-/// knowable up front (strings, builders, user CharSequences via their
-/// `length` property) and the combined UTF-16 length exceeds
-/// `Int.MAX_VALUE`, throw OutOfMemoryError BEFORE materialising anything —
-/// the JVM builder grows capacity first, so an overflowing CharSequence's
-/// chars are never read.
+/// Guard an append or insert: when the argument's length is knowable up front
+/// and the combined UTF-16 length exceeds `Int.MAX_VALUE`, throw OutOfMemoryError
+/// before materialising anything, as the JVM builder grows capacity first and
+/// never reads the overflowing CharSequence's chars.
 fn appendOverflowGuard(ctx: *CallCtx, sb: StringBuilderRef, v: *const Value) Allocator.Error!?EvalResult {
     const add: i64 = switch (v.*) {
         .String => |s| blk: {
@@ -324,12 +282,8 @@ fn appendOverflowGuard(ctx: *CallCtx, sb: StringBuilderRef, v: *const Value) All
     return null;
 }
 
-/// The text `append(value)` / `insert(_, value)` writes for `value`. Owned by
-/// the caller. Unlike `appendValue` this renders a `StringBuilder` as its
-/// content, a `CharArray` as its characters, and any other object via its
-/// `toString()` (run through the host) — matching `append(CharSequence)` /
-/// `append(CharArray)` / `append(Any?)`. Rendered before the receiver buffer
-/// is borrowed so a user `toString()` can run without holding that borrow.
+/// The text `append(value)` and `insert(_, value)` write. Rendered before the
+/// receiver buffer is borrowed, so a user `toString()` runs without that borrow.
 fn renderPiece(ctx: *CallCtx, v: Value) Allocator.Error![]u8 {
     const a = ctx.allocator;
     switch (v) {
@@ -366,10 +320,8 @@ fn renderPiece(ctx: *CallCtx, v: Value) Allocator.Error![]u8 {
                 return buf.toOwnedSlice(a);
             }
         },
-        // `append(Any?)` calls the value's `toString()` — a user override on an
-        // instance, and a container's own rendering, which is what makes its
-        // ELEMENTS' overrides fire (the structural renderer prints
-        // `ClassName@id` for a user element).
+        // `append(Any?)` calls the value's `toString()`, so a user override and a
+        // container's own rendering fire.
         .Instance, .List, .Set, .Map, .Pair, .Triple, .Result => {
             if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |res| {
                 switch (res) {
@@ -387,8 +339,6 @@ fn renderPiece(ctx: *CallCtx, v: Value) Allocator.Error![]u8 {
     return displayValue(a, v);
 }
 
-/// The UTF-16 units of a `CharArray` / `CharSequence` / `Char` argument, for
-/// the range ops. Caller owns the result; `null` if `v` is not such a value.
 fn valueToUtf16(allocator: Allocator, v: Value) Allocator.Error!?[]u16 {
     switch (v) {
         .String => |s| {
@@ -429,21 +379,14 @@ fn rangeOob(allocator: Allocator, msg: []const u8) Allocator.Error!RuntimeError 
 }
 
 
-// ============================================================
-// Constructors
-// ============================================================
-
-/// `String()` / `String(chars: CharArray)` / `String(chars, offset, length)`
-/// / `String(other: CharSequence)`. klio registers `String` as a host ctor so
-/// these shapes don't hit a 0-arg-only declaration.
 pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) {
         return ok(.{ .String = try runtime.strInitOwned(a, try a.dupe(u8, "")) });
     }
     switch (ctx.args[0]) {
-        // CharArray is a Value.Array, but some producers (e.g. toCharArray)
-        // yield a Value.List of chars — accept either.
+        // CharArray is a Value.Array, but `toCharArray` yields a Value.List of
+        // chars, so accept either.
         .Array, .List => {
             const prim_is_byte: bool = switch (ctx.args[0]) {
                 .Array => |arr| if (arr.primKind()) |p| (p == .Byte or p == .UByte) else false,
@@ -466,9 +409,6 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                 const off = ctx.args[1].asI64() orelse 0;
                 const cnt = ctx.args[2].asI64() orelse 0;
                 const size: i64 = @intCast(elems.len);
-                // `String(chars, offset, count)` throws when offset or count
-                // is negative or the slice runs past the array end (JVM's
-                // StringIndexOutOfBoundsException, an IndexOutOfBoundsException).
                 if (off < 0 or cnt < 0 or off > size - cnt) {
                     const msg = try std.fmt.allocPrint(a, "offset {d}, count {d}, size {d}", .{ off, cnt, size });
                     defer if (runtime.freeScratch()) a.free(msg);
@@ -479,12 +419,9 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
             }
             const end = @min(start +| count, elems.len);
 
-            // `String(ByteArray[, offset, length][, charset])` decodes
-            // bytes as UTF-8; `String(CharArray[, offset, count])` builds
-            // from UTF-16 code units. `byteArrayOf` tags its array
-            // `prim = Byte` even though the literal elements arrive as
-            // `Int`, so key off the array kind (with an element-kind
-            // fallback) rather than reading every slot as a NUL char.
+            // `byteArrayOf` tags its array `prim = Byte` though its literal
+            // elements arrive as `Int`, so dispatch keys off the array kind,
+            // with an element-kind fallback.
             const first_is_byte = elems.len > start and (elems[start] == .Byte or elems[start] == .UByte);
             const is_bytes = prim_is_byte or first_is_byte;
             if (is_bytes) {
@@ -533,8 +470,6 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
 }
 
-/// `String::from_utf8_lossy` — decode UTF-8, replacing each invalid byte
-/// sequence with U+FFFD. Caller owns the result.
 fn utf8Lossy(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     if (std.unicode.utf8ValidateSlice(bytes)) {
         return allocator.dupe(u8, bytes);
@@ -575,7 +510,6 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
     var buf: Buffer = .empty;
     errdefer buf.deinit(a);
     if (ctx.args.len == 0) {
-        // empty buffer
     } else if (ctx.args.len == 1) {
         switch (ctx.args[0]) {
             .String => |s| {
@@ -592,8 +526,6 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                 }
                 try buf.ensureTotalCapacityPrecise(a, @intCast(n));
             },
-            // `StringBuilder(content: CharSequence)` — seed from another
-            // builder's current contents.
             .StringBuilder => |sb| {
                 const g = sb.borrow();
                 defer g.deinit();
@@ -613,12 +545,6 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .StringBuilder = ref });
 }
 
-// ============================================================
-// Range ops (UTF-16 unit based)
-// ============================================================
-
-/// `StringBuilder.setRange(startIndex, endIndex, value: String)` — replace
-/// the UTF-16 units in `[startIndex, endIndex)` with `value`.
 pub fn string_builder_set_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.setRange"));
@@ -634,8 +560,8 @@ pub fn string_builder_set_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const units = try encodeUtf16(a, buf.items);
     defer a.free(units);
     const len: i64 = @intCast(units.len);
-    // Throw only for start < 0, start > length, or start > endIndex; an
-    // endIndex past the length is clamped (Kotlin/JVM semantics).
+    // Throws only for start < 0, start > length or start > endIndex; an endIndex
+    // past the length is clamped.
     if (start < 0 or start > len or start > end) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start, end, len });
         defer if (runtime.freeScratch()) a.free(msg);
@@ -650,8 +576,6 @@ pub fn string_builder_set_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     return okSb(sb);
 }
 
-/// `Vec::splice(start..end, value)` — replace `units[start..end]` with
-/// `value`. Caller owns the result.
 fn spliceUnits(allocator: Allocator, units: []const u16, start: usize, end: usize, value: []const u16) Allocator.Error![]u16 {
     const head = units[0..start];
     const tail = units[end..];
@@ -662,15 +586,11 @@ fn spliceUnits(allocator: Allocator, units: []const u16, start: usize, end: usiz
     return out;
 }
 
-/// `StringBuilder.appendRange(value, startIndex, endIndex)` — append
-/// `value[startIndex, endIndex)` (CharArray or CharSequence).
 pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.appendRange"));
-    // A `String` value appends its byte range directly: the range's bytes
-    // come from the string's own UTF-16 cursor, and the builder's buffer is
-    // never re-encoded (an escaper appending run after run of a long text
-    // was quadratic in both).
+    // A `String` appends its byte range directly, through the string's own UTF-16
+    // cursor, so run-after-run appends stay linear.
     if (ctx.args.len > 1 and ctx.args[1] == .String) {
         const g = ctx.args[1].String.borrow();
         defer g.deinit();
@@ -715,8 +635,6 @@ pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     return okSb(sb);
 }
 
-/// `StringBuilder.insertRange(index, value, startIndex, endIndex)` — insert
-/// `value[startIndex, endIndex)` at `index`.
 pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.insertRange"));
@@ -753,22 +671,14 @@ pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     return okSb(sb);
 }
 
-// ============================================================
-// Append / set / length / get
-// ============================================================
-
 pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
-    // `append(value: CharSequence?/CharArray, startIndex: Int, endIndex: Int)`
-    // is the subrange overload — it appends `value[startIndex, endIndex)`, not
-    // the three arguments separately. Detect it (a CharSequence/CharArray
-    // value followed by two Ints) and route to the range append; everything
-    // else is the single-value `append`.
+    // `append(value, startIndex, endIndex)` is the subrange overload: it appends
+    // `value[startIndex, endIndex)`, not the three arguments separately.
     if (ctx.args.len == 4 and isCharSeqOrArray(ctx.args[1]) and
         ctx.args[2].asI64() != null and ctx.args[3].asI64() != null)
     {
         // `append(str: CharArray, offset, len)` is a deprecated stub that always
-        // throws (KT-15220); the real CharArray subrange is `appendRange`. Only
-        // the `CharSequence` subrange overload appends `value[start, end)`.
+        // throws (KT-15220); the real CharArray subrange is `appendRange`.
         if (ctx.args[1] == .Array) {
             return thrown(ctx.allocator, "kotlin.NotImplementedError", "An operation is not implemented.");
         }
@@ -776,8 +686,6 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.append"));
-    // Render each argument before borrowing the buffer: a user `toString()`
-    // must not run while the receiver buffer is held mutably.
     for (ctx.args[1..]) |v| {
         if (try appendOverflowGuard(ctx, sb, &v)) |oom| return oom;
         const piece = try renderPiece(ctx, v);
@@ -796,8 +704,6 @@ fn isCharSeqOrArray(v: Value) bool {
     };
 }
 
-/// `StringBuilder.set(index, value: Char)` (`sb[i] = c`) — replace the
-/// UTF-16 unit at `index`, in place.
 pub fn string_builder_set(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.set"));
@@ -850,8 +756,6 @@ pub fn string_builder_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@intCast(sbMemoFor(sb, g.get().items).u16_len)));
 }
 
-/// `StringBuilder.capacity()` — the backing buffer's current capacity (always
-/// >= length). `StringBuilder(n)` reserves exactly `n`.
 pub fn string_builder_capacity(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.capacity"));
     const g = sb.borrow();
@@ -859,9 +763,6 @@ pub fn string_builder_capacity(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@intCast(g.get().capacity)));
 }
 
-/// `StringBuilder.ensureCapacity(minimumCapacity)` — grow the backing buffer so
-/// its capacity is at least `minimumCapacity`; a non-positive argument is
-/// ignored (matching the JVM contract).
 pub fn string_builder_ensure_capacity(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.ensureCapacity"));
     if (ctx.args.len >= 2) {
@@ -876,8 +777,6 @@ pub fn string_builder_ensure_capacity(ctx: *CallCtx) Allocator.Error!EvalResult 
     return ok(.Unit);
 }
 
-/// `StringBuilder.trimToSize()` — a capacity hint with no observable effect
-/// on the contents (klio's buffer has no separate capacity to shrink).
 pub fn string_builder_trim_to_size(ctx: *CallCtx) Allocator.Error!EvalResult {
     _ = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.trimToSize"));
     return ok(.Unit);
@@ -896,9 +795,8 @@ pub fn string_builder_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.toString"));
     const g = sb.borrow();
     defer g.deinit();
-    // Coalesce any WTF-8 surrogate pairs accumulated from individual `Char`
-    // appends into astral scalars, so the result is canonical UTF-8 (a builder
-    // fed a high+low pair equals the astral string literal).
+    // Coalesce WTF-8 surrogate pairs from individual `Char` appends into astral
+    // scalars, so a builder fed a high plus low pair equals the astral literal.
     const dup = try runtime.coalesceSurrogates(a, g.get().items);
     return ok(.{ .String = try runtime.strInitOwned(a, dup) });
 }
@@ -951,10 +849,6 @@ pub fn string_builder_clear(ctx: *CallCtx) Allocator.Error!EvalResult {
     return okSb(sb);
 }
 
-// ============================================================
-// Char-index ops (Kotlin `char` based)
-// ============================================================
-
 pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.insert"));
@@ -972,8 +866,8 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
-    // Splice in UTF-16-unit space so the insert index matches Kotlin even when
-    // the buffer (or piece) contains astral chars / lone surrogates.
+    // Splice in UTF-16-unit space so the insert index matches Kotlin even with
+    // astral chars or lone surrogates in the buffer.
     const units = try bufUnits(a, buf.items);
     defer a.free(units);
     const n: i64 = @intCast(units.len);
@@ -1034,8 +928,8 @@ pub fn string_builder_delete_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const units = try bufUnits(a, buf.items);
     defer a.free(units);
     const n: i64 = @intCast(units.len);
-    // Kotlin throws only for startIndex < 0, > length, or > endIndex; an
-    // endIndex past the length is clamped (deletes through the end).
+    // Kotlin throws only for startIndex < 0, > length or > endIndex; an endIndex
+    // past the length deletes through the end.
     if (start.? < 0 or start.? > n or start.? > end.?) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start.?, end.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
@@ -1088,7 +982,6 @@ pub fn string_builder_reverse(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
-    // Reverse by Kotlin `char` (UTF-8 scalar), mirroring `chars().rev()`.
     var rev: std.ArrayList(u8) = .empty;
     defer rev.deinit(a);
     var view = std.unicode.Utf8View.initUnchecked(buf.items);
@@ -1103,8 +996,6 @@ pub fn string_builder_reverse(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.substring"));
-    // `subSequence(range: IntRange)` — a single range argument whose `first`
-    // and `last + 1` are the substring bounds.
     const is_range = ctx.args.len == 2 and ctx.args[1] == .Range;
     const start = if (is_range)
         @as(?i64, ctx.args[1].Range.start)
@@ -1165,16 +1056,12 @@ pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.Unit);
 }
 
-/// `replace(startIndex, endIndex, newString)` — splice `newString` over the
-/// `[start, end)` char range. Returns the builder (Kotlin/JVM semantics).
 pub fn string_builder_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.replace"));
-    // The CharSequence `replace(oldValue, newValue[, ignoreCase])` and
-    // `replace(regex, replacement/transform)` extensions share this name with the
-    // Java `replace(start: Int, end: Int, str)` range mutator; a non-integer
-    // second argument is one of the extensions — snapshot the receiver as a
-    // String and route it to the String intrinsic.
+    // The CharSequence `replace(oldValue, newValue)` extensions share this name
+    // with the Java `replace(start: Int, end: Int, str)` range mutator, so a
+    // non-integer second argument routes to the String intrinsic.
     if (ctx.args.len > 1 and !ctx.args[1].isIntegral()) {
         const str_val: Value = blk: {
             const sg = sb.borrow();
@@ -1236,10 +1123,6 @@ pub fn string_builder_last_index(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(n - 1));
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 const testing = std.testing;
 
 fn newSb(a: Allocator, seed: []const u8) Allocator.Error!Value {
@@ -1250,10 +1133,8 @@ fn newSb(a: Allocator, seed: []const u8) Allocator.Error!Value {
     return .{ .StringBuilder = ref };
 }
 
-/// Free a produced value and its backing heap. Under reclaim the `StringRef`
-/// cell owns its `[]const u8` and frees it on `deinit`, so dropping the cell
-/// is enough; under the arena fast path `deinit` is a no-op and the arena
-/// reclaims the bytes wholesale.
+/// Free a produced value and its heap: under reclaim the `StringRef` cell frees
+/// its bytes on `deinit`; under the arena the arena reclaims them.
 fn freeSb(v: Value, a: Allocator) void {
     _ = a;
     switch (v) {

@@ -1,6 +1,5 @@
-//! Comparison intrinsics: `compareValues`, `compareValuesBy`, the
-//! `Comparator { … }` SAM factory, `compareBy` / `compareByDescending`,
-//! and the `naturalOrder` / `reverseOrder` comparator factories.
+//! Comparison intrinsics: `compareValues`, `compareValuesBy`, the `Comparator`
+//! SAM factory, `compareBy` and the `naturalOrder` comparator factories.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -13,14 +12,13 @@ const ComparatorStep = runtime.ComparatorStep;
 const ObjRef = runtime.ObjRef;
 const text = @import("../text.zig");
 
-/// `Result<Ordering, RuntimeError>` for the value-level comparison helper.
 const CmpResult = union(enum) {
     ord: std.math.Order,
     err: RuntimeError,
 };
 
-/// Total order over IEEE-754 doubles matching Kotlin's `Double.compareTo`:
-/// `-0.0 < 0.0` and every `NaN` sorts above `+Infinity`.
+/// Total order over doubles matching Kotlin's `Double.compareTo`: `-0.0 < 0.0`
+/// and every NaN sorts above `+Infinity`.
 fn kotlinFloatTotalCmp(a: f64, b: f64) std.math.Order {
     if (a < b) return .lt;
     if (a > b) return .gt;
@@ -33,10 +31,8 @@ fn kotlinFloatTotalCmp(a: f64, b: f64) std.math.Order {
     return std.math.order(bits.of(a), bits.of(b));
 }
 
-/// Compare two values by Kotlin's natural ordering. Numerics compare by
-/// widened value (integral via `i64`, floating via the IEEE total order);
-/// strings via UTF-16 code units; chars and booleans by their ordinal.
-/// Any other pairing is not comparable.
+/// Kotlin's natural ordering: numerics by widened value, strings by UTF-16 code
+/// unit, chars and booleans by ordinal. Any other pairing is not comparable.
 fn compareValuesPure(a: *const Value, b: *const Value) CmpResult {
     if (a.isNumeric() and b.isNumeric()) {
         if (a.isIntegral() and b.isIntegral()) {
@@ -66,10 +62,8 @@ fn compareValuesPure(a: *const Value, b: *const Value) CmpResult {
             .Bool => |y| .{ .ord = std.math.order(@intFromBool(x), @intFromBool(y)) },
             else => notComparable(a, b),
         },
-        // Enum entries carry Kotlin's natural ordering as their declaration
-        // ordinal, so `compareValues(SUNDAY, SATURDAY)` orders them instead of
-        // refusing. Restricted to two entries of the SAME enum class: entries
-        // of different enums have no common ordering.
+        // Enum entries order by declaration ordinal, but only within one enum
+        // class: entries of different enums have no common ordering.
         .Instance => |x| switch (b.*) {
             .Instance => |y| blk: {
                 const gx = x.borrow();
@@ -94,11 +88,8 @@ fn compareValuesPure(a: *const Value, b: *const Value) CmpResult {
     };
 }
 
-/// Kotlin's natural ordering reaches any class that implements
-/// `Comparable`, not just the builtins: `sortedBy { it.instant }` and
-/// `compareValues(a, b)` on a library value type must dispatch its own
-/// `compareTo`. Tried only after the builtin table declines, so the common
-/// numeric/string path stays allocation- and dispatch-free.
+/// Kotlin's natural ordering reaches any `Comparable`, so a library value type
+/// dispatches its own `compareTo`. Tried only after the builtin table declines.
 fn compareViaCompareTo(
     ctx: *CallCtx,
     a: *const Value,
@@ -140,19 +131,12 @@ fn isNull(v: Value) bool {
     return v == .Null;
 }
 
-/// Anything Kotlin can invoke as a key selector. A selector is very often a
-/// property REFERENCE rather than a lambda — `compareValuesBy(a, b,
-/// TestDispatchEvent::time, TestDispatchEvent::count)` is how the test
-/// scheduler orders its event heap — and a `KProperty1<T, R>` is a `(T) -> R`.
-/// Accepting only `IrClosure` rejected every reference form, though
-/// `invokeCallable` dispatches all of them (`map(E::time)` has always worked).
-/// Mirrors `interp_ir.valueIsCallable`, which the stdlib layer cannot import.
+/// Anything Kotlin can invoke as a key selector, often a property reference
+/// rather than a lambda, since a `KProperty1<T, R>` is a `(T) -> R`. Mirrors
+/// `interp_ir.valueIsCallable`, which the stdlib layer cannot import.
 fn isCallable(v: Value) bool {
     return switch (v) {
         .IrClosure, .Intrinsic, .BoundMethod, .PropertyRef => true,
-        // `E::time` — an UNBOUND property reference — lowers to a synth instance
-        // carrying `__bound_receiver__` (the owning class). It is the `KProperty1`
-        // Kotlin passes as a `(T) -> R`, and `invokeCallable` dispatches it.
         .Instance => |inst| blk: {
             const g = inst.borrow();
             defer g.deinit();
@@ -230,16 +214,11 @@ pub fn cmp_compare_by_descending(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
     return makeComparator(ctx, true);
 }
 
-/// Build a `Comparator` whose steps are each argument used as a key
-/// selector, tagged with the shared per-step `descending` flag. The
-/// comparator-level `descending` stays `false`; reversal is per step.
+/// Build a `Comparator` whose steps are each argument used as a key selector;
+/// reversal is per step, so the comparator-level flag stays false.
 fn makeComparator(ctx: *CallCtx, descending: bool) std.mem.Allocator.Error!EvalResult {
-    // `compareBy(comparator, selector)` vs the vararg `compareBy(s1, s2)`:
-    // both take two args, distinguished by arg[0] — a comparator value
-    // (`.Comparator`, or a non-callable comparator like
-    // `String.CASE_INSENSITIVE_ORDER`) vs a selector (a callable). Only the
-    // comparator form gets a per-step key comparator; the selector form falls
-    // through to the multi-selector loop below.
+    // `compareBy(comparator, selector)` and the vararg `compareBy(s1, s2)` both
+    // take two args, distinguished by arg[0] being a comparator or a callable.
     if (ctx.args.len == 2 and isCallable(ctx.args[1]) and
         (ctx.args[0] == .Comparator or !isCallable(ctx.args[0])))
     {
@@ -279,13 +258,6 @@ pub fn cmp_compare_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = Value.newInt(n) };
 }
 
-// ============================================================
-// Comparator factories
-// ============================================================
-
-/// `naturalOrder()` — an empty-step `Comparator`. The interpreter's sort
-/// path treats an empty-step comparator as "compare items directly via the
-/// natural order".
 pub fn comparator_natural_order(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const steps = try ctx.allocator.alloc(ComparatorStep, 0);
     return .{ .ok = try Value.newComparator(ctx.allocator, .{
@@ -294,7 +266,6 @@ pub fn comparator_natural_order(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
     }) };
 }
 
-/// `reverseOrder()` — an empty-step `Comparator` flagged `descending`.
 pub fn comparator_reverse_order(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const steps = try ctx.allocator.alloc(ComparatorStep, 0);
     return .{ .ok = try Value.newComparator(ctx.allocator, .{
@@ -303,14 +274,8 @@ pub fn comparator_reverse_order(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
     }) };
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
-
 const testing = std.testing;
 
-/// A stand-in closure value for the tests below: the id is what the selector
-/// and comparator paths read, and a real cell is what carries it.
 fn testClosure(id: u64) Value {
     const c = runtime.IrClosureRef.init(testing.allocator, .{ .id = id, .captures = &.{} }) catch unreachable;
     return .{ .IrClosure = c };
@@ -330,11 +295,7 @@ fn makeCtx(host: runtime.IntrinsicHost, out: runtime.Output, args: []const Value
     };
 }
 
-/// Test host whose `invokeCallable` echoes a value chosen by a key
-/// function over the single supplied argument. Used to drive the
-/// selector-invoking `compareValuesBy` path without a real interpreter.
 const SelectorHost = struct {
-    /// Maps an input arg to the key the selector "returns".
     keyFn: *const fn (arg: Value) Value,
 
     fn init(allocator: std.mem.Allocator, keyFn: *const fn (arg: Value) Value) SelectorHost {

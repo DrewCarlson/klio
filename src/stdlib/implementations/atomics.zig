@@ -1,19 +1,11 @@
 //! `kotlin.concurrent.atomics` read-modify-write bindings.
 //!
-//! KLIO runs real worker threads, so a composite atomic operation
-//! (`compareAndSet`, `exchange`, `fetchAndAdd`, `addAndFetch`,
-//! `compareAndExchange`) must observe its read, compute, and write-back as one
-//! step. Each runs under a single exclusive borrow of the receiver's cell — the
-//! same per-object writer lock `kotlinx.atomicfu` and `kotlin.synchronized`
-//! use — so concurrent workers never interleave within an operation. `load` and
-//! `store` stay as the class's plain field access: a single field read/write is
-//! already atomic under the cell lock.
-//!
-//! The class shapes (the `value` cell and the `array` backing) come from the
-//! klio-authored `actual` declarations (kotlin-klio/kotlin-concurrent/); these
-//! bindings shadow the source method bodies at dispatch time. The inline
-//! `update` extension family splices into callers and cannot be shadowed here,
-//! so those actuals are compare-and-set loops built on the bound CAS.
+//! Real worker threads run Kotlin code, so a composite atomic operation observes
+//! its read, compute and write-back as one step, under a single exclusive borrow
+//! of the receiver's cell: the same per-object writer lock `kotlinx.atomicfu` and
+//! `kotlin.synchronized` use. `load` and `store` stay plain field access, already
+//! atomic under that lock. These bindings shadow the klio-authored `actual`
+//! method bodies; the inline `update` family splices into callers instead.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -39,19 +31,14 @@ fn asI64(v: Value) ?i64 {
     };
 }
 
-/// Widen an `Int` operand to `Long` when the cell it targets holds a `Long`.
-/// `AtomicLong`'s `expectedValue`/`newValue` are `Long`, but a bare integer
-/// literal (`compareAndSet(0, 1)`) reaches this native binding still tagged
-/// `Int`; matching the cell's type keeps comparison and write-back on `Long`.
+/// Widen an `Int` operand to `Long` when the target cell holds a `Long`: a bare
+/// integer literal reaches this binding still tagged `Int`.
 fn matchCell(cell: Value, operand: Value) Value {
     if (cell == .Long and operand == .Int) return .{ .Long = @as(i64, operand.Int) };
     return operand;
 }
-
-/// Compare an atomic's current value against the caller's expected value.
-/// `AtomicReference` (and the reference `AtomicArray`) compare by reference
-/// identity; primitive cells (`AtomicInt`/`AtomicLong`/`AtomicBoolean`)
-/// compare by value, reconciling an `Int` literal against a `Long` cell.
+/// `AtomicReference` compares by reference identity, a primitive cell by value,
+/// reconciling an `Int` literal against a `Long` cell.
 fn atomicEq(cur: Value, expected: Value) bool {
     if (cur.isNumeric() or cur == .Bool or cur == .Char) {
         const e = matchCell(cur, expected);
@@ -59,10 +46,6 @@ fn atomicEq(cur: Value, expected: Value) bool {
     }
     return Value.referenceEq(&cur, &expected);
 }
-
-// -------------------------------------------------------------------------
-// Scalar cells (`value` field).
-// -------------------------------------------------------------------------
 
 const ScalarStep = struct { next: Value, out: Value };
 
@@ -79,8 +62,6 @@ fn withValueMut(
     defer g.deinit();
     const cur = g.get().get("value") orelse return typeErr("atomic receiver missing `value`");
     const step = f(fctx, cur);
-    // `out` escapes to the caller and `next` is stored; both need a reference
-    // independent of the cell's. `cur` was borrowed from the cell.
     if (runtime.reclaimEnabled()) {
         step.out.retain();
         step.next.retain();
@@ -157,10 +138,6 @@ pub fn addAndFetch(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return withValueMut(ctx, i64, delta, step);
 }
 
-// -------------------------------------------------------------------------
-// Array cells (`array` field over an `ArrayData`).
-// -------------------------------------------------------------------------
-
 const ArrayStep = struct { next: Value, out: Value };
 
 fn throwAtomicIoob(ctx: *CallCtx, idx: i64, len: usize) std.mem.Allocator.Error!EvalResult {
@@ -183,14 +160,12 @@ fn withArrayElemMut(
         return typeErr("atomic array op requires a receiver + index");
     }
     const idx = asI64(ctx.args[1]) orelse return typeErr("atomic array index must be Int");
-    // Hold the receiver's writer lock across the element read-modify-write so
-    // the backing array cannot be observed mid-operation.
     const g = ctx.args[0].Instance.borrowMut();
     defer g.deinit();
     const arr_v = g.get().get("array") orelse return typeErr("atomic array missing `array`");
     if (arr_v != .Array) return typeErr("atomic array backing is not an array");
     const arr = arr_v.Array;
-    // A catchable IndexOutOfBoundsException (not an interpreter `.Type` error).
+    // A catchable IndexOutOfBoundsException, not an interpreter `.Type` error.
     if (idx < 0 or idx >= arr.len()) return throwAtomicIoob(ctx, idx, arr.len());
     const cur = arr.get(@intCast(idx));
     const step = f(fctx, cur);

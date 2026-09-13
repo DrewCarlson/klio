@@ -1,7 +1,5 @@
 //! Exception / Throwable stdlib intrinsics.
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. For member access the
-//! receiver is `args[0]`, with any further user arguments following.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -22,29 +20,17 @@ fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
 
-// ============================================================
-// Exceptions
-// ============================================================
-
-/// Build a `Value.Exception` for `fqn` with an optional message. The `fqn`
-/// and (when present) `message` slices are copied into fresh refcounted
-/// handles allocated from `allocator`. Re-exported for sibling intrinsic
-/// modules.
 pub fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]const u8) std.mem.Allocator.Error!Value {
     return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, fqn),
         .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
-        // A shared suppressed list so `addSuppressed` (e.g. from `use`'s
-        // close-while-failing path) records onto this throwable.
         .suppressed = (try ValueList.init(allocator, .empty)).cell,
     });
 }
 
-/// Throwable accepts up to two arguments:
-///   (), (message), (cause), (message, cause).
-/// A single Throwable-typed argument is treated as `cause`; anything else
-/// becomes `message`.
+/// Throwable accepts `()`, `(message)`, `(cause)` or `(message, cause)`: a
+/// single Throwable-typed argument is a cause, anything else a message.
 pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!EvalResult {
     var message: ?StringRef = null;
     var cause: ?ValueBox = null;
@@ -57,9 +43,8 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
             message = try messageOf(ctx.allocator, v);
             switch (c.*) {
                 .Null => cause = null,
-                // A builtin exception is `Value.Exception`; a user / pack
-                // exception subclass is a `Value.Instance` of a
-                // Throwable-derived class. Both are valid causes.
+                // A builtin exception is a `Value.Exception` and a user or pack
+                // subclass a `Value.Instance`; both are valid causes.
                 .Exception, .Instance => {
                     c.retain();
                     cause = try Value.boxRef(ctx.allocator, c.*);
@@ -74,7 +59,6 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
             }
         } else {
             if (v.* == .Exception or v.* == .Instance) {
-                // `Throwable(cause)`: the message is the cause's rendering.
                 v.retain();
                 cause = try Value.boxRef(ctx.allocator, v.*);
                 message = try messageOf(ctx.allocator, v);
@@ -89,14 +73,10 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
         .message = .from(message),
         .cause = if (cause) |c| c.cell else null,
         .identity = ctx.host.allocInstanceId(),
-        // A shared list so `addSuppressed` on any value-copy is observed by
-        // `suppressedExceptions` on every other copy of this throwable.
         .suppressed = (try ValueList.init(ctx.allocator, .empty)).cell,
     }));
 }
 
-/// `Value::Null => None`, `Value::String(s) => Some(text)`,
-/// `other => Some(format!("{other}"))` — rendered into a fresh handle.
 fn messageOf(allocator: std.mem.Allocator, v: *const Value) std.mem.Allocator.Error!?StringRef {
     return switch (v.*) {
         .Null => null,
@@ -107,9 +87,7 @@ fn messageOf(allocator: std.mem.Allocator, v: *const Value) std.mem.Allocator.Er
     };
 }
 
-/// Free a message handle built by `messageOf`. The cell owns its bytes and
-/// frees them on the last `deinit`. Used on the error path that discards a
-/// half-built exception.
+/// Free a message handle on the error path that discards a half-built exception.
 fn freeMessage(allocator: std.mem.Allocator, m: StringRef) void {
     _ = allocator;
     m.deinit();
@@ -157,8 +135,8 @@ pub fn excn_uninitialized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn excn_cancellation(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const fqn = "kotlin.coroutines.cancellation.CancellationException";
-    // `CancellationException(cause)` — a single Throwable argument — defaults
-    // its message to cause.toString(); the generic builder leaves it null.
+    // `CancellationException(cause)` defaults its message to `cause.toString()`,
+    // where the generic builder leaves it null.
     if (ctx.args.len == 1 and (ctx.args[0] == .Exception or ctx.args[0] == .Instance)) {
         const cause = ctx.args[0];
         var message: ?StringRef = null;
@@ -213,9 +191,8 @@ pub fn throwable_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
-/// `Throwable.addSuppressed(other)` — append to the receiver's shared
-/// suppressed list (built at construction). A throwable created outside the
-/// constructor path has no list, so the call is a no-op there.
+/// Append to the receiver's shared suppressed list, built at construction; a
+/// throwable created outside the constructor path has no list, so this no-ops.
 pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len >= 2 and ctx.args[0] == .Exception) {
         if (ctx.args[0].Exception.suppressed) |sl_cell| {
@@ -226,10 +203,9 @@ pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
             try g.get().append(ctx.allocator, ctx.args[1]);
         }
     }
-    // A USER throwable is an interpreted Instance; its suppressed set is
-    // the hidden `__suppressed__` list the member arms also maintain. The
-    // statically bound header call lands here directly, so the Instance
-    // shape must be served, not silently dropped.
+    // A user throwable is an interpreted Instance whose suppressed set is the
+    // hidden `__suppressed__` list the member arms maintain, and the statically
+    // bound header call lands here directly.
     if (ctx.args.len >= 2 and ctx.args[0] == .Instance) {
         const inst = ctx.args[0].Instance;
         const existing: ?Value = blk: {
@@ -256,8 +232,6 @@ pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
     return ok(.Unit);
 }
 
-/// `Throwable.suppressedExceptions` / `getSuppressed()` — a read-only view of
-/// the receiver's shared suppressed list (empty when none recorded).
 pub fn throwable_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len >= 1 and ctx.args[0] == .Exception) {
         if (ctx.args[0].Exception.suppressed) |sl_cell| {
@@ -298,15 +272,9 @@ fn makeList(items: ValueList, mutable: bool) std.mem.Allocator.Error!Value {
     });
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 const testing = std.testing;
 
-// A shared stateless host so the exception constructor's
-// `ctx.host.allocInstanceId()` resolves (NoopHost has no `alloc_instance_id`
-// vtable entry, so it returns 0) instead of dereferencing an undefined host.
+// A shared stateless host, so the constructor's `allocInstanceId()` resolves.
 var test_noop_host: runtime.NoopHost = .{};
 
 fn noopCtx(args: []const Value) CallCtx {
@@ -322,8 +290,6 @@ fn freeException(exc: anytype) void {
     runtime.exceptionRefOf(exc).deinit();
 }
 
-/// Drop a `makeException` result in a test: releasing the box tears down
-/// its `fqn`, optional `message`, cause, stack, and suppressed list.
 fn freeMade(v: Value) void {
     runtime.exceptionRefOf(v.Exception).deinit();
 }
@@ -391,7 +357,6 @@ test "single throwable argument is treated as the cause" {
     try testing.expect(r == .ok);
     const exc = r.ok.Exception;
     defer freeException(exc);
-    // The message is the cause's rendering, as the JVM constructor defines it.
     try testing.expect(exc.message.isSome());
     try testing.expect(exc.cause != null);
     const cause_box = ValueBox{ .cell = exc.cause.? };
@@ -441,10 +406,8 @@ test "null cause argument is accepted as no cause" {
 }
 
 test "instance cause argument is accepted" {
-    // A Throwable-derived user subclass shows up as a Value.Instance and is a
-    // valid cause; build one through the class machinery is heavyweight here,
-    // so exercise the acceptance path via the same branch using an Exception
-    // and confirm the dedicated Instance branch compiles by type.
+    // Building a Throwable-derived user subclass through the class machinery is
+    // heavyweight here, so the same acceptance branch runs with an Exception.
     const cause = try makeException(testing.allocator, "kotlin.RuntimeException", null);
     defer freeMade(cause);
     const msg = try runtime.strInit(testing.allocator, "m");
@@ -537,7 +500,6 @@ test "suppressed returns an empty list" {
     const r = try throwable_suppressed(&ctx);
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .List);
-    // The ObjRef's last `deinit` frees the inner ArrayList.
     defer runtime.listRefOf(r.ok.List).deinit();
     const g = r.ok.List.items.borrow();
     defer g.deinit();

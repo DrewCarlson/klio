@@ -1,11 +1,8 @@
 //! Native bindings for `kotlinx.io`.
 //!
-//! `Buffer`, `Source`, `Sink`, and `ByteString` are implemented as
-//! real common-side Kotlin in the pack's `shim/` source — no native
-//! state, no method-body overrides. The only `actual`s the host
-//! supplies are the platform-optimised base64 / hex codecs, declared
-//! `expect fun` on the Kotlin side. This keeps the pack faithful to
-//! upstream's "common code + thin platform actuals" structure.
+//! `Buffer`, `Source`, `Sink` and `ByteString` are real common-side Kotlin in
+//! the pack's `shim/` source. The only `actual`s the host supplies are the
+//! platform base64 and hex codecs and the `kotlinx.io.files` primitives.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -20,18 +17,12 @@ const ValueList = runtime.ValueList;
 const PrimitiveArrayKind = runtime.PrimitiveArrayKind;
 const HostBindings = stdlib.HostBindings;
 
-/// `actual` implementations of the `expect` codec extensions plus the
-/// `kotlinx.io.files` filesystem primitives.
 pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBindings {
     var b = HostBindings.init(allocator);
-    // `actual` implementations of the `expect` codec extensions.
     try b.register("kotlinx.io.encodeBase64", base64Encode);
     try b.register("kotlinx.io.decodeBase64", base64Decode);
     try b.register("kotlinx.io.encodeHex", hexEncode);
     try b.register("kotlinx.io.decodeHex", hexDecode);
-    // `kotlinx.io.files` filesystem primitives. The Kotlin actuals
-    // (klioMain/kotlinx/io/files/Actuals.kt) own the policy/exception
-    // logic; these are thin `std::fs` I/O primitives.
     try b.register("kotlinx.io.files.__kxio_readAllBytes", fsReadAllBytes);
     try b.register("kotlinx.io.files.__kxio_writeBytes", fsWriteBytes);
     try b.register("kotlinx.io.files.__kxio_exists", fsExists);
@@ -49,8 +40,6 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
-/// `Result<T, RuntimeError>` returned by the argument decoders. OOM stays
-/// a Zig error; a `RuntimeError` surfaces as data.
 fn ArgResult(comptime T: type) type {
     return union(enum) { val: T, err: EvalResult };
 }
@@ -67,7 +56,6 @@ fn argBool(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult(bool) {
     return .{ .err = try typeErr(ctx, "kotlinx.io.files: argument {d} must be a Boolean", .{idx}) };
 }
 
-/// Read the `idx`th argument as a `String`. Returns an owned copy.
 fn argString(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult([]const u8) {
     if (idx < ctx.args.len and ctx.args[idx] == .String) {
         const g = ctx.args[idx].String.borrow();
@@ -77,10 +65,9 @@ fn argString(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult([]cons
     return .{ .err = try typeErr(ctx, "kotlinx.io: argument {d} must be a String", .{idx}) };
 }
 
-// Kotlin Byte is a signed i8; raw bytes reinterpret it as u8, and an
-// Int/Long element narrows via toByte() before that reinterpret.
-//
-// The returned slice is owned by `ctx.allocator`; the caller frees it.
+// Kotlin Byte is a signed i8; raw bytes reinterpret it as u8, and an Int or Long
+// element narrows through `toByte()` first. The slice is owned by
+// `ctx.allocator`.
 fn argBytes(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult([]u8) {
     if (idx >= ctx.args.len) {
         return .{ .err = try typeErr(ctx, "kotlinx.io: argument {d} must be a String or byte array", .{idx}) };
@@ -109,7 +96,6 @@ fn argBytes(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult([]u8) {
     }
 }
 
-// A Kotlin `ByteArray` from raw bytes (u8 reinterpreted as signed Byte).
 fn bytesValue(ctx: *CallCtx, bytes: []const u8) std.mem.Allocator.Error!Value {
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
@@ -118,7 +104,6 @@ fn bytesValue(ctx: *CallCtx, bytes: []const u8) std.mem.Allocator.Error!Value {
     return try runtime.ArrayData.initPacked(ctx.allocator, .Byte, items.items);
 }
 
-// A thrown `kotlinx.io.IOException` the Kotlin `try/catch` can catch.
 fn ioError(ctx: *CallCtx, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!EvalResult {
     const msg = try std.fmt.allocPrint(ctx.allocator, fmt, args);
     return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
@@ -166,9 +151,9 @@ fn fsWriteBytes(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const cwd = std.Io.Dir.cwd();
 
     if (append) {
-        // Concatenate the existing contents with the new data, then write
-        // them back. The `std.Io` file API has no positional seek; the
-        // observable result matches `OpenOptions::append`.
+        // Concatenate the existing contents with the new data, then write back:
+        // the `std.Io` file API has no positional seek, and the observable result
+        // matches an append open.
         const existing = cwd.readFileAlloc(io, path, ctx.allocator, .unlimited) catch &[_]u8{};
         defer ctx.allocator.free(existing);
         var combined: std.ArrayList(u8) = .empty;
@@ -333,9 +318,8 @@ fn fsList(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 fn fsTempDir(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // Mirrors `std::env::temp_dir()`'s Unix default. The platform's
-    // override variable is captured at process start, which an intrinsic
-    // cannot reach here, so we report the conventional system temp root.
+    // The platform's temp-dir override variable is captured at process start,
+    // which an intrinsic cannot reach, so report the conventional system root.
     const dir: []const u8 = switch (@import("builtin").os.tag) {
         .windows => "C:\\Windows\\Temp",
         else => "/tmp",
@@ -368,7 +352,6 @@ fn base64Decode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     defer ctx.allocator.free(out);
     dec.decode(out, s) catch |e|
         return typeErr(ctx, "base64 decode: {s}", .{@errorName(e)});
-    // Raw u8 reinterpreted as Kotlin's signed Byte.
     return ok(try bytesValue(ctx, out));
 }
 
@@ -389,8 +372,6 @@ fn hexEncode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
 }
 
-// Each nibble is a 4-bit hex digit, so the packed byte fits u8; the raw
-// u8 then reinterprets as Kotlin's signed Byte.
 fn hexDecode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const s = switch (try argString(ctx, 0)) {
         .val => |str| str,
@@ -420,10 +401,6 @@ fn hexDigit(c: u8) ?u8 {
     };
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
-
 const testing = std.testing;
 
 fn testCtx(args: []const Value) CallCtx {
@@ -446,12 +423,9 @@ fn freeResult(r: EvalResult) void {
     }
 }
 
-/// Free the heap a returned `Value` owns. The intrinsics allocate from
-/// `ctx.allocator`; in production that is an arena, but the unit tests
-/// use the debug allocator and must release each allocation by hand.
+/// Free the heap a returned `Value` owns: production runs on an arena, but the
+/// unit tests use the debug allocator.
 fn freeString(s: StringRef) void {
-    // The intrinsics mint these via `initOwned`, so the cell owns its byte
-    // buffer and frees it on the final `deinit` under reclaim.
     s.deinit();
 }
 
@@ -459,15 +433,12 @@ fn freeValue(v: Value) void {
     switch (v) {
         .String => |s| freeString(s),
         .Array => |a| a.deinitStorage(),
-        // Boxed payloads: the box teardown releases elements and handles.
         .List => |l| runtime.listRefOf(l).deinit(),
         .Exception => |e| runtime.exceptionRefOf(e).deinit(),
         else => {},
     }
 }
 
-/// Absolute path of a testing tmp directory (its `Io.Dir` lives under
-/// `.zig-cache/tmp/<rand>`; the intrinsics need an absolute string path).
 fn tmpAbsPath(tmp: *testing.TmpDir, alloc: std.mem.Allocator) ![]const u8 {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(testing.io, &buf);
@@ -596,7 +567,6 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
     const path_ref = try runtime.strInit(testing.allocator, file_path);
     defer path_ref.deinit();
 
-    // write "hi"
     {
         var items: std.ArrayList(Value) = .empty;
         defer items.deinit(testing.allocator);
@@ -611,7 +581,6 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         try testing.expect(r == .ok);
     }
 
-    // exists
     {
         const args = [_]Value{.{ .String = path_ref }};
         var ctx = testCtx(&args);
@@ -620,7 +589,6 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         try testing.expect(r.ok.Bool);
     }
 
-    // read back
     {
         const args = [_]Value{.{ .String = path_ref }};
         var ctx = testCtx(&args);
@@ -632,7 +600,6 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         try testing.expectEqual(@as(i8, 'h'), items[0].Byte);
     }
 
-    // metadata: regular file, size 2
     {
         const args = [_]Value{.{ .String = path_ref }};
         var ctx = testCtx(&args);
@@ -644,7 +611,6 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         try testing.expectEqual(@as(i64, 2), items[1].Long);
     }
 
-    // list the directory finds data.bin
     {
         const dir_ref = try runtime.strInit(testing.allocator, dir_path);
         defer dir_ref.deinit();
@@ -663,7 +629,6 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         try testing.expect(found);
     }
 
-    // delete
     {
         const args = [_]Value{.{ .String = path_ref }};
         var ctx = testCtx(&args);
@@ -732,7 +697,6 @@ test "create directories reports its outcome codes" {
         defer freeResult(r);
         try testing.expectEqual(@as(i32, 0), r.ok.Int);
     }
-    // Already a directory -> 1.
     {
         const args = [_]Value{.{ .String = nested_ref }};
         var ctx = testCtx(&args);

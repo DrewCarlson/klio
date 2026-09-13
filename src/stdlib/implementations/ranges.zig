@@ -1,7 +1,5 @@
 //! Range/progression stdlib intrinsics.
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. For member access the
-//! receiver is `args[0]`, with any further user arguments following.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -22,9 +20,8 @@ fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
 
-/// The progression's element kind, derived from the operand types so a Long
-/// `downTo`/`until` yields a `.Long` range (structurally equal to the matching
-/// `..` range) rather than a default `.Int` one.
+/// The progression's element kind, from the operand types, so a Long `downTo`
+/// yields a `.Long` range structurally equal to the matching `..` range.
 fn rangeKindForArgs(a: Value, b: Value) RangeKind {
     if (a == .Long or b == .Long) return .Long;
     if (a == .ULong or b == .ULong) return .ULong;
@@ -34,13 +31,7 @@ fn rangeKindForArgs(a: Value, b: Value) RangeKind {
     return .Int;
 }
 
-// ============================================================
-// Range progressions
-// ============================================================
-
 pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // As `until`: the name is shared with library extensions on non-integral
-    // types, so a shape this builtin cannot serve declines rather than fails.
     const pair = pairIntArgs(ctx, "downTo") orelse
         return .{ .err = .{ .Unimplemented = "Vm::downTo non-integral operands" } };
     return ok(try Value.newRange(ctx.allocator, .{
@@ -52,11 +43,8 @@ pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }));
 }
 
-/// `Int.rangeTo` / `Long.rangeTo` / `Char.rangeTo` called by name
-/// (`0.rangeTo(2)`): the same value the `..` operator builds. Without a
-/// builtin the explicit call fell through to the generic
-/// `Comparable<T>.rangeTo` extension, whose `ComparableRange` has no
-/// iterator. Non-integral operands are not ours.
+/// `rangeTo` called by name builds what the `..` operator does; the generic
+/// `Comparable<T>.rangeTo` it would otherwise reach has no iterator.
 pub fn ranges_range_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const pair = pairIntArgs(ctx, "rangeTo") orelse
         return .{ .err = .{ .Unimplemented = "Vm::rangeTo non-integral operands" } };
@@ -67,20 +55,17 @@ pub fn ranges_range_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
     }));
 }
-/// `Int.rangeUntil` by name is `until`.
 pub fn ranges_range_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ranges_until(ctx);
 }
 pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // `until` is the integral range builtin, but the name is shared by user
-    // extensions (e.g. `LocalDate.until(other, unit)`). Non-integral operands
-    // are not ours: yield `Unimplemented` so dispatch falls back to the user
-    // extension rather than hard-failing with a type error.
+    // User extensions share the name `until`, so a non-integral operand yields
+    // `Unimplemented` and dispatch falls back to the extension.
     const pair = pairIntArgs(ctx, "until") orelse
         return .{ .err = .{ .Unimplemented = "Vm::until non-integral operands" } };
     const kind = rangeKindForArgs(ctx.args[0], ctx.args[1]);
     // `a until MIN_VALUE` is empty: Kotlin returns the type's EMPTY range rather
-    // than wrapping `to - 1` below MIN.
+    // than wrapping `to - 1` below the minimum.
     if (kind.untilEmpty(pair[1])) {
         const e = kind.emptyBounds();
         return ok(try Value.newRange(ctx.allocator, .{ .start = e[0], .end = e[1], .step = 1, .kind = kind }));
@@ -94,9 +79,6 @@ pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // Either range representation serves as the receiver: the host
-    // `Value.Range` and the `Value.Instance` an upstream
-    // `LongProgression.fromClosedRange` builds carry the same triple.
     if (ctx.args.len == 2 and ctx.args[1].isIntegral()) {
         if (asRangeView(&ctx.args[0])) |r| {
         const n = ctx.args[1].asI64().?;
@@ -119,25 +101,18 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }));
         }
     }
-    // Not the integral builtin's shape (a progression INSTANCE receiver, a
-    // non-integral step): decline so dispatch reaches the library extension
-    // of the same name rather than hard-failing here.
     return .{ .err = .{ .Unimplemented = "Vm::step non-integral operands" } };
 }
 
-/// Match Kotlin's `IntProgression.fromClosedRange`: the stored `end` is the
-/// last element that's actually reachable from `start` with the given
-/// `step`. For `1..10 step 2` this normalizes 10 -> 9 because 9 is the last
-/// reachable value.
+/// As Kotlin's `IntProgression.fromClosedRange`: the stored `end` is the last
+/// element reachable from `start` by `step`, so `1..10 step 2` normalizes to 9.
 pub fn normalizeProgressionEnd(start: i64, end: i64, step: i64, kind: RangeKind) i64 {
     if (step == 0) return end;
-    // Kotlin getProgressionLastElement: when `start` is already past `end` (an
-    // empty/one-element progression, unsigned for ULong), the closed-range bound
-    // stays as `last`.
+    // When `start` is already past `end`, unsigned for ULong, the closed-range
+    // bound stays as `last`.
     if (!kind.inBounds(start, end, step)) return end;
-    // The distance between the bounds can exceed `i64` (`MIN..MAX`, or ULong
-    // bounds stored as negative bit patterns), so the remainder is taken in
-    // the unsigned domain, where the wrapped difference is exact.
+    // The distance between the bounds can exceed i64, so the remainder is taken
+    // in the unsigned domain, where the wrapped difference is exact.
     if (step > 0) {
         const dist: u64 = @bitCast(end -% start);
         const st: u64 = @intCast(step);
@@ -162,7 +137,6 @@ fn pairIntArgs(ctx: *const CallCtx, what: []const u8) ?[2]i64 {
     return .{ a, b };
 }
 
-// Int narrows the endpoint; Char reinterprets it as a UTF-16 code unit.
 pub fn rangeEndpoint(kind: RangeKind, v: i64) Value {
     return switch (kind) {
         .Long => .{ .Long = v },
@@ -173,22 +147,14 @@ pub fn rangeEndpoint(kind: RangeKind, v: i64) Value {
     };
 }
 
-/// View a receiver as a range's `(start, end, step, kind)`.
-///
-/// klio represents a range two ways: the host `Value.Range`, and -- when the
-/// upstream `kotlin.ranges.{Int,Long,Char}{Range,Progression}` constructor is
-/// invoked as a class (e.g. `Array<T>.indices`'s getter does `IntRange(0,
-/// lastIndex)`) -- a generic `Value.Instance` carrying the same `first`/`last`/
-/// `step` fields. Range intrinsics accept either so an op like `reversed` works
-/// regardless of which form a range value took, without a caller having to
-/// normalize first.
+/// View a receiver as a range's `(start, end, step, kind)`. A range is either a
+/// host `Value.Range` or a `Value.Instance` carrying the same `first`, `last`
+/// and `step` fields, built when a `kotlin.ranges` constructor runs as a class.
 pub const RangeView = struct {
     start: i64,
     end: i64,
     step: i64,
     kind: RangeKind,
-    /// Mirrors `Value.Range.progression`; an `Instance`-backed view of a
-    /// `*Progression` class is always a progression.
     progression: bool = false,
 };
 
@@ -229,8 +195,6 @@ pub fn asRangeView(v: *const Value) ?RangeView {
             defer cg.deinit();
             const fqn = cg.get().fqn;
             const range_type = instanceRangeType(fqn) orelse return null;
-            // IntProgression stores first/last/step; IntRange also exposes
-            // start/endInclusive -- accept whichever the lowered fields carry.
             const start = num(data, &.{ "first", "start" }) orelse return null;
             const end = num(data, &.{ "last", "endInclusive" }) orelse return null;
             const step = num(data, &.{"step"}) orelse 1;
@@ -263,8 +227,8 @@ fn rangeViewArg(ctx: *const CallCtx, op: []const u8) ?RangeView {
 }
 
 fn rangeViewEmpty(view: RangeView) bool {
-    // Empty when `start` is already past `end` in the step direction (unsigned
-    // for ULong, so `MaxUL..MinUL` is empty rather than a wrapped range).
+    // Empty when `start` is past `end` in the step direction, compared unsigned
+    // for ULong so `MaxUL..MinUL` is empty rather than a wrapped range.
     return !view.kind.inBounds(view.start, view.end, view.step);
 }
 
@@ -276,11 +240,8 @@ fn throwNoSuchElement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }) } };
 }
 
-/// `IntProgression.first()` / `last()` (the iterable extensions, not the
-/// `start`/`endInclusive` bound properties) throw on an empty progression.
-/// The `Iterable.first()`/`last()` *functions* (a call): throw on an empty
-/// range. The `Progression.first`/`.last` property *reads* (non-throwing) are
-/// served ahead of this in the field-access path.
+/// The `Iterable.first()` and `last()` functions throw on an empty progression;
+/// the non-throwing property reads are served earlier, in the field-access path.
 pub fn range_first(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "first") orelse return typeErr("first requires a Range receiver");
     if (rangeViewEmpty(view)) return throwNoSuchElement(ctx);
@@ -293,8 +254,8 @@ pub fn range_last(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(rangeEndpoint(view.kind, view.end));
 }
 
-/// `ClosedRange.start` / `endInclusive` return the stored bound even for an
-/// empty range (unlike `first()`/`last()`).
+/// `ClosedRange.start` and `endInclusive` return the stored bound even for an
+/// empty range, unlike `first()` and `last()`.
 pub fn range_start(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "start") orelse return typeErr("start requires a Range receiver");
     return ok(rangeEndpoint(view.kind, view.start));
@@ -307,9 +268,8 @@ pub fn range_end_inclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_step_field(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "step") orelse return typeErr("step requires a Range receiver");
-    // A progression's `step` is always `Int` (Int/Char/UInt progressions) or
-    // `Long` (Long/ULong progressions) — never the element type — and keeps its
-    // sign (negative for a `downTo`).
+    // A progression's `step` is always `Int` or `Long`, never the element type,
+    // and keeps its sign, so a `downTo` step is negative.
     return ok(switch (view.kind) {
         .Long, .ULong => Value{ .Long = view.step },
         .Int, .Char, .UInt => Value.newInt(view.step),
@@ -326,10 +286,9 @@ fn rangeKindMax(kind: RangeKind) i64 {
     };
 }
 
-/// `OpenEndRange.endExclusive` — one past the last element. A `..<` range is
-/// stored as the closed `start..(end-1)`, so the exclusive bound is `end + 1`.
-/// When `endInclusive` is the element type's MAX value the exclusive bound is
-/// unrepresentable, so the access throws (matching the stdlib).
+/// One past the last element. A `..<` range is stored as the closed
+/// `start..(end-1)`, so the exclusive bound is `end + 1`; when `endInclusive` is
+/// the type's maximum it is unrepresentable and the access throws.
 pub fn range_end_exclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "endExclusive") orelse return typeErr("endExclusive requires a Range receiver");
     if (view.end == rangeKindMax(view.kind)) {
@@ -358,20 +317,16 @@ pub fn range_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "contains") orelse return typeErr("contains requires a Range receiver");
-    // `ClosedRange<Int>.contains(element: Int?)`: a null element is never in the range.
     if (ctx.args.len > 1 and ctx.args[1] == .Null) return ok(.{ .Bool = false });
     const n: i64 = blk: {
         if (ctx.args.len > 1) {
             if (ctx.args[1].asI64()) |v| break :blk v;
-            // A Char range takes a Char (`'b' in 'a'..'c'` and
-            // `('a'..'c').contains('b')` are the same call).
             if (ctx.args[1] == .Char) break :blk @as(i64, ctx.args[1].Char);
         }
         return typeErr("Range.contains requires an Int argument");
     };
     const lo = if (view.step > 0) view.start else view.end;
     const hi = if (view.step > 0) view.end else view.start;
-    // ULong bounds span the full u64 range stored as i64, so test unsigned.
     const in_bounds = if (view.kind == .ULong) blk2: {
         const un: u64 = @bitCast(n);
         break :blk2 un >= @as(u64, @bitCast(lo)) and un <= @as(u64, @bitCast(hi));
@@ -380,16 +335,12 @@ pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return ok(.{ .Bool = false });
     }
     const s = intAbs(view.step);
-    // The distance to `start` can exceed i64 for a range spanning most of
-    // the type (`MIN..MAX`), so the alignment test is widened.
     const diff = @as(i128, n) - @as(i128, view.start);
     return ok(.{ .Bool = s == 1 or @rem(diff, @as(i128, s)) == 0 });
 }
 
 pub fn range_is_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "isEmpty") orelse return typeErr("isEmpty requires a Range receiver");
-    // `rangeViewEmpty` compares unsigned for ULong, so `ULongRange.EMPTY`
-    // (`MaxUL..MinUL`) reads as empty.
     return ok(.{ .Bool = rangeViewEmpty(view) });
 }
 
@@ -418,11 +369,8 @@ pub fn range_to_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try makeList(items, false));
 }
 
-// The element count is a Kotlin Int; range sizes never exceed i64::MAX.
 pub fn range_count(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "count") orelse return typeErr("count requires a Range receiver");
-    // O(1) element count: never iterate (a near-MAX range has billions of
-    // elements). `(last - first) / step + 1`, clamped to 0 when empty.
     const n: i64 = if (view.step > 0)
         (if (view.start > view.end) 0 else @divFloor(view.end - view.start, view.step) + 1)
     else
@@ -445,10 +393,6 @@ pub fn range_sum(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     });
 }
 
-// ============================================================
-// Local helpers.
-// ============================================================
-
 fn makeList(items: ValueList, mutable: bool) std.mem.Allocator.Error!Value {
     return try Value.newList(items.cell.allocator, .{
         .items = items,
@@ -458,9 +402,6 @@ fn makeList(items: ValueList, mutable: bool) std.mem.Allocator.Error!Value {
     });
 }
 
-/// Lazy iterator over an inclusive integer progression with a signed step.
-/// Empty when `step == 0` or the bounds are crossed; `cur` advances by a
-/// saturating add.
 const RangeIntIter = struct {
     cur: i64,
     end: i64,
@@ -470,14 +411,13 @@ const RangeIntIter = struct {
 
     fn next(self: *RangeIntIter) ?i64 {
         if (self.done or self.step == 0) return null;
-        // `inBounds` compares unsigned for ULong (`MaxUL..MinUL` is empty).
         if (!self.kind.inBounds(self.cur, self.end, self.step)) {
             self.done = true;
             return null;
         }
         const v = self.cur;
-        // `end` is the exact final element; stop once yielded so the cursor
-        // never advances past it (Long.MAX overflow, or a ULong wrap past MaxUL).
+        // `end` is the exact final element, so stop once it is yielded and the
+        // cursor never overflows past it.
         if (self.cur == self.end) {
             self.done = true;
             return v;
@@ -504,10 +444,6 @@ fn intAbs(v: i64) i64 {
     return if (v < 0) -%v else v;
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 const testing = std.testing;
 
 fn noopCtx(args: []const Value) CallCtx {
@@ -520,20 +456,12 @@ fn noopCtx(args: []const Value) CallCtx {
 }
 
 test "normalize progression end clamps to last reachable element" {
-    // 1..10 step 2 -> last reachable is 9.
     try testing.expectEqual(@as(i64, 9), normalizeProgressionEnd(1, 10, 2, .Int));
-    // 1..10 step 3 -> 1,4,7,10 -> 10.
     try testing.expectEqual(@as(i64, 10), normalizeProgressionEnd(1, 10, 3, .Int));
-    // exact multiple stays put.
     try testing.expectEqual(@as(i64, 9), normalizeProgressionEnd(1, 9, 2, .Int));
-    // empty forward range keeps the closed-range bound (Kotlin
-    // getProgressionLastElement: start >= end yields end).
     try testing.expectEqual(@as(i64, 1), normalizeProgressionEnd(5, 1, 2, .Int));
-    // step == 0 returns end unchanged.
     try testing.expectEqual(@as(i64, 10), normalizeProgressionEnd(1, 10, 0, .Int));
-    // 10 downTo 1 step 2 -> 10,8,6,4,2 -> 2.
     try testing.expectEqual(@as(i64, 2), normalizeProgressionEnd(10, 1, -2, .Int));
-    // empty backward range keeps the closed-range bound (start <= end yields end).
     try testing.expectEqual(@as(i64, 5), normalizeProgressionEnd(1, 5, -2, .Int));
 }
 
@@ -602,8 +530,6 @@ test "step throws on non-positive step" {
     try testing.expect(r == .err);
     try testing.expect(r.err == .Thrown);
     const exc = r.err.Thrown.Exception;
-    // The message cell owns its bytes and frees them on the final drop;
-    // just borrow to assert, then drop the two refcounted handles.
     {
         const mg = exc.message.get().?.borrow();
         defer mg.deinit();
@@ -629,7 +555,6 @@ test "first and last read range endpoints" {
 }
 
 test "step field returns the signed step" {
-    // `10 downTo 1 step 2` -> IntProgression.step is -2 (Kotlin keeps the sign).
     const range = try Value.newRange(testing.allocator, .{ .start = 10, .end = 1, .step = -2, .kind = .Int });
     defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{range};
@@ -706,7 +631,6 @@ test "to list enumerates elements" {
     var ctx = noopCtx(&args);
     const r = try range_to_list(&ctx);
     try testing.expect(r == .ok);
-    // The ObjRef owns the backing ArrayList and frees it on the final drop.
     defer runtime.listRefOf(r.ok.List).deinit();
     const g = r.ok.List.items.borrow();
     defer g.deinit();

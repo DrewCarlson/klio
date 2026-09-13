@@ -1,5 +1,4 @@
-//! `Set` intrinsics: set algebra, membership, sorting, mutation and
-//! the additional set members.
+//! `Set` intrinsics: set algebra, membership, sorting and mutation.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -43,10 +42,6 @@ const materialiseSequence = sequence_mod.materialiseSequence;
 const views_mod = @import("views.zig");
 const syncMapView = views_mod.syncMapView;
 
-// =====================================================================
-// Set ops
-// =====================================================================
-
 fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, what)) {
@@ -86,8 +81,7 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
             if (!try containsBoxedH(ctx.host, ctx.out, out.items, &arg)) try out.append(a, arg);
         },
     }
-    // `out` holds borrowed elements (snapshot/args); the new set owns one ref
-    // per element, so retain each before adopting the backing.
+    // `out` holds borrowed elements, so retain each before the set adopts them.
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
 }
@@ -128,8 +122,6 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     for (src) |v| {
         if (!try containsBoxedH(ctx.host, ctx.out, removals.items, &v)) try out.append(a, v);
     }
-    // `out` holds borrowed elements (snapshot/args); the new set owns one ref
-    // per element, so retain each before adopting the backing.
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
 }
@@ -158,8 +150,6 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     for (src) |v| {
         if (try containsBoxedH(ctx.host, ctx.out, other.items, &v)) try out.append(a, v);
     }
-    // `out` holds borrowed elements (snapshot/args); the new set owns one ref
-    // per element, so retain each before adopting the backing.
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
 }
@@ -233,14 +223,13 @@ pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("add requires an argument");
     const arg = ctx.args[1];
-    // Snapshot for the membership check (dispatching `equals` re-enters the VM,
-    // which must not happen under the mutable borrow); then borrow to append.
+    // Snapshot for the membership check: dispatching `equals` re-enters the VM,
+    // which must not happen under the mutable borrow.
     const snap = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(snap);
     if (try containsBoxedH(ctx.host, ctx.out, snap, &arg)) return ok(.{ .Bool = false });
     const g = it.borrowMut();
     defer g.deinit();
-    // The set owns one reference per element; retain the borrowed argument.
     if (runtime.reclaimEnabled()) arg.retain();
     try g.get().append(a, arg);
     return ok(.{ .Bool = true });
@@ -262,8 +251,6 @@ pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
         defer g.deinit();
         if (indexOfBoxed(g.get().items, &arg)) |pos| {
             const gone = g.get().orderedRemove(pos);
-            // remove(element): Boolean discards the element; drop the
-            // collection's owned reference to it.
             if (runtime.reclaimEnabled()) gone.release(a);
             removed = true;
         }
@@ -283,7 +270,6 @@ pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
     {
         const g = it.borrowMut();
         defer g.deinit();
-        // clear() discards every element; drop the set's owned references.
         if (runtime.reclaimEnabled()) for (g.get().items) |v| v.release(a);
         g.get().clearRetainingCapacity();
     }
@@ -303,9 +289,8 @@ pub fn collectColl(a: Allocator, v: ?Value) Error!?[]Value {
     return null;
 }
 
-/// A removeAll/retainAll argument that is a lambda/function reference (not a
-/// collection or a callable user Collection instance) is the predicate form
-/// `removeAll { (T) -> Boolean }`.
+/// A `removeAll` argument that is a function reference rather than a collection
+/// is the predicate form `removeAll { (T) -> Boolean }`.
 fn isPredicateArg(v: Value) bool {
     return switch (v) {
         .IrClosure, .BoundMethod, .Intrinsic => true,
@@ -313,8 +298,6 @@ fn isPredicateArg(v: Value) bool {
     };
 }
 
-/// `MutableCollection.removeAll/retainAll { predicate }`: keep an element when
-/// `retain == predicate(element)`.
 fn mutCollRemoveRetainPred(ctx: *CallCtx, items: ValueList, recv: Value, retain: bool) Error!EvalResult {
     const a = ctx.allocator;
     const pred = ctx.args[1];
@@ -363,18 +346,14 @@ pub fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: [
             .List => |l| break :blk try snapshotItems(a, l.items),
             .Set => |s| break :blk try snapshotItems(a, s.items),
             .Array => |arr| break :blk try arr.snapshot(a),
-            // Any other Iterable (a `.Sequence`, or an `.Instance` exposing
-            // `iterator()`): drain it.
             else => break :blk switch (try iterableItemsCtx(ctx, arg, what)) {
                 .items => |x| x,
                 .err => |e| return e,
             },
         }
     };
-    // Decide keep/drop per element under a snapshot (membership dispatches a
-    // user `equals` that re-enters the VM, which must not run under the mutable
-    // borrow); then compact in place under one borrow. Single-threaded, so the
-    // snapshot's order matches the live list.
+    // Decide per element under a snapshot, since membership dispatches a user
+    // `equals` that re-enters the VM, then compact in place under one borrow.
     const snap = try snapshotItems(a, items);
     defer if (runtime.freeScratch()) a.free(snap);
     const keep_flags = try a.alloc(bool, snap.len);
@@ -397,7 +376,6 @@ pub fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: [
                 list.items[w] = v;
                 w += 1;
             } else if (runtime.reclaimEnabled()) {
-                // Dropped element: release the collection's owned reference.
                 v.release(a);
             }
         }
@@ -430,10 +408,6 @@ pub fn coll_mut_set_retain_all(ctx: *CallCtx) Error!EvalResult {
     };
     return mutCollRemoveRetain(ctx, it, ctx.args[0], "retainAll", true, true);
 }
-
-// =====================================================================
-// Additional Set ops
-// =====================================================================
 
 pub fn coll_set_contains_all(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -512,9 +486,8 @@ pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         };
-    // Collect the genuinely-new items under a snapshot (dispatching key
-    // `equals` re-enters the VM and must not run under the mutable borrow),
-    // checking against the growing `seen` set; then append them in one borrow.
+    // Collect the new items under a snapshot, key `equals` re-entering the VM,
+    // then append them in one borrow.
     const initial = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(initial);
     var seen: std.ArrayList(Value) = .empty;

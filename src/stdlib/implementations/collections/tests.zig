@@ -46,8 +46,8 @@ const coll_triple_ctor = tuple_mod.coll_triple_ctor;
 const pair_first = tuple_mod.pair_first;
 const pair_second = tuple_mod.pair_second;
 
-/// Minimal host that reports Unimplemented for callable invocations — the
-/// pure (non-HOF) intrinsics under test never reach those paths.
+/// Minimal host reporting Unimplemented for callable invocations, which the
+/// non-higher-order intrinsics under test never reach.
 const TestHarness = struct {
     arena: std.heap.ArenaAllocator,
     noop: runtime.NoopHost,

@@ -1,11 +1,9 @@
 //! Native Skia backend for the `klio.compose.ui` pack.
 //!
-//! The compose UI layer composes into a LayoutNode tree and records a display
-//! list of draw ops in pure Kotlin (klioMain). This module replays that list onto
-//! a real Skia raster surface through libklio_skia (built by build.zig with the
-//! platform C++ toolchain) and encodes a PNG. The shared library is dlopened
-//! lazily so the interpreter never links libstdc++/Skia; a build without the Skia
-//! libs simply has no renderer here (skiaRender returns 0).
+//! The compose UI layer records a display list of draw ops in pure Kotlin; this
+//! module replays it onto a Skia raster surface through libklio_skia and encodes
+//! a PNG. The shared library is dlopened lazily so the interpreter never links
+//! libstdc++ or Skia; without it `skiaRender` returns 0.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -23,9 +21,6 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
-/// Diagnostic: with `KLIO_RSS_LOG` set, print current RSS on each rendered frame.
-/// A manual window drag then traces whether memory climbs (and settles), showing
-/// whether the resize growth is heap churn or the stack high-water mark.
 var rss_log_gate: enum { unknown, on, off } = .unknown;
 fn rssLog() void {
     if (rss_log_gate == .unknown) {
@@ -48,8 +43,6 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("klio.compose.ui.__composeui_winSurface", winSurfaceOf);
     try b.register("klio.compose.ui.__composeui_winPresent", winPresent);
     try b.register("klio.compose.ui.__composeui_winClear", winClear);
-    // The real-engine window driver (androidx.compose.ui.window.KlioWindow)
-    // declares the same host entrypoints under its own package.
     try b.register("androidx.compose.ui.window.__composeui_winOpen", winOpen);
     try b.register("androidx.compose.ui.window.__composeui_winProbe", winProbe);
     try b.register("androidx.compose.ui.window.__composeui_winSetTitle", winSetTitle);
@@ -102,7 +95,6 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_text2", canvasDrawText2);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface", canvasDrawSurface);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface_rect", canvasDrawSurfaceRect);
-    // The skparagraph engine, consumed by the androidx.compose.ui.text pack.
     try b.register("androidx.compose.ui.text.platform.__skia_para_new", paraNew);
     try b.register("androidx.compose.ui.text.platform.__skia_para_layout", paraLayout);
     try b.register("androidx.compose.ui.text.platform.__skia_para_metric", paraMetric);
@@ -141,15 +133,9 @@ fn argFloat(v: Value) f32 {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Skia backend — the rasterizer. The klio.compose.ui draw pass records a display
-// list of draw ops; this replays it onto a Skia raster surface and encodes a PNG.
-// ---------------------------------------------------------------------------
-
 const SkSurface = anyopaque;
 const SkWindow = anyopaque;
 
-/// The dlopened Skia shim entry points (see src/compose_ui/skia_shim.cpp).
 const Skia = struct {
     lib: std.DynLib,
     new: *const fn (c_int, c_int) callconv(.c) ?*SkSurface,
@@ -167,8 +153,6 @@ const Skia = struct {
     savePng: *const fn (?*SkSurface, [*:0]const u8) callconv(.c) c_int,
     encodePng: *const fn (?*SkSurface, *usize) callconv(.c) ?[*]u8,
     freeBuffer: *const fn ([*]u8) callconv(.c) void,
-    // Optional graphics helpers (present in current builds; guarded so a stale
-    // shared library degrades instead of failing the whole Skia load).
     pathOp: ?PathOpFn,
     freeCstr: ?FreeCstrFn,
     cSave: ?CVoidFn,
@@ -209,20 +193,17 @@ const Skia = struct {
     paraPhCount: ?ParaPhCountFn,
     paraPhRect: ?ParaPhRectFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
-    /// Optional: mobile backends (iOS) attach to an OS-provided surface layer
-    /// instead of creating a window. Null on desktop backends (Cocoa/SDL), where
-    /// `winOpen` creates the window.
+    /// Optional: mobile backends attach to an OS-provided surface layer; null on
+    /// desktop, where `winOpen` creates the window.
     winAttach: ?WinAttachFn,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
     winPoll: *const fn (?*SkWindow, c_int, *c_int, *c_int) callconv(.c) c_int,
     winClose: *const fn (?*SkWindow) callconv(.c) void,
-    /// Optional: only the native live-resize backends (Cocoa) export this. A
-    /// backend that reports resizes purely through `winPoll` (SDL) leaves it null.
+    /// Optional: only native live-resize backends export this.
     winSetResizeCb: ?ResizeCbFn,
     winSetTitle: ?*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void,
     winSetSize: ?*const fn (?*SkWindow, c_int, c_int) callconv(.c) void,
-    /// Optional: window icon from encoded PNG bytes (a bundle's `--icon`).
     winSetIconPng: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
 };
 
@@ -231,8 +212,8 @@ const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int)
 const PathOpFn = *const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) ?[*:0]u8;
 const FreeCstrFn = *const fn ([*:0]u8) callconv(.c) void;
 
-// Canvas (SkCanvas over a surface) entry points. Optional so a stale shared
-// library degrades to no-op drawing instead of failing the whole Skia load.
+// Canvas entry points, optional so a stale shared library degrades to no-op
+// drawing instead of failing the whole Skia load.
 const CVoidFn = *const fn (?*SkSurface) callconv(.c) void;
 const CXYFn = *const fn (?*SkSurface, f32, f32) callconv(.c) void;
 const CRotateFn = *const fn (?*SkSurface, f32) callconv(.c) void;
@@ -272,32 +253,27 @@ const ParaPhRectFn = *const fn (?*KlioPara, i32, i32) callconv(.c) f32;
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
 
-/// The app host (an iOS `.app`) that statically links the Skia shim opts in by
-/// declaring `pub const klio_skia_static` in its root; the plain interpreter does
-/// not, so on iOS it emits no shim symbol references and stays headless.
+/// An app host that statically links the Skia shim opts in by declaring
+/// `pub const klio_skia_static`. The plain interpreter does not, so on iOS it
+/// emits no shim symbol references and stays headless.
 const use_static_skia = @hasDecl(@import("root"), "klio_skia_static");
 
-/// The platform shared-library file name build.zig installs.
 const skia_lib_name = switch (@import("builtin").os.tag) {
     .macos => "libklio_skia.dylib",
     .windows => "klio_skia.dll",
     else => "libklio_skia.so",
 };
 
-/// Open + resolve the Skia shim once. Search order: `$KLIO_SKIA_LIB` (a full
-/// path), then the bare name via the loader path (zig-out/lib on `LD_LIBRARY_PATH`
-/// / rpath / a system install). Cached (including a failed load) for the process.
+/// Open and resolve the Skia shim once, searching `$KLIO_SKIA_LIB` then the bare
+/// name through the loader path. The result, a failed load included, is cached.
 fn loadSkia() ?*Skia {
     if (skia_state) |*s| return s;
     if (skia_tried) return null;
     skia_tried = true;
 
-    // Mobile app hosts (iOS, Android) link the shim statically and opt in via
-    // `klio_skia_static` — resolve from symbols, not dlopen (iOS bans dlopen of a
-    // runtime-written dylib; the Android host ships no separate .so).
+    // Mobile app hosts link the shim statically: iOS bans dlopen of a
+    // runtime-written dylib, and the Android host ships no separate .so.
     if (comptime use_static_skia) return loadSkiaStatic();
-    // A mobile target WITHOUT the static opt-in (the plain interpreter) has no
-    // shim to dlopen, so it renders headless rather than searching for one.
     const mobile_os = @import("builtin").os.tag == .ios or
         (@import("builtin").os.tag == .linux and
             (@import("builtin").abi == .android or @import("builtin").abi == .androideabi));
@@ -371,9 +347,7 @@ fn loadSkia() ?*Skia {
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
         .winPoll = F.get(&lib, "winPoll", "klio_win_poll") orelse return skiaLoadFail(&lib),
         .winClose = F.get(&lib, "winClose", "klio_win_close") orelse return skiaLoadFail(&lib),
-        // Optional native-live-resize hook (Cocoa only); absent on SDL builds.
         .winSetResizeCb = lib.lookup(ResizeCbFn, "klio_win_set_resize_cb"),
-        // Optional (older shims lack them): recomposition-driven window params.
         .winSetTitle = lib.lookup(*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void, "klio_win_set_title"),
         .winSetSize = lib.lookup(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_size"),
         .winSetIconPng = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_icon_png"),
@@ -387,17 +361,11 @@ fn skiaLoadFail(lib: *std.DynLib) ?*Skia {
     return null;
 }
 
-/// Reference a statically-linked shim symbol directly. Reached only from the app
-/// host (which links libklio_skia.a and opts in via `use_static_skia`), so the
-/// symbol is always defined at the app link — the plain interpreter never emits
-/// these references.
 fn externSym(comptime T: type, comptime name: [:0]const u8) T {
     return @extern(T, .{ .name = name });
 }
 
-/// iOS resolution of the shim from statically-linked symbols (no dlopen). Mirrors
-/// `loadSkia`'s field set. The shim ships with the interpreter, so every symbol
-/// is present; optional fields are bound directly too.
+/// iOS resolution of the shim from statically-linked symbols, no dlopen.
 fn loadSkiaStatic() ?*Skia {
     const s = Skia{
         .lib = undefined,
@@ -470,29 +438,22 @@ fn loadSkiaStatic() ?*Skia {
     return &skia_state.?;
 }
 
-// ---------------------------------------------------------------------------
-// Bundle-mode configuration: a bundle boot installs the extracted shim's
-// path, the app name (the default window title), and the window-icon PNG
-// before the program runs. All set-up-time, read-only during execution.
-// ---------------------------------------------------------------------------
+// Bundle-mode configuration: a bundle boot installs the extracted shim's path,
+// the app name and the window-icon PNG before the program runs. Written at
+// set-up time, read-only during execution.
 
 var skia_lib_override: ?[]const u8 = null;
 var window_icon_png: ?[]const u8 = null;
 var default_window_title: ?[:0]const u8 = null;
 
-/// Load the Skia shim from this exact path (highest priority, ahead of
-/// `KLIO_SKIA_LIB`). The slice must outlive the process.
 pub fn setSkiaLibPath(path: []const u8) void {
     skia_lib_override = path;
 }
 
-/// PNG bytes applied as the window icon when each window opens. The
-/// slice must outlive the process (a bundle's mmap qualifies).
 pub fn setWindowIconPng(png: []const u8) void {
     window_icon_png = png;
 }
 
-/// Title used when the program opens a window without naming one.
 pub fn setDefaultWindowTitle(title: [:0]const u8) void {
     default_window_title = title;
 }
@@ -505,9 +466,8 @@ fn openSkiaLib() ?std.DynLib {
         if (std.DynLib.open(p)) |l| return l else |_| {}
     }
     if (std.DynLib.open(skia_lib_name)) |l| return l else |_| {}
-    // The install layout puts the shim in `lib/` next to the binary's `bin/`;
-    // resolve it relative to the executable so a plain `zig-out/bin/klio`
-    // renders without loader-path setup.
+    // The install layout puts the shim in `lib/` next to the binary's `bin/`, so
+    // resolving relative to the executable needs no loader-path setup.
     const exe_dir = selfExeDir() orelse return null;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ "../lib", "." }) |rel| {
@@ -519,8 +479,6 @@ fn openSkiaLib() ?std.DynLib {
 
 var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
 
-/// The directory holding the running executable (no trailing slash), or null
-/// where the platform offers no way to ask.
 fn selfExeDir() ?[]const u8 {
     const os = @import("builtin").os.tag;
     var len: usize = 0;
@@ -571,8 +529,8 @@ fn skiaRender(ctx: *CallCtx) Error!EvalResult {
 
     const width: c_int = @intCast(@max(1, argInt(ctx.args[1])));
     const height: c_int = @intCast(@max(1, argInt(ctx.args[2])));
-    // Opt-in GPU (Ganesh+EGL) surface when KLIO_SKIA_GPU is set and the backend was
-    // built with it; otherwise (or on GPU init failure) fall back to raster.
+    // Opt-in GPU surface when KLIO_SKIA_GPU is set and the backend was built
+    // with it; on GPU init failure, fall back to raster.
     const gpu = runtime.envOnce("KLIO_SKIA_GPU") != null;
     const surface = (if (gpu) skia.newGpu(width, height) else null) orelse
         skia.new(width, height) orelse return ok(Value.newLong(0));
@@ -582,7 +540,6 @@ fn skiaRender(ctx: *CallCtx) Error!EvalResult {
     defer dg.deinit();
     replay(skia, surface, dg.get().bytes);
 
-    // Write the PNG (best-effort) via a null-terminated path.
     const a = ctx.allocator;
     const pg = ctx.args[0].String.borrow();
     defer pg.deinit();
@@ -590,7 +547,6 @@ fn skiaRender(ctx: *CallCtx) Error!EvalResult {
     defer a.free(path_z);
     _ = skia.savePng(surface, path_z.ptr);
 
-    // Checksum the encoded bytes for a deterministic test assertion.
     var len: usize = 0;
     const buf = skia.encodePng(surface, &len) orelse return ok(Value.newLong(0));
     defer skia.freeBuffer(buf);
@@ -599,9 +555,8 @@ fn skiaRender(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@bitCast(h)));
 }
 
-/// `__composeui_measureText(text, width, size): Long` — the wrapped height (px,
-/// ceil'd) of `text` laid out to `width` at font `size`. 0 when Skia is
-/// unavailable, so the caller can fall back to an estimate.
+/// `__composeui_measureText(text, width, size): Long`: the wrapped height in
+/// ceiled px, or 0 when Skia is unavailable so the caller can estimate.
 fn measureText(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3 or ctx.args[0] != .String) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -662,7 +617,6 @@ fn replay(skia: *Skia, surface: *SkSurface, list: []const u8) void {
             const y = parseF32(it.next() orelse continue);
             const size = parseF32(it.next() orelse continue);
             const color = parseU32Hex(it.next() orelse continue);
-            // The remainder of the line is the (possibly space-containing) text.
             const s = std.mem.trimStart(u8, it.rest(), " ");
             var buf: [256]u8 = undefined;
             const n = @min(s.len, buf.len - 1);
@@ -686,18 +640,11 @@ fn replay(skia: *Skia, surface: *SkSurface, list: []const u8) void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Windowing intrinsics — open an on-screen window, replay a display list into
-// it each frame, and pump input events. The window handle is passed to Kotlin as
-// a Long (the KlioWindow pointer). All no-op / report "closed" when Skia or a
-// windowing backend is unavailable, so a headless build degrades gracefully.
-// ---------------------------------------------------------------------------
+// Windowing intrinsics: open an on-screen window, replay a display list into it
+// each frame, and pump input events. The window handle reaches Kotlin as a Long
+// (the KlioWindow pointer). Each one no-ops or reports "closed" when Skia or a
+// windowing backend is unavailable, so a headless build still runs.
 
-/// `__composeui_winOpen(width, height, title): Long` — the window handle, or 0.
-/// `__composeui_winProbe(): Long` — 1 when a windowing backend (Skia native
-/// lib with a window driver) is loadable in this environment, else 0. Lets
-/// `application {}` report headless without opening anything.
-/// `__composeui_winSetTitle(handle, title): Long` — retitle a live window.
 fn winSetTitle(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -711,7 +658,6 @@ fn winSetTitle(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
-/// `__composeui_winSetSize(handle, w, h): Long` — resize a live window.
 fn winSetSize(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -735,7 +681,6 @@ fn winOpen(ctx: *CallCtx) Error!EvalResult {
     const h: c_int = @intCast(@max(1, argInt(ctx.args[1])));
     const tg = ctx.args[2].String.borrow();
     defer tg.deinit();
-    // A window the program leaves untitled takes the bundle's app name.
     const kotlin_title = tg.get().bytes;
     const title_bytes = if (kotlin_title.len == 0)
         (default_window_title orelse kotlin_title)
@@ -743,9 +688,6 @@ fn winOpen(ctx: *CallCtx) Error!EvalResult {
         kotlin_title;
     const title_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{title_bytes}, 0) catch return ok(Value.newLong(0));
     defer ctx.allocator.free(title_z);
-    // Mobile: attach to the app-provided surface layer instead of creating a
-    // window (the OS owns the view). Desktop backends have no winAttach and
-    // create the window via winOpen.
     var win_opt: ?*SkWindow = null;
     if (surface_layer) |layer| {
         if (skia.winAttach) |attach| win_opt = attach(layer, w, h, surface_scale);
@@ -757,8 +699,6 @@ fn winOpen(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(win)))));
 }
 
-/// `__composeui_winRender(handle, displayList): Long` — replay the list into the
-/// window's surface and present it. Returns 1 on success, 0 otherwise.
 fn winRender(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -766,9 +706,9 @@ fn winRender(ctx: *CallCtx) Error!EvalResult {
     const surface = skia.winSurface(win) orelse return ok(Value.newLong(0));
     const dg = ctx.args[1].String.borrow();
     defer dg.deinit();
-    // Clear to opaque black before replaying so frames don't accumulate on the
-    // persistent window surface (the display list draws the UI on top, and a
-    // double-buffered GPU swapchain would otherwise show a stale back buffer).
+    // Clear to opaque black before replaying so frames do not accumulate on the
+    // persistent window surface; a double-buffered swapchain would otherwise show
+    // a stale back buffer.
     skia.clear(surface, 0xFF000000);
     replay(skia, surface, dg.get().bytes);
     skia.winPresent(win);
@@ -777,38 +717,31 @@ fn winRender(ctx: *CallCtx) Error!EvalResult {
 }
 
 /// Registered for the duration of a `winPoll` so the shim's live-resize observer
-/// can drive a frame while the modal drag blocks the VM's loop. Holds the render
-/// callback (a live poll argument, so no separate GC root is needed) plus the host
-/// handle and output to invoke it through.
+/// can drive a frame while the modal drag blocks the VM's loop. The render
+/// callback is a live poll argument, so it needs no separate GC root.
 const ResizeCb = struct {
     host: IntrinsicHost,
     callback: Value,
     out: Output,
 };
 
-/// C trampoline the shim calls on each live-resize step: invokes the Kotlin render
-/// callback with the new (width, height) in points, which recomposes and redraws.
 fn resizeTrampoline(user: ?*anyopaque, w: c_int, h: c_int) callconv(.c) void {
     const rc: *ResizeCb = @ptrCast(@alignCast(user orelse return));
     var args = [_]Value{ Value.newInt(@intCast(w)), Value.newInt(@intCast(h)) };
     _ = rc.host.invokeCallable(&rc.callback, &args, rc.out) catch {};
 }
 
-/// `__composeui_winPoll(handle, timeoutMs, onResize?): Long` — wait up to timeoutMs
-/// for an event; returns `(type << 32) | (x << 16) | y` where type is 0 none, 1
-/// click, 2 close. When `onResize: (Int, Int) -> Unit` is supplied it is invoked
-/// during a live resize so the UI reflows in realtime.
+/// `__composeui_winPoll(handle, timeoutMs, onResize?): Long`: wait up to
+/// timeoutMs for an event and return `(type << 32) | (x << 16) | y`, where type
+/// is 0 none, 1 click, 2 close. A supplied `onResize` runs during a live resize.
 fn winPoll(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return ok(Value.newLong(2 << 32));
     const skia = loadSkia() orelse return ok(Value.newLong(2 << 32));
     const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(2 << 32));
     const timeout: c_int = @intCast(@max(0, argInt(ctx.args[1])));
-    // Register the live-resize render callback (if given) for this poll only. `rc`
-    // stays valid on the stack for the whole `skia.winPoll` call, and the callback
-    // is a live argument so the VM keeps it rooted.
     var rc: ResizeCb = undefined;
-    // The live-resize callback only fires on backends that export the hook
-    // (Cocoa). SDL reports resizes through winPoll's event code, so skip it there.
+    // The live-resize callback fires only on backends exporting the hook; SDL
+    // reports resizes through winPoll's event code instead.
     const has_cb = ctx.args.len >= 3 and ctx.args[2] != .Null and skia.winSetResizeCb != null;
     if (has_cb) {
         rc = .{ .host = ctx.host, .callback = ctx.args[2], .out = ctx.out };
@@ -824,23 +757,15 @@ fn winPoll(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(packed_ev));
 }
 
-// ---------------------------------------------------------------------------
 // OS-driven frame loop (mobile): the platform owns the run loop and calls
-// klio_render_frame each vsync on the resident VM. `application` (KlioWindow)
-// registers a per-frame render callback and returns instead of looping; the app
-// shell drives it (iOS CADisplayLink). See plans/open-campaigns.md.
-// ---------------------------------------------------------------------------
+// klio_render_frame each vsync on the resident VM. `application` registers a
+// per-frame render callback and returns instead of looping.
 
-// The OS-provided surface layer + geometry the app installs before running the
-// program. When set, winOpen attaches to it (klio_win_attach) instead of
-// creating a window, and __composeui_isHosted reports true.
 var surface_layer: ?*anyopaque = null;
 var surface_w: c_int = 0;
 var surface_h: c_int = 0;
 var surface_scale: f64 = 1.0;
 
-/// Install the app-provided surface layer (an iOS CAMetalLayer) + geometry. The
-/// app shell calls this before running the program.
 pub export fn klio_set_surface(layer: ?*anyopaque, w: c_int, h: c_int, scale: f64) void {
     surface_layer = layer;
     surface_w = w;
@@ -848,11 +773,9 @@ pub export fn klio_set_surface(layer: ?*anyopaque, w: c_int, h: c_int, scale: f6
     surface_scale = scale;
 }
 
-/// The resident per-frame render callback: the Kotlin render lambda plus the host
-/// and output to invoke it through. Unlike ResizeCb this outlives the call that
-/// registered it — the program's main returns while the VM stays resident, and
-/// the mobile run keeps everything on a process-lifetime arena, so the captured
-/// composition survives across frames.
+/// The resident per-frame render callback. Unlike ResizeCb it outlives the call
+/// that registered it: main returns while the VM stays resident on a
+/// process-lifetime arena holding the captured composition.
 const FrameCb = struct {
     host: IntrinsicHost,
     callback: Value,
@@ -861,23 +784,15 @@ const FrameCb = struct {
 };
 var frame_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
 
-/// The resident input callback: the Kotlin lambda that routes a platform touch
-/// (iOS UITouch) into the live windows' pointer processors. Same residency
-/// contract as `frame_cb` — persisted so it outlives the run that registered it.
 var input_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
 
-/// `__composeui_isHosted(): Boolean` — true when the platform owns the frame loop
-/// (an app surface has been installed). `application` then registers a frame
-/// callback and returns instead of running its own loop.
 fn isHosted(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     return ok(Value{ .Bool = surface_layer != null });
 }
 
-/// `__composeui_surfaceWidth(): Int` / `__composeui_surfaceHeight(): Int` — the
-/// hosted surface's size in points (the OS owns the geometry on mobile). A
-/// hosted `Window` sizes itself to these so its Metal drawable matches the view;
-/// `0` when no surface is installed.
+/// The hosted surface's size in points, which the OS owns on mobile. A hosted
+/// `Window` sizes itself to these so its Metal drawable matches the view.
 fn surfaceWidth(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     return ok(Value.newInt(surface_w));
@@ -887,39 +802,30 @@ fn surfaceHeight(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newInt(surface_h));
 }
 
-/// `__composeui_setFrameCallback(cb: () -> Boolean): Long` — store the render
-/// callback the platform frame source invokes each frame. The host handed to a
-/// native intrinsic is transient (it dies when `main`'s activation returns), so
-/// `persist()` it into a resident copy the frame loop can re-enter later. The
-/// callback lambda and its captured composition live on the run's process-
-/// lifetime arena, so storing the `Value` by itself is safe across frames.
+/// Store the render callback the platform frame source invokes each frame. The
+/// host handed to a native intrinsic dies when `main`'s activation returns, so
+/// `persist()` makes a resident copy; the lambda and its composition live on the
+/// run's process-lifetime arena.
 fn setFrameCallback(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
     frame_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
     return ok(Value.newLong(1));
 }
 
-/// `__composeui_setInputCallback(cb: (x: Int, y: Int, phase: Int) -> Unit): Long`
-/// — store the callback the platform input source invokes on each touch. Same
-/// persisted-host residency contract as `setFrameCallback`.
 fn setInputCallback(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
     input_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
     return ok(Value.newLong(1));
 }
 
-/// True once `application` has registered a hosted frame callback: the run must
-/// stay resident (its VM, arena, and reclaim mode are kept alive) so the
-/// platform frame source can re-enter each vsync.
+/// True once `application` registered a hosted frame callback: the run must stay
+/// resident, VM and arena alive, for the frame source to re-enter.
 pub fn hostedActive() bool {
     return frame_cb.set;
 }
 
-/// Whether the resident VM still needs a frame: the last `frameHosted` reported
-/// pending work (a recomposition, running effect, or dirty window), or an input
-/// event has arrived since. The app shell's frame source reads this and skips
-/// re-entering the VM when clean — a static scene between changes then costs no
-/// per-vsync interpreter re-entry. Starts true (the first frame must render).
+/// Whether the resident VM still needs a frame. The frame source skips
+/// re-entering while false, so a static scene costs no per-vsync re-entry.
 var frame_needs_render: bool = true;
 
 fn renderFrameBody(_: void) void {
@@ -928,49 +834,37 @@ fn renderFrameBody(_: void) void {
         frame_needs_render = true; // errored: render again rather than stall
         return;
     };
-    // `frameHosted` returns whether the VM still has pending work; when false the
-    // shell may skip the next re-entry until input or a periodic pump.
     frame_needs_render = switch (res) {
         .ok => |v| v == .Bool and v.Bool,
         .err => true,
     };
 }
 
-/// Render one frame: invoke the resident Kotlin render callback. Called by the
-/// app shell's frame source (iOS CADisplayLink) on the main thread — the same
-/// thread the resident VM ran main on, so it is a plain same-thread re-entry.
-/// The platform callback arrives on the UI thread's small stack, so the frame
-/// body runs on the persistent interpreter stack (a deep composition would
-/// otherwise overflow).
+/// Render one frame on the main thread the VM ran main on, a plain same-thread
+/// re-entry. The platform callback arrives on the UI thread's small stack, so the
+/// frame body runs on the persistent interpreter stack instead.
 pub export fn klio_render_frame() void {
     if (!frame_cb.set) return;
     runtime.runOnPersistentBigStack(void, void, renderFrameBody, {});
 }
 
-/// C query for the app shell: nonzero when the resident VM needs the next frame
-/// rendered (pending compose work or fresh input). The shell skips the (costly)
-/// `klio_render_frame` re-entry while this is zero — see `frame_needs_render`.
 pub export fn klio_frame_needs_render() c_int {
     return if (frame_needs_render) 1 else 0;
 }
 
-/// Force the next frame to render (input dispatch marks the VM dirty this way).
 fn markFrameDirty() void {
     frame_needs_render = true;
 }
 
-/// C query for the app shell: nonzero once the program registered a hosted frame
-/// callback (a Compose UI opened). The shell starts its frame source (iOS
-/// CADisplayLink) only then; a non-UI program leaves it zero and the shell exits.
+/// C query: nonzero once a hosted frame callback is registered. The shell starts
+/// its frame source only then, and a non-UI program exits.
 pub export fn klio_frame_active() c_int {
     return if (frame_cb.set) 1 else 0;
 }
 
-/// One pointer in the current multi-touch snapshot: a stable per-finger `id`,
-/// its position in surface points, whether it is currently down, and any scroll
-/// delta (nonzero only for a Scroll event from a wheel / trackpad). Compose wants
-/// ALL active pointers in one event and diffs snapshots, so the app hands the
-/// whole set each event and the Kotlin callback reads it back by index.
+/// One pointer in the current multi-touch snapshot, with a scroll delta nonzero
+/// only for a Scroll event. Compose diffs whole snapshots, so the app hands over
+/// every active pointer per event.
 const TouchPoint = struct { id: c_int, x: c_int, y: c_int, down: bool, sdx: c_int = 0, sdy: c_int = 0 };
 var touch_points: [16]TouchPoint = undefined;
 var touch_count: usize = 0;
@@ -981,13 +875,9 @@ fn dispatchTouchBody(phase: c_int) void {
 }
 
 /// Route a multi-touch snapshot into the resident VM's input callback. `ids` are
-/// stable per finger across its lifecycle; `xs`/`ys` are in surface points;
-/// `downs[i] != 0` means that pointer is pressed. `phase` is the primary event
-/// type (0=down, 1=move, 2=up, 3=cancel). Called by the app shell on the main
-/// thread — same-thread re-entry, so it runs on the persistent interpreter stack
-/// like the frame callback (touch and frame never overlap: both are serviced
-/// serially by the platform run loop). The callback reads the snapshot back via
-/// `__composeui_touchCount` / `__composeui_touch{Id,X,Y,Down}`.
+/// stable per finger, `xs`/`ys` are surface points, `downs[i] != 0` means
+/// pressed, and `phase` is 0 down, 1 move, 2 up, 3 cancel. The run loop services
+/// touch and frame serially, so they never overlap.
 pub export fn klio_dispatch_touches(
     count: c_int,
     ids: [*]const c_int,
@@ -1004,11 +894,8 @@ pub export fn klio_dispatch_touches(
     markFrameDirty();
 }
 
-/// Route a discrete scroll (wheel / trackpad) into the resident VM as a single
-/// unpressed pointer carrying a scroll delta, dispatched with phase 4 (Scroll).
-/// `x`/`y` are the pointer position in surface points; `dx`/`dy` the scroll
-/// amount. Touch-drag scrolling needs none of this — it falls out of the normal
-/// pointer stream; this is only for indirect scroll devices.
+/// Route a discrete wheel or trackpad scroll in as one unpressed pointer with a
+/// scroll delta, phase 4. Touch-drag scrolling needs none of this.
 pub export fn klio_dispatch_scroll(x: c_int, y: c_int, dx: c_int, dy: c_int) void {
     if (!input_cb.set) return;
     touch_count = 1;
@@ -1024,8 +911,6 @@ fn touchIndex(ctx: *CallCtx) ?usize {
     return @intCast(i);
 }
 
-/// Snapshot query intrinsics the hosted input callback reads to rebuild the
-/// pointer set: `__composeui_touchCount(): Int` plus per-index accessors.
 fn touchCount(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     return ok(Value.newInt(@intCast(touch_count)));
@@ -1055,11 +940,6 @@ fn touchScrollY(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newInt(touch_points[i].sdy));
 }
 
-// --- Keyboard / text input --------------------------------------------------
-
-/// Platform keyboard show/hide, provided by the app shell (iOS: become/resign
-/// first responder on a UIKeyInput view). Compose's text-input service calls the
-/// `__composeui_show/hideKeyboard` intrinsics when a text field gains/loses focus.
 const KbFn = *const fn () callconv(.c) void;
 var keyboard_show_fn: ?KbFn = null;
 var keyboard_hide_fn: ?KbFn = null;
@@ -1080,8 +960,8 @@ fn hideKeyboard(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
-/// The resident text-input callback plus the staged text bytes for one event.
-/// Same persisted-host residency contract as `frame_cb` / `input_cb`.
+/// The resident text-input callback and its staged text. Same persisted-host
+/// residency contract as `frame_cb`.
 var text_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
 var staged_text: [512]u8 = undefined;
 var staged_text_len: usize = 0;
@@ -1097,8 +977,6 @@ fn dispatchTextBody(kind: c_int) void {
     _ = text_cb.host.invokeCallable(&text_cb.callback, &args, text_cb.out) catch {};
 }
 
-/// Commit inserted UTF-8 text (kind 0). The callback reads it via
-/// `__composeui_textInput`. Called by the app shell on the main thread.
 pub export fn klio_dispatch_text(bytes: [*]const u8, len: c_int) void {
     if (!text_cb.set) return;
     const n = @min(@as(usize, @intCast(@max(len, 0))), staged_text.len);
@@ -1116,18 +994,13 @@ pub export fn klio_dispatch_key(kind: c_int) void {
     markFrameDirty();
 }
 
-/// `__composeui_textInput(): String` — the staged inserted text (kind 0).
 fn textInput(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, staged_text[0..staged_text_len])) });
 }
 
-/// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
-//// The host OS, as a lowercase name. foundation's `DesktopPlatform` needs it: the
-/// desktop key mapping is genuinely different per platform (macOS binds the text
-/// shortcuts to Meta, Linux and Windows to Ctrl), so defaulting would give the
-/// wrong bindings on a real macOS host. Upstream reads
-/// `System.getProperty("os.name")`, which klio has no JVM to serve.
+/// The host OS, as a lowercase name. foundation's `DesktopPlatform` needs it:
+/// macOS binds the text shortcuts to Meta while Linux and Windows bind Ctrl.
 fn hostOs(ctx: *CallCtx) Error!EvalResult {
     const name = switch (@import("builtin").os.tag) {
         .linux => "linux",
@@ -1139,9 +1012,6 @@ fn hostOs(ctx: *CallCtx) Error!EvalResult {
     return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, name)) });
 }
 
-// usable with the `androidx.compose.ui.graphics.__skia_c_*` draw intrinsics
-/// (the same surface type `__skia_surf_new` yields), or 0. The real ui engine's
-/// `KlioCanvas` draws frames directly onto it.
 fn winSurfaceOf(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1150,7 +1020,6 @@ fn winSurfaceOf(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(surface)))));
 }
 
-/// `__composeui_winPresent(handle): Long` — present the window's surface.
 fn winPresent(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1159,7 +1028,6 @@ fn winPresent(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
-/// `__composeui_winClear(handle, argb): Long` — clear the window's surface.
 fn winClear(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1169,7 +1037,6 @@ fn winClear(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
-/// `__composeui_winClose(handle): Long`
 fn winClose(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1183,10 +1050,8 @@ fn winHandle(v: Value) ?*SkWindow {
     return @ptrFromInt(@as(usize, @intCast(h)));
 }
 
-/// `androidx.compose.ui.graphics.__skia_path_op(a: String, b: String, op: Int): String?`
-/// — combine two serialized path command buffers with a boolean op (SkPathOps).
-/// Returns the result command buffer, or null when the op fails or no Skia
-/// backend is available (the caller then leaves its path unchanged).
+/// Combine two serialized path command buffers with a boolean op. Null when the
+/// op fails or no Skia backend is available, leaving the caller's path unchanged.
 fn pathOp(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3 or ctx.args[0] != .String or ctx.args[1] != .String) return ok(Value.Null);
     const skia = loadSkia() orelse return ok(Value.Null);
@@ -1208,11 +1073,8 @@ fn pathOp(ctx: *CallCtx) Error!EvalResult {
     return ok(Value{ .String = try runtime.strInitOwned(a, owned) });
 }
 
-// ---------------------------------------------------------------------------
-// Canvas intrinsics — a real androidx.compose.ui.graphics.Canvas actual draws
-// through these onto an offscreen surface (handle = the KlioSurface pointer as
-// a Long). All no-op when Skia / the canvas entry points are unavailable.
-// ---------------------------------------------------------------------------
+// Canvas intrinsics: a Canvas actual draws through these onto an offscreen
+// surface, the handle being a KlioSurface pointer as a Long.
 
 fn surfArg(v: Value) ?*SkSurface {
     const h: u64 = @bitCast(argInt(v));
@@ -1224,7 +1086,6 @@ fn argU32(v: Value) u32 {
     return @bitCast(@as(i32, @truncate(argInt(v))));
 }
 
-/// `__skia_surf_new(width, height): Long` — a raster surface handle, or 0.
 fn surfNew(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1234,7 +1095,6 @@ fn surfNew(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(surf)))));
 }
 
-/// `__skia_surf_save_png(handle, path): Long` — 1 on success.
 fn surfSavePng(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1247,7 +1107,6 @@ fn surfSavePng(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(if (skia.savePng(surf, path_z.ptr) == 0) 1 else 0));
 }
 
-/// `__skia_surf_free(handle): Long`
 fn surfFree(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1255,8 +1114,6 @@ fn surfFree(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__skia_surf_pixel(handle, x, y): Long` — one pixel as ARGB (0 when out of
-/// range, unreadable, or headless).
 fn surfPixel(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1267,7 +1124,6 @@ fn surfPixel(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@intCast(f(surf, x, y))));
 }
 
-/// `__skia_c_draw_surface(dst, src, x, y): Long` — blit src's contents at (x, y).
 fn canvasDrawSurface(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 4) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1277,8 +1133,6 @@ fn canvasDrawSurface(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__skia_c_draw_surface_rect(dst, src, sl, st, sr, sb, dl, dt, dr, db): Long`
-/// — map src's (sl,st,sr,sb) onto dst's (dl,dt,dr,db).
 fn canvasDrawSurfaceRect(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 10) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1299,8 +1153,8 @@ fn canvasDrawSurfaceRect(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__skia_para_new(textUtf8, spec): Long` — build a styled paragraph; 0 when
-/// no Skia backend / no font is available (callers fall back to stub metrics).
+/// Build a styled paragraph, or 0 when no Skia backend or font is available, so
+/// callers fall back to stub metrics.
 fn paraNew(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[0] != .String or ctx.args[1] != .String) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1504,8 +1358,7 @@ fn canvasClipPath(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__skia_c_set_shader(handle, gradientText)` — arm the next draw's gradient
-/// shader (empty text clears it). The Canvas actual sets it around a brush draw.
+/// Arm the next draw's gradient shader; empty text clears it.
 fn canvasSetShader(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
@@ -1562,7 +1415,6 @@ fn canvasDrawCircle(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__skia_c_draw_line(handle, x0, y0, x1, y1, argb, strokeWidth, cap, aa)`
 fn canvasDrawLine(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len < 9) return ok(Value.newLong(0));
@@ -1572,7 +1424,6 @@ fn canvasDrawLine(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__skia_c_draw_path(handle, pathText, argb, style, strokeWidth, cap, join, aa)`
 fn canvasDrawPath(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len < 8 or ctx.args[1] != .String) return ok(Value.newLong(0));
@@ -1587,10 +1438,6 @@ fn canvasDrawPath(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__skia_c_draw_text(handle, text, x, y, sizePx, argb)` — draw a single text
-/// run with its baseline origin at (x, y) onto the surface's canvas, honouring
-/// the canvas's current transform/clip. The real Paragraph engine positions each
-/// wrapped line and calls this per line.
 fn canvasDrawText(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len < 6 or ctx.args[1] != .String) return ok(Value.newLong(0));
@@ -1604,8 +1451,7 @@ fn canvasDrawText(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__skia_c_draw_text2(handle, text, x, y, sizePx, argb, flags): Long` — a
-/// styled run at a baseline origin: flags bit0 bold, bit1 italic, bit2
+/// A styled run at a baseline origin; flags are bit0 bold, bit1 italic, bit2
 /// underline, bit3 strikethrough.
 fn canvasDrawText2(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1621,8 +1467,6 @@ fn canvasDrawText2(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// `__composeui_text_width(text, sizePx): Float` — the advance width of a single
-/// unwrapped run at the given pixel size (the wrap pass measures candidate runs).
 fn textWidth(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[0] != .String) return ok(.{ .Float = 0 });
     const skia = loadSkia() orelse return ok(.{ .Float = 0 });
@@ -1634,8 +1478,8 @@ fn textWidth(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Float = f(txt.ptr, argFloat(ctx.args[1])) });
 }
 
-/// `__composeui_font_metric(sizePx, which): Float` — a font vertical metric at
-/// the given size: which=0 ascent (negative), 1 descent (positive), 2 leading.
+/// A font vertical metric: which=0 ascent (negative), 1 descent (positive),
+/// 2 leading.
 fn fontMetric(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return ok(.{ .Float = 0 });
     const skia = loadSkia() orelse return ok(.{ .Float = 0 });
@@ -1643,8 +1487,6 @@ fn fontMetric(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Float = f(argFloat(ctx.args[0]), @intCast(argInt(ctx.args[1]))) });
 }
 
-/// `__skia_c_concat(handle, sx, kx, tx, ky, sy, ty)` — concat a 2D affine
-/// transform (Compose Matrix's affine components) onto the canvas.
 fn canvasConcat(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len < 7) return ok(Value.newLong(0));
@@ -1678,20 +1520,17 @@ test "hostBindings registers the skia render + windowing sinks" {
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {
-    // The Skia shared library is not present in the unit-test environment, so
-    // loadSkia() fails and skiaRender returns 0 — this exercises the arg-shape
-    // guards + the display-list entry without needing the .so.
+    // The Skia shared library is absent in the unit-test environment, so this
+    // exercises the arg-shape guards without needing the .so.
     const a = testing.allocator;
     var host: TestHost = .{};
     var path = Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, "/tmp/klio_skia_test.png")) };
     defer path.String.deinit();
     var list = Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, "clear FF000000\nrect 0 0 4 4 FFFFFFFF\n")) };
     defer list.String.deinit();
-    // Too few args -> 0.
     const short = [_]Value{path};
     var ctx0 = host.ctx(&short);
     try testing.expectEqual(@as(i64, 0), (try skiaRender(&ctx0)).ok.Long);
-    // Well-formed call: 0 when the lib is absent (unit tests), any value when present.
     const args = [_]Value{ path, Value.newInt(4), Value.newInt(4), list };
     var ctx = host.ctx(&args);
     _ = (try skiaRender(&ctx)).ok.Long;

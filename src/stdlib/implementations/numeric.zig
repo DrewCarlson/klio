@@ -1,7 +1,7 @@
-//! Numeric type intrinsics and conversions: the member implementations
-//! for `Int`/`Long`/`Short`/`Byte`, the unsigned family, `Float`/`Double`,
-//! and `Boolean`, plus the shared bit-count / coercion / floorDiv / mod
-//! helpers used across the integer kinds.
+//! Numeric type intrinsics and conversions: the member implementations for
+//! `Int`, `Long`, `Short`, `Byte`, the unsigned family, `Float`, `Double` and
+//! `Boolean`, plus the bit-count, coercion, floorDiv and mod helpers shared
+//! across the integer kinds.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -14,13 +14,6 @@ const StringRef = runtime.StringRef;
 
 const Allocator = std.mem.Allocator;
 
-// ============================================================
-// Local result/helper plumbing
-// ============================================================
-
-/// `Result<T, RuntimeError>` for the fallible non-`Value` helpers. The
-/// intrinsics surface OOM as a Zig error and the `RuntimeError` as data via
-/// `EvalResult`.
 fn Res(comptime T: type) type {
     return union(enum) {
         ok: T,
@@ -32,7 +25,6 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
-/// `inc()` / `dec()` keep the receiver's numeric type; `delta` is +1 or -1.
 fn numIncDec(ctx: *CallCtx, comptime delta: i64) Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return .{ .err = .{ .Arity = "inc/dec: missing receiver" } };
     return switch (ctx.args[0]) {
@@ -69,12 +61,11 @@ pub fn num_unary_minus(ctx: *CallCtx) Allocator.Error!EvalResult {
     return switch (ctx.args[0]) {
         .Int => |x| ok(.{ .Int = -%x }),
         .Long => |x| ok(.{ .Long = -%x }),
-        // `Byte`/`Short.unaryMinus()` widen to `Int` (Kotlin).
+        // Kotlin widens `Byte.unaryMinus()` and `Short.unaryMinus()` to `Int`.
         .Short => |x| ok(.{ .Int = -@as(i32, x) }),
         .Byte => |x| ok(.{ .Int = -@as(i32, x) }),
-        // Negating NaN keeps the canonical quiet NaN (matches the eval
-        // `Neg` arm: `Double.NaN` is upstream `-(0.0/0.0)` and the
-        // commonTest pins its raw bits to the canonical positive form).
+        // Negating NaN keeps the canonical quiet NaN, whose raw bits commonTest
+        // pins to the positive form.
         .Float => |x| ok(.{ .Float = if (std.math.isNan(x)) std.math.nan(f32) else -x }),
         .Double => |x| ok(.{ .Double = if (std.math.isNan(x)) std.math.nan(f64) else -x }),
         else => .{ .err = .{ .Type = "unaryMinus requires a signed numeric receiver" } },
@@ -89,9 +80,6 @@ fn arityErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloc
     return .{ .Arity = try std.fmt.allocPrint(allocator, fmt, args) };
 }
 
-/// Build an exception `Value`. Mirrors `implementations::make_exception`.
-/// `message`, when present, must be allocator-owned for the program
-/// lifetime (the arena).
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, fqn),
@@ -100,9 +88,8 @@ fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Al
     });
 }
 
-/// Kotlin's `compareTo` total order over floating values. NaN sorts as the
-/// greatest value and `-0.0 < 0.0`, unlike the IEEE `<`/`>` operators.
-/// Returns `-1`/`0`/`1` for less/equal/greater.
+/// Kotlin's `compareTo` total order over floats: NaN sorts greatest and
+/// `-0.0 < 0.0`, unlike the IEEE operators.
 fn kotlinFloatTotalCmp(a: f64, b: f64) i64 {
     if (a < b) return -1;
     if (a > b) return 1;
@@ -118,10 +105,6 @@ fn kotlinFloatTotalCmp(a: f64, b: f64) i64 {
     if (ba > bb) return 1;
     return 0;
 }
-
-// ============================================================
-// Int members
-// ============================================================
 
 fn recvInt(allocator: Allocator, args: []const Value, what: []const u8) Allocator.Error!Res(i64) {
     if (args.len > 0) {
@@ -155,13 +138,12 @@ pub fn int_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
-/// Render `n` in `radix`. Kotlin prefixes a `-` and renders the absolute
-/// digit run for negatives; casts through `i128` to handle `i64::MIN`.
+/// Render `n` in `radix`. Kotlin prefixes `-` and renders the absolute digit
+/// run; the cast goes through `i128` so the minimum i64 works.
 pub fn intToRadixString(allocator: Allocator, n: i64, radix: u32) Allocator.Error![]u8 {
     if (n == 0) return allocator.dupe(u8, "0");
     const negative = n < 0;
     var x: u128 = if (negative)
-        // unsigned_abs of an i64 widened through i128.
         @intCast(@as(i128, -@as(i128, n)))
     else
         @intCast(n);
@@ -178,7 +160,6 @@ pub fn intToRadixString(allocator: Allocator, n: i64, radix: u32) Allocator.Erro
     return digits.toOwnedSlice(allocator);
 }
 
-/// `std::char::from_digit` for `0..=35`.
 fn fromDigit(d: u32) u8 {
     if (d < 10) return @intCast('0' + d);
     return @intCast('a' + (d - 10));
@@ -202,8 +183,6 @@ pub fn int_to_float(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .Float = @floatFromInt(n) });
 }
 pub fn int_to_int(ctx: *CallCtx) Allocator.Error!EvalResult {
-    // Identity for Int receivers; truncates Long/Short/Byte if any caller
-    // routes through this slot.
     const n = switch (try recvInt(ctx.allocator, ctx.args, "Int.toInt")) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
@@ -225,9 +204,8 @@ pub fn int_to_byte(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newByte(n));
 }
 
-// Long-only conversion methods (when the receiver is `Value::Long`).
-// These intentionally mirror the Int-family — `recvInt` widens any
-// integral receiver to i64, so they cover Long, Int, Short, Byte.
+// Long-only conversions, for a `Value.Long` receiver. `recvInt` widens any
+// integral receiver to i64, so these cover Long, Int, Short and Byte too.
 pub fn long_to_long(ctx: *CallCtx) Allocator.Error!EvalResult {
     return retInt(ctx, "Long.toLong", recvAsLong);
 }
@@ -267,7 +245,6 @@ pub fn long_to_float(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .Float = @floatFromInt(n) });
 }
 
-// Shared tail for `to_long`-shaped intrinsics.
 fn recvAsLong(n: i64) Value {
     return .{ .Long = n };
 }
@@ -296,8 +273,8 @@ fn unsignedKindResult(recv: Value, r: u64) Value {
     };
 }
 
-/// `UInt/ULong/UByte/UShort.div`/`floorDiv` — unsigned division keeping the
-/// receiver's kind. For unsigned values floorDiv == div (no sign).
+/// Unsigned division keeping the receiver's kind; without a sign, floorDiv
+/// equals div.
 pub fn unsigned_div(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len < 2) return .{ .err = try arityErr(ctx.allocator, "div expects a divisor", .{}) };
     const x = ctx.args[0].asU64() orelse return .{ .err = try typeErr(ctx.allocator, "div: non-unsigned receiver", .{}) };
@@ -309,7 +286,7 @@ pub fn unsigned_div(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(unsignedKindResult(ctx.args[0], x / y));
 }
 
-/// `UInt/ULong/UByte/UShort.rem`/`mod` — unsigned remainder (mod == rem).
+/// Unsigned remainder, where mod is rem.
 pub fn unsigned_rem(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len < 2) return .{ .err = try arityErr(ctx.allocator, "rem expects a divisor", .{}) };
     const x = ctx.args[0].asU64() orelse return .{ .err = try typeErr(ctx.allocator, "rem: non-unsigned receiver", .{}) };
@@ -378,14 +355,13 @@ pub fn unsigned_to_byte(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newByte(@bitCast(v)));
 }
 
-/// The unsigned value-class constructors: `UInt(data)` reinterprets the
-/// signed counterpart as the HOST unsigned value, so the shipped upstream
-/// source bodies (`UInt(this.data.plus(other.data))`, the companion's
-/// `UInt(-1)` constants) produce the same representation literals and host
-/// operators do — never an interpreted instance.
+/// The unsigned value-class constructors. `UInt(data)` reinterprets the signed
+/// counterpart as the host unsigned value, so the shipped upstream source bodies
+/// produce the representation literals and host operators do, never an
+/// interpreted instance.
 fn unsignedCtorArg(args: []const Value) ?i64 {
     // A bare ctor call inside a member body routes through the member walk,
-    // which prepends the implicit receiver; the ctor itself takes one value.
+    // which prepends the implicit receiver; the ctor takes one value.
     const v = switch (args.len) {
         1 => args[0],
         2 => args[1],
@@ -394,11 +370,9 @@ fn unsignedCtorArg(args: []const Value) ?i64 {
     return v.asI64();
 }
 
-/// The `UnsignedCommon.kt` expect surface: the shipped unsigned source
-/// bodies delegate their arithmetic/conversion/rendering cores to these
-/// (`div` is `uintDivide(this, other)`), and the actuals are wasm/js/jvm
-/// intrinsics upstream — here they are host intrinsics keyed by their
-/// top-level FQN.
+/// The `UnsignedCommon.kt` expect surface the shipped unsigned bodies delegate
+/// their arithmetic, conversion and rendering cores to. Upstream's actuals are
+/// platform intrinsics; here they are host intrinsics keyed by top-level FQN.
 fn twoArgVals(args: []const Value) ?struct { i64, i64 } {
     if (args.len != 2) return null;
     const a = args[0].asI64() orelse return null;
@@ -607,7 +581,6 @@ pub fn unsigned_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
-/// Render an unsigned magnitude in `radix` (no sign prefix).
 pub fn uintToRadixString(allocator: Allocator, n: u64, radix: u32) Allocator.Error![]u8 {
     if (n == 0) return allocator.dupe(u8, "0");
     var x = n;
@@ -622,10 +595,6 @@ pub fn uintToRadixString(allocator: Allocator, n: u64, radix: u32) Allocator.Err
     std.mem.reverse(u8, digits.items);
     return digits.toOwnedSlice(allocator);
 }
-
-// ============================================================
-// Float receiver conversions
-// ============================================================
 
 pub fn float_to_double(ctx: *CallCtx) Allocator.Error!EvalResult {
     const f = switch (try recvFloat(ctx.allocator, ctx.args, "Float.toDouble")) {
@@ -711,14 +680,10 @@ pub fn float_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
         return .{ .err = .{ .Type = "Float.compareTo requires a number" } };
     };
-    // `compareTo` is a total order (NaN greatest, -0.0 < 0.0), unlike the
-    // IEEE `<`/`>` operators; a Double argument compares as Double.
+    // `compareTo` is a total order, NaN greatest and `-0.0 < 0.0`; a Double
+    // argument compares as Double.
     return ok(Value.newInt(kotlinFloatTotalCmp(@floatCast(a), b)));
 }
-
-// ============================================================
-// Double additional conversions (Float)
-// ============================================================
 
 pub fn double_to_float(ctx: *CallCtx) Allocator.Error!EvalResult {
     const d = switch (try recvDouble(ctx.allocator, ctx.args, "Double.toFloat")) {
@@ -748,10 +713,6 @@ pub fn double_to_byte(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     return ok(Value.newByte(f64ToI32Kotlin(d)));
 }
-
-// ============================================================
-// Integer bit / arithmetic binops
-// ============================================================
 
 fn intBinop(
     ctx: *CallCtx,
@@ -913,8 +874,6 @@ pub fn long_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const b = blk: {
         if (argAt(ctx, 1)) |arg| {
             if (arg.asI64()) |v| break :blk v;
-            // `Long.compareTo(Double)`: both convert to Double and follow
-            // the total order.
             if (arg.asF64()) |f| return ok(.{ .Int = @intCast(kotlinFloatTotalCmp(@floatFromInt(a), f)) });
         }
         return .{ .err = .{ .Type = "Long.compareTo requires a Long" } };
@@ -994,8 +953,7 @@ pub fn ulong_shr(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .ULong = u64arg(ctx.args[0]) >> @truncate(shiftCount(ctx.args[1])) });
 }
 
-/// `compareTo` for the unsigned types — an unsigned comparison (the Kotlin
-/// default would recurse without a native binding).
+/// An unsigned comparison; without a native binding the Kotlin default recurses.
 pub fn unsigned_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len < 2) return .{ .err = .{ .Type = "compareTo requires an argument" } };
     const a = unsignedVal(ctx.args[0]) orelse return .{ .err = .{ .Type = "unsigned compareTo: bad receiver" } };
@@ -1011,19 +969,14 @@ pub fn int_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const b = blk: {
         if (argAt(ctx, 1)) |arg| {
             if (arg.asI64()) |v| break :blk v;
-            // `Int.compareTo(Double)` / `Byte.compareTo(Float)`: both convert
-            // to Double and follow the total order (`0.compareTo(-0.0) == 1`,
-            // `0.compareTo(NaN) == -1`).
+            // Mixed integer and float comparisons convert both sides to Double
+            // and follow the total order, so `0.compareTo(NaN) == -1`.
             if (arg.asF64()) |f| return ok(.{ .Int = @intCast(kotlinFloatTotalCmp(@floatFromInt(a), f)) });
         }
         return .{ .err = .{ .Type = "Int.compareTo requires an Int" } };
     };
     return ok(.{ .Int = if (a < b) -1 else @intFromBool(a > b) });
 }
-
-// ============================================================
-// Double members
-// ============================================================
 
 fn recvDouble(allocator: Allocator, args: []const Value, what: []const u8) Allocator.Error!Res(f64) {
     if (args.len > 0) {
@@ -1062,10 +1015,9 @@ pub fn double_to_long(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .Long = f64ToI64Kotlin(d) });
 }
 
-/// `Double`/`Float.toU*()` saturate to the *unsigned* destination range, per
-/// Kotlin: `NaN -> 0`, `<= 0 -> 0`, `>= max -> max`, else truncate toward zero.
-/// (Routing through `toLong()` would wrap negatives and overshoot values above
-/// the narrow unsigned max.)
+/// `toU*()` on a float saturates to the unsigned range: NaN and `<= 0` give 0,
+/// `>= max` gives max, the rest truncate toward zero. Routing through `toLong()`
+/// would wrap negatives and overshoot the narrow unsigned max.
 fn floatingToUnsignedSat(d: f64, max_val: u64) u64 {
     if (std.math.isNan(d) or d <= 0.0) return 0;
     const maxf: f64 = @floatFromInt(max_val);
@@ -1099,11 +1051,10 @@ pub fn double_to_ubyte(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .UByte = @truncate(u) });
 }
 
-/// Kotlin's `Double.toInt` semantics: truncate toward zero, saturate at
-/// `Int.MIN_VALUE`/`Int.MAX_VALUE` for out-of-range, `NaN -> 0`.
+/// Kotlin's `Double.toInt`: truncate toward zero, saturate out-of-range at the
+/// Int bounds, and map NaN to 0.
 pub fn f64ToI32Kotlin(d: f64) i32 {
     if (std.math.isNan(d)) return 0;
-    // `f64::from(i32::MAX)` / `f64::from(i32::MIN)` — both exact in f64.
     const hi: f64 = @floatFromInt(@as(i32, std.math.maxInt(i32)));
     const lo: f64 = @floatFromInt(@as(i32, std.math.minInt(i32)));
     if (d >= hi) return std.math.maxInt(i32);
@@ -1113,7 +1064,6 @@ pub fn f64ToI32Kotlin(d: f64) i32 {
 
 pub fn f64ToI64Kotlin(d: f64) i64 {
     if (std.math.isNan(d)) return 0;
-    // `i64::MAX as f64` rounds up to 2^63; `i64::MIN as f64` is exact.
     const hi: f64 = @floatFromInt(@as(i64, std.math.maxInt(i64)));
     const lo: f64 = @floatFromInt(@as(i64, std.math.minInt(i64)));
     if (d >= hi) return std.math.maxInt(i64);
@@ -1147,10 +1097,9 @@ pub fn double_is_nan(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .Bool = std.math.isNan(d) });
 }
 
-// IEEE-754 bit reflection. `toRawBits` preserves the exact bit pattern;
-// `toBits` collapses every NaN to the single canonical quiet NaN
-// (matching `java.lang.Double.doubleToLongBits`/`Float.floatToIntBits`);
-// `fromBits` reconstructs the value.
+// IEEE-754 bit reflection. `toRawBits` preserves the exact bit pattern while
+// `toBits` collapses every NaN to the canonical quiet NaN, as
+// `java.lang.Double.doubleToLongBits` does.
 pub fn double_to_raw_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
     const d = switch (try recvDouble(ctx.allocator, ctx.args, "Double.toRawBits")) {
         .ok => |v| v,
@@ -1233,14 +1182,8 @@ pub fn double_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
         return .{ .err = .{ .Type = "Double.compareTo requires a number" } };
     };
-    // `compareTo` is a total order (NaN greatest, -0.0 < 0.0), unlike the
-    // IEEE `<`/`>` operators.
     return ok(.{ .Int = @intCast(kotlinFloatTotalCmp(a, b)) });
 }
-
-// ============================================================
-// Boolean members
-// ============================================================
 
 pub fn bool_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .Bool) {
@@ -1250,7 +1193,6 @@ pub fn bool_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInit(ctx.allocator, if (b) "true" else "false") });
 }
 
-/// `Boolean.compareTo`: `false` sorts before `true`.
 pub fn bool_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .Bool) {
         return .{ .err = .{ .Type = "Boolean.compareTo requires a Boolean receiver" } };
@@ -1262,10 +1204,6 @@ pub fn bool_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const b: i64 = @intFromBool(ctx.args[1].Bool);
     return ok(.{ .Int = if (a < b) -1 else @intFromBool(a > b) });
 }
-
-// ============================================================
-// Additional Int
-// ============================================================
 
 pub fn int_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
     const v = switch (try recvInt(ctx.allocator, ctx.args, "Int.coerceIn")) {
@@ -1333,8 +1271,6 @@ pub fn int_coerce_at_most(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@min(v, hi)));
 }
 
-/// `Int`/`Long`.`countLeadingZeroBits()` — leading zeros in the
-/// two's-complement bit pattern (32 / 64 wide). Result is Int.
 pub fn num_count_leading_zero_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Arity = "countLeadingZeroBits" } };
@@ -1353,7 +1289,6 @@ pub fn num_count_leading_zero_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@as(i64, n)));
 }
 
-/// `Int`/`Long`.`countTrailingZeroBits()`.
 pub fn num_count_trailing_zero_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Arity = "countTrailingZeroBits" } };
@@ -1372,7 +1307,6 @@ pub fn num_count_trailing_zero_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@as(i64, n)));
 }
 
-/// `Int`/`Long`.`countOneBits()` (population count).
 pub fn num_count_one_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Arity = "countOneBits" } };
@@ -1391,8 +1325,6 @@ pub fn num_count_one_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@as(i64, n)));
 }
 
-/// Render the `{what} requires an integer, got {other}` type error; `{other}`
-/// is the value's variant tag name.
 fn countTypeErr(allocator: Allocator, what: []const u8, other: Value) Allocator.Error!RuntimeError {
     return typeErr(allocator, "{s} requires an integer, got {s}", .{ what, @tagName(other) });
 }
@@ -1409,8 +1341,8 @@ pub fn num_floor_div(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (divisor == 0) {
         return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero") } };
     }
-    // `MIN / -1` overflows the truncated quotient; Kotlin wraps it to MIN
-    // (and the remainder is 0, so floorDiv == MIN too).
+    // `MIN / -1` overflows the truncated quotient, and Kotlin wraps it to MIN;
+    // the remainder is 0, so floorDiv is MIN too.
     if (dividend == std.math.minInt(i64) and divisor == -1) {
         return ok(if (lhs == .Long or rhs == .Long) Value{ .Long = dividend } else Value.newInt(@truncate(dividend)));
     }
@@ -1423,9 +1355,8 @@ pub fn num_floor_div(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(if (wide) Value{ .Long = quotient } else Value.newInt(quotient));
 }
 
-/// `Int`/`Long`/… `mod` — remainder whose sign follows the divisor
-/// (Kotlin's `mod`, distinct from `%` whose sign follows the dividend).
-/// Result widens to `Long` if either operand is `Long`.
+/// Kotlin's `mod`: the remainder takes the divisor's sign, unlike `%`, which
+/// takes the dividend's. Widens to `Long` if either operand is Long.
 pub fn num_mod(ctx: *CallCtx) Allocator.Error!EvalResult {
     const pair = switch (try arg2(ctx.allocator, ctx, "mod")) {
         .ok => |p| p,
@@ -1438,7 +1369,7 @@ pub fn num_mod(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (divisor == 0) {
         return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero") } };
     }
-    // `MIN % -1` is 0 mathematically but the raw `@rem` overflows; short-circuit.
+    // `MIN % -1` is mathematically 0, but the raw `@rem` overflows.
     if (dividend == std.math.minInt(i64) and divisor == -1) {
         return ok(if (lhs == .Long or rhs == .Long) Value{ .Long = 0 } else Value.newInt(0));
     }
@@ -1450,14 +1381,9 @@ pub fn num_mod(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(if (wide) Value{ .Long = rem } else Value.newInt(rem));
 }
 
-// ============================================================
-// num coerce family (Long / Double receivers)
-// ============================================================
-
-/// Numeric `min`/`max` over a Kotlin number pair, mirroring
-/// `math::num_extreme`. Integral pairs widen to the larger kind (Long if
-/// either is Long, else Int); any floating operand promotes to Double and
-/// propagates NaN (Math.min/max semantics).
+/// Numeric `min` and `max` over a Kotlin number pair: an integral pair widens to
+/// the larger kind, and any floating operand promotes to Double and propagates
+/// NaN, as `Math.min`/`max` do.
 fn numExtreme(allocator: Allocator, args: []const Value, want_min: bool, what: []const u8) Allocator.Error!Res(Value) {
     if (args.len != 2) {
         return .{ .err = try arityErr(allocator, "{s} expects 2 arguments", .{what}) };
@@ -1468,7 +1394,6 @@ fn numExtreme(allocator: Allocator, args: []const Value, want_min: bool, what: [
     if (floating) {
         const x = numericAsF64(first) orelse return .{ .err = try typeErr(allocator, "{s}: non-numeric arg", .{what}) };
         const y = numericAsF64(second) orelse return .{ .err = try typeErr(allocator, "{s}: non-numeric arg", .{what}) };
-        // Kotlin's minOf/maxOf use Math.min/max, which propagate NaN.
         const r: f64 = if (std.math.isNan(x) or std.math.isNan(y))
             std.math.nan(f64)
         else if (want_min)
@@ -1477,9 +1402,7 @@ fn numExtreme(allocator: Allocator, args: []const Value, want_min: bool, what: [
             @max(x, y);
         return .{ .ok = .{ .Double = r } };
     }
-    // Unsigned pairs (`maxOf(1u, 5u)`, `minOf(10uL, 3uL)`): compare by
-    // unsigned magnitude and keep the operands' kind, widening to the
-    // larger when they differ.
+    // An unsigned pair compares by magnitude and keeps the operands' kind.
     if (unsignedAsU64(first) != null or unsignedAsU64(second) != null) {
         const x = unsignedAsU64(first) orelse return .{ .err = try typeErr(allocator, "{s}: non-numeric arg", .{what}) };
         const y = unsignedAsU64(second) orelse return .{ .err = try typeErr(allocator, "{s}: non-numeric arg", .{what}) };
@@ -1498,7 +1421,6 @@ fn numExtreme(allocator: Allocator, args: []const Value, want_min: bool, what: [
     return .{ .ok = Value.newInt(r) };
 }
 
-/// Unsigned operand widened to `u64` (UByte/UShort/UInt/ULong only).
 fn unsignedAsU64(v: Value) ?u64 {
     return switch (v) {
         .UByte => |x| @as(u64, x),
@@ -1509,7 +1431,6 @@ fn unsignedAsU64(v: Value) ?u64 {
     };
 }
 
-/// Mirror of `math::numeric_as_i64` (Int/Long/Short/Byte only).
 fn numericAsI64(v: Value) ?i64 {
     return switch (v) {
         .Int => |x| @as(i64, x),
@@ -1520,7 +1441,6 @@ fn numericAsI64(v: Value) ?i64 {
     };
 }
 
-/// Mirror of `math::numeric_as_f64` (signed integers + float/double).
 fn numericAsF64(v: Value) ?f64 {
     return switch (v) {
         .Int => |x| @floatFromInt(x),
@@ -1553,15 +1473,10 @@ pub fn num_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
         };
         return wrapRes(try numExtreme(ctx.allocator, &.{ lo, .{ .Long = r.end } }, true, "coerceIn"));
     }
-    // A floating-point range (`ClosedFloatingPointRange`, a runtime instance)
-    // clamps via IEEE `<=` so NaN and signed zero behave as Kotlin specifies:
-    // the value is returned unchanged when neither comparison holds (NaN), and
-    // an empty range (`!(start <= end)`) throws.
-    // `ClosedFloatingPointRange` (ClosedDoubleRange / ClosedFloatRange) backs
-    // its bounds with `_start` / `_endInclusive` fields. Clamp via IEEE `<=` so
-    // NaN and signed zero behave as Kotlin specifies: the value is returned
-    // unchanged when neither comparison holds (NaN), and an empty range
-    // (`!(start <= end)`) throws.
+    // `ClosedFloatingPointRange` backs its bounds with `_start` and
+    // `_endInclusive`. Clamping goes through IEEE `<=` so NaN and signed zero
+    // behave as Kotlin specifies: the value comes back unchanged when neither
+    // comparison holds, and `!(start <= end)` is an empty range, which throws.
     if (rest.len == 1 and rest[0] == .Instance) {
         var start_v: Value = undefined;
         var end_v: Value = undefined;
@@ -1585,8 +1500,7 @@ pub fn num_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
         return ok(recv);
     }
     if (rest.len == 2) {
-        // A null bound is unconstrained (`coerceIn(min: T?, max: T?)`); both
-        // present with min > max is an empty range.
+        // A null bound is unconstrained; both present with min > max is empty.
         if (rest[0] != .Null and rest[1] != .Null) {
             if (rest[0].asF64()) |lo| if (rest[1].asF64()) |hi| if (lo > hi) {
                 const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", "Cannot coerce value to an empty range: maximum is less than minimum.");
@@ -1640,8 +1554,6 @@ fn wrapRes(r: Res(Value)) EvalResult {
 }
 
 pub fn int_to_char(ctx: *CallCtx) Allocator.Error!EvalResult {
-    // Kotlin's `Int.toChar()` is a narrowing conversion: it keeps the low
-    // 16 bits (the resulting UTF-16 code unit), never throwing.
     const v = switch (try recvInt(ctx.allocator, ctx.args, "Int.toChar")) {
         .ok => |x| x,
         .err => |e| return .{ .err = e },
@@ -1649,17 +1561,11 @@ pub fn int_to_char(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .Char = @truncate(@as(u64, @bitCast(v))) });
 }
 
-// ============================================================
-// Argument helpers
-// ============================================================
-
-/// `ctx.args.get(i)` — the i-th argument, or null when out of range.
 fn argAt(ctx: *CallCtx, i: usize) ?Value {
     if (i < ctx.args.len) return ctx.args[i];
     return null;
 }
 
-/// Mirror of `math::arg2`: require exactly two arguments.
 fn arg2(allocator: Allocator, ctx: *CallCtx, what: []const u8) Allocator.Error!Res([2]Value) {
     if (ctx.args.len != 2) {
         return .{ .err = try arityErr(allocator, "{s} expects 2 arguments", .{what}) };
@@ -1667,15 +1573,10 @@ fn arg2(allocator: Allocator, ctx: *CallCtx, what: []const u8) Allocator.Error!R
     return .{ .ok = .{ ctx.args[0], ctx.args[1] } };
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
-
 const testing = std.testing;
 
-/// Per-test arena so intrinsics can allocate (strings, exception cells,
-/// formatted diagnostics) without per-value frees — matching the real
-/// runtime's arena-per-phase ownership.
+/// Per-test arena, so intrinsics allocate without per-value frees as the
+/// runtime's arena-per-phase ownership does.
 const Harness = struct {
     arena: std.heap.ArenaAllocator,
 
@@ -1851,7 +1752,6 @@ test "long shifts mask to 0..63" {
     var h = Harness.init();
     defer h.deinit();
     var ctx = h.ctx(&.{ Value{ .Long = 1 }, Value.newInt(64) });
-    // 64 & 63 == 0, so a no-op shift.
     try expectValue(try long_shl(&ctx), .{ .Long = 1 });
 }
 
@@ -1867,7 +1767,6 @@ test "compareTo total order" {
         try expectValue(try long_compare_to(&ctx), .{ .Int = 0 });
     }
     {
-        // NaN is the greatest value under the total order.
         var ctx = h.ctx(&.{ Value{ .Double = std.math.nan(f64) }, Value{ .Double = 1.0 } });
         try expectValue(try double_compare_to(&ctx), .{ .Int = 1 });
     }
@@ -1886,7 +1785,6 @@ test "double bit reflection round trip" {
         try expectValue(try double_from_bits(&ctx), .{ .Double = 2.5 });
     }
     {
-        // toBits canonicalises NaN.
         var ctx = h.ctx(&.{.{ .Double = std.math.nan(f64) }});
         try expectValue(try double_to_bits(&ctx), .{ .Long = @bitCast(@as(u64, 0x7ff8_0000_0000_0000)) });
     }
@@ -1930,7 +1828,6 @@ test "num coerce family widens like minOf/maxOf" {
     var h = Harness.init();
     defer h.deinit();
     {
-        // Long receiver keeps a Long result.
         var ctx = h.ctx(&.{ Value{ .Long = 50 }, Value{ .Long = 0 }, Value{ .Long = 10 } });
         try expectValue(try num_coerce_in(&ctx), .{ .Long = 10 });
     }
@@ -1952,12 +1849,10 @@ test "floorDiv and mod follow Kotlin sign rules" {
         try expectValue(try num_mod(&ctx), Value.newInt(1));
     }
     {
-        // Widening to Long when either operand is Long.
         var ctx = h.ctx(&.{ Value{ .Long = -7 }, Value.newInt(2) });
         try expectValue(try num_floor_div(&ctx), .{ .Long = -4 });
     }
     {
-        // Division by zero throws ArithmeticException.
         var ctx = h.ctx(&.{ Value.newInt(1), Value.newInt(0) });
         const res = try num_floor_div(&ctx);
         try testing.expect(res == .err and res.err == .Thrown);
@@ -1984,7 +1879,6 @@ test "bit counts across integer widths" {
         try expectValue(try num_count_trailing_zero_bits(&ctx), Value.newInt(3));
     }
     {
-        // Byte zero saturates trailing-zero count at 8.
         var ctx = h.ctx(&.{Value{ .Byte = 0 }});
         try expectValue(try num_count_trailing_zero_bits(&ctx), Value.newInt(8));
     }
