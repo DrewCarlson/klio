@@ -1,8 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Type reference inside the IR. Today this is a textual FQN/name
-/// — the evaluator resolves against the class table at runtime.
+/// Type reference in the IR: a textual name resolved against the class table at runtime.
 pub const TypeRef = struct {
     name: []const u8,
     nullable: bool,
@@ -44,7 +43,6 @@ pub const TypeRef = struct {
     }
 };
 
-/// Identifier for a virtual register inside one function body.
 pub const Reg = enum(u32) {
     _,
     pub fn from(v: u32) Reg {
@@ -55,11 +53,6 @@ pub const Reg = enum(u32) {
     }
 };
 
-/// One implicit-receiver tower entry: the receiver's type head, plus the
-/// label under which its VALUE is addressable from nested scopes
-/// (`this@<label>` — the extension fn or receiver lambda name), when one
-/// is bound. A null label still serves resolution/derivation; only static
-/// EMISSION with an outer receiver needs the value channel.
 /// One contextual function-type parameter shape carried into a lambda body.
 pub const PendingCtxFnShape = struct {
     name: []const u8,
@@ -67,12 +60,12 @@ pub const PendingCtxFnShape = struct {
     n_regular: usize,
 };
 
+/// One implicit-receiver tower entry: the receiver's type head plus the `this@<label>` that addresses its value, null when unbound.
 pub const ReceiverTowerEntry = struct {
     head: []const u8,
     label: ?[]const u8 = null,
 };
 
-/// Identifier for a basic block inside one function body.
 pub const BlockId = enum(u32) {
     _,
     pub fn from(v: u32) BlockId {
@@ -83,7 +76,6 @@ pub const BlockId = enum(u32) {
     }
 };
 
-/// Identifier for a function inside the IR module.
 pub const FuncId = enum(u32) {
     _,
     pub fn from(v: u32) FuncId {
@@ -94,17 +86,8 @@ pub const FuncId = enum(u32) {
     }
 };
 
-/// Stable identity of one virtual override family. A slot is rooted at the
-/// declaration selected against the call site's static receiver type; the
-/// link step maps `(runtime ClassId, MethodSlotId)` to the concrete `FuncId`.
-/// Keeping this distinct from `FuncId` makes the bytecode contract explicit
-/// even though the initial stable numbering reuses the root declaration id.
-/// Handles into a `CallVirtual` instruction's host-receiver site memo
-/// (see the field docs there). Built by the exec arm from the live
-/// instruction and threaded into the host's virtual dispatch so the
-/// resolution can stamp the site; null when the call carries argument
-/// names or a parameter map (the memoized direct dispatch binds
-/// positionally).
+/// Out-pointers into a `CallVirtual` site memo: virtual dispatch stamps the resolved class
+/// and native here. Null when the call carries argument names or a parameter map.
 pub const VirtNativeSite = struct {
     cls: *u64,
     native: *u64,
@@ -112,10 +95,10 @@ pub const VirtNativeSite = struct {
     name_len: *u32,
 };
 
-/// One reified type-parameter substitution: the parameter's name and the
-/// rendered actual type it stands for.
 pub const ReifiedName = struct { name: []const u8, actual: []const u8 };
 
+/// Stable identity of one virtual override family, rooted at the declaration the
+/// static receiver type selects; linking maps `(ClassId, MethodSlotId)` to a `FuncId`.
 pub const MethodSlotId = enum(u32) {
     _,
     pub fn from(v: u32) MethodSlotId {
@@ -129,7 +112,6 @@ pub const MethodSlotId = enum(u32) {
     }
 };
 
-/// Identifier for a class declared in the IR module.
 pub const ClassId = enum(u32) {
     _,
     pub fn from(v: u32) ClassId {
@@ -140,6 +122,8 @@ pub const ClassId = enum(u32) {
     }
 };
 
+/// Identity key for a class type parameter: `$class$`, NUL, owner id, NUL, name
+/// length, `:`, name. The parse side also strips an `out#`/`in#` variance prefix.
 pub fn classTypeParamIdentity(
     allocator: Allocator,
     owner: ClassId,
@@ -189,14 +173,10 @@ pub const ConstId = enum(u32) {
     }
 };
 
-/// One scope-true type rename carried by `Inst.BuildObject`: the simple
-/// name a reference uses and the mangled lift name it resolves to in the
-/// object expression's lexical scope.
+/// A `BuildObject` type rename: the simple name a reference uses, and the mangled lift name.
 pub const ScopeRename = struct { name: []const u8, renamed: []const u8 };
 
-/// One classifier resolved at an anonymous-object expression's lexical site.
-/// Runtime-lowered object members use its exact FQN instead of re-resolving a
-/// bare name in their intentionally small side module.
+/// A classifier resolved at an anonymous-object site, so its lowered members use the exact FQN.
 pub const ScopeClassRef = struct {
     name: []const u8,
     fqn: []const u8,

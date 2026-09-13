@@ -64,10 +64,8 @@ pub fn registerMethodSlotTarget(
 pub const TypeBinding = struct {
     name: []const u8,
     ty: TypeRef,
-    /// The call site wrote this type argument out. Kotlin takes an
-    /// explicit argument as final and does not infer the parameter from
-    /// the value arguments at all, so a later value argument may be a
-    /// SUBTYPE of it without contradicting it.
+    /// The call site wrote this type argument out. Kotlin takes an explicit argument as final, so a
+    /// later value argument may be a SUBTYPE of it without contradicting it.
     explicit: bool = false,
 };
 
@@ -91,8 +89,7 @@ pub fn widenBinding(bindings: []TypeBinding, name: []const u8, ty: TypeRef) void
     }
 }
 
-/// Engine helper for external consumers: substitute `ty` through a
-/// solved binding set (arena-scoped result).
+/// Substitute `ty` through a solved binding set; the result is arena-scoped.
 pub fn substituteBoundType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
     return substituteType(allocator, ty, bindings);
 }
@@ -204,29 +201,17 @@ pub fn bindCallType(
     const pattern_head = staticTypeHead(pattern.name);
     if (callTypeRefParam(params, pattern)) {
         if (bindingType(bindings.items, pattern_head)) |bound| {
-            // `arrayOf<Base>(Derived())`: the written argument decides the
-            // parameter, and the value being a subtype of it is exactly
-            // what the call means. Demanding equality here rejected the
-            // whole instantiation and left the receiver untyped.
+            // The written type argument decides the parameter, and a value that is a subtype of it agrees.
             if (bindingIsExplicit(bindings.items, pattern_head)) return true;
             if (bound.eql(actual)) return true;
-            // Kotlin infers the parameter from every constraint together,
-            // so a constraint one side already subsumes narrows nothing:
-            // `m.getOrDefault(k, Derived())` on a Map<K, Base> means
-            // V=Base with the value argument a subtype of it, and
-            // `listOf(Derived(), base)` means T=Base by the same rule.
-            // Keep the subsuming side; genuinely unrelated constraints
-            // (kotlinc would compute a common supertype) still refuse.
+            // Kotlin infers a parameter from every constraint together, so a constraint one side already
+            // subsumes narrows nothing; genuinely unrelated constraints still refuse.
             const lub_off = if (std.c.getenv("KLIO_BIND_LUB")) |v|
                 std.mem.eql(u8, std.mem.span(v), "0")
             else
                 false;
-            // `Nothing?` is the null literal's type and the bottom of the
-            // lattice, so it constrains nothing but nullability: Kotlin
-            // reads `listOf(null, "foo")` as `List<String?>`. Widen to the
-            // other constraint and carry the nullability across, in either
-            // order. Without this the pair binds nothing, the call has no
-            // return type, and every use of the result is left untyped.
+            // `Nothing?` is the null literal's type and the bottom of the lattice, so it constrains only
+            // nullability: widen to the other constraint and carry the nullability across, in either order.
             if (std.mem.eql(u8, staticTypeHead(bound.name), "Nothing")) {
                 var widened = actual;
                 widened.nullable = widened.nullable or bound.nullable;
@@ -265,10 +250,8 @@ pub fn bindCallType(
     if (pattern_args.len == 0) return true;
     var projected_actual = actual;
     if (!self.staticTypesShareClassifier(pattern, actual)) {
-        // Same-head types with no class row behind the head (the
-        // synthetic `Function{N}` family) bind structurally by
-        // position: `Function1<Int, T>` against `Function1<Int, Int>`
-        // binds `T` even though no classifier backs `Function1`.
+        // Same-head types with no class row behind the head (the synthetic `Function{N}` family) bind
+        // structurally by position: `Function1<Int, T>` against `Function1<Int, Int>` binds `T`.
         const same_head = std.mem.eql(u8, pattern_head, staticTypeHead(actual.name));
         if (!same_head or self.staticTypeClassId(pattern) != null) {
             const pattern_id = self.staticTypeClassId(pattern) orelse return false;
@@ -327,11 +310,8 @@ pub fn declaredTypeParamBounds(
     const params = self.registry.func_type_params.get(fid) orelse return &.{};
     const bounds = try allocator.alloc(ModuleRegistry.TypeParamBound, params.items.len);
     const explicit = self.registry.func_type_param_bounds.get(fid) orelse &.{};
-    // The param list can carry a DUPLICATE name when a declaration
-    // registered through both the header phase and body placement; one
-    // record per NAME, or the multi-bound arms downstream refuse a
-    // single-parameter declaration (`Iterable<T>.minus` read bounds=2
-    // and staticGenericReceiverApplicable declined every candidate).
+    // The param list can carry a DUPLICATE name when a declaration registered through both the header
+    // phase and body placement; keep one record per NAME, or the multi-bound arms downstream refuse it.
     var n: usize = 0;
     outer: for (params.items) |param| {
         for (bounds[0..n]) |seen| {
@@ -351,12 +331,7 @@ pub fn declaredTypeParamBounds(
     return bounds[0..n];
 }
 
-/// Instantiate the structural return type of an already-resolved call.
-/// The target identity comes from the shared call resolver; this step only
-/// binds its declaration-owned type parameters from explicit type
-/// arguments and the statically-known argument types.
-/// Whether `ty` (recursively) names any of `params` — raw source
-/// spellings, the form a declared return type carries.
+/// Whether `ty` recursively names any of `params`, in the raw source spellings a return type carries.
 pub fn typeMentionsAnyParamName(ty: *const TypeRef, params: []const []const u8) bool {
     const head = staticTypeHead(std.mem.trimEnd(u8, ty.name, "?"));
     for (params) |p| {
@@ -388,18 +363,8 @@ pub fn instantiatedCallReturnType(
     );
 }
 
-/// `owner_params_in_scope`: the CALLER's body is (lexically inside) the
-/// target's own class, so the owner's type parameters are names the
-/// caller resolves — a bare-head implicit-this projection keeps them as
-/// THEMSELVES instead of erasing to `*`: `val data = createFrom(...)`
-/// inside `IterableTests<T : Iterable<String>>` types `data: T`, which
-/// the bound-ref channel then resolves.
-/// The substitution engine's CORE: solve every callee type-parameter
-/// binding one call site offers — explicit type args, the owner
-/// projection, the receiver, named and positional/vararg arguments,
-/// and the star erasure for what stays open. Consumers substitute
-/// whatever slot they need against the result. Arena-scoped: the
-/// bindings borrow `a` and the module.
+/// The substitution engine's core: every callee type-parameter binding one call site offers, from
+/// explicit type args, the owner projection, the receiver, and the arguments. Arena-scoped on `a`.
 pub const SolvedBindings = struct {
     bindings: []TypeBinding,
     type_params: []const []const u8,
@@ -470,24 +435,11 @@ pub fn solveCallBindings(
                 }
                 break :blk2 true;
             };
-            // A bare receiver HEAD (an implicit `this` in a method body)
-            // carries no type arguments to project — but a return that
-            // never mentions the class's parameters is complete without
-            // them (`findClause(...): ClauseData?` on a bare
-            // SelectImplementation head). A param-mentioning return
-            // erases the unknown parameters to star projections instead
-            // of refusing: `iterator()` on a bare `Iterable` head yields
-            // `Iterator<*>`, whose HEAD is what the initialized local
-            // needs to bind its `hasNext()`/`next()`, and `*` is
-            // applicability-neutral downstream. `KLIO_STAR_RET=0`
-            // disables.
+            // A bare receiver HEAD carries no type arguments to project; a return that mentions the owner's
+            // parameters erases them to star projections rather than refusing. `KLIO_STAR_RET=0` disables.
             if (!projected_ok) {
-                // The return may reference the owner's parameters by RAW
-                // name or by the class-param IDENTITY mangle (an
-                // inherited interface header's `Iterator<E>` carries
-                // `$class$ N i:E` in its args) — test both, or the star
-                // fill skips exactly the headers the completeness check
-                // then refuses (`Set.iterator` stayed underivable).
+                // The return may reference the owner's parameters by RAW name or by the class-param identity
+                // mangle (`$class$ N i:E`), so test both or the star fill skips exactly those headers.
                 const mentions = blk_m: {
                     if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) break :blk_m true;
                     for (owner_class.type_params) |param| {
@@ -540,21 +492,14 @@ if (mentions) {
         type_params;
 
     const first_param: usize = @intFromBool(funcHasImplicitThis(f));
-    // An extension receiver written head-only (a bare implicit `this`)
-    // cannot bind the declared receiver's type parameters; the erasure
-    // pass below substitutes `*` for the still-unbound ones instead of
-    // refusing, exactly as the owner-projection arm above does for
-    // members. A receiver WITH arguments that fails to bind is a real
-    // mismatch and still refuses here.
+    // An extension receiver written head-only cannot bind the declared receiver's type parameters, so
+    // the erasure below substitutes `*`. A receiver WITH arguments that fails to bind still refuses.
     if (first_param != 0 and
         (decl_sig == null or decl_sig.?.kind != .instance_method))
     {
         if (receiver) |actual_receiver| {
-            // Project the actual receiver onto the DECLARED head first:
-            // a List<String> receiver binds an Iterable<K> pattern
-            // (K := String) instead of head-mismatching into a refusal —
-            // the same rule the splice window and the sibling-expected
-            // solve already apply.
+            // Project the actual receiver onto the DECLARED head first: a `List<String>` receiver binds an
+            // `Iterable<K>` pattern (K := String) instead of head-mismatching into a refusal.
             var recv_eff = actual_receiver;
             if (self.staticTypeClassId(f.params[0].ty)) |dcid| {
                 if (try self.projectTypeToClass(a, actual_receiver, dcid)) |projected| {
@@ -579,8 +524,7 @@ if (mentions) {
     const filled = try a.alloc(bool, params.len);
     @memset(filled, false);
 
-    // Named arguments establish their slots before positional/vararg
-    // binding, matching Kotlin's call binding order.
+    // Named arguments establish their slots before positional/vararg binding, as Kotlin binds a call.
     for (args) |arg| {
         const name = arg.named orelse continue;
         const actual = arg.ty orelse continue;
@@ -608,8 +552,7 @@ if (mentions) {
         if (arg.named != null) continue;
         const actual = arg.ty orelse continue;
 
-        // A trailing callable binds to a trailing function parameter even
-        // when defaulted parameters precede it.
+        // A trailing callable binds to a trailing function parameter even behind defaulted parameters.
         var pi: usize = next_param;
         if (arg.is_lambda and ai + 1 == args.len and params.len != 0 and
             std.mem.startsWith(u8, params[params.len - 1].ty.name, "Function") and
@@ -661,14 +604,8 @@ if (mentions) {
         }
     }
 
-    // A function type parameter still unbound after the receiver and every
-    // argument had their chance erases to `*` rather than refusing the
-    // whole return: `MutableList(3) { ... }` (a receiver-less generic
-    // factory whose lambda carries no inferred type) yields
-    // `MutableList<*>` — the HEAD binds the local's member calls, and `*`
-    // is applicability-neutral downstream. A hard bind CONFLICT still
-    // refused above; this only covers absence. A result erased to a bare
-    // `*` head is refused below as before.
+    // A function type parameter still unbound after the receiver and every argument erases to `*`
+    // instead of refusing the return; a hard bind conflict already refused above. `KLIO_STAR_RET=0` off.
     if (!std.mem.eql(u8, runtime.envOnce("KLIO_STAR_RET") orelse "1", "0")) {
         for (function_type_params) |tp| {
             var bound = false;
@@ -698,9 +635,7 @@ pub fn instantiatedCallReturnTypeScoped(
     owner_params_in_scope: bool,
 ) Allocator.Error!?TypeRef {
     const f = self.funcById(fid) orelse return null;
-    // An unannotated source function currently carries Unit as its
-    // lowering placeholder. Do not present that placeholder as static
-    // receiver evidence.
+    // An unannotated source function carries Unit as its lowering placeholder, not as static evidence.
     if (std.mem.eql(u8, staticTypeHead(f.return_ty.name), "Unit")) return null;
 
     var scratch = std.heap.ArenaAllocator.init(allocator);
@@ -724,8 +659,7 @@ pub fn instantiatedCallReturnTypeScoped(
         return null;
     }
     const substituted = try substituteType(a, f.return_ty, bindings_items);
-    // A return erased to a bare `*` head names nothing a caller can bind
-    // against; it would only pollute the local's declared-type record.
+    // A return erased to a bare `*` head names nothing a caller can bind against.
     if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) {
         if (runtime.envSetOnce("KLIO_ICRT")) std.debug.print("[icrt] {s}: star head\n", .{f.fqn});
         return null;
@@ -734,21 +668,8 @@ pub fn instantiatedCallReturnTypeScoped(
     return try substituted.clone(allocator);
 }
 
-/// Instantiate a declared type of extension `fid` from the ACTUAL
-/// receiver: bind the declaration's receiver parameter against
-/// `receiver`, then substitute into `ty`. Null when the declaration has
-/// no receiver or type parameters, nothing binds, or the substitution
-/// stays incomplete — the caller keeps its explicit-args answer.
-/// `Iterable<T>.count(predicate: (T) -> Boolean)` on an
-/// `Iterable<String>` receiver instantiates `(String) -> Boolean`.
-/// The substitution engine's receiver leg, shared by both entry
-/// points: solve the callee's type parameters from the ACTUAL
-/// receiver against the declared one, substitute into `ty`.
-/// `require_complete` demands every parameter `ty` mentions be
-/// bound (the return-type contract); without it the parameters the
-/// receiver proves substitute and the rest stay as written (the
-/// lambda-param contract — its consumer refuses leftover bare
-/// heads itself).
+/// Solve the callee's type parameters from the ACTUAL receiver against the declared one, then
+/// substitute into `ty`. `require_complete` demands every parameter `ty` mentions be bound.
 pub fn instantiatedTypeFromReceiverImpl(
     self: *const Module,
     allocator: Allocator,
@@ -783,12 +704,8 @@ pub fn instantiatedTypeFromReceiver(
     return self.instantiatedTypeFromReceiverImpl(allocator, fid, ty, receiver, true);
 }
 
-/// `instantiatedTypeFromReceiver` without the completeness requirement:
-/// substitute the parameters the receiver DOES bind and leave the rest
-/// as written. For a `minOfWith(comparator) { selector }` the receiver
-/// binds `T` but not the return-only `R`; the lambda-param consumer
-/// needs the value-param portion (`T`), and its own guard refuses any
-/// entry whose head stayed a bare parameter.
+/// `instantiatedTypeFromReceiver` without the completeness requirement: the parameters the receiver
+/// does bind substitute, the rest stay as written for a consumer that guards bare heads itself.
 pub fn instantiatedTypeFromReceiverPartial(
     self: *const Module,
     allocator: Allocator,
@@ -799,9 +716,8 @@ pub fn instantiatedTypeFromReceiverPartial(
     return self.instantiatedTypeFromReceiverImpl(allocator, fid, ty, receiver, false);
 }
 
-/// Instantiate an arbitrary type owned by a resolved declaration from
-/// explicit call-site type arguments. Returns null while any declaration
-/// type parameter used by `ty` remains unbound.
+/// Instantiate a type owned by a resolved declaration from explicit call-site type arguments; null
+/// while any declaration type parameter `ty` uses stays unbound.
 pub fn instantiatedDeclarationType(
     self: *const Module,
     allocator: Allocator,
@@ -888,9 +804,8 @@ pub fn funcTypeParamIndex(self: *const Module, fid: FuncId, name: []const u8) ?u
     return null;
 }
 
-/// `KLIO_OVERRIDES_TRACE=1`: report why `overridesSlot` rejected a
-/// candidate. Called once per (own method, inherited slot) pair, so the
-/// lookup is resolved once rather than per call.
+/// `KLIO_OVERRIDES_TRACE=1`: report why `overridesSlot` rejected a candidate. Resolved once per
+/// (own method, inherited slot) pair, not per call.
 pub fn overridesTraceOn() bool {
     const S = struct {
         var known: ?bool = null;
@@ -901,9 +816,8 @@ pub fn overridesTraceOn() bool {
     return k;
 }
 
-/// Class declared directly inside `scope`, matched on the full
-/// `scope.name` FQN rather than on a simple name, so an unrelated class
-/// sharing the simple name cannot answer.
+/// Class declared directly inside `scope`, matched on the full `scope.name` FQN, so an unrelated
+/// class sharing the simple name cannot answer.
 pub fn classIdDeclaredIn(self: *const Module, scope: []const u8, name: []const u8) ?ClassId {
     for (self.classes.items) |class| {
         if (class.fqn.len != scope.len + name.len + 1) continue;
@@ -923,12 +837,8 @@ pub fn overrideTypeClassId(self: *const Module, fid: FuncId, name: []const u8) ?
     const owner = sig.enclosing_class orelse return null;
     if (self.classIdNestedIn(owner, applicability.simpleName(name))) |id| return id;
     if (owner.int() >= self.classes.items.len) return null;
-    // An unqualified classifier written inside a nested class resolves in
-    // the enclosing classes' scopes too, so widen outwards along the
-    // owner's FQN instead of stopping at the owner itself. `Key` written
-    // in `CoroutineContext.Element` names `CoroutineContext.Key`; without
-    // this walk the two spellings of one parameter type compare unequal
-    // and an override goes unrecognised.
+    // An unqualified classifier inside a nested class resolves in the enclosing scopes too, so widen
+    // outwards along the owner's FQN: `Key` in `CoroutineContext.Element` names `CoroutineContext.Key`.
     var scope = self.classes.items[owner.int()].fqn;
     while (true) {
         if (self.classIdDeclaredIn(scope, name)) |id| return id;
@@ -1082,15 +992,8 @@ pub fn mergeInheritedMethod(
     }
 }
 
-/// Point a slot left naming a bodyless interface declaration at the bodied
-/// implementation the class holds for the same member under another slot.
-/// A redeclared interface member owns a slot of its own —
-/// `MutableList.remove` redeclares `MutableCollection.remove` — while the
-/// implementing body arrives through a different supertype edge keyed by
-/// the base declaration's slot (`AbstractMutableCollection.remove`), so
-/// nothing else connects the two and the redeclaration's slot dispatches
-/// into an unexecutable header. Class-owned bodyless declarations are left
-/// alone: those are host-linked members, not unmet requirements.
+/// Point a slot left naming a bodyless interface declaration at the bodied implementation the class
+/// holds under another slot. Class-owned bodyless declarations are host-linked members, so skipped.
 pub fn unifyRedeclaredSlots(
     self: *const Module,
     allocator: Allocator,
@@ -1119,9 +1022,8 @@ pub fn unifyRedeclaredSlots(
     }
 }
 
-/// Choose the more-specific implementation of one inherited virtual slot.
-/// Runtime-defined classes use the same rule when merging the already-linked
-/// slot tables of their declared supertypes.
+/// Choose the more-specific implementation of one inherited virtual slot; runtime-defined classes
+/// merge their supertypes' already-linked slot tables by the same rule.
 pub fn preferredMethodSlotTarget(
     self: *const Module,
     allocator: Allocator,
@@ -1170,9 +1072,8 @@ pub fn linkMethodClass(
         }
     }
 
-    // `Class.methods` contains executable bodies only; abstract/interface
-    // headers are deliberately absent. Slots are declaration metadata, so
-    // enumerate the canonical declaration table instead.
+    // `Class.methods` holds executable bodies only, abstract headers absent; slots are declaration
+    // metadata, so enumerate the canonical declaration table instead.
     var own_methods: std.ArrayList(FuncId) = .empty;
     defer own_methods.deinit(allocator);
     var decl_it = self.decl_sigs.iterator();
@@ -1207,10 +1108,8 @@ pub fn linkMethodClass(
     state[cid.int()] = 2;
 }
 
-/// Build every `(runtime class, virtual slot) -> implementation` entry once
-/// after class and member headers are complete. Generic substitutions are
-/// composed along resolved `ClassId` inheritance edges; runtime dispatch is
-/// consequently numeric and performs no overload or name resolution.
+/// Build every `(runtime class, virtual slot) -> implementation` entry once after class and member
+/// headers are complete, so runtime dispatch is numeric and resolves no names.
 pub fn linkMethodSlots(self: *Module, allocator: Allocator) Allocator.Error!void {
     self.method_dispatch.clearRetainingCapacity();
     var scratch = std.heap.ArenaAllocator.init(allocator);

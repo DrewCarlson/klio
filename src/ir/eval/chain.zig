@@ -15,11 +15,7 @@ const DEFAULT_MAX_EVAL_DEPTH = ev_state.DEFAULT_MAX_EVAL_DEPTH;
 const EnclosingEntry = ev_state.EnclosingEntry;
 const EvalTls = ev_state.EvalTls;
 
-/// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
-/// callable. Appends to the current frame's chain; the invoked frame picks
-/// it up at entry. A no-op (silently dropped) when no frame is active.
-/// Iterate the pushed enclosing receivers, innermost first. The values are
-/// borrowed from the live chain — do not retain past the call.
+/// Iterate the pushed enclosing receivers, innermost first. The values are borrowed from the live chain.
 pub const EnclosingChainIter = struct {
     idx: usize,
     pub fn next(self: *EnclosingChainIter) ?Value {
@@ -38,29 +34,25 @@ pub fn enclosingChainIter() EnclosingChainIter {
     return .{ .idx = chain.items.len };
 }
 
+/// Push an implicit receiver for the about-to-be-invoked callable, which picks it up at entry. A no-op when no frame is active.
 pub fn pushEnclosing(v: *const Value) void {
     const chain = ev_state.evtls.active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .receiver }) catch {};
 }
 
-/// Push a receiver-lambda subject (`with(x) { … }`'s `x`). The subject is a
-/// receiver inside the lambda body, but its `outer` links are not.
+/// Push a receiver-lambda subject (`with(x) { … }`'s `x`): a receiver inside the lambda body, but its `outer` links are not.
 pub fn pushEnclosingSubject(v: *const Value) void {
     const chain = ev_state.evtls.active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .subject }) catch {};
 }
 
-/// Push `v` for dispatch-time visibility only (the member-extension
-/// visibility filter and field-resolution fallbacks consult the chain
-/// while resolving one call). The entry never becomes part of a callee
-/// frame's lexical receiver scope.
+/// Push `v` for dispatch-time visibility only; the entry never enters a callee frame's lexical receiver scope.
 pub fn pushEnclosingAccess(v: *const Value) void {
     const chain = ev_state.evtls.active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .access }) catch {};
 }
 
-/// Pop the most recent `pushEnclosing`/`pushEnclosingSubject`. A no-op when no
-/// frame is active or the chain is empty.
+/// Pop the most recent push. A no-op when no frame is active or the chain is empty.
 pub fn popEnclosing() void {
     const chain = ev_state.evtls.active_chain orelse return;
     if (chain.items.len > 0) _ = chain.pop();
@@ -84,12 +76,8 @@ pub fn enclosingThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
     return out;
 }
 
-/// The enclosing-`this` chain with subject tags, innermost first. Caller owns
-/// the returned slice.
-/// Fold the active enclosing-`this` chain's shape (entry kinds + receiver
-/// class identities) into a hash, without allocating. Used to key
-/// chain-dependent resolutions (member-extension applicability) in the
-/// extension cache: identical chain shapes resolve identically.
+/// Fold the chain's shape (entry kinds plus receiver class identities) into a hash, without allocating.
+/// Keys chain-dependent resolutions in the extension cache: identical shapes resolve identically.
 pub fn enclosingChainClassHash() u64 {
     var h = std.hash.Wyhash.init(0x8f14e45fceea167a);
     if (ev_state.evtls.active_chain) |chain| {
@@ -108,6 +96,7 @@ pub fn enclosingChainClassHash() u64 {
     return h.final() | 1;
 }
 
+/// The enclosing-`this` chain with subject tags, innermost first. Caller owns the returned slice.
 pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
     const chain = ev_state.evtls.active_chain orelse return allocator.alloc(EnclosingEntry, 0);
     var out = try allocator.alloc(EnclosingEntry, chain.items.len);
@@ -118,13 +107,8 @@ pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEn
     return out;
 }
 
-/// Snapshot the receiver chain a closure created *right here* lexically
-/// sees (storage order, innermost last). Kotlin closures resolve bare
-/// names against the receivers in scope at their creation site, so the
-/// snapshot is taken once at `Lambda`/`AstLambda` execution and seeds the
-/// body frame's chain at every later invocation — wherever (and on
-/// whichever thread) that happens. `access` entries are dispatch-transient
-/// and excluded. Caller owns the returned slice.
+/// The receivers a closure created here lexically sees (storage order innermost last, `access` entries excluded):
+/// Kotlin resolves bare names at the creation site, so this seeds every later body frame. Caller owns the slice.
 pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
     var out: std.ArrayList(EnclosingEntry) = .empty;
     errdefer out.deinit(allocator);
@@ -134,12 +118,7 @@ pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry 
             try out.append(allocator, e);
         }
     }
-    // The creating function's OWN receiver (`this`, params[0] of an
-    // extension or member) is the innermost lexical receiver at the
-    // literal, and it lives in the frame's params — never on the enclosing
-    // chain. Without it a lambda inside `ReceiveChannel.toList()` had only
-    // the buildList receiver in scope and `consumeEach(::add)` dispatched
-    // on the MutableList.
+    // The creating function's own receiver (`this`, params[0]) is the innermost lexical receiver at the literal, yet it lives in the frame's params, not on the chain.
     if (ev_state.evtls.frame_chain) |fr| {
         if (fr.func.params.len != 0 and std.mem.eql(u8, fr.func.params[0].name, "this") and
             fr.params.items.len != 0)
@@ -176,24 +155,12 @@ pub fn traceEnclosingEntries(label: []const u8, entries: []const EnclosingEntry)
     std.debug.print("\n", .{});
 }
 
-/// Backing allocator for a frame's `enclosing_this` chain. The chain is
-/// frame-scoped (created and torn down with the frame, or copied verbatim into
-/// a `FrameSnapshot` on suspend), so it is backed by the same per-call
-/// allocator the frame's regs/params/captures use.
+/// Backing allocator for a frame's `enclosing_this` chain: the process-wide slab, since a suspend snapshot copies the chain and can outlive the per-call arena.
 pub fn chainAllocator() Allocator {
-    // The process-wide slab (NOT `page_allocator`): the enclosing-`this` chain is
-    // (re)allocated on every method/extension call that seeds its own receiver,
-    // and `page_allocator` would mmap+munmap a page per call — a syscall pair
-    // that dominated instance-method dispatch. The slab is global and stable
-    // (the chain can outlive a per-call arena via a suspend snapshot) yet fast.
     return runtime.slab.allocator;
 }
 
-/// Per-thread free-list of enclosing-`this` chain buffers. Nearly every call
-/// seeds a chain of one or two entries and drops it again at teardown, so the
-/// buffer is recycled rather than round-tripped through the slab. The backing
-/// allocator is process-global, so a buffer is safe to hand to any later frame
-/// on this thread.
+/// Per-thread free list of chain buffers; the backing is process-global, so a recycled buffer is safe for any later frame on this thread.
 pub const CHAIN_POOL_MAX: usize = 128;
 
 pub fn chainAcquire(ev: *EvalTls) std.ArrayList(EnclosingEntry) {
@@ -217,8 +184,7 @@ pub fn chainRelease(ev: *EvalTls, list: *std.ArrayList(EnclosingEntry)) void {
 
 pub fn maxEvalDepth() usize {
     if (ev_state.evtls.eval_depth_cap != 0) return ev_state.evtls.eval_depth_cap;
-    // `procEnvGetVar` reads the whole environment block into a scratch
-    // allocator, so a tiny fixed buffer would fail; use the page allocator.
+    // `procEnvGetVar` reads the whole environment block into the scratch allocator, so a fixed buffer would fail.
     const a = std.heap.page_allocator;
     const cap = blk: {
         const raw = runtime.procEnvGetVar(a, "KLIO_MAX_EVAL_DEPTH") catch break :blk DEFAULT_MAX_EVAL_DEPTH;

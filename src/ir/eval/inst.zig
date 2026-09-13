@@ -109,12 +109,17 @@ const tryLeafValues = ev_native.tryLeafValues;
 const valueToI64 = ev_values.valueToI64;
 const vcallFlatEnabled = ev_flow.vcallFlatEnabled;
 
+/// Every arm is OUTLINED and `execInst` itself stays `noinline`. Zig does not
+/// reclaim block-scoped stack allocations (ziglang/zig#23475), so all the arms'
+/// locals would otherwise live in one frame, summed, across the interpreter's
+/// recursion. `noinline` is required: outlining the arms alone lets LLVM inline
+/// `execInst` into its caller, which ADDS the arm frame instead of replacing it.
 pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
     if (parent.frame_count_on) parent.inst_count += 1;
     if (runtime.prof.op_prof_active) runtime.prof.current_op = @intFromEnum(inst.*);
     switch (inst.*) {
         .SuspendResumePoint => {
-            // No runtime effect on its own.
+            // No runtime effect on its own; the entry dispatch table reads `state`.
         },
         .Const => |c| {
             const v = try constToValue(allocator, &frame.module.consts.items[c.value.int()]);
@@ -145,8 +150,7 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         .CellSet => |cs| return execArmCellSet(H, allocator, frame, cs, host),
         .Not => |n| {
             const v = frame.read(n.src);
-            // User-defined `operator fun not(): T` overrides the builtin
-            // Bool inversion; route through call_member.
+            // A user-defined `operator fun not()` overrides the builtin Bool inversion.
             if (v == .Instance) {
                 const result = host.callMember(allocator, &v, "not", &.{});
                 switch (try result) {
@@ -232,10 +236,8 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         .CallValue => |cv| return execArmCallValue(H, allocator, frame, cv, host),
         .CallValueWithThis => |cvt| {
             var callee_v = frame.read(cvt.callee);
-            // A boxed capture holds the callable in a cell — a recursive local
-            // extension function reaches its own closure through the shared
-            // self-cell. A Cell is never callable itself, so classify its
-            // CONTENT, exactly as the value-or-member arm does.
+            // A boxed capture holds the callable: a recursive local extension function reaches
+            // its own closure through the shared self-cell, so classify the Cell's CONTENT.
             if (callee_v == .Cell) {
                 const cg = callee_v.Cell.borrow();
                 callee_v = cg.get().*;
@@ -253,13 +255,8 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
                 for (arg_values) |*av| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(av.*))});
                 std.debug.print("\n", .{});
             }
-            // Flat receiver-lambda dispatch: the plain bound shape (a
-            // `this`-capture closure at exact arity) runs as a pushed
-            // activation; the host performs the same receiver selection and
-            // capture binding the recursive path would, then hands back the
-            // ready call. The special shapes (local named fn,
-            // receiver-fills-param, pass-threaded composable, explicit
-            // receiver overflow) decline and keep the recursive path.
+            // Flat receiver-lambda dispatch: only the plain bound shape (a `this`-capture closure
+            // at exact arity) runs as a pushed activation; every other shape keeps the recursive path.
             if (comptime @hasDecl(H, "prepareClosureWithThisFlatCall")) {
                 if (flatEnabled() and cvt.recv_head == null and callee_v == .IrClosure and argNamesAllNull(cvt.arg_names)) {
                     if (try host.prepareClosureWithThisFlatCall(allocator, &callee_v, &recv, arg_values)) |prep0| {
@@ -340,7 +337,6 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCellSet(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
     _ = host;
     const v = frame.read(cs.value);
@@ -360,17 +356,10 @@ noinline fn execArmCellSet(comptime H: type, allocator: Allocator, frame: *Frame
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmUnOp(comptime H: type, allocator: Allocator, frame: *Frame, u: anytype, host: *H) Allocator.Error!Step {
     const v = frame.read(u.operand);
-    // Builtin scalar fast path: outside any class scope a scalar's
-    // unary operators are its builtin members and no extension can
-    // shadow them, so the string-keyed probe below (a full member
-    // dispatch per `i++` in every counting loop) is semantically
-    // dead. Inside a class scope a MEMBER EXTENSION operator can
-    // apply (`operator fun Int.unaryPlus()` in a DSL builder —
-    // kotlinc resolves `+1` to it), so any enclosing instance
-    // keeps the probe.
+    // Outside any class scope a scalar's unary operators are its builtin members that no
+    // extension can shadow; an enclosing instance may bring a member-extension operator.
     const enclosing_possible = frame.enclosing_this.items.len != 0 or
         (frame.params.items.len > 0 and frame.params.items[0] == .Instance);
     if (!enclosing_possible) {
@@ -393,8 +382,6 @@ noinline fn execArmUnOp(comptime H: type, allocator: Allocator, frame: *Frame, u
         .Inc => "inc",
         .Dec => "dec",
     };
-    // User-class operator dispatch for unary +/-/inc/dec on an
-    // Instance always wins.
     if (v == .Instance) {
         switch (try host.callMember(allocator, &v, method, &.{})) {
             .ok => |rv| {
@@ -404,10 +391,8 @@ noinline fn execArmUnOp(comptime H: type, allocator: Allocator, frame: *Frame, u
             .err => |e| return raiseStep(frame, e),
         }
     }
-    // Member-extension operator on a primitive receiver. The
-    // calling frame's `this` carries the enclosing class —
-    // surface it as enclosing-this so the extension-fallback
-    // visibility filter accepts the member-ext owner.
+    // Member-extension operator on a primitive receiver: surface the calling frame's `this`
+    // as enclosing-this so the extension-fallback visibility filter accepts the owner.
     var pushed_enclosing = false;
     if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
         pushEnclosingAccess(&frame.params.items[0]);
@@ -432,7 +417,6 @@ noinline fn execArmUnOp(comptime H: type, allocator: Allocator, frame: *Frame, u
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, bo: anytype, host: *H) Allocator.Error!Step {
     const l = frame.read(bo.lhs);
     const r = frame.read(bo.rhs);
@@ -443,17 +427,12 @@ pub noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Fra
     return .cont;
 }
 
-/// The full binary-operator semantics with no frame coupling: the framed
-/// arm and the fused tier both call this, so the slow tails (identity and
-/// structural equality, string concatenation through user toString,
-/// collection operators, compareTo reduction) exist exactly once.
+/// Binary-operator semantics with no frame coupling: the framed arm and the fused tier
+/// both call this, so the slow equality, concatenation and compareTo tails exist once.
 pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Value, comptime OpT: type, bo: OpT, host: *H) Allocator.Error!EvalResult {
     var l = l_in;
     var r = r_in;
-    // A boxed capture is transparent to every operator: the Cell
-    // is a carrier (an anon-object method's captured outer `var`),
-    // never a user value — `result == null` must compare the
-    // content.
+    // A boxed capture is transparent to every operator: compare the cell's CONTENT.
     while (l == .Cell) {
         const cg = l.Cell.borrow();
         l = cg.get().*;
@@ -464,16 +443,9 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
         r = cg.get().*;
         cg.deinit();
     }
-    // StringConcat over a Value.Instance routes the instance
-    // through toString so user-defined overrides fire.
-    // `Add` with a String operand IS concatenation (`String.plus(Any?)`), so
-    // it renders the other side the same way — through the host, where a user
-    // `toString` and a container's element renderings fire. The host-free
-    // arithmetic fallback would print `ClassName@id` for a user element.
-    // LEFT operand only: `String.plus(Any?)` is a member on String, while
-    // `collection + element` is the collection's own `plus`.
-    // `String?.plus(Any?)` is the only `plus` a null receiver resolves to:
-    // `null + x` renders both sides.
+    // `Add` with a String or null LEFT operand is `String.plus(Any?)`: both sides render
+    // through the host so a user `toString` fires. LEFT only, since `collection + element`
+    // is the collection's own `plus`; `String?.plus(Any?)` is what `null + x` resolves to.
     const string_add = bo.op == .Add and (l == .String or l == .Null);
     if (bo.op == .StringConcat or string_add) {
         const ls = switch (try stringify(H, allocator, host, &l)) {
@@ -485,27 +457,19 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
             .err => |e| return errResult(e),
         };
         const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });
-        // `ls`/`rs` are owned renderings (stringify/renderValue allocate
-        // a private copy); `combined` is adopted by the StringRef cell.
-        // Free the two now-dead pieces under a freeing allocator.
+        // `ls`/`rs` are owned renderings; `combined` is adopted by the StringRef cell.
         if (runtime.freeScratch()) {
             allocator.free(ls);
             allocator.free(rs);
         }
         return ok(.{ .String = try runtime.strInitOwned(allocator, combined) });
     }
-    // Collection `+` / `-` operators are stdlib operator
-    // functions on the left collection.
     if ((bo.op == .Add or bo.op == .Sub) and switch (l) {
         .Map, .List, .Set, .Sequence, .Range => true,
         else => false,
     }) {
-        // A compound assign (`xs += y`) onto a mutable collection
-        // dispatches the in-place `plusAssign` / `minusAssign`
-        // (Kotlin prefers `MutableCollection.plusAssign`), so the
-        // collection stays mutable. A read-only collection (or a
-        // plain `xs + y`) takes the `plus` / `minus` path below,
-        // producing a fresh read-only result.
+        // `xs += y` on a MUTABLE collection dispatches the in-place `plusAssign`/`minusAssign`
+        // Kotlin prefers; a read-only receiver or a plain `xs + y` takes `plus`/`minus` below.
         if (bo.compound) {
             const mutable = switch (l) {
                 .List => |c| c.mutable,
@@ -541,16 +505,13 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
             .err => |e| return errResult(e),
         }
     }
-    // Referential identity (`===` / `!==`): pure pointer
-    // identity, never a user `equals` dispatch.
+    // `===`/`!==` is pointer identity, never a user `equals` dispatch.
     if (bo.op == .IdentEq or bo.op == .IdentNeq) {
         const same = Value.referenceEq(&l, &r);
         const b = if (bo.op == .IdentNeq) !same else same;
         return ok(.{ .Bool = b });
     }
-    // Result wrappers have no user `equals` surface of their own, but their
-    // payload equality still follows Kotlin `==`. This matters for value-class
-    // wrappers such as ChannelResult, whose closed holder defines `equals`.
+    // A `Result` has no user `equals` surface of its own; its payload still follows Kotlin `==`.
     if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
         (l == .Result or r == .Result))
     {
@@ -572,10 +533,7 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
         const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
         return ok(.{ .Bool = b });
     }
-    // `x == null` / `x != null` is a null check, never a user `equals`
-    // dispatch (Kotlin compares against the null literal by identity).
-    // Without this, every `?.` safe-call's null guard dispatched
-    // `x.equals(null)` — a full member resolution per access.
+    // `x == null` compares against the null literal by identity, never a user `equals`.
     if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
         (l == .Null or r == .Null))
     {
@@ -583,21 +541,9 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
         const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !both_null else both_null;
         return ok(.{ .Bool = b });
     }
-    // Collection `==` / `!=`: compare element/entry-wise so a user
-    // `equals` override fires (bare structural equality treats a
-    // non-data Instance by identity, so `setOf(P)==setOf(P)`, map value
-    // equality, and nested collections would be wrong).
-    // Set/Map `==` / `!=`: compare element/entry-wise so a user
-    // `equals` override fires (bare structural equality treats a
-    // non-data Instance by identity, so `setOf(P)==setOf(P)` and map
-    // value equality would be wrong). Restricted to a Set/Map operand:
-    // List equality already dispatches element `equals` via
-    // `collectionsEqualHostAware` and its array/sublist views need the
-    // established path.
-    // A native-collection LEFT operand against a user Instance also
-    // routes here: Kotlin dispatches `a.equals(b)` on the LEFT, and a
-    // native Set/List/Map's equals is the collection contract — the
-    // instance need not override `equals` for `setOf(x) == wrapper`.
+    // Set/Map (and Pair/Triple) `==` compares entry-wise so an element's user `equals` fires;
+    // bare structural equality would treat a non-data Instance by identity. A native LEFT
+    // operand against an Instance routes here too, since Kotlin dispatches on the left.
     if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
         ((isSetOrMap(&l) and isSetOrMap(&r)) or
             ((isSetOrMap(&l) or l == .List) and r == .Instance) or
@@ -609,15 +555,13 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
             return ok(.{ .Bool = if (neg) !eq else eq });
         }
     }
-    // Callable references compare by target, bound receiver and adaptation
-    // (two loads of `::f` are equal; two wrappers of the same adaptation of
-    // the same target are equal), never by closure identity alone.
+    // Callable references compare by target, bound receiver and adaptation, never by
+    // closure identity alone.
     if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
         (l == .IrClosure or r == .IrClosure or l == .PropertyRef or r == .PropertyRef) and
         comptime @hasDecl(H, "deepValueEquals"))
     {
-        // A callable against a non-callable, non-instance value is never
-        // equal (`::foo == "foo"`); an instance keeps its own `equals`.
+        // A callable never equals a non-callable value; an Instance keeps its own `equals`.
         const eq = if (l != .Instance and r != .Instance)
             try host.deepValueEquals(allocator, &l, &r)
         else
@@ -626,19 +570,15 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
         if (l != .Instance and r != .Instance) return ok(.{ .Bool = if (neg) !eq else eq });
     }
     if (operatorMethod(bo.op)) |method| {
-        // A comparison between a Char and another scalar has no builtin
-        // order: it resolves to a `compareTo` extension the program
-        // declares (`operator fun Int.compareTo(c: Char)`).
+        // A Char compared with another scalar has no builtin order: only a `compareTo`
+        // extension the program declares can serve it.
         const is_compare = bo.op == .Less or bo.op == .LessEq or bo.op == .Greater or bo.op == .GreaterEq;
         const char_mixed_compare = is_compare and
             ((std.meta.activeTag(l) != std.meta.activeTag(r) and (l == .Char or r == .Char)) or
                 l == .Null or r == .Null or l == .Array or r == .Array);
         if (l == .Instance or r == .Instance or char_mixed_compare) {
-            // A `fun interface` SAM wrapper has no equality of its own —
-            // dispatching `equals` on it routes into the wrapped lambda.
-            // Compare through the wrapper (structuralEq unwraps both
-            // sides), so a memoized lambda equals its converted form no
-            // matter which call boundary happened to wrap it.
+            // A `fun interface` SAM wrapper has no equality of its own: compare through the
+            // wrapper, so a memoized lambda equals its converted form.
             if ((bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) and
                 (Value.samTargetOf(&l) != null or Value.samTargetOf(&r) != null))
             {
@@ -646,25 +586,14 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
                 const bv = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eqv else eqv;
                 return ok(.{ .Bool = bv });
             }
-            // `a == b` dispatches `a.equals(b)`, but a builtin
-            // collection carries only structural equality; when the
-            // left operand is a builtin and the right is a user
-            // Instance (a class implementing Set/List/Map with its own
-            // `equals`), dispatch on the Instance instead. Structural
-            // equality is symmetric, so the result is identical and a
-            // builtin receiver need not implement `equals(Instance)`.
+            // `a == b` dispatches on the LEFT, but a builtin collection carries only structural
+            // equality; swap so a user Instance's own `equals` runs. Equality is symmetric.
             const swap = (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) and l != .Instance and r == .Instance;
             const recv_ptr = if (swap) &r else &l;
             const arg_val = if (swap) l else r;
-            // Strict extension dispatch: an operator extension whose
-            // declared receiver doesn't accept `l` is not a candidate
-            // (kotlinc drops it), so `Unimplemented` surfaces and the
-            // `<op>Assign` fallback below can fire — `config += other`
-            // on a type declaring only `plusAssign` must not bind a
-            // receiver-incompatible `plus` like `String?.plus(Any?)`.
+            // Strict extension dispatch: an operator extension whose declared receiver rejects `l`
+            // is no candidate, so `Unimplemented` surfaces and the `<op>Assign` fallback can fire.
             var result: Value = undefined;
-            // The mixed Char comparison has no member: only an extension
-            // `compareTo` the program declares can serve it.
             const ext_only: ?EvalResult = if (char_mixed_compare and comptime @hasDecl(H, "extensionFnFallback"))
                 try host.extensionFnFallback(allocator, recv_ptr, method, &.{arg_val}, false, null, null)
             else
@@ -672,8 +601,7 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
             switch (ext_only orelse try host.callMemberStrictExt(allocator, recv_ptr, method, &.{arg_val}, &.{null}, null)) {
                 .ok => |v| result = v,
                 .err => |e| switch (e) {
-                    // `a OP= b` lowers to `a = a.OP(b)`, but the
-                    // type may declare only the in-place form.
+                    // The type may declare only the in-place `<op>Assign` form.
                     .Unimplemented => {
                         if (l == .Instance and compoundAssignMethod(bo.op) != null) {
                             const assign = compoundAssignMethod(bo.op).?;
@@ -683,9 +611,7 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
                             }
                             result = l;
                         } else if (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) {
-                            // No user `equals` surface: Kotlin's
-                            // default is structural/identity equality
-                            // (`!=` negates it below).
+                            // Kotlin's default equality is structural.
                             const boxed = bo.op == .BoxedEq or bo.op == .BoxedNotEq;
                             result = .{ .Bool = if (boxed)
                                 Value.structuralEqBoxed(&l, &r)
@@ -698,24 +624,19 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
                     else => return errResult(e),
                 },
             }
-            // compareTo wrappers need to be reduced to a Bool.
             const final_val: Value = switch (bo.op) {
                 .Less => .{ .Bool = if (valueToI64(&result)) |i| i < 0 else false },
                 .LessEq => .{ .Bool = if (valueToI64(&result)) |i| i <= 0 else false },
                 .Greater => .{ .Bool = if (valueToI64(&result)) |i| i > 0 else false },
                 .GreaterEq => .{ .Bool = if (valueToI64(&result)) |i| i >= 0 else false },
-                // `!=`: negate the `equals` result.
                 .NotEq, .BoxedNotEq => if (result == .Bool) Value{ .Bool = !result.Bool } else result,
                 else => result,
             };
             return ok(final_val);
         }
     }
-    // A `..` / `..<` over operands the i64-backed `Range` value cannot
-    // represent — floating point (`ClosedFloatingPointRange`), strings,
-    // or any other `Comparable` (`ClosedRange` via `Comparable.rangeTo`)
-    // — routes to the stdlib `rangeTo`/`rangeUntil` operator. Integer,
-    // Char and unsigned operands are handled by `applyBinop` below.
+    // `..`/`..<` over operands the i64-backed `Range` cannot represent (floating point,
+    // String, any other `Comparable`) routes to the stdlib `rangeTo`/`rangeUntil`.
     if ((bo.op == .RangeTo or bo.op == .RangeUntil) and
         (l == .Double or l == .Float or r == .Double or r == .Float or
             l == .String or r == .String or l == .Instance or r == .Instance))
@@ -728,11 +649,8 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
             .err => |e| return errResult(e),
         }
     }
-    // Builtin-collection equality whose ELEMENTS include user
-    // instances (a windowed tail yields the raw RingBuffer — a
-    // List on the JVM): pure structural comparison cannot
-    // dispatch the element's `equals`, so ask the host for an
-    // element-wise compare before falling back.
+    // A builtin List whose ELEMENTS are user instances needs an element-wise compare to
+    // dispatch their `equals`; structural comparison alone cannot.
     if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
         (l == .List or r == .List))
     {
@@ -747,11 +665,8 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
     }
 }
 
-/// Outlined `execInst` arm — see `execInst`.
-
-/// The stored slot's name against the site's name. Both come from the same
-/// module string pool at nearly every site, so the pointer check settles it
-/// without touching the bytes — this guard runs on EVERY field read.
+/// The stored slot's name against the site's name. Both come from the same module string
+/// pool at nearly every site, so the pointer check settles this per-read guard.
 inline fn sameFieldName(stored: []const u8, want: []const u8) bool {
     if (stored.ptr == want.ptr and stored.len == want.len) return true;
     if (std.mem.eql(u8, stored, want)) return true;
@@ -763,10 +678,8 @@ inline fn sameFieldName(stored: []const u8, want: []const u8) bool {
         want[want.len - stored.len - 1] == '\u{1f}';
 }
 
-/// Dispatch-phase nanoseconds, counted only under `KLIO_FRAME_COUNT`. Only
-/// phases that RETURN before the callee runs are timed: a timer around a
-/// whole dispatch arm would bill the callee's own execution to dispatch,
-/// which is how a 63ns resolution first read as 590ns.
+/// Dispatch-phase nanoseconds under `KLIO_FRAME_COUNT`. Only phases that RETURN before
+/// the callee runs may be timed, or the callee's execution is billed to dispatch.
 pub fn armNow() u64 {
     return gfNow();
 }
@@ -775,8 +688,6 @@ pub fn armIsOn() bool {
     return parent.frame_count_on;
 }
 
-/// Monotonic nanoseconds for the field-read attribution buckets. Read only
-/// when `KLIO_FRAME_COUNT` is on, so the clock never prices a normal run.
 inline fn gfNow() u64 {
     if (!parent.frame_count_on) return 0;
     return @intCast(runtime.clockMonotonicNanos());
@@ -786,7 +697,6 @@ var gf_slow_census_state: u8 = 0;
 
 var gf_slow_census_val: bool = false;
 
-/// `KLIO_GF_SLOW_CENSUS=1`: one line per field read that reaches the ladder.
 fn gfSlowCensusOn() bool {
     if (gf_slow_census_state == 0) {
         gf_slow_census_val = runtime.envOnce("KLIO_GF_SLOW_CENSUS") != null;
@@ -844,12 +754,8 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
         try frame.write(gf.dst, bv);
         return .cont;
     }
-    // A bare class name in value position resolves through the per-class
-    // companion memo, and any NON-class receiver of the sentinel is an
-    // identity read (the host arm returns it unchanged); the site-claim
-    // machinery below never claims these, so without this arm every read
-    // paid the host round-trip (718k sentinel reads in one recompose
-    // test, most of them instance identities).
+    // `<class-companion-or-self>`: a bare class name in value position reads through the
+    // per-class companion memo; a NON-class receiver of the sentinel is an identity read.
     if (std.mem.eql(u8, name, "<class-companion-or-self>")) {
         if (recv == .Class) {
             const g = recv.Class.borrow();
@@ -874,13 +780,8 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             return .cont;
         }
     }
-    // Keep the executing function's receiver reachable as the
-    // enclosing `this` while the field/property is resolved. Inside
-    // a lambda the receiver rides the closure's captured `this`
-    // slot rather than params[0] (`placeable.mainAxisSize` in a
-    // `repeat { }` body needs the enclosing item as the
-    // member-extension property's owner) — `callerThisValue`
-    // resolves both forms.
+    // Keep the executing function's receiver reachable as the enclosing `this` while the
+    // property resolves; in a lambda it rides the captured `this`, which `callerThisValue` finds.
     var pushed_enclosing = false;
     if (callerThisValue(frame)) |ct_v| {
         var ct = ct_v;
@@ -891,10 +792,8 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             pushed_enclosing = true;
         }
     }
-    // Site memo: serve a stored-slot read or a class getter directly when
-    // the receiver's class is the one that claimed this site. The slot
-    // read re-verifies by name and declines the lateinit/delegate shapes,
-    // exactly as the (class, name) memo it mirrors.
+    // Site memo: serve a stored slot or class getter directly when the receiver's class claimed
+    // this site. The slot read re-verifies by name and declines lateinit and delegate shapes.
     if (comptime @hasDecl(H, "fieldSiteRoute")) {
         if (recv == .Instance) {
             const w0 = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
@@ -915,21 +814,15 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                         const idx: usize = @intCast(route >> 2);
                         if (idx >= b.fields.items.len) break :fast;
                         const f = &b.fields.items[idx];
-                        // A recorded LAYOUT match proves the index names this
-                        // property; only a drifted layout (dynamic define)
-                        // pays the name re-verify. The claim key stays the
-                        // CLASS — two classes can share a layout while
-                        // routing the same name differently.
+                        // A recorded LAYOUT match proves the index names this property;
+                        // the claim key stays the CLASS, as two classes can share a layout.
                         if (@atomicLoad(u64, @constCast(&gf.site_shape), .monotonic) != b.shapeOf() and
                             !sameFieldName(f.name, name)) break :fast;
                         const v = f.value;
                         if (v == .Delegate) break :fast;
                         if (parent.frame_count_on) parent.gf_mono += 1;
                         // A stored slot holding NULL is a plain null unless the
-                        // property is an unset `lateinit`, whose read must
-                        // throw. Declining every null sent the commonest field
-                        // shape there is — an optional link (`next`) — down the
-                        // slow ladder on every read.
+                        // property is an unset `lateinit`, whose read must throw.
                         if (v == .Null) {
                             if (comptime !@hasDecl(H, "storedNullServable")) break :fast;
                             if (!nullSiteOk(H, host, &recv, name, @constCast(&gf.null_ok))) break :fast;
@@ -965,11 +858,8 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     }
                 }
             }
-            // A polymorphic site: the mono-class claim belongs to a
-            // different receiver class (an iterator hierarchy sharing one
-            // base-class read site). Serve this class from its own
-            // (class, name) memo route — one probe instead of the slow
-            // ladder — leaving the site's claim untouched.
+            // A polymorphic site: the mono-class claim belongs to another receiver class. Serve this
+            // class from its own (class, name) memo route, leaving the site's claim untouched.
             if (site_mismatch) poly: {
                 const cls_now: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(recv.Instance));
                 const r: struct { route: u64 } = .{
@@ -1035,18 +925,11 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             v.retain();
             if (comptime @hasDecl(H, "fieldSiteRoute")) {
                 if (recv == .Instance and @atomicLoad(u64, @constCast(&gf.site_cls), .monotonic) == 0) {
-                    // Claim only once a route exists. The (class, name) memo
-                    // fills lazily — and not at all while the dispatch
-                    // universe is still unstable — so a no-route first read
-                    // must leave the site unclaimed for a later read to
-                    // retry, or a warmup-executed hot site is pinned to the
-                    // slow ladder for the whole run.
+                    // Claim only once a route exists: the (class, name) memo fills lazily,
+                    // so a no-route first read must leave the site free for a later retry.
                     if (host.fieldSiteRoute(&recv, name)) |r| {
-                        // For a stored route, bind (shape, index, name) under
-                        // ONE borrow — the layout id recorded is exactly the
-                        // one the index was verified against, so the replay's
-                        // shape match can retire the per-hit verify. The
-                        // CLAIM key stays the class.
+                        // Bind (shape, index, name) under ONE borrow, so the recorded
+                        // layout is the one the index was verified against.
                         const shp: u64 = blk: {
                             const g2 = recv.Instance.borrow();
                             defer g2.deinit();
@@ -1072,7 +955,6 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmSetField(comptime H: type, allocator: Allocator, frame: *Frame, sf: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(sf.receiver);
     const v = frame.read(sf.value);
@@ -1086,7 +968,6 @@ noinline fn execArmSetField(comptime H: type, allocator: Allocator, frame: *Fram
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 fn modCountFrozenEval(mc: ?runtime.ObjRef(u64)) bool {
     const cell = mc orelse return false;
     const g = cell.borrow();
@@ -1103,17 +984,9 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
         .ok => |fv| fv,
         .err => |e| return raiseStep(frame, e),
     };
-    // A collection-typed property compound-assigns in place: Kotlin
-    // dispatches `<op>Assign` on the field value and never reassigns
-    // the property. A mutable collection mutates; a read-only view
-    // (`map.entries`, `keys`, `values`) raises UnsupportedOperationException
-    // from its `add`. Either way there is NO write-back to the
-    // (read-only) property.
-    // A READ-ONLY collection value cannot inhabit a Mutable*-typed
-    // property in well-typed Kotlin, so its `+=` resolved to the binary
-    // `plus` with a property write-back (`var invalidations: List<...>;
-    // reference.invalidations += pair` builds a NEW list) — never the
-    // in-place `plusAssign` (which the intrinsic guard would refuse).
+    // A MUTABLE collection property compound-assigns in place: Kotlin dispatches `<op>Assign`
+    // on the field value with NO write-back. A read-only value resolves to the binary `plus`
+    // instead, and the property write-back below stores the fresh result.
     const is_collection = switch (cur) {
         .List => |l| l.mutable and !modCountFrozenEval(l.mod_count.get()),
         .Set => |st| st.mutable and !modCountFrozenEval(st.mod_count.get()),
@@ -1128,10 +1001,7 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
         }
         return .cont;
     }
-    // A user instance may declare the in-place operator
-    // (`operator fun plusAssign`); prefer it, mutating in place with no
-    // write-back. Fall through to read-modify-write only when the type
-    // has no `<op>Assign`.
+    // Prefer a user-declared `<op>Assign`: it mutates in place with no write-back.
     if (cur == .Instance and assign != null) {
         switch (try host.callMember(allocator, &cur, assign.?, &.{v})) {
             .ok => return .cont,
@@ -1141,10 +1011,7 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
             },
         }
     }
-    // Read-modify-write: compute `cur.<op>(value)` and reassign the
-    // property. Scalars and strings combine via `applyBinop`; a user
-    // type with only the binary operator (`operator fun plus`) routes
-    // through `callMember`.
+    // Read-modify-write: compute `cur.<op>(value)` and reassign the property.
     const combined: Value = blk: {
         if (cur == .Instance) {
             if (operatorMethod(cf.op)) |method| {
@@ -1154,9 +1021,7 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
                 }
             }
         }
-        // A read-only collection combines through its binary operator
-        // intrinsic (`List + element`, `Map + Pair`), producing the fresh
-        // value the property write-back stores.
+        // A read-only collection combines through its binary operator intrinsic.
         switch (cur) {
             .List, .Set, .Map => {
                 if (operatorMethod(cf.op)) |method| {
@@ -1173,9 +1038,7 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
             .err => |e| return raiseStep(frame, e),
         }
     };
-    // `combined` is an owned value (applyBinop / a user operator both
-    // hand back a fresh reference); `setField` retains its own copy, so
-    // drop ours now to balance.
+    // `combined` is owned and `setField` retains its own copy, so drop ours to balance.
     const r = try host.setField(allocator, &recv, name, combined);
     combined.release(allocator);
     switch (r) {
@@ -1185,14 +1048,8 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
-
-/// A member call site that sees more than one receiver class re-ran the
-/// whole resolution ladder on every call — the single claimed class in the
-/// instruction only ever serves one of them. Compose's changelist walks ~40
-/// `Operation` subclasses through one site, so remember the resolved target
-/// per (site, class, argument signature) instead. The dispatch generation is
-/// folded into the key, so a cache flush invalidates every entry at once.
+/// Per-(site, class, argument signature) memo for a member site that sees more than one
+/// receiver class; the dispatch generation is in the key, so a flush drops every entry.
 const CALL_PIC_SLOTS: usize = 1 << 14;
 
 const CallPicEnt = struct { key: u64 = 0, fid: u32 = 0 };
@@ -1277,10 +1134,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             }
         }
     }
-    // Complete lowering evidence selected this declaration. Execute that
-    // identity before representation-specific member fast paths; an invalid
-    // identity is an image/link error, never permission to reinterpret the
-    // call through name-based dispatch.
+    // Complete lowering evidence selected this declaration: execute that identity before any
+    // representation fast path. An invalid one is a link error, never licence to re-resolve.
     if (cm.resolved) |fid| {
         dispatchBump(.call_member_resolved);
         if (comptime @hasDecl(H, "invokeResolvedMember")) {
@@ -1294,10 +1149,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             defer if (dispatch_recv) |value| value.release(allocator);
             const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
             defer allocator.free(ra);
-            // Scalar-replay leaf on the lowering-resolved member: the
-            // receiver rides as param 0 (opaque genre when non-scalar); a
-            // bail falls through to the ordinary invokers, which re-run
-            // the pure body exactly.
+            // Scalar-replay leaf: the receiver rides as param 0 (opaque genre when non-scalar);
+            // a bail falls through to the ordinary invokers, which re-run the pure body exactly.
             if (argNamesAllNull(cm.arg_names) and ra.len + 1 <= 8 and
                 cm.dispatch_receiver == null and recv != .Null) leaf: {
                 const lf = frame.module.funcById(fid) orelse break :leaf;
@@ -1312,10 +1165,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                     .raise => |e| return raiseStep(frame, e),
                 };
             }
-            // A lowering-resolved plain member at the fully-applied no-vararg
-            // shape runs as a pushed activation; member extensions (which
-            // seed the dispatch receiver) and every padded/vararg shape keep
-            // the recursive invoker.
+            // A resolved plain member at the fully-applied no-vararg shape runs as a pushed activation;
+            // member extensions and every padded or vararg shape keep the recursive invoker.
             if (comptime @hasDecl(H, "prepareResolvedFlatCall")) {
                 if (flatEnabled() and vcallFlatEnabled() and argNamesAllNull(cm.arg_names)) {
                     if (try host.prepareResolvedFlatCall(allocator, &recv, fid, ra)) |prep0| {
@@ -1361,10 +1212,6 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         try frame.write(cm.dst, rv);
         return .cont;
     }
-    // Fast path: a range iterator's `hasNext()`/`next()`. The universal
-    // `for (x in range)` desugaring calls these once per element; the
-    // inline handler avoids the member-dispatch hashmap probes that
-    // otherwise dominate tight integer loops.
     if (recv == .RangeIter) {
         if (constStr(frame.module, cm.name)) |nm| {
             if (rangeIterFast(allocator, &recv, nm, cm.n_args)) |r| {
@@ -1379,12 +1226,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             }
         }
     }
-    // A method borrows its receiver for the call's whole duration.
-    // Pin it: the dispatched body may, via the coroutine machinery,
-    // drop every other reference to the receiver (e.g. a job
-    // completing inside `runBlocking.joinBlocking`), and the register
-    // read is only a borrow. Retain across the dispatch so the
-    // receiver outlives the call regardless. No-op under the arena.
+    // Pin the receiver across the dispatch: the register read is only a borrow, and the
+    // callee may drop every other reference (a job completing inside `joinBlocking`).
     recv.retain();
     defer recv.release(allocator);
     const name_str = constStr(frame.module, cm.name) orelse
@@ -1396,11 +1239,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
     defer freeArgNames(allocator, names);
-    // Keep the caller's instance `this` reachable while the
-    // `recv.member(...)` dispatch resolves (the member-extension
-    // visibility filter consults the chain); the callee's own
-    // lexical scope is its dispatch receiver, so the entry is
-    // access-only.
+    // Keep the caller's instance `this` reachable while the dispatch resolves (the
+    // member-extension visibility filter consults the chain); the entry is access-only.
     var pushed_enclosing = false;
     if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
         const pi = frame.params.items[0].Instance;
@@ -1412,10 +1252,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     }
     const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
     const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
-    // Site memo replay: the claimed (class, arg-signature) pair serves its
-    // recorded target without the string-keyed cache probe. The signature is
-    // the same strict fold the method cache keys under, so the replay can
-    // never serve an overload that cache would have discriminated.
+    // Site memo replay: the claimed (class, arg-signature) pair serves its recorded target.
+    // The signature is the same strict fold the method cache keys under, so no overload slips.
     if (parent.frame_count_on) parent.cm_pre_ns +%= gfNow() -% cm_t0;
     if (comptime @hasDecl(H, "memberSiteSig") and @hasDecl(H, "prepareMemberFlatFromFid")) {
         if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names)) {
@@ -1423,8 +1261,6 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             if (w0 > 1) site: {
                 const cls_now: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(recv.Instance));
                 if (w0 != cls_now) {
-                    // A polymorphic site: this class has its own remembered
-                    // target, so it never re-runs the ladder either.
                     const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
                     const sig_p = host.memberSiteSig(arg_values) orelse break :site;
                     const fid_p = callPicGet(@intFromPtr(cm), cls_now, sig_p, gen) orelse break :site;
@@ -1453,9 +1289,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 if (route == 0) break :site;
                 const sig_now = host.memberSiteSig(arg_values) orelse break :site;
                 if (sig_now != @atomicLoad(u64, @constCast(&cm.site_sig), .monotonic)) break :site;
-                // Route bit0 = 1 carries a flat-call FuncId; bit0 = 0
-                // carries a host-serve kind (the CHAMP builder ops) that
-                // answers without any call machinery.
+                // Route bit0 = 1 carries a flat-call FuncId; bit0 = 0 carries a
+                // host-serve kind that answers without any call machinery.
                 if (route & 1 == 0) {
                     if (comptime @hasDecl(H, "hostMemberServeKind")) {
                         if (try host.hostMemberServeKind(allocator, @intCast(route >> 1), &recv, arg_values)) |served| {
@@ -1489,10 +1324,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             }
         }
     }
-    // Flat member dispatch: a previously-resolved user method (or cached
-    // top-level extension) at the fully-applied no-vararg shape runs as a
-    // pushed activation. The host consults the same caches the recursive
-    // ladder's entry consults; anything else falls through to the ladder.
+    // Flat member dispatch: a resolved method or cached top-level extension at the
+    // fully-applied no-vararg shape runs as a pushed activation; the rest fall to the ladder.
     if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
         if (flatEnabled()) {
             runtime.prof.opRoute(1);
@@ -1503,9 +1336,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             const prep_opt: ?FlatCallReq = if (argNamesAllNull(cm.arg_names))
                 try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)
             else if (comptime @hasDecl(H, "prepareMemberFlatCallNamed"))
-                // A NAMED call whose binding permutation is already known
-                // replays it into declaration order and runs flat, exactly
-                // as the positional form does.
+                // A NAMED call whose binding permutation is known replays into declaration order.
                 try host.prepareMemberFlatCallNamed(allocator, &recv, name_str, arg_values, names, static_recv, declared_recv)
             else
                 null;
@@ -1514,10 +1345,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
-                // Claim the site memo for the resolved target, keyed by the
-                // receiver class and the strict argument signature. Claimed
-                // only once resolution is stable (the same gate the host's
-                // own caches fill under) and only for the positional form.
+                // Claim the site memo for the resolved target, keyed by receiver class and strict
+                // argument signature, once resolution is stable and only for the positional form.
                 if (comptime @hasDecl(H, "memberSiteSig")) {
                     if (memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names) and
                         dispatchCacheStable())
@@ -1528,9 +1357,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                                 @atomicStore(u64, @constCast(&cm.site_sig), sig, .monotonic);
                                 @atomicStore(u64, @constCast(&cm.site_route), (@as(u64, prep.func.id.int()) << 1) | 1, .release);
                             } else if (cls > 1) {
-                                // The instruction already belongs to another
-                                // class: remember this one in the per-site
-                                // cache so it stops re-resolving too.
+                                // The site is claimed by another class; memo this one.
                                 const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
                                 callPicPut(@intFromPtr(cm), cls, sig, gen, prep.func.id.int());
                             }
@@ -1543,9 +1370,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             }
         }
     }
-    // Host member serves (the CHAMP builder ops) answer here, ahead of the
-    // ladder entry, and claim the site memo with a host-kind route so later
-    // executions skip the flat-prepare decline walk entirely.
+    // Host member serves answer ahead of the ladder entry and claim the site with a
+    // host-kind route, so later executions skip the flat-prepare decline walk.
     if (comptime @hasDecl(H, "hostMemberServeProbe")) {
         if (recv == .Instance and argNamesAllNull(cm.arg_names)) {
             if (try host.hostMemberServeProbe(allocator, &recv, name_str, arg_values)) |hit| {
@@ -1597,15 +1423,13 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     return .cont;
 }
 
-/// The full `LoadGlobal` semantics with no frame coupling — the framed arm
-/// and the fused tier both call this. The result is RETAINED for the
-/// caller's register.
+/// `LoadGlobal` semantics with no frame coupling: the framed arm and the fused tier both
+/// call this. The result is RETAINED for the caller's register.
 pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Module, lg: anytype, host: *H) Allocator.Error!EvalResult {
     {
             const name_str = constStr(module, lg.name) orelse
                 return errResult(.{ .Type = "LoadGlobal: name not a string const" });
-            // A lowering-resolved identity binds that exact declaration;
-            // the name string is only the unresolved-shape fallback.
+            // A lowering-resolved identity binds that exact declaration; the name is the fallback.
             const by_id: ?Value = if (lg.func != null or lg.class != null)
                 host.lookupGlobalById(allocator, lg.func, lg.class, lg.ctor_ref)
             else
@@ -1615,16 +1439,13 @@ pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Mo
                 .ok => |maybe| maybe,
                 .err => |e| return errResult(e),
             };
-            // No receiver probe here: a `LoadGlobal` is emitted only where
-            // no implicit receiver can shadow the name, and kotlinc
-            // rejects resolving it against a *caller's* receiver (dynamic
-            // scope), so a miss is a hard unresolved reference.
+            // No receiver probe: `LoadGlobal` is emitted only where no implicit receiver can shadow
+            // the name, and Kotlin rejects resolving it against a caller's receiver.
             var v: Value = undefined;
             if (found) |fv| {
                 v = fv;
             } else if (comptime @hasDecl(H, "callFunc")) {
-                // A top-level `val`/`var` declared with only a custom getter
-                // has no global binding; re-run its 0-arg getter on each read.
+                // A top-level `val`/`var` with only a custom getter has no binding; re-run its getter.
                 if (module.registry.top_level_prop_getters.get(name_str)) |getter_fid| {
                     switch (try host.callFunc(allocator, module, getter_fid, &.{})) {
                         .ok => |gv| {
@@ -1633,12 +1454,8 @@ pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Mo
                         .err => |e| return errResult(e),
                     }
                 }
-                // A qualified class/companion member the lowering flattened to
-                // one global name (`import X.Companion.Y` baked as the FQN
-                // `pkg.X.Y`): no such global binding exists, but the owner
-                // class does — split at the last dot and read the member off
-                // the class value (which serves companion fields), so the
-                // import aliases the SAME value `X.Y` reads.
+                // A qualified companion member the lowering flattened to one global name (`pkg.X.Y`) has
+                // no global binding: split at the last dot and read the member off the owner class value.
                 if (std.mem.findScalarLast(u8, name_str, '.')) |dot| {
                     if (dot != 0 and dot + 1 < name_str.len) {
                         const owner_v: ?Value = switch (try host.lookupGlobalThrowing(allocator, name_str[0..dot])) {
@@ -1658,12 +1475,8 @@ pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Mo
                         }
                     }
                 }
-                // A `$lc<fn>`-mangled LOCAL class name (`Local$lcmain`) is how
-                // lowering refers to a local class, but the runtime registers
-                // it under its simple declared name (`Local`). A reified
-                // splice that materialized the mangled name as a global —
-                // `Json.encodeToString(localValue)` -> `Local$lcmain.serializer()`
-                // — resolves through the simple name.
+                // A `$lc<fn>`-mangled local class name (`Local$lcmain`) is how lowering names a local
+                // class; the runtime registers it under the simple declared name.
                 if (std.mem.find(u8, name_str, "$lc")) |lci| {
                     const simple = name_str[0..lci];
                     if (simple.len != 0) {
@@ -1694,13 +1507,3 @@ pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Mo
             return ok(v);
     }
 }
-
-// ---- The fused execution tier -----------------------------------------------
-//
-// A body the classifier accepts runs with its registers in a per-thread
-// C bank: no Frame, no register pool, no activation bookkeeping. Unlike the
-// leaf tier there is NO abandon — fused bodies contain writes, so every
-// admitted instruction either executes or RAISES exactly as the framed arm
-// would, and classification is TRANSITIVE over statically-resolved calls so
-// no framed machinery (and no suspension) can ever appear beneath a fused
-// activation. `KLIO_FUSED=0` disables the tier.

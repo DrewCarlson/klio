@@ -1,16 +1,9 @@
-//! IR evaluator.
+//! IR evaluator: runs a `Func`'s blocks over its register file and yields a
+//! `Value`, trapping an `Inst` the lowering pass never emits as `EvalError.Unsupported`.
 //!
-//! Walks a `Func`'s `[]Block` and produces a `Value`. Today
-//! supports the subset of `Inst`s the lowering pass emits: `Const`,
-//! `BinOp`, `UnOp`, `Not`, `Move`, plus `Goto` / `Branch` / `Return`
-//! / `Throw` / `Unreachable` terminators. Other ops trap as
-//! `EvalError.Unsupported`.
-//!
-//! The evaluator does not yet replace the tree-walking interpreter.
-//! It exists so the IR shape can be exercised end-to-end on
-//! hand-built or lowered modules; as the lowering pass grows, the
-//! evaluator grows alongside it, and the cutover lands once parity
-//! holds across the corpus.
+//! This root re-exports the `eval/` submodules (state, frame, activation, enter,
+//! exec, flow, inst, fused, leaf, loop, native, snapshot, chain, diag, values,
+//! host) and holds the process-wide counters and the hooks the host installs.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -148,61 +141,35 @@ pub const stackTraceArray = ev_diag.stackTraceArray;
 pub const formatThrowable = ev_diag.formatThrowable;
 pub const attachStackTrace = ev_diag.attachStackTrace;
 
-/// Per-test wall-clock deadline (monotonic milliseconds), 0 = disarmed.
-/// The test runner arms it before each test phase and clears it after;
-/// the eval loop's counter gate checks it on every thread, so a wedged
-/// pump or a real-thread deadlock unwinds as a test failure instead of
-/// hanging the whole class. Deliberately NOT cleared on fire: a lenient
-/// dispatch arm that swallows the first error meets the deadline again
-/// at the next gate, so retry ladders cannot absorb it.
+/// Per-test wall-clock deadline in monotonic milliseconds, 0 = disarmed; the eval loop's counter gate checks it on every thread.
+/// Deliberately not cleared when it fires, so a dispatch arm that swallows the first error meets it again at the next gate.
 pub var test_wall_deadline_ms = std.atomic.Value(i64).init(0);
 
-/// Threads currently inside at least one interpreted activation (the
-/// outermost `runFrame` entry). The test runner's wall-cap drain polls this
-/// to know every abandoned cohort member has actually LEFT interpreted code
-/// before it clears the abandonment flags — a straggler that outlives a
-/// fixed grace window would otherwise keep running its dead test's loops
-/// (with the flags cleared, forever) and contaminate every later test in
-/// the class.
+/// Threads currently inside an outermost `runFrame`. The wall-cap drain polls this to know every abandoned thread
+/// has left interpreted code before it clears the abandonment flags, so no straggler runs on into a later test.
 pub var threads_in_eval = std.atomic.Value(u32).init(0);
 
-/// First wall-cap fire already threw the catchable timeout on some thread;
-/// a second expiry (the extended unwind deadline) hard-aborts. Reset by the
-/// test runner when it arms a fresh deadline.
+/// The wall cap has already thrown its catchable timeout on some thread; a second expiry hard-aborts. The test runner resets it when it arms a deadline.
 pub var wall_cap_thrown = std.atomic.Value(bool).init(false);
 
-/// Installed by the VM host so the stats dump can report how many named
-/// member calls the builtin intrinsic replay served outright. `member_ladder`
-/// counts the ROUTE a call took, not the work it did, so the two differ.
+/// Installed by the VM host: named member calls the builtin intrinsic replay served outright, which `member_ladder` (a route count) does not measure.
 pub var dispatch_replay_hits: ?*const fn () u64 = null;
 
-/// Set by the host so the dispatch report can name how the member-extension
-/// fallback resolved: a plain-key hit, a chain-folded hit, or a full walk.
+/// Set by the host so the dispatch report can name how the member-extension fallback resolved: plain-key hit, chain-folded hit, or full walk.
 pub var ext_fb_counts: ?*const fn () [4]u64 = null;
 
-/// KLIO_FN_PROF report: the sampler's per-id counts resolved to function
-/// names through `module`. Ids fold into the table, so a name is reported
-/// only when its id owns the slot; the fold is 1:1 for every program with
-/// fewer functions than the table's slots.
-/// KLIO_FRAME_COUNT / KLIO_FRAME_CENSUS: how many interpreted activations a
-/// workload runs, and which functions they belong to. `activations` counts
-/// register-bank acquisitions (one per real frame); `entries` counts
-/// `runFrameExec` entries, which is higher because a flat call re-enters its
-/// caller's frame. The frames-per-unit-of-work metric that separates "too
-/// many frames" (splice work) from "frames too expensive" (activation cost).
+/// `KLIO_FRAME_COUNT`: `frame_count_total` counts `runFrameExec` entries, `frame_alloc_total` register-bank acquisitions (one per real frame). A flat call re-enters its caller's frame, so entries run higher.
 pub var frame_count_total: u64 = 0;
 pub var frame_alloc_total: u64 = 0;
 pub var frame_count_on: bool = false;
 
 pub var frame_watch_want: []const u8 = "";
 
-/// Executed-instruction total (`KLIO_FRAME_COUNT` prints it): the denominator
-/// that turns a sampled opcode profile into a per-instruction cost.
+/// Executed-instruction total: the denominator that turns a sampled opcode profile into a per-instruction cost.
 pub threadlocal var inst_count: u64 = 0;
 pub var inst_count_all: std.atomic.Value(u64) = .init(0);
 
-/// Delivery-route tag for KLIO_RESUME_TRACE: which host path drove the
-/// current resume (park slot, persisted take, adopt, inline claim...).
+/// Delivery-route tag for `KLIO_RESUME_TRACE`: which host path drove the current resume (park slot, persisted take, adopt, inline claim).
 pub threadlocal var resume_route: []const u8 = "?";
 
 const ev_chain = @import("eval/chain.zig");
@@ -325,10 +292,6 @@ const ev_inst = @import("eval/inst.zig");
 pub const armNow = ev_inst.armNow;
 pub const armIsOn = ev_inst.armIsOn;
 
-/// A field-read site that sees more than one receiver class re-asked the
-/// host's (class, name) memo on every read, which interns the name and
-/// probes a hash map. Remember the answer per (site, class) instead: the
-/// route is a pure function of that pair.
 pub var cm_calls: u64 = 0;
 pub var cm_args_ns: u64 = 0;
 pub var cm_prep_ns: u64 = 0;

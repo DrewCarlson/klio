@@ -43,29 +43,19 @@ const ok = ev_flow.ok;
 const scalarBin = ev_exec.scalarBin;
 const serveOuterSlotRoute = ev_diag.serveOuterSlotRoute;
 
-/// Per-thread bank of leaf register files, one per nesting level. A stack
-/// array would be `undefined`-filled on entry under the safety builds (and
-/// zeroed under any build), which for a two-instruction accessor costs more
-/// than the frame the serve replaces; the bank is initialised once per
-/// thread and each level owns its slice for the serve's duration.
+/// Per-thread bank of leaf register files, one per nesting level. Each level owns its slice
+/// for the duration of its serve; the bank is initialised once per thread.
 pub const LEAF_BANK_DEPTH: usize = 8;
 
 threadlocal var leaf_bank: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined;
 
-/// Scratch for the leaf serve's literal-typing coercion, per nesting level.
-/// A per-call `[LEAF_MAX_REGS]Value = undefined` stack array paid a 2.5KB
-/// safety-mode 0xAA fill on EVERY serve — 15% of the compose slot-table
-/// benchmark's whole profile; the threadlocal bank is initialized once per
-/// thread and reused.
+/// Per-thread scratch for the leaf serve's literal-typing coercion, one buffer per nesting level.
 pub threadlocal var coerce_bank: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined;
 
-/// How far a leaf serve chains into other leaf callees. A gap-buffer read is
-/// typically three levels (`groupSize` -> `groupIndexToAddress` -> the array
-/// index helper); the bound keeps the native recursion trivially finite.
+/// How far a leaf serve chains into other leaf callees, bounding the native recursion.
 pub const LEAF_MAX_DEPTH: u8 = 8;
 
-/// Raised by the walk when an instruction needs the frame path. Caught at the
-/// serve boundary, where it becomes a plain "declined".
+/// Raised when an instruction needs the frame path; the serve boundary turns it into a decline.
 const LeafAbandon = error{LeafAbandon};
 
 pub fn leafReqServable(req: FlatCallReq) bool {
@@ -105,11 +95,8 @@ pub fn leafExprServeAt(
         if (trace) std.debug.print("[leaf] {s}: arity {d} vs {d}\n", .{ func.name, args.len, func.params.len });
         return null;
     }
-    // The literal-typing coercions a real frame push applies
-    // (Frame.newWithCaptures) apply on this serve too: a bare Int flowing
-    // into a declared Long param, or into a shared type-variable slot
-    // beside a Long peer, is a Long-typed literal — `eq(0, 0L)` must
-    // compare two Longs here exactly as on the framed path.
+    // The literal-typing coercions a frame push applies hold here too: a bare Int flowing into a
+    // declared Long param, or into a shared type-variable slot beside a Long peer, is a Long literal.
     const reclaim = runtime.reclaimEnabled();
     const ev: *EvalTls = &ev_state.evtls;
     if (ev.leaf_depth >= LEAF_BANK_DEPTH) return null;
@@ -124,18 +111,12 @@ pub fn leafExprServeAt(
             eff_args = coerce_buf;
         }
     }
-    // Only the body's own locals are live, and they come from the per-thread
-    // bank rather than a fresh stack array.
     const nlive: usize = @min(@as(usize, func.n_locals), ir.LEAF_MAX_REGS);
     const regs: []Value = leaf_bank[ev.leaf_depth][0..nlive];
     ev.leaf_depth += 1;
     defer ev.leaf_depth -= 1;
-    // A def-before-use-proven body never reads a stale slot, so the bank
-    // keeps whatever the previous serve left; the fill stays for reclaim
-    // builds (each write releases the slot's prior value, which must be
-    // live) and unproven bodies. `wmask` tracks which slots the serve has
-    // written so a lazy pin can zero the rest first (the keepalive pins the
-    // whole slice, and a stale slot must not reach the collector).
+    // `wmask` marks the slots this serve has written; an unwritten slot reads as the fill value.
+    // Reclaim builds fill eagerly instead, since every write releases the slot's prior value.
     var wmask: u64 = 0;
     if (reclaim) {
         for (regs) |*v| v.* = .Unit;
@@ -144,11 +125,8 @@ pub fn leafExprServeAt(
     defer if (reclaim) {
         for (regs) |*v| v.release(allocator);
     };
-    // The register file is a native local, invisible to the collector's frame
-    // walk, so an instruction that can allocate must pin it first or a
-    // collection could sweep an intermediate. Pinning is deferred to the
-    // first such instruction: a plain field-and-arithmetic accessor — the
-    // shape this exists for — reaches no safe point and pays nothing.
+    // The register file is a native local, invisible to the collector's frame walk, so an instruction
+    // that can allocate pins it first. The pin is deferred to the first such instruction.
     var pin: ?usize = null;
     defer if (pin) |m| runtime.keepaliveRestore(m);
     const fs: ?*const bc.FuncStreams = if (bc.enabled())
@@ -162,20 +140,13 @@ pub fn leafExprServeAt(
         error.LeafAbandon => return null,
         error.OutOfMemory => return error.OutOfMemory,
     };
-    // The register file is released on the way out; the caller owns one
-    // reference to the result, exactly as a returning frame would hand over.
+    // The caller owns one reference to the result, exactly as a returning frame hands it over.
     out.retain();
     return EvalResult{ .ok = out };
 }
 
-/// The leaf walk over the function's DENSE bytecode stream: the same op
-/// set the framed flat loop runs, over the leaf bank. The Inst-union
-/// re-walk this replaces was the single largest cost of call-dense
-/// interpreted code (~35% of a 3M-call benchmark); simple ops decode from
-/// packed u32s here, and only the complex ops (`escape`) touch the union,
-/// through the same `leafRunOne` the fallback walker uses. Any structure
-/// the stream cannot express abandons to the framed path exactly as the
-/// union walker would.
+/// The leaf walk over the function's DENSE bytecode stream: the same op set the framed flat loop
+/// runs, over the leaf bank. Complex ops reach `leafRunOne`; what the stream cannot express abandons.
 fn leafWalkStream(
     comptime H: type,
     allocator: Allocator,
@@ -276,8 +247,7 @@ fn leafWalkStream(
                 },
             }
         }
-        // Off the stream's end (or `term_exit`): the block's REAL
-        // terminator decides, exactly as the union walker's loop does.
+        // Off the stream's end (or `term_exit`): the block's real terminator decides.
         switch (func.blocks[block].terminator) {
             .Return => |r| {
                 const rr = r orelse return .Unit;
@@ -294,9 +264,7 @@ fn leafWalkStream(
     }
 }
 
-/// Walk the body's blocks until one returns. `Goto`/`Branch` are followed;
-/// everything else about the body was admitted structurally, and any
-/// individual instruction the serve cannot execute abandons here.
+/// Walk the body's blocks until one returns; an instruction the serve cannot execute abandons here.
 fn leafWalk(
     comptime H: type,
     allocator: Allocator,
@@ -333,9 +301,7 @@ fn leafWalk(
                 }
                 block_idx = if (c.Bool) br.t.int() else br.f.int();
             },
-            // A guard's throwing arm is admitted structurally but never
-            // executed here: raising needs the frame path's unwind machinery.
-            // `leafExprBody` admits no other terminator.
+            // A guard's throwing arm never executes here: raising needs the frame path's unwind machinery.
             else => return error.LeafAbandon,
         }
     }
@@ -361,9 +327,7 @@ fn leafRunInsts(
     }
 }
 
-/// One leaf-body instruction — shared by the Inst-union walker above and
-/// the dense-stream walker (`leafWalkStream`), whose `escape` ops land
-/// here.
+/// One leaf-body instruction, shared by the union walker and the dense stream's `escape` ops.
 fn leafRunOne(
     comptime H: type,
     allocator: Allocator,
@@ -435,11 +399,7 @@ fn leafRunOne(
                 if (!leafWrite(allocator, regs, gf.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .CallMember => |cm| {
-                // The value-level fast serves only: a primitive bit/conversion
-                // member is a pure function of its receiver and argument, so
-                // the frameless walk can run it. The gap-buffer and trie
-                // helpers this exists for (`indexSegment`, the mask/shift
-                // predicates) are otherwise a full activation per bit twiddle.
+                // A primitive bit/conversion member is a pure function of its receiver and argument.
                 if (cm.arg_names.len != 0 or cm.n_args > 1) return error.LeafAbandon;
                 const recv = leafRead(regs, wmask.*, cm.receiver) orelse return error.LeafAbandon;
                 const nm = constStr(module, cm.name) orelse return error.LeafAbandon;
@@ -448,10 +408,7 @@ fn leafRunOne(
                 else
                     null;
                 const mv = primitiveMemberOp(&recv, nm, marg) orelse blk: {
-                    // `data[idx]` on a container lowers as a `get` member
-                    // call in accessor bodies; serve it exactly as the
-                    // `.Index` arm below does (a bounds miss abandons to
-                    // the framed path, which raises properly).
+                    // `data[idx]` lowers as a `get` member call here; a bounds miss abandons.
                     if (marg) |ia| {
                         if (std.mem.eql(u8, nm, "get")) {
                             if (fastIndexGet(&recv, &ia)) |v| break :blk v;
@@ -472,9 +429,8 @@ fn leafRunOne(
                 if (!leafWrite(allocator, regs, ix.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .LoadGlobal => |lg| {
-                // Only a plain-name scalar read is servable: an identity-
-                // resolved binding is a function/class value, and anything
-                // non-scalar may need the singleton/init/delegate machinery.
+                // Only a plain-name scalar read is servable: an identity-resolved binding is a
+                // function or class value, and the rest may need singleton/init/delegate machinery.
                 if (comptime !@hasDecl(H, "leafGlobalGet")) return error.LeafAbandon;
                 if (lg.func != null or lg.class != null or lg.ctor_ref) return error.LeafAbandon;
                 const gname = constStr(module, lg.name) orelse return error.LeafAbandon;
@@ -515,18 +471,14 @@ fn leafRunOne(
                     }
                     return error.LeafAbandon;
                 }
-                // A symbol the link step settled onto a native binding, or one
-                // that redirects to a sibling declaration, does not run this
-                // body at all.
+                // A natively bound or redirected symbol never runs this body.
                 if (!host.funcRunsItsBody(c.func)) {
                     if (trace) std.debug.print("[leaf] {s}: callee {s} resolves elsewhere\n", .{ func.name, callee.name });
                     return error.LeafAbandon;
                 }
                 const base = c.args.int();
                 if (base + c.n_args > regs.len) return error.LeafAbandon;
-                // The arg slice reads raw slots: settle any not-yet-written
-                // one to the fill value first (the lazy-fill invariant every
-                // masked read enforces individually).
+                // The arg slice reads raw slots: settle unwritten ones to the fill value first.
                 var ai: usize = base;
                 while (ai < base + c.n_args) : (ai += 1) {
                     if (ai < 64 and (wmask.* >> @as(u6, @intCast(ai))) & 1 == 0) {
@@ -542,8 +494,7 @@ fn leafRunOne(
             },
             else => |other| {
                 if (trace) std.debug.print("[leaf] {s}: unsupported {s}\n", .{ func.name, @tagName(other) });
-                // Structural: this instruction can never serve, so no
-                // future attempt on this body can succeed.
+                // Structural: no future attempt on this body can succeed.
                 @constCast(func).leaf_hopeless = 1;
                 return error.LeafAbandon;
             },
@@ -551,8 +502,7 @@ fn leafRunOne(
     }
 }
 
-/// `KLIO_LEAF_TRACE=<name>` — report why the frameless leaf serve declined
-/// for a matching function.
+/// `KLIO_LEAF_TRACE=<name>`: report why the frameless leaf serve declined for a matching function.
 var leaf_trace_state: u8 = 0;
 
 var leaf_trace_want: []const u8 = "";
@@ -567,18 +517,10 @@ fn leafTraceWant(func: *const Func) bool {
     return std.mem.find(u8, func.name, leaf_trace_want) != null;
 }
 
-/// The declared members of a builtin receiver that no user declaration can
-/// shadow and that the field ladder reaches only after some sixty name
-/// comparisons. Array length reads dominate the slow-ladder field census on a
-/// composition workload, so answer them without entering the ladder.
+/// Members of a builtin receiver answered without entering the field ladder.
 pub fn builtinFieldFast(comptime H: type, host: *H, allocator: Allocator, recv: *const Value, name: []const u8) Allocator.Error!?Value {
-    // `indices` / `lastIndex` over any host container with a direct
-    // length: the same answers the host field arm computes, minus the
-    // ladder. The map CAS loop's `fastForEach` read `List.indices`
-    // through the slow ladder 220k times in one run. Both names are
-    // SHADOWABLE stdlib extension properties, so the serve is gated on
-    // the host's program-wide verdict that no user declaration shadows
-    // them (a user `List.indices` must win through the ladder).
+    // `indices` and `lastIndex` are shadowable stdlib extension properties, so the serve is gated on
+    // the host's program-wide verdict that no user declaration shadows them.
     if (std.mem.eql(u8, name, "indices") or std.mem.eql(u8, name, "lastIndex")) {
         const servable = if (comptime @hasDecl(H, "builtinIndexPropsServable")) host.builtinIndexPropsServable() else false;
         if (!servable) return null;
@@ -610,11 +552,8 @@ pub fn builtinFieldFast(comptime H: type, host: *H, allocator: Allocator, recv: 
             defer g.deinit();
             return Value.newInt(@intCast(g.get().u16_len));
         },
-        // Plain container sizes: `backing != null` marks a live VIEW
-        // (`subList`, a map's `values`), whose length the view machinery
-        // computes — only backing-free containers read their own item
-        // list here. `Stack.size` -> `backing.size` otherwise paid the
-        // slow field ladder on every read (678k in one recompose test).
+        // `backing != null` marks a live view (`subList`, a map's `values`) whose length the view
+        // machinery computes; only backing-free containers read their own item list here.
         .List => |l| if (l.backing == null and std.mem.eql(u8, name, "size")) {
             const g = l.items.borrow();
             defer g.deinit();
@@ -625,11 +564,6 @@ pub fn builtinFieldFast(comptime H: type, host: *H, allocator: Allocator, recv: 
             defer g.deinit();
             return Value.newInt(@intCast(g.get().items.len));
         },
-        // Progression `first`/`last`/`step` property reads on a host range
-        // value, exactly the host field arm's answers (stored bounds even
-        // when empty; `step` in the progression's width). The map CAS
-        // loop's `indices` iteration read these through the slow ladder
-        // 440k times in one run.
         .Range => |r| {
             if (std.mem.eql(u8, name, "step")) {
                 return switch (r.kind) {
@@ -654,14 +588,11 @@ pub fn builtinFieldFast(comptime H: type, host: *H, allocator: Allocator, recv: 
     return null;
 }
 
-/// Pin the leaf register file as a collector root, once per serve. Called
-/// immediately before the first instruction that can reach a safe point.
+/// Pin the leaf register file as a collector root, once per serve, immediately before the first
+/// instruction that can reach a safe point.
 fn leafPin(pin: *?usize, regs: []Value, wmask: *u64) void {
     if (pin.* != null) return;
-    // The keepalive pins the SLICE (the collector reads its current
-    // contents), so every slot must hold a valid value before the pin: a
-    // no-fill serve zeroes the not-yet-written slots here, paying the fill
-    // only on the (rare) pinning path.
+    // The keepalive pins the slice, so every slot must hold a valid value before the pin.
     for (regs, 0..) |*v, i| {
         if (i < 64 and wmask.* & (@as(u64, 1) << @intCast(i)) == 0) v.* = .Unit;
     }
@@ -673,19 +604,13 @@ fn leafPin(pin: *?usize, regs: []Value, wmask: *u64) void {
 fn leafRead(regs: []const Value, wmask: u64, r: Reg) ?Value {
     const i = r.int();
     if (i >= regs.len) return null;
-    // A slot this serve has not written yet reads as the fill value. The
-    // eager whole-bank fill was 15% of the compose slot-table benchmark's
-    // profile (millions of serves x n_locals Unit stores); reads are far
-    // rarer than slots, so the zero moved here. Reclaim builds keep the
-    // eager fill (their teardown releases every slot, so all slots must
-    // hold owned values) and pass an all-ones mask.
+    // An unwritten slot reads as the fill value; reclaim builds fill eagerly and pass all ones.
     if ((wmask >> @as(u6, @truncate(i))) & 1 == 0) return .{ .Unit = {} };
     return regs[i];
 }
 
-/// Store into the leaf register file with the same ownership rule a frame
-/// uses: the register owns one reference, the previous occupant loses one.
-/// `borrowed` marks a value the leaf does not yet own a reference to.
+/// Store into the leaf register file with a frame's ownership rule: the register owns one reference,
+/// the previous occupant loses one. `borrowed` marks a value the leaf does not yet own.
 fn leafWrite(allocator: Allocator, regs: []Value, r: Reg, v: Value, reclaim: bool, borrowed: bool, wmask: *u64) bool {
     const i = r.int();
     if (i >= regs.len) return false;
@@ -701,11 +626,8 @@ fn leafWrite(allocator: Allocator, regs: []Value, r: Reg, v: Value, reclaim: boo
     return true;
 }
 
-/// The stored-slot read of one `GetField` in a leaf body, using the
-/// instruction's own claimed (class, slot) route — the same single-fill site
-/// memo the framed `GetField` arm fills and re-verifies by name. Null for a
-/// getter-routed, unclaimed, lateinit or delegated field, which the leaf
-/// cannot serve.
+/// The stored-slot read of one `GetField`, through the instruction's own claimed (class, slot) route.
+/// Null for a getter-routed, unclaimed, lateinit or delegated field, which the leaf cannot serve.
 fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype, recv: *const Value, fname: []const u8, pin: *?usize, regs: []Value, wmask: *u64) Allocator.Error!?Value {
     const claimed = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
     const cls: u64 = blk: {
@@ -714,11 +636,8 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
         break :blk @intCast(g.get().class.identity());
     };
     if (claimed == 0) {
-        // First execution claims the site for this class when the shared
-        // (class, name) memo already routes the read to a stored slot or to
-        // a getter that is itself a leaf. For a stored route the layout id
-        // is bound to the verified index under one borrow, so a replay
-        // matching BOTH class and shape skips the per-hit verify.
+        // First execution claims the site for this class when the shared (class, name) memo routes to a
+        // stored slot or a leaf getter; a replay matching both class and shape skips the verify.
         if (host.fieldSiteRoute(recv, fname)) |route| {
             const usable = switch (route.route & 3) {
                 1, 3 => true,
@@ -746,13 +665,8 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
         }
         return null;
     }
-    // A POLYMORPHIC site (`op.ints` inside `Operations.pushOp`, where `op` is
-    // any of the changelist's ~40 Operation subclasses) claims one class and
-    // then sees another on nearly every call. Declining there sent the whole
-    // body — one of the hottest in a recomposition — to the frame path
-    // forever. The per-site claim is only a fast path: on a miss, ask the
-    // shared (class, name) memo, which answers from its own cache — its
-    // index is NOT shape-checked, so that path keeps the name verify.
+    // A polymorphic site claims one class and then sees another, so the claim is only a fast path:
+    // on a miss the shared memo answers, and its unshape-checked index keeps the name verify.
     var route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
     var mono_claim = true;
     if (claimed != cls) {
@@ -761,9 +675,7 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
         route = alt.route;
         mono_claim = false;
     }
-    // A property whose backing is another leaf property chains through it:
-    // the callee is pure by construction, so re-running it if this serve is
-    // later abandoned observes nothing.
+    // The chained getter is pure, so re-running it after an abandon observes nothing.
     if (route & 3 == 2) {
         if (!host.fieldGetterIsLeaf(@enumFromInt(route >> 2))) return null;
         leafPin(pin, regs, wmask);
@@ -781,22 +693,18 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
     const fields = b.fields.items;
     if (idx >= fields.len) return null;
     const f = &fields[idx];
-    // A mono claim whose recorded LAYOUT matches the live receiver proves
-    // the index; anything else pays the name verify.
+    // A recorded layout matching the live receiver proves the index; anything else verifies by name.
     const shape_ok = mono_claim and
         @atomicLoad(u64, @constCast(&gf.site_shape), .monotonic) == b.shapeOf();
     if (!shape_ok and !std.mem.eql(u8, f.name, fname) and !leafSgetterMatches(fname, f.name)) return null;
     const v = f.value;
     if (v == .Null or v == .Delegate) return null;
-    // Owned on the way out, matching the getter branch above: the register
-    // file this lands in releases what it holds.
+    // Owned on the way out: the register file this lands in releases what it holds.
     v.retain();
     return v;
 }
 
-/// A scoped `$sgetter$<owner>\u{1f}<prop>` site stores its slot under the
-/// bare property name; match the separator-guarded suffix so the drift guard
-/// stays exact.
+/// A scoped `$sgetter$<owner>\u{1f}<prop>` site stores its slot under the bare property name.
 fn leafSgetterMatches(name: []const u8, field_name: []const u8) bool {
     return std.mem.startsWith(u8, name, "$sgetter$") and
         name.len > field_name.len and

@@ -44,7 +44,6 @@ const suspendLiveRegs = ev_snapshot.suspendLiveRegs;
 
 const FuncBuilder = ir.build.FuncBuilder;
 
-/// Free a `Func` produced by `finish` in a test.
 fn freeFunc(func: Func) void {
     for (func.blocks) |b| {
         if (b.insts.len != 0) testing.allocator.free(b.insts);
@@ -183,11 +182,9 @@ test "suspend liveness keeps only values read on reachable resume paths" {
         .is_suspend = true,
     };
 
-    // Resuming before the move needs both branch results, but neither the
-    // move's destination nor the dead fourth register.
+    // Before the move both branch results are live; the move's destination and the dead fourth register are not.
     const before_move = try suspendLiveRegs(&func, .from(0), 2);
     try testing.expectEqualSlices(u32, &.{ 0, 1 }, before_move);
-    // At the terminator the branch condition is also live.
     const before_term = try suspendLiveRegs(&func, .from(0), entry_insts.len);
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, before_term);
 }
@@ -298,7 +295,6 @@ test "enclosing chain tags subjects and projects innermost-first" {
     pushEnclosing(&receiver);
     pushEnclosingSubject(&subject);
 
-    // Value projection: innermost first, tags invisible.
     const vals = try enclosingThisChainAlloc(testing.allocator);
     defer testing.allocator.free(vals);
     try testing.expectEqual(@as(usize, 2), vals.len);
@@ -306,7 +302,6 @@ test "enclosing chain tags subjects and projects innermost-first" {
     try testing.expect(vals[1] == .Int and vals[1].Int == 1);
     try testing.expect(enclosingThisLast().? == .Int and enclosingThisLast().?.Int == 2);
 
-    // Tagged projection: same order, push-site tags preserved.
     const entries = try enclosingEntriesAlloc(testing.allocator);
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 2), entries.len);

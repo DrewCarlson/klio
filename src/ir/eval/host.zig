@@ -1,5 +1,4 @@
-//! The evaluator host interface and the null host used when no interpreter
-//! is driving.
+//! The evaluator host interface and the null host used when no interpreter is driving.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -28,28 +27,21 @@ const errResult = ev_flow.errResult;
 const eval = ev_enter.eval;
 const ok = ev_flow.ok;
 
-/// `Result<Option<Value>, EvalError>` for `lookup_global_throwing` /
-/// `call_named_overload`.
+/// Result of the value-returning host lookups: an absent value is `ok: null`, not an error.
 pub const MaybeValueResult = union(enum) {
     ok: ?Value,
     err: EvalError,
 };
 
-/// `Result<(), EvalError>` for the side-effecting host calls.
 pub const UnitResult = union(enum) {
     ok: void,
     err: EvalError,
 };
 
-/// `(n_params, first_param_is_this)` shape report for a callable.
 pub const ReceiverShape = struct { n_params: usize, first_is_this: bool };
 
-/// No-op host for ir's own unit tests and IR-shape exercises, and the
-/// default host for the bare `eval` entry. A concrete second host type
-/// alongside the interpreter's `VmHost`: every method is the trait-default
-/// the old vtable returned when a slot was `null`
-/// (`Unsupported`/`null`/`false`/empty). The evaluator is generic over the
-/// host type and calls these as plain comptime-duck-typed methods.
+/// No-op host for ir's own tests and the default for the bare `eval` entry: every method returns the
+/// trait default (`Unsupported`/`null`/`false`/empty). The evaluator is generic over the host type.
 pub const NullHost = struct {
     pub fn callValue(self: *NullHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
         _ = .{ self, allocator, callee, args };
@@ -143,8 +135,7 @@ pub const NullHost = struct {
 
     pub fn getMemberField(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
         _ = self;
-        // Strict probe contract: a miss is an error, never a spurious
-        // `Null`/`Unit` value, so the walk's candidate order stays honest.
+        // Strict probe contract: a miss is an error, never a spurious `Null`/`Unit`, so the walk's candidate order stays honest.
         if (receiver.* == .Instance) {
             const g = receiver.Instance.borrow();
             defer g.deinit();
@@ -155,8 +146,6 @@ pub const NullHost = struct {
     }
     pub fn getMemberFieldNoExt(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
         _ = self;
-        // Strict probe contract: a miss is an error, never a spurious
-        // `Null`/`Unit` value, so the walk's candidate order stays honest.
         if (receiver.* == .Instance) {
             const g = receiver.Instance.borrow();
             defer g.deinit();
@@ -182,8 +171,7 @@ pub const NullHost = struct {
         }
     }
 
-    /// The bare-IR host has no class table, so a `super.prop = v` write has
-    /// nothing to walk past: store the field.
+    /// The bare-IR host has no class table, so a `super.prop = v` write has nothing to walk past: store the field.
     pub fn setFieldFrom(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value, super_owner: ?[]const u8) Allocator.Error!UnitResult {
         _ = super_owner;
         return setField(self, allocator, receiver, name, value);
@@ -211,7 +199,6 @@ pub const NullHost = struct {
         _ = self;
         const nominal = value.typeFqn();
         if (std.mem.eql(u8, nominal, ty.name)) return true;
-        // nominal.ends_with(".{ty.name}")
         if (nominal.len > ty.name.len + 1 and
             nominal[nominal.len - ty.name.len - 1] == '.' and
             std.mem.eql(u8, nominal[nominal.len - ty.name.len ..], ty.name))

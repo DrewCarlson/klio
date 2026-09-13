@@ -1,7 +1,6 @@
 const std = @import("std");
 
-/// Constant pool entry. Anything not representable as a `u32`
-/// (strings, large integers, types) lives here.
+/// Constant pool entry: anything not representable as a `u32` lives here.
 pub const Const = union(enum) {
     Unit,
     Int: i32,
@@ -20,9 +19,8 @@ pub const Const = union(enum) {
     String: []const u8,
     Null,
 
-    /// Structural equality used by the interning pool. `Double` /
-    /// `Float` compare by bit pattern so NaN interns total and
-    /// +0.0 / -0.0 stay distinct.
+    /// Structural equality for the interning pool. `Double`/`Float` compare by bit
+    /// pattern, so NaN interns total and +0.0 / -0.0 stay distinct.
     pub fn eql(self: Const, other: Const) bool {
         return switch (self) {
             .Unit => other == .Unit,
@@ -44,10 +42,7 @@ pub const Const = union(enum) {
     }
 };
 
-/// Structural hash paired with `Const.eql`: scalars hash their bit
-/// pattern (so NaN and ±0.0 follow the interning pool's bit-level
-/// equality), strings hash their bytes, and the tag seeds the hash so
-/// same-width variants stay distinct.
+/// Structural hash paired with `Const.eql`, including its bit-pattern float rule.
 pub fn constHash(c: Const) u64 {
     var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(c)));
     switch (c) {

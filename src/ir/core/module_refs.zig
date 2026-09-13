@@ -19,16 +19,9 @@ const idGet = core_names.idGet;
 const last_in_scope_tier = Module.last_in_scope_tier;
 const staticTypeHead = Module.staticTypeHead;
 
-/// Value-position bare-reference resolution: resolve `name` (a bare
-/// identifier read, not a call) to a unique `FuncId` under the same
-/// scope tiers as `resolveBareCallIndexed`, with no arity filter — a
-/// reference denotes the declaration itself, so a vararg or
-/// defaulted signature is as referenceable as any other. Extension
-/// forms never resolve (a bare read cannot supply the receiver),
-/// intrinsic-owned names defer to the lowerer's intrinsic routing,
-/// and the winning tier must hold exactly one candidate. A phase-1
-/// header stub resolves too: its FQN is final and phase-2 fills the
-/// same slot, so the answer is declaration-order independent.
+/// Resolve a bare identifier read to a unique `FuncId` under the same scope tiers as
+/// `resolveBareCallIndexed`, with no arity filter: a reference denotes the declaration
+/// itself. Extensions never resolve, and the winning tier must hold one candidate.
 pub fn resolveBareRefIndexed(
     self: *const Module,
     name: []const u8,
@@ -60,10 +53,8 @@ pub fn resolveBareRefIndexed(
     return null;
 }
 
-/// Resolve an overloaded bare callable reference from its expected
-/// function-parameter types. Candidate enumeration, scope, and static
-/// applicability are identical to a source call; no receiver is supplied,
-/// so extension declarations remain outside this unbound bare form.
+/// Resolve an overloaded bare callable reference from its expected parameter types.
+/// Scope and applicability match a source call; extensions stay out, being unbound.
 pub fn resolveBareRefExpected(
     self: *const Module,
     allocator: Allocator,
@@ -88,25 +79,17 @@ pub fn resolveBareRefExpected(
     return if (pick.unique) pick.target else null;
 }
 
-/// The best (lowest) scope tier among the value-referenceable
-/// non-extension funcs of `name` at a reference site, or `null` when
-/// no such func exists. A value reference (`::name` / a bare read)
-/// denotes the declaration itself, so this ranks under the same
-/// scoping order as `resolveBareRefIndexed` but ignores arity and
-/// uniqueness. `other_package_tier` means every candidate lives in a
-/// package the caller neither declares, imports, nor sees by default
-/// or via the shipped surface — Kotlin does not resolve such a
-/// reference at all, so the lowerer rejects it (kotlinc:
-/// `unresolved reference`).
+/// Best (lowest) scope tier among the value-referenceable non-extension funcs of `name`,
+/// ignoring arity and uniqueness, or null when none exists. `other_package_tier` means
+/// every candidate is in a package the caller cannot see, which Kotlin leaves unresolved.
 pub fn bareRefTier(
     self: *const Module,
     name: []const u8,
     caller_pkg_in: []const u8,
     caller_file: FileId,
 ) ?u8 {
-    // Scope follows the reference span's FILE (see
-    // resolveBareCallIndexed): a spliced inline body carries the donor
-    // file's spans, so its bare reads rank in the donor's package.
+    // Scope follows the reference span's file: a spliced inline body carries the
+    // donor file's spans, so its bare reads rank in the donor's package.
     const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
     var best_tier: u8 = 255;
     var candidate_it = self.bareCallCandidateIterator(name, caller_file);
@@ -121,11 +104,7 @@ pub fn bareRefTier(
     return best_tier;
 }
 
-/// The best (lowest) scope tier among the classes named `name` at a
-/// reference site, or `null` when no such class exists. Mirrors
-/// `bareRefTier` for `::Ctor` callable references and bare type-name
-/// value reads; `other_package_tier` means the only matching class is
-/// in an unimported package.
+/// `bareRefTier` for classes: `::Ctor` references and bare type-name value reads.
 pub fn classRefTier(
     self: *const Module,
     name: []const u8,
@@ -133,8 +112,8 @@ pub fn classRefTier(
     caller_file: FileId,
 ) ?u8 {
     const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
-    // Exact imports include renamed aliases and collision-mangled classes
-    // that have no `class_index` entry under the call-site spelling.
+    // Exact imports cover renamed aliases and collision-mangled classes that have
+    // no `class_index` entry under the call-site spelling.
     if (self.classIdExactImport(name, caller_file) != null) return 0;
     var best_tier: u8 = 255;
     for (self.class_index.items) |entry| {
@@ -147,12 +126,6 @@ pub fn classRefTier(
     return best_tier;
 }
 
-/// The best (lowest) scope tier among the top-level property
-/// declarations named `name` at a reference site, or `null` when no
-/// such property is known. A bare property read resolves under the
-/// same Kotlin scoping order as a call; `other_package_tier` means
-/// every declaration is in an unimported package, so kotlinc rejects
-/// the read as unresolved.
 pub fn topLevelPropRefTier(
     self: *const Module,
     name: []const u8,
@@ -170,16 +143,8 @@ pub fn topLevelPropRefTier(
     return best_tier;
 }
 
-/// The declared type head of the top-level property a bare read of
-/// `name` resolves to under Kotlin scoping — the best-tier declaration,
-/// and only when every declaration AT that tier agrees on the head (a
-/// cross-package name clash types nothing).
-/// The type head of one top-level property declaration: what its
-/// annotation or literal initializer stated, else what the function its
-/// initializer CALLS returns. The call is resolved here rather than at
-/// registration because only now is the whole declaration set visible.
-/// The full declared type of one top-level property declaration, where
-/// its arguments were recorded. Null leaves the head-only answer.
+/// Full declared type of the top-level property a bare read of `name` resolves to,
+/// retaining type arguments where they were recorded.
 pub fn topLevelPropTypeRef(
     self: *const Module,
     name: []const u8,
@@ -205,10 +170,7 @@ pub fn topLevelPropTypeRef(
     return found;
 }
 
-/// The tiered HEAD twin of `topLevelPropTypeRef`: a scalar top-level
-/// property (`private const val DAYS_PER_CYCLE = 146097L`) records only
-/// its head, and the deriver's Path arm needs it under the same
-/// caller-scope tiers.
+/// Head-only twin of `topLevelPropTypeRef`, tiered by caller scope.
 pub fn topLevelPropTypeHeadTiered(
     self: *const Module,
     name: []const u8,
@@ -244,6 +206,8 @@ pub fn topLevelPropTypeHeadTiered(
     return found;
 }
 
+/// Type head of one top-level property: its annotation or literal initializer, else the
+/// return head of the function its initializer calls, resolvable only now.
 pub fn topLevelPropHeadFor(self: *const Module, fqn: []const u8) ?[]const u8 {
     if (self.registry.top_level_prop_type_heads.get(fqn)) |h| return h;
     const callee = self.registry.top_level_prop_init_callees.get(fqn) orelse return null;
@@ -260,9 +224,7 @@ pub fn topLevelPropHeadFor(self: *const Module, fqn: []const u8) ?[]const u8 {
         } else head = h;
     }
     if (head) |h| {
-        // Only a head that names a class the module knows: a type
-        // parameter or an unresolvable name disproves candidates a null
-        // would have left open.
+        // A head naming no known class disproves candidates a null would leave open.
         if (self.uniqueClassIdBySimpleName(h) == null and self.classIdByFqn(h) == null) return null;
         return h;
     }
@@ -271,6 +233,8 @@ pub fn topLevelPropHeadFor(self: *const Module, fqn: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Type head of the property a bare read of `name` resolves to: the best-tier
+/// declaration, and only when every declaration at that tier agrees on the head.
 pub fn topLevelPropTypeHead(
     self: *const Module,
     name: []const u8,
@@ -296,10 +260,8 @@ pub fn topLevelPropTypeHead(
     return head;
 }
 
-/// Resolve a top-level callable extension property at an explicit
-/// receiver call site. A member function has already been ruled out by
-/// the caller; this query applies receiver, arity, visibility, and normal
-/// Kotlin import/package tiers and commits only one declaration identity.
+/// Resolve a top-level callable extension property at an explicit receiver site,
+/// after member functions are ruled out; commits exactly one declaration identity.
 pub fn resolveCallableExtensionProperty(
     self: *const Module,
     name: []const u8,
@@ -368,12 +330,9 @@ pub fn resolveCallableExtensionProperty(
     return if (ambiguous) null else best;
 }
 
-/// The literal value of the top-level `const val` a bare reference to
-/// `name` resolves to at this site, or null when the best-scoped
-/// declaration is not a recorded compile-time constant (or the pick is
-/// ambiguous). Kotlin inlines const vals at every reference; emitting
-/// the literal keeps the read immune to the flat runtime global table,
-/// where a same-simple-name value from another module can win.
+/// Literal value of the top-level `const val` a bare reference resolves to, or null when
+/// the best-scoped declaration is not a recorded constant. Kotlin inlines const vals,
+/// which also keeps the read off the flat runtime global table.
 pub fn topLevelConstLiteral(
     self: *const Module,
     name: []const u8,
@@ -399,8 +358,6 @@ pub fn topLevelConstLiteral(
     return self.registry.top_level_const_vals.get(fqn);
 }
 
-/// The FQN of the first known top-level property declaration named
-/// `name`, for an out-of-scope value-reference diagnostic.
 pub fn topLevelPropFqn(self: *const Module, name: []const u8) ?[]const u8 {
     const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
     if (list.items.len == 0) return null;

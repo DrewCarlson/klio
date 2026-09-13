@@ -30,12 +30,8 @@ pub const BareCallCandidateIterator = struct {
     alias_candidate_index: usize = 0,
     alias_fqn: []const u8 = "",
 
-    /// A `private` declaration is visible only inside its declaring file
-    /// (a private member extension's whole lexical family lives there
-    /// too), so a cross-file private candidate is never resolvable —
-    /// admitting one let a test class's private
-    /// `CoroutineScope.block(context)` shadow-defer every bare `block`
-    /// in the program.
+    /// A `private` declaration is visible only inside its declaring file, its whole lexical
+    /// family included, so a cross-file private candidate never resolves.
     fn visibleFrom(it: *const BareCallCandidateIterator, id: FuncId) bool {
         const decl_file = it.module.registry.private_fn_files.get(id) orelse return true;
         return decl_file.int() == it.caller_file.int();
@@ -109,10 +105,8 @@ pub fn renamedImportDenotesFunc(
     return false;
 }
 
-/// Every declaration denoted by a bare source name in this file. This is
-/// the canonical candidate enumeration for calls and function references:
-/// ordinary declarations enter by simple name, renamed imports by exact
-/// FQN, and each declaration identity appears once.
+/// Every declaration a bare source name denotes in this file: ordinary declarations enter by
+/// simple name, renamed imports by exact FQN, and each declaration identity appears once.
 pub fn bareCallCandidates(
     self: *const Module,
     allocator: Allocator,
@@ -135,15 +129,8 @@ pub fn hasBareCallCandidate(
     return candidate_it.next() != null;
 }
 
-/// Whether any bare-call candidate for `name` is a PLAIN function rather
-/// than an extension. An extension candidate cannot answer a bare call
-/// that supplies no receiver of its receiver type, so a caller deciding
-/// between "the enclosing class's member" and "a top-level function"
-/// must not be talked out of the member by an extension namesake:
-/// kotlinx-io's `Utf8Test` declares both
-/// `assertCodePointDecoded(String, vararg Int)` and
-/// `Buffer.assertCodePointDecoded(Int, String, Int)`, and the latter made
-/// the former's own bare call look like a global.
+/// Whether any bare-call candidate for `name` is a PLAIN function rather than an extension: an
+/// extension namesake must not talk a caller out of the enclosing class's own member.
 pub fn hasNonExtensionBareCallCandidate(
     self: *const Module,
     name: []const u8,
@@ -158,8 +145,7 @@ pub fn hasNonExtensionBareCallCandidate(
     return false;
 }
 
-/// Whether source file `file` declares `import <pkg>.*`. A wildcard
-/// import is file-scoped like a named one.
+/// Whether file `file` declares `import <pkg>.*`; a wildcard import is file-scoped like a named one.
 pub fn importWildcardIn(self: *const Module, file: FileId, pkg: []const u8) bool {
     if (pkg.len == 0) return false;
     if (self.registry.import_wildcards.get(file)) |list| {
@@ -170,11 +156,8 @@ pub fn importWildcardIn(self: *const Module, file: FileId, pkg: []const u8) bool
     return false;
 }
 
-/// Packages whose top-level entities are implicitly visible in every
-/// Kotlin source file. Mirrors the canonical
-/// `stdlib.IMPLICITLY_IMPORTED_PACKAGES` (the `ir` module cannot
-/// depend on `stdlib`); an interp-side test keeps the two in
-/// lockstep.
+/// Packages whose top-level entities are implicitly visible in every Kotlin source file. Mirrors
+/// `stdlib.IMPLICITLY_IMPORTED_PACKAGES`, which `ir` cannot depend on; a test keeps the two in step.
 pub const default_import_packages = [_][]const u8{
     "kotlin",
     "kotlin.annotation",
@@ -193,50 +176,27 @@ pub fn isDefaultImportPackage(pkg: []const u8) bool {
     return false;
 }
 
-/// The lowest tier whose candidates are visible to the caller under
-/// Kotlin scoping (named import / own package / wildcard import /
-/// default import). An identical-signature tie above this line is a
-/// real ambiguity; below it Kotlin would not resolve the call at all
-/// and klio's lenient pick stays heuristic.
+/// Lowest tier whose candidates the caller can see under Kotlin scoping. An identical-signature tie
+/// at or above it is a real ambiguity; below it Kotlin resolves nothing and klio's pick is lenient.
 pub const last_in_scope_tier: u8 = 3;
 
-/// The tier of a candidate in a package the caller neither
-/// declares, imports, nor sees by default or via the shipped
-/// surface — Kotlin does not resolve such a reference at all.
+/// Tier of a candidate in a package the caller neither declares, imports, nor sees by default:
+/// Kotlin does not resolve such a reference at all.
 pub const other_package_tier: u8 = 5;
 
-/// Bare-call preference tier of a candidate func, ranked low-to-high
-/// urgency: 0 = file-named-import, 1 = own package, 2 = file-
-/// wildcard-import package, 3 = default-import package, 4 = built-in
-/// stdlib, 5 = any other package. This is Kotlin's resolution order
-/// for an unqualified top-level callable: the file's explicit
-/// imports outrank even a same-file declaration, then the declaring
-/// package's own scope, then star imports, then the implicitly
-/// imported packages. `caller_pkg` is the caller's declaring package
-/// (`""` for a user script). A non-wildcard import of `name` in
-/// `caller_file` whose full path equals the candidate's FQN matches
-/// tier 0; a wildcard import of the candidate's package matches
-/// tier 2.
+/// Bare-call preference tier of a candidate: 0 = file named import, 1 = own package, 2 = file
+/// wildcard import, 3 = default import, 4 = built-in stdlib, 5 = any other package, which is
+/// Kotlin's resolution order for an unqualified top-level callable. `caller_pkg` is the caller's
+/// declaring package, `""` for a user script.
 pub fn bareCallTier(self: *const Module, f: *const Func, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
     return self.scopeTier(f.fqn, f.package, name, caller_pkg, caller_file);
 }
 
-/// The scope tier of one declared symbol (function or class) at a
-/// reference site, over its FQN and declaring package. Shared by
-/// `bareCallTier` and `classIdIndexed` so both kinds rank under the
-/// same Kotlin scoping order.
-/// The class/object this file EXACT-imports under `name` (tier-0
-/// resolution only). A read where a same-named top-level property would
-/// otherwise win by default still binds an explicitly imported
-/// classifier — kotlinc gives the exact import precedence over a
-/// cross-package property (ktor: `import ...server...ContentNegotiation`
-/// must not read the client package's same-named top-level val).
+/// The class or object this file EXACT-imports under `name`, tier-0 resolution only: kotlinc gives
+/// an explicit import precedence over a same-named cross-package top-level property.
 pub fn classIdExactImport(self: *const Module, name: []const u8, caller_file: FileId) ?ClassId {
-    // Resolve the imported FQN directly rather than requiring a
-    // `class_index` entry whose SIMPLE name is `name`: a collision-mangled
-    // class (`import a.Widget` where a same-named `b.Widget` mangled both
-    // to `Widget$fN`) is registered only under its mangled name, so the
-    // simple-name scan misses it — but its FQN still resolves.
+    // Resolve the imported FQN directly: a collision-mangled class is registered only under its
+    // mangled name, so a simple-name scan misses it while its FQN still resolves.
     for (self.importAliasPathsIn(caller_file, name)) |p| {
         if (self.classIdByFqn(p.fqn)) |cid| return cid;
     }
@@ -254,8 +214,7 @@ pub fn scopeTier(self: *const Module, fqn: []const u8, pkg: []const u8, name: []
     return 5;
 }
 
-/// Number of *user* parameters a func declares (excluding a leading
-/// synthesized extension/member `this`).
+/// User parameters `f` declares, excluding a leading synthesized extension/member `this`.
 pub fn funcUserArity(f: *const Func) usize {
     if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) {
         return f.params.len - 1;
@@ -263,39 +222,23 @@ pub fn funcUserArity(f: *const Func) usize {
     return f.params.len;
 }
 
-/// True for a func declared with a leading synthesized `this`
-/// param — an instance method, a top-level extension, or a member
-/// extension. A true bare call (no qualifier) only ever binds a
-/// *non-extension* top-level function; receiver-based resolution of
-/// the extension forms is the heuristic's domain, not the index's.
+/// True for a func with a leading synthesized `this`: an instance method, a top-level extension, or
+/// a member extension. A true bare call only ever binds a non-extension top-level function.
 pub fn funcHasImplicitThis(f: *const Func) bool {
     return f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
 }
 
-/// `funcHasImplicitThis` for a candidate whose header stub carries no
-/// parameters yet (a pack's deferred inline extension): the declaration
-/// signature's receiver says it takes an implicit `this`.
+/// `funcHasImplicitThis` for a candidate whose header stub carries no parameters yet (a pack's
+/// deferred inline extension): the declaration signature's receiver answers instead.
 pub fn candidateHasImplicitThis(self: *const Module, id: FuncId, f: *const Func) bool {
     if (funcHasImplicitThis(f)) return true;
-    // A header stub may list only the value parameters; its declared
-    // receiver still makes it an extension, never a plain function.
+    // A header stub may list only value parameters; its declared receiver still makes it an extension.
     const ds = self.decl_sigs.get(id.int()) orelse return false;
     return ds.receiver_ty != null;
 }
 
-/// The applicability `SigView` for a candidate at LOWERING time
-/// (distinct from the module-internal `SigView` above, which the
-/// index uses only for the `sameUserSig` identity check). Strips a
-/// leading synthesized `this` so the shared scorer ranks value args
-/// against user parameters. A phase-one header whose declaration has a
-/// body is equally rankable: its params already carry the complete types,
-/// defaults, and vararg flags even though its IR blocks are not lowered
-/// yet. An `expect` header is also a valid compile-time target; linking or
-/// runtime execution decides whether an actual implementation exists.
-///
-/// `func_defaults` lives on `ProgramImage`, not on `Module`, so the
-/// lowering adapter cannot read it; it carries defaults on the params
-/// (`paramHasDefault`'s null-`defaults` fallback).
+/// Applicability `SigView` at LOWERING time: strips a leading synthesized `this` so the shared scorer
+/// ranks value args against user params. Defaults ride the params, since `func_defaults` is image-side.
 pub fn sigViewForApplicability(
     self: *const Module,
     id: FuncId,
@@ -327,74 +270,53 @@ pub fn sigViewForApplicability(
     };
 }
 
-/// Why the symbol index declined to resolve a bare call. Every
-/// deferral carries one of these so an audit sweep can prove that
-/// the heuristic fallback only ever handles classified structural
-/// shapes, never an unclassified pick.
+/// Why the symbol index declined to resolve a bare call. Every deferral carries one, so an audit can
+/// prove the heuristic fallback only handles classified shapes.
 pub const ResolveDeferReason = enum {
     /// No top-level function with this simple name exists.
     no_candidates,
-    /// Every candidate takes an implicit receiver `this` (instance
-    /// method, top-level or member extension); receiver-based
-    /// resolution is the heuristic's domain.
+    /// Every candidate takes an implicit receiver `this`; receiver-based resolution is the heuristic's.
     extension_form,
-    /// The lowerer always routes this bare name to an intrinsic; the
-    /// index defers so it never binds the body the lowerer skips.
+    /// The lowerer routes this name to an intrinsic, so the index must not bind the body it skips.
     intrinsic_owned,
-    /// More than one exact match in a winning tier the caller can
-    /// SEE (named import, own package, wildcard import, or default
-    /// import), every match with the SAME full parameter type
-    /// signature — generic arguments and function-type shapes
-    /// included — so nothing can tell them apart, at lowering or at
-    /// runtime. Kotlin rejects such a set as conflicting overloads.
+    /// Several exact matches in a winning tier the caller can SEE, all with the same full parameter
+    /// signature, generic arguments and function-type shapes included: Kotlin rejects such a set.
     ambiguous_tier,
-    /// More than one exact match in the winning tier, but the
-    /// matches differ in parameter types: an overload set the
-    /// runtime resolves by argument type.
+    /// Several exact matches in the winning tier differing in parameter types: the runtime dispatches.
     type_overload,
-    /// More than one identical exact match, but every match lives in
-    /// a package the caller neither declares, imports, nor sees by
-    /// default — Kotlin would not resolve the call at all, so klio's
-    /// lenient cross-package pick stays with the heuristic.
+    /// Several identical matches, all in packages the caller neither declares, imports, nor sees by
+    /// default: Kotlin resolves nothing, so the lenient cross-package pick stays with the heuristic.
     unimported_set,
-    /// The winning tier has candidates, but none matches the call's
-    /// arity exactly.
+    /// The winning tier has candidates, but none matches the call's arity exactly.
     arity_mismatch,
-    /// Candidates have defaults, but the positional call cannot bind
-    /// them, or a legacy header lacks per-parameter default flags.
+    /// Defaults exist, but the positional call cannot bind them, or a header lacks the per-param flags.
     default_param_shape,
-    /// Only header stubs / bodyless decls with no declared-arity
-    /// record were available.
+    /// Only header stubs or bodyless decls with no declared-arity record were available.
     bodyless_only,
     /// The only exact matches are low-priority overloads.
     low_priority_only,
     /// The only near matches take a trailing vararg.
     vararg_only,
-    /// The call's trailing lambda spans a default-parameter gap, a
-    /// shape the index does not model.
+    /// The call's trailing lambda spans a default-parameter gap, a shape the index does not model.
     trailing_lambda_shape,
-    /// Same-tier same-arity overload set disambiguated by an `as`
-    /// cast at the call site. Assigned by the lowerer (which sees
-    /// the cast), never produced by the index itself.
+    /// Same-tier same-arity overload set disambiguated by an `as` cast. Assigned by the lowerer, which
+    /// sees the cast; the index never produces it.
     cast_disambiguated,
 };
 
-/// Result of `resolveBareCallIndexed`: either a unique `FuncId` or a
-/// reason-tagged deferral to the heuristic, plus the winning tier and
-/// its best-match count for the resolve audit's readout.
+/// Result of `resolveBareCallIndexed`: a unique `FuncId` or a reason-tagged deferral, plus the
+/// winning tier and its best-match count for the resolve audit.
 pub const BareCallResolution = struct {
     pub const Outcome = union(enum) {
         resolved: FuncId,
         deferred: ResolveDeferReason,
     };
     outcome: Outcome,
-    /// Winning preference tier (0..5), or 255 when no candidate
-    /// established one.
+    /// Winning preference tier (0..5); 255 when no candidate established one.
     tier: u8 = 255,
     /// Best-ranked positional matches counted within the winning tier.
     tier_count: usize = 0,
-    /// First two best-ranked matches in the winning tier; both set when
-    /// the outcome is `ambiguous_tier`.
+    /// First two best-ranked matches in the winning tier; both set when the outcome is `ambiguous_tier`.
     first: ?FuncId = null,
     second: ?FuncId = null,
 
@@ -406,11 +328,8 @@ pub const BareCallResolution = struct {
         };
     }
 
-    /// Deferred because every candidate that matched is
-    /// `@LowPriorityInOverloadResolution` / a deprecated stub. Binding the
-    /// heuristic here would statically pick such a stub over a same-name
-    /// class constructor (kotlinx-datetime's `fun LocalDateTime`), which
-    /// self-recurses; the caller must emit a dynamic call instead.
+    /// Deferred because every match is `@LowPriorityInOverloadResolution` or a deprecated stub. Binding
+    /// one statically over a same-name class constructor self-recurses, so the caller emits a dynamic call.
     pub fn lowPriorityOnly(self: BareCallResolution) bool {
         return switch (self.outcome) {
             .deferred => |r| r == .low_priority_only,
@@ -423,31 +342,21 @@ pub const BareCallResolution = struct {
     }
 };
 
-/// Whether a phase-1 header stub's *declared* user arity exactly
-/// matches the call: no defaults (`required == total`), no vararg at
-/// any position, and exactly `want` parameters. Stubs carry no
-/// lowered params, so this is the order-independent arity source for
-/// ranking forward references; defaults/vararg/trailing-lambda
-/// shapes on a stub stay deferred to the heuristic.
+/// Whether a phase-1 header stub's DECLARED user arity matches the call exactly: no defaults
+/// (`required == total`), no vararg at any position, exactly `want` parameters. Stubs carry no params.
 pub fn stubDeclArity(self: *const Module, id: FuncId) ?DeclArity {
     return self.decl_user_arity.get(id.int());
 }
 
-/// Preference tier of one specific candidate at a call site. The
-/// resolve audit uses this to grade a heuristic pick against the
-/// index's: a divergence where the index pick ranks strictly better
-/// is a package-preference correction, not a mis-bind.
+/// Preference tier of one specific candidate at a call site. The resolve audit grades a heuristic
+/// pick against the index's: an index pick that ranks strictly better is a correction, not a mis-bind.
 pub fn bareCallTierOf(self: *const Module, id: FuncId, name: []const u8, caller_pkg: []const u8, caller_file: FileId) ?u8 {
     const f = self.funcById(id) orelse return null;
     return self.bareCallTier(f, name, caller_pkg, caller_file);
 }
 
-/// A candidate's user-parameter type signature: lowered params for
-/// a body-bearing func, the phase-1 declared record for a header
-/// stub. Both render through `lower.decl.loweredTypeRef`, so a stub
-/// and its later-lowered body expose identical structures. `null`
-/// when the signature is unknowable (a bodyless func with no
-/// declared record), which forfeits any identity proof.
+/// A candidate's user-parameter type signature: lowered params for a body-bearing func, the phase-1
+/// declared record for a header stub; null when unknowable, which forfeits any identity proof.
 pub const SigView = union(enum) {
     body: *const Func,
     decl: []const TypeRef,
@@ -476,14 +385,8 @@ pub fn sigViewOf(self: *const Module, id: FuncId, f: *const Func) ?SigView {
     return null;
 }
 
-/// Whether two candidates declare the same user parameter type
-/// signature (leading synthesized `this` excluded), compared over
-/// the FULL declared structure: head name, nullability, and the
-/// recursive argument shapes — generic arguments, and a function
-/// type's suspend marker, receiver, parameter, and return types.
-/// Only a set equal at this granularity is a true duplicate that
-/// Kotlin rejects as conflicting overloads; any structural
-/// difference leaves a type-dispatched overload set.
+/// Whether two candidates declare the same user parameter signature (synthesized `this` excluded)
+/// over head name, nullability, and recursive argument shapes. Only such a set is a true duplicate.
 pub fn sameUserSig(a: SigView, b: SigView) bool {
     if (a.len() != b.len()) return false;
     var i: usize = 0;
@@ -493,9 +396,7 @@ pub fn sameUserSig(a: SigView, b: SigView) bool {
     return true;
 }
 
-/// Whether any parameter is declared `vararg`, at any position —
-/// the body-side mirror of `DeclArity.has_vararg`, so the stub and
-/// body gates skip the same candidate shapes.
+/// Whether any parameter is declared `vararg`, the body-side mirror of `DeclArity.has_vararg`.
 pub fn anyParamVararg(f: *const Func) bool {
     for (f.params) |p| {
         if (p.is_vararg) return true;
@@ -503,10 +404,8 @@ pub fn anyParamVararg(f: *const Func) bool {
     return false;
 }
 
-/// Number of positional arguments omitted from the end of `f` while still
-/// producing a valid call. Kotlin permits the omission only when every
-/// omitted parameter has a default; a required parameter after an earlier
-/// default therefore remains required for a positional call.
+/// Positional arguments omittable from the end of `f`. Kotlin allows the omission only when every
+/// omitted parameter has a default, so a required parameter after a default stays required.
 pub fn positionalDefaultsUsed(f: *const Func, want: usize) ?usize {
     const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
     const params = f.params[off..];
@@ -527,9 +426,6 @@ pub fn omittedPositionHasDefault(f: *const Func, want: usize) bool {
     return false;
 }
 
-/// Whether the call's trailing lambda can bind `f`'s last (function-
-/// typed) parameter with every gap parameter defaulted — the shape
-/// the heuristic's trailing-lambda rung accepts and the index defers.
 /// Whether a declared parameter type names a `fun interface`.
 pub fn typeNamesFunInterface(self: *const Module, ty_name: []const u8) bool {
     const nm = std.mem.trimEnd(u8, ty_name, "?");
@@ -540,8 +436,7 @@ pub fn typeNamesFunInterface(self: *const Module, ty_name: []const u8) bool {
 
 pub fn tlShapeMatches(self: *const Module, f: *const Func, want: usize) bool {
     const up = funcUserArity(f);
-    // A trailing lambda also fills a `fun interface` parameter (SAM
-    // conversion): `g { A("K") }` for `fun g(unit: Unit = Unit, b: B)`.
+    // A trailing lambda also fills a `fun interface` parameter by SAM conversion.
     const last_is_fn = f.params.len != 0 and
         (std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function") or
             self.typeNamesFunInterface(f.params[f.params.len - 1].ty.name));
@@ -556,33 +451,8 @@ pub fn tlShapeMatches(self: *const Module, f: *const Func, want: usize) bool {
     return true;
 }
 
-/// Principled bare-call resolution: resolve `name` (called with
-/// `want_arity` user args, `last_arg_lambda` set when a trailing
-/// lambda is supplied) to a UNIQUE `FuncId` as a function of the
-/// caller's package + imports + the complete header set, independent
-/// of declaration order. Phase-1 header stubs (forward references,
-/// `expect` decls) rank by their recorded declared arity, so the
-/// answer does not depend on whether a candidate's body has been
-/// lowered yet.
-///
-/// Preference order — file-named imports, then the caller's own
-/// package, then wildcard imports, then the default-import packages,
-/// then built-in stdlib (Kotlin's scoping order) — picks the highest
-/// non-empty tier; within that tier the candidate is returned only when
-/// exactly one non-extension func matches the positional call. Exact
-/// arity outranks a call that consumes defaults, then fewer consumed
-/// defaults wins. Extension funcs (a leading
-/// synthesized `this`) are never index-resolved: a bare call to one
-/// needs a receiver the index does not model, so it is left to the
-/// order-based heuristic. A name the index cannot resolve to a
-/// single non-extension target defers with a reason classifying
-/// why. Where the index and the heuristic both resolve, they agree
-/// — except when the heuristic's declaration-order pick sits in a
-/// strictly worse preference tier or matches the call less exactly
-/// (a vararg/default/arity-mismatched fallback where the index found
-/// an exact overload); the resolve audit grades every divergence as
-/// one of those corrections, a receiver-preference the heuristic
-/// retains, or a bug.
+/// Resolve `name` (`want_arity` user args, `last_arg_lambda` for a trailing lambda) from imports and
+/// package alone: the highest non-empty tier must hold one matching non-extension func, else defer.
 pub fn resolveBareCallIndexed(
     self: *const Module,
     name: []const u8,
@@ -591,18 +461,14 @@ pub fn resolveBareCallIndexed(
     want_arity: usize,
     last_arg_lambda: bool,
 ) BareCallResolution {
-    // Scope follows the call span's FILE: a spliced inline body carries
-    // the donor file's spans, so its bare calls resolve in the donor's
-    // package (`withFrameNanos` inside `withFrameMillis`'s body is a
-    // same-package call wherever the splice lands).
+    // Scope follows the call span's FILE: a spliced inline body carries the donor file's spans, so its
+    // bare calls resolve in the donor's package.
     const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
     var candidate_it = self.bareCallCandidateIterator(name, caller_file);
     if (candidate_it.next() == null)
         return BareCallResolution.deferred(.no_candidates);
 
-    // Highest-priority tier among the non-extension candidates:
-    // body-bearing funcs, plus header stubs with a declared-arity
-    // record (rankable without a lowered body).
+    // Highest-priority tier among non-extension candidates: bodies, plus stubs with a declared arity.
     var best_tier: u8 = 255;
     var all_ext = true;
     var ext_in_scope = false;
@@ -623,29 +489,19 @@ pub fn resolveBareCallIndexed(
     if (best_tier == 255) {
         return BareCallResolution.deferred(if (all_ext) .extension_form else .bodyless_only);
     }
-    // Every rankable non-extension candidate lives in a package the
-    // caller cannot see, while an in-scope extension (or member) form
-    // exists. Kotlin resolves the call against an implicit receiver's
-    // extension long before it would even consider the invisible
-    // package, so receiver-based resolution — the heuristic's
-    // domain — decides; binding (or rejecting) the invisible
-    // function here would be wrong on both counts.
+    // Every rankable non-extension candidate is in a package the caller cannot see while an in-scope
+    // extension or member exists: Kotlin resolves against the receiver before ever reaching it.
     if (best_tier == other_package_tier and ext_in_scope) {
         return BareCallResolution.deferred(.extension_form);
     }
 
-    // Within the best tier, look for a unique positional,
-    // non-low-priority, non-extension candidate. Exact arity outranks a
-    // candidate that consumes defaults; among defaulted candidates, the
-    // one consuming fewer defaults outranks one consuming more. Track the
-    // closest miss so a zero-match tier defers with the blocking shape.
+    // Within the best tier, find a unique positional, non-low-priority, non-extension candidate: exact
+    // arity outranks consuming defaults, and fewer defaults outrank more. Track the closest miss.
     var chosen: ?FuncId = null;
     var second: ?FuncId = null;
     var count: usize = 0;
     var best_defaults_used: usize = std.math.maxInt(usize);
-    // Whether every best-ranked match has the same user
-    // parameter type signature as the first one. Distinguishes a
-    // true ambiguity from a type-dispatched overload set.
+    // Whether every best-ranked match shares the first's signature: true ambiguity, or overload set.
     var sigs_identical = true;
     var saw_tl = false;
     var saw_arity = false;
@@ -659,9 +515,8 @@ pub fn resolveBareCallIndexed(
         if (self.candidateHasImplicitThis(id, f)) continue;
         if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
         const is_stub = !f.hasBody();
-        // The stub and body gates accept the same positional/default
-        // shapes so resolution never depends on whether the body has
-        // already replaced its phase-1 header.
+        // Stub and body gates accept the same shapes, so resolution never depends on whether the body has
+        // replaced its header.
         const defaults_used: usize = if (is_stub) blk: {
             const da = self.stubDeclArity(id) orelse {
                 saw_bodyless = true;
@@ -679,8 +534,7 @@ pub fn resolveBareCallIndexed(
                 saw_arity = true;
                 continue;
             }
-            // Legacy/test stubs may carry only the aggregate declared
-            // arity. Full arity needs no per-parameter default evidence.
+            // A stub may carry only the aggregate arity; full arity needs no per-parameter default evidence.
             if (want_arity == da.total) break :blk 0;
             const used = positionalDefaultsUsed(f, want_arity) orelse {
                 if (want_arity < da.total and da.required != da.total) {
@@ -724,9 +578,7 @@ pub fn resolveBareCallIndexed(
         }
         if (chosen) |first_id| {
             if (second == null) second = id;
-            // Identity is proven over lowered params for bodies and
-            // the phase-1 declared record for stubs; a candidate
-            // with neither forfeits the proof.
+            // A candidate with neither lowered params nor a declared record forfeits the identity proof.
             if (sigs_identical) {
                 const first_f = self.funcById(first_id);
                 const first_view: ?SigView = if (first_f) |ff| self.sigViewOf(first_id, ff) else null;
@@ -743,12 +595,8 @@ pub fn resolveBareCallIndexed(
         count += 1;
     }
     if (count == 1) {
-        // A unique match in a package the caller cannot see is not a
-        // resolution: kotlinc rejects the reference outright. Defer as
-        // an unimported set — the diagnostic layer reports it and the
-        // dynamic path keeps klio's lenient last resort. A candidate
-        // with no recorded package is a lift artifact with unreliable
-        // scoping metadata and keeps the lenient resolution.
+        // A unique match in a package the caller cannot see is no resolution, so defer as an unimported
+        // set. A candidate with no recorded package is a lift artifact and keeps the lenient pick.
         const chosen_pkg_known = blk: {
             const cfn = self.funcById(chosen.?) orelse break :blk false;
             break :blk cfn.package.len != 0;
@@ -800,7 +648,3 @@ pub fn resolveBareCallIndexed(
     return .{ .outcome = .{ .deferred = reason }, .tier = best_tier, .tier_count = 0 };
 }
 
-// -----------------------------------------------------------------
-// `resolveCall` — the single applicability-primary, type-aware,
-// three-tier bare-call resolver.
-// -----------------------------------------------------------------

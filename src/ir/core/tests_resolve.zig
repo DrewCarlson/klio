@@ -22,10 +22,8 @@ test "symbol index proves stub signatures through the declared record" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // One lowered body plus one forward-referenced stub of the same
-    // name/arity. With a matching declared signature recorded at phase 1
-    // the set is provably identical (ambiguous); without any record the
-    // proof is forfeited (type overload).
+    // One lowered body plus a forward-referenced stub of the same name and arity: with a declared signature
+    // recorded at phase 1 the set is provably identical (ambiguous), without a record the proof is forfeited.
     _ = try pushTestFunc(&m, a, "g", "app.g", "app", 1);
     const stub = try pushTestFuncOpts(&m, a, "g", "app.g2.g", "app", 0, .{ .stub = true });
     try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .has_vararg = false });
@@ -348,11 +346,7 @@ test "symbol index distinguishes overloads by generic arguments" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Two same-package stubs whose declared params differ only in the
-    // generic argument (`List<Int>` vs `List<String>`): a legal Kotlin
-    // overload set the runtime dispatches by argument type, never an
-    // ambiguity. Rewriting the second record to `List<Int>` makes the
-    // pair a true duplicate and the verdict flips to ambiguous.
+    // Same-package stubs whose declared params differ only in the generic argument (`List<Int>` vs `List<String>`) are a legal overload set, not an ambiguity.
     const s1 = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 0, .{ .stub = true });
     try m.decl_user_arity.put(s1.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     {
@@ -376,8 +370,7 @@ test "symbol index distinguishes overloads by generic arguments" {
     const got = m.resolveBareCallIndexed("pick", "app", FileId.from(0), 1, false);
     try testing.expectEqual(Module.ResolveDeferReason.type_overload, deferReasonOf(got).?);
 
-    // Make the second stub's declared type IDENTICAL (`List<Int>`):
-    // now nothing distinguishes the pair and it is a real ambiguity.
+    // Identical declared types leave nothing to distinguish the pair: a real ambiguity.
     {
         const old = m.decl_user_sig.fetchRemove(s2.int()).?;
         for (old.value) |*ty| ty.deinit(a);
@@ -396,8 +389,7 @@ test "symbol index distinguishes a stub overload by its declared types" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Body takes Int, forward-referenced stub declares String: a
-    // type-dispatched overload set even though one body is unlowered.
+    // Body takes Int, forward-referenced stub declares String: a type-dispatched overload set even with one body unlowered.
     _ = try pushTestFunc(&m, a, "h2", "app.h2", "app", 1);
     const stub = try pushTestFuncOpts(&m, a, "h2", "app.x.h2", "app", 0, .{ .stub = true });
     try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .has_vararg = false });
@@ -1256,8 +1248,6 @@ test "resolveCall: a resolved extension in a receiver context defers to CallMemb
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // The only candidate is an extension; applicability resolves it and the
-    // emission decision retains the member-first walk.
     const ext = try pushTestFuncOpts(&m, a, "ext", "app.ext", "app", 1, .{ .extension = true });
     try m.rebuildFuncNameIndex(a);
     const args = [_]applicability.ArgShape{.{}};
@@ -1275,9 +1265,7 @@ test "resolveCall: a type-distinguishable stub overload defers to a receiver pro
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Two incomplete same-arity stubs of different declared types carry no
-    // canonical declaration record, so applicability cannot rank either and
-    // the call remains a runtime probe.
+    // Two incomplete same-arity stubs of different declared types carry no canonical record, so neither can be ranked and the call stays a runtime probe.
 
     const s1 = try pushTestFuncOpts(&m, a, "minOf", "app.minOf", "app", 0, .{ .stub = true });
     try m.decl_user_arity.put(s1.int(), .{ .required = 1, .total = 1, .has_vararg = false });
@@ -1299,7 +1287,6 @@ test "resolveCall: a shadowed value capture defers to CallValue" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // No same-name top-level function exists; the name is a captured local.
     try m.rebuildFuncNameIndex(a);
     const args = [_]applicability.ArgShape{.{}};
     const res = try m.resolveCall(a, "cb", "app", FileId.from(0), &args, false, .{ .is_value_capture = true });
@@ -1313,8 +1300,7 @@ test "symbol index never resolves an extension form" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // One candidate, an extension (leading `this` param): the index does
-    // not model receiver resolution, so it defers to the heuristic.
+    // One candidate, an extension (leading `this` param): the index does not model receiver resolution, so it defers to the heuristic.
     _ = try pushTestFuncOpts(&m, a, "ext", "app.ext", "app", 0, .{ .extension = true });
     try m.rebuildFuncNameIndex(a);
 
@@ -1336,9 +1322,7 @@ test "symbol index resolves an intrinsic-backed name like any other symbol" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // `compareValues` is an ordinary symbol: it resolves through the index like
-    // any other function. Its native intrinsic attaches at run time via
-    // `resolvedNativeForm`, not through a name-based index escape hatch.
+    // `compareValues` resolves through the index like any other symbol; its native intrinsic attaches at run time via `resolvedNativeForm`.
     const fid = try pushTestFunc(&m, a, "compareValues", "kotlin.comparisons.compareValues", "kotlin.comparisons", 2);
     try m.rebuildFuncNameIndex(a);
 
@@ -1396,16 +1380,13 @@ test "symbol index defers a default-gap trailing-lambda shape" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // `fun tl(x: Int = 0, body: () -> Unit)` called as `tl { ... }`:
-    // one supplied arg (the lambda), the gap param defaulted — the
-    // heuristic's trailing-lambda rung handles this, the index defers.
+    // `fun tl(x: Int = 0, body: () -> Unit)` called as `tl { ... }` supplies one argument and defaults the gap param: the heuristic's trailing-lambda rung handles it.
     _ = try pushTestFuncOpts(&m, a, "tl", "app.tl", "app", 2, .{ .fn_tail_with_defaults = true });
     try m.rebuildFuncNameIndex(a);
 
     const got = m.resolveBareCallIndexed("tl", "app", FileId.from(0), 1, true);
     try testing.expectEqual(Module.ResolveDeferReason.trailing_lambda_shape, deferReasonOf(got).?);
 
-    // Without the trailing lambda the same call is a plain arity miss.
     const got2 = m.resolveBareCallIndexed("tl", "app", FileId.from(0), 1, false);
     try testing.expectEqual(Module.ResolveDeferReason.arity_mismatch, deferReasonOf(got2).?);
 }
@@ -1414,8 +1395,7 @@ test "symbol index ranks a forward-referenced stub by declared arity" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // An own-package phase-1 stub (body not lowered yet) with a recorded
-    // exact declared arity resolves, independent of lowering order.
+    // An own-package phase-1 stub with a recorded exact declared arity resolves independent of lowering order.
     const stub = try pushTestFuncOpts(&m, a, "fwd", "app.fwd", "app", 0, .{ .stub = true });
     try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     _ = try pushTestFunc(&m, a, "fwd", "lib.fwd", "lib", 1);
@@ -1449,8 +1429,7 @@ test "symbol index resolves a default-bearing body" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // `fun d(x: Int, y: Int = 0)` binds both its full and under-applied
-    // positional forms to the same static target.
+    // `fun d(x: Int, y: Int = 0)` binds its full and under-applied positional forms to the same static target.
     const body = try pushTestFuncOpts(&m, a, "d", "app.d", "app", 2, .{});
     m.funcByIdMut(body).?.params[1].has_default = true;
     try m.rebuildFuncNameIndex(a);
@@ -1502,19 +1481,13 @@ test "packageHeadDeclared distinguishes a package head from a member head" {
         }
         m.deinit(a);
     }
-    // A top-level func in package `mypkg` makes `mypkg` a declared package
-    // head; a top-level func with no package (`helper`) is not a head.
     _ = try pushTestFunc(&m, a, "build", "mypkg.build", "mypkg", 0);
     _ = try pushTestFunc(&m, a, "helper", "helper", "", 0);
 
-    // `mypkg.build(...)` — `mypkg` is the first segment of a declared FQN,
-    // so it is a package head that flattens to a global load.
+    // `mypkg` is the first segment of a declared FQN, so it is a package head that flattens to a global load.
     try testing.expect(m.packageHeadDeclared("mypkg"));
-    // `helper.foo` — `helper` names a top-level symbol, not a package
-    // prefix, so it is a member/receiver head, not a package head.
+    // `helper` names a top-level symbol, not a package prefix, so it is a member/receiver head.
     try testing.expect(!m.packageHeadDeclared("helper"));
-    // A name with no declaration at all (a receiver member like `inner`)
-    // is never a package head.
     try testing.expect(!m.packageHeadDeclared("inner"));
     try testing.expect(!m.packageHeadDeclared(""));
 }
@@ -1523,14 +1496,13 @@ test "funcId ranks a user declaration above a shipped same-name" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Shipped decl concatenates first (packs precede user sources).
+    // Shipped decls concatenate first: packs precede user sources.
     _ = try pushTestFunc(&m, a, "shuffle", "kotlin.collections.shuffle", "kotlin.collections", 1);
     const user = try pushTestFunc(&m, a, "shuffle", "shuffle", "", 1);
     try m.rebuildFuncNameIndex(a);
     try testing.expectEqual(user.int(), m.funcId("shuffle").?.int());
 
-    // The package classification is a head-segment match, not a raw
-    // prefix: a user package starting with `kotlinx2` is not shipped.
+    // Package classification is a head-segment match, not a raw prefix: a user package starting with `kotlinx2` is not shipped.
     var m2 = Module.default(a);
     defer freeTestModule(&m2, a);
     _ = try pushTestFunc(&m2, a, "go", "kotlinx.coroutines.go", "kotlinx.coroutines", 0);
@@ -1566,13 +1538,11 @@ test "uniqueClassIdBySimpleName caches without changing scan semantics" {
     defer m.deinit(a);
     const solo = try pushTestClass(&m, a, "Solo", "lib.Solo", "lib");
     const inner = try pushTestClass(&m, a, "Outer$Inner", "lib.Outer.Inner", "lib");
-    // Unique names resolve, via both the class name and the FQN's last segment.
     try testing.expectEqual(solo.int(), m.uniqueClassIdBySimpleName("Solo").?.int());
     try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Inner").?.int());
     try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Outer$Inner").?.int());
     try testing.expect(m.uniqueClassIdBySimpleName("Missing") == null);
-    // A class appended after the first lookup is visible to the next one,
-    // and a second identity under the same simple name makes it ambiguous.
+    // A class appended after the first lookup is visible to the next, and a second identity under the same simple name makes it ambiguous.
     _ = try pushTestClass(&m, a, "Solo", "app.Solo", "app");
     try testing.expect(m.uniqueClassIdBySimpleName("Solo") == null);
     try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Inner").?.int());
@@ -1584,12 +1554,10 @@ test "classIdIndexed prefers the caller's own package on a collision" {
     defer m.deinit(a);
     const lib = try pushTestClass(&m, a, "Config", "lib.Config", "lib");
     const app = try pushTestClass(&m, a, "Config", "app.Config", "app");
-    // Flat lookup returns the first declaration regardless of caller.
     try testing.expectEqual(lib.int(), m.classId("Config").?.int());
-    // The indexed lookup binds the class the caller's package declares.
+    // The indexed lookup binds the class the caller's package declares; the flat one keeps declaration order.
     try testing.expectEqual(app.int(), m.classIdIndexed("Config", "app", FileId.from(0)).?.int());
     try testing.expectEqual(lib.int(), m.classIdIndexed("Config", "lib", FileId.from(0)).?.int());
-    // A caller in neither package keeps the declaration-order pick.
     try testing.expectEqual(lib.int(), m.classIdIndexed("Config", "other", FileId.from(0)).?.int());
     try testing.expect(m.classIdIndexed("Missing", "app", FileId.from(0)) == null);
 }
@@ -1598,12 +1566,10 @@ test "bare-ref index resolves a unique candidate with no arity filter" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Vararg and defaulted shapes the CALL index defers on still
-    // resolve as references.
+    // Vararg and defaulted shapes the CALL index defers on still resolve as references.
     const f = try pushTestFuncOpts(&m, a, "fmt", "app.fmt", "app", 2, .{ .last_vararg = true });
     try m.rebuildFuncNameIndex(a);
     try testing.expectEqual(f.int(), m.resolveBareRefIndexed("fmt", "app", FileId.from(0)).?.int());
-    // Cross-package: the caller's own package wins over another package.
     const own = try pushTestFunc(&m, a, "pick", "app.pick", "app", 0);
     _ = try pushTestFunc(&m, a, "pick", "lib.pick", "lib", 0);
     try m.rebuildFuncNameIndex(a);
@@ -1614,10 +1580,9 @@ test "bare-ref index defers ambiguity, extensions, and unknown names" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Two same-tier candidates: ambiguous, defer.
     _ = try pushTestFunc(&m, a, "h", "app.h", "app", 0);
     _ = try pushTestFunc(&m, a, "h", "app.util.h", "app", 1);
-    // A single extension-form candidate: never a bare reference.
+    // A single extension-form candidate is never a bare reference.
     _ = try pushTestFuncOpts(&m, a, "ext", "app.ext", "app", 1, .{ .extension = true });
     try m.rebuildFuncNameIndex(a);
     try testing.expect(m.resolveBareRefIndexed("h", "app", FileId.from(0)) == null);
@@ -1630,9 +1595,7 @@ test "a cross-file private declaration is not a bare-call candidate" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // A private member extension declared in file 7 (a test class's
-    // `CoroutineScope.block(context)`) must not enter another file's
-    // candidate set; the same-file query still sees it.
+    // A private member extension declared in file 7 must not enter another file's candidate set; the same-file query still sees it.
     const priv = try pushTestFuncOpts(&m, a, "block", "lib.T.block", "lib", 1, .{ .extension = true });
     m.funcs.items[priv.int()].kind = .member_extension;
     try m.registry.member_ext_owner_class.put(priv, "T");
@@ -1661,7 +1624,7 @@ test "classIdIndexed ranks a named import above the own package" {
     try inner.put("Config", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
     try testing.expectEqual(imported.int(), m.classIdIndexed("Config", "app", FileId.from(0)).?.int());
-    // A file without the import resolves the own-package class.
+    // Imports are file-scoped: a file without the import resolves the own-package class.
     try testing.expectEqual(
         m.classIdByFqn("app.Config").?.int(),
         m.classIdIndexed("Config", "app", FileId.from(1)).?.int(),

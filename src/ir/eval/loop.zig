@@ -62,9 +62,7 @@ const runFrameExec = ev_exec.runFrameExec;
 const snapshotSuspendedFrame = ev_activation.snapshotSuspendedFrame;
 const teardownActivation = ev_activation.teardownActivation;
 
-/// The driver core. `root_act` is set when the root frame is itself a
-/// resumed live activation — a suspension then live-parks the root too
-/// instead of snapshotting it (the caller relinquished ownership).
+/// The driver core. `root_act` marks a root frame that is itself a resumed live activation, which a suspension live-parks rather than snapshots.
 pub fn runFlatLoop(
     comptime H: type,
     allocator: Allocator,
@@ -80,8 +78,7 @@ pub fn runFlatLoop(
     const ev: *EvalTls = &ev_state.evtls;
     var stack: std.ArrayList(*Activation) = .empty;
     defer stack.deinit(allocator);
-    // On an allocation failure, unwind every open activation so no frame is
-    // left dangling on the GC chain.
+    // On an allocation failure, unwind every open activation so no frame dangles on the GC chain.
     errdefer while (stack.pop()) |act| {
         ev.eval_depth -= 1;
         teardownActivation(H, allocator, act, host);
@@ -100,16 +97,8 @@ pub fn runFlatLoop(
         rthrow = null;
         runwind = null;
         if (flat_site) |site| {
-            // A leaf-expression callee needs none of the activation: serve it
-            // here and deliver its value straight into the caller's register.
-            // This is the seam every direct call passes through, so it covers
-            // plain calls the member and getter entries never see.
-            // The module the callee's body must be READ against. A request
-            // that names one is authoritative; otherwise the caller's module
-            // is right only when it actually owns this `Func`. An anonymous
-            // object's runtime module delegates base funcs through the shared
-            // lazy header section but carries only its own const pool, so a
-            // callee reached from there would read const ids outside it.
+            // The module the callee's body must be READ against: a request that names one is
+            // authoritative, the caller's module only when it actually owns this `Func`.
             const callee_mod: *const Module = site.req.run_module orelse blk_cm: {
                 if (funcOwnedBy(f.module, site.req.func)) break :blk_cm f.module;
                 if (comptime @hasDecl(H, "ownerModuleForFunc")) {
@@ -117,18 +106,11 @@ pub fn runFlatLoop(
                 }
                 break :blk_cm f.module;
             };
-            // A host-served compose helper answers before any activation
-            // opens, on the flat path as well as the recursive seam: the
-            // composer's stacks are reached through both. A pending
-            // enclosing pop or chain seed is fine — `discardFlatReq` undoes
-            // everything the request set up.
+            // A host-served compose helper answers before any activation opens; `discardFlatReq` undoes the request.
             if (site.req.captures.items.len == 0 and site.req.closure_id == null and
                 site.req.type_args.len == 0 and !site.req.composer_pushed)
             {
-                // The seam method tier on the flat path: a deopt-free
-                // compiled method body serves the request natively (RETURN
-                // is its only outcome). Counting/compiling stays on the
-                // recursive seam; this arm only RUNS an already-compiled one.
+                // The seam method tier: a deopt-free compiled method body serves the request natively.
                 if (comptime @hasDecl(H, "plainStoredFieldIndex")) run: {
                     const cl = jit_loop.methodSeamPeek(site.req.func) orelse break :run;
                     if (site.req.args.items.len < site.req.func.params.len or
@@ -206,9 +188,7 @@ pub fn runFlatLoop(
                         continue;
                     },
                     .err => |e| switch (e) {
-                        // The flat protocol: a throw re-enters the caller
-                        // through `rthrow` so its catch handlers dispatch;
-                        // only the non-catchable unwinds ride `runwind`.
+                        // The flat protocol: a throw re-enters the caller through `rthrow` so its catches dispatch.
                         .Throw => |v| {
                             rthrow = v;
                             cur = site.ret_block;
@@ -225,14 +205,7 @@ pub fn runFlatLoop(
                 }
             }
             if (leafReqServable(site.req)) {
-                // A flat request carries the callee's `Func` directly, but the
-                // module its body must be READ against is only known when the
-                // request names one. Falling back to the caller's module is
-                // wrong whenever the callee was resolved in a different one:
-                // its const and func ids index that module's tables, and an
-                // anonymous object's one-function runtime module has neither
-                // (`androidx.compose.runtime.report`, id 15036, served against
-                // a module of 1 func and 6 consts, read const 9028).
+                // A leaf-expression callee needs no activation: serve it straight into the caller's register.
                 if (try leafExprServe(H, allocator, callee_mod, site.req.func, site.req.args.items, host)) |lr| {
                     const dst = site.req.dst;
                     discardFlatReq(H, allocator, site.req, host);
@@ -242,8 +215,7 @@ pub fn runFlatLoop(
                     continue;
                 }
             }
-            // Same depth bound as the recursive path: an unbounded interpreted
-            // recursion becomes a catchable StackOverflowError at the caller.
+            // Same depth bound as the recursive path: unbounded recursion becomes a catchable StackOverflowError.
             if (ev.eval_depth >= maxEvalDepth()) {
                 dumpFrameChainForDiag();
                 discardFlatReq(H, allocator, site.req, host);
@@ -267,13 +239,9 @@ pub fn runFlatLoop(
             };
             cur = site.req.func.entry;
             ridx = 0;
-            // Function-tier attempt for the fresh activation: the framed
-            // entry hook lives only in runFrameExec's generic loop, and the
-            // flat driver is the path member- and bc-driven calls actually
-            // take. Function-mode bodies are suspension-free by
-            // construction, so the outcomes are exactly RETURN (deliver as
-            // the driver's own completion), a real throw, or a deopt that
-            // resumes interpretation at the outcome point in this frame.
+            // Function-tier attempt for the fresh activation: the framed entry hook lives only in
+            // `runFrameExec`, and the flat driver is the path member- and bc-driven calls take.
+            // Function-mode bodies are suspension-free, so the outcomes are RETURN, a throw, or a deopt.
             if (comptime @hasDecl(H, "callFunc")) hook: {
                 if (!jit_loop.funcEnabled()) break :hook;
                 if (runtime.envOnce("KLIO_FJ_FLATHOOK")) |v| {
@@ -343,22 +311,15 @@ pub fn runFlatLoop(
                     }
                     continue;
                 }
-                // Deopt: resume interpretation at the outcome point (the
-                // frame's written scalar registers were reboxed by runFunc).
-                // A handler-issued deopt carries the sentinel and records the
-                // resume instruction on the context; a native one (div by
-                // zero) encodes the instruction directly.
+                // Deopt: resume at the outcome point, whose scalar registers runFunc already reboxed.
                 if (runtime.envOnce("KLIO_JIT_DEBUG") != null) std.debug.print("[jit-dbg] flat DEOPT {s} b={d} i={d}\n", .{ site.req.func.fqn, fo.code.block, fo.code.inst });
                 cur = fo.code.block;
                 ridx = if (fo.code.inst == jit_loop.DEOPT_INST) hctx.pending_deopt_inst else fo.code.inst;
             }
             continue;
         }
-        // A suspension: park the current frame at its own suspension point,
-        // then every outer activation at its recorded call-return point,
-        // preserving the innermost-first order of the recursive path. Flat
-        // activations park LIVE — the intact frame moves into the state by
-        // pointer, no copies — and only a native root frame snapshots.
+        // A suspension parks the current frame at its suspension point, then every outer activation
+        // at its call-return point. Flat activations park LIVE by pointer; a native root snapshots.
         if (park_out) |pp| {
             const state = res.err.Suspended;
             var pb = pp.block;
@@ -376,10 +337,7 @@ pub fn runFlatLoop(
                 const rd = a.ret_dst;
                 try liveParkActivation(H, allocator, a, pb, pi, pd, state, host);
                 if (is_root_pump) {
-                    // No-driver root: park the root into ITS OWN pump,
-                    // drain the pump to quiescence (persisting an
-                    // unresumed root), and continue the caller with the
-                    // resumed value or COROUTINE_SUSPENDED.
+                    // No-driver root: park the root into its own pump and drain that pump to quiescence.
                     if (comptime @hasDecl(H, "rootPumpBarrierPark")) {
                         const r = try host.rootPumpBarrierPark(allocator, state, scope_keep, scope_base);
                         const pf2: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
@@ -397,11 +355,8 @@ pub fn runFlatLoop(
                     }
                 }
                 if (is_barrier) {
-                    // The undispatched-start boundary: the parked segment
-                    // belongs to the enclosing pump, and the CALLER
-                    // continues with the hook's value (COROUTINE_SUSPENDED)
-                    // — the defining startCoroutineUninterceptedOrReturn
-                    // split. Ownership of `state` moves to the pump.
+                    // The undispatched-start boundary: the parked segment belongs to the enclosing pump,
+                    // the CALLER continues with COROUTINE_SUSPENDED, and `state` moves to the pump.
                     const v: Value = if (comptime @hasDecl(H, "undispatchedBarrierPark"))
                         try host.undispatchedBarrierPark(allocator, state, scope_base)
                     else
@@ -425,17 +380,13 @@ pub fn runFlatLoop(
             }
             return res;
         }
-        // The current frame exited; deliver its result to the calling
-        // activation, applying the callee-boundary transforms each popped
-        // frame's result crosses.
+        // The current frame exited: deliver its result through each popped frame's boundary transforms.
         deliver: while (true) {
             if (stack.items.len == 0) return res;
             const act = stack.pop().?;
             ev.eval_depth -= 1;
             res = frameBoundary(act.frame.func, res);
-            // A no-driver root's completion runs its pump to quiescence
-            // (launched children, timers) before the caller sees the
-            // result — the recursive branch's tail, guard still pushed.
+            // A no-driver root's completion drains its pump (launched children, timers) first.
             if (act.root_pump) {
                 if (comptime @hasDecl(H, "rootPumpFlatComplete")) {
                     res = try host.rootPumpFlatComplete(allocator, res, act.keepalive orelse .Unit, act.barrier_scope_base);
@@ -470,9 +421,7 @@ pub fn runFlatLoop(
                         ridx = rix;
                         break :deliver;
                     },
-                    // Anything else exits the calling frame as-is (matching
-                    // the recursive raised-switch's default arm); keep
-                    // popping so each crossed frame's boundary applies.
+                    // Anything else exits the calling frame as-is; keep popping so each boundary applies.
                     else => {},
                 },
             }
@@ -484,13 +433,11 @@ pub fn typeRefName(name: []const u8) TypeRef {
     return .{ .name = name, .nullable = false, .args = &.{} };
 }
 
-/// The loop JIT's call trampoline, specialized per host. A compiled loop's native
-/// call site invokes `call` with the loop's `TrampCtx` and a site index; it reboxes
-/// the scalar args from the slot file, runs the callee through `host.callFunc`, and
-/// reboxes a scalar result back into the dst slot. Returns 0 to continue the native
-/// loop, or `THROW_INST`'s resume code with the error stashed in `Ctx.pending` for
-/// the interpreter to re-raise (a throw routes through the try-stack; any other
-/// error propagates out of the frame, matching the interpreted call exactly).
+/// The loop JIT's call trampoline, specialized per host. A compiled loop's native call site
+/// invokes `call` with the loop's `TrampCtx` and a site index; it reboxes the scalar args
+/// from the slot file, runs the callee through `host.callFunc`, and reboxes a scalar result
+/// into the dst slot. Returns 0 to continue natively, or `THROW_INST`'s resume code with
+/// the error stashed in `Ctx.pending`.
 pub fn LoopTramp(comptime H: type) type {
     return struct {
         pub const Ctx = struct {
@@ -500,13 +447,8 @@ pub fn LoopTramp(comptime H: type) type {
             frame: *Frame,
             pending: ?EvalError = null,
             pending_deopt_inst: u32 = 0,
-            /// Set alongside `pending` when a trampolined callee SUSPENDED:
-            /// the call site's instruction index and result register, so the
-            /// interpreter can park this frame at the call exactly as the
-            /// interpreted path would (block, inst+1, resume reg). Without
-            /// it the suspension propagated as a plain error and the loop
-            /// frame fell out of the continuation — a JITted `for` sending
-            /// into a channel silently lost every element after the tier-up.
+            /// Set alongside `pending` when a trampolined callee SUSPENDED: the call site's instruction
+            /// index and result register, so the interpreter parks this frame exactly at the call.
             pending_suspend_inst: u32 = 0,
             pending_suspend_dst: ?Reg = null,
         };
@@ -519,22 +461,9 @@ pub fn LoopTramp(comptime H: type) type {
             }
         }
 
-        /// The trampoline's BULKY non-call sites (field write, subscript, value call,
-        /// map get/set). Zig does not reclaim block-scoped stack allocations
-        /// (ziglang/zig#23475), so their locals sat in `call`'s frame — and `call` is
-        /// the frame held LIVE across the interpreter's recursion (once a function is
-        /// JIT'd the recursive call runs native code -> this trampoline -> `callFunc`,
-        /// so `runFrameInner` is not even on the path). Outlining them lifted the
-        /// recursion ceiling ~13%.
-        ///
-        /// The three TINY hot sites (object move, null test, field read) deliberately
-        /// stay inline in `call`: they fire once per JIT'd loop iteration, and
-        /// outlining them too cost ~3% throughput for no extra depth.
-        /// ESCAPE: run the interpreter's own arm for one instruction against
-        /// the live frame. Full scalar sync both ways — before: every
-        /// scalar-typed register's slot reboxes into the frame; after: each
-        /// reboxes back (a kind change deopts AT THE NEXT instruction — the
-        /// arm's effects are real and the frame is already correct).
+        /// ESCAPE: run the interpreter's own arm for one instruction against the live frame, with
+        /// full scalar sync both ways, so a kind change deopts AT THE NEXT instruction. Outlined
+        /// because Zig does not reclaim block-scoped stack allocations (ziglang/zig#23475).
         noinline fn execEscapeSite(tctx: *jit_loop.TrampCtx, lc: *Ctx, cl: anytype, site: anytype) ?u64 {
             const n = cl.n_regs;
             var r: u32 = 0;
@@ -561,9 +490,7 @@ pub fn LoopTramp(comptime H: type) type {
                     return jit_loop.throwCode(site.block);
                 },
                 .flat_call => {
-                    // The arm prepared a flat request but ran nothing:
-                    // discard it and deopt AT this instruction so the
-                    // interpreter re-runs it with its own flat machinery.
+                    // The arm prepared a flat request but ran nothing: discard it and deopt AT this instruction.
                     const req = lc.frame.flat_call.?;
                     lc.frame.flat_call = null;
                     discardFlatReq(H, lc.allocator, req, lc.host);
@@ -615,10 +542,7 @@ pub fn LoopTramp(comptime H: type) type {
                 }
                 return 0;
             }
-            // Object collection subscript: read element `recv[idx]` directly (no
-            // `get` dispatch) and write it into the register. Out-of-range or an
-            // unsupported container deopts; the interpreter re-runs the subscript
-            // (a side-effect-free read) and raises the proper exception on OOB.
+            // Object collection subscript: read `recv[idx]` with no `get` dispatch; out of range deopts.
             if (site.is_obj_index) {
                 const recv = lc.frame.regs.items[site.recv_reg];
                 const idx_v = jit_loop.valueFromSlotTagged(cl.reg_types[site.args_reg], tctx.tags[site.args_reg], tctx.slots[site.args_reg]);
@@ -657,9 +581,7 @@ pub fn LoopTramp(comptime H: type) type {
                         else => jit_loop.valueFromSlotTagged(cl.reg_types[ar], tctx.tags[tr2], tctx.slots[ar]),
                     };
                 }
-                // Plain exact-arity closure: skip the value-dispatch preamble
-                // and run the resolved body directly; a declined shape falls
-                // through to the full route below.
+                // Plain exact-arity closure: run the resolved body, skipping the value-dispatch preamble.
                 if (comptime @hasDecl(H, "callClosureFast")) {
                     if (callee == .IrClosure) {
                         const fr = lc.host.callClosureFast(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
@@ -742,13 +664,9 @@ pub fn LoopTramp(comptime H: type) type {
             return null;
         }
 
-        /// A compiled loop's native call site. The site's own work runs in
-        /// `callSite`; on the way back the loop's array caches are refreshed,
-        /// because the callee may have grown a backing store (moving the buffer)
-        /// or rebound the receiver register, and the native code indexes the
-        /// cache directly. A receiver that is no longer the array the loop was
-        /// compiled for deopts to the instruction AFTER the call, whose effects
-        /// have already happened.
+        /// A compiled loop's native call site. Its own work runs in `callSite`; on return the loop's
+        /// array caches refresh, because the callee may have grown a backing store or rebound the
+        /// receiver register while native code indexes the cache directly.
         pub fn call(ctx_opaque: *anyopaque, site_idx: u64) callconv(.c) u64 {
             const code = callSite(ctx_opaque, site_idx);
             if (code != 0) return code;
@@ -771,10 +689,7 @@ pub fn LoopTramp(comptime H: type) type {
                 if (execEscapeSite(tctx, lc, cl, site)) |code| return code;
                 return 0;
             }
-            // Object move: copy one boxed register into another (both in `regs`).
-            // A `.null_`-typed source is the null literal, not a live register, so
-            // write `.Null` directly (its slot-backed register is not maintained
-            // during the native run).
+            // Object move between boxed registers. A `.null_`-typed source is the null literal.
             if (site.is_obj_move) {
                 const v = if (cl.reg_types[site.src_reg] == .null_) Value.Null else lc.frame.regs.items[site.src_reg];
                 v.retain();
@@ -807,8 +722,7 @@ pub fn LoopTramp(comptime H: type) type {
                 lc.pending_deopt_inst = site.inst;
                 return jit_loop.deoptCode(site.block);
             }
-            // Boxed structural/reference comparison: write a boolean to the
-            // scalar destination while both values remain GC-rooted in regs.
+            // Boxed comparison: write a boolean to the scalar dst while both values stay rooted in regs.
             if (site.is_null_check) {
                 const lhs = if (cl.reg_types[site.recv_reg] == .null_) Value.Null else lc.frame.regs.items[site.recv_reg];
                 const rhs = if (cl.reg_types[site.src_reg] == .null_) Value.Null else lc.frame.regs.items[site.src_reg];
@@ -817,16 +731,11 @@ pub fn LoopTramp(comptime H: type) type {
                 tctx.slots[site.dst_reg] = if (r) 1 else 0;
                 return 0;
             }
-            // A field read is a direct stored-field load — no host call, no side
-            // effect, so a deopt is safe (the interpreter re-reads).
+            // A field read is a direct stored-field load with no side effect, so a deopt is safe.
             if (site.is_field) {
                 const recv = lc.frame.regs.items[site.recv_reg];
-                // A by-name site resolves the stored index on the live
-                // receiver per call (a getter property or missing member
-                // deopts — the read is pure, the interpreter re-runs it).
-                // A fixed-index site's varying boxed receiver may be a
-                // different class this iteration (or null after a `?.` chain
-                // step); deopt unless it matches.
+                // A by-name site resolves the stored index on the live receiver per call, deopting on a
+                // getter or missing member. A fixed-index site's varying receiver may be another class.
                 if (recv != .Instance or (!site.field_named and site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
                     lc.pending_deopt_inst = site.inst;
                     return jit_loop.deoptCode(site.block);
@@ -845,7 +754,6 @@ pub fn LoopTramp(comptime H: type) type {
                 const fv: ?Value = if (fidx < g.get().fields.items.len) g.get().fields.items[fidx].value else null;
                 g.deinit();
                 if (cl.reg_types[site.dst_reg] == .object) {
-                    // Object field: write the boxed value straight into the frame.
                     const v = fv orelse .Null;
                     v.retain();
                     lc.frame.write(Reg.from(site.dst_reg), v) catch {
@@ -862,30 +770,24 @@ pub fn LoopTramp(comptime H: type) type {
                     }
                     return 0;
                 }
-                // Field no longer the cached scalar (e.g. a nullable field went
-                // null): deopt and let the interpreter re-read it.
+                // Field no longer the cached scalar kind: deopt and let the interpreter re-read.
                 lc.pending_deopt_inst = site.inst;
                 return jit_loop.deoptCode(site.block);
             }
-            // Scalar field store: write the value directly into the boxed receiver's
-            // stored field (a plain stored property — no custom setter).
-            // Gate on the tag before CALLING the outlined helper: a member/func site
-            // must not pay a call just to be told the site is not one of these.
+            // Scalar field store straight into the boxed receiver's stored field. Gate on the tag
+            // first, so a member or func site pays no call into the outlined helper.
             if (site.is_field_set or site.is_obj_index or site.is_call_value or
                 site.is_map_set or site.is_map_get)
             {
                 if (bulkySite(tctx, lc, cl, site)) |code| return code;
             }
-            // The native loop does not run `.Trace`; refresh the calling frame's
-            // position so a throw from the callee reports this call's line.
+            // The native loop does not run `.Trace`; refresh the frame position for a callee throw.
             if (site.span) |sp| lc.frame.cur_span = sp;
             var argbuf: [6]Value = undefined;
             var k: usize = 0;
             while (k < site.n_args) : (k += 1) {
                 const ar = @as(usize, site.args_reg) + k;
-                // The LIVE tag comes through the move chain's source: the
-                // native code copies arg SLOTS without updating the tag
-                // array (see CallSite.arg_tag_regs).
+                // The LIVE tag rides the move chain's source: native code copies arg SLOTS, not tags.
                 const tr: usize = if (k < 3 and site.arg_tag_regs[k] != 0) site.arg_tag_regs[k] else ar;
                 argbuf[k] = switch (cl.reg_types[ar]) {
                     .object => lc.frame.regs.items[ar],
@@ -893,26 +795,18 @@ pub fn LoopTramp(comptime H: type) type {
                     else => jit_loop.valueFromSlotTagged(cl.reg_types[ar], tctx.tags[tr], tctx.slots[ar]),
                 };
             }
-            // Native recursion: a compiled body calling a compiled (scalar)
-            // callee runs its body directly — no interpreter frame, no dispatch.
-            // The callee is pure (scalar in, scalar out), so a deopt/throw can
-            // safely fall back to the frame-based path by re-running it below.
+            // Native recursion: a compiled body calls a compiled scalar callee directly; it is pure,
+            // so a deopt or throw falls back to the frame path by re-running.
             if (!site.is_member and !site.is_virtual and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
-                    // A callee only ever called from compiled code is never
-                    // probed by the interpreter, so it stayed uncompiled and this
-                    // site trampolined every iteration. The call is hot by
-                    // construction; offer the body to the tier once.
+                    // A callee only ever called from compiled code is never probed, so offer it to the tier once.
                     const compiled_callee = jit_loop.compiledFunc(callee) orelse
                         jit_loop.compileCalleeForCall(lc.module, callee, argbuf[0..site.n_args], &resolveMember, &resolveVirtual, &resolveField, &resolveFieldNN, ctx_opaque);
                     if (compiled_callee) |callee_cl| {
                         if (!callee_cl.no_native_recurse and
                             ev_state.evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192)
                         {
-                            // Per-depth rows from the thread's static bank: a
-                            // stack `undefined` array here is 0xaa-filled per
-                            // CALL under the safe build — it was 70% of a
-                            // native fib's wall.
+                            // Per-depth rows from the thread's static bank: a stack `undefined` array is 0xaa-filled per call.
                             const fslots: []i64 = &ev_state.native_slot_bank[ev_state.evtls.jit_native_depth];
                             const ftags: []u8 = &ev_state.native_tag_bank[ev_state.evtls.jit_native_depth];
                             ev_state.evtls.jit_native_depth += 1;
@@ -928,13 +822,10 @@ pub fn LoopTramp(comptime H: type) type {
                                     }
                                     return 0;
                                 }
-                                // A deeper call threw: `lc.pending` is already set —
-                                // propagate it out (do NOT re-run; the callee may have
-                                // had effects), unwinding this native frame too.
+                                // A deeper call threw and `lc.pending` is set: propagate rather than re-run.
                                 if (o.code.inst == jit_loop.THROW_INST) return jit_loop.throwCode(site.block);
                             }
-                            // Not run (param-kind mismatch / depth / oversized): the
-                            // callee never executed, so the frame path runs it once.
+                            // Not run (param-kind mismatch, depth, oversized): the frame path runs it once.
                         }
                     }
                 }
@@ -972,8 +863,7 @@ pub fn LoopTramp(comptime H: type) type {
                     .null_ => Value.Null,
                     else => jit_loop.valueFromSlotTagged(cl.reg_types[site.recv_reg], tctx.tags[recv_tag_src], tctx.slots[site.recv_reg]),
                 };
-                // A varying boxed receiver may be a different class this iteration;
-                // deopt unless it matches the class the return type was resolved for.
+                // A varying boxed receiver may be a different class this iteration; deopt unless it matches.
                 if (site.recv_class != 0 and site.recv_varies and (recv != .Instance or jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
                     lc.pending_deopt_inst = site.inst;
                     return jit_loop.deoptCode(site.block);
@@ -1012,11 +902,8 @@ pub fn LoopTramp(comptime H: type) type {
                         return jit_loop.throwCode(site.block);
                     };
                 }
-                // Inline cache: lowering could not name this site's target, so
-                // the interpreter re-ran FULL by-name dispatch (candidate scan +
-                // overload ranking) on every call from compiled code. Resolve
-                // once per (receiver class, argument shape) and call the target
-                // directly while the shape holds.
+                // Inline cache: lowering could not name this site's target, so by-name dispatch ran in
+                // full every call. Resolve once per (receiver class, argument shape) while it holds.
                 if (comptime @hasDecl(H, "resolveMemberFuncId") and @hasDecl(H, "invokeResolvedMember")) {
                     if (site.dispatch_recv_reg == null and site.declared_name.len == 0 and
                         @as(usize, @intCast(site_idx)) < cl.member_ics.len)
@@ -1028,9 +915,7 @@ pub fn LoopTramp(comptime H: type) type {
                                 if (lc.host.resolveMemberFuncId(lc.allocator, &recv, site.name, argbuf[0..site.n_args])) |fid| {
                                     ic.* = .{ .key = key, .target = fid, .valid = true };
                                 } else {
-                                    // Unresolvable at this shape: leave the entry
-                                    // invalid so the next call retries rather than
-                                    // caching a miss forever.
+                                    // Unresolvable at this shape: leave the entry invalid so the next call retries.
                                     ic.valid = false;
                                 }
                             }
@@ -1055,8 +940,7 @@ pub fn LoopTramp(comptime H: type) type {
                         .Type = "host cannot dispatch member calls",
                     } };
                 }
-                // Keep the caller's instance `this` reachable for member-extension
-                // visibility, exactly as the interpreted CallMember path does.
+                // Keep the caller's instance `this` reachable for member-extension visibility.
                 var pushed = false;
                 if (lc.frame.params.items.len > 0 and lc.frame.params.items[0] == .Instance) {
                     const pi = lc.frame.params.items[0].Instance;
@@ -1095,11 +979,7 @@ pub fn LoopTramp(comptime H: type) type {
                             };
                         } else {
                             const s = jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) orelse {
-                                // The call ALREADY RAN — a deopt that re-runs
-                                // the instruction would double its effects.
-                                // Deliver the boxed result into the frame
-                                // register (the rebox pass skips it) and
-                                // resume interpretation AFTER the site.
+                                // The call ALREADY RAN: deliver the boxed result and resume AFTER the site.
                                 v.retain();
                                 lc.frame.write(Reg.from(site.dst_reg), v) catch {
                                     lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
@@ -1110,9 +990,7 @@ pub fn LoopTramp(comptime H: type) type {
                                 return jit_loop.deoptCode(site.block);
                             };
                             tctx.slots[site.dst_reg] = s;
-                            // The call's ACTUAL result kind governs how this
-                            // register reboxes (an intrinsic `toChar` has no
-                            // static return to read).
+                            // The call's ACTUAL result kind governs how this register reboxes.
                             if (cl.reg_types[site.dst_reg] == .i32) {
                                 tctx.tags[site.dst_reg] = @intFromEnum(std.meta.activeTag(v));
                             }
@@ -1127,47 +1005,35 @@ pub fn LoopTramp(comptime H: type) type {
             }
         }
 
-        /// Compile-time member resolver: resolve `receiver.name(args)` to the
-        /// method `FuncId` so the loop JIT can learn its return type. Run time
-        /// still dispatches through `callMemberNamed`, so this never alters
-        /// behavior — it only informs the slot's static type.
+        /// Compile-time member resolver, for the JIT's return type; run time still dispatches by name.
         pub fn resolveMember(user: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value) ?FuncId {
             if (comptime !@hasDecl(H, "resolveMemberFuncId")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.resolveMemberFuncId(lc.allocator, receiver, name, args);
         }
 
-        /// Compile-time virtual-slot resolver: the FuncId the slot dispatches
-        /// to on the receiver's class, so a loop-invariant virtual call can
-        /// inline its monomorphic target. Null keeps the site a trampoline.
+        /// Compile-time virtual-slot resolver, so a loop-invariant virtual call inlines its target.
         pub fn resolveVirtual(user: *anyopaque, receiver: *const Value, slot: u32) ?FuncId {
             if (comptime !@hasDecl(H, "resolveVirtualFuncId")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.resolveVirtualFuncId(receiver, ir.MethodSlotId.from(slot));
         }
 
-        /// Compile-time field resolver: the stored-field index of `name` on the
-        /// receiver, or null if it is not a plain stored property (so the read
-        /// stays interpreted).
+        /// Compile-time field resolver: the stored-field index of `name`, null if not plain stored.
         pub fn resolveField(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
             if (comptime !@hasDecl(H, "plainStoredFieldIndex")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.plainStoredFieldIndex(lc.allocator, receiver, name);
         }
 
-        /// Like `resolveField`, but only for a non-nullable scalar stored field —
-        /// the index where a member-inlined field read can never observe null (so
-        /// the loop can inline a method that also writes a field).
+        /// Like `resolveField`, but only a non-nullable scalar field, where a read cannot see null.
         pub fn resolveFieldNN(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
             if (comptime !@hasDecl(H, "plainStoredScalarFieldNN")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.plainStoredScalarFieldNN(lc.allocator, receiver, name);
         }
 
-        /// What the four compile-time resolvers above actually read: the host and
-        /// the allocator, never the frame. The fused walker has no frame until it
-        /// materializes one, and it has to know whether the loop compiles BEFORE
-        /// paying for that, so it answers with this instead of a `Ctx`.
+        /// What the four resolvers read: the host and the allocator, never the frame, which the fused walker has not built yet.
         pub const ResolveCtx = struct {
             host: *H,
             allocator: Allocator,

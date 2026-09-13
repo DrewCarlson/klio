@@ -32,9 +32,7 @@ const trailingGapDefaulted = Module.trailingGapDefaulted;
 const typeContainsBoundParam = Module.typeContainsBoundParam;
 
 /// Resolve an explicit-receiver top-level extension call from declaration
-/// metadata alone. Only a statically proven receiver and a unique overload
-/// at the innermost visible scope produce a target; runtime-value evidence
-/// and declaration-order tie breaking are deliberately unavailable here.
+/// metadata: only a proven receiver and a unique innermost overload commit.
 pub fn resolveExtensionCall(
     self: *const Module,
     name: []const u8,
@@ -54,11 +52,8 @@ pub fn resolveExtensionCall(
         ctx.caller_file,
         ctx.caller_package,
     ) catch return .{};
-    // A receiver still HEADED by a type parameter ranks with its full
-    // bound substituted: `data - "foo"` on a `T : Iterable<String>`
-    // receiver must refute `Set.minus` exactly as kotlinc does — an
-    // unresolved `T` head leaves every receiver-shaped candidate
-    // applicable, and the wrong overload can outrank the bound's own.
+    // A receiver headed by a type parameter ranks with its full bound
+    // substituted, so a `T : Iterable<String>` receiver refutes `Set.minus`.
     if (scoped_receiver.args.len == 0) {
         const rhead = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
         if (runtime.envSetOnce("KLIO_HOP_TRACE")) {
@@ -89,8 +84,7 @@ pub fn resolveExtensionCall(
     var named_maps: std.ArrayList(?[]const usize) = .empty;
     var named_skips: std.ArrayList(bool) = .empty;
     var unknown_best_tier: u8 = 255;
-    // The per-call window delimiter for the rex trace: every candidate
-    // row until the next rex-call row belongs to this resolution.
+    // Window delimiter for the rex trace: rows up to the next rex-call row.
     if (runtime.envSetOnce("KLIO_REX_TRACE")) {
         if (applicability.trace_call_span) |sp| {
             std.debug.print("[rex-call] {s} recv={s} rargs={d} at=f{d}:{d}\n", .{ name, scoped_receiver.name, scoped_receiver.args.len, sp.file.int(), sp.start });
@@ -110,25 +104,11 @@ pub fn resolveExtensionCall(
         if ((kind != .top_level_extension and !is_member_extension) or
             f.params.len == 0 or
             !std.mem.eql(u8, f.params[0].name, "this")) continue;
-        // `@Deprecated(level = ERROR|HIDDEN)` is UN-CALLABLE at any
-        // site that does not `@Suppress("DEPRECATION_ERROR")`: kotlinc
-        // reports an error rather than binding it, so it must never be
-        // a static commit — not even as a sole survivor after a member
-        // refutation (the stdlib's Java-compat
-        // `MutableList<T>.remove(index: Int) = removeAt(index)` bound
-        // `subList.remove(3)` to REMOVE-AT semantics through exactly
-        // that hole).
+        // `@Deprecated(level = ERROR|HIDDEN)` is un-callable without
+        // `@Suppress("DEPRECATION_ERROR")`, so it is never a static commit.
         if (f.deprecated_error and !core_func.suppress_deprecation_error) continue;
-        // Ordered named arguments bind by parameter IDENTITY, and may
-        // skip parameters Kotlin fills from defaults: `rangesDelimitedBy(
-        // delimiters, ignoreCase = x, limit = y)` skips the defaulted
-        // `startIndex`, and kotlinc still resolves the call statically.
-        // Build the arg -> param mapping monotonically (each named
-        // argument binds the next parameter carrying its name; every
-        // parameter it skips must default); the scorer then judges each
-        // argument against ITS parameter instead of the raw position.
-        // Backwards-reordered named calls and vararg declarations keep
-        // the strict in-position rule and stay deferred.
+        // Ordered named arguments bind by parameter IDENTITY and may skip defaulted
+        // parameters; backwards-reordered and vararg calls keep the positional rule.
         var named_map: ?[]const usize = null;
         var named_map_skips = false;
         {
@@ -176,9 +156,7 @@ pub fn resolveExtensionCall(
                         map_buf[i] = pj;
                         next = pj + 1;
                     } else {
-                        // The trailing-callable rule applies inside the
-                        // mapping too: a last positional lambda fills the
-                        // LAST parameter across a defaulted gap.
+                        // A last positional lambda fills the LAST parameter here too.
                         if (i + 1 == args.len and
                             (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) and
                             next < f.params.len - 1 and
@@ -198,9 +176,7 @@ pub fn resolveExtensionCall(
                         next += 1;
                     }
                 }
-                // Everything left unbound past the last binding must
-                // default; skipped middles were checked as they were
-                // crossed.
+                // Everything left unbound past the last binding must default.
                 for (f.params[next..]) |param| {
                     if (!param.has_default and param.default == null)
                         continue :candidate_loop;
@@ -250,13 +226,8 @@ pub fn resolveExtensionCall(
                         };
                         if (decl_file.int() != ctx.caller_file.int()) continue;
                     } else {
-                        // A private MEMBER extension is visible only in
-                        // its declaring class's lexical family — nesting
-                        // in either direction covers a companion's
-                        // privates in the enclosing class — and never
-                        // through inheritance: PrivateDerived does not
-                        // see PrivateBase's private extension, so the
-                        // stdlib candidate must win there.
+                        // A private member extension is visible only in its
+                        // declaring class's lexical family, never by inheritance.
                         const owner_name = self.registry.member_ext_owner_class.get(fid) orelse continue;
                         const owner_cid = (self.classIdByFqn(owner_name) orelse
                             self.classId(owner_name)) orelse continue;
@@ -303,15 +274,8 @@ pub fn resolveExtensionCall(
             if (args.len < required) continue;
         } else if (named_map == null) {
             if (args.len > f.params.len - 1) continue;
-            // Trailing-callable rule at the ARITY gate: the last arg
-            // fills the LAST param when that param is function-typed,
-            // so only the MIDDLE gap must default — `windowed(2, 3)
-            // { transform }` binds the 4-value-param transform
-            // overload with `partialWindows` defaulted; the
-            // positional walk instead demanded `transform` itself
-            // default and dropped the overload kotlinc picks.
-            // A named-mapped candidate already proved its skipped and
-            // trailing parameters default while the map was built.
+            // Trailing-callable rule at the ARITY gate: the last arg fills the LAST
+            // param when that param is function-typed, so only the middle gap defaults.
             const trailing_call = args.len > 0 and args.len < f.params.len - 1 and
                 (args[args.len - 1].is_lambda or
                     args[args.len - 1].lambda_arity != null or
@@ -351,12 +315,8 @@ pub fn resolveExtensionCall(
             scoped_receiver,
             scoped_recv_param,
         );
-        // KLIO_RECV_REFUTE=1 (A/B, default OFF): kotlinc's static
-        // receiver semantics — a candidate whose declared receiver
-        // classifier is provably unrelated to the PROVEN static receiver
-        // is not a candidate at all (`Map.minus` never binds an
-        // Iterable-typed receiver). The lazy default keeps the
-        // runtime-polymorphic leniency until the audit adjudicates.
+        // `KLIO_RECV_REFUTE=1` (default off): a declared receiver classifier
+        // provably unrelated to the proven static receiver refutes outright.
         if (compatibility == .unknown and scoped_receiver.args.len != 0 and
             recvRefuteOn())
         {
@@ -388,13 +348,8 @@ pub fn resolveExtensionCall(
             if (generic_applies) {
                 compatibility = .compatible;
             } else {
-                // A bound HEAD the actual receiver provably fails refutes
-                // the candidate outright: `where T : Node, T : Observer`
-                // never binds a CanvasScope receiver, and kotlinc drops
-                // the candidate at the declaration. Sound even for
-                // records marked incomplete — dropped bound arguments
-                // only narrow a bound — but only when BOTH classifiers
-                // are known classes with a provably absent relation.
+                // A bound HEAD the actual receiver provably fails refutes the candidate,
+                // but only when both classifiers are known classes.
                 var head_refuted = false;
                 const recv_head_name = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
                 const recv_cid: ?ClassId = if (std.mem.findScalar(u8, recv_head_name, '.') != null)
@@ -507,18 +462,12 @@ pub fn resolveExtensionCall(
         }
         if (compatibility == .incompatible) continue;
         if (has_vararg) {
-            // `applicability.applicable` maps fixed/default/vararg
-            // positions below. Keep the extra static compatibility proof
-            // conservative until it models repeated vararg element slots.
+            // `applicability.applicable` maps the fixed/default/vararg positions below;
+            // keep the extra proof conservative until it models repeated vararg slots.
             compatibility = .unknown;
         } else {
-            // A trailing lambda fills the LAST parameter even when
-            // DEFAULTED parameters are omitted between (`windowed(2, 3)
-            // { transform }` maps the lambda past `partialWindows`);
-            // judging it positionally refuted the overload kotlinc
-            // binds. The skipped middle must be all-defaulted (Kotlin
-            // fills the gap from defaults only) — see the member-side
-            // mapping's tryResume note.
+            // A trailing lambda fills the LAST parameter even across omitted DEFAULTED
+            // parameters; the skipped middle must then be all-defaulted.
             const trailing_lambda_arg = args.len != 0 and
                 (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
                     args[args.len - 1].func_typed) and
@@ -532,15 +481,8 @@ pub fn resolveExtensionCall(
                 else
                     1 + ai;
                 const param = f.params[pi];
-                // The RECEIVER's instantiation constrains the callee's
-                // own type parameters before any argument is judged:
-                // `plus(elements: Iterable<T>)` on a `List<List<String>>`
-                // receiver requires `Iterable<List<String>>`, so a
-                // `List<String>` argument REFUTES the candidate — the
-                // raw `Iterable<T>` judged String-vs-T as "own tp,
-                // anything goes" and falsely proved it. Substitute what
-                // the receiver binds, then judge; unbound params keep
-                // the raw path.
+                // The receiver's instantiation constrains the callee's own type parameters
+                // before any argument is judged; unbound params keep the raw path.
                 var judged_param = param.ty;
                 var subst_param: ?TypeRef = null;
                 if (arg.ty != null and
@@ -611,9 +553,8 @@ pub fn resolveExtensionCall(
     const sigs = sa.alloc(applicability.SigView, ids.items.len) catch return .{};
     for (ids.items, 0..) |fid, i| {
         const f = self.funcById(fid).?;
-        // A named-mapped candidate presents COMPACTED parameters: the
-        // scorer judges positionally, so each argument's slot must hold
-        // the parameter its name bound, not the raw declaration order.
+        // A named-mapped candidate presents COMPACTED parameters: each argument's
+        // slot holds the parameter its name bound, not raw declaration order.
         const params = if (named_maps.items[i]) |mp| blk_cp: {
             const cp = sa.alloc(Param, mp.len + 1) catch return .{};
             cp[0] = f.params[0];
@@ -741,29 +682,21 @@ pub fn resolveExtensionCall(
         )
     else
         false;
-    // A renamed import fixes the declaration family by exact FQN. Once
-    // ordinary applicability selects one overload from that family, an
-    // unknown argument type does not erase the identity; receiver/member
-    // precedence is still decided by `emitFormFor`.
+    // A renamed import fixes the declaration family by exact FQN; an unknown
+    // argument type does not erase that identity once an overload is selected.
     const receiver_supplies_lambda = if (best) |target|
         ranked_sigs.items.len == 1 and
             self.genericReceiverSuppliesLambdaReceiver(target, args)
     else
         false;
-    // Every other candidate was ELIMINATED by proof and exactly one
-    // remains: kotlinc commits it — an unproven receiver instantiation
-    // does not change that there is nothing else the call could resolve
-    // to. Guarded to receivers that carry explicit type arguments
-    // (`Array<T>`), so a bare conservative head keeps the withhold.
+    // Exactly one candidate survives elimination by proof, so commit it. Guarded
+    // to receivers carrying explicit type arguments; a bare head withholds.
     const sole_off = if (std.c.getenv("KLIO_SOLE_EXT")) |v|
         std.mem.eql(u8, std.mem.span(v), "0")
     else
         false;
-    // A member-refuted call may commit its sole survivor only when the
-    // candidate is declared in the CALLER'S OWN FILE — the file-private
-    // shape (Select.kt's tryResume) kotlinc must bind, and narrow
-    // enough that cross-file stdlib chains keep their deferral
-    // (a wider member_refuted commit re-broke trimIndent).
+    // A member-refuted call commits its sole survivor only when that candidate is
+    // declared in the CALLER'S OWN FILE, keeping cross-file chains deferred.
     const sole_same_file = ids.items.len == 1 and blk: {
         const sp = self.decl_span.get(ids.items[0].int()) orelse break :blk false;
         break :blk sp.file.int() == ctx.caller_file.int();
@@ -771,14 +704,8 @@ pub fn resolveExtensionCall(
     const sole_survivor = !sole_off and ids.items.len == 1 and
         ranked_sigs.items.len == 1 and scoped_receiver.args.len != 0 and
         (receiver_pruned != 0 or (ctx.member_refuted and sole_same_file));
-    // The widened member-refuted commit: when the MEMBER was refuted by
-    // an authoritative argument, the strict ext_key winner commits even
-    // with an unproven receiver instantiation — every supplied argument
-    // is authoritative (unauthoritative args cannot refute a member, so
-    // reaching here with member_refuted implies authority), the key
-    // strictly beat every rival (untied), and kotlinc has no member to
-    // prefer. The trimIndent hazard was the FILE-blind sole rule
-    // without key strictness; this rule requires both.
+    // Widened member-refuted commit: an authoritative argument refuted the member
+    // and the ext_key winner strictly beat every rival, so it commits anyway.
     var refuted_args_authoritative = true;
     for (proof_args) |pa| {
         if (pa.ty == null and pa.literal_kind == null and
@@ -788,11 +715,8 @@ pub fn resolveExtensionCall(
             break;
         }
     }
-    // The winner's declared receiver must RELATE to the static
-    // receiver (same head, proven subtype, or the winner's own type
-    // parameter): an argument-keyed winner on an unrelated receiver is
-    // exactly the over-commit that put a Map-family extension on a
-    // Sequence (SequenceTest.flatten).
+    // The winner's declared receiver must RELATE to the static receiver: same
+    // head, proven subtype, or the winner's own type parameter.
     const winner_recv_related = blk: {
         const brp = best_recv_param orelse break :blk false;
         var wh = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, brp.name, "?")));
@@ -821,16 +745,8 @@ pub fn resolveExtensionCall(
             .sole_unknown = if (!tied) best else null,
             .param_rep = if (tied) self.tiedLambdaParamRep(tied_ids.items) else null,
         };
-    // A winner whose named arguments SKIPPED defaulted parameters COMMITS:
-    // the emitted Call carries the argument names, and the host boundary
-    // binds them by declaration parameter — callFuncNamed fills a
-    // defaultless hole before a bound slot with Null (the convention the
-    // natives read as "defaulted") instead of dropping the bound tail,
-    // and the incompatible-receiver guard knows the full builtin family
-    // (`ByteArray` was classified a user class, which stripped the names
-    // off `decodeToString(throwOnInvalidSequence = true)` on re-dispatch).
-    // `KLIO_NAMED_COMMIT=0` demotes back to the typing-only channel for
-    // single-binary A/B.
+    // A winner whose named arguments skipped defaulted parameters still commits:
+    // the Call carries the names. `KLIO_NAMED_COMMIT=0` demotes it to typing.
     if (best) |target| {
         for (ids.items, named_skips.items) |fid, skipped| {
             if (fid != target) continue;
@@ -854,11 +770,8 @@ pub fn resolveExtensionCall(
     };
 }
 
-/// Resolve one member name against the declarations owned by the static
-/// receiver class. Candidate applicability and overload ranking are shared
-/// with runtime dispatch; this function additionally classifies whether
-/// the resulting declaration can be called directly or needs a virtual
-/// method slot.
+/// Resolve one member name against the declarations owned by the static receiver
+/// class, and classify it as a direct call or a virtual method slot.
 pub fn resolveMemberCall(
     self: *const Module,
     owner: ClassId,
@@ -895,13 +808,8 @@ pub fn resolveMemberCall(
     var unknown_count: usize = 0;
     var visibility_unknown = false;
     var any_applicable = false;
-    // A `@Deprecated(level = ERROR|HIDDEN)` member is not a source-level
-    // candidate while an ordinary same-name member exists: kotlinc never
-    // binds `Updater.set(value: Int, ...)` (HIDDEN) beside the generic
-    // `set(value: V, ...)`, and counting it as a second unknown for a
-    // type-parameter-shaped argument left the call with no target at all.
-    // Kept as the last resort for a name whose every overload is hidden,
-    // mirroring `funcId`.
+    // A `@Deprecated(level = ERROR|HIDDEN)` member is not a source-level candidate
+    // while an ordinary same-name member exists; it is the last resort only.
     var any_ordinary = false;
     for (candidates.items) |candidate| {
         const cf = self.funcById(candidate.fid) orelse continue;
@@ -923,9 +831,8 @@ pub fn resolveMemberCall(
                 !self.lexicalChainContains(ctx.lexical_owner.?, declared_owner))) continue;
         if (ds.visibility == .Protected) {
             const lexical = ctx.lexical_owner orelse continue;
-            // Kotlin exposes a protected declaration only within its
-            // declaring class hierarchy, and a subclass may access it
-            // only through a receiver from that subclass hierarchy.
+            // Kotlin exposes a protected declaration only within its declaring hierarchy,
+            // and to a subclass only through a receiver from that subclass hierarchy.
             const access_owner = self.protectedAccessOwner(
                 lexical,
                 declared_owner,
@@ -934,12 +841,8 @@ pub fn resolveMemberCall(
         }
         if (ctx.private_only and ds.visibility != .Private) continue;
         const f = self.funcById(fid) orelse continue;
-        // A bodyless member header that lists no value parameters yet
-        // (an interface member such as `Map.get(key)` before its body
-        // lowers) is judged by its DECLARED arity: an applicable member
-        // outranks any same-named extension, and treating it as
-        // inapplicable let `Map<out K, V>.get` bind `map[key]` and call
-        // itself from its own body.
+        // A bodyless member header listing no value parameters yet is judged by its
+        // DECLARED arity; an applicable member outranks a same-named extension.
         const lists_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
         const listed_values = f.params.len - @intFromBool(lists_this);
         if (ds.arity.total != 0 and listed_values < ds.arity.required and (!f.hasBody() or listed_values < ds.arity.total)) {
@@ -955,9 +858,7 @@ pub fn resolveMemberCall(
         }
         const sig = applicability.SigView{
             .params = f.params,
-            // Member resolution may bind an abstract declaration to a
-            // virtual slot; executability belongs to dispatch, not
-            // overload applicability.
+            // Executability belongs to dispatch, not to overload applicability.
             .has_body = true,
             .low_priority = rankLowPriority(f),
             .is_member = true,
@@ -1013,11 +914,8 @@ pub fn resolveMemberCall(
             best_score = applied;
             tied = false;
         } else if (applied == best_score) {
-            // Redeclarations of one virtual family are not an overload
-            // tie: `Set.iterator` overrides `Collection.iterator`
-            // overrides `Iterable.iterator`, and every one of them names
-            // the same slot family. Keep the overriding declaration; a
-            // genuine tie between unrelated members still defers.
+            // Redeclarations of one virtual family are not an overload tie: keep the
+            // overriding declaration. A tie between unrelated members still defers.
             const existing = best.?;
             var family = false;
             if (self.decl_sigs.get(fid.int())) |cs| if (cs.enclosing_class) |co| {
@@ -1030,13 +928,8 @@ pub fn resolveMemberCall(
                 if (self.overridesSlot(sa, eo, existing, fid) catch false) family = true;
             };
             if (!family) {
-                // DIAMOND family: neither declaration overrides the
-                // other, but both override one slot the RESOLUTION
-                // owner inherits (`AbstractMutableCollection` sees
-                // `iterator` from both `AbstractCollection` and
-                // `MutableCollection`). Kotlin merges these into one
-                // intersection slot; keep the declaration with the
-                // more specific return type.
+                // DIAMOND family: neither declaration overrides the other but both override
+                // one slot the resolution owner inherits; keep the more specific return type.
                 const cand_o = self.overridesSlot(sa, owner, fid, existing) catch false;
                 const exist_o = self.overridesSlot(sa, owner, existing, fid) catch false;
                 if (cand_o or exist_o) {
@@ -1065,24 +958,19 @@ pub fn resolveMemberCall(
     }
     const target = best.?;
     const ds = self.decl_sigs.get(target.int()).?;
-    // Native/expect/abstract headers identify an overload but do not carry
-    // the ordinary IR-function ABI required by a direct FuncId call.
+    // Native/expect/abstract headers identify an overload but carry no IR ABI.
     if (!ds.has_body) return .{ .target = target, .dispatch = .virtual, .applicable = true };
     if (ds.visibility == .Private) return .{ .target = target, .dispatch = .direct, .applicable = true };
     const f = self.funcById(target) orelse return .{};
-    // An unclaimed classifier header carries no trustworthy final/open/
-    // interface modifiers. Its declaration identity can still resolve the
-    // overload, but dispatch must remain virtual until the class is filled.
+    // An unclaimed classifier header carries no trustworthy final/open/interface
+    // modifiers: it can still resolve the overload, but dispatch stays virtual.
     if (class.is_stub) return .{ .target = target, .dispatch = .virtual, .applicable = true };
     const declaring_class = if (ds.enclosing_class) |decl_owner|
         (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
     else
         null;
-    // The DECLARING class may still be an unclaimed header when the
-    // owner's bodies lower ahead of it (a pack's `AbstractEncoder`
-    // lowered before `Encoder` was filled): its `is_interface` reads
-    // false and the interface default bound direct, so the implementing
-    // class's override never ran. Unknown declarer: virtual.
+    // The DECLARING class may itself be an unclaimed header when the owner's
+    // bodies lower ahead of it, so an unknown declarer is treated as virtual.
     const declared_on_interface = if (declaring_class) |decl| (decl.is_interface or decl.is_stub) else true;
     // An enum class is extensible by its entries' bodies, which override
     // its `open`/`abstract` members: only a final member is bound direct.
@@ -1097,13 +985,8 @@ pub fn resolveMemberCall(
     return .{ .target = target, .dispatch = .virtual, .applicable = true };
 }
 
-/// The `direct` vs `virtual` choice for an already-identified target,
-/// factored out of `resolveMemberCall` so a caller that promotes a
-/// deferred-but-identified resolution reaches the SAME answer instead of
-/// assuming `virtual`. Assuming virtual is wrong for a final or private
-/// method: it has no vtable slot at all, and the call fails at runtime with
-/// "virtual method slot is not linked for receiver class" even when the
-/// receiver's class is exactly the declaring one.
+/// The `direct` vs `virtual` choice for an already-identified target. Assuming
+/// `virtual` is wrong for a final or private method: it has no vtable slot.
 pub fn dispatchForTarget(self: *const Module, owner: ClassId, target: FuncId) ?MemberDispatch {
     if (owner.int() >= self.classes.items.len) return null;
     const class = &self.classes.items[owner.int()];
@@ -1111,16 +994,8 @@ pub fn dispatchForTarget(self: *const Module, owner: ClassId, target: FuncId) ?M
     if (!ds.has_body) return .virtual;
     if (ds.visibility == .Private) return .direct;
     const f = self.funcById(target) orelse return null;
-    // An unclaimed classifier header carries no trustworthy final/open/
-    // interface modifiers: every flag reads false whether the class is
-    // closed or merely unlowered, so "closed and final" cannot be told
-    // from "unknown". Answer virtual, exactly as `resolveMemberCall`
-    // does — reading the placeholder as closed bound a defaulted
-    // INTERFACE member by fid and the implementing class's override
-    // never ran (`SerializersModuleCollector.contextual`, whose default
-    // forwards to the provider overload, registered every serializer as
-    // a provider). Value classes never reach here as stubs; their
-    // receivers take the ordinary final-class rule below.
+    // An unclaimed classifier header reads every modifier false whether the class
+    // is closed or merely unlowered, so answer virtual rather than direct.
     if (class.is_stub) return .virtual;
     const declaring_class = if (ds.enclosing_class) |decl_owner|
         (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
@@ -1154,9 +1029,8 @@ pub fn internalVisibleFrom(
     return caller_module.? == declaration_module.?;
 }
 
-/// Reconstruct the owner-scoped index from serialized declaration records.
-/// Pack images do not serialize this derived table; loading calls this
-/// once after functions, classes, and declaration signatures are available.
+/// Rebuild the owner-scoped index from serialized declaration records: pack
+/// images do not serialize this derived table.
 pub fn rebuildMemberNameIndex(self: *Module, allocator: Allocator) Allocator.Error!void {
     var old_it = self.member_name_index.valueIterator();
     while (old_it.next()) |list| list.deinit(allocator);

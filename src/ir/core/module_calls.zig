@@ -30,18 +30,10 @@ const overrideArgs = Module.overrideArgs;
 const rankLowPriority = core_func.rankLowPriority;
 const staticTypeVar = Module.staticTypeVar;
 
-/// The three-tier static/dynamic boundary as a resolver verdict.
-///   exact   — a committed static target; the emitted IR is a direct Call.
-///   virtual — the slot / candidate is static, the leaf chosen at runtime
-///             (member-vs-global on an implicit receiver, or a receiver-
-///             bound extension): CallMember / CallMemberOrGlobal.
-///   deferred— no static target: unknown receiver or no unique applicable
-///             candidate; the runtime probe.
+/// Resolver verdict: `exact` commits a static target, `virtual` fixes the
+/// candidate but picks the leaf at runtime, `deferred` has no static target.
 pub const Confidence = enum { exact, virtual, deferred };
 
-/// The IR emission shape the lowerer switches on — one enum in place of
-/// the per-path re-decision across emitBareFuncCall / emitExtBareCall /
-/// lowerImplicitThisCall / lowerUnresolvedBareCall.
 pub const EmitForm = enum {
     Call,
     CallMember,
@@ -49,10 +41,7 @@ pub const EmitForm = enum {
     CallValue,
 };
 
-/// A resolved bare call: the committed target (null on a pure deferral),
-/// its confidence, the IR emission form, the in-scope candidate set for
-/// the runtime walk / diagnostics, and the index classification carried
-/// through unchanged.
+/// A resolved bare call; `target` is null on a pure deferral.
 pub const Resolution = struct {
     target: ?FuncId,
     confidence: Confidence,
@@ -61,39 +50,26 @@ pub const Resolution = struct {
     reason: ?ResolveDeferReason = null,
     tier: u8 = 255,
     tier_count: usize = 0,
-    /// Resolution proved the declaration final through unique
-    /// applicability, an explicit cast, an exact receiver, or eager type
-    /// evidence. The emitted `Call` is exact, so runtime value types never
-    /// reopen that source-level decision.
+    /// The target is proven final (unique applicability, an explicit cast, an exact
+    /// receiver, or eager type evidence); runtime value types never reopen it.
     target_final: bool = false,
 };
 
-/// The receiver-context bits the lowerer computes on the FuncBuilder,
-/// passed in so `resolveCall` stays a pure function of (call site, sig
-/// index, receiver context) and never reaches into FuncBuilder. Each
-/// field maps 1:1 to an existing lowering gate.
+/// The receiver-context bits the lowerer computes, passed in so `resolveCall`
+/// stays a pure function of (call site, sig index, receiver context).
 pub const ResolveCtx = struct {
     in_receiver_context: bool = false,
     unknown_receiver: bool = false,
-    /// The body's only implicit receiver is a FUNCTION-typed extension
-    /// receiver (no owner class, no captured `this`), whose member
-    /// surface is closed to `invoke`/`call`: no member can shadow the
-    /// resolved name, so the member-shadowable gates stand down.
-    /// `runSafely(completion) { … }` inside
-    /// `(suspend () -> T).startCoroutineCancellable` is the canonical
-    /// site — deferring it hands a private INLINE callee to the runtime
-    /// walk, which cannot splice it.
+    /// The only implicit receiver is a FUNCTION-typed extension receiver, whose
+    /// member surface is closed, so the member-shadowable gates stand down.
     recv_cannot_shadow: bool = false,
     enclosing_has_member: bool = false,
-    /// The body's receiver type is statically known (a plain method
-    /// body): the member-shadow question was answered precisely by its
-    /// own hierarchy in `enclosing_has_member`, so Phase C must not
-    /// widen it back through the program-wide member-name universe.
+    /// The body's receiver type is statically known, so `enclosing_has_member`
+    /// answered the shadow question exactly; do not widen to the name universe.
     receiver_known: bool = false,
     has_type_args: bool = false,
-    /// A `$composer` binding exists in the current lowering scope. Bare
-    /// composable calls can resolve against their source parameter list
-    /// before lowering appends the compiler ABI pair.
+    /// A `$composer` binding is in scope, so bare composable calls resolve against
+    /// their source parameter list before lowering appends the compiler ABI pair.
     has_composer: bool = false,
     cast_pick: ?FuncId = null,
     recv_ty: ?[]const u8 = null,
@@ -101,43 +77,23 @@ pub const ResolveCtx = struct {
     /// Bounds for type parameters appearing in `recv_type`.
     actual_type_param_bounds: []const ModuleRegistry.TypeParamBound = &.{},
     is_value_capture: bool = false,
-    /// The caller sits in a tailrec function body (`tailrecSelf() != null`).
-    /// A positional call to a tailrec target from such a body emits a static
-    /// tail `Call`, ahead of the member-shadowable walk — the receiver
-    /// gate never re-routes a tail call.
+    /// The caller sits in a tailrec function body: a positional call to a tailrec
+    /// target emits a static tail `Call`, ahead of the member-shadowable walk.
     in_tailrec_body: bool = false,
-    /// A lambda argument contains a bare non-local `return`, which is
-    /// only legal against an INLINE callee: kotlinc resolves the call
-    /// statically to the inline function, so the member-shadowable
-    /// deferral must not re-route it (`synchronized(this) { … return
-    /// false … }` framed the block, and a park inside it lost the
-    /// enclosing frame the labeled return targets).
+    /// A lambda argument holds a bare non-local `return`, legal only against an
+    /// INLINE callee, so the member-shadowable deferral must not re-route it.
     nonlocal_return_lambda: bool = false,
-    /// The class whose body lexically encloses the call, when there is
-    /// one. Scopes the member-extension candidates: only a call inside
-    /// the declaring class (or a subclass) has that class as an implicit
-    /// dispatch receiver, so only there is one bindable by a bare call.
+    /// The class whose body lexically encloses the call. Scopes the member-extension
+    /// candidates: only there is that class an implicit dispatch receiver.
     owner_class: ?[]const u8 = null,
-    /// Every implicit callable receiver is represented by `recv_type`
-    /// and/or `owner_class`, and each hierarchy is complete. Lambda/thunk
-    /// bodies and declarations with outer or companion receivers leave
-    /// this false.
+    /// `recv_type` and `owner_class` represent every implicit callable receiver and
+    /// each hierarchy is complete. Lambdas, thunks, outers and companions: false.
     receiver_scope_complete: bool = false,
-    /// The full implicit-receiver tower's heads (innermost first) when
-    /// the lowering context carries one. With `receiver_scope_complete`,
-    /// these are the receivers beyond `recv_type`/`owner_class` that the
-    /// known-receiver applicability probe must also consult — a lambda
-    /// body's scope is complete exactly when its tower enumerates every
-    /// level.
+    /// The implicit-receiver tower's heads, innermost first: the receivers beyond
+    /// `recv_type`/`owner_class` the applicability probe must also consult.
     tower: []const ReceiverTowerEntry = &.{},
-    /// `receiver_scope_complete` was proven by the TOWER (a lambda/thunk
-    /// context), not a plain method body. A tower-unlocked static commit
-    /// additionally requires a SOLE candidate: the pre-existing deferral
-    /// was the runtime's overload/tier safety net for unproven argument
-    /// types, and unlocking it must not let a near-tier pick beat an
-    /// applicable far-tier import (`test.text.assertContentEquals(String,
-    /// CharSequence)` vs the star-imported Sequence form was the live
-    /// break).
+    /// `receiver_scope_complete` was proven by the TOWER, not a plain method body.
+    /// A tower-unlocked static commit additionally requires a sole candidate.
     tower_scope: bool = false,
 };
 
@@ -151,24 +107,11 @@ pub fn isNonExtFid(self: *const Module, id: FuncId) bool {
     return !funcHasImplicitThis(f);
 }
 
-/// Whether a member-extension candidate is out of scope for a BARE call
-/// whose enclosing class is `ctx_owner`. A member extension (`fun A.f()`
-/// declared in the body of class B) needs two receivers: B to dispatch on
-/// and A as the extension receiver. A bare call carries one implicit
-/// `this`, so it can only bind such a candidate from inside B (or a
-/// subclass), where B's receiver is implicit — or when B is an object,
-/// whose single instance is always reachable. Everywhere else the
-/// candidate does not exist: `with(x) { … }` in `MultiParagraph` is
-/// `kotlin.with`, never `KeyframesSpecConfig`'s `KeyframeEntity.with`.
-/// The runtime applies the same gate in `memberExtVisible`; without it
-/// here, lowering commits to a target the runtime would have rejected.
+/// A member extension (`fun A.f()` declared in class B) needs two receivers, so
+/// a bare call binds one only inside B, a subclass, or when B is an `object`.
 pub fn memberExtOutOfScope(self: *const Module, id: FuncId, ctx_owner: ?[]const u8) bool {
     const f = self.funcById(id) orelse return false;
-    // The declaration kind, not `f.kind`: a phase-1 header stub still
-    // carries `.plain` on the Func while the DeclSig knows it is a member
-    // extension — reading the stub admitted a test class's private
-    // `CoroutineScope.block(context)` as a tier-0 candidate for every
-    // bare `block` in the program.
+    // The declaration kind, not `f.kind`: a header stub still carries `.plain`.
     if (self.declarationKind(id, f) != .member_extension) return false;
     const owner = self.registry.member_ext_owner_class.get(id) orelse return false;
     for (self.registry.object_names.items) |o| {
@@ -178,11 +121,8 @@ pub fn memberExtOutOfScope(self: *const Module, id: FuncId, ctx_owner: ?[]const 
     return !self.classIsOrExtends(start, owner);
 }
 
-/// Lowering-side hierarchy oracle for the applicability engine: walks
-/// `class_super_names` by evidence head (lift-mangle stripped), so
-/// declared-type evidence can prove a subtype match where the plain
-/// head comparison cannot. Interfaces and classes both live in the
-/// registry chain.
+/// Hierarchy oracle for the applicability engine: walks `class_super_names` by
+/// evidence head, lift-mangling stripped. Interfaces and classes both.
 pub fn evidenceSubtypeCb(ctx: *anyopaque, sub: []const u8, super: []const u8) bool {
     const self: *const Module = @ptrCast(@alignCast(ctx));
     if (std.mem.eql(u8, sub, super)) return true;
@@ -227,18 +167,8 @@ pub fn evidenceSubtypeCb(ctx: *anyopaque, sub: []const u8, super: []const u8) bo
     return false;
 }
 
-/// Whether an EXTENSION candidate's declared receiver could be supplied
-/// by the statically-known receiver context: the owner class's chain or
-/// an enclosing class's. Consulted only when the call site's receiver
-/// types are statically known (a plain method body) — a bare call there
-/// can only reach an extension through `this`/outer instances, so a
-/// declared receiver provably outside every chain disqualifies the
-/// candidate (`TestScope.runTest` inside a plain test class). A
-/// type-parameter, function-type, or unresolvable receiver head keeps
-/// the candidate.
-/// Whether `owner` (or its hierarchy) declares a member called `name`.
-/// Gates the receiver-implausibility rule above: with no member competitor
-/// there is nothing to prefer, so the extension must stand.
+/// Whether `owner` or its hierarchy declares a member called `name`. Gates the
+/// receiver-implausibility rule: with no competitor the extension must stand.
 pub fn ownerDeclaresMember(self: *const Module, owner: []const u8, name: []const u8) bool {
     if (self.registry.hierarchy_methods.get(owner)) |set| {
         if (set.contains(name)) return true;
@@ -252,6 +182,8 @@ pub fn ownerDeclaresMember(self: *const Module, owner: []const u8, name: []const
     return false;
 }
 
+/// Whether an extension candidate's declared receiver could be supplied by the
+/// statically known receiver chains. An unresolvable head keeps the candidate.
 pub fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, owner: ?[]const u8) bool {
     const dbg = if (runtime.envOnce("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, f.name) else false;
     if (dbg) std.debug.print("[extplaus] fid={d} fqn={s} recv_ty={s} owner={?s}\n", .{ id.int(), f.fqn, if (f.params.len != 0) f.params[0].ty.name else "-", owner });
@@ -294,8 +226,6 @@ pub fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, own
     return false;
 }
 
-/// Whether a candidate's declared signature can bind the call's argument
-/// shapes.
 pub fn declSigScore(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) ?applicability.Score {
     const sv = self.sigViewForApplicability(fid, callShapesHaveComposerPair(args)) orelse return .{ .points = 0 };
     const named = !allShapeNamesNull(args);
@@ -332,10 +262,8 @@ pub fn bareScoreEqual(a: applicability.Score, b: applicability.Score) bool {
         a.unknown_args == b.unknown_args;
 }
 
-/// Compare the argument-to-parameter mapping produced by applicability
-/// against the identity-aware static type proof. Additive eager type heads
-/// are removed from this proof: they may rank candidates, but cannot reject
-/// one or make a target final.
+/// Judge applicability's argument-to-parameter mapping against the identity-aware
+/// static type proof. Additive eager heads rank candidates but never reject one.
 pub fn staticBareArgsCompatibility(
     self: *const Module,
     fid: FuncId,
@@ -406,10 +334,8 @@ pub fn staticBareArgsCompatibility(
     return result;
 }
 
-/// Rank one receiverless or receiver-formed candidate group directly
-/// through the shared applicability engine. Scope selection happens after
-/// applicability: an inapplicable named-import tier does not hide an
-/// applicable declaration in the caller's package.
+/// Rank one receiverless or receiver-formed candidate group. Scope selection
+/// happens after applicability: an inapplicable near tier hides nothing.
 pub fn applicableBarePick(
     self: *const Module,
     name: []const u8,
@@ -448,9 +374,7 @@ pub fn applicableBarePick(
             if (self.memberExtOutOfScope(id, ctx.owner_class)) continue;
             if (ctx.receiver_known and
                 !self.extReceiverPlausible(id, f, ctx.owner_class)) continue;
-            // The enclosing extension body's own receiver head is
-            // evidence too: `get(index)` inside `Iterable<T>.elementAt`
-            // never binds `Map<out K, V>.get`, whatever the owner class.
+            // The enclosing extension body's own receiver head is evidence too.
             if (kind == .top_level_extension) {
                 if (ctx.recv_ty) |rt0| {
                     var rh = applicability.simpleName(std.mem.trimEnd(u8, rt0, "?"));
@@ -471,20 +395,8 @@ pub fn applicableBarePick(
                     }
                 }
             }
-            // Inside a receiver LAMBDA the receiver types are not "known"
-            // in the plain-method-body sense, so the check above is
-            // skipped and an extension on an unrelated type can win over
-            // the enclosing class's own member: a bare `forEachIndexed`
-            // written inside `buildString { … }` bound
-            // `CharSequence.forEachIndexed` and iterated the builder the
-            // body was appending to.
-            //
-            // Narrow deliberately. This fires ONLY when the enclosing
-            // class really declares a member of this name, so there is a
-            // competitor to prefer. Without that guard it also
-            // disqualified private stdlib extensions on `String` called
-            // from inside stdlib (`parseDigits`, `uuidCheckHyphenAt`),
-            // whose receiver context none of these sources capture.
+            // In a receiver lambda the receiver types are not known in the method-body
+            // sense, so an unrelated extension can outrank the owner's own member.
             if (!ctx.receiver_known and ctx.recv_ty != null and ctx.owner_class != null and
                 self.ownerDeclaresMember(ctx.owner_class.?, name))
             {
@@ -518,10 +430,8 @@ pub fn applicableBarePick(
             continue;
         };
         if (drop_trace) std.debug.print("[keep] {s}#{d} params={d} args={d} recv_formed={} at={?d}\n", .{ name, id.int(), sig.params.len, args.len, receiver_formed, if (applicability.trace_call_span) |sp| sp.start else null });
-        // Declared-type evidence disproves a receiver-formed candidate
-        // exactly as a plain one: `decodeFromString(serializer, s)`
-        // with `s: String` never binds the enclosing `(s: String, mode:
-        // Mode)` member extension.
+        // Declared-type evidence disproves a receiver-formed candidate exactly as it
+        // does a plain one.
         const static_compatibility = self.staticBareArgsCompatibility(
             id,
             sig,
@@ -562,9 +472,8 @@ pub fn applicableBarePick(
     return best;
 }
 
-/// The in-scope candidate set (scopeTier <= `tier`) in sig-index order,
-/// borrowed from `alloc`. Carried on the virtual / deferred forms for the
-/// runtime member-first walk and the ambiguity / out-of-scope diagnostics.
+/// The in-scope candidate set (scopeTier <= `tier`) in sig-index order, allocated
+/// from `alloc`. Carried on the virtual and deferred forms.
 pub fn candidateSet(
     self: *const Module,
     alloc: std.mem.Allocator,
@@ -584,13 +493,7 @@ pub fn candidateSet(
     return list.toOwnedSlice(alloc);
 }
 
-/// The authoritative package/import-scoped callable set for a deferred
-/// bare call. `null` means the module has no complete, rankable declaration
-/// set for `name` (the remaining host-only/incomplete-header boundary); a
-/// non-null slice is bounded by Kotlin visibility, and may be empty when
-/// rankable declarations exist but none are visible from this site.
-/// `KLIO_BCC_WHY=1`: report why the scoped bare-call candidate set came
-/// back empty. Resolved once — this runs per lowered call site.
+/// `KLIO_BCC_WHY=1`: report why the scoped bare-call candidate set came back empty.
 pub fn bccWhyOn() bool {
     const S = struct {
         var known: ?bool = null;
@@ -601,6 +504,8 @@ pub fn bccWhyOn() bool {
     return k;
 }
 
+/// The package/import-scoped callable set for a deferred bare call. `null`: no
+/// complete rankable declaration set; empty: rankable but none visible here.
 pub fn boundedCallCandidates(
     self: *const Module,
     alloc: std.mem.Allocator,
@@ -648,12 +553,8 @@ pub fn boundedCallCandidates(
     return @as(?[]const FuncId, try list.toOwnedSlice(alloc));
 }
 
-/// The authoritative package/import-scoped overload set for a bare call
-/// containing a spread argument. Scope is chosen before applicability and
-/// only declarations with a `vararg` parameter survive: Kotlin never lets
-/// a spread bind a fixed parameter. A non-null empty slice means the
-/// winning scope tier has declarations for the name but no vararg target;
-/// callers must diagnose that miss rather than widen to another package.
+/// The scoped overload set for a bare call with a spread argument; only `vararg`
+/// declarations survive. A non-null empty slice means no vararg target in tier.
 pub fn boundedSpreadCandidates(
     self: *const Module,
     alloc: std.mem.Allocator,
@@ -685,16 +586,11 @@ pub fn boundedSpreadCandidates(
     return @as(?[]const FuncId, try list.toOwnedSlice(alloc));
 }
 
-/// Header registration records the declaration kind before a function body
-/// is placed. During that window the placeholder `Func.kind` may still be
-/// its default `.plain`; resolution must trust the canonical declaration
-/// record so extension headers never enter a receiverless global set.
+/// The declaration kind from the canonical record: while a header is registered
+/// the placeholder `Func.kind` may still read `.plain` for an extension.
 pub fn declarationKind(self: *const Module, id: FuncId, f: *const Func) FuncKind {
     if (self.decl_sigs.get(id.int())) |ds| {
-        // A header stub registered plain but declaring a receiver
-        // (`Map<out K, V>.get(key)` before its body lowers) is an
-        // extension: judged receiver-formed, never as a bare
-        // function of its value parameters.
+        // A stub registered plain but declaring a receiver is an extension.
         if (ds.kind == .plain and ds.receiver_ty != null) return .top_level_extension;
         return ds.kind;
     }
@@ -708,18 +604,10 @@ pub fn declarationHasVararg(self: *const Module, id: FuncId, f: *const Func) boo
     return anyParamVararg(f);
 }
 
-/// Whether declaration metadata proves that a receiverless call count can
-/// bind. If no scoped declaration can bind, the host/incomplete-header
-/// compatibility boundary remains active until P10 supplies a complete
-/// declaration for the host shape.
+/// Whether declaration metadata proves a receiverless call count can bind.
 pub fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want: usize) bool {
-    // The compose pass appends ($composer, $changed) to composable
-    // signatures. Call sites lower with USER argument counts (the pair
-    // is threaded later, or completed at runtime), so the pair never
-    // counts toward the REQUIRED arity — excluding an exact-arity
-    // composable here left only a vararg sibling in the bounded set and
-    // committed the wrong overload. A post-pass site that already
-    // carries the pair still binds through the untrimmed total.
+    // The compose pass appends ($composer, $changed); call sites lower with USER
+    // argument counts, so the pair never counts toward the required arity.
     const has_pair = f.params.len >= 2 and
         std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
         std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer");
@@ -745,11 +633,8 @@ pub fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want:
     return has_vararg or want <= total;
 }
 
-/// The best visible tier among receiverless package-scope functions.
-/// Members and extensions are handled by the receiver leg of
-/// `CallMemberOrGlobal`; allowing them to establish this tier would let an
-/// own-class test method hide an imported top-level function from the
-/// terminal global leg.
+/// The best visible tier among receiverless package-scope functions only: members
+/// and extensions belong to the receiver leg of `CallMemberOrGlobal`.
 pub fn lowestVisibleGlobalTier(
     self: *const Module,
     name: []const u8,
@@ -787,13 +672,8 @@ pub fn lowestVisibleTier(
     return best;
 }
 
-/// Resolve a bare `name` call to a `Resolution{ target, confidence,
-/// emit_form, candidate_set }` — a pure function of (call site, sig index,
-/// receiver context). Candidate scope and applicability are resolved in one
-/// direction: a proven implicit-receiver extension first, then the first
-/// package/import tier containing an applicable receiverless declaration,
-/// then a conservative receiver-formed fallback. The emit form is derived
-/// from the resulting target and receiver context exactly once.
+/// Resolve a bare `name` call: a proven implicit-receiver extension first, then
+/// the first tier with an applicable receiverless declaration, then a fallback.
 pub fn resolveCall(
     self: *const Module,
     alloc: std.mem.Allocator,
@@ -819,8 +699,6 @@ pub fn resolveCall(
 }
 
 /// Resolve from a candidate set already enumerated for this source name.
-/// Lowering uses this form when the same set also participates in cast
-/// selection and hidden-ABI retries.
 pub fn resolveCallCandidates(
     self: *const Module,
     alloc: std.mem.Allocator,
@@ -832,10 +710,8 @@ pub fn resolveCallCandidates(
     last_arg_lambda: bool,
     ctx: ResolveCtx,
 ) std.mem.Allocator.Error!Resolution {
-    // Same file-follows-span package rule as `resolveBareCallIndexed`.
     const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
-    // The symbol index supplies diagnostic classification and the fallback
-    // scope when no complete declaration is applicable.
+    // The symbol index supplies diagnostic classification and the fallback tier.
     var ires = self.resolveBareCallIndexed(name, caller_pkg, caller_file, args.len, last_arg_lambda);
     if (ctx.cast_pick != null) {
         switch (ires.outcome) {
@@ -955,7 +831,6 @@ pub fn resolveCallCandidates(
         );
     }
 
-    // Derive the static/virtual/deferred emission form once.
     var res = try self.emitFormFor(
         alloc,
         name,
@@ -977,10 +852,7 @@ pub fn resolveCallCandidates(
     return res;
 }
 
-/// Whether a bare call binding target `id` is a tail call: exactly when
-/// the committed target itself is `tailrec`. (The name-list arm this
-/// replaced could mark a call to a non-tailrec target as a tail call
-/// just because a same-name sibling was tailrec.)
+/// Whether the committed target is itself `tailrec`, making this call a tail call.
 pub fn calleeIsTailrec(self: *const Module, id: FuncId, name: []const u8) bool {
     _ = name;
     if (self.funcById(id)) |f| {
@@ -989,11 +861,8 @@ pub fn calleeIsTailrec(self: *const Module, id: FuncId, name: []const u8) bool {
     return false;
 }
 
-/// Whether any statically known implicit receiver has an applicable member
-/// or extension named `name`. A definite false is available only when the
-/// lowerer proved that the extension/dispatch receivers form the complete
-/// receiver scope; receiver lambdas, thunks, outers, and companions keep
-/// the conservative runtime walk.
+/// Whether a statically known implicit receiver has an applicable member or
+/// extension named `name`; null unless the receiver scope is provably complete.
 pub fn knownReceiverApplicability(
     self: *const Module,
     name: []const u8,
@@ -1068,11 +937,8 @@ pub fn knownReceiverApplicability(
             receiver_count += 1;
         }
     }
-    // Tower receivers beyond recv/owner: each head becomes a symbolic
-    // instantiation exactly like the owner path. A head that resolves no
-    // class, exceeds the fixed capacity, or carries an incomplete proof
-    // marks the scope incomplete (the probe then abstains rather than
-    // proving a negative it cannot see).
+    // Tower receivers beyond recv/owner, each symbolically instantiated. An
+    // unresolvable head or an overflow marks the scope incomplete: abstain.
     var tower_incomplete = false;
     var tower_slot: usize = 0;
     for (ctx.tower) |tower_entry| {
@@ -1146,9 +1012,8 @@ pub fn knownReceiverApplicability(
         if (has_incomplete_receiver) return null;
         return false;
     }
-    // The static extension resolver deliberately declines named and spread
-    // argument shapes. They therefore cannot prove a negative: preserve
-    // the receiver walk unless a member already proved applicability.
+    // The static extension resolver declines named and spread shapes, so they
+    // cannot prove a negative; keep the receiver walk.
     for (args) |arg| {
         if (arg.named != null or arg.is_spread) return null;
     }
@@ -1206,13 +1071,8 @@ pub fn knownReceiverMemberApplicable(
     );
 }
 
-/// Whether a tower-unlocked static commit is argument-PROVEN over its
-/// whole candidate set: the target judges `.compatible` on every
-/// supplied argument and every competitor is structurally inapplicable
-/// or judges `.incompatible`. An `.unknown` anywhere keeps the deferral
-/// — the runtime re-pick stays the safety net exactly where the static
-/// shapes cannot decide (a tier pick without type proof is not a
-/// commitment).
+/// Whether a tower-unlocked commit is argument-PROVEN: the target judges
+/// `.compatible` and every competitor is inapplicable or `.incompatible`.
 pub fn towerPickProven(
     self: *const Module,
     target: FuncId,
@@ -1220,10 +1080,8 @@ pub fn towerPickProven(
     args: []const applicability.ArgShape,
     bounds: []const ModuleRegistry.TypeParamBound,
 ) bool {
-    // POSITIVE evidence only: `.compatible` from the judge means "not
-    // refuted", so a proof additionally demands every argument carry an
-    // authoritative shape (a literal kind or an authoritative type) —
-    // an unjudgeable argument keeps the deferral.
+    // `.compatible` means only not refuted, so a proof additionally demands every
+    // argument carry an authoritative shape.
     for (args) |arg| {
         if (arg.literal_kind == null and (arg.ty == null or !arg.ty_authoritative)) return false;
     }
@@ -1253,9 +1111,8 @@ pub fn towerPickProven(
     return saw_target;
 }
 
-/// The single member-vs-global decision, folding the receiver
-/// gates once. `Call → exact`, `CallMember`/`CallMemberOrGlobal → virtual`
-/// (target non-null) or `deferred` (target null), `CallValue → deferred`.
+/// The member-vs-global decision: `Call` is exact, `CallMember` and
+/// `CallMemberOrGlobal` virtual or deferred by target, `CallValue` deferred.
 pub fn emitFormFor(
     self: *const Module,
     alloc: std.mem.Allocator,
@@ -1306,10 +1163,8 @@ pub fn emitFormFor(
                         !ctx.recv_cannot_shadow and
                         self.registry.class_member_names.contains(name));
             } else member_shadowable;
-            // Extension member-first defer: in a receiver context a member of
-            // the implicit receiver could shadow the extension, so it
-            // dispatches member-first. Unlike the non-extension gate, a cast
-            // or explicit type arguments do NOT suppress this.
+            // In a receiver context a member of the implicit receiver could shadow the
+            // extension. Unlike the non-extension gate, a cast or type args do not suppress it.
             if (ctx.in_receiver_context and extension_receiver_shadowable) {
                 const cs = try self.candidateSet(
                     alloc,
@@ -1321,20 +1176,12 @@ pub fn emitFormFor(
                 );
                 return .{ .target = t, .confidence = .virtual, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
             }
-            // A renamed import records an exact declaration identity that
-            // cannot be recovered from runtime dispatch by the alias.
+            // A renamed import fixes an identity the alias cannot recover at runtime.
             if (cast_static or renamed_target) {
                 return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
             }
-            // The innermost receiver type PROVABLY cannot take this
-            // extension: the receiver must come from an OUTER implicit
-            // receiver that only the runtime walk can supply. The
-            // static `.CallMember` bind would put the wrong `this` in
-            // the extension's receiver slot with no runtime recovery —
-            // `read(this)` inside the `CompositionLocal.currentValue`
-            // accessor resolves `PersistentCompositionLocalMap.read`,
-            // whose receiver is the accessor's DISPATCH owner, present
-            // only on the enclosing chain.
+            // The innermost receiver provably cannot take this extension: it must come
+            // from an OUTER implicit receiver only the runtime walk can supply.
             if (known_receiver_applicable == false) {
                 const cs = try self.candidateSet(
                     alloc,
@@ -1348,14 +1195,12 @@ pub fn emitFormFor(
             }
             return .{ .target = t, .confidence = .virtual, .emit_form = .CallMember, .reason = reason, .tier = tier, .tier_count = tier_count };
         }
-        // A positional tail call to a tailrec target from a tailrec body
-        // emits a static `Call` (lowered to a `TailCallFunc`), ahead of the
-        // member-shadowable gate — a tail call is never redispatched.
+        // A positional tail call to a tailrec target emits a static `Call` ahead of the
+        // member-shadowable gate; a tail call is never redispatched.
         if (ctx.in_tailrec_body and self.calleeIsTailrec(t, name) and allShapeNamesNull(args)) {
             return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
         }
-        // Non-extension: the member-shadowable gate, suppressed by a cast or
-        // explicit type arguments (the static-resolution forms).
+        // Non-extension: the member-shadowable gate, suppressed by the static forms.
         const static_ok = cast_static or ctx.has_type_args or
             (ctx.nonlocal_return_lambda and self.funcIsInline(t));
         const shadow = ctx.in_receiver_context and member_shadowable and !static_ok;
@@ -1363,11 +1208,8 @@ pub fn emitFormFor(
             if (std.mem.eql(u8, w, name)) std.debug.print("[ef] {s} t={d} inline={} nlr={} recvctx={} shadowable={} shadow={} file={d}\n", .{ name, t.int(), self.funcIsInline(t), ctx.nonlocal_return_lambda, ctx.in_receiver_context, member_shadowable, shadow, caller_file.int() });
         }
         if (!shadow) {
-            // A tower-unlocked commit also stands down for a VALUE
-            // CAPTURE in scope: an outer local fn shares the name, lives
-            // in a capture cell no candidate tier can see, and Kotlin
-            // binds it over every global (`fun check(a, b, m) {...};
-            // repeat(1000) { check(a, b) }` bound `kotlin.check`).
+            // A tower-unlocked commit also stands down for a VALUE CAPTURE: an outer local
+            // fn sits in a capture cell no tier sees, and Kotlin binds it over every global.
             if (ctx.tower_scope and (ctx.is_value_capture or
                 (candidates.len > 1 and
                     !self.towerPickProven(t, candidates, args, ctx.actual_type_param_bounds))))
