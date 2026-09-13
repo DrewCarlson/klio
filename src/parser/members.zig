@@ -40,14 +40,12 @@ const parseIdent = support.parseIdent;
 const peekIdentText = support.peekIdentText;
 const text = support.text;
 
-/// True when the token kind's active tag is `tag`. Payload-carrying variants
-/// like `Keyword` compare on tag alone; callers that need the payload
-/// destructure it themselves.
+/// Compares active tags, so a payload-carrying variant matches on tag alone.
 fn is(k: *const TokenKind, comptime tag: std.meta.Tag(TokenKind)) bool {
     return std.meta.activeTag(k.*) == tag;
 }
 
-/// The token kind at `idx`, or `null` past the end of the stream.
+/// `null` past the end of the stream.
 fn kindAt(p: *const Parser, idx: usize) ?TokenKind {
     if (idx >= p.tokens.len) return null;
     return p.tokens[idx].kind;
@@ -79,7 +77,6 @@ pub fn parseFun(p: *Parser, flags: ModifierFlags) ?Function {
             skipNl(p);
             break :blk if (exprmod.parseExprBody(p)) |e| FunctionBody{ .Expr = e } else null;
         },
-        // Function declaration without body (abstract / external).
         else => null,
     };
     const end = p.tokens[p.pos -| 1].span;
@@ -109,35 +106,28 @@ pub fn parseFun(p: *Parser, flags: ModifierFlags) ?Function {
     };
 }
 
-/// Result of `parseFunReceiver` / `parsePropertyReceiver`. Parse failure, no
-/// receiver, and a receiver type are three distinct states, so a flat
-/// `??TypeRef` would be ambiguous: `present(null)` means no receiver, and
-/// `failure` propagates a parse failure to the caller.
+/// `present(null)` is no receiver, `failure` a parse failure; a flat `??TypeRef`
+/// would conflate the two.
 const ReceiverResult = union(enum) {
     failure,
     present: ?TypeRef,
 };
 
-/// Parse the optional extension receiver before a function name: `.present(null)`
-/// for none, `.present(ty)` for one, `.failure` to propagate a parse failure.
 fn parseFunReceiverResult(p: *Parser) ReceiverResult {
-    // Receiver-typed extension function `fun T.foo(...)` / `fun T?.foo(...)`.
-    // Pre-scanning for `Ident (?)? . Ident` keeps the non-extension path on
+    // Pre-scanning `Ident (?)? . Ident` keeps the non-extension path on
     // `parseIdent` for the function name.
     if (looksLikeExtensionReceiver(p)) {
         const saved_sqp = p.suppress_qualified_path;
         p.suppress_qualified_path = true;
         var ty = types.parseType(p);
         p.suppress_qualified_path = saved_sqp;
-        // Fold further `.Ident` segments into the receiver for a qualified
-        // receiver like `Foo.Companion.bar()`; the last `.Ident` is the name.
+        // Fold further `.Ident` segments in; the last one is the function name.
         while (ty) |*t| {
             if (t.function != null or t.nullable) break;
             const after = kindAt(p, p.pos);
             const after_next = kindAt(p, p.pos + 1);
             const after_2 = kindAt(p, p.pos + 2);
-            // `.Ident .Ident`: fold only while at least two `.Ident` pairs
-            // remain, since the last one is the function name.
+            // Fold only while at least two `.Ident` pairs remain.
             if (after != null and is(&after.?, .Dot) and
                 after_next != null and is(&after_next.?, .Ident) and
                 after_2 != null and is(&after_2.?, .Dot))
@@ -153,9 +143,7 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
                 after_next != null and is(&after_next.?, .Ident) and
                 after_2 != null and is(&after_2.?, .Lt))
             {
-                // `.Ident<...>`, a nested type with generic arguments
-                // (`Map.Entry<K, V>.component1()`). Fold it only when a
-                // following `.Ident` supplies the function name.
+                // `.Ident<...>`: fold only when a following `.Ident` supplies the function name.
                 const save_pos = p.pos;
                 _ = bump(p); // '.'
                 const seg = parseIdent(p, "type segment") orelse {
@@ -163,7 +151,6 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
                     break;
                 };
                 const args: []ast.TypeArg = if (is(peekKind(p), .Lt)) types.parseTypeArgs(p) else &.{};
-                // Require following `.Ident` (the function name).
                 const next0 = kindAt(p, p.pos);
                 const next1 = kindAt(p, p.pos + 1);
                 if (!(next0 != null and is(&next0.?, .Dot)) or
@@ -182,9 +169,8 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
                 after_next != null and is(&after_next.?, .Ident) and after_2 != null and
                 (is(&after_2.?, .QuestionDot) or after_2.?.isQuestion()))
             {
-                // `.Ident ?. ...`: a NULLABLE qualified receiver
-                // (`Modifier.Node?.hit`). Fold the `.Ident`; the loop breaks on
-                // the `?` / `?.`, consumed below as the separator.
+                // Nullable qualified receiver `Modifier.Node?.hit`: the loop
+                // breaks on the `?` / `?.`, consumed below.
                 _ = bump(p); // '.'
                 const seg = parseIdent(p, "type segment") orelse break;
                 t.name = Ident{
@@ -192,8 +178,7 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
                     .span = t.name.span.join(seg.span),
                 };
                 t.span = t.span.join(seg.span);
-                // A plain `?` is its own token: mark the receiver nullable and
-                // consume it here, leaving the `.` for the name.
+                // A plain `?` is its own token: consume it here, leaving the `.` for the name.
                 if (peekKind(p).*.isQuestion()) {
                     t.nullable = true;
                     _ = bump(p);
@@ -203,9 +188,8 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
                 break;
             }
         }
-        // `parseType` consumed the `Ident` and any trailing `?`; consume the dot
-        // before the function name. `T?.foo` lexes `?.` as one `QuestionDot`, so
-        // that token both marks the receiver nullable and serves as the dot.
+        // `T?.foo` lexes `?.` as one `QuestionDot`, which marks the receiver
+        // nullable and serves as the dot before the function name.
         if (is(peekKind(p), .QuestionDot)) {
             if (ty) |*t| {
                 t.nullable = true;
@@ -220,8 +204,6 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
         skipNl(p);
         return .{ .present = ty };
     } else if (looksLikeParenExtensionReceiver(p)) {
-        // Parenthesized / function-type extension receiver:
-        // `fun (suspend () -> T).startCoroutine(...)`.
         const ty = types.parseType(p);
         if (is(peekKind(p), .QuestionDot)) {
             _ = bump(p);
@@ -235,7 +217,6 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
     }
 }
 
-/// Tri-state wrapper: `null` on parse failure, else the optional receiver type.
 fn parseFunReceiver(p: *Parser) ??TypeRef {
     return switch (parseFunReceiverResult(p)) {
         .failure => null,
@@ -243,9 +224,8 @@ fn parseFunReceiver(p: *Parser) ??TypeRef {
     };
 }
 
-/// Anonymous function `fun [<T>] [Receiver.](...) [: Ret] [body]`; no name
-/// follows `fun`. A `return` in the body leaves this function, not the
-/// enclosing one.
+/// Anonymous function `fun [<T>] [Receiver.](...) [: Ret] [body]`. A `return`
+/// leaves this function, not the enclosing one.
 pub fn parseAnonFun(p: *Parser) ?Expr {
     const kw = bump(p); // `fun`
     skipNl(p);
@@ -301,8 +281,8 @@ fn boxBody(p: *Parser, b: FunctionBody) *FunctionBody {
     return ptr;
 }
 
-/// Look-ahead for `Ident (?)? . (`, the anonymous-function receiver shape.
-/// Distinct from a named-fun extension receiver: no name follows the dot.
+/// Look-ahead for `Ident (?)? . (`: an anonymous-function receiver has no name
+/// after the dot.
 pub fn looksLikeAnonFunReceiver(p: *const Parser) bool {
     const t0 = kindAt(p, p.pos) orelse return false;
     if (!is(&t0, .Ident)) return false;
@@ -316,14 +296,11 @@ pub fn looksLikeAnonFunReceiver(p: *const Parser) bool {
         at_j1 != null and is(&at_j1.?, .LParen);
 }
 
-/// Look-ahead for `Ident (?)? . Ident` at the cursor, the shape that introduces
-/// an extension function's receiver type. Commits nothing, so the ordinary
-/// declaration path is unaffected when no receiver is present.
+/// Look-ahead for `Ident (?)? . Ident`, an extension receiver. Commits nothing.
 pub fn looksLikeExtensionReceiver(p: *const Parser) bool {
     const t0 = kindAt(p, p.pos) orelse return false;
     if (!is(&t0, .Ident)) return false;
     var j = p.pos + 1;
-    // Skip a balanced generic-argument list (`<T>` / `<A, B<C>>`).
     if (kindAt(p, j)) |k| {
         if (is(&k, .Lt)) {
             var depth: usize = 1;
@@ -344,8 +321,7 @@ pub fn looksLikeExtensionReceiver(p: *const Parser) bool {
     if (kindAt(p, j)) |k| {
         if (k.isQuestion()) j += 1;
     }
-    // `T?.foo` lexes the `?.` as a single `QuestionDot` token; treat it as
-    // nullable-receiver followed by the member separator.
+    // `T?.foo` lexes `?.` as one `QuestionDot`: nullable receiver plus separator.
     const at_j = kindAt(p, j);
     if (at_j != null and is(&at_j.?, .QuestionDot)) {
         const at_j1 = kindAt(p, j + 1);
@@ -356,9 +332,7 @@ pub fn looksLikeExtensionReceiver(p: *const Parser) bool {
         at_j1b != null and is(&at_j1b.?, .Ident);
 }
 
-/// Look-ahead for a parenthesized extension receiver `( ... ) (?)? . Ident`, as
-/// in `fun (suspend () -> T).f()` or `fun ((A) -> B).f()`. The receiver is a
-/// function or grouped type, which the `Ident`-led scan does not cover.
+/// Look-ahead for `( ... ) (?)? . Ident`, which the `Ident`-led scan misses.
 pub fn looksLikeParenExtensionReceiver(p: *const Parser) bool {
     const first = kindAt(p, p.pos);
     if (!(first != null and is(&first.?, .LParen))) return false;
@@ -398,7 +372,6 @@ pub fn parseParamList(p: *Parser) []Param {
     return parseParamListWith(p, false);
 }
 
-/// The `Any?` placeholder used when a parameter's type is missing or elided.
 fn anyPlaceholder(name_span: span.Span) TypeRef {
     return TypeRef{
         .name = Ident{ .name = "Any", .span = name_span },
@@ -412,8 +385,8 @@ fn anyPlaceholder(name_span: span.Span) TypeRef {
     };
 }
 
-/// `parseParamList` with the type annotation optional under `allow_no_type`, as
-/// anonymous function expressions (`fun(n) = ...`) take it from the context.
+/// Under `allow_no_type` the annotation is optional, as an anonymous function
+/// takes it from the context.
 pub fn parseParamListWith(p: *Parser, allow_no_type: bool) []Param {
     var params: std.ArrayList(Param) = .empty;
     while (true) {
@@ -423,7 +396,7 @@ pub fn parseParamListWith(p: *Parser, allow_no_type: bool) []Param {
             else => {},
         }
         const annotations = file.parseAnnotations(p);
-        // Allow `val`/`var` markers in constructor-like params; ignore.
+        // `val`/`var` markers are allowed here and ignored.
         if (peekKind(p).* == .Keyword and
             (peekKind(p).Keyword == .Val or peekKind(p).Keyword == .Var))
         {
@@ -460,16 +433,11 @@ pub fn parseParamListWith(p: *Parser, allow_no_type: bool) []Param {
         if (has_colon) {
             _ = bump(p);
         } else if (!allow_no_type) {
-            // A required type annotation is missing: emit the standard
-            // "expected `:`" diagnostic. Anon-fn params legally omit it and
-            // pass `allow_no_type = true`.
             _ = expect(p, .Colon, "`:`");
         }
         const ty = if (has_colon or !allow_no_type)
             (types.parseType(p) orelse anyPlaceholder(name.span))
         else
-            // No colon where one is optional: synthesise an `Any?` placeholder
-            // without trying to parse a type.
             anyPlaceholder(name.span);
         var default: ?Expr = null;
         if (is(peekKind(p), .Eq)) {
@@ -517,9 +485,8 @@ pub fn parseProperty(p: *Parser) ?Property {
     return parsePropertyWithFlags(p, ModifierFlags{});
 }
 
-/// Parse a local `val`/`var`. Local properties cannot declare accessors, so a
-/// following `get(...)` / `set(...)` is a separate statement (a call to a
-/// function named `set`, say) and must not be consumed.
+/// Local properties cannot declare accessors, so a following `get(...)` /
+/// `set(...)` is a separate statement and must not be consumed.
 pub fn parseLocalProperty(p: *Parser, flags: ModifierFlags) ?Property {
     return parsePropertyInner(p, flags, false);
 }
@@ -530,32 +497,26 @@ pub fn parsePropertyWithFlags(p: *Parser, flags: ModifierFlags) ?Property {
 
 fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?Property {
     // `suspend` is not a property modifier, but the stdlib `coroutineContext`
-    // intrinsic carries it under a `@Suppress`. Suspend bodies run inline, so
-    // the modifier is inert on a property rather than an error.
+    // carries it, and suspend bodies run inline, so it is inert here.
     _ = flags.suspend_span;
     const kw_tok = bump(p);
     const mutable = kw_tok.kind == .Keyword and kw_tok.kind.Keyword == .Var;
     skipNl(p);
-    // Type parameters on an extension property: `var <T> Box<T>.value: T`.
-    // Generics are erased, so the list serves one purpose: a bare
-    // type-parameter receiver (`val <A : Pipeline<*, ...>> A.pluginRegistry`)
-    // is rewritten below to the parameter's upper bound.
+    // Generics are erased, so the type parameters serve one purpose: a bare
+    // type-parameter receiver is rewritten below to its bound.
     var prop_type_params: []ast.TypeParam = &.{};
     if (is(peekKind(p), .Lt)) {
         prop_type_params = types.parseTypeParams(p, true);
         skipNl(p);
     }
-    // A use-site-targeted annotation may prefix the extension receiver
-    // (`val @receiver:... KProperty0<*>.isInitialized`). Annotations are no-ops
-    // here, so consume and discard them before the receiver type.
+    // A use-site-targeted annotation may prefix the receiver; discard it.
     if (peekKind(p).isAt()) {
         _ = file.parseAnnotations(p);
         skipNl(p);
     }
     var receiver_type = parsePropertyReceiver(p) orelse return null;
-    // A bare type-parameter receiver resolves to its declared upper bound:
-    // `<A : Pipeline<*, …>> A.x` is an extension on `Pipeline`, not on a type
-    // named `A`. An unbounded parameter (`<T> T.x`) applies to `Any`.
+    // A bare type-parameter receiver extends its upper bound; an unbounded
+    // parameter extends `Any`.
     if (receiver_type) |*rt| {
         if (rt.type_args.len == 0) {
             for (prop_type_params) |tp| {
@@ -578,10 +539,10 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
     var init: ?Expr = null;
     var delegate: ?Expr = null;
     var explicit_field: ?ast.ExplicitField = null;
-    // Explicit backing-field clause in the initializer slot, ahead of any `=`
-    // or `by`: `field[: Type][= init]`, on the same line or the next. A local
-    // property (`allow_accessors == false`) cannot declare one, so the shape is
-    // recognized and rejected to report the misuse, not a stray assignment.
+    // Explicit backing-field clause in the initializer slot, ahead of any `=` or
+    // `by`, on the same line or the next. A local property cannot declare one,
+    // so the shape is recognized and rejected to report the misuse rather than a
+    // stray assignment.
     if (scanFieldClause(p, !allow_accessors)) |scan| {
         explicit_field = parseFieldClause(p, scan, allow_accessors);
     }
@@ -599,15 +560,12 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         }
     }
     if (allow_accessors and explicit_field == null and (init != null or delegate != null)) {
-        // Initializer-first order: `val x: Int = 5` then `field = 6`, parsed so
-        // the property-initializer-with-field diagnostic can name both.
         if (scanFieldClause(p, false)) |scan| {
             explicit_field = parseFieldClause(p, scan, allow_accessors);
         }
     }
     if (explicit_field != null and delegate == null) {
-        // A delegate written after the field clause (`field: Int = 1` +
-        // `by lazy { 2 }`) still parses; the checker rejects the pair.
+        // A delegate after the field clause still parses; the checker rejects the pair.
         if (nextSignificantIsBy(p)) {
             skipNl(p);
             _ = bump(p); // `by`
@@ -666,15 +624,13 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
     };
 }
 
-/// Result of `scanFieldClause`: where the `field` keyword sits and where
-/// any (illegal) modifier list ahead of it begins.
+/// Where the `field` keyword sits, and where any illegal modifier run ahead of it begins.
 const FieldScan = struct {
     field_idx: usize,
     first_mod_idx: ?usize,
 };
 
-/// Modifier soft keywords that users plausibly write ahead of a `field`
-/// clause. None are legal there; the parser reports each and moves on.
+/// None are legal ahead of a `field` clause; each is reported.
 fn isFieldClauseModifier(t: []const u8) bool {
     const mods = [_][]const u8{
         "public", "private", "protected", "internal", "lateinit",
@@ -686,11 +642,10 @@ fn isFieldClauseModifier(t: []const u8) bool {
     return false;
 }
 
-/// Lookahead (across newlines, skipping modifier soft keywords) for an explicit
-/// backing-field clause: the contextual keyword `field` in the initializer slot.
-/// Does not advance `p.pos`. `require_marker` demands a `:` or `=` right after
-/// `field`, for local properties, where a bare `field` line is an ordinary
-/// expression statement and inside an accessor body names the backing field.
+/// Lookahead (across newlines, skipping modifier soft keywords) for `field` in
+/// the initializer slot; does not advance `p.pos`. `require_marker` demands a
+/// `:` or `=` after it, for local properties, where a bare `field` line is an
+/// ordinary expression statement.
 fn scanFieldClause(p: *const Parser, require_marker: bool) ?FieldScan {
     if (require_marker and p.in_accessor_body) return null;
     var i = p.pos;
@@ -717,8 +672,7 @@ fn scanFieldClause(p: *const Parser, require_marker: bool) ?FieldScan {
     const has_marker = is(&next, .Colon) or is(&next, .Eq);
     if (!has_marker) {
         if (require_marker) return null;
-        // A bare `field` (the field takes the property's type) only reads
-        // as a clause when it clearly ends there.
+        // A bare `field` reads as a clause only when it clearly ends there.
         switch (next) {
             .Newline, .Semicolon, .RBrace, .Eof => {},
             else => return null,
@@ -727,9 +681,8 @@ fn scanFieldClause(p: *const Parser, require_marker: bool) ?FieldScan {
     return .{ .field_idx = i, .first_mod_idx = first_mod };
 }
 
-/// Consume and build the field clause `scanFieldClause` located. On a local
-/// property the clause is a syntax error: reported at the `field` token,
-/// consumed for recovery, and dropped. A modifier ahead of `field` is rejected.
+/// On a local property the clause is a syntax error: reported, consumed for
+/// recovery, and dropped.
 fn parseFieldClause(p: *Parser, scan: FieldScan, allow_accessors: bool) ?ast.ExplicitField {
     skipNl(p);
     while (p.pos < scan.field_idx) {
@@ -777,8 +730,7 @@ fn parseFieldClause(p: *Parser, scan: FieldScan, allow_accessors: bool) ?ast.Exp
     return .{ .ty = fty, .init = finit, .span = field_tok.span };
 }
 
-/// True when the next significant token, newlines skipped, is the soft keyword
-/// `by`. Does not advance `p.pos`.
+/// Does not advance `p.pos`.
 fn nextSignificantIsBy(p: *const Parser) bool {
     var i = p.pos;
     while (kindAt(p, i)) |k| {
@@ -791,8 +743,7 @@ fn nextSignificantIsBy(p: *const Parser) bool {
 }
 
 /// At `(`: whether the balanced group is followed by `.` `Ident`, making it a
-/// parenthesized (function-type) extension receiver rather than anything else a
-/// declaration could start with.
+/// parenthesized function-type extension receiver.
 fn parenReceiverAhead(p: *const Parser) bool {
     if (!is(peekKind(p), .LParen)) return false;
     var j = p.pos;
@@ -816,9 +767,7 @@ fn parenReceiverAhead(p: *const Parser) bool {
 }
 
 fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
-    // A parenthesized function-type receiver (`val (Int.() -> String).baz`,
-    // `var <T> (List<T>.() -> T).bar`). The group is a type when a `.` and the
-    // property name follow its closing `)`.
+    // The group is a type when a `.` and the property name follow its `)`.
     if (parenReceiverAhead(p)) {
         const ty = types.parseType(p) orelse return .failure;
         _ = expect(p, .Dot, "`.`") orelse return .failure;
@@ -830,10 +779,8 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
         p.suppress_qualified_path = true;
         var ty = types.parseType(p);
         p.suppress_qualified_path = saved_sqp;
-        // Accumulate the receiver's full dotted class path. `parseType` under
-        // suppression takes only the first segment, so a nested receiver
-        // (`LineHeightStyle.Alignment.Companion.Saver`) would lose the middle
-        // segments and mis-parse the property name.
+        // `parseType` under suppression takes only the first segment, so a
+        // nested receiver would lose its middle segments and mis-parse the name.
         var path: std.ArrayList(u8) = .empty;
         defer path.deinit(p.allocator);
         if (ty) |t| path.appendSlice(p.allocator, t.name.name) catch @panic("OOM");
@@ -847,15 +794,13 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
             }
         } else {
             _ = expect(p, .Dot, "`.`") orelse return .failure;
-            // Consume intermediate qualifier segments: an ident followed by
-            // `.<ident>` belongs to the receiver's class path, not the property
-            // name. Stop at `Companion` and at the final segment.
+            // An ident followed by `.<ident>` belongs to the class path, not the
+            // property name. Stop at `Companion` and at the final segment.
             while (true) {
                 const here = peekIdentText(p) orelse break;
                 if (std.mem.eql(u8, here, "Companion")) break;
                 const k1 = kindAt(p, p.pos + 1) orelse break;
-                // `Ident<...>.`: a nested segment carrying generic arguments
-                // (`val Map.Entry<K, V>.key`), folded with its arguments kept.
+                // `Ident<...>.` is a nested segment; fold it with its arguments.
                 if (is(&k1, .Lt)) {
                     const save_pos = p.pos;
                     const seg = parseIdent(p, "type") orelse break;
@@ -884,12 +829,10 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
                 if (ty) |*t| t.name = seg;
             }
         }
-        // A Companion-qualified receiver (`String.Companion.CASE_INSENSITIVE_ORDER`):
-        // the receiver type is `<Class>.Companion`, so consume `Companion .` and
-        // take the following ident as the property name. The type collapses to
-        // the class, but `qualified_path` keeps `<Class>.Companion` so
-        // registration keys it apart from a plain `val <Class>.foo` extension,
-        // which targets instances rather than the companion.
+        // Companion-qualified receiver (`String.Companion.CASE_INSENSITIVE_ORDER`):
+        // the type collapses to the class, but `qualified_path` keeps
+        // `<Class>.Companion` so registration keys it apart from a plain
+        // `val <Class>.foo`, which targets instances rather than the companion.
         const next1 = kindAt(p, p.pos + 1);
         const is_companion = blk: {
             const t = peekIdentText(p) orelse break :blk false;
@@ -904,8 +847,7 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
                 t.qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM");
             }
         } else if (std.mem.indexOfScalar(u8, path.items, '.') != null) {
-            // A multi-segment receiver with no companion (`A.B.foo`): keep the
-            // full path so the resolver targets the nested class, not just `A`.
+            // Keep the full path of `A.B.foo` so the resolver targets the nested class.
             if (ty) |*t| {
                 t.qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM");
             }
@@ -924,8 +866,6 @@ fn parsePropertyReceiver(p: *Parser) ??TypeRef {
     };
 }
 
-/// Result of `scanAccessorModifiers`: the keyword candidate's token index plus
-/// the modifiers seen ahead of it.
 const AccessorScan = struct {
     index: usize,
     visibility: ?Visibility,
@@ -933,9 +873,8 @@ const AccessorScan = struct {
     had_annotation: bool,
 };
 
-/// Lookahead from `from`, skipping newlines and any leading `inline` or
-/// visibility modifiers ahead of a `get` / `set` keyword, to that keyword's
-/// token index plus the modifiers seen. Does not advance `p.pos`.
+/// Lookahead from `from` past newlines and any `inline` or visibility modifiers
+/// to a `get` / `set` keyword. Does not advance `p.pos`.
 fn scanAccessorModifiers(p: *const Parser, from: usize) AccessorScan {
     var i = from;
     while (kindAt(p, i)) |k| {
@@ -945,23 +884,18 @@ fn scanAccessorModifiers(p: *const Parser, from: usize) AccessorScan {
     var acc_visibility: ?Visibility = null;
     var acc_inline = false;
     var had_annotation = false;
-    // `inline` and a visibility modifier may appear in either order ahead of
-    // `get` / `set`: both `inline get()` and `private inline set(v)` parse.
+    // Kotlin accepts `inline get()` and `private inline set(v)`, so either order.
     while (i < p.tokens.len) {
         const tok = p.tokens[i];
-        // Scan past an accessor annotation (`@InternalAPI set(value)`,
-        // `@Composable get()`); the commit path re-parses the leading run into
-        // the accessor's `annotations`.
+        // The commit path re-parses this annotation run into the accessor's `annotations`.
         if (tok.kind.isAt()) {
             had_annotation = true;
             i += 1; // `@`
-            // Optional use-site target `@set:Foo` / `@get:Foo`.
             const a = kindAt(p, i);
             const b = kindAt(p, i + 1);
             if (a != null and is(&a.?, .Ident) and b != null and is(&b.?, .Colon)) {
                 i += 2;
             }
-            // Qualified annotation name: `Ident ('.' Ident)*`.
             while (kindAt(p, i)) |k| {
                 if (!is(&k, .Ident)) break;
                 i += 1;
@@ -975,7 +909,6 @@ fn scanAccessorModifiers(p: *const Parser, from: usize) AccessorScan {
                     break;
                 }
             }
-            // Optional `(args)`: skip the balanced parens.
             if (kindAt(p, i)) |k| {
                 if (is(&k, .LParen)) {
                     var depth: i32 = 0;
@@ -1031,24 +964,20 @@ fn scanAccessorModifiers(p: *const Parser, from: usize) AccessorScan {
     return .{ .index = i, .visibility = acc_visibility, .inlined = acc_inline, .had_annotation = had_annotation };
 }
 
-/// Getter, setter, and bare-`set` visibility from `parsePropertyAccessors`.
 const PropertyAccessors = struct {
     getter: ?Accessor,
     setter: ?Accessor,
     setter_visibility: ?Visibility,
 };
 
-/// Parse the optional `get` / `set` accessors that may follow a property, in
-/// either order and across newlines. Returns the getter, setter and any
-/// bare-`set` visibility; `null` propagates a parse failure.
+/// In either order and across newlines; `null` propagates a parse failure.
 fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
     var getter: ?Accessor = null;
     var setter: ?Accessor = null;
     var setter_visibility: ?Visibility = null;
     while (true) {
         const save = p.pos;
-        // An accessor may follow a `;` on the property's line
-        // (`var x = "OK"; private set`).
+        // An accessor may follow a `;` (`var x = "OK"; private set`).
         var scan_from = p.pos;
         if (kindAt(p, scan_from)) |k| if (is(&k, .Semicolon)) {
             var j = scan_from + 1;
@@ -1072,33 +1001,27 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
         const is_set = std.mem.eql(u8, ident_text, "set");
         if (!is_get and !is_set) break;
         const next = kindAt(p, i + 1);
-        // Bare `private set` (no parens) is valid: it keeps the default
-        // accessor and only restricts visibility, so the synthesized accessor
-        // is bodyless and carries nothing but that visibility.
+        // Bare `private set` keeps the default accessor and only restricts
+        // visibility, so the synthesized accessor is bodyless.
         const is_bodyless = !(next != null and is(&next.?, .LParen));
         if (is_bodyless and acc_visibility == null and !acc_inline and !scan.had_annotation) {
-            // A bare `get` / `set` declares the default accessor only when
-            // nothing follows it on the line: `set = 5` or `set.add(x)` is an
-            // identifier named `set`, not an accessor.
+            // A bare `get` / `set` is the default accessor only when nothing
+            // follows it on the line: `set = 5` is an identifier named `set`.
             const after = kindAt(p, i + 1);
             const alone = after == null or is(&after.?, .Newline) or is(&after.?, .Semicolon) or
                 is(&after.?, .RBrace) or is(&after.?, .Eof);
             if (!alone) break;
         }
-        // Commit: consume the newlines, optional visibility or annotation, and
-        // the accessor. Annotations are parsed for real (`@Composable get()`
-        // marks an accessor the compose pass transforms), and the scanner's
-        // index lands on the `get`/`set` ident whatever the modifier order.
+        // The annotations are parsed for real: `@Composable get()` marks an
+        // accessor the compose pass transforms.
         p.pos = save;
         skipNl(p);
         const acc_annotations = file.parseAnnotations(p);
         p.pos = i;
         const start_span = bump(p).span; // get / set
         if (is_bodyless) {
-            // Bodyless accessor (no `(...)`): `private set` restricts the
-            // setter's visibility while the default accessor stays in effect,
-            // and an abstract `get` on an interface or `expect` property
-            // declares the accessor without a body. Neither synthesizes one.
+            // Bodyless: `private set` only restricts visibility, and an abstract
+            // `get` has no body.
             if (is_set) {
                 if (acc_visibility) |v| setter_visibility = v;
             }
@@ -1107,8 +1030,6 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
         _ = expect(p, .LParen, "`(`") orelse return null;
         var acc_params: std.ArrayList(Ident) = .empty;
         if (!is(peekKind(p), .RParen)) {
-            // A setter parameter may carry annotations:
-            // `set(@Suppress("AutoBoxing") dateMillis) { ... }`.
             _ = file.parseAnnotations(p);
             const par = parseIdent(p, "setter parameter") orelse return null;
             acc_params.append(p.allocator, par) catch @panic("OOM");

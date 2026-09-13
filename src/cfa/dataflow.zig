@@ -1,15 +1,7 @@
 //! Generic monotone dataflow framework plus the killDataFlow inference pass.
-//!
-//! The framework exposes a lattice contract, two combinators (`Flat(T)` for
-//! finite-height pointwise facts, `MapLattice(K, L)` for per-key facts) and a
-//! `solveForward` worklist runner that iterates blocks in reverse postorder to a
-//! fixpoint. An analysis supplies a forward-transfer value whose methods mutate
-//! per-node and per-edge state.
-//!
-//! `killDataFlow` builds on the framework: it counts assignments to each `Place`
-//! at every program point, and after fixpoint any backedge whose count differs
-//! from the loop entry's gets a `KillDataFlow(place)` node injected at the loop
-//! head, so smart-cast analyses drop that place's narrowings.
+//! The framework exposes a lattice contract, the `Flat(T)` and `MapLattice(K, L)`
+//! combinators, and a `solveForward` worklist runner that iterates blocks in
+//! reverse postorder to a fixpoint against a caller-supplied transfer value.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -25,8 +17,7 @@ const Terminator = ir.Terminator;
 
 // A monotone lattice value must expose `bottom`, `join`, `eql` and `clone`.
 // `join` returns `true` when the receiver changed, which is how the worklist
-// knows to re-enqueue successors. `clone` takes an allocator, a no-op for a
-// trivially-copyable lattice. The member shape, duck-typed at comptime:
+// knows to re-enqueue successors. The member shape, duck-typed at comptime:
 //
 //   pub fn bottom(allocator) L
 //   pub fn join(self: *L, allocator, other: *const L) Allocator.Error!bool
@@ -34,9 +25,8 @@ const Terminator = ir.Terminator;
 //   pub fn clone(self: L, allocator) Allocator.Error!L
 //   pub fn deinit(self: *L, allocator) void
 
-/// `Flat(T)` is the three-point lattice: bottom (unknown), a single
-/// concrete value, or top (conflicting). `T` must be trivially
-/// comparable with `==`.
+/// Three-point lattice: bottom (unknown), one concrete value, or top
+/// (conflicting). `T` must be comparable with `==`.
 pub fn Flat(comptime T: type) type {
     return union(enum) {
         Bottom,
@@ -89,9 +79,8 @@ pub fn Flat(comptime T: type) type {
     };
 }
 
-/// Comparator keeping a `MapLattice` ordered. `K` must expose
-/// `pub fn order(self: K, other: K) std.math.Order`, as `Place.order` does, or
-/// be an integer or enum for `std.math.order`.
+/// `K` must expose `pub fn order(self: K, other: K) std.math.Order`, as
+/// `Place.order` does, or be an integer or enum for `std.math.order`.
 fn keyOrder(comptime K: type, a: K, b: K) std.math.Order {
     if (@hasDecl(K, "order")) return a.order(b);
     return std.math.order(@intFromEnum(a), @intFromEnum(b));
@@ -102,8 +91,7 @@ fn keyClone(comptime K: type, allocator: Allocator, k: K) Allocator.Error!K {
     return k;
 }
 
-/// Map lattice with pointwise join; a missing key reads as `L.bottom()`. Keys
-/// stay in ascending `keyOrder`, mirroring `BTreeMap` iteration order.
+/// Pointwise join; a missing key reads as `L.bottom()`. Keys stay in ascending `keyOrder`.
 pub fn MapLattice(comptime K: type, comptime L: type) type {
     return struct {
         pub const Entry = struct { key: K, value: L };
@@ -136,15 +124,13 @@ pub fn MapLattice(comptime K: type, comptime L: type) type {
             return null;
         }
 
-        /// Clone of the fact for `k`, or `L.bottom()` when absent. Caller owns
-        /// the returned value.
+        /// `L.bottom()` when absent. Caller owns the returned value.
         pub fn get(self: *const Self, allocator: Allocator, k: K) Allocator.Error!L {
             if (self.find(k)) |i| return self.entries.items[i].value.clone(allocator);
             return L.bottom(allocator);
         }
 
-        /// Insert/overwrite, keeping the entry list ordered. Takes
-        /// ownership of `k` and `v`.
+        /// Keeps the entry list ordered. Takes ownership of `k` and `v`.
         pub fn put(self: *Self, allocator: Allocator, k: K, v: L) Allocator.Error!void {
             if (self.find(k)) |i| {
                 self.entries.items[i].value.deinit(allocator);
@@ -202,15 +188,13 @@ pub fn MapLattice(comptime K: type, comptime L: type) type {
     };
 }
 
-/// Per-block in-state for a forward dataflow problem.
 pub fn BlockStates(comptime L: type) type {
     return std.ArrayList(L);
 }
 
-/// Solve a forward dataflow problem to fixpoint, returning the per-block
-/// in-state. `transfer` is any value exposing `transferNode`, `transferEdge` and
-/// `transferTerminator`, each of which may be a no-op. `entry_state` is consumed
-/// into the entry block's state.
+/// Solve to fixpoint, returning the per-block in-state. `transfer` exposes
+/// `transferNode`, `transferEdge` and `transferTerminator`, each optionally a
+/// no-op. `entry_state` is consumed into the entry block's state.
 pub fn solveForward(
     comptime L: type,
     comptime T: type,
@@ -265,7 +249,6 @@ pub fn solveForward(
                 in_queue[target] = true;
             }
         }
-        // Compact the queue periodically to bound memory growth.
         if (head > 64 and head * 2 > queue.items.len) {
             const remaining = queue.items.len - head;
             std.mem.copyForwards(BlockId, queue.items[0..remaining], queue.items[head..]);
@@ -310,17 +293,13 @@ fn reversePostorder(allocator: Allocator, cfg: *const Cfg) Allocator.Error![]Blo
     return order.toOwnedSlice(allocator);
 }
 
-// killDataFlow inference.
-//
-// Every program point counts how many times each `Place` has been assigned
-// along the path. A backedge reaching a head with a higher per-place count than
-// the head's entry had means the place was reassigned inside the loop body, so
-// any smart cast bound on it must be dropped before the next iteration. A
-// `KillDataFlow(place)` node is then injected at the loop head's first non-decl
-// node, where the smart-cast analysis sees it.
+// killDataFlow inference: every program point counts how many times each
+// `Place` has been assigned along the path. A backedge reaching a head with a
+// higher count than the head's entry means the place was reassigned inside the
+// loop, so a `KillDataFlow(place)` node is injected at the loop head's first
+// non-decl node and smart-cast drops its narrowings.
 
-/// An ordered set of `Place` for the killDataFlow pass. Entries own their
-/// cloned places.
+/// Entries own their cloned places.
 const PlaceSet = struct {
     items: std.ArrayList(Place) = .empty,
 
@@ -334,7 +313,6 @@ const PlaceSet = struct {
         return null;
     }
 
-    /// Insert a clone of `p` when absent; true when it was inserted.
     fn insert(self: *PlaceSet, allocator: Allocator, p: Place) Allocator.Error!bool {
         if (self.find(p) != null) return false;
         var idx: usize = 0;
@@ -370,8 +348,7 @@ const BlockSet = struct {
     }
 };
 
-/// Apply killDataFlow inference to `cfg` in place, inserting a
-/// `Node.KillDataFlow` at each loop head for every `Place` reassigned anywhere
+/// Insert a `Node.KillDataFlow` at each loop head for every `Place` reassigned
 /// on a path that re-enters the head through a backedge.
 pub fn inferKillDataFlow(allocator: Allocator, cfg: *Cfg) Allocator.Error!void {
     var loop_bodies = try collectLoopBodies(allocator, cfg);
@@ -413,8 +390,8 @@ const LoopBody = struct {
     body: BlockSet,
 };
 
-/// For each loop head, the blocks forming its body: those reachable from `head`
-/// along forward edges that can still reach back to it through a `Backedge`.
+/// Per loop head, the blocks reachable from it along forward edges that can
+/// still reach back through a `Backedge`.
 fn collectLoopBodies(allocator: Allocator, cfg: *const Cfg) Allocator.Error!std.ArrayList(LoopBody) {
     var out: std.ArrayList(LoopBody) = .empty;
     errdefer {
@@ -459,8 +436,8 @@ fn findLoopHeads(allocator: Allocator, cfg: *const Cfg) Allocator.Error![]BlockI
     for (cfg.blocks.items) |block| {
         for (block.nodes.items) |node| {
             if (node == .Backedge) {
-                // The block containing the backedge node gotos the loop head,
-                // its single normal successor.
+                // The block holding the backedge node gotos the loop head, its
+                // single normal successor.
                 for (block.succs.items) |edge| {
                     if (edge.kind == .Normal) {
                         _ = try heads.insert(allocator, edge.block);

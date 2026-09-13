@@ -1,29 +1,18 @@
-//! Kotlin parser.
+//! Kotlin parser: hand-written recursive descent over the `lexer` module's
+//! `Token` stream, with a Pratt expression grammar at these precedence levels:
 //!
-//! Hand-written recursive descent over the `lexer` module's `Token` stream. The
-//! expression grammar is a Pratt parser with these precedence levels:
-//!
-//!   disjunction      ||
-//!   conjunction      &&
-//!   equality         == != === !==
-//!   comparison       < > <= >=
-//!   named_checks     in !in is !is
-//!   elvis            ?:
-//!   range            .. ..<
-//!   additive         + -
-//!   multiplicative   * / %
-//!   prefix           + - ! ++ --
-//!   postfix          ++ -- . ?. !! () []
-//!   primary
+//!   disjunction  ||          conjunction     &&
+//!   equality     == != === !==   comparison  < > <= >=
+//!   named_checks in !in is !is   elvis       ?:
+//!   range        .. ..<      additive        + -
+//!   multiplicative * / %     prefix          + - ! ++ --
+//!   postfix      ++ -- . ?. !! () []     primary
 //!
 //! Assignment is parsed at the statement level, Kotlin assignments not being
-//! expressions. Newlines are soft separators: inside parens, braces and
-//! brackets they are skipped freely, and at statement positions they terminate
-//! a statement.
-//!
-//! The recursive-descent methods live in sibling files as free functions over
-//! `*Parser` (`expr.parseExpr(p)`, `file.parseFile(p)`). This root file owns the
-//! `Parser` struct, the modifier-flag helpers, the entry point and the tests.
+//! expressions. Newlines are soft separators: skipped freely inside brackets,
+//! terminating a statement at statement positions. The descent methods live in
+//! sibling files as free functions over `*Parser`; this file owns the `Parser`
+//! struct, the modifier flags and the entry point.
 
 const std = @import("std");
 
@@ -51,23 +40,20 @@ const FileId = span.FileId;
 const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 
-/// Language features that change how source parses, the way kotlinc's
-/// `-XXLanguage:+Feature` does. Set once per process from `klio run
-/// --language=+Feature` (or `KLIO_LANGUAGE`), read by the parser.
+/// Source-affecting language features, as kotlinc's `-XXLanguage:+Feature`.
+/// Set once per process from `klio run --language=+Feature` or `KLIO_LANGUAGE`.
 pub const LanguageFeatures = struct {
-    /// Kotlin 2.4 `NameBasedDestructuring`: the full form
-    /// `(val a, val b = prop)` and the positional `[a, b]`, which klio parses
-    /// unconditionally.
+    /// The full form `(val a, val b = prop)` and positional `[a, b]`, which
+    /// klio parses unconditionally.
     name_based_destructuring: bool = false,
-    /// `EnableNameBasedDestructuringShortForm`: the parenthesized short
-    /// form `(a, b = prop)` binds by property name; off, `(a, b)` stays
-    /// positional (`componentN`).
+    /// The parenthesized short form `(a, b = prop)` binds by property name;
+    /// off, `(a, b)` stays positional.
     name_based_short_form: bool = false,
 };
 pub var language: LanguageFeatures = .{};
 
-/// Apply one `+Feature` / `-Feature` spec. An unknown feature is accepted and
-/// ignored; the return says whether the name was a known toggle.
+/// An unknown feature is accepted and ignored; the return says whether the name
+/// was a known toggle.
 pub fn setLanguageFeature(spec: []const u8) bool {
     const s = std.mem.trim(u8, spec, " \t");
     if (s.len < 2) return false;
@@ -85,41 +71,33 @@ pub fn setLanguageFeature(spec: []const u8) bool {
 }
 
 pub const Parser = struct {
-    /// Arena used for every AST node and for owned diagnostic-message
-    /// strings produced during the parse.
+    /// Arena for every AST node and owned diagnostic-message string.
     allocator: std.mem.Allocator,
     file: FileId,
     src: []const u8,
     tokens: []const Token,
     pos: usize,
     diagnostics: DiagnosticSink,
-    /// When `true`, postfix parsing does not attach a trailing `{ ... }` lambda.
-    /// Set while reading the delegate of a `: I by expr` supertype entry, so the
-    /// class body's opening brace is not swallowed as `expr { ... }`.
+    /// Postfix parsing then attaches no trailing `{ ... }` lambda. Set while
+    /// reading the delegate of a `: I by expr` supertype, so the class body's
+    /// brace is not swallowed as `expr { ... }`.
     suppress_trailing_lambda: bool,
-    /// When `true`, `parseSimpleType` does NOT fold trailing `.Ident` segments
-    /// into a qualified type path. Set while parsing an extension or
-    /// anonymous-function receiver type, where the trailing `.name` is the
-    /// function name and the receiver-fold loop separates the qualifier itself.
+    /// `parseSimpleType` then folds no trailing `.Ident` into a qualified path.
+    /// Set while parsing an extension or anonymous-function receiver, where the
+    /// trailing `.name` is the function name.
     suppress_qualified_path: bool,
-    /// When `true`, the cursor is inside a property accessor body, where `field`
-    /// is the backing-field expression. Local-property parsing then never reads
-    /// a `field = value` assignment as an explicit-backing-field clause.
+    /// Inside an accessor body `field` is the backing-field expression, so
+    /// local-property parsing must not read `field = value` as a field clause.
     in_accessor_body: bool,
-    /// Per-token flag: `true` when the token sits inside an unclosed `(` or `[`,
-    /// not `{`. Kotlin treats newlines as soft inside round and square brackets,
-    /// where an expression may break around a binary or infix operator, but as
-    /// significant inside `{ ... }` blocks. Precomputed for O(1) lookup however
-    /// the cursor moves; allocated from `allocator`.
+    /// Per token: inside an unclosed `(` or `[`, but not `{`, where Kotlin
+    /// treats newlines as soft. Precomputed for O(1) lookup; allocated from
+    /// `allocator`.
     nl_soft: []bool,
 
-    /// Build a parser over a freshly lexed token stream.
-    ///
-    /// A newline is soft, so an expression may wrap across it, only when the
-    /// innermost still-open bracket is `(` or `[`. Inside a `{ ... }` block,
-    /// lambda or `when` body, newlines stay significant even when that `{}` is
-    /// nested inside `(...)`, as in `f(when { a -> x \n b -> y })`. A bracket
-    /// stack tracks this so the innermost context wins.
+    /// A newline is soft only when the innermost still-open bracket is `(` or
+    /// `[`. Inside a `{ ... }` block, lambda or `when` body newlines stay
+    /// significant even when that `{}` is nested in `(...)`, as in
+    /// `f(when { a -> x \n b -> y })`, so a bracket stack decides.
     pub fn new(
         allocator: std.mem.Allocator,
         file_id: FileId,
@@ -172,14 +150,11 @@ pub const Parser = struct {
         return p;
     }
 
-    /// Parse the whole compilation unit; diagnostics are left on
-    /// `self.diagnostics`.
     pub fn parseFile(self: *Parser) KotlinFile {
         return file.parseFile(self);
     }
 };
 
-/// Class-declaration modifiers, one field per Kotlin modifier.
 pub const ClassModifiers = struct {
     is_data: bool = false,
     is_companion: bool = false,
@@ -195,8 +170,6 @@ pub const ClassModifiers = struct {
     is_actual: bool = false,
 };
 
-/// Declaration modifiers, one field per Kotlin modifier, filled in and read
-/// field-by-field across the parse modules.
 pub const ModifierFlags = struct {
     is_data: bool = false,
     is_companion: bool = false,
@@ -218,29 +191,25 @@ pub const ModifierFlags = struct {
     is_suspend: bool = false,
     is_expect: bool = false,
     is_actual: bool = false,
-    /// Span of the `suspend` modifier when one was consumed, so a rejection on
-    /// constructors, accessors, anonymous functions or delegation operators can
-    /// point at it.
+    /// Set when the modifier was consumed, so a rejection on a constructor or
+    /// accessor can point at it.
     suspend_span: ?span.Span = null,
-    /// Span of the `inline` modifier when one was consumed, so `inline class`
-    /// can be reported as a deprecated alias for `value class`.
+    /// Set when the modifier was consumed, so `inline class` can be reported as
+    /// a deprecated alias for `value class`.
     inline_span: ?span.Span = null,
-    /// Parsed `context(name: Type, ...)` modifier clause. Attached to the
-    /// following function/property declaration; rejected on classes,
-    /// objects, type aliases, and constructors.
+    /// Attached to the following function or property; rejected on classes,
+    /// objects, type aliases and constructors.
     context_params: []ast.ContextParam = &.{},
-    /// Span of the `context(...)` clause when one was consumed, used both for
-    /// rejections in invalid positions and to detect a second clause
+    /// Used for rejections in invalid positions and to detect a second clause
     /// (`MULTIPLE_CONTEXT_LISTS`).
     context_span: ?span.Span = null,
     visibility: Visibility = Visibility.default,
     annotations: std.ArrayList(Annotation) = .empty,
 };
 
-/// Identifiers that are reserved soft modifiers or contextual keywords and must
-/// never be tentatively consumed as an infix function name. Without the guard,
-/// `val x = foo` followed by `private fun ...` on the next line misreads, the
-/// previous statement having no newline separator.
+/// Reserved soft modifiers and contextual keywords, never to be tentatively
+/// consumed as an infix function name: without the guard, `val x = foo` followed
+/// by `private fun ...` misreads across the line break.
 pub fn isValidInfixName(name: []const u8) bool {
     const reserved = [_][]const u8{
         "private",  "public",      "protected", "internal", "open",
@@ -268,8 +237,7 @@ pub fn isTrailingLambdaCallable(e: *const Expr) bool {
 
 const testing = std.testing;
 
-/// When true, the full-pipeline tests below are skipped through
-/// `skipIfStubbed`.
+/// When true, the full-pipeline tests below are skipped.
 const siblings_stubbed = false;
 
 const ParseOut = struct {
@@ -301,8 +269,6 @@ test "foundation: nl_soft precomputes bracket softness" {
     const lexed = try lx.tokenize();
     const p = Parser.new(a, id, src, lexed.tokens);
 
-    // Find the two newline tokens and assert softness: the first newline
-    // sits inside `(` (soft), the second sits inside `{` (hard).
     var seen: usize = 0;
     for (p.tokens, 0..) |t, i| {
         if (std.meta.activeTag(t.kind) == .Newline) {
@@ -888,7 +854,6 @@ test "annotation_all_multi_bracket_rejected" {
         }
     }
     try testing.expect(found);
-    // Recovery: both bracketed annotations still parse onto the param.
     const cp = out.file.decls[0].Class.primary_params[0];
     try testing.expectEqual(@as(usize, 2), cp.annotations.len);
 }
@@ -1127,9 +1092,7 @@ test "labeled_lambda_via_run" {
 
 test "generic_call_with_labeled_trailing_lambda" {
     // `f<Unit> sc@{ ... }` is a generic call whose trailing lambda carries a
-    // label, not the comparison `f < Unit > sc`. Without the labeled-lambda case
-    // in `trySkipGenericCallArgs` the `<`/`>` parse as operators and
-    // `suspendCancellableCoroutine<Unit> sc@{ ... }` mis-lowers.
+    // label, not the comparison `f < Unit > sc`.
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1629,7 +1592,6 @@ test "ebf: modifier ahead of field clause rejected" {
         }
     }
     try testing.expect(found);
-    // The clause itself still lands on the property.
     const p = out.file.decls[0].Class.members[0].Property;
     try testing.expect(p.explicit_field != null);
 }
@@ -1782,7 +1744,6 @@ test "ctx: statement-level call is not a context clause" {
     );
     try testing.expect(!out.parser.diagnostics.hasErrors());
     const body = out.file.decls[0].Function.body.?.Block;
-    // The single statement is an expression (the call), not a declaration.
     try testing.expect(body.stmts.len == 1);
     try testing.expect(body.stmts[0] != .Decl);
 }
@@ -1802,7 +1763,6 @@ test "ctx: statement-level local contextual function" {
     const local = body.stmts[0].Decl.Function;
     try testing.expectEqual(@as(usize, 1), local.context_params.len);
     try testing.expectEqualStrings("c", local.context_params[0].name.name);
-    // The second statement is the stdlib `context(...)` call.
     try testing.expect(body.stmts[1] != .Decl);
 }
 
@@ -1861,8 +1821,7 @@ test "annotation on a receiver function type annotates the function type" {
     const f = out.file.decls[0].Function;
     const ty = f.params[0].ty;
     try testing.expect(ty.function != null);
-    // The annotation written before the receiver head belongs to the
-    // FUNCTION type, not the receiver.
+    // The annotation before the receiver head belongs to the FUNCTION type.
     try testing.expectEqual(@as(usize, 1), ty.annotations.len);
     try testing.expectEqualStrings("Composable", ty.annotations[0].path[ty.annotations[0].path.len - 1].name);
     const recv = ty.function.?.receiver.?;

@@ -28,8 +28,8 @@ const TypeRef = ast.TypeRef;
 const Annotation = ast.Annotation;
 const Span = span.Span;
 
-// Cross-module parse entry points live in sibling files and are reached through
-// a `@hasDecl` gate that yields an empty result when the sibling has none.
+// These parse routines live in sibling files and are reached through a
+// `@hasDecl` gate that yields an empty result when the sibling has none.
 
 fn parseExpr(p: *Parser) ?Expr {
     if (@hasDecl(root.expr, "parseExpr")) return root.expr.parseExpr(p);
@@ -74,47 +74,38 @@ fn parseAnnotations(p: *Parser) []Annotation {
     return &.{};
 }
 
-/// Allocate a single `Expr` on the parser arena.
 fn box(p: *Parser, e: Expr) *Expr {
     const ptr = p.allocator.create(Expr) catch @panic("OOM in parser");
     ptr.* = e;
     return ptr;
 }
 
-/// Build a one-element `[]Stmt` on the arena.
 fn singleStmt(p: *Parser, s: Stmt) []Stmt {
     const buf = p.allocator.alloc(Stmt, 1) catch @panic("OOM in parser");
     buf[0] = s;
     return buf;
 }
 
-/// Build a one-element `[]Ident` on the arena.
 fn singleIdent(p: *Parser, id: Ident) []Ident {
     const buf = p.allocator.alloc(Ident, 1) catch @panic("OOM in parser");
     buf[0] = id;
     return buf;
 }
 
-/// Parse a `controlStructureBody`: a statement, which may be an assignment,
-/// wrapped as a single-statement block, or an expression. Used for `if`, `else`,
-/// `while`, `for` and `do-while` bodies, so `if (c) x = v` parses.
+/// A statement, possibly an assignment, wrapped as a single-statement block, or
+/// an expression. So `if (c) x = v` parses.
 pub fn parseControlStructureBody(p: *Parser) ?Expr {
-    // Kotlin grammar: `controlStructureBody : block | statement`.
     // `for (x in xs);`: an empty statement is an empty body.
     if (std.meta.activeTag(support.peekKind(p).*) == .Semicolon) {
         const semi = support.bump(p);
         return Expr{ .Block = .{ .stmts = &.{}, .span = semi.span } };
     }
-    // An annotation may prefix the body expression (`-> @Suppress("UNCHECKED_CAST")
-    // (x as T)` in `Comparator.reversed()`); strip it as a runtime no-op.
     skipLeadingExprAnnotation(p);
     // A leading `{` here is the body block, not a lambda: the lambda reading
-    // applies only in true expression position (`val f = { ... }`), which
-    // `parsePrimary` handles.
+    // applies only in true expression position, which `parsePrimary` handles.
     if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) {
-        // A `{ params -> body }` at branch position is a lambda literal, since
-        // the branch evaluates to a function value; a `{` with no top-level
-        // `->` is the body block.
+        // A `{ params -> body }` at branch position is a lambda literal; a `{`
+        // with no top-level `->` is the body block.
         const next = p.pos + 1;
         const save_pos = p.pos;
         p.pos = next;
@@ -167,8 +158,7 @@ pub fn parseIf(p: *Parser) ?Expr {
     support.skipNl(p);
     _ = support.expect(p, .RParen, "`)`") orelse return null;
     support.skipNl(p);
-    // The then-branch may be omitted, with `;` or `else` right after the closing
-    // paren. The branchless `if (c) else ;` is valid and evaluates to Unit.
+    // The then-branch may be omitted: `if (c) else ;` is valid and gives Unit.
     const cond_span = cond.span();
     const then_branch: Expr = switch (support.peekKind(p).*) {
         .Semicolon => blk: {
@@ -184,12 +174,9 @@ pub fn parseIf(p: *Parser) ?Expr {
         } } else (parseControlStructureBody(p) orelse return null),
         else => parseControlStructureBody(p) orelse return null,
     };
-    // `else` may follow on the next line.
     const save = p.pos;
     support.skipNl(p);
-    // A following `else ->` is a `when` arm's else, not this `if`'s else branch,
-    // so it is left unconsumed (kotlinx-coroutines writes
-    // `when { cond -> if (c) return X; else -> ... }`).
+    // A following `else ->` is a `when` arm's else, not this `if`'s, so it is left unconsumed.
     const else_is_when_arm = blk: {
         const is_else = switch (support.peekKind(p).*) {
             .Keyword => |k| k == .Else,
@@ -243,7 +230,6 @@ pub fn parseWhile(p: *Parser) ?Expr {
     support.skipNl(p);
     _ = support.expect(p, .RParen, "`)`") orelse return null;
     support.skipNl(p);
-    // An empty body (`while (cond) ;`) is a valid loop with no statements.
     const body: Expr = switch (support.peekKind(p).*) {
         .Semicolon => blk: {
             const semi = support.bump(p);
@@ -261,7 +247,6 @@ pub fn parseWhile(p: *Parser) ?Expr {
 pub fn parseDoWhile(p: *Parser) ?Expr {
     const kw = support.bump(p);
     support.skipNl(p);
-    // Body is optional: `do { ... } while(c)` or `do; while(c)`.
     const is_while = switch (support.peekKind(p).*) {
         .Keyword => |k| k == .While,
         else => false,
@@ -293,20 +278,18 @@ pub const DestructEntries = struct {
     /// The property each name reads in the name-based form; empty otherwise.
     sources: []Ident,
     by_name: bool,
-    /// Any entry declared `var` (the name-based form declares per entry).
     any_var: bool,
 };
 
-/// The entries of a destructuring group after its opener, up to and including
-/// `close`: positional `a, b: T, _`, where each name reads `componentN` and an
-/// entry inside `[ ]` may carry `val`/`var`; or the name-based
-/// `val a, var n: T = prop` inside `( )`, where each name reads the property it
-/// names, or the one written after `=`.
+/// The entries of a destructuring group up to and including `close`: positional
+/// `a, b: T, _`, each name reading `componentN`, with `val`/`var` allowed inside
+/// `[ ]`; or name-based `val a, var n: T = prop` inside `( )`, each name reading
+/// the property it names or the one after `=`.
 pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what: []const u8) ?DestructEntries {
     var names: std.ArrayList(Ident) = .empty;
     var sources: std.ArrayList(Ident) = .empty;
-    // Under `+NameBasedDestructuring` the parenthesized short form binds
-    // by name too (`(a, b = prop)`); `[a, b]` is the positional form.
+    // Under `+NameBasedDestructuring` the parenthesized short form binds by
+    // name too; `[a, b]` stays positional.
     var by_name = !positional and root.language.name_based_short_form;
     var any_var = false;
     while (true) {
@@ -363,11 +346,7 @@ pub fn parseFor(p: *Parser) ?Expr {
     const kw = support.bump(p);
     _ = support.expect(p, .LParen, "`(`") orelse return null;
     support.skipNl(p);
-    // `{annotation} (variableDeclaration | multiVariableDeclaration)`. An
-    // annotation on the iteration variable is consumed syntactically.
     _ = parseAnnotations(p);
-    // Destructuring: `for ((a, b) in iter)`, `for ([a, b] in iter)`, or the
-    // name-based `for ((val k, val v) in iter)`. Plain: `for (x in iter)`.
     var vars: []Ident = undefined;
     var for_by_name = false;
     var var_sources: []Ident = &.{};
@@ -436,9 +415,8 @@ pub fn parseReturn(p: *Parser) ?Expr {
     } };
 }
 
-/// `label@ <expr>` at expression position. The label name is a bare identifier
-/// and the `@` may be `AtNoWs` (`foo@`) or `AtPostWs` (`foo@ for(...)`),
-/// matching the grammar's `simpleIdentifier (AT_NO_WS | AT_POST_WS)`.
+/// The `@` may be `AtNoWs` (`foo@`) or `AtPostWs` (`foo@ for(...)`), matching
+/// `simpleIdentifier (AT_NO_WS | AT_POST_WS)`.
 pub fn tryParseLabelBinding(p: *Parser) ?Expr {
     if (std.meta.activeTag(support.peekKind(p).*) != .Ident) {
         return null;
@@ -467,15 +445,14 @@ pub fn tryParseLabelBinding(p: *Parser) ?Expr {
     } };
 }
 
-/// Parse the body of a `label@ <body>` binding, re-entering the prefix rung so
-/// the labeled expression still captures call chains and trailing lambdas.
+/// Re-enters the prefix rung, so the labeled expression still captures call
+/// chains and trailing lambdas.
 pub fn parseUnaryForLabel(p: *Parser) ?Expr {
     return parsePrefix(p);
 }
 
-/// After a `return` / `break` / `continue` keyword, consume an optional
-/// `@label` suffix. The lexer emits `AtNoWs` when the `@` attaches directly to
-/// the keyword (`return@foo`), and only that shape is accepted.
+/// The lexer emits `AtNoWs` when the `@` attaches directly to the keyword
+/// (`return@foo`), and only that shape is accepted.
 pub fn consumeJumpLabel(p: *Parser) ?Ident {
     if (std.meta.activeTag(support.peekKind(p).*) != .AtNoWs) {
         return null;
@@ -603,9 +580,8 @@ const WhenBindingResult = struct {
 };
 
 /// Look ahead inside `when (` for the `{annotation}* val name (: Ty)? =` shape
-/// that introduces a subject-bound variable. On a match the binding and subject
-/// expression are parsed; otherwise the cursor is left where it was so the
-/// caller falls back to a bare subject.
+/// of a subject-bound variable. On a match the binding and subject are parsed;
+/// otherwise the cursor is left for the caller's bare-subject path.
 pub fn tryParseWhenBinding(p: *Parser) ?WhenBindingResult {
     const save = p.pos;
     const annotations = parseAnnotations(p);
@@ -618,7 +594,6 @@ pub fn tryParseWhenBinding(p: *Parser) ?WhenBindingResult {
         p.pos = save;
         return null;
     }
-    // Peek further: val NAME (':' …)? '='
     var i = p.pos + 1;
     while (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Newline) {
         i += 1;
@@ -627,16 +602,14 @@ pub fn tryParseWhenBinding(p: *Parser) ?WhenBindingResult {
         p.pos = save;
         return null;
     }
-    // Skip past the name and optional `: Type` to look for `=`.
     var j = i + 1;
     while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) {
         j += 1;
     }
     const next_j = if (j < p.tokens.len) std.meta.activeTag(p.tokens[j].kind) else .Eof;
     if (next_j == .Colon) {
-        // A type follows, and scanning past an arbitrary type for `=` cannot be
-        // decided here, so commit and let the recovery path report an
-        // ill-formed binding.
+        // Scanning past an arbitrary type for `=` cannot be decided here, so
+        // commit and let recovery report an ill-formed binding.
     } else if (next_j != .Eq) {
         p.pos = save;
         return null;
@@ -686,8 +659,6 @@ pub fn parseWhenBranch(p: *Parser, has_subject: bool) ?WhenBranch {
     support.skipNl(p);
     _ = support.expect(p, .Arrow, "`->`") orelse return null;
     support.skipNl(p);
-    // Branch bodies are control-structure bodies: an assignment statement
-    // (`sum += item`) is allowed alongside expressions.
     const body = parseControlStructureBody(p) orelse return null;
     const sp = start.join(body.span());
     return WhenBranch{
@@ -699,7 +670,6 @@ pub fn parseWhenBranch(p: *Parser, has_subject: bool) ?WhenBranch {
 
 pub fn parseWhenPattern(p: *Parser, has_subject: bool) ?WhenPattern {
     const start = support.currentSpan(p);
-    // `else` is always valid as a pattern.
     const at_else = switch (support.peekKind(p).*) {
         .Keyword => |k| k == .Else,
         else => false,
@@ -711,10 +681,8 @@ pub fn parseWhenPattern(p: *Parser, has_subject: bool) ?WhenPattern {
             .span = tok.span,
         };
     }
-    // A subject-bound `when` accepts `is Type`, `!is Type`, `in expr` and
-    // `!in expr`. A subject-free `when` takes Boolean conditions only, but the
-    // keyword forms still parse and the interpreter rejects them, which keeps
-    // recovery simple.
+    // A subject-free `when` takes Boolean conditions only, but the keyword forms
+    // still parse and the interpreter rejects them, which keeps recovery simple.
     if (has_subject) {
         switch (support.peekKind(p).*) {
             .Keyword => |k| switch (k) {
@@ -785,13 +753,11 @@ pub fn parseWhenPattern(p: *Parser, has_subject: bool) ?WhenPattern {
 }
 
 pub fn parseLambdaLiteral(p: *Parser) ?Expr {
-    // At `{`: an optional `params ->` header, then a statement list.
     const lbrace = support.bump(p);
     var header = parseLambdaHeader(p);
-    // A header-less lambda (`{ ... }`) gets the implicit single `it` parameter,
-    // exactly as a trailing lambda does; otherwise a non-trailing lambda
-    // argument (`f({ it.x }, y)`) loses both its `it` and the arity-0
-    // receiver-lambda treatment.
+    // A header-less lambda gets the implicit `it`, as a trailing lambda does;
+    // otherwise a non-trailing `f({ it.x }, y)` loses both its `it` and the
+    // arity-0 receiver-lambda treatment.
     var implicit_it = false;
     if (header.params.len == 0) {
         implicit_it = true;
@@ -833,7 +799,6 @@ pub fn parseLambdaLiteral(p: *Parser) ?Expr {
 }
 
 pub fn parseTrailingLambda(p: *Parser) ?Expr {
-    // Same shape; if no `->` is present, default to a single `it` param.
     const lbrace = support.bump(p);
     var header = parseLambdaHeader(p);
     var implicit_it = false;
@@ -876,15 +841,11 @@ pub fn parseTrailingLambda(p: *Parser) ?Expr {
     return Expr{ .Lambda = .{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp, .implicit_it = implicit_it } };
 }
 
-/// Whether the `{ ... }` at the cursor carries a `params ->` header: true iff
-/// an `Arrow` occurs at the lambda's own nesting level (depth 0) before its
-/// closing `}`. Nested lambdas, function types and `when` arrows sit deeper and
-/// are ignored. Non-mutating.
-///
-/// A depth-0 `->` that belongs to a function type does not count. The
-/// unambiguous signal is an `as` / `as?` at depth 0 before the arrow: a lambda
-/// parameter list never contains `as`, so `{ x as () -> T; ... }` is a block
-/// whose first statement casts `x` to a function type.
+/// Whether the `{ ... }` at the cursor carries a `params ->` header: true iff an
+/// `Arrow` sits at the lambda's own nesting level before its closing `}`.
+/// Non-mutating. A depth-0 `->` belonging to a function type does not count,
+/// and the signal for that is an `as` / `as?` at depth 0 before the arrow, since
+/// a parameter list never contains `as`.
 pub fn lambdaHasHeader(p: *const Parser) bool {
     var depth: i32 = 0;
     var i = p.pos;
@@ -892,11 +853,9 @@ pub fn lambdaHasHeader(p: *const Parser) bool {
         switch (p.tokens[i].kind) {
             .Arrow => if (depth == 0) return true,
             // A declaration keyword, `=` or `;` at the brace's top level before
-            // any header `->` makes these braces a block body: none can appear
-            // in a lambda parameter list. This guards an arrow belonging to a
-            // function-TYPE annotation (`{ val u: (Int) -> Unit = { }; ... }`),
-            // whose `(Int)` parens close before the arrow and drop it to depth
-            // 0, where it would otherwise read as a header arrow.
+            // any header `->` makes these braces a block body. This guards an
+            // arrow from a function-TYPE annotation (`{ val u: (Int) -> Unit =
+            // { }; ... }`), whose parens close before the arrow.
             .Keyword => |kw| if (depth == 0) switch (kw) {
                 .As, .Val, .Var, .Fun => return false,
                 else => {},
@@ -923,34 +882,28 @@ pub fn lambdaHasHeader(p: *const Parser) bool {
 
 const LambdaHeader = struct {
     params: []Ident,
-    /// Declared type annotations aligned with `params` (`null` per
-    /// unannotated slot); empty when no header was parsed.
+    /// Aligned with `params`, `null` per unannotated slot; empty when no header was parsed.
     param_tys: []?TypeRef = &.{},
     dest_stmts: []Stmt,
 };
 
-/// Read the optional `params ->` header of a `{ ... }` lambda. Returns the
-/// parameter list, empty when no `->` is present, plus the destructuring
-/// statements the caller prepends to the body: one `val (a, b, ...) =
-/// $$dest_<i>` per destructured slot.
+/// Returns the parameter list, empty when there is no `->`, plus one
+/// `val (a, b) = $$dest_<i>` statement per destructured slot for the caller to
+/// prepend to the body.
 pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
     const empty = LambdaHeader{ .params = &.{}, .param_tys = &.{}, .dest_stmts = &.{} };
     const save = p.pos;
     support.skipNl(p);
-    // Empty `{ -> ... }` form: arrow at front, no params.
     if (std.meta.activeTag(support.peekKind(p).*) == .Arrow) {
         _ = support.bump(p);
         return empty;
     }
-    // A header exists only when a `->` appears at the lambda's top level before
-    // its closing `}`. Without the guard a body opening with `(`, such as
+    // Without this guard a body opening with `(`, such as
     // `{ ((if (c) a else b) + x) }`, is misparsed as a destructuring parameter
     // list, emitting diagnostics that backtracking cannot unwind.
     if (!lambdaHasHeader(p)) {
         return empty;
     }
-    // `(ident (: Type)?, …)` destructured param OR
-    // `ident (: Type)?, ident (: Type)?, … ->`
     const at_param_start = switch (support.peekKind(p).*) {
         .Ident, .LParen, .LBracket => true,
         else => false,
@@ -999,8 +952,8 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                     const sp = lparen.span.join(rparen.span);
                     const outer = std.fmt.allocPrint(p.allocator, "$$dest_{d}", .{local.items.len}) catch @panic("OOM in parser");
                     local.append(p.allocator, .{ .name = outer, .span = sp }) catch @panic("OOM in parser");
-                    // A destructuring lambda parameter may carry a type
-                    // annotation on the group: `{ (a, b): Pair<A, B> -> ... }`.
+                    // A destructuring parameter may annotate the whole group:
+                    // `{ (a, b): Pair<A, B> -> ... }`.
                     var dest_ty: ?TypeRef = null;
                     support.skipNl(p);
                     if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
@@ -1053,8 +1006,6 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                 .dest_stmts = dest_stmts.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
             };
         }
-        // No arrow: the idents consumed above are body expression tokens, so
-        // rewind for `parseStmt`.
         p.pos = save;
     }
     return empty;

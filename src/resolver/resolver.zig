@@ -1,9 +1,7 @@
-//! Name resolution.
-//!
-//! Walks a parsed `KotlinFile` into a side table mapping every name-use site
-//! (`Span`) to the declaration it refers to. Top-level functions and properties
-//! are forward-declared, so a use may precede its declaration. Builtins such as
-//! `println` and `print` resolve to `Symbol.Builtin` with no declaration site.
+//! Name resolution: walks a parsed `KotlinFile` into a side table mapping every
+//! name-use `Span` to the declaration it refers to. Top-level functions and
+//! properties are forward-declared, so a use may precede its declaration;
+//! builtins such as `println` resolve to `Symbol.Builtin` with no declaration.
 
 const std = @import("std");
 
@@ -29,7 +27,6 @@ const Property = ast.Property;
 const Stmt = ast.Stmt;
 const StringPart = ast.StringPart;
 
-/// Stable identifier for a resolver-tracked symbol.
 pub const SymbolId = enum(u32) {
     _,
     pub fn from(v: u32) SymbolId {
@@ -47,12 +44,9 @@ pub const SymbolKind = enum {
     LocalProperty,
     Parameter,
     ForVar,
-    /// An interpreter-provided builtin such as `println` or `print`.
     Builtin,
     Class,
-    /// A `typealias`. Aliases are transparent at use sites; the distinct kind
-    /// lets typeck recognize them when lowering type references and at call
-    /// sites that construct through the underlying class.
+    /// Its own kind, so typeck recognizes an alias at type and call sites.
     TypeAlias,
 };
 
@@ -62,8 +56,6 @@ pub const Symbol = struct {
     kind: SymbolKind,
     /// Source span of the declaration. `null` for builtins.
     decl_span: ?Span,
-    /// Whether the declared type is nullable (`T?`); `null` when the resolver
-    /// cannot tell (no annotation, inference deferred).
     nullable: ?bool,
 };
 
@@ -82,19 +74,13 @@ pub const ScopeKind = enum {
     File,
     Function,
     Block,
-    /// Class or object body: a declaration scope holding every member name.
-    /// A name that resolves neither here nor in an enclosing scope is not an
-    /// R0001 error, since it may be inherited or looked up on `this`.
+    /// A name unresolved here and in enclosing scopes is not an R0001 error.
     ClassBody,
-    /// A scope that may carry an implicit receiver the resolver cannot see
-    /// lexically: a lambda body (`"hi".apply { length }`), an extension
-    /// function, an extension property accessor. Bare names that do not resolve
-    /// lexically defer to typeck's member resolution, as in `ClassBody`.
+    /// A scope whose implicit receiver is not lexically visible (lambda body,
+    /// extension function or accessor); bare names defer to typeck.
     ImplicitReceiver,
 };
 
-/// Lexical scope tree. Every scope but the file scope has a parent, plus a
-/// kind tag for diagnostics and a flat name table.
 pub const Scope = struct {
     id: ScopeId,
     parent: ?ScopeId,
@@ -102,16 +88,12 @@ pub const Scope = struct {
     bindings: std.StringHashMap(SymbolId),
 };
 
-/// Output of name resolution. Every container and string here comes from the
-/// driver-owned arena passed to `resolve`/`resolveModule`, freed by the driver
-/// once typeck and lowering are done, so resolution has no teardown of its own.
+/// Every container and string comes from the driver-owned arena; nothing is freed.
 pub const Resolution = struct {
     scopes: std.ArrayList(Scope),
     symbols: std.ArrayList(Symbol),
-    /// Maps a name-use span to the symbol it resolves to.
     uses: std.AutoHashMap(Span, SymbolId),
-    /// Declaration spans referenced by at least one use site: a reverse index
-    /// that answers declaration-use questions without scanning `uses`.
+    /// Reverse index: declaration spans with at least one use site.
     referenced_decls: std.AutoHashMap(Span, void),
     diagnostics: DiagnosticSink,
 
@@ -129,9 +111,8 @@ pub const Resolution = struct {
     }
 };
 
-/// Package roots a fully-qualified reference can start with. The interpreter
-/// resolves such paths against its native symbol tables, so `<root>.x.y` is
-/// qualified rather than a use of a lexical binding named `<root>`.
+/// Package roots a qualified reference can start with: `<root>.x.y` is
+/// qualified, not a use of a binding named `<root>`.
 fn isPackageRoot(name: []const u8) bool {
     return std.mem.eql(u8, name, "kotlin") or std.mem.eql(u8, name, "kotlinx") or
         std.mem.eql(u8, name, "java");
@@ -147,15 +128,12 @@ const BUILTINS = [_][]const u8{
     "require",
     "repeat",
     "contract",
-    // Threads and monitors. `synchronized` is in `kotlin`, `thread` in
-    // `kotlin.concurrent`, and `Thread`'s statics (`Thread.sleep`) are written
-    // bare, so all three resolve through the builtins scope either way.
+    // Threads and monitors, written bare and so reached through the builtins scope.
     "synchronized",
     "thread",
     "Thread",
-    // Builder-style inference entry points: typeck threads the lambda body
-    // through `check_builder_call`, so member references on the implicit
-    // receiver (`add`, `put`) resolve through the receiver's class table.
+    // Builder-inference entry points: typeck threads the lambda body through
+    // `check_builder_call`, so `add` / `put` resolve on the receiver.
     "buildList",
     "buildMap",
     "buildSet",
@@ -163,10 +141,7 @@ const BUILTINS = [_][]const u8{
     "iterator",
 };
 
-/// Resolve a parsed file. The result always holds a builtins scope and a file
-/// scope, even for input with no declarations. `allocator` must be a
-/// driver-owned arena: every container and string comes from it and nothing is
-/// freed, so the driver reclaims the workspace by freeing that arena.
+/// `allocator` must be a driver-owned arena, since nothing is freed.
 pub fn resolve(allocator: std.mem.Allocator, file: *const KotlinFile) !Resolution {
     var r = try Resolver.init(allocator);
     try r.run(file);
@@ -179,19 +154,16 @@ pub fn resolve(allocator: std.mem.Allocator, file: *const KotlinFile) !Resolutio
     };
 }
 
-/// Resolve a multi-file module. Top-level declarations are package-qualified:
-/// files sharing a `package` header declare into one package scope, so a
-/// redeclaration is flagged only within a package and two packages may each
-/// declare `class Config`. Cross-package references resolve through a tolerant
-/// shared module scope, while each file's imports apply only inside its own
-/// decls. Use-spans stay distinguishable by the `FileId` on each `Span`.
+/// Files sharing a `package` header declare into one package scope, so a
+/// redeclaration is flagged only within a package. Cross-package references
+/// resolve through a tolerant shared module scope, and each file's imports apply
+/// only inside its own decls.
 pub fn resolveModule(allocator: std.mem.Allocator, files: []const KotlinFile) !Resolution {
     return resolveModuleWithNatives(allocator, files, &.{});
 }
 
-/// `resolveModule` plus natively implemented symbols (installed pack bindings
-/// such as `kotlinx.coroutines.runBlocking`). Each FQN's leaf name is bound in
-/// the builtins scope so a bare use of a native entry point resolves.
+/// Each native FQN's leaf name is bound in the builtins scope, so a bare use
+/// resolves.
 pub fn resolveModuleWithNatives(
     allocator: std.mem.Allocator,
     files: []const KotlinFile,
@@ -209,9 +181,8 @@ pub fn resolveModuleWithNatives(
     const module_scope = try r.pushScope(builtins, .File);
     var pkg_scopes = std.StringHashMap(ScopeId).init(allocator);
     defer pkg_scopes.deinit();
-    // Phase 1: forward-declare every file's top-level decls into its package
-    // scope (redeclaration detection is per package), then mirror the binding
-    // into the shared module scope without diagnostics, for cross-package uses.
+    // Phase 1: forward-declare each file's top-level decls into its package scope,
+    // then mirror them into the module scope without diagnostics.
     for (files) |*file| {
         try r.setFilePackage(file);
         const pkg_scope = blk: {
@@ -224,9 +195,8 @@ pub fn resolveModuleWithNatives(
             try r.mirrorModuleBinding(module_scope, pkg_scope, decl);
         }
     }
-    // Phase 2: per file, apply its imports in a fresh child of its package
-    // scope, then resolve decl bodies. Lookup walks file, package, module,
-    // builtins.
+    // Phase 2: apply each file's imports in a child of its package scope, then
+    // resolve bodies. Lookup walks file, package, module, builtins.
     for (files) |*file| {
         try r.setFilePackage(file);
         const pkg_scope = pkg_scopes.get(r.file_package orelse "").?;
@@ -267,14 +237,11 @@ const SigKey = struct {
 
 const SigKeyMap = std.HashMap(SigKey, void, SigKeyContext, std.hash_map.default_max_load_percentage);
 
-/// Error set shared by the mutually recursive walk methods. Naming it breaks
-/// the inferred-error-set loop across `resolveFunction`, `resolveBlock` and
-/// `resolveStmt`.
+/// Named explicitly to break the inferred-error-set loop across the walk methods.
 const ResolveError = error{OutOfMemory};
 
 const Resolver = struct {
-    /// Driver-owned arena: every container spine and string comes from it and
-    /// the resolver frees nothing.
+    /// Driver-owned arena; the resolver frees nothing.
     allocator: std.mem.Allocator,
     scopes: std.ArrayList(Scope),
     symbols: std.ArrayList(Symbol),
@@ -283,9 +250,8 @@ const Resolver = struct {
     diagnostics: DiagnosticSink,
     /// Dotted package name from the file's `package` header; set per file.
     file_package: ?[]const u8,
-    /// Signature keys of already-declared top-level functions, keyed by
-    /// `(scope, name, arity, param-type-names)`: overloads with distinct
-    /// signatures coexist while an exact duplicate is a redeclaration.
+    /// Keyed by `(scope, name, arity, param-type-names)`: distinct overloads
+    /// coexist, an exact duplicate is a redeclaration.
     fn_sig_keys: SigKeyMap,
 
     fn init(allocator: std.mem.Allocator) !Resolver {
@@ -307,7 +273,6 @@ const Resolver = struct {
         return r;
     }
 
-    /// Allocator for resolver-owned strings.
     fn strs(self: *Resolver) std.mem.Allocator {
         return self.allocator;
     }
@@ -334,8 +299,6 @@ const Resolver = struct {
             try self.declareTopLevel(file_scope, decl);
         }
 
-        // Imported names are in scope at use sites; bind any leaf a
-        // declaration didn't already claim.
         for (file.imports) |*imp| {
             try self.bindImportLeaf(file_scope, imp);
         }
@@ -354,14 +317,10 @@ const Resolver = struct {
         const own_pkg = self.file_package;
         const path_str = try joinPath(a, imp.path);
 
-        // Importing from the file's own package is legal and a no-op, since
-        // same-package entities are already visible.
         if (own_pkg) |own| {
             const same_package = if (imp.wildcard)
                 std.mem.eql(u8, path_str, own)
             else blk: {
-                // For a non-wildcard import the package is the path minus the
-                // trailing entity segment.
                 const prefix = try joinPath(a, imp.path[0 .. imp.path.len - 1]);
                 break :blk std.mem.eql(u8, prefix, own);
             };
@@ -369,10 +328,8 @@ const Resolver = struct {
         }
 
         if (!std.mem.eql(u8, imp.path[0].name, "kotlin")) {
-            // Non-`kotlin.*` import, permitted when a loaded pack registered
-            // the package (`kotlinx.coroutines`, `kotlinx.io`). The candidate
-            // package is the whole path for a wildcard, else the path minus the
-            // trailing entity segment.
+            // Non-`kotlin.*` import, permitted when a loaded pack registered the
+            // package. Wildcard takes the whole path, else drop the entity segment.
             const candidate_pkg = if (imp.wildcard)
                 path_str
             else if (imp.path.len >= 2)
@@ -396,15 +353,11 @@ const Resolver = struct {
             return;
         }
 
-        // Path starts with `kotlin`: validate the package portion against the
-        // implicitly imported packages.
         const candidate_pkg = if (imp.wildcard)
             path_str
         else if (imp.path.len >= 2)
             try joinPath(a, imp.path[0 .. imp.path.len - 1])
         else
-            // `import kotlin`: the whole path is the package, and it matches
-            // an implicitly imported one.
             path_str;
         if (!stdlib.isKnownPackage(candidate_pkg)) {
             const msg = try std.fmt.allocPrint(
@@ -423,12 +376,10 @@ const Resolver = struct {
     }
 
     fn declareTopLevel(self: *Resolver, scope: ScopeId, decl: *const Decl) !void {
-        // Extension functions are also bound by bare name as a tolerant
-        // fallback: inside a receiver-typed lambda the implicit receiver makes
-        // `launch { }` / `async { }` callable unqualified, and the resolver has
-        // no receiver-type information before typeck. Functions never conflict
-        // on name alone, so the bare binding is safe and keeps valid code from
-        // reporting UNRESOLVED_REFERENCE. Qualified `recv.ext()` is unaffected.
+        // Extension functions are also bound by bare name: inside a
+        // receiver-typed lambda `launch { }` is callable unqualified, and the
+        // resolver has no receiver type before typeck. Functions never conflict
+        // on name alone, so the extra binding is safe.
         switch (decl.*) {
             .Property => |p| {
                 if (p.receiver_type != null) return;
@@ -442,25 +393,20 @@ const Resolver = struct {
             .Object => |o| .{ o.name.name, .Class, o.name.span },
             .TypeAlias => |a| .{ a.name.name, .TypeAlias, a.name.span },
         };
-        // Kotlin lets top-level functions share a name (overloads) and lets a
-        // factory function share a name with a class (`fun CoroutineScope(...)`
-        // beside `interface CoroutineScope`). Only an exact duplicate signature
-        // is a redeclaration; the rest is settled by overload resolution.
+        // Overloads are legal and a factory function may share a class's name, so
+        // only an exact duplicate signature is a redeclaration.
         if (decl.* == .Function) {
             const f = decl.Function;
             var key_buf: std.ArrayList(u8) = .empty;
             try key_buf.print(self.strs(), "{s}#{d}", .{ name, f.params.len });
             for (f.params) |p| {
                 try key_buf.append(self.strs(), '|');
-                // A vararg parameter's type is the array of its element type
-                // (`vararg v: Int` is `IntArray`), so it never collides with a
-                // fixed parameter of the element type: `select(vararg values:
-                // Int)` and `select(value: Int)` are distinct overloads.
+                // A vararg's type is the array of its element type, so
+                // `select(vararg v: Int)` and `select(v: Int)` stay distinct.
                 if (p.is_vararg) try key_buf.append(self.strs(), '*');
                 try key_buf.appendSlice(self.strs(), p.ty.name.name);
             }
-            // Context parameters are part of the signature: two overloads that
-            // differ only in their context clause are distinct declarations.
+            // Two overloads differing only in their context clause are distinct.
             for (f.context_params) |cp| {
                 try key_buf.append(self.strs(), '^');
                 try key_buf.appendSlice(self.strs(), cp.ty.name.name);
@@ -492,8 +438,7 @@ const Resolver = struct {
             try self.scopes.items[scope.int()].bindings.put(name, id);
             return;
         }
-        // A non-function sharing a name with a function is the legal factory
-        // pattern: bind it without a conflict diagnostic.
+        // A non-function sharing a function's name is the legal factory pattern.
         const func_involved = blk: {
             if (self.scopes.items[scope.int()].bindings.get(name)) |id| {
                 break :blk self.symbols.items[id.int()].kind == .TopLevelFunction;
@@ -508,10 +453,8 @@ const Resolver = struct {
         _ = try self.declare(scope, name, kind, sp, false);
     }
 
-    /// Mirror a top-level binding from its package scope into the shared module
-    /// scope without diagnostics: that scope is the tolerant cross-package
-    /// fallback, never a redeclaration domain. First binding wins, so the
-    /// fallback is declaration-order stable.
+    /// No diagnostics: the module scope is the tolerant cross-package fallback,
+    /// and the first binding wins.
     fn mirrorModuleBinding(self: *Resolver, module_scope: ScopeId, pkg_scope: ScopeId, decl: *const Decl) !void {
         switch (decl.*) {
             .Property => |p| {
@@ -540,8 +483,8 @@ const Resolver = struct {
         sp: Span,
         allow_shadow: bool,
     ) !SymbolId {
-        // A duplicate in the same scope is an error at file scope; inner scopes
-        // permit redeclaration with a shadowing warning.
+        // A same-scope duplicate is an error at file scope, a shadowing warning
+        // inside.
         const existing = self.scopes.items[scope.int()].bindings.get(name);
         if (existing) |prev_id| {
             const prev_kind = self.scopes.items[scope.int()].kind;
@@ -560,7 +503,6 @@ const Resolver = struct {
                 }
                 try self.diagnostics.emit(self.allocator, d);
             } else if (allow_shadow) {
-                // Same-scope redeclaration in a block. Treat as shadow warning.
                 const msg = try std.fmt.allocPrint(
                     self.strs(),
                     "`{s}` shadows an earlier binding",
@@ -583,17 +525,13 @@ const Resolver = struct {
             .Class => |*c| try self.resolveClassBody(scope, c.primary_params, c.init_blocks, c.members),
             .Object => |*o| try self.resolveClassBody(scope, &.{}, o.init_blocks, o.members),
             .TypeAlias => {
-                // The alias target is resolved by typeck; a typealias body has
-                // no name-use sites to bind here.
+                // Typeck resolves the alias target; nothing to bind here.
             },
         }
     }
 
-    /// Walk a class or object body. The body is a declaration scope: every
-    /// member is visible to every other regardless of source order, so members
-    /// are pre-declared into a fresh class scope before the bodies are walked.
-    /// An unresolved bare name here is not an error; it may be an inherited
-    /// member or a `this.x` lookup the runtime resolves dynamically.
+    /// A declaration scope, so members are pre-declared before their bodies are
+    /// walked; an unresolved bare name here is not an error.
     fn resolveClassBody(
         self: *Resolver,
         parent: ScopeId,
@@ -635,9 +573,8 @@ const Resolver = struct {
         }
     }
 
-    /// Context parameters are in scope by name in the body, at the same level
-    /// as the value parameters. An anonymous `_` parameter resolves for context
-    /// lookup only and is not named.
+    /// Bound at the value-parameter scope level; an anonymous `_` resolves for
+    /// context lookup only.
     fn declareContextParams(self: *Resolver, scope: ScopeId, cps: []const ast.ContextParam) ResolveError!void {
         for (cps) |*cp| {
             if (std.mem.eql(u8, cp.name.name, "_")) continue;
@@ -701,18 +638,14 @@ const Resolver = struct {
             try self.pushScope(parent, .Block)
         else
             parent;
-        // Local functions are visible to sibling statements regardless of
-        // declaration order, so mutual recursion works: pre-declare every local
-        // `fun` name into the block scope before walking bodies. `val` / `var`
-        // keep their strict order-of-appearance binding.
+        // Local functions are visible to sibling statements regardless of order,
+        // so each local `fun` name is pre-declared before bodies are walked.
         for (block.stmts) |*s| {
             switch (s.*) {
                 .Decl => |d| switch (d) {
                     .Function => |f| {
                         _ = try self.declare(scope, f.name.name, .LocalFunction, f.name.span, true);
                     },
-                    // Local classes and objects are declarations too, binding
-                    // their name for the rest of the block.
                     .Class => |c| {
                         _ = try self.declare(scope, c.name.name, .Class, c.name.span, true);
                     },
@@ -734,7 +667,6 @@ const Resolver = struct {
             .Expr => |*e| try self.resolveExpr(scope, e),
             .Decl => |*d| switch (d.*) {
                 .Function => |*f| {
-                    // Name is pre-declared by `resolveBlock`; resolve body.
                     try self.resolveFunction(scope, f);
                 },
                 .Property => |p| {
@@ -748,8 +680,7 @@ const Resolver = struct {
                 },
                 .Class, .Object => {},
                 .TypeAlias => |*a| {
-                    // Declare the local typealias name so typeck can flag
-                    // T0039; its target has no name-use sites to track.
+                    // Declare the name so typeck can flag T0039.
                     _ = try self.declare(scope, a.name.name, .TypeAlias, a.name.span, true);
                 },
             },
@@ -784,11 +715,8 @@ const Resolver = struct {
             .Path => |p| {
                 if (p.segments.len > 0) {
                     const first = p.segments[0];
-                    // A path headed by a package root (`kotlin.math.abs`,
-                    // `kotlinx.coroutines.delay`) is a fully-qualified
-                    // reference, not a use of a binding named `kotlin`, unless
-                    // something local shadows the head. A dotted head also
-                    // arrives here as a single-segment receiver.
+                    // A path headed by a package root (`kotlin.math.abs`) is
+                    // fully qualified, unless something local shadows the head.
                     if (isPackageRoot(first.name) and self.lookup(scope, first.name) == null) {
                         return;
                     }
@@ -879,15 +807,13 @@ const Resolver = struct {
                 try self.resolveBlock(lam_scope, &lam.body, false);
             },
             .This, .Super => {
-                // No resolver diagnostic: the interpreter checks at evaluation
-                // time whether `this` / `super` is bound.
+                // The interpreter checks at evaluation time whether `this` is bound.
             },
             .When => |w| {
                 if (w.subject) |s| {
                     try self.resolveExpr(scope, s);
                 }
-                // `when (val v = subject)` binds `v` for the patterns and the
-                // branch bodies.
+                // `when (val v = subject)` binds `v` for the patterns and bodies.
                 var branch_scope = scope;
                 if (w.subject_binding) |b| {
                     branch_scope = try self.pushScope(scope, .Block);
@@ -922,8 +848,7 @@ const Resolver = struct {
                 }
             },
             .PropertyRef => {
-                // `::name` is resolved by the interpreter as a lightweight
-                // metadata value, so there is no name use to record here.
+                // `::name` is a runtime metadata value; no name use to record.
             },
             .MemberRef => |mr| {
                 try self.resolveExpr(scope, mr.receiver);
@@ -942,9 +867,8 @@ const Resolver = struct {
                         try self.resolveExpr(scope, d);
                     }
                 }
-                // An object literal body is a declaration scope: pre-declare
-                // every member name into a fresh scope, then walk the bodies
-                // against it.
+                // A declaration scope: pre-declare the member names, then walk
+                // the bodies against them.
                 const body_scope = try self.pushScope(scope, .Block);
                 for (oe.members) |*m| {
                     const name: []const u8, const kind: SymbolKind, const sp: Span = switch (m.*) {
@@ -993,10 +917,8 @@ const Resolver = struct {
         }
     }
 
-    /// `UNNECESSARY_SAFE_CALL`: `s?.x` on a known-non-nullable receiver is a
-    /// Kotlin warning. Flagged only for a single-identifier receiver whose
-    /// binding carries an explicit non-nullable type, which keeps the check
-    /// free of false positives.
+    /// `UNNECESSARY_SAFE_CALL`: `s?.x` on a known-non-nullable receiver, flagged
+    /// only for a single-identifier receiver with an explicit non-nullable type.
     fn checkUnnecessarySafeCall(self: *Resolver, scope: ScopeId, receiver: *const Expr, op_span: Span) !void {
         const segments = switch (receiver.*) {
             .Path => |p| p.segments,
@@ -1028,9 +950,7 @@ const Resolver = struct {
                 try self.referenced_decls.put(decl_span, {});
             }
         } else if (self.isInsideClassBody(scope)) {
-            // Inside a class or object body the name may be an inherited member
-            // or a dynamic `this`-receiver lookup; defer to the interpreter
-            // instead of raising R0001.
+            // The name may be inherited or a dynamic `this` lookup, so defer.
         } else {
             const msg = try std.fmt.allocPrint(
                 self.strs(),
@@ -1095,9 +1015,7 @@ const Resolver = struct {
         return id;
     }
 
-    /// Bind the leaf of a non-wildcard import (or its `as` alias) so use sites
-    /// of an explicitly imported stdlib value resolve. Only fills a name that
-    /// nothing else binds, so a same-named local or top-level declaration wins.
+    /// Only fills a name nothing else binds, so a same-named declaration wins.
     fn bindImportLeaf(self: *Resolver, scope: ScopeId, imp: *const ImportDecl) !void {
         if (imp.wildcard or imp.path.len == 0) return;
         const leaf = if (imp.alias) |a| a.name else imp.path[imp.path.len - 1].name;
@@ -1118,9 +1036,7 @@ fn joinPath(allocator: std.mem.Allocator, path: []const ast.Ident) ![]const u8 {
     return buf.toOwnedSlice(allocator);
 }
 
-// The resolver's dependency graph excludes the lexer and parser, so the tests
-// build the `KotlinFile` AST directly with small helpers rather than parsing
-// source text.
+// The resolver excludes the lexer and parser, so the tests build the AST directly.
 
 const testing = std.testing;
 const test_file = span.FileId.from(0);
@@ -1264,8 +1180,7 @@ fn mkClass(name: []const u8, members: []Decl) ast.Class {
     };
 }
 
-/// Collect factory names and legacy codes from each diagnostic so tests can
-/// assert against either identifier.
+/// Factory names and legacy codes per diagnostic, so tests assert on either.
 fn codes(allocator: std.mem.Allocator, r: *const Resolution) !std.ArrayList([]const u8) {
     var out: std.ArrayList([]const u8) = .empty;
     for (r.diagnostics.diags()) |d| {
@@ -1302,8 +1217,7 @@ fn anyUseOfKind(r: *const Resolution, kind: SymbolKind) bool {
 
 test "resolves forward reference between top level funs" {
     const a = testing.allocator;
-    // fun main() { greet() }
-    // fun greet() { println("hi") }
+    // fun main() { greet() }; fun greet() { println("hi") }
     var greet_callee = pathExpr("greet");
     defer a.free(greet_callee.Path.segments);
     const greet_call = callExpr(&greet_callee, &.{});
@@ -1375,8 +1289,7 @@ test "unresolved identifier emits r0001" {
 
 test "non kotlin import emits r0003" {
     const a = testing.allocator;
-    // import com.example.Thing
-    // fun main() {}
+    // import com.example.Thing; fun main() {}
     var imp_path = [_]ast.Ident{ ident("com"), ident("example"), ident("Thing") };
     var imports = [_]ImportDecl{.{ .path = &imp_path, .alias = null, .wildcard = false, .span = ts() }};
     var main_fn = emptyFn("main");
@@ -1394,8 +1307,7 @@ test "non kotlin import emits r0003" {
 
 test "kotlin import is accepted" {
     const a = testing.allocator;
-    // import kotlin.math.PI
-    // fun main() {}
+    // import kotlin.math.PI; fun main() {}
     var imp_path = [_]ast.Ident{ ident("kotlin"), ident("math"), ident("PI") };
     var imports = [_]ImportDecl{.{ .path = &imp_path, .alias = null, .wildcard = false, .span = ts() }};
     var main_fn = emptyFn("main");
@@ -1413,8 +1325,7 @@ test "kotlin import is accepted" {
 
 test "duplicate top level emits r0004" {
     const a = testing.allocator;
-    // fun foo() {}
-    // fun foo() {}
+    // fun foo() {} twice
     var foo1 = emptyFn("foo");
     foo1.body = .{ .Block = .{ .stmts = &.{}, .span = ts() } };
     var foo2 = emptyFn("foo");
@@ -1432,8 +1343,7 @@ test "duplicate top level emits r0004" {
 
 test "module: cross-package same simple names are not redeclarations" {
     const a = testing.allocator;
-    // package liba: class Config; fun setup() {}
-    // package appb: class Config; fun setup() {}
+    // package liba: class Config; fun setup() {} / package appb: the same names
     var lib_setup = emptyFn("setup");
     lib_setup.body = .{ .Block = .{ .stmts = &.{}, .span = ts() } };
     var app_setup = emptyFn("setup");
@@ -1481,8 +1391,7 @@ test "module: same-package duplicate across files is a redeclaration" {
 
 test "module: cross-package reference resolves through the module scope" {
     const a = testing.allocator;
-    // package liba: fun helper() {}
-    // (no package): fun main() { helper() }
+    // package liba: fun helper() {} / no package: fun main() { helper() }
     var helper = emptyFn("helper");
     helper.body = .{ .Block = .{ .stmts = &.{}, .span = ts() } };
     var lib_decls = [_]Decl{.{ .Function = helper }};
@@ -1511,11 +1420,7 @@ test "module: cross-package reference resolves through the module scope" {
 
 test "shadowing in inner scope emits r0002" {
     const a = testing.allocator;
-    // fun main() {
-    //     val x = 1
-    //     val x = 2
-    //     println(x)
-    // }
+    // fun main() { val x = 1; val x = 2; println(x) }
     var x1 = emptyProp(false, "x");
     x1.init = .{ .IntLit = .{ .value = 1, .kind = .Int, .span = ts() } };
     var x2 = emptyProp(false, "x");
@@ -1548,9 +1453,7 @@ test "shadowing in inner scope emits r0002" {
 
 test "for loop variable is resolvable in body" {
     const a = testing.allocator;
-    // fun main() {
-    //     for (i in 1..3) { println(i) }
-    // }
+    // fun main() { for (i in 1..3) { println(i) } }
     var one = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = ts() } };
     var three = Expr{ .IntLit = .{ .value = 3, .kind = .Int, .span = ts() } };
     var range = Expr{ .Binary = .{ .op = .Range, .lhs = &one, .rhs = &three, .span = ts() } };
@@ -1607,9 +1510,7 @@ test "function parameter resolves inside body" {
 
 test "mutual recursion resolves" {
     const a = testing.allocator;
-    // fun even(n: Int): Boolean = if (n == 0) true else odd(n - 1)
-    // fun odd(n: Int): Boolean = if (n == 0) false else even(n - 1)
-    // even body
+    // fun even(n: Int) = if (n == 0) true else odd(n - 1), and odd its mirror.
     var even_n = pathExpr("n");
     defer a.free(even_n.Path.segments);
     var even_zero = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = ts() } };
@@ -1664,10 +1565,7 @@ test "mutual recursion resolves" {
 
 test "unnecessary safe call on non nullable" {
     const a = testing.allocator;
-    // fun main() {
-    //     val s: String = "hi"
-    //     val n = s?.length
-    // }
+    // fun main() { val s: String = "hi"; val n = s?.length }
     var str_parts = [_]StringPart{.{ .Text = "hi" }};
     var s_prop = emptyProp(false, "s");
     s_prop.ty = typeRef("String", false);
@@ -1701,10 +1599,7 @@ test "unnecessary safe call on non nullable" {
 
 test "safe call on nullable is silent" {
     const a = testing.allocator;
-    // fun main() {
-    //     val s: String? = null
-    //     val n = s?.length
-    // }
+    // fun main() { val s: String? = null; val n = s?.length }
     var s_prop = emptyProp(false, "s");
     s_prop.ty = typeRef("String", true);
     s_prop.init = .{ .NullLit = .{ .span = ts() } };
@@ -1737,11 +1632,7 @@ test "safe call on nullable is silent" {
 
 test "class member sibling reference resolves" {
     const a = testing.allocator;
-    // class C {
-    //     fun a(): Int = b() + 1
-    //     fun b(): Int = 10
-    // }
-    // fun main() { println(C().a()) }
+    // class C { fun a(): Int = b() + 1; fun b(): Int = 10 } fun main() { println(C().a()) }
     var b_callee = pathExpr("b");
     defer a.free(b_callee.Path.segments);
     var b_call = callExpr(&b_callee, &.{});
@@ -1789,10 +1680,7 @@ test "class member sibling reference resolves" {
 
 test "forward reference to local val in statement scope errors" {
     const a = testing.allocator;
-    // fun main() {
-    //     println(x)
-    //     val x = 1
-    // }
+    // fun main() { println(x); val x = 1 }
     var println_callee = pathExpr("println");
     defer a.free(println_callee.Path.segments);
     const x_use = pathExpr("x");
@@ -1822,14 +1710,8 @@ test "forward reference to local val in statement scope errors" {
 
 test "object literal member forward reference resolves" {
     const a = testing.allocator;
-    // interface Greeter { fun hello(): String }
-    // fun main() {
-    //     val g = object : Greeter {
-    //         override fun hello() = name
-    //         val name = "world"
-    //     }
-    //     println(g.hello())
-    // }
+    // interface Greeter { fun hello(): String }; fun main() { val g = object :
+    // Greeter { override fun hello() = name; val name = "world" }; g.hello() }
     var hello_abstract = emptyFn("hello");
     hello_abstract.return_type = typeRef("String", false);
     var greeter_members = [_]Decl{.{ .Function = hello_abstract }};
@@ -1899,10 +1781,7 @@ test "object literal member forward reference resolves" {
 
 test "safe call without annotation is silent" {
     const a = testing.allocator;
-    // fun main() {
-    //     val s = "hi"
-    //     val n = s?.length
-    // }
+    // fun main() { val s = "hi"; val n = s?.length }
     var str_parts = [_]StringPart{.{ .Text = "hi" }};
     var s_prop = emptyProp(false, "s");
     s_prop.init = .{ .StringTemplate = .{ .parts = &str_parts, .span = ts() } };

@@ -1,11 +1,8 @@
 //! Kotlin type-constraint system: inference variables, per-variable bound sets
 //! carrying the implicit `Nothing <: α <: Any?` bounds, a constraint pool, and
-//! reduction plus incorporation passes driven to a fixpoint. The solver picks a
-//! substitution per variable from the pull-up / push-down preference and the
-//! GLB/LUB routing.
-//!
-//! Consumed by the type checker for call-site type-argument inference, by branch
-//! joins for LUB, and by smart-cast composition for GLB (intersection).
+//! reduction plus incorporation driven to a fixpoint. The solver substitutes per
+//! variable from the pull-up / push-down preference and the GLB/LUB routing.
+//! Used for call-site inference, branch-join LUB and smart-cast GLB.
 
 const std = @import("std");
 const span = @import("span");
@@ -17,9 +14,7 @@ const Variance = types.Variance;
 const GenericArg = types.GenericArg;
 const Span = span.Span;
 
-/// Fresh inference variable identity. Distinct from `Type.TypeParam`, which
-/// models a fixed type variable: unknown but immutable inside the body of a
-/// generic declaration.
+/// Distinct from `Type.TypeParam`, which is a fixed type variable.
 pub const InferenceVar = enum(u32) {
     _,
 
@@ -32,8 +27,8 @@ pub const InferenceVar = enum(u32) {
     }
 };
 
-/// Pull-up (largest, LUB of lower bounds) or push-down (smallest, GLB of upper
-/// bounds) preference on an inference variable. Variables default to pull-up.
+/// Pull-up takes the LUB of the lower bounds, push-down the GLB of the upper
+/// bounds; variables default to pull-up.
 pub const SolutionPreference = enum {
     PullUp,
     PushDown,
@@ -41,22 +36,15 @@ pub const SolutionPreference = enum {
     pub const default: SolutionPreference = .PullUp;
 };
 
-/// A variable that cannot be fixed in the active stage because its resolution
-/// depends on something else: a lambda body not yet type-checked, a callable
-/// reference whose overload needs the expected type, a `@BuilderInference`
-/// receiver. Staged fixation skips postponed vars; the typechecker re-runs the
-/// surrounding lambda body once the gating variable resolves and feeds the
-/// resulting constraints back.
+/// A variable that cannot be fixed in the active stage: a lambda body not yet
+/// type-checked, a callable reference awaiting an expected type, a
+/// `@BuilderInference` receiver. Staged fixation skips it; the typechecker
+/// re-runs the lambda body once the gate clears and feeds constraints back.
 pub const PostponedKind = union(enum) {
-    /// Lambda whose receiver and parameter types, or whose body, cannot be
-    /// checked until `gating` resolves.
     Lambda: struct { gating: InferenceVar },
-    /// `::name` whose overload resolution awaits an expected type.
     CallableRef,
-    /// `@BuilderInference` receiver: the body must be re-typed under the fixed
-    /// receiver type before its constraints can flow.
+    /// The body must be re-typed under the fixed receiver first.
     BuilderInference: struct { owner: InferenceVar },
-    /// Eta-expansion of a callable to a function-typed expectation.
     Eta,
 
     pub fn eql(self: PostponedKind, other: PostponedKind) bool {
@@ -72,19 +60,15 @@ pub const PostponedKind = union(enum) {
     }
 };
 
-/// Per-variable bound set, pre-seeded with the implicit `Nothing <: α <: Any?`
-/// bounds; callers add tighter ones freely. Every `Type` held here is owned by
-/// the `ConstraintSystem` arena, so the struct has no `deinit` of its own.
+/// Pre-seeded with `Nothing <: α <: Any?`. Every `Type` is arena-owned, so
+/// there is no `deinit`.
 pub const BoundSet = struct {
     lower: std.ArrayList(Type),
     upper: std.ArrayList(Type),
     preference: SolutionPreference,
-    /// When set, staged fixation skips this variable in the current pass.
     postponed: ?PostponedKind,
 
-    /// Fresh bound set seeded with `Nothing <: α` and `α <: Any?`. The list
-    /// spines and the seeded `Any` box are allocated in `arena`, which owns
-    /// everything here.
+    /// Seeded with `Nothing <: α` and `α <: Any?`, all allocated in `arena`.
     pub fn new(arena: Allocator) Allocator.Error!BoundSet {
         var lower: std.ArrayList(Type) = .empty;
         try lower.append(arena, .Nothing);
@@ -104,12 +88,11 @@ pub const BoundSet = struct {
         self.postponed = kind;
     }
 
-    /// Whether the variable is postponed, so staged fixation skips it.
     pub fn isPostponed(self: *const BoundSet) bool {
         return self.postponed != null;
     }
 
-    /// Add `t` (already arena-owned) to the lower bounds unless present.
+    /// `t` must already be arena-owned; false when an equal bound is present.
     pub fn addLower(self: *BoundSet, arena: Allocator, t: Type) Allocator.Error!bool {
         for (self.lower.items) |x| {
             if (x.eql(t)) return false;
@@ -118,7 +101,7 @@ pub const BoundSet = struct {
         return true;
     }
 
-    /// Add `t` (already arena-owned) to the upper bounds unless present.
+    /// `t` must already be arena-owned; false when an equal bound is present.
     pub fn addUpper(self: *BoundSet, arena: Allocator, t: Type) Allocator.Error!bool {
         for (self.upper.items) |x| {
             if (x.eql(t)) return false;
@@ -128,32 +111,22 @@ pub const BoundSet = struct {
     }
 };
 
-/// Kind of constraint. `Equality` is symmetric and reduces to `S <: T` plus
-/// `T <: S`, and merges any inference vars involved through union-find.
+/// `Equality` reduces to both subtype directions and merges the vars through
+/// union-find.
 pub const ConstraintKind = enum {
     Subtype,
     Equality,
 };
 
-/// Where a constraint came from, so a failure diagnostic can point at the
-/// responsible source expression. The solver only carries the data; diagnostic
-/// renderers consume it.
+/// Where a constraint came from, so a failure can point at the source.
 pub const Provenance = union(enum) {
-    /// Argument `arg_idx` of the call at `span`, bound to a parameter of the
-    /// inferred function signature.
     CallSite: struct { span: Span, arg_idx: usize },
-    /// The return type of a call at `span` flowing into the expected type.
     Return: struct { span: Span },
-    /// The body of a lambda at `span` flows into its expected return.
     LambdaBody: struct { span: Span },
-    /// A smart-cast intersection at a CFG join, fed back as a refined bound.
     SmartCast: struct { span: Span },
-    /// A bound carried by a declaration-site type parameter.
     Bound: struct { name: []const u8 },
-    /// LUB join over `if` / `when` / `try` branches.
     LubJoin: struct { span: Span },
-    /// Derivation by the solver itself (incorporation, equality propagation,
-    /// supertype walk); the payload names the derivation for diagnostics.
+    /// Solver-internal derivation; the payload names it for diagnostics.
     Derived: []const u8,
 
     pub fn eql(self: Provenance, other: Provenance) bool {
@@ -176,9 +149,8 @@ pub const Provenance = union(enum) {
     }
 };
 
-/// Constraint over types that may contain inference variables. A variable is
-/// encoded as `Type.TypeParam(name)`, where `name` is the textual id assigned
-/// by `ConstraintSystem.fresh`. Every `Type` is owned by the system arena.
+/// An inference variable is encoded as `Type.TypeParam(name)` with the id from
+/// `ConstraintSystem.fresh`. Every `Type` is arena-owned.
 pub const Constraint = struct {
     lhs: Type,
     rhs: Type,
@@ -186,17 +158,11 @@ pub const Constraint = struct {
     provenance: Provenance,
 };
 
-/// Failure modes the reducer can hit, surfaced through diagnostics at the call
-/// site. `Type` values are owned by the system arena.
+/// Reducer failures, surfaced as diagnostics. `Type`s are arena-owned.
 pub const InferenceError = union(enum) {
-    /// Two resolved (non-inference-variable) types are unrelated, so the
-    /// constraint cannot be satisfied.
     UnsatisfiableConcrete: struct { lhs: Type, rhs: Type },
-    /// A nullable lhs flows into a known non-nullable rhs.
     NullableIntoNonNullable: struct { lhs: Type, rhs: Type },
-    /// A generic-class supertype required by rhs was not found on lhs.
     MissingSupertype: struct { lhs: Type, rhs_head: []const u8 },
-    /// Bounds on the same variable form a contradiction.
     ContradictoryBounds: InferenceVar,
 
     pub fn eql(self: InferenceError, other: InferenceError) bool {
@@ -215,9 +181,8 @@ pub const InferenceError = union(enum) {
     }
 };
 
-/// Stable identifier for an interned type: two types are `TypeId`-equal iff
-/// structurally equal. Keys the solver's `seen` set, so a constraint already
-/// reduced is never re-emitted.
+/// Two types are `TypeId`-equal iff structurally equal. Keys the `seen` set, so
+/// a reduced constraint is never re-emitted.
 pub const TypeId = enum(u32) {
     _,
 
@@ -230,7 +195,6 @@ pub const TypeId = enum(u32) {
     }
 };
 
-/// Key into the `seen` set: a reduced `(S, T, kind)` triple.
 const SeenKey = struct {
     lhs: TypeId,
     rhs: TypeId,
@@ -252,8 +216,7 @@ const SeenContext = struct {
     }
 };
 
-/// Structural hash/eql context for `Type` as a hash-map key; the stored key is
-/// owned by the system arena.
+/// Structural hash/eql for `Type` as a map key; stored keys are arena-owned.
 const TypeContext = struct {
     pub fn hash(_: TypeContext, t: Type) u64 {
         var h = std.hash.Wyhash.init(0);
@@ -302,42 +265,28 @@ const TypeIndex = std.HashMapUnmanaged(Type, TypeId, TypeContext, std.hash_map.d
 const EquivMap = std.AutoHashMapUnmanaged(InferenceVar, InferenceVar);
 const ResolvedMap = std.AutoHashMap(InferenceVar, Type);
 
-/// The last unsatisfied constraint with the provenance that produced it.
 pub const LastError = struct {
     err: InferenceError,
     provenance: Provenance,
 };
 
-/// Solver workspace: the inference variables, their bounds, and the pending
-/// constraint pool. All owned `Type` data lives in the internal arena and is
-/// released by `deinit`.
+/// Owned `Type` data lives in the arena `deinit` releases.
 pub const ConstraintSystem = struct {
-    /// Backing store for every `Type` cloned into bounds, the pending pool, the
-    /// interned pool, and recorded errors.
     type_arena: std.heap.ArenaAllocator,
-    /// Allocator for the container structures (maps, lists).
     gpa: Allocator,
 
     bounds: VarMap,
-    /// Stable id-to-name lookup for the textual encoding inside
-    /// `Type.TypeParam`. Names are arena-owned.
+    /// Id-to-name for the encoding in `Type.TypeParam`; names are arena-owned.
     var_names: NameMap,
     next_id: u32,
     pending: std.ArrayList(Constraint),
-    /// Constraints already reduced, keyed by interned type ids, so
-    /// incorporation never re-emits an `S <: T` it has processed.
+    /// Constraints already reduced, so incorporation never re-emits one.
     seen: SeenSet,
-    /// Interned type pool: each structurally unique `Type` gets a stable
-    /// `TypeId`.
     type_pool: std.ArrayList(Type),
     type_index: TypeIndex,
-    /// Equality classes over inference variables. A derived `α ≡ β`, whether
-    /// explicit or from `S <: α ∧ α <: S`, collapses the two so later
-    /// constraints share a single bound set.
+    /// A derived `α ≡ β` collapses the two so later constraints share one bound set.
     equiv: EquivMap,
-    /// Last `InferenceError` with its failing provenance. The solver keeps
-    /// draining the pool to surface further errors; the caller reads this after
-    /// solving.
+    /// The solver keeps draining the pool, so the caller reads this after solving.
     last_error_val: ?LastError,
 
     pub fn init(gpa: Allocator) ConstraintSystem {
@@ -356,10 +305,8 @@ pub const ConstraintSystem = struct {
         };
     }
 
-    /// Every container the system holds is arena-backed, so map spines, bound
-    /// lists, interned `Type`s and `var_names` keys are all reclaimed by the one
-    /// `type_arena.deinit()`. No system memory is freed through `gpa`, and no
-    /// arena memory is ever handed to a foreign allocator.
+    /// One `type_arena.deinit()` reclaims everything; nothing is freed through
+    /// `gpa`.
     pub fn deinit(self: *ConstraintSystem) void {
         self.type_arena.deinit();
     }
@@ -368,13 +315,12 @@ pub const ConstraintSystem = struct {
         return self.type_arena.allocator();
     }
 
-    /// Clone `t` into the system arena so the solver owns a stable copy.
+    /// Clone into the system arena so the solver owns a stable copy.
     fn own(self: *ConstraintSystem, t: Type) Allocator.Error!Type {
         return t.clone(self.arena());
     }
 
-    /// Allocates a fresh inference variable. The returned `Type` is the
-    /// canonical textual encoding used inside constraints (arena-owned).
+    /// The returned `Type` is the canonical arena-owned encoding of the variable.
     pub fn fresh(self: *ConstraintSystem, hint: []const u8) Allocator.Error!struct { InferenceVar, Type } {
         const id = InferenceVar.from(self.next_id);
         self.next_id += 1;
@@ -418,15 +364,13 @@ pub const ConstraintSystem = struct {
         };
     }
 
-    /// Subtype constraint without provenance, for callers that have no source
-    /// span to attribute a failure to.
+    /// For callers with no source span to attribute a failure to.
     pub fn addConstraint(self: *ConstraintSystem, lhs: Type, rhs: Type) Allocator.Error!void {
         try self.addConstraintWith(lhs, rhs, .Subtype, Provenance.derived("legacy"));
     }
 
-    /// Equality constraint. Records `S ≡ T`, reduces to `S <: T` and `T <: S`
-    /// in the pending pool, and merges the equivalence classes when both sides
-    /// are inference vars.
+    /// Reduces to both subtype directions, merging the equivalence classes when
+    /// both sides are inference vars.
     pub fn addEquality(self: *ConstraintSystem, lhs: Type, rhs: Type, provenance: Provenance) Allocator.Error!void {
         if (self.isInferenceVar(lhs)) |a| {
             if (self.isInferenceVar(rhs)) |b| {
@@ -437,8 +381,7 @@ pub const ConstraintSystem = struct {
         try self.addConstraintWith(rhs, lhs, .Subtype, provenance);
     }
 
-    /// Subtype constraint with provenance. The typechecker uses this entry
-    /// point; the carried provenance feeds failure diagnostics.
+    /// The carried provenance feeds failure diagnostics.
     pub fn addConstraintWith(
         self: *ConstraintSystem,
         lhs: Type,
@@ -464,8 +407,7 @@ pub const ConstraintSystem = struct {
         });
     }
 
-    /// Interned id for `t`, allocating a fresh one for a structural form not
-    /// seen before. `t` must already be arena-owned.
+    /// `t` must already be arena-owned.
     fn intern(self: *ConstraintSystem, t: Type) Allocator.Error!TypeId {
         if (self.type_index.get(t)) |id| {
             return id;
@@ -483,13 +425,11 @@ pub const ConstraintSystem = struct {
         if (ra == rb) {
             return;
         }
-        // Point the higher-id var at the lower-id one; stable choice.
         const keep = if (ra.int() <= rb.int()) ra else rb;
         const drop = if (ra.int() <= rb.int()) rb else ra;
         const arena_alloc = self.arena();
         try self.equiv.put(arena_alloc, drop, keep);
-        // Merge bound sets: drop's bounds become keep's. The dropped lists are
-        // arena-owned and reclaimed at teardown, so nothing is freed here.
+        // Dropped bound lists are arena-owned, so nothing is freed here.
         if (self.bounds.fetchRemove(drop)) |entry| {
             const dropped = entry.value;
             const target = self.bounds.getPtr(keep).?;
@@ -513,7 +453,6 @@ pub const ConstraintSystem = struct {
         return cur;
     }
 
-    /// Canonical representative of an inference variable's equivalence class.
     /// Callers rewrite bounds through the union-find before consulting them.
     pub fn canonical(self: *const ConstraintSystem, v: InferenceVar) InferenceVar {
         return self.findRoot(v);
@@ -532,9 +471,8 @@ pub const ConstraintSystem = struct {
         return gop.value_ptr;
     }
 
-    /// Drain the pending pool, applying the reduction rules, and return the
-    /// first inference error as data. New bounds can drive incorporation, so
-    /// callers loop reduce and incorporate through `solveToFixpoint`.
+    /// Drain the pending pool and return the first inference error as data. New
+    /// bounds drive incorporation, so callers loop through `solveToFixpoint`.
     pub fn reduce(self: *ConstraintSystem) Allocator.Error!?InferenceError {
         while (self.pending.pop()) |c| {
             const key: SeenKey = .{
@@ -560,7 +498,7 @@ pub const ConstraintSystem = struct {
         kind: ConstraintKind,
         provenance: Provenance,
     ) Allocator.Error!?InferenceError {
-        // Inference variable on either side -> add a bound.
+        // An inference variable on either side becomes a bound.
         if (self.isInferenceVar(lhs)) |raw| {
             const v = self.findRoot(raw);
             const bs = try self.boundsEntry(v);
@@ -579,32 +517,26 @@ pub const ConstraintSystem = struct {
             }
             return null;
         }
-        // Resolved on both sides.
         const result: ?InferenceError = blk: {
-            // `S? <: T?` reduces to `S!! <: T` and `S <: T`: the non-null
-            // projection checks the underlying types, the second arm carries
-            // the nullability-compatible case.
+            // `S? <: T?` reduces to `S!! <: T` and `S <: T`.
             if (lhs == .Nullable and rhs == .Nullable) {
                 try self.addConstraintWith(lhs.Nullable.*, rhs.Nullable.*, kind, provenance);
                 try self.addConstraintWith(lhs.Nullable.nonNull().*, rhs.Nullable.*, kind, provenance);
                 break :blk null;
             }
-            // Nullable lhs into a non-nullable resolved rhs is a hard fail.
             if (lhs == .Nullable and !rhs.isNullable()) {
                 break :blk InferenceError{ .NullableIntoNonNullable = .{
                     .lhs = try self.own(lhs),
                     .rhs = try self.own(rhs),
                 } };
             }
-            // Intersection on the right: reduce per-component.
             if (rhs == .Intersection) {
                 for (rhs.Intersection) |p| {
                     try self.addConstraintWith(lhs, p, kind, provenance);
                 }
                 break :blk null;
             }
-            // Intersection on the left: at least one component must satisfy,
-            // approximated by accepting when any does at the current state.
+            // Intersection on the left: accept when any component satisfies.
             if (lhs == .Intersection) {
                 for (lhs.Intersection) |p| {
                     if (p.isSubtypeOf(rhs)) break :blk null;
@@ -614,10 +546,9 @@ pub const ConstraintSystem = struct {
                     .rhs = try self.own(rhs),
                 } };
             }
-            // Function on both sides: decompose structurally so an inference
-            // variable in a parameter or the return type gets bound. Parameters
-            // are contravariant, the return type covariant. A non-suspend
-            // function satisfies a `suspend` expectation, not the reverse.
+            // Decompose function types so an inference variable in a parameter
+            // or return gets bound: parameters contravariant, return covariant,
+            // and a non-suspend function satisfies a `suspend` expectation.
             if (lhs == .Function and rhs == .Function and
                 lhs.Function.params.len == rhs.Function.params.len)
             {
@@ -630,14 +561,12 @@ pub const ConstraintSystem = struct {
                     } };
                 }
                 for (lf.params, rf.params) |l, r| {
-                    // contravariant: expected-param <: actual-param
                     try self.addConstraintWith(r, l, .Subtype, provenance);
                 }
                 try self.addConstraintWith(lf.return_type.*, rf.return_type.*, .Subtype, provenance);
                 break :blk null;
             }
-            // Parameterised generic on both sides with the same head: reduce
-            // per-argument with variance-aware containment.
+            // Same generic head: reduce per argument, variance-aware.
             if (lhs == .Generic and rhs == .Generic and
                 std.mem.eql(u8, lhs.Generic.name, rhs.Generic.name) and
                 lhs.Generic.args.len == rhs.Generic.args.len)
@@ -654,13 +583,11 @@ pub const ConstraintSystem = struct {
                     switch (variance) {
                         .Out => try self.addConstraintWith(l.ty, r.ty, .Subtype, provenance),
                         .In => try self.addConstraintWith(r.ty, l.ty, .Subtype, provenance),
-                        // Both directions, i.e. equality on the type argument.
                         .Invariant => try self.addEquality(l.ty, r.ty, provenance),
                     }
                 }
                 break :blk null;
             }
-            // Pure subtype check between resolved types.
             if (lhs.isSubtypeOf(rhs)) {
                 break :blk null;
             }
@@ -675,27 +602,23 @@ pub const ConstraintSystem = struct {
         return result;
     }
 
-    /// Transitive closure plus equality derivation, repeated until no fresh
-    /// constraint or bound appears: `S <: α` with `α <: T` gives `S <: T`; the
-    /// same concrete `S` as both an upper and a lower bound of `α` gives
-    /// `α ≡ S`; two upper (or two lower) bounds sharing a parameterised head
-    /// (`α <: List<X>`, `α <: List<Int>`) give equalities on their invariant
-    /// arguments; a cycle `α <: β <: α` collapses both vars through union-find.
+    /// Transitive closure plus equality derivation, to a fixpoint: `S <: α` with
+    /// `α <: T` gives `S <: T`; one concrete `S` as both bounds gives `α ≡ S`;
+    /// two bounds sharing a parameterised head give equalities on invariant
+    /// arguments; a cycle `α <: β <: α` collapses through union-find.
     pub fn incorporate(self: *ConstraintSystem) Allocator.Error!?InferenceError {
         const Pending = struct { lhs: Type, rhs: Type, kind: ConstraintKind, provenance: Provenance };
         var iterations: u32 = 0;
         while (true) {
             iterations += 1;
             if (iterations > 1024) {
-                // Cap on derivation rounds. Reduction never invents fresh class
-                // symbols, so hitting the cap means a provenance cycle.
+                // Reduction invents no fresh symbols, so the cap means a cycle.
                 return null;
             }
             var new_constraints: std.ArrayList(Pending) = .empty;
             defer new_constraints.deinit(self.gpa);
 
-            // (1) Transitive closure `S <: α ∧ α <: T ⇒ S <: T`, plus equality
-            //     when the same concrete type appears as both bounds.
+            // (1) Transitive closure, plus equality when one concrete type is both bounds.
             {
                 var it = self.bounds.iterator();
                 while (it.next()) |entry| {
@@ -711,7 +634,6 @@ pub const ConstraintSystem = struct {
                             });
                         }
                     }
-                    // (1a) Equality from same-type bound on both sides.
                     for (bs.lower.items) |s| {
                         if (!isInferenceVarType(s)) {
                             var found = false;
@@ -734,9 +656,8 @@ pub const ConstraintSystem = struct {
                 }
             }
 
-            // (2) Equality from paired generic bounds: two upper or two lower
-            //     bounds sharing a parameterised head emit per-argument
-            //     constraints.
+            // (2) Two upper or two lower bounds sharing a parameterised head
+            //     emit per-argument constraints.
             {
                 var it = self.bounds.iterator();
                 while (it.next()) |entry| {
@@ -771,7 +692,7 @@ pub const ConstraintSystem = struct {
         return null;
     }
 
-    /// Returns the arena-owned textual encoding of `v`.
+    /// Arena-owned.
     fn encode(self: *ConstraintSystem, v: InferenceVar) Allocator.Error![]const u8 {
         var it = self.var_names.iterator();
         while (it.next()) |entry| {
@@ -809,15 +730,14 @@ pub const ConstraintSystem = struct {
                             .provenance = Provenance.derived("incorporate-generic-equality"),
                         });
                     }
-                    // Out/Out is a deliberate no-op: the most-specific common
-                    // subtype is left to solver fixation, as are the other
-                    // variance combinations.
+                    // Out/Out is a deliberate no-op: the common subtype is left
+                    // to solver fixation, as are the other combinations.
                 }
             }
         }
     }
 
-    /// Returns owned slice of cyclic var pairs; caller frees with `gpa`.
+    /// Caller frees the returned slice with `gpa`.
     fn collectVarCycles(self: *const ConstraintSystem) Allocator.Error![][2]InferenceVar {
         var out: std.ArrayList([2]InferenceVar) = .empty;
         errdefer out.deinit(self.gpa);
@@ -859,12 +779,10 @@ pub const ConstraintSystem = struct {
         return null;
     }
 
-    /// Staged fixation. Builds the dependency graph `α →dep β` (β occurs in
-    /// α's bounds), computes SCCs, then fixes variables in reverse topological
-    /// order, substituting each resolved type into the remaining bounds before
-    /// moving on. Postponed variables are skipped, and an SCC of mutually
-    /// dependent vars is resolved together by repeated substitution until it
-    /// stops changing. The returned map and its `Type` values are arena-owned.
+    /// Staged fixation: build the dependency graph `α →dep β`, compute SCCs, then
+    /// fix variables in reverse topological order, substituting each resolved
+    /// type into the remaining bounds. Postponed variables are skipped, and a
+    /// mutually dependent SCC is resolved by repeated substitution. Arena-owned.
     pub fn solveStaged(self: *ConstraintSystem) Allocator.Error!ResolvedMap {
         var vars: std.ArrayList(InferenceVar) = .empty;
         defer vars.deinit(self.gpa);
@@ -891,7 +809,6 @@ pub const ConstraintSystem = struct {
             for (bs.upper.items) |t| {
                 try collectVars(self.gpa, t, &self.var_names, &targets);
             }
-            // Drop self-references, then sort + dedup.
             var k: usize = 0;
             while (k < targets.items.len) {
                 if (targets.items[k] == v) {
@@ -913,20 +830,18 @@ pub const ConstraintSystem = struct {
         }
 
         var resolved = ResolvedMap.init(self.gpa);
-        // Iterate SCCs in reverse: tarjan emits deepest dependencies first.
+        // Reverse order: tarjan emits deepest dependencies first.
         var si: usize = sccs.len;
         while (si > 0) {
             si -= 1;
             const scc = sccs[si];
-            // Inside an SCC, fix each var against the current substitution of
-            // the others and repeat until no resolved type changes.
+            // Fix each var against the others' current substitution until nothing changes.
             var changed = true;
             var local_iters: u32 = 0;
             while (changed and local_iters < 64) {
                 changed = false;
                 for (scc) |v| {
-                    // Postponed variables are skipped: the typechecker re-feeds
-                    // constraints once the gating event clears.
+                    // The typechecker re-feeds constraints once the gate clears.
                     if (self.bounds.getPtr(v)) |b| {
                         if (b.postponed != null) continue;
                     }
@@ -979,9 +894,8 @@ pub const ConstraintSystem = struct {
         }
     }
 
-    /// Pick a concrete substitution for every inference variable: push-down
-    /// takes the GLB of the upper bounds (their intersection), pull-up (the
-    /// default) the LUB of the lower bounds. Map and `Type`s are arena-owned.
+    /// Push-down takes the GLB of the upper bounds, pull-up the LUB of the lower
+    /// bounds. Arena-owned.
     pub fn solve(self: *ConstraintSystem) Allocator.Error!ResolvedMap {
         var out = ResolvedMap.init(self.gpa);
         errdefer out.deinit();
@@ -1027,7 +941,7 @@ fn lessThanVar(_: void, a: InferenceVar, b: InferenceVar) bool {
     return a.int() < b.int();
 }
 
-/// In-place dedup of an already-sorted slice. Returns the new length.
+/// Returns the new length.
 fn dedupSorted(items: []InferenceVar) usize {
     if (items.len == 0) return 0;
     var w: usize = 1;
@@ -1041,9 +955,8 @@ fn dedupSorted(items: []InferenceVar) usize {
     return w;
 }
 
-/// LUB across a slice of resolved types. Conservative: the unique element when
-/// all entries are equal, else a promotion to a common builtin, falling back to
-/// `Any` / `Any?` for unrelated class types. The result is allocated in `arena`.
+/// LUB across resolved types: the unique element when all are equal, else a
+/// promotion to a common builtin, falling back to `Any` / `Any?`.
 pub fn lubMany(arena: Allocator, type_list: []const Type) Allocator.Error!Type {
     if (type_list.len == 0) {
         return .Nothing;
@@ -1069,7 +982,6 @@ fn isInferenceVarType(t: Type) bool {
     };
 }
 
-/// Append every inference variable appearing inside `t` to `out`.
 fn collectVars(
     gpa: Allocator,
     t: Type,
@@ -1105,8 +1017,7 @@ fn collectVars(
     }
 }
 
-/// Substitute resolved inference variables inside `t` with their concrete
-/// types, as staged fixation does once an earlier SCC resolved. Arena-owned.
+/// As staged fixation does once an earlier SCC resolved. Arena-owned.
 fn substituteVars(
     arena: Allocator,
     t: Type,
@@ -1174,7 +1085,6 @@ fn substituteVars(
     }
 }
 
-/// Mutable working set for `tarjanScc`'s depth-first traversal.
 const TarjanState = struct {
     gpa: Allocator,
     idx_of: std.AutoHashMap(InferenceVar, usize),
@@ -1201,8 +1111,7 @@ const TarjanState = struct {
         self.lowlink.deinit();
         self.on_stack.deinit();
         self.stack.deinit(self.gpa);
-        // The caller owns the returned SCC slices; only the outer list is freed
-        // here.
+        // The caller owns the returned SCC slices; only the outer list is freed.
         self.sccs.deinit(self.gpa);
     }
 
@@ -1243,9 +1152,8 @@ const TarjanState = struct {
     }
 };
 
-/// Tarjan's SCC algorithm over inference variables, returning the SCCs in
-/// topological order (deepest dependencies first) so staged fixation can fix a
-/// batch once its dependencies resolve. Outer and inner slices are owned by `gpa`.
+/// Deepest dependencies first, so a batch is fixable once its dependencies
+/// resolve. `gpa` owns the outer and inner slices.
 fn tarjanScc(
     gpa: Allocator,
     vars: []const InferenceVar,

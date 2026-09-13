@@ -1,6 +1,5 @@
-//! Shared cursor, peek, expect and recovery helpers for the parser. Free
-//! functions over `*Parser`, matching the convention of the sibling parse files
-//! (`support.peekKind(p)`).
+//! Shared cursor, peek, expect and recovery helpers, as free functions over
+//! `*Parser`.
 
 const std = @import("std");
 
@@ -21,16 +20,13 @@ const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 const Span = span.Span;
 
-/// Whether newlines are soft at the cursor, that is inside `(` or `[`. When
-/// they are, the expression grammar may continue across a line break before or
-/// after a binary or infix operator.
+/// Newlines are soft inside `(` or `[`, where an expression may continue across
+/// a line break around a binary or infix operator.
 pub fn nlIsSoft(p: *const Parser) bool {
     if (p.pos < p.nl_soft.len) return p.nl_soft[p.pos];
     return false;
 }
 
-/// Skip newline tokens only where they are soft, inside round or square
-/// brackets. A no-op elsewhere, so block-level statement separation stands.
 pub fn skipSoftNl(p: *Parser) void {
     while (std.meta.activeTag(peekKind(p).*) == .Newline and nlIsSoft(p)) {
         p.pos += 1;
@@ -53,7 +49,6 @@ pub fn bump(p: *Parser) Token {
     return t;
 }
 
-/// Skip soft newlines, the ones that do not terminate a statement.
 pub fn skipNl(p: *Parser) void {
     while (std.meta.activeTag(peekKind(p).*) == .Newline) {
         p.pos += 1;
@@ -61,8 +56,7 @@ pub fn skipNl(p: *Parser) void {
 }
 
 /// Assignments are statements, not expressions. After an expression in value
-/// context (parens, an `if`/`while`/`when` condition, a `for` range, a value
-/// argument), reject a trailing assignment operator and consume the RHS to
+/// context, reject a trailing assignment operator and consume the RHS to
 /// recover.
 pub fn rejectTrailingAssignment(p: *Parser) void {
     const is_assign = switch (peekKind(p).*) {
@@ -82,11 +76,9 @@ pub fn rejectTrailingAssignment(p: *Parser) void {
     _ = expr.parseExpr(p);
 }
 
-/// True when the cursor is at a token that cannot begin an expression, so a
-/// preceding `return` / `break` / `continue` carries no value. Besides a
-/// statement boundary (newline, `;`, `}`, EOF) this covers the closers `)` and
-/// `]` and the separator `,`, so a bare `return` parses in expression position:
-/// `x ?: return`, `f(x ?: return)`, `listOf(x ?: return, y)`.
+/// True at a token that cannot begin an expression, so a preceding `return` /
+/// `break` / `continue` carries no value. Besides a statement boundary this
+/// covers `)`, `]` and `,`, so `f(x ?: return)` parses.
 pub fn atNewlineOrSemiOrClose(p: *const Parser) bool {
     return switch (peekKind(p).*) {
         .Newline, .Semicolon, .Eof, .RBrace, .RParen, .RBracket, .Comma => true,
@@ -98,11 +90,9 @@ pub fn text(p: *const Parser, sp: Span) []const u8 {
     return p.src[sp.start..sp.end];
 }
 
-/// Read the identifier name stored in the token's span, stripping the
-/// surrounding backticks of an escaped identifier.
-///
-/// The result borrows from the parser's source buffer when unescaped and from
-/// the arena when stripped; callers must not free it.
+/// Strips the backticks of an escaped identifier. The result borrows from the
+/// source buffer when unescaped and from the arena when stripped; callers must
+/// not free it.
 pub fn identName(p: *Parser, sp: Span) []const u8 {
     const raw = text(p, sp);
     if (raw.len >= 2 and raw[0] == '`' and raw[raw.len - 1] == '`') {
@@ -121,8 +111,7 @@ pub fn err(p: *Parser, code: []const u8, msg: []const u8, sp: Span) void {
     p.diagnostics.emit(p.allocator, d) catch {};
 }
 
-/// Like `err`, but also tags the diagnostic with a compiler-named factory
-/// so downstream consumers can match on the stable diagnostic name.
+/// Like `err`, but tags the diagnostic with a factory so consumers can match on the stable name.
 pub fn errWithFactory(
     p: *Parser,
     factory: *const diagnostics.DiagnosticFactory,
@@ -186,8 +175,6 @@ pub fn recoverToStmtEnd(p: *Parser) void {
     }
 }
 
-/// Returns the text of the next token if it is an `Ident`, without
-/// consuming.
 pub fn peekIdentText(p: *const Parser) ?[]const u8 {
     if (p.pos >= p.tokens.len) return null;
     const tok = p.tokens[p.pos];
@@ -203,8 +190,8 @@ pub fn peekKeywordIdent(p: *const Parser, name: []const u8) bool {
 }
 
 /// True when the next significant token, newlines skipped, is `kind`. Lets a
-/// line that STARTS with a binary continuation operator such as `?:` join the
-/// previous expression instead of ending it.
+/// line STARTING with a continuation operator such as `?:` join the previous
+/// expression.
 pub fn newlineThen(p: *const Parser, kind: TokenKind) bool {
     if (std.meta.activeTag(peekKind(p).*) != .Newline) {
         return false;
@@ -225,7 +212,7 @@ fn lexAndMake(arena: std.mem.Allocator, src: []const u8) !*Parser {
     const id = span.FileId.from(0);
     var lx = try lexer.Lexer.init(arena, id, src);
     const res = try lx.tokenize();
-    // Leak the lex result's allocations into the arena; freed by the caller.
+    // The lex result's allocations leak into the arena, freed by the caller.
     return Parser.new(arena, id, src, res.tokens);
 }
 

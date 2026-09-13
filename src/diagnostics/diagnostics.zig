@@ -1,13 +1,7 @@
-//! Compiler diagnostics.
-//!
-//! Models a Kotlin-compatible diagnostic: an emission can carry a
-//! `DiagnosticFactory` (stable id, default severity and message template taken
-//! from kotlinc's `FirErrors.kt`), secondary labels, notes and `FixIt`s.
-//! Severities align with kotlinc's `CompilerMessageSeverity`.
-//!
-//! Rendering lives in the `render` module: plain text matching kotlinc's
-//! `MessageRenderer.PLAIN`, NDJSON for tooling, and SARIF 2.1.0 for
-//! static-analysis aggregators.
+//! Compiler diagnostics. An emission can carry a `DiagnosticFactory` (stable
+//! id, default severity and message template from kotlinc's `FirErrors.kt`),
+//! secondary labels, notes and `FixIt`s, with severities aligned to kotlinc's
+//! `CompilerMessageSeverity`. Rendering lives in the `render` module.
 
 const std = @import("std");
 const span = @import("span");
@@ -33,9 +27,9 @@ pub const Severity = enum {
     }
 };
 
-/// A stable diagnostic identifier with its default severity and message
-/// template. Names mirror the upstream Kotlin compiler, so IDE infrastructure
-/// (IntelliJ inspections, quick-fix dispatchers) recognizes them untranslated.
+/// A stable identifier with its default severity and message template. Names
+/// mirror the upstream compiler, so IDE infrastructure recognizes them
+/// untranslated.
 pub const DiagnosticFactory = struct {
     name: []const u8,
     default_severity: Severity,
@@ -58,8 +52,7 @@ pub const TextEdit = struct {
     replacement: []const u8,
 };
 
-/// A suggested code change. `kind` lets IDEs filter quick-fixes from
-/// refactors. `edits` are applied atomically.
+/// `kind` lets IDEs filter quick-fixes from refactors; `edits` apply atomically.
 pub const FixIt = struct {
     title: []const u8,
     kind: FixItKind,
@@ -68,11 +61,9 @@ pub const FixIt = struct {
 
 pub const Diagnostic = struct {
     severity: Severity,
-    /// Canonical Kotlin-style factory when one applies; emit sites without one
-    /// fall back to `legacy_code`.
+    /// Emit sites without a factory fall back to `legacy_code`.
     factory: ?*const DiagnosticFactory,
-    /// Older klio-internal code (`E0001`, `R0005`), kept so the renderer emits
-    /// an identifier for an emit site that has no factory.
+    /// Older klio-internal code, kept so a factory-less emit site still renders an identifier.
     legacy_code: ?[]const u8,
     message: []const u8,
     primary: Label,
@@ -99,9 +90,8 @@ pub const Diagnostic = struct {
         return d;
     }
 
-    /// Build a diagnostic from a factory. Severity defaults to the factory's
-    /// declared default; the message is the factory's template, which call
-    /// sites may override with `withMessage`.
+    /// Severity defaults to the factory's, and the message to its template,
+    /// which call sites may override with `withMessage`.
     pub fn fromFactory(factory: *const DiagnosticFactory, sp: Span) Diagnostic {
         return .{
             .severity = factory.default_severity,
@@ -169,8 +159,6 @@ pub const Diagnostic = struct {
         return self;
     }
 
-    /// The identifier rendered in tool output: the factory name when present,
-    /// else the legacy code.
     pub fn code(self: *const Diagnostic) ?[]const u8 {
         if (self.factory) |f| return f.name;
         return self.legacy_code;
@@ -204,7 +192,6 @@ pub const DiagnosticSink = struct {
         return self.diagnostics.items;
     }
 
-    /// Render with the default plain-text renderer.
     pub fn render(
         self: *const DiagnosticSink,
         allocator: std.mem.Allocator,

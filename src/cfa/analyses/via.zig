@@ -1,11 +1,8 @@
-//! Variable initialisation analysis.
-//!
-//! Forward pass over the CFG with a `Map<Place, Flat<AssignState>>` lattice.
-//! `DeclLocal` seeds `Unassigned` and `Assign` sets `Assigned`. Reading a place
-//! whose state is not `Assigned`, so `Unassigned` or the `Top` that means "may
-//! be unassigned along some path", is a definite-assignment violation. The
-//! module exposes the per-place facts plus a helper that reports violations as
-//! a list of spans.
+//! Variable initialisation analysis: a forward pass with a
+//! `Map<Place, Flat<AssignState>>` lattice, where `DeclLocal` seeds
+//! `Unassigned` and `Assign` sets `Assigned`. Reading a place whose state is not
+//! `Assigned` is a definite-assignment violation. Exposes the per-place facts
+//! plus a helper reporting violations as spans.
 
 const std = @import("std");
 const span = @import("span");
@@ -20,9 +17,7 @@ const Place = ir.Place;
 const Span = span.Span;
 
 pub const AssignState = enum {
-    /// Declared but no `Assign` has been seen on this path.
     Unassigned,
-    /// Definitely assigned on this path.
     Assigned,
 
     pub fn bottom() AssignState {
@@ -65,18 +60,14 @@ pub const UnassignedRead = struct {
 pub const ViaBlockStates = std.ArrayList(ViaLattice);
 
 pub fn solveVia(allocator: Allocator, cfg: *const Cfg) Allocator.Error!ViaBlockStates {
-    // Function parameters count as assigned on entry to the body. Lowering
-    // emits no `DeclLocal` for them, so absent means no fact and nothing is
-    // flagged.
+    // Parameters count as assigned on entry, and lowering emits no `DeclLocal`
+    // for them, so absent means no fact and nothing is flagged.
     const entry = ViaLattice.init();
     var transfer = ViaTransfer{};
     return dataflow.solveForward(ViaLattice, ViaTransfer, allocator, cfg, entry, &transfer);
 }
 
-/// The in-state at every node of `block`, produced by re-running the transfer
-/// from the block's start, for a "check at this AST span" query that needs no
-/// full per-node array. Consumes `entry`; the caller owns every returned
-/// lattice.
+/// Consumes `entry`; the caller owns every returned lattice.
 pub fn statesWithinBlock(
     allocator: Allocator,
     cfg: *const Cfg,
@@ -101,11 +92,10 @@ pub fn statesWithinBlock(
     return out.toOwnedSlice(allocator);
 }
 
-/// A place is read when it is named on the right of an `Eval` whose AST shape
-/// touches it. The IR records no reads directly, those living in
-/// `ExprRef.span`, so this returns the per-block fact stream: the typechecker
-/// answers "is this place assigned at this span?" by indexing the state map with
-/// the place at the eval's preceding program point. Caller owns the result.
+/// The IR records no reads directly, those living in `ExprRef.span`, so this
+/// returns the per-block fact stream: the typechecker answers "is this place
+/// assigned at this span?" by indexing with the place at the eval's preceding
+/// program point. Caller owns the result.
 pub fn placeStateAtBlockEntry(
     allocator: Allocator,
     states: *const ViaBlockStates,
@@ -115,8 +105,6 @@ pub fn placeStateAtBlockEntry(
     return states.items[block.int()].get(allocator, place.*);
 }
 
-/// One ordered entry of `maybeUnassignedPlaces`: a place plus the
-/// blocks at whose entry it may be unassigned.
 pub const MaybeUnassignedEntry = struct {
     place: Place,
     blocks: std.ArrayList(BlockId),
@@ -127,7 +115,6 @@ pub const MaybeUnassignedEntry = struct {
     }
 };
 
-/// Ordered `Place -> []BlockId` collection, iterated in sorted-key order.
 pub const MaybeUnassigned = struct {
     entries: std.ArrayList(MaybeUnassignedEntry) = .empty,
 
@@ -144,9 +131,8 @@ pub const MaybeUnassigned = struct {
     }
 };
 
-/// Collect the places that join to `Top`, assigned on some paths and not
-/// others, at any block entry. These are the candidates for a "variable might be
-/// uninitialised" diagnostic. Caller owns the returned collection.
+/// Places that join to `Top`, assigned on some paths and not others: the
+/// candidates for a "might be uninitialised" diagnostic. Caller owns the result.
 pub fn maybeUnassignedPlaces(allocator: Allocator, states: *const ViaBlockStates) Allocator.Error!MaybeUnassigned {
     var out = MaybeUnassigned{};
     errdefer out.deinit(allocator);
@@ -240,8 +226,6 @@ test "solve via over a straight-line block" {
     };
     defer {
         for (cfg.blocks.items) |*b| {
-            // Node names are string literals in this fixture, not
-            // allocator-owned, so only the containers are freed.
             b.nodes.deinit(a);
             b.preds.deinit(a);
             b.succs.deinit(a);
@@ -267,7 +251,6 @@ test "solve via over a straight-line block" {
     defer deinitStates(a, &states);
     try testing.expectEqual(@as(usize, 1), states.items.len);
 
-    // At block entry the place is not yet seeded.
     const px = Place{ .Local = .{ .name = "x" } };
     var entry_fact = try placeStateAtBlockEntry(a, &states, BlockId.from(0), &px);
     defer entry_fact.deinit(a);
@@ -283,8 +266,6 @@ test "states within block tracks per-node assignment" {
     };
     defer {
         for (cfg.blocks.items) |*b| {
-            // Node names are string literals in this fixture, not
-            // allocator-owned, so only the containers are freed.
             b.nodes.deinit(a);
             b.preds.deinit(a);
             b.succs.deinit(a);
@@ -340,7 +321,6 @@ test "maybe unassigned collects flagged places" {
     var out = try maybeUnassignedPlaces(a, &states);
     defer out.deinit(a);
     try testing.expectEqual(@as(usize, 2), out.entries.items.len);
-    // Ordered by place: "x" before "z".
     try testing.expectEqualStrings("x", out.entries.items[0].place.Local.name);
     try testing.expectEqualStrings("z", out.entries.items[1].place.Local.name);
     try testing.expectEqual(@as(usize, 1), out.entries.items[0].blocks.items.len);

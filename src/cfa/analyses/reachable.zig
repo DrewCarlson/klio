@@ -1,14 +1,8 @@
-//! Reachability analysis.
-//!
-//! A block is reachable iff a path runs from the CFG's entry to it over edges
-//! the dataflow regards as live. An edge is dead when its source block ends in a
-//! divergent terminator (`Throw`, `Return`, `Unreachable`) or when an
-//! `Unreachable` node appears before the terminator, as it does after a
-//! `Nothing`-typed call.
-//!
-//! The `WithTypes` variant consults a span-keyed type map supplied by the
-//! typechecker, so an `Eval` of a `Nothing`-returning call (`error("...")`,
-//! `TODO()`) prunes its block's successors exactly as an explicit `Throw` does.
+//! Reachability analysis. A block is reachable iff a path runs from the entry
+//! over live edges; an edge is dead when its source ends in a divergent
+//! terminator or an `Unreachable` node precedes the terminator. The `WithTypes`
+//! variant consults the typechecker's span-keyed types, so an `Eval` of a
+//! `Nothing`-returning call prunes successors as a `Throw` does.
 
 const std = @import("std");
 const ir = @import("../ir.zig");
@@ -31,8 +25,7 @@ const SpanKeyContext = struct {
     }
 };
 
-/// Span-keyed type map, the shape the typechecker collects its span-to-`Type`
-/// results into.
+/// The shape the typechecker collects its span-to-`Type` results into.
 pub const TypeMap = std.HashMap(SpanKey, Type, SpanKeyContext, std.hash_map.default_max_load_percentage);
 
 pub const Reachability = struct {
@@ -65,9 +58,8 @@ pub fn analyse(allocator: Allocator, cfg: *const Cfg) Allocator.Error!Reachabili
     return analyseWithTypes(allocator, cfg, null);
 }
 
-/// Like `analyse`, but consults the typechecker's span-to-`Type` results so an
-/// `Eval` of a `Nothing`-typed expression acts as an in-block `Unreachable`
-/// marker: control does not propagate past it.
+/// Like `analyse`, but an `Eval` of a `Nothing`-typed expression acts as an
+/// in-block `Unreachable` marker: control does not propagate past it.
 pub fn analyseWithTypes(
     allocator: Allocator,
     cfg: *const Cfg,
@@ -112,9 +104,8 @@ pub fn analyseWithTypes(
         switch (block.term) {
             .Return, .Unreachable => {},
             // A throw's recorded successors are exactly the exceptional edges
-            // lowering routed to enclosing catch and finally blocks, where
-            // control genuinely flows. With no handler the successor list is
-            // empty.
+            // lowering routed to enclosing handlers, where control genuinely
+            // flows; with no handler the list is empty.
             else => {
                 for (block.succs.items) |e| {
                     try stack.append(allocator, e.block);
@@ -164,8 +155,8 @@ test "reachability after return is dead" {
     defer deinitBuilder(&b, a);
     const entry = try b.newBlock(a);
     const dead = try b.newBlock(a);
-    // entry returns, yet keeps an out-edge to `dead`; the divergent
-    // terminator must stop the walk from following it.
+    // The entry returns yet keeps an out-edge to `dead`, which the divergent
+    // terminator must stop the walk from following.
     try b.setTerminator(a, entry, .{ .Return = null });
     try b.addEdge(a, entry, dead, .Normal);
     try b.setTerminator(a, dead, .{ .Return = null });
