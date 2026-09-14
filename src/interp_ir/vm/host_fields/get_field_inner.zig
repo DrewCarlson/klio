@@ -811,7 +811,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
         // Delegated extension property (`val R.x by expr`): materialise the
         // delegate once per property, then read `getValue(thisRef, property)`.
         if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
-            const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
+            const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid, receiver);
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
             return try delegateCall(self, allocator, &d, "getValue", &.{ receiver.*, prop_ref }, receiver);
         }

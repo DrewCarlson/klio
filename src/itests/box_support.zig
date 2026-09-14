@@ -32,9 +32,10 @@ const BACKEND_NAME = "KLIO";
 /// are `companionBlocksAndExtensions`, the 2.4.20 companion-block feature klio
 /// does not implement; the rest cluster on collection literals, full value
 /// classes, contextual callable references and eager lambda analysis. Supplying
-/// the backend marker below then took the two `classLiteral` tests green.
-pub const BASELINE: usize = 6056;
-pub const MAX_FAILED: usize = 337;
+/// the backend marker below then took the two `classLiteral` tests green, and
+/// resolving a member through a property reference took three delegate tests.
+pub const BASELINE: usize = 6059;
+pub const MAX_FAILED: usize = 334;
 
 /// Directives binding a test to a framework feature with no klio counterpart:
 /// a backend restriction, a second module, reflection, JDK classes, compiler

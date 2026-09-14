@@ -1207,7 +1207,14 @@ fn tryBareTypeNameMemberRef(b: *FuncBuilder, mr: @FieldType(Expr, "MemberRef")) 
         // classifier, so defer to `lowerReceiver`, which applies the
         // rewrite.
         const renamed = scopeTypeRename(b, rn, mr.receiver.Path.segments[0].span.file.int()) != null;
-        if (!renamed and b.resolve(rn) == null and !b.knowsOuter(rn) and
+        // A member-extension accessor has the declaring class's members in scope, so
+        // `d::y` names that member and not a global. Only the reference's receiver
+        // reaches here; `d.y` already resolves through the implicit receiver.
+        const owner_member = if (b.dispatchClass()) |owner|
+            b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = rn }) != null
+        else
+            false;
+        if (!renamed and !owner_member and b.resolve(rn) == null and !b.knowsOuter(rn) and
             b.module.classId(rn) == null and !b.hasOwnMember(rn) and
             !isTopLevelProp(rn))
         {

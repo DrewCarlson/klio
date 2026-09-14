@@ -233,3 +233,36 @@ test "top_level_property_reference_get_set" {
     ;
     try assertKlio("top_level_property_reference", src, "3.14\nkt\nkt\n7\n9\n9\n");
 }
+
+test "a member extension reaches the declaring class through a property reference" {
+    const src =
+        \\
+        \\class A
+        \\class Src { var y: String = "src" }
+        \\
+        \\class Holder {
+        \\    val d = Src()
+        \\    val A.refProbe: String get() = (d::y).get()
+        \\    var A.viaRef: String by d::y
+        \\}
+        \\
+        \\class SameType(val prop: String) {
+        \\    val SameType.x: String by ::prop
+        \\}
+        \\
+        \\fun main() {
+        \\    val a = A()
+        \\    with(Holder()) {
+        \\        println(a.refProbe)
+        \\        println(a.viaRef)
+        \\        a.viaRef = "W"
+        \\        println(a.viaRef + "/" + d.y)
+        \\    }
+        \\    with(SameType("outer")) {
+        \\        println(SameType("inner").x)
+        \\    }
+        \\}
+        \\
+    ;
+    try assertKlio("member_ext_property_reference", src, "src\nsrc\nW/W\nouter\n");
+}

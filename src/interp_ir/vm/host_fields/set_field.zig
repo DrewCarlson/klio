@@ -173,7 +173,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
         }
         // A delegated extension property writes through `setValue`.
         if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, real_name)) |hit| {
-            const d = try extPropDelegateInstance(self, allocator, hit.key, real_name, hit.fid);
+            const d = try extPropDelegateInstance(self, allocator, hit.key, real_name, hit.fid, receiver);
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, real_name) } };
             const r = try delegateCall(self, allocator, &d, "setValue", &.{ receiver.*, prop_ref, value }, receiver);
             switch (r) {

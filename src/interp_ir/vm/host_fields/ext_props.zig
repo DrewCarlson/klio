@@ -107,7 +107,7 @@ pub fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const V
         return r;
     }
     if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
-        const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
+        const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid, receiver);
         const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
         return try delegateCall(self, allocator, &d, "getValue", &.{ receiver.*, prop_ref }, receiver);
     }
@@ -318,21 +318,54 @@ pub fn extPropDelegateInstance(
     key: []const u8,
     name: []const u8,
     fid: FuncId,
+    receiver: *const Value,
 ) Allocator.Error!Value {
+    // `class C { val d = Src(); var A.x: String by d::y }` reads the declaring class's
+    // scope, so the delegate belongs to one C instance: seed the thunk with the owner
+    // and key the cache by it. A delegate naming nothing from the owner keeps the
+    // program-wide entry.
+    const mptr: *const Module = self.module.asPtr();
+    const owner_inst: ?Value = if (mptr.registry.member_ext_owner_class.get(fid)) |owner|
+        try host_call_member.memberExtOwnerInstance(self, allocator, receiver, owner)
+    else
+        null;
     var kb: [256]u8 = undefined;
-    const cache_name = std.fmt.bufPrint(&kb, "__ext_delegate\x1f{s}\x1f{s}", .{ key, name }) catch
-        return runThunkValue(self, allocator, fid);
+    const cache_name = (if (owner_inst) |oi|
+        std.fmt.bufPrint(&kb, "__ext_delegate\x1f{s}\x1f{s}\x1f{x}", .{ key, name, ownerIdentity(oi) })
+    else
+        std.fmt.bufPrint(&kb, "__ext_delegate\x1f{s}\x1f{s}", .{ key, name })) catch
+        return runThunkForOwner(self, allocator, fid, owner_inst);
     {
         const gg = self.globals.borrow();
         defer gg.deinit();
         if (gg.get().lookup(cache_name)) |v| return v;
     }
-    const v = try runThunkValue(self, allocator, fid);
+    const v = try runThunkForOwner(self, allocator, fid, owner_inst);
     const owned_name = try allocator.dupe(u8, cache_name);
     const g = self.globals.borrowMut();
     defer g.deinit();
     g.get().define(owned_name, v) catch {};
     return v;
+}
+
+/// Identity of the owner instance a per-owner delegate belongs to.
+fn ownerIdentity(v: Value) usize {
+    return switch (v) {
+        .Instance => |i| @intFromPtr(i.asPtr()),
+        else => 0,
+    };
+}
+
+/// Run the delegate thunk with the declaring class's instance in scope, so the
+/// expression resolves the owner's members.
+fn runThunkForOwner(self: *VmHost, allocator: Allocator, fid: FuncId, owner: ?Value) Allocator.Error!Value {
+    const o = owner orelse return runThunkValue(self, allocator, fid);
+    const mptr: *const Module = self.module.asPtr();
+    const r = try self.callFunc(allocator, mptr, fid, &.{o});
+    return switch (r) {
+        .ok => |v| v,
+        .err => Value.Null,
+    };
 }
 
 pub fn runThunkValue(self: *VmHost, allocator: Allocator, fid: FuncId) Allocator.Error!Value {

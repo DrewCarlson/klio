@@ -3153,8 +3153,18 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const st
         // `val R.x by expr` has no accessor bodies: the delegate object, produced once by this thunk and
         // cached per property, serves reads and writes through getValue/setValue.
         const nm = try std.fmt.allocPrint(a, "__ext_prop_delegate_{s}_{s}", .{ recv_name, p.name.name });
-        const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
+        // The delegate expression reads the declaring class's scope: `by d::y` names a
+        // member of the owner, so a member extension lowers it as an accessor over that
+        // class and takes the instance as its receiver. A top-level one needs none.
+        const fid = if (dispatch_owner) |owner_simple| blk: {
+            var owner_members = StringSet.init(a);
+            defer owner_members.deinit();
+            break :blk try ir.lower.lowerAccessorExprWithExpected(module, owner_simple, &owner_members, &.{"this"}, delegate, nm, null);
+        } else try ir.lower.lowerExprAsThunk(module, delegate, nm);
         try extension_prop_delegates.put(.{ .a = recv_key, .b = p.name.name }, fid);
+        if (epd.owner) |owner| {
+            try module.registry.member_ext_owner_class.put(fid, owner);
+        }
     }
     if (p.setter) |setter| {
         try lowerExtensionPropSetter(ctx, epd, p, setter, recv_name, recv_key, dispatch_owner);
