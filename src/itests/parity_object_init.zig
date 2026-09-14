@@ -420,10 +420,12 @@ test "subclass_instantiation_initializes_companion_chain" {
         \\fun main() { println("start"); val s = Sub(); println("made " + (s is Base)) }
         \\
     ;
+    // kotlinc runs the superclass's companion first; this expectation had the
+    // pair the other way round.
     try assertKlio(
         "companion_chain",
         src,
-        "start\nsub-comp-init\nbase-comp-init\nmade true\n",
+        "start\nbase-comp-init\nsub-comp-init\nmade true\n",
     );
 }
 
@@ -732,4 +734,34 @@ test "anonymous object initializer retains lexical classifier identity" {
         \\
     ;
     try assertKlio("anonymous_object_classifier_identity", src, "true\n");
+}
+
+test "a superclass companion initialises before its subclass's" {
+    const src =
+        \\
+        \\var l = ""
+        \\fun log(t: String) { l += t + "\n" }
+        \\
+        \\open class B { companion object { init { log("B.Companion") } } }
+        \\class A : B() { companion object { init { log("A.Companion") } } }
+        \\
+        \\interface I { companion object { init { log("I.Companion") } } }
+        \\class ViaInterface : I { companion object { init { log("ViaInterface.Companion") } } }
+        \\
+        \\open class Top { companion object { init { log("Top.Companion") } } }
+        \\open class Mid : Top() { companion object { init { log("Mid.Companion") } } }
+        \\class Leaf : Mid() { companion object { init { log("Leaf.Companion") } } }
+        \\
+        \\fun main() {
+        \\    l = ""; A; println(l.trim())
+        \\    l = ""; ViaInterface; println(l.trim())
+        \\    l = ""; Leaf; println(l.trim())
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "companion_init_order",
+        src,
+        "B.Companion\nA.Companion\nViaInterface.Companion\nTop.Companion\nMid.Companion\nLeaf.Companion\n",
+    );
 }

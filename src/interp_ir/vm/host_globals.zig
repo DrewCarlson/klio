@@ -14,6 +14,7 @@ const host_impl = @import("host_impl.zig");
 const host_instances = @import("host_instances.zig");
 const trace = @import("trace.zig");
 const host_call_member = @import("host_call_member.zig");
+const common = @import("host_fields/common.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -175,6 +176,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
             if (v == .Instance) return .{ .ok = v };
         }
     }
+    try initSupertypeCompanionsOf(self, raw_name);
     // Canonicalize to the run-stable image key: the entry outlives the call.
     const name = blk: {
         const pg = self.prog.borrow();
@@ -432,6 +434,64 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
                 else => return .{ .err = e },
             }
         },
+    }
+}
+
+/// The class whose companion singleton is named `singleton`, or null when the name
+/// is not a companion.
+fn companionOwnerOf(self: *VmHost, singleton: []const u8) ?[]const u8 {
+    const g = self.module.borrow();
+    defer g.deinit();
+    var it = g.get().registry.companion_singletons.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.value_ptr.*, singleton)) return e.key_ptr.*;
+    }
+    return null;
+}
+
+/// Whether the named class is declared `interface`.
+fn isInterfaceClass(self: *VmHost, name: []const u8) bool {
+    const g = self.module.borrow();
+    defer g.deinit();
+    const m = g.get();
+    const cid = m.classId(name) orelse return false;
+    if (cid.int() >= m.classes.items.len) return false;
+    return m.classes.items[cid.int()].is_interface;
+}
+
+/// A superclass's companion initialises before its subclass's, so reading `A1`
+/// runs `B1.Companion` first. Every companion read lands here, whichever path
+/// asked for it.
+fn initSupertypeCompanionsOf(self: *VmHost, singleton: []const u8) Allocator.Error!void {
+    const owner = companionOwnerOf(self, singleton) orelse return;
+    var chain: [32][]const u8 = undefined;
+    var n: usize = 0;
+    var cur = common.firstSupertype(self, owner);
+    while (cur) |c| : (cur = common.firstSupertype(self, c)) {
+        if (n == chain.len or std.mem.eql(u8, c, owner)) break;
+        // A superinterface's companion is not a superclass's: only the class chain
+        // initialises ahead of the subclass.
+        if (isInterfaceClass(self, c)) break;
+        var seen = false;
+        for (chain[0..n]) |x| {
+            if (std.mem.eql(u8, x, c)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) break;
+        chain[n] = c;
+        n += 1;
+    }
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        const sup_companion = blk: {
+            const g = self.module.borrow();
+            defer g.deinit();
+            break :blk g.get().registry.companion_singletons.get(chain[i]) orelse continue;
+        };
+        _ = try ensureObjectSingleton(self, sup_companion);
     }
 }
 
