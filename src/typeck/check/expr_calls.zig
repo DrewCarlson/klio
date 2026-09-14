@@ -897,6 +897,7 @@ fn checkOverloadedCallRecImpl(
         }
         for (sigs) |*s| try filtered.append(self.allocator, s);
     }
+    dropLowPriorityCandidates(&filtered);
     if (filtered.items.len == 1) {
         const sig = filtered.items[0];
         if (has_type_args) {
@@ -1257,6 +1258,28 @@ fn lambdaReturnTiebreak(
         if (p.Function.return_type.eql(actual_ret.*)) return s;
     }
     return null;
+}
+
+/// kotlinc drops a `@Deprecated(level = ERROR|HIDDEN)` or
+/// `@LowPriorityInOverloadResolution` declaration from the candidate set while any
+/// ordinary overload applies: a HIDDEN one exists for binary compatibility, not for
+/// source calls to reach. Compacts in place, keeping declaration order.
+fn dropLowPriorityCandidates(list: *std.ArrayList(*const FnSig)) void {
+    var any_ordinary = false;
+    for (list.items) |s| {
+        if (!s.low_priority) {
+            any_ordinary = true;
+            break;
+        }
+    }
+    if (!any_ordinary) return;
+    var w: usize = 0;
+    for (list.items) |s| {
+        if (s.low_priority) continue;
+        list.items[w] = s;
+        w += 1;
+    }
+    list.items.len = w;
 }
 
 const AmbResolution = struct {

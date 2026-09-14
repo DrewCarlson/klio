@@ -607,6 +607,10 @@ pub const FnSig = struct {
     /// Two overloads whose context type-sets differ are shadowed contextual
     /// overloads, not conflicting ones.
     context_types: []const []const u8 = &.{},
+    /// `@LowPriorityInOverloadResolution` or `@Deprecated(level = ERROR|HIDDEN)`:
+    /// kotlinc keeps such a declaration out of the candidate set while any
+    /// ordinary overload applies.
+    low_priority: bool = false,
 };
 
 /// Kept apart from `MemberFlags` so name-keyed override walks keep their

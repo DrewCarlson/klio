@@ -148,3 +148,30 @@ test "constructor_default_chained" {
         "http://localhost:8080\nhttp://example.com:8080\nhttps://api.example.com:443\n",
     );
 }
+
+test "a hidden-deprecated overload is no source-level candidate" {
+    const src =
+        \\
+        \\@Deprecated(
+        \\    "takes ellipsis, pass overflow instead",
+        \\    level = DeprecationLevel.HIDDEN,
+        \\)
+        \\fun pick(text: String, width: Int, maxLines: Int = 5, ellipsis: Boolean = false): String =
+        \\    "hidden-ellipsis"
+        \\
+        \\fun pick(text: String, width: Int, maxLines: Int = 5, overflow: String = "clip"): String =
+        \\    "visible-overflow"
+        \\
+        \\fun main() {
+        \\    println(pick("t", 1))
+        \\    println(pick(text = "t", width = 1))
+        \\    println(pick("t", 1, 9, "ellipsis"))
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "hidden_overload",
+        src,
+        "visible-overflow\nvisible-overflow\nvisible-overflow\n",
+    );
+}

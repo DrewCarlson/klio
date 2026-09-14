@@ -15,6 +15,7 @@ const expr = @import("expr.zig");
 const expr_calls = @import("expr_calls.zig");
 const narrowing = @import("narrowing.zig");
 const phases = @import("phases.zig");
+const annotations = @import("annotations.zig");
 
 const Allocator = std.mem.Allocator;
 const Span = span.Span;
@@ -315,7 +316,21 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
         .is_extension = f.receiver_type != null,
         .is_crossinline_param = is_crossinline_param,
         .context_types = context_types,
+        .low_priority = annotationsAreLowPriority(f.annotations),
     };
+}
+
+/// `@LowPriorityInOverloadResolution`, or `@Deprecated` at `ERROR`/`HIDDEN`: neither
+/// is a source-level candidate while an ordinary overload applies.
+fn annotationsAreLowPriority(anns: []const ast.Annotation) bool {
+    for (anns) |*a| {
+        const leaf = if (a.path.len > 0) a.path[a.path.len - 1].name else "";
+        if (std.mem.eql(u8, leaf, "LowPriorityInOverloadResolution")) return true;
+    }
+    if (annotations.parseDeprecation(anns)) |info| {
+        return info.level == .Error or info.level == .Hidden;
+    }
+    return false;
 }
 
 pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
