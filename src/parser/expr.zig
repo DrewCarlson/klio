@@ -677,11 +677,12 @@ fn callableReference(chain: *PostfixChain) Step {
             span_first.join(span_last),
         );
     }
-    chain.pending_type_args = &.{};
+    const qualifier_type_args = chain.takeTypeArgs();
     const sp = chain.expr.span().join(name.span);
     chain.expr = Expr{ .MemberRef = .{
         .receiver = boxExpr(p, chain.expr),
         .name = name,
+        .qualifier_type_args = qualifier_type_args,
         .span = sp,
     } };
     return .advance;

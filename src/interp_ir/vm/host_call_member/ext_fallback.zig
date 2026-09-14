@@ -998,6 +998,7 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
             null,
             owner_id,
             false,
+            false,
         )) |sv| {
             if (sv == .Instance) return sv;
         }

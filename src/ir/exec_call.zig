@@ -1520,7 +1520,7 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
     // runtime-scoped shadowing capture outranks it, as on the call form.
     const by_id: ?Value = if (resolved == null and (lt.func != null or lt.class != null) and
         !host.isShadowingCapture(bare_name))
-        host.lookupGlobalById(allocator, lt.func, lt.class, false)
+        host.lookupGlobalById(allocator, lt.func, lt.class, false, false)
     else
         null;
     var v: Value = undefined;
@@ -2466,7 +2466,7 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             const binding_ctor = is_ctor_name or (ctor_class != null and by_id_func == null);
             const by_id: ?Value = if ((ctor_class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
-                host.lookupGlobalById(allocator, by_id_func, ctor_class, binding_ctor)
+                host.lookupGlobalById(allocator, by_id_func, ctor_class, binding_ctor, false)
             else
                 null;
             // A bounded candidate set is authoritative: a miss may not widen back
@@ -2530,7 +2530,7 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 // the function, so re-bind through the function index first.
                 if (!valueInvocable(frame.module, callee) and cmg.candidates == null) {
                     if (frame.module.funcId(name_str)) |fid| {
-                        if (host.lookupGlobalById(allocator, fid, null, false)) |fv| {
+                        if (host.lookupGlobalById(allocator, fid, null, false, false)) |fv| {
                             orAudit("CallMemberOrGlobal", name_str, "noncallable_rebind", -1, null);
                             callee = fv;
                         }

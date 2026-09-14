@@ -1431,7 +1431,7 @@ pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Mo
                 return errResult(.{ .Type = "LoadGlobal: name not a string const" });
             // A lowering-resolved identity binds that exact declaration; the name is the fallback.
             const by_id: ?Value = if (lg.func != null or lg.class != null)
-                host.lookupGlobalById(allocator, lg.func, lg.class, lg.ctor_ref)
+                host.lookupGlobalById(allocator, lg.func, lg.class, lg.ctor_ref, lg.type_qualifier)
             else
                 null;
             const lg_r: MaybeValueResult = if (by_id != null) .{ .ok = by_id } else try host.lookupGlobalThrowing(allocator, name_str);

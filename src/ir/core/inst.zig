@@ -314,7 +314,9 @@ pub const Inst = union(enum) {
     /// Resolve a bare global identifier through the Host. `func`/`class` carry an exact identity
     /// when the index found one; `ctor_ref` makes `::C` the CONSTRUCTOR, not a companion.
     /// index found one. `ctor_ref`: `::C` denotes the CONSTRUCTOR, not a published companion.
-    LoadGlobal: struct { dst: Reg, name: ConstId, func: ?FuncId = null, class: ?ClassId = null, ctor_ref: bool = false },
+    /// `type_qualifier`: the CLASS value, never the object's singleton — `Alias<T>::m`
+    /// writes a type, so the reference it qualifies is unbound.
+    LoadGlobal: struct { dst: Reg, name: ConstId, func: ?FuncId = null, class: ?ClassId = null, ctor_ref: bool = false, type_qualifier: bool = false },
     /// Bare-name read in a receiver context that is no local, capture, or own member: the
     /// runtime searches the implicit receivers innermost first, then the global.
     /// enclosing-`this` chain, each dispatch receiver's nesting tower) innermost first.

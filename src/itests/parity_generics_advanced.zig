@@ -176,3 +176,21 @@ test "type_param_operand_compares_by_equals" {
     ;
     try assertKlio("type_param_eq", src, "true\nfalse\ntrue\ntrue\ntrue\nfalse\nfalse\ntrue\n");
 }
+
+test "written type arguments make a callable reference's qualifier a type" {
+    const src =
+        \\
+        \\object SomeObject { fun foo(): String = "OK" }
+        \\typealias OnSomeObject<T> = SomeObject
+        \\typealias Plain = SomeObject
+        \\
+        \\fun main() {
+        \\    println(SomeObject::foo())
+        \\    println(Plain::foo())
+        \\    println((OnSomeObject<Any>::foo)(SomeObject))
+        \\    println(OnSomeObject::foo())
+        \\}
+        \\
+    ;
+    try assertKlio("type_arg_qualified_ref", src, "OK\nOK\nOK\nOK\n");
+}

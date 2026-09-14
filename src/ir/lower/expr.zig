@@ -1230,9 +1230,41 @@ fn tryBareTypeNameMemberRef(b: *FuncBuilder, mr: @FieldType(Expr, "MemberRef")) 
     return null;
 }
 
+/// `Alias<Any>::foo`: written type arguments make the qualifier a type, so the
+/// reference is unbound and takes the receiver, even where the qualifier names an
+/// object. Without them `Obj::foo` stays bound to the singleton.
+fn tryTypeArgQualifiedRef(b: *FuncBuilder, mr: @FieldType(Expr, "MemberRef")) Allocator.Error!?Reg {
+    if (mr.qualifier_type_args.len == 0) return null;
+    if (std.mem.eql(u8, mr.name.name, "class")) return null;
+    if (mr.receiver.* != .Path or mr.receiver.Path.segments.len != 1) return null;
+    const rn0 = mr.receiver.Path.segments[0].name;
+    var rn = scopeTypeRename(b, rn0, mr.receiver.Path.segments[0].span.file.int()) orelse rn0;
+    // The qualifier may be a typealias, which is where the written arguments most
+    // often sit: `typealias OnObj<T> = Obj`.
+    if (b.module.classId(rn) == null) {
+        if (b.module.registry.type_alias_types.get(rn)) |shape| rn = typeHead(shape.target.name);
+    }
+    const cid = b.module.classIdIndexed(rn, b.self_package, mr.receiver.Path.segments[0].span.file) orelse
+        b.module.classId(rn) orelse return null;
+    // A local of the same name is the value the reference reads, not the type.
+    if (b.resolve(rn0) != null or b.knowsOuter(rn0)) return null;
+    // Only an object needs the rewrite: its bare name loads the singleton, which
+    // would bind the reference. A class name already loads the class.
+    if (cid.int() >= b.module.classes.items.len) return null;
+    if (!b.module.classes.items[cid.int()].is_object) return null;
+    const recv = b.allocReg();
+    const rnm = try b.module.internConst(b.allocator, .{ .String = rn });
+    try b.push(.{ .LoadGlobal = .{ .dst = recv, .name = rnm, .class = cid, .type_qualifier = true } });
+    const dst = b.allocReg();
+    const nm = try b.module.internConst(b.allocator, .{ .String = mr.name.name });
+    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
+    return dst;
+}
+
 /// `recv::name`: a callable reference with a written receiver.
 fn lowerMemberRefExpr(b: *FuncBuilder, mr: @FieldType(Expr, "MemberRef")) Allocator.Error!Reg {
     if (try tryTypeClassRef(b, mr)) |r| return r;
+    if (try tryTypeArgQualifiedRef(b, mr)) |r| return r;
     if (try tryLocalExtensionMemberRef(b, mr)) |r| return r;
     if (try tryExtensionMemberRef(b, mr)) |r| return r;
     if (try tryNestedClassRef(b, mr)) |r| return r;

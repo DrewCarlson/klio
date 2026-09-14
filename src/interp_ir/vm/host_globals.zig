@@ -1171,7 +1171,7 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
 
 /// Resolve a lowering-bound global by exact identity, so no name-keyed
 /// re-resolution swaps in a same-simple-name twin. Null falls to the name path.
-pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, class: ?ir.ClassId, ctor_ref: bool) ?Value {
+pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, class: ?ir.ClassId, ctor_ref: bool, type_qualifier: bool) ?Value {
     if (runtime.envOnce("KLIO_GLOBAL_TRACE") != null) {
         if (class) |cid| {
             const mg = self.module.borrow();
@@ -1196,7 +1196,7 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
     }
     if (class) |cid| {
         // The id table is authoritative: a name binding cannot shadow it.
-        if (!ctor_ref) {
+        if (!ctor_ref and !type_qualifier) {
             const sg = self.singletons_by_id.borrow();
             const own = sg.get().get(cid.int());
             sg.deinit();
@@ -1240,6 +1240,7 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                 // In value position a class with a companion is its companion
                 // singleton and a plain `object` its own, only once published.
                 const singleton_name: ?[]const u8 = blk: {
+                    if (type_qualifier) break :blk null;
                     if (ctor_ref and !is_object) break :blk null;
                     const mg = self.module.borrow();
                     defer mg.deinit();

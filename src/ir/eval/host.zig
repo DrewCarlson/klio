@@ -223,8 +223,8 @@ pub const NullHost = struct {
         return .{ .ok = self.lookupGlobal(name) };
     }
 
-    pub fn lookupGlobalById(self: *NullHost, allocator: Allocator, func: ?FuncId, class: ?ClassId, ctor_ref: bool) ?Value {
-        _ = ctor_ref;
+    pub fn lookupGlobalById(self: *NullHost, allocator: Allocator, func: ?FuncId, class: ?ClassId, ctor_ref: bool, type_qualifier: bool) ?Value {
+        _ = .{ ctor_ref, type_qualifier };
         _ = .{ self, allocator, func, class };
         return null;
     }

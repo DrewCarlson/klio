@@ -35,9 +35,10 @@ const BACKEND_NAME = "KLIO";
 /// the backend marker below then took the two `classLiteral` tests green, and
 /// resolving a member through a property reference took three delegate tests, and
 /// `Any?.toString()` over a nullable unsigned took the inline-class one, and
-/// initialising a superclass's companion first took three more.
-pub const BASELINE: usize = 6063;
-pub const MAX_FAILED: usize = 330;
+/// initialising a superclass's companion first took three more, and a written type
+/// argument on an object qualifier took the callable-reference one.
+pub const BASELINE: usize = 6064;
+pub const MAX_FAILED: usize = 329;
 
 /// Directives binding a test to a framework feature with no klio counterpart:
 /// a backend restriction, a second module, reflection, JDK classes, compiler

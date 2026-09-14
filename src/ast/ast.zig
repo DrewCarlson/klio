@@ -670,6 +670,9 @@ pub const Expr = union(enum) {
     MemberRef: struct {
         receiver: *Expr,
         name: Ident,
+        /// `Alias<Any>::foo`: written type arguments make the qualifier a type, so
+        /// the reference is unbound even where the qualifier names an object.
+        qualifier_type_args: []TypeRef = &.{},
         span: Span,
     },
     /// `subject` is `None` for the subject-free `when { cond -> ... }`. The first
