@@ -87,9 +87,15 @@ pub const StdlibBase = struct {
 };
 
 /// The allocator must be the process-lifetime base arena. Null when the base is not
-/// snapshot-safe (resolve diagnostics or a `main`), leaving the full per-program build.
+/// snapshot-safe (resolve diagnostics), leaving the full per-program build.
+///
+/// A dependency that declares `main` is snapshot-safe: the image serialises the
+/// base's entry point, and lowering the user program afterwards rebinds `main` to
+/// whichever the program declares, so the same entry wins either way. Refusing
+/// those bases cost every project whose own library pack carries a `main` its
+/// image, and with it a dozen seconds on every run.
 pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
-    return buildBaseInner(allocator, files, false);
+    return buildBaseInner(allocator, files, .allow);
 }
 
 /// The parent's primary parameter at `idx`, instantiated by the supertype's written
@@ -138,16 +144,23 @@ pub fn irTypeToAstInstantiated(a: Allocator, ty: ir.TypeRef, tps: []const []cons
 }
 
 pub fn buildProgramBase(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
-    return buildBaseInner(allocator, files, true);
+    return buildBaseInner(allocator, files, .require);
 }
 
-pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_main: bool) Allocator.Error!?*StdlibBase {
+/// What the base does with a `main` among its files: a program base must have
+/// one, a dependency base may carry one it never runs.
+pub const MainPolicy = enum { require, allow };
+
+pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_policy: MainPolicy) Allocator.Error!?*StdlibBase {
     var lifted: []Decl = &.{};
     var built = try buildModuleFilesInner(allocator, files, null, &lifted);
     {
         const mg = built.module.borrow();
         defer mg.deinit();
-        const main_ok = if (allow_main) built.main != null else built.main == null;
+        const main_ok = switch (main_policy) {
+            .require => built.main != null,
+            .allow => true,
+        };
         if (mg.get().resolve_diags.items.len != 0 or !main_ok) {
             built.deinit();
             return null;
@@ -339,24 +352,18 @@ pub fn noteBaseDeclNames(base: *StdlibBase, d: *const Decl, root_pkg: bool) Allo
 }
 
 /// Conservative: any top-level simple-name overlap in either namespace, any expect or
-/// actual decl, any package overlap, or a function-type alias matching a base param type.
+/// actual decl, or a function-type alias matching a base param type.
+///
+/// Sharing a package with the base is not itself a conflict. A program's own
+/// package is in the base whenever its library ships as a pack, which is every
+/// project whose tests sit beside the code they test, and refusing those cost
+/// them the image on every run. What the refusal was guarding is name capture,
+/// and the per-declaration checks below cover it: a packaged user file is
+/// checked against every base name in both namespaces, so a declaration that
+/// could rebind a base reference is still refused. A name the base never had
+/// cannot change how the base resolved, since the base was lowered without it.
 pub fn canExtendBase(base: *const StdlibBase, user_files: []const KotlinFile) bool {
     for (user_files) |*f| {
-        if (f.package) |p| {
-            var buf: [256]u8 = undefined;
-            var n: usize = 0;
-            for (p.path, 0..) |id, i| {
-                if (i != 0) {
-                    if (n >= buf.len) return false;
-                    buf[n] = '.';
-                    n += 1;
-                }
-                if (n + id.name.len > buf.len) return false;
-                @memcpy(buf[n .. n + id.name.len], id.name);
-                n += id.name.len;
-            }
-            if (base.packages.contains(buf[0..n])) return extendRefused("package overlap", buf[0..n]);
-        }
         // A root-package user callable collides only with a base callable reachable from the root
         // package. The TYPE namespace keeps the whole-set refusal, since casts, `is` checks and
         // reified probes resolve type names WITHOUT package scoping.
