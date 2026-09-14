@@ -1500,17 +1500,17 @@
 
 
 <h1 id="stdlib-strategy">Stdlib strategy<a class="headerlink" href="#stdlib-strategy" title="Permanent link">&para;</a></h1>
-<p>The Kotlin stdlib is <strong>the</strong> runtime surface a program has access to. klio ships a complete implementation that behaves exactly like Kotlin 2.4.0's stdlib on the JVM where semantics are platform-agnostic.</p>
+<p>The Kotlin stdlib is <strong>the</strong> runtime surface a program has access to. klio ships a complete implementation that behaves exactly like Kotlin 2.4.20's stdlib on the JVM where semantics are platform-agnostic.</p>
 <h2 id="guiding-principles">Guiding principles<a class="headerlink" href="#guiding-principles" title="Permanent link">&para;</a></h2>
 <ol>
 <li>
-<p><strong>Upstream source is the implementation.</strong> The stdlib pack's Kotlin source is the upstream tree itself (<code>kotlin/libraries/stdlib</code>, pinned at v2.4.0) plus klio-authored actuals under <code>kotlin-klio/</code>, interpreted like any other Kotlin. Hand-written Zig intrinsics (<code>src/stdlib/implementations/</code>) shadow individual functions at dispatch where host access (IO, clock, threads) or performance demands a native body. This inverts the original plan (all-native, CPython-style): interpreting upstream keeps behavior exactly aligned and makes version bumps a re-pin, not a rewrite.</p>
+<p><strong>Upstream source is the implementation.</strong> The stdlib pack's Kotlin source is the upstream tree itself (<code>kotlin/libraries/stdlib</code>, pinned at v2.4.20) plus klio-authored actuals under <code>kotlin-klio/</code>, interpreted like any other Kotlin. Hand-written Zig intrinsics (<code>src/stdlib/implementations/</code>) shadow individual functions at dispatch where host access (IO, clock, threads) or performance demands a native body. This inverts the original plan (all-native, CPython-style): interpreting upstream keeps behavior exactly aligned and makes version bumps a re-pin, not a rewrite.</p>
 </li>
 <li>
 <p><strong>The API surface is mined, not maintained by hand.</strong> <code>stdlib_gen</code> reads <code>kotlin/libraries/stdlib/</code> and produces the symbol index (<code>SymbolEntry</code> per public symbol: FQN, kind, signature, modifiers, source span) that the resolver and the Vm's dispatch consult. Bumping Kotlin versions regenerates the surface mechanically.</p>
 </li>
 <li>
-<p><strong>Pin to Kotlin 2.4.0.</strong> The <code>kotlin/</code> submodule is pinned at the tag; bumping is a deliberate, tracked operation.</p>
+<p><strong>Pin to Kotlin 2.4.20.</strong> The <code>kotlin/</code> submodule is pinned at the tag; bumping is a deliberate, tracked operation.</p>
 </li>
 <li>
 <p><strong>Coverage is enforced by upstream's own tests.</strong> The upstream stdlib <code>commonTest</code> suite (117 files, ~2,150 tests) runs directly under the interpreter. <code>src/itests/stdlib_commontest.zig</code> ratchets the pass count (never lower it); <code>scripts/commontest-sweep.py</code> gives per-file iteration. The suite passes per-file at 100% as of 2026-07-06.</p>
