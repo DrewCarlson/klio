@@ -41,6 +41,8 @@ const io = @import("io.zig");
 const pack_cache = @import("pack_cache.zig");
 pub const RequestedFeatures = pack_cache.RequestedFeatures;
 const loadInstalledPacks = pack_cache.loadInstalledPacks;
+const loadInstalledPacksOpts = pack_cache.loadInstalledPacksOpts;
+const project = @import("project.zig");
 
 const stdlib_image = @import("stdlib_image.zig");
 const bundle = @import("bundle.zig");
@@ -218,7 +220,9 @@ pub fn runModuleFiles(
         asts.append(gpa, file_ast) catch return 1;
     }
 
-    const loaded = loadInstalledPacks(gpa, asts.items, &map, features);
+    const loaded = loadInstalledPacksOpts(gpa, asts.items, &map, features, .{
+        .exclude_lib_ids = project.ownLibraryExclusion(gpa, paths),
+    });
     // Pack ASTs first so the user's `main` wins when lowering picks an entry.
     var all_asts: std.ArrayList(KotlinFile) = .empty;
     defer all_asts.deinit(gpa);
@@ -259,7 +263,9 @@ pub fn runFileIrVm(
     defer user_asts.deinit(gpa);
     user_asts.append(gpa, file_ast) catch return 1;
 
-    const loaded = loadInstalledPacks(gpa, user_asts.items, &map, features);
+    const loaded = loadInstalledPacksOpts(gpa, user_asts.items, &map, features, .{
+        .exclude_lib_ids = project.ownLibraryExclusion(gpa, &.{path}),
+    });
     var all_asts: std.ArrayList(KotlinFile) = .empty;
     defer all_asts.deinit(gpa);
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;

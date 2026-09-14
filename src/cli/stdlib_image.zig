@@ -41,6 +41,7 @@ const stdlib_pack = @import("stdlib_pack");
 
 const io = @import("io.zig");
 const pack_cache = @import("pack_cache.zig");
+const project = @import("project.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
 
 /// Keep this many images; older ones (by mtime) are pruned after a bake. Below
@@ -580,6 +581,10 @@ pub fn tryPrepare(
 ) ?Prepared {
     if (disabled(gpa)) return null;
     const t0 = runtime.clockMonotonicNanos();
+    // The library these sources are must stay out of the base. Its installed
+    // pack declares the same `main` they do, and a base that declares one is
+    // not snapshot-safe, which would disable the image for every later run.
+    const own_library = project.ownLibraryExclusion(gpa, paths);
     const cache = cacheDir(gpa) orelse return null;
     const exe = exeStamp(gpa) orelse return null;
     const stdlib_hash = stdlibContentHash(gpa) orelse return null;
@@ -616,6 +621,7 @@ pub fn tryPrepare(
             .selection = &sel_tmp,
             .report_failures = false,
             .asts_needed = false,
+            .exclude_lib_ids = own_library,
         }).bindings;
         for (sel_tmp.packs.items) |p| {
             const feats = gpa.alloc([]const u8, p.features.len) catch return null;
@@ -793,6 +799,7 @@ fn bakeAndPrepare(
     const deps = pack_cache.loadInstalledPacksOpts(gpa, user.asts, dep_map, features, .{
         .embedded_report = &report,
         .selection = &selection,
+        .exclude_lib_ids = project.ownLibraryExclusion(gpa, paths),
     });
     const tb_parse = runtime.clockMonotonicNanos();
 

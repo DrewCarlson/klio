@@ -83,6 +83,11 @@ pub const LoadOptions = struct {
     /// When false, the ASTs are dropped and a pack carrying the `imports`
     /// section skips parsing its sources.
     asts_needed: bool = true,
+    /// Libraries never loaded from the cache, however the imports match. Running
+    /// a library's own source passes its id here: the sources on the command
+    /// line are that library, and loading the installed copy as well would
+    /// declare every one of its declarations twice.
+    exclude_lib_ids: []const []const u8 = &.{},
 };
 
 /// `ok` is an owned path, `err` an owned message; the caller frees whichever is set.
@@ -993,6 +998,12 @@ fn loadInstalledPacksImpl(
 
     var loaded_lib_ids = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&loaded_lib_ids);
+    // An excluded library reads as already loaded, so no pass picks it up.
+    for (opts.exclude_lib_ids) |id| {
+        const dup = try gpa.dupe(u8, id);
+        const gop = try loaded_lib_ids.getOrPut(dup);
+        if (gop.found_existing) gpa.free(dup) else gop.value_ptr.* = {};
+    }
 
     // Feature requests accumulate across passes: the CLI seed plus pack deps.
     var feature_reqs = try cloneRequestedFeatures(gpa, requested_features);

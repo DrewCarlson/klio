@@ -190,3 +190,75 @@ pub fn planTest(a: Allocator, dir: []const u8, sel: FeatureSel) ?TestPlan {
         .active_features = active.toOwnedSlice(a) catch return null,
     };
 }
+
+/// The library whose own source `paths` belong to, or null. Walking up from a
+/// source file to its `klio.toml` answers one question: are these files the
+/// library itself? They are when the file sits under a declared source root, and
+/// then the installed pack built from those same files must not load alongside
+/// them. A file under a `[[test]]` root is a consumer, not the library, so it
+/// resolves against the installed pack as usual.
+pub fn owningLibraryId(a: Allocator, paths: []const []const u8) ?[]const u8 {
+    const first = if (paths.len != 0) paths[0] else return null;
+    // Absolute first: a relative path runs out of components before the walk
+    // reaches the working directory, and the manifest there goes unseen.
+    var dir = std.fs.path.dirname(absOrSelf(a, first)) orelse return null;
+
+    while (true) {
+        const toml_path = std.fs.path.join(a, &.{ dir, "klio.toml" }) catch return null;
+        if (readFileAlloc(a, toml_path)) |text| {
+            const cfg = switch (pack_build.parseLibraryToml(a, text)) {
+                .ok => |c| c,
+                .err => return null,
+            };
+            if (cfg.library.id.len == 0) return null;
+            for (paths) |p| {
+                if (!underSourceRoot(a, dir, &cfg, p)) return null;
+            }
+            return cfg.library.id;
+        }
+        dir = std.fs.path.dirname(dir) orelse return null;
+        if (dir.len == 0) return null;
+    }
+}
+
+fn underSourceRoot(a: Allocator, project_dir: []const u8, cfg: *const pack_build.LibraryToml, path: []const u8) bool {
+    const abs = absOrSelf(a, path);
+    for (cfg.library.source_roots) |root| {
+        if (pathStartsWith(abs, absOrSelf(a, std.fs.path.join(a, &.{ project_dir, root }) catch return false))) return true;
+    }
+    for (cfg.source) |s| {
+        if (pathStartsWith(abs, absOrSelf(a, std.fs.path.join(a, &.{ project_dir, s.root }) catch return false))) return true;
+    }
+    if (cfg.library.source_roots.len == 0 and cfg.source.len == 0) {
+        return pathStartsWith(abs, absOrSelf(a, std.fs.path.join(a, &.{ project_dir, "src" }) catch return false));
+    }
+    return false;
+}
+
+fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    return path.len == prefix.len or path[prefix.len] == '/';
+}
+
+fn absOrSelf(a: Allocator, path: []const u8) []const u8 {
+    if (std.fs.path.isAbsolute(path)) return path;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.c.getcwd(&buf, buf.len) == null) return path;
+    const len = std.mem.findScalar(u8, &buf, 0) orelse buf.len;
+    return std.fs.path.resolve(a, &.{ buf[0..len], path }) catch path;
+}
+
+fn readFileAlloc(a: Allocator, path: []const u8) ?[]u8 {
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    return std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .unlimited) catch null;
+}
+
+/// `owningLibraryId` as a load exclusion list, empty when the sources are not a
+/// library's own.
+pub fn ownLibraryExclusion(a: Allocator, paths: []const []const u8) []const []const u8 {
+    const id = owningLibraryId(a, paths) orelse return &.{};
+    const one = a.alloc([]const u8, 1) catch return &.{};
+    one[0] = id;
+    return one;
+}
