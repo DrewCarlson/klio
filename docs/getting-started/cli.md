@@ -53,7 +53,7 @@ stdlib gate variants). Old images beyond a small keep-count are pruned.
 | Command                                       | Purpose                                                                       |
 |-----------------------------------------------|-------------------------------------------------------------------------------|
 | `klio pack new <dir> [--id NAME]`             | Scaffold a library: `klio.toml`, `src/main/kotlin/`, README.                   |
-| `klio pack build <dir> [--out PATH]`          | Build a `.klio-pack` from a directory holding a `klio.toml`.                    |
+| `klio pack build <dir> [--out PATH]`          | Build a `.klio-pack` from a directory holding a `klio.toml`. `--out` names the file.  |
 | `klio pack install <pack>`                    | Copy a pack into `~/.klio/packs/` so subsequent `klio run` calls see it.        |
 | `klio pack list`                              | Show every cached pack with version and dependency hints.                      |
 | `klio pack remove <id> [--version VER]`       | Delete a cached pack.                                                          |

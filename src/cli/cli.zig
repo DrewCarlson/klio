@@ -672,13 +672,49 @@ fn runPackCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     return pack_build.runPack(gpa, cmd);
 }
 
+/// The value of `--flag <value>` or `--flag=value`, null when absent.
+fn packFlag(args: []const []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], name)) {
+            return if (i + 1 < args.len) args[i + 1] else null;
+        }
+        if (std.mem.startsWith(u8, args[i], name) and
+            args[i].len > name.len and args[i][name.len] == '=')
+        {
+            return args[i][name.len + 1 ..];
+        }
+    }
+    return null;
+}
+
+/// The positional arguments, with flags and their values removed.
+fn packPositionals(buf: [][]const u8, args: []const []const u8) [][]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.startsWith(u8, args[i], "--")) {
+            // `--flag value` consumes the value too; `--flag=value` stands alone.
+            if (std.mem.findScalar(u8, args[i], '=') == null) i += 1;
+            continue;
+        }
+        if (n >= buf.len) break;
+        buf[n] = args[i];
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 /// Only the minimal positional form; flag-heavy variants take their defaults.
 fn parsePackCmd(args: []const []const u8) ?PackCmd {
     const sub = args[0];
-    const pos = args[1..];
+    var pos_buf: [8][]const u8 = undefined;
+    const pos = packPositionals(&pos_buf, args[1..]);
     if (std.mem.eql(u8, sub, "build")) {
         if (pos.len < 1) return null;
-        return .{ .Build = .{ .dir = pos[0] } };
+        var build_cmd: PackCmd = .{ .Build = .{ .dir = pos[0] } };
+        if (packFlag(args, "--out")) |o| build_cmd.Build.out = o;
+        return build_cmd;
     } else if (std.mem.eql(u8, sub, "stdlib")) {
         return .{ .Stdlib = .{} };
     } else if (std.mem.eql(u8, sub, "install")) {
@@ -697,7 +733,9 @@ fn parsePackCmd(args: []const []const u8) ?PackCmd {
         return .{ .Verify = .{ .pack = pos[0] } };
     } else if (std.mem.eql(u8, sub, "new")) {
         if (pos.len < 1) return null;
-        return .{ .New = .{ .dir = pos[0] } };
+        var new_cmd: PackCmd = .{ .New = .{ .dir = pos[0] } };
+        if (packFlag(args, "--id")) |id| new_cmd.New.id = id;
+        return new_cmd;
     } else if (std.mem.eql(u8, sub, "migrate")) {
         if (pos.len < 1) return null;
         return .{ .Migrate = .{ .input = pos[0] } };

@@ -274,8 +274,10 @@ fn writeFileWithParents(gpa: std.mem.Allocator, path: []const u8, data: []const 
     defer threaded.deinit();
     const tio = threaded.io();
     if (std.fs.path.dirname(path)) |parent| {
-        std.Io.Dir.cwd().createDirPath(tio, parent) catch |e|
-            return .{ .err = fail(gpa, "{s}", .{@errorName(e)}) };
+        // A parent that already exists can still fail here: on macOS `/tmp` is a
+        // symlink, and creating the path through it reports NotDir. The write
+        // below is the real test of whether the directory is usable.
+        std.Io.Dir.cwd().createDirPath(tio, parent) catch {};
     }
     std.Io.Dir.cwd().writeFile(tio, .{ .sub_path = path, .data = data }) catch |e|
         return .{ .err = fail(gpa, "{s}", .{@errorName(e)}) };
