@@ -358,6 +358,23 @@ pub fn loweredCheckTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []con
                 } else |_| {}
             }
         }
+        // `Outer.Mid.Inner`: resolve the head through the file's imports, or by its
+        // simple name when the owner is declared here, and rejoin the rest. This
+        // reaches a nesting level the two-segment key above cannot name.
+        if (std.mem.findScalar(u8, qp, '.')) |d| {
+            const head_id_opt = b.module.classIdExactImport(qp[0..d], ty.span.file) orelse
+                b.module.uniqueClassIdBySimpleName(qp[0..d]);
+            if (head_id_opt) |head_id| {
+                if (head_id.int() < b.module.classes.items.len) {
+                    const head_fqn = b.module.classes.items[head_id.int()].fqn;
+                    if (std.fmt.allocPrint(b.allocator, "{s}.{s}", .{ head_fqn, qp[d + 1 ..] })) |joined| {
+                        if (b.module.classIdByFqn(joined)) |cid| {
+                            if (cid.int() < b.module.classes.items.len) return b.module.classes.items[cid.int()].fqn;
+                        }
+                    } else |_| {}
+                }
+            }
+        }
         // Normalise to the canonical FQN when the path resolves; otherwise carry
         // it through for the runtime to resolve once every class is registered.
         if (b.module.classIdByFqn(qp)) |cid| {

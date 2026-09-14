@@ -3,13 +3,13 @@
 # selected when a user import prefix-matches its id, so importing any
 # `androidx.compose.runtime.*` symbol pulls this pack in.
 id = "androidx.compose.runtime"
-version = "1.11.1"
+version = "1.12.0"
 abi = 1
 implicit_packages = []
 auto_bindings = true
 
 # Upstream androidx.compose.runtime commonMain, consumed straight from the
-# in-pack git submodule (compose-multiplatform-core v1.11.1). `include` curates
+# in-pack git submodule (compose-multiplatform-core v1.12.0). `include` curates
 # exactly the files klio can lex + parse and that do not depend on the compiler
 # plugin: the public annotations / contracts. The compiler-coupled engine
 # (Composer / SlotTable / Recomposer), the MVCC snapshot core, and the

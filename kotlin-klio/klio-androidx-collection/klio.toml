@@ -7,7 +7,7 @@
 # for every `expect` (Float.fromBits, LinkedHashMap-backed LruHashMap,
 # kotlinx.atomicfu.locks-backed Lock, …).
 id = "androidx.collection"
-version = "1.11.1"
+version = "1.12.0"
 abi = 1
 implicit_packages = []
 auto_bindings = true

@@ -4,7 +4,7 @@
 # the platform actuals (CommonRippleNode serves the platform ripple).
 [library]
 id = "androidx.compose.material.ripple"
-version = "1.11.1"
+version = "1.12.0"
 abi = 1
 implicit_packages = []
 auto_bindings = true

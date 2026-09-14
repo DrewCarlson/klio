@@ -5,7 +5,7 @@
 # (KlioCanvas). WIP: the node/layout tier is landing incrementally.
 [library]
 id = "androidx.compose.ui"
-version = "1.11.1"
+version = "1.12.0"
 abi = 1
 implicit_packages = []
 auto_bindings = true
@@ -207,6 +207,7 @@ include = [
     "androidx/compose/ui/node/UnplacedAwareModifierNode.kt",
     "androidx/compose/ui/node/WeakReference.kt",
     "androidx/compose/ui/platform/AccessibilityManager.kt",
+    "androidx/compose/ui/platform/SoundEffect.kt",
     "androidx/compose/ui/platform/AtomicInt.kt",
     "androidx/compose/ui/platform/ClassHelpers.kt",
     "androidx/compose/ui/platform/Clipboard.kt",
@@ -262,6 +263,8 @@ include = [
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui/src/skikoMain/kotlin"
 include = [
+    "androidx/compose/ui/platform/CompositionLocals.skiko.kt",
+    "androidx/compose/ui/platform/PlatformPrefetchScheduler.skiko.kt",
     "androidx/compose/ui/autofill/ContentDataType.skiko.kt",
     "androidx/compose/ui/autofill/ContentType.skiko.kt",
     "androidx/compose/ui/autofill/FillableData.skiko.kt",

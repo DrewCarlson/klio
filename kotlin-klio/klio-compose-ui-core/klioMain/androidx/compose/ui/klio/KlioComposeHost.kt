@@ -61,6 +61,10 @@ import androidx.compose.ui.node.Owner
 import androidx.compose.ui.node.OwnerSnapshotObserver
 import androidx.compose.ui.node.RootForTest
 import androidx.compose.ui.platform.AccessibilityManager
+import androidx.compose.ui.InternalComposeUiApi
+import androidx.compose.ui.platform.LocalPlatformPrefetchScheduler
+import androidx.compose.ui.platform.PlatformPrefetchRequest
+import androidx.compose.ui.platform.PlatformPrefetchScheduler
 import androidx.compose.ui.platform.Clipboard
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalAccessibilityManager
@@ -533,9 +537,25 @@ internal class KlioComposeOwner(
 // model are omitted).
 // ---------------------------------------------------------------------------
 
+// Prefetching is a latency optimisation: a lazy layout still composes every item
+// it needs on demand. klio has no frame-idle slot to run requests in, so they are
+// accepted and dropped.
+@OptIn(InternalComposeUiApi::class)
+internal object KlioPrefetchScheduler : PlatformPrefetchScheduler {
+    override fun scheduleHighPriorityPrefetch(
+        request: PlatformPrefetchRequest
+    ) {}
+
+    override fun scheduleLowPriorityPrefetch(
+        request: PlatformPrefetchRequest
+    ) {}
+}
+
+@OptIn(InternalComposeUiApi::class)
 @Composable
 internal fun ProvideKlioCompositionLocals(owner: KlioComposeOwner, content: @Composable () -> Unit) {
     CompositionLocalProvider(
+        LocalPlatformPrefetchScheduler provides KlioPrefetchScheduler,
         LocalDensity provides owner.density,
         LocalLayoutDirection provides owner.layoutDirection,
         LocalFontFamilyResolver providesDefault owner.fontFamilyResolver,

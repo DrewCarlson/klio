@@ -2,7 +2,7 @@
 
 The Compose Multiplatform runtime, running on klio with **no Compose compiler
 plugin**. The pack consumes the upstream `androidx.compose.runtime` annotation
-surface verbatim (vendored from compose-multiplatform-core v1.11.1) and supplies
+surface verbatim (vendored from compose-multiplatform-core v1.12.0) and supplies
 a klio-authored engine — composer, composition, recomposer, observable state,
 CompositionLocal, and effects — in `klioMain`.
 

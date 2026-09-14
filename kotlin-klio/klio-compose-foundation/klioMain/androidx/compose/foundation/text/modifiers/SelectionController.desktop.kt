@@ -1,4 +1,4 @@
-// Vendored from compose-multiplatform-core desktopMain (v1.11.1),
+// Vendored from compose-multiplatform-core desktopMain (v1.12.0),
 // androidx/compose/foundation/text/modifiers/SelectionController.desktop.kt.
 //
 // COPIED, not linked: the desktop source set as a whole depends on JVM APIs
@@ -29,5 +29,5 @@ import androidx.compose.ui.layout.LayoutCoordinates
 
 internal actual fun SelectionRegistrar.makeSelectionModifier(
     selectableId: Long,
-    layoutCoordinates: () -> LayoutCoordinates?
-): Modifier = makeSkikoSelectionModifier(selectableId, layoutCoordinates)
+    layoutCoordinatesProvider: () -> LayoutCoordinates?
+): Modifier = makeDefaultSelectionModifier(selectableId, layoutCoordinatesProvider)

@@ -525,3 +525,43 @@ test "inner_class_super_constructor_reads_outer_field" {
     ;
     try assertKlio("inner_super_outer", src, "42\n");
 }
+
+test "is_check_names_a_nested_class_two_levels_down" {
+    const src =
+        \\
+        \\class A(val focus: Focus) {
+        \\    abstract class Focus private constructor() {
+        \\        class Opacity : Focus()
+        \\        class Ring(val w: Int) : Focus()
+        \\    }
+        \\}
+        \\class B(val focus: Focus) {
+        \\    abstract class Focus private constructor() {
+        \\        class Opacity : Focus()
+        \\    }
+        \\}
+        \\fun nameA(f: A.Focus): String =
+        \\    when (f) {
+        \\        is A.Focus.Opacity -> "a-opacity"
+        \\        is A.Focus.Ring -> "a-ring"
+        \\        else -> error("unknown")
+        \\    }
+        \\fun nameB(f: B.Focus): String =
+        \\    when (f) {
+        \\        is B.Focus.Opacity -> "b-opacity"
+        \\        else -> error("unknown")
+        \\    }
+        \\fun main() {
+        \\    val a: A.Focus = A.Focus.Opacity()
+        \\    println(nameA(a))
+        \\    println(nameA(A.Focus.Ring(2)))
+        \\    println(nameB(B.Focus.Opacity()))
+        \\    println((a as A.Focus.Opacity) === a)
+        \\    val any: Any = B.Focus.Opacity()
+        \\    println(any is A.Focus.Opacity)
+        \\    println(any is B.Focus.Opacity)
+        \\}
+        \\
+    ;
+    try assertKlio("nested_is_two_levels", src, "a-opacity\na-ring\nb-opacity\ntrue\nfalse\ntrue\n");
+}

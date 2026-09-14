@@ -1,11 +1,11 @@
 # androidx.compose.ui.text — text model + styling (AnnotatedString, TextStyle,
 # SpanStyle/ParagraphStyle, FontFamily/FontWeight, TextLayoutResult), vendored
 # verbatim. A dependency of compose.foundation. Text SHAPING/measure/draw
-# (ActualParagraph, drawMultiParagraph) are klioMain actuals over the Skia
+# (Paragraph, ParagraphIntrinsics, drawMultiParagraph) are klioMain actuals over the Skia
 # Paragraph shim; landing incrementally, so those defer to runtime for now.
 [library]
 id = "androidx.compose.ui.text"
-version = "1.11.1"
+version = "1.12.0"
 abi = 1
 implicit_packages = []
 auto_bindings = true
@@ -17,7 +17,6 @@ include = [
     "androidx/compose/ui/text/AtomicReference.kt",
     "androidx/compose/ui/text/Bullet.kt",
     "androidx/compose/ui/text/CharHelpers.kt",
-    "androidx/compose/ui/text/ComposeUiTextFlags.kt",
     "androidx/compose/ui/text/ExperimentalTextApi.kt",
     "androidx/compose/ui/text/font/DelegatingFontLoaderForDeprecatedUsage.kt",
     "androidx/compose/ui/text/font/FontFamily.kt",
@@ -63,7 +62,6 @@ include = [
     "androidx/compose/ui/text/Placeholder.kt",
     "androidx/compose/ui/text/platform/Dispatcher.kt",
     "androidx/compose/ui/text/platform/PlatformMultiParagraphDraw.kt",
-    "androidx/compose/ui/text/platform/PlatformParagraph.kt",
     "androidx/compose/ui/text/platform/PlatformString.kt",
     "androidx/compose/ui/text/platform/Synchronization.kt",
     "androidx/compose/ui/text/PlatformTextStyle.kt",

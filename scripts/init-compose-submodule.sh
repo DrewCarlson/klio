@@ -52,6 +52,7 @@ sparse=(
   "compose/foundation/foundation/src/skikoMain"
   "compose/foundation/foundation/src/desktopMain"
   "compose/material3/material3/src/commonMain"
+  "compose/material3/material3/src/skikoMain"
   "compose/material/material-ripple/src/commonMain"
   "compose/material/material-ripple/src/nonAndroidMain"
   "graphics/graphics-shapes/src/commonMain"

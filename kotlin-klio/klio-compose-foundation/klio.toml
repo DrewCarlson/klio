@@ -2,7 +2,7 @@
 # scroll, lazy lists, text fields, gestures, selection), vendored verbatim.
 [library]
 id = "androidx.compose.foundation"
-version = "1.11.1"
+version = "1.12.0"
 abi = 1
 implicit_packages = []
 auto_bindings = true
@@ -326,6 +326,17 @@ include = [
     "androidx/compose/foundation/text/modifiers/SelectableTextAnnotatedStringElement.kt",
     "androidx/compose/foundation/text/modifiers/SelectableTextAnnotatedStringNode.kt",
     "androidx/compose/foundation/text/modifiers/SelectionController.kt",
+    "androidx/compose/foundation/gestures/AbstractScrollableNode.kt",
+    "androidx/compose/foundation/lazy/layout/LazyLayoutAnimateItemModifier.kt",
+    "androidx/compose/foundation/lazy/layout/LazyLayoutItemAnimatorModifier.kt",
+    "androidx/compose/foundation/lazy/layout/LazyLayoutBringIntoViewSpec.kt",
+    "androidx/compose/foundation/style/StyleProperties.kt",
+    "androidx/compose/foundation/text/input/TextFieldTextStyles.kt",
+    "androidx/compose/foundation/text/input/TrackedRange.kt",
+    "androidx/compose/foundation/text/input/internal/Interval.kt",
+    "androidx/compose/foundation/text/modifiers/SelectionModifierElement.kt",
+    "androidx/compose/foundation/text/selection/SelectionState.kt",
+    "androidx/compose/foundation/text/modifiers/SelectionModifierNode.kt",
     "androidx/compose/foundation/text/modifiers/TextAnnotatedStringElement.kt",
     "androidx/compose/foundation/text/modifiers/TextAnnotatedStringNode.kt",
     "androidx/compose/foundation/text/modifiers/TextAutoSizeLayoutScope.kt",
@@ -362,6 +373,8 @@ include = [
 # files klio can lex + parse and whose dependencies the pack carries.
 root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/skikoMain/kotlin"
 include = [
+    "androidx/compose/foundation/ComposeFoundationFlags.skiko.kt",
+    "androidx/compose/foundation/lazy/layout/PrefetchScheduler.skiko.kt",
     "androidx/compose/foundation/text/AutofillHighlight.skiko.kt",
     "androidx/compose/foundation/text/BasicSecureTextField.skiko.kt",
     "androidx/compose/foundation/text/BasicText.skiko.kt",
@@ -379,14 +392,12 @@ include = [
     "androidx/compose/foundation/text/contextmenu/data/TextContextMenuData.skiko.kt",
     "androidx/compose/foundation/text/contextmenu/internal/DefaultTextContextMenuDropdownProvider.skiko.kt",
     "androidx/compose/foundation/text/handwriting/StylusHandwriting.skiko.kt",
-    "androidx/compose/foundation/text/input/TextObfuscationMode.skiko.kt",
     "androidx/compose/foundation/text/input/internal/LegacyPlatformTextInputServiceAdapter.skiko.kt",
     "androidx/compose/foundation/text/input/internal/TextFieldDragAndDropNode.skiko.kt",
     "androidx/compose/foundation/text/input/internal/TextFieldKeyEventHandler.skiko.kt",
     "androidx/compose/foundation/text/input/internal/TextFieldLayoutStateCache.skiko.kt",
     "androidx/compose/foundation/text/input/internal/TextInputSession.skiko.kt",
     "androidx/compose/foundation/text/input/internal/ToCharArray.skiko.kt",
-    "androidx/compose/foundation/text/modifiers/SelectionController.skiko.kt",
     "androidx/compose/foundation/text/selection/PlatformSelectionBehaviors.skiko.kt",
     "androidx/compose/foundation/text/selection/SelectionGestures.skiko.kt",
     "androidx/compose/foundation/text/selection/SelectionHandles.skiko.kt",

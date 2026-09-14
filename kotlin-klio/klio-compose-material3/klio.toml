@@ -2,7 +2,7 @@
 # Surface, Card, Scaffold, theming/color scheme, typography), vendored verbatim.
 [library]
 id = "androidx.compose.material3"
-version = "1.11.1"
+version = "1.12.0"
 abi = 1
 implicit_packages = []
 auto_bindings = true
@@ -16,6 +16,13 @@ include = [
     "androidx/compose/material3/AppBarDsl.kt",
     "androidx/compose/material3/AppBarRow.kt",
     "androidx/compose/material3/Badge.kt",
+    "androidx/compose/material3/BottomSheet.kt",
+    "androidx/compose/material3/ScrollField.kt",
+    "androidx/compose/material3/internal/ripple/Border.kt",
+    "androidx/compose/material3/internal/ripple/CommonRipple.kt",
+    "androidx/compose/material3/internal/ripple/Ripple.kt",
+    "androidx/compose/material3/internal/ripple/RippleAnimation.kt",
+    "androidx/compose/material3/internal/ripple/RippleNodeConfig.kt",
     "androidx/compose/material3/BottomSheetScaffold.kt",
     "androidx/compose/material3/Button.kt",
     "androidx/compose/material3/ButtonGroup.kt",
@@ -251,6 +258,14 @@ include = [
     "androidx/compose/material3/tokens/VibrantMenuTokens.kt",
     "androidx/compose/material3/tokens/XLargeIconButtonTokens.kt",
     "androidx/compose/material3/tokens/XSmallIconButtonTokens.kt",
+]
+
+# material3 vendored its own ripple in 1.12.0; `createPlatformRippleNode` is an
+# expect whose non-Android actual delegates to the common node.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/material3/material3/src/skikoMain/kotlin"
+include = [
+    "androidx/compose/material3/internal/ripple/Ripple.skiko.kt",
 ]
 
 [[source]]

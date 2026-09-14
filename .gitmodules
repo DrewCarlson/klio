@@ -38,7 +38,7 @@
 	url = https://github.com/JetBrains/compose-multiplatform-core
 	update = none
 	shallow = true
-	branch = v1.11.1
+	branch = v1.12.0
 # Upstream androidx.collection (from the same compose-multiplatform-core fork):
 # the compose runtime's common code depends on it. Treeless/sparse/shallow,
 # update=none; see scripts/init-androidx-collection-submodule.sh.
@@ -47,7 +47,7 @@
 	url = https://github.com/JetBrains/compose-multiplatform-core
 	update = none
 	shallow = true
-	branch = v1.11.1
+	branch = v1.12.0
 [submodule "kotlin-klio/klio-mosaic/upstream"]
 	path = kotlin-klio/klio-mosaic/upstream
 	url = https://github.com/JakeWharton/mosaic

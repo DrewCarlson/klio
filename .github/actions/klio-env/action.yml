@@ -52,7 +52,7 @@ runs:
           kotlin-klio/klio-compose-runtime/upstream
           kotlin-klio/klio-androidx-collection/upstream
           kotlin-klio/klio-mosaic/upstream
-        key: compose-src-${{ hashFiles('.gitmodules') }}-v1.11.1-mosaic
+        key: compose-src-${{ hashFiles('.gitmodules') }}-v1.12.0-mosaic
 
     - name: populate compose + androidx-collection + mosaic submodules (if not cached)
       if: steps.compose-src-cache.outputs.cache-hit != 'true'

@@ -5,7 +5,7 @@
 # SaveableStateRegistry) are not vendored — only the pure Saver surface.
 [library]
 id = "androidx.compose.runtime.saveable"
-version = "1.11.1"
+version = "1.12.0"
 abi = 1
 implicit_packages = []
 source_roots = ["klioMain"]
