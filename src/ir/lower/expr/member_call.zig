@@ -522,7 +522,11 @@ fn tryNullableReceiverExtension(m: *MemberCall) Allocator.Error!?ResolvedMemberL
             if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
             if (!f.params[0].ty.nullable) continue;
             const eh = typeHead(std.mem.trimEnd(u8, f.params[0].ty.name, "?"));
-            if (eh.len == 0 or std.mem.eql(u8, eh, nn_head) or
+            // Every type is an `Any`, including the unsigned value classes the class
+            // table does not record a supertype for, so `Any?.toString()` covers a
+            // nullable receiver of any head.
+            const on_any = std.mem.eql(u8, eh, "Any") or std.mem.eql(u8, eh, "kotlin.Any");
+            if (eh.len == 0 or on_any or std.mem.eql(u8, eh, nn_head) or
                 b.module.classIsOrExtends(nn_head, eh))
             {
                 any_nullable_ext = true;

@@ -164,3 +164,25 @@ test "safe_call_chain" {
     ;
     try assertKlio("safe_call", src, "7,null,null\n");
 }
+
+test "an Any-receiver extension covers a nullable unsigned" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val a: UInt? = 5u
+        \\    val b: UInt? = null
+        \\    val c: ULong? = null
+        \\    val d: UByte? = 7u
+        \\    val e: UShort? = null
+        \\    println(a.toString())
+        \\    println(b.toString())
+        \\    println(c.toString())
+        \\    println(d.toString())
+        \\    println(e.toString())
+        \\    println(b.hashCode())
+        \\    println(b == null)
+        \\}
+        \\
+    ;
+    try assertKlio("nullable_unsigned_any_ext", src, "5\nnull\nnull\n7\nnull\n0\ntrue\n");
+}
