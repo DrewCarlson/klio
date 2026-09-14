@@ -1428,7 +1428,7 @@ const StdlibMeta = struct {
 const PackMeta = struct {
     lib_id: []const u8,
     import_prefixes: []const []const u8,
-    /// `[[deps]]` ids from the manifest, chased transitively.
+    /// `[deps]` ids from the manifest, chased transitively.
     deps: []const []const u8,
 };
 
@@ -1550,7 +1550,7 @@ fn packMeta(io: Io, idx: usize) Allocator.Error!*const PackMeta {
     return &pack_meta_cache[idx].?;
 }
 
-/// `[[deps]]` ids a pack manifest declares; "stdlib" finds no pack dir.
+/// `[deps]` ids a pack manifest declares; "stdlib" finds no pack dir.
 fn manifestDepIds(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     defer out.deinit(allocator);
@@ -1562,14 +1562,14 @@ fn manifestDepIds(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.
     while (it.next()) |line| {
         const l = std.mem.trim(u8, std.mem.sliceTo(line, '#'), " \t\r\n");
         if (std.mem.startsWith(u8, l, "[")) {
-            in_deps = std.mem.eql(u8, l, "[[deps]]");
+            in_deps = std.mem.eql(u8, l, "[deps]");
             continue;
         }
-        if (in_deps and std.mem.startsWith(u8, l, "id")) {
-            const rest = std.mem.trimStart(u8, l[2..], " =");
-            const v = std.mem.trim(u8, std.mem.trim(u8, rest, " \t\r\n"), "\"");
-            if (v.len != 0) try out.append(allocator, try allocator.dupe(u8, v));
-        }
+        if (!in_deps) continue;
+        // `<id> = "<version>"`, the id optionally quoted.
+        const eq = std.mem.findScalar(u8, l, '=') orelse continue;
+        const key = std.mem.trim(u8, std.mem.trim(u8, l[0..eq], " \t\r\n"), "\"");
+        if (key.len != 0) try out.append(allocator, try allocator.dupe(u8, key));
     }
     return try out.toOwnedSlice(allocator);
 }

@@ -16,5 +16,6 @@ auto_bindings = true
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
+

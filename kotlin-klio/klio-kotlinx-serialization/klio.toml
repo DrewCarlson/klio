@@ -97,8 +97,8 @@ root = "upstream/formats/json-io/commonMain/src"
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
 
 # Cargo-style features mirroring kotlinx-serialization's Gradle modules.
 # The reflective serialization-core (annotations, KSerializer,

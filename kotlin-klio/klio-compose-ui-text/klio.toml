@@ -97,21 +97,14 @@ include = [
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
-[[deps]]
-id = "androidx.compose.runtime"
-[[deps]]
-id = "androidx.compose.runtime.saveable"
-[[deps]]
-id = "androidx.compose.ui.util"
-[[deps]]
-id = "androidx.compose.ui.geometry"
-[[deps]]
-id = "androidx.compose.ui.unit"
-[[deps]]
-id = "androidx.compose.ui.graphics"
-[[deps]]
-id = "androidx.collection"
-[[deps]]
-id = "kotlinx.atomicfu"
+[deps]
+stdlib = "*"
+"androidx.compose.runtime" = "*"
+"androidx.compose.runtime.saveable" = "*"
+"androidx.compose.ui.util" = "*"
+"androidx.compose.ui.geometry" = "*"
+"androidx.compose.ui.unit" = "*"
+"androidx.compose.ui.graphics" = "*"
+"androidx.collection" = "*"
+"kotlinx.atomicfu" = "*"
+

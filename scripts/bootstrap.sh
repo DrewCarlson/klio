@@ -161,7 +161,7 @@ fi
 # --- 6. packs (opt-in) -----------------------------------------------------
 # The shipped library packs (kotlinx, ktor, compose, kotlin.test) install into
 # ~/.klio/packs so `klio run` sees them. They are opt-in: the embedded stdlib
-# needs none of them, and CI builds + tests without them. Packs carry a `[[deps]]`
+# needs none of them, and CI builds + tests without them. Packs carry a `[deps]`
 # graph, so a pack may fail to build until its deps are installed -- retry to a
 # fixpoint instead of hardcoding an install order.
 if [ "$DO_PACKS" -eq 1 ]; then

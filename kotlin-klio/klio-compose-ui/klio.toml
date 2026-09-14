@@ -18,7 +18,7 @@ auto_bindings = true
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
-[[deps]]
-id = "androidx.compose.runtime"
+[deps]
+stdlib = "*"
+"androidx.compose.runtime" = "*"
+

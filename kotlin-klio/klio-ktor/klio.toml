@@ -459,21 +459,15 @@ include = [
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
 # native engine helpers.
 
-[[deps]]
-id = "stdlib"
-
+[deps]
+stdlib = "*"
 # Pipeline runtime deps: coroutines (`PipelineContext : CoroutineScope`,
 # suspend `proceed`) and atomicfu (`Pipeline`'s `by atomic(...)`).
-[[deps]]
-id = "kotlinx.coroutines"
-
-[[deps]]
-id = "kotlinx.atomicfu"
-
+"kotlinx.coroutines" = "*"
+"kotlinx.atomicfu" = "*"
 # `io.ktor.utils.io` channel types (`ByteReadChannel`/`ByteWriteChannel`) and
 # the `OutgoingContent` body layer are backed by kotlinx.io `Buffer`/`Source`.
-[[deps]]
-id = "kotlinx.io"
+"kotlinx.io" = "*"
 
 # Features mirror ktor's Gradle module structure: one feature per ktor
 # module, all opt-in via `--feature io.ktor/<name>`. Nothing loads by

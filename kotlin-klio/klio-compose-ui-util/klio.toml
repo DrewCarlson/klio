@@ -24,8 +24,8 @@ include = [
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
 # ListUtils' fast collection helpers build on androidx.collection.
-[[deps]]
-id = "androidx.collection"
+"androidx.collection" = "*"
+

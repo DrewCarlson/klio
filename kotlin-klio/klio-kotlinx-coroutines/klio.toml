@@ -20,8 +20,8 @@ root = "upstream/kotlinx-coroutines-test/common/src"
 [[source]]
 root = "klioTest"
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
 
 [[test]]
 root = "upstream/kotlinx-coroutines-core/common/test"

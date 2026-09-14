@@ -28,8 +28,8 @@ abi = 1
 implicit_packages = []
 source_roots = ["src/main/kotlin"]
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
 
 # Map Kotlin FQN -> host_symbol for any native bindings. Omit the
 # table when the library is pure Kotlin.
@@ -47,7 +47,7 @@ The fields that matter:
 | `implicit_packages` | Packages always visible to consumers (rare).                          |
 | `source_roots`      | Glob-relative directories of `.kt` files. Defaults to `["src"]`.      |
 | `[[source]]`        | A packed source set: `root` + optional `include` (file list relative to `root`). Repeatable; use instead of `source_roots` for finer control. |
-| `[[deps]]`          | Library ids this pack depends on. The loader topo-sorts them.         |
+| `[deps]`            | One line per dependency: `"kotlinx.io" = "*"` for any version, a version string for a minimum, `{ version = "..", features = [..], default_features = false }` for the rest. The loader topo-sorts them. |
 | `[bindings]`        | `"FQN" = "host_symbol"` lines for native intrinsics.                  |
 | `[features]`        | Named, opt-in source subsets (`name = { sources = [...] }`, optionally `requires = [...]`). Consumers enable them with `--feature <id>/<name>`. |
 | `[[test]]`          | A test source set for `klio test <project>`: `root` + optional `include`, optional `feature = "<name>"` (composed only when that feature is active; untagged = core, always active). Test sources are never packed. |

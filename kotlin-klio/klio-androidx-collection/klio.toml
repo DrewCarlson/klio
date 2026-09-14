@@ -21,8 +21,8 @@ root = "upstream/collection/collection/src/nonJvmMain/kotlin"
 [[source]]
 root = "upstream/collection/collection/src/jbMain/kotlin"
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
 # The `Lock` actual (jbMain) uses kotlinx.atomicfu.locks.
-[[deps]]
-id = "kotlinx.atomicfu"
+"kotlinx.atomicfu" = "*"
+

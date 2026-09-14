@@ -17,5 +17,6 @@ root = "upstream/common/src/main/kotlin"
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
+

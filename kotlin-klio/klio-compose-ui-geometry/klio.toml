@@ -22,9 +22,8 @@ include = [
     "androidx/compose/ui/geometry/MutableRect.kt",
 ]
 
-[[deps]]
-id = "stdlib"
-[[deps]]
-id = "androidx.compose.runtime"
-[[deps]]
-id = "androidx.compose.ui.util"
+[deps]
+stdlib = "*"
+"androidx.compose.runtime" = "*"
+"androidx.compose.ui.util" = "*"
+

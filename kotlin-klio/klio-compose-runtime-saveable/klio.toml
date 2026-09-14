@@ -23,5 +23,6 @@ include = [
     "androidx/compose/runtime/saveable/Saver.kt",
 ]
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
+

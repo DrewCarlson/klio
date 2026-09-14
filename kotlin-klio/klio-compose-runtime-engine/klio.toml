@@ -228,15 +228,13 @@ include = [
 [[source]]
 root = "engineMain"
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
 # The coroutine-backed effects (rememberCoroutineScope / LaunchedEffect /
 # produceState) build on the kotlinx.coroutines pack.
-[[deps]]
-id = "kotlinx.coroutines"
+"kotlinx.coroutines" = "*"
 # The compose runtime's common code (frame clock, AwaiterQueue, snapshot
 # system, collections) is built on androidx.collection.
-[[deps]]
-id = "androidx.collection"
-[[deps]]
-id = "kotlinx.atomicfu"
+"androidx.collection" = "*"
+"kotlinx.atomicfu" = "*"
+

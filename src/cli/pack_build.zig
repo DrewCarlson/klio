@@ -673,7 +673,8 @@ fn scaffoldLibrary(gpa: std.mem.Allocator, dir: []const u8, id_override: ?[]cons
     }
 
     const klio_toml = std.fmt.allocPrint(gpa,
-        "[library]\nid = \"{s}\"\nversion = \"0.1.0\"\nabi = 1\nimplicit_packages = []\nsource_roots = [\"src/main/kotlin\"]\n\n[[deps]]\nid = \"stdlib\"\n\n" ++
+        "[library]\nid = \"{s}\"\nversion = \"0.1.0\"\nabi = 1\nimplicit_packages = []\nsource_roots = [\"src/main/kotlin\"]\n\n" ++
+            "# One line per dependency. `*` takes any version; a version string sets\n# the minimum, and `{{ version = \"..\", features = [..] }}` carries the rest.\n[deps]\nstdlib = \"*\"\n\n" ++
             "# Map FQN to host_symbol for any native binding the host registers.\n# Omit the table when the library is pure Kotlin.\n# [bindings]\n# \"{s}.example.hello\" = \"{s}.example.hello\"\n",
         .{ id, id, id },
     ) catch return .{ .err = fail(gpa, "out of memory", .{}) };
@@ -907,10 +908,10 @@ pub const LibraryToml = struct {
     application: ApplicationToml = .{},
 };
 
-/// The tables of a `klio.toml`. `[[deps]]`, `[[source]]` and `[[test]]` open a
+/// The tables of a `klio.toml`. `[[source]]` and `[[test]]` open a
 /// fresh entry per header; every other section assigns in place, so a repeated
 /// key overwrites the earlier one.
-const TomlSection = enum { none, library, dep, bindings, source, test_source, features, feature_def, application };
+const TomlSection = enum { none, library, deps, bindings, source, test_source, features, feature_def, application };
 
 /// The parse in progress: the entries the repeated sections accumulate, and
 /// the scalar tables assigned straight into `cfg`.
@@ -988,10 +989,7 @@ fn enterSection(r: *TomlReader, line: []const u8) !void {
 
 /// `[[name]]`: opens one more entry of a repeated table.
 fn enterArraySection(r: *TomlReader, name: []const u8) !void {
-    if (std.mem.eql(u8, name, "deps")) {
-        r.section = .dep;
-        try r.deps.append(r.a, .{});
-    } else if (std.mem.eql(u8, name, "source")) {
+    if (std.mem.eql(u8, name, "source")) {
         r.section = .source;
         try r.sources.append(r.a, .{ .root = "" });
     } else if (std.mem.eql(u8, name, "test")) {
@@ -1008,6 +1006,8 @@ fn enterTableSection(r: *TomlReader, name: []const u8) !void {
         r.section = .library;
     } else if (std.mem.eql(u8, name, "application")) {
         r.section = .application;
+    } else if (std.mem.eql(u8, name, "deps")) {
+        r.section = .deps;
     } else if (std.mem.eql(u8, name, "bindings")) {
         r.section = .bindings;
     } else if (std.mem.eql(u8, name, "features")) {
@@ -1026,7 +1026,7 @@ fn assignKey(r: *TomlReader, key: []const u8, val: []const u8) !void {
     switch (r.section) {
         .none => {},
         .library => assignLibrary(a, &r.cfg.library, key, val),
-        .dep => assignDep(a, &r.deps.items[r.deps.items.len - 1], key, val),
+        .deps => try assignDepsKey(r, key, val),
         .bindings => try r.bindings.append(a, try parseBindingPair(a, key, val)),
         .source => assignSource(a, &r.sources.items[r.sources.items.len - 1], key, val),
         .test_source => assignTest(a, &r.tests.items[r.tests.items.len - 1], key, val),
@@ -1034,6 +1034,51 @@ fn assignKey(r: *TomlReader, key: []const u8, val: []const u8) !void {
         .feature_def => assignFeatureDef(a, &r.feature_defs.items[r.feature_defs.items.len - 1], key, val),
         .application => assignApplication(a, &r.cfg.application, key, val),
     }
+}
+
+/// `[deps]`: one line per dependency. `"kotlinx.io" = "*"` accepts any version,
+/// a version string sets the minimum, and an inline table carries the rest:
+/// `"kotlinx.io" = { version = "0.9.0", features = ["json"] }`.
+fn assignDepsKey(r: *TomlReader, key: []const u8, val: []const u8) !void {
+    const a = r.a;
+    var entry = DepEntry{ .id = tomlString(a, key) };
+    const trimmed = std.mem.trimStart(u8, val, " \t");
+    if (std.mem.startsWith(u8, trimmed, "{")) {
+        if (sliceInlineScalar(trimmed, "version")) |v| entry.min_version = versionOrAny(a, v);
+        if (sliceInlineArray(trimmed, "features")) |arr| entry.features = parseStrArray(a, arr) catch &.{};
+        if (sliceInlineScalar(trimmed, "default_features")) |b| entry.default_features = tomlBool(b);
+    } else {
+        entry.min_version = versionOrAny(a, trimmed);
+    }
+    try r.deps.append(a, entry);
+}
+
+/// `*` is "any version", which the loader spells as an empty minimum.
+fn versionOrAny(a: std.mem.Allocator, val: []const u8) []const u8 {
+    const text = tomlString(a, val);
+    return if (std.mem.eql(u8, text, "*")) "" else text;
+}
+
+/// The scalar text for `field = <value>` inside an inline table, quotes kept so
+/// it feeds `tomlString`. Null when the field is absent.
+fn sliceInlineScalar(table: []const u8, field: []const u8) ?[]const u8 {
+    var search_from: usize = 0;
+    while (std.mem.findPos(u8, table, search_from, field)) |at| {
+        const after = at + field.len;
+        const before_ok = at == 0 or table[at - 1] == '{' or table[at - 1] == ',' or table[at - 1] == ' ';
+        var i = after;
+        while (i < table.len and (table[i] == ' ' or table[i] == '\t')) : (i += 1) {}
+        if (!before_ok or i >= table.len or table[i] != '=') {
+            search_from = after;
+            continue;
+        }
+        i += 1;
+        while (i < table.len and (table[i] == ' ' or table[i] == '\t')) : (i += 1) {}
+        var end = i;
+        while (end < table.len and table[end] != ',' and table[end] != '}') : (end += 1) {}
+        return std.mem.trim(u8, table[i..end], " \t");
+    }
+    return null;
 }
 
 /// `[features]`: the default set, plus the inline-table feature definitions
@@ -1125,18 +1170,6 @@ fn assignLibrary(a: std.mem.Allocator, h: *LibraryHeader, key: []const u8, val: 
         h.auto_bindings = tomlBool(val);
     } else if (std.mem.eql(u8, key, "binding_auto_prefixes")) {
         h.binding_auto_prefixes = parseStrArray(a, val) catch &.{};
-    }
-}
-
-fn assignDep(a: std.mem.Allocator, d: *DepEntry, key: []const u8, val: []const u8) void {
-    if (std.mem.eql(u8, key, "id")) {
-        d.id = tomlString(a, val);
-    } else if (std.mem.eql(u8, key, "min_version")) {
-        d.min_version = tomlString(a, val);
-    } else if (std.mem.eql(u8, key, "features")) {
-        d.features = parseStrArray(a, val) catch &.{};
-    } else if (std.mem.eql(u8, key, "default_features")) {
-        d.default_features = tomlBool(val);
     }
 }
 
@@ -1610,13 +1643,9 @@ test "parseLibraryToml reads header, deps, bindings, source, features" {
         \\source_roots = ["src/main/kotlin"]
         \\auto_bindings = true
         \\
-        \\[[deps]]
-        \\id = "stdlib"
-        \\
-        \\[[deps]]
-        \\id = "kotlinx.io"
-        \\min_version = "0.3.0"
-        \\features = ["files"]
+        \\[deps]
+        \\stdlib = "*"
+        \\"kotlinx.io" = { version = "0.3.0", features = ["files"] }
         \\
         \\[bindings]
         \\"myorg.crypto.hash" = "myorg.crypto.hash"
@@ -1694,6 +1723,61 @@ test "parseLibraryToml reads the application table" {
         .err => return error.TestParseFailed,
     };
     try std.testing.expectEqual(@as(usize, 0), bare.application.main.len);
+}
+
+test "parseLibraryToml reads the concise [deps] table" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const text =
+        \\[library]
+        \\id = "com.example.app"
+        \\
+        \\[deps]
+        \\stdlib = "*"
+        \\"kotlin.test" = "2.4.20"
+        \\"kotlinx.io" = { version = "0.9.0", features = ["json"], default_features = false }
+        \\
+    ;
+    const cfg = switch (parseLibraryToml(arena.allocator(), text)) {
+        .ok => |c| c,
+        .err => |e| {
+            std.debug.print("parse failed: {s}\n", .{e});
+            return error.TestUnexpectedResult;
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 3), cfg.deps.len);
+    try std.testing.expectEqualStrings("stdlib", cfg.deps[0].id);
+    try std.testing.expectEqualStrings("", cfg.deps[0].min_version);
+    try std.testing.expectEqualStrings("kotlin.test", cfg.deps[1].id);
+    try std.testing.expectEqualStrings("2.4.20", cfg.deps[1].min_version);
+    try std.testing.expectEqualStrings("kotlinx.io", cfg.deps[2].id);
+    try std.testing.expectEqualStrings("0.9.0", cfg.deps[2].min_version);
+    try std.testing.expectEqual(@as(usize, 1), cfg.deps[2].features.len);
+    try std.testing.expectEqualStrings("json", cfg.deps[2].features[0]);
+    try std.testing.expect(!cfg.deps[2].default_features);
+}
+
+test "parseLibraryToml keeps [deps] entries in declaration order" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const text =
+        \\[deps]
+        \\stdlib = "*"
+        \\"kotlinx.coroutines" = "*"
+        \\"kotlinx.io" = "*"
+        \\
+    ;
+    const cfg = switch (parseLibraryToml(arena.allocator(), text)) {
+        .ok => |c| c,
+        .err => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 3), cfg.deps.len);
+    try std.testing.expectEqualStrings("stdlib", cfg.deps[0].id);
+    try std.testing.expectEqualStrings("kotlinx.coroutines", cfg.deps[1].id);
+    try std.testing.expectEqualStrings("kotlinx.io", cfg.deps[2].id);
+    for (cfg.deps) |d| try std.testing.expect(d.default_features);
 }
 
 test "parseLibraryToml folds multi-line arrays and inline-table features" {

@@ -15,17 +15,12 @@ root = "../klio-compose-runtime/upstream/compose/material/material-ripple/src/co
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/material/material-ripple/src/nonAndroidMain/kotlin"
 
-[[deps]]
-id = "stdlib"
-[[deps]]
-id = "kotlinx.coroutines"
-[[deps]]
-id = "androidx.collection"
-[[deps]]
-id = "androidx.compose.runtime"
-[[deps]]
-id = "androidx.compose.animation.core"
-[[deps]]
-id = "androidx.compose.foundation"
-[[deps]]
-id = "androidx.compose.ui"
+[deps]
+stdlib = "*"
+"kotlinx.coroutines" = "*"
+"androidx.collection" = "*"
+"androidx.compose.runtime" = "*"
+"androidx.compose.animation.core" = "*"
+"androidx.compose.foundation" = "*"
+"androidx.compose.ui" = "*"
+

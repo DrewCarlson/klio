@@ -37,11 +37,9 @@ include = [
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
-[[deps]]
-id = "androidx.compose.runtime"
-[[deps]]
-id = "androidx.compose.ui.util"
-[[deps]]
-id = "androidx.compose.ui.geometry"
+[deps]
+stdlib = "*"
+"androidx.compose.runtime" = "*"
+"androidx.compose.ui.util" = "*"
+"androidx.compose.ui.geometry" = "*"
+

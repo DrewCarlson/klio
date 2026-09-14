@@ -29,7 +29,7 @@ include = [
     "androidx/graphics/shapes/Utils.kt",
 ]
 
-[[deps]]
-id = "stdlib"
-[[deps]]
-id = "androidx.collection"
+[deps]
+stdlib = "*"
+"androidx.collection" = "*"
+

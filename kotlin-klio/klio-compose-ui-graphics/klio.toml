@@ -108,17 +108,13 @@ include = [
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
-[[deps]]
-id = "androidx.compose.runtime"
-[[deps]]
-id = "androidx.compose.ui.util"
-[[deps]]
-id = "androidx.compose.ui.geometry"
-[[deps]]
-id = "androidx.compose.ui.unit"
+[deps]
+stdlib = "*"
+"androidx.compose.runtime" = "*"
+"androidx.compose.ui.util" = "*"
+"androidx.compose.ui.geometry" = "*"
+"androidx.compose.ui.unit" = "*"
 # Connector.kt uses androidx.collection.mutableIntObjectMapOf for its
 # colorspace-connection cache.
-[[deps]]
-id = "androidx.collection"
+"androidx.collection" = "*"
+

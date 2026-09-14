@@ -71,7 +71,7 @@ When `klio` starts:
 1. The embedded stdlib pack is decoded and installed.
 2. Every file matching `~/.klio/packs/*.klio-pack` and
    `$KLIO_PACKS` is enumerated.
-3. Packs are topologically sorted by `[[deps]]` and installed in
+3. Packs are topologically sorted by `[deps]` and installed in
    order.
 4. For each pack:
     - `manifest.abi_version` is checked against

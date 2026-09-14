@@ -127,11 +127,9 @@ include = [
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
-
-[[deps]]
-id = "kotlinx.serialization"
+[deps]
+stdlib = "*"
+"kotlinx.serialization" = "*"
 
 # commonTest sources for `klio test` (not packed).
 [[test]]

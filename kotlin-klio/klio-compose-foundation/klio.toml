@@ -406,27 +406,17 @@ include = [
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
-[[deps]]
-id = "androidx.compose.runtime"
-[[deps]]
-id = "androidx.compose.runtime.saveable"
-[[deps]]
-id = "androidx.compose.ui"
-[[deps]]
-id = "androidx.compose.ui.unit"
-[[deps]]
-id = "androidx.compose.ui.geometry"
-[[deps]]
-id = "androidx.compose.ui.graphics"
-[[deps]]
-id = "androidx.compose.ui.text"
-[[deps]]
-id = "androidx.compose.ui.util"
-[[deps]]
-id = "androidx.compose.foundation.layout"
-[[deps]]
-id = "androidx.compose.animation.core"
-[[deps]]
-id = "androidx.collection"
+[deps]
+stdlib = "*"
+"androidx.compose.runtime" = "*"
+"androidx.compose.runtime.saveable" = "*"
+"androidx.compose.ui" = "*"
+"androidx.compose.ui.unit" = "*"
+"androidx.compose.ui.geometry" = "*"
+"androidx.compose.ui.graphics" = "*"
+"androidx.compose.ui.text" = "*"
+"androidx.compose.ui.util" = "*"
+"androidx.compose.foundation.layout" = "*"
+"androidx.compose.animation.core" = "*"
+"androidx.collection" = "*"
+

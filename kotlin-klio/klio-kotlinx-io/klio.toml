@@ -55,8 +55,8 @@ include = [
 [[source]]
 root = "klioMain"
 
-[[deps]]
-id = "stdlib"
+[deps]
+stdlib = "*"
 
 # commonTest sources for `klio test` (not packed).
 [[test]]
