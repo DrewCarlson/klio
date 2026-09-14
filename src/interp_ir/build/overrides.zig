@@ -716,11 +716,26 @@ fn inheritExpectFunctionDefaults(ctx: *BuildCtx) Allocator.Error!void {
             if ((af.receiver_type == null) != (ef.receiver_type == null)) continue;
             if (af.receiver_type != null and
                 !std.mem.eql(u8, af.receiver_type.?.name.name, ef.receiver_type.?.name.name)) continue;
+            if (!expectActualParamsMatch(af.params, ef.params)) continue;
             for (af.params, ef.params) |*ap, *ep| {
                 if (ap.default == null) ap.default = ep.default;
             }
         }
     }
+}
+
+/// Whether an `actual`'s parameter list is the one this `expect` declares. Kotlin
+/// requires the pair to agree on parameter names and types, so they identify each
+/// other among same-arity overloads: `Paragraph` ships four nine-parameter
+/// overloads, and matching on arity alone transplants one's defaults onto another's
+/// slots.
+fn expectActualParamsMatch(ap: []const ast.Param, ep: []const ast.Param) bool {
+    if (ap.len != ep.len) return false;
+    for (ap, ep) |*a, *e| {
+        if (!std.mem.eql(u8, a.name.name, e.name.name)) return false;
+        if (!std.mem.eql(u8, a.ty.name.name, e.ty.name.name)) return false;
+    }
+    return true;
 }
 
 fn inheritExpectClassCtorDefaults(ctx: *BuildCtx) Allocator.Error!void {

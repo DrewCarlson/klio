@@ -175,3 +175,30 @@ test "a hidden-deprecated overload is no source-level candidate" {
         "visible-overflow\nvisible-overflow\nvisible-overflow\n",
     );
 }
+
+test "an expect's defaults reach the actual that declares its own parameter list" {
+    const src =
+        \\
+        \\expect fun build(text: String, n: Int, a: Int = 1, flag: Boolean = false): String
+        \\
+        \\expect fun build(text: String, s: String, a: Int = 2, label: String = "L"): String
+        \\
+        \\actual fun build(text: String, n: Int, a: Int, flag: Boolean): String =
+        \\    "int n=$n a=$a flag=$flag"
+        \\
+        \\actual fun build(text: String, s: String, a: Int, label: String): String =
+        \\    "str s=$s a=$a label=$label"
+        \\
+        \\fun main() {
+        \\    println(build("t", 5))
+        \\    println(build("t", "x"))
+        \\    println(build("t", "x", 9))
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "expect_defaults_per_overload",
+        src,
+        "int n=5 a=1 flag=false\nstr s=x a=2 label=L\nstr s=x a=9 label=L\n",
+    );
+}
