@@ -17,6 +17,12 @@ const HELPERS = [_][]const u8{
 };
 pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 
+/// kotlinc's harness substitutes this marker with the name of the backend under
+/// test; a test branches on it to allow for JS's widened primitive classes. klio
+/// is not a JS backend, so it answers with its own name.
+const BACKEND_MARKER = "BACKEND_UNDER_TEST";
+const BACKEND_NAME = "KLIO";
+
 /// Pass floor and failure ceiling. They tighten as fixes land, and loosen
 /// only with a root-caused record.
 ///
@@ -25,9 +31,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// 2.4.10 corpus did not have, and no test that passed before fails now. Twelve
 /// are `companionBlocksAndExtensions`, the 2.4.20 companion-block feature klio
 /// does not implement; the rest cluster on collection literals, full value
-/// classes, contextual callable references and eager lambda analysis.
-pub const BASELINE: usize = 6054;
-pub const MAX_FAILED: usize = 339;
+/// classes, contextual callable references and eager lambda analysis. Supplying
+/// the backend marker below then took the two `classLiteral` tests green.
+pub const BASELINE: usize = 6056;
+pub const MAX_FAILED: usize = 337;
 
 /// Directives binding a test to a framework feature with no klio counterpart:
 /// a backend restriction, a second module, reflection, JDK classes, compiler
@@ -119,6 +126,9 @@ pub const Case = struct {
     reason: ?[]const u8 = null,
     with_coroutines: bool = false,
     value_class_placeholder: bool = false,
+    /// The test reads kotlinc's `BACKEND_UNDER_TEST` marker, which its harness
+    /// substitutes with the backend's name; klio supplies its own.
+    backend_marker: bool = false,
     /// `// LANGUAGE: +Feature …` specs, passed to the child as `--language=`.
     language: []const u8 = "",
     package: ?[]const u8 = null,
@@ -189,6 +199,7 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
             continue;
         }
         if (!isCommentOrBlank(line)) in_header = false;
+        if (std.mem.find(u8, line, BACKEND_MARKER) != null) c.backend_marker = true;
         try cur.appendSlice(a, line);
         try cur.append(a, '\n');
     }
@@ -458,10 +469,14 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
             const fname = try std.fmt.allocPrint(a, "{d}_{s}", .{ si, base });
             const fpath = try std.fs.path.join(a, &.{ dir, fname });
             const stripped = try stripDiagnosticMarkup(a, s.text);
-            const text = if (case.value_class_placeholder)
+            const inlined = if (case.value_class_placeholder)
                 try std.mem.replaceOwned(u8, a, stripped, "OPTIONAL_JVM_INLINE_ANNOTATION", "@JvmInline")
             else
                 stripped;
+            const text = if (case.backend_marker)
+                try std.mem.replaceOwned(u8, a, inlined, BACKEND_MARKER, "\"" ++ BACKEND_NAME ++ "\"")
+            else
+                inlined;
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = fpath, .data = text });
             try argv.append(a, fpath);
         }
