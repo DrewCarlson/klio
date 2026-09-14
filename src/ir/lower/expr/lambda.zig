@@ -199,7 +199,9 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (receiver_type) |receiver| {
         b.module.pending_lambda_own_recv_type = try receiver.clone(b.allocator);
     }
-    b.module.pending_lambda_unit = b.pending_ref_lambda_unit;
+    // A `-> Unit` expectation coerces the body's tail, whether it arrives as a call
+    // argument or as the declared type of what the lambda is assigned to.
+    b.module.pending_lambda_unit = b.pending_ref_lambda_unit or expectsUnitFunction(b.peekExpected());
     if (!suppress_it) {
         if (b.pending_ref_lambda_param_types) |types| {
             const value_param_count: usize = if (lam.implicit_it and
@@ -2020,4 +2022,17 @@ pub fn samLambdaParamTypes(
     }
     out[0] = tys;
     return out;
+}
+
+/// Whether the expected type is a function type returning `Unit`, the shape that
+/// coerces a lambda's tail expression.
+pub fn expectsUnitFunction(expected: ?ast.TypeRef) bool {
+    const ty = expected orelse return false;
+    const ft = ty.function orelse return false;
+    // `() -> Unit?` keeps whatever the tail produced, `null` included; only the
+    // non-null `Unit` return coerces.
+    if (ft.ret.nullable) return false;
+    const ret = ft.ret.name.name;
+    if (std.mem.endsWith(u8, ret, "?")) return false;
+    return std.mem.eql(u8, ret, "Unit") or std.mem.eql(u8, ret, "kotlin.Unit");
 }

@@ -954,3 +954,25 @@ test "a parenthesized factory result accepts a trailing lambda" {
     ;
     try assertKlio("parenthesized_callable_result", src, "42\n");
 }
+
+test "a Unit-returning expected type coerces a lambda's tail" {
+    const src =
+        \\
+        \\object Dummy
+        \\class Holder { fun produce(): Dummy = Dummy }
+        \\
+        \\fun main() {
+        \\    val h = Holder()
+        \\    val nullary: () -> Unit = { h.produce() }
+        \\    println(nullary() == Unit)
+        \\    val unary: (Int) -> Unit = { _ -> h.produce() }
+        \\    println(unary(1) == Unit)
+        \\    val receiverLambda: Holder.() -> Unit = { produce() }
+        \\    println(h.receiverLambda() == Unit)
+        \\    val nullableUnit: () -> Unit? = { null }
+        \\    println(nullableUnit() == null)
+        \\}
+        \\
+    ;
+    try assertKlio("expected_unit_lambda_tail", src, "true\ntrue\ntrue\ntrue\n");
+}
