@@ -380,6 +380,7 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
     var project_features: std.ArrayList([]const u8) = .empty;
     defer project_features.deinit(gpa);
     var all_features = false;
+    var test_group: ?[]const u8 = null;
     var virtual_time = false;
     var filter: ?[]const u8 = null;
     var test_format: commands.TestFormat = .plain;
@@ -445,6 +446,16 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
                 return 2;
             };
             if (timeout_s == 0) timeout_s = 1;
+        } else if (std.mem.startsWith(u8, a, "--test-group")) {
+            // Set by the parent when it runs one group per process.
+            test_group = if (optionValue(a, "--test-group=")) |vv| vv else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    printErr(gpa, "error: --test-group requires a value\n", .{});
+                    return 2;
+                }
+                break :blk args[i];
+            };
         } else if (std.mem.eql(u8, a, "--all")) {
             all_features = true;
         } else if (std.mem.eql(u8, a, "--filter")) {
@@ -527,11 +538,54 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
         else
             .all;
         if (project.planTest(gpa, paths.items[0], sel)) |plan| {
-            activateFeatures(gpa, &requested, plan.pack_id, plan.active_features);
             if (buildAndInstallProjectPack(gpa, plan.project_dir, plan.pack_id)) |code| {
                 if (code != 0) return code;
             }
-            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items, filter, test_format, list_only);
+            // One group runs here; several run a process each, because a
+            // program leaves state behind that the next one in the same
+            // process trips over.
+            const only = test_group orelse if (plan.groups.len == 1) plan.groups[0].name else {
+                var names: std.ArrayList([]const u8) = .empty;
+                defer names.deinit(gpa);
+                for (plan.groups) |g| names.append(gpa, g.name) catch return 2;
+
+                var base: std.ArrayList([]const u8) = .empty;
+                defer base.deinit(gpa);
+                for (paths.items) |p| base.append(gpa, p) catch return 2;
+                if (all_features) base.append(gpa, "--all") catch return 2;
+                for (project_features.items) |fs| {
+                    base.append(gpa, "--feature") catch return 2;
+                    base.append(gpa, fs) catch return 2;
+                }
+                for (only_files.items) |of| {
+                    base.append(gpa, "--only-file") catch return 2;
+                    base.append(gpa, of) catch return 2;
+                }
+                if (filter) |f| {
+                    base.append(gpa, "--filter") catch return 2;
+                    base.append(gpa, f) catch return 2;
+                }
+                if (list_only) base.append(gpa, "--list") catch return 2;
+                base.append(gpa, "--format") catch return 2;
+                base.append(gpa, @tagName(test_format)) catch return 2;
+                return commands.runTestGroups(gpa, self_exe, names.items, base.items);
+            };
+
+            for (plan.groups) |group| {
+                if (!std.mem.eql(u8, group.name, only)) continue;
+                activateFeatures(gpa, &requested, plan.pack_id, group.active_features);
+                return commands.runTestFiles(
+                    gpa,
+                    group.roots,
+                    &requested,
+                    only_files.items,
+                    filter,
+                    test_format,
+                    list_only,
+                );
+            }
+            printErr(gpa, "error: no test group named `{s}`\n", .{only});
+            return 2;
         }
     }
     return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter, test_format, list_only);

@@ -3061,6 +3061,57 @@ pub fn runTestsIsolated(
     return if (failed + timed_out > 0) 1 else 0;
 }
 
+/// Runs each test group in its own process.
+///
+/// A program leaves state behind that the next one in the same process finds
+/// installed over a released arena: the closure spine is the one that crashes
+/// first. Nothing had ever run two programs in one process, so rather than
+/// audit every global for it, a group gets a process, which is also what
+/// `--isolate` does for a single test.
+pub fn runTestGroups(
+    gpa: std.mem.Allocator,
+    self: []const u8,
+    groups: []const []const u8,
+    base_args: []const []const u8,
+) u8 {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const rio = threaded.io();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    runtime.procEnvPutAllInto(gpa, &env);
+
+    var worst: u8 = 0;
+    for (groups) |name| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        const flag = std.fmt.allocPrint(gpa, "--test-group={s}", .{name}) catch return 2;
+        defer gpa.free(flag);
+        argv.append(gpa, self) catch return 2;
+        argv.append(gpa, "test") catch return 2;
+        argv.appendSlice(gpa, base_args) catch return 2;
+        argv.append(gpa, flag) catch return 2;
+
+        io.printStdout(gpa, "[{s}]\n", .{name});
+        const res = std.process.run(gpa, rio, .{ .argv = argv.items, .environ_map = &env }) catch {
+            io.printStdout(gpa, "error: test group `{s}` failed to start\n", .{name});
+            worst = 2;
+            continue;
+        };
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        io.writeStdout(res.stdout);
+        if (res.stderr.len != 0) io.writeStderr(res.stderr);
+        const code: u8 = switch (res.term) {
+            .exited => |c| @intCast(c),
+            else => 2,
+        };
+        if (code > worst) worst = code;
+    }
+    return worst;
+}
+
 /// `klio test`: run `@Test` functions in the given files. 1 if any fails.
 pub fn runTestFiles(
     gpa: std.mem.Allocator,

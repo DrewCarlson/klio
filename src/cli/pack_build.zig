@@ -980,6 +980,13 @@ pub const TestRoot = struct {
     include: [][]const u8 = &.{},
     exclude: [][]const u8 = &.{},
     feature: []const u8 = "",
+    /// Test roots sharing a group compose into one program, and each group runs
+    /// as its own. A root with no group joins every group, which is where
+    /// shared support belongs: a klio-authored `actual` for an upstream
+    /// `expect`, say. When no root names a group every root composes together,
+    /// which is what a pack with one test suite wants and what they all did
+    /// before groups existed.
+    group: []const u8 = "",
 };
 
 /// The `[application]` table: how `klio bundle <dir>` packages the project.
@@ -1297,6 +1304,8 @@ fn assignTest(a: std.mem.Allocator, t: *TestRoot, key: []const u8, val: []const 
         t.exclude = parseStrArray(a, val) catch &.{};
     } else if (std.mem.eql(u8, key, "feature")) {
         t.feature = tomlString(a, val);
+    } else if (std.mem.eql(u8, key, "group")) {
+        t.group = tomlString(a, val);
     }
 }
 

@@ -111,12 +111,18 @@ stdlib = "*"
 default = []
 json = { sources = ["upstream/formats/json/commonMain/src", "upstream/formats/json-io/commonMain/src", "klioMain/kotlinx/serialization/json"], deps = ["kotlinx.io"] }
 
-# commonTest sources for `klio test` (not packed).
+# commonTest sources for `klio test` (not packed). Upstream compiles core's
+# tests and the JSON suite as separate modules, and each vendors its own copy
+# of the shared fixtures (Platform, TypesUmbrella, PolyBase, IntData and the
+# rest), so the two are separate groups here rather than one program that would
+# declare all seventeen twice.
 [[test]]
 root = "upstream/core/commonTest"
+group = "core"
 
 # klio-authored platform actual for the commonTest support surface
-# (`expect val currentPlatform`); see klioTest/ for why NATIVE.
+# (`expect val currentPlatform`); see klioTest/ for why NATIVE. Ungrouped, so
+# it composes into both suites, each of which declares that `expect`.
 [[test]]
 root = "klioTest"
 
@@ -128,7 +134,9 @@ root = "klioTest"
 [[test]]
 root = "upstream/formats/json-okio/commonMain/src"
 feature = "json"
+group = "json"
 
 [[test]]
 root = "upstream/formats/json-tests/commonTest/src"
 feature = "json"
+group = "json"

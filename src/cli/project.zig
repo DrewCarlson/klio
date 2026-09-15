@@ -19,6 +19,13 @@ pub const TestPlan = struct {
     /// Its pack is built and installed so the library API resolves inside the tests.
     project_dir: []const u8,
     pack_id: []const u8,
+    /// One program each, run in order. A manifest naming no group yields one.
+    groups: []const TestGroup,
+};
+
+/// One test program: the roots that compose into it, and the features they need.
+pub const TestGroup = struct {
+    name: []const u8,
     /// Core plus active-feature test roots, project-dir-joined.
     roots: []const []const u8,
     /// The caller adds these to the requested-feature set before the pack loads.
@@ -164,30 +171,55 @@ pub fn planTest(a: Allocator, dir: []const u8, sel: FeatureSel) ?TestPlan {
     };
     if (manifest.tests.len == 0) return null;
 
-    var roots: std.ArrayList([]const u8) = .empty;
-    var active: std.ArrayList([]const u8) = .empty;
+    // The groups the selected roots name, in first-seen order. None means a
+    // single unnamed program holding every selected root.
+    var names: std.ArrayList([]const u8) = .empty;
     for (manifest.tests) |t| {
-        if (t.root.len == 0) continue;
+        if (t.root.len == 0 or t.group.len == 0) continue;
         if (!featureSelected(t.feature, sel, &manifest)) continue;
-        const joined = std.fs.path.join(a, &.{ dir, t.root }) catch continue;
-        roots.append(a, joined) catch continue;
-        if (t.feature.len != 0) {
-            const dup = a.dupe(u8, t.feature) catch continue;
-            var seen = false;
-            for (active.items) |x| if (std.mem.eql(u8, x, dup)) {
-                seen = true;
-                break;
-            };
-            if (!seen) active.append(a, dup) catch {};
-        }
+        var seen = false;
+        for (names.items) |x| if (std.mem.eql(u8, x, t.group)) {
+            seen = true;
+            break;
+        };
+        if (!seen) names.append(a, t.group) catch continue;
     }
-    if (roots.items.len == 0) return null;
+    if (names.items.len == 0) names.append(a, "") catch return null;
+
+    var groups: std.ArrayList(TestGroup) = .empty;
+    for (names.items) |name| {
+        var roots: std.ArrayList([]const u8) = .empty;
+        var active: std.ArrayList([]const u8) = .empty;
+        for (manifest.tests) |t| {
+            if (t.root.len == 0) continue;
+            // An ungrouped root joins every group; a grouped one only its own.
+            if (t.group.len != 0 and !std.mem.eql(u8, t.group, name)) continue;
+            if (!featureSelected(t.feature, sel, &manifest)) continue;
+            const joined = std.fs.path.join(a, &.{ dir, t.root }) catch continue;
+            roots.append(a, joined) catch continue;
+            if (t.feature.len != 0) {
+                const dup = a.dupe(u8, t.feature) catch continue;
+                var seen = false;
+                for (active.items) |x| if (std.mem.eql(u8, x, dup)) {
+                    seen = true;
+                    break;
+                };
+                if (!seen) active.append(a, dup) catch {};
+            }
+        }
+        if (roots.items.len == 0) continue;
+        groups.append(a, .{
+            .name = name,
+            .roots = roots.toOwnedSlice(a) catch continue,
+            .active_features = active.toOwnedSlice(a) catch continue,
+        }) catch continue;
+    }
+    if (groups.items.len == 0) return null;
 
     return TestPlan{
         .project_dir = a.dupe(u8, dir) catch return null,
         .pack_id = a.dupe(u8, manifest.library.id) catch return null,
-        .roots = roots.toOwnedSlice(a) catch return null,
-        .active_features = active.toOwnedSlice(a) catch return null,
+        .groups = groups.toOwnedSlice(a) catch return null,
     };
 }
 
