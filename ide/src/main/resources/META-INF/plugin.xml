@@ -1,0 +1,39 @@
+<idea-plugin>
+    <id>dev.klio.intellij</id>
+    <name>KLIO</name>
+    <vendor>klio</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.kotlin</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="dev.klio.ide.KlioSettings"/>
+        <applicationConfigurable parentId="tools" instance="dev.klio.ide.KlioSettingsConfigurable"
+                                 id="dev.klio.settings" displayName="KLIO"/>
+        <nonProjectFileWritingAccessExtension implementation="dev.klio.ide.KlioReadOnlyPackSources"/>
+        <newProjectWizard.generator implementation="dev.klio.ide.KlioNewProjectWizard"/>
+        <postStartupActivity implementation="dev.klio.ide.KlioStartupActivity"/>
+        <problemHighlightFilter implementation="dev.klio.ide.KlioHighlightFilter"/>
+        <notificationGroup id="KLIO" displayType="BALLOON"/>
+        <appStarter id="klio-selfcheck" implementation="dev.klio.ide.KlioSelfCheckStarter"/>
+        <configurationType implementation="dev.klio.ide.KlioRunConfigurationType"/>
+        <runConfigurationProducer implementation="dev.klio.ide.KlioRunConfigurationProducer"/>
+        <runConfigurationProducer implementation="dev.klio.ide.KlioTestConfigurationProducer"/>
+        <runLineMarkerContributor language="kotlin" implementationClass="dev.klio.ide.KlioRunLineMarkerContributor"/>
+        <editorNotificationProvider implementation="dev.klio.ide.KlioSyncNotificationProvider"/>
+        <completion.contributor language="any" implementationClass="dev.klio.ide.KlioManifestCompletionContributor"/>
+    </extensions>
+
+    <extensions defaultExtensionNs="org.jetbrains.kotlin">
+        <supportsKotlinPluginMode supportsK2="true"/>
+    </extensions>
+
+    <actions>
+        <action id="klio.sync"
+                class="dev.klio.ide.KlioSyncAction"
+                text="Sync KLIO Project"
+                description="Re-read the klio project model and rebuild the workspace">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

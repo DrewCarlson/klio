@@ -1,0 +1,14 @@
+[library]
+id = "dev.klio.sample"
+version = "0.1.0"
+abi = 1
+source_roots = ["src/main/kotlin"]
+
+[deps]
+stdlib = "*"
+"kotlin.test" = "*"
+"kotlinx.coroutines" = "*"
+"kotlinx.datetime" = "*"
+
+[[test]]
+root = "src/test/kotlin"

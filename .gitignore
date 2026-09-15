@@ -21,3 +21,9 @@ scripts/__pycache__/
 
 # Session scratch programs and census dumps.
 scratchpad/
+
+# IntelliJ plugin build outputs
+ide/build/
+ide/.gradle/
+ide/.intellijPlatform/
+ide/.kotlin/
