@@ -313,9 +313,9 @@ test "maybe unassigned collects flagged places" {
     defer deinitStates(a, &states);
 
     var st = ViaLattice.init();
-    try st.put(a, .{ .Local = .{ .name = try a.dupe(u8, "x") } }, .{ .Value = .Unassigned });
-    try st.put(a, .{ .Local = .{ .name = try a.dupe(u8, "y") } }, .{ .Value = .Assigned });
-    try st.put(a, .{ .Local = .{ .name = try a.dupe(u8, "z") } }, .Top);
+    try st.put(a, .{ .Local = .{ .name = "x" } }, .{ .Value = .Unassigned });
+    try st.put(a, .{ .Local = .{ .name = "y" } }, .{ .Value = .Assigned });
+    try st.put(a, .{ .Local = .{ .name = "z" } }, .Top);
     try states.append(a, st);
 
     var out = try maybeUnassignedPlaces(a, &states);

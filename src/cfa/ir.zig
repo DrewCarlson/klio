@@ -63,8 +63,11 @@ pub const Symbol = struct {
         return std.mem.eql(u8, self.name, other.name);
     }
 
+    /// Borrows: a name belongs to whoever first built the place, and the CFG
+    /// lowering that does outlives every lattice state cloned from it.
     pub fn clone(self: Symbol, allocator: Allocator) Allocator.Error!Symbol {
-        return .{ .name = try allocator.dupe(u8, self.name) };
+        _ = allocator;
+        return .{ .name = self.name };
     }
 };
 
@@ -77,8 +80,10 @@ pub const FieldId = struct {
         return std.mem.eql(u8, self.name, other.name);
     }
 
+    /// Borrows, as `Symbol.clone` does.
     pub fn clone(self: FieldId, allocator: Allocator) Allocator.Error!FieldId {
-        return .{ .name = try allocator.dupe(u8, self.name) };
+        _ = allocator;
+        return .{ .name = self.name };
     }
 };
 
@@ -118,13 +123,15 @@ pub const Place = union(enum) {
         };
     }
 
+    /// Frees only what a place owns. Names are borrowed from the lowering that
+    /// built the place, so a cloned place must not free them; the boxed
+    /// receiver a `Field` projection allocates is owned and released here.
     pub fn deinit(self: *Place, allocator: Allocator) void {
         switch (self.*) {
-            .Local => |s| allocator.free(s.name),
+            .Local => {},
             .Field => |*f| {
                 f.receiver.deinit(allocator);
                 allocator.destroy(f.receiver);
-                allocator.free(f.field.name);
             },
             .This => {},
         }
