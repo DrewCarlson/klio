@@ -109,6 +109,10 @@ test "resolveCall selects scope after applicability" {
     var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try inner.put("pick", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
+    {
+        var bit = inner.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(FileId.from(0), k.*);
+    }
     try m.rebuildFuncNameIndex(a);
 
     const args = [_]applicability.ArgShape{.{
@@ -777,6 +781,10 @@ test "an imported same-name upper bound cannot complete raw bound evidence" {
     var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try imports.put("Bound", paths);
     try m.registry.import_aliases.put(FileId.from(0), imports);
+    {
+        var bit = imports.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(FileId.from(0), k.*);
+    }
     try testing.expectEqual(left, m.classIdIndexed("Bound", "app", FileId.from(0)).?);
 
     try testing.expect(m.knownReceiverCallableApplicable(
@@ -1623,6 +1631,10 @@ test "classIdIndexed ranks a named import above the own package" {
     var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try inner.put("Config", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
+    {
+        var bit = inner.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(FileId.from(0), k.*);
+    }
     try testing.expectEqual(imported.int(), m.classIdIndexed("Config", "app", FileId.from(0)).?.int());
     // Imports are file-scoped: a file without the import resolves the own-package class.
     try testing.expectEqual(

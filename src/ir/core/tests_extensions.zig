@@ -1646,6 +1646,10 @@ test "symbol index ranks a named import above the caller's own package" {
     var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try inner.put("greet", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
+    {
+        var bit = inner.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(FileId.from(0), k.*);
+    }
     try m.rebuildFuncNameIndex(a);
 
     const got = m.resolveBareCallIndexed("greet", "app", FileId.from(0), 0, false);
@@ -1684,6 +1688,10 @@ test "renamed imports enter the canonical candidate set by exact identity" {
     var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try imports.put("hello", paths);
     try m.registry.import_aliases.put(FileId.from(0), imports);
+    {
+        var bit = imports.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(FileId.from(0), k.*);
+    }
     try m.rebuildFuncNameIndex(a);
 
     const candidates = try m.bareCallCandidates(a, "hello", FileId.from(0));
@@ -1945,6 +1953,10 @@ test "bounded spread candidates retain renamed import identity" {
     var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try imports.put("originalMerge", paths);
     try m.registry.import_aliases.put(FileId.from(0), imports);
+    {
+        var bit = imports.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(FileId.from(0), k.*);
+    }
     try m.rebuildFuncNameIndex(a);
 
     const scoped = (try m.boundedSpreadCandidates(
@@ -1971,6 +1983,10 @@ test "bounded spread candidates do not widen past a fixed-only tier" {
     var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try inner.put("pick", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
+    {
+        var bit = inner.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(FileId.from(0), k.*);
+    }
     try m.rebuildFuncNameIndex(a);
 
     const scoped = (try m.boundedSpreadCandidates(a, "pick", "app", FileId.from(0))).?;
@@ -2000,6 +2016,10 @@ test "a renamed import of a typealias still expands at its reference site" {
     var per_file = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try per_file.put("Short", paths);
     try m.registry.import_aliases.put(FileId.from(1), per_file);
+    {
+        var bit = per_file.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(FileId.from(1), k.*);
+    }
 
     const found = try m.scopedTypeAliasFqn(
         a,

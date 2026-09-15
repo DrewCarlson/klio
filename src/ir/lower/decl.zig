@@ -3013,6 +3013,10 @@ test "resolveAnnotationNames yields fqn candidates from imports" {
         try ignore_paths.append(ra, .{ .fqn = try ra.dupe(u8, "t.Skip"), .segs = try ra.alloc([]const u8, 0) });
         try named.put("Ignore", ignore_paths);
         try m.registry.import_aliases.put(file, named);
+        {
+            var bit = named.keyIterator();
+            while (bit.next()) |k| try m.registry.noteImportAliasName(file, k.*);
+        }
 
         var wild: std.ArrayList([]const u8) = .empty;
         try wild.append(ra, try ra.dupe(u8, "org.junit"));

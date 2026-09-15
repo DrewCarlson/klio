@@ -385,6 +385,7 @@ pub fn classId(self: *const Module, name: []const u8) ?ClassId {
 
 /// Resolve a simple classifier head only when it denotes one class identity module-wide.
 pub fn uniqueClassIdBySimpleName(self: *const Module, name: []const u8) ?ClassId {
+
     if (self.class_fqn_map != null) {
         // Finalized: `buildClassIdMap` completed the cache and lookups are concurrent, so read it
         // lock-free while it mirrors the append-only class list; a later addition falls back to the scan.
@@ -1032,10 +1033,15 @@ pub fn importAliasIn(self: *const Module, file: FileId, name: []const u8) ?[]con
 /// Every non-wildcard import in `file` binding leaf `name`, in declaration order. Kotlin keeps
 /// every such import in scope, so an identical-signature pair behind two same-leaf imports is
 /// an ambiguity, never a shadow.
+
 pub fn importAliasPathsIn(self: *const Module, file: FileId, name: []const u8) []const ModuleRegistry.ImportPath {
-    if (self.registry.import_aliases.get(file)) |m| {
-        if (m.get(name)) |paths| return paths.items;
-    }
+    // The file's bloom answers first: it is keyed by file id and the bit comes
+    // from the name's length and ends, so a name the file never imports costs
+    // no string hash at all.
+    const bloom = self.registry.import_alias_bloom.get(file) orelse return &.{};
+    if ((bloom & ModuleRegistry.importAliasBit(name)) == 0) return &.{};
+    const m = self.registry.import_aliases.get(file) orelse return &.{};
+    if (m.get(name)) |paths| return paths.items;
     return &.{};
 }
 

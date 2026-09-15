@@ -103,6 +103,11 @@ pub const ModuleRegistry = struct {
     /// Per-file non-wildcard import leaf -> every import bound to that leaf, in declaration order:
     /// named imports are file-scoped, and same-leaf imports all stay in scope (ambiguity at the use site).
     import_aliases: std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))),
+    /// One bit per import leaf a file declares, so a name a file cannot have is
+    /// refused without hashing it. A lookup asks about a name the file imports
+    /// roughly once in three hundred, and the rest were paying a string hash to
+    /// be told nothing.
+    import_alias_bloom: std.AutoHashMap(FileId, u64),
     /// Per-file wildcard-import packages, dotted and owned; `import pkg.*` outranks the built-ins.
     import_wildcards: std.AutoHashMap(FileId, std.ArrayList([]const u8)),
     /// Per-file declared package. A spliced inline body carries the DONOR file's spans, so bare-call
@@ -224,6 +229,7 @@ pub const ModuleRegistry = struct {
             .type_alias_simple = std.StringHashMap(void).init(allocator),
             .recv_fn_aliases = std.StringHashMap(u8).init(allocator),
             .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
+            .import_alias_bloom = std.AutoHashMap(FileId, u64).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
             .file_packages = std.AutoHashMap(FileId, []const u8).init(allocator),
             .file_modules = std.AutoHashMap(FileId, u32).init(allocator),
@@ -239,6 +245,24 @@ pub const ModuleRegistry = struct {
             .top_level_prop_setters = std.StringHashMap(FuncId).init(allocator),
             .allocator = allocator,
         };
+    }
+
+    /// The bit an import leaf claims in its file's bloom. Cheap on purpose: the
+    /// point is to answer without hashing the name.
+    pub fn importAliasBit(name: []const u8) u64 {
+        if (name.len == 0) return 0;
+        const first: u64 = name[0];
+        const last: u64 = name[name.len - 1];
+        const h = (@as(u64, name.len) *% 131) ^ (first *% 7) ^ (last *% 17);
+        return @as(u64, 1) << @truncate(h & 63);
+    }
+
+    /// The one way to record an import leaf, so the bloom cannot fall behind the
+    /// map it filters: a missing bit would hide an import that is really there.
+    pub fn noteImportAliasName(self: *ModuleRegistry, file: FileId, name: []const u8) !void {
+        const gop = try self.import_alias_bloom.getOrPut(file);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* |= importAliasBit(name);
     }
 
     /// The one way to register a structural alias, so the simple-name index
@@ -324,6 +348,7 @@ pub const ModuleRegistry = struct {
             self.abstract_member_defaults.deinit();
         }
         self.type_aliases.deinit();
+        self.import_alias_bloom.deinit();
         self.type_alias_types.deinit();
         self.type_alias_simple.deinit();
         self.recv_fn_aliases.deinit();
@@ -517,6 +542,8 @@ pub const ModuleRegistry = struct {
         {
             var it = self.import_aliases.iterator();
             while (it.next()) |e| try out.import_aliases.put(e.key_ptr.*, e.value_ptr.*);
+            var bit = self.import_alias_bloom.iterator();
+            while (bit.next()) |e| try out.import_alias_bloom.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.import_wildcards.iterator();

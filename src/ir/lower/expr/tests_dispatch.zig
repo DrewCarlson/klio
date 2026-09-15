@@ -427,6 +427,10 @@ test "bare is-check type normalises to the file's exact-import class FQN" {
         var inner_map = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
         try inner_map.put("Marker", paths);
         try m.registry.import_aliases.put(span.FileId.from(0), inner_map);
+        {
+            var bit = inner_map.keyIterator();
+            while (bit.next()) |k| try m.registry.noteImportAliasName(span.FileId.from(0), k.*);
+        }
     }
     var b = try FuncBuilder.init(a, &m);
     defer b.deinit();

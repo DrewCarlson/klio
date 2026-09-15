@@ -1461,6 +1461,7 @@ fn registerFileImports(ctx: *BuildCtx) Allocator.Error!void {
         const leaf = if (imp.alias) |al| al.name else imp.path[imp.path.len - 1].name;
         const fgop = try module.registry.import_aliases.getOrPut(imp.span.file);
         if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+        try module.registry.noteImportAliasName(imp.span.file, leaf);
         const lgop = try fgop.value_ptr.getOrPut(leaf);
         if (!lgop.found_existing) lgop.value_ptr.* = .empty;
         // Kotlin keeps every same-leaf import in scope, a second one being an ambiguity at the use site

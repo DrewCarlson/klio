@@ -2167,6 +2167,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
             var list: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
             try list.appendSlice(a, le.paths);
             try inner.put(le.leaf, list);
+            try r.noteImportAliasName(entry.file, le.leaf);
         }
         try r.import_aliases.put(entry.file, inner);
     }

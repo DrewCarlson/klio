@@ -1285,6 +1285,10 @@ test "renamed overloaded import binds exact extension and plain identities" {
     var imports = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
     try imports.put("combineOriginal", paths);
     try m.registry.import_aliases.put(sp.file, imports);
+    {
+        var bit = imports.keyIterator();
+        while (bit.next()) |k| try m.registry.noteImportAliasName(sp.file, k.*);
+    }
 
     _ = try m.addClass(a, .{
         .id = ir.ClassId.from(0),
