@@ -424,6 +424,11 @@ pub fn cfgIsUnreachableAt(self: *Checker, query_span: Span) Allocator.Error!?boo
 
 /// Read by the smart-cast pass so `AssumeRefEq` can narrow each side to the
 /// other's declared type when no prior fact applies.
+/// The declared type of every binding in scope, as a lookup the smart-cast
+/// analysis reads and never retains: `PlaceTypeMap` borrows the entry slice and
+/// hands out `*const Type`. The names and types therefore stay borrowed from the
+/// frames, which outlive the query. Copying them instead cost a string dupe and
+/// a type clone per binding per query, and a query runs per narrowed reference.
 pub fn cfgDeclaredTypes(self: *const Checker, allocator: Allocator) Allocator.Error!DeclaredTypes {
     var out = DeclaredTypes{ .entries = .empty };
     errdefer out.deinit(allocator);
@@ -431,15 +436,16 @@ pub fn cfgDeclaredTypes(self: *const Checker, allocator: Allocator) Allocator.Er
         var it = frame.bindings.iterator();
         while (it.next()) |e| {
             try out.entries.append(allocator, .{
-                .key = Place{ .Local = .{ .name = try allocator.dupe(u8, e.key_ptr.*) } },
-                .value = try e.value_ptr.ty.clone(allocator),
+                .key = Place{ .Local = .{ .name = e.key_ptr.* } },
+                .value = e.value_ptr.ty,
             });
         }
     }
     return out;
 }
 
-/// `map()` yields a borrowed `PlaceTypeMap` over these owned entries.
+/// `map()` yields a borrowed `PlaceTypeMap` over these entries. The entries
+/// themselves borrow from the checker's frames, so only the list is owned.
 pub const DeclaredTypes = struct {
     entries: std.ArrayList(smartcast.PlaceTypeMap.Entry),
 
@@ -448,10 +454,6 @@ pub const DeclaredTypes = struct {
     }
 
     pub fn deinit(self: *DeclaredTypes, allocator: Allocator) void {
-        for (self.entries.items) |*e| {
-            e.key.deinit(allocator);
-            e.value.deinit(allocator);
-        }
         self.entries.deinit(allocator);
     }
 };
