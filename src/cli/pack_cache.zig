@@ -83,6 +83,13 @@ pub const LoadOptions = struct {
     /// When false, the ASTs are dropped and a pack carrying the `imports`
     /// section skips parsing its sources.
     asts_needed: bool = true,
+    /// When set, the only libraries an import may pull in: a project's declared
+    /// dependencies. A pack the manifest does not name stays out however well
+    /// its package matches, so what a project can use is what it says it uses.
+    /// The set grows as packs load, since a declared dependency's own
+    /// dependencies are equally declared. Null keeps the import-driven
+    /// behaviour, which is what a loose file outside any project gets.
+    declared_lib_ids: ?[]const []const u8 = null,
     /// Libraries never loaded from the cache, however the imports match. Running
     /// a library's own source passes its id here: the sources on the command
     /// line are that library, and loading the installed copy as well would
@@ -998,6 +1005,17 @@ fn loadInstalledPacksImpl(
 
     var loaded_lib_ids = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&loaded_lib_ids);
+
+    var declared = std.StringHashMap(void).init(gpa);
+    defer freeStringSet(&declared);
+    if (opts.declared_lib_ids) |ids| {
+        for (ids) |id| {
+            const dup = try gpa.dupe(u8, id);
+            const gop = try declared.getOrPut(dup);
+            if (gop.found_existing) gpa.free(dup) else gop.value_ptr.* = {};
+        }
+    }
+    const restrict = opts.declared_lib_ids != null;
     // An excluded library reads as already loaded, so no pass picks it up.
     for (opts.exclude_lib_ids) |id| {
         const dup = try gpa.dupe(u8, id);
@@ -1036,6 +1054,7 @@ fn loadInstalledPacksImpl(
             changed = false;
             for (candidates) |*c| {
                 const lib_id = c.manifest.library_id;
+                if (restrict and !declared.contains(lib_id)) continue;
                 if (!importPrefixMatches(gpa, &pre_prefixes, lib_id)) continue;
                 // The contribution loop below is idempotent, so re-visiting is safe.
                 if (!pre_wanted.contains(lib_id)) {
@@ -1062,6 +1081,11 @@ fn loadInstalledPacksImpl(
                     }
                 }
                 for (c.manifest.dependencies) |dep| {
+                    if (restrict) {
+                        const dep_dup = gpa.dupe(u8, dep.library_id) catch continue;
+                        const dep_gop = declared.getOrPut(dep_dup) catch continue;
+                        if (dep_gop.found_existing) gpa.free(dep_dup) else dep_gop.value_ptr.* = {};
+                    }
                     if (dep.features.len != 0) {
                         if (try addFeatureSliceChanged(gpa, &feature_reqs, dep.library_id, dep.features)) changed = true;
                     }
@@ -1086,6 +1110,7 @@ fn loadInstalledPacksImpl(
         for (candidates) |*c| {
             const lib_id = c.manifest.library_id;
             if (loaded_lib_ids.contains(lib_id)) continue;
+            if (restrict and !declared.contains(lib_id)) continue;
             const wanted = importPrefixMatches(gpa, &known_prefixes, lib_id);
             if (!wanted) continue;
             const lib_dup = try gpa.dupe(u8, lib_id);
@@ -1132,6 +1157,11 @@ fn loadInstalledPacksImpl(
             for (c.manifest.dependencies) |dep| {
                 if (dep.features.len != 0) {
                     try addFeatureSlice(gpa, &feature_reqs, dep.library_id, dep.features);
+                }
+                if (restrict) {
+                    const dep_dup = try gpa.dupe(u8, dep.library_id);
+                    const dep_gop = try declared.getOrPut(dep_dup);
+                    if (dep_gop.found_existing) gpa.free(dep_dup) else dep_gop.value_ptr.* = {};
                 }
             }
 

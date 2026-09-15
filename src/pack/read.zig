@@ -35,6 +35,120 @@ pub const SectionBytes = union(enum) {
     }
 };
 
+/// One section, read without pulling the whole pack into memory.
+///
+/// The layout makes this possible: a fixed header, then the section directory,
+/// then the payloads it points at. Reading the header and directory is a few
+/// hundred bytes whatever the pack weighs, and the wanted section is then one
+/// positional read. A catalogue over every installed pack costs kilobytes this
+/// way and tens of megabytes through `fromPath`.
+///
+/// The tradeoff is the pack hash, which covers the whole body and so cannot be
+/// checked without reading it. Callers that need the integrity guarantee, or
+/// more than one section, want `fromPath`.
+pub fn readSectionFromPath(
+    allocator: Allocator,
+    path: []const u8,
+    name: []const u8,
+    result: *PackError,
+) Allocator.Error!?SectionBytes {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
+        result.* = .{ .Compression = @errorName(e) };
+        return null;
+    };
+    defer file.close(io);
+
+    var head: [format.HASHED_REGION_OFFSET + 4]u8 = undefined;
+    const head_read = file.readPositionalAll(io, &head, 0) catch |e| {
+        result.* = .{ .Compression = @errorName(e) };
+        return null;
+    };
+    if (head_read != head.len) {
+        result.* = .Truncated;
+        return null;
+    }
+    if (!std.mem.eql(u8, head[0..4], format.MAGIC)) {
+        result.* = .BadMagic;
+        return null;
+    }
+    const version = std.mem.readInt(u32, head[4..8], .little);
+    if (version != format.FORMAT_VERSION) {
+        result.* = .{ .VersionMismatch = .{ .expected = format.FORMAT_VERSION, .found = version } };
+        return null;
+    }
+
+    const dir_len: usize = std.mem.readInt(u32, head[format.HASHED_REGION_OFFSET..][0..4], .little);
+    const dir_start = format.HASHED_REGION_OFFSET + 4;
+    const dir_bytes = try allocator.alloc(u8, dir_len);
+    defer allocator.free(dir_bytes);
+    const dir_read = file.readPositionalAll(io, dir_bytes, dir_start) catch |e| {
+        result.* = .{ .Compression = @errorName(e) };
+        return null;
+    };
+    if (dir_read != dir_len) {
+        result.* = .Truncated;
+        return null;
+    }
+
+    var cursor = Cursor{ .bytes = dir_bytes };
+    const dir = decodeValue(SectionDirectory, allocator, &cursor) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Malformed => {
+            result.* = .{ .Decode = "section directory is malformed" };
+            return null;
+        },
+    };
+    defer freeDir(allocator, dir);
+
+    const entry = blk: {
+        for (dir.entries) |e| {
+            if (std.mem.eql(u8, e.name, name)) break :blk e;
+        }
+        return null;
+    };
+    // A dictionary-compressed section needs a second one to decode against,
+    // which is what the whole-pack reader is for.
+    if (entry.compression == .ZstdDict) {
+        result.* = .{ .Compression = "section is zstd_dict compressed; read the pack whole" };
+        return null;
+    }
+
+    const payload_start = dir_start + dir_len;
+    const stored = try allocator.alloc(u8, @intCast(entry.stored_len));
+    var keep_stored = false;
+    defer if (!keep_stored) allocator.free(stored);
+    const got = file.readPositionalAll(io, stored, payload_start + entry.offset) catch |e| {
+        result.* = .{ .Compression = @errorName(e) };
+        return null;
+    };
+    if (got != stored.len) {
+        result.* = .Truncated;
+        return null;
+    }
+
+    switch (entry.compression) {
+        .None => {
+            keep_stored = true;
+            return SectionBytes{ .owned = stored };
+        },
+        .Zstd => {
+            const out = zstd.decompress(allocator, stored, @intCast(entry.uncompressed_len)) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ZstdFailed => {
+                    result.* = .{ .Compression = zstd.last_error };
+                    return null;
+                },
+            };
+            return SectionBytes{ .owned = out };
+        },
+        .ZstdDict => unreachable,
+    }
+}
+
 /// Parsed view over bytes the reader owns for its lifetime. Payload accessors
 /// borrow for uncompressed sections and allocate for compressed ones.
 pub const PackReader = struct {
@@ -426,6 +540,65 @@ test "fromPath loads and validates a written pack" {
     try std.testing.expectEqual(@as(usize, 1), reader.sectionCount());
     const got = (try reader.readSection(section_names.MANIFEST, &err)).?;
     try std.testing.expectEqualSlices(u8, "manifest-bytes", got.slice());
+}
+
+test "readSectionFromPath answers what the whole-pack read answers" {
+    const a = std.testing.allocator;
+    const write = @import("write.zig");
+    const io = std.testing.io;
+
+    var err: PackError = undefined;
+    var w = write.PackWriter.init(a);
+    defer w.deinit();
+    // A section ahead of the wanted one, so the seek has an offset to get right,
+    // and a compressed payload, so decode runs on the short path too.
+    _ = try w.addRaw(section_names.BINDINGS, "binding-bytes");
+    _ = try w.addRaw(section_names.MANIFEST, "manifest-bytes");
+    _ = try w.addZstd(section_names.SOURCES, "source-bytes-that-compress-well-aaaaaaaaaaaaaaaa");
+    var bytes = (try w.finish(&err)).?;
+    defer bytes.deinit(a);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.kliopack", .data = bytes.items });
+    const path = try tmp.dir.realPathFileAlloc(io, "lib.kliopack", a);
+    defer a.free(path);
+
+    var reader = (try PackReader.fromPath(a, path, &err)).?;
+    defer reader.deinit();
+
+    for ([_][]const u8{ section_names.MANIFEST, section_names.BINDINGS, section_names.SOURCES }) |name| {
+        const whole = (try reader.readSection(name, &err)).?;
+        defer whole.deinit(a);
+        const seeked = (try readSectionFromPath(a, path, name, &err)).?;
+        defer seeked.deinit(a);
+        try std.testing.expectEqualSlices(u8, whole.slice(), seeked.slice());
+    }
+
+    try std.testing.expect((try readSectionFromPath(a, path, "absent", &err)) == null);
+}
+
+test "readSectionFromPath rejects a file that is not a pack" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var err: PackError = undefined;
+
+    // Long enough to reach the magic, so the magic is what rejects it.
+    const filler = "x" ** (format.HASHED_REGION_OFFSET + 16);
+    try tmp.dir.writeFile(io, .{ .sub_path = "not.kliopack", .data = filler });
+    const path = try tmp.dir.realPathFileAlloc(io, "not.kliopack", a);
+    defer a.free(path);
+    try std.testing.expect((try readSectionFromPath(a, path, section_names.MANIFEST, &err)) == null);
+    try std.testing.expect(err == .BadMagic);
+
+    // Shorter than the header it has to read first.
+    try tmp.dir.writeFile(io, .{ .sub_path = "stub.kliopack", .data = "KPK\x00 and nothing else" });
+    const stub = try tmp.dir.realPathFileAlloc(io, "stub.kliopack", a);
+    defer a.free(stub);
+    try std.testing.expect((try readSectionFromPath(a, stub, section_names.MANIFEST, &err)) == null);
+    try std.testing.expect(err == .Truncated);
 }
 
 test "fromPath reports a missing file" {

@@ -222,6 +222,7 @@ pub fn runModuleFiles(
 
     const loaded = loadInstalledPacksOpts(gpa, asts.items, &map, features, .{
         .exclude_lib_ids = project.ownLibraryExclusion(gpa, paths),
+        .declared_lib_ids = project.declaredDependencyIds(gpa, paths),
     });
     // Pack ASTs first so the user's `main` wins when lowering picks an entry.
     var all_asts: std.ArrayList(KotlinFile) = .empty;
@@ -265,6 +266,7 @@ pub fn runFileIrVm(
 
     const loaded = loadInstalledPacksOpts(gpa, user_asts.items, &map, features, .{
         .exclude_lib_ids = project.ownLibraryExclusion(gpa, &.{path}),
+        .declared_lib_ids = project.declaredDependencyIds(gpa, &.{path}),
     });
     var all_asts: std.ArrayList(KotlinFile) = .empty;
     defer all_asts.deinit(gpa);
@@ -3164,8 +3166,9 @@ pub fn runTestFiles(
     return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter, format, list_only);
 }
 
-/// `plain` is the per-test list plus summary, `json` a machine-readable object.
-pub const TestFormat = enum { plain, json };
+/// `plain` is the per-test list plus summary, `json` a machine-readable object,
+/// `ij` the service-message stream an IDE test tree consumes as tests finish.
+pub const TestFormat = enum { plain, json, ij };
 
 fn writeJsonString(gpa: std.mem.Allocator, s: []const u8) void {
     io.printStdout(gpa, "\"", .{});
@@ -3230,6 +3233,9 @@ fn runTestsOnBuilt(
         return 0;
     }
 
+    test_runner.setReporter(if (format == .ij) .teamcity else .plain);
+    defer test_runner.setReporter(.plain);
+
     var stdout = io.StdoutSink{};
     // In place on this thread: a test recurses as deeply as `main` and may open a window.
     var report = runtime.runOnBigStackMainThread(TestRunCtx, test_runner.Report, testRunEntry, .{
@@ -3262,6 +3268,9 @@ fn runTestsOnBuilt(
         io.printStdout(gpa, "]}}\n", .{});
         return if (report.failed > 0) 1 else 0;
     }
+
+    // `ij` already streamed every result as a service message.
+    if (format == .ij) return if (report.failed > 0) 1 else 0;
 
     for (report.results) |r| {
         const tag = switch (r.outcome) {

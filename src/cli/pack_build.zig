@@ -655,9 +655,27 @@ fn trainZstdDict(
     return .{ .err = fail(gpa, "zstd dict training failed: no zstd encoder in this build", .{}) };
 }
 
+/// The name of the first file a scaffold would overwrite, or null when every
+/// path it writes is free. Caller frees.
+fn scaffoldConflict(gpa: std.mem.Allocator, dir: []const u8) ?[]u8 {
+    const writes = [_][]const u8{ "klio.toml", "README.md", "src/main/kotlin/Sample.kt" };
+    for (writes) |rel| {
+        const path = std.fs.path.join(gpa, &.{ dir, rel }) catch continue;
+        defer gpa.free(path);
+        if (pathExists(gpa, path)) return gpa.dupe(u8, rel) catch null;
+    }
+    return null;
+}
+
 fn scaffoldLibrary(gpa: std.mem.Allocator, dir: []const u8, id_override: ?[]const u8) VoidResult {
-    if (pathExists(gpa, dir)) {
-        return .{ .err = fail(gpa, "{s} already exists", .{dir}) };
+    // Scaffolding into a directory that already exists is the normal case:
+    // `mkdir app && klio pack new app`, and an IDE creates the project
+    // directory, and its own `.idea`, before asking for one. What must not
+    // happen is writing over someone's work, so the refusal is per file: every
+    // path the scaffold would write has to be free.
+    if (scaffoldConflict(gpa, dir)) |conflict| {
+        defer gpa.free(conflict);
+        return .{ .err = fail(gpa, "{s} already has a {s}", .{ dir, conflict }) };
     }
     const id = id_override orelse std.fs.path.basename(dir);
     if (id.len == 0) {
@@ -816,6 +834,79 @@ pub fn collectPackSources(
     const slice = files.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
     std.mem.sort(schema.SourceFile, slice, {}, lessSourceFile);
     return .{ .ok = slice };
+}
+
+/// Records `expect`/`actual` for one declaration and its members.
+fn scanDeclExpectActual(decl: *const ast.Decl, out_expect: *bool, out_actual: *bool) void {
+    switch (decl.*) {
+        .Function => |f| {
+            if (f.is_expect) out_expect.* = true;
+            if (f.is_actual) out_actual.* = true;
+        },
+        .Property => |pr| {
+            if (pr.is_expect) out_expect.* = true;
+            if (pr.is_actual) out_actual.* = true;
+        },
+        .Class => |c| {
+            if (c.is_expect) out_expect.* = true;
+            if (c.is_actual) out_actual.* = true;
+            for (c.members) |*m| scanDeclExpectActual(m, out_expect, out_actual);
+        },
+        .Object => |o| {
+            if (o.is_expect) out_expect.* = true;
+            if (o.is_actual) out_actual.* = true;
+            for (o.members) |*m| scanDeclExpectActual(m, out_expect, out_actual);
+        },
+        .TypeAlias => {},
+    }
+}
+
+/// The source sets a pack was built from, in walk order, each tagged with
+/// whether it declares `expect` or `actual`. An `expect`-bearing root resolves
+/// as its own module ahead of the roots that actualise it, which is what lets
+/// an IDE reconstruct the refinement graph from the pack alone.
+fn buildSourceSetIndex(
+    a: std.mem.Allocator,
+    roots: []const SourceRoot,
+    bundle: *const schema.AstBundle,
+    features: []const FeatureTomlDef,
+) std.mem.Allocator.Error!schema.SourceSetIndex {
+    const sets = try a.alloc(schema.SourceSetEntry, roots.len);
+    for (roots, sets) |sr, *dst| {
+        var has_expect = false;
+        var has_actual = false;
+        for (bundle.files) |f| {
+            if (!pathUnderRoot(f.rel_path, sr.root)) continue;
+            for (f.kotlin_file.decls) |*d| scanDeclExpectActual(d, &has_expect, &has_actual);
+        }
+        dst.* = .{
+            .root = sr.root,
+            .feature = featureForRoot(sr.root, features),
+            .has_expect = has_expect,
+            .has_actual = has_actual,
+        };
+    }
+    return .{ .sets = sets };
+}
+
+fn pathUnderRoot(rel: []const u8, root: []const u8) bool {
+    if (root.len == 0) return true;
+    if (!std.mem.startsWith(u8, rel, root)) return false;
+    return rel.len > root.len and rel[root.len] == '/';
+}
+
+/// The feature gating `root`, empty when no feature claims it. A feature's
+/// `sources` are `rel_path` prefixes, so a root matches when either side
+/// prefixes the other.
+fn featureForRoot(root: []const u8, features: []const FeatureTomlDef) []const u8 {
+    for (features) |f| {
+        for (f.sources) |pat| {
+            const p = std.mem.trimEnd(u8, pat, "/");
+            if (p.len == 0) continue;
+            if (std.mem.startsWith(u8, root, p) or std.mem.startsWith(u8, p, root)) return f.name;
+        }
+    }
+    return "";
 }
 
 fn anyMatch(rel: []const u8, pats: []const []const u8) bool {
@@ -1544,6 +1635,11 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     const imports_bytes = (schema.encode(schema.ImportsBundle, a, &imports_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
+    const source_sets = buildSourceSetIndex(a, effective.items, &ast_bundle, cfg.features.defs) catch
+        return .{ .err = fail(gpa, "out of memory", .{}) };
+    const sourcesets_bytes = (schema.encode(schema.SourceSetIndex, a, &source_sets, &perr) catch
+        return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
+
     // The bundle's files outlive this call in the arena, so borrow, never clone.
     const asts = a.alloc(KotlinFile, ast_bundle.files.len) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     for (ast_bundle.files, asts) |f, *dst| dst.* = f.kotlin_file;
@@ -1557,6 +1653,7 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     _ = writer.addRaw(section_names.MANIFEST, manifest_bytes.items) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addRaw(section_names.BINDINGS, bindings_bytes.items) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addSection(section_names.SOURCES, sources_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };
+    _ = writer.addSection(section_names.SOURCESETS, sourcesets_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addSection(section_names.IMPORTS, imports_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addSection(section_names.AST, ast_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addSection(section_names.TYPECK, typeck_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };

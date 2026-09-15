@@ -16,6 +16,18 @@ const Value = runtime.Value;
 
 pub const Outcome = enum { passed, failed, skipped };
 
+/// How per-test progress is reported as the run proceeds. `plain` is the
+/// `[test] name TAG 12ms` line; `teamcity` is the service-message protocol an
+/// IDE test tree consumes, so results appear as they finish rather than in one
+/// block at the end.
+pub const Reporter = enum { plain, teamcity };
+
+var reporter: Reporter = .plain;
+
+pub fn setReporter(mode: Reporter) void {
+    reporter = mode;
+}
+
 pub const TestResult = struct {
     /// `MathTest.addition` or `topLevelTest`.
     display: []const u8,
@@ -349,8 +361,17 @@ const RunState = struct {
     gpa: Allocator,
     plan: *const Plan,
     results: std.ArrayList(TestResult),
-    /// The previous `record`'s reading; the delta is the finished test's time.
-    last_record_ns: i128 = 0,
+    /// Stamped when a test starts running; the delta at `record` is its own time,
+    /// not the gap since the previous result.
+    test_started_ns: i128 = 0,
+    /// The test whose `testStarted` has been emitted and not yet finished.
+    open_test: ?[]const u8 = null,
+    /// The suite the service-message reporter has open, so it closes exactly one.
+    current_suite: ?[]const u8 = null,
+    /// Where service messages go. The program's own stdout, which is the stream
+    /// an IDE parses them from, and which keeps a test's `println` in order with
+    /// the events around it.
+    out: ?Output = null,
 };
 
 fn describeThrow(gpa: Allocator, v: Value) []const u8 {
@@ -375,17 +396,174 @@ fn describeThrow(gpa: Allocator, v: Value) []const u8 {
     return gpa.dupe(u8, ty) catch "";
 }
 
+/// TeamCity service-message escaping: the six characters the protocol reserves.
+fn emitEscaped(out: Output, text: []const u8) void {
+    for (text) |c| switch (c) {
+        '\'' => out.write("|'"),
+        '\n' => out.write("|n"),
+        '\r' => out.write("|r"),
+        '|' => out.write("||"),
+        '[' => out.write("|["),
+        ']' => out.write("|]"),
+        else => out.write(&[_]u8{c}),
+    };
+}
+
+/// `Class.method` splits into a suite and a test; a top-level test has no suite.
+fn suiteOf(display: []const u8) ?[]const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, display, '.') orelse return null;
+    if (dot == 0) return null;
+    return display[0..dot];
+}
+
+fn testNameOf(display: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, display, '.') orelse return display;
+    return display[dot + 1 ..];
+}
+
+/// A comparison failure carries both values, which an IDE turns into a
+/// side-by-side diff when they travel as separate attributes. kotlin.test
+/// renders `Expected <a>, actual <b>.`; the JUnit spelling turns up in ported
+/// assertions.
+const Comparison = struct { expected: []const u8, actual: []const u8 };
+
+fn parseComparison(detail: []const u8) ?Comparison {
+    if (parseBracketed(detail, "Expected <", ">, actual <")) |c| return c;
+    if (parseBracketed(detail, "expected:<", "> but was:<")) |c| return c;
+    return null;
+}
+
+fn parseBracketed(detail: []const u8, open: []const u8, mid: []const u8) ?Comparison {
+    const start = std.mem.indexOf(u8, detail, open) orelse return null;
+    const expected_start = start + open.len;
+    const mid_at = std.mem.indexOfPos(u8, detail, expected_start, mid) orelse return null;
+    const actual_start = mid_at + mid.len;
+    if (actual_start >= detail.len) return null;
+    const close = std.mem.lastIndexOfScalar(u8, detail, '>') orelse return null;
+    if (close < actual_start) return null;
+    return .{
+        .expected = detail[expected_start..mid_at],
+        .actual = detail[actual_start..close],
+    };
+}
+
+test "a comparison failure splits into its two values" {
+    const jetbrains = parseComparison("kotlin.AssertionError: Expected <4>, actual <5>.").?;
+    try std.testing.expectEqualStrings("4", jetbrains.expected);
+    try std.testing.expectEqualStrings("5", jetbrains.actual);
+    const junit = parseComparison("expected:<a> but was:<b>").?;
+    try std.testing.expectEqualStrings("a", junit.expected);
+    try std.testing.expectEqualStrings("b", junit.actual);
+    try std.testing.expect(parseComparison("plain failure") == null);
+}
+
+fn emitServiceMessages(
+    st: *RunState,
+    display: []const u8,
+    outcome: Outcome,
+    detail: ?[]const u8,
+    dur_ms: i128,
+) void {
+    const out = st.out orelse return;
+    const name = testNameOf(display);
+
+    switch (outcome) {
+        .passed => {},
+        .skipped => {
+            out.write("##teamcity[testIgnored name='");
+            emitEscaped(out, name);
+            out.write("']\n");
+        },
+        .failed => {
+            const text = detail orelse "test failed";
+            out.write("##teamcity[testFailed name='");
+            emitEscaped(out, name);
+            out.write("' message='");
+            emitEscaped(out, text);
+            if (parseComparison(text)) |cmp| {
+                out.write("' type='comparisonFailure' expected='");
+                emitEscaped(out, cmp.expected);
+                out.write("' actual='");
+                emitEscaped(out, cmp.actual);
+            }
+            out.write("' details='']\n");
+        },
+    }
+
+    var buf: [64]u8 = undefined;
+    const dur = std.fmt.bufPrint(&buf, "{d}", .{dur_ms}) catch "0";
+    out.write("##teamcity[testFinished name='");
+    emitEscaped(out, name);
+    out.write("' duration='");
+    out.write(dur);
+    out.write("']\n");
+}
+
+fn eqlOpt(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// Closes the suite the last test opened, so the tree never ends mid-branch.
+fn finishReporting(st: *const RunState) void {
+    if (reporter != .teamcity) return;
+    const out = st.out orelse return;
+    if (st.current_suite) |open| {
+        out.write("##teamcity[testSuiteFinished name='");
+        emitEscaped(out, open);
+        out.write("']\n");
+    }
+}
+
+/// Opens a test: its duration counts from here, and anything it prints from here
+/// until its result belongs to it rather than to the suite around it.
+fn beginTest(st: *RunState, display: []const u8) void {
+    if (st.open_test != null) return;
+    st.test_started_ns = runtime.clockMonotonicNanos();
+    st.open_test = display;
+    if (reporter != .teamcity) return;
+    const out = st.out orelse return;
+
+    const suite = suiteOf(display);
+    if (!eqlOpt(st.current_suite, suite)) {
+        if (st.current_suite) |open| {
+            out.write("##teamcity[testSuiteFinished name='");
+            emitEscaped(out, open);
+            out.write("']\n");
+        }
+        if (suite) |next| {
+            out.write("##teamcity[testSuiteStarted name='");
+            emitEscaped(out, next);
+            out.write("' locationHint='klio://");
+            emitEscaped(out, next);
+            out.write("']\n");
+        }
+        st.current_suite = suite;
+    }
+
+    out.write("##teamcity[testStarted name='");
+    emitEscaped(out, testNameOf(display));
+    out.write("' locationHint='klio://");
+    emitEscaped(out, display);
+    out.write("' captureStandardOutput='true']\n");
+}
+
 fn record(st: *RunState, display: []const u8, outcome: Outcome, detail: ?[]const u8) Allocator.Error!void {
-    // Progress streams to stderr; stdout stays one post-run block to parse.
+    // A result without a start is a test that never ran: open it now so every
+    // outcome is reported inside its own start/finish pair.
+    beginTest(st, display);
     const tag = switch (outcome) {
         .passed => "PASSED",
         .failed => "FAILED",
         .skipped => "SKIPPED",
     };
-    const now_ns = runtime.clockMonotonicNanos();
-    const dur_ms: i128 = @divTrunc(now_ns - st.last_record_ns, std.time.ns_per_ms);
-    st.last_record_ns = now_ns;
-    std.debug.print("[test] {s} {s} {d}ms\n", .{ display, tag, dur_ms });
+    const dur_ms: i128 = @divTrunc(runtime.clockMonotonicNanos() - st.test_started_ns, std.time.ns_per_ms);
+    st.open_test = null;
+    switch (reporter) {
+        .plain => std.debug.print("[test] {s} {s} {d}ms\n", .{ display, tag, dur_ms }),
+        .teamcity => emitServiceMessages(st, display, outcome, detail, dur_ms),
+    }
     const owned_display = st.gpa.dupe(u8, display) catch |err| {
         std.debug.print("[test-runner] display allocation failed len={d}\n", .{display.len});
         return err;
@@ -494,6 +672,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
             continue;
         };
         if (ir.eval.evalDepthNow() != 0) std.debug.print("[depth-leak] {d} before {s}\n", .{ ir.eval.evalDepthNow(), t.display });
+        beginTest(st, t.display);
         armWallDeadlineFor(t.display);
         const oc = try vm.callNoArg(fid);
         clearWallDeadline();
@@ -517,6 +696,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
             };
             // Fresh instance per test (JUnit semantics).
             if (ir.eval.evalDepthNow() != 0) std.debug.print("[depth-leak] {d} before {s}\n", .{ ir.eval.evalDepthNow(), m.display });
+            beginTest(st, m.display);
             armWallDeadlineFor(m.display);
             const inst = try vm.construct(cid);
             drainWallCapAbandon();
@@ -594,8 +774,15 @@ pub fn runTests(
     defer freePlan(gpa, &plan);
 
     // Stamp the clock at run start so the first duration is real, not 0ms.
-    var st = RunState{ .gpa = gpa, .plan = &plan, .results = .empty, .last_record_ns = runtime.clockMonotonicNanos() };
+    var st = RunState{
+        .gpa = gpa,
+        .plan = &plan,
+        .results = .empty,
+        .test_started_ns = runtime.clockMonotonicNanos(),
+        .out = out,
+    };
     const prep = try vm.runCalls(out, *RunState, &st, runBody);
+    finishReporting(&st);
     if (prep) |_| {
         // Surface one failing entry so the caller exits non-zero.
         try record(&st, "<startup>", .failed, try gpa.dupe(u8, "module initialization failed"));

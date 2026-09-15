@@ -19,6 +19,8 @@ pub const FORMAT_VERSION = format.FORMAT_VERSION;
 pub const MAGIC = format.MAGIC;
 pub const SectionDirectory = format.SectionDirectory;
 pub const SectionEntry = format.SectionEntry;
+/// One section without reading the pack whole; see `read.readSectionFromPath`.
+pub const readSectionFromPath = read.readSectionFromPath;
 pub const section_names = format.section_names;
 
 pub const PackReader = read.PackReader;

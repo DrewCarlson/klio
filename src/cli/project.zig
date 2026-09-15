@@ -198,23 +198,30 @@ pub fn planTest(a: Allocator, dir: []const u8, sel: FeatureSel) ?TestPlan {
 /// them. A file under a `[[test]]` root is a consumer, not the library, so it
 /// resolves against the installed pack as usual.
 pub fn owningLibraryId(a: Allocator, paths: []const []const u8) ?[]const u8 {
+    const owner = owningManifest(a, paths) orelse return null;
+    if (owner.cfg.library.id.len == 0) return null;
+    for (paths) |p| {
+        if (!underSourceRoot(a, owner.dir, &owner.cfg, p)) return null;
+    }
+    return owner.cfg.library.id;
+}
+
+const OwningManifest = struct { dir: []const u8, cfg: pack_build.LibraryToml };
+
+/// The manifest governing `paths`, and the directory holding it. Absolute
+/// first: a relative path runs out of components before the walk reaches the
+/// working directory, and the manifest there goes unseen.
+fn owningManifest(a: Allocator, paths: []const []const u8) ?OwningManifest {
     const first = if (paths.len != 0) paths[0] else return null;
-    // Absolute first: a relative path runs out of components before the walk
-    // reaches the working directory, and the manifest there goes unseen.
     var dir = std.fs.path.dirname(absOrSelf(a, first)) orelse return null;
 
     while (true) {
         const toml_path = std.fs.path.join(a, &.{ dir, "klio.toml" }) catch return null;
         if (readFileAlloc(a, toml_path)) |text| {
-            const cfg = switch (pack_build.parseLibraryToml(a, text)) {
-                .ok => |c| c,
-                .err => return null,
+            return switch (pack_build.parseLibraryToml(a, text)) {
+                .ok => |c| .{ .dir = dir, .cfg = c },
+                .err => null,
             };
-            if (cfg.library.id.len == 0) return null;
-            for (paths) |p| {
-                if (!underSourceRoot(a, dir, &cfg, p)) return null;
-            }
-            return cfg.library.id;
         }
         dir = std.fs.path.dirname(dir) orelse return null;
         if (dir.len == 0) return null;
@@ -261,4 +268,33 @@ pub fn ownLibraryExclusion(a: Allocator, paths: []const []const u8) []const []co
     const one = a.alloc([]const u8, 1) catch return &.{};
     one[0] = id;
     return one;
+}
+
+/// The `<pack>/<feature>` specs the manifest owning `paths` declares on its
+/// dependencies. A manifest that asks for a dependency's feature is asking for
+/// it whenever the project runs, not only when a `--feature` flag repeats it.
+pub fn declaredFeatureSpecs(a: Allocator, paths: []const []const u8) []const []const u8 {
+    const owner = owningManifest(a, paths) orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (owner.cfg.deps) |dep| {
+        for (dep.features) |feature| {
+            const spec = std.fmt.allocPrint(a, "{s}/{s}", .{ dep.id, feature }) catch continue;
+            out.append(a, spec) catch continue;
+        }
+    }
+    return out.items;
+}
+
+/// The dependency ids the manifest owning `paths` declares, or null when the
+/// sources belong to no project. Null and empty differ: no manifest means the
+/// old import-driven loading, while a manifest with no dependencies means a
+/// project that uses nothing but the stdlib.
+pub fn declaredDependencyIds(a: Allocator, paths: []const []const u8) ?[]const []const u8 {
+    const owner = owningManifest(a, paths) orelse return null;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (owner.cfg.deps) |dep| out.append(a, dep.id) catch continue;
+    // A project resolves against itself as well: its own sources are on the
+    // command line, and its own pack may be installed.
+    if (owner.cfg.library.id.len != 0) out.append(a, owner.cfg.library.id) catch {};
+    return out.items;
 }

@@ -345,6 +345,55 @@ pub const SourceFile = struct {
     }
 };
 
+/// The `[[source]]` roots a pack was built from, in walk order. Every packed
+/// source's `rel_path` starts with exactly one of these prefixes, so a reader
+/// can recover which source set a file belongs to. Optional: a pack built
+/// before the section existed carries none, and reads as one unnamed set.
+pub const SourceSetIndex = struct {
+    sets: []SourceSetEntry = &.{},
+
+    pub const empty: SourceSetIndex = .{ .sets = &.{} };
+
+    pub fn eql(self: SourceSetIndex, other: SourceSetIndex) bool {
+        if (self.sets.len != other.sets.len) return false;
+        for (self.sets, other.sets) |a, b| {
+            if (!a.eql(b)) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *SourceSetIndex, allocator: Allocator) void {
+        for (self.sets) |*s| s.deinit(allocator);
+        allocator.free(self.sets);
+        self.* = undefined;
+    }
+};
+
+pub const SourceSetEntry = struct {
+    /// The `rel_path` prefix every member shares.
+    root: []const u8,
+    /// The feature gating the root, empty for core.
+    feature: []const u8 = "",
+    /// Whether any declaration under the root carries `expect`. Such a root
+    /// must resolve as its own module, ahead of the roots that actualise it.
+    has_expect: bool = false,
+    /// Whether any declaration under the root carries `actual`.
+    has_actual: bool = false,
+
+    pub fn eql(self: SourceSetEntry, other: SourceSetEntry) bool {
+        return std.mem.eql(u8, self.root, other.root) and
+            std.mem.eql(u8, self.feature, other.feature) and
+            self.has_expect == other.has_expect and
+            self.has_actual == other.has_actual;
+    }
+
+    pub fn deinit(self: *SourceSetEntry, allocator: Allocator) void {
+        allocator.free(self.root);
+        allocator.free(self.feature);
+        self.* = undefined;
+    }
+};
+
 /// Per-source package headers and import paths, precomputed at pack build. A
 /// loader needing only the import graph skips parsing the carried sources.
 pub const ImportsBundle = struct {

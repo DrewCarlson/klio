@@ -21,6 +21,7 @@ const RequestedFeatures = pack_cache.RequestedFeatures;
 
 const pack_build = @import("pack_build.zig");
 const project = @import("project.zig");
+const ide = @import("ide.zig");
 const PackCmd = pack_build.PackCmd;
 
 const stdlib_image = @import("stdlib_image.zig");
@@ -68,6 +69,9 @@ const USAGE =
     \\                             libklio_rt.a).
     \\  repl                       Start an interactive REPL.
     \\  pack <subcommand>          Build or inspect a `.klio-pack` artifact.
+    \\  ide <subcommand>           Emit the project model an editor builds its
+    \\                             workspace from (`ide model`), or prune what
+    \\                             it materialised (`ide gc`).
     \\
     \\Performance (any command; also via the KLIO_OPT env var):
     \\  --opt <fast|safe|off>      fast (default): JIT + bounded GC. safe: no JIT.
@@ -80,7 +84,9 @@ const USAGE =
     \\Test options:
     \\  --filter <substrings>        Run only tests whose Class/method/file matches
     \\                               any of the comma-separated substrings.
-    \\  --format <plain|json>        plain (default) or a machine-readable JSON summary.
+    \\  --format <plain|json|ij>     plain (default), a machine-readable JSON summary,
+    \\                               or `ij` service messages an IDE test tree reads
+    \\                               as each test finishes.
     \\  --all / --feature <name>     Select which feature modules' tests to run.
     \\  --list                       List discovered @Test names without running them.
     \\  --isolate [--timeout <s>]    Debug: run each test in its own sub-process with a
@@ -200,6 +206,8 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
         return commands.runRepl(gpa);
     } else if (std.mem.eql(u8, cmd, "pack")) {
         return runPackCmd(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "ide")) {
+        return ide.run(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "bake")) {
         return runBakeCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "bundle")) {
@@ -344,13 +352,18 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         interp_ir.setCoroutineTimeMode(.Virtual);
     }
 
-    var requested = parseRequestedFeatures(gpa, feature_specs.items);
-    defer deinitRequestedFeatures(&requested);
-
     if (files.items.len == 0) {
         printErr(gpa, "usage: klio run <file.kt> [<file2.kt> ...]\n", .{});
         return 2;
     }
+
+    // A manifest that names a dependency's feature is asking for it on every
+    // run of that project, not only when the command line repeats it.
+    for (project.declaredFeatureSpecs(gpa, files.items)) |spec| {
+        feature_specs.append(gpa, spec) catch return 2;
+    }
+    var requested = parseRequestedFeatures(gpa, feature_specs.items);
+    defer deinitRequestedFeatures(&requested);
     if (files.items.len == 1) {
         return commands.runFileIrVm(gpa, files.items[0], &requested);
     }
@@ -385,7 +398,7 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
             const v = if (optionValue(a, "--format=")) |vv| vv else blk: {
                 i += 1;
                 if (i >= args.len) {
-                    printErr(gpa, "error: --format requires a value (plain|json)\n", .{});
+                    printErr(gpa, "error: --format requires a value (plain|json|ij)\n", .{});
                     return 2;
                 }
                 break :blk args[i];
@@ -394,8 +407,10 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
                 test_format = .json;
             } else if (std.mem.eql(u8, v, "plain")) {
                 test_format = .plain;
+            } else if (std.mem.eql(u8, v, "ij") or std.mem.eql(u8, v, "teamcity")) {
+                test_format = .ij;
             } else {
-                printErr(gpa, "error: unknown --format `{s}` (use plain|json)\n", .{v});
+                printErr(gpa, "error: unknown --format `{s}` (use plain|json|ij)\n", .{v});
                 return 2;
             }
         } else if (std.mem.eql(u8, a, "--list")) {

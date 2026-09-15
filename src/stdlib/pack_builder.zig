@@ -86,6 +86,17 @@ pub fn buildStdlibPack(
     _ = try writer.addRaw(section_names.SYMBOLS, symbol_bytes.items);
     _ = try writer.addRaw(section_names.BINDINGS, binding_bytes.items);
     _ = try writer.addRaw(section_names.SOURCES, sources_bytes.items);
+
+    // The two stdlib roots: the curated upstream tree carries every `expect`,
+    // the klio tree every `actual`, so a reader recovers the refinement order
+    // without reparsing.
+    var source_sets = [_]schema.SourceSetEntry{
+        .{ .root = "stdlib/kotlin/libraries/stdlib", .has_expect = true },
+        .{ .root = "stdlib/klio", .has_actual = true },
+    };
+    const set_index = schema.SourceSetIndex{ .sets = &source_sets };
+    const set_bytes = (try schema.encode(schema.SourceSetIndex, a, &set_index, result)) orelse return null;
+    _ = try writer.addRaw(section_names.SOURCESETS, set_bytes.items);
     return try writer.finish(result);
 }
 

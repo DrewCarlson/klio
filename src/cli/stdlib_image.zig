@@ -622,6 +622,7 @@ pub fn tryPrepare(
             .report_failures = false,
             .asts_needed = false,
             .exclude_lib_ids = own_library,
+            .declared_lib_ids = project.declaredDependencyIds(gpa, paths),
         }).bindings;
         for (sel_tmp.packs.items) |p| {
             const feats = gpa.alloc([]const u8, p.features.len) catch return null;
@@ -800,6 +801,7 @@ fn bakeAndPrepare(
         .embedded_report = &report,
         .selection = &selection,
         .exclude_lib_ids = project.ownLibraryExclusion(gpa, paths),
+        .declared_lib_ids = project.declaredDependencyIds(gpa, paths),
     });
     const tb_parse = runtime.clockMonotonicNanos();
 

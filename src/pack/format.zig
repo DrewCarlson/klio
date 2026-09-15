@@ -82,6 +82,10 @@ pub const section_names = struct {
     /// Per-source package and import paths (`schema.ImportsBundle`), from the
     /// same parse that fills `ast`. Optional.
     pub const IMPORTS: []const u8 = "imports";
+    /// The `[[source]]` roots the pack was built from
+    /// (`schema.SourceSetIndex`), so a reader can recover which source set a
+    /// packed file belongs to. Optional.
+    pub const SOURCESETS: []const u8 = "sourcesets";
     pub const AST: []const u8 = "ast";
     pub const RESOLVED: []const u8 = "resolved";
     pub const TYPECK: []const u8 = "typeck";
