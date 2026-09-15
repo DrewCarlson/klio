@@ -849,6 +849,7 @@ pub const Module = struct {
     pub const preferredMethodSlotTarget = m_methods.preferredMethodSlotTarget;
     pub const linkMethodClass = m_methods.linkMethodClass;
     pub const linkMethodSlots = m_methods.linkMethodSlots;
+    pub const linkMethodSlotsFrom = m_methods.linkMethodSlotsFrom;
 
     pub const funcCount = m_lookup.funcCount;
     pub const deinit = m_lookup.deinit;

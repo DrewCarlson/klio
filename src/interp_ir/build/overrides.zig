@@ -122,6 +122,7 @@ const BuildCtx = struct {
     package_prefix: []const u8,
     /// Marks from the seed clone: registry materialisation appends only past these.
     base_funcs_len: usize,
+    base_classes_len: usize,
     base_object_names_len: usize,
 
     object_names: std.ArrayList([]const u8),
@@ -188,6 +189,7 @@ const BuildCtx = struct {
         const module: *Module = &module_ref.cell.data;
         const a = module.registry.allocator;
         const base_funcs_len = module.funcs.items.len;
+        const base_classes_len = module.classes.items.len;
         if (file_packages) |packages| {
             var package_it = packages.iterator();
             while (package_it.next()) |entry| {
@@ -232,6 +234,7 @@ const BuildCtx = struct {
             .base = base,
             .package_prefix = package_prefix,
             .base_funcs_len = base_funcs_len,
+            .base_classes_len = base_classes_len,
             .base_object_names_len = base_object_names_len,
             .object_names = object_names,
             .object_spans = .empty,
@@ -3435,7 +3438,12 @@ fn finishModule(ctx: *BuildCtx) Allocator.Error!void {
 
     // Virtual override families settle after every class and member header is complete, so runtime
     // member dispatch can use class and slot ids alone.
-    try module.linkMethodSlots(a);
+    // Extending a base keeps the dispatch entries that came with it.
+    if (ctx.base != null) {
+        try module.linkMethodSlotsFrom(a, ctx.base_classes_len);
+    } else {
+        try module.linkMethodSlots(a);
+    }
 
     // Debug-only frame-dump hook for intrinsics below the ir layer.
     ir.eval.installDebugFrameDump();

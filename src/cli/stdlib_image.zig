@@ -191,12 +191,20 @@ fn hashCheckoutSources(gpa: Allocator, fio: std.Io, hasher: *std.crypto.hash.Bla
     return true;
 }
 
-/// Hash of the pack bytes embedded in the binary, null in builds carrying none.
+/// Identity of the pack bytes embedded in the binary, null in builds carrying
+/// none.
+///
+/// The bytes are part of the executable, and the key already carries the
+/// executable's stamp, so hashing ten megabytes on every run only restates what
+/// the stamp says. The length keeps this distinct from a checkout hash over the
+/// same sources.
 fn embeddedContentHash() ?[32]u8 {
     const bytes = stdlib_pack.EMBEDDED_PACK_BYTES orelse return null;
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update("embedded:");
-    hasher.update(bytes);
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+    hasher.update(&len_buf);
     var out: [32]u8 = undefined;
     hasher.final(&out);
     return out;
@@ -765,11 +773,21 @@ fn finishFromLoaded(
     map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
 
+    const te0 = runtime.clockMonotonicNanos();
     publishExternDecls(gpa, loaded.base);
+    const te_extern = runtime.clockMonotonicNanos();
     publishBaseEagerCalls(gpa, loaded.base);
+    const te_eager = runtime.clockMonotonicNanos();
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    const te_user_check = runtime.clockMonotonicNanos();
     span.active_map = map;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user2.asts) catch return null;
+    trace(gpa, "  extend: extern {d}ms, eager {d}ms, user-check {d}ms, build {d}ms", .{
+        (te_extern - te0) / 1_000_000,
+        (te_eager - te_extern) / 1_000_000,
+        (te_user_check - te_eager) / 1_000_000,
+        (runtime.clockMonotonicNanos() - te_user_check) / 1_000_000,
+    });
 
     var bindings = bindings_in;
     for (loaded.binding_fqns) |fqn| {

@@ -1112,6 +1112,21 @@ pub fn linkMethodClass(
 /// headers are complete, so runtime dispatch is numeric and resolves no names.
 pub fn linkMethodSlots(self: *Module, allocator: Allocator) Allocator.Error!void {
     self.method_dispatch.clearRetainingCapacity();
+    return self.linkMethodSlotsFrom(allocator, 0);
+}
+
+/// Links the classes from `first_class` on, leaving the entries already in
+/// `method_dispatch` alone.
+///
+/// A program extending a baked base inherits that base's dispatch table with the
+/// image, and its own declarations only ever ADD classes: a dispatch entry is
+/// keyed by class id, and nothing a program declares can change what a base
+/// class dispatches to. Re-linking every base class to append a few user ones
+/// walked the whole class table and, per class, the whole declaration table.
+/// `linkMethodClass` pulls in each ancestor a linked class needs, so the chains
+/// a user class actually extends still settle.
+pub fn linkMethodSlotsFrom(self: *Module, allocator: Allocator, first_class: usize) Allocator.Error!void {
+    if (first_class >= self.classes.items.len) return;
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const sa = scratch.allocator();
@@ -1119,7 +1134,7 @@ pub fn linkMethodSlots(self: *Module, allocator: Allocator) Allocator.Error!void
     for (maps) |*map| map.* = std.AutoHashMap(u32, FuncId).init(sa);
     const state = try sa.alloc(u8, self.classes.items.len);
     @memset(state, 0);
-    for (self.classes.items) |class| try self.linkMethodClass(sa, maps, state, class.id);
+    for (self.classes.items[first_class..]) |class| try self.linkMethodClass(sa, maps, state, class.id);
     for (maps, 0..) |*map, raw_cid| {
         var it = map.iterator();
         while (it.next()) |entry| {
