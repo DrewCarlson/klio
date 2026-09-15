@@ -2076,15 +2076,23 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     out.package = img.package;
     try out.tailrec_fn_names.appendSlice(a, img.tailrec_fn_names);
 
-    for (img.decl_user_params) |kv| try out.decl_user_params.put(kv.k, kv.v);
-    for (img.decl_user_arity) |kv| try out.decl_user_arity.put(kv.k, kv.v);
-    for (img.decl_user_sig) |kv| try out.decl_user_sig.put(kv.k, kv.v);
+    // Every one of these maps is filled from a slice whose length is already
+    // known, so they are sized once instead of rehashed as they grow.
+    try out.decl_user_params.ensureTotalCapacity(@intCast(img.decl_user_params.len));
+    try out.decl_user_arity.ensureTotalCapacity(@intCast(img.decl_user_arity.len));
+    try out.decl_user_sig.ensureTotalCapacity(@intCast(img.decl_user_sig.len));
+    try out.decl_sigs.ensureTotalCapacity(@intCast(img.decl_sigs.len));
+    try out.decl_span.ensureTotalCapacity(@intCast(img.decl_span.len));
+
+    for (img.decl_user_params) |kv| out.decl_user_params.putAssumeCapacity(kv.k, kv.v);
+    for (img.decl_user_arity) |kv| out.decl_user_arity.putAssumeCapacity(kv.k, kv.v);
+    for (img.decl_user_sig) |kv| out.decl_user_sig.putAssumeCapacity(kv.k, kv.v);
     for (img.decl_sigs) |l| {
         const rt: ?ir.TypeRef = if (l.recv_head.len != 0)
             .{ .name = l.recv_head, .nullable = l.recv_nullable, .args = &.{} }
         else
             null;
-        try out.decl_sigs.put(l.fid, .{
+        out.decl_sigs.putAssumeCapacity(l.fid, .{
             .enclosing_class = l.enclosing_class,
             .receiver_ty = rt,
             .arity = .{ .required = l.required, .total = l.total, .has_vararg = l.has_vararg },
@@ -2097,7 +2105,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
             .host_symbol = if (l.host_symbol.len != 0) l.host_symbol else null,
         });
     }
-    for (img.decl_span) |kv| try out.decl_span.put(kv.k, kv.v);
+    for (img.decl_span) |kv| out.decl_span.putAssumeCapacity(kv.k, kv.v);
     for (img.member_decl_groups) |group| {
         for (group.fids) |fid| try out.registerMemberDecl(a, group.owner_fqn, group.name, fid);
     }
@@ -2108,26 +2116,38 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     const r = &out.registry;
     const ri = &img.registry;
     try r.object_names.appendSlice(a, ri.object_names);
-    for (ri.companion_singletons) |kv| try r.companion_singletons.put(kv.k, kv.v);
-    for (ri.enclosing_class) |kv| try r.enclosing_class.put(kv.k, kv.v);
+    try r.companion_singletons.ensureTotalCapacity(@intCast(ri.companion_singletons.len));
+    for (ri.companion_singletons) |kv| r.companion_singletons.putAssumeCapacity(kv.k, kv.v);
+    try r.enclosing_class.ensureTotalCapacity(@intCast(ri.enclosing_class.len));
+    for (ri.enclosing_class) |kv| r.enclosing_class.putAssumeCapacity(kv.k, kv.v);
     for (ri.func_type_params) |kv| {
         var list: std.ArrayList([]const u8) = .empty;
         try list.appendSlice(a, kv.v);
         try r.func_type_params.put(kv.k, list);
     }
-    for (ri.func_type_param_bounds) |kv| try r.func_type_param_bounds.put(kv.k, kv.v);
-    for (ri.class_type_param_bounds) |kv| try r.class_type_param_bounds.put(kv.k, kv.v);
-    for (ri.top_level_delegated_props) |k| try r.top_level_delegated_props.put(k, {});
-    for (ri.top_level_lateinit_props) |k| try r.top_level_lateinit_props.put(k, {});
-    for (ri.top_level_prop_getters) |kv| try r.top_level_prop_getters.put(kv.k, kv.v);
-    for (ri.top_level_prop_setters) |kv| try r.top_level_prop_setters.put(kv.k, kv.v);
+    try r.func_type_param_bounds.ensureTotalCapacity(@intCast(ri.func_type_param_bounds.len));
+    for (ri.func_type_param_bounds) |kv| r.func_type_param_bounds.putAssumeCapacity(kv.k, kv.v);
+    try r.class_type_param_bounds.ensureTotalCapacity(@intCast(ri.class_type_param_bounds.len));
+    for (ri.class_type_param_bounds) |kv| r.class_type_param_bounds.putAssumeCapacity(kv.k, kv.v);
+    try r.top_level_delegated_props.ensureTotalCapacity(@intCast(ri.top_level_delegated_props.len));
+    for (ri.top_level_delegated_props) |k| r.top_level_delegated_props.putAssumeCapacity(k, {});
+    try r.top_level_lateinit_props.ensureTotalCapacity(@intCast(ri.top_level_lateinit_props.len));
+    for (ri.top_level_lateinit_props) |k| r.top_level_lateinit_props.putAssumeCapacity(k, {});
+    try r.top_level_prop_getters.ensureTotalCapacity(@intCast(ri.top_level_prop_getters.len));
+    for (ri.top_level_prop_getters) |kv| r.top_level_prop_getters.putAssumeCapacity(kv.k, kv.v);
+    try r.top_level_prop_setters.ensureTotalCapacity(@intCast(ri.top_level_prop_setters.len));
+    for (ri.top_level_prop_setters) |kv| r.top_level_prop_setters.putAssumeCapacity(kv.k, kv.v);
     for (ri.hierarchy_methods) |kv| {
         try r.hierarchy_methods.put(kv.k, try sliceToSet(a, kv.v));
     }
-    for (ri.class_member_names) |k| try r.class_member_names.put(k, {});
-    for (ri.class_super_names) |kv| try r.class_super_names.put(kv.k, kv.v);
-    for (ri.delegated_body_props) |p| try r.delegated_body_props.put(.{ .a = p.a, .b = p.b }, {});
-    for (ri.member_ext_owner_class) |kv| try r.member_ext_owner_class.put(kv.k, kv.v);
+    try r.class_member_names.ensureTotalCapacity(@intCast(ri.class_member_names.len));
+    for (ri.class_member_names) |k| r.class_member_names.putAssumeCapacity(k, {});
+    try r.class_super_names.ensureTotalCapacity(@intCast(ri.class_super_names.len));
+    for (ri.class_super_names) |kv| r.class_super_names.putAssumeCapacity(kv.k, kv.v);
+    try r.delegated_body_props.ensureTotalCapacity(@intCast(ri.delegated_body_props.len));
+    for (ri.delegated_body_props) |p| r.delegated_body_props.putAssumeCapacity(.{ .a = p.a, .b = p.b }, {});
+    try r.member_ext_owner_class.ensureTotalCapacity(@intCast(ri.member_ext_owner_class.len));
+    for (ri.member_ext_owner_class) |kv| r.member_ext_owner_class.putAssumeCapacity(kv.k, kv.v);
     for (ri.local_fn_defaults) |kv| {
         var list: std.ArrayList(?FuncId) = .empty;
         try list.appendSlice(a, kv.v);
@@ -2138,7 +2158,8 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         try list.appendSlice(a, entry.slots);
         try r.abstract_member_defaults.put(.{ .a = entry.a, .b = entry.b }, list);
     }
-    for (ri.type_aliases) |kv| try r.type_aliases.put(kv.k, kv.v);
+    try r.type_aliases.ensureTotalCapacity(@intCast(ri.type_aliases.len));
+    for (ri.type_aliases) |kv| r.type_aliases.putAssumeCapacity(kv.k, kv.v);
     for (ri.type_alias_types) |kv| try r.putTypeAliasType(kv.k, kv.v);
     for (ri.import_aliases) |entry| {
         var inner = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
@@ -2159,23 +2180,40 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         for (kv.v) |skv| try inner.put(skv.k, skv.v);
         try r.nested_object_aliases.put(kv.k, inner);
     }
-    for (ri.mangled_nested) |kv| try r.mangled_nested.put(kv.k, kv.v);
-    for (ri.class_const_inits) |entry| try r.class_const_inits.put(.{ .a = entry.a, .b = entry.b }, entry.v);
-    for (ri.class_prop_type_heads) |entry| try r.class_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
-    for (ri.class_prop_type_refs) |entry| try r.class_prop_type_refs.put(.{ .a = entry.a, .b = entry.b }, entry.v);
-    for (ri.top_level_prop_type_refs) |entry| try r.top_level_prop_type_refs.put(entry.name, entry.v);
-    for (ri.ext_prop_type_heads) |entry| try r.ext_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
-    for (ri.iface_member_ext_recv) |entry| try r.iface_member_ext_recv.put(.{ .a = entry.a, .b = entry.b }, entry.v);
-    for (ri.iface_member_ctx_types) |entry| try r.iface_member_ctx_types.put(.{ .a = entry.a, .b = entry.b }, entry.v);
-    for (ri.abstract_member_arity) |entry| try r.abstract_member_arity.put(.{ .a = entry.a, .b = entry.b }, entry.v);
-    for (ri.private_fn_files) |kv| try r.private_fn_files.put(kv.k, kv.v);
-    for (ri.file_packages) |kv| try r.file_packages.put(kv.k, kv.v);
-    for (ri.file_modules) |kv| try r.file_modules.put(kv.k, kv.v);
-    for (ri.top_level_const_vals) |kv| try r.top_level_const_vals.put(kv.k, kv.v);
-    for (ri.member_method_fids) |kv| try r.member_method_fids.put(kv.k, kv.v);
-    for (ri.recv_fn_props) |pk| try r.recv_fn_props.put(.{ .a = pk.a, .b = pk.b }, pk.v);
-    for (ri.private_shadow_props) |k| try r.private_shadow_props.put(k, {});
-    for (ri.override_cell_props) |k| try r.override_cell_props.put(k, {});
+    try r.mangled_nested.ensureTotalCapacity(@intCast(ri.mangled_nested.len));
+    for (ri.mangled_nested) |kv| r.mangled_nested.putAssumeCapacity(kv.k, kv.v);
+    try r.class_const_inits.ensureTotalCapacity(@intCast(ri.class_const_inits.len));
+    for (ri.class_const_inits) |entry| r.class_const_inits.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, entry.v);
+    try r.class_prop_type_heads.ensureTotalCapacity(@intCast(ri.class_prop_type_heads.len));
+    for (ri.class_prop_type_heads) |entry| r.class_prop_type_heads.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, entry.v);
+    try r.class_prop_type_refs.ensureTotalCapacity(@intCast(ri.class_prop_type_refs.len));
+    for (ri.class_prop_type_refs) |entry| r.class_prop_type_refs.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, entry.v);
+    try r.top_level_prop_type_refs.ensureTotalCapacity(@intCast(ri.top_level_prop_type_refs.len));
+    for (ri.top_level_prop_type_refs) |entry| r.top_level_prop_type_refs.putAssumeCapacity(entry.name, entry.v);
+    try r.ext_prop_type_heads.ensureTotalCapacity(@intCast(ri.ext_prop_type_heads.len));
+    for (ri.ext_prop_type_heads) |entry| r.ext_prop_type_heads.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, entry.v);
+    try r.iface_member_ext_recv.ensureTotalCapacity(@intCast(ri.iface_member_ext_recv.len));
+    for (ri.iface_member_ext_recv) |entry| r.iface_member_ext_recv.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, entry.v);
+    try r.iface_member_ctx_types.ensureTotalCapacity(@intCast(ri.iface_member_ctx_types.len));
+    for (ri.iface_member_ctx_types) |entry| r.iface_member_ctx_types.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, entry.v);
+    try r.abstract_member_arity.ensureTotalCapacity(@intCast(ri.abstract_member_arity.len));
+    for (ri.abstract_member_arity) |entry| r.abstract_member_arity.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, entry.v);
+    try r.private_fn_files.ensureTotalCapacity(@intCast(ri.private_fn_files.len));
+    for (ri.private_fn_files) |kv| r.private_fn_files.putAssumeCapacity(kv.k, kv.v);
+    try r.file_packages.ensureTotalCapacity(@intCast(ri.file_packages.len));
+    for (ri.file_packages) |kv| r.file_packages.putAssumeCapacity(kv.k, kv.v);
+    try r.file_modules.ensureTotalCapacity(@intCast(ri.file_modules.len));
+    for (ri.file_modules) |kv| r.file_modules.putAssumeCapacity(kv.k, kv.v);
+    try r.top_level_const_vals.ensureTotalCapacity(@intCast(ri.top_level_const_vals.len));
+    for (ri.top_level_const_vals) |kv| r.top_level_const_vals.putAssumeCapacity(kv.k, kv.v);
+    try r.member_method_fids.ensureTotalCapacity(@intCast(ri.member_method_fids.len));
+    for (ri.member_method_fids) |kv| r.member_method_fids.putAssumeCapacity(kv.k, kv.v);
+    try r.recv_fn_props.ensureTotalCapacity(@intCast(ri.recv_fn_props.len));
+    for (ri.recv_fn_props) |pk| r.recv_fn_props.putAssumeCapacity(.{ .a = pk.a, .b = pk.b }, pk.v);
+    try r.private_shadow_props.ensureTotalCapacity(@intCast(ri.private_shadow_props.len));
+    for (ri.private_shadow_props) |k| r.private_shadow_props.putAssumeCapacity(k, {});
+    try r.override_cell_props.ensureTotalCapacity(@intCast(ri.override_cell_props.len));
+    for (ri.override_cell_props) |k| r.override_cell_props.putAssumeCapacity(k, {});
     for (ri.hierarchy_shadow_names) |entry| {
         try r.hierarchy_shadow_names.put(entry.k, .{
             .names = try sliceToSet(a, entry.names),
