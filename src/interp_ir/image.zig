@@ -2134,7 +2134,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         try r.abstract_member_defaults.put(.{ .a = entry.a, .b = entry.b }, list);
     }
     for (ri.type_aliases) |kv| try r.type_aliases.put(kv.k, kv.v);
-    for (ri.type_alias_types) |kv| try r.type_alias_types.put(kv.k, kv.v);
+    for (ri.type_alias_types) |kv| try r.putTypeAliasType(kv.k, kv.v);
     for (ri.import_aliases) |entry| {
         var inner = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
         for (entry.leaves) |le| {
@@ -2589,7 +2589,7 @@ test "module image preserves linked identities with lazy function headers" {
         .has_body = true,
         .host_symbol = "kotlin.IntArray.min",
     });
-    try source.registry.type_alias_types.put("Names", .{
+    try source.registry.putTypeAliasType("Names", .{
         .type_params = &.{},
         .target = .{
             .name = "List",

@@ -100,6 +100,57 @@ pub fn collectUserComposableFiles(allocator: Allocator, files: []const KotlinFil
     return out;
 }
 
+/// `KLIO_TRACE_LOWER=1` prints how long each lowering pass took. The passes run
+/// nested and on more than one module per process, so each line names its pass
+/// and the caller reads them in order rather than as a tree.
+pub const phase = struct {
+    var last: u64 = 0;
+
+    pub fn on() bool {
+        return runtime.envOnce("KLIO_TRACE_LOWER") != null;
+    }
+
+    pub fn start() void {
+        if (on()) last = runtime.clockMonotonicNanos();
+    }
+
+    pub fn mark(name: []const u8) void {
+        if (!on()) return;
+        const now = runtime.clockMonotonicNanos();
+        std.debug.print("[lower] {s} {d}ms\n", .{ name, (now - last) / 1_000_000 });
+        last = now;
+    }
+
+    /// Per-body cost, so a pass that is one loop reports what the loop spent it on.
+    const Body = struct { name: []const u8 = "", ns: u64 = 0 };
+    var bodies: usize = 0;
+    var bodies_ns: u64 = 0;
+    var worst: [8]Body = @splat(.{});
+
+    pub fn noteBody(name: []const u8, ns: u64) void {
+        bodies += 1;
+        bodies_ns += ns;
+        if (ns <= worst[worst.len - 1].ns) return;
+        var i: usize = worst.len - 1;
+        while (i > 0 and worst[i - 1].ns < ns) : (i -= 1) worst[i] = worst[i - 1];
+        worst[i] = .{ .name = name, .ns = ns };
+    }
+
+    pub fn reportBodies() void {
+        if (!on() or bodies == 0) return;
+        std.debug.print("[lower] {d} bodies, {d}ms total, {d}us mean\n", .{
+            bodies, bodies_ns / 1_000_000, bodies_ns / bodies / 1_000,
+        });
+        for (worst) |w| {
+            if (w.ns == 0) break;
+            std.debug.print("[lower]   slowest {s} {d}ms\n", .{ w.name, w.ns / 1_000_000 });
+        }
+        bodies = 0;
+        bodies_ns = 0;
+        worst = @splat(.{});
+    }
+};
+
 pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
     ir.build.localClassScopeReset();
     const ComposeMaps = struct {
@@ -154,11 +205,14 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
     } else 0;
     // `@Serializable` lowering: each serializable class's generated serializer
     // declarations are synthesized as ordinary Kotlin before anything reads the decls.
+    phase.start();
     const files: []KotlinFile = try serialization_pass.transformFiles(allocator, files_in);
+    phase.mark("serialization-pass");
     // Typealias expansion: every alias reference becomes its target before any phase
     // reads the declarations (`KLIO_ALIAS_EXPAND=0` skips it).
     const alias_expand_off = if (runtime.envOnce("KLIO_ALIAS_EXPAND")) |v| std.mem.eql(u8, v, "0") else false;
     if (!alias_expand_off) try ast.alias_expand.expandFiles(allocator, files);
+    phase.mark("alias-expand");
     var user_composable_files = try collectUserComposableFiles(allocator, files);
     defer user_composable_files.deinit();
     compose_pass.user_composable_files = &user_composable_files;
@@ -257,6 +311,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         compose_pass.active_inline_fns = &maps.inline_fns;
         compose_pass.active_stability = &maps.stability;
     }
+    phase.mark("compose-pass");
 
     // Kotlin gives same-named top-level properties distinct storage per declaration (a
     // `private` one is file-scoped, non-private ones in different packages are distinct)
@@ -517,6 +572,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         .decls = try decls.toOwnedSlice(allocator),
         .span = Span.init(span.FileId.from(0), 0, 0),
     };
+    phase.mark("rename-tables");
     const built = try buildModuleWithOverrides(
         allocator,
         &combined,

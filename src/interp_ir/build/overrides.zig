@@ -324,6 +324,8 @@ const BuildCtx = struct {
     }
 };
 
+const phase = @import("module.zig").phase;
+
 pub fn buildModuleWithOverrides(
     allocator: Allocator,
     file: *const KotlinFile,
@@ -346,6 +348,7 @@ pub fn buildModuleWithOverrides(
         base,
     );
     defer ctx.deinitScratch();
+    phase.mark("build-ctx-init");
 
     try liftFileDecls(&ctx);
     try repointMangledSupertypes(&ctx);
@@ -377,13 +380,17 @@ pub fn buildModuleWithOverrides(
     try collectMemberTrailingLambdaShapes(ctx.module, &ctx.file_classes);
     try fillReservedClassPrimaryParams(&ctx);
     try registerTopLevelFuncHeaders(&ctx);
+    phase.mark("registerTopLevelFuncHeaders");
     try registerCallableExtensionProps(&ctx);
     try registerReceiverFnPropHeads(&ctx);
 
     // Lower every body and thunk against the now-complete header set.
     try lowerClassBodies(&ctx);
+    phase.mark("lowerClassBodies");
     try lowerTopLevelFunctionBodies(&ctx);
+    phase.mark("lowerTopLevelFunctionBodies");
     try lowerClassMemberThunks(&ctx);
+    phase.mark("lowerClassMemberThunks");
     try buildRuntimeClassDefs(&ctx);
     try registerEnumEntries(&ctx);
     try linkRuntimeSupertypes(&ctx);
@@ -401,7 +408,10 @@ pub fn buildModuleWithOverrides(
     try rewriteAliasedParamTypes(&ctx);
     try materialiseRegistry(&ctx);
     try finishModule(&ctx);
-    return ctx.finish();
+    phase.mark("finishModule");
+    const r = ctx.finish();
+    phase.mark("finish");
+    return r;
 }
 
 
@@ -1486,7 +1496,7 @@ fn registerTypeAliasShapes(ctx: *BuildCtx) Allocator.Error!void {
             .type_params = type_params,
             .target = try ir.lower.decl.loweredTypeRef(a, &ta.target, true),
         };
-        try module.registry.type_alias_types.put(ta.name.name, alias_shape);
+        try module.registry.putTypeAliasType(ta.name.name, alias_shape);
         const alias_fqn = try resolveFqn(
             a,
             fqn_overrides,
@@ -1494,7 +1504,7 @@ fn registerTypeAliasShapes(ctx: *BuildCtx) Allocator.Error!void {
             package_prefix,
             ta.name.name,
         );
-        try module.registry.type_alias_types.put(alias_fqn, alias_shape);
+        try module.registry.putTypeAliasType(alias_fqn, alias_shape);
         if (ta.target.function) |ft| {
             const tag = try std.fmt.allocPrint(a, "Function{d}", .{ft.params.len});
             try module.registry.type_aliases.put(ta.name.name, tag);
@@ -1529,9 +1539,9 @@ fn registerClassTypeAliasShapes(ctx: *BuildCtx) Allocator.Error!void {
             }
             const alias_shape = ir.ModuleRegistry.TypeAliasShape{ .type_params = type_params, .target = target };
             const qualified = try std.fmt.allocPrint(a, "{s}.{s}", .{ c.name.name, ta.name.name });
-            try module.registry.type_alias_types.put(qualified, alias_shape);
+            try module.registry.putTypeAliasType(qualified, alias_shape);
             if (!module.registry.type_alias_types.contains(ta.name.name)) {
-                try module.registry.type_alias_types.put(ta.name.name, alias_shape);
+                try module.registry.putTypeAliasType(ta.name.name, alias_shape);
             }
         }
     }
@@ -1884,7 +1894,9 @@ fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
             }
             const stub_pkg = module.funcByIdMut(stub_ids.items[stub_cursor]).?.package;
             const prev_pkg = ir.lower.decl.setLowerSelfPackage(stub_pkg);
+            const t_fn = if (phase.on()) runtime.clockMonotonicNanos() else 0;
             const func = try ir.lower.lowerFunctionBodyInto(module, f, file_classes);
+            if (phase.on()) phase.noteBody(f.name.name, runtime.clockMonotonicNanos() - t_fn);
             _ = ir.lower.decl.setLowerSelfPackage(prev_pkg);
             const id = stub_ids.items[stub_cursor];
             stub_cursor += 1;
@@ -1906,6 +1918,7 @@ fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
             try lowerFunctionDefaultThunks(ctx, f, id);
         }
     }
+    phase.reportBodies();
 }
 
 fn registerBodyFuncTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) Allocator.Error!void {

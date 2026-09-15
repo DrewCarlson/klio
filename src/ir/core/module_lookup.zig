@@ -823,10 +823,11 @@ pub fn classIdIndexed(self: *const Module, name: []const u8, caller_pkg_in: []co
         const w = runtime.envOnce("KLIO_CIX_TRACE") orelse break :blk false;
         break :blk std.mem.eql(u8, w, name);
     };
+    const name_imports = self.importAliasPathsIn(caller_file, name);
     if (self.classNameCandidates(name)) |ids| {
         for (ids) |cid| {
             const c = idGet(Class, self.classes.items, cid.int()) orelse continue;
-            const t = self.scopeTier(c.fqn, c.package, name, caller_pkg, caller_file);
+            const t = self.scopeTierIn(c.fqn, c.package, caller_pkg, caller_file, name_imports);
             if (cix_trace) std.debug.print("[cix] {s} cand={d} fqn={s} pkg={s} tier={d} caller_pkg={s} file={d}\n", .{ name, cid.int(), c.fqn, c.package, t, caller_pkg, caller_file.int() });
             if (t < best_tier) {
                 best_tier = t;
@@ -834,14 +835,14 @@ pub fn classIdIndexed(self: *const Module, name: []const u8, caller_pkg_in: []co
             }
         }
         if (cix_trace) std.debug.print("[cix] {s} candidates-path best={?} tier={d}\n", .{ name, if (best) |b2| b2.int() else null, best_tier });
-        if (best_tier > 3 and self.importAliasPathsIn(caller_file, name).len != 0) return null;
+        if (best_tier > 3 and name_imports.len != 0) return null;
         return best;
     }
     if (cix_trace) std.debug.print("[cix] {s} NO candidate list (flat scan)\n", .{name});
     for (self.class_index.items) |entry| {
         if (!std.mem.eql(u8, entry.name, name)) continue;
         const c = idGet(Class, self.classes.items, entry.id.int()) orelse continue;
-        const t = self.scopeTier(c.fqn, c.package, name, caller_pkg, caller_file);
+        const t = self.scopeTierIn(c.fqn, c.package, caller_pkg, caller_file, name_imports);
         if (t < best_tier) {
             best_tier = t;
             best = entry.id;

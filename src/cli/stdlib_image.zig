@@ -824,17 +824,24 @@ fn bakeAndPrepare(
 
     const tb_pre = runtime.clockMonotonicNanos();
     stageBaseEagerCalls(gpa, deps.asts);
+    const tb_stage = runtime.clockMonotonicNanos();
     const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse {
         writeTombstone(gpa, cache, hex);
         trace(gpa, "unbakeable {s} (base not snapshot-safe)", .{hex});
         return null;
     };
     base.user_file_start = @intCast(dep_map.files.items.len);
+    const tb_build = runtime.clockMonotonicNanos();
 
     // The only run where the base's sources exist; the results ride the image.
     checkBaseSources(gpa, base, deps.asts);
 
     const tb_lower = runtime.clockMonotonicNanos();
+    trace(gpa, "  lower: stage {d}ms, build {d}ms, check {d}ms", .{
+        (tb_stage - tb_pre) / 1_000_000,
+        (tb_build - tb_stage) / 1_000_000,
+        (tb_lower - tb_build) / 1_000_000,
+    });
     const bytes = (image.bake(gpa, base, dep_map, .{
         .known_packages = report.known_packages.items,
         .binding_fqns = report.binding_fqns.items,
@@ -843,8 +850,13 @@ fn bakeAndPrepare(
         trace(gpa, "unbakeable {s} (outside serializable surface)", .{hex});
         return null;
     };
+    const tb_bake = runtime.clockMonotonicNanos();
     writeAtomic(gpa, cache, image_path, bytes);
     pruneImages(gpa, cache);
+    trace(gpa, "  serialize: bake {d}ms, write {d}ms", .{
+        (tb_bake - tb_lower) / 1_000_000,
+        (runtime.clockMonotonicNanos() - tb_bake) / 1_000_000,
+    });
     trace(gpa, "baked {s} ({d} bytes; parse {d}ms, lower {d}ms, serialize {d}ms)", .{
         hex,
         bytes.len,

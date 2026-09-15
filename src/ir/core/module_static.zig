@@ -679,7 +679,20 @@ pub fn staticReceiverCompatibility(
     receiver: TypeRef,
     param: TypeRef,
 ) StaticCompatibility {
-    const actual_alias = self.staticAliasHead(receiver);
+    return self.staticReceiverCompatibilityWith(fid, receiver, self.staticAliasHead(receiver), param);
+}
+
+/// `staticReceiverCompatibility` with the receiver's alias head already walked.
+/// Ranking a candidate list asks about one receiver against many declared
+/// types, and walking the receiver's aliases again per candidate is a hash
+/// lookup per candidate for an answer that cannot change.
+pub fn staticReceiverCompatibilityWith(
+    self: *const Module,
+    fid: ?FuncId,
+    receiver: TypeRef,
+    actual_alias: StaticAliasHead,
+    param: TypeRef,
+) StaticCompatibility {
     const declared_alias = self.staticAliasHead(param);
     if (actual_alias.structure_lost or declared_alias.structure_lost) return .unknown;
     const actual = actual_alias.name;
@@ -861,6 +874,12 @@ pub fn scopedTypeAliasFqn(
         }
         if (imported) |path| return path;
     }
+    // Everything from here asks for a key spelled `<prefix>.<name>` or bare
+    // `name`, so one hash on the simple name answers them all when no alias
+    // carries it, which is the overwhelming case. The renamed-import branch
+    // above is deliberately ahead of this: `import p.Alias as Short` is keyed
+    // by `Alias`, and looking it up by `Short` would miss here.
+    if (!self.registry.type_alias_simple.contains(name)) return null;
     if (package.len != 0) {
         const own = try std.fmt.allocPrint(
             allocator,

@@ -92,6 +92,11 @@ pub const ModuleRegistry = struct {
     type_aliases: std.StringHashMap([]const u8),
     /// Structural alias targets used by static applicability proofs.
     type_alias_types: std.StringHashMap(TypeAliasShape),
+    /// The simple names `type_alias_types` holds, however each key is qualified.
+    /// Every scoped lookup probes `<some prefix>.<simple name>` or the bare name,
+    /// so a name absent here cannot match any key and the probes are skipped
+    /// without building the qualified strings they would hash.
+    type_alias_simple: std.StringHashMap(void),
     /// Function-type aliases whose target declares an extension receiver -> the target's VALUE-parameter
     /// count. The `Function{N}` tag in `type_aliases` drops the receiver; a bare call still binds `this`.
     recv_fn_aliases: std.StringHashMap(u8),
@@ -216,6 +221,7 @@ pub const ModuleRegistry = struct {
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
             .type_aliases = std.StringHashMap([]const u8).init(allocator),
             .type_alias_types = std.StringHashMap(TypeAliasShape).init(allocator),
+            .type_alias_simple = std.StringHashMap(void).init(allocator),
             .recv_fn_aliases = std.StringHashMap(u8).init(allocator),
             .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
@@ -233,6 +239,14 @@ pub const ModuleRegistry = struct {
             .top_level_prop_setters = std.StringHashMap(FuncId).init(allocator),
             .allocator = allocator,
         };
+    }
+
+    /// The one way to register a structural alias, so the simple-name index
+    /// cannot drift from the keys it indexes.
+    pub fn putTypeAliasType(self: *ModuleRegistry, key: []const u8, shape: TypeAliasShape) !void {
+        try self.type_alias_types.put(key, shape);
+        const simple = if (std.mem.lastIndexOfScalar(u8, key, '.')) |dot| key[dot + 1 ..] else key;
+        try self.type_alias_simple.put(simple, {});
     }
 
     pub fn deinit(self: *ModuleRegistry) void {
@@ -311,6 +325,7 @@ pub const ModuleRegistry = struct {
         }
         self.type_aliases.deinit();
         self.type_alias_types.deinit();
+        self.type_alias_simple.deinit();
         self.recv_fn_aliases.deinit();
         {
             var it = self.import_aliases.valueIterator();
@@ -497,7 +512,7 @@ pub const ModuleRegistry = struct {
         }
         {
             var it = self.type_alias_types.iterator();
-            while (it.next()) |e| try out.type_alias_types.put(e.key_ptr.*, e.value_ptr.*);
+            while (it.next()) |e| try out.putTypeAliasType(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.import_aliases.iterator();

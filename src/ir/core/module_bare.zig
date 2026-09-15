@@ -204,7 +204,21 @@ pub fn classIdExactImport(self: *const Module, name: []const u8, caller_file: Fi
 }
 
 pub fn scopeTier(self: *const Module, fqn: []const u8, pkg: []const u8, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
-    for (self.importAliasPathsIn(caller_file, name)) |p| {
+    return self.scopeTierIn(fqn, pkg, caller_pkg, caller_file, self.importAliasPathsIn(caller_file, name));
+}
+
+/// `scopeTier` with the named imports already in hand. Ranking a list of
+/// candidates asks for the same name at the same site every time, and that
+/// lookup hashes the name, so the loops hoist it and pass the answer here.
+pub fn scopeTierIn(
+    self: *const Module,
+    fqn: []const u8,
+    pkg: []const u8,
+    caller_pkg: []const u8,
+    caller_file: FileId,
+    paths: []const ModuleRegistry.ImportPath,
+) u8 {
+    for (paths) |p| {
         if (std.mem.eql(u8, p.fqn, fqn)) return 0;
     }
     if (std.mem.eql(u8, pkg, caller_pkg)) return 1;

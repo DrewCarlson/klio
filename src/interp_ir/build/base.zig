@@ -154,6 +154,7 @@ pub const MainPolicy = enum { require, allow };
 pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_policy: MainPolicy) Allocator.Error!?*StdlibBase {
     var lifted: []Decl = &.{};
     var built = try buildModuleFilesInner(allocator, files, null, &lifted);
+    @import("module.zig").phase.mark("build-module-total");
     {
         const mg = built.module.borrow();
         defer mg.deinit();
@@ -234,6 +235,7 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
     // A non-inline base function runs from its lowered IR, never its AST body, so stripping
     // those bodies drops dead trees while keeping dispatch metadata.
     prune.stripDeadBodies(@constCast(base.lifted_decls), true);
+    @import("module.zig").phase.mark("base-bookkeeping");
 
     return base;
 }

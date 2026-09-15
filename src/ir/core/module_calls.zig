@@ -362,6 +362,7 @@ pub fn applicableBarePick(
         const w = dropTraceEnv() orelse break :blk false;
         break :blk std.mem.eql(u8, w, name);
     };
+    const name_imports = self.importAliasPathsIn(caller_file, name);
     for (candidates) |id| {
         const f = self.funcById(id) orelse continue;
         const kind = self.declarationKind(id, f);
@@ -446,7 +447,7 @@ pub fn applicableBarePick(
         const tier: u8 = if (kind == .member_extension or kind == .instance_method)
             0
         else
-            self.scopeTier(f.fqn, f.package, name, caller_pkg, caller_file);
+            self.scopeTierIn(f.fqn, f.package, caller_pkg, caller_file, name_imports);
         if (receiver_formed and tier >= other_package_tier) continue;
         if (tier < best.tier) {
             best = .{

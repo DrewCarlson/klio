@@ -315,15 +315,15 @@ test "extension resolver expands receiver aliases in their file scope" {
     );
     try m.registry.file_packages.put(FileId.from(1), "app");
     try m.registry.file_packages.put(FileId.from(2), "app");
-    try m.registry.type_alias_types.put("app.CompositeKeyHashCode", .{
+    try m.registry.putTypeAliasType("app.CompositeKeyHashCode", .{
         .type_params = &.{},
         .target = .{ .name = "Long", .nullable = false, .args = &.{} },
     });
-    try m.registry.type_alias_types.put("other.CompositeKeyHashCode", .{
+    try m.registry.putTypeAliasType("other.CompositeKeyHashCode", .{
         .type_params = &.{},
         .target = .{ .name = "String", .nullable = false, .args = &.{} },
     });
-    try m.registry.type_alias_types.put("CompositeKeyHashCode", .{
+    try m.registry.putTypeAliasType("CompositeKeyHashCode", .{
         .type_params = &.{},
         .target = .{ .name = "String", .nullable = false, .args = &.{} },
     });
@@ -1563,7 +1563,7 @@ test "static subtype proof respects variance, bottom, stars, and aliases" {
         &.{},
     ));
 
-    try m.registry.type_alias_types.put("Ints", .{
+    try m.registry.putTypeAliasType("Ints", .{
         .type_params = &.{},
         .target = .{
             .name = "MutableList",
@@ -1581,7 +1581,7 @@ test "static subtype proof respects variance, bottom, stars, and aliases" {
         },
     )));
 
-    try m.registry.type_alias_types.put("alpha.Items", .{
+    try m.registry.putTypeAliasType("alpha.Items", .{
         .type_params = &.{"T"},
         .target = .{
             .name = "MutableList",
@@ -1589,7 +1589,7 @@ test "static subtype proof respects variance, bottom, stars, and aliases" {
             .args = @constCast(&type_vars),
         },
     });
-    try m.registry.type_alias_types.put("beta.Items", .{
+    try m.registry.putTypeAliasType("beta.Items", .{
         .type_params = &.{"T"},
         .target = .{
             .name = "MutableList",
@@ -1976,4 +1976,37 @@ test "bounded spread candidates do not widen past a fixed-only tier" {
     const scoped = (try m.boundedSpreadCandidates(a, "pick", "app", FileId.from(0))).?;
     defer a.free(scoped);
     try testing.expectEqual(@as(usize, 0), scoped.len);
+}
+
+test "a renamed import of a typealias still expands at its reference site" {
+    // `import p.Bag as Short` keys the import by `Short` while the alias itself
+    // is registered as `p.Bag`, so a lookup that pre-filters on the simple name
+    // has to consult the renamed imports before it gives up.
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    try m.registry.file_packages.put(FileId.from(1), "app");
+    try m.registry.putTypeAliasType("p.Bag", .{
+        .type_params = &.{},
+        .target = .{ .name = "String", .nullable = false, .args = &.{} },
+    });
+
+    var paths: std.ArrayList(ModuleRegistry.ImportPath) = .empty;
+    const segs = try a.alloc([]const u8, 2);
+    segs[0] = "p";
+    segs[1] = "Bag";
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "p.Bag"), .segs = segs });
+    var per_file = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    try per_file.put("Short", paths);
+    try m.registry.import_aliases.put(FileId.from(1), per_file);
+
+    const found = try m.scopedTypeAliasFqn(
+        a,
+        .{ .name = "Short", .nullable = false, .args = &.{} },
+        FileId.from(1),
+        "app",
+    );
+    try testing.expect(found != null);
+    try testing.expectEqualStrings("p.Bag", found.?);
 }

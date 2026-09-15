@@ -33,6 +33,7 @@ const typeContainsBoundParam = Module.typeContainsBoundParam;
 
 /// Resolve an explicit-receiver top-level extension call from declaration
 /// metadata: only a proven receiver and a unique innermost overload commit.
+
 pub fn resolveExtensionCall(
     self: *const Module,
     name: []const u8,
@@ -94,12 +95,19 @@ pub fn resolveExtensionCall(
     }
     var candidate_it = self.bareCallCandidateIterator(name, ctx.caller_file);
     var receiver_pruned: usize = 0;
+    // Same name, same site, every candidate: the named imports are hoisted out
+    // of the ranking rather than hashed once per candidate.
+    const caller_import_paths = self.importAliasPathsIn(ctx.caller_file, name);
+    // One receiver, many declared types: its alias head is walked once here
+    // rather than per candidate.
+    const scoped_receiver_alias = self.staticAliasHead(scoped_receiver);
+    const scoped_receiver_cid = self.staticTypeClassId(scoped_receiver);
+    const rex_trace = runtime.envSetOnce("KLIO_REX_TRACE");
     candidate_loop: while (candidate_it.next()) |fid| {
         const f = self.funcById(fid) orelse continue;
         const ds = self.decl_sigs.get(fid.int());
         const kind = if (ds) |decl| decl.kind else f.kind;
         const is_member_extension = kind == .member_extension;
-        const rex_trace = runtime.envSetOnce("KLIO_REX_TRACE");
         if (rex_trace) std.debug.print("[rex] {s} fid={d} kind={s} enter recv={s} rargs={d}\n", .{ name, fid.int(), @tagName(kind), scoped_receiver.name, scoped_receiver.args.len });
         if ((kind != .top_level_extension and !is_member_extension) or
             f.params.len == 0 or
@@ -205,12 +213,12 @@ pub fn resolveExtensionCall(
             )
         else
             64 + @min(
-                self.scopeTier(
+                self.scopeTierIn(
                     f.fqn,
                     f.package,
-                    name,
                     ctx.caller_package,
                     ctx.caller_file,
+                    caller_import_paths,
                 ) + 1,
                 191,
             );
@@ -310,9 +318,10 @@ pub fn resolveExtensionCall(
             decl_file,
             f.package,
         ) catch return .{};
-        var compatibility = self.staticReceiverCompatibility(
+        var compatibility = self.staticReceiverCompatibilityWith(
             fid,
             scoped_receiver,
+            scoped_receiver_alias,
             scoped_recv_param,
         );
         // `KLIO_RECV_REFUTE=1` (default off): a declared receiver classifier
@@ -395,7 +404,7 @@ pub fn resolveExtensionCall(
                 }
             }
         } else if (compatibility == .unknown) {
-            const receiver_id = self.staticTypeClassId(scoped_receiver);
+            const receiver_id = scoped_receiver_cid;
             const param_id = self.staticTypeClassId(scoped_recv_param);
             const disjoint_known_classifiers = receiver_id != null and
                 param_id != null and
