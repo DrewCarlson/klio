@@ -94,6 +94,7 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         }
         // The Vm owns the ordered list; the image borrows its slice for per-file clinit.
         prog.top_level_props_ordered = vm.top_level_props.items;
+        vm.base_top_level_props = built.base_top_level_props;
 
         // Move each dispatch-time side table into the image, swapping a fresh empty in.
         prog.body_prop_inits.deinit();
@@ -534,7 +535,11 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         };
         vmhost.host_impl.setStartupInitsActive(true);
         defer vmhost.host_impl.setStartupInitsActive(false);
-        for (self.top_level_props.items) |nf| {
+        // A baked base's property initialisers run when something first reads
+        // one, the way Kotlin runs a file's on first touch of that file. The
+        // stdlib's tables are most of them and a program that never reads one
+        // should not pay to build it.
+        for (self.top_level_props.items[@min(self.base_top_level_props, self.top_level_props.items.len)..]) |nf| {
             const init_func = module.funcById(nf.func) orelse return .InvalidMain;
             {
                 const g = self.globals.borrow();

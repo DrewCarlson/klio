@@ -1488,9 +1488,13 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         if (host_impl.pendingTypedDefault(self, name)) |d| return d;
         const r = host_impl.ensureTopLevelInited(self, name) catch return null;
         if (r == .ok) {
-            if (r.ok) |v| {
-                if (v != .Null) return v;
-            }
+            // A property initialised to null is bound, not missing, so the
+            // binding decides rather than the value: `var x: T? = null` read
+            // before anything assigns it answers null, and falling through
+            // would report it unresolved.
+            const g = self.globals.borrow();
+            defer g.deinit();
+            if (g.get().lookup(name)) |v| return v;
         }
     }
 

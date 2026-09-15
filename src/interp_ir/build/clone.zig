@@ -35,6 +35,7 @@ const StrFunc = build_types.StrFunc;
 /// cells a run mutates, is copied.
 pub fn adoptBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!BuiltModule {
     var out = base.*;
+    out.base_top_level_props = base.top_level_props.items.len;
     out.module = base.module.clone();
     out.classes = try cloneClassTableForRun(a, &base.classes);
     return out;
@@ -76,6 +77,7 @@ pub fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!
     try copyStrMap([]const ?[]const u8, &out.parent_ctor_arg_names, &base.parent_ctor_arg_names);
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);
+    out.base_top_level_props = base.top_level_props.items.len;
     try copyPairMap(&out.extension_props, &base.extension_props);
     {
         var it = base.owner_keyed_ext_names.keyIterator();

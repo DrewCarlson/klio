@@ -1179,6 +1179,8 @@ pub const Vm = struct {
     classes: ObjRef(ClassTable),
     /// Top-level property initialiser `FuncIds`, run at `run` start.
     top_level_props: std.ArrayList(NameFunc),
+    /// Leading entries from a baked base; they initialise on first read.
+    base_top_level_props: usize = 0,
     enum_entry_arg_inits: std.ArrayList(EnumEntryArgInit),
     /// Default outer instance to attach to locally-registered classes.
     class_default_outer: ObjRef(OuterTable),

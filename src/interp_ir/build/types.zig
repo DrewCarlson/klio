@@ -113,6 +113,9 @@ pub const BuiltModule = struct {
     /// `init { ... }` blocks per class. Each `FuncId` takes `this`.
     init_blocks: std.StringHashMap([]FuncId),
     top_level_props: std.ArrayList(NameFunc),
+    /// How many leading `top_level_props` came from a baked base. Those run on
+    /// first read; a program's own still run before `main`.
+    base_top_level_props: usize = 0,
     /// Top-level extension properties, keyed by `(receiver type, prop)`.
     extension_props: PairFuncMap,
     /// Names having at least one owner-qualified key; see the Prog field.

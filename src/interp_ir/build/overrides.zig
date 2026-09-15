@@ -124,6 +124,7 @@ const BuildCtx = struct {
     /// Marks from the seed clone: registry materialisation appends only past these.
     base_funcs_len: usize,
     base_classes_len: usize,
+    base_top_level_props: usize,
     base_object_names_len: usize,
 
     object_names: std.ArrayList([]const u8),
@@ -240,6 +241,7 @@ const BuildCtx = struct {
             .package_prefix = package_prefix,
             .base_funcs_len = base_funcs_len,
             .base_classes_len = base_classes_len,
+            .base_top_level_props = if (seed) |*sd| sd.base_top_level_props else 0,
             .base_object_names_len = base_object_names_len,
             .object_names = object_names,
             .object_spans = .empty,
@@ -308,6 +310,7 @@ const BuildCtx = struct {
             .parent_ctor_arg_names = self.parent_ctor_arg_names,
             .init_blocks = self.init_blocks,
             .top_level_props = self.top_level_props,
+            .base_top_level_props = self.base_top_level_props,
             .extension_props = self.extension_props,
             .owner_keyed_ext_names = self.owner_keyed_ext_names,
             .nullable_ext_props = self.nullable_ext_props,
