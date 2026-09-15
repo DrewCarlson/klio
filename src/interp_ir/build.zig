@@ -110,6 +110,7 @@ const build_module = @import("build/module.zig");
 pub const buildModule = build_module.buildModule;
 pub const buildModuleFiles = build_module.buildModuleFiles;
 pub const buildModuleFilesExtend = build_module.buildModuleFilesExtend;
+pub const buildModuleFilesExtendOwned = build_module.buildModuleFilesExtendOwned;
 const collectUserComposableFiles = build_module.collectUserComposableFiles;
 const buildModuleFilesInner = build_module.buildModuleFilesInner;
 

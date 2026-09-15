@@ -3566,9 +3566,18 @@ fn tryImagePath(
     const prev_reclaim = runtime.reclaimEnabled();
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
+    const t_prep0 = runtime.clockMonotonicNanos();
     const prepared = stdlib_image.tryPrepare(gpa, paths, features) orelse return null;
+    const t_prep1 = runtime.clockMonotonicNanos();
     const msg = if (paths.len == 1) "error: no main function found" else "runtime error: no main function in module";
-    return runBuiltModule(gpa, prepared.built, prepared.bindings, prepared.map, msg);
+    const code = runBuiltModule(gpa, prepared.built, prepared.bindings, prepared.map, msg);
+    if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+        std.debug.print("[run] prepare {d}ms, execute {d}ms\n", .{
+            (t_prep1 - t_prep0) / 1_000_000,
+            (runtime.clockMonotonicNanos() - t_prep1) / 1_000_000,
+        });
+    }
+    return code;
 }
 
 /// Tail shared by the whole-module and image paths: Vm, bindings, run `main`.
@@ -3614,11 +3623,21 @@ pub fn runBuiltModuleArgs(
         }
     }
     const main_id = built.main;
+    const t_vm0 = runtime.clockMonotonicNanos();
     const fb = Vm.fromBuilt(gpa, &built) catch return 1;
     var vm = fb.vm;
-    defer if (!compose_ui.hostedActive()) vm.deinit();
+    defer if (!compose_ui.hostedActive()) {
+        const t_d = runtime.clockMonotonicNanos();
+        vm.deinit();
+        if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+            std.debug.print("[run]   vm.deinit {d}ms\n", .{(runtime.clockMonotonicNanos() - t_d) / 1_000_000});
+        }
+    };
     vm.program_args = program_args;
     vm.setInstalledBindings(bindings) catch return 1;
+    if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+        std.debug.print("[run]   vm init+bindings {d}ms\n", .{(runtime.clockMonotonicNanos() - t_vm0) / 1_000_000});
+    }
 
     const main = main_id orelse {
         io.printStderr(gpa, "{s}\n", .{no_main_msg});
@@ -3632,7 +3651,11 @@ pub fn runBuiltModuleArgs(
         span.active_map = null;
     };
     runtime.prof.maybeStart();
+    const t_main = runtime.clockMonotonicNanos();
     const res = runMainBigStack(&vm, main, stdout.output());
+    if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+        std.debug.print("[run]   main {d}ms\n", .{(runtime.clockMonotonicNanos() - t_main) / 1_000_000});
+    }
     runtime.prof.maybeReport();
     {
         const mg = built.module.borrow();

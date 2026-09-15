@@ -793,6 +793,9 @@ const ImageRoot = struct {
     /// Self-contained `lifted_decls`, decl `i` at `lifted_decl_offsets[i]`.
     lifted_decl_section: []const u8 = &.{},
     lifted_decl_offsets: []const u32 = &.{},
+    /// Whether anything in that section is composable; false lets a run skip
+    /// decoding it.
+    has_composables: bool = false,
     func_header_section: []const u8 = &.{},
     func_header_offsets: []const u32 = &.{},
     /// Ids of bodyless funcs (no blocks, not deferred), the lazy link input.
@@ -1022,6 +1025,7 @@ pub fn bake(
         }
         root.lifted_decl_section = decl_enc.out.items;
         root.lifted_decl_offsets = offsets;
+        root.has_composables = base.has_composables;
     }
 
     {
@@ -2040,6 +2044,7 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
         .deferred_bodies = root.deferred_bodies,
         .lifted_decl_section = root.lifted_decl_section,
         .lifted_decl_offsets = root.lifted_decl_offsets,
+        .has_composables = root.has_composables,
         .arena = a,
     };
 

@@ -49,6 +49,7 @@ const transplantExpectMemberDefaults = build_classes.transplantExpectMemberDefau
 const build_clone = @import("clone.zig");
 const classTableByQualifiedSuffix = build_clone.classTableByQualifiedSuffix;
 const cloneBuiltForRun = build_clone.cloneBuiltForRun;
+const adoptBuiltForRun = build_clone.adoptBuiltForRun;
 
 const build_scan = @import("scan.zig");
 const boundTypeRecordComplete = build_scan.boundTypeRecordComplete;
@@ -181,8 +182,12 @@ const BuildCtx = struct {
         file_packages: ?*const std.AutoHashMap(ir.FileId, []const u8),
         file_modules: ?*const std.AutoHashMap(ir.FileId, u32),
         base: ?*const StdlibBase,
+        own_base: bool,
     ) Allocator.Error!BuildCtx {
-        var seed: ?BuiltModule = if (base) |bs| try cloneBuiltForRun(allocator, &bs.built) else null;
+        var seed: ?BuiltModule = if (base) |bs|
+            (if (own_base) try adoptBuiltForRun(allocator, &bs.built) else try cloneBuiltForRun(allocator, &bs.built))
+        else
+            null;
         const module_ref = if (seed) |*s| s.module else try ObjRef(Module).init(allocator, Module.default(allocator));
         // The ObjRef holds the only handle during the build and nothing else borrows it, so a
         // raw pointer into the cell is a stable `*Module` for the lowering driver.
@@ -339,6 +344,7 @@ pub fn buildModuleWithOverrides(
     file_modules: ?*const std.AutoHashMap(ir.FileId, u32),
     base: ?*const StdlibBase,
     out_lifted: ?*[]Decl,
+    own_base: bool,
 ) Allocator.Error!BuiltModule {
     var ctx = try BuildCtx.init(
         allocator,
@@ -349,68 +355,114 @@ pub fn buildModuleWithOverrides(
         file_packages,
         file_modules,
         base,
+        own_base,
     );
     defer ctx.deinitScratch();
     phase.mark("build-ctx-init");
 
     try liftFileDecls(&ctx);
+    phase.mark("liftFileDecls");
     try repointMangledSupertypes(&ctx);
+    phase.mark("repointMangledSupertypes");
     try repointAliasedNestedSupertypes(&ctx);
+    phase.mark("repointAliasedNestedSupertypes");
     try applyExpectActualSubstitutions(&ctx, out_lifted);
+    phase.mark("applyExpectActualSubstitutions");
 
     // Register every declaration's identity and metadata. Nothing here lowers a body, so a
     // body lowered below sees complete tables however its declaration is ordered in source.
     try collectFileClasses(&ctx);
+    phase.mark("collectFileClasses");
     try registerConstInitializers(&ctx);
+    phase.mark("registerConstInitializers");
     try registerHierarchyMethodNames(&ctx);
+    phase.mark("registerHierarchyMethodNames");
     try registerHierarchyShadowNames(&ctx);
+    phase.mark("registerHierarchyShadowNames");
     try registerMemberNameUniverse(&ctx);
+    phase.mark("registerMemberNameUniverse");
     try registerPropertyTypeHeads(&ctx);
+    phase.mark("registerPropertyTypeHeads");
     try registerClassSuperNameChains(&ctx);
+    phase.mark("registerClassSuperNameChains");
     try registerShadowedStorageProps(&ctx);
+    phase.mark("registerShadowedStorageProps");
     try installLiftedNameTables(&ctx);
+    phase.mark("installLiftedNameTables");
     try installMemberAstTables(&ctx);
+    phase.mark("installMemberAstTables");
     try installInlineFnTables(&ctx);
+    phase.mark("installInlineFnTables");
     try installTopLevelPropNames(&ctx);
+    phase.mark("installTopLevelPropNames");
     try registerFileImports(&ctx);
+    phase.mark("registerFileImports");
     try reserveClassShells(&ctx);
+    phase.mark("reserveClassShells");
     try linkReservedClassSupertypes(&ctx);
+    phase.mark("linkReservedClassSupertypes");
     try reserveClassMemberHeaders(&ctx);
+    phase.mark("reserveClassMemberHeaders");
     try registerTypeAliasShapes(&ctx);
+    phase.mark("registerTypeAliasShapes");
     try registerClassTypeAliasShapes(&ctx);
+    phase.mark("registerClassTypeAliasShapes");
     // Member signatures need the same source-order independence as top-level headers: the
     // trailing receiver-lambda portion is recorded before any class body lowers.
     try collectMemberTrailingLambdaShapes(ctx.module, &ctx.file_classes);
+    phase.mark("collectMemberTrailingLambdaShapes");
     try fillReservedClassPrimaryParams(&ctx);
+    phase.mark("fillReservedClassPrimaryParams");
     try registerTopLevelFuncHeaders(&ctx);
     phase.mark("registerTopLevelFuncHeaders");
+    phase.mark("registerTopLevelFuncHeaders");
     try registerCallableExtensionProps(&ctx);
+    phase.mark("registerCallableExtensionProps");
     try registerReceiverFnPropHeads(&ctx);
+    phase.mark("registerReceiverFnPropHeads");
 
     // Lower every body and thunk against the now-complete header set.
     try lowerClassBodies(&ctx);
     phase.mark("lowerClassBodies");
+    phase.mark("lowerClassBodies");
     try lowerTopLevelFunctionBodies(&ctx);
+    phase.mark("lowerTopLevelFunctionBodies");
     phase.mark("lowerTopLevelFunctionBodies");
     try lowerClassMemberThunks(&ctx);
     phase.mark("lowerClassMemberThunks");
+    phase.mark("lowerClassMemberThunks");
     try buildRuntimeClassDefs(&ctx);
+    phase.mark("buildRuntimeClassDefs");
     try registerEnumEntries(&ctx);
+    phase.mark("registerEnumEntries");
     try linkRuntimeSupertypes(&ctx);
+    phase.mark("linkRuntimeSupertypes");
     try lowerParentCtorArgThunks(&ctx);
+    phase.mark("lowerParentCtorArgThunks");
     try lowerInitBlockThunks(&ctx);
+    phase.mark("lowerInitBlockThunks");
     try lowerClassDelegateThunks(&ctx);
+    phase.mark("lowerClassDelegateThunks");
     try lowerSecondaryCtors(&ctx);
+    phase.mark("lowerSecondaryCtors");
     try lowerTopLevelConstProps(&ctx);
+    phase.mark("lowerTopLevelConstProps");
     try lowerTopLevelProps(&ctx);
+    phase.mark("lowerTopLevelProps");
     try lowerExtensionProps(&ctx);
+    phase.mark("lowerExtensionProps");
 
     // Settle the cross-declaration links runtime dispatch reads.
     try settleDefaultArgThunks(&ctx);
+    phase.mark("settleDefaultArgThunks");
     try registerTypeAliasTags(&ctx);
+    phase.mark("registerTypeAliasTags");
     try rewriteAliasedParamTypes(&ctx);
+    phase.mark("rewriteAliasedParamTypes");
     try materialiseRegistry(&ctx);
+    phase.mark("materialiseRegistry");
     try finishModule(&ctx);
+    phase.mark("finishModule");
     phase.mark("finishModule");
     const r = ctx.finish();
     phase.mark("finish");

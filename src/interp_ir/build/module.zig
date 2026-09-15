@@ -54,19 +54,26 @@ pub fn buildModule(allocator: Allocator, file: *const KotlinFile) Allocator.Erro
         null,
         null,
         null,
+        false,
     );
 }
 
 /// Declarations from every file are concatenated into one synthesised file and
 /// lowered as a single program.
 pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!BuiltModule {
-    return buildModuleFilesInner(allocator, files, null, null);
+    return buildModuleFilesInner(allocator, files, null, null, false);
 }
 
 /// The base's lowered module and tables are cloned onto `allocator` and only the
 /// user declarations are lifted on top. Callers must have verified `canExtendBase`.
 pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, user_files: []const KotlinFile) Allocator.Error!BuiltModule {
-    return buildModuleFilesInner(allocator, user_files, base, null);
+    return buildModuleFilesInner(allocator, user_files, base, null, false);
+}
+
+/// `buildModuleFilesExtend` for a base this run owns outright: nothing else
+/// reads it afterwards, so it is extended in place instead of copied.
+pub fn buildModuleFilesExtendOwned(allocator: Allocator, base: *const StdlibBase, user_files: []const KotlinFile) Allocator.Error!BuiltModule {
+    return buildModuleFilesInner(allocator, user_files, base, null, true);
 }
 
 /// Files where a bare `@Composable` is the program's own annotation class: the package
@@ -151,7 +158,7 @@ pub const phase = struct {
     }
 };
 
-pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
+pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl, own_base: bool) Allocator.Error!BuiltModule {
     ir.build.localClassScopeReset();
     const ComposeMaps = struct {
         names: std.StringHashMap(void),
@@ -248,13 +255,23 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         defer comp_getter_props.deinit();
         var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
         defer inline_fns.deinit();
+        // Reading the base means decoding every lifted declaration in the image.
+        // It contributes composable names, sinks and getter props only if it
+        // declares composables; it also contributes its inline function names,
+        // which matter only while a composable transform is running at all. So
+        // a base without composables is worth reading only when this module
+        // brings composables of its own.
+        const module_has_composables =
+            names.count() != 0 or sinks.count() != 0 or comp_getter_props.count() != 0;
         if (base) |bsp| {
-            // An image-loaded base leaves `lifted_decls` empty, so collectors read the decoded section.
-            const base_decls = try composeBaseDecls(allocator, bsp);
-            try composeBaseNames(&names, base_decls);
-            try composeBaseSinks(&sinks, base_decls);
-            try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
-            try composeBaseInlineFns(&inline_fns, base_decls);
+            if (bsp.has_composables or module_has_composables) {
+                // An image-loaded base leaves `lifted_decls` empty, so collectors read the decoded section.
+                const base_decls = try composeBaseDecls(allocator, bsp);
+                try composeBaseNames(&names, base_decls);
+                try composeBaseSinks(&sinks, base_decls);
+                try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
+                try composeBaseInlineFns(&inline_fns, base_decls);
+            }
         }
         if (runtime.envOnce("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
@@ -583,6 +600,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         &file_modules,
         base,
         out_lifted,
+        own_base,
     );
     if (compose_pass.composeAuditOn()) {
         const ca = &compose_pass.compose_audit;

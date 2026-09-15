@@ -25,17 +25,42 @@ const StrFunc = build_types.StrFunc;
 
 /// Spines are copied and lowered leaf data is shared with the immutable base; the
 /// runtime-mutable graphs (ClassDef table, enum-entry instances, companion cells) deep clone.
+/// Extend a base this run owns, without copying it.
+///
+/// `cloneBuiltForRun` exists so a base can be extended more than once: the run
+/// mutates its copy and the base stays as it was. A base decoded from an image
+/// for one `klio run` has no second reader, is never freed, and dies with the
+/// process, so that copy is roughly fifty hash maps rebuilt entry by entry for
+/// nobody. The tables are shared by value here; only the class table, whose
+/// cells a run mutates, is copied.
+pub fn adoptBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!BuiltModule {
+    var out = base.*;
+    out.module = base.module.clone();
+    out.classes = try cloneClassTableForRun(a, &base.classes);
+    return out;
+}
+
 pub fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!BuiltModule {
+    const t0 = runtime.clockMonotonicNanos();
     const module_clone = blk: {
         const mg = base.module.borrow();
         defer mg.deinit();
         break :blk try mg.get().cloneForExtend(a);
     };
+    const t_mod = runtime.clockMonotonicNanos();
     const module_ref = try ObjRef(Module).init(a, module_clone);
     var out = emptyBuilt(a, module_ref, base.main);
 
     out.classes.deinit();
     out.classes = try cloneClassTableForRun(a, &base.classes);
+    const t_cls = runtime.clockMonotonicNanos();
+    defer if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+        std.debug.print("[run]   clone: module {d}ms, classes {d}ms, tables {d}ms\n", .{
+            (t_mod - t0) / 1_000_000,
+            (t_cls - t_mod) / 1_000_000,
+            (runtime.clockMonotonicNanos() - t_cls) / 1_000_000,
+        });
+    };
 
     try copyPairMap(&out.body_prop_inits, &base.body_prop_inits);
     try copyPairMap(&out.instance_prop_getters, &base.instance_prop_getters);

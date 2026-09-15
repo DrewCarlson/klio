@@ -781,7 +781,8 @@ fn finishFromLoaded(
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const te_user_check = runtime.clockMonotonicNanos();
     span.active_map = map;
-    const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user2.asts) catch return null;
+    // Loaded for this run alone: nothing reads the base after this.
+    const built = interp_ir.build.buildModuleFilesExtendOwned(gpa, loaded.base, user2.asts) catch return null;
     trace(gpa, "  extend: extern {d}ms, eager {d}ms, user-check {d}ms, build {d}ms", .{
         (te_extern - te0) / 1_000_000,
         (te_eager - te_extern) / 1_000_000,

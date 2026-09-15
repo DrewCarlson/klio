@@ -68,6 +68,10 @@ pub const StdlibBase = struct {
     /// `lifted_decl_offsets[i]`), decoded on first touch. Borrow the image buffer.
     lifted_decl_section: []const u8 = &.{},
     lifted_decl_offsets: []const u32 = &.{},
+    /// True when any lifted declaration carries `@Composable` or a composable
+    /// lambda shape. The compose oracle decodes the whole lifted section to
+    /// answer that, so a base that declares none says so instead.
+    has_composables: bool = false,
     /// The process-lifetime allocator the base lives in: a lazily decoded deferred body
     /// must outlive a per-program build, so it decodes here.
     arena: Allocator = undefined,
@@ -153,7 +157,7 @@ pub const MainPolicy = enum { require, allow };
 
 pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_policy: MainPolicy) Allocator.Error!?*StdlibBase {
     var lifted: []Decl = &.{};
-    var built = try buildModuleFilesInner(allocator, files, null, &lifted);
+    var built = try buildModuleFilesInner(allocator, files, null, &lifted, false);
     @import("module.zig").phase.mark("build-module-total");
     {
         const mg = built.module.borrow();
@@ -231,6 +235,24 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
         }
         base.enum_id_next = 1 + n;
     }
+
+    // Answered once here so a run extending this base need not decode the whole
+    // lifted section to discover there is nothing composable in it.
+    base.has_composables = blk: {
+        var probe = StringSet.init(allocator);
+        defer probe.deinit();
+        for (files) |*f| {
+            for (f.decls) |*d| {
+                try composeBaseNameDecl(&probe, d);
+                if (probe.count() != 0) break :blk true;
+            }
+        }
+        for (base.lifted_decls) |*d| {
+            try composeBaseNameDecl(&probe, d);
+            if (probe.count() != 0) break :blk true;
+        }
+        break :blk false;
+    };
 
     // A non-inline base function runs from its lowered IR, never its AST body, so stripping
     // those bodies drops dead trees while keeping dispatch metadata.

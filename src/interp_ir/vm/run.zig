@@ -390,7 +390,11 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     const module = mg.get();
     const sink = self.out_sink.output();
 
+    const t_prep = runtime.clockMonotonicNanos();
     if (try vmPrepareInner(self, module, sink)) |verr| return .{ .err = verr };
+    if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+        std.debug.print("[run]   vmPrepareInner {d}ms\n", .{(runtime.clockMonotonicNanos() - t_prep) / 1_000_000});
+    }
 
     const func = module.funcById(main) orelse return .{ .err = .InvalidMain };
     // A `suspend fun main` runs on the cooperative pump, so `delay` parks, not escapes.
@@ -521,6 +525,13 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
     // is mid-flight a forward read of a later annotated property observes its
     // declared type's default (JVM <clinit> semantics); the flag scopes that here.
     {
+        const t_tlp = runtime.clockMonotonicNanos();
+        defer if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+            std.debug.print("[run]   top-level prop inits {d}ms ({d} props)\n", .{
+                (runtime.clockMonotonicNanos() - t_tlp) / 1_000_000,
+                self.top_level_props.items.len,
+            });
+        };
         vmhost.host_impl.setStartupInitsActive(true);
         defer vmhost.host_impl.setStartupInitsActive(false);
         for (self.top_level_props.items) |nf| {
