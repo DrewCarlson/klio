@@ -62,7 +62,9 @@ fn collectPinnedFunc(rel: *BodyRelease, f: *const ir.Func) void {
 }
 
 /// Replace the bodies of non-inline, object-free functions across `decls` with
-/// an empty block, recursing into members. Such a top-level function also drops
+/// an empty block, recursing into members. `decls` is the lifted list: a
+/// nested class or object is visited through its top-level copy, which shares
+/// its member structs, not through the outer's members. Such a top-level function also drops
 /// its signature: resolution binds through the baked symbol index and calls
 /// dispatch by `FuncId`, so only class members are read back through
 /// `MethodDef.decl`. `keep_composable_sigs` spares the signature of a
@@ -191,10 +193,16 @@ fn declName(d: *const Decl) []const u8 {
 fn pruneDecl(d: *Decl, top_level: bool, keep_composable_sigs: bool, rel: *BodyRelease) void {
     switch (d.*) {
         .Function => |*f| pruneFunction(f, top_level, keep_composable_sigs, rel),
+        // A nested class or object stays in its outer's members after the lift
+        // copied it to the top level, and the copy shares the member structs,
+        // so the top-level visit strips them; a second visit here would race a
+        // strip thread that holds the copy.
         .Class => |*c| {
+            if (!top_level) return;
             for (c.members) |*m| pruneDecl(m, false, keep_composable_sigs, rel);
         },
         .Object => |*o| {
+            if (!top_level) return;
             for (o.members) |*m| pruneDecl(m, false, keep_composable_sigs, rel);
         },
         .Property, .TypeAlias => {},
@@ -223,9 +231,11 @@ const BodyRelease = struct {
     deferred: ?*Detached = null,
     /// A subtree reached twice would be shared between bodies, which no pass
     /// produces; debug builds refuse rather than free it twice.
+    current_span: struct { file: u32 = 0, start: u32 = 0 } = .{},
     seen: Seen = if (builtin.mode == .Debug) .empty else {},
 
-    const Seen = if (builtin.mode == .Debug) std.AutoHashMapUnmanaged(usize, void) else void;
+    const Owner = struct { name: []const u8, file: u32, start: u32 };
+    const Seen = if (builtin.mode == .Debug) std.AutoHashMapUnmanaged(usize, Owner) else void;
 
     fn deinit(self: *BodyRelease) void {
         if (builtin.mode == .Debug) self.seen.deinit(std.heap.page_allocator);
@@ -264,27 +274,35 @@ const BodyRelease = struct {
         self.release(FunctionBody, body);
     }
 
-    fn note(self: *BodyRelease, ptr: usize, bytes: usize, comptime what: []const u8) void {
+    /// True when a debug build has already seen `ptr` under another stripped
+    /// body; the caller reports the node and refuses to free it twice.
+    fn note(self: *BodyRelease, ptr: usize, bytes: usize, comptime what: []const u8) bool {
         if (self.collect) |c| {
             c.out.put(c.a, ptr, {}) catch {};
-            return;
+            return false;
         }
         if (self.verify) {
             if (builtin.mode == .Debug and self.seen.contains(ptr)) {
                 std.debug.panic("prune: kept declaration `{s}` points into a freed body ({s})", .{ self.current_decl, what });
             }
-            return;
+            return false;
         }
         self.stats.nodes += 1;
         self.stats.bytes += bytes;
         if (self.dry) {
             if (self.pinned.?.contains(ptr)) self.hit = true;
-            return;
+            return false;
         }
         if (builtin.mode == .Debug) {
-            const gop = self.seen.getOrPut(std.heap.page_allocator, ptr) catch return;
-            if (gop.found_existing) @panic("prune: a stripped body shares a subtree with another");
+            const gop = self.seen.getOrPut(std.heap.page_allocator, ptr) catch return false;
+            if (gop.found_existing) {
+                const o = gop.value_ptr.*;
+                std.debug.print("prune: stripped body `{s}` (file {d} offset {d}) shares a {s} with `{s}` (file {d} offset {d})\n", .{ self.current_decl, self.current_span.file, self.current_span.start, what, o.name, o.file, o.start });
+                return true;
+            }
+            gop.value_ptr.* = .{ .name = self.current_decl, .file = self.current_span.file, .start = self.current_span.start };
         }
+        return false;
     }
 
     fn freeing(self: *const BodyRelease) ?Allocator {
@@ -309,7 +327,7 @@ const BodyRelease = struct {
                         if (!self.descendsDecls()) return;
                     }
                     self.release(p.child, v.*);
-                    self.note(@intFromPtr(v.*), @sizeOf(p.child), @typeName(p.child));
+                    if (self.note(@intFromPtr(v.*), @sizeOf(p.child), @typeName(p.child))) @panic("prune: a stripped body shares a subtree with another");
                     if (self.freeing()) |a| a.destroy(v.*);
                 },
                 .slice => {
@@ -319,7 +337,12 @@ const BodyRelease = struct {
                     }
                     for (v.*) |*e| self.release(p.child, e);
                     if (v.len == 0) return;
-                    self.note(@intFromPtr(v.ptr), v.len * @sizeOf(p.child), "[]" ++ @typeName(p.child));
+                    if (self.note(@intFromPtr(v.ptr), v.len * @sizeOf(p.child), "[]" ++ @typeName(p.child))) {
+                        if (comptime p.child == ast.Ident) {
+                            for (v.*) |id| std.debug.print("  ident `{s}` file {d} offset {d}\n", .{ id.name, id.span.file.int(), id.span.start });
+                        }
+                        @panic("prune: a stripped body shares a subtree with another");
+                    }
                     if (self.freeing()) |a| a.free(v.*);
                 },
                 else => {},
@@ -366,6 +389,8 @@ fn pruneFunction(f: *Function, top_level: bool, keep_composable_sigs: bool, rel:
         const sp = fnBodySpan(&old);
         // Keep `body != null` so dispatch still treats the method as concrete.
         f.body = .{ .Block = .{ .stmts = &.{}, .span = sp } };
+        rel.current_decl = f.name.name;
+        rel.current_span = .{ .file = f.span.file.int(), .start = f.span.start };
         rel.releaseBody(&old);
         if (top_level and !keep_sig) {
             f.receiver_type = null;
@@ -628,6 +653,30 @@ test "stripping frees exactly the trees the body owned" {
     try testing.expectEqual(@as(usize, 1), released.bodies);
     try testing.expectEqual(@as(usize, 8), released.nodes);
     try testing.expectEqual(@as(usize, 0), decls[0].Function.body.?.Block.stmts.len);
+}
+
+test "a nested class is stripped once, through its lifted copy" {
+    const a = testing.allocator;
+    const stmts = try a.alloc(Stmt, 1);
+    stmts[0] = tIntStmt();
+    const members = try a.alloc(Decl, 1);
+    defer a.free(members);
+    members[0] = .{ .Function = tFn(.{ .Block = .{ .stmts = stmts, .span = tSpan(0, 9) } }, false) };
+    var inner = tClass();
+    inner.members = members;
+    const outer_members = try a.alloc(Decl, 1);
+    defer a.free(outer_members);
+    outer_members[0] = .{ .Class = inner };
+    var outer = tClass();
+    outer.name = tIdent("Outer");
+    outer.members = outer_members;
+    // The lift leaves `inner` in `outer` and appends a copy sharing its members.
+    var decls = [_]Decl{ .{ .Class = outer }, .{ .Class = inner } };
+    const released = stripDeadBodies(&decls, false, a, null);
+    try testing.expectEqual(@as(usize, 1), released.bodies);
+    try testing.expectEqual(@as(usize, 1), released.nodes);
+    try testing.expectEqual(@as(usize, 0), decls[0].Class.members[0].Class.members[0].Function.body.?.Block.stmts.len);
+    try testing.expectEqual(@as(usize, 0), decls[1].Class.members[0].Function.body.?.Block.stmts.len);
 }
 
 test "a body an instruction points into is blanked but kept allocated" {

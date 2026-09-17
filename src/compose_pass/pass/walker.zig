@@ -651,8 +651,10 @@ pub const Walker = struct {
                 c.callee.Path.segments.len == 1 and
                 std.mem.eql(u8, c.callee.Path.segments[0].name, "key"),
             .Block => |blk| {
-                // Rewritten form: { startMovableGroup(…); …; endMovableGroup(); … }.
-                if (blk.stmts.len != 0 and isComposerCallStmt(&blk.stmts[0], "startMovableGroup")) return true;
+                // Rewritten form: { val $key$k…; startMovableGroup(…); …; endMovableGroup(); … }.
+                var first: usize = 0;
+                while (first < blk.stmts.len and blk.stmts[first] == .Decl) first += 1;
+                if (first < blk.stmts.len and isComposerCallStmt(&blk.stmts[first], "startMovableGroup")) return true;
                 if (blk.stmts.len != 1) return false;
                 if (blk.stmts[0] != .Expr) return false;
                 return bodyIsSoleKeyCall(&blk.stmts[0].Expr);
@@ -902,31 +904,53 @@ pub const Walker = struct {
     }
 
     /// Rewrite a threaded `key(k…, block, …)` call into
-    ///     { $composer.startMovableGroup(<site key>, <joined keys>)
-    ///       val $key$v = key(…)
+    ///     { val $key$k0 = k0; …
+    ///       $composer.startMovableGroup(<site key>, <joined keys>)
+    ///       val $key$v = key($key$k0…, block, …)
     ///       $composer.endMovableGroup()
     ///       $key$v }
-    /// `dyn_n` counts the dynamic key arguments; multiple keys join through `joinKey`.
+    /// `dyn_n` counts the dynamic key arguments; multiple keys join through
+    /// `joinKey`. Each key is bound once: the group and the retained call both
+    /// name the temporary, so a key expression is evaluated once and its tree
+    /// has one owner.
     fn wrapKeyCall(w: *Walker, e: *Expr, dyn_n: usize) void {
         const call_expr = e.*;
         const sp = exprSpanOf(&call_expr);
-        var joined = call_expr.Call.args[0];
-        for (call_expr.Call.args[1..dyn_n]) |k| {
-            const jargs = w.a.alloc(Expr, 2) catch @panic("oom");
-            jargs[0] = joined;
-            jargs[1] = k;
-            joined = w.b.callMember(w.composerRef(), "joinKey", jargs);
+        const stmts = w.a.alloc(ast.Stmt, dyn_n + 4) catch @panic("oom");
+        const args = call_expr.Call.args;
+        var joined: Expr = undefined;
+        for (0..dyn_n) |i| {
+            const name = std.fmt.allocPrint(w.a, "$key$k{d}", .{i}) catch @panic("oom");
+            stmts[i] = .{ .Decl = ast.box(w.a, ast.Decl{ .Property = w.valProperty(name, args[i]) }) catch @panic("oom") };
+            args[i] = w.b.pathExpr(name);
+            if (i == 0) {
+                joined = w.b.pathExpr(name);
+            } else {
+                const jargs = w.a.alloc(Expr, 2) catch @panic("oom");
+                jargs[0] = joined;
+                jargs[1] = w.b.pathExpr(name);
+                joined = w.b.callMember(w.composerRef(), "joinKey", jargs);
+            }
         }
         const start_args = w.a.alloc(Expr, 2) catch @panic("oom");
         start_args[0] = w.b.intLit(positionalKey(sp));
         start_args[1] = joined;
-        const result_prop = w.a.create(ast.Property) catch @panic("oom");
-        result_prop.* = .{
+        stmts[dyn_n] = .{ .Expr = w.b.callMember(w.composerRef(), "startMovableGroup", start_args) };
+        stmts[dyn_n + 1] = .{ .Decl = ast.box(w.a, ast.Decl{ .Property = w.valProperty("$key$v", call_expr) }) catch @panic("oom") };
+        stmts[dyn_n + 2] = .{ .Expr = w.b.callMember(w.composerRef(), "endMovableGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        stmts[dyn_n + 3] = .{ .Expr = w.b.pathExpr("$key$v") };
+        e.* = .{ .Block = .{ .stmts = stmts, .span = sp } };
+    }
+
+    /// A generated `val <name> = <init>` declaration.
+    fn valProperty(w: *Walker, name: []const u8, init: Expr) *ast.Property {
+        const prop = w.a.create(ast.Property) catch @panic("oom");
+        prop.* = .{
             .mutable = false,
-            .name = w.b.ident("$key$v"),
+            .name = w.b.ident(name),
             .receiver_type = null,
             .ty = null,
-            .init = w.b.box(call_expr),
+            .init = w.b.box(init),
             .delegate = null,
             .getter = null,
             .setter = null,
@@ -943,12 +967,7 @@ pub const Walker = struct {
             .annotations = &.{},
             .span = w.b.gen_span,
         };
-        const stmts = w.a.alloc(ast.Stmt, 4) catch @panic("oom");
-        stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startMovableGroup", start_args) };
-        stmts[1] = .{ .Decl = ast.box(w.a, ast.Decl{ .Property = result_prop }) catch @panic("oom") };
-        stmts[2] = .{ .Expr = w.b.callMember(w.composerRef(), "endMovableGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
-        stmts[3] = .{ .Expr = w.b.pathExpr("$key$v") };
-        e.* = .{ .Block = .{ .stmts = stmts, .span = sp } };
+        return prop;
     }
 
     /// Bracket a Block branch with `startReplaceGroup(<span key>)`/`endReplaceGroup()`.

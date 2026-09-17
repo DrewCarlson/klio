@@ -698,7 +698,6 @@ test "threadCall leaves a non-content overload's trailing lambda positional" {
     try testing.expect(!c.has_trailing_lambda);
 }
 
-
 test "a sink lambda is shaped with the bare pair; slots come from resolution" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -998,19 +997,24 @@ test "key(k) { } gains a movable-group bracket with the dynamic key" {
     try sinks.put("key", {});
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
-    // The key call became { startMovableGroup(site, k); val $key$v = key(...);
-    // endMovableGroup(); $key$v }.
+    // The key call became { val $key$k0 = k; startMovableGroup(site, $key$k0);
+    // val $key$v = key($key$k0, ...); endMovableGroup(); $key$v }: the key is
+    // evaluated once and both readers name the temporary.
     const blk = wrappedBodyStmts(&out)[0].Expr.Block;
-    try testing.expectEqual(@as(usize, 4), blk.stmts.len);
-    const start = blk.stmts[0].Expr.Call;
+    try testing.expectEqual(@as(usize, 5), blk.stmts.len);
+    const k0 = blk.stmts[0].Decl.Property;
+    try testing.expectEqualStrings("$key$k0", k0.name.name);
+    try testing.expectEqualStrings("k", k0.init.?.Path.segments[0].name);
+    const start = blk.stmts[1].Expr.Call;
     try testing.expectEqualStrings("startMovableGroup", start.callee.Member.name.name);
     try testing.expectEqual(@as(usize, 2), start.args.len);
-    try testing.expectEqualStrings("k", start.args[1].Path.segments[0].name);
-    const kcall = blk.stmts[1].Decl.Property.init.?.Call;
+    try testing.expectEqualStrings("$key$k0", start.args[1].Path.segments[0].name);
+    const kcall = blk.stmts[2].Decl.Property.init.?.Call;
     try testing.expectEqualStrings("key", kcall.callee.Path.segments[0].name);
     try testing.expectEqual(@as(usize, 2), kcall.args.len);
-    try testing.expectEqualStrings("endMovableGroup", blk.stmts[2].Expr.Call.callee.Member.name.name);
-    try testing.expectEqualStrings("$key$v", blk.stmts[3].Expr.Path.segments[0].name);
+    try testing.expectEqualStrings("$key$k0", kcall.args[0].Path.segments[0].name);
+    try testing.expectEqualStrings("endMovableGroup", blk.stmts[3].Expr.Call.callee.Member.name.name);
+    try testing.expectEqualStrings("$key$v", blk.stmts[4].Expr.Path.segments[0].name);
 }
 
 test "a non-local return through a sink lambda closes groups via endToMarker" {
