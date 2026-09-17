@@ -96,8 +96,106 @@ const SmartStateAt = struct {
     state: *const smartcast.SmartCastLattice,
 };
 
-/// One solve serves every fact extraction at that point. All working memory
-/// lives on `scratch`.
+/// One function's dataflow solutions, kept across every query inside it.
+///
+/// The smart-cast solve reads the declared-type map only at an `AssumeRefEq`,
+/// so a CFG without one is solved once; with one, the solution follows the map
+/// the checker's frames currently spell. The VIA solve reads the CFG alone.
+pub const SolveMemo = struct {
+    arena: std.heap.ArenaAllocator,
+    fn_span: ?Span = null,
+    ref_eq: bool = false,
+    /// The declared map the smart-cast solution used, owned by the arena.
+    declared: []const smartcast.PlaceTypeMap.Entry = &.{},
+    smart: ?smartcast.SmartCastBlockStates = null,
+    /// Per block, the states after each node, computed on first query.
+    smart_within: []?smartcast.SmartCastBlockStates = &.{},
+    via: ?via.ViaBlockStates = null,
+    via_within: []?[]via.ViaLattice = &.{},
+
+    fn reset(self: *SolveMemo, fn_span: Span, cfg: *const cfa.Cfg) void {
+        _ = self.arena.reset(.retain_capacity);
+        self.fn_span = fn_span;
+        self.ref_eq = cfgHasRefEq(cfg);
+        self.declared = &.{};
+        self.smart = null;
+        self.smart_within = &.{};
+        self.via = null;
+        self.via_within = &.{};
+    }
+};
+
+fn cfgHasRefEq(cfg: *const cfa.Cfg) bool {
+    for (cfg.blocks.items) |*blk| {
+        for (blk.nodes.items) |*n| {
+            if (n.* == .AssumeRefEq) return true;
+        }
+    }
+    return false;
+}
+
+fn memoFor(self: *const Checker, fn_span: Span, cfg: *const cfa.Cfg) *SolveMemo {
+    const m = self.solve_memo;
+    if (m.fn_span) |cur| {
+        if (std.meta.eql(cur, fn_span)) return m;
+    }
+    m.reset(fn_span, cfg);
+    return m;
+}
+
+/// Whether the frames now spell a different declared map than the memo solved with.
+fn declaredMoved(self: *const Checker, m: *const SolveMemo, scratch: Allocator) Allocator.Error!bool {
+    var now = try cfgDeclaredTypes(self, scratch);
+    defer now.deinit(scratch);
+    if (now.entries.items.len != m.declared.len) return true;
+    for (now.entries.items, m.declared) |n, o| {
+        if (!n.key.eql(o.key) or !n.value.eql(o.value)) return true;
+    }
+    return false;
+}
+
+fn memoSmartStates(
+    self: *const Checker,
+    m: *SolveMemo,
+    lowered: *const cfa.lower.Lowered,
+    scratch: Allocator,
+) Allocator.Error!*smartcast.SmartCastBlockStates {
+    if (m.smart != null) {
+        if (!m.ref_eq or !(try declaredMoved(self, m, scratch))) return &m.smart.?;
+        m.reset(m.fn_span.?, &lowered.cfg);
+    }
+    const a = m.arena.allocator();
+    var declared: ?smartcast.PlaceTypeMap = null;
+    if (m.ref_eq) {
+        var d = try cfgDeclaredTypes(self, a);
+        // The frames these borrow from pop before the next comparison.
+        for (d.entries.items) |*e| e.value = try e.value.clone(a);
+        m.declared = d.entries.items;
+        declared = d.map();
+    }
+    m.smart = try smartcast.solveWithDeclared(a, &lowered.cfg, &lowered.reg_to_place, declared);
+    m.smart_within = try a.alloc(?smartcast.SmartCastBlockStates, lowered.cfg.blocks.items.len);
+    @memset(m.smart_within, null);
+    return &m.smart.?;
+}
+
+fn memoSmartWithin(
+    m: *SolveMemo,
+    lowered: *const cfa.lower.Lowered,
+    bid: cfa.BlockId,
+    states: *const smartcast.SmartCastBlockStates,
+) Allocator.Error!*const smartcast.SmartCastBlockStates {
+    const slot = &m.smart_within[bid.int()];
+    if (slot.* == null) {
+        const a = m.arena.allocator();
+        const entry = try states.items[bid.int()].clone(a);
+        const declared: ?smartcast.PlaceTypeMap = if (m.ref_eq) .{ .entries = m.declared } else null;
+        slot.* = try smartcast.statesWithinBlockWithDeclared(a, &lowered.cfg, bid, entry, &lowered.reg_to_place, declared);
+    }
+    return &slot.*.?;
+}
+
+/// The state at `query_span`, from the memoised solve of the enclosing function.
 fn solvedSmartStateAt(self: *const Checker, scratch: Allocator, query_span: Span) Allocator.Error!?SmartStateAt {
     const fn_span = lastSpan(self.cfg_fn_stack.items) orelse return null;
     const lowered = self.lowerings.get(fn_span) orelse return null;
@@ -105,18 +203,12 @@ fn solvedSmartStateAt(self: *const Checker, scratch: Allocator, query_span: Span
     const bid = pos_entry.block;
     const pos = pos_entry.node_idx;
 
-    const declared = try cfgDeclaredTypes(self, scratch);
-    const entry = (try solveBlockEntry(scratch, lowered, bid, declared.map())) orelse return null;
-    const states = try smartcast.statesWithinBlockWithDeclared(
-        scratch,
-        &lowered.cfg,
-        bid,
-        entry,
-        &lowered.reg_to_place,
-        declared.map(),
-    );
-    if (pos >= states.items.len) return null;
-    return .{ .lowered = lowered, .state = &states.items[pos] };
+    const m = memoFor(self, fn_span, &lowered.cfg);
+    const states = try memoSmartStates(self, m, lowered, scratch);
+    if (bid.int() >= states.items.len) return null;
+    const within = try memoSmartWithin(m, lowered, bid, states);
+    if (pos >= within.items.len) return null;
+    return .{ .lowered = lowered, .state = &within.items[pos] };
 }
 
 /// Follows the alias chain; cloned onto `self.allocator`.
@@ -359,20 +451,27 @@ pub fn cfgViaUnassignedAt(self: *const Checker, name: []const u8, query_span: Sp
     const bid = pos_entry.block;
     const pos = pos_entry.node_idx;
 
-    const scratch = queryScratch(self);
-
-    const solved = try via.solveVia(scratch, &lowered.cfg);
+    const m = memoFor(self, fn_span, &lowered.cfg);
+    const a = m.arena.allocator();
+    if (m.via == null) {
+        m.via = try via.solveVia(a, &lowered.cfg);
+        m.via_within = try a.alloc(?[]via.ViaLattice, lowered.cfg.blocks.items.len);
+        @memset(m.via_within, null);
+    }
+    const solved = &m.via.?;
     if (bid.int() >= solved.items.len) return null;
-    const entry = try solved.items[bid.int()].clone(scratch);
-
-    const states = try via.statesWithinBlock(scratch, &lowered.cfg, bid, entry);
+    const slot = &m.via_within[bid.int()];
+    if (slot.* == null) {
+        const entry = try solved.items[bid.int()].clone(a);
+        slot.* = try via.statesWithinBlock(a, &lowered.cfg, bid, entry);
+    }
+    const states = slot.*.?;
     if (pos >= states.len) return null;
-    const state = &states[pos];
     const place = Place{ .Local = .{ .name = name } };
     // No VIA fact means a parameter, assigned at entry and never
     // `DeclLocal`-ed, or a name tracked outside the CFG. Answer null there so
     // callers fall back to other signals.
-    return viaVerdict(state, place);
+    return viaVerdict(&states[pos], place);
 }
 
 /// The checker's `Nothing`-typed spans are threaded through, so a
@@ -645,19 +744,6 @@ fn lastSpan(items: []const Span) ?Span {
     return items[items.len - 1];
 }
 
-/// Null when `bid` is out of range. The caller owns the returned lattice.
-fn solveBlockEntry(
-    allocator: Allocator,
-    lowered: *const cfa.lower.Lowered,
-    bid: cfa.BlockId,
-    declared: smartcast.PlaceTypeMap,
-) Allocator.Error!?smartcast.SmartCastLattice {
-    var solved = try smartcast.solveWithDeclared(allocator, &lowered.cfg, &lowered.reg_to_place, declared);
-    defer deinitSmartStates(allocator, &solved);
-    if (bid.int() >= solved.items.len) return null;
-    return try solved.items[bid.int()].clone(allocator);
-}
-
 fn smartFact(state: *const smartcast.SmartCastLattice, place: Place) ?*const smartcast.SmartCastFact {
     for (state.entries.items) |*e| {
         if (e.key.eql(place)) return &e.value;
@@ -675,11 +761,6 @@ fn viaVerdict(state: anytype, place: Place) ?bool {
         };
     }
     return null;
-}
-
-fn deinitSmartStates(allocator: Allocator, states: *smartcast.SmartCastBlockStates) void {
-    for (states.items) |*s| s.deinit(allocator);
-    states.deinit(allocator);
 }
 
 fn deinitSubst(allocator: Allocator, subst: *std.StringHashMap(Type)) void {

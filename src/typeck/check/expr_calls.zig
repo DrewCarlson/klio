@@ -1421,6 +1421,7 @@ pub fn inferCallReturnWithArgs(
             .depth = 0,
             .all_vars = .empty,
         };
+        self.types_journal.clearRetainingCapacity();
     }
     // The value name slices belong to the constraint system's arena, which
     // outlives this map, so teardown frees the spine only.
@@ -1591,16 +1592,16 @@ fn refreshRecordedTypes(self: *Checker, session: *root.InferenceSession) Allocat
         try subst.put(sv.unique, try pick.clone(self.allocator));
     }
     if (subst.count() == 0) return;
-    var it = self.types.iterator();
-    while (it.next()) |e| {
-        if (!typeMentionsTypeParam(e.value_ptr)) continue;
-        var replaced = helpers.substituteTypeParams(self.allocator, e.value_ptr, &subst) catch continue;
-        if (replaced.eql(e.value_ptr.*)) {
+    for (self.types_journal.items) |sp| {
+        const recorded = self.types.getPtr(sp) orelse continue;
+        if (!typeMentionsTypeParam(recorded)) continue;
+        var replaced = helpers.substituteTypeParams(self.allocator, recorded, &subst) catch continue;
+        if (replaced.eql(recorded.*)) {
             replaced.deinit(self.allocator);
             continue;
         }
-        e.value_ptr.deinit(self.allocator);
-        e.value_ptr.* = replaced;
+        recorded.deinit(self.allocator);
+        recorded.* = replaced;
     }
 }
 

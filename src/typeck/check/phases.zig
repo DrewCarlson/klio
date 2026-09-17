@@ -9,6 +9,7 @@ const diagnostics = @import("diagnostics");
 const resolver = @import("resolver");
 
 const root = @import("../check.zig");
+const narrowing = @import("narrowing.zig");
 const helpers = root.helpers;
 
 const Allocator = std.mem.Allocator;
@@ -52,6 +53,8 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
     try frames.append(allocator, Frame.init(allocator));
     const query_scratch = try allocator.create(std.heap.ArenaAllocator);
     query_scratch.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const solve_memo = try allocator.create(narrowing.SolveMemo);
+    solve_memo.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     return .{
         .allocator = allocator,
         .resolution = resolution,
@@ -104,6 +107,8 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .ebf_outside = std.AutoHashMap(root.Span, root.EbfOutside).init(allocator),
         .field_narrow_off = 0,
         .query_scratch = query_scratch,
+        .solve_memo = solve_memo,
+        .types_journal = .empty,
     };
 }
 

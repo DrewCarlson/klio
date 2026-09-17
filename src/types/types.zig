@@ -454,33 +454,31 @@ pub const TypeResult = union(enum) {
     }
 };
 
+const builtin_by_name = std.StaticStringMap(Type).initComptime(.{
+    .{ "Unit", Type.Unit },
+    .{ "Boolean", Type.Boolean },
+    .{ "Byte", Type.Byte },
+    .{ "Short", Type.Short },
+    .{ "Int", Type.Int },
+    .{ "Long", Type.Long },
+    .{ "UByte", Type.UByte },
+    .{ "UShort", Type.UShort },
+    .{ "UInt", Type.UInt },
+    .{ "ULong", Type.ULong },
+    .{ "Float", Type.Float },
+    .{ "Double", Type.Double },
+    .{ "Char", Type.Char },
+    .{ "String", Type.String },
+    .{ "Any", Type.Any },
+    .{ "Nothing", Type.Nothing },
+});
+
 pub fn builtinByName(name: []const u8) ?Type {
     const short = if (std.mem.startsWith(u8, name, "kotlin."))
         name["kotlin.".len..]
     else
         name;
-    const map = .{
-        .{ "Unit", Type.Unit },
-        .{ "Boolean", Type.Boolean },
-        .{ "Byte", Type.Byte },
-        .{ "Short", Type.Short },
-        .{ "Int", Type.Int },
-        .{ "Long", Type.Long },
-        .{ "UByte", Type.UByte },
-        .{ "UShort", Type.UShort },
-        .{ "UInt", Type.UInt },
-        .{ "ULong", Type.ULong },
-        .{ "Float", Type.Float },
-        .{ "Double", Type.Double },
-        .{ "Char", Type.Char },
-        .{ "String", Type.String },
-        .{ "Any", Type.Any },
-        .{ "Nothing", Type.Nothing },
-    };
-    inline for (map) |entry| {
-        if (std.mem.eql(u8, short, entry[0])) return entry[1];
-    }
-    return null;
+    return builtin_by_name.get(short);
 }
 
 pub fn convertTypeRef(allocator: Allocator, t: *const TypeRef) Allocator.Error!TypeResult {

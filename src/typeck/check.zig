@@ -116,6 +116,7 @@ pub fn typecheck(
     cfa.analyses.contracts.setUserInlineContracts(user_contracts);
     var tc = try Checker.new(allocator, resolution);
     defer destroyQueryScratch(allocator, tc.query_scratch);
+    defer destroySolveMemo(allocator, tc.solve_memo);
     try tc.run(file);
     try annotations.applySuppressAnnotations(allocator, file, &tc.diagnostics);
     cfa.analyses.contracts.setUserInlineContracts(
@@ -218,6 +219,7 @@ pub fn typecheckModule(
     cfa.analyses.contracts.setUserInlineContracts(user_contracts);
     var tc = try Checker.new(allocator, resolution);
     defer destroyQueryScratch(allocator, tc.query_scratch);
+    defer destroySolveMemo(allocator, tc.solve_memo);
     if (types.pending_extern_decls) |ed| {
         var cit = ed.classes.keyIterator();
         while (cit.next()) |k| {
@@ -313,6 +315,11 @@ pub fn typecheckModule(
 fn destroyQueryScratch(allocator: Allocator, scratch: *std.heap.ArenaAllocator) void {
     scratch.deinit();
     allocator.destroy(scratch);
+}
+
+fn destroySolveMemo(allocator: Allocator, memo: *narrowing.SolveMemo) void {
+    memo.arena.deinit();
+    allocator.destroy(memo);
 }
 
 fn mergeModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!KotlinFile {
@@ -857,6 +864,11 @@ pub const Checker = struct {
     /// Backed by the page allocator so pages are genuinely returned between
     /// queries even when the driver hands the checker a phase arena.
     query_scratch: *std.heap.ArenaAllocator,
+    /// The enclosing function's dataflow solutions; see `narrowing.SolveMemo`.
+    solve_memo: *narrowing.SolveMemo,
+    /// Spans recorded in `types` since the root inference session began; only
+    /// these can carry its variables.
+    types_journal: std.ArrayList(Span),
 
     pub const new = phases.new;
     pub const run = phases.run;

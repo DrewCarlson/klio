@@ -126,46 +126,105 @@ pub fn memberExtOutOfScope(self: *const Module, id: FuncId, ctx_owner: ?[]const 
 pub fn evidenceSubtypeCb(ctx: *anyopaque, sub: []const u8, super: []const u8) bool {
     const self: *const Module = @ptrCast(@alignCast(ctx));
     if (std.mem.eql(u8, sub, super)) return true;
-    var cur_buf: [32][]const u8 = undefined;
-    var stack_len: usize = 0;
-    cur_buf[stack_len] = sub;
-    stack_len += 1;
-    var seen_buf: [128][]const u8 = undefined;
-    var seen_len: usize = 0;
-    while (stack_len != 0) {
-        stack_len -= 1;
-        const cur = cur_buf[stack_len];
-        var already = false;
-        for (seen_buf[0..seen_len]) |s2| {
-            if (std.mem.eql(u8, s2, cur)) {
-                already = true;
-                break;
-            }
-        }
-        if (already) continue;
-        if (seen_len < seen_buf.len) {
-            seen_buf[seen_len] = cur;
-            seen_len += 1;
-        }
-        const chain = self.registry.class_super_names.get(cur) orelse
-            (if (self.registry.mangled_nested.get(cur)) |m| self.registry.class_super_names.get(m) else null) orelse
-            continue;
-        for (chain) |sup_raw| {
-            var sn = sup_raw;
-            if (std.mem.findScalarLast(u8, sn, '.')) |i| sn = sn[i + 1 ..];
-            if (std.mem.findScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
-            if (std.mem.findScalarLast(u8, sn, '$')) |i| {
-                if (i + 1 < sn.len) sn = sn[i + 1 ..];
-            }
-            if (std.mem.eql(u8, sn, super)) return true;
-            if (stack_len < cur_buf.len) {
-                cur_buf[stack_len] = sn;
-                stack_len += 1;
-            }
-        }
+    const reg: *ModuleRegistry = @constCast(&self.registry);
+    if (reg.evidence_supers_gen != reg.class_super_gen) {
+        reg.dropEvidenceSupers();
+        reg.evidence_supers_gen = reg.class_super_gen;
+    }
+    if (reg.evidence_supers.get(sub)) |set| return set.contains(super);
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    collectEvidenceSupers(self, sub, &set, reg.allocator) catch {
+        set.deinit(reg.allocator);
+        return walkEvidenceSupers(self, sub, super);
+    };
+    const key = reg.allocator.dupe(u8, sub) catch {
+        set.deinit(reg.allocator);
+        return walkEvidenceSupers(self, sub, super);
+    };
+    reg.evidence_supers.put(reg.allocator, key, set) catch {
+        reg.allocator.free(key);
+        set.deinit(reg.allocator);
+        return walkEvidenceSupers(self, sub, super);
+    };
+    return set.contains(super);
+}
+
+/// The names the walk from `sub` compares against, in walk order.
+fn collectEvidenceSupers(
+    self: *const Module,
+    sub: []const u8,
+    out: *std.StringHashMapUnmanaged(void),
+    allocator: std.mem.Allocator,
+) std.mem.Allocator.Error!void {
+    var it = EvidenceWalk.init(self, sub);
+    while (it.next()) |sn| try out.put(allocator, sn, {});
+}
+
+fn walkEvidenceSupers(self: *const Module, sub: []const u8, super: []const u8) bool {
+    var it = EvidenceWalk.init(self, sub);
+    while (it.next()) |sn| {
+        if (std.mem.eql(u8, sn, super)) return true;
     }
     return false;
 }
+
+/// Depth-first over the registered supertype-name chains, bounded so a
+/// malformed hierarchy terminates; each yielded name is one the chains spell.
+const EvidenceWalk = struct {
+    module: *const Module,
+    cur_buf: [32][]const u8 = undefined,
+    stack_len: usize = 0,
+    seen_buf: [128][]const u8 = undefined,
+    seen_len: usize = 0,
+    chain: []const []const u8 = &.{},
+    chain_i: usize = 0,
+
+    fn init(module: *const Module, sub: []const u8) EvidenceWalk {
+        var w = EvidenceWalk{ .module = module };
+        w.cur_buf[0] = sub;
+        w.stack_len = 1;
+        return w;
+    }
+
+    fn next(self: *EvidenceWalk) ?[]const u8 {
+        while (true) {
+            if (self.chain_i < self.chain.len) {
+                var sn = self.chain[self.chain_i];
+                self.chain_i += 1;
+                if (std.mem.findScalarLast(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+                if (std.mem.findScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
+                if (std.mem.findScalarLast(u8, sn, '$')) |i| {
+                    if (i + 1 < sn.len) sn = sn[i + 1 ..];
+                }
+                if (self.stack_len < self.cur_buf.len) {
+                    self.cur_buf[self.stack_len] = sn;
+                    self.stack_len += 1;
+                }
+                return sn;
+            }
+            if (self.stack_len == 0) return null;
+            self.stack_len -= 1;
+            const cur = self.cur_buf[self.stack_len];
+            var already = false;
+            for (self.seen_buf[0..self.seen_len]) |s2| {
+                if (std.mem.eql(u8, s2, cur)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            if (self.seen_len < self.seen_buf.len) {
+                self.seen_buf[self.seen_len] = cur;
+                self.seen_len += 1;
+            }
+            const reg = &self.module.registry;
+            self.chain = reg.class_super_names.get(cur) orelse
+                (if (reg.mangled_nested.get(cur)) |m| reg.class_super_names.get(m) else null) orelse
+                &.{};
+            self.chain_i = 0;
+        }
+    }
+};
 
 /// Whether `owner` or its hierarchy declares a member called `name`. Gates the
 /// receiver-implausibility rule: with no competitor the extension must stand.

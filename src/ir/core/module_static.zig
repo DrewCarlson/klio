@@ -486,19 +486,22 @@ pub fn staticAliasHead(self: *const Module, ty: TypeRef) StaticAliasHead {
     };
 }
 
+const static_builtin_concrete = std.StaticStringMap(void).initComptime(.{
+    .{"Any"},         .{"Nothing"},     .{"Unit"},         .{"Boolean"},   .{"Char"},
+    .{"Byte"},        .{"Short"},       .{"Int"},          .{"Long"},      .{"Float"},
+    .{"Double"},      .{"UByte"},       .{"UShort"},       .{"UInt"},      .{"ULong"},
+    .{"Array"},       .{"ByteArray"},   .{"ShortArray"},   .{"IntArray"},  .{"LongArray"},
+    .{"FloatArray"},  .{"DoubleArray"}, .{"BooleanArray"}, .{"CharArray"}, .{"UByteArray"},
+    .{"UShortArray"}, .{"UIntArray"},   .{"ULongArray"},
+});
+
 pub fn staticBuiltinConcrete(head: []const u8) bool {
-    inline for (.{
-        "Any",         "Nothing",     "Unit",         "Boolean",   "Char",
-        "Byte",        "Short",       "Int",          "Long",      "Float",
-        "Double",      "UByte",       "UShort",       "UInt",      "ULong",
-        "Array",       "ByteArray",   "ShortArray",   "IntArray",  "LongArray",
-        "FloatArray",  "DoubleArray", "BooleanArray", "CharArray", "UByteArray",
-        "UShortArray", "UIntArray",   "ULongArray",
-    }) |candidate| {
-        if (std.mem.eql(u8, head, candidate)) return true;
-    }
-    return false;
+    return static_builtin_concrete.has(head);
 }
+
+const static_builtin_ifaces = std.StaticStringMap(void).initComptime(.{
+    .{"Number"}, .{"CharSequence"}, .{"Comparable"}, .{"Iterable"}, .{"Collection"}, .{"Sequence"},
+});
 
 pub const StaticBuiltinIdentity = enum {
     no,
@@ -513,12 +516,7 @@ pub fn staticBuiltinIdentity(
 ) StaticBuiltinIdentity {
     const is_builtin = staticBuiltinConcrete(head) or
         applicability.builtinSupersOf(head).len != 0 or
-        std.mem.eql(u8, head, "Number") or
-        std.mem.eql(u8, head, "CharSequence") or
-        std.mem.eql(u8, head, "Comparable") or
-        std.mem.eql(u8, head, "Iterable") or
-        std.mem.eql(u8, head, "Collection") or
-        std.mem.eql(u8, head, "Sequence");
+        static_builtin_ifaces.has(head);
     if (!is_builtin) return .no;
     const qualified = overrideQualifiedPath(ty) orelse blk: {
         if (std.mem.findScalar(u8, ty.name, '.') != null) {

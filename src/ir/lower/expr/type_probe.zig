@@ -615,16 +615,16 @@ pub fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr,
 /// declared parameter types do not definitely reject the literal argument types.
 fn anyFactoryApplicable(b: *FuncBuilder, name: []const u8, args: []const Expr, arg_names: []const ?[]const u8, call_file: ir.FileId) bool {
     const nargs = args.len;
-    for (b.module.func_index.items) |entry| {
-        if (!std.mem.eql(u8, entry.name, name)) continue;
-        if (b.module.funcById(entry.id)) |ff| {
+    const ids = b.module.func_name_index.get(name) orelse return false;
+    for (ids.items) |id| {
+        if (b.module.funcById(id)) |ff| {
             if (b.module.scopeTier(ff.fqn, ff.package, name, b.self_package, call_file) > 3) continue;
             if (!namedArgsNameParams(ff.params, arg_names)) continue;
         }
-        if (b.module.decl_user_arity.get(entry.id.int())) |arity| {
+        if (b.module.decl_user_arity.get(id.int())) |arity| {
             const n: u32 = @intCast(nargs);
             if (n >= arity.required and (arity.has_vararg or n <= arity.total)) {
-                if (b.module.decl_user_sig.get(entry.id.int())) |sig| {
+                if (b.module.decl_user_sig.get(id.int())) |sig| {
                     if (factorySigRejectsArgs(b, sig, args)) continue;
                 }
                 return true;

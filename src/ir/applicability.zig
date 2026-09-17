@@ -192,38 +192,37 @@ pub const ApplicabilityScope = struct {
 };
 
 /// Nominal supertypes a builtin head satisfies; list position is the distance.
+const number_supers: []const []const u8 = &.{ "Number", "Comparable" };
+const progression_supers: []const []const u8 = &.{"Iterable"};
+
+/// The supertypes a builtin's simple name implies; the boxed numerics are
+/// `Number`s, so a runtime `Int` satisfies `Number?`.
+const builtin_super_names = std.StaticStringMap([]const []const u8).initComptime(.{
+    .{ "Int", number_supers },
+    .{ "Long", number_supers },
+    .{ "Short", number_supers },
+    .{ "Byte", number_supers },
+    .{ "Double", number_supers },
+    .{ "Float", number_supers },
+    .{ "List", &.{ "Collection", "Iterable", "MutableList", "MutableCollection", "MutableIterable" } },
+    .{ "MutableList", &.{ "List", "Collection", "Iterable", "MutableCollection", "MutableIterable" } },
+    .{ "Collection", &.{ "Iterable", "MutableCollection", "MutableIterable" } },
+    .{ "Set", &.{ "Collection", "Iterable", "MutableSet", "MutableCollection", "MutableIterable" } },
+    .{ "MutableSet", &.{ "Set", "Collection", "Iterable", "MutableCollection", "MutableIterable" } },
+    .{ "Map", &.{"MutableMap"} },
+    .{ "MutableMap", &.{"Map"} },
+    .{ "IntRange", &.{ "IntProgression", "ClosedRange", "Iterable", "OpenEndRange" } },
+    .{ "LongRange", &.{ "LongProgression", "ClosedRange", "Iterable", "OpenEndRange" } },
+    .{ "CharRange", &.{ "CharProgression", "ClosedRange", "Iterable", "OpenEndRange" } },
+    .{ "IntProgression", progression_supers },
+    .{ "LongProgression", progression_supers },
+    .{ "CharProgression", progression_supers },
+    .{ "String", &.{ "CharSequence", "Comparable" } },
+    .{ "StringBuilder", &.{ "CharSequence", "Appendable" } },
+});
+
 pub fn builtinSupersOf(concrete: []const u8) []const []const u8 {
-    const eq = std.mem.eql;
-    const s = simpleName(concrete);
-    // The boxed numerics are `Number`s: a runtime `Int` satisfies `Number?`.
-    if (eq(u8, s, "Int") or eq(u8, s, "Long") or eq(u8, s, "Short") or eq(u8, s, "Byte") or
-        eq(u8, s, "Double") or eq(u8, s, "Float"))
-        return &.{ "Number", "Comparable" };
-    if (eq(u8, s, "List"))
-        return &.{ "Collection", "Iterable", "MutableList", "MutableCollection", "MutableIterable" };
-    if (eq(u8, s, "MutableList"))
-        return &.{ "List", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
-    if (eq(u8, s, "Collection"))
-        return &.{ "Iterable", "MutableCollection", "MutableIterable" };
-    if (eq(u8, s, "Set"))
-        return &.{ "Collection", "Iterable", "MutableSet", "MutableCollection", "MutableIterable" };
-    if (eq(u8, s, "MutableSet"))
-        return &.{ "Set", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
-    if (eq(u8, s, "Map")) return &.{"MutableMap"};
-    if (eq(u8, s, "MutableMap")) return &.{"Map"};
-    if (eq(u8, s, "IntRange"))
-        return &.{ "IntProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    if (eq(u8, s, "LongRange"))
-        return &.{ "LongProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    if (eq(u8, s, "CharRange"))
-        return &.{ "CharProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    if (eq(u8, s, "IntProgression") or eq(u8, s, "LongProgression") or eq(u8, s, "CharProgression"))
-        return &.{"Iterable"};
-    if (eq(u8, s, "String"))
-        return &.{ "CharSequence", "Comparable" };
-    if (eq(u8, s, "StringBuilder"))
-        return &.{ "CharSequence", "Appendable" };
-    return &.{};
+    return builtin_super_names.get(simpleName(concrete)) orelse &.{};
 }
 
 pub fn simpleName(name: []const u8) []const u8 {

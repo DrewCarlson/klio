@@ -57,6 +57,13 @@ pub const ModuleRegistry = struct {
     /// Class -> transitive supertype simple names, nearest first, recorded from the AST before body
     /// lowering so extension receivers rank while the `Class.supertypes` slots are still filling.
     class_super_names: std.StringHashMap([]const []const u8),
+    /// Bumped whenever `class_super_names` or `mangled_nested` change, so the
+    /// supertype-name closures below are dropped rather than trusted.
+    class_super_gen: u32 = 0,
+    /// Per class name, every simple name the supertype-name walk reaches from
+    /// it; `evidenceSubtype` builds each on first query. Keys are owned.
+    evidence_supers: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)) = .empty,
+    evidence_supers_gen: u32 = 0,
     /// Body-property `(class, prop)` pairs declared with `by`.
     delegated_body_props: StrPairSet,
     /// (class, property) pairs whose declared type is a receiver function type; the value is the
@@ -326,6 +333,8 @@ pub const ModuleRegistry = struct {
             while (it.next()) |names| a.free(names.*);
             self.class_super_names.deinit();
         }
+        self.dropEvidenceSupers();
+        self.evidence_supers.deinit(self.allocator);
         self.delegated_body_props.deinit();
         self.recv_fn_props.deinit();
         self.class_prop_type_heads.deinit();
@@ -404,6 +413,19 @@ pub const ModuleRegistry = struct {
     /// Clone for extension: outer container spines are copied onto `a`, while inner containers and
     /// value slices are SHARED with the original by value-copy. Sound because the extending build only
     /// inserts new keys and replaces whole entries, never appending into a container reached by an old key.
+    pub fn noteClassChainChange(self: *ModuleRegistry) void {
+        self.class_super_gen +%= 1;
+    }
+
+    pub fn dropEvidenceSupers(self: *ModuleRegistry) void {
+        var it = self.evidence_supers.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.deinit(self.allocator);
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.evidence_supers.clearRetainingCapacity();
+    }
+
     pub fn cloneForExtend(self: *const ModuleRegistry, a: Allocator) Allocator.Error!ModuleRegistry {
         var out = ModuleRegistry.init(a);
         try out.object_names.appendSlice(a, self.object_names.items);

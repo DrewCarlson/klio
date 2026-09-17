@@ -2008,7 +2008,10 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
                 // An empty chain still registers: the key's presence is the typing
                 // record a supertype-less local class's methods bind through.
                 const owned = chain.toOwnedSlice(ra) catch null;
-                if (owned) |sl| b.module.registry.class_super_names.put(key, sl) catch {};
+                if (owned) |sl| {
+                    b.module.registry.class_super_names.put(key, sl) catch {};
+                    b.module.registry.noteClassChainChange();
+                }
             } else {
                 chain.deinit(ra);
             }

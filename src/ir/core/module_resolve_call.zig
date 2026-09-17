@@ -6,6 +6,7 @@ const root_ir = @import("../ir.zig");
 const core_func = @import("func.zig");
 const core_ids = @import("ids.zig");
 const m_static = @import("module_static.zig");
+const ModuleRegistry = @import("registry.zig").ModuleRegistry;
 
 const ClassId = core_ids.ClassId;
 const ExtensionResolution = Module.ExtensionResolution;
@@ -34,7 +35,397 @@ const typeContainsBoundParam = Module.typeContainsBoundParam;
 /// Resolve an explicit-receiver top-level extension call from declaration
 /// metadata: only a proven receiver and a unique innermost overload commit.
 
+/// The receiver half of one candidate's verdict: the declared receiver
+/// against the call's, aliases resolved and declared bounds applied. Reads
+/// only the receiver, the declaration and the caller's bounds, so the
+/// verdict is memoised on those.
+fn receiverVerdict(
+    self: *const Module,
+    sa: Allocator,
+    name: []const u8,
+    fid: FuncId,
+    f: *const Func,
+    ds: ?Module.DeclSig,
+    receiver: TypeRef,
+    scoped_receiver: TypeRef,
+    scoped_receiver_alias: m_static.StaticAliasHead,
+    scoped_receiver_cid: ?ClassId,
+    ctx: ExtensionResolveCtx,
+    rex_trace: bool,
+    receiver_pruned: *usize,
+) Allocator.Error!m_static.StaticCompatibility {
+    const recv_param = if (ds) |decl| decl.receiver_ty orelse f.params[0].ty else f.params[0].ty;
+    const decl_file = if (self.decl_span.get(fid.int())) |decl_source|
+        decl_source.file
+    else
+        null;
+    const scoped_recv_param = self.resolveTypeAliasAt(
+        sa,
+        recv_param,
+        decl_file,
+        f.package,
+    ) catch |e| return e;
+    var compatibility = self.staticReceiverCompatibilityWith(
+        fid,
+        scoped_receiver,
+        scoped_receiver_alias,
+        scoped_recv_param,
+    );
+    // `KLIO_RECV_REFUTE=1` (default off): a declared receiver classifier
+    // provably unrelated to the proven static receiver refutes outright.
+    if (compatibility == .unknown and scoped_receiver.args.len != 0 and
+        recvRefuteOn())
+    {
+        const rh = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
+        const ph = staticTypeHead(std.mem.trimEnd(u8, scoped_recv_param.name, "?"));
+        if (!std.mem.eql(u8, rh, ph) and
+            self.staticBuiltinIdentity(scoped_receiver, rh) == .yes and
+            self.staticBuiltinIdentity(scoped_recv_param, ph) == .yes and
+            !evidenceSubtypeCb(@ptrCast(@constCast(self)), rh, ph))
+        {
+            compatibility = .incompatible;
+        }
+    }
+    const declared_bounds = self.declaredTypeParamBounds(sa, fid) catch |e| return e;
+    if (rex_trace) {
+        std.debug.print("[rex] {s} fid={d} bounds={d} compat0={s}", .{ name, fid.int(), declared_bounds.len, @tagName(compatibility) });
+        for (declared_bounds) |db| std.debug.print(" {s}<:{s}", .{ db.param, db.bound });
+        std.debug.print("\n", .{});
+    }
+    if (declared_bounds.len != 0) {
+        const generic_applies = self.staticGenericReceiverApplicable(
+            sa,
+            scoped_receiver,
+            scoped_recv_param,
+            declared_bounds,
+            ctx.actual_type_param_bounds,
+        ) catch |e| return e;
+        if (rex_trace) std.debug.print("[rex] {s} fid={d} generic_applies={}\n", .{ name, fid.int(), generic_applies });
+        if (generic_applies) {
+            compatibility = .compatible;
+        } else {
+            // A bound HEAD the actual receiver provably fails refutes the candidate,
+            // but only when both classifiers are known classes.
+            var head_refuted = false;
+            const recv_head_name = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
+            const recv_cid: ?ClassId = if (std.mem.findScalar(u8, recv_head_name, '.') != null)
+                self.classIdByFqn(recv_head_name)
+            else
+                self.classId(recv_head_name);
+            if (recv_cid != null) {
+                const recv_param_head = staticTypeHead(std.mem.trimEnd(u8, scoped_recv_param.name, "?"));
+                for (declared_bounds) |db| {
+                    if (!std.mem.eql(u8, db.param, recv_param_head)) continue;
+                    var bh = staticTypeHead(db.bound);
+                    if (std.mem.findScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
+                    bh = std.mem.trimEnd(u8, std.mem.trim(u8, bh, " "), "?");
+                    if (std.mem.eql(u8, bh, "Any") or std.mem.eql(u8, bh, "kotlin.Any")) continue;
+                    const bound_cid: ?ClassId = if (std.mem.findScalar(u8, bh, '.') != null)
+                        self.classIdByFqn(bh)
+                    else
+                        self.classId(bh);
+                    if (bound_cid == null) continue;
+                    if (!self.classIdIsOrExtends(recv_cid.?, bound_cid.?)) {
+                        head_refuted = true;
+                        break;
+                    }
+                }
+            }
+            if (rex_trace) std.debug.print("[rex] {s} fid={d} head_refuted={}\n", .{ name, fid.int(), head_refuted });
+            if (head_refuted) {
+                compatibility = .incompatible;
+                receiver_pruned.* += 1;
+            } else {
+                var erased_receiver = scoped_receiver;
+                erased_receiver.args = &.{};
+                var erased_param = scoped_recv_param;
+                erased_param.args = &.{};
+                compatibility = if (self.staticReceiverCompatibility(
+                    null,
+                    erased_receiver,
+                    erased_param,
+                ) == .incompatible)
+                    .incompatible
+                else
+                    .unknown;
+            }
+        }
+    } else if (compatibility == .unknown) {
+        const receiver_id = scoped_receiver_cid;
+        const param_id = self.staticTypeClassId(scoped_recv_param);
+        const disjoint_known_classifiers = receiver_id != null and
+            param_id != null and
+            !self.classIdIsOrExtends(receiver_id.?, param_id.?);
+        const known_classifier_path = receiver_id != null and
+            param_id != null and
+            self.classIdIsOrExtends(receiver_id.?, param_id.?);
+        const same_known_classifier = scoped_receiver.args.len != 0 and
+            scoped_recv_param.args.len != 0 and
+            ((receiver_id != null and param_id != null and
+                receiver_id.? == param_id.?) or
+                (std.mem.eql(
+                    u8,
+                    staticTypeHead(scoped_receiver.name),
+                    staticTypeHead(scoped_recv_param.name),
+                ) and
+                    self.staticBuiltinIdentity(
+                        scoped_receiver,
+                        staticTypeHead(scoped_receiver.name),
+                    ) == .yes and
+                    self.staticBuiltinIdentity(
+                        scoped_recv_param,
+                        staticTypeHead(scoped_recv_param.name),
+                    ) == .yes));
+        if (disjoint_known_classifiers) {
+            compatibility = .incompatible;
+        } else if (known_classifier_path or same_known_classifier or
+            typeContainsBoundParam(receiver, ctx.actual_type_param_bounds))
+        {
+            const subtype = self.staticTypeIsSubtypeWithBounds(
+                sa,
+                scoped_receiver,
+                scoped_recv_param,
+                ctx.actual_type_param_bounds,
+            ) catch |e| return e;
+            if (runtime.envSetOnce("KLIO_DISPROOF_TRACE")) {
+                std.debug.print("[disproof] {s} fid={d} recv={s}<{d}> param={s}<{d}> subtype={} recv_dis={} param_dis={}\n", .{
+                    name,
+                    fid.int(),
+                    scoped_receiver.name,
+                    scoped_receiver.args.len,
+                    scoped_recv_param.name,
+                    scoped_recv_param.args.len,
+                    subtype,
+                    self.staticTypeDisproofComplete(scoped_receiver, ctx.actual_type_param_bounds),
+                    self.staticTypeDisproofComplete(scoped_recv_param, ctx.actual_type_param_bounds),
+                });
+            }
+            if (subtype) {
+                compatibility = .compatible;
+            } else if (self.staticTypeDisproofComplete(
+                scoped_receiver,
+                ctx.actual_type_param_bounds,
+            ) and
+                self.staticTypeDisproofComplete(
+                    scoped_recv_param,
+                    ctx.actual_type_param_bounds,
+                ))
+            {
+                compatibility = .incompatible;
+                receiver_pruned.* += 1;
+            }
+        }
+    }
+    return compatibility;
+}
+
+/// Verdicts of `receiverVerdict`, keyed by everything it reads.
+pub const RecvVerdictCache = struct {
+    pub const Verdict = struct { compat: m_static.StaticCompatibility, pruned: bool };
+    map: std.StringHashMapUnmanaged(Verdict) = .empty,
+    classes_n: usize = 0,
+    funcs_n: usize = 0,
+    chain_gen: u32 = 0,
+    aliases_n: usize = 0,
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    pub fn clear(self: *RecvVerdictCache, gpa: Allocator) void {
+        var it = self.map.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        self.map.clearRetainingCapacity();
+    }
+};
+
+pub fn recvVerdictCache(self: *const Module) ?*RecvVerdictCache {
+    const gpa = self.lookup_cache_gpa orelse return null;
+    const c = self.recv_verdict_cache orelse blk: {
+        const c = gpa.create(RecvVerdictCache) catch return null;
+        c.* = .{};
+        @constCast(self).recv_verdict_cache = c;
+        break :blk c;
+    };
+    const classes_n = self.classes.items.len;
+    const funcs_n = self.func_index.items.len;
+    const chain_gen = self.registry.class_super_gen;
+    const aliases_n = self.registry.type_aliases.count() + self.registry.type_alias_simple.count();
+    if (c.classes_n != classes_n or c.funcs_n != funcs_n or c.chain_gen != chain_gen or c.aliases_n != aliases_n) {
+        c.clear(gpa);
+        c.classes_n = classes_n;
+        c.funcs_n = funcs_n;
+        c.chain_gen = chain_gen;
+        c.aliases_n = aliases_n;
+    }
+    return c;
+}
+
+fn writeTypeRef(w: *std.Io.Writer, t: TypeRef) std.Io.Writer.Error!void {
+    try w.writeAll(t.name);
+    if (t.nullable) try w.writeByte('?');
+    if (t.args.len != 0) {
+        try w.writeByte('<');
+        for (t.args, 0..) |arg, i| {
+            if (i != 0) try w.writeByte(',');
+            try writeTypeRef(w, arg);
+        }
+        try w.writeByte('>');
+    }
+}
+
+/// Null when the key outgrows `buf`; such a call ranks uncached.
+fn recvVerdictKey(
+    buf: []u8,
+    receiver: TypeRef,
+    scoped_receiver: TypeRef,
+    fid: FuncId,
+    bounds: []const ModuleRegistry.TypeParamBound,
+) ?[]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    writeTypeRef(&w, scoped_receiver) catch return null;
+    w.print("|{d}|{d}|", .{ @intFromBool(typeContainsBoundParam(receiver, bounds)), fid.int() }) catch return null;
+    for (bounds) |b| {
+        w.print("{s}:{s}:{d}{d}", .{ b.param, b.bound, @intFromBool(b.complete), @intFromBool(b.head_only) }) catch return null;
+        for (b.args) |arg| w.print("<{s}", .{arg}) catch return null;
+        w.writeByte(';') catch return null;
+    }
+    return w.buffered();
+}
+
+/// The last few extension resolutions, keyed on everything the ranking reads:
+/// the call's inputs, the candidate universe's size, the supertype-chain
+/// generation and the deprecation gate. A call site resolves the same
+/// extension several times, for its emit form, its return type and its
+/// emission, and the ranking is pure in these inputs.
+pub const ExtResolveCache = struct {
+    const N = 8;
+    const Entry = struct {
+        name: []const u8,
+        receiver: TypeRef,
+        args: []const applicability.ArgShape,
+        ctx: ExtensionResolveCtx,
+        universe: usize,
+        chain_gen: u32,
+        suppress: bool,
+        result: ExtensionResolution,
+    };
+    arena: std.heap.ArenaAllocator,
+    entries: [N]?Entry = @splat(null),
+    next: usize = 0,
+    hits: u64 = 0,
+    misses: u64 = 0,
+};
+
+pub fn extResolveCache(self: *const Module) ?*ExtResolveCache {
+    if (self.ext_resolve_cache) |c| return c;
+    const gpa = self.lookup_cache_gpa orelse return null;
+    const c = gpa.create(ExtResolveCache) catch return null;
+    c.* = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    @constCast(self).ext_resolve_cache = c;
+    return c;
+}
+
+/// Structural equality: slices compare by content, where `std.meta.eql`
+/// compares them by address.
+fn deepEql(comptime T: type, a: T, b: T) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => |st| blk: {
+            inline for (st.fields) |f| {
+                if (!deepEql(f.type, @field(a, f.name), @field(b, f.name))) break :blk false;
+            }
+            break :blk true;
+        },
+        .optional => |o| blk: {
+            if (a == null or b == null) break :blk a == null and b == null;
+            break :blk deepEql(o.child, a.?, b.?);
+        },
+        .pointer => |p| switch (p.size) {
+            .slice => blk: {
+                if (a.len != b.len) break :blk false;
+                for (a, b) |x, y| {
+                    if (!deepEql(p.child, x, y)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => a == b,
+        },
+        else => a == b,
+    };
+}
+
+fn deepClone(comptime T: type, a: Allocator, v: T) Allocator.Error!T {
+    return switch (@typeInfo(T)) {
+        .@"struct" => |st| blk: {
+            var out: T = v;
+            inline for (st.fields) |f| @field(out, f.name) = try deepClone(f.type, a, @field(v, f.name));
+            break :blk out;
+        },
+        .optional => |o| if (v) |x| try deepClone(o.child, a, x) else null,
+        .pointer => |p| switch (p.size) {
+            .slice => blk: {
+                const out = try a.alloc(p.child, v.len);
+                for (v, out) |x, *dst| dst.* = try deepClone(p.child, a, x);
+                break :blk out;
+            },
+            else => v,
+        },
+        else => v,
+    };
+}
+
 pub fn resolveExtensionCall(
+    self: *const Module,
+    name: []const u8,
+    receiver: TypeRef,
+    args: []const applicability.ArgShape,
+    ctx: ExtensionResolveCtx,
+) ExtensionResolution {
+    const cache = self.extResolveCache() orelse return resolveExtensionCallUncached(self, name, receiver, args, ctx);
+    // A runtime shape carries a value identity no copy can keep; the traces
+    // report every ranking they see.
+    for (args) |arg| {
+        if (arg.value != null) return resolveExtensionCallUncached(self, name, receiver, args, ctx);
+    }
+    if (runtime.envSetOnce("KLIO_REX_TRACE") or runtime.envSetOnce("KLIO_HOP_TRACE")) {
+        return resolveExtensionCallUncached(self, name, receiver, args, ctx);
+    }
+    const universe = self.func_index.items.len;
+    const chain_gen = self.registry.class_super_gen;
+    const suppress = core_func.suppress_deprecation_error;
+    for (cache.entries) |maybe| {
+        const e = maybe orelse continue;
+        if (e.universe == universe and e.chain_gen == chain_gen and e.suppress == suppress and
+            std.mem.eql(u8, e.name, name) and deepEql(TypeRef, e.receiver, receiver) and
+            deepEql([]const applicability.ArgShape, e.args, args) and deepEql(ExtensionResolveCtx, e.ctx, ctx))
+        {
+            cache.hits += 1;
+            return e.result;
+        }
+    }
+    const result = resolveExtensionCallUncached(self, name, receiver, args, ctx);
+    cache.misses += 1;
+    if (cache.next == 0 and cache.entries[ExtResolveCache.N - 1] != null) {
+        cache.entries = @splat(null);
+        _ = cache.arena.reset(.retain_capacity);
+    }
+    const a = cache.arena.allocator();
+    const entry = Entry: {
+        break :Entry ExtResolveCache.Entry{
+            .name = a.dupe(u8, name) catch return result,
+            .receiver = deepClone(TypeRef, a, receiver) catch return result,
+            .args = deepClone([]const applicability.ArgShape, a, args) catch return result,
+            .ctx = deepClone(ExtensionResolveCtx, a, ctx) catch return result,
+            .universe = universe,
+            .chain_gen = chain_gen,
+            .suppress = suppress,
+            .result = result,
+        };
+    };
+    cache.entries[cache.next] = entry;
+    cache.next = (cache.next + 1) % ExtResolveCache.N;
+    return result;
+}
+
+fn resolveExtensionCallUncached(
     self: *const Module,
     name: []const u8,
     receiver: TypeRef,
@@ -307,166 +698,28 @@ pub fn resolveExtensionCall(
             }
             if (!omitted_defaults) continue;
         }
-        const recv_param = if (ds) |decl| decl.receiver_ty orelse f.params[0].ty else f.params[0].ty;
-        const decl_file = if (self.decl_span.get(fid.int())) |decl_source|
-            decl_source.file
-        else
-            null;
-        const scoped_recv_param = self.resolveTypeAliasAt(
-            sa,
-            recv_param,
-            decl_file,
-            f.package,
-        ) catch return .{};
-        var compatibility = self.staticReceiverCompatibilityWith(
-            fid,
-            scoped_receiver,
-            scoped_receiver_alias,
-            scoped_recv_param,
-        );
-        // `KLIO_RECV_REFUTE=1` (default off): a declared receiver classifier
-        // provably unrelated to the proven static receiver refutes outright.
-        if (compatibility == .unknown and scoped_receiver.args.len != 0 and
-            recvRefuteOn())
-        {
-            const rh = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
-            const ph = staticTypeHead(std.mem.trimEnd(u8, scoped_recv_param.name, "?"));
-            if (!std.mem.eql(u8, rh, ph) and
-                self.staticBuiltinIdentity(scoped_receiver, rh) == .yes and
-                self.staticBuiltinIdentity(scoped_recv_param, ph) == .yes and
-                !evidenceSubtypeCb(@ptrCast(@constCast(self)), rh, ph))
-            {
-                compatibility = .incompatible;
+        var compatibility: m_static.StaticCompatibility = .unknown;
+        var verdict_hit = false;
+        var key_buf: [768]u8 = undefined;
+        const verdict_key: ?[]const u8 = if (rex_trace) null else recvVerdictKey(&key_buf, receiver, scoped_receiver, fid, ctx.actual_type_param_bounds);
+        const vcache = if (verdict_key != null) self.recvVerdictCache() else null;
+        if (vcache) |c| {
+            if (c.map.get(verdict_key.?)) |v| {
+                compatibility = v.compat;
+                if (v.pruned) receiver_pruned += 1;
+                verdict_hit = true;
+                c.hits += 1;
             }
         }
-        const declared_bounds = self.declaredTypeParamBounds(sa, fid) catch return .{};
-        if (rex_trace) {
-            std.debug.print("[rex] {s} fid={d} bounds={d} compat0={s}", .{ name, fid.int(), declared_bounds.len, @tagName(compatibility) });
-            for (declared_bounds) |db| std.debug.print(" {s}<:{s}", .{ db.param, db.bound });
-            std.debug.print("\n", .{});
-        }
-        if (declared_bounds.len != 0) {
-            const generic_applies = self.staticGenericReceiverApplicable(
-                sa,
-                scoped_receiver,
-                scoped_recv_param,
-                declared_bounds,
-                ctx.actual_type_param_bounds,
-            ) catch return .{};
-            if (rex_trace) std.debug.print("[rex] {s} fid={d} generic_applies={}\n", .{ name, fid.int(), generic_applies });
-            if (generic_applies) {
-                compatibility = .compatible;
-            } else {
-                // A bound HEAD the actual receiver provably fails refutes the candidate,
-                // but only when both classifiers are known classes.
-                var head_refuted = false;
-                const recv_head_name = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
-                const recv_cid: ?ClassId = if (std.mem.findScalar(u8, recv_head_name, '.') != null)
-                    self.classIdByFqn(recv_head_name)
-                else
-                    self.classId(recv_head_name);
-                if (recv_cid != null) {
-                    const recv_param_head = staticTypeHead(std.mem.trimEnd(u8, scoped_recv_param.name, "?"));
-                    for (declared_bounds) |db| {
-                        if (!std.mem.eql(u8, db.param, recv_param_head)) continue;
-                        var bh = staticTypeHead(db.bound);
-                        if (std.mem.findScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
-                        bh = std.mem.trimEnd(u8, std.mem.trim(u8, bh, " "), "?");
-                        if (std.mem.eql(u8, bh, "Any") or std.mem.eql(u8, bh, "kotlin.Any")) continue;
-                        const bound_cid: ?ClassId = if (std.mem.findScalar(u8, bh, '.') != null)
-                            self.classIdByFqn(bh)
-                        else
-                            self.classId(bh);
-                        if (bound_cid == null) continue;
-                        if (!self.classIdIsOrExtends(recv_cid.?, bound_cid.?)) {
-                            head_refuted = true;
-                            break;
-                        }
-                    }
-                }
-                if (rex_trace) std.debug.print("[rex] {s} fid={d} head_refuted={}\n", .{ name, fid.int(), head_refuted });
-                if (head_refuted) {
-                    compatibility = .incompatible;
-                    receiver_pruned += 1;
-                } else {
-                    var erased_receiver = scoped_receiver;
-                    erased_receiver.args = &.{};
-                    var erased_param = scoped_recv_param;
-                    erased_param.args = &.{};
-                    compatibility = if (self.staticReceiverCompatibility(
-                        null,
-                        erased_receiver,
-                        erased_param,
-                    ) == .incompatible)
-                        .incompatible
-                    else
-                        .unknown;
-                }
-            }
-        } else if (compatibility == .unknown) {
-            const receiver_id = scoped_receiver_cid;
-            const param_id = self.staticTypeClassId(scoped_recv_param);
-            const disjoint_known_classifiers = receiver_id != null and
-                param_id != null and
-                !self.classIdIsOrExtends(receiver_id.?, param_id.?);
-            const known_classifier_path = receiver_id != null and
-                param_id != null and
-                self.classIdIsOrExtends(receiver_id.?, param_id.?);
-            const same_known_classifier = scoped_receiver.args.len != 0 and
-                scoped_recv_param.args.len != 0 and
-                ((receiver_id != null and param_id != null and
-                    receiver_id.? == param_id.?) or
-                    (std.mem.eql(
-                        u8,
-                        staticTypeHead(scoped_receiver.name),
-                        staticTypeHead(scoped_recv_param.name),
-                    ) and
-                        self.staticBuiltinIdentity(
-                            scoped_receiver,
-                            staticTypeHead(scoped_receiver.name),
-                        ) == .yes and
-                        self.staticBuiltinIdentity(
-                            scoped_recv_param,
-                            staticTypeHead(scoped_recv_param.name),
-                        ) == .yes));
-            if (disjoint_known_classifiers) {
-                compatibility = .incompatible;
-            } else if (known_classifier_path or same_known_classifier or
-                typeContainsBoundParam(receiver, ctx.actual_type_param_bounds))
-            {
-                const subtype = self.staticTypeIsSubtypeWithBounds(
-                    sa,
-                    scoped_receiver,
-                    scoped_recv_param,
-                    ctx.actual_type_param_bounds,
-                ) catch return .{};
-                if (runtime.envSetOnce("KLIO_DISPROOF_TRACE")) {
-                    std.debug.print("[disproof] {s} fid={d} recv={s}<{d}> param={s}<{d}> subtype={} recv_dis={} param_dis={}\n", .{
-                        name,
-                        fid.int(),
-                        scoped_receiver.name,
-                        scoped_receiver.args.len,
-                        scoped_recv_param.name,
-                        scoped_recv_param.args.len,
-                        subtype,
-                        self.staticTypeDisproofComplete(scoped_receiver, ctx.actual_type_param_bounds),
-                        self.staticTypeDisproofComplete(scoped_recv_param, ctx.actual_type_param_bounds),
-                    });
-                }
-                if (subtype) {
-                    compatibility = .compatible;
-                } else if (self.staticTypeDisproofComplete(
-                    scoped_receiver,
-                    ctx.actual_type_param_bounds,
-                ) and
-                    self.staticTypeDisproofComplete(
-                        scoped_recv_param,
-                        ctx.actual_type_param_bounds,
-                    ))
-                {
-                    compatibility = .incompatible;
-                    receiver_pruned += 1;
-                }
+        if (!verdict_hit) {
+            const pruned_before = receiver_pruned;
+            compatibility = receiverVerdict(self, sa, name, fid, f, ds, receiver, scoped_receiver, scoped_receiver_alias, scoped_receiver_cid, ctx, rex_trace, &receiver_pruned) catch return .{};
+            if (vcache) |c| {
+                c.misses += 1;
+                const gpa = self.lookup_cache_gpa.?;
+                if (gpa.dupe(u8, verdict_key.?)) |owned| {
+                    c.map.put(gpa, owned, .{ .compat = compatibility, .pruned = receiver_pruned != pruned_before }) catch gpa.free(owned);
+                } else |_| {}
             }
         }
         if (compatibility == .incompatible) continue;

@@ -257,6 +257,10 @@ pub const Module = struct {
     class_fqn_map: ?std.StringHashMap(ClassId) = null,
     /// Allocator for the lowering-phase lookup caches below; null disables them, so lookups scan.
     lookup_cache_gpa: ?Allocator = null,
+    /// See `ExtResolveCache`; created on first use from `lookup_cache_gpa`.
+    ext_resolve_cache: ?*m_resolve_call.ExtResolveCache = null,
+    /// See `RecvVerdictCache`; created on first use from `lookup_cache_gpa`.
+    recv_verdict_cache: ?*m_resolve_call.RecvVerdictCache = null,
     /// Lowering-phase package-head set: every dot-aligned FQN prefix of every declared func and
     /// class. Prefixes are only ever added, so the set never goes stale-positive.
     pkg_head_cache: std.StringHashMapUnmanaged(void) = .empty,
@@ -802,6 +806,8 @@ pub const Module = struct {
     pub const genericReceiverSuppliesLambdaReceiver = m_static.genericReceiverSuppliesLambdaReceiver;
 
     pub const resolveExtensionCall = m_resolve_call.resolveExtensionCall;
+    pub const extResolveCache = m_resolve_call.extResolveCache;
+    pub const recvVerdictCache = m_resolve_call.recvVerdictCache;
     pub const resolveMemberCall = m_resolve_call.resolveMemberCall;
     pub const dispatchForTarget = m_resolve_call.dispatchForTarget;
     pub const methodIsFinal = m_resolve_call.methodIsFinal;

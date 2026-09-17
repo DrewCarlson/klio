@@ -1165,6 +1165,7 @@ fn registerClassSuperNameChains(ctx: *BuildCtx) Allocator.Error!void {
             }
             const super_chain = try chain.toOwnedSlice(a);
             try module.registry.class_super_names.put(e.key_ptr.*, super_chain);
+            module.registry.noteClassChainChange();
             // Also keyed by fqn, so a receiver whose simple name collides across packs resolves its OWN chain.
             {
                 const cfqn = try resolveFqn(a, fqn_overrides, e.value_ptr.get().name.span, package_prefix, e.key_ptr.*);
@@ -1276,6 +1277,7 @@ fn installLiftedNameTables(ctx: *BuildCtx) Allocator.Error!void {
     {
         var it = mangled_nested.iterator();
         while (it.next()) |e| try module.registry.mangled_nested.put(e.key_ptr.*, e.value_ptr.*);
+        module.registry.noteClassChainChange();
     }
     // The enclosing-class chain backs the scope-true alias walk; both tables install before lowering.
     {
@@ -1978,6 +1980,10 @@ fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
         }
     }
     phase.reportBodies();
+    if (phase.on()) {
+        if (ctx.module.extResolveCache()) |c| std.debug.print("[lower] ext-resolve cache hits {d} misses {d}\n", .{ c.hits, c.misses });
+        if (ctx.module.recvVerdictCache()) |c| std.debug.print("[lower] recv-verdict cache hits {d} misses {d} entries {d}\n", .{ c.hits, c.misses, c.map.count() });
+    }
 }
 
 fn registerBodyFuncTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) Allocator.Error!void {

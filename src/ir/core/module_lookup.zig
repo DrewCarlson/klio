@@ -242,6 +242,15 @@ pub fn deinit(self: *Module, allocator: Allocator) void {
     }
     self.func_index.deinit(allocator);
     if (self.lookup_cache_gpa) |cg| {
+        if (self.ext_resolve_cache) |c| {
+            c.arena.deinit();
+            cg.destroy(c);
+        }
+        if (self.recv_verdict_cache) |c| {
+            c.clear(cg);
+            c.map.deinit(cg);
+            cg.destroy(c);
+        }
         self.pkg_head_cache.deinit(cg);
         var cn_it = self.class_name_cache.valueIterator();
         while (cn_it.next()) |list| list.deinit(cg);

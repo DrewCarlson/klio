@@ -1052,6 +1052,7 @@ pub fn linkMethodClass(
     allocator: Allocator,
     maps: []std.AutoHashMap(u32, FuncId),
     state: []u8,
+    own: []const []const FuncId,
     cid: ClassId,
 ) Allocator.Error!void {
     if (cid.int() >= self.classes.items.len or state[cid.int()] == 2) return;
@@ -1059,7 +1060,7 @@ pub fn linkMethodClass(
     state[cid.int()] = 1;
     const class = &self.classes.items[cid.int()];
     for (class.supertypes) |super_id| {
-        try self.linkMethodClass(allocator, maps, state, super_id);
+        try self.linkMethodClass(allocator, maps, state, own, super_id);
         if (super_id.int() >= maps.len) continue;
         var inherited = maps[super_id.int()].iterator();
         while (inherited.next()) |entry| {
@@ -1072,22 +1073,8 @@ pub fn linkMethodClass(
         }
     }
 
-    // `Class.methods` holds executable bodies only, abstract headers absent; slots are declaration
-    // metadata, so enumerate the canonical declaration table instead.
-    var own_methods: std.ArrayList(FuncId) = .empty;
-    defer own_methods.deinit(allocator);
-    var decl_it = self.decl_sigs.iterator();
-    while (decl_it.next()) |entry| {
-        const decl_owner = entry.value_ptr.enclosing_class orelse continue;
-        if (decl_owner.int() != cid.int() or entry.value_ptr.kind != .instance_method) continue;
-        try own_methods.append(allocator, FuncId.from(entry.key_ptr.*));
-    }
-    std.mem.sort(FuncId, own_methods.items, {}, struct {
-        fn lessThan(_: void, lhs: FuncId, rhs: FuncId) bool {
-            return lhs.int() < rhs.int();
-        }
-    }.lessThan);
-    for (own_methods.items) |fid| {
+    const own_methods: []const FuncId = if (cid.int() < own.len) own[cid.int()] else &.{};
+    for (own_methods) |fid| {
         const sig = self.decl_sigs.get(fid.int()) orelse continue;
         if (sig.kind != .instance_method or sig.visibility == .Private) continue;
         const inherited_count = maps[cid.int()].count();
@@ -1125,6 +1112,30 @@ pub fn linkMethodSlots(self: *Module, allocator: Allocator) Allocator.Error!void
 /// walked the whole class table and, per class, the whole declaration table.
 /// `linkMethodClass` pulls in each ancestor a linked class needs, so the chains
 /// a user class actually extends still settle.
+/// Each class's instance-method declarations by ascending id. `Class.methods`
+/// holds executable bodies only, abstract headers absent; slots are declaration
+/// metadata, so the canonical declaration table is read, once for every class.
+fn ownInstanceMethods(self: *const Module, allocator: Allocator) Allocator.Error![]const []const FuncId {
+    const lists = try allocator.alloc(std.ArrayListUnmanaged(FuncId), self.classes.items.len);
+    @memset(lists, .empty);
+    var decl_it = self.decl_sigs.iterator();
+    while (decl_it.next()) |entry| {
+        const decl_owner = entry.value_ptr.enclosing_class orelse continue;
+        if (entry.value_ptr.kind != .instance_method or decl_owner.int() >= lists.len) continue;
+        try lists[decl_owner.int()].append(allocator, FuncId.from(entry.key_ptr.*));
+    }
+    const own = try allocator.alloc([]const FuncId, lists.len);
+    for (lists, own) |*list, *dst| {
+        std.mem.sort(FuncId, list.items, {}, struct {
+            fn lessThan(_: void, lhs: FuncId, rhs: FuncId) bool {
+                return lhs.int() < rhs.int();
+            }
+        }.lessThan);
+        dst.* = list.items;
+    }
+    return own;
+}
+
 pub fn linkMethodSlotsFrom(self: *Module, allocator: Allocator, first_class: usize) Allocator.Error!void {
     if (first_class >= self.classes.items.len) return;
     var scratch = std.heap.ArenaAllocator.init(allocator);
@@ -1134,7 +1145,8 @@ pub fn linkMethodSlotsFrom(self: *Module, allocator: Allocator, first_class: usi
     for (maps) |*map| map.* = std.AutoHashMap(u32, FuncId).init(sa);
     const state = try sa.alloc(u8, self.classes.items.len);
     @memset(state, 0);
-    for (self.classes.items[first_class..]) |class| try self.linkMethodClass(sa, maps, state, class.id);
+    const own = try ownInstanceMethods(self, sa);
+    for (self.classes.items[first_class..]) |class| try self.linkMethodClass(sa, maps, state, own, class.id);
     for (maps, 0..) |*map, raw_cid| {
         var it = map.iterator();
         while (it.next()) |entry| {

@@ -70,6 +70,7 @@ fn recordType(self: *Checker, sp: Span, ty: *const Type) Allocator.Error!void {
     const gop = try self.types.getOrPut(sp);
     if (gop.found_existing) gop.value_ptr.deinit(self.allocator);
     gop.value_ptr.* = owned;
+    if (self.inference_session != null) try self.types_journal.append(self.allocator, sp);
     if (owned == .Nothing) {
         const ng = try self.nothing_spans.getOrPut(sp);
         if (!ng.found_existing) self.nothing_epoch += 1;

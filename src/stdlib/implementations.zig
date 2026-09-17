@@ -1716,6 +1716,38 @@ const TABLE_MAP = blk: {
     break :blk std.StaticStringMap(StdlibFn).initComptime(kvs);
 };
 
+/// Every table fqn grouped under its last segment, for the receiver-qualified
+/// resolution in `declarationHostSymbol`. Built on first use; the table is
+/// static, so the index lives for the process.
+var name_index: std.StringHashMapUnmanaged([]const []const u8) = .empty;
+/// 0 unbuilt, 1 building, 2 ready.
+var name_index_state = std.atomic.Value(u8).init(0);
+
+fn ensureNameIndex() void {
+    if (name_index_state.load(.acquire) == 2) return;
+    if (name_index_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+        buildNameIndex();
+        name_index_state.store(2, .release);
+        return;
+    }
+    while (name_index_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+}
+
+fn buildNameIndex() void {
+    const a = std.heap.page_allocator;
+    var groups: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
+    for (TABLE) |e| {
+        const at = std.mem.findScalarLast(u8, e.fqn, '.') orelse continue;
+        const gop = groups.getOrPut(a, e.fqn[at + 1 ..]) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(a, e.fqn) catch return;
+    }
+    var it = groups.iterator();
+    while (it.next()) |g| {
+        name_index.put(a, g.key_ptr.*, g.value_ptr.items) catch return;
+    }
+}
+
 const PARAM_NAMES_MAP = blk: {
     @setEvalBranchQuota(PARAM_NAMES.len * PARAM_NAMES.len);
     var kvs: [PARAM_NAMES.len]struct { []const u8, []const []const u8 } = undefined;
@@ -1751,19 +1783,19 @@ pub fn declarationHostSymbol(
     recv = std.mem.trimEnd(u8, recv, "?");
     if (recv.len == 0) return null;
 
+    ensureNameIndex();
+    const fqns = name_index.get(name) orelse return null;
     var found: ?[]const u8 = null;
-    for (TABLE) |entry| {
-        const name_at = std.mem.findScalarLast(u8, entry.fqn, '.') orelse continue;
-        if (!std.mem.eql(u8, entry.fqn[name_at + 1 ..], name)) continue;
-        const owner = entry.fqn[0..name_at];
+    for (fqns) |fqn| {
+        const owner = fqn[0 .. fqn.len - name.len - 1];
         if (!std.mem.eql(u8, owner, recv) and
             !(owner.len > recv.len and owner[owner.len - recv.len - 1] == '.' and
                 std.mem.eql(u8, owner[owner.len - recv.len ..], recv)))
         {
             continue;
         }
-        if (found != null and !std.mem.eql(u8, found.?, entry.fqn)) return null;
-        found = entry.fqn;
+        if (found != null and !std.mem.eql(u8, found.?, fqn)) return null;
+        found = fqn;
     }
     return found;
 }

@@ -2183,6 +2183,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     }
     try r.mangled_nested.ensureTotalCapacity(@intCast(ri.mangled_nested.len));
     for (ri.mangled_nested) |kv| r.mangled_nested.putAssumeCapacity(kv.k, kv.v);
+    r.noteClassChainChange();
     try r.class_const_inits.ensureTotalCapacity(@intCast(ri.class_const_inits.len));
     for (ri.class_const_inits) |entry| r.class_const_inits.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, entry.v);
     try r.class_prop_type_heads.ensureTotalCapacity(@intCast(ri.class_prop_type_heads.len));
