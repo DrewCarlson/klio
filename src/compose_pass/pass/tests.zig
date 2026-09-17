@@ -448,34 +448,69 @@ test "defaulted composable param becomes marker-guarded prologue" {
     const seg = marker.callee.Path.segments;
     try testing.expectEqualStrings("klioComposableDefaultMarker", seg[seg.len - 1].name);
 
-    // Body: startRestartGroup, `val x = if (x$arg === marker()) 5 else x$arg`, $dirty,
-    // probe(x), skip-if, endRestartGroup?.updateScope.
+    try testing.expectEqualStrings("$composer", out.params[1].name.name);
+    try testing.expectEqualStrings("$changed", out.params[2].name.name);
+    // The threaded pair is the whole ABI: the absent-argument mask rides in `$changed`.
+    try testing.expectEqual(@as(usize, 3), out.params.len);
+
+    // Body: startRestartGroup, `var x = x$arg`, `val $defaults = …`, $dirty, probe(x),
+    // skip-if (defaults group then body), endRestartGroup?.updateScope.
     const stmts = out.body.?.Block.stmts;
-    try testing.expectEqual(@as(usize, 6), stmts.len);
+    try testing.expectEqual(@as(usize, 7), stmts.len);
     const prop = stmts[1].Decl.Property;
+    try testing.expect(prop.mutable);
     try testing.expectEqualStrings("x", prop.name.name);
     try testing.expectEqualStrings("Int", prop.ty.?.name.name);
-    const pick = prop.init.?.If;
-    try testing.expect(pick.cond.Binary.op == .IdentEq);
-    try testing.expectEqualStrings("x$arg", pick.cond.Binary.lhs.Path.segments[0].name);
-    try testing.expectEqual(@as(i64, 5), pick.then_branch.IntLit.value);
-    try testing.expectEqualStrings("x$arg", pick.else_branch.?.Path.segments[0].name);
+    try testing.expectEqualStrings("x$arg", prop.init.?.Path.segments[0].name);
 
-    // A defaulted param's probe is also guarded by `if (x$arg !== marker())`.
-    const cguard = stmts[3].Expr.If;
+    // `val $defaults = ($changed and 0b1000) or (if (x$arg === marker()) 0b1000 else 0)`.
+    const mask = stmts[2].Decl.Property;
+    try testing.expectEqualStrings("$defaults", mask.name.name);
+    const or_call = mask.init.?.Call;
+    try testing.expectEqualStrings("or", or_call.callee.Member.name.name);
+    const carried = or_call.callee.Member.receiver.Call;
+    try testing.expectEqualStrings("and", carried.callee.Member.name.name);
+    try testing.expectEqualStrings("$changed", carried.callee.Member.receiver.Path.segments[0].name);
+    try testing.expectEqual(@as(i64, 8), carried.args[0].IntLit.value);
+    const bit = or_call.args[0].If;
+    try testing.expect(bit.cond.Binary.op == .IdentEq);
+    try testing.expectEqualStrings("x$arg", bit.cond.Binary.lhs.Path.segments[0].name);
+    try testing.expectEqual(@as(i64, 8), bit.then_branch.IntLit.value);
+
+    // A defaulted slot the caller never passed is certain-same and is never probed.
+    const taken = stmts[4].Expr.If;
+    try testing.expect(taken.cond.Binary.op == .Neq);
+    try testing.expectEqualStrings("$defaults", taken.cond.Binary.lhs.Call.callee.Member.receiver.Path.segments[0].name);
+    const cguard = taken.else_branch.?.Block.stmts[0].Expr.If;
     try testing.expect(cguard.cond.Binary.op == .Eq);
-    const guard = cguard.then_branch.Block.stmts[0].Expr.If;
-    try testing.expect(guard.cond.Binary.op == .IdentNeq);
-    try testing.expectEqualStrings("x$arg", guard.cond.Binary.lhs.Path.segments[0].name);
-    const probe = guard.then_branch.Block.stmts[0];
+    const probe = cguard.then_branch.Block.stmts[0];
     // The probe reads the RESOLVED value `x`, not the renamed argument.
     try testing.expectEqualStrings("x", probe.Assign.value.Call.args[0].If.cond.Call.args[0].Path.segments[0].name);
-    // The restart re-call passes the RESOLVED value, so the default is computed
-    // once for the group rather than afresh on every recomposition.
-    const upd = stmts[5].Expr.Call;
+
+    // The execute branch opens with the defaults group: the default is evaluated on an
+    // ordinary call and jumped over on a restart, which carries the value in instead.
+    const exec = stmts[5].Expr.If.then_branch.Block.stmts;
+    try testing.expectEqualStrings("startDefaults", exec[0].Expr.Call.callee.Member.name.name);
+    try testing.expectEqualStrings("endDefaults", exec[2].Expr.Call.callee.Member.name.name);
+    const dsel = exec[1].Expr.If;
+    try testing.expect(dsel.cond.Binary.op == .Or);
+    try testing.expectEqualStrings("defaultsInvalid", dsel.cond.Binary.rhs.Member.name.name);
+    const resolve = dsel.then_branch.Block.stmts[0].Assign;
+    try testing.expectEqualStrings("x", resolve.target.Path.segments[0].name);
+    try testing.expectEqual(@as(i64, 5), resolve.value.If.then_branch.IntLit.value);
+    try testing.expectEqualStrings("skipToGroupEnd", dsel.else_branch.?.Block.stmts[0].Expr.Call.callee.Member.name.name);
+
+    // The restart re-call passes the RESOLVED value, and folds the mask into the flags,
+    // so the default is computed once for the group rather than on every recomposition.
+    const upd = stmts[6].Expr.Call;
     const lam = upd.args[0].Lambda;
     const reinvoke = lam.body.stmts[0].Expr.Call;
+    try testing.expectEqual(@as(usize, 3), reinvoke.args.len);
     try testing.expectEqualStrings("x", reinvoke.args[0].Path.segments[0].name);
+    const flags = reinvoke.args[2].Call;
+    try testing.expectEqualStrings("or", flags.callee.Member.name.name);
+    try testing.expectEqualStrings("$defaults", flags.args[0].Path.segments[0].name);
+    try testing.expectEqualStrings("updateChangedFlags", flags.callee.Member.receiver.Call.callee.Path.segments[3].name);
 }
 
 test "threadCall appends the composer pair as named args" {

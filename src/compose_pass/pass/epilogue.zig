@@ -34,6 +34,8 @@ pub const EpilogueInjector = struct {
     /// Whether the body owns a restart bracket: a content lambda's belongs to
     /// `ComposableLambdaImpl`, so only replace-groups close there.
     has_restart: bool = true,
+    /// Whether the function carries the absent-argument mask its restart passes back.
+    has_defaults: bool = false,
     /// Open wrapped replace-groups at the current descent position.
     replace_depth: usize = 0,
     /// Inline-lambda boundaries entered: callee name, implicit label, and the
@@ -116,7 +118,7 @@ pub const EpilogueInjector = struct {
                     ) };
                 }
                 if (exits_composable) {
-                    list[n_end] = .{ .Expr = try endRestartGroupExpr(self.a, self.b, self.fn_name, self.value_params) };
+                    list[n_end] = .{ .Expr = try endRestartGroupExpr(self.a, self.b, self.fn_name, self.value_params, self.has_defaults) };
                 }
                 list[n_end + extra - 1] = .{ .Expr = inner };
                 e.* = .{ .Block = .{ .stmts = list, .span = ret_span } };
@@ -283,9 +285,15 @@ pub fn isComposerCallStmt(s: *const Stmt, name: []const u8) bool {
         std.mem.eql(u8, recv.Path.segments[0].name, composer_param);
 }
 
-pub fn endRestartGroupExpr(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params: []const Param) std.mem.Allocator.Error!Expr {
+pub fn endRestartGroupExpr(
+    a: std.mem.Allocator,
+    b: B,
+    fn_name: []const u8,
+    value_params: []const Param,
+    has_defaults: bool,
+) std.mem.Allocator.Error!Expr {
     const end_call = b.callMember(b.pathExpr(composer_param), "endRestartGroup", &.{});
-    const lambda = try recomposeLambda(a, b, fn_name, value_params);
+    const lambda = try recomposeLambda(a, b, fn_name, value_params, has_defaults);
     return .{ .Call = .{
         .callee = b.box(.{ .Member = .{
             .receiver = b.box(end_call),
@@ -302,16 +310,29 @@ pub fn endRestartGroupExpr(a: std.mem.Allocator, b: B, fn_name: []const u8, valu
     } };
 }
 
-/// `{ c, _f -> Self(origValueArgs, c, $changed or 1) }`. `value_params` are the
-/// TRANSFORMED params, so a defaulted one is its renamed `p$arg`; the restart
-/// passes the RESOLVED `p` the prologue bound, never the marker again. Passing
-/// the marker would evaluate the default afresh on every recomposition, while
-/// a default is computed once for the life of the group.
-fn recomposeLambda(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params: []const Param) std.mem.Allocator.Error!Expr {
+/// `{ c, _f -> Self(origValueArgs, c, $changed or 1, $defaults) }`. `value_params` are
+/// the TRANSFORMED params, so a defaulted one is its renamed `p$arg`; the restart passes
+/// the RESOLVED `p` the prologue bound, never the marker again. The mask travels with it,
+/// so the body still knows which slots the CALLER never supplied and leaves both their
+/// defaults and their `changed` slots alone.
+fn recomposeLambda(
+    a: std.mem.Allocator,
+    b: B,
+    fn_name: []const u8,
+    value_params: []const Param,
+    has_defaults: bool,
+) std.mem.Allocator.Error!Expr {
     var call_args = try a.alloc(Expr, value_params.len + 2);
     for (value_params, 0..) |p, i| {
         const n = p.name.name;
-        call_args[i] = b.pathExpr(if (std.mem.endsWith(u8, n, "$arg")) n[0 .. n.len - "$arg".len] else n);
+        // With a defaults group the restart carries the RESOLVED value, so the default is
+        // computed once for the life of the group. Without one — a function whose
+        // defaulted slots outrun the mask — it hands `p$arg` back untouched, so the
+        // marker still marks the same slots and the probe reads the same branch.
+        call_args[i] = b.pathExpr(if (has_defaults and std.mem.endsWith(u8, n, "$arg"))
+            n[0 .. n.len - "$arg".len]
+        else
+            n);
     }
     call_args[value_params.len] = b.pathExpr("$rc"); // recompose composer lambda param
     // `updateChangedFlags($changed or 1)` folds every DYNAMIC "changed" triple to "same":
@@ -325,10 +346,17 @@ fn recomposeLambda(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params
     );
     const ucf_args = try a.alloc(Expr, 1);
     ucf_args[0] = forced;
-    call_args[value_params.len + 1] = b.call(
+    const updated = b.call(
         b.pathExprSegs(&.{ "androidx", "compose", "runtime", "updateChangedFlags" }),
         ucf_args,
     );
+    // The absent-argument mask rides in bits `updateChangedFlags` leaves alone, so the
+    // body still knows which slots the ORIGINAL caller never supplied and leaves both
+    // their defaults and their `changed` slots untouched.
+    call_args[value_params.len + 1] = if (has_defaults)
+        b.callMember(updated, "or", b.slice1(b.pathExpr(root.defaults_local)))
+    else
+        updated;
     const reinvoke = b.call(b.pathExpr(fn_name), call_args);
 
     const lam_params = try a.alloc(Ident, 2);

@@ -33,6 +33,10 @@ pub var dbg_groups: bool = false;
 
 pub const composer_param = "$composer";
 pub const changed_param = "$changed";
+/// The absent-argument mask: which parameters took their default on this call. It rides
+/// in `$changed`, one bit per probed slot, so the compose ABI stays the `$composer`,
+/// `$changed` pair every dispatch path already knows.
+pub const defaults_local = "$defaults";
 /// The skip-calculus accumulator local (`var $dirty = $changed and 1`).
 pub const dirty_local = "$dirty";
 pub var emit_skip_calculus: bool = true;

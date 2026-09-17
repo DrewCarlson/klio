@@ -13,6 +13,7 @@ const Stmt = ast.Stmt;
 
 const composer_param = root.composer_param;
 const changed_param = root.changed_param;
+const defaults_local = root.defaults_local;
 const dirty_local = root.dirty_local;
 const isComposable = root.isComposable;
 const positionalKey = root.positionalKey;
@@ -126,28 +127,7 @@ fn markerCall(b: B) Expr {
     return b.call(b.pathExprSegs(&default_marker_path), b.a.alloc(Expr, 0) catch @panic("oom"));
 }
 
-/// Guard a marker-defaulted param's probe with `if (p$arg !== marker())`: kotlinc's
-/// `$default`-mask path sets the dirty bits directly and stores no `changed` slot.
-fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt, triple: u5) Stmt {
-    const not_default = Expr{ .Binary = .{
-        .op = .IdentNeq,
-        .lhs = b.box(b.pathExpr(arg_name)),
-        .rhs = b.box(markerCall(b)),
-        .span = b.gen_span,
-    } };
-    const then_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
-    then_stmts[0] = probe;
-    // Default taken: the slot is certain-same for this composition, so the triple's
-    // same bit must set, or the `!= SAME` gate reads the empty triple as unknown.
-    const else_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
-    else_stmts[0] = dirtyOrConst(b, dirtySame(triple));
-    return .{ .Expr = .{ .If = .{
-        .cond = b.box(not_default),
-        .then_branch = b.box(.{ .Block = .{ .stmts = then_stmts, .span = b.gen_span } }),
-        .else_branch = b.box(.{ .Block = .{ .stmts = else_stmts, .span = b.gen_span } }),
-        .span = b.gen_span,
-    } } };
-}
+
 
 // Ten 3-bit triples fit above the forced bit in a Kotlin `Int`; slots beyond that
 // share the last triple, which only widens invalidation.
@@ -166,6 +146,55 @@ fn dirtySame(triple: u5) i64 {
 /// The whole-triple mask for probe `i` (0b111 at its position).
 pub fn dirtyMask(triple: u5) i64 {
     return @as(i64, 14) << (3 * @as(u6, triple));
+}
+
+/// The absent-argument bit parameter `i` owns. `$dirty`/`$changed` spend three bits per
+/// probed slot starting at bit 1, of which only the lower two carry the skip calculus;
+/// the third is free and travels through `updateChangedFlags` untouched, so a restart
+/// can tell the body which slots the original caller never supplied. Ten slots fit.
+pub fn defaultBit(i: usize) i64 {
+    return @as(i64, 8) << (3 * @as(u6, @intCast(i)));
+}
+
+/// The widest parameter index the absent-argument mask reaches.
+pub const max_default_slot: usize = 9;
+
+/// `$defaults and <bit> != 0`: whether the caller left parameter `i` to its default.
+fn defaultTaken(b: B, bit: i64) Expr {
+    return .{ .Binary = .{
+        .op = .Neq,
+        .lhs = b.box(b.callMember(b.pathExpr(defaults_local), "and", b.slice1(b.intLit(bit)))),
+        .rhs = b.box(b.intLit(0)),
+        .span = b.gen_span,
+    } };
+}
+
+/// A defaulted slot never reaches `composer.changed`: the caller stored nothing for an
+/// argument it did not pass, so the triple reads certain-same and the probe is the
+/// branch taken only when a value did arrive. `taken` is the test for "took its default":
+/// the mask when the function carries one, the marker the argument still holds otherwise.
+fn defaultedProbe(b: B, taken: Expr, guarded: Stmt, triple: u5) Stmt {
+    const then_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
+    then_stmts[0] = dirtyOrConst(b, dirtySame(triple));
+    const else_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
+    else_stmts[0] = guarded;
+    return .{ .Expr = .{ .If = .{
+        .cond = b.box(taken),
+        .then_branch = b.box(.{ .Block = .{ .stmts = then_stmts, .span = b.gen_span } }),
+        .else_branch = b.box(.{ .Block = .{ .stmts = else_stmts, .span = b.gen_span } }),
+        .span = b.gen_span,
+    } } };
+}
+
+/// `p$arg === marker()`: the test a function past the mask's reach uses instead. Its
+/// restart hands `p$arg` straight back, so both compositions read the same branch.
+fn markerTaken(b: B, arg_name: []const u8) Expr {
+    return .{ .Binary = .{
+        .op = .IdentEq,
+        .lhs = b.box(b.pathExpr(arg_name)),
+        .rhs = b.box(markerCall(b)),
+        .span = b.gen_span,
+    } };
 }
 
 /// `if ($changed and (0b110 << 3i) == 0) { <probe> }`: the probe runs only when the
@@ -214,9 +243,17 @@ fn dirtyOrProbe(b: B, probe: Expr, triple: u5) Stmt {
 }
 
 /// Every original param keeps its slot; a defaulted `p: T = D` is renamed `p$arg` with
-/// the marker as its default and the prologue declares
-/// `val p = if (p$arg === marker()) D else p$arg`. `$composer`/`$changed` come last.
-const ParamsAndPrologue = struct { params: []Param, prologue: []Stmt };
+/// the marker as its default. A restartable function binds `var p = p$arg` and resolves
+/// the default inside a `startDefaults` group a restart jumps over; everything else
+/// resolves it once, inline. The threaded pair is unchanged: the absent-argument mask
+/// rides in the free bit of each slot's `$changed` triple.
+const ParamsAndPrologue = struct {
+    params: []Param,
+    prologue: []Stmt,
+    /// `startDefaults() … endDefaults()`, the head of a restartable body's execute
+    /// branch. Empty when no parameter has a default.
+    defaults: []Stmt = &.{},
+};
 
 fn composableLambdaParamNames(a: std.mem.Allocator, f: *const Function) std.mem.Allocator.Error!std.StringHashMap(void) {
     var set = std.StringHashMap(void).init(a);
@@ -226,55 +263,166 @@ fn composableLambdaParamNames(a: std.mem.Allocator, f: *const Function) std.mem.
     return set;
 }
 
-fn buildParamsAndPrologue(a: std.mem.Allocator, b: B, f: *const Function) std.mem.Allocator.Error!ParamsAndPrologue {
+fn localProp(
+    a: std.mem.Allocator,
+    b: B,
+    mutable: bool,
+    name: ast.Ident,
+    ty: ?ast.TypeRef,
+    init: Expr,
+) std.mem.Allocator.Error!Stmt {
+    const prop = try a.create(ast.Property);
+    prop.* = .{
+        .mutable = mutable,
+        .name = name,
+        .receiver_type = null,
+        .ty = if (ty) |t| try ast.box(a, t) else null,
+        .init = try ast.box(a, init),
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = b.gen_span,
+    };
+    return .{ .Decl = try ast.box(a, ast.Decl{ .Property = prop }) };
+}
+
+fn assignStmt(a: std.mem.Allocator, b: B, target: Expr, value: Expr) std.mem.Allocator.Error!Stmt {
+    return .{ .Assign = try ast.box(a, ast.AssignStmt{
+        .target = target,
+        .op = .Assign,
+        .value = value,
+        .span = b.gen_span,
+    }) };
+}
+
+fn buildParamsAndPrologue(
+    a: std.mem.Allocator,
+    b: B,
+    f: *const Function,
+    restartable: bool,
+    skippable: bool,
+) std.mem.Allocator.Error!ParamsAndPrologue {
+    var n_defaulted: usize = 0;
+    var widest_default: usize = 0;
+    if (f.body != null) {
+        for (f.params, 0..) |p, i| {
+            if (p.default == null) continue;
+            n_defaulted += 1;
+            widest_default = i;
+        }
+    }
+    // A restart re-enters with the values the scope captured, and a default is computed
+    // once for the life of the group: that needs both a group the restart jumps over and
+    // a mask saying which slots the original caller never supplied. Past the mask's reach
+    // the old one-shot prologue stands, which recomputes but never misreads a slot.
+    const group = restartable and n_defaulted > 0 and widest_default <= max_default_slot;
     var params = try a.alloc(Param, f.params.len + 2);
     var prologue: std.ArrayList(Stmt) = .empty;
+    var resolves: std.ArrayList(Stmt) = .empty;
+    // `$changed and <all flags>`: a restart hands the mask back in the bits it owns.
+    var mask: ?Expr = null;
+    var all_flags: i64 = 0;
+    var keep_mask: i64 = 0x7fffffff;
     for (f.params, 0..) |p, i| {
         params[i] = p;
         if (p.default == null or f.body == null) continue;
         const argname = try std.fmt.allocPrint(a, "{s}$arg", .{p.name.name});
         params[i].name = b.ident(argname);
         params[i].default = b.box(markerCall(b));
-        const cond = Expr{ .Binary = .{
+        const absent = Expr{ .Binary = .{
             .op = .IdentEq,
             .lhs = b.box(b.pathExpr(argname)),
             .rhs = b.box(markerCall(b)),
             .span = b.gen_span,
         } };
-        const pick = Expr{ .If = .{
-            .cond = b.box(cond),
-            .then_branch = p.default.?,
-            .else_branch = b.box(b.pathExpr(argname)),
+        if (!group) {
+            try prologue.append(a, try localProp(a, b, false, p.name, p.ty, .{ .If = .{
+                .cond = b.box(absent),
+                .then_branch = p.default.?,
+                .else_branch = b.box(b.pathExpr(argname)),
+                .span = b.gen_span,
+            } }));
+            continue;
+        }
+        const bit = defaultBit(i);
+        all_flags |= bit;
+        // `var p: T = p$arg` holds the marker until the defaults group resolves it, the
+        // value a caller passed, or — on a restart — the value the scope captured.
+        try prologue.append(a, try localProp(a, b, true, p.name, p.ty, b.pathExpr(argname)));
+        const term = Expr{ .If = .{
+            .cond = b.box(absent),
+            .then_branch = b.box(b.intLit(bit)),
+            .else_branch = b.box(b.intLit(0)),
             .span = b.gen_span,
         } };
-        const prop = try a.create(ast.Property);
-        prop.* = .{
-            .mutable = false,
-            .name = p.name,
-            .receiver_type = null,
-            .ty = try ast.box(a, p.ty),
-            .init = try ast.box(a, pick),
-            .delegate = null,
-            .getter = null,
-            .setter = null,
-            .is_abstract = false,
-            .is_open = false,
-            .is_override = false,
-            .is_lateinit = false,
-            .is_const = false,
-            .is_inline = false,
-            .is_expect = false,
-            .is_actual = false,
-            .setter_visibility = null,
-            .visibility = .Public,
-            .annotations = &.{},
+        mask = if (mask) |m| b.callMember(m, "or", b.slice1(term)) else term;
+        // An if EXPRESSION, not a statement: a statement would invite the walker's
+        // branch bracket inside the defaults group the skip path jumps over.
+        try resolves.append(a, try assignStmt(a, b, b.pathExpr(p.name.name), .{ .If = .{
+            .cond = b.box(defaultTaken(b, bit)),
+            .then_branch = p.default.?,
+            .else_branch = b.box(b.pathExpr(p.name.name)),
             .span = b.gen_span,
-        };
-        try prologue.append(a, .{ .Decl = try ast.box(a, ast.Decl{ .Property = prop }) });
+        } }));
+        keep_mask &= ~(@as(i64, 6) << (3 * @as(u6, tripleIdx(i))));
     }
     params[f.params.len] = b.param(composer_param, b.typeRef("Composer"));
     params[f.params.len + 1] = b.param(changed_param, b.typeRef("Int"));
-    return .{ .params = params, .prologue = try prologue.toOwnedSlice(a) };
+    if (!group) return .{ .params = params, .prologue = try prologue.toOwnedSlice(a) };
+
+    const carried = b.callMember(b.pathExpr(changed_param), "and", b.slice1(b.intLit(all_flags)));
+    try prologue.append(a, try localProp(a, b, false, b.ident(defaults_local), null, b.callMember(
+        carried,
+        "or",
+        b.slice1(mask.?),
+    )));
+
+    // `$changed and 1 == 0 || $composer.defaultsInvalid`: bit 0 is set only by a restart,
+    // so an ordinary call evaluates the defaults and a restart reuses what the scope
+    // captured, unless a state read inside a default changed.
+    const cond = Expr{ .Binary = .{
+        .op = .Or,
+        .lhs = b.box(.{ .Binary = .{
+            .op = .Eq,
+            .lhs = b.box(b.callMember(b.pathExpr(changed_param), "and", b.slice1(b.intLit(1)))),
+            .rhs = b.box(b.intLit(0)),
+            .span = b.gen_span,
+        } }),
+        .rhs = b.box(b.member(b.pathExpr(composer_param), "defaultsInvalid")),
+        .span = b.gen_span,
+    } };
+    var skip: std.ArrayList(Stmt) = .empty;
+    try skip.append(a, .{ .Expr = b.callMember(b.pathExpr(composer_param), "skipToGroupEnd", try a.alloc(Expr, 0)) });
+    if (skippable) {
+        // Values carried in from the scope, never re-established here: their triples read
+        // unknown so a child cannot skip on a certainty this call did not make.
+        try skip.append(a, try assignStmt(a, b, b.pathExpr(dirty_local), b.callMember(
+            b.pathExpr(dirty_local),
+            "and",
+            b.slice1(b.intLit(keep_mask)),
+        )));
+    }
+    const defaults = try a.alloc(Stmt, 3);
+    defaults[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "startDefaults", try a.alloc(Expr, 0)) };
+    defaults[1] = .{ .Expr = .{ .If = .{
+        .cond = b.box(cond),
+        .then_branch = b.box(.{ .Block = .{ .stmts = try resolves.toOwnedSlice(a), .span = b.gen_span } }),
+        .else_branch = b.box(.{ .Block = .{ .stmts = try skip.toOwnedSlice(a), .span = b.gen_span } }),
+        .span = b.gen_span,
+    } } };
+    defaults[2] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "endDefaults", try a.alloc(Expr, 0)) };
+    return .{ .params = params, .prologue = try prologue.toOwnedSlice(a), .defaults = defaults };
 }
 
 /// Returns a NEW `Function`, leaving the input unmutated; fresh nodes are
@@ -294,7 +442,7 @@ pub fn transformComposableFunction(
     // skippable: no probes, no skip branch.
     const skippable = root.emit_skip_calculus and fnIsSkippable(f, in_class, enclosing_class);
 
-    const pp = try buildParamsAndPrologue(a, b, f);
+    const pp = try buildParamsAndPrologue(a, b, f, true, skippable);
     const params = pp.params;
 
     const orig_stmts: []const Stmt = switch (f.body orelse return signatureOnly(f, params)) {
@@ -334,6 +482,14 @@ pub fn transformComposableFunction(
     for (pp.prologue) |*s| {
         try w.walkStmt(s);
         try out.append(a, s.*);
+    }
+    // The defaults group brackets itself, so the walker adds no branch groups of its own:
+    // the skip path jumps straight to `endDefaults` and must find nothing else opened.
+    if (pp.defaults.len != 0) {
+        const saved_groups = w.explicit_groups;
+        w.explicit_groups = true;
+        for (pp.defaults) |*s| try w.walkStmt(s);
+        w.explicit_groups = saved_groups;
     }
     // Skip calculus: probe every value parameter through `$composer.changed(p)`, which also
     // stores the value. The body executes on a change, a forced scope, or a busy composer.
@@ -382,8 +538,11 @@ pub fn transformComposableFunction(
                 b.slice1(b.pathExpr(p.name.name)),
             ), triple);
             if (p.default != null and f.body != null) {
-                const arg_name = try std.fmt.allocPrint(a, "{s}$arg", .{p.name.name});
-                try out.append(a, guardProbe(b, dirtyProbeIfPassed(b, arg_name, probe, triple), triple));
+                const taken = if (pp.defaults.len != 0)
+                    defaultTaken(b, defaultBit(pi))
+                else
+                    markerTaken(b, try std.fmt.allocPrint(a, "{s}$arg", .{p.name.name}));
+                try out.append(a, defaultedProbe(b, taken, guardProbe(b, probe, triple), triple));
             } else {
                 try out.append(a, guardProbe(b, probe, triple));
             }
@@ -405,17 +564,18 @@ pub fn transformComposableFunction(
     // `if ($composer.shouldExecute($dirty != 0 || !$composer.skipping, $dirty and 1))`:
     // the wrapper gives PausableComposition its pause points.
     var body_list: std.ArrayList(Stmt) = .empty;
+    for (pp.defaults) |s| try body_list.append(a, s);
     for (orig_stmts) |*s| {
         try w.walkStmt(@constCast(s));
         try body_list.append(a, s.*);
     }
     {
-        var inj = EpilogueInjector{ .a = a, .b = b, .fn_name = f.name.name, .value_params = params[0..f.params.len] };
+        var inj = EpilogueInjector{ .a = a, .b = b, .fn_name = f.name.name, .value_params = params[0..f.params.len], .has_defaults = pp.defaults.len != 0 };
         try inj.stmts(body_list.items);
     }
     if (!root.emit_skip_calculus) {
         for (body_list.items) |s| try out.append(a, s);
-        try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f.name.name, params[0..f.params.len]) });
+        try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f.name.name, params[0..f.params.len], pp.defaults.len != 0) });
         const plain_body = Block{ .stmts = try out.toOwnedSlice(a), .span = f.span };
         return withBody(f, params, .{ .Block = plain_body });
     }
@@ -458,7 +618,7 @@ pub fn transformComposableFunction(
         .else_branch = b.box(.{ .Block = .{ .stmts = skip_stmts, .span = b.gen_span } }),
         .span = b.gen_span,
     } } });
-    try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f.name.name, params[0..f.params.len]) });
+    try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f.name.name, params[0..f.params.len], pp.defaults.len != 0) });
 
     const new_body = Block{ .stmts = try out.toOwnedSlice(a), .span = f.span };
     return withBody(f, params, .{ .Block = new_body });
@@ -475,7 +635,7 @@ pub fn transformThreadedComposable(
     locals: ?*std.StringHashMap(void),
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
-    const pp = try buildParamsAndPrologue(a, b, f);
+    const pp = try buildParamsAndPrologue(a, b, f, false, false);
     const params = pp.params;
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
