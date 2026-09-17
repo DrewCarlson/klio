@@ -94,11 +94,10 @@ pub const FieldsTls = struct {
     super_write_owner: ?[]const u8 = null,
     anon_key_buf: [512]u8 = undefined,
 };
-/// Owner thread reads the global copy, every other thread its own.
-var fld_tls_owner: FieldsTls = .{};
-threadlocal var fld_tls_other: FieldsTls = .{};
+/// One copy per thread; see `runtime.tls_fast.PerThread`.
+const fld_tls = runtime.tls_fast.PerThread(FieldsTls);
 pub inline fn fldTls() *FieldsTls {
-    return if (runtime.tls_fast.isOwner()) &fld_tls_owner else &fld_tls_other;
+    return fld_tls.get();
 }
 
 /// Resolved once per `VmHost` view and reached through `self.tls` after that;

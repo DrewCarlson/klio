@@ -3122,7 +3122,7 @@ fn mextArmEnabled() bool {
 
 fn routeTraceOn(name: []const u8) bool {
     if (!route_trace_init) {
-        route_trace_val = if (std.c.getenv("KLIO_ROUTE")) |w| std.mem.span(w) else null;
+        route_trace_val = runtime.envOnce("KLIO_ROUTE");
         route_trace_init = true;
     }
     const w = route_trace_val orelse return false;

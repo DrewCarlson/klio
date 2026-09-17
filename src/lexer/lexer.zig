@@ -7,6 +7,16 @@
 //! tracks brace depth so nested braces stay balanced.
 
 const std = @import("std");
+
+/// `KLIO_DOLLAR_TRACE`, read once: the lexer meets a `$` in every template.
+var dollar_trace: ?bool = null;
+fn dollarTraceOn() bool {
+    return dollar_trace orelse blk: {
+        const on = @import("builtin").link_libc and std.c.getenv("KLIO_DOLLAR_TRACE") != null;
+        dollar_trace = on;
+        break :blk on;
+    };
+}
 const diagnostics = @import("diagnostics");
 const span = @import("span");
 
@@ -445,7 +455,7 @@ pub const Lexer = struct {
             if (b == '$') {
                 const n = self.multiDollarPrefixLen().?;
                 dollars = if (n > 255) 255 else @intCast(n);
-                if (@import("builtin").link_libc and std.c.getenv("KLIO_DOLLAR_TRACE") != null) {
+                if (dollarTraceOn()) {
                     const lo = if (self.pos > 80) self.pos - 80 else 0;
                     const hi = @min(self.pos + 80, self.src.len);
                     std.debug.print("[dollar-arm] file={d} pos={d} ctx=<{s}>\n", .{ self.file.int(), self.pos, self.src[lo..hi] });

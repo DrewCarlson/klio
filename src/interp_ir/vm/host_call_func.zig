@@ -1435,12 +1435,14 @@ fn missingActual(allocator: Allocator, f: *const Func) EvalResult {
 /// Direct-mapped memo of which parameters take a `fun interface`, a bitmask over the
 /// first 32. Keys are reusable `*const Func` addresses, so entries ride `gen`.
 const SamMaskEntry = struct { func_p: usize = 0, mask: u32 = 0, valid: bool = false, gen: u32 = 0 };
-threadlocal var sam_mask_cache: [1024]SamMaskEntry = @splat(.{});
+const SamMaskTls = struct { cache: [1024]SamMaskEntry = @splat(.{}) };
+const sam_mask_tls = runtime.tls_fast.PerThread(SamMaskTls);
 
 fn samParamMask(self: *VmHost, func: *const ir.Func) u32 {
     const key = @intFromPtr(func);
     const gen = host_call_member.dispatchCacheGen();
-    const slot = &sam_mask_cache[(key >> 4) % sam_mask_cache.len];
+    const cache = &sam_mask_tls.get().cache;
+    const slot = &cache[(key >> 4) % cache.len];
     if (slot.valid and slot.func_p == key and slot.gen == gen) return slot.mask;
     var mask: u32 = 0;
     for (func.params, 0..) |*p, i| {

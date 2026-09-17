@@ -107,6 +107,7 @@ pub fn parseFile(p: *Parser) KotlinFile {
         .file_annotations = file_annotations,
         .imports = imports,
         .decls = decls.toOwnedSlice(p.allocator) catch @panic("OOM in parseFile"),
+        .has_composable = p.saw_composable,
         .span = start.join(end),
     };
 }
@@ -805,6 +806,7 @@ pub fn parseUnescapedAnnotationCtx(
         _ = support.expect(p, .RParen, "`)`");
     }
     const end = prevSpan(p);
+    if (std.mem.eql(u8, path.items[path.items.len - 1].name, "Composable")) p.saw_composable = true;
     return .{
         .use_site = use_site,
         .path = path.toOwnedSlice(p.allocator) catch @panic("OOM"),

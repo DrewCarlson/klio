@@ -673,7 +673,8 @@ pub fn admArgKey(arg: *const Value) ?usize {
 }
 
 pub const TlAdmEntry = struct { ty: usize = 0, akey: usize = 0, gen: u32 = 0, verdict: u8 = 0 };
-pub threadlocal var tl_adm_cache: [4096]TlAdmEntry = @splat(.{});
+const AdmTls = struct { cache: [4096]TlAdmEntry = @splat(.{}) };
+const adm_tls = runtime.tls_fast.PerThread(AdmTls);
 
 /// Memoized front for the type-disproof adjudicator: entries are keyed on the
 /// param-type pointer and `admArgKey`, stamped with the dispatch cache generation.
@@ -681,7 +682,8 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     const akey = admArgKey(arg) orelse return argDefinitelyNotParamTypeUncached(self, param_ty, arg);
     const ty = @intFromPtr(param_ty);
     const h = (@as(u64, @intCast(ty)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(akey));
-    const e = &tl_adm_cache[@as(usize, @intCast((h ^ (h >> 17)) & (tl_adm_cache.len - 1)))];
+    const cache = &adm_tls.get().cache;
+    const e = &cache[@as(usize, @intCast((h ^ (h >> 17)) & (cache.len - 1)))];
     const gen = cacheGen();
     if (e.verdict != 0 and e.ty == ty and e.akey == akey and e.gen == gen) return e.verdict == 2;
     const v = argDefinitelyNotParamTypeUncached(self, param_ty, arg);

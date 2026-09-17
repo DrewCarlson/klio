@@ -101,6 +101,7 @@ fn runCli(a: std.mem.Allocator, args: std.process.Args) u8 {
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
+    runtime.process_start_ns = runtime.clockMonotonicNanos();
     // The program thread reads its per-thread interpreter state from ordinary
     // globals, every other thread from a threadlocal. Claim before any
     // interpreter thread exists.
@@ -197,8 +198,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                     runtime.leaktrack.report();
                 return rc;
             }
+            runtime.slab.poison_free = runtime.envOnce("KLIO_SLAB_POISON") != null;
             if (runtime.envOnce("KLIO_SLAB_TRACE")) |_| {
                 runtime.slab.trace_enabled = true;
+                runtime.slab.trace_all = runtime.envOnce("KLIO_SLAB_TRACE_ALL") != null;
                 runtime.slab.installTraceSignalDump();
                 const rc = runCli(runtime.slab.allocator, init.args);
                 runtime.slab.traceReport();

@@ -3426,10 +3426,24 @@ fn typeckThreads() usize {
     return n;
 }
 
+pub const EagerCallOptions = struct {
+    /// See `typeck.ModuleOptions.diagnostics`.
+    diagnostics: bool = true,
+};
+
 pub fn computeEagerCalls(
     gpa: std.mem.Allocator,
     combined: []const KotlinFile,
     native_fqns: []const []const u8,
+) ?std.AutoHashMap(span_mod.Span, span_mod.Span) {
+    return computeEagerCallsOpts(gpa, combined, native_fqns, .{});
+}
+
+pub fn computeEagerCallsOpts(
+    gpa: std.mem.Allocator,
+    combined: []const KotlinFile,
+    native_fqns: []const []const u8,
+    opts: EagerCallOptions,
 ) ?std.AutoHashMap(span_mod.Span, span_mod.Span) {
     const audit = runtime.envOnce("KLIO_EAGER_AUDIT") != null;
     if (audit) {
@@ -3437,14 +3451,40 @@ pub fn computeEagerCalls(
         for (combined) |*kf| ndecl += kf.decls.len;
         std.debug.print("[EAGER] {d} files / {d} top-level decls handed to the checker\n", .{ combined.len, ndecl });
     }
-    const r = resolver.resolveModuleWithNatives(gpa, combined, native_fqns) catch {
+    // The check's own memory goes once its tables are copied out below: for
+    // the stdlib that is the recorded type of every expression and a CFG per
+    // function, none of it read again.
+    var check_arena = std.heap.ArenaAllocator.init(gpa);
+    defer check_arena.deinit();
+    const ca = check_arena.allocator();
+    const t_stage0 = runtime.clockMonotonicNanos();
+    const r = resolver.resolveModuleWithNatives(ca, combined, native_fqns) catch {
         if (audit) std.debug.print("[EAGER] resolver failed; staying lazy\n", .{});
         return null;
     };
-    const tc = typeck.typecheckModuleOpts(gpa, combined, &r, .{ .body_threads = typeckThreads() }) catch {
+    const t_stage1 = runtime.clockMonotonicNanos();
+    var tc = typeck.typecheckModuleOpts(ca, combined, &r, .{ .body_threads = typeckThreads(), .diagnostics = opts.diagnostics }) catch {
         if (audit) std.debug.print("[EAGER] typeck failed; staying lazy\n", .{});
         return null;
     };
+    defer tc.deinit(ca);
+    if (runtime.envOnce("KLIO_TRACE_STDLIB_IMAGE") != null) {
+        const st = typeck.check.stage_timing;
+        std.debug.print("[stdlib-image]   stage: resolve {d}ms, check {d}ms (decls {d}ms, property inits {d}ms, bodies {d}ms on {d} threads, merge {d}ms)\n", .{
+            (t_stage1 - t_stage0) / 1_000_000,
+            (runtime.clockMonotonicNanos() - t_stage1) / 1_000_000,
+            (runtime.clockMonotonicNanos() - t_stage1 -| st.serial_ns -| st.pool_ns -| st.merge_ns) / 1_000_000,
+            st.serial_ns / 1_000_000,
+            st.pool_ns / 1_000_000,
+            st.threads,
+            st.merge_ns / 1_000_000,
+        });
+    }
+    // The contracts registry the check installed lives on the arena; leave a
+    // live-allocator one behind for the next check to replace.
+    defer typeck.check.resetUserInlineContracts(gpa);
+    var names = std.StringHashMap([]const u8).init(gpa);
+    defer names.deinit();
     // A builtin-header FnSig carries a synthetic span that can collide.
     var declared = std.AutoHashMap(span_mod.Span, void).init(gpa);
     defer declared.deinit();
@@ -3507,7 +3547,8 @@ pub fn computeEagerCalls(
     while (tit.next()) |e| {
         // A type inside a generic body is true only for the last instantiation.
         if (tc.types_instantiation_dependent.contains(e.key_ptr.*)) continue;
-        const head = eagerHeadOf(e.value_ptr, false) orelse continue;
+        var head = eagerHeadOf(e.value_ptr, false) orelse continue;
+        head.name = internName(gpa, &names, head.name) catch continue;
         tout.put(e.key_ptr.*, head) catch continue;
         tn += 1;
     }
@@ -3518,7 +3559,8 @@ pub fn computeEagerCalls(
         var cit = tc.expr_class.iterator();
         while (cit.next()) |e| {
             if (tout.contains(e.key_ptr.*)) continue;
-            tout.put(e.key_ptr.*, .{ .name = e.value_ptr.*, .nullable = false }) catch continue;
+            const name = internName(gpa, &names, e.value_ptr.*) catch continue;
+            tout.put(e.key_ptr.*, .{ .name = name, .nullable = false }) catch continue;
             cn_added += 1;
         }
     }
@@ -3526,7 +3568,10 @@ pub fn computeEagerCalls(
     ir.pending_eager_types = tout;
     var rout = std.AutoHashMap(span_mod.Span, []const u8).init(gpa);
     var rit = tc.lambda_recv_heads.iterator();
-    while (rit.next()) |e| rout.put(e.key_ptr.*, e.value_ptr.*) catch {};
+    while (rit.next()) |e| {
+        const name = internName(gpa, &names, e.value_ptr.*) catch continue;
+        rout.put(e.key_ptr.*, name) catch {};
+    }
     if (audit) std.debug.print("[EAGER] {d} lambda receiver heads recorded\n", .{rout.count()});
     ir.pending_eager_recv_heads = rout;
     var pout = std.AutoHashMap(span_mod.Span, ir.EagerParamShape).init(gpa);
@@ -3535,6 +3580,15 @@ pub fn computeEagerCalls(
     if (audit) std.debug.print("[EAGER] {d} param shapes recorded\n", .{pout.count()});
     ir.pending_eager_param_shapes = pout;
     return out;
+}
+
+/// One owned copy per distinct name: the tables outlive the check that
+/// spelled them, and the same few heads recur across every call site.
+fn internName(gpa: std.mem.Allocator, names: *std.StringHashMap([]const u8), s: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (names.get(s)) |owned| return owned;
+    const owned = try gpa.dupe(u8, s);
+    try names.put(owned, owned);
+    return owned;
 }
 
 fn eagerHeadOf(t: *const typeck.check.Type, nullable: bool) ?ir.EagerTypeHead {
@@ -3587,9 +3641,11 @@ fn tryImagePath(
     const msg = if (paths.len == 1) "error: no main function found" else "runtime error: no main function in module";
     const code = runBuiltModule(gpa, prepared.built, prepared.bindings, prepared.map, msg);
     if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
-        std.debug.print("[run] prepare {d}ms, execute {d}ms\n", .{
+        std.debug.print("[run] startup {d}ms, prepare {d}ms, execute {d}ms (rss {d}mb)\n", .{
+            (t_prep0 -| runtime.process_start_ns) / 1_000_000,
             (t_prep1 - t_prep0) / 1_000_000,
             (runtime.clockMonotonicNanos() - t_prep1) / 1_000_000,
+            (runtime.currentRssKb() orelse 0) / 1024,
         });
     }
     return code;
@@ -3665,6 +3721,22 @@ pub fn runBuiltModuleArgs(
     defer if (!compose_ui.hostedActive()) {
         span.active_map = null;
     };
+    // The build's scratch is freed but its pages are still resident; hand them
+    // back once before the program's own allocations start.
+    {
+        const t_trim = runtime.clockMonotonicNanos();
+        const before = runtime.slab.mapped_bytes.load(.monotonic);
+        if (runtime.envOnce("KLIO_SLAB_STAT") != null) runtime.slab.occupancyReport();
+        runtime.slab.reclaimAll();
+        if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+            std.debug.print("[run]   trim {d}ms: mapped {d}mb -> {d}mb (rss {d}mb)\n", .{
+                (runtime.clockMonotonicNanos() - t_trim) / 1_000_000,
+                before / (1024 * 1024),
+                runtime.slab.mapped_bytes.load(.monotonic) / (1024 * 1024),
+                (runtime.currentRssKb() orelse 0) / 1024,
+            });
+        }
+    }
     runtime.prof.maybeStart();
     const t_main = runtime.clockMonotonicNanos();
     const res = runMainBigStack(&vm, main, stdout.output());

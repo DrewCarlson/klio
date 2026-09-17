@@ -7,6 +7,7 @@
 //! have allocated them, so the module comes out the same either way.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ir = @import("ir");
 const ast = @import("ast");
@@ -82,6 +83,8 @@ const Shard = struct {
     thread: ?std.Thread = null,
     failed: bool = false,
     forked: bool = false,
+    fork_ns: u64 = 0,
+    busy_ns: u64 = 0,
 
     /// Fills the shard's own tables; the spawner's `thread` stays as it is.
     fn fork(self: *Shard, index: u32, main: *const Module, a: Allocator) Allocator.Error!void {
@@ -102,8 +105,10 @@ const Shard = struct {
         try m.class_index.appendSlice(a, main.class_index.items);
         m.func_index = .empty;
         try m.func_index.appendSlice(a, main.func_index.items);
-        m.func_name_index = try cloneListMap(FuncId, a, &main.func_name_index);
-        m.member_name_index = try cloneListMap(FuncId, a, &main.member_name_index);
+        // `func_name_index` and `member_name_index` stay the main module's:
+        // a body reads them and only the header and placement passes write
+        // them, and copying two maps of lists was most of a fork. `lower`
+        // checks that in debug builds.
         m.method_dispatch = try main.method_dispatch.clone();
         m.decl_ast_body = try main.decl_ast_body.clone();
         inline for (fid_maps) |name| @field(m, name) = try @field(main, name).clone();
@@ -136,8 +141,6 @@ const Shard = struct {
         m.classes.deinit(a);
         m.class_index.deinit(a);
         m.func_index.deinit(a);
-        releaseListMap(FuncId, a, &m.func_name_index);
-        releaseListMap(FuncId, a, &m.member_name_index);
         m.method_dispatch.deinit();
         m.decl_ast_body.deinit();
         inline for (fid_maps) |name| @field(m, name).deinit();
@@ -251,12 +254,17 @@ fn threadCount(n_jobs: usize) usize {
 }
 
 fn workerMain(work: *Work, shard: *Shard, index: u32) void {
+    defer runtime.slab.flushMagazines();
     // Each worker copies the module for itself: the copies are the pool's
     // serial cost otherwise, and the source is read-only while they are made.
+    const t_fork = runtime.clockMonotonicNanos();
     shard.fork(index, work.module, work.allocator) catch {
         shard.failed = true;
         return;
     };
+    shard.fork_ns = runtime.clockMonotonicNanos() - t_fork;
+    const t_busy = runtime.clockMonotonicNanos();
+    defer shard.busy_ns = runtime.clockMonotonicNanos() - t_busy;
     ir.build.installThreadState(work.build_state);
     ir.lower.inline_state.installThreadState(work.inline_state) catch {
         shard.failed = true;
@@ -297,6 +305,20 @@ pub fn lowerJob(m: *Module, job: Job, file_classes: *const overrides.FileClasses
     return ir.lower.lowerFunctionBodyInto(m, job.f, file_classes);
 }
 
+/// Entry and id counts of the tables the shards share with the main module,
+/// compared before and after the pool in debug builds: a body that wrote one
+/// would have written the main module.
+const SharedFootprint = struct { names: usize, name_ids: usize, members: usize, member_ids: usize };
+
+fn sharedFootprint(m: *const Module) SharedFootprint {
+    var out: SharedFootprint = .{ .names = m.func_name_index.count(), .name_ids = 0, .members = m.member_name_index.count(), .member_ids = 0 };
+    var it = m.func_name_index.valueIterator();
+    while (it.next()) |l| out.name_ids += l.items.len;
+    var mit = m.member_name_index.valueIterator();
+    while (mit.next()) |l| out.member_ids += l.items.len;
+    return out;
+}
+
 /// Lowers `jobs` on a pool and returns each body, its ids as a serial pass
 /// would have allocated them, ready to place in job order. Null when the pool
 /// did not run or a shard did something the merge cannot carry over; the
@@ -308,6 +330,7 @@ pub fn lower(ctx: *BuildCtx, jobs: []const Job) Allocator.Error!?[]Func {
     const a = ctx.module.registry.allocator;
     const t0 = runtime.clockMonotonicNanos();
     try ctx.module.warmLookupCaches();
+    const shared_before = if (builtin.mode == .Debug) sharedFootprint(ctx.module) else {};
 
     var work = Work{
         .jobs = jobs,
@@ -332,6 +355,9 @@ pub fn lower(ctx: *BuildCtx, jobs: []const Job) Allocator.Error!?[]Func {
     }
     if (spawned == 0) return null;
     for (shards[0..spawned]) |*s| s.thread.?.join();
+    if (builtin.mode == .Debug) {
+        std.debug.assert(std.meta.eql(shared_before, sharedFootprint(ctx.module)));
+    }
     if (work.next.load(.monotonic) < jobs.len) return error.OutOfMemory;
     for (shards[0..spawned]) |*s| {
         if (s.failed) return error.OutOfMemory;
@@ -386,6 +412,30 @@ pub fn lower(ctx: *BuildCtx, jobs: []const Job) Allocator.Error!?[]Func {
     if (module_trace.phase.on()) {
         const t2 = runtime.clockMonotonicNanos();
         std.debug.print("[lower] body pool: {d} bodies on {d} threads, lower {d}ms, merge {d}ms\n", .{ jobs.len, spawned, (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000 });
+        var ext_hits: u64 = 0;
+        var ext_misses: u64 = 0;
+        var recv_hits: u64 = 0;
+        var recv_misses: u64 = 0;
+        for (shards[0..spawned]) |*s| {
+            if (s.module.ext_resolve_cache) |c| {
+                ext_hits += c.hits;
+                ext_misses += c.misses;
+            }
+            if (s.module.recv_verdict_cache) |c| {
+                recv_hits += c.hits;
+                recv_misses += c.misses;
+            }
+        }
+        std.debug.print("[lower] body pool caches: ext-resolve hits {d} misses {d}, recv-verdict hits {d} misses {d}\n", .{ ext_hits, ext_misses, recv_hits, recv_misses });
+        var fork_max: u64 = 0;
+        var busy_max: u64 = 0;
+        var busy_min: u64 = std.math.maxInt(u64);
+        for (shards[0..spawned]) |*s| {
+            fork_max = @max(fork_max, s.fork_ns);
+            busy_max = @max(busy_max, s.busy_ns);
+            busy_min = @min(busy_min, s.busy_ns);
+        }
+        std.debug.print("[lower] body pool workers: fork max {d}ms, busy max {d}ms min {d}ms\n", .{ fork_max / 1_000_000, busy_max / 1_000_000, busy_min / 1_000_000 });
     }
     return out;
 }

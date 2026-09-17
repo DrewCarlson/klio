@@ -543,7 +543,7 @@ fn recordBareCallLambdaShapes(c: *CallCtx) Allocator.Error!void {
                 if (ok) {
                     if (common) |receiver| {
                         common = null;
-                        if (std.c.getenv("KLIO_LAR_TRACE") != null)
+                        if (runtime.envOnce("KLIO_LAR_TRACE") != null)
                             std.debug.print("[lar-site] site=common name={s} recv={s} s={d}..{d}\n", .{ cnm, receiver.name, args[args.len - 1].span().start, args[args.len - 1].span().end });
                         try b.recordLambdaArgRecvOwned(args[args.len - 1].span(), receiver);
                     }

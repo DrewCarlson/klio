@@ -24,14 +24,16 @@ const methodArgSig = virtual_tail.methodArgSig;
 /// One remembered `name slice -> canonical string` mapping. The canonical string is
 /// program-lifetime; `src` is a hint, and every hit is byte-compared before it is used.
 pub const NameIdSlot = struct { src: usize = 0, gen: u32 = 0, canon: []const u8 = &.{} };
-pub threadlocal var name_id_cache: [8192]NameIdSlot = @splat(.{});
+const NameIdTls = struct { cache: [8192]NameIdSlot = @splat(.{}) };
+const name_id_tls = runtime.tls_fast.PerThread(NameIdTls);
 
 /// Canonical pointer identity for a dispatch-cache method name. Runtime callable
 /// references carry collected String storage, so a raw byte address must never enter a
 /// program-lifetime key; the mapping is per source address, confirmed by byte compare.
 pub fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
     const src = @intFromPtr(name.ptr);
-    const slot = &name_id_cache[((src *% 0x9E3779B97F4A7C15) >> 32) % name_id_cache.len];
+    const cache = &name_id_tls.get().cache;
+    const slot = &cache[((src *% 0x9E3779B97F4A7C15) >> 32) % cache.len];
     if (slot.src == src and slot.gen == cacheGen() and slot.canon.len == name.len and std.mem.eql(u8, slot.canon, name)) {
         return @intFromPtr(slot.canon.ptr);
     }

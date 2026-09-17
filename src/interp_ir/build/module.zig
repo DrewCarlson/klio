@@ -124,7 +124,7 @@ pub const phase = struct {
     pub fn mark(name: []const u8) void {
         if (!on()) return;
         const now = runtime.clockMonotonicNanos();
-        std.debug.print("[lower] {s} {d}ms\n", .{ name, (now - last) / 1_000_000 });
+        std.debug.print("[lower] {s} {d}ms (rss {d}mb)\n", .{ name, (now - last) / 1_000_000, (runtime.currentRssKb() orelse 0) / 1024 });
         last = now;
     }
 
@@ -246,7 +246,13 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
 
     // `@Composable` lowering: composable functions are rewritten to thread the composer per
     // the Compose plugin ABI. The oracle spans this module's decls plus the baked base.
-    {
+    // Every collector below walks the whole module; a module whose parser saw no
+    // `@Composable`, over a base holding none, has nothing for them to find.
+    const any_composable = blk: {
+        for (files_in) |*f| if (f.has_composable) break :blk true;
+        break :blk if (base) |bsp| bsp.has_composables else false;
+    };
+    if (any_composable) {
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
@@ -602,6 +608,10 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         out_lifted,
         own_base,
     );
+    // The lifted copies in the build carry every declaration; the concatenated
+    // file's own arrays are dead.
+    allocator.free(combined.decls);
+    allocator.free(combined.imports);
     if (compose_pass.composeAuditOn()) {
         const ca = &compose_pass.compose_audit;
         std.debug.print(

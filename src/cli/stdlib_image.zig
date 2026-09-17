@@ -69,7 +69,12 @@ fn traceEnabled(gpa: Allocator) bool {
 
 fn trace(gpa: Allocator, comptime fmt: []const u8, args: anytype) void {
     if (!traceEnabled(gpa)) return;
-    io.printStderr(gpa, "[stdlib-image] " ++ fmt ++ "\n", args);
+    io.printStderr(gpa, "[stdlib-image] " ++ fmt ++ " (rss {d}mb)\n", args ++ .{rssMb()});
+}
+
+/// Resident set in MB, for the traces; 0 where the platform does not say.
+pub fn rssMb() u64 {
+    return (runtime.currentRssKb() orelse 0) / 1024;
 }
 
 fn disabled(gpa: Allocator) bool {
@@ -326,15 +331,18 @@ fn bakeAndWrite(gpa: Allocator, job: *const BakeJob) bool {
         return false;
     };
     const t_bake = runtime.clockMonotonicNanos();
+    defer gpa.free(bytes);
     writeAtomic(gpa, job.cache, job.image_path, bytes);
+    clearBakeMarker(gpa, job.image_path);
     pruneImages(gpa, job.cache);
     trace(gpa, "  serialize: bake {d}ms, write {d}ms", .{
         (t_bake - t0) / 1_000_000,
         (runtime.clockMonotonicNanos() - t_bake) / 1_000_000,
     });
-    trace(gpa, "baked {s} ({d} bytes; parse {d}ms, lower {d}ms, serialize {d}ms)", .{
+    trace(gpa, "baked {s} ({d} bytes, {d} inline forest nodes; parse {d}ms, lower {d}ms, serialize {d}ms)", .{
         job.hex.*,
         bytes.len,
+        interp_ir.image.inline_forest_nodes,
         job.parse_ms,
         job.lower_ms,
         (runtime.clockMonotonicNanos() - t0) / 1_000_000,
@@ -359,6 +367,9 @@ fn forkBake(gpa: Allocator, job: *const BakeJob) bool {
         if (v.len != 0 and !std.mem.eql(u8, v, "0")) return false;
     }
     const tracing = traceEnabled(gpa);
+    // The marker outlives a child that dies before it writes the image, so
+    // the next cold run can say so rather than staying cold in silence.
+    writeBakeMarker(gpa, job.cache, job.image_path);
     const pid = std.c.fork();
     if (pid < 0) return false;
     if (pid == 0) {
@@ -454,7 +465,10 @@ fn stageBaseEagerCalls(gpa: Allocator, asts: []const KotlinFile) void {
     // source extension pick is trustworthy here, unlike in a user program.
     typeck_mod.check.expr_calls.complete_universe = true;
     defer typeck_mod.check.expr_calls.complete_universe = false;
-    if (@import("commands.zig").computeEagerCalls(gpa, asts, &.{})) |ec| {
+    // The picks are all this run reads; `KLIO_STAGE_DIAG` runs the checker's
+    // diagnostic passes too, to compare against.
+    const opts: @import("commands.zig").EagerCallOptions = .{ .diagnostics = runtime.envOnce("KLIO_STAGE_DIAG") != null };
+    if (@import("commands.zig").computeEagerCallsOpts(gpa, asts, &.{}, opts)) |ec| {
         if (ir_mod.pending_eager_calls) |*old| old.deinit();
         ir_mod.pending_eager_calls = ec;
     }
@@ -800,6 +814,36 @@ fn tombstoneExists(gpa: Allocator, cache: []const u8, hex: [32]u8) bool {
     return true;
 }
 
+fn bakeMarkerPath(gpa: Allocator, image_path: []const u8) ?[]u8 {
+    return std.fmt.allocPrint(gpa, "{s}.baking", .{image_path}) catch null;
+}
+
+fn writeBakeMarker(gpa: Allocator, cache: []const u8, image_path: []const u8) void {
+    const path = bakeMarkerPath(gpa, image_path) orelse return;
+    defer gpa.free(path);
+    writeAtomic(gpa, cache, path, "baking");
+}
+
+fn clearBakeMarker(gpa: Allocator, image_path: []const u8) void {
+    const path = bakeMarkerPath(gpa, image_path) orelse return;
+    defer gpa.free(path);
+    var threaded = threadedIo(gpa);
+    defer threaded.deinit();
+    std.Io.Dir.cwd().deleteFile(threaded.io(), path) catch {};
+}
+
+/// True, and the marker cleared, when a background bake of this image was
+/// started and never finished.
+fn takeAbandonedBake(gpa: Allocator, image_path: []const u8) bool {
+    const path = bakeMarkerPath(gpa, image_path) orelse return false;
+    defer gpa.free(path);
+    var threaded = threadedIo(gpa);
+    defer threaded.deinit();
+    _ = std.Io.Dir.cwd().statFile(threaded.io(), path, .{}) catch return false;
+    std.Io.Dir.cwd().deleteFile(threaded.io(), path) catch {};
+    return true;
+}
+
 fn writeTombstone(gpa: Allocator, cache: []const u8, hex: [32]u8) void {
     const path = std.fmt.allocPrint(gpa, "{s}/stdlib-{s}.unbakeable", .{ cache, hex }) catch return;
     defer gpa.free(path);
@@ -917,12 +961,13 @@ fn bakeAndPrepare(
     {
         const t = report.timing;
         const staged = t.sources + t.register + t.lex_parse_wall;
-        trace(gpa, "  parse: sources {d}ms, register {d}ms, lex+parse {d}ms wall ({d} files on {d} threads; lex {d}ms, parse {d}ms summed; longest {d}ms for {d} bytes), stdlib-other {d}ms, packs {d}ms", .{
+        trace(gpa, "  parse: sources {d}ms, register {d}ms, lex+parse {d}ms wall ({d} files on {d} threads, {d} pieces; lex {d}ms, parse {d}ms summed; longest {d}ms for {d} bytes), stdlib-other {d}ms, packs {d}ms", .{
             t.sources / 1_000_000,
             t.register / 1_000_000,
             t.lex_parse_wall / 1_000_000,
             t.files,
             t.threads,
+            t.pieces,
             t.lex / 1_000_000,
             t.parse / 1_000_000,
             t.longest / 1_000_000,
@@ -949,6 +994,7 @@ fn bakeAndPrepare(
         if (tombstoneExists(gpa, cache, hex)) return null;
     }
 
+    if (takeAbandonedBake(gpa, image_path)) trace(gpa, "the previous background bake of {s} did not finish; baking again", .{hex});
     const tb_pre = runtime.clockMonotonicNanos();
     stageBaseEagerCalls(gpa, deps.asts);
     const tb_stage = runtime.clockMonotonicNanos();
@@ -996,7 +1042,9 @@ fn bakeAndPrepare(
     publishBaseEagerCalls(gpa, base);
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     span.active_map = map;
-    const built = interp_ir.build.buildModuleFilesExtend(gpa, base, user2.asts) catch return null;
+    // Built for this run alone: the bake child works on its own copy of the
+    // address space, and nothing in this process reads the base afterwards.
+    const built = interp_ir.build.buildModuleFilesExtendOwned(gpa, base, user2.asts) catch return null;
     return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };
 }
 

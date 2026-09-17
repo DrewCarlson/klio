@@ -247,7 +247,7 @@ pub fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *cons
     // vector) reorders the args once and enters the positional ladder.
     if (any_named and receiver.* == .Instance) {
         if (namedOrderKey(self, receiver, name, args, arg_names)) |k| {
-            const tslot = &caches.tl_perm_cache[tlSlot(k)];
+            const tslot = &caches.tl().perm[tlSlot(k)];
             var perm: ?root_mod.ProgramImage.NamedPerm = null;
             if (tslot.raw_plus != 0 and tslot.gen == cacheGen() and tslot.class_p == k.class_p and tslot.name_p == k.name_p and
                 tslot.sig == k.sig and tslot.n_args == k.n_args)
@@ -407,7 +407,7 @@ pub fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *cons
                     defer pg.deinit();
                     pg.get().named_perm_cache.put(k, perm) catch {};
                 }
-                caches.tl_perm_cache[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .gen = cacheGen(), .perm = perm };
+                caches.tl().perm[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .gen = cacheGen(), .perm = perm };
             }
         }
         return primary;
@@ -990,7 +990,7 @@ pub fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value
         return try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names);
     // Thread-local L1 over the perm map, off the shared reader lock.
     var perm: ?root_mod.ProgramImage.NamedPerm = null;
-    const tslot = &caches.tl_perm_cache[tlSlot(key)];
+    const tslot = &caches.tl().perm[tlSlot(key)];
     if (tslot.raw_plus != 0 and tslot.gen == cacheGen() and tslot.class_p == key.class_p and tslot.name_p == key.name_p and
         tslot.sig == key.sig and tslot.n_args == key.n_args)
     {

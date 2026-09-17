@@ -203,7 +203,7 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 .ty = declared,
                 .mutable = p.mutable,
                 .decl_span = p.name.span,
-                .class_name = cn,
+                .class_name = try self.internOpt(cn),
                 .decl_type_name = decl_type_name,
             });
 
@@ -396,7 +396,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             else
                 null;
             if (target) |cn| {
-                try self.expr_class.put(t.span, cn);
+                try self.expr_class.put(t.span, try self.internName(cn));
             }
             return .Unresolved;
         },
@@ -462,7 +462,7 @@ fn tyOfPath(self: *Checker, p: @FieldType(Expr, "Path")) Allocator.Error!Type {
             facts.gadt.deinit();
         }
         if (facts.narrowed_class) |cn| {
-            try self.expr_class.put(sp, cn);
+            try self.expr_class.put(sp, try self.internName(cn));
         }
         if (facts.narrowed) |narrowed| {
             return narrowed;
@@ -481,7 +481,7 @@ fn tyOfPath(self: *Checker, p: @FieldType(Expr, "Path")) Allocator.Error!Type {
             if (b.ebf) |ebf| {
                 if (sp.file.int() != ebf.file.int() or self.field_narrow_off > 0) {
                     if (ebf.public_class) |c| {
-                        try self.expr_class.put(sp, c);
+                        try self.expr_class.put(sp, try self.internName(c));
                     }
                     try self.ebf_outside.put(sp, .{
                         .head = ebf.public_class,
@@ -499,7 +499,7 @@ fn tyOfPath(self: *Checker, p: @FieldType(Expr, "Path")) Allocator.Error!Type {
                 try emitErr(self, msg, sp, codes.TYPE_VAR_NOT_DEFINITELY_ASSIGNED);
             }
             if (cn) |c| {
-                try self.expr_class.put(sp, c);
+                try self.expr_class.put(sp, try self.internName(c));
             }
             // Inside a branch narrowing a generic receiver, fold the
             // implied type-parameter substitution into the type.
@@ -527,7 +527,7 @@ fn tyOfPath(self: *Checker, p: @FieldType(Expr, "Path")) Allocator.Error!Type {
             }
         }
         if (self.classes.contains(name)) {
-            try self.expr_class.put(sp, name);
+            try self.expr_class.put(sp, try self.internName(name));
             return .Unresolved;
         }
         // Resolved by name but absent from these tables, as stdlib
@@ -545,7 +545,7 @@ fn tyOfMember(self: *Checker, expr: *const Expr, m: @FieldType(Expr, "Member")) 
         var facts = try narrowing.cfgSmartFactsAt(self, key, sp, false);
         defer facts.gadt.deinit();
         if (facts.narrowed_class) |cn| {
-            try self.expr_class.put(sp, cn);
+            try self.expr_class.put(sp, try self.internName(cn));
         }
         if (facts.narrowed) |narrowed| {
             var rt = try self.checkExpr(m.receiver, null);
@@ -572,7 +572,7 @@ fn tyOfCall(self: *Checker, c: @FieldType(Expr, "Call")) Allocator.Error!Type {
     if (c.callee.* == .Path and c.callee.Path.segments.len == 1) {
         const name = c.callee.Path.segments[0].name;
         if (self.classes.contains(name)) {
-            try self.expr_class.put(sp, name);
+            try self.expr_class.put(sp, try self.internName(name));
         }
     }
     // Unqualified `super.f(...)` needs exactly one contributing direct
@@ -932,7 +932,7 @@ fn tyOfWhen(self: *Checker, w: @FieldType(Expr, "When"), expected: ?*const Type)
             .ty = ty,
             .mutable = false,
             .decl_span = b.name.span,
-            .class_name = class_name,
+            .class_name = try self.internOpt(class_name),
             .decl_type_name = null,
         });
     }
@@ -1070,7 +1070,7 @@ fn tyOfAs(self: *Checker, as_e: @FieldType(Expr, "As")) Allocator.Error!Type {
     }
     var target = try convertTypeRefLossyH(a, &as_e.ty);
     if (classNameFromTyperef(&as_e.ty)) |cn| {
-        try self.expr_class.put(as_e.span, cn);
+        try self.expr_class.put(as_e.span, try self.internName(cn));
     }
     // Narrowing comes from the AssumeIs emitted for the cast.
     if (as_e.safe) {
@@ -1098,7 +1098,7 @@ fn tyOfAnonFun(self: *Checker, af: @FieldType(Expr, "AnonFun")) Allocator.Error!
             .ty = receiver_type,
             .mutable = false,
             .decl_span = null,
-            .class_name = receiver_class,
+            .class_name = try self.internOpt(receiver_class),
             .decl_type_name = receiver_class,
         });
         if (receiver_class) |cn| {
@@ -1281,7 +1281,7 @@ pub fn checkMemberAccess(
                 result = found[0];
                 found_as_member = true;
                 if (found[1]) |cn| {
-                    try self.expr_class.put(member_span, cn);
+                    try self.expr_class.put(member_span, try self.internName(cn));
                 }
                 // Inside the declaring scope the read narrows to the field
                 // type; outside, the public type stands and is recorded.
@@ -1291,7 +1291,7 @@ pub fn checkMemberAccess(
                         result.deinit(a);
                         result = try hit.ebf.field_ty.clone(a);
                         if (hit.ebf.field_class) |cn| {
-                            try self.expr_class.put(member_span, cn);
+                            try self.expr_class.put(member_span, try self.internName(cn));
                         }
                     } else {
                         const head: ?[]const u8 = switch (result.nonNull().*) {
@@ -1313,7 +1313,7 @@ pub fn checkMemberAccess(
             result.deinit(a);
             result = try ep.ty.clone(a);
             if (ep.return_class) |cn| {
-                try self.expr_class.put(member_span, cn);
+                try self.expr_class.put(member_span, try self.internName(cn));
             }
         }
     }

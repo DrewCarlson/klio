@@ -256,7 +256,29 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
 
     // A non-inline base function runs from its lowered IR, never its AST body, so stripping
     // those bodies drops dead trees while keeping dispatch metadata.
-    prune.stripDeadBodies(@constCast(base.lifted_decls), true);
+    // `KLIO_PRUNE_KEEP` leaves the stripped trees allocated: a cold-run failure
+    // that disappears under it is a pointer into a stripped body that
+    // `collectPinned` does not know about.
+    const released = blk: {
+        var pinned: prune.Pinned = .empty;
+        defer pinned.deinit(allocator);
+        {
+            const mg = base.built.module.borrow();
+            defer mg.deinit();
+            try prune.collectPinned(allocator, mg.get(), &pinned);
+        }
+        const free_with: ?Allocator = if (runtime.envOnce("KLIO_PRUNE_KEEP") != null) null else allocator;
+        break :blk prune.stripDeadBodies(@constCast(base.lifted_decls), true, free_with, &pinned);
+    };
+    if (runtime.envOnce("KLIO_TRACE_LOWER") != null) std.debug.print(
+        "[lower] strip-dead-bodies: {d} bodies, {d} nodes, {d}kb freed; {d} bodies pinned by lowered code\n",
+        .{ released.bodies, released.nodes, released.bytes / 1024, released.pinned_bodies },
+    );
+    {
+        const mg = base.built.module.borrowMut();
+        defer mg.deinit();
+        mg.get().dropLoweringCaches();
+    }
     @import("module.zig").phase.mark("base-bookkeeping");
 
     return base;

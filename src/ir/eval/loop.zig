@@ -115,8 +115,9 @@ pub fn runFlatLoop(
                     const cl = jit_loop.methodSeamPeek(site.req.func) orelse break :run;
                     if (site.req.args.items.len < site.req.func.params.len or
                         ev_state.evtls.jit_native_depth >= NATIVE_SLOT_BANK_DEPTH or cl.n_slots > 192) break :run;
-                    const fslots: []i64 = &ev_state.native_slot_bank[ev_state.evtls.jit_native_depth];
-                    const ftags: []u8 = &ev_state.native_tag_bank[ev_state.evtls.jit_native_depth];
+                    const banks = ev_state.native_banks.get();
+                    const fslots: []i64 = &banks.slot[ev_state.evtls.jit_native_depth];
+                    const ftags: []u8 = &banks.tag[ev_state.evtls.jit_native_depth];
                     ev_state.evtls.jit_native_depth += 1;
                     const fo = jit_loop.runFunc(cl, &.{}, site.req.args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
                     ev_state.evtls.jit_native_depth -= 1;
@@ -807,8 +808,9 @@ pub fn LoopTramp(comptime H: type) type {
                             ev_state.evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192)
                         {
                             // Per-depth rows from the thread's static bank: a stack `undefined` array is 0xaa-filled per call.
-                            const fslots: []i64 = &ev_state.native_slot_bank[ev_state.evtls.jit_native_depth];
-                            const ftags: []u8 = &ev_state.native_tag_bank[ev_state.evtls.jit_native_depth];
+                            const banks = ev_state.native_banks.get();
+                            const fslots: []i64 = &banks.slot[ev_state.evtls.jit_native_depth];
+                            const ftags: []u8 = &banks.tag[ev_state.evtls.jit_native_depth];
                             ev_state.evtls.jit_native_depth += 1;
                             const fo = jit_loop.runFunc(callee_cl, &.{}, argbuf[0..site.n_args], fslots[0..callee_cl.n_slots], ftags[0..callee_cl.n_regs], &call, tctx.user);
                             ev_state.evtls.jit_native_depth -= 1;

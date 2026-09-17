@@ -2,6 +2,7 @@
 //! arguments at the call site. Free functions over the shared `FuncBuilder`.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
@@ -1351,7 +1352,7 @@ fn inferReifiedTypeArgsRecv(
     for (f.params, 0..) |*p, i| {
         if (i >= ordered.len) break;
         const arg = ordered[i] orelse continue;
-        if (std.c.getenv("KLIO_UNIFY_TRACE") != null)
+        if (runtime.envOnce("KLIO_UNIFY_TRACE") != null)
             std.debug.print("[unify-fn] {s} p{d}={s}:{s}<{d}> arg={s}\n", .{ f.name.name, i, p.name.name, p.ty.name.name, p.ty.type_args.len, @tagName(std.meta.activeTag(arg.*)) });
         try unifyParamAgainstArg(allocator, &p.ty, arg, &tp_names, &subst, bb);
     }
@@ -1380,7 +1381,7 @@ fn inferReifiedTypeArgsRecv(
     // Fallback: unify the declared return against the call's expected type.
     if (expected) |exp| {
         if (f.return_type) |*ret| {
-            if (std.c.getenv("KLIO_UNIFY_TRACE") != null) {
+            if (runtime.envOnce("KLIO_UNIFY_TRACE") != null) {
                 std.debug.print("[unify-exp] {s} ret={s}<{d}> exp={s}<{d}>", .{ f.name.name, ret.name.name, ret.type_args.len, exp.name.name, exp.type_args.len });
                 for (exp.type_args) |*ta| std.debug.print(" [{s}{s}]", .{ if (ta.is_star) "*" else "", ta.ty.name.name });
                 std.debug.print("\n", .{});
@@ -1395,7 +1396,7 @@ fn inferReifiedTypeArgsRecv(
                 out[i] = t;
             }
         }
-        if (std.c.getenv("KLIO_UNIFY_TRACE") != null) {
+        if (runtime.envOnce("KLIO_UNIFY_TRACE") != null) {
             std.debug.print("[unify-out] {s} {s} subst={s} enclosing={s}\n", .{ f.name.name, tp.name.name, if (subst.get(tp.name.name)) |t| t.name.name else "-", if (bb) |b| (b.resolveReifiedTypeName(tp.name.name) orelse "-") else "-" });
         }
     }
@@ -1604,7 +1605,7 @@ fn unifyBareTypeParam(
             try subst.put(param_ty.name.name, aty.*);
             return true;
         }
-        if (std.c.getenv("KLIO_UNIFY_TRACE") != null) {
+        if (runtime.envOnce("KLIO_UNIFY_TRACE") != null) {
             const st = staticArgTypeRef(allocator, arg, bb);
             std.debug.print("[unify-tp] {s} arg={s} static={s}<{d}>\n", .{ param_ty.name.name, @tagName(std.meta.activeTag(arg.*)), if (st) |t| t.name.name else "-", if (st) |t| t.type_args.len else 0 });
         }
@@ -1928,7 +1929,7 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
                 written_name = dotted;
             }
         }
-        if (std.c.getenv("KLIO_CTORARG_TRACE") != null)
+        if (runtime.envOnce("KLIO_CTORARG_TRACE") != null)
             std.debug.print("[ctorarg] dotted={s} cid={?d}\n", .{ dotted, if (cid) |c| c.int() else null });
     }
     // A nested class referenced bare inside its declaring subtree lives in the class
@@ -2029,7 +2030,7 @@ pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const Func
         if (expr_lower.objectRefTypeRef(@constCast(b), arg)) |t| break :blk t;
         if (arg.* != .Call) return null;
         const derived_opt = static_call_type.staticCallReturnTypeRef(@constCast(b), arg) catch null;
-        if (std.c.getenv("KLIO_UNIFY_TRACE") != null) std.debug.print("[satr] call callee={s} derived={?s} nta={d} dargs={d} darg0={s}\n", .{ @tagName(std.meta.activeTag(arg.Call.callee.*)), if (derived_opt) |d| d.name else null, arg.Call.type_args.len, if (derived_opt) |d| d.args.len else 0, if (derived_opt) |d| (if (d.args.len != 0) d.args[0].name else "-") else "-" });
+        if (runtime.envOnce("KLIO_UNIFY_TRACE") != null) std.debug.print("[satr] call callee={s} derived={?s} nta={d} dargs={d} darg0={s}\n", .{ @tagName(std.meta.activeTag(arg.Call.callee.*)), if (derived_opt) |d| d.name else null, arg.Call.type_args.len, if (derived_opt) |d| d.args.len else 0, if (derived_opt) |d| (if (d.args.len != 0) d.args[0].name else "-") else "-" });
         const derived = derived_opt orelse return null;
         // A derived return whose arguments are still the callee's own type
         // parameters says nothing the head does not. An explicit type-argument list
@@ -2102,7 +2103,7 @@ fn explicitCallInstantiation(b: *const FuncBuilder, arg: *const Expr, head: []co
     };
     const head_s = if (std.mem.findScalarLast(u8, head, '.')) |d| head[d + 1 ..] else head;
     var found: ?TypeRef = null;
-    const tr = std.c.getenv("KLIO_UNIFY_TRACE") != null;
+    const tr = runtime.envOnce("KLIO_UNIFY_TRACE") != null;
     if (tr) std.debug.print("[eci] {s} head={s} cands={d} nta={d}\n", .{ cname, head, b.module.funcsBySimpleName(cname).len, call.type_args.len });
     for (b.module.funcsBySimpleName(cname)) |fid| {
         const f = b.module.funcById(fid) orelse continue;

@@ -87,6 +87,21 @@ pub const TypeCheck = struct {
     /// Ranking only. Separate from `expr_class`, which lowering reads as type
     /// evidence: a head good enough to rank is not one lowering can bind.
     rank_class: std.AutoHashMap(Span, []const u8),
+    /// What the body pass's workers allocated: the results above point into
+    /// these, so they live as long as the result does.
+    worker_arenas: []*std.heap.ArenaAllocator = &.{},
+
+    /// Frees the workers' memory. Everything else was allocated from the
+    /// allocator the check ran on; a caller that gave it an arena frees the
+    /// rest by dropping that.
+    pub fn deinit(self: *TypeCheck, allocator: Allocator) void {
+        for (self.worker_arenas) |arena| {
+            arena.deinit();
+            allocator.destroy(arena);
+        }
+        allocator.free(self.worker_arenas);
+        self.worker_arenas = &.{};
+    }
 
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
         return self.types.getPtr(sp);
@@ -132,6 +147,7 @@ pub fn typecheck(
         .lambda_param_shapes = tc.lambda_param_shapes,
         .expr_class = tc.expr_class,
         .rank_class = tc.rank_class,
+        .worker_arenas = try tc.worker_arenas.toOwnedSlice(allocator),
     };
 }
 
@@ -210,8 +226,13 @@ fn calleeNameIs(callee: *const Expr, name: []const u8) bool {
 /// Per-decl `Span.file` survives the merge, so cross-file visibility checks
 /// still work.
 pub const ModuleOptions = struct {
-    /// Threads for the body pass; above one, `allocator` must be thread-safe.
+    /// Threads for the body pass. Each worker allocates from an arena of its
+    /// own, so `allocator` need not be thread-safe.
     body_threads: usize = 1,
+    /// False skips the declaration-level diagnostic passes and merges from the
+    /// workers only what a reader of the call resolutions and types needs; the
+    /// stage that records a base's eager call picks reads nothing else.
+    diagnostics: bool = true,
 };
 
 pub fn typecheckModule(
@@ -221,6 +242,10 @@ pub fn typecheckModule(
 ) Allocator.Error!TypeCheck {
     return typecheckModuleOpts(allocator, files, resolution, .{});
 }
+
+/// Wall time of the last body check's phases, for the stage trace of a bake.
+pub const StageTiming = struct { serial_ns: u64 = 0, pool_ns: u64 = 0, merge_ns: u64 = 0, threads: usize = 0 };
+pub var stage_timing: StageTiming = .{};
 
 pub fn typecheckModuleOpts(
     allocator: Allocator,
@@ -233,6 +258,8 @@ pub fn typecheckModuleOpts(
     cfa.analyses.contracts.setUserInlineContracts(user_contracts);
     var tc = try Checker.new(allocator, resolution);
     tc.body_threads = opts.body_threads;
+    tc.report_diagnostics = opts.diagnostics;
+    stage_timing = .{};
     defer destroyQueryScratch(allocator, tc.query_scratch);
     defer destroySolveMemo(allocator, tc.solve_memo);
     if (types.pending_extern_decls) |ed| {
@@ -322,11 +349,19 @@ pub fn typecheckModuleOpts(
         .lambda_param_shapes = tc.lambda_param_shapes,
         .expr_class = tc.expr_class,
         .rank_class = tc.rank_class,
+        .worker_arenas = try tc.worker_arenas.toOwnedSlice(allocator),
     };
 }
 
 /// Backed by the page allocator, not the driver's phase arena, so this
 /// teardown is required even though everything else rides that arena.
+/// Replaces the inline-contracts registry a check left behind with an empty
+/// one on `allocator`: a caller that ran the check on an arena drops that
+/// arena, and the registry must not keep pointing into it.
+pub fn resetUserInlineContracts(allocator: Allocator) void {
+    cfa.analyses.contracts.setUserInlineContracts(cfa.analyses.contracts.UserInlineContracts.init(allocator));
+}
+
 fn destroyQueryScratch(allocator: Allocator, scratch: *std.heap.ArenaAllocator) void {
     scratch.deinit();
     allocator.destroy(scratch);
@@ -884,11 +919,29 @@ pub const Checker = struct {
     /// Spans recorded in `types` since the root inference session began; only
     /// these can carry its variables.
     types_journal: std.ArrayList(Span),
-    /// Threads for the body pass. Above one, `allocator` must be thread-safe.
+    /// Threads for the body pass; each worker allocates from an arena of its own.
     body_threads: usize,
+    /// See `ModuleOptions.diagnostics`.
+    report_diagnostics: bool = true,
+    /// The workers' arenas, handed to the result.
+    worker_arenas: std.ArrayList(*std.heap.ArenaAllocator),
+    /// One owned copy of every class name the checker records by span or
+    /// binding. A name read off a type would die with that type.
+    names: std.StringHashMap(void),
 
     pub const new = phases.new;
     pub const run = phases.run;
+
+    /// The checker's own copy of `s`, shared by every record of that name.
+    pub fn internName(self: *Checker, s: []const u8) Allocator.Error![]const u8 {
+        const gop = try self.names.getOrPut(s);
+        if (!gop.found_existing) gop.key_ptr.* = try self.allocator.dupe(u8, s);
+        return gop.key_ptr.*;
+    }
+
+    pub fn internOpt(self: *Checker, s: ?[]const u8) Allocator.Error!?[]const u8 {
+        return if (s) |x| try self.internName(x) else null;
+    }
 
     // Bound here so every per-aspect file calls them as `self.<name>(...)`.
     pub const declareTopLevel = decl.declareTopLevel;

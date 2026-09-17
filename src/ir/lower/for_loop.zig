@@ -1,6 +1,7 @@
 //! `for (x in xs) body` loop lowering, over the shared `FuncBuilder`.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
@@ -688,7 +689,7 @@ fn bindSingleLoopVar(b: *FuncBuilder, v: ast.Ident, iter: *const Expr, next_reg:
             .nullable = false,
             .args = &.{},
         });
-    } else if (std.c.getenv("KLIO_FORVAR_TRACE") != null) {
+    } else if (runtime.envOnce("KLIO_FORVAR_TRACE") != null) {
         std.debug.print("[forvar] {s} elem=null iter_tag={s} fn={s} splice={s}\n", .{ v.name, @tagName(std.meta.activeTag(iter.*)), build.currentRealFn() orelse "-", b.spliceRecvTy() orelse "-" });
     }
 }

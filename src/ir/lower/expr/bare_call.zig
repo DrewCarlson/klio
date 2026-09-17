@@ -1240,7 +1240,7 @@ fn emitImplicitThisCall(
             const uninstantiated = bareTypeParamHead(recv) or
                 ir.parseClassTypeParamIdentity(recv) != null;
             if (!(uninstantiated and b.lambdaArgRecv(trailing.span()) != null)) {
-                if (std.c.getenv("KLIO_LAR_TRACE") != null)
+                if (runtime.envOnce("KLIO_LAR_TRACE") != null)
                     std.debug.print("[lar-site] site=shape name={s} recv={s} s={d}..{d}\n", .{ name0, recv, trailing.span().start, trailing.span().end });
                 try b.recordLambdaArgRecvOwned(
                     trailing.span(),

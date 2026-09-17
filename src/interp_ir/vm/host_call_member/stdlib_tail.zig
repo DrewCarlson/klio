@@ -717,7 +717,7 @@ pub fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *cons
         // Thread-local L1: a hit avoids the shared program cell's reader lock.
         for ([2]?root_mod.ProgramImage.MemberResolveKey{ key, key_f }) |k_opt| {
             const k = k_opt orelse continue;
-            const e = &caches.tl_resolve_cache[tlResolveSlot(k)];
+            const e = &caches.tl().resolve[tlResolveSlot(k)];
             if (tlResolveMatch(e, k)) {
                 if (e.state == 1) return null;
                 return try dispatchWithReceiver(self, allocator, e.fqn, e.func.?, receiver, args);

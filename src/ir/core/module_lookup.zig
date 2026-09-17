@@ -98,6 +98,25 @@ pub fn ensureFuncBody(self: *const Module, func: *Func) bool {
     return func.blocks.len != 0;
 }
 
+/// Frees the caches only lowering reads: the extension resolution ring, the
+/// receiver verdicts and the supertype-name closures. A later lowering
+/// against this module rebuilds them on demand.
+pub fn dropLoweringCaches(self: *Module) void {
+    const cg = self.lookup_cache_gpa orelse return;
+    if (self.ext_resolve_cache) |c| {
+        c.arena.deinit();
+        cg.destroy(c);
+        self.ext_resolve_cache = null;
+    }
+    if (self.recv_verdict_cache) |c| {
+        c.clear(cg);
+        c.map.deinit(cg);
+        cg.destroy(c);
+        self.recv_verdict_cache = null;
+    }
+    self.registry.dropEvidenceSupers();
+}
+
 /// Fills every lookup cache a body lowering would otherwise fill on first
 /// use, so copies of the module made after this share them without writing.
 pub fn warmLookupCaches(self: *Module) Allocator.Error!void {
@@ -1119,8 +1138,8 @@ pub fn addClass(self: *Module, allocator: Allocator, class_in: Class) Allocator.
     const id = ClassId.from(@intCast(self.classes.items.len));
     class.id = id;
     try self.class_index.append(allocator, .{ .name = class.name, .id = id });
-    if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
-        if (std.mem.find(u8, class.name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ class.name, id.int() });
+    if (runtime.envOnce("KLIO_CIDX_TRACE")) |w| {
+        if (std.mem.find(u8, class.name, w) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ class.name, id.int() });
     }
     try self.classes.append(allocator, class);
     return id;
@@ -1285,8 +1304,8 @@ pub fn reserveClass(self: *Module, allocator: Allocator, name: []const u8, is_in
     if (self.classIndexEntryByName(name)) |id| return id;
     const id = ClassId.from(@intCast(self.classes.items.len));
     try self.class_index.append(allocator, .{ .name = name, .id = id });
-    if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
-        if (std.mem.find(u8, name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
+    if (runtime.envOnce("KLIO_CIDX_TRACE")) |w| {
+        if (std.mem.find(u8, name, w) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
     }
     try self.classes.append(allocator, .{
         .id = id,
@@ -1315,8 +1334,8 @@ pub fn reserveClassFqn(self: *Module, allocator: Allocator, name: []const u8, fq
     }
     const id = ClassId.from(@intCast(self.classes.items.len));
     try self.class_index.append(allocator, .{ .name = name, .id = id });
-    if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
-        if (std.mem.find(u8, name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
+    if (runtime.envOnce("KLIO_CIDX_TRACE")) |w| {
+        if (std.mem.find(u8, name, w) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
     }
     try self.classes.append(allocator, .{
         .id = id,

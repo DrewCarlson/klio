@@ -28,8 +28,19 @@ pub const TlMethodEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args
 /// `raw_plus` sentinel: the shared map had no entry when last probed. The only
 /// staleness is a later insert, so `miss_ttl` re-probes every 64th consult.
 pub const TL_ABSENT: u64 = std.math.maxInt(u64);
-pub threadlocal var tl_method_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
-pub threadlocal var tl_ext_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
+
+/// The per-thread L1 caches, one block per thread; see `runtime.tls_fast.PerThread`.
+pub const Tl = struct {
+    method: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{}),
+    ext: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{}),
+    perm: [TL_METHOD_CACHE_SIZE]TlPermEntry = @splat(.{}),
+    resolve: [TL_METHOD_CACHE_SIZE]TlResolveEntry = @splat(.{}),
+    intrinsic: [TL_METHOD_CACHE_SIZE]TlIntrinsicEntry = @splat(.{}),
+};
+const per_thread = runtime.tls_fast.PerThread(Tl);
+pub inline fn tl() *Tl {
+    return per_thread.get();
+}
 
 pub inline fn tlSlot(key: root_mod.ProgramImage.InstanceMethodKey) usize {
     const h = key.sig ^ (@as(u64, @intCast(key.class_p)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(key.name_p));
@@ -64,11 +75,9 @@ pub inline fn tlPutAbsent(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root
 }
 
 pub const TlPermEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u8 = 0, gen: u32 = 0, perm: root_mod.ProgramImage.NamedPerm = .{ .n = 0xFF, .src = @splat(0xFF) } };
-pub threadlocal var tl_perm_cache: [TL_METHOD_CACHE_SIZE]TlPermEntry = @splat(.{});
 
 /// Stdlib member-resolve L1. `state`: 0 empty, 1 confirmed-none, 2 resolved.
 pub const TlResolveEntry = struct { type_p: usize = 0, name_p: usize = 0, args_empty: bool = false, file: u32 = 0, argc: u32 = 0, state: u8 = 0, gen: u32 = 0, func: ?StdlibFn = null, fqn: []const u8 = "" };
-pub threadlocal var tl_resolve_cache: [TL_METHOD_CACHE_SIZE]TlResolveEntry = @splat(.{});
 
 pub inline fn tlResolveSlot(key: root_mod.ProgramImage.MemberResolveKey) usize {
     const h = (@as(u64, @intCast(key.type_p)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(key.name_p)) ^ @intFromBool(key.args_empty) ^ (@as(u64, key.file) << 32) ^ (@as(u64, key.argc) << 20);
@@ -81,7 +90,7 @@ pub inline fn tlResolveMatch(e: *const TlResolveEntry, key: root_mod.ProgramImag
 }
 
 pub fn tlResolveStore(key: root_mod.ProgramImage.MemberResolveKey, entry: root_mod.ProgramImage.MemberResolveEntry) void {
-    tl_resolve_cache[tlResolveSlot(key)] = .{
+    tl().resolve[tlResolveSlot(key)] = .{
         .type_p = key.type_p,
         .name_p = key.name_p,
         .args_empty = key.args_empty,
@@ -95,7 +104,7 @@ pub fn tlResolveStore(key: root_mod.ProgramImage.MemberResolveKey, entry: root_m
 }
 
 pub fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
-    switch (tlGet(&tl_method_cache, key)) {
+    switch (tlGet(&tl().method, key)) {
         .hit => |raw| return raw,
         .absent => return null,
         .unknown => {},
@@ -105,20 +114,20 @@ pub fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.Insta
         defer pg.deinit();
         break :blk pg.get().instance_method_cache.get(key);
     };
-    if (raw) |r| tlPut(&tl_method_cache, key, r) else tlPutAbsent(&tl_method_cache, key);
+    if (raw) |r| tlPut(&tl().method, key, r) else tlPutAbsent(&tl().method, key);
     return raw;
 }
 
 pub fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
     if (!ir.eval.dispatchCacheStable()) return;
-    tlPut(&tl_method_cache, key, raw);
+    tlPut(&tl().method, key, raw);
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().instance_method_cache.put(key, raw) catch {};
 }
 
 pub fn extMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
-    switch (tlGet(&tl_ext_cache, key)) {
+    switch (tlGet(&tl().ext, key)) {
         .hit => |raw| return raw,
         .absent => return null,
         .unknown => {},
@@ -128,13 +137,13 @@ pub fn extMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMetho
         defer pg.deinit();
         break :blk pg.get().ext_method_cache.get(key);
     };
-    if (raw) |r| tlPut(&tl_ext_cache, key, r) else tlPutAbsent(&tl_ext_cache, key);
+    if (raw) |r| tlPut(&tl().ext, key, r) else tlPutAbsent(&tl().ext, key);
     return raw;
 }
 
 pub fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: u32) void {
     if (!ir.eval.dispatchCacheStable()) return;
-    tlPut(&tl_ext_cache, key, fid);
+    tlPut(&tl().ext, key, fid);
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().ext_method_cache.put(key, fid) catch {};
@@ -142,10 +151,9 @@ pub fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMetho
 
 /// Pack-binding inline cache L1. `state`: 0 empty, 1 mirrored, 2 known-miss.
 pub const TlIntrinsicEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, state: u8 = 0, gen: u32 = 0, miss_ttl: u8 = 0, entry: root_mod.ProgramImage.MemberResolveEntry = .{ .func = null, .fqn = "" } };
-pub threadlocal var tl_intrinsic_cache: [TL_METHOD_CACHE_SIZE]TlIntrinsicEntry = @splat(.{});
 
 pub fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?root_mod.ProgramImage.MemberResolveEntry {
-    const e = &tl_intrinsic_cache[tlSlot(key)];
+    const e = &tl().intrinsic[tlSlot(key)];
     if (e.state != 0 and e.gen == cacheGen() and e.class_p == key.class_p and e.name_p == key.name_p and
         e.sig == key.sig and e.n_args == key.n_args)
     {

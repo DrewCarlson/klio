@@ -110,6 +110,8 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .solve_memo = solve_memo,
         .types_journal = .empty,
         .body_threads = 1,
+        .worker_arenas = .empty,
+        .names = std.StringHashMap(void).init(allocator),
     };
 }
 
@@ -152,6 +154,9 @@ pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
         }
     }
     try checkBodies(self, file.decls);
+    // Everything from here to the bodies only reports; a caller that reads
+    // the resolutions and types alone skips it.
+    if (!self.report_diagnostics) return;
     // Reified/inline, vararg and declaration-site variance diagnostics.
     for (file.decls) |*d| {
         try checkGenericsDecl(self, d);
@@ -3452,8 +3457,17 @@ const Worker = struct {
 /// between them is a top-level property's inferred type reaching the
 /// declarations after it, so the properties are checked first, in order, and
 /// their bindings replayed into each worker as it passes them.
+/// Monotonic nanoseconds for the phase timers; only differences matter, 0 without libc.
+fn nowNs() u64 {
+    if (comptime !@import("builtin").link_libc) return 0;
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
     const workers_n = bodyWorkers(self, decls.len);
+    const t_start = nowNs();
     if (workers_n < 2) {
         for (decls) |*d| try self.checkDecl(d);
         return;
@@ -3479,13 +3493,18 @@ fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
         }
     }
 
+    const t_pool = nowNs();
     var work = BodyWork{ .decls = decls, .write_backs = write_backs.items };
     const workers = try a.alloc(Worker, workers_n);
     defer a.free(workers);
     var forked: usize = 0;
-    defer for (workers[0..forked]) |*w| releaseWorker(self, w);
+    defer for (workers[0..forked]) |*w| releaseWorker(w);
     for (workers) |*w| {
-        w.* = .{ .checker = try forkWorker(self, &seed) };
+        // Everything the worker allocates lives in an arena the result owns.
+        const arena = try a.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        try self.worker_arenas.append(a, arena);
+        w.* = .{ .checker = try forkWorker(self, &seed, arena.allocator()) };
         forked += 1;
     }
     var spawned: usize = 0;
@@ -3496,8 +3515,15 @@ fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
     // Whatever failed to start leaves its share to the rest.
     if (spawned == 0) workerMain(&work, &workers[0]);
     for (workers[0..spawned]) |*w| w.thread.?.join();
+    const t_join = nowNs();
     if (work.failed.load(.monotonic)) return error.OutOfMemory;
     try mergeWorkers(self, workers, main_ranges.items, base_len);
+    root.stage_timing = .{
+        .serial_ns = t_pool - t_start,
+        .pool_ns = t_join - t_pool,
+        .merge_ns = nowNs() - t_join,
+        .threads = spawned,
+    };
 }
 
 fn bodyWorkers(self: *const Checker, n_decls: usize) usize {
@@ -3506,10 +3532,10 @@ fn bodyWorkers(self: *const Checker, n_decls: usize) usize {
 }
 
 /// A checker sharing the declaration tables and owning fresh result maps and
-/// stacks, its frame the seeded top level.
-fn forkWorker(self: *const Checker, seed: *const std.StringHashMap(root.Binding)) Allocator.Error!Checker {
-    const a = self.allocator;
+/// stacks on `a`, its frame the seeded top level.
+fn forkWorker(self: *const Checker, seed: *const std.StringHashMap(root.Binding), a: Allocator) Allocator.Error!Checker {
     var c = self.*;
+    c.allocator = a;
     c.types = std.AutoHashMap(root.Span, root.Type).init(a);
     c.resolved_calls = std.AutoHashMap(root.Span, root.ResolvedCall).init(a);
     c.lambda_recv_heads = std.AutoHashMap(root.Span, []const u8).init(a);
@@ -3523,7 +3549,7 @@ fn forkWorker(self: *const Checker, seed: *const std.StringHashMap(root.Binding)
     c.list_elem = std.AutoHashMap(root.Span, root.Type).init(a);
     c.diagnostics = root.DiagnosticSink.init();
     c.frames = .empty;
-    try c.frames.append(a, .{ .bindings = try seed.clone() });
+    try c.frames.append(a, .{ .bindings = try seed.cloneWithAllocator(a) });
     c.class_stack = .empty;
     c.fn_return_stack = .empty;
     c.label_stack = .empty;
@@ -3548,6 +3574,8 @@ fn forkWorker(self: *const Checker, seed: *const std.StringHashMap(root.Binding)
     c.solve_memo.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     c.types_journal = .empty;
     c.body_threads = 1;
+    c.worker_arenas = .empty;
+    c.names = std.StringHashMap(void).init(a);
     return c;
 }
 
@@ -3599,10 +3627,12 @@ fn mergeWorkers(self: *Checker, workers: []Worker, main_ranges: []const DiagRang
         try moveEntries(&self.rank_class, &c.rank_class);
         try moveEntries(&self.list_elem, &c.list_elem);
         try moveEntries(&self.types_instantiation_dependent, &c.types_instantiation_dependent);
+        if (!self.report_diagnostics) continue;
         try moveEntries(&self.cfgs, &c.cfgs);
         try moveEntries(&self.lowerings, &c.lowerings);
         try moveEntries(&self.ebf_outside, &c.ebf_outside);
     }
+    if (!self.report_diagnostics) return;
     // Declaration order, as a sequential pass would have emitted them.
     var ordered: std.ArrayList(OrderedDiag) = .empty;
     defer ordered.deinit(a);
@@ -3620,50 +3650,14 @@ fn mergeWorkers(self: *Checker, workers: []Worker, main_ranges: []const DiagRang
     for (ordered.items) |e| try self.diagnostics.diagnostics.append(a, e.diag);
 }
 
-/// Frees what a worker still holds after its results moved to the module checker.
-fn releaseWorker(self: *Checker, w: *Worker) void {
-    const a = self.allocator;
+/// Frees a worker's scratch. Its results and everything else it allocated
+/// live in its arena, which the result now owns.
+fn releaseWorker(w: *Worker) void {
     const c = &w.checker;
-    c.types.deinit();
-    c.resolved_calls.deinit();
-    c.lambda_recv_heads.deinit();
-    c.lambda_param_shapes.deinit();
-    c.nothing_spans.deinit();
-    {
-        var it = c.nothing_by_fn.valueIterator();
-        while (it.next()) |m| m.deinit();
-        c.nothing_by_fn.deinit();
-    }
-    {
-        var it = c.reach_cache.valueIterator();
-        while (it.next()) |e| a.free(e.reachable);
-        c.reach_cache.deinit();
-    }
-    c.expr_class.deinit();
-    c.rank_class.deinit();
-    c.list_elem.deinit();
-    c.diagnostics.diagnostics.deinit(a);
-    for (c.frames.items) |*f| f.deinit();
-    c.frames.deinit(a);
-    c.class_stack.deinit(a);
-    c.fn_return_stack.deinit(a);
-    c.label_stack.deinit(a);
-    c.public_inline_stack.deinit(a);
-    c.suspend_context_stack.deinit(a);
-    c.reified_type_params.deinit(a);
-    c.type_params_in_scope.deinit(a);
-    c.dsl_receiver_stack.deinit(a);
-    c.cfgs.deinit();
-    c.lowerings.deinit();
-    c.cfg_fn_stack.deinit(a);
-    c.types_instantiation_dependent.deinit();
-    c.ebf_outside.deinit();
     c.query_scratch.deinit();
-    a.destroy(c.query_scratch);
+    c.allocator.destroy(c.query_scratch);
     c.solve_memo.arena.deinit();
-    a.destroy(c.solve_memo);
-    c.types_journal.deinit(a);
-    w.ranges.deinit(a);
+    c.allocator.destroy(c.solve_memo);
 }
 
 test {

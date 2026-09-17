@@ -410,8 +410,9 @@ pub fn evalWithCapturesChained(
             .run => |cl| if (args.items.len >= func.params.len and
                 ev_state.evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and cl.n_slots <= 192)
             {
-                const fslots: []i64 = &ev_state.native_slot_bank[ev_state.evtls.jit_native_depth];
-                const ftags: []u8 = &ev_state.native_tag_bank[ev_state.evtls.jit_native_depth];
+                const banks = ev_state.native_banks.get();
+                const fslots: []i64 = &banks.slot[ev_state.evtls.jit_native_depth];
+                const ftags: []u8 = &banks.tag[ev_state.evtls.jit_native_depth];
                 ev_state.evtls.jit_native_depth += 1;
                 const fo = jit_loop.runFunc(cl, &.{}, args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
                 ev_state.evtls.jit_native_depth -= 1;

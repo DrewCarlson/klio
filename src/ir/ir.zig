@@ -810,6 +810,7 @@ pub const Module = struct {
     pub const extResolveCache = m_resolve_call.extResolveCache;
     pub const declaredWithBody = m_lookup.declaredWithBody;
     pub const warmLookupCaches = m_lookup.warmLookupCaches;
+    pub const dropLoweringCaches = m_lookup.dropLoweringCaches;
     pub const recvVerdictCache = m_resolve_call.recvVerdictCache;
     pub const resolveMemberCall = m_resolve_call.resolveMemberCall;
     pub const dispatchForTarget = m_resolve_call.dispatchForTarget;

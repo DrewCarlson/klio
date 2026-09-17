@@ -446,10 +446,10 @@ pub fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8
 /// return head.
 pub fn propInitCallHead(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {
     const p = inline_state.memberPropAst(owner, name) orelse {
-        if (std.c.getenv("KLIO_PROPHEAD_TRACE") != null) std.debug.print("[prophead-lazy] no ast for {s}.{s}\n", .{ owner, name });
+        if (runtime.envOnce("KLIO_PROPHEAD_TRACE") != null) std.debug.print("[prophead-lazy] no ast for {s}.{s}\n", .{ owner, name });
         return null;
     };
-    if (std.c.getenv("KLIO_PROPHEAD_TRACE") != null) std.debug.print("[prophead-lazy] {s}.{s} ty={} init={}\n", .{ owner, name, p.ty != null, p.init != null });
+    if (runtime.envOnce("KLIO_PROPHEAD_TRACE") != null) std.debug.print("[prophead-lazy] {s}.{s} ty={} init={}\n", .{ owner, name, p.ty != null, p.init != null });
     if (p.ty != null) return null;
     const init = p.init orelse return null;
     if (init != .Call) return null;

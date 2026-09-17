@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 const applicability = @import("applicability");
 const Allocator = std.mem.Allocator;
 const root_ir = @import("../ir.zig");
@@ -178,8 +179,8 @@ pub fn topLevelPropTypeHeadTiered(
     caller_file: FileId,
 ) ?[]const u8 {
     const list = self.registry.top_level_prop_pkgs.get(name) orelse {
-        if (std.c.getenv("KLIO_TLP_TRACE")) |w| {
-            if (std.mem.eql(u8, std.mem.span(w), name))
+        if (runtime.envOnce("KLIO_TLP_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name))
                 std.debug.print("[tlp] {s} NO-LIST caller_pkg={s}\n", .{ name, caller_pkg });
         }
         return null;
@@ -188,8 +189,8 @@ pub fn topLevelPropTypeHeadTiered(
     var found: ?[]const u8 = null;
     for (list.items) |pd| {
         const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
-        if (std.c.getenv("KLIO_TLP_TRACE")) |w| {
-            if (std.mem.eql(u8, std.mem.span(w), name))
+        if (runtime.envOnce("KLIO_TLP_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name))
                 std.debug.print("[tlp] {s} fqn={s} pkg={s} tier={d} head={s} caller_pkg={s}\n", .{ name, pd.fqn, pd.package, t, self.registry.top_level_prop_type_heads.get(pd.fqn) orelse "-", caller_pkg });
         }
         if (t == 255) continue;

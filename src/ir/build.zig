@@ -2,6 +2,7 @@
 //! `lower` emits through these; kept separate from the type definitions.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("ir.zig");
 const span_mod = @import("span");
@@ -261,7 +262,7 @@ pub fn fileOrPkgTypeRename(name: []const u8, file: u32) ?[]const u8 {
     const pkgs = lower_file_pkgs orelse return null;
     const pkg = pkgs.get(span_mod.FileId.from(file)) orelse return null;
     const r = pkgTypeRename(name, pkg);
-    if (r != null and std.c.getenv("KLIO_RENAME_TRACE") != null)
+    if (r != null and runtime.envOnce("KLIO_RENAME_TRACE") != null)
         std.debug.print("[rnm-pkg] {s} pkg={s} -> {s} file={d}\n", .{ name, pkg, r.?, file });
     return r;
 }
@@ -1293,7 +1294,7 @@ pub const FuncBuilder = struct {
     }
 
     pub fn bind(self: *FuncBuilder, name: []const u8, reg: Reg) Allocator.Error!void {
-        if (std.c.getenv("KLIO_THIS_TRACE") != null and std.mem.eql(u8, name, "this")) {
+        if (runtime.envOnce("KLIO_THIS_TRACE") != null and std.mem.eql(u8, name, "this")) {
             std.debug.print("[bind-this] reg={d} depth={d}\n", .{ reg.int(), self.scopes.items.len });
         }
         try self.scopes.items[self.scopes.items.len - 1].put(name, reg);
@@ -1668,7 +1669,7 @@ pub const FuncBuilder = struct {
         sp: span_mod.Span,
         receiver: TypeRef,
     ) Allocator.Error!void {
-        if (std.c.getenv("KLIO_LAR_TRACE") != null) {
+        if (runtime.envOnce("KLIO_LAR_TRACE") != null) {
             std.debug.print("[lar-put] f={d} s={d}..{d} ty={s}\n", .{ sp.file.int(), sp.start, sp.end, receiver.name });
         }
         var owned = receiver;
@@ -1680,7 +1681,7 @@ pub const FuncBuilder = struct {
     }
 
     pub fn lambdaArgRecv(self: *const FuncBuilder, sp: span_mod.Span) ?TypeRef {
-        if (std.c.getenv("KLIO_LAR_TRACE") != null) {
+        if (runtime.envOnce("KLIO_LAR_TRACE") != null) {
             std.debug.print("[lar-get] f={d} s={d}..{d} hit={}\n", .{ sp.file.int(), sp.start, sp.end, self.lambda_arg_recv.get(sp) != null });
         }
         return self.lambda_arg_recv.get(sp);
@@ -1728,10 +1729,10 @@ pub const FuncBuilder = struct {
     }
     /// Takes ownership of `ty`.
     pub fn setLocalDeclTypeOwned(self: *FuncBuilder, name: []const u8, ty: TypeRef) Allocator.Error!void {
-        if (std.c.getenv("KLIO_VALTY_TRACE")) |w| {
-            if (std.mem.eql(u8, std.mem.span(w), name)) {
+        if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name)) {
                 std.debug.print("[valty] WRITE {s} = {s}\n", .{ name, ty.name });
-                if (std.c.getenv("KLIO_VALTY_STACK") != null) {
+                if (runtime.envOnce("KLIO_VALTY_STACK") != null) {
                     std.debug.dumpCurrentStackTrace(.{});
                 }
             }
@@ -2519,7 +2520,20 @@ pub const FuncBuilder = struct {
         return null;
     }
 
+    /// A scope map probe with the name's hash computed once for the whole
+    /// scope chain: every level of the chain probes with the same hash.
+    const PreHashed = struct {
+        h: u64,
+        pub fn hash(self: @This(), _: []const u8) u64 {
+            return self.h;
+        }
+        pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+    };
+
     pub fn resolve(self: *const FuncBuilder, name: []const u8) ?Reg {
+        const ctx = PreHashed{ .h = std.hash_map.hashString(name) };
         // The inline fn's parameter scopes are not in a spliced lambda's
         // lexical scope: search its own scopes, then the caller scopes.
         if (self.lambda_splice_resolve) |w| {
@@ -2527,7 +2541,7 @@ pub const FuncBuilder = struct {
             var i = top;
             while (i > w.own_base) {
                 i -= 1;
-                if (self.scopes.items[i].get(name)) |r| return r;
+                if (self.scopes.items[i].getAdapted(name, ctx)) |r| return r;
             }
             var j = @min(w.caller_depth, top);
             while (j > 0) {
@@ -2541,7 +2555,7 @@ pub const FuncBuilder = struct {
                     }
                 }
                 if (banded) continue;
-                if (self.scopes.items[j].get(name)) |r| return r;
+                if (self.scopes.items[j].getAdapted(name, ctx)) |r| return r;
             }
             return null;
         }
@@ -2549,7 +2563,7 @@ pub const FuncBuilder = struct {
         const stop = self.splice_body_floor orelse 0;
         while (i > stop) {
             i -= 1;
-            if (self.scopes.items[i].get(name)) |r| return r;
+            if (self.scopes.items[i].getAdapted(name, ctx)) |r| return r;
         }
         return null;
     }
@@ -2713,7 +2727,7 @@ pub const FuncBuilder = struct {
         };
         if (!S.checked) {
             S.checked = true;
-            if (std.c.getenv("KLIO_EMIT_TRACE")) |v| S.value = std.mem.span(v);
+            if (runtime.envOnce("KLIO_EMIT_TRACE")) |v| S.value = v;
         }
         return S.value;
     }
@@ -2724,8 +2738,8 @@ pub const FuncBuilder = struct {
     fn pushTraceInit() void {
         if (push_trace_checked) return;
         push_trace_checked = true;
-        if (std.c.getenv("KLIO_GF_TRACE")) |w| gf_trace = std.mem.span(w);
-        if (std.c.getenv("KLIO_LG_TRACE")) |w| lg_trace = std.mem.span(w);
+        if (runtime.envOnce("KLIO_GF_TRACE")) |w| gf_trace = w;
+        if (runtime.envOnce("KLIO_LG_TRACE")) |w| lg_trace = w;
     }
 
     pub fn push(self: *FuncBuilder, inst: Inst) Allocator.Error!void {
@@ -2765,7 +2779,7 @@ pub const FuncBuilder = struct {
                             .String => |n| if (std.mem.eql(u8, n, want)) {
                                 std.debug.print("[emit] CallMember name={s} in_fn={s}\n", .{ n, currentRealFn() orelse "-" });
                                 // `KLIO_EMIT_STACK`: name the emitting arm.
-                                if (std.c.getenv("KLIO_EMIT_STACK") != null) {
+                                if (runtime.envOnce("KLIO_EMIT_STACK") != null) {
                                     std.debug.dumpCurrentStackTrace(.{});
                                 }
                             },

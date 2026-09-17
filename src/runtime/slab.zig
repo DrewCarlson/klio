@@ -104,7 +104,7 @@ pub var trace_all: bool = false;
 /// `KLIO_CELL_TRACE`: the same for small slab cells, whose alloc and free are
 /// guaranteed-paired unlike the higher-level leak locator.
 pub var cell_trace_enabled: bool = false;
-const TRACE_FRAMES = 14;
+const TRACE_FRAMES = 30;
 const MapRec = struct { size: usize, addrs: [TRACE_FRAMES]usize, n: usize };
 var trace_map: std.AutoHashMapUnmanaged(usize, MapRec) = .empty;
 var trace_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -453,10 +453,19 @@ fn allocSmall(len: usize) ?[*]u8 {
     return first;
 }
 
+/// `KLIO_SLAB_POISON`: overwrite a freed cell so a reader of freed memory
+/// sees garbage at once instead of the old contents.
+pub var poison_free: bool = false;
+
 fn freeSmall(ptr: [*]u8) void {
     const slab = slabOf(ptr);
     const ci = slab.class_idx;
     const cs = &class_states[ci];
+    if (builtin.mode == .Debug) {
+        const data_start = std.mem.alignForward(usize, @intFromPtr(slab) + @sizeOf(SlabHeader), CELL_ALIGN);
+        std.debug.assert((@intFromPtr(ptr) - data_start) % slab.cell_size == 0);
+    }
+    if (poison_free) @memset(ptr[0..slab.cell_size], 0xAA);
     if (cell_trace_enabled) {
         cs.lock.lock();
         defer cs.lock.unlock();
@@ -623,8 +632,56 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
     }
 }
 
+/// `KLIO_SLAB_STAT`: per size class, the spans on the partial list with their
+/// free and dormant cells, and the parked spares. A full span is off every
+/// list, so what is not counted here is live.
+pub fn occupancyReport() void {
+    var free_total: usize = 0;
+    var dormant_total: usize = 0;
+    var spare_total: usize = 0;
+    std.debug.print("[slab] class  cell  partial   free-cells  dormant  spare\n", .{});
+    for (&class_states, 0..) |*cs, ci| {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        var partial: usize = 0;
+        var free_cells: usize = 0;
+        var dormant: usize = 0;
+        var s = cs.partial;
+        while (s) |p| : (s = p.next) {
+            partial += 1;
+            free_cells += p.free_count;
+            dormant += p.dormant_cells;
+        }
+        if (partial == 0 and cs.spare_count == 0) continue;
+        const sz = class_sizes[ci];
+        std.debug.print("[slab] {d:>5} {d:>5} {d:>8} {d:>12} {d:>8} {d:>6}\n", .{ ci, sz, partial, free_cells, dormant, cs.spare_count });
+        free_total += free_cells * sz;
+        dormant_total += dormant * sz;
+        spare_total += @as(usize, cs.spare_count) * SLAB;
+    }
+    const mapped = mapped_bytes.load(.monotonic);
+    std.debug.print("[slab] mapped {d}kb: free {d}kb, dormant {d}kb, spare {d}kb, live+headers {d}kb\n", .{
+        mapped / 1024,
+        free_total / 1024,
+        dormant_total / 1024,
+        spare_total / 1024,
+        (mapped -| free_total -| dormant_total -| spare_total) / 1024,
+    });
+}
+
 /// The GC's `release_to_os` hook, run stop-the-world after a sweep.
 pub fn reclaimDormant() void {
+    reclaimWith(RECLAIM_IDLE_PASSES);
+}
+
+/// One-off trim between two phases of a run (the program build and its
+/// execution): the build's burst of scratch is not coming back, so every
+/// parked spare goes now instead of ageing out over later collections.
+pub fn reclaimAll() void {
+    reclaimWith(1);
+}
+
+fn reclaimWith(idle_passes: u32) void {
     const pg = std.heap.pageSize();
     if (SLAB / pg > MAX_PAGES) return; // runtime page larger than the scan bound
     for (&class_states, 0..) |*cs, ci| {
@@ -638,7 +695,7 @@ pub fn reclaimDormant() void {
         while (sp) |s| {
             const next = s.next;
             s.idle_passes +|= 1;
-            if (s.idle_passes >= RECLAIM_IDLE_PASSES) {
+            if (s.idle_passes >= idle_passes) {
                 unmapRaw(@ptrCast(s), SLAB);
             } else {
                 s.next = keep;

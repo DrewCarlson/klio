@@ -161,10 +161,12 @@ pub const EvalTls = struct {
 pub const NATIVE_SLOT_BANK_DEPTH: usize = 192;
 
 /// One disjoint slot/tag row per nesting level, so re-entrancy is safe.
-/// Thread-local statics zero once; a stack buffer is 0xaa-filled per call.
-pub threadlocal var native_slot_bank: [NATIVE_SLOT_BANK_DEPTH][192]i64 = @splat(@splat(0));
-
-pub threadlocal var native_tag_bank: [NATIVE_SLOT_BANK_DEPTH][192]u8 = @splat(@splat(0));
+/// Per-thread statics zero once; a stack buffer is 0xaa-filled per call.
+pub const NativeBanks = struct {
+    slot: [NATIVE_SLOT_BANK_DEPTH][192]i64 = @splat(@splat(0)),
+    tag: [NATIVE_SLOT_BANK_DEPTH][192]u8 = @splat(@splat(0)),
+};
+pub const native_banks = runtime.tls_fast.PerThread(NativeBanks);
 
 /// One implicit receiver on the enclosing-`this` chain. A `receiver` carries
 /// its whole class-nesting tower, a `subject` only itself, an `access` one dispatch.

@@ -161,7 +161,7 @@ var gf_trace_val: ?[]const u8 = null;
 /// `KLIO_GF_TRACE`, cached once: the raw getenv is a full environ scan and this gate sits on every GetField.
 pub fn gfTraceWant() ?[]const u8 {
     if (!gf_trace_init) {
-        gf_trace_val = if (std.c.getenv("KLIO_GF_TRACE")) |w| std.mem.span(w) else null;
+        gf_trace_val = runtime.envOnce("KLIO_GF_TRACE");
         gf_trace_init = true;
     }
     return gf_trace_val;
@@ -173,7 +173,7 @@ var cm_trace_val: ?[]const u8 = null;
 
 pub fn cmTraceWant() ?[]const u8 {
     if (!cm_trace_init) {
-        cm_trace_val = if (std.c.getenv("KLIO_CM_TRACE")) |w| std.mem.span(w) else null;
+        cm_trace_val = runtime.envOnce("KLIO_CM_TRACE");
         cm_trace_init = true;
     }
     return cm_trace_val;
@@ -185,7 +185,7 @@ var chain_trace_on: bool = false;
 
 pub fn chainTraceOn() bool {
     if (!chain_trace_init) {
-        chain_trace_on = std.c.getenv("KLIO_CHAIN_TRACE") != null;
+        chain_trace_on = runtime.envOnce("KLIO_CHAIN_TRACE") != null;
         chain_trace_init = true;
     }
     return chain_trace_on;

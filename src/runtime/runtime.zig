@@ -203,6 +203,8 @@ pub const clockWallMillis = clock_mod.wallMillis;
 pub const clockWallTime = clock_mod.wallTime;
 pub const ClockWallTime = clock_mod.WallTime;
 pub const clockMonotonicNanos = clock_mod.monotonicNanos;
+/// `main`'s first instruction, for traces that place a phase in the process's life.
+pub var process_start_ns: u64 = 0;
 pub const clockSleepMillis = clock_mod.sleepMillis;
 pub const clockSleepMicros = clock_mod.sleepMicros;
 pub const EventGate = clock_mod.EventGate;

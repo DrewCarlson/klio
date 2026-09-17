@@ -110,6 +110,9 @@ pub const KotlinFile = struct {
     decls: []Decl,
     span: Span,
     file_annotations: []Annotation = &.{},
+    /// The parser saw a `@Composable` annotation somewhere in the file, so the
+    /// compose pass has something to do.
+    has_composable: bool = false,
 };
 
 fn rewriteAliasedTypeName(ty: *TypeRef, aliases: *const std.StringHashMap([]const u8)) void {

@@ -244,7 +244,7 @@ def no_summary_detail(p):
     stderr = p.stderr.decode(errors="replace")
     tests = re.findall(r"^\[test\] ([^\n]+)$", stderr, re.MULTILINE)
     last_test = tests[-1] if tests else "none"
-    panic = re.search(r"^(?:thread \d+ panic:|KGC:|error:)[^\n]*", stderr, re.MULTILINE)
+    panic = re.search(r"^(?:thread \d+ panic:|KGC:|error:|Segmentation fault at address|Bus error at address|Illegal instruction at address)[^\n]*", stderr, re.MULTILINE)
     reason = panic.group(0) if panic else stderr[-300:].strip().splitlines()[0] if stderr.strip() else "no diagnostic"
     gc_lines = re.findall(r"^\[kgc\][^\n]*", stderr, re.MULTILINE)
     gc = f"; {gc_lines[-1]}" if gc_lines else ""

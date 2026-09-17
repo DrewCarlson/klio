@@ -192,7 +192,7 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     };
     // The body owns that receiver as its extension receiver, so a bare call there
     // prefers an extension on it over a same-file plain namesake.
-    if (std.c.getenv("KLIO_LAR_TRACE") != null) {
+    if (runtime.envOnce("KLIO_LAR_TRACE") != null) {
         std.debug.print("[lar-stash] s={d}..{d} head={s} ty={s}\n", .{ expr.span().start, expr.span().end, receiver_head orelse "-", if (receiver_type) |r| r.name else "-" });
     }
     if (receiver_head) |rr| b.module.pending_lambda_own_recv = rr;
@@ -233,7 +233,7 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Non-callable-local evidence flows in transitively.
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
-    if (std.c.getenv("KLIO_LAMINH") != null) std.debug.print("[laminh] produce lambda b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
+    if (runtime.envOnce("KLIO_LAMINH") != null) std.debug.print("[laminh] produce lambda b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
     // Fold active inline-splice param types into the snapshot: a nested closure
     // in a spliced body captures the callee's parameter by name.
     if (b.module.pending_lambda_local_decl_types) |*locals| {
@@ -374,7 +374,7 @@ pub fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
-    if (std.c.getenv("KLIO_LAMINH") != null) std.debug.print("[laminh] produce anonfun b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
+    if (runtime.envOnce("KLIO_LAMINH") != null) std.debug.print("[laminh] produce anonfun b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
     if (af.context_params.len != 0) b.module.pending_lambda_ctx_params = af.context_params;
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
@@ -1048,7 +1048,7 @@ fn recordCallBoundLambdaReceiver(
         cleanup.deinit(b.allocator);
         return;
     }
-    if (std.c.getenv("KLIO_LAR_TRACE") != null)
+    if (runtime.envOnce("KLIO_LAR_TRACE") != null)
         std.debug.print("[lar-site] site=cbr fn={s} declared={s} resolved={s} s={d}..{d}\n", .{ func.fqn, declared_receiver.name, resolved.name, call_span.start, call_span.end });
     try b.recordLambdaArgRecvOwned(call_span, resolved);
 }

@@ -49,6 +49,48 @@ pub inline fn isOwner() bool {
     return o != 0 and o == threadPtr();
 }
 
+/// Per-thread state too large for the thread-local block. Darwin sizes every
+/// thread's block by the image's whole `threadlocal` footprint and fills it on
+/// that thread's first access to any `threadlocal`, so a parser or lowering
+/// worker that never dispatches a call still paid for the dispatch caches.
+/// The owner thread reads an ordinary global; any other thread a copy
+/// allocated on its first use and kept for the thread's life.
+pub fn PerThread(comptime T: type) type {
+    return struct {
+        var owner_copy: T = .{};
+        threadlocal var other: ?*T = null;
+
+        pub inline fn get() *T {
+            if (isOwner()) return &owner_copy;
+            return other orelse allocOther();
+        }
+
+        fn allocOther() *T {
+            const p = std.heap.page_allocator.create(T) catch @panic("out of memory for per-thread state");
+            p.* = .{};
+            other = p;
+            return p;
+        }
+    };
+}
+
+test "PerThread hands each thread its own copy" {
+    const Counter = struct { n: u32 = 0 };
+    const per = PerThread(Counter);
+    per.get().n += 1;
+    const Other = struct {
+        fn run(out: *u32) void {
+            per.get().n += 5;
+            out.* = per.get().n;
+        }
+    };
+    var seen: u32 = 0;
+    const t = try std.Thread.spawn(.{}, Other.run, .{&seen});
+    t.join();
+    try std.testing.expectEqual(@as(u32, 5), seen);
+    try std.testing.expectEqual(@as(u32, 1), per.get().n);
+}
+
 test "before a claim nobody is the owner" {
     const saved = @atomicLoad(usize, &owner, .monotonic);
     defer @atomicStore(usize, &owner, saved, .release);

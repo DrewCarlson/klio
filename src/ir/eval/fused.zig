@@ -94,13 +94,11 @@ const FusedTls = struct {
     depth: usize = 0,
 };
 
-/// The owner thread reads this copy, every other thread `fused_tls_other`; see `runtime.tls_fast`.
-var fused_tls_owner: FusedTls = .{};
-
-threadlocal var fused_tls_other: FusedTls = .{};
+/// One copy per thread; see `runtime.tls_fast.PerThread`.
+const fused_tls = runtime.tls_fast.PerThread(FusedTls);
 
 pub inline fn fusedTls() *FusedTls {
-    return if (runtime.tls_fast.isOwner()) &fused_tls_owner else &fused_tls_other;
+    return fused_tls.get();
 }
 
 var fused_enabled_state: u8 = 0;

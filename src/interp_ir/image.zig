@@ -82,6 +82,11 @@ fn isForestField(comptime T: type) bool {
 /// encode so a `ForestField.ptr` encodes lazily. Null elsewhere.
 var bake_forest_map: ?*const std.AutoHashMap(usize, runtime.forest.ForestRef) = null;
 
+/// Forest fields the bake had to encode inline: nodes outside the lifted
+/// declarations, which is an object expression's box, or a pointer into a
+/// body the strip should have kept.
+pub var inline_forest_nodes: usize = 0;
+
 /// Decl-index base of the loading image's forest slot. Refs bake image-local, so
 /// `decodeForestField` adds this while the root payload decodes; zero elsewhere.
 var load_forest_rebase: u32 = 0;
@@ -104,6 +109,7 @@ fn encodeForestField(comptime T: type, e: *Encoder, value: *const T) Allocator.E
                     try e.varint(r.ord);
                     return;
                 }
+                inline_forest_nodes += 1;
             }
             try e.varint(1);
             try encodeValue(Child, e, p);

@@ -709,7 +709,12 @@ const POLY_FIELD_SLOTS: usize = 1 << 14;
 
 const PolyFieldEnt = struct { key: u64 = 0, route: u64 = 0 };
 
-threadlocal var poly_field_cache: [POLY_FIELD_SLOTS]PolyFieldEnt = @splat(.{});
+/// The site caches below, one copy per thread; see `runtime.tls_fast.PerThread`.
+const SiteCaches = struct {
+    poly_field: [POLY_FIELD_SLOTS]PolyFieldEnt = @splat(.{}),
+    call_pic: [CALL_PIC_SLOTS]CallPicEnt = @splat(.{}),
+};
+const site_caches = runtime.tls_fast.PerThread(SiteCaches);
 
 inline fn polyFieldKey(site: usize, cls: u64) u64 {
     const k = (@as(u64, site) *% 0x9E3779B97F4A7C15) ^ (cls *% 0xC2B2AE3D27D4EB4F);
@@ -721,7 +726,7 @@ fn polyFieldRoute(comptime H: type, host: *H, site: usize, cls: u64, recv: *cons
     // mirrors it, so the generation belongs in the key.
     const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
     const key = polyFieldKey(site, cls ^ (gen *% 0x51_7C_C1_B7_27_22_0A_95));
-    const slot = &poly_field_cache[@as(usize, @intCast(key >> 17)) & (POLY_FIELD_SLOTS - 1)];
+    const slot = &site_caches.get().poly_field[@as(usize, @intCast(key >> 17)) & (POLY_FIELD_SLOTS - 1)];
     if (slot.key == key) return if (slot.route == 0) null else slot.route;
     const r = host.fieldSiteRoute(recv, name);
     const route: u64 = if (r) |rr| (if (rr.cls == cls) rr.route else 0) else 0;
@@ -1054,8 +1059,6 @@ const CALL_PIC_SLOTS: usize = 1 << 14;
 
 const CallPicEnt = struct { key: u64 = 0, fid: u32 = 0 };
 
-threadlocal var call_pic: [CALL_PIC_SLOTS]CallPicEnt = @splat(.{});
-
 inline fn callPicKey(site: usize, cls: u64, sig: u64, gen: u64) u64 {
     var k = (@as(u64, site) *% 0x9E3779B97F4A7C15) ^ (cls *% 0xC2B2AE3D27D4EB4F);
     k ^= sig *% 0xD6E8FEB86659FD93;
@@ -1065,14 +1068,14 @@ inline fn callPicKey(site: usize, cls: u64, sig: u64, gen: u64) u64 {
 
 fn callPicGet(site: usize, cls: u64, sig: u64, gen: u64) ?u32 {
     const key = callPicKey(site, cls, sig, gen);
-    const e = &call_pic[@as(usize, @intCast(key >> 17)) & (CALL_PIC_SLOTS - 1)];
+    const e = &site_caches.get().call_pic[@as(usize, @intCast(key >> 17)) & (CALL_PIC_SLOTS - 1)];
     if (e.key != key) return null;
     return e.fid;
 }
 
 fn callPicPut(site: usize, cls: u64, sig: u64, gen: u64, fid: u32) void {
     const key = callPicKey(site, cls, sig, gen);
-    const e = &call_pic[@as(usize, @intCast(key >> 17)) & (CALL_PIC_SLOTS - 1)];
+    const e = &site_caches.get().call_pic[@as(usize, @intCast(key >> 17)) & (CALL_PIC_SLOTS - 1)];
     e.key = key;
     e.fid = fid;
 }

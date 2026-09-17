@@ -2,6 +2,20 @@
 
 const std = @import("std");
 
+/// A trace flag read once per variable: these sit inside the call checker,
+/// which runs on every call of every body.
+fn envFlag(comptime name: [:0]const u8) bool {
+    const S = struct {
+        var state = std.atomic.Value(u8).init(0);
+        var on: bool = false;
+    };
+    if (S.state.load(.acquire) == 0) {
+        S.on = std.c.getenv(name) != null;
+        S.state.store(1, .release);
+    }
+    return S.on;
+}
+
 const span = @import("span");
 const ast = @import("ast");
 const diagnostics = @import("diagnostics");
@@ -48,19 +62,19 @@ pub fn checkCall(
     const ty = try checkCallInner(self, callee, args, arg_names, type_args, call_span);
     if (!self.expr_class.contains(call_span)) {
         if (returnClassName(self, &ty)) |cn| {
-            self.expr_class.put(call_span, cn) catch {};
+            self.expr_class.put(call_span, try self.internName(cn)) catch {};
         } else if (callee.* == .Path and callee.Path.segments.len == 1) {
             // Class identity rides the signature; one declaration settles it.
             const nm0 = callee.Path.segments[0].name;
             if (self.fns.get(nm0)) |sigs| {
                 if (sigs.items.len == 1) {
                     if (sigs.items[0].return_class) |cn| {
-                        if (self.classes.contains(cn)) self.expr_class.put(call_span, cn) catch {};
+                        if (self.classes.contains(cn)) self.expr_class.put(call_span, try self.internName(cn)) catch {};
                     }
                 }
             } else if (self.extern_fn_return_class) |ext| {
                 if (ext.get(nm0)) |cn| {
-                    if (self.classes.contains(cn)) self.expr_class.put(call_span, cn) catch {};
+                    if (self.classes.contains(cn)) self.expr_class.put(call_span, try self.internName(cn)) catch {};
                 }
             }
         }
@@ -344,7 +358,7 @@ fn checkCallInner(
             defer cands.deinit(self.allocator);
             try expr_mod.lookupExtensionCandidates(self, cn, mname, args.len, &cands);
             _ = @atomicRmw(u64, &call_shape_counts[2], .Add, 1, .monotonic);
-            if (std.c.getenv("KLIO_EAGER_AUDIT") != null) {
+            if (envFlag("KLIO_EAGER_AUDIT")) {
                 std.debug.print("[EAGER-MEMBER] recv_class={s} name={s} cands={d} ext_key={}\n", .{ cn, mname, cands.items.len, self.extensions.contains(cn) });
             }
             if (cands.items.len != 0) {
@@ -370,9 +384,9 @@ fn checkCallInner(
                     // A head good enough to choose the next receiver is not
                     // necessarily one lowering can bind against.
                     if (cands.items[0].sig.extern_fid != null) {
-                        try self.rank_class.put(call_span, rcn);
+                        try self.rank_class.put(call_span, try self.internName(rcn));
                     } else {
-                        try self.expr_class.put(call_span, rcn);
+                        try self.expr_class.put(call_span, try self.internName(rcn));
                     }
                 }
                 return ret;
@@ -1074,7 +1088,7 @@ fn checkOverloadedCallRecImpl(
     if (record and chosen != null and args_decisive and sig_params_decisive and
         (!sig.is_extension or sig.extern_fid != null or complete_universe))
     {
-        if (std.c.getenv("KLIO_EAGER_HITS") != null) {
+        if (envFlag("KLIO_EAGER_HITS")) {
             std.debug.print("[REC-MSC] '{s}' args:", .{record_name});
             for (arg_tys.items) |*t| switch (t.*) {
                 .Generic => |g| std.debug.print(" G:{s}", .{g.name}),
@@ -1946,7 +1960,7 @@ pub fn checkToplevelContractCall(
                 lam.params,
                 &lam.body,
                 null,
-                .{ .ty = recv, .class_name = recv_cls },
+                .{ .ty = recv, .class_name = try self.internOpt(recv_cls) },
             );
             defer ty.deinit(self.allocator);
             return switch (ty) {
@@ -2049,7 +2063,7 @@ pub fn checkToplevelContractCall(
         t0.deinit(self.allocator);
         if (args[1] == .Lambda) {
             const lam = args[1].Lambda;
-            var t = try checkLambdaInPlace(self, lam.params, &lam.body, .{ .ty = .Int, .class_name = null }, null);
+            var t = try checkLambdaInPlace(self, lam.params, &lam.body, .{ .ty = .Int, .class_name = try self.internOpt(null) }, null);
             t.deinit(self.allocator);
         } else {
             var t = try expr_mod.checkExpr(self, &args[1], null);
@@ -2093,7 +2107,7 @@ pub fn checkMemberContractCall(
         var ty = try checkLambdaInPlace(self,
             lam.params,
             &lam.body,
-            .{ .ty = recv_ty, .class_name = recv_cls },
+            .{ .ty = recv_ty, .class_name = try self.internOpt(recv_cls) },
             null,
         );
         defer ty.deinit(self.allocator);
@@ -2106,7 +2120,7 @@ pub fn checkMemberContractCall(
             lam.params,
             &lam.body,
             null,
-            .{ .ty = recv_ty, .class_name = recv_cls },
+            .{ .ty = recv_ty, .class_name = try self.internOpt(recv_cls) },
         );
         defer ty.deinit(self.allocator);
         return switch (ty) {
@@ -2118,7 +2132,7 @@ pub fn checkMemberContractCall(
             lam.params,
             &lam.body,
             null,
-            .{ .ty = try recv_ty.clone(self.allocator), .class_name = recv_cls },
+            .{ .ty = try recv_ty.clone(self.allocator), .class_name = try self.internOpt(recv_cls) },
         );
         t.deinit(self.allocator);
         return recv_ty;
@@ -2126,7 +2140,7 @@ pub fn checkMemberContractCall(
         var t = try checkLambdaInPlace(self,
             lam.params,
             &lam.body,
-            .{ .ty = try recv_ty.clone(self.allocator), .class_name = recv_cls },
+            .{ .ty = try recv_ty.clone(self.allocator), .class_name = try self.internOpt(recv_cls) },
             null,
         );
         t.deinit(self.allocator);
@@ -2220,7 +2234,7 @@ pub fn checkLambdaInPlace(
             .ty = ib.ty,
             .mutable = false,
             .decl_span = null,
-            .class_name = ib.class_name,
+            .class_name = try self.internOpt(ib.class_name),
             .decl_type_name = null,
         });
     } else {
@@ -2239,7 +2253,7 @@ pub fn checkLambdaInPlace(
             .ty = tb.ty,
             .mutable = false,
             .decl_span = null,
-            .class_name = tb.class_name,
+            .class_name = try self.internOpt(tb.class_name),
             .decl_type_name = null,
         });
         if (tb.class_name) |cn| {
@@ -2250,9 +2264,9 @@ pub fn checkLambdaInPlace(
             }
             try self.dsl_receiver_stack.append(self.allocator, .{ .name = cn, .markers = markers });
             try self.class_stack.append(self.allocator, cn);
-            if (std.c.getenv("KLIO_RH_TRACE") != null)
+            if (envFlag("KLIO_RH_TRACE"))
                 std.debug.print("[rh-put] site=inplace f={d} s={d}..{d} head={s}\n", .{ body.span.file.int(), body.span.start, body.span.end, cn });
-            self.lambda_recv_heads.put(body.span, cn) catch {};
+            self.lambda_recv_heads.put(body.span, try self.internName(cn)) catch {};
             const actual_ret = try expr_mod.checkBlock(self, body, null);
             _ = self.class_stack.pop();
             var popped = self.dsl_receiver_stack.pop().?;
@@ -2310,9 +2324,9 @@ pub fn checkLambdaShaped(
             is_suspend = f.is_suspend;
             // The head that answers member-versus-global inside the body.
             if (f.receiver_head) |h| {
-                if (std.c.getenv("KLIO_RH_TRACE") != null)
+                if (envFlag("KLIO_RH_TRACE"))
                     std.debug.print("[rh-put] site=shaped f={d} s={d}..{d} head={s}\n", .{ body.span.file.int(), body.span.start, body.span.end, h });
-                self.lambda_recv_heads.put(body.span, h) catch {};
+                self.lambda_recv_heads.put(body.span, try self.internName(h)) catch {};
             }
             // Lowering falls back to this for a cross-pack member call, whose
             // callee is not in its name index.

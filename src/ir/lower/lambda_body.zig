@@ -2,6 +2,7 @@
 //! closing over the enclosing scope's registers.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
@@ -108,7 +109,7 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
     }
     const dst = b.allocReg();
     const unit = try b.module.internConst(b.allocator, .Unit);
-    if (std.c.getenv("KLIO_TRACE_CAPTURE") != null) {
+    if (runtime.envOnce("KLIO_TRACE_CAPTURE") != null) {
         std.debug.print("[CAPTURE] unresolved `{s}` collapses to Unit\n", .{name});
     }
     try b.push(.{ .Const = .{ .dst = dst, .value = unit } });
@@ -343,7 +344,7 @@ fn adoptEnclosingReceiver(ctx: *LambdaBodyCtx) Allocator.Error!void {
     }
     // A local extension function's body owns its declared receiver outright, the
     // standing a top-level extension body gets from `setRecvTy`.
-    if (std.c.getenv("KLIO_LAR_TRACE") != null) {
+    if (runtime.envOnce("KLIO_LAR_TRACE") != null) {
         std.debug.print("[lar-body] s={d} own_ty={s} own={s}\n", .{ body.span.start, if (module.pending_lambda_own_recv_type) |r| r.name else "-", module.pending_lambda_own_recv orelse "-" });
     }
     if (module.pending_lambda_own_recv_type) |receiver| {
@@ -379,7 +380,7 @@ fn inheritEnclosingLocals(ctx: *LambdaBodyCtx) Allocator.Error!void {
     // `KLIO_LAMINH=1` traces the declared-type inheritance channel: an empty
     // inherited snapshot while the enclosing builder holds records means the body
     // lowered from the wrong builder, costing every member call its receiver type.
-    if (std.c.getenv("KLIO_LAMINH") != null) {
+    if (runtime.envOnce("KLIO_LAMINH") != null) {
         std.debug.print("[laminh] consume pending={?d} nonfn={} params={?d}\n", .{
             if (module.pending_lambda_local_decl_types) |l| l.types.count() else null,
             module.pending_lambda_nonfn_locals != null,

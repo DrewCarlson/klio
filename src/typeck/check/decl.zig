@@ -166,7 +166,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                     .ty = bound_ty,
                     .mutable = p.mutable,
                     .decl_span = p.name.span,
-                    .class_name = bound_cn,
+                    .class_name = try self.internOpt(bound_cn),
                     .decl_type_name = null,
                     .ebf = ebf,
                 });
@@ -199,7 +199,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 .ty = Type.Unresolved,
                 .mutable = false,
                 .decl_span = o.name.span,
-                .class_name = o.name.name,
+                .class_name = try self.internOpt(o.name.name),
                 .decl_type_name = null,
             });
         },
@@ -850,7 +850,7 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
             .ty = ty,
             .mutable = false,
             .decl_span = p.name.span,
-            .class_name = cn,
+            .class_name = try self.internOpt(cn),
             .decl_type_name = decl_type_name,
         });
         if (p.default) |default| {
@@ -1456,7 +1456,7 @@ fn bindPrimaryConstructorParams(self: *Checker, c: *const Class) Allocator.Error
             .ty = ty,
             .mutable = p.property != null and p.property.? == true,
             .decl_span = p.name.span,
-            .class_name = cn,
+            .class_name = try self.internOpt(cn),
             .decl_type_name = null,
         });
         if (p.default) |*default| {
@@ -1510,7 +1510,7 @@ fn checkBodyProperties(self: *Checker, c: *const Class, uninitialized_properties
                 .ty = pty,
                 .mutable = p.mutable,
                 .decl_span = p.name.span,
-                .class_name = if (bind_tr) |tr| classNameFromTyperef(tr) else null,
+                .class_name = try self.internOpt(if (bind_tr) |tr| classNameFromTyperef(tr) else null),
                 .decl_type_name = null,
             });
             try uninitialized_properties.append(self.allocator, .{
@@ -2221,7 +2221,7 @@ pub fn checkSecondaryCtor(self: *Checker, sc: *const SecondaryCtor) Allocator.Er
             .ty = ty,
             .mutable = false,
             .decl_span = p.name.span,
-            .class_name = cn,
+            .class_name = try self.internOpt(cn),
             .decl_type_name = null,
         });
     }

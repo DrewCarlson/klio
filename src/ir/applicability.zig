@@ -8,6 +8,19 @@
 
 const std = @import("std");
 
+/// A trace variable read once: these sit on the scoring path of every call.
+fn envOnce(comptime name: [:0]const u8) ?[]const u8 {
+    const S = struct {
+        var state = std.atomic.Value(u8).init(0);
+        var value: ?[]const u8 = null;
+    };
+    if (S.state.load(.acquire) == 0) {
+        S.value = if (std.c.getenv(name)) |raw| std.mem.span(raw) else null;
+        S.state.store(1, .release);
+    }
+    return S.value;
+}
+
 const ir = @import("ir");
 const span_mod = @import("span");
 
@@ -633,7 +646,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
 var score_trace_cached: ?bool = null;
 fn scoreTraceOn() bool {
     if (score_trace_cached) |b| return b;
-    const b = std.c.getenv("KLIO_SCORE_TRACE") != null;
+    const b = envOnce("KLIO_SCORE_TRACE") != null;
     score_trace_cached = b;
     return b;
 }
@@ -647,13 +660,13 @@ pub threadlocal var trace_call_name: ?[]const u8 = null;
 
 /// Whether any `[extkey]` tracing is on, so callers can skip keeping the span.
 pub fn extKeyTraceEnabled() bool {
-    return std.c.getenv("KLIO_EXTKEY_TRACE") != null;
+    return envOnce("KLIO_EXTKEY_TRACE") != null;
 }
 
 /// `KLIO_EXTKEY_TRACE=<name|fid>[,...]` gate: a numeric token selects one
 /// candidate by `FuncId`, anything else every candidate of that call name.
 fn extKeyTraceWanted(fid: ?FuncId) bool {
-    const want = std.mem.span(std.c.getenv("KLIO_EXTKEY_TRACE") != null orelse return false);
+    const want = envOnce("KLIO_EXTKEY_TRACE") orelse return false;
     var it = std.mem.tokenizeScalar(u8, want, ',');
     while (it.next()) |tok| {
         if (std.fmt.parseInt(u32, tok, 10)) |n| {
@@ -1181,7 +1194,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
 
 fn applicTraceReject(site: []const u8) void {
     if (comptime !@import("builtin").link_libc) return;
-    if (std.c.getenv("KLIO_APPLIC_TRACE") == null) return;
+    if (envOnce("KLIO_APPLIC_TRACE") == null) return;
     std.debug.print("[applic-reject] {s}\n", .{site});
 }
 
@@ -1215,7 +1228,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         // `$composer`/`$changed` pair included.
         const p = pos orelse {
             if (comptime @import("builtin").link_libc) {
-                if (std.c.getenv("KLIO_APPLIC_TRACE") != null) {
+                if (envOnce("KLIO_APPLIC_TRACE") != null) {
                     std.debug.print("[applic-reject] named-3 fid={?d} arg={s} params:", .{ if (sig.fid) |f| f.int() else null, n });
                     for (params) |*pp| std.debug.print(" {s}", .{pp.name});
                     std.debug.print("\n", .{});
@@ -1337,7 +1350,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
 
         if (pidx >= params.len) {
             if (comptime @import("builtin").link_libc) {
-                if (std.c.getenv("KLIO_APPLIC_TRACE") != null) {
+                if (envOnce("KLIO_APPLIC_TRACE") != null) {
                     std.debug.print("[applic-reject] named-5 fid={?d} args:", .{if (sig.fid) |f| f.int() else null});
                     for (args) |*aa| std.debug.print(" {s}{s}", .{ aa.named orelse "_", if (aa.is_lambda) "(lam)" else "" });
                     std.debug.print(" params:", .{});

@@ -398,7 +398,11 @@ pub const MextOverrideEntry = struct {
     gen: u32 = 0,
 };
 pub const MEXT_OVERRIDE_SLOTS = 1024;
-pub threadlocal var mext_override_cache: [MEXT_OVERRIDE_SLOTS]MextOverrideEntry = @splat(.{});
+const MextTls = struct {
+    overrides: [MEXT_OVERRIDE_SLOTS]MextOverrideEntry = @splat(.{}),
+    closure_front: [CLOSURE_NAMES_FRONT_SLOTS]ClosureNamesFront = @splat(.{}),
+};
+const mext_tls = runtime.tls_fast.PerThread(MextTls);
 
 /// `memberExtOverrideLookup` behind a direct-mapped per-thread cache, writing at
 /// most `out.len` entries and returning how many.
@@ -410,7 +414,7 @@ pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []cons
         break :blk @intCast(g.get().class.identity());
     };
     const slot = (cls_id ^ (@intFromPtr(name.ptr) >> 3) ^ (nparams *% 0x9E37)) & (MEXT_OVERRIDE_SLOTS - 1);
-    const e = mext_override_cache[slot];
+    const e = mext_tls.get().overrides[slot];
     if (e.valid and e.gen == cacheGen() and e.cls == cls_id and e.name_p == @intFromPtr(name.ptr) and e.nparams == nparams) {
         const n = @min(e.n, out.len);
         for (0..n) |i| out[i] = @enumFromInt(e.fids[i]);
@@ -427,7 +431,7 @@ pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []cons
         .gen = cacheGen(),
     };
     for (0..n) |i| entry.fids[i] = @intCast(found[i].int());
-    mext_override_cache[slot] = entry;
+    mext_tls.get().overrides[slot] = entry;
     const m = @min(n, out.len);
     for (0..m) |i| out[i] = found[i];
     return m;
@@ -509,13 +513,12 @@ pub const OWNER_SIG_MAX = 48;
 pub const ClosureNamesEntry = struct { fqn_p: usize, fqn_len: usize, set: *const std.StringHashMap(void) };
 pub const ClosureNamesFront = struct { cls: usize = 0, fqn_p: usize = 0, fqn_len: usize = 0, set: ?*const std.StringHashMap(void) = null };
 pub const CLOSURE_NAMES_FRONT_SLOTS = 512;
-pub threadlocal var closure_names_front: [CLOSURE_NAMES_FRONT_SLOTS]ClosureNamesFront = @splat(.{});
 pub var closure_names_lock = std.atomic.Value(bool).init(false);
 pub var closure_names_map: ?std.AutoHashMap(usize, ClosureNamesEntry) = null;
 pub fn classClosureNames(cls: *const ClassDef) *const std.StringHashMap(void) {
     const key = @intFromPtr(cls);
     const fqn_p = @intFromPtr(cls.fqn.ptr);
-    const front = &closure_names_front[((key *% 0x9E3779B97F4A7C15) >> 32) % CLOSURE_NAMES_FRONT_SLOTS];
+    const front = &mext_tls.get().closure_front[((key *% 0x9E3779B97F4A7C15) >> 32) % CLOSURE_NAMES_FRONT_SLOTS];
     if (front.cls == key and front.fqn_p == fqn_p and front.fqn_len == cls.fqn.len) {
         if (front.set) |s| return s;
     }

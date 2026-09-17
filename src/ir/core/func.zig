@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 const root_ir = @import("../ir.zig");
 const core_ids = @import("ids.zig");
 const core_inst = @import("inst.zig");
@@ -353,8 +354,9 @@ pub const Func = struct {
         // Per-block summary: `gen` = registers the block writes, `exposed` = registers it reads
         // before writing them; an instruction's own def never covers its own use. The scratch
         // is thread-local because stack arrays this size are poisoned under safe builds.
-        const gen = &frame_fill_scratch[0];
-        const exposed = &frame_fill_scratch[1];
+        const scratch = frame_fill_scratch.get();
+        const gen = &scratch.sets[0];
+        const exposed = &scratch.sets[1];
         for (self.blocks, 0..) |*b, bi| {
             var written: RegSet = regSetEmpty();
             var expo: RegSet = regSetEmpty();
@@ -378,7 +380,7 @@ pub const Func = struct {
         }
         // Forward must-written fixpoint. Unreachable blocks keep the ALL set and verify
         // vacuously; a `TailJump` resets the register file so it contributes no edge.
-        const in = &frame_fill_scratch[2];
+        const in = &frame_fill_scratch.get().sets[2];
         for (0..nb) |bi| in[bi] = regSetFull();
         in[entry_idx] = regSetEmpty();
         var rounds: usize = 0;
@@ -499,7 +501,8 @@ inline fn regSetAnyOutside(a: RegSet, b: RegSet) bool {
 
 /// `frameDefBeforeUse` scratch (gen / exposed / in). Thread-local so the once-per-func
 /// analysis skips the safe builds' stack poisoning and concurrent first-asks stay apart.
-pub threadlocal var frame_fill_scratch: [3][FRAME_FILL_MAX_BLOCKS]RegSet = undefined;
+const FrameFillScratch = struct { sets: [3][FRAME_FILL_MAX_BLOCKS]RegSet = undefined };
+const frame_fill_scratch = runtime.tls_fast.PerThread(FrameFillScratch);
 
 pub const LEAF_MAX_INSTS: usize = 96;
 

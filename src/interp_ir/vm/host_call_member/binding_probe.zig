@@ -198,7 +198,7 @@ pub fn instanceBindingNamedProbe(
                 defer pg.deinit();
                 pg.get().named_perm_cache.put(k, perm) catch {};
             }
-            caches.tl_perm_cache[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .gen = cacheGen(), .perm = perm };
+            caches.tl().perm[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .gen = cacheGen(), .perm = perm };
         }
     }
     return instanceBindingProbe(self, allocator, receiver, name, filled.items);

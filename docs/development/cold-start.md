@@ -123,7 +123,114 @@ a cheap hit; and a whole-call cache in front of extension resolution hit only
 emits it share the name, receiver and arguments but not the context. The
 per-candidate receiver verdict is the grain that repeats.
 
-## What remains
+## Memory
+
+The trace lines above carry the resident set (`rss`) at each step, so the
+same run that shows where the time goes shows where the memory goes. For the
+finer view, `vmmap --summary <pid>` splits the resident set by region type
+(the slab and the page allocator are `VM_ALLOCATE`, the C heap is `MALLOC_*`,
+the binary's own pages are `__TEXT`/`__LINKEDIT`); `KLIO_SLAB_STAT=1` prints
+the slab's per-size-class occupancy at the pre-execution trim; and
+`KLIO_SLAB_TRACE=1 KLIO_SLAB_TRACE_ALL=1` with a SIGTERM during `main`
+attributes every mapping the process still holds to the allocation that made
+it. A `Thread.sleep` or a long loop in the program gives the time to attach.
+
+### What a cold run holds when `main` starts
+
+A cold run lowers from the AST and executes from the module it just built, so
+what it keeps is what a warm run never materialises: the stdlib's parse trees
+and the tables the build used. Debug, `hello.kt`, sync bake:
+
+| Step | Before | After |
+|------|-------:|------:|
+| After parse | 105 MB | 82 MB |
+| After the check that records the eager call picks | 165 MB | 87 MB (checker on an arena, freed) |
+| After lowering | 216 MB | 184 MB |
+| After the bake | 226 MB | 190 MB (image bytes freed) |
+| At `main` | 307 MB | 188 MB |
+| Peak (`/usr/bin/time -l`) | 357 MB | 258 MB |
+| Warm run at `main` | 82 MB | 74 MB |
+
+ReleaseFast at `main`: 177 MB cold, 65 MB warm. Of the cold run's resident
+set at `main`, the slab holds 108 MB, 104 MB of it live; the rest is the
+binary's own pages (large in a Debug build, small in release) and the GC's
+reservation.
+
+What was retained for nothing, and the fix for each:
+
+- **The checker's tables.** The eager-call pass ran the type checker on the
+  general allocator and never freed it: 60 MB of types, scopes and per-body
+  scratch. The checker now runs on an arena per worker, freed once the pass
+  has copied its picks out. That copy exposed a use-after-free: the checker
+  recorded a call's receiver class as a slice of the call's own return type,
+  which the caller freed. Class names the checker records are now interned
+  in the checker, so the recorded tables own every string they hold.
+- **Lowering caches.** The extension-resolution and receiver-verdict caches
+  serve the build; `dropLoweringCaches` frees them after the base build
+  (they rebuild lazily if a runtime lowering of an object literal needs them).
+- **The image bytes.** A sync bake kept the 10 MB it had just written.
+- **Four copies of the top-level declaration list.** A `Decl` is 672 bytes
+  and was copied by value from each file into the concatenated file, from
+  there into the lifted list, and from there into the retained list. The
+  lowered module and the runtime read only the retained list, so the other
+  three are freed once it exists (11 MB).
+- **A clone of the base.** The base was cloned before the user program was
+  lowered on top, so the base could be extended again; a cold `klio run`
+  extends the base it just built and nothing reads it afterwards, so it is
+  adopted in place, as the warm path already did.
+- **The per-thread dispatch caches.** Two megabytes of `threadlocal` arrays
+  (method, extension, field, permission and applicability caches, the
+  polymorphic inline caches, the native slot banks) sized every thread's
+  thread-local block. Darwin allocates that block with `malloc` on a thread's
+  first access to any thread-local, so each of the thirty parse, check and
+  lowering workers paid 2.4 MB it never used, and the C heap kept 23 MB of
+  those blocks resident after the workers had exited. The caches now live in
+  a per-thread block the owner thread reads as a global and any other thread
+  allocates on first use (`runtime.tls_fast.PerThread`); the thread-local
+  block is 300 KB. The build workers also hand their slab magazines back at
+  exit.
+- **Stripped bodies.** The base build blanks the body of every non-inline
+  stdlib function the lowered code does not point into, but the trees stayed
+  allocated. The strip now frees them (2250 bodies, 46000 nodes, 13 MB) by a
+  walk over the node types that skips strings (slices of the source), type
+  references and annotations (copied by value into the lowered module, so
+  their children are shared) and class declarations (never in a stripped
+  body). What the lowered module points into is pinned first: an
+  `Inst.AstLambda` keeps its lambda's block for a runtime re-lowering, so the
+  138 bodies holding one are blanked but left allocated. Before, those
+  pointers survived only because nothing freed the trees; the bake encoded the
+  dead-but-intact nodes inline. The oracle for the free is the image: baked
+  with `KLIO_PRUNE_KEEP=1` (trees left allocated) and without, the two are
+  byte-identical, so nothing the bake reads was freed. `KLIO_SLAB_POISON=1`
+  overwrites freed cells; the corpus and the commontest sweep run under it
+  after any change to what the build frees.
+- **The trim.** Before `main`, `slab.reclaimAll` returns the build's fully
+  free pages and every parked spare span to the OS, once, rather than waiting
+  for the GC's aged trim.
+
+### What remains
+
+The AST itself stays: the runtime reaches class members' property
+initialisers, accessors, delegates, constructor defaults, init blocks and
+the inline bodies through `ForestField` pointers, and a cold run's forest is
+the in-memory tree. Freed body cells sit between live nodes, so they lower
+the run's later growth rather than its resident set at `main`. Two levers
+would change that:
+
+1. **Execute the fresh image.** After the bake, load the image the way a warm
+   run does and drop the build wholesale; the cold run would then hold what
+   the warm run holds. It costs the load (15 ms release) plus waiting for
+   the bake instead of forking it, so it trades cold time for memory.
+2. **Box the declarations.** `Stmt` embeds `Decl` (680 bytes) by value and
+   `Function` is 664 bytes, so every statement is the size of a declaration
+   and every list of declarations copies its contents. Boxing them shrinks
+   the tree and makes the copies pointer-sized.
+
+The embedded stdlib sources are still duplicated into the source map at
+parse (4 MB, plus line tables) rather than borrowed from the binary as the
+image path borrows them from the mapping.
+
+## What remains for time
 
 After the changes the bake is dominated by lowering the function bodies
 (about 70% of the remaining time), and inside that by resolution (extension

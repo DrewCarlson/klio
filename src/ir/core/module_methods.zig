@@ -206,8 +206,8 @@ pub fn bindCallType(
             if (bound.eql(actual)) return true;
             // Kotlin infers a parameter from every constraint together, so a constraint one side already
             // subsumes narrows nothing; genuinely unrelated constraints still refuse.
-            const lub_off = if (std.c.getenv("KLIO_BIND_LUB")) |v|
-                std.mem.eql(u8, std.mem.span(v), "0")
+            const lub_off = if (runtime.envOnce("KLIO_BIND_LUB")) |v|
+                std.mem.eql(u8, v, "0")
             else
                 false;
             // `Nothing?` is the null literal's type and the bottom of the lattice, so it constrains only
@@ -979,8 +979,8 @@ pub fn mergeInheritedMethod(
     if (existing.int() == incoming.int()) return;
 
     gop.value_ptr.* = try self.preferredMethodSlotTarget(allocator, existing, incoming);
-    if (std.c.getenv("KLIO_SLOT_TRACE")) |want| {
-        const w = std.mem.span(want);
+    if (runtime.envOnce("KLIO_SLOT_TRACE")) |want| {
+        const w = want;
         const chosen = gop.value_ptr.*;
         const en = if (self.funcById(existing)) |f| f.name else "?";
         if (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, en)) {
@@ -1154,8 +1154,8 @@ pub fn linkMethodSlotsFrom(self: *Module, allocator: Allocator, first_class: usi
                 methodDispatchKey(ClassId.from(@intCast(raw_cid)), MethodSlotId.from(entry.key_ptr.*)),
                 entry.value_ptr.*,
             );
-            if (std.c.getenv("KLIO_SLOT_DUMP")) |want| {
-                const w = std.mem.span(want);
+            if (runtime.envOnce("KLIO_SLOT_DUMP")) |want| {
+                const w = want;
                 const fid = entry.value_ptr.*;
                 const fname = if (self.funcById(fid)) |f| f.name else "?";
                 if (std.mem.eql(u8, w, fname)) {

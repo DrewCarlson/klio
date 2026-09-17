@@ -23,12 +23,15 @@ const StdlibFn = @import("host.zig").StdlibFn;
 /// Scratch arena for the supertype walks below; the walk is bounded. Held
 /// thread-local rather than on the stack, so the safety fill of an `undefined`
 /// stack array does not run on every call.
-threadlocal var subtype_scratch: [16 * 1024]u8 align(16) = undefined;
+const SubtypeTls = struct {
+    scratch: [16 * 1024]u8 align(16) = undefined,
+    /// A class's `Map.Entry`-ness is fixed by its supertype graph.
+    map_entry_memo: [512]MapEntryMemoSlot = @splat(.{}),
+};
+const subtype_tls = @import("tls_fast.zig").PerThread(SubtypeTls);
 threadlocal var subtype_scratch_busy: bool = false;
 
-/// A class's `Map.Entry`-ness is fixed by its supertype graph.
 const MapEntryMemoSlot = struct { key: usize = 0, val: bool = false };
-threadlocal var map_entry_memo: [512]MapEntryMemoSlot = @splat(.{});
 
 /// A nested walk finds the buffer lent out and uses the page allocator.
 const SubtypeScratch = struct {
@@ -42,7 +45,7 @@ const SubtypeScratch = struct {
         }
         subtype_scratch_busy = true;
         self.owned = true;
-        self.fba = std.heap.FixedBufferAllocator.init(&subtype_scratch);
+        self.fba = std.heap.FixedBufferAllocator.init(&subtype_tls.get().scratch);
         return self.fba.allocator();
     }
 
@@ -2629,7 +2632,8 @@ pub const Value = union(enum) {
         };
         // A property of the class, and every `==` between instances asks it.
         const key = cls.identity();
-        const slot = &map_entry_memo[(key >> 4) % map_entry_memo.len];
+        const memo = &subtype_tls.get().map_entry_memo;
+        const slot = &memo[(key >> 4) % memo.len];
         if (slot.key == key) return slot.val;
         const cg = cls.borrow();
         defer cg.deinit();

@@ -530,7 +530,7 @@ pub fn prepareMemberFlatCallNamed(
     if (args.len > 15) return null;
     const k = namedOrderKey(self, receiver, name, args, arg_names) orelse return null;
     var perm: ?root_mod.ProgramImage.NamedPerm = null;
-    const tslot = &caches.tl_perm_cache[tlSlot(k)];
+    const tslot = &caches.tl().perm[tlSlot(k)];
     if (tslot.raw_plus != 0 and tslot.gen == cacheGen() and tslot.class_p == k.class_p and tslot.name_p == k.name_p and
         tslot.sig == k.sig and tslot.n_args == k.n_args)
     {
@@ -990,7 +990,7 @@ pub fn builtinIntrinsicReplay(self: *VmHost, allocator: Allocator, receiver: *co
         .name_p = name_p,
         .args_empty = args.len == 0,
     };
-    const e = &caches.tl_resolve_cache[tlResolveSlot(key)];
+    const e = &caches.tl().resolve[tlResolveSlot(key)];
     if (e.state == 2 and e.gen == cacheGen() and e.type_p == key.type_p and e.name_p == key.name_p and e.args_empty == key.args_empty) {
         return try dispatchWithReceiver(self, allocator, e.fqn, e.func.?, receiver, args);
     }

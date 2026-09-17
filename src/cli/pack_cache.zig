@@ -77,6 +77,8 @@ pub const ParseTiming = struct {
     total: u64 = 0,
     files: usize = 0,
     threads: usize = 1,
+    /// Pieces the large files were cut into, over all of them.
+    pieces: usize = 0,
 };
 
 /// One selected pack, identified for cache keying: cache path, stored content
@@ -254,6 +256,13 @@ const ParseJob = struct {
     result: Result = .skipped,
     lex_ns: u64 = 0,
     parse_ns: u64 = 0,
+    /// Set on a job that parses one piece of a chunked file.
+    piece: ?Piece = null,
+    /// For a chunked file, the slowest piece's parse: with the lex, its
+    /// critical path.
+    longest_piece_ns: u64 = 0,
+    /// Pieces the file was cut into; zero when it parsed whole.
+    pieces: usize = 0,
 
     const Result = union(enum) {
         /// An allocation failed; the file is dropped silently.
@@ -263,13 +272,112 @@ const ParseJob = struct {
         /// The parser reported errors; it holds the diagnostics.
         parse_errors: *parser.Parser,
         ok: KotlinFile,
+        /// The file's tokens were cut into this many pieces, each a job of
+        /// its own appended to the pool; `lexed` owns the token strings the
+        /// pieces borrow until they are assembled.
+        pieces: struct { count: usize, lexed: lexer.LexResult },
     };
+
+    /// An owned copy of a token range of the file, ending in `Eof`.
+    const Piece = struct { of: usize, index: usize, tokens: []Token };
 };
+
+const Token = lexer.Token;
+
+/// A file at least this large parses in pieces: once lexed, its token stream
+/// is cut at top-level declaration boundaries and each piece parses as a job
+/// of its own alongside the other files, so the largest file no longer bounds
+/// the wall of the whole parse. `_Arrays.kt` alone is a quarter of the stdlib.
+const chunk_min_bytes: usize = 192 * 1024;
+/// Source bytes a piece aims for.
+const chunk_bytes: usize = 96 * 1024;
+
+fn tokenIsTrivia(t: *const Token) bool {
+    return switch (t.kind) {
+        .Whitespace, .Newline, .LineComment, .BlockComment => true,
+        else => false,
+    };
+}
+
+/// A token that can open a top-level declaration: a modifier or keyword, a
+/// name, or an annotation. After a `}` at depth zero and a newline nothing
+/// else can follow at the top level, so a cut before one is a cut between
+/// two declarations. `else`, `catch` and `finally` continue the expression
+/// whose block just closed, in a property initialiser or an expression body.
+fn tokenStartsDecl(t: *const Token, src: []const u8) bool {
+    return switch (t.kind) {
+        .Keyword => |k| k != .Else,
+        .Ident => blk: {
+            const text = src[t.span.start..t.span.end];
+            break :blk !std.mem.eql(u8, text, "catch") and !std.mem.eql(u8, text, "finally");
+        },
+        .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => true,
+        else => false,
+    };
+}
+
+/// Cut points into `tokens`: index `cuts[k]` starts piece `k+1`. Empty when
+/// the file yields fewer than two pieces.
+fn pieceCuts(allocator: Allocator, tokens: []const Token, src: []const u8) Allocator.Error![]usize {
+    var cuts: std.ArrayList(usize) = .empty;
+    errdefer cuts.deinit(allocator);
+    var depth: usize = 0;
+    var piece_start: u32 = 0;
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        switch (tokens[i].kind) {
+            .LParen, .LBracket, .LBrace => depth += 1,
+            .RParen, .RBracket, .RBrace => depth -|= 1,
+            else => continue,
+        }
+        if (tokens[i].kind != .RBrace or depth != 0) continue;
+        var j = i + 1;
+        var saw_newline = false;
+        while (j < tokens.len and tokenIsTrivia(&tokens[j])) : (j += 1) {
+            if (tokens[j].kind == .Newline) saw_newline = true;
+        }
+        if (j >= tokens.len or !saw_newline or !tokenStartsDecl(&tokens[j], src)) continue;
+        if (tokens[j].span.start - piece_start < chunk_bytes) continue;
+        try cuts.append(allocator, j);
+        piece_start = tokens[j].span.start;
+    }
+    if (cuts.items.len == 0) {
+        cuts.deinit(allocator);
+        return &.{};
+    }
+    return cuts.toOwnedSlice(allocator);
+}
+
+/// The tokens of piece `[from, to)` with an `Eof` after them; the last piece
+/// carries the file's own. A piece after the first opens with the newline
+/// its cut followed, so a look at the token before a declaration finds one.
+fn pieceTokens(allocator: Allocator, tokens: []const Token, from: usize, to: usize, fid: span.FileId) Allocator.Error![]Token {
+    const last_is_eof = to == tokens.len;
+    const lead: usize = @intFromBool(from != 0);
+    const out = try allocator.alloc(Token, lead + to - from + @intFromBool(!last_is_eof));
+    if (from != 0) {
+        const at = tokens[from].span.start;
+        out[0] = .{ .kind = .Newline, .span = span.Span.init(fid, at, at) };
+    }
+    @memcpy(out[lead .. lead + to - from], tokens[from..to]);
+    if (!last_is_eof) {
+        const end = tokens[to - 1].span.end;
+        out[lead + to - from] = .{ .kind = .Eof, .span = span.Span.init(fid, end, end) };
+    }
+    return out;
+}
 
 /// Lex, parse and alias-expand one registered file. Per file the only shared
 /// state is the allocator, so jobs may run on any thread.
-fn runParseJob(allocator: Allocator, job: *ParseJob) void {
+fn runParseJob(allocator: Allocator, pool: ?*ParsePool, index: usize, job: *ParseJob) void {
     const t0 = runtime.clockMonotonicNanos();
+    if (job.piece) |piece| {
+        const p = parser.Parser.new(allocator, job.fid, job.src, piece.tokens);
+        const file_ast = p.parseFile();
+        job.parse_ns = runtime.clockMonotonicNanos() - t0;
+        job.result = if (p.diagnostics.hasErrors()) .{ .parse_errors = p } else .{ .ok = file_ast };
+        return;
+    }
     var lx = lexer.Lexer.init(allocator, job.fid, job.src) catch return;
     var lexed = lx.tokenize() catch return;
     const t1 = runtime.clockMonotonicNanos();
@@ -278,6 +386,13 @@ fn runParseJob(allocator: Allocator, job: *ParseJob) void {
         job.result = .{ .lex_errors = lexed.diagnostics.diags().len };
         lexed.deinit(allocator);
         return;
+    }
+    if (pool != null and job.src.len >= chunk_min_bytes) {
+        const count = pool.?.addPieces(index, lexed.tokens);
+        if (count >= 2) {
+            job.result = .{ .pieces = .{ .count = count, .lexed = lexed } };
+            return;
+        }
     }
     const p = parser.Parser.new(allocator, job.fid, job.src, lexed.tokens);
     var file_ast = p.parseFile();
@@ -289,6 +404,7 @@ fn runParseJob(allocator: Allocator, job: *ParseJob) void {
     lexed.deinit(allocator);
     ast.expandFileClassAliases(allocator, &file_ast);
     job.parse_ns = runtime.clockMonotonicNanos() - t1;
+    if (std.c.getenv("KLIO_PARSE_CHECK") != null) checkNamesInSource(job, &file_ast);
     job.result = .{ .ok = file_ast };
 }
 
@@ -327,17 +443,82 @@ fn parseWorkerCount(allocator: Allocator, n: usize) usize {
 
 const ParsePool = struct {
     allocator: Allocator,
-    jobs: []ParseJob,
-    /// Job indices in dispatch order: largest source first, so the longest
-    /// file starts at once and the wall approaches the CPU-time share.
+    /// The files, then the pieces appended while the pool runs. Reserved up
+    /// front for every piece the large files can add, so an append never
+    /// moves a job another thread is working on.
+    jobs: *std.ArrayList(ParseJob),
+    files: usize,
+    /// File job indices in dispatch order: largest source first, so the
+    /// longest file starts at once and the wall approaches the CPU-time share.
     order: []const usize,
     next: std.atomic.Value(usize) = .init(0),
+    /// File jobs claimed and not yet finished; a worker out of work waits on
+    /// these, since one of them may still cut a large file into pieces.
+    inflight: std.atomic.Value(usize) = .init(0),
+    lock: runtime.SpinMutex = .{},
+    piece_next: usize = 0,
+
+    fn takePiece(self: *ParsePool) ?usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.files + self.piece_next >= self.jobs.items.len) return null;
+        const i = self.files + self.piece_next;
+        self.piece_next += 1;
+        return i;
+    }
+
+    /// Cuts `lexed` into piece jobs for file job `of`; the count added.
+    fn addPieces(self: *ParsePool, of: usize, lexed: []const Token) usize {
+        const job = self.jobs.items[of];
+        const cuts = pieceCuts(self.allocator, lexed, job.src) catch return 0;
+        if (cuts.len == 0) return 0;
+        defer self.allocator.free(cuts);
+        if (std.c.getenv("KLIO_PARSE_CHECK") != null) {
+            std.debug.print("[parse-check] {s}: {d} cuts\n", .{ job.rel_path, cuts.len });
+            for (cuts) |c| {
+                const at = lexed[c].span.start;
+                const end = @min(job.src.len, at + 48);
+                std.debug.print("[parse-check]   token {d} at byte {d}: `{s}`\n", .{ c, at, job.src[at..end] });
+            }
+        }
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.jobs.items.len + cuts.len + 1 > self.jobs.capacity) return 0;
+        var from: usize = 0;
+        var index: usize = 0;
+        var k: usize = 0;
+        while (k <= cuts.len) : (k += 1) {
+            const to = if (k < cuts.len) cuts[k] else lexed.len;
+            const tokens = pieceTokens(self.allocator, lexed, from, to, job.fid) catch break;
+            self.jobs.appendAssumeCapacity(.{
+                .fid = job.fid,
+                .src = job.src,
+                .rel_path = job.rel_path,
+                .piece = .{ .of = of, .index = index, .tokens = tokens },
+            });
+            index += 1;
+            from = to;
+        }
+        return index;
+    }
 
     fn drain(self: *ParsePool) void {
         while (true) {
-            const i = self.next.fetchAdd(1, .monotonic);
-            if (i >= self.order.len) return;
-            runParseJob(self.allocator, &self.jobs[self.order[i]]);
+            if (self.takePiece()) |i| {
+                runParseJob(self.allocator, self, i, &self.jobs.items[i]);
+                continue;
+            }
+            const o = self.next.fetchAdd(1, .monotonic);
+            if (o < self.order.len) {
+                _ = self.inflight.fetchAdd(1, .monotonic);
+                const i = self.order[o];
+                runParseJob(self.allocator, self, i, &self.jobs.items[i]);
+                _ = self.inflight.fetchSub(1, .monotonic);
+                continue;
+            }
+            // Every file is claimed; pieces can still appear while one is lexing.
+            if (self.inflight.load(.acquire) == 0) return;
+            std.Thread.yield() catch {};
         }
     }
 
@@ -353,23 +534,37 @@ const ParsePool = struct {
 
 /// Lex and parse every job, fanning out over a pool when the allocator can
 /// serve one; the calling thread drains alongside. Returns the thread count.
-fn runParseJobs(allocator: Allocator, jobs: []ParseJob) usize {
-    return runParseJobsOn(allocator, jobs, parseWorkerCount(allocator, jobs.len));
+fn runParseJobs(allocator: Allocator, jobs: *std.ArrayList(ParseJob)) usize {
+    return runParseJobsOn(allocator, jobs, parseWorkerCount(allocator, jobs.items.len));
 }
 
-fn runParseJobsOn(allocator: Allocator, jobs: []ParseJob, want: usize) usize {
+/// Pieces the files at least `chunk_min_bytes` long can add to the pool.
+fn pieceCapacity(jobs: []const ParseJob) usize {
+    var n: usize = 0;
+    for (jobs) |*j| {
+        if (j.src.len >= chunk_min_bytes) n += j.src.len / chunk_bytes + 2;
+    }
+    return n;
+}
+
+fn runParseJobsOn(allocator: Allocator, jobs: *std.ArrayList(ParseJob), want: usize) usize {
+    const files = jobs.items.len;
     if (want <= 1) {
-        for (jobs) |*job| runParseJob(allocator, job);
+        for (jobs.items, 0..) |*job, i| runParseJob(allocator, null, i, job);
         return 1;
     }
-    const order = allocator.alloc(usize, jobs.len) catch {
-        for (jobs) |*job| runParseJob(allocator, job);
+    const order = allocator.alloc(usize, files) catch {
+        for (jobs.items, 0..) |*job, i| runParseJob(allocator, null, i, job);
         return 1;
     };
     defer allocator.free(order);
+    jobs.ensureUnusedCapacity(allocator, pieceCapacity(jobs.items)) catch {
+        for (jobs.items, 0..) |*job, i| runParseJob(allocator, null, i, job);
+        return 1;
+    };
     for (order, 0..) |*slot, i| slot.* = i;
-    std.mem.sort(usize, order, @as([]const ParseJob, jobs), ParsePool.largerFirst);
-    var pool = ParsePool{ .allocator = allocator, .jobs = jobs, .order = order };
+    std.mem.sort(usize, order, @as([]const ParseJob, jobs.items), ParsePool.largerFirst);
+    var pool = ParsePool{ .allocator = allocator, .jobs = jobs, .files = files, .order = order };
     var threads: [max_parse_workers]std.Thread = undefined;
     var spawned: usize = 0;
     while (spawned + 1 < want) : (spawned += 1) {
@@ -381,7 +576,147 @@ fn runParseJobsOn(allocator: Allocator, jobs: []ParseJob, want: usize) usize {
     }
     pool.drain();
     for (threads[0..spawned]) |t| t.join();
+    for (jobs.items[0..files], 0..) |*job, i| {
+        if (job.result == .pieces) assemblePieces(allocator, jobs.items, i, job);
+    }
     return spawned + 1;
+}
+
+/// Joins the parsed pieces of file job `index` into its `ok` result, or
+/// parses the file whole again when a piece failed, so its diagnostics are
+/// the ones a whole parse reports. Frees the pieces and the file's tokens.
+fn assemblePieces(allocator: Allocator, jobs: []ParseJob, index: usize, job: *ParseJob) void {
+    var info = job.result.pieces;
+    defer info.lexed.deinit(allocator);
+    job.pieces = info.count;
+    var all_ok = true;
+    var n_decls: usize = 0;
+    var parse_ns: u64 = 0;
+    for (jobs) |*pj| {
+        const piece = pj.piece orelse continue;
+        if (piece.of != index) continue;
+        parse_ns += pj.parse_ns;
+        job.longest_piece_ns = @max(job.longest_piece_ns, pj.parse_ns);
+        switch (pj.result) {
+            .ok => |f| n_decls += f.decls.len,
+            else => all_ok = false,
+        }
+    }
+    job.parse_ns = parse_ns;
+    defer for (jobs) |*pj| {
+        const piece = pj.piece orelse continue;
+        if (piece.of == index) allocator.free(piece.tokens);
+    };
+    if (!all_ok) {
+        job.result = .skipped;
+        runParseJob(allocator, null, index, job);
+        return;
+    }
+    const decls = allocator.alloc(ast.Decl, n_decls) catch {
+        job.result = .skipped;
+        return;
+    };
+    var file_ast: ?KotlinFile = null;
+    var filled: usize = 0;
+    var next_index: usize = 0;
+    while (true) {
+        var found = false;
+        for (jobs) |*pj| {
+            const piece = pj.piece orelse continue;
+            if (piece.of != index or piece.index != next_index) continue;
+            const f = pj.result.ok;
+            if (file_ast == null) file_ast = f;
+            @memcpy(decls[filled .. filled + f.decls.len], f.decls);
+            filled += f.decls.len;
+            allocator.free(f.decls);
+            if (f.has_composable) file_ast.?.has_composable = true;
+            // The piece is spent: a caller walking every job must not see it as a file.
+            pj.result = .skipped;
+            found = true;
+            break;
+        }
+        if (!found) break;
+        next_index += 1;
+    }
+    var out = file_ast.?;
+    out.decls = decls;
+    out.span = span.Span.init(job.fid, 0, @intCast(job.src.len));
+    ast.expandFileClassAliases(allocator, &out);
+    if (std.c.getenv("KLIO_PARSE_CHECK") != null) {
+        checkPiecesAgainstWhole(allocator, job, &out);
+        checkNamesInSource(job, &out);
+    }
+    job.result = .{ .ok = out };
+}
+
+/// `KLIO_PARSE_CHECK`: parse the file whole again and report the first
+/// declaration whose span the piecewise parse got differently.
+fn checkPiecesAgainstWhole(allocator: Allocator, job: *const ParseJob, pieced: *const KotlinFile) void {
+    var lx = lexer.Lexer.init(allocator, job.fid, job.src) catch return;
+    var lexed = lx.tokenize() catch return;
+    defer lexed.deinit(allocator);
+    const p = parser.Parser.new(allocator, job.fid, job.src, lexed.tokens);
+    const whole = p.parseFile();
+    if (whole.decls.len != pieced.decls.len) {
+        std.debug.print("[parse-check] {s}: {d} declarations whole, {d} in pieces\n", .{ job.rel_path, whole.decls.len, pieced.decls.len });
+    }
+    const n = @min(whole.decls.len, pieced.decls.len);
+    for (whole.decls[0..n], pieced.decls[0..n], 0..) |*a, *b, i| {
+        const sa = declSpan(a);
+        const sb = declSpan(b);
+        if (sa.start != sb.start or sa.end != sb.end or std.meta.activeTag(a.*) != std.meta.activeTag(b.*) or
+            !std.mem.eql(u8, declName(a), declName(b)) or declShape(a) != declShape(b))
+        {
+            std.debug.print("[parse-check] {s}: declaration {d} differs: whole {s} `{s}` {d}..{d}, pieces {s} `{s}` {d}..{d}\n", .{
+                job.rel_path, i, @tagName(a.*), declName(a), sa.start, sa.end, @tagName(b.*), declName(b), sb.start, sb.end,
+            });
+            return;
+        }
+    }
+}
+
+fn declName(d: *const ast.Decl) []const u8 {
+    return switch (d.*) {
+        .Function => |*f| f.name.name,
+        .Property => |pr| pr.name.name,
+        .Class => |*c| c.name.name,
+        .Object => |*o| o.name.name,
+        .TypeAlias => |*t| t.name.name,
+    };
+}
+
+/// A coarse shape: parameter and member counts, whether a body is present.
+fn declShape(d: *const ast.Decl) usize {
+    return switch (d.*) {
+        .Function => |*f| f.params.len * 4 + @as(usize, @intFromBool(f.body != null)) * 2 + @as(usize, @intFromBool(f.receiver_type != null)),
+        .Property => |pr| @as(usize, @intFromBool(pr.init != null)) * 2 + @as(usize, @intFromBool(pr.getter != null)),
+        .Class => |*c| c.members.len * 4 + c.primary_params.len,
+        .Object => |*o| o.members.len,
+        .TypeAlias => 0,
+    };
+}
+
+/// `KLIO_PARSE_CHECK`: every declaration name must be a slice of the source.
+fn checkNamesInSource(job: *const ParseJob, file: *const KotlinFile) void {
+    const lo = @intFromPtr(job.src.ptr);
+    const hi = lo + job.src.len;
+    for (file.decls, 0..) |*d, i| {
+        const n = declName(d);
+        const a = @intFromPtr(n.ptr);
+        if (n.len > job.src.len or a < lo or a + n.len > hi) {
+            std.debug.print("[parse-check] {s}: declaration {d} ({s}) name outside the source: ptr {x} len {d}\n", .{ job.rel_path, i, @tagName(d.*), a, n.len });
+        }
+    }
+}
+
+fn declSpan(d: *const ast.Decl) span.Span {
+    return switch (d.*) {
+        .Function => |*f| f.span,
+        .Property => |pr| pr.span,
+        .Class => |*c| c.span,
+        .Object => |*o| o.span,
+        .TypeAlias => |*t| t.span,
+    };
 }
 
 /// Consume the embedded stdlib pack's `SOURCES`. Only the Kotlin sources are
@@ -428,10 +763,14 @@ fn loadEmbeddedStdlibSources(
     var jobs: std.ArrayList(ParseJob) = .empty;
     defer jobs.deinit(allocator);
     const t_register = runtime.clockMonotonicNanos();
+    // `KLIO_TRACE_FILES`: the FileId every stdlib source registers under.
+    const files_trace = std.c.getenv("KLIO_TRACE_FILES") != null;
+    if (files_trace) std.debug.print("[file] node sizes: Expr {d} Stmt {d} Decl {d} Function {d} TypeRef {d} Ident {d}\n", .{ @sizeOf(ast.Expr), @sizeOf(ast.Stmt), @sizeOf(ast.Decl), @sizeOf(ast.Function), @sizeOf(ast.TypeRef), @sizeOf(ast.Ident) });
     for (sources.files) |sf| {
         // Sources whose interpreted declarations would shadow klio's intrinsics.
         if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
         const fid = source_map.add(sf.rel_path, sf.bytes) catch continue;
+        if (files_trace) std.debug.print("[file] {d} {s}\n", .{ fid.int(), sf.rel_path });
         jobs.append(allocator, .{
             .fid = fid,
             .src = source_map.get(fid).source,
@@ -441,14 +780,17 @@ fn loadEmbeddedStdlibSources(
     const t_parse = runtime.clockMonotonicNanos();
     timing.register = t_parse - t_register;
     timing.files = jobs.items.len;
-    timing.threads = runParseJobs(allocator, jobs.items);
+    const file_jobs = jobs.items.len;
+    timing.threads = runParseJobs(allocator, &jobs);
     timing.lex_parse_wall = runtime.clockMonotonicNanos() - t_parse;
 
-    for (jobs.items) |*job| {
+    for (jobs.items[0..file_jobs]) |*job| {
         timing.lex += job.lex_ns;
         timing.parse += job.parse_ns;
-        if (job.lex_ns + job.parse_ns > timing.longest) {
-            timing.longest = job.lex_ns + job.parse_ns;
+        timing.pieces += job.pieces;
+        const critical = job.lex_ns + if (job.longest_piece_ns != 0) job.longest_piece_ns else job.parse_ns;
+        if (critical > timing.longest) {
+            timing.longest = critical;
             timing.longest_bytes = job.src.len;
         }
         if (diag and (std.mem.find(u8, job.rel_path, "Maps.kt") != null or
@@ -457,7 +799,7 @@ fn loadEmbeddedStdlibSources(
             io.printStderr(allocator, "[embed source] {s}\n", .{job.rel_path});
         }
         switch (job.result) {
-            .skipped => {},
+            .skipped, .pieces => {},
             .lex_errors => |n| if (diag) {
                 io.printStderr(allocator, "[embed lex err] {s}: {d} diags\n", .{ job.rel_path, n });
             },
@@ -938,7 +1280,7 @@ fn loadPackCandidate(
                     .rel_path = sf.rel_path,
                 }) catch continue;
             }
-            _ = runParseJobs(allocator, jobs.items);
+            _ = runParseJobs(allocator, &jobs);
             for (jobs.items) |job| {
                 const file_ast = switch (job.result) {
                     .ok => |f| f,
@@ -2023,6 +2365,97 @@ fn registerParseJobs(map: *SourceMap, sources: []const []const u8, jobs: []Parse
     }
 }
 
+/// Runs the jobs of a fixed array through the pool driver and copies the file
+/// results back; no file here is large enough to be cut.
+fn runJobsOn(a: Allocator, jobs: []ParseJob, want: usize) !usize {
+    var list: std.ArrayList(ParseJob) = .empty;
+    defer list.deinit(a);
+    try list.appendSlice(a, jobs);
+    const threads = runParseJobsOn(a, &list, want);
+    @memcpy(jobs, list.items[0..jobs.len]);
+    return threads;
+}
+
+test "a large source parses in pieces on the pool as it parses whole" {
+    const a = std.heap.smp_allocator;
+    // Declarations of every shape a cut must respect: blocks followed by
+    // `else`, `catch` and `finally` on their own lines, annotations, and
+    // expression bodies between block bodies.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "package p.big\nimport kotlin.collections.List\n");
+    var i: usize = 0;
+    while (src.items.len < chunk_min_bytes + chunk_bytes) : (i += 1) {
+        const decl = try std.fmt.allocPrint(a,
+            \\/** Doc {d}. */
+            \\fun f{d}(x: Int): Int {{
+            \\    return x + {d}
+            \\}}
+            \\val v{d} = if (f{d}(1) > 0) {{
+            \\    1
+            \\}}
+            \\else {{
+            \\    2
+            \\}}
+            \\val t{d} = try {{
+            \\    f{d}(2)
+            \\}}
+            \\catch (e: Exception) {{
+            \\    0
+            \\}}
+            \\finally {{
+            \\}}
+            \\@Deprecated("old")
+            \\fun g{d}() = f{d}(3)
+            \\class C{d} {{
+            \\    fun m() = {d}
+            \\}}
+            \\
+        , .{ i, i, i, i, i, i, i, i, i, i, i });
+        defer a.free(decl);
+        try src.appendSlice(a, decl);
+    }
+    const source = src.items;
+    var pooled_map = SourceMap.init(a);
+    defer pooled_map.deinit();
+    var pooled: std.ArrayList(ParseJob) = .empty;
+    defer pooled.deinit(a);
+    {
+        const fid = try pooled_map.add("big.kt", source);
+        try pooled.append(a, .{ .fid = fid, .src = pooled_map.get(fid).source, .rel_path = "big.kt" });
+    }
+    try std.testing.expect(runParseJobsOn(a, &pooled, 4) >= 2);
+    var serial_map = SourceMap.init(a);
+    defer serial_map.deinit();
+    var serial: std.ArrayList(ParseJob) = .empty;
+    defer serial.deinit(a);
+    {
+        const fid = try serial_map.add("big.kt", source);
+        try serial.append(a, .{ .fid = fid, .src = serial_map.get(fid).source, .rel_path = "big.kt" });
+    }
+    try std.testing.expectEqual(@as(usize, 1), runParseJobsOn(a, &serial, 1));
+
+    const pf = pooled.items[0];
+    const sf = serial.items[0];
+    try std.testing.expect(pf.pieces >= 2);
+    try std.testing.expect(pf.result == .ok);
+    try std.testing.expect(sf.result == .ok);
+    for (pooled.items[1..]) |*piece| try std.testing.expect(piece.result == .skipped);
+    const pd = pf.result.ok.decls;
+    const sd = sf.result.ok.decls;
+    try std.testing.expectEqual(sd.len, pd.len);
+    try std.testing.expect(pd.len >= 5 * i);
+    for (sd, pd) |*x, *y| {
+        try std.testing.expectEqual(std.meta.activeTag(x.*), std.meta.activeTag(y.*));
+        try std.testing.expectEqualStrings(declName(x), declName(y));
+        try std.testing.expectEqual(declSpan(x).start, declSpan(y).start);
+        try std.testing.expectEqual(declSpan(x).end, declSpan(y).end);
+        try std.testing.expectEqual(declShape(x), declShape(y));
+    }
+    try std.testing.expectEqualStrings("p", pf.result.ok.package.?.path[0].name);
+    try std.testing.expectEqual(@as(usize, 1), pf.result.ok.imports.len);
+}
+
 test "parse jobs on a pool match serial parsing and keep file order" {
     // The pool needs an allocator that serves several threads at once.
     const a = std.heap.smp_allocator;
@@ -2037,13 +2470,13 @@ test "parse jobs on a pool match serial parsing and keep file order" {
     defer pooled_map.deinit();
     var pooled: [sources.len]ParseJob = undefined;
     try registerParseJobs(&pooled_map, &sources, &pooled);
-    try std.testing.expect(runParseJobsOn(a, &pooled, 4) >= 1);
+    try std.testing.expect(try runJobsOn(a, &pooled, 4) >= 1);
 
     var serial_map = SourceMap.init(a);
     defer serial_map.deinit();
     var serial: [sources.len]ParseJob = undefined;
     try registerParseJobs(&serial_map, &sources, &serial);
-    try std.testing.expectEqual(@as(usize, 1), runParseJobsOn(a, &serial, 1));
+    try std.testing.expectEqual(@as(usize, 1), try runJobsOn(a, &serial, 1));
 
     try std.testing.expect(pooled[0].result == .ok);
     try std.testing.expect(pooled[1].result == .lex_errors);
@@ -2054,6 +2487,7 @@ test "parse jobs on a pool match serial parsing and keep file order" {
         try std.testing.expectEqual(@as(u32, @intCast(i)), pj.fid.int());
         try std.testing.expectEqual(std.meta.activeTag(sj.result), std.meta.activeTag(pj.result));
         switch (pj.result) {
+            .pieces => unreachable,
             .ok => |pf| {
                 const sf = sj.result.ok;
                 try std.testing.expectEqual(pj.fid, pf.span.file);

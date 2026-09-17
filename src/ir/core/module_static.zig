@@ -644,8 +644,8 @@ pub fn staticTypeDisproofComplete(
     raw_ty: TypeRef,
     bounds: []const ModuleRegistry.TypeParamBound,
 ) bool {
-    const relaxed = if (std.c.getenv("KLIO_TP_DISPROOF")) |v|
-        !std.mem.eql(u8, std.mem.span(v), "0")
+    const relaxed = if (runtime.envOnce("KLIO_TP_DISPROOF")) |v|
+        !std.mem.eql(u8, v, "0")
     else
         true;
     if (!relaxed) return self.staticTypeProofComplete(raw_ty, bounds);
@@ -1370,8 +1370,8 @@ pub fn staticGenericReceiverApplicableMode(
     const a = arena.allocator();
     var bindings: std.ArrayList(TypeBinding) = .empty;
     const gra_trace = blk: {
-        const w = std.c.getenv("KLIO_GRA_TRACE") orelse break :blk false;
-        break :blk std.mem.eql(u8, std.mem.span(w), staticTypeHead(actual.name));
+        const w = runtime.envOnce("KLIO_GRA_TRACE") orelse break :blk false;
+        break :blk std.mem.eql(u8, w, staticTypeHead(actual.name));
     };
     // The HEADS must relate before argument binding proves anything: a `Sequence<T>` pattern never
     // applies to an `Iterable<String>`. A pattern head that IS a declared parameter defers to binding.
@@ -1744,8 +1744,8 @@ pub fn lambdaRefuteOn() bool {
         var val: bool = true;
     };
     if (!S.cached) {
-        S.val = std.c.getenv("KLIO_LAMBDA_REFUTE") == null or
-            !std.mem.eql(u8, std.mem.span(std.c.getenv("KLIO_LAMBDA_REFUTE").?), "0");
+        S.val = runtime.envOnce("KLIO_LAMBDA_REFUTE") == null or
+            !std.mem.eql(u8, runtime.envOnce("KLIO_LAMBDA_REFUTE").?, "0");
         S.cached = true;
     }
     return S.val;
@@ -1778,7 +1778,7 @@ pub fn bargTraceEnv() ?[]const u8 {
         var val: ?[]const u8 = null;
     };
     if (!S.cached) {
-        S.val = if (std.c.getenv("KLIO_BARG_TRACE")) |w| std.mem.span(w) else null;
+        S.val = runtime.envOnce("KLIO_BARG_TRACE");
         S.cached = true;
     }
     return S.val;
@@ -1790,7 +1790,7 @@ pub fn dropTraceEnv() ?[]const u8 {
         var val: ?[]const u8 = null;
     };
     if (!S.cached) {
-        S.val = if (std.c.getenv("KLIO_DROP_TRACE")) |w| std.mem.span(w) else null;
+        S.val = runtime.envOnce("KLIO_DROP_TRACE");
         S.cached = true;
     }
     return S.val;
@@ -1832,8 +1832,8 @@ pub fn staticMemberArgsCompatibility(
     const skip: usize = if (f.params.len != 0 and
         std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     const params = f.params[skip..];
-    if (std.c.getenv("KLIO_SMAC_TRACE")) |w| {
-        if (std.mem.eql(u8, std.mem.span(w), f.name)) {
+    if (runtime.envOnce("KLIO_SMAC_TRACE")) |w| {
+        if (std.mem.eql(u8, w, f.name)) {
             std.debug.print("[smac] rt={} {s}#{d} nargs={d} recv={s} recv_args={d} nf={d}\n", .{
                 eval.currentFrameFunc() != null,
                 f.fqn,
@@ -1909,8 +1909,8 @@ pub fn staticMemberArgsCompatibility(
             instantiated_param,
             actual_bounds,
         );
-        if (std.c.getenv("KLIO_SMAC_TRACE")) |w| {
-            if (std.mem.eql(u8, std.mem.span(w), f.name)) {
+        if (runtime.envOnce("KLIO_SMAC_TRACE")) |w| {
+            if (std.mem.eql(u8, w, f.name)) {
                 std.debug.print("[smac-arg] param={s}<{d}> inst={s}<{d}> arg_ty={s} route={s} -> {s}\n", .{
                     param.ty.name,
                     param.ty.args.len,

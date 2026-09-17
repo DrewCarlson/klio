@@ -222,7 +222,8 @@ fn receiverVerdict(
 /// Verdicts of `receiverVerdict`, keyed by everything it reads.
 pub const RecvVerdictCache = struct {
     pub const Verdict = struct { compat: m_static.StaticCompatibility, pruned: bool };
-    map: std.StringHashMapUnmanaged(Verdict) = .empty,
+    /// Keyed by a 128-bit hash of the verdict's inputs; see `recvVerdictKey`.
+    map: std.AutoHashMapUnmanaged(u128, Verdict) = .empty,
     classes_n: usize = 0,
     funcs_n: usize = 0,
     chain_gen: u32 = 0,
@@ -231,8 +232,7 @@ pub const RecvVerdictCache = struct {
     misses: u64 = 0,
 
     pub fn clear(self: *RecvVerdictCache, gpa: Allocator) void {
-        var it = self.map.keyIterator();
-        while (it.next()) |k| gpa.free(k.*);
+        _ = gpa;
         self.map.clearRetainingCapacity();
     }
 };
@@ -279,7 +279,7 @@ fn recvVerdictKey(
     scoped_receiver: TypeRef,
     fid: FuncId,
     bounds: []const ModuleRegistry.TypeParamBound,
-) ?[]const u8 {
+) ?u128 {
     var w = std.Io.Writer.fixed(buf);
     writeTypeRef(&w, scoped_receiver) catch return null;
     w.print("|{d}|{d}|", .{ @intFromBool(typeContainsBoundParam(receiver, bounds)), fid.int() }) catch return null;
@@ -288,7 +288,12 @@ fn recvVerdictKey(
         for (b.args) |arg| w.print("<{s}", .{arg}) catch return null;
         w.writeByte(';') catch return null;
     }
-    return w.buffered();
+    // Two independently seeded 64-bit hashes of the written form: the map
+    // then stores no key bytes, and 2^-128 is below any other failure here.
+    const bytes = w.buffered();
+    const lo = std.hash.Wyhash.hash(0x9E3779B97F4A7C15, bytes);
+    const hi = std.hash.Wyhash.hash(0xC2B2AE3D27D4EB4F, bytes);
+    return (@as(u128, hi) << 64) | lo;
 }
 
 /// The last few extension resolutions, keyed on everything the ranking reads:
@@ -701,7 +706,7 @@ fn resolveExtensionCallUncached(
         var compatibility: m_static.StaticCompatibility = .unknown;
         var verdict_hit = false;
         var key_buf: [768]u8 = undefined;
-        const verdict_key: ?[]const u8 = if (rex_trace) null else recvVerdictKey(&key_buf, receiver, scoped_receiver, fid, ctx.actual_type_param_bounds);
+        const verdict_key: ?u128 = if (rex_trace) null else recvVerdictKey(&key_buf, receiver, scoped_receiver, fid, ctx.actual_type_param_bounds);
         const vcache = if (verdict_key != null) self.recvVerdictCache() else null;
         if (vcache) |c| {
             if (c.map.get(verdict_key.?)) |v| {
@@ -716,10 +721,7 @@ fn resolveExtensionCallUncached(
             compatibility = receiverVerdict(self, sa, name, fid, f, ds, receiver, scoped_receiver, scoped_receiver_alias, scoped_receiver_cid, ctx, rex_trace, &receiver_pruned) catch return .{};
             if (vcache) |c| {
                 c.misses += 1;
-                const gpa = self.lookup_cache_gpa.?;
-                if (gpa.dupe(u8, verdict_key.?)) |owned| {
-                    c.map.put(gpa, owned, .{ .compat = compatibility, .pruned = receiver_pruned != pruned_before }) catch gpa.free(owned);
-                } else |_| {}
+                c.map.put(self.lookup_cache_gpa.?, verdict_key.?, .{ .compat = compatibility, .pruned = receiver_pruned != pruned_before }) catch {};
             }
         }
         if (compatibility == .incompatible) continue;
@@ -953,8 +955,8 @@ fn resolveExtensionCallUncached(
         false;
     // Exactly one candidate survives elimination by proof, so commit it. Guarded
     // to receivers carrying explicit type arguments; a bare head withholds.
-    const sole_off = if (std.c.getenv("KLIO_SOLE_EXT")) |v|
-        std.mem.eql(u8, std.mem.span(v), "0")
+    const sole_off = if (runtime.envOnce("KLIO_SOLE_EXT")) |v|
+        std.mem.eql(u8, v, "0")
     else
         false;
     // A member-refuted call commits its sole survivor only when that candidate is
@@ -1109,8 +1111,8 @@ pub fn resolveMemberCall(
         const listed_values = f.params.len - @intFromBool(lists_this);
         if (ds.arity.total != 0 and listed_values < ds.arity.required and (!f.hasBody() or listed_values < ds.arity.total)) {
             if (args.len >= ds.arity.required and (args.len <= ds.arity.total or ds.arity.has_vararg)) {
-                if (std.c.getenv("KLIO_RMC_TRACE")) |w| {
-                    if (std.mem.eql(u8, std.mem.span(w), name)) std.debug.print("[rmc] {s} cand={s}#{d} STUB-UNKNOWN params={d} body={} required={d} total={d}\n", .{ name, f.fqn, fid.int(), f.params.len, f.hasBody(), ds.arity.required, ds.arity.total });
+                if (runtime.envOnce("KLIO_RMC_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, name)) std.debug.print("[rmc] {s} cand={s}#{d} STUB-UNKNOWN params={d} body={} required={d} total={d}\n", .{ name, f.fqn, fid.int(), f.params.len, f.hasBody(), ds.arity.required, ds.arity.total });
                 }
                 any_applicable = true;
                 unknown = fid;
@@ -1238,8 +1240,8 @@ pub fn resolveMemberCall(
     // its `open`/`abstract` members: only a final member is bound direct.
     const closed_class = !class.is_open and !class.is_abstract and !class.is_enum;
     const direct = !class.is_interface and (closed_class or (!declared_on_interface and methodIsFinal(f)));
-    if (std.c.getenv("KLIO_DISPATCH_TRACE")) |w| {
-        if (std.mem.eql(u8, std.mem.span(w), name)) std.debug.print("[dispatch] {s} owner={s} iface={} open={} abstract={} stub={} decl_owner={s} decl_iface={} decl_stub={} final={} -> {s}\n", .{ name, class.fqn, class.is_interface, class.is_open, class.is_abstract, class.is_stub, if (declaring_class) |d| d.fqn else "-", declared_on_interface, if (declaring_class) |d| d.is_stub else false, methodIsFinal(f), if (direct) "direct" else "virtual" });
+    if (runtime.envOnce("KLIO_DISPATCH_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name)) std.debug.print("[dispatch] {s} owner={s} iface={} open={} abstract={} stub={} decl_owner={s} decl_iface={} decl_stub={} final={} -> {s}\n", .{ name, class.fqn, class.is_interface, class.is_open, class.is_abstract, class.is_stub, if (declaring_class) |d| d.fqn else "-", declared_on_interface, if (declaring_class) |d| d.is_stub else false, methodIsFinal(f), if (direct) "direct" else "virtual" });
     }
     if (direct) {
         return .{ .target = target, .dispatch = .direct, .applicable = true };

@@ -381,12 +381,15 @@ backend (the default for `fast`/`safe`).
 | `KLIO_ENUM_INIT_TRACE` | set | VM-start enum entry construction: which entries are rebuilt through the class path and the header thunk chain per class | `[enum-init]`, `[chain]` |
 | `KLIO_CTOR_TRACE` | set | Each secondary-constructor default-argument thunk as it is evaluated (class, parameter, thunk id, argument count) | `[ctor-default]` |
 | `KLIO_TOPPROP_TRACE` | set | A top-level property initializer that deferred to on-access during the startup pass, with its error tag | `[topprop-defer]` |
-| `KLIO_PARSE_JOBS` | count | Caps the threads that lex and parse the stdlib and pack sources at load (default: one per CPU); `1` parses serially | none |
+| `KLIO_PARSE_JOBS` | count | Caps the threads that lex and parse the stdlib and pack sources at load (default: one per CPU); `1` parses serially, every file whole, which is the reference for the pool's piecewise parse of the largest files | none |
+| `KLIO_STAGE_DIAG` | set | Runs the checker's declaration-level diagnostic passes during the bake's eager-call stage, which otherwise skips them; the base image must be byte-identical either way | none |
+| `KLIO_PARSE_CHECK` | set | Prints where each large source was cut into pieces for the parse pool, parses each such file whole again and reports the first declaration the piecewise parse got differently, and checks every declaration name is a slice of its source | `[parse-check]` |
+| `KLIO_TRACE_FILES` | set | The FileId each stdlib source registers under, for reading a `fN:offset` span in a trace | `[file]` |
 | `KLIO_TYPECK_THREADS` | count | Caps the threads the checker's body pass uses when it records the base's call resolutions during a bake (default: one per CPU); `1` checks serially | none |
 | `KLIO_LOWER_FINGERPRINT` | set | After the top-level bodies lower, one line per function with a hash of everything it carries but addresses; two builds of one module compare by these lines | `[fn]` |
 | `KLIO_LOWER_THREADS` | count | Caps the threads that lower the base's function bodies during a bake (default: one per CPU); `1` lowers serially, which is the reference the pool must match | none |
-| `KLIO_TRACE_LOWER` | set | Wall time of every lowering step of a build, the per-body total with the slowest bodies, and the resolution cache hit counts | `[lower]` |
-| `KLIO_TRACE_RUN` | set | Wall time of the run's own steps: base clone, VM init, top-level property initialisation, `main`, teardown, and the prepare/execute split | `[run]` |
+| `KLIO_TRACE_LOWER` | set | Wall time and resident set after every lowering step of a build, the per-body total with the slowest bodies, the resolution cache hit counts, and what the dead-body strip freed | `[lower]` |
+| `KLIO_TRACE_RUN` | set | Wall time of the run's own steps: the startup before the image path, base clone, VM init, top-level property initialisation, the pre-execution trim with the slab's mapped bytes before and after it, `main`, teardown, and the prepare/execute split with the resident set | `[run]` |
 | `KLIO_BOX_FILTER` / `KLIO_BOX_JOBS` / `KLIO_BOX_TIMEOUT_MS` | substring / count / ms | The box conformance runner's test subset, worker width, and per-test wall | `[box-fail]`, `[box-excluded]` |
 | `KLIO_GC_STRESS` | set; `0`/empty off | Collects at every safe point; surfaces incomplete roots/tracers immediately | none |
 | `KLIO_GC_STRESS_EVERY` | number (`0` off) | Collects every N safe points (cheaper sampled stress) | none |
@@ -401,8 +404,11 @@ backend (the default for `fast`/`safe`).
 | `KLIO_BOXDIE_TRACE` | set | Logs, with a native stack, a boxed List view whose box dies while a backing value is still attached | `[boxdie]` |
 | `KLIO_ALLOC_TRACK` | set; `0`/empty off | Global allocation counters, a size histogram, and named phase snapshots; whole-process report at exit | `[alloc-track]` |
 | `KLIO_PAGE_TRACE` | set; `0`/empty off | Histogram of direct page allocations, with stacks for the 96 KB to 160 KB window | `[page-trace]` |
-| `KLIO_SLAB_STAT` | set | Total bytes currently mapped from the OS, printed at exit | `[slab]` |
-| `KLIO_SLAB_TRACE` | set | Capture stacks of every live slab/large mmap, dumped at exit or on SIGTERM/SIGINT | `[slabtrace]` |
+| `KLIO_SLAB_STAT` | set | Total bytes currently mapped from the OS, printed at exit, and at the pre-execution trim the per-size-class occupancy: partial spans, their free and dormant cells, parked spares, and what that leaves live | `[slab]` |
+| `KLIO_SLAB_TRACE` | set | Capture stacks of every live slab/large mmap made after the program started, dumped at exit or on SIGTERM/SIGINT; a span is attributed to the allocation that mapped it | `[slabtrace]` |
+| `KLIO_SLAB_TRACE_ALL` | set (with `KLIO_SLAB_TRACE`) | Traces the build-phase mmaps too, so a SIGTERM during `main` attributes everything a cold run still holds | `[slabtrace]` |
+| `KLIO_SLAB_POISON` | set | Overwrites every freed slab cell with `0xAA`, so a reader of freed memory sees garbage at once; the check to run the corpus and the sweep under after anything that frees build-phase trees | none |
+| `KLIO_PRUNE_KEEP` | set | Leaves the stripped stdlib function bodies allocated instead of freeing them after the base build. A cold-run failure that disappears under it is a pointer into a stripped body that `prune.collectPinned` does not know about; the image baked with and without it must be byte-identical | none |
 | `KLIO_CELL_TRACE` | set | Sampled tracking of live small slab cells with their allocation stacks | `[slabtrace]` |
 | `KLIO_DECODE_STATS` | set | Per-type decoded bytes/nodes while loading a stdlib/module image, top 25 by bytes | `[decode-stats]` |
 | `KLIO_RSS_CAP_KB` | KiB (default 6 GiB) | The RSS watchdog cap; the process aborts the moment RSS exceeds it, forestalling the kernel OOM killer. `0`/unset keeps the default (it does not disable the watchdog) | `[klio]` |

@@ -761,6 +761,8 @@ fn applyExpectActualSubstitutions(ctx: *BuildCtx, out_lifted: ?*[]Decl) Allocato
     }
     ctx.decls = decls_list.items;
     if (out_lifted) |out| out.* = ctx.decls;
+    // Every later pass reads `ctx.decls`; the pre-filter copies are dead.
+    all_decls.clearAndFree(a);
 }
 
 fn inheritExpectFunctionDefaults(ctx: *BuildCtx) Allocator.Error!void {
@@ -1812,13 +1814,13 @@ fn registerHeaderTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) 
             }
         }
         const hdr_skip = blk: {
-            const w = std.c.getenv("KLIO_HDR_BOUNDS_SKIP") orelse break :blk false;
-            break :blk std.mem.find(u8, std.mem.span(w), f.name.name) != null;
+            const w = runtime.envOnce("KLIO_HDR_BOUNDS_SKIP") orelse break :blk false;
+            break :blk std.mem.find(u8, w, f.name.name) != null;
         };
         // `KLIO_HDR_BOUNDS=0` disables this; `KLIO_HDR_BOUNDS_SKIP` bisects by name.
         const hdr_on = blk: {
-            const w = std.c.getenv("KLIO_HDR_BOUNDS") orelse break :blk true;
-            break :blk !std.mem.eql(u8, std.mem.span(w), "0");
+            const w = runtime.envOnce("KLIO_HDR_BOUNDS") orelse break :blk true;
+            break :blk !std.mem.eql(u8, w, "0");
         };
         if (hdr_on and hdr_bounds.items.len != 0 and !hdr_skip) {
             if (runtime.envSetOnce("KLIO_HDR_BOUNDS_LIST")) {

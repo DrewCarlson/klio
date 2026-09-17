@@ -89,6 +89,8 @@ pub const Parser = struct {
     /// Inside an accessor body `field` is the backing-field expression, so
     /// local-property parsing must not read `field = value` as a field clause.
     in_accessor_body: bool,
+    /// Set when any annotation named `Composable` is parsed.
+    saw_composable: bool = false,
     /// Per token: inside an unclosed `(` or `[`, but not `{`, where Kotlin
     /// treats newlines as soft. Precomputed for O(1) lookup; allocated from
     /// `allocator`.
