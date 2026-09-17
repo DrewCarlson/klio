@@ -63,6 +63,32 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
         defer cg.deinit();
         break :blk cg.get().fqn;
     };
+    // The memo the two resolutions below fill. A recorded route proves the class-level
+    // delegate walk already answered no, since the delegate arm returns before either
+    // put; only the per-INSTANCE delegate question is left, and that one is a pointer
+    // walk rather than a name lookup. Anything unusual — an outer hop, an unset
+    // `lateinit`, a delegate value in the slot — declines to the full ladder.
+    if (!runtimeClassDelegatesProp(inst, name)) {
+        if (host_call_member.memberNameIdentity(self, name)) |name_p| {
+            const cls_id: usize = @intCast(runtime.InstanceData.classIdentityUnlocked(inst));
+            if (fieldReadCacheGet(self, cls_id, name_p)) |hit| memo: {
+                const NONE = root.ProgramImage.FieldReadHit.NONE;
+                if (hit.getter != NONE) {
+                    return try evalGetterTagged(self, allocator, @enumFromInt(hit.getter), receiver.*, "field-memo");
+                }
+                if (hit.stored_idx == NONE or hit.outer_hops != 0) break :memo;
+                const g = inst.borrow();
+                defer g.deinit();
+                const fields = g.get().fields.items;
+                if (hit.stored_idx >= fields.len) break :memo;
+                const f = &fields[hit.stored_idx];
+                // Instances add slots, so the recorded index is re-verified by name.
+                if (!std.mem.eql(u8, f.name, name)) break :memo;
+                if (f.value == .Null or f.value == .Delegate) break :memo;
+                return ok(f.value);
+            }
+        }
+    }
     // Delegated body property: route through the delegate's `getValue`.
     const delegate_owner: bool = runtimeClassDelegatesProp(inst, name) or blk: {
         // With no `by`-delegated body properties at all, skip the supertype walk.
