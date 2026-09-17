@@ -72,8 +72,14 @@ durably: `"kotlinx.serialization" = { features = ["json"] }` under
 
 An import that lands in a module that is not active prints a note
 naming the feature to enable. A pack with no `[features]` table is a
-single module and loads whole. The shipped feature tables are on each
-pack's page: [kotlinx.coroutines](shipped/coroutines.md),
+single module and loads whole.
+
+A program's dependencies belong in its `klio.toml`: `[deps]` names the
+packs and the features of each, and that is the whole load set. A file
+run without a manifest still selects packs by matching its imports
+against installed pack ids; that path exists for one-off scripts and is
+being retired in favour of declared dependencies. The shipped feature
+tables are on each pack's page: [kotlinx.coroutines](shipped/coroutines.md),
 [kotlinx.serialization](shipped/serialization.md),
 [kotlinx.io](shipped/io.md), and [io.ktor](shipped/ktor.md).
 

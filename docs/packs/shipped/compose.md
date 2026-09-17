@@ -3,10 +3,11 @@
 Compose Multiplatform ships as one pack per upstream module, each named
 after its Maven artifact, all vendored from one compose-multiplatform-core
 checkout (v1.12.0) hosted under `kotlin-klio/klio-compose-runtime/upstream`.
-A pack loads when a program's imports prefix-match its id, so
-`import androidx.compose.material3.Button` pulls `androidx.compose.material3`
-and, through its `[deps]`, every module under it; nothing needs a
-`--feature` flag.
+A program declares the packs it uses in its `klio.toml`
+(`"androidx.compose.material3" = "*"` pulls, through that pack's `[deps]`,
+every module under it); a manifest-less file still selects packs by import
+prefix, the legacy path being retired. No compose pack has features:
+each upstream module is its own pack.
 
 | Pack id                              | Upstream module                | Depends on                                               |
 |--------------------------------------|--------------------------------|----------------------------------------------------------|

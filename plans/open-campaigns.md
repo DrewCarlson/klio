@@ -122,26 +122,26 @@ against the code.
   `docs/packs/authoring.md`). Modules present in the sparse checkouts but not
   shipped, each one more feature once it parses and runs: serialization cbor /
   protobuf / properties; ktor network, client-cio, server-cio, the auth /
-  logging / sse / websockets / status-pages plugins. Open design question:
-  collapsing the per-module compose packs into one `androidx.compose` pack
-  with features would need import-driven feature activation to stay
-  flag-free.
+  logging / sse / websockets / status-pages plugins. Direction: what a
+  program depends on is declared, never inferred. Features already are
+  (`--feature`, or `[deps]` with `features = [...]`); pack selection by
+  import prefix is the legacy path for a manifest-less file and is to be
+  retired, so every example, fixture, and itest program moves under a
+  `klio.toml` that names its packs and features (`// Run with:` headers are
+  the interim spelling), and a file with no manifest resolves against the
+  stdlib alone.
 - kotlinx-coroutines-test's own suite (`klio test kotlin-klio/klio-kotlinx-coroutines
-  --test-group test`, composed under the `test` feature) is 43 / 75 green:
-  the runTest timeout and uncaught-exception contracts and Main mocking
-  fail, and `RunTestTest.testCoroutineCompletingWithoutDispatch` panics with
-  an integer overflow in `src/ir/eval/fused.zig` (fusedInst); see
-  `pack-module-features.md`.
-- The shipped stdlib image (`zig build` -> `bake-image --stdlib-cache`,
-  installed under `share/klio/cache`) diverges from a runtime bake of the
-  same binary: served from it, `examples/delegates.kt`,
-  `complex_oop_delegation.kt`, `coroutine_context_completion.kt`, and
-  `function_type_supertypes.kt` fail (`getValue` on a top-level `by lazy`
-  dispatches to `kotlin.text.toHexString`; `coroutineContext` reads a
-  `Result`), while the same binary copied elsewhere (a new exe stamp, so the
-  shipped key misses and the run bakes) passes them. Present at d76d86b6.
-  Repro: `rm -rf $KLIO_HOME/.klio/cache && klio run examples/delegates.kt`
-  with `KLIO_TRACE_STDLIB_IMAGE=1` showing `hit (shipped)`.
+  --test-group test`, composed under the `test` feature) runs whole at 42
+  passed, 31 failed, 2 skipped: RunTestTest (16: the timeout and
+  uncaught-exception contracts), TestScopeTest (11: background work, child
+  failure cancellation, scheduler reuse), TestDispatchersTest (4: Main
+  mocking, the immediate dispatcher), and one scheduler-reuse test in each
+  of the Standard and Unconfined dispatcher suites.
+- A second image bake in one process lowers differently from the first
+  (the shipped full-gate image diverged from a runtime bake by six megabytes
+  and misdispatched `getValue`; `bake-image --stdlib-cache` now bakes each
+  probe in a child). The state a bake leaves behind is not identified; every
+  in-process multi-bake path is suspect until it is.
 - Pack-actual residuals in kotlinx-io: `SegmentPool` is a no-op,
   `isWindows` is false, the line separator is `\n`.
 - Lazy image: record the RSS win; drop the retained `lifted_decls` field
