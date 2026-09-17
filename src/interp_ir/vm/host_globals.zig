@@ -294,11 +294,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
                 defer sg.deinit();
                 sg.get().put(class_id.int(), inst) catch {};
             }
-            {
-                const g = self.globals.borrowMut();
-                defer g.deinit();
-                g.get().define(name, inst) catch {};
-            }
+            defineRootGlobal(self, name, inst);
             clearObjectState(self, name);
             return .{ .ok = inst };
         },
@@ -417,12 +413,13 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
                 defer sg.deinit();
                 sg.get().put(class_id.int(), inst) catch {};
             }
-            {
-                const g = self.globals.borrowMut();
+            defineRootGlobal(self, fqn, inst);
+            const simple_bound = blk: {
+                const g = self.globals.borrow();
                 defer g.deinit();
-                g.get().define(fqn, inst) catch {};
-                if (g.get().lookup(simple) == null) g.get().define(simple, inst) catch {};
-            }
+                break :blk g.get().lookup(simple) != null;
+            };
+            if (!simple_bound) defineRootGlobal(self, simple, inst);
             clearObjectState(self, fqn);
             return .{ .ok = inst };
         },
@@ -1084,8 +1081,8 @@ fn delegatesStub(ctx: *CallCtx) Allocator.Error!runtime.EvalResult {
 }
 
 const PRIMITIVE_TYPE_NAMES = [_][]const u8{
-    "Int",     "Long",  "Short", "Byte",   "Float", "Double",
-    "Boolean", "Char",  "String", "Unit",  "Any",   "Nothing",
+    "Int",     "Long",  "Short",  "Byte",  "Float",  "Double",
+    "Boolean", "Char",  "String", "Unit",  "Any",    "Nothing",
     "UInt",    "ULong", "UShort", "UByte", "Number",
 };
 
@@ -1329,7 +1326,6 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
     return null;
 }
 
-
 /// The effective lookup key for a top-level property read. A `var` with a
 /// custom setter but a default getter stores under `__klio_topfield__<name>`
 /// so plain-name writes dispatch the setter; a custom getter keeps the miss.
@@ -1510,7 +1506,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
     }
 
     if (cached) |v| {
-        if (gtrace) std.debug.print("[gtrace] {s} arm=cached kind={s}\n", .{ name, @tagName(v) });
+        if (gtrace) std.debug.print("[gtrace] {s} arm=cached kind={s} id={x} host={x} globals={x} thread={d}\n", .{ name, @tagName(v), if (v == .Instance) @intFromPtr(v.Instance.asPtr()) else 0, @intFromPtr(self), @intFromPtr(self.globals.asPtr()), std.Thread.getCurrentId() });
         if (v == .Delegate) {
             const d = v.Delegate;
             const kind: DelegateKind = blk2: {
@@ -1833,12 +1829,13 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
     }
 
     // Assign through the scope chain so a write from a child scope mutates the
-    // real top-level binding; only a genuinely new name defines here.
-    const g = self.globals.borrowMut();
-    defer g.deinit();
-    if (g.get().assign(name, value) != null) {
-        try g.get().define(name, value);
-    }
+    // real top-level binding; only a genuinely new name defines, at the root.
+    const assigned = blk: {
+        const g = self.globals.borrowMut();
+        defer g.deinit();
+        break :blk g.get().assign(name, value) == null;
+    };
+    if (!assigned) defineRootGlobal(self, name, value);
     return .{ .ok = {} };
 }
 
@@ -1849,6 +1846,33 @@ pub fn mainFuncNameMatches(self: *VmHost, fid: ir.FuncId, name: []const u8) bool
     defer mg.deinit();
     const f = mg.get().funcById(fid) orelse return false;
     return std.mem.eql(u8, f.name, name);
+}
+
+/// The outermost globals scope. An anonymous object's body runs under a
+/// transient capture layer over the program's globals, and a top-level
+/// binding made in that layer would vanish with it: a file's `<clinit>`
+/// would run again elsewhere and hand out a second sentinel or singleton.
+pub fn rootGlobals(self: *VmHost) ObjRef(runtime.Env) {
+    var cur = self.globals.clone();
+    while (true) {
+        const parent: ?ObjRef(runtime.Env) = blk: {
+            const g = cur.borrow();
+            defer g.deinit();
+            break :blk if (g.get().parent) |p| p.clone() else null;
+        };
+        const next = parent orelse return cur;
+        cur.deinit();
+        cur = next;
+    }
+}
+
+/// Bind a top-level name in the root globals scope.
+pub fn defineRootGlobal(self: *VmHost, name: []const u8, value: Value) void {
+    const root_env = rootGlobals(self);
+    defer root_env.deinit();
+    const g = root_env.borrowMut();
+    defer g.deinit();
+    g.get().define(name, value) catch {};
 }
 
 pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []const u8) Allocator.Error!MaybeValueResult {

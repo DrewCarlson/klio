@@ -613,7 +613,19 @@ fn atomicRefCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     defer g.deinit();
     const guard = g.get();
     const cur = guard.get("value") orelse Value.Null;
-    if (Value.referenceEq(&cur, &expected)) {
+    const swapped = Value.referenceEq(&cur, &expected);
+    if (runtime.envOnce("KLIO_CAS_TRACE") != null) {
+        std.debug.print("[cas] ref @{x} cur={s}@{x} expected={s}@{x} update={s} swapped={}\n", .{
+            @intFromPtr(inst.asPtr()),
+            @tagName(cur),
+            if (cur == .Instance) @intFromPtr(cur.Instance.asPtr()) else 0,
+            @tagName(expected),
+            if (expected == .Instance) @intFromPtr(expected.Instance.asPtr()) else 0,
+            @tagName(update),
+            swapped,
+        });
+    }
+    if (swapped) {
         if (runtime.reclaimEnabled()) update.retain();
         try guard.define(ctx.allocator, "value", update);
         return ok(.{ .Bool = true });

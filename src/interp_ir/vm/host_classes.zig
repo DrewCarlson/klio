@@ -3,6 +3,7 @@
 //! `*VmHost`, aliased as methods by `vmhost.zig`.
 
 const std = @import("std");
+const host_globals = @import("host_globals.zig");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -1025,9 +1026,7 @@ fn publishLocalSingleton(self: *VmHost, allocator: Allocator, class_name: []cons
     switch (r) {
         .ok => |inst| {
             if (dbg) std.debug.print("[init-debug] local singleton {s} -> {s} ({s})\n", .{ class_name, global_name, @tagName(std.meta.activeTag(inst)) });
-            const g = self.globals.borrowMut();
-            defer g.deinit();
-            g.get().define(global_name, inst) catch {};
+            host_globals.defineRootGlobal(self, global_name, inst);
         },
         .err => |e| {
             if (dbg) std.debug.print("[init-debug] local singleton {s} FAILED: {s}\n", .{ class_name, @tagName(std.meta.activeTag(e)) });
@@ -1399,30 +1398,29 @@ fn isReflectionTypeName(name: []const u8) bool {
 fn isBuiltinTypeName(name: []const u8) bool {
     const builtins = [_][]const u8{
         // Primitives + their boxed/number forms.
-        "Int",                           "Long",                                 "Short",                           "Byte",                         "Double",              "Float",                      "Char",                     "Boolean",
-        "UInt",                          "ULong",                                "UShort",                          "UByte",                        "Number",              "Unit",                       "Nothing",                  "Any",
+        "Int",                      "Long",                  "Short",                         "Byte",                                 "Double",                          "Float",                        "Char",                "Boolean",
+        "UInt",                     "ULong",                 "UShort",                        "UByte",                                "Number",                          "Unit",                         "Nothing",             "Any",
         // Strings / char sequences.
-        "String",                        "CharSequence",                         "StringBuilder",
+        "String",                   "CharSequence",          "StringBuilder",
         // Comparison / common interfaces.
-                          "Comparable",                   "Comparator",          "Pair",                       "Triple",
-        "Entry",                         "MutableEntry",
+                        "Comparable",                           "Comparator",                      "Pair",                         "Triple",              "Entry",
+        "MutableEntry",
         // Collections + arrays (read-only and mutable).
-                          "Array",
-        "IntArray",                      "LongArray",                            "ShortArray",                      "ByteArray",                    "DoubleArray",         "FloatArray",                 "CharArray",                "BooleanArray",
-        "UIntArray",                     "ULongArray",                           "UShortArray",                     "UByteArray",                   "List",                "MutableList",                "ArrayList",                "AbstractList",
-        "AbstractMutableList",           "Collection",                           "MutableCollection",               "AbstractCollection",           "Iterable",            "MutableIterable",            "Iterator",                 "MutableIterator",
-        "ListIterator",                  "Set",                                  "MutableSet",                      "HashSet",                      "LinkedHashSet",       "AbstractSet",                "Map",                      "MutableMap",
-        "HashMap",                       "LinkedHashMap",                        "AbstractMap",                     "Sequence",                     "EnumEntries",
+                    "Array",                 "IntArray",                      "LongArray",                            "ShortArray",                      "ByteArray",                    "DoubleArray",         "FloatArray",
+        "CharArray",                "BooleanArray",          "UIntArray",                     "ULongArray",                           "UShortArray",                     "UByteArray",                   "List",                "MutableList",
+        "ArrayList",                "AbstractList",          "AbstractMutableList",           "Collection",                           "MutableCollection",               "AbstractCollection",           "Iterable",            "MutableIterable",
+        "Iterator",                 "MutableIterator",       "ListIterator",                  "Set",                                  "MutableSet",                      "HashSet",                      "LinkedHashSet",       "AbstractSet",
+        "Map",                      "MutableMap",            "HashMap",                       "LinkedHashMap",                        "AbstractMap",                     "Sequence",                     "EnumEntries",
         // Ranges / progressions.
-                "IntRange",                   "LongRange",                "CharRange",
-        "IntProgression",                "LongProgression",                      "CharProgression",                 "ClosedRange",                  "OpenEndRange",
+                "IntRange",
+        "LongRange",                "CharRange",             "IntProgression",                "LongProgression",                      "CharProgression",                 "ClosedRange",                  "OpenEndRange",
         // Reflection.
-               "KClass",                     "KProperty",                "KCallable",
-        "KFunction",                     "KMutableProperty",
+               "KClass",
+        "KProperty",                "KCallable",             "KFunction",                     "KMutableProperty",
         // Throwable hierarchy.
-                            "Throwable",                       "Exception",                    "RuntimeException",    "Error",                      "IllegalArgumentException", "IllegalStateException",
-        "IndexOutOfBoundsException",     "ArrayIndexOutOfBoundsException",       "StringIndexOutOfBoundsException", "NullPointerException",         "ArithmeticException", "ClassCastException",         "NoSuchElementException",   "NumberFormatException",
-        "UnsupportedOperationException", "UninitializedPropertyAccessException", "ConcurrentModificationException", "NoWhenBranchMatchedException", "AssertionError",      "NegativeArraySizeException",
+                            "Throwable",                       "Exception",                    "RuntimeException",    "Error",
+        "IllegalArgumentException", "IllegalStateException", "IndexOutOfBoundsException",     "ArrayIndexOutOfBoundsException",       "StringIndexOutOfBoundsException", "NullPointerException",         "ArithmeticException", "ClassCastException",
+        "NoSuchElementException",   "NumberFormatException", "UnsupportedOperationException", "UninitializedPropertyAccessException", "ConcurrentModificationException", "NoWhenBranchMatchedException", "AssertionError",      "NegativeArraySizeException",
     };
     if (containsStr(&builtins, name)) return true;
     return std.mem.startsWith(u8, name, "Function");

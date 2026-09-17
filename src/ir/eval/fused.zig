@@ -221,9 +221,7 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                 }
             };
             switch (inst.*) {
-                .Trace, .Const, .Move, .LoadParam, .BinOp, .Not, .GetField, .SetField,
-                .Index, .IndexSet, .NotNullAssert, .LateinitCheck, .MakeCell,
-                .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
+                .Trace, .Const, .Move, .LoadParam, .BinOp, .Not, .GetField, .SetField, .Index, .IndexSet, .NotNullAssert, .LateinitCheck, .MakeCell, .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
                 .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return 2,
                 .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return 2,
                 // Open-world but non-suspending, so nothing beneath needs materialization.
@@ -752,7 +750,8 @@ fn fusedInst(
                 fusedWrite(allocator, regs, cast.dst, .Null, reclaim, false);
             } else {
                 if (runtime.envOnce("KLIO_THROW_TRACE") != null) {
-                    std.debug.print("[throw-trace] from fused fn {s}: ClassCastException cast to {s} (value tag {s})\n", .{ func.name, cast.ty.name, @tagName(std.meta.activeTag(v)) });
+                    std.debug.print("[throw-trace] from fused fn {s}: ClassCastException cast to {s} (value {s})\n", .{ func.name, cast.ty.name, exec_call.castTraceLabel(&v) });
+                    if (regs.len != 0 and regs[0] == .Instance) std.debug.print("[throw-trace]   r0 = {s} @{x}\n", .{ exec_call.castTraceLabel(&regs[0]), @intFromPtr(regs[0].Instance.asPtr()) });
                 }
                 const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
                 const exc = try Value.newException(allocator, .{

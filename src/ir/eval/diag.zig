@@ -499,10 +499,7 @@ fn fuseClassify(func: *const Func) u8 {
         }
         for (b.insts) |*inst| {
             switch (inst.*) {
-                .Const, .Move, .LoadParam, .LoadCapture, .BinOp, .UnOp, .Not, .Trace,
-                .GetField, .SetField, .Index, .IndexSet, .Cast, .InstanceOf,
-                .NotNullAssert, .LateinitCheck, .Call, .MakeCell, .CellGet,
-                .CellSet, .QualifiedThis, .EnclosingPush, .EnclosingPop => {},
+                .Const, .Move, .LoadParam, .LoadCapture, .BinOp, .UnOp, .Not, .Trace, .GetField, .SetField, .Index, .IndexSet, .Cast, .InstanceOf, .NotNullAssert, .LateinitCheck, .Call, .MakeCell, .CellGet, .CellSet, .QualifiedThis, .EnclosingPush, .EnclosingPop => {},
                 else => return 2 + @as(u8, @intFromEnum(std.meta.activeTag(inst.*))),
             }
         }
@@ -737,7 +734,7 @@ pub fn dumpCurrentFrameParamsForDiag() void {
     var cur = ev_state.evtls.frame_chain;
     var depth: usize = 0;
     while (cur) |fr| : (cur = fr.gc_link) {
-        if (depth >= 3) break;
+        if (depth >= 12) break;
         depth += 1;
         const label = if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name;
         std.debug.print("[frame-params] {s} ({d} params, {d} bound):\n", .{
@@ -746,17 +743,26 @@ pub fn dumpCurrentFrameParamsForDiag() void {
         for (fr.func.params, 0..) |p, i| {
             if (i >= fr.params.items.len) break;
             const v = &fr.params.items[i];
-            std.debug.print("  [{d}] {s} = {s} {s}\n", .{
-                i, p.name, @tagName(std.meta.activeTag(v.*)), diagValueClassName(v),
+            std.debug.print("  [{d}] {s} = {s} {s}{s}\n", .{
+                i, p.name, @tagName(std.meta.activeTag(v.*)), diagValueClassName(v), diagIdentity(v),
             });
         }
         // A mis-captured callee slot is only visible in the closure environment.
         for (fr.captures.items, 0..) |*cv, i| {
-            std.debug.print("  [cap {d}] {s} {s}\n", .{
-                i, @tagName(std.meta.activeTag(cv.*)), diagValueClassName(cv),
+            std.debug.print("  [cap {d}] {s} {s}{s}\n", .{
+                i, @tagName(std.meta.activeTag(cv.*)), diagValueClassName(cv), diagIdentity(cv),
             });
         }
     }
+}
+
+/// ` @<address>` of an instance, so two frames' receivers can be told apart.
+fn diagIdentity(v: *const Value) []const u8 {
+    if (v.* != .Instance) return "";
+    const S = struct {
+        threadlocal var buf: [24]u8 = undefined;
+    };
+    return std.fmt.bufPrint(&S.buf, " @{x}", .{@intFromPtr(v.Instance.asPtr())}) catch "";
 }
 
 /// Concrete runtime class for diagnostics; `typeFqn` alone prints `<instance>`.

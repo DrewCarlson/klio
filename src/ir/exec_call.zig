@@ -72,6 +72,19 @@ fn leafPlainReq(req: FlatCallReq) bool {
         req.owning == null;
 }
 
+/// The class of an instance that failed a cast, else its value tag, for the
+/// throw trace.
+pub fn castTraceLabel(v: *const Value) []const u8 {
+    if (v.* == .Instance) {
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        return cg.get().fqn;
+    }
+    return @tagName(v.*);
+}
+
 pub fn envVarSet(name: []const u8) bool {
     return runtime.procEnvIsSet(std.heap.page_allocator, name);
 }
@@ -1270,7 +1283,7 @@ pub noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Fram
         // A failed cast raises without passing through the `Throw` terminator,
         // so KLIO_THROW_TRACE needs its own trace here.
         if (envVarSet("KLIO_THROW_TRACE")) {
-            std.debug.print("[throw-trace] from fn {s} (fqn={s}): ClassCastException cast to {s} (value tag {s})\n", .{ frame.func.name, frame.func.fqn, cast.ty.name, @tagName(v) });
+            std.debug.print("[throw-trace] from fn {s} (fqn={s}): ClassCastException cast to {s} (value {s})\n", .{ frame.func.name, frame.func.fqn, cast.ty.name, castTraceLabel(&v) });
         }
         const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
         const exc = try Value.newException(allocator, .{
@@ -1466,32 +1479,31 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
             // receiver's IMPORTED extension property. Pass 0 probes members.
             var pass: u8 = 0;
             walk: while (pass < 2) : (pass += 1) {
-            for (cands, 0..) |c, ci| {
-                if (missTraceWant()) |w| if (std.mem.eql(u8, w, name_str)) {
-                    std.debug.print("[ltg-cand] name={s} pass={d} ci={d} depth={d} tag={s} in_fn={s}\n", .{ name_str, pass, ci, c.depth, @tagName(std.meta.activeTag(c.v)), frame.func.name });
-                };
-                switch (try (if (pass == 0)
-                    host.getMemberFieldNoExt(allocator, &c.v, name_str)
-                else
-                    host.getMemberField(allocator, &c.v, name_str)))
-                {
-                    .ok => |v| {
-                        orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
-                        resolved = v;
-                        winner = ci;
-                        break :walk;
-                    },
-                    // Only `Unimplemented` means this candidate has no such member;
-                    // any other error came from an accessor that RAN.
-                    .err => |e| {
-                        if (e == .Unimplemented) {
-                            freeMissErr(allocator, e);
-                        } else {
-                            return raiseStep(frame, e);
-                        }
-                    },
+                for (cands, 0..) |c, ci| {
+                    if (missTraceWant()) |w| if (std.mem.eql(u8, w, name_str)) {
+                        std.debug.print("[ltg-cand] name={s} pass={d} ci={d} depth={d} tag={s} in_fn={s}\n", .{ name_str, pass, ci, c.depth, @tagName(std.meta.activeTag(c.v)), frame.func.name });
+                    };
+                    switch (try (if (pass == 0)
+                        host.getMemberFieldNoExt(allocator, &c.v, name_str)
+                    else
+                        host.getMemberField(allocator, &c.v, name_str))) {
+                        .ok => |v| {
+                            orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
+                            resolved = v;
+                            winner = ci;
+                            break :walk;
+                        },
+                        // Only `Unimplemented` means this candidate has no such member;
+                        // any other error came from an accessor that RAN.
+                        .err => |e| {
+                            if (e == .Unimplemented) {
+                                freeMissErr(allocator, e);
+                            } else {
+                                return raiseStep(frame, e);
+                            }
+                        },
+                    }
                 }
-            }
             }
             // The enum's static scope encloses its companion, nested objects
             // and entry bodies: a bare entry name read there is the entry.

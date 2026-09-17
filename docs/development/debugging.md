@@ -189,7 +189,8 @@ left in, they cost twice the timeout apiece for no signal and turn a five-minute
 comparison into a three-hour one.
 
 | `KLIO_OPERATOR_TY` | `0` to disable | Off, an indexed read and the `times`/`div`/`rem`/`rangeTo` operators stop lending their declared return type to a receiver | — |
-| `KLIO_GLOBAL_TRACE` | `<name>` | Which arm resolves a global lookup: cached value, function, or intrinsic | `[gtrace]` |
+| `KLIO_GLOBAL_TRACE` | `<name>` | Which arm resolves a global lookup: cached value, function, or intrinsic, with the instance address; a file `<clinit>` binding the name prints `arm=init` with the host, its globals scope, the thread and the frames that drove it | `[gtrace]` |
+| `KLIO_CAS_TRACE` | set | Every atomicfu `AtomicRef.compareAndSet`: the atomic, the current and expected values with their addresses, and whether it swapped | `[cas]` |
 | `KLIO_OUTER_TRACE` | `<substr>` | Inner-class enclosing `this@Outer` selection for IR names containing the substring | `[outer]` |
 | `KLIO_ANON_AUDIT` | set | Synthesized class name and captured names at each anonymous-object site | `[ANON]` |
 | `KLIO_REBIND_AUDIT` | set | Arity-guess `this` rebinds during closure invocation | `[REBIND]` |
@@ -263,7 +264,7 @@ nondeterminism, not modes).
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
 | `KLIO_ERR_TRACE` | set | On otherwise-traceless Vm failures: the live frame chain plus a site-specific miss line (unresolved field get, uninvokable call value, unmatched `this@label`). In `klio test` it also renders the full throwable (type, message, frames, causes) instead of the terse summary | `[errtrace]`, `[getfield-miss]`, `[callvalue-miss]`, `[labeled-this]` |
-| `KLIO_THROW_TRACE` | set | One line per exception as it is thrown (including failed casts that raise without a `Throw`) | `[throw-trace]` |
+| `KLIO_THROW_TRACE` | set | One line per exception as it is thrown (including failed casts that raise without a `Throw`, which name the class of the value and, off the fused tier, the receiver in `r0` with its address) | `[throw-trace]` |
 | `KLIO_THROW_STACK` | set (needs `KLIO_THROW_TRACE`) | Adds the full frame chain at each throw site | `[errtrace]` |
 | `KLIO_LR_TRACE` | set | Labeled-return propagation through interpreter frames (raise, pass, exit) | `[lr-raise]`, `[lr]`, `[lr-exit]` |
 | `KLIO_AMP_TRACE` | `<substr>` | A resolution-class error about to be re-tagged as `CalleeFailed` whose message contains the substring; dumps the frames before they are torn down | `[amp]` |

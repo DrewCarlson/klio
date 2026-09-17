@@ -505,9 +505,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     // thread's re-entrant reads see it while other threads wait.
     if (classDefIsObject(class_def)) {
         if (!host_globals.noteObjectInFlight(self, class_name, inst_value)) {
-            const g = self.globals.borrowMut();
-            g.get().define(class_name, inst_value) catch {};
-            g.deinit();
+            host_globals.defineRootGlobal(self, class_name, inst_value);
         }
     }
 

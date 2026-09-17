@@ -193,9 +193,13 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
         const r = try ir.eval.evalWith(VmHost, self.allocator, m, func, .empty, self);
         switch (r) {
             .ok => |v| {
-                const g = self.globals.borrowMut();
-                defer g.deinit();
-                g.get().define(nf.name, v) catch {};
+                if (runtime.envOnce("KLIO_GLOBAL_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, nf.name)) {
+                        std.debug.print("[gtrace] {s} arm=init id={x} host={x} globals={x} thread={d} for={s}\n", .{ nf.name, if (v == .Instance) @intFromPtr(v.Instance.asPtr()) else 0, @intFromPtr(self), @intFromPtr(self.globals.asPtr()), std.Thread.getCurrentId(), name });
+                        ir.eval.dumpCurrentFrameParamsForDiag();
+                    }
+                }
+                vmhost.host_globals.defineRootGlobal(self, nf.name, v);
             },
             .err => |e| return .{ .err = e },
         }
