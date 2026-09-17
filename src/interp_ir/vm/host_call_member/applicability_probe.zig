@@ -1032,6 +1032,19 @@ pub fn argsRelaxedAdjudicable(args: []const Value) bool {
     return true;
 }
 
+/// Whether `v` can bind a function-typed parameter: a closure or bound method,
+/// or an instance whose class chain declares `invoke`. The compose pass hands a
+/// composable lambda over as such an instance, and the trailing-lambda rule
+/// must see it as callable or the call binds the argument to the wrong slot.
+fn bindsFunctionParam(self: *VmHost, mod_opt: ?*const Module, v: *const Value) bool {
+    if (isCallable(v)) return true;
+    if (v.* != .Instance) return false;
+    if (mod_opt) |m| return classChainHasInvokeIn(m, v);
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return classChainHasInvokeIn(mg.get(), v);
+}
+
 pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []const Func, args_in: []const Value) ?Func {
     if (candidates.len == 0) return null;
     const args = args_in;
@@ -1111,7 +1124,7 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
             // that param is function-typed, so only the gap params need defaults.
             const trailing_bind = eff_args.len > 0 and
                 isFunctionTypeRef(&effective[effective.len - 1].ty) and
-                isCallable(&eff_args[eff_args.len - 1]);
+                bindsFunctionParam(self, mod_opt, &eff_args[eff_args.len - 1]);
             const first_unfilled = if (trailing_bind) eff_args.len - 1 else eff_args.len;
             const last_checked = if (trailing_bind) effective.len - 1 else effective.len;
             var k: usize = first_unfilled;
@@ -1127,7 +1140,7 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
         // nominally. Under the trailing-lambda rule the final arg judges the last param.
         const tail_lambda_bind = eff_args.len > 0 and eff_args.len < effective.len and
             isFunctionTypeRef(&effective[effective.len - 1].ty) and
-            isCallable(&eff_args[eff_args.len - 1]);
+            bindsFunctionParam(self, mod_opt, &eff_args[eff_args.len - 1]);
         var i: usize = 0;
         while (i < eff_args.len and i < effective.len) : (i += 1) {
             const pi = if (tail_lambda_bind and i == eff_args.len - 1) effective.len - 1 else i;

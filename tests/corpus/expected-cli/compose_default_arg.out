@@ -1,0 +1,2 @@
+distinct defaults after compose = 1
+distinct defaults after recompose = 1

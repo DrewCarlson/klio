@@ -303,11 +303,16 @@ pub fn endRestartGroupExpr(a: std.mem.Allocator, b: B, fn_name: []const u8, valu
 }
 
 /// `{ c, _f -> Self(origValueArgs, c, $changed or 1) }`. `value_params` are the
-/// TRANSFORMED params, so a defaulted one is its renamed `p$arg` and the marker
-/// flows through the restart.
+/// TRANSFORMED params, so a defaulted one is its renamed `p$arg`; the restart
+/// passes the RESOLVED `p` the prologue bound, never the marker again. Passing
+/// the marker would evaluate the default afresh on every recomposition, while
+/// a default is computed once for the life of the group.
 fn recomposeLambda(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params: []const Param) std.mem.Allocator.Error!Expr {
     var call_args = try a.alloc(Expr, value_params.len + 2);
-    for (value_params, 0..) |p, i| call_args[i] = b.pathExpr(p.name.name);
+    for (value_params, 0..) |p, i| {
+        const n = p.name.name;
+        call_args[i] = b.pathExpr(if (std.mem.endsWith(u8, n, "$arg")) n[0 .. n.len - "$arg".len] else n);
+    }
     call_args[value_params.len] = b.pathExpr("$rc"); // recompose composer lambda param
     // `updateChangedFlags($changed or 1)` folds every DYNAMIC "changed" triple to "same":
     // the restart re-runs with the values the scope captured, so a frozen caller bit must

@@ -470,11 +470,12 @@ test "defaulted composable param becomes marker-guarded prologue" {
     const probe = guard.then_branch.Block.stmts[0];
     // The probe reads the RESOLVED value `x`, not the renamed argument.
     try testing.expectEqualStrings("x", probe.Assign.value.Call.args[0].If.cond.Call.args[0].Path.segments[0].name);
-    // The restart re-call passes the RENAMED param (marker flows through).
+    // The restart re-call passes the RESOLVED value, so the default is computed
+    // once for the group rather than afresh on every recomposition.
     const upd = stmts[5].Expr.Call;
     const lam = upd.args[0].Lambda;
     const reinvoke = lam.body.stmts[0].Expr.Call;
-    try testing.expectEqualStrings("x$arg", reinvoke.args[0].Path.segments[0].name);
+    try testing.expectEqualStrings("x", reinvoke.args[0].Path.segments[0].name);
 }
 
 test "threadCall appends the composer pair as named args" {
