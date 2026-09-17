@@ -3458,17 +3458,20 @@ pub fn computeEagerCallsOpts(
     defer check_arena.deinit();
     const ca = check_arena.allocator();
     const t_stage0 = runtime.clockMonotonicNanos();
-    const r = resolver.resolveModuleWithNatives(ca, combined, native_fqns) catch {
+    var r = resolver.resolveModuleWithNatives(ca, combined, native_fqns) catch {
         if (audit) std.debug.print("[EAGER] resolver failed; staying lazy\n", .{});
         return null;
     };
+    defer r.deinit();
     const t_stage1 = runtime.clockMonotonicNanos();
     var tc = typeck.typecheckModuleOpts(ca, combined, &r, .{ .body_threads = typeckThreads(), .diagnostics = opts.diagnostics }) catch {
         if (audit) std.debug.print("[EAGER] typeck failed; staying lazy\n", .{});
         return null;
     };
     defer tc.deinit(ca);
-    if (runtime.envOnce("KLIO_TRACE_STDLIB_IMAGE") != null) {
+    const t_check_end = runtime.clockMonotonicNanos();
+    const tracing = runtime.envOnce("KLIO_TRACE_STDLIB_IMAGE") != null;
+    if (tracing) {
         const st = typeck.check.stage_timing;
         std.debug.print("[stdlib-image]   stage: resolve {d}ms, check {d}ms (decls {d}ms, property inits {d}ms, bodies {d}ms on {d} threads, merge {d}ms)\n", .{
             (t_stage1 - t_stage0) / 1_000_000,
@@ -3579,6 +3582,7 @@ pub fn computeEagerCallsOpts(
     while (pit.next()) |e| pout.put(e.key_ptr.*, .{ .has_receiver = e.value_ptr.has_receiver, .arity = e.value_ptr.arity }) catch {};
     if (audit) std.debug.print("[EAGER] {d} param shapes recorded\n", .{pout.count()});
     ir.pending_eager_param_shapes = pout;
+    if (tracing) std.debug.print("[stdlib-image]   stage tables: {d}ms\n", .{(runtime.clockMonotonicNanos() - t_check_end) / 1_000_000});
     return out;
 }
 

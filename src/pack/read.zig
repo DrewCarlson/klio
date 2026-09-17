@@ -154,6 +154,8 @@ pub fn readSectionFromPath(
 pub const PackReader = struct {
     allocator: Allocator,
     bytes: []u8,
+    /// False for a reader over bytes it borrows, which `deinit` leaves alone.
+    owns_bytes: bool = true,
     dir: SectionDirectory,
     payload_start: usize,
 
@@ -175,53 +177,66 @@ pub const PackReader = struct {
     /// Takes ownership of `bytes`, freeing them in `deinit`. Verifies magic,
     /// format version and pack hash; on error `bytes` are freed and null returned.
     pub fn fromBytes(allocator: Allocator, bytes: []u8, result: *PackError) Allocator.Error!?PackReader {
+        return init(allocator, bytes, true, true, result);
+    }
+
+    /// A reader over bytes the caller keeps alive and trusts: the bytes a
+    /// binary carries, whose integrity the binary's own identity covers, so
+    /// neither the hash over them nor a copy of them is taken.
+    pub fn fromBytesBorrowed(allocator: Allocator, bytes: []const u8, result: *PackError) Allocator.Error!?PackReader {
+        return init(allocator, @constCast(bytes), false, false, result);
+    }
+
+    fn init(allocator: Allocator, bytes: []u8, owns: bool, verify_hash: bool, result: *PackError) Allocator.Error!?PackReader {
         const buf = bytes;
         if (buf.len < format.HASHED_REGION_OFFSET + 4) {
-            allocator.free(bytes);
+            if (owns) allocator.free(bytes);
             result.* = .Truncated;
             return null;
         }
         if (!std.mem.eql(u8, buf[0..4], format.MAGIC)) {
-            allocator.free(bytes);
+            if (owns) allocator.free(bytes);
             result.* = .BadMagic;
             return null;
         }
         const version = std.mem.readInt(u32, buf[4..8], .little);
         if (version != format.FORMAT_VERSION) {
-            allocator.free(bytes);
+            if (owns) allocator.free(bytes);
             result.* = .{ .VersionMismatch = .{ .expected = format.FORMAT_VERSION, .found = version } };
             return null;
         }
-        var stored_hash: [format.HASH_LEN]u8 = undefined;
-        @memcpy(&stored_hash, buf[format.HASH_OFFSET .. format.HASH_OFFSET + format.HASH_LEN]);
-        var computed: [format.HASH_LEN]u8 = undefined;
-        std.crypto.hash.Blake3.hash(buf[format.HASHED_REGION_OFFSET..], &computed, .{});
-        if (!std.mem.eql(u8, &computed, &stored_hash)) {
-            allocator.free(bytes);
-            result.* = .HashMismatch;
-            return null;
+        if (verify_hash) {
+            var stored_hash: [format.HASH_LEN]u8 = undefined;
+            @memcpy(&stored_hash, buf[format.HASH_OFFSET .. format.HASH_OFFSET + format.HASH_LEN]);
+            var computed: [format.HASH_LEN]u8 = undefined;
+            std.crypto.hash.Blake3.hash(buf[format.HASHED_REGION_OFFSET..], &computed, .{});
+            if (!std.mem.eql(u8, &computed, &stored_hash)) {
+                if (owns) allocator.free(bytes);
+                result.* = .HashMismatch;
+                return null;
+            }
         }
 
         const dir_len: usize = std.mem.readInt(u32, buf[format.HASHED_REGION_OFFSET..][0..4], .little);
         const dir_start = format.HASHED_REGION_OFFSET + 4;
         const dir_end = std.math.add(usize, dir_start, dir_len) catch {
-            allocator.free(bytes);
+            if (owns) allocator.free(bytes);
             result.* = .Truncated;
             return null;
         };
         if (dir_end > buf.len) {
-            allocator.free(bytes);
+            if (owns) allocator.free(bytes);
             result.* = .Truncated;
             return null;
         }
         var cursor = Cursor{ .bytes = buf[dir_start..dir_end] };
         const dir = decodeValue(SectionDirectory, allocator, &cursor) catch |e| switch (e) {
             error.OutOfMemory => {
-                allocator.free(bytes);
+                if (owns) allocator.free(bytes);
                 return error.OutOfMemory;
             },
             error.Malformed => {
-                allocator.free(bytes);
+                if (owns) allocator.free(bytes);
                 result.* = .{ .Decode = "section directory is malformed" };
                 return null;
             },
@@ -230,19 +245,19 @@ pub const PackReader = struct {
         for (dir.entries) |e| {
             const end = std.math.add(u64, e.offset, e.stored_len) catch {
                 freeDir(allocator, dir);
-                allocator.free(bytes);
+                if (owns) allocator.free(bytes);
                 result.* = .Truncated;
                 return null;
             };
             const abs = std.math.add(u64, @as(u64, payload_start), end) catch {
                 freeDir(allocator, dir);
-                allocator.free(bytes);
+                if (owns) allocator.free(bytes);
                 result.* = .Truncated;
                 return null;
             };
             if (abs > buf.len) {
                 freeDir(allocator, dir);
-                allocator.free(bytes);
+                if (owns) allocator.free(bytes);
                 result.* = .Truncated;
                 return null;
             }
@@ -250,6 +265,7 @@ pub const PackReader = struct {
         return PackReader{
             .allocator = allocator,
             .bytes = bytes,
+            .owns_bytes = owns,
             .dir = dir,
             .payload_start = payload_start,
         };
@@ -257,7 +273,7 @@ pub const PackReader = struct {
 
     pub fn deinit(self: *PackReader) void {
         freeDir(self.allocator, self.dir);
-        self.allocator.free(self.bytes);
+        if (self.owns_bytes) self.allocator.free(self.bytes);
         self.* = undefined;
     }
 
@@ -353,7 +369,24 @@ pub fn decode(
     bytes: []const u8,
     result: *PackError,
 ) Allocator.Error!?T {
-    var cursor = Cursor{ .bytes = bytes };
+    return decodeWith(T, allocator, bytes, false, result);
+}
+
+/// `decode` whose byte strings are slices of `bytes` rather than copies:
+/// for input that outlives the value, such as the bytes a binary carries. The
+/// value's containers are still the caller's to free, and a byte string a
+/// `deinit` would free must then be left alone.
+pub fn decodeBorrowed(
+    comptime T: type,
+    allocator: Allocator,
+    bytes: []const u8,
+    result: *PackError,
+) Allocator.Error!?T {
+    return decodeWith(T, allocator, bytes, true, result);
+}
+
+fn decodeWith(comptime T: type, allocator: Allocator, bytes: []const u8, borrow: bool, result: *PackError) Allocator.Error!?T {
+    var cursor = Cursor{ .bytes = bytes, .borrow = borrow };
     return decodeValue(T, allocator, &cursor) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Malformed => {
@@ -368,6 +401,8 @@ const DecodeError = error{ OutOfMemory, Malformed };
 const Cursor = struct {
     bytes: []const u8,
     pos: usize = 0,
+    /// Byte strings come back as slices of `bytes` instead of copies.
+    borrow: bool = false,
 
     fn take(self: *Cursor, n: usize) DecodeError![]const u8 {
         if (self.pos + n > self.bytes.len) return error.Malformed;
@@ -422,6 +457,7 @@ fn decodeValue(comptime T: type, allocator: Allocator, c: *Cursor) DecodeError!T
                     const len: usize = @intCast(try c.varint());
                     if (p.child == u8) {
                         const src = try c.take(len);
+                        if (p.is_const and c.borrow) return src;
                         return try allocator.dupe(u8, src);
                     }
                     const out = try allocator.alloc(p.child, len);

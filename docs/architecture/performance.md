@@ -99,6 +99,11 @@ The full design, including the root-completeness analysis, is in
 Independent of the profile, `klio run` bakes the lowered stdlib (and
 selected packs) to a content-addressed image under `~/.klio/cache`
 on first use and extends it with just the user program on later
-runs, cutting startup to a few hundred milliseconds. See the
-[CLI tour](../getting-started/cli.md) for the cache keys and
-`KLIO_STDLIB_IMAGE` / `KLIO_TRACE_STDLIB_IMAGE` controls.
+runs, cutting startup to tens of milliseconds. The build bakes the
+stdlib-only image too, with the binary it just linked, and installs it
+under `share/klio/cache` beside `bin/klio`; a run whose own cache misses
+reads that copy, so a rebuilt klio's first run of an import-free program
+is a warm one. A program that pulls packs in keys its own image and bakes
+it on its first run. See the [CLI tour](../getting-started/cli.md) for
+the cache keys and `KLIO_STDLIB_IMAGE` / `KLIO_TRACE_STDLIB_IMAGE`
+controls.

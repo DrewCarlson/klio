@@ -93,8 +93,19 @@ fn threadedIo(allocator: Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(allocator, .{});
 }
 
+/// `bakeStdlibCache` points the cache at a directory of its own for one bake.
+var cache_dir_override: ?[]const u8 = null;
+/// `bakeStdlibCache` needs the image written before it returns.
+var force_sync: bool = false;
+
 /// `$KLIO_HOME/.klio/cache` (or `~/.klio/cache`), created if absent. Caller frees.
 fn cacheDir(gpa: Allocator) ?[]u8 {
+    if (cache_dir_override) |dir| {
+        var threaded = threadedIo(gpa);
+        defer threaded.deinit();
+        std.Io.Dir.cwd().createDirPath(threaded.io(), dir) catch return null;
+        return gpa.dupe(u8, dir) catch null;
+    }
     const home = (runtime.procEnvKlioHome(gpa) catch null) orelse return null;
     defer gpa.free(home);
     const dir = std.fs.path.join(gpa, &.{ home, ".klio", "cache" }) catch return null;
@@ -108,23 +119,74 @@ fn cacheDir(gpa: Allocator) ?[]u8 {
 }
 
 /// Size + mtime of the running executable: any rebuild invalidates every image.
+/// The running executable's path, into `buf`.
+fn exePath(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    if (builtin.os.tag == .linux) return "/proc/self/exe";
+    if (builtin.os.tag.isDarwin()) {
+        var n: u32 = buf.len;
+        if (std.c._NSGetExecutablePath(buf, &n) != 0) return null;
+        return std.mem.sliceTo(buf, 0);
+    }
+    return null;
+}
+
+/// The image the build installed beside the binary for this key, if any:
+/// `<bin dir>/../share/klio/cache/stdlib-<key>.klio-image`. Caller frees.
+fn shippedImagePath(gpa: Allocator, hex: [32]u8) ?[]u8 {
+    const name = std.fmt.allocPrint(gpa, "stdlib-{s}.klio-image", .{hex}) catch return null;
+    defer gpa.free(name);
+    return shippedCachePath(gpa, name);
+}
+
+/// The build's copy of a cache file `name`, beside the binary. Caller frees.
+/// `KLIO_STDLIB_IMAGE_SHIPPED=0` ignores that copy, for a measurement or a
+/// test that wants the run's own cache to decide.
+fn shippedCachePath(gpa: Allocator, name: []const u8) ?[]u8 {
+    if (runtime.envOnce("KLIO_STDLIB_IMAGE_SHIPPED")) |v| {
+        if (std.mem.eql(u8, v, "0")) return null;
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = exePath(&buf) orelse return null;
+    // The Linux path is a link; the shipped cache sits beside the real file.
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = if (builtin.os.tag == .linux)
+        (std.posix.readlink(exe, &real_buf) catch return null)
+    else
+        exe;
+    const bin_dir = std.fs.path.dirname(real) orelse return null;
+    return std.fs.path.join(gpa, &.{ bin_dir, "..", "share", "klio", "cache", name }) catch null;
+}
+
+/// The run's meta file, else the build's copy of it beside the binary, so a
+/// fresh data home takes the shipped image without parsing the stdlib to
+/// learn the key.
+fn readMetaFromCaches(gpa: Allocator, meta_file: []const u8) ?MetaFile {
+    if (readMeta(gpa, meta_file)) |m| return m;
+    const shipped = shippedCachePath(gpa, std.fs.path.basename(meta_file)) orelse return null;
+    defer gpa.free(shipped);
+    return readMeta(gpa, shipped);
+}
+
+/// The image for `hex` from the run's cache, else the one shipped beside the
+/// binary; `shipped` says which served.
+const FoundImage = struct { loaded: image.Loaded, shipped: bool };
+
+fn loadImageFromCaches(gpa: Allocator, image_path: []const u8, hex: [32]u8) ?FoundImage {
+    if (loadImageFile(gpa, image_path)) |loaded| return .{ .loaded = loaded, .shipped = false };
+    const shipped = shippedImagePath(gpa, hex) orelse return null;
+    defer gpa.free(shipped);
+    if (loadImageFile(gpa, shipped)) |loaded| return .{ .loaded = loaded, .shipped = true };
+    return null;
+}
+
 fn exeStamp(gpa: Allocator) ?[2]u64 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
     const fio = threaded.io();
     const cwd = std.Io.Dir.cwd();
-    const st = blk: {
-        if (builtin.os.tag == .linux)
-            break :blk cwd.statFile(fio, "/proc/self/exe", .{}) catch return null;
-        if (builtin.os.tag.isDarwin()) {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            var n: u32 = buf.len;
-            if (std.c._NSGetExecutablePath(&buf, &n) != 0) return null;
-            const path = std.mem.sliceTo(&buf, 0);
-            break :blk cwd.statFile(fio, path, .{}) catch return null;
-        }
-        return null;
-    };
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = exePath(&buf) orelse return null;
+    const st = cwd.statFile(fio, path, .{}) catch return null;
     const mtime_ns: u64 = @truncate(@as(u128, @bitCast(@as(i128, st.mtime.nanoseconds))));
     return .{ st.size, mtime_ns };
 }
@@ -309,6 +371,18 @@ fn writeAtomic(gpa: Allocator, cache: []const u8, dest: []const u8, bytes: []con
     };
 }
 
+/// The strip's deferred freeing walk, run on its own thread.
+const DetachedRelease = struct {
+    gpa: Allocator,
+    bodies: []const ast.FunctionBody,
+    stats: interp_ir.prune.Released = .{},
+
+    fn run(self: *DetachedRelease) void {
+        defer runtime.slab.flushMagazines();
+        self.stats = interp_ir.prune.releaseDetached(self.gpa, self.bodies);
+    }
+};
+
 const BakeJob = struct {
     cache: []const u8,
     hex: *const [32]u8,
@@ -362,14 +436,16 @@ var background_bake: ?std.c.pid_t = null;
 /// fork that failed.
 fn forkBake(gpa: Allocator, job: *const BakeJob) bool {
     if (comptime !background_bake_supported) return false;
+    if (force_sync) return false;
     if (getEnvVar(gpa, "KLIO_STDLIB_IMAGE_SYNC")) |v| {
         defer gpa.free(v);
         if (v.len != 0 and !std.mem.eql(u8, v, "0")) return false;
     }
     const tracing = traceEnabled(gpa);
-    // The marker outlives a child that dies before it writes the image, so
-    // the next cold run can say so rather than staying cold in silence.
-    writeBakeMarker(gpa, job.cache, job.image_path);
+    const t0 = runtime.clockMonotonicNanos();
+    // The build's parked scratch is not coming back to either process, and a
+    // fork's cost is its resident pages: give them back first.
+    runtime.slab.reclaimAll();
     const pid = std.c.fork();
     if (pid < 0) return false;
     if (pid == 0) {
@@ -377,11 +453,15 @@ fn forkBake(gpa: Allocator, job: *const BakeJob) bool {
         _ = std.c.close(0);
         _ = std.c.close(1);
         if (!tracing) _ = std.c.close(2);
+        // The marker outlives a child that dies before it writes the image,
+        // so the next cold run can say so rather than staying cold in
+        // silence. The child writes it: the program is not waiting on it.
+        writeBakeMarker(gpa, job.cache, job.image_path);
         _ = bakeAndWrite(gpa, job);
         std.c._exit(0);
     }
     background_bake = pid;
-    trace(gpa, "baking {s} in the background", .{job.hex.*});
+    trace(gpa, "baking {s} in the background (fork {d}us)", .{ job.hex.*, (runtime.clockMonotonicNanos() - t0) / 1000 });
     return true;
 }
 
@@ -468,10 +548,12 @@ fn stageBaseEagerCalls(gpa: Allocator, asts: []const KotlinFile) void {
     // The picks are all this run reads; `KLIO_STAGE_DIAG` runs the checker's
     // diagnostic passes too, to compare against.
     const opts: @import("commands.zig").EagerCallOptions = .{ .diagnostics = runtime.envOnce("KLIO_STAGE_DIAG") != null };
+    const t0 = runtime.clockMonotonicNanos();
     if (@import("commands.zig").computeEagerCallsOpts(gpa, asts, &.{}, opts)) |ec| {
         if (ir_mod.pending_eager_calls) |*old| old.deinit();
         ir_mod.pending_eager_calls = ec;
     }
+    trace(gpa, "  stage total: {d}ms", .{(runtime.clockMonotonicNanos() - t0) / 1_000_000});
 }
 
 /// Check the base's sources, keying the resolutions to FuncIds so they ride the
@@ -760,7 +842,7 @@ pub fn tryPrepare(
 
     const meta_file = metaPath(gpa, cache, stdlib_hash) orelse return null;
     var gate_full: ?bool = null;
-    if (readMeta(gpa, meta_file)) |meta| {
+    if (readMetaFromCaches(gpa, meta_file)) |meta| {
         var prefix_set = std.StringHashMap(void).init(gpa);
         defer prefix_set.deinit();
         for (selection.final_prefixes.items) |p| prefix_set.put(p, {}) catch return null;
@@ -780,12 +862,13 @@ pub fn tryPrepare(
         const key = imageKey(stdlib_hash, exe, gate, selection.packs.items);
         const hex = keyHex(key);
         const image_path = std.fmt.allocPrint(gpa, "{s}/stdlib-{s}.klio-image", .{ cache, hex }) catch return null;
-        if (loadImageFile(gpa, image_path)) |loaded| {
+        if (loadImageFromCaches(gpa, image_path, hex)) |found| {
             const t_load = runtime.clockMonotonicNanos();
-            const out = finishFromLoaded(gpa, loaded, user, paths, pack_bindings);
+            const out = finishFromLoaded(gpa, found.loaded, user, paths, pack_bindings);
             // A null `out` means the extend gate refused; not a served hit.
-            trace(gpa, "{s} {s} (key {d}ms, packs {d}ms, load {d}ms, extend {d}ms)", .{
+            trace(gpa, "{s}{s} {s} (key {d}ms, packs {d}ms, load {d}ms, extend {d}ms)", .{
                 if (out != null) @as([]const u8, "hit") else "hit-but-fallback",
+                if (found.shipped) @as([]const u8, " (shipped)") else "",
                 hex,
                 (t_hash - t0) / 1_000_000,
                 (t_packs - t_hash) / 1_000_000,
@@ -798,11 +881,21 @@ pub fn tryPrepare(
             trace(gpa, "unbakeable {s}", .{hex});
             return null;
         }
+        tracePreBake(gpa, t0, t_hash, t_packs);
         return bakeAndPrepare(gpa, cache, meta_file, false, user, paths, features);
     }
 
     // No meta yet: the full load computes the gate and the key follows from it.
+    tracePreBake(gpa, t0, t_hash, t_packs);
     return bakeAndPrepare(gpa, cache, meta_file, true, user, paths, features);
+}
+
+fn tracePreBake(gpa: Allocator, t0: u64, t_hash: u64, t_packs: u64) void {
+    trace(gpa, "  before bake: key {d}ms, user+packs {d}ms, meta {d}ms", .{
+        (t_hash - t0) / 1_000_000,
+        (t_packs - t_hash) / 1_000_000,
+        (runtime.clockMonotonicNanos() - t_packs) / 1_000_000,
+    });
 }
 
 fn tombstoneExists(gpa: Allocator, cache: []const u8, hex: [32]u8) bool {
@@ -987,9 +1080,9 @@ fn bakeAndPrepare(
             .any_non_implicit = report.any_non_implicit,
         });
         // The gate was unknown here, so an image for the now-known key may exist.
-        if (loadImageFile(gpa, image_path)) |loaded| {
-            trace(gpa, "hit {s}", .{hex});
-            return finishFromLoaded(gpa, loaded, user, paths, deps.bindings);
+        if (loadImageFromCaches(gpa, image_path, hex)) |found| {
+            trace(gpa, "hit{s} {s}", .{ if (found.shipped) @as([]const u8, " (shipped)") else "", hex });
+            return finishFromLoaded(gpa, found.loaded, user, paths, deps.bindings);
         }
         if (tombstoneExists(gpa, cache, hex)) return null;
     }
@@ -1028,7 +1121,21 @@ fn bakeAndPrepare(
         .parse_ms = (tb_parse - tb0) / 1_000_000,
         .lower_ms = (tb_lower - tb_pre) / 1_000_000,
     };
+    const tx0 = runtime.clockMonotonicNanos();
     if (!forkBake(gpa, &bake_job)) _ = bakeAndWrite(gpa, &bake_job);
+    const tx_fork = runtime.clockMonotonicNanos();
+    // The strip's freeing walk runs beside the rest of the preparation and is
+    // done before the program starts. It touches only what the strip detached.
+    var release = DetachedRelease{ .gpa = gpa, .bodies = base.detached_bodies.items };
+    const release_thread: ?std.Thread = if (release.bodies.len != 0)
+        std.Thread.spawn(.{}, DetachedRelease.run, .{&release}) catch null
+    else
+        null;
+    defer {
+        if (release_thread) |t| t.join() else release.run();
+        base.detached_bodies.deinit(gpa);
+        if (traceEnabled(gpa) and release.bodies.len != 0) trace(gpa, "  released {d} detached bodies: {d} nodes, {d}kb", .{ release.bodies.len, release.stats.nodes, release.stats.bytes / 1024 });
+    }
 
     if (!interp_ir.build.canExtendBase(base, user.asts)) {
         trace(gpa, "fallback (base name collision)", .{});
@@ -1040,12 +1147,52 @@ fn bakeAndPrepare(
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
     publishExternDecls(gpa, base);
     publishBaseEagerCalls(gpa, base);
+    const tx_publish = runtime.clockMonotonicNanos();
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    const tx_eager = runtime.clockMonotonicNanos();
     span.active_map = map;
     // Built for this run alone: the bake child works on its own copy of the
     // address space, and nothing in this process reads the base afterwards.
     const built = interp_ir.build.buildModuleFilesExtendOwned(gpa, base, user2.asts) catch return null;
+    trace(gpa, "  after bake: fork {d}ms, user+publish {d}ms, user-check {d}ms, extend {d}ms", .{
+        (tx_fork - tx0) / 1_000_000,
+        (tx_publish - tx_fork) / 1_000_000,
+        (tx_eager - tx_publish) / 1_000_000,
+        (runtime.clockMonotonicNanos() - tx_eager) / 1_000_000,
+    });
     return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };
+}
+
+/// `klio bake-image --stdlib-cache <dir>`: bake the stdlib-only image, keyed
+/// as this binary keys it, into `dir` as a cache the runtime reads when its
+/// own misses. The build runs it on the freshly built binary and installs the
+/// directory beside it, so a rebuilt klio's first run is not a cold one. The
+/// base is that of a program with no imports, which is what any import-free
+/// program looks up; a program that pulls packs in still bakes its own.
+pub fn bakeStdlibCache(gpa: Allocator, dir: []const u8, features: *const RequestedFeatures) u8 {
+    cache_dir_override = dir;
+    defer cache_dir_override = null;
+    force_sync = true;
+    defer force_sync = false;
+    const cache = cacheDir(gpa) orelse {
+        io.printStderr(gpa, "error: cannot create {s}\n", .{dir});
+        return 1;
+    };
+    defer gpa.free(cache);
+    const probe = std.fs.path.join(gpa, &.{ cache, "probe.kt" }) catch return 1;
+    defer gpa.free(probe);
+    writeAtomic(gpa, cache, probe, "fun main() {}\n");
+    defer {
+        var threaded = threadedIo(gpa);
+        defer threaded.deinit();
+        std.Io.Dir.cwd().deleteFile(threaded.io(), probe) catch {};
+    }
+    const prepared = tryPrepare(gpa, &.{probe}, features);
+    if (prepared == null) {
+        io.printStderr(gpa, "error: the stdlib image did not bake into {s}\n", .{dir});
+        return 1;
+    }
+    return 0;
 }
 
 /// One dependency load for `klio bundle`. Lowering mutates the ASTs and baking

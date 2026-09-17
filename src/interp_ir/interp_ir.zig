@@ -16,6 +16,7 @@ pub const Output = runtime.Output;
 
 pub const build = @import("build.zig");
 pub const image = @import("image.zig");
+pub const prune = @import("prune.zig");
 
 const vmhost = @import("vm/vmhost.zig");
 const run_mod = @import("vm/run.zig");

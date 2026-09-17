@@ -70,7 +70,7 @@ pub fn stdlibSources(allocator: Allocator, env: ?*const EnvMap, result: *PackErr
         return .{ .arena = arena, .files = bundle.files };
     }
     if (EMBEDDED_PACK_BYTES) |bytes| {
-        return .{ .arena = arena, .files = try decodeSources(a, try a.dupe(u8, bytes), result) };
+        return .{ .arena = arena, .files = try decodeEmbeddedSources(a, bytes, result) };
     }
     arena.deinit();
     return null;
@@ -82,6 +82,19 @@ fn decodeSources(a: Allocator, bytes: []u8, result: *PackError) Allocator.Error!
     var reader = (try pack.PackReader.fromBytes(a, bytes, result)) orelse return &.{};
     const payload = (try reader.readSection(pack.section_names.SOURCES, result)) orelse return &.{};
     const bundle = (try pack.schema.decode(pack.schema.SourceBundle, a, payload.slice(), result)) orelse return &.{};
+    return bundle.files;
+}
+
+/// The sources the binary carries, as slices of its own bytes: no copy of
+/// the pack, no hash over it and no copy of each file, only the file table
+/// on the arena `a`. The section is stored uncompressed, so its payload is a
+/// slice of the pack too.
+fn decodeEmbeddedSources(a: Allocator, bytes: []const u8, result: *PackError) Allocator.Error![]const pack.schema.SourceFile {
+    var reader = (try pack.PackReader.fromBytesBorrowed(a, bytes, result)) orelse return &.{};
+    // A compressed section would land on the arena instead, which the files
+    // then borrow from just the same.
+    const payload = (try reader.readSection(pack.section_names.SOURCES, result)) orelse return &.{};
+    const bundle = (try pack.schema.decodeBorrowed(pack.schema.SourceBundle, a, payload.slice(), result)) orelse return &.{};
     return bundle.files;
 }
 

@@ -64,6 +64,9 @@ pub const StdlibBase = struct {
     /// Encoded `inline`, object-free function bodies, decoded lazily on first splice and
     /// borrowing the image buffer. Empty for a freshly-built base, which keeps full bodies.
     deferred_bodies: []const u8 = &.{},
+    /// The bodies the strip detached and left for `prune.releaseDetached`: the
+    /// run frees them beside its own work once the bake has its copy.
+    detached_bodies: prune.Detached = .empty,
     /// Per-decl encodings of `lifted_decls` with byte offsets (decl `i` at
     /// `lifted_decl_offsets[i]`), decoded on first touch. Borrow the image buffer.
     lifted_decl_section: []const u8 = &.{},
@@ -259,6 +262,8 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
     // `KLIO_PRUNE_KEEP` leaves the stripped trees allocated: a cold-run failure
     // that disappears under it is a pointer into a stripped body that
     // `collectPinned` does not know about.
+    const t_pin = runtime.clockMonotonicNanos();
+    var t_strip: u64 = t_pin;
     const released = blk: {
         var pinned: prune.Pinned = .empty;
         defer pinned.deinit(allocator);
@@ -267,18 +272,29 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
             defer mg.deinit();
             try prune.collectPinned(allocator, mg.get(), &pinned);
         }
+        t_strip = runtime.clockMonotonicNanos();
         const free_with: ?Allocator = if (runtime.envOnce("KLIO_PRUNE_KEEP") != null) null else allocator;
-        break :blk prune.stripDeadBodies(@constCast(base.lifted_decls), true, free_with, &pinned);
+        break :blk prune.stripDeadBodiesDeferring(@constCast(base.lifted_decls), true, free_with, &pinned, &base.detached_bodies);
     };
-    if (runtime.envOnce("KLIO_TRACE_LOWER") != null) std.debug.print(
-        "[lower] strip-dead-bodies: {d} bodies, {d} nodes, {d}kb freed; {d} bodies pinned by lowered code\n",
-        .{ released.bodies, released.nodes, released.bytes / 1024, released.pinned_bodies },
-    );
+    const t_stripped = runtime.clockMonotonicNanos();
     {
         const mg = base.built.module.borrowMut();
         defer mg.deinit();
         mg.get().dropLoweringCaches();
     }
+    if (runtime.envOnce("KLIO_TRACE_LOWER") != null) std.debug.print(
+        "[lower] strip-dead-bodies: {d} bodies, {d} detached, {d} nodes, {d}kb freed; {d} bodies pinned by lowered code (pins {d}us, strip {d}us, drop caches {d}us)\n",
+        .{
+            released.bodies,
+            base.detached_bodies.items.len,
+            released.nodes,
+            released.bytes / 1024,
+            released.pinned_bodies,
+            (t_strip - t_pin) / 1000,
+            (t_stripped - t_strip) / 1000,
+            (runtime.clockMonotonicNanos() - t_stripped) / 1000,
+        },
+    );
     @import("module.zig").phase.mark("base-bookkeeping");
 
     return base;

@@ -283,6 +283,11 @@ pub const Lexer = struct {
     /// diagnostics and is freed with `LexResult.deinit`.
     pub fn tokenize(self: *Lexer) !LexResult {
         var tokens: std.ArrayList(Token) = .empty;
+        // Source runs about four bytes a token, comments included. Reserving
+        // for that once keeps a large file's token list from doubling through
+        // a chain of maps and copies; the pages past the last token are never
+        // touched, and the settled list gives them back in place.
+        try tokens.ensureTotalCapacity(self.allocator, self.src.len / 4 + 64);
         loop: while (true) {
             switch (self.currentMode()) {
                 .Normal, .Interp => {
@@ -418,31 +423,34 @@ pub const Lexer = struct {
             return .{ .kind = .Newline, .span = self.span(start) };
         }
         if (b == '/' and self.peekByte(1) == @as(?u8, '/')) {
-            while (self.peekByte(0)) |c| {
-                if (c == '\n') break;
-                self.pos += 1;
-            }
+            self.pos = @intCast(std.mem.indexOfScalarPos(u8, self.src, self.pos, '\n') orelse self.src.len);
             return .{ .kind = .LineComment, .span = self.span(start) };
         }
         if (b == '/' and self.peekByte(1) == @as(?u8, '*')) {
+            // Comments are a good part of a documented source, so the scan
+            // jumps between stars: a `/*` opens, a `*/` closes. A star's
+            // neighbours decide, and the opening delimiter's own star is
+            // behind the scan. Every other byte is comment text, multi-byte
+            // characters included, since neither delimiter byte can be part
+            // of one.
             self.pos += 2;
             var depth: u32 = 1;
             while (depth > 0) {
-                const c0 = self.peekByte(0);
-                const c1 = self.peekByte(1);
-                if (c0 == @as(?u8, '/') and c1 == @as(?u8, '*')) {
-                    self.pos += 2;
-                    depth += 1;
-                } else if (c0 == @as(?u8, '*') and c1 == @as(?u8, '/')) {
-                    self.pos += 2;
-                    depth -= 1;
-                } else if (c0) |c| {
-                    if (c < 0x80) self.pos += 1 else _ = self.bumpChar();
-                } else {
+                const i = std.mem.indexOfScalarPos(u8, self.src, self.pos, '*') orelse {
+                    self.pos = @intCast(self.src.len);
                     var d = Diagnostic.err("unterminated block comment", self.span(start));
                     _ = d.withCode("E0020");
                     try self.emit(d);
                     break;
+                };
+                if (i > self.pos and self.src[i - 1] == '/') {
+                    depth += 1;
+                    self.pos = @intCast(i + 1);
+                } else if (i + 1 < self.src.len and self.src[i + 1] == '/') {
+                    depth -= 1;
+                    self.pos = @intCast(i + 2);
+                } else {
+                    self.pos = @intCast(i + 1);
                 }
             }
             return .{ .kind = .BlockComment, .span = self.span(start) };
@@ -1673,6 +1681,40 @@ test "unterminated block comment diag" {
     var r = try lex("/* never closes");
     defer r.deinit(testing.allocator);
     try testing.expect(r.diagnostics.hasErrors());
+}
+
+test "block comment delimiters that share a star" {
+    // The scan moves between stars, so the shapes where a star serves two
+    // roles, or none, must still close where Kotlin closes them.
+    const cases = [_][]const u8{
+        "/**/ 1",
+        "/*/ */ 1",
+        "/* **/ 1",
+        "/***/ 1",
+        "/* a /* b */ c */ 1",
+        "/*/ inner /* deeper */ */ 1",
+        "/* * / */ 1",
+    };
+    for (cases) |src| {
+        var r = try lex(src);
+        defer r.deinit(testing.allocator);
+        try testing.expect(!r.diagnostics.hasErrors());
+        // Comments are not tokens; the literal after one must be the only token.
+        try testing.expectEqual(@as(usize, 2), r.tokens.len);
+        try testing.expect(r.tokens[0].kind == .IntLiteral);
+        try testing.expect(r.tokens[1].kind == .Eof);
+    }
+    var open = try lex("/* a /* b */ still open");
+    defer open.deinit(testing.allocator);
+    try testing.expect(open.diagnostics.hasErrors());
+    var line = try lex("// to the end of the line */ 1\n2");
+    defer line.deinit(testing.allocator);
+    try testing.expect(!line.diagnostics.hasErrors());
+    var ints: usize = 0;
+    for (line.tokens) |t| {
+        if (t.kind == .IntLiteral) ints += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), ints);
 }
 
 test "numeric suffixes and bases" {

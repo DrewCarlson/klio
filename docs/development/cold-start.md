@@ -10,11 +10,12 @@ section of [performance](../architecture/performance.md).
 
 Measure with `KLIO_TRACE_STDLIB_IMAGE=1` (phase totals), `KLIO_TRACE_LOWER=1`
 (lowering steps and cache counters) and `KLIO_TRACE_RUN=1` (the run itself),
-against a fresh data home:
+against a fresh data home, and with the image the build ships beside the
+binary ignored, or the run is a warm one:
 
 ```sh
-rm -rf /tmp/klio-cold && KLIO_HOME=/tmp/klio-cold KLIO_TRACE_STDLIB_IMAGE=1 \
-  KLIO_TRACE_LOWER=1 ./zig-out/bin/klio run hello.kt
+rm -rf /tmp/klio-cold && KLIO_HOME=/tmp/klio-cold KLIO_STDLIB_IMAGE_SHIPPED=0 \
+  KLIO_TRACE_STDLIB_IMAGE=1 KLIO_TRACE_LOWER=1 ./zig-out/bin/klio run hello.kt
 ```
 
 A profile of the whole bake is one `sample` of the process at 1ms; the
@@ -232,12 +233,79 @@ image path borrows them from the mapping.
 
 ## What remains for time
 
-After the changes the bake is dominated by lowering the function bodies
-(about 70% of the remaining time), and inside that by resolution (extension
-and bare-call candidate ranking, about a third), inline splicing (re-lowering
-an inline callee's AST at each call site, about a sixth) and string hashing
-across the module's many name-keyed maps. Serialization is about 10%, the
-checker about 12%.
+A ReleaseFast cold `klio run hello.kt` now prepares in 163 to 174 ms and
+its wall is 175 to 215 ms; the process itself (load, `main`, exit) is 4 ms
+of that. The bake in the child takes another 35 to 45 ms off the critical
+path. Inside prepare:
+
+| Phase | Now | Before this round |
+|-------|----:|------:|
+| Read and register the sources | 7 ms | 7 ms |
+| Lex and parse, ten threads | 21 to 24 ms | 25 to 29 ms |
+| Stage: resolve 7 on the pool, declarations 4, bodies 12 on ten threads, merge 5 | 37 ms | 55 ms |
+| Build: headers about 20 serial, class bodies 10, bodies 25 to 30 on the pool, bookkeeping 5 | 78 ms | 118 ms |
+| Everything else (cache key, user parse, extend) | about 18 ms | about 20 ms |
+
+What this round changed, each with its own verification:
+
+- **Trace flags read once.** Every lowering of a call read its trace flags
+  with `getenv`, which walks the environment under libc's lock; on the
+  pool that serialised the workers. The pool's bodies went from 60 ms to
+  33 ms.
+- **The stage runs the checker for the picks alone.** Its declaration-level
+  diagnostic passes and the merge of every worker's control-flow graphs were
+  work nothing read; the image is byte-identical without them
+  (`KLIO_STAGE_DIAG=1` restores them to compare).
+- **The pool's workers share the name indexes** instead of copying two maps
+  of lists each; a fork is 2 to 5 ms instead of up to 22.
+- **The compose pass skips a module without a `@Composable`**, which the
+  parser flags, so a stdlib base no longer walks its declarations four times
+  to find nothing.
+- **The largest sources parse in pieces.** `_Arrays.kt` alone bounded the
+  parse wall; its token stream is cut at declaration boundaries and the
+  pieces parse alongside the other files. `KLIO_PARSE_JOBS=1` is the
+  reference, `KLIO_PARSE_CHECK=1` compares a piecewise parse with a whole
+  one.
+- **A dead bake child is no longer silent.** The forked bake of the compose
+  base had been crashing for every compose example while the runs passed,
+  since a child that dies writes no image. The strip now pins every node a
+  lowered instruction reaches, the cache keeps a `.baking` marker while the
+  child works, and the next cold run says when the previous bake died.
+  `KLIO_STDLIB_IMAGE_SYNC=1` on a compose example is the check the corpus
+  cannot make.
+
+The body lowering that is left is spread thin: string-keyed map lookups are
+about 16% of a worker's time (local names, class names, receiver verdicts),
+thread-local access 5%, allocation 5%, bare-call candidate iteration 7%,
+extension resolution about a quarter, inline splicing about a sixth.
+
+### A program that pulls packs in
+
+`examples/compose_window.kt` keys its own image (the stdlib plus the
+compose packs, 16000 declarations, a 78 MB image), so the shipped stdlib
+image does not serve it and its first run bakes. ReleaseFast:
+
+| | Cold | Warm |
+|---|---:|---:|
+| Wall | 3.0 s (was 3.8 s) | 600 ms |
+| Prepare | 2.6 s | 226 ms |
+| Stage: resolve 27, declarations 31, bodies 344 on ten threads, merge 40 | 510 ms | |
+| Build: headers about 200 serial, class bodies 340 (pool), top-level bodies 174 (pool), member thunks 144 serial | 1.2 s (was 2.1 s) | |
+| Serialize (in the child, off the path) | 320 ms | |
+| Extend the user program | | 118 ms |
+| Load the packs' metadata | | 42 ms |
+| The program itself | 350 ms | 350 ms |
+
+The top-level bodies had lowered serially here: a local function's
+default-argument thunks grew a registry table in a shard, so the pool gave
+up. That table rides the merge now (1023 ms to 174 ms). What remains on
+this base, in order of size: the stage's bodies (3.5 s of CPU over ten
+threads; the checker's per-body cost is the lever), the serial header
+steps, the class-member thunks, and on the warm side the extend, which
+re-registers every base class's members on each run by decoding them from
+the image (`installMemberAstTables`, `registerHierarchyMethodNames`, and
+the compose pass decoding every lifted declaration to collect composable
+names that the image could carry precomputed).
 
 ### Bodies on a pool
 
@@ -291,16 +359,23 @@ sources cost more than loading the image it keyed, on every warm run too.
 
 The levers, in the order they will be taken:
 
-1. **Splice inline callees from a lowered template** instead of re-lowering
+1. **The serial remainder.** The resolver's second pass now runs on the
+   pool (10 ms to 7 ms; its declaration pass is the serial rest); the
+   header steps (about 20 ms) are one thread registering 6000 signatures;
+   the extend of the user program and the cache-key work are 18 ms of
+   small steps.
+2. **Splice inline callees from a lowered template** instead of re-lowering
    their AST per call site.
-2. **Bake at build time.** The key includes the executable's stamp, so every
-   rebuild is cold; the JDK, V8, Dart and CPython all produce their equivalent
-   of the image in the build and ship it. `zig build` already has a base-gen
-   step for the parity harness; extending it to install the stdlib image next
-   to the binary removes the cold path from a fresh install entirely, and
-   layering pack images over it (as the JDK's dynamic archive layers over the
-   static one) removes it for new pack combinations.
-3. **Lower on demand.** The image already defers inline bodies and decodes
+3. **Bake at build time: done for the stdlib.** The key includes the
+   executable's stamp, so every rebuild was cold. `zig build` now runs the
+   built binary once (`klio bake-image --stdlib-cache`) and installs the
+   image and its meta file under `share/klio/cache`; a run whose own cache
+   misses reads them there (`hit (shipped)` in the trace). The first run
+   after a rebuild of an import-free program is 25 ms in release, 141 ms in
+   Debug, where it was the cold bake. A program that pulls packs in still
+   keys its own image; layering pack images over the stdlib one (as the
+   JDK's dynamic archive layers over the static one) is what remains here.
+4. **Lower on demand.** The image already defers inline bodies and decodes
    function bodies lazily; lowering them lazily, with the image completed in
    the background after the run, would make a cold run cost the headers plus
    what the program reaches. This changes the runtime model and is the last

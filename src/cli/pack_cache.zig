@@ -746,8 +746,16 @@ fn loadEmbeddedStdlibSources(
         io.printStderr(allocator, "set KLIO_STDLIB_PACK to a stdlib .klio-pack, or run from a klio checkout\n", .{});
         return;
     };
-    defer sources.deinit();
-    if (sources.files.len == 0) return;
+    if (sources.files.len == 0) {
+        sources.deinit();
+        return;
+    }
+    // The map borrows every source and keeps the bundle's arena, so nothing
+    // here copies the sources or indexes their lines.
+    source_map.adopt(sources.arena) catch {
+        sources.deinit();
+        return;
+    };
     timing.sources = runtime.clockMonotonicNanos() - t_start;
 
     const diag = envVarPresent(allocator, "KLIO_PACK_DIAG");
@@ -769,7 +777,7 @@ fn loadEmbeddedStdlibSources(
     for (sources.files) |sf| {
         // Sources whose interpreted declarations would shadow klio's intrinsics.
         if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
-        const fid = source_map.add(sf.rel_path, sf.bytes) catch continue;
+        const fid = source_map.addBorrowed(sf.rel_path, sf.bytes) catch continue;
         if (files_trace) std.debug.print("[file] {d} {s}\n", .{ fid.int(), sf.rel_path });
         jobs.append(allocator, .{
             .fid = fid,

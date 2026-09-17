@@ -1709,12 +1709,26 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.UByteArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
 };
 
-const TABLE_MAP = blk: {
-    @setEvalBranchQuota(TABLE.len * TABLE.len);
-    var kvs: [TABLE.len]struct { []const u8, StdlibFn } = undefined;
-    for (TABLE, 0..) |e, i| kvs[i] = .{ e.fqn, e.f };
-    break :blk std.StaticStringMap(StdlibFn).initComptime(kvs);
-};
+// The fqn indexes are hash maps built on first use: a `StaticStringMap` over
+// sixteen hundred entries compares every key of the probed length, which put
+// each header's lookup near a microsecond.
+var table_map: std.StringHashMapUnmanaged(StdlibFn) = .empty;
+var param_names_map: std.StringHashMapUnmanaged([]const []const u8) = .empty;
+var fqn_index_state = std.atomic.Value(u8).init(0);
+
+fn ensureFqnIndex() void {
+    if (fqn_index_state.load(.acquire) == 2) return;
+    if (fqn_index_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+        const a = std.heap.page_allocator;
+        table_map.ensureTotalCapacity(a, TABLE.len) catch {};
+        for (TABLE) |e| table_map.put(a, e.fqn, e.f) catch {};
+        param_names_map.ensureTotalCapacity(a, PARAM_NAMES.len) catch {};
+        for (PARAM_NAMES) |e| param_names_map.put(a, e.fqn, e.names) catch {};
+        fqn_index_state.store(2, .release);
+        return;
+    }
+    while (fqn_index_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+}
 
 /// Every table fqn grouped under its last segment, for the receiver-qualified
 /// resolution in `declarationHostSymbol`. Built on first use; the table is
@@ -1748,19 +1762,14 @@ fn buildNameIndex() void {
     }
 }
 
-const PARAM_NAMES_MAP = blk: {
-    @setEvalBranchQuota(PARAM_NAMES.len * PARAM_NAMES.len);
-    var kvs: [PARAM_NAMES.len]struct { []const u8, []const []const u8 } = undefined;
-    for (PARAM_NAMES, 0..) |e, i| kvs[i] = .{ e.fqn, e.names };
-    break :blk std.StaticStringMap([]const []const u8).initComptime(kvs);
-};
-
 pub fn lookupParamNames(fqn: []const u8) ?[]const []const u8 {
-    return PARAM_NAMES_MAP.get(fqn);
+    ensureFqnIndex();
+    return param_names_map.get(fqn);
 }
 
 pub fn lookup(fqn: []const u8) ?StdlibFn {
-    return TABLE_MAP.get(fqn);
+    ensureFqnIndex();
+    return table_map.get(fqn);
 }
 
 /// Resolve one Kotlin source declaration to the host ABI symbol implementing it.

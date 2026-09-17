@@ -721,6 +721,28 @@ pub fn build(b: *std.Build) void {
     if (android_ndk) |ndk| wireAndroidNdk(b, exe.root_module, ndk);
     b.installArtifact(exe);
 
+    // A rebuilt klio keys the stdlib image on its own stamp, so its first run
+    // would bake. The build bakes that image once with the built binary (the
+    // install keeps the artifact's mtime, so the installed copy keys the same
+    // way) and installs it under share/klio/cache, which the runtime reads
+    // when its own cache misses. Re-runs when the binary or a stdlib source
+    // changes.
+    const stdlib_cache = b.addRunArtifact(exe);
+    stdlib_cache.setCwd(b.path("."));
+    stdlib_cache.addArg("bake-image");
+    stdlib_cache.addArg("--stdlib-cache");
+    const stdlib_cache_dir = stdlib_cache.addOutputDirectoryArg("stdlib-cache");
+    for (stdlib_sources.CURATED_UPSTREAM_SOURCES) |rel|
+        stdlib_cache.addFileInput(b.path(b.fmt("{s}/{s}", .{ stdlib_sources.UPSTREAM_STDLIB_ROOT, rel })));
+    for (stdlib_sources.KLIO_STDLIB_ACTUAL_FILES) |rel|
+        stdlib_cache.addFileInput(b.path(b.fmt("{s}/{s}", .{ stdlib_sources.KLIO_STDLIB_DIR, rel })));
+    const stdlib_cache_install = b.addInstallDirectory(.{
+        .source_dir = stdlib_cache_dir,
+        .install_dir = .prefix,
+        .install_subdir = "share/klio/cache",
+    });
+    b.getInstallStep().dependOn(&stdlib_cache_install.step);
+
     // The C-ABI runtime library the C transpiler's output links against:
     // `zig build klio-rt` installs
     // lib/libklio_rt.a + include/klio_rt.h. Ships inside every transpiled

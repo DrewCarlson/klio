@@ -503,6 +503,17 @@ pub fn decode(
     return read.decode(T, allocator, bytes, result);
 }
 
+/// `decode` with byte strings borrowed from `bytes`; see `read.decodeBorrowed`.
+pub fn decodeBorrowed(
+    comptime T: type,
+    allocator: Allocator,
+    bytes: []const u8,
+    result: *PackError,
+) Allocator.Error!?T {
+    const read = @import("read.zig");
+    return read.decodeBorrowed(T, allocator, bytes, result);
+}
+
 fn eqlOptStr(a: ?[]const u8, b: ?[]const u8) bool {
     if ((a == null) != (b == null)) return false;
     if (a == null) return true;

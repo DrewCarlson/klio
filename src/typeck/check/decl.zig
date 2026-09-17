@@ -939,8 +939,9 @@ fn checkFunctionBody(self: *Checker, f: *const Function, body: *const FunctionBo
             var body_ty = try checkBlock(self, b, declared_return);
             defer body_ty.deinit(self.allocator);
             // A declared return other than `Unit` or `Nothing` requires every
-            // path to terminate; the CFG decides.
-            const normal_exit_reachable = blk: {
+            // path to terminate; the CFG decides. Only the diagnostic reads
+            // the answer, so a check that reports none skips the analysis.
+            const normal_exit_reachable = if (!self.report_diagnostics) false else blk: {
                 const scratch = narrowing.queryScratch(self);
                 // Only divergent spans matter, so feed just this function's
                 // bucket, not the whole types map.

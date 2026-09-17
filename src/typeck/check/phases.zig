@@ -3602,11 +3602,18 @@ fn workerMain(work: *BodyWork, w: *Worker) void {
     }
 }
 
-fn moveEntries(dst: anytype, src: anytype) Allocator.Error!void {
-    try dst.ensureUnusedCapacity(src.count());
+fn moveEntries(dst: anytype, src: anytype) void {
     var it = src.iterator();
     while (it.next()) |e| dst.putAssumeCapacity(e.key_ptr.*, e.value_ptr.*);
     src.clearRetainingCapacity();
+}
+
+/// Room in the main map for every worker's entries at once, so the merge
+/// grows each map one time rather than once per worker.
+fn reserveMerged(dst: anytype, workers: []Worker, comptime field: []const u8) Allocator.Error!void {
+    var total: u32 = 0;
+    for (workers) |*w| total += @field(w.checker, field).count();
+    try dst.ensureUnusedCapacity(total);
 }
 
 const OrderedDiag = struct { decl: usize, diag: root.Diagnostic };
@@ -3617,20 +3624,33 @@ fn diagBeforeDecl(_: void, x: OrderedDiag, y: OrderedDiag) bool {
 
 fn mergeWorkers(self: *Checker, workers: []Worker, main_ranges: []const DiagRange, base_len: usize) Allocator.Error!void {
     const a = self.allocator;
+    try reserveMerged(&self.types, workers, "types");
+    try reserveMerged(&self.resolved_calls, workers, "resolved_calls");
+    try reserveMerged(&self.lambda_recv_heads, workers, "lambda_recv_heads");
+    try reserveMerged(&self.lambda_param_shapes, workers, "lambda_param_shapes");
+    try reserveMerged(&self.expr_class, workers, "expr_class");
+    try reserveMerged(&self.rank_class, workers, "rank_class");
+    try reserveMerged(&self.list_elem, workers, "list_elem");
+    try reserveMerged(&self.types_instantiation_dependent, workers, "types_instantiation_dependent");
+    if (self.report_diagnostics) {
+        try reserveMerged(&self.cfgs, workers, "cfgs");
+        try reserveMerged(&self.lowerings, workers, "lowerings");
+        try reserveMerged(&self.ebf_outside, workers, "ebf_outside");
+    }
     for (workers) |*w| {
         const c = &w.checker;
-        try moveEntries(&self.types, &c.types);
-        try moveEntries(&self.resolved_calls, &c.resolved_calls);
-        try moveEntries(&self.lambda_recv_heads, &c.lambda_recv_heads);
-        try moveEntries(&self.lambda_param_shapes, &c.lambda_param_shapes);
-        try moveEntries(&self.expr_class, &c.expr_class);
-        try moveEntries(&self.rank_class, &c.rank_class);
-        try moveEntries(&self.list_elem, &c.list_elem);
-        try moveEntries(&self.types_instantiation_dependent, &c.types_instantiation_dependent);
+        moveEntries(&self.types, &c.types);
+        moveEntries(&self.resolved_calls, &c.resolved_calls);
+        moveEntries(&self.lambda_recv_heads, &c.lambda_recv_heads);
+        moveEntries(&self.lambda_param_shapes, &c.lambda_param_shapes);
+        moveEntries(&self.expr_class, &c.expr_class);
+        moveEntries(&self.rank_class, &c.rank_class);
+        moveEntries(&self.list_elem, &c.list_elem);
+        moveEntries(&self.types_instantiation_dependent, &c.types_instantiation_dependent);
         if (!self.report_diagnostics) continue;
-        try moveEntries(&self.cfgs, &c.cfgs);
-        try moveEntries(&self.lowerings, &c.lowerings);
-        try moveEntries(&self.ebf_outside, &c.ebf_outside);
+        moveEntries(&self.cfgs, &c.cfgs);
+        moveEntries(&self.lowerings, &c.lowerings);
+        moveEntries(&self.ebf_outside, &c.ebf_outside);
     }
     if (!self.report_diagnostics) return;
     // Declaration order, as a sequential pass would have emitted them.

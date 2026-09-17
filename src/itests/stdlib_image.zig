@@ -31,6 +31,9 @@ fn baseEnv(a: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
     try map.put("HOME", home);
     // The tests read the image right after a run, so it bakes in-process.
     try map.put("KLIO_STDLIB_IMAGE_SYNC", "1");
+    // The build ships an image beside the binary; these tests watch the
+    // cache under their own home bake, reject and rebake.
+    try map.put("KLIO_STDLIB_IMAGE_SHIPPED", "0");
     // The comparisons assert byte-identical stderr; keep tracing off.
     _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_TRACE_STDLIB_IMAGE"));
     _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_STDLIB_IMAGE"));

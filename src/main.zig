@@ -214,11 +214,22 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 runtime.slab.traceReport();
                 return rc;
             }
+            if (runtime.envOnce("KLIO_SLAB_MAPS")) |_| {
+                runtime.slab.map_sites_enabled = true;
+                const rc = runCli(runtime.slab.allocator, init.args);
+                runtime.slab.mapSitesReport();
+                return rc;
+            }
             if (runtime.envOnce("KLIO_SLAB_STAT")) |_| {
                 const rc = runCli(runtime.slab.allocator, init.args);
                 std.debug.print(
-                    "[slab] mapped_bytes={d} ({d} MB)\n",
-                    .{ runtime.slab.mapped_bytes.load(.monotonic), runtime.slab.mapped_bytes.load(.monotonic) / (1024 * 1024) },
+                    "[slab] mapped_bytes={d} ({d} MB), maps {d}, unmaps {d}\n",
+                    .{
+                        runtime.slab.mapped_bytes.load(.monotonic),
+                        runtime.slab.mapped_bytes.load(.monotonic) / (1024 * 1024),
+                        runtime.slab.map_calls.load(.monotonic),
+                        runtime.slab.unmap_calls.load(.monotonic),
+                    },
                 );
                 return rc;
             }

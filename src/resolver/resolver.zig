@@ -4,6 +4,7 @@
 //! builtins such as `println` resolve to `Symbol.Builtin` with no declaration.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const ast = @import("ast");
 const diagnostics = @import("diagnostics");
@@ -92,10 +93,24 @@ pub const Scope = struct {
 pub const Resolution = struct {
     scopes: std.ArrayList(Scope),
     symbols: std.ArrayList(Symbol),
+    /// Use sites of the declaration pass; when the second pass ran on a pool,
+    /// each body's uses and scopes stayed with its worker, since nothing reads
+    /// them after the pass.
     uses: std.AutoHashMap(Span, SymbolId),
     /// Reverse index: declaration spans with at least one use site.
     referenced_decls: std.AutoHashMap(Span, void),
     diagnostics: DiagnosticSink,
+    /// The pool workers' arenas: the diagnostics they emitted live there.
+    arenas: []*std.heap.ArenaAllocator = &.{},
+
+    pub fn deinit(self: *Resolution) void {
+        for (self.arenas) |a| {
+            a.deinit();
+            std.heap.page_allocator.destroy(a);
+        }
+        if (self.arenas.len != 0) std.heap.page_allocator.free(self.arenas);
+        self.arenas = &.{};
+    }
 
     pub fn symbol(self: *const Resolution, id: SymbolId) *const Symbol {
         return &self.symbols.items[id.int()];
@@ -196,19 +211,23 @@ pub fn resolveModuleWithNatives(
         }
     }
     // Phase 2: apply each file's imports in a child of its package scope, then
-    // resolve bodies. Lookup walks file, package, module, builtins.
-    for (files) |*file| {
-        try r.setFilePackage(file);
-        const pkg_scope = pkg_scopes.get(r.file_package orelse "").?;
-        const file_scope = try r.pushScope(pkg_scope, .File);
-        for (file.imports) |*imp| {
-            try r.checkImport(imp);
-            try r.bindImportLeaf(file_scope, imp);
-        }
-        for (file.decls) |*decl| {
-            try r.resolveDecl(file_scope, decl, true);
+    // resolve bodies. Lookup walks file, package, module, builtins. The files
+    // are independent once phase 1 has declared everything, so they resolve
+    // on a pool when there are enough of them.
+    const threads = resolveThreads(files.len);
+    if (threads >= 2) {
+        if (try resolveFilesOnPool(allocator, &r, files, &pkg_scopes, threads)) |arenas| {
+            return .{
+                .scopes = r.scopes,
+                .symbols = r.symbols,
+                .uses = r.uses,
+                .referenced_decls = r.referenced_decls,
+                .diagnostics = r.diagnostics,
+                .arenas = arenas,
+            };
         }
     }
+    for (files) |*file| try r.resolveFile(file, &pkg_scopes);
     return .{
         .scopes = r.scopes,
         .symbols = r.symbols,
@@ -216,6 +235,132 @@ pub fn resolveModuleWithNatives(
         .referenced_decls = r.referenced_decls,
         .diagnostics = r.diagnostics,
     };
+}
+
+/// `KLIO_RESOLVE_THREADS` caps the pool (1 resolves serially, the reference);
+/// `KLIO_MAX_WORKERS` caps it with every other pool. Default: one per CPU.
+fn resolveThreads(n_files: usize) usize {
+    if (n_files < 8) return 1;
+    var want = std.Thread.getCpuCount() catch 1;
+    if (std.c.getenv("KLIO_MAX_WORKERS")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |cap| {
+            if (cap >= 1) want = @min(want, cap);
+        }
+    }
+    if (std.c.getenv("KLIO_RESOLVE_THREADS")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |cap| {
+            if (cap >= 1) want = cap;
+        }
+    }
+    return @min(@min(want, n_files), max_resolve_workers);
+}
+
+const max_resolve_workers: usize = 64;
+/// The resolver recurses per nesting level; the reservation is virtual until touched.
+const resolve_worker_stack: usize = 16 * 1024 * 1024;
+
+const FileDiagRange = struct { worker: usize, start: usize, end: usize };
+
+const ResolveWork = struct {
+    files: []const KotlinFile,
+    pkg_scopes: *const std.StringHashMap(ScopeId),
+    next: std.atomic.Value(usize) = .init(0),
+    ranges: []FileDiagRange,
+};
+
+const ResolveWorker = struct {
+    index: usize,
+    r: Resolver,
+    arena: *std.heap.ArenaAllocator,
+    thread: ?std.Thread = null,
+    failed: bool = false,
+};
+
+/// Each worker resolves files from a shared counter on a copy of the
+/// resolver whose phase-1 scopes and symbols it reads and never writes: its
+/// own scopes and symbols append past them into its arena. The merge keeps
+/// what a reader needs, the referenced declarations and the diagnostics in
+/// file order. Null when no worker could start; a worker's allocation failure
+/// is the pass's.
+fn resolveFilesOnPool(
+    allocator: std.mem.Allocator,
+    r: *Resolver,
+    files: []const KotlinFile,
+    pkg_scopes: *const std.StringHashMap(ScopeId),
+    threads: usize,
+) !?[]*std.heap.ArenaAllocator {
+    const pa = std.heap.page_allocator;
+    const ranges = try allocator.alloc(FileDiagRange, files.len);
+    defer allocator.free(ranges);
+    var work = ResolveWork{ .files = files, .pkg_scopes = pkg_scopes, .ranges = ranges };
+    const workers = try allocator.alloc(ResolveWorker, threads);
+    defer allocator.free(workers);
+    const arenas = try pa.alloc(*std.heap.ArenaAllocator, threads);
+    var made: usize = 0;
+    errdefer {
+        for (arenas[0..made]) |a| {
+            a.deinit();
+            pa.destroy(a);
+        }
+        pa.free(arenas);
+    }
+    for (workers, 0..) |*w, i| {
+        const arena = try pa.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(pa);
+        arenas[i] = arena;
+        made += 1;
+        w.* = .{ .index = i, .r = try r.forkForPool(arena.allocator()), .arena = arena };
+    }
+    const shared_before = if (builtin.mode == .Debug) sharedScopeFootprint(r) else {};
+    var spawned: usize = 0;
+    for (workers) |*w| {
+        w.thread = std.Thread.spawn(.{ .stack_size = resolve_worker_stack }, resolveWorkerMain, .{ &work, w }) catch break;
+        spawned += 1;
+    }
+    if (spawned == 0) {
+        for (arenas[0..made]) |a| {
+            a.deinit();
+            pa.destroy(a);
+        }
+        pa.free(arenas);
+        return null;
+    }
+    for (workers[0..spawned]) |*w| w.thread.?.join();
+    if (builtin.mode == .Debug) std.debug.assert(std.meta.eql(shared_before, sharedScopeFootprint(r)));
+    for (workers[0..spawned]) |*w| if (w.failed) return error.OutOfMemory;
+    if (work.next.load(.monotonic) < files.len) return error.OutOfMemory;
+    for (workers[0..spawned]) |*w| {
+        var it = w.r.referenced_decls.keyIterator();
+        while (it.next()) |k| try r.referenced_decls.put(k.*, {});
+    }
+    for (ranges) |range| {
+        const w = &workers[range.worker];
+        for (w.r.diagnostics.diagnostics.items[range.start..range.end]) |d| try r.diagnostics.emit(allocator, d);
+    }
+    return arenas;
+}
+
+fn resolveWorkerMain(work: *ResolveWork, w: *ResolveWorker) void {
+    while (true) {
+        const i = work.next.fetchAdd(1, .monotonic);
+        if (i >= work.files.len) return;
+        const start = w.r.diagnostics.diagnostics.items.len;
+        w.r.resolveFile(&work.files[i], work.pkg_scopes) catch {
+            w.failed = true;
+            return;
+        };
+        work.ranges[i] = .{ .worker = w.index, .start = start, .end = w.r.diagnostics.diagnostics.items.len };
+    }
+}
+
+/// Entry counts of the scopes every worker shares; a body that bound a name
+/// into one would have written the main resolver.
+const SharedScopeFootprint = struct { scopes: usize, bindings: usize, symbols: usize };
+
+fn sharedScopeFootprint(r: *const Resolver) SharedScopeFootprint {
+    var out: SharedScopeFootprint = .{ .scopes = r.scopes.items.len, .bindings = 0, .symbols = r.symbols.items.len };
+    for (r.scopes.items) |*s| out.bindings += s.bindings.count();
+    return out;
 }
 
 const SigKeyContext = struct {
@@ -275,6 +420,37 @@ const Resolver = struct {
 
     fn strs(self: *Resolver) std.mem.Allocator {
         return self.allocator;
+    }
+
+    /// Phase 2 for one file: its imports into a scope of its own under its
+    /// package's, then its bodies.
+    fn resolveFile(self: *Resolver, file: *const KotlinFile, pkg_scopes: *const std.StringHashMap(ScopeId)) !void {
+        try self.setFilePackage(file);
+        const pkg_scope = pkg_scopes.get(self.file_package orelse "").?;
+        const file_scope = try self.pushScope(pkg_scope, .File);
+        for (file.imports) |*imp| {
+            try self.checkImport(imp);
+            try self.bindImportLeaf(file_scope, imp);
+        }
+        for (file.decls) |*decl| {
+            try self.resolveDecl(file_scope, decl, true);
+        }
+    }
+
+    /// A copy for a pool worker on `arena`: its own copies of the phase-1
+    /// scope and symbol lists (the scopes' binding maps stay shared and are
+    /// only read), and maps of its own for what a body writes.
+    fn forkForPool(self: *const Resolver, arena: std.mem.Allocator) !Resolver {
+        return .{
+            .allocator = arena,
+            .scopes = try self.scopes.clone(arena),
+            .symbols = try self.symbols.clone(arena),
+            .uses = std.AutoHashMap(Span, SymbolId).init(arena),
+            .referenced_decls = std.AutoHashMap(Span, void).init(arena),
+            .diagnostics = DiagnosticSink.init(),
+            .file_package = null,
+            .fn_sig_keys = try self.fn_sig_keys.cloneWithAllocator(arena),
+        };
     }
 
     fn setFilePackage(self: *Resolver, file: *const KotlinFile) !void {

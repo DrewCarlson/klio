@@ -17,7 +17,7 @@ pub const IdMap = struct {
     const_base: u32,
     consts: []const ConstId,
 
-    fn mapFunc(self: *const IdMap, id: FuncId) FuncId {
+    pub fn mapFunc(self: *const IdMap, id: FuncId) FuncId {
         const i = id.int();
         if (i < self.func_base) return id;
         return self.funcs[i - self.func_base];

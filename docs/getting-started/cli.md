@@ -37,7 +37,10 @@ The first `klio run` lowers the embedded stdlib (and any packs the
 program imports) and bakes the result to
 `~/.klio/cache/stdlib-<key>.klio-image`; every later run loads that
 image and lowers only the user program, cutting startup from seconds to
-a few hundred milliseconds. The cache is content-addressed — the key
+tens of milliseconds. The build bakes the stdlib-only image as well and
+installs it under `share/klio/cache` beside `bin/klio`; a run whose own
+cache misses reads that copy, so a freshly built klio's first run of an
+import-free program is already warm. The cache is content-addressed — the key
 hashes the interpreter binary's identity, every stdlib source the bake
 consumed, the stdlib load gate, and each selected pack's content hash
 and feature set — so editing a stdlib source, swapping a pack, or

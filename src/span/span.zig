@@ -114,13 +114,24 @@ pub const SourceFile = struct {
 pub const SourceMap = struct {
     arena: std.heap.ArenaAllocator,
     files: std.ArrayList(SourceFile),
+    /// Arenas holding sources registered with `addBorrowed`, freed with the
+    /// map: a bundle of sources is adopted whole rather than copied.
+    adopted: std.ArrayList(std.heap.ArenaAllocator) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) SourceMap {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .files = .empty };
     }
 
     pub fn deinit(self: *SourceMap) void {
+        for (self.adopted.items) |*a| a.deinit();
+        self.adopted.deinit(self.arena.child_allocator);
         self.arena.deinit();
+    }
+
+    /// Takes ownership of an arena whose contents the map's borrowed files
+    /// point into. It lives as long as the map.
+    pub fn adopt(self: *SourceMap, arena: std.heap.ArenaAllocator) !void {
+        try self.adopted.append(self.arena.child_allocator, arena);
     }
 
     pub fn add(self: *SourceMap, path: []const u8, source: []const u8) !FileId {
@@ -133,10 +144,10 @@ pub const SourceMap = struct {
         return id;
     }
 
-    /// Register a file whose `path` and `source` already have process-lifetime
-    /// backing (the mmap'd stdlib image), borrowing both slices and skipping the
-    /// per-line index. Saves the whole-stdlib source dupe (~6 MB) and its line
-    /// tables (~1 MB) at startup; `lineCol` then scans linearly.
+    /// Register a file whose `path` and `source` outlive the map (the mmap'd
+    /// stdlib image, or an arena the map adopted), borrowing both slices and
+    /// skipping the per-line index. Saves the whole-stdlib source dupe (~6 MB)
+    /// and its line tables (~1 MB) at startup; `lineCol` then scans linearly.
     pub fn addBorrowed(self: *SourceMap, path: []const u8, source: []const u8) !FileId {
         const a = self.arena.allocator();
         const id = FileId.from(@intCast(self.files.items.len));

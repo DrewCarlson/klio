@@ -70,7 +70,20 @@ fn collectPinnedFunc(rel: *BodyRelease, f: *const ir.Func) void {
 /// unless `pinned` holds an address inside them; a file whose declarations
 /// were copied into `decls` still points at the freed trees.
 pub fn stripDeadBodies(decls: []Decl, keep_composable_sigs: bool, allocator: ?Allocator, pinned: ?*const Pinned) Released {
-    var rel = BodyRelease{ .allocator = allocator, .pinned = pinned };
+    return stripDeadBodiesDeferring(decls, keep_composable_sigs, allocator, pinned, null);
+}
+
+/// The bodies a strip detached but did not free: `releaseDetached` frees them
+/// later, off the path that is waiting on the strip.
+pub const Detached = std.ArrayList(FunctionBody);
+
+/// `stripDeadBodies` that hands the stripped bodies to `deferred` instead of
+/// freeing them, so the walk that frees can run beside later work. The
+/// declarations are left as the strip leaves them either way. A debug build
+/// frees in place, where its walk over the kept declarations then refuses a
+/// pointer into what was freed.
+pub fn stripDeadBodiesDeferring(decls: []Decl, keep_composable_sigs: bool, allocator: ?Allocator, pinned: ?*const Pinned, deferred: ?*Detached) Released {
+    var rel = BodyRelease{ .allocator = allocator, .pinned = pinned, .deferred = if (builtin.mode == .Debug) null else deferred };
     defer rel.deinit();
     for (decls) |*d| pruneDecl(d, true, keep_composable_sigs, &rel);
     // A debug build then walks everything that stays and refuses a pointer
@@ -83,6 +96,14 @@ pub fn stripDeadBodies(decls: []Decl, keep_composable_sigs: bool, allocator: ?Al
             rel.release(Decl, d);
         }
     }
+    return rel.stats;
+}
+
+/// Frees the bodies a deferring strip detached.
+pub fn releaseDetached(allocator: Allocator, bodies: []const FunctionBody) Released {
+    var rel = BodyRelease{ .allocator = allocator };
+    defer rel.deinit();
+    for (bodies) |*b| rel.release(FunctionBody, b);
     return rel.stats;
 }
 
@@ -127,6 +148,8 @@ const BodyRelease = struct {
     current_decl: []const u8 = "",
     /// `collectPinned`'s pass: every address visited goes into the set.
     collect: ?struct { a: Allocator, out: *Pinned } = null,
+    /// A stripped body goes here instead of being freed.
+    deferred: ?*Detached = null,
     /// A subtree reached twice would be shared between bodies, which no pass
     /// produces; debug builds refuse rather than free it twice.
     seen: Seen = if (builtin.mode == .Debug) .empty else {},
@@ -162,6 +185,11 @@ const BodyRelease = struct {
             }
         }
         self.stats.bodies += 1;
+        if (self.deferred) |d| {
+            if (self.allocator) |a| {
+                if (d.append(a, body.*)) |_| return else |_| {}
+            }
+        }
         self.release(FunctionBody, body);
     }
 

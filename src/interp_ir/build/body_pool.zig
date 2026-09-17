@@ -220,7 +220,7 @@ fn journaled(comptime T: type, comptime name: []const u8) bool {
         inline for (.{ "funcs", "consts", "const_dedup", "top_level", "resolve_diags", "decl_ast_body", "func_by_decl_span" }) |n| if (std.mem.eql(u8, n, name)) return true;
         return false;
     }
-    inline for (.{ "evidence_supers", "recv_fn_props" }) |n| if (std.mem.eql(u8, n, name)) return true;
+    inline for (.{ "evidence_supers", "recv_fn_props", "local_fn_defaults" }) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
 }
 
@@ -406,6 +406,26 @@ pub fn lower(ctx: *BuildCtx, jobs: []const Job) Allocator.Error!?[]Func {
         ir.remap.remapFunc(&r.func, &map);
         for (s.module.resolve_diags.items) |d| try main.resolve_diags.append(a, d);
         s.module.resolve_diags.clearRetainingCapacity();
+    }
+    // A local function declared in a body registers its default-argument
+    // thunks under its body's id; both are the shard's ids until now.
+    for (shards[0..spawned]) |*s| {
+        const map = ir.remap.IdMap{
+            .func_base = s.funcs_at_fork,
+            .funcs = s.func_map,
+            .const_base = s.consts_at_fork,
+            .consts = s.const_map,
+        };
+        var it = s.module.registry.local_fn_defaults.iterator();
+        while (it.next()) |e| {
+            if (e.key_ptr.int() < s.funcs_at_fork) continue;
+            var slots: std.ArrayList(?FuncId) = .empty;
+            try slots.ensureTotalCapacity(a, e.value_ptr.items.len);
+            for (e.value_ptr.items) |slot| slots.appendAssumeCapacity(if (slot) |id| map.mapFunc(id) else null);
+            const gop = try main.registry.local_fn_defaults.getOrPut(map.mapFunc(e.key_ptr.*));
+            if (gop.found_existing) gop.value_ptr.deinit(a);
+            gop.value_ptr.* = slots;
+        }
     }
     const out = try a.alloc(Func, jobs.len);
     for (work.results, out) |*r, *o| o.* = r.func;

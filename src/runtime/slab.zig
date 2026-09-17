@@ -5,11 +5,14 @@
 //! same-size cells share a `SLAB`-aligned slab, whose header a cell pointer
 //! masked to the `SLAB` boundary finds, and the slab is `munmap`ped the instant
 //! its last live cell frees. An allocation over `MAX_SMALL`, or needing more
-//! than `CELL_ALIGN`, goes straight to `mmap` and is recognised on free by the
-//! same test the allocation used.
+//! than `CELL_ALIGN`, is a large block: a power of two up to `LARGE_MAX`,
+//! parked mapped when freed for the next block of its size, and a direct
+//! `mmap` above that. Free recognises each by the same test the allocation
+//! used.
 //!
-//! One spinlock per size class guards that class's partial-slab list; the large
-//! path is lock-free. A lock is never held across a GC safe point.
+//! One spinlock per size class guards that class's partial-slab list, and one
+//! per large class its parked blocks. A lock is never held across a GC safe
+//! point.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -20,7 +23,7 @@ const Alignment = std.mem.Alignment;
 
 const SLAB: usize = 256 * 1024; // slab span, and the cell-to-slab mask granularity
 const CELL_ALIGN: usize = 16; // every slab cell is 16-byte aligned
-const MAX_SMALL: usize = 8 * 1024; // above this, allocations go direct to mmap
+const MAX_SMALL: usize = 8 * 1024; // above this, allocations are large blocks
 
 /// Spaced finely below 256, where the `ControlBlock`s and host scratch cluster.
 const class_sizes = [_]usize{
@@ -30,12 +33,21 @@ const class_sizes = [_]usize{
     2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192,
 };
 
-fn classIndex(size: usize) usize {
-    var i: usize = 0;
-    while (i < class_sizes.len) : (i += 1) {
-        if (class_sizes[i] >= size) return i;
+/// Class per 16-byte size step, so a lookup is one load on every alloc and
+/// free rather than a scan of the class table.
+const class_by_step: [MAX_SMALL / CELL_ALIGN + 1]u8 = blk: {
+    var t: [MAX_SMALL / CELL_ALIGN + 1]u8 = undefined;
+    var ci: usize = 0;
+    for (&t, 0..) |*slot, step| {
+        while (class_sizes[ci] < step * CELL_ALIGN) ci += 1;
+        slot.* = @intCast(ci);
     }
-    unreachable; // the caller guarantees size <= MAX_SMALL
+    break :blk t;
+};
+
+inline fn classIndex(size: usize) usize {
+    // The caller guarantees size <= MAX_SMALL.
+    return class_by_step[(size + CELL_ALIGN - 1) / CELL_ALIGN];
 }
 
 const FreeCell = struct { next: ?*FreeCell };
@@ -43,9 +55,13 @@ const FreeCell = struct { next: ?*FreeCell };
 const SlabHeader = struct {
     class_idx: u32,
     total: u32, // cells in this slab
-    free_count: u32, // cells on `free_head`, dormant ones excluded
+    free_count: u32, // cells on `free_head` plus the untouched run, dormant ones excluded
     cell_size: u32,
     free_head: ?*FreeCell,
+    /// Cells from this index up have never been handed out. They carry no
+    /// link storage and their pages are untouched, so a fresh slab costs a
+    /// map and nothing more until its cells are used.
+    bump: u32,
     next: ?*SlabHeader, // partial-list links, owned by the class lock
     prev: ?*SlabHeader,
     /// Bit p marks page p decommitted, its cells pulled off the free list so
@@ -247,9 +263,56 @@ fn mapRaw(size: usize) ?[]align(std.heap.page_size_min) u8 {
         0,
     ) catch return null;
     _ = mapped_bytes.fetchAdd(size, .monotonic);
+    _ = map_calls.fetchAdd(1, .monotonic);
     // Track only post-startup mmaps; `KLIO_SLAB_TRACE_ALL` drops the gate.
     if (trace_enabled and (gc.program_started or trace_all)) traceNote(@intFromPtr(m.ptr), size);
+    if (map_sites_enabled) noteMapSite(size);
     return m;
+}
+
+// `KLIO_SLAB_MAPS`: every map call by the site that made it, whether or not
+// the memory is still live, so a list that doubles through maps and copies
+// shows as a site with a count, where the live tracer sees only its last size.
+pub var map_sites_enabled: bool = false;
+const MapSite = struct { addrs: [TRACE_FRAMES]usize, n: usize, count: usize, bytes: usize };
+var map_sites: std.AutoHashMapUnmanaged(u64, MapSite) = .empty;
+
+fn noteMapSite(size: usize) void {
+    var addrs: [TRACE_FRAMES]usize = undefined;
+    const st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &addrs);
+    const n = st.return_addresses.len;
+    const key = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(addrs[0..n]));
+    traceLock();
+    defer traceUnlock();
+    const gop = map_sites.getOrPut(std.heap.page_allocator, key) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = .{ .addrs = addrs, .n = n, .count = 0, .bytes = 0 };
+    gop.value_ptr.count += 1;
+    gop.value_ptr.bytes += size;
+}
+
+pub fn mapSitesReport() void {
+    if (!map_sites_enabled) return;
+    var sites: std.ArrayList(MapSite) = .empty;
+    traceLock();
+    var it = map_sites.iterator();
+    while (it.next()) |e| sites.append(std.heap.page_allocator, e.value_ptr.*) catch {};
+    traceUnlock();
+    std.sort.pdq(MapSite, sites.items, {}, struct {
+        fn lt(_: void, x: MapSite, y: MapSite) bool {
+            return x.count > y.count;
+        }
+    }.lt);
+    var total_bytes: usize = 0;
+    for (sites.items) |*s| total_bytes += s.bytes;
+    std.debug.print("[slabmaps] {d} maps, {d} bytes, from {d} sites\n", .{ map_calls.load(.monotonic), total_bytes, sites.items.len });
+    var shown: usize = 0;
+    for (sites.items) |*s| {
+        if (shown >= 40) break;
+        shown += 1;
+        std.debug.print("\n[slabmaps] {d} maps, {d} bytes:\n", .{ s.count, s.bytes });
+        const st: std.debug.StackTrace = .{ .return_addresses = s.addrs[0..s.n], .skipped = .none };
+        trace.dump(&st);
+    }
 }
 
 fn unmapRaw(ptr: [*]u8, size: usize) void {
@@ -257,28 +320,166 @@ fn unmapRaw(ptr: [*]u8, size: usize) void {
     if (trace_enabled) traceForget(@intFromPtr(ptr));
     std.posix.munmap(aligned[0..size]);
     _ = mapped_bytes.fetchSub(size, .monotonic);
+    _ = unmap_calls.fetchAdd(1, .monotonic);
 }
+
+/// `KLIO_SLAB_STAT`: system calls made so far. A large allocation is one map
+/// and its free one unmap, so a list that doubles past `MAX_SMALL` shows here.
+pub var map_calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+pub var unmap_calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
 inline fn pageUp(n: usize) usize {
     const p = std.heap.pageSize();
     return std.mem.alignForward(usize, n, p);
 }
 
+// Large blocks: a size from `MAX_SMALL` to `LARGE_MAX` rounds up to a power
+// of two, and a freed block of that class parks on the class's list, mapped
+// and resident, for the next block of its size. Page faults serialise across
+// threads, so a build phase that maps, touches and unmaps a fresh block per
+// list would otherwise spend its parallelism in the kernel. Above `LARGE_MAX`
+// a block maps and unmaps directly. The reclaim pass ages parked blocks out.
+
+const LARGE_MIN: usize = 16 * 1024;
+const LARGE_MAX: usize = 4 * 1024 * 1024;
+const large_class_count = std.math.log2_int(usize, LARGE_MAX / LARGE_MIN) + 1;
+
+/// Link and age live in the block itself: it was in use, so its first page is
+/// resident.
+const LargeBlock = struct { next: ?*LargeBlock, idle_passes: u8 };
+const LargeClass = struct { lock: SpinLock = .{}, head: ?*LargeBlock = null, count: u32 = 0 };
+var large_classes: [large_class_count]LargeClass = blk: {
+    var s: [large_class_count]LargeClass = undefined;
+    for (&s) |*c| c.* = .{};
+    break :blk s;
+};
+
+/// Null above `LARGE_MAX`: that block maps and unmaps directly.
+inline fn largeClass(len: usize) ?usize {
+    if (len > LARGE_MAX) return null;
+    const rounded = std.math.ceilPowerOfTwo(usize, @max(len, LARGE_MIN)) catch unreachable;
+    return std.math.log2_int(usize, rounded / LARGE_MIN);
+}
+
+inline fn largeClassSize(ci: usize) usize {
+    return LARGE_MIN << @intCast(ci);
+}
+
+/// The mapped extent of a large block, which `free` and `resize` key on.
+inline fn largeExtent(len: usize) usize {
+    return if (largeClass(len)) |ci| largeClassSize(ci) else pageUp(len);
+}
+
 fn allocLarge(len: usize) ?[*]u8 {
-    const m = mapRaw(pageUp(len)) orelse return null;
+    const ci = largeClass(len) orelse {
+        const m = mapRaw(pageUp(len)) orelse return null;
+        return m.ptr;
+    };
+    const lc = &large_classes[ci];
+    {
+        lc.lock.lock();
+        defer lc.lock.unlock();
+        if (lc.head) |b| {
+            lc.head = b.next;
+            lc.count -= 1;
+            return @ptrCast(b);
+        }
+    }
+    const m = mapRaw(largeClassSize(ci)) orelse return null;
     return m.ptr;
 }
 
-/// Over-maps and trims the unaligned head and tail.
-fn mapSlabRegion() ?*SlabHeader {
-    const over = mapRaw(SLAB + SLAB) orelse return null;
+fn freeLarge(ptr: [*]u8, len: usize) void {
+    const ci = largeClass(len) orelse {
+        unmapRaw(ptr, pageUp(len));
+        return;
+    };
+    const lc = &large_classes[ci];
+    const b: *LargeBlock = @ptrCast(@alignCast(ptr));
+    lc.lock.lock();
+    defer lc.lock.unlock();
+    b.* = .{ .next = lc.head, .idle_passes = 0 };
+    lc.head = b;
+    lc.count += 1;
+}
+
+/// Ages parked large blocks and unmaps those idle for `idle_passes`.
+fn reclaimLarge(idle_passes: u32) void {
+    for (&large_classes, 0..) |*lc, ci| {
+        lc.lock.lock();
+        defer lc.lock.unlock();
+        var keep: ?*LargeBlock = null;
+        var keep_count: u32 = 0;
+        var b = lc.head;
+        while (b) |blk| {
+            const next = blk.next;
+            blk.idle_passes +|= 1;
+            if (blk.idle_passes >= idle_passes) {
+                unmapRaw(@ptrCast(blk), largeClassSize(ci));
+            } else {
+                blk.next = keep;
+                keep = blk;
+                keep_count += 1;
+            }
+            b = next;
+        }
+        lc.head = keep;
+        lc.count = keep_count;
+    }
+}
+
+/// Bytes parked on the large-block lists.
+fn largeParked() usize {
+    var total: usize = 0;
+    for (&large_classes, 0..) |*lc, ci| {
+        lc.lock.lock();
+        defer lc.lock.unlock();
+        total += @as(usize, lc.count) * largeClassSize(ci);
+    }
+    return total;
+}
+
+/// Over-maps `len` bytes and trims the unaligned head and tail.
+fn mapAligned(len: usize) ?usize {
+    const over = mapRaw(len + SLAB) orelse return null;
     const base = @intFromPtr(over.ptr);
     const aligned = std.mem.alignForward(usize, base, SLAB);
     const head = aligned - base;
     if (head != 0) unmapRaw(over.ptr, head);
-    const tail = (base + over.len) - (aligned + SLAB);
-    if (tail != 0) unmapRaw(@ptrFromInt(aligned + SLAB), tail);
-    return @ptrFromInt(aligned);
+    const tail = (base + over.len) - (aligned + len);
+    if (tail != 0) unmapRaw(@ptrFromInt(aligned + len), tail);
+    return aligned;
+}
+
+// Fresh slabs are carved from a reserve mapped `RESERVE_SLABS` at a time and
+// aligned once, so a slab costs an atomic step rather than a map and two
+// trims. The reserve's unused tail is mapped but never touched, so it holds
+// address space and no memory; a slab unmapped later splits the region.
+const RESERVE_SLABS: usize = 16;
+var reserve_next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var reserve_end: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var reserve_lock: SpinLock = .{};
+
+fn mapSlabRegion() ?*SlabHeader {
+    while (true) {
+        const next = reserve_next.load(.acquire);
+        if (next < reserve_end.load(.acquire)) {
+            if (reserve_next.cmpxchgWeak(next, next + SLAB, .acq_rel, .acquire) == null) return @ptrFromInt(next);
+            continue;
+        }
+        reserve_lock.lock();
+        defer reserve_lock.unlock();
+        if (reserve_next.load(.acquire) < reserve_end.load(.acquire)) continue;
+        const region = mapAligned(RESERVE_SLABS * SLAB) orelse return null;
+        reserve_end.store(region + RESERVE_SLABS * SLAB, .release);
+        reserve_next.store(region + SLAB, .release);
+        return @ptrFromInt(region);
+    }
+}
+
+/// Bytes of the reserve mapped but not yet carved into a slab.
+fn reserveUnused() usize {
+    return reserve_end.load(.acquire) -| reserve_next.load(.acquire);
 }
 
 fn newSlab(class_idx: usize) ?*SlabHeader {
@@ -293,25 +494,60 @@ fn newSlab(class_idx: usize) ?*SlabHeader {
         .free_count = total,
         .cell_size = @intCast(cell_size),
         .free_head = null,
+        .bump = 0,
         .next = null,
         .prev = null,
         .dormant_pages = 0,
         .dormant_cells = 0,
         .idle_passes = 0,
     };
-    // Thread cells on descending, so the head ends up as cell 0.
-    var i: usize = total;
-    while (i > 0) {
-        i -= 1;
-        const cell: *FreeCell = @ptrFromInt(data_start + i * cell_size);
-        cell.next = s.free_head;
-        s.free_head = cell;
-    }
     return s;
 }
 
 inline fn slabOf(ptr: [*]u8) *SlabHeader {
     return @ptrFromInt(@intFromPtr(ptr) & ~(SLAB - 1));
+}
+
+inline fn dataStart(s: *const SlabHeader) usize {
+    return std.mem.alignForward(usize, @intFromPtr(s) + @sizeOf(SlabHeader), CELL_ALIGN);
+}
+
+inline fn cellAt(s: *const SlabHeader, i: usize) [*]u8 {
+    return @ptrFromInt(dataStart(s) + i * s.cell_size);
+}
+
+/// Unlinks a slab from the partial list. Caller holds the lock.
+fn unlinkPartial(cs: *ClassState, slab: *SlabHeader) void {
+    if (slab.prev) |p| p.next = slab.next else cs.partial = slab.next;
+    if (slab.next) |n| n.prev = slab.prev;
+    slab.prev = null;
+    slab.next = null;
+}
+
+/// Cells came back to a slab: relink one that was off the list as full, and
+/// park one that is now wholly free. Caller holds the lock.
+fn noteCellsReturned(cs: *ClassState, slab: *SlabHeader, was_full: bool) void {
+    if (was_full) {
+        slab.prev = null;
+        slab.next = cs.partial;
+        if (cs.partial) |p| p.prev = slab;
+        cs.partial = slab;
+    }
+    if (slab.free_count + slab.dormant_cells == slab.total) {
+        unlinkPartial(cs, slab);
+        // Park it on the class's spare stack so the next burst reuses mapped
+        // slabs. Parking never raises the peak, since these spans were garbage
+        // moments ago, and the reclaim pass ages idle spares back to the OS. A
+        // dormant-paged slab unmaps outright.
+        if (slab.dormant_pages == 0) {
+            slab.idle_passes = 0;
+            slab.next = cs.spare;
+            cs.spare = slab;
+            cs.spare_count += 1;
+        } else {
+            unmapRaw(@ptrCast(slab), SLAB);
+        }
+    }
 }
 
 /// The parked spare before a freshly mapped slab. Caller holds the lock.
@@ -329,12 +565,11 @@ fn takeFrontier(cs: *ClassState, ci: usize) ?*SlabHeader {
     return s;
 }
 
-fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
+/// The head slab with a cell to give, reviving dormant pages before mapping
+/// fresh memory so the address space stays bounded. Caller holds the lock.
+fn frontierSlab(cs: *ClassState, ci: usize) ?*SlabHeader {
     var slab = cs.partial orelse takeFrontier(cs, ci) orelse return null;
-    // A reclaim pass may have decommitted the head's free cells into dormant
-    // pages. Re-commit one before mapping fresh memory: this bounds the address
-    // space.
-    while (slab.free_head == null) {
+    while (slab.free_head == null and slab.bump == slab.total) {
         if (slab.dormant_pages != 0) {
             _ = reviveOnePage(slab, class_sizes[ci], std.heap.pageSize());
             continue;
@@ -344,15 +579,73 @@ fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
         slab.next = null;
         slab = cs.partial orelse takeFrontier(cs, ci) orelse return null;
     }
-    const cell = slab.free_head.?;
-    slab.free_head = cell.next;
-    slab.free_count -= 1;
+    return slab;
+}
+
+/// A slab that gave its last cell leaves the partial list; a free finds it
+/// again through the mask. Caller holds the lock.
+inline fn noteCellsTaken(cs: *ClassState, slab: *SlabHeader) void {
     if (slab.free_count == 0 and slab.dormant_pages == 0) {
         cs.partial = slab.next;
         if (slab.next) |n| n.prev = null;
         slab.next = null;
     }
-    return @ptrCast(cell);
+}
+
+fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
+    const slab = frontierSlab(cs, ci) orelse return null;
+    const cell: [*]u8 = if (slab.free_head) |c| blk: {
+        slab.free_head = c.next;
+        break :blk @ptrCast(c);
+    } else blk: {
+        const c = cellAt(slab, slab.bump);
+        slab.bump += 1;
+        break :blk c;
+    };
+    slab.free_count -= 1;
+    noteCellsTaken(cs, slab);
+    return cell;
+}
+
+/// The untouched run of a magazine refill: up to `RUN_BYTES` of never-used
+/// cells taken from the head slab in one step, threaded to nothing. False
+/// when the head has freed cells, which are resident and come first, or no
+/// untouched cells left; the caller then pops its free list.
+fn takeRunLocked(cs: *ClassState, ci: usize, run: *Run) bool {
+    const slab = frontierSlab(cs, ci) orelse return false;
+    if (slab.free_head != null) return false;
+    const left = slab.total - slab.bump;
+    if (left == 0) return false;
+    const n: u32 = @min(left, run_cells[ci]);
+    run.next = @intFromPtr(cellAt(slab, slab.bump));
+    run.end = run.next + @as(usize, n) * slab.cell_size;
+    slab.bump += n;
+    slab.free_count -= n;
+    noteCellsTaken(cs, slab);
+    return true;
+}
+
+/// Hands an unused run back: retracted when it is still the slab's frontier,
+/// threaded onto the free list otherwise. Caller holds the lock.
+fn returnRunLocked(cs: *ClassState, run: *Run) void {
+    if (run.next == run.end) return;
+    const slab = slabOf(@ptrFromInt(run.next));
+    const was_full = slab.free_count == 0 and slab.dormant_pages == 0;
+    const n: u32 = @intCast((run.end - run.next) / slab.cell_size);
+    if (@intFromPtr(cellAt(slab, slab.bump)) == run.end) {
+        slab.bump -= n;
+        slab.free_count += n;
+    } else {
+        var p = run.next;
+        while (p < run.end) : (p += slab.cell_size) {
+            const cell: *FreeCell = @ptrFromInt(p);
+            cell.next = slab.free_head;
+            slab.free_head = cell;
+        }
+        slab.free_count += n;
+    }
+    run.* = .{};
+    noteCellsReturned(cs, slab, was_full);
 }
 
 fn freeLockedOne(ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
@@ -364,52 +657,46 @@ fn freeLockedOne(ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
     cell.next = slab.free_head;
     slab.free_head = cell;
     slab.free_count += 1;
-    if (was_full) {
-        slab.prev = null;
-        slab.next = cs.partial;
-        if (cs.partial) |p| p.prev = slab;
-        cs.partial = slab;
-    }
-    if (slab.free_count + slab.dormant_cells == slab.total) {
-        if (slab.prev) |p| p.next = slab.next else cs.partial = slab.next;
-        if (slab.next) |n| n.prev = slab.prev;
-        slab.prev = null;
-        slab.next = null;
-        // Park it on the class's spare stack so the next burst reuses mapped,
-        // already-threaded slabs. Parking never raises the peak, since these
-        // spans were garbage moments ago, and the reclaim pass ages idle spares
-        // back to the OS. A dormant-paged slab unmaps outright.
-        if (slab.dormant_pages == 0) {
-            slab.idle_passes = 0;
-            slab.next = cs.spare;
-            cs.spare = slab;
-            cs.spare_count += 1;
-        } else {
-            unmapRaw(@ptrCast(slab), SLAB);
-        }
-    }
+    noteCellsReturned(cs, slab, was_full);
 }
 
 // Per-thread magazines: taking the class spinlock on every alloc and free
 // serializes the workers on a handful of hot size classes, so each thread
 // caches free cells per class and takes the lock once per batch. Magazine cells
 // are off their slab's free list, so the reclaim pass sees them as live.
+//
+// A refill prefers an untouched run of the head slab: one lock step hands a
+// thread `RUN_BYTES` of cells it then bumps through with no link storage and
+// no page touched before its first use. Ten threads building fresh trees
+// otherwise spend their time on the class locks, threading and faulting in
+// cells they are about to take.
 
-/// About 4KB of cached cells, at least 4, at most 64.
+/// About 4KB of cached free cells, at least 4, at most 64.
 const mag_caps: [class_sizes.len]u16 = blk: {
     var c: [class_sizes.len]u16 = undefined;
     for (class_sizes, 0..) |sz, i| c[i] = @intCast(@min(64, @max(4, 4096 / sz)));
     break :blk c;
 };
 
-const Magazine = struct { head: ?*FreeCell = null, count: u16 = 0 };
+/// Cells per untouched run: one lock step per this much fresh memory.
+const RUN_BYTES: usize = 16 * 1024;
+const run_cells: [class_sizes.len]u32 = blk: {
+    var c: [class_sizes.len]u32 = undefined;
+    for (class_sizes, 0..) |sz, i| c[i] = @intCast(@max(1, RUN_BYTES / sz));
+    break :blk c;
+};
+
+/// A contiguous run of never-used cells a thread bumps through.
+const Run = struct { next: usize = 0, end: usize = 0 };
+
+const Magazine = struct { head: ?*FreeCell = null, count: u16 = 0, run: Run = .{} };
 
 threadlocal var magazines: [class_sizes.len]Magazine = @splat(.{});
 
 /// Called at worker-thread exit so a dead thread strands nothing.
 pub fn flushMagazines() void {
     for (&magazines, 0..) |*mag, ci| {
-        if (mag.head == null) continue;
+        if (mag.head == null and mag.run.next == mag.run.end) continue;
         const cs = &class_states[ci];
         cs.lock.lock();
         defer cs.lock.unlock();
@@ -418,6 +705,7 @@ pub fn flushMagazines() void {
             freeLockedOne(@ptrCast(cell), slabOf(@ptrCast(cell)), cs);
         }
         mag.count = 0;
+        returnRunLocked(cs, &mag.run);
     }
 }
 
@@ -439,8 +727,18 @@ fn allocSmall(len: usize) ?[*]u8 {
         mag.count -= 1;
         return @ptrCast(cell);
     }
+    if (mag.run.next < mag.run.end) {
+        const cell: [*]u8 = @ptrFromInt(mag.run.next);
+        mag.run.next += class_sizes[ci];
+        return cell;
+    }
     cs.lock.lock();
     defer cs.lock.unlock();
+    if (takeRunLocked(cs, ci, &mag.run)) {
+        const cell: [*]u8 = @ptrFromInt(mag.run.next);
+        mag.run.next += class_sizes[ci];
+        return cell;
+    }
     const first = allocLockedOne(cs, ci) orelse return null;
     var want: u16 = mag_caps[ci] / 2;
     while (want > 0) : (want -= 1) {
@@ -564,16 +862,19 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
     }
 
     // A page is reclaimable iff no live cell overlaps it; page 0 is header.
+    // The untouched run past `bump` is not resident and has no links to drop,
+    // and a dormant page there would revive cells the run still owns.
     var reclaimable = [_]bool{false} ** MAX_PAGES;
     {
+        const untouched_from = if (s.bump < s.total) (data_start + s.bump * cell_size - slab_base) / pg else n_pages;
         var p: usize = 1;
         while (p < n_pages) : (p += 1) {
-            reclaimable[p] = (s.dormant_pages & (@as(u64, 1) << @intCast(p))) == 0;
+            reclaimable[p] = p < untouched_from and (s.dormant_pages & (@as(u64, 1) << @intCast(p))) == 0;
         }
     }
     {
         var i: usize = 0;
-        while (i < s.total) : (i += 1) {
+        while (i < s.bump) : (i += 1) {
             const is_free = (free_bits[i >> 6] & (@as(u64, 1) << @intCast(i & 63))) != 0;
             const cell_off = data_start + i * cell_size;
             const start_pg = (cell_off - slab_base) / pg;
@@ -615,7 +916,7 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
         }
     }
     s.free_head = new_head;
-    s.free_count = kept;
+    s.free_count = kept + (s.total - s.bump);
     s.dormant_cells += dropped;
 
     var p: usize = 1;
@@ -660,12 +961,16 @@ pub fn occupancyReport() void {
         spare_total += @as(usize, cs.spare_count) * SLAB;
     }
     const mapped = mapped_bytes.load(.monotonic);
-    std.debug.print("[slab] mapped {d}kb: free {d}kb, dormant {d}kb, spare {d}kb, live+headers {d}kb\n", .{
+    const reserve = reserveUnused();
+    const parked_large = largeParked();
+    std.debug.print("[slab] mapped {d}kb: free {d}kb, dormant {d}kb, spare {d}kb, reserve {d}kb, parked large {d}kb, live+headers {d}kb\n", .{
         mapped / 1024,
         free_total / 1024,
         dormant_total / 1024,
         spare_total / 1024,
-        (mapped -| free_total -| dormant_total -| spare_total) / 1024,
+        reserve / 1024,
+        parked_large / 1024,
+        (mapped -| free_total -| dormant_total -| spare_total -| reserve -| parked_large) / 1024,
     });
 }
 
@@ -682,6 +987,7 @@ pub fn reclaimAll() void {
 }
 
 fn reclaimWith(idle_passes: u32) void {
+    reclaimLarge(idle_passes);
     const pg = std.heap.pageSize();
     if (SLAB / pg > MAX_PAGES) return; // runtime page larger than the scan bound
     for (&class_states, 0..) |*cs, ci| {
@@ -731,13 +1037,27 @@ fn resize(_: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, _: usi
         return classIndex(new_len) == classIndex(buf.len);
     }
     if (isSmall(new_len, alignment)) return false;
-    return pageUp(new_len) == pageUp(buf.len);
+    // `free` keys on the requested length, so the block stays what that
+    // length maps to: its class, or its page count above the classes.
+    const old_extent = largeExtent(buf.len);
+    const new_extent = largeExtent(new_len);
+    if (new_extent == old_extent) return true;
+    if (new_extent > old_extent) return false;
+    // A shrink gives the tail back in place, so a list that reserved for its
+    // worst case and settled smaller neither copies nor remaps. A block
+    // shrinking out of the classes would change what `free` does with it.
+    if (largeClass(buf.len) == null and largeClass(new_len) != null) return false;
+    unmapRaw(buf.ptr + new_extent, old_extent - new_extent);
+    return true;
 }
 
-fn remap(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) ?[*]u8 {
-    // Force alloc-copy-free, keeping a pointer's slab-or-mmap classification
-    // fixed for life, so free agrees with alloc.
-    return null;
+fn remap(ctx: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    // A pointer's slab-or-mmap classification is fixed for life, so free
+    // agrees with alloc: only a shrink within a class, or one that stays
+    // large, moves nothing. A list settling into its owned slice takes this.
+    if (new_len == 0 or new_len > buf.len) return null;
+    if (isSmall(buf.len, alignment) != isSmall(new_len, alignment)) return null;
+    return if (resize(ctx, buf, alignment, new_len, ret_addr)) buf.ptr else null;
 }
 
 fn free(_: *anyopaque, buf: []u8, alignment: Alignment, _: usize) void {
@@ -745,7 +1065,7 @@ fn free(_: *anyopaque, buf: []u8, alignment: Alignment, _: usize) void {
     if (isSmall(buf.len, alignment)) {
         freeSmall(buf.ptr);
     } else {
-        unmapRaw(buf.ptr, pageUp(buf.len));
+        freeLarge(buf.ptr, buf.len);
     }
 }
 
@@ -870,4 +1190,89 @@ test "slab reclaim decommits sparse slabs, preserves stragglers, revives dormant
     for (kept) |k| for (bufs[k]) |byte| try T.expectEqual(@as(u8, @intCast(k & 0xff)), byte);
     for (more) |b| a.free(b);
     for (kept) |k| a.free(bufs[k]);
+}
+
+test "slab refill takes an untouched run and a flush gives it back" {
+    const a = allocator;
+    const T = std.testing;
+    flushMagazines();
+    const ci = classIndex(3584);
+    const cs = &class_states[ci];
+    const p1 = try a.alloc(u8, 3584);
+    const p2 = try a.alloc(u8, 3584);
+    // Consecutive cells of one run, taken from the slab in one step.
+    try T.expectEqual(@intFromPtr(p1.ptr) + 3584, @intFromPtr(p2.ptr));
+    const slab = slabOf(p1.ptr);
+    {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        try T.expectEqual(run_cells[ci], slab.bump);
+        try T.expectEqual(slab.total - run_cells[ci], slab.free_count);
+    }
+    a.free(p2);
+    a.free(p1);
+    flushMagazines();
+    {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        // The unused tail of the run retracted the frontier; the two freed
+        // cells sit on the free list; the slab is wholly free and parked.
+        try T.expectEqual(@as(u32, 2), slab.bump);
+        try T.expectEqual(slab.total, slab.free_count);
+        try T.expectEqual(@as(?*SlabHeader, slab), cs.spare);
+    }
+    // A run that is no longer the frontier threads its cells instead.
+    {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        var r1: Run = .{};
+        var r2: Run = .{};
+        try T.expect(!takeRunLocked(cs, ci, &r1)); // freed cells come first
+        const s = frontierSlab(cs, ci).?;
+        try T.expectEqual(slab, s);
+        s.free_head = null;
+        s.free_count -= 2;
+        try T.expect(takeRunLocked(cs, ci, &r1));
+        try T.expect(takeRunLocked(cs, ci, &r2));
+        try T.expectEqual(r1.end, r2.next);
+        const bump_after = s.bump;
+        returnRunLocked(cs, &r1);
+        try T.expectEqual(bump_after, s.bump);
+        try T.expectEqual(run_cells[ci], s.free_count - (s.total - s.bump));
+        returnRunLocked(cs, &r2);
+        try T.expectEqual(bump_after - run_cells[ci], s.bump);
+    }
+}
+
+test "slab parks a freed large block for its class and the reclaim pass ages it out" {
+    const a = allocator;
+    const T = std.testing;
+    const ci = largeClass(100 * 1024).?;
+    try T.expectEqual(@as(usize, 128 * 1024), largeClassSize(ci));
+    const lc = &large_classes[ci];
+    reclaimAll();
+    const p1 = try a.alloc(u8, 100 * 1024);
+    const addr = @intFromPtr(p1.ptr);
+    @memset(p1, 7);
+    a.free(p1);
+    try T.expectEqual(@as(u32, 1), lc.count);
+    // The next block of the class is the parked one, resident as it was left.
+    const p2 = try a.alloc(u8, 90 * 1024);
+    try T.expectEqual(addr, @intFromPtr(p2.ptr));
+    try T.expectEqual(@as(u32, 0), lc.count);
+    // A shrink into a smaller class gives the tail back in place and the
+    // block then parks under its new size.
+    var list = p2;
+    try T.expect(a.resize(list, 20 * 1024));
+    list = list[0 .. 20 * 1024];
+    a.free(list);
+    try T.expectEqual(@as(u32, 0), lc.count);
+    const small_ci = largeClass(20 * 1024).?;
+    try T.expectEqual(@as(u32, 1), large_classes[small_ci].count);
+    reclaimAll();
+    try T.expectEqual(@as(u32, 0), large_classes[small_ci].count);
+    // Above the classes a block maps and unmaps directly.
+    try T.expectEqual(@as(?usize, null), largeClass(LARGE_MAX + 1));
+    const huge = try a.alloc(u8, LARGE_MAX + 1);
+    a.free(huge);
 }
