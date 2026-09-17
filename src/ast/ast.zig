@@ -1013,6 +1013,222 @@ test "recursive expr nodes box through pointers" {
     try std.testing.expectEqual(@as(i64, 1), u.Unary.expr.IntLit.value);
 }
 
+// Whether a body declares something, exhaustive over every `Stmt` and `Expr`
+// case. Two passes read it: lowering, whose instructions point into an object
+// expression or a local classifier, and the type checker, whose workers share
+// the signature and class tables a local declaration writes.
+
+/// What a walk counts as a declaration inside a body.
+pub const Declares = struct {
+    /// An `object : T {}` expression counts.
+    object_exprs: bool = false,
+    /// A nested `fun` counts; a nested class or object always does.
+    nested_fns: bool = false,
+};
+
+/// Whether `b` declares anything `opts` counts.
+pub fn bodyDeclares(comptime opts: Declares, b: *const FunctionBody) bool {
+    return bodyHas(opts, b);
+}
+
+/// Whether the bodies `d` owns declare anything `opts` counts: its own body,
+/// a property's initialiser and accessors, and the same for every member of a
+/// class or object. `d` itself is not a declaration inside a body, so it never
+/// answers for itself.
+pub fn declBodiesDeclare(comptime opts: Declares, d: *const Decl) bool {
+    return switch (d.*) {
+        .Function => |*f| if (f.body) |*b| bodyHas(opts, b) else false,
+        .Property => propertyHas(opts, d.Property),
+        .Class => |*c| {
+            for (c.members) |*m| if (declBodiesDeclare(opts, m)) return true;
+            return false;
+        },
+        .Object => |*o| {
+            for (o.members) |*m| if (declBodiesDeclare(opts, m)) return true;
+            return false;
+        },
+        .TypeAlias => false,
+    };
+}
+
+fn bodyHas(comptime opts: Declares, b: *const FunctionBody) bool {
+    return switch (b.*) {
+        .Block => |*blk| blockHas(opts, blk),
+        .Expr => |*e| exprHas(opts, e),
+    };
+}
+
+fn blockHas(comptime opts: Declares, b: *const Block) bool {
+    for (b.stmts) |*s| if (stmtHas(opts, s)) return true;
+    return false;
+}
+
+fn stmtHas(comptime opts: Declares, s: *const Stmt) bool {
+    return switch (s.*) {
+        .Expr => |*e| exprHas(opts, e),
+        .Decl => |d| declHas(opts, d),
+        .Assign => |a| exprHas(opts, &a.target) or exprHas(opts, &a.value),
+        .DestructuringDecl => |dd| exprHas(opts, &dd.init),
+    };
+}
+
+fn propertyHas(comptime opts: Declares, p: *const Property) bool {
+    if (p.init) |e| if (exprHas(opts, e)) return true;
+    if (p.explicit_field) |ef| {
+        if (ef.init) |e| if (exprHas(opts, e)) return true;
+    }
+    if (p.delegate) |e| if (exprHas(opts, e)) return true;
+    if (p.getter) |acc| if (bodyHas(opts, &acc.body)) return true;
+    if (p.setter) |acc| if (bodyHas(opts, &acc.body)) return true;
+    return false;
+}
+
+fn declHas(comptime opts: Declares, d: *const Decl) bool {
+    return switch (d.*) {
+        // A nested function registers its signature where the checker's
+        // workers can see it; lowering only cares about classifiers.
+        .Function => |*f| if (opts.nested_fns)
+            true
+        else if (f.body) |*b| bodyHas(opts, b) else false,
+        .Property => propertyHas(opts, d.Property),
+        // Declared inside a body: an `Inst.RegisterClass` points at it.
+        .Class, .Object => true,
+        .TypeAlias => false,
+    };
+}
+
+fn optExprHas(comptime opts: Declares, e: ?*const Expr) bool {
+    return if (e) |x| exprHas(opts, x) else false;
+}
+
+fn exprHas(comptime opts: Declares, e: *const Expr) bool {
+    return switch (e.*) {
+        .ObjectExpr => opts.object_exprs,
+        .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .Path, .This, .Super, .PropertyRef, .Break, .Continue => false,
+        .StringTemplate => |*x| {
+            for (x.parts) |*p| switch (p.*) {
+                .Interp => |ie| if (exprHas(opts, ie)) return true,
+                .Text, .ShortInterp => {},
+            };
+            return false;
+        },
+        .Member => |*x| exprHas(opts, x.receiver),
+        .Call => |*x| {
+            if (exprHas(opts, x.callee)) return true;
+            for (x.args) |*a| if (exprHas(opts, a)) return true;
+            return false;
+        },
+        .Index => |*x| {
+            if (exprHas(opts, x.receiver)) return true;
+            for (x.args) |*a| if (exprHas(opts, a)) return true;
+            return false;
+        },
+        .Binary => |*x| exprHas(opts, x.lhs) or exprHas(opts, x.rhs),
+        .Unary => |*x| exprHas(opts, x.expr),
+        .Postfix => |*x| exprHas(opts, x.expr),
+        .If => |*x| exprHas(opts, x.cond) or exprHas(opts, x.then_branch) or optExprHas(opts, x.else_branch),
+        .While => |*x| exprHas(opts, x.cond) or exprHas(opts, x.body),
+        .DoWhile => |*x| optExprHas(opts, x.body) or exprHas(opts, x.cond),
+        .For => |x| exprHas(opts, x.iter) or exprHas(opts, x.body),
+        .Return => |*x| optExprHas(opts, x.value),
+        .Labeled => |*x| exprHas(opts, x.expr),
+        .Block => |*x| blockHas(opts, x),
+        .Throw => |*x| exprHas(opts, x.value),
+        .Try => |x| {
+            if (blockHas(opts, &x.body)) return true;
+            for (x.catches) |*c| if (blockHas(opts, &c.body)) return true;
+            if (x.finally) |*fb| if (blockHas(opts, fb)) return true;
+            return false;
+        },
+        .Lambda => |x| blockHas(opts, &x.body),
+        .MemberRef => |*x| exprHas(opts, x.receiver),
+        .When => |x| {
+            if (optExprHas(opts, x.subject)) return true;
+            for (x.branches) |*br| {
+                if (exprHas(opts, &br.body)) return true;
+                for (br.patterns) |*p| switch (p.kind) {
+                    .Value => |*ve| if (exprHas(opts, ve)) return true,
+                    .InRange => |*ie| if (exprHas(opts, ie)) return true,
+                    .NotInRange => |*ie| if (exprHas(opts, ie)) return true,
+                    .IsType, .NotIsType, .Else => {},
+                };
+            }
+            return false;
+        },
+        .IsCheck => |x| exprHas(opts, x.expr),
+        .As => |x| exprHas(opts, x.expr),
+        .AnonFun => |x| if (x.body) |b| bodyHas(opts, b) else false,
+        .Spread => |*x| exprHas(opts, x.expr),
+    };
+}
+
+fn testSpan() Span {
+    return .{ .file = @enumFromInt(0), .start = 0, .end = 0 };
+}
+
+fn testFn(body: ?FunctionBody) Function {
+    return .{
+        .name = .{ .name = "f", .span = testSpan() },
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &.{},
+        .return_type = null,
+        .body = body,
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = testSpan(),
+    };
+}
+
+test "a nested function answers only the walk that counts one" {
+    // fun outer() { fun inner() {} }
+    var inner = Decl{ .Function = testFn(.{ .Block = .{ .stmts = &.{}, .span = testSpan() } }) };
+    var stmts = [_]Stmt{.{ .Decl = &inner }};
+    const outer = Decl{ .Function = testFn(.{ .Block = .{ .stmts = &stmts, .span = testSpan() } }) };
+
+    // The checker's walk: a nested `fun` registers a signature in the shared
+    // table, so the body checks serially.
+    try std.testing.expect(declBodiesDeclare(.{ .nested_fns = true }, &outer));
+    // Lowering's walk: only a classifier matters to it.
+    try std.testing.expect(!declBodiesDeclare(.{}, &outer));
+    try std.testing.expect(!declBodiesDeclare(.{ .object_exprs = true }, &outer));
+
+    // A body that declares nothing answers neither.
+    const bare = Decl{ .Function = testFn(.{ .Block = .{ .stmts = &.{}, .span = testSpan() } }) };
+    try std.testing.expect(!declBodiesDeclare(.{ .nested_fns = true }, &bare));
+    // Nor does a bodyless declaration.
+    const abstract = Decl{ .Function = testFn(null) };
+    try std.testing.expect(!declBodiesDeclare(.{ .nested_fns = true }, &abstract));
+}
+
+test "a local function inside a lambda answers" {
+    // fun outer() { run { fun inner() {} } }
+    var inner = Decl{ .Function = testFn(.{ .Block = .{ .stmts = &.{}, .span = testSpan() } }) };
+    var lambda_stmts = [_]Stmt{.{ .Decl = &inner }};
+    var lambda = LambdaExpr{
+        .params = &.{},
+        .body = .{ .stmts = &lambda_stmts, .span = testSpan() },
+        .span = testSpan(),
+    };
+    var lambda_expr = Expr{ .Lambda = &lambda };
+    var outer_stmts = [_]Stmt{.{ .Expr = lambda_expr }};
+    const outer = Decl{ .Function = testFn(.{ .Block = .{ .stmts = &outer_stmts, .span = testSpan() } }) };
+    try std.testing.expect(declBodiesDeclare(.{ .nested_fns = true }, &outer));
+    try std.testing.expect(!declBodiesDeclare(.{}, &outer));
+    _ = &lambda_expr;
+}
+
 test {
     _ = annotation_targets;
     _ = alias_expand;

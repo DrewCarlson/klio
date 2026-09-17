@@ -3444,6 +3444,12 @@ const DiagRange = struct { decl: usize, start: usize, end: usize };
 const BodyWork = struct {
     decls: []const Decl,
     write_backs: []const WriteBack,
+    /// Per declaration: checked on the main thread at its position, off the
+    /// pool. A body that declares a local `fun`, class or object registers it
+    /// in the signature and class tables every worker shares, so two such
+    /// bodies on two threads grow one map under the other's reader and the
+    /// reader sees an entry that was never written.
+    serial: []const bool,
     next: std.atomic.Value(usize) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
 };
@@ -3483,6 +3489,9 @@ fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
     defer write_backs.deinit(a);
     var main_ranges: std.ArrayList(DiagRange) = .empty;
     defer main_ranges.deinit(a);
+    const serial = try a.alloc(bool, decls.len);
+    defer a.free(serial);
+    for (decls, serial) |*d, *flag| flag.* = ast.declBodiesDeclare(.{ .nested_fns = true }, d);
     for (decls, 0..) |*d, i| {
         if (d.* != .Property) continue;
         const before = self.diagnostics.diagnostics.items.len;
@@ -3497,7 +3506,7 @@ fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
     }
 
     const t_pool = nowNs();
-    var work = BodyWork{ .decls = decls, .write_backs = write_backs.items };
+    var work = BodyWork{ .decls = decls, .write_backs = write_backs.items, .serial = serial };
     const workers = try a.alloc(Worker, workers_n);
     defer a.free(workers);
     var forked: usize = 0;
@@ -3520,6 +3529,16 @@ fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
     for (workers[0..spawned]) |*w| w.thread.?.join();
     const t_join = nowNs();
     if (work.failed.load(.monotonic)) return error.OutOfMemory;
+    // The declaring bodies, once the pool has joined: their local names enter
+    // the shared tables with no reader beside them. They run after rather than
+    // before so a body the pool checked never sees a name that a later body
+    // declares, which a sequential pass would not have shown it either.
+    for (decls, 0..) |*d, i| {
+        if (!serial[i] or d.* == .Property) continue;
+        const before = self.diagnostics.diagnostics.items.len;
+        try self.checkDecl(d);
+        try main_ranges.append(a, .{ .decl = i, .start = before, .end = self.diagnostics.diagnostics.items.len });
+    }
     try mergeWorkers(self, workers, main_ranges.items, base_len);
     root.stage_timing = .{
         .serial_ns = t_pool - t_start,
@@ -3593,7 +3612,7 @@ fn workerMain(work: *BodyWork, w: *Worker) void {
             if (c.frames.items[0].bindings.getPtr(wb.name)) |b| b.* = wb.binding;
         }
         const d = &work.decls[j];
-        if (d.* == .Property) continue;
+        if (d.* == .Property or work.serial[j]) continue;
         const before = c.diagnostics.diagnostics.items.len;
         c.checkDecl(d) catch {
             work.failed.store(true, .monotonic);

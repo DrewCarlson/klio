@@ -433,121 +433,14 @@ fn collectDeferrableDecl(allocator: std.mem.Allocator, d: *const Decl, out: *std
 // `Expr` and `Stmt` case: an object expression, or a local class or object.
 
 pub fn fnBodyKeepsAst(b: *const FunctionBody) bool {
-    return bodyHas(true, b);
+    return ast.bodyDeclares(.{ .object_exprs = true }, b);
 }
 
 /// Whether a body declares a class or an object: lowering such a body
 /// registers the classifier's supertypes and member headers in the module's
 /// registry, which the body pool shares between its workers read-only.
 pub fn fnBodyDeclaresClass(b: *const FunctionBody) bool {
-    return bodyHas(false, b);
-}
-
-/// The walk behind both predicates: a class or object declaration answers
-/// either, an object expression only the strip's.
-fn bodyHas(comptime object_exprs: bool, b: *const FunctionBody) bool {
-    return switch (b.*) {
-        .Block => |*blk| blockHas(object_exprs, blk),
-        .Expr => |*e| exprHas(object_exprs, e),
-    };
-}
-
-fn blockHas(comptime oe: bool, b: *const Block) bool {
-    for (b.stmts) |*s| if (stmtHas(oe, s)) return true;
-    return false;
-}
-
-fn stmtHas(comptime oe: bool, s: *const Stmt) bool {
-    return switch (s.*) {
-        .Expr => |*e| exprHas(oe, e),
-        .Decl => |d| declHas(oe, d),
-        .Assign => |a| exprHas(oe, &a.target) or exprHas(oe, &a.value),
-        .DestructuringDecl => |dd| exprHas(oe, &dd.init),
-    };
-}
-
-fn declHas(comptime oe: bool, d: *const Decl) bool {
-    return switch (d.*) {
-        .Function => |*f| if (f.body) |*b| bodyHas(oe, b) else false,
-        .Property => |p| {
-            if (p.init) |e| if (exprHas(oe, e)) return true;
-            if (p.explicit_field) |ef| {
-                if (ef.init) |e| if (exprHas(oe, e)) return true;
-            }
-            if (p.delegate) |e| if (exprHas(oe, e)) return true;
-            if (p.getter) |acc| if (bodyHas(oe, &acc.body)) return true;
-            if (p.setter) |acc| if (bodyHas(oe, &acc.body)) return true;
-            return false;
-        },
-        // Declared inside a body: an `Inst.RegisterClass` points at it.
-        .Class, .Object => true,
-        .TypeAlias => false,
-    };
-}
-
-fn optExprHas(comptime oe: bool, e: ?*const Expr) bool {
-    return if (e) |x| exprHas(oe, x) else false;
-}
-
-fn exprHas(comptime oe: bool, e: *const Expr) bool {
-    return switch (e.*) {
-        .ObjectExpr => oe,
-        .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .Path, .This, .Super, .PropertyRef, .Break, .Continue => false,
-        .StringTemplate => |*x| {
-            for (x.parts) |*p| switch (p.*) {
-                .Interp => |ie| if (exprHas(oe, ie)) return true,
-                .Text, .ShortInterp => {},
-            };
-            return false;
-        },
-        .Member => |*x| exprHas(oe, x.receiver),
-        .Call => |*x| {
-            if (exprHas(oe, x.callee)) return true;
-            for (x.args) |*a| if (exprHas(oe, a)) return true;
-            return false;
-        },
-        .Index => |*x| {
-            if (exprHas(oe, x.receiver)) return true;
-            for (x.args) |*a| if (exprHas(oe, a)) return true;
-            return false;
-        },
-        .Binary => |*x| exprHas(oe, x.lhs) or exprHas(oe, x.rhs),
-        .Unary => |*x| exprHas(oe, x.expr),
-        .Postfix => |*x| exprHas(oe, x.expr),
-        .If => |*x| exprHas(oe, x.cond) or exprHas(oe, x.then_branch) or optExprHas(oe, x.else_branch),
-        .While => |*x| exprHas(oe, x.cond) or exprHas(oe, x.body),
-        .DoWhile => |*x| optExprHas(oe, x.body) or exprHas(oe, x.cond),
-        .For => |x| exprHas(oe, x.iter) or exprHas(oe, x.body),
-        .Return => |*x| optExprHas(oe, x.value),
-        .Labeled => |*x| exprHas(oe, x.expr),
-        .Block => |*x| blockHas(oe, x),
-        .Throw => |*x| exprHas(oe, x.value),
-        .Try => |x| {
-            if (blockHas(oe, &x.body)) return true;
-            for (x.catches) |*c| if (blockHas(oe, &c.body)) return true;
-            if (x.finally) |*fb| if (blockHas(oe, fb)) return true;
-            return false;
-        },
-        .Lambda => |x| blockHas(oe, &x.body),
-        .MemberRef => |*x| exprHas(oe, x.receiver),
-        .When => |x| {
-            if (optExprHas(oe, x.subject)) return true;
-            for (x.branches) |*br| {
-                if (exprHas(oe, &br.body)) return true;
-                for (br.patterns) |*p| switch (p.kind) {
-                    .Value => |*ve| if (exprHas(oe, ve)) return true,
-                    .InRange => |*ie| if (exprHas(oe, ie)) return true,
-                    .NotInRange => |*ie| if (exprHas(oe, ie)) return true,
-                    .IsType, .NotIsType, .Else => {},
-                };
-            }
-            return false;
-        },
-        .IsCheck => |x| exprHas(oe, x.expr),
-        .As => |x| exprHas(oe, x.expr),
-        .AnonFun => |x| if (x.body) |b| bodyHas(oe, b) else false,
-        .Spread => |*x| exprHas(oe, x.expr),
-    };
+    return ast.bodyDeclares(.{}, b);
 }
 
 const testing = std.testing;
