@@ -9,26 +9,35 @@ program enables a feature, because not every program needs the network.
 
 ## Features
 
-Features mirror ktor's Gradle module structure — one feature per module,
-all opt-in via `--feature io.ktor/<name>`. Nothing loads by default; a
-higher-level feature pulls the modules it needs through `requires`, so
-enabling the client also enables everything under it.
+Features mirror ktor's Gradle modules one for one, named after the
+artifact with `ktor-` stripped, all opt-in via `--feature io.ktor/<name>`.
+Nothing loads by default; a feature's `requires` carries its module's
+upstream dependencies inside ktor, so enabling a module enables everything
+it is built on.
 
-| Feature                       | Surface (`io.ktor.…`)                         | Requires            |
-|-------------------------------|-----------------------------------------------|---------------------|
-| `io`                          | `utils.io.*` — `ByteChannel`, locks, charsets | —                   |
-| `utils`                       | `util.*` — collections, pipeline, date, log   | `io`                |
-| `http`                        | `http.*` — URLs, headers, status, content     | `utils`             |
-| `events`                      | `events.*` — the event bus                    | `utils`             |
-| `client`                      | `client.*` — `HttpClient` + plugins           | `http`, `events`    |
-| `server`                      | `server.*` — `embeddedServer`, routing        | `http`, `events`    |
-| `client-serialization`        | `ContentNegotiation { json() }` (client)      | `client`            |
-| `server-serialization`        | typed `respond`/`receive` + `json()` (server) | `server`            |
+| Feature                       | Surface (`io.ktor.…`)                                  | Requires                                  | Other packs                        |
+|-------------------------------|--------------------------------------------------------|-------------------------------------------|------------------------------------|
+| `io`                          | `utils.io.*`: `ByteChannel`, locks, charsets           |                                           |                                    |
+| `utils`                       | `util.*`: collections, pipeline, date, log             | `io`                                      |                                    |
+| `http`                        | `http.*`: URLs, headers, status, content               | `utils`                                   |                                    |
+| `events`                      | `events.*`: the event bus                              | `utils`                                   |                                    |
+| `sse`                         | `sse.*`: the `ServerSentEvent` model                   | `utils`                                   |                                    |
+| `websockets`                  | `websocket.*`: the frame model                         | `http`                                    |                                    |
+| `serialization`               | `serialization.*`: the `ContentConverter` contract     | `websockets`                              |                                    |
+| `serialization-kotlinx`       | `serialization.kotlinx.*`: the kotlinx converter       | `serialization`                           | `kotlinx.serialization`            |
+| `serialization-kotlinx-json`  | `serialization.kotlinx.json.*`: `json()`               | `serialization-kotlinx`                   | `kotlinx.serialization/json-io`    |
+| `test-dispatcher`             | `test.dispatcher.*`: `testSuspend` runners             | `utils`                                   | `kotlinx.coroutines/test`          |
+| `test-base`                   | `test.*`: `runTest`, `runTestWithData`                 | `test-dispatcher`                         |                                    |
+| `client-core`                 | `client.*`: `HttpClient` + default plugins             | `http`, `events`, `sse`, `serialization`  |                                    |
+| `server-core`                 | `server.*`: `embeddedServer`, routing, pipeline        | `http`, `events`, `serialization`, `websockets` |                              |
+| `client-content-negotiation`  | `client.plugins.contentnegotiation.*`                  | `client-core`, `serialization`            |                                    |
+| `server-content-negotiation`  | `server.plugins.contentnegotiation.*`: typed `receive`/`respond` | `server-core`                   |                                    |
 
 So a bare channel program enables `--feature io.ktor/io`; a client program
-enables `--feature io.ktor/client` (which transitively pulls `http`,
-`utils`, `io`, and `events`). The `*-serialization` features additionally
-pull the `kotlinx.serialization` pack's `json` feature.
+enables `--feature io.ktor/client-core`; typed JSON on either side pairs the
+content-negotiation plugin with the JSON converter, exactly as the two
+Gradle dependencies would:
+`--feature io.ktor/client-content-negotiation,serialization-kotlinx-json`.
 
 ## Client
 
@@ -48,7 +57,7 @@ fun main() {
 }
 ```
 
-Run it with `klio run --feature io.ktor/client program.kt`.
+Run it with `klio run --feature io.ktor/client-core program.kt`.
 
 ### Engine
 
@@ -125,8 +134,10 @@ fun main() {
 }
 ```
 
-Run it with `klio run --feature io.ktor/server-serialization server.kt`
-(use `io.ktor/server` if you do not need typed JSON), then drive it:
+Run it with
+`klio run --feature io.ktor/server-content-negotiation,serialization-kotlinx-json server.kt`
+(`--feature io.ktor/server-core` alone if you do not need typed JSON), then
+drive it:
 
 ```sh
 curl -i 'http://127.0.0.1:8080/users/42?q=hi' -H 'X-Tag: abc'

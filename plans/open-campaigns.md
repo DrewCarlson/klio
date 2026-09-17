@@ -115,8 +115,33 @@ against the code.
   the cold `klio run hello.kt` under 50 ms acceptance (unverified).
 - Multiplatform axis: `target` on sources, `--target`/`KLIO_TARGET` for
   `run` and `pack build`, per-target bindings, an emitter for
-  `ACTUAL_ANNOTATIONS_NOT_MATCH_EXPECT`, splitting the monolithic
-  `io.ktor` pack, retiring the interim `klio-compose-ui` pack.
+  `ACTUAL_ANNOTATIONS_NOT_MATCH_EXPECT`, retiring the interim
+  `klio-compose-ui` pack.
+- Pack features follow upstream modules (one feature per Gradle module,
+  `default` = the primary module; the rule and layout live in
+  `docs/packs/authoring.md`). Modules present in the sparse checkouts but not
+  shipped, each one more feature once it parses and runs: serialization cbor /
+  protobuf / properties; ktor network, client-cio, server-cio, the auth /
+  logging / sse / websockets / status-pages plugins. Open design question:
+  collapsing the per-module compose packs into one `androidx.compose` pack
+  with features would need import-driven feature activation to stay
+  flag-free.
+- kotlinx-coroutines-test's own suite (`klio test kotlin-klio/klio-kotlinx-coroutines
+  --test-group test`, composed under the `test` feature) is 43 / 75 green:
+  the runTest timeout and uncaught-exception contracts and Main mocking
+  fail, and `RunTestTest.testCoroutineCompletingWithoutDispatch` panics with
+  an integer overflow in `src/ir/eval/fused.zig` (fusedInst); see
+  `pack-module-features.md`.
+- The shipped stdlib image (`zig build` -> `bake-image --stdlib-cache`,
+  installed under `share/klio/cache`) diverges from a runtime bake of the
+  same binary: served from it, `examples/delegates.kt`,
+  `complex_oop_delegation.kt`, `coroutine_context_completion.kt`, and
+  `function_type_supertypes.kt` fail (`getValue` on a top-level `by lazy`
+  dispatches to `kotlin.text.toHexString`; `coroutineContext` reads a
+  `Result`), while the same binary copied elsewhere (a new exe stamp, so the
+  shipped key misses and the run bakes) passes them. Present at d76d86b6.
+  Repro: `rm -rf $KLIO_HOME/.klio/cache && klio run examples/delegates.kt`
+  with `KLIO_TRACE_STDLIB_IMAGE=1` showing `hit (shipped)`.
 - Pack-actual residuals in kotlinx-io: `SegmentPool` is a no-op,
   `isWindows` is false, the line separator is `\n`.
 - Lazy image: record the RSS win; drop the retained `lifted_decls` field

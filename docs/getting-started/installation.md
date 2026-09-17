@@ -46,7 +46,8 @@ and install the ones your programs need:
 ./zig-out/bin/klio pack install target/packs/kotlinx.coroutines.klio-pack
 ```
 
-The ktor pack is feature-gated: install it the same way
-(`kotlin-klio/klio-ktor`), then enable what a program uses per run,
-e.g. `klio run --feature io.ktor/client program.kt`. See
+A multi-module pack exposes each upstream module as a feature. The
+ktor pack loads nothing by default: install it the same way
+(`kotlin-klio/klio-ktor`), then enable the modules a program uses per
+run, e.g. `klio run --feature io.ktor/client-core program.kt`. See
 [Using packs](../packs/using.md).

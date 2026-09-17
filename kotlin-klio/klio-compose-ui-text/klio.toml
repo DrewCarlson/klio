@@ -107,4 +107,5 @@ stdlib = "*"
 "androidx.compose.ui.graphics" = "*"
 "androidx.collection" = "*"
 "kotlinx.atomicfu" = "*"
+"kotlinx.coroutines" = "*"
 

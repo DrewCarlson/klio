@@ -83,7 +83,8 @@ your code also runs it.
   [kotlinx.coroutines](packs/shipped/coroutines.md),
   [kotlinx.serialization](packs/shipped/serialization.md),
   [io.ktor](packs/shipped/ktor.md),
-  [androidx.compose.runtime](packs/shipped/compose-runtime.md).
+  [androidx.compose.runtime](packs/shipped/compose-runtime.md),
+  [the Compose packs](packs/shipped/compose.md).
 
 ## Development
 

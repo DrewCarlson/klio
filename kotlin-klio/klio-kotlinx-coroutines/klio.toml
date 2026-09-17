@@ -5,32 +5,54 @@ abi = 1
 implicit_packages = []
 auto_bindings = true
 
+# Upstream kotlinx-coroutines-core commonMain, consumed straight from the
+# in-pack git submodule.
 [[source]]
 root = "upstream/kotlinx-coroutines-core/common/src"
 
-[[source]]
-root = "klioMain"
-
-# kotlinx-coroutines-test (`kotlinx.coroutines.test.*`): TestScope /
-# TestDispatcher / TestCoroutineScheduler and the `runTest` builder, plus
-# the native actuals (TestResult = Unit, createTestResult = runBlocking).
+# Upstream kotlinx-coroutines-test commonMain (`kotlinx.coroutines.test.*`):
+# TestScope / TestDispatcher / TestCoroutineScheduler and the `runTest`
+# builder.
 [[source]]
 root = "upstream/kotlinx-coroutines-test/common/src"
 
+# klio-authored actuals for both modules. A file's package path places it in
+# its module: `kotlinx/coroutines/test/` is the test module's platform layer
+# (TestResult = Unit, createTestResult = runBlocking, the main-dispatcher
+# hook); everything else actualises core.
 [[source]]
-root = "klioTest"
+root = "klioMain"
 
 [deps]
 stdlib = "*"
+# The core's own atomics (`atomic(...)` fields throughout the common sources).
+"kotlinx.atomicfu" = "*"
 
+# One feature per upstream module. `core` (kotlinx-coroutines-core) is the
+# default and loads whenever the pack does; `test` (kotlinx-coroutines-test)
+# is opt-in via `--feature kotlinx.coroutines/test`.
+[features]
+default = ["core"]
+core = { sources = ["upstream/kotlinx-coroutines-core", "klioMain"] }
+test = { sources = ["upstream/kotlinx-coroutines-test", "klioMain/kotlinx/coroutines/test"], requires = ["core"] }
+
+# commonTest sources for `klio test` (not packed). Upstream compiles the core
+# suite and the test module's suite as separate modules; each is its own group
+# here. The core suite runs on core alone, so it is untagged.
 [[test]]
 root = "upstream/kotlinx-coroutines-core/common/test"
+group = "core"
 
-# Shared commonTest infrastructure; the platform actuals for it are
-# klio-authored (klioTestUtils/) — real threads, runBlocking-backed
-# runTest, no platform skip annotations.
+[[test]]
+root = "upstream/kotlinx-coroutines-test/common/test"
+feature = "test"
+group = "test"
+
+# Shared commonTest infrastructure (upstream test-utils) and its klio-authored
+# platform actuals: real threads, a runBlocking-backed `runTest`, no platform
+# skip annotations. Ungrouped, so it composes into both suites.
 [[test]]
 root = "upstream/test-utils/common/src"
 
 [[test]]
-root = "klioTestUtils"
+root = "klioTest"

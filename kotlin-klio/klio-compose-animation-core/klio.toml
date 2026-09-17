@@ -2,7 +2,8 @@
 # AnimationSpec/VectorConverter, Animatable, TargetBasedAnimation, ArcSpline,
 # vector value types), vendored verbatim. klioMain supplies the platform-primitive
 # actuals (atomics, current-thread token, binary search, cancellation base).
-# A dependency of compose.foundation.
+# The `animation` module above it (fling decay, Color animation) is its own
+# pack, klio-compose-animation. A dependency of compose.foundation.
 [library]
 id = "androidx.compose.animation.core"
 version = "1.12.0"
@@ -52,19 +53,6 @@ include = [
     "androidx/compose/animation/core/VisibilityThresholds.kt",
 ]
 
-# The spline-based fling decay from the upstream `animation` module (the
-# platform scroll fling physics): three self-contained files consumed here
-# until the full androidx.compose.animation module gets its own pack.
-[[source]]
-root = "../klio-compose-runtime/upstream/compose/animation/animation/src/commonMain/kotlin"
-include = [
-    "androidx/compose/animation/ColorVectorConverter.kt",
-    "androidx/compose/animation/FlingCalculator.kt",
-    "androidx/compose/animation/SingleValueAnimation.kt",
-    "androidx/compose/animation/SplineBasedDecay.kt",
-    "androidx/compose/animation/SplineBasedFloatDecayAnimationSpec.kt",
-]
-
 [[source]]
 root = "klioMain"
 
@@ -77,4 +65,6 @@ stdlib = "*"
 "androidx.compose.ui.graphics" = "*"
 "kotlinx.atomicfu" = "*"
 "kotlinx.coroutines" = "*"
+"androidx.compose.ui" = "*"
+"androidx.collection" = "*"
 

@@ -1,4 +1,4 @@
-// Run with: klio run --feature io.ktor/io examples/channel_segment_namesake.kt
+// Run with: klio run --feature io.ktor/io --feature kotlinx.coroutines/test examples/channel_segment_namesake.kt
 // A ktor ByteChannel pumps data through kotlinx.coroutines' upstream
 // BufferedChannel, whose ChannelSegment extends the internal
 // kotlinx.coroutines.internal.Segment while kotlinx.io ships a PUBLIC

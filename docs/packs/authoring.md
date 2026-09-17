@@ -49,8 +49,50 @@ The fields that matter:
 | `[[source]]`        | A packed source set: `root` + optional `include` (file list relative to `root`). Repeatable; use instead of `source_roots` for finer control. |
 | `[deps]`            | One line per dependency: `"kotlinx.io" = "*"` for any version, a version string for a minimum, `{ version = "..", features = [..], default_features = false }` for the rest. The loader topo-sorts them. |
 | `[bindings]`        | `"FQN" = "host_symbol"` lines for native intrinsics.                  |
-| `[features]`        | Named, opt-in source subsets (`name = { sources = [...] }`, optionally `requires = [...]`). Consumers enable them with `--feature <id>/<name>`. |
-| `[[test]]`          | A test source set for `klio test <project>`: `root` + optional `include`, optional `feature = "<name>"` (composed only when that feature is active; untagged = core, always active). Test sources are never packed. |
+| `[features]`        | One feature per upstream module: `default = [...]` names the primary module(s); `name = { sources = [...], requires = [...], deps = [...] }` declares one (see below). Consumers enable them with `--feature <id>/<name>`. |
+| `[[test]]`          | A test source set for `klio test <project>`: `root` + optional `include`, optional `feature = "<name>"` (composed only when that feature is active; untagged = core, always active), optional `group` (each group is its own test program). Test sources are never packed. |
+
+### Features: one per upstream module
+
+A multi-module library ships as one pack whose features are its modules,
+named after the artifact with the library prefix stripped
+(`kotlinx-coroutines-test` -> `test`, `ktor-client-core` -> `client-core`):
+
+```toml
+[[source]]
+root = "upstream/kotlinx-coroutines-core/common/src"
+
+[[source]]
+root = "upstream/kotlinx-coroutines-test/common/src"
+
+[[source]]
+root = "klioMain"
+
+[features]
+default = ["core"]
+core = { sources = ["upstream/kotlinx-coroutines-core", "klioMain"] }
+test = { sources = ["upstream/kotlinx-coroutines-test", "klioMain/kotlinx/coroutines/test"], requires = ["core"] }
+```
+
+- `sources` are pack-relative path prefixes over the collected files. A
+  file claimed by several features belongs to the one whose matching
+  prefix is longest, so `klioMain` can hold every module's klio-authored
+  actuals with the package path placing each file in its module. A file
+  no feature claims always loads.
+- `requires` names the pack's own modules this one is built on (its
+  upstream `api` dependencies inside the library); `deps` names features
+  of other packs (`"kotlinx.serialization/json-io"`, or a bare pack id for
+  its defaults).
+- `default` is the module that loads when a consumer names nothing,
+  normally the library's entry point (`core`); a pack with no single
+  entry point (ktor) defaults to nothing.
+- A library with one module declares no `[features]` at all.
+- `klio pack build` refuses a manifest whose `default`, `requires`, or
+  `[[test]] feature` names an undeclared feature, or whose `sources`
+  prefix covers no collected file.
+
+Lay klio-authored sources out as `klioMain/` (packed, any module) and
+`klioTest/` (test-only support for `[[test]]`, never packed).
 
 ### Testing the project
 

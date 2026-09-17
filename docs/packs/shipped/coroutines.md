@@ -37,6 +37,28 @@ Available:
 | Flow         | `flow`, the operator surface, `SharedFlow` / `StateFlow` on hot sources |
 | Sync         | `Mutex`, `Semaphore` (`withPermit`)                                     |
 
+## Features
+
+One feature per upstream module. `core` (kotlinx-coroutines-core) is the
+default and loads with the pack; `test` (kotlinx-coroutines-test) is
+opt-in.
+
+| Feature | Module                  | Surface                                                       | Requires |
+|---------|-------------------------|---------------------------------------------------------------|----------|
+| `core`  | kotlinx-coroutines-core | builders, Job, dispatchers, channels, select, Flow, sync      |          |
+| `test`  | kotlinx-coroutines-test | `runTest`, `TestScope`, `TestDispatcher`, `TestCoroutineScheduler` | `core` |
+
+```kotlin
+import kotlinx.coroutines.test.runTest
+
+fun main() = runTest {
+    // virtual time: delay() advances the scheduler instead of the clock
+}
+```
+
+Run it with `klio run --feature kotlinx.coroutines/test program.kt`. The
+ktor pack's `test-dispatcher` feature pulls it in automatically.
+
 ## Execution semantics
 
 klio runs coroutines on cooperative pumps — one per `runBlocking`

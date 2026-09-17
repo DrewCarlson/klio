@@ -76,8 +76,10 @@ sources into **one module** and runs them. Whole-module composition resolves
 cross-file references correctly — running the same files individually breaks
 cross-file resolution and mis-counts. `[[test]]` sets can be feature-scoped;
 `--all` (default) runs core + every feature module, `--feature <name>` narrows
-to core + the named feature(s). See [Authoring a pack](packs/authoring.md) for
-the `[[test]]` manifest schema.
+to core + the named feature(s). The project's `[deps]` scope which packs the
+tests resolve against, plus `kotlin.test` itself, which every `klio test` run
+declares. See [Authoring a pack](packs/authoring.md) for the `[[test]]`
+manifest schema.
 
 ### Runner options
 

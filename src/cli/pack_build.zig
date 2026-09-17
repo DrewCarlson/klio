@@ -864,29 +864,49 @@ fn scanDeclExpectActual(decl: *const ast.Decl, out_expect: *bool, out_actual: *b
 /// The source sets a pack was built from, in walk order, each tagged with
 /// whether it declares `expect` or `actual`. An `expect`-bearing root resolves
 /// as its own module ahead of the roots that actualise it, which is what lets
-/// an IDE reconstruct the refinement graph from the pack alone.
+/// an IDE reconstruct the refinement graph from the pack alone. A root that
+/// spans several features yields one set per feature, rooted at the prefix
+/// the feature claimed it by, so `klioMain` with a `test` module under
+/// `klioMain/kotlinx/coroutines/test` is two sets, not one mislabelled root.
 fn buildSourceSetIndex(
     a: std.mem.Allocator,
     roots: []const SourceRoot,
     bundle: *const schema.AstBundle,
     features: []const FeatureTomlDef,
 ) std.mem.Allocator.Error!schema.SourceSetIndex {
-    const sets = try a.alloc(schema.SourceSetEntry, roots.len);
-    for (roots, sets) |sr, *dst| {
-        var has_expect = false;
-        var has_actual = false;
+    var sets: std.ArrayList(schema.SourceSetEntry) = .empty;
+    for (roots) |sr| {
+        const first = sets.items.len;
         for (bundle.files) |f| {
             if (!pathUnderRoot(f.rel_path, sr.root)) continue;
-            for (f.kotlin_file.decls) |*d| scanDeclExpectActual(d, &has_expect, &has_actual);
+            var set_root = sr.root;
+            var feature: []const u8 = "";
+            if (featureClaim(f.rel_path, features)) |c| {
+                feature = c.feature;
+                // A claim narrower than the root names the set; a claim on a
+                // single file names that file's directory.
+                if (c.prefix.len > sr.root.len and pathUnderRoot(c.prefix, sr.root)) {
+                    set_root = if (std.mem.endsWith(u8, c.prefix, ".kt"))
+                        std.fs.path.dirname(c.prefix) orelse sr.root
+                    else
+                        c.prefix;
+                }
+            }
+            const entry: *schema.SourceSetEntry = blk: {
+                for (sets.items[first..]) |*e| {
+                    if (std.mem.eql(u8, e.root, set_root) and std.mem.eql(u8, e.feature, feature)) break :blk e;
+                }
+                try sets.append(a, .{ .root = set_root, .feature = feature });
+                break :blk &sets.items[sets.items.len - 1];
+            };
+            for (f.kotlin_file.decls) |*d| scanDeclExpectActual(d, &entry.has_expect, &entry.has_actual);
         }
-        dst.* = .{
-            .root = sr.root,
-            .feature = featureForRoot(sr.root, features),
-            .has_expect = has_expect,
-            .has_actual = has_actual,
-        };
+        if (sets.items.len == first) {
+            const feature = if (featureClaim(sr.root, features)) |c| c.feature else "";
+            try sets.append(a, .{ .root = sr.root, .feature = feature });
+        }
     }
-    return .{ .sets = sets };
+    return .{ .sets = try sets.toOwnedSlice(a) };
 }
 
 fn pathUnderRoot(rel: []const u8, root: []const u8) bool {
@@ -895,18 +915,69 @@ fn pathUnderRoot(rel: []const u8, root: []const u8) bool {
     return rel.len > root.len and rel[root.len] == '/';
 }
 
-/// The feature gating `root`, empty when no feature claims it. A feature's
-/// `sources` are `rel_path` prefixes, so a root matches when either side
-/// prefixes the other.
-fn featureForRoot(root: []const u8, features: []const FeatureTomlDef) []const u8 {
+/// The feature claiming `rel`, and the `sources` prefix it claimed it by.
+const FeatureClaim = struct { feature: []const u8, prefix: []const u8 };
+
+/// The loader's rule: the longest covering prefix over every feature wins, and
+/// the first feature in manifest order on a tie. Null when nothing claims `rel`.
+fn featureClaim(rel: []const u8, features: []const FeatureTomlDef) ?FeatureClaim {
+    var best: ?FeatureClaim = null;
     for (features) |f| {
         for (f.sources) |pat| {
             const p = std.mem.trimEnd(u8, pat, "/");
             if (p.len == 0) continue;
-            if (std.mem.startsWith(u8, root, p) or std.mem.startsWith(u8, p, root)) return f.name;
+            if (!std.mem.eql(u8, rel, p) and !pathUnderRoot(rel, p)) continue;
+            if (best == null or p.len > best.?.prefix.len) best = .{ .feature = f.name, .prefix = p };
         }
     }
-    return "";
+    return best;
+}
+
+fn findFeature(defs: []const FeatureTomlDef, name: []const u8) ?*const FeatureTomlDef {
+    for (defs) |*f| {
+        if (std.mem.eql(u8, f.name, name)) return f;
+    }
+    return null;
+}
+
+/// Every feature reference in the manifest must resolve, and every gate must
+/// gate something: `default`, each `requires`, and each `[[test]] feature` name
+/// a declared feature, and each `sources` prefix covers at least one collected
+/// file. A prefix that covers nothing is the bug that once left a feature's
+/// entrypoints resolving to nothing at run time.
+fn validateFeatures(gpa: std.mem.Allocator, cfg: *const LibraryToml, files: []const schema.SourceFile) ?Failure {
+    const defs = cfg.features.defs;
+    for (cfg.features.default) |name| {
+        if (findFeature(defs, name) == null) {
+            return fail(gpa, "[features] default names `{s}`, which no feature declares", .{name});
+        }
+    }
+    for (defs) |f| {
+        for (f.requires) |r| {
+            if (findFeature(defs, r) == null) {
+                return fail(gpa, "feature `{s}` requires `{s}`, which no feature declares", .{ f.name, r });
+            }
+        }
+        for (f.sources) |pat| {
+            const p = std.mem.trimEnd(u8, pat, "/");
+            var covered = false;
+            for (files) |sf| {
+                if (std.mem.eql(u8, sf.rel_path, p) or pathUnderRoot(sf.rel_path, p)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                return fail(gpa, "feature `{s}` gates `{s}`, which covers no collected source; check the prefix against the [[source]] roots", .{ f.name, pat });
+            }
+        }
+    }
+    for (cfg.tests) |t| {
+        if (t.feature.len != 0 and findFeature(defs, t.feature) == null) {
+            return fail(gpa, "[[test]] root `{s}` is gated on `{s}`, which no feature declares", .{ t.root, t.feature });
+        }
+    }
+    return null;
 }
 
 fn anyMatch(rel: []const u8, pats: []const []const u8) bool {
@@ -1601,6 +1672,7 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
         .ok => {},
     }
     const files = files_res.ok;
+    if (validateFeatures(gpa, &cfg, files)) |e| return .{ .err = e };
 
     const feature_defs = a.alloc(schema.FeatureDef, cfg.features.defs.len) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     for (cfg.features.defs, feature_defs) |src, *dst| {
@@ -1989,6 +2061,107 @@ test "buildAstBundle accepts a clean file" {
     try std.testing.expect(err == null);
     try std.testing.expectEqual(@as(usize, 1), bundle.files.len);
     try std.testing.expectEqualStrings("ok/Good.kt", bundle.files[0].rel_path);
+}
+
+test "featureClaim picks the longest covering prefix" {
+    var core_srcs = [_][]const u8{ "upstream/kotlinx-coroutines-core", "klioMain" };
+    var test_srcs = [_][]const u8{ "upstream/kotlinx-coroutines-test", "klioMain/kotlinx/coroutines/test" };
+    const defs = [_]FeatureTomlDef{
+        .{ .name = "core", .sources = &core_srcs },
+        .{ .name = "test", .sources = &test_srcs },
+    };
+    const c1 = featureClaim("klioMain/kotlinx/coroutines/EventLoop.kt", &defs).?;
+    try std.testing.expectEqualStrings("core", c1.feature);
+    try std.testing.expectEqualStrings("klioMain", c1.prefix);
+    const c2 = featureClaim("klioMain/kotlinx/coroutines/test/TestBuilders.kt", &defs).?;
+    try std.testing.expectEqualStrings("test", c2.feature);
+    try std.testing.expectEqualStrings("klioMain/kotlinx/coroutines/test", c2.prefix);
+    try std.testing.expect(featureClaim("docs/Readme.kt", &defs) == null);
+}
+
+test "buildSourceSetIndex splits a root by the features that claim it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files = [_]schema.SourceFile{
+        .{ .rel_path = "upstream/core/src/Job.kt", .bytes = "package kotlinx.coroutines\nexpect fun job(): Int\n" },
+        .{ .rel_path = "klioMain/kotlinx/coroutines/Actuals.kt", .bytes = "package kotlinx.coroutines\nactual fun job(): Int = 1\n" },
+        .{ .rel_path = "klioMain/kotlinx/coroutines/test/TestBuilders.kt", .bytes = "package kotlinx.coroutines.test\nfun runTest() {}\n" },
+        .{ .rel_path = "klioMain/kotlin/native/Platform.kt", .bytes = "package kotlin.native\nobject Platform\n" },
+    };
+    var err: ?Failure = null;
+    const bundle = buildAstBundle(std.testing.allocator, a, &files, &err);
+    try std.testing.expect(err == null);
+    var core_srcs = [_][]const u8{ "upstream/core", "klioMain" };
+    var test_srcs = [_][]const u8{"klioMain/kotlinx/coroutines/test"};
+    var server_srcs = [_][]const u8{"klioMain/kotlin/native/Platform.kt"};
+    const defs = [_]FeatureTomlDef{
+        .{ .name = "core", .sources = &core_srcs },
+        .{ .name = "server", .sources = &server_srcs },
+        .{ .name = "test", .sources = &test_srcs },
+    };
+    const roots = [_]SourceRoot{ .{ .root = "upstream/core/src" }, .{ .root = "klioMain" } };
+    const idx = try buildSourceSetIndex(a, &roots, &bundle, &defs);
+    try std.testing.expectEqual(@as(usize, 4), idx.sets.len);
+    try std.testing.expectEqualStrings("upstream/core/src", idx.sets[0].root);
+    try std.testing.expectEqualStrings("core", idx.sets[0].feature);
+    try std.testing.expect(idx.sets[0].has_expect);
+    try std.testing.expectEqualStrings("klioMain", idx.sets[1].root);
+    try std.testing.expectEqualStrings("core", idx.sets[1].feature);
+    try std.testing.expect(idx.sets[1].has_actual);
+    // Sets follow first-seen file order under the root.
+    try std.testing.expectEqualStrings("klioMain/kotlinx/coroutines/test", idx.sets[2].root);
+    try std.testing.expectEqualStrings("test", idx.sets[2].feature);
+    try std.testing.expect(!idx.sets[2].has_expect and !idx.sets[2].has_actual);
+    // A single-file claim roots its set at the file's directory.
+    try std.testing.expectEqualStrings("klioMain/kotlin/native", idx.sets[3].root);
+    try std.testing.expectEqualStrings("server", idx.sets[3].feature);
+}
+
+test "validateFeatures rejects dangling names and empty gates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files = [_]schema.SourceFile{
+        .{ .rel_path = "upstream/core/src/A.kt", .bytes = "" },
+        .{ .rel_path = "upstream/json/src/B.kt", .bytes = "" },
+    };
+    const parse = struct {
+        fn run(alloc: std.mem.Allocator, text: []const u8) !LibraryToml {
+            return switch (parseLibraryToml(alloc, text)) {
+                .ok => |c| c,
+                .err => error.TestParseFailed,
+            };
+        }
+    }.run;
+
+    const good = try parse(a,
+        \\[library]
+        \\id = "lib"
+        \\[features]
+        \\default = ["core"]
+        \\core = { sources = ["upstream/core"] }
+        \\json = { sources = ["upstream/json/"], requires = ["core"] }
+        \\[[test]]
+        \\root = "upstream/json/test"
+        \\feature = "json"
+        \\
+    );
+    try std.testing.expect(validateFeatures(std.testing.allocator, &good, &files) == null);
+
+    const cases = [_][]const u8{
+        "[library]\nid = \"lib\"\n[features]\ndefault = [\"nope\"]\ncore = { sources = [\"upstream/core\"] }\n",
+        "[library]\nid = \"lib\"\n[features]\ncore = { sources = [\"upstream/core\"], requires = [\"base\"] }\n",
+        "[library]\nid = \"lib\"\n[features]\ncore = { sources = [\"upstream/cbor\"] }\n",
+        "[library]\nid = \"lib\"\n[features]\ncore = { sources = [\"upstream/core\"] }\n[[test]]\nroot = \"t\"\nfeature = \"json\"\n",
+    };
+    const needles = [_][]const u8{ "default names `nope`", "requires `base`", "covers no collected source", "gated on `json`" };
+    for (cases, needles) |text, needle| {
+        const cfg = try parse(a, text);
+        const failure = validateFeatures(std.testing.allocator, &cfg, &files) orelse return error.TestExpectedFailure;
+        defer std.testing.allocator.free(failure);
+        try std.testing.expect(std.mem.find(u8, failure, needle) != null);
+    }
 }
 
 test "registry index round-trips through json" {

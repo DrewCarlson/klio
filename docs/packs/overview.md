@@ -36,7 +36,7 @@ without re-running the parser or typechecker.
 |------------------|------------------------|------------------------------------------------|
 | Embedded stdlib  | `stdlib.klio-pack`     | Built into the `klio` binary; always active.   |
 | Bundled libs     | `kotlinx.io.klio-pack` | Built from `kotlin-klio/`; `klio pack install`. |
-| Feature-gated    | `io.ktor.klio-pack`    | Same flow; gated surfaces load per run via `--feature`. |
+| Multi-module     | `io.ktor.klio-pack`    | Same flow; each upstream module is a feature, loaded per run via `--feature`. |
 | Third-party      | Anything you build     | `klio pack install <file>`.                    |
 
 The same format, the same loader, the same dispatch path — only the
@@ -51,9 +51,9 @@ content and the install flow differ.
   serialised into the `bindings` section so the loader can resolve
   each FQN against a host's `HostBindings` registry.
 - **Manifest.** Library id, version, ABI version, dependencies,
-  implicit packages, and any feature definitions (named source
-  subsets a consumer opts into with `--feature <id>/<name>`; see
-  [Using packs](using.md)).
+  implicit packages, and the feature table (one feature per upstream
+  module, with its defaults; a consumer opts into a module with
+  `--feature <id>/<name>`; see [Using packs](using.md)).
 
 ## What does not go in a pack
 

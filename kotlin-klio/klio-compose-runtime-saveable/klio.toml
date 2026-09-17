@@ -25,4 +25,6 @@ include = [
 
 [deps]
 stdlib = "*"
+"androidx.compose.runtime" = "*"
+"androidx.collection" = "*"
 

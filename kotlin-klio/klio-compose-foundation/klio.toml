@@ -418,5 +418,7 @@ stdlib = "*"
 "androidx.compose.ui.util" = "*"
 "androidx.compose.foundation.layout" = "*"
 "androidx.compose.animation.core" = "*"
+"androidx.compose.animation" = "*"
 "androidx.collection" = "*"
+"kotlinx.coroutines" = "*"
 

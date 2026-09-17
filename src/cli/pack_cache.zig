@@ -1074,16 +1074,42 @@ fn appendFailure(
     try failures.append(allocator, .{ .path = path_dup, .msg = msg });
 }
 
+/// Whether `pat`, a pack-root-relative prefix, covers `rel_path`: the path is
+/// the prefix itself or a file under it.
+fn prefixCovers(rel_path: []const u8, pat_raw: []const u8) bool {
+    const pat = std.mem.trimEnd(u8, pat_raw, "/");
+    if (std.mem.eql(u8, rel_path, pat)) return true;
+    return rel_path.len > pat.len and std.mem.startsWith(u8, rel_path, pat) and rel_path[pat.len] == '/';
+}
+
+/// The length of the longest prefix in `sources` covering `rel_path`, null
+/// when none does.
+fn featureMatchLen(rel_path: []const u8, sources: [][]const u8) ?usize {
+    var best: ?usize = null;
+    for (sources) |pat_raw| {
+        if (!prefixCovers(rel_path, pat_raw)) continue;
+        const n = std.mem.trimEnd(u8, pat_raw, "/").len;
+        if (best == null or n > best.?) best = n;
+    }
+    return best;
+}
+
 /// Whether `rel_path` falls under any of `sources`, each a pack-root-relative prefix.
 fn sourceInFeature(rel_path: []const u8, sources: [][]const u8) bool {
-    for (sources) |pat_raw| {
-        const pat = std.mem.trimEnd(u8, pat_raw, "/");
-        if (std.mem.eql(u8, rel_path, pat)) return true;
-        if (rel_path.len > pat.len and std.mem.startsWith(u8, rel_path, pat) and rel_path[pat.len] == '/') {
-            return true;
-        }
+    return featureMatchLen(rel_path, sources) != null;
+}
+
+/// The most specific claim on `rel_path`: the longest prefix any feature's
+/// `sources` covers it by. A file claimed by several features belongs to the
+/// ones whose matching prefix has this length, so `klioMain` can be one
+/// module's root while `klioMain/kotlinx/coroutines/test` is another's.
+fn gateLen(rel_path: []const u8, manifest: *const schema.PackManifest) ?usize {
+    var best: ?usize = null;
+    for (manifest.features) |f| {
+        const n = featureMatchLen(rel_path, f.sources) orelse continue;
+        if (best == null or n > best.?) best = n;
     }
-    return false;
+    return best;
 }
 
 /// Defaults (unless opted out) plus requested features, expanded over `requires`.
@@ -1120,20 +1146,20 @@ fn resolveActiveFeatures(
     return active;
 }
 
-/// A file gated by a feature needs it active; an ungated core file always loads.
+/// A file gated by a feature needs it active; an ungated core file always
+/// loads. Only the most specific claim gates: a file under both `klioMain`
+/// (core) and `klioMain/kotlinx/coroutines/test` (test) loads with `test`.
 fn sourceIsActive(
     rel_path: []const u8,
     manifest: *const schema.PackManifest,
     active: *const std.StringHashMap(void),
 ) bool {
-    var gated = false;
+    const n = gateLen(rel_path, manifest) orelse return true;
     for (manifest.features) |f| {
-        if (sourceInFeature(rel_path, f.sources)) {
-            gated = true;
-            if (active.contains(f.name)) return true;
-        }
+        if (featureMatchLen(rel_path, f.sources) != n) continue;
+        if (active.contains(f.name)) return true;
     }
-    return !gated;
+    return false;
 }
 
 /// The first feature gating an inactive file, to hint what to enable. Borrows `manifest`.
@@ -1145,12 +1171,11 @@ fn inactiveGate(
     active: *const std.StringHashMap(void),
 ) ?Gate {
     if (sourceIsActive(rel_path, manifest, active)) return null;
+    const n = gateLen(rel_path, manifest) orelse return null;
     for (manifest.features) |f| {
         for (f.sources) |pat_raw| {
             const p = std.mem.trimEnd(u8, pat_raw, "/");
-            if (std.mem.eql(u8, rel_path, p) or
-                (rel_path.len > p.len and std.mem.startsWith(u8, rel_path, p) and rel_path[p.len] == '/'))
-            {
+            if (p.len == n and prefixCovers(rel_path, pat_raw)) {
                 return .{ .feature = f.name, .prefix = p };
             }
         }
@@ -1615,6 +1640,11 @@ fn loadInstalledPacksImpl(
                             if (gop.found_existing) gpa.free(dup) else gop.value_ptr.* = {};
                             changed = true;
                         }
+                        // A feature's dependency is as declared as a `[deps]` entry.
+                        if (restrict and !declared.contains(lib)) {
+                            try declared.put(try gpa.dupe(u8, lib), {});
+                            changed = true;
+                        }
                         if (std.mem.findScalar(u8, dep, '/')) |slash| {
                             if (try addFeatureReqsChanged(gpa, &feature_reqs, dep[0..slash], dep[slash + 1 ..])) changed = true;
                         }
@@ -1683,13 +1713,13 @@ fn loadInstalledPacksImpl(
             for (c.manifest.features) |f| {
                 if (active.contains(f.name)) {
                     for (f.deps) |dep| {
+                        const lib = if (std.mem.findScalar(u8, dep, '/')) |slash| dep[0..slash] else dep;
                         if (std.mem.findScalar(u8, dep, '/')) |slash| {
-                            const lib = dep[0..slash];
-                            const feats = dep[slash + 1 ..];
-                            try new_prefixes.append(gpa, try gpa.dupe(u8, lib));
-                            try addFeatureReqs(gpa, &feature_reqs, lib, feats);
-                        } else {
-                            try new_prefixes.append(gpa, try gpa.dupe(u8, dep));
+                            try addFeatureReqs(gpa, &feature_reqs, lib, dep[slash + 1 ..]);
+                        }
+                        try new_prefixes.append(gpa, try gpa.dupe(u8, lib));
+                        if (restrict and !declared.contains(lib)) {
+                            try declared.put(try gpa.dupe(u8, lib), {});
                         }
                     }
                 }
@@ -2618,6 +2648,72 @@ test "sourceIsActive and inactiveGate" {
     try active.put("server", {});
     try std.testing.expect(sourceIsActive("shim/server/Routing.kt", &manifest, &active));
     try std.testing.expect(inactiveGate("shim/server/Routing.kt", &manifest, &active) == null);
+}
+
+test "the most specific feature prefix gates a file" {
+    var core_srcs = [_][]const u8{ "upstream/kotlinx-coroutines-core", "klioMain" };
+    var test_srcs = [_][]const u8{ "upstream/kotlinx-coroutines-test", "klioMain/kotlinx/coroutines/test" };
+    var core_req = [_][]const u8{};
+    var test_req = [_][]const u8{"core"};
+    const core = schema.FeatureDef{ .name = "core", .sources = &core_srcs, .deps = &.{}, .requires = &core_req };
+    const tst = schema.FeatureDef{ .name = "test", .sources = &test_srcs, .deps = &.{}, .requires = &test_req };
+    var feats = [_]schema.FeatureDef{ core, tst };
+    var default = [_][]const u8{"core"};
+    const manifest = schema.PackManifest{
+        .library_id = "kotlinx.coroutines",
+        .library_version = "1.0",
+        .abi_version = 1,
+        .implicit_packages = &.{},
+        .dependencies = &.{},
+        .default_features = &default,
+        .features = &feats,
+    };
+    const a = std.testing.allocator;
+    var active = try resolveActiveFeatures(a, &manifest, null);
+    defer active.deinit();
+    try std.testing.expect(active.contains("core"));
+    try std.testing.expect(!active.contains("test"));
+
+    // Core files under both roots load with the default.
+    try std.testing.expect(sourceIsActive("upstream/kotlinx-coroutines-core/common/src/Job.kt", &manifest, &active));
+    try std.testing.expect(sourceIsActive("klioMain/kotlinx/coroutines/EventLoop.kt", &manifest, &active));
+    // A test-module actual under klioMain is claimed by the longer prefix only.
+    try std.testing.expect(!sourceIsActive("klioMain/kotlinx/coroutines/test/TestBuilders.kt", &manifest, &active));
+    try std.testing.expect(!sourceIsActive("upstream/kotlinx-coroutines-test/common/src/TestScope.kt", &manifest, &active));
+    const gate = inactiveGate("klioMain/kotlinx/coroutines/test/TestBuilders.kt", &manifest, &active);
+    try std.testing.expect(gate != null);
+    try std.testing.expectEqualStrings("test", gate.?.feature);
+    try std.testing.expectEqualStrings("klioMain/kotlinx/coroutines/test", gate.?.prefix);
+    // A file claimed by nothing is ungated.
+    try std.testing.expect(sourceIsActive("README.kt", &manifest, &active));
+
+    try active.put("test", {});
+    try std.testing.expect(sourceIsActive("klioMain/kotlinx/coroutines/test/TestBuilders.kt", &manifest, &active));
+    try std.testing.expect(sourceIsActive("upstream/kotlinx-coroutines-test/common/src/TestScope.kt", &manifest, &active));
+}
+
+test "features sharing a prefix of equal length both gate it" {
+    var a_srcs = [_][]const u8{"upstream/ktor-shared/ktor-serialization/"};
+    var b_srcs = [_][]const u8{"upstream/ktor-shared/ktor-serialization"};
+    const fa = schema.FeatureDef{ .name = "client-serialization", .sources = &a_srcs, .deps = &.{}, .requires = &.{} };
+    const fb = schema.FeatureDef{ .name = "server-serialization", .sources = &b_srcs, .deps = &.{}, .requires = &.{} };
+    var feats = [_]schema.FeatureDef{ fa, fb };
+    const manifest = schema.PackManifest{
+        .library_id = "io.ktor",
+        .library_version = "1.0",
+        .abi_version = 1,
+        .implicit_packages = &.{},
+        .dependencies = &.{},
+        .default_features = &.{},
+        .features = &feats,
+    };
+    const a = std.testing.allocator;
+    var active = std.StringHashMap(void).init(a);
+    defer active.deinit();
+    const path = "upstream/ktor-shared/ktor-serialization/common/src/ContentConverter.kt";
+    try std.testing.expect(!sourceIsActive(path, &manifest, &active));
+    try active.put("server-serialization", {});
+    try std.testing.expect(sourceIsActive(path, &manifest, &active));
 }
 
 test "packageOfSource finds the package line" {

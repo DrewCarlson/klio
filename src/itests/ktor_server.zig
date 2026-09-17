@@ -269,7 +269,7 @@ test "server: routing, params, headers, status codes, and typed JSON" {
     try cwd.writeFile(io, .{ .sub_path = path, .data = prog });
 
     var child = std.process.spawn(io, .{
-        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server-serialization", path },
+        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server-content-negotiation,serialization-kotlinx-json", path },
         .environ_map = &env,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -360,7 +360,7 @@ test "server: start(wait = false) is non-blocking and the daemon serve abandons 
     // The program must exit on its own once the daemon serve loop sees the
     // run-boundary abandon; the timeout turns a hang into a failure.
     const r = std.process.run(a, io, .{
-        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server", path },
+        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server-core", path },
         .environ_map = &env,
         .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
     }) catch |e| {

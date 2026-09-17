@@ -23,4 +23,8 @@ stdlib = "*"
 "androidx.compose.animation.core" = "*"
 "androidx.compose.foundation" = "*"
 "androidx.compose.ui" = "*"
+"androidx.compose.ui.geometry" = "*"
+"androidx.compose.ui.graphics" = "*"
+"androidx.compose.ui.unit" = "*"
+"androidx.compose.ui.util" = "*"
 

@@ -7,6 +7,18 @@ segment-based `Buffer`, the `Source` / `Sink` / `RawSource` /
 the `ByteString` module (`ByteString`, `ByteStringBuilder`).
 klio-authored actuals under `klioMain` supply the platform layer.
 
+## Features
+
+One feature per upstream module. `core` (kotlinx-io-core) is the default
+and is built on `bytestring` (kotlinx-io-bytestring); a consumer that only
+wants `ByteString` takes the pack with `default_features = false` and
+`features = ["bytestring"]`.
+
+| Feature      | Module                | Surface                                                        | Requires     |
+|--------------|-----------------------|----------------------------------------------------------------|--------------|
+| `bytestring` | kotlinx-io-bytestring | `ByteString`, `ByteStringBuilder`, Base64 / hex codecs         |              |
+| `core`       | kotlinx-io-core       | `Buffer`, `Source` / `Sink`, UTF-8, `kotlinx.io.files`         | `bytestring` |
+
 ## Surface
 
 ```kotlin

@@ -1,3 +1,4 @@
+// Run with: klio run --feature kotlinx.coroutines/test examples/runtest_channel_resume_order.kt
 // A channel delivery to a coroutine on the runTest scheduler is DISPATCHED
 // through that scheduler, so it stays ordered with the tasks around it: after
 // `trySend` + `yield()` the collector has run. klio's native channel resume

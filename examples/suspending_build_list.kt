@@ -1,3 +1,4 @@
+// Run with: klio run --feature kotlinx.coroutines/test examples/suspending_build_list.kt
 // `ReceiveChannel.toList()` is `buildList { consumeEach(::add) }` — an
 // inline builder whose lambda SUSPENDS (each element is received from the
 // channel). The inline chain (buildList -> buildListInternal ->

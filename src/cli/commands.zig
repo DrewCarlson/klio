@@ -3200,7 +3200,12 @@ pub fn runTestFiles(
         user_asts.append(gpa, file_ast) catch return 1;
     }
 
-    const loaded = loadInstalledPacks(gpa, user_asts.items, &map, features);
+    // The same scope the image path resolves against, so a hit and a
+    // fallback load the same packs.
+    const loaded = loadInstalledPacksOpts(gpa, user_asts.items, &map, features, .{
+        .exclude_lib_ids = project.ownLibraryExclusion(gpa, files.items),
+        .declared_lib_ids = project.declaredDependencyIds(gpa, files.items),
+    });
     var all_asts: std.ArrayList(KotlinFile) = .empty;
     defer all_asts.deinit(gpa);
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;

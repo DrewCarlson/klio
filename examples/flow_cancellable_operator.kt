@@ -1,3 +1,4 @@
+// Run with: klio run --feature kotlinx.coroutines/test examples/flow_cancellable_operator.kt
 // A plain flow operator chain is NOT cancellable: onEach builds on the
 // internal unsafeTransform (via an aliased import, `unsafeTransform as
 // transform`), so cancelling the collecting coroutine mid-collect does not

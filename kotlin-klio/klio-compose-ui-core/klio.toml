@@ -283,4 +283,7 @@ stdlib = "*"
 "androidx.compose.ui.graphics" = "*"
 "androidx.collection" = "*"
 "kotlinx.atomicfu" = "*"
+"androidx.compose.runtime.saveable" = "*"
+"androidx.compose.ui.text" = "*"
+"kotlinx.coroutines" = "*"
 

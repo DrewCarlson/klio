@@ -404,6 +404,7 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
 }
 
 fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []const u8) u8 {
+    project.implicit_dependencies = &.{"kotlin.test"};
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
     var feature_specs: std.ArrayList([]const u8) = .empty;
@@ -551,6 +552,12 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
             base.append(gpa, "--feature") catch return 2;
             base.append(gpa, fs) catch return 2;
         }
+        // Pack features (`<pack>/<feature>`) reach the children too; a test
+        // suite written against an opt-in module resolves nothing without them.
+        for (feature_specs.items) |fs| {
+            base.append(gpa, "--feature") catch return 2;
+            base.append(gpa, fs) catch return 2;
+        }
         for (only_files.items) |of| {
             base.append(gpa, "--only-file") catch return 2;
             base.append(gpa, of) catch return 2;
@@ -587,6 +594,10 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
                 for (paths.items) |p| base.append(gpa, p) catch return 2;
                 if (all_features) base.append(gpa, "--all") catch return 2;
                 for (project_features.items) |fs| {
+                    base.append(gpa, "--feature") catch return 2;
+                    base.append(gpa, fs) catch return 2;
+                }
+                for (feature_specs.items) |fs| {
                     base.append(gpa, "--feature") catch return 2;
                     base.append(gpa, fs) catch return 2;
                 }
@@ -900,11 +911,17 @@ fn parseRequestedFeatures(gpa: std.mem.Allocator, specs: []const []const u8) Req
             if (!gop.found_existing) {
                 gop.value_ptr.* = std.StringHashMap(void).init(gpa);
             }
-            gop.value_ptr.put(feat, {}) catch {};
+            // `<pack>/<a>,<b>` names several features of one pack at once,
+            // the spelling a manifest's `deps` entry uses.
+            var feats = std.mem.splitScalar(u8, feat, ',');
+            while (feats.next()) |one_raw| {
+                const one = std.mem.trim(u8, one_raw, " \t");
+                if (one.len != 0) gop.value_ptr.put(one, {}) catch {};
+            }
         } else {
             printErr(
                 gpa,
-                "warning: --feature `{s}` ignored; use `<pack>/<feature>` (e.g. io.ktor/server)\n",
+                "warning: --feature `{s}` ignored; use `<pack>/<feature>` (e.g. io.ktor/server-core)\n",
                 .{spec},
             );
         }
@@ -955,10 +972,21 @@ test "optionValue extracts =value" {
 
 test "parseRequestedFeatures splits pack/feature" {
     const gpa = std.testing.allocator;
-    var rf = parseRequestedFeatures(gpa, &.{"io.ktor/server"});
+    var rf = parseRequestedFeatures(gpa, &.{"io.ktor/server-core"});
     defer deinitRequestedFeatures(&rf);
     const feats = rf.get("io.ktor").?;
-    try std.testing.expect(feats.contains("server"));
+    try std.testing.expect(feats.contains("server-core"));
+}
+
+test "parseRequestedFeatures takes a comma list of one pack's features" {
+    const gpa = std.testing.allocator;
+    var rf = parseRequestedFeatures(gpa, &.{ "io.ktor/server-content-negotiation, serialization-kotlinx-json", "kotlinx.coroutines/test" });
+    defer deinitRequestedFeatures(&rf);
+    const ktor = rf.get("io.ktor").?;
+    try std.testing.expect(ktor.contains("server-content-negotiation"));
+    try std.testing.expect(ktor.contains("serialization-kotlinx-json"));
+    try std.testing.expectEqual(@as(u32, 2), ktor.count());
+    try std.testing.expect(rf.get("kotlinx.coroutines").?.contains("test"));
 }
 
 test "parsePackCmd list and build" {

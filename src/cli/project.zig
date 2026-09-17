@@ -334,6 +334,12 @@ pub fn declaredFeatureSpecs(a: Allocator, paths: []const []const u8) []const []c
     return out.items;
 }
 
+/// Libraries the running command needs whatever the project declares. `klio
+/// test` runs `kotlin.test`: its `@Test` and assertions are the runner's own
+/// dependency, so a library's test sources resolve them without the manifest
+/// listing a dependency the library itself does not have.
+pub var implicit_dependencies: []const []const u8 = &.{};
+
 /// The dependency ids the manifest owning `paths` declares, or null when the
 /// sources belong to no project. Null and empty differ: no manifest means the
 /// old import-driven loading, while a manifest with no dependencies means a
@@ -345,5 +351,6 @@ pub fn declaredDependencyIds(a: Allocator, paths: []const []const u8) ?[]const [
     // A project resolves against itself as well: its own sources are on the
     // command line, and its own pack may be installed.
     if (owner.cfg.library.id.len != 0) out.append(a, owner.cfg.library.id) catch {};
+    for (implicit_dependencies) |id| out.append(a, id) catch {};
     return out.items;
 }

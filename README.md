@@ -124,7 +124,11 @@ packs, and the repository includes integrations for:
   modules
 - Mosaic terminal UI
 
-See [Using packs](https://drewcarlson.github.io/klio/main/packs/using/)
+Each pack is one library, and each of the library's upstream modules is a
+feature of that pack (`kotlinx.serialization/json`, `kotlinx.coroutines/test`,
+`io.ktor/client-core`), enabled per run with `--feature` or durably in a
+project's `klio.toml`. See
+[Using packs](https://drewcarlson.github.io/klio/main/packs/using/)
 for installation and the documentation for each supported library.
 
 ## Project status

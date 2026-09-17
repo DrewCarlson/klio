@@ -432,7 +432,7 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/TestBase.common.kt",
             "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/LaunchFlow.kt",
             "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/MainDispatcherTestBase.kt",
-            "kotlin-klio/klio-kotlinx-coroutines/klioTestUtils/kotlinx/coroutines/testing/TestBase.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/klioTest/kotlinx/coroutines/testing/TestBase.kt",
         },
         // The hot children cross the 60s default under load; the cap is a hang
         // guard, not a wall ratchet.
@@ -490,7 +490,8 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/OkioStreams.kt",
             "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/internal/OkioJsonStreams.kt",
         },
-        .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
+        // The suite's KXIO streaming mode runs the json-io module, which pulls json and the kotlinx.io pack.
+        .extra_args = &.{ "--feature", "kotlinx.serialization/json-io" },
         // Two compute-heavy files; splitting keeps their fast tests counted.
         .split_files = &.{ "json/JsonHugeDataSerializationTest.kt", "json/JsonUnicodeTest.kt" },
         .extra_env = &.{.{ "KLIO_TEST_WALL_CAP_FOR", "JsonUnicodeTest.testRandomEscapeSequences=900,JsonHugeDataSerializationTest.test=900" }},

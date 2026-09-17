@@ -76,40 +76,42 @@ include = [
 
 # Upstream kotlinx-serialization-json 1.11.0 commonMain, consumed
 # verbatim (Json : StringFormat, streaming/tree codecs, JsonElement,
-# builders, naming strategies). Packed here; the `json` feature below
-# gates it at load, together with the klio actuals for its `expect`s
-# under klioMain/kotlinx/serialization/json.
+# builders, naming strategies). Gated under the `json` feature together
+# with the klio actuals for its `expect`s under klioMain/.../json.
 [[source]]
 root = "upstream/formats/json/commonMain/src"
+
+# Upstream kotlinx-serialization-json-io (formats/json-io):
+# `Json.encodeToSink` / `decodeFromSource` over kotlinx.io Source/Sink.
+# Gated under the `json-io` feature, which pulls the kotlinx.io pack its
+# Source/Sink/Buffer types come from.
+[[source]]
+root = "upstream/formats/json-io/commonMain/src"
 
 # klio-supplied layer: marker annotations / runtime helpers that the
 # excluded reified-generic upstream files would otherwise provide,
 # plus actuals for the internal `expect`s in Platform.common.kt and
 # the reflective `serializer()` entrypoints (the compiler-plugin
 # replacement; backed by the host intrinsics in src/kotlinx_serialization).
-# json-io (formats/json-io): `Json.encodeToSink` / `decodeFromSource` over
-# kotlinx.io Source/Sink. Collected here; gated to the `json` feature so it
-# loads only with `--feature kotlinx.serialization/json` (which pulls the
-# kotlinx.io pack its Source/Sink/Buffer types come from).
-[[source]]
-root = "upstream/formats/json-io/commonMain/src"
-
+# The package path places a file in its module: `kotlinx/serialization/json/`
+# holds the json module's actuals.
 [[source]]
 root = "klioMain"
 
 [deps]
 stdlib = "*"
 
-# Cargo-style features mirroring kotlinx-serialization's Gradle modules.
-# The reflective serialization-core (annotations, KSerializer,
-# descriptors, encoding) is the ungated core, always loaded. The JSON
-# format is upstream kotlinx-serialization-json's commonMain verbatim
-# (Json : StringFormat, the streaming/tree codecs, JsonElement) plus the
-# klio actuals for its five `expect`s under klioMain/.../json; opt-in
-# via `--feature kotlinx.serialization/json`.
+# One feature per upstream module, mirroring kotlinx-serialization's Gradle
+# artifacts. `core` (kotlinx-serialization-core: annotations, KSerializer,
+# descriptors, encoding, the reflective serializer) is the default. `json`
+# (kotlinx-serialization-json) and `json-io` (kotlinx-serialization-json-io)
+# are opt-in: `--feature kotlinx.serialization/json`, or `json-io` for the
+# streaming entrypoints over kotlinx.io.
 [features]
-default = []
-json = { sources = ["upstream/formats/json/commonMain/src", "upstream/formats/json-io/commonMain/src", "klioMain/kotlinx/serialization/json"], deps = ["kotlinx.io"] }
+default = ["core"]
+core = { sources = ["upstream/core", "klioMain"] }
+json = { sources = ["upstream/formats/json/", "klioMain/kotlinx/serialization/json"], requires = ["core"] }
+json-io = { sources = ["upstream/formats/json-io/"], requires = ["json"], deps = ["kotlinx.io"] }
 
 # commonTest sources for `klio test` (not packed). Upstream compiles core's
 # tests and the JSON suite as separate modules, and each vendors its own copy
@@ -124,19 +126,24 @@ group = "core"
 # (`expect val currentPlatform`); see klioTest/ for why NATIVE. Ungrouped, so
 # it composes into both suites, each of which declares that `expect`.
 [[test]]
-root = "klioTest"
+root = "klioTest/kotlinx"
 
-# Upstream's JSON test suite (formats/json-tests), gated on the `json`
-# feature. Its OKIO streaming mode runs upstream's json-okio adapter module
-# unchanged over the klioTest/json stand-in for the okio buffer type the
-# pack does not ship; the KXIO mode runs the pack's own json-io module over
-# the real kotlinx.io pack.
+# Upstream's JSON test suite (formats/json-tests). Its OKIO streaming mode runs
+# upstream's json-okio adapter module unchanged over the klioTest/json stand-in
+# for the okio buffer type the pack does not ship; the KXIO mode runs the
+# pack's own json-io module over the real kotlinx.io pack, so the suite is
+# gated on `json-io`.
 [[test]]
 root = "upstream/formats/json-okio/commonMain/src"
-feature = "json"
+feature = "json-io"
+group = "json"
+
+[[test]]
+root = "klioTest/json"
+feature = "json-io"
 group = "json"
 
 [[test]]
 root = "upstream/formats/json-tests/commonTest/src"
-feature = "json"
+feature = "json-io"
 group = "json"

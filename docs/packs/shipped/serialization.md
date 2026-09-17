@@ -12,12 +12,18 @@ unmodified.
 
 ## Features
 
-The core is always loaded with the pack. The JSON format
-(`kotlinx-serialization-json`: `Json`, `encodeToString`,
-`decodeFromString`) is opt-in:
+One feature per upstream module. `core` is the default and loads with
+the pack; the formats are opt-in.
+
+| Feature   | Module                          | Surface                                                     | Requires | Other packs  |
+|-----------|---------------------------------|-------------------------------------------------------------|----------|--------------|
+| `core`    | kotlinx-serialization-core      | annotations, `KSerializer`, descriptors, encoding, modules  |          |              |
+| `json`    | kotlinx-serialization-json      | `Json`, `encodeToString` / `decodeFromString`, `JsonElement` | `core`   |              |
+| `json-io` | kotlinx-serialization-json-io   | `Json.encodeToSink` / `decodeFromSource` over kotlinx.io     | `json`   | `kotlinx.io` |
 
 ```sh
 klio run --feature kotlinx.serialization/json app.kt
+klio run --feature kotlinx.serialization/json-io stream.kt
 ```
 
 ## Surface
@@ -41,8 +47,8 @@ fun main() {
 
 Nested `@Serializable` classes, collections, maps, nullable fields,
 and default values round-trip. The ktor pack's `ContentNegotiation`
-/ `json()` features build on this pack (its `*-serialization`
-features pull `kotlinx.serialization/json` in automatically); the
+/ `json()` features build on this pack (`io.ktor/serialization-kotlinx-json`
+pulls `kotlinx.serialization/json-io` in automatically); the
 kotlinx.datetime pack depends on it so its value types stay
 `@Serializable`.
 

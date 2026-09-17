@@ -12,6 +12,8 @@ auto_bindings = true
 # source sets, tests) is excluded by omission. Bumping the version =
 # updating the submodule + reviewing this list.
 
+# kotlinx-io-core: Buffer, the Source/Sink hierarchy, UTF-8, and the
+# `kotlinx.io.files` filesystem surface.
 [[source]]
 root = "upstream/core/common/src"
 include = [
@@ -40,6 +42,7 @@ include = [
     "files/Paths.kt",
 ]
 
+# kotlinx-io-bytestring: the immutable ByteString and its builder / codecs.
 [[source]]
 root = "upstream/bytestring/common/src"
 include = [
@@ -52,14 +55,33 @@ include = [
     "unsafe/UnsafeByteStringOperations.kt",
 ]
 
+# klio-authored platform actuals for both modules; the package path places a
+# file in its module (`kotlinx/io/bytestring/` actualises bytestring).
 [[source]]
 root = "klioMain"
 
 [deps]
 stdlib = "*"
 
-# commonTest sources for `klio test` (not packed).
+# One feature per upstream module. `core` (kotlinx-io-core) is the default;
+# it is built on `bytestring` (kotlinx-io-bytestring), which a consumer can
+# take alone with `default_features = false`.
+[features]
+default = ["core"]
+bytestring = { sources = ["upstream/bytestring", "klioMain/kotlinx/io/bytestring"] }
+core = { sources = ["upstream/core", "klioMain"], requires = ["bytestring"] }
+
+# commonTest sources for `klio test` (not packed), each module's own suite
+# under its feature. `klioTest` actualises the two `expect`s the core suite
+# declares (temp files, UTF-8 round trips).
 [[test]]
 root = "upstream/core/common/test"
+feature = "core"
+
+[[test]]
+root = "klioTest"
+feature = "core"
+
 [[test]]
 root = "upstream/bytestring/common/test"
+feature = "bytestring"

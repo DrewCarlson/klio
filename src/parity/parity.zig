@@ -660,17 +660,9 @@ fn fileBaseKey(arena: Allocator, io: Io, file: []const u8) u64 {
     var prefixes = std.StringHashMap(void).init(arena);
     collectImportPrefixes(arena, &ast_f, &prefixes) catch return 0;
     collectQualifiedPrefixes(arena, text, &prefixes) catch return 0;
-    var imports_coroutines = false;
-    var itk = prefixes.keyIterator();
-    while (itk.next()) |imp| {
-        if (std.mem.startsWith(u8, imp.*, "kotlinx.coroutines")) {
-            imports_coroutines = true;
-            break;
-        }
-    }
     base_lock.lock();
     defer base_lock.unlock();
-    const mask = packMaskFor(io, &prefixes, imports_coroutines, arena) catch return 0;
+    const mask = packMaskFor(io, &prefixes, arena) catch return 0;
     const full = stdlibGateFull(io, &prefixes, mask, arena) catch return 0;
     return (@as(u64, mask) << 1) | @intFromBool(full);
 }
@@ -1150,7 +1142,7 @@ pub const LoadedProgram = struct {
 /// One in-repo kotlinx pack source file, path and bytes both arena-owned.
 const PackSource = struct { path: []u8, text: []u8 };
 
-pub const N_PACK_DIRS = 17;
+pub const N_PACK_DIRS = 18;
 /// One bit per in-repo pack dir (`kotlinxPackDirs` order).
 pub const PackMask = u32;
 
@@ -1169,6 +1161,7 @@ fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-unit" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-graphics" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-animation-core" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-animation" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-runtime-saveable" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-text" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-serialization" }),
@@ -1183,12 +1176,11 @@ fn collectKotlinxPackSources(
     io: Io,
     pack_dirs: []const []const u8,
     import_prefixes: *const std.StringHashMap(void),
-    imports_coroutines: bool,
 ) Allocator.Error!SResult([]PackSource) {
     var out: std.ArrayList(PackSource) = .empty;
     defer out.deinit(arena);
     // One selection authority: the same closure the baked-base key uses.
-    const mask = try packMaskFor(io, import_prefixes, imports_coroutines, arena);
+    const mask = try packMaskFor(io, import_prefixes, arena);
     for (pack_dirs, 0..) |pack_dir, idx| {
         if (mask & (@as(PackMask, 1) << @intCast(idx)) == 0) continue;
 
@@ -1274,21 +1266,8 @@ pub fn loadProgramFiles(arena: Allocator, io: Io, files: []const []const u8, mod
     for (user_asts.items) |*ua| {
         try collectImportPrefixes(arena, ua, &user_import_prefixes);
     }
-    var imports_coroutines = false;
-    {
-        var it = user_import_prefixes.keyIterator();
-        while (it.next()) |imp_ptr| {
-            const imp = imp_ptr.*;
-            if (std.mem.eql(u8, imp, "kotlinx.coroutines") or
-                std.mem.startsWith(u8, imp, "kotlinx.coroutines."))
-            {
-                imports_coroutines = true;
-                break;
-            }
-        }
-    }
 
-    const pack_sources = switch (try collectKotlinxPackSources(arena, io, &pack_dirs, &user_import_prefixes, imports_coroutines)) {
+    const pack_sources = switch (try collectKotlinxPackSources(arena, io, &pack_dirs, &user_import_prefixes)) {
         .err => |e| return .{ .err = e },
         .ok => |s| s,
     };
@@ -1575,7 +1554,7 @@ fn manifestDepIds(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.
 }
 
 /// Which packs `import_prefixes` pulls in, as a mask over `kotlinxPackDirs`.
-fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_coroutines: bool, scratch: Allocator) Allocator.Error!PackMask {
+fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), scratch: Allocator) Allocator.Error!PackMask {
     var mask: PackMask = 0;
     var idx: usize = 0;
     while (idx < N_PACK_DIRS) : (idx += 1) {
@@ -1592,7 +1571,6 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
                 break;
             }
         }
-        if (std.mem.eql(u8, meta.lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
         if (wanted) mask |= @as(PackMask, 1) << @intCast(idx);
     }
     // Manifest-dependency closure: a selected pack transitively pulls its deps.
@@ -1839,22 +1817,9 @@ fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: Lo
     var prefixes = std.StringHashMap(void).init(arena);
     for (scratch_asts) |*f| try collectImportPrefixes(arena, f, &prefixes);
     for (texts) |t| try collectQualifiedPrefixes(arena, t, &prefixes);
-    var imports_coroutines = false;
-    {
-        var it = prefixes.keyIterator();
-        while (it.next()) |imp_ptr| {
-            const imp = imp_ptr.*;
-            if (std.mem.eql(u8, imp, "kotlinx.coroutines") or
-                std.mem.startsWith(u8, imp, "kotlinx.coroutines."))
-            {
-                imports_coroutines = true;
-                break;
-            }
-        }
-    }
 
     base_lock.lock();
-    const mask: PackMask = if (mode == .EmbeddedOnly) 0 else packMaskFor(io, &prefixes, imports_coroutines, arena) catch |e| {
+    const mask: PackMask = if (mode == .EmbeddedOnly) 0 else packMaskFor(io, &prefixes, arena) catch |e| {
         base_lock.unlock();
         return e;
     };

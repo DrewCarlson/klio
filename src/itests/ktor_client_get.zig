@@ -228,7 +228,7 @@ test "client GET single-sends with status and body (default engine)" {
         \\    client.close()
         \\}
         \\
-    , "io.ktor/client",
+    , "io.ktor/client-core",
         \\status=200 OK
         \\body={"name":"Ada","age":36,"roles":["ADMIN","USER"]}
         \\
@@ -251,7 +251,7 @@ test "client GET with explicit engine and followRedirects off" {
         \\    client.close()
         \\}
         \\
-    , "io.ktor/client",
+    , "io.ktor/client-core",
         \\status=200 OK
         \\body={"name":"Ada","age":36,"roles":["ADMIN","USER"]}
         \\
@@ -281,7 +281,7 @@ test "typed body deserializes through client-serialization" {
         \\    client.close()
         \\}
         \\
-    , "io.ktor/client-serialization",
+    , "io.ktor/client-content-negotiation,serialization-kotlinx-json",
         \\user=User(name=Ada, age=36, roles=[ADMIN, USER])
         \\first=ADMIN
         \\
@@ -314,7 +314,7 @@ test "POST setBody serializes through ContentNegotiation onto the wire" {
         \\    client.close()
         \\}
         \\
-    , "io.ktor/client-serialization",
+    , "io.ktor/client-content-negotiation,serialization-kotlinx-json",
         \\status=200 OK
         \\echo={"name":"Bo","age":7,"roles":["USER"]}
         \\

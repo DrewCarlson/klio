@@ -40,26 +40,42 @@ KLIO_PACKS=/path/to/foo.klio-pack klio run app.kt
 `KLIO_PACKS` accepts a colon-separated list of paths. These are
 loaded after the stdlib pack and before the cached packs.
 
-## Feature-gated surfaces
+## Features: one per upstream module
 
-A pack can gate parts of its source behind named features
-(`[features]` in its `klio.toml`). Nothing gated loads by default;
-enable a feature per run with `--feature <pack>/<feature>`
-(repeatable, accepted by `klio run`, `klio test`, `klio check`, and
-`klio bundle` — which bakes the choice into the
-[bundled executable](../BUNDLE.md)):
+A pack is one library; its features are that library's Gradle modules,
+named after the artifact with the library prefix stripped
+(`kotlinx-coroutines-test` is `kotlinx.coroutines/test`,
+`ktor-client-core` is `io.ktor/client-core`). Each pack's `default`
+names its primary module, so importing `kotlinx.coroutines.*` loads
+`core` with nothing to enable; every other module is opt-in per run
+with `--feature <pack>/<feature>` (repeatable, or one value naming
+several of a pack's features with commas; accepted by `klio run`,
+`klio test`, `klio check`, and `klio bundle`, which bakes the choice
+into the [bundled executable](../BUNDLE.md)):
 
 ```sh
 klio run --feature kotlinx.serialization/json app.kt
-klio run --feature io.ktor/client fetch.kt
+klio run --feature kotlinx.coroutines/test scheduler_test.kt
+klio run --feature io.ktor/client-core fetch.kt
+klio run --feature io.ktor/server-content-negotiation,serialization-kotlinx-json api.kt
 ```
 
-Features can require other features (enabling `io.ktor/client`
-transitively pulls `http`, `utils`, `io`, and `events`) and can pull
-features of dependency packs (the ktor `*-serialization` features
-enable `kotlinx.serialization/json`). The shipped feature tables are
-on each pack's page, e.g. [io.ktor](shipped/ktor.md) and
-[kotlinx.serialization](shipped/serialization.md).
+A feature carries its module's upstream dependencies: `requires` pulls
+the pack's own modules it is built on (`io.ktor/client-core` activates
+`http`, `utils`, `io`, `events`, `sse`, `serialization`, and
+`websockets`), and `deps` pulls features of other packs
+(`io.ktor/serialization-kotlinx-json` enables
+`kotlinx.serialization/json-io`, which enables `json` and loads the
+`kotlinx.io` pack). A program's `klio.toml` asks for the same thing
+durably: `"kotlinx.serialization" = { features = ["json"] }` under
+`[deps]`, with `default_features = false` to take only what it names.
+
+An import that lands in a module that is not active prints a note
+naming the feature to enable. A pack with no `[features]` table is a
+single module and loads whole. The shipped feature tables are on each
+pack's page: [kotlinx.coroutines](shipped/coroutines.md),
+[kotlinx.serialization](shipped/serialization.md),
+[kotlinx.io](shipped/io.md), and [io.ktor](shipped/ktor.md).
 
 ## Removing a pack
 
