@@ -727,10 +727,13 @@ pub const CooperativeInterceptor = struct {
         self.next_token += 1;
         const token = self.next_token;
         state.token = token;
+        // A wake past the clock's range never comes on its own (a
+        // `Duration.INFINITE` timeout, `delay(Long.MAX_VALUE)`): it parks
+        // indefinitely and resumes only on an explicit ready entry.
         const wake_at = if (state.wake_in_millis < 0)
             INDEFINITE
         else
-            self.nowMillis() + state.wake_in_millis;
+            std.math.add(i64, self.nowMillis(), state.wake_in_millis) catch INDEFINITE;
         if (self.mode == .Wall and state.wake_in_millis > 0) {
             countWallDelay(state.wake_in_millis);
             if (state.wake_in_millis > 2000 and streakDiagOn())
