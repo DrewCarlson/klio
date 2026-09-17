@@ -1465,7 +1465,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         break :blk std.mem.eql(u8, w, name);
     };
 
-    const cached: ?Value = blk: {
+    var cached: ?Value = blk: {
         const g = self.globals.borrow();
         defer g.deinit();
         break :blk g.get().lookup(name);
@@ -1488,9 +1488,19 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
             // binding decides rather than the value: `var x: T? = null` read
             // before anything assigns it answers null, and falling through
             // would report it unresolved.
-            const g = self.globals.borrow();
-            defer g.deinit();
-            if (g.get().lookup(name)) |v| return v;
+            const bound: ?Value = blk: {
+                const g = self.globals.borrow();
+                defer g.deinit();
+                break :blk g.get().lookup(name);
+            };
+            if (bound) |v| {
+                // A delegated property's binding is its delegate; the read
+                // goes through `getValue` below exactly as a startup-pass
+                // binding does, so a pack's `by lazy` answers its value on the
+                // first access as well as the second.
+                if (!registryHasDelegatedProp(self, name)) return v;
+                cached = v;
+            }
         }
     }
 
