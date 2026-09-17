@@ -159,6 +159,23 @@ pub fn defaultBit(i: usize) i64 {
 /// The widest parameter index the absent-argument mask reaches.
 pub const max_default_slot: usize = 9;
 
+/// Whether re-evaluating this default on a later composition yields the same value a
+/// restart would have carried in. A literal, a `null` or a plain name does; anything
+/// that calls, allocates or reads through a receiver may not, and only those need the
+/// defaults group — which costs a slot-table group on every composition that runs it.
+fn defaultRecomputesEqual(e: *const Expr) bool {
+    return switch (e.*) {
+        .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .Path => true,
+        .StringTemplate => |t| blk: {
+            for (t.parts) |part| {
+                if (part != .Text) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
 /// `$defaults and <bit> != 0`: whether the caller left parameter `i` to its default.
 fn defaultTaken(b: B, bit: i64) Expr {
     return .{ .Binary = .{
@@ -315,18 +332,21 @@ fn buildParamsAndPrologue(
 ) std.mem.Allocator.Error!ParamsAndPrologue {
     var n_defaulted: usize = 0;
     var widest_default: usize = 0;
+    var any_recomputes_different = false;
     if (f.body != null) {
         for (f.params, 0..) |p, i| {
-            if (p.default == null) continue;
+            const d = p.default orelse continue;
             n_defaulted += 1;
             widest_default = i;
+            if (!defaultRecomputesEqual(d)) any_recomputes_different = true;
         }
     }
     // A restart re-enters with the values the scope captured, and a default is computed
     // once for the life of the group: that needs both a group the restart jumps over and
-    // a mask saying which slots the original caller never supplied. Past the mask's reach
-    // the old one-shot prologue stands, which recomputes but never misreads a slot.
-    const group = restartable and n_defaulted > 0 and widest_default <= max_default_slot;
+    // a mask saying which slots the original caller never supplied. Where every default
+    // recomputes to the same value, or past the mask's reach, the one-shot prologue
+    // stands: it re-evaluates, but never misreads a slot.
+    const group = restartable and any_recomputes_different and widest_default <= max_default_slot;
     var params = try a.alloc(Param, f.params.len + 2);
     var prologue: std.ArrayList(Stmt) = .empty;
     var resolves: std.ArrayList(Stmt) = .empty;

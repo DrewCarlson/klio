@@ -419,14 +419,71 @@ test "transform injects composer/changed params and brackets the body" {
     try testing.expectEqualStrings("endRestartGroup", upd.callee.Member.receiver.Call.callee.Member.name.name);
 }
 
+test "a literal default keeps the one-shot prologue and the verbatim restart" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // @Composable fun App(x: Int = 5) { }: 5 re-evaluates to 5, so the group is waste.
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+    var five = Expr{ .IntLit = .{ .value = 5, .kind = .Int, .span = gsp } };
+    var app_params = [_]Param{.{
+        .name = dummyIdent("x"),
+        .ty = .{ .name = dummyIdent("Int"), .nullable = false, .span = gsp, .type_args = &.{}, .function = null, .definitely_non_null = false },
+        .default = &five,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = gsp,
+    }};
+    var body_stmts = [_]Stmt{};
+    const app = emptyFn("App", &app_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+
+    var ctx: u8 = 0;
+    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false, null, null);
+
+    // startRestartGroup, `val x = if (x$arg === marker()) 5 else x$arg`, $dirty,
+    // probe(x), skip-if, endRestartGroup?.updateScope. No defaults group.
+    const stmts = out.body.?.Block.stmts;
+    try testing.expectEqual(@as(usize, 6), stmts.len);
+    const prop = stmts[1].Decl.Property;
+    try testing.expect(!prop.mutable);
+    try testing.expectEqualStrings("x", prop.name.name);
+    try testing.expectEqual(@as(i64, 5), prop.init.?.If.then_branch.IntLit.value);
+    for (stmts) |st| {
+        if (st != .Expr or st.Expr != .Call) continue;
+        if (st.Expr.Call.callee.* != .Member) continue;
+        try testing.expect(!std.mem.eql(u8, st.Expr.Call.callee.Member.name.name, "startDefaults"));
+    }
+
+    // The restart hands `x$arg` back untouched, so the marker still marks the same slot.
+    const upd = stmts[5].Expr.Call;
+    const reinvoke = upd.args[0].Lambda.body.stmts[0].Expr.Call;
+    try testing.expectEqualStrings("x$arg", reinvoke.args[0].Path.segments[0].name);
+}
+
 test "defaulted composable param becomes marker-guarded prologue" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // @Composable fun App(x: Int = 5) { }
+    // @Composable fun App(x: Int = fresh()) { }. A CALL default: it may produce a new
+    // value each time, which is what the defaults group exists to prevent.
     const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
-    var five = Expr{ .IntLit = .{ .value = 5, .kind = .Int, .span = gsp } };
+    var fresh_segs = [_]Ident{dummyIdent("fresh")};
+    var fresh_callee = Expr{ .Path = .{ .segments = &fresh_segs, .span = gsp } };
+    var no_args = [_]Expr{};
+    var no_names = [_]?[]const u8{};
+    var five = Expr{ .Call = .{
+        .callee = &fresh_callee,
+        .args = &no_args,
+        .arg_names = &no_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = gsp,
+    } };
     var app_params = [_]Param{.{
         .name = dummyIdent("x"),
         .ty = .{ .name = dummyIdent("Int"), .nullable = false, .span = gsp, .type_args = &.{}, .function = null, .definitely_non_null = false },
@@ -497,7 +554,7 @@ test "defaulted composable param becomes marker-guarded prologue" {
     try testing.expectEqualStrings("defaultsInvalid", dsel.cond.Binary.rhs.Member.name.name);
     const resolve = dsel.then_branch.Block.stmts[0].Assign;
     try testing.expectEqualStrings("x", resolve.target.Path.segments[0].name);
-    try testing.expectEqual(@as(i64, 5), resolve.value.If.then_branch.IntLit.value);
+    try testing.expectEqualStrings("fresh", resolve.value.If.then_branch.Call.callee.Path.segments[0].name);
     try testing.expectEqualStrings("skipToGroupEnd", dsel.else_branch.?.Block.stmts[0].Expr.Call.callee.Member.name.name);
 
     // The restart re-call passes the RESOLVED value, and folds the mask into the flags,
