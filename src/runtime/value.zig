@@ -6,6 +6,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const objcell = @import("objcell.zig");
+const slab = @import("slab.zig");
 const tls_fast = @import("tls_fast.zig");
 const trace_mod = @import("trace.zig");
 const float_fmt = @import("float_fmt.zig");
@@ -1950,7 +1951,7 @@ pub const Value = union(enum) {
     pub fn internIntrinsic(fqn: []const u8, func: StdlibFn) Value {
         intrinsic_intern_mutex.lock();
         defer intrinsic_intern_mutex.unlock();
-        const a = std.heap.page_allocator;
+        const a = slab.allocator;
         if (intrinsic_intern == null) intrinsic_intern = std.StringHashMap(*const IntrinsicData).init(a);
         const gop = intrinsic_intern.?.getOrPut(fqn) catch @panic("intrinsic intern");
         if (!gop.found_existing) {

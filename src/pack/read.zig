@@ -35,118 +35,176 @@ pub const SectionBytes = union(enum) {
     }
 };
 
-/// One section, read without pulling the whole pack into memory.
+/// A pack opened by its header alone: the stored hash, the directory and the
+/// payload offset, from a few hundred bytes of the file whatever the pack
+/// weighs. A section is then one positional read, decompressed if stored so.
+/// A catalogue over every installed pack costs kilobytes this way and tens
+/// of megabytes through `fromPath`, and a program's run reads only the
+/// sections of the packs it selects.
 ///
-/// The layout makes this possible: a fixed header, then the section directory,
-/// then the payloads it points at. Reading the header and directory is a few
-/// hundred bytes whatever the pack weighs, and the wanted section is then one
-/// positional read. A catalogue over every installed pack costs kilobytes this
-/// way and tens of megabytes through `fromPath`.
-///
-/// The tradeoff is the pack hash, which covers the whole body and so cannot be
-/// checked without reading it. Callers that need the integrity guarantee, or
-/// more than one section, want `fromPath`.
+/// The tradeoff is the pack hash, which covers the whole body and so cannot
+/// be checked without reading it: an installed pack was checked when it was
+/// installed. A caller that needs the guarantee wants `fromPath`.
+pub const LazyPack = struct {
+    allocator: Allocator,
+    path: []const u8,
+    hash: [format.HASH_LEN]u8,
+    dir: SectionDirectory,
+    payload_start: usize,
+
+    pub fn fromPath(allocator: Allocator, path: []const u8, result: *PackError) Allocator.Error!?LazyPack {
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
+            result.* = .{ .Compression = @errorName(e) };
+            return null;
+        };
+        defer file.close(io);
+        var head: [format.HASHED_REGION_OFFSET + 4]u8 = undefined;
+        const head_read = file.readPositionalAll(io, &head, 0) catch |e| {
+            result.* = .{ .Compression = @errorName(e) };
+            return null;
+        };
+        if (head_read != head.len) {
+            result.* = .Truncated;
+            return null;
+        }
+        if (!std.mem.eql(u8, head[0..4], format.MAGIC)) {
+            result.* = .BadMagic;
+            return null;
+        }
+        const version = std.mem.readInt(u32, head[4..8], .little);
+        if (version != format.FORMAT_VERSION) {
+            result.* = .{ .VersionMismatch = .{ .expected = format.FORMAT_VERSION, .found = version } };
+            return null;
+        }
+        var hash: [format.HASH_LEN]u8 = undefined;
+        @memcpy(&hash, head[format.HASH_OFFSET .. format.HASH_OFFSET + format.HASH_LEN]);
+        const dir_len: usize = std.mem.readInt(u32, head[format.HASHED_REGION_OFFSET..][0..4], .little);
+        const dir_start = format.HASHED_REGION_OFFSET + 4;
+        const dir_bytes = try allocator.alloc(u8, dir_len);
+        defer allocator.free(dir_bytes);
+        const dir_read = file.readPositionalAll(io, dir_bytes, dir_start) catch |e| {
+            result.* = .{ .Compression = @errorName(e) };
+            return null;
+        };
+        if (dir_read != dir_len) {
+            result.* = .Truncated;
+            return null;
+        }
+        var cursor = Cursor{ .bytes = dir_bytes };
+        const dir = decodeValue(SectionDirectory, allocator, &cursor) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Malformed => {
+                result.* = .{ .Decode = "section directory is malformed" };
+                return null;
+            },
+        };
+        return .{
+            .allocator = allocator,
+            .path = path,
+            .hash = hash,
+            .dir = dir,
+            .payload_start = dir_start + dir_len,
+        };
+    }
+
+    pub fn deinit(self: *LazyPack) void {
+        freeDir(self.allocator, self.dir);
+        self.* = undefined;
+    }
+
+    /// The hash the pack carries, as `PackReader.packHash` reports it.
+    pub fn packHash(self: *const LazyPack) [format.HASH_LEN]u8 {
+        return self.hash;
+    }
+
+    pub fn sections(self: *const LazyPack) []const SectionEntry {
+        return self.dir.entries;
+    }
+
+    fn findEntry(self: *const LazyPack, name: []const u8) ?SectionEntry {
+        for (self.dir.entries) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e;
+        }
+        return null;
+    }
+
+    /// The stored bytes of one section, read by position.
+    fn readStored(self: *const LazyPack, entry: SectionEntry, result: *PackError) Allocator.Error!?[]u8 {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        var file = std.Io.Dir.cwd().openFile(io, self.path, .{}) catch |e| {
+            result.* = .{ .Compression = @errorName(e) };
+            return null;
+        };
+        defer file.close(io);
+        const stored = try self.allocator.alloc(u8, @intCast(entry.stored_len));
+        errdefer self.allocator.free(stored);
+        const got = file.readPositionalAll(io, stored, self.payload_start + @as(usize, @intCast(entry.offset))) catch |e| {
+            self.allocator.free(stored);
+            result.* = .{ .Compression = @errorName(e) };
+            return null;
+        };
+        if (got != stored.len) {
+            self.allocator.free(stored);
+            result.* = .Truncated;
+            return null;
+        }
+        return stored;
+    }
+
+    /// The section's bytes, owned by the caller; null with `result` set when
+    /// the section is absent or unreadable.
+    pub fn readSection(self: *const LazyPack, name: []const u8, result: *PackError) Allocator.Error!?SectionBytes {
+        const entry = self.findEntry(name) orelse return null;
+        const stored = (try self.readStored(entry, result)) orelse return null;
+        switch (entry.compression) {
+            .None => return SectionBytes{ .owned = stored },
+            .Zstd => {
+                defer self.allocator.free(stored);
+                const out = zstd.decompress(self.allocator, stored, @intCast(entry.uncompressed_len)) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ZstdFailed => {
+                        result.* = .{ .Compression = zstd.last_error };
+                        return null;
+                    },
+                };
+                return SectionBytes{ .owned = out };
+            },
+            .ZstdDict => {
+                defer self.allocator.free(stored);
+                const dict_entry = self.findEntry(section_names.ZSTD_DICT) orelse {
+                    result.* = .{ .Compression = "section is zstd_dict compressed but the pack has no zstd_dict section" };
+                    return null;
+                };
+                const dict = (try self.readStored(dict_entry, result)) orelse return null;
+                defer self.allocator.free(dict);
+                const out = zstd.decompressDict(self.allocator, stored, dict, @intCast(entry.uncompressed_len)) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ZstdFailed => {
+                        result.* = .{ .Compression = zstd.last_error };
+                        return null;
+                    },
+                };
+                return SectionBytes{ .owned = out };
+            },
+        }
+    }
+};
+
+/// One section of the pack at `path`, through a `LazyPack`.
 pub fn readSectionFromPath(
     allocator: Allocator,
     path: []const u8,
     name: []const u8,
     result: *PackError,
 ) Allocator.Error!?SectionBytes {
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
-        result.* = .{ .Compression = @errorName(e) };
-        return null;
-    };
-    defer file.close(io);
-
-    var head: [format.HASHED_REGION_OFFSET + 4]u8 = undefined;
-    const head_read = file.readPositionalAll(io, &head, 0) catch |e| {
-        result.* = .{ .Compression = @errorName(e) };
-        return null;
-    };
-    if (head_read != head.len) {
-        result.* = .Truncated;
-        return null;
-    }
-    if (!std.mem.eql(u8, head[0..4], format.MAGIC)) {
-        result.* = .BadMagic;
-        return null;
-    }
-    const version = std.mem.readInt(u32, head[4..8], .little);
-    if (version != format.FORMAT_VERSION) {
-        result.* = .{ .VersionMismatch = .{ .expected = format.FORMAT_VERSION, .found = version } };
-        return null;
-    }
-
-    const dir_len: usize = std.mem.readInt(u32, head[format.HASHED_REGION_OFFSET..][0..4], .little);
-    const dir_start = format.HASHED_REGION_OFFSET + 4;
-    const dir_bytes = try allocator.alloc(u8, dir_len);
-    defer allocator.free(dir_bytes);
-    const dir_read = file.readPositionalAll(io, dir_bytes, dir_start) catch |e| {
-        result.* = .{ .Compression = @errorName(e) };
-        return null;
-    };
-    if (dir_read != dir_len) {
-        result.* = .Truncated;
-        return null;
-    }
-
-    var cursor = Cursor{ .bytes = dir_bytes };
-    const dir = decodeValue(SectionDirectory, allocator, &cursor) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Malformed => {
-            result.* = .{ .Decode = "section directory is malformed" };
-            return null;
-        },
-    };
-    defer freeDir(allocator, dir);
-
-    const entry = blk: {
-        for (dir.entries) |e| {
-            if (std.mem.eql(u8, e.name, name)) break :blk e;
-        }
-        return null;
-    };
-    // A dictionary-compressed section needs a second one to decode against,
-    // which is what the whole-pack reader is for.
-    if (entry.compression == .ZstdDict) {
-        result.* = .{ .Compression = "section is zstd_dict compressed; read the pack whole" };
-        return null;
-    }
-
-    const payload_start = dir_start + dir_len;
-    const stored = try allocator.alloc(u8, @intCast(entry.stored_len));
-    var keep_stored = false;
-    defer if (!keep_stored) allocator.free(stored);
-    const got = file.readPositionalAll(io, stored, payload_start + entry.offset) catch |e| {
-        result.* = .{ .Compression = @errorName(e) };
-        return null;
-    };
-    if (got != stored.len) {
-        result.* = .Truncated;
-        return null;
-    }
-
-    switch (entry.compression) {
-        .None => {
-            keep_stored = true;
-            return SectionBytes{ .owned = stored };
-        },
-        .Zstd => {
-            const out = zstd.decompress(allocator, stored, @intCast(entry.uncompressed_len)) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ZstdFailed => {
-                    result.* = .{ .Compression = zstd.last_error };
-                    return null;
-                },
-            };
-            return SectionBytes{ .owned = out };
-        },
-        .ZstdDict => unreachable,
-    }
+    var lazy = (try LazyPack.fromPath(allocator, path, result)) orelse return null;
+    defer lazy.deinit();
+    return lazy.readSection(name, result);
 }
 
 /// Parsed view over bytes the reader owns for its lifetime. Payload accessors

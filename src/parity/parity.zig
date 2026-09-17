@@ -1735,7 +1735,7 @@ fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: PackMask, full: boo
 /// Build the EmbeddedOnly base for one gate variant and bake it, always from source.
 pub fn bakeEmbeddedBase(allocator: Allocator, io: Io, full: bool) Allocator.Error!?[]u8 {
     const entry = (try buildBaseEntryFromSource(allocator, io, .EmbeddedOnly, 0, full)) orelse return null;
-    return try interp_ir.image.bake(allocator, entry.base, entry.map, .{});
+    return try interp_ir.image.bake(allocator, allocator, entry.base, entry.map, .{});
 }
 
 fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: PackMask, full: bool) Allocator.Error!?*const BaseEntry {

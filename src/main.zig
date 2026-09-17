@@ -214,6 +214,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 runtime.slab.traceReport();
                 return rc;
             }
+            if (runtime.envOnce("KLIO_SLAB_CENSUS")) |v| {
+                runtime.slab.census_enabled = true;
+                runtime.slab.census_by_churn = std.mem.eql(u8, v, "churn");
+                const rc = runCli(runtime.slab.allocator, init.args);
+                cli.mem_census.printTypeSizes();
+                runtime.slab.censusReport();
+                return rc;
+            }
             if (runtime.envOnce("KLIO_SLAB_MAPS")) |_| {
                 runtime.slab.map_sites_enabled = true;
                 const rc = runCli(runtime.slab.allocator, init.args);

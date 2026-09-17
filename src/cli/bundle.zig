@@ -784,7 +784,7 @@ fn bakeProgramImage(
     span.active_map = deps.map;
     const pb = (interp_ir.build.buildProgramBase(gpa, all.items) catch return null) orelse return null;
     pb.user_file_start = @intCast(dep_file_count);
-    return (image.bake(gpa, pb, deps.map, .{
+    return (image.bake(gpa, gpa, pb, deps.map, .{
         .known_packages = report.known_packages.items,
         .binding_fqns = report.binding_fqns.items,
     }) catch return null) orelse null;

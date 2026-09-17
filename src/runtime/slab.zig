@@ -13,6 +13,11 @@
 //! One spinlock per size class guards that class's partial-slab list, and one
 //! per large class its parked blocks. A lock is never held across a GC safe
 //! point.
+//!
+//! The state is a `Heap`. The process allocates from `main_heap` through
+//! `allocator`; a phase whose every allocation dies together, such as the
+//! stdlib build a cold run bakes into an image, takes `buildHeap()` and drops
+//! it with `releaseAll` in a handful of unmaps, no per-cell frees.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -54,6 +59,9 @@ const FreeCell = struct { next: ?*FreeCell };
 
 const SlabHeader = struct {
     class_idx: u32,
+    /// The heap the slab belongs to; a free through another heap's allocator
+    /// is a caller mixing allocators, caught in a debug build.
+    heap_id: u8,
     total: u32, // cells in this slab
     free_count: u32, // cells on `free_head` plus the untouched run, dormant ones excluded
     cell_size: u32,
@@ -101,11 +109,107 @@ const SpinLock = struct {
     }
 };
 
-var class_states: [class_sizes.len]ClassState = blk: {
-    var s: [class_sizes.len]ClassState = undefined;
-    for (&s) |*c| c.* = .{};
-    break :blk s;
+/// One allocator's whole state. Nothing in it is shared between heaps but the
+/// per-thread magazines, which index by `id`.
+pub const Heap = struct {
+    id: u8,
+    class_states: [class_sizes.len]ClassState = @splat(.{}),
+    large_classes: [large_class_count]LargeClass = @splat(.{}),
+    reserve_next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    reserve_end: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    reserve_lock: SpinLock = .{},
+    /// Every range this heap has mapped and not unmapped, kept only for a heap
+    /// that `releaseAll` will drop as a whole.
+    track_regions: bool = false,
+    regions: std.ArrayList(Region) = .empty,
+    regions_lock: SpinLock = .{},
+    /// Set by `releaseAll`: a free is then a no-op, an allocation a bug.
+    released: bool = false,
+    /// Bytes mapped by this heap now.
+    mapped: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    pub fn allocator(h: *Heap) Allocator {
+        return .{ .ptr = h, .vtable = &vtable };
+    }
 };
+
+const Region = gc.Range;
+
+/// Magazine slots: the process heap and the build heap.
+const MAX_HEAPS = 2;
+
+var main_heap: Heap = .{ .id = 0 };
+var build_heap: Heap = .{ .id = 1, .track_regions = true };
+var build_heap_taken: bool = false;
+
+/// The heap for a phase dropped whole: every allocation from it is gone after
+/// `releaseAll`, whatever still points at it. One at a time.
+pub fn buildHeap() *Heap {
+    std.debug.assert(!build_heap_taken);
+    build_heap_taken = true;
+    build_heap.released = false;
+    return &build_heap;
+}
+
+/// Unmaps everything `h` holds, in one pass over its regions, and resets it
+/// for the next taker. Frees into the heap afterwards are ignored, so a
+/// container the phase left behind may still `deinit`; an allocation is a bug.
+pub fn releaseAll(h: *Heap) void {
+    std.debug.assert(h.track_regions);
+    @atomicStore(bool, &h.released, true, .release);
+    // This thread's cached cells of the heap are about to vanish with it.
+    magazines[h.id] = @splat(.{});
+    h.regions_lock.lock();
+    // The collector's lists may still name cells minted on the heap.
+    gc.forgetRanges(h.regions.items);
+    var bytes: usize = 0;
+    for (h.regions.items) |r| {
+        const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(r.start);
+        std.posix.munmap(p[0..r.len]);
+        bytes += r.len;
+        _ = unmap_calls.fetchAdd(1, .monotonic);
+    }
+    const n = h.regions.items.len;
+    h.regions.clearRetainingCapacity();
+    h.regions_lock.unlock();
+    _ = mapped_bytes.fetchSub(bytes, .monotonic);
+    if (trace_enabled or census_enabled) std.debug.print("[slab] build heap released {d} bytes in {d} regions\n", .{ bytes, n });
+    const regions = h.regions;
+    h.* = .{ .id = h.id, .track_regions = h.track_regions, .regions = regions };
+    if (h == &build_heap) build_heap_taken = false;
+}
+
+/// Bytes the build heap holds now, for the traces.
+pub fn buildHeapMapped() usize {
+    return build_heap.mapped.load(.monotonic);
+}
+
+fn regionsAdd(h: *Heap, start: usize, len: usize) void {
+    h.regions_lock.lock();
+    defer h.regions_lock.unlock();
+    h.regions.append(std.heap.page_allocator, .{ .start = start, .len = len }) catch {};
+}
+
+/// Takes `[start, start+len)` out of the region that holds it.
+fn regionsRemove(h: *Heap, start: usize, len: usize) void {
+    h.regions_lock.lock();
+    defer h.regions_lock.unlock();
+    for (h.regions.items, 0..) |*r, i| {
+        if (start < r.start or start + len > r.start + r.len) continue;
+        const left: Region = .{ .start = r.start, .len = start - r.start };
+        const right: Region = .{ .start = start + len, .len = (r.start + r.len) - (start + len) };
+        if (left.len != 0) {
+            r.* = left;
+            if (right.len != 0) h.regions.append(std.heap.page_allocator, right) catch {};
+        } else if (right.len != 0) {
+            r.* = right;
+        } else {
+            _ = h.regions.swapRemove(i);
+        }
+        return;
+    }
+    std.debug.assert(false); // an unmap of memory this heap never mapped
+}
 
 /// `KLIO_SLAB_STAT`: bytes currently mapped from the OS. Independent of the
 /// GC's cell accounting, so growth against a flat live set is a non-cell leak.
@@ -253,7 +357,7 @@ inline fn isSmall(len: usize, alignment: Alignment) bool {
 }
 
 
-fn mapRaw(size: usize) ?[]align(std.heap.page_size_min) u8 {
+fn mapRaw(h: *Heap, size: usize) ?[]align(std.heap.page_size_min) u8 {
     const m = std.posix.mmap(
         null,
         size,
@@ -263,7 +367,9 @@ fn mapRaw(size: usize) ?[]align(std.heap.page_size_min) u8 {
         0,
     ) catch return null;
     _ = mapped_bytes.fetchAdd(size, .monotonic);
+    _ = h.mapped.fetchAdd(size, .monotonic);
     _ = map_calls.fetchAdd(1, .monotonic);
+    if (h.track_regions) regionsAdd(h, @intFromPtr(m.ptr), size);
     // Track only post-startup mmaps; `KLIO_SLAB_TRACE_ALL` drops the gate.
     if (trace_enabled and (gc.program_started or trace_all)) traceNote(@intFromPtr(m.ptr), size);
     if (map_sites_enabled) noteMapSite(size);
@@ -315,11 +421,112 @@ pub fn mapSitesReport() void {
     }
 }
 
-fn unmapRaw(ptr: [*]u8, size: usize) void {
+// `KLIO_SLAB_CENSUS`: every allocation from process start, small cell or
+// large block, charged to its calling site and credited back on free, so the
+// report lists what is live at the end by the code that allocated it. The
+// map-site tracer counts maps; this counts bytes still held.
+pub var census_enabled: bool = false;
+const CENSUS_FRAMES = 14;
+const CensusSite = struct {
+    addrs: [CENSUS_FRAMES]usize,
+    n: usize,
+    live_bytes: usize,
+    live_count: usize,
+    total_bytes: usize,
+    total_count: usize,
+};
+const CensusCell = struct { site: u32, len: usize };
+var census_sites: std.ArrayList(CensusSite) = .empty;
+var census_index: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+var census_cells: std.AutoHashMapUnmanaged(usize, CensusCell) = .empty;
+var census_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn censusLock() void {
+    while (census_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+}
+fn censusUnlock() void {
+    census_lock.store(false, .release);
+}
+
+fn censusNote(ptr: usize, len: usize) void {
+    var addrs: [CENSUS_FRAMES]usize = undefined;
+    const st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &addrs);
+    const n = st.return_addresses.len;
+    const key = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(addrs[0..n]));
+    censusLock();
+    defer censusUnlock();
+    const gop = census_index.getOrPut(std.heap.page_allocator, key) catch return;
+    if (!gop.found_existing) {
+        gop.value_ptr.* = @intCast(census_sites.items.len);
+        census_sites.append(std.heap.page_allocator, .{ .addrs = addrs, .n = n, .live_bytes = 0, .live_count = 0, .total_bytes = 0, .total_count = 0 }) catch return;
+    }
+    const site = &census_sites.items[gop.value_ptr.*];
+    site.live_bytes += len;
+    site.live_count += 1;
+    site.total_bytes += len;
+    site.total_count += 1;
+    census_cells.put(std.heap.page_allocator, ptr, .{ .site = gop.value_ptr.*, .len = len }) catch {};
+}
+
+fn censusForget(ptr: usize) void {
+    censusLock();
+    defer censusUnlock();
+    const kv = census_cells.fetchRemove(ptr) orelse return;
+    const site = &census_sites.items[kv.value.site];
+    site.live_bytes -= kv.value.len;
+    site.live_count -= 1;
+}
+
+fn censusResize(ptr: usize, new_len: usize) void {
+    censusLock();
+    defer censusUnlock();
+    const c = census_cells.getPtr(ptr) orelse return;
+    const site = &census_sites.items[c.site];
+    site.live_bytes = site.live_bytes - c.len + new_len;
+    c.len = new_len;
+}
+
+/// `KLIO_SLAB_CENSUS=churn` orders the report by bytes allocated over the
+/// run instead of bytes still live, for the sites that turn memory over.
+pub var census_by_churn: bool = false;
+
+pub fn censusReport() void {
+    if (!census_enabled) return;
+    censusLock();
+    const sites = census_sites.items;
+    censusUnlock();
+    std.sort.pdq(CensusSite, sites, {}, struct {
+        fn lt(_: void, x: CensusSite, y: CensusSite) bool {
+            if (census_by_churn) return x.total_bytes > y.total_bytes;
+            return x.live_bytes > y.live_bytes;
+        }
+    }.lt);
+    var live: usize = 0;
+    var live_n: usize = 0;
+    var total: usize = 0;
+    for (sites) |*s| {
+        live += s.live_bytes;
+        live_n += s.live_count;
+        total += s.total_bytes;
+    }
+    std.debug.print("[census] live {d} bytes in {d} allocations, {d} bytes allocated in all, {d} sites\n", .{ live, live_n, total, sites.len });
+    var shown: usize = 0;
+    for (sites) |*s| {
+        if (shown >= 6000 or (if (census_by_churn) s.total_bytes < 256 * 1024 else s.live_bytes < 2 * 1024)) break;
+        shown += 1;
+        std.debug.print("\n[census] live {d} bytes in {d} allocations (allocated {d} in {d}):\n", .{ s.live_bytes, s.live_count, s.total_bytes, s.total_count });
+        const st: std.debug.StackTrace = .{ .return_addresses = s.addrs[0..s.n], .skipped = .none };
+        trace.dump(&st);
+    }
+}
+
+fn unmapRaw(h: *Heap, ptr: [*]u8, size: usize) void {
     const aligned: [*]align(std.heap.page_size_min) u8 = @alignCast(ptr);
     if (trace_enabled) traceForget(@intFromPtr(ptr));
+    if (h.track_regions) regionsRemove(h, @intFromPtr(ptr), size);
     std.posix.munmap(aligned[0..size]);
     _ = mapped_bytes.fetchSub(size, .monotonic);
+    _ = h.mapped.fetchSub(size, .monotonic);
     _ = unmap_calls.fetchAdd(1, .monotonic);
 }
 
@@ -348,11 +555,6 @@ const large_class_count = std.math.log2_int(usize, LARGE_MAX / LARGE_MIN) + 1;
 /// resident.
 const LargeBlock = struct { next: ?*LargeBlock, idle_passes: u8 };
 const LargeClass = struct { lock: SpinLock = .{}, head: ?*LargeBlock = null, count: u32 = 0 };
-var large_classes: [large_class_count]LargeClass = blk: {
-    var s: [large_class_count]LargeClass = undefined;
-    for (&s) |*c| c.* = .{};
-    break :blk s;
-};
 
 /// Null above `LARGE_MAX`: that block maps and unmaps directly.
 inline fn largeClass(len: usize) ?usize {
@@ -370,12 +572,12 @@ inline fn largeExtent(len: usize) usize {
     return if (largeClass(len)) |ci| largeClassSize(ci) else pageUp(len);
 }
 
-fn allocLarge(len: usize) ?[*]u8 {
+fn allocLarge(h: *Heap, len: usize) ?[*]u8 {
     const ci = largeClass(len) orelse {
-        const m = mapRaw(pageUp(len)) orelse return null;
+        const m = mapRaw(h, pageUp(len)) orelse return null;
         return m.ptr;
     };
-    const lc = &large_classes[ci];
+    const lc = &h.large_classes[ci];
     {
         lc.lock.lock();
         defer lc.lock.unlock();
@@ -385,16 +587,16 @@ fn allocLarge(len: usize) ?[*]u8 {
             return @ptrCast(b);
         }
     }
-    const m = mapRaw(largeClassSize(ci)) orelse return null;
+    const m = mapRaw(h, largeClassSize(ci)) orelse return null;
     return m.ptr;
 }
 
-fn freeLarge(ptr: [*]u8, len: usize) void {
+fn freeLarge(h: *Heap, ptr: [*]u8, len: usize) void {
     const ci = largeClass(len) orelse {
-        unmapRaw(ptr, pageUp(len));
+        unmapRaw(h, ptr, pageUp(len));
         return;
     };
-    const lc = &large_classes[ci];
+    const lc = &h.large_classes[ci];
     const b: *LargeBlock = @ptrCast(@alignCast(ptr));
     lc.lock.lock();
     defer lc.lock.unlock();
@@ -404,8 +606,8 @@ fn freeLarge(ptr: [*]u8, len: usize) void {
 }
 
 /// Ages parked large blocks and unmaps those idle for `idle_passes`.
-fn reclaimLarge(idle_passes: u32) void {
-    for (&large_classes, 0..) |*lc, ci| {
+fn reclaimLarge(h: *Heap, idle_passes: u32) void {
+    for (&h.large_classes, 0..) |*lc, ci| {
         lc.lock.lock();
         defer lc.lock.unlock();
         var keep: ?*LargeBlock = null;
@@ -415,7 +617,7 @@ fn reclaimLarge(idle_passes: u32) void {
             const next = blk.next;
             blk.idle_passes +|= 1;
             if (blk.idle_passes >= idle_passes) {
-                unmapRaw(@ptrCast(blk), largeClassSize(ci));
+                unmapRaw(h, @ptrCast(blk), largeClassSize(ci));
             } else {
                 blk.next = keep;
                 keep = blk;
@@ -429,9 +631,9 @@ fn reclaimLarge(idle_passes: u32) void {
 }
 
 /// Bytes parked on the large-block lists.
-fn largeParked() usize {
+fn largeParked(h: *Heap) usize {
     var total: usize = 0;
-    for (&large_classes, 0..) |*lc, ci| {
+    for (&h.large_classes, 0..) |*lc, ci| {
         lc.lock.lock();
         defer lc.lock.unlock();
         total += @as(usize, lc.count) * largeClassSize(ci);
@@ -440,14 +642,14 @@ fn largeParked() usize {
 }
 
 /// Over-maps `len` bytes and trims the unaligned head and tail.
-fn mapAligned(len: usize) ?usize {
-    const over = mapRaw(len + SLAB) orelse return null;
+fn mapAligned(h: *Heap, len: usize) ?usize {
+    const over = mapRaw(h, len + SLAB) orelse return null;
     const base = @intFromPtr(over.ptr);
     const aligned = std.mem.alignForward(usize, base, SLAB);
     const head = aligned - base;
-    if (head != 0) unmapRaw(over.ptr, head);
+    if (head != 0) unmapRaw(h, over.ptr, head);
     const tail = (base + over.len) - (aligned + len);
-    if (tail != 0) unmapRaw(@ptrFromInt(aligned + len), tail);
+    if (tail != 0) unmapRaw(h, @ptrFromInt(aligned + len), tail);
     return aligned;
 }
 
@@ -456,40 +658,38 @@ fn mapAligned(len: usize) ?usize {
 // trims. The reserve's unused tail is mapped but never touched, so it holds
 // address space and no memory; a slab unmapped later splits the region.
 const RESERVE_SLABS: usize = 16;
-var reserve_next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
-var reserve_end: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
-var reserve_lock: SpinLock = .{};
 
-fn mapSlabRegion() ?*SlabHeader {
+fn mapSlabRegion(h: *Heap) ?*SlabHeader {
     while (true) {
-        const next = reserve_next.load(.acquire);
-        if (next < reserve_end.load(.acquire)) {
-            if (reserve_next.cmpxchgWeak(next, next + SLAB, .acq_rel, .acquire) == null) return @ptrFromInt(next);
+        const next = h.reserve_next.load(.acquire);
+        if (next < h.reserve_end.load(.acquire)) {
+            if (h.reserve_next.cmpxchgWeak(next, next + SLAB, .acq_rel, .acquire) == null) return @ptrFromInt(next);
             continue;
         }
-        reserve_lock.lock();
-        defer reserve_lock.unlock();
-        if (reserve_next.load(.acquire) < reserve_end.load(.acquire)) continue;
-        const region = mapAligned(RESERVE_SLABS * SLAB) orelse return null;
-        reserve_end.store(region + RESERVE_SLABS * SLAB, .release);
-        reserve_next.store(region + SLAB, .release);
+        h.reserve_lock.lock();
+        defer h.reserve_lock.unlock();
+        if (h.reserve_next.load(.acquire) < h.reserve_end.load(.acquire)) continue;
+        const region = mapAligned(h, RESERVE_SLABS * SLAB) orelse return null;
+        h.reserve_end.store(region + RESERVE_SLABS * SLAB, .release);
+        h.reserve_next.store(region + SLAB, .release);
         return @ptrFromInt(region);
     }
 }
 
 /// Bytes of the reserve mapped but not yet carved into a slab.
-fn reserveUnused() usize {
-    return reserve_end.load(.acquire) -| reserve_next.load(.acquire);
+fn reserveUnused(h: *Heap) usize {
+    return h.reserve_end.load(.acquire) -| h.reserve_next.load(.acquire);
 }
 
-fn newSlab(class_idx: usize) ?*SlabHeader {
-    const s = mapSlabRegion() orelse return null;
+fn newSlab(h: *Heap, class_idx: usize) ?*SlabHeader {
+    const s = mapSlabRegion(h) orelse return null;
     const cell_size = class_sizes[class_idx];
     const data_start = std.mem.alignForward(usize, @intFromPtr(s) + @sizeOf(SlabHeader), CELL_ALIGN);
     const data_end = @intFromPtr(s) + SLAB;
     const total: u32 = @intCast((data_end - data_start) / cell_size);
     s.* = .{
         .class_idx = @intCast(class_idx),
+        .heap_id = h.id,
         .total = total,
         .free_count = total,
         .cell_size = @intCast(cell_size),
@@ -526,7 +726,7 @@ fn unlinkPartial(cs: *ClassState, slab: *SlabHeader) void {
 
 /// Cells came back to a slab: relink one that was off the list as full, and
 /// park one that is now wholly free. Caller holds the lock.
-fn noteCellsReturned(cs: *ClassState, slab: *SlabHeader, was_full: bool) void {
+fn noteCellsReturned(h: *Heap, cs: *ClassState, slab: *SlabHeader, was_full: bool) void {
     if (was_full) {
         slab.prev = null;
         slab.next = cs.partial;
@@ -545,19 +745,19 @@ fn noteCellsReturned(cs: *ClassState, slab: *SlabHeader, was_full: bool) void {
             cs.spare = slab;
             cs.spare_count += 1;
         } else {
-            unmapRaw(@ptrCast(slab), SLAB);
+            unmapRaw(h, @ptrCast(slab), SLAB);
         }
     }
 }
 
 /// The parked spare before a freshly mapped slab. Caller holds the lock.
-fn takeFrontier(cs: *ClassState, ci: usize) ?*SlabHeader {
+fn takeFrontier(h: *Heap, cs: *ClassState, ci: usize) ?*SlabHeader {
     const s = if (cs.spare) |sp| blk: {
         cs.spare = sp.next;
         cs.spare_count -= 1;
         sp.idle_passes = 0;
         break :blk sp;
-    } else newSlab(ci) orelse return null;
+    } else newSlab(h, ci) orelse return null;
     s.prev = null;
     s.next = cs.partial;
     if (cs.partial) |p| p.prev = s;
@@ -567,8 +767,8 @@ fn takeFrontier(cs: *ClassState, ci: usize) ?*SlabHeader {
 
 /// The head slab with a cell to give, reviving dormant pages before mapping
 /// fresh memory so the address space stays bounded. Caller holds the lock.
-fn frontierSlab(cs: *ClassState, ci: usize) ?*SlabHeader {
-    var slab = cs.partial orelse takeFrontier(cs, ci) orelse return null;
+fn frontierSlab(h: *Heap, cs: *ClassState, ci: usize) ?*SlabHeader {
+    var slab = cs.partial orelse takeFrontier(h, cs, ci) orelse return null;
     while (slab.free_head == null and slab.bump == slab.total) {
         if (slab.dormant_pages != 0) {
             _ = reviveOnePage(slab, class_sizes[ci], std.heap.pageSize());
@@ -577,7 +777,7 @@ fn frontierSlab(cs: *ClassState, ci: usize) ?*SlabHeader {
         cs.partial = slab.next;
         if (slab.next) |n| n.prev = null;
         slab.next = null;
-        slab = cs.partial orelse takeFrontier(cs, ci) orelse return null;
+        slab = cs.partial orelse takeFrontier(h, cs, ci) orelse return null;
     }
     return slab;
 }
@@ -592,8 +792,8 @@ inline fn noteCellsTaken(cs: *ClassState, slab: *SlabHeader) void {
     }
 }
 
-fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
-    const slab = frontierSlab(cs, ci) orelse return null;
+fn allocLockedOne(h: *Heap, cs: *ClassState, ci: usize) ?[*]u8 {
+    const slab = frontierSlab(h, cs, ci) orelse return null;
     const cell: [*]u8 = if (slab.free_head) |c| blk: {
         slab.free_head = c.next;
         break :blk @ptrCast(c);
@@ -611,8 +811,8 @@ fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
 /// cells taken from the head slab in one step, threaded to nothing. False
 /// when the head has freed cells, which are resident and come first, or no
 /// untouched cells left; the caller then pops its free list.
-fn takeRunLocked(cs: *ClassState, ci: usize, run: *Run) bool {
-    const slab = frontierSlab(cs, ci) orelse return false;
+fn takeRunLocked(h: *Heap, cs: *ClassState, ci: usize, run: *Run) bool {
+    const slab = frontierSlab(h, cs, ci) orelse return false;
     if (slab.free_head != null) return false;
     const left = slab.total - slab.bump;
     if (left == 0) return false;
@@ -627,7 +827,7 @@ fn takeRunLocked(cs: *ClassState, ci: usize, run: *Run) bool {
 
 /// Hands an unused run back: retracted when it is still the slab's frontier,
 /// threaded onto the free list otherwise. Caller holds the lock.
-fn returnRunLocked(cs: *ClassState, run: *Run) void {
+fn returnRunLocked(h: *Heap, cs: *ClassState, run: *Run) void {
     if (run.next == run.end) return;
     const slab = slabOf(@ptrFromInt(run.next));
     const was_full = slab.free_count == 0 and slab.dormant_pages == 0;
@@ -645,10 +845,10 @@ fn returnRunLocked(cs: *ClassState, run: *Run) void {
         slab.free_count += n;
     }
     run.* = .{};
-    noteCellsReturned(cs, slab, was_full);
+    noteCellsReturned(h, cs, slab, was_full);
 }
 
-fn freeLockedOne(ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
+fn freeLockedOne(h: *Heap, ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
     // A slab is off the partial list only when truly full: no free cell and no
     // dormant page. A reclaim pass can leave `free_count == 0` on a linked slab,
     // so re-linking on `free_count` alone would cycle the list.
@@ -657,7 +857,7 @@ fn freeLockedOne(ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
     cell.next = slab.free_head;
     slab.free_head = cell;
     slab.free_count += 1;
-    noteCellsReturned(cs, slab, was_full);
+    noteCellsReturned(h, cs, slab, was_full);
 }
 
 // Per-thread magazines: taking the class spinlock on every alloc and free
@@ -691,37 +891,44 @@ const Run = struct { next: usize = 0, end: usize = 0 };
 
 const Magazine = struct { head: ?*FreeCell = null, count: u16 = 0, run: Run = .{} };
 
-threadlocal var magazines: [class_sizes.len]Magazine = @splat(.{});
+threadlocal var magazines: [MAX_HEAPS][class_sizes.len]Magazine = @splat(@splat(.{}));
 
 /// Called at worker-thread exit so a dead thread strands nothing.
 pub fn flushMagazines() void {
-    for (&magazines, 0..) |*mag, ci| {
-        if (mag.head == null and mag.run.next == mag.run.end) continue;
-        const cs = &class_states[ci];
-        cs.lock.lock();
-        defer cs.lock.unlock();
-        while (mag.head) |cell| {
-            mag.head = cell.next;
-            freeLockedOne(@ptrCast(cell), slabOf(@ptrCast(cell)), cs);
+    inline for (.{ &main_heap, &build_heap }) |h| {
+        for (&magazines[h.id], 0..) |*mag, ci| {
+            if (mag.head == null and mag.run.next == mag.run.end) continue;
+            // A released heap took its cells with it.
+            if (@atomicLoad(bool, &h.released, .acquire)) {
+                mag.* = .{};
+                continue;
+            }
+            const cs = &h.class_states[ci];
+            cs.lock.lock();
+            defer cs.lock.unlock();
+            while (mag.head) |cell| {
+                mag.head = cell.next;
+                freeLockedOne(h, @ptrCast(cell), slabOf(@ptrCast(cell)), cs);
+            }
+            mag.count = 0;
+            returnRunLocked(h, cs, &mag.run);
         }
-        mag.count = 0;
-        returnRunLocked(cs, &mag.run);
     }
 }
 
-fn allocSmall(len: usize) ?[*]u8 {
+fn allocSmall(h: *Heap, len: usize) ?[*]u8 {
     const ci = classIndex(len);
-    const cs = &class_states[ci];
+    const cs = &h.class_states[ci];
     // A magazine round-trip would be invisible to the per-address cell tracer.
     if (cell_trace_enabled) {
         cs.lock.lock();
         defer cs.lock.unlock();
-        const cell = allocLockedOne(cs, ci) orelse return null;
+        const cell = allocLockedOne(h, cs, ci) orelse return null;
         // Sample 1 address in 256, deterministically so free's remove agrees.
         if (gc.program_started and (@intFromPtr(cell) & 0xff) == 0) cellTraceNote(ci, @intFromPtr(cell), len);
         return cell;
     }
-    const mag = &magazines[ci];
+    const mag = &magazines[h.id][ci];
     if (mag.head) |cell| {
         mag.head = cell.next;
         mag.count -= 1;
@@ -734,15 +941,15 @@ fn allocSmall(len: usize) ?[*]u8 {
     }
     cs.lock.lock();
     defer cs.lock.unlock();
-    if (takeRunLocked(cs, ci, &mag.run)) {
+    if (takeRunLocked(h, cs, ci, &mag.run)) {
         const cell: [*]u8 = @ptrFromInt(mag.run.next);
         mag.run.next += class_sizes[ci];
         return cell;
     }
-    const first = allocLockedOne(cs, ci) orelse return null;
+    const first = allocLockedOne(h, cs, ci) orelse return null;
     var want: u16 = mag_caps[ci] / 2;
     while (want > 0) : (want -= 1) {
-        const extra = allocLockedOne(cs, ci) orelse break;
+        const extra = allocLockedOne(h, cs, ci) orelse break;
         const cell: *FreeCell = @ptrCast(@alignCast(extra));
         cell.next = mag.head;
         mag.head = cell;
@@ -755,23 +962,24 @@ fn allocSmall(len: usize) ?[*]u8 {
 /// sees garbage at once instead of the old contents.
 pub var poison_free: bool = false;
 
-fn freeSmall(ptr: [*]u8) void {
+fn freeSmall(h: *Heap, ptr: [*]u8) void {
     const slab = slabOf(ptr);
     const ci = slab.class_idx;
-    const cs = &class_states[ci];
+    const cs = &h.class_states[ci];
     if (builtin.mode == .Debug) {
         const data_start = std.mem.alignForward(usize, @intFromPtr(slab) + @sizeOf(SlabHeader), CELL_ALIGN);
         std.debug.assert((@intFromPtr(ptr) - data_start) % slab.cell_size == 0);
+        std.debug.assert(slab.heap_id == h.id);
     }
     if (poison_free) @memset(ptr[0..slab.cell_size], 0xAA);
     if (cell_trace_enabled) {
         cs.lock.lock();
         defer cs.lock.unlock();
         if ((@intFromPtr(ptr) & 0xff) == 0) _ = class_trace[ci].map.remove(@intFromPtr(ptr));
-        freeLockedOne(ptr, slab, cs);
+        freeLockedOne(h, ptr, slab, cs);
         return;
     }
-    const mag = &magazines[ci];
+    const mag = &magazines[h.id][ci];
     if (mag.count < mag_caps[ci]) {
         const cell: *FreeCell = @ptrCast(@alignCast(ptr));
         cell.next = mag.head;
@@ -781,13 +989,13 @@ fn freeSmall(ptr: [*]u8) void {
     }
     cs.lock.lock();
     defer cs.lock.unlock();
-    freeLockedOne(ptr, slab, cs);
+    freeLockedOne(h, ptr, slab, cs);
     var drain: u16 = mag_caps[ci] / 2;
     while (drain > 0) : (drain -= 1) {
         const cell = mag.head orelse break;
         mag.head = cell.next;
         mag.count -= 1;
-        freeLockedOne(@ptrCast(cell), slabOf(@ptrCast(cell)), cs);
+        freeLockedOne(h, @ptrCast(cell), slabOf(@ptrCast(cell)), cs);
     }
 }
 
@@ -937,11 +1145,16 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
 /// free and dormant cells, and the parked spares. A full span is off every
 /// list, so what is not counted here is live.
 pub fn occupancyReport() void {
+    heapOccupancyReport(&main_heap);
+    if (build_heap_taken) heapOccupancyReport(&build_heap);
+}
+
+fn heapOccupancyReport(h: *Heap) void {
     var free_total: usize = 0;
     var dormant_total: usize = 0;
     var spare_total: usize = 0;
-    std.debug.print("[slab] class  cell  partial   free-cells  dormant  spare\n", .{});
-    for (&class_states, 0..) |*cs, ci| {
+    std.debug.print("[slab] heap {d}: class  cell  partial   free-cells  dormant  spare\n", .{h.id});
+    for (&h.class_states, 0..) |*cs, ci| {
         cs.lock.lock();
         defer cs.lock.unlock();
         var partial: usize = 0;
@@ -960,9 +1173,9 @@ pub fn occupancyReport() void {
         dormant_total += dormant * sz;
         spare_total += @as(usize, cs.spare_count) * SLAB;
     }
-    const mapped = mapped_bytes.load(.monotonic);
-    const reserve = reserveUnused();
-    const parked_large = largeParked();
+    const mapped = h.mapped.load(.monotonic);
+    const reserve = reserveUnused(h);
+    const parked_large = largeParked(h);
     std.debug.print("[slab] mapped {d}kb: free {d}kb, dormant {d}kb, spare {d}kb, reserve {d}kb, parked large {d}kb, live+headers {d}kb\n", .{
         mapped / 1024,
         free_total / 1024,
@@ -976,21 +1189,21 @@ pub fn occupancyReport() void {
 
 /// The GC's `release_to_os` hook, run stop-the-world after a sweep.
 pub fn reclaimDormant() void {
-    reclaimWith(RECLAIM_IDLE_PASSES);
+    reclaimWith(&main_heap, RECLAIM_IDLE_PASSES);
 }
 
 /// One-off trim between two phases of a run (the program build and its
 /// execution): the build's burst of scratch is not coming back, so every
 /// parked spare goes now instead of ageing out over later collections.
 pub fn reclaimAll() void {
-    reclaimWith(1);
+    reclaimWith(&main_heap, 1);
 }
 
-fn reclaimWith(idle_passes: u32) void {
-    reclaimLarge(idle_passes);
+fn reclaimWith(h: *Heap, idle_passes: u32) void {
+    reclaimLarge(h, idle_passes);
     const pg = std.heap.pageSize();
     if (SLAB / pg > MAX_PAGES) return; // runtime page larger than the scan bound
-    for (&class_states, 0..) |*cs, ci| {
+    for (&h.class_states, 0..) |*cs, ci| {
         cs.lock.lock();
         defer cs.lock.unlock();
         // Dropping every parked spare here would make each collection of a
@@ -1002,7 +1215,7 @@ fn reclaimWith(idle_passes: u32) void {
             const next = s.next;
             s.idle_passes +|= 1;
             if (s.idle_passes >= idle_passes) {
-                unmapRaw(@ptrCast(s), SLAB);
+                unmapRaw(h, @ptrCast(s), SLAB);
             } else {
                 s.next = keep;
                 keep = s;
@@ -1023,14 +1236,29 @@ fn reclaimWith(idle_passes: u32) void {
 }
 
 
-fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
-    if (len == 0) return null;
-    if (isSmall(len, alignment)) return allocSmall(len);
-    return allocLarge(len);
+inline fn heapOf(ctx: *anyopaque) *Heap {
+    return @ptrCast(@alignCast(ctx));
 }
 
-fn resize(_: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, _: usize) bool {
+fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
+    if (len == 0) return null;
+    const h = heapOf(ctx);
+    std.debug.assert(!h.released);
+    const p = (if (isSmall(len, alignment)) allocSmall(h, len) else allocLarge(h, len)) orelse return null;
+    if (census_enabled) censusNote(@intFromPtr(p), len);
+    return p;
+}
+
+fn resize(ctx: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+    const ok = resizeInner(ctx, buf, alignment, new_len, ret_addr);
+    if (ok and census_enabled) censusResize(@intFromPtr(buf.ptr), new_len);
+    return ok;
+}
+
+fn resizeInner(ctx: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, _: usize) bool {
     if (new_len == 0) return false;
+    const h = heapOf(ctx);
+    if (h.released) return false;
     if (isSmall(buf.len, alignment)) {
         // `free` keys on the requested length, so the class must not change.
         if (!isSmall(new_len, alignment)) return false;
@@ -1047,7 +1275,7 @@ fn resize(_: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, _: usi
     // worst case and settled smaller neither copies nor remaps. A block
     // shrinking out of the classes would change what `free` does with it.
     if (largeClass(buf.len) == null and largeClass(new_len) != null) return false;
-    unmapRaw(buf.ptr + new_extent, old_extent - new_extent);
+    unmapRaw(h, buf.ptr + new_extent, old_extent - new_extent);
     return true;
 }
 
@@ -1060,12 +1288,16 @@ fn remap(ctx: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, ret_a
     return if (resize(ctx, buf, alignment, new_len, ret_addr)) buf.ptr else null;
 }
 
-fn free(_: *anyopaque, buf: []u8, alignment: Alignment, _: usize) void {
+fn free(ctx: *anyopaque, buf: []u8, alignment: Alignment, _: usize) void {
     if (buf.len == 0) return;
+    const h = heapOf(ctx);
+    // A container the released phase left behind may still deinit.
+    if (@atomicLoad(bool, &h.released, .acquire)) return;
+    if (census_enabled) censusForget(@intFromPtr(buf.ptr));
     if (isSmall(buf.len, alignment)) {
-        freeSmall(buf.ptr);
+        freeSmall(h, buf.ptr);
     } else {
-        freeLarge(buf.ptr, buf.len);
+        freeLarge(h, buf.ptr, buf.len);
     }
 }
 
@@ -1076,8 +1308,40 @@ const vtable: Allocator.VTable = .{
     .free = free,
 };
 
-/// Stateless, so one shared instance serves every thread.
-pub const allocator: Allocator = .{ .ptr = undefined, .vtable = &vtable };
+/// The process heap, shared by every thread.
+pub const allocator: Allocator = .{ .ptr = &main_heap, .vtable = &vtable };
+
+test "build heap: allocations die together on release, later frees are no-ops" {
+    const T = std.testing;
+    const h = buildHeap();
+    const a = h.allocator();
+    const before = mapped_bytes.load(.monotonic);
+    const small = try a.alloc(u8, 100);
+    const large = try a.alloc(u8, 3 * 1024 * 1024);
+    const huge = try a.alloc(u8, LARGE_MAX + 4096);
+    @memset(small, 1);
+    @memset(large, 2);
+    @memset(huge, 3);
+    try T.expect(h.mapped.load(.monotonic) >= 3 * 1024 * 1024 + LARGE_MAX);
+    try T.expect(h.regions.items.len >= 3);
+    // Freeing the direct map splits nothing but drops its region.
+    const regions_before = h.regions.items.len;
+    a.free(huge);
+    try T.expectEqual(regions_before - 1, h.regions.items.len);
+    releaseAll(h);
+    try T.expect(h.released == false); // reset for the next taker
+    try T.expectEqual(@as(usize, 0), h.mapped.load(.monotonic));
+    try T.expectEqual(@as(usize, 0), h.regions.items.len);
+    try T.expectEqual(before, mapped_bytes.load(.monotonic));
+    // A container the phase left behind may still free into it.
+    const h2 = buildHeap();
+    const a2 = h2.allocator();
+    const cell = try a2.alloc(u8, 64);
+    @atomicStore(bool, &h2.released, true, .release);
+    a2.free(cell);
+    @atomicStore(bool, &h2.released, false, .release);
+    releaseAll(h2);
+}
 
 test "slab alloc/free round-trips across classes and frees slabs" {
     const a = allocator;
@@ -1127,7 +1391,7 @@ test "slab spare stack parks freed slabs and ages them out across reclaim passes
     const T = std.testing;
     flushMagazines();
     const ci = classIndex(2048);
-    const cs = &class_states[ci];
+    const cs = &main_heap.class_states[ci];
     // Every fully-free slab parks, so a multi-slab burst parks more than one.
     const N = 400; // about 128 cells per 256K slab at 2 KiB, so several slabs
     var bufs: [N][]u8 = undefined;
@@ -1197,7 +1461,7 @@ test "slab refill takes an untouched run and a flush gives it back" {
     const T = std.testing;
     flushMagazines();
     const ci = classIndex(3584);
-    const cs = &class_states[ci];
+    const cs = &main_heap.class_states[ci];
     const p1 = try a.alloc(u8, 3584);
     const p2 = try a.alloc(u8, 3584);
     // Consecutive cells of one run, taken from the slab in one step.
@@ -1227,19 +1491,19 @@ test "slab refill takes an untouched run and a flush gives it back" {
         defer cs.lock.unlock();
         var r1: Run = .{};
         var r2: Run = .{};
-        try T.expect(!takeRunLocked(cs, ci, &r1)); // freed cells come first
-        const s = frontierSlab(cs, ci).?;
+        try T.expect(!takeRunLocked(&main_heap, cs, ci, &r1)); // freed cells come first
+        const s = frontierSlab(&main_heap, cs, ci).?;
         try T.expectEqual(slab, s);
         s.free_head = null;
         s.free_count -= 2;
-        try T.expect(takeRunLocked(cs, ci, &r1));
-        try T.expect(takeRunLocked(cs, ci, &r2));
+        try T.expect(takeRunLocked(&main_heap, cs, ci, &r1));
+        try T.expect(takeRunLocked(&main_heap, cs, ci, &r2));
         try T.expectEqual(r1.end, r2.next);
         const bump_after = s.bump;
-        returnRunLocked(cs, &r1);
+        returnRunLocked(&main_heap, cs, &r1);
         try T.expectEqual(bump_after, s.bump);
         try T.expectEqual(run_cells[ci], s.free_count - (s.total - s.bump));
-        returnRunLocked(cs, &r2);
+        returnRunLocked(&main_heap, cs, &r2);
         try T.expectEqual(bump_after - run_cells[ci], s.bump);
     }
 }
@@ -1249,7 +1513,7 @@ test "slab parks a freed large block for its class and the reclaim pass ages it 
     const T = std.testing;
     const ci = largeClass(100 * 1024).?;
     try T.expectEqual(@as(usize, 128 * 1024), largeClassSize(ci));
-    const lc = &large_classes[ci];
+    const lc = &main_heap.large_classes[ci];
     reclaimAll();
     const p1 = try a.alloc(u8, 100 * 1024);
     const addr = @intFromPtr(p1.ptr);
@@ -1268,9 +1532,9 @@ test "slab parks a freed large block for its class and the reclaim pass ages it 
     a.free(list);
     try T.expectEqual(@as(u32, 0), lc.count);
     const small_ci = largeClass(20 * 1024).?;
-    try T.expectEqual(@as(u32, 1), large_classes[small_ci].count);
+    try T.expectEqual(@as(u32, 1), main_heap.large_classes[small_ci].count);
     reclaimAll();
-    try T.expectEqual(@as(u32, 0), large_classes[small_ci].count);
+    try T.expectEqual(@as(u32, 0), main_heap.large_classes[small_ci].count);
     // Above the classes a block maps and unmaps directly.
     try T.expectEqual(@as(?usize, null), largeClass(LARGE_MAX + 1));
     const huge = try a.alloc(u8, LARGE_MAX + 1);

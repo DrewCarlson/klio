@@ -52,16 +52,20 @@ var reclaim_req_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0
 /// process env never changes mid-run.
 var env_cache_mutex: SpinMutex = .{};
 var env_cache: ?std.StringHashMap(?[]const u8) = null;
+/// The cache's keys and table share a few pages: a page per key mapped a
+/// fresh 16 KB for every variable the process ever asked about.
+var env_cache_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 pub fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
     if (comptime !@import("builtin").link_libc) return null;
     const key = std.mem.span(name);
     env_cache_mutex.lock();
     defer env_cache_mutex.unlock();
-    if (env_cache == null) env_cache = std.StringHashMap(?[]const u8).init(std.heap.page_allocator);
+    const a = env_cache_arena.allocator();
+    if (env_cache == null) env_cache = std.StringHashMap(?[]const u8).init(a);
     if (env_cache.?.get(key)) |cached| return cached;
     const value: ?[]const u8 = if (std.c.getenv(name)) |raw| std.mem.span(raw) else null;
-    const stable_key = std.heap.page_allocator.dupe(u8, key) catch return value;
+    const stable_key = a.dupe(u8, key) catch return value;
     env_cache.?.put(stable_key, value) catch {};
     return value;
 }

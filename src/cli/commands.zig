@@ -3505,6 +3505,7 @@ pub fn computeEagerCallsOpts(
         }
     }
     var out = std.AutoHashMap(span_mod.Span, span_mod.Span).init(gpa);
+    out.ensureTotalCapacity(tc.resolved_calls.count()) catch {};
     // Picks declared in a prebuilt image have no source span; they go by FuncId.
     var out_fids = std.AutoHashMap(span_mod.Span, u32).init(gpa);
     var it = tc.resolved_calls.iterator();
@@ -3545,6 +3546,7 @@ pub fn computeEagerCallsOpts(
     } else out_fids.deinit();
     // Only decisive heads enter: Function/TypeParam/Unresolved would override.
     var tout = std.AutoHashMap(span_mod.Span, ir.EagerTypeHead).init(gpa);
+    tout.ensureTotalCapacity(tc.types.count() + tc.expr_class.count()) catch {};
     var tit = tc.types.iterator();
     var tn: usize = 0;
     while (tit.next()) |e| {
@@ -3570,6 +3572,7 @@ pub fn computeEagerCallsOpts(
     if (audit) std.debug.print("[EAGER] {d} type heads recorded ({d} excluded as instantiation-dependent, {d} from class evidence)\n", .{ tn + cn_added, tc.types_instantiation_dependent.count(), cn_added });
     ir.pending_eager_types = tout;
     var rout = std.AutoHashMap(span_mod.Span, []const u8).init(gpa);
+    rout.ensureTotalCapacity(tc.lambda_recv_heads.count()) catch {};
     var rit = tc.lambda_recv_heads.iterator();
     while (rit.next()) |e| {
         const name = internName(gpa, &names, e.value_ptr.*) catch continue;
@@ -3578,6 +3581,7 @@ pub fn computeEagerCallsOpts(
     if (audit) std.debug.print("[EAGER] {d} lambda receiver heads recorded\n", .{rout.count()});
     ir.pending_eager_recv_heads = rout;
     var pout = std.AutoHashMap(span_mod.Span, ir.EagerParamShape).init(gpa);
+    pout.ensureTotalCapacity(tc.lambda_param_shapes.count()) catch {};
     var pit = tc.lambda_param_shapes.iterator();
     while (pit.next()) |e| pout.put(e.key_ptr.*, .{ .has_receiver = e.value_ptr.has_receiver, .arity = e.value_ptr.arity }) catch {};
     if (audit) std.debug.print("[EAGER] {d} param shapes recorded\n", .{pout.count()});
@@ -3644,6 +3648,7 @@ fn tryImagePath(
     const t_prep1 = runtime.clockMonotonicNanos();
     const msg = if (paths.len == 1) "error: no main function found" else "runtime error: no main function in module";
     const code = runBuiltModule(gpa, prepared.built, prepared.bindings, prepared.map, msg);
+    stdlib_image.finishBackgroundBake();
     if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
         std.debug.print("[run] startup {d}ms, prepare {d}ms, execute {d}ms (rss {d}mb)\n", .{
             (t_prep0 -| runtime.process_start_ns) / 1_000_000,

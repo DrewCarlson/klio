@@ -148,6 +148,69 @@ fn writeBarrierSlow(h: *GcHeader) void {
         @panic("KGC: remembered set allocation failed");
 }
 
+/// An address range about to be unmapped as a whole.
+pub const Range = struct { start: usize, len: usize };
+
+fn inRanges(ranges: []const Range, h: *GcHeader) bool {
+    const addr = @intFromPtr(h);
+    for (ranges) |r| {
+        if (addr >= r.start and addr < r.start + r.len) return true;
+    }
+    return false;
+}
+
+/// Unlinks every cell inside `ranges` from the collector's lists before the
+/// memory goes away under it: a build phase mints permanent cells and a store
+/// into one puts it on the remembered set, which the next collection would
+/// otherwise trace through freed memory.
+pub fn forgetRanges(ranges: []const Range) void {
+    {
+        remembered_lock.lock();
+        defer remembered_lock.unlock();
+        var i: usize = 0;
+        while (i < remembered.items.len) {
+            if (inRanges(ranges, remembered.items[i])) {
+                _ = remembered.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    {
+        program_perm_lock.lock();
+        defer program_perm_lock.unlock();
+        program_perm = unlinkInRanges(program_perm, ranges);
+    }
+    {
+        reg_lock.lock();
+        defer reg_lock.unlock();
+        nursery = unlinkInRanges(nursery, ranges);
+        const before = tenured_count;
+        tenured = unlinkInRanges(tenured, ranges);
+        var n: usize = 0;
+        var cur = tenured;
+        while (cur) |h| : (cur = h.gc_next) n += 1;
+        tenured_count = n;
+        if (before != n) live_bytes = n;
+    }
+}
+
+fn unlinkInRanges(head: ?*GcHeader, ranges: []const Range) ?*GcHeader {
+    var out = head;
+    var prev: ?*GcHeader = null;
+    var cur = head;
+    while (cur) |h| {
+        const next = h.gc_next;
+        if (inRanges(ranges, h)) {
+            if (prev) |p| p.gc_next = next else out = next;
+        } else {
+            prev = h;
+        }
+        cur = next;
+    }
+    return out;
+}
+
 /// Drop one cell from the remembered set, for a caller about to free it.
 pub fn forgetCell(h: *GcHeader) void {
     remembered_lock.lock();

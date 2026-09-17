@@ -24,6 +24,7 @@ pub const readSectionFromPath = read.readSectionFromPath;
 pub const section_names = format.section_names;
 
 pub const PackReader = read.PackReader;
+pub const LazyPack = read.LazyPack;
 pub const DEFAULT_ZSTD_LEVEL = write.DEFAULT_ZSTD_LEVEL;
 pub const PackWriter = write.PackWriter;
 

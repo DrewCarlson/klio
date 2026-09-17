@@ -270,7 +270,13 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         const module_has_composables =
             names.count() != 0 or sinks.count() != 0 or comp_getter_props.count() != 0;
         if (base) |bsp| {
-            if (bsp.has_composables or module_has_composables) {
+            if (bsp.compose_sets_baked) {
+                // The image took the collections at bake; nothing decodes.
+                for (bsp.compose_names) |n| try names.put(n, {});
+                for (bsp.compose_sinks) |n| try sinks.put(n, {});
+                for (bsp.compose_getter_props) |n| try comp_getter_props.put(n, {});
+                for (bsp.compose_inline_fns) |n| try inline_fns.put(n, {});
+            } else if (bsp.has_composables or module_has_composables) {
                 // An image-loaded base leaves `lifted_decls` empty, so collectors read the decoded section.
                 const base_decls = try composeBaseDecls(allocator, bsp);
                 try composeBaseNames(&names, base_decls);

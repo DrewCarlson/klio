@@ -30,6 +30,7 @@ const FF = runtime.forest.ForestField;
 const span = @import("span");
 
 const build = @import("build.zig");
+const build_base = @import("build/base.zig");
 const prune = @import("prune.zig");
 
 const Allocator = std.mem.Allocator;
@@ -97,8 +98,11 @@ fn encodeForestField(comptime T: type, e: *Encoder, value: *const T) Allocator.E
     const Child = T.Child;
     switch (value.*) {
         .ref => |r| {
+            // A ref came from a loaded image and carries its slot; the bake
+            // writes the declarations of that image in the same order, so
+            // its local index is the new ref.
             try e.varint(0);
-            try e.varint(r.decl);
+            try e.varint(runtime.forest.localIndex(r.decl));
             try e.varint(r.ord);
         },
         .ptr => |p| {
@@ -110,6 +114,13 @@ fn encodeForestField(comptime T: type, e: *Encoder, value: *const T) Allocator.E
                     return;
                 }
                 inline_forest_nodes += 1;
+                if (runtime.envOnce("KLIO_IMAGE_INLINE_TRACE") != null) {
+                    if (Child == ast.Function) {
+                        std.debug.print("[image] inline forest node: function {s} inline={} body={}\n", .{ p.name.name, p.is_inline, p.body != null });
+                    } else {
+                        std.debug.print("[image] inline forest node: {s}\n", .{@typeName(Child)});
+                    }
+                }
             }
             try e.varint(1);
             try encodeValue(Child, e, p);
@@ -558,6 +569,9 @@ const RegistryImage = struct {
     member_ext_owner_class: []KV(FuncId, []const u8),
     local_fn_defaults: []KV(FuncId, []const ?FuncId),
     abstract_member_defaults: []struct { a: []const u8, b: []const u8, slots: []const ?FuncId },
+    /// Per member function, the trailing-lambda call shapes it accepts, so
+    /// an extending build registers only its own classes' shapes.
+    member_trailing_lambda_shapes: []struct { a: []const u8, b: []const u8, shapes: []const ir.ModuleRegistry.MemberTrailingLambdaShape } = &.{},
     type_aliases: []StrKV,
     type_alias_types: []KV([]const u8, ir.ModuleRegistry.TypeAliasShape),
     import_aliases: []struct {
@@ -802,6 +816,13 @@ const ImageRoot = struct {
     /// Whether anything in that section is composable; false lets a run skip
     /// decoding it.
     has_composables: bool = false,
+    /// What the compose pass collects over every base declaration, taken at
+    /// bake so a run extending the base decodes none of them for it.
+    compose_sets_baked: bool = false,
+    compose_names: []const []const u8 = &.{},
+    compose_sinks: []const []const u8 = &.{},
+    compose_getter_props: []const []const u8 = &.{},
+    compose_inline_fns: []const []const u8 = &.{},
     func_header_section: []const u8 = &.{},
     func_header_offsets: []const u32 = &.{},
     /// Ids of bodyless funcs (no blocks, not deferred), the lazy link input.
@@ -924,22 +945,186 @@ pub const BakeExtras = struct {
 
 /// Serialize `base` and its SourceMap into an owned `gpa` buffer; null when the
 /// base holds state outside the serializable surface.
+/// One thread per two hundred and fifty-six items, at most one per CPU under
+/// the `KLIO_MAX_WORKERS` ceiling every pool honours.
+fn sectionThreads(n_items: usize) usize {
+    var n: usize = std.Thread.getCpuCount() catch 1;
+    if (runtime.envOnce("KLIO_MAX_WORKERS")) |v| {
+        if (std.fmt.parseInt(usize, v, 10)) |x| {
+            if (x != 0) n = @min(n, x);
+        } else |_| {}
+    }
+    n = @min(n, n_items / 256);
+    return @max(@min(n, 8), 1);
+}
+
+/// One thread's share of a section: a contiguous run of items into its own
+/// buffer, each item self-contained, its offset recorded against that buffer.
+fn SectionWorker(comptime Ctx: type) type {
+    return struct {
+        ctx: Ctx,
+        enc: Encoder,
+        lo: usize,
+        hi: usize,
+        offsets: []u32,
+        failed: bool = false,
+        thread: ?std.Thread = null,
+
+        fn run(self: *@This()) void {
+            defer runtime.slab.flushMagazines();
+            self.runInner() catch {
+                self.failed = true;
+            };
+        }
+
+        fn runInner(self: *@This()) Allocator.Error!void {
+            var i = self.lo;
+            while (i < self.hi) : (i += 1) {
+                self.enc.resetRegistry();
+                self.offsets[i - self.lo] = @intCast(self.enc.out.items.len);
+                try self.ctx.encodeOne(&self.enc, i);
+            }
+        }
+    };
+}
+
+/// Encodes `n` items as one section on `scratch`: `ctx.encodeOne(enc, i)`
+/// writes item `i` self-contained after a registry reset. The items are
+/// shared out over threads in contiguous runs whose buffers concatenate in
+/// order, so the section is byte for byte what a serial encode writes.
+/// `offsets[i]` is item `i`'s offset in the section. `ctx.forThread()` gives
+/// each worker its own context and `ctx.merge(worker)` folds one back.
+fn encodeSection(comptime Ctx: type, scratch: Allocator, ctx: *Ctx, n: usize, offsets: []u32) Allocator.Error![]u8 {
+    const Worker = SectionWorker(Ctx);
+    const threads = sectionThreads(n);
+    const workers = try scratch.alloc(Worker, threads);
+    defer scratch.free(workers);
+    const per = (n + threads - 1) / threads;
+    for (workers, 0..) |*w, t| {
+        const lo = @min(t * per, n);
+        const hi = @min(lo + per, n);
+        w.* = .{ .ctx = try ctx.forThread(), .enc = Encoder.init(scratch), .lo = lo, .hi = hi, .offsets = offsets[lo..hi] };
+    }
+    defer for (workers) |*w| w.enc.deinit();
+    if (threads == 1) {
+        workers[0].run();
+    } else {
+        for (workers[1..]) |*w| w.thread = std.Thread.spawn(.{}, Worker.run, .{w}) catch null;
+        workers[0].run();
+        for (workers[1..]) |*w| {
+            if (w.thread) |t| t.join() else w.run();
+        }
+    }
+    var total: usize = 0;
+    for (workers) |*w| {
+        if (w.failed) return error.OutOfMemory;
+        total += w.enc.out.items.len;
+    }
+    const out = try scratch.alloc(u8, total);
+    var base: usize = 0;
+    for (workers) |*w| {
+        @memcpy(out[base .. base + w.enc.out.items.len], w.enc.out.items);
+        for (w.offsets) |*o| o.* += @intCast(base);
+        base += w.enc.out.items.len;
+        try ctx.merge(&w.ctx);
+    }
+    return out;
+}
+
+/// A section over a read-only item list; every thread shares the list.
+fn PlainSection(comptime Item: type, comptime encodeItem: fn (*Encoder, Item) Allocator.Error!void) type {
+    return struct {
+        items: []const Item,
+        fn forThread(self: *@This()) Allocator.Error!@This() {
+            return self.*;
+        }
+        fn merge(_: *@This(), _: *@This()) Allocator.Error!void {}
+        fn encodeOne(self: *@This(), e: *Encoder, i: usize) Allocator.Error!void {
+            try encodeItem(e, self.items[i]);
+        }
+    };
+}
+
+fn encodeInlineBody(e: *Encoder, f: *ast.Function) Allocator.Error!void {
+    try encodeValue(ast.FunctionBody, e, &f.body.?);
+}
+
+fn encodeFuncBlocks(e: *Encoder, f: *ir.Func) Allocator.Error!void {
+    try encodeValue([]ir.Block, e, &f.blocks);
+}
+
+fn encodeFuncHeader(e: *Encoder, f: *const ir.Func) Allocator.Error!void {
+    try encodeValue(ir.Func, e, f);
+}
+
+const ForestPair = struct { addr: usize, ref: runtime.forest.ForestRef };
+
+/// The lifted declarations, each recording the address of every node it
+/// encodes so a pointer into it elsewhere in the image encodes as a ref.
+const DeclSection = struct {
+    decls: []const ast.Decl,
+    origins: []const usize,
+    scratch: Allocator,
+    pairs: std.ArrayList(ForestPair) = .empty,
+
+    fn forThread(self: *DeclSection) Allocator.Error!DeclSection {
+        return .{ .decls = self.decls, .origins = self.origins, .scratch = self.scratch };
+    }
+
+    fn merge(self: *DeclSection, other: *DeclSection) Allocator.Error!void {
+        try self.pairs.appendSlice(self.scratch, other.pairs.items);
+        other.pairs.deinit(self.scratch);
+    }
+
+    fn encodeOne(self: *DeclSection, e: *Encoder, i: usize) Allocator.Error!void {
+        const d = &self.decls[i];
+        try encodeValue(ast.Decl, e, d);
+        var it = e.nodes.iterator();
+        while (it.next()) |kv| {
+            try self.pairs.append(self.scratch, .{ .addr = kv.key_ptr.addr, .ref = .{ .decl = @intCast(i), .ord = kv.value_ptr.* } });
+        }
+        // The declaration object the lowering pointed into may be another
+        // copy of this one; its nodes within the object's own bytes alias
+        // this encoding, and everything under it is shared.
+        if (i < self.origins.len and self.origins[i] != 0) {
+            const here = @intFromPtr(d);
+            const there = self.origins[i];
+            if (there != here) {
+                var oit = e.nodes.iterator();
+                while (oit.next()) |kv| {
+                    const addr = kv.key_ptr.addr;
+                    if (addr >= here and addr < here + @sizeOf(ast.Decl)) {
+                        try self.pairs.append(self.scratch, .{ .addr = there + (addr - here), .ref = .{ .decl = @intCast(i), .ord = kv.value_ptr.* } });
+                    }
+                }
+            }
+        }
+    }
+};
+
+/// The image bytes for `base`, on `out`. Everything the encode needs along
+/// the way is on `scratch` and freed before the return; a caller whose build
+/// heap dies with the base passes that heap, so the bake's turnover dies with
+/// it too.
 pub fn bake(
-    gpa: Allocator,
+    out_a: Allocator,
+    scratch: Allocator,
     base: *const StdlibBase,
     map: *const SourceMap,
     extras: BakeExtras,
 ) Allocator.Error!?[]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    const gpa = scratch;
+    var arena_state = std.heap.ArenaAllocator.init(scratch);
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
+    const bake_trace = runtime.envSetOnce("KLIO_TRACE_BAKE");
+    var tb = runtime.clockMonotonicNanos();
     const root = (try rootFromBase(a, base, map, extras)) orelse return null;
+    if (bake_trace) tb = bakeMark("root", tb);
 
     // Defer `inline`, object-free bodies into a side section, each replaced by
     // a marker block whose span encodes its offset. The base is restored after.
-    var body_enc = Encoder.init(gpa);
-    defer body_enc.deinit();
     const Saved = struct { f: *ast.Function, body: ast.FunctionBody };
     var saved: std.ArrayList(Saved) = .empty;
     defer saved.deinit(a);
@@ -947,12 +1132,11 @@ pub fn bake(
         var deferrable: std.ArrayList(*ast.Function) = .empty;
         defer deferrable.deinit(a);
         try prune.collectDeferrable(a, root.lifted_decls, &deferrable);
-        for (deferrable.items) |f| {
-            const real = f.body.?;
-            const offset: u32 = @intCast(body_enc.out.items.len);
-            body_enc.resetRegistry();
-            try encodeValue(ast.FunctionBody, &body_enc, &real);
-            try saved.append(a, .{ .f = f, .body = real });
+        const offsets = try a.alloc(u32, deferrable.items.len);
+        var section = PlainSection(*ast.Function, encodeInlineBody){ .items = deferrable.items };
+        root.deferred_bodies = try encodeSection(@TypeOf(section), gpa, &section, deferrable.items.len, offsets);
+        for (deferrable.items, offsets) |f, offset| {
+            try saved.append(a, .{ .f = f, .body = f.body.? });
             f.body = .{ .Block = .{ .stmts = &.{}, .span = .{
                 .file = @enumFromInt(DEFERRED_MAGIC),
                 .start = offset,
@@ -960,39 +1144,43 @@ pub fn bake(
             } } };
         }
     }
-    root.deferred_bodies = body_enc.out.items;
+    if (bake_trace) tb = bakeMark("inline bodies", tb);
 
     // Defer AST-free `blocks` likewise, recording `offset + 1` per func.
-    var fn_blk_enc = Encoder.init(gpa);
-    defer fn_blk_enc.deinit();
     var fn_saved: std.ArrayList(struct { f: *ir.Func, blocks: []ir.Block }) = .empty;
     defer fn_saved.deinit(a);
     {
+        var with_blocks: std.ArrayList(*ir.Func) = .empty;
+        defer with_blocks.deinit(a);
         for (root.module.funcs) |*f| {
             if (f.blocks.len == 0 or funcRefsAst(f)) continue;
-            const offset: u32 = @intCast(fn_blk_enc.out.items.len);
-            fn_blk_enc.resetRegistry();
-            try encodeValue([]ir.Block, &fn_blk_enc, &f.blocks);
+            try with_blocks.append(a, f);
+        }
+        const offsets = try a.alloc(u32, with_blocks.items.len);
+        var section = PlainSection(*ir.Func, encodeFuncBlocks){ .items = with_blocks.items };
+        root.module.deferred_func_section = try encodeSection(@TypeOf(section), gpa, &section, with_blocks.items.len, offsets);
+        for (with_blocks.items, offsets) |f, offset| {
             try fn_saved.append(a, .{ .f = f, .blocks = f.blocks });
             f.deferred_offset = offset + 1;
             f.blocks = &.{};
         }
-        root.module.deferred_func_section = fn_blk_enc.out.items;
     }
+    if (bake_trace) tb = bakeMark("func blocks", tb);
 
     // Per-func headers, decoded on first `funcById`, plus the bodyless-id list
     // and fqn-head set. The eager func table is then nulled.
-    var fn_hdr_enc = Encoder.init(gpa);
-    defer fn_hdr_enc.deinit();
     {
         const offs = try a.alloc(u32, root.module.funcs.len);
         var bodyless: std.ArrayList(u32) = .empty;
         var heads = std.StringHashMap(void).init(gpa);
         defer heads.deinit();
+        var section = PlainSection(*const ir.Func, encodeFuncHeader){ .items = undefined };
+        const hdr_items = try a.alloc(*const ir.Func, root.module.funcs.len);
+        for (root.module.funcs, 0..) |*f, i| hdr_items[i] = f;
+        section.items = hdr_items;
+        root.func_header_section = try encodeSection(@TypeOf(section), gpa, &section, hdr_items.len, offs);
         for (root.module.funcs, 0..) |*f, i| {
-            offs[i] = @intCast(fn_hdr_enc.out.items.len + 1);
-            fn_hdr_enc.resetRegistry();
-            try encodeValue(ir.Func, &fn_hdr_enc, f);
+            offs[i] += 1;
             if (f.deferred_offset == 0 and f.blocks.len == 0) try bodyless.append(a, @intCast(i));
             // Only a dotted fqn contributes a package head; recording a dotless
             // name would make every bare stdlib func name a "package".
@@ -1001,7 +1189,6 @@ pub fn bake(
                 if (h.len != 0) try heads.put(h, {});
             }
         }
-        root.func_header_section = fn_hdr_enc.out.items;
         root.func_header_offsets = offs;
         root.bodyless_func_ids = try bodyless.toOwnedSlice(a);
         var head_list: std.ArrayList([]const u8) = .empty;
@@ -1010,28 +1197,42 @@ pub fn bake(
         root.func_fqn_heads = try head_list.toOwnedSlice(a);
         root.module.funcs = &.{};
     }
+    if (bake_trace) tb = bakeMark("func headers", tb);
 
     // Per-decl sections, emitted after the deferral so they capture the final
     // baked form. The eager decls stay; the loader picks one.
-    var decl_enc = Encoder.init(gpa);
-    defer decl_enc.deinit();
     // Map each forest node's address to its ref, so a `ptr` encodes lazily.
     var forest_map = std.AutoHashMap(usize, runtime.forest.ForestRef).init(gpa);
     defer forest_map.deinit();
     {
         const offsets = try a.alloc(u32, root.lifted_decls.len);
-        for (root.lifted_decls, 0..) |*d, i| {
-            offsets[i] = @intCast(decl_enc.out.items.len);
-            decl_enc.resetRegistry();
-            try encodeValue(ast.Decl, &decl_enc, d);
-            var it = decl_enc.nodes.iterator();
-            while (it.next()) |kv| {
-                try forest_map.put(kv.key_ptr.addr, .{ .decl = @intCast(i), .ord = kv.value_ptr.* });
-            }
-        }
-        root.lifted_decl_section = decl_enc.out.items;
+        var section = DeclSection{ .decls = root.lifted_decls, .origins = base.lifted_origins, .scratch = gpa };
+        defer section.pairs.deinit(gpa);
+        root.lifted_decl_section = try encodeSection(DeclSection, gpa, &section, root.lifted_decls.len, offsets);
+        try forest_map.ensureTotalCapacity(@intCast(section.pairs.items.len));
+        for (section.pairs.items) |pr| try forest_map.put(pr.addr, pr.ref);
         root.lifted_decl_offsets = offsets;
         root.has_composables = base.has_composables;
+    }
+    if (bake_trace) tb = bakeMark("lifted decls", tb);
+    {
+        var names = std.StringHashMap(void).init(gpa);
+        defer names.deinit();
+        var sinks = std.StringHashMap(void).init(gpa);
+        defer sinks.deinit();
+        var getters = std.StringHashMap(void).init(gpa);
+        defer getters.deinit();
+        var inline_fns = std.StringHashMap(void).init(gpa);
+        defer inline_fns.deinit();
+        try build_base.composeBaseNames(&names, root.lifted_decls);
+        try build_base.composeBaseSinks(&sinks, root.lifted_decls);
+        try build_base.composeBaseComposableGetterProps(&getters, root.lifted_decls);
+        try build_base.composeBaseInlineFns(&inline_fns, root.lifted_decls);
+        root.compose_names = try setToSlice(a, &names);
+        root.compose_sinks = try setToSlice(a, &sinks);
+        root.compose_getter_props = try setToSlice(a, &getters);
+        root.compose_inline_fns = try setToSlice(a, &inline_fns);
+        root.compose_sets_baked = true;
     }
 
     {
@@ -1161,8 +1362,20 @@ pub fn bake(
     // everything load reads, and a still-raw forest pointer inline-encodes.
     root.lifted_decls = &.{};
 
+    if (bake_trace) tb = bakeMark("tables", tb);
+    // The payload is mostly the sections and the sources copied through, so
+    // their sum sizes the buffer once, on the allocator the bytes are kept on.
     var e = Encoder.init(gpa);
-    defer e.deinit();
+    e.gpa = out_a;
+    defer {
+        e.gpa = gpa;
+        e.nodes.deinit();
+        e.slices.deinit();
+    }
+    var estimate: usize = 1 << 20;
+    estimate += root.deferred_bodies.len + root.module.deferred_func_section.len + root.func_header_section.len + root.lifted_decl_section.len;
+    for (root.files) |f| estimate += f.source.len + f.path.len;
+    try e.out.ensureTotalCapacity(out_a, estimate);
 
     try e.bytes(MAGIC);
     try e.bytes(&std.mem.toBytes(std.mem.nativeToLittle(u32, FORMAT_VERSION)));
@@ -1175,6 +1388,7 @@ pub fn bake(
     const payload_len: u64 = e.out.items.len - payload_start;
     @memcpy(e.out.items[len_slot .. len_slot + 8], &std.mem.toBytes(std.mem.nativeToLittle(u64, payload_len)));
     try e.bytes(TRAILER);
+    if (bake_trace) tb = bakeMark("root encode", tb);
 
     for (saved.items) |s| s.f.body = s.body;
     for (fn_saved.items) |s| {
@@ -1182,7 +1396,14 @@ pub fn bake(
         s.f.deferred_offset = 0;
     }
 
-    return try e.out.toOwnedSlice(e.gpa);
+    return try e.out.toOwnedSlice(out_a);
+}
+
+/// `KLIO_TRACE_BAKE`: one line per bake phase with its wall time.
+fn bakeMark(name: []const u8, since: u64) u64 {
+    const now = runtime.clockMonotonicNanos();
+    std.debug.print("[bake] {s}: {d}us\n", .{ name, (now - since) / 1000 });
+    return now;
 }
 
 fn rootFromBase(
@@ -1339,6 +1560,16 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
             var i: usize = 0;
             while (it.next()) |entry| : (i += 1) {
                 list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .slots = entry.value_ptr.items };
+            }
+            break :blk list;
+        },
+        .member_trailing_lambda_shapes = blk: {
+            const E = @TypeOf(out.registry.member_trailing_lambda_shapes[0]);
+            var list = try a.alloc(E, r.member_trailing_lambda_shapes.count());
+            var it = r.member_trailing_lambda_shapes.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .shapes = entry.value_ptr.items };
             }
             break :blk list;
         },
@@ -1885,6 +2116,74 @@ pub const Loaded = struct {
     binding_fqns: []const []const u8,
 };
 
+/// Brings an image's base wholly into memory: every function with its
+/// blocks, every lifted declaration, and every inline body, so the base can
+/// be extended with more sources and baked again as a larger image. The
+/// base reads nothing lazily from its image afterwards. False when a
+/// function or declaration does not decode.
+pub fn materialize(a: Allocator, base: *StdlibBase) Allocator.Error!bool {
+    {
+        const mg = base.built.module.borrowMut();
+        defer mg.deinit();
+        const m = mg.get();
+        const n = m.func_header_offsets.len;
+        if (n != 0) {
+            var funcs: std.ArrayList(ir.Func) = .empty;
+            try funcs.ensureTotalCapacity(a, n + m.funcs.items.len);
+            for (0..n) |i| {
+                const f = m.funcById(FuncId.from(@intCast(i))) orelse return false;
+                _ = m.ensureFuncBody(@constCast(f));
+                funcs.appendAssumeCapacity(f.*);
+            }
+            for (m.funcs.items) |f| funcs.appendAssumeCapacity(f);
+            m.funcs = funcs;
+            m.func_header_offsets = &.{};
+            m.func_header_section = &.{};
+            m.func_header_decode = null;
+            m.func_cache = &.{};
+            m.deferred_func_section = &.{};
+            m.deferred_func_decode = null;
+            m.bodyless_func_ids = &.{};
+            m.func_fqn_heads = &.{};
+        }
+    }
+    if (base.lifted_decls.len == 0 and base.lifted_decl_offsets.len != 0) {
+        const count = runtime.forest.slotDeclCount(base.forest_slot);
+        if (count != base.lifted_decl_offsets.len) return false;
+        // Every inline body the bake deferred comes back in place of its
+        // marker, through the same restore the splicer uses, on the forest's
+        // own declarations: a pointer taken through a ref names those, and
+        // the copies below share every node under them.
+        if (base.deferred_bodies.len != 0) {
+            ir.lower.inline_state.setDeferredSection(base.deferred_bodies, base.arena, decodeDeferredBody);
+        }
+        const decls = try a.alloc(ast.Decl, count);
+        const origins = try a.alloc(usize, count);
+        for (decls, origins, 0..) |*d, *o, i| {
+            const src = runtime.forest.declPtr(base.forest_slot, @intCast(i)) orelse return false;
+            if (base.deferred_bodies.len != 0) restoreInlineBodies(src);
+            d.* = src.*;
+            o.* = @intFromPtr(src);
+        }
+        base.lifted_decls = decls;
+        base.lifted_origins = origins;
+        base.materialized = true;
+        base.lifted_decl_section = &.{};
+        base.lifted_decl_offsets = &.{};
+        base.deferred_bodies = &.{};
+    }
+    return true;
+}
+
+fn restoreInlineBodies(d: *const ast.Decl) void {
+    switch (d.*) {
+        .Function => |*f| ir.lower.inline_state.ensureInlineBody(f),
+        .Class => |*c| for (c.members) |*m| restoreInlineBodies(m),
+        .Object => |*o| for (o.members) |*m| restoreInlineBodies(m),
+        .Property, .TypeAlias => {},
+    }
+}
+
 /// Why the most recent `load` on this thread returned null; diagnostic only.
 threadlocal var load_failure: []const u8 = "";
 
@@ -1946,6 +2245,11 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
     }
     runtime.allocTrackReportPhase("image.decode", snap0);
     dumpDecodeStats();
+    // `KLIO_IMAGE_CLASSES`: every class the image holds, by id, name and fqn,
+    // so two images of one base can be compared class for class.
+    if (runtime.envSetOnce("KLIO_IMAGE_CLASSES")) {
+        for (root.module.classes) |*c| std.debug.print("[image] class #{d} {s} {s}\n", .{ c.id.int(), c.name, c.fqn });
+    }
 
     const snap1 = runtime.allocTrackSnapshot();
     const loaded = try baseFromRoot(a, root, slot);
@@ -2047,6 +2351,12 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
         },
         .user_file_start = @intCast(root.files.len),
         .enum_id_next = root.enum_id_next,
+        .forest_slot = slot,
+        .compose_sets_baked = root.compose_sets_baked,
+        .compose_names = root.compose_names,
+        .compose_sinks = root.compose_sinks,
+        .compose_getter_props = root.compose_getter_props,
+        .compose_inline_fns = root.compose_inline_fns,
         .deferred_bodies = root.deferred_bodies,
         .lifted_decl_section = root.lifted_decl_section,
         .lifted_decl_offsets = root.lifted_decl_offsets,
@@ -2163,6 +2473,12 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         var list: std.ArrayList(?FuncId) = .empty;
         try list.appendSlice(a, entry.slots);
         try r.abstract_member_defaults.put(.{ .a = entry.a, .b = entry.b }, list);
+    }
+    try r.member_trailing_lambda_shapes.ensureTotalCapacity(@intCast(ri.member_trailing_lambda_shapes.len));
+    for (ri.member_trailing_lambda_shapes) |entry| {
+        var list: std.ArrayList(ir.ModuleRegistry.MemberTrailingLambdaShape) = .empty;
+        try list.appendSlice(a, entry.shapes);
+        r.member_trailing_lambda_shapes.putAssumeCapacity(.{ .a = entry.a, .b = entry.b }, list);
     }
     try r.type_aliases.ensureTotalCapacity(@intCast(ri.type_aliases.len));
     for (ri.type_aliases) |kv| r.type_aliases.putAssumeCapacity(kv.k, kv.v);

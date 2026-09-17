@@ -113,6 +113,25 @@ fn ensureDecl(idx: u32) ?DeclReg {
     return dr;
 }
 
+/// The declaration `local` of the image in `slot`, decoded on first ask.
+pub fn declPtr(slot: u32, local: u32) ?*const ast.Decl {
+    const dr = ensureDecl((slot << SLOT_SHIFT) | local) orelse return null;
+    return dr.decl;
+}
+
+/// How many declarations the image in `slot` holds.
+pub fn slotDeclCount(slot: u32) usize {
+    if (slot >= MAX_SECTIONS) return 0;
+    const sec = if (sections[slot]) |*s| s else return 0;
+    return sec.memo.len;
+}
+
+/// A ref's declaration index within its own image, the slot bits dropped:
+/// what a bake of that image's declarations, in the same order, writes.
+pub fn localIndex(decl: u32) u32 {
+    return decl & LOCAL_MASK;
+}
+
 pub fn resolveNode(ref: ForestRef) ?usize {
     const dr = ensureDecl(ref.decl) orelse return null;
     if (ref.ord >= dr.nodes.len) return null;

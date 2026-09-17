@@ -95,8 +95,6 @@ fn threadedIo(allocator: Allocator) std.Io.Threaded {
 
 /// `bakeStdlibCache` points the cache at a directory of its own for one bake.
 var cache_dir_override: ?[]const u8 = null;
-/// `bakeStdlibCache` needs the image written before it returns.
-var force_sync: bool = false;
 
 /// `$KLIO_HOME/.klio/cache` (or `~/.klio/cache`), created if absent. Caller frees.
 fn cacheDir(gpa: Allocator) ?[]u8 {
@@ -371,108 +369,53 @@ fn writeAtomic(gpa: Allocator, cache: []const u8, dest: []const u8, bytes: []con
     };
 }
 
-/// The strip's deferred freeing walk, run on its own thread.
-const DetachedRelease = struct {
+/// The base's declarations published for the user check, on its own thread
+/// beside the strip.
+/// The image write, off the path the program is waiting on. `finishBackgroundBake`
+/// joins it before the process exits, so a normal exit never leaves a
+/// half-written temp file behind.
+const ImageWriter = struct {
     gpa: Allocator,
-    bodies: []const ast.FunctionBody,
-    stats: interp_ir.prune.Released = .{},
+    cache: []u8,
+    image_path: []u8,
+    bytes: []const u8,
+    thread: ?std.Thread = null,
 
-    fn run(self: *DetachedRelease) void {
+    fn run(self: *ImageWriter) void {
         defer runtime.slab.flushMagazines();
-        self.stats = interp_ir.prune.releaseDetached(self.gpa, self.bodies);
+        writeAtomic(self.gpa, self.cache, self.image_path, self.bytes);
+        clearBakeMarker(self.gpa, self.image_path);
+        pruneImages(self.gpa, self.cache);
     }
 };
 
-const BakeJob = struct {
-    cache: []const u8,
-    hex: *const [32]u8,
-    image_path: []const u8,
-    base: *const StdlibBase,
-    map: *const SourceMap,
-    extras: image.BakeExtras,
-    parse_ms: u64,
-    lower_ms: u64,
-};
+var image_writer: ?*ImageWriter = null;
 
-/// Encodes the base and publishes the image. False when the base lies outside
-/// the serializable surface, which leaves a tombstone so later runs skip the
-/// bake; the run itself goes on against the base either way.
-fn bakeAndWrite(gpa: Allocator, job: *const BakeJob) bool {
-    const t0 = runtime.clockMonotonicNanos();
-    const bytes = (image.bake(gpa, job.base, job.map, job.extras) catch return false) orelse {
-        writeTombstone(gpa, job.cache, job.hex.*);
-        trace(gpa, "unbakeable {s} (outside serializable surface)", .{job.hex.*});
-        return false;
+/// Publishes `bytes` as the image at `image_path` on a thread. The loaded
+/// base borrows `bytes` for the process's life, so they are never freed.
+fn publishImage(gpa: Allocator, cache: []const u8, image_path: []const u8, bytes: []const u8) void {
+    finishBackgroundBake();
+    const w = gpa.create(ImageWriter) catch return;
+    w.* = .{
+        .gpa = gpa,
+        .cache = gpa.dupe(u8, cache) catch return,
+        .image_path = gpa.dupe(u8, image_path) catch return,
+        .bytes = bytes,
     };
-    const t_bake = runtime.clockMonotonicNanos();
-    defer gpa.free(bytes);
-    writeAtomic(gpa, job.cache, job.image_path, bytes);
-    clearBakeMarker(gpa, job.image_path);
-    pruneImages(gpa, job.cache);
-    trace(gpa, "  serialize: bake {d}ms, write {d}ms", .{
-        (t_bake - t0) / 1_000_000,
-        (runtime.clockMonotonicNanos() - t_bake) / 1_000_000,
-    });
-    trace(gpa, "baked {s} ({d} bytes, {d} inline forest nodes; parse {d}ms, lower {d}ms, serialize {d}ms)", .{
-        job.hex.*,
-        bytes.len,
-        interp_ir.image.inline_forest_nodes,
-        job.parse_ms,
-        job.lower_ms,
-        (runtime.clockMonotonicNanos() - t0) / 1_000_000,
-    });
-    return true;
+    w.thread = std.Thread.spawn(.{}, ImageWriter.run, .{w}) catch null;
+    if (w.thread == null) w.run();
+    image_writer = w;
 }
 
-const background_bake_supported = builtin.os.tag != .windows and builtin.link_libc;
-
-/// The child publishing the image while this process runs the program.
-var background_bake: ?std.c.pid_t = null;
-
-/// Bakes in a forked child. The program then never waits for the encoder,
-/// and the child's copy of the base is the base as built, untouched by the
-/// memos the run writes into shared instructions. False when the bake must
-/// happen here: `KLIO_STDLIB_IMAGE_SYNC=1`, a platform without fork, or a
-/// fork that failed.
-fn forkBake(gpa: Allocator, job: *const BakeJob) bool {
-    if (comptime !background_bake_supported) return false;
-    if (force_sync) return false;
-    if (getEnvVar(gpa, "KLIO_STDLIB_IMAGE_SYNC")) |v| {
-        defer gpa.free(v);
-        if (v.len != 0 and !std.mem.eql(u8, v, "0")) return false;
-    }
-    const tracing = traceEnabled(gpa);
-    const t0 = runtime.clockMonotonicNanos();
-    // The build's parked scratch is not coming back to either process, and a
-    // fork's cost is its resident pages: give them back first.
-    runtime.slab.reclaimAll();
-    const pid = std.c.fork();
-    if (pid < 0) return false;
-    if (pid == 0) {
-        // Whoever reads this process's output must not wait on the child.
-        _ = std.c.close(0);
-        _ = std.c.close(1);
-        if (!tracing) _ = std.c.close(2);
-        // The marker outlives a child that dies before it writes the image,
-        // so the next cold run can say so rather than staying cold in
-        // silence. The child writes it: the program is not waiting on it.
-        writeBakeMarker(gpa, job.cache, job.image_path);
-        _ = bakeAndWrite(gpa, job);
-        std.c._exit(0);
-    }
-    background_bake = pid;
-    trace(gpa, "baking {s} in the background (fork {d}us)", .{ job.hex.*, (runtime.clockMonotonicNanos() - t0) / 1000 });
-    return true;
-}
-
-/// Waits for the background bake: a command that exists to produce the image
-/// returns with it written.
+/// Waits for the image write: a command that exists to produce the image
+/// returns with it written, and a run does not exit from under it.
 pub fn finishBackgroundBake() void {
-    if (comptime !background_bake_supported) return;
-    const pid = background_bake orelse return;
-    background_bake = null;
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
+    const w = image_writer orelse return;
+    image_writer = null;
+    if (w.thread) |t| t.join();
+    w.gpa.free(w.cache);
+    w.gpa.free(w.image_path);
+    w.gpa.destroy(w);
 }
 
 fn pruneImages(gpa: Allocator, cache: []const u8) void {
@@ -882,12 +825,12 @@ pub fn tryPrepare(
             return null;
         }
         tracePreBake(gpa, t0, t_hash, t_packs);
-        return bakeAndPrepare(gpa, cache, meta_file, false, user, paths, features);
+        return bakeAndPrepare(gpa, cache, meta_file, false, gate, user, paths, features, pack_bindings);
     }
 
     // No meta yet: the full load computes the gate and the key follows from it.
     tracePreBake(gpa, t0, t_hash, t_packs);
-    return bakeAndPrepare(gpa, cache, meta_file, true, user, paths, features);
+    return bakeAndPrepare(gpa, cache, meta_file, true, null, user, paths, features, pack_bindings);
 }
 
 fn tracePreBake(gpa: Allocator, t0: u64, t_hash: u64, t_packs: u64) void {
@@ -1026,29 +969,112 @@ fn finishFromLoaded(
     return .{ .built = built, .map = map, .bindings = bindings, .user_asts = user2.asts };
 }
 
-/// Cold path: load, lower, bake and publish the image and its meta sidecar.
+/// The stdlib image a pack program builds on, materialised.
+const StdlibLayer = struct {
+    loaded: image.Loaded,
+    any_non_implicit: bool,
+    /// The image's file count: the stdlib's sources, first in its map.
+    stdlib_files: usize,
+};
+
+/// The stdlib's own image for `gate`, from the cache or the build's copy,
+/// brought wholly into memory so packs can lower on top of it. Null when
+/// there is none, when the program pulls no pack in, or when the layered
+/// build is switched off.
+fn loadStdlibLayer(gpa: Allocator, cache: []const u8, stdlib_hash: [32]u8, exe: [2]u64, gate: bool, user: ParsedUser) ?StdlibLayer {
+    // Opt-in: the layered build lowers only the packs on the stdlib image, but
+    // a global call inside a pack member resolves dynamically over the layer
+    // where the whole-program build resolves it statically, and a pack `actual`
+    // does not yet supersede the stdlib's `expect` across the image boundary.
+    // Both are the same gap a program-over-image run has today; closing it
+    // makes the layer exact. `KLIO_STDLIB_IMAGE_LAYER=1` turns it on.
+    if (!std.mem.eql(u8, runtime.envOnce("KLIO_STDLIB_IMAGE_LAYER") orelse "0", "1")) return null;
+    var any_import = false;
+    for (user.asts) |f| {
+        if (f.imports.len != 0) any_import = true;
+    }
+    if (!any_import) return null;
+    const meta_file = metaPath(gpa, cache, stdlib_hash) orelse return null;
+    defer gpa.free(meta_file);
+    const meta = readMetaFromCaches(gpa, meta_file) orelse {
+        trace(gpa, "  stdlib layer: no meta", .{});
+        return null;
+    };
+    const key = imageKey(stdlib_hash, exe, gate, &.{});
+    const hex = keyHex(key);
+    const image_path = std.fmt.allocPrint(gpa, "{s}/stdlib-{s}.klio-image", .{ cache, hex }) catch return null;
+    defer gpa.free(image_path);
+    const t0 = runtime.clockMonotonicNanos();
+    const found = loadImageFromCaches(gpa, image_path, hex) orelse {
+        trace(gpa, "  stdlib layer: no image {s} for gate:{s}", .{ hex, if (gate) @as([]const u8, "full") else "implicit" });
+        return null;
+    };
+    const t_load = runtime.clockMonotonicNanos();
+    const ok = image.materialize(gpa, found.loaded.base) catch return null;
+    if (!ok) {
+        trace(gpa, "stdlib layer {s} did not materialise; lowering from source", .{hex});
+        return null;
+    }
+    trace(gpa, "  stdlib layer {s}{s}: load {d}ms, materialise {d}ms", .{
+        hex,
+        if (found.shipped) @as([]const u8, " (shipped)") else "",
+        (t_load - t0) / 1_000_000,
+        (runtime.clockMonotonicNanos() - t_load) / 1_000_000,
+    });
+    return .{ .loaded = found.loaded, .any_non_implicit = meta.any_non_implicit, .stdlib_files = found.loaded.map.files.items.len };
+}
+
+/// Cold path: load, lower, bake and publish the image and its meta sidecar,
+/// then run from the image exactly as the next run will.
+///
+/// The parse, the stage, the lowered base and the bake's own turnover all
+/// live on the build heap, which is dropped whole once the image bytes
+/// exist: nothing the program runs on points into it. What the run needs is
+/// decoded from those bytes on demand, so a cold run holds what a warm one
+/// holds, plus the bytes.
 fn bakeAndPrepare(
     gpa: Allocator,
     cache: []const u8,
     meta_file: []const u8,
     write_meta_file: bool,
+    gate: ?bool,
     user: ParsedUser,
     paths: []const []const u8,
     features: *const RequestedFeatures,
+    bindings: HostBindings,
 ) ?Prepared {
     const exe = exeStamp(gpa) orelse return null;
     const stdlib_hash = stdlibContentHash(gpa) orelse return null;
 
+    const heap = runtime.slab.buildHeap();
+    const ba = heap.allocator();
+    var heap_released = false;
+    defer if (!heap_released) dropBuildHeap(heap);
+
     const tb0 = runtime.clockMonotonicNanos();
-    const dep_map = gpa.create(SourceMap) catch return null;
-    dep_map.* = SourceMap.init(gpa);
+    // A program that pulls packs in builds on the stdlib image when one is
+    // at hand for its gate: the stdlib's own parse, stage and lowering are
+    // then not repeated, and only the packs lower. `KLIO_STDLIB_IMAGE_LAYER=0`
+    // lowers everything from source, the reference for the layered build.
+    const layer = if (gate) |g| loadStdlibLayer(gpa, cache, stdlib_hash, exe, g, user) else null;
+    // Over a layer the packs register after the image's files, and the stdlib
+    // parses for the stage alone onto a scratch map whose ids are the image's,
+    // so the stage checks the whole universe as a fresh build does and its
+    // picks name declarations the lowering on top can find.
+    const dep_map: *SourceMap = if (layer) |l| l.loaded.map else blk: {
+        const m = ba.create(SourceMap) catch return null;
+        m.* = SourceMap.init(ba);
+        break :blk m;
+    };
+    var stage_map = SourceMap.init(ba);
     var report = pack_cache.EmbeddedReport{};
     var selection = pack_cache.Selection{};
-    const deps = pack_cache.loadInstalledPacksOpts(gpa, user.asts, dep_map, features, .{
+    const deps = pack_cache.loadInstalledPacksOpts(ba, user.asts, dep_map, features, .{
+        .stdlib_map = if (layer != null) &stage_map else null,
         .embedded_report = &report,
         .selection = &selection,
-        .exclude_lib_ids = project.ownLibraryExclusion(gpa, paths),
-        .declared_lib_ids = project.declaredDependencyIds(gpa, paths),
+        .exclude_lib_ids = project.ownLibraryExclusion(ba, paths),
+        .declared_lib_ids = project.declaredDependencyIds(ba, paths),
     });
     const tb_parse = runtime.clockMonotonicNanos();
     {
@@ -1073,6 +1099,7 @@ fn bakeAndPrepare(
     const key = imageKey(stdlib_hash, exe, report.gate_full, selection.packs.items);
     const hex = keyHex(key);
     const image_path = std.fmt.allocPrint(gpa, "{s}/stdlib-{s}.klio-image", .{ cache, hex }) catch return null;
+    defer gpa.free(image_path);
 
     if (write_meta_file) {
         writeMeta(gpa, cache, meta_file, .{
@@ -1082,85 +1109,94 @@ fn bakeAndPrepare(
         // The gate was unknown here, so an image for the now-known key may exist.
         if (loadImageFromCaches(gpa, image_path, hex)) |found| {
             trace(gpa, "hit{s} {s}", .{ if (found.shipped) @as([]const u8, " (shipped)") else "", hex });
-            return finishFromLoaded(gpa, found.loaded, user, paths, deps.bindings);
+            return finishFromLoaded(gpa, found.loaded, user, paths, bindings);
         }
         if (tombstoneExists(gpa, cache, hex)) return null;
     }
 
-    if (takeAbandonedBake(gpa, image_path)) trace(gpa, "the previous background bake of {s} did not finish; baking again", .{hex});
+    if (takeAbandonedBake(gpa, image_path)) trace(gpa, "the previous bake of {s} did not finish; baking again", .{hex});
     const tb_pre = runtime.clockMonotonicNanos();
-    stageBaseEagerCalls(gpa, deps.asts);
+    stageBaseEagerCalls(ba, deps.asts);
     const tb_stage = runtime.clockMonotonicNanos();
-    const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse {
+    // The loader lists the packs' ASTs first and the stdlib's last; over a
+    // layer only the packs lower, and the stage's stdlib files must be the
+    // image's, in the same order, for its picks to name what the lowering
+    // finds.
+    const base = (if (layer) |l| blk: {
+        if (stage_map.files.items.len != l.stdlib_files or report.stdlib_asts > deps.asts.len) {
+            trace(gpa, "stdlib layer: the image holds {d} stdlib files, this build {d}; lowering from source", .{ l.stdlib_files, stage_map.files.items.len });
+            break :blk null;
+        }
+        break :blk interp_ir.build.buildStdlibBaseOnTop(ba, l.loaded.base, deps.asts[0 .. deps.asts.len - report.stdlib_asts]) catch return null;
+    } else interp_ir.build.buildStdlibBaseUnstripped(ba, deps.asts) catch return null) orelse
+    {
         writeTombstone(gpa, cache, hex);
         trace(gpa, "unbakeable {s} (base not snapshot-safe)", .{hex});
         return null;
     };
     base.user_file_start = @intCast(dep_map.files.items.len);
-    const tb_build = runtime.clockMonotonicNanos();
 
     // The only run where the base's sources exist; the results ride the image.
-    checkBaseSources(gpa, base, deps.asts);
-
-    const tb_lower = runtime.clockMonotonicNanos();
-    trace(gpa, "  lower: stage {d}ms, build {d}ms, check {d}ms", .{
+    checkBaseSources(ba, base, deps.asts);
+    // Dead bodies are blanked so the bake skips them; the heap frees them.
+    interp_ir.build.stripStdlibBaseKeep(base);
+    const tb_build = runtime.clockMonotonicNanos();
+    trace(gpa, "  lower: stage {d}ms, build {d}ms", .{
         (tb_stage - tb_pre) / 1_000_000,
         (tb_build - tb_stage) / 1_000_000,
-        (tb_lower - tb_build) / 1_000_000,
     });
-    const bake_job = BakeJob{
-        .cache = cache,
-        .hex = &hex,
-        .image_path = image_path,
-        .base = base,
-        .map = dep_map,
-        .extras = .{
-            .known_packages = report.known_packages.items,
-            .binding_fqns = report.binding_fqns.items,
-        },
-        .parse_ms = (tb_parse - tb0) / 1_000_000,
-        .lower_ms = (tb_lower - tb_pre) / 1_000_000,
-    };
-    const tx0 = runtime.clockMonotonicNanos();
-    if (!forkBake(gpa, &bake_job)) _ = bakeAndWrite(gpa, &bake_job);
-    const tx_fork = runtime.clockMonotonicNanos();
-    // The strip's freeing walk runs beside the rest of the preparation and is
-    // done before the program starts. It touches only what the strip detached.
-    var release = DetachedRelease{ .gpa = gpa, .bodies = base.detached_bodies.items };
-    const release_thread: ?std.Thread = if (release.bodies.len != 0)
-        std.Thread.spawn(.{}, DetachedRelease.run, .{&release}) catch null
-    else
-        null;
-    defer {
-        if (release_thread) |t| t.join() else release.run();
-        base.detached_bodies.deinit(gpa);
-        if (traceEnabled(gpa) and release.bodies.len != 0) trace(gpa, "  released {d} detached bodies: {d} nodes, {d}kb", .{ release.bodies.len, release.stats.nodes, release.stats.bytes / 1024 });
-    }
 
-    if (!interp_ir.build.canExtendBase(base, user.asts)) {
-        trace(gpa, "fallback (base name collision)", .{});
+    // The marker outlives a process that dies before the image lands, so the
+    // next cold run says so rather than staying cold in silence.
+    writeBakeMarker(gpa, cache, image_path);
+    const bytes = (image.bake(gpa, ba, base, dep_map, .{
+        .known_packages = report.known_packages.items,
+        .binding_fqns = report.binding_fqns.items,
+    }) catch return null) orelse {
+        clearBakeMarker(gpa, image_path);
+        writeTombstone(gpa, cache, hex);
+        trace(gpa, "unbakeable {s} (outside serializable surface)", .{hex});
         return null;
-    }
-    const map = gpa.create(SourceMap) catch return null;
-    map.* = SourceMap.init(gpa);
-    map.files.appendSlice(map.arena.allocator(), dep_map.files.items) catch return null;
-    const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
-    publishExternDecls(gpa, base);
-    publishBaseEagerCalls(gpa, base);
-    const tx_publish = runtime.clockMonotonicNanos();
-    if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
-    const tx_eager = runtime.clockMonotonicNanos();
-    span.active_map = map;
-    // Built for this run alone: the bake child works on its own copy of the
-    // address space, and nothing in this process reads the base afterwards.
-    const built = interp_ir.build.buildModuleFilesExtendOwned(gpa, base, user2.asts) catch return null;
-    trace(gpa, "  after bake: fork {d}ms, user+publish {d}ms, user-check {d}ms, extend {d}ms", .{
-        (tx_fork - tx0) / 1_000_000,
-        (tx_publish - tx_fork) / 1_000_000,
-        (tx_eager - tx_publish) / 1_000_000,
-        (runtime.clockMonotonicNanos() - tx_eager) / 1_000_000,
+    };
+    const tb_bake = runtime.clockMonotonicNanos();
+    publishImage(gpa, cache, image_path, bytes);
+    trace(gpa, "baked {s} ({d} bytes, {d} inline forest nodes; parse {d}ms, lower {d}ms, bake {d}ms)", .{
+        hex,
+        bytes.len,
+        interp_ir.image.inline_forest_nodes,
+        (tb_parse - tb0) / 1_000_000,
+        (tb_build - tb_pre) / 1_000_000,
+        (tb_bake - tb_build) / 1_000_000,
     });
-    return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };
+
+    // From here the run is a warm one over the bytes just baked. A rejected
+    // image is a bug in the bake; the caller's from-source path still runs
+    // the program.
+    const loaded = (image.load(gpa, bytes) catch null) orelse {
+        trace(gpa, "the baked image does not load: {s}", .{image.lastLoadFailure()});
+        return null;
+    };
+    const tb_load = runtime.clockMonotonicNanos();
+    const heap_bytes = heap.mapped.load(.monotonic);
+    dropBuildHeap(heap);
+    heap_released = true;
+    const tb_drop = runtime.clockMonotonicNanos();
+    trace(gpa, "  dropped the build heap: {d}mb in {d}us", .{ heap_bytes / (1024 * 1024), (tb_drop - tb_load) / 1000 });
+    const out = finishFromLoaded(gpa, loaded, user, paths, bindings);
+    trace(gpa, "  after bake: load {d}ms, drop {d}ms, extend {d}ms", .{
+        (tb_load - tb_bake) / 1_000_000,
+        (tb_drop - tb_load) / 1_000_000,
+        (runtime.clockMonotonicNanos() - tb_drop) / 1_000_000,
+    });
+    return out;
+}
+
+/// Unmaps the build heap. The stage's picks point into it, and the run
+/// publishes its own from the image.
+fn dropBuildHeap(heap: *runtime.slab.Heap) void {
+    if (ir_mod.pending_eager_calls) |*old| old.deinit();
+    ir_mod.pending_eager_calls = null;
+    runtime.slab.releaseAll(heap);
 }
 
 /// `klio bake-image --stdlib-cache <dir>`: bake the stdlib-only image, keyed
@@ -1172,25 +1208,33 @@ fn bakeAndPrepare(
 pub fn bakeStdlibCache(gpa: Allocator, dir: []const u8, features: *const RequestedFeatures) u8 {
     cache_dir_override = dir;
     defer cache_dir_override = null;
-    force_sync = true;
-    defer force_sync = false;
     const cache = cacheDir(gpa) orelse {
         io.printStderr(gpa, "error: cannot create {s}\n", .{dir});
         return 1;
     };
     defer gpa.free(cache);
-    const probe = std.fs.path.join(gpa, &.{ cache, "probe.kt" }) catch return 1;
-    defer gpa.free(probe);
-    writeAtomic(gpa, cache, probe, "fun main() {}\n");
-    defer {
-        var threaded = threadedIo(gpa);
-        defer threaded.deinit();
-        std.Io.Dir.cwd().deleteFile(threaded.io(), probe) catch {};
-    }
-    const prepared = tryPrepare(gpa, &.{probe}, features);
-    if (prepared == null) {
-        io.printStderr(gpa, "error: the stdlib image did not bake into {s}\n", .{dir});
-        return 1;
+    // Two images, one per gate: the implicit one an import-free program looks
+    // up, and the full one a program with a stdlib import looks up, which is
+    // also what a program that pulls packs in builds its own base on.
+    const probes = [_]struct { name: []const u8, source: []const u8 }{
+        .{ .name = "probe.kt", .source = "fun main() {}\n" },
+        .{ .name = "probe_full.kt", .source = "import kotlin.math.abs\nfun main() { abs(1) }\n" },
+    };
+    for (probes) |pr| {
+        const probe = std.fs.path.join(gpa, &.{ cache, pr.name }) catch return 1;
+        defer gpa.free(probe);
+        writeAtomic(gpa, cache, probe, pr.source);
+        defer {
+            var threaded = threadedIo(gpa);
+            defer threaded.deinit();
+            std.Io.Dir.cwd().deleteFile(threaded.io(), probe) catch {};
+        }
+        const prepared = tryPrepare(gpa, &.{probe}, features);
+        finishBackgroundBake();
+        if (prepared == null) {
+            io.printStderr(gpa, "error: the stdlib image did not bake into {s}\n", .{dir});
+            return 1;
+        }
     }
     return 0;
 }
@@ -1256,7 +1300,7 @@ pub fn bundleBaseImage(
     const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse return null;
     base.user_file_start = @intCast(deps.map.files.items.len);
     checkBaseSources(gpa, base, deps.asts);
-    const bytes = (image.bake(gpa, base, deps.map, .{
+    const bytes = (image.bake(gpa, gpa, base, deps.map, .{
         .known_packages = report.known_packages.items,
         .binding_fqns = report.binding_fqns.items,
     }) catch return null) orelse return null;

@@ -326,7 +326,7 @@ const ExtraKnownPackages = struct {
         self.lock.lock();
         defer self.lock.unlock();
         if (self.set == null) self.set = .empty;
-        const a = std.heap.page_allocator;
+        const a = runtime.slab.allocator;
         const owned = a.dupe(u8, pkg) catch return;
         self.set.?.put(a, owned, {}) catch {};
     }
@@ -642,7 +642,7 @@ fn paramIndex() *const std.StringHashMapUnmanaged([]const []const u8) {
 }
 
 fn buildParamIndex() std.mem.Allocator.Error!void {
-    const a = std.heap.page_allocator;
+    const a = runtime.slab.allocator;
     for (generated.stdlibSymbols()) |e| {
         if (e.param_names.len == 0) continue;
         const gop = try param_index.getOrPut(a, e.fqn);

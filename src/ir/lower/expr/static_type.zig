@@ -1187,9 +1187,11 @@ const TyMemo = struct {
 };
 threadlocal var ty_memo: TyMemo = .{};
 
-/// The memo outlives any one function build, so its storage is process-lifetime.
+/// The memo outlives any one function build, so its storage is the process
+/// heap: what a query's clear frees goes back to it and its pages return to
+/// the OS, where a free-list allocator kept every thread's peak mapped.
 fn memoAlloc() std.mem.Allocator {
-    return std.heap.smp_allocator;
+    return runtime.slab.allocator;
 }
 
 fn tyMemoOn() bool {

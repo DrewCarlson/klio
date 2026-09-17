@@ -178,32 +178,51 @@ pub fn setInlineFnAsts(m: std.StringHashMap([]const FnField)) void {
     inline_id_by_fn = null;
 }
 
+/// A table key of an owner and a member name, and for a function its arity.
+/// The slices are the declarations' own names, which live as long as the
+/// entries they key, so registering a member formats and allocates nothing.
+const MemberKey = struct { owner: []const u8, name: []const u8, arity: usize = 0 };
+
+const MemberKeyContext = struct {
+    pub fn hash(_: @This(), k: MemberKey) u64 {
+        var h = std.hash.Wyhash.init(k.arity);
+        h.update(k.owner);
+        h.update(&[_]u8{0x1f});
+        h.update(k.name);
+        return h.final();
+    }
+    pub fn eql(_: @This(), a: MemberKey, b: MemberKey) bool {
+        return a.arity == b.arity and std.mem.eql(u8, a.owner, b.owner) and std.mem.eql(u8, a.name, b.name);
+    }
+};
+
+fn MemberMap(comptime V: type) type {
+    return std.HashMap(MemberKey, V, MemberKeyContext, std.hash_map.default_max_load_percentage);
+}
+
 /// Record one top-level `inline fun`'s AST under its phase-1 header stub `FuncId`,
 /// called inside the stub loop so every id the symbol index can resolve has its AST
 /// on file before phase-2 body lowering. The container outlives the build arena; the
 /// AST pointers share it, exactly like `inline_fn_asts`.
-var expr_body_members: ?std.StringHashMap(FnField) = null;
+var expr_body_members: ?MemberMap(FnField) = null;
 
 /// Record an expression-bodied member with no return annotation under its
 /// (owner, name, arity) key, so a caller lowered before the member's own decl pass
 /// derives the inferred return on demand.
 pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem.Allocator.Error!void {
     if (expr_body_members == null) {
-        expr_body_members = std.StringHashMap(FnField).init(std.heap.page_allocator);
+        expr_body_members = MemberMap(FnField).init(runtime.slab.allocator);
     }
-    const key = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}\x1f{d}", .{ owner, f.name.name, f.params.len });
     if (runtime.envSetOnce("KLIO_EBM_TRACE") and std.mem.eql(u8, f.name.name, "createOnCancellationAction"))
         std.debug.print("[ebm] register owner={s} arity={d}\n", .{ owner, f.params.len });
-    try expr_body_members.?.put(key, FnField.fromPtr(f));
+    try expr_body_members.?.put(.{ .owner = owner, .name = f.name.name, .arity = f.params.len }, FnField.fromPtr(f));
 }
 
-/// Drop every registered expression-body member AST and free the owned keys. The
-/// pointers share one program's build arena, so an in-process driver must clear them
-/// at the run boundary.
+/// Drop every registered expression-body member AST. The pointers and the
+/// keys share one program's build arena, so an in-process driver must clear
+/// them at the run boundary.
 pub fn resetExprBodyMembers() void {
     if (expr_body_members) |*m| {
-        var it = m.keyIterator();
-        while (it.next()) |k| std.heap.page_allocator.free(k.*);
         m.deinit();
         expr_body_members = null;
     }
@@ -211,17 +230,14 @@ pub fn resetExprBodyMembers() void {
 
 /// The registered expression body for (owner, name, arity), or null.
 pub fn exprBodyMemberAst(owner: []const u8, name: []const u8, nparams: usize) ?*const ast.Function {
-    var buf: [256]u8 = undefined;
     if (runtime.envSetOnce("KLIO_EBM_TRACE") and std.mem.eql(u8, name, "createOnCancellationAction"))
         std.debug.print("[ebm] lookup owner={s} arity={d} n={d}\n", .{ owner, nparams, if (expr_body_members) |m| m.count() else 0 });
     if (expr_body_members) |*m| {
-        const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner, name, nparams }) catch return null;
-        if (m.get(key)) |ff| return ff.get();
+        if (m.get(.{ .owner = owner, .name = name, .arity = nparams })) |ff| return ff.get();
         // A lifted nested class spells `Outer$Inner` while the registration walk
         // spells the source-simple `Inner`; normalize on miss.
         if (std.mem.findScalarLast(u8, owner, '$')) |d| {
-            const key2 = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner[d + 1 ..], name, nparams }) catch return null;
-            if (m.get(key2)) |ff| return ff.get();
+            if (m.get(.{ .owner = owner[d + 1 ..], .name = name, .arity = nparams })) |ff| return ff.get();
         }
     }
     return null;
@@ -229,7 +245,7 @@ pub fn exprBodyMemberAst(owner: []const u8, name: []const u8, nparams: usize) ?*
 
 pub fn registerInlineFnId(id: u32, f: FnField) std.mem.Allocator.Error!void {
     if (inline_fn_ids == null) {
-        inline_fn_ids = std.AutoHashMap(u32, FnField).init(std.heap.page_allocator);
+        inline_fn_ids = std.AutoHashMap(u32, FnField).init(runtime.slab.allocator);
     }
     try inline_fn_ids.?.put(id, f);
 }
@@ -242,7 +258,7 @@ pub fn inlineAstById(id: u32) ?*const ast.Function {
         if (m.get(id)) |ff| {
             const f = ff.get();
             if (inline_id_by_fn == null) {
-                inline_id_by_fn = std.AutoHashMap(usize, u32).init(std.heap.page_allocator);
+                inline_id_by_fn = std.AutoHashMap(usize, u32).init(runtime.slab.allocator);
             }
             inline_id_by_fn.?.put(@intFromPtr(f), id) catch {};
             return f;
@@ -291,26 +307,25 @@ pub fn candidatesForName(name: []const u8) ?[]const *const ast.Function {
 /// build before registering owners.
 pub fn resetInlineMemberOwners() void {
     if (inline_member_owner) |*m| m.deinit();
-    inline_member_owner = std.AutoHashMap(usize, []const u8).init(std.heap.page_allocator);
+    inline_member_owner = std.AutoHashMap(usize, []const u8).init(runtime.slab.allocator);
 }
 
 /// Member and object property ASTs by `owner\x1fname`, so reified-type-argument
 /// inference can resolve a property-access argument's declared generic type. Keys
 /// live in the build arena, under the same teardown discipline as the other tables.
-threadlocal var member_prop_asts: ?std.StringHashMap(*const ast.Property) = null;
+threadlocal var member_prop_asts: ?MemberMap(*const ast.Property) = null;
 
 /// Drop the previous build's property-AST map and start a fresh one.
 pub fn resetMemberPropAsts() void {
     if (member_prop_asts) |*m| m.deinit();
-    member_prop_asts = std.StringHashMap(*const ast.Property).init(std.heap.page_allocator);
+    member_prop_asts = MemberMap(*const ast.Property).init(runtime.slab.allocator);
 }
 
 /// Record that class or object `owner` declares property `p`. First registration
 /// wins, mirroring `class_index` collision semantics.
-pub fn registerMemberPropAst(a: std.mem.Allocator, owner: []const u8, p: *const ast.Property) void {
+pub fn registerMemberPropAst(owner: []const u8, p: *const ast.Property) void {
     if (member_prop_asts == null) resetMemberPropAsts();
-    const key = std.fmt.allocPrint(a, "{s}\x1f{s}", .{ owner, p.name.name }) catch return;
-    const gop = member_prop_asts.?.getOrPut(key) catch return;
+    const gop = member_prop_asts.?.getOrPut(.{ .owner = owner, .name = p.name.name }) catch return;
     if (gop.found_existing) return;
     gop.value_ptr.* = p;
 }
@@ -318,9 +333,7 @@ pub fn registerMemberPropAst(a: std.mem.Allocator, owner: []const u8, p: *const 
 /// The property AST `owner` declares under `name`, or null.
 pub fn memberPropAst(owner: []const u8, name: []const u8) ?*const ast.Property {
     const m = member_prop_asts orelse return null;
-    var buf: [512]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ owner, name }) catch return null;
-    return m.get(key);
+    return m.get(.{ .owner = owner, .name = name });
 }
 
 /// Member-extension property receiver-type heads by `owner\x1fname`. Distinct from
@@ -328,19 +341,18 @@ pub fn memberPropAst(owner: []const u8, name: []const u8) ?*const ast.Property {
 /// same-named member and a member-extension property and the member would hide it.
 /// Used at a read site to detect that the receiver's static type resolves the read
 /// to the in-scope extension getter rather than a stored field.
-threadlocal var member_ext_prop_recv: ?std.StringHashMap([]const u8) = null;
+threadlocal var member_ext_prop_recv: ?MemberMap([]const u8) = null;
 
 pub fn resetMemberExtPropRecv() void {
     if (member_ext_prop_recv) |*m| m.deinit();
-    member_ext_prop_recv = std.StringHashMap([]const u8).init(std.heap.page_allocator);
+    member_ext_prop_recv = MemberMap([]const u8).init(runtime.slab.allocator);
 }
 
 /// Record that class `owner` declares a member-extension property `name` whose
 /// extension-receiver type head is `recv_head`.
-pub fn registerMemberExtPropRecv(a: std.mem.Allocator, owner: []const u8, name: []const u8, recv_head: []const u8) void {
+pub fn registerMemberExtPropRecv(owner: []const u8, name: []const u8, recv_head: []const u8) void {
     if (member_ext_prop_recv == null) resetMemberExtPropRecv();
-    const key = std.fmt.allocPrint(a, "{s}\x1f{s}", .{ owner, name }) catch return;
-    const gop = member_ext_prop_recv.?.getOrPut(key) catch return;
+    const gop = member_ext_prop_recv.?.getOrPut(.{ .owner = owner, .name = name }) catch return;
     if (gop.found_existing) return;
     gop.value_ptr.* = recv_head;
 }
@@ -349,9 +361,7 @@ pub fn registerMemberExtPropRecv(a: std.mem.Allocator, owner: []const u8, name: 
 /// declares under `name`, or null when it declares no such extension.
 pub fn memberExtPropRecv(owner: []const u8, name: []const u8) ?[]const u8 {
     const m = member_ext_prop_recv orelse return null;
-    var buf: [512]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ owner, name }) catch return null;
-    return m.get(key);
+    return m.get(.{ .owner = owner, .name = name });
 }
 
 /// Declared supertype references, with their type arguments, by class or object
@@ -361,7 +371,7 @@ threadlocal var class_supertype_refs: ?std.StringHashMap([]const ast.TypeRef) = 
 
 pub fn resetClassSupertypeRefs() void {
     if (class_supertype_refs) |*m| m.deinit();
-    class_supertype_refs = std.StringHashMap([]const ast.TypeRef).init(std.heap.page_allocator);
+    class_supertype_refs = std.StringHashMap([]const ast.TypeRef).init(runtime.slab.allocator);
 }
 
 /// Record `name`'s declared supertypes. First registration wins, matching the
@@ -400,7 +410,7 @@ fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
     const fields = (if (inline_fn_asts) |*c| c.get(name) else null) orelse return null;
     // Resolve this name's candidates once, decoding only their forest decls, and
     // cache the pointer slice so the picking logic stays pointer-based.
-    const a = std.heap.page_allocator;
+    const a = runtime.slab.allocator;
     var buf = a.alloc(*const ast.Function, fields.len) catch return null;
     // A `@Deprecated(level = ERROR|HIDDEN)` or `@LowPriorityInOverloadResolution`
     // inline overload is not a source-level candidate, yet a binary-compat form can
@@ -839,8 +849,8 @@ pub const ThreadState = struct {
     inline_id_by_fn: ?std.AutoHashMap(usize, u32),
     inline_member_owner: ?std.AutoHashMap(usize, []const u8),
     top_level_prop_names: ?StringSet,
-    member_prop_asts: ?std.StringHashMap(*const ast.Property),
-    member_ext_prop_recv: ?std.StringHashMap([]const u8),
+    member_prop_asts: ?MemberMap(*const ast.Property),
+    member_ext_prop_recv: ?MemberMap([]const u8),
     class_supertype_refs: ?std.StringHashMap([]const ast.TypeRef),
 };
 

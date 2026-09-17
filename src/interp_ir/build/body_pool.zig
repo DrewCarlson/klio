@@ -326,7 +326,15 @@ fn sharedFootprint(m: *const Module) SharedFootprint {
 /// slice.
 pub fn lower(ctx: *BuildCtx, jobs: []const Job) Allocator.Error!?[]Func {
     const threads = threadCount(jobs.len);
-    if (threads < 2 or ctx.base != null) return null;
+    if (threads < 2) return null;
+    // Over a base a program extends, the bodies lower serially as they
+    // always have; over a materialised image, whose functions are all in
+    // memory and which a build on top extends as a fresh base, the pool
+    // runs as it does for a fresh build, and the merge numbers what it
+    // appends past the base's ids as the serial pass would.
+    if (ctx.base) |bs| {
+        if (!bs.materialized or ctx.module.func_header_offsets.len != 0) return null;
+    }
     const a = ctx.module.registry.allocator;
     const t0 = runtime.clockMonotonicNanos();
     try ctx.module.warmLookupCaches();

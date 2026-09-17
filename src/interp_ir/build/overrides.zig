@@ -121,6 +121,8 @@ pub const BuildCtx = struct {
     func_fqn_overrides: *const SpanStrMap,
     decl_pkg: *const SpanStrMap,
     base: ?*const StdlibBase,
+    /// The base is this build's alone, extended in place and used once.
+    own_base: bool,
     package_prefix: []const u8,
     /// Marks from the seed clone: registry materialisation appends only past these.
     base_funcs_len: usize,
@@ -239,6 +241,7 @@ pub const BuildCtx = struct {
             .func_fqn_overrides = func_fqn_overrides,
             .decl_pkg = decl_pkg,
             .base = base,
+            .own_base = own_base,
             .package_prefix = package_prefix,
             .base_funcs_len = base_funcs_len,
             .base_classes_len = base_classes_len,
@@ -413,7 +416,18 @@ pub fn buildModuleWithOverrides(
     phase.mark("registerClassTypeAliasShapes");
     // Member signatures need the same source-order independence as top-level headers: the
     // trailing receiver-lambda portion is recorded before any class body lowers.
-    try collectMemberTrailingLambdaShapes(ctx.module, &ctx.file_classes);
+    // A base's classes carry their shapes in its registry; only this build's
+    // own classes are collected, so no base class is decoded for it.
+    if (ctx.base != null) {
+        var own = FileClasses.init(ctx.a);
+        defer own.deinit();
+        for (ctx.decls) |*d| {
+            if (d.* == .Class) try own.put(d.Class.name.name, FF(ast.Class).fromPtr(&d.Class));
+        }
+        try collectMemberTrailingLambdaShapes(ctx.module, &own);
+    } else {
+        try collectMemberTrailingLambdaShapes(ctx.module, &ctx.file_classes);
+    }
     phase.mark("collectMemberTrailingLambdaShapes");
     try fillReservedClassPrimaryParams(&ctx);
     phase.mark("fillReservedClassPrimaryParams");
@@ -910,34 +924,63 @@ fn registerHierarchyMethodNames(ctx: *BuildCtx) Allocator.Error!void {
     const fqn_overrides = ctx.fqn_overrides;
     const package_prefix = ctx.package_prefix;
     const file_classes = &ctx.file_classes;
-    // Per-class transitive member-function-name set; seeded base classes already carry theirs.
-    {
+    // Per-class transitive member-function-name set. A base's classes carry
+    // theirs, so only this build's own classes are walked: touching a base
+    // class here would decode its declaration from the image for nothing.
+    var own = OwnClasses.of(ctx);
+    while (own.next()) |oc| {
+        const cname = oc.name;
+        const c = oc.class;
         // A class also records its hierarchy's method names under its qualified name, so a reader
         // holding the fqn gets an exact answer when two packages share a simple name.
-        var it = file_classes.iterator();
-        while (it.next()) |kv| {
-            const cname = kv.key_ptr.*;
-            const c = kv.value_ptr.get();
-            const cfqn = try resolveFqn(a, fqn_overrides, c.name.span, package_prefix, cname);
-            const fqn_wanted = !std.mem.eql(u8, cfqn, cname) and
-                !module.registry.hierarchy_methods.contains(cfqn);
-            const simple_wanted = !module.registry.hierarchy_methods.contains(cname);
-            if (!fqn_wanted and !simple_wanted) continue;
-            var methods = StringSet.init(a);
-            var seen = StringSet.init(a);
-            defer seen.deinit();
-            try collectHierarchyMethodNames(cname, file_classes, &methods, &seen);
-            if (simple_wanted and fqn_wanted) {
-                try module.registry.hierarchy_methods.put(cname, try methods.clone());
-                try module.registry.hierarchy_methods.put(cfqn, methods);
-            } else if (simple_wanted) {
-                try module.registry.hierarchy_methods.put(cname, methods);
-            } else {
-                try module.registry.hierarchy_methods.put(cfqn, methods);
-            }
+        const cfqn = try resolveFqn(a, fqn_overrides, c.name.span, package_prefix, cname);
+        const fqn_wanted = !std.mem.eql(u8, cfqn, cname) and
+            !module.registry.hierarchy_methods.contains(cfqn);
+        const simple_wanted = !module.registry.hierarchy_methods.contains(cname);
+        if (!fqn_wanted and !simple_wanted) continue;
+        var methods = StringSet.init(a);
+        var seen = StringSet.init(a);
+        defer seen.deinit();
+        try collectHierarchyMethodNames(cname, file_classes, &methods, &seen);
+        if (simple_wanted and fqn_wanted) {
+            try module.registry.hierarchy_methods.put(cname, try methods.clone());
+            try module.registry.hierarchy_methods.put(cfqn, methods);
+        } else if (simple_wanted) {
+            try module.registry.hierarchy_methods.put(cname, methods);
+        } else {
+            try module.registry.hierarchy_methods.put(cfqn, methods);
         }
     }
 }
+
+/// The classes a pass registers per class: every class in scope for a
+/// fresh build, and only the build's own top-level classes over a base,
+/// whose classes registered theirs in the build that made the base.
+const OwnClasses = struct {
+    decls: []Decl,
+    file_classes: ?FileClasses.Iterator,
+    i: usize = 0,
+
+    const Entry = struct { name: []const u8, class: *const ast.Class };
+
+    fn of(ctx: *BuildCtx) OwnClasses {
+        if (ctx.base != null) return .{ .decls = ctx.decls, .file_classes = null };
+        return .{ .decls = &.{}, .file_classes = ctx.file_classes.iterator() };
+    }
+
+    fn next(self: *OwnClasses) ?Entry {
+        if (self.file_classes) |*it| {
+            const kv = it.next() orelse return null;
+            return .{ .name = kv.key_ptr.*, .class = kv.value_ptr.get() };
+        }
+        while (self.i < self.decls.len) {
+            const d = &self.decls[self.i];
+            self.i += 1;
+            if (d.* == .Class) return .{ .name = d.Class.name.name, .class = &d.Class };
+        }
+        return null;
+    }
+};
 
 fn registerHierarchyShadowNames(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
@@ -1196,14 +1239,15 @@ fn registerShadowedStorageProps(ctx: *BuildCtx) Allocator.Error!void {
     const module = ctx.module;
     const file_classes = &ctx.file_classes;
     // Kotlin gives a private stored property shadowing a supertype's same-named declaration its own
-    // cell, so construction and the accessors use the owner-mangled key.
+    // cell, so construction and the accessors use the owner-mangled key. A base's
+    // classes carry their entries, so only this build's own classes are walked.
     {
-        var it = file_classes.iterator();
-        while (it.next()) |e| {
-            const cname = e.key_ptr.*;
+        var own = OwnClasses.of(ctx);
+        while (own.next()) |oc| {
+            const cname = oc.name;
             const chain = module.registry.class_super_names.get(cname) orelse continue;
             if (chain.len == 0) continue;
-            const c = e.value_ptr.get();
+            const c = oc.class;
             var prop_i: usize = 0;
             _ = &prop_i;
             const record = struct {
@@ -1305,18 +1349,36 @@ fn installMemberAstTables(ctx: *BuildCtx) Allocator.Error!void {
     // The owner class of every inline member fn, keyed by AST pointer, so a bare call to a name
     // declared inline in several unrelated classes binds the enclosing class's overload.
     {
-        ir.lower.resetInlineMemberOwners();
-        ir.lower.resetMemberPropAsts();
-        ir.lower.resetClassSupertypeRefs();
-        ir.lower.resetMemberExtPropRecv();
-        // Same lifetime rule: the registered expression-body member ASTs point into the previous build's arena.
-        ir.lower.resetExprBodyMembers();
-        var fcit = file_classes.iterator();
-        while (fcit.next()) |e| {
-            registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
-            registerMemberPropAsts(a, e.value_ptr.get().members, e.value_ptr.get().name.name, resolveFqn(a, fqn_overrides, e.value_ptr.get().span, package_prefix, e.value_ptr.get().name.name) catch null);
-            ir.lower.registerClassSupertypeRefs(e.value_ptr.get().name.name, e.value_ptr.get().supertypes);
-            registerClassSupertypes(e.value_ptr.get().members);
+        // A base built in this process, on this thread, and extended once in
+        // place still has every base class registered from its own build:
+        // this build adds its declarations to those tables. Any other base
+        // starts the tables over, since what they held points into a build
+        // that is gone or into an image's decoded declarations.
+        const live = if (ctx.base) |bs| bs.tables_live and ctx.own_base else false;
+        if (live) {
+            @constCast(ctx.base.?).tables_live = false;
+            for (decls) |*d| {
+                if (d.* != .Class) continue;
+                const c = &d.Class;
+                registerInlineMemberOwners(c.members, c.name.name);
+                registerMemberPropAsts(a, c.members, c.name.name, resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name) catch null);
+                ir.lower.registerClassSupertypeRefs(c.name.name, c.supertypes);
+                registerClassSupertypes(c.members);
+            }
+        } else {
+            ir.lower.resetInlineMemberOwners();
+            ir.lower.resetMemberPropAsts();
+            ir.lower.resetClassSupertypeRefs();
+            ir.lower.resetMemberExtPropRecv();
+            // Same lifetime rule: the registered expression-body member ASTs point into the previous build's arena.
+            ir.lower.resetExprBodyMembers();
+            var fcit = file_classes.iterator();
+            while (fcit.next()) |e| {
+                registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
+                registerMemberPropAsts(a, e.value_ptr.get().members, e.value_ptr.get().name.name, resolveFqn(a, fqn_overrides, e.value_ptr.get().span, package_prefix, e.value_ptr.get().name.name) catch null);
+                ir.lower.registerClassSupertypeRefs(e.value_ptr.get().name.name, e.value_ptr.get().supertypes);
+                registerClassSupertypes(e.value_ptr.get().members);
+            }
         }
         for (decls) |*d| {
             switch (d.*) {
@@ -1336,8 +1398,8 @@ fn installInlineFnTables(ctx: *BuildCtx) Allocator.Error!void {
     // Every `inline fun` body, available to the lowerer by simple name. The three tables install
     // into build-scoped thread-locals, each `deinit`ing the table left by the PREVIOUS build, whose
     // `a` is typically an already-torn-down per-run arena, so the containers are backed by the
-    // process-lifetime page allocator while keys and value slices stay in the build arena.
-    const tl = std.heap.page_allocator;
+    // process heap while keys and value slices stay in the build arena.
+    const tl = runtime.slab.allocator;
     {
         var inline_fns = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(a);
         // Base inline fns first, preserving whole-program declaration order per overload list.
@@ -1392,7 +1454,7 @@ fn installTopLevelPropNames(ctx: *BuildCtx) Allocator.Error!void {
     const func_fqn_overrides = ctx.func_fqn_overrides;
     const decl_pkg = ctx.decl_pkg;
     const package_prefix = ctx.package_prefix;
-    const tl = std.heap.page_allocator;
+    const tl = runtime.slab.allocator;
     // Top-level property names with each declaration's scoping identity, so a bare read ranks under
     // Kotlin scoping exactly as a bare call does.
     {
@@ -3473,7 +3535,7 @@ fn settleDefaultArgThunks(ctx: *BuildCtx) Allocator.Error!void {
         }
     }
 
-    try propagateInheritedDefaults(a, module, func_defaults);
+    try propagateInheritedDefaults(a, module, func_defaults, ctx.base_classes_len);
 }
 
 fn registerTypeAliasTags(ctx: *BuildCtx) Allocator.Error!void {

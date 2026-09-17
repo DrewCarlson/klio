@@ -57,6 +57,8 @@ pub const EmbeddedReport = struct {
     gate_full: bool = false,
     known_packages: std.ArrayList([]const u8) = .empty,
     binding_fqns: std.ArrayList([]const u8) = .empty,
+    /// How many of the returned ASTs are the stdlib's, listed last.
+    stdlib_asts: usize = 0,
     timing: ParseTiming = .{},
 };
 
@@ -98,6 +100,11 @@ pub const Selection = struct {
 pub const LoadOptions = struct {
     /// When false, only cache packs load; the caller supplies the lowered stdlib.
     include_stdlib: bool = true,
+    /// Where the stdlib's sources register when not `source_map`: a build on
+    /// top of the stdlib image stages the stdlib from a scratch map whose ids
+    /// are the image's, and lowers only the packs, which register on
+    /// `source_map` after the image's files.
+    stdlib_map: ?*SourceMap = null,
     embedded_report: ?*EmbeddedReport = null,
     selection: ?*Selection = null,
     /// When false, an undecodable wanted pack is skipped without the warning.
@@ -414,7 +421,7 @@ const parse_worker_stack: usize = 64 * 1024 * 1024;
 
 /// Whether `a` may serve several threads at once: only the process allocators
 /// that document it. A wrapped or arena allocator parses serially.
-fn allocatorIsThreadSafe(a: Allocator) bool {
+pub fn allocatorIsThreadSafe(a: Allocator) bool {
     return a.vtable == runtime.slab.allocator.vtable or
         a.vtable == std.heap.smp_allocator.vtable or
         a.vtable == std.heap.c_allocator.vtable or
@@ -732,9 +739,11 @@ fn loadEmbeddedStdlibSources(
 ) Allocator.Error!void {
     const t_start = runtime.clockMonotonicNanos();
     var timing: ParseTiming = .{};
+    const asts_before = out_asts.items.len;
     defer if (report) |rep| {
         timing.total = runtime.clockMonotonicNanos() - t_start;
         rep.timing = timing;
+        rep.stdlib_asts = out_asts.items.len - asts_before;
     };
 
     var env = procEnvMap(allocator);
@@ -949,7 +958,9 @@ fn dottedPrefix(allocator: Allocator, s: []const u8, prefix: []const u8) bool {
 
 
 const PackCandidate = struct {
-    pack: PackReader,
+    /// The pack by its header: its manifest cost a few hundred bytes to read,
+    /// and a program that selects it reads the sections it needs by position.
+    pack: pack.LazyPack,
     manifest: schema.PackManifest,
     path: []u8,
 
@@ -1010,12 +1021,8 @@ fn collectPackCandidates(allocator: Allocator, cache: []const u8, failures: *std
         const path = try std.fs.path.join(allocator, &.{ cache, entry.name });
         var keep_path = false;
         defer if (!keep_path) allocator.free(path);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(fio, path, allocator, .unlimited) catch {
-            try appendFailure(allocator, failures, path, "the file could not be read", .{});
-            continue;
-        };
         var err: PackError = undefined;
-        var reader = ((PackReader.fromBytes(allocator, bytes, &err) catch continue) orelse {
+        var reader = ((pack.LazyPack.fromPath(allocator, path, &err) catch continue) orelse {
             try appendFailure(allocator, failures, path, "{f}", .{err});
             continue;
         });
@@ -1359,9 +1366,10 @@ fn loadPackCandidate(
     try readPackBindings(allocator, reader, lib_id, merged, out_bindings);
 }
 
+/// `reader` is a `PackReader` or a `LazyPack`; both read a section by name.
 fn readPackBindings(
     allocator: Allocator,
-    reader: *const PackReader,
+    reader: anytype,
     lib_id: []const u8,
     merged: *const HostBindings,
     out_bindings: *HostBindings,
@@ -1490,7 +1498,7 @@ fn loadInstalledPacksImpl(
         .err => |e| {
             gpa.free(e);
             if (opts.include_stdlib) {
-                try loadEmbeddedStdlibSources(gpa, &user_import_prefixes, source_map, &out_asts, &out_bindings, opts.embedded_report);
+                try loadEmbeddedStdlibSources(gpa, &user_import_prefixes, opts.stdlib_map orelse source_map, &out_asts, &out_bindings, opts.embedded_report);
             }
             return .{ .asts = try out_asts.toOwnedSlice(gpa), .bindings = out_bindings };
         },
@@ -1739,7 +1747,7 @@ fn loadInstalledPacksImpl(
     }
 
     if (opts.include_stdlib) {
-        try loadEmbeddedStdlibSources(gpa, &known_prefixes, source_map, &out_asts, &out_bindings, opts.embedded_report);
+        try loadEmbeddedStdlibSources(gpa, &known_prefixes, opts.stdlib_map orelse source_map, &out_asts, &out_bindings, opts.embedded_report);
     }
 
     // Hint at features the imports need. Drop hints for packages something else

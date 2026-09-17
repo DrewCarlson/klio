@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ast = @import("ast");
 const ir = @import("ir");
+const runtime = @import("runtime");
 const Allocator = std.mem.Allocator;
 
 const Decl = ast.Decl;
@@ -83,6 +84,13 @@ pub const Detached = std.ArrayList(FunctionBody);
 /// frees in place, where its walk over the kept declarations then refuses a
 /// pointer into what was freed.
 pub fn stripDeadBodiesDeferring(decls: []Decl, keep_composable_sigs: bool, allocator: ?Allocator, pinned: ?*const Pinned, deferred: ?*Detached) Released {
+    if (builtin.mode != .Debug) {
+        if (deferred) |out| {
+            if (allocator) |a| {
+                if (stripOnThreads(decls, keep_composable_sigs, a, pinned, out)) |stats| return stats;
+            }
+        }
+    }
     var rel = BodyRelease{ .allocator = allocator, .pinned = pinned, .deferred = if (builtin.mode == .Debug) null else deferred };
     defer rel.deinit();
     for (decls) |*d| pruneDecl(d, true, keep_composable_sigs, &rel);
@@ -97,6 +105,69 @@ pub fn stripDeadBodiesDeferring(decls: []Decl, keep_composable_sigs: bool, alloc
         }
     }
     return rel.stats;
+}
+
+/// The strip over contiguous runs of the declarations on threads: each walks
+/// its own declarations against the shared, read-only pinned set and
+/// detaches into its own list, which the caller's list then takes over. Null
+/// when there is too little to share out, so the caller strips in place.
+fn stripOnThreads(decls: []Decl, keep_composable_sigs: bool, allocator: Allocator, pinned: ?*const Pinned, out: *Detached) ?Released {
+    const threads = stripThreads(decls.len);
+    if (threads < 2) return null;
+    const Part = struct {
+        decls: []Decl,
+        keep_sigs: bool,
+        allocator: Allocator,
+        pinned: ?*const Pinned,
+        detached: Detached = .empty,
+        stats: Released = .{},
+        thread: ?std.Thread = null,
+
+        fn run(self: *@This()) void {
+            defer runtime.slab.flushMagazines();
+            var rel = BodyRelease{ .allocator = self.allocator, .pinned = self.pinned, .deferred = &self.detached };
+            defer rel.deinit();
+            for (self.decls) |*d| pruneDecl(d, true, self.keep_sigs, &rel);
+            self.stats = rel.stats;
+        }
+    };
+    const parts = allocator.alloc(Part, threads) catch return null;
+    defer allocator.free(parts);
+    const per = (decls.len + threads - 1) / threads;
+    for (parts, 0..) |*part, i| {
+        const lo = @min(i * per, decls.len);
+        const hi = @min(lo + per, decls.len);
+        part.* = .{ .decls = decls[lo..hi], .keep_sigs = keep_composable_sigs, .allocator = allocator, .pinned = pinned };
+    }
+    for (parts[1..]) |*part| part.thread = std.Thread.spawn(.{}, Part.run, .{part}) catch null;
+    parts[0].run();
+    var total: Released = .{};
+    for (parts) |*part| {
+        if (part.thread) |t| t.join() else if (part != &parts[0]) part.run();
+        total.bodies += part.stats.bodies;
+        total.nodes += part.stats.nodes;
+        total.bytes += part.stats.bytes;
+        total.pinned_bodies += part.stats.pinned_bodies;
+        out.appendSlice(allocator, part.detached.items) catch {
+            // Out of room for the list: free these now rather than leak them.
+            _ = releaseDetached(allocator, part.detached.items);
+        };
+        part.detached.deinit(allocator);
+    }
+    return total;
+}
+
+/// One thread per sixty-four declarations, at most one per CPU, under the
+/// `KLIO_MAX_WORKERS` ceiling every pool honours.
+fn stripThreads(n_decls: usize) usize {
+    var n: usize = std.Thread.getCpuCount() catch 1;
+    if (runtime.envOnce("KLIO_MAX_WORKERS")) |v| {
+        if (std.fmt.parseInt(usize, v, 10)) |x| {
+            if (x != 0) n = @min(n, x);
+        } else |_| {}
+    }
+    n = @min(n, n_decls / 64);
+    return @max(n, 1);
 }
 
 /// Frees the bodies a deferring strip detached.

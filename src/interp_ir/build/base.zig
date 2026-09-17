@@ -67,6 +67,31 @@ pub const StdlibBase = struct {
     /// The bodies the strip detached and left for `prune.releaseDetached`: the
     /// run frees them beside its own work once the bake has its copy.
     detached_bodies: prune.Detached = .empty,
+    /// The forest slot an image's base decodes its declarations in; a
+    /// freshly built base has them live and no slot.
+    forest_slot: u32 = 0,
+    /// True once `image.materialize` brought an image's base wholly into
+    /// memory: its functions are eager and it builds on like a fresh base.
+    materialized: bool = false,
+    /// Per lifted declaration, the address of the declaration object the
+    /// lowering took its pointers into when that is not `lifted_decls[i]`
+    /// itself: a materialised image's decoded declaration, or the array a
+    /// build on top lowered from before its declarations joined the base's.
+    /// The bake aliases them to the same nodes. Empty for a fresh base.
+    lifted_origins: []const usize = &.{},
+    /// True for a base built in this process on this thread, whose member
+    /// AST tables are still installed: the one extend that owns it adds its
+    /// own declarations to them instead of registering every base class
+    /// again. An image's base decodes its declarations and starts over.
+    tables_live: bool = false,
+    /// What the compose pass collects over the base's declarations, taken
+    /// at bake for an image's base so a run extending it decodes none of
+    /// them; a freshly built base has its declarations and collects live.
+    compose_sets_baked: bool = false,
+    compose_names: []const []const u8 = &.{},
+    compose_sinks: []const []const u8 = &.{},
+    compose_getter_props: []const []const u8 = &.{},
+    compose_inline_fns: []const []const u8 = &.{},
     /// Per-decl encodings of `lifted_decls` with byte offsets (decl `i` at
     /// `lifted_decl_offsets[i]`), decoded on first touch. Borrow the image buffer.
     lifted_decl_section: []const u8 = &.{},
@@ -103,6 +128,13 @@ pub const StdlibBase = struct {
 /// image, and with it a dozen seconds on every run.
 pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
     return buildBaseInner(allocator, files, .allow);
+}
+
+/// `buildStdlibBase` up to the strip of the dead bodies, which `stripBase`
+/// then does: a caller with work that reads the module and nothing of the
+/// trees runs it beside the strip.
+pub fn buildStdlibBaseUnstripped(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
+    return buildBaseInnerOpts(allocator, files, .allow, false);
 }
 
 /// The parent's primary parameter at `idx`, instantiated by the supertype's written
@@ -159,6 +191,10 @@ pub fn buildProgramBase(allocator: Allocator, files: []const KotlinFile) Allocat
 pub const MainPolicy = enum { require, allow };
 
 pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_policy: MainPolicy) Allocator.Error!?*StdlibBase {
+    return buildBaseInnerOpts(allocator, files, main_policy, true);
+}
+
+fn buildBaseInnerOpts(allocator: Allocator, files: []const KotlinFile, main_policy: MainPolicy, strip: bool) Allocator.Error!?*StdlibBase {
     var lifted: []Decl = &.{};
     var built = try buildModuleFilesInner(allocator, files, null, &lifted, false);
     @import("module.zig").phase.mark("build-module-total");
@@ -207,37 +243,8 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
     // follow their package scoping; both join the general universe only.
     for (base.lifted_decls) |*d| try noteBaseDeclNames(base, d, false);
 
-    {
-        const mg = base.built.module.borrow();
-        defer mg.deinit();
-        const module = mg.get();
-        var inline_ids: std.ArrayList(StdlibBase.InlineId) = .empty;
-        for (module.funcs.items) |*f| {
-            for (f.params) |*p| try base.param_type_names.put(p.ty.name, {});
-            if (f.is_inline) {
-                if (ir.lower.inline_state.inlineAstById(f.id.int())) |fn_ast| {
-                    try inline_ids.append(allocator, .{ .id = f.id.int(), .f = FF(ast.Function).fromPtr(fn_ast) });
-                }
-            }
-        }
-        base.inline_ids = try inline_ids.toOwnedSlice(allocator);
-    }
-
-    // Continue the enum-entry identity sequence: identities run 1..N in build order.
-    {
-        var counted = std.AutoHashMap(usize, void).init(allocator);
-        defer counted.deinit();
-        var n: u64 = 0;
-        var it = base.built.classes.valueIterator();
-        while (it.next()) |def| {
-            const gop = try counted.getOrPut(@intFromPtr(def.cell));
-            if (gop.found_existing) continue;
-            const g = def.borrow();
-            n += g.get().enum_entries.len;
-            g.deinit();
-        }
-        base.enum_id_next = 1 + n;
-    }
+    try noteBaseFuncs(allocator, base);
+    try noteBaseEnumIds(allocator, base);
 
     // Answered once here so a run extending this base need not decode the whole
     // lifted section to discover there is nothing composable in it.
@@ -257,8 +264,137 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
         break :blk false;
     };
 
-    // A non-inline base function runs from its lowered IR, never its AST body, so stripping
-    // those bodies drops dead trees while keeping dispatch metadata.
+    base.tables_live = true;
+    @import("module.zig").phase.mark("base-bookkeeping");
+    if (strip) try stripBase(allocator, base);
+    return base;
+}
+
+/// A base of `prior` plus `files`, lowered on top of `prior` as a program
+/// would be and assembled into a base of its own, so it bakes as the image
+/// of the larger declaration set. `prior` must be materialised (its
+/// declarations and functions live, nothing read lazily from its image) and
+/// is consumed: its module is extended in place. Null when the files do not
+/// lower cleanly.
+pub fn buildStdlibBaseOnTop(allocator: Allocator, prior: *StdlibBase, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
+    var lifted: []Decl = &.{};
+    var built = try buildModuleFilesInner(allocator, files, prior, &lifted, true);
+    @import("module.zig").phase.mark("build-module-total");
+    {
+        const mg = built.module.borrow();
+        defer mg.deinit();
+        if (mg.get().resolve_diags.items.len != 0) {
+            built.deinit();
+            return null;
+        }
+    }
+    const base = try allocator.create(StdlibBase);
+    base.* = .{
+        .built = built,
+        .lifted_decls = blk: {
+            const all = try allocator.alloc(Decl, prior.lifted_decls.len + lifted.len);
+            @memcpy(all[0..prior.lifted_decls.len], prior.lifted_decls);
+            @memcpy(all[prior.lifted_decls.len..], lifted);
+            break :blk all;
+        },
+        .lifted_origins = blk: {
+            const origins = try allocator.alloc(usize, prior.lifted_decls.len + lifted.len);
+            for (origins[0..prior.lifted_decls.len], 0..) |*o, i| {
+                o.* = if (i < prior.lifted_origins.len) prior.lifted_origins[i] else @intFromPtr(&prior.lifted_decls[i]);
+            }
+            for (origins[prior.lifted_decls.len..], lifted) |*o, *d| o.* = @intFromPtr(d);
+            break :blk origins;
+        },
+        .decl_names = try cloneSet(allocator, &prior.decl_names),
+        .root_decl_names = try cloneSet(allocator, &prior.root_decl_names),
+        .packages = try cloneSet(allocator, &prior.packages),
+        .param_type_names = StringSet.init(allocator),
+        .type_names = try cloneSet(allocator, &prior.type_names),
+        .inline_ids = &.{},
+        .user_file_start = 0,
+        .enum_id_next = 1,
+        .arena = allocator,
+        .has_composables = prior.has_composables,
+    };
+    for (files) |*f| {
+        if (f.package) |p| {
+            var dotted: std.ArrayList(u8) = .empty;
+            for (p.path, 0..) |id, i| {
+                if (i != 0) try dotted.append(allocator, '.');
+                try dotted.appendSlice(allocator, id.name);
+            }
+            try base.packages.put(try dotted.toOwnedSlice(allocator), {});
+        }
+        for (f.decls) |*d| try noteBaseDeclNames(base, d, f.package == null);
+    }
+    for (lifted) |*d| try noteBaseDeclNames(base, d, false);
+    try noteBaseFuncs(allocator, base);
+    try noteBaseEnumIds(allocator, base);
+    if (!base.has_composables) {
+        var probe = StringSet.init(allocator);
+        defer probe.deinit();
+        for (files) |*f| {
+            for (f.decls) |*d| {
+                try composeBaseNameDecl(&probe, d);
+                if (probe.count() != 0) break;
+            }
+        }
+        base.has_composables = probe.count() != 0;
+    }
+    base.tables_live = true;
+    @import("module.zig").phase.mark("base-bookkeeping");
+    try stripBase(allocator, base);
+    return base;
+}
+
+/// The parameter type names and inline function ids the module's functions
+/// declare, for the reuse gate and the inline registry.
+fn noteBaseFuncs(allocator: Allocator, base: *StdlibBase) Allocator.Error!void {
+    const mg = base.built.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    var inline_ids: std.ArrayList(StdlibBase.InlineId) = .empty;
+    for (module.funcs.items) |*f| {
+        for (f.params) |*p| try base.param_type_names.put(p.ty.name, {});
+        if (f.is_inline) {
+            if (ir.lower.inline_state.inlineAstById(f.id.int())) |fn_ast| {
+                try inline_ids.append(allocator, .{ .id = f.id.int(), .f = FF(ast.Function).fromPtr(fn_ast) });
+            }
+        }
+    }
+    base.inline_ids = try inline_ids.toOwnedSlice(allocator);
+}
+
+/// Where a program's enum entry numbering continues from, past every entry
+/// the base's classes declare.
+fn noteBaseEnumIds(allocator: Allocator, base: *StdlibBase) Allocator.Error!void {
+    // Continue the enum-entry identity sequence: identities run 1..N in build order.
+    var counted = std.AutoHashMap(usize, void).init(allocator);
+    defer counted.deinit();
+    var n: u64 = 0;
+    var it = base.built.classes.valueIterator();
+    while (it.next()) |def| {
+        const gop = try counted.getOrPut(@intFromPtr(def.cell));
+        if (gop.found_existing) continue;
+        const g = def.borrow();
+        n += g.get().enum_entries.len;
+        g.deinit();
+    }
+    base.enum_id_next = 1 + n;
+}
+
+fn cloneSet(allocator: Allocator, src: *const StringSet) Allocator.Error!StringSet {
+    var out = StringSet.init(allocator);
+    try out.ensureTotalCapacity(src.count());
+    var it = src.keyIterator();
+    while (it.next()) |k| out.putAssumeCapacity(k.*, {});
+    return out;
+}
+
+/// Strips the base's dead bodies: a non-inline base function runs from its
+/// lowered IR, never its AST body, so the trees go while dispatch metadata
+/// stays. Runs once, after `buildStdlibBaseUnstripped`.
+pub fn stripBase(allocator: Allocator, base: *StdlibBase) Allocator.Error!void {
     // `KLIO_PRUNE_KEEP` leaves the stripped trees allocated: a cold-run failure
     // that disappears under it is a pointer into a stripped body that
     // `collectPinned` does not know about.
@@ -295,9 +431,25 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
             (runtime.clockMonotonicNanos() - t_stripped) / 1000,
         },
     );
-    @import("module.zig").phase.mark("base-bookkeeping");
+    @import("module.zig").phase.mark("strip-dead-bodies");
+}
 
-    return base;
+/// `stripBase` for a base whose every allocation dies with its heap once the
+/// image holds it: the dead bodies are blanked so the bake skips them, and
+/// nothing is freed or pinned, since the walk that would free is pure cost.
+pub fn stripBaseKeep(base: *StdlibBase) void {
+    const t0 = runtime.clockMonotonicNanos();
+    const released = prune.stripDeadBodies(@constCast(base.lifted_decls), true, null, null);
+    {
+        const mg = base.built.module.borrowMut();
+        defer mg.deinit();
+        mg.get().dropLoweringCaches();
+    }
+    if (runtime.envOnce("KLIO_TRACE_LOWER") != null) std.debug.print(
+        "[lower] strip-dead-bodies: {d} bodies blanked, {d} nodes ({d}us)\n",
+        .{ released.bodies, released.nodes, (runtime.clockMonotonicNanos() - t0) / 1000 },
+    );
+    @import("module.zig").phase.mark("strip-dead-bodies");
 }
 
 /// The base's lifted decls for the compose-plugin collectors, which need the whole base

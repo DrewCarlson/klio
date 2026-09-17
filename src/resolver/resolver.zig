@@ -102,13 +102,15 @@ pub const Resolution = struct {
     diagnostics: DiagnosticSink,
     /// The pool workers' arenas: the diagnostics they emitted live there.
     arenas: []*std.heap.ArenaAllocator = &.{},
+    /// What the arenas and their list came from: `pool_backing` at the time.
+    arenas_backing: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn deinit(self: *Resolution) void {
         for (self.arenas) |a| {
             a.deinit();
-            std.heap.page_allocator.destroy(a);
+            self.arenas_backing.destroy(a);
         }
-        if (self.arenas.len != 0) std.heap.page_allocator.free(self.arenas);
+        if (self.arenas.len != 0) self.arenas_backing.free(self.arenas);
         self.arenas = &.{};
     }
 
@@ -224,6 +226,7 @@ pub fn resolveModuleWithNatives(
                 .referenced_decls = r.referenced_decls,
                 .diagnostics = r.diagnostics,
                 .arenas = arenas,
+                .arenas_backing = pool_backing,
             };
         }
     }
@@ -282,6 +285,12 @@ const ResolveWorker = struct {
 /// what a reader needs, the referenced declarations and the diagnostics in
 /// file order. Null when no worker could start; a worker's allocation failure
 /// is the pass's.
+/// The allocator behind the pool's worker arenas. The page allocator serves
+/// any caller; a process allocator that parks what the arenas free makes
+/// their teardown a few list operations instead of a system call per chunk,
+/// and the CLI installs its own when it is safe to share between threads.
+pub var pool_backing: std.mem.Allocator = std.heap.page_allocator;
+
 fn resolveFilesOnPool(
     allocator: std.mem.Allocator,
     r: *Resolver,
@@ -289,7 +298,7 @@ fn resolveFilesOnPool(
     pkg_scopes: *const std.StringHashMap(ScopeId),
     threads: usize,
 ) !?[]*std.heap.ArenaAllocator {
-    const pa = std.heap.page_allocator;
+    const pa = pool_backing;
     const ranges = try allocator.alloc(FileDiagRange, files.len);
     defer allocator.free(ranges);
     var work = ResolveWork{ .files = files, .pkg_scopes = pkg_scopes, .ranges = ranges };

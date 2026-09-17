@@ -1719,7 +1719,7 @@ var fqn_index_state = std.atomic.Value(u8).init(0);
 fn ensureFqnIndex() void {
     if (fqn_index_state.load(.acquire) == 2) return;
     if (fqn_index_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
-        const a = std.heap.page_allocator;
+        const a = runtime.slab.allocator;
         table_map.ensureTotalCapacity(a, TABLE.len) catch {};
         for (TABLE) |e| table_map.put(a, e.fqn, e.f) catch {};
         param_names_map.ensureTotalCapacity(a, PARAM_NAMES.len) catch {};
@@ -1748,7 +1748,9 @@ fn ensureNameIndex() void {
 }
 
 fn buildNameIndex() void {
-    const a = std.heap.page_allocator;
+    // A process-lifetime index, on the process heap: the page allocator gave
+    // every per-name list a page of its own, eight megabytes for the table.
+    const a = runtime.slab.allocator;
     var groups: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
     for (TABLE) |e| {
         const at = std.mem.findScalarLast(u8, e.fqn, '.') orelse continue;

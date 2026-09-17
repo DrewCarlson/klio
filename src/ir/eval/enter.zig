@@ -287,7 +287,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
                 .LoadGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
                 .GetField => |x| std.debug.print(" field={s} recv=r{d} dst=r{d}", .{ constStr(module, x.field) orelse "?", x.receiver.int(), x.dst.int() }),
                 .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
-                .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int() }),
+                .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d} func={?d} final={} class={?d} cands={d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int(), if (x.func) |f| f.int() else null, x.func_final, if (x.class) |c| c.int() else null, if (x.candidates) |cl| cl.len else 0 }),
                 .CallMember => |x| std.debug.print(" name={s} recv=r{d} resolved={?d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), if (x.resolved) |f| f.int() else null }),
                 .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),

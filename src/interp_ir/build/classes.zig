@@ -88,15 +88,15 @@ pub fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []cons
     for (members) |*m| {
         switch (m.*) {
             .Property => |p| {
-                ir.lower.registerMemberPropAst(a, owner, p);
+                ir.lower.registerMemberPropAst(owner, p);
                 // The qualified owner too: two inner classes of one package can share a simple name.
                 if (qualified) |q| {
-                    if (!std.mem.eql(u8, q, owner)) ir.lower.registerMemberPropAst(a, q, p);
+                    if (!std.mem.eql(u8, q, owner)) ir.lower.registerMemberPropAst(q, p);
                 }
                 // A member-EXTENSION property takes a dedicated key so a same-named plain member cannot
                 // hide it; a read whose static receiver type matches takes the extension getter.
                 if (p.receiver_type) |rt| {
-                    ir.lower.registerMemberExtPropRecv(a, owner, p.name.name, rt.name.name);
+                    ir.lower.registerMemberExtPropRecv(owner, p.name.name, rt.name.name);
                 }
             },
             .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name, nestedQualified(a, qualified, c.name.name)),
@@ -569,7 +569,10 @@ pub fn buildClassDef(
 }
 
 /// Propagate supertype default-thunk slots onto an override lacking its own thunk.
-pub fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: *std.AutoHashMap(u32, []?FuncId)) Allocator.Error!void {
+/// Classes from `from` on: a base's classes settled their inherited defaults
+/// in the build that made the base, and a class added on top of it cannot
+/// change what a base class inherits, so an extending build starts past them.
+pub fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: *std.AutoHashMap(u32, []?FuncId), from: usize) Allocator.Error!void {
     var by_id = std.AutoHashMap(u32, usize).init(a);
     defer by_id.deinit();
     for (module.classes.items, 0..) |*c, i| try by_id.put(c.id.int(), i);
@@ -578,7 +581,7 @@ pub fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: 
     var inherited: std.ArrayList(Inherited) = .empty;
     defer inherited.deinit(a);
 
-    for (module.classes.items) |*c| {
+    for (module.classes.items[@min(from, module.classes.items.len)..]) |*c| {
         var anc: std.ArrayList(usize) = .empty;
         defer anc.deinit(a);
         var seen = std.AutoHashMap(u32, void).init(a);

@@ -17,6 +17,7 @@ pub const commands = @import("commands.zig");
 const DiagFormat = commands.DiagFormat;
 
 const pack_cache = @import("pack_cache.zig");
+const resolver = @import("resolver");
 const RequestedFeatures = pack_cache.RequestedFeatures;
 
 const pack_build = @import("pack_build.zig");
@@ -29,6 +30,7 @@ const stdlib_image = @import("stdlib_image.zig");
 const unimplemented = @import("unimplemented.zig");
 
 pub const bundle = @import("bundle.zig");
+pub const mem_census = @import("mem_census.zig");
 const bundle_boot = @import("bundle_boot.zig");
 
 pub const VERSION = "0.1.0";
@@ -100,6 +102,9 @@ const USAGE =
 ;
 
 pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
+    // The resolver's pool arenas come from the process allocator when it can
+    // serve several threads, so their teardown parks blocks instead of unmapping.
+    if (pack_cache.allocatorIsThreadSafe(gpa)) resolver.pool_backing = gpa;
     const argv = try io.processArgs(gpa, args_in);
     defer io.freeArgs(gpa, argv);
     return runArgv(gpa, argv);
