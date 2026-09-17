@@ -1391,7 +1391,7 @@ pub threadlocal var od_depth: u8 = 0;
 /// The local whose own initializer is being typed. Its name is not in scope
 /// there, so a bare call of that name inside the initializer resolves past it.
 /// Saved and restored by `localInitTypeRef`, which nests.
-pub var init_self_name: ?[]const u8 = null;
+pub threadlocal var init_self_name: ?[]const u8 = null;
 
 
 const testing = std.testing;

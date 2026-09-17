@@ -109,6 +109,7 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .query_scratch = query_scratch,
         .solve_memo = solve_memo,
         .types_journal = .empty,
+        .body_threads = 1,
     };
 }
 
@@ -150,10 +151,7 @@ pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
             }
         }
     }
-    // Typecheck bodies.
-    for (file.decls) |*d| {
-        try self.checkDecl(d);
-    }
+    try checkBodies(self, file.decls);
     // Reified/inline, vararg and declaration-site variance diagnostics.
     for (file.decls) |*d| {
         try checkGenericsDecl(self, d);
@@ -3426,6 +3424,246 @@ fn tarjanSccs(allocator: Allocator, edges: []const []const usize) Allocator.Erro
         if (t.idx_of[v] == null) try t.strongconnect(v);
     }
     return t.sccs.toOwnedSlice(allocator);
+}
+
+
+/// A top-level property's inferred type, visible to the declarations after it.
+const WriteBack = struct { decl: usize, name: []const u8, binding: root.Binding };
+
+/// The diagnostics one declaration's check emitted, as a range of a sink.
+const DiagRange = struct { decl: usize, start: usize, end: usize };
+
+const BodyWork = struct {
+    decls: []const Decl,
+    write_backs: []const WriteBack,
+    next: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+};
+
+const Worker = struct {
+    checker: Checker,
+    ranges: std.ArrayList(DiagRange) = .empty,
+    applied: usize = 0,
+    thread: ?std.Thread = null,
+};
+
+/// Body checks are independent once the declarations are seeded: each reads
+/// the shared tables and writes span-keyed results of its own. The one flow
+/// between them is a top-level property's inferred type reaching the
+/// declarations after it, so the properties are checked first, in order, and
+/// their bindings replayed into each worker as it passes them.
+fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
+    const workers_n = bodyWorkers(self, decls.len);
+    if (workers_n < 2) {
+        for (decls) |*d| try self.checkDecl(d);
+        return;
+    }
+    const a = self.allocator;
+    var seed = try self.frames.items[0].bindings.clone();
+    defer seed.deinit();
+    const base_len = self.diagnostics.diagnostics.items.len;
+    var write_backs: std.ArrayList(WriteBack) = .empty;
+    defer write_backs.deinit(a);
+    var main_ranges: std.ArrayList(DiagRange) = .empty;
+    defer main_ranges.deinit(a);
+    for (decls, 0..) |*d, i| {
+        if (d.* != .Property) continue;
+        const before = self.diagnostics.diagnostics.items.len;
+        try self.checkDecl(d);
+        try main_ranges.append(a, .{ .decl = i, .start = before, .end = self.diagnostics.diagnostics.items.len });
+        const name = d.Property.name.name;
+        const seeded = seed.get(name) orelse continue;
+        const now = self.frames.items[0].bindings.get(name) orelse continue;
+        if (seeded.ty == .Unresolved and now.ty != .Unresolved) {
+            try write_backs.append(a, .{ .decl = i, .name = name, .binding = now });
+        }
+    }
+
+    var work = BodyWork{ .decls = decls, .write_backs = write_backs.items };
+    const workers = try a.alloc(Worker, workers_n);
+    defer a.free(workers);
+    var forked: usize = 0;
+    defer for (workers[0..forked]) |*w| releaseWorker(self, w);
+    for (workers) |*w| {
+        w.* = .{ .checker = try forkWorker(self, &seed) };
+        forked += 1;
+    }
+    var spawned: usize = 0;
+    for (workers) |*w| {
+        w.thread = std.Thread.spawn(.{}, workerMain, .{ &work, w }) catch break;
+        spawned += 1;
+    }
+    // Whatever failed to start leaves its share to the rest.
+    if (spawned == 0) workerMain(&work, &workers[0]);
+    for (workers[0..spawned]) |*w| w.thread.?.join();
+    if (work.failed.load(.monotonic)) return error.OutOfMemory;
+    try mergeWorkers(self, workers, main_ranges.items, base_len);
+}
+
+fn bodyWorkers(self: *const Checker, n_decls: usize) usize {
+    if (self.body_threads < 2 or n_decls < 64) return 1;
+    return @max(1, @min(self.body_threads, n_decls / 16));
+}
+
+/// A checker sharing the declaration tables and owning fresh result maps and
+/// stacks, its frame the seeded top level.
+fn forkWorker(self: *const Checker, seed: *const std.StringHashMap(root.Binding)) Allocator.Error!Checker {
+    const a = self.allocator;
+    var c = self.*;
+    c.types = std.AutoHashMap(root.Span, root.Type).init(a);
+    c.resolved_calls = std.AutoHashMap(root.Span, root.ResolvedCall).init(a);
+    c.lambda_recv_heads = std.AutoHashMap(root.Span, []const u8).init(a);
+    c.lambda_param_shapes = std.AutoHashMap(root.Span, root.ParamShape).init(a);
+    c.nothing_spans = std.AutoHashMap(root.Span, void).init(a);
+    c.nothing_by_fn = std.AutoHashMap(root.Span, std.AutoHashMap(root.Span, void)).init(a);
+    c.nothing_epoch = 0;
+    c.reach_cache = root.ReachCache.init(a);
+    c.expr_class = std.AutoHashMap(root.Span, []const u8).init(a);
+    c.rank_class = std.AutoHashMap(root.Span, []const u8).init(a);
+    c.list_elem = std.AutoHashMap(root.Span, root.Type).init(a);
+    c.diagnostics = root.DiagnosticSink.init();
+    c.frames = .empty;
+    try c.frames.append(a, .{ .bindings = try seed.clone() });
+    c.class_stack = .empty;
+    c.fn_return_stack = .empty;
+    c.label_stack = .empty;
+    c.public_inline_stack = .empty;
+    c.suspend_context_stack = .empty;
+    c.reified_type_params = .empty;
+    c.type_params_in_scope = .empty;
+    c.dsl_receiver_stack = .empty;
+    c.cfgs = std.AutoHashMap(root.Span, root.Cfg).init(a);
+    c.lowerings = std.AutoHashMap(root.Span, *root.Lowered).init(a);
+    c.cfg_fn_stack = .empty;
+    c.generic_body_depth = 0;
+    c.types_instantiation_dependent = std.AutoHashMap(root.Span, void).init(a);
+    c.inference_session = null;
+    c.builder_inference_active = false;
+    c.lambda_depth = 0;
+    c.ebf_outside = std.AutoHashMap(root.Span, root.EbfOutside).init(a);
+    c.field_narrow_off = 0;
+    c.query_scratch = try a.create(std.heap.ArenaAllocator);
+    c.query_scratch.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    c.solve_memo = try a.create(narrowing.SolveMemo);
+    c.solve_memo.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    c.types_journal = .empty;
+    c.body_threads = 1;
+    return c;
+}
+
+fn workerMain(work: *BodyWork, w: *Worker) void {
+    const c = &w.checker;
+    while (true) {
+        const j = work.next.fetchAdd(1, .monotonic);
+        if (j >= work.decls.len) return;
+        while (w.applied < work.write_backs.len and work.write_backs[w.applied].decl < j) : (w.applied += 1) {
+            const wb = work.write_backs[w.applied];
+            if (c.frames.items[0].bindings.getPtr(wb.name)) |b| b.* = wb.binding;
+        }
+        const d = &work.decls[j];
+        if (d.* == .Property) continue;
+        const before = c.diagnostics.diagnostics.items.len;
+        c.checkDecl(d) catch {
+            work.failed.store(true, .monotonic);
+            return;
+        };
+        w.ranges.append(c.allocator, .{ .decl = j, .start = before, .end = c.diagnostics.diagnostics.items.len }) catch {
+            work.failed.store(true, .monotonic);
+            return;
+        };
+    }
+}
+
+fn moveEntries(dst: anytype, src: anytype) Allocator.Error!void {
+    try dst.ensureUnusedCapacity(src.count());
+    var it = src.iterator();
+    while (it.next()) |e| dst.putAssumeCapacity(e.key_ptr.*, e.value_ptr.*);
+    src.clearRetainingCapacity();
+}
+
+const OrderedDiag = struct { decl: usize, diag: root.Diagnostic };
+
+fn diagBeforeDecl(_: void, x: OrderedDiag, y: OrderedDiag) bool {
+    return x.decl < y.decl;
+}
+
+fn mergeWorkers(self: *Checker, workers: []Worker, main_ranges: []const DiagRange, base_len: usize) Allocator.Error!void {
+    const a = self.allocator;
+    for (workers) |*w| {
+        const c = &w.checker;
+        try moveEntries(&self.types, &c.types);
+        try moveEntries(&self.resolved_calls, &c.resolved_calls);
+        try moveEntries(&self.lambda_recv_heads, &c.lambda_recv_heads);
+        try moveEntries(&self.lambda_param_shapes, &c.lambda_param_shapes);
+        try moveEntries(&self.expr_class, &c.expr_class);
+        try moveEntries(&self.rank_class, &c.rank_class);
+        try moveEntries(&self.list_elem, &c.list_elem);
+        try moveEntries(&self.types_instantiation_dependent, &c.types_instantiation_dependent);
+        try moveEntries(&self.cfgs, &c.cfgs);
+        try moveEntries(&self.lowerings, &c.lowerings);
+        try moveEntries(&self.ebf_outside, &c.ebf_outside);
+    }
+    // Declaration order, as a sequential pass would have emitted them.
+    var ordered: std.ArrayList(OrderedDiag) = .empty;
+    defer ordered.deinit(a);
+    for (main_ranges) |r| {
+        for (self.diagnostics.diagnostics.items[r.start..r.end]) |d| try ordered.append(a, .{ .decl = r.decl, .diag = d });
+    }
+    for (workers) |*w| {
+        for (w.ranges.items) |r| {
+            for (w.checker.diagnostics.diagnostics.items[r.start..r.end]) |d| try ordered.append(a, .{ .decl = r.decl, .diag = d });
+        }
+        w.checker.diagnostics.diagnostics.clearRetainingCapacity();
+    }
+    std.mem.sort(OrderedDiag, ordered.items, {}, diagBeforeDecl);
+    self.diagnostics.diagnostics.shrinkRetainingCapacity(base_len);
+    for (ordered.items) |e| try self.diagnostics.diagnostics.append(a, e.diag);
+}
+
+/// Frees what a worker still holds after its results moved to the module checker.
+fn releaseWorker(self: *Checker, w: *Worker) void {
+    const a = self.allocator;
+    const c = &w.checker;
+    c.types.deinit();
+    c.resolved_calls.deinit();
+    c.lambda_recv_heads.deinit();
+    c.lambda_param_shapes.deinit();
+    c.nothing_spans.deinit();
+    {
+        var it = c.nothing_by_fn.valueIterator();
+        while (it.next()) |m| m.deinit();
+        c.nothing_by_fn.deinit();
+    }
+    {
+        var it = c.reach_cache.valueIterator();
+        while (it.next()) |e| a.free(e.reachable);
+        c.reach_cache.deinit();
+    }
+    c.expr_class.deinit();
+    c.rank_class.deinit();
+    c.list_elem.deinit();
+    c.diagnostics.diagnostics.deinit(a);
+    for (c.frames.items) |*f| f.deinit();
+    c.frames.deinit(a);
+    c.class_stack.deinit(a);
+    c.fn_return_stack.deinit(a);
+    c.label_stack.deinit(a);
+    c.public_inline_stack.deinit(a);
+    c.suspend_context_stack.deinit(a);
+    c.reified_type_params.deinit(a);
+    c.type_params_in_scope.deinit(a);
+    c.dsl_receiver_stack.deinit(a);
+    c.cfgs.deinit();
+    c.lowerings.deinit();
+    c.cfg_fn_stack.deinit(a);
+    c.types_instantiation_dependent.deinit();
+    c.ebf_outside.deinit();
+    c.query_scratch.deinit();
+    a.destroy(c.query_scratch);
+    c.solve_memo.arena.deinit();
+    a.destroy(c.solve_memo);
+    c.types_journal.deinit(a);
+    w.ranges.deinit(a);
 }
 
 test {

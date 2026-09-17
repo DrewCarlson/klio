@@ -10,6 +10,7 @@ const ast = @import("ast");
 const compose_pass = @import("compose_pass");
 const stdlib = @import("stdlib");
 const lift = @import("lift.zig");
+const body_pool = @import("body_pool.zig");
 const image = @import("../image.zig");
 
 const Allocator = std.mem.Allocator;
@@ -87,7 +88,7 @@ const BuiltModule = build_types.BuiltModule;
 const ClassTable = build_types.ClassTable;
 const EnumEntryArgInit = build_types.EnumEntryArgInit;
 const EnumEntryMethod = build_types.EnumEntryMethod;
-const FileClasses = build_types.FileClasses;
+pub const FileClasses = build_types.FileClasses;
 const NameFunc = build_types.NameFunc;
 const PairFuncMap = build_types.PairFuncMap;
 const PairStrMap = build_types.PairStrMap;
@@ -108,7 +109,7 @@ const ExtPropDecl = struct { p: *const ast.Property, owner: ?[]const u8, owner_t
 
 /// The state a whole-file lowering pass threads through its phases; a value lives here only
 /// when more than one phase reads or writes it.
-const BuildCtx = struct {
+pub const BuildCtx = struct {
     /// The caller's allocator, which owns the returned `BuiltModule`.
     allocator: Allocator,
     /// The module registry's allocator, backing every build-scoped table.
@@ -1924,66 +1925,138 @@ fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
     // sibling top-level function resolves against the complete header set.
     var empty_set = StringSet.init(a);
     defer empty_set.deinit();
+    // Every class's shell and member sets first, then every member body, then
+    // each class sealed in declaration order: a member sees the same module
+    // whichever class it belongs to and whichever thread lowers it.
+    const Begun = struct { state: *ir.lower.decl.ClassState, first_job: usize, n_members: usize, fqn: []const u8, pkg: []const u8 };
+    var begun: std.ArrayList(Begun) = .empty;
+    defer begun.deinit(a);
+    var jobs: std.ArrayList(body_pool.Job) = .empty;
+    defer jobs.deinit(a);
     for (decls) |*d| {
-        if (d.* == .Class) {
-            const c = &d.Class;
-            const extras: *const StringSet = nested_outer_members.getPtr(c.name.name) orelse &empty_set;
-            const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
-            const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
-            _ = try ir.lower.lowerClassWithExtrasFqnPkg(module, c, file_classes, extras, cfqn, cls_pkg);
+        if (d.* != .Class) continue;
+        const c = &d.Class;
+        const extras: *const StringSet = nested_outer_members.getPtr(c.name.name) orelse &empty_set;
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        const prev = ir.lower.decl.enterClassContext(cfqn, cls_pkg);
+        const state = try ir.lower.decl.beginClass(module, c, file_classes, extras);
+        ir.lower.decl.leaveClassContext(prev);
+        try begun.append(a, .{ .state = state, .first_job = jobs.items.len, .n_members = c.members.len, .fqn = cfqn, .pkg = cls_pkg });
+        for (c.members) |*m| {
+            if (m.* != .Function or m.Function.body == null) continue;
+            try jobs.append(a, .{
+                .f = &m.Function,
+                .id = FuncId.from(0),
+                .pkg = cls_pkg,
+                .member = .{
+                    .owner_class = c.name.name,
+                    .own_members = state.own_member_names,
+                    .enclosing = extras,
+                    .own_member_arity = state.own_member_arity,
+                    .class_fqn = cfqn,
+                    .class_pkg = cls_pkg,
+                },
+            });
         }
     }
+    const lowered = try lowerJobs(ctx, jobs.items);
+    defer a.free(lowered);
+    for (begun.items) |b| {
+        const c = b.state.c;
+        const per_member = try a.alloc(?ir.Func, b.n_members);
+        defer a.free(per_member);
+        @memset(per_member, null);
+        var next = b.first_job;
+        for (c.members, per_member) |*m, *slot| {
+            if (m.* != .Function or m.Function.body == null) continue;
+            slot.* = lowered[next];
+            next += 1;
+        }
+        const prev = ir.lower.decl.enterClassContext(b.fqn, b.pkg);
+        defer ir.lower.decl.leaveClassContext(prev);
+        _ = try ir.lower.decl.finishClass(b.state, per_member);
+    }
 }
+
 
 fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const decls = ctx.decls;
-    const file_classes = &ctx.file_classes;
     const stub_ids = &ctx.stub_ids;
     // Phase 2: each function body lowers into its reserved slot against the phase-1 header set.
+    var jobs: std.ArrayList(body_pool.Job) = .empty;
+    defer jobs.deinit(a);
     var stub_cursor: usize = 0;
     for (decls) |*d| {
-        if (d.* == .Function) {
-            const f = &d.Function;
-            // A header-only declaration (a retained `expect`) keeps its phase-1 stub, so `hasBody()` stays
-            // false and `linkBodyless` settles its executable form; lowering it would manufacture a
-            // `return Unit` body that shadows the real dispatch.
-            if (f.body == null) {
-                stub_cursor += 1;
-                continue;
-            }
-            const stub_pkg = module.funcByIdMut(stub_ids.items[stub_cursor]).?.package;
-            const prev_pkg = ir.lower.decl.setLowerSelfPackage(stub_pkg);
-            const t_fn = if (phase.on()) runtime.clockMonotonicNanos() else 0;
-            const func = try ir.lower.lowerFunctionBodyInto(module, f, file_classes);
-            if (phase.on()) phase.noteBody(f.name.name, runtime.clockMonotonicNanos() - t_fn);
-            _ = ir.lower.decl.setLowerSelfPackage(prev_pkg);
-            const id = stub_ids.items[stub_cursor];
+        if (d.* != .Function) continue;
+        const f = &d.Function;
+        // A header-only declaration (a retained `expect`) keeps its phase-1 stub, so `hasBody()` stays
+        // false and `linkBodyless` settles its executable form; lowering it would manufacture a
+        // `return Unit` body that shadows the real dispatch.
+        if (f.body == null) {
             stub_cursor += 1;
-            var placed = func;
-            placed.id = id;
-            placed.fqn = module.funcByIdMut(id).?.fqn;
-            placed.package = module.funcByIdMut(id).?.package;
-            module.funcByIdMut(id).?.* = placed;
-            // Kotlin scopes a private top-level declaration to its FILE, so dispatch never binds a private
-            // extension from another file.
-            if (f.visibility == .Private) {
-                try module.registry.private_fn_files.put(id, f.name.span.file);
-            }
-            if (std.mem.eql(u8, f.name.name, "main")) ctx.main_id = id;
-            try module.top_level.append(a, id);
-
-            try registerBodyFuncTypeParams(ctx, f, id);
-
-            try lowerFunctionDefaultThunks(ctx, f, id);
+            continue;
+        }
+        const id = stub_ids.items[stub_cursor];
+        stub_cursor += 1;
+        try jobs.append(a, .{ .f = f, .id = id, .pkg = module.funcByIdMut(id).?.package });
+    }
+    const lowered = try lowerJobs(ctx, jobs.items);
+    defer a.free(lowered);
+    for (jobs.items, lowered) |job, func| try placeBody(ctx, job, func);
+    phase.reportBodies();
+    if (runtime.envOnce("KLIO_LOWER_FINGERPRINT") != null) {
+        std.debug.print("[fn-block] {d} functions\n", .{module.funcs.items.len});
+        for (module.funcs.items) |*fnc| {
+            var n: usize = 0;
+            for (fnc.blocks) |blk| n += blk.insts.len;
+            std.debug.print("[fn] {d} {s} blocks={d} insts={d} hash={x}\n", .{ fnc.id.int(), fnc.fqn, fnc.blocks.len, n, ir.remap.semanticHash(fnc) });
         }
     }
-    phase.reportBodies();
     if (phase.on()) {
         if (ctx.module.extResolveCache()) |c| std.debug.print("[lower] ext-resolve cache hits {d} misses {d}\n", .{ c.hits, c.misses });
         if (ctx.module.recvVerdictCache()) |c| std.debug.print("[lower] recv-verdict cache hits {d} misses {d} entries {d}\n", .{ c.hits, c.misses, c.map.count() });
     }
+}
+
+/// Every job's body, on the pool when it runs and serially otherwise. Bodies
+/// lower against the header set alone and are placed by the caller after, so
+/// what a call resolves to does not depend on where its callee is declared.
+/// The caller frees the slice.
+fn lowerJobs(ctx: *BuildCtx, jobs: []const body_pool.Job) Allocator.Error![]ir.Func {
+    const a = ctx.a;
+    if (try body_pool.lower(ctx, jobs)) |lowered| return lowered;
+    const lowered = try a.alloc(ir.Func, jobs.len);
+    errdefer a.free(lowered);
+    for (jobs, lowered) |job, *out| {
+        const t_fn = if (phase.on()) runtime.clockMonotonicNanos() else 0;
+        out.* = try body_pool.lowerJob(ctx.module, job, &ctx.file_classes);
+        if (phase.on()) phase.noteBody(job.f.name.name, runtime.clockMonotonicNanos() - t_fn);
+    }
+    return lowered;
+}
+
+/// Files a lowered body in its reserved slot and records what the module keeps per body.
+pub fn placeBody(ctx: *BuildCtx, job: body_pool.Job, func: ir.Func) Allocator.Error!void {
+    const module = ctx.module;
+    const f = job.f;
+    const id = job.id;
+    var placed = func;
+    placed.id = id;
+    placed.fqn = module.funcByIdMut(id).?.fqn;
+    placed.package = module.funcByIdMut(id).?.package;
+    module.funcByIdMut(id).?.* = placed;
+    // Kotlin scopes a private top-level declaration to its FILE, so dispatch never binds a private
+    // extension from another file.
+    if (f.visibility == .Private) {
+        try module.registry.private_fn_files.put(id, f.name.span.file);
+    }
+    if (std.mem.eql(u8, f.name.name, "main")) ctx.main_id = id;
+    try module.top_level.append(ctx.a, id);
+    try registerBodyFuncTypeParams(ctx, f, id);
+    try lowerFunctionDefaultThunks(ctx, f, id);
 }
 
 fn registerBodyFuncTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) Allocator.Error!void {

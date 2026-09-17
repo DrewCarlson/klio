@@ -42,6 +42,8 @@ fn baseEnv(a: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
     errdefer map.deinit();
     runtime.procEnvPutAllInto(a, &map);
     try map.put("HOME", home);
+    // The tests read the image right after a run, so it bakes in-process.
+    try map.put("KLIO_STDLIB_IMAGE_SYNC", "1");
     _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_TRACE_STDLIB_IMAGE"));
     _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_STDLIB_IMAGE"));
     _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_PACK_DIAG"));

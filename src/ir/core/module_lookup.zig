@@ -98,6 +98,26 @@ pub fn ensureFuncBody(self: *const Module, func: *Func) bool {
     return func.blocks.len != 0;
 }
 
+/// Fills every lookup cache a body lowering would otherwise fill on first
+/// use, so copies of the module made after this share them without writing.
+pub fn warmLookupCaches(self: *Module) Allocator.Error!void {
+    const gpa = self.lookup_cache_gpa orelse return;
+    try self.topUpUniqueSimpleCache();
+    try self.topUpClassNameCache(gpa);
+    try self.topUpClassFqnCache();
+    try self.topUpPkgHeads();
+    if (self.ext_names_by_recv_head == null or self.ext_index_decl_count != self.func_index.items.len) {
+        try self.rebuildExtIndex(gpa);
+    }
+}
+
+/// Whether `f` has a body: lowered already, or declared with one and not yet
+/// placed. Resolution asks this rather than `hasBody`, so a caller's answer
+/// does not depend on where its callee is declared.
+pub fn declaredWithBody(self: *const Module, id: FuncId, f: *const Func) bool {
+    return f.hasBody() or self.decl_ast_body.contains(id.int());
+}
+
 /// Look up a function by id. Eager build: direct table index. Lazy (loaded image, with
 /// `func_header_offsets`): decode the header on first touch, memoised in `func_cache`.
 pub fn funcById(self: *const Module, id: FuncId) ?*const Func {

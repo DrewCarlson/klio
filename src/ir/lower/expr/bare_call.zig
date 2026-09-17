@@ -2214,7 +2214,7 @@ pub fn lowerFqnGlobalCall(
             for (b.module.funcsBySimpleName(last)) |fid| {
                 const f = b.module.funcById(fid) orelse continue;
                 if (!std.mem.eql(u8, f.fqn, fqn)) continue;
-                if (!f.hasBody()) continue;
+                if (!b.module.declaredWithBody(fid, f)) continue;
                 if (f.low_priority) continue;
                 fqn_overloads += 1;
                 if (!fqnCallArityFits(b, fid, args.len)) continue;

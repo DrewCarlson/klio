@@ -3411,6 +3411,21 @@ fn collectKtDir(
 
 /// Convert typeck's recorded overload picks into the span-pair map lowering
 /// composes with. Any failure returns null and AST evidence alone is used.
+/// The checker's body pass width: the CPU count under the process-wide
+/// `KLIO_MAX_WORKERS` ceiling, or `KLIO_TYPECK_THREADS` outright.
+fn typeckThreads() usize {
+    if (runtime.envOnce("KLIO_TYPECK_THREADS")) |v| {
+        if (std.fmt.parseInt(usize, v, 10)) |n| return @max(n, 1) else |_| {}
+    }
+    var n: usize = std.Thread.getCpuCount() catch 1;
+    if (runtime.envOnce("KLIO_MAX_WORKERS")) |v| {
+        if (std.fmt.parseInt(usize, v, 10)) |x| {
+            if (x != 0) n = @min(n, x);
+        } else |_| {}
+    }
+    return n;
+}
+
 pub fn computeEagerCalls(
     gpa: std.mem.Allocator,
     combined: []const KotlinFile,
@@ -3426,7 +3441,7 @@ pub fn computeEagerCalls(
         if (audit) std.debug.print("[EAGER] resolver failed; staying lazy\n", .{});
         return null;
     };
-    const tc = typeck.typecheckModule(gpa, combined, &r) catch {
+    const tc = typeck.typecheckModuleOpts(gpa, combined, &r, .{ .body_threads = typeckThreads() }) catch {
         if (audit) std.debug.print("[EAGER] typeck failed; staying lazy\n", .{});
         return null;
     };

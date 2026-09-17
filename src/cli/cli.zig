@@ -665,7 +665,9 @@ fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
 
     var requested = parseRequestedFeatures(gpa, feature_specs.items);
     defer deinitRequestedFeatures(&requested);
-    return stdlib_image.runBake(gpa, files.items, &requested);
+    const code = stdlib_image.runBake(gpa, files.items, &requested);
+    stdlib_image.finishBackgroundBake();
+    return code;
 }
 
 fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {

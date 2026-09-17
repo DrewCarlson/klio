@@ -209,6 +209,27 @@ pub fn lowerClassWithExtrasFqn(
 /// Like `lowerClassWithExtrasFqn` but with the declaring package supplied
 /// explicitly: a nested or companion class's FQN is class-qualified, so deriving
 /// the package from it would hand the symbol index a phantom package.
+/// The class a member lowers inside: its fqn and package, and the self
+/// package its bodies resolve against.
+pub const ClassContext = struct {
+    fqn: ?[]const u8,
+    pkg: ?[]const u8,
+    self_package: []const u8,
+};
+
+pub fn enterClassContext(class_fqn: []const u8, class_pkg: []const u8) ClassContext {
+    const prev = ClassContext{ .fqn = lower_class_fqn, .pkg = lower_class_pkg, .self_package = setLowerSelfPackage(class_pkg) };
+    lower_class_fqn = class_fqn;
+    lower_class_pkg = class_pkg;
+    return prev;
+}
+
+pub fn leaveClassContext(prev: ClassContext) void {
+    lower_class_fqn = prev.fqn;
+    lower_class_pkg = prev.pkg;
+    _ = setLowerSelfPackage(prev.self_package);
+}
+
 pub fn lowerClassWithExtrasFqnPkg(
     module: *Module,
     c: *const ast.Class,
@@ -229,11 +250,11 @@ pub fn lowerClassWithExtrasFqnPkg(
 
 /// Package-qualified FQN for the class currently being lowered, read once where the
 /// IR `Class` shell is created.
-var lower_class_fqn: ?[]const u8 = null;
+threadlocal var lower_class_fqn: ?[]const u8 = null;
 
 /// Declaring package matching `lower_class_fqn`; null falls back to deriving it
 /// from the FQN.
-var lower_class_pkg: ?[]const u8 = null;
+threadlocal var lower_class_pkg: ?[]const u8 = null;
 
 /// The caller-package seed lives next to `FuncBuilder`, which reads it on init;
 /// re-exported here for the build drivers.
@@ -1051,50 +1072,101 @@ pub fn lowerClassWithExtras(
     file_classes: *const FileClasses,
     extra_members: *const StringSet,
 ) Allocator.Error!ClassId {
+    const state = try beginClass(module, c, file_classes, extra_members);
     const a = module.registry.allocator;
+    const lowered = try a.alloc(?Func, c.members.len);
+    defer a.free(lowered);
+    @memset(lowered, null);
+    for (c.members, lowered) |*m, *out| {
+        if (m.* != .Function or m.Function.body == null) continue;
+        out.* = try lowerMemberBody(module, &m.Function, c.name.name, state.own_member_names, extra_members, state.own_member_arity);
+    }
+    return finishClass(state, lowered);
+}
 
+/// A class's lowering between its shell and its method list: the shell is
+/// registered and the member name sets built, then every member body lowers
+/// against them, on one thread or many, and `finishClass` places the bodies
+/// in member order. Owned by the registry allocator until `finishClass`.
+pub const ClassState = struct {
+    module: *Module,
+    c: *const ast.Class,
+    class_id: ClassId,
+    extra_members: *const StringSet,
+    own_member_names: *StringSet,
+    own_member_arity: *std.StringHashMap(u64),
+};
+
+pub fn beginClass(
+    module: *Module,
+    c: *const ast.Class,
+    file_classes: *const FileClasses,
+    extra_members: *const StringSet,
+) Allocator.Error!*ClassState {
+    const a = module.registry.allocator;
     const class_id = try registerClassShell(module, a, c);
-
     // Collect this class's own member names so method-body lowering can tell
     // `someMember()` from `topLevelFn()`. The lexically enclosing class's members
     // stay separate: they belong to an enclosing `this@Outer`, reached only through
     // the implicit-receiver candidate walk. Routing them through the candidate
     // resolver matches kotlinc, which searches the inner's own `this` then its
     // `outer` links, while a subject brings only itself.
-    var own_member_names = StringSet.init(a);
-    defer own_member_names.deinit();
-    try collectOwnMemberNames(a, c, file_classes, &own_member_names);
+    const own_member_names = try a.create(StringSet);
+    own_member_names.* = StringSet.init(a);
+    try collectOwnMemberNames(a, c, file_classes, own_member_names);
     // Per-member arity masks, so a method body's bare call prefers a member only
     // when one is arity-applicable.
-    var own_member_arity = std.StringHashMap(u64).init(a);
-    defer own_member_arity.deinit();
-    try collectOwnMemberArities(a, c, file_classes, &own_member_arity);
+    const own_member_arity = try a.create(std.StringHashMap(u64));
+    own_member_arity.* = std.StringHashMap(u64).init(a);
+    try collectOwnMemberArities(a, c, file_classes, own_member_arity);
+    const state = try a.create(ClassState);
+    state.* = .{
+        .module = module,
+        .c = c,
+        .class_id = class_id,
+        .extra_members = extra_members,
+        .own_member_names = own_member_names,
+        .own_member_arity = own_member_arity,
+    };
+    return state;
+}
 
+/// Places every lowered member (`lowered[i]` for member `i`, null for the
+/// rest) in declaration order and seals the class's method list.
+pub fn finishClass(state: *ClassState, lowered: []const ?Func) Allocator.Error!ClassId {
+    const module = state.module;
+    const a = module.registry.allocator;
+    const c = state.c;
+    const class_id = state.class_id;
+    defer {
+        state.own_member_names.deinit();
+        a.destroy(state.own_member_names);
+        state.own_member_arity.deinit();
+        a.destroy(state.own_member_arity);
+        a.destroy(state);
+    }
     var methods: std.ArrayList(FuncId) = .empty;
     errdefer methods.deinit(a);
-
     var ctx: ClassLower = .{
         .a = a,
         .module = module,
         .c = c,
         .class_id = class_id,
-        .extra_members = extra_members,
-        .own_member_names = &own_member_names,
-        .own_member_arity = &own_member_arity,
+        .extra_members = state.extra_members,
+        .own_member_names = state.own_member_names,
+        .own_member_arity = state.own_member_arity,
         .methods = &methods,
     };
-
-    for (c.members) |*m| {
-        if (m.* == .Function) {
-            const f = &m.Function;
-            // Skip bodyless methods: they would lower to a func returning Unit, and
-            // IR-native member dispatch must fall through to the real override.
-            if (f.body == null) {
-                try retainBodylessMember(&ctx, f);
-                continue;
-            }
-            try lowerConcreteMember(&ctx, f);
+    for (c.members, lowered) |*m, body| {
+        if (m.* != .Function) continue;
+        const f = &m.Function;
+        // Skip bodyless methods: they would lower to a func returning Unit, and
+        // IR-native member dispatch must fall through to the real override.
+        if (f.body == null) {
+            try retainBodylessMember(&ctx, f);
+            continue;
         }
+        try placeConcreteMember(&ctx, f, body.?);
     }
     try lowerDataClassComponents(&ctx);
     // Patch the registered class with its now-known method list.
@@ -1241,17 +1313,10 @@ fn recordAbstractMemberArity(ctx: *ClassLower, f: *const ast.Function) Allocator
 
 /// Lower a member that has a body, then index it by the routes member
 /// resolution reads.
-fn lowerConcreteMember(ctx: *ClassLower, f: *const ast.Function) Allocator.Error!void {
-    // Use the method's own FuncId, not `funcs.len() - 1`: lowering a method
+fn placeConcreteMember(ctx: *ClassLower, f: *const ast.Function, body: Func) Allocator.Error!void {
+    // Use the method's own FuncId, not `funcs.len() - 1`: placing a method
     // also pushes its default-arg thunk funcs.
-    const placed = try lowerMethodWithMemberContext(
-        ctx.module,
-        f,
-        ctx.c.name.name,
-        ctx.own_member_names,
-        ctx.extra_members,
-        ctx.own_member_arity,
-    );
+    const placed = try placeMember(ctx.module, f, body, ctx.c.name.name, ctx.own_member_names);
     try ctx.methods.append(ctx.a, placed.id);
     try recordMemberMethodFid(ctx, f.name.name, f.params.len, placed.id);
     try recordMemberDeclSig(ctx, f, placed.id);
@@ -1861,6 +1926,20 @@ pub fn lowerMethodWithMemberContext(
     enclosing_members: *const StringSet,
     own_member_arity: ?*const std.StringHashMap(u64),
 ) Allocator.Error!Func {
+    const body = try lowerMemberBody(module, f, owner_class, own_members, enclosing_members, own_member_arity);
+    return placeMember(module, f, body, owner_class, own_members);
+}
+
+/// A member's body as a function, not yet placed: reads the module, appends
+/// only the lambdas of its own.
+pub fn lowerMemberBody(
+    module: *Module,
+    f: *const ast.Function,
+    owner_class: []const u8,
+    own_members: *const StringSet,
+    enclosing_members: *const StringSet,
+    own_member_arity: ?*const std.StringHashMap(u64),
+) Allocator.Error!Func {
     // A method body lowered on its own declares its local classes into the same
     // scope stack a function body does, and must leave it as found.
     const local_class_mark = build.localClassScopeMark();
@@ -1890,19 +1969,52 @@ pub fn lowerMethodWithMemberContext(
             var eit = enclosing_members.keyIterator();
             while (eit.next()) |k| try owner_scope.put(k.*, {});
         }
-        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, &owner_scope, null);
-        const reserved_id = module.funcByDeclSpan(f.name.span);
-        const id = reserved_id orelse module.nextFuncId();
-        var placed = func;
+        var func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, &owner_scope, null);
         try rewriteMemberFuncTypes(
             module,
             a,
             memberOwnerIdForFunction(module, owner_class, f),
             f,
-            &placed,
+            &func,
         );
+        func.kind = .member_extension;
+        return func;
+    }
+    var func = try lowerFunctionBodyWithImplicitOwnerEnclosing(
+        module,
+        f,
+        &[_][]const u8{"this"},
+        owner_class,
+        own_members,
+        enclosing_members,
+        own_member_arity,
+    );
+    try rewriteMemberFuncTypes(
+        module,
+        a,
+        memberOwnerIdForFunction(module, owner_class, f),
+        f,
+        &func,
+    );
+    func.kind = .instance_method;
+    return func;
+}
+
+/// Files a lowered member in its reserved slot, or appends it, and records
+/// what the module keeps per member: its owner, visibility and default thunks.
+pub fn placeMember(
+    module: *Module,
+    f: *const ast.Function,
+    func: Func,
+    owner_class: []const u8,
+    own_members: *const StringSet,
+) Allocator.Error!Func {
+    const a = module.registry.allocator;
+    if (f.receiver_type != null) {
+        const reserved_id = module.funcByDeclSpan(f.name.span);
+        const id = reserved_id orelse module.nextFuncId();
+        var placed = func;
         placed.id = id;
-        placed.kind = .member_extension;
         if (reserved_id != null) {
             const stub = module.funcById(id).?;
             placed.fqn = stub.fqn;
@@ -1937,27 +2049,10 @@ pub fn lowerMethodWithMemberContext(
         try recordMethodParamDefaults(module, f, id, null, null);
         return placed;
     }
-    const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(
-        module,
-        f,
-        &[_][]const u8{"this"},
-        owner_class,
-        own_members,
-        enclosing_members,
-        own_member_arity,
-    );
     const reserved_id = module.funcByDeclSpan(f.name.span);
     const id = reserved_id orelse module.nextFuncId();
     var placed = func;
-    try rewriteMemberFuncTypes(
-        module,
-        a,
-        memberOwnerIdForFunction(module, owner_class, f),
-        f,
-        &placed,
-    );
     placed.id = id;
-    placed.kind = .instance_method;
     if (reserved_id) |_| {
         const stub = module.funcById(id).?;
         placed.fqn = stub.fqn;

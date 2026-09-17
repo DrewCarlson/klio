@@ -334,9 +334,12 @@ pub const Lexer = struct {
         return self.src[i];
     }
 
+    /// The scalar at `pos`. An ASCII byte is its own scalar; a malformed or
+    /// truncated multi-byte sequence yields its lead byte, one byte wide.
     fn peekChar(self: *const Lexer) ?u21 {
         if (self.pos >= self.src.len) return null;
         const rest = self.src[self.pos..];
+        if (rest[0] < 0x80) return rest[0];
         const len = std.unicode.utf8ByteSequenceLength(rest[0]) catch return rest[0];
         if (len > rest.len) return rest[0];
         return std.unicode.utf8Decode(rest[0..len]) catch rest[0];
@@ -345,6 +348,10 @@ pub const Lexer = struct {
     fn bumpChar(self: *Lexer) ?u21 {
         if (self.pos >= self.src.len) return null;
         const rest = self.src[self.pos..];
+        if (rest[0] < 0x80) {
+            self.pos += 1;
+            return rest[0];
+        }
         const seq = std.unicode.utf8ByteSequenceLength(rest[0]) catch {
             self.pos += 1;
             return rest[0];
@@ -419,8 +426,8 @@ pub const Lexer = struct {
                 } else if (c0 == @as(?u8, '*') and c1 == @as(?u8, '/')) {
                     self.pos += 2;
                     depth -= 1;
-                } else if (c0 != null) {
-                    _ = self.bumpChar();
+                } else if (c0) |c| {
+                    if (c < 0x80) self.pos += 1 else _ = self.bumpChar();
                 } else {
                     var d = Diagnostic.err("unterminated block comment", self.span(start));
                     _ = d.withCode("E0020");
@@ -485,6 +492,12 @@ pub const Lexer = struct {
             if (self.peekByte(1)) |b1| {
                 if (std.ascii.isDigit(b1)) return self.lexNumber(start);
             }
+        }
+
+        // No operator starts with a letter or underscore, so an identifier
+        // skips the operator tables.
+        if (isIdentStartByte(b)) {
+            return self.lexIdentOrKeyword(start);
         }
 
         if (try self.lexPunct(start)) |tok| {
@@ -556,8 +569,14 @@ pub const Lexer = struct {
 
     fn lexIdentOrKeyword(self: *Lexer, start: u32) Token {
         _ = self.bumpChar();
-        while (self.peekChar()) |c| {
-            if (isIdentContByte(c) or isXidContinue(c)) {
+        while (self.pos < self.src.len) {
+            const b = self.src[self.pos];
+            if (b < 0x80) {
+                if (!isIdentContByte(b)) break;
+                self.pos += 1;
+                continue;
+            }
+            if (isXidContinue(self.peekChar().?)) {
                 _ = self.bumpChar();
             } else break;
         }
@@ -821,32 +840,47 @@ pub const Lexer = struct {
             return .{ .kind = k, .span = self.span(start) };
         }
 
-        const two: ?TokenKind = blk: {
-            if (b0 == '=' and b1 == @as(?u8, '=')) break :blk .EqEq;
-            if (b0 == '!' and b1 == @as(?u8, '=')) break :blk .BangEq;
-            if (b0 == '<' and b1 == @as(?u8, '=')) break :blk .Le;
-            if (b0 == '>' and b1 == @as(?u8, '=')) break :blk .Ge;
-            if (b0 == '&' and b1 == @as(?u8, '&')) break :blk .AmpAmp;
-            if (b0 == '|' and b1 == @as(?u8, '|')) break :blk .PipePipe;
-            if (b0 == '+' and b1 == @as(?u8, '+')) break :blk .PlusPlus;
-            if (b0 == '-' and b1 == @as(?u8, '-')) break :blk .MinusMinus;
-            if (b0 == '+' and b1 == @as(?u8, '=')) break :blk .PlusEq;
-            if (b0 == '-' and b1 == @as(?u8, '=')) break :blk .MinusEq;
-            if (b0 == '*' and b1 == @as(?u8, '=')) break :blk .StarEq;
-            if (b0 == '/' and b1 == @as(?u8, '=')) break :blk .SlashEq;
-            if (b0 == '%' and b1 == @as(?u8, '=')) break :blk .PercentEq;
-            if (b0 == '-' and b1 == @as(?u8, '>')) break :blk .Arrow;
-            if (b0 == '=' and b1 == @as(?u8, '>')) break :blk .FatArrow;
-            if (b0 == '.' and b1 == @as(?u8, '.')) break :blk .DotDot;
-            if (b0 == ':' and b1 == @as(?u8, ':')) break :blk .ColonColon;
-            if (b0 == '?' and b1 == @as(?u8, '.')) break :blk .QuestionDot;
+        const two: ?TokenKind = if (b1) |c1| switch (b0) {
+            '=' => switch (c1) {
+                '=' => .EqEq,
+                '>' => .FatArrow,
+                else => null,
+            },
+            '!' => switch (c1) {
+                '=' => .BangEq,
+                '!' => .BangBang,
+                else => null,
+            },
+            '<' => if (c1 == '=') .Le else null,
+            '>' => if (c1 == '=') .Ge else null,
+            '&' => if (c1 == '&') .AmpAmp else null,
+            '|' => if (c1 == '|') .PipePipe else null,
+            '+' => switch (c1) {
+                '+' => .PlusPlus,
+                '=' => .PlusEq,
+                else => null,
+            },
+            '-' => switch (c1) {
+                '-' => .MinusMinus,
+                '=' => .MinusEq,
+                '>' => .Arrow,
+                else => null,
+            },
+            '*' => if (c1 == '=') .StarEq else null,
+            '/' => if (c1 == '=') .SlashEq else null,
+            '%' => if (c1 == '=') .PercentEq else null,
+            '.' => if (c1 == '.') .DotDot else null,
+            ':' => if (c1 == ':') .ColonColon else null,
             // `?::` is a `?` (nullable receiver) plus `::`, as in
             // `Any?::toString`, so it must not be swallowed as elvis.
-            if (b0 == '?' and b1 == @as(?u8, ':') and b2 != @as(?u8, ':')) break :blk .QuestionColon;
-            if (b0 == '!' and b1 == @as(?u8, '!')) break :blk .BangBang;
-            if (b0 == ';' and b1 == @as(?u8, ';')) break :blk .DoubleSemicolon;
-            break :blk null;
-        };
+            '?' => switch (c1) {
+                '.' => .QuestionDot,
+                ':' => if (b2 != @as(?u8, ':')) .QuestionColon else null,
+                else => null,
+            },
+            ';' => if (c1 == ';') .DoubleSemicolon else null,
+            else => null,
+        } else null;
         if (two) |k| {
             self.pos += 2;
             return .{ .kind = k, .span = self.span(start) };
@@ -1072,6 +1106,19 @@ pub const Lexer = struct {
                 continue;
             }
 
+            // A run of plain ASCII is copied through as-is; each byte would
+            // encode to itself.
+            if (b < 0x80) {
+                var end: u32 = self.pos + 1;
+                while (end < self.src.len) : (end += 1) {
+                    const nb = self.src[end];
+                    if (nb >= 0x80 or nb == '"' or nb == '$') break;
+                    if (!raw and (nb == '\n' or nb == '\\')) break;
+                }
+                try text.appendSlice(self.allocator, self.src[self.pos..end]);
+                self.pos = end;
+                continue;
+            }
             const c = self.bumpChar().?;
             try appendCodepoint(&text, self.allocator, c);
         }
@@ -2046,3 +2093,54 @@ test "raw string quote-run: leading quote joins the content" {
     try testing.expect(t[2].kind == .StringQuote and t[2].kind.StringQuote.triple);
 }
 
+
+test "identifier spans ASCII and non-ASCII scalars alike" {
+    const src = "val naïveΣ2 = πr2";
+    var r = try lex(src);
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(testing.allocator);
+    for (r.tokens) |t| {
+        if (t.kind == .Ident) try names.append(testing.allocator, t.span.text(src));
+    }
+    try testing.expectEqual(@as(usize, 2), names.items.len);
+    try testing.expectEqualStrings("naïveΣ2", names.items[0]);
+    try testing.expectEqualStrings("πr2", names.items[1]);
+}
+
+test "string body keeps ASCII runs, scalars, escapes and templates in order" {
+    var r = try lex("\"ab€c\\td\\u00e9$x-y\"");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    const t = r.tokens;
+    try testing.expect(t[1].kind == .StringText);
+    try testing.expectEqualStrings("ab€c\td\u{e9}", t[1].kind.StringText);
+    try testing.expect(t[2].kind == .ShortInterp and std.mem.eql(u8, t[2].kind.ShortInterp, "x"));
+    try testing.expect(t[3].kind == .StringText and std.mem.eql(u8, t[3].kind.StringText, "-y"));
+    try testing.expect(t[4].kind == .StringQuote);
+}
+
+test "raw string body copies backslashes and newlines through" {
+    var r = try lex("\"\"\"a\\n\nb\"\"\"");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    try testing.expect(r.tokens[1].kind == .StringText);
+    try testing.expectEqualStrings("a\\n\nb", r.tokens[1].kind.StringText);
+}
+
+test "malformed lead byte in a string is one scalar wide" {
+    // The lead byte of a truncated sequence stands for itself, as U+00C3.
+    var r = try lex("\"a\xC3x\"");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    try testing.expect(r.tokens[1].kind == .StringText);
+    try testing.expectEqualStrings("a\u{c3}x", r.tokens[1].kind.StringText);
+}
+
+test "block comment skips multi-byte scalars" {
+    var r = try lex("/* π /* nested € */ */x");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    try testing.expect(r.tokens[0].kind == .Ident);
+}

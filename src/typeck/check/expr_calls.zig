@@ -85,7 +85,7 @@ fn checkCallInner(
     type_args: []const TypeRef,
     call_span: Span,
 ) Allocator.Error!Type {
-    call_shape_counts[0] += 1;
+    _ = @atomicRmw(u64, &call_shape_counts[0], .Add, 1, .monotonic);
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const callee_span = callee.Path.span;
         const name = callee.Path.segments[0].name;
@@ -238,7 +238,7 @@ fn checkCallInner(
     // Flow a seeded `List<T>` element type through the chain so each lambda
     // gets a concrete expected parameter type.
     if (callee.* == .Member) {
-        call_shape_counts[1] += 1;
+        _ = @atomicRmw(u64, &call_shape_counts[1], .Add, 1, .monotonic);
         const m = callee.Member;
         const mname = m.name.name;
         if (isScopeFn(mname)) {
@@ -343,12 +343,12 @@ fn checkCallInner(
             var cands: std.ArrayList(expr_mod.ExtensionCandidate) = .empty;
             defer cands.deinit(self.allocator);
             try expr_mod.lookupExtensionCandidates(self, cn, mname, args.len, &cands);
-            call_shape_counts[2] += 1;
+            _ = @atomicRmw(u64, &call_shape_counts[2], .Add, 1, .monotonic);
             if (std.c.getenv("KLIO_EAGER_AUDIT") != null) {
                 std.debug.print("[EAGER-MEMBER] recv_class={s} name={s} cands={d} ext_key={}\n", .{ cn, mname, cands.items.len, self.extensions.contains(cn) });
             }
             if (cands.items.len != 0) {
-                call_shape_counts[3] += 1;
+                _ = @atomicRmw(u64, &call_shape_counts[3], .Add, 1, .monotonic);
                 // Full selection, so `sb.append("x")` picks `append(String)`
                 // over an arity-matching sibling.
                 var sigs_buf: std.ArrayList(FnSig) = .empty;
@@ -674,7 +674,7 @@ pub var eager_gate_counts: [7]u64 = @splat(0);
 /// receiver class was named, [3] those that found extension candidates.
 pub var call_shape_counts: [5]u64 = @splat(0);
 fn eagerGate(i: usize) void {
-    eager_gate_counts[i] += 1;
+    _ = @atomicRmw(u64, &eager_gate_counts[i], .Add, 1, .monotonic);
 }
 
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record_name: []const u8) void {
@@ -792,7 +792,7 @@ pub fn checkOverloadedCallRecordedAt(
     return checkOverloadedCallRecImpl(self, sigs, args, arg_names, type_args, call_span, true, record_name);
 }
 
-var record_span_override: ?Span = null;
+threadlocal var record_span_override: ?Span = null;
 
 /// True over a complete universe: the base's own sources at image bake time.
 /// Outside it a source-extension pick is refused, since a program that loads

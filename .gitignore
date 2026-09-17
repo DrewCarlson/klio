@@ -2,6 +2,7 @@
 kotlin-language-spec
 .idea
 zig-out/
+zig-out-rel/
 .zig-cache/
 zig-pkg/
 target/

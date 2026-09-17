@@ -326,7 +326,8 @@ fn soleBodiedCandidatePick(
     var sole: ?FuncId = null;
     for (cands) |fid| {
         const f = b.module.funcById(fid) orelse continue;
-        if (!f.hasBody()) continue;
+        // A header stub with a declared return answers as its body would.
+        if (!b.module.declaredWithBody(fid, f) or (!f.hasBody() and !f.return_ty_declared)) continue;
         if (f.low_priority) continue;
         const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (f.params.len -| base != want) continue;
@@ -561,7 +562,8 @@ fn exactArityOverloadPick(
         var match: ?FuncId = null;
         for (cands) |fid| {
             const f = b.module.funcById(fid) orelse continue;
-            if (!f.hasBody()) continue;
+            // A header stub with a declared return answers as its body would.
+        if (!b.module.declaredWithBody(fid, f) or (!f.hasBody() and !f.return_ty_declared)) continue;
             const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
             if (f.params.len -| base != want) continue;
             var all_exact = true;

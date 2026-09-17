@@ -825,6 +825,70 @@ pub fn inlineExpandLeave() void {
 
 /// Release any installed tables, for tests and for a build driver tearing down
 /// between builds.
+/// The per-thread inline tables a pool worker needs from the driver's thread.
+/// The two a lookup may fill are cloned on install, so no two threads share one.
+pub const ThreadState = struct {
+    deferred_section: []const u8,
+    deferred_alloc: Allocator,
+    deferred_decode: ?DeferredDecodeFn,
+    inline_fn_asts: ?std.StringHashMap([]const FnField),
+    inline_fn_asts_resolved: ?std.StringHashMap([]const *const ast.Function),
+    type_alias_tags: ?*const std.StringHashMap([]const u8),
+    shadowed_inline_names: ?StringSet,
+    inline_fn_ids: ?std.AutoHashMap(u32, FnField),
+    inline_id_by_fn: ?std.AutoHashMap(usize, u32),
+    inline_member_owner: ?std.AutoHashMap(usize, []const u8),
+    top_level_prop_names: ?StringSet,
+    member_prop_asts: ?std.StringHashMap(*const ast.Property),
+    member_ext_prop_recv: ?std.StringHashMap([]const u8),
+    class_supertype_refs: ?std.StringHashMap([]const ast.TypeRef),
+};
+
+pub fn captureThreadState() ThreadState {
+    return .{
+        .deferred_section = deferred_section,
+        .deferred_alloc = deferred_alloc,
+        .deferred_decode = deferred_decode,
+        .inline_fn_asts = inline_fn_asts,
+        .inline_fn_asts_resolved = inline_fn_asts_resolved,
+        .type_alias_tags = type_alias_tags,
+        .shadowed_inline_names = shadowed_inline_names,
+        .inline_fn_ids = inline_fn_ids,
+        .inline_id_by_fn = inline_id_by_fn,
+        .inline_member_owner = inline_member_owner,
+        .top_level_prop_names = top_level_prop_names,
+        .member_prop_asts = member_prop_asts,
+        .member_ext_prop_recv = member_ext_prop_recv,
+        .class_supertype_refs = class_supertype_refs,
+    };
+}
+
+pub fn installThreadState(s: ThreadState) Allocator.Error!void {
+    deferred_section = s.deferred_section;
+    deferred_alloc = s.deferred_alloc;
+    deferred_decode = s.deferred_decode;
+    inline_fn_asts = s.inline_fn_asts;
+    inline_fn_asts_resolved = if (s.inline_fn_asts_resolved) |m| try m.clone() else null;
+    type_alias_tags = s.type_alias_tags;
+    shadowed_inline_names = s.shadowed_inline_names;
+    inline_fn_ids = s.inline_fn_ids;
+    inline_id_by_fn = if (s.inline_id_by_fn) |m| try m.clone() else null;
+    inline_member_owner = s.inline_member_owner;
+    top_level_prop_names = s.top_level_prop_names;
+    member_prop_asts = s.member_prop_asts;
+    member_ext_prop_recv = s.member_ext_prop_recv;
+    class_supertype_refs = s.class_supertype_refs;
+    inline_expand_depth = 0;
+}
+
+/// Frees what `installThreadState` cloned onto this thread.
+pub fn dropThreadState() void {
+    if (inline_fn_asts_resolved) |*m| m.deinit();
+    inline_fn_asts_resolved = null;
+    if (inline_id_by_fn) |*m| m.deinit();
+    inline_id_by_fn = null;
+}
+
 pub fn resetForTest() void {
     if (inline_fn_asts) |*m| {
         m.deinit();

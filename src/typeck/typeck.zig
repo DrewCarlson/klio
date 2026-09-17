@@ -14,6 +14,8 @@ pub const check = @import("check.zig");
 pub const TypeCheck = check.TypeCheck;
 pub const typecheck = check.typecheck;
 pub const typecheckModule = check.typecheckModule;
+pub const typecheckModuleOpts = check.typecheckModuleOpts;
+pub const ModuleOptions = check.ModuleOptions;
 pub const Checker = check.Checker;
 pub const codes = check.codes;
 

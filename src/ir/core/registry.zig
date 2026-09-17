@@ -410,9 +410,6 @@ pub const ModuleRegistry = struct {
         self.top_level_prop_setters.deinit();
     }
 
-    /// Clone for extension: outer container spines are copied onto `a`, while inner containers and
-    /// value slices are SHARED with the original by value-copy. Sound because the extending build only
-    /// inserts new keys and replaces whole entries, never appending into a container reached by an old key.
     pub fn noteClassChainChange(self: *ModuleRegistry) void {
         self.class_super_gen +%= 1;
     }
@@ -426,6 +423,9 @@ pub const ModuleRegistry = struct {
         self.evidence_supers.clearRetainingCapacity();
     }
 
+    /// Clone for extension: outer container spines are copied onto `a`, while inner containers and
+    /// value slices are SHARED with the original by value-copy. Sound because the extending build only
+    /// inserts new keys and replaces whole entries, never appending into a container reached by an old key.
     pub fn cloneForExtend(self: *const ModuleRegistry, a: Allocator) Allocator.Error!ModuleRegistry {
         var out = ModuleRegistry.init(a);
         try out.object_names.appendSlice(a, self.object_names.items);

@@ -348,6 +348,58 @@ pub fn setLowerAnonScopeClasses(classes: []const ir.ScopeClassRef) []const ir.Sc
     return prev;
 }
 
+/// The lowering state a thread carries: the seeds the driver installs before
+/// bodies lower, and the scratch a body leaves cleared. A pool worker installs
+/// the driver thread's capture before its first body.
+pub const ThreadState = struct {
+    self_package: []const u8,
+    file_private_renames: ?*const FilePrivateRenames,
+    file_private_func_renames: ?*const FilePrivateRenames,
+    file_type_renames: ?*const FileTypeRenames,
+    pkg_type_renames: ?*const PkgTypeRenames,
+    file_pkgs: ?*const FilePkgMap,
+    owner_class: ?[]const u8,
+    anon_scope_renames: []const ir.ScopeRename,
+    anon_prop_heads: []const AnonPropHead,
+    anon_capture_names: []const []const u8,
+    anon_boxed_names: []const []const u8,
+    anon_scope_classes: []const ir.ScopeClassRef,
+};
+
+pub fn captureThreadState() ThreadState {
+    return .{
+        .self_package = lower_self_package,
+        .file_private_renames = lower_file_private_renames,
+        .file_private_func_renames = lower_file_private_func_renames,
+        .file_type_renames = lower_file_type_renames,
+        .pkg_type_renames = lower_pkg_type_renames,
+        .file_pkgs = lower_file_pkgs,
+        .owner_class = current_owner_class,
+        .anon_scope_renames = lower_anon_scope_renames,
+        .anon_prop_heads = lower_anon_prop_heads,
+        .anon_capture_names = lower_anon_capture_names,
+        .anon_boxed_names = lower_anon_boxed_names,
+        .anon_scope_classes = lower_anon_scope_classes,
+    };
+}
+
+pub fn installThreadState(s: ThreadState) void {
+    lower_self_package = s.self_package;
+    lower_file_private_renames = s.file_private_renames;
+    lower_file_private_func_renames = s.file_private_func_renames;
+    lower_file_type_renames = s.file_type_renames;
+    lower_pkg_type_renames = s.pkg_type_renames;
+    lower_file_pkgs = s.file_pkgs;
+    current_owner_class = s.owner_class;
+    lower_anon_scope_renames = s.anon_scope_renames;
+    lower_anon_prop_heads = s.anon_prop_heads;
+    lower_anon_capture_names = s.anon_capture_names;
+    lower_anon_boxed_names = s.anon_boxed_names;
+    lower_anon_scope_classes = s.anon_scope_classes;
+    current_real_fn = null;
+    local_class_scope_len = 0;
+}
+
 pub fn anonScopeClass(name: []const u8) ?ir.ScopeClassRef {
     for (lower_anon_scope_classes) |class_ref| {
         if (std.mem.eql(u8, class_ref.name, name)) return class_ref;

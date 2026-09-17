@@ -209,15 +209,30 @@ fn calleeNameIs(callee: *const Expr, name: []const u8) bool {
 
 /// Per-decl `Span.file` survives the merge, so cross-file visibility checks
 /// still work.
+pub const ModuleOptions = struct {
+    /// Threads for the body pass; above one, `allocator` must be thread-safe.
+    body_threads: usize = 1,
+};
+
 pub fn typecheckModule(
     allocator: Allocator,
     files: []const KotlinFile,
     resolution: *const Resolution,
 ) Allocator.Error!TypeCheck {
+    return typecheckModuleOpts(allocator, files, resolution, .{});
+}
+
+pub fn typecheckModuleOpts(
+    allocator: Allocator,
+    files: []const KotlinFile,
+    resolution: *const Resolution,
+    opts: ModuleOptions,
+) Allocator.Error!TypeCheck {
     const merged = try mergeModuleFiles(allocator, files);
     const user_contracts = try scanUserInlineContracts(allocator, &merged);
     cfa.analyses.contracts.setUserInlineContracts(user_contracts);
     var tc = try Checker.new(allocator, resolution);
+    tc.body_threads = opts.body_threads;
     defer destroyQueryScratch(allocator, tc.query_scratch);
     defer destroySolveMemo(allocator, tc.solve_memo);
     if (types.pending_extern_decls) |ed| {
@@ -869,6 +884,8 @@ pub const Checker = struct {
     /// Spans recorded in `types` since the root inference session began; only
     /// these can carry its variables.
     types_journal: std.ArrayList(Span),
+    /// Threads for the body pass. Above one, `allocator` must be thread-safe.
+    body_threads: usize,
 
     pub const new = phases.new;
     pub const run = phases.run;

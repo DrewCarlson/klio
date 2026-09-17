@@ -38,6 +38,7 @@ const core_consts = @import("core/consts.zig");
 const m_lookup = @import("core/module_lookup.zig");
 const m_static = @import("core/module_static.zig");
 const m_resolve_call = @import("core/module_resolve_call.zig");
+pub const remap = @import("core/remap.zig");
 const m_methods = @import("core/module_methods.zig");
 const m_bare = @import("core/module_bare.zig");
 const m_calls = @import("core/module_calls.zig");
@@ -807,6 +808,8 @@ pub const Module = struct {
 
     pub const resolveExtensionCall = m_resolve_call.resolveExtensionCall;
     pub const extResolveCache = m_resolve_call.extResolveCache;
+    pub const declaredWithBody = m_lookup.declaredWithBody;
+    pub const warmLookupCaches = m_lookup.warmLookupCaches;
     pub const recvVerdictCache = m_resolve_call.recvVerdictCache;
     pub const resolveMemberCall = m_resolve_call.resolveMemberCall;
     pub const dispatchForTarget = m_resolve_call.dispatchForTarget;
@@ -1022,6 +1025,7 @@ test {
     testing.refAllDecls(@import("core/module_methods.zig"));
     testing.refAllDecls(@import("core/module_refs.zig"));
     testing.refAllDecls(@import("core/module_resolve_call.zig"));
+    testing.refAllDecls(@import("core/remap.zig"));
     testing.refAllDecls(@import("core/module_static.zig"));
     testing.refAllDecls(@import("core/names.zig"));
     testing.refAllDecls(@import("core/registry.zig"));

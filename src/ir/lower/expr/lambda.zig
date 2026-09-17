@@ -674,7 +674,7 @@ pub fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg
             }
             if (!gap_defaulted) continue;
         }
-        if (!f.hasBody()) {
+        if (!b.module.declaredWithBody(fid, f)) {
             if (bodyless == null) bodyless = fid;
             continue;
         }

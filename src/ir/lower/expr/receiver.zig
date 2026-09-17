@@ -270,7 +270,7 @@ pub fn overloadPickByLambdaReturnFull(
             continue;
         };
         const why = lamret_why != null and std.mem.find(u8, f.fqn, lamret_why.?) != null;
-        if (!f.hasBody() and !expr_mod.lamret_allow_bodyless) {
+        if (!b.module.declaredWithBody(fid, f) and !expr_mod.lamret_allow_bodyless) {
             if (why) std.debug.print("[lamret-why] {s}#{d} skip=no_body\n", .{ f.fqn, fid.int() });
             continue;
         }

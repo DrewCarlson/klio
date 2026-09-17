@@ -1823,7 +1823,7 @@ fn unifyParamAgainstArg(
 /// type is evident without a type checker.
 /// `callerOwnerClass` is the caller's lexical owner while a splice infers its
 /// reified bindings after the callee frame is pushed.
-var splice_lexical_owner: ?[]const u8 = null;
+threadlocal var splice_lexical_owner: ?[]const u8 = null;
 
 /// The caller's lexical owner while a splice binds its arguments, for derivations
 /// that rename nested classes through the scope the argument was written in.
@@ -2725,7 +2725,7 @@ fn astTypeMentionsFnTypeParam(ty: *const ast.TypeRef, f: *const ast.Function) bo
     return false;
 }
 
-pub var splice_route_tag: []const u8 = "?";
+pub threadlocal var splice_route_tag: []const u8 = "?";
 
 /// The declaration a call splices. A bare call arrives with its `target` already
 /// resolved, so the splice expands the declaration the call binds. A member call

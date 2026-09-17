@@ -710,8 +710,8 @@ fn topLevelPropertyTypeRef(b: *FuncBuilder, p: @FieldType(Expr, "Path")) ?ir.Typ
 
 
 /// Locals whose initializer the walk is inside, so it refuses to re-enter one.
-var init_chain: [16][]const u8 = @splat(&.{});
-pub var init_chain_len: usize = 0;
+threadlocal var init_chain: [16][]const u8 = @splat(&.{});
+pub threadlocal var init_chain_len: usize = 0;
 
 pub fn pushInitChain(name: []const u8) bool {
     if (init_chain_len == init_chain.len) return false;

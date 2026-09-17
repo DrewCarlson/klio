@@ -381,6 +381,12 @@ backend (the default for `fast`/`safe`).
 | `KLIO_ENUM_INIT_TRACE` | set | VM-start enum entry construction: which entries are rebuilt through the class path and the header thunk chain per class | `[enum-init]`, `[chain]` |
 | `KLIO_CTOR_TRACE` | set | Each secondary-constructor default-argument thunk as it is evaluated (class, parameter, thunk id, argument count) | `[ctor-default]` |
 | `KLIO_TOPPROP_TRACE` | set | A top-level property initializer that deferred to on-access during the startup pass, with its error tag | `[topprop-defer]` |
+| `KLIO_PARSE_JOBS` | count | Caps the threads that lex and parse the stdlib and pack sources at load (default: one per CPU); `1` parses serially | none |
+| `KLIO_TYPECK_THREADS` | count | Caps the threads the checker's body pass uses when it records the base's call resolutions during a bake (default: one per CPU); `1` checks serially | none |
+| `KLIO_LOWER_FINGERPRINT` | set | After the top-level bodies lower, one line per function with a hash of everything it carries but addresses; two builds of one module compare by these lines | `[fn]` |
+| `KLIO_LOWER_THREADS` | count | Caps the threads that lower the base's function bodies during a bake (default: one per CPU); `1` lowers serially, which is the reference the pool must match | none |
+| `KLIO_TRACE_LOWER` | set | Wall time of every lowering step of a build, the per-body total with the slowest bodies, and the resolution cache hit counts | `[lower]` |
+| `KLIO_TRACE_RUN` | set | Wall time of the run's own steps: base clone, VM init, top-level property initialisation, `main`, teardown, and the prepare/execute split | `[run]` |
 | `KLIO_BOX_FILTER` / `KLIO_BOX_JOBS` / `KLIO_BOX_TIMEOUT_MS` | substring / count / ms | The box conformance runner's test subset, worker width, and per-test wall | `[box-fail]`, `[box-excluded]` |
 | `KLIO_GC_STRESS` | set; `0`/empty off | Collects at every safe point; surfaces incomplete roots/tracers immediately | none |
 | `KLIO_GC_STRESS_EVERY` | number (`0` off) | Collects every N safe points (cheaper sampled stress) | none |
@@ -417,7 +423,8 @@ overrides and traces.
 | `KLIO_HOME` | path | The klio data home (packs, cache, registry, stubs); overrides the `~/.klio` default | none |
 | `KLIO_STDLIB_PACK` | path | On-disk stdlib pack override, first in the resolution order (also folded into the image cache key) | none |
 | `KLIO_STDLIB_IMAGE` | `0` disables | The stdlib image cache; disabled, every run lowers the full dependency set | none |
-| `KLIO_TRACE_STDLIB_IMAGE` | set; `0`/empty off | One `hit`/`baked`/`fallback` line per run with the cache key and timing | `[stdlib-image]` |
+| `KLIO_TRACE_STDLIB_IMAGE` | set; `0`/empty off | One `hit`/`baked`/`fallback` line per run with the cache key and timing. The `baked` line comes from the child that serializes the image, after the run's own output, and that child keeps stderr open until it is done | `[stdlib-image]` |
+| `KLIO_STDLIB_IMAGE_SYNC` | set; `0`/empty off | Serialize the image in the running process instead of a forked child, so the image exists when the run returns; the image itests set it | none |
 | `KLIO_PACK_DIAG` | set | Disables the image cache so the legacy loader runs, and turns on its diagnostics (per-source lex/parse error dumps) | `[embed lex err]` |
 | `KLIO_AST_REBASE_TRACE` | set | Old-to-new FileId mapping when a cached AST bundle's spans are rebased | `[ast-rebase]` |
 | `KLIO_BUNDLE_INSPECT` | `1` (`0` off) | A bundled executable prints its manifest and payload table, then exits without running | manifest listing |

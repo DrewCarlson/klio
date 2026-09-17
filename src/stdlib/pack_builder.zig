@@ -101,8 +101,11 @@ pub fn buildStdlibPack(
 }
 
 /// Read the curated upstream files plus the klio-authored `actual`s into a
-/// `SourceBundle`. Fails as data when an expected file is absent.
-fn buildCuratedSources(a: std.mem.Allocator, result: *PackError) std.mem.Allocator.Error!?schema.SourceBundle {
+/// `SourceBundle`, every string allocated from `a`. Fails as data when an
+/// expected file is absent. This is exactly what the built pack's `SOURCES`
+/// section decodes back to, so a reader with the checkout at hand takes it
+/// directly.
+pub fn buildCuratedSources(a: std.mem.Allocator, result: *PackError) std.mem.Allocator.Error!?schema.SourceBundle {
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
     const io = threaded.io();

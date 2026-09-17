@@ -39,6 +39,52 @@ pub fn stdlibPackBytes(allocator: Allocator, env: ?*const EnvMap, result: *PackE
     return null;
 }
 
+/// The stdlib `SOURCES`, every string in `arena`; `deinit` drops them all.
+pub const StdlibSources = struct {
+    arena: std.heap.ArenaAllocator,
+    files: []const pack.schema.SourceFile,
+
+    pub fn deinit(self: *StdlibSources) void {
+        self.arena.deinit();
+    }
+};
+
+/// The stdlib sources, resolved in the order at the top of this file. The
+/// checkout is read straight into the bundle rather than packed and decoded
+/// again, which yields the same files; a pack override and the baked-in
+/// bytes decode their `SOURCES` section. Null when every source fails, with
+/// `result` naming the missing root; a pack that resolves but does not decode
+/// yields no files.
+pub fn stdlibSources(allocator: Allocator, env: ?*const EnvMap, result: *PackError) Allocator.Error!?StdlibSources {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    if (env) |m| {
+        if (m.get(STDLIB_PACK_ENV)) |path| {
+            if (try readFile(a, path)) |bytes| {
+                return .{ .arena = arena, .files = try decodeSources(a, bytes, result) };
+            }
+        }
+    }
+    if (try stdlib.pack_builder.buildCuratedSources(a, result)) |bundle| {
+        return .{ .arena = arena, .files = bundle.files };
+    }
+    if (EMBEDDED_PACK_BYTES) |bytes| {
+        return .{ .arena = arena, .files = try decodeSources(a, try a.dupe(u8, bytes), result) };
+    }
+    arena.deinit();
+    return null;
+}
+
+/// The `SOURCES` section of the pack `bytes`, or no files when it does not
+/// decode. `bytes` and everything decoded belong to the arena `a`.
+fn decodeSources(a: Allocator, bytes: []u8, result: *PackError) Allocator.Error![]const pack.schema.SourceFile {
+    var reader = (try pack.PackReader.fromBytes(a, bytes, result)) orelse return &.{};
+    const payload = (try reader.readSection(pack.section_names.SOURCES, result)) orelse return &.{};
+    const bundle = (try pack.schema.decode(pack.schema.SourceBundle, a, payload.slice(), result)) orelse return &.{};
+    return bundle.files;
+}
+
 /// Implicit packages the pack manifest declares. Slice and strings owned by
 /// the caller; any failure yields an empty slice.
 pub fn embeddedImplicitPackages(allocator: Allocator, env: ?*const EnvMap) Allocator.Error![][]const u8 {
@@ -131,5 +177,28 @@ test "embedded implicit packages match static list" {
     try std.testing.expectEqual(from_static.len, from_pack.len);
     for (from_pack, from_static) |got, want| {
         try std.testing.expectEqualStrings(want, got);
+    }
+}
+
+test "direct sources equal the packed and decoded sources" {
+    const a = std.testing.allocator;
+    var err: PackError = undefined;
+
+    var direct = (try stdlibSources(a, null, &err)) orelse return error.SkipZigTest;
+    defer direct.deinit();
+    try std.testing.expect(direct.files.len != 0);
+
+    const bytes = (try stdlibPackBytes(a, null, &err)).?;
+    var reader = (try pack.PackReader.fromBytes(a, bytes, &err)).?;
+    defer reader.deinit();
+    const payload = (try reader.readSection(pack.section_names.SOURCES, &err)).?;
+    defer payload.deinit(a);
+    var bundle = (try pack.schema.decode(pack.schema.SourceBundle, a, payload.slice(), &err)).?;
+    defer bundle.deinit(a);
+
+    try std.testing.expectEqual(bundle.files.len, direct.files.len);
+    for (bundle.files, direct.files) |want, got| {
+        try std.testing.expectEqualStrings(want.rel_path, got.rel_path);
+        try std.testing.expectEqualStrings(want.bytes, got.bytes);
     }
 }

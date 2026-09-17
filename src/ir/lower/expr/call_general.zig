@@ -1492,7 +1492,7 @@ fn emitPlainValueCall(g: *GenCtx) Allocator.Error!Reg {
 pub fn aFuncFits(b: *FuncBuilder, nm: []const u8, want: usize) bool {
     for (b.module.funcsBySimpleName(nm)) |fid| {
         const mf = b.module.funcById(fid) orelse continue;
-        if (!mf.hasBody()) continue;
+        if (!b.module.declaredWithBody(fid, mf)) continue;
         const has_this = mf.params.len != 0 and std.mem.eql(u8, mf.params[0].name, "this");
         const base: usize = if (has_this) 1 else 0;
         const user = mf.params.len - base;

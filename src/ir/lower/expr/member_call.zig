@@ -1431,7 +1431,7 @@ fn uniqueAnyNullableExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?
     return found;
 }
 
-pub var ext_route_tag: []const u8 = "?";
+pub threadlocal var ext_route_tag: []const u8 = "?";
 /// The state the resolved-extension call threads through its emission arms.
 const ExtCall = struct {
     b: *FuncBuilder,

@@ -3,8 +3,8 @@
 //! once, then load and extend it per run.
 //!
 //! The key is a Blake3 over the image format version, the running executable's
-//! size and mtime, the content of every stdlib source the pack builder reads (or
-//! the `KLIO_STDLIB_PACK` override pack bytes), the stdlib load gate
+//! size and mtime, the path, size and mtime of every stdlib source the pack
+//! builder reads (or the `KLIO_STDLIB_PACK` override pack bytes), the stdlib load gate
 //! (implicit-only vs full curated set), and each selected pack's stored content
 //! hash and resolved feature set. A mismatch rebakes rather than serving stale
 //! lowered code. Packs still load per run for their bindings and known-package
@@ -159,35 +159,37 @@ fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
     return out;
 }
 
-/// Fold the cwd checkout's stdlib sources into `hasher`; false when one is
-/// unreadable, and the run falls through to the embedded pack.
+/// Fold the cwd checkout's stdlib sources into `hasher` by path, size and
+/// modification time; false when one is missing, and the run falls through
+/// to the embedded pack. Reading and hashing the sources themselves cost more
+/// than loading the image they key.
 fn hashCheckoutSources(gpa: Allocator, fio: std.Io, hasher: *std.crypto.hash.Blake3) bool {
+    _ = gpa;
     const cwd = std.Io.Dir.cwd();
     const pb = stdlib.pack_builder;
     var upstream = cwd.openDir(fio, pb.UPSTREAM_STDLIB_ROOT, .{}) catch return false;
     defer upstream.close(fio);
     for (pb.CURATED_UPSTREAM_SOURCES) |rel| {
-        const bytes = upstream.readFileAlloc(fio, rel, gpa, .unlimited) catch return false;
-        defer gpa.free(bytes);
-        hasher.update(rel);
-        hasher.update(":");
-        var len_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len_buf, bytes.len, .little);
-        hasher.update(&len_buf);
-        hasher.update(bytes);
+        if (!hashSourceStamp(fio, upstream, rel, hasher)) return false;
     }
     var klio_dir = cwd.openDir(fio, pb.KLIO_STDLIB_DIR, .{}) catch return false;
     defer klio_dir.close(fio);
     for (pb.KLIO_STDLIB_ACTUAL_FILES) |rel| {
-        const bytes = klio_dir.readFileAlloc(fio, rel, gpa, .unlimited) catch return false;
-        defer gpa.free(bytes);
-        hasher.update(rel);
-        hasher.update(":");
-        var len_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len_buf, bytes.len, .little);
-        hasher.update(&len_buf);
-        hasher.update(bytes);
+        if (!hashSourceStamp(fio, klio_dir, rel, hasher)) return false;
     }
+    return true;
+}
+
+fn hashSourceStamp(fio: std.Io, dir: std.Io.Dir, rel: []const u8, hasher: *std.crypto.hash.Blake3) bool {
+    const st = dir.statFile(fio, rel, .{}) catch return false;
+    hasher.update(rel);
+    hasher.update(":");
+    var word: [8]u8 = undefined;
+    std.mem.writeInt(u64, &word, st.size, .little);
+    hasher.update(&word);
+    const mtime_ns: u64 = @truncate(@as(u128, @bitCast(@as(i128, st.mtime.nanoseconds))));
+    std.mem.writeInt(u64, &word, mtime_ns, .little);
+    hasher.update(&word);
     return true;
 }
 
@@ -302,6 +304,86 @@ fn writeAtomic(gpa: Allocator, cache: []const u8, dest: []const u8, bytes: []con
     };
 }
 
+const BakeJob = struct {
+    cache: []const u8,
+    hex: *const [32]u8,
+    image_path: []const u8,
+    base: *const StdlibBase,
+    map: *const SourceMap,
+    extras: image.BakeExtras,
+    parse_ms: u64,
+    lower_ms: u64,
+};
+
+/// Encodes the base and publishes the image. False when the base lies outside
+/// the serializable surface, which leaves a tombstone so later runs skip the
+/// bake; the run itself goes on against the base either way.
+fn bakeAndWrite(gpa: Allocator, job: *const BakeJob) bool {
+    const t0 = runtime.clockMonotonicNanos();
+    const bytes = (image.bake(gpa, job.base, job.map, job.extras) catch return false) orelse {
+        writeTombstone(gpa, job.cache, job.hex.*);
+        trace(gpa, "unbakeable {s} (outside serializable surface)", .{job.hex.*});
+        return false;
+    };
+    const t_bake = runtime.clockMonotonicNanos();
+    writeAtomic(gpa, job.cache, job.image_path, bytes);
+    pruneImages(gpa, job.cache);
+    trace(gpa, "  serialize: bake {d}ms, write {d}ms", .{
+        (t_bake - t0) / 1_000_000,
+        (runtime.clockMonotonicNanos() - t_bake) / 1_000_000,
+    });
+    trace(gpa, "baked {s} ({d} bytes; parse {d}ms, lower {d}ms, serialize {d}ms)", .{
+        job.hex.*,
+        bytes.len,
+        job.parse_ms,
+        job.lower_ms,
+        (runtime.clockMonotonicNanos() - t0) / 1_000_000,
+    });
+    return true;
+}
+
+const background_bake_supported = builtin.os.tag != .windows and builtin.link_libc;
+
+/// The child publishing the image while this process runs the program.
+var background_bake: ?std.c.pid_t = null;
+
+/// Bakes in a forked child. The program then never waits for the encoder,
+/// and the child's copy of the base is the base as built, untouched by the
+/// memos the run writes into shared instructions. False when the bake must
+/// happen here: `KLIO_STDLIB_IMAGE_SYNC=1`, a platform without fork, or a
+/// fork that failed.
+fn forkBake(gpa: Allocator, job: *const BakeJob) bool {
+    if (comptime !background_bake_supported) return false;
+    if (getEnvVar(gpa, "KLIO_STDLIB_IMAGE_SYNC")) |v| {
+        defer gpa.free(v);
+        if (v.len != 0 and !std.mem.eql(u8, v, "0")) return false;
+    }
+    const tracing = traceEnabled(gpa);
+    const pid = std.c.fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        // Whoever reads this process's output must not wait on the child.
+        _ = std.c.close(0);
+        _ = std.c.close(1);
+        if (!tracing) _ = std.c.close(2);
+        _ = bakeAndWrite(gpa, job);
+        std.c._exit(0);
+    }
+    background_bake = pid;
+    trace(gpa, "baking {s} in the background", .{job.hex.*});
+    return true;
+}
+
+/// Waits for the background bake: a command that exists to produce the image
+/// returns with it written.
+pub fn finishBackgroundBake() void {
+    if (comptime !background_bake_supported) return;
+    const pid = background_bake orelse return;
+    background_bake = null;
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+}
+
 fn pruneImages(gpa: Allocator, cache: []const u8) void {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -400,6 +482,15 @@ fn checkBaseSources(gpa: Allocator, base: *interp_ir.build.StdlibBase, asts: []c
                 }
             }
         }
+        // By call site, so the baked order does not depend on how the
+        // checker's map was filled.
+        std.mem.sort(interp_ir.build.StdlibBase.EagerCall, out.items, {}, struct {
+            fn lessThan(_: void, x: interp_ir.build.StdlibBase.EagerCall, y: interp_ir.build.StdlibBase.EagerCall) bool {
+                if (x.call.file.int() != y.call.file.int()) return x.call.file.int() < y.call.file.int();
+                if (x.call.start != y.call.start) return x.call.start < y.call.start;
+                return x.call.end < y.call.end;
+            }
+        }.lessThan);
         base.eager_calls = out.toOwnedSlice(gpa) catch &.{};
         if (runtime.envOnce("KLIO_EAGER_AUDIT") != null) {
             std.debug.print("[stdlib-check] {d} base call resolutions, {d} keyed to a FuncId\n", .{ total, base.eager_calls.len });
@@ -823,6 +914,23 @@ fn bakeAndPrepare(
         .declared_lib_ids = project.declaredDependencyIds(gpa, paths),
     });
     const tb_parse = runtime.clockMonotonicNanos();
+    {
+        const t = report.timing;
+        const staged = t.sources + t.register + t.lex_parse_wall;
+        trace(gpa, "  parse: sources {d}ms, register {d}ms, lex+parse {d}ms wall ({d} files on {d} threads; lex {d}ms, parse {d}ms summed; longest {d}ms for {d} bytes), stdlib-other {d}ms, packs {d}ms", .{
+            t.sources / 1_000_000,
+            t.register / 1_000_000,
+            t.lex_parse_wall / 1_000_000,
+            t.files,
+            t.threads,
+            t.lex / 1_000_000,
+            t.parse / 1_000_000,
+            t.longest / 1_000_000,
+            t.longest_bytes,
+            (t.total -| staged) / 1_000_000,
+            ((tb_parse - tb0) -| t.total) / 1_000_000,
+        });
+    }
 
     const key = imageKey(stdlib_hash, exe, report.gate_full, selection.packs.items);
     const hex = keyHex(key);
@@ -861,28 +969,20 @@ fn bakeAndPrepare(
         (tb_build - tb_stage) / 1_000_000,
         (tb_lower - tb_build) / 1_000_000,
     });
-    const bytes = (image.bake(gpa, base, dep_map, .{
-        .known_packages = report.known_packages.items,
-        .binding_fqns = report.binding_fqns.items,
-    }) catch return null) orelse {
-        writeTombstone(gpa, cache, hex);
-        trace(gpa, "unbakeable {s} (outside serializable surface)", .{hex});
-        return null;
+    const bake_job = BakeJob{
+        .cache = cache,
+        .hex = &hex,
+        .image_path = image_path,
+        .base = base,
+        .map = dep_map,
+        .extras = .{
+            .known_packages = report.known_packages.items,
+            .binding_fqns = report.binding_fqns.items,
+        },
+        .parse_ms = (tb_parse - tb0) / 1_000_000,
+        .lower_ms = (tb_lower - tb_pre) / 1_000_000,
     };
-    const tb_bake = runtime.clockMonotonicNanos();
-    writeAtomic(gpa, cache, image_path, bytes);
-    pruneImages(gpa, cache);
-    trace(gpa, "  serialize: bake {d}ms, write {d}ms", .{
-        (tb_bake - tb_lower) / 1_000_000,
-        (runtime.clockMonotonicNanos() - tb_bake) / 1_000_000,
-    });
-    trace(gpa, "baked {s} ({d} bytes; parse {d}ms, lower {d}ms, serialize {d}ms)", .{
-        hex,
-        bytes.len,
-        (tb_parse - tb0) / 1_000_000,
-        (tb_lower - tb_pre) / 1_000_000,
-        (runtime.clockMonotonicNanos() - tb_lower) / 1_000_000,
-    });
+    if (!forkBake(gpa, &bake_job)) _ = bakeAndWrite(gpa, &bake_job);
 
     if (!interp_ir.build.canExtendBase(base, user.asts)) {
         trace(gpa, "fallback (base name collision)", .{});

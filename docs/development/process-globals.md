@@ -103,3 +103,17 @@ The oracles that catch a violation: `itest-differential` (its order test
 runs the corpus forward and backward, so state leaking between programs
 diverges), `itest-parity_corpus_pinned`, and `KLIO_GC_STRESS=1` /
 `KLIO_GC_STRESS_EVERY=N` over either.
+
+## Lowering on a pool
+
+The base bake lowers top-level function bodies on a pool
+(`src/interp_ir/build/body_pool.zig`). Everything a body's lowering reads
+from ambient state is threadlocal: the seeds the driver installs before bodies
+lower (`src/ir/build.zig`, `src/ir/lower/inline_state.zig`) and the scratch a
+body leaves cleared. Each file exposes `captureThreadState` /
+`installThreadState`; a worker installs the driver thread's capture before its
+first body, and the two inline tables a lookup may fill are cloned per worker.
+A new module-level `var` on the lowering path must be `threadlocal`, or the
+pool races on it silently; the audit counters in `src/ir/lower/expr/audit.zig`
+are threadlocal for that reason and count the driver thread only.
+

@@ -57,6 +57,26 @@ pub const EmbeddedReport = struct {
     gate_full: bool = false,
     known_packages: std.ArrayList([]const u8) = .empty,
     binding_fqns: std.ArrayList([]const u8) = .empty,
+    timing: ParseTiming = .{},
+};
+
+/// Where the embedded stdlib source load spent its time, in nanoseconds. The
+/// per-file lex and parse figures are summed across every file (CPU time when
+/// the files were parsed on a pool), the `lex_parse_wall` figure is the wall
+/// time of that pass.
+pub const ParseTiming = struct {
+    /// Resolving and reading the source bundle.
+    sources: u64 = 0,
+    register: u64 = 0,
+    lex: u64 = 0,
+    parse: u64 = 0,
+    lex_parse_wall: u64 = 0,
+    /// The slowest single file's lex plus parse, and its size in bytes.
+    longest: u64 = 0,
+    longest_bytes: usize = 0,
+    total: u64 = 0,
+    files: usize = 0,
+    threads: usize = 1,
 };
 
 /// One selected pack, identified for cache keying: cache path, stored content
@@ -223,6 +243,147 @@ fn packagePathOf(allocator: Allocator, file: KotlinFile) Allocator.Error![]u8 {
 }
 
 
+/// One source file registered on the SourceMap, awaiting its lex and parse.
+/// The files are registered in bundle order before any is parsed, so FileIds
+/// and the resulting AST order never depend on how the parse pass is
+/// scheduled.
+const ParseJob = struct {
+    fid: span.FileId,
+    src: []const u8,
+    rel_path: []const u8,
+    result: Result = .skipped,
+    lex_ns: u64 = 0,
+    parse_ns: u64 = 0,
+
+    const Result = union(enum) {
+        /// An allocation failed; the file is dropped silently.
+        skipped,
+        /// The lexer reported errors; the diagnostic count.
+        lex_errors: usize,
+        /// The parser reported errors; it holds the diagnostics.
+        parse_errors: *parser.Parser,
+        ok: KotlinFile,
+    };
+};
+
+/// Lex, parse and alias-expand one registered file. Per file the only shared
+/// state is the allocator, so jobs may run on any thread.
+fn runParseJob(allocator: Allocator, job: *ParseJob) void {
+    const t0 = runtime.clockMonotonicNanos();
+    var lx = lexer.Lexer.init(allocator, job.fid, job.src) catch return;
+    var lexed = lx.tokenize() catch return;
+    const t1 = runtime.clockMonotonicNanos();
+    job.lex_ns = t1 - t0;
+    if (lexed.diagnostics.hasErrors()) {
+        job.result = .{ .lex_errors = lexed.diagnostics.diags().len };
+        lexed.deinit(allocator);
+        return;
+    }
+    const p = parser.Parser.new(allocator, job.fid, job.src, lexed.tokens);
+    var file_ast = p.parseFile();
+    if (p.diagnostics.hasErrors()) {
+        job.result = .{ .parse_errors = p };
+        lexed.deinit(allocator);
+        return;
+    }
+    lexed.deinit(allocator);
+    ast.expandFileClassAliases(allocator, &file_ast);
+    job.parse_ns = runtime.clockMonotonicNanos() - t1;
+    job.result = .{ .ok = file_ast };
+}
+
+const max_parse_workers: usize = 64;
+/// The parser recurses per nesting level; the reservation is virtual until touched.
+const parse_worker_stack: usize = 64 * 1024 * 1024;
+
+/// Whether `a` may serve several threads at once: only the process allocators
+/// that document it. A wrapped or arena allocator parses serially.
+fn allocatorIsThreadSafe(a: Allocator) bool {
+    return a.vtable == runtime.slab.allocator.vtable or
+        a.vtable == std.heap.smp_allocator.vtable or
+        a.vtable == std.heap.c_allocator.vtable or
+        a.vtable == std.heap.page_allocator.vtable;
+}
+
+/// Threads for `n` parse jobs: one per CPU under the process-wide
+/// `KLIO_MAX_WORKERS` ceiling, or `KLIO_PARSE_JOBS` outright.
+fn parseWorkerCount(allocator: Allocator, n: usize) usize {
+    if (n < 2 or !allocatorIsThreadSafe(allocator)) return 1;
+    var want = std.Thread.getCpuCount() catch 1;
+    if (getEnvVar(allocator, "KLIO_MAX_WORKERS")) |v| {
+        defer allocator.free(v);
+        if (std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10) catch null) |cap| {
+            if (cap >= 1) want = @min(want, cap);
+        }
+    }
+    if (getEnvVar(allocator, "KLIO_PARSE_JOBS")) |v| {
+        defer allocator.free(v);
+        if (std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10) catch null) |cap| {
+            if (cap >= 1) want = cap;
+        }
+    }
+    return @min(@min(want, n), max_parse_workers);
+}
+
+const ParsePool = struct {
+    allocator: Allocator,
+    jobs: []ParseJob,
+    /// Job indices in dispatch order: largest source first, so the longest
+    /// file starts at once and the wall approaches the CPU-time share.
+    order: []const usize,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn drain(self: *ParsePool) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.order.len) return;
+            runParseJob(self.allocator, &self.jobs[self.order[i]]);
+        }
+    }
+
+    fn worker(self: *ParsePool) void {
+        defer runtime.slab.flushMagazines();
+        self.drain();
+    }
+
+    fn largerFirst(jobs: []const ParseJob, x: usize, y: usize) bool {
+        return jobs[x].src.len > jobs[y].src.len;
+    }
+};
+
+/// Lex and parse every job, fanning out over a pool when the allocator can
+/// serve one; the calling thread drains alongside. Returns the thread count.
+fn runParseJobs(allocator: Allocator, jobs: []ParseJob) usize {
+    return runParseJobsOn(allocator, jobs, parseWorkerCount(allocator, jobs.len));
+}
+
+fn runParseJobsOn(allocator: Allocator, jobs: []ParseJob, want: usize) usize {
+    if (want <= 1) {
+        for (jobs) |*job| runParseJob(allocator, job);
+        return 1;
+    }
+    const order = allocator.alloc(usize, jobs.len) catch {
+        for (jobs) |*job| runParseJob(allocator, job);
+        return 1;
+    };
+    defer allocator.free(order);
+    for (order, 0..) |*slot, i| slot.* = i;
+    std.mem.sort(usize, order, @as([]const ParseJob, jobs), ParsePool.largerFirst);
+    var pool = ParsePool{ .allocator = allocator, .jobs = jobs, .order = order };
+    var threads: [max_parse_workers]std.Thread = undefined;
+    var spawned: usize = 0;
+    while (spawned + 1 < want) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(
+            .{ .stack_size = parse_worker_stack },
+            ParsePool.worker,
+            .{&pool},
+        ) catch break;
+    }
+    pool.drain();
+    for (threads[0..spawned]) |t| t.join();
+    return spawned + 1;
+}
+
 /// Consume the embedded stdlib pack's `SOURCES`. Only the Kotlin sources are
 /// parsed and registered: `SYMBOLS` and `BINDINGS` are statically linked in and
 /// the cache loop skips on-disk `stdlib*` packs. Gated on the user's imports.
@@ -234,22 +395,25 @@ fn loadEmbeddedStdlibSources(
     out_bindings: *HostBindings,
     report: ?*EmbeddedReport,
 ) Allocator.Error!void {
+    const t_start = runtime.clockMonotonicNanos();
+    var timing: ParseTiming = .{};
+    defer if (report) |rep| {
+        timing.total = runtime.clockMonotonicNanos() - t_start;
+        rep.timing = timing;
+    };
+
     var env = procEnvMap(allocator);
     defer env.deinit();
     var err: PackError = undefined;
-    const bytes = (stdlib_pack.stdlibPackBytes(allocator, &env, &err) catch return) orelse {
+    var sources = (stdlib_pack.stdlibSources(allocator, &env, &err) catch return) orelse {
         // Every pack source failed; surface the builder's message now.
         io.printStderr(allocator, "error: stdlib sources unavailable: {f}\n", .{err});
         io.printStderr(allocator, "set KLIO_STDLIB_PACK to a stdlib .klio-pack, or run from a klio checkout\n", .{});
         return;
     };
-    var reader = (PackReader.fromBytes(allocator, bytes, &err) catch return) orelse return;
-    defer reader.deinit();
-    const payload = (reader.readSection(section_names.SOURCES, &err) catch return) orelse return;
-    defer payload.deinit(allocator);
-    var bundle = (schema.decode(schema.SourceBundle, allocator, payload.slice(), &err) catch return) orelse return;
-    defer bundle.deinit(allocator);
-    if (bundle.files.len == 0) return;
+    defer sources.deinit();
+    if (sources.files.len == 0) return;
+    timing.sources = runtime.clockMonotonicNanos() - t_start;
 
     const diag = envVarPresent(allocator, "KLIO_PACK_DIAG");
 
@@ -261,46 +425,55 @@ fn loadEmbeddedStdlibSources(
         parsed.deinit(allocator);
     }
 
-    for (bundle.files) |sf| {
+    var jobs: std.ArrayList(ParseJob) = .empty;
+    defer jobs.deinit(allocator);
+    const t_register = runtime.clockMonotonicNanos();
+    for (sources.files) |sf| {
         // Sources whose interpreted declarations would shadow klio's intrinsics.
         if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
-        if (diag and (std.mem.find(u8, sf.rel_path, "Maps.kt") != null or
-            std.mem.find(u8, sf.rel_path, "Sets.kt") != null))
-        {
-            io.printStderr(allocator, "[embed source] {s}\n", .{sf.rel_path});
-        }
         const fid = source_map.add(sf.rel_path, sf.bytes) catch continue;
-        const src = source_map.get(fid).source;
-        var lx = lexer.Lexer.init(allocator, fid, src) catch continue;
-        var lexed = lx.tokenize() catch continue;
-        const lex_errors = lexed.diagnostics.hasErrors();
-        if (lex_errors) {
-            if (diag) {
-                io.printStderr(allocator, "[embed lex err] {s}: {d} diags\n", .{
-                    sf.rel_path, lexed.diagnostics.diags().len,
-                });
-            }
-            lexed.deinit(allocator);
-            continue;
+        jobs.append(allocator, .{
+            .fid = fid,
+            .src = source_map.get(fid).source,
+            .rel_path = sf.rel_path,
+        }) catch continue;
+    }
+    const t_parse = runtime.clockMonotonicNanos();
+    timing.register = t_parse - t_register;
+    timing.files = jobs.items.len;
+    timing.threads = runParseJobs(allocator, jobs.items);
+    timing.lex_parse_wall = runtime.clockMonotonicNanos() - t_parse;
+
+    for (jobs.items) |*job| {
+        timing.lex += job.lex_ns;
+        timing.parse += job.parse_ns;
+        if (job.lex_ns + job.parse_ns > timing.longest) {
+            timing.longest = job.lex_ns + job.parse_ns;
+            timing.longest_bytes = job.src.len;
         }
-        const p = parser.Parser.new(allocator, fid, src, lexed.tokens);
-        var file_ast = p.parseFile();
-        if (p.diagnostics.hasErrors()) {
-            if (diag) {
+        if (diag and (std.mem.find(u8, job.rel_path, "Maps.kt") != null or
+            std.mem.find(u8, job.rel_path, "Sets.kt") != null))
+        {
+            io.printStderr(allocator, "[embed source] {s}\n", .{job.rel_path});
+        }
+        switch (job.result) {
+            .skipped => {},
+            .lex_errors => |n| if (diag) {
+                io.printStderr(allocator, "[embed lex err] {s}: {d} diags\n", .{ job.rel_path, n });
+            },
+            .parse_errors => |p| if (diag) {
                 for (p.diagnostics.diags()) |d| {
-                    io.printStderr(allocator, "[embed parse err] {s}: {s}\n", .{ sf.rel_path, d.message });
+                    io.printStderr(allocator, "[embed parse err] {s}: {s}\n", .{ job.rel_path, d.message });
                 }
-            }
-            lexed.deinit(allocator);
-            continue;
+            },
+            .ok => |file_ast| {
+                const pkg = packagePathOf(allocator, file_ast) catch continue;
+                parsed.append(allocator, .{ .pkg = pkg, .file = file_ast }) catch {
+                    allocator.free(pkg);
+                    continue;
+                };
+            },
         }
-        lexed.deinit(allocator);
-        ast.expandFileClassAliases(allocator, &file_ast);
-        const pkg = packagePathOf(allocator, file_ast) catch continue;
-        parsed.append(allocator, .{ .pkg = pkg, .file = file_ast }) catch {
-            allocator.free(pkg);
-            continue;
-        };
     }
 
     // Implicitly-imported packages are visible without an import, so always load.
@@ -730,6 +903,8 @@ fn loadPackCandidate(
         if (schema.decode(schema.SourceBundle, allocator, payload.slice(), &err) catch null) |bundle_val| {
             var bundle = bundle_val;
             defer bundle.deinit(allocator);
+            var jobs: std.ArrayList(ParseJob) = .empty;
+            defer jobs.deinit(allocator);
             for (bundle.files) |sf| {
                 if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
                 // A source under an inactive feature's roots is skipped; record
@@ -757,21 +932,18 @@ fn loadPackCandidate(
                     continue;
                 }
                 const fid = source_map.add(sf.rel_path, sf.bytes) catch continue;
-                const src = source_map.get(fid).source;
-                var lx = lexer.Lexer.init(allocator, fid, src) catch continue;
-                var lexed = lx.tokenize() catch continue;
-                if (lexed.diagnostics.hasErrors()) {
-                    lexed.deinit(allocator);
-                    continue;
-                }
-                const p = parser.Parser.new(allocator, fid, src, lexed.tokens);
-                var file_ast = p.parseFile();
-                if (p.diagnostics.hasErrors()) {
-                    lexed.deinit(allocator);
-                    continue;
-                }
-                lexed.deinit(allocator);
-                ast.expandFileClassAliases(allocator, &file_ast);
+                jobs.append(allocator, .{
+                    .fid = fid,
+                    .src = source_map.get(fid).source,
+                    .rel_path = sf.rel_path,
+                }) catch continue;
+            }
+            _ = runParseJobs(allocator, jobs.items);
+            for (jobs.items) |job| {
+                const file_ast = switch (job.result) {
+                    .ok => |f| f,
+                    else => continue,
+                };
                 if (file_ast.package) |pkg| {
                     const path = joinIdentPath(allocator, pkg.path) catch continue;
                     defer allocator.free(path);
@@ -1843,6 +2015,59 @@ pub fn verifyPack(allocator: Allocator, path: []const u8, smoke: ?[]const u8) Vo
     return .{ .ok = {} };
 }
 
+
+fn registerParseJobs(map: *SourceMap, sources: []const []const u8, jobs: []ParseJob) !void {
+    for (sources, 0..) |src, i| {
+        const fid = try map.add("f.kt", src);
+        jobs[i] = .{ .fid = fid, .src = map.get(fid).source, .rel_path = "f.kt" };
+    }
+}
+
+test "parse jobs on a pool match serial parsing and keep file order" {
+    // The pool needs an allocator that serves several threads at once.
+    const a = std.heap.smp_allocator;
+    const sources = [_][]const u8{
+        "package p.one\nfun a() = 1\n",
+        "package p.two\nval x = 'ab'\n",
+        "package p.three\nfun (\n",
+        "package p.four\nclass C { fun m(x: Int): Int = x + 1 }\nfun b() = C().m(2)\nval c = 3\n",
+        "fun d() = \"${1 + 1}\"\n",
+    };
+    var pooled_map = SourceMap.init(a);
+    defer pooled_map.deinit();
+    var pooled: [sources.len]ParseJob = undefined;
+    try registerParseJobs(&pooled_map, &sources, &pooled);
+    try std.testing.expect(runParseJobsOn(a, &pooled, 4) >= 1);
+
+    var serial_map = SourceMap.init(a);
+    defer serial_map.deinit();
+    var serial: [sources.len]ParseJob = undefined;
+    try registerParseJobs(&serial_map, &sources, &serial);
+    try std.testing.expectEqual(@as(usize, 1), runParseJobsOn(a, &serial, 1));
+
+    try std.testing.expect(pooled[0].result == .ok);
+    try std.testing.expect(pooled[1].result == .lex_errors);
+    try std.testing.expect(pooled[2].result == .parse_errors);
+    try std.testing.expect(pooled[3].result == .ok);
+    try std.testing.expect(pooled[4].result == .ok);
+    for (&pooled, &serial, 0..) |*pj, *sj, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), pj.fid.int());
+        try std.testing.expectEqual(std.meta.activeTag(sj.result), std.meta.activeTag(pj.result));
+        switch (pj.result) {
+            .ok => |pf| {
+                const sf = sj.result.ok;
+                try std.testing.expectEqual(pj.fid, pf.span.file);
+                try std.testing.expectEqual(sf.decls.len, pf.decls.len);
+                try std.testing.expect(sf.span.eql(pf.span));
+                try std.testing.expectEqual(sf.package == null, pf.package == null);
+            },
+            .lex_errors => |n| try std.testing.expectEqual(sj.result.lex_errors, n),
+            .parse_errors => |p| try std.testing.expectEqual(sj.result.parse_errors.diagnostics.diags().len, p.diagnostics.diags().len),
+            .skipped => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), pooled[3].result.ok.decls.len);
+}
 
 test "merged host bindings cover stdlib defaults" {
     var b = mergedHostBindings(std.testing.allocator);
