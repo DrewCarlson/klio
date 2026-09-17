@@ -9,19 +9,30 @@ const EvalResult = runtime.EvalResult;
 const RuntimeError = runtime.RuntimeError;
 const Value = runtime.Value;
 
-/// Spin mutex for the monitor table and each monitor's state. Zig 0.16's std has
-/// no blocking `Thread.Mutex`, so synchronization is atomic spin and yield.
+/// Spin mutex for the monitor table. Zig 0.16's std has no blocking
+/// `Thread.Mutex`, so synchronization is atomic spin and yield.
 const SpinMutex = runtime.SpinMutex;
 
-const MonitorState = struct {
-    owner: ?std.Thread.Id,
-    depth: usize,
+const Monitor = struct {
+    /// Owning thread, 0 when free. An uncontended enter is one CAS: no table lock,
+    /// no second mutex, which is what a `synchronized` block costs in the common
+    /// single-owner case the snapshot system takes on every state write.
+    owner: std.atomic.Value(u64) = .init(0),
+    /// Re-entry count, written only by the owning thread.
+    depth: usize = 0,
 };
 
-const Monitor = struct {
-    mutex: SpinMutex = .{},
-    state: MonitorState = .{ .owner = null, .depth = 0 },
-};
+/// The calling thread's id, resolved once. `getCurrentId` is a libsystem call on
+/// macOS, and a monitor enter and exit would otherwise pay it twice.
+threadlocal var cached_tid: u64 = 0;
+
+inline fn currentTid() u64 {
+    if (cached_tid == 0) {
+        const raw: u64 = @intCast(std.Thread.getCurrentId());
+        cached_tid = if (raw == 0) 1 else raw;
+    }
+    return cached_tid;
+}
 
 /// Process-wide monitor table keyed by the lock value's object identity;
 /// identity-less value-type locks share the sentinel key 0. Never freed.
@@ -34,7 +45,23 @@ const Registry = struct {
     }
 };
 
+/// Last monitor this thread resolved. Monitors are never freed and the registry is
+/// never cleared, so the pointer stays valid for the life of the process; a lock taken
+/// repeatedly then costs no registry lock and no hash lookup.
+threadlocal var cached_key: usize = 0;
+threadlocal var cached_monitor: ?*Monitor = null;
+
 fn monitorFor(key: usize) std.mem.Allocator.Error!*Monitor {
+    if (cached_monitor) |m| {
+        if (cached_key == key) return m;
+    }
+    const mon = try monitorForSlow(key);
+    cached_key = key;
+    cached_monitor = mon;
+    return mon;
+}
+
+fn monitorForSlow(key: usize) std.mem.Allocator.Error!*Monitor {
     Registry.mutex.lock();
     defer Registry.mutex.unlock();
     if (Registry.map == null) {
@@ -50,79 +77,75 @@ fn monitorFor(key: usize) std.mem.Allocator.Error!*Monitor {
 }
 
 /// Reentrant acquire of the monitor for `key`; the enter ordering rides on the
-/// monitor's own `SpinMutex`. False when the wait was abandoned at a run
-/// boundary, since the owner may itself have been abandoned while holding the
-/// monitor; the caller must then not treat the monitor as held.
+/// owner CAS. False when the wait was abandoned at a run boundary, since the owner
+/// may itself have been abandoned while holding the monitor; the caller must then
+/// not treat the monitor as held.
 pub fn monitorEnter(key: usize) std.mem.Allocator.Error!bool {
-    const mon = try monitorFor(key);
-    const me = std.Thread.getCurrentId();
+    return monitorEnterMon(try monitorFor(key));
+}
+
+fn monitorEnterMon(mon: *Monitor) bool {
+    const me = currentTid();
+    // Only this thread can read its own id here, so the re-entry test needs no lock.
+    if (mon.owner.load(.monotonic) == me) {
+        mon.depth += 1;
+        return true;
+    }
     var rounds: u32 = 0;
     while (true) {
-        mon.mutex.lock();
-        if (mon.state.owner) |o| {
-            if (o == me) {
-                mon.state.depth += 1;
-                mon.mutex.unlock();
-                return true;
-            }
-            // The owner runs an arbitrary interpreted body, so the wait is
-            // unbounded: spin briefly, then yield, then park at a millisecond
-            // cadence. A pure spin loop saturates every core under contention,
-            // and the sleep brackets the GC blocking-safe region.
-            mon.mutex.unlock();
-            if (runtime.shouldAbandon()) return false;
-            rounds +|= 1;
-            if (rounds <= 512) {
-                // A snapshot-write critical section runs a few microseconds of
-                // interpreted code, which 64 hints never bridges, so ~512 spans
-                // the common section before the park.
-                std.atomic.spinLoopHint();
-            } else if (rounds <= 4096) {
-                std.Thread.yield() catch {};
-            } else if (rounds <= 8192) {
-                runtime.clockSleepMicros(100);
-            } else {
-                runtime.clockSleepMillis(1);
-            }
-        } else {
-            mon.state.owner = me;
-            mon.state.depth = 1;
-            mon.mutex.unlock();
+        if (mon.owner.cmpxchgWeak(0, me, .acquire, .monotonic) == null) {
+            mon.depth = 1;
             return true;
+        }
+        // The owner runs an arbitrary interpreted body, so the wait is
+        // unbounded: spin briefly, then yield, then park at a millisecond
+        // cadence. A pure spin loop saturates every core under contention,
+        // and the sleep brackets the GC blocking-safe region.
+        if (runtime.shouldAbandon()) return false;
+        rounds +|= 1;
+        if (rounds <= 512) {
+            // A snapshot-write critical section runs a few microseconds of
+            // interpreted code, which 64 hints never bridges, so ~512 spans
+            // the common section before the park.
+            std.atomic.spinLoopHint();
+        } else if (rounds <= 4096) {
+            std.Thread.yield() catch {};
+        } else if (rounds <= 8192) {
+            runtime.clockSleepMicros(100);
+        } else {
+            runtime.clockSleepMillis(1);
         }
     }
 }
 
 pub fn monitorTryEnter(key: usize) std.mem.Allocator.Error!bool {
     const mon = try monitorFor(key);
-    const me = std.Thread.getCurrentId();
-    mon.mutex.lock();
-    defer mon.mutex.unlock();
-    if (mon.state.owner) |o| {
-        if (o == me) {
-            mon.state.depth += 1;
-            return true;
-        }
-        return false;
+    const me = currentTid();
+    if (mon.owner.load(.monotonic) == me) {
+        mon.depth += 1;
+        return true;
     }
-    mon.state.owner = me;
-    mon.state.depth = 1;
-    return true;
+    if (mon.owner.cmpxchgStrong(0, me, .acquire, .monotonic) == null) {
+        mon.depth = 1;
+        return true;
+    }
+    return false;
 }
 
 /// Release one level of the monitor for `key`. False when the calling thread
 /// does not own it, which the JVM reports as IllegalMonitorStateException.
 pub fn monitorExit(key: usize) std.mem.Allocator.Error!bool {
-    const mon = try monitorFor(key);
-    const me = std.Thread.getCurrentId();
-    mon.mutex.lock();
-    defer mon.mutex.unlock();
-    const owner = mon.state.owner orelse return false;
-    if (owner != me) return false;
-    mon.state.depth -= 1;
-    if (mon.state.depth == 0) {
-        mon.state.owner = null;
+    return monitorExitMon(try monitorFor(key));
+}
+
+fn monitorExitMon(mon: *Monitor) bool {
+    if (mon.owner.load(.monotonic) != currentTid()) return false;
+    if (mon.depth > 1) {
+        mon.depth -= 1;
+        return true;
     }
+    mon.depth = 0;
+    mon.owner.store(0, .release);
     return true;
 }
 
@@ -136,9 +159,12 @@ pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     else
         return .{ .err = .{ .Arity = "synchronized expects (lock, block)" } };
     const key = lock.lockIdentity() orelse 0;
-    if (!try monitorEnter(key)) return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
+    // One resolve for both halves: the body may take other locks and displace the
+    // thread's cache entry, which would otherwise make the exit pay a lookup.
+    const mon = try monitorFor(key);
+    if (!monitorEnterMon(mon)) return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
     const result = ctx.host.invokeCallable(&block, &.{}, ctx.out);
-    _ = try monitorExit(key);
+    _ = monitorExitMon(mon);
     return result;
 }
 
