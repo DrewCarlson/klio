@@ -113,6 +113,9 @@ def main():
             try:
                 subprocess.run(
                     ["nice", "-n", "10", "zig-out/bin/klio-harness", "test",
+                     # The mock composition fixtures drive `runTest`, which is
+                     # the coroutines pack's `test` module.
+                     "--feature", "kotlinx.coroutines/test",
                      *srcs, "--filter=" + ",".join(members)],
                     cwd=REPO, stdout=out, stderr=subprocess.STDOUT,
                     timeout=args.timeout, env=env,

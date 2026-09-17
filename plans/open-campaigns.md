@@ -130,13 +130,11 @@ against the code.
   `klio.toml` that names its packs and features (`// Run with:` headers are
   the interim spelling), and a file with no manifest resolves against the
   stdlib alone.
-- kotlinx-coroutines-test's own suite (`klio test kotlin-klio/klio-kotlinx-coroutines
-  --test-group test`, composed under the `test` feature) runs whole at 42
-  passed, 31 failed, 2 skipped: RunTestTest (16: the timeout and
-  uncaught-exception contracts), TestScopeTest (11: background work, child
-  failure cancellation, scheduler reuse), TestDispatchersTest (4: Main
-  mocking, the immediate dispatcher), and one scheduler-reuse test in each
-  of the Standard and Unconfined dispatcher suites.
+- Every upstream suite klio runs, its count and what stands between it and
+  a clean sweep, is `pack-suites-to-green.md`. Open at the census:
+  kotlinx-coroutines-test 42 / 73 with no gate yet, the compose runtime
+  above its failure ceiling, and the stdlib `js/` directory that no gate
+  claims.
 - A second image bake in one process lowers differently from the first
   (the shipped full-gate image diverged from a runtime bake by six megabytes
   and misdispatched `getValue`; `bake-image --stdlib-cache` now bakes each
@@ -178,7 +176,7 @@ against the code.
 ## Doc register
 
 Open: `conformance-backlog.md` (active), `kotlinc-box-conformance.md`,
-`safe-tier-allocation-fill.md`, and this file.
+`pack-suites-to-green.md`, `safe-tier-allocation-fill.md`, and this file.
 
 Reference (not campaigns): `docs/design/` (architecture summary,
 coroutine model, GC, JIT, diagnostics, benchmarks, stdlib, intrinsics,

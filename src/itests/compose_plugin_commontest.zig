@@ -31,6 +31,11 @@ const ROOTS = [_][]const u8{
 };
 const SCRATCH_HOME = "/tmp/klio_itest_compose_plugin_home";
 
+/// The runtime's own test fixtures (`CompositionTest`, `TestMonotonicFrameClock`)
+/// drive composition through kotlinx-coroutines-test's `runTest`, which is the
+/// coroutines pack's `test` module.
+const CHILD_FEATURES = [_][]const u8{ "--feature", "kotlinx.coroutines/test" };
+
 const Pack = struct { dir: []const u8, artifact: []const u8 };
 /// Dependency order. The last entry supplies `androidx.compose.runtime` from
 /// the engine pack, whose sources are the upstream Composer and SlotTable.
@@ -332,6 +337,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     var stress_argv: std.ArrayList([]const u8) = .empty;
     try stress_argv.append(a, klioBin(&env));
     try stress_argv.append(a, "test");
+    try stress_argv.appendSlice(a, &CHILD_FEATURES);
     try stress_argv.appendSlice(a, sources.items);
     try stress_argv.append(a, "--filter=SnapshotStateMapTests.validateEntriesRemoveAll");
     // 240s: this step compiles the same whole source set every job does (~50s
@@ -433,6 +439,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
         try argv.appendSlice(a, &.{ "nice", "-n", "10" });
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
+        try argv.appendSlice(a, &CHILD_FEATURES);
         try argv.appendSlice(a, sources.items);
         try argv.append(a, try std.fmt.allocPrint(a, "--filter={s}", .{cls}));
         try jobs.append(a, try argv.toOwnedSlice(a));

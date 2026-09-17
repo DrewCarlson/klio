@@ -42,19 +42,41 @@ def strip_comments(src):
     return "\n".join(re.sub(r"//.*$", "", ln) for ln in src.splitlines())
 
 
+def suite_table_entry(suite):
+    """The `.{ .name = "<suite>", ... }` literal of `commontest_support.suites`,
+    where the table-driven suites keep their config; None when absent."""
+    with open(os.path.join(ITESTS, "commontest_support.zig")) as fh:
+        table = strip_comments(fh.read())
+    m = re.search(r'\n    \.\{\s*\n\s*\.name = "' + re.escape(suite) + r'",(.*?)\n    \},', table, re.S)
+    return m.group(0) if m else None
+
+
 def parse_config(suite):
-    """Pull test_roots / packs / scratch_home / extra_support out of the Zig itest."""
+    """Pull test_roots / packs / scratch_home / extra_support out of the Zig itest,
+    or out of its `commontest_support.suites` entry when the itest only names it."""
     path = os.path.join(ITESTS, f"{suite}_commontest.zig")
     if not os.path.exists(path):
         sys.exit(f"no such suite: {suite} (have: {', '.join(suites())})")
     with open(path) as fh:
         src = strip_comments(fh.read())
+    if ".test_roots" not in src and "TEST_ROOT" not in src:
+        src = suite_table_entry(suite) or src
 
     def strings_in(field):
-        m = re.search(re.escape("." + field) + r"\s*=\s*&\.\{(.*?)\n\s*\}", src, re.S)
+        # The field's `&.{ ... }` literal, brace-matched: a one-line literal
+        # and a multi-line one end at their own brace, never at a later
+        # field's.
+        m = re.search(re.escape("." + field) + r"\s*=\s*&\.\{", src)
         if not m:
             return []
-        return re.findall(r'"([^"]*)"', m.group(1))
+        depth, i = 1, m.end()
+        while i < len(src) and depth:
+            if src[i] == "{":
+                depth += 1
+            elif src[i] == "}":
+                depth -= 1
+            i += 1
+        return re.findall(r'"([^"]*)"', src[m.end():i - 1])
 
     packs = []
     m = re.search(r"\.packs\s*=\s*&\.\{(.*?)\n\s*\},\n", src, re.S)
@@ -70,8 +92,19 @@ def parse_config(suite):
     # config that would look like a suite with no tests.
     test_roots = strings_in("test_roots")
     if not test_roots:
-        for m in re.finditer(r'const TEST_ROOTS?\b[^=]*=\s*(.+)', src):
-            test_roots += re.findall(r'"([^"]*)"', m.group(1))
+        # `const UPSTREAM = "..."` spliced into `UPSTREAM ++ "/tail"` entries,
+        # so a root built by concatenation reads as the path it names.
+        consts = dict(re.findall(r'const ([A-Z_]+)\s*=\s*"([^"]*)";', src))
+        def splice(text):
+            return re.sub(r'\b([A-Z_]+)\s*\+\+\s*"([^"]*)"',
+                          lambda m: '"' + consts.get(m.group(1), m.group(1)) + m.group(2) + '"', text)
+        for m in re.finditer(r'const (?:TEST_ROOTS?|ROOTS)\b[^=]*=\s*(\[_\]\[\]const u8\{[^}]*\}|[^\n]+)', src):
+            test_roots += re.findall(r'"([^"]*)"', splice(m.group(1)))
+    extra_support = strings_in("extra_support")
+    if not extra_support:
+        m = re.search(r'const ACTUALS\s*=\s*\[_\]\[\]const u8\{(.*?)\};', src, re.S)
+        if m:
+            extra_support = re.findall(r'"([^"]*)"', m.group(1))
     if not packs:
         m = re.search(r"const PACKS\s*=\s*\[_\]Pack\{(.*?)\n\};", src, re.S)
         if m:
@@ -79,6 +112,12 @@ def parse_config(suite):
                 r'\.dir\s*=\s*"([^"]*)"\s*,\s*\.artifact\s*=\s*"([^"]*)"', m.group(1)
             ):
                 packs.append((d, art))
+    if not packs:
+        # An itest that builds and installs its packs inline names them in
+        # the two `runKlio` calls.
+        for d in re.findall(r'"pack",\s*"build",\s*"([^"]*)"', src):
+            arts = re.findall(r'"pack",\s*"install",\s*"([^"]*)"', src)
+            packs.append((d, arts[len(packs)] if len(packs) < len(arts) else ""))
 
     # Honesty guard: if the itest installs packs through a helper this parser
     # cannot read, the census would run against whatever is already in the
@@ -100,7 +139,9 @@ def parse_config(suite):
         baseline = re.search(r"const BASELINE:\s*usize\s*=\s*(\d+)", src)
     return {
         "test_roots": test_roots,
-        "extra_support": strings_in("extra_support"),
+        "extra_support": extra_support,
+        # `--feature ...` and the like, which a suite's children all take.
+        "extra_args": strings_in("extra_args"),
         "packs": packs,
         "scratch_home": home.group(1) if home else f"/tmp/klio_census_{suite}_home",
         "baseline": int(baseline.group(1)) if baseline else 0,
@@ -243,15 +284,15 @@ def symbol(msg):
     return None
 
 
-def run_target(target, support, env, timeout, all_targets=None, bases=()):
+def run_target(target, support, env, timeout, all_targets=None, bases=(), extra_args=()):
     if all_targets is not None:
-        argv = [BIN, "test", "--only-file", target] + support + all_targets
+        argv = [BIN, "test", *extra_args, "--only-file", target] + support + all_targets
     elif bases:
         # The base files carry their own cases; `--only-file` keeps them
         # compiled but unrun so each case is counted once.
-        argv = [BIN, "test", "--only-file", target] + support + list(bases) + [target]
+        argv = [BIN, "test", *extra_args, "--only-file", target] + support + list(bases) + [target]
     else:
-        argv = [BIN, "test"] + support + [target]
+        argv = [BIN, "test", *extra_args] + support + [target]
     try:
         r = sh(argv, env, timeout=timeout)
         out = r.stdout
@@ -323,7 +364,8 @@ def main():
                 owner[(pkg, d)].append(i)
         index_of = {t: i for i, t in enumerate(all_targets)}
         futs = [pool.submit(run_target, t, support, env, args.timeout, whole,
-                            [all_targets[b] for b in provider_closure(scans, owner, index_of[t])])
+                            [all_targets[b] for b in provider_closure(scans, owner, index_of[t])],
+                            cfg["extra_args"])
                 for t in targets]
         for f in concurrent.futures.as_completed(futs):
             target, passed, failed, inc, err = f.result()

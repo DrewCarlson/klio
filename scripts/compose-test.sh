@@ -25,4 +25,4 @@ exec env \
   kotlinx_coroutines_test_default_timeout="${kotlinx_coroutines_test_default_timeout:-10s}" \
   KLIO_TEST_WALL_CAP="${KLIO_TEST_WALL_CAP:-90}" \
   KLIO_MAX_WORKERS="${KLIO_MAX_WORKERS:-3}" \
-  nice -n 10 zig-out/bin/klio-harness test $SRCS "--filter=$FILTER" "$@"
+  nice -n 10 zig-out/bin/klio-harness test --feature kotlinx.coroutines/test $SRCS "--filter=$FILTER" "$@"
