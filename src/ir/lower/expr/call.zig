@@ -446,6 +446,27 @@ fn recordBareCallLambdaShapes(c: *CallCtx) Allocator.Error!void {
 
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const cnm = callee.Path.segments[0].name;
+        // A call through a function-typed local or parameter, captured or bound
+        // here: the name is a value, so no name index answers for it and its
+        // declared type is the only source for its lambda arguments' arity.
+        // Without it a `{ … }` argument in a `() -> R` slot keeps an implicit
+        // `it` that shadows the enclosing lambda's.
+        {
+            if (b.fnValueParamArities(cnm)) |arities| {
+                var any_named = false;
+                for (ast_arg_names) |n| {
+                    if (n != null) any_named = true;
+                }
+                if (!any_named) {
+                    for (args, 0..) |*a, i| {
+                        if (a.* != .Lambda and a.* != .AnonFun) continue;
+                        if (i >= arities.len or arities[i] < 0) continue;
+                        b.recordLambdaArgArity(a.span(), arities[i]);
+                    }
+                    return;
+                }
+            }
+        }
     // A bare call to an own member resolves to the member, which is absent from
     // `func_name_index`. The registered member AST, keyed by (owner, name,
     // arity), is the signature source; positional args only.

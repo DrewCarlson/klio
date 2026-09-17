@@ -514,6 +514,11 @@ fn inheritCapturedCallables(
             try b.setReceiverLambdaRecvHead(kv.name, kv.head);
         }
     }
+    if (module.pending_lambda_fn_value_arities) |kvs| {
+        module.pending_lambda_fn_value_arities = null;
+        defer moduleAllocator(module).free(kvs);
+        for (kvs) |kv| try b.setFnValueParamArities(kv.name, kv.arities);
+    }
     try b.inheritLocalExtFns(inherited_ext);
     try b.inheritErasedRecvParams(inherited_erased);
     // And for local-fn overload sets: a call to a captured local fn declared more

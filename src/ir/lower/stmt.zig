@@ -172,6 +172,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
     // `val x = expr` / `var x = expr`: the init lowers into a fresh register and
     // binds in the current scope, mutability being enforced by typeck.
     try markContextFnLocal(b, p);
+    try markFnValueLocal(b, p);
     const init: Reg = try lowerPropertyInit(b, p);
     try markAnyTypedLocal(b, p);
     // Record the local's declared type, or its initializer expression when
@@ -209,6 +210,20 @@ fn tracePropertyDeclEntry(b: *FuncBuilder, p: *const ast.Property) void {
             std.debug.print("\n", .{});
         }
     }
+}
+
+/// A local declared with a function type: a call through it shapes its lambda
+/// arguments from that type, which is the only place they are written down.
+fn markFnValueLocal(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!void {
+    const ty = p.ty orelse return;
+    const ft = ty.function orelse return;
+    if (ft.params.len == 0) return;
+    const arities = try b.allocator.alloc(i16, ft.params.len);
+    defer b.allocator.free(arities);
+    for (ft.params, arities) |*pt, *slot| {
+        slot.* = if (pt.function) |inner| @intCast(inner.params.len) else -1;
+    }
+    try b.setFnValueParamArities(p.name.name, arities);
 }
 
 /// A local holding a contextual function has a call shape, splitting leading
@@ -734,6 +749,7 @@ fn captureEnclosingEnv(ctx: *LocalFnCtx) Allocator.Error!void {
     ctx.outer_names = try b.visibleNames();
     ctx.inherited_rlp = try b.receiverLambdaParamNames();
     try b.stashRecvHeadsForLambda();
+    try b.stashFnValueAritiesForLambda();
     ctx.outer_boxed = try b.boxedVarsSnapshot();
     errdefer ctx.outer_boxed.deinit();
     // A local extension function binds its receiver as the implicit first

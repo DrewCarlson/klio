@@ -2681,6 +2681,18 @@ fn markContextDeclGate(ctx: *BodyLower) void {
 /// A param whose declared type is a receiver-typed function carries that fact so
 /// a bare call `block(...)` lowers to a member call with the enclosing `this` as
 /// receiver. Implicit params never come in this shape.
+/// The value-parameter arity of each parameter of the function type `ft`,
+/// `-1` where that parameter is not itself a function type. A receiver-typed
+/// parameter counts its value parameters only, matching how a lambda in that
+/// slot is shaped.
+fn fnValueParamArities(b: *FuncBuilder, ft: anytype) Allocator.Error![]i16 {
+    const out = try b.allocator.alloc(i16, ft.params.len);
+    for (ft.params, out) |*pt, *slot| {
+        slot.* = if (pt.function) |inner| @intCast(inner.params.len) else -1;
+    }
+    return out;
+}
+
 fn markFunctionTypedParams(ctx: *BodyLower) Allocator.Error!void {
     const b = ctx.b;
     for (ctx.f.params) |*p| {
@@ -2693,6 +2705,13 @@ fn markFunctionTypedParams(ctx: *BodyLower) Allocator.Error!void {
             }
         }
         if (p.ty.function) |ft| {
+            // A call through this parameter shapes its lambda arguments from
+            // the declared type: nothing else can, the callee being a value.
+            if (ft.params.len != 0) {
+                const arities = try fnValueParamArities(b, ft);
+                defer b.allocator.free(arities);
+                try b.setFnValueParamArities(p.name.name, arities);
+            }
             if (ft.receiver != null) {
                 try b.markReceiverLambdaParam(p.name.name);
                 if (p.ty.function) |fnty| try b.markReceiverLambdaArity(p.name.name, fnty.params.len);

@@ -573,6 +573,11 @@ pub const FuncBuilder = struct {
     /// Local fns declared as extensions, whose bare call prepends the implicit
     /// receiver. The value is the value-parameter count, or -1 when unknown.
     local_ext_fns: std.StringHashMap(i8),
+    /// Per function-typed local or parameter, the value-parameter arity of each
+    /// of its OWN parameters, `-1` where that parameter is not a function type.
+    /// A call through the name shapes its lambda arguments from this: the
+    /// callee is a value, so no name index can answer for it.
+    fn_value_param_arities: std.StringHashMap([]const i16),
     /// Locals proven not callable, so a bare call of the name takes the function.
     nonfn_locals: StringSet,
     /// One entry per same-named local-fn declaration, in decl order; each closure
@@ -742,6 +747,7 @@ pub const FuncBuilder = struct {
             .local_fns = StringSet.init(allocator),
             .local_fn_return_tys = std.StringHashMap(TypeRef).init(allocator),
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
+            .fn_value_param_arities = std.StringHashMap([]const i16).init(allocator),
             .local_decl_types = std.StringHashMap(TypeRef).init(allocator),
             .local_ast_tys = std.StringHashMap(*const ast.TypeRef).init(allocator),
             .local_decl_nullable = std.StringHashMap(void).init(allocator),
@@ -838,6 +844,11 @@ pub const FuncBuilder = struct {
             var it = self.local_fn_param_tys.valueIterator();
             while (it.next()) |v| self.allocator.free(v.*);
             self.local_fn_param_tys.deinit();
+        }
+        {
+            var it = self.fn_value_param_arities.valueIterator();
+            while (it.next()) |v| self.allocator.free(v.*);
+            self.fn_value_param_arities.deinit();
         }
         self.local_fns.deinit();
         {
@@ -1927,6 +1938,16 @@ pub const FuncBuilder = struct {
     pub fn localFnParamTys(self: *const FuncBuilder, name: []const u8) ?[]const ?[]const u8 {
         return self.local_fn_param_tys.get(name);
     }
+    /// Record, for the function-typed local or parameter `name`, the arity of
+    /// each of its own parameters (`-1` for a parameter that is not a function
+    /// type). Takes a copy.
+    pub fn setFnValueParamArities(self: *FuncBuilder, name: []const u8, arities: []const i16) Allocator.Error!void {
+        const owned = try self.allocator.dupe(i16, arities);
+        if (self.fn_value_param_arities.fetchPut(name, owned) catch null) |old| self.allocator.free(old.value);
+    }
+    pub fn fnValueParamArities(self: *const FuncBuilder, name: []const u8) ?[]const i16 {
+        return self.fn_value_param_arities.get(name);
+    }
     pub fn isLocalFn(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_fns.contains(name);
     }
@@ -2051,6 +2072,18 @@ pub const FuncBuilder = struct {
             out[i] = .{ .name = e.key_ptr.*, .head = e.value_ptr.* };
         }
         self.module.pending_lambda_recv_heads = out;
+    }
+    /// Stash the function-value arity table for a nested lambda body, so a call
+    /// through a captured function-typed name keeps its argument shaping.
+    pub fn stashFnValueAritiesForLambda(self: *FuncBuilder) Allocator.Error!void {
+        if (self.fn_value_param_arities.count() == 0) return;
+        const out = try self.allocator.alloc(ir.FnValueAritiesKV, self.fn_value_param_arities.count());
+        var it = self.fn_value_param_arities.iterator();
+        var i: usize = 0;
+        while (it.next()) |e| : (i += 1) {
+            out[i] = .{ .name = e.key_ptr.*, .arities = e.value_ptr.* };
+        }
+        self.module.pending_lambda_fn_value_arities = out;
     }
     /// Declared non-receiver arity of a receiver-lambda param, disambiguating
     /// `f(x)`: at arity 0 the argument is the receiver, at arity 1 the parameter.

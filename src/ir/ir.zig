@@ -170,6 +170,9 @@ pub const SelfLocalFn = struct {
 };
 
 pub const RecvHeadKV = struct { name: []const u8, head: ?[]const u8 };
+/// A function-typed local or parameter and the value-parameter arity of each
+/// of its own parameters; `-1` marks a parameter that is not a function type.
+pub const FnValueAritiesKV = struct { name: []const u8, arities: []const i16 };
 
 /// One type-parameter bound ref with type arguments; owned by the module allocator.
 pub const PendingBoundRef = struct {
@@ -251,6 +254,9 @@ pub const Module = struct {
     /// Receiver-lambda param names to the enclosing builder's declared receiver heads, so a
     /// captured receiver-fn param invoked bare re-selects by its head. Slices are borrowed.
     pending_lambda_recv_heads: ?[]RecvHeadKV = null,
+    /// Captured function-typed callables' own parameter arities, so a call
+    /// through one inside a nested lambda still shapes its lambda arguments.
+    pending_lambda_fn_value_arities: ?[]FnValueAritiesKV = null,
     /// The caller's solved fn-type-parameter bindings for an inline splice; tys owned by the
     /// lowering allocator.
     pending_splice_solved: ?[]Module.TypeBinding = null,

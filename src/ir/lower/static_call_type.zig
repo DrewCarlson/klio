@@ -1472,15 +1472,36 @@ fn barePathCalleeTarget(
     // prove one. An inline splice window is a receiver context too, its
     // receiver living in the window hint rather than `recvTy`, and a
     // non-exact pick there poisons every chained call after it.
+    // An ERASED enclosing receiver is a receiver context too: inside
+    // `apply { … }` the receiver is the type parameter `T`, so whether it
+    // carries the name is unknowable here and a non-exact global pick is a
+    // guess. Taking it as evidence types the call by the wrong declaration's
+    // return, and the next call in the chain then inlines against that type
+    // (`drop(1).forEach { … }` over a List spliced `CharSequence.forEach`).
+    const enclosing_erased = if (b.enclosingRecvTy()) |t| blk_erased: {
+        const h = typeHead(std.mem.trimEnd(u8, t, "?"));
+        if (b.isTypeParam(h) or ir.parseClassTypeParamIdentity(h) != null) break :blk_erased true;
+        // A head naming no classifier this module knows is a type parameter of
+        // an enclosing generic extension whose scope this builder does not
+        // hold — `apply`'s `T`, spliced in. Unknown, so not evidence.
+        break :blk_erased applicability.builtinSupersOf(h).len == 0 and
+            b.module.classIdIndexed(h, b.self_package, name.span.file) == null and
+            b.module.classId(h) == null and
+            b.module.classIdByFqn(h) == null;
+    } else false;
+    // A lambda body whose own receiver was never proven absent may still have
+    // one, so it is no more a top-level context than an erased head is: the
+    // spliced body of `apply { … }` reports no receiver at all.
+    const maybe_receiver_lambda = b.isLambdaBody() and !b.own_recv_known_none;
     const top_level_usable = res.target != null and
         (res.confidence == .exact or
             (b.recvTy() == null and b.spliceRecvTy() == null and
-                !b.isParamThunk()));
+                !enclosing_erased and !maybe_receiver_lambda and !b.isParamThunk()));
     const sole_global = soleGlobalBareTarget(b, name, res.target, top_level_usable);
     const agreed_return = agreedBareReturnTypeRef(b, name, top_level_usable);
     if (runtime.envOnce("KLIO_SCRT_TRACE")) |w3| {
         if (std.mem.eql(u8, w3, name.name)) {
-            std.debug.print("[scrt-path] {s} usable={} target={?} conf={s}\n", .{ name.name, top_level_usable, if (res.target) |t| t.int() else null, @tagName(res.confidence) });
+            std.debug.print("[scrt-path] {s} usable={} target={?} conf={s} recv={?s} splice={?s} encl={?s} erased={} lam={} thunk={}\n", .{ name.name, top_level_usable, if (res.target) |t| t.int() else null, @tagName(res.confidence), b.recvTy(), b.spliceRecvTy(), b.enclosingRecvTy(), enclosing_erased, maybe_receiver_lambda, b.isParamThunk() });
         }
     }
     const target: FuncId = (if (top_level_usable) res.target else null) orelse blk: {

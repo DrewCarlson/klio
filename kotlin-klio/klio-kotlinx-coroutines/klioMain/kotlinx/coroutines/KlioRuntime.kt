@@ -233,9 +233,19 @@ private val klioUnconfined: CoroutineDispatcher = Unconfined
 
 public actual object Dispatchers {
     public actual val Default: CoroutineDispatcher get() = KlioDefaultDispatcher
-    public actual val Main: MainCoroutineDispatcher get() = KlioMainDispatcher
+    public actual val Main: MainCoroutineDispatcher get() = injectedMainDispatcher ?: KlioMainDispatcher
     public actual val Unconfined: CoroutineDispatcher get() = klioUnconfined
     public val IO: CoroutineDispatcher get() = KlioIoDispatcher
+
+    // `Dispatchers.setMain` installs kotlinx-coroutines-test's
+    // TestMainDispatcher here and `resetMain` takes it back out, the same
+    // seam every non-JVM target supplies.
+    private var injectedMainDispatcher: MainCoroutineDispatcher? = null
+
+    @PublishedApi
+    internal fun injectMain(dispatcher: MainCoroutineDispatcher) {
+        injectedMainDispatcher = dispatcher
+    }
 }
 
 // Carries the timeout `block` and its cancelled state as instance

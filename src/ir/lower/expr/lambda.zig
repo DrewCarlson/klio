@@ -171,6 +171,7 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const outer_names = try b.visibleNames();
     const inherited_rlp = try b.receiverLambdaParamNames();
     try b.stashRecvHeadsForLambda();
+    try b.stashFnValueAritiesForLambda();
     var outer_boxed = try b.boxedVarsSnapshot();
     defer outer_boxed.deinit();
     const enclosing_owner = try enclosingOwnerFor(b);
@@ -362,6 +363,7 @@ pub fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const outer_names = try b.visibleNames();
     const inherited_rlp = try b.receiverLambdaParamNames();
     try b.stashRecvHeadsForLambda();
+    try b.stashFnValueAritiesForLambda();
     var outer_boxed = try b.boxedVarsSnapshot();
     defer outer_boxed.deinit();
     const enclosing_owner = try enclosingOwnerFor(b);
