@@ -835,6 +835,11 @@ pub const Checker = struct {
     list_elem: std.AutoHashMap(Span, Type),
     diagnostics: DiagnosticSink,
     frames: std.ArrayList(Frame),
+    /// A body worker's view of the top-level bindings: the seed the main
+    /// checker holds, read through this pointer instead of cloned per worker.
+    /// Frame 0 of such a worker is empty, and every lookup that reaches it
+    /// consults this map. Null on the main checker.
+    shared_globals: ?*const std.StringHashMap(Binding) = null,
     /// By simple name, each mapping to every overload's signature.
     fns: std.StringHashMap(std.ArrayList(FnSig)),
     /// Dotted package per file. Two same-name signatures from different

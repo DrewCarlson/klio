@@ -333,13 +333,13 @@ pub fn checkCtorParamInBlock(
     for (b.stmts) |*s| {
         switch (s.*) {
             .Expr => |*e| try checkCtorParamInExpr(self, e, non_prop, local),
-            .Assign => |*a| {
+            .Assign => |a| {
                 try checkCtorParamInExpr(self, &a.target, non_prop, local);
                 try checkCtorParamInExpr(self, &a.value, non_prop, local);
             },
-            .Decl => |*d| switch (d.*) {
+            .Decl => |d| switch (d.*) {
                 .Property => |p| {
-                    if (p.init) |*init| try checkCtorParamInExpr(self, init, non_prop, local);
+                    if (p.init) |init| try checkCtorParamInExpr(self, init, non_prop, local);
                     try local.put(p.name.name, {});
                 },
                 .Function => |*f| {
@@ -347,7 +347,7 @@ pub fn checkCtorParamInBlock(
                 },
                 else => {},
             },
-            .DestructuringDecl => |*dd| {
+            .DestructuringDecl => |dd| {
                 try checkCtorParamInExpr(self, &dd.init, non_prop, local);
                 for (dd.names) |*n| {
                     if (!std.mem.eql(u8, n.name, "_")) try local.put(n.name, {});
@@ -520,7 +520,7 @@ pub fn checkPropertyInitializerCycles(self: *Checker, file: *const KotlinFile) A
     for (props.items, 0..) |p, idx| {
         var reads = std.AutoHashMap(usize, void).init(a);
         defer reads.deinit();
-        try helpers.collectPropertyReads(&p.init.?, &by_name, &reads);
+        try helpers.collectPropertyReads(p.init.?, &by_name, &reads);
         var list: std.ArrayList(usize) = .empty;
         var it = reads.keyIterator();
         while (it.next()) |k| try list.append(a, k.*);
@@ -749,7 +749,7 @@ pub fn checkPhaseJDecl(self: *Checker, d: *const Decl, in_accessor: bool) Alloca
             if (p.setter) |s| {
                 try walkAccessorForPhaseJ(self, s, has_backing_field, p.name.name);
             }
-            if (p.init) |*init| {
+            if (p.init) |init| {
                 try walkExprForPhaseJ(self, init, in_accessor, true, p.name.name);
             }
         },
@@ -786,13 +786,13 @@ pub fn walkBlockForPhaseJ(
 ) Allocator.Error!void {
     for (b.stmts) |*s| {
         switch (s.*) {
-            .Decl => |*d| try checkPhaseJDecl(self, d, in_accessor),
+            .Decl => |d| try checkPhaseJDecl(self, d, in_accessor),
             .Expr => |*e| try walkExprForPhaseJ(self, e, in_accessor, has_backing_field, prop_name),
-            .Assign => |*a| {
+            .Assign => |a| {
                 try walkExprForPhaseJ(self, &a.target, in_accessor, has_backing_field, prop_name);
                 try walkExprForPhaseJ(self, &a.value, in_accessor, has_backing_field, prop_name);
             },
-            .DestructuringDecl => |*dd| {
+            .DestructuringDecl => |dd| {
                 try walkExprForPhaseJ(self, &dd.init, in_accessor, has_backing_field, prop_name);
             },
         }
@@ -948,10 +948,10 @@ pub fn checkPhaseGDecl(self: *Checker, d: *const Decl, at_top_level: bool) Alloc
 pub fn walkBlockForPhaseG(self: *Checker, b: *const Block) Allocator.Error!void {
     for (b.stmts) |*s| {
         switch (s.*) {
-            .Decl => |*d| try checkPhaseGDecl(self, d, false),
+            .Decl => |d| try checkPhaseGDecl(self, d, false),
             .Expr => |*e| try walkExprForPhaseG(self, e),
-            .Assign => |*a| try walkExprForPhaseG(self, &a.value),
-            .DestructuringDecl => |*dd| try walkExprForPhaseG(self, &dd.init),
+            .Assign => |a| try walkExprForPhaseG(self, &a.value),
+            .DestructuringDecl => |dd| try walkExprForPhaseG(self, &dd.init),
         }
     }
 }
@@ -1126,13 +1126,13 @@ pub fn walkBlockForInlineEscape(
     for (b.stmts) |*s| {
         switch (s.*) {
             .Expr => |*e| try walkExprForInlineEscape(self, e, inline_params, crossinline_params, false),
-            .Assign => |*a| {
+            .Assign => |a| {
                 try flagInlineEscape(self, &a.value, inline_params, crossinline_params, "stored in a variable");
                 try walkExprForInlineEscape(self, &a.value, inline_params, crossinline_params, false);
             },
-            .Decl => |*d| switch (d.*) {
+            .Decl => |d| switch (d.*) {
                 .Property => |p| {
-                    if (p.init) |*init| {
+                    if (p.init) |init| {
                         try flagInlineEscape(self, init, inline_params, crossinline_params, "stored in a variable");
                         try walkExprForInlineEscape(self, init, inline_params, crossinline_params, false);
                     }
@@ -1291,7 +1291,7 @@ pub fn checkConstVal(self: *Checker, p: *const Property, scope: PhaseFScope) All
             try self.diagnostics.emit(self.allocator, d);
         }
     }
-    if (p.init) |*init| {
+    if (p.init) |init| {
         if (!isConstInitializer(self, init)) {
             const msg = try std.fmt.allocPrint(
                 self.allocator,
@@ -1417,7 +1417,9 @@ pub fn isAnnotationParamDefaultConst(self: *const Checker, e: *const Expr) bool 
 }
 
 pub fn isConstRef(self: *const Checker, name: []const u8) bool {
-    if (self.frames.items[0].bindings.get(name)) |b| {
+    const top: ?root.Binding = self.frames.items[0].bindings.get(name) orelse
+        (if (self.shared_globals) |g| g.get(name) else null);
+    if (top) |b| {
         if (!b.mutable) {
             return switch (b.ty) {
                 .Int, .Long, .Short, .Byte, .Float, .Double, .Boolean, .Char, .String => true,
@@ -1437,7 +1439,7 @@ fn checkValueClassModifiers(self: *Checker, c: *const Class) Allocator.Error!voi
     if (c.is_data) try emitValueClassShape(self, sp, "`value class {s}` cannot be `data`", c.name.name);
     if (c.is_enum) try emitValueClassShape(self, sp, "`value class {s}` cannot be `enum`", c.name.name);
     if (c.is_annotation) try emitValueClassShape(self, sp, "`value class {s}` cannot be `annotation`", c.name.name);
-    if (c.init_blocks.len != 0) try emitValueClassShape(self, sp, "`value class {s}` cannot have `init` blocks", c.name.name);
+    if (c.x().init_blocks.len != 0) try emitValueClassShape(self, sp, "`value class {s}` cannot have `init` blocks", c.name.name);
 }
 
 fn emitValueClassShape(self: *Checker, sp: Span, comptime fmt: []const u8, name: []const u8) Allocator.Error!void {
@@ -1457,7 +1459,7 @@ fn emitValueClassShape2(self: *Checker, sp: Span, comptime fmt: []const u8, a0: 
 pub fn checkValueClass(self: *Checker, c: *const Class) Allocator.Error!void {
     const sp = c.name.span;
     try checkValueClassModifiers(self, c);
-    for (c.secondary_ctors) |*sc| {
+    for (c.x().secondary_ctors) |*sc| {
         if (sc.body) |b| {
             if (b.stmts.len != 0) {
                 try emitValueClassShape(self, sp, "`value class {s}` secondary constructors must have empty bodies", c.name.name);
@@ -1520,8 +1522,8 @@ fn checkAnnotationClassShape(self: *Checker, c: *const Class) Allocator.Error!vo
     if (c.is_enum) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot be `enum`", c.name.name);
     if (c.is_inner) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot be `inner`", c.name.name);
     if (c.is_value) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot be `value`", c.name.name);
-    if (c.secondary_ctors.len != 0) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot have secondary constructors", c.name.name);
-    if (c.init_blocks.len != 0) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot have `init` blocks", c.name.name);
+    if (c.x().secondary_ctors.len != 0) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot have secondary constructors", c.name.name);
+    if (c.x().init_blocks.len != 0) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot have `init` blocks", c.name.name);
     if (c.members.len != 0) {
         // Kotlin permits a bare companion object here and nothing else.
         for (c.members) |*m| {
@@ -1748,9 +1750,9 @@ pub fn checkDefinitelyNonNullDecl(
             var frame = std.StringHashMap(void).init(a);
             for (f.type_params) |*tp| try frame.put(tp.name.name, {});
             try tp_scope.append(a, frame);
-            if (f.receiver_type) |*r| try checkDnnTyperef(self, r, tp_scope.items);
+            if (f.receiver_type) |r| try checkDnnTyperef(self, r, tp_scope.items);
             for (f.params) |*p| try checkDnnTyperef(self, &p.ty, tp_scope.items);
-            if (f.return_type) |*rt| try checkDnnTyperef(self, rt, tp_scope.items);
+            if (f.return_type) |rt| try checkDnnTyperef(self, rt, tp_scope.items);
             if (f.body) |body| {
                 switch (body) {
                     .Block => |b| try walkBlockForDnn(self, &b, tp_scope),
@@ -1770,8 +1772,8 @@ pub fn checkDefinitelyNonNullDecl(
             popped.deinit();
         },
         .Property => |p| {
-            if (p.ty) |*t| try checkDnnTyperef(self, t, tp_scope.items);
-            if (p.init) |*init| try walkExprForDnn(self, init, tp_scope);
+            if (p.ty) |t| try checkDnnTyperef(self, t, tp_scope.items);
+            if (p.init) |init| try walkExprForDnn(self, init, tp_scope);
         },
         .Object => |*o| {
             for (o.members) |*m| try checkDefinitelyNonNullDecl(self, m, tp_scope);
@@ -1820,10 +1822,10 @@ pub fn checkDnnTyperef(self: *Checker, t: *const TypeRef, tp_scope: []const std.
 pub fn walkBlockForDnn(self: *Checker, b: *const Block, tp_scope: *std.ArrayList(std.StringHashMap(void))) Allocator.Error!void {
     for (b.stmts) |*s| {
         switch (s.*) {
-            .Decl => |*d| try checkDefinitelyNonNullDecl(self, d, tp_scope),
+            .Decl => |d| try checkDefinitelyNonNullDecl(self, d, tp_scope),
             .Expr => |*e| try walkExprForDnn(self, e, tp_scope),
-            .Assign => |*a| try walkExprForDnn(self, &a.value, tp_scope),
-            .DestructuringDecl => |*dd| try walkExprForDnn(self, &dd.init, tp_scope),
+            .Assign => |a| try walkExprForDnn(self, &a.value, tp_scope),
+            .DestructuringDecl => |dd| try walkExprForDnn(self, &dd.init, tp_scope),
         }
     }
 }
@@ -1994,7 +1996,7 @@ pub fn checkMemberVariancePositions(
             }
         },
         .In => {
-            if (f.return_type) |*rt| {
+            if (f.return_type) |rt| {
                 if (helpers.typeRefUses(rt, param)) {
                     const msg = try std.fmt.allocPrint(
                         self.allocator,
@@ -2014,10 +2016,10 @@ pub fn checkMemberVariancePositions(
 pub fn walkBlockForGenerics(self: *Checker, b: *const Block) Allocator.Error!void {
     for (b.stmts) |*s| {
         switch (s.*) {
-            .Decl => |*d| try checkGenericsDecl(self, d),
+            .Decl => |d| try checkGenericsDecl(self, d),
             .Expr => |*e| try walkExprForGenerics(self, e),
-            .Assign => |*a| try walkExprForGenerics(self, &a.value),
-            .DestructuringDecl => |*dd| try walkExprForGenerics(self, &dd.init),
+            .Assign => |a| try walkExprForGenerics(self, &a.value),
+            .DestructuringDecl => |dd| try walkExprForGenerics(self, &dd.init),
         }
     }
 }
@@ -2267,11 +2269,11 @@ fn annotationWalkClass(self: *Checker, meta: *const std.StringHashMap(Annotation
             try annotationCheckSetMsg(self, meta, p.annotations, .ValueParameter, "constructor parameters without corresponding property (consider adding val/var)");
         }
     }
-    for (c.secondary_ctors) |*sc| {
+    for (c.x().secondary_ctors) |*sc| {
         try annotationCheckSet(self, meta, sc.annotations, .Constructor);
         for (sc.params) |*p| try annotationCheckSet(self, meta, p.annotations, .ValueParameter);
     }
-    for (c.enum_entries) |*e| try annotationCheckSet(self, meta, e.annotations, .Property);
+    for (c.x().enum_entries) |*e| try annotationCheckSet(self, meta, e.annotations, .Property);
     for (c.members) |*m| try annotationWalkDecl(self, meta, m, .Member);
 }
 
@@ -2743,7 +2745,7 @@ fn walkDeclForOptIn(
             const self_markers = try markerNamesIn(a, p.annotations, markers);
             defer a.free(self_markers);
             for (self_markers) |m| try scope.append(a, m);
-            if (p.init) |*init| try walkExprForOptIn(self, init, markers, required, scope, out);
+            if (p.init) |init| try walkExprForOptIn(self, init, markers, required, scope, out);
             if (p.getter) |acc| try walkAccessorBodyOptIn(self, &acc.body, markers, required, scope, out);
             if (p.setter) |acc| try walkAccessorBodyOptIn(self, &acc.body, markers, required, scope, out);
             popN(scope, self_markers.len);
@@ -2754,14 +2756,14 @@ fn walkDeclForOptIn(
             const self_markers = try markerNamesIn(a, c.annotations, markers);
             defer a.free(self_markers);
             for (self_markers) |m| try scope.append(a, m);
-            for (c.init_blocks) |*ib| try walkBlockForOptIn(self, ib, markers, required, scope, out);
+            for (c.x().init_blocks) |*ib| try walkBlockForOptIn(self, ib, markers, required, scope, out);
             for (c.primary_params) |*p| {
                 if (p.default) |*def| try walkExprForOptIn(self, def, markers, required, scope, out);
             }
-            for (c.secondary_ctors) |*sc| {
+            for (c.x().secondary_ctors) |*sc| {
                 if (sc.body) |*body| try walkBlockForOptIn(self, body, markers, required, scope, out);
             }
-            for (c.enum_entries) |*ee| {
+            for (c.x().enum_entries) |*ee| {
                 for (ee.args) |*arg| try walkExprForOptIn(self, arg, markers, required, scope, out);
                 for (ee.body_members) |*m| try walkDeclForOptIn(self, m, markers, required, scope, out);
             }
@@ -2801,12 +2803,12 @@ fn walkBlockForOptIn(
     for (b.stmts) |*s| {
         switch (s.*) {
             .Expr => |*e| try walkExprForOptIn(self, e, markers, required, scope, out),
-            .Decl => |*d| try walkDeclForOptIn(self, d, markers, required, scope, out),
-            .Assign => |*a| {
+            .Decl => |d| try walkDeclForOptIn(self, d, markers, required, scope, out),
+            .Assign => |a| {
                 try walkExprForOptIn(self, &a.target, markers, required, scope, out);
                 try walkExprForOptIn(self, &a.value, markers, required, scope, out);
             },
-            .DestructuringDecl => |*dd| {
+            .DestructuringDecl => |dd| {
                 try walkExprForOptIn(self, &dd.init, markers, required, scope, out);
             },
         }
@@ -3106,19 +3108,19 @@ fn walkDeclForDeprecation(
             }
         },
         .Property => |p| {
-            if (p.init) |*init| try walkExprForDeprecation(self, init, info, out);
+            if (p.init) |init| try walkExprForDeprecation(self, init, info, out);
             if (p.getter) |acc| try walkAccessorBodyDeprecation(self, &acc.body, info, out);
             if (p.setter) |acc| try walkAccessorBodyDeprecation(self, &acc.body, info, out);
         },
         .Class => |*c| {
-            for (c.init_blocks) |*ib| try walkBlockForDeprecation(self, ib, info, out);
+            for (c.x().init_blocks) |*ib| try walkBlockForDeprecation(self, ib, info, out);
             for (c.primary_params) |*p| {
                 if (p.default) |*def| try walkExprForDeprecation(self, def, info, out);
             }
-            for (c.secondary_ctors) |*sc| {
+            for (c.x().secondary_ctors) |*sc| {
                 if (sc.body) |*body| try walkBlockForDeprecation(self, body, info, out);
             }
-            for (c.enum_entries) |*ee| {
+            for (c.x().enum_entries) |*ee| {
                 for (ee.args) |*arg| try walkExprForDeprecation(self, arg, info, out);
                 for (ee.body_members) |*m| try walkDeclForDeprecation(self, m, info, out);
             }
@@ -3152,12 +3154,12 @@ fn walkBlockForDeprecation(
     for (b.stmts) |*s| {
         switch (s.*) {
             .Expr => |*e| try walkExprForDeprecation(self, e, info, out),
-            .Decl => |*d| try walkDeclForDeprecation(self, d, info, out),
-            .Assign => |*a| {
+            .Decl => |d| try walkDeclForDeprecation(self, d, info, out),
+            .Assign => |a| {
                 try walkExprForDeprecation(self, &a.target, info, out);
                 try walkExprForDeprecation(self, &a.value, info, out);
             },
-            .DestructuringDecl => |*dd| {
+            .DestructuringDecl => |dd| {
                 try walkExprForDeprecation(self, &dd.init, info, out);
             },
         }
@@ -3549,7 +3551,8 @@ fn forkWorker(self: *const Checker, seed: *const std.StringHashMap(root.Binding)
     c.list_elem = std.AutoHashMap(root.Span, root.Type).init(a);
     c.diagnostics = root.DiagnosticSink.init();
     c.frames = .empty;
-    try c.frames.append(a, .{ .bindings = try seed.cloneWithAllocator(a) });
+    try c.frames.append(a, Frame.init(a));
+    c.shared_globals = seed;
     c.class_stack = .empty;
     c.fn_return_stack = .empty;
     c.label_stack = .empty;

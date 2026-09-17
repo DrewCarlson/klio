@@ -472,7 +472,7 @@ pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8
         var lx = lexer.Lexer.init(gpa, fid, src) catch return null;
         const lexed = lx.tokenize() catch return null;
         if (lexed.diagnostics.hasErrors()) return null;
-        const p = parser.Parser.new(gpa, fid, src, lexed.tokens);
+        const p = parser.Parser.new(gpa, fid, src, lexed.tokens, lexed.strings);
         const file_ast = p.parseFile();
         if (p.diagnostics.hasErrors()) return null;
         out_asts[i] = file_ast;

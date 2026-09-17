@@ -77,12 +77,12 @@ pub fn localExtRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Alloc
         .span = sp,
     } } };
     const boxed = try ma.create(ast.Expr);
-    boxed.* = .{ .Lambda = .{
+    boxed.* = .{ .Lambda = try ast.box(ma, ast.LambdaExpr{
         .params = params,
         .body = .{ .stmts = stmts, .span = sp },
         .span = sp,
         .implicit_it = false,
-    } };
+    }) };
     return try lowerExpr(b, boxed);
 }
 
@@ -164,12 +164,12 @@ pub fn varargIntrinsicRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span
         .span = sp,
     } } };
     const boxed = try ma.create(ast.Expr);
-    boxed.* = .{ .Lambda = .{
+    boxed.* = .{ .Lambda = try ast.box(ma, ast.LambdaExpr{
         .params = params,
         .body = .{ .stmts = stmts, .span = sp },
         .span = sp,
         .implicit_it = false,
-    } };
+    }) };
     return try lowerExpr(b, boxed);
 }
 
@@ -207,12 +207,12 @@ pub fn boundLocalExtRefClosure(b: *FuncBuilder, receiver: *const Expr, name: []c
         .span = sp,
     } } };
     const boxed = try ma.create(ast.Expr);
-    boxed.* = .{ .Lambda = .{
+    boxed.* = .{ .Lambda = try ast.box(ma, ast.LambdaExpr{
         .params = params,
         .body = .{ .stmts = stmts, .span = sp },
         .span = sp,
         .implicit_it = false,
-    } };
+    }) };
     return try lowerExpr(b, boxed);
 }
 
@@ -255,12 +255,12 @@ pub fn arrayCtorRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allo
         .span = sp,
     } } };
     const boxed = try ma.create(ast.Expr);
-    boxed.* = .{ .Lambda = .{
+    boxed.* = .{ .Lambda = try ast.box(ma, ast.LambdaExpr{
         .params = params,
         .body = .{ .stmts = stmts, .span = sp },
         .span = sp,
         .implicit_it = false,
-    } };
+    }) };
     return try lowerExpr(b, boxed);
 }
 
@@ -396,12 +396,12 @@ pub fn adaptedRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span, fid: F
         .span = sp,
     } } };
     const boxed = try ma.create(ast.Expr);
-    boxed.* = .{ .Lambda = .{
+    boxed.* = .{ .Lambda = try ast.box(ma, ast.LambdaExpr{
         .params = params,
         .body = .{ .stmts = stmts, .span = sp },
         .span = sp,
         .implicit_it = false,
-    } };
+    }) };
     const heads: []const u8 = blk: {
         const types = b.pending_ref_lambda_param_types orelse break :blk "";
         var buf: std.ArrayList(u8) = .empty;
@@ -439,12 +439,12 @@ pub fn reifiedRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Alloca
         .is_infix = false,
         .span = sp,
     } } };
-    const lam: ast.Expr = .{ .Lambda = .{
+    const lam: ast.Expr = .{ .Lambda = try ast.box(b.allocator, ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = stmts, .span = sp },
         .span = sp,
         .implicit_it = false,
-    } };
+    }) };
     const boxed = try ma.create(ast.Expr);
     boxed.* = lam;
     return try lowerExpr(b, boxed);

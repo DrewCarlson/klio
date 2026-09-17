@@ -96,7 +96,7 @@ pub fn runCheck(
         for (lexed.diagnostics.diags()) |d| {
             all.emit(gpa, d) catch return 2;
         }
-        const p = Parser.new(gpa, id, src, lexed.tokens);
+        const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
         const file_ast = p.parseFile();
         for (p.diagnostics.diags()) |d| {
             all.emit(gpa, d) catch return 2;
@@ -179,7 +179,7 @@ pub fn runParse(gpa: std.mem.Allocator, path: []const u8) u8 {
     defer lexed.deinit(gpa);
     renderToStderr(gpa, &lexed.diagnostics, &map);
     if (lexed.diagnostics.hasErrors()) return 1;
-    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     renderToStderr(gpa, &p.diagnostics, &map);
     io.printStdout(gpa, "{any}\n", .{file_ast});
@@ -213,7 +213,7 @@ pub fn runModuleFiles(
         defer lexed.deinit(gpa);
         renderToStderr(gpa, &lexed.diagnostics, &map);
         if (lexed.diagnostics.hasErrors()) return 1;
-        const p = Parser.new(gpa, id, src, lexed.tokens);
+        const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
         const file_ast = p.parseFile();
         renderToStderr(gpa, &p.diagnostics, &map);
         if (p.diagnostics.hasErrors()) return 1;
@@ -255,7 +255,7 @@ pub fn runFileIrVm(
     defer lexed.deinit(gpa);
     renderToStderr(gpa, &lexed.diagnostics, &map);
     if (lexed.diagnostics.hasErrors()) return 1;
-    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     renderToStderr(gpa, &p.diagnostics, &map);
     if (p.diagnostics.hasErrors()) return 1;
@@ -292,7 +292,7 @@ pub fn runDumpIr(
     defer lexed.deinit(gpa);
     renderToStderr(gpa, &lexed.diagnostics, &map);
     if (lexed.diagnostics.hasErrors()) return 1;
-    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     renderToStderr(gpa, &p.diagnostics, &map);
     if (p.diagnostics.hasErrors()) return 1;
@@ -341,7 +341,7 @@ pub fn runTranspileDump(
     defer lexed.deinit(gpa);
     renderToStderr(gpa, &lexed.diagnostics, &map);
     if (lexed.diagnostics.hasErrors()) return 1;
-    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     renderToStderr(gpa, &p.diagnostics, &map);
     if (p.diagnostics.hasErrors()) return 1;
@@ -416,7 +416,7 @@ pub fn runTranspileNative(
     defer lexed.deinit(gpa);
     renderToStderr(gpa, &lexed.diagnostics, &map);
     if (lexed.diagnostics.hasErrors()) return 1;
-    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     renderToStderr(gpa, &p.diagnostics, &map);
     if (p.diagnostics.hasErrors()) return 1;
@@ -602,7 +602,7 @@ pub fn runTranspile(
     defer lexed.deinit(gpa);
     renderToStderr(gpa, &lexed.diagnostics, &map);
     if (lexed.diagnostics.hasErrors()) return 1;
-    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     renderToStderr(gpa, &p.diagnostics, &map);
     if (p.diagnostics.hasErrors()) return 1;
@@ -1593,7 +1593,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
     // op level: reified `is T`, `as T`/`::class`/`typeOf`, lambda-param calls.
     for (f.blocks, 0..) |*blk, bi| {
         if (!ok) break;
-        if (blk.catches.len != 0 or blk.finally != null) {
+        if (blk.h().catches.len != 0 or blk.h().finally != null) {
             leafTrace(f, "try");
             ok = false;
             break;
@@ -1661,7 +1661,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             }
                         },
-                        .CallMemberOrGlobal => |*cg| {
+                        .CallMemberOrGlobal => |cg| {
                             // Tail position of a receiver-less top-level fn, so
                             // no member leg can shadow the class leg.
             if (cg.func != null and cg.class == null) {
@@ -1955,7 +1955,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                             if (ni.dst.int() > max_reg) max_reg = ni.dst.int();
                             if (ni.args.int() + ni.n_args > max_reg) max_reg = ni.args.int() + ni.n_args;
                         },
-                        .CallMemberOrGlobal => |*cg| {
+                        .CallMemberOrGlobal => |cg| {
                             if (cg.dst.int() > max_reg) max_reg = cg.dst.int();
                             if (cg.args.int() + cg.n_args > max_reg) max_reg = cg.args.int() + cg.n_args;
                         },
@@ -2056,7 +2056,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal.class == null)
                     {
                         // No member can shadow it, so emit a direct `kl_` call.
-                        const cg = &f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal;
+                        const cg = f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal;
                         const cb = cg.args.int();
                         try w.print("  {{ int64_t cav[{d}]; int32_t cag[{d}];\n", .{ @max(cg.n_args, 1), @max(cg.n_args, 1) });
                         var ci: u32 = 0;
@@ -2071,7 +2071,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                     }
                     const ctor_args: ?struct { base: u32, n: u32 } = switch (f.blocks[bi].insts[code[pc + 1]]) {
                         .NewInstance => |*ni| .{ .base = ni.args.int(), .n = ni.n_args },
-                        .CallMemberOrGlobal => |*cg| .{ .base = cg.args.int(), .n = cg.n_args },
+                        .CallMemberOrGlobal => |cg| .{ .base = cg.args.int(), .n = cg.n_args },
                         else => null,
                     };
                     if (ctor_args) |ca| {
@@ -3193,7 +3193,7 @@ pub fn runTestFiles(
         defer lexed.deinit(gpa);
         renderToStderr(gpa, &lexed.diagnostics, &map);
         if (lexed.diagnostics.hasErrors()) return 1;
-        const p = Parser.new(gpa, id, src, lexed.tokens);
+        const p = Parser.new(gpa, id, src, lexed.tokens, lexed.strings);
         const file_ast = p.parseFile();
         renderToStderr(gpa, &p.diagnostics, &map);
         if (p.diagnostics.hasErrors()) return 1;

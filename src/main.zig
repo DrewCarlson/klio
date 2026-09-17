@@ -219,6 +219,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 runtime.slab.census_by_churn = std.mem.eql(u8, v, "churn");
                 const rc = runCli(runtime.slab.allocator, init.args);
                 cli.mem_census.printTypeSizes();
+                if (std.mem.eql(u8, v, "shapes")) cli.mem_census.printShapeDetail();
                 runtime.slab.censusReport();
                 return rc;
             }

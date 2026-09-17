@@ -7,6 +7,7 @@ const ast = @import("ast");
 const Allocator = std.mem.Allocator;
 const Expr = ast.Expr;
 const Stmt = ast.Stmt;
+const Decl = ast.Decl;
 pub const StringSet = std.StringHashMap(void);
 
 /// `expr as Any`, or transitively wrapped, for the boxed-equality routing.
@@ -126,9 +127,9 @@ fn collectIdentsStmt(s: *const Stmt, out: *StringSet, member_out: ?*StringSet) A
             try collectIdents(&a.value, out, member_out);
         },
         .DestructuringDecl => |d| try collectIdents(&d.init, out, member_out),
-        .Decl => |d| switch (d) {
+        .Decl => |d| switch (d.*) {
             .Property => |p| {
-                if (p.init) |*e| try collectIdents(e, out, member_out);
+                if (p.init) |e| try collectIdents(e, out, member_out);
                 // A `by`-delegate lambda references, and may mutate, an outer
                 // capture just as an initializer does.
                 if (p.delegate) |e| try collectIdents(e, out, member_out);
@@ -146,7 +147,7 @@ fn collectIdentsStmt(s: *const Stmt, out: *StringSet, member_out: ?*StringSet) A
             },
             // A nested local class's member and init-block bodies reference
             // captured outer locals exactly as an anonymous object's do.
-            .Class => |*c| try classBodyIdents(c.members, c.init_blocks, out, member_out),
+            .Class => |*c| try classBodyIdents(c.members, c.x().init_blocks, out, member_out),
             .Object => |*o| try classBodyIdents(o.members, o.init_blocks, out, member_out),
             else => {},
         },
@@ -168,12 +169,12 @@ fn classBodyIdents(members: []const ast.Decl, init_blocks: []const ast.Block, ou
             };
         },
         .Property => |p| {
-            if (p.init) |*pi| try collectIdents(pi, out, member_out);
+            if (p.init) |pi| try collectIdents(pi, out, member_out);
             if (p.delegate) |e| try collectIdents(e, out, member_out);
             if (p.getter) |g| try accessorIdents(g, out, member_out);
             if (p.setter) |st| try accessorIdents(st, out, member_out);
         },
-        .Class => |*c| try classBodyIdents(c.members, c.init_blocks, out, member_out),
+        .Class => |*c| try classBodyIdents(c.members, c.x().init_blocks, out, member_out),
         .Object => |*o| try classBodyIdents(o.members, o.init_blocks, out, member_out),
         else => {},
     };
@@ -202,9 +203,9 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
                 try scanLambdaRefsExpr(&a.value, out);
             },
             .DestructuringDecl => |d| try scanLambdaRefsExpr(&d.init, out),
-            .Decl => |d| switch (d) {
+            .Decl => |d| switch (d.*) {
                 .Property => |p| {
-                    if (p.init) |*e| try scanLambdaRefsExpr(e, out);
+                    if (p.init) |e| try scanLambdaRefsExpr(e, out);
                     // A `by`-delegate expression holds the lambda that captures, and
                     // may mutate, an outer `var`.
                     if (p.delegate) |e| try scanLambdaRefsExpr(e, out);
@@ -219,7 +220,7 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
                 },
                 // A local class's member bodies reference and write captured outer
                 // locals exactly as an anonymous object's do.
-                .Class => |*c| try classBodyPathIdents(c.members, c.init_blocks, out),
+                .Class => |*c| try classBodyPathIdents(c.members, c.x().init_blocks, out),
                 .Object => |*o| try classBodyPathIdents(o.members, o.init_blocks, out),
                 else => {},
             },
@@ -241,12 +242,12 @@ fn classBodyPathIdents(members: []const ast.Decl, init_blocks: []const ast.Block
             };
         },
         .Property => |p| {
-            if (p.init) |*pi| try collectPathIdents(pi, out);
+            if (p.init) |pi| try collectPathIdents(pi, out);
             if (p.delegate) |e| try collectPathIdents(e, out);
             if (p.getter) |g| try accessorPathIdents(g, out);
             if (p.setter) |st| try accessorPathIdents(st, out);
         },
-        .Class => |*c| try classBodyPathIdents(c.members, c.init_blocks, out),
+        .Class => |*c| try classBodyPathIdents(c.members, c.x().init_blocks, out),
         .Object => |*o| try classBodyPathIdents(o.members, o.init_blocks, out),
         else => {},
     };
@@ -372,14 +373,14 @@ fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
 pub fn collectVarDecls(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
     for (stmts) |*s| {
         switch (s.*) {
-            .Decl => |d| switch (d) {
+            .Decl => |d| switch (d.*) {
                 .Property => |p| {
                     const deferred_val = p.init == null and p.delegate == null and
                         p.getter == null and p.setter == null;
                     if (p.mutable or deferred_val) try out.put(p.name.name, {});
                     // The initializer's expression blocks declare capturable vars
                     // too.
-                    if (p.init) |*e| try collectVarDeclsExpr(e, out);
+                    if (p.init) |e| try collectVarDeclsExpr(e, out);
                     if (p.delegate) |e| try collectVarDeclsExpr(e, out);
                 },
                 else => {},
@@ -441,9 +442,9 @@ fn assignedInLambdasStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
             try assignedInLambdasExpr(&a.value, out);
         },
         .DestructuringDecl => |d| try assignedInLambdasExpr(&d.init, out),
-        .Decl => |d| switch (d) {
+        .Decl => |d| switch (d.*) {
             .Property => |p| {
-                if (p.init) |*e| try assignedInLambdasExpr(e, out);
+                if (p.init) |e| try assignedInLambdasExpr(e, out);
                 // A `by`-delegate lambda can mutate a captured outer name too.
                 if (p.delegate) |e| try assignedInLambdasExpr(e, out);
             },
@@ -455,7 +456,7 @@ fn assignedInLambdasStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
             },
             // A local class's method bodies write captured outer locals exactly as
             // an anonymous object's do.
-            .Class => |*c| try classBodyAssigns(c.members, c.init_blocks, out),
+            .Class => |*c| try classBodyAssigns(c.members, c.x().init_blocks, out),
             .Object => |*o| try classBodyAssigns(o.members, o.init_blocks, out),
             else => {},
         },
@@ -474,12 +475,12 @@ fn classBodyAssigns(members: []const ast.Decl, init_blocks: []const ast.Block, o
             };
         },
         .Property => |p| {
-            if (p.init) |*pi| try assignedInLambdasExpr(pi, out);
+            if (p.init) |pi| try assignedInLambdasExpr(pi, out);
             if (p.delegate) |e| try assignedInLambdasExpr(e, out);
             if (p.getter) |g| try accessorAssigns(g, out);
             if (p.setter) |st| try accessorAssigns(st, out);
         },
-        .Class => |*c| try classBodyAssigns(c.members, c.init_blocks, out),
+        .Class => |*c| try classBodyAssigns(c.members, c.x().init_blocks, out),
         .Object => |*o| try classBodyAssigns(o.members, o.init_blocks, out),
         else => {},
     };
@@ -594,9 +595,9 @@ fn collectLambdaBodyAssigns(stmts: []const Stmt, out: *StringSet) Allocator.Erro
             },
             .Expr => |*e| try collectAssignTargets(e, out),
             .DestructuringDecl => |d| try assignedInLambdasExpr(&d.init, out),
-            .Decl => |d| switch (d) {
+            .Decl => |d| switch (d.*) {
                 .Property => |p| {
-                    if (p.init) |*e| try assignedInLambdasExpr(e, out);
+                    if (p.init) |e| try assignedInLambdasExpr(e, out);
                 },
                 else => {},
             },
@@ -716,7 +717,7 @@ fn dummySpan() span.Span {
 
 test "is boxed to any form matches as Any" {
     var inner = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } };
-    const e = Expr{ .As = .{
+    var e_node = ast.AsExpr{
         .expr = &inner,
         .ty = .{
             .name = .{ .name = "Any", .span = dummySpan() },
@@ -725,12 +726,11 @@ test "is boxed to any form matches as Any" {
             .type_args = &.{},
             .function = null,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         },
         .safe = false,
         .span = dummySpan(),
-    } };
+    };
+    const e = Expr{ .As = &e_node };
     try testing.expect(isBoxedToAnyForm(&e));
 }
 
@@ -774,14 +774,14 @@ test "collect dotted fqn rejects non-identifier chain" {
 
 test "compute boxed vars keeps only captured var decls" {
     // var captured = 0; var untouched = 0; { x -> captured }
-    const lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
-    const lit1 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
+    var lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
+    var lit1 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     var prop_captured = ast.Property{
         .mutable = true,
         .name = .{ .name = "captured", .span = dummySpan() },
         .receiver_type = null,
         .ty = null,
-        .init = lit0,
+        .init = &lit0,
         .delegate = null,
         .getter = null,
         .setter = null,
@@ -800,21 +800,24 @@ test "compute boxed vars keeps only captured var decls" {
     };
     var prop_untouched = prop_captured;
     prop_untouched.name = .{ .name = "untouched", .span = dummySpan() };
-    prop_untouched.init = lit1;
+    prop_untouched.init = &lit1;
 
     // Lambda body references `captured`.
     var refseg = [_]ast.Ident{.{ .name = "captured", .span = dummySpan() }};
     var refexpr = Expr{ .Path = .{ .segments = &refseg, .span = dummySpan() } };
     var lambda_stmts = [_]Stmt{.{ .Expr = refexpr }};
-    var lambda = Expr{ .Lambda = .{
+    var lam_node_811 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &lambda_stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    var lambda = Expr{ .Lambda = &lam_node_811 };
 
+    var prop_captured_decl = Decl{ .Property = &prop_captured };
+    var prop_untouched_decl = Decl{ .Property = &prop_untouched };
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = &prop_captured } },
-        .{ .Decl = .{ .Property = &prop_untouched } },
+        .{ .Decl = &prop_captured_decl },
+        .{ .Decl = &prop_untouched_decl },
         .{ .Expr = lambda },
     };
     _ = &refexpr;
@@ -828,13 +831,13 @@ test "compute boxed vars keeps only captured var decls" {
 test "compute boxed vars does not box a var a string template mentions" {
     // A template is not a lambda, so `s` must stay a plain register; a false box
     // puts a CellGet/CellSet on every hot access.
-    const lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
+    var lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     var prop_s = ast.Property{
         .mutable = true,
         .name = .{ .name = "s", .span = dummySpan() },
         .receiver_type = null,
         .ty = null,
-        .init = lit0,
+        .init = &lit0,
         .delegate = null,
         .getter = null,
         .setter = null,
@@ -856,8 +859,9 @@ test "compute boxed vars does not box a var a string template mentions" {
         .{ .ShortInterp = .{ .name = "s", .span = dummySpan() } },
     };
     const tmpl = Expr{ .StringTemplate = .{ .parts = &parts, .span = dummySpan() } };
+    var prop_s_decl = Decl{ .Property = &prop_s };
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = &prop_s } },
+        .{ .Decl = &prop_s_decl },
         .{ .Expr = tmpl },
     };
     var boxed = try computeBoxedVars(testing.allocator, &stmts);
@@ -868,13 +872,13 @@ test "compute boxed vars does not box a var a string template mentions" {
 test "compute boxed vars boxes a var captured in a by-delegate lambda" {
     // var captured = 0
     // val answer by delegateFn { captured }   // the lambda lives in the delegate
-    const lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
+    var lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     var prop_captured = ast.Property{
         .mutable = true,
         .name = .{ .name = "captured", .span = dummySpan() },
         .receiver_type = null,
         .ty = null,
-        .init = lit0,
+        .init = &lit0,
         .delegate = null,
         .getter = null,
         .setter = null,
@@ -896,11 +900,12 @@ test "compute boxed vars boxes a var captured in a by-delegate lambda" {
     var refseg = [_]ast.Ident{.{ .name = "captured", .span = dummySpan() }};
     var refexpr = Expr{ .Path = .{ .segments = &refseg, .span = dummySpan() } };
     var lambda_stmts = [_]Stmt{.{ .Expr = refexpr }};
-    var lambda = Expr{ .Lambda = .{
+    var lam_node_904 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &lambda_stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    var lambda = Expr{ .Lambda = &lam_node_904 };
     var calleeseg = [_]ast.Ident{.{ .name = "delegateFn", .span = dummySpan() }};
     var callee = Expr{ .Path = .{ .segments = &calleeseg, .span = dummySpan() } };
     var call_args = [_]Expr{lambda};
@@ -938,9 +943,11 @@ test "compute boxed vars boxes a var captured in a by-delegate lambda" {
         .span = dummySpan(),
     };
 
+    var prop_captured_decl = Decl{ .Property = &prop_captured };
+    var prop_answer_decl = Decl{ .Property = &prop_answer };
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = &prop_captured } },
-        .{ .Decl = .{ .Property = &prop_answer } },
+        .{ .Decl = &prop_captured_decl },
+        .{ .Decl = &prop_answer_decl },
     };
     _ = &refexpr;
     _ = &lambda;
@@ -979,7 +986,8 @@ test "collect path idents recurses into a nested local fun body" {
         .annotations = &.{},
         .span = dummySpan(),
     };
-    const fn_stmt = Stmt{ .Decl = .{ .Function = func } };
+    var fn_decl = Decl{ .Function = func };
+    const fn_stmt = Stmt{ .Decl = &fn_decl };
     var out = StringSet.init(testing.allocator);
     defer out.deinit();
     try collectPathIdentsStmt(&fn_stmt, &out);
@@ -994,18 +1002,20 @@ test "names assigned in lambdas reports writes but not bare reads" {
     var rseg = [_]ast.Ident{.{ .name = "onlyread", .span = dummySpan() }};
     var rval = Expr{ .Path = .{ .segments = &rseg, .span = dummySpan() } };
 
-    var assign_stmt = Stmt{ .Assign = .{
+    var assign_node = ast.AssignStmt{
         .target = wtarget,
         .op = .Assign,
         .value = rval,
         .span = dummySpan(),
-    } };
+    };
+    var assign_stmt = Stmt{ .Assign = &assign_node };
     var lam_stmts = [_]Stmt{assign_stmt};
-    var lam = Expr{ .Lambda = .{
+    var lam_node_1013 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &lam_stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    var lam = Expr{ .Lambda = &lam_node_1013 };
     var stmts = [_]Stmt{.{ .Expr = lam }};
     _ = .{ &wtarget, &rval, &assign_stmt, &lam };
 
@@ -1022,11 +1032,12 @@ test "names assigned in lambdas catches postfix increment target" {
     var ctarget = Expr{ .Path = .{ .segments = &cseg, .span = dummySpan() } };
     var postfix = Expr{ .Postfix = .{ .op = .Inc, .expr = &ctarget, .span = dummySpan() } };
     var lam_stmts = [_]Stmt{.{ .Expr = postfix }};
-    var lam = Expr{ .Lambda = .{
+    var lam_node_1034 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &lam_stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    var lam = Expr{ .Lambda = &lam_node_1034 };
     var stmts = [_]Stmt{.{ .Expr = lam }};
     _ = .{ &ctarget, &postfix, &lam };
 
@@ -1049,7 +1060,7 @@ fn qthisStmt(s: *const Stmt, label: []const u8) bool {
         .Expr => |*e| qthisExpr(e, label),
         .Assign => |a| qthisExpr(&a.target, label) or qthisExpr(&a.value, label),
         .DestructuringDecl => |d| qthisExpr(&d.init, label),
-        .Decl => |d| qthisDecl(&d, label),
+        .Decl => |d| qthisDecl(d, label),
     };
 }
 
@@ -1065,7 +1076,7 @@ fn qthisDecl(d: *const ast.Decl, label: []const u8) bool {
     return switch (d.*) {
         .Function => |f| qthisBody(f.body, label),
         .Property => |p| blk: {
-            if (p.init) |*e| if (qthisExpr(e, label)) break :blk true;
+            if (p.init) |e| if (qthisExpr(e, label)) break :blk true;
             if (p.getter) |g| if (qthisBody(g.body, label)) break :blk true;
             if (p.setter) |st| if (qthisBody(st.body, label)) break :blk true;
             break :blk false;
@@ -1228,7 +1239,7 @@ pub fn containsLabeledReturn(e: *const Expr, label: []const u8) bool {
                     };
                 },
                 .Property => |p| {
-                    if (p.init) |*pi| if (containsLabeledReturn(pi, label)) return true;
+                    if (p.init) |pi| if (containsLabeledReturn(pi, label)) return true;
                 },
                 else => {},
             };
@@ -1268,9 +1279,9 @@ pub fn containsLabeledReturnStmt(s: *const Stmt, label: []const u8) bool {
         .Expr => |*e| return containsLabeledReturn(e, label),
         .Assign => |a| return containsLabeledReturn(&a.target, label) or containsLabeledReturn(&a.value, label),
         .DestructuringDecl => |d| return containsLabeledReturn(&d.init, label),
-        .Decl => |d| switch (d) {
+        .Decl => |d| switch (d.*) {
             .Property => |p| {
-                if (p.init) |*e| if (containsLabeledReturn(e, label)) return true;
+                if (p.init) |e| if (containsLabeledReturn(e, label)) return true;
                 if (p.delegate) |e| if (containsLabeledReturn(e, label)) return true;
                 return false;
             },
@@ -1294,11 +1305,11 @@ pub fn containsLabeledReturnStmt(s: *const Stmt, label: []const u8) bool {
                         };
                     },
                     .Property => |p| {
-                        if (p.init) |*pi| if (containsLabeledReturn(pi, label)) return true;
+                        if (p.init) |pi| if (containsLabeledReturn(pi, label)) return true;
                     },
                     else => {},
                 };
-                for (c.init_blocks) |*blk| {
+                for (c.x().init_blocks) |*blk| {
                     for (blk.stmts) |*st| if (containsLabeledReturnStmt(st, label)) return true;
                 }
                 return false;

@@ -245,7 +245,7 @@ fn sameDeclSig(a: ir.Module.DeclSig, b: ir.Module.DeclSig) bool {
 /// canonical declaration signature rather than by simple name.
 pub fn selectedCallHasComposerAbi(module: *const Module, func_id: FuncId, f: *const Func) bool {
     if (hasThreadedComposerParams(f)) return true;
-    for (f.annotation_names) |ann| {
+    for (f.x().annotation_names) |ann| {
         if (std.mem.eql(u8, ann, "Composable") or std.mem.endsWith(u8, ann, ".Composable")) return true;
     }
     const selected_sig = module.decl_sigs.get(func_id.int()) orelse return false;

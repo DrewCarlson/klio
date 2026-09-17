@@ -560,7 +560,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         try body_props.append(allocator, .{
             .name = p.name.name,
             .mutable = p.mutable,
-            .init = if (p.init) |*e| FF(ast.Expr).fromPtr(e) else null,
+            .init = if (p.init) |e| FF(ast.Expr).fromPtr(e) else null,
             .getter = if (p.getter) |g| FF(ast.Accessor).fromPtr(g) else null,
             .setter = if (p.setter) |s| FF(ast.Accessor).fromPtr(s) else null,
             .delegate = if (p.delegate) |e| FF(ast.Expr).fromPtr(e) else null,
@@ -590,7 +590,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
             continue;
         }
         supertype_names[i] = t.name.name;
-        supertype_paths[i] = t.qualified_path;
+        supertype_paths[i] = t.x().qualified_path;
     }
 
     // Local classes register after the class graph is linked, so connect their
@@ -651,11 +651,11 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
 
     // ClassDef convention: an init block's position is the body-property index
     // it runs before, so construction interleaves them in declaration order.
-    const ib_blocks = try allocator.alloc(FF(ast.Block), class.init_blocks.len);
-    const ib_positions = try allocator.alloc(usize, class.init_blocks.len);
-    for (class.init_blocks, 0..) |*blk, idx| {
+    const ib_blocks = try allocator.alloc(FF(ast.Block), class.x().init_blocks.len);
+    const ib_positions = try allocator.alloc(usize, class.x().init_blocks.len);
+    for (class.x().init_blocks, 0..) |*blk, idx| {
         ib_blocks[idx] = FF(ast.Block).fromPtr(blk);
-        const member_pos = if (idx < class.init_block_positions.len) class.init_block_positions[idx] else class.members.len;
+        const member_pos = if (idx < class.x().init_block_positions.len) class.x().init_block_positions[idx] else class.members.len;
         const upto = @min(member_pos, class.members.len);
         var prop_pos: usize = 0;
         for (class.members[0..upto]) |*m| {
@@ -674,7 +674,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
             for (class.type_params, names) |*tp, *out| out.* = tp.name.name;
             break :blk names;
         },
-        .type_param_bounds = try build.classTypeParamBoundHeads(allocator, class.type_params, class.where_bounds),
+        .type_param_bounds = try build.classTypeParamBoundHeads(allocator, class.type_params, class.x().where_bounds),
         .primary_params = primary_params,
         .methods = &.{},
         .body_properties = try body_props.toOwnedSlice(allocator),
@@ -759,7 +759,7 @@ fn lowerAndRegisterMethods(
     for (class.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
-        if (p.ty) |*ty| {
+        if (p.ty) |ty| {
             try prop_heads.append(allocator, .{
                 .owner = class.name.name,
                 .name = p.name.name,
@@ -863,7 +863,7 @@ fn lowerAndRegisterMethods(
                 if (p.init) |init_expr| {
                     // Declaring the primary params binds a bare name to the ctor
                     // param, even one the property shadows.
-                    var thunk = host_instances.synthThunk(p.name, .{ .Expr = init_expr }, null, false);
+                    var thunk = host_instances.synthThunk(p.name, .{ .Expr = init_expr.* }, null, false);
                     const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
                     for (class.primary_params, 0..) |*pp, pi| {
                         tparams[pi] = .{
@@ -924,7 +924,7 @@ fn lowerAndRegisterMethods(
     }
     // `init { … }` blocks lower as thunks over `this` under `$init$block$<idx>`,
     // run with the captured cells bound.
-    for (class.init_blocks, 0..) |*blk, idx| {
+    for (class.x().init_blocks, 0..) |*blk, idx| {
         const thunk_name: ast.Ident = .{
             .name = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx}),
             .span = blk.span,
@@ -1288,7 +1288,7 @@ fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Cl
                 else => {},
             }
         }
-        for (class.init_blocks, 0..) |_, idx| {
+        for (class.x().init_blocks, 0..) |_, idx| {
             const nm = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx});
             const key = try anonKey(allocator, class.name.name, nm);
             if (tbl.get().getPtr(key)) |entry| {

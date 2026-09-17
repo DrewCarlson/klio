@@ -301,7 +301,7 @@ fn rejectsLoopShape(ctx: *const LoopCtx) bool {
     var unsupported_shape = false;
     for (body) |bid| {
         const blk = &func.blocks[bid.int()];
-        if (blk.catches.len != 0 or blk.finally != null) return true;
+        if (blk.h().catches.len != 0 or blk.h().finally != null) return true;
         switch (blk.terminator) {
             .Goto, .Branch => {},
             else => return true,

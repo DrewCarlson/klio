@@ -516,7 +516,7 @@ fn validateBodyShape(ctx: *FuncCtx) Allocator.Error!bool {
 fn rejectsBlockShape(ctx: *const FuncCtx, blk: *const ir.Block) bool {
     const func = ctx.func;
     const recv_regs = ctx.recv_regs;
-    if (blk.catches.len != 0 or blk.finally != null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4163\n", .{func.name}); return true; }
+    if (blk.h().catches.len != 0 or blk.h().finally != null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4163\n", .{func.name}); return true; }
     switch (blk.terminator) {
         .Goto, .Branch, .Return => {},
         else => { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4166\n", .{func.name}); return true; },

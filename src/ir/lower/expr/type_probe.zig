@@ -777,7 +777,7 @@ pub fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg
         .name = getter,
         .args = args_start,
         .n_args = 2,
-        .arg_names = &.{},
+        .extra = try b.memberExtra(.{ .arg_names = &.{} }),
     } });
     return dst;
 }

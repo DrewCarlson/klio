@@ -125,6 +125,27 @@ pub fn errWithFactory(
     p.diagnostics.emit(p.allocator, d) catch {};
 }
 
+/// A type reference's boxed extras, null when both are at their defaults.
+pub fn typeRefExtra(p: *Parser, e: ast.TypeRefExtra) ?*const ast.TypeRefExtra {
+    return ast.typeRefExtra(p.allocator, e) catch @panic("OOM in parser");
+}
+
+pub fn classExtra(p: *Parser, e: ast.ClassExtra) ?*const ast.ClassExtra {
+    return ast.classExtra(p.allocator, e) catch @panic("OOM in parser");
+}
+
+/// `boxed` over an optional: null stays null.
+pub fn boxedOpt(p: *Parser, value: anytype) ?*@TypeOf(value.?) {
+    return if (value) |v| boxed(p, v) else null;
+}
+
+/// A boxed node for a pointer payload of the AST, on the parser's allocator.
+pub fn boxed(p: *Parser, value: anytype) *@TypeOf(value) {
+    const ptr = p.allocator.create(@TypeOf(value)) catch @panic("OOM in parser");
+    ptr.* = value;
+    return ptr;
+}
+
 pub fn expect(p: *Parser, kind: TokenKind, what: []const u8) ?Token {
     skipNl(p);
     if (std.meta.activeTag(peekKind(p).*) == std.meta.activeTag(kind)) {
@@ -213,7 +234,7 @@ fn lexAndMake(arena: std.mem.Allocator, src: []const u8) !*Parser {
     var lx = try lexer.Lexer.init(arena, id, src);
     const res = try lx.tokenize();
     // The lex result's allocations leak into the arena, freed by the caller.
-    return Parser.new(arena, id, src, res.tokens);
+    return Parser.new(arena, id, src, res.tokens, res.strings);
 }
 
 test "peek and bump advance the cursor" {

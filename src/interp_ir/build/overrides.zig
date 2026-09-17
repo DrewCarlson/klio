@@ -714,7 +714,7 @@ fn repointAliasedNestedSupertypes(ctx: *BuildCtx) Allocator.Error!void {
         for (all_decls.items) |*d| {
             if (d.* != .Class) continue;
             for (d.Class.supertypes) |*t| {
-                if (t.qualified_path != null) continue;
+                if (t.x().qualified_path != null) continue;
                 var owner: ?[]const u8 = d.Class.name.name;
                 var hops: usize = 0;
                 while (owner) |o| : (hops += 1) {
@@ -906,7 +906,7 @@ fn registerConstInitializers(ctx: *BuildCtx) Allocator.Error!void {
             switch (d.*) {
                 .Class => |*c| try collectConsts(module, c.name.name, c.members),
                 .Property => |p| if (p.is_const) {
-                    if (p.init) |*init| {
+                    if (p.init) |init| {
                         if (literalToConst(init)) |cst| {
                             try module.registry.class_const_inits.put(.{ .a = "", .b = p.name.name }, cst);
                         }
@@ -1055,7 +1055,7 @@ fn registerClassPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!voi
 
 /// The type a class body property states, annotated or inferred from its initializer.
 fn declaredMemberPropType(c: *const ast.Class, prop: *const ast.Property) ?*const ast.TypeRef {
-    if (prop.ty) |*t| return t;
+    if (prop.ty) |t| return t;
     const src = propHeadSourceExpr(prop) orelse return null;
     // `private val _start = start` beside `class R(start: Double)` is the parameter's type.
     if (src.* == .Path and src.Path.segments.len == 1 and
@@ -1074,7 +1074,7 @@ fn declaredMemberPropType(c: *const ast.Class, prop: *const ast.Property) ?*cons
     for (c.members) |*fm| {
         if (fm.* != .Function) continue;
         if (!std.mem.eql(u8, fm.Function.name.name, fname)) continue;
-        if (fm.Function.return_type) |*rt| return rt;
+        if (fm.Function.return_type) |rt| return rt;
         return null;
     }
     // A FUNCTION-TYPED ctor property invoked as the initializer takes the function type's return.
@@ -1101,9 +1101,9 @@ fn registerClassMemberPropTypeHeads(ctx: *BuildCtx, c: *ast.Class, cfqn: []const
             }
         } else if (propCtorHeadEvidence(prop, decls, module, c)) |head| {
             try putClassPropHead(module, c.name.name, cfqn, prop.name.name, head);
-        } else if (prop.init != null and memberSizedInitHead(c, &prop.init.?) != null) {
-            try putClassPropHead(module, c.name.name, cfqn, prop.name.name, memberSizedInitHead(c, &prop.init.?).?);
-        } else if (prop.init) |*init| {
+        } else if (prop.init != null and memberSizedInitHead(c, prop.init.?) != null) {
+            try putClassPropHead(module, c.name.name, cfqn, prop.name.name, memberSizedInitHead(c, prop.init.?).?);
+        } else if (prop.init) |init| {
             if (literalTypeHead(init)) |head| {
                 try putClassPropHead(module, c.name.name, cfqn, prop.name.name, head);
             }
@@ -1131,12 +1131,12 @@ fn registerNestedClassPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Err
         for (nested.members) |*nmem| {
             if (nmem.* != .Property) continue;
             const nprop = nmem.Property;
-            if (nprop.ty) |*ty| {
+            if (nprop.ty) |ty| {
                 if (classPropHead(nested, ty)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = nested.name.name, .b = nprop.name.name }, head);
                     try notePropTypeRef(a, module, nested, nprop.name.name, ty);
                 }
-            } else if (nprop.init) |*init| {
+            } else if (nprop.init) |init| {
                 if (literalTypeHead(init)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = nested.name.name, .b = nprop.name.name }, head);
                 }
@@ -1158,9 +1158,9 @@ fn registerCompanionPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error
         for (cobj.members) |*om| {
             if (om.* != .Property) continue;
             const cprop = om.Property;
-            if (cprop.ty) |*ty| {
-                try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, ty.qualified_path orelse ty.name.name);
-            } else if (cprop.init) |*init| {
+            if (cprop.ty) |ty| {
+                try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, ty.x().qualified_path orelse ty.name.name);
+            } else if (cprop.init) |init| {
                 if (literalTypeHead(init)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
                 } else if (propCtorHeadEvidence(cprop, decls, module, c)) |head| {
@@ -1181,8 +1181,8 @@ fn registerObjectPropTypeHeads(ctx: *BuildCtx, o: *ast.ObjectDecl) Allocator.Err
     for (o.members) |*m| {
         if (m.* != .Property) continue;
         const prop = m.Property;
-        if (prop.ty) |*ty| {
-            try putClassPropHead(module, o.name.name, ofqn, prop.name.name, ty.qualified_path orelse ty.name.name);
+        if (prop.ty) |ty| {
+            try putClassPropHead(module, o.name.name, ofqn, prop.name.name, ty.x().qualified_path orelse ty.name.name);
         } else if (propCtorHeadEvidence(prop, decls, module, null)) |head| {
             try putClassPropHead(module, o.name.name, ofqn, prop.name.name, head);
         }
@@ -1713,12 +1713,12 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
     const stub_ids = &ctx.stub_ids;
     const id = module.nextFuncId();
     const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
-    const receiver_ty: ?ir.TypeRef = if (f.receiver_type) |*rt|
+    const receiver_ty: ?ir.TypeRef = if (f.receiver_type) |rt|
         try ir.lower.decl.loweredTypeRef(a, rt, true)
     else
         null;
-    const receiver_abi_name: ?[]const u8 = if (f.receiver_type) |*rt|
-        rt.qualified_path orelse rt.name.name
+    const receiver_abi_name: ?[]const u8 = if (f.receiver_type) |rt|
+        rt.x().qualified_path orelse rt.name.name
     else
         null;
     const host_symbol = stdlib.declarationHostSymbol(
@@ -1733,7 +1733,7 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
         .fqn = fqn,
         .package = decl_pkg.get(f.span) orelse packageOfFqn(fqn, f.name.name),
         .params = stub_params,
-        .return_ty = if (f.return_type) |*rt|
+        .return_ty = if (f.return_type) |rt|
             ir.lower.decl.renameParamHead(try ir.lower.decl.loweredTypeRef(a, rt, true), rt)
         else
             ir.build.typeUnit(),
@@ -1745,8 +1745,6 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
         .is_tailrec = f.is_tailrec,
         .is_lambda = false,
         .is_inline = f.is_inline,
-        .capture_order = &.{},
-        .implicit_label = null,
         .low_priority = ir.lower.decl.isLowPriorityOverload(f),
         .deprecated_error = ir.lower.decl.annotationsAreDeprecatedError(f.annotations),
         .is_expect = f.is_expect,
@@ -1912,7 +1910,7 @@ fn registerCallableExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
         const recv = p.receiver_type orelse continue;
         const prop_ty = p.ty orelse continue;
         const fn_ty = prop_ty.function orelse continue;
-        const recv_name: []const u8 = if (recv.qualified_path) |qp|
+        const recv_name: []const u8 = if (recv.x().qualified_path) |qp|
             (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv.name.name)
         else
             recv.name.name;
@@ -2354,18 +2352,18 @@ fn lowerBodyPropertyThunks(
     const body_prop_cfqn = scope.cfqn;
     const body_prop_dual = scope.dual;
     // An explicit backing field's initializer IS the property's storage initializer.
-    const storage_init: ?*const ast.Expr = if (p.init) |*init|
+    const storage_init: ?*const ast.Expr = if (p.init) |init|
         init
     else if (p.explicit_field) |ef|
-        (if (ef.init) |*finit| finit else null)
+        (if (ef.init) |finit| finit else null)
     else
         null;
     const storage_init_ty: ?ast.TypeRef = if (p.init != null)
-        p.ty
+        ast.unbox(p.ty)
     else if (p.explicit_field) |ef|
-        (ef.ty orelse p.ty)
+        ast.unbox(ef.ty orelse p.ty)
     else
-        p.ty;
+        ast.unbox(p.ty);
     // A PRIVATE stored property never participates in override dispatch, so the virtual property walk
     // can skip a foreign class's private field.
     if (p.visibility == .Private and p.getter == null) {
@@ -2409,7 +2407,7 @@ fn lowerBodyPropertyGetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property
                 const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body, c.name.name);
                 // The property's declared type is the expression body's expected type, which a getter returning a
                 // lambda needs to prove the lambda's parameter shape.
-                break :blk try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, own_members, &.{"this"}, rewritten, nm, p.ty);
+                break :blk try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, own_members, &.{"this"}, rewritten, nm, ast.unbox(p.ty));
             },
             .Block => |blk_body| blk: {
                 const rewritten = try lift.rewriteBlockField(a, &blk_body, p.name.name, c.name.name);
@@ -2446,8 +2444,8 @@ fn lowerBodyPropertySetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property
         const setter_param_name = if (setter.params.len != 0) setter.params[0].name else "value";
         const nm = try std.fmt.allocPrint(a, "__set_{s}_{s}", .{ c.name.name, p.name.name });
         // The value parameter's type is the property's declared type, so `value` resolves statically.
-        const vty_head: ?[]const u8 = if (p.ty) |*t| t.name.name else null;
-        const vty_nullable = if (p.ty) |*t| t.nullable else false;
+        const vty_head: ?[]const u8 = if (p.ty) |t| t.name.name else null;
+        const vty_nullable = if (p.ty) |t| t.nullable else false;
         const fid = switch (setter.body) {
             .Expr => |body| blk: {
                 const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body, c.name.name);
@@ -2557,7 +2555,7 @@ fn registerEnumClassEntries(ctx: *BuildCtx, c: *ast.Class, next_id: *u64) Alloca
     const enum_key = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
     const class_def = classes.get(enum_key) orelse classes.get(c.name.name) orelse return;
     var entries: std.ArrayList(ClassDef.EnumEntry) = .empty;
-    for (c.enum_entries, 0..) |*entry, ordinal| {
+    for (c.x().enum_entries, 0..) |*entry, ordinal| {
         try lowerEnumEntry(ctx, c, entry, ordinal, class_def, next_id, &entries);
     }
     const g = class_def.borrowMut();
@@ -2738,7 +2736,7 @@ fn lowerParentCtorArgThunks(ctx: *BuildCtx) Allocator.Error!void {
         const parent_args = first_parent_args orelse continue;
         // Argument labels parallel to `parent_args`, null where the call is all positional.
         const parent_names: ?[]const ?[]const u8 =
-            if (first_idx < c.supertype_arg_names.len) c.supertype_arg_names[first_idx] else null;
+            if (first_idx < c.x().supertype_arg_names.len) c.x().supertype_arg_names[first_idx] else null;
         var param_refs: std.ArrayList([]const u8) = .empty;
         defer param_refs.deinit(a);
         if (c.is_inner) try param_refs.append(a, "this");
@@ -2807,7 +2805,7 @@ fn lowerInitBlockThunks(ctx: *BuildCtx) Allocator.Error!void {
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
-        if (c.init_blocks.len == 0) continue;
+        if (c.x().init_blocks.len == 0) continue;
         var own_members = StringSet.init(a);
         defer own_members.deinit();
         for (c.primary_params) |*p| {
@@ -2829,7 +2827,7 @@ fn lowerInitBlockThunks(ctx: *BuildCtx) Allocator.Error!void {
         defer local_params.deinit(a);
         try local_params.append(a, "this");
         for (c.primary_params) |*p| try local_params.append(a, p.name.name);
-        var fids = try a.alloc(FuncId, c.init_blocks.len);
+        var fids = try a.alloc(FuncId, c.x().init_blocks.len);
         const ib_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
         const prev_ib_pkg = ir.lower.decl.setLowerSelfPackage(ib_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_ib_pkg);
@@ -2846,7 +2844,7 @@ fn lowerInitBlockThunks(ctx: *BuildCtx) Allocator.Error!void {
             module.classes.items[cid.int()].primary_params
         else
             &.{};
-        for (c.init_blocks, 0..) |*blk, idx| {
+        for (c.x().init_blocks, 0..) |*blk, idx| {
             const nm = try std.fmt.allocPrint(a, "__init_block_{s}_{d}", .{ c.name.name, idx });
             module.pending_param_types = ib_types;
             fids[idx] = try ir.lower.lowerInitBlockWithParams(module, c.name.name, &own_members, local_params.items, ib_param_types, blk, nm);
@@ -2902,7 +2900,7 @@ fn lowerSecondaryCtors(ctx: *BuildCtx) Allocator.Error!void {
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
-        if (c.secondary_ctors.len == 0) continue;
+        if (c.x().secondary_ctors.len == 0) continue;
         try lowerClassSecondaryCtors(ctx, c);
     }
 }
@@ -2978,8 +2976,8 @@ fn lowerClassSecondaryCtors(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void 
             if (!own_arity.contains(pn.*)) try own_arity.put(pn.*, 0);
         }
     }
-    var entries = try a.alloc(SecondaryCtorEntry, c.secondary_ctors.len);
-    for (c.secondary_ctors, 0..) |*sc, sc_idx| {
+    var entries = try a.alloc(SecondaryCtorEntry, c.x().secondary_ctors.len);
+    for (c.x().secondary_ctors, 0..) |*sc, sc_idx| {
         entries[sc_idx] = try lowerSecondaryCtor(ctx, c, sc, sc_idx, &own_members, &own_arity);
     }
     try secondary_ctors.put(c.name.name, entries);
@@ -3159,9 +3157,9 @@ fn lowerTopLevelConstProps(ctx: *BuildCtx) Allocator.Error!void {
         const tp_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_tp_pkg = ir.lower.decl.setLowerSelfPackage(tp_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_tp_pkg);
-        if (p.init) |*init| {
+        if (p.init) |init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
-            const fid = try ir.lower.lowerExprAsThunkTyped(module, init, nm, p.ty);
+            const fid = try ir.lower.lowerExprAsThunkTyped(module, init, nm, ast.unbox(p.ty));
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .file = p.span.file.int() });
         }
     }
@@ -3183,10 +3181,10 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
         const tp_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_tp_pkg = ir.lower.decl.setLowerSelfPackage(tp_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_tp_pkg);
-        const storage_init: ?*const ast.Expr = if (p.init) |*init|
+        const storage_init: ?*const ast.Expr = if (p.init) |init|
             init
         else if (p.explicit_field) |ef|
-            (if (ef.init) |*finit| finit else null)
+            (if (ef.init) |finit| finit else null)
         else
             null;
         // A custom accessor next to real storage moves the storage binding to the raw
@@ -3199,10 +3197,10 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
             p.name.name;
         if (storage_init) |init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
-            const fid = try ir.lower.lowerExprAsThunkTyped(module, init, nm, p.ty);
+            const fid = try ir.lower.lowerExprAsThunkTyped(module, init, nm, ast.unbox(p.ty));
             // Annotated: default from the declared type. Unannotated: infer from a trivially-typed literal
             // initializer so a forward read observes the typed field default, as kotlinc does.
-            const dflt = if (p.ty) |*t| typedDefaultFor(t) else typedDefaultForInit(init);
+            const dflt = if (p.ty) |t| typedDefaultFor(t) else typedDefaultForInit(init);
             try top_level_props.append(a, .{ .name = storage_name, .func = fid, .default = dflt, .file = p.span.file.int() });
         } else if (p.delegate) |delegate| {
             try top_level_delegated_props.put(p.name.name, {});
@@ -3347,7 +3345,7 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const st
     // A `val X.Companion.foo` records `qualified_path = "X.Companion"` and is keyed under that path,
     // so it never collides with a plain `val X.foo`. A function-type receiver keys under `Function`.
     if (recv.function != null) recv_name = "Function";
-    const recv_key: []const u8 = if (recv.qualified_path) |qp|
+    const recv_key: []const u8 = if (recv.x().qualified_path) |qp|
         (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv_name)
     else
         recv_name;
@@ -3362,7 +3360,7 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const st
     else
         null;
     if (p.getter) |getter| {
-        try lowerExtensionPropGetter(ctx, epd, p, getter, recv, recv_name, recv_key, ep_pkg, dispatch_owner);
+        try lowerExtensionPropGetter(ctx, epd, p, getter, recv.*, recv_name, recv_key, ep_pkg, dispatch_owner);
     }
     if (p.delegate) |delegate| {
         // `val R.x by expr` has no accessor bodies: the delegate object, produced once by this thunk and
@@ -3408,8 +3406,8 @@ fn lowerExtensionPropGetter(
     module.pending_accessor_this_label = p.name.name;
     module.pending_accessor_dispatch_owner = dispatch_owner;
     const fid = switch (getter.body) {
-        .Expr => |body| try ir.lower.lowerAccessorExprWithExpected(module, recv_name, &empty_members, &.{"this"}, &body, nm, p.ty),
-        .Block => |blk| try ir.lower.lowerAccessorBlockRet(module, recv_name, &empty_members, &.{"this"}, &blk, nm, p.ty),
+        .Expr => |body| try ir.lower.lowerAccessorExprWithExpected(module, recv_name, &empty_members, &.{"this"}, &body, nm, ast.unbox(p.ty)),
+        .Block => |blk| try ir.lower.lowerAccessorBlockRet(module, recv_name, &empty_members, &.{"this"}, &blk, nm, ast.unbox(p.ty)),
     };
     if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
         if (std.mem.eql(u8, w, p.name.name))

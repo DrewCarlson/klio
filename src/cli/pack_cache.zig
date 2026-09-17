@@ -286,7 +286,7 @@ const ParseJob = struct {
     };
 
     /// An owned copy of a token range of the file, ending in `Eof`.
-    const Piece = struct { of: usize, index: usize, tokens: []Token };
+    const Piece = struct { of: usize, index: usize, tokens: []Token, strings: []const []const u8 };
 };
 
 const Token = lexer.Token;
@@ -379,7 +379,7 @@ fn pieceTokens(allocator: Allocator, tokens: []const Token, from: usize, to: usi
 fn runParseJob(allocator: Allocator, pool: ?*ParsePool, index: usize, job: *ParseJob) void {
     const t0 = runtime.clockMonotonicNanos();
     if (job.piece) |piece| {
-        const p = parser.Parser.new(allocator, job.fid, job.src, piece.tokens);
+        const p = parser.Parser.new(allocator, job.fid, job.src, piece.tokens, piece.strings);
         const file_ast = p.parseFile();
         job.parse_ns = runtime.clockMonotonicNanos() - t0;
         job.result = if (p.diagnostics.hasErrors()) .{ .parse_errors = p } else .{ .ok = file_ast };
@@ -395,13 +395,13 @@ fn runParseJob(allocator: Allocator, pool: ?*ParsePool, index: usize, job: *Pars
         return;
     }
     if (pool != null and job.src.len >= chunk_min_bytes) {
-        const count = pool.?.addPieces(index, lexed.tokens);
+        const count = pool.?.addPieces(index, lexed.tokens, lexed.strings);
         if (count >= 2) {
             job.result = .{ .pieces = .{ .count = count, .lexed = lexed } };
             return;
         }
     }
-    const p = parser.Parser.new(allocator, job.fid, job.src, lexed.tokens);
+    const p = parser.Parser.new(allocator, job.fid, job.src, lexed.tokens, lexed.strings);
     var file_ast = p.parseFile();
     if (p.diagnostics.hasErrors()) {
         job.result = .{ .parse_errors = p };
@@ -475,7 +475,7 @@ const ParsePool = struct {
     }
 
     /// Cuts `lexed` into piece jobs for file job `of`; the count added.
-    fn addPieces(self: *ParsePool, of: usize, lexed: []const Token) usize {
+    fn addPieces(self: *ParsePool, of: usize, lexed: []const Token, strings: []const []const u8) usize {
         const job = self.jobs.items[of];
         const cuts = pieceCuts(self.allocator, lexed, job.src) catch return 0;
         if (cuts.len == 0) return 0;
@@ -501,7 +501,7 @@ const ParsePool = struct {
                 .fid = job.fid,
                 .src = job.src,
                 .rel_path = job.rel_path,
-                .piece = .{ .of = of, .index = index, .tokens = tokens },
+                .piece = .{ .of = of, .index = index, .tokens = tokens, .strings = strings },
             });
             index += 1;
             from = to;
@@ -662,7 +662,7 @@ fn checkPiecesAgainstWhole(allocator: Allocator, job: *const ParseJob, pieced: *
     var lx = lexer.Lexer.init(allocator, job.fid, job.src) catch return;
     var lexed = lx.tokenize() catch return;
     defer lexed.deinit(allocator);
-    const p = parser.Parser.new(allocator, job.fid, job.src, lexed.tokens);
+    const p = parser.Parser.new(allocator, job.fid, job.src, lexed.tokens, lexed.strings);
     const whole = p.parseFile();
     if (whole.decls.len != pieced.decls.len) {
         std.debug.print("[parse-check] {s}: {d} declarations whole, {d} in pieces\n", .{ job.rel_path, whole.decls.len, pieced.decls.len });
@@ -2729,7 +2729,7 @@ test "rebaseFileSpans retargets every span in a parsed file" {
     var lx = try lexer.Lexer.init(aa, old, src);
     const lexed = try lx.tokenize();
     try std.testing.expect(!lexed.diagnostics.hasErrors());
-    const p = parser.Parser.new(aa, old, src, lexed.tokens);
+    const p = parser.Parser.new(aa, old, src, lexed.tokens, lexed.strings);
     var file = p.parseFile();
     try std.testing.expect(!p.diagnostics.hasErrors());
     try std.testing.expectEqual(old, file.span.file);

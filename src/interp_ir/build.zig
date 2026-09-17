@@ -235,8 +235,6 @@ test "multi-file assembly retains packaged typealias identities" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     var decls = [_]ast.Decl{.{ .TypeAlias = .{
         .name = .{ .name = "Counter", .span = s },
@@ -311,8 +309,6 @@ test "class type-parameter metadata includes where bounds and unbounded identiti
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const comparable_ty = ast.TypeRef{
         .name = .{ .name = "Comparable", .span = s },
@@ -321,8 +317,6 @@ test "class type-parameter metadata includes where bounds and unbounded identiti
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const string_ty = ast.TypeRef{
         .name = .{ .name = "String", .span = s },
@@ -331,8 +325,6 @@ test "class type-parameter metadata includes where bounds and unbounded identiti
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const comparable_args = [_]ast.TypeArg{.{
         .variance = .Invariant,
@@ -347,8 +339,6 @@ test "class type-parameter metadata includes where bounds and unbounded identiti
         .type_args = @constCast(&comparable_args),
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const params = [_]ast.TypeParam{
         .{
@@ -381,9 +371,10 @@ test "class type-parameter metadata includes where bounds and unbounded identiti
         .bound = comparable_ty,
         .span = s,
     }};
+    const extra: ast.ClassExtra = .{ .where_bounds = @constCast(&where_bounds) };
     var class: ast.Class = undefined;
     class.type_params = @constCast(&params);
-    class.where_bounds = @constCast(&where_bounds);
+    class.extra = &extra;
 
     const bounds = (try collectClassTypeParamBounds(testing.allocator, &class)).?;
     defer testing.allocator.free(bounds);
@@ -412,8 +403,6 @@ test "expect class member defaults transplant to the matching actual signature" 
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     var default_expr = ast.Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = s } };
     var expected_param: ast.Param = undefined;

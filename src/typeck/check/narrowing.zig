@@ -73,6 +73,9 @@ pub fn lookup(self: *const Checker, name: []const u8) ?*const Binding {
             return b;
         }
     }
+    if (self.shared_globals) |g| {
+        if (g.getPtr(name)) |b| return b;
+    }
     return null;
 }
 
@@ -385,8 +388,8 @@ pub fn synthesizeClassInitBody(self: *const Checker, c: *const Class) Allocator.
                 .mutable = p.property == true,
                 .name = p.name,
                 .receiver_type = null,
-                .ty = p.ty,
-                .init = Expr{ .Path = .{ .segments = segments, .span = p.name.span } },
+                .ty = try ast.box(self.allocator, p.ty),
+                .init = try ast.box(self.allocator, Expr{ .Path = .{ .segments = segments, .span = p.name.span } }),
                 .delegate = null,
                 .getter = null,
                 .setter = null,
@@ -405,7 +408,7 @@ pub fn synthesizeClassInitBody(self: *const Checker, c: *const Class) Allocator.
             };
             const sp = try self.allocator.create(Property);
             sp.* = shadow;
-            try stmts.append(self.allocator, .{ .Decl = .{ .Property = sp } });
+            try stmts.append(self.allocator, .{ .Decl = try ast.box(self.allocator, ast.Decl{ .Property = sp }) });
         }
     }
     // Source order interleaves initializers with init blocks correctly.
@@ -415,10 +418,10 @@ pub fn synthesizeClassInitBody(self: *const Checker, c: *const Class) Allocator.
             if (p.getter != null or p.delegate != null) {
                 continue;
             }
-            try stmts.append(self.allocator, .{ .Decl = .{ .Property = p } });
+            try stmts.append(self.allocator, .{ .Decl = try ast.box(self.allocator, ast.Decl{ .Property = p }) });
         }
     }
-    for (c.init_blocks) |*ib| {
+    for (c.x().init_blocks) |*ib| {
         for (ib.stmts) |s| {
             try stmts.append(self.allocator, s);
         }
@@ -531,6 +534,15 @@ pub fn cfgIsUnreachableAt(self: *Checker, query_span: Span) Allocator.Error!?boo
 pub fn cfgDeclaredTypes(self: *const Checker, allocator: Allocator) Allocator.Error!DeclaredTypes {
     var out = DeclaredTypes{ .entries = .empty };
     errdefer out.deinit(allocator);
+    if (self.shared_globals) |g| {
+        var git = g.iterator();
+        while (git.next()) |e| {
+            try out.entries.append(allocator, .{
+                .key = Place{ .Local = .{ .name = e.key_ptr.* } },
+                .value = e.value_ptr.ty,
+            });
+        }
+    }
     for (self.frames.items) |*frame| {
         var it = frame.bindings.iterator();
         while (it.next()) |e| {

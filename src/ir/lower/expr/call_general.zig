@@ -498,7 +498,7 @@ const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
 const dst = b.allocReg();
 const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
 orEmitAudit(b, "inline_splice_recv_walk", "CallMemberOrGlobal", nm);
-try b.push(.{ .CallMemberOrGlobal = .{
+try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
     .dst = dst,
     .this_idx = 0,
     .name = nmc,
@@ -515,7 +515,7 @@ try b.push(.{ .CallMemberOrGlobal = .{
     // receivers; a static head would pin the strict-ext arm to
     // the subject where the walk should fall outward.
     .static_recv = if (b.encl_tower_depth > 0) null else try cmgStaticRecv(b),
-} });
+}) });
 return dst;
 }
 
@@ -539,7 +539,7 @@ if (b.resolve("this")) |bound_this| {
     const dst = b.allocReg();
     const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
     orEmitAudit(b, "inline_splice_unknown_recv", "CallMemberOrGlobal", nm);
-    try b.push(.{ .CallMemberOrGlobal = .{
+    try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
         .dst = dst,
         .this_idx = 0,
         .name = nmc,
@@ -553,7 +553,7 @@ if (b.resolve("this")) |bound_this| {
         // receivers; a static head would pin the strict-ext arm to
         // the subject where the walk should fall outward.
         .static_recv = if (b.encl_tower_depth > 0) null else try cmgStaticRecv(b),
-    } });
+    }) });
     return dst;
 } else if (b.knowsOuter("this") or b.capturesThisSlot()) {
     const run = try lowerArgRun(b, args);
@@ -562,7 +562,7 @@ if (b.resolve("this")) |bound_this| {
     const dst = b.allocReg();
     const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
     orEmitAudit(b, "inline_splice_unknown_recv", "CallMemberOrGlobal", nm);
-    try b.push(.{ .CallMemberOrGlobal = .{
+    try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
         .dst = dst,
         .this_idx = this_idx,
         .name = nmc,
@@ -572,7 +572,7 @@ if (b.resolve("this")) |bound_this| {
         .arg_names = arg_names,
         .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
-    } });
+    }) });
     return dst;
 }
     return null;
@@ -811,10 +811,9 @@ fn tryCtorParamVarargShadow(g: *GenCtx) Allocator.Error!?Reg {
                 .dst = dst,
                 .receiver = this_reg,
                 .name = nmc,
-                .trailing_lambda = b.callTrailingLambda(),
                 .args = run[0],
                 .n_args = run[1],
-                .arg_names = arg_names,
+                .extra = try b.memberExtra(.{ .trailing_lambda = b.callTrailingLambda(), .arg_names = arg_names }),
             } });
             return dst;
         }
@@ -1188,7 +1187,7 @@ if (shadowed_by_class or force_static_class or static_sam) {
             .name = nm,
             .args = run[0],
             .n_args = run[1],
-            .arg_names = arg_names,
+            .extra = try b.memberExtra(.{ .arg_names = arg_names }),
         } });
         return dst;
     }
@@ -1214,7 +1213,7 @@ if (shadowed_by_class or force_static_class or static_sam) {
     const this_idx = try b.recordCapture("this");
     const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
     orEmitAudit(b, "class_or_factory_call", "CallMemberOrGlobal", callee.Path.segments[0].name);
-    try b.push(.{ .CallMemberOrGlobal = .{
+    try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
         .dst = dst,
         .this_idx = this_idx,
         .name = nmc,
@@ -1224,7 +1223,7 @@ if (shadowed_by_class or force_static_class or static_sam) {
         .class = class_id,
         .candidates = try cmgCandidates(b, callee.Path.segments[0].name, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
-    } });
+    }) });
 }
 return dst;
 }

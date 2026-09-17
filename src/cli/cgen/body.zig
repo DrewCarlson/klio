@@ -116,7 +116,7 @@ pub fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, pr
     defer gpa.free(points);
     var has_catch = false;
     for (f.blocks) |*blk| {
-        if (blk.catches.len != 0) has_catch = true;
+        if (blk.h().catches.len != 0) has_catch = true;
     }
     const ctx: Body = .{
         .gpa = gpa,
@@ -147,8 +147,8 @@ pub fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, pr
     for (f.blocks, 0..) |*blk, bi| {
         if (!live[bi]) continue;
         try w.print("B{d}:;\n", .{bi});
-        if (blk.catch_done_for != null) try w.writeAll("  klio_try_disarm();\n");
-        if (blk.catches.len != 0) try writeCatchLandingPad(&ctx, blk, bi);
+        if (blk.h().catch_done_for != null) try w.writeAll("  klio_try_disarm();\n");
+        if (blk.h().catches.len != 0) try writeCatchLandingPad(&ctx, blk, bi);
         for (blk.insts) |*inst| try writeInst(&ctx, inst);
         try writeTerminator(&ctx, blk, bi, has_catch);
     }
@@ -294,7 +294,7 @@ fn writeCatchLandingPad(ctx: *const Body, blk: *const ir.Block, bi: usize) !void
     try w.print("  if (setjmp(KT{d}.jb) != 0) {{\n", .{bi});
     try w.print("    klio_nat_frame_restore(KM{d});\n", .{bi});
     try w.writeAll("    klio_try_disarm();\n");
-    for (blk.catches) |h| {
+    for (blk.h().catches) |h| {
         var eb: [32]u8 = undefined;
         const ht = prog.throws.find(h.type_name).?;
         try w.print("    if (klio_nat_catches(klio_in_flight, {d}, {d})) {{ {s} = klio_in_flight; goto B{d}; }} /* {s} */\n", .{

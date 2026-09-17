@@ -156,7 +156,7 @@ pub const Walker = struct {
                 try w.walkExpr(e);
                 if (w.thread and !w.explicit_groups) w.wrapStatementConditional(e);
             },
-            .Assign => |*asg| {
+            .Assign => |asg| {
                 try w.walkExpr(&asg.target);
                 // `content.value = { … }` on a `MutableState<@Composable fn>` val: composable by the
                 // state's declared type, so it wraps and a swapped content invalidates.
@@ -176,8 +176,8 @@ pub const Walker = struct {
                 }
                 try w.walkExpr(&asg.value);
             },
-            .DestructuringDecl => |*d| try w.walkExpr(&d.init),
-            .Decl => |*d| try w.walkDecl(d),
+            .DestructuringDecl => |d| try w.walkExpr(&d.init),
+            .Decl => |d| try w.walkDecl(d),
         }
     }
 
@@ -196,8 +196,8 @@ pub const Walker = struct {
                     }
                 }
                 // The declared type makes the initializer composable, or the literal is annotated.
-                if (p.init) |*ini| {
-                    if (p.ty != null and isComposableFnType(&p.ty.?)) {
+                if (p.init) |ini| {
+                    if (p.ty != null and isComposableFnType(p.ty.?)) {
                         try w.walkComposableValueExpr(
                             ini,
                             @intCast(@min(p.ty.?.function.?.params.len, 255)),
@@ -207,9 +207,9 @@ pub const Walker = struct {
                         if (root.emit_lambda_memo and !w.thread and ini.* == .Lambda) {
                             w.wrapInComposableLambdaInstance(ini);
                         }
-                    } else if (p.ty != null and stateOfComposableArity(&p.ty.?) != null) {
+                    } else if (p.ty != null and stateOfComposableArity(p.ty.?) != null) {
                         // The state's type argument makes every stored lambda composable.
-                        const arity = stateOfComposableArity(&p.ty.?).?;
+                        const arity = stateOfComposableArity(p.ty.?).?;
                         if (w.composable_state_vals == null) {
                             const m = w.a.create(std.StringHashMap(u8)) catch @panic("oom");
                             m.* = std.StringHashMap(u8).init(w.a);
@@ -231,7 +231,7 @@ pub const Walker = struct {
                         // No declared type: the literal's header is the arity, and a headerless literal is
                         // `() -> Unit`, since its parser-injected `it` never binds without an expected type.
                         const arity: u8 = if (ini.Lambda.implicit_it) 0 else @intCast(@min(ini.Lambda.params.len, 255));
-                        try w.transformComposableLambda(&ini.Lambda, arity, null);
+                        try w.transformComposableLambda(ini.Lambda, arity, null);
                     } else {
                         try w.walkExpr(ini);
                     }
@@ -239,8 +239,8 @@ pub const Walker = struct {
                 if (p.delegate) |del| try w.walkExpr(del);
                 // Such a val joins the scoped locals set, so a bare `content()` threads.
                 const holds_composable = blk: {
-                    if (p.ty != null and isComposableFnType(&p.ty.?)) break :blk true;
-                    if (p.init) |*ini2| {
+                    if (p.ty != null and isComposableFnType(p.ty.?)) break :blk true;
+                    if (p.init) |ini2| {
                         if (ini2.* == .Lambda and isComposable(ini2.Lambda.annotations)) break :blk true;
                     }
                     // `val current by rememberUpdatedState(content)` reads back a composable value.
@@ -263,7 +263,7 @@ pub const Walker = struct {
                     break :blk false;
                 };
                 if (!holds_composable) {
-                    if (p.init) |*ini3| {
+                    if (p.init) |ini3| {
                         if (ini3.* == .Call) {
                             if (calleeSimpleName(ini3.Call.callee)) |cn| {
                                 if (std.mem.eql(u8, cn, "movableContentOf") or
@@ -315,7 +315,7 @@ pub const Walker = struct {
                 }
                 const saved_ret = w.ret_composable;
                 const saved_rfp = w.ret_fn_params;
-                w.ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+                w.ret_composable = f.return_type != null and isComposableFnType(f.return_type.?);
                 w.wrap_ret_lambda = w.ret_composable and std.mem.startsWith(u8, f.name.name, "movableContent");
                 w.ret_fn_params = if (w.ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
                 defer {
@@ -325,7 +325,7 @@ pub const Walker = struct {
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
                     .Expr => |*e| if (w.ret_composable and e.* == .Lambda) {
-                        try w.transformComposableLambda(&e.Lambda, w.ret_fn_params, null);
+                        try w.transformComposableLambda(e.Lambda, w.ret_fn_params, null);
                         if (root.emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(e);
                     } else {
                         try w.walkExpr(e);
@@ -344,14 +344,14 @@ pub const Walker = struct {
         expected_params: u8,
     ) std.mem.Allocator.Error!void {
         switch (e.*) {
-            .Lambda => |*lam| try w.transformComposableLambda(lam, expected_params, null),
+            .Lambda => |lam| try w.transformComposableLambda(lam, expected_params, null),
             .If => |*f| {
                 try w.walkExpr(f.cond);
                 try w.walkComposableValueExpr(f.then_branch, expected_params);
                 if (f.else_branch) |else_branch|
                     try w.walkComposableValueExpr(else_branch, expected_params);
             },
-            .When => |*wh| {
+            .When => |wh| {
                 if (wh.subject) |subject| try w.walkExpr(subject);
                 for (wh.branches) |*branch| {
                     for (branch.patterns) |*pattern| switch (pattern.kind) {
@@ -362,7 +362,7 @@ pub const Walker = struct {
                     try w.walkComposableValueExpr(&branch.body, expected_params);
                 }
             },
-            .Try => |*tr| {
+            .Try => |tr| {
                 try w.walkComposableValueBlock(&tr.body, expected_params);
                 for (tr.catches) |*catch_clause|
                     try w.walkComposableValueBlock(&catch_clause.body, expected_params);
@@ -372,7 +372,7 @@ pub const Walker = struct {
             .Labeled => |*labeled| {
                 if (labeled.expr.* == .Lambda) {
                     try w.transformComposableLambda(
-                        &labeled.expr.Lambda,
+                        labeled.expr.Lambda,
                         expected_params,
                         labeled.label.name,
                     );
@@ -380,7 +380,7 @@ pub const Walker = struct {
                     try w.walkComposableValueExpr(labeled.expr, expected_params);
                 }
             },
-            .As => |*cast| try w.walkComposableValueExpr(cast.expr, expected_params),
+            .As => |cast| try w.walkComposableValueExpr(cast.expr, expected_params),
             .Binary => |*binary| {
                 if (binary.op == .Elvis) {
                     try w.walkComposableValueExpr(binary.lhs, expected_params);
@@ -454,7 +454,7 @@ pub const Walker = struct {
 
     pub fn wrapInComposableLambdaLabeled(w: *Walker, arg: *Expr, label: ?[]const u8) void {
         const key = positionalKey(exprSpanOf(arg));
-        if (arg.* == .Lambda) w.wrapLambdaBodyInPausePoint(&arg.Lambda);
+        if (arg.* == .Lambda) w.wrapLambdaBodyInPausePoint(arg.Lambda);
         // The memo remembers the impl in a slot of the current group; a child group here would
         // break `deactivateToEndGroup`.
         const args = w.a.alloc(Expr, 5) catch @panic("oom");
@@ -486,7 +486,7 @@ pub const Walker = struct {
     /// so it wraps in `composableLambdaInstance(key, true, block)`, whose invoke restarts.
     pub fn wrapInComposableLambdaInstance(w: *Walker, arg: *Expr) void {
         const key = positionalKey(exprSpanOf(arg));
-        if (arg.* == .Lambda) w.wrapLambdaBodyInPausePoint(&arg.Lambda);
+        if (arg.* == .Lambda) w.wrapLambdaBodyInPausePoint(arg.Lambda);
         const args = w.a.alloc(Expr, 3) catch @panic("oom");
         args[0] = w.b.intLit(key);
         args[1] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
@@ -516,9 +516,9 @@ pub const Walker = struct {
                     .Assign => |a| {
                         if (w.branchHasComposable(&a.value)) return true;
                     },
-                    .Decl => |d| switch (d) {
+                    .Decl => |d| switch (d.*) {
                         .Property => |pp| {
-                            if (pp.init) |*ini| if (w.branchHasComposable(ini)) return true;
+                            if (pp.init) |ini| if (w.branchHasComposable(ini)) return true;
                         },
                         else => {},
                     },
@@ -535,9 +535,9 @@ pub const Walker = struct {
                 for (lam.body.stmts) |*st| switch (st.*) {
                     .Expr => |*se| if (w.branchHasComposable(se)) return true,
                     .Assign => |as| if (w.branchHasComposable(&as.value)) return true,
-                    .Decl => |d| switch (d) {
+                    .Decl => |d| switch (d.*) {
                         .Property => |pp| {
-                            if (pp.init) |*ini| if (w.branchHasComposable(ini)) return true;
+                            if (pp.init) |ini| if (w.branchHasComposable(ini)) return true;
                         },
                         else => {},
                     },
@@ -615,7 +615,7 @@ pub const Walker = struct {
                     }
                 }
             },
-            .When => |*wh| {
+            .When => |wh| {
                 var any = false;
                 var has_else = false;
                 for (wh.branches) |*br| {
@@ -689,9 +689,9 @@ pub const Walker = struct {
                 for (blk.stmts) |*st| switch (st.*) {
                     .Expr => |*se| if (loopBodyEscapes(se)) return true,
                     .Assign => |a| if (loopBodyEscapes(&a.value)) return true,
-                    .Decl => |d| switch (d) {
+                    .Decl => |d| switch (d.*) {
                         .Property => |pp| {
-                            if (pp.init) |*ini| if (loopBodyEscapes(ini)) return true;
+                            if (pp.init) |ini| if (loopBodyEscapes(ini)) return true;
                         },
                         else => {},
                     },
@@ -752,7 +752,7 @@ pub const Walker = struct {
     /// compares equal, so the wrap bails when the body writes one, whose cell key is dead.
     fn memoizePlainLambdaArg(w: *Walker, arg: *Expr, callee_name: []const u8) void {
         if (arg.* != .Lambda) return;
-        const lam = &arg.Lambda;
+        const lam = arg.Lambda;
         var refs = std.StringHashMap(void).init(w.a);
         defer refs.deinit();
         var declared = std.StringHashMap(void).init(w.a);
@@ -774,13 +774,13 @@ pub const Walker = struct {
         }
         const calc_stmts = w.a.alloc(Stmt, 1) catch @panic("oom");
         calc_stmts[0] = .{ .Expr = arg.* };
-        const calc = Expr{ .Lambda = .{
+        const calc = Expr{ .Lambda = ast.box(w.a, ast.LambdaExpr{
             .params = &.{},
             .param_tys = &.{},
             .body = .{ .stmts = calc_stmts, .span = lam.span },
             .implicit_it = false,
             .span = lam.span,
-        } };
+        }) catch @panic("oom") };
         // kotlinc's zero-key-slot shape: when `$dirty` already carries every capture's change
         // state, the memo is `$composer.cache(<any capture changed>, calc)`.
         const memo_trace = root.memo_trace_enabled;
@@ -800,7 +800,7 @@ pub const Walker = struct {
                 .name = w.b.ident(nm),
                 .receiver_type = null,
                 .ty = null,
-                .init = arg.*,
+                .init = w.b.box(arg.*),
                 .delegate = null,
                 .getter = null,
                 .setter = null,
@@ -926,7 +926,7 @@ pub const Walker = struct {
             .name = w.b.ident("$key$v"),
             .receiver_type = null,
             .ty = null,
-            .init = call_expr,
+            .init = w.b.box(call_expr),
             .delegate = null,
             .getter = null,
             .setter = null,
@@ -945,7 +945,7 @@ pub const Walker = struct {
         };
         const stmts = w.a.alloc(ast.Stmt, 4) catch @panic("oom");
         stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startMovableGroup", start_args) };
-        stmts[1] = .{ .Decl = .{ .Property = result_prop } };
+        stmts[1] = .{ .Decl = ast.box(w.a, ast.Decl{ .Property = result_prop }) catch @panic("oom") };
         stmts[2] = .{ .Expr = w.b.callMember(w.composerRef(), "endMovableGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
         stmts[3] = .{ .Expr = w.b.pathExpr("$key$v") };
         e.* = .{ .Block = .{ .stmts = stmts, .span = sp } };
@@ -983,7 +983,7 @@ pub const Walker = struct {
                 .name = w.b.ident(result_name),
                 .receiver_type = null,
                 .ty = null,
-                .init = blk.stmts[tail_index].Expr,
+                .init = w.b.box(blk.stmts[tail_index].Expr),
                 .delegate = null,
                 .getter = null,
                 .setter = null,
@@ -1000,7 +1000,7 @@ pub const Walker = struct {
                 .annotations = &.{},
                 .span = w.b.gen_span,
             };
-            stmts[tail_index + 1] = .{ .Decl = .{ .Property = result_prop } };
+            stmts[tail_index + 1] = .{ .Decl = ast.box(w.a, ast.Decl{ .Property = result_prop }) catch @panic("oom") };
             stmts[tail_index + 2] = .{ .Expr = w.b.callMember(
                 w.composerRef(),
                 "endReplaceGroup",
@@ -1068,7 +1068,7 @@ pub const Walker = struct {
                                 const ti = pi + ta_off;
                                 if (ti >= c.type_args.len) break;
                                 const tref = &c.type_args[ti];
-                                if (tref.function != null and isComposable(tref.annotations) and
+                                if (tref.function != null and isComposable(tref.x().annotations) and
                                     !w.lambda_params.?.contains(lp2.name) and added_n < added_names.len)
                                 {
                                     w.lambda_params.?.put(lp2.name, {}) catch @panic("oom");
@@ -1099,7 +1099,7 @@ pub const Walker = struct {
                         calleeInlinesLambda(name.?))
                     {
                         // An inline callee's lambda body composes inline in the enclosing composable.
-                        if (!lambdaHasComposerParams(&arg.Lambda)) {
+                        if (!lambdaHasComposerParams(arg.Lambda)) {
                             // An inline lambda's params shadow same-named tripled fn params.
                             if (w.param_triples) |triples| {
                                 for (arg.Lambda.params) |lp2| {
@@ -1199,7 +1199,7 @@ pub const Walker = struct {
                 try w.walkExpr(dw.cond);
                 if (dw.body) |bd| w.wrapLoopContent(e, bd);
             },
-            .For => |*fr| {
+            .For => |fr| {
                 try w.walkExpr(fr.iter);
                 try w.walkExpr(fr.body);
                 w.wrapLoopContent(e, fr.body);
@@ -1207,7 +1207,7 @@ pub const Walker = struct {
             .Return => |*r| {
                 if (r.value) |v| {
                     if (w.ret_composable and v.* == .Lambda) {
-                        try w.transformComposableLambda(&v.Lambda, w.ret_fn_params, null);
+                        try w.transformComposableLambda(v.Lambda, w.ret_fn_params, null);
                         if (root.emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(v);
                     } else {
                         try w.walkExpr(v);
@@ -1225,7 +1225,7 @@ pub const Walker = struct {
                             .name = w.b.ident(tmp_name),
                             .receiver_type = null,
                             .ty = null,
-                            .init = rv.*,
+                            .init = w.b.box(rv.*),
                             .delegate = null,
                             .getter = null,
                             .setter = null,
@@ -1247,7 +1247,7 @@ pub const Walker = struct {
                         new_val.* = w.b.pathExpr(tmp_name);
                         ret_copy.value = new_val;
                         const stmts = try w.a.alloc(Stmt, 3);
-                        stmts[0] = .{ .Decl = .{ .Property = tmp_prop } };
+                        stmts[0] = .{ .Decl = try ast.box(w.a, ast.Decl{ .Property = tmp_prop }) };
                         stmts[1] = .{ .Expr = w.b.callMember(
                             w.composerRef(),
                             "endToMarker",
@@ -1272,12 +1272,12 @@ pub const Walker = struct {
             .Throw => |*t| try w.walkExpr(t.value),
             .Labeled => |*l| try w.walkExpr(l.expr),
             .Block => |*blk| try w.walkBlock(blk),
-            .Try => |*t| {
+            .Try => |t| {
                 try w.walkBlock(&t.body);
                 for (t.catches) |*ca| try w.walkBlock(&ca.body);
                 if (t.finally) |*fin| try w.walkBlock(fin);
             },
-            .When => |*wh| {
+            .When => |wh| {
                 if (wh.subject) |sub| try w.walkExpr(sub);
                 var any_composable = false;
                 for (wh.branches) |*br| {
@@ -1294,13 +1294,13 @@ pub const Walker = struct {
                     for (wh.branches) |*br| w.wrapBranchInReplaceGroup(&br.body);
                 }
             },
-            .IsCheck => |*ic| try w.walkExpr(ic.expr),
-            .As => |*as| try w.walkExpr(as.expr),
+            .IsCheck => |ic| try w.walkExpr(ic.expr),
+            .As => |as| try w.walkExpr(as.expr),
             .StringTemplate => |*st| for (st.parts) |*part| switch (part.*) {
                 .Interp => |ie| try w.walkExpr(ie),
                 else => {},
             },
-            .Lambda => |*lam| {
+            .Lambda => |lam| {
                 // The lambda body was already walked against its own composer, and a shared node must
                 // not thread twice. A plain value-position lambda is not composable content.
                 if (!lambdaHasComposerParams(lam)) {
@@ -1310,7 +1310,7 @@ pub const Walker = struct {
                     w.thread = saved;
                 }
             },
-            .AnonFun => |*af| if (af.body) |ab| switch (ab.*) {
+            .AnonFun => |af| if (af.body) |ab| switch (ab.*) {
                 .Block => |*blk| try w.walkBlock(blk),
                 .Expr => |*ex| try w.walkExpr(ex),
             },
@@ -1385,7 +1385,7 @@ pub const Walker = struct {
             .name = w.b.ident(marker_var),
             .receiver_type = null,
             .ty = null,
-            .init = w.b.member(w.composerRef(), "currentMarker"),
+            .init = w.b.box(w.b.member(w.composerRef(), "currentMarker")),
             .delegate = null,
             .getter = null,
             .setter = null,
@@ -1404,7 +1404,7 @@ pub const Walker = struct {
         };
         const old = lam.body.stmts;
         const stmts = w.a.alloc(Stmt, old.len + 1) catch @panic("oom");
-        stmts[0] = .{ .Decl = .{ .Property = prop } };
+        stmts[0] = .{ .Decl = ast.box(w.a, ast.Decl{ .Property = prop }) catch @panic("oom") };
         @memcpy(stmts[1..], old);
         lam.body.stmts = stmts;
     }

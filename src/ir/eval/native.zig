@@ -427,7 +427,7 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         const SiteCtor = struct { class: ir.ClassId, n_args: u32, arg_names: []const ?ir.ConstId, heads: []const ?ir.ConstId };
         const sc: SiteCtor = switch (sf.blocks[tbi].insts[tii]) {
             .NewInstance => |*ni| .{ .class = ni.class, .n_args = ni.n_args, .arg_names = ni.arg_names, .heads = ni.arg_static_heads },
-            .CallMemberOrGlobal => |*cg| if (cg.class) |cl| SiteCtor{ .class = cl, .n_args = cg.n_args, .arg_names = cg.arg_names, .heads = &.{} } else return null,
+            .CallMemberOrGlobal => |cg| if (cg.class) |cl| SiteCtor{ .class = cl, .n_args = cg.n_args, .arg_names = cg.arg_names, .heads = &.{} } else return null,
             else => return null,
         };
         var vals: [8]Value = undefined;

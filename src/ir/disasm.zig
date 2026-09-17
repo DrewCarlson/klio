@@ -48,7 +48,7 @@ fn classify(inst: *const Inst) ?Kind {
         .CallMemberOrGlobal => |c| if (c.func != null or c.class != null or c.candidates != null) .dyn_bound else .dyn_unbound,
         .CallSpread => |c| if (c.virtual_slot != null) .virtual else if (c.candidates != null) .dyn_bound else .dyn_unbound,
         .CallVirtual => .virtual,
-        .CallMember => |c| if (c.resolved != null) .direct else .dyn_unbound,
+        .CallMember => |c| if (c.x().resolved != null) .direct else .dyn_unbound,
         .CallValue,
         .CallValueWithThis,
         .CallSuper,
@@ -127,8 +127,8 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .CallMember => |c| {
             try w.print("r{d} <- CallMember r{d}.'{s}' ", .{ reg(c.dst), reg(c.receiver), constStr(m, c.name) });
             try argRun(w, c.args, c.n_args);
-            if (c.resolved) |target| {
-                if (c.dispatch_receiver) |dispatch| {
+            if (c.x().resolved) |target| {
+                if (c.x().dispatch_receiver) |dispatch| {
                     try w.print(
                         "        [DIRECT member-ext dispatch=r{d} -> {s}#{d}]",
                         .{ reg(dispatch), funcName(m, target), target.int() },
@@ -151,7 +151,7 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .CallVirtual => |c| {
             try w.print("r{d} <- CallVirtual slot#{d} r{d} ", .{ reg(c.dst), c.slot.int(), reg(c.receiver) });
             try argRun(w, c.args, c.n_args);
-            if (c.arg_params) |params| {
+            if (c.x().arg_params) |params| {
                 try w.writeAll(" params=[");
                 for (params, 0..) |param, i| {
                     if (i != 0) try w.writeByte(',');

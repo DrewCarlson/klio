@@ -710,7 +710,7 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
     defer self.ka.restore(ka);
     runtime.keepalivePushCell(&self.globals.cell.hdr);
     var cap_vec: std.ArrayList(Value) = .empty;
-    for (f.capture_order) |cn| {
+    for (f.x().capture_order) |cn| {
         if (std.mem.eql(u8, cn, "this")) {
             try cap_vec.append(allocator, receiver.*);
         } else {

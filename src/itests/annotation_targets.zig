@@ -53,7 +53,7 @@ fn cat(a: std.mem.Allocator, decls: []const u8, body: []const u8) []const u8 {
 fn frontendDiags(a: std.mem.Allocator, src: []const u8) ![]const Diagnostic {
     var lx = try lexer.Lexer.init(a, FileId.from(0), src);
     const lexed = try lx.tokenize();
-    const p = parser.Parser.new(a, FileId.from(0), src, lexed.tokens);
+    const p = parser.Parser.new(a, FileId.from(0), src, lexed.tokens, lexed.strings);
     const kf = p.parseFile();
     var out: std.ArrayList(Diagnostic) = .empty;
     try out.appendSlice(a, p.diagnostics.diags());
@@ -140,7 +140,7 @@ const Lowered = struct {
 fn lower(a: std.mem.Allocator, src: []const u8) !Lowered {
     var lx = try lexer.Lexer.init(a, FileId.from(0), src);
     const lexed = try lx.tokenize();
-    const p = parser.Parser.new(a, FileId.from(0), src, lexed.tokens);
+    const p = parser.Parser.new(a, FileId.from(0), src, lexed.tokens, lexed.strings);
     const kf = p.parseFile();
     const built = try interp_ir.build.buildModule(a, &kf);
     return .{ .built = built };

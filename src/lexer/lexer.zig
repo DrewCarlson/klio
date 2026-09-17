@@ -120,12 +120,13 @@ pub const TokenKind = union(enum) {
     CharLiteral: u16,
 
     StringQuote: struct { triple: bool },
-    /// Owned UTF-8 text; freed via `Token.deinit`.
-    StringText: []const u8,
+    /// Index into `LexResult.strings`: the unescaped text. A token is twenty
+    /// bytes with the text out of line, forty with a slice in the union.
+    StringText: u32,
     InterpStart,
     InterpEnd,
-    /// Owned identifier name; freed via `Token.deinit`.
-    ShortInterp: []const u8,
+    /// Index into `LexResult.strings`: the identifier name.
+    ShortInterp: u32,
 
     // Identifiers and keywords
     Ident,
@@ -218,24 +219,20 @@ pub const TokenKind = union(enum) {
 pub const Token = struct {
     kind: TokenKind,
     span: Span,
-
-    pub fn deinit(self: *Token, allocator: std.mem.Allocator) void {
-        switch (self.kind) {
-            .StringText => |s| allocator.free(s),
-            .ShortInterp => |s| allocator.free(s),
-            else => {},
-        }
-    }
 };
 
 pub const LexResult = struct {
     tokens: []Token,
+    /// The string payloads the tokens index: template text and short
+    /// interpolation names, owned here.
+    strings: []const []const u8,
     diagnostics: DiagnosticSink,
     /// Borrowed by the `DiagnosticSink`; freed alongside the diagnostics.
     owned_messages: []const []const u8,
 
     pub fn deinit(self: *LexResult, allocator: std.mem.Allocator) void {
-        for (self.tokens) |*t| t.deinit(allocator);
+        for (self.strings) |s| allocator.free(s);
+        allocator.free(self.strings);
         allocator.free(self.tokens);
         self.diagnostics.deinit(allocator);
         for (self.owned_messages) |m| allocator.free(m);
@@ -260,6 +257,8 @@ pub const Lexer = struct {
     modes: std.ArrayList(Mode),
     diagnostics: DiagnosticSink,
     owned_messages: std.ArrayList([]const u8),
+    /// What the tokens' `StringText` and `ShortInterp` index.
+    strings: std.ArrayList([]const u8),
     ws_before: bool,
     nl_before: bool,
 
@@ -274,6 +273,7 @@ pub const Lexer = struct {
             .modes = modes,
             .diagnostics = DiagnosticSink.init(),
             .owned_messages = .empty,
+            .strings = .empty,
             .ws_before = false,
             .nl_before = false,
         };
@@ -327,6 +327,7 @@ pub const Lexer = struct {
         self.modes.deinit(self.allocator);
         return .{
             .tokens = try tokens.toOwnedSlice(self.allocator),
+            .strings = try self.strings.toOwnedSlice(self.allocator),
             .diagnostics = self.diagnostics,
             .owned_messages = try self.owned_messages.toOwnedSlice(self.allocator),
         };
@@ -983,8 +984,10 @@ pub const Lexer = struct {
     ) !void {
         if (text.items.len != 0) {
             const owned = try text.toOwnedSlice(self.allocator);
+            const idx: u32 = @intCast(self.strings.items.len);
+            try self.strings.append(self.allocator, owned);
             try tokens.append(self.allocator, .{
-                .kind = .{ .StringText = owned },
+                .kind = .{ .StringText = idx },
                 .span = Span.init(self.file, segment_start, self.pos),
             });
         }
@@ -1111,8 +1114,10 @@ pub const Lexer = struct {
                             }
                             break :blk try self.allocator.dupe(u8, self.src[ident_start..self.pos]);
                         };
+                        const name_idx: u32 = @intCast(self.strings.items.len);
+                        try self.strings.append(self.allocator, name);
                         try tokens.append(self.allocator, .{
-                            .kind = .{ .ShortInterp = name },
+                            .kind = .{ .ShortInterp = name_idx },
                             .span = Span.init(self.file, short_start, self.pos),
                         });
                         return;
@@ -1845,11 +1850,11 @@ test "regular string template short and full" {
     var i: usize = 0;
     try testing.expect(t[i].kind == .StringQuote and !t[i].kind.StringQuote.triple);
     i += 1;
-    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, t[i].kind.StringText, "hi "));
+    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, r.strings[t[i].kind.StringText], "hi "));
     i += 1;
-    try testing.expect(t[i].kind == .ShortInterp and std.mem.eql(u8, t[i].kind.ShortInterp, "name"));
+    try testing.expect(t[i].kind == .ShortInterp and std.mem.eql(u8, r.strings[t[i].kind.ShortInterp], "name"));
     i += 1;
-    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, t[i].kind.StringText, ", age="));
+    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, r.strings[t[i].kind.StringText], ", age="));
     i += 1;
     try testing.expect(t[i].kind == .InterpStart);
     i += 1;
@@ -1861,7 +1866,7 @@ test "regular string template short and full" {
     i += 1;
     try testing.expect(t[i].kind == .InterpEnd);
     i += 1;
-    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, t[i].kind.StringText, "!"));
+    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, r.strings[t[i].kind.StringText], "!"));
     i += 1;
     try testing.expect(t[i].kind == .StringQuote and !t[i].kind.StringQuote.triple);
 }
@@ -1891,13 +1896,13 @@ test "triple quoted raw string keeps backslashes and newlines" {
     var texts: std.ArrayList([]const u8) = .empty;
     defer texts.deinit(testing.allocator);
     for (r.tokens) |t| {
-        if (t.kind == .StringText) try texts.append(testing.allocator, t.kind.StringText);
+        if (t.kind == .StringText) try texts.append(testing.allocator, r.strings[t.kind.StringText]);
     }
     try testing.expectEqual(@as(usize, 1), texts.items.len);
     try testing.expectEqualStrings("raw \\n\nliteral ", texts.items[0]);
     var has_x = false;
     for (r.tokens) |t| {
-        if (t.kind == .ShortInterp and std.mem.eql(u8, t.kind.ShortInterp, "x")) has_x = true;
+        if (t.kind == .ShortInterp and std.mem.eql(u8, r.strings[t.kind.ShortInterp], "x")) has_x = true;
     }
     try testing.expect(has_x);
 }
@@ -1911,7 +1916,7 @@ test "raw string closes on the last three quotes of a run" {
     var texts: std.ArrayList([]const u8) = .empty;
     defer texts.deinit(testing.allocator);
     for (r.tokens) |t| {
-        if (t.kind == .StringText) try texts.append(testing.allocator, t.kind.StringText);
+        if (t.kind == .StringText) try texts.append(testing.allocator, r.strings[t.kind.StringText]);
     }
     try testing.expectEqual(@as(usize, 1), texts.items.len);
     try testing.expectEqualStrings("a\"", texts.items[0]);
@@ -1925,7 +1930,7 @@ test "raw string quote runs around an interpolation" {
     var texts: std.ArrayList([]const u8) = .empty;
     defer texts.deinit(testing.allocator);
     for (r.tokens) |t| {
-        if (t.kind == .StringText) try texts.append(testing.allocator, t.kind.StringText);
+        if (t.kind == .StringText) try texts.append(testing.allocator, r.strings[t.kind.StringText]);
     }
     try testing.expectEqual(@as(usize, 2), texts.items.len);
     try testing.expectEqualStrings("\"", texts.items[0]);
@@ -2112,7 +2117,7 @@ test "multi-dollar string: short runs literal, marker interpolates" {
     try testing.expect(t[i].kind == .StringQuote and !t[i].kind.StringQuote.triple);
     i += 1;
     try testing.expect(t[i].kind == .StringText and
-        std.mem.eql(u8, t[i].kind.StringText, "runTest$default and "));
+        std.mem.eql(u8, r.strings[t[i].kind.StringText], "runTest$default and "));
     i += 1;
     try testing.expect(t[i].kind == .InterpStart);
     i += 1;
@@ -2120,9 +2125,9 @@ test "multi-dollar string: short runs literal, marker interpolates" {
     i += 1;
     try testing.expect(t[i].kind == .InterpEnd);
     i += 1;
-    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, t[i].kind.StringText, " and "));
+    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, r.strings[t[i].kind.StringText], " and "));
     i += 1;
-    try testing.expect(t[i].kind == .ShortInterp and std.mem.eql(u8, t[i].kind.ShortInterp, "y"));
+    try testing.expect(t[i].kind == .ShortInterp and std.mem.eql(u8, r.strings[t[i].kind.ShortInterp], "y"));
 }
 
 test "multi-dollar triple-dollar: two dollars stay literal" {
@@ -2130,9 +2135,9 @@ test "multi-dollar triple-dollar: two dollars stay literal" {
     defer r.deinit(testing.allocator);
     try testing.expect(!r.diagnostics.hasErrors());
     const t = r.tokens;
-    try testing.expect(t[1].kind == .StringText and std.mem.eql(u8, t[1].kind.StringText, "a"));
-    try testing.expect(t[2].kind == .ShortInterp and std.mem.eql(u8, t[2].kind.ShortInterp, "b"));
-    try testing.expect(t[3].kind == .StringText and std.mem.eql(u8, t[3].kind.StringText, " $$c"));
+    try testing.expect(t[1].kind == .StringText and std.mem.eql(u8, r.strings[t[1].kind.StringText], "a"));
+    try testing.expect(t[2].kind == .ShortInterp and std.mem.eql(u8, r.strings[t[2].kind.ShortInterp], "b"));
+    try testing.expect(t[3].kind == .StringText and std.mem.eql(u8, r.strings[t[3].kind.StringText], " $$c"));
 }
 
 test "raw string quote-run: leading quote joins the content" {
@@ -2141,7 +2146,7 @@ test "raw string quote-run: leading quote joins the content" {
     try testing.expect(!r.diagnostics.hasErrors());
     const t = r.tokens;
     try testing.expect(t[0].kind == .StringQuote and t[0].kind.StringQuote.triple);
-    try testing.expect(t[1].kind == .StringText and std.mem.eql(u8, t[1].kind.StringText, "\"v\""));
+    try testing.expect(t[1].kind == .StringText and std.mem.eql(u8, r.strings[t[1].kind.StringText], "\"v\""));
     try testing.expect(t[2].kind == .StringQuote and t[2].kind.StringQuote.triple);
 }
 
@@ -2167,9 +2172,9 @@ test "string body keeps ASCII runs, scalars, escapes and templates in order" {
     try testing.expect(!r.diagnostics.hasErrors());
     const t = r.tokens;
     try testing.expect(t[1].kind == .StringText);
-    try testing.expectEqualStrings("ab€c\td\u{e9}", t[1].kind.StringText);
-    try testing.expect(t[2].kind == .ShortInterp and std.mem.eql(u8, t[2].kind.ShortInterp, "x"));
-    try testing.expect(t[3].kind == .StringText and std.mem.eql(u8, t[3].kind.StringText, "-y"));
+    try testing.expectEqualStrings("ab€c\td\u{e9}", r.strings[t[1].kind.StringText]);
+    try testing.expect(t[2].kind == .ShortInterp and std.mem.eql(u8, r.strings[t[2].kind.ShortInterp], "x"));
+    try testing.expect(t[3].kind == .StringText and std.mem.eql(u8, r.strings[t[3].kind.StringText], "-y"));
     try testing.expect(t[4].kind == .StringQuote);
 }
 
@@ -2178,7 +2183,7 @@ test "raw string body copies backslashes and newlines through" {
     defer r.deinit(testing.allocator);
     try testing.expect(!r.diagnostics.hasErrors());
     try testing.expect(r.tokens[1].kind == .StringText);
-    try testing.expectEqualStrings("a\\n\nb", r.tokens[1].kind.StringText);
+    try testing.expectEqualStrings("a\\n\nb", r.strings[r.tokens[1].kind.StringText]);
 }
 
 test "malformed lead byte in a string is one scalar wide" {
@@ -2187,7 +2192,7 @@ test "malformed lead byte in a string is one scalar wide" {
     defer r.deinit(testing.allocator);
     try testing.expect(!r.diagnostics.hasErrors());
     try testing.expect(r.tokens[1].kind == .StringText);
-    try testing.expectEqualStrings("a\u{c3}x", r.tokens[1].kind.StringText);
+    try testing.expectEqualStrings("a\u{c3}x", r.strings[r.tokens[1].kind.StringText]);
 }
 
 test "block comment skips multi-byte scalars" {

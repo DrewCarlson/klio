@@ -705,10 +705,10 @@ fn freeModuleFuncs(module: *Module) void {
     for (module.funcs.items) |func| {
         for (func.blocks) |bk| {
             if (bk.insts.len != 0) a.free(bk.insts);
-            if (bk.catches.len != 0) a.free(bk.catches);
+            if (bk.h().catches.len != 0) a.free(bk.h().catches);
         }
         a.free(func.blocks);
-        if (func.capture_order.len != 0) a.free(func.capture_order);
+        if (func.x().capture_order.len != 0) a.free(func.x().capture_order);
         if (func.params.len != 0) a.free(func.params);
     }
 }

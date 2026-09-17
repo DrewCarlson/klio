@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const runtime = @import("runtime");
 const root_ir = @import("../ir.zig");
 const core_ids = @import("ids.zig");
@@ -19,10 +20,11 @@ const visitTerminatorRegs = core_inst.visitTerminatorRegs;
 
 /// A basic block: instruction stream plus terminator. With a non-empty `catches`, a
 /// `Throw` raised anywhere in the try scope looks up a handler here before propagating.
-pub const Block = struct {
-    id: BlockId,
-    insts: []Inst,
-    terminator: Terminator,
+/// The exception-handling metadata of a block, present on the few that carry
+/// any: a try body, its join, a finally sentinel, a labeled-return absorption
+/// region. Out of line, so a block is 64 bytes rather than 152 and the walkers
+/// that remap, hash and encode a function follow the pointer.
+pub const BlockHandlers = struct {
     catches: []CatchHandler = &.{},
     /// Finally-block id to run on every exit from this block's try-region. Paired with
     /// `finally_done` so eval can tell entering the finally from having finished it.
@@ -40,6 +42,39 @@ pub const Block = struct {
     /// Try-region body entries whose `TryFrame` this block pops when it exits via `Goto`:
     /// an inline `return` replays its finallys inline and bypasses the sentinel that pops them.
     pop_on_exit: []const BlockId = &.{},
+
+    /// The remap and fingerprint walkers follow a pointer to this type.
+    pub const hashed_by_content = {};
+
+    pub fn any(self: *const BlockHandlers) bool {
+        return self.catches.len != 0 or self.finally != null or self.finally_done != null or
+            self.finally_done_for != null or self.catch_done_for != null or self.lr_absorb != null or
+            self.pop_on_exit.len != 0;
+    }
+};
+
+/// What a block without handlers reads through `h()`.
+pub const no_handlers: BlockHandlers = .{};
+
+pub const Block = struct {
+    id: BlockId,
+    insts: []Inst,
+    terminator: Terminator,
+    /// Null on the blocks that carry none; read through `h()`, written through `handlersMut`.
+    handlers: ?*BlockHandlers = null,
+
+    pub inline fn h(self: *const Block) *const BlockHandlers {
+        return self.handlers orelse &no_handlers;
+    }
+
+    /// The handlers to write, allocated on first use.
+    pub fn handlersMut(self: *Block, a: Allocator) Allocator.Error!*BlockHandlers {
+        if (self.handlers) |p| return p;
+        const p = try a.create(BlockHandlers);
+        p.* = .{};
+        self.handlers = p;
+        return p;
+    }
 };
 
 /// Classification of a lowered function, for the runtime extension scorer. A member
@@ -75,15 +110,42 @@ pub fn rankLowPriority(f: *const Func) bool {
     return f.low_priority and !(f.deprecated_error and suppress_deprecation_error);
 }
 
+/// The header fields most functions leave at their defaults, out of line:
+/// the adapted-reference key, a receiver lambda's receiver head, the capture
+/// order, the implicit label and the annotation names. A function header is
+/// 232 bytes with them boxed, 304 inline, and the image decodes a header per
+/// function the run reaches.
+pub const FuncExtra = struct {
+    /// For the forwarding lambda of an adapted callable reference: target plus adaptation
+    /// (`fqn|arity|unit`), so two wrappers of the same adaptation compare and hash equal.
+    ref_key: []const u8 = "",
+    /// Declared receiver head of a receiver-lambda body. The receiver arrives at invocation
+    /// rather than occupying a parameter slot; the head selects it from the receiver tower.
+    lambda_receiver_ty: ?[]const u8 = null,
+    /// Capture-name list in `LoadCapture` index order; the dispatch site builds the vector in it.
+    capture_order: [][]const u8 = &.{},
+    /// For a lambda body, the simple name of the function the literal was passed to: its
+    /// implicit label, so `this@with` resolves to the receiver it was invoked with.
+    implicit_label: ?[]const u8 = null,
+    /// Resolved fully-qualified names of each source annotation; empty for the baked image.
+    annotation_names: []const []const u8 = &.{},
+
+    pub const hashed_by_content = {};
+
+    pub fn isDefault(self: *const FuncExtra) bool {
+        return self.ref_key.len == 0 and self.lambda_receiver_ty == null and self.capture_order.len == 0 and
+            self.implicit_label == null and self.annotation_names.len == 0;
+    }
+};
+
+pub const no_func_extra: FuncExtra = .{};
+
 pub const Func = struct {
     id: FuncId,
     name: []const u8,
     fqn: []const u8,
     /// Declaring package path; empty for a script with no package header.
     package: []const u8 = "",
-    /// For the forwarding lambda of an adapted callable reference: target plus adaptation
-    /// (`fqn|arity|unit`), so two wrappers of the same adaptation compare and hash equal.
-    ref_key: []const u8 = "",
     params: []Param,
     return_ty: TypeRef,
     /// Whether `return_ty` came from an explicit `: T`. An expression body with no annotation
@@ -168,16 +230,8 @@ pub const Func = struct {
     /// The lambda kept its parser-injected `it` because no expected function type
     /// constrained it: kotlinc types such a lambda `() -> R`, so its arity reads as zero.
     lambda_it_unconstrained: bool = false,
-    /// Declared receiver head of a receiver-lambda body. The receiver arrives at invocation
-    /// rather than occupying a parameter slot; the head selects it from the receiver tower.
-    lambda_receiver_ty: ?[]const u8 = null,
     /// `inline fun`: a non-local `return` from a lambda passed to it unwinds through this frame.
     is_inline: bool = false,
-    /// Capture-name list in `LoadCapture` index order; the dispatch site builds the vector in it.
-    capture_order: [][]const u8 = &.{},
-    /// For a lambda body, the simple name of the function the literal was passed to: its
-    /// implicit label, so `this@with` resolves to the receiver it was invoked with.
-    implicit_label: ?[]const u8 = null,
     /// Marked `@LowPriorityInOverloadResolution` or `@Deprecated(level = ERROR)`: a valid
     /// overload target only when no ordinary candidate applies.
     low_priority: bool = false,
@@ -194,8 +248,53 @@ pub const Func = struct {
     is_open: bool = false,
     /// Carries `final`. On an `override` member it seals the method, monomorphic despite `is_override`.
     is_final: bool = false,
-    /// Resolved fully-qualified names of each source annotation; empty for the baked image.
-    annotation_names: []const []const u8 = &.{},
+
+    /// Null when every rare header field is at its default; read through `x()`.
+    extra: ?*const FuncExtra = null,
+
+    pub inline fn x(self: *const Func) *const FuncExtra {
+        return self.extra orelse &no_func_extra;
+    }
+
+    /// Replaces the rare fields; a box is allocated only when some field
+    /// leaves its default, and a box already there is reused.
+    pub fn setExtra(self: *Func, a: Allocator, e: FuncExtra) Allocator.Error!void {
+        if (self.extra) |old| {
+            @constCast(old).* = e;
+            return;
+        }
+        if (e.isDefault()) return;
+        const p = try a.create(FuncExtra);
+        p.* = e;
+        self.extra = p;
+    }
+
+    /// Frees what a builder allocated for this function on `a`: the block
+    /// and instruction arrays, the handler boxes, the boxed instruction
+    /// payloads and their extras, the capture order and the header's extra
+    /// box. For a function built on a general allocator, as the unit tests
+    /// do; a module on an arena never needs it.
+    pub fn freeBuilt(self: *const Func, a: Allocator) void {
+        for (self.blocks) |b| {
+            for (b.insts) |inst| switch (inst) {
+                .CallMember => |cm| if (cm.extra) |e| a.destroy(e),
+                .CallVirtual => |cv| if (cv.extra) |e| a.destroy(e),
+                .CallSpread => |p| a.destroy(p),
+                .CallMemberOrGlobal => |p| a.destroy(p),
+                .AstLambda => |p| a.destroy(p),
+                .BuildObject => |p| a.destroy(p),
+                else => {},
+            };
+            if (b.insts.len != 0) a.free(b.insts);
+            if (b.handlers) |hs| {
+                if (hs.catches.len != 0) a.free(hs.catches);
+                a.destroy(hs);
+            }
+        }
+        a.free(self.blocks);
+        if (self.x().capture_order.len != 0) a.free(self.x().capture_order);
+        if (self.extra) |e| a.destroy(e);
+    }
 
     /// True when this function has an IR body: present blocks, or blocks deferred to the
     /// image's lazy-IR section. Every bodyless check uses this, never a bare `blocks.len`.
@@ -222,7 +321,7 @@ pub const Func = struct {
         const verdict: ?ConstId = blk: {
             if (self.params.len != 1 or self.is_suspend or self.blocks.len != 1) break :blk null;
             const b = &self.blocks[0];
-            if (b.catches.len != 0 or b.insts.len != 2) break :blk null;
+            if (b.h().catches.len != 0 or b.insts.len != 2) break :blk null;
             const lp = switch (b.insts[0]) {
                 .LoadParam => |lp| lp,
                 else => break :blk null,
@@ -336,7 +435,7 @@ pub const Func = struct {
         const entry_idx = self.entry.int();
         if (entry_idx >= nb) return false;
         for (self.blocks) |*b| {
-            if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return false;
+            if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return false;
         }
         const Ctx = struct {
             uses: RegSet = regSetEmpty(),
@@ -430,7 +529,7 @@ pub const Func = struct {
         var total: usize = 0;
         for (self.blocks) |*b| {
             // A finally-carrying body needs the try-stack machinery the frameless walk skips.
-            if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return false;
+            if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return false;
             total += b.insts.len;
             if (total > LEAF_MAX_INSTS) return false;
             switch (b.terminator) {

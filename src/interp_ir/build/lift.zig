@@ -131,7 +131,7 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
         .Throw => |t| try walkField(allocator, t.value, prop, mode),
         // `field` is an ordinary binding inside the accessor, so a nested scope captures it:
         // without this walk a `field` inside a lambda, loop, when or try reads an unresolved global.
-        .Lambda => |*l| {
+        .Lambda => |l| {
             for (l.body.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
         },
         .AnonFun => |af| {
@@ -153,7 +153,7 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
             try walkField(allocator, f.body, prop, mode);
         },
         .Labeled => |l| try walkField(allocator, l.expr, prop, mode),
-        .ObjectExpr => |*o| {
+        .ObjectExpr => |o| {
             const inner: FieldSubst = switch (mode) {
                 .this_member => |owner| if (owner) |own| .{ .object_member = own } else mode,
                 else => mode,
@@ -166,7 +166,7 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
                 for (blk.stmts) |*st| try walkFieldStmt(keep, st, prop, inner);
             }
         },
-        .Try => |*t| {
+        .Try => |t| {
             for (t.body.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
             for (t.catches) |*c| {
                 for (c.body.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
@@ -175,7 +175,7 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
                 for (fin.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
             }
         },
-        .When => |*w| {
+        .When => |w| {
             if (w.subject) |subj| try walkField(allocator, subj, prop, mode);
             for (w.branches) |*br| {
                 for (br.patterns) |*pat| switch (pat.kind) {
@@ -194,21 +194,21 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
 fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8, mode: FieldSubst) Allocator.Error!void {
     switch (s.*) {
         .Expr => |*e| try walkField(allocator, e, prop, mode),
-        .Assign => |*a| {
+        .Assign => |a| {
             try walkField(allocator, &a.target, prop, mode);
             try walkField(allocator, &a.value, prop, mode);
         },
         // A local `val`/`var` carries its initializer in a `Decl.Property` whose `field`
         // reference must be rewritten; a local cannot have accessors, so only its initializer walks.
-        .Decl => |*d| try walkFieldDecl(allocator, d, prop, mode),
-        .DestructuringDecl => |*dd| try walkField(allocator, &dd.init, prop, mode),
+        .Decl => |d| try walkFieldDecl(allocator, d, prop, mode),
+        .DestructuringDecl => |dd| try walkField(allocator, &dd.init, prop, mode),
     }
 }
 
 fn walkFieldDecl(allocator: Allocator, d: *Decl, prop: []const u8, mode: FieldSubst) Allocator.Error!void {
     switch (d.*) {
         .Property => |p| {
-            if (p.init) |*init| try walkField(allocator, init, prop, mode);
+            if (p.init) |init| try walkField(allocator, init, prop, mode);
             if (p.delegate) |del| try walkField(allocator, del, prop, mode);
         },
         .Function => |*f| {
@@ -238,7 +238,7 @@ pub fn collectUsedQualifiedSupertypes(allocator: Allocator, decls: []const Decl,
 
 fn walkQualifiedSupertypes(allocator: Allocator, c: *const Class, out: *StringSet) Allocator.Error!void {
     for (c.supertypes) |*t| {
-        if (t.qualified_path) |qp| {
+        if (t.x().qualified_path) |qp| {
             if (lastTwo(allocator, qp)) |key| {
                 try out.put(try out.allocator.dupe(u8, key), {});
             }
@@ -295,7 +295,7 @@ pub fn collectEnclosingMemberNames(c: *const Class, out: *StringSet) Allocator.E
         try out.put(try a.dupe(u8, "entries"), {});
         try out.put(try a.dupe(u8, "values"), {});
         try out.put(try a.dupe(u8, "valueOf"), {});
-        for (c.enum_entries) |*e| {
+        for (c.x().enum_entries) |*e| {
             try out.put(try a.dupe(u8, e.name.name), {});
         }
     }
@@ -423,7 +423,7 @@ pub fn liftClassRecursive(
                     try extras.put(try a.dupe(u8, "entries"), {});
                     try extras.put(try a.dupe(u8, "values"), {});
                     try extras.put(try a.dupe(u8, "valueOf"), {});
-                    for (c.enum_entries) |*e| try extras.put(try a.dupe(u8, e.name.name), {});
+                    for (c.x().enum_entries) |*e| try extras.put(try a.dupe(u8, e.name.name), {});
                 }
                 var ci = enclosing_chain.len;
                 while (ci > 0) {
@@ -527,14 +527,15 @@ pub fn synthesizeClassFromObject(allocator: Allocator, o: *const ObjectDecl) All
     return .{
         .name = o.name,
         .type_params = &.{},
-        .where_bounds = &.{},
         .primary_params = &.{},
-        .init_blocks = o.init_blocks,
-        .init_block_positions = o.init_block_positions,
         .supertypes = o.supertypes,
         .supertype_args = o.supertype_args,
-        .supertype_arg_names = o.supertype_arg_names,
         .supertype_delegates = delegates,
+        .extra = try ast.classExtra(allocator, .{
+            .init_blocks = o.init_blocks,
+            .init_block_positions = o.init_block_positions,
+            .supertype_arg_names = o.supertype_arg_names,
+        }),
         .is_data = o.is_data,
         .is_companion = false,
         .is_enum = false,
@@ -544,12 +545,10 @@ pub fn synthesizeClassFromObject(allocator: Allocator, o: *const ObjectDecl) All
         .is_open = false,
         .is_abstract = false,
         .is_inner = false,
-        .secondary_ctors = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .is_value = false,
         .is_annotation = false,
-        .enum_entries = &.{},
         .members = o.members,
         .visibility = .Public,
         .primary_ctor_visibility = null,

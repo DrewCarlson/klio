@@ -391,7 +391,7 @@ pub fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .name = get_nm,
                     .args = key_start,
                     .n_args = @intCast(n_keys),
-                    .arg_names = &.{},
+                    .extra = try b.memberExtra(.{ .arg_names = &.{} }),
                 } });
                 const new = b.allocReg();
                 try b.push(.{ .UnOp = .{ .dst = new, .op = uo, .operand = old } });
@@ -404,7 +404,7 @@ pub fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .name = set_nm,
                     .args = key_start,
                     .n_args = @as(u32, @intCast(n_keys)) + 1,
-                    .arg_names = &.{},
+                    .extra = try b.memberExtra(.{ .arg_names = &.{} }),
                 } });
                 return old;
             }

@@ -46,7 +46,7 @@ pub fn replaceDotWithDollar(allocator: Allocator, s: []const u8) Allocator.Error
 /// A supertype reference resolves to the mangled top-level name when the nested type
 /// it names was mangled, matching the last two qualified segments.
 pub fn resolveMangled(allocator: Allocator, mangled_nested: *const lift.MangledMap, t: *const ast.TypeRef) ?[]const u8 {
-    const qp = t.qualified_path orelse return null;
+    const qp = t.x().qualified_path orelse return null;
     var last: ?usize = null;
     var prev: ?usize = null;
     var i: usize = 0;
@@ -68,7 +68,7 @@ pub fn collectConsts(module: *Module, cls_name: []const u8, members: []const Dec
     for (members) |*m| {
         switch (m.*) {
             .Property => |p| if (p.is_const) {
-                if (p.init) |*init| {
+                if (p.init) |init| {
                     if (literalToConst(init)) |c| {
                         try module.registry.class_const_inits.put(.{ .a = cls_name, .b = p.name.name }, c);
                     }
@@ -315,7 +315,7 @@ pub fn buildPropertyAnchors(
 
 /// Type head of an unannotated property whose initializer is a literal; null otherwise.
 pub fn inferredPropTypeHead(p: *const ast.Property) ?[]const u8 {
-    const init = if (p.init) |*e| e else return null;
+    const init = if (p.init) |e| e else return null;
     return switch (init.*) {
         .StringTemplate => "String",
         .IntLit => "Int",
@@ -417,10 +417,10 @@ pub fn buildClassDef(
         const p = m.Property;
         // A member-extension property belongs to the extension surface, not the class's own.
         if (p.receiver_type != null) continue;
-        const storage_init: ?*const ast.Expr = if (p.init) |*e|
+        const storage_init: ?*const ast.Expr = if (p.init) |e|
             e
         else if (p.explicit_field) |ef|
-            (if (ef.init) |*finit| finit else null)
+            (if (ef.init) |finit| finit else null)
         else
             null;
         try body_props.append(a, .{
@@ -439,7 +439,7 @@ pub fn buildClassDef(
                 .is_delegated = p.delegate != null,
             }),
             .has_backing = memberHasBackingField(p),
-            .type_head = if (p.ty) |*ty| ty.name.name else inferredPropTypeHead(p),
+            .type_head = if (p.ty) |ty| ty.name.name else inferredPropTypeHead(p),
             .scalar_nn = scalarNonNullProp(p),
         });
     }
@@ -449,8 +449,8 @@ pub fn buildClassDef(
     const is_object = spanNamesObject(object_spans.items, c.span);
 
     // init-block property positions: count `Property` decls in members[0..pos].
-    var init_block_positions = try a.alloc(usize, c.init_block_positions.len);
-    for (c.init_block_positions, 0..) |pos, i| {
+    var init_block_positions = try a.alloc(usize, c.x().init_block_positions.len);
+    for (c.x().init_block_positions, 0..) |pos, i| {
         const upto = @min(pos, c.members.len);
         var count: usize = 0;
         for (c.members[0..upto]) |*m| {
@@ -460,11 +460,11 @@ pub fn buildClassDef(
         init_block_positions[i] = count;
     }
 
-    var init_blocks_ast = try a.alloc(FF(ast.Block), c.init_blocks.len);
-    for (c.init_blocks, 0..) |*blk, i| init_blocks_ast[i] = FF(ast.Block).fromPtr(blk);
+    var init_blocks_ast = try a.alloc(FF(ast.Block), c.x().init_blocks.len);
+    for (c.x().init_blocks, 0..) |*blk, i| init_blocks_ast[i] = FF(ast.Block).fromPtr(blk);
 
-    var secondary = try a.alloc(FF(ast.SecondaryCtor), c.secondary_ctors.len);
-    for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = FF(ast.SecondaryCtor).fromPtr(sc);
+    var secondary = try a.alloc(FF(ast.SecondaryCtor), c.x().secondary_ctors.len);
+    for (c.x().secondary_ctors, 0..) |*sc, i| secondary[i] = FF(ast.SecondaryCtor).fromPtr(sc);
 
     // `@Serializer(forClass = C::class)` is written on a declaration with no supertype; the
     // kotlinx plugin makes it a `KSerializer<C>`, which `is`/`as KSerializer` read.
@@ -507,13 +507,13 @@ pub fn buildClassDef(
         if (t.function != null) continue;
         // A renamed file-private supertype resolves to its mangled lift name, keyed by the
         // reference's own span file.
-        supertype_names[i] = if (t.qualified_path == null)
+        supertype_names[i] = if (t.x().qualified_path == null)
             ir.build.fileOrPkgTypeRename(t.name.name, t.span.file.int()) orelse
                 ir.lower.decl.importedPkgTypeRename(module, t.name.name, t.span.file) orelse
                 t.name.name
         else
             t.name.name;
-        supertype_paths[i] = t.qualified_path;
+        supertype_paths[i] = t.x().qualified_path;
     }
 
     const fqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
@@ -532,7 +532,7 @@ pub fn buildClassDef(
             for (c.type_params, names) |*tp, *out| out.* = tp.name.name;
             break :blk names;
         },
-        .type_param_bounds = try classTypeParamBoundHeads(a, c.type_params, c.where_bounds),
+        .type_param_bounds = try classTypeParamBoundHeads(a, c.type_params, c.x().where_bounds),
         .primary_params = primary_params,
         .methods = &.{},
         .body_properties = try body_props.toOwnedSlice(a),
@@ -709,8 +709,8 @@ pub fn retainDecl(
             // Superseded only by an `actual` in its OWN package: a same-named actual elsewhere
             // implements a different declaration.
             if (actual_func_names.contains(fqn)) return false;
-            const receiver_name: ?[]const u8 = if (f.receiver_type) |*rt|
-                rt.qualified_path orelse rt.name.name
+            const receiver_name: ?[]const u8 = if (f.receiver_type) |rt|
+                rt.x().qualified_path orelse rt.name.name
             else
                 null;
             // A declaration with an exact host ABI symbol survives with its ordinary FuncId identity.
@@ -748,8 +748,8 @@ pub fn transplantExpectMemberDefaults(actual: *ast.Function, expected: *const as
     if (!std.mem.eql(u8, actual.name.name, expected.name.name)) return false;
     if (actual.params.len != expected.params.len) return false;
     if ((actual.receiver_type == null) != (expected.receiver_type == null)) return false;
-    if (actual.receiver_type) |*ar| {
-        if (!sameExpectActualTypeHead(ar, &expected.receiver_type.?)) return false;
+    if (actual.receiver_type) |ar| {
+        if (!sameExpectActualTypeHead(ar, expected.receiver_type.?)) return false;
     }
     for (actual.params, expected.params) |*ap, *ep| {
         if (!std.mem.eql(u8, ap.name.name, ep.name.name)) return false;

@@ -173,8 +173,6 @@ pub fn parseTypeArgs(p: *Parser) []TypeArg {
                     .type_args = &.{},
                     .function = null,
                     .definitely_non_null = false,
-                    .annotations = &.{},
-                    .qualified_path = null,
                 },
                 .span = s.span,
             }) catch @panic("OOM in parseTypeArgs");
@@ -235,8 +233,6 @@ pub fn parseCallTypeArgs(p: *Parser) []TypeRef {
                 .type_args = &.{},
                 .function = null,
                 .definitely_non_null = false,
-                .annotations = &.{},
-                .qualified_path = null,
             }) catch @panic("OOM in parseCallTypeArgs");
         } else if (isKind(peekKind(p), .Ident) and
             std.mem.eql(u8, support.text(p, support.currentSpan(p)), "_"))
@@ -252,8 +248,6 @@ pub fn parseCallTypeArgs(p: *Parser) []TypeRef {
                 .type_args = &.{},
                 .function = null,
                 .definitely_non_null = false,
-                .annotations = &.{},
-                .qualified_path = null,
             }) catch @panic("OOM in parseCallTypeArgs");
         } else {
             const id_text = support.peekIdentText(p);
@@ -330,14 +324,14 @@ pub fn parseType(p: *Parser) ?TypeRef {
     else
         (parseSimpleType(p) orelse return null);
     if (type_annotations.len != 0) {
-        if (ty.annotations.len == 0) {
-            ty.annotations = type_annotations;
-        } else {
-            const combined = p.allocator.alloc(ast.Annotation, ty.annotations.len + type_annotations.len) catch @panic("OOM in parseType");
-            @memcpy(combined[0..ty.annotations.len], ty.annotations);
-            @memcpy(combined[ty.annotations.len..], type_annotations);
-            ty.annotations = combined;
-        }
+        const own = ty.x().annotations;
+        const anns = if (own.len == 0) type_annotations else blk: {
+            const combined = p.allocator.alloc(ast.Annotation, own.len + type_annotations.len) catch @panic("OOM in parser");
+            @memcpy(combined[0..own.len], own);
+            @memcpy(combined[own.len..], type_annotations);
+            break :blk combined;
+        };
+        ty.extra = support.typeRefExtra(p, .{ .annotations = anns, .qualified_path = ty.x().qualified_path });
     }
     if (peekKind(p).isQuestion()) {
         const q = support.bump(p);
@@ -395,7 +389,7 @@ pub fn parseType(p: *Parser) ?TypeRef {
         // Annotations before the receiver head annotate the whole function type,
         // so they are hoisted onto the outer TypeRef.
         var recv_ty = ty;
-        recv_ty.annotations = &.{};
+        recv_ty.extra = support.typeRefExtra(p, .{ .qualified_path = ty.x().qualified_path });
         func.* = .{
             .receiver = recv_ty,
             .params = params,
@@ -410,8 +404,7 @@ pub fn parseType(p: *Parser) ?TypeRef {
             .type_args = &.{},
             .function = func,
             .definitely_non_null = false,
-            .annotations = ty.annotations,
-            .qualified_path = null,
+            .extra = support.typeRefExtra(p, .{ .annotations = ty.x().annotations }),
         };
     }
     // A claimed `suspend` with no function type is dropped.
@@ -465,8 +458,7 @@ pub fn parseSimpleType(p: *Parser) ?TypeRef {
         .type_args = type_args,
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = qualified_path,
+        .extra = support.typeRefExtra(p, .{ .qualified_path = qualified_path }),
     };
 }
 
@@ -505,8 +497,7 @@ pub fn parseQualifiedType(p: *Parser) ?TypeRef {
             .type_args = type_args,
             .function = null,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = dotted,
+            .extra = support.typeRefExtra(p, .{ .qualified_path = dotted }),
         };
     }
     if (peekKind(p).isQuestion()) {
@@ -573,8 +564,6 @@ pub fn parseParensOrFunctionType(p: *Parser, start: Span) ?TypeRef {
             .type_args = &.{},
             .function = func,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         };
     } else if (items.items.len == 1 and !saw_comma) {
         var inner = items.items[0];

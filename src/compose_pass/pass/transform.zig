@@ -76,7 +76,7 @@ fn transformDecl(
             } else {
                 if (f.body == null) return;
                 // Not composable: still walk the body so a `setContent { … }` lambda transforms.
-                const ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+                const ret_composable = f.return_type != null and isComposableFnType(f.return_type.?);
                 const ret_fn_params: u8 = if (ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
                 const wrap_ret = ret_composable and std.mem.startsWith(u8, f.name.name, "movableContent");
                 // A non-composable fn can still take `@Composable`-typed lambda params, so a bare
@@ -87,7 +87,7 @@ fn transformDecl(
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
                     .Expr => |*e| if (ret_composable and e.* == .Lambda) {
-                        try w.transformComposableLambda(&e.Lambda, ret_fn_params, null);
+                        try w.transformComposableLambda(e.Lambda, ret_fn_params, null);
                         if (root.emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(e);
                     } else {
                         try w.walkExpr(e);
@@ -100,7 +100,7 @@ fn transformDecl(
         .Property => |p| {
             const pb = B{ .a = a, .gen_span = p.span };
             var w = Walker{ .a = a, .b = pb, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
-            if (p.init) |*ini| try w.walkExpr(ini);
+            if (p.init) |ini| try w.walkExpr(ini);
             if (p.delegate) |del| try w.walkExpr(del);
             // A `@Composable` property getter has no `$composer` param, so its body walks in
             // ambient mode through the `__compose_currentComposer` intrinsic.
@@ -188,12 +188,12 @@ fn guardProbe(b: B, probe: Stmt, triple: u5) Stmt {
 }
 
 fn dirtyOrConst(b: B, v: i64) Stmt {
-    return .{ .Assign = .{
+    return .{ .Assign = ast.box(b.a, ast.AssignStmt{
         .target = b.pathExpr(dirty_local),
         .op = .Assign,
         .value = b.callMember(b.pathExpr(dirty_local), "or", b.slice1(b.intLit(v))),
         .span = b.gen_span,
-    } };
+    }) catch @panic("oom") };
 }
 
 /// `$dirty = $dirty or (if (<probe>) <changed_i> else <same_i>)`. The probe runs every
@@ -205,12 +205,12 @@ fn dirtyOrProbe(b: B, probe: Expr, triple: u5) Stmt {
         .else_branch = b.box(b.intLit(dirtySame(triple))),
         .span = b.gen_span,
     } };
-    return .{ .Assign = .{
+    return .{ .Assign = ast.box(b.a, ast.AssignStmt{
         .target = b.pathExpr(dirty_local),
         .op = .Assign,
         .value = b.callMember(b.pathExpr(dirty_local), "or", b.slice1(pick)),
         .span = b.gen_span,
-    } };
+    }) catch @panic("oom") };
 }
 
 /// Every original param keeps its slot; a defaulted `p: T = D` is renamed `p$arg` with
@@ -252,8 +252,8 @@ fn buildParamsAndPrologue(a: std.mem.Allocator, b: B, f: *const Function) std.me
             .mutable = false,
             .name = p.name,
             .receiver_type = null,
-            .ty = p.ty,
-            .init = pick,
+            .ty = try ast.box(a, p.ty),
+            .init = try ast.box(a, pick),
             .delegate = null,
             .getter = null,
             .setter = null,
@@ -270,7 +270,7 @@ fn buildParamsAndPrologue(a: std.mem.Allocator, b: B, f: *const Function) std.me
             .annotations = &.{},
             .span = b.gen_span,
         };
-        try prologue.append(a, .{ .Decl = .{ .Property = prop } });
+        try prologue.append(a, .{ .Decl = try ast.box(a, ast.Decl{ .Property = prop }) });
     }
     params[f.params.len] = b.param(composer_param, b.typeRef("Composer"));
     params[f.params.len + 1] = b.param(changed_param, b.typeRef("Int"));
@@ -315,7 +315,7 @@ pub fn transformComposableFunction(
     // The defaults prologue walks too, so a composable call in a default is threaded.
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
-    const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+    const w_ret_composable = f.return_type != null and isComposableFnType(f.return_type.?);
     var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
     // Only non-defaulted, non-vararg params get a triple: a defaulted param's triple can
     // carry the default-taken same bit while the body sees a re-evaluated value.
@@ -346,7 +346,7 @@ pub fn transformComposableFunction(
             .ty = null,
             // Full copy, kotlinc's `$dirty = $changed`, so a guarded-off probe still has its
             // triple populated from the caller's certainty bits.
-            .init = b.pathExpr(changed_param),
+            .init = b.box(b.pathExpr(changed_param)),
             .delegate = null,
             .getter = null,
             .setter = null,
@@ -363,7 +363,7 @@ pub fn transformComposableFunction(
             .annotations = &.{},
             .span = b.gen_span,
         };
-        try out.append(a, .{ .Decl = .{ .Property = dirty_prop } });
+        try out.append(a, .{ .Decl = try ast.box(a, ast.Decl{ .Property = dirty_prop }) });
         for (f.params, 0..) |p, pi| {
             const triple = tripleIdx(pi);
             if (p.is_vararg) {
@@ -391,7 +391,7 @@ pub fn transformComposableFunction(
         // The receiver's triple sits after the value params, kotlinc's slot order.
         if (f.receiver_type != null or in_class) {
             const recv_triple = tripleIdx(f.params.len);
-            const recv_probe: []const u8 = if (f.receiver_type) |*rt|
+            const recv_probe: []const u8 = if (f.receiver_type) |rt|
                 probeMethodFor(rt, f.type_params)
             else
                 "changedInstance";
@@ -479,7 +479,7 @@ pub fn transformThreadedComposable(
     const params = pp.params;
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
-    const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+    const w_ret_composable = f.return_type != null and isComposableFnType(f.return_type.?);
     var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0, .explicit_groups = isExplicitGroups(f) };
     const body = f.body orelse return signatureOnly(f, params);
     // A non-restartable composable still owns a replace group: repeated calls in a spliced
@@ -536,7 +536,7 @@ pub fn transformThreadedComposable(
                 .name = b.ident(result_name),
                 .receiver_type = null,
                 .ty = null,
-                .init = ne,
+                .init = b.box(ne),
                 .delegate = null,
                 .getter = null,
                 .setter = null,
@@ -557,7 +557,7 @@ pub fn transformThreadedComposable(
             stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "startReplaceGroup", b.slice1(b.intLit(group_key))) };
             @memcpy(stmts[1 .. 1 + pp.prologue.len], pp.prologue);
             for (stmts[1 .. 1 + pp.prologue.len]) |*s| try w.walkStmt(s);
-            stmts[1 + pp.prologue.len] = .{ .Decl = .{ .Property = result_prop } };
+            stmts[1 + pp.prologue.len] = .{ .Decl = try ast.box(a, ast.Decl{ .Property = result_prop }) };
             stmts[2 + pp.prologue.len] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "endReplaceGroup", try a.alloc(Expr, 0)) };
             stmts[3 + pp.prologue.len] = .{ .Expr = .{ .Return = .{
                 .value = b.box(b.pathExpr(result_name)),

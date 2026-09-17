@@ -448,8 +448,8 @@ fn smallInlineBody(f: *const ast.Function) bool {
                     .Expr => |*e| exprContainsTry(e),
                     .Assign => |asg| exprContainsTry(&asg.value),
                     .DestructuringDecl => |d| exprContainsTry(&d.init),
-                    .Decl => |decl| switch (decl) {
-                        .Property => |pr| if (pr.init) |*init| exprContainsTry(init) else false,
+                    .Decl => |decl| switch (decl.*) {
+                        .Property => |pr| if (pr.init) |init| exprContainsTry(init) else false,
                         else => false,
                     },
                 };
@@ -518,8 +518,8 @@ fn thisScanStmts(stmts: []const ast.Stmt, in_lambda: bool) bool {
             .Expr => |*e| thisScan(e, in_lambda),
             .Assign => |asg| thisScan(&asg.target, in_lambda) or thisScan(&asg.value, in_lambda),
             .DestructuringDecl => |d| thisScan(&d.init, in_lambda),
-            .Decl => |decl| switch (decl) {
-                .Property => |pr| if (pr.init) |*init| thisScan(init, in_lambda) else false,
+            .Decl => |decl| switch (decl.*) {
+                .Property => |pr| if (pr.init) |init| thisScan(init, in_lambda) else false,
                 else => false,
             },
         };

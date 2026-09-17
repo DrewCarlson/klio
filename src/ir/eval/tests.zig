@@ -45,12 +45,7 @@ const suspendLiveRegs = ev_snapshot.suspendLiveRegs;
 const FuncBuilder = ir.build.FuncBuilder;
 
 fn freeFunc(func: Func) void {
-    for (func.blocks) |b| {
-        if (b.insts.len != 0) testing.allocator.free(b.insts);
-        if (b.catches.len != 0) testing.allocator.free(b.catches);
-    }
-    testing.allocator.free(func.blocks);
-    if (func.capture_order.len != 0) testing.allocator.free(func.capture_order);
+    func.freeBuilt(testing.allocator);
 }
 
 fn lit(b: *FuncBuilder, v: i32) Allocator.Error!Reg {

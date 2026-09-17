@@ -80,6 +80,10 @@ const Builder = struct {
         return .{ .name = name, .span = self.ts() };
     }
 
+    fn dupOpt(self: *Builder, comptime T: type, value: ?T) ?*T {
+        return if (value) |v| self.dup(T, v) else null;
+    }
+
     fn dup(self: *Builder, comptime T: type, value: T) *T {
         const p = self.a().create(T) catch unreachable;
         p.* = value;
@@ -109,8 +113,6 @@ const Builder = struct {
             .type_args = &.{},
             .function = null,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         };
     }
 
@@ -124,8 +126,6 @@ const Builder = struct {
             .type_args = ta,
             .function = null,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         };
     }
 
@@ -145,8 +145,6 @@ const Builder = struct {
             .type_args = &.{},
             .function = ftr,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         };
     }
 
@@ -166,8 +164,6 @@ const Builder = struct {
             .type_args = &.{},
             .function = ftr,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         };
     }
 
@@ -255,21 +251,21 @@ const Builder = struct {
     }
 
     fn isCheck(self: *Builder, e: Expr, t: TypeRef, negated: bool) Expr {
-        return .{ .IsCheck = .{
+        return .{ .IsCheck = self.dup(ast.IsCheckExpr, .{
             .expr = self.dup(Expr, e),
             .ty = t,
             .negated = negated,
             .span = self.ts(),
-        } };
+        }) };
     }
 
     fn asCast(self: *Builder, e: Expr, t: TypeRef, safe: bool) Expr {
-        return .{ .As = .{
+        return .{ .As = self.dup(ast.AsExpr, .{
             .expr = self.dup(Expr, e),
             .ty = t,
             .safe = safe,
             .span = self.ts(),
-        } };
+        }) };
     }
 
     fn ifExpr(self: *Builder, cond: Expr, then_b: Expr, else_b: ?Expr) Expr {
@@ -320,11 +316,11 @@ const Builder = struct {
     fn lambda(self: *Builder, params: []const []const u8, stmts: []const Stmt) Expr {
         const ps = self.a().alloc(Ident, params.len) catch unreachable;
         for (params, 0..) |p, i| ps[i] = self.ident(p);
-        return .{ .Lambda = .{
+        return .{ .Lambda = self.dup(ast.LambdaExpr, .{
             .params = ps,
             .body = .{ .stmts = self.slice(Stmt, stmts), .span = self.ts() },
             .span = self.ts(),
-        } };
+        }) };
     }
 
     /// `fun(params): ret { body }` anonymous function expression.
@@ -333,23 +329,23 @@ const Builder = struct {
             .stmts = self.slice(Stmt, &.{.{ .Expr = body }}),
             .span = self.ts(),
         } });
-        return .{ .AnonFun = .{
+        return .{ .AnonFun = self.dup(ast.AnonFunExpr, .{
             .receiver_ty = null,
             .params = self.slice(Param, params),
             .return_ty = ret,
             .body = fb,
             .is_suspend = false,
             .span = self.ts(),
-        } };
+        }) };
     }
 
     fn whenExpr(self: *Builder, subject: ?Expr, binding: ?WhenBinding, branches: []const WhenBranch) Expr {
-        return .{ .When = .{
+        return .{ .When = self.dup(ast.WhenExpr, .{
             .subject = if (subject) |s| self.dup(Expr, s) else null,
             .subject_binding = binding,
             .branches = self.slice(WhenBranch, branches),
             .span = self.ts(),
-        } };
+        }) };
     }
 
     fn whenIs(self: *Builder, t: TypeRef, body: Expr) WhenBranch {
@@ -369,12 +365,12 @@ const Builder = struct {
     }
 
     fn assign(self: *Builder, target: Expr, value: Expr) Stmt {
-        return .{ .Assign = .{
+        return .{ .Assign = self.dup(ast.AssignStmt, .{
             .target = target,
             .op = .Assign,
             .value = value,
             .span = self.ts(),
-        } };
+        }) };
     }
 
     /// `val name [: ty] = init`
@@ -388,7 +384,7 @@ const Builder = struct {
     }
 
     fn localProp(self: *Builder, mutable: bool, name: []const u8, t: ?TypeRef, init_e: ?Expr) Stmt {
-        return .{ .Decl = .{ .Property = self.dup(Property, self.prop(mutable, name, t, init_e)) } };
+        return .{ .Decl = self.dup(Decl, .{ .Property = self.dup(Property, self.prop(mutable, name, t, init_e)) }) };
     }
 
     fn prop(self: *Builder, mutable: bool, name: []const u8, t: ?TypeRef, init_e: ?Expr) Property {
@@ -396,8 +392,8 @@ const Builder = struct {
             .mutable = mutable,
             .name = self.ident(name),
             .receiver_type = null,
-            .ty = t,
-            .init = init_e,
+            .ty = self.dupOpt(TypeRef, t),
+            .init = self.dupOpt(Expr, init_e),
             .delegate = null,
             .getter = null,
             .setter = null,
@@ -475,7 +471,7 @@ const Builder = struct {
             .type_params = &.{},
             .where_bounds = &.{},
             .params = self.slice(Param, params),
-            .return_type = ret,
+            .return_type = self.dupOpt(TypeRef, ret),
             .body = body,
             .is_open = false,
             .is_override = false,
@@ -521,10 +517,7 @@ const Builder = struct {
         return .{
             .name = self.ident(name),
             .type_params = &.{},
-            .where_bounds = &.{},
             .primary_params = &.{},
-            .init_blocks = &.{},
-            .init_block_positions = &.{},
             .supertypes = &.{},
             .supertype_args = &.{},
             .supertype_delegates = &.{},
@@ -535,14 +528,12 @@ const Builder = struct {
             .is_open = false,
             .is_abstract = false,
             .is_inner = false,
-            .secondary_ctors = &.{},
             .is_interface = false,
             .is_fun_interface = false,
             .is_value = false,
             .is_annotation = false,
             .is_expect = false,
             .is_actual = false,
-            .enum_entries = &.{},
             .members = &.{},
             .visibility = .Public,
             .primary_ctor_visibility = null,
@@ -1454,7 +1445,7 @@ test "accessor_return_type_match_ok" {
     var x = b.prop(false, "x", b.ty("Int"), null);
     x.getter = b.dup(Accessor, .{
         .params = &.{},
-        .return_type = b.ty("Int"),
+        .return_type = b.dup(TypeRef, b.ty("Int")),
         .body = .{ .Expr = b.intLit(1) },
         .visibility = null,
         .is_inline = false,
@@ -1478,7 +1469,7 @@ test "accessor_return_type_mismatch_flagged" {
     var x = b.prop(false, "x", b.ty("Int"), null);
     x.getter = b.dup(Accessor, .{
         .params = &.{},
-        .return_type = b.ty("String"),
+        .return_type = b.dup(TypeRef, b.ty("String")),
         .body = .{ .Expr = b.str("hi") },
         .visibility = null,
         .is_inline = false,
@@ -1538,7 +1529,7 @@ test "extension_function_resolves_through_receiver_chain" {
     dog.supertypes = b.slice(TypeRef, &.{b.ty("Animal")});
     dog.supertype_args = b.slice(?[]Expr, &.{b.slice(Expr, &.{b.path("n")})});
     var greet = b.funExpr("greet", &.{}, b.ty("String"), b.binary(.Add, b.str("hi "), b.member(.{ .This = .{ .qualifier = null, .span = b.ts() } }, "name")));
-    greet.receiver_type = b.ty("Animal");
+    greet.receiver_type = b.dup(TypeRef, b.ty("Animal"));
     const main = b.funBlock("main", &.{}, null, &.{
         b.valDecl("d", null, b.call(b.path("Dog"), &.{b.str("Rex")})),
         b.valDecl("g", b.ty("String"), b.call(b.member(b.path("d"), "greet"), &.{})),
@@ -1557,7 +1548,7 @@ test "receiver extension keeps shadowable global out of eager calls" {
     const block_ty = b.tyFun(&.{}, b.ty("Unit"));
     const global_launch = b.funBlock("launch", &.{b.param("block", block_ty)}, null, &.{});
     var extension_launch = b.funBlock("launch", &.{b.param("block", block_ty)}, null, &.{});
-    extension_launch.receiver_type = b.ty("Scope");
+    extension_launch.receiver_type = b.dup(TypeRef, b.ty("Scope"));
     const receiver_block_ty = b.tyReceiverFun(b.ty("Scope"), &.{}, b.ty("Unit"));
     const with_scope = b.funBlock("withScope", &.{b.param("block", receiver_block_ty)}, null, &.{});
 
@@ -1744,7 +1735,7 @@ test "super_ambiguous_reports_t0093" {
     var cc = b.class("C");
     cc.supertypes = b.slice(TypeRef, &.{ b.ty("A"), b.ty("B") });
     cc.supertype_args = b.slice(?[]Expr, &.{ null, null });
-    const super_call = b.call(b.member(.{ .Super = .{ .qualifier = null, .label = null, .span = b.ts() } }, "f"), &.{});
+    const super_call = b.call(b.member(.{ .Super = b.dup(ast.SuperExpr, .{ .qualifier = null, .label = null, .span = b.ts() }) }, "f"), &.{});
     var f_over = b.funExpr("f", &.{}, b.ty("Int"), b.binary(.Add, super_call, b.intLit(1)));
     f_over.is_override = true;
     cc.members = b.slice(Decl, &.{.{ .Function = f_over }});
@@ -1766,8 +1757,8 @@ test "super_qualified_unambiguous_ok" {
     var cc = b.class("C");
     cc.supertypes = b.slice(TypeRef, &.{ b.ty("A"), b.ty("B") });
     cc.supertype_args = b.slice(?[]Expr, &.{ null, null });
-    const super_a = b.call(b.member(.{ .Super = .{ .qualifier = b.ty("A"), .label = null, .span = b.ts() } }, "f"), &.{});
-    const super_b = b.call(b.member(.{ .Super = .{ .qualifier = b.ty("B"), .label = null, .span = b.ts() } }, "f"), &.{});
+    const super_a = b.call(b.member(.{ .Super = b.dup(ast.SuperExpr, .{ .qualifier = b.ty("A"), .label = null, .span = b.ts() }) }, "f"), &.{});
+    const super_b = b.call(b.member(.{ .Super = b.dup(ast.SuperExpr, .{ .qualifier = b.ty("B"), .label = null, .span = b.ts() }) }, "f"), &.{});
     var f_over = b.funExpr("f", &.{}, b.ty("Int"), b.binary(.Add, super_a, super_b));
     f_over.is_override = true;
     cc.members = b.slice(Decl, &.{.{ .Function = f_over }});
@@ -1781,7 +1772,7 @@ test "nothing_receiver_uses_extension_only" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var describe = b.funExpr("describe", &.{}, b.ty("String"), b.str("x"));
-    describe.receiver_type = b.tyNull("Any");
+    describe.receiver_type = b.dup(TypeRef, b.tyNull("Any"));
     const bottom = b.funExpr("bottom", &.{}, b.ty("Nothing"), b.throwExpr(b.call(b.path("RuntimeException"), &.{b.str("x")})));
     const main = b.funBlock("main", &.{}, null, &.{
         b.valDecl("s", b.ty("String"), b.call(b.member(b.call(b.path("bottom"), &.{}), "describe"), &.{})),
@@ -2041,12 +2032,12 @@ test "useless_elvis_nonnull_lhs" {
 test "finally_return_makes_continuation_unreachable" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
-    const try_expr: Expr = .{ .Try = .{
+    const try_expr: Expr = .{ .Try = b.dup(ast.TryExpr, .{
         .body = .{ .stmts = b.slice(Stmt, &.{b.exprStmt(b.call(b.path("println"), &.{b.str("try")}))}), .span = b.ts() },
         .catches = &.{},
         .finally = .{ .stmts = b.slice(Stmt, &.{b.exprStmt(b.returnExpr(null))}), .span = b.ts() },
         .span = b.ts(),
-    } };
+    }) };
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(try_expr),
         b.exprStmt(b.call(b.path("println"), &.{b.str("dead")})),
@@ -2093,8 +2084,9 @@ test "class_val_property_uninit_in_init_block" {
         ))}),
         .span = b.ts(),
     };
-    foo.init_blocks = b.slice(Block, &.{init_blk});
-    foo.init_block_positions = b.slice(usize, &.{0});
+    const fx = try foo.xMut(b.a());
+    fx.init_blocks = b.slice(Block, &.{init_blk});
+    fx.init_block_positions = b.slice(usize, &.{0});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.member(b.call(b.path("Foo"), &.{b.boolLit(true)}), "x")})),
     });
@@ -2118,8 +2110,9 @@ test "class_val_property_initialized_in_all_init_branches" {
         ))}),
         .span = b.ts(),
     };
-    foo.init_blocks = b.slice(Block, &.{init_blk});
-    foo.init_block_positions = b.slice(usize, &.{0});
+    const fx = try foo.xMut(b.a());
+    fx.init_blocks = b.slice(Block, &.{init_blk});
+    fx.init_block_positions = b.slice(usize, &.{0});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.member(b.call(b.path("Foo"), &.{b.boolLit(true)}), "x")})),
     });
@@ -2388,7 +2381,7 @@ test "module: same-package same-signature functions across files still conflict"
 }
 
 fn ebfOf(b: *Builder, t: ?TypeRef, init_e: ?Expr) *ast.ExplicitField {
-    return b.dup(ast.ExplicitField, .{ .ty = t, .init = init_e, .span = b.ts() });
+    return b.dup(ast.ExplicitField, .{ .ty = b.dupOpt(TypeRef, t), .init = b.dupOpt(Expr, init_e), .span = b.ts() });
 }
 
 test "ebf_var_property_flagged" {
@@ -2599,7 +2592,7 @@ test "annotation_all_target_on_local_property_rejected" {
     const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY" });
     var local = b.prop(false, "x", null, b.intLit(1));
     local.annotations = b.slice(Annotation, &.{annotationWithSite(&b, .All, "Wide")});
-    const f_decl = b.funBlock("f", &.{}, null, &.{.{ .Decl = .{ .Property = b.dup(Property, local) } }});
+    const f_decl = b.funBlock("f", &.{}, null, &.{.{ .Decl = b.dup(Decl, .{ .Property = b.dup(Property, local) }) }});
     const f = b.file(&.{ .{ .Class = wide }, .{ .Function = f_decl } });
     var c = checkFile(testing.allocator, &f);
     defer c.deinit();

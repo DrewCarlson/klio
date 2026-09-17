@@ -16,6 +16,209 @@ const ScopeRename = core_ids.ScopeRename;
 const Span = root_ir.Span;
 const TypeRef = core_ids.TypeRef;
 
+/// Call a callable value with mixed positional and spread args; each spread part's
+/// array or list items are flattened into positional args at evaluation time.
+pub const CallSpreadInst = struct {
+    dst: Reg,
+    callee: Reg,
+    parts: []SpreadPart,
+    arg_names: []?ConstId = &.{},
+    /// Statically resolved member slot. When present, `callee` is the receiver and
+    /// `arg_params` maps each source part to its parameter before spread expansion.
+    virtual_slot: ?MethodSlotId = null,
+    arg_params: ?[]u32 = null,
+    trailing_lambda: bool = false,
+    /// When set, the flattened args go to method `member` on the receiver in `callee`
+    /// rather than invoking `callee`, so `recv.method(*array)` dispatches as a member.
+    member: ?ConstId = null,
+    /// Bare top-level name whose overload set lowering bounded by call-site scope.
+    /// `candidates` is authoritative when non-null, empty slice included.
+    name: ?ConstId = null,
+    candidates: ?[]const FuncId = null,
+    /// Declaring package of the lowering-selected candidate set. A synthesized lambda
+    /// frame has no package of its own; this keeps applicability in the resolved scope.
+    anchor_pkg: ?ConstId = null,
+
+    /// Owned by the instruction out of line; the walkers follow the pointer.
+    pub const hashed_by_content = {};
+};
+
+/// Bare-name call inside a lambda body that may run with a this-receiver: dispatch as
+/// a member when the captured `this` has one, else fall back to a top-level lookup.
+pub const CallMemberOrGlobalInst = struct {
+    dst: Reg,
+    this_idx: u16,
+    name: ConstId,
+    args: Reg,
+    n_args: u32,
+    arg_names: []?ConstId,
+    /// Trailing-lambda syntax bit; see `Inst.CallMember.trailing_lambda`.
+    trailing_lambda: bool = false,
+    /// Scope-resolved class when the bare name is a constructor call; the global leg
+    /// constructs exactly this class.
+    class: ?ClassId = null,
+    /// Lowering-resolved top-level function for a bare call a runtime receiver member
+    /// can shadow; the global leg calls exactly this declaration.
+    func: ?FuncId = null,
+    /// Call-site evidence committed `func` among a return-variant family: the global leg must
+    /// not value-re-rank past it, a closure argument carrying no return type. The member
+    /// leg still runs first.
+    func_final: bool = false,
+    /// Package/import-scoped callable set from the lowering resolver. Null is the host-symbol
+    /// boundary, where the runtime may consult the name index; a non-null slice is
+    /// authoritative, empty included.
+    candidates: ?[]const FuncId = null,
+    /// An inline-splice's bound receiver, in a local register rather than the frame's
+    /// `this` slot. When set it is the innermost implicit-receiver candidate.
+    recv: ?Reg = null,
+    /// The enclosing extension's declared receiver head, so the walk resolves same-name
+    /// extensions against the STATIC type even inside a synthesized closure frame.
+    static_recv: ?ConstId = null,
+    /// Explicit call-site type arguments, preserved through the deferred form so the
+    /// global leg can type its dispatch (unsigned literal coercion, reified serving).
+    type_args: []ConstId = &.{},
+    /// Site memo for the member-probe skip: the receiver class and argument signature for
+    /// which a previous execution found no member or extension and took the global leg.
+    skip_cls: u64 = 0,
+    skip_sig: u64 = 0,
+    /// The global-leg target a previous execution resolved for `skip_cls`/`skip_sig`,
+    /// stored as `FuncId + 1` (0 = unclaimed). Claimed only for a plain positional call
+    /// the overload terminal answered with a fused activation, so a replay is exact.
+    global_fid: u32 = 0,
+
+    /// Owned by the instruction out of line; the walkers follow the pointer.
+    pub const hashed_by_content = {};
+};
+
+/// Materialise a closure from a stashed AST `Block` plus captured registers indexed
+/// by name; the VM builds an `IrClosure` over `body_func` and the captured values.
+pub const AstLambdaInst = struct {
+    dst: Reg,
+    params: [][]const u8,
+    body_ast: ast.Block,
+    captures: []Reg,
+    captured_names: [][]const u8,
+    /// True for an anonymous function expression, whose `return` exits the function
+    /// itself; false for a lambda, where the enclosing function is the return target.
+    absorb_return: bool = false,
+    /// `FuncId` of the IR-lowered body, emitted alongside the AST snapshot so call
+    /// sites can dispatch without the tree walker. Null when only the AST form exists.
+    body_func: ?FuncId = null,
+
+    /// Owned by the instruction out of line; the walkers follow the pointer.
+    pub const hashed_by_content = {};
+};
+
+/// Build an anonymous-object instance from an `object { … }` AST node: synthesise a
+/// `ClassDef`, fill its env from `captures`, run its init pipeline, return the instance.
+pub const BuildObjectInst = struct {
+    dst: Reg,
+    ast: FF(ast.Expr),
+    captured_names: [][]const u8,
+    captures: []Reg,
+    /// Scope-true type renames visible at the object expression's lexical site. Member bodies
+    /// lower at runtime into a fresh side module with none of the build's scope registries,
+    /// so the renames must ride on the instruction.
+    scope_renames: []const ScopeRename = &.{},
+    /// Exact classifier identities referenced by the object subtree.
+    scope_classes: []const ScopeClassRef = &.{},
+
+    /// Owned by the instruction out of line; the walkers follow the pointer.
+    pub const hashed_by_content = {};
+};
+
+/// The lowering facts a member call rarely carries, out of line so the
+/// instruction stays 64 bytes: the hot path reads the receiver, the name,
+/// the argument run and the site memo inline.
+pub const CallMemberExtra = struct {
+    arg_names: []?ConstId = &.{},
+    /// Trailing-lambda syntax bit; see `Inst.Call.trailing_lambda`.
+    trailing_lambda: bool = false,
+    /// The receiver's declared type head when lowering knows it. Kotlin resolves
+    /// extension calls against the static type, not a subtype's same-name extension.
+    static_recv: ?ConstId = null,
+    /// The receiver expression's declared type head, used only by the extension-selection
+    /// filter; `static_recv`, the extension-BODY receiver, drives the member walk instead.
+    declared_recv: ?ConstId = null,
+    /// A lowering-resolved, provably monomorphic target: called directly, skipping all
+    /// name-based resolution. Set only where the target cannot vary; null stays virtual.
+    resolved: ?FuncId = null,
+    /// Dispatch receiver for a resolved member-extension target, picked by the implicit
+    /// receiver tower; the extension receiver stays in `receiver`. Null for plain members.
+    dispatch_receiver: ?Reg = null,
+
+    pub const hashed_by_content = {};
+
+    pub fn isDefault(self: *const CallMemberExtra) bool {
+        return self.arg_names.len == 0 and !self.trailing_lambda and self.static_recv == null and
+            self.declared_recv == null and self.resolved == null and self.dispatch_receiver == null;
+    }
+};
+
+pub const no_member_extra: CallMemberExtra = .{};
+
+pub const CallMemberInst = struct {
+    dst: Reg,
+    receiver: Reg,
+    name: ConstId,
+    args: Reg,
+    n_args: u32,
+    /// Site memo, single-fill (see `GetField.site_cls`): the first Instance class whose
+    /// by-name dispatch flat-resolved claims it, `site_sig` the argument signature it was
+    /// keyed under, `site_route` the packed target (`FuncId << 1 | 1`, never 0 if filled).
+    site_cls: u64 = 0,
+    site_sig: u64 = 0,
+    site_route: u64 = 0,
+    /// Null when every lowering fact is at its default; read through `x()`.
+    extra: ?*const CallMemberExtra = null,
+
+    pub inline fn x(self: *const CallMemberInst) *const CallMemberExtra {
+        return self.extra orelse &no_member_extra;
+    }
+};
+
+/// The lowering facts a resolved virtual call rarely carries, out of line.
+pub const CallVirtualExtra = struct {
+    /// Declaration parameter index filled by each source-order argument (receiver
+    /// excluded). Null selects positional binding; a non-null empty map is an indexed
+    /// zero-argument call such as an empty vararg. Resolved against the slot root.
+    arg_params: ?[]u32 = null,
+    arg_names: []?ConstId = &.{},
+    trailing_lambda: bool = false,
+
+    pub const hashed_by_content = {};
+
+    pub fn isDefault(self: *const CallVirtualExtra) bool {
+        return self.arg_params == null and self.arg_names.len == 0 and !self.trailing_lambda;
+    }
+};
+
+pub const no_virtual_extra: CallVirtualExtra = .{};
+
+/// Virtual member call whose overload was resolved statically; `slot` names the selected
+/// override family. Runtime work is one `(ClassId, slot) -> FuncId` lookup, which a
+/// host-backed receiver lacks, so it walks by member name.
+pub const CallVirtualInst = struct {
+    dst: Reg,
+    receiver: Reg,
+    slot: MethodSlotId,
+    args: Reg,
+    n_args: u32,
+    /// Site memo, single-fill (see `GetField.site_cls`), for a host-backed receiver:
+    /// `site_cls` interns the receiver type FQN pointer (CAS from 0), `site_name_*` the
+    /// member name, `site_native` the native form, stored LAST with release as the gate.
+    site_cls: u64 = 0,
+    site_native: u64 = 0,
+    site_name_ptr: u64 = 0,
+    site_name_len: u32 = 0,
+    /// Null when every lowering fact is at its default; read through `x()`.
+    extra: ?*const CallVirtualExtra = null,
+
+    pub inline fn x(self: *const CallVirtualInst) *const CallVirtualExtra {
+        return self.extra orelse &no_virtual_extra;
+    }
+};
+
 pub const Inst = union(enum) {
     Const: struct { dst: Reg, value: ConstId },
     /// Suspend-resume marker: `state` picks the resume block from the entry dispatch table.
@@ -112,29 +315,6 @@ pub const Inst = union(enum) {
         /// intrinsic container creator (`emptyList<String>()`) can stamp its element type.
         type_args: []ConstId = &.{},
     },
-    /// Call a callable value with mixed positional and spread args; each spread part's
-    /// array or list items are flattened into positional args at evaluation time.
-    CallSpread: struct {
-        dst: Reg,
-        callee: Reg,
-        parts: []SpreadPart,
-        arg_names: []?ConstId = &.{},
-        /// Statically resolved member slot. When present, `callee` is the receiver and
-        /// `arg_params` maps each source part to its parameter before spread expansion.
-        virtual_slot: ?MethodSlotId = null,
-        arg_params: ?[]u32 = null,
-        trailing_lambda: bool = false,
-        /// When set, the flattened args go to method `member` on the receiver in `callee`
-        /// rather than invoking `callee`, so `recv.method(*array)` dispatches as a member.
-        member: ?ConstId = null,
-        /// Bare top-level name whose overload set lowering bounded by call-site scope.
-        /// `candidates` is authoritative when non-null, empty slice included.
-        name: ?ConstId = null,
-        candidates: ?[]const FuncId = null,
-        /// Declaring package of the lowering-selected candidate set. A synthesized lambda
-        /// frame has no package of its own; this keeps applicability in the resolved scope.
-        anchor_pkg: ?ConstId = null,
-    },
     /// `super.method(args)`: resolved against the parent of `owner_class`, not the leaf
     /// class. A non-null `qualifier` is `super<Qual>.method()`, dispatched on `Qual`.
     CallSuper: struct {
@@ -176,57 +356,15 @@ pub const Inst = union(enum) {
         /// Lowering proved the fallback's shape; false keeps the compatibility path.
         fallback_receiver_shape_known: bool = false,
     },
-    CallMember: struct {
-        dst: Reg,
-        receiver: Reg,
-        name: ConstId,
-        args: Reg,
-        n_args: u32,
-        arg_names: []?ConstId = &.{},
-        /// Trailing-lambda syntax bit; see `Inst.Call.trailing_lambda`.
-        trailing_lambda: bool = false,
-        /// The receiver's declared type head when lowering knows it. Kotlin resolves
-        /// extension calls against the static type, not a subtype's same-name extension.
-        static_recv: ?ConstId = null,
-        /// The receiver expression's declared type head, used only by the extension-selection
-        /// filter; `static_recv`, the extension-BODY receiver, drives the member walk instead.
-        declared_recv: ?ConstId = null,
-        /// A lowering-resolved, provably monomorphic target: called directly, skipping all
-        /// name-based resolution. Set only where the target cannot vary; null stays virtual.
-        resolved: ?FuncId = null,
-        /// Site memo, single-fill (see `GetField.site_cls`): the first Instance class whose
-        /// by-name dispatch flat-resolved claims it, `site_sig` the argument signature it was
-        /// keyed under, `site_route` the packed target (`FuncId << 1 | 1`, never 0 if filled).
-        site_cls: u64 = 0,
-        site_sig: u64 = 0,
-        site_route: u64 = 0,
-        /// Dispatch receiver for a resolved member-extension target, picked by the implicit
-        /// receiver tower; the extension receiver stays in `receiver`. Null for plain members.
-        dispatch_receiver: ?Reg = null,
-    },
-    /// Virtual member call whose overload was resolved statically; `slot` names the selected
-    /// override family. Runtime work is one `(ClassId, slot) -> FuncId` lookup, which a
-    /// host-backed receiver lacks, so it walks by member name.
-    CallVirtual: struct {
-        dst: Reg,
-        receiver: Reg,
-        slot: MethodSlotId,
-        args: Reg,
-        n_args: u32,
-        /// Declaration parameter index filled by each source-order argument (receiver
-        /// excluded). Null selects positional binding; a non-null empty map is an indexed
-        /// zero-argument call such as an empty vararg. Resolved against the slot root.
-        arg_params: ?[]u32 = null,
-        arg_names: []?ConstId = &.{},
-        trailing_lambda: bool = false,
-        /// Site memo, single-fill (see `GetField.site_cls`), for a host-backed receiver:
-        /// `site_cls` interns the receiver type FQN pointer (CAS from 0), `site_name_*` the
-        /// member name, `site_native` the native form, stored LAST with release as the gate.
-        site_cls: u64 = 0,
-        site_native: u64 = 0,
-        site_name_ptr: u64 = 0,
-        site_name_len: u32 = 0,
-    },
+    /// `recv.name(args)`, resolved by name at run time; `resolved` in the extra box names a
+    /// monomorphic target lowering proved. Named so the union stays 64 bytes.
+    CallMember: CallMemberInst,
+    CallVirtual: CallVirtualInst,
+    /// Boxed: rare and large.
+    CallSpread: *CallSpreadInst,
+    CallMemberOrGlobal: *CallMemberOrGlobalInst,
+    AstLambda: *AstLambdaInst,
+    BuildObject: *BuildObjectInst,
     NewInstance: struct {
         dst: Reg,
         class: ClassId,
@@ -342,49 +480,6 @@ pub const Inst = union(enum) {
         /// CALLER's frame, so `this_idx` names an unpopulated slot. Tried first, still checked.
         recv: ?Reg = null,
     },
-    /// Bare-name call inside a lambda body that may run with a this-receiver: dispatch as
-    /// a member when the captured `this` has one, else fall back to a top-level lookup.
-    CallMemberOrGlobal: struct {
-        dst: Reg,
-        this_idx: u16,
-        name: ConstId,
-        args: Reg,
-        n_args: u32,
-        arg_names: []?ConstId,
-        /// Trailing-lambda syntax bit; see `Inst.CallMember.trailing_lambda`.
-        trailing_lambda: bool = false,
-        /// Scope-resolved class when the bare name is a constructor call; the global leg
-        /// constructs exactly this class.
-        class: ?ClassId = null,
-        /// Lowering-resolved top-level function for a bare call a runtime receiver member
-        /// can shadow; the global leg calls exactly this declaration.
-        func: ?FuncId = null,
-        /// Call-site evidence committed `func` among a return-variant family: the global leg must
-        /// not value-re-rank past it, a closure argument carrying no return type. The member
-        /// leg still runs first.
-        func_final: bool = false,
-        /// Package/import-scoped callable set from the lowering resolver. Null is the host-symbol
-        /// boundary, where the runtime may consult the name index; a non-null slice is
-        /// authoritative, empty included.
-        candidates: ?[]const FuncId = null,
-        /// An inline-splice's bound receiver, in a local register rather than the frame's
-        /// `this` slot. When set it is the innermost implicit-receiver candidate.
-        recv: ?Reg = null,
-        /// The enclosing extension's declared receiver head, so the walk resolves same-name
-        /// extensions against the STATIC type even inside a synthesized closure frame.
-        static_recv: ?ConstId = null,
-        /// Explicit call-site type arguments, preserved through the deferred form so the
-        /// global leg can type its dispatch (unsigned literal coercion, reified serving).
-        type_args: []ConstId = &.{},
-        /// Site memo for the member-probe skip: the receiver class and argument signature for
-        /// which a previous execution found no member or extension and took the global leg.
-        skip_cls: u64 = 0,
-        skip_sig: u64 = 0,
-        /// The global-leg target a previous execution resolved for `skip_cls`/`skip_sig`,
-        /// stored as `FuncId + 1` (0 = unclaimed). Claimed only for a plain positional call
-        /// the overload terminal answered with a fused activation, so a replay is exact.
-        global_fid: u32 = 0,
-    },
     /// Write a top-level binding, routed through `Host.store_global` so a delegated
     /// top-level property's setter (or a plain top-level `var`) is updated.
     StoreGlobal: struct { name: ConstId, value: Reg },
@@ -398,41 +493,12 @@ pub const Inst = union(enum) {
         /// the local class rather than a same-named top-level function, as Kotlin requires.
         dst: ?Reg = null,
     },
-    /// Build an anonymous-object instance from an `object { … }` AST node: synthesise a
-    /// `ClassDef`, fill its env from `captures`, run its init pipeline, return the instance.
-    BuildObject: struct {
-        dst: Reg,
-        ast: FF(ast.Expr),
-        captured_names: [][]const u8,
-        captures: []Reg,
-        /// Scope-true type renames visible at the object expression's lexical site. Member bodies
-        /// lower at runtime into a fresh side module with none of the build's scope registries,
-        /// so the renames must ride on the instruction.
-        scope_renames: []const ScopeRename = &.{},
-        /// Exact classifier identities referenced by the object subtree.
-        scope_classes: []const ScopeClassRef = &.{},
-    },
     /// Materialise a lambda value: `captures` lists the registers the evaluator snapshots
     /// into a closure env, and `body_func` is the body lowered as a separate Func.
     Lambda: struct {
         dst: Reg,
         body_func: FuncId,
         captures: []Reg,
-    },
-    /// Materialise a closure from a stashed AST `Block` plus captured registers indexed
-    /// by name; the VM builds an `IrClosure` over `body_func` and the captured values.
-    AstLambda: struct {
-        dst: Reg,
-        params: [][]const u8,
-        body_ast: ast.Block,
-        captures: []Reg,
-        captured_names: [][]const u8,
-        /// True for an anonymous function expression, whose `return` exits the function
-        /// itself; false for a lambda, where the enclosing function is the return target.
-        absorb_return: bool = false,
-        /// `FuncId` of the IR-lowered body, emitted alongside the AST snapshot so call
-        /// sites can dispatch without the tree walker. Null when only the AST form exists.
-        body_func: ?FuncId = null,
     },
 };
 
@@ -513,6 +579,8 @@ pub fn visitPayloadRegs(payload: anytype, ctx: anytype, comptime cb: fn (@TypeOf
         return;
     }
     switch (@typeInfo(P)) {
+        // A boxed payload: the registers sit behind the pointer.
+        .pointer => |p| if (p.size == .one) visitPayloadRegs(payload.*, ctx, cb),
         .@"struct" => |st| {
             inline for (st.fields) |f| {
                 const is_def = comptime std.mem.eql(u8, f.name, "dst");
@@ -544,6 +612,9 @@ pub fn visitPayloadRegs(payload: anytype, ctx: anytype, comptime cb: fn (@TypeOf
                     for (@field(payload, f.name)) |r| cb(ctx, r, false);
                 } else if (f.type == []SpreadPart or f.type == []const SpreadPart) {
                     for (@field(payload, f.name)) |part| cb(ctx, part.reg, false);
+                } else if (@typeInfo(f.type) == .optional and @typeInfo(@typeInfo(f.type).optional.child) == .pointer and @typeInfo(@typeInfo(f.type).optional.child).pointer.size == .one) {
+                    // An `extra` box may carry a register (`dispatch_receiver`).
+                    if (@field(payload, f.name)) |boxed| visitPayloadRegs(boxed, ctx, cb);
                 }
             }
         },
@@ -560,6 +631,16 @@ pub fn setInstDst(inst: *Inst, new_dst: Reg) bool {
                 if (@FieldType(P, "dst") == Reg) {
                     payload.dst = new_dst;
                     return true;
+                }
+            }
+            // A boxed payload keeps its `dst` behind the pointer.
+            if (@typeInfo(P) == .pointer and @typeInfo(P).pointer.size == .one) {
+                const C = @typeInfo(P).pointer.child;
+                if (@typeInfo(C) == .@"struct" and @hasField(C, "dst")) {
+                    if (@FieldType(C, "dst") == Reg) {
+                        payload.*.dst = new_dst;
+                        return true;
+                    }
                 }
             }
             return false;

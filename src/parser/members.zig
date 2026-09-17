@@ -82,12 +82,12 @@ pub fn parseFun(p: *Parser, flags: ModifierFlags) ?Function {
     const end = p.tokens[p.pos -| 1].span;
     return Function{
         .name = name,
-        .receiver_type = receiver_type,
+        .receiver_type = support.boxedOpt(p, receiver_type),
         .context_params = flags.context_params,
         .type_params = type_params,
         .where_bounds = where_bounds,
         .params = params,
-        .return_type = return_type,
+        .return_type = support.boxedOpt(p, return_type),
         .body = body,
         .is_open = flags.is_open or flags.is_abstract,
         .is_override = flags.is_override,
@@ -265,14 +265,14 @@ pub fn parseAnonFun(p: *Parser) ?Expr {
         else => null,
     };
     const end = p.tokens[p.pos -| 1].span;
-    return Expr{ .AnonFun = .{
+    return Expr{ .AnonFun = support.boxed(p, ast.AnonFunExpr{
         .receiver_ty = receiver_ty,
         .params = params,
         .return_ty = return_ty,
         .body = body,
         .is_suspend = false,
         .span = kw.span.join(end),
-    } };
+    }) };
 }
 
 fn boxBody(p: *Parser, b: FunctionBody) *FunctionBody {
@@ -380,8 +380,6 @@ fn anyPlaceholder(name_span: span.Span) TypeRef {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 
@@ -602,9 +600,9 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         .mutable = mutable,
         .name = name,
         .context_params = flags.context_params,
-        .receiver_type = receiver_type,
-        .ty = ty,
-        .init = init,
+        .receiver_type = support.boxedOpt(p, receiver_type),
+        .ty = support.boxedOpt(p, ty),
+        .init = support.boxedOpt(p, init),
         .delegate = delegate_boxed,
         .getter = getter_boxed,
         .setter = setter_boxed,
@@ -727,7 +725,7 @@ fn parseFieldClause(p: *Parser, scan: FieldScan, allow_accessors: bool) ?ast.Exp
         finit = exprmod.parseExpr(p);
     }
     if (!allow_accessors) return null;
-    return .{ .ty = fty, .init = finit, .span = field_tok.span };
+    return .{ .ty = support.boxedOpt(p, fty), .init = support.boxedOpt(p, finit), .span = field_tok.span };
 }
 
 /// Does not advance `p.pos`.
@@ -844,12 +842,12 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
             skipNl(p);
             path.appendSlice(p.allocator, ".Companion") catch @panic("OOM");
             if (ty) |*t| {
-                t.qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM");
+                t.extra = support.typeRefExtra(p, .{ .annotations = t.x().annotations, .qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM") });
             }
         } else if (std.mem.findScalar(u8, path.items, '.') != null) {
             // Keep the full path of `A.B.foo` so the resolver targets the nested class.
             if (ty) |*t| {
-                t.qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM");
+                t.extra = support.typeRefExtra(p, .{ .annotations = t.x().annotations, .qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM") });
             }
         }
         skipNl(p);
@@ -1062,7 +1060,7 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
         const end = p.tokens[p.pos -| 1].span;
         const acc = Accessor{
             .params = acc_params.toOwnedSlice(p.allocator) catch @panic("OOM"),
-            .return_type = return_type,
+            .return_type = support.boxedOpt(p, return_type),
             .body = body,
             .visibility = acc_visibility,
             .is_inline = acc_inline,

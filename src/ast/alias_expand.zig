@@ -208,7 +208,7 @@ fn collectDecls(idx: *Index, decls: []const Decl, owner: []const u8, pkg: []cons
                 const path = try joinPath(idx.a, &.{ owner, c.name.name });
                 try idx.addClass(c.name.name, .{ .path = path, .pkg = pkg, .is_inner = c.is_inner });
                 try idx.block(c.name.name);
-                for (c.enum_entries) |*e| {
+                for (c.x().enum_entries) |*e| {
                     try idx.block(e.name.name);
                     try collectDecls(idx, e.body_members, path, pkg, file);
                 }
@@ -418,7 +418,7 @@ const Walker = struct {
     fn expandAlias(w: *Walker, al: Alias, args: []const TypeArg, use_span: Span) Allocator.Error!?Expanded {
         if (args.len != 0 and args.len != al.type_params.len) return null;
         const inferred = args.len == 0 and al.type_params.len != 0;
-        if (al.target.function == null and al.target.qualified_path == null and al.target.type_args.len == 0) {
+        if (al.target.function == null and al.target.x().qualified_path == null and al.target.type_args.len == 0) {
             if (paramIndex(al, al.target.name.name)) |i| {
                 if (inferred or args[i].is_star) return null;
                 var out = try cloneType(w.a, &args[i].ty);
@@ -453,13 +453,13 @@ const Walker = struct {
             out.function = nf;
             return out;
         }
-        if (ty.qualified_path == null and ty.type_args.len == 0) {
+        if (ty.x().qualified_path == null and ty.type_args.len == 0) {
             if (paramIndex(al, ty.name.name)) |i| {
                 if (i < args.len and !args[i].is_star) {
                     var sub = try cloneType(a, &args[i].ty);
                     sub.nullable = sub.nullable or ty.nullable;
                     sub.definitely_non_null = sub.definitely_non_null or ty.definitely_non_null;
-                    if (ty.annotations.len != 0) sub.annotations = ty.annotations;
+                    if (ty.x().annotations.len != 0) sub.extra = try ast.typeRefExtra(a, .{ .annotations = ty.x().annotations, .qualified_path = sub.x().qualified_path });
                     return sub;
                 }
                 // Unbound: keep the parameter name; the enclosing type argument
@@ -471,7 +471,7 @@ const Walker = struct {
         for (ty.type_args, out.type_args) |*ta, *o| {
             o.* = ta.*;
             if (ta.is_star) continue;
-            const bare = ta.ty.function == null and ta.ty.qualified_path == null and ta.ty.type_args.len == 0;
+            const bare = ta.ty.function == null and ta.ty.x().qualified_path == null and ta.ty.type_args.len == 0;
             if (bare) {
                 if (paramIndex(al, ta.ty.name.name)) |i| {
                     if (i >= args.len or args[i].is_star) {
@@ -521,20 +521,20 @@ const Walker = struct {
             if (!ta.is_star) _ = try w.expandType(&ta.ty, depth);
         }
         if (w.mode != .rewrite or depth > 16) return false;
-        const al = (if (ty.qualified_path) |qp| w.findAliasByPath(qp) else w.findAlias(ty.name.name)) orelse return false;
+        const al = (if (ty.x().qualified_path) |qp| w.findAliasByPath(qp) else w.findAlias(ty.name.name)) orelse return false;
         const expanded = (try w.expandAlias(al, ty.type_args, ty.span)) orelse return false;
         var out = expanded.ty;
         out.nullable = out.nullable or ty.nullable;
         out.definitely_non_null = out.definitely_non_null or ty.definitely_non_null;
-        if (ty.annotations.len != 0) {
-            if (out.annotations.len == 0) {
-                out.annotations = ty.annotations;
-            } else {
-                const merged = try w.a.alloc(ast.Annotation, ty.annotations.len + out.annotations.len);
-                @memcpy(merged[0..ty.annotations.len], ty.annotations);
-                @memcpy(merged[ty.annotations.len..], out.annotations);
-                out.annotations = merged;
-            }
+        if (ty.x().annotations.len != 0) {
+            const own = out.x().annotations;
+            const anns = if (own.len == 0) ty.x().annotations else blk: {
+                const merged = try w.a.alloc(ast.Annotation, ty.x().annotations.len + own.len);
+                @memcpy(merged[0..ty.x().annotations.len], ty.x().annotations);
+                @memcpy(merged[ty.x().annotations.len..], own);
+                break :blk merged;
+            };
+            out.extra = try ast.typeRefExtra(w.a, .{ .annotations = anns, .qualified_path = out.x().qualified_path });
         }
         ty.* = out;
         return true;
@@ -544,8 +544,8 @@ const Walker = struct {
     /// collapses to its own name: its outer part is the receiver, never a path
     /// prefix.
     fn targetSegments(w: *Walker, al: Alias, target: *const TypeRef, collapse_inner: bool) Allocator.Error![]Ident {
-        const path = target.qualified_path orelse target.name.name;
-        if (collapse_inner and target.qualified_path != null and w.idx.classIsInner(al.pkg, path)) {
+        const path = target.x().qualified_path orelse target.name.name;
+        if (collapse_inner and target.x().qualified_path != null and w.idx.classIsInner(al.pkg, path)) {
             const segs = try w.a.alloc(Ident, 1);
             segs[0] = .{ .name = target.name.name, .span = target.name.span };
             return segs;
@@ -581,7 +581,7 @@ const Walker = struct {
         const args = try typeRefsAsArgs(w.a, c.type_args);
         const expanded = (try w.expandAlias(al, args, p.span)) orelse return false;
         if (expanded.ty.function != null) return false;
-        if (expanded.ty.qualified_path == null and w.typeParamInScope(expanded.ty.name.name)) return false;
+        if (expanded.ty.x().qualified_path == null and w.typeParamInScope(expanded.ty.name.name)) return false;
         p.segments = try w.targetSegments(al, &expanded.ty, true);
         c.type_args = try w.callTypeArgs(expanded);
         return true;
@@ -593,7 +593,7 @@ const Walker = struct {
         const al = w.findAlias(m.name.name) orelse return;
         const args = try typeRefsAsArgs(w.a, c.type_args);
         const expanded = (try w.expandAlias(al, args, m.name.span)) orelse return;
-        if (expanded.ty.function != null or expanded.ty.qualified_path == null) return;
+        if (expanded.ty.function != null or expanded.ty.x().qualified_path == null) return;
         m.name = .{ .name = expanded.ty.name.name, .span = expanded.ty.name.span };
         c.type_args = try w.callTypeArgs(expanded);
     }
@@ -646,6 +646,10 @@ const Walker = struct {
         _ = try w.expandType(ty, 0);
     }
 
+    fn walkBoxedType(w: *Walker, ty: ?*TypeRef) Allocator.Error!void {
+        if (ty) |t| try w.walkType(t);
+    }
+
     fn walkOptType(w: *Walker, ty: *?TypeRef) Allocator.Error!void {
         if (ty.*) |*t| try w.walkType(t);
     }
@@ -682,7 +686,7 @@ const Walker = struct {
 
     fn walkAccessor(w: *Walker, acc: *ast.Accessor) Allocator.Error!void {
         for (acc.params) |p| try w.declare(p.name);
-        try w.walkOptType(&acc.return_type);
+        try w.walkBoxedType(acc.return_type);
         try w.walkBody(&acc.body);
     }
 
@@ -704,24 +708,24 @@ const Walker = struct {
                 defer w.popTypeParams(mark);
                 try w.walkTypeParams(f.type_params);
                 try w.walkWhereBounds(f.where_bounds);
-                try w.walkOptType(&f.receiver_type);
+                try w.walkBoxedType(f.receiver_type);
                 try w.walkContextParams(f.context_params);
                 try w.walkParams(f.params);
-                try w.walkOptType(&f.return_type);
+                try w.walkBoxedType(f.return_type);
                 if (f.body) |*b| try w.walkBody(b);
             },
             .Property => |p| {
                 try w.declare(p.name.name);
                 try w.walkContextParams(p.context_params);
-                try w.walkOptType(&p.receiver_type);
-                try w.walkOptType(&p.ty);
-                if (p.init) |*e| try w.walkExpr(e);
+                try w.walkBoxedType(p.receiver_type);
+                try w.walkBoxedType(p.ty);
+                if (p.init) |e| try w.walkExpr(e);
                 if (p.delegate) |e| try w.walkExpr(e);
                 if (p.getter) |g| try w.walkAccessor(g);
                 if (p.setter) |s| try w.walkAccessor(s);
                 if (p.explicit_field) |ef| {
-                    try w.walkOptType(&ef.ty);
-                    if (ef.init) |*e| try w.walkExpr(e);
+                    try w.walkBoxedType(ef.ty);
+                    if (ef.init) |e| try w.walkExpr(e);
                 }
             },
             .Class => |*c| {
@@ -729,7 +733,7 @@ const Walker = struct {
                 const mark = try w.pushTypeParams(c.type_params);
                 defer w.popTypeParams(mark);
                 try w.walkTypeParams(c.type_params);
-                try w.walkWhereBounds(c.where_bounds);
+                try w.walkWhereBounds(c.x().where_bounds);
                 try w.pushClass(c.name.name);
                 defer w.popClass();
                 for (c.primary_params) |*p| {
@@ -738,8 +742,8 @@ const Walker = struct {
                     if (p.default) |*e| try w.walkExpr(e);
                 }
                 try w.walkSupertypes(c.supertypes, c.supertype_args, c.supertype_delegates);
-                for (c.init_blocks) |*b| try w.walkBlock(b);
-                for (c.secondary_ctors) |*sc| {
+                for (c.x().init_blocks) |*b| try w.walkBlock(b);
+                for (c.x().secondary_ctors) |*sc| {
                     try w.walkParams(sc.params);
                     switch (sc.delegation) {
                         .This, .Super => |list| for (list) |*e| try w.walkExpr(e),
@@ -747,7 +751,7 @@ const Walker = struct {
                     }
                     if (sc.body) |*b| try w.walkBlock(b);
                 }
-                for (c.enum_entries) |*e| {
+                for (c.x().enum_entries) |*e| {
                     try w.declare(e.name.name);
                     for (e.args) |*arg| try w.walkExpr(arg);
                     for (e.body_members) |*m| try w.walkDecl(m);
@@ -773,12 +777,12 @@ const Walker = struct {
     fn walkStmt(w: *Walker, s: *Stmt) Allocator.Error!void {
         switch (s.*) {
             .Expr => |*e| try w.walkExpr(e),
-            .Decl => |*d| try w.walkDecl(d),
-            .Assign => |*asg| {
+            .Decl => |d| try w.walkDecl(d),
+            .Assign => |asg| {
                 try w.walkExpr(&asg.target);
                 try w.walkExpr(&asg.value);
             },
-            .DestructuringDecl => |*dd| {
+            .DestructuringDecl => |dd| {
                 for (dd.names) |n| try w.declare(n.name);
                 try w.walkExpr(&dd.init);
             },
@@ -830,7 +834,7 @@ const Walker = struct {
                 if (dw.body) |b| try w.walkExpr(b);
                 try w.walkExpr(dw.cond);
             },
-            .For => |*f| {
+            .For => |f| {
                 for (f.vars) |v| try w.declare(v.name);
                 try w.walkOptType(&f.var_ty);
                 try w.walkExpr(f.iter);
@@ -840,7 +844,7 @@ const Walker = struct {
             .Labeled => |*l| try w.walkExpr(l.expr),
             .Block => |*b| try w.walkBlock(b),
             .Throw => |*t| try w.walkExpr(t.value),
-            .Try => |*t| {
+            .Try => |t| {
                 try w.walkBlock(&t.body);
                 for (t.catches) |*c| {
                     try w.declare(c.binding.name);
@@ -849,19 +853,19 @@ const Walker = struct {
                 }
                 if (t.finally) |*f| try w.walkBlock(f);
             },
-            .Lambda => |*l| {
+            .Lambda => |l| {
                 for (l.params) |p| try w.declare(p.name);
                 for (l.param_tys) |*pt| try w.walkOptType(pt);
                 try w.walkBlock(&l.body);
             },
             .This => {},
-            .Super => |*s| try w.walkOptType(&s.qualifier),
+            .Super => |s| try w.walkOptType(&s.qualifier),
             .PropertyRef => |*pr| if (w.mode == .rewrite) try w.rewriteRefName(&pr.name),
             .MemberRef => |*mr| {
                 try w.walkExpr(mr.receiver);
                 if (w.mode == .rewrite) try w.rewriteRefName(&mr.name);
             },
-            .When => |*wn| {
+            .When => |wn| {
                 if (wn.subject) |s| try w.walkExpr(s);
                 if (wn.subject_binding) |*sb| {
                     try w.declare(sb.name.name);
@@ -876,15 +880,15 @@ const Walker = struct {
                     try w.walkExpr(&br.body);
                 }
             },
-            .IsCheck => |*ic| {
+            .IsCheck => |ic| {
                 try w.walkExpr(ic.expr);
                 try w.walkType(&ic.ty);
             },
-            .As => |*as| {
+            .As => |as| {
                 try w.walkExpr(as.expr);
                 try w.walkType(&as.ty);
             },
-            .AnonFun => |*af| {
+            .AnonFun => |af| {
                 try w.walkOptType(&af.receiver_ty);
                 try w.walkContextParams(af.context_params);
                 try w.walkParams(af.params);
@@ -892,7 +896,7 @@ const Walker = struct {
                 if (af.body) |b| try w.walkBody(b);
             },
             .Spread => |*s| try w.walkExpr(s.expr),
-            .ObjectExpr => |*o| {
+            .ObjectExpr => |o| {
                 try w.walkSupertypes(o.supertypes, o.supertype_args, o.supertype_delegates);
                 for (o.init_blocks) |*b| try w.walkBlock(b);
                 for (o.members) |*m| try w.walkDecl(m);
@@ -925,8 +929,6 @@ fn tType(a: Allocator, name: []const u8, args: []const []const u8) Allocator.Err
         .type_args = targs,
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 

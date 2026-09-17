@@ -601,7 +601,7 @@ fn emitIteratorCall(b: *FuncBuilder, binding: IterBinding, it_reg: Reg, zero: Re
             .name = name,
             .args = args_start,
             .n_args = 0,
-            .arg_names = &.{},
+            .extra = try b.memberExtra(.{ .arg_names = &.{} }),
         } });
     }
 }
@@ -630,7 +630,7 @@ fn emitHasNextCheck(
         .name = hn_name,
         .args = hn_args,
         .n_args = 0,
-        .arg_names = &.{},
+        .extra = try b.memberExtra(.{ .arg_names = &.{} }),
     } });
     b.terminate(.{ .Branch = .{
         .cond = has_next,
@@ -657,7 +657,7 @@ fn emitNextCall(b: *FuncBuilder, binding: IterBinding, it_reg: Reg) Allocator.Er
         .name = next_name,
         .args = nargs,
         .n_args = 0,
-        .arg_names = &.{},
+        .extra = try b.memberExtra(.{ .arg_names = &.{} }),
     } });
     return next_reg;
 }
@@ -734,7 +734,7 @@ fn bindDestructuredLoopVars(
             .name = nm,
             .args = cargs,
             .n_args = 0,
-            .arg_names = &.{},
+            .extra = try b.memberExtra(.{ .arg_names = &.{} }),
         } });
         try b.bind(v.name, comp);
         if (elem_ty) |ety| {

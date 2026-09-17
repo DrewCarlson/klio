@@ -512,8 +512,7 @@ fn lowerIndex(b: *FuncBuilder, ix: @FieldType(Expr, "Index")) Allocator.Error!Re
         .name = nm,
         .args = run[0],
         .n_args = run[1],
-        .arg_names = &.{},
-        .static_recv = static_recv,
+        .extra = try b.memberExtra(.{ .arg_names = &.{}, .static_recv = static_recv }),
     } });
     return dst;
 }
@@ -1299,14 +1298,14 @@ fn lowerObjectExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const dst = b.allocReg();
     const ast_box = try b.allocator.create(Expr);
     ast_box.* = expr.*;
-    try b.push(.{ .BuildObject = .{
+    try b.push(.{ .BuildObject = try b.boxInst(ir.BuildObjectInst{
         .dst = dst,
         .ast = runtime.forest.ForestField(Expr).fromPtr(ast_box),
         .captured_names = captured_names,
         .captures = captures,
         .scope_renames = try collectScopeRenames(b, expr.ObjectExpr.span.file.int()),
         .scope_classes = try collectScopeClasses(b, expr),
-    } });
+    }) });
     return dst;
 }
 

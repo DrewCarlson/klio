@@ -977,7 +977,7 @@ fn collectTryRegions(e: *Emit) void {
     const accepted = e.accepted;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
-            if (blk.catches.len != 0) e.uses_try = true;
+            if (blk.h().catches.len != 0) e.uses_try = true;
         }
     }
 }

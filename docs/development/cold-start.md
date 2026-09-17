@@ -210,25 +210,102 @@ ReleaseFast at `main` now: 47 MB cold (40 MB physical footprint against 25
 warm), from 160. The peak over the run is unchanged at about 250 MB: it is
 the build itself, and the levers on it are the shapes below.
 
+### The shapes
+
+The peak was the build's own size, and the census said the shapes were
+fat. Each was boxed or split, and the base build's lowering fingerprints
+(`KLIO_LOWER_FINGERPRINT=1`, with the hash following pointers to AST nodes)
+are identical before and after every step; the per-run cold corpus and the
+installed-home corpus match the baseline program for program.
+
+| Shape | Before | After | What changed |
+|-------|-------:|------:|--------------|
+| `Expr` | 288 | 80 | nine rare variants (`AnonFun`, `When`, `For`, `Super`, `IsCheck`, `As`, `ObjectExpr`, `Try`, `Lambda`) behind pointers; a call is the largest left |
+| `Stmt` | 680 | 88 | the declaration, assignment and destructuring payloads boxed |
+| `Decl` | 672 | 280 | follows `Function` |
+| `Function` | 664 | 248 | receiver and return type references boxed |
+| `Property` | 640 | 144 | receiver type, type and initializer boxed |
+| `Accessor` | 456 | 144 | return type boxed |
+| `WhenBranch` | 320 | 112 | follows `Expr` |
+| `Token` | 40 | 20 | template text and interpolation names index `LexResult.strings` |
+
+`KLIO_SLAB_CENSUS=shapes` prints the variant and field sizes behind the
+largest unions and structs, which is how each step was chosen. What the
+boxing bought, ReleaseFast cold hello on an idle machine:
+
+| | Before | After |
+|---|---:|---:|
+| Resident set after the parse | 85 MB | 55 MB |
+| Resident set after the build | 190 MB | 158 MB |
+| Peak resident set | 251 MB | 217 MB |
+| Lex and parse, ten threads | 9 to 15 ms | 5 ms |
+| Prepare | 130 to 137 ms | 120 to 122 ms |
+
+The boxing has one hazard: a pass that copied an expression by value and
+rewrote a variant's field now writes through to the shared node. The
+fingerprint over the base build is the check for it (fourteen functions
+differed once, and it was the hash walker skipping the boxed nodes, not the
+lowering); a pointer cast that took the address of an inline declaration
+was the one real fault, caught by the release build's own bake.
+
+The checker's body workers also cloned the top-level frame, twenty
+thousand bindings each, before starting; they read the main checker's seed
+through a shared pointer now.
+
+### The IR round
+
+The lowered side went the same way, checked the same way: base-build
+fingerprints identical to the pre-round commit at every step (the walker
+hashes a block's handlers as if inline, a call's fields in one fixed order
+whichever side of its box they sit on, and union tags by name so a
+reordered union changes no hash), both corpus modes at the baseline, and
+the interpreter's own time flat on eight CPU-bound examples (medians within
+noise of the pre-round binary, from 80 ms to 2.2 s each).
+
+| Shape | Before | After | What changed |
+|-------|-------:|------:|--------------|
+| `ir.Block` | 152 | 64 | the try machinery (catch handlers, the finally and its sentinels, the labeled-return region, the frames to pop) behind a `BlockHandlers` pointer the few blocks that carry any allocate |
+| `ir.Inst` | 128 | 64 | `CallSpread`, `CallMemberOrGlobal`, `AstLambda` and `BuildObject` boxed; a member call's lowering facts (named arguments, static and declared receivers, a resolved target, the dispatch receiver) in an `extra` box most calls never allocate, the hot fields and the site memo inline; the resolved virtual call keeps its argument maps the same way |
+| `ir.Func` | 304 | 232 | the adapted-reference key, a receiver lambda's receiver head, the capture order, the implicit label and the annotation names in a `FuncExtra` box |
+| `ast.TypeRef` | 104 | 80 | annotations and the qualified path in a `TypeRefExtra` box; `Param` 176 to 152, `TypeArg` 120 to 96, `FunctionTypeRef` 264 to 216 with it |
+| `ast.Class` | 272 | 184 | where bounds, init blocks and their positions, named supertype arguments, secondary constructors and enum entries in a `ClassExtra` box; `Decl`, the union that held the class as its widest variant, 280 to 256 with it |
+
+What it bought, ReleaseFast cold hello, idle machine, the shapes round as
+the baseline: resident set after the build 156 MB to 141, at the bake 171
+to 157, the image 10.0 MB to 9.7 (a box that is absent encodes as one
+byte); the cold wall (141 to 148 ms), the warm run (18 ms) and the eight
+run-time examples unchanged within noise. The peak stays at about 210 MB,
+which the checker's arenas and the module tables set, not the IR.
+
+The bytecode stream cache keyed on the address of a function's blocks
+alone; with blocks a third the size a function freed and another built at
+the same address collided in the evaluator's own tests, so the key carries
+a shape signature of the blocks. `Func.freeBuilt` frees everything a
+builder allocated for a function, which the unit tests share instead of
+six private copies.
+
+`ast.Class` went last. Of its eight rarely-filled slices, six are rare
+in fact: where bounds, init blocks and their positions, named supertype
+arguments, secondary constructors and enum entries, which one stdlib class
+in eight carries. The per-supertype argument and delegate slices are
+parallel to `supertypes`, so any class with a supertype fills them, and
+they stay inline. The six sit in a `ClassExtra` box, null when every one
+is empty; readers go through `x()`, the parser and the object lifter build
+the box with `classExtra`, and the one writer takes it through `xMut()`.
+A class is 184 bytes rather than 272, and because the class was the
+widest variant of the declaration union, every `Decl` is 256 rather than
+280, which reaches the forty thousand declarations the stdlib parses, not
+only the three thousand classes. The fingerprint hashes a class's fields
+in their former order whichever side of the box they sit, so the base
+build read identical (6506 functions), both corpus modes held the
+baseline, and the cold wall, the warm run and the eight run-time examples
+did not move. The resident set at the megabyte moves by less than one.
+
 ### What remains
 
-The peak is the build's own size, and the census says where it goes. The
-shapes are fat: `Stmt` is 680 bytes because it embeds `Decl` by value,
-`Decl` 672 because `Function` is 664 (two inline 112-byte type references
-and a 304-byte body), `Expr` 288 because four rare variants (`AnonFun`
-280, `When` 224, `For` 176, `Super` 168) size the union while a call is 72
-and a path 32; a token is 40 bytes for a 24-byte kind and a 12-byte span.
-The lowered side is `Block` 152, `Inst` 128, `Func` 304. Boxing the rare
-variants and the declarations, and moving the token's string payloads to a
-side table, cut the parse's live set and its churn several-fold and the
-page faults with them, which is what bounds the parallel phases.
-
-The churn is the other half: 700 MB allocated for a 10 MB image. The
-largest turners are the token lists (50 MB, ten bytes of token per source
-byte), the checker's arenas (60 MB), the per-worker tables of the resolver
-and checker, the module tables doubling as they fill (30 MB), the encoder
-buffers (44 MB, now on the build heap) and the statement lists doubling
-with 680-byte elements.
+The churn that remains is the checker's arenas (60 MB, freed together),
+the module tables doubling as they fill (30 MB) and the resolver's and
+checker's per-worker tables.
 
 The image carries the sources (7.5 MB of its 10). A run that has the
 stdlib pack in its binary has those bytes already; keying the sources by

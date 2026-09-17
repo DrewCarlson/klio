@@ -856,7 +856,7 @@ pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame
     const args = try readArgRun(allocator, frame, cv.args, cv.n_args);
     defer allocator.free(args);
     if (comptime @hasDecl(H, "prepareVirtualFlatCall")) {
-        if (flatEnabled() and vcallFlatEnabled() and cv.arg_params == null and argNamesAllNull(cv.arg_names)) {
+        if (flatEnabled() and vcallFlatEnabled() and cv.x().arg_params == null and argNamesAllNull(cv.x().arg_names)) {
             if (try host.prepareVirtualFlatCall(allocator, &recv, cv.slot, args)) |prep0| {
                 dispatchBump(.virtual_flat_prepare);
                 var prep = prep0;
@@ -866,15 +866,15 @@ pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame
             }
         }
     }
-    const names = try resolveArgNames(allocator, frame.module, cv.arg_names);
+    const names = try resolveArgNames(allocator, frame.module, cv.x().arg_names);
     defer freeArgNames(allocator, names);
-    const prev_tl = if (cv.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
+    const prev_tl = if (cv.x().trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
     else
         false;
     // Only a plain positional call may stamp or replay the site memo, whose
     // memoized direct dispatch binds positionally.
-    const site: ?ir.VirtNativeSite = if (cv.arg_params == null and argNamesAllNull(cv.arg_names))
+    const site: ?ir.VirtNativeSite = if (cv.x().arg_params == null and argNamesAllNull(cv.x().arg_names))
         .{
             .cls = @constCast(&cv.site_cls),
             .native = @constCast(&cv.site_native),
@@ -883,8 +883,8 @@ pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame
         }
     else
         null;
-    const result = host.invokeVirtualMember(allocator, &recv, cv.slot, args, names, cv.arg_params, site);
-    if (cv.trailing_lambda) {
+    const result = host.invokeVirtualMember(allocator, &recv, cv.slot, args, names, cv.x().arg_params, site);
+    if (cv.x().trailing_lambda) {
         if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
     }
     switch (try result) {
@@ -1896,7 +1896,7 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             std.debug.print("[cmg] {s} this_tag={s} ctor_name={} in_fn={s}#{d} this_idx={d} ncaps={d} recv_reg={?d} direct_cls={s}\n", .{ name_str, @tagName(std.meta.activeTag(this_val)), is_ctor_name, frame.func.name, frame.func.id.int(), cmg.this_idx, frame.captures.items.len, if (cmg.recv) |r| r.int() else null, dtc });
             for (frame.captures.items, 0..) |cv, cvi| {
                 const cn: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&cv) else "-";
-                const nm: []const u8 = if (cvi < frame.func.capture_order.len) frame.func.capture_order[cvi] else "?";
+                const nm: []const u8 = if (cvi < frame.func.x().capture_order.len) frame.func.x().capture_order[cvi] else "?";
                 std.debug.print("[cmg-cap] [{d}] {s} = {s} {s}\n", .{ cvi, nm, @tagName(std.meta.activeTag(cv)), cn });
             }
         }
@@ -2725,7 +2725,7 @@ pub fn callerThisValue(frame: *const Frame) ?Value {
     var idx = frame.func.this_cap_idx;
     if (idx == -2) {
         idx = -1;
-        for (frame.func.capture_order, 0..) |n, i| {
+        for (frame.func.x().capture_order, 0..) |n, i| {
             if (std.mem.eql(u8, n, "this")) {
                 idx = @intCast(i);
                 break;
@@ -2764,7 +2764,7 @@ fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) 
     // capture: several emit arms bake 0 as a placeholder, and `captures[0]` is then
     // whatever capture came first, which must never enter the walk.
     var idx = this_idx;
-    const order = frame.func.capture_order;
+    const order = frame.func.x().capture_order;
     if (order.len != 0 and
         !(this_idx < order.len and std.mem.eql(u8, order[this_idx], "this")))
     {
@@ -3355,7 +3355,7 @@ pub inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *con
 /// call and reach the name ladder on every execution. A member always wins over an
 /// extension in Kotlin, so these names on an `Int` pair mean the builtin.
 pub inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
-    if (cm.arg_names.len != 0 or cm.n_args > 1) return null;
+    if (cm.x().arg_names.len != 0 or cm.n_args > 1) return null;
     const recv = frame.read(cm.receiver);
     const nm = constStr(frame.module, cm.name) orelse return null;
     const arg: ?Value = if (cm.n_args == 1) frame.read(Reg.from(cm.args.int())) else null;
@@ -3486,7 +3486,7 @@ pub inline fn nullSiteOk(comptime H: type, host: *H, recv: *const Value, name: [
 }
 
 pub inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) ?Value {
-    if (cm.arg_names.len != 0 or cm.n_args == 0) return null;
+    if (cm.x().arg_names.len != 0 or cm.n_args == 0) return null;
     const nm = constStr(frame.module, cm.name) orelse return null;
     const is_get = cm.n_args == 1 and std.mem.eql(u8, nm, "get");
     const is_set = cm.n_args == 2 and std.mem.eql(u8, nm, "set");

@@ -179,11 +179,12 @@ test "super property in a lambda uses the enclosing this capture" {
     b.setOwnerClass("Derived");
     b.setOuterNames(StringSet.init(testing.allocator));
 
-    var receiver = Expr{ .Super = .{
+    var receiver_node = ast.SuperExpr{
         .qualifier = null,
         .label = null,
         .span = dummySpan(),
-    } };
+    };
+    var receiver = Expr{ .Super = &receiver_node };
     const e = Expr{ .Member = .{
         .receiver = &receiver,
         .name = .{ .name = "label", .span = dummySpan() },
@@ -199,7 +200,7 @@ test "super property in a lambda uses the enclosing this capture" {
     const capture = func.blocks[0].insts[0].LoadCapture;
     const call = func.blocks[0].insts[1].CallSuper;
     try testing.expectEqual(capture.dst, call.receiver);
-    try testing.expectEqualStrings("this", func.capture_order[capture.idx]);
+    try testing.expectEqualStrings("this", func.x().capture_order[capture.idx]);
 }
 
 test "labeled super starts at the labeled outer class on this@Outer" {
@@ -211,11 +212,12 @@ test "labeled super starts at the labeled outer class on this@Outer" {
     b.setOuterNames(StringSet.init(testing.allocator));
     try b.bind("this", b.allocReg());
 
-    var receiver = Expr{ .Super = .{
+    var receiver_node = ast.SuperExpr{
         .qualifier = null,
         .label = .{ .name = "Outer", .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    var receiver = Expr{ .Super = &receiver_node };
     const e = Expr{ .Member = .{
         .receiver = &receiver,
         .name = .{ .name = "label", .span = dummySpan() },
@@ -395,10 +397,9 @@ test "lowers is-check to instance-of" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
-    const e = Expr{ .IsCheck = .{ .expr = &inner, .ty = ty, .negated = false, .span = dummySpan() } };
+    var is_node = ast.IsCheckExpr{ .expr = &inner, .ty = ty, .negated = false, .span = dummySpan() };
+    const e = Expr{ .IsCheck = &is_node };
     const r = try lowerExpr(&b, &e);
     b.terminate(.{ .Return = r });
     const func = try b.finish("f", "f", build.typeBool());
@@ -441,8 +442,6 @@ test "bare is-check type normalises to the file's exact-import class FQN" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     try testing.expectEqualStrings("com.ga.Operation.Marker", loweredCheckTypeName(&b, &ty));
     // A file without the import keeps the bare simple name.
@@ -453,8 +452,6 @@ test "bare is-check type normalises to the file's exact-import class FQN" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     try testing.expectEqualStrings("Marker", loweredCheckTypeName(&b, &ty2));
 }
@@ -562,12 +559,13 @@ test "typed explicit extension receiver supplies trailing lambda arity" {
     var recv_segs = [_]ast.Ident{.{ .name = "outerScope", .span = dummySpan() }};
     const receiver = Expr{ .Path = .{ .segments = &recv_segs, .span = dummySpan() } };
     var implicit_it = [_]ast.Ident{.{ .name = "it", .span = dummySpan() }};
-    const args = [_]Expr{.{ .Lambda = .{
+    var lam_node_568 = ast.LambdaExpr{
         .params = &implicit_it,
         .body = .{ .stmts = &.{}, .span = dummySpan() },
         .span = dummySpan(),
         .implicit_it = true,
-    } }};
+    };
+    const args = [_]Expr{.{ .Lambda = &lam_node_568 }};
     const arities = (try memberCallArgArities(&b, &receiver, "launch", &args, &.{})).?;
     defer a.free(arities);
     try testing.expectEqualSlices(i16, &.{0}, arities);
@@ -1067,13 +1065,13 @@ test "explicit member extension emits its resolved declaration identity" {
         b.blocks.items[b.cur.int()].insts.len - 1
     ];
     try testing.expect(inst == .CallMember);
-    try testing.expectEqual(target, inst.CallMember.resolved.?);
-    try testing.expect(inst.CallMember.dispatch_receiver != null);
+    try testing.expectEqual(target, inst.CallMember.x().resolved.?);
+    try testing.expect(inst.CallMember.x().dispatch_receiver != null);
     var found_dispatch = false;
     for (b.blocks.items[b.cur.int()].insts) |candidate| {
         if (candidate != .LoadGlobal) continue;
         if (candidate.LoadGlobal.class == owner and
-            candidate.LoadGlobal.dst == inst.CallMember.dispatch_receiver.?)
+            candidate.LoadGlobal.dst == inst.CallMember.x().dispatch_receiver.?)
         {
             found_dispatch = true;
             break;
@@ -1248,11 +1246,12 @@ test "trailing lambda's implicit label survives a call-shaped receiver" {
         .safe = false,
         .span = dummySpan(),
     } };
-    var args = [_]Expr{.{ .Lambda = .{
+    var lam_node_1254 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &.{}, .span = dummySpan() },
         .span = dummySpan(),
-    } }};
+    };
+    var args = [_]Expr{.{ .Lambda = &lam_node_1254 }};
     var arg_names = [_]?[]const u8{null};
     const e = Expr{ .Call = .{
         .callee = &callee,
@@ -1270,7 +1269,7 @@ test "trailing lambda's implicit label survives a call-shaped receiver" {
     var found = false;
     for (m.funcs.items) |*f| {
         if (f.is_lambda) {
-            try testing.expectEqualStrings("apply", f.implicit_label orelse "");
+            try testing.expectEqualStrings("apply", f.x().implicit_label orelse "");
             found = true;
         }
     }
@@ -1300,8 +1299,6 @@ test "inline extension receiver type remains available during body splicing" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     _ = try b.bindSpliceParamTy("minimumValue", param_ty);
     var segments = [_]ast.Ident{.{

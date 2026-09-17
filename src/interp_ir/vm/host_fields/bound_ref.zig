@@ -84,7 +84,7 @@ pub fn stampRefAdaptation(self: *VmHost, allocator: Allocator, v: *const Value, 
                 defer hit.class.deinit();
                 const decl = hit.method.decl.get();
                 declared = decl.params.len + @as(usize, if (bound) 0 else 1);
-                returns_unit = if (decl.return_type) |*rt| std.mem.eql(u8, typeHeadOf(rt.name.name), "Unit") else (if (decl.body) |bd| bd == .Block else false);
+                returns_unit = if (decl.return_type) |rt| std.mem.eql(u8, typeHeadOf(rt.name.name), "Unit") else (if (decl.body) |bd| bd == .Block else false);
                 for (decl.params, 0..) |*prm, i| if (prm.is_vararg) {
                     has_vararg = true;
                     vararg_at = i + @as(usize, if (bound) 0 else 1);

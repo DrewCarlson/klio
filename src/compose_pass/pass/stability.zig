@@ -182,9 +182,9 @@ const StabilityClassifier = struct {
             }
             if (p.getter != null and p.init == null and p.explicit_field == null) continue;
             if (p.mutable) return false;
-            if (p.ty) |*ty| {
+            if (p.ty) |ty| {
                 if (!try self.typeStable(ty, tps)) return false;
-            } else if (p.init) |*ini| {
+            } else if (p.init) |ini| {
                 if (!literalStable(ini)) return false;
             }
         }

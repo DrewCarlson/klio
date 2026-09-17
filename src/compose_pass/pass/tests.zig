@@ -72,13 +72,14 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     } } }};
     var lam_params: [0]Ident = .{};
     var lam_ptys: [0]?TypeRef = .{};
-    var col_args = [_]Expr{.{ .Lambda = .{
+    var lam_node_75 = ast.LambdaExpr{
         .params = &lam_params,
         .param_tys = &lam_ptys,
         .body = .{ .stmts = &lam_body_stmts, .span = gsp },
         .implicit_it = true,
         .span = gsp,
-    } }};
+    };
+    var col_args = [_]Expr{.{ .Lambda = &lam_node_75 }};
     var col_segs = [_]Ident{dummyIdent("Column")};
     var col_callee = Expr{ .Path = .{ .segments = &col_segs, .span = gsp } };
     var col_names = [_]?[]const u8{null};
@@ -292,12 +293,13 @@ test "a @Composable getter property is collected and detected as composable cont
         .has_trailing_lambda = false,
         .span = gsp,
     } } }};
-    const lam = Expr{ .Lambda = .{
+    var lam_node_295 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &lam_stmts, .span = gsp },
         .implicit_it = false,
         .span = gsp,
-    } };
+    };
+    const lam = Expr{ .Lambda = &lam_node_295 };
 
     var ctx: u8 = 0;
     var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = noComposable, .oracle_ctx = &ctx };
@@ -356,7 +358,7 @@ test "transform injects composer/changed params and brackets the body" {
     const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
     var app_params = [_]Param{.{
         .name = dummyIdent("x"),
-        .ty = .{ .name = dummyIdent("Int"), .nullable = false, .span = gsp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .ty = .{ .name = dummyIdent("Int"), .nullable = false, .span = gsp, .type_args = &.{}, .function = null, .definitely_non_null = false },
         .default = null,
         .is_vararg = false,
         .is_crossinline = false,
@@ -427,7 +429,7 @@ test "defaulted composable param becomes marker-guarded prologue" {
     var five = Expr{ .IntLit = .{ .value = 5, .kind = .Int, .span = gsp } };
     var app_params = [_]Param{.{
         .name = dummyIdent("x"),
-        .ty = .{ .name = dummyIdent("Int"), .nullable = false, .span = gsp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .ty = .{ .name = dummyIdent("Int"), .nullable = false, .span = gsp, .type_args = &.{}, .function = null, .definitely_non_null = false },
         .default = &five,
         .is_vararg = false,
         .is_crossinline = false,
@@ -515,13 +517,14 @@ test "a conditional initializer propagates its composable function type to lambd
         b.pathExpr("ReusableContentHost"),
         a.alloc(Expr, 0) catch @panic("oom"),
     ) }};
-    const lambda = Expr{ .Lambda = .{
+    var lam_node_518 = ast.LambdaExpr{
         .params = &lambda_params,
         .param_tys = &lambda_param_tys,
         .body = .{ .stmts = &body_stmts, .span = gsp },
         .implicit_it = true,
         .span = gsp,
-    } };
+    };
+    const lambda = Expr{ .Lambda = &lam_node_518 };
     var value = Expr{ .If = .{
         .cond = b.box(.{ .BoolLit = .{ .value = true, .span = gsp } }),
         .then_branch = b.box(b.pathExpr("content")),
@@ -560,24 +563,26 @@ test "remember propagates a composable result type into its calculation result" 
         b.pathExpr("Box"),
         a.alloc(Expr, 0) catch @panic("oom"),
     ) }};
-    const content = Expr{ .Lambda = .{
+    var lam_node_563 = ast.LambdaExpr{
         .params = &content_params,
         .param_tys = &content_param_tys,
         .body = .{ .stmts = &content_stmts, .span = gsp },
         .implicit_it = true,
         .span = gsp,
-    } };
+    };
+    const content = Expr{ .Lambda = &lam_node_563 };
 
     var calculation_params: [0]Ident = .{};
     var calculation_param_tys: [0]?TypeRef = .{};
     var calculation_stmts = [_]Stmt{.{ .Expr = content }};
-    const calculation = Expr{ .Lambda = .{
+    var lam_node_574 = ast.LambdaExpr{
         .params = &calculation_params,
         .param_tys = &calculation_param_tys,
         .body = .{ .stmts = &calculation_stmts, .span = gsp },
         .implicit_it = true,
         .span = gsp,
-    } };
+    };
+    const calculation = Expr{ .Lambda = &lam_node_574 };
     const remember_args = try a.alloc(Expr, 1);
     remember_args[0] = calculation;
     var value = b.call(b.pathExprSegs(&.{ "androidx", "compose", "runtime", "remember" }), remember_args);
@@ -614,15 +619,16 @@ test "threadCall re-names a trailing lambda across a defaulted gap" {
     var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = gsp } };
     var lam_params: [0]Ident = .{};
     var lam_ptys: [0]?TypeRef = .{};
+    var lam_node_619 = ast.LambdaExpr{
+        .params = &lam_params,
+        .param_tys = &lam_ptys,
+        .body = .{ .stmts = &.{}, .span = gsp },
+        .implicit_it = false,
+        .span = gsp,
+    };
     var args = [_]Expr{
         .{ .IntLit = .{ .value = 42, .kind = .Int, .span = gsp } },
-        .{ .Lambda = .{
-            .params = &lam_params,
-            .param_tys = &lam_ptys,
-            .body = .{ .stmts = &.{}, .span = gsp },
-            .implicit_it = false,
-            .span = gsp,
-        } },
+        .{ .Lambda = &lam_node_619 },
     };
     var arg_names = [_]?[]const u8{ null, null };
     var call = Expr{ .Call = .{
@@ -659,15 +665,16 @@ test "threadCall leaves a non-content overload's trailing lambda positional" {
     var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = gsp } };
     var lam_params: [0]Ident = .{};
     var lam_ptys: [0]?TypeRef = .{};
+    var lam_node_664 = ast.LambdaExpr{
+        .params = &lam_params,
+        .param_tys = &lam_ptys,
+        .body = .{ .stmts = &.{}, .span = gsp },
+        .implicit_it = false,
+        .span = gsp,
+    };
     var args = [_]Expr{
         .{ .IntLit = .{ .value = 7, .kind = .Int, .span = gsp } },
-        .{ .Lambda = .{
-            .params = &lam_params,
-            .param_tys = &lam_ptys,
-            .body = .{ .stmts = &.{}, .span = gsp },
-            .implicit_it = false,
-            .span = gsp,
-        } },
+        .{ .Lambda = &lam_node_664 },
     };
     var arg_names = [_]?[]const u8{ null, null };
     var call = Expr{ .Call = .{
@@ -701,13 +708,14 @@ test "a sink lambda is shaped with the bare pair; slots come from resolution" {
     // Bar(title = { }): the pass appends only the composer pair, no synthetic `it`.
     var segs = [_]Ident{dummyIdent("Bar")};
     var callee = Expr{ .Path = .{ .segments = &segs, .span = gsp } };
-    var args = [_]Expr{.{ .Lambda = .{
+    var lam_node_704 = ast.LambdaExpr{
         .params = &.{},
         .param_tys = &.{},
         .body = .{ .stmts = &.{}, .span = gsp },
         .implicit_it = true,
         .span = gsp,
-    } }};
+    };
+    var args = [_]Expr{.{ .Lambda = &lam_node_704 }};
     var arg_names = [_]?[]const u8{"title"};
     var call = Expr{ .Call = .{
         .callee = &callee,
@@ -765,13 +773,14 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
     // ($composer, $changed) and no `it`.
     var lam_params: [0]Ident = .{};
     var lam_ptys: [0]?TypeRef = .{};
-    var call_args = [_]Expr{.{ .Lambda = .{
+    var lam_node_768 = ast.LambdaExpr{
         .params = &lam_params,
         .param_tys = &lam_ptys,
         .body = .{ .stmts = &.{}, .span = gsp },
         .implicit_it = true,
         .span = gsp,
-    } }};
+    };
+    var call_args = [_]Expr{.{ .Lambda = &lam_node_768 }};
     var segs = [_]Ident{dummyIdent("movableContentWithReceiverOf")};
     var callee = Expr{ .Path = .{ .segments = &segs, .span = gsp } };
     var names = [_]?[]const u8{null};
@@ -782,8 +791,6 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     }};
     var body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
         .callee = &callee,
@@ -816,8 +823,6 @@ fn testTypeRef(name: []const u8) TypeRef {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 
@@ -838,10 +843,7 @@ fn testClass(name: []const u8, primary_params: []ast.ClassParam) ast.Class {
     return .{
         .name = dummyIdent(name),
         .type_params = &.{},
-        .where_bounds = &.{},
         .primary_params = primary_params,
-        .init_blocks = &.{},
-        .init_block_positions = &.{},
         .supertypes = &.{},
         .supertype_args = &.{},
         .supertype_delegates = &.{},
@@ -852,14 +854,12 @@ fn testClass(name: []const u8, primary_params: []ast.ClassParam) ast.Class {
         .is_open = false,
         .is_abstract = false,
         .is_inner = false,
-        .secondary_ctors = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .is_value = false,
         .is_annotation = false,
         .is_expect = false,
         .is_actual = false,
-        .enum_entries = &.{},
         .members = &.{},
         .visibility = .Public,
         .primary_ctor_visibility = null,
@@ -969,15 +969,16 @@ test "key(k) { } gains a movable-group bracket with the dynamic key" {
     var lam_params: [0]Ident = .{};
     var lam_ptys: [0]?TypeRef = .{};
     var k_segs = [_]Ident{dummyIdent("k")};
+    var lam_node_974 = ast.LambdaExpr{
+        .params = &lam_params,
+        .param_tys = &lam_ptys,
+        .body = .{ .stmts = &lam_body_stmts, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    };
     var key_args = [_]Expr{
         .{ .Path = .{ .segments = &k_segs, .span = gsp } },
-        .{ .Lambda = .{
-            .params = &lam_params,
-            .param_tys = &lam_ptys,
-            .body = .{ .stmts = &lam_body_stmts, .span = gsp },
-            .implicit_it = true,
-            .span = gsp,
-        } },
+        .{ .Lambda = &lam_node_974 },
     };
     var key_segs = [_]Ident{dummyIdent("key")};
     var key_callee = Expr{ .Path = .{ .segments = &key_segs, .span = gsp } };
@@ -1026,13 +1027,14 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
     var noparams_l: [0]Ident = .{};
     var noptys_l: [0]?TypeRef = .{};
     const inner_lam = try a.create(Expr);
-    inner_lam.* = .{ .Lambda = .{
+    var lam_node_1029 = ast.LambdaExpr{
         .params = &noparams_l,
         .param_tys = &noptys_l,
         .body = .{ .stmts = inner_body, .span = gsp },
         .implicit_it = true,
         .span = gsp,
-    } };
+    };
+    inner_lam.* = .{ .Lambda = &lam_node_1029 };
     const il_segs = try a.alloc(Ident, 1);
     il_segs[0] = dummyIdent("InlineLinear");
     const inner_callee = try a.create(Expr);
@@ -1055,13 +1057,14 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
     const outer_body = try a.alloc(Stmt, 1);
     outer_body[0] = .{ .Expr = inner_call.* };
     const outer_lam = try a.create(Expr);
-    outer_lam.* = .{ .Lambda = .{
+    var lam_node_1058 = ast.LambdaExpr{
         .params = &noparams_l,
         .param_tys = &noptys_l,
         .body = .{ .stmts = outer_body, .span = gsp },
         .implicit_it = true,
         .span = gsp,
-    } };
+    };
+    outer_lam.* = .{ .Lambda = &lam_node_1058 };
     const outer_labeled = try a.create(Expr);
     outer_labeled.* = .{ .Labeled = .{ .label = dummyIdent("outer"), .expr = outer_lam, .span = gsp } };
     const ol_segs = try a.alloc(Ident, 1);
@@ -1102,7 +1105,7 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
     try testing.expect(olam.body.stmts[0] == .Decl);
     const marker_prop = olam.body.stmts[0].Decl.Property;
     try testing.expect(!marker_prop.mutable);
-    try testing.expect(marker_prop.init.? == .Member);
+    try testing.expect(marker_prop.init.?.* == .Member);
     try testing.expectEqualStrings("currentMarker", marker_prop.init.?.Member.name.name);
     const marker_name = marker_prop.name.name;
     // The inner sink lambda's `return@outer` became `{ endToMarker(m); return }`.
@@ -1201,7 +1204,7 @@ test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
     try testing.expect(isComposerCallStmt(&plain_then[0], "startReplaceGroup"));
     try testing.expect(plain_then[1] == .Decl);
     const branch_result = plain_then[1].Decl.Property;
-    try testing.expect(branch_result.init.? == .Call);
+    try testing.expect(branch_result.init.?.* == .Call);
     try testing.expectEqualStrings("Foo", branch_result.init.?.Call.callee.Path.segments[0].name);
     try testing.expect(isComposerCallStmt(&plain_then[2], "endReplaceGroup"));
     try testing.expect(plain_then[3] == .Expr);

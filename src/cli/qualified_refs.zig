@@ -183,7 +183,7 @@ fn walkBlock(
 ) Allocator.Error!void {
     for (b.stmts) |s| switch (s) {
         .Expr => |e| try walkExpr(allocator, out, &e),
-        .Decl => |d| try walkDecl(allocator, out, d),
+        .Decl => |d| try walkDecl(allocator, out, d.*),
         .Assign => |a| {
             try walkExpr(allocator, out, &a.target);
             try walkExpr(allocator, out, &a.value);
@@ -216,7 +216,7 @@ fn walkDecl(
             if (fun.body) |body| try walkFunctionBody(allocator, out, body);
         },
         .Property => |prop| {
-            if (prop.init) |e| try walkExpr(allocator, out, &e);
+            if (prop.init) |e| try walkExpr(allocator, out, e);
             if (prop.delegate) |e| try walkExpr(allocator, out, e);
             if (prop.getter) |g| try walkFunctionBody(allocator, out, g.body);
             if (prop.setter) |s| try walkFunctionBody(allocator, out, s.body);
@@ -231,8 +231,8 @@ fn walkDecl(
             for (cls.supertype_delegates) |maybe_del| {
                 if (maybe_del) |del| try walkExpr(allocator, out, &del);
             }
-            for (cls.init_blocks) |ib| try walkBlock(allocator, out, ib);
-            for (cls.secondary_ctors) |ctor| {
+            for (cls.x().init_blocks) |ib| try walkBlock(allocator, out, ib);
+            for (cls.x().secondary_ctors) |ctor| {
                 switch (ctor.delegation) {
                     .This => |args| for (args) |*a| try walkExpr(allocator, out, a),
                     .Super => |args| for (args) |*a| try walkExpr(allocator, out, a),
@@ -240,7 +240,7 @@ fn walkDecl(
                 }
                 if (ctor.body) |b| try walkBlock(allocator, out, b);
             }
-            for (cls.enum_entries) |entry| {
+            for (cls.x().enum_entries) |entry| {
                 for (entry.args) |*a| try walkExpr(allocator, out, a);
                 for (entry.body_members) |m| try walkDecl(allocator, out, m);
             }
@@ -268,7 +268,7 @@ fn collectFromSource(arena: Allocator, out_alloc: Allocator, src: []const u8) !s
     const s = sm.get(fid).source;
     var lx = try lexer.Lexer.init(arena, fid, s);
     const lexed = try lx.tokenize();
-    const p = parser.Parser.new(arena, fid, s, lexed.tokens);
+    const p = parser.Parser.new(arena, fid, s, lexed.tokens, lexed.strings);
     const file = p.parseFile();
     const files = [_]KotlinFile{file};
     return collect(out_alloc, &files);

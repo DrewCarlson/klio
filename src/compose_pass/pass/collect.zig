@@ -76,11 +76,11 @@ fn collectParamsInto(a: std.mem.Allocator, map: *std.StringHashMap(ComposablePar
 }
 
 pub fn isComposableLambdaParam(p: *const Param) bool {
-    return p.ty.function != null and isComposable(p.ty.annotations);
+    return p.ty.function != null and isComposable(p.ty.x().annotations);
 }
 
 pub fn isComposableFnType(t: *const ast.TypeRef) bool {
-    return t.function != null and isComposable(t.annotations);
+    return t.function != null and isComposable(t.x().annotations);
 }
 
 pub fn stateOfComposableArity(t: *const ast.TypeRef) ?u8 {
@@ -159,7 +159,7 @@ fn sinkContentReach(params: anytype) ?u8 {
     const n = sinkParamCount(params);
     if (n == 0) return null;
     const lp = &params[n - 1];
-    if (lp.ty.function == null or !isComposable(lp.ty.annotations)) return null;
+    if (lp.ty.function == null or !isComposable(lp.ty.x().annotations)) return null;
     var required: u8 = 0;
     for (params[0 .. n - 1]) |*p| {
         if (p.default == null and !p.is_vararg) required += 1;
@@ -301,7 +301,7 @@ fn collectSinksInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.
         .Class => |*c| {
             // A class whose primary constructor takes a `@Composable` lambda is a sink too.
             for (c.primary_params) |*p| {
-                if (p.ty.function != null and isComposable(p.ty.annotations)) {
+                if (p.ty.function != null and isComposable(p.ty.x().annotations)) {
                     try set.put(c.name.name, {});
                     break;
                 }

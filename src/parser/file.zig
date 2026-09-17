@@ -632,8 +632,6 @@ pub fn parseContextClause(p: *Parser) ContextClause {
                 .type_args = &.{},
                 .function = null,
                 .definitely_non_null = false,
-                .annotations = &.{},
-                .qualified_path = null,
             };
             var pspan = name.span.join(ty.span);
             if (std.meta.activeTag(support.peekKind(p).*) == .Eq) {

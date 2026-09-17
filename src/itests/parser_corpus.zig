@@ -29,7 +29,7 @@ fn render(arena: Allocator, src: []const u8) ![]u8 {
     const id = span.FileId.from(0);
     var lx = try lexer.Lexer.init(arena, id, src);
     const lexed = try lx.tokenize();
-    const p = parser.Parser.new(arena, id, src, lexed.tokens);
+    const p = parser.Parser.new(arena, id, src, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
 
     var out: std.ArrayList(u8) = .empty;

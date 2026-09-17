@@ -281,7 +281,7 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         },
         .CallSpread => |cs| return execArmCallSpread(H, allocator, frame, cs, host),
         .CallSuper => |csup| return execArmCallSuper(H, allocator, frame, csup, host),
-        .CallMemberOrGlobal => |*cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
+        .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |*cm| return execArmCallMember(H, allocator, frame, cm, host),
         .CallVirtual => |*cv| return execArmCallVirtual(H, allocator, frame, cv, host),
         .CallMemberOrValue => |cmv| return execArmCallMemberOrValue(H, allocator, frame, cmv, host),
@@ -1101,7 +1101,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         if (constStr(frame.module, cm.name)) |nm| {
             if (std.mem.eql(u8, nm, want)) {
                 const chain = ev_state.evtls.active_chain;
-                const drecv_tn: []const u8 = if (cm.dispatch_receiver) |reg| blk: {
+                const drecv_tn: []const u8 = if (cm.x().dispatch_receiver) |reg| blk: {
                     const dv = frame.read(reg);
                     if (dv == .Instance) {
                         const g = dv.Instance.borrow();
@@ -1116,7 +1116,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 std.debug.print("[cmarm] name={s} in={s} resolved={} dispatch={s} chain_len={d} chain_base={d}\n", .{
                     nm,
                     frame.func.name,
-                    cm.resolved != null,
+                    cm.x().resolved != null,
                     drecv_tn,
                     if (chain) |c| c.items.len else 0,
                     ev_state.evtls.active_chain_base,
@@ -1139,12 +1139,12 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     }
     // Complete lowering evidence selected this declaration: execute that identity before any
     // representation fast path. An invalid one is a link error, never licence to re-resolve.
-    if (cm.resolved) |fid| {
+    if (cm.x().resolved) |fid| {
         dispatchBump(.call_member_resolved);
         if (comptime @hasDecl(H, "invokeResolvedMember")) {
             recv.retain();
             defer recv.release(allocator);
-            var dispatch_recv: ?Value = if (cm.dispatch_receiver) |reg|
+            var dispatch_recv: ?Value = if (cm.x().dispatch_receiver) |reg|
                 frame.read(reg)
             else
                 null;
@@ -1154,8 +1154,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             defer allocator.free(ra);
             // Scalar-replay leaf: the receiver rides as param 0 (opaque genre when non-scalar);
             // a bail falls through to the ordinary invokers, which re-run the pure body exactly.
-            if (argNamesAllNull(cm.arg_names) and ra.len + 1 <= 8 and
-                cm.dispatch_receiver == null and recv != .Null) leaf: {
+            if (argNamesAllNull(cm.x().arg_names) and ra.len + 1 <= 8 and
+                cm.x().dispatch_receiver == null and recv != .Null) leaf: {
                 const lf = frame.module.funcById(fid) orelse break :leaf;
                 var all: [8]Value = undefined;
                 all[0] = recv;
@@ -1171,7 +1171,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             // A resolved plain member at the fully-applied no-vararg shape runs as a pushed activation;
             // member extensions and every padded or vararg shape keep the recursive invoker.
             if (comptime @hasDecl(H, "prepareResolvedFlatCall")) {
-                if (flatEnabled() and vcallFlatEnabled() and argNamesAllNull(cm.arg_names)) {
+                if (flatEnabled() and vcallFlatEnabled() and argNamesAllNull(cm.x().arg_names)) {
                     if (try host.prepareResolvedFlatCall(allocator, &recv, fid, ra)) |prep0| {
                         dispatchBump(.resolved_flat_prepare);
                         var prep = prep0;
@@ -1185,7 +1185,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 value
             else
                 null;
-            const names_resolved = try resolveArgNames(allocator, frame.module, cm.arg_names);
+            const names_resolved = try resolveArgNames(allocator, frame.module, cm.x().arg_names);
             defer allocator.free(names_resolved);
             switch (try host.invokeResolvedMember(
                 allocator,
@@ -1240,7 +1240,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
     if (parent.frame_count_on) parent.cm_args_ns +%= gfNow() -% cm_args_t0;
     defer allocator.free(arg_values);
-    const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
+    const names = try resolveArgNames(allocator, frame.module, cm.x().arg_names);
     defer freeArgNames(allocator, names);
     // Keep the caller's instance `this` reachable while the dispatch resolves (the
     // member-extension visibility filter consults the chain); the entry is access-only.
@@ -1253,13 +1253,13 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             pushed_enclosing = true;
         }
     }
-    const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
-    const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
+    const static_recv: ?[]const u8 = if (cm.x().static_recv) |sid| constStr(frame.module, sid) else null;
+    const declared_recv: ?[]const u8 = if (cm.x().declared_recv) |did| constStr(frame.module, did) else null;
     // Site memo replay: the claimed (class, arg-signature) pair serves its recorded target.
     // The signature is the same strict fold the method cache keys under, so no overload slips.
     if (parent.frame_count_on) parent.cm_pre_ns +%= gfNow() -% cm_t0;
     if (comptime @hasDecl(H, "memberSiteSig") and @hasDecl(H, "prepareMemberFlatFromFid")) {
-        if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names)) {
+        if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.x().arg_names)) {
             const w0 = @atomicLoad(u64, @constCast(&cm.site_cls), .acquire);
             if (w0 > 1) site: {
                 const cls_now: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(recv.Instance));
@@ -1336,7 +1336,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             defer if (parent.frame_count_on) {
                 parent.cm_prep_ns +%= gfNow() -% cm_prep_t0;
             };
-            const prep_opt: ?FlatCallReq = if (argNamesAllNull(cm.arg_names))
+            const prep_opt: ?FlatCallReq = if (argNamesAllNull(cm.x().arg_names))
                 try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)
             else if (comptime @hasDecl(H, "prepareMemberFlatCallNamed"))
                 // A NAMED call whose binding permutation is known replays into declaration order.
@@ -1351,7 +1351,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 // Claim the site memo for the resolved target, keyed by receiver class and strict
                 // argument signature, once resolution is stable and only for the positional form.
                 if (comptime @hasDecl(H, "memberSiteSig")) {
-                    if (memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names) and
+                    if (memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.x().arg_names) and
                         dispatchCacheStable())
                     {
                         if (host.memberSiteSig(arg_values)) |sig| {
@@ -1376,7 +1376,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     // Host member serves answer ahead of the ladder entry and claim the site with a
     // host-kind route, so later executions skip the flat-prepare decline walk.
     if (comptime @hasDecl(H, "hostMemberServeProbe")) {
-        if (recv == .Instance and argNamesAllNull(cm.arg_names)) {
+        if (recv == .Instance and argNamesAllNull(cm.x().arg_names)) {
             if (try host.hostMemberServeProbe(allocator, &recv, name_str, arg_values)) |hit| {
                 if (comptime @hasDecl(H, "memberSiteSig")) {
                     if (memberSiteEnabled() and dispatchCacheStable() and
@@ -1404,11 +1404,11 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     dispatchBump(.member_ladder);
     ladderStatsBump(&recv, name_str, frame.func.name);
     runtime.prof.opRoute(2);
-    const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
+    const prev_tl = if (cm.x().trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
     else
         false;
-    const tl_touched = cm.trailing_lambda;
+    const tl_touched = cm.x().trailing_lambda;
     const res = if (static_recv) |sname|
         host.callMemberNamedStatic(allocator, &recv, name_str, arg_values, names, sname)
     else if (declared_recv != null)

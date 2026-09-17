@@ -2878,6 +2878,7 @@ test "codec preserves explicit receiver-lambda shape" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    const extra = ir.FuncExtra{ .lambda_receiver_ty = "String" };
     const func = ir.Func{
         .id = FuncId.from(0),
         .name = "<lambda>",
@@ -2890,33 +2891,36 @@ test "codec preserves explicit receiver-lambda shape" {
         .is_suspend = false,
         .lambda_receiver_shape_known = true,
         .lambda_has_receiver = true,
-        .lambda_receiver_ty = "String",
+        .extra = &extra,
     };
     const bytes = try encodeOne(ir.Func, a, &func);
     const got = try decodeOne(ir.Func, a, bytes);
+    defer if (got.extra) |e| a.destroy(e);
     try testing.expect(got.lambda_receiver_shape_known);
     try testing.expect(got.lambda_has_receiver);
-    try testing.expectEqualStrings("String", got.lambda_receiver_ty.?);
+    try testing.expectEqualStrings("String", got.x().lambda_receiver_ty.?);
 }
 
 test "codec preserves both receivers of an exact member extension call" {
     const a = testing.allocator;
+    const extra = ir.CallMemberExtra{ .resolved = ir.FuncId.from(5), .dispatch_receiver = ir.Reg.from(6) };
     const inst = ir.Inst{ .CallMember = .{
         .dst = ir.Reg.from(1),
         .receiver = ir.Reg.from(2),
         .name = ir.ConstId.from(3),
         .args = ir.Reg.from(4),
         .n_args = 0,
-        .resolved = ir.FuncId.from(5),
-        .dispatch_receiver = ir.Reg.from(6),
+        .extra = &extra,
     } };
     const bytes = try encodeOne(ir.Inst, a, &inst);
     defer a.free(bytes);
     const got = try decodeOne(ir.Inst, a, bytes);
     try testing.expect(got == .CallMember);
+    // The decode boxed the extra facts; the test owns that box.
+    defer if (got.CallMember.extra) |e| a.destroy(e);
     try testing.expectEqual(ir.Reg.from(2), got.CallMember.receiver);
-    try testing.expectEqual(ir.FuncId.from(5), got.CallMember.resolved.?);
-    try testing.expectEqual(ir.Reg.from(6), got.CallMember.dispatch_receiver.?);
+    try testing.expectEqual(ir.FuncId.from(5), got.CallMember.x().resolved.?);
+    try testing.expectEqual(ir.Reg.from(6), got.CallMember.x().dispatch_receiver.?);
 }
 
 test "module image preserves linked identities with lazy function headers" {
@@ -3052,7 +3056,7 @@ test "codec resolves an external pointer aliasing a boxed Param default" {
     var def_expr = ast.Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = sp } };
     var params = [_]ast.Param{.{
         .name = .{ .name = "x", .span = sp },
-        .ty = .{ .name = .{ .name = "Int", .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .ty = .{ .name = .{ .name = "Int", .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false },
         .default = &def_expr,
         .is_vararg = false,
         .is_crossinline = false,

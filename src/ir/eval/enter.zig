@@ -276,8 +276,8 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
     // A deferred body has no blocks yet; wait for the post-materialize call.
     if (func.blocks.len == 0) return;
     dump_fn_done = true;
-    std.debug.print("[dump-fn] {s}#{d} params={d} blocks={d} recv_ty={?s} caps=", .{ func.fqn, func.id.int(), func.params.len, func.blocks.len, func.lambda_receiver_ty });
-    for (func.capture_order) |cn| std.debug.print("{s},", .{cn});
+    std.debug.print("[dump-fn] {s}#{d} params={d} blocks={d} recv_ty={?s} caps=", .{ func.fqn, func.id.int(), func.params.len, func.blocks.len, func.x().lambda_receiver_ty });
+    for (func.x().capture_order) |cn| std.debug.print("{s},", .{cn});
     std.debug.print("\n", .{});
     for (func.blocks, 0..) |*blk, bi| {
         std.debug.print("  block {d}:\n", .{bi});
@@ -288,7 +288,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
                 .GetField => |x| std.debug.print(" field={s} recv=r{d} dst=r{d}", .{ constStr(module, x.field) orelse "?", x.receiver.int(), x.dst.int() }),
                 .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
                 .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d} func={?d} final={} class={?d} cands={d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int(), if (x.func) |f| f.int() else null, x.func_final, if (x.class) |c| c.int() else null, if (x.candidates) |cl| cl.len else 0 }),
-                .CallMember => |x| std.debug.print(" name={s} recv=r{d} resolved={?d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), if (x.resolved) |f| f.int() else null }),
+                .CallMember => |x| std.debug.print(" name={s} recv=r{d} resolved={?d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), if (x.x().resolved) |f| f.int() else null }),
                 .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
                 .AstLambda => |x| std.debug.print(" dst=r{d} body=#{?d}", .{ x.dst.int(), if (x.body_func) |bf| bf.int() else null }),
@@ -369,7 +369,7 @@ fn frameMatchesLabel(func: *const Func, label: []const u8) bool {
     {
         return true;
     }
-    if (func.implicit_label) |il| return std.mem.eql(u8, il, label);
+    if (func.x().implicit_label) |il| return std.mem.eql(u8, il, label);
     return false;
 }
 
@@ -521,7 +521,7 @@ pub fn frameBoundary(func: *const Func, result_in: EvalResult) EvalResult {
     }
     if (result == .err and result.err == .LabeledReturn) {
         if (lrTraceOn()) {
-            std.debug.print("[lr] label={s} passed_frame={s} implicit={s}\n", .{ result.err.LabeledReturn.label, func.name, func.implicit_label orelse "-" });
+            std.debug.print("[lr] label={s} passed_frame={s} implicit={s}\n", .{ result.err.LabeledReturn.label, func.name, func.x().implicit_label orelse "-" });
         }
     }
     // A bare integer literal returned into a declared `Long` carries an `Int` tag out of the body.

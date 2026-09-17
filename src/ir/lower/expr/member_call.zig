@@ -1254,14 +1254,14 @@ fn emitResolvedMemberCall(
         } else null;
         const dst = b.allocReg();
         if (has_spread) {
-            try b.push(.{ .CallSpread = .{
+            try b.push(.{ .CallSpread = try b.boxInst(ir.CallSpreadInst{
                 .dst = dst,
                 .callee = recv_reg,
                 .parts = try lowerSpreadParts(b, args),
                 .virtual_slot = ir.MethodSlotId.fromFunc(func_id),
                 .arg_params = arg_params,
                 .trailing_lambda = b.callTrailingLambda(),
-            } });
+            }) });
             return .{ .lowered = dst };
         }
         const run = try lowerArgRunWithArity(b, args, arg_arity);
@@ -1272,9 +1272,7 @@ fn emitResolvedMemberCall(
             .slot = ir.MethodSlotId.fromFunc(func_id),
             .args = run[0],
             .n_args = run[1],
-            .arg_params = arg_params,
-            .arg_names = if (arg_params == null) arg_names else &.{},
-            .trailing_lambda = b.callTrailingLambda(),
+            .extra = try b.virtualExtra(.{ .arg_params = arg_params, .arg_names = if (arg_params == null) arg_names else &.{}, .trailing_lambda = b.callTrailingLambda() }),
         } });
         return .{ .lowered = dst };
     }
@@ -1693,11 +1691,7 @@ fn emitExtensionCall(x: ExtCall) Allocator.Error!?Reg {
             .name = method_name,
             .args = run[0],
             .n_args = run[1],
-            .arg_names = arg_names,
-            .trailing_lambda = b.callTrailingLambda(),
-            .declared_recv = declared_recv,
-            .resolved = func_id,
-            .dispatch_receiver = dispatch_reg,
+            .extra = try b.memberExtra(.{ .arg_names = arg_names, .trailing_lambda = b.callTrailingLambda(), .declared_recv = declared_recv, .resolved = func_id, .dispatch_receiver = dispatch_reg }),
         } });
         return dst;
     }
@@ -2468,11 +2462,9 @@ fn emitDeferredMemberCall(f: *Fallback) Allocator.Error!Reg {
         .dst = dst,
         .receiver = recv,
         .name = nm,
-        .trailing_lambda = b.callTrailingLambda(),
         .args = run[0],
         .n_args = run[1],
-        .arg_names = arg_names,
-        .declared_recv = declared_recv,
+        .extra = try b.memberExtra(.{ .trailing_lambda = b.callTrailingLambda(), .arg_names = arg_names, .declared_recv = declared_recv }),
     } });
     return dst;
 }

@@ -23,7 +23,7 @@ const TypedDefault = build_types.TypedDefault;
 pub fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
     return !bound.nullable and bound.type_args.len == 0 and
         bound.function == null and !bound.definitely_non_null and
-        bound.qualified_path == null;
+        bound.x().qualified_path == null;
 }
 
 pub fn collectClassTypeParamBounds(
@@ -45,7 +45,7 @@ pub fn collectClassTypeParamBounds(
             });
             any_bound = true;
         }
-        for (class.where_bounds) |*where_bound| {
+        for (class.x().where_bounds) |*where_bound| {
             if (!std.mem.eql(u8, where_bound.name.name, param.name.name)) continue;
             try bounds.append(allocator, .{
                 .param = param.name.name,
@@ -117,7 +117,7 @@ pub fn typedDefaultFor(ty: ?*const ast.TypeRef) TypedDefault {
     };
     inline for (heads) |h| {
         if (std.mem.eql(u8, t.name.name, h[0])) {
-            if (t.qualified_path) |q| {
+            if (t.x().qualified_path) |q| {
                 if (!std.mem.startsWith(u8, q, "kotlin.") or !std.mem.eql(u8, q["kotlin.".len..], h[0])) return .null_ref;
             }
             return h[1];
@@ -222,8 +222,8 @@ pub fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, ou
 /// recorded in the decl scan so the bare-read type channel answers while the declaring
 /// library is still lowering.
 pub fn noteExtPropTypeHead(module: *Module, p: *const ast.Property) Allocator.Error!void {
-    const recv = &(p.receiver_type orelse return);
-    const ty = &(p.ty orelse return);
+    const recv = p.receiver_type orelse return;
+    const ty = p.ty orelse return;
     if (recv.name.name.len == 0) return;
     // A function-typed property records the `<function>` marker: no class answers a bare
     // read's type from it, but the member-call route knows `recv.name(args)` invokes it.
@@ -266,7 +266,7 @@ pub fn notePropScope(
     }
     try gop.value_ptr.append(a, .{ .fqn = fqn, .package = pkg });
     // The declared type head, so a bare read used as a receiver types statically.
-    if (p.ty) |*ty| {
+    if (p.ty) |ty| {
         if (ty.function == null and ty.name.name.len != 0) {
             try module.registry.top_level_prop_type_heads.put(fqn, ty.name.name);
             if (ty.type_args.len != 0) {
@@ -282,7 +282,7 @@ pub fn notePropScope(
                 }
             }
         }
-    } else if (p.init) |*init| {
+    } else if (p.init) |init| {
         // An unannotated property states its type through a literal initializer as definitely
         // as an annotation would, which is how the stdlib writes its file-level constants.
         if (constExprTypeHead(module, init)) |head| {
@@ -295,7 +295,7 @@ pub fn notePropScope(
     }
     // A `const val` with a literal initializer records its value so references inline it.
     if (p.is_const) {
-        if (p.init) |*init| {
+        if (p.init) |init| {
             if (constLiteralOf(init)) |cv| {
                 try module.registry.top_level_const_vals.put(fqn, cv);
             }
@@ -604,7 +604,7 @@ pub fn collectHierarchyShadowNames(start: []const u8, by_name: *const FileClasse
 /// The single expression a property's static head may be inferred from: its initializer,
 /// or an accessor-only property's single-expression getter body.
 pub fn propHeadSourceExpr(prop: *const ast.Property) ?*const ast.Expr {
-    if (prop.init) |*init| return init;
+    if (prop.init) |init| return init;
     if (prop.getter) |g| {
         if (g.body == .Expr) return &g.body.Expr;
     }
@@ -646,7 +646,7 @@ pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, 
         if (!std.mem.eql(u8, d.Function.name.name, nm)) continue;
         if (found != null) return null;
         const rt = d.Function.return_type orelse return null;
-        if (rt.nullable or rt.function != null or rt.qualified_path != null) return null;
+        if (rt.nullable or rt.function != null or rt.x().qualified_path != null) return null;
         found = rt.name.name;
     }
     if (found != null) return found;
@@ -718,7 +718,7 @@ pub fn notePropTypeRef(
 pub fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
     // A type written qualified keeps its dotted path: `name` alone is the last segment, and
     // recording just `Builder` binds a same-named class from an enclosing scope.
-    if (ty.qualified_path) |qp| return qp;
+    if (ty.x().qualified_path) |qp| return qp;
     const head = ty.name.name;
     for (c.type_params) |*tp| {
         // An UNBOUNDED class type parameter is still the property's type, and the bound record
@@ -828,7 +828,7 @@ pub fn scalarNonNullProp(p: *const ast.Property) bool {
         return false;
     }
     const init = p.init orelse return false;
-    return switch (init) {
+    return switch (init.*) {
         .IntLit, .BoolLit, .FloatLit, .CharLit => true,
         else => false,
     };
@@ -847,7 +847,7 @@ pub fn primitiveZeroFor(p: *const ast.Property) ?Value {
     }
     // Inferred: a primitive literal initializer names the type exactly.
     const init = p.init orelse return null;
-    return switch (init) {
+    return switch (init.*) {
         .IntLit => Value{ .Int = 0 },
         .BoolLit => Value{ .Bool = false },
         .FloatLit => Value{ .Double = 0.0 },

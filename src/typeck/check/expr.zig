@@ -115,7 +115,7 @@ pub fn checkBlock(self: *Checker, block: *const Block, expected: ?*const Type) A
 pub fn checkStmt(self: *Checker, stmt: *const Stmt, expected: ?*const Type) Allocator.Error!Type {
     switch (stmt.*) {
         .Expr => |*e| return self.checkExpr(e, expected),
-        .Decl => |*d| {
+        .Decl => |d| {
             try checkLocalDecl(self, d);
             return .Unit;
         },
@@ -165,11 +165,11 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
                     try self.diagnostics.emit(a, d);
                 }
             }
-            var annot: ?Type = if (p.ty) |*t| try convertTypeRefLossyH(a, t) else null;
+            var annot: ?Type = if (p.ty) |t| try convertTypeRefLossyH(a, t) else null;
             defer if (annot) |*an| an.deinit(a);
 
             var init_ty: Type = blk: {
-                if (p.init) |*init| {
+                if (p.init) |init| {
                     break :blk try self.checkExpr(init, if (annot) |*an| an else null);
                 } else if (p.delegate) |dexpr| {
                     var dt = try self.checkExpr(dexpr, null);
@@ -187,14 +187,14 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 try expr_calls.checkAssignable(self, &init_ty, &annot.?, p.init.?.span());
             }
 
-            var cn: ?[]const u8 = if (p.ty) |*t| classNameFromTyperef(t) else null;
+            var cn: ?[]const u8 = if (p.ty) |t| classNameFromTyperef(t) else null;
             if (cn == null) {
-                if (p.init) |*init| {
+                if (p.init) |init| {
                     cn = self.expr_class.get(init.span());
                 }
             }
 
-            const decl_type_name: ?[]const u8 = if (p.ty) |*t|
+            const decl_type_name: ?[]const u8 = if (p.ty) |t|
                 (if (builtinByName(t.name.name) == null) t.name.name else null)
             else
                 null;
@@ -209,7 +209,7 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
 
             // A mutable binding could be reassigned, breaking the alias.
             if (!p.mutable) {
-                if (p.init) |*init| {
+                if (p.init) |init| {
                     if (singlePathName(init)) |src| {
                         // The alias itself lives in the CFG lowering's `aliases`
                         // map, read by `cfgNarrowedAt`.
@@ -783,6 +783,9 @@ fn tyOfThrow(self: *Checker, th: @FieldType(Expr, "Throw")) Allocator.Error!Type
                     break :blk b.decl_type_name;
                 }
             }
+            if (self.shared_globals) |g| {
+                if (g.get(name)) |b| break :blk b.decl_type_name;
+            }
             break :blk null;
         };
         if (decl_ty_name) |tname| {
@@ -1207,7 +1210,7 @@ fn tyOfObjectExpr(self: *Checker, oe: @FieldType(Expr, "ObjectExpr")) Allocator.
         switch (m.*) {
             .Function => |*f| try decl_mod.checkFunction(self, f),
             .Property => |p| {
-                if (p.init) |*init| {
+                if (p.init) |init| {
                     var it = try self.checkExpr(init, null);
                     it.deinit(a);
                 }

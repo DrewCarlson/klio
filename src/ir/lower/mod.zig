@@ -161,12 +161,7 @@ fn intLit(v: i64) Expr {
 }
 
 fn freeFunc(func: Func) void {
-    for (func.blocks) |b| {
-        if (b.insts.len != 0) testing.allocator.free(b.insts);
-        if (b.catches.len != 0) testing.allocator.free(b.catches);
-    }
-    testing.allocator.free(func.blocks);
-    if (func.capture_order.len != 0) testing.allocator.free(func.capture_order);
+    func.freeBuilt(testing.allocator);
 }
 
 test "lowers_int_literal_to_const" {

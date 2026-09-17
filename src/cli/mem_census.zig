@@ -13,6 +13,37 @@ fn row(comptime name: []const u8, comptime T: type) void {
     std.debug.print("[census] sizeof {s} = {d}\n", .{ name, @sizeOf(T) });
 }
 
+fn variants(comptime name: []const u8, comptime T: type) void {
+    std.debug.print("[census] sizeof {s} = {d}; variants:", .{ name, @sizeOf(T) });
+    inline for (@typeInfo(T).@"union".fields) |f| {
+        if (@sizeOf(f.type) >= 32) std.debug.print(" {s}={d}", .{ f.name, @sizeOf(f.type) });
+    }
+    std.debug.print("\n", .{});
+}
+
+fn fields(comptime name: []const u8, comptime T: type) void {
+    std.debug.print("[census] sizeof {s} = {d}; fields:", .{ name, @sizeOf(T) });
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (@sizeOf(f.type) >= 8) std.debug.print(" {s}={d}", .{ f.name, @sizeOf(f.type) });
+    }
+    std.debug.print("\n", .{});
+}
+
+/// `KLIO_SLAB_CENSUS=shapes` prints the variant and field sizes behind the
+/// largest unions and structs, for the next boxing.
+pub fn printShapeDetail() void {
+    variants("ast.Expr", ast.Expr);
+    variants("ir.Inst", ir.Inst);
+    variants("ir.Terminator", ir.Terminator);
+    variants("ir.Const", ir.Const);
+    fields("ir.Block", ir.Block);
+    fields("ir.Func", ir.Func);
+    fields("ir.Class", ir.Class);
+    fields("ast.TypeRef", ast.TypeRef);
+    fields("ast.Class", ast.Class);
+    fields("ast.Function", ast.Function);
+}
+
 pub fn printTypeSizes() void {
     row("span.Span", span.Span);
     row("lexer.Token", lexer.Token);

@@ -47,12 +47,12 @@ pub fn collectPinned(a: Allocator, module: *const ir.Module, out: *Pinned) Alloc
 fn collectPinnedFunc(rel: *BodyRelease, f: *const ir.Func) void {
     for (f.blocks) |*b| {
         for (b.insts) |*inst| switch (inst.*) {
-            .AstLambda => |*al| rel.release(ast.Block, &al.body_ast),
+            .AstLambda => |al| rel.release(ast.Block, &al.body_ast),
             .RegisterClass => |*rc| switch (rc.class) {
                 .ptr => |p| rel.release(ast.Class, p),
                 .ref => {},
             },
-            .BuildObject => |*bo| switch (bo.ast) {
+            .BuildObject => |bo| switch (bo.ast) {
                 .ptr => |p| rel.release(Expr, p),
                 .ref => {},
             },
@@ -351,7 +351,7 @@ fn annotationsHaveComposable(annotations: []const ast.Annotation) bool {
 fn composeOracleNeedsSig(f: *const Function) bool {
     if (annotationsHaveComposable(f.annotations)) return true;
     for (f.params) |p| {
-        if (p.ty.function != null and annotationsHaveComposable(p.ty.annotations)) return true;
+        if (p.ty.function != null and annotationsHaveComposable(p.ty.x().annotations)) return true;
     }
     return false;
 }
@@ -422,9 +422,9 @@ fn blockKeepsAst(b: *const Block) bool {
 fn stmtKeepsAst(s: *const Stmt) bool {
     return switch (s.*) {
         .Expr => |*e| exprKeepsAst(e),
-        .Decl => |*d| declKeepsAst(d),
-        .Assign => |*a| exprKeepsAst(&a.target) or exprKeepsAst(&a.value),
-        .DestructuringDecl => |*dd| exprKeepsAst(&dd.init),
+        .Decl => |d| declKeepsAst(d),
+        .Assign => |a| exprKeepsAst(&a.target) or exprKeepsAst(&a.value),
+        .DestructuringDecl => |dd| exprKeepsAst(&dd.init),
     };
 }
 
@@ -432,9 +432,9 @@ fn declKeepsAst(d: *const Decl) bool {
     return switch (d.*) {
         .Function => |*f| if (f.body) |*b| fnBodyKeepsAst(b) else false,
         .Property => |p| {
-            if (p.init) |*e| if (exprKeepsAst(e)) return true;
+            if (p.init) |e| if (exprKeepsAst(e)) return true;
             if (p.explicit_field) |ef| {
-                if (ef.init) |*e| if (exprKeepsAst(e)) return true;
+                if (ef.init) |e| if (exprKeepsAst(e)) return true;
             }
             if (p.delegate) |e| if (exprKeepsAst(e)) return true;
             if (p.getter) |acc| if (fnBodyKeepsAst(&acc.body)) return true;
@@ -479,20 +479,20 @@ fn exprKeepsAst(e: *const Expr) bool {
         .If => |*x| exprKeepsAst(x.cond) or exprKeepsAst(x.then_branch) or optExprKeepsAst(x.else_branch),
         .While => |*x| exprKeepsAst(x.cond) or exprKeepsAst(x.body),
         .DoWhile => |*x| optExprKeepsAst(x.body) or exprKeepsAst(x.cond),
-        .For => |*x| exprKeepsAst(x.iter) or exprKeepsAst(x.body),
+        .For => |x| exprKeepsAst(x.iter) or exprKeepsAst(x.body),
         .Return => |*x| optExprKeepsAst(x.value),
         .Labeled => |*x| exprKeepsAst(x.expr),
         .Block => |*x| blockKeepsAst(x),
         .Throw => |*x| exprKeepsAst(x.value),
-        .Try => |*x| {
+        .Try => |x| {
             if (blockKeepsAst(&x.body)) return true;
             for (x.catches) |*c| if (blockKeepsAst(&c.body)) return true;
             if (x.finally) |*fb| if (blockKeepsAst(fb)) return true;
             return false;
         },
-        .Lambda => |*x| blockKeepsAst(&x.body),
+        .Lambda => |x| blockKeepsAst(&x.body),
         .MemberRef => |*x| exprKeepsAst(x.receiver),
-        .When => |*x| {
+        .When => |x| {
             if (optExprKeepsAst(x.subject)) return true;
             for (x.branches) |*br| {
                 if (exprKeepsAst(&br.body)) return true;
@@ -505,9 +505,9 @@ fn exprKeepsAst(e: *const Expr) bool {
             }
             return false;
         },
-        .IsCheck => |*x| exprKeepsAst(x.expr),
-        .As => |*x| exprKeepsAst(x.expr),
-        .AnonFun => |*x| if (x.body) |b| fnBodyKeepsAst(b) else false,
+        .IsCheck => |x| exprKeepsAst(x.expr),
+        .As => |x| exprKeepsAst(x.expr),
+        .AnonFun => |x| if (x.body) |b| fnBodyKeepsAst(b) else false,
         .Spread => |*x| exprKeepsAst(x.expr),
     };
 }
@@ -562,10 +562,7 @@ fn tClass() ast.Class {
     return .{
         .name = .{ .name = "Local", .span = tSpan(3, 4) },
         .type_params = &.{},
-        .where_bounds = &.{},
         .primary_params = &.{},
-        .init_blocks = &.{},
-        .init_block_positions = &.{},
         .supertypes = &.{},
         .supertype_args = &.{},
         .supertype_delegates = &.{},
@@ -576,14 +573,12 @@ fn tClass() ast.Class {
         .is_open = false,
         .is_abstract = false,
         .is_inner = false,
-        .secondary_ctors = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .is_value = false,
         .is_annotation = false,
         .is_expect = false,
         .is_actual = false,
-        .enum_entries = &.{},
         .members = &.{},
         .visibility = .Public,
         .primary_ctor_visibility = null,
@@ -593,7 +588,8 @@ fn tClass() ast.Class {
 }
 
 test "a body declaring a local class is left intact" {
-    var stmts = [_]Stmt{.{ .Decl = .{ .Class = tClass() } }};
+    var decl_decl = Decl{ .Class = tClass() };
+    var stmts = [_]Stmt{.{ .Decl = &decl_decl }};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, false);
     tPrune(&f, true, false);
     try testing.expectEqual(@as(usize, 1), f.body.?.Block.stmts.len);
@@ -641,11 +637,12 @@ test "a body an instruction points into is blanked but kept allocated" {
     const inner = try a.alloc(Stmt, 1);
     inner[0] = tIntStmt();
     const stmts = try a.alloc(Stmt, 1);
-    stmts[0] = .{ .Expr = .{ .Lambda = .{
+    var lam_node_645 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = inner, .span = tSpan(2, 3) },
         .span = tSpan(1, 4),
-    } } };
+    };
+    stmts[0] = .{ .Expr = .{ .Lambda = &lam_node_645 } };
     var decls = [_]Decl{.{ .Function = tFn(.{ .Block = .{ .stmts = stmts, .span = tSpan(0, 5) } }, false) }};
     var pinned: Pinned = .empty;
     defer pinned.deinit(testing.allocator);
@@ -688,7 +685,7 @@ test "inline body is left intact" {
 }
 
 test "object-bearing body is left intact" {
-    const obj: Expr = .{ .ObjectExpr = .{
+    var obj_node = ast.ObjectLiteral{
         .supertypes = &.{},
         .supertype_args = &.{},
         .supertype_delegates = &.{},
@@ -696,7 +693,8 @@ test "object-bearing body is left intact" {
         .init_blocks = &.{},
         .init_block_positions = &.{},
         .span = tSpan(5, 6),
-    } };
+    };
+    const obj: Expr = .{ .ObjectExpr = &obj_node };
     var stmts = [_]Stmt{.{ .Expr = obj }};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, false);
     tPrune(&f, true, false);
@@ -718,7 +716,7 @@ test "a @Composable function keeps its signature when composable sigs are kept" 
     f.annotations = &anns;
     var params = [_]ast.Param{.{
         .name = tIdent("content"),
-        .ty = .{ .name = tIdent("Function0"), .nullable = false, .span = tSpan(0, 0), .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .ty = .{ .name = tIdent("Function0"), .nullable = false, .span = tSpan(0, 0), .type_args = &.{}, .function = null, .definitely_non_null = false },
         .default = null,
         .is_vararg = false,
         .is_crossinline = false,

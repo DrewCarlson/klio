@@ -129,7 +129,7 @@ pub fn arrayOpOf(module: *const Module, inst: *const Inst) ?ArrayOp {
         .Index => |ix| return .{ .is_set = false, .recv = ix.receiver, .index = ix.index, .value = ix.index, .dst = ix.dst },
         .IndexSet => |ix| return .{ .is_set = true, .recv = ix.receiver, .index = ix.index, .value = ix.value, .dst = ix.index },
         .CallMember => |cm| {
-            if (cm.arg_names.len != 0) return null;
+            if (cm.x().arg_names.len != 0) return null;
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
@@ -164,7 +164,7 @@ const NumConv = struct { dst: Reg, src: Reg, to: RegType };
 pub fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
     switch (inst.*) {
         .CallMember => |cm| {
-            if (cm.arg_names.len != 0 or cm.n_args != 0) return null;
+            if (cm.x().arg_names.len != 0 or cm.n_args != 0) return null;
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
@@ -183,8 +183,8 @@ pub fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
         // The same conversion also lowers as a VIRTUAL call; only builtin declarations count,
         // since a user class's own `toLong()` is a real call.
         .CallVirtual => |cv| {
-            if (cv.arg_names.len != 0 or cv.n_args != 0) return null;
-            if (cv.arg_params != null or cv.trailing_lambda) return null;
+            if (cv.x().arg_names.len != 0 or cv.n_args != 0) return null;
+            if (cv.x().arg_params != null or cv.x().trailing_lambda) return null;
             const decl = module.funcById(ir.FuncId.from(cv.slot.int())) orelse return null;
             if (!std.mem.startsWith(u8, decl.fqn, "kotlin.")) return null;
             const to: RegType = if (std.mem.eql(u8, decl.name, "toDouble"))
@@ -211,7 +211,7 @@ const BitOp = struct { dst: Reg, lhs: Reg, rhs: Reg, kind: BitKind };
 pub fn bitwiseOpOf(module: *const Module, inst: *const Inst) ?BitOp {
     switch (inst.*) {
         .CallMember => |cm| {
-            if (cm.arg_names.len != 0 or cm.n_args != 1) return null;
+            if (cm.x().arg_names.len != 0 or cm.n_args != 1) return null;
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
@@ -306,13 +306,13 @@ pub fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMem
     if (bitwiseOpOf(module, inst) != null) return null;
     switch (inst.*) {
         .CallMember => |cm| {
-            if (cm.arg_names.len != 0 or cm.static_recv != null) return null;
+            if (cm.x().arg_names.len != 0 or cm.x().static_recv != null) return null;
             if (cm.n_args > 6) return null;
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
             var declared: []const u8 = "";
-            if (cm.declared_recv) |did| {
+            if (cm.x().declared_recv) |did| {
                 if (did.int() < module.consts.items.len and module.consts.items[did.int()] == .String) {
                     declared = module.consts.items[did.int()].String;
                 } else return null;
@@ -323,8 +323,8 @@ pub fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMem
                 .args_reg = cm.args.int(),
                 .n_args = cm.n_args,
                 .dst = cm.dst,
-                .resolved = cm.resolved,
-                .dispatch_recv = cm.dispatch_receiver,
+                .resolved = cm.x().resolved,
+                .dispatch_recv = cm.x().dispatch_receiver,
                 .declared = declared,
             };
         },
@@ -339,8 +339,8 @@ const TrampVirtual = struct { recv: Reg, slot: u32, args_reg: u32, n_args: u32, 
 pub fn trampolinableVirtualOf(inst: *const Inst) ?TrampVirtual {
     switch (inst.*) {
         .CallVirtual => |cv| {
-            if (cv.arg_names.len != 0 or cv.arg_params != null) return null;
-            if (cv.trailing_lambda) return null;
+            if (cv.x().arg_names.len != 0 or cv.x().arg_params != null) return null;
+            if (cv.x().trailing_lambda) return null;
             if (cv.n_args > 6) return null;
             return .{ .recv = cv.receiver, .slot = cv.slot.int(), .args_reg = cv.args.int(), .n_args = cv.n_args, .dst = cv.dst };
         },

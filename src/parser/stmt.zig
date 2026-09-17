@@ -117,7 +117,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                 const prop = members.parseLocalProperty(p, flags) orelse return null;
                 const pp = p.allocator.create(ast.Property) catch @panic("OOM");
                 pp.* = prop;
-                return Stmt{ .Decl = Decl{ .Property = pp } };
+                return Stmt{ .Decl = support.boxed(p, Decl{ .Property = pp }) };
             },
             .Fun => {
                 const next: ?TokenKind = if (p.pos + 1 < p.tokens.len) p.tokens[p.pos + 1].kind else null;
@@ -144,7 +144,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                         visibility,
                         annotations,
                     ) orelse return null;
-                    return Stmt{ .Decl = Decl{ .Class = c } };
+                    return Stmt{ .Decl = support.boxed(p, Decl{ .Class = c }) };
                 }
                 // No name after `fun`. A `fun <...> Ident(...)` is a local
                 // generic declaration and falls through to `parseFun`.
@@ -179,7 +179,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                     return parseExprOrAssignStmt(p);
                 }
                 const f = members.parseFun(p, flags) orelse return null;
-                return Stmt{ .Decl = Decl{ .Function = f } };
+                return Stmt{ .Decl = support.boxed(p, Decl{ .Function = f }) };
             },
             .Class, .Interface => {
                 const visibility = flags.visibility;
@@ -214,7 +214,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                     visibility,
                     annotations,
                 ) orelse return null;
-                return Stmt{ .Decl = Decl{ .Class = c } };
+                return Stmt{ .Decl = support.boxed(p, Decl{ .Class = c }) };
             },
             .Object => {
                 // `object Name { ... }` is a local singleton; `object { ... }`
@@ -229,7 +229,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                         flags.visibility,
                         flags.annotations.items,
                     ) orelse return null;
-                    return Stmt{ .Decl = Decl{ .Object = o } };
+                    return Stmt{ .Decl = support.boxed(p, Decl{ .Object = o }) };
                 } else {
                     p.pos = save;
                     return parseExprOrAssignStmt(p);
@@ -237,7 +237,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
             },
             .Typealias => {
                 const a = file.parseTypealias(p, flags.visibility, flags.annotations.items) orelse return null;
-                return Stmt{ .Decl = Decl{ .TypeAlias = a } };
+                return Stmt{ .Decl = support.boxed(p, Decl{ .TypeAlias = a }) };
             },
             else => return parseFallthroughStmt(p, save),
         },
@@ -271,14 +271,14 @@ pub fn parseDestructuringDecl(p: *Parser) ?Stmt {
     support.skipNl(p);
     const init = expr.parseExpr(p) orelse return null;
     const sp = kw.span.join(init.span());
-    return Stmt{ .DestructuringDecl = .{
+    return Stmt{ .DestructuringDecl = support.boxed(p, ast.DestructuringDeclStmt{
         .mutable = mutable,
         .names = entries.names,
         .by_name = entries.by_name,
         .sources = entries.sources,
         .init = init,
         .span = sp,
-    } };
+    }) };
 }
 
 /// Opens with `(` followed by `val`/`var`.
@@ -289,14 +289,14 @@ pub fn parseNameBasedDestructuringStmt(p: *Parser) ?Stmt {
     support.skipNl(p);
     const init = expr.parseExpr(p) orelse return null;
     const sp = open.span.join(init.span());
-    return Stmt{ .DestructuringDecl = .{
+    return Stmt{ .DestructuringDecl = support.boxed(p, ast.DestructuringDeclStmt{
         .mutable = entries.any_var,
         .names = entries.names,
         .by_name = entries.by_name,
         .sources = entries.sources,
         .init = init,
         .span = sp,
-    } };
+    }) };
 }
 
 /// Opens with `[` and carries no leading keyword.
@@ -307,14 +307,14 @@ pub fn parseBracketDestructuringStmt(p: *Parser) ?Stmt {
     support.skipNl(p);
     const init = expr.parseExpr(p) orelse return null;
     const sp = open.span.join(init.span());
-    return Stmt{ .DestructuringDecl = .{
+    return Stmt{ .DestructuringDecl = support.boxed(p, ast.DestructuringDeclStmt{
         .mutable = entries.any_var,
         .names = entries.names,
         .by_name = entries.by_name,
         .sources = entries.sources,
         .init = init,
         .span = sp,
-    } };
+    }) };
 }
 
 pub fn parseExprOrAssignStmt(p: *Parser) ?Stmt {
@@ -333,12 +333,12 @@ pub fn parseExprOrAssignStmt(p: *Parser) ?Stmt {
         support.skipNl(p);
         const rhs = expr.parseExpr(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
-        return Stmt{ .Assign = .{
+        return Stmt{ .Assign = support.boxed(p, ast.AssignStmt{
             .target = lhs,
             .op = o,
             .value = rhs,
             .span = sp,
-        } };
+        }) };
     }
     return Stmt{ .Expr = lhs };
 }

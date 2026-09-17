@@ -257,7 +257,7 @@ pub fn runFrameExec(
         }
         const block = &func.blocks[cur.int()];
         // Normal flow into a catch-only try's join pops the body's entry (see `Block.catch_done_for`).
-        if (block.catch_done_for) |body| {
+        if (block.h().catch_done_for) |body| {
             if (rpositionByBody(try_stack.items, body)) |p| {
                 _ = try_stack.orderedRemove(p);
             }
@@ -273,17 +273,17 @@ pub fn runFrameExec(
         }
         const insts: []const Inst = block.insts;
         const term = block.terminator;
-        const finally = block.finally;
-        const finally_done = block.finally_done;
-        const has_catches = block.catches.len != 0;
-        if (resume_idx == 0 and (has_catches or finally != null or block.lr_absorb != null)) {
+        const finally = block.h().finally;
+        const finally_done = block.h().finally_done;
+        const has_catches = block.h().catches.len != 0;
+        if (resume_idx == 0 and (has_catches or finally != null or block.h().lr_absorb != null)) {
             try try_stack.append(allocator, .{
                 .body = cur,
                 .chain_len = frame.enclosing_this.items.len,
-                .catches = block.catches,
+                .catches = block.h().catches,
                 .finally_entry = finally,
                 .finally_done = finally_done,
-                .lr_absorb = block.lr_absorb,
+                .lr_absorb = block.h().lr_absorb,
             });
         }
         var thrown: ?Value = null;
@@ -652,7 +652,7 @@ pub fn runFrameExec(
         }
         // Symmetric try-stack pop on normal flow through finally.
         if (term == .Goto and frame.pending_finally.rethrow == null and frame.pending_finally.return_value == null and frame.pending_finally.unwind == null) {
-            const done_for = frame.block(cur).finally_done_for;
+            const done_for = frame.block(cur).h().finally_done_for;
             const pos: ?usize = if (done_for) |body|
                 rpositionByBody(try_stack.items, body)
             else
@@ -663,7 +663,7 @@ pub fn runFrameExec(
         }
         // An inline `return` jumping to its join bypasses the sentinel, so pop `Block.pop_on_exit` here.
         if (term == .Goto) {
-            for (block.pop_on_exit) |body| {
+            for (block.h().pop_on_exit) |body| {
                 if (rpositionByBody(try_stack.items, body)) |p| {
                     _ = try_stack.orderedRemove(p);
                 }

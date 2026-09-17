@@ -622,8 +622,6 @@ fn typeRef(name: []const u8, nullable: bool) TypeRef {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 

@@ -76,6 +76,8 @@ pub const Parser = struct {
     file: FileId,
     src: []const u8,
     tokens: []const Token,
+    /// The tokens' string payloads, from the lexer.
+    strings: []const []const u8,
     pos: usize,
     diagnostics: DiagnosticSink,
     /// Postfix parsing then attaches no trailing `{ ... }` lambda. Set while
@@ -105,6 +107,7 @@ pub const Parser = struct {
         file_id: FileId,
         src: []const u8,
         tokens: []const Token,
+        strings: []const []const u8,
     ) *Parser {
         const nl_soft = allocator.alloc(bool, tokens.len) catch @panic("OOM in Parser.new");
         var stack: std.ArrayList(u8) = .empty;
@@ -142,6 +145,7 @@ pub const Parser = struct {
             .file = file_id,
             .src = src,
             .tokens = tokens,
+            .strings = strings,
             .pos = 0,
             .diagnostics = DiagnosticSink.init(),
             .suppress_trailing_lambda = false,
@@ -252,7 +256,7 @@ fn parse(arena: std.mem.Allocator, src: []const u8) !ParseOut {
     var lx = try lexer.Lexer.init(arena, id, src);
     const lexed = try lx.tokenize();
     try testing.expect(!lexed.diagnostics.hasErrors());
-    const p = Parser.new(arena, id, src, lexed.tokens);
+    const p = Parser.new(arena, id, src, lexed.tokens, lexed.strings);
     const kf = p.parseFile();
     return .{ .file = kf, .parser = p };
 }
@@ -269,7 +273,7 @@ test "foundation: nl_soft precomputes bracket softness" {
     const id = span.FileId.from(0);
     var lx = try lexer.Lexer.init(a, id, src);
     const lexed = try lx.tokenize();
-    const p = Parser.new(a, id, src, lexed.tokens);
+    const p = Parser.new(a, id, src, lexed.tokens, lexed.strings);
 
     var seen: usize = 0;
     for (p.tokens, 0..) |t, i| {
@@ -577,7 +581,7 @@ test "diagnostic_on_missing_close_paren" {
 }
 
 fn propertyType(kf: KotlinFile) *const ast.TypeRef {
-    return &kf.decls[0].Property.ty.?;
+    return kf.decls[0].Property.ty.?;
 }
 
 test "function_type_simple" {
@@ -1103,7 +1107,7 @@ test "generic_call_with_labeled_trailing_lambda" {
     const stmts = bodyStmts(out.file.decls[0].Function);
     // `val r = <Call>`: the initializer is a Call, not a comparison Binary.
     const init = stmts[0].Decl.Property.init.?;
-    try testing.expect(init == .Call);
+    try testing.expect(init.* == .Call);
     try testing.expect(init.Call.type_args.len == 1);
 }
 
@@ -1824,10 +1828,10 @@ test "annotation on a receiver function type annotates the function type" {
     const ty = f.params[0].ty;
     try testing.expect(ty.function != null);
     // The annotation before the receiver head belongs to the FUNCTION type.
-    try testing.expectEqual(@as(usize, 1), ty.annotations.len);
-    try testing.expectEqualStrings("Composable", ty.annotations[0].path[ty.annotations[0].path.len - 1].name);
+    try testing.expectEqual(@as(usize, 1), ty.x().annotations.len);
+    try testing.expectEqualStrings("Composable", ty.x().annotations[0].path[ty.x().annotations[0].path.len - 1].name);
     const recv = ty.function.?.receiver.?;
-    try testing.expectEqual(@as(usize, 0), recv.annotations.len);
+    try testing.expectEqual(@as(usize, 0), recv.x().annotations.len);
     try testing.expectEqualStrings("Int", recv.name.name);
     try testing.expectEqual(@as(usize, 1), ty.function.?.params.len);
 }

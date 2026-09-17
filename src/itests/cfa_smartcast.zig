@@ -25,7 +25,7 @@ fn parseAndLower(arena: std.mem.Allocator, src: []const u8) !cfa.lower.Lowered {
     var lx = try lexer.Lexer.init(arena, file, src);
     const lexed = try lx.tokenize();
     try std.testing.expect(!lexed.diagnostics.hasErrors());
-    const p = parser.Parser.new(arena, file, src, lexed.tokens);
+    const p = parser.Parser.new(arena, file, src, lexed.tokens, lexed.strings);
     const parsed = p.parseFile();
     try std.testing.expect(!p.diagnostics.hasErrors());
 

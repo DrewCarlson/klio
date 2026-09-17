@@ -606,7 +606,7 @@ pub fn trivialInitServe(allocator: Allocator, m: *const ir.Module, func: *const 
         if (func.blocks.len == 0) _ = m.ensureFuncBody(mut);
         if (func.blocks.len == 1) one: {
             const blk = &func.blocks[0];
-            if (blk.catches.len != 0 or blk.finally != null) break :one;
+            if (blk.h().catches.len != 0 or blk.h().finally != null) break :one;
             if (blk.terminator != .Return) break :one;
             const ret_reg = blk.terminator.Return orelse break :one;
             if (blk.insts.len > 24) break :one;

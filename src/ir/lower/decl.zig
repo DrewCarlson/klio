@@ -537,7 +537,7 @@ fn reservedHeaderParams(ctx: *HeaderReserve, f: *const ast.Function) Allocator.E
     const params = try a.alloc(Param, f.params.len + 1);
     params[0] = .{
         .name = "this",
-        .ty = if (f.receiver_type) |*rt|
+        .ty = if (f.receiver_type) |rt|
             try loweredMemberTypeRef(module, a, owner_id, f, rt, false)
         else blk: {
             const owner_args = try a.alloc(TypeRef, c.type_params.len);
@@ -598,7 +598,7 @@ fn appendReservedHeaderFunc(
     const a = ctx.a;
     const module = ctx.module;
     const fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ ctx.class_fqn, f.name.name });
-    const return_ty = if (f.return_type) |*rt|
+    const return_ty = if (f.return_type) |rt|
         renameParamHead(try loweredMemberTypeRef(module, a, ctx.owner_id, f, rt, false), rt)
     else
         build.typeUnit();
@@ -683,7 +683,7 @@ fn recordReservedHeaderDecl(
     try module.decl_user_sig.put(id.int(), sig);
     try module.decl_sigs.put(id.int(), .{
         .enclosing_class = owner_id,
-        .receiver_ty = if (f.receiver_type) |*rt|
+        .receiver_ty = if (f.receiver_type) |rt|
             try loweredMemberTypeRef(module, a, owner_id, f, rt, true)
         else
             null,
@@ -834,7 +834,7 @@ fn collectMemberArities(
         // an empty mask: the name is known but takes no arity, and a same-named
         // function overload ORs its own mask in.
         if (m.* == .Property) {
-            if (m.Property.ty) |*pt| {
+            if (m.Property.ty) |pt| {
                 if (pt.function == null and !isFunctionTypeName(pt.name.name)) try mergeMemberArity(out, m.Property.name.name, 0);
             }
         }
@@ -871,7 +871,7 @@ pub fn addVisibleMemberNames(
     // Enum entry names are visible bare inside the enum's method bodies, and
     // `entries` resolves to the synthesized list of all entries.
     if (c.is_enum) {
-        for (c.enum_entries) |*entry| {
+        for (c.x().enum_entries) |*entry| {
             try own_member_names.put(entry.name.name, {});
         }
         // Built-in members on every enum entry: synthesised `name` and `ordinal`.
@@ -1027,7 +1027,7 @@ pub fn populateClassSupertypes(
     var supertype_refs: std.ArrayList(TypeRef) = .empty;
     errdefer supertype_refs.deinit(a);
     for (c.supertypes) |*t| {
-        if (t.qualified_path) |qp| {
+        if (t.x().qualified_path) |qp| {
             if (module.classIdByQualifiedSuffix(qp)) |cid| {
                 try supertypes.append(a, cid);
                 try supertype_refs.append(a, try loweredTypeRef(a, t, false));
@@ -1265,7 +1265,7 @@ fn retainBodylessMember(ctx: *ClassLower, f: *const ast.Function) Allocator.Erro
     // An abstract member-extension declaration records its
     // extension-receiver type head, which a SAM conversion of the fun
     // interface binds as the lambda's implicit `this`.
-    if (f.receiver_type) |*rt| {
+    if (f.receiver_type) |rt| {
         try module.registry.iface_member_ext_recv.put(.{ .a = c.name.name, .b = f.name.name }, rt.name.name);
     }
     // Likewise its `context(...)` parameter types, which the SAM
@@ -1359,7 +1359,7 @@ fn recordMemberDeclSig(ctx: *ClassLower, f: *const ast.Function, id: FuncId) All
     }
     try module.decl_sigs.put(id.int(), .{
         .enclosing_class = ctx.class_id,
-        .receiver_ty = if (f.receiver_type) |*rt| try loweredTypeRef(a, rt, true) else null,
+        .receiver_ty = if (f.receiver_type) |rt| try loweredTypeRef(a, rt, true) else null,
         .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
         .sig = msig,
         .kind = if (f.receiver_type != null) .member_extension else .instance_method,
@@ -1434,7 +1434,7 @@ fn synthesizeComponentAccessor(
         .type_params = &.{},
         .where_bounds = &.{},
         .params = &.{},
-        .return_type = p.ty,
+        .return_type = try ast.box(a, p.ty),
         .body = .{ .Expr = .{ .Member = .{
             .receiver = recv,
             .name = p.name,
@@ -1539,7 +1539,7 @@ pub fn functionSupertypeTags(allocator: Allocator, ft: *const ast.FunctionTypeRe
 /// file-private `typealias` carries the name the alias registration holds. Scoped
 /// to nominal, non-qualified heads so it cannot disturb the structural type.
 pub fn renameParamHead(ty: ir.TypeRef, src: *const ast.TypeRef) ir.TypeRef {
-    if (src.function != null or src.qualified_path != null) return ty;
+    if (src.function != null or src.x().qualified_path != null) return ty;
     var out = ty;
     out.name = build.fileOrPkgTypeRename(ty.name, src.span.file.int()) orelse ty.name;
     return out;
@@ -1591,7 +1591,7 @@ pub fn loweredTypeRef(allocator: Allocator, ty: *const ast.TypeRef, own_names: b
         errdefer if (own_names) marker.deinit(allocator);
         try args.append(allocator, marker);
     }
-    if (ty.qualified_path) |qp| {
+    if (ty.x().qualified_path) |qp| {
         var marker = ir.TypeRef{
             .name = try std.fmt.allocPrint(allocator, "#qual:{s}", .{qp}),
             .nullable = false,
@@ -1793,7 +1793,7 @@ fn retainExpectMemberHeader(
             .has_default = p.default != null,
         };
     }
-    const ret: ir.TypeRef = if (f.return_type) |*rt|
+    const ret: ir.TypeRef = if (f.return_type) |rt|
         try loweredTypeRef(a, rt, true)
     else
         .{ .name = "Unit", .nullable = false, .args = &.{} };
@@ -1871,7 +1871,7 @@ pub fn retainLocalClassMemberHeader(
             .has_default = p.default != null,
         };
     }
-    const ret: ir.TypeRef = if (f.return_type) |*rt|
+    const ret: ir.TypeRef = if (f.return_type) |rt|
         try loweredTypeRef(a, rt, true)
     else
         .{ .name = "Unit", .nullable = false, .args = &.{} };
@@ -2124,13 +2124,13 @@ fn registerFuncTypeParams(module: *Module, f: *const ast.Function, id: FuncId) A
 /// call on the parameter even when the record dropped the bound's type arguments.
 fn boundTypeRecordHeadOnly(bound: *const ast.TypeRef) bool {
     return !bound.nullable and bound.function == null and
-        bound.qualified_path == null and bound.name.name.len != 0;
+        bound.x().qualified_path == null and bound.name.name.len != 0;
 }
 
 fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
     return !bound.nullable and bound.type_args.len == 0 and
         bound.function == null and !bound.definitely_non_null and
-        bound.qualified_path == null;
+        bound.x().qualified_path == null;
 }
 
 /// The bound's type-argument heads, kept only when every argument is a plain
@@ -2175,7 +2175,7 @@ fn loweredClassTypeParamBounds(
                 .args = try concreteBoundArgs(allocator, class.type_params, upper),
             });
         }
-        for (class.where_bounds) |*where_bound| {
+        for (class.x().where_bounds) |*where_bound| {
             if (!std.mem.eql(u8, where_bound.name.name, param.name.name)) continue;
             try bounds.append(allocator, .{
                 .param = param.name.name,
@@ -2499,7 +2499,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     b.setInline(f.is_inline);
     // The declared return type is the expected type for an expression body and for a
     // `return …` inside a block body, so a reified inline call can infer.
-    b.setDeclaredReturn(f.return_type);
+    b.setDeclaredReturn(ast.unbox(f.return_type));
 
     // The boxed-var set was computed and set before `bindParams` above so the
     // params bind as cells.
@@ -2787,7 +2787,7 @@ fn installOwnerAndReceiverType(ctx: *BodyLower) Allocator.Error!void {
     if (ctx.owner_class) |owner| {
         b.setOwnerClass(owner);
     }
-    if (ctx.f.receiver_type) |*receiver| {
+    if (ctx.f.receiver_type) |receiver| {
         b.setRecvTypeRefOwned(try loweredTypeRef(b.allocator, receiver, true));
     } else {
         b.setRecvTy(null);
@@ -2852,7 +2852,7 @@ fn lowerBodyIntoBuilder(ctx: *BodyLower, derived_return: *?TypeRef) Allocator.Er
                 // An expression body has no statements, so mark its source position
                 // here for stack traces, or the frame reports no line.
                 try b.push(.{ .Trace = .{ .span = e.span() } });
-                const prev = b.pushExpected(f.return_type);
+                const prev = b.pushExpected(ast.unbox(f.return_type));
                 // An expression body with no annotation carries its inferred return
                 // where the static derivation proves one, so callers' locals type
                 // through it, which member refutation needs.
@@ -2874,7 +2874,7 @@ fn finishLoweredFunc(ctx: *BodyLower, derived_return: ?TypeRef) Allocator.Error!
     const a = ctx.a;
     const f = ctx.f;
     const fqn = f.name.name;
-    const return_ty: TypeRef = if (f.return_type) |*rt|
+    const return_ty: TypeRef = if (f.return_type) |rt|
         renameParamHead(try loweredTypeRef(a, rt, false), rt)
     else if (derived_return) |dr|
         dr
@@ -2926,7 +2926,7 @@ fn applyReceiverParamType(ctx: *BodyLower, func: *Func) Allocator.Error!void {
     const a = ctx.a;
     const f = ctx.f;
     const module = ctx.module;
-    if (f.receiver_type) |*rt| {
+    if (f.receiver_type) |rt| {
         if (func.params.len != 0 and std.mem.eql(u8, func.params[0].name, "this")) {
             // The full structural type, head name and generic arguments, so the
             // strict extension-receiver prover can refute a `List<String>` receiver
@@ -2967,7 +2967,9 @@ fn applyFuncDeclFlags(ctx: *BodyLower, func: *Func) Allocator.Error!void {
     // extension receiver, distinct from a user param that spells its name `this`.
     func.has_receiver_param = ctx.implicit_params.len != 0 and
         std.mem.eql(u8, ctx.implicit_params[0], "this");
-    func.annotation_names = try resolveAnnotationNames(ctx.module, f.annotations);
+    var extra = func.x().*;
+    extra.annotation_names = try resolveAnnotationNames(ctx.module, f.annotations);
+    try func.setExtra(ctx.a, extra);
 }
 
 /// A function is excluded from overload resolution while any ordinary candidate
@@ -3148,20 +3150,18 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
     var m = Module.default(a);
     defer m.deinit(a);
     const sp = ast.Span{ .file = ir.FileId.from(0), .start = 10, .end = 20 };
-    const scope_ty: ast.TypeRef = .{
+    var scope_ty: ast.TypeRef = .{
         .name = .{ .name = "Scope", .span = sp },
         .nullable = false,
         .span = sp,
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const body: ast.FunctionBody = .{ .Block = .{ .stmts = &.{}, .span = sp } };
     const helper: ast.Function = .{
         .name = .{ .name = "helper", .span = sp },
-        .receiver_type = scope_ty,
+        .receiver_type = &scope_ty,
         .type_params = &.{},
         .where_bounds = &.{},
         .params = &.{},
@@ -3258,10 +3258,7 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
     const cls: ast.Class = .{
         .name = .{ .name = "Host", .span = sp },
         .type_params = @constCast(&host_type_params),
-        .where_bounds = &.{},
         .primary_params = &.{},
-        .init_blocks = &.{},
-        .init_block_positions = &.{},
         .supertypes = &.{},
         .supertype_args = &.{},
         .supertype_delegates = &.{},
@@ -3272,14 +3269,12 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
         .is_open = false,
         .is_abstract = false,
         .is_inner = false,
-        .secondary_ctors = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .is_value = false,
         .is_annotation = false,
         .is_expect = false,
         .is_actual = false,
-        .enum_entries = &.{},
         .members = &members,
         .visibility = .Public,
         .primary_ctor_visibility = null,
@@ -3435,8 +3430,6 @@ test "class superclass edges are available before method lowering" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     var supertypes = [_]ast.TypeRef{supertype};
     var class: ast.Class = undefined;
@@ -3519,8 +3512,6 @@ test "function bounds shadow class bounds and mark intersections incomplete" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const params = [_]ast.TypeParam{.{
         .name = .{ .name = "T", .span = sp },
@@ -3537,8 +3528,6 @@ test "function bounds shadow class bounds and mark intersections incomplete" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const where_bounds = [_]ast.WhereBound{.{
         .name = .{ .name = "T", .span = sp },

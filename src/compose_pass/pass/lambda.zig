@@ -105,7 +105,7 @@ pub fn collectLambdaCaptureFacts(stmts: []const Stmt, refs: *std.StringHashMap(v
 fn collectCaptureFactsStmt(st: *const Stmt, refs: *std.StringHashMap(void), declared: *std.StringHashMap(void), bad: *bool, callee: []const u8) void {
     switch (st.*) {
         .Expr => |*e| collectCaptureFactsExpr(e, refs, declared, bad, callee),
-        .Assign => |*a| {
+        .Assign => |a| {
             if (a.target == .Path and a.target.Path.segments.len == 1) {
                 if (!declared.contains(a.target.Path.segments[0].name)) {
                     bad.* = true;
@@ -116,9 +116,9 @@ fn collectCaptureFactsStmt(st: *const Stmt, refs: *std.StringHashMap(void), decl
             }
             collectCaptureFactsExpr(&a.value, refs, declared, bad, callee);
         },
-        .Decl => |*d| switch (d.*) {
+        .Decl => |d| switch (d.*) {
             .Property => |pp| {
-                if (pp.init) |*ini| collectCaptureFactsExpr(ini, refs, declared, bad, callee);
+                if (pp.init) |ini| collectCaptureFactsExpr(ini, refs, declared, bad, callee);
                 declared.put(pp.name.name, {}) catch {};
             },
             .Function => |*f| {
@@ -130,7 +130,7 @@ fn collectCaptureFactsStmt(st: *const Stmt, refs: *std.StringHashMap(void), decl
             },
             else => bad.* = true,
         },
-        .DestructuringDecl => |*dd| {
+        .DestructuringDecl => |dd| {
             collectCaptureFactsExpr(&dd.init, refs, declared, bad, callee);
             for (dd.names) |nm| declared.put(nm.name, {}) catch {};
         },

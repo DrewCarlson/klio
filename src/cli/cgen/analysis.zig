@@ -35,7 +35,7 @@ const tyOf = cgen.tyOf;
 /// A zero-argument numeric conversion (`x.toLong()`), lowered as a `CallMember`. Every
 /// direction is a C cast, but Kotlin's `toInt()` on a floating value saturates, so it is refused.
 pub fn numConv(m: *const Module, cm: anytype) ?Ty {
-    if (cm.n_args != 0 or cm.arg_names.len != 0) return null;
+    if (cm.n_args != 0 or cm.x().arg_names.len != 0) return null;
     if (cm.name.int() >= m.consts.items.len) return null;
     const nm = m.consts.items[cm.name.int()];
     if (nm != .String) return null;
@@ -53,7 +53,7 @@ pub fn numConv(m: *const Module, cm: anytype) ?Ty {
 }
 
 pub fn numConvVirtual(m: *const Module, cv: anytype) ?Ty {
-    if (cv.n_args != 0 or cv.arg_names.len != 0) return null;
+    if (cv.n_args != 0 or cv.x().arg_names.len != 0) return null;
     const decl = m.funcById(ir.FuncId.from(cv.slot.int())) orelse return null;
     if (!std.mem.startsWith(u8, decl.fqn, "kotlin.")) return null;
     if (std.mem.eql(u8, decl.name, "toInt")) return .i32;

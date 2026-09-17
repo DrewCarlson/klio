@@ -429,8 +429,8 @@ pub fn writeDivGuard(w: *std.Io.Writer, rhs: u32) !void {
 /// its terminator goes. Null once they are exhausted.
 pub fn succOf(f: *const Func, blk: *const ir.Block, i: u32) ?u32 {
     _ = f;
-    if (i < blk.catches.len) return blk.catches[i].handler.int();
-    const k = i - @as(u32, @intCast(blk.catches.len));
+    if (i < blk.h().catches.len) return blk.h().catches[i].handler.int();
+    const k = i - @as(u32, @intCast(blk.h().catches.len));
     return switch (blk.terminator) {
         .Goto => |g| if (k == 0) g.int() else null,
         .Branch => |br| switch (k) {
@@ -487,7 +487,7 @@ pub fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
             if (!hit[bi]) continue;
             // A handler is reached by a throw, not a terminator: without this edge its
             // target looks dead.
-            for (blk.catches) |h| {
+            for (blk.h().catches) |h| {
                 if (h.handler.int() < hit.len and !hit[h.handler.int()]) {
                     hit[h.handler.int()] = true;
                     grew = true;

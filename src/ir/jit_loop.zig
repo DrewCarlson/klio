@@ -120,14 +120,14 @@ test "loop JIT preserves exact member-extension operands" {
     var module = Module.init(testing.allocator);
     defer module.deinit(testing.allocator);
     const name = try module.internConst(testing.allocator, .{ .String = "pick" });
+    const extra = ir.CallMemberExtra{ .resolved = FuncId.from(17), .dispatch_receiver = Reg.from(2) };
     const inst = Inst{ .CallMember = .{
         .dst = Reg.from(8),
         .receiver = Reg.from(3),
         .name = name,
         .args = Reg.from(4),
         .n_args = 1,
-        .resolved = FuncId.from(17),
-        .dispatch_receiver = Reg.from(2),
+        .extra = &extra,
     } };
     const member = trampolinableMemberOf(&module, &inst).?;
     try testing.expectEqual(FuncId.from(17), member.resolved.?);

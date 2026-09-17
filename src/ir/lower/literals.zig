@@ -85,8 +85,6 @@ test "widen long literal" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const e = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     const widened = widenNumericLiteral(&e, &ty).?;
@@ -101,8 +99,6 @@ test "no widen for non-long target" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const e = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     try testing.expect(widenNumericLiteral(&e, &ty) == null);

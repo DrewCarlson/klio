@@ -707,7 +707,7 @@ const Resolver = struct {
         switch (decl.*) {
             .Function => |*f| try self.resolveFunction(scope, f),
             .Property => |p| try self.resolveProperty(scope, p, is_top_level),
-            .Class => |*c| try self.resolveClassBody(scope, c.primary_params, c.init_blocks, c.members),
+            .Class => |*c| try self.resolveClassBody(scope, c.primary_params, c.x().init_blocks, c.members),
             .Object => |*o| try self.resolveClassBody(scope, &.{}, o.init_blocks, o.members),
             .TypeAlias => {
                 // Typeck resolves the alias target; nothing to bind here.
@@ -795,7 +795,7 @@ const Resolver = struct {
                 self.symbols.items[id.int()].nullable = ty.nullable;
             }
         }
-        if (p.init) |*p_init| {
+        if (p.init) |p_init| {
             try self.resolveExpr(scope, p_init);
         }
         if (p.getter) |getter| {
@@ -827,7 +827,7 @@ const Resolver = struct {
         // so each local `fun` name is pre-declared before bodies are walked.
         for (block.stmts) |*s| {
             switch (s.*) {
-                .Decl => |d| switch (d) {
+                .Decl => |d| switch (d.*) {
                     .Function => |f| {
                         _ = try self.declare(scope, f.name.name, .LocalFunction, f.name.span, true);
                     },
@@ -850,12 +850,12 @@ const Resolver = struct {
     fn resolveStmt(self: *Resolver, scope: ScopeId, stmt: *const Stmt) ResolveError!void {
         switch (stmt.*) {
             .Expr => |*e| try self.resolveExpr(scope, e),
-            .Decl => |*d| switch (d.*) {
+            .Decl => |d| switch (d.*) {
                 .Function => |*f| {
                     try self.resolveFunction(scope, f);
                 },
                 .Property => |p| {
-                    if (p.init) |*p_init| {
+                    if (p.init) |p_init| {
                         try self.resolveExpr(scope, p_init);
                     }
                     const id = try self.declare(scope, p.name.name, .LocalProperty, p.name.span, true);
@@ -869,11 +869,11 @@ const Resolver = struct {
                     _ = try self.declare(scope, a.name.name, .TypeAlias, a.name.span, true);
                 },
             },
-            .Assign => |*as| {
+            .Assign => |as| {
                 try self.resolveExpr(scope, &as.target);
                 try self.resolveExpr(scope, &as.value);
             },
-            .DestructuringDecl => |*dd| {
+            .DestructuringDecl => |dd| {
                 try self.resolveExpr(scope, &dd.init);
                 for (dd.names) |n| {
                     if (std.mem.eql(u8, n.name, "_")) continue;
@@ -1091,7 +1091,7 @@ const Resolver = struct {
                 }
             },
             .Property => |p| {
-                if (p.init) |*e| {
+                if (p.init) |e| {
                     try self.resolveExpr(scope, e);
                 }
                 if (p.delegate) |d| {
@@ -1246,8 +1246,6 @@ fn typeRef(name: []const u8, nullable: bool) ast.TypeRef {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 
@@ -1335,10 +1333,7 @@ fn mkClass(name: []const u8, members: []Decl) ast.Class {
     return .{
         .name = ident(name),
         .type_params = &.{},
-        .where_bounds = &.{},
         .primary_params = &.{},
-        .init_blocks = &.{},
-        .init_block_positions = &.{},
         .supertypes = &.{},
         .supertype_args = &.{},
         .supertype_delegates = &.{},
@@ -1349,14 +1344,12 @@ fn mkClass(name: []const u8, members: []Decl) ast.Class {
         .is_open = false,
         .is_abstract = false,
         .is_inner = false,
-        .secondary_ctors = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .is_value = false,
         .is_annotation = false,
         .is_expect = false,
         .is_actual = false,
-        .enum_entries = &.{},
         .members = members,
         .visibility = .Public,
         .primary_ctor_visibility = null,
@@ -1607,9 +1600,11 @@ test "shadowing in inner scope emits r0002" {
     const a = testing.allocator;
     // fun main() { val x = 1; val x = 2; println(x) }
     var x1 = emptyProp(false, "x");
-    x1.init = .{ .IntLit = .{ .value = 1, .kind = .Int, .span = ts() } };
+    var x1_init = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = ts() } };
+    x1.init = &x1_init;
     var x2 = emptyProp(false, "x");
-    x2.init = .{ .IntLit = .{ .value = 2, .kind = .Int, .span = ts() } };
+    var x2_init_1613 = Expr{ .IntLit = .{ .value = 2, .kind = .Int, .span = ts() } };
+    x2.init = &x2_init_1613;
 
     var println_callee = pathExpr("println");
     defer a.free(println_callee.Path.segments);
@@ -1618,9 +1613,11 @@ test "shadowing in inner scope emits r0002" {
     var args = [_]Expr{x_use};
     const call = callExpr(&println_callee, &args);
 
+    var x1_decl = Decl{ .Property = &x1 };
+    var x2_decl = Decl{ .Property = &x2 };
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = &x1 } },
-        .{ .Decl = .{ .Property = &x2 } },
+        .{ .Decl = &x1_decl },
+        .{ .Decl = &x2_decl },
         .{ .Expr = call },
     };
     var main_fn = emptyFn("main");
@@ -1653,13 +1650,14 @@ test "for loop variable is resolvable in body" {
     var body = Expr{ .Block = .{ .stmts = &body_stmts, .span = ts() } };
 
     var vars = [_]ast.Ident{ident("i")};
-    const for_expr = Expr{ .For = .{
+    var for_expr_node = ast.ForExpr{
         .vars = &vars,
         .var_ty = null,
         .iter = &range,
         .body = &body,
         .span = ts(),
-    } };
+    };
+    const for_expr = Expr{ .For = &for_expr_node };
     var stmts = [_]Stmt{.{ .Expr = for_expr }};
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };
@@ -1681,7 +1679,8 @@ test "function parameter resolves inside body" {
     var params = [_]Param{intParam("x")};
     var id_fn = emptyFn("id");
     id_fn.params = &params;
-    id_fn.return_type = typeRef("Int", false);
+    var id_fn_ret = typeRef("Int", false);
+    id_fn.return_type = &id_fn_ret;
     id_fn.body = .{ .Expr = x_use };
     var decls = [_]Decl{.{ .Function = id_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
@@ -1714,7 +1713,8 @@ test "mutual recursion resolves" {
     var n_param = [_]Param{intParam("n")};
     var even_fn = emptyFn("even");
     even_fn.params = &n_param;
-    even_fn.return_type = typeRef("Boolean", false);
+    var even_fn_ret = typeRef("Boolean", false);
+    even_fn.return_type = &even_fn_ret;
     even_fn.body = .{ .Expr = even_if };
 
     // odd body
@@ -1736,7 +1736,8 @@ test "mutual recursion resolves" {
     var n_param2 = [_]Param{intParam("n")};
     var odd_fn = emptyFn("odd");
     odd_fn.params = &n_param2;
-    odd_fn.return_type = typeRef("Boolean", false);
+    var odd_fn_ret = typeRef("Boolean", false);
+    odd_fn.return_type = &odd_fn_ret;
     odd_fn.body = .{ .Expr = odd_if };
 
     var decls = [_]Decl{ .{ .Function = even_fn }, .{ .Function = odd_fn } };
@@ -1753,8 +1754,10 @@ test "unnecessary safe call on non nullable" {
     // fun main() { val s: String = "hi"; val n = s?.length }
     var str_parts = [_]StringPart{.{ .Text = "hi" }};
     var s_prop = emptyProp(false, "s");
-    s_prop.ty = typeRef("String", false);
-    s_prop.init = .{ .StringTemplate = .{ .parts = &str_parts, .span = ts() } };
+    var s_prop_ty = typeRef("String", false);
+    s_prop.ty = &s_prop_ty;
+    var s_prop_init = Expr{ .StringTemplate = .{ .parts = &str_parts, .span = ts() } };
+    s_prop.init = &s_prop_init;
 
     var s_recv = pathExpr("s");
     defer a.free(s_recv.Path.segments);
@@ -1765,11 +1768,14 @@ test "unnecessary safe call on non nullable" {
         .span = ts(),
     } };
     var n_prop = emptyProp(false, "n");
-    n_prop.init = member;
+    var n_prop_init_1777 = member;
+    n_prop.init = &n_prop_init_1777;
 
+    var s_prop_decl = Decl{ .Property = &s_prop };
+    var n_prop_decl = Decl{ .Property = &n_prop };
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = &s_prop } },
-        .{ .Decl = .{ .Property = &n_prop } },
+        .{ .Decl = &s_prop_decl },
+        .{ .Decl = &n_prop_decl },
     };
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };
@@ -1786,8 +1792,10 @@ test "safe call on nullable is silent" {
     const a = testing.allocator;
     // fun main() { val s: String? = null; val n = s?.length }
     var s_prop = emptyProp(false, "s");
-    s_prop.ty = typeRef("String", true);
-    s_prop.init = .{ .NullLit = .{ .span = ts() } };
+    var s_prop_ty = typeRef("String", true);
+    s_prop.ty = &s_prop_ty;
+    var s_prop_init2 = Expr{ .NullLit = .{ .span = ts() } };
+    s_prop.init = &s_prop_init2;
 
     var s_recv = pathExpr("s");
     defer a.free(s_recv.Path.segments);
@@ -1798,11 +1806,14 @@ test "safe call on nullable is silent" {
         .span = ts(),
     } };
     var n_prop = emptyProp(false, "n");
-    n_prop.init = member;
+    var n_prop_init_1814 = member;
+    n_prop.init = &n_prop_init_1814;
 
+    var s_prop_decl = Decl{ .Property = &s_prop };
+    var n_prop_decl = Decl{ .Property = &n_prop };
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = &s_prop } },
-        .{ .Decl = .{ .Property = &n_prop } },
+        .{ .Decl = &s_prop_decl },
+        .{ .Decl = &n_prop_decl },
     };
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };
@@ -1824,12 +1835,14 @@ test "class member sibling reference resolves" {
     var one = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = ts() } };
     const add = Expr{ .Binary = .{ .op = .Add, .lhs = &b_call, .rhs = &one, .span = ts() } };
     var a_fn = emptyFn("a");
-    a_fn.return_type = typeRef("Int", false);
+    var a_fn_ret = typeRef("Int", false);
+    a_fn.return_type = &a_fn_ret;
     a_fn.body = .{ .Expr = add };
 
     const ten = Expr{ .IntLit = .{ .value = 10, .kind = .Int, .span = ts() } };
     var b_fn = emptyFn("b");
-    b_fn.return_type = typeRef("Int", false);
+    var b_fn_ret = typeRef("Int", false);
+    b_fn.return_type = &b_fn_ret;
     b_fn.body = .{ .Expr = ten };
 
     var members = [_]Decl{ .{ .Function = a_fn }, .{ .Function = b_fn } };
@@ -1874,11 +1887,13 @@ test "forward reference to local val in statement scope errors" {
     const call = callExpr(&println_callee, &args);
 
     var x_prop = emptyProp(false, "x");
-    x_prop.init = .{ .IntLit = .{ .value = 1, .kind = .Int, .span = ts() } };
+    var x_prop_init = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = ts() } };
+    x_prop.init = &x_prop_init;
 
+    var x_prop_decl = Decl{ .Property = &x_prop };
     var stmts = [_]Stmt{
         .{ .Expr = call },
-        .{ .Decl = .{ .Property = &x_prop } },
+        .{ .Decl = &x_prop_decl },
     };
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };
@@ -1898,7 +1913,8 @@ test "object literal member forward reference resolves" {
     // interface Greeter { fun hello(): String }; fun main() { val g = object :
     // Greeter { override fun hello() = name; val name = "world" }; g.hello() }
     var hello_abstract = emptyFn("hello");
-    hello_abstract.return_type = typeRef("String", false);
+    var hello_abstract_ret = typeRef("String", false);
+    hello_abstract.return_type = &hello_abstract_ret;
     var greeter_members = [_]Decl{.{ .Function = hello_abstract }};
     var greeter = mkClass("Greeter", &greeter_members);
     greeter.is_interface = true;
@@ -1912,7 +1928,8 @@ test "object literal member forward reference resolves" {
 
     var str_parts = [_]StringPart{.{ .Text = "world" }};
     var name_prop = emptyProp(false, "name");
-    name_prop.init = .{ .StringTemplate = .{ .parts = &str_parts, .span = ts() } };
+    var name_prop_init = Expr{ .StringTemplate = .{ .parts = &str_parts, .span = ts() } };
+    name_prop.init = &name_prop_init;
 
     var obj_members = [_]Decl{
         .{ .Function = hello_impl },
@@ -1921,7 +1938,7 @@ test "object literal member forward reference resolves" {
     var greeter_super = [_]ast.TypeRef{typeRef("Greeter", false)};
     var super_args = [_]?[]Expr{null};
     var super_delegates = [_]?Expr{null};
-    const obj_expr = Expr{ .ObjectExpr = .{
+    var obj_expr_node = ast.ObjectLiteral{
         .supertypes = &greeter_super,
         .supertype_args = &super_args,
         .supertype_delegates = &super_delegates,
@@ -1929,9 +1946,11 @@ test "object literal member forward reference resolves" {
         .init_blocks = &.{},
         .init_block_positions = &.{},
         .span = ts(),
-    } };
+    };
+    const obj_expr = Expr{ .ObjectExpr = &obj_expr_node };
     var g_prop = emptyProp(false, "g");
-    g_prop.init = obj_expr;
+    var g_prop_init_1956 = obj_expr;
+    g_prop.init = &g_prop_init_1956;
 
     // println(g.hello())
     var g_recv = pathExpr("g");
@@ -1948,8 +1967,9 @@ test "object literal member forward reference resolves" {
     var println_args = [_]Expr{hello_call};
     const println_call = callExpr(&println_callee, &println_args);
 
+    var g_prop_decl = Decl{ .Property = &g_prop };
     var main_stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = &g_prop } },
+        .{ .Decl = &g_prop_decl },
         .{ .Expr = println_call },
     };
     var main_fn = emptyFn("main");
@@ -1969,7 +1989,8 @@ test "safe call without annotation is silent" {
     // fun main() { val s = "hi"; val n = s?.length }
     var str_parts = [_]StringPart{.{ .Text = "hi" }};
     var s_prop = emptyProp(false, "s");
-    s_prop.init = .{ .StringTemplate = .{ .parts = &str_parts, .span = ts() } };
+    var s_prop_init = Expr{ .StringTemplate = .{ .parts = &str_parts, .span = ts() } };
+    s_prop.init = &s_prop_init;
 
     var s_recv = pathExpr("s");
     defer a.free(s_recv.Path.segments);
@@ -1980,11 +2001,14 @@ test "safe call without annotation is silent" {
         .span = ts(),
     } };
     var n_prop = emptyProp(false, "n");
-    n_prop.init = member;
+    var n_prop_init = member;
+    n_prop.init = &n_prop_init;
 
+    var s_prop_decl = Decl{ .Property = &s_prop };
+    var n_prop_decl = Decl{ .Property = &n_prop };
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = &s_prop } },
-        .{ .Decl = .{ .Property = &n_prop } },
+        .{ .Decl = &s_prop_decl },
+        .{ .Decl = &n_prop_decl },
     };
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };

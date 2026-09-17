@@ -21,7 +21,7 @@ const NEG_DIR = "tests/fixtures/typeck_negative";
 fn codesForSource(a: std.mem.Allocator, file_id: FileId, src: []const u8) ![]const []const u8 {
     var lx = try Lexer.init(a, file_id, src);
     const lexed = try lx.tokenize();
-    const p = Parser.new(a, file_id, src, lexed.tokens);
+    const p = Parser.new(a, file_id, src, lexed.tokens, lexed.strings);
     const file = p.parseFile();
 
     var r = try resolver.resolve(a, &file);
@@ -49,12 +49,12 @@ fn codesForFixture(a: std.mem.Allocator, name: []const u8) ![]const []const u8 {
 fn codesForMerged(a: std.mem.Allocator, src_a: []const u8, src_b: []const u8) ![]const []const u8 {
     var lx_a = try Lexer.init(a, FileId.from(0), src_a);
     const lexed_a = try lx_a.tokenize();
-    const p_a = Parser.new(a, FileId.from(0), src_a, lexed_a.tokens);
+    const p_a = Parser.new(a, FileId.from(0), src_a, lexed_a.tokens, lexed_a.strings);
     const file_a = p_a.parseFile();
 
     var lx_b = try Lexer.init(a, FileId.from(1), src_b);
     const lexed_b = try lx_b.tokenize();
-    const p_b = Parser.new(a, FileId.from(1), src_b, lexed_b.tokens);
+    const p_b = Parser.new(a, FileId.from(1), src_b, lexed_b.tokens, lexed_b.strings);
     const file_b = p_b.parseFile();
 
     const merged_decls = try a.alloc(ast.Decl, file_a.decls.len + file_b.decls.len);
@@ -721,7 +721,7 @@ test "overload checker records its pick per call span" {
     ;
     var lx = try Lexer.init(a, FileId.from(0), src);
     const lexed = try lx.tokenize();
-    const p = Parser.new(a, FileId.from(0), src, lexed.tokens);
+    const p = Parser.new(a, FileId.from(0), src, lexed.tokens, lexed.strings);
     const file = p.parseFile();
     var r = try resolver.resolve(a, &file);
     var tc = try typeck.typecheck(a, &file, &r);

@@ -497,7 +497,7 @@ const Gen = struct {
     /// `qualified_path` of `Outer.Nested` must survive, since the bare name is
     /// unresolvable from the synthetic file.
     fn qualifyTy(self: *const Gen, t: *const ast.TypeRef) Allocator.Error![]const u8 {
-        return self.qualify(t.qualified_path orelse t.name.name);
+        return self.qualify(t.x().qualified_path orelse t.name.name);
     }
 
     fn qualify(self: *const Gen, written: []const u8) Allocator.Error![]const u8 {
@@ -574,7 +574,7 @@ const Gen = struct {
         if (i >= t.type_args.len or t.type_args[i].is_star) {
             return "PolymorphicSerializer(Any::class)";
         }
-        return self.serializerExpr(&t.type_args[i].ty, t.type_args[i].ty.annotations);
+        return self.serializerExpr(&t.type_args[i].ty, t.type_args[i].ty.x().annotations);
     }
 
     /// `ContextualSerializer(X::class, fallback, args)`. A non-generic
@@ -613,7 +613,7 @@ const Gen = struct {
     fn serializerExprNonNull(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error![]const u8 {
         const a = self.a;
         if (serializableWith(a, annotations)) |w| return self.customSerializerRef(t, w);
-        if (serializableWith(a, t.annotations)) |w| return self.customSerializerRef(t, w);
+        if (serializableWith(a, t.x().annotations)) |w| return self.customSerializerRef(t, w);
         if (t.function == null and t.type_args.len == 0 and self.typeParamIndex(simpleHead(t.name.name)) == null) {
             if (self.idx.type_aliases.get(simpleHead(t.name.name))) |ta| {
                 if (ta.type_params.len == 0 and !std.mem.eql(u8, simpleHead(ta.target.name.name), simpleHead(t.name.name))) {
@@ -704,7 +704,7 @@ const Gen = struct {
             if (cn.is_enum and !isSerializableIn(self.idx, cn.annotations)) {
                 const serial = if (self.pkg.len == 0) qn else try std.fmt.allocPrint(a, "{s}.{s}", .{ self.pkg, qn });
                 var marked = false;
-                for (cn.enum_entries) |*en| {
+                for (cn.x().enum_entries) |*en| {
                     if (en.annotations.len != 0) marked = true;
                 }
                 const class_anns = try classAnnotationCalls(a, self.idx, qn);
@@ -862,9 +862,9 @@ fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Erro
         if (!has_field) continue;
         // An unannotated property has an inferred type: name it from a literal
         // initializer, else fall back to `Any`.
-        const ty: *const ast.TypeRef = if (p.ty) |*t| t else blk: {
+        const ty: *const ast.TypeRef = if (p.ty) |t| t else blk: {
             const init = p.init orelse continue;
-            const inferred_name: []const u8 = switch (init) {
+            const inferred_name: []const u8 = switch (init.*) {
                 .StringTemplate => "String",
                 .IntLit => |lit| switch (lit.kind) {
                     .Long => "Long",
@@ -885,8 +885,6 @@ fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Erro
                 .type_args = &.{},
                 .function = null,
                 .definitely_non_null = false,
-                .annotations = &.{},
-                .qualified_path = null,
             };
             break :blk t;
         };
@@ -896,7 +894,7 @@ fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Erro
             .serial_name = sn,
             .ty = ty,
             .annotations = p.annotations,
-            .default_text = if (p.init) |*i| exprText(i) else null,
+            .default_text = if (p.init) |i| exprText(i) else null,
             .in_ctor = false,
             .required = hasAnnotation(p.annotations, "Required"),
             .encode_default = encodeDefaultMode(p.annotations),
@@ -1382,7 +1380,7 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
 
 fn writeAnnotatedEnumSerializer(w: *std.ArrayList(u8), a: Allocator, c: *const ast.Class, serial: []const u8, path: []const u8, class_anns: []const []const u8) Allocator.Error!void {
     try wp(w, a, "createAnnotatedEnumSerializer(\"{s}\", {s}.values(), arrayOf<String?>(", .{ try kq(a, serial), path });
-    for (c.enum_entries, 0..) |*en, i| {
+    for (c.x().enum_entries, 0..) |*en, i| {
         if (i > 0) try w.appendSlice(a, ", ");
         if (findAnnotation(en.annotations, "SerialName")) |an| {
             if (annotationStringArg(an)) |s| {
@@ -1393,7 +1391,7 @@ fn writeAnnotatedEnumSerializer(w: *std.ArrayList(u8), a: Allocator, c: *const a
         try w.appendSlice(a, "null");
     }
     try w.appendSlice(a, "), arrayOf<Array<Annotation>?>(");
-    for (c.enum_entries, 0..) |*en, i| {
+    for (c.x().enum_entries, 0..) |*en, i| {
         if (i > 0) try w.appendSlice(a, ", ");
         var anns: std.ArrayList([]const u8) = .empty;
         for (en.annotations) |*an| {
@@ -1434,7 +1432,7 @@ fn genEnumFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *co
     const gn = try genNameFor(a, info);
     const serial = try serialNameOf(a, info);
     var marked = false;
-    for (c.enum_entries) |*en| {
+    for (c.x().enum_entries) |*en| {
         if (en.annotations.len != 0) marked = true;
     }
     const class_anns = try classAnnotationCalls(a, idx, info.path);
@@ -1680,7 +1678,7 @@ fn parseSnippet(a: Allocator, file: FileId, src: []const u8) ?ast.KotlinFile {
     var lx = lexer_mod.Lexer.init(a, file, src) catch return null;
     var lexed = lx.tokenize() catch return null;
     if (lexed.diagnostics.hasErrors()) return null;
-    var p = parser_mod.Parser.new(a, file, src, lexed.tokens);
+    var p = parser_mod.Parser.new(a, file, src, lexed.tokens, lexed.strings);
     const kf = p.parseFile();
     if (p.diagnostics.hasErrors()) {
         if (std.c.getenv("KLIO_SERIAL_DUMP") != null) {
@@ -1843,7 +1841,7 @@ fn walkLocalExpr(ctx: *Ctx, f: *ast.Function, e: *ast.Expr, outer: []const u8) A
             try walkLocalExpr(ctx, f, c.callee, outer);
             for (c.args) |*a| try walkLocalExpr(ctx, f, a, outer);
         },
-        .Lambda => |*l| try processLocalStmts(ctx, f, l.body.stmts, outer),
+        .Lambda => |l| try processLocalStmts(ctx, f, l.body.stmts, outer),
         .Block => |*blk| try processLocalStmts(ctx, f, blk.stmts, outer),
         .If => |*i| {
             try walkLocalExpr(ctx, f, i.cond, outer);
@@ -1858,16 +1856,16 @@ fn walkLocalExpr(ctx: *Ctx, f: *ast.Function, e: *ast.Expr, outer: []const u8) A
             if (w.body) |wb| try walkLocalExpr(ctx, f, wb, outer);
             try walkLocalExpr(ctx, f, w.cond, outer);
         },
-        .For => |*fr| {
+        .For => |fr| {
             try walkLocalExpr(ctx, f, fr.iter, outer);
             try walkLocalExpr(ctx, f, fr.body, outer);
         },
-        .Try => |*t| {
+        .Try => |t| {
             try processLocalStmts(ctx, f, t.body.stmts, outer);
             for (t.catches) |*cc| try processLocalStmts(ctx, f, cc.body.stmts, outer);
             if (t.finally) |*fb| try processLocalStmts(ctx, f, fb.stmts, outer);
         },
-        .When => |*w| {
+        .When => |w| {
             if (w.subject) |sub| try walkLocalExpr(ctx, f, sub, outer);
             for (w.branches) |*br| try walkLocalExpr(ctx, f, &br.body, outer);
         },
@@ -1886,9 +1884,9 @@ fn walkLocalExpr(ctx: *Ctx, f: *ast.Function, e: *ast.Expr, outer: []const u8) A
             for (ix.args) |*a| try walkLocalExpr(ctx, f, a, outer);
         },
         .Spread => |*sp| try walkLocalExpr(ctx, f, sp.expr, outer),
-        .IsCheck => |*ic| try walkLocalExpr(ctx, f, ic.expr, outer),
-        .As => |*ac| try walkLocalExpr(ctx, f, ac.expr, outer),
-        .AnonFun => |*af| if (af.body) |fb| switch (fb.*) {
+        .IsCheck => |ic| try walkLocalExpr(ctx, f, ic.expr, outer),
+        .As => |ac| try walkLocalExpr(ctx, f, ac.expr, outer),
+        .AnonFun => |af| if (af.body) |fb| switch (fb.*) {
             .Block => |*blk| try processLocalStmts(ctx, f, blk.stmts, outer),
             .Expr => |*ex| try walkLocalExpr(ctx, f, ex, outer),
         },
@@ -1904,20 +1902,20 @@ fn processLocalStmts(ctx: *Ctx, f: *ast.Function, stmts: []ast.Stmt, outer: []co
                 try walkLocalExpr(ctx, f, e, outer);
                 continue;
             },
-            .Assign => |*a| {
+            .Assign => |a| {
                 try walkLocalExpr(ctx, f, &a.value, outer);
                 continue;
             },
-            .DestructuringDecl => |*dd| {
+            .DestructuringDecl => |dd| {
                 try walkLocalExpr(ctx, f, &dd.init, outer);
                 continue;
             },
             .Decl => {},
         }
-        if (dbg) std.debug.print("[serial-pass] local decl in {s}: {s}\n", .{ f.name.name, @tagName(std.meta.activeTag(st.Decl)) });
-        switch (st.Decl) {
+        if (dbg) std.debug.print("[serial-pass] local decl in {s}: {s}\n", .{ f.name.name, @tagName(std.meta.activeTag(st.Decl.*)) });
+        switch (st.Decl.*) {
             .Property => |p| {
-                if (p.init) |*init| try walkLocalExpr(ctx, f, init, outer);
+                if (p.init) |init| try walkLocalExpr(ctx, f, init, outer);
                 continue;
             },
             .Function => |*lf| {
@@ -2308,7 +2306,7 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
             const p = d.Property;
             if (!p.is_const) continue;
             const ini = p.init orelse continue;
-            if (exprStringLiteral(&ini)) |txt| try idx.const_strings.put(p.name.name, txt);
+            if (exprStringLiteral(ini)) |txt| try idx.const_strings.put(p.name.name, txt);
         }
     }
     for (files_in) |*f| try indexAnnotationClasses(&idx, f.decls);
@@ -2405,7 +2403,7 @@ fn declsMentionSerializable(decls: []const ast.Decl) bool {
                 if (body != .Block) continue;
                 for (body.Block.stmts) |*st| {
                     if (st.* != .Decl) continue;
-                    if (declsMentionSerializable(@as([*]const ast.Decl, @ptrCast(&st.Decl))[0..1])) return true;
+                    if (declsMentionSerializable(@as([*]const ast.Decl, @ptrCast(st.Decl))[0..1])) return true;
                 }
             },
             else => {},

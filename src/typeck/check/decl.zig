@@ -96,9 +96,9 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
     switch (decl.*) {
         .Function => |*f| {
             const sig = try signatureOf(self, f);
-            if (f.receiver_type) |*recv| {
+            if (f.receiver_type) |recv| {
                 var return_class: ?[]const u8 = null;
-                if (f.return_type) |*rt| return_class = classNameFromTyperef(rt);
+                if (f.return_type) |rt| return_class = classNameFromTyperef(rt);
                 const gop = try self.extensions.getOrPut(recv.name.name);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 try gop.value_ptr.append(self.allocator, .{
@@ -122,9 +122,9 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
             }
         },
         .Property => |p| {
-            const ty = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
-            const cn = if (p.ty) |*pt| classNameFromTyperef(pt) else null;
-            if (p.receiver_type) |*recv| {
+            const ty = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
+            const cn = if (p.ty) |pt| classNameFromTyperef(pt) else null;
+            if (p.receiver_type) |recv| {
                 const gop = try self.extension_properties.getOrPut(recv.name.name);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 try gop.value_ptr.append(self.allocator, .{
@@ -140,8 +140,8 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 var bound_cn = cn;
                 var ebf: ?root.EbfBinding = null;
                 if (p.explicit_field) |ef| {
-                    const disp = if (p.ty) |*pt| try helpers.typeRefDisplay(self.allocator, pt) else p.name.name;
-                    if (ef.ty) |*ft| {
+                    const disp = if (p.ty) |pt| try helpers.typeRefDisplay(self.allocator, pt) else p.name.name;
+                    if (ef.ty) |ft| {
                         bound_ty = try convertTypeRefLossy(self.allocator, ft);
                         bound_cn = classNameFromTyperef(ft);
                         ebf = .{
@@ -284,7 +284,7 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
         names[i] = p.name.name;
         is_vararg[i] = p.is_vararg;
     }
-    const return_ty = if (f.return_type) |*rt|
+    const return_ty = if (f.return_type) |rt|
         try convertTypeRefWithTparams(self.allocator, rt, &tparams)
     else
         Type.Unit;
@@ -310,7 +310,7 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
         .type_param_names = bounds.names,
         .type_param_bounds = bounds.bounds,
         .param_class_names = param_class_names,
-        .return_class = if (f.return_type) |*rt| classNameFromTyperef(rt) else null,
+        .return_class = if (f.return_type) |rt| classNameFromTyperef(rt) else null,
         .decl_span = f.name.span,
         .is_suspend = f.is_suspend,
         .is_extension = f.receiver_type != null,
@@ -340,7 +340,7 @@ pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
     info.is_sealed = c.is_sealed;
     info.is_enum = c.is_enum;
     info.is_open = c.is_open or c.is_abstract or c.is_sealed;
-    info.has_secondary_ctors = c.secondary_ctors.len != 0;
+    info.has_secondary_ctors = c.x().secondary_ctors.len != 0;
     info.decl_visibility = c.visibility;
     info.decl_file = c.name.span.file;
     info.primary_ctor_visibility = c.primary_ctor_visibility;
@@ -361,7 +361,7 @@ pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
             } });
         }
     }
-    const ctor_bounds = try collectTypeParamBounds(self, c.type_params, c.where_bounds);
+    const ctor_bounds = try collectTypeParamBounds(self, c.type_params, c.x().where_bounds);
     const ctor_params = try self.allocator.alloc(Type, c.primary_params.len);
     const ctor_has_default = try self.allocator.alloc(bool, c.primary_params.len);
     const ctor_param_names = try self.allocator.alloc([]const u8, c.primary_params.len);
@@ -476,7 +476,7 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                     .is_suspend = f.is_suspend,
                 } };
                 try info.members.put(f.name.name, ty);
-                if (f.return_type) |*rt| {
+                if (f.return_type) |rt| {
                     if (classNameFromTyperef(rt)) |cn| try info.member_class.put(f.name.name, cn);
                 }
                 // Kotlin makes these implicitly `open`.
@@ -497,7 +497,7 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                 try info.member_visibility.put(f.name.name, f.visibility);
             },
             .Property => |p| {
-                const ty = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
+                const ty = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
                 try info.member_sigs.put(p.name.name, .{ .Property = .{
                     .ty = try ty.clone(self.allocator),
                     .mutable = p.mutable,
@@ -505,15 +505,15 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                 } });
                 try info.members.put(p.name.name, ty);
                 try info.member_mutable.put(p.name.name, p.mutable);
-                if (p.ty) |*pt| {
+                if (p.ty) |pt| {
                     if (classNameFromTyperef(pt)) |cn| try info.member_class.put(p.name.name, cn);
                 }
                 if (p.explicit_field) |ef| {
                     // `members` keeps the public type; the declaring scope
                     // reads the field type.
-                    const fty = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else Type.Unresolved;
-                    const fcn = if (ef.ty) |*ft| classNameFromTyperef(ft) else null;
-                    const disp = if (p.ty) |*pt| try helpers.typeRefDisplay(self.allocator, pt) else p.name.name;
+                    const fty = if (ef.ty) |ft| try convertTypeRefLossy(self.allocator, ft) else Type.Unresolved;
+                    const fcn = if (ef.ty) |ft| classNameFromTyperef(ft) else null;
+                    const disp = if (p.ty) |pt| try helpers.typeRefDisplay(self.allocator, pt) else p.name.name;
                     try info.member_ebf.put(p.name.name, .{
                         .field_ty = fty,
                         .field_class = fcn,
@@ -552,8 +552,8 @@ pub fn checkDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
 }
 
 pub fn checkTopLevelProperty(self: *Checker, p: *const Property) Allocator.Error!void {
-    if (p.init) |*init| {
-        var annot: ?Type = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else null;
+    if (p.init) |init| {
+        var annot: ?Type = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else null;
         defer if (annot) |*a| a.deinit(self.allocator);
         var init_ty = try self.checkExpr(init, if (annot) |*a| a else null);
         defer init_ty.deinit(self.allocator);
@@ -568,8 +568,8 @@ pub fn checkTopLevelProperty(self: *Checker, p: *const Property) Allocator.Error
         }
     }
     if (p.explicit_field) |ef| {
-        if (ef.init) |*finit| {
-            var want: ?Type = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else null;
+        if (ef.init) |finit| {
+            var want: ?Type = if (ef.ty) |ft| try convertTypeRefLossy(self.allocator, ft) else null;
             defer if (want) |*a| a.deinit(self.allocator);
             var fty = try self.checkExpr(finit, if (want) |*a| a else null);
             defer fty.deinit(self.allocator);
@@ -666,7 +666,7 @@ pub fn checkOperatorSignature(self: *Checker, f: *const Function) Allocator.Erro
         }
     }
     if (returns_bool) {
-        if (f.return_type) |*rt| {
+        if (f.return_type) |rt| {
             var ty = try convertTypeRefLossy(self.allocator, rt);
             defer ty.deinit(self.allocator);
             const nn = ty.nonNull();
@@ -677,7 +677,7 @@ pub fn checkOperatorSignature(self: *Checker, f: *const Function) Allocator.Erro
         }
     }
     if (returns_int) {
-        if (f.return_type) |*rt| {
+        if (f.return_type) |rt| {
             var ty = try convertTypeRefLossy(self.allocator, rt);
             defer ty.deinit(self.allocator);
             const nn = ty.nonNull();
@@ -861,7 +861,7 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
             try checkAssignable(self, &dty, &want, default.span());
         }
     }
-    var declared_return = if (f.return_type) |*rt| try convertTypeRefLossy(self.allocator, rt) else Type.Unit;
+    var declared_return = if (f.return_type) |rt| try convertTypeRefLossy(self.allocator, rt) else Type.Unit;
     defer declared_return.deinit(self.allocator);
 
     try self.fn_return_stack.append(self.allocator, try declared_return.clone(self.allocator));
@@ -994,7 +994,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     for (c.type_params) |*tp| try class_tps.put(tp.name.name, {});
     try self.type_params_in_scope.append(self.allocator, class_tps);
     try self.reified_type_params.append(self.allocator, std.StringHashMap(void).init(self.allocator));
-    try checkCircularBounds(self, c.type_params, c.where_bounds);
+    try checkCircularBounds(self, c.type_params, c.x().where_bounds);
     try checkDataOrEnumFinality(self, c);
     try checkSecondaryCtorDelegationCycles(self, c);
     try checkDataClassPrimaryProperties(self, c);
@@ -1022,11 +1022,11 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     // Covers property initializers and init blocks.
     const init_cfg_span = try lowerClassInitFlow(self, c);
     try checkPropertiesDefinitelyAssigned(self, c, &uninitialized_properties, init_cfg_span);
-    for (c.secondary_ctors) |*sc| try checkSecondaryCtor(self, sc);
+    for (c.x().secondary_ctors) |*sc| try checkSecondaryCtor(self, sc);
     for (c.members) |*m| {
         if (m.* == .Function) try checkFunction(self, &m.Function);
     }
-    for (c.enum_entries) |*entry| try checkEnumEntry(self, entry);
+    for (c.x().enum_entries) |*entry| try checkEnumEntry(self, entry);
     popFrame(self);
     _ = self.class_stack.pop();
     {
@@ -1061,19 +1061,19 @@ fn checkDataOrEnumFinality(self: *Checker, c: *const Class) Allocator.Error!void
 
 fn checkSecondaryCtorDelegationCycles(self: *Checker, c: *const Class) Allocator.Error!void {
     // Secondary-constructor delegation must not form a cycle.
-    if (c.secondary_ctors.len != 0) {
-        const n = c.secondary_ctors.len;
+    if (c.x().secondary_ctors.len != 0) {
+        const n = c.x().secondary_ctors.len;
         var edges = try self.allocator.alloc(std.ArrayList(usize), n);
         defer {
             for (edges) |*e| e.deinit(self.allocator);
             self.allocator.free(edges);
         }
         for (edges) |*e| e.* = .empty;
-        for (c.secondary_ctors, 0..) |*sc, i| {
+        for (c.x().secondary_ctors, 0..) |*sc, i| {
             switch (sc.delegation) {
                 .This => |args| {
                     const arity = args.len;
-                    for (c.secondary_ctors, 0..) |*other, j| {
+                    for (c.x().secondary_ctors, 0..) |*other, j| {
                         if (other.params.len == arity) try edges[i].append(self.allocator, j);
                     }
                 },
@@ -1104,7 +1104,7 @@ fn checkSecondaryCtorDelegationCycles(self: *Checker, c: *const Class) Allocator
             }
             if (hit_self) {
                 const msg = try std.fmt.allocPrint(self.allocator, "secondary constructor of `{s}` participates in a delegation cycle", .{c.name.name});
-                try emitError(self, msg, c.secondary_ctors[start].span, codes.TYPE_CONSTRUCTOR_DELEGATION_CYCLE);
+                try emitError(self, msg, c.x().secondary_ctors[start].span, codes.TYPE_CONSTRUCTOR_DELEGATION_CYCLE);
             }
         }
     }
@@ -1299,7 +1299,7 @@ fn checkOverrideSignatures(self: *Checker, c: *const Class, inherited: *std.Stri
                     try emitError(self, msg, f.name.span, codes.TYPE_OVERRIDE_SUSPEND_MISMATCH);
                 }
                 // Only when both ends annotate a return type.
-                if (f.return_type) |*rt| {
+                if (f.return_type) |rt| {
                     var derived_ret = try convertTypeRefLossy(self.allocator, rt);
                     defer derived_ret.deinit(self.allocator);
                     if (!derived_ret.isSubtypeOf(base.return_ty)) {
@@ -1318,7 +1318,7 @@ fn checkOverrideSignatures(self: *Checker, c: *const Class, inherited: *std.Stri
                 const got = inherited_sigs.get(p.name.name) orelse continue;
                 if (got != .Property) continue;
                 const base = got.Property;
-                var derived_ty = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
+                var derived_ty = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
                 defer derived_ty.deinit(self.allocator);
                 // Mutability cannot strengthen.
                 if (base.mutable and !p.mutable) {
@@ -1475,8 +1475,8 @@ fn checkBodyProperties(self: *Checker, c: *const Class, uninitialized_properties
     for (c.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
-        if (p.init) |*init| {
-            var want: ?Type = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else null;
+        if (p.init) |init| {
+            var want: ?Type = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else null;
             var ity = try self.checkExpr(init, if (want) |*a| a else null);
             defer ity.deinit(self.allocator);
             if (want) |*a| {
@@ -1486,8 +1486,8 @@ fn checkBodyProperties(self: *Checker, c: *const Class, uninitialized_properties
         }
         // Against the field type, not the property type.
         if (p.explicit_field) |ef| {
-            if (ef.init) |*finit| {
-                var want: ?Type = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else null;
+            if (ef.init) |finit| {
+                var want: ?Type = if (ef.ty) |ft| try convertTypeRefLossy(self.allocator, ft) else null;
                 var fty = try self.checkExpr(finit, if (want) |*a| a else null);
                 defer fty.deinit(self.allocator);
                 if (want) |*a| {
@@ -1502,10 +1502,10 @@ fn checkBodyProperties(self: *Checker, c: *const Class, uninitialized_properties
             // Inside the declaring scope an explicit field is seen and
             // assigned at the field type.
             const narrow_tr: ?*const ast.TypeRef = if (p.explicit_field) |ef|
-                (if (ef.ty) |*ft| ft else null)
+                (if (ef.ty) |ft| ft else null)
             else
                 null;
-            const bind_tr: ?*const ast.TypeRef = narrow_tr orelse (if (p.ty) |*pt| @as(?*const ast.TypeRef, pt) else null);
+            const bind_tr: ?*const ast.TypeRef = narrow_tr orelse (if (p.ty) |pt| @as(?*const ast.TypeRef, pt) else null);
             const pty = if (bind_tr) |tr| try convertTypeRefLossy(self.allocator, tr) else Type.Unresolved;
             try currentFrame(self).bindings.put(p.name.name, .{
                 .ty = pty,
@@ -1561,7 +1561,7 @@ fn lowerClassInitFlow(self: *Checker, c: *const Class) Allocator.Error!Span {
     init_low.* = init_lowered;
     try self.lowerings.put(init_cfg_span, init_low);
     try self.cfg_fn_stack.append(self.allocator, init_cfg_span);
-    for (c.init_blocks) |*b| {
+    for (c.x().init_blocks) |*b| {
         var bty = try checkBlock(self, b, null);
         bty.deinit(self.allocator);
     }
@@ -1571,7 +1571,7 @@ fn lowerClassInitFlow(self: *Checker, c: *const Class) Allocator.Error!Span {
 
 fn checkPropertiesDefinitelyAssigned(self: *Checker, c: *const Class, uninitialized_properties: *const std.ArrayList(UninitProperty), init_cfg_span: Span) Allocator.Error!void {
     // Each must be definitely assigned by the end of initialization.
-    if (c.secondary_ctors.len != 0) {
+    if (c.x().secondary_ctors.len != 0) {
         // Secondary-constructor flow runs its own path.
     } else if (c.is_expect) {
         // An `expect class` has no bodies or initializers.
@@ -1875,11 +1875,11 @@ pub fn checkLateinit(self: *Checker, p: *const Property) Allocator.Error!void {
         const msg = try std.fmt.allocPrint(self.allocator, "`lateinit` modifier is not allowed on `val` (use `lateinit var` for `{s}`)", .{p.name.name});
         try emitError(self, msg, p.name.span, codes.TYPE_LATEINIT_VAL);
     }
-    if (p.init) |*init| {
+    if (p.init) |init| {
         const msg = try std.fmt.allocPrint(self.allocator, "`lateinit` property `{s}` cannot have an initializer", .{p.name.name});
         try emitError(self, msg, init.span(), codes.TYPE_LATEINIT_WITH_INITIALIZER);
     }
-    if (p.ty) |*ty| {
+    if (p.ty) |ty| {
         if (ty.nullable) {
             const msg = try std.fmt.allocPrint(self.allocator, "`lateinit` property `{s}` may not have a nullable type", .{p.name.name});
             try emitError(self, msg, ty.span, codes.TYPE_LATEINIT_NULLABLE);
@@ -1918,7 +1918,7 @@ pub fn checkExplicitBackingField(self: *Checker, p: *const Property, in_interfac
     if (p.setter) |acc| {
         try emitEbf(self, &g.PROPERTY_WITH_EXPLICIT_FIELD_AND_ACCESSORS, "Properties with explicit backing fields cannot have accessors.", acc.span);
     }
-    if (p.init) |*init| {
+    if (p.init) |init| {
         try emitEbf(self, &g.PROPERTY_INITIALIZER_WITH_EXPLICIT_FIELD_DECLARATION, "Property initializers are prohibited for properties with explicit backing field declaration.", init.span());
     }
     if (p.is_open or p.is_override) {
@@ -1942,8 +1942,8 @@ pub fn checkExplicitBackingField(self: *Checker, p: *const Property, in_interfac
     if (p.visibility == .Private) {
         try emitEbf(self, &g.EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE, "Private properties cannot have explicit backing fields.", p.name.span);
     }
-    if (p.ty) |*pt| {
-        if (ef.ty) |*ft| {
+    if (p.ty) |pt| {
+        if (ef.ty) |ft| {
             if (helpers.typeRefEql(ft, pt)) {
                 var d = Diagnostic.warning("Explicit backing field declaration is unnecessary if it has the same type as the property.", ef.span);
                 _ = d.withCode(codes.WARN_REDUNDANT_EXPLICIT_BACKING_FIELD);
@@ -2093,7 +2093,7 @@ fn builtinChainContains(sub: []const u8, sup: []const u8) bool {
 
 /// It must match the property's declared type.
 pub fn checkAccessorReturnTypes(self: *Checker, p: *const Property) Allocator.Error!void {
-    const prop_ty_ref = if (p.ty) |*pt| pt else return;
+    const prop_ty_ref = if (p.ty) |pt| pt else return;
     var prop_ty = try convertTypeRefLossy(self.allocator, prop_ty_ref);
     defer prop_ty.deinit(self.allocator);
     const accessors = [_]struct { a: ?*const Accessor, label: []const u8 }{
@@ -2102,7 +2102,7 @@ pub fn checkAccessorReturnTypes(self: *Checker, p: *const Property) Allocator.Er
     };
     for (accessors) |item| {
         const a = item.a orelse continue;
-        const rt = if (a.return_type) |*r| r else continue;
+        const rt = if (a.return_type) |r| r else continue;
         var rty = try convertTypeRefLossy(self.allocator, rt);
         defer rty.deinit(self.allocator);
         if (!typesMatchForAccessor(&rty, &prop_ty)) {
@@ -2249,8 +2249,8 @@ pub fn checkObject(self: *Checker, o: *const ObjectDecl) Allocator.Error!void {
     for (o.members) |*m| {
         switch (m.*) {
             .Property => |p| {
-                if (p.init) |*init| {
-                    var want: ?Type = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else null;
+                if (p.init) |init| {
+                    var want: ?Type = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else null;
                     var ity = try self.checkExpr(init, if (want) |*a| a else null);
                     defer ity.deinit(self.allocator);
                     if (want) |*a| {
@@ -2259,8 +2259,8 @@ pub fn checkObject(self: *Checker, o: *const ObjectDecl) Allocator.Error!void {
                     }
                 }
                 if (p.explicit_field) |ef| {
-                    if (ef.init) |*finit| {
-                        var want: ?Type = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else null;
+                    if (ef.init) |finit| {
+                        var want: ?Type = if (ef.ty) |ft| try convertTypeRefLossy(self.allocator, ft) else null;
                         var fty = try self.checkExpr(finit, if (want) |*a| a else null);
                         defer fty.deinit(self.allocator);
                         if (want) |*a| {

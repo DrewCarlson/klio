@@ -289,7 +289,9 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // re-select a chain value satisfying the wrong head. Null for a plain
         // lambda disables re-selection and keeps the passed receiver.
         if (lambda_receiver_shape_known) {
-            f.lambda_receiver_ty = if (receiver_head) |h| try b.allocator.dupe(u8, h) else null;
+            var extra = f.x().*;
+            extra.lambda_receiver_ty = if (receiver_head) |h| try b.allocator.dupe(u8, h) else null;
+            try f.setExtra(b.allocator, extra);
         }
     }
 
@@ -297,7 +299,9 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (b.pending_lambda_label) |label| {
         b.pending_lambda_label = null;
         if (b.module.funcByIdMut(body_func)) |f| {
-            f.implicit_label = label;
+            var extra = f.x().*;
+            extra.implicit_label = label;
+            try f.setExtra(b.allocator, extra);
         }
     }
     // A `suspend { … }` literal: the body is a suspend function value.
@@ -316,7 +320,7 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         try lambdaParamNames(b.allocator, lam.params);
     const body_ast = lam.body;
     const dst = b.allocReg();
-    try b.push(.{ .AstLambda = .{
+    try b.push(.{ .AstLambda = try b.boxInst(ir.AstLambdaInst{
         .dst = dst,
         .params = param_names,
         .body_ast = body_ast,
@@ -324,7 +328,7 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .captured_names = captured_names,
         .absorb_return = false,
         .body_func = body_func,
-    } });
+    }) });
     return dst;
 }
 
@@ -398,7 +402,7 @@ pub fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const captures = try b.allocator.alloc(Reg, captured_names.len);
     for (captured_names, captures) |n, *c| c.* = try resolveCapture(b, n);
     const dst = b.allocReg();
-    try b.push(.{ .AstLambda = .{
+    try b.push(.{ .AstLambda = try b.boxInst(ir.AstLambdaInst{
         .dst = dst,
         .params = param_names,
         .body_ast = body_block,
@@ -406,7 +410,7 @@ pub fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .captured_names = captured_names,
         .absorb_return = true,
         .body_func = lowered.func,
-    } });
+    }) });
     return dst;
 }
 

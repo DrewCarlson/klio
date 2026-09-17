@@ -300,7 +300,7 @@ pub const Lowering = struct {
         const a = self.allocator;
         switch (stmt.*) {
             .Expr => |*e| return try self.lowerExpr(e, cur),
-            .Decl => |d| switch (d) {
+            .Decl => |d| switch (d.*) {
                 .Property => |p| {
                     const sp = p.name.span;
                     try self.b.push(a, cur.*, .{ .DeclLocal = .{
@@ -309,11 +309,11 @@ pub const Lowering = struct {
                         .span = sp,
                     } });
                     if (p.init) |init_expr| {
-                        const r = try self.lowerExpr(&init_expr, cur);
+                        const r = try self.lowerExpr(init_expr, cur);
                         // An immutable local bound to a place records the
                         // aliasing, so lookups for the new name follow the chain.
                         if (!p.mutable) {
-                            if (try exprToPlace(a, &init_expr)) |src| {
+                            if (try exprToPlace(a, init_expr)) |src| {
                                 try self.aliases.put(
                                     .{ .name = try a.dupe(u8, p.name.name) },
                                     src,
@@ -1394,7 +1394,7 @@ fn lowerFirstFun(arena: Allocator, src: []const u8) ![]u8 {
     var lexer = try Lexer.init(arena, file, src);
     const lexed = try lexer.tokenize();
     try std.testing.expect(!lexed.diagnostics.hasErrors());
-    const parser = Parser.new(arena, file, src, lexed.tokens);
+    const parser = Parser.new(arena, file, src, lexed.tokens, lexed.strings);
     const parsed = parser.parseFile();
     try std.testing.expect(!parser.diagnostics.hasErrors());
 
@@ -1608,7 +1608,7 @@ test "bound smart-cast records an alias for an immutable place binding" {
     ;
     var lexer = try Lexer.init(a, file, src);
     const lexed = try lexer.tokenize();
-    const parser = Parser.new(a, file, src, lexed.tokens);
+    const parser = Parser.new(a, file, src, lexed.tokens, lexed.strings);
     const parsed = parser.parseFile();
     var func: ?*const ast.Function = null;
     for (parsed.decls) |*d| {

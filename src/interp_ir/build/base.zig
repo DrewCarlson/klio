@@ -144,7 +144,7 @@ pub fn parentCtorParamExpected(a: Allocator, module: *ir.Module, c: *const ast.C
     const sup = &c.supertypes[sup_idx];
     const file = sup.name.span.file;
     const pkg = module.packageOfFile(file) orelse "";
-    const cid = (if (sup.qualified_path) |qp| module.classIdByQualifiedSuffix(qp) else null) orelse
+    const cid = (if (sup.x().qualified_path) |qp| module.classIdByQualifiedSuffix(qp) else null) orelse
         module.classIdIndexed(sup.name.name, pkg, file) orelse module.classId(sup.name.name) orelse return null;
     if (cid.int() >= module.classes.items.len) return null;
     const pc = &module.classes.items[cid.int()];
@@ -177,8 +177,6 @@ pub fn irTypeToAstInstantiated(a: Allocator, ty: ir.TypeRef, tps: []const []cons
         .type_args = args,
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 
@@ -502,8 +500,8 @@ pub fn composeBaseComposableGetterProps(props: *std.StringHashMap(void), base_de
 pub fn composeBaseFactoryDecl(factories: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| {
-            if (f.return_type) |*rt| {
-                if (rt.function != null and compose_pass.isComposable(rt.annotations)) {
+            if (f.return_type) |rt| {
+                if (rt.function != null and compose_pass.isComposable(rt.x().annotations)) {
                     try factories.put(f.name.name, {});
                 }
             }
@@ -517,7 +515,7 @@ pub fn composeBaseFactoryDecl(factories: *std.StringHashMap(void), d: *const Dec
 pub fn composeBaseSinkDecl(sinks: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| for (f.params) |*p| {
-            if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations)) {
+            if (p.ty.function != null and compose_pass.isComposable(p.ty.x().annotations)) {
                 try sinks.put(f.name.name, {});
                 break;
             }
@@ -525,7 +523,7 @@ pub fn composeBaseSinkDecl(sinks: *std.StringHashMap(void), d: *const Decl) Allo
         .Class => |*c| {
             // A class constructor taking a `@Composable` lambda is a sink under the class name.
             for (c.primary_params) |*p| {
-                if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations)) {
+                if (p.ty.function != null and compose_pass.isComposable(p.ty.x().annotations)) {
                     try sinks.put(c.name.name, {});
                     break;
                 }

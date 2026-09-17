@@ -66,8 +66,24 @@ pub const FuncStreams = struct {
 
 var cache_mutex: runtime.SpinMutex = .{};
 /// Keyed per (function, fuse variant): the loop JIT takes single functions off
-/// fusion, so both variants can be live in one process.
-const CacheKey = struct { blocks: usize, fuse: bool };
+/// fusion, so both variants can be live in one process. The address alone is
+/// not an identity: a function freed and another built at the same address
+/// would serve the first one's streams, so the key carries a shape signature
+/// of the blocks it was built from.
+const CacheKey = struct { blocks: usize, sig: u64, fuse: bool };
+
+fn blocksSignature(blocks: []const ir.Block) u64 {
+    var h = std.hash.Wyhash.init(blocks.len);
+    for (blocks) |*b| {
+        h.update(std.mem.asBytes(&@as(u32, @intCast(b.insts.len))));
+        h.update(std.mem.asBytes(&@as(u8, @intFromEnum(b.terminator))));
+        if (b.insts.len != 0) {
+            h.update(std.mem.asBytes(&@as(u8, @intFromEnum(b.insts[0]))));
+            h.update(std.mem.asBytes(&@as(u8, @intFromEnum(b.insts[b.insts.len - 1]))));
+        }
+    }
+    return h.final();
+}
 var cache: ?std.AutoHashMap(CacheKey, *const FuncStreams) = null;
 
 /// Generation for the per-Func `bc_memo` fast path: `resetCacheForTest` frees
@@ -117,7 +133,7 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
             return if (m == 1) null else @ptrFromInt(m);
         }
     }
-    const key: CacheKey = .{ .blocks = @intFromPtr(func.blocks.ptr), .fuse = allow_fuse };
+    const key: CacheKey = .{ .blocks = @intFromPtr(func.blocks.ptr), .sig = blocksSignature(func.blocks), .fuse = allow_fuse };
     cache_mutex.lock();
     defer cache_mutex.unlock();
     if (cache == null) {
@@ -148,10 +164,10 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
 /// empty, the frame loop's Goto/Branch/Return handling reduces to the fused ops.
 fn fusible(func: *const ir.Func) bool {
     for (func.blocks) |*blk| {
-        if (blk.catches.len != 0 or blk.finally != null or
-            blk.finally_done != null or blk.finally_done_for != null or
-            blk.catch_done_for != null or blk.pop_on_exit.len != 0 or
-            blk.lr_absorb != null)
+        if (blk.h().catches.len != 0 or blk.h().finally != null or
+            blk.h().finally_done != null or blk.h().finally_done_for != null or
+            blk.h().catch_done_for != null or blk.h().pop_on_exit.len != 0 or
+            blk.h().lr_absorb != null)
         {
             return false;
         }

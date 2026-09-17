@@ -490,7 +490,7 @@ fn fuseClassify(func: *const Func) u8 {
     if (func.n_locals > 128) return 255;
     var total: usize = 0;
     for (func.blocks) |*b| {
-        if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return 255;
+        if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return 255;
         total += b.insts.len;
         if (total > 256) return 255;
         switch (b.terminator) {

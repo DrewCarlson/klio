@@ -285,12 +285,12 @@ pub fn parseNamedChecks(p: *Parser) ?Expr {
         support.skipNl(p);
         const ty = parseQualifiedType(p) orelse break;
         const sp = lhs.span().join(ty.span);
-        lhs = Expr{ .IsCheck = .{
+        lhs = Expr{ .IsCheck = support.boxed(p, ast.IsCheckExpr{
             .expr = boxExpr(p, lhs),
             .ty = ty,
             .negated = negated,
             .span = sp,
-        } };
+        }) };
     }
     return lhs;
 }
@@ -485,12 +485,12 @@ pub fn parseAs(p: *Parser) ?Expr {
         support.skipNl(p);
         const ty = parseQualifiedType(p) orelse break;
         const sp = lhs.span().join(ty.span);
-        lhs = Expr{ .As = .{
+        lhs = Expr{ .As = support.boxed(p, ast.AsExpr{
             .expr = boxExpr(p, lhs),
             .ty = ty,
             .safe = safe,
             .span = sp,
-        } };
+        }) };
     }
     return lhs;
 }

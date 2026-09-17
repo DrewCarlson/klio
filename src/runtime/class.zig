@@ -884,8 +884,6 @@ fn typeRef(name: []const u8, nullable: bool, args: []ast.TypeArg) ast.TypeRef {
         .type_args = args,
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 

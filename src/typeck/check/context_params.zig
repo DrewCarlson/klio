@@ -399,15 +399,15 @@ fn walkBlock(ctx: *Ctx, b: *const Block) Allocator.Error!void {
 fn walkStmt(ctx: *Ctx, s: *const Stmt) Allocator.Error!void {
     switch (s.*) {
         .Expr => |*e| try walkExpr(ctx, e),
-        .Decl => |*d| switch (d.*) {
+        .Decl => |d| switch (d.*) {
             .Function => |*f| try walkFunction(ctx, f, null),
             .Property => |p| {
-                if (p.init) |*e| try walkExpr(ctx, e);
+                if (p.init) |e| try walkExpr(ctx, e);
                 try walkProperty(ctx, p, null);
             },
             else => {},
         },
-        .Assign => |*a| {
+        .Assign => |a| {
             try walkExpr(ctx, &a.target);
             try walkExpr(ctx, &a.value);
         },
@@ -439,14 +439,14 @@ fn walkExpr(ctx: *Ctx, e: *const Expr) Allocator.Error!void {
             if (i.else_branch) |eb| try walkExpr(ctx, eb);
         },
         .Block => |*b| try walkBlock(ctx, b),
-        .Lambda => |*l| try walkBlock(ctx, &l.body),
+        .Lambda => |l| try walkBlock(ctx, &l.body),
         .Index => |*ix| {
             try walkExpr(ctx, ix.receiver);
             for (ix.args) |*a| try walkExpr(ctx, a);
         },
-        .As => |*a| try walkExpr(ctx, a.expr),
-        .IsCheck => |*i| try walkExpr(ctx, i.expr),
-        .When => |*w| {
+        .As => |a| try walkExpr(ctx, a.expr),
+        .IsCheck => |i| try walkExpr(ctx, i.expr),
+        .When => |w| {
             if (w.subject) |sub| try walkExpr(ctx, sub);
             for (w.branches) |*br| try walkExpr(ctx, &br.body);
         },

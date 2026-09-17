@@ -200,7 +200,7 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
     var entry_prefix: usize = 0;
     var entry_heavy = false;
     for (func.blocks, 0..) |*b, bi| {
-        if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return 2;
+        if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return 2;
         total += b.insts.len;
         if (total > FUSED_MAX_INSTS) return 2;
         switch (b.terminator) {

@@ -121,7 +121,7 @@ pub fn hoistMutualLocalFns(b: *FuncBuilder, block: *const AstBlock) Allocator.Er
     var local_fns: std.ArrayList(LocalFn) = .empty;
     defer local_fns.deinit(b.allocator);
     for (block.stmts, 0..) |*s, i| {
-        if (s.* == .Decl and s.Decl == .Function) {
+        if (s.* == .Decl and s.Decl.* == .Function) {
             local_fns.append(b.allocator, .{ .pos = i, .func = &s.Decl.Function }) catch return error.OutOfMemory;
         }
     }

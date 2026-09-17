@@ -400,7 +400,7 @@ fn leafRunOne(
             },
             .CallMember => |cm| {
                 // A primitive bit/conversion member is a pure function of its receiver and argument.
-                if (cm.arg_names.len != 0 or cm.n_args > 1) return error.LeafAbandon;
+                if (cm.x().arg_names.len != 0 or cm.n_args > 1) return error.LeafAbandon;
                 const recv = leafRead(regs, wmask.*, cm.receiver) orelse return error.LeafAbandon;
                 const nm = constStr(module, cm.name) orelse return error.LeafAbandon;
                 const marg: ?Value = if (cm.n_args == 1)
@@ -457,7 +457,7 @@ fn leafRunOne(
                         }
                         if (pflag) why = "param-default-or-vararg";
                         for (callee.blocks) |*cb| {
-                            if (cb.catches.len != 0 or cb.finally != null or cb.lr_absorb != null) why = "try-region";
+                            if (cb.h().catches.len != 0 or cb.h().finally != null or cb.h().lr_absorb != null) why = "try-region";
                             switch (cb.terminator) {
                                 .Return, .Goto, .Branch, .Throw, .Unreachable => {},
                                 else => |t| {

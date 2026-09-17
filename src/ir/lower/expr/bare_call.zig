@@ -353,10 +353,9 @@ fn tryParamThunkCompanionCall(
                 .dst = dst,
                 .receiver = cls,
                 .name = nmc,
-                .trailing_lambda = b.callTrailingLambda(),
                 .args = run[0],
                 .n_args = run[1],
-                .arg_names = arg_names,
+                .extra = try b.memberExtra(.{ .trailing_lambda = b.callTrailingLambda(), .arg_names = arg_names }),
             } });
             return dst;
         }
@@ -1272,7 +1271,7 @@ fn emitImplicitThisCall(
     {
         const this_idx = try b.recordCapture("this");
         orEmitAudit(b, "implicit_this_call_global_fallback", "CallMemberOrGlobal", name0);
-        try b.push(.{ .CallMemberOrGlobal = .{
+        try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
             .dst = dst,
             .this_idx = this_idx,
             .recv = this_reg,
@@ -1283,7 +1282,7 @@ fn emitImplicitThisCall(
             .arg_names = arg_names,
             .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
             .static_recv = try cmgStaticRecv(b),
-        } });
+        }) });
         return dst;
     }
     try b.push(.{ .CallMember = .{
@@ -1292,7 +1291,7 @@ fn emitImplicitThisCall(
         .name = nm,
         .args = run[0],
         .n_args = run[1],
-        .arg_names = arg_names,
+        .extra = try b.memberExtra(.{ .arg_names = arg_names }),
     } });
     return dst;
 }
@@ -1889,15 +1888,14 @@ fn emitDeferredBareCall(
             .name = nm,
             .args = run[0],
             .n_args = run[1],
-            .arg_names = arg_names,
-            .trailing_lambda = b.callTrailingLambda(),
+            .extra = try b.memberExtra(.{ .arg_names = arg_names, .trailing_lambda = b.callTrailingLambda() }),
         } });
         return dst;
     }
     if (b.resolve("this")) |this_reg| {
         const run = try lowerArgRunWithArity(b, args, bare_arity);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        try b.push(.{ .CallMemberOrGlobal = .{
+        try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
             .dst = dst,
             .this_idx = 0,
             .name = nm,
@@ -1911,13 +1909,13 @@ fn emitDeferredBareCall(
             .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
             .static_recv = try cmgStaticRecv(b),
             .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
-        } });
+        }) });
         return dst;
     }
     const this_idx = try b.recordCapture("this");
     const run = try lowerArgRunWithArity(b, args, bare_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-    try b.push(.{ .CallMemberOrGlobal = .{
+    try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
         .dst = dst,
         .this_idx = this_idx,
         .name = nm,
@@ -1930,7 +1928,7 @@ fn emitDeferredBareCall(
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
         .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
-    } });
+    }) });
     return dst;
 }
 
@@ -2182,10 +2180,9 @@ pub fn lowerFqnGlobalCall(
                     .dst = dst,
                     .receiver = recv,
                     .name = mname,
-                    .trailing_lambda = b.callTrailingLambda(),
                     .args = run[0],
                     .n_args = run[1],
-                    .arg_names = arg_names,
+                    .extra = try b.memberExtra(.{ .trailing_lambda = b.callTrailingLambda(), .arg_names = arg_names }),
                 } });
                 return dst;
             }

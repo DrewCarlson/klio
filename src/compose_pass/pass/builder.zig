@@ -82,8 +82,6 @@ pub const B = struct {
             .type_args = &.{},
             .function = null,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         };
     }
 

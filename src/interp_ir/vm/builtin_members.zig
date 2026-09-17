@@ -2596,7 +2596,7 @@ pub fn closureRefEquals(self: *VmHost, allocator: Allocator, a: *const Value, b:
         const mb = ib.module orelse mg.get();
         const fa = ma.funcById(ia.body_func) orelse break :blk false;
         const fb = mb.funcById(ib.body_func) orelse break :blk false;
-        break :blk fa.ref_key.len != 0 and std.mem.eql(u8, fa.ref_key, fb.ref_key);
+        break :blk fa.x().ref_key.len != 0 and std.mem.eql(u8, fa.x().ref_key, fb.x().ref_key);
     };
     if (key_eq) {
         if (xa.len != xb.len) return false;
@@ -2620,8 +2620,8 @@ pub fn closureRefHash(self: *VmHost, allocator: Allocator, v: *const Value) Allo
         defer mg.deinit();
         const mod = info.module orelse mg.get();
         const f = mod.funcById(info.body_func) orelse break :blk null;
-        if (f.ref_key.len == 0) break :blk null;
-        break :blk javaStringHash(f.ref_key);
+        if (f.x().ref_key.len == 0) break :blk null;
+        break :blk javaStringHash(f.x().ref_key);
     };
     if (key_hash) |kh| {
         var h = kh;

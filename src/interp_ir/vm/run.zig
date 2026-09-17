@@ -589,11 +589,11 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
             for (df.blocks, 0..) |blk, bi| {
                 std.debug.print("[dumpfn] b{d}: catches={d} fin={?} fin_done={?} done_for={?} pop={d}\n", .{
                     bi,
-                    blk.catches.len,
-                    if (blk.finally) |x| @intFromEnum(x) else null,
-                    if (blk.finally_done) |x| @intFromEnum(x) else null,
-                    if (blk.finally_done_for) |x| @intFromEnum(x) else null,
-                    blk.pop_on_exit.len,
+                    blk.h().catches.len,
+                    if (blk.h().finally) |x| @intFromEnum(x) else null,
+                    if (blk.h().finally_done) |x| @intFromEnum(x) else null,
+                    if (blk.h().finally_done_for) |x| @intFromEnum(x) else null,
+                    blk.h().pop_on_exit.len,
                 });
                 for (blk.insts) |inst| {
                     switch (inst) {
@@ -652,10 +652,10 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                                 cm.receiver.int(),
                                 nm,
                                 cm.n_args,
-                                cm.trailing_lambda,
-                                cm.static_recv != null,
-                                cm.declared_recv != null,
-                                if (cm.resolved) |r| r.int() else null,
+                                cm.x().trailing_lambda,
+                                cm.x().static_recv != null,
+                                cm.x().declared_recv != null,
+                                if (cm.x().resolved) |r| r.int() else null,
                             });
                         },
                         .CallValue => |cv| std.debug.print("[dumpfn]   CallValue dst=r{d} callee=r{d} args=r{d} n={d}\n", .{ cv.dst.int(), cv.callee.int(), cv.args.int(), cv.n_args }),
@@ -889,12 +889,7 @@ test {
 
 /// Free a `Func` body from `FuncBuilder.finish`; module `deinit` frees the list only.
 fn freeFunc(func: ir.Func) void {
-    for (func.blocks) |blk| {
-        if (blk.insts.len != 0) testing.allocator.free(blk.insts);
-        if (blk.catches.len != 0) testing.allocator.free(blk.catches);
-    }
-    testing.allocator.free(func.blocks);
-    if (func.capture_order.len != 0) testing.allocator.free(func.capture_order);
+    func.freeBuilt(testing.allocator);
 }
 
 test "vm runs a simple main returning an int const" {

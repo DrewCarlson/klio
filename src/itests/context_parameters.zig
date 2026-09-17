@@ -43,7 +43,7 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
 fn frontendDiags(a: std.mem.Allocator, src: []const u8) ![]const Diagnostic {
     var lx = try lexer.Lexer.init(a, FileId.from(0), src);
     const lexed = try lx.tokenize();
-    const p = parser.Parser.new(a, FileId.from(0), src, lexed.tokens);
+    const p = parser.Parser.new(a, FileId.from(0), src, lexed.tokens, lexed.strings);
     const kf = p.parseFile();
     var out: std.ArrayList(Diagnostic) = .empty;
     try out.appendSlice(a, p.diagnostics.diags());

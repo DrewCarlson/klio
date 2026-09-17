@@ -1432,7 +1432,7 @@ fn buildAstBundle(gpa: std.mem.Allocator, a: std.mem.Allocator, files: []const s
             }
             continue;
         }
-        const p = Parser.new(a, id, src, lexed.tokens);
+        const p = Parser.new(a, id, src, lexed.tokens, lexed.strings);
         const file_ast = p.parseFile();
         if (p.diagnostics.hasErrors()) {
             if (out_err.* == null) {

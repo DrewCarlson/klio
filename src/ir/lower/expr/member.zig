@@ -452,7 +452,7 @@ pub fn propInitCallHead(b: *const FuncBuilder, owner: []const u8, name: []const 
     if (runtime.envOnce("KLIO_PROPHEAD_TRACE") != null) std.debug.print("[prophead-lazy] {s}.{s} ty={} init={}\n", .{ owner, name, p.ty != null, p.init != null });
     if (p.ty != null) return null;
     const init = p.init orelse return null;
-    if (init != .Call) return null;
+    if (init.* != .Call) return null;
     const callee = init.Call.callee;
     if (callee.* != .Path or callee.Path.segments.len != 1) return null;
     const nm = callee.Path.segments[0].name;

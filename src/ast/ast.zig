@@ -9,6 +9,19 @@ pub const Ident = struct {
     span: Span,
 };
 
+/// The value behind an optional boxed node, for a reader that wants the
+/// optional by value.
+pub fn unbox(p: anytype) ?@TypeOf(p.?.*) {
+    return if (p) |x| x.* else null;
+}
+
+/// Boxes `value` for a pointer payload.
+pub fn box(allocator: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!*@TypeOf(value) {
+    const p = try allocator.create(@TypeOf(value));
+    p.* = value;
+    return p;
+}
+
 pub const Visibility = enum {
     Public,
     Private,
@@ -59,8 +72,8 @@ pub fn blockUsesField(b: *const Block) bool {
         const hit = switch (s) {
             .Expr => |*e| exprUsesField(e),
             .Assign => |a| exprUsesField(&a.target) or exprUsesField(&a.value),
-            .Decl => |d| switch (d) {
-                .Property => |p| if (p.init) |*i| exprUsesField(i) else false,
+            .Decl => |d| switch (d.*) {
+                .Property => |p| if (p.init) |i| exprUsesField(i) else false,
                 else => false,
             },
             else => false,
@@ -125,8 +138,8 @@ fn expandAliasesInDecls(decls: []Decl, aliases: *const std.StringHashMap([]const
         switch (d.*) {
             .Function => |*f| {
                 for (f.params) |*p| rewriteAliasedTypeName(&p.ty, aliases);
-                if (f.receiver_type) |*rt| rewriteAliasedTypeName(rt, aliases);
-                if (f.return_type) |*rt| rewriteAliasedTypeName(rt, aliases);
+                if (f.receiver_type) |rt| rewriteAliasedTypeName(rt, aliases);
+                if (f.return_type) |rt| rewriteAliasedTypeName(rt, aliases);
             },
             .Class => |*c| {
                 for (c.primary_params) |*p| rewriteAliasedTypeName(&p.ty, aliases);
@@ -196,12 +209,15 @@ pub const TypeAlias = struct {
 
 pub const Function = struct {
     name: Ident,
-    receiver_type: ?TypeRef,
+    /// Boxed: a type reference is a hundred bytes and most functions have no
+    /// receiver, so the absent case costs a pointer.
+    receiver_type: ?*TypeRef,
     context_params: []ContextParam = &.{},
     type_params: []TypeParam,
     where_bounds: []WhereBound,
     params: []Param,
-    return_type: ?TypeRef,
+    /// Boxed, like `receiver_type`.
+    return_type: ?*TypeRef,
     body: ?FunctionBody,
     is_open: bool,
     is_override: bool,
@@ -272,9 +288,10 @@ pub const Property = struct {
     mutable: bool,
     name: Ident,
     context_params: []ContextParam = &.{},
-    receiver_type: ?TypeRef,
-    ty: ?TypeRef,
-    init: ?Expr,
+    /// Boxed, as are `ty` and `init`: each is absent on most properties.
+    receiver_type: ?*TypeRef,
+    ty: ?*TypeRef,
+    init: ?*Expr,
     /// `init` is `None` when set. Boxed.
     delegate: ?*Expr,
     /// Boxed; the shared-graph codec resolves `PropertyDef.getter` to this node.
@@ -301,16 +318,16 @@ pub const Property = struct {
 
 /// Member and top-level `val` properties only.
 pub const ExplicitField = struct {
-    ty: ?TypeRef,
+    ty: ?*TypeRef,
     /// When absent the field must be definitely assigned on every construction path.
-    init: ?Expr,
+    init: ?*Expr,
     /// Span of the `field` keyword token.
     span: Span,
 };
 
 pub const Accessor = struct {
     params: []Ident,
-    return_type: ?TypeRef,
+    return_type: ?*TypeRef,
     body: FunctionBody,
     visibility: ?Visibility,
     /// This accessor alone is inlined; `Property.is_inline` inlines both.
@@ -319,36 +336,52 @@ pub const Accessor = struct {
     span: Span,
 };
 
+/// What a class rarely carries: where bounds, init blocks, named
+/// supertype arguments, secondary constructors and enum entries. Out of
+/// line so a class is 184 bytes rather than 272; the stdlib holds three
+/// thousand and one in eight fills the box.
+pub const ClassExtra = struct {
+    where_bounds: []WhereBound = &.{},
+    /// Interleaved with body-property initializers per `init_block_positions`.
+    init_blocks: []Block = &.{},
+    /// Index into `members` per entry: position `N` runs before `members[N]`'s
+    /// initializer. Same length as `init_blocks`.
+    init_block_positions: []usize = &.{},
+    /// Parallel to `supertype_args`: each argument's label, `null` when
+    /// positional; empty means all positional.
+    supertype_arg_names: []const ?[]const ?[]const u8 = &.{},
+    secondary_ctors: []SecondaryCtor = &.{},
+    /// Entries of an enum class; its post-`;` declarations are `members`.
+    enum_entries: []EnumEntry = &.{},
+
+    pub fn isDefault(self: *const ClassExtra) bool {
+        return self.where_bounds.len == 0 and self.init_blocks.len == 0 and
+            self.init_block_positions.len == 0 and self.supertype_arg_names.len == 0 and
+            self.secondary_ctors.len == 0 and self.enum_entries.len == 0;
+    }
+};
+
+pub const no_class_extra: ClassExtra = .{};
+
 pub const Class = struct {
     name: Ident,
     type_params: []TypeParam,
-    where_bounds: []WhereBound,
     primary_params: []ClassParam,
     /// False for `class A { constructor(...) }`, which gains no implicit
     /// zero-argument constructor.
     has_primary_ctor: bool = true,
-    /// Interleaved with body-property initializers per `init_block_positions`.
-    init_blocks: []Block,
-    /// Index into `members` per entry: position `N` runs before `members[N]`'s
-    /// initializer. Same length as `init_blocks`.
-    init_block_positions: []usize,
     supertypes: []TypeRef,
     /// Per supertype, the `: Bar(a, b)` arguments. `None` is no `(...)` at all,
     /// an empty list the explicit `: Bar()`.
     supertype_args: []?[]Expr,
-    /// Parallel to `supertype_args`: each argument's label, `null` when
-    /// positional; empty means all positional.
-    supertype_arg_names: []const ?[]const ?[]const u8 = &.{},
     supertype_delegates: []?Expr,
     is_data: bool,
     is_companion: bool,
-    /// Entries live in `enum_entries`, post-`;` declarations in `members`.
     is_enum: bool,
     is_sealed: bool,
     is_open: bool,
     is_abstract: bool,
     is_inner: bool,
-    secondary_ctors: []SecondaryCtor,
     is_interface: bool,
     is_fun_interface: bool,
     is_value: bool,
@@ -356,14 +389,37 @@ pub const Class = struct {
     is_expect: bool,
     /// Matched to an `expect class` by simple name.
     is_actual: bool,
-    enum_entries: []EnumEntry,
     members: []Decl,
     visibility: Visibility,
     /// From `class Foo private constructor(...)`; `None` inherits the class visibility.
     primary_ctor_visibility: ?Visibility,
     annotations: []Annotation,
     span: Span,
+    /// Null when every rare field is empty; read through `x()`, written
+    /// through `xMut()`.
+    extra: ?*const ClassExtra = null,
+
+    pub inline fn x(self: *const Class) *const ClassExtra {
+        return self.extra orelse &no_class_extra;
+    }
+
+    /// The box to write, allocated on first use.
+    pub fn xMut(self: *Class, allocator: std.mem.Allocator) std.mem.Allocator.Error!*ClassExtra {
+        if (self.extra) |e| return @constCast(e);
+        const e = try allocator.create(ClassExtra);
+        e.* = .{};
+        self.extra = e;
+        return e;
+    }
 };
+
+/// A boxed `ClassExtra`, or null when every field is at its default.
+pub fn classExtra(allocator: std.mem.Allocator, e: ClassExtra) std.mem.Allocator.Error!?*const ClassExtra {
+    if (e.isDefault()) return null;
+    const p = try allocator.create(ClassExtra);
+    p.* = e;
+    return p;
+}
 
 pub const EnumEntry = struct {
     name: Ident,
@@ -425,6 +481,23 @@ pub const ObjectDecl = struct {
     span: Span,
 };
 
+/// What a type reference rarely carries: its annotations and, for a
+/// qualified spelling, the path. Out of line so a type reference is 72
+/// bytes rather than 104; parameters, type arguments and supertypes each
+/// hold one inline.
+pub const TypeRefExtra = struct {
+    annotations: []Annotation = &.{},
+    /// `name` keeps only the last segment, so this distinguishes `Outer.Inner`
+    /// from a same-named top-level class.
+    qualified_path: ?[]const u8 = null,
+
+    pub fn isDefault(self: *const TypeRefExtra) bool {
+        return self.annotations.len == 0 and self.qualified_path == null;
+    }
+};
+
+pub const no_type_ref_extra: TypeRefExtra = .{};
+
 pub const TypeRef = struct {
     name: Ident,
     nullable: bool,
@@ -436,11 +509,22 @@ pub const TypeRef = struct {
     function: ?*FunctionTypeRef,
     /// Typeck rejects it on a non-type-parameter receiver; interp treats it as the base `T`.
     definitely_non_null: bool,
-    annotations: []Annotation,
-    /// `name` keeps only the last segment, so this distinguishes `Outer.Inner`
-    /// from a same-named top-level class.
-    qualified_path: ?[]const u8,
+    /// Null when the reference carries no annotation and no qualified path;
+    /// read through `x()`.
+    extra: ?*const TypeRefExtra = null,
+
+    pub inline fn x(self: *const TypeRef) *const TypeRefExtra {
+        return self.extra orelse &no_type_ref_extra;
+    }
 };
+
+/// A boxed `TypeRefExtra`, or null when both fields are at their defaults.
+pub fn typeRefExtra(allocator: std.mem.Allocator, e: TypeRefExtra) std.mem.Allocator.Error!?*const TypeRefExtra {
+    if (e.isDefault()) return null;
+    const p = try allocator.create(TypeRefExtra);
+    p.* = e;
+    return p;
+}
 
 pub const FunctionTypeRef = struct {
     receiver: ?TypeRef,
@@ -458,27 +542,34 @@ pub const Block = struct {
     span: Span,
 };
 
-pub const Stmt = union(enum) {
-    Expr: Expr,
-    Decl: Decl,
-    Assign: struct {
-        target: Expr,
-        op: AssignOp,
-        value: Expr,
-        span: Span,
-    },
-    /// Each name receives `expr.componentN()`; `_` evaluates its component for
-    /// effect without binding.
-    DestructuringDecl: struct {
-        mutable: bool,
-        names: []Ident,
+/// `Stmt` payloads are boxed for the same reason as the expression's: a
+/// declaration is hundreds of bytes and an assignment carries two
+/// expressions, while most statements are one expression.
+pub const AssignStmt = struct {
+    target: Expr,
+    op: AssignOp,
+    value: Expr,
+    span: Span,
+};
+
+/// Each name receives `expr.componentN()`; `_` evaluates its component for
+/// effect without binding.
+pub const DestructuringDeclStmt = struct {
+    mutable: bool,
+    names: []Ident,
     /// Name-based `(val a, val n = prop) = x` reads the property each name gives;
     /// positional forms read `componentN`.
-        by_name: bool = false,
-        sources: []Ident = &.{},
-        init: Expr,
-        span: Span,
-    },
+    by_name: bool = false,
+    sources: []Ident = &.{},
+    init: Expr,
+    span: Span,
+};
+
+pub const Stmt = union(enum) {
+    Expr: Expr,
+    Decl: *Decl,
+    Assign: *AssignStmt,
+    DestructuringDecl: *DestructuringDeclStmt,
 };
 
 pub const AssignOp = enum {
@@ -504,6 +595,113 @@ pub const FloatLitKind = enum {
     Float,
 
     pub const default: FloatLitKind = .Double;
+};
+
+/// The `Expr` variants below are boxed: each is far larger than a call or a
+/// path, and an inline payload would size every expression by the largest.
+/// Boxed, an expression is 80 bytes where it was 288.
+/// `vars` holds one name, or more for `for ((k, v) in m)`, where each element
+/// supplies the matching component.
+    
+pub const ForExpr = struct {
+    vars: []Ident,
+    by_name: bool = false,
+/// True even for a one-element group: `for ([b] in xs)` calls `component1()`,
+/// `for (x in xs)` binds the element.
+    destructured: bool = false,
+    var_sources: []Ident = &.{},
+    var_ty: ?TypeRef,
+    iter: *Expr,
+    body: *Expr,
+    span: Span,
+};
+
+    
+pub const TryExpr = struct {
+    body: Block,
+    catches: []Catch,
+    finally: ?Block,
+    span: Span,
+};
+
+/// `qualifier` carries `super<Base>.foo()`, needed when several supertypes
+/// supply a matching member; `label` carries `super@Outer.foo()`, dispatching
+/// through the outer class's parent.
+    
+pub const SuperExpr = struct {
+    qualifier: ?TypeRef,
+    label: ?Ident,
+    span: Span,
+};
+
+/// `subject` is `None` for the subject-free `when { cond -> ... }`. The first
+/// match supplies the result; no match and no `else` throws
+/// `kotlin.NoWhenBranchMatchedException`.
+    
+pub const WhenExpr = struct {
+    subject: ?*Expr,
+    subject_binding: ?WhenBinding,
+    branches: []WhenBranch,
+    span: Span,
+};
+
+    
+pub const IsCheckExpr = struct {
+    expr: *Expr,
+    ty: TypeRef,
+    negated: bool,
+    span: Span,
+};
+
+/// Under `safe` a failed cast yields `null` instead of throwing `kotlin.ClassCastException`.
+    
+pub const AsExpr = struct {
+    expr: *Expr,
+    ty: TypeRef,
+    safe: bool,
+    span: Span,
+};
+
+    
+pub const AnonFunExpr = struct {
+    receiver_ty: ?TypeRef,
+    context_params: []ContextParam = &.{},
+    params: []Param,
+    return_ty: ?TypeRef,
+    body: ?*FunctionBody,
+    is_suspend: bool,
+    span: Span,
+};
+
+/// Captures the enclosing scope for its method bodies; each occurrence gives
+/// a fresh `ClassDef` and one instance.
+    
+pub const ObjectLiteral = struct {
+    supertypes: []TypeRef,
+    supertype_args: []?[]Expr,
+    supertype_arg_names: []const ?[]const ?[]const u8 = &.{},
+    supertype_delegates: []?Expr,
+    members: []Decl,
+    init_blocks: []Block,
+    /// See `Class.init_block_positions`.
+    init_block_positions: []usize,
+    span: Span,
+};
+
+pub const LambdaExpr = struct {
+    params: []Ident,
+    /// Aligned with `params`, `null` per unannotated slot; empty when the
+    /// literal declares no header.
+    param_tys: []?TypeRef = &.{},
+    /// Read by the compose pass to transform an `@Composable { ... }` literal
+    /// bound to an untyped val.
+    annotations: []Annotation = &.{},
+    body: Block,
+    span: Span,
+    /// The parser injected the single `it`; real arity comes from the expected
+    /// type, so `{ x() }` is `() -> R` in value position and `(T) -> R` where
+    /// one parameter is expected.
+    implicit_it: bool = false,
 };
 
 pub const Expr = union(enum) {
@@ -598,18 +796,7 @@ pub const Expr = union(enum) {
     },
     /// `vars` holds one name, or more for `for ((k, v) in m)`, where each element
     /// supplies the matching component.
-    For: struct {
-        vars: []Ident,
-        by_name: bool = false,
-    /// True even for a one-element group: `for ([b] in xs)` calls `component1()`,
-    /// `for (x in xs)` binds the element.
-        destructured: bool = false,
-        var_sources: []Ident = &.{},
-        var_ty: ?TypeRef,
-        iter: *Expr,
-        body: *Expr,
-        span: Span,
-    },
+    For: *ForExpr,
     Return: struct {
         value: ?*Expr,
         label: ?Ident,
@@ -633,27 +820,8 @@ pub const Expr = union(enum) {
         value: *Expr,
         span: Span,
     },
-    Try: struct {
-        body: Block,
-        catches: []Catch,
-        finally: ?Block,
-        span: Span,
-    },
-    Lambda: struct {
-        params: []Ident,
-        /// Aligned with `params`, `null` per unannotated slot; empty when the
-        /// literal declares no header.
-        param_tys: []?TypeRef = &.{},
-        /// Read by the compose pass to transform an `@Composable { ... }` literal
-        /// bound to an untyped val.
-        annotations: []Annotation = &.{},
-        body: Block,
-        span: Span,
-        /// The parser injected the single `it`; real arity comes from the expected
-        /// type, so `{ x() }` is `() -> R` in value position and `(T) -> R` where
-        /// one parameter is expected.
-        implicit_it: bool = false,
-    },
+    Try: *TryExpr,
+    Lambda: *LambdaExpr,
     This: struct {
         qualifier: ?Ident,
         span: Span,
@@ -661,11 +829,7 @@ pub const Expr = union(enum) {
     /// `qualifier` carries `super<Base>.foo()`, needed when several supertypes
     /// supply a matching member; `label` carries `super@Outer.foo()`, dispatching
     /// through the outer class's parent.
-    Super: struct {
-        qualifier: ?TypeRef,
-        label: ?Ident,
-        span: Span,
-    },
+    Super: *SuperExpr,
     PropertyRef: struct {
         name: Ident,
         span: Span,
@@ -681,34 +845,11 @@ pub const Expr = union(enum) {
     /// `subject` is `None` for the subject-free `when { cond -> ... }`. The first
     /// match supplies the result; no match and no `else` throws
     /// `kotlin.NoWhenBranchMatchedException`.
-    When: struct {
-        subject: ?*Expr,
-        subject_binding: ?WhenBinding,
-        branches: []WhenBranch,
-        span: Span,
-    },
-    IsCheck: struct {
-        expr: *Expr,
-        ty: TypeRef,
-        negated: bool,
-        span: Span,
-    },
+    When: *WhenExpr,
+    IsCheck: *IsCheckExpr,
     /// Under `safe` a failed cast yields `null` instead of throwing `kotlin.ClassCastException`.
-    As: struct {
-        expr: *Expr,
-        ty: TypeRef,
-        safe: bool,
-        span: Span,
-    },
-    AnonFun: struct {
-        receiver_ty: ?TypeRef,
-        context_params: []ContextParam = &.{},
-        params: []Param,
-        return_ty: ?TypeRef,
-        body: ?*FunctionBody,
-        is_suspend: bool,
-        span: Span,
-    },
+    As: *AsExpr,
+    AnonFun: *AnonFunExpr,
     /// Valid only as a top-level value argument; typeck rejects a non-`vararg`
     /// bound parameter.
     Spread: struct {
@@ -717,17 +858,7 @@ pub const Expr = union(enum) {
     },
     /// Captures the enclosing scope for its method bodies; each occurrence gives
     /// a fresh `ClassDef` and one instance.
-    ObjectExpr: struct {
-        supertypes: []TypeRef,
-        supertype_args: []?[]Expr,
-        supertype_arg_names: []const ?[]const ?[]const u8 = &.{},
-        supertype_delegates: []?Expr,
-        members: []Decl,
-        init_blocks: []Block,
-        /// See `Class.init_block_positions`.
-        init_block_positions: []usize,
-        span: Span,
-    },
+    ObjectExpr: *ObjectLiteral,
 
     pub fn span(self: *const Expr) Span {
         return switch (self.*) {

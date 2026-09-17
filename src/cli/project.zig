@@ -151,7 +151,7 @@ fn declaresMain(a: Allocator, path: []const u8) bool {
     var lx = lexer.Lexer.init(a, fid, src) catch return false;
     const lexed = lx.tokenize() catch return false;
     if (lexed.diagnostics.hasErrors()) return false;
-    const p = parser.Parser.new(a, fid, src, lexed.tokens);
+    const p = parser.Parser.new(a, fid, src, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     if (p.diagnostics.hasErrors()) return false;
     for (file_ast.decls) |d| {

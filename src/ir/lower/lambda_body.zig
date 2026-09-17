@@ -853,13 +853,15 @@ fn finishBodyFunc(
     const id = module.nextFuncId();
     func.id = id;
     func.is_lambda = is_lambda;
+    var extra = func.x().*;
     if (module.pending_ref_key) |key| {
-        func.ref_key = key;
+        extra.ref_key = key;
         module.pending_ref_key = null;
     }
     // The receiver head may alias a span-keyed `lambda_arg_recv` entry the builder
     // frees at teardown, and the Func outlives the builder, so it must own its copy.
-    func.lambda_receiver_ty = if (b.recvTy()) |head| try b.allocator.dupe(u8, head) else null;
+    extra.lambda_receiver_ty = if (b.recvTy()) |head| try b.allocator.dupe(u8, head) else null;
+    try func.setExtra(b.allocator, extra);
     const placed_params = try placeDeclaredParams(ctx, names);
     func.params = placed_params;
     // A local extension function lowers as a lambda body with a synthesized leading

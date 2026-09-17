@@ -240,7 +240,7 @@ pub fn walkDeclForOptIn(
             for (self_markers) |m| {
                 try scope.append(allocator, m);
             }
-            if (p.init) |*init| {
+            if (p.init) |init| {
                 try walkExprForOptIn(allocator, init, markers, required, scope, out);
             }
             const accessors = [_]?*const ast.Accessor{
@@ -264,7 +264,7 @@ pub fn walkDeclForOptIn(
             for (self_markers) |m| {
                 try scope.append(allocator, m);
             }
-            for (c.init_blocks) |*ib| {
+            for (c.x().init_blocks) |*ib| {
                 try walkBlockForOptIn(allocator, ib, markers, required, scope, out);
             }
             for (c.primary_params) |*p| {
@@ -272,12 +272,12 @@ pub fn walkDeclForOptIn(
                     try walkExprForOptIn(allocator, def, markers, required, scope, out);
                 }
             }
-            for (c.secondary_ctors) |*sc| {
+            for (c.x().secondary_ctors) |*sc| {
                 if (sc.body) |*body| {
                     try walkBlockForOptIn(allocator, body, markers, required, scope, out);
                 }
             }
-            for (c.enum_entries) |*ee| {
+            for (c.x().enum_entries) |*ee| {
                 for (ee.args) |*a| {
                     try walkExprForOptIn(allocator, a, markers, required, scope, out);
                 }
@@ -325,12 +325,12 @@ pub fn walkBlockForOptIn(
     for (b.stmts) |*s| {
         switch (s.*) {
             .Expr => |*e| try walkExprForOptIn(allocator, e, markers, required, scope, out),
-            .Decl => |*d| try walkDeclForOptIn(allocator, d, markers, required, scope, out),
-            .Assign => |*a| {
+            .Decl => |d| try walkDeclForOptIn(allocator, d, markers, required, scope, out),
+            .Assign => |a| {
                 try walkExprForOptIn(allocator, &a.target, markers, required, scope, out);
                 try walkExprForOptIn(allocator, &a.value, markers, required, scope, out);
             },
-            .DestructuringDecl => |*dd| {
+            .DestructuringDecl => |dd| {
                 try walkExprForOptIn(allocator, &dd.init, markers, required, scope, out);
             },
         }
@@ -600,10 +600,10 @@ pub fn collectSuppressDecl(
             for (c.primary_params) |*cp| {
                 try pushSuppress(allocator, cp.annotations, cp.span, out);
             }
-            for (c.secondary_ctors) |*sc| {
+            for (c.x().secondary_ctors) |*sc| {
                 try pushSuppress(allocator, sc.annotations, sc.span, out);
             }
-            for (c.enum_entries) |*ee| {
+            for (c.x().enum_entries) |*ee| {
                 try pushSuppress(allocator, ee.annotations, ee.span, out);
             }
             for (c.members) |*m| {
@@ -805,7 +805,7 @@ pub fn walkDeclForDeprecation(
             }
         },
         .Property => |p| {
-            if (p.init) |*init| {
+            if (p.init) |init| {
                 try walkExprForDeprecation(allocator, init, info, out);
             }
             const accessors = [_]?*const ast.Accessor{
@@ -821,7 +821,7 @@ pub fn walkDeclForDeprecation(
             }
         },
         .Class => |*c| {
-            for (c.init_blocks) |*ib| {
+            for (c.x().init_blocks) |*ib| {
                 try walkBlockForDeprecation(allocator, ib, info, out);
             }
             for (c.primary_params) |*p| {
@@ -829,12 +829,12 @@ pub fn walkDeclForDeprecation(
                     try walkExprForDeprecation(allocator, def, info, out);
                 }
             }
-            for (c.secondary_ctors) |*sc| {
+            for (c.x().secondary_ctors) |*sc| {
                 if (sc.body) |*body| {
                     try walkBlockForDeprecation(allocator, body, info, out);
                 }
             }
-            for (c.enum_entries) |*ee| {
+            for (c.x().enum_entries) |*ee| {
                 for (ee.args) |*a| {
                     try walkExprForDeprecation(allocator, a, info, out);
                 }
@@ -874,12 +874,12 @@ pub fn walkStmtForDeprecation(
 ) Allocator.Error!void {
     switch (s.*) {
         .Expr => |*e| try walkExprForDeprecation(allocator, e, info, out),
-        .Decl => |*d| try walkDeclForDeprecation(allocator, d, info, out),
-        .Assign => |*a| {
+        .Decl => |d| try walkDeclForDeprecation(allocator, d, info, out),
+        .Assign => |a| {
             try walkExprForDeprecation(allocator, &a.target, info, out);
             try walkExprForDeprecation(allocator, &a.value, info, out);
         },
-        .DestructuringDecl => |*dd| {
+        .DestructuringDecl => |dd| {
             try walkExprForDeprecation(allocator, &dd.init, info, out);
         },
     }

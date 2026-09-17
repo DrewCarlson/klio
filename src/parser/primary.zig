@@ -205,7 +205,7 @@ pub fn parsePrimary(p: *Parser) ?Expr {
                 const st = class.parseOptionalSupertypesFull(p);
                 const body = class.parseClassBody(p);
                 const end = p.tokens[p.pos -| 1].span;
-                return Expr{ .ObjectExpr = .{
+                return Expr{ .ObjectExpr = support.boxed(p, ast.ObjectLiteral{
                     .supertypes = st.types,
                     .supertype_args = st.args,
                     .supertype_arg_names = st.arg_names,
@@ -214,7 +214,7 @@ pub fn parsePrimary(p: *Parser) ?Expr {
                     .init_blocks = body.init_blocks,
                     .init_block_positions = body.init_block_positions,
                     .span = kw_tok.span.join(end),
-                } };
+                }) };
             },
             .Super => {
                 const tok = support.bump(p);
@@ -234,11 +234,11 @@ pub fn parsePrimary(p: *Parser) ?Expr {
                 if (label) |l| {
                     end = end.join(l.span);
                 }
-                return Expr{ .Super = .{
+                return Expr{ .Super = support.boxed(p, ast.SuperExpr{
                     .qualifier = qualifier,
                     .label = label,
                     .span = tok.span.join(end),
-                } };
+                }) };
             },
             .Break => {
                 const tok = support.bump(p);
@@ -364,14 +364,14 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
                 _ = support.bump(p);
                 // Own the text: the lexer's StringText buffer is freed after
                 // parsing, before lowering, so a borrow would dangle.
-                const owned = p.allocator.dupe(u8, s) catch @panic("OOM in primary");
+                const owned = p.allocator.dupe(u8, p.strings[s]) catch @panic("OOM in primary");
                 parts.append(p.allocator, StringPart{ .Text = owned }) catch @panic("OOM in primary");
             },
             .ShortInterp => |name| {
                 const tok = support.bump(p);
                 // Own the name: the token's buffer is freed with the token
                 // stream, possibly before resolution.
-                const owned_name = p.allocator.dupe(u8, name) catch @panic("OOM in primary");
+                const owned_name = p.allocator.dupe(u8, p.strings[name]) catch @panic("OOM in primary");
                 parts.append(p.allocator, StringPart{ .ShortInterp = Ident{
                     .name = owned_name,
                     .span = tok.span,

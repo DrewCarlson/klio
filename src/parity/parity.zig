@@ -1089,7 +1089,7 @@ fn embeddedStdlibSourcesPrefixed(arena: Allocator, io: Io, import_prefixes: *con
         var lx = try lexer.Lexer.init(arena, fid, srcf);
         const lexed = try lx.tokenize();
         if (lexed.diagnostics.hasErrors()) continue;
-        const p = parser.Parser.new(arena, fid, srcf, lexed.tokens);
+        const p = parser.Parser.new(arena, fid, srcf, lexed.tokens, lexed.strings);
         const file_ast = p.parseFile();
         if (p.diagnostics.hasErrors()) continue;
         const pkg = try packageName(arena, &file_ast);
@@ -1503,7 +1503,7 @@ fn stdlibMeta(io: Io) Allocator.Error!*const StdlibMeta {
             var lx = try lexer.Lexer.init(a, fid, srcf);
             const lexed = try lx.tokenize();
             if (lexed.diagnostics.hasErrors()) continue;
-            const p = parser.Parser.new(a, fid, srcf, lexed.tokens);
+            const p = parser.Parser.new(a, fid, srcf, lexed.tokens, lexed.strings);
             const file_ast = p.parseFile();
             if (p.diagnostics.hasErrors()) continue;
             const pkg = try packageName(a, &file_ast);
@@ -2353,7 +2353,7 @@ fn parsePackFile(arena: Allocator, map: *SourceMap, path: []const u8, text: []co
     if (lexed.diagnostics.hasErrors()) {
         return .{ .err = try std.fmt.allocPrint(arena, "lex: {d} error(s)", .{lexed.diagnostics.diags().len}) };
     }
-    const p = parser.Parser.new(arena, id, srcf, lexed.tokens);
+    const p = parser.Parser.new(arena, id, srcf, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     if (p.diagnostics.hasErrors()) {
         return .{ .err = try std.fmt.allocPrint(arena, "parse: {d} error(s)", .{p.diagnostics.diags().len}) };

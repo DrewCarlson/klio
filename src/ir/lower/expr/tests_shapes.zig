@@ -54,12 +54,7 @@ pub fn dummySpan() span.Span {
 }
 
 pub fn freeFunc(func: Func) void {
-    for (func.blocks) |b| {
-        if (b.insts.len != 0) testing.allocator.free(b.insts);
-        if (b.catches.len != 0) testing.allocator.free(b.catches);
-    }
-    testing.allocator.free(func.blocks);
-    if (func.capture_order.len != 0) testing.allocator.free(func.capture_order);
+    func.freeBuilt(testing.allocator);
 }
 
 test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
@@ -70,11 +65,12 @@ test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
 
     const lit = Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = dummySpan() } };
     var lam_params = [_]ast.Ident{.{ .name = "x", .span = dummySpan() }};
-    const lam = Expr{ .Lambda = .{
+    var lam_node_73 = ast.LambdaExpr{
         .params = &lam_params,
         .body = .{ .stmts = &.{}, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    const lam = Expr{ .Lambda = &lam_node_73 };
     var spread_inner = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     const spread = Expr{ .Spread = .{ .expr = &spread_inner, .span = dummySpan() } };
 
@@ -394,7 +390,7 @@ test "selected call args discard a composer pair from a non-composable overload"
         .blocks = &.{},
         .entry = ir.BlockId.from(0),
         .is_suspend = false,
-        .annotation_names = &.{"Composable"},
+        .extra = &ir.FuncExtra{ .annotation_names = &.{"Composable"} },
     });
 
     const args = [_]Expr{
@@ -491,12 +487,13 @@ test "threaded trailing lambda binds before the composer pair" {
         .is_suspend = false,
     };
     var lambda_params: [0]ast.Ident = .{};
+    var lam_node_495 = ast.LambdaExpr{
+        .params = &lambda_params,
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    };
     const args = [_]Expr{
-        .{ .Lambda = .{
-            .params = &lambda_params,
-            .body = .{ .stmts = &.{}, .span = dummySpan() },
-            .span = dummySpan(),
-        } },
+        .{ .Lambda = &lam_node_495 },
         .{ .NullLit = .{ .span = dummySpan() } },
         .{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } },
     };
@@ -551,7 +548,7 @@ test "selected composable parameters bind named and trailing lambdas exactly" {
         .blocks = &.{},
         .entry = ir.BlockId.from(0),
         .is_suspend = false,
-        .annotation_names = &.{"Composable"},
+        .extra = &ir.FuncExtra{ .annotation_names = &.{"Composable"} },
     });
 
     var composable_names = std.StringHashMap(void).init(a);
@@ -585,17 +582,19 @@ test "selected composable parameters bind named and trailing lambdas exactly" {
     var lambda_params: [0]ast.Ident = .{};
     var lambda_stmts = [_]ast.Stmt{.{ .Expr = top_call }};
     var content_params = [_]ast.Ident{.{ .name = "padding", .span = dummySpan() }};
+    var lam_node_589 = ast.LambdaExpr{
+        .params = &lambda_params,
+        .body = .{ .stmts = &lambda_stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    };
+    var lam_node_594 = ast.LambdaExpr{
+        .params = &content_params,
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    };
     var source_args = [_]Expr{
-        .{ .Lambda = .{
-            .params = &lambda_params,
-            .body = .{ .stmts = &lambda_stmts, .span = dummySpan() },
-            .span = dummySpan(),
-        } },
-        .{ .Lambda = .{
-            .params = &content_params,
-            .body = .{ .stmts = &.{}, .span = dummySpan() },
-            .span = dummySpan(),
-        } },
+        .{ .Lambda = &lam_node_589 },
+        .{ .Lambda = &lam_node_594 },
     };
     const source_names = [_]?[]const u8{ "topBar", null };
     var selected = try selectedCallArgsForBuilder(
@@ -662,11 +661,12 @@ test "member-or-global emission binds a composable trailing lambda by parameter"
     var callee_segments = [_]ast.Ident{.{ .name = "Surface", .span = dummySpan() }};
     var callee = Expr{ .Path = .{ .segments = &callee_segments, .span = dummySpan() } };
     var lambda_params: [0]ast.Ident = .{};
-    var args = [_]Expr{.{ .Lambda = .{
+    var lam_node_665 = ast.LambdaExpr{
         .params = &lambda_params,
         .body = .{ .stmts = &.{}, .span = dummySpan() },
         .span = dummySpan(),
-    } }};
+    };
+    var args = [_]Expr{.{ .Lambda = &lam_node_665 }};
     var names = [_]?[]const u8{null};
     const call = Expr{ .Call = .{
         .callee = &callee,
@@ -755,11 +755,12 @@ test "trailing lambda names only a fixed parameter after a vararg" {
     });
 
     var lambda_params = [_]ast.Ident{.{ .name = "it", .span = dummySpan() }};
-    const lambda = Expr{ .Lambda = .{
+    var lam_node_758 = ast.LambdaExpr{
         .params = &lambda_params,
         .body = .{ .stmts = &.{}, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    const lambda = Expr{ .Lambda = &lam_node_758 };
     const final_args = [_]Expr{
         .{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } },
         lambda,
@@ -775,13 +776,14 @@ test "trailing lambda names only a fixed parameter after a vararg" {
     try testing.expectEqual(@as(usize, 0), positional.len);
 
     var no_lambda_params: [0]ast.Ident = .{};
+    var lam_node_780 = ast.LambdaExpr{
+        .params = &no_lambda_params,
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    };
     const fixed_args = [_]Expr{
         .{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } },
-        .{ .Lambda = .{
-            .params = &no_lambda_params,
-            .body = .{ .stmts = &.{}, .span = dummySpan() },
-            .span = dummySpan(),
-        } },
+        .{ .Lambda = &lam_node_780 },
     };
     const fixed_names = [_]?[]const u8{ null, null };
     const tagged = try trailingLambdaArgNames(
@@ -812,8 +814,6 @@ test "lambda lowering records unknown, plain, and receiver callable shapes" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const string_ty = ast.TypeRef{
         .name = .{ .name = "String", .span = sp },
@@ -822,8 +822,6 @@ test "lambda lowering records unknown, plain, and receiver callable shapes" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     var plain_fn = ast.FunctionTypeRef{
         .receiver = null,
@@ -846,8 +844,6 @@ test "lambda lowering records unknown, plain, and receiver callable shapes" {
         .type_args = &.{},
         .function = &plain_fn,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     const receiver_ty = ast.TypeRef{
         .name = .{ .name = "<function>", .span = sp },
@@ -856,14 +852,13 @@ test "lambda lowering records unknown, plain, and receiver callable shapes" {
         .type_args = &.{},
         .function = &receiver_fn,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
-    const lambda = Expr{ .Lambda = .{
+    var lam_node_862 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &.{}, .span = sp },
         .span = sp,
-    } };
+    };
+    const lambda = Expr{ .Lambda = &lam_node_862 };
 
     _ = try lowerExpr(&b, &lambda);
     const unknown = &m.funcs.items[m.funcs.items.len - 1];
@@ -939,11 +934,12 @@ test "receiver lambda substitutes a direct call type parameter" {
     try b.setLocalInitExpr("owner", &ctor_init);
     var owner_path = [_]ast.Ident{.{ .name = "owner", .span = sp }};
     const owner_arg = Expr{ .Path = .{ .segments = &owner_path, .span = sp } };
-    const lambda = Expr{ .Lambda = .{
+    var lam_node_942 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &.{}, .span = sp },
         .span = sp,
-    } };
+    };
+    const lambda = Expr{ .Lambda = &lam_node_942 };
     const args = [_]Expr{ owner_arg, lambda };
 
     try recordLambdaArgReceivers(&b, &func, &args, &.{}, &.{}, 0);
@@ -962,8 +958,6 @@ test "receiver lambda substitutes a direct call type parameter" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     try recordLambdaArgReceivers(&b, &func, &args, &.{}, &.{explicit_any}, 0);
     try testing.expectEqualStrings("Any", b.lambdaArgRecv(sp).?.name);
@@ -1039,11 +1033,12 @@ test "argument maps repeat a vararg slot before a trailing lambda" {
         .{ .name = "block", .ty = .{ .name = "Function0", .nullable = false, .args = &.{} }, .default = null },
     };
     var lambda_params: [0]ast.Ident = .{};
+    var lam_node_1046 = ast.LambdaExpr{ .params = &lambda_params, .body = .{ .stmts = &.{}, .span = dummySpan() }, .span = dummySpan() };
     const args = [_]Expr{
         .{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } },
         .{ .IntLit = .{ .value = 2, .kind = .Int, .span = dummySpan() } },
         .{ .IntLit = .{ .value = 3, .kind = .Int, .span = dummySpan() } },
-        .{ .Lambda = .{ .params = &lambda_params, .body = .{ .stmts = &.{}, .span = dummySpan() }, .span = dummySpan() } },
+        .{ .Lambda = &lam_node_1046 },
     };
     const mapped = (try mapArgsToParams(&b, &params, &args, &.{})).?;
     defer testing.allocator.free(mapped);
@@ -1168,11 +1163,12 @@ test "fun interface classifier lowers to a static SAM instance" {
     defer b.deinit();
     var segments = [_]ast.Ident{.{ .name = "Action", .span = dummySpan() }};
     var callee = Expr{ .Path = .{ .segments = &segments, .span = dummySpan() } };
-    var args = [_]Expr{.{ .Lambda = .{
+    var lam_node_1171 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &.{}, .span = dummySpan() },
         .span = dummySpan(),
-    } }};
+    };
+    var args = [_]Expr{.{ .Lambda = &lam_node_1171 }};
     const call = Expr{ .Call = .{
         .callee = &callee,
         .args = &args,

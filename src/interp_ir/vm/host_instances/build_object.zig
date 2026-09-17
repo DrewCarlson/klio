@@ -159,8 +159,6 @@ pub fn synthSetterThunk(allocator: Allocator, name: ast.Ident, value_param: ast.
             .type_args = &.{},
             .function = null,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         },
         .default = null,
         .is_vararg = false,
@@ -174,7 +172,7 @@ pub fn synthSetterThunk(allocator: Allocator, name: ast.Ident, value_param: ast.
 }
 
 /// A 0-arg getter/init thunk `Function` over an accessor or expression body.
-pub fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef, is_override: bool) ast.Function {
+pub fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?*ast.TypeRef, is_override: bool) ast.Function {
     return .{
         .name = name,
         .receiver_type = null,
@@ -331,7 +329,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         for (members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
-            if (p.ty) |*ty| {
+            if (p.ty) |ty| {
                 try prop_heads.append(allocator, .{
                     .owner = synth_class_name,
                     .name = p.name.name,
@@ -339,7 +337,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 });
                 continue;
             }
-            const init_expr: *const ast.Expr = if (p.init) |*e| e else continue;
+            const init_expr: *const ast.Expr = if (p.init) |e| e else continue;
             const head: ?[]const u8 = blk: {
                 if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {
                     const v = findCapture(capture_pairs, init_expr.Path.segments[0].name) orelse break :blk null;
@@ -539,10 +537,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 try complex_local.append(allocator, .{ .name = dfield, .module = sub_ref, .func = func.id });
                 continue;
             }
-            const init_expr: *const ast.Expr = if (p.init) |*e|
+            const init_expr: *const ast.Expr = if (p.init) |e|
                 e
             else if (p.explicit_field) |ef|
-                (if (ef.init) |*finit| finit else continue)
+                (if (ef.init) |finit| finit else continue)
             else
                 continue;
             const is_lit = (try simpleLiteral(allocator, init_expr)) != null;
@@ -679,10 +677,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         for (members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
-            const storage_init: ?*const ast.Expr = if (p.init) |*e|
+            const storage_init: ?*const ast.Expr = if (p.init) |e|
                 e
             else if (p.explicit_field) |ef|
-                (if (ef.init) |*finit| finit else null)
+                (if (ef.init) |finit| finit else null)
             else
                 null;
             try body_props.append(allocator, .{
@@ -718,7 +716,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse sup: {
                 // A qualified supertype names a lifted nested class registered as
                 // `Outer$Inner`; the bare name would match any same-named class.
-                if (t.qualified_path) |qp| {
+                if (t.x().qualified_path) |qp| {
                     const mangled = try allocator.dupe(u8, qp);
                     for (mangled) |*ch| {
                         if (ch.* == '.') ch.* = '$';
@@ -1204,7 +1202,7 @@ pub fn runAnonThunk(
     runtime.keepalivePushCell(&self.globals.cell.hdr);
     runtime.keepalivePushCell(&mref.cell.hdr);
     var cap_vec: std.ArrayList(Value) = .empty;
-    for (func.capture_order) |cn| {
+    for (func.x().capture_order) |cn| {
         if (std.mem.eql(u8, cn, "this")) {
             try cap_vec.append(allocator, inst_value.*);
         } else {

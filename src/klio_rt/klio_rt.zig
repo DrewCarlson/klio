@@ -317,7 +317,6 @@ export fn klio_nat_class(
     const cls = runtime.ObjRef(runtime.ClassDef).init(a, .{
         .name = nm,
         .fqn = nm,
-        .annotation_names = &.{},
         .primary_params = blk: {
             if (primary_hi <= primary_lo or primary_hi > n_fields) break :blk &.{};
             const n = primary_hi - primary_lo;

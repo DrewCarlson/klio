@@ -397,7 +397,7 @@ fn parseOne(a: std.mem.Allocator, map: *SourceMap, name: []const u8, src: []cons
     var lx = try lexer.Lexer.init(a, fid, srcf);
     const lexed = try lx.tokenize();
     try std.testing.expect(!lexed.diagnostics.hasErrors());
-    const p = parser.Parser.new(a, fid, srcf, lexed.tokens);
+    const p = parser.Parser.new(a, fid, srcf, lexed.tokens, lexed.strings);
     const file_ast = p.parseFile();
     try std.testing.expect(!p.diagnostics.hasErrors());
     return file_ast;

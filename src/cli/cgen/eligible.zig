@@ -258,8 +258,8 @@ fn walkBody(w: *Walk, order: []const u32) Error!Step {
     for (order) |bi| {
         const blk = &f.blocks[bi];
         // A `finally` runs on every exit from its region, a separate shape from a handler.
-        if (blk.finally != null) return stepNo(f, "finally");
-        for (blk.catches) |h| {
+        if (blk.h().finally != null) return stepNo(f, "finally");
+        for (blk.h().catches) |h| {
             if (h.exception_reg.int() >= f.n_locals) return stepNo(f, "catch register");
             // The handler tests an interval, so the caught type has to be one the hierarchy places.
             if (prog.throws.find(h.type_name) == null) return stepNo(f, "catch type");
@@ -959,7 +959,7 @@ fn memberOfHostValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem_cls = w.elem_cls;
     const known = w.known;
     const cm = inst.CallMember;
-    if (cm.arg_names.len == 0 and cm.name.int() < m.consts.items.len and
+    if (cm.x().arg_names.len == 0 and cm.name.int() < m.consts.items.len and
         cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
         types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
         isBuiltinCls(cls[cm.receiver.int()].?))
@@ -1092,7 +1092,7 @@ fn memberOfCompanion(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem_cls = w.elem_cls;
     const known = w.known;
     const cm = inst.CallMember;
-    if (numConv(m, cm) == null and cm.arg_names.len == 0 and cm.name.int() < m.consts.items.len) {
+    if (numConv(m, cm) == null and cm.x().arg_names.len == 0 and cm.name.int() < m.consts.items.len) {
         if (companionReceiver(m, prog, types, cls, cm.receiver.int())) |cc6| {
             const mn6 = m.consts.items[cm.name.int()];
             if (mn6 != .String) return stepNo(f, "member name kind");
@@ -1129,7 +1129,7 @@ fn memberOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem_cls = w.elem_cls;
     const known = w.known;
     const cm = inst.CallMember;
-    if (numConv(m, cm) == null and cm.arg_names.len == 0 and
+    if (numConv(m, cm) == null and cm.x().arg_names.len == 0 and
         cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
         types[cm.receiver.int()] == .object)
     {
@@ -1351,7 +1351,7 @@ fn virtualOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem_cls = w.elem_cls;
     const known = w.known;
     const cv = inst.CallVirtual;
-    if (cv.arg_names.len == 0 and cv.receiver.int() < f.n_locals and
+    if (cv.x().arg_names.len == 0 and cv.receiver.int() < f.n_locals and
         known[cv.receiver.int()] and types[cv.receiver.int()] == .object)
     {
         if (m.funcById(ir.FuncId.from(cv.slot.int()))) |root| {

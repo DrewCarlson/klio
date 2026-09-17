@@ -50,14 +50,14 @@ pub const EpilogueInjector = struct {
     fn stmt(self: *EpilogueInjector, s: *Stmt) std.mem.Allocator.Error!void {
         switch (s.*) {
             .Expr => |*e| try self.expr(e),
-            .Assign => |*asg| {
+            .Assign => |asg| {
                 try self.expr(&asg.target);
                 try self.expr(&asg.value);
             },
-            .DestructuringDecl => |*dd| try self.expr(&dd.init),
-            .Decl => |*d| switch (d.*) {
+            .DestructuringDecl => |dd| try self.expr(&dd.init),
+            .Decl => |d| switch (d.*) {
                 .Property => |p| {
-                    if (p.init) |*ini| try self.expr(ini);
+                    if (p.init) |ini| try self.expr(ini);
                     if (p.delegate) |del| try self.expr(del);
                 },
                 else => {},
@@ -132,7 +132,7 @@ pub const EpilogueInjector = struct {
                 const inlines = callee_name != null and calleeInlinesLambda(callee_name.?);
                 for (c.args) |*arg| {
                     switch (arg.*) {
-                        .Lambda => |*lam| if (inlines) {
+                        .Lambda => |lam| if (inlines) {
                             const pushed = self.n_labels < self.labels.len;
                             if (pushed) {
                                 self.labels[self.n_labels] = .{ .name = callee_name.?, .depth = self.replace_depth };
@@ -152,12 +152,12 @@ pub const EpilogueInjector = struct {
                 try self.expr(f.then_branch);
                 if (f.else_branch) |eb| try self.expr(eb);
             },
-            .When => |*wh| {
+            .When => |wh| {
                 if (wh.subject) |sub| try self.expr(sub);
                 for (wh.branches) |*br| try self.expr(&br.body);
             },
             .Block => |*blk| try self.block(blk),
-            .Try => |*t| {
+            .Try => |t| {
                 try self.block(&t.body);
                 for (t.catches) |*ca| try self.block(&ca.body);
                 if (t.finally) |*fin| try self.block(fin);
@@ -170,7 +170,7 @@ pub const EpilogueInjector = struct {
                 if (dw.body) |bd| try self.expr(bd);
                 try self.expr(dw.cond);
             },
-            .For => |*fr| {
+            .For => |fr| {
                 try self.expr(fr.iter);
                 try self.expr(fr.body);
             },
@@ -187,8 +187,8 @@ pub const EpilogueInjector = struct {
             },
             .Labeled => |*l| try self.expr(l.expr),
             .Throw => |*t| try self.expr(t.value),
-            .IsCheck => |*ic| try self.expr(ic.expr),
-            .As => |*as| try self.expr(as.expr),
+            .IsCheck => |ic| try self.expr(ic.expr),
+            .As => |as| try self.expr(as.expr),
             .StringTemplate => |*st| for (st.parts) |*part| switch (part.*) {
                 .Interp => |ie| try self.expr(ie),
                 else => {},
@@ -208,11 +208,11 @@ fn blockUsesIt(blk: *const ast.Block) bool {
 fn stmtUsesIt(s: *const Stmt) bool {
     switch (s.*) {
         .Expr => |*e| return exprUsesIt(e),
-        .Assign => |*asg| return exprUsesIt(&asg.target) or exprUsesIt(&asg.value),
-        .DestructuringDecl => |*dd| return exprUsesIt(&dd.init),
-        .Decl => |*d| switch (d.*) {
+        .Assign => |asg| return exprUsesIt(&asg.target) or exprUsesIt(&asg.value),
+        .DestructuringDecl => |dd| return exprUsesIt(&dd.init),
+        .Decl => |d| switch (d.*) {
             .Property => |pr| {
-                if (pr.init) |*ini| return exprUsesIt(ini);
+                if (pr.init) |ini| return exprUsesIt(ini);
                 return false;
             },
             else => return false,
@@ -239,7 +239,7 @@ fn exprUsesIt(e: *const Expr) bool {
             if (f.else_branch) |eb| return exprUsesIt(eb);
             return false;
         },
-        .When => |*wh| {
+        .When => |wh| {
             if (wh.subject) |sub| if (exprUsesIt(sub)) return true;
             for (wh.branches) |*br| if (exprUsesIt(&br.body)) return true;
             return false;
@@ -334,13 +334,13 @@ fn recomposeLambda(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params
     lam_ptys[1] = null;
     const body_stmts = try a.alloc(Stmt, 1);
     body_stmts[0] = .{ .Expr = reinvoke };
-    return .{ .Lambda = .{
+    return .{ .Lambda = try ast.box(a, ast.LambdaExpr{
         .params = lam_params,
         .param_tys = lam_ptys,
         .body = .{ .stmts = body_stmts, .span = b.gen_span },
         .implicit_it = false,
         .span = b.gen_span,
-    } };
+    }) };
 }
 
 fn oneNull(a: std.mem.Allocator) std.mem.Allocator.Error![]?[]const u8 {
@@ -360,7 +360,7 @@ pub fn calleeSimpleName(callee: *const Expr) ?[]const u8 {
 
 /// The lambda inside a memo wrap the pass emitted around a sink argument, for the
 /// lowering-side shape repair: the wrap runs before resolution selects the parameter.
-pub fn memoWrappedLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
+pub fn memoWrappedLambda(e: *Expr) ?*ast.LambdaExpr {
     if (e.* != .Call) return null;
     const c = &e.Call;
     const nm = calleeSimpleName(c.callee) orelse return null;
@@ -372,10 +372,10 @@ pub fn memoWrappedLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
 
 /// A lambda literal argument, or one wrapped in a `Labeled` node from `lbl@{ … }`,
 /// returned as the payload pointer so both forms thread alike.
-pub fn trailingLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
+pub fn trailingLambda(e: *Expr) ?*ast.LambdaExpr {
     return switch (e.*) {
-        .Lambda => &e.Lambda,
-        .Labeled => |*l| if (l.expr.* == .Lambda) &l.expr.Lambda else null,
+        .Lambda => e.Lambda,
+        .Labeled => |*l| if (l.expr.* == .Lambda) l.expr.Lambda else null,
         else => null,
     };
 }

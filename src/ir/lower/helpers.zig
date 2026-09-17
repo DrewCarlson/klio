@@ -107,7 +107,7 @@ pub fn coerceBroadCollectionToList(
         .name = nm,
         .args = args,
         .n_args = 0,
-        .arg_names = &.{},
+        .extra = try b.memberExtra(.{ .arg_names = &.{} }),
     } });
     return dst;
 }
@@ -448,7 +448,7 @@ pub fn internTypeArgsScoped(
 /// A dotted type spelling names the class the fqn suffix resolves to, whose
 /// registered lifted name the runtime class table holds.
 fn qualifiedClassName(b: *FuncBuilder, t: *const ast.TypeRef) ?[]const u8 {
-    const qp = t.qualified_path orelse return null;
+    const qp = t.x().qualified_path orelse return null;
     const cid = b.module.classIdByQualifiedSuffix(qp) orelse return null;
     if (cid.int() >= b.module.classes.items.len) return null;
     return b.module.classes.items[cid.int()].name;
@@ -567,8 +567,6 @@ test "intern type args interns simple names" {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     }};
     const out = try internTypeArgs(testing.allocator, &m, &args);
     defer testing.allocator.free(out);

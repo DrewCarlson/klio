@@ -33,7 +33,7 @@ const FnSig = root.FnSig;
 
 pub fn typeRefUses(t: *const TypeRef, name: []const u8) bool {
     // `@UnsafeVariance` suppresses the check at this occurrence.
-    if (hasUnsafeVariance(t.annotations)) {
+    if (hasUnsafeVariance(t.x().annotations)) {
         return false;
     }
     if (std.mem.eql(u8, t.name.name, name) and t.type_args.len == 0 and t.function == null) {
@@ -228,8 +228,8 @@ pub fn scanLambdaStmtsForReturn(stmts: []const Stmt) bool {
             .Expr => |*e| scanLambdaExprForReturn(e),
             .Assign => |a| scanLambdaExprForReturn(&a.target) or scanLambdaExprForReturn(&a.value),
             .DestructuringDecl => |d| scanLambdaExprForReturn(&d.init),
-            .Decl => |d| switch (d) {
-                .Property => |p| if (p.init) |*i| scanLambdaExprForReturn(i) else false,
+            .Decl => |d| switch (d.*) {
+                .Property => |p| if (p.init) |i| scanLambdaExprForReturn(i) else false,
                 else => false,
             },
         };
@@ -286,7 +286,7 @@ fn anyExprReturn(args: []const Expr) bool {
 pub fn stmtSpan(s: *const Stmt) Span {
     return switch (s.*) {
         .Expr => |*e| e.span(),
-        .Decl => |d| switch (d) {
+        .Decl => |d| switch (d.*) {
             .Function => |f| f.name.span,
             .Property => |p| p.name.span,
             .Class => |c| c.name.span,
@@ -335,8 +335,8 @@ pub fn blockUsesField(b: *const Block) bool {
         const hit = switch (s) {
             .Expr => |*e| exprUsesField(e),
             .Assign => |a| exprUsesField(&a.target) or exprUsesField(&a.value),
-            .Decl => |d| switch (d) {
-                .Property => |p| if (p.init) |*i| exprUsesField(i) else false,
+            .Decl => |d| switch (d.*) {
+                .Property => |p| if (p.init) |i| exprUsesField(i) else false,
                 else => false,
             },
             else => false,

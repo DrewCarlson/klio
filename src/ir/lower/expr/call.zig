@@ -1102,7 +1102,7 @@ fn tryInferredReifiedMemberInline(mi: *MemberInline) Allocator.Error!?Reg {
         const nm = try b.module.internConst(b.allocator, .{ .String = mname });
         const dst = b.allocReg();
         orEmitAudit(b, "member_inline_typed", "CallMemberOrGlobal", mname);
-        try b.push(.{ .CallMemberOrGlobal = .{
+        try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
             .dst = dst,
             .this_idx = 0,
             .name = nm,
@@ -1114,7 +1114,7 @@ fn tryInferredReifiedMemberInline(mi: *MemberInline) Allocator.Error!?Reg {
             .func = fid,
             .candidates = try cmgCandidates(b, mname, callee.Member.name.span.file, run[1]),
             .type_args = ta_ids,
-        } });
+        }) });
         return dst;
     }
     return null;
@@ -1205,7 +1205,7 @@ fn tryReifiedFirstSplice(mi: *MemberInline, cf: *const ast.Function, fid: FuncId
 // Only when the registered target is this declaration: `cf`
 // came from a simple-name lookup, and another class's
 // same-named inline member must not splice onto this receiver.
-    const cf_recv: ?[]const u8 = if (cf.receiver_type) |*rt|
+    const cf_recv: ?[]const u8 = if (cf.receiver_type) |rt|
         typeHead(std.mem.trimEnd(u8, rt.name.name, "?"))
     else
         inline_state.inlineMemberOwner(cf);
@@ -1288,11 +1288,9 @@ fn spliceOrDispatchMemberInline(mi: *MemberInline, member_target: ?*const ast.Fu
         .dst = dst,
         .receiver = recv,
         .name = nm,
-        .trailing_lambda = b.callTrailingLambda(),
         .args = run[0],
         .n_args = run[1],
-        .arg_names = arg_names,
-        .declared_recv = bail_declared,
+        .extra = try b.memberExtra(.{ .trailing_lambda = b.callTrailingLambda(), .arg_names = arg_names, .declared_recv = bail_declared }),
     } });
     return dst;
 }
@@ -1625,10 +1623,9 @@ fn lowerSafeMemberCall(c: *CallCtx) Allocator.Error!Reg {
         .dst = v,
         .receiver = recv,
         .name = nm,
-        .trailing_lambda = b.callTrailingLambda(),
         .args = run[0],
         .n_args = run[1],
-        .arg_names = arg_names,
+        .extra = try b.memberExtra(.{ .trailing_lambda = b.callTrailingLambda(), .arg_names = arg_names }),
     } });
     try b.push(.{ .Move = .{ .dst = dst, .src = v } });
     b.terminate(.{ .Goto = join });
@@ -1950,7 +1947,7 @@ fn lowerCallSpread(
     const parts = try lowerSpreadParts(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
-    try b.push(.{ .CallSpread = .{
+    try b.push(.{ .CallSpread = try b.boxInst(ir.CallSpreadInst{
         .dst = dst,
         .callee = callee_reg,
         .parts = parts,
@@ -1959,7 +1956,7 @@ fn lowerCallSpread(
         .name = spread_name,
         .candidates = spread_candidates,
         .anchor_pkg = spread_anchor_pkg,
-    } });
+    }) });
     return dst;
 }
 

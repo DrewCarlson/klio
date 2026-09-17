@@ -203,13 +203,13 @@ fn solveComparatorSibling(
     ta[0] = .{
         .variance = .Invariant,
         .is_star = false,
-        .ty = .{ .name = .{ .name = derived_owned, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .ty = .{ .name = .{ .name = derived_owned, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false },
         .span = sp,
     };
     if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) {
         std.debug.print("[sibexp] outer={s} head={s} derived={s}\n", .{ f.fqn, head_owned, derived_owned });
     }
-    return .{ .site = s, .ty = .{ .name = .{ .name = head_owned, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
+    return .{ .site = s, .ty = .{ .name = .{ .name = head_owned, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false } };
 }
 
 /// Whether every head in `ty`, through its arguments, names something the receiving
@@ -251,8 +251,6 @@ pub fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.Type
                 .type_args = &.{},
                 .function = null,
                 .definitely_non_null = false,
-                .annotations = &.{},
-                .qualified_path = null,
             }, .span = sp };
             continue;
         }
@@ -266,8 +264,6 @@ pub fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.Type
         .type_args = tas,
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 
@@ -859,7 +855,7 @@ pub fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const 
             // constructor call or typed value.
             const sib_ty_full: ast.TypeRef = blk: {
                 if (staticEnumElem(b, sib)) |enum_name| {
-                    break :blk .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null };
+                    break :blk .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false };
                 }
                 const st = instantiatedSiblingCallTypeRef(b, sib) orelse
                     inline_call.ctorArgTypeRef(b.allocator, sib, b) orelse
@@ -880,7 +876,7 @@ pub fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const 
             if (std.mem.findScalarLast(u8, head, '.')) |i| head = head[i + 1 ..];
             const ta = b.allocator.alloc(ast.TypeArg, 1) catch return null;
             ta[0] = .{ .variance = .Invariant, .is_star = false, .ty = sib_ty, .span = sp };
-            return .{ .site = arg, .ty = .{ .name = .{ .name = head, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
+            return .{ .site = arg, .ty = .{ .name = .{ .name = head, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false } };
         }
     }
     return null;

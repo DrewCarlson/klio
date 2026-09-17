@@ -432,6 +432,14 @@ pub const ContextFnShape = struct { n_ctx: usize, n_regular: usize, ctx_types: [
 
 pub const HiddenBinding = struct { frame: usize, reg: Reg };
 
+/// `FuncBuilder.funcExtra` for a caller holding the allocator alone.
+pub fn funcExtraOn(a: Allocator, e: ir.FuncExtra) Allocator.Error!?*const ir.FuncExtra {
+    if (e.isDefault()) return null;
+    const p = try a.create(ir.FuncExtra);
+    p.* = e;
+    return p;
+}
+
 pub const FuncBuilder = struct {
     allocator: Allocator,
     module: *Module,
@@ -775,7 +783,10 @@ pub const FuncBuilder = struct {
         const a = self.allocator;
         for (self.blocks.items) |*b| {
             if (b.insts.len != 0) a.free(b.insts);
-            if (b.catches.len != 0) a.free(b.catches);
+            if (b.handlers) |hs| {
+                if (hs.catches.len != 0) a.free(hs.catches);
+                a.destroy(hs);
+            }
         }
         self.blocks.deinit(a);
         self.pending_fwd_lambdas.deinit(a);
@@ -2436,18 +2447,25 @@ pub const FuncBuilder = struct {
         const start = @min(from, items.len);
         return self.allocator.dupe(BlockId, items[start..]);
     }
+    /// The handlers of `block` to write, allocated on first use. The setters
+    /// below keep their plain signatures; the builder is already out of memory
+    /// for the function body long before this box fails.
+    fn handlersOf(self: *FuncBuilder, block: BlockId) *ir.BlockHandlers {
+        return self.blocks.items[block.int()].handlersMut(self.allocator) catch @panic("OOM in FuncBuilder");
+    }
     /// Append `bodies` to a block's `pop_on_exit` list, keeping what is there.
     pub fn appendPopOnExit(self: *FuncBuilder, block: BlockId, bodies: []const BlockId) Allocator.Error!void {
         if (bodies.len == 0) return;
-        const existing = self.blocks.items[block.int()].pop_on_exit;
+        const hs = try self.blocks.items[block.int()].handlersMut(self.allocator);
+        const existing = hs.pop_on_exit;
         const merged = try self.allocator.alloc(BlockId, existing.len + bodies.len);
         @memcpy(merged[0..existing.len], existing);
         @memcpy(merged[existing.len..], bodies);
-        self.blocks.items[block.int()].pop_on_exit = merged;
+        hs.pop_on_exit = merged;
     }
     /// The try bodies whose `TryFrame` the runtime pops when `block` gotos out.
     pub fn setPopOnExit(self: *FuncBuilder, block: BlockId, bodies: []const BlockId) void {
-        self.blocks.items[block.int()].pop_on_exit = bodies;
+        self.handlersOf(block).pop_on_exit = bodies;
     }
     /// The caller owns the returned slice.
     pub fn activeFinallys(self: *const FuncBuilder) Allocator.Error![]ast.Block {
@@ -2575,38 +2593,39 @@ pub const FuncBuilder = struct {
         catches: []CatchHandler,
         finally: ?BlockId,
     ) void {
-        const cur = block.int();
-        if (self.blocks.items[cur].catches.len != 0) self.allocator.free(self.blocks.items[cur].catches);
-        self.blocks.items[cur].catches = catches;
-        self.blocks.items[cur].finally = finally;
+        const hs = self.handlersOf(block);
+        if (hs.catches.len != 0) self.allocator.free(hs.catches);
+        hs.catches = catches;
+        hs.finally = finally;
     }
 
     /// Mark `join` as the normal-flow exit of the catch-only try entered at
     /// `body_entry`, so the eval pops that `TryFrame` when control arrives.
     pub fn setCatchDoneFor(self: *FuncBuilder, body_entry: BlockId, join: BlockId) void {
-        self.blocks.items[join.int()].catch_done_for = body_entry;
+        self.handlersOf(join).catch_done_for = body_entry;
     }
 
     /// Arm `region` to absorb a labeled return for the inline function `label`: a
     /// `LabeledReturn` for it jumps to `handler` with the value in `value_reg`.
     /// Normal flow into `handler` pops the region's frame via `catch_done_for`.
     pub fn setLrAbsorb(self: *FuncBuilder, region: BlockId, label: []const u8, handler: BlockId, value_reg: Reg) void {
-        self.blocks.items[region.int()].lr_absorb = .{ .label = label, .handler = handler, .value_reg = value_reg };
-        self.blocks.items[handler.int()].catch_done_for = region;
+        self.handlersOf(region).lr_absorb = .{ .label = label, .handler = handler, .value_reg = value_reg };
+        self.handlersOf(handler).catch_done_for = region;
     }
 
     /// Mark `done` as the post-finally sentinel for the try at `body_entry`.
     pub fn setFinallyDoneFor(self: *FuncBuilder, body_entry: BlockId, done: BlockId) void {
-        self.blocks.items[body_entry.int()].finally_done = done;
-        self.blocks.items[done.int()].finally_done_for = body_entry;
+        self.handlersOf(body_entry).finally_done = done;
+        self.handlersOf(done).finally_done_for = body_entry;
     }
 
     /// Protect a catch-handler block with the try's `finally`, so a throw from the
     /// catch runs it and re-raises past `done`, the shared post-finally sentinel.
     /// The handler keeps no catches of its own.
     pub fn protectCatchWithFinally(self: *FuncBuilder, catch_block: BlockId, finally_entry: BlockId, done: BlockId) void {
-        self.blocks.items[catch_block.int()].finally = finally_entry;
-        self.blocks.items[catch_block.int()].finally_done = done;
+        const hs = self.handlersOf(catch_block);
+        hs.finally = finally_entry;
+        hs.finally_done = done;
     }
 
     /// Ascending; the caller owns the returned slice.
@@ -2740,6 +2759,34 @@ pub const FuncBuilder = struct {
         push_trace_checked = true;
         if (runtime.envOnce("KLIO_GF_TRACE")) |w| gf_trace = w;
         if (runtime.envOnce("KLIO_LG_TRACE")) |w| lg_trace = w;
+    }
+
+    /// The out-of-line facts of a member call, or null when they are all at
+    /// their defaults, which most calls are.
+    pub fn memberExtra(self: *FuncBuilder, e: ir.CallMemberExtra) Allocator.Error!?*const ir.CallMemberExtra {
+        if (e.isDefault()) return null;
+        const p = try self.allocator.create(ir.CallMemberExtra);
+        p.* = e;
+        return p;
+    }
+
+    pub fn virtualExtra(self: *FuncBuilder, e: ir.CallVirtualExtra) Allocator.Error!?*const ir.CallVirtualExtra {
+        if (e.isDefault()) return null;
+        const p = try self.allocator.create(ir.CallVirtualExtra);
+        p.* = e;
+        return p;
+    }
+
+    /// The rare header fields of a function, or null when all are at their defaults.
+    pub fn funcExtra(self: *FuncBuilder, e: ir.FuncExtra) Allocator.Error!?*const ir.FuncExtra {
+        return funcExtraOn(self.allocator, e);
+    }
+
+    /// A boxed instruction payload on the function's allocator.
+    pub fn boxInst(self: *FuncBuilder, v: anytype) Allocator.Error!*@TypeOf(v) {
+        const p = try self.allocator.create(@TypeOf(v));
+        p.* = v;
+        return p;
     }
 
     pub fn push(self: *FuncBuilder, inst: Inst) Allocator.Error!void {
@@ -2956,8 +3003,7 @@ pub const FuncBuilder = struct {
             .is_tailrec = self.tailrec_self != null,
             .is_lambda = false,
             .is_inline = self.is_inline,
-            .capture_order = capture_order,
-            .implicit_label = null,
+            .extra = try self.funcExtra(.{ .capture_order = capture_order }),
             .low_priority = false,
             // The declaring package in effect for this lowering. Explicit decl
             // paths overwrite it after `finish`; the synthetic paths (init blocks,
@@ -3049,12 +3095,7 @@ const testing = std.testing;
 
 /// Free a test `Func`: its per-block slices, the block list, capture names.
 fn freeFunc(func: Func) void {
-    for (func.blocks) |b| {
-        if (b.insts.len != 0) testing.allocator.free(b.insts);
-        if (b.catches.len != 0) testing.allocator.free(b.catches);
-    }
-    testing.allocator.free(func.blocks);
-    if (func.capture_order.len != 0) testing.allocator.free(func.capture_order);
+    func.freeBuilt(testing.allocator);
 }
 
 test {

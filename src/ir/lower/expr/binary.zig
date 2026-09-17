@@ -184,10 +184,9 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
                     .dst = dst,
                     .receiver = l,
                     .name = nm,
-                    .static_recv = try b.module.internConst(b.allocator, .{ .String = ty }),
                     .args = args_start,
                     .n_args = 1,
-                    .arg_names = &.{},
+                    .extra = try b.memberExtra(.{ .static_recv = try b.module.internConst(b.allocator, .{ .String = ty }), .arg_names = &.{} }),
                 } });
                 return dst;
             }
@@ -390,7 +389,7 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             .name = nm,
             .args = arg_slot,
             .n_args = 1,
-            .arg_names = &.{},
+            .extra = try b.memberExtra(.{ .arg_names = &.{} }),
         } });
         const zero = try b.emitConst(.{ .Int = 0 });
         const dst = b.allocReg();

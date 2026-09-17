@@ -300,7 +300,7 @@ pub fn runCheckUnimplemented(
         var lx = Lexer.init(gpa, id, owned_src) catch return 2;
         var lexed = lx.tokenize() catch return 2;
         defer lexed.deinit(gpa);
-        const p = Parser.new(gpa, id, owned_src, lexed.tokens);
+        const p = Parser.new(gpa, id, owned_src, lexed.tokens, lexed.strings);
         const file_ast = p.parseFile();
         user_asts.append(gpa, file_ast) catch return 2;
     }

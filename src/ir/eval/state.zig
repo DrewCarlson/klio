@@ -344,7 +344,7 @@ pub inline fn regsAlloc(fallback: Allocator) Allocator {
 /// (moves, consts, arithmetic, branches, returns, exact calls), no catch/finally.
 pub fn classifyFlattenable(f: *const Func) u8 {
     for (f.blocks) |*blk| {
-        if (blk.catches.len != 0 or blk.finally != null or blk.lr_absorb != null) return 2;
+        if (blk.h().catches.len != 0 or blk.h().finally != null or blk.h().lr_absorb != null) return 2;
         for (blk.insts) |*inst| {
             switch (inst.*) {
                 .Move,

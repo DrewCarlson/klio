@@ -539,7 +539,7 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     if (type_args.len == 0) {
         if (try spliceReifiedTypeArgs(b, func_id, args.len)) |stamped| type_args = stamped;
     }
-    try b.push(.{ .CallMemberOrGlobal = .{
+    try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
         .dst = dst,
         .this_idx = this_idx,
         .name = nm,
@@ -552,7 +552,7 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = cmg_static_recv,
         .type_args = type_args,
-    } });
+    }) });
     return dst;
 }
 
@@ -897,11 +897,9 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_
             .dst = dst,
             .receiver = this_reg,
             .name = nmc,
-            .trailing_lambda = b.callTrailingLambda(),
             .args = uargs[0],
             .n_args = uargs[1],
-            .arg_names = uarg_names,
-            .static_recv = static_recv,
+            .extra = try b.memberExtra(.{ .trailing_lambda = b.callTrailingLambda(), .arg_names = uarg_names, .static_recv = static_recv }),
         } });
         return dst;
     }

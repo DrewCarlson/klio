@@ -200,7 +200,7 @@ fn classMemberDeclType(b: *const FuncBuilder, owner: []const u8, name: []const u
             }
         }
         if (inline_state.memberPropAst(cur, name)) |prop| {
-            if (prop.ty) |*t| {
+            if (prop.ty) |t| {
                 if (t.name.name.len != 0) return t.name.name;
             }
         }
@@ -307,8 +307,8 @@ fn suspendScanStmts(b: *const FuncBuilder, heads: []const []const u8, stmts: []c
             .Expr => |*e| suspendScan(b, heads, e),
             .Assign => |asg| suspendScan(b, heads, &asg.target) or suspendScan(b, heads, &asg.value),
             .DestructuringDecl => |d| suspendScan(b, heads, &d.init),
-            .Decl => |decl| switch (decl) {
-                .Property => |p| if (p.init) |*init| suspendScan(b, heads, init) else false,
+            .Decl => |decl| switch (decl.*) {
+                .Property => |p| if (p.init) |init| suspendScan(b, heads, init) else false,
                 else => false,
             },
         };
@@ -419,8 +419,8 @@ fn labelScanStmtsG(comptime deep: bool, stmts: []const Stmt, label: []const u8) 
             .Expr => |*e| labelScanG(deep, e, label),
             .Assign => |asg| labelScanG(deep, &asg.target, label) or labelScanG(deep, &asg.value, label),
             .DestructuringDecl => |d| labelScanG(deep, &d.init, label),
-            .Decl => |decl| switch (decl) {
-                .Property => |pr| if (pr.init) |*init| labelScanG(deep, init, label) else false,
+            .Decl => |decl| switch (decl.*) {
+                .Property => |pr| if (pr.init) |init| labelScanG(deep, init, label) else false,
                 else => false,
             },
         };
@@ -501,11 +501,11 @@ fn pocStmts(comptime exempt_call_head: bool, stmts: []const Stmt, name: []const 
             .Expr => |*e| pocUses(exempt_call_head, e, name),
             .Assign => |asg| pocUses(exempt_call_head, &asg.target, name) or pocUses(exempt_call_head, &asg.value, name),
             .DestructuringDecl => |d| pocUses(exempt_call_head, &d.init, name),
-            .Decl => |decl| switch (decl) {
+            .Decl => |decl| switch (decl.*) {
                 .Property => |pr| blk: {
                     // A same-named local re-declaration shadows below; keep the arg.
                     if (std.mem.eql(u8, pr.name.name, name)) break :blk true;
-                    break :blk if (pr.init) |*init| pocUses(exempt_call_head, init, name) else false;
+                    break :blk if (pr.init) |init| pocUses(exempt_call_head, init, name) else false;
                 },
                 else => true,
             },
@@ -605,8 +605,8 @@ fn scanStmts(stmts: []const Stmt) bool {
             .Expr => |*e| scan(e),
             .Assign => |asg| scan(&asg.target) or scan(&asg.value),
             .DestructuringDecl => |d| scan(&d.init),
-            .Decl => |decl| switch (decl) {
-                .Property => |p| if (p.init) |*init| scan(init) else false,
+            .Decl => |decl| switch (decl.*) {
+                .Property => |p| if (p.init) |init| scan(init) else false,
                 else => false,
             },
         };
@@ -1358,7 +1358,7 @@ fn inferReifiedTypeArgsRecv(
     }
 
     // Receiver position: unify the declared receiver against the receiver expression.
-    if (f.receiver_type) |*rt| {
+    if (f.receiver_type) |rt| {
         if (recv_arg) |ra| {
             try unifyParamAgainstArg(allocator, rt, ra, &tp_names, &subst, bb);
         } else if (bb) |b| {
@@ -1371,8 +1371,6 @@ fn inferReifiedTypeArgsRecv(
                     .type_args = &.{},
                     .function = null,
                     .definitely_non_null = false,
-                    .annotations = &.{},
-                    .qualified_path = null,
                 };
                 try unifyTypeParam(rt, &synth, &tp_names, &subst);
             }
@@ -1380,7 +1378,7 @@ fn inferReifiedTypeArgsRecv(
     }
     // Fallback: unify the declared return against the call's expected type.
     if (expected) |exp| {
-        if (f.return_type) |*ret| {
+        if (f.return_type) |ret| {
             if (runtime.envOnce("KLIO_UNIFY_TRACE") != null) {
                 std.debug.print("[unify-exp] {s} ret={s}<{d}> exp={s}<{d}>", .{ f.name.name, ret.name.name, ret.type_args.len, exp.name.name, exp.type_args.len });
                 for (exp.type_args) |*ta| std.debug.print(" [{s}{s}]", .{ if (ta.is_star) "*" else "", ta.ty.name.name });
@@ -1424,8 +1422,6 @@ fn inferReifiedTypeArgsRecv(
                 .type_args = &.{},
                 .function = null,
                 .definitely_non_null = false,
-                .annotations = &.{},
-                .qualified_path = null,
             };
         }
     }
@@ -1551,7 +1547,7 @@ fn unifyFunctionTypedParam(
 ) Allocator.Error!bool {
     if (param_ty.function) |ft| {
         if (arg.* == .Lambda) {
-            const lam = &arg.Lambda;
+            const lam = arg.Lambda;
             const n = @min(ft.params.len, lam.param_tys.len);
             var i: usize = 0;
             while (i < n) : (i += 1) {
@@ -1573,8 +1569,6 @@ fn unifyFunctionTypedParam(
                     .type_args = &.{},
                     .function = null,
                     .definitely_non_null = false,
-                    .annotations = &.{},
-                    .qualified_path = null,
                 });
             }
         }
@@ -1673,7 +1667,7 @@ fn unifySerializerFactoryParam(
         tp_names.contains(param_ty.type_args[0].ty.name.name)) param_ty.type_args[0].ty.name.name else null;
     const kser_open = if (kser_tv) |tv| blk: {
         const prior = subst.get(tv) orelse break :blk true;
-        break :blk prior.qualified_path == null and std.mem.findScalar(u8, prior.name.name, '.') == null;
+        break :blk prior.x().qualified_path == null and std.mem.findScalar(u8, prior.name.name, '.') == null;
     } else false;
     if (kser_open) kser: {
         if (arg.* == .Call and arg.Call.callee.* == .Member and
@@ -1691,7 +1685,7 @@ fn unifySerializerFactoryParam(
                         if (std.mem.eql(u8, prior.name.name, last)) {
                             if (qualified == null) break :kser;
                             var merged = prior;
-                            merged.qualified_path = qualified;
+                            merged.extra = try ast.typeRefExtra(allocator, .{ .annotations = prior.x().annotations, .qualified_path = qualified });
                             try subst.put(kser_tv.?, merged);
                             return true;
                         }
@@ -1703,8 +1697,7 @@ fn unifySerializerFactoryParam(
                         .type_args = &.{},
                         .function = null,
                         .definitely_non_null = false,
-                        .annotations = &.{},
-                        .qualified_path = qualified,
+                        .extra = try ast.typeRefExtra(allocator, .{ .qualified_path = qualified }),
                     });
                     return true;
                 }
@@ -1740,8 +1733,6 @@ fn unifyClassLiteralParam(
                     .type_args = &.{},
                     .function = null,
                     .definitely_non_null = false,
-                    .annotations = &.{},
-                    .qualified_path = null,
                 });
                 return true;
             }
@@ -2009,8 +2000,7 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
         .type_args = targs,
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = qualified,
+        .extra = ast.typeRefExtra(allocator, .{ .qualified_path = qualified }) catch return null,
     };
     return out;
 }
@@ -2086,8 +2076,6 @@ pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const Func
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
     return out;
 }
@@ -2149,8 +2137,6 @@ fn explicitCallInstantiation(b: *const FuncBuilder, arg: *const Expr, head: []co
             .type_args = targs,
             .function = null,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         };
         if (found) |prev| {
             // Same-shaped candidates agree; a different shape is ambiguous.
@@ -2235,8 +2221,6 @@ fn unifyLoweredTypeParam(
             .type_args = &.{},
             .function = null,
             .definitely_non_null = false,
-            .annotations = &.{},
-            .qualified_path = null,
         });
     }
 }
@@ -2288,8 +2272,6 @@ fn declTypeSupertypeBind(
                 .type_args = &.{},
                 .function = null,
                 .definitely_non_null = false,
-                .annotations = &.{},
-                .qualified_path = null,
             });
         }
         return;
@@ -2336,8 +2318,6 @@ fn argGenericTypeRef(allocator: Allocator, arg: *const Expr, depth: usize) Alloc
                 .type_args = targs,
                 .function = null,
                 .definitely_non_null = false,
-                .annotations = &.{},
-                .qualified_path = null,
             };
             return out;
         },
@@ -2361,16 +2341,16 @@ fn argGenericTypeRef(allocator: Allocator, arg: *const Expr, depth: usize) Alloc
 /// AST: the declared type, the getter's return annotation, or an expression body.
 fn propGenericTypeRef(allocator: Allocator, owner: []const u8, name: []const u8, depth: usize) Allocator.Error!?*const TypeRef {
     const p = inline_state.memberPropAst(owner, name) orelse return null;
-    if (p.ty) |*t| {
+    if (p.ty) |t| {
         if (t.type_args.len != 0) return t;
     }
     if (p.getter) |g| {
-        if (g.return_type) |*rt| {
+        if (g.return_type) |rt| {
             if (rt.type_args.len != 0) return rt;
         }
         if (g.body == .Expr) return argGenericTypeRef(allocator, &g.body.Expr, depth + 1);
     }
-    if (p.init) |*init| return argGenericTypeRef(allocator, init, depth + 1);
+    if (p.init) |init| return argGenericTypeRef(allocator, init, depth + 1);
     return null;
 }
 
@@ -2550,9 +2530,9 @@ fn collectRuntimeTypeNamesStmt(s: *const Stmt, out: *ast_scan.StringSet) Allocat
             try collectRuntimeTypeNames(&a.value, out);
         },
         .DestructuringDecl => |d| try collectRuntimeTypeNames(&d.init, out),
-        .Decl => |d| switch (d) {
+        .Decl => |d| switch (d.*) {
             .Property => |p| {
-                if (p.init) |*e| try collectRuntimeTypeNames(e, out);
+                if (p.init) |e| try collectRuntimeTypeNames(e, out);
                 if (p.delegate) |e| try collectRuntimeTypeNames(e, out);
             },
             .Function => |f| {
@@ -3717,7 +3697,7 @@ fn bindSpliceTypeParamBounds(
             break :blk null;
         };
         const ub = bound_ty orelse continue;
-        if (ub.function != null or ub.qualified_path != null or ub.name.name.len == 0) continue;
+        if (ub.function != null or ub.x().qualified_path != null or ub.name.name.len == 0) continue;
         const r = try b.bindSpliceTypeParamBound(tp.name.name, .{
             .param = tp.name.name,
             .bound = ub.name.name,
@@ -3939,7 +3919,7 @@ fn lowerSplicedBody(
         // type as the expected tail-position type, so a tail-position reified call
         // infers from this function's return rather than the splice site's expected.
         .Expr => |*e| blk: {
-            const prev = b.pushExpected(f.return_type);
+            const prev = b.pushExpected(ast.unbox(f.return_type));
             defer b.restoreExpected(prev);
             break :blk try lowerExpr(b, e);
         },
@@ -4060,7 +4040,7 @@ pub fn tryInlineCallWithTypeArgs(
     const prev_hint_recv = b.spliceHintRecv();
     b.setSpliceHint(true, if (f.receiver_type) |rt| rt.name.name else if (member_splice) inline_state.inlineMemberOwner(f) else null);
     defer b.setSpliceHint(prev_hint_active, prev_hint_recv);
-    const prev_hint_recv_ref = b.setSpliceHintRecvRef(f.receiver_type);
+    const prev_hint_recv_ref = b.setSpliceHintRecvRef(ast.unbox(f.receiver_type));
     defer _ = b.setSpliceHintRecvRef(prev_hint_recv_ref);
     // The spliced body has its own receiver context, so the caller's smart-cast
     // narrow of `this` must not leak into it.
@@ -4290,7 +4270,7 @@ fn reifiedQualifiedName(b: *FuncBuilder, a: ast.TypeRef) ?[]const u8 {
     // An inferred nested type argument carries its dotted spelling in `name`, not
     // `qualified_path`, so resolve either; the dotted head names a `.`-aligned
     // suffix of the nested class's lifted fqn.
-    const qp = a.qualified_path orelse
+    const qp = a.x().qualified_path orelse
         (if (std.mem.findScalar(u8, a.name.name, '.') != null and a.name.name[0] != '.')
             a.name.name
         else
@@ -4548,11 +4528,12 @@ fn ident(name: []const u8) ast.Ident {
 test "arg_lambda_has_nonlocal_return detects bare return" {
     var ret = Expr{ .Return = .{ .value = null, .label = null, .span = dummySpan() } };
     var stmts = [_]Stmt{.{ .Expr = ret }};
-    const lam = Expr{ .Lambda = .{
+    var lam_node_4551 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    const lam = Expr{ .Lambda = &lam_node_4551 };
     const args = [_]Expr{lam};
     try testing.expect(argLambdaHasNonlocalReturn(&args));
     _ = &ret;
@@ -4562,17 +4543,19 @@ test "arg_lambda_has_nonlocal_return ignores nested lambda return" {
     // A `return` inside a nested lambda is local to that lambda.
     var inner_ret = Expr{ .Return = .{ .value = null, .label = null, .span = dummySpan() } };
     var inner_stmts = [_]Stmt{.{ .Expr = inner_ret }};
-    const inner_lam = Expr{ .Lambda = .{
+    var lam_node_4565 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &inner_stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    const inner_lam = Expr{ .Lambda = &lam_node_4565 };
     var outer_stmts = [_]Stmt{.{ .Expr = inner_lam }};
-    const outer_lam = Expr{ .Lambda = .{
+    var lam_node_4571 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &outer_stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    const outer_lam = Expr{ .Lambda = &lam_node_4571 };
     const args = [_]Expr{outer_lam};
     try testing.expect(!argLambdaHasNonlocalReturn(&args));
     _ = &inner_ret;
@@ -4589,11 +4572,12 @@ test "arg_lambda_has_nonlocal_return scans nested control flow" {
         .span = dummySpan(),
     } };
     var stmts = [_]Stmt{.{ .Expr = if_expr }};
-    const lam = Expr{ .Lambda = .{
+    var lam_node_4592 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    const lam = Expr{ .Lambda = &lam_node_4592 };
     const args = [_]Expr{lam};
     try testing.expect(argLambdaHasNonlocalReturn(&args));
 }
@@ -4601,11 +4585,12 @@ test "arg_lambda_has_nonlocal_return scans nested control flow" {
 test "arg_lambda_has_nonlocal_return false for plain body" {
     var lit = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } };
     var stmts = [_]Stmt{.{ .Expr = lit }};
-    const lam = Expr{ .Lambda = .{
+    var lam_node_4604 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &stmts, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    const lam = Expr{ .Lambda = &lam_node_4604 };
     const args = [_]Expr{lam};
     try testing.expect(!argLambdaHasNonlocalReturn(&args));
     _ = &lit;
@@ -4623,11 +4608,12 @@ test "inline lambda forwarding preserves the original literal" {
     var b = try FuncBuilder.init(testing.allocator, &module);
     defer b.deinit();
 
-    var lambda = Expr{ .Lambda = .{
+    var lam_node_4626 = ast.LambdaExpr{
         .params = &.{},
         .body = .{ .stmts = &.{}, .span = dummySpan() },
         .span = dummySpan(),
-    } };
+    };
+    var lambda = Expr{ .Lambda = &lam_node_4626 };
     var substitutions = std.StringHashMap(*const ast.Expr).init(testing.allocator);
     try substitutions.put("block", &lambda);
     try b.pushInlineLambdaFrame(substitutions, b.scopeDepth());
@@ -4648,8 +4634,6 @@ fn typeRef(name: []const u8) TypeRef {
         .type_args = &.{},
         .function = null,
         .definitely_non_null = false,
-        .annotations = &.{},
-        .qualified_path = null,
     };
 }
 

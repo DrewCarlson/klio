@@ -241,7 +241,7 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
         const takes_receiver = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
         if (takes_receiver) return null;
         if (!std.mem.eql(u8, f.name, "<lambda>")) return null;
-        if (f.lambda_receiver_ty) |head| {
+        if (f.x().lambda_receiver_ty) |head| {
             if (callValueTraceOn()) std.debug.print("[cvt-head] id={d} head={s}\n", .{ id, head });
             if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
                 selected_this = matched;
@@ -417,7 +417,7 @@ pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: 
                 defer module_g.deinit();
                 const m = info.module orelse module_g.get();
                 const f = m.funcById(info.body_func) orelse break :blk false;
-                break :blk f.lambda_receiver_ty != null;
+                break :blk f.x().lambda_receiver_ty != null;
             };
             if ((!has_this or receiver_lambda) and args.len == info.n_params) {
                 return prepareClosureWithThisFlatCall(self, allocator, callee, recv, args);
@@ -1349,7 +1349,7 @@ pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const
                 defer module_g.deinit();
                 const m = info.module orelse module_g.get();
                 const f = m.funcById(info.body_func) orelse break :blk false;
-                break :blk f.lambda_receiver_ty != null;
+                break :blk f.x().lambda_receiver_ty != null;
             };
             if ((!has_this or receiver_lambda) and args.len == info.n_params) {
                 if (runtime.envOnce("KLIO_CVNRC") != null) {
@@ -1638,7 +1638,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
             defer module_g.deinit();
             const m = info.module orelse module_g.get();
             if (m.funcById(info.body_func)) |f| {
-                if (f.lambda_receiver_ty) |head| {
+                if (f.x().lambda_receiver_ty) |head| {
                     if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
                         selected_this = matched;
                     }
@@ -1692,7 +1692,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                         if (f) |func| if (func.params.len != 0) func.params[0].name else "-" else "-",
                         info.receiver_shape_known,
                         info.has_receiver,
-                        if (f) |func| func.lambda_receiver_ty orelse "-" else "-",
+                        if (f) |func| func.x().lambda_receiver_ty orelse "-" else "-",
                         has_this_capture,
                     },
                 );
@@ -2020,7 +2020,7 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
         n_params = f.params.len;
         receiver_shape_known = f.lambda_receiver_shape_known;
         has_receiver = f.lambda_has_receiver;
-        capture_names = try allocator.dupe([]const u8, f.capture_order);
+        capture_names = try allocator.dupe([]const u8, f.x().capture_order);
     }
     // Canonical capture store for the HOF invoke path; a captured `var` is a
     // shared `Value.Cell`, so writes are visible by reference.

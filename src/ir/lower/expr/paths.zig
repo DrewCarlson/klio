@@ -270,7 +270,7 @@ fn lastTwoSegments(path: []const u8) ?[]const u8 {
 /// The lowered name for a type position: a qualified nested reference resolves to
 /// its mangled lift name, then the `scopeTypeRename` ladder, then the simple name.
 pub fn loweredTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8 {
-    if (ty.qualified_path) |qp| {
+    if (ty.x().qualified_path) |qp| {
         if (lastTwoSegments(qp)) |key| {
             if (b.module.registry.mangled_nested.get(key)) |m| return m;
         }
@@ -298,7 +298,7 @@ pub fn loweredOwnedLocalTypeRef(b: *const FuncBuilder, ty: *const ast.TypeRef) A
         b.allocator.free(lowered.name);
         lowered.name = owned_head;
     }
-    if (ty.qualified_path == null) {
+    if (ty.x().qualified_path == null) {
         var alias_fqn: ?[]const u8 = null;
         const imports = b.module.importAliasPathsIn(ty.span.file, ty.name.name);
         for (imports) |imported| {
@@ -340,7 +340,7 @@ pub fn loweredOwnedLocalTypeRef(b: *const FuncBuilder, ty: *const ast.TypeRef) A
 /// dotted path, normalised to the class FQN, so the runtime walk can reject a
 /// same-simple-name class from another package.
 pub fn loweredCheckTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8 {
-    if (ty.qualified_path) |qp| {
+    if (ty.x().qualified_path) |qp| {
         if (lastTwoSegments(qp)) |key| {
             if (b.module.registry.mangled_nested.get(key)) |m| return m;
         }

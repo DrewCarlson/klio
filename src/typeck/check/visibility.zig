@@ -71,6 +71,9 @@ fn lookup(self: *const Checker, name: []const u8) ?*const root.Binding {
             return b;
         }
     }
+    if (self.shared_globals) |g| {
+        if (g.getPtr(name)) |b| return b;
+    }
     return null;
 }
 

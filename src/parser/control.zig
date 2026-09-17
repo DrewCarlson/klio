@@ -133,12 +133,12 @@ pub fn parseControlStructureBody(p: *Parser) ?Expr {
         support.skipNl(p);
         const rhs = parseExpr(p) orelse return null;
         const sp = expr.span().join(rhs.span());
-        const st = Stmt{ .Assign = .{
+        const st = Stmt{ .Assign = support.boxed(p, ast.AssignStmt{
             .target = expr,
             .op = o,
             .value = rhs,
             .span = sp,
-        } };
+        }) };
         return Expr{ .Block = .{
             .stmts = singleStmt(p, st),
             .span = sp,
@@ -383,7 +383,7 @@ pub fn parseFor(p: *Parser) ?Expr {
     _ = support.expect(p, .RParen, "`)`") orelse return null;
     support.skipNl(p);
     const body = parseControlStructureBody(p) orelse return null;
-    return Expr{ .For = .{
+    return Expr{ .For = support.boxed(p, ast.ForExpr{
         .vars = vars,
         .by_name = for_by_name,
         .destructured = destructured,
@@ -392,7 +392,7 @@ pub fn parseFor(p: *Parser) ?Expr {
         .iter = box(p, iter),
         .body = box(p, body),
         .span = kw.span.join(body.span()),
-    } };
+    }) };
 }
 
 pub fn parseReturn(p: *Parser) ?Expr {
@@ -522,12 +522,12 @@ pub fn parseTry(p: *Parser) ?Expr {
         catches_slice[catches_slice.len - 1].body.span
     else
         body.span;
-    return Expr{ .Try = .{
+    return Expr{ .Try = support.boxed(p, ast.TryExpr{
         .body = body,
         .catches = catches_slice,
         .finally = finally,
         .span = kw.span.join(end),
-    } };
+    }) };
 }
 
 pub fn parseWhen(p: *Parser) ?Expr {
@@ -566,12 +566,12 @@ pub fn parseWhen(p: *Parser) ?Expr {
         branches.append(p.allocator, branch) catch @panic("OOM in parser");
     }
     const rbrace = support.expect(p, .RBrace, "`}`") orelse return null;
-    return Expr{ .When = .{
+    return Expr{ .When = support.boxed(p, ast.WhenExpr{
         .subject = subject,
         .subject_binding = subject_binding,
         .branches = branches.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .span = kw.span.join(rbrace.span),
-    } };
+    }) };
 }
 
 const WhenBindingResult = struct {
@@ -795,7 +795,7 @@ pub fn parseLambdaLiteral(p: *Parser) ?Expr {
         .stmts = stmts.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .span = sp,
     };
-    return Expr{ .Lambda = .{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp, .implicit_it = implicit_it } };
+    return Expr{ .Lambda = support.boxed(p, ast.LambdaExpr{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp, .implicit_it = implicit_it }) };
 }
 
 pub fn parseTrailingLambda(p: *Parser) ?Expr {
@@ -838,7 +838,7 @@ pub fn parseTrailingLambda(p: *Parser) ?Expr {
         .stmts = stmts.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .span = sp,
     };
-    return Expr{ .Lambda = .{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp, .implicit_it = implicit_it } };
+    return Expr{ .Lambda = support.boxed(p, ast.LambdaExpr{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp, .implicit_it = implicit_it }) };
 }
 
 /// Whether the `{ ... }` at the cursor carries a `params ->` header: true iff an
@@ -991,14 +991,14 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                     .segments = singleIdent(p, params[pd.idx]),
                     .span = pd.span,
                 } };
-                dest_stmts.append(p.allocator, .{ .DestructuringDecl = .{
+                dest_stmts.append(p.allocator, .{ .DestructuringDecl = support.boxed(p, ast.DestructuringDeclStmt{
                     .mutable = false,
                     .names = pd.names,
                     .by_name = pd.by_name,
                     .sources = pd.sources,
                     .init = init,
                     .span = pd.span,
-                } }) catch @panic("OOM in parser");
+                }) }) catch @panic("OOM in parser");
             }
             return LambdaHeader{
                 .params = params,

@@ -168,7 +168,7 @@ pub fn lex(allocator: std.mem.Allocator, map: *SourceMap, prog: *const Program) 
 }
 
 pub fn parse(allocator: std.mem.Allocator, lexed: *const Lexed) KotlinFile {
-    var p = parser.Parser.new(allocator, lexed.id, lexed.source, lexed.result.tokens);
+    var p = parser.Parser.new(allocator, lexed.id, lexed.source, lexed.result.tokens, lexed.result.strings);
     return p.parseFile();
 }
 

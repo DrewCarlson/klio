@@ -230,7 +230,7 @@ pub fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32, r
     var void_rets: usize = 0;
     for (order) |b| {
         const blk = &f.blocks[b];
-        if (blk.catches.len != 0 or blk.finally != null) return false;
+        if (blk.h().catches.len != 0 or blk.h().finally != null) return false;
         switch (blk.terminator) {
             .Goto, .Branch => {},
             .Return => |r| if (r != null) {

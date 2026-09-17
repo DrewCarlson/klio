@@ -1404,7 +1404,7 @@ fn implicitReceiverBareTarget(
     // declared return.
     if (bare_resolved.target == null) {
         if (inline_state.exprBodyMemberAst(bare_head, name.name, call.args.len)) |fa| {
-            if (fa.return_type) |*rt| {
+            if (fa.return_type) |rt| {
                 const fwd = try loweredOwnedLocalTypeRef(b, rt);
                 if (bt) std.debug.print("[bareret] {s} on {s} ast-declared return={s}\n", .{ name.name, ident, fwd.name });
                 return .{ .answer = fwd };
@@ -1707,7 +1707,7 @@ const fa_hit = inline_state.exprBodyMemberAst(head, member.name.name, memberArgC
     break :blk_fa cand;
 };
     const fa = fa_hit orelse return null;
-    if (fa.return_type) |*rt| {
+    if (fa.return_type) |rt| {
         var out = try loweredOwnedLocalTypeRef(b, rt);
         if (member.safe) out.nullable = true;
         if (bareTypeParamHead(out.name)) try resolveDeclaredReturnBound(b, call_expr, head, fa, &out);
@@ -2264,13 +2264,13 @@ fn enrichLambdaArgShapes(
         // preceding local whose annotated or derivable init type is concrete.
         expr.od_depth += 1;
         for (stmts[0 .. stmts.len - 1]) |*st| {
-            if (st.* != .Decl or st.Decl != .Property) continue;
+            if (st.* != .Decl or st.Decl.* != .Property) continue;
             const prop = st.Decl.Property;
             if (prop.receiver_type != null or prop.delegate != null) continue;
             var decl_owned: ?ir.TypeRef = null;
-            if (prop.ty) |*annotated| {
+            if (prop.ty) |annotated| {
                 decl_owned = loweredOwnedLocalTypeRef(&nb, annotated) catch null;
-            } else if (prop.init) |*init| {
+            } else if (prop.init) |init| {
                 decl_owned = staticExprTypeRef(&nb, init) catch null;
             }
             var dt = decl_owned orelse continue;
@@ -2808,7 +2808,7 @@ fn underivedCandidateReturn(
                         var nb3 = try FuncBuilder.init(b.allocator, b.module);
                         nb3.census_quiet = true;
                         defer nb3.deinit();
-                        if (fa.receiver_type) |*frt| {
+                        if (fa.receiver_type) |frt| {
                             nb3.setRecvTypeRefOwned(try loweredOwnedLocalTypeRef(&nb3, frt));
                         }
                         for (fa.params) |*ap| {
