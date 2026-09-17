@@ -301,6 +301,67 @@ build read identical (6506 functions), both corpus modes held the
 baseline, and the cold wall, the warm run and the eight run-time examples
 did not move. The resident set at the megabyte moves by less than one.
 
+### The serial stretch
+
+With the parallel pools at about 45 ms of the 119 ms prepare, the serial
+work between them was the larger half, and it came in two dozen pieces
+none of which a millisecond trace could rank. Three instruments settled
+it. The lowering trace prints microseconds. The PC sampler runs on macOS
+(the timer through libc, the program counter and the link register read
+from the arm64 signal context, since the std helper returned zero), tags
+every sample with the phase it fell in, and dumps raw addresses that
+`scripts/prof_symbolize.py` folds by function, by phase, and by caller
+for a leaf. Measure from outside the checkout: a run inside it reads the
+231 stdlib sources from disk (4 ms) where a user's binary has them
+embedded.
+
+What the profile said, in samples of 100 µs across the whole run:
+
+| Where | Samples | What it was |
+|-------|--------:|-------------|
+| `memcpy` | 630 | a block's instruction slice grew by one element per push, a fresh allocation and a full copy each; a thread's fork of the module for the body pool; the root encoder's buffer growing once past its estimate |
+| `__mmap`, `__munmap` | 240 | the checker's page-allocator arenas mapping a chunk per call and unmapping at the end of the stage; the build heap's regions at the drop; the parse's token arrays above the slab's parking limit |
+| `swtch_pri` | 120 | parse workers yielding in a loop while the last big files were cut |
+| hash map growth | 240 | tables doubling through passes whose sizes were known |
+
+What changed, and what it bought on a cold hello from outside the
+checkout (prepare 118 ms, wall 135 ms, peak 211 MB before):
+
+- The builder keeps a list per block and sizes the slice once at finish.
+  The copying moved rather than vanished: the finish copy lands on fresh
+  pages, and a variant that left the lists in place saved no wall and
+  cost 24 MB of build heap, so the exact slices stay.
+- The build heap's regions unmap on a detached thread once the collector
+  has forgotten them, and the checker's worker arenas release through the
+  same janitor: the two together were four milliseconds on the path. The
+  same arenas moved onto the process slab cost 150 MB of resident set and
+  moved back.
+- The root encoder reserves for the tables and its slice registry once.
+- A parse worker with nothing to take parks on an event gate.
+- The stage runs as a job the build starts once the syntax transforms
+  are done and joins before the first body lowers; nothing between reads
+  its picks and nothing writes the syntax it reads. The checker therefore
+  sees the syntax as transformed, which the bodies see too: 63 of the
+  6506 stdlib functions lower differently, the same 63 whether the job
+  runs beside the passes or on the calling thread, and the stdlib
+  commontest sweep (2466 passes) and both corpus modes are unchanged.
+- A name with no inline candidate is remembered as such; the header pass
+  and the resolver size their tables by declaration count.
+
+| | Before | After |
+|---|---:|---:|
+| Prepare | 118 ms | 99 ms |
+| Cold wall, median | 135 ms | 125 ms |
+| Warm wall | 17 ms | 16 ms |
+| Peak resident set | 211 MB | 223 MB |
+
+The peak rises because the stage's arenas and the build's tables now
+coexist. The eight run-time examples are unchanged within noise.
+
+The pools scale at about 65% from five threads to ten, so their wall is
+compute plus contention, not the page-fault cliff the off-CPU share
+suggested; the sampler simply undercounts a phase on ten threads.
+
 ### What remains
 
 The churn that remains is the checker's arenas (60 MB, freed together),

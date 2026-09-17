@@ -90,6 +90,9 @@ pub const TypeCheck = struct {
     /// What the body pass's workers allocated: the results above point into
     /// these, so they live as long as the result does.
     worker_arenas: []*std.heap.ArenaAllocator = &.{},
+    /// The workers' query scratch and solve memo arenas, kept whole so the
+    /// result frees them with the rest.
+    worker_scratch: []std.heap.ArenaAllocator = &.{},
 
     /// Frees the workers' memory. Everything else was allocated from the
     /// allocator the check ran on; a caller that gave it an arena frees the
@@ -101,6 +104,32 @@ pub const TypeCheck = struct {
         }
         allocator.free(self.worker_arenas);
         self.worker_arenas = &.{};
+        for (self.worker_scratch) |*arena| arena.deinit();
+        allocator.free(self.worker_scratch);
+        self.worker_scratch = &.{};
+    }
+
+    /// Moves every worker arena out, on a page-allocator slice the caller
+    /// frees with them, so their teardown can run off the critical path;
+    /// `deinit` then has none left to free.
+    pub fn takeArenas(self: *TypeCheck, allocator: Allocator) ?[]std.heap.ArenaAllocator {
+        const n = self.worker_arenas.len + self.worker_scratch.len;
+        const out = std.heap.page_allocator.alloc(std.heap.ArenaAllocator, n) catch return null;
+        var i: usize = 0;
+        for (self.worker_arenas) |arena| {
+            out[i] = arena.*;
+            i += 1;
+            allocator.destroy(arena);
+        }
+        for (self.worker_scratch) |arena| {
+            out[i] = arena;
+            i += 1;
+        }
+        allocator.free(self.worker_arenas);
+        self.worker_arenas = &.{};
+        allocator.free(self.worker_scratch);
+        self.worker_scratch = &.{};
+        return out;
     }
 
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
@@ -148,6 +177,7 @@ pub fn typecheck(
         .expr_class = tc.expr_class,
         .rank_class = tc.rank_class,
         .worker_arenas = try tc.worker_arenas.toOwnedSlice(allocator),
+        .worker_scratch = try tc.worker_scratch.toOwnedSlice(allocator),
     };
 }
 
@@ -350,6 +380,7 @@ pub fn typecheckModuleOpts(
         .expr_class = tc.expr_class,
         .rank_class = tc.rank_class,
         .worker_arenas = try tc.worker_arenas.toOwnedSlice(allocator),
+        .worker_scratch = try tc.worker_scratch.toOwnedSlice(allocator),
     };
 }
 
@@ -930,6 +961,7 @@ pub const Checker = struct {
     report_diagnostics: bool = true,
     /// The workers' arenas, handed to the result.
     worker_arenas: std.ArrayList(*std.heap.ArenaAllocator),
+    worker_scratch: std.ArrayList(std.heap.ArenaAllocator) = .empty,
     /// One owned copy of every class name the checker records by span or
     /// binding. A name read off a type would die with that type.
     names: std.StringHashMap(void),

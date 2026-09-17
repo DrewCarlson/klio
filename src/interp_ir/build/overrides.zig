@@ -341,6 +341,24 @@ pub const BuildCtx = struct {
 
 const phase = @import("module.zig").phase;
 
+/// A stage the driver hands the build to run beside its table passes: the
+/// checker's picks for the bodies. It starts once the passes that rewrite
+/// the syntax are done and is joined before the first body lowers, so it
+/// reads the syntax the bodies see and nothing reads its results early.
+pub const StageJob = struct {
+    ctx: *anyopaque,
+    run: *const fn (*anyopaque, []const KotlinFile) void,
+};
+
+/// Consumed by the next build; the driver sets both before calling in.
+pub var stage_job: ?StageJob = null;
+/// The files, after their transforms, the stage checks.
+pub var stage_files: []const KotlinFile = &.{};
+
+fn runStageJob(job: StageJob, files: []const KotlinFile) void {
+    job.run(job.ctx, files);
+}
+
 pub fn buildModuleWithOverrides(
     allocator: Allocator,
     file: *const KotlinFile,
@@ -375,6 +393,20 @@ pub fn buildModuleWithOverrides(
     phase.mark("repointAliasedNestedSupertypes");
     try applyExpectActualSubstitutions(&ctx, out_lifted);
     phase.mark("applyExpectActualSubstitutions");
+
+    // The syntax is final from here; the stage runs on its own thread while
+    // the tables below register from the same syntax.
+    var stage_thread: ?std.Thread = null;
+    var stage_pending: ?StageJob = null;
+    if (stage_job) |job| {
+        stage_job = null;
+        stage_pending = job;
+        // `KLIO_STAGE_SERIAL=1` runs it here instead, on this thread, to tell
+        // an ordering effect from a concurrency one.
+        if (runtime.envOnce("KLIO_STAGE_SERIAL") == null) {
+            stage_thread = std.Thread.spawn(.{ .stack_size = 64 << 20 }, runStageJob, .{ job, stage_files }) catch null;
+        }
+    }
 
     // Register every declaration's identity and metadata. Nothing here lowers a body, so a
     // body lowered below sees complete tables however its declaration is ordered in source.
@@ -438,6 +470,16 @@ pub fn buildModuleWithOverrides(
     phase.mark("registerCallableExtensionProps");
     try registerReceiverFnPropHeads(&ctx);
     phase.mark("registerReceiverFnPropHeads");
+
+    // The bodies read the stage's picks, so it finishes first and the module
+    // takes its tables, which the stage left in the shared hand-off.
+    if (stage_thread) |t| t.join() else if (stage_pending) |job| runStageJob(job, stage_files);
+    if (stage_pending != null) {
+        if (ir.staged_picks) |p| {
+            ir.staged_picks = null;
+            ctx.module.adoptPicks(p);
+        }
+    }
 
     // Lower every body and thunk against the now-complete header set.
     try lowerClassBodies(&ctx);
@@ -1698,6 +1740,20 @@ fn registerTopLevelFuncHeaders(ctx: *BuildCtx) Allocator.Error!void {
     const decls = ctx.decls;
     // Phase 1 of two-phase consumption: every top-level function's HEADER registers before any body
     // lowers, so phase-2 lowering resolves bare calls against the full package-qualified set.
+    var n: usize = 0;
+    for (decls) |*d| {
+        if (d.* == .Function) n += 1;
+    }
+    // The tables grow once for the whole pass rather than doubling through it.
+    const m = ctx.module;
+    try m.funcs.ensureUnusedCapacity(ctx.a, n);
+    try m.func_index.ensureUnusedCapacity(ctx.a, n);
+    try m.func_name_index.ensureUnusedCapacity(@intCast(n));
+    try m.decl_user_params.ensureUnusedCapacity(@intCast(n));
+    try m.decl_user_arity.ensureUnusedCapacity(@intCast(n));
+    try m.decl_user_sig.ensureUnusedCapacity(@intCast(n));
+    try m.decl_span.ensureUnusedCapacity(@intCast(n));
+    try m.decl_sigs.ensureUnusedCapacity(@intCast(n));
     for (decls) |*d| {
         if (d.* == .Function) try registerTopLevelFuncHeader(ctx, &d.Function);
     }

@@ -97,25 +97,25 @@ const Shard = struct {
         m.const_dedup = try main.const_dedup.clone(a);
         m.top_level = .empty;
         m.resolve_diags = .empty;
-        m.tailrec_fn_names = .empty;
-        try m.tailrec_fn_names.appendSlice(a, main.tailrec_fn_names.items);
-        m.classes = .empty;
-        try m.classes.appendSlice(a, main.classes.items);
-        m.class_index = .empty;
-        try m.class_index.appendSlice(a, main.class_index.items);
+        // The tables a body only reads stay the main module's: the pool
+        // rejects a shard whose copy of one of them grew, so sharing them is
+        // the same guarantee without the copy. `tailrec_fn_names`, the
+        // classes, the class index, the method dispatch table, the
+        // declaration-span map and the writable registry maps but one are
+        // such tables.
         m.func_index = .empty;
         try m.func_index.appendSlice(a, main.func_index.items);
         // `func_name_index` and `member_name_index` stay the main module's:
         // a body reads them and only the header and placement passes write
         // them, and copying two maps of lists was most of a fork. `lower`
         // checks that in debug builds.
-        m.method_dispatch = try main.method_dispatch.clone();
         m.decl_ast_body = try main.decl_ast_body.clone();
         inline for (fid_maps) |name| @field(m, name) = try @field(main, name).clone();
-        m.func_by_decl_span = if (main.func_by_decl_span) |fm| try fm.clone() else null;
         m.ext_resolve_cache = null;
         m.recv_verdict_cache = null;
-        inline for (registry_writable) |name| @field(m.registry, name) = try @field(main.registry, name).clone();
+        // A body's local function defaults are its own; the merge folds the
+        // shard's into the main table, so it starts empty.
+        m.registry.local_fn_defaults = @TypeOf(main.registry.local_fn_defaults).init(a);
         m.registry.evidence_supers = .empty;
         m.registry.evidence_supers_gen = m.registry.class_super_gen;
         self.index = index;
@@ -137,14 +137,9 @@ const Shard = struct {
         m.const_dedup.deinit(a);
         m.top_level.deinit(a);
         m.resolve_diags.deinit(a);
-        m.tailrec_fn_names.deinit(a);
-        m.classes.deinit(a);
-        m.class_index.deinit(a);
         m.func_index.deinit(a);
-        m.method_dispatch.deinit();
         m.decl_ast_body.deinit();
         inline for (fid_maps) |name| @field(m, name).deinit();
-        if (m.func_by_decl_span) |*fm| fm.deinit();
         if (m.ext_resolve_cache) |c| {
             c.arena.deinit();
             a.destroy(c);
@@ -154,7 +149,7 @@ const Shard = struct {
             c.map.deinit(a);
             a.destroy(c);
         }
-        inline for (registry_writable) |name| @field(m.registry, name).deinit();
+        m.registry.local_fn_defaults.deinit();
         m.registry.dropEvidenceSupers();
         m.registry.evidence_supers.deinit(m.registry.allocator);
         a.free(self.func_map);

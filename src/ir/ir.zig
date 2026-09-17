@@ -122,6 +122,37 @@ pub threadlocal var pending_eager_param_shapes: ?std.AutoHashMap(span.Span, Eage
 
 pub const EagerParamShape = struct { has_receiver: bool, arity: u16 };
 
+/// The five pick tables as one value, for a stage that ran on another
+/// thread: it moves its thread's tables here and the build adopts them into
+/// the module it is building.
+pub const StagedPicks = struct {
+    calls: ?std.AutoHashMap(span.Span, span.Span) = null,
+    call_fids: ?std.AutoHashMap(span.Span, u32) = null,
+    types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
+    recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
+    param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
+};
+
+/// Moves the calling thread's pending tables out, leaving none pending.
+pub fn takePendingPicks() StagedPicks {
+    const out: StagedPicks = .{
+        .calls = pending_eager_calls,
+        .call_fids = pending_eager_call_fids,
+        .types = pending_eager_types,
+        .recv_heads = pending_eager_recv_heads,
+        .param_shapes = pending_eager_param_shapes,
+    };
+    pending_eager_calls = null;
+    pending_eager_call_fids = null;
+    pending_eager_types = null;
+    pending_eager_recv_heads = null;
+    pending_eager_param_shapes = null;
+    return out;
+}
+
+/// Written by a stage thread before it is joined, read by the build after.
+pub var staged_picks: ?StagedPicks = null;
+
 /// Context parameters of a local contextual function, threaded into its body lowering.
 pub const PendingCtx = struct {
     params: []const ast.ContextParam,
@@ -524,6 +555,7 @@ pub const Module = struct {
     pub const ensureFuncBody = m_lookup.ensureFuncBody;
     pub const funcById = m_lookup.funcById;
     pub const funcByIdMut = m_lookup.funcByIdMut;
+    pub const adoptPicks = m_lookup.adoptPicks;
     pub const appendedFuncCount = m_lookup.appendedFuncCount;
     pub const appendFunc = m_lookup.appendFunc;
     pub const nextFuncId = m_lookup.nextFuncId;

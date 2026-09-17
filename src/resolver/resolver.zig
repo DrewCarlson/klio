@@ -199,7 +199,12 @@ pub fn resolveModuleWithNatives(
     var pkg_scopes = std.StringHashMap(ScopeId).init(allocator);
     defer pkg_scopes.deinit();
     // Phase 1: forward-declare each file's top-level decls into its package scope,
-    // then mirror them into the module scope without diagnostics.
+    // then mirror them into the module scope without diagnostics. Every one
+    // becomes a symbol and a module binding, so the tables take that size once.
+    var n_decls: usize = 0;
+    for (files) |*file| n_decls += file.decls.len;
+    try r.symbols.ensureUnusedCapacity(allocator, n_decls);
+    try r.scopes.items[module_scope.int()].bindings.ensureUnusedCapacity(@intCast(n_decls));
     for (files) |*file| {
         try r.setFilePackage(file);
         const pkg_scope = blk: {
@@ -207,6 +212,7 @@ pub fn resolveModuleWithNatives(
             if (!gop.found_existing) gop.value_ptr.* = try r.pushScope(module_scope, .File);
             break :blk gop.value_ptr.*;
         };
+        try r.scopes.items[pkg_scope.int()].bindings.ensureUnusedCapacity(@intCast(file.decls.len));
         for (file.decls) |*decl| {
             try r.declareTopLevel(pkg_scope, decl);
             try r.mirrorModuleBinding(module_scope, pkg_scope, decl);

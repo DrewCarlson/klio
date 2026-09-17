@@ -464,6 +464,13 @@ const ParsePool = struct {
     inflight: std.atomic.Value(usize) = .init(0),
     lock: runtime.SpinMutex = .{},
     piece_next: usize = 0,
+    /// Rung whenever pieces land or a file finishes; a worker with nothing
+    /// to take parks on it rather than yielding in a loop.
+    gate: runtime.EventGate = .{},
+
+    fn signal(self: *ParsePool) void {
+        self.gate.ring();
+    }
 
     fn takePiece(self: *ParsePool) ?usize {
         self.lock.lock();
@@ -506,11 +513,13 @@ const ParsePool = struct {
             index += 1;
             from = to;
         }
+        self.signal();
         return index;
     }
 
     fn drain(self: *ParsePool) void {
         while (true) {
+            const seen = self.gate.epochNow();
             if (self.takePiece()) |i| {
                 runParseJob(self.allocator, self, i, &self.jobs.items[i]);
                 continue;
@@ -520,12 +529,13 @@ const ParsePool = struct {
                 _ = self.inflight.fetchAdd(1, .monotonic);
                 const i = self.order[o];
                 runParseJob(self.allocator, self, i, &self.jobs.items[i]);
-                _ = self.inflight.fetchSub(1, .monotonic);
+                _ = self.inflight.fetchSub(1, .release);
+                self.signal();
                 continue;
             }
             // Every file is claimed; pieces can still appear while one is lexing.
             if (self.inflight.load(.acquire) == 0) return;
-            std.Thread.yield() catch {};
+            self.gate.waitFrom(seen, 2_000);
         }
     }
 

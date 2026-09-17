@@ -482,6 +482,14 @@ pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8
 
 /// Stage the base's eager call resolutions before `buildStdlibBase` lowers the
 /// bodies; an unproven composable call bakes without its `($composer, $changed)`.
+/// The stage as the build runs it, beside its own table passes.
+const StageCtx = struct { gpa: Allocator };
+
+fn stageJobRun(ctx: *anyopaque, files: []const KotlinFile) void {
+    const c: *const StageCtx = @ptrCast(@alignCast(ctx));
+    stageBaseEagerCalls(c.gpa, files);
+}
+
 fn stageBaseEagerCalls(gpa: Allocator, asts: []const KotlinFile) void {
     if (std.mem.eql(u8, runtime.envOnce("KLIO_STDLIB_CHECK") orelse "1", "0")) return;
     // The base's own sources are the whole universe for calls inside them, so a
@@ -496,6 +504,9 @@ fn stageBaseEagerCalls(gpa: Allocator, asts: []const KotlinFile) void {
         if (ir_mod.pending_eager_calls) |*old| old.deinit();
         ir_mod.pending_eager_calls = ec;
     }
+    // The tables sit in this thread's storage; the build, on its own thread
+    // with its module already made, adopts them from here after the join.
+    ir_mod.staged_picks = ir_mod.takePendingPicks();
     trace(gpa, "  stage total: {d}ms", .{(runtime.clockMonotonicNanos() - t0) / 1_000_000});
 }
 
@@ -834,6 +845,7 @@ pub fn tryPrepare(
 }
 
 fn tracePreBake(gpa: Allocator, t0: u64, t_hash: u64, t_packs: u64) void {
+    runtime.prof.phaseMark("before bake");
     trace(gpa, "  before bake: key {d}ms, user+packs {d}ms, meta {d}ms", .{
         (t_hash - t0) / 1_000_000,
         (t_packs - t_hash) / 1_000_000,
@@ -946,14 +958,18 @@ fn finishFromLoaded(
 
     const te0 = runtime.clockMonotonicNanos();
     publishExternDecls(gpa, loaded.base);
+    runtime.prof.phaseMark("extend extern");
     const te_extern = runtime.clockMonotonicNanos();
     publishBaseEagerCalls(gpa, loaded.base);
+    runtime.prof.phaseMark("extend eager");
     const te_eager = runtime.clockMonotonicNanos();
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    runtime.prof.phaseMark("extend user-check");
     const te_user_check = runtime.clockMonotonicNanos();
     span.active_map = map;
     // Loaded for this run alone: nothing reads the base after this.
     const built = interp_ir.build.buildModuleFilesExtendOwned(gpa, loaded.base, user2.asts) catch return null;
+    runtime.prof.phaseMark("extend build");
     trace(gpa, "  extend: extern {d}ms, eager {d}ms, user-check {d}ms, build {d}ms", .{
         (te_extern - te0) / 1_000_000,
         (te_eager - te_extern) / 1_000_000,
@@ -1076,6 +1092,7 @@ fn bakeAndPrepare(
         .exclude_lib_ids = project.ownLibraryExclusion(ba, paths),
         .declared_lib_ids = project.declaredDependencyIds(ba, paths),
     });
+    runtime.prof.phaseMark("parse");
     const tb_parse = runtime.clockMonotonicNanos();
     {
         const t = report.timing;
@@ -1115,9 +1132,10 @@ fn bakeAndPrepare(
     }
 
     if (takeAbandonedBake(gpa, image_path)) trace(gpa, "the previous bake of {s} did not finish; baking again", .{hex});
-    const tb_pre = runtime.clockMonotonicNanos();
-    stageBaseEagerCalls(ba, deps.asts);
     const tb_stage = runtime.clockMonotonicNanos();
+    // The build runs the stage on a thread beside its table passes.
+    var stage_ctx = StageCtx{ .gpa = ba };
+    interp_ir.build.setStageJob(.{ .ctx = @ptrCast(&stage_ctx), .run = stageJobRun });
     // The loader lists the packs' ASTs first and the stdlib's last; over a
     // layer only the packs lower, and the stage's stdlib files must be the
     // image's, in the same order, for its picks to name what the lowering
@@ -1135,16 +1153,15 @@ fn bakeAndPrepare(
         return null;
     };
     base.user_file_start = @intCast(dep_map.files.items.len);
+    // A build that never reached its fork point leaves the stage to run here.
+    if (interp_ir.build.takeStageJob()) |job| job.run(job.ctx, deps.asts);
 
     // The only run where the base's sources exist; the results ride the image.
     checkBaseSources(ba, base, deps.asts);
     // Dead bodies are blanked so the bake skips them; the heap frees them.
     interp_ir.build.stripStdlibBaseKeep(base);
     const tb_build = runtime.clockMonotonicNanos();
-    trace(gpa, "  lower: stage {d}ms, build {d}ms", .{
-        (tb_stage - tb_pre) / 1_000_000,
-        (tb_build - tb_stage) / 1_000_000,
-    });
+    trace(gpa, "  lower: build {d}ms with the stage beside it", .{(tb_build - tb_stage) / 1_000_000});
 
     // The marker outlives a process that dies before the image lands, so the
     // next cold run says so rather than staying cold in silence.
@@ -1158,6 +1175,7 @@ fn bakeAndPrepare(
         trace(gpa, "unbakeable {s} (outside serializable surface)", .{hex});
         return null;
     };
+    runtime.prof.phaseMark("bake finish");
     const tb_bake = runtime.clockMonotonicNanos();
     publishImage(gpa, cache, image_path, bytes);
     trace(gpa, "baked {s} ({d} bytes, {d} inline forest nodes; parse {d}ms, lower {d}ms, bake {d}ms)", .{
@@ -1165,7 +1183,7 @@ fn bakeAndPrepare(
         bytes.len,
         interp_ir.image.inline_forest_nodes,
         (tb_parse - tb0) / 1_000_000,
-        (tb_build - tb_pre) / 1_000_000,
+        (tb_build - tb_stage) / 1_000_000,
         (tb_bake - tb_build) / 1_000_000,
     });
 
@@ -1176,10 +1194,12 @@ fn bakeAndPrepare(
         trace(gpa, "the baked image does not load: {s}", .{image.lastLoadFailure()});
         return null;
     };
+    runtime.prof.phaseMark("load");
     const tb_load = runtime.clockMonotonicNanos();
     const heap_bytes = heap.mapped.load(.monotonic);
     dropBuildHeap(heap);
     heap_released = true;
+    runtime.prof.phaseMark("drop build heap");
     const tb_drop = runtime.clockMonotonicNanos();
     trace(gpa, "  dropped the build heap: {d}mb in {d}us", .{ heap_bytes / (1024 * 1024), (tb_drop - tb_load) / 1000 });
     const out = finishFromLoaded(gpa, loaded, user, paths, bindings);
@@ -1296,8 +1316,10 @@ pub fn bundleBaseImage(
     }
 
     // Same bake-time staging and check as `bakeAndPrepare`, the other from-source path.
-    stageBaseEagerCalls(gpa, deps.asts);
+    var stage_ctx = StageCtx{ .gpa = gpa };
+    interp_ir.build.setStageJob(.{ .ctx = @ptrCast(&stage_ctx), .run = stageJobRun });
     const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse return null;
+    if (interp_ir.build.takeStageJob()) |job| job.run(job.ctx, deps.asts);
     base.user_file_start = @intCast(deps.map.files.items.len);
     checkBaseSources(gpa, base, deps.asts);
     const bytes = (image.bake(gpa, gpa, base, deps.map, .{

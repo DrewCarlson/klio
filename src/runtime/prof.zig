@@ -11,18 +11,39 @@ const cpu_context = std.debug.cpu_context;
 
 const MAX_SAMPLES = 1 << 22; // 4M slots; overflow simply stops recording.
 
+/// The sampler runs on Linux and on Darwin; both deliver SIGPROF from an
+/// ITIMER_PROF interval timer.
+const sampler_os = builtin.os.tag == .linux or builtin.os.tag.isDarwin();
+
+/// Arms (or with 0 disarms) the profiling interval timer at `usec`.
+fn armTimer(usec: i64) void {
+    if (builtin.os.tag == .linux) {
+        // The kernel reads `setitimer`'s second field as MICROseconds.
+        const its = linux.itimerspec{
+            .it_interval = .{ .sec = @divFloor(usec, 1_000_000), .nsec = @mod(usec, 1_000_000) },
+            .it_value = .{ .sec = @divFloor(usec, 1_000_000), .nsec = @mod(usec, 1_000_000) },
+        };
+        _ = linux.setitimer(@intFromEnum(linux.ITIMER.PROF), &its, null);
+    } else if (builtin.os.tag.isDarwin()) {
+        const tv: std.c.timeval = .{ .sec = @intCast(@divFloor(usec, 1_000_000)), .usec = @intCast(@mod(usec, 1_000_000)) };
+        _ = setitimer(ITIMER_PROF_C, &.{ .it_interval = tv, .it_value = tv }, null);
+    }
+}
+
 /// `mmap`ed by `maybeStart`, never static arrays: at 32 MB apiece a Debug
 /// build's `undefined` poison pattern would keep them out of `.bss`.
 var samples: ?[*]usize = null;
 /// Caller PC one frame up, 0 when unavailable, for `KLIO_PROF_CALLERS`.
 var callers: ?[*]usize = null;
 var callers2: ?[*]usize = null;
+/// The phase index each sample fell in, for `phaseMark`.
+var phases: ?[*]u32 = null;
 
 fn allocTables() bool {
     const bytes = MAX_SAMPLES * @sizeOf(usize);
     const m = std.posix.mmap(
         null,
-        bytes * 3,
+        bytes * 3 + MAX_SAMPLES * @sizeOf(u32),
         .{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
@@ -32,25 +53,79 @@ fn allocTables() bool {
     samples = base;
     callers = base + MAX_SAMPLES;
     callers2 = base + 2 * MAX_SAMPLES;
+    phases = @ptrCast(base + 3 * MAX_SAMPLES);
     return true;
+}
+
+const MAX_PHASES = 1024;
+var phase_names: [MAX_PHASES][]const u8 = undefined;
+var phase_idx: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+/// Ends the current phase under `name`: the samples taken since the previous
+/// mark report under it. Cheap enough to call whether or not the sampler
+/// runs; the passes of a build and the steps of a cold run call it.
+pub fn phaseMark(name: []const u8) void {
+    const i = phase_idx.load(.monotonic);
+    if (i < MAX_PHASES) phase_names[i] = name;
+    phase_idx.store(i + 1, .monotonic);
 }
 var count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var active: bool = false;
 
+/// Darwin's arm64 signal context: the program counter sits in the machine
+/// context the ucontext points at.
+const DarwinUcontextArm64 = extern struct {
+    _onstack: i32,
+    _sigmask: std.c.sigset_t,
+    _stack: std.c.stack_t,
+    _link: ?*anyopaque,
+    _mcsize: u64,
+    mcontext: *extern struct {
+        _far: u64 align(16),
+        _esr: u64,
+        x: [30]u64,
+        lr: u64,
+        sp: u64,
+        pc: u64,
+    },
+};
+
+/// The interrupted instruction pointer, 0 when the context is unreadable.
+fn pcFromContext(ctx: ?*anyopaque) usize {
+    if (builtin.os.tag.isDarwin() and builtin.cpu.arch == .aarch64) {
+        const uc: *const DarwinUcontextArm64 = @ptrCast(@alignCast(ctx orelse return 0));
+        return @intCast(uc.mcontext.pc);
+    }
+    const cc = cpu_context.fromPosixSignalContext(ctx) orelse return 0;
+    return cc.getPc();
+}
+
+/// The link register on arm64 Darwin: in a leaf such as memcpy it is the
+/// return address, so the sample names the copy's caller.
+fn lrFromContext(ctx: ?*anyopaque) usize {
+    if (builtin.os.tag.isDarwin() and builtin.cpu.arch == .aarch64) {
+        const uc: *const DarwinUcontextArm64 = @ptrCast(@alignCast(ctx orelse return 0));
+        return @intCast(uc.mcontext.lr);
+    }
+    return 0;
+}
+
 fn handler(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
     _ = sig;
     _ = info;
-    const cc = cpu_context.fromPosixSignalContext(ctx) orelse return;
-    const pc = cc.getPc();
+    const pc = pcFromContext(ctx);
+    if (pc == 0) return;
     const sm = samples orelse return;
     const c1 = callers orelse return;
     const c2 = callers2 orelse return;
+    const ph = phases orelse return;
     const i = count.fetchAdd(1, .monotonic);
     if (i < MAX_SAMPLES) {
         sm[i] = pc;
         const pair = callerPcsFromContext(ctx);
-        c1[i] = pair[0];
+        c1[i] = if (pair[0] != 0) pair[0] else lrFromContext(ctx);
         c2[i] = pair[1];
+        ph[i] = phase_idx.load(.monotonic);
     }
 }
 
@@ -95,7 +170,10 @@ fn callerPcsFromContext(ctx: ?*anyopaque) [2]usize {
 
 /// Interval defaults to 1ms; `KLIO_PROF=<usec>` overrides.
 pub fn maybeStart() void {
-    if (builtin.os.tag != .linux) return;
+    if (!sampler_os) return;
+    // Started once for the process: a later call from the run command must
+    // not remap the sample buffer under a running timer.
+    if (active) return;
     const env = if (builtin.link_libc) (std.c.getenv("KLIO_PROF") orelse return) else return;
     const env_s = std.mem.span(env);
     var usec: i64 = 1000;
@@ -111,12 +189,7 @@ pub fn maybeStart() void {
         .flags = posix.SA.SIGINFO | posix.SA.RESTART,
     };
     posix.sigaction(.PROF, &act, null);
-    // The kernel reads `setitimer`'s second field as MICROseconds.
-    const its = linux.itimerspec{
-        .it_interval = .{ .sec = @divFloor(usec, 1_000_000), .nsec = @mod(usec, 1_000_000) },
-        .it_value = .{ .sec = @divFloor(usec, 1_000_000), .nsec = @mod(usec, 1_000_000) },
-    };
-    _ = linux.setitimer(@intFromEnum(linux.ITIMER.PROF), &its, null);
+    armTimer(usec);
 }
 
 const NameCount = struct { name: []const u8, count: u32 };
@@ -232,14 +305,10 @@ pub fn opProfCounts() ?*const [OP_SLOTS]std.atomic.Value(u64) {
 }
 
 pub fn maybeReport() void {
-    if (builtin.os.tag != .linux) return;
+    if (!sampler_os) return;
     if (!active) return;
     active = false;
-    const zero = linux.itimerspec{
-        .it_interval = .{ .sec = 0, .nsec = 0 },
-        .it_value = .{ .sec = 0, .nsec = 0 },
-    };
-    _ = linux.setitimer(@intFromEnum(linux.ITIMER.PROF), &zero, null);
+    armTimer(0);
 
     const total = @min(count.load(.monotonic), MAX_SAMPLES);
     if (total == 0) {
@@ -304,19 +373,36 @@ pub fn maybeReport() void {
         const RawPc = struct {
             addr: usize,
             count: u32,
+            phase: u32,
+            caller: usize,
             fn lt(_: void, a: @This(), b: @This()) bool {
                 return a.count > b.count;
             }
         };
+        const RawKey = struct { addr: usize, phase: u32, caller: usize };
+        var raw_counts = std.AutoHashMap(RawKey, u32).init(gpa);
+        defer raw_counts.deinit();
+        const ph = (phases orelse return)[0..total];
+        const cl = (callers orelse return)[0..total];
+        for (sm, ph, cl) |pc, phase, caller| {
+            const e = raw_counts.getOrPut(.{ .addr = pc, .phase = phase, .caller = caller }) catch continue;
+            if (e.found_existing) e.value_ptr.* += 1 else e.value_ptr.* = 1;
+        }
         var raw_list = std.ArrayList(RawPc).empty;
         defer raw_list.deinit(gpa);
-        var rit = addr_counts.iterator();
-        while (rit.next()) |e| raw_list.append(gpa, .{ .addr = e.key_ptr.*, .count = e.value_ptr.* }) catch {};
+        var rit = raw_counts.iterator();
+        while (rit.next()) |e| raw_list.append(gpa, .{ .addr = e.key_ptr.addr, .count = e.value_ptr.*, .phase = e.key_ptr.phase, .caller = e.key_ptr.caller }) catch {};
         std.mem.sort(RawPc, raw_list.items, {}, RawPc.lt);
-        std.debug.print("[prof-raw] top unique PCs:\n", .{});
+        const n_phases = @min(phase_idx.load(.monotonic), MAX_PHASES);
+        for (phase_names[0..n_phases], 0..) |name, i| std.debug.print("[prof-phase] {d} {s}\n", .{ i, name });
+        // `KLIO_PROF_RAW=<n>` prints the n most sampled PCs (default 10) with
+        // the handler's own address, so an offline symbolizer can slide them.
+        const raw_env = std.mem.span(std.c.getenv("KLIO_PROF_RAW").?);
+        const raw_limit: usize = std.fmt.parseInt(usize, raw_env, 10) catch 10;
+        std.debug.print("[prof-raw] top unique PCs (anchor handler=0x{x}):\n", .{@intFromPtr(&handler)});
         for (raw_list.items, 0..) |rc, i| {
-            if (i >= 10) break;
-            std.debug.print("  0x{x}  {d}\n", .{ rc.addr, rc.count });
+            if (i >= raw_limit) break;
+            std.debug.print("  0x{x}  {d}  {d}  0x{x}\n", .{ rc.addr, rc.count, rc.phase, rc.caller });
         }
     }
 

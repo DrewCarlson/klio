@@ -163,13 +163,22 @@ pub fn releaseAll(h: *Heap) void {
     // The collector's lists may still name cells minted on the heap.
     gc.forgetRanges(h.regions.items);
     var bytes: usize = 0;
-    for (h.regions.items) |r| {
-        const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(r.start);
-        std.posix.munmap(p[0..r.len]);
-        bytes += r.len;
-        _ = unmap_calls.fetchAdd(1, .monotonic);
-    }
+    for (h.regions.items) |r| bytes += r.len;
     const n = h.regions.items.len;
+    // Nothing reads the heap after this, so the unmapping itself, a few
+    // milliseconds of kernel work, runs on a thread of its own while the
+    // program starts; the regions stay mapped and harmless until then.
+    const deferred = std.heap.page_allocator.dupe(Region, h.regions.items) catch null;
+    if (deferred) |list| {
+        if (std.Thread.spawn(.{ .stack_size = 64 * 1024 }, unmapRegionsThread, .{list})) |t| {
+            t.detach();
+        } else |_| {
+            unmapRegions(list);
+            std.heap.page_allocator.free(list);
+        }
+    } else {
+        unmapRegions(h.regions.items);
+    }
     h.regions.clearRetainingCapacity();
     h.regions_lock.unlock();
     _ = mapped_bytes.fetchSub(bytes, .monotonic);
@@ -177,6 +186,19 @@ pub fn releaseAll(h: *Heap) void {
     const regions = h.regions;
     h.* = .{ .id = h.id, .track_regions = h.track_regions, .regions = regions };
     if (h == &build_heap) build_heap_taken = false;
+}
+
+fn unmapRegions(regions: []const Region) void {
+    for (regions) |r| {
+        const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(r.start);
+        std.posix.munmap(p[0..r.len]);
+        _ = unmap_calls.fetchAdd(1, .monotonic);
+    }
+}
+
+fn unmapRegionsThread(regions: []Region) void {
+    unmapRegions(regions);
+    std.heap.page_allocator.free(regions);
 }
 
 /// Bytes the build heap holds now, for the traces.

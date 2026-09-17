@@ -404,10 +404,18 @@ pub fn inlineMemberOwner(f: *const ast.Function) ?[]const u8 {
 }
 
 fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
+    // Every call site asks; a name with no inline candidate, the common
+    // case, is remembered as an empty slice so it costs one lookup.
     if (inline_fn_asts_resolved) |*r| {
-        if (r.get(name)) |cached| return cached;
+        if (r.get(name)) |cached| return if (cached.len == 0) null else cached;
     }
-    const fields = (if (inline_fn_asts) |*c| c.get(name) else null) orelse return null;
+    const fields = (if (inline_fn_asts) |*c| c.get(name) else null) orelse {
+        if (inline_fn_asts_resolved == null) {
+            inline_fn_asts_resolved = std.StringHashMap([]const *const ast.Function).init(runtime.slab.allocator);
+        }
+        inline_fn_asts_resolved.?.put(name, &.{}) catch {};
+        return null;
+    };
     // Resolve this name's candidates once, decoding only their forest decls, and
     // cache the pointer slice so the picking logic stays pointer-based.
     const a = runtime.slab.allocator;

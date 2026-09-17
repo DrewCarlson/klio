@@ -448,6 +448,9 @@ pub const FuncBuilder = struct {
     /// A lambda declared receiverless: the enclosing tier is its next receiver link.
     own_recv_known_none: bool = false,
     blocks: std.ArrayList(Block) = .empty,
+    /// Per block, the list its instructions grow in; `blocks[i].insts` is a
+    /// view of `inst_lists[i].items` until `finish` sizes it exactly.
+    inst_lists: std.ArrayList(std.ArrayListUnmanaged(Inst)) = .empty,
     cur: BlockId,
     next_reg: u32,
     /// Forwarded splice lambda literals `finish` can nop when no read remains.
@@ -775,14 +778,16 @@ pub const FuncBuilder = struct {
             .terminator = .{ .Return = null },
         };
         try self.blocks.append(allocator, entry);
+        try self.inst_lists.append(allocator, .empty);
         try self.scopes.append(allocator, StringRegMap.init(allocator));
         return self;
     }
 
     pub fn deinit(self: *FuncBuilder) void {
         const a = self.allocator;
+        for (self.inst_lists.items) |*l| l.deinit(a);
+        self.inst_lists.deinit(a);
         for (self.blocks.items) |*b| {
-            if (b.insts.len != 0) a.free(b.insts);
             if (b.handlers) |hs| {
                 if (hs.catches.len != 0) a.free(hs.catches);
                 a.destroy(hs);
@@ -1241,13 +1246,7 @@ pub const FuncBuilder = struct {
         const dst = self.capture_regs.get(name).?;
         if (!self.capture_loads_emitted.contains(name)) {
             try self.capture_loads_emitted.put(name, {});
-            const b0 = &self.blocks.items[0];
-            const old = b0.insts;
-            const new = try self.allocator.alloc(Inst, old.len + 1);
-            @memcpy(new[0..old.len], old);
-            new[old.len] = .{ .LoadCapture = .{ .dst = dst, .idx = idx } };
-            if (old.len != 0) self.allocator.free(old);
-            b0.insts = new;
+            try self.pushInto(BlockId.from(0), .{ .LoadCapture = .{ .dst = dst, .idx = idx } });
         }
         return dst;
     }
@@ -2730,6 +2729,7 @@ pub const FuncBuilder = struct {
             .insts = &.{},
             .terminator = .Unreachable,
         });
+        try self.inst_lists.append(self.allocator, .empty);
         return id;
     }
 
@@ -2845,14 +2845,14 @@ pub const FuncBuilder = struct {
                 else => {},
             }
         }
-        const cur = self.cur.int();
-        const block = &self.blocks.items[cur];
-        const old = block.insts;
-        const new = try self.allocator.alloc(Inst, old.len + 1);
-        @memcpy(new[0..old.len], old);
-        new[old.len] = inst;
-        if (old.len != 0) self.allocator.free(old);
-        block.insts = new;
+        try self.pushInto(self.cur, inst);
+    }
+
+    /// Appends to a block's list and refreshes the block's view of it.
+    fn pushInto(self: *FuncBuilder, b: BlockId, inst: Inst) Allocator.Error!void {
+        const list = &self.inst_lists.items[b.int()];
+        try list.append(self.allocator, inst);
+        self.blocks.items[b.int()].insts = list.items;
     }
 
     /// Copy-coalescing peephole run once at `finish`: an instruction defining a
@@ -2906,8 +2906,10 @@ pub const FuncBuilder = struct {
                 w += 1;
             }
             if (!fused_any) continue;
-            // Exact-size reallocation: the slice frees by its allocated length,
-            // so an in-place shrink would corrupt a size-checked allocator.
+            if (self.allocator.resize(blk.insts, w)) {
+                blk.insts.len = w;
+                continue;
+            }
             const out = self.allocator.alloc(ir.Inst, w) catch continue;
             @memcpy(out, blk.insts[0..w]);
             self.allocator.free(blk.insts);
@@ -2987,6 +2989,11 @@ pub const FuncBuilder = struct {
         self.elideDeadForwardedLambdas();
         const n_locals = self.next_reg;
         const blocks = try self.blocks.toOwnedSlice(self.allocator);
+        // Each block owns an exactly sized slice from here: the slices free
+        // by their length, and the spare capacity of the lists would hold
+        // tens of megabytes across the stdlib's blocks.
+        for (blocks, self.inst_lists.items) |*b, *list| b.insts = try list.toOwnedSlice(self.allocator);
+        self.inst_lists.clearRetainingCapacity();
         self.fuseSingleUseMoves(blocks);
         self.blocks = .empty;
         const capture_order = try self.allocator.dupe([]const u8, self.capture_order.items);

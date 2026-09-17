@@ -3463,12 +3463,19 @@ pub fn computeEagerCallsOpts(
         return null;
     };
     defer r.deinit();
+    runtime.prof.phaseMark("stage resolve");
     const t_stage1 = runtime.clockMonotonicNanos();
     var tc = typeck.typecheckModuleOpts(ca, combined, &r, .{ .body_threads = typeckThreads(), .diagnostics = opts.diagnostics }) catch {
         if (audit) std.debug.print("[EAGER] typeck failed; staying lazy\n", .{});
         return null;
     };
-    defer tc.deinit(ca);
+    defer {
+        // The workers' arenas sit on the page allocator; their unmapping runs
+        // on a thread of its own while the build goes on.
+        if (tc.takeArenas(ca)) |arenas| runtime.janitor.releaseArenas(arenas);
+        tc.deinit(ca);
+    }
+    runtime.prof.phaseMark("stage check");
     const t_check_end = runtime.clockMonotonicNanos();
     const tracing = runtime.envOnce("KLIO_TRACE_STDLIB_IMAGE") != null;
     if (tracing) {
@@ -3586,6 +3593,7 @@ pub fn computeEagerCallsOpts(
     while (pit.next()) |e| pout.put(e.key_ptr.*, .{ .has_receiver = e.value_ptr.has_receiver, .arity = e.value_ptr.arity }) catch {};
     if (audit) std.debug.print("[EAGER] {d} param shapes recorded\n", .{pout.count()});
     ir.pending_eager_param_shapes = pout;
+    runtime.prof.phaseMark("stage tables");
     if (tracing) std.debug.print("[stdlib-image]   stage tables: {d}ms\n", .{(runtime.clockMonotonicNanos() - t_check_end) / 1_000_000});
     return out;
 }
@@ -3645,15 +3653,19 @@ fn tryImagePath(
     defer runtime.setReclaim(prev_reclaim);
     const t_prep0 = runtime.clockMonotonicNanos();
     const prepared = stdlib_image.tryPrepare(gpa, paths, features) orelse return null;
+    runtime.prof.phaseMark("prepare tail");
     const t_prep1 = runtime.clockMonotonicNanos();
     const msg = if (paths.len == 1) "error: no main function found" else "runtime error: no main function in module";
     const code = runBuiltModule(gpa, prepared.built, prepared.bindings, prepared.map, msg);
+    runtime.prof.phaseMark("execute");
     stdlib_image.finishBackgroundBake();
     if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
-        std.debug.print("[run] startup {d}ms, prepare {d}ms, execute {d}ms (rss {d}mb)\n", .{
+        const t_end = runtime.clockMonotonicNanos();
+        std.debug.print("[run] startup {d}ms, prepare {d}ms, execute {d}ms, {d}ms after start (rss {d}mb)\n", .{
             (t_prep0 -| runtime.process_start_ns) / 1_000_000,
             (t_prep1 - t_prep0) / 1_000_000,
-            (runtime.clockMonotonicNanos() - t_prep1) / 1_000_000,
+            (t_end - t_prep1) / 1_000_000,
+            (t_end -| runtime.process_start_ns) / 1_000_000,
             (runtime.currentRssKb() orelse 0) / 1024,
         });
     }

@@ -51,27 +51,18 @@ pub fn init(allocator: Allocator) Module {
         .member_name_index = StrPairMap(std.ArrayList(FuncId)).init(allocator),
         .method_dispatch = std.AutoHashMap(u64, FuncId).init(allocator),
     };
-    if (root_ir.pending_eager_call_fids) |pf| {
-        out__.eager_call_fids = pf;
-        root_ir.pending_eager_call_fids = null;
-    }
-    if (root_ir.pending_eager_calls) |pec| {
-        out__.eager_calls = pec;
-        root_ir.pending_eager_calls = null;
-    }
-    if (root_ir.pending_eager_types) |pet| {
-        out__.eager_types = pet;
-        root_ir.pending_eager_types = null;
-    }
-    if (root_ir.pending_eager_recv_heads) |per| {
-        out__.eager_recv_heads = per;
-        root_ir.pending_eager_recv_heads = null;
-    }
-    if (root_ir.pending_eager_param_shapes) |pep| {
-        out__.eager_param_shapes = pep;
-        root_ir.pending_eager_param_shapes = null;
-    }
+    out__.adoptPicks(root_ir.takePendingPicks());
     return out__;
+}
+
+/// Takes the stage's pick tables the module lowers its bodies with; each
+/// table given replaces the one held.
+pub fn adoptPicks(self: *Module, p: root_ir.StagedPicks) void {
+    if (p.call_fids) |m| self.eager_call_fids = m;
+    if (p.calls) |m| self.eager_calls = m;
+    if (p.types) |m| self.eager_types = m;
+    if (p.recv_heads) |m| self.eager_recv_heads = m;
+    if (p.param_shapes) |m| self.eager_param_shapes = m;
 }
 
 pub fn default(allocator: Allocator) Module {

@@ -149,6 +149,19 @@ pub const buildStdlibBaseUnstripped = build_base.buildStdlibBaseUnstripped;
 pub const buildStdlibBaseOnTop = build_base.buildStdlibBaseOnTop;
 pub const stripStdlibBase = build_base.stripBase;
 pub const stripStdlibBaseKeep = build_base.stripBaseKeep;
+pub const StageJob = build_overrides.StageJob;
+
+/// Hands the next build a stage to run beside its table passes.
+pub fn setStageJob(job: StageJob) void {
+    build_overrides.stage_job = job;
+}
+
+/// The stage the last build did not reach, if any, for the caller to run.
+pub fn takeStageJob() ?StageJob {
+    const job = build_overrides.stage_job;
+    build_overrides.stage_job = null;
+    return job;
+}
 const parentCtorParamExpected = build_base.parentCtorParamExpected;
 const irTypeToAstInstantiated = build_base.irTypeToAstInstantiated;
 pub const buildProgramBase = build_base.buildProgramBase;

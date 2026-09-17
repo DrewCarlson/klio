@@ -97,7 +97,11 @@ fn cliBody(ctx: CliCtx) u8 {
 }
 
 fn runCli(a: std.mem.Allocator, args: std.process.Args) u8 {
-    return runtime.runOnBigStackMainThread(CliCtx, u8, cliBody, .{ .a = a, .args = args });
+    const rc = runtime.runOnBigStackMainThread(CliCtx, u8, cliBody, .{ .a = a, .args = args });
+    if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+        std.debug.print("[run] back in main {d}ms after start\n", .{(runtime.clockMonotonicNanos() -| runtime.process_start_ns) / 1_000_000});
+    }
+    return rc;
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {

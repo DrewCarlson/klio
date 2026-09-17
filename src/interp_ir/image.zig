@@ -1121,6 +1121,7 @@ pub fn bake(
     const bake_trace = runtime.envSetOnce("KLIO_TRACE_BAKE");
     var tb = runtime.clockMonotonicNanos();
     const root = (try rootFromBase(a, base, map, extras)) orelse return null;
+    runtime.prof.phaseMark("bake root");
     if (bake_trace) tb = bakeMark("root", tb);
 
     // Defer `inline`, object-free bodies into a side section, each replaced by
@@ -1144,6 +1145,7 @@ pub fn bake(
             } } };
         }
     }
+    runtime.prof.phaseMark("bake inline bodies");
     if (bake_trace) tb = bakeMark("inline bodies", tb);
 
     // Defer AST-free `blocks` likewise, recording `offset + 1` per func.
@@ -1165,6 +1167,7 @@ pub fn bake(
             f.blocks = &.{};
         }
     }
+    runtime.prof.phaseMark("bake func blocks");
     if (bake_trace) tb = bakeMark("func blocks", tb);
 
     // Per-func headers, decoded on first `funcById`, plus the bodyless-id list
@@ -1197,6 +1200,7 @@ pub fn bake(
         root.func_fqn_heads = try head_list.toOwnedSlice(a);
         root.module.funcs = &.{};
     }
+    runtime.prof.phaseMark("bake func headers");
     if (bake_trace) tb = bakeMark("func headers", tb);
 
     // Per-decl sections, emitted after the deferral so they capture the final
@@ -1214,6 +1218,7 @@ pub fn bake(
         root.lifted_decl_offsets = offsets;
         root.has_composables = base.has_composables;
     }
+    runtime.prof.phaseMark("bake lifted decls");
     if (bake_trace) tb = bakeMark("lifted decls", tb);
     {
         var names = std.StringHashMap(void).init(gpa);
@@ -1362,6 +1367,7 @@ pub fn bake(
     // everything load reads, and a still-raw forest pointer inline-encodes.
     root.lifted_decls = &.{};
 
+    runtime.prof.phaseMark("bake tables");
     if (bake_trace) tb = bakeMark("tables", tb);
     // The payload is mostly the sections and the sources copied through, so
     // their sum sizes the buffer once, on the allocator the bytes are kept on.
@@ -1372,10 +1378,15 @@ pub fn bake(
         e.nodes.deinit();
         e.slices.deinit();
     }
+    // The tables encode to about a third of the sections' bytes; a buffer
+    // that grew once more would copy the whole image, and the slice registry
+    // fills to some sixty thousand entries.
     var estimate: usize = 1 << 20;
-    estimate += root.deferred_bodies.len + root.module.deferred_func_section.len + root.func_header_section.len + root.lifted_decl_section.len;
+    const sections = root.deferred_bodies.len + root.module.deferred_func_section.len + root.func_header_section.len + root.lifted_decl_section.len;
+    estimate += sections + sections / 2;
     for (root.files) |f| estimate += f.source.len + f.path.len;
     try e.out.ensureTotalCapacity(out_a, estimate);
+    try e.slices.ensureTotalCapacity(1 << 17);
 
     try e.bytes(MAGIC);
     try e.bytes(&std.mem.toBytes(std.mem.nativeToLittle(u32, FORMAT_VERSION)));
@@ -1384,11 +1395,25 @@ pub fn bake(
     const payload_start = e.out.items.len;
     bake_forest_map = &forest_map;
     defer bake_forest_map = null;
-    try encodeValue(ImageRoot, &e, root);
+    // Field by field, which encodes the same bytes as the struct and lets the
+    // trace attribute the root's time.
+    inline for (@typeInfo(ImageRoot).@"struct".fields) |f| {
+        const tf = if (bake_trace) runtime.clockMonotonicNanos() else 0;
+        const before = e.out.items.len;
+        try encodeValue(f.type, &e, &@field(root.*, f.name));
+        if (bake_trace) {
+            const us = (runtime.clockMonotonicNanos() - tf) / 1000;
+            if (us >= 100) std.debug.print("[bake]   root.{s}: {d}us, {d} bytes\n", .{ f.name, us, e.out.items.len - before });
+        }
+    }
     const payload_len: u64 = e.out.items.len - payload_start;
     @memcpy(e.out.items[len_slot .. len_slot + 8], &std.mem.toBytes(std.mem.nativeToLittle(u64, payload_len)));
     try e.bytes(TRAILER);
-    if (bake_trace) tb = bakeMark("root encode", tb);
+    runtime.prof.phaseMark("bake root encode");
+    if (bake_trace) {
+        tb = bakeMark("root encode", tb);
+        std.debug.print("[bake]   root registries: {d} slices, {d} nodes; {d} of {d} bytes reserved\n", .{ e.slice_count, e.node_count, e.out.items.len, e.out.capacity });
+    }
 
     for (saved.items) |s| s.f.body = s.body;
     for (fn_saved.items) |s| {
@@ -2232,13 +2257,23 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
     const snap0 = runtime.allocTrackSnapshot();
     var d = Decoder{ .a = a, .buf = bytes[payload_start .. payload_start + payload_len] };
     const root = a.create(ImageRoot) catch return error.OutOfMemory;
-    decodeInto(ImageRoot, &d, root) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Malformed => {
-            load_failure = "malformed payload";
-            return null;
-        },
-    };
+    const load_trace = runtime.envSetOnce("KLIO_TRACE_BAKE");
+    // Field by field, the same bytes as the struct, so the trace attributes
+    // the root's time.
+    inline for (@typeInfo(ImageRoot).@"struct".fields) |f| {
+        const tf = if (load_trace) runtime.clockMonotonicNanos() else 0;
+        decodeInto(f.type, &d, &@field(root.*, f.name)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Malformed => {
+                load_failure = "malformed payload";
+                return null;
+            },
+        };
+        if (load_trace) {
+            const us = (runtime.clockMonotonicNanos() - tf) / 1000;
+            if (us >= 100) std.debug.print("[load]   root.{s}: {d}us\n", .{ f.name, us });
+        }
+    }
     if (d.pos != d.buf.len) {
         load_failure = "trailing payload bytes";
         return null;
@@ -2252,7 +2287,9 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
     }
 
     const snap1 = runtime.allocTrackSnapshot();
+    const tb = if (load_trace) runtime.clockMonotonicNanos() else 0;
     const loaded = try baseFromRoot(a, root, slot);
+    if (load_trace) std.debug.print("[load]   baseFromRoot: {d}us\n", .{(runtime.clockMonotonicNanos() - tb) / 1000});
     runtime.allocTrackReportPhase("image.baseFromRoot", snap1);
     if (loaded == null) load_failure = "inconsistent tables";
     return loaded;

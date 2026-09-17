@@ -111,6 +111,7 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .types_journal = .empty,
         .body_threads = 1,
         .worker_arenas = .empty,
+        .worker_scratch = .empty,
         .names = std.StringHashMap(void).init(allocator),
     };
 }
@@ -3500,7 +3501,7 @@ fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
     const workers = try a.alloc(Worker, workers_n);
     defer a.free(workers);
     var forked: usize = 0;
-    defer for (workers[0..forked]) |*w| releaseWorker(w);
+    defer for (workers[0..forked]) |*w| releaseWorker(self, w);
     for (workers) |*w| {
         // Everything the worker allocates lives in an arena the result owns.
         const arena = try a.create(std.heap.ArenaAllocator);
@@ -3675,11 +3676,13 @@ fn mergeWorkers(self: *Checker, workers: []Worker, main_ranges: []const DiagRang
 
 /// Frees a worker's scratch. Its results and everything else it allocated
 /// live in its arena, which the result now owns.
-fn releaseWorker(w: *Worker) void {
+/// A worker's scratch arenas join the result's list rather than freeing
+/// here: the caller releases them all at once, off the critical path.
+fn releaseWorker(self: *Checker, w: *Worker) void {
     const c = &w.checker;
-    c.query_scratch.deinit();
+    self.worker_scratch.append(self.allocator, c.query_scratch.*) catch c.query_scratch.deinit();
     c.allocator.destroy(c.query_scratch);
-    c.solve_memo.arena.deinit();
+    self.worker_scratch.append(self.allocator, c.solve_memo.arena) catch c.solve_memo.arena.deinit();
     c.allocator.destroy(c.solve_memo);
 }
 

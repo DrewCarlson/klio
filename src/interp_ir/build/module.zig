@@ -122,9 +122,10 @@ pub const phase = struct {
     }
 
     pub fn mark(name: []const u8) void {
+        runtime.prof.phaseMark(name);
         if (!on()) return;
         const now = runtime.clockMonotonicNanos();
-        std.debug.print("[lower] {s} {d}ms (rss {d}mb)\n", .{ name, (now - last) / 1_000_000, (runtime.currentRssKb() orelse 0) / 1024 });
+        std.debug.print("[lower] {s} {d}us (rss {d}mb)\n", .{ name, (now - last) / 1_000, (runtime.currentRssKb() orelse 0) / 1024 });
         last = now;
     }
 
@@ -602,6 +603,9 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         .span = Span.init(span.FileId.from(0), 0, 0),
     };
     phase.mark("rename-tables");
+    // The stage, when the driver set one, checks these files as transformed.
+    build_overrides.stage_files = files;
+    defer build_overrides.stage_files = &.{};
     const built = try buildModuleWithOverrides(
         allocator,
         &combined,
