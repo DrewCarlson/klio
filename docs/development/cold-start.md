@@ -600,8 +600,12 @@ thunks and constants of its own (measured on the stdlib: 539 functions and
 worker a shard, a copy of the module whose appendable tables are its own,
 allocates those ids locally, and merges the shards in declaration order,
 renumbering ids through a reflective walk of the emitted instructions
-(`ir.remap`) so the module comes out as a serial pass builds it. A shard that
-grew any other table makes the pool give up and the driver lower serially.
+(`ir.remap`) so the module comes out as a serial pass builds it. A body that
+declares a local class or object registers its supertypes and member headers
+in the registry as it lowers, tables the shards share read-only, so the pool
+keeps such a body off the shards and lowers it on the main thread at its
+position in the merge. A shard that still grew a shared table makes the pool
+give up and the driver lower serially.
 Ambient lowering state is threadlocal and captured per worker; see
 [process globals](process-globals.md). Class member bodies take the same
 pool: every class's shell and member sets are registered first, every member

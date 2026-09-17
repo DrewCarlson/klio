@@ -433,37 +433,50 @@ fn collectDeferrableDecl(allocator: std.mem.Allocator, d: *const Decl, out: *std
 // `Expr` and `Stmt` case: an object expression, or a local class or object.
 
 pub fn fnBodyKeepsAst(b: *const FunctionBody) bool {
+    return bodyHas(true, b);
+}
+
+/// Whether a body declares a class or an object: lowering such a body
+/// registers the classifier's supertypes and member headers in the module's
+/// registry, which the body pool shares between its workers read-only.
+pub fn fnBodyDeclaresClass(b: *const FunctionBody) bool {
+    return bodyHas(false, b);
+}
+
+/// The walk behind both predicates: a class or object declaration answers
+/// either, an object expression only the strip's.
+fn bodyHas(comptime object_exprs: bool, b: *const FunctionBody) bool {
     return switch (b.*) {
-        .Block => |*blk| blockKeepsAst(blk),
-        .Expr => |*e| exprKeepsAst(e),
+        .Block => |*blk| blockHas(object_exprs, blk),
+        .Expr => |*e| exprHas(object_exprs, e),
     };
 }
 
-fn blockKeepsAst(b: *const Block) bool {
-    for (b.stmts) |*s| if (stmtKeepsAst(s)) return true;
+fn blockHas(comptime oe: bool, b: *const Block) bool {
+    for (b.stmts) |*s| if (stmtHas(oe, s)) return true;
     return false;
 }
 
-fn stmtKeepsAst(s: *const Stmt) bool {
+fn stmtHas(comptime oe: bool, s: *const Stmt) bool {
     return switch (s.*) {
-        .Expr => |*e| exprKeepsAst(e),
-        .Decl => |d| declKeepsAst(d),
-        .Assign => |a| exprKeepsAst(&a.target) or exprKeepsAst(&a.value),
-        .DestructuringDecl => |dd| exprKeepsAst(&dd.init),
+        .Expr => |*e| exprHas(oe, e),
+        .Decl => |d| declHas(oe, d),
+        .Assign => |a| exprHas(oe, &a.target) or exprHas(oe, &a.value),
+        .DestructuringDecl => |dd| exprHas(oe, &dd.init),
     };
 }
 
-fn declKeepsAst(d: *const Decl) bool {
+fn declHas(comptime oe: bool, d: *const Decl) bool {
     return switch (d.*) {
-        .Function => |*f| if (f.body) |*b| fnBodyKeepsAst(b) else false,
+        .Function => |*f| if (f.body) |*b| bodyHas(oe, b) else false,
         .Property => |p| {
-            if (p.init) |e| if (exprKeepsAst(e)) return true;
+            if (p.init) |e| if (exprHas(oe, e)) return true;
             if (p.explicit_field) |ef| {
-                if (ef.init) |e| if (exprKeepsAst(e)) return true;
+                if (ef.init) |e| if (exprHas(oe, e)) return true;
             }
-            if (p.delegate) |e| if (exprKeepsAst(e)) return true;
-            if (p.getter) |acc| if (fnBodyKeepsAst(&acc.body)) return true;
-            if (p.setter) |acc| if (fnBodyKeepsAst(&acc.body)) return true;
+            if (p.delegate) |e| if (exprHas(oe, e)) return true;
+            if (p.getter) |acc| if (bodyHas(oe, &acc.body)) return true;
+            if (p.setter) |acc| if (bodyHas(oe, &acc.body)) return true;
             return false;
         },
         // Declared inside a body: an `Inst.RegisterClass` points at it.
@@ -472,68 +485,68 @@ fn declKeepsAst(d: *const Decl) bool {
     };
 }
 
-fn optExprKeepsAst(e: ?*const Expr) bool {
-    return if (e) |x| exprKeepsAst(x) else false;
+fn optExprHas(comptime oe: bool, e: ?*const Expr) bool {
+    return if (e) |x| exprHas(oe, x) else false;
 }
 
-fn exprKeepsAst(e: *const Expr) bool {
+fn exprHas(comptime oe: bool, e: *const Expr) bool {
     return switch (e.*) {
-        .ObjectExpr => true,
+        .ObjectExpr => oe,
         .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .Path, .This, .Super, .PropertyRef, .Break, .Continue => false,
         .StringTemplate => |*x| {
             for (x.parts) |*p| switch (p.*) {
-                .Interp => |ie| if (exprKeepsAst(ie)) return true,
+                .Interp => |ie| if (exprHas(oe, ie)) return true,
                 .Text, .ShortInterp => {},
             };
             return false;
         },
-        .Member => |*x| exprKeepsAst(x.receiver),
+        .Member => |*x| exprHas(oe, x.receiver),
         .Call => |*x| {
-            if (exprKeepsAst(x.callee)) return true;
-            for (x.args) |*a| if (exprKeepsAst(a)) return true;
+            if (exprHas(oe, x.callee)) return true;
+            for (x.args) |*a| if (exprHas(oe, a)) return true;
             return false;
         },
         .Index => |*x| {
-            if (exprKeepsAst(x.receiver)) return true;
-            for (x.args) |*a| if (exprKeepsAst(a)) return true;
+            if (exprHas(oe, x.receiver)) return true;
+            for (x.args) |*a| if (exprHas(oe, a)) return true;
             return false;
         },
-        .Binary => |*x| exprKeepsAst(x.lhs) or exprKeepsAst(x.rhs),
-        .Unary => |*x| exprKeepsAst(x.expr),
-        .Postfix => |*x| exprKeepsAst(x.expr),
-        .If => |*x| exprKeepsAst(x.cond) or exprKeepsAst(x.then_branch) or optExprKeepsAst(x.else_branch),
-        .While => |*x| exprKeepsAst(x.cond) or exprKeepsAst(x.body),
-        .DoWhile => |*x| optExprKeepsAst(x.body) or exprKeepsAst(x.cond),
-        .For => |x| exprKeepsAst(x.iter) or exprKeepsAst(x.body),
-        .Return => |*x| optExprKeepsAst(x.value),
-        .Labeled => |*x| exprKeepsAst(x.expr),
-        .Block => |*x| blockKeepsAst(x),
-        .Throw => |*x| exprKeepsAst(x.value),
+        .Binary => |*x| exprHas(oe, x.lhs) or exprHas(oe, x.rhs),
+        .Unary => |*x| exprHas(oe, x.expr),
+        .Postfix => |*x| exprHas(oe, x.expr),
+        .If => |*x| exprHas(oe, x.cond) or exprHas(oe, x.then_branch) or optExprHas(oe, x.else_branch),
+        .While => |*x| exprHas(oe, x.cond) or exprHas(oe, x.body),
+        .DoWhile => |*x| optExprHas(oe, x.body) or exprHas(oe, x.cond),
+        .For => |x| exprHas(oe, x.iter) or exprHas(oe, x.body),
+        .Return => |*x| optExprHas(oe, x.value),
+        .Labeled => |*x| exprHas(oe, x.expr),
+        .Block => |*x| blockHas(oe, x),
+        .Throw => |*x| exprHas(oe, x.value),
         .Try => |x| {
-            if (blockKeepsAst(&x.body)) return true;
-            for (x.catches) |*c| if (blockKeepsAst(&c.body)) return true;
-            if (x.finally) |*fb| if (blockKeepsAst(fb)) return true;
+            if (blockHas(oe, &x.body)) return true;
+            for (x.catches) |*c| if (blockHas(oe, &c.body)) return true;
+            if (x.finally) |*fb| if (blockHas(oe, fb)) return true;
             return false;
         },
-        .Lambda => |x| blockKeepsAst(&x.body),
-        .MemberRef => |*x| exprKeepsAst(x.receiver),
+        .Lambda => |x| blockHas(oe, &x.body),
+        .MemberRef => |*x| exprHas(oe, x.receiver),
         .When => |x| {
-            if (optExprKeepsAst(x.subject)) return true;
+            if (optExprHas(oe, x.subject)) return true;
             for (x.branches) |*br| {
-                if (exprKeepsAst(&br.body)) return true;
+                if (exprHas(oe, &br.body)) return true;
                 for (br.patterns) |*p| switch (p.kind) {
-                    .Value => |*ve| if (exprKeepsAst(ve)) return true,
-                    .InRange => |*ie| if (exprKeepsAst(ie)) return true,
-                    .NotInRange => |*ie| if (exprKeepsAst(ie)) return true,
+                    .Value => |*ve| if (exprHas(oe, ve)) return true,
+                    .InRange => |*ie| if (exprHas(oe, ie)) return true,
+                    .NotInRange => |*ie| if (exprHas(oe, ie)) return true,
                     .IsType, .NotIsType, .Else => {},
                 };
             }
             return false;
         },
-        .IsCheck => |x| exprKeepsAst(x.expr),
-        .As => |x| exprKeepsAst(x.expr),
-        .AnonFun => |x| if (x.body) |b| fnBodyKeepsAst(b) else false,
-        .Spread => |*x| exprKeepsAst(x.expr),
+        .IsCheck => |x| exprHas(oe, x.expr),
+        .As => |x| exprHas(oe, x.expr),
+        .AnonFun => |x| if (x.body) |b| bodyHas(oe, b) else false,
+        .Spread => |*x| exprHas(oe, x.expr),
     };
 }
 
@@ -610,6 +623,20 @@ fn tClass() ast.Class {
         .annotations = &.{},
         .span = tSpan(3, 4),
     };
+}
+
+test "a local class in a nested lambda marks a body, an object expression does not" {
+    var decl_decl = Decl{ .Class = tClass() };
+    var lam_stmts = [_]Stmt{.{ .Decl = &decl_decl }};
+    var lam = ast.LambdaExpr{ .params = &.{}, .body = .{ .stmts = &lam_stmts, .span = tSpan(1, 2) }, .span = tSpan(1, 2) };
+    var stmts = [_]Stmt{.{ .Expr = .{ .Lambda = &lam } }};
+    const with_class: FunctionBody = .{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } };
+    try testing.expect(fnBodyDeclaresClass(&with_class));
+    try testing.expect(fnBodyKeepsAst(&with_class));
+    var lit = ast.ObjectLiteral{ .supertypes = &.{}, .supertype_args = &.{}, .supertype_delegates = &.{}, .members = &.{}, .init_blocks = &.{}, .init_block_positions = &.{}, .span = tSpan(1, 2) };
+    const only_object: FunctionBody = .{ .Expr = .{ .ObjectExpr = &lit } };
+    try testing.expect(!fnBodyDeclaresClass(&only_object));
+    try testing.expect(fnBodyKeepsAst(&only_object));
 }
 
 test "a body declaring a local class is left intact" {

@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const ir = @import("ir");
 const ast = @import("ast");
 const runtime = @import("runtime");
+const prune = @import("../prune.zig");
 const overrides = @import("overrides.zig");
 const module_trace = @import("module.zig");
 
@@ -50,6 +51,10 @@ const Result = struct {
 
 const Work = struct {
     jobs: []const Job,
+    /// Per job: lowers on the main thread at its merge position, off the
+    /// shards. A body that declares a class or object writes the registry
+    /// tables the shards share.
+    serial: []const bool,
     results: []Result,
     file_classes: *const overrides.FileClasses,
     module: *const Module,
@@ -62,11 +67,11 @@ const Work = struct {
 /// The registry tables a body may write. Every other table is read only while
 /// bodies lower, so a shard shares it.
 const registry_writable = [_][]const u8{
-    "abstract_member_arity",   "abstract_member_defaults", "class_type_param_bounds",
-    "func_type_param_bounds",  "func_type_params",         "iface_member_ctx_types",
-    "iface_member_ext_recv",   "import_aliases",           "import_wildcards",
-    "local_fn_defaults",       "member_ext_owner_class",   "member_method_fids",
-    "private_fn_files",        "class_super_names",
+    "abstract_member_arity",  "abstract_member_defaults", "class_type_param_bounds",
+    "func_type_param_bounds", "func_type_params",         "iface_member_ctx_types",
+    "iface_member_ext_recv",  "import_aliases",           "import_wildcards",
+    "local_fn_defaults",      "member_ext_owner_class",   "member_method_fids",
+    "private_fn_files",       "class_super_names",
 };
 
 /// The module tables a body may append to, keyed by or holding FuncIds.
@@ -270,6 +275,7 @@ fn workerMain(work: *Work, shard: *Shard, index: u32) void {
     while (true) {
         const j = work.next.fetchAdd(1, .monotonic);
         if (j >= work.jobs.len) return;
+        if (work.serial[j]) continue;
         const job = work.jobs[j];
         const funcs_from: u32 = @intCast(m.funcs.items.len);
         const consts_from: u32 = @intCast(m.consts.items.len);
@@ -335,8 +341,16 @@ pub fn lower(ctx: *BuildCtx, jobs: []const Job) Allocator.Error!?[]Func {
     try ctx.module.warmLookupCaches();
     const shared_before = if (builtin.mode == .Debug) sharedFootprint(ctx.module) else {};
 
+    const serial = try a.alloc(bool, jobs.len);
+    defer a.free(serial);
+    var n_serial: usize = 0;
+    for (jobs, serial) |job, *flag| {
+        flag.* = if (job.f.body) |*b| prune.fnBodyDeclaresClass(b) else false;
+        if (flag.*) n_serial += 1;
+    }
     var work = Work{
         .jobs = jobs,
+        .serial = serial,
         .results = try a.alloc(Result, jobs.len),
         .file_classes = &ctx.file_classes,
         .module = ctx.module,
@@ -373,7 +387,13 @@ pub fn lower(ctx: *BuildCtx, jobs: []const Job) Allocator.Error!?[]Func {
     const t1 = runtime.clockMonotonicNanos();
 
     const main = ctx.module;
-    for (work.results) |*r| {
+    for (work.results, 0..) |*r, j| {
+        // A body the shards skipped lowers here, in job order, so its ids and
+        // its registry writes land as a serial pass would place them.
+        if (serial[j]) {
+            r.* = .{ .func = try lowerJob(main, jobs[j], work.file_classes) };
+            continue;
+        }
         const s = &shards[r.shard];
         // Constants first: a body's constants keep their creation order and the
         // module's dedup, exactly as interning them while lowering did.
@@ -434,7 +454,7 @@ pub fn lower(ctx: *BuildCtx, jobs: []const Job) Allocator.Error!?[]Func {
     for (work.results, out) |*r, *o| o.* = r.func;
     if (module_trace.phase.on()) {
         const t2 = runtime.clockMonotonicNanos();
-        std.debug.print("[lower] body pool: {d} bodies on {d} threads, lower {d}ms, merge {d}ms\n", .{ jobs.len, spawned, (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000 });
+        std.debug.print("[lower] body pool: {d} bodies on {d} threads ({d} serial), lower {d}ms, merge {d}ms\n", .{ jobs.len, spawned, n_serial, (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000 });
         var ext_hits: u64 = 0;
         var ext_misses: u64 = 0;
         var recv_hits: u64 = 0;

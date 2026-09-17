@@ -10,6 +10,7 @@ const ast = @import("ast");
 const compose_pass = @import("compose_pass");
 const stdlib = @import("stdlib");
 const lift = @import("lift.zig");
+const prune = @import("../prune.zig");
 const body_pool = @import("body_pool.zig");
 pub const lazy = @import("lazy.zig");
 const image = @import("../image.zig");
@@ -100,7 +101,6 @@ const StrFunc = build_types.StrFunc;
 const StrPair = build_types.StrPair;
 const StrPairContext = build_types.StrPairContext;
 const StrPairSet = build_types.StrPairSet;
-
 
 /// The alias a mangled pack-private object needs under every class declaring a namesake.
 const PendingAlias = struct { cls: []const u8, simple: []const u8, mangled: []const u8 };
@@ -542,7 +542,6 @@ pub fn buildModuleWithOverrides(
     return r;
 }
 
-
 /// Flatten nested declarations into `all_decls`, mangling pack-private objects that collide.
 fn liftFileDecls(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
@@ -931,7 +930,6 @@ fn inheritExpectClassMemberDefaults(ctx: *BuildCtx) Allocator.Error!void {
         }
     }
 }
-
 
 fn collectFileClasses(ctx: *BuildCtx) Allocator.Error!void {
     const base = ctx.base;
@@ -2042,7 +2040,6 @@ fn registerReceiverFnPropHeads(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-
 fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2123,14 +2120,16 @@ fn deferMemberJobs(ctx: *BuildCtx, p: *lazy.Plan, jobs: []const body_pool.Job) A
     const out = try a.alloc(ir.Func, jobs.len);
     errdefer a.free(out);
     for (jobs, out) |job, *slot| {
-        if (ctx.module.funcByDeclSpan(job.f.name.span)) |id| {
-            const header = ctx.module.funcByIdMut(id).?;
-            header.lazy_deferred = true;
-            slot.* = header.*;
-            try p.deferBody(id, job);
-        } else {
-            slot.* = try body_pool.lowerJob(ctx.module, job, &ctx.file_classes);
+        if (!bodyWritesRegistry(job)) {
+            if (ctx.module.funcByDeclSpan(job.f.name.span)) |id| {
+                const header = ctx.module.funcByIdMut(id).?;
+                header.lazy_deferred = true;
+                slot.* = header.*;
+                try p.deferBody(id, job);
+                continue;
+            }
         }
+        slot.* = try body_pool.lowerJob(ctx.module, job, &ctx.file_classes);
     }
     return out;
 }
@@ -2142,6 +2141,10 @@ fn deferTopLevelJobs(ctx: *BuildCtx, p: *lazy.Plan, jobs: []const body_pool.Job)
     const out = try a.alloc(ir.Func, jobs.len);
     errdefer a.free(out);
     for (jobs, out) |job, *slot| {
+        if (bodyWritesRegistry(job)) {
+            slot.* = try body_pool.lowerJob(ctx.module, job, &ctx.file_classes);
+            continue;
+        }
         const header = ctx.module.funcByIdMut(job.id).?;
         header.lazy_deferred = true;
         slot.* = header.*;
@@ -2150,11 +2153,16 @@ fn deferTopLevelJobs(ctx: *BuildCtx, p: *lazy.Plan, jobs: []const body_pool.Job)
     return out;
 }
 
+/// A body that declares a class or object registers it in the module while
+/// lowering; it lowers in the build, on its thread, never on demand.
+fn bodyWritesRegistry(job: body_pool.Job) bool {
+    return if (job.f.body) |*b| prune.fnBodyDeclaresClass(b) else false;
+}
+
 /// The pool over a job list, for a lazy build's completion.
 pub fn lowerJobsFor(ctx: *BuildCtx, jobs: []const body_pool.Job) Allocator.Error![]ir.Func {
     return lowerJobs(ctx, jobs);
 }
-
 
 fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
@@ -3629,7 +3637,6 @@ fn lowerExtensionPropSetter(
         try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
     }
 }
-
 
 /// Fold the local-fn default thunks into `func_defaults`, then propagate supertype member defaults
 /// onto the overrides that lack their own.
