@@ -421,6 +421,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             try solo.appendSlice(a, &.{ "env", "KLIO_GC_GROWTH=8", "KLIO_GC_THRESHOLD_KB=524288" });
             try solo.append(a, klioBin(&env));
             try solo.append(a, "test");
+            try solo.appendSlice(a, &CHILD_FEATURES);
             try solo.appendSlice(a, trimmed.items);
             try solo.append(a, "--filter=RecomposerTests.validatePotentialDeadlock");
             try jobs.append(a, try solo.toOwnedSlice(a));
@@ -429,6 +430,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             try rest.appendSlice(a, &.{ "nice", "-n", "10" });
             try rest.append(a, klioBin(&env));
             try rest.append(a, "test");
+            try rest.appendSlice(a, &CHILD_FEATURES);
             try rest.appendSlice(a, trimmed.items);
             try rest.append(a, "--filter=RecomposerTests,!validatePotentialDeadlock");
             try jobs.append(a, try rest.toOwnedSlice(a));
