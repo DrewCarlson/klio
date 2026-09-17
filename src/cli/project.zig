@@ -59,7 +59,23 @@ pub const Application = struct {
     icon: []const u8,
     /// Each entry is `path[:mount]`.
     includes: []const []const u8,
+    lazy_bodies: ?bool = null,
 };
+
+/// `lazy_bodies` under `[application]` in `dir`'s klio.toml; null when the
+/// file or the key is absent.
+pub fn lazyBodiesFromToml(gpa: Allocator, dir: []const u8) ?bool {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const toml_path = std.fs.path.join(a, &.{ dir, "klio.toml" }) catch return null;
+    const text = pack_build.readFileOwned(a, toml_path) orelse return null;
+    const manifest = switch (pack_build.parseLibraryToml(a, text)) {
+        .ok => |m| m,
+        .err => return null,
+    };
+    return manifest.application.lazy_bodies;
+}
 
 /// Resolves the project at `dir`, discovering `main` when the manifest omits it:
 /// exactly one source under the roots may declare one. Null without a readable manifest.
@@ -122,6 +138,7 @@ pub fn loadApplication(a: Allocator, dir: []const u8) ?Application {
         .name = app.name,
         .icon = if (app.icon.len != 0) std.fs.path.join(a, &.{ dir, app.icon }) catch "" else "",
         .includes = includes.toOwnedSlice(a) catch return null,
+        .lazy_bodies = app.lazy_bodies,
     };
 }
 

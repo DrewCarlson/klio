@@ -81,6 +81,10 @@ const USAGE =
     \\
     \\Run options:
     \\  --virtual-time             Use deterministic virtual time for coroutines.
+    \\  --lazy-bodies              On a cold run, start before the stdlib's bodies lower:
+    \\                             each lowers on its first call and the image completes
+    \\                             after the program (KLIO_LAZY_BODIES=1, or lazy_bodies
+    \\                             under [application] in klio.toml).
     \\  --feature <pack>/<feature> Enable a pack feature (repeatable).
     \\
     \\Test options:
@@ -326,18 +330,31 @@ fn runDumpIrCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     return commands.runDumpIr(gpa, file.?, opts, &requested);
 }
 
+/// `KLIO_LAZY_BODIES`: `1`/`true` on, `0`/`false` off, null otherwise.
+fn lazyBodiesFromEnv() ?bool {
+    const v = runtime.envOnce("KLIO_LAZY_BODIES") orelse return null;
+    if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) return true;
+    if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) return false;
+    return null;
+}
+
 fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var files: std.ArrayList([]const u8) = .empty;
     defer files.deinit(gpa);
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
     var virtual_time = false;
+    var lazy_bodies: ?bool = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--virtual-time")) {
             virtual_time = true;
+        } else if (std.mem.eql(u8, a, "--lazy-bodies")) {
+            lazy_bodies = true;
+        } else if (std.mem.eql(u8, a, "--no-lazy-bodies")) {
+            lazy_bodies = false;
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
             if (i >= args.len) {
@@ -365,6 +382,8 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     if (virtual_time) {
         interp_ir.setCoroutineTimeMode(.Virtual);
     }
+    // The flag, then the environment, then the working directory's klio.toml.
+    runtime.lazy_bodies = lazy_bodies orelse lazyBodiesFromEnv() orelse project.lazyBodiesFromToml(gpa, ".") orelse false;
 
     if (files.items.len == 0) {
         printErr(gpa, "usage: klio run <file.kt> [<file2.kt> ...]\n", .{});

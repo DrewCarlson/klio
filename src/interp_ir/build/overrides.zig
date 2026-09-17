@@ -11,6 +11,7 @@ const compose_pass = @import("compose_pass");
 const stdlib = @import("stdlib");
 const lift = @import("lift.zig");
 const body_pool = @import("body_pool.zig");
+pub const lazy = @import("lazy.zig");
 const image = @import("../image.zig");
 
 const Allocator = std.mem.Allocator;
@@ -141,6 +142,8 @@ pub const BuildCtx = struct {
     expect_class_members: std.StringHashMap([]const Decl),
 
     decls: []Decl,
+    /// Set for a build whose bodies are deferred; the context then outlives the call.
+    lazy: ?*lazy.Plan = null,
     /// Every class in scope: the base's plus this file set's.
     file_classes: FileClasses,
     /// The phase-1 header slots in declaration order, consumed by phase 2.
@@ -371,7 +374,11 @@ pub fn buildModuleWithOverrides(
     out_lifted: ?*[]Decl,
     own_base: bool,
 ) Allocator.Error!BuiltModule {
-    var ctx = try BuildCtx.init(
+    // A lazy plan keeps the context past this call: the program runs with
+    // the bodies deferred and the completion lowers them into it.
+    const plan = lazy.take();
+    const ctx = try allocator.create(BuildCtx);
+    ctx.* = try BuildCtx.init(
         allocator,
         file,
         fqn_overrides,
@@ -382,16 +389,21 @@ pub fn buildModuleWithOverrides(
         base,
         own_base,
     );
-    defer ctx.deinitScratch();
+    ctx.lazy = plan;
+    if (plan) |p| p.ctx = ctx;
+    defer if (plan == null) {
+        ctx.deinitScratch();
+        allocator.destroy(ctx);
+    };
     phase.mark("build-ctx-init");
 
-    try liftFileDecls(&ctx);
+    try liftFileDecls(ctx);
     phase.mark("liftFileDecls");
-    try repointMangledSupertypes(&ctx);
+    try repointMangledSupertypes(ctx);
     phase.mark("repointMangledSupertypes");
-    try repointAliasedNestedSupertypes(&ctx);
+    try repointAliasedNestedSupertypes(ctx);
     phase.mark("repointAliasedNestedSupertypes");
-    try applyExpectActualSubstitutions(&ctx, out_lifted);
+    try applyExpectActualSubstitutions(ctx, out_lifted);
     phase.mark("applyExpectActualSubstitutions");
 
     // The syntax is final from here; the stage runs on its own thread while
@@ -410,41 +422,41 @@ pub fn buildModuleWithOverrides(
 
     // Register every declaration's identity and metadata. Nothing here lowers a body, so a
     // body lowered below sees complete tables however its declaration is ordered in source.
-    try collectFileClasses(&ctx);
+    try collectFileClasses(ctx);
     phase.mark("collectFileClasses");
-    try registerConstInitializers(&ctx);
+    try registerConstInitializers(ctx);
     phase.mark("registerConstInitializers");
-    try registerHierarchyMethodNames(&ctx);
+    try registerHierarchyMethodNames(ctx);
     phase.mark("registerHierarchyMethodNames");
-    try registerHierarchyShadowNames(&ctx);
+    try registerHierarchyShadowNames(ctx);
     phase.mark("registerHierarchyShadowNames");
-    try registerMemberNameUniverse(&ctx);
+    try registerMemberNameUniverse(ctx);
     phase.mark("registerMemberNameUniverse");
-    try registerPropertyTypeHeads(&ctx);
+    try registerPropertyTypeHeads(ctx);
     phase.mark("registerPropertyTypeHeads");
-    try registerClassSuperNameChains(&ctx);
+    try registerClassSuperNameChains(ctx);
     phase.mark("registerClassSuperNameChains");
-    try registerShadowedStorageProps(&ctx);
+    try registerShadowedStorageProps(ctx);
     phase.mark("registerShadowedStorageProps");
-    try installLiftedNameTables(&ctx);
+    try installLiftedNameTables(ctx);
     phase.mark("installLiftedNameTables");
-    try installMemberAstTables(&ctx);
+    try installMemberAstTables(ctx);
     phase.mark("installMemberAstTables");
-    try installInlineFnTables(&ctx);
+    try installInlineFnTables(ctx);
     phase.mark("installInlineFnTables");
-    try installTopLevelPropNames(&ctx);
+    try installTopLevelPropNames(ctx);
     phase.mark("installTopLevelPropNames");
-    try registerFileImports(&ctx);
+    try registerFileImports(ctx);
     phase.mark("registerFileImports");
-    try reserveClassShells(&ctx);
+    try reserveClassShells(ctx);
     phase.mark("reserveClassShells");
-    try linkReservedClassSupertypes(&ctx);
+    try linkReservedClassSupertypes(ctx);
     phase.mark("linkReservedClassSupertypes");
-    try reserveClassMemberHeaders(&ctx);
+    try reserveClassMemberHeaders(ctx);
     phase.mark("reserveClassMemberHeaders");
-    try registerTypeAliasShapes(&ctx);
+    try registerTypeAliasShapes(ctx);
     phase.mark("registerTypeAliasShapes");
-    try registerClassTypeAliasShapes(&ctx);
+    try registerClassTypeAliasShapes(ctx);
     phase.mark("registerClassTypeAliasShapes");
     // Member signatures need the same source-order independence as top-level headers: the
     // trailing receiver-lambda portion is recorded before any class body lowers.
@@ -461,14 +473,14 @@ pub fn buildModuleWithOverrides(
         try collectMemberTrailingLambdaShapes(ctx.module, &ctx.file_classes);
     }
     phase.mark("collectMemberTrailingLambdaShapes");
-    try fillReservedClassPrimaryParams(&ctx);
+    try fillReservedClassPrimaryParams(ctx);
     phase.mark("fillReservedClassPrimaryParams");
-    try registerTopLevelFuncHeaders(&ctx);
+    try registerTopLevelFuncHeaders(ctx);
     phase.mark("registerTopLevelFuncHeaders");
     phase.mark("registerTopLevelFuncHeaders");
-    try registerCallableExtensionProps(&ctx);
+    try registerCallableExtensionProps(ctx);
     phase.mark("registerCallableExtensionProps");
-    try registerReceiverFnPropHeads(&ctx);
+    try registerReceiverFnPropHeads(ctx);
     phase.mark("registerReceiverFnPropHeads");
 
     // The bodies read the stage's picks, so it finishes first and the module
@@ -482,50 +494,51 @@ pub fn buildModuleWithOverrides(
     }
 
     // Lower every body and thunk against the now-complete header set.
-    try lowerClassBodies(&ctx);
+    try lowerClassBodies(ctx);
     phase.mark("lowerClassBodies");
     phase.mark("lowerClassBodies");
-    try lowerTopLevelFunctionBodies(&ctx);
+    try lowerTopLevelFunctionBodies(ctx);
     phase.mark("lowerTopLevelFunctionBodies");
     phase.mark("lowerTopLevelFunctionBodies");
-    try lowerClassMemberThunks(&ctx);
+    try lowerClassMemberThunks(ctx);
     phase.mark("lowerClassMemberThunks");
     phase.mark("lowerClassMemberThunks");
-    try buildRuntimeClassDefs(&ctx);
+    try buildRuntimeClassDefs(ctx);
     phase.mark("buildRuntimeClassDefs");
-    try registerEnumEntries(&ctx);
+    try registerEnumEntries(ctx);
     phase.mark("registerEnumEntries");
-    try linkRuntimeSupertypes(&ctx);
+    try linkRuntimeSupertypes(ctx);
     phase.mark("linkRuntimeSupertypes");
-    try lowerParentCtorArgThunks(&ctx);
+    try lowerParentCtorArgThunks(ctx);
     phase.mark("lowerParentCtorArgThunks");
-    try lowerInitBlockThunks(&ctx);
+    try lowerInitBlockThunks(ctx);
     phase.mark("lowerInitBlockThunks");
-    try lowerClassDelegateThunks(&ctx);
+    try lowerClassDelegateThunks(ctx);
     phase.mark("lowerClassDelegateThunks");
-    try lowerSecondaryCtors(&ctx);
+    try lowerSecondaryCtors(ctx);
     phase.mark("lowerSecondaryCtors");
-    try lowerTopLevelConstProps(&ctx);
+    try lowerTopLevelConstProps(ctx);
     phase.mark("lowerTopLevelConstProps");
-    try lowerTopLevelProps(&ctx);
+    try lowerTopLevelProps(ctx);
     phase.mark("lowerTopLevelProps");
-    try lowerExtensionProps(&ctx);
+    try lowerExtensionProps(ctx);
     phase.mark("lowerExtensionProps");
 
     // Settle the cross-declaration links runtime dispatch reads.
-    try settleDefaultArgThunks(&ctx);
+    try settleDefaultArgThunks(ctx);
     phase.mark("settleDefaultArgThunks");
-    try registerTypeAliasTags(&ctx);
+    try registerTypeAliasTags(ctx);
     phase.mark("registerTypeAliasTags");
-    try rewriteAliasedParamTypes(&ctx);
+    try rewriteAliasedParamTypes(ctx);
     phase.mark("rewriteAliasedParamTypes");
-    try materialiseRegistry(&ctx);
+    try materialiseRegistry(ctx);
     phase.mark("materialiseRegistry");
-    try finishModule(&ctx);
+    try finishModule(ctx);
     phase.mark("finishModule");
     phase.mark("finishModule");
     const r = ctx.finish();
     phase.mark("finish");
+    if (plan) |p| lazy.active_build = p;
     return r;
 }
 
@@ -2041,8 +2054,13 @@ fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
     const nested_outer_members = &ctx.nested_outer_members;
     // Classes lower after the top-level function headers register, so a method body's bare call to a
     // sibling top-level function resolves against the complete header set.
-    var empty_set = StringSet.init(a);
-    defer empty_set.deinit();
+    // Jobs point at the empty set; a lazy build's outlive this call.
+    const empty_set = try a.create(StringSet);
+    empty_set.* = StringSet.init(a);
+    defer if (ctx.lazy == null) {
+        empty_set.deinit();
+        a.destroy(empty_set);
+    };
     // Every class's shell and member sets first, then every member body, then
     // each class sealed in declaration order: a member sees the same module
     // whichever class it belongs to and whichever thread lowers it.
@@ -2054,7 +2072,7 @@ fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
-        const extras: *const StringSet = nested_outer_members.getPtr(c.name.name) orelse &empty_set;
+        const extras: *const StringSet = nested_outer_members.getPtr(c.name.name) orelse empty_set;
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
         const prev = ir.lower.decl.enterClassContext(cfqn, cls_pkg);
@@ -2078,7 +2096,7 @@ fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
             });
         }
     }
-    const lowered = try lowerJobs(ctx, jobs.items);
+    const lowered = if (ctx.lazy) |p| try deferMemberJobs(ctx, p, jobs.items) else try lowerJobs(ctx, jobs.items);
     defer a.free(lowered);
     for (begun.items) |b| {
         const c = b.state.c;
@@ -2093,8 +2111,48 @@ fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
         }
         const prev = ir.lower.decl.enterClassContext(b.fqn, b.pkg);
         defer ir.lower.decl.leaveClassContext(prev);
-        _ = try ir.lower.decl.finishClass(b.state, per_member);
+        _ = try ir.lower.decl.finishClassOpts(b.state, per_member, ctx.lazy != null);
     }
+}
+
+/// A lazy build's member bodies: each reserved slot's header stands in for
+/// its body and the job is recorded under the slot's id. A member without a
+/// reserved slot lowers now, as its placement would allocate its id.
+fn deferMemberJobs(ctx: *BuildCtx, p: *lazy.Plan, jobs: []const body_pool.Job) Allocator.Error![]ir.Func {
+    const a = ctx.a;
+    const out = try a.alloc(ir.Func, jobs.len);
+    errdefer a.free(out);
+    for (jobs, out) |job, *slot| {
+        if (ctx.module.funcByDeclSpan(job.f.name.span)) |id| {
+            const header = ctx.module.funcByIdMut(id).?;
+            header.lazy_deferred = true;
+            slot.* = header.*;
+            try p.deferBody(id, job);
+        } else {
+            slot.* = try body_pool.lowerJob(ctx.module, job, &ctx.file_classes);
+        }
+    }
+    return out;
+}
+
+/// A lazy build's top-level bodies: the reserved header stands in and the
+/// job is recorded under its id.
+fn deferTopLevelJobs(ctx: *BuildCtx, p: *lazy.Plan, jobs: []const body_pool.Job) Allocator.Error![]ir.Func {
+    const a = ctx.a;
+    const out = try a.alloc(ir.Func, jobs.len);
+    errdefer a.free(out);
+    for (jobs, out) |job, *slot| {
+        const header = ctx.module.funcByIdMut(job.id).?;
+        header.lazy_deferred = true;
+        slot.* = header.*;
+        try p.deferBody(job.id, job);
+    }
+    return out;
+}
+
+/// The pool over a job list, for a lazy build's completion.
+pub fn lowerJobsFor(ctx: *BuildCtx, jobs: []const body_pool.Job) Allocator.Error![]ir.Func {
+    return lowerJobs(ctx, jobs);
 }
 
 
@@ -2121,7 +2179,7 @@ fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
         stub_cursor += 1;
         try jobs.append(a, .{ .f = f, .id = id, .pkg = module.funcByIdMut(id).?.package });
     }
-    const lowered = try lowerJobs(ctx, jobs.items);
+    const lowered = if (ctx.lazy) |p| try deferTopLevelJobs(ctx, p, jobs.items) else try lowerJobs(ctx, jobs.items);
     defer a.free(lowered);
     for (jobs.items, lowered) |job, func| try placeBody(ctx, job, func);
     phase.reportBodies();

@@ -205,6 +205,15 @@ pub const ClockWallTime = clock_mod.WallTime;
 pub const clockMonotonicNanos = clock_mod.monotonicNanos;
 /// `main`'s first instruction, for traces that place a phase in the process's life.
 pub var process_start_ns: u64 = 0;
+
+/// Lazy bodies for a cold run: the base build lowers its headers, the
+/// program runs, each body lowers on its first call, and the image
+/// completes after the run. Set by `klio run --lazy-bodies`,
+/// `KLIO_LAZY_BODIES=1`, or `lazy_bodies = true` under `[application]` in
+/// the working directory's klio.toml. Off by default: the run keeps the
+/// build resident for its whole duration and the image lands only once
+/// the program ends.
+pub var lazy_bodies: bool = false;
 pub const clockSleepMillis = clock_mod.sleepMillis;
 pub const clockSleepMicros = clock_mod.sleepMicros;
 pub const EventGate = clock_mod.EventGate;

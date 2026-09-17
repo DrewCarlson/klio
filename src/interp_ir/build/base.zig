@@ -23,6 +23,7 @@ const build_module = @import("module.zig");
 const buildModuleFilesInner = build_module.buildModuleFilesInner;
 
 const build_types = @import("types.zig");
+const lazy = @import("lazy.zig");
 const BuiltModule = build_types.BuiltModule;
 
 /// Owned by a process-lifetime arena; safe to read from many threads once built.
@@ -194,8 +195,48 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, main_poli
 
 fn buildBaseInnerOpts(allocator: Allocator, files: []const KotlinFile, main_policy: MainPolicy, strip: bool) Allocator.Error!?*StdlibBase {
     var lifted: []Decl = &.{};
-    var built = try buildModuleFilesInner(allocator, files, null, &lifted, false);
+    const plan = lazy.pending;
+    if (plan) |p| {
+        p.after_build = lazyAfterBuild;
+        p.files = files;
+        p.main_policy = main_policy;
+    }
+    const built = try buildModuleFilesInner(allocator, files, null, &lifted, false);
     @import("module.zig").phase.mark("build-module-total");
+    if (plan) |p| {
+        // The wrapper ran inside the build and the program with it.
+        const base = p.base orelse return null;
+        @import("module.zig").phase.mark("base-bookkeeping");
+        if (strip) try stripBase(allocator, base);
+        return base;
+    }
+    const base = (try wrapBase(allocator, files, built, lifted, main_policy)) orelse return null;
+    @import("module.zig").phase.mark("base-bookkeeping");
+    if (strip) try stripBase(allocator, base);
+    return base;
+}
+
+/// A lazy build's callback: wraps the base around the built module, runs
+/// the program against it with the hook installed, and keeps the exit code.
+fn lazyAfterBuild(p: *lazy.Plan, built: BuiltModule, lifted: []Decl) void {
+    const base = (wrapBase(p.a, p.files, built, lifted, p.main_policy) catch null) orelse return;
+    p.base = base;
+    lazy.active = p;
+    lazy.captureState();
+    lazy.prepareRun() catch return;
+    ir.lazy_hook = lazy.hook;
+    defer {
+        ir.lazy_hook = null;
+        lazy.leaveRun();
+        lazy.active = null;
+    }
+    p.exit_code = p.run.run(p.run.ctx, base);
+}
+
+/// The base around a built module: its bookkeeping over the files' names,
+/// packages, functions and enum ids.
+fn wrapBase(allocator: Allocator, files: []const KotlinFile, built_in: BuiltModule, lifted: []Decl, main_policy: MainPolicy) Allocator.Error!?*StdlibBase {
+    var built = built_in;
     {
         const mg = built.module.borrow();
         defer mg.deinit();
@@ -263,8 +304,6 @@ fn buildBaseInnerOpts(allocator: Allocator, files: []const KotlinFile, main_poli
     };
 
     base.tables_live = true;
-    @import("module.zig").phase.mark("base-bookkeeping");
-    if (strip) try stripBase(allocator, base);
     return base;
 }
 

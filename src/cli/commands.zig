@@ -3653,6 +3653,19 @@ fn tryImagePath(
     defer runtime.setReclaim(prev_reclaim);
     const t_prep0 = runtime.clockMonotonicNanos();
     const prepared = stdlib_image.tryPrepare(gpa, paths, features) orelse return null;
+    if (prepared.ran) |code| {
+        // Lazy bodies: the program ran inside the build, whose image is
+        // being written; nothing is left to execute.
+        stdlib_image.finishBackgroundBake();
+        if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
+            std.debug.print("[run] lazy bodies: prepare and execute {d}ms, {d}ms after start (rss {d}mb)\n", .{
+                (runtime.clockMonotonicNanos() - t_prep0) / 1_000_000,
+                (runtime.clockMonotonicNanos() -| runtime.process_start_ns) / 1_000_000,
+                (runtime.currentRssKb() orelse 0) / 1024,
+            });
+        }
+        return code;
+    }
     runtime.prof.phaseMark("prepare tail");
     const t_prep1 = runtime.clockMonotonicNanos();
     const msg = if (paths.len == 1) "error: no main function found" else "runtime error: no main function in module";

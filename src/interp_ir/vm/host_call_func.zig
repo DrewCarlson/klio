@@ -1228,6 +1228,8 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
         if (fp_trace) std.debug.print("[fastplan] {s}: no body\n", .{f.name});
         return 1;
     }
+    // A lazy build's deferred body has not settled its plan yet.
+    if (f.lazy_deferred) return 1;
     // Inline bodies splice, so a runtime call to one keeps the full path.
     if (f.is_inline) {
         if (fp_trace) std.debug.print("[fastplan] {s}: inline\n", .{f.name});

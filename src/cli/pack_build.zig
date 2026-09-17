@@ -996,6 +996,9 @@ pub const ApplicationToml = struct {
     icon: []const u8 = "",
     main: []const u8 = "",
     include: [][]const u8 = &.{},
+    /// `lazy_bodies = true`: a cold run lowers the stdlib's bodies on first
+    /// call and completes its image after the program. Null when unset.
+    lazy_bodies: ?bool = null,
 };
 
 pub const LibraryToml = struct {
@@ -1292,6 +1295,8 @@ fn assignApplication(a: std.mem.Allocator, app: *ApplicationToml, key: []const u
         app.main = tomlString(a, val);
     } else if (std.mem.eql(u8, key, "include")) {
         app.include = parseStrArray(a, val) catch &.{};
+    } else if (std.mem.eql(u8, key, "lazy_bodies")) {
+        app.lazy_bodies = tomlBool(val);
     }
 }
 

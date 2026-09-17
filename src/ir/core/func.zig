@@ -241,6 +241,9 @@ pub const Func = struct {
     /// An `expect` declaration. Its `actual` may live outside the pack's source set, in which
     /// case nothing serves the call and the runtime says so instead of returning `Unit`.
     is_expect: bool = false,
+    /// A lazy build deferred this body: the header stands in its slot and
+    /// the body lowers on first execution, so it counts as having a body.
+    lazy_deferred: bool = false,
     /// Carries the source `override` modifier. A call resolved against a STATIC receiver type
     /// must exclude a subtype's same-name non-override, which is outside that member scope.
     is_override: bool = false,
@@ -299,7 +302,7 @@ pub const Func = struct {
     /// True when this function has an IR body: present blocks, or blocks deferred to the
     /// image's lazy-IR section. Every bodyless check uses this, never a bare `blocks.len`.
     pub fn hasBody(self: *const Func) bool {
-        return self.blocks.len != 0 or self.deferred_offset != 0;
+        return self.blocks.len != 0 or self.deferred_offset != 0 or self.lazy_deferred;
     }
 
     /// The GetField name ConstId when the body is exactly `LoadParam #0; GetField; return`,

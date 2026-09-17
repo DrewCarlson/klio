@@ -72,7 +72,7 @@ const registry_writable = [_][]const u8{
 /// The module tables a body may append to, keyed by or holding FuncIds.
 const fid_maps = [_][]const u8{ "decl_span", "decl_sigs", "decl_user_params", "decl_user_arity", "decl_user_sig" };
 
-const Shard = struct {
+pub const Shard = struct {
     index: u32,
     module: Module,
     funcs_at_fork: u32,
@@ -87,7 +87,7 @@ const Shard = struct {
     busy_ns: u64 = 0,
 
     /// Fills the shard's own tables; the spawner's `thread` stays as it is.
-    fn fork(self: *Shard, index: u32, main: *const Module, a: Allocator) Allocator.Error!void {
+    pub fn fork(self: *Shard, index: u32, main: *const Module, a: Allocator) Allocator.Error!void {
         var m = main.*;
         m.funcs = .empty;
         try m.funcs.appendSlice(a, main.funcs.items);

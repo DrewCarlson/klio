@@ -41,12 +41,16 @@ pub fn adoptBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!
     return out;
 }
 
+/// Set for a run that lowers stdlib bodies into its own module as it goes:
+/// the module then carries every registry table, not the extend's few.
+pub var complete_run_clone: bool = false;
+
 pub fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!BuiltModule {
     const t0 = runtime.clockMonotonicNanos();
     const module_clone = blk: {
         const mg = base.module.borrow();
         defer mg.deinit();
-        break :blk try mg.get().cloneForExtend(a);
+        break :blk if (complete_run_clone) try mg.get().cloneForExtendComplete(a) else try mg.get().cloneForExtend(a);
     };
     const t_mod = runtime.clockMonotonicNanos();
     const module_ref = try ObjRef(Module).init(a, module_clone);

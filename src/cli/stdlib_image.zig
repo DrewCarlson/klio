@@ -55,6 +55,8 @@ pub const Prepared = struct {
     bindings: HostBindings,
     /// The user files parsed onto `map`; their FileIds trail the base's.
     user_asts: []const KotlinFile,
+    /// Lazy bodies: the program already ran inside the build, with this code.
+    ran: ?u8 = null,
 };
 
 fn getEnvVar(allocator: Allocator, name: []const u8) ?[]u8 {
@@ -484,6 +486,70 @@ pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8
 /// bodies; an unproven composable call bakes without its `($composer, $changed)`.
 /// The stage as the build runs it, beside its own table passes.
 const StageCtx = struct { gpa: Allocator };
+
+/// What the lazy run needs from the cold driver, and what it leaves.
+const LazyRun = struct {
+    gpa: Allocator,
+    known_packages: []const []const u8,
+    binding_fqns: []const []const u8,
+    dep_map: *const SourceMap,
+    user: ParsedUser,
+    paths: []const []const u8,
+    bindings: HostBindings,
+    prepared: ?Prepared = null,
+};
+
+/// Runs the program against a base whose bodies are still deferred; each
+/// lowers on its first call through the module's hook.
+fn lazyRunProgram(ctx: *anyopaque, base: *interp_ir.build.StdlibBase) u8 {
+    const r: *LazyRun = @ptrCast(@alignCast(ctx));
+    const prepared = finishFromBase(r.gpa, base, r) orelse return 1;
+    r.prepared = prepared;
+    interp_ir.build.lazy.enterRun();
+    trace(r.gpa, "  lazy bodies: the program runs inside the build", .{});
+    const msg = if (r.paths.len == 1) "error: no main function found" else "runtime error: no main function in module";
+    return @import("commands.zig").runBuiltModuleArgs(r.gpa, prepared.built, prepared.bindings, prepared.map, msg, &.{});
+}
+
+/// `finishFromLoaded` over a base built in this process rather than loaded
+/// from an image: the user program extends it and runs it.
+fn finishFromBase(gpa: Allocator, base: *interp_ir.build.StdlibBase, r: *const LazyRun) ?Prepared {
+    for (r.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
+    if (!interp_ir.build.canExtendBase(base, r.user.asts)) {
+        trace(gpa, "fallback (base name collision)", .{});
+        return null;
+    }
+    const map = gpa.create(SourceMap) catch return null;
+    map.* = SourceMap.init(gpa);
+    map.files.appendSlice(map.arena.allocator(), r.dep_map.files.items) catch return null;
+    const user2 = parseUserFiles(gpa, map, r.paths, r.user.texts) orelse return null;
+    publishExternDecls(gpa, base);
+    publishBaseEagerCalls(gpa, base);
+    if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    span.active_map = map;
+    // The base is baked after the run, so the run module clones its tables
+    // rather than taking them, and clones all of them: bodies lower into it
+    // as the program runs.
+    interp_ir.build.clone.complete_run_clone = true;
+    defer interp_ir.build.clone.complete_run_clone = false;
+    const built = interp_ir.build.buildModuleFilesExtend(gpa, base, user2.asts) catch return null;
+    {
+        // A body lowering on first call appends to the module frames are
+        // running in: new functions box rather than move the table, and the
+        // constants take their room now rather than move later.
+        const mg = built.module.borrow();
+        defer mg.deinit();
+        const m: *ir_mod.Module = @constCast(mg.get());
+        m.funcs_live = true;
+        m.consts.ensureUnusedCapacity(m.func_name_index.allocator, 1 << 16) catch {};
+        m.late_funcs.ensureUnusedCapacity(m.func_name_index.allocator, 1 << 14) catch {};
+    }
+    var bindings = r.bindings;
+    for (r.binding_fqns) |fqn| {
+        if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
+    }
+    return .{ .built = built, .map = map, .bindings = bindings, .user_asts = user2.asts };
+}
 
 fn stageJobRun(ctx: *anyopaque, files: []const KotlinFile) void {
     const c: *const StageCtx = @ptrCast(@alignCast(ctx));
@@ -1136,6 +1202,20 @@ fn bakeAndPrepare(
     // The build runs the stage on a thread beside its table passes.
     var stage_ctx = StageCtx{ .gpa = ba };
     interp_ir.build.setStageJob(.{ .ctx = @ptrCast(&stage_ctx), .run = stageJobRun });
+    // Lazy bodies: the build runs the program before its bodies lower.
+    var lazy_run = LazyRun{
+        .gpa = gpa,
+        .known_packages = report.known_packages.items,
+        .binding_fqns = report.binding_fqns.items,
+        .dep_map = dep_map,
+        .user = user,
+        .paths = paths,
+        .bindings = bindings,
+    };
+    const lazy_plan: ?*interp_ir.build.lazy.Plan = if (runtime.lazy_bodies)
+        interp_ir.build.lazy.arm(ba, .{ .ctx = @ptrCast(&lazy_run), .run = lazyRunProgram }) catch null
+    else
+        null;
     // The loader lists the packs' ASTs first and the stdlib's last; over a
     // layer only the packs lower, and the stage's stdlib files must be the
     // image's, in the same order, for its picks to name what the lowering
@@ -1190,6 +1270,14 @@ fn bakeAndPrepare(
     // From here the run is a warm one over the bytes just baked. A rejected
     // image is a bug in the bake; the caller's from-source path still runs
     // the program.
+    if (lazy_plan) |lp| {
+        // The program ran inside the build; the image, baked from the base
+        // the pools completed after it, is being written. The build stays
+        // resident until exit, as the run module points into it.
+        const ran = lazy_run.prepared orelse return null;
+        trace(gpa, "  lazy bodies: exit {d}; the image was baked after the run", .{lp.exit_code orelse 1});
+        return .{ .built = ran.built, .map = ran.map, .bindings = ran.bindings, .user_asts = ran.user_asts, .ran = lp.exit_code orelse 1 };
+    }
     const loaded = (image.load(gpa, bytes) catch null) orelse {
         trace(gpa, "the baked image does not load: {s}", .{image.lastLoadFailure()});
         return null;

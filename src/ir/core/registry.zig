@@ -14,6 +14,25 @@ const TypeRef = core_ids.TypeRef;
 
 /// Module-scoped side tables the Vm consults at dispatch time. Serialized into
 /// pack files, so a pre-built pack ships its registry beside its frozen IR.
+/// A hash map or list cloned with its container values cloned in turn;
+/// anything else is the same value, shared.
+fn deepClone(comptime T: type, a: Allocator, v: T) Allocator.Error!T {
+    if (@typeInfo(T) != .@"struct") return v;
+    if (@hasDecl(T, "valueIterator") and (@hasDecl(T, "cloneWithAllocator") or @hasDecl(T, "clone"))) {
+        var out = if (@hasDecl(T, "cloneWithAllocator")) try v.cloneWithAllocator(a) else try v.clone(a);
+        var it = out.valueIterator();
+        while (it.next()) |vp| vp.* = try deepClone(@TypeOf(vp.*), a, vp.*);
+        return out;
+    }
+    if (@hasField(T, "items") and @hasField(T, "capacity")) {
+        var out: T = .empty;
+        try out.appendSlice(a, v.items);
+        for (out.items) |*e| e.* = try deepClone(@TypeOf(e.*), a, e.*);
+        return out;
+    }
+    return v;
+}
+
 pub const ModuleRegistry = struct {
     /// Names of `object` singletons; the Vm publishes one instance of each as a global.
     object_names: std.ArrayList([]const u8) = .empty,
@@ -278,6 +297,22 @@ pub const ModuleRegistry = struct {
         try self.type_alias_types.put(key, shape);
         const simple = if (std.mem.lastIndexOfScalar(u8, key, '.')) |dot| key[dot + 1 ..] else key;
         try self.type_alias_simple.put(simple, {});
+    }
+
+    /// Every table, deep-cloned onto `a`: a module a program runs in and
+    /// lowers into at run time needs all of them where the extend clone
+    /// carries the few a user program's lowering reads.
+    pub fn cloneComplete(self: *const ModuleRegistry, a: Allocator) Allocator.Error!ModuleRegistry {
+        var out: ModuleRegistry = undefined;
+        inline for (std.meta.fields(ModuleRegistry)) |f| {
+            @field(out, f.name) = try deepClone(f.type, a, @field(self.*, f.name));
+        }
+        out.allocator = a;
+        // The supertype evidence is derived and rebuilt on demand; a copy of
+        // the module starts without it, as the pool's shards do.
+        out.evidence_supers = .empty;
+        out.evidence_supers_gen = out.class_super_gen;
+        return out;
     }
 
     pub fn deinit(self: *ModuleRegistry) void {

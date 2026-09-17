@@ -153,6 +153,10 @@ pub fn takePendingPicks() StagedPicks {
 /// Written by a stage thread before it is joined, read by the build after.
 pub var staged_picks: ?StagedPicks = null;
 
+/// Installed while a lazy build's program runs: a function about to
+/// execute with no blocks is handed here to lower first.
+pub var lazy_hook: ?*const fn (*const Module, *Func) void = null;
+
 /// Context parameters of a local contextual function, threaded into its body lowering.
 pub const PendingCtx = struct {
     params: []const ast.ContextParam,
@@ -556,6 +560,7 @@ pub const Module = struct {
     pub const funcById = m_lookup.funcById;
     pub const funcByIdMut = m_lookup.funcByIdMut;
     pub const adoptPicks = m_lookup.adoptPicks;
+    pub const cloneForExtendComplete = m_lookup.cloneForExtendComplete;
     pub const appendedFuncCount = m_lookup.appendedFuncCount;
     pub const appendFunc = m_lookup.appendFunc;
     pub const nextFuncId = m_lookup.nextFuncId;

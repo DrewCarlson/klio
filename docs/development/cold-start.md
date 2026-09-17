@@ -340,11 +340,13 @@ checkout (prepare 118 ms, wall 135 ms, peak 211 MB before):
 - A parse worker with nothing to take parks on an event gate.
 - The stage runs as a job the build starts once the syntax transforms
   are done and joins before the first body lowers; nothing between reads
-  its picks and nothing writes the syntax it reads. The checker therefore
-  sees the syntax as transformed, which the bodies see too: 63 of the
-  6506 stdlib functions lower differently, the same 63 whether the job
-  runs beside the passes or on the calling thread, and the stdlib
-  commontest sweep (2466 passes) and both corpus modes are unchanged.
+  its picks and nothing writes the syntax it reads. The pick tables are
+  thread-local and a module adopts them from its own thread when it is
+  made, so the stage hands its tables over and the build adopts them
+  after the join: with that, lowering fingerprints are identical to the
+  build before the move on every function. (Without it 63 functions
+  lost their eager routes, which the stdlib commontest sweep and the
+  corpus could not tell apart.)
 - A name with no inline candidate is remembered as such; the header pass
   and the resolver size their tables by declaration count.
 
@@ -361,6 +363,49 @@ coexist. The eight run-time examples are unchanged within noise.
 The pools scale at about 65% from five threads to ten, so their wall is
 compute plus contention, not the page-fault cliff the off-CPU share
 suggested; the sampler simply undercounts a phase on ten threads.
+
+### Lazy bodies
+
+Off by default, behind `klio run --lazy-bodies`, `KLIO_LAZY_BODIES=1` or
+`lazy_bodies = true` under `[application]` in the working directory's
+klio.toml. A cold run then stops the base build short of its body pools:
+every function's reserved header stands in its slot, marked deferred so
+dispatch treats it as a body (the header carries the suspension, kind
+and receiver a caller binds against), and the program runs from inside
+the build while everything the lowering installed on the thread is still
+in place. A body lowers on its first execution, where the VM already
+materialises image-deferred bodies (`ensureFuncBody`). It lowers in one
+shard forked from the base, whose tables are complete where the run
+module's extend clone is not; the functions and constants it adds are
+renumbered into the module that reached it, as the pool's merge
+renumbers a worker's, with one map per module since an anonymous
+object's side module interns its own constants and diverges. A body
+reached on a dispatcher thread lowers under the plan's own copy of the
+inline tables. When the program returns, the pools lower every deferred
+body into the base in their usual order and the run bakes and publishes
+the image as before.
+
+What it buys is the time to `main`, not the time to exit:
+
+| Cold, from outside the checkout | Eager | Lazy |
+|---|---:|---:|
+| hello, first output | 107 ms | 64 ms |
+| hello, wall to exit | 107 ms | 110 ms |
+| collections example, first output | 121 ms | 71 ms |
+| collections example, wall to exit | 130 ms | 131 ms |
+
+The collections example lowers 76 of the 4885 deferred bodies on first
+call, a coroutine example about 180 of 6587 with the packs; hello lowers
+none, as `println` is a host binding. The costs: the build stays resident
+for the whole run (the run's resident set is the build's, about 95 MB at
+`main` for hello against 48), the image lands only once the program ends
+and a program that exits abnormally leaves no image, and the completed
+image numbers its lambdas after the data-class components rather than
+before them, so it differs from an eager bake in ids though not in
+behaviour. The eager path is untouched: its fingerprints are identical on
+every function. The corpus in lazy mode and a warm run of the corpus over
+a lazy-baked image both hold the baseline. Bundles ship an image and never
+take this path.
 
 ### What remains
 

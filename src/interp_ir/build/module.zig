@@ -618,6 +618,14 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         out_lifted,
         own_base,
     );
+    if (build_overrides.lazy.active_build) |p| {
+        build_overrides.lazy.active_build = null;
+        // The program runs here, inside the build, so what the lowering
+        // installed on this thread stays in place for the bodies that lower
+        // on first call; the pools then complete the base for the bake.
+        if (p.after_build) |after| after(p, built, if (out_lifted) |l| l.* else &.{});
+        try build_overrides.lazy.complete(p);
+    }
     // The lifted copies in the build carry every declaration; the concatenated
     // file's own arrays are dead.
     allocator.free(combined.decls);

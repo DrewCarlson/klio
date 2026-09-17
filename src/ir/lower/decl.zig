@@ -1134,17 +1134,23 @@ pub fn beginClass(
 /// Places every lowered member (`lowered[i]` for member `i`, null for the
 /// rest) in declaration order and seals the class's method list.
 pub fn finishClass(state: *ClassState, lowered: []const ?Func) Allocator.Error!ClassId {
+    return finishClassOpts(state, lowered, false);
+}
+
+/// `keep_state` leaves the class state and its member sets alive: a build
+/// that defers its bodies lowers them later against them.
+pub fn finishClassOpts(state: *ClassState, lowered: []const ?Func, keep_state: bool) Allocator.Error!ClassId {
     const module = state.module;
     const a = module.registry.allocator;
     const c = state.c;
     const class_id = state.class_id;
-    defer {
+    defer if (!keep_state) {
         state.own_member_names.deinit();
         a.destroy(state.own_member_names);
         state.own_member_arity.deinit();
         a.destroy(state.own_member_arity);
         a.destroy(state);
-    }
+    };
     var methods: std.ArrayList(FuncId) = .empty;
     errdefer methods.deinit(a);
     var ctx: ClassLower = .{

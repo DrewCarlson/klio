@@ -73,6 +73,11 @@ pub fn default(allocator: Allocator) Module {
 /// Decoded into the module's process-lifetime arena, so the patch outlives a per-program build.
 pub fn ensureFuncBody(self: *const Module, func: *Func) bool {
     if (func.blocks.len != 0) return true;
+    // A body a lazy build deferred lowers here, on its first execution.
+    if (root_ir.lazy_hook) |hook| {
+        hook(self, func);
+        if (func.blocks.len != 0) return true;
+    }
     if (func.deferred_offset == 0) return false;
     const decode = self.deferred_func_decode orelse return false;
     // The header lock serializes decode and publication: the two-word `blocks` write
@@ -337,6 +342,14 @@ pub fn deinit(self: *Module, allocator: Allocator) void {
 
 /// Clone for EXTENSION: container spines are copied onto `a`, leaf data (instructions, strings,
 /// params, registry values) is shared with the arena-owned original, which must stay immutable.
+/// The extend clone with every registry table, for a module a program runs
+/// in and lowers into at run time.
+pub fn cloneForExtendComplete(self: *const Module, a: Allocator) Allocator.Error!Module {
+    var out = try self.cloneForExtend(a);
+    out.registry = try self.registry.cloneComplete(a);
+    return out;
+}
+
 pub fn cloneForExtend(self: *const Module, a: Allocator) Allocator.Error!Module {
     var out = Module.init(a);
     // Base funcs (ids 0..base_n) are delegated through the shared lazy header section, so

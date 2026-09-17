@@ -881,6 +881,29 @@ pub fn captureThreadState() ThreadState {
     };
 }
 
+/// A state whose tables are the caller's own copies, for a thread that
+/// must keep lowering after this thread's tables are rebuilt: a build on
+/// this thread replaces and frees them. The resolution cache and the id
+/// cache start empty; the alias tags are the build's and outlive it.
+pub fn cloneThreadState(a: Allocator, s: ThreadState) Allocator.Error!ThreadState {
+    var out = s;
+    out.inline_fn_asts = if (s.inline_fn_asts) |m| try cloneWith(a, m) else null;
+    out.inline_fn_asts_resolved = null;
+    out.shadowed_inline_names = if (s.shadowed_inline_names) |m| try cloneWith(a, m) else null;
+    out.inline_fn_ids = if (s.inline_fn_ids) |m| try cloneWith(a, m) else null;
+    out.inline_id_by_fn = null;
+    out.inline_member_owner = if (s.inline_member_owner) |m| try cloneWith(a, m) else null;
+    out.top_level_prop_names = if (s.top_level_prop_names) |m| try cloneWith(a, m) else null;
+    out.member_prop_asts = if (s.member_prop_asts) |m| try cloneWith(a, m) else null;
+    out.member_ext_prop_recv = if (s.member_ext_prop_recv) |m| try cloneWith(a, m) else null;
+    out.class_supertype_refs = if (s.class_supertype_refs) |m| try cloneWith(a, m) else null;
+    return out;
+}
+
+fn cloneWith(a: Allocator, m: anytype) Allocator.Error!@TypeOf(m) {
+    return m.cloneWithAllocator(a);
+}
+
 pub fn installThreadState(s: ThreadState) Allocator.Error!void {
     deferred_section = s.deferred_section;
     deferred_alloc = s.deferred_alloc;

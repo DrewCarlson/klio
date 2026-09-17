@@ -150,6 +150,8 @@ pub const buildStdlibBaseOnTop = build_base.buildStdlibBaseOnTop;
 pub const stripStdlibBase = build_base.stripBase;
 pub const stripStdlibBaseKeep = build_base.stripBaseKeep;
 pub const StageJob = build_overrides.StageJob;
+pub const lazy = build_overrides.lazy;
+pub const clone = build_clone;
 
 /// Hands the next build a stage to run beside its table passes.
 pub fn setStageJob(job: StageJob) void {
