@@ -222,7 +222,7 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     } else if (std.mem.eql(u8, cmd, "bundle")) {
         return bundle.runBundle(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "bake-image")) {
-        return runBakeImageCmd(gpa, rest);
+        return runBakeImageCmd(gpa, rest, argv[0]);
     } else if (std.mem.eql(u8, cmd, "run-image")) {
         return runRunImageCmd(gpa, rest);
     }
@@ -236,10 +236,12 @@ fn usageBakeImage(gpa: std.mem.Allocator) u8 {
     return 2;
 }
 
-fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []const u8) u8 {
     var out: ?[]const u8 = null;
     var program: ?[]const u8 = null;
     var stdlib_cache: ?[]const u8 = null;
+    // The child half of `--stdlib-cache`: one probe's image in this process.
+    var probe: ?[]const u8 = null;
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
     var i: usize = 0;
@@ -253,6 +255,10 @@ fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return usageBakeImage(gpa);
             stdlib_cache = args[i];
+        } else if (std.mem.eql(u8, a, "--probe")) {
+            i += 1;
+            if (i >= args.len) return usageBakeImage(gpa);
+            probe = args[i];
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
             if (i >= args.len) return usageBakeImage(gpa);
@@ -267,8 +273,9 @@ fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     defer deinitRequestedFeatures(&requested);
     if (stdlib_cache) |dir| {
         if (program != null or out != null) return usageBakeImage(gpa);
-        return stdlib_image.bakeStdlibCache(gpa, dir, &requested);
+        return stdlib_image.bakeStdlibCache(gpa, dir, &requested, self_exe, probe);
     }
+    if (probe != null) return usageBakeImage(gpa);
     if (program == null or out == null) return usageBakeImage(gpa);
     return bundle.bakeImage(gpa, &.{program.?}, &requested, out.?);
 }

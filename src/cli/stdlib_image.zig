@@ -1307,13 +1307,84 @@ fn dropBuildHeap(heap: *runtime.slab.Heap) void {
     runtime.slab.releaseAll(heap);
 }
 
-/// `klio bake-image --stdlib-cache <dir>`: bake the stdlib-only image, keyed
-/// as this binary keys it, into `dir` as a cache the runtime reads when its
+/// `klio bake-image --stdlib-cache <dir>`: bake the stdlib-only images, keyed
+/// as this binary keys them, into `dir` as a cache the runtime reads when its
 /// own misses. The build runs it on the freshly built binary and installs the
-/// directory beside it, so a rebuilt klio's first run is not a cold one. The
-/// base is that of a program with no imports, which is what any import-free
-/// program looks up; a program that pulls packs in still bakes its own.
-pub fn bakeStdlibCache(gpa: Allocator, dir: []const u8, features: *const RequestedFeatures) u8 {
+/// directory beside it, so a rebuilt klio's first run is not a cold one. Two
+/// images, one per gate: the implicit one an import-free program looks up, and
+/// the full one a program with a stdlib import looks up, which is also what a
+/// program that pulls packs in builds its own base on.
+///
+/// Each image bakes in a child process (`--probe <name>` is the child's
+/// spelling). A bake leaves state behind that a second bake in the same
+/// process lowers differently: the second image diverged from a runtime bake
+/// of its own key by six megabytes and dispatched a delegated read to the
+/// wrong function, while the first matched byte for byte. The runtime bakes
+/// one image per process, so only a fresh process reproduces its image.
+pub fn bakeStdlibCache(
+    gpa: Allocator,
+    dir: []const u8,
+    features: *const RequestedFeatures,
+    self_exe: []const u8,
+    only_probe: ?[]const u8,
+) u8 {
+    const probes = [_]struct { name: []const u8, source: []const u8 }{
+        .{ .name = "probe.kt", .source = "fun main() {}\n" },
+        .{ .name = "probe_full.kt", .source = "import kotlin.math.abs\nfun main() { abs(1) }\n" },
+    };
+    if (only_probe) |want| {
+        for (&probes) |pr| {
+            if (std.mem.eql(u8, pr.name, want)) return bakeStdlibProbe(gpa, dir, features, pr.name, pr.source);
+        }
+        io.printStderr(gpa, "error: unknown stdlib-cache probe `{s}`\n", .{want});
+        return 1;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var threaded = threadedIo(gpa);
+    defer threaded.deinit();
+    const rio = threaded.io();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    runtime.procEnvPutAllInto(gpa, &env);
+
+    for (&probes) |pr| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        argv.appendSlice(a, &.{ self_exe, "bake-image", "--stdlib-cache", dir, "--probe", pr.name }) catch return 1;
+        var lib_it = features.iterator();
+        while (lib_it.next()) |entry| {
+            var feat_it = entry.value_ptr.keyIterator();
+            while (feat_it.next()) |feat| {
+                argv.append(a, "--feature") catch return 1;
+                argv.append(a, std.fmt.allocPrint(a, "{s}/{s}", .{ entry.key_ptr.*, feat.* }) catch return 1) catch return 1;
+            }
+        }
+        const res = std.process.run(gpa, rio, .{ .argv = argv.items, .environ_map = &env }) catch |e| {
+            io.printStderr(gpa, "error: the stdlib image bake for {s} could not start: {s}\n", .{ pr.name, @errorName(e) });
+            return 1;
+        };
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        if (res.stderr.len != 0) io.writeStderr(res.stderr);
+        switch (res.term) {
+            .exited => |code| if (code != 0) {
+                io.printStderr(gpa, "error: the stdlib image bake for {s} exited with {d}\n", .{ pr.name, code });
+                return 1;
+            },
+            else => {
+                io.printStderr(gpa, "error: the stdlib image bake for {s} died\n", .{pr.name});
+                return 1;
+            },
+        }
+    }
+    return 0;
+}
+
+/// One probe's bake into `dir`, in this process: the child half of
+/// `bakeStdlibCache`.
+fn bakeStdlibProbe(gpa: Allocator, dir: []const u8, features: *const RequestedFeatures, name: []const u8, source: []const u8) u8 {
     cache_dir_override = dir;
     defer cache_dir_override = null;
     const cache = cacheDir(gpa) orelse {
@@ -1321,28 +1392,19 @@ pub fn bakeStdlibCache(gpa: Allocator, dir: []const u8, features: *const Request
         return 1;
     };
     defer gpa.free(cache);
-    // Two images, one per gate: the implicit one an import-free program looks
-    // up, and the full one a program with a stdlib import looks up, which is
-    // also what a program that pulls packs in builds its own base on.
-    const probes = [_]struct { name: []const u8, source: []const u8 }{
-        .{ .name = "probe.kt", .source = "fun main() {}\n" },
-        .{ .name = "probe_full.kt", .source = "import kotlin.math.abs\nfun main() { abs(1) }\n" },
-    };
-    for (probes) |pr| {
-        const probe = std.fs.path.join(gpa, &.{ cache, pr.name }) catch return 1;
-        defer gpa.free(probe);
-        writeAtomic(gpa, cache, probe, pr.source);
-        defer {
-            var threaded = threadedIo(gpa);
-            defer threaded.deinit();
-            std.Io.Dir.cwd().deleteFile(threaded.io(), probe) catch {};
-        }
-        const prepared = tryPrepare(gpa, &.{probe}, features);
-        finishBackgroundBake();
-        if (prepared == null) {
-            io.printStderr(gpa, "error: the stdlib image did not bake into {s}\n", .{dir});
-            return 1;
-        }
+    const probe = std.fs.path.join(gpa, &.{ cache, name }) catch return 1;
+    defer gpa.free(probe);
+    writeAtomic(gpa, cache, probe, source);
+    defer {
+        var threaded = threadedIo(gpa);
+        defer threaded.deinit();
+        std.Io.Dir.cwd().deleteFile(threaded.io(), probe) catch {};
+    }
+    const prepared = tryPrepare(gpa, &.{probe}, features);
+    finishBackgroundBake();
+    if (prepared == null) {
+        io.printStderr(gpa, "error: the stdlib image did not bake into {s}\n", .{dir});
+        return 1;
     }
     return 0;
 }

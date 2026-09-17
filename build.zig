@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const stdlib_sources = @import("src/stdlib/stdlib_sources.zig");
 
 /// One Zig module per former Rust crate. `deps` are the non-dev crate
@@ -741,6 +742,12 @@ pub fn build(b: *std.Build) void {
         .install_dir = .prefix,
         .install_subdir = "share/klio/cache",
     });
+    // The install merges into the directory, so without this every earlier
+    // binary's images would stay beside the new ones (1.6 GB after a day).
+    if (builtin.os.tag != .windows) {
+        const clear_cache = b.addSystemCommand(&.{ "rm", "-rf", b.getInstallPath(.prefix, "share/klio/cache") });
+        stdlib_cache_install.step.dependOn(&clear_cache.step);
+    }
     b.getInstallStep().dependOn(&stdlib_cache_install.step);
 
     // The C-ABI runtime library the C transpiler's output links against:
