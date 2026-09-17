@@ -41,7 +41,10 @@ const Registry = struct {
     var map: ?std.AutoHashMap(usize, *Monitor) = null;
 
     fn allocator() std.mem.Allocator {
-        return std.heap.page_allocator;
+        // One monitor per lock OBJECT, and a continuation mints a new one per
+        // suspension, so the table grows through the run: a page per entry is both
+        // an mmap and 16 KB of address space.
+        return std.heap.smp_allocator;
     }
 };
 

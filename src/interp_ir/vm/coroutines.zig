@@ -220,7 +220,9 @@ const SlotOwners = struct {
     var pending: ?std.AutoHashMap(i64, Value) = null;
 
     fn allocator() Allocator {
-        return std.heap.page_allocator;
+        // Park and resume insert and remove per suspension, so the page allocator
+        // would round-trip a mapping through mmap and munmap on every one.
+        return std.heap.smp_allocator;
     }
 
     fn ensure() Allocator.Error!*std.AutoHashMap(i64, ObjRef(DriverWakeup)) {
@@ -286,7 +288,9 @@ const PersistedParked = struct {
     var map: ?std.AutoHashMap(i64, Entry) = null;
 
     fn allocator() Allocator {
-        return std.heap.page_allocator;
+        // Park and resume insert and remove per suspension, so the page allocator
+        // would round-trip a mapping through mmap and munmap on every one.
+        return std.heap.smp_allocator;
     }
 
     fn put(slot: i64, state: SuspendState, scope_delta: []Value) Allocator.Error!void {
@@ -372,7 +376,9 @@ const VirtualClock = struct {
     var pool_unsettled: usize = 0;
 
     fn allocator() Allocator {
-        return std.heap.page_allocator;
+        // Park and resume insert and remove per suspension, so the page allocator
+        // would round-trip a mapping through mmap and munmap on every one.
+        return std.heap.smp_allocator;
     }
 
     fn enterUnsettled() void {

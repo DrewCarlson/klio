@@ -417,7 +417,7 @@ fn internShape(fields: []const InstanceData.Field) usize {
             shape_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         break :blk shape_arena_state.?.allocator();
     };
-    const gop = shape_table.getOrPut(std.heap.page_allocator, h) catch return SHAPE_NONE;
+    const gop = shape_table.getOrPut(std.heap.smp_allocator, h) catch return SHAPE_NONE;
     if (!gop.found_existing) gop.value_ptr.* = .empty;
     for (gop.value_ptr.items) |rec| {
         if (shapeMatches(rec, fields)) return @intFromPtr(rec);
@@ -431,7 +431,9 @@ fn internShape(fields: []const InstanceData.Field) usize {
         lens[i] = @intCast(f.name.len);
     }
     rec.* = .{ .ptrs = ptrs, .lens = lens };
-    gop.value_ptr.append(std.heap.page_allocator, rec) catch return SHAPE_NONE;
+    // A bucket list on the page allocator costs a mapping and an mmap for its first
+    // element, and a layout miss is per instance, not per class.
+    gop.value_ptr.append(std.heap.smp_allocator, rec) catch return SHAPE_NONE;
     shape_count += 1;
     return @intFromPtr(rec);
 }
