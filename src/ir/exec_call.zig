@@ -433,6 +433,9 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
     // Monomorphic fast path: a single-overload non-extension top-level function
     // with a body and no varargs, defaults, type params or native binding.
     if (comptime @hasDecl(H, "callFuncFast")) {
+        if (call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) {
+            dispatchBump(.static_decline_named);
+        }
         if (call.type_args.len == 0 and argNamesAllNull(call.arg_names)) {
             if (frame.module.funcById(call.func)) |cf| {
                 var plan = cf.fast_call;
@@ -442,6 +445,12 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                 }
                 // The low bits carry the eligible arity plus 2.
                 const plan_arity = plan & 0x1FFF;
+                if (plan_arity < 2) {
+                    dispatchBump(.static_decline_plan);
+                    if (runtime.envOnce("KLIO_FASTPLAN_TRACE")) |w| {
+                        if (w.len == 1 and w[0] == '*') std.debug.print("[fastplan-decline] {s}\n", .{cf.name});
+                    }
+                }
                 // Same-name, same-arity peers: only this site's scope can say
                 // whether the baked target is the one resolution picks.
                 var ambig_ok = true;
@@ -458,6 +467,8 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                         ambig_ok = false;
                     }
                 }
+                if (!ambig_ok) dispatchBump(.static_decline_ambig);
+                if (ambig_ok and plan_arity >= 2 and plan_arity - 2 != call.n_args) dispatchBump(.static_decline_arity);
                 if (ambig_ok and plan_arity >= 2 and plan_arity - 2 == call.n_args) {
                     const args_list = try readArgList(allocator, frame, call.args, call.n_args);
                     // The caller's `this` seeds the enclosing receiver: lexical
@@ -3386,6 +3397,9 @@ pub inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
 /// The value-level core of `primitiveMemberFast`, shared with the frameless leaf
 /// walk: a pure function of the receiver, name and at most one argument.
 pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Value {
+    // No instance is a primitive, and an instance is the receiver this is asked
+    // about most; deciding it here spares the name compares below.
+    if (recv_in.* == .Instance) return null;
     const recv = recv_in.*;
     // `compareTo` on two same-kind primitives answers what the host intrinsic does:
     // the CODE DIFFERENCE for `Char`, and -1/0/1 for `Int`/`Long`.
@@ -3508,12 +3522,15 @@ pub inline fn nullSiteOk(comptime H: type, host: *H, recv: *const Value, name: [
 
 pub inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) ?Value {
     if (cm.x().arg_names.len != 0 or cm.n_args == 0) return null;
+    // The indexed shapes are arrays, lists, maps and strings; an instance
+    // receiver reaches neither serve, so its tag answers before the names do.
+    const recv = frame.read(cm.receiver);
+    if (recv == .Instance) return null;
     const nm = constStr(frame.module, cm.name) orelse return null;
     const is_get = cm.n_args == 1 and std.mem.eql(u8, nm, "get");
     const is_set = cm.n_args == 2 and std.mem.eql(u8, nm, "set");
     if (!is_get and !is_set) return null;
     const idx_v = frame.read(Reg.from(cm.args.int()));
-    const recv = frame.read(cm.receiver);
     if (is_get) return fastIndexGet(&recv, &idx_v);
     const new_val = frame.read(Reg.from(cm.args.int() + 1));
     return fastIndexSet(allocator, &recv, &idx_v, new_val);

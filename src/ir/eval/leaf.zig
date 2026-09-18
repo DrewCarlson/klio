@@ -529,6 +529,13 @@ fn leafTraceWant(func: *const Func) bool {
 
 /// Members of a builtin receiver answered without entering the field ladder.
 pub fn builtinFieldFast(comptime H: type, host: *H, allocator: Allocator, recv: *const Value, name: []const u8) Allocator.Error!?Value {
+    // Every shape below is a builtin container, string or range. Deciding that
+    // from the receiver's tag first spares the name compares on the receiver
+    // this is asked about most: an instance, which answers none of them.
+    switch (recv.*) {
+        .Array, .String, .List, .Set, .Range => {},
+        else => return null,
+    }
     // `indices` and `lastIndex` are shadowable stdlib extension properties, so the serve is gated on
     // the host's program-wide verdict that no user declaration shadows them.
     if (std.mem.eql(u8, name, "indices") or std.mem.eql(u8, name, "lastIndex")) {

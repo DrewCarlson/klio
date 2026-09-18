@@ -374,6 +374,11 @@ pub const DispatchKind = enum(u8) {
     /// Exact static calls fused by the cached fast plan, split by admission.
     static_flat_fuse,
     static_flat_fuse_ext,
+    /// Why an exact static call did NOT reach the fused plan.
+    static_decline_named,
+    static_decline_plan,
+    static_decline_ambig,
+    static_decline_arity,
     /// By-name member calls replayed from their instruction-site memo.
     member_site_flat,
     /// Every interpreter frame constructed: the denominator for the rest.
@@ -599,7 +604,7 @@ pub fn frameCountDump(module: *const Module) void {
         }
     }
     std.debug.print("[census-split] compose={d} accessor={d} lambda={d} coroutines={d} other={d}\n", .{ in_compose, in_accessor, in_lambda, in_coroutines, in_other });
-    const top = @min(list.items.len, 40);
+    const top = @min(list.items.len, 300);
     for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}\n", .{ e.n, e.name });
 }
 

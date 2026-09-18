@@ -145,6 +145,64 @@ off a monomorphic member call and 0.9% off an object construction. Three compose
 tests that had been timing out under fleet load now pass, and the gate holds its
 1402/2.
 
+## Where the time is, measured four ways
+
+The four instruments disagree, and the disagreement is the finding.
+
+**Self time by subsystem** is the only measure that cannot double-count, and it
+is flat:
+
+| Subsystem | Share |
+|-----------|------:|
+| call and frame machinery | 22% |
+| instruction execution (walker, bytecode, leaf, fused tiers) | 21% |
+| host dispatch and resolution | 14% |
+| name-keyed table probes and hashing | 13% |
+| allocation, collection, object cells | 10% |
+| everything else | 20% |
+
+**The opcode sampler** says `Call` holds 67.6% — but the opcode tag is set at
+`execInst` entry and a callee served by the leaf or fused tier never sets its
+own, so a call's tag covers every body those tiers run. It ranks, it does not
+apportion.
+
+**The Kotlin-function sampler** says `KlioContinuation.resumeWith` holds 44% on
+two activations per recomposition. That is the same leak: everything the resume
+subtree runs outside a framed body bills to it. Resumes replay about four frames
+each, which is the normal unwind depth, not a pathology.
+
+**Child attribution over the call tree** is useless on the recursive spine —
+every wrapper reports 0.34% self and 99.66% "child" — but it is exact off the
+spine, and there it showed the field-read arm is 61% running getter BODIES,
+27.6% the resolution ladder, and 10.8% its own fast path.
+
+The lesson for the next pass: rank with the samplers, apportion with self time,
+and never let a percentage from a nested instrument justify a change.
+
+## What a call costs, and why it does not fuse
+
+`execArmCall` runs 904 static calls per recomposition. 47% reach the fused plan
+that pushes the callee's frame directly; the rest take a tail that allocates an
+argument run, resolves names, builds a type-argument list and re-checks the
+overload. The declines are now censused (`KLIO_DISPATCH_STATS`):
+
+| Decline | Share of static calls |
+|---------|----------------------:|
+| callee's plan ineligible | 31% |
+| named or type arguments at the site | 5% |
+| same-name, same-arity peers | 4.5% |
+| argument count is not the plan's arity | 0.8% |
+
+`KLIO_FASTPLAN_TRACE=*` names the ineligible callees, and they are led by
+`isFull`, `__klioMonitorEnter`/`Exit`, `hash`, `countTrailingZeroBits`, `max`
+and `unbox` — targets the link settled on a native binding, which have no body
+to enter.
+
+The bytecode tier covers thirteen opcodes: constants, moves, binary operators
+and control flow. Every field read, call, construction, global load and lambda
+escapes to the generic arm, so the tier never sees the instructions this
+workload is made of.
+
 ## Leads measured and rejected
 
 Recorded because the measurement is the finding. All four looked right and none
@@ -172,6 +230,43 @@ of them paid.
 - **Hashing a `(class, member)` pair in one pass** over a joined stack buffer
   instead of hashing each name and mixing. 1.1% slower: the copy costs more than
   the hash's second setup.
+- **Serving a link-settled native binding from the call instruction**, sparing
+  the four host layers and the argument-run allocation between the instruction
+  and a function with no body. It fires on 33 000 calls per advance and measures
+  neutral, with the discriminator free (a flag in the plan word the site already
+  loads) or charged (a hash probe per call). The layers are not the cost.
+- **Letting a fully-applied call to a defaulted function fuse.** A call that
+  supplies every parameter runs no thunk and fills nothing, and the plan already
+  records the full arity, so excluding default-bearing functions outright was
+  costing every composable its fast plan. It adds 1 262 fused calls per advance
+  and measures neutral.
+- **Hoisting the field-read guard above the resolution arms**, the order a
+  specializing bytecode VM uses: compare the claimed class, then load the slot,
+  with the builtin-field shapes and the companion sentinel as the deopt path.
+  It measures -0.3% and BREAKS FIVE compose tests. The one thing it skips is the
+  enclosing-`this` push, which is documented as keeping the caller's receiver
+  reachable "while the property resolves" — and something observes that entry
+  during what is otherwise a pure slot read. The coupling is worth finding before
+  this is tried again; until then the guard stays where it is.
+
+## What a ten-fold would take
+
+`derivedStateOfLeak` allows 320 µs per recomposition. klio spends 2 980 µs on
+1 243 activations and 5 515 instructions the generic arm executes — about 260 ns
+per activation would be the budget, against roughly 2 400 ns today. A bytecode
+VM reaches that budget; klio's pipeline cannot be trimmed into it, because no
+stage of it is more than a fifth of the total. Three changes would move the
+floor, and all three are re-architecture rather than optimisation:
+
+1. **Resolve every call and field access to a slot or `FuncId` at link time** so
+   the steady state never consults a name. The site memos approximate this, but
+   the generality they fall back to is structured into every path, so even a hit
+   pays for the miss's shape.
+2. **Widen the bytecode tier to the instructions this workload runs** — field
+   reads, calls, constructions — so the common path never reaches the union
+   dispatch.
+3. **Flatten the activation**: register windows in one contiguous stack rather
+   than a per-activation list plus a host round-trip per call.
 
 The pattern: klio's hot path is cache-resident, so adding a lookup table to
 avoid a short scan loses, and removing work the operation did not need wins.
