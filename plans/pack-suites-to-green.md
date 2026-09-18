@@ -240,14 +240,68 @@ of them paid.
   records the full arity, so excluding default-bearing functions outright was
   costing every composable its fast plan. It adds 1 262 fused calls per advance
   and measures neutral.
+- **Serving a static call's linked native binding from the call instruction**
+  and **collapsing the activation seam's four tier probes onto the memos each
+  already keeps on the `Func`**. Both neutral. The seam and the host layers are
+  not the cost.
 - **Hoisting the field-read guard above the resolution arms**, the order a
   specializing bytecode VM uses: compare the claimed class, then load the slot,
   with the builtin-field shapes and the companion sentinel as the deopt path.
   It measures -0.3% and BREAKS FIVE compose tests. The one thing it skips is the
   enclosing-`this` push, which is documented as keeping the caller's receiver
   reachable "while the property resolves" — and something observes that entry
-  during what is otherwise a pure slot read. The coupling is worth finding before
-  this is tried again; until then the guard stays where it is.
+  during what is otherwise a pure slot read. Placing the serve LATER — after the
+  builtin shapes and the companion sentinel, before only the push — is worse
+  still: 31 failures, most of `PausableCompositionTests`, which is far outside
+  the shard's noise band and so is certainly a real break. The six-failure
+  reading for the first placement is NOT certain: on a loaded machine one binary
+  gave 6 then 7 failures while another gave 6 then 2, so shard counts only
+  discriminate when the machine is quiet. What is established is that a
+  specialised field read cannot skip the preamble wholesale, which also blocks a
+  `GetField` bytecode op until the coupling is found.
+
+## The frameless tier, and why the workload cannot reach it
+
+The interpreter has four tiers. Measured on a bare one-parameter activation
+(`scratchpad/probe/ProbeAct.kt`, 292 ns against a 118 ns empty loop):
+
+| Quantity | Value |
+|----------|------:|
+| One activation, simplest possible | 174 ns |
+| The fused walker, per instruction | ~19 ns |
+| The fused walker's entry | ~25 ns |
+
+So the frameless tier is roughly ten times cheaper per instruction than the
+framed path — and a recomposer frame runs 79% of its activations framed anyway.
+`KLIO_FUSE_DECLINE=1` names every activation the tier turns away and why:
+
+| Gate | Share of declines |
+|------|------------------:|
+| the body's classification | 96% |
+| a partial body with no materialize allowed | 2.3% |
+| argument count not the declared arity | 2.1% |
+
+and the classification declines are led, per advance, by
+`AtomicArray.get` (16 962), `CoroutineContext.Element.get` (13 305),
+`atomic` (9 914), `ChannelSegment.getState` (9 422),
+`ContinuationInterceptor.get` (7 021) and `CombinedContext.get` (6 360).
+
+Two of the classifier's rules were tested against that census and neither paid:
+
+- **A defaulted parameter is a hard decline.** `fusedExecOpt` only enters when
+  the call supplied every parameter, so no thunk can run and nothing is filled;
+  the rule looked redundant and the compose pass gives every composable a marker
+  default. Removing it changed the fused counts by three activations in two
+  million. The composables are declined earlier, by something else.
+- **A generic signature is a hard decline** — `bareTypeVarHead` on the return
+  type or any parameter — which is exactly what shuts out the coroutine-context
+  family, since `get` returns `E?`. The rule reads as belt-and-braces, because
+  `as T` and `is T` are guarded per instruction and no other fusable op reads a
+  type argument. Removing it admitted 84 500 activations and made things
+  slightly WORSE, and full fusion fell from 535 778 to 415 211: the newly
+  admitted bodies classify as partial rather than fusable, and their callers
+  lose their own full-fusion verdict through the `.Call` arm. The rule is
+  load-bearing through the recursive classification, not just its own decline.
 
 ## What a ten-fold would take
 

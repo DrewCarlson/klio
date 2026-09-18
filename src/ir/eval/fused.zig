@@ -273,6 +273,19 @@ inline fn fusedRaise(e: EvalError) FusedFail {
     return error.Raise;
 }
 
+/// `KLIO_FUSE_DECLINE=1`: one line per activation the frameless tier turned
+/// away, naming the gate and the function, so the declines can be counted by
+/// weight rather than by distinct function.
+var fuse_decline_state: u8 = 0;
+
+fn fusedDecline(reason: []const u8, func: *const Func) void {
+    if (fuse_decline_state == 0) {
+        fuse_decline_state = if (runtime.envOnce("KLIO_FUSE_DECLINE") != null) 2 else 1;
+    }
+    if (fuse_decline_state != 2) return;
+    std.debug.print("[fuse-decline] {s} {s}\n", .{ reason, if (func.fqn.len != 0) func.fqn else func.name });
+}
+
 /// The tier's entry: null when the body is ineligible and the caller must take the framed
 /// path, else an `.ok` or a genuinely raised `.err`, never an abandon.
 pub fn fusedExec(
@@ -301,18 +314,33 @@ pub fn fusedExecOpt(
     if (!fusedEnabled()) return null;
     if (!fusedNameSelected(if (func.fqn.len != 0) func.fqn else func.name)) return null;
     const verdict = fusedVerdict(H, host, module, func);
-    if (verdict == 2) return null;
-    if (verdict == 4 and !allow_materialize) return null;
-    if (args.len != func.params.len) return null;
+    if (verdict == 2) {
+        fusedDecline("classify", func);
+        return null;
+    }
+    if (verdict == 4 and !allow_materialize) {
+        fusedDecline("partial-no-materialize", func);
+        return null;
+    }
+    if (args.len != func.params.len) {
+        fusedDecline("arity", func);
+        return null;
+    }
     // An inner-class member's bare reads reach the enclosing instance, which the walker does
     // not model, so a receiver carrying an outer declines.
     if (args.len > 0 and args[0] == .Instance) {
         const g = args[0].Instance.borrow();
         const has_outer = g.get().outer != null;
         g.deinit();
-        if (has_outer) return null;
+        if (has_outer) {
+            fusedDecline("receiver-has-outer", func);
+            return null;
+        }
     }
-    if (fusedTls().depth >= FUSED_BANK_DEPTH) return null;
+    if (fusedTls().depth >= FUSED_BANK_DEPTH) {
+        fusedDecline("bank-depth", func);
+        return null;
+    }
     // A hot fully-fusable body yields so the function JIT can count it; a fused body opens no frame.
     if (jit_loop.fusedShouldYieldToFuncTier(func)) return null;
     // A memoized verdict reaches this thread without ordering against the body's lazy decode;
