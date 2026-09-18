@@ -108,10 +108,16 @@ pub fn runBoundaryAbandonActive() bool {
 }
 
 /// True when abandonment is requested and the thread is either abandonable or
-/// the boundary is draining. The threadlocal gate keeps the check cheap.
+/// the boundary is draining.
+///
+/// The request flag is read first because it is a plain global and the other
+/// two are not: `thread_abandonable` is threadlocal, and on Darwin every read
+/// of it is a `_tlv_get_addr` call. This guard runs on every branch and back
+/// edge the evaluator takes, and abandonment is off for all but the last
+/// instants of a run, so the ordinary answer now costs one acquire load.
 pub fn shouldAbandon() bool {
-    if (!thread_abandonable and !run_boundary_abandon.load(.acquire)) return false;
-    return abandon_requested.load(.acquire);
+    if (!abandon_requested.load(.acquire)) return false;
+    return thread_abandonable or run_boundary_abandon.load(.acquire);
 }
 
 /// Raw flag addresses for the transpiled hot path's inlined edge guard.
