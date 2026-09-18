@@ -393,7 +393,7 @@ pub fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const 
         cg.deinit();
         g.deinit();
     }
-    const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ name, args.len });
+    const arity_name = try hcm.joinArity(allocator, name, args.len);
     // Scratch lookup key (lookupAnonMethod dupes what it stores); free it.
     defer if (runtime.freeScratch()) allocator.free(arity_name);
     if (missTraceEnv()) |want| if (std.mem.eql(u8, want, name)) {
@@ -541,7 +541,25 @@ pub const AnonMethodEntry = root_mod.AnonMethodEntry;
 /// `(class, member)` key for `anon_methods`, unit-separated so the two
 /// segments can't collide. Must match `run.zig`/`host_fields.zig`.
 pub fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class_name, member });
+    const sep = "\u{1f}";
+    const out = try allocator.alloc(u8, class_name.len + sep.len + member.len);
+    @memcpy(out[0..class_name.len], class_name);
+    @memcpy(out[class_name.len..][0..sep.len], sep);
+    @memcpy(out[class_name.len + sep.len ..], member);
+    return out;
+}
+
+/// `<a>\u{1f}<b>` in `buf`, or null when it does not fit. The formatter's
+/// machinery is heavier than the join, and this runs on every dispatch that
+/// reaches an anonymous-object method table.
+fn joinKey(buf: []u8, a: []const u8, b: []const u8) ?[]const u8 {
+    const sep = "\u{1f}";
+    const n = a.len + sep.len + b.len;
+    if (n > buf.len) return null;
+    @memcpy(buf[0..a.len], a);
+    @memcpy(buf[a.len..][0..sep.len], sep);
+    @memcpy(buf[a.len + sep.len ..][0..b.len], b);
+    return buf[0..n];
 }
 
 pub fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const u8, arity_name: []const u8, name: []const u8) ?AnonMethodEntry {
@@ -550,16 +568,16 @@ pub fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const
     if (tbl.get().count() == 0) return null;
     // Probe keys live in a stack buffer; the heap fallback covers long names.
     var kb: [256]u8 = undefined;
-    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, arity_name })) |ak| {
+    if (joinKey(&kb, class_name, arity_name)) |ak| {
         if (tbl.get().get(ak)) |e| return e;
-    } else |_| {
+    } else {
         const ak = anonKey(allocator, class_name, arity_name) catch return null;
         defer allocator.free(ak);
         if (tbl.get().get(ak)) |e| return e;
     }
-    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, name })) |pk| {
+    if (joinKey(&kb, class_name, name)) |pk| {
         if (tbl.get().get(pk)) |e| return e;
-    } else |_| {
+    } else {
         const pk = anonKey(allocator, class_name, name) catch return null;
         defer allocator.free(pk);
         if (tbl.get().get(pk)) |e| return e;
@@ -573,9 +591,9 @@ pub fn lookupAnonMethodExact(self: *VmHost, allocator: Allocator, class_name: []
     defer tbl.deinit();
     if (tbl.get().count() == 0) return null;
     var kb: [256]u8 = undefined;
-    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, arity_name })) |key| {
+    if (joinKey(&kb, class_name, arity_name)) |key| {
         return tbl.get().get(key);
-    } else |_| {}
+    }
     const key = anonKey(allocator, class_name, arity_name) catch return null;
     defer allocator.free(key);
     return tbl.get().get(key);

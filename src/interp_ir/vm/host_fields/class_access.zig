@@ -2,6 +2,7 @@
 //! class / singleton resolution, and the `KClass` reflective surface.
 
 const std = @import("std");
+const hcm = @import("../host_call_member.zig");
 const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -138,7 +139,7 @@ pub fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const 
         if (cls_fqn.len != 0) {
             // A classifier nested in the companion is reachable through the class
             // name too, and is probed before the bare-name fallbacks.
-            const direct_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name });
+            const direct_fqn = try hcm.joinDot(allocator, cls_fqn, name);
             defer allocator.free(direct_fqn);
             const companion_fqn = try std.fmt.allocPrint(allocator, "{s}.Companion.{s}", .{ cls_fqn, name });
             defer allocator.free(companion_fqn);

@@ -246,8 +246,8 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
         if (runtime.freeScratch()) for (probes.items) |p| allocator.free(p);
         probes.deinit(allocator);
     }
-    try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name }));
-    try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_name, name }));
+    try probes.append(allocator, try hcm.joinDot(allocator, cls_fqn, name));
+    try probes.append(allocator, try hcm.joinDot(allocator, cls_name, name));
     {
         var queue: std.ArrayList([]const u8) = .empty;
         defer queue.deinit(allocator);
@@ -264,7 +264,7 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
             if (cg.get().get(cur)) |def| {
                 const dg = def.borrow();
                 for (dg.get().supertype_names) |sup| {
-                    try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ sup, name }));
+                    try probes.append(allocator, try hcm.joinDot(allocator, sup, name));
                     try queue.append(allocator, sup);
                 }
                 dg.deinit();
@@ -298,8 +298,8 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
     // klio-stdlib intrinsics on an anonymous/synth class.
     if (is_anonymous) {
         const synth = [_][]const u8{
-            try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name }),
-            try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_name, name }),
+            try hcm.joinDot(allocator, cls_fqn, name),
+            try hcm.joinDot(allocator, cls_name, name),
         };
         // The synthesized lookup keys are scratch; free them once probed.
         defer if (runtime.freeScratch()) {

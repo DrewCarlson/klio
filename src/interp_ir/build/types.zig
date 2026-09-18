@@ -28,8 +28,8 @@ pub const StrPairContext = struct {
     }
 };
 
-pub const PairFuncMap = std.HashMap(StrPair, FuncId, StrPairContext, std.hash_map.default_max_load_percentage);
-pub const StrPairSet = std.HashMap(StrPair, void, StrPairContext, std.hash_map.default_max_load_percentage);
+pub const PairFuncMap = std.HashMap(StrPair, FuncId, StrPairContext, runtime.nameMaxLoadPercentage);
+pub const StrPairSet = std.HashMap(StrPair, void, StrPairContext, runtime.nameMaxLoadPercentage);
 
 pub const ClassTable = runtime.NameHashMap(ObjRef(ClassDef));
 
@@ -136,7 +136,7 @@ pub const BuiltModule = struct {
     func_defaults: std.AutoHashMap(u32, []?FuncId),
     enclosing_class: runtime.NameHashMap([]const u8),
     /// Pre-lowered per-entry `override fun` bodies, keyed by `(synth class, method)`.
-    enum_entry_methods: std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage),
+    enum_entry_methods: std.HashMap(StrPair, EnumEntryMethod, StrPairContext, runtime.nameMaxLoadPercentage),
     /// `(enum class, entry)` → synth class name for entries with methods.
     enum_entry_synth_class: PairStrMap,
     func_type_params: std.AutoHashMap(u32, [][]const u8),
@@ -178,7 +178,7 @@ pub const BuiltModule = struct {
     }
 };
 
-pub const PairStrMap = std.HashMap(StrPair, []const u8, StrPairContext, std.hash_map.default_max_load_percentage);
+pub const PairStrMap = std.HashMap(StrPair, []const u8, StrPairContext, runtime.nameMaxLoadPercentage);
 
 /// Public for the image loader, which fills the shell table-by-table from decoded data.
 pub fn emptyBuiltShell(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) BuiltModule {
@@ -212,7 +212,7 @@ pub fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) B
         .class_delegates = runtime.NameHashMap([]StrFunc).init(allocator),
         .func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator),
         .enclosing_class = runtime.NameHashMap([]const u8).init(allocator),
-        .enum_entry_methods = std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage).init(allocator),
+        .enum_entry_methods = std.HashMap(StrPair, EnumEntryMethod, StrPairContext, runtime.nameMaxLoadPercentage).init(allocator),
         .enum_entry_synth_class = PairStrMap.init(allocator),
         .func_type_params = std.AutoHashMap(u32, [][]const u8).init(allocator),
         .top_level_delegated_props = runtime.NameHashMap(void).init(allocator),
@@ -233,6 +233,6 @@ pub const SpanContext = struct {
         return std.meta.eql(x, y);
     }
 };
-pub const SpanStrMap = std.HashMap(Span, []const u8, SpanContext, std.hash_map.default_max_load_percentage);
+pub const SpanStrMap = std.HashMap(Span, []const u8, SpanContext, runtime.nameMaxLoadPercentage);
 
 pub const FileClasses = runtime.NameHashMap(FF(ast.Class));

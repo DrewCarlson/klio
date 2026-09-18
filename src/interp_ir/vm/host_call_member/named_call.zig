@@ -337,7 +337,7 @@ pub fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *cons
             break :blk mod.classIdNestedIn(rid, name);
         };
         if (class_id == null) {
-            const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+            const fqn_probe = try hcm.joinDot(allocator, cfqn, name);
             defer if (runtime.freeScratch()) allocator.free(fqn_probe);
             class_id = mod.classIdByFqn(fqn_probe);
         }
@@ -499,7 +499,7 @@ pub fn copyNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, ar
 pub fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!?EvalResult {
     const type_fqn = receiver.typeFqn();
     const probes = [_][]const u8{
-        try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }),
+        try hcm.joinDot(allocator, type_fqn, name),
         try std.fmt.allocPrint(allocator, "kotlin.text.{s}", .{name}),
         try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}),
         try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}),

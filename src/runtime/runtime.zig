@@ -201,6 +201,7 @@ pub const eqlName = namehash_mod.eqlName;
 pub const NameContext = namehash_mod.NameContext;
 pub const PrehashedName = namehash_mod.PrehashedName;
 pub const NameHashMap = namehash_mod.NameHashMap;
+pub const nameMaxLoadPercentage = namehash_mod.name_max_load_percentage;
 pub const NameHashMapUnmanaged = namehash_mod.NameHashMapUnmanaged;
 
 pub const procEnvGetVar = proc_env_mod.getVar;

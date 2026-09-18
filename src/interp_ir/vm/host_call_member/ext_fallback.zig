@@ -161,13 +161,13 @@ pub fn resolveExtReceiverFqn(allocator: Allocator, mod: *const Module, c: *const
         if (mod.classIdByFqn(p.fqn)) |cid| return mod.classFqnById(cid);
     }
     if (c.func.package.len != 0) {
-        const cand = std.fmt.allocPrint(allocator, "{s}.{s}", .{ c.func.package, simple }) catch return null;
+        const cand = hcm.joinDot(allocator, c.func.package, simple) catch return null;
         defer if (runtime.freeScratch()) allocator.free(cand);
         if (mod.classIdByFqn(cand)) |cid| return mod.classFqnById(cid);
     }
     if (mod.registry.import_wildcards.get(file)) |list| {
         for (list.items) |pkg| {
-            const cand = std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, simple }) catch return null;
+            const cand = hcm.joinDot(allocator, pkg, simple) catch return null;
             defer if (runtime.freeScratch()) allocator.free(cand);
             if (mod.classIdByFqn(cand)) |cid| return mod.classFqnById(cid);
         }

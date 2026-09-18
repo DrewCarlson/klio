@@ -377,7 +377,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
         if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
             return .{ .ok = Value.newInt(@as(i64, @intCast(@intFromPtr(receiver.Intrinsic.fqn.ptr) & 0x7fffffff))) };
         }
-        const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ receiver.Intrinsic.fqn, name });
+        const probe = try hcm.joinDot(allocator, receiver.Intrinsic.fqn, name);
         defer if (runtime.freeScratch()) allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |func| {
             return dispatchIntrinsic(self, allocator, probe, func, args);
@@ -395,8 +395,8 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
             const label = try std.fmt.allocPrint(allocator, "class {s}", .{cname});
             return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, label) } };
         }
-        const probe_simple = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
-        const probe_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+        const probe_simple = try hcm.joinDot(allocator, cname, name);
+        const probe_fqn = try hcm.joinDot(allocator, cfqn, name);
         // `dispatchIntrinsic` borrows the key for the call only; free both probes here.
         defer if (runtime.freeScratch()) {
             allocator.free(probe_simple);
@@ -481,7 +481,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
                 }
                 const og = oc.borrow();
                 const outer_fqn = og.get().fqn;
-                const qualified = std.fmt.allocPrint(allocator, "{s}.{s}", .{ outer_fqn, name }) catch {
+                const qualified = hcm.joinDot(allocator, outer_fqn, name) catch {
                     og.deinit();
                     oc.deinit();
                     break;
@@ -595,7 +595,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
             break :blk mod.classIdNestedIn(rid, name);
         };
         if (class_id == null) {
-            const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+            const fqn_probe = try hcm.joinDot(allocator, cfqn, name);
             defer if (runtime.freeScratch()) allocator.free(fqn_probe);
             class_id = mod.classIdByFqn(fqn_probe);
         }
@@ -1528,7 +1528,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
                 break :blk null;
             };
             if (enc_fqn) |enc| {
-                const nested_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ enc, name });
+                const nested_fqn = try hcm.joinDot(allocator, enc, name);
                 defer if (runtime.freeScratch()) allocator.free(nested_fqn);
                 // A class nested in the companion itself is keyed under the companion's fqn.
                 const own_fqn = blk: {
@@ -1536,7 +1536,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
                     defer ig.deinit();
                     const icg = ig.get().class.borrow();
                     defer icg.deinit();
-                    break :blk try std.fmt.allocPrint(allocator, "{s}.{s}", .{ icg.get().fqn, name });
+                    break :blk try hcm.joinDot(allocator, icg.get().fqn, name);
                 };
                 defer if (runtime.freeScratch()) allocator.free(own_fqn);
                 const cid = blk: {

@@ -1811,11 +1811,35 @@ pub fn declarationHostSymbol(
     return found;
 }
 
+/// The entries that carry a predicate. Every installed-binding probe asks
+/// whether a binding applies to its arguments, and a few dozen of the table's
+/// entries answer anything but "no predicate", so the question walks those
+/// instead of the whole table.
+const ApplicableEntry = struct { fqn: []const u8, f: ApplicableFn };
+
+const APPLICABLE_TABLE: []const ApplicableEntry = blk: {
+    @setEvalBranchQuota(100_000);
+    var n: usize = 0;
+    for (TABLE) |e| {
+        if (e.applicable != null) n += 1;
+    }
+    var out: [n]ApplicableEntry = undefined;
+    var i: usize = 0;
+    for (TABLE) |e| {
+        if (e.applicable) |p| {
+            out[i] = .{ .fqn = e.fqn, .f = p };
+            i += 1;
+        }
+    }
+    const frozen = out;
+    break :blk &frozen;
+};
+
 pub fn applicable(fqn: []const u8, args: []const Value) ?bool {
-    for (TABLE) |entry| {
+    for (APPLICABLE_TABLE) |entry| {
+        if (entry.fqn.len != fqn.len) continue;
         if (!std.mem.eql(u8, entry.fqn, fqn)) continue;
-        const predicate = entry.applicable orelse return null;
-        return predicate(args);
+        return entry.f(args);
     }
     return null;
 }

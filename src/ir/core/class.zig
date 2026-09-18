@@ -73,7 +73,7 @@ pub const StrPairContext = struct {
 };
 
 pub fn StrPairMap(comptime V: type) type {
-    return std.HashMap(StrPair, V, StrPairContext, std.hash_map.default_max_load_percentage);
+    return std.HashMap(StrPair, V, StrPairContext, runtime.nameMaxLoadPercentage);
 }
 
 pub const StrPairSet = StrPairMap(void);

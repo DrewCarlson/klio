@@ -258,7 +258,6 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
         cg.deinit();
         g.deinit();
     }
-    if (std.mem.find(u8, cls_name, "$Companion$") != null) return null;
     // The ordered ancestor-companion list is a pure function of the class, so it caches
     // per class identity; only the per-name membership check below stays dynamic.
     const cached: ?[]const []const u8 = blk: {
@@ -267,6 +266,15 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
         break :blk pg.get().companion_chain_cache.get(cls_ident);
     };
     if (cached) |chain| return companionChainProbe(self, chain, name);
+    // A companion's own class has no chain. The name test decides that, so it
+    // runs once per class and the empty chain it records answers after.
+    if (std.mem.find(u8, cls_name, "$Companion$") != null) {
+        const pg = self.prog.borrowMut();
+        defer pg.deinit();
+        const cache = &pg.get().companion_chain_cache;
+        if (!cache.contains(cls_ident)) cache.put(cls_ident, &.{}) catch {};
+        return null;
+    }
     var built = try companionChainBuild(self, allocator, cls_name);
     defer built.deinit(allocator);
     {

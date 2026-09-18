@@ -547,6 +547,35 @@ fn unsupported(name: []const u8) EvalResult {
     return .{ .err = .{ .Unsupported = name } };
 }
 
+/// `<a>.<b>`, allocated. The member tails build these probe keys on every
+/// dispatch, and the formatter's machinery is heavier than the join itself.
+pub fn joinDot(allocator: Allocator, a: []const u8, b: []const u8) Allocator.Error![]u8 {
+    const out = try allocator.alloc(u8, a.len + 1 + b.len);
+    @memcpy(out[0..a.len], a);
+    out[a.len] = '.';
+    @memcpy(out[a.len + 1 ..], b);
+    return out;
+}
+
+/// `<name>#<n>`, the arity-qualified key an anonymous-object method table uses.
+pub fn joinArity(allocator: Allocator, name: []const u8, n: usize) Allocator.Error![]u8 {
+    var digits: [24]u8 = undefined;
+    var i: usize = digits.len;
+    var v = n;
+    while (true) {
+        i -= 1;
+        digits[i] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+        if (v == 0) break;
+    }
+    const d = digits[i..];
+    const out = try allocator.alloc(u8, name.len + 1 + d.len);
+    @memcpy(out[0..name.len], name);
+    out[name.len] = '#';
+    @memcpy(out[name.len + 1 ..], d);
+    return out;
+}
+
 pub fn unimplemented(allocator: Allocator, comptime fmt: []const u8, args: anytype) Allocator.Error!EvalResult {
     const msg = try std.fmt.allocPrint(allocator, fmt, args);
     return .{ .err = .{ .Unimplemented = msg } };

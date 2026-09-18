@@ -2,6 +2,7 @@
 //! receiver's own storage out to the extension and enclosing-receiver fallbacks.
 
 const std = @import("std");
+const hcm = @import("../host_call_member.zig");
 const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -949,7 +950,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
         }
         if (!have_verdict) {
             const probes = [_][]const u8{
-                try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }),
+                try hcm.joinDot(allocator, type_fqn, name),
                 try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}),
                 try std.fmt.allocPrint(allocator, "kotlin.text.{s}", .{name}),
                 try std.fmt.allocPrint(allocator, "kotlin.math.{s}", .{name}),
@@ -1284,7 +1285,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
     if (receiver.* == .Instance and !probe_is_toplevel_fn and instanceIsHostSynth(receiver.Instance)) {
         const cls_fqn = classFqnOf(receiver.Instance);
         if (cls_fqn.len != 0) {
-            const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name });
+            const probe = try hcm.joinDot(allocator, cls_fqn, name);
             defer allocator.free(probe);
             if (lookupIntrinsic(self, probe)) |func| {
                 const args = [_]Value{receiver.*};

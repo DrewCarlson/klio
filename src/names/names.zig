@@ -62,12 +62,17 @@ pub const PrehashedName = struct {
     }
 };
 
+/// Load factor for the name tables. They are read far more than they are
+/// written and they are small next to the program's heap, so the table trades
+/// space for a shorter probe.
+pub const name_max_load_percentage = 40;
+
 pub fn NameHashMap(comptime V: type) type {
-    return std.HashMap([]const u8, V, NameContext, std.hash_map.default_max_load_percentage);
+    return std.HashMap([]const u8, V, NameContext, name_max_load_percentage);
 }
 
 pub fn NameHashMapUnmanaged(comptime V: type) type {
-    return std.HashMapUnmanaged([]const u8, V, NameContext, std.hash_map.default_max_load_percentage);
+    return std.HashMapUnmanaged([]const u8, V, NameContext, name_max_load_percentage);
 }
 
 test "hashName separates the names a program actually uses" {
