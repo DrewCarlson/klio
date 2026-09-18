@@ -219,17 +219,26 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
         g.deinit();
     }
 
-    // Inline cache on (class, name, arg-sig) holding a resolved intrinsic or a
-    // recorded miss. Only a primitive-arg call is keyed.
-    const ib_key = instanceMethodKey(self, receiver, name, args);
+    // Inline cache on (class, name, argument shapes) holding a resolved
+    // intrinsic or a recorded miss. The probe list itself is a function of the
+    // receiver class and the name, so the arguments enter the key only as the
+    // shapes `implementationApplicable` reads, and that filter is re-run here
+    // rather than trusted from the entry.
+    const ib_key = virtual_tail.instanceBindingKey(self, receiver, name, args);
     if (ib_key) |k| {
-        if (instanceIntrinsicCacheGet(self, k)) |entry| {
+        if (instanceIntrinsicCacheGet(self, k)) |entry| hit: {
             const func = entry.func orelse return null;
+            if (stdlib.implementationApplicable(entry.fqn, args)) |applies| {
+                if (!applies) break :hit;
+            }
             const all_args = try prependReceiver(allocator, receiver, args);
             defer if (runtime.freeScratch()) allocator.free(all_args);
             return try dispatchIntrinsic(self, allocator, entry.fqn, func, all_args);
         }
     }
+    // A binding that exists but declines THIS call's shapes must not be recorded
+    // as "no binding at all", or a later applicable call would read that miss.
+    var declined_binding = false;
 
     var probes: std.ArrayList([]const u8) = .empty;
     // Probe FQNs are per-call scratch; freeing is a no-op under the arena.
@@ -242,7 +251,7 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
     {
         var queue: std.ArrayList([]const u8) = .empty;
         defer queue.deinit(allocator);
-        var seen: std.StringHashMap(void) = .init(allocator);
+        var seen: runtime.NameHashMap(void) = .init(allocator);
         defer seen.deinit();
         try queue.append(allocator, cls_name);
         try queue.append(allocator, cls_fqn);
@@ -274,7 +283,10 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
         if (installed) |func| {
             // A binding inapplicable to this call shape is not the target.
             if (stdlib.implementationApplicable(p, args)) |applies| {
-                if (!applies) continue;
+                if (!applies) {
+                    declined_binding = true;
+                    continue;
+                }
             }
             if (ib_key) |k| instanceIntrinsicCachePut(self, k, func, p);
             const all_args = try prependReceiver(allocator, receiver, args);
@@ -343,12 +355,14 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
         }
     }
     // No intrinsic through any probe stage: cache the miss.
-    if (ib_key) |k| instanceIntrinsicCachePut(self, k, null, "");
+    if (!declined_binding) {
+        if (ib_key) |k| instanceIntrinsicCachePut(self, k, null, "");
+    }
     return null;
 }
 
-pub fn receiverClassChain(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!std.StringHashMap(void) {
-    var seen: std.StringHashMap(void) = .init(allocator);
+pub fn receiverClassChain(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!runtime.NameHashMap(void) {
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     var stack: std.ArrayList([]const u8) = .empty;
     defer stack.deinit(allocator);
     {

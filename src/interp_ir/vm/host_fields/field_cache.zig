@@ -31,6 +31,49 @@ pub inline fn tlFieldSlot(class_p: usize, name_p: usize) usize {
     return @intCast((h ^ (h >> 17)) & (TL_FIELD_CACHE_SIZE - 1));
 }
 
+/// `KLIO_FRC_DIAG=1`: why a field-read memo entry was not recorded.
+fn frcDiag(self: *VmHost, inst: ObjRef(InstanceData), name: []const u8, why: []const u8) void {
+    _ = self;
+    if (runtime.envOnce("KLIO_FRC_DIAG") == null) return;
+    const g = inst.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    std.debug.print("[frc] {s}.{s}: {s}\n", .{ cg.get().name, name, why });
+}
+
+/// Whether the class cell behind this instance lives for the program, so an
+/// entry keyed on its address cannot be read against a later class that reused
+/// it. A lowered declaration is registered once at link time and held for the
+/// run; only a class the evaluator synthesizes as it runs — a local class or an
+/// anonymous object — has a cell that dies. The verdict is a property of the
+/// class, so it is decided once per cell.
+const HELD_SLOTS: usize = 1 << 10;
+
+const HeldEnt = struct { class_p: usize = 0, gen: u32 = 0, held: bool = false };
+
+const held_cache = runtime.tls_fast.PerThread(struct {
+    e: [HELD_SLOTS]HeldEnt = @splat(.{}),
+});
+
+fn registryHeldClass(self: *VmHost, inst: ObjRef(InstanceData)) bool {
+    _ = self;
+    const class_p: usize = @intCast(runtime.InstanceData.classIdentityUnlocked(inst));
+    const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
+    const slot = &held_cache.get().e[(class_p >> 4) & (HELD_SLOTS - 1)];
+    if (slot.class_p == class_p and slot.gen == gen) return slot.held;
+    const held = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        const dg = g.get().class.borrow();
+        defer dg.deinit();
+        const c = dg.get();
+        break :blk !c.is_local_runtime and !c.is_anonymous;
+    };
+    slot.* = .{ .class_p = class_p, .gen = gen, .held = held };
+    return held;
+}
+
 pub fn fieldReadCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldReadHit {
     const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
     const e = &self.tls.tl_field_read_cache[tlFieldSlot(class_p, name_p)];
@@ -83,13 +126,18 @@ pub fn fieldWriteCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.Pr
 
 /// Capped, so per-evaluation anonymous classes cannot grow it unboundedly.
 pub fn fieldReadCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldReadHit) void {
-    if (!ir.eval.dispatchCacheStable()) return;
-    // Main-module classes only: their cells stay registry-held for the whole
-    // program, so no later cell can alias the identity key.
-    {
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        if (mg.get().classIdByFqn(fqn) == null) return;
+    if (!ir.eval.dispatchCacheStable()) {
+        frcDiag(self, inst, name, "run not stable");
+        return;
+    }
+    _ = fqn;
+    // The key is the class CELL's address, so the entry is only sound while that
+    // cell cannot be freed and its address reused. A declaration the class table
+    // holds satisfies that for the program's life; one the evaluator synthesizes
+    // as it runs does not.
+    if (!registryHeldClass(self, inst)) {
+        frcDiag(self, inst, name, "class not registry-held");
+        return;
     }
     const class_p = blk: {
         const g = inst.borrow();
@@ -99,8 +147,14 @@ pub fn fieldReadCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     // The interned name id keys the entry; the caller's slice may be scratch.
-    const name_p = pg.get().memberNameIdentity(name) orelse return;
-    if (pg.get().field_read_cache.count() >= 65536) return;
+    const name_p = pg.get().memberNameIdentity(name) orelse {
+        frcDiag(self, inst, name, "name not internable");
+        return;
+    };
+    if (pg.get().field_read_cache.count() >= 65536) {
+        frcDiag(self, inst, name, "table full");
+        return;
+    }
     pg.get().field_read_cache.put(.{ .class_p = class_p, .name_p = name_p }, hit) catch {};
 }
 
@@ -110,11 +164,8 @@ pub fn fieldReadCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const
 /// names its property from a String's bytes, which dangle.
 pub fn fieldWriteCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldWriteHit) void {
     if (!ir.eval.dispatchCacheStable()) return;
-    {
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        if (mg.get().classIdByFqn(fqn) == null) return;
-    }
+    _ = fqn;
+    if (!registryHeldClass(self, inst)) return;
     const class_p = blk: {
         const g = inst.borrow();
         defer g.deinit();

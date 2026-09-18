@@ -643,31 +643,40 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
             std.debug.print("[cv-callee] in={s} kind={s}\n", .{ frame.func.name, @tagName(std.meta.activeTag(callee_v)) });
         }
     }
-    var arg_values_list: std.ArrayList(Value) = .empty;
-    defer arg_values_list.deinit(allocator);
-    {
-        const tmp = try readArgRun(allocator, frame, cv.args, cv.n_args);
-        defer allocator.free(tmp);
-        try arg_values_list.appendSlice(allocator, tmp);
-    }
-    var names_list: std.ArrayList(?[]const u8) = .empty;
-    defer names_list.deinit(allocator);
-    {
-        const tmp = try resolveArgNames(allocator, frame.module, cv.arg_names);
-        defer freeArgNames(allocator, tmp);
-        try names_list.appendSlice(allocator, tmp);
+    // The argument run and the resolved names are already owned slices; a
+    // closure call is one of the hottest arms in a compose frame, so they are
+    // passed through as they are and only copied for the receiver prepend.
+    const args_run = try readArgRun(allocator, frame, cv.args, cv.n_args);
+    defer allocator.free(args_run);
+    const names_run = try resolveArgNames(allocator, frame.module, cv.arg_names);
+    defer freeArgNames(allocator, names_run);
+    var call_args: []const Value = args_run;
+    var call_names: []const ?[]const u8 = names_run;
+    var prepend_args: ?[]Value = null;
+    var prepend_names: ?[]?[]const u8 = null;
+    defer {
+        if (prepend_args) |a| allocator.free(a);
+        if (prepend_names) |n| allocator.free(n);
     }
     if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
-        for (arg_values_list.items, 0..) |*av, ai| {
+        for (call_args, 0..) |*av, ai| {
             std.debug.print("[cv-arg] in={s} #{d} kind={s}\n", .{ frame.func.name, ai, @tagName(std.meta.activeTag(av.*)) });
         }
     }
     const caller_this = callerThisValue(frame);
     if (host.callableReceiverShape(&callee_v)) |shape| {
-        if (shape.first_is_this and arg_values_list.items.len + 1 == shape.n_params) {
+        if (shape.first_is_this and call_args.len + 1 == shape.n_params) {
             if (caller_this) |ct| {
-                try arg_values_list.insert(allocator, 0, ct);
-                try names_list.insert(allocator, 0, null);
+                const a = try allocator.alloc(Value, call_args.len + 1);
+                prepend_args = a;
+                a[0] = ct;
+                @memcpy(a[1..], call_args);
+                call_args = a;
+                const n = try allocator.alloc(?[]const u8, call_names.len + 1);
+                prepend_names = n;
+                n[0] = null;
+                @memcpy(n[1..], call_names);
+                call_names = n;
             }
         }
     }
@@ -680,7 +689,7 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
     // creation-time receiver chain, which the dynamic caller's `this` is not on.
     if (comptime @hasDecl(H, "prepareClosureFlatCall")) {
         if (flatEnabled() and callee_v == .IrClosure and cv.type_args.len == 0 and argNamesAllNull(cv.arg_names)) {
-            if (try host.prepareClosureFlatCall(allocator, &callee_v, arg_values_list.items)) |prep0| {
+            if (try host.prepareClosureFlatCall(allocator, &callee_v, call_args)) |prep0| {
                 var prep = prep0;
                 prep.dst = cv.dst;
                 frame.flat_call = prep;
@@ -697,9 +706,9 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
             for (cv.type_args[0..n_ta], ta_buf[0..n_ta]) |cid, *slot| {
                 slot.* = constStr(frame.module, cid) orelse "";
             }
-            break :blk host.callValueNamedTyped(allocator, &callee_v, arg_values_list.items, names_list.items, ta_buf[0..n_ta]);
+            break :blk host.callValueNamedTyped(allocator, &callee_v, call_args, call_names, ta_buf[0..n_ta]);
         }
-        break :blk host.callValueNamed(allocator, &callee_v, arg_values_list.items, names_list.items);
+        break :blk host.callValueNamed(allocator, &callee_v, call_args, call_names);
     };
     switch (try result) {
         .ok => |rv| {

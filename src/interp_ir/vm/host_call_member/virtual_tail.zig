@@ -943,6 +943,44 @@ pub fn instanceMethodKey(self: *VmHost, receiver: *const Value, name: []const u8
     return instanceMethodKeyScoped(self, receiver, name, args, null, null);
 }
 
+/// Argument shapes only, with no argument's own class folded in.
+///
+/// Which installed binding a member call reaches is decided by the receiver's
+/// class, the member name and the argument count, and then filtered by
+/// `implementationApplicable`, which reads the argument shapes. An argument's
+/// class never selects the binding, so folding it into the key made a call whose
+/// arguments differ every invocation — a compare-and-set over changing state is
+/// the common one — miss its cache every time and rebuild the whole probe list.
+fn methodArgSigShapes(args: []const Value) ?u64 {
+    if (args.len > 12) return null;
+    var h = std.hash.Wyhash.init(0x00B1_4D17_6C0A_45E0 +% args.len);
+    for (args) |*a| {
+        const tag: u8 = @intFromEnum(std.meta.activeTag(a.*));
+        h.update((&tag)[0..1]);
+        switch (a.*) {
+            .Array => |arr| {
+                const pk: u8 = if (arr.primKind()) |p| @as(u8, @intFromEnum(p)) + 1 else 0;
+                h.update((&pk)[0..1]);
+            },
+            else => {},
+        }
+    }
+    const v = h.final();
+    return if (v == 0) 3 else v;
+}
+
+/// `instanceMethodKey` for the installed-binding probe: same receiver identity,
+/// argument SHAPES in place of argument classes. Salted apart from the exact
+/// key so the two never name the same cache entry.
+pub fn instanceBindingKey(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
+    var k = instanceMethodKeyScoped(self, receiver, name, &.{}, null, null) orelse return null;
+    const shapes = methodArgSigShapes(args) orelse return null;
+    k.n_args = @intCast(args.len);
+    k.sig = (k.sig ^ shapes) *% 0x9E3779B97F4A7C15 ^ 0x00B1_4D17_6CE7_5A17;
+    if (k.sig == 0) k.sig = 7;
+    return k;
+}
+
 /// Scope-aware cache key: a `static_recv`/`declared_recv`-directed call resolves
 /// in the static type's scope, so the scope names fold into `sig`.
 pub fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {

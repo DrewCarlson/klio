@@ -147,10 +147,14 @@ pub fn fieldWriteSiteRoute(self: *VmHost, receiver: *const Value, name: []const 
 pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?FieldSiteClaim {
     if (receiver.* != .Instance) return null;
     if (std.mem.eql(u8, name, "coroutineContext")) return null;
+    const inst = receiver.Instance;
+    const cls: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(inst));
+    // The scoped-getter walk records its winner under the scoped name, so the
+    // memo is probed as the read was written before the name is reduced.
+    if (routeFromMemo(self, inst, cls, name)) |r| return r;
     // A property getter reading its own backing store carries the scoped name
-    // `$sgetter$<owner>\u{1f}<prop>`, which no (class, name) memo holds. When
-    // the receiver is that owner, Kotlin's virtual dispatch resolves the read
-    // to the plain property on the receiver's own class.
+    // `$sgetter$<owner>\u{1f}<prop>`. When the receiver is that owner, Kotlin's
+    // virtual dispatch resolves the read to the plain property on its own class.
     if (std.mem.startsWith(u8, name, "$sgetter$")) {
         const rest = name["$sgetter$".len..];
         if (std.mem.findScalar(u8, rest, '\u{1f}')) |sep| {
@@ -164,16 +168,24 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
                 break :blk mg.get().classIsOrExtends(rcn, owner);
             };
             if (!owns) return null;
-            return fieldSiteRoute(self, receiver, prop);
+            return routeFromMemo(self, inst, cls, prop);
         }
-        return null;
     }
-    const inst = receiver.Instance;
-    const cls: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(inst));
+    return null;
+}
+
+/// The (class, name) memo's answer as a site route, or null when it holds none.
+fn routeFromMemo(self: *VmHost, inst: ObjRef(InstanceData), cls: u64, name: []const u8) ?FieldSiteClaim {
     const hit = blk: {
-        const name_p = host_call_member.memberNameIdentity(self, name) orelse break :blk null;
+        const name_p = host_call_member.memberNameIdentity(self, name) orelse {
+            fsrDiag(self, inst, name, "no interned name");
+            break :blk null;
+        };
         break :blk fieldReadCacheGet(self, @intCast(cls), name_p);
-    } orelse return null;
+    } orelse {
+        fsrDiag(self, inst, name, "no (class, name) memo");
+        return null;
+    };
     const NONE = root.ProgramImage.FieldReadHit.NONE;
     if (hit.getter != NONE) return .{ .cls = cls, .route = (@as(u64, hit.getter) << 2) | 2 };
     if (hit.stored_idx != NONE) {
@@ -188,6 +200,18 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
         return .{ .cls = cls, .route = (@as(u64, hit.stored_idx) << 2) | 1 };
     }
     return null;
+}
+
+/// `KLIO_FSR_DIAG=<substring>`: why the field-site route declined for a name.
+fn fsrDiag(self: *VmHost, inst: ObjRef(InstanceData), name: []const u8, why: []const u8) void {
+    _ = self;
+    const want = runtime.envOnce("KLIO_FSR_DIAG") orelse return;
+    if (std.mem.find(u8, name, want) == null) return;
+    const g = inst.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    std.debug.print("[fsr] {s}.{s}: {s}\n", .{ cg.get().name, name, why });
 }
 
 pub fn runFieldGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value) Allocator.Error!EvalResult {
