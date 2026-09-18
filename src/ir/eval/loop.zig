@@ -178,7 +178,9 @@ pub fn runFlatLoop(
                     }
                     break :blk_cm2 f.module;
                 };
-                const fr = (try fusedExecOpt(H, allocator, callee_mod2, site.req.func, site.req.args.items, host, true)) orelse break :fused;
+                // Completable bodies only; a partial run pays the tier's entry and then
+                // opens the frame it was meant to avoid. See the seam in `enter.zig`.
+                const fr = (try fusedExecOpt(H, allocator, callee_mod2, site.req.func, site.req.args.items, host, false)) orelse break :fused;
                 const dst = site.req.dst;
                 discardFlatReq(H, allocator, site.req, host);
                 switch (fr) {

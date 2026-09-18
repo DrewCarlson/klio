@@ -439,11 +439,14 @@ pub fn evalWithCapturesChained(
         }
     }
     // The fused tier at the same seam: no Frame at all, raising real errors rather than abandoning.
+    // `allow_materialize` is false: a body the walker cannot finish pays the tier's entry AND the
+    // frame it then opens, and measured against a recomposer frame that trade is a loss of 2.9%.
+    // Only a body the walker runs to completion takes this path.
     if (owning == null and closure_id == null and chain_seed.len == 0 and
         captures.items.len == 0 and
         (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
     {
-        if (try fusedExecOpt(H, allocator, module, func, args.items, host, true)) |fr| {
+        if (try fusedExecOpt(H, allocator, module, func, args.items, host, false)) |fr| {
             var a = args;
             a.deinit(allocator);
             var c = captures;

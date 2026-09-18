@@ -198,16 +198,29 @@ overload. The declines are now censused (`KLIO_DISPATCH_STATS`):
 and `unbox` — targets the link settled on a native binding, which have no body
 to enter.
 
-The bytecode tier covers thirteen opcodes: constants, moves, binary operators
-and control flow. Every field read, call, construction, global load and lambda
-escapes to the generic arm, so the tier never sees the instructions this
-workload is made of.
+The bytecode tier now covers fifteen opcodes: constants, moves, unary and binary
+operators, a site-claimed field read, and control flow. Calls, constructions,
+global loads and lambdas still escape to the generic arm — and measuring the two
+opcodes added here showed that escaping is not what costs (see "The bytecode
+tier is not where the time is").
 
 ## Leads measured and rejected
 
 Recorded because the measurement is the finding. All four looked right and none
 of them paid.
 
+- **Threaded dispatch for the bytecode stream.** The textbook interpreter
+  optimisation: instead of one shared back edge whose indirect branch every
+  opcode funnels through, give each arm its own jump to the next opcode's arm,
+  so each gets its own predictor entry. Zig's labelled-switch `continue`
+  expresses it directly, and a sentinel op at the end of each unfused stream
+  removes the bound check the shared back edge was doing. It measures **12%
+  SLOWER** on a tight integer loop and flat on the recompose benchmark. Apple
+  Silicon's indirect predictor already handles the shared dispatch, and
+  replicating the jump-table load at fifteen sites costs more in code size than
+  the prediction was costing. The technique is a win on hardware with a weaker
+  BTB; on this target it is a regression, and it is the reason the stream keeps
+  its single `while` back edge.
 - **A hand-rolled short-string hash.** Fewer instructions than Wyhash, worse
   distribution: at the tables' load factor the extra probing cost more than the
   mixing saved. Construction 3.4% slower.
@@ -260,6 +273,51 @@ of them paid.
   specialised field read cannot skip the preamble wholesale, which also blocks a
   `GetField` bytecode op until the coupling is found.
 
+## A change can be correct, faster, and still fail the gate
+
+Two changes in this pass were semantically clean — every test they were accused
+of breaking passes standalone on the accused binary — measured faster, and still
+made shard 1 fail deterministically:
+
+- hoisting the field-read guard above the resolution preamble (-0.3%)
+- stopping the leaf tier from re-attempting a body that keeps abandoning (-2.0%)
+
+For the second, the shard ran 428/6 and 427/7 against 433/1 and 432/2 for the
+committed binary, interleaved, at SIMILAR or faster child wall times — 144 s and
+153 s against 155 s and 437 s. So it is not a budget cut and not machine noise:
+the change shifts timing inside the child, which runs its coroutine workers
+uncapped, and exposes a latent concurrency sensitivity in tests like
+`avoidsThrashingTheSlotTable` and `rememberObserverThrashing`.
+
+That sensitivity is the real defect and it is worth finding: it is currently
+absorbing perf work that is otherwise correct. Until it is, the rule is that a
+perf change must hold shard 1 interleaved against the committed binary, and
+standalone passes do not clear it.
+
+## The frameless tier runs only what it can finish
+
+The tier that executes a body without a Frame has three verdicts: fusable,
+partial and declined. A PARTIAL body ran its fusable prefix in the walker and
+then materialised a Frame to finish — paying the tier's entry, which is about a
+tenth of a member call, and then the frame it was meant to avoid.
+
+Measured against the baseline binary, with the tier entered only for bodies it
+can run to completion:
+
+| Benchmark | Change |
+|-----------|-------:|
+| recomposition | **-2.9%** |
+| wide composition | **-3.4%** |
+| object construction | -1.3% |
+| monomorphic member call | +0.6% |
+| bare activation | +0.2% |
+
+Turning the tier OFF entirely is worth more on compose (-3.4%) but costs a tight
+monomorphic call loop 5.3%, so the tier earns its place on the bodies it
+finishes and only those. Two call sites allowed materialisation, the recursive
+seam and the flat-call loop; changing one and not the other reads as a 0.3%
+nothing, which is how this was missed the first time.
+
 ## The frameless tier, and why the workload cannot reach it
 
 The interpreter has four tiers. Measured on a bare one-parameter activation
@@ -303,22 +361,192 @@ Two of the classifier's rules were tested against that census and neither paid:
   lose their own full-fusion verdict through the `.Call` arm. The rule is
   load-bearing through the recursive classification, not just its own decline.
 
+## The bytecode tier is not where the time is
+
+The tier now carries a field read (`gf_site`) and a unary operator (`un`)
+alongside its constants, moves and binary operators. Both were built to the
+shape a specialising VM uses: the stream tries the guarded fast helper, and on a
+miss takes the instruction's own arm through `afterStep`, exactly as `bin` does.
+Both are correct and both are nearly free:
+
+| Change | Recompose benchmark | Tight integer loop |
+|--------|--------------------:|-------------------:|
+| `gf_site`, serving 2.45 M of 4.5 M field reads inline | -0.3% | — |
+| `un`, removing the escape from every `i++` | -0.2% | 0% |
+| `shouldAbandon` reordered off the threadlocal | -0.1% | -11% |
+
+The `un` row is the finding. Removing a whole `execInst` dispatch from the
+innermost loop of a 40-million-iteration counting loop changed that loop by
+**zero**, which settles what an escape costs: the union switch is a jump table
+and the arm call is a call, and together they are lost in the noise of the work
+the instruction does. The `gf_site` row says the same thing from the other side
+— it moved 2.45 M reads off the generic arm and bought 0.3%, which is 8 ns a
+read, which is the dispatch and nothing else.
+
+So widening the tier further — a call opcode, a global load, a construction —
+buys about one percent in total, not the order of magnitude the goal needs. The
+tier is worth having and it is now built out to the instructions that actually
+escape in hot code, but it is finished as a lever.
+
+The `shouldAbandon` row is a separate, real finding about branch cost.
+`fusedEdgeGuard` runs on every branch and every back edge, and it led with
+`thread_abandonable`, a threadlocal — so on Darwin every branch the evaluator
+took made a `_tlv_get_addr` call. Testing the plain global `abandon_requested`
+first is semantically identical (`A and (B or C)` either way) and cuts a tight
+loop by 11%. It moves compose by 0.1%, because compose is call-bound rather than
+branch-bound, which is itself the point: the same change is worth two orders of
+magnitude more to one workload than the other.
+
+## Where a recomposition's 2 811 µs goes
+
+One `benchRecompose` run: 1 881 recompositions in 5 289 ms, so 2 811 µs each.
+Per recomposition the interpreter runs 1 510 activations, 7 900 dispatch events
+and 5 110 instructions the generic arm executes. Sampler self time buckets as:
+
+| Area | Share of self time |
+|------|-------------------:|
+| The frame walker and the fused/leaf tiers | 36% |
+| The VM host dispatch layers (`vm/*`, `exec_call`) | 30% |
+| Name hashing and hash-map probes | 15.6% |
+| Allocation and free | 6.4% |
+| `ObjRef` borrow | 3.0% |
+
+The hashing share is the one that does not belong. It is name lookups — strings
+hashed at run time to find a member, a class, a global or a property — and it is
+diffuse: the `(class, member)` registry probes alone come from twelve distinct
+callers with no dominant one (`lookupPairFuncHop` 39 samples, then
+`objectSingletonForMember`, `memberExtOverridesFor`, `materializeInstance`,
+`delegatedPropRegistered`, `instanceField` at 15 to 18 each). There is no hot
+spot to fix; the design re-hashes names on every operation.
+
+## Only 8% of activations run frameless
+
+`KLIO_FUSE_DECLINE=1` over `benchRecompose`: 2 627 816 declines against
+2 840 440 activations.
+
+| Gate | Declines |
+|------|---------:|
+| `classify` (the static verdict is 2) | 2 011 977 |
+| `partial-no-materialize` (verdict 4, which now runs framed) | 574 676 |
+| `arity` | 41 158 |
+
+The functions declining most are one-line accessors, and they decline on their
+*signature*, not their body: `fusedClassify` rejects any function whose return
+type or any parameter type is a bare type variable, because `as T` / `is T`
+consults a reified context the frameless walker does not carry. So
+`kotlinx.atomicfu.AtomicArray.get` (118 212 activations),
+`kotlin.coroutines.CoroutineContext.Element.get` (92 073),
+`kotlinx.atomicfu.atomic` (66 896), `ChannelSegment.getState` (52 538),
+`ContinuationInterceptor.get` (48 277), `CombinedContext.get` (43 866),
+`Symbol.unbox` (21 929) and `kotlin.also` (19 714) all pay a full frame to read
+one field — and the body-level `Cast`/`InstanceOf` guards next to the signature
+check already cover the case the signature check exists for.
+
+Relaxing that gate is worth bounding before building it. Two functions with the
+same trivial body, one generic and one not, cost 388 ns and 303 ns per call
+against a 101 ns empty loop — so the frame is worth about 85 ns of a 290 ns
+activation. Converting every decline would be roughly 4% of the benchmark. Real,
+and not the goal.
+
+## What one activation costs, and what came off it
+
+A probe that makes eight calls per loop iteration, so loop overhead is a tenth
+of the sample, put a fully fusable static activation at **189 ns**. Sampling it
+gave the first breakdown of an activation that is not confounded by compose:
+
+| Area | Share | ns |
+|------|------:|---:|
+| The caller's frame loop running the `Call` | 18% | 35 |
+| The frameless tier: entry plus the body's own instructions | 26% | 50 |
+| The flat loop | 11% | 20 |
+| `execArmCall` | 4% | 8 |
+| Identified machinery (carrier, safepoint, keepalive, seam probes, lookups) | 22% | 42 |
+
+The machinery row is what a flattened activation does not pay, and the largest
+single item in it was the argument carrier: every call acquired a pooled
+`ArrayList`, copied the argument registers into it, handed it to a flat-call
+request, and let the activation seam ask whether the body could run frameless.
+
+**The static-call shortcut removes all of that.** A callee whose memoized
+verdict says fully fusable runs straight from the caller's register run: a stack
+copy, no carrier, no flat request, no second pass through the seam. The values
+stay the caller's and its registers keep them reachable, which is exactly how
+the frameless tier's own call arm already borrows them.
+
+| Probe | Before | After |
+|-------|-------:|------:|
+| Static activation (eight calls per iteration) | 191 ns | 118 ns |
+| One-parameter call in a loop | 307 ns | 224 ns |
+| Generic one-parameter call in a loop | 395 ns | 217 ns |
+
+Two things had to be right for it to pay. The verdict byte is read **first**:
+an ungated version copied arguments and probed the tier for every callee, and
+since most of them decline, compose came out 0.6% slower. And the enclosing-`this`
+push had to move above the carrier so both paths share it.
+
+The generic row comes from a second change. `fusedClassify` declined any function
+whose return type or any parameter type was a bare type variable, which is a
+syntactic proxy ("short uppercase name") for "this body might consult reified
+type information". The precise concern is `as T` / `is T`, and the Cast and
+InstanceOf instructions are already guarded for exactly that two lines below;
+the argument side is covered too, because `fusedRun` applies the same
+`coercePlanFor` widening the framed entry does, type-variable peer rule included.
+Dropping the signature gate lets 216 000 more activations per benchmark run
+frameless and halves a generic call.
+
+## Every lever now converges on the same constraint
+
+Both changes are large on their probes and **neutral on compose**, and the
+reason is one number: only about 8% of activations are fully fusable, so a
+frameless activation getting 38% cheaper reaches very little of the workload.
+
+What it did change is the value of converting the rest. The gap between a
+fusable body and a declining one was 91 ns; it is now **179 ns**, because only
+one side got cheaper. At 2.4 M declines per benchmark run that is ~8.9% of
+compose, against the ~4% the same lever was worth before. The bound moved
+because the floor moved.
+
+The blocker is `CallMember`, by a wide margin, and it is a keystone rather than
+one more item: the frameless tier declines any body containing a dynamic member
+call, which is most real bodies, and a body that declines also stops every
+caller whose `Call` site would otherwise fuse transitively. The gate's stated
+reason is performance ("fused-first execution never stamps the site memos"),
+not correctness, and the memos are reachable from the tier since it holds the
+instruction pointer. The risk is the shape it creates: a body admitted as fully
+fusable that meets something the arm cannot serve returns `error.Materialize`
+mid-run, which pays the tier's entry AND the frame it then opens, and that trade
+already measured as a 2.9% loss. Admitting `CallMember` therefore has to come
+with an arm complete enough that materialising stays rare.
+
 ## What a ten-fold would take
 
-`derivedStateOfLeak` allows 320 µs per recomposition. klio spends 2 980 µs on
-1 243 activations and 5 515 instructions the generic arm executes — about 260 ns
-per activation would be the budget, against roughly 2 400 ns today. A bytecode
-VM reaches that budget; klio's pipeline cannot be trimmed into it, because no
-stage of it is more than a fifth of the total. Three changes would move the
-floor, and all three are re-architecture rather than optimisation:
+`derivedStateOfLeak` allows about 320 µs per recomposition against 2 811 µs
+today, so the budget is ~210 ns per activation against ~1 860 ns. Every lever
+measured in this pass is worth single digits, and they are independent, so they
+do not compound into an order of magnitude:
+
+| Lever | Measured or bounded |
+|-------|--------------------:|
+| Finishing the bytecode tier | ~1% |
+| Making every declined body frameless | ~8.9% |
+| Everything landed, cumulative, on compose | 9.5% |
+| The same work on a call-heavy program | 38-45% |
+
+The order of magnitude is in the two numbers the levers do not touch: **~25 ns
+for a trivial register-to-register integer instruction** (a bytecode VM spends 2
+to 5) and the cheapest possible activation, now **118 ns** where a bytecode VM
+spends 20 to 50. Three
+changes would move those floors, and all three are re-architecture:
 
 1. **Resolve every call and field access to a slot or `FuncId` at link time** so
    the steady state never consults a name. The site memos approximate this, but
    the generality they fall back to is structured into every path, so even a hit
-   pays for the miss's shape.
-2. **Widen the bytecode tier to the instructions this workload runs** — field
-   reads, calls, constructions — so the common path never reaches the union
-   dispatch.
+   pays for the miss's shape — and 15.6% of self time is still name hashing.
+2. **Collapse the host dispatch layers.** A static call crosses `execArmCall`,
+   `callFunc`, `callFuncNamed`, `callFuncTyped`, `callFuncTypedInner` and the
+   activation seam; a member call crosses a comparable stack. That is 30% of
+   self time, and serving a link-settled native binding from the instruction
+   measured neutral, so it is the *shape* of the layers rather than their count.
 3. **Flatten the activation**: register windows in one contiguous stack rather
    than a per-activation list plus a host round-trip per call.
 
