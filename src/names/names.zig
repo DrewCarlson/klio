@@ -62,10 +62,13 @@ pub const PrehashedName = struct {
     }
 };
 
-/// Load factor for the name tables. They are read far more than they are
-/// written and they are small next to the program's heap, so the table trades
-/// space for a shorter probe.
-pub const name_max_load_percentage = 40;
+/// Load factor for the name tables.
+///
+/// Lowering it to 40 buys a shorter probe and 2.4% of a recomposer frame when
+/// the program has the machine to itself, and costs more than that when it does
+/// not: under the gate's thirteen concurrent children the wider tables slowed
+/// the longest job by 12%. The default stays.
+pub const name_max_load_percentage = std.hash_map.default_max_load_percentage;
 
 pub fn NameHashMap(comptime V: type) type {
     return std.HashMap([]const u8, V, NameContext, name_max_load_percentage);
