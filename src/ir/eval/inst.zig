@@ -748,6 +748,62 @@ fn polyFieldRoute(comptime H: type, host: *H, site: usize, cls: u64, recv: *cons
     return if (route == 0) null else route;
 }
 
+/// The claimed site's stored-slot read, written straight into `dst`.
+///
+/// This is the guard a specialising bytecode VM puts first: compare the
+/// receiver's class against the word the site claimed, then load the slot. True
+/// means the read is done; false means the instruction takes `execArmGetField`,
+/// whose arms — the builtin-field shapes, the companion sentinel, the
+/// enclosing-`this` push a resolution needs — belong to a site that has not
+/// claimed. Mirrors `binFast`: the stream tries this, then the arm.
+///
+/// Skipping the arm's enclosing-`this` push is sound for exactly the reads this
+/// serves. The arm pushes it, then pops it again before writing a stored slot,
+/// and the only host call in between is `storedNullServable`, which scans the
+/// receiver class's declared properties for a `lateinit` and consults no
+/// receiver chain. Nothing between that push and its pop can observe the entry.
+pub fn gfSiteFast(comptime H: type, host: *H, frame: *Frame, gf: anytype, dst: ir.Reg, recv_reg: ir.Reg, allocator: Allocator) bool {
+    if (comptime !@hasDecl(H, "fieldSiteRoute")) return false;
+    const recv = frame.regs.items.ptr[recv_reg.int()];
+    if (recv != .Instance) return false;
+    const w0 = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
+    if (w0 <= 1) return false;
+    const route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+    if (route & 3 != 1) return false;
+    const name = constStr(frame.module, gf.field) orelse return false;
+    const idx: usize = @intCast(route >> 2);
+    const v = blk: {
+        const g = recv.Instance.borrow();
+        defer g.deinit();
+        const b = g.get();
+        if (w0 != @as(u64, @intCast(b.class.identity()))) break :blk null;
+        if (idx >= b.fields.items.len) break :blk null;
+        const f = &b.fields.items[idx];
+        // A recorded LAYOUT match proves the index names this property; the
+        // claim key stays the CLASS, as two classes can share a layout.
+        if (@atomicLoad(u64, @constCast(&gf.site_shape), .monotonic) != b.shapeOf() and
+            !sameFieldName(f.name, name)) break :blk null;
+        break :blk f.value;
+    } orelse return false;
+    if (v == .Delegate) return false;
+    // A stored slot holding NULL is a plain null unless the property is an
+    // unset `lateinit`, whose read must throw.
+    if (v == .Null) {
+        if (comptime !@hasDecl(H, "storedNullServable")) return false;
+        if (!nullSiteOk(H, host, &recv, name, @constCast(&gf.null_ok))) return false;
+    }
+    if (parent.frame_count_on) parent.gf_mono += 1;
+    v.retain();
+    // The stream's register writes are proven in bounds at build time, so this
+    // is the unchecked store `writeFastU` makes, kept here to avoid a cycle.
+    const di = dst.int();
+    const old = frame.regs.items.ptr[di];
+    frame.regs.items.ptr[di] = v;
+    frame.wmask.set(di);
+    if (runtime.reclaimEnabled()) old.release(allocator);
+    return true;
+}
+
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
     if (parent.frame_count_on) parent.gf_slow += 1;
     const recv = frame.read(gf.receiver);

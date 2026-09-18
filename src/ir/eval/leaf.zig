@@ -223,12 +223,16 @@ fn leafWalkStream(
                     }
                     pc += 6;
                 },
-                .escape => {
+                .escape, .gf_site, .un => {
                     const inst_idx = code[pc + 1];
                     const b = &func.blocks[block];
                     if (inst_idx >= b.insts.len) return error.LeafAbandon;
                     try leafRunOne(H, allocator, module, func, args, host, depth, &b.insts[inst_idx], regs, reclaim, trace, pin, wmask);
-                    pc += 2;
+                    pc += switch (op) {
+                        .gf_site => 4,
+                        .un => 5,
+                        else => 2,
+                    };
                 },
                 .jump => {
                     block = code[pc + 1];

@@ -443,6 +443,42 @@ pub fn runFrameExec(
                             .ret => return ret_v,
                         }
                     },
+                    .un => {
+                        if (unopFast(frame, @enumFromInt(code[pc + 2]), @enumFromInt(code[pc + 3]), @enumFromInt(code[pc + 4]), allocator)) {
+                            pc += 5;
+                            continue :bc_loop;
+                        }
+                        idx = code[pc + 1];
+                        const inst = &binsts[idx];
+                        const r = try execInst(H, allocator, frame, inst, host);
+                        switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                            .cont => pc += 5,
+                            .brk => break :bc_loop,
+                            .ret => return ret_v,
+                        }
+                    },
+                    .gf_site => {
+                        idx = code[pc + 1];
+                        const inst = &binsts[idx];
+                        if (ev_inst.gfSiteFast(
+                            H,
+                            host,
+                            frame,
+                            &inst.GetField,
+                            @enumFromInt(code[pc + 2]),
+                            @enumFromInt(code[pc + 3]),
+                            allocator,
+                        )) {
+                            pc += 4;
+                            continue :bc_loop;
+                        }
+                        const r = try execInst(H, allocator, frame, inst, host);
+                        switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                            .cont => pc += 4,
+                            .brk => break :bc_loop,
+                            .ret => return ret_v,
+                        }
+                    },
                     .escape => {
                         idx = code[pc + 1];
                         const inst = &binsts[idx];
@@ -1091,6 +1127,54 @@ pub inline fn binFast(frame: *Frame, op: BinOp, dst: Reg, lhs: Reg, rhs: Reg, al
     frame.wmask.set(dst.int());
     if (runtime.reclaimEnabled()) old.release(allocator);
     return true;
+}
+
+/// The scalar UnOp core, mirroring `binFast`. Declines whenever an enclosing
+/// instance is in scope: there a member-extension operator can shadow a
+/// scalar's builtin `inc`/`dec`/`unaryMinus`, which only the arm resolves.
+pub inline fn unopFast(frame: *Frame, op: ir.UnOp, dst: Reg, src: Reg, allocator: Allocator) bool {
+    if (frame.enclosing_this.items.len != 0) return false;
+    if (frame.params.items.len > 0 and frame.params.items.ptr[0] == .Instance) return false;
+    const regs = frame.regs.items.ptr;
+    const out: Value = scalarUn(op, regs[src.int()]) orelse return false;
+    const old = regs[dst.int()];
+    regs[dst.int()] = out;
+    frame.wmask.set(dst.int());
+    if (runtime.reclaimEnabled()) old.release(allocator);
+    return true;
+}
+
+/// `applyUnop`'s exact semantics for the scalar tags; null for everything else,
+/// including the widening `Byte`/`Short` negations and the NaN sign rules the
+/// arm spells out.
+pub inline fn scalarUn(op: ir.UnOp, v: Value) ?Value {
+    return switch (op) {
+        .Inc => switch (v) {
+            .Int => |i| .{ .Int = i +% 1 },
+            .Long => |l| .{ .Long = l +% 1 },
+            .Char => |c| .{ .Char = c +% 1 },
+            .UInt => |x| .{ .UInt = x +% 1 },
+            .ULong => |x| .{ .ULong = x +% 1 },
+            else => null,
+        },
+        .Dec => switch (v) {
+            .Int => |i| .{ .Int = i -% 1 },
+            .Long => |l| .{ .Long = l -% 1 },
+            .Char => |c| .{ .Char = c -% 1 },
+            .UInt => |x| .{ .UInt = x -% 1 },
+            .ULong => |x| .{ .ULong = x -% 1 },
+            else => null,
+        },
+        .Neg => switch (v) {
+            .Int => |i| .{ .Int = -%i },
+            .Long => |l| .{ .Long = -%l },
+            else => null,
+        },
+        .Plus => switch (v) {
+            .Int, .Long, .Double, .Float => v,
+            else => null,
+        },
+    };
 }
 
 /// The shared same-tag scalar BinOp core with `applyBinop`'s exact semantics. Null for

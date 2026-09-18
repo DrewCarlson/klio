@@ -1632,6 +1632,15 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                     }
                     pc += 6;
                 },
+                .un => pc += 5,
+                .gf_site => {
+                    const gf = f.blocks[bi].insts[code[pc + 1]].GetField;
+                    if (leafConstStrOf(consts, gf.field) == null) {
+                        leafTrace(f, "field-name");
+                        ok = false;
+                    }
+                    pc += 4;
+                },
                 .escape => {
                     const inst_idx = code[pc + 1];
                     switch (f.blocks[bi].insts[inst_idx]) {
@@ -1941,6 +1950,16 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                     if (code[pc + 5] > max_reg) max_reg = code[pc + 5];
                     pc += 6;
                 },
+                .gf_site => {
+                    if (code[pc + 2] > max_reg) max_reg = code[pc + 2];
+                    if (code[pc + 3] > max_reg) max_reg = code[pc + 3];
+                    pc += 4;
+                },
+                .un => {
+                    if (code[pc + 3] > max_reg) max_reg = code[pc + 3];
+                    if (code[pc + 4] > max_reg) max_reg = code[pc + 4];
+                    pc += 5;
+                },
                 .escape => {
                     switch (f.blocks[bi].insts[code[pc + 1]]) {
                         .Call => |*c| {
@@ -2044,6 +2063,18 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                 .bin => {
                     try emitLeafBin(w, @enumFromInt(code[pc + 2]), code[pc + 3], code[pc + 4], code[pc + 5]);
                     pc += 6;
+                },
+                .un => {
+                    const u = &f.blocks[bi].insts[code[pc + 1]].UnOp;
+                    try emitLeafUn(w, u.op, u.dst.int(), u.operand.int());
+                    pc += 5;
+                },
+                .gf_site => {
+                    const gf = &f.blocks[bi].insts[code[pc + 1]].GetField;
+                    const fname = leafConstStrOf(consts, gf.field).?;
+                    try w.print("  {{ static uint64_t KFS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
+                    try w.print("    if (!kl_getfield(ev, l{d}, g{d}, &KFS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ gf.receiver.int(), gf.receiver.int(), bi, code[pc + 1], fname, gf.dst.int(), gf.dst.int() });
+                    pc += 4;
                 },
                 .escape => {
                     if (f.blocks[bi].insts[code[pc + 1]] == .UnOp) {
@@ -2734,6 +2765,28 @@ fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block
             .bin => {
                 try emitBinSite(w, block, code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4], code[pc + 5]);
                 pc += 6;
+            },
+            .un => {
+                // The native tier has no dedicated unary site; run the arm.
+                try w.print("  if (klio_op_escape(ctx, {d}u, {d}u)) return;\n", .{ block, code[pc + 1] });
+                pc += 5;
+            },
+            .gf_site => {
+                // Same class-guarded inline the escape form emitted.
+                const inst_idx = code[pc + 1];
+                const gf = f.blocks[block].insts[inst_idx].GetField;
+                try w.print(
+                    "  {{ static uint64_t gfr_{d}_{d} = 0;\n" ++
+                        "    if (!kv_getfield(ctx, regs, {d}u, {d}u, {d}u, {d}u, &gfr_{d}_{d}))\n" ++
+                        "      if (klio_op_escape(ctx, {d}u, {d}u)) return; }}\n",
+                    .{
+                        block,        inst_idx,
+                        block,        inst_idx, gf.dst.int(), gf.receiver.int(),
+                        block,        inst_idx,
+                        block,        inst_idx,
+                    },
+                );
+                pc += 4;
             },
             .escape => {
                 // A statically-bound call quickens; the caller stays on the C stack.

@@ -38,6 +38,13 @@ pub const Op = enum(u32) {
     ret,
     /// No operands: run the block's real terminator in the frame loop.
     term_exit,
+    /// inst_idx, kind, dst, operand: a unary operator, with the scalar tags
+    /// served inline and every other shape falling to the instruction's arm.
+    un,
+    /// inst_idx, dst, receiver: a field read whose site has claimed a plain
+    /// stored slot for the receiver's class serves it inline; every other shape
+    /// falls to the instruction's own arm, exactly as `bin` does.
+    gf_site,
     /// inst_idx, kind, dst, lhs, rhs, t_block, f_block: the block's last
     /// instruction is a BinOp whose dst is the Branch condition. The compare
     /// still writes dst, so register state matches the unfused form;
@@ -190,7 +197,7 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const, n_locals: u
     if (!fuse) {
         const dedicated = for (insts) |*inst| {
             switch (inst.*) {
-                .Const, .Move, .LoadParam, .CellGet, .BinOp => break true,
+                .Const, .Move, .LoadParam, .CellGet, .BinOp, .GetField, .UnOp => break true,
                 else => {},
             }
         } else false;
@@ -270,6 +277,31 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const, n_locals: u
             },
             .Trace => |t| {
                 code.appendSlice(a, &.{ @intFromEnum(Op.trace), t.span.file.int(), t.span.start, t.span.end }) catch return null;
+            },
+            .UnOp => |u| {
+                if (!regOk(n_locals, u.dst.int()) or !regOk(n_locals, u.operand.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
+                code.appendSlice(a, &.{
+                    @intFromEnum(Op.un),
+                    @intCast(i),
+                    @intFromEnum(u.op),
+                    u.dst.int(),
+                    u.operand.int(),
+                }) catch return null;
+            },
+            .GetField => |gf| {
+                if (!regOk(n_locals, gf.dst.int()) or !regOk(n_locals, gf.receiver.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
+                code.appendSlice(a, &.{
+                    @intFromEnum(Op.gf_site),
+                    @intCast(i),
+                    gf.dst.int(),
+                    gf.receiver.int(),
+                }) catch return null;
             },
             .BinOp => |bo| {
                 if (!regOk(n_locals, bo.dst.int()) or !regOk(n_locals, bo.lhs.int()) or
@@ -427,6 +459,14 @@ pub fn dumpStream(w: anytype, s: *const Stream) !void {
             .const_load => {
                 try w.print("  {d:>4}: const_load r{d} <- const#{d}\n", .{ pc, code[pc + 1], code[pc + 2] });
                 pc += 3;
+            },
+            .un => {
+                try w.print("  {d:>4}: un         r{d} <- op{d} r{d}\n", .{ pc, code[pc + 3], code[pc + 2], code[pc + 4] });
+                pc += 5;
+            },
+            .gf_site => {
+                try w.print("  {d:>4}: gf_site    r{d} <- r{d}.#{d}\n", .{ pc, code[pc + 2], code[pc + 3], code[pc + 1] });
+                pc += 4;
             },
             .const_int => {
                 try w.print("  {d:>4}: const_int  r{d} <- {d}\n", .{ pc, code[pc + 1], @as(i32, @bitCast(code[pc + 2])) });
