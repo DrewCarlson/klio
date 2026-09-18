@@ -195,7 +195,7 @@ pub fn isImplicitlyImportedPackage(package_path: []const u8) bool {
 /// map constructor: the link-time global maps and the lowerer's inline-shadow
 /// name set all take their name domain from this rule.
 pub fn noteBareNameMapping(
-    map: *std.StringHashMap([]const u8),
+    map: *runtime.NameHashMap([]const u8),
     packages: []const []const u8,
     fqn: []const u8,
 ) std.mem.Allocator.Error!void {
@@ -697,7 +697,7 @@ test "implicitly imported packages match spec list" {
 }
 
 test "noteBareNameMapping keeps the earliest-ranked package and ignores the rest" {
-    var map = std.StringHashMap([]const u8).init(testing.allocator);
+    var map = runtime.NameHashMap([]const u8).init(testing.allocator);
     defer map.deinit();
     const pkgs = [_][]const u8{ "kotlin", "kotlin.math" };
     try noteBareNameMapping(&map, &pkgs, "kotlin.math.abs");
@@ -716,7 +716,7 @@ test "the inline shadow set's name domain comes from the shared constructor" {
     // The lowerer derives `shadowed_inline_names` from `noteBareNameMapping` over
     // `IMPLICITLY_IMPORTED_PACKAGES`. `synchronized` is deliberately absent: it
     // is an inline actual that splices so its block can suspend.
-    var map = std.StringHashMap([]const u8).init(testing.allocator);
+    var map = runtime.NameHashMap([]const u8).init(testing.allocator);
     defer map.deinit();
     var it = implementations.allFqns();
     while (it.next()) |fqn| {

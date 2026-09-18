@@ -65,10 +65,10 @@ pub fn pushNativePark(
     frame: ?*anyopaque,
     wake_in_millis: i64,
 ) Allocator.Error!void {
-    const state = ev_state.evtls.in_flight_suspend orelse blk: {
+    const state = ev_state.evtlsPtr().in_flight_suspend orelse blk: {
         const st = try allocator.create(SuspendState);
         st.* = .{ .token = 0, .frames = .empty, .wake_in_millis = wake_in_millis, .pending_resume_reg = null };
-        ev_state.evtls.in_flight_suspend = st;
+        ev_state.evtlsPtr().in_flight_suspend = st;
         break :blk st;
     };
     if (wake_in_millis != 0) state.wake_in_millis = wake_in_millis;
@@ -90,8 +90,8 @@ pub fn pushNativePark(
 
 pub fn takeInFlightSuspend(allocator: Allocator) ?*SuspendState {
     _ = allocator;
-    const st = ev_state.evtls.in_flight_suspend;
-    ev_state.evtls.in_flight_suspend = null;
+    const st = ev_state.evtlsPtr().in_flight_suspend;
+    ev_state.evtlsPtr().in_flight_suspend = null;
     return st;
 }
 
@@ -136,11 +136,11 @@ pub fn resumeContinuation(
     var carry = resume_value;
     // Per-frame prev-chain captures are coherent only while the replay runs, so a deactivation
     // cascade can leave the thread's active chain pointing into a torn-down frame's list.
-    const saved_chain = ev_state.evtls.active_chain;
-    const saved_chain_base = ev_state.evtls.active_chain_base;
+    const saved_chain = ev_state.evtlsPtr().active_chain;
+    const saved_chain_base = ev_state.evtlsPtr().active_chain_base;
     defer {
-        ev_state.evtls.active_chain = saved_chain;
-        ev_state.evtls.active_chain_base = saved_chain_base;
+        ev_state.evtlsPtr().active_chain = saved_chain;
+        ev_state.evtlsPtr().active_chain_base = saved_chain_base;
     }
     // `frames` is innermost-first, so resume the innermost and feed its value to the next-outer.
     // A drained list continues through the inherited `tails` segments, promoted one at a time.
@@ -163,13 +163,13 @@ pub fn resumeContinuation(
     var head: usize = 0;
     // Root the not-yet-rebuilt outer snapshots for the resume's duration: they are out of the park
     // registry and not yet on the frame chain, so an inner frame's collection would sweep them.
-    var resume_node = ResumeFrames{ .prev = ev_state.evtls.resuming, .frames = &frames, .head = &head, .tails = &tails };
+    var resume_node = ResumeFrames{ .prev = ev_state.evtlsPtr().resuming, .frames = &frames, .head = &head, .tails = &tails };
     if (runtime.gc.gc_enabled) {
         gcInstallFrameRoot();
-        ev_state.evtls.resuming = &resume_node;
+        ev_state.evtlsPtr().resuming = &resume_node;
     }
     defer if (runtime.gc.gc_enabled) {
-        ev_state.evtls.resuming = resume_node.prev;
+        ev_state.evtlsPtr().resuming = resume_node.prev;
     };
     var first = true;
     var pending_throw_from_inner: ?Value = null;
@@ -256,7 +256,7 @@ pub fn resumeContinuation(
         try params.appendSlice(allocator, snap.params);
         var caps: std.ArrayList(Value) = .empty;
         try caps.appendSlice(allocator, snap.captures);
-        var frame = try Frame.newWithCaptures(&ev_state.evtls, allocator, m, func, params, caps);
+        var frame = try Frame.newWithCaptures(ev_state.evtlsPtr(), allocator, m, func, params, caps);
         frame.closure_id = snap.closure_id;
         frame.pending_finally = snap.pending_finally;
         defer frame.deinit();
@@ -396,16 +396,16 @@ pub fn runFrame(
     host: *H,
 ) Allocator.Error!EvalResult {
     // Every nested Kotlin call re-enters here, so bounding this depth raises a catchable `StackOverflowError` before the native stack faults.
-    if (ev_state.evtls.eval_depth >= maxEvalDepth()) {
+    if (ev_state.evtlsPtr().eval_depth >= maxEvalDepth()) {
         dumpFrameChainForDiag();
         return errResult(.{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" });
     }
-    if (ev_state.evtls.eval_depth == 0) _ = parent.threads_in_eval.fetchAdd(1, .monotonic);
-    ev_state.evtls.eval_depth += 1;
+    if (ev_state.evtlsPtr().eval_depth == 0) _ = parent.threads_in_eval.fetchAdd(1, .monotonic);
+    ev_state.evtlsPtr().eval_depth += 1;
     defer {
-        ev_state.evtls.eval_depth -= 1;
+        ev_state.evtlsPtr().eval_depth -= 1;
         // Back at the outermost activation with no native JIT frame on the stack, so the JIT cache may be trimmed.
-        if (ev_state.evtls.eval_depth == 0) {
+        if (ev_state.evtlsPtr().eval_depth == 0) {
             _ = parent.threads_in_eval.fetchSub(1, .monotonic);
             jit_loop.evictIfOverBudget();
         }
@@ -515,7 +515,7 @@ pub fn actFree(ev: *EvalTls, allocator: Allocator, act: *Activation) void {
 
 /// Open a flat activation for a direct interpreted call: the entry sequence `evalWithCapturesChained` performs recursively.
 pub fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const Module, req: FlatCallReq, host: *H) Allocator.Error!*Activation {
-    const ev: *EvalTls = &ev_state.evtls;
+    const ev: *EvalTls = ev_state.evtlsPtr();
     boolThisTrap(req.func, req.args.items);
     const module = req.run_module orelse caller_module;
     dumpFnIfRequested(module, req.func);
@@ -659,7 +659,7 @@ pub fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
         if (runtime.reclaimEnabled()) ka.release(allocator);
     }
     if (act.type_args.len > 0) allocator.free(act.type_args);
-    actFree(&ev_state.evtls, allocator, act);
+    actFree(ev_state.evtlsPtr(), allocator, act);
 }
 
 /// Reinstall a live-parked activation and run it on. A suspension is re-parked by the driver; a completion is torn down here.
@@ -677,7 +677,7 @@ fn resumeLiveActivation(
 ) Allocator.Error!EvalResult {
     // A live-parked activation may resume on a different worker thread than the one that parked it,
     // so rebind the frame to the resuming thread's eval TLS before the parked pointer is used.
-    act.frame.tls = &ev_state.evtls;
+    act.frame.tls = ev_state.evtlsPtr();
     gcPushFrame(&act.frame);
     act.frame.activateAs();
     if (resume_throw == null) {
@@ -687,7 +687,7 @@ fn resumeLiveActivation(
     if (res == .err and res.err == .Suspended) return res;
     const out = frameBoundary(act.frame.func, res);
     teardownActivation(H, allocator, act, host);
-    actFree(&ev_state.evtls, allocator, act);
+    actFree(ev_state.evtlsPtr(), allocator, act);
     return out;
 }
 

@@ -246,22 +246,22 @@ pub fn nuTraceWant() ?[]const u8 {
 /// Host-to-driver flat-call handoff for ladders whose pick lives deep in host code: the exec arm arms the slot,
 /// the host terminal takes the arm (one-shot) and stashes a flat request, and the arm pushes the activation.
 pub fn armHostFlatReq() void {
-    ev_state.evtls.host_flat_armed = true;
+    ev_state.evtlsPtr().host_flat_armed = true;
 }
 
 pub fn takeHostFlatArm() bool {
-    const a = ev_state.evtls.host_flat_armed;
-    ev_state.evtls.host_flat_armed = false;
+    const a = ev_state.evtlsPtr().host_flat_armed;
+    ev_state.evtlsPtr().host_flat_armed = false;
     return a;
 }
 
 pub fn stashHostFlatReq(req: FlatCallReq) void {
-    ev_state.evtls.host_flat_req = req;
+    ev_state.evtlsPtr().host_flat_req = req;
 }
 
 pub fn takeHostFlatReq() ?FlatCallReq {
-    const r = ev_state.evtls.host_flat_req;
-    ev_state.evtls.host_flat_req = null;
+    const r = ev_state.evtlsPtr().host_flat_req;
+    ev_state.evtlsPtr().host_flat_req = null;
     return r;
 }
 

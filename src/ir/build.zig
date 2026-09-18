@@ -21,8 +21,8 @@ const Terminator = ir.Terminator;
 const TypeRef = ir.TypeRef;
 const CatchHandler = ir.CatchHandler;
 
-pub const StringSet = std.StringHashMap(void);
-const StringRegMap = std.StringHashMap(Reg);
+pub const StringSet = runtime.NameHashMap(void);
+const StringRegMap = runtime.NameHashMap(Reg);
 
 /// A mutable var's home register plus the scope depth it bound at, which lets
 /// `mutableHome` hide a home a spliced inline body installed, as `resolve` does.
@@ -39,7 +39,7 @@ pub const FinallyWindow = struct {
 
 /// Per inline-fn-splice frame: substitution map plus `inline_return` snapshot.
 const InlineLambdaFrame = struct {
-    subst: std.StringHashMap(*const ast.Expr),
+    subst: runtime.NameHashMap(*const ast.Expr),
     snapshot: []InlineReturn,
     /// The bare-call receiver hint active at the inline CALL SITE: a lambda
     /// argument spliced from this frame is caller code and resolves under it.
@@ -94,7 +94,7 @@ pub fn setLowerSelfPackage(pkg: []const u8) []const u8 {
 /// Per-file top-level property renames: FileId -> (simple name -> renamed global
 /// name), the flat globals table's model of Kotlin's file-scoped `private` and
 /// per-package storage; a reference resolves through its own span file.
-pub const FilePrivateRenames = std.AutoHashMap(u32, std.StringHashMap([]const u8));
+pub const FilePrivateRenames = std.AutoHashMap(u32, runtime.NameHashMap([]const u8));
 
 threadlocal var lower_file_private_renames: ?*const FilePrivateRenames = null;
 
@@ -200,7 +200,7 @@ pub fn currentOwnerClass() ?[]const u8 {
 /// File-keyed type renames: FileId -> (simple type name -> mangled lift name).
 /// Kotlin file-scopes a `private` top-level class or typealias, so one whose
 /// simple name another file claims mangles; references rewrite by span file.
-pub const FileTypeRenames = std.AutoHashMap(u32, std.StringHashMap([]const u8));
+pub const FileTypeRenames = std.AutoHashMap(u32, runtime.NameHashMap([]const u8));
 
 threadlocal var lower_file_type_renames: ?*const FileTypeRenames = null;
 
@@ -216,7 +216,7 @@ pub fn fileTypeRename(name: []const u8, file: u32) ?[]const u8 {
     return inner.get(name);
 }
 
-pub fn fileTypeRenamesFor(file: u32) ?*const std.StringHashMap([]const u8) {
+pub fn fileTypeRenamesFor(file: u32) ?*const runtime.NameHashMap([]const u8) {
     const m = lower_file_type_renames orelse return null;
     return m.getPtr(file);
 }
@@ -224,7 +224,7 @@ pub fn fileTypeRenamesFor(file: u32) ?*const std.StringHashMap([]const u8) {
 /// Package-scoped type renames: a mangled `internal` classifier resolves through
 /// this map in every file of its package, the file map not serving same-package
 /// cross-file references. Cross-package references resolve by FQN.
-pub const PkgTypeRenames = std.StringHashMap(std.StringHashMap([]const u8));
+pub const PkgTypeRenames = runtime.NameHashMap(runtime.NameHashMap([]const u8));
 
 threadlocal var lower_pkg_type_renames: ?*const PkgTypeRenames = null;
 
@@ -240,7 +240,7 @@ pub fn pkgTypeRename(name: []const u8, pkg: []const u8) ?[]const u8 {
     return inner.get(name);
 }
 
-pub fn pkgTypeRenamesFor(pkg: []const u8) ?*const std.StringHashMap([]const u8) {
+pub fn pkgTypeRenamesFor(pkg: []const u8) ?*const runtime.NameHashMap([]const u8) {
     const m = lower_pkg_type_renames orelse return null;
     return m.getPtr(pkg);
 }
@@ -476,7 +476,7 @@ pub const FuncBuilder = struct {
     /// Names declared `var` in any live scope; a `val` target dispatches `plusAssign`.
     mutables: StringSet,
     /// Permanent home register per `var` local: reads resolve to it, writes Move in.
-    mutable_homes: std.StringHashMap(MutableHome),
+    mutable_homes: runtime.NameHashMap(MutableHome),
     /// Per-scope undo journal for `mutables`/`mutable_homes`: entries record the
     /// pre-declaration state and `popScope` restores it, so a block-scoped `var`
     /// stops shadowing a class property. The bottom scope has no frame.
@@ -537,7 +537,7 @@ pub const FuncBuilder = struct {
     /// Per own-member name, a bitmask of accepted argument counts: bit `i` some
     /// overload binds `i` user args, bit 62 one declares type parameters, bit 63
     /// a vararg overload. A name absent from the map is applicable.
-    own_member_arity: std.StringHashMap(u64),
+    own_member_arity: runtime.NameHashMap(u64),
     /// Member names of the lexically enclosing class, carried into a lambda body.
     /// Unlike `own_members` these never reroute a bare reference through `this.`.
     enclosing_members: StringSet,
@@ -566,37 +566,37 @@ pub const FuncBuilder = struct {
     local_fns: StringSet,
     /// A local `fun`'s declared return type, keyed by its mangled binding name.
     /// A local fn is a closure in a cell, so nothing else answers this. Owned.
-    local_fn_return_tys: std.StringHashMap(TypeRef),
+    local_fn_return_tys: runtime.NameHashMap(TypeRef),
     /// Declared parameter type name per positional parameter of a local function,
     /// leading `this` dropped, so a numeric literal argument coerces at the call.
-    local_fn_param_tys: std.StringHashMap([]const ?[]const u8),
+    local_fn_param_tys: runtime.NameHashMap([]const ?[]const u8),
     /// Local fns declared as extensions, whose bare call prepends the implicit
     /// receiver. The value is the value-parameter count, or -1 when unknown.
-    local_ext_fns: std.StringHashMap(i8),
+    local_ext_fns: runtime.NameHashMap(i8),
     /// Per function-typed local or parameter, the value-parameter arity of each
     /// of its OWN parameters, `-1` where that parameter is not a function type.
     /// A call through the name shapes its lambda arguments from this: the
     /// callee is a value, so no name index can answer for it.
-    fn_value_param_arities: std.StringHashMap([]const i16),
+    fn_value_param_arities: runtime.NameHashMap([]const i16),
     /// Locals proven not callable, so a bare call of the name takes the function.
     nonfn_locals: StringSet,
     /// One entry per same-named local-fn declaration, in decl order; each closure
     /// is also bound under a mangled name, the plain name staying last-decl-wins.
-    local_fn_overloads: std.StringHashMap(std.ArrayList(LocalFnOverload)),
-    local_decl_types: std.StringHashMap(TypeRef),
+    local_fn_overloads: runtime.NameHashMap(std.ArrayList(LocalFnOverload)),
+    local_decl_types: runtime.NameHashMap(TypeRef),
     /// Source-annotated AST types of locals, so a later assignment lowers under the
     /// declaration's expected type. Pointers into the AST, which outlives the build.
-    local_ast_tys: std.StringHashMap(*const ast.TypeRef),
-    local_decl_nullable: std.StringHashMap(void),
-    local_call_returns: std.StringHashMap(ir.EagerTypeHead),
-    local_decl_recv_fn: std.StringHashMap(void),
+    local_ast_tys: runtime.NameHashMap(*const ast.TypeRef),
+    local_decl_nullable: runtime.NameHashMap(void),
+    local_call_returns: runtime.NameHashMap(ir.EagerTypeHead),
+    local_decl_recv_fn: runtime.NameHashMap(void),
     /// Initializer expression per un-annotated local; the AST outlives the pass.
-    local_init_exprs: std.StringHashMap(*const ast.Expr),
+    local_init_exprs: runtime.NameHashMap(*const ast.Expr),
     /// Locals whose name named nothing at their own declaration point: Kotlin
     /// scopes a local only after its initializer, so a bare call there ignores it.
-    local_init_name_free: std.StringHashMap(void),
+    local_init_name_free: runtime.NameHashMap(void),
     /// Declaration span per recorded initializer, so a relower reads self.
-    local_init_decl_spans: std.StringHashMap(ast.Span),
+    local_init_decl_spans: runtime.NameHashMap(ast.Span),
     /// Params whose declared type is a receiver-typed function (`block: T.() ->
     /// R`): a bare call `block(...)` dispatches with the enclosing `this`.
     receiver_lambda_params: StringSet,
@@ -605,8 +605,8 @@ pub const FuncBuilder = struct {
     splice_rlp_marks: StringSet,
     shared_rlp_marks: StringSet,
     receiver_lambda_recv_heads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
-    receiver_lambda_arity: std.StringHashMap(usize),
-    context_fn_params: std.StringHashMap(ContextFnShape),
+    receiver_lambda_arity: runtime.NameHashMap(usize),
+    context_fn_params: runtime.NameHashMap(ContextFnShape),
     /// Params and locals typed by an unconstrained generic type parameter: Kotlin
     /// desugars a comparison on one to `compareTo`, the total order, not IEEE.
     generic_typed_params: StringSet,
@@ -618,10 +618,10 @@ pub const FuncBuilder = struct {
     /// Reified type-parameter names bound by an in-progress inline splice, mapped
     /// to the register holding the resolved class value; nested splices chain.
     reified_type_binds: StringRegMap,
-    reified_type_names: std.StringHashMap([]const u8),
+    reified_type_names: runtime.NameHashMap([]const u8),
     /// Splice-scoped param name to declared type, reified substitutions applied:
     /// a nested reified call infers its type parameter from this lexical record.
-    splice_param_tys: std.StringHashMap(ast.TypeRef),
+    splice_param_tys: runtime.NameHashMap(ast.TypeRef),
     /// User `finally { … }` blocks enclosing the cursor, innermost on top: a
     /// `return` reached during inline expansion replays each before exiting.
     finally_stack: std.ArrayList(ast.Block) = .empty,
@@ -713,9 +713,9 @@ pub const FuncBuilder = struct {
     /// Non-reified type parameters in scope, own plus the enclosing class's: a
     /// cast to one is unchecked, erased to the bound, never a class check.
     type_param_names: StringSet,
-    type_param_bounds: std.StringHashMap(ir.ModuleRegistry.TypeParamBound),
+    type_param_bounds: runtime.NameHashMap(ir.ModuleRegistry.TypeParamBound),
     /// Full lowered upper bound, keeping the type arguments the string record drops.
-    type_param_bound_refs: std.StringHashMap(TypeRef),
+    type_param_bound_refs: runtime.NameHashMap(TypeRef),
     owned_type_param_names: std.ArrayList([]u8),
 
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
@@ -729,49 +729,49 @@ pub const FuncBuilder = struct {
             .capture_regs = StringRegMap.init(allocator),
             .capture_loads_emitted = StringSet.init(allocator),
             .mutables = StringSet.init(allocator),
-            .mutable_homes = std.StringHashMap(MutableHome).init(allocator),
+            .mutable_homes = runtime.NameHashMap(MutableHome).init(allocator),
             .boxed_vars = StringSet.init(allocator),
             .any_typed_locals = StringSet.init(allocator),
             .broad_coll_locals = StringSet.init(allocator),
             .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
             .type_param_names = StringSet.init(allocator),
-            .type_param_bounds = std.StringHashMap(ir.ModuleRegistry.TypeParamBound).init(allocator),
-            .type_param_bound_refs = std.StringHashMap(TypeRef).init(allocator),
+            .type_param_bounds = runtime.NameHashMap(ir.ModuleRegistry.TypeParamBound).init(allocator),
+            .type_param_bound_refs = runtime.NameHashMap(TypeRef).init(allocator),
             .owned_type_param_names = .empty,
-            .own_member_arity = std.StringHashMap(u64).init(allocator),
+            .own_member_arity = runtime.NameHashMap(u64).init(allocator),
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
             .lambda_arg_recv = std.AutoHashMap(span_mod.Span, TypeRef).init(allocator),
             .enclosing_members = StringSet.init(allocator),
             .param_names = StringSet.init(allocator),
             .local_fns = StringSet.init(allocator),
-            .local_fn_return_tys = std.StringHashMap(TypeRef).init(allocator),
-            .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
-            .fn_value_param_arities = std.StringHashMap([]const i16).init(allocator),
-            .local_decl_types = std.StringHashMap(TypeRef).init(allocator),
-            .local_ast_tys = std.StringHashMap(*const ast.TypeRef).init(allocator),
-            .local_decl_nullable = std.StringHashMap(void).init(allocator),
-            .local_call_returns = std.StringHashMap(ir.EagerTypeHead).init(allocator),
-            .local_decl_recv_fn = std.StringHashMap(void).init(allocator),
-            .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
-            .local_init_name_free = std.StringHashMap(void).init(allocator),
-            .local_init_decl_spans = std.StringHashMap(ast.Span).init(allocator),
-            .local_ext_fns = std.StringHashMap(i8).init(allocator),
+            .local_fn_return_tys = runtime.NameHashMap(TypeRef).init(allocator),
+            .local_fn_param_tys = runtime.NameHashMap([]const ?[]const u8).init(allocator),
+            .fn_value_param_arities = runtime.NameHashMap([]const i16).init(allocator),
+            .local_decl_types = runtime.NameHashMap(TypeRef).init(allocator),
+            .local_ast_tys = runtime.NameHashMap(*const ast.TypeRef).init(allocator),
+            .local_decl_nullable = runtime.NameHashMap(void).init(allocator),
+            .local_call_returns = runtime.NameHashMap(ir.EagerTypeHead).init(allocator),
+            .local_decl_recv_fn = runtime.NameHashMap(void).init(allocator),
+            .local_init_exprs = runtime.NameHashMap(*const ast.Expr).init(allocator),
+            .local_init_name_free = runtime.NameHashMap(void).init(allocator),
+            .local_init_decl_spans = runtime.NameHashMap(ast.Span).init(allocator),
+            .local_ext_fns = runtime.NameHashMap(i8).init(allocator),
             .nonfn_locals = StringSet.init(allocator),
-            .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
+            .local_fn_overloads = runtime.NameHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
             .splice_rlp_marks = StringSet.init(allocator),
             .shared_rlp_marks = StringSet.init(allocator),
-            .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
-            .context_fn_params = std.StringHashMap(ContextFnShape).init(allocator),
+            .receiver_lambda_arity = runtime.NameHashMap(usize).init(allocator),
+            .context_fn_params = runtime.NameHashMap(ContextFnShape).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
             .plain_fn_params = StringSet.init(allocator),
             .fn_params_take_lambda = StringSet.init(allocator),
             .erased_recv_params = StringSet.init(allocator),
             .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
-            .reified_type_names = std.StringHashMap([]const u8).init(allocator),
-            .splice_param_tys = std.StringHashMap(ast.TypeRef).init(allocator),
+            .reified_type_names = runtime.NameHashMap([]const u8).init(allocator),
+            .splice_param_tys = runtime.NameHashMap(ast.TypeRef).init(allocator),
             .is_lambda_body = false,
             .is_anon_fn_body = false,
             .is_named_local_fn = false,
@@ -1019,12 +1019,12 @@ pub const FuncBuilder = struct {
         _ = self.inline_stack.pop();
     }
     /// Takes ownership of `m`; the current `inline_return` is duplicated in.
-    pub fn pushInlineLambdaFrame(self: *FuncBuilder, m: std.StringHashMap(*const ast.Expr), caller_scope_depth: usize) Allocator.Error!void {
+    pub fn pushInlineLambdaFrame(self: *FuncBuilder, m: runtime.NameHashMap(*const ast.Expr), caller_scope_depth: usize) Allocator.Error!void {
         try self.pushInlineLambdaFrameHinted(m, caller_scope_depth, self.splice_hint_active, self.splice_hint_recv, self.this_narrow);
     }
 
     /// As `pushInlineLambdaFrame`, with an explicit call-site bare-call hint.
-    pub fn pushInlineLambdaFrameHinted(self: *FuncBuilder, m: std.StringHashMap(*const ast.Expr), caller_scope_depth: usize, hint_active: bool, hint_recv: ?[]const u8, this_narrow: ?[]const u8) Allocator.Error!void {
+    pub fn pushInlineLambdaFrameHinted(self: *FuncBuilder, m: runtime.NameHashMap(*const ast.Expr), caller_scope_depth: usize, hint_active: bool, hint_recv: ?[]const u8, this_narrow: ?[]const u8) Allocator.Error!void {
         const snap = try self.allocator.dupe(InlineReturn, self.inline_return.items);
         try self.inline_lambda_subst.append(self.allocator, .{ .subst = m, .snapshot = snap, .caller_scope_depth = caller_scope_depth, .caller_hint_active = hint_active, .caller_hint_recv = hint_recv, .caller_this_narrow = this_narrow });
     }
@@ -1101,7 +1101,7 @@ pub const FuncBuilder = struct {
         self: *const FuncBuilder,
         name: []const u8,
         lam: *const ast.Expr,
-    ) ?*const std.StringHashMap(*const ast.Expr) {
+    ) ?*const runtime.NameHashMap(*const ast.Expr) {
         const i = self.definingInlineLambdaFrame(name, lam) orelse return null;
         if (i == 0) return null;
         return &self.inline_lambda_subst.items[i - 1].subst;
@@ -1609,7 +1609,7 @@ pub const FuncBuilder = struct {
         return self.own_members.contains(name);
     }
     /// Takes ownership of `map`.
-    pub fn setOwnMemberArity(self: *FuncBuilder, map: std.StringHashMap(u64)) void {
+    pub fn setOwnMemberArity(self: *FuncBuilder, map: runtime.NameHashMap(u64)) void {
         self.own_member_arity.deinit();
         self.own_member_arity = map;
     }
@@ -1775,7 +1775,7 @@ pub const FuncBuilder = struct {
         return self.local_decl_nullable.contains(name);
     }
     pub fn localDeclTypesSnapshot(self: *const FuncBuilder) Allocator.Error!ir.PendingLocalDeclTypes {
-        var types = std.StringHashMap(TypeRef).init(self.allocator);
+        var types = runtime.NameHashMap(TypeRef).init(self.allocator);
         errdefer {
             var cleanup_it = types.valueIterator();
             while (cleanup_it.next()) |ty| ty.deinit(self.allocator);
@@ -1790,11 +1790,11 @@ pub const FuncBuilder = struct {
             }
             try types.put(entry.key_ptr.*, cloned);
         }
-        var nullable = std.StringHashMap(void).init(self.allocator);
+        var nullable = runtime.NameHashMap(void).init(self.allocator);
         errdefer nullable.deinit();
         var null_it = self.local_decl_nullable.keyIterator();
         while (null_it.next()) |name| try nullable.put(name.*, {});
-        var call_returns = std.StringHashMap(ir.EagerTypeHead).init(self.allocator);
+        var call_returns = runtime.NameHashMap(ir.EagerTypeHead).init(self.allocator);
         errdefer call_returns.deinit();
         var return_it = self.local_call_returns.iterator();
         while (return_it.next()) |entry| try call_returns.put(entry.key_ptr.*, entry.value_ptr.*);
@@ -1917,7 +1917,7 @@ pub const FuncBuilder = struct {
     pub fn localDeclTypeRef(self: *const FuncBuilder, name: []const u8) ?TypeRef {
         return self.local_decl_types.get(name);
     }
-    pub fn localInitExprIterator(self: *const FuncBuilder) std.StringHashMap(*const ast.Expr).Iterator {
+    pub fn localInitExprIterator(self: *const FuncBuilder) runtime.NameHashMap(*const ast.Expr).Iterator {
         return self.local_init_exprs.iterator();
     }
     pub fn localInitExpr(self: *const FuncBuilder, name: []const u8) ?*const ast.Expr {
@@ -1994,7 +1994,7 @@ pub const FuncBuilder = struct {
     }
     /// Seed the overload table from an enclosing scope's, so a nested lambda
     /// selects among siblings. Slices are duplicated into this allocator.
-    pub fn inheritLocalFnOverloads(self: *FuncBuilder, table: *const std.StringHashMap(std.ArrayList(LocalFnOverload))) Allocator.Error!void {
+    pub fn inheritLocalFnOverloads(self: *FuncBuilder, table: *const runtime.NameHashMap(std.ArrayList(LocalFnOverload))) Allocator.Error!void {
         var it = table.iterator();
         while (it.next()) |e| {
             const gop = try self.local_fn_overloads.getOrPut(e.key_ptr.*);
@@ -2127,7 +2127,7 @@ pub const FuncBuilder = struct {
         return cloneStringSet(self.allocator, &self.receiver_lambda_params);
     }
     /// The innermost frame's substitution map, keyed by the inline fn's lambda params.
-    pub fn innermostInlineLambdaSubst(self: *const FuncBuilder) ?*const std.StringHashMap(*const ast.Expr) {
+    pub fn innermostInlineLambdaSubst(self: *const FuncBuilder) ?*const runtime.NameHashMap(*const ast.Expr) {
         if (self.inline_lambda_subst.items.len == 0) return null;
         return &self.inline_lambda_subst.items[self.inline_lambda_subst.items.len - 1].subst;
     }
@@ -2160,15 +2160,15 @@ pub const FuncBuilder = struct {
         return self.splice_rlp_marks.contains(name);
     }
     /// The caller owns the returned set.
-    pub fn localExtFnNames(self: *const FuncBuilder) Allocator.Error!std.StringHashMap(i8) {
-        var out = std.StringHashMap(i8).init(self.allocator);
+    pub fn localExtFnNames(self: *const FuncBuilder) Allocator.Error!runtime.NameHashMap(i8) {
+        var out = runtime.NameHashMap(i8).init(self.allocator);
         var it = self.local_ext_fns.iterator();
         while (it.next()) |e| try out.put(e.key_ptr.*, e.value_ptr.*);
         return out;
     }
     /// Seed from an enclosing scope's set so a captured local ext fn called bare
     /// still gets the receiver prepended. Copies names; caller keeps ownership.
-    pub fn inheritLocalExtFns(self: *FuncBuilder, names: *const std.StringHashMap(i8)) Allocator.Error!void {
+    pub fn inheritLocalExtFns(self: *FuncBuilder, names: *const runtime.NameHashMap(i8)) Allocator.Error!void {
         var it = names.iterator();
         while (it.next()) |e| try self.local_ext_fns.put(e.key_ptr.*, e.value_ptr.*);
     }
@@ -2441,7 +2441,7 @@ pub const FuncBuilder = struct {
     pub fn spliceParamTy(self: *const FuncBuilder, name: []const u8) ?ast.TypeRef {
         return self.splice_param_tys.get(name);
     }
-    pub fn spliceParamTyIterator(self: *const FuncBuilder) std.StringHashMap(ast.TypeRef).Iterator {
+    pub fn spliceParamTyIterator(self: *const FuncBuilder) runtime.NameHashMap(ast.TypeRef).Iterator {
         return self.splice_param_tys.iterator();
     }
     pub fn pushFinally(self: *FuncBuilder, block: ast.Block, body_entry: BlockId) Allocator.Error!void {
@@ -2583,7 +2583,7 @@ pub const FuncBuilder = struct {
     };
 
     pub fn resolve(self: *const FuncBuilder, name: []const u8) ?Reg {
-        const ctx = PreHashed{ .h = std.hash_map.hashString(name) };
+        const ctx = PreHashed{ .h = runtime.hashName(name) };
         // The inline fn's parameter scopes are not in a spliced lambda's
         // lexical scope: search its own scopes, then the caller scopes.
         if (self.lambda_splice_resolve) |w| {

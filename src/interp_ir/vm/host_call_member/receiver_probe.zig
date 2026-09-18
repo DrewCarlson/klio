@@ -189,7 +189,7 @@ pub fn inheritedMemberDefaults(self: *VmHost, allocator: Allocator, supertypes: 
 
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     for (supertypes) |s| try queue.append(allocator, s);
 
@@ -258,9 +258,7 @@ pub fn fakeOverrideInheritedDefault(
         for (direct.items) |cn| {
             var is_iface = false;
             const fqn: []const u8 = blk: {
-                const cgr = self.classes.borrow();
-                defer cgr.deinit();
-                if (cgr.get().get(cn)) |d| {
+                if (host_classes.classDefLookup(self, cn)) |d| {
                     const dg = d.borrow();
                     defer dg.deinit();
                     is_iface = dg.get().is_interface;
@@ -413,9 +411,7 @@ pub fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *
     // unbounded type parameter, unless a class of that name is registered.
     if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) {
         const registered = blk: {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            break :blk cg.get().get(pn) != null;
+            break :blk host_classes.classDefLookup(self, pn) != null;
         };
         if (!registered) return true;
     }
@@ -964,7 +960,7 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
             const a = self.allocator;
             var queue: std.ArrayList([]const u8) = .empty;
             defer queue.deinit(a);
-            var seen: std.StringHashMap(void) = .init(a);
+            var seen: runtime.NameHashMap(void) = .init(a);
             defer seen.deinit();
             {
                 const g = inst.borrow();
@@ -1045,7 +1041,7 @@ pub fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []
             const a = self.allocator;
             var queue: std.ArrayList([]const u8) = .empty;
             defer queue.deinit(a);
-            var seen: std.StringHashMap(void) = .init(a);
+            var seen: runtime.NameHashMap(void) = .init(a);
             defer seen.deinit();
             {
                 const g = inst.borrow();

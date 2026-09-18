@@ -21,9 +21,9 @@ const Const = ir.Const;
 const Param = ir.Param;
 const Terminator = ir.Terminator;
 const TypeRef = ir.TypeRef;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 /// The per-name local-fn overload registry a nested body inherits.
-pub const LocalFnOverloadTable = std.StringHashMap(std.ArrayList(build.LocalFnOverload));
+pub const LocalFnOverloadTable = runtime.NameHashMap(std.ArrayList(build.LocalFnOverload));
 
 /// The lexically enclosing class context, so an enclosing-class member
 /// out-prioritises a same-named imported extension.
@@ -127,7 +127,7 @@ pub fn lowerLambdaBodyCapturing(
     outer: StringSet,
     outer_boxed: *const StringSet,
     inherited_rlp: StringSet,
-    inherited_lef: std.StringHashMap(i8),
+    inherited_lef: runtime.NameHashMap(i8),
     inherited_erp: StringSet,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
@@ -157,7 +157,7 @@ pub fn lowerLambdaBodyCapturingKind(
     outer_boxed: *const StringSet,
     tailrec_self: ?[]const u8,
     inherited_rlp: StringSet,
-    inherited_lef: std.StringHashMap(i8),
+    inherited_lef: runtime.NameHashMap(i8),
     inherited_erp: StringSet,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
@@ -193,7 +193,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
     is_named_local_fn: bool,
     named_local_encl_recv: bool,
     inherited_rlp: StringSet,
-    inherited_lef: std.StringHashMap(i8),
+    inherited_lef: runtime.NameHashMap(i8),
     inherited_erp: StringSet,
     inherited_lfo: ?*const LocalFnOverloadTable,
     enclosing_owner: ?EnclosingOwner,
@@ -257,7 +257,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     is_named_local_fn: bool,
     named_local_encl_recv: bool,
     inherited_rlp: StringSet,
-    inherited_lef: std.StringHashMap(i8),
+    inherited_lef: runtime.NameHashMap(i8),
     inherited_erp: StringSet,
     inherited_lfo: ?*const LocalFnOverloadTable,
     enclosing_owner: ?EnclosingOwner,
@@ -497,7 +497,7 @@ fn bindEnclosingNameScope(
 fn inheritCapturedCallables(
     ctx: *LambdaBodyCtx,
     inherited: *const StringSet,
-    inherited_ext: *const std.StringHashMap(i8),
+    inherited_ext: *const runtime.NameHashMap(i8),
     inherited_erased: *const StringSet,
     inherited_lfo: ?*const LocalFnOverloadTable,
 ) Allocator.Error!void {

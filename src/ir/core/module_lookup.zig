@@ -40,7 +40,7 @@ const staticTypeHead = Module.staticTypeHead;
 pub fn init(allocator: Allocator) Module {
     var out__ = Module{
         .lookup_cache_gpa = allocator,
-        .func_name_index = std.StringHashMap(std.ArrayList(FuncId)).init(allocator),
+        .func_name_index = runtime.NameHashMap(std.ArrayList(FuncId)).init(allocator),
         .registry = ModuleRegistry.init(allocator),
         .decl_user_params = std.AutoHashMap(u32, u32).init(allocator),
         .decl_user_arity = std.AutoHashMap(u32, DeclArity).init(allocator),
@@ -528,7 +528,7 @@ pub fn topUpClassNameCache(self: *Module, gpa: Allocator) Allocator.Error!void {
 /// Build the `class_id_map` overlay from `class_index`, first entry winning a duplicate
 /// simple name as the scan does. Idempotent; call once after finalize, before concurrency.
 pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void {
-    var m = std.StringHashMap(ClassId).init(allocator);
+    var m = runtime.NameHashMap(ClassId).init(allocator);
     try m.ensureTotalCapacity(@intCast(self.class_index.items.len));
     for (self.class_index.items) |entry| {
         const gop = m.getOrPutAssumeCapacity(entry.name);
@@ -537,7 +537,7 @@ pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void
     if (self.class_id_map) |*old| old.deinit();
     self.class_id_map = m;
 
-    var fm = std.StringHashMap(ClassId).init(allocator);
+    var fm = runtime.NameHashMap(ClassId).init(allocator);
     try fm.ensureTotalCapacity(@intCast(self.classes.items.len));
     for (self.classes.items) |c| {
         const gop = fm.getOrPutAssumeCapacity(c.fqn);
@@ -557,7 +557,7 @@ pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void
     // The nesting tree: a class's parent is the class whose FQN is its own minus the last segment,
     // keyed by that segment. Lifted `$` names alias in, so `Outer$Companion$Key` and `Key` agree.
     var pm = std.AutoHashMap(ClassId, ClassId).init(allocator);
-    var cm = std.AutoHashMap(ClassId, std.StringHashMap(ClassId)).init(allocator);
+    var cm = std.AutoHashMap(ClassId, runtime.NameHashMap(ClassId)).init(allocator);
     for (self.classes.items) |c| {
         const dot = std.mem.findScalarLast(u8, c.fqn, '.') orelse continue;
         const parent_fqn = c.fqn[0..dot];
@@ -569,7 +569,7 @@ pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void
         } orelse continue;
         try pm.put(c.id, pid);
         const gop = try cm.getOrPut(pid);
-        if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(ClassId).init(allocator);
+        if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap(ClassId).init(allocator);
         const cg = try gop.value_ptr.getOrPut(seg);
         if (!cg.found_existing) cg.value_ptr.* = c.id;
     }
@@ -685,7 +685,7 @@ pub fn extCouldApplyWhy(
     return .none;
 }
 
-pub fn mergeExtArity(map: *std.StringHashMap(ExtArity), name: []const u8, arity: ExtArity) Allocator.Error!void {
+pub fn mergeExtArity(map: *runtime.NameHashMap(ExtArity), name: []const u8, arity: ExtArity) Allocator.Error!void {
     const gop = try map.getOrPut(name);
     gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.merge(arity) else arity;
 }
@@ -697,8 +697,8 @@ pub fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void
         m.deinit();
     }
     if (self.generic_ext_names) |*m| m.deinit();
-    var idx = std.StringHashMap(std.StringHashMap(ExtArity)).init(allocator);
-    var gen = std.StringHashMap(ExtArity).init(allocator);
+    var idx = runtime.NameHashMap(runtime.NameHashMap(ExtArity)).init(allocator);
+    var gen = runtime.NameHashMap(ExtArity).init(allocator);
     for (self.func_index.items) |entry| {
         const ds = self.decl_sigs.get(entry.id.int());
         const f = if (ds == null) self.funcById(entry.id) else null;
@@ -725,7 +725,7 @@ pub fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void
             continue;
         }
         const gop = try idx.getOrPut(head);
-        if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(ExtArity).init(allocator);
+        if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap(ExtArity).init(allocator);
         try mergeExtArity(gop.value_ptr, entry.name, arity);
     }
     self.ext_names_by_recv_head = idx;

@@ -111,7 +111,17 @@ pub const EvalError = union(enum) {
 /// before the 256 MiB interpret stack faults. `KLIO_MAX_EVAL_DEPTH` overrides.
 pub const DEFAULT_MAX_EVAL_DEPTH: usize = 2_000;
 
-pub threadlocal var evtls: EvalTls = .{};
+/// The evaluator's per-thread state, held off the thread-local block. Darwin
+/// resolves every `threadlocal` access through a call into dyld, and the
+/// evaluator touches this state in every frame push, every register pool take
+/// and every free: on a recomposer profile those calls were a larger block
+/// than the instruction dispatch they served. The thread that runs the program
+/// reads an ordinary global; any other thread keeps a copy of its own.
+const EvalTlsStore = runtime.tls_fast.PerThread(EvalTls);
+
+pub inline fn evtlsPtr() *EvalTls {
+    return EvalTlsStore.get();
+}
 
 /// The evaluator's per-thread hot state in ONE threadlocal, so a function that
 /// touches several fields pays one TLV address lookup instead of one per field.
@@ -175,22 +185,22 @@ pub const EnclosingEntry = runtime.ImplicitReceiver;
 /// Source span of the statement the innermost active frame is executing, set
 /// per statement by `.Trace`; compose keys its positional group on it.
 pub fn currentCallSiteSpan() ?ir.Span {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain) {
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain) {
         // The walker records each Trace span on its mark just as a frame tracks
         // cur_span, null included: gates read the innermost site, never the caller's.
         return fusedTls().marks[fusedTls().depth - 1].span;
     }
-    return if (evtls.frame_chain) |fr| fr.cur_span else null;
+    return if (evtlsPtr().frame_chain) |fr| fr.cur_span else null;
 }
 
 /// Declaring package of the innermost executing frame. Null-receiver extension
 /// property dispatch keys on it, so same-name extensions resolve per visibility.
 pub fn currentFramePackage() ?[]const u8 {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain) {
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain) {
         const pkg = fusedTls().marks[fusedTls().depth - 1].func.package;
         if (pkg.len != 0) return pkg;
     }
-    const fr = evtls.frame_chain orelse return null;
+    const fr = evtlsPtr().frame_chain orelse return null;
     const pkg = fr.func.package;
     return if (pkg.len == 0) null else pkg;
 }
@@ -233,12 +243,12 @@ pub const ThisChainIter = struct {
 };
 
 pub fn frameThisChainIter() ThisChainIter {
-    return .{ .cur = evtls.frame_chain, .fused_i = fusedTls().depth };
+    return .{ .cur = evtlsPtr().frame_chain, .fused_i = fusedTls().depth };
 }
 
 pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
     var out: std.ArrayList(Value) = .empty;
-    var cur = evtls.frame_chain;
+    var cur = evtlsPtr().frame_chain;
     var steps: usize = 0;
     while (cur) |f| : (cur = f.gc_link) {
         if (steps > 256) break;
@@ -254,11 +264,11 @@ pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
 
 /// Nearest enclosing frame's package, walking past accessors and init thunks.
 pub fn nearestFramePackage() ?[]const u8 {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain) {
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain) {
         const pkg = fusedTls().marks[fusedTls().depth - 1].func.package;
         if (pkg.len != 0) return pkg;
     }
-    var cur = evtls.frame_chain;
+    var cur = evtlsPtr().frame_chain;
     while (cur) |f| : (cur = f.gc_link) {
         if (f.func.package.len != 0) return f.func.package;
     }
@@ -271,31 +281,31 @@ pub const RefSiteOverride = struct { file: ir.FileId, frame: *const Frame };
 
 /// The reference-site file, while the frame it was pushed under is innermost.
 pub fn refSiteFile() ?ir.FileId {
-    const o = evtls.ref_site_override orelse return null;
-    const fr = evtls.frame_chain orelse return null;
+    const o = evtlsPtr().ref_site_override orelse return null;
+    const fr = evtlsPtr().frame_chain orelse return null;
     return if (fr == o.frame) o.file else null;
 }
 
 /// Install a reference-site override on the innermost frame, returning the
 /// previous one for `popRefSiteFile` to restore when the dispatch completes.
 pub fn pushRefSiteFile(file: ir.FileId) ?RefSiteOverride {
-    const prev = evtls.ref_site_override;
-    if (evtls.frame_chain) |fr| evtls.ref_site_override = .{ .file = file, .frame = fr };
+    const prev = evtlsPtr().ref_site_override;
+    if (evtlsPtr().frame_chain) |fr| evtlsPtr().ref_site_override = .{ .file = file, .frame = fr };
     return prev;
 }
 
 pub fn popRefSiteFile(prev: ?RefSiteOverride) void {
-    evtls.ref_site_override = prev;
+    evtlsPtr().ref_site_override = prev;
 }
 
 pub fn currentFuncName() ?[]const u8 {
-    return if (evtls.frame_chain) |fr| fr.func.name else null;
+    return if (evtlsPtr().frame_chain) |fr| fr.func.name else null;
 }
 
 /// The innermost frame's i-th bound parameter, borrowed. Reified type-variable
 /// reads resolve through it: a type param naming a value param binds that class.
 pub fn currentFrameParam(i: usize) ?Value {
-    const fr = evtls.frame_chain orelse return null;
+    const fr = evtlsPtr().frame_chain orelse return null;
     if (i >= fr.params.items.len) return null;
     return fr.params.items[i];
 }
@@ -303,16 +313,16 @@ pub fn currentFrameParam(i: usize) ?Value {
 /// The module the innermost frame's body is read against: a side module for an
 /// anonymous-object or local-class member, else the main module.
 pub fn currentFrameModule() ?*const Module {
-    const fr = evtls.frame_chain orelse return null;
+    const fr = evtlsPtr().frame_chain orelse return null;
     return fr.module;
 }
 
 /// The innermost EXECUTING function: the fused walker's body while no frame
 /// sits above the chain head it recorded, else the innermost frame's.
 pub fn currentFrameFunc() ?*const ir.Func {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain)
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain)
         return fusedTls().marks[fusedTls().depth - 1].func;
-    return if (evtls.frame_chain) |fr| fr.func else null;
+    return if (evtlsPtr().frame_chain) |fr| fr.func else null;
 }
 
 pub const FusedMark = struct { func: *const ir.Func, mod: *const Module, head: ?*Frame, recv: ?Value, span: ?ir.Span = null };
@@ -320,12 +330,12 @@ pub const FusedMark = struct { func: *const ir.Func, mod: *const Module, head: ?
 /// Type-parameter names the innermost frame's function declares; an `object`
 /// expression lowered at run time inherits them as its members' type variables.
 pub fn currentFrameTypeParams() []const []const u8 {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain) {
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain) {
         const mk = &fusedTls().marks[fusedTls().depth - 1];
         const tps = mk.mod.registry.func_type_params.get(mk.func.id) orelse return &.{};
         return tps.items;
     }
-    const fr = evtls.frame_chain orelse return &.{};
+    const fr = evtlsPtr().frame_chain orelse return &.{};
     const tps = fr.module.registry.func_type_params.get(fr.func.id) orelse return &.{};
     return tps.items;
 }
@@ -529,7 +539,7 @@ fn argsClassOfExact(len: usize) ?usize {
 }
 
 pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.ArrayList(Value) {
-    const ev = &evtls;
+    const ev = evtlsPtr();
     if (argsClassOf(cap)) |ci| {
         const bucket = &ev.args_class_pool[ci];
         if (bucket.len > 0) {
@@ -554,10 +564,10 @@ pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.Arra
 
 /// Recycle or free an arg/capture carrier; the values inside stay the caller's.
 pub fn releaseArgs(allocator: Allocator, list: *std.ArrayList(Value)) void {
-    releaseArgsIn(&evtls, allocator, list);
+    releaseArgsIn(evtlsPtr(), allocator, list);
 }
 
-/// `releaseArgs` with the running thread's `&evtls` resolved once; it must be
+/// `releaseArgs` with the running thread's `evtlsPtr()` resolved once; it must be
 /// read fresh at the call, since a resumed coroutine can land on any thread.
 pub fn releaseArgsIn(ev: *EvalTls, allocator: Allocator, list: *std.ArrayList(Value)) void {
     if (list.capacity != 0) {
@@ -628,12 +638,12 @@ pub inline fn gcPushFrame(f: *Frame) void {
             std.debug.print("\n", .{});
         }
     }
-    f.gc_link = evtls.frame_chain;
-    evtls.frame_chain = f;
+    f.gc_link = evtlsPtr().frame_chain;
+    evtlsPtr().frame_chain = f;
 }
 
 pub inline fn gcPopFrame(f: *Frame) void {
-    evtls.frame_chain = f.gc_link;
+    evtlsPtr().frame_chain = f.gc_link;
 }
 
 /// Mark a frame's register file, skipping slots the written mask says were
@@ -723,7 +733,7 @@ pub inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .fused_chains = &fusedTls().chain, .fused_depth = &fusedTls().depth, .tid = runtime.gc.currentTid() };
+    frame_anchor = .{ .chain = &evtlsPtr().frame_chain, .resuming = &evtlsPtr().resuming, .fused_chains = &fusedTls().chain, .fused_depth = &fusedTls().depth, .tid = runtime.gc.currentTid() };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -735,12 +745,12 @@ pub fn gcUninstallFrameRoot() void {
         runtime.gc.unregisterThreadRoot(&frame_troot);
         frame_troot_inited = false;
     }
-    if (runtime.gc.gc_enabled and evtls.regs_pool.items.len > 0) {
-        drainRegsPool(&evtls, std.heap.c_allocator);
-        evtls.regs_pool.deinit(std.heap.c_allocator);
+    if (runtime.gc.gc_enabled and evtlsPtr().regs_pool.items.len > 0) {
+        drainRegsPool(evtlsPtr(), std.heap.c_allocator);
+        evtlsPtr().regs_pool.deinit(std.heap.c_allocator);
         // `deinit` leaves the list undefined, and the interpreter runs on the main
         // thread, whose threadlocals outlive this seam and would read a garbage length.
-        evtls.regs_pool = .empty;
+        evtlsPtr().regs_pool = .empty;
     }
 }
 
@@ -751,7 +761,7 @@ pub fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
     // fused body opens no Frame, and each mark records the chain head it sits on.
     var frame_n: usize = 0;
     {
-        var cur = evtls.frame_chain;
+        var cur = evtlsPtr().frame_chain;
         while (cur) |f| : (cur = f.gc_link) frame_n += 1;
     }
     const total = fusedTls().depth + frame_n;
@@ -760,7 +770,7 @@ pub fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
     errdefer allocator.free(frames);
     var i: usize = 0;
     var fi: usize = fusedTls().depth;
-    var fr = evtls.frame_chain;
+    var fr = evtlsPtr().frame_chain;
     while (true) {
         while (fi > 0 and fusedTls().marks[fi - 1].head == fr) {
             const mk = &fusedTls().marks[fi - 1];
@@ -793,7 +803,7 @@ pub fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
 
 /// Print the active frame chain to stderr; env-gated call sites only.
 pub fn debugPrintFrames() void {
-    var cur = evtls.frame_chain;
+    var cur = evtlsPtr().frame_chain;
     while (cur) |f| : (cur = f.gc_link) {
         var path: []const u8 = "?";
         var line: u32 = 0;

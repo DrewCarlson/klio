@@ -17,7 +17,7 @@ const image = @import("../image.zig");
 const Allocator = std.mem.Allocator;
 const KotlinFile = ast.KotlinFile;
 const Decl = ast.Decl;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 const build_module = @import("module.zig");
 const buildModuleFilesInner = build_module.buildModuleFilesInner;
@@ -505,11 +505,11 @@ pub fn composeBaseDecls(allocator: Allocator, base: *const StdlibBase) Allocator
     return out[0..n];
 }
 
-pub fn composeBaseNames(names: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+pub fn composeBaseNames(names: *runtime.NameHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| try composeBaseNameDecl(names, d);
 }
 
-pub fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
+pub fn composeBaseNameDecl(names: *runtime.NameHashMap(void), d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| if (compose_pass.isComposable(f.annotations)) try names.put(f.name.name, {}),
         .Class => |*c| for (c.members) |*m| try composeBaseNameDecl(names, m),
@@ -520,23 +520,23 @@ pub fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allo
 
 /// Base functions taking a `@Composable` lambda parameter: the sinks user composable
 /// calls pass into.
-pub fn composeBaseSinks(sinks: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+pub fn composeBaseSinks(sinks: *runtime.NameHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| try composeBaseSinkDecl(sinks, d);
 }
 
-pub fn composeBaseInlineFns(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+pub fn composeBaseInlineFns(set: *runtime.NameHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| {
         try compose_pass.collectInlineFnNamesInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
     }
 }
 
-pub fn composeBaseComposableGetterProps(props: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+pub fn composeBaseComposableGetterProps(props: *runtime.NameHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| {
         try compose_pass.collectComposableGetterPropsInto(props, @as([*]const Decl, @ptrCast(d))[0..1]);
     }
 }
 
-pub fn composeBaseFactoryDecl(factories: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
+pub fn composeBaseFactoryDecl(factories: *runtime.NameHashMap(void), d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| {
             if (f.return_type) |rt| {
@@ -551,7 +551,7 @@ pub fn composeBaseFactoryDecl(factories: *std.StringHashMap(void), d: *const Dec
     }
 }
 
-pub fn composeBaseSinkDecl(sinks: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
+pub fn composeBaseSinkDecl(sinks: *runtime.NameHashMap(void), d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| for (f.params) |*p| {
             if (p.ty.function != null and compose_pass.isComposable(p.ty.x().annotations)) {

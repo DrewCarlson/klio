@@ -2,6 +2,7 @@
 //! prologue, the `$dirty` skip calculus, and the restartable-group bracket.
 
 const std = @import("std");
+const namehash = @import("names");
 const ast = @import("ast");
 const root = @import("../compose_pass.zig");
 
@@ -50,8 +51,8 @@ const Walker = walker.Walker;
 pub fn transformDecls(
     a: std.mem.Allocator,
     decls: []ast.Decl,
-    composable_names: *const std.StringHashMap(void),
-    lambda_sinks: *const std.StringHashMap(void),
+    composable_names: *const namehash.NameHashMap(void),
+    lambda_sinks: *const namehash.NameHashMap(void),
 ) std.mem.Allocator.Error!void {
     var oracle = NameSetOracle{ .names = composable_names };
     for (decls) |*d| try transformDecl(a, d, &oracle, lambda_sinks, false, null);
@@ -61,7 +62,7 @@ fn transformDecl(
     a: std.mem.Allocator,
     d: *ast.Decl,
     oracle: *NameSetOracle,
-    sinks: *const std.StringHashMap(void),
+    sinks: *const namehash.NameHashMap(void),
     in_class: bool,
     enclosing_class: ?[]const u8,
 ) std.mem.Allocator.Error!void {
@@ -82,7 +83,7 @@ fn transformDecl(
                 const wrap_ret = ret_composable and std.mem.startsWith(u8, f.name.name, "movableContent");
                 // A non-composable fn can still take `@Composable`-typed lambda params, so a bare
                 // `content()` inside one of its composable lambdas is a composable call.
-                const lp = a.create(std.StringHashMap(void)) catch @panic("oom");
+                const lp = a.create(namehash.NameHashMap(void)) catch @panic("oom");
                 lp.* = try composableLambdaParamNames(a, f);
                 var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false, .ret_composable = ret_composable, .ret_fn_params = ret_fn_params, .lambda_params = lp, .wrap_ret_lambda = wrap_ret };
                 if (f.body) |*fb| switch (fb.*) {
@@ -272,8 +273,8 @@ const ParamsAndPrologue = struct {
     defaults: []Stmt = &.{},
 };
 
-fn composableLambdaParamNames(a: std.mem.Allocator, f: *const Function) std.mem.Allocator.Error!std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(a);
+fn composableLambdaParamNames(a: std.mem.Allocator, f: *const Function) std.mem.Allocator.Error!namehash.NameHashMap(void) {
+    var set = namehash.NameHashMap(void).init(a);
     for (f.params) |*p| {
         if (isComposableLambdaParam(p)) try set.put(p.name.name, {});
     }
@@ -452,9 +453,9 @@ pub fn transformComposableFunction(
     f: *const Function,
     oracle: ComposableOracle,
     oracle_ctx: *anyopaque,
-    sinks: ?*const std.StringHashMap(void),
+    sinks: ?*const namehash.NameHashMap(void),
     in_class: bool,
-    locals: ?*std.StringHashMap(void),
+    locals: ?*namehash.NameHashMap(void),
     enclosing_class: ?[]const u8,
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
@@ -481,15 +482,15 @@ pub fn transformComposableFunction(
         b.slice1(b.intLit(positionalKey(f.span))),
     ) });
     // The defaults prologue walks too, so a composable call in a default is threaded.
-    const lp = try a.create(std.StringHashMap(void));
+    const lp = try a.create(namehash.NameHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
     const w_ret_composable = f.return_type != null and isComposableFnType(f.return_type.?);
     var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
     // Only non-defaulted, non-vararg params get a triple: a defaulted param's triple can
     // carry the default-taken same bit while the body sees a re-evaluated value.
     if (skippable) {
-        const triples = try a.create(std.StringHashMap(u5));
-        triples.* = std.StringHashMap(u5).init(a);
+        const triples = try a.create(namehash.NameHashMap(u5));
+        triples.* = namehash.NameHashMap(u5).init(a);
         for (f.params, 0..) |p, pi| {
             if (p.is_vararg or p.default != null) continue;
             // Index 9 is the shared overflow triple; only owned triples drive a memo condition.
@@ -651,13 +652,13 @@ pub fn transformThreadedComposable(
     f: *const Function,
     oracle: ComposableOracle,
     oracle_ctx: *anyopaque,
-    sinks: ?*const std.StringHashMap(void),
-    locals: ?*std.StringHashMap(void),
+    sinks: ?*const namehash.NameHashMap(void),
+    locals: ?*namehash.NameHashMap(void),
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
     const pp = try buildParamsAndPrologue(a, b, f, false, false);
     const params = pp.params;
-    const lp = try a.create(std.StringHashMap(void));
+    const lp = try a.create(namehash.NameHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
     const w_ret_composable = f.return_type != null and isComposableFnType(f.return_type.?);
     var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0, .explicit_groups = isExplicitGroups(f) };

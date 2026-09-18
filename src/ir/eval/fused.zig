@@ -334,14 +334,14 @@ fn fusedRun(
     host: *H,
 ) Allocator.Error!EvalResult {
     const ft = fusedTls();
-    const ev: *EvalTls = &ev_state.evtls;
+    const ev: *EvalTls = ev_state.evtlsPtr();
     const ka = runtime.keepaliveHandle();
     const reclaim = runtime.reclaimEnabled();
     var eff_args = args_in;
     {
         const plan = coercePlanFor(module, func);
         if (plan & 6 != 0 and args_in.len <= ir.LEAF_MAX_REGS) {
-            const coerce_buf: []Value = ev_leaf.coerce_bank[ft.depth % LEAF_BANK_DEPTH][0..args_in.len];
+            const coerce_buf: []Value = ev_leaf.leafBanks().coerce[ft.depth % LEAF_BANK_DEPTH][0..args_in.len];
             @memcpy(coerce_buf, args_in);
             if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf);
             if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf);
@@ -532,7 +532,7 @@ fn fusedMaterializeAndRun(
     pushed_enclosing: usize,
     host: *H,
 ) Allocator.Error!EvalResult {
-    const ev: *EvalTls = &ev_state.evtls;
+    const ev: *EvalTls = ev_state.evtlsPtr();
     if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
         std.debug.print("[fused-mat] {s} at b{d}:{d} pushes={d}\n", .{
             if (func.fqn.len != 0) func.fqn else func.name, cur.int(), idx, pushed_enclosing,

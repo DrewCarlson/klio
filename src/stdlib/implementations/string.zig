@@ -98,7 +98,7 @@ fn recvString(allocator: Allocator, args: []const Value, what: []const u8) Alloc
         .StringBuilder => |sb| {
             const g = sb.borrow();
             defer g.deinit();
-            recv_memo.valid = false;
+            recvMemo().valid = false;
             return .{ .ok = g.get().items };
         },
         else => |other| {
@@ -167,24 +167,32 @@ const RecvMemo = struct {
         if (self.cell) |c| c.cursorSet(u16_pos, byte_pos);
     }
 };
-threadlocal var recv_memo: RecvMemo = .{};
+/// Off the thread-local block: every host builtin entry clears it, and on
+/// Darwin a `threadlocal` access is a call into dyld.
+const recv_memo_tls = runtime.tls_fast.PerThread(RecvMemo);
+
+inline fn recvMemo() *RecvMemo {
+    return recv_memo_tls.get();
+}
 
 /// Forget the receiver memo. Called at every host-builtin entry so a cell
 /// pointer never outlives the call whose argument kept it alive.
 pub fn clearRecvMemo() void {
-    recv_memo.valid = false;
-    recv_memo.cell = null;
+    const m = recvMemo();
+    m.valid = false;
+    m.cell = null;
 }
 
 fn memoFor(s: []const u8) ?*RecvMemo {
-    if (!recv_memo.valid or recv_memo.ptr != s.ptr or recv_memo.len != s.len) return null;
-    return &recv_memo;
+    const m = recvMemo();
+    if (!m.valid or m.ptr != s.ptr or m.len != s.len) return null;
+    return m;
 }
 
 fn noteRecvData(d: *const runtime.StringData) void {
     // Always refreshed from the live header: a collected string's bytes can be
     // reused by a new string of the same length at the same address.
-    recv_memo = .{
+    recvMemo().* = .{
         .ptr = d.bytes.ptr,
         .len = d.bytes.len,
         .valid = true,

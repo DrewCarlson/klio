@@ -2,6 +2,7 @@
 //! walks a bare name resolves through, and the inner-class outer-instance chain.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
@@ -176,9 +177,7 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
                 if (owned) |v| return ok(v);
             }
             cur2 = blk: {
-                const cg = self.classes.borrow();
-                defer cg.deinit();
-                const d = cg.get().get(cn2) orelse break :blk null;
+                const d = host_classes.classDefLookup(self, cn2) orelse break :blk null;
                 const dg = d.borrow();
                 defer dg.deinit();
                 const sups = dg.get().supertype_names;
@@ -296,9 +295,7 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
                 .err => |e| return errRes(e),
             }
         }
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(name)) |def| {
+        if (host_classes.classDefLookup(self, name)) |def| {
             // A runtime-registered local object publishes its singleton under its own name.
             const local_runtime = blk: {
                 const dg = def.borrow();
@@ -386,7 +383,7 @@ pub fn resolveInstanceGetter(
     // lists interface `I` first, so `supertype_names[0]` alone never reaches `B`.
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     // Seed with the receiver's own class; pre-pushing a supertype's supers inverts the order.
     try queue.append(allocator, class_name);
@@ -396,9 +393,7 @@ pub fn resolveInstanceGetter(
         if (seen.contains(cn)) continue;
         try seen.put(cn, {});
         const cdef: ?ObjRef(ClassDef) = blk: {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            break :blk cg.get().get(cn);
+            break :blk host_classes.classDefLookup(self, cn);
         };
         // A class in the chain that stores `name` overrides any higher base getter.
         if (cdef) |d| {
@@ -707,9 +702,7 @@ pub fn instanceDeclaresProperty(self: *VmHost, receiver: *const Value, name: []c
         if (depth > 64) break;
         var found = false;
         {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            if (cg.get().get(cn)) |d| {
+            if (host_classes.classDefLookup(self, cn)) |d| {
                 const dg = d.borrow();
                 defer dg.deinit();
                 for (dg.get().primary_params) |p| {

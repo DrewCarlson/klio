@@ -59,7 +59,7 @@ pub fn wallCapFire(allocator: Allocator) Allocator.Error!EvalResult {
 
 /// Per-test invariant probe: a nonzero depth between tests is an unwind leak.
 pub fn evalDepthNow() usize {
-    return ev_state.evtls.eval_depth;
+    return ev_state.evtlsPtr().eval_depth;
 }
 
 /// Whether dispatch caches may be populated: a capped or abandoned run aborts
@@ -108,7 +108,7 @@ pub fn serveOuterSlotRoute(recv: *const Value, name: []const u8, route: u64) ?Va
     return v;
 }
 
-var call_stats: ?std.StringHashMap(u64) = null;
+var call_stats: ?runtime.NameHashMap(u64) = null;
 
 fn callStatsBump(fqn: []const u8) void {
     callStatsBumpId(fqn, 0, null);
@@ -143,10 +143,10 @@ pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     var caller_key: ?[]const u8 = null;
     if (callerStatsFilter()) |substr| {
         if (std.mem.find(u8, key, substr) != null) {
-            const cfqn: []const u8 = if (ev_state.evtls.frame_chain) |fr| fr.func.fqn else "<top>";
+            const cfqn: []const u8 = if (ev_state.evtlsPtr().frame_chain) |fr| fr.func.fqn else "<top>";
             var site_buf: [64]u8 = undefined;
             var site: []const u8 = "";
-            if (ev_state.evtls.frame_chain) |fr| {
+            if (ev_state.evtlsPtr().frame_chain) |fr| {
                 if (fr.cur_span) |sp| {
                     if (span.active_map) |am| {
                         if (am.getChecked(sp.file)) |sf| {
@@ -162,7 +162,7 @@ pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     }
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
-    if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    if (call_stats == null) call_stats = runtime.NameHashMap(u64).init(std.heap.page_allocator);
     callStatsBumpKeyLocked(key);
     if (caller_key) |ck| callStatsBumpKeyLocked(ck);
 }
@@ -208,7 +208,7 @@ pub fn gfStatsBump(recv: *const Value, name: []const u8) void {
     const key = std.fmt.bufPrint(&buf, "<gf>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
-    if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    if (call_stats == null) call_stats = runtime.NameHashMap(u64).init(std.heap.page_allocator);
     const gop = call_stats.?.getOrPut(key) catch return;
     if (!gop.found_existing) {
         gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
@@ -235,7 +235,7 @@ pub fn ladderStatsBump(recv: *const Value, name: []const u8, in_fn: []const u8) 
     const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}@{s}", .{ recv_name, name, in_fn }) catch return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
-    if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    if (call_stats == null) call_stats = runtime.NameHashMap(u64).init(std.heap.page_allocator);
     const gop = call_stats.?.getOrPut(key) catch return;
     if (!gop.found_existing) {
         gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
@@ -307,7 +307,7 @@ pub fn opProfDump() void {
 }
 
 /// Probe channel: host dispatch stages report names that miss their caches.
-var probe_stats: ?std.StringHashMap(u64) = null;
+var probe_stats: ?runtime.NameHashMap(u64) = null;
 
 pub fn callStatsProbe(name: []const u8) void {
     if (call_stats_state == 0)
@@ -315,7 +315,7 @@ pub fn callStatsProbe(name: []const u8) void {
     if (call_stats_state != 2) return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
-    if (probe_stats == null) probe_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    if (probe_stats == null) probe_stats = runtime.NameHashMap(u64).init(std.heap.page_allocator);
     const gop = probe_stats.?.getOrPut(name) catch return;
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* += 1;
@@ -440,7 +440,7 @@ pub fn callStatsDump() void {
         }
     }.lt);
     std.debug.print("[call-stats] total={d} distinct={d}\n", .{ total, list.items.len });
-    const top = @min(list.items.len, 60);
+    const top = @min(list.items.len, 400);
     for (list.items[0..top]) |e| std.debug.print("[call-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
 }
 
@@ -707,7 +707,7 @@ pub fn installDebugFrameDump() void {
 /// Ungated frame-chain dump for diagnostics that gate at their own call site.
 pub fn dumpFrameChainForDiagAlways() void {
     std.debug.print("[errtrace] frame chain (innermost first):\n", .{});
-    var cur = ev_state.evtls.frame_chain;
+    var cur = ev_state.evtlsPtr().frame_chain;
     var depth: usize = 0;
     while (cur) |f| : (cur = f.gc_link) {
         const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
@@ -731,7 +731,7 @@ pub fn dumpFrameChainForDiagAlways() void {
 
 /// The innermost frames' declared params with the runtime shape each is bound to.
 pub fn dumpCurrentFrameParamsForDiag() void {
-    var cur = ev_state.evtls.frame_chain;
+    var cur = ev_state.evtlsPtr().frame_chain;
     var depth: usize = 0;
     while (cur) |fr| : (cur = fr.gc_link) {
         if (depth >= 12) break;
@@ -786,16 +786,16 @@ pub fn spinDumpMaybe() void {
     }
     const iv = spin_interval_s orelse return;
     const now: i64 = @intCast(runtime.clockMonotonicNanos() / std.time.ns_per_s);
-    if (ev_state.evtls.spin_last_dump == 0) {
-        ev_state.evtls.spin_last_dump = now;
+    if (ev_state.evtlsPtr().spin_last_dump == 0) {
+        ev_state.evtlsPtr().spin_last_dump = now;
         return;
     }
-    if (now - ev_state.evtls.spin_last_dump < iv) return;
-    ev_state.evtls.spin_last_dump = now;
+    if (now - ev_state.evtlsPtr().spin_last_dump < iv) return;
+    ev_state.evtlsPtr().spin_last_dump = now;
     std.debug.print("[spin] frame chain (innermost first):\n", .{});
     // Innermost frames' scalar registers: live state of a loop that never ends.
     {
-        var rf = ev_state.evtls.frame_chain;
+        var rf = ev_state.evtlsPtr().frame_chain;
         var fi: usize = 0;
         while (rf) |f0| : (rf = f0.gc_link) {
             if (fi >= 3) break;
@@ -814,7 +814,7 @@ pub fn spinDumpMaybe() void {
             fi += 1;
         }
     }
-    var cur = ev_state.evtls.frame_chain;
+    var cur = ev_state.evtlsPtr().frame_chain;
     var depth: usize = 0;
     while (cur) |f| : (cur = f.gc_link) {
         const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;

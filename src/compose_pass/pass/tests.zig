@@ -1,6 +1,7 @@
 //! Unit tests for the Compose lowering pass.
 
 const std = @import("std");
+const namehash = @import("names");
 const ast = @import("ast");
 const span_mod = @import("span");
 const root = @import("../compose_pass.zig");
@@ -95,7 +96,7 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     var noparams: [0]Param = .{};
     const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
-    var sinks = std.StringHashMap(void).init(a);
+    var sinks = namehash.NameHashMap(void).init(a);
     try sinks.put("Column", {});
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
@@ -200,7 +201,7 @@ test "bodyless composable declarations keep their header and gain the threaded A
 
     var names = try collectComposableNames(a, &decls);
     defer names.deinit();
-    var sinks = std.StringHashMap(void).init(a);
+    var sinks = namehash.NameHashMap(void).init(a);
     defer sinks.deinit();
     try transformDecls(a, &decls, &names, &sinks);
 
@@ -818,7 +819,7 @@ test "a sink lambda is shaped with the bare pair; slots come from resolution" {
         .has_trailing_lambda = false,
         .span = gsp,
     } };
-    var sinks = std.StringHashMap(void).init(a);
+    var sinks = namehash.NameHashMap(void).init(a);
     defer sinks.deinit();
     try sinks.put("Bar", {});
     var ctx: u8 = 0;
@@ -895,7 +896,7 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
     } } }};
     var noparams: [0]Param = .{};
     const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
-    var sinks = std.StringHashMap(void).init(a);
+    var sinks = namehash.NameHashMap(void).init(a);
     try sinks.put("movableContentWithReceiverOf", {});
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, noneComposable, &ctx, &sinks, false, null, null);
@@ -1086,7 +1087,7 @@ test "key(k) { } gains a movable-group bracket with the dynamic key" {
     } } }};
     var noparams: [0]Param = .{};
     const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
-    var sinks = std.StringHashMap(void).init(a);
+    var sinks = namehash.NameHashMap(void).init(a);
     try sinks.put("key", {});
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
@@ -1184,10 +1185,10 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
     var noparams: [0]Param = .{};
     const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
-    var sinks = std.StringHashMap(void).init(a);
+    var sinks = namehash.NameHashMap(void).init(a);
     try sinks.put("InlineLinear", {});
     // `InlineLinear` inlines, so its lambda is spliced, never wrapped, and stays raw.
-    var inline_fns = std.StringHashMap(void).init(a);
+    var inline_fns = namehash.NameHashMap(void).init(a);
     try inline_fns.put("InlineLinear", {});
     root.active_inline_fns = &inline_fns;
     defer root.active_inline_fns = null;

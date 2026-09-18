@@ -22,7 +22,7 @@ const InstanceData = runtime.InstanceData;
 const Env = runtime.Env;
 const ObjRef = runtime.ObjRef;
 const Decl = ast.Decl;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 const build_scan = @import("scan.zig");
 const classTypeParamBoundHeads = build_scan.classTypeParamBoundHeads;
@@ -149,7 +149,7 @@ pub fn registerInlineMemberOwners(members: []const Decl, owner: []const u8) void
     }
 }
 
-pub fn collectInline(allocator: Allocator, d: *const Decl, out: *std.StringHashMap(std.ArrayList(FF(ast.Function)))) Allocator.Error!void {
+pub fn collectInline(allocator: Allocator, d: *const Decl, out: *runtime.NameHashMap(std.ArrayList(FF(ast.Function)))) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| if (f.is_inline and f.body != null) {
             const gop = try out.getOrPut(f.name.name);
@@ -343,7 +343,7 @@ pub fn spanNamesObject(object_spans: []const Span, target: Span) bool {
     return false;
 }
 
-pub fn fillNestedClassTables(a: Allocator, decls_in: []const Decl, classes: *const std.StringHashMap(ObjRef(ClassDef)), outer_fqn: []const u8) Allocator.Error!void {
+pub fn fillNestedClassTables(a: Allocator, decls_in: []const Decl, classes: *const runtime.NameHashMap(ObjRef(ClassDef)), outer_fqn: []const u8) Allocator.Error!void {
     for (decls_in) |*d| {
         const members: []const Decl = switch (d.*) {
             .Class => |*c| c.members,

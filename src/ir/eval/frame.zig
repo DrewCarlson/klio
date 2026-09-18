@@ -97,9 +97,9 @@ pub const Frame = struct {
     /// The enclosing-`this` chain this frame runs with, innermost last: the frame's lexical receivers plus
     /// what dispatch pushed for this call. Snapshotted on suspend and restored verbatim on resume.
     enclosing_this: std.ArrayList(EnclosingEntry),
-    /// The `evtls.active_chain` to restore on exit, returning receiver resolution to the caller's chain.
+    /// The `evtlsPtr().active_chain` to restore on exit, returning receiver resolution to the caller's chain.
     prev_chain: ?*std.ArrayList(EnclosingEntry),
-    /// The caller's `evtls.active_chain_base`, restored on exit alongside `prev_chain`.
+    /// The caller's `evtlsPtr().active_chain_base`, restored on exit alongside `prev_chain`.
     prev_chain_base: usize,
     /// The per-method sub-module this frame runs in (anonymous object, local or nested class), null in the
     /// main module. Carried into the snapshot so a suspended method resolves `FuncId` against that module.
@@ -108,7 +108,7 @@ pub const Frame = struct {
     /// A frame rebuilt by `resumeContinuation` adopts the values its snapshot retained: it owns one reference
     /// to each param and capture and releases them at teardown. A freshly-called frame borrows them.
     owns_params_caps: bool = false,
-    /// Intrusive link onto the per-thread GC frame chain (see `evtls.frame_chain`).
+    /// Intrusive link onto the per-thread GC frame chain (see `evtlsPtr().frame_chain`).
     gc_link: ?*Frame = null,
     /// The closure side-table id when this frame runs a closure body. The body holds only a copy of its capture
     /// values, so the frame re-roots the slot through `markClosureHook`; otherwise a collection sweeps the store.
@@ -149,7 +149,7 @@ pub const Frame = struct {
         if (cvTraceOn() and
             params.items.len < func.params.len)
         {
-            const caller = if (ev_state.evtls.frame_chain) |fr| (if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name) else "<none>";
+            const caller = if (ev_state.evtlsPtr().frame_chain) |fr| (if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name) else "<none>";
             std.debug.print("[frame-short] fn={s} args={d} params={d} caller={s}\n", .{
                 if (func.fqn.len != 0) func.fqn else func.name, params.items.len, func.params.len, caller,
             });
@@ -187,7 +187,7 @@ pub const Frame = struct {
             frameCensusBump(func.id.int());
             fuseCensusBump(func);
             if (parent.frame_watch_want.len != 0 and std.mem.find(u8, func.name, parent.frame_watch_want) != null) {
-                const caller: []const u8 = if (ev_state.evtls.frame_chain) |fr| fr.func.name else "<top>";
+                const caller: []const u8 = if (ev_state.evtlsPtr().frame_chain) |fr| fr.func.name else "<top>";
                 std.debug.print("[framewatch] {s} <- {s}\n", .{ func.name, caller });
             }
         }
@@ -288,7 +288,7 @@ pub const Frame = struct {
         }
         // Args before regs: `releaseRegs` runs the depth-0 pool drain, so the outermost frame's own carriers must
         // already be pooled. The pools belong to the thread tearing the frame down, not the one that built it.
-        const ev: *EvalTls = &ev_state.evtls;
+        const ev: *EvalTls = ev_state.evtlsPtr();
         releaseArgsIn(ev, self.allocator, &self.params);
         releaseArgsIn(ev, self.allocator, &self.captures);
         releaseRegs(ev, self.allocator, &self.regs);

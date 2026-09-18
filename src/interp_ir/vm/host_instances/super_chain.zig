@@ -41,7 +41,7 @@ const TypeRef = ir.TypeRef;
 const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
 const StrPair = ir.StrPair;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 const AnonMethodEntry = root.AnonMethodEntry;
 const NameValue = root.NameValue;
 
@@ -142,10 +142,10 @@ pub fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: [
         .host = ih.intrinsicHost(),
         .allocator = self.allocator,
     };
-    const prev_fqn_lt = runtime.leaktrack.current_fqn;
-    runtime.leaktrack.current_fqn = fqn;
+    const prev_fqn_lt = runtime.leaktrack.currentFqn();
+    runtime.leaktrack.setCurrentFqn(fqn);
     const r = try func(&ctx);
-    runtime.leaktrack.current_fqn = prev_fqn_lt;
+    runtime.leaktrack.setCurrentFqn(prev_fqn_lt);
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| switch (e) {
@@ -454,7 +454,7 @@ pub fn extendAnonymousParentCtorArgs(
     direct_args: []Value,
     outer_hint: ?*const Value,
     fields: *std.ArrayList(InstanceData.Field),
-    args_by_class: *std.StringHashMap([]Value),
+    args_by_class: *runtime.NameHashMap([]Value),
 ) Allocator.Error!UnitOrErr {
     var cur_def: ?ObjRef(ClassDef) = direct_def.clone();
     defer if (cur_def) |d| d.deinit();

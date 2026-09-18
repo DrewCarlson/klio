@@ -4,6 +4,7 @@
 //! plus any raw host temporary the port never frees.
 
 const std = @import("std");
+const tls_fast = @import("tls_fast.zig");
 const trace = @import("trace.zig");
 const gc = @import("gc.zig");
 const Allocator = std.mem.Allocator;
@@ -20,8 +21,20 @@ const Record = struct {
     fqn: []const u8 = "",
 };
 
-/// Innermost intrinsic wins; `note` reads it to tag each allocation.
-pub threadlocal var current_fqn: ?[]const u8 = null;
+/// Innermost intrinsic wins; `note` reads it to tag each allocation. Every
+/// intrinsic dispatch saves and restores it, so it lives off the thread-local
+/// block like the rest of the per-thread interpreter state.
+const Current = struct { fqn: ?[]const u8 = null };
+
+const current_tls = tls_fast.PerThread(Current);
+
+pub inline fn currentFqn() ?[]const u8 {
+    return current_tls.get().fqn;
+}
+
+pub inline fn setCurrentFqn(v: ?[]const u8) void {
+    current_tls.get().fqn = v;
+}
 
 const Site = struct {
     addrs: [FRAMES]usize,
@@ -59,7 +72,7 @@ fn note(ptr: [*]u8, len: usize, ret: usize) void {
     defer release();
     var rec: Record = if (by_fqn_only) .{ .len = len, .addrs = undefined, .n = 0 } else capture(ret);
     rec.len = len;
-    rec.fqn = if (current_fqn) |f| (back.dupe(u8, f) catch "") else "";
+    rec.fqn = if (currentFqn()) |f| (back.dupe(u8, f) catch "") else "";
     live.put(back, @intFromPtr(ptr), rec) catch return;
 }
 

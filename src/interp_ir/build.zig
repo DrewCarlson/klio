@@ -37,7 +37,7 @@ const ObjRef = runtime.ObjRef;
 const Value = runtime.Value;
 const KotlinFile = ast.KotlinFile;
 const Decl = ast.Decl;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 // The builder is split across `build/`; every declaration keeps its name and
 // visibility here so call sites read `build.<name>` unchanged.

@@ -2,6 +2,7 @@
 //! owner-keyed scoping probe a private member extension needs, delegate forms.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
@@ -171,9 +172,7 @@ pub fn extPropDeclaredCallable(self: *VmHost, allocator: Allocator, receiver: *c
             return declaredTypeIsCallable(mod, &dt);
         }
         head = blk: {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            const def = cg.get().get(h) orelse break :blk null;
+            const def = host_classes.classDefLookup(self, h) orelse break :blk null;
             const dg = def.borrow();
             defer dg.deinit();
             const p = dg.get().parent orelse break :blk null;
@@ -226,9 +225,7 @@ pub fn enclosingCompanionMember(self: *VmHost, allocator: Allocator, inst: *cons
                 }
             }
             owner = blk: {
-                const cg = self.classes.borrow();
-                defer cg.deinit();
-                const def = cg.get().get(o) orelse break :blk null;
+                const def = host_classes.classDefLookup(self, o) orelse break :blk null;
                 const dg = def.borrow();
                 defer dg.deinit();
                 const p = dg.get().parent orelse break :blk null;
@@ -296,9 +293,7 @@ pub fn resolveExtPropDelegate(
                 }
             }
             const def: ?ObjRef(ClassDef) = blk: {
-                const cg = self.classes.borrow();
-                defer cg.deinit();
-                break :blk cg.get().get(sup);
+                break :blk host_classes.classDefLookup(self, sup);
             };
             if (def) |d| {
                 const dg = d.borrow();
@@ -663,9 +658,7 @@ pub fn resolveExtensionPropImpl(
                 if (lookupPairFunc(Pick.map(pg.get().*), sup, name)) |fid| return fid;
             }
             const def: ?ObjRef(ClassDef) = blk: {
-                const cg = self.classes.borrow();
-                defer cg.deinit();
-                break :blk cg.get().get(sup);
+                break :blk host_classes.classDefLookup(self, sup);
             };
             if (def) |d| {
                 const dg = d.borrow();

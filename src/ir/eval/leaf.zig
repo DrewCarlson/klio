@@ -47,10 +47,20 @@ const serveOuterSlotRoute = ev_diag.serveOuterSlotRoute;
 /// for the duration of its serve; the bank is initialised once per thread.
 pub const LEAF_BANK_DEPTH: usize = 8;
 
-threadlocal var leaf_bank: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined;
+/// The banks live off the thread-local block for the same reason the evaluator's
+/// state does: a leaf serve is the cheapest call shape there is, and resolving a
+/// Darwin `threadlocal` costs more than the serve it feeds.
+const LeafBanks = struct {
+    regs: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined,
+    /// Scratch for the leaf serve's literal-typing coercion, one buffer per level.
+    coerce: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined,
+};
 
-/// Per-thread scratch for the leaf serve's literal-typing coercion, one buffer per nesting level.
-pub threadlocal var coerce_bank: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined;
+const leaf_banks = runtime.tls_fast.PerThread(LeafBanks);
+
+pub inline fn leafBanks() *LeafBanks {
+    return leaf_banks.get();
+}
 
 /// How far a leaf serve chains into other leaf callees, bounding the native recursion.
 pub const LEAF_MAX_DEPTH: u8 = 8;
@@ -98,13 +108,13 @@ pub fn leafExprServeAt(
     // The literal-typing coercions a frame push applies hold here too: a bare Int flowing into a
     // declared Long param, or into a shared type-variable slot beside a Long peer, is a Long literal.
     const reclaim = runtime.reclaimEnabled();
-    const ev: *EvalTls = &ev_state.evtls;
+    const ev: *EvalTls = ev_state.evtlsPtr();
     if (ev.leaf_depth >= LEAF_BANK_DEPTH) return null;
     var eff_args = args;
     {
         const plan = coercePlanFor(module, func);
         if (plan & 6 != 0 and args.len <= ir.LEAF_MAX_REGS) {
-            const coerce_buf: []Value = coerce_bank[ev.leaf_depth][0..args.len];
+            const coerce_buf: []Value = leafBanks().coerce[ev.leaf_depth][0..args.len];
             @memcpy(coerce_buf, args);
             if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf);
             if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf);
@@ -112,7 +122,7 @@ pub fn leafExprServeAt(
         }
     }
     const nlive: usize = @min(@as(usize, func.n_locals), ir.LEAF_MAX_REGS);
-    const regs: []Value = leaf_bank[ev.leaf_depth][0..nlive];
+    const regs: []Value = leafBanks().regs[ev.leaf_depth][0..nlive];
     ev.leaf_depth += 1;
     defer ev.leaf_depth -= 1;
     // `wmask` marks the slots this serve has written; an unwritten slot reads as the fill value.

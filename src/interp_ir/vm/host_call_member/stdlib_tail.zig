@@ -965,7 +965,7 @@ pub fn appendInstanceSuppressed(inst: ObjRef(InstanceData), allocator: Allocator
 pub fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {
     var stack: std.ArrayList([]const u8) = .empty;
     defer stack.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     {
         const g = inst.borrow();

@@ -1838,7 +1838,7 @@ pub fn allFqns() FqnIterator {
 const testing = std.testing;
 
 test "table has no duplicate fqns" {
-    var seen = std.StringHashMap(void).init(testing.allocator);
+    var seen = runtime.NameHashMap(void).init(testing.allocator);
     defer seen.deinit();
     for (TABLE) |e| {
         const gop = try seen.getOrPut(e.fqn);

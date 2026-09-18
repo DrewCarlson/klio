@@ -2,6 +2,7 @@
 //! sites, group brackets, and composable-lambda memoization.
 
 const std = @import("std");
+const namehash = @import("names");
 const ast = @import("ast");
 const span_mod = @import("span");
 const root = @import("../compose_pass.zig");
@@ -63,21 +64,21 @@ pub const Walker = struct {
     b: B,
     oracle: ComposableOracle,
     oracle_ctx: *anyopaque,
-    sinks: ?*const std.StringHashMap(void) = null,
+    sinks: ?*const namehash.NameHashMap(void) = null,
     /// Vals typed `MutableState<@Composable fn>`, keyed to the fn type's arity.
-    composable_state_vals: ?*std.StringHashMap(u8) = null,
+    composable_state_vals: ?*namehash.NameHashMap(u8) = null,
     /// `@Composable`-lambda-typed params of the enclosing fn; a bare call to one threads.
-    lambda_params: ?*std.StringHashMap(void) = null,
+    lambda_params: ?*namehash.NameHashMap(void) = null,
     /// Wrap a returned composable lambda in composableLambdaInstance: factories only.
     wrap_ret_lambda: bool = false,
     /// LOCAL `@Composable` declarations in this walk; they must never join the oracle.
-    locals: ?*std.StringHashMap(void) = null,
+    locals: ?*namehash.NameHashMap(void) = null,
     /// Scoped vals holding composable lambdas. Their bare calls are VALUE invocations, so
     /// the pair passes positionally: `invoke(c, changed)` cannot bind named args.
-    composable_vals: ?*std.StringHashMap(void) = null,
+    composable_vals: ?*namehash.NameHashMap(void) = null,
     /// Vals from `movableContentOf`. Their invokes keep the runtime-completed protocol, so
     /// the name feeds ONLY the branch scan, which still needs its groups and empty else.
-    movable_vals: ?*std.StringHashMap(void) = null,
+    movable_vals: ?*namehash.NameHashMap(void) = null,
     /// Ambient mode: a `@Composable` property getter has no `$composer` param, so composer
     /// references resolve through the `__compose_currentComposer` intrinsic.
     ambient: bool = false,
@@ -98,11 +99,11 @@ pub const Walker = struct {
     nlr_counter: usize = 0,
     /// Value-param name to skip-calculus triple, present only when probes were emitted: a
     /// memoized lambda capturing only params derives validity from `$dirty`, no key slots.
-    param_triples: ?*const std.StringHashMap(u5) = null,
+    param_triples: ?*const namehash.NameHashMap(u5) = null,
     /// Whether `$dirty` carries live per-param facts here: false in a nested lambda.
     dirty_in_scope: bool = false,
     /// Locals shadowing a tripled param name, which the triple does not describe.
-    shadowed_triples: ?*std.StringHashMap(void) = null,
+    shadowed_triples: ?*namehash.NameHashMap(void) = null,
 
     /// A `return@label` target: the labelled lambda, the local holding its start marker,
     /// and whether a non-local return referenced it.
@@ -188,8 +189,8 @@ pub const Walker = struct {
                 if (w.param_triples) |triples| {
                     if (triples.contains(p.name.name)) {
                         if (w.shadowed_triples == null) {
-                            const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
-                            set.* = std.StringHashMap(void).init(w.a);
+                            const set = w.a.create(namehash.NameHashMap(void)) catch @panic("oom");
+                            set.* = namehash.NameHashMap(void).init(w.a);
                             w.shadowed_triples = set;
                         }
                         w.shadowed_triples.?.put(p.name.name, {}) catch @panic("oom");
@@ -211,8 +212,8 @@ pub const Walker = struct {
                         // The state's type argument makes every stored lambda composable.
                         const arity = stateOfComposableArity(p.ty.?).?;
                         if (w.composable_state_vals == null) {
-                            const m = w.a.create(std.StringHashMap(u8)) catch @panic("oom");
-                            m.* = std.StringHashMap(u8).init(w.a);
+                            const m = w.a.create(namehash.NameHashMap(u8)) catch @panic("oom");
+                            m.* = namehash.NameHashMap(u8).init(w.a);
                             w.composable_state_vals = m;
                         }
                         w.composable_state_vals.?.put(p.name.name, arity) catch @panic("oom");
@@ -270,8 +271,8 @@ pub const Walker = struct {
                                     std.mem.eql(u8, cn, "movableContentWithReceiverOf"))
                                 {
                                     if (w.movable_vals == null) {
-                                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
-                                        set.* = std.StringHashMap(void).init(w.a);
+                                        const set = w.a.create(namehash.NameHashMap(void)) catch @panic("oom");
+                                        set.* = namehash.NameHashMap(void).init(w.a);
                                         w.movable_vals = set;
                                     }
                                     try w.movable_vals.?.put(p.name.name, {});
@@ -283,14 +284,14 @@ pub const Walker = struct {
                 if (holds_composable) {
                     // `locals` feeds nested transforms and branch scans; `composable_vals` only the pair.
                     if (w.locals == null) {
-                        const lset = w.a.create(std.StringHashMap(void)) catch @panic("oom");
-                        lset.* = std.StringHashMap(void).init(w.a);
+                        const lset = w.a.create(namehash.NameHashMap(void)) catch @panic("oom");
+                        lset.* = namehash.NameHashMap(void).init(w.a);
                         w.locals = lset;
                     }
                     try w.locals.?.put(p.name.name, {});
                     if (w.composable_vals == null) {
-                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
-                        set.* = std.StringHashMap(void).init(w.a);
+                        const set = w.a.create(namehash.NameHashMap(void)) catch @panic("oom");
+                        set.* = namehash.NameHashMap(void).init(w.a);
                         w.composable_vals = set;
                     }
                     try w.composable_vals.?.put(p.name.name, {});
@@ -301,8 +302,8 @@ pub const Walker = struct {
                 // in the oracle through the body-deep collection.
                 if (f.body != null and isComposable(f.annotations)) {
                     if (w.locals == null) {
-                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
-                        set.* = std.StringHashMap(void).init(w.a);
+                        const set = w.a.create(namehash.NameHashMap(void)) catch @panic("oom");
+                        set.* = namehash.NameHashMap(void).init(w.a);
                         w.locals = set;
                     }
                     try w.locals.?.put(f.name.name, {});
@@ -755,9 +756,9 @@ pub const Walker = struct {
     fn memoizePlainLambdaArg(w: *Walker, arg: *Expr, callee_name: []const u8) void {
         if (arg.* != .Lambda) return;
         const lam = arg.Lambda;
-        var refs = std.StringHashMap(void).init(w.a);
+        var refs = namehash.NameHashMap(void).init(w.a);
         defer refs.deinit();
-        var declared = std.StringHashMap(void).init(w.a);
+        var declared = namehash.NameHashMap(void).init(w.a);
         defer declared.deinit();
         var bad = false;
         collectLambdaCaptureFacts(lam.body.stmts, &refs, &declared, &bad, callee_name);
@@ -1124,8 +1125,8 @@ pub const Walker = struct {
                                 for (arg.Lambda.params) |lp2| {
                                     if (!triples.contains(lp2.name)) continue;
                                     if (w.shadowed_triples == null) {
-                                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
-                                        set.* = std.StringHashMap(void).init(w.a);
+                                        const set = w.a.create(namehash.NameHashMap(void)) catch @panic("oom");
+                                        set.* = namehash.NameHashMap(void).init(w.a);
                                         w.shadowed_triples = set;
                                     }
                                     w.shadowed_triples.?.put(lp2.name, {}) catch @panic("oom");

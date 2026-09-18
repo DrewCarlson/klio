@@ -6,6 +6,7 @@
 //! `compress_symbols` flag has no effect.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const pack = @import("pack");
 
 const root = @import("stdlib.zig");
@@ -54,7 +55,7 @@ pub fn buildStdlibPack(
     const symbol_bytes = (try schema.encode(schema.SymbolIndex, a, &symbol_index, result)) orelse return null;
 
     var bindings: std.ArrayList(schema.Binding) = .empty;
-    var seen = std.StringHashMap(void).init(a);
+    var seen = runtime.NameHashMap(void).init(a);
     var names = root.allSymbolNames();
     while (names.next()) |fqn| {
         if (root.implementation(fqn) == null) continue;

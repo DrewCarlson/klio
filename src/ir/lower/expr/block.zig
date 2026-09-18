@@ -1,6 +1,7 @@
 //! Block lowering and the small path/segment utilities.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("../../ir.zig");
 const build = @import("../../build.zig");
@@ -13,7 +14,7 @@ const FuncBuilder = build.FuncBuilder;
 const Expr = ast.Expr;
 const AstBlock = ast.Block;
 const Reg = ir.Reg;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 const collectPathIdents = ast_scan.collectPathIdents;
 const collectPathIdentsStmt = ast_scan.collectPathIdentsStmt;
 const isPkgRoot = literals.isPkgRoot;

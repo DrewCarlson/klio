@@ -99,7 +99,7 @@ pub fn runFrameExec(
 ) Allocator.Error!EvalResult {
     if (parent.frame_count_on) parent.frame_count_total += 1;
     // KLIO_FN_PROF: the caller's attribution is restored on exit, so samples are self-time.
-    const fn_prof_prev = runtime.prof.current_fn;
+    const fn_prof_prev = if (runtime.prof.fn_prof_active) runtime.prof.current_fn else 0;
     if (runtime.prof.fn_prof_active) runtime.prof.current_fn = frame.func.id.int();
     defer if (runtime.prof.fn_prof_active) {
         runtime.prof.current_fn = fn_prof_prev;
@@ -108,12 +108,13 @@ pub fn runFrameExec(
     // but a suspended coroutine resumes on whatever thread the dispatcher hands it, and the
     // free-list, receiver chain and frame chain behind it are per-thread and unsynchronized.
     // The chain activation re-homes with it, so deactivate restores this thread's chain.
-    if (frame.tls != &ev_state.evtls) {
-        frame.tls = &ev_state.evtls;
-        frame.prev_chain = ev_state.evtls.active_chain;
-        frame.prev_chain_base = ev_state.evtls.active_chain_base;
-        ev_state.evtls.active_chain = &frame.enclosing_this;
-        ev_state.evtls.active_chain_base = frame.enclosing_this.items.len;
+    const here = ev_state.evtlsPtr();
+    if (frame.tls != here) {
+        frame.tls = here;
+        frame.prev_chain = here.active_chain;
+        frame.prev_chain_base = here.active_chain_base;
+        here.active_chain = &frame.enclosing_this;
+        here.active_chain_base = frame.enclosing_this.items.len;
     }
     const ftls: *EvalTls = frame.tls;
     var cur = cur_in;
@@ -320,7 +321,7 @@ pub fn runFrameExec(
             frame.materializeRegs();
             // Every native level stacks kf, glue and serve frames for any call form. Past this
             // depth a deep chain runs the stream instead, so the C stack stays bounded.
-            if (ev_state.evtls.eval_depth > NATIVE_RECURSE_MAX_DEPTH) break :native_run;
+            if (ev_state.evtlsPtr().eval_depth > NATIVE_RECURSE_MAX_DEPTH) break :native_run;
             var nctx: NativeCtx = .{
                 .frame = frame,
                 .allocator = allocator,

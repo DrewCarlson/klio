@@ -4,21 +4,27 @@
 const std = @import("std");
 const objcell = @import("objcell.zig");
 const value_mod = @import("value.zig");
+const namehash = @import("names");
 
 const ObjRef = objcell.ObjRef;
 const Value = value_mod.Value;
 const RuntimeError = value_mod.RuntimeError;
 
+/// A scope's bindings. The name hash is the interpreter's, not Wyhash: a
+/// global read walks every enclosing scope, so the same name is probed once per
+/// level and the hash runs on the hottest path there is.
+pub const VarMap = namehash.NameHashMap(Value);
+
 pub const Env = struct {
     parent: ?ObjRef(Env) = null,
-    vars: std.StringHashMap(Value),
+    vars: VarMap,
 
     pub fn init(allocator: std.mem.Allocator) Env {
-        return .{ .parent = null, .vars = std.StringHashMap(Value).init(allocator) };
+        return .{ .parent = null, .vars = VarMap.init(allocator) };
     }
 
     pub fn withParent(allocator: std.mem.Allocator, parent: ObjRef(Env)) Env {
-        return .{ .parent = parent, .vars = std.StringHashMap(Value).init(allocator) };
+        return .{ .parent = parent, .vars = VarMap.init(allocator) };
     }
 
     pub fn deinit(self: *Env) void {
@@ -48,12 +54,18 @@ pub const Env = struct {
         _ = self.vars.remove(name);
     }
 
+    /// The chain hashes `name` once and reuses that word at every level: a
+    /// global read from a deep scope was hashing the same bytes once per hop.
     pub fn lookup(self: *const Env, name: []const u8) ?Value {
-        if (self.vars.get(name)) |v| return v;
+        return self.lookupHashed(name, .{ .h = namehash.hashName(name) });
+    }
+
+    fn lookupHashed(self: *const Env, name: []const u8, at: namehash.PrehashedName) ?Value {
+        if (self.vars.getAdapted(name, at)) |v| return v;
         const parent = self.parent orelse return null;
         const g = parent.borrow();
         defer g.deinit();
-        return g.get().lookup(name);
+        return g.get().lookupHashed(name, at);
     }
 
     /// This scope only.
@@ -67,12 +79,16 @@ pub const Env = struct {
 
     /// Ignores any binding in `stop_at`, compared by cell identity.
     pub fn lookupExcluding(self: *const Env, name: []const u8, stop_at: ObjRef(Env)) ?Value {
-        if (self.vars.get(name)) |v| return v;
+        return self.lookupExcludingHashed(name, stop_at, .{ .h = namehash.hashName(name) });
+    }
+
+    fn lookupExcludingHashed(self: *const Env, name: []const u8, stop_at: ObjRef(Env), at: namehash.PrehashedName) ?Value {
+        if (self.vars.getAdapted(name, at)) |v| return v;
         const parent = self.parent orelse return null;
         if (ObjRef(Env).ptrEq(parent, stop_at)) return null;
         const g = parent.borrow();
         defer g.deinit();
-        return g.get().lookupExcluding(name, stop_at);
+        return g.get().lookupExcludingHashed(name, stop_at, at);
     }
 
     /// Walks inside-out. The caller owns the returned slice.
@@ -96,11 +112,15 @@ pub const Env = struct {
     pub const DepthValue = struct { value: Value, depth: usize };
 
     pub fn lookupWithDepth(self: *const Env, name: []const u8) ?DepthValue {
-        if (self.vars.get(name)) |v| return .{ .value = v, .depth = 0 };
+        return self.lookupWithDepthHashed(name, .{ .h = namehash.hashName(name) });
+    }
+
+    fn lookupWithDepthHashed(self: *const Env, name: []const u8, at: namehash.PrehashedName) ?DepthValue {
+        if (self.vars.getAdapted(name, at)) |v| return .{ .value = v, .depth = 0 };
         const parent = self.parent orelse return null;
         const g = parent.borrow();
         defer g.deinit();
-        const inner = g.get().lookupWithDepth(name) orelse return null;
+        const inner = g.get().lookupWithDepthHashed(name, at) orelse return null;
         return .{ .value = inner.value, .depth = inner.depth + 1 };
     }
 
@@ -124,14 +144,18 @@ pub const Env = struct {
     /// Walks the parent chain. Answers a `RuntimeError.Unbound` data value, not
     /// a Zig error, when the name resolves nowhere.
     pub fn assign(self: *Env, name: []const u8, value: Value) ?RuntimeError {
-        if (self.vars.getPtr(name)) |slot| {
+        return self.assignHashed(name, value, .{ .h = namehash.hashName(name) });
+    }
+
+    fn assignHashed(self: *Env, name: []const u8, value: Value, at: namehash.PrehashedName) ?RuntimeError {
+        if (self.vars.getPtrAdapted(name, at)) |slot| {
             slot.* = value;
             return null;
         }
         if (self.parent) |p| {
             const g = p.borrowMut();
             defer g.deinit();
-            return g.get().assign(name, value);
+            return g.get().assignHashed(name, value, at);
         }
         return .{ .Unbound = name };
     }

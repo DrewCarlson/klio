@@ -132,7 +132,7 @@ pub fn copyPairMap(dst: *PairFuncMap, src: *const PairFuncMap) Allocator.Error!v
     while (it.next()) |e| try dst.put(e.key_ptr.*, e.value_ptr.*);
 }
 
-pub fn copyStrMap(comptime V: type, dst: *std.StringHashMap(V), src: *const std.StringHashMap(V)) Allocator.Error!void {
+pub fn copyStrMap(comptime V: type, dst: *runtime.NameHashMap(V), src: *const runtime.NameHashMap(V)) Allocator.Error!void {
     var it = src.iterator();
     while (it.next()) |e| try dst.put(e.key_ptr.*, e.value_ptr.*);
 }

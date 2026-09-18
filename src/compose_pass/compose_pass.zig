@@ -11,6 +11,7 @@
 //! Group keys derive from the call's source span, stable per call site.
 
 const std = @import("std");
+const namehash = @import("names");
 const ast = @import("ast");
 const span_mod = @import("span");
 
@@ -72,7 +73,7 @@ pub fn positionalKey(sp: Span) i64 {
     return @as(i64, @as(i32, @truncate(@as(i64, @bitCast(h)))));
 }
 
-pub var active_composable_params: ?*const std.StringHashMap(ComposableParams) = null;
+pub var active_composable_params: ?*const namehash.NameHashMap(ComposableParams) = null;
 
 /// Fully-closed memoized lambdas lifted to top-level singleton vals; the driver
 /// appends them to the compilation's decls after `transformDecls`. Null disables.
@@ -83,19 +84,19 @@ pub var memo_trace_enabled: bool = false;
 
 pub var compose_audit: ComposeAudit = .{};
 
-pub var active_composable_names: ?*const std.StringHashMap(void) = null;
-pub var active_composable_sinks: ?*const std.StringHashMap(void) = null;
+pub var active_composable_names: ?*const namehash.NameHashMap(void) = null;
+pub var active_composable_sinks: ?*const namehash.NameHashMap(void) = null;
 
 /// Names of INLINE functions in the universe. A composable call is legal inside a
 /// lambda argument only when the callee inlines it or the parameter is composable.
-pub var active_inline_fns: ?*const std.StringHashMap(void) = null;
+pub var active_inline_fns: ?*const namehash.NameHashMap(void) = null;
 
 /// Properties whose read invokes a `@Composable` getter, so a lambda that only reads
 /// one still counts as composable content.
-pub var active_composable_getter_props: ?*const std.StringHashMap(void) = null;
+pub var active_composable_getter_props: ?*const namehash.NameHashMap(void) = null;
 
 /// Class name to stability for this run. Null treats every type as stable.
-pub var active_stability: ?*const std.StringHashMap(Stability) = null;
+pub var active_stability: ?*const namehash.NameHashMap(Stability) = null;
 
 const collect = @import("pass/collect.zig");
 pub const ComposableOracle = collect.ComposableOracle;

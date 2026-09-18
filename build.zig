@@ -22,10 +22,13 @@ fn modSource(b: *std.Build, m: Mod) []const u8 {
 
 const mod_list = [_]Mod{
     .{ .name = "span", .tested = true },
+    // Name hashing for the interpreter's side tables, depended on by every
+    // module that keys one by a declaration name.
+    .{ .name = "names", .tested = true },
     .{ .name = "diagnostics", .deps = &.{"span"}, .tested = true },
     .{ .name = "ast", .deps = &.{"span"}, .tested = true },
-    .{ .name = "compose_pass", .deps = &.{ "ast", "span" }, .src = "src/compose_pass/compose_pass.zig", .tested = true },
-    .{ .name = "runtime", .deps = &.{ "ast", "span" }, .tested = true },
+    .{ .name = "compose_pass", .deps = &.{ "ast", "span", "names" }, .src = "src/compose_pass/compose_pass.zig", .tested = true },
+    .{ .name = "runtime", .deps = &.{ "ast", "span", "names" }, .tested = true },
     .{ .name = "types", .deps = &.{ "ast", "diagnostics", "span" }, .tested = true },
     .{ .name = "lexer", .deps = &.{ "diagnostics", "span" }, .tested = true },
     .{ .name = "pack", .deps = &.{ "ast", "span", "types" }, .tested = true },

@@ -1,6 +1,7 @@
 //! Member-extension visibility and shadowing rules, and interface delegation.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
@@ -125,9 +126,7 @@ pub fn implementsSupertypeMemberExt(self: *VmHost, mod: *const Module, owner: []
     else
         owner;
     const sups: []const []const u8 = blk: {
-        const g = self.classes.borrow();
-        defer g.deinit();
-        const d = g.get().get(runtime_owner) orelse break :blk &.{};
+        const d = host_classes.classDefLookup(self, runtime_owner) orelse break :blk &.{};
         const dg = d.borrow();
         defer dg.deinit();
         break :blk dg.get().supertype_names;
@@ -488,7 +487,7 @@ pub const OwnerSet = struct {
     sig: [OWNER_SIG_MAX]usize = @splat(0),
     n: u32 = 0,
     /// The walked set for a chain longer than `sig` holds.
-    owned: ?std.StringHashMap(void) = null,
+    owned: ?runtime.NameHashMap(void) = null,
     fn contains(self: *const OwnerSet, key: []const u8) bool {
         if (self.owned) |*m| return m.contains(key);
         for (self.sig[0..self.n]) |p| {
@@ -510,12 +509,12 @@ pub const OwnerSet = struct {
 pub const OWNER_SIG_MAX = 48;
 /// One memoized closure-name set, built once per class for the process since class
 /// definitions are immutable after linking; `fqn` validates a reused address.
-pub const ClosureNamesEntry = struct { fqn_p: usize, fqn_len: usize, set: *const std.StringHashMap(void) };
-pub const ClosureNamesFront = struct { cls: usize = 0, fqn_p: usize = 0, fqn_len: usize = 0, set: ?*const std.StringHashMap(void) = null };
+pub const ClosureNamesEntry = struct { fqn_p: usize, fqn_len: usize, set: *const runtime.NameHashMap(void) };
+pub const ClosureNamesFront = struct { cls: usize = 0, fqn_p: usize = 0, fqn_len: usize = 0, set: ?*const runtime.NameHashMap(void) = null };
 pub const CLOSURE_NAMES_FRONT_SLOTS = 512;
 pub var closure_names_lock = std.atomic.Value(bool).init(false);
 pub var closure_names_map: ?std.AutoHashMap(usize, ClosureNamesEntry) = null;
-pub fn classClosureNames(cls: *const ClassDef) *const std.StringHashMap(void) {
+pub fn classClosureNames(cls: *const ClassDef) *const runtime.NameHashMap(void) {
     const key = @intFromPtr(cls);
     const fqn_p = @intFromPtr(cls.fqn.ptr);
     const front = &mext_tls.get().closure_front[((key *% 0x9E3779B97F4A7C15) >> 32) % CLOSURE_NAMES_FRONT_SLOTS];
@@ -527,11 +526,11 @@ pub fn classClosureNames(cls: *const ClassDef) *const std.StringHashMap(void) {
     defer closure_names_lock.store(false, .release);
     if (closure_names_map == null) closure_names_map = .init(pa);
     const map = &closure_names_map.?;
-    const set: *const std.StringHashMap(void) = blk: {
+    const set: *const runtime.NameHashMap(void) = blk: {
         if (map.get(key)) |e| {
             if (e.fqn_p == fqn_p and e.fqn_len == cls.fqn.len) break :blk e.set;
         }
-        const s = pa.create(std.StringHashMap(void)) catch @panic("out of memory");
+        const s = pa.create(runtime.NameHashMap(void)) catch @panic("out of memory");
         s.* = .init(pa);
         var closure: std.ArrayList(*const ClassDef) = .empty;
         defer closure.deinit(pa);
@@ -585,8 +584,8 @@ pub fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!Ow
     return out;
 }
 /// The walked form of `enclosingOwnerSet`, as one caller-owned map.
-pub fn enclosingOwnerSetWalk(self: *VmHost, allocator: Allocator) Allocator.Error!std.StringHashMap(void) {
-    var set: std.StringHashMap(void) = .init(allocator);
+pub fn enclosingOwnerSetWalk(self: *VmHost, allocator: Allocator) Allocator.Error!runtime.NameHashMap(void) {
+    var set: runtime.NameHashMap(void) = .init(allocator);
     const chain = try enclosingThisChain(self, allocator);
     defer allocator.free(chain);
     var closure: std.ArrayList(*const ClassDef) = .empty;
@@ -845,9 +844,7 @@ pub fn delegatedInterfaceDeclares(self: *VmHost, allocator: Allocator, inst: Obj
                 if (v == .Class) break :blk v.Class.clone();
             }
         }
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(iface_name)) |d| break :blk d.clone();
+        if (host_classes.classDefLookup(self, iface_name)) |d| break :blk d.clone();
         break :blk null;
     };
     const def = iface_def orelse return null;

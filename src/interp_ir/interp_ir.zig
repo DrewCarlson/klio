@@ -109,8 +109,8 @@ pub const NameValue = struct {
 };
 
 pub const ClassTable = build.ClassTable;
-pub const OuterTable = std.StringHashMap(Value);
-pub const AnonMethods = ObjRef(std.StringHashMap(AnonMethodEntry));
+pub const OuterTable = runtime.NameHashMap(Value);
+pub const AnonMethods = ObjRef(runtime.NameHashMap(AnonMethodEntry));
 
 /// `(class, member)` → `FuncId` registry table (shared with `build`).
 pub const PairFuncMap = build.PairFuncMap;
@@ -125,7 +125,7 @@ pub const TopLevelPropInit = struct { func: FuncId, default: build.TypedDefault,
 /// Program metadata built once by `build.build_module` and shared by handle
 /// with every OS thread. Declaration tables are fixed; caches fill in lazily.
 pub const ProgramImage = struct {
-    top_level_prop_inits: std.StringHashMap(TopLevelPropInit),
+    top_level_prop_inits: runtime.NameHashMap(TopLevelPropInit),
     /// The same props in declaration order, borrowed from the Vm's slice.
     top_level_props_ordered: []const NameFunc = &.{},
     /// Enum-entry ctor-arg thunks, borrowed from the Vm, evaluated on first use.
@@ -135,28 +135,28 @@ pub const ProgramImage = struct {
     body_prop_inits: PairFuncMap,
     instance_prop_getters: PairFuncMap,
     /// Every property name with a custom getter; gates the accessor probe.
-    getter_prop_names: std.StringHashMap(void),
+    getter_prop_names: runtime.NameHashMap(void),
     instance_prop_setters: PairFuncMap,
     /// Getter-backed body properties declared `private`; never virtual.
     instance_prop_private: PairFuncMap,
-    parent_ctor_args: std.StringHashMap([]FuncId),
+    parent_ctor_args: runtime.NameHashMap([]FuncId),
     /// Labels parallel to `parent_ctor_args`, bound by name rather than position.
-    parent_ctor_arg_names: std.StringHashMap([]const ?[]const u8),
-    init_blocks: std.StringHashMap([]FuncId),
+    parent_ctor_arg_names: runtime.NameHashMap([]const ?[]const u8),
+    init_blocks: runtime.NameHashMap([]FuncId),
     extension_props: PairFuncMap,
     /// Property names with an owner-qualified extension-prop key
     /// (`"<Owner>\x00<recv>"`); gates the lexical-tower probe's frame walk.
-    owner_keyed_ext_names: std.StringHashMap(void),
+    owner_keyed_ext_names: runtime.NameHashMap(void),
     /// Extension-property getters for a null receiver; null means ambiguous.
-    nullable_ext_props: std.StringHashMap(?FuncId),
+    nullable_ext_props: runtime.NameHashMap(?FuncId),
     extension_prop_setters: PairFuncMap,
     extension_prop_delegates: PairFuncMap,
-    secondary_ctors: std.StringHashMap([]build.SecondaryCtorEntry),
-    primary_ctor_default_thunks: std.StringHashMap([]?FuncId),
+    secondary_ctors: runtime.NameHashMap([]build.SecondaryCtorEntry),
+    primary_ctor_default_thunks: runtime.NameHashMap([]?FuncId),
     /// Every top-level `object` and synthesised companion. Startup defers any
     /// whose initializer throws to `lookupGlobal`, as Kotlin's lazy init does.
-    object_names: std.StringHashMap(void),
-    class_delegates: std.StringHashMap([]StrFunc),
+    object_names: runtime.NameHashMap(void),
+    class_delegates: runtime.NameHashMap([]StrFunc),
     func_defaults: std.AutoHashMap(u32, []?FuncId),
     installed_bindings: ObjRef(HostBindings),
     /// Executable form per top-level symbol, keyed by `FuncId.int()`: present
@@ -170,14 +170,14 @@ pub const ProgramImage = struct {
     /// Bare name → FQN over the stdlib packages an unqualified reference may
     /// bind into implicitly; the first package in `bare_probe_packages` order
     /// wins a collision. Keys and values borrow FQN bytes outliving this image.
-    default_import_globals: std.StringHashMap([]const u8),
+    default_import_globals: runtime.NameHashMap([]const u8),
     /// Bare name → FQN for package-level pack bindings. Receiver-qualified
     /// bindings are member forms a bare name can never mean and are excluded;
     /// the smallest FQN wins a collision, so hash order cannot change the pick.
-    pack_bare_aliases: std.StringHashMap([]const u8),
+    pack_bare_aliases: runtime.NameHashMap([]const u8),
     /// Bare name → FQN over the `any_member_prefixes` surfaces, probed for an
     /// instance receiver with no user extension.
-    any_member_globals: std.StringHashMap([]const u8),
+    any_member_globals: runtime.NameHashMap([]const u8),
     resolved_linked: bool,
     /// Builtin member-call resolution memo: `(receiver type, name, args-empty)`
     /// → the intrinsic, `null` meaning fall through to extension/global
@@ -189,7 +189,7 @@ pub const ProgramImage = struct {
     /// Program-lifetime canonical storage for the names the dispatch caches key
     /// on. A callable reference's name is a collectable runtime String whose
     /// address can be reused, so interning by content keeps pointer keys exact.
-    member_names: std.StringHashMap(void),
+    member_names: runtime.NameHashMap(void),
     /// Module `canonicalizeProgramNames` last processed; the pass runs once.
     canonicalized_module_identity: usize = 0,
     /// Monomorphic inline cache for user-class instance-method dispatch. The
@@ -304,36 +304,36 @@ pub const ProgramImage = struct {
 
     pub fn init(allocator: Allocator) Allocator.Error!ProgramImage {
         return .{
-            .top_level_prop_inits = std.StringHashMap(TopLevelPropInit).init(allocator),
+            .top_level_prop_inits = runtime.NameHashMap(TopLevelPropInit).init(allocator),
             .body_prop_inits = PairFuncMap.init(allocator),
             .instance_prop_getters = PairFuncMap.init(allocator),
-            .getter_prop_names = std.StringHashMap(void).init(allocator),
+            .getter_prop_names = runtime.NameHashMap(void).init(allocator),
             .instance_prop_setters = PairFuncMap.init(allocator),
             .instance_prop_private = PairFuncMap.init(allocator),
-            .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
-            .parent_ctor_arg_names = std.StringHashMap([]const ?[]const u8).init(allocator),
-            .init_blocks = std.StringHashMap([]FuncId).init(allocator),
+            .parent_ctor_args = runtime.NameHashMap([]FuncId).init(allocator),
+            .parent_ctor_arg_names = runtime.NameHashMap([]const ?[]const u8).init(allocator),
+            .init_blocks = runtime.NameHashMap([]FuncId).init(allocator),
             .extension_props = PairFuncMap.init(allocator),
-            .owner_keyed_ext_names = std.StringHashMap(void).init(allocator),
-            .nullable_ext_props = std.StringHashMap(?FuncId).init(allocator),
+            .owner_keyed_ext_names = runtime.NameHashMap(void).init(allocator),
+            .nullable_ext_props = runtime.NameHashMap(?FuncId).init(allocator),
             .extension_prop_setters = PairFuncMap.init(allocator),
             .extension_prop_delegates = PairFuncMap.init(allocator),
-            .secondary_ctors = std.StringHashMap([]build.SecondaryCtorEntry).init(allocator),
-            .primary_ctor_default_thunks = std.StringHashMap([]?FuncId).init(allocator),
-            .object_names = std.StringHashMap(void).init(allocator),
-            .class_delegates = std.StringHashMap([]StrFunc).init(allocator),
+            .secondary_ctors = runtime.NameHashMap([]build.SecondaryCtorEntry).init(allocator),
+            .primary_ctor_default_thunks = runtime.NameHashMap([]?FuncId).init(allocator),
+            .object_names = runtime.NameHashMap(void).init(allocator),
+            .class_delegates = runtime.NameHashMap([]StrFunc).init(allocator),
             .func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator),
             .installed_bindings = try ObjRef(HostBindings).init(allocator, HostBindings.init(allocator)),
             .resolved_native = std.AutoHashMap(u32, StdlibFn).init(allocator),
             .vararg_spread_adapters = std.AutoHashMap(u32, u32).init(allocator),
             .resolved_redirect = std.AutoHashMap(u32, []FuncId).init(allocator),
-            .default_import_globals = std.StringHashMap([]const u8).init(allocator),
-            .pack_bare_aliases = std.StringHashMap([]const u8).init(allocator),
-            .any_member_globals = std.StringHashMap([]const u8).init(allocator),
+            .default_import_globals = runtime.NameHashMap([]const u8).init(allocator),
+            .pack_bare_aliases = runtime.NameHashMap([]const u8).init(allocator),
+            .any_member_globals = runtime.NameHashMap([]const u8).init(allocator),
             .resolved_linked = false,
             .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
             .field_probe_cache = std.AutoHashMap(MemberHasKey, MemberResolveEntry).init(allocator),
-            .member_names = std.StringHashMap(void).init(allocator),
+            .member_names = runtime.NameHashMap(void).init(allocator),
             .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .runtime_virtual_cache = std.AutoHashMap(RuntimeVirtualKey, RuntimeVirtualTarget).init(allocator),
             .ext_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
@@ -732,7 +732,7 @@ pub const ProgramImage = struct {
 
     /// Record a package-level binding's bare-name alias. An uppercase parent
     /// segment is a member form a bare name cannot mean; smallest FQN wins.
-    fn notePackAlias(map: *std.StringHashMap([]const u8), fqn: []const u8) Allocator.Error!void {
+    fn notePackAlias(map: *runtime.NameHashMap([]const u8), fqn: []const u8) Allocator.Error!void {
         const dot = std.mem.findScalarLast(u8, fqn, '.') orelse return;
         const pkg = fqn[0..dot];
         const name = fqn[dot + 1 ..];
@@ -1135,7 +1135,7 @@ pub const ObjectInitState = union(enum) {
 
 /// Lazy-`object` init table. The cell's writer lock serializes the claim that
 /// makes first-access construction once-only across threads.
-pub const ObjectStates = ObjRef(std.StringHashMap(ObjectInitState));
+pub const ObjectStates = ObjRef(runtime.NameHashMap(ObjectInitState));
 /// `ClassId.int()` → published singleton, authoritative for id-committed reads;
 /// name reads go through `globals`. Published to the id table first.
 pub const SingletonsById = ObjRef(std.AutoHashMap(u32, runtime.Value));

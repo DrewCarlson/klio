@@ -3,12 +3,13 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const runtime = @import("runtime");
 
 const Allocator = std.mem.Allocator;
 const Expr = ast.Expr;
 const Stmt = ast.Stmt;
 const Decl = ast.Decl;
-pub const StringSet = std.StringHashMap(void);
+pub const StringSet = runtime.NameHashMap(void);
 
 /// `expr as Any`, or transitively wrapped, for the boxed-equality routing.
 pub fn isBoxedToAnyForm(e: *const Expr) bool {

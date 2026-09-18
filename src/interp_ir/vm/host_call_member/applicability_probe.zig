@@ -2,6 +2,7 @@
 //! type-disproof adjudicator, and member overload selection.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
@@ -113,7 +114,7 @@ pub fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const
     const Entry = struct { name: []const u8, depth: usize };
     var queue: std.ArrayList(Entry) = .empty;
     defer queue.deinit(a);
-    var seen: std.StringHashMap(void) = .init(a);
+    var seen: runtime.NameHashMap(void) = .init(a);
     defer seen.deinit();
     {
         const g = inst.borrow();
@@ -356,7 +357,7 @@ pub fn instanceExtendsFunctionType(self: *VmHost, v: *const Value) bool {
     const a = self.allocator;
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(a);
-    var seen: std.StringHashMap(void) = .init(a);
+    var seen: runtime.NameHashMap(void) = .init(a);
     defer seen.deinit();
     {
         const g = v.Instance.borrow();
@@ -437,7 +438,7 @@ pub fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
     const a = self.allocator;
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(a);
-    var seen: std.StringHashMap(void) = .init(a);
+    var seen: runtime.NameHashMap(void) = .init(a);
     defer seen.deinit();
     queue.append(a, start) catch return false;
     var head: usize = 0;
@@ -569,9 +570,7 @@ pub fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, recei
         // A class value is a `KClass` / `KClassifier`: the reflection heads it
         // reports stay candidates though the stdlib registers ClassDefs for them.
         if (receiver.isRuntimeType(simpleName(pn))) return false;
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        return cg.get().get(simpleName(pn)) != null;
+        return host_classes.classDefLookup(self, simpleName(pn)) != null;
     }
     return false;
 }
@@ -720,9 +719,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
     // conversion only to fun interfaces. An unregistered head is not definite.
     if (isCallable(arg)) {
         if (runtime.envOnce("KLIO_ADM_TRACE") != null) {
-            const cg2 = self.classes.borrow();
-            defer cg2.deinit();
-            std.debug.print("[adm] callable-vs pn={s} orig={s} reg={}\n", .{ pn, orig, cg2.get().get(pn) != null });
+            std.debug.print("[adm] callable-vs pn={s} orig={s} reg={}\n", .{ pn, orig, host_classes.classDefLookup(self, pn) != null });
         }
         if (isDefinitelyNonFunctionTypeName(pn)) return true;
         if (!std.mem.startsWith(u8, pn, "Function") and
@@ -878,9 +875,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
         start_fqn = cg.get().fqn;
         // Definiteness needs the arg's class known, so its closure is complete.
         const known = blk: {
-            const ccg = self.classes.borrow();
-            defer ccg.deinit();
-            break :blk ccg.get().get(start) != null;
+            break :blk host_classes.classDefLookup(self, start) != null;
         };
         cg.deinit();
         g.deinit();
@@ -927,7 +922,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
     const a = self.allocator;
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(a);
-    var seen: std.StringHashMap(void) = .init(a);
+    var seen: runtime.NameHashMap(void) = .init(a);
     defer seen.deinit();
     queue.append(a, start) catch return false;
     var head: usize = 0;

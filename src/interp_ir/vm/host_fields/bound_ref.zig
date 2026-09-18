@@ -1,6 +1,7 @@
 //! Bound callable references (`recv::name`): their parts, adaptation stamp, and construction.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
@@ -151,9 +152,7 @@ pub fn stampRefAdaptation(self: *VmHost, allocator: Allocator, v: *const Value, 
 /// declaration overrides an inherited accessor, so the setter walk stores the
 /// field directly instead of falling through to a supertype's custom setter.
 pub fn classDeclaresStoredProp(self: *VmHost, cn: []const u8, name: []const u8) bool {
-    const cg = self.classes.borrow();
-    defer cg.deinit();
-    const def = cg.get().get(cn) orelse return false;
+    const def = host_classes.classDefLookup(self, cn) orelse return false;
     const dg = def.borrow();
     defer dg.deinit();
     for (dg.get().body_properties) |p| {

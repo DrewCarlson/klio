@@ -2234,7 +2234,7 @@ const UserMethodMemoLock = struct {
     }
 };
 var user_method_memo_lock: UserMethodMemoLock = .{};
-var user_method_memo: ?std.StringHashMap(UserMethodMemoEntry) = null;
+var user_method_memo: ?runtime.NameHashMap(UserMethodMemoEntry) = null;
 
 fn userMethodMemoGet(key: []const u8, gen: u32) ?bool {
     user_method_memo_lock.lock();
@@ -2248,7 +2248,7 @@ fn userMethodMemoGet(key: []const u8, gen: u32) ?bool {
 fn userMethodMemoPut(key: []const u8, gen: u32, has: bool) void {
     user_method_memo_lock.lock();
     defer user_method_memo_lock.unlock();
-    if (user_method_memo == null) user_method_memo = std.StringHashMap(UserMethodMemoEntry).init(std.heap.page_allocator);
+    if (user_method_memo == null) user_method_memo = runtime.NameHashMap(UserMethodMemoEntry).init(std.heap.page_allocator);
     const memo = &user_method_memo.?;
     if (memo.getPtr(key)) |e| {
         e.* = .{ .has = has, .gen = gen };
@@ -2295,7 +2295,7 @@ fn classHasUserMethod(self: *VmHost, allocator: Allocator, start_in: []const u8,
 fn classHasUserMethodWalk(self: *VmHost, allocator: Allocator, start: []const u8, mname: []const u8) bool {
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     queue.append(allocator, start) catch return false;
     var head: usize = 0;

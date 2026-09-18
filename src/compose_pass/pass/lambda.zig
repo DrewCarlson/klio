@@ -1,6 +1,7 @@
 //! Composable lambda-argument transform after resolution, and the capture analysis.
 
 const std = @import("std");
+const namehash = @import("names");
 const ast = @import("ast");
 const span_mod = @import("span");
 const root = @import("../compose_pass.zig");
@@ -98,11 +99,11 @@ pub fn plainMemoExcluded(name: []const u8) bool {
 /// `refs` collects bare name reads, `declared` the names bound inside, `bad` the shapes
 /// memoization must skip: a write to a captured name, whose boxed cell key is
 /// meaningless, or a labeled return that rewrapping would re-parent.
-pub fn collectLambdaCaptureFacts(stmts: []const Stmt, refs: *std.StringHashMap(void), declared: *std.StringHashMap(void), bad: *bool, callee_name: []const u8) void {
+pub fn collectLambdaCaptureFacts(stmts: []const Stmt, refs: *namehash.NameHashMap(void), declared: *namehash.NameHashMap(void), bad: *bool, callee_name: []const u8) void {
     for (stmts) |*st| collectCaptureFactsStmt(st, refs, declared, bad, callee_name);
 }
 
-fn collectCaptureFactsStmt(st: *const Stmt, refs: *std.StringHashMap(void), declared: *std.StringHashMap(void), bad: *bool, callee: []const u8) void {
+fn collectCaptureFactsStmt(st: *const Stmt, refs: *namehash.NameHashMap(void), declared: *namehash.NameHashMap(void), bad: *bool, callee: []const u8) void {
     switch (st.*) {
         .Expr => |*e| collectCaptureFactsExpr(e, refs, declared, bad, callee),
         .Assign => |a| {
@@ -137,7 +138,7 @@ fn collectCaptureFactsStmt(st: *const Stmt, refs: *std.StringHashMap(void), decl
     }
 }
 
-fn collectCaptureFactsExpr(e: *const Expr, refs: *std.StringHashMap(void), declared: *std.StringHashMap(void), bad: *bool, callee: []const u8) void {
+fn collectCaptureFactsExpr(e: *const Expr, refs: *namehash.NameHashMap(void), declared: *namehash.NameHashMap(void), bad: *bool, callee: []const u8) void {
     if (bad.*) return;
     switch (e.*) {
         .Path => |p| {

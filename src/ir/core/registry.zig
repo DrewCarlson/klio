@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 const Allocator = std.mem.Allocator;
 const root_ir = @import("../ir.zig");
 const core_class = @import("class.zig");
@@ -37,45 +38,45 @@ pub const ModuleRegistry = struct {
     /// Names of `object` singletons; the Vm publishes one instance of each as a global.
     object_names: std.ArrayList([]const u8) = .empty,
     /// Outer class -> companion-singleton global name; `Foo.X` falls through to it.
-    companion_singletons: std.StringHashMap([]const u8),
+    companion_singletons: runtime.NameHashMap([]const u8),
     /// Fqns whose installed host binding outranks any interpreted body (a pack's stub declarations).
-    host_shadowed_fqns: std.StringHashMap(void),
+    host_shadowed_fqns: runtime.NameHashMap(void),
     /// Inner class -> outer class name; resolves `this@Outer` and outer-chain field reads.
-    enclosing_class: std.StringHashMap([]const u8),
+    enclosing_class: runtime.NameHashMap([]const u8),
     /// Per-function type-parameter names in source order; reified dispatch binds each.
     func_type_params: std.AutoHashMap(FuncId, std.ArrayList([]const u8)),
     /// Declared upper bounds of a function's type parameters, one entry per (param, bound).
     func_type_param_bounds: std.AutoHashMap(FuncId, []const TypeParamBound),
     /// Declared upper bounds of each class's type parameters, keyed by class simple name.
     /// Dispatch disproves an argument whose type violates the bound on a class parameter.
-    class_type_param_bounds: std.StringHashMap([]const TypeParamBound),
+    class_type_param_bounds: runtime.NameHashMap([]const TypeParamBound),
     /// Top-level properties declared `by`; reads and writes route through `getValue`/`setValue`.
-    top_level_delegated_props: std.StringHashMap(void),
+    top_level_delegated_props: runtime.NameHashMap(void),
     /// Top-level `lateinit var` names: no binding until the first write, so a read that finds
     /// none throws `UninitializedPropertyAccessException` and `isInitialized` answers from it.
-    top_level_lateinit_props: std.StringHashMap(void),
+    top_level_lateinit_props: runtime.NameHashMap(void),
     /// Class -> member FUNCTION names declared or inherited transitively; Kotlin keeps the namespaces apart.
-    hierarchy_methods: std.StringHashMap(std.StringHashMap(void)),
+    hierarchy_methods: runtime.NameHashMap(runtime.NameHashMap(void)),
     /// Private stored properties that shadow a same-name supertype declaration, keyed
     /// "Class\x1fprop". Each gets its own cell, addressed owner-mangled. Lowering-only.
-    private_shadow_props: std.StringHashMap(void),
+    private_shadow_props: runtime.NameHashMap(void),
     /// Initialized `override val/var` whose supertype also stores the name, keyed "Class\x1fprop".
     /// Each class keeps its own cell: a read takes the most-derived, `super.x` the base. Lowering-only.
-    override_cell_props: std.StringHashMap(void),
+    override_cell_props: runtime.NameHashMap(void),
     /// Per-class transitive member-name set for the member-shadow gate, plus whether the supertype
     /// chain resolved; an incomplete set cannot prove non-shadowability. Lowering-only.
-    hierarchy_shadow_names: std.StringHashMap(HierarchyShadowSet),
+    hierarchy_shadow_names: runtime.NameHashMap(HierarchyShadowSet),
     /// (declaring class, method) -> trailing-lambda shapes, collected from every member declaration
     /// before any body lowers, so receiver-lambda typing does not depend on source order.
     member_trailing_lambda_shapes: StrPairMap(std.ArrayList(MemberTrailingLambdaShape)),
     /// `"<class>\x00<method>\x00<userArity>"` -> the lowered method's FuncId, filled as each body
     /// lowers, so a body reaches a sibling member's signature before `Class.methods` is patched.
-    member_method_fids: std.StringHashMap(FuncId),
+    member_method_fids: runtime.NameHashMap(FuncId),
     /// Every member name declared by any class: only these can be shadowed by a runtime receiver.
-    class_member_names: std.StringHashMap(void),
+    class_member_names: runtime.NameHashMap(void),
     /// Class -> transitive supertype simple names, nearest first, recorded from the AST before body
     /// lowering so extension receivers rank while the `Class.supertypes` slots are still filling.
-    class_super_names: std.StringHashMap([]const []const u8),
+    class_super_names: runtime.NameHashMap([]const []const u8),
     /// Bumped whenever `class_super_names` or `mangled_nested` change, so the
     /// supertype-name closures below are dropped rather than trusted.
     class_super_gen: u32 = 0,
@@ -109,26 +110,26 @@ pub const ModuleRegistry = struct {
     /// members, which lower no func and join no class method list but must still outrank extensions.
     abstract_member_arity: StrPairMap(u64),
     /// Top-level `const val` literals by FQN; Kotlin inlines constants, so lowering emits the literal.
-    top_level_const_vals: std.StringHashMap(Const),
+    top_level_const_vals: runtime.NameHashMap(Const),
     /// Per-local-function default-arg thunks keyed by body `FuncId`; a null slot is a required parameter.
     local_fn_defaults: std.AutoHashMap(FuncId, std.ArrayList(?FuncId)),
     /// Default-arg thunks for bodyless members, keyed `(class, method)`.
     abstract_member_defaults: StrPairMap(std.ArrayList(?FuncId)),
     /// `typealias Name = Target` -> `Name` mapped to `Target`'s simple head name.
-    type_aliases: std.StringHashMap([]const u8),
+    type_aliases: runtime.NameHashMap([]const u8),
     /// Structural alias targets used by static applicability proofs.
-    type_alias_types: std.StringHashMap(TypeAliasShape),
+    type_alias_types: runtime.NameHashMap(TypeAliasShape),
     /// The simple names `type_alias_types` holds, however each key is qualified.
     /// Every scoped lookup probes `<some prefix>.<simple name>` or the bare name,
     /// so a name absent here cannot match any key and the probes are skipped
     /// without building the qualified strings they would hash.
-    type_alias_simple: std.StringHashMap(void),
+    type_alias_simple: runtime.NameHashMap(void),
     /// Function-type aliases whose target declares an extension receiver -> the target's VALUE-parameter
     /// count. The `Function{N}` tag in `type_aliases` drops the receiver; a bare call still binds `this`.
-    recv_fn_aliases: std.StringHashMap(u8),
+    recv_fn_aliases: runtime.NameHashMap(u8),
     /// Per-file non-wildcard import leaf -> every import bound to that leaf, in declaration order:
     /// named imports are file-scoped, and same-leaf imports all stay in scope (ambiguity at the use site).
-    import_aliases: std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))),
+    import_aliases: std.AutoHashMap(FileId, runtime.NameHashMap(std.ArrayList(ImportPath))),
     /// One bit per import leaf a file declares, so a name a file cannot have is
     /// refused without hashing it. A lookup asks about a name the file imports
     /// roughly once in three hundred, and the rest were paying a string hash to
@@ -142,29 +143,29 @@ pub const ModuleRegistry = struct {
     /// Kotlin compilation-module identity per file: `internal` is visible only within one identity.
     file_modules: std.AutoHashMap(FileId, u32),
     /// Nested-object simple-name aliases, keyed by enclosing class name.
-    nested_object_aliases: std.StringHashMap(std.StringHashMap([]const u8)),
+    nested_object_aliases: runtime.NameHashMap(runtime.NameHashMap([]const u8)),
     /// Qualified nested class (`Outer.Inner`) -> mangled lift name, for nested classes the lift renamed.
     /// A qualified type reference resolves through this, never to a same-simple-name top-level class.
-    mangled_nested: std.StringHashMap([]const u8),
+    mangled_nested: runtime.NameHashMap([]const u8),
     /// `(class, member)` -> `Const` for a class or companion `const val`.
     class_const_inits: StrPairMap(Const),
     /// Top-level property simple name -> every declaration of it, with FQN and package. A bare read
     /// ranks scope tiers like a bare call: a declaration only in an unimported package is unresolved.
-    top_level_prop_pkgs: std.StringHashMap(std.ArrayList(PropDecl)),
+    top_level_prop_pkgs: runtime.NameHashMap(std.ArrayList(PropDecl)),
     /// Top-level property FQN -> declared type head, as annotated; unannotated declarations record none.
-    top_level_prop_type_heads: std.StringHashMap([]const u8),
+    top_level_prop_type_heads: runtime.NameHashMap([]const u8),
     /// Same key with the full declared type, which alone says what iterating or indexing yields.
-    top_level_prop_type_refs: std.StringHashMap(TypeRef),
+    top_level_prop_type_refs: runtime.NameHashMap(TypeRef),
     /// Top-level property FQN -> the simple name its UNANNOTATED initializer calls, resolved to a head
     /// only at query time, when a same-named user function is visible and can instead make it ambiguous.
-    top_level_prop_init_callees: std.StringHashMap([]const u8),
+    top_level_prop_init_callees: runtime.NameHashMap([]const u8),
     /// Top-level extension properties whose values are callable: `recv.p(args)` is a read plus `invoke`.
-    callable_extension_props: std.StringHashMap(std.ArrayList(CallableExtensionProp)),
+    callable_extension_props: runtime.NameHashMap(std.ArrayList(CallableExtensionProp)),
     /// Top-level property -> 0-arg getter `FuncId`; a `LoadGlobal` of the name re-invokes it per read.
-    top_level_prop_getters: std.StringHashMap(FuncId),
+    top_level_prop_getters: runtime.NameHashMap(FuncId),
     /// Top-level `var` custom setters: a `StoreGlobal` invokes the thunk, whose own `field =` write
     /// lands on the `__klio_topfield__<name>` storage binding.
-    top_level_prop_setters: std.StringHashMap(FuncId),
+    top_level_prop_setters: runtime.NameHashMap(FuncId),
 
     allocator: Allocator,
 
@@ -208,7 +209,7 @@ pub const ModuleRegistry = struct {
     };
 
     pub const HierarchyShadowSet = struct {
-        names: std.StringHashMap(void),
+        names: runtime.NameHashMap(void),
         complete: bool,
     };
 
@@ -221,22 +222,22 @@ pub const ModuleRegistry = struct {
 
     pub fn init(allocator: Allocator) ModuleRegistry {
         return .{
-            .companion_singletons = std.StringHashMap([]const u8).init(allocator),
-            .host_shadowed_fqns = std.StringHashMap(void).init(allocator),
-            .enclosing_class = std.StringHashMap([]const u8).init(allocator),
+            .companion_singletons = runtime.NameHashMap([]const u8).init(allocator),
+            .host_shadowed_fqns = runtime.NameHashMap(void).init(allocator),
+            .enclosing_class = runtime.NameHashMap([]const u8).init(allocator),
             .func_type_params = std.AutoHashMap(FuncId, std.ArrayList([]const u8)).init(allocator),
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
-            .class_type_param_bounds = std.StringHashMap([]const TypeParamBound).init(allocator),
-            .top_level_delegated_props = std.StringHashMap(void).init(allocator),
-            .top_level_lateinit_props = std.StringHashMap(void).init(allocator),
-            .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
-            .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
+            .class_type_param_bounds = runtime.NameHashMap([]const TypeParamBound).init(allocator),
+            .top_level_delegated_props = runtime.NameHashMap(void).init(allocator),
+            .top_level_lateinit_props = runtime.NameHashMap(void).init(allocator),
+            .hierarchy_methods = runtime.NameHashMap(runtime.NameHashMap(void)).init(allocator),
+            .hierarchy_shadow_names = runtime.NameHashMap(HierarchyShadowSet).init(allocator),
             .member_trailing_lambda_shapes = StrPairMap(std.ArrayList(MemberTrailingLambdaShape)).init(allocator),
-            .private_shadow_props = std.StringHashMap(void).init(allocator),
-            .override_cell_props = std.StringHashMap(void).init(allocator),
-            .member_method_fids = std.StringHashMap(FuncId).init(allocator),
-            .class_member_names = std.StringHashMap(void).init(allocator),
-            .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
+            .private_shadow_props = runtime.NameHashMap(void).init(allocator),
+            .override_cell_props = runtime.NameHashMap(void).init(allocator),
+            .member_method_fids = runtime.NameHashMap(FuncId).init(allocator),
+            .class_member_names = runtime.NameHashMap(void).init(allocator),
+            .class_super_names = runtime.NameHashMap([]const []const u8).init(allocator),
             .delegated_body_props = StrPairSet.init(allocator),
             .recv_fn_props = StrPairMap([]const u8).init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
@@ -247,28 +248,28 @@ pub const ModuleRegistry = struct {
             .iface_member_ext_recv = StrPairMap([]const u8).init(allocator),
             .iface_member_ctx_types = StrPairMap([]const u8).init(allocator),
             .abstract_member_arity = StrPairMap(u64).init(allocator),
-            .top_level_const_vals = std.StringHashMap(Const).init(allocator),
+            .top_level_const_vals = runtime.NameHashMap(Const).init(allocator),
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
-            .type_aliases = std.StringHashMap([]const u8).init(allocator),
-            .type_alias_types = std.StringHashMap(TypeAliasShape).init(allocator),
-            .type_alias_simple = std.StringHashMap(void).init(allocator),
-            .recv_fn_aliases = std.StringHashMap(u8).init(allocator),
-            .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
+            .type_aliases = runtime.NameHashMap([]const u8).init(allocator),
+            .type_alias_types = runtime.NameHashMap(TypeAliasShape).init(allocator),
+            .type_alias_simple = runtime.NameHashMap(void).init(allocator),
+            .recv_fn_aliases = runtime.NameHashMap(u8).init(allocator),
+            .import_aliases = std.AutoHashMap(FileId, runtime.NameHashMap(std.ArrayList(ImportPath))).init(allocator),
             .import_alias_bloom = std.AutoHashMap(FileId, u64).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
             .file_packages = std.AutoHashMap(FileId, []const u8).init(allocator),
             .file_modules = std.AutoHashMap(FileId, u32).init(allocator),
-            .nested_object_aliases = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
-            .mangled_nested = std.StringHashMap([]const u8).init(allocator),
+            .nested_object_aliases = runtime.NameHashMap(runtime.NameHashMap([]const u8)).init(allocator),
+            .mangled_nested = runtime.NameHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
-            .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
-            .top_level_prop_type_heads = std.StringHashMap([]const u8).init(allocator),
-            .top_level_prop_type_refs = std.StringHashMap(TypeRef).init(allocator),
-            .top_level_prop_init_callees = std.StringHashMap([]const u8).init(allocator),
-            .callable_extension_props = std.StringHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
-            .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
-            .top_level_prop_setters = std.StringHashMap(FuncId).init(allocator),
+            .top_level_prop_pkgs = runtime.NameHashMap(std.ArrayList(PropDecl)).init(allocator),
+            .top_level_prop_type_heads = runtime.NameHashMap([]const u8).init(allocator),
+            .top_level_prop_type_refs = runtime.NameHashMap(TypeRef).init(allocator),
+            .top_level_prop_init_callees = runtime.NameHashMap([]const u8).init(allocator),
+            .callable_extension_props = runtime.NameHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
+            .top_level_prop_getters = runtime.NameHashMap(FuncId).init(allocator),
+            .top_level_prop_setters = runtime.NameHashMap(FuncId).init(allocator),
             .allocator = allocator,
         };
     }

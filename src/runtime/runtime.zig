@@ -11,6 +11,7 @@ const class_mod = @import("class.zig");
 const host_mod = @import("host.zig");
 const output_mod = @import("output.zig");
 const env_mod = @import("env.zig");
+const namehash_mod = @import("names");
 const proc_env_mod = @import("proc_env.zig");
 const clock_mod = @import("clock.zig");
 const float_fmt_mod = @import("float_fmt.zig");
@@ -194,6 +195,14 @@ pub const charUnitsToString = output_mod.charUnitsToString;
 
 pub const Env = env_mod.Env;
 
+pub const hashName = namehash_mod.hashName;
+pub const mixHash = namehash_mod.mixHash;
+pub const eqlName = namehash_mod.eqlName;
+pub const NameContext = namehash_mod.NameContext;
+pub const PrehashedName = namehash_mod.PrehashedName;
+pub const NameHashMap = namehash_mod.NameHashMap;
+pub const NameHashMapUnmanaged = namehash_mod.NameHashMapUnmanaged;
+
 pub const procEnvGetVar = proc_env_mod.getVar;
 pub const procEnvKlioHome = proc_env_mod.klioHome;
 pub const procEnvIsSet = proc_env_mod.isSet;
@@ -261,6 +270,7 @@ test {
     _ = host_mod;
     _ = output_mod;
     _ = env_mod;
+    _ = namehash_mod;
     _ = proc_env_mod;
     _ = clock_mod;
     _ = float_fmt_mod;

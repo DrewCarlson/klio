@@ -26,7 +26,7 @@ const Const = ir.Const;
 const BinOp = ir.BinOp;
 const FuncId = ir.FuncId;
 const Terminator = ir.Terminator;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 const lowerExpr = expr_mod.lowerExpr;
 const lowerReceiver = expr_mod.lowerReceiver;
@@ -524,7 +524,7 @@ const LocalFnCtx = struct {
     outer_names: StringSet = undefined,
     inherited_rlp: StringSet = undefined,
     outer_boxed: StringSet = undefined,
-    inherited_lef: std.StringHashMap(i8) = undefined,
+    inherited_lef: runtime.NameHashMap(i8) = undefined,
     inherited_erp: StringSet = undefined,
     tailrec_self: ?[]const u8 = undefined,
     enclosing_owner: ?lambda_body.EnclosingOwner = undefined,

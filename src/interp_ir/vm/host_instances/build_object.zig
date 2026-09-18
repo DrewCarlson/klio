@@ -41,7 +41,7 @@ const TypeRef = ir.TypeRef;
 const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
 const StrPair = ir.StrPair;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 const AnonMethodEntry = root.AnonMethodEntry;
 const NameValue = root.NameValue;
 
@@ -402,7 +402,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     // is one scope, so an initializer may construct a class declared further down.
     if (!site_built) try host_classes.registerNestedClassMembers(self, allocator, synth_class_name, members);
     // Two same-arity overloads share the `name#arity` key, so each also registers indexed.
-    var overload_seen = std.StringHashMap(usize).init(allocator);
+    var overload_seen = runtime.NameHashMap(usize).init(allocator);
     defer overload_seen.deinit();
     for (members) |*m| {
         switch (m.*) {
@@ -669,9 +669,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
 
     // The ClassDef is site-stable; per-instance captures and fields apply below.
     const class_def = if (site_built) blk: {
-        const g = self.classes.borrow();
-        defer g.deinit();
-        break :blk g.get().get(synth_class_name).?.clone();
+        break :blk host_classes.classDefLookup(self, synth_class_name).?.clone();
     } else blk: {
         var body_props: std.ArrayList(PropertyDef) = .empty;
         for (members) |*m| {
@@ -829,7 +827,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
 
     // Parent primary-param fields from the supertype ctor args. A pre-lowered
     // thunk evaluates in the enclosing scope; the direct path covers literals.
-    var super_args_by_class = std.StringHashMap([]Value).init(allocator);
+    var super_args_by_class = runtime.NameHashMap([]Value).init(allocator);
     defer super_args_by_class.deinit();
     var direct_parent: ?ObjRef(ClassDef) = null;
     defer if (direct_parent) |p| p.deinit();

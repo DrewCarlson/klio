@@ -1099,7 +1099,7 @@ pub fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *c
     const WalkItem = struct { cid: ?ir.ClassId, name: []const u8, hint: []const u8 = "" };
     var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     // Walk the hierarchy by IR class id from the receiver's exact FQN, so a
     // same-simple-name class in another package cannot shadow a method.

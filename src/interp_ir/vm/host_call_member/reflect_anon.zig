@@ -2,6 +2,7 @@
 //! `KFunction` members) and anonymous/local class method dispatch.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
@@ -524,9 +525,7 @@ pub fn localClassTypeParam(self: *VmHost, f: *const ir.Func, ty: *const ir.TypeR
     // params[0] is `this`, typed by the class holding the declared type params.
     if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return false;
     const cls_name = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
-    const cg = self.classes.borrow();
-    defer cg.deinit();
-    const def = cg.get().get(cls_name) orelse return false;
+    const def = host_classes.classDefLookup(self, cls_name) orelse return false;
     const dg = def.borrow();
     defer dg.deinit();
     for (dg.get().type_params) |tp| {

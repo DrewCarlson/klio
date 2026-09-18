@@ -65,14 +65,10 @@ pub const StrPair = struct {
 
 pub const StrPairContext = struct {
     pub fn hash(_: StrPairContext, key: StrPair) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(key.a);
-        h.update(&.{0});
-        h.update(key.b);
-        return h.final();
+        return runtime.mixHash(runtime.hashName(key.a), runtime.hashName(key.b));
     }
     pub fn eql(_: StrPairContext, x: StrPair, y: StrPair) bool {
-        return std.mem.eql(u8, x.a, y.a) and std.mem.eql(u8, x.b, y.b);
+        return runtime.eqlName(x.a, y.a) and runtime.eqlName(x.b, y.b);
     }
 };
 

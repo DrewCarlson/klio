@@ -12,7 +12,7 @@ const Module = ir.Module;
 const Const = ir.Const;
 const Value = runtime.Value;
 const Decl = ast.Decl;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 const build_types = @import("types.zig");
 const FileClasses = build_types.FileClasses;

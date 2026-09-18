@@ -2,6 +2,7 @@
 //! static members, and the enclosing-enum lookup a bare entry name takes.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
 const VmHost = vmhost.VmHost;
@@ -27,9 +28,7 @@ pub fn enumTableClass(cls: runtime.ObjRef(runtime.ClassDef)) @TypeOf(cls.borrow(
 
 pub fn leafStaticMember(self: *VmHost, owner: []const u8, member: []const u8) ?Value {
     const def = blk: {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        break :blk cg.get().get(owner) orelse return null;
+        break :blk host_classes.classDefLookup(self, owner) orelse return null;
     };
     const dg = def.borrow();
     defer dg.deinit();
@@ -151,9 +150,7 @@ pub fn enclosingEnumDef(self: *VmHost, receiver: *const Value) ?runtime.ObjRef(r
             return null;
         };
         const def: ?runtime.ObjRef(runtime.ClassDef) = blk: {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            break :blk if (cg.get().get(enclosing)) |d| d.clone() else null;
+            break :blk if (host_classes.classDefLookup(self, enclosing)) |d| d.clone() else null;
         };
         if (def) |d| {
             const dg = d.borrow();

@@ -2,6 +2,7 @@
 //! behind them, and the enclosing-`this` stack accessors.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
@@ -138,7 +139,7 @@ pub fn hostHasMemberUncached(self: *VmHost, receiver: *const Value, name: []cons
     }
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(a);
-    var seen: std.StringHashMap(void) = .init(a);
+    var seen: runtime.NameHashMap(void) = .init(a);
     defer seen.deinit();
     queue.append(a, cls_name) catch return false;
     var head: usize = 0;
@@ -204,7 +205,7 @@ pub fn hostHasProperty(self: *VmHost, receiver: *const Value, name: []const u8) 
     }
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(a);
-    var seen: std.StringHashMap(void) = .init(a);
+    var seen: runtime.NameHashMap(void) = .init(a);
     defer seen.deinit();
     queue.append(a, cls_name) catch return false;
     var head: usize = 0;
@@ -324,9 +325,7 @@ pub fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []cons
         // An enclosing `object` declaration is itself a singleton in scope here.
         if (head != 0 and classIsObjectDecl(self, cname)) try out.append(allocator, cname);
         {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            if (cg.get().get(cname)) |def| {
+            if (host_classes.classDefLookup(self, cname)) |def| {
                 const dg = def.borrow();
                 defer dg.deinit();
                 for (dg.get().supertype_names) |sn| try queue.append(allocator, sn);
@@ -348,9 +347,7 @@ pub fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []cons
 }
 
 pub fn classIsObjectDecl(self: *VmHost, name: []const u8) bool {
-    const g = self.classes.borrow();
-    defer g.deinit();
-    const d = g.get().get(name) orelse return false;
+    const d = host_classes.classDefLookup(self, name) orelse return false;
     const dg = d.borrow();
     defer dg.deinit();
     return dg.get().is_object and !dg.get().is_anonymous;

@@ -13,7 +13,7 @@ const span = @import("span");
 const Allocator = std.mem.Allocator;
 const KotlinFile = ast.KotlinFile;
 const Decl = ast.Decl;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 const build_base = @import("base.zig");
 const composeBaseComposableGetterProps = build_base.composeBaseComposableGetterProps;
@@ -81,7 +81,7 @@ pub fn buildModuleFilesExtendOwned(allocator: Allocator, base: *const StdlibBase
 pub fn collectUserComposableFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!std.AutoHashMap(ir.FileId, void) {
     var out = std.AutoHashMap(ir.FileId, void).init(allocator);
     errdefer out.deinit();
-    var own_pkgs = std.StringHashMap(void).init(allocator);
+    var own_pkgs = runtime.NameHashMap(void).init(allocator);
     defer own_pkgs.deinit();
     for (files) |*f| {
         const pkg = try packagePrefix(allocator, f.package);
@@ -162,11 +162,11 @@ pub const phase = struct {
 pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl, own_base: bool) Allocator.Error!BuiltModule {
     ir.build.localClassScopeReset();
     const ComposeMaps = struct {
-        names: std.StringHashMap(void),
-        sinks: std.StringHashMap(void),
-        comp_getter_props: std.StringHashMap(void),
-        inline_fns: std.StringHashMap(void),
-        stability: std.StringHashMap(compose_pass.Stability),
+        names: runtime.NameHashMap(void),
+        sinks: runtime.NameHashMap(void),
+        comp_getter_props: runtime.NameHashMap(void),
+        inline_fns: runtime.NameHashMap(void),
+        stability: runtime.NameHashMap(compose_pass.Stability),
 
         fn deinit(self: *@This()) void {
             self.names.deinit();
@@ -328,11 +328,11 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
             .inline_fns = inline_fns,
             .stability = stability,
         };
-        names = std.StringHashMap(void).init(allocator);
-        sinks = std.StringHashMap(void).init(allocator);
-        comp_getter_props = std.StringHashMap(void).init(allocator);
-        inline_fns = std.StringHashMap(void).init(allocator);
-        stability = std.StringHashMap(compose_pass.Stability).init(allocator);
+        names = runtime.NameHashMap(void).init(allocator);
+        sinks = runtime.NameHashMap(void).init(allocator);
+        comp_getter_props = runtime.NameHashMap(void).init(allocator);
+        inline_fns = runtime.NameHashMap(void).init(allocator);
+        stability = runtime.NameHashMap(compose_pass.Stability).init(allocator);
     }
     if (compose_maps) |*maps| {
         compose_pass.active_composable_names = &maps.names;
@@ -361,9 +361,9 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         private_func_renames.deinit();
     }
     {
-        var name_files = std.StringHashMap(u32).init(allocator);
+        var name_files = runtime.NameHashMap(u32).init(allocator);
         defer name_files.deinit();
-        var name_counts = std.StringHashMap(u32).init(allocator);
+        var name_counts = runtime.NameHashMap(u32).init(allocator);
         defer name_counts.deinit();
         for (decls.items) |*d| {
             if (d.* != .Property) continue;
@@ -389,16 +389,16 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
             const fid = p.span.file.int();
             const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ p.name.name, fid });
             const gop = try private_prop_renames.getOrPut(fid);
-            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+            if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap([]const u8).init(allocator);
             try gop.value_ptr.put(p.name.name, mangled);
             p.name = .{ .name = mangled, .span = p.name.span };
         }
         // File-private top-level FUNCTIONS: file-scoped in Kotlin but flat here, so two files
         // declaring `private fun debugLog(...)` read as conflicting overloads without a mangle.
         {
-            var fn_files = std.StringHashMap(u32).init(allocator);
+            var fn_files = runtime.NameHashMap(u32).init(allocator);
             defer fn_files.deinit();
-            var fn_counts = std.StringHashMap(u32).init(allocator);
+            var fn_counts = runtime.NameHashMap(u32).init(allocator);
             defer fn_counts.deinit();
             for (decls.items) |*d| {
                 if (d.* != .Function) continue;
@@ -423,14 +423,14 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
                 const fid = fdec.span.file.int();
                 const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ fdec.name.name, fid });
                 const gop = try private_func_renames.getOrPut(fid);
-                if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap([]const u8).init(allocator);
                 try gop.value_ptr.put(fdec.name.name, mangled);
                 fdec.name = .{ .name = mangled, .span = fdec.name.span };
             }
         }
         // A simple name declared non-privately by two or more packages: each gets its FQN slot.
         const FqnCand = struct { pkg: []const u8, fqn: []const u8 };
-        var fqn_renamed = std.StringHashMap(std.ArrayList(FqnCand)).init(allocator);
+        var fqn_renamed = runtime.NameHashMap(std.ArrayList(FqnCand)).init(allocator);
         defer {
             var it = fqn_renamed.valueIterator();
             while (it.next()) |list| list.deinit(allocator);
@@ -462,7 +462,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
             const fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, simple });
             const fid = p.span.file.int();
             const gop = try private_prop_renames.getOrPut(fid);
-            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+            if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap([]const u8).init(allocator);
             // A file-private decl of the same name wins for its own file's references.
             if (gop.value_ptr.get(simple) == null) try gop.value_ptr.put(simple, fqn);
             const lgop = try fqn_renamed.getOrPut(simple);
@@ -481,7 +481,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
                     const simple = e.key_ptr.*;
                     {
                         const fgop = try private_prop_renames.getOrPut(fid);
-                        if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                        if (!fgop.found_existing) fgop.value_ptr.* = runtime.NameHashMap([]const u8).init(allocator);
                         if (fgop.value_ptr.get(simple) != null) continue;
                     }
                     var pick: ?[]const u8 = null;
@@ -510,7 +510,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
                     }
                     if (pick) |fqn| {
                         const fgop = try private_prop_renames.getOrPut(fid);
-                        if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                        if (!fgop.found_existing) fgop.value_ptr.* = runtime.NameHashMap([]const u8).init(allocator);
                         try fgop.value_ptr.put(simple, fqn);
                     }
                 }
@@ -538,9 +538,9 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         pkg_type_renames.deinit();
     }
     {
-        var name_files = std.StringHashMap(u32).init(allocator);
+        var name_files = runtime.NameHashMap(u32).init(allocator);
         defer name_files.deinit();
-        var name_counts = std.StringHashMap(u32).init(allocator);
+        var name_counts = runtime.NameHashMap(u32).init(allocator);
         defer name_counts.deinit();
         // A name any expect/actual declaration claims is shared by design and never mangles.
         var ea_names = StringSet.init(allocator);
@@ -577,12 +577,12 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
             // file, same-package files, and imports, which resolve by FQN through the fqn override.
             const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ tg.name.name, tg.fid });
             const gop = try file_type_renames.getOrPut(tg.fid);
-            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+            if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap([]const u8).init(allocator);
             try gop.value_ptr.put(tg.name.name, mangled);
             if (tg.vis == .Internal) {
                 if (file_pkgs.get(span.FileId.from(tg.fid))) |pkg| {
                     const pgop = try pkg_type_renames.getOrPut(pkg);
-                    if (!pgop.found_existing) pgop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                    if (!pgop.found_existing) pgop.value_ptr.* = runtime.NameHashMap([]const u8).init(allocator);
                     try pgop.value_ptr.put(tg.name.name, mangled);
                 }
             }

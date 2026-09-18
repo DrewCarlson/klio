@@ -2,6 +2,7 @@
 //! receiver's own storage out to the extension and enclosing-receiver fallbacks.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
@@ -432,9 +433,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                     if (containsStr(seen.items, cn)) break;
                     try seen.append(allocator, cn);
                     const stored_here = blk: {
-                        const cg = self.classes.borrow();
-                        defer cg.deinit();
-                        const def = cg.get().get(cn) orelse break :blk false;
+                        const def = host_classes.classDefLookup(self, cn) orelse break :blk false;
                         const dg = def.borrow();
                         defer dg.deinit();
                         break :blk declaresStored(dg.get(), prop);
@@ -718,9 +717,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
         while (cur) |cn_raw| {
             // A dotted nested supertype registers under a mangled key; canonicalize.
             const cn = canon: {
-                const cg0 = self.classes.borrow();
-                defer cg0.deinit();
-                if (cg0.get().get(cn_raw) != null) break :canon cn_raw;
+                if (host_classes.classDefLookup(self, cn_raw) != null) break :canon cn_raw;
                 break :canon host_call_member.mangledClassKeyOf(self, cn_raw) orelse cn_raw;
             };
             cur = null;
@@ -1076,9 +1073,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                     }
                 }
                 const def: ?ObjRef(ClassDef) = blk: {
-                    const cg = self.classes.borrow();
-                    defer cg.deinit();
-                    if (cg.get().get(fqn)) |d| break :blk d.clone();
+                    if (host_classes.classDefLookup(self, fqn)) |d| break :blk d.clone();
                     break :blk null;
                 };
                 if (def) |d| return ok(.{ .Class = d });

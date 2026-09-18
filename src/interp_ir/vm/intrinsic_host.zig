@@ -4,6 +4,7 @@
 //! into the vtable by `vmhost.zig`; each transient `VmHost` shares live program state.
 
 const std = @import("std");
+const host_classes = @import("host_classes.zig");
 const stdlib = @import("stdlib");
 
 const ir = @import("ir");

@@ -149,7 +149,7 @@ pub fn findClassInHierarchy(self: *VmHost, allocator: Allocator, receiver: *cons
     const WalkItem = struct { cid: ?ir.ClassId, name: []const u8, hint: []const u8 = "" };
     var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     const start_cid: ?ir.ClassId = blk: {
         const mg = self.module.borrow();
@@ -191,7 +191,7 @@ pub fn findClassInHierarchy(self: *VmHost, allocator: Allocator, receiver: *cons
 /// The FQNs at or above `start_cid`, the classes a member must be declared on to
 /// be visible from the static receiver type; one declared elsewhere in the
 /// runtime hierarchy is invisible unless it overrides a visible member.
-pub fn ancestorClosureFqns(self: *VmHost, allocator: Allocator, start_cid: ir.ClassId, out: *std.StringHashMap(void)) Allocator.Error!void {
+pub fn ancestorClosureFqns(self: *VmHost, allocator: Allocator, start_cid: ir.ClassId, out: *runtime.NameHashMap(void)) Allocator.Error!void {
     var queue: std.ArrayList(ir.ClassId) = .empty;
     defer queue.deinit(allocator);
     try queue.append(allocator, start_cid);
@@ -263,7 +263,7 @@ pub fn classByNamePreferring(mod: *const Module, want: []const u8, hint_fqn: []c
 pub fn closureHasGenericMethod(self: *VmHost, allocator: Allocator, start_cid: ir.ClassId, name: []const u8, tvc: usize) Allocator.Error!bool {
     var queue: std.ArrayList(ir.ClassId) = .empty;
     defer queue.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     try queue.append(allocator, start_cid);
     var head: usize = 0;
@@ -298,7 +298,7 @@ pub fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *con
     const inst = receiver.Instance;
     // A call carrying a static receiver type resolves in that type's member scope,
     // so the closure excludes a subtype candidate overriding nothing visible there.
-    var static_up: std.StringHashMap(void) = .init(allocator);
+    var static_up: runtime.NameHashMap(void) = .init(allocator);
     defer static_up.deinit();
     var static_up_ready = false;
     var static_cid: ir.ClassId = undefined;
@@ -329,7 +329,7 @@ pub fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *con
     const WalkItem = struct { cid: ?ir.ClassId, name: []const u8, hint: []const u8 = "", runtime_only: bool = false };
     var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     // Start from the IR class id keyed by exact FQN and walk by resolved supertype
     // id, so a same-simple-name class in another package can never shadow it.

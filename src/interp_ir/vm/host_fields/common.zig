@@ -11,6 +11,7 @@ const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const host_globals = @import("../host_globals.zig");
 const host_call_member = @import("../host_call_member.zig");
+const host_classes = @import("../host_classes.zig");
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ValueList = runtime.ValueList;
@@ -187,9 +188,7 @@ pub fn lookupPairFunc(map: anytype, a: []const u8, b: []const u8) ?FuncId {
 pub fn lookupPairFuncHop(self: *VmHost, map: anytype, cn: []const u8, b: []const u8) ?FuncId {
     if (map.get(.{ .a = cn, .b = b })) |f| return f;
     const fqn: ?[]const u8 = blk: {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        const d = cg.get().get(cn) orelse break :blk null;
+        const d = host_classes.classDefLookup(self, cn) orelse break :blk null;
         const dg = d.borrow();
         defer dg.deinit();
         break :blk dg.get().fqn;
@@ -249,10 +248,10 @@ pub fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, f
         .host = ih.intrinsicHost(),
         .allocator = allocator,
     };
-    const prev_fqn_lt = runtime.leaktrack.current_fqn;
-    runtime.leaktrack.current_fqn = fqn;
+    const prev_fqn_lt = runtime.leaktrack.currentFqn();
+    runtime.leaktrack.setCurrentFqn(fqn);
     const r = try func(&ctx);
-    runtime.leaktrack.current_fqn = prev_fqn_lt;
+    runtime.leaktrack.setCurrentFqn(prev_fqn_lt);
     return switch (r) {
         .ok => |v| ok(v),
         .err => |e| switch (e) {
@@ -382,21 +381,15 @@ pub fn companionSimpleName(mangled: []const u8) []const u8 {
 }
 
 pub fn firstSupertype(self: *VmHost, cn: []const u8) ?[]const u8 {
-    {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(cn)) |d| {
-            const dg = d.borrow();
-            defer dg.deinit();
-            const sts = dg.get().supertype_names;
-            return if (sts.len > 0) sts[0] else null;
-        }
+    if (host_classes.classDefLookup(self, cn)) |d| {
+        const dg = d.borrow();
+        defer dg.deinit();
+        const sts = dg.get().supertype_names;
+        return if (sts.len > 0) sts[0] else null;
     }
     // A dotted nested name may register under its lifted mangled key.
     if (host_call_member.mangledClassKeyOf(self, cn)) |m| {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(m)) |d| {
+        if (host_classes.classDefLookup(self, m)) |d| {
             const dg = d.borrow();
             defer dg.deinit();
             const sts = dg.get().supertype_names;

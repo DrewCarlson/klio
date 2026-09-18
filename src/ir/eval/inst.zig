@@ -707,7 +707,13 @@ fn gfSlowCensusOn() bool {
 
 const POLY_FIELD_SLOTS: usize = 1 << 14;
 
-const PolyFieldEnt = struct { key: u64 = 0, route: u64 = 0 };
+/// Reads a recorded field-route decline answers before re-asking the host.
+const POLY_FIELD_MISS_TTL: u16 = 63;
+
+/// A polymorphic field route, or a recorded decline. The (class, name) memo the
+/// route reads fills lazily, so a decline recorded on the first reads of a site
+/// would otherwise stand for the program's life; `miss_ttl` re-asks periodically.
+const PolyFieldEnt = struct { key: u64 = 0, route: u64 = 0, miss_ttl: u16 = 0 };
 
 /// The site caches below, one copy per thread; see `runtime.tls_fast.PerThread`.
 const SiteCaches = struct {
@@ -727,11 +733,18 @@ fn polyFieldRoute(comptime H: type, host: *H, site: usize, cls: u64, recv: *cons
     const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
     const key = polyFieldKey(site, cls ^ (gen *% 0x51_7C_C1_B7_27_22_0A_95));
     const slot = &site_caches.get().poly_field[@as(usize, @intCast(key >> 17)) & (POLY_FIELD_SLOTS - 1)];
-    if (slot.key == key) return if (slot.route == 0) null else slot.route;
+    if (slot.key == key) {
+        if (slot.route != 0) return slot.route;
+        if (slot.miss_ttl > 0) {
+            slot.miss_ttl -= 1;
+            return null;
+        }
+    }
     const r = host.fieldSiteRoute(recv, name);
     const route: u64 = if (r) |rr| (if (rr.cls == cls) rr.route else 0) else 0;
     slot.key = key;
     slot.route = route;
+    slot.miss_ttl = if (route == 0) POLY_FIELD_MISS_TTL else 0;
     return if (route == 0) null else route;
 }
 
@@ -1100,7 +1113,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         const want = w0;
         if (constStr(frame.module, cm.name)) |nm| {
             if (std.mem.eql(u8, nm, want)) {
-                const chain = ev_state.evtls.active_chain;
+                const chain = ev_state.evtlsPtr().active_chain;
                 const drecv_tn: []const u8 = if (cm.x().dispatch_receiver) |reg| blk: {
                     const dv = frame.read(reg);
                     if (dv == .Instance) {
@@ -1119,7 +1132,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                     cm.x().resolved != null,
                     drecv_tn,
                     if (chain) |c| c.items.len else 0,
-                    ev_state.evtls.active_chain_base,
+                    ev_state.evtlsPtr().active_chain_base,
                 });
                 if (chain) |c| {
                     for (c.items, 0..) |e, i| {

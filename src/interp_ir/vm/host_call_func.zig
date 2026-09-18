@@ -2,6 +2,7 @@
 //! named args, type args, and overloads. Aliased as `VmHost` methods by `vmhost.zig`.
 
 const std = @import("std");
+const host_classes = @import("host_classes.zig");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -294,9 +295,7 @@ pub fn reifiedFromFrame(self: *VmHost, allocator: Allocator, name: []const u8) ?
                 const fqn = v.typeFqn();
                 const head = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
                 {
-                    const cg = self.classes.borrow();
-                    defer cg.deinit();
-                    if (cg.get().get(head)) |c| return Value{ .Class = c.clone() };
+                    if (host_classes.classDefLookup(self, head)) |c| return Value{ .Class = c.clone() };
                 }
                 return host_call_member.syntheticClassFromFqn(allocator, fqn) catch null;
             },
@@ -418,9 +417,7 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             var ok_walk = true;
             while (segs.next()) |seg| {
                 if (cur == null) {
-                    const cg = self.classes.borrow();
-                    defer cg.deinit();
-                    cur = cg.get().get(seg);
+                    cur = host_classes.classDefLookup(self, seg);
                     if (cur == null) {
                         // The root may itself be nested in an executing receiver.
                         var it0 = ir.eval.frameThisChainIter();
@@ -573,10 +570,10 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .host = intrinsic.intrinsicHost(),
         .allocator = allocator,
     };
-    const prev_fqn_lt = runtime.leaktrack.current_fqn;
-    runtime.leaktrack.current_fqn = fqn;
+    const prev_fqn_lt = runtime.leaktrack.currentFqn();
+    runtime.leaktrack.setCurrentFqn(fqn);
     const r = try func(&ctx);
-    runtime.leaktrack.current_fqn = prev_fqn_lt;
+    runtime.leaktrack.setCurrentFqn(prev_fqn_lt);
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = runtimeErrorToEval(allocator, e) },
@@ -1376,9 +1373,7 @@ threadlocal var bodyless_active: [32]struct { fid: u32, ident: u64 } = undefined
 threadlocal var bodyless_active_len: usize = 0;
 
 fn ownerIsFunInterface(self: *VmHost, class_name: []const u8) bool {
-    const g = self.classes.borrow();
-    defer g.deinit();
-    const d = g.get().get(class_name) orelse return false;
+    const d = host_classes.classDefLookup(self, class_name) orelse return false;
     const dg = d.borrow();
     defer dg.deinit();
     return dg.get().is_fun_interface;
@@ -1810,9 +1805,7 @@ fn extRecvDisprovenByValue(self: *VmHost, ty: *const TypeRef, v: *const Value) b
     if (std.mem.startsWith(u8, head, "Function")) return false;
     if (v.* != .Instance) return false;
     {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(head) == null) return false;
+        if (host_classes.classDefLookup(self, head) == null) return false;
     }
     return !host_call_member.receiverImplementsHead(self, v, head);
 }
@@ -2318,9 +2311,7 @@ pub fn prepareTypedFlatCall(self: *VmHost, allocator: Allocator, module: *const 
             const cls_value: ?Value = if (typeArgUnbound(arg_name, names))
                 (inferTypeArgFromArgs(self, allocator, f, type_name, call_args.items) orelse continue)
             else blk: {
-                const cg = self.classes.borrow();
-                defer cg.deinit();
-                if (cg.get().get(arg_name)) |c| break :blk Value{ .Class = c.clone() };
+                if (host_classes.classDefLookup(self, arg_name)) |c| break :blk Value{ .Class = c.clone() };
                 break :blk host_globals.lookupGlobal(self, arg_name);
             };
             const prev = blk: {
@@ -2597,9 +2588,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
             const rf = funcAt(module, resolved) orelse break :blk null;
             break :blk inferTypeArgFromArgs(self, allocator, rf, type_name, args);
         } else blk: {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            if (cg.get().get(arg_name)) |c| break :blk Value{ .Class = c.clone() };
+            if (host_classes.classDefLookup(self, arg_name)) |c| break :blk Value{ .Class = c.clone() };
             break :blk host_globals.lookupGlobal(self, arg_name);
         };
         if (cls_value == null and arg_full.len == 0) continue;

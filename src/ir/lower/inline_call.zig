@@ -52,7 +52,7 @@ pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocato
             };
             // Tally concrete return types across the same-name overloads and pick
             // the most common; `Unit`, a bare type parameter, and a tie answer none.
-            var tally = std.StringHashMap(usize).init(b.allocator);
+            var tally = runtime.NameHashMap(usize).init(b.allocator);
             defer tally.deinit();
             for (b.module.funcsBySimpleName(name)) |fid| {
                 const f = b.module.funcById(fid) orelse continue;
@@ -865,9 +865,9 @@ fn inheritedLambdaSubst(
     b: *FuncBuilder,
     lam: *const Expr,
     defining_frame: ?usize,
-) Allocator.Error!std.StringHashMap(*const ast.Expr) {
+) Allocator.Error!runtime.NameHashMap(*const ast.Expr) {
     const params = lam.Lambda.params;
-    var inherited_subst = std.StringHashMap(*const ast.Expr).init(b.allocator);
+    var inherited_subst = runtime.NameHashMap(*const ast.Expr).init(b.allocator);
     if (defining_frame) |di| {
         if (di > 0) {
             var dit = b.inline_lambda_subst.items[di - 1].subst.iterator();
@@ -1034,7 +1034,7 @@ const SplicedLambdaReturn = struct {
 
 fn openSplicedLambdaReturn(
     b: *FuncBuilder,
-    inherited_subst: std.StringHashMap(*const ast.Expr),
+    inherited_subst: runtime.NameHashMap(*const ast.Expr),
     owner_ret: ?[]InlineReturn,
 ) Allocator.Error!SplicedLambdaReturn {
     try b.pushInlineLambdaFrame(inherited_subst, b.scopeDepth());
@@ -1339,12 +1339,12 @@ fn inferReifiedTypeArgsRecv(
     }
     if (!needs_infer) return out;
 
-    var tp_names = std.StringHashMap(void).init(allocator);
+    var tp_names = runtime.NameHashMap(void).init(allocator);
     defer tp_names.deinit();
     for (f.type_params) |tp| {
         try tp_names.put(tp.name.name, {});
     }
-    var subst = std.StringHashMap(TypeRef).init(allocator);
+    var subst = runtime.NameHashMap(TypeRef).init(allocator);
     defer subst.deinit();
 
     // Unify each declared value-parameter type against its actual argument, so a
@@ -1487,8 +1487,8 @@ pub fn argsBindAllReified(allocator: Allocator, name: []const u8, args: []const 
 fn unifySplicedParamArg(
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
     bb: ?*const FuncBuilder,
 ) Allocator.Error!bool {
     if (arg.* == .Path and arg.Path.segments.len == 1) {
@@ -1542,8 +1542,8 @@ fn unifySplicedParamArg(
 fn unifyFunctionTypedParam(
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
 ) Allocator.Error!bool {
     if (param_ty.function) |ft| {
         if (arg.* == .Lambda) {
@@ -1585,8 +1585,8 @@ fn unifyBareTypeParam(
     allocator: Allocator,
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
     bb: ?*const FuncBuilder,
 ) Allocator.Error!bool {
     // The parameter is a type parameter (`cause: T`), and its argument's own type
@@ -1620,8 +1620,8 @@ fn unifyGenericClassParam(
     allocator: Allocator,
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
     bb: ?*const FuncBuilder,
 ) Allocator.Error!bool {
     // A generic-class parameter against an argument the call derivation can type
@@ -1654,8 +1654,8 @@ fn unifySerializerFactoryParam(
     allocator: Allocator,
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
 ) Allocator.Error!bool {
     // A companion serializer-factory argument against a `KSerializer<T>` parameter
     // solves `T` from the receiver, the generated factory returning the
@@ -1711,8 +1711,8 @@ fn unifySerializerFactoryParam(
 fn unifyClassLiteralParam(
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
 ) Allocator.Error!bool {
     // A class-literal argument against a `KClass<T>` parameter solves `T = C`.
     if (param_ty.type_args.len == 1 and !param_ty.type_args[0].is_star and
@@ -1749,8 +1749,8 @@ fn unifyTypeArgumentsAgainstArg(
     allocator: Allocator,
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
     bb: ?*const FuncBuilder,
 ) Allocator.Error!bool {
     if (param_ty.type_args.len != 0) {
@@ -1796,8 +1796,8 @@ fn unifyParamAgainstArg(
     allocator: Allocator,
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
     bb: ?*const FuncBuilder,
 ) Allocator.Error!void {
     // An argument naming an enclosing splice's parameter carries that parameter's
@@ -2196,8 +2196,8 @@ fn argDeclSupertypeMatching(arg: *const Expr, want: []const u8, bb: ?*const Func
 fn unifyLoweredTypeParam(
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
     bb: ?*const FuncBuilder,
 ) Allocator.Error!void {
     const b = bb orelse return;
@@ -2230,8 +2230,8 @@ fn unifyLoweredTypeParam(
 fn declTypeSupertypeBind(
     param_ty: *const TypeRef,
     arg: *const Expr,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
     bb: ?*const FuncBuilder,
 ) Allocator.Error!void {
     const b = bb orelse return;
@@ -2381,8 +2381,8 @@ fn cloneAstTypeRef(alloc: std.mem.Allocator, t: ast.TypeRef) std.mem.Allocator.E
 fn unifyTypeParam(
     decl: *const TypeRef,
     actual: *const TypeRef,
-    tp_names: *const std.StringHashMap(void),
-    subst: *std.StringHashMap(TypeRef),
+    tp_names: *const runtime.NameHashMap(void),
+    subst: *runtime.NameHashMap(TypeRef),
 ) Allocator.Error!void {
     if (decl.type_args.len == 0 and tp_names.contains(decl.name.name)) {
         // A star projection binds nothing.
@@ -3177,7 +3177,7 @@ const InlineArgBind = struct {
     explicit_receiver: ?Reg,
     splice_boxed: *const ast_scan.StringSet,
     arg_regs: []Reg,
-    lambda_map: *std.StringHashMap(*const ast.Expr),
+    lambda_map: *runtime.NameHashMap(*const ast.Expr),
     param_ty_saves: *std.ArrayList(PTySave),
     bound_param_names: *std.ArrayList([]const u8),
     boxed_here: *std.ArrayList([]const u8),
@@ -3507,7 +3507,7 @@ fn markInlineGenericTypedParams(
     marked_generic: *std.ArrayList([]const u8),
 ) Allocator.Error!void {
     if (f.type_params.len != 0) {
-        var tp_names = std.StringHashMap(void).init(b.allocator);
+        var tp_names = runtime.NameHashMap(void).init(b.allocator);
         defer tp_names.deinit();
         for (f.type_params) |tp| {
             try tp_names.put(tp.name.name, {});
@@ -3738,7 +3738,7 @@ const NameRestore = struct { name: []const u8, prev: ?[]const u8 };
 /// every substituted lambda is forwarded, inherit that frame's provenance.
 fn pushSpliceLambdaFrame(
     b: *FuncBuilder,
-    lambda_map: std.StringHashMap(*const ast.Expr),
+    lambda_map: runtime.NameHashMap(*const ast.Expr),
     caller_scope_depth: *usize,
     prev_hint_active: bool,
     prev_hint_recv: ?[]const u8,
@@ -4061,7 +4061,7 @@ pub fn tryInlineCallWithTypeArgs(
     var splice_boxed = ast_scan.StringSet.init(b.allocator);
     defer splice_boxed.deinit();
     try computeSpliceBoxedNames(b, f, body, &splice_boxed);
-    var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
+    var lambda_map = runtime.NameHashMap(*const ast.Expr).init(b.allocator);
     const arg_regs = try b.allocator.alloc(Reg, f.params.len);
     defer b.allocator.free(arg_regs);
     // The caller's emitter computed instantiated expected param types per argument
@@ -4614,7 +4614,7 @@ test "inline lambda forwarding preserves the original literal" {
         .span = dummySpan(),
     };
     var lambda = Expr{ .Lambda = &lam_node_4626 };
-    var substitutions = std.StringHashMap(*const ast.Expr).init(testing.allocator);
+    var substitutions = runtime.NameHashMap(*const ast.Expr).init(testing.allocator);
     try substitutions.put("block", &lambda);
     try b.pushInlineLambdaFrame(substitutions, b.scopeDepth());
     defer b.popInlineLambdaFrame();
@@ -4638,10 +4638,10 @@ fn typeRef(name: []const u8) TypeRef {
 }
 
 test "unify_type_param binds a bare type parameter" {
-    var tp_names = std.StringHashMap(void).init(testing.allocator);
+    var tp_names = runtime.NameHashMap(void).init(testing.allocator);
     defer tp_names.deinit();
     try tp_names.put("T", {});
-    var subst = std.StringHashMap(TypeRef).init(testing.allocator);
+    var subst = runtime.NameHashMap(TypeRef).init(testing.allocator);
     defer subst.deinit();
     const decl = typeRef("T");
     const actual = typeRef("User");
@@ -4651,10 +4651,10 @@ test "unify_type_param binds a bare type parameter" {
 }
 
 test "unify_type_param recurses through generic args" {
-    var tp_names = std.StringHashMap(void).init(testing.allocator);
+    var tp_names = runtime.NameHashMap(void).init(testing.allocator);
     defer tp_names.deinit();
     try tp_names.put("T", {});
-    var subst = std.StringHashMap(TypeRef).init(testing.allocator);
+    var subst = runtime.NameHashMap(TypeRef).init(testing.allocator);
     defer subst.deinit();
     // decl: Box<T> ; actual: Box<Int> ; solves T = Int.
     var decl_args = [_]ast.TypeArg{.{

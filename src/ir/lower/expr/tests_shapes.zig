@@ -2,6 +2,7 @@
 //! and call emission.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("../../ir.zig");
 const build = @import("../../build.zig");
@@ -14,7 +15,7 @@ const UnOp = ir.UnOp;
 const FuncId = ir.FuncId;
 const BlockId = ir.BlockId;
 const Func = ir.Func;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 const testing = std.testing;
 
 const expr_mod = @import("../expr.zig");
@@ -551,9 +552,9 @@ test "selected composable parameters bind named and trailing lambdas exactly" {
         .extra = &ir.FuncExtra{ .annotation_names = &.{"Composable"} },
     });
 
-    var composable_names = std.StringHashMap(void).init(a);
+    var composable_names = runtime.NameHashMap(void).init(a);
     try composable_names.put("TopAppBar", {});
-    var sinks = std.StringHashMap(void).init(a);
+    var sinks = runtime.NameHashMap(void).init(a);
     compose_pass.active_composable_names = &composable_names;
     defer compose_pass.active_composable_names = null;
     compose_pass.active_composable_sinks = &sinks;
@@ -1278,7 +1279,7 @@ test "renamed overloaded import binds exact extension and plain identities" {
     var paths: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
     const import_segs = try a.dupe([]const u8, &.{ "sample", "combine" });
     try paths.append(a, .{ .fqn = try a.dupe(u8, "sample.combine"), .segs = import_segs });
-    var imports = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+    var imports = runtime.NameHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
     try imports.put("combineOriginal", paths);
     try m.registry.import_aliases.put(sp.file, imports);
     {
@@ -1298,7 +1299,7 @@ test "renamed overloaded import binds exact extension and plain identities" {
         .companion = null,
         .supertypes = &.{},
     });
-    const string_names = std.StringHashMap(void).init(a);
+    const string_names = runtime.NameHashMap(void).init(a);
     try m.registry.hierarchy_shadow_names.put("String", .{
         .names = string_names,
         .complete = true,

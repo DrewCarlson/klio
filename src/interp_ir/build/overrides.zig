@@ -26,7 +26,7 @@ const ObjRef = runtime.ObjRef;
 const Value = runtime.Value;
 const KotlinFile = ast.KotlinFile;
 const Decl = ast.Decl;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 const build_base = @import("base.zig");
 const parentCtorParamExpected = build_base.parentCtorParamExpected;
@@ -138,8 +138,8 @@ pub const BuildCtx = struct {
     mangled_nested: lift.MangledMap,
     all_decls: std.ArrayList(Decl),
     /// Superseded `expect class` shapes, kept for the default transplant.
-    expect_class_ctor_params: std.StringHashMap([]const ast.ClassParam),
-    expect_class_members: std.StringHashMap([]const Decl),
+    expect_class_ctor_params: runtime.NameHashMap([]const ast.ClassParam),
+    expect_class_members: runtime.NameHashMap([]const Decl),
 
     decls: []Decl,
     /// Set for a build whose bodies are deferred; the context then outlives the call.
@@ -153,30 +153,30 @@ pub const BuildCtx = struct {
 
     main_id: ?FuncId,
     classes: ClassTable,
-    companion_singletons: std.StringHashMap([]const u8),
+    companion_singletons: runtime.NameHashMap([]const u8),
     enclosing_class: lift.EnclosingMap,
     body_prop_inits: PairFuncMap,
     instance_prop_getters: PairFuncMap,
-    getter_prop_names: std.StringHashMap(void),
+    getter_prop_names: runtime.NameHashMap(void),
     instance_prop_setters: PairFuncMap,
     instance_prop_private: PairFuncMap,
     delegated_body_props: StrPairSet,
-    primary_ctor_default_thunks: std.StringHashMap([]?FuncId),
-    parent_ctor_args: std.StringHashMap([]FuncId),
-    parent_ctor_arg_names: std.StringHashMap([]const ?[]const u8),
-    init_blocks: std.StringHashMap([]FuncId),
+    primary_ctor_default_thunks: runtime.NameHashMap([]?FuncId),
+    parent_ctor_args: runtime.NameHashMap([]FuncId),
+    parent_ctor_arg_names: runtime.NameHashMap([]const ?[]const u8),
+    init_blocks: runtime.NameHashMap([]FuncId),
     top_level_props: std.ArrayList(NameFunc),
-    top_level_delegated_props: std.StringHashMap(void),
+    top_level_delegated_props: runtime.NameHashMap(void),
     extension_props: PairFuncMap,
-    owner_keyed_ext_names: std.StringHashMap(void),
-    nullable_ext_props: std.StringHashMap(?FuncId),
+    owner_keyed_ext_names: runtime.NameHashMap(void),
+    nullable_ext_props: runtime.NameHashMap(?FuncId),
     extension_prop_setters: PairFuncMap,
     extension_prop_delegates: PairFuncMap,
     enum_entry_arg_inits: std.ArrayList(EnumEntryArgInit),
     enum_entry_methods: std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage),
     enum_entry_synth_class: PairStrMap,
-    secondary_ctors: std.StringHashMap([]SecondaryCtorEntry),
-    class_delegates: std.StringHashMap([]StrFunc),
+    secondary_ctors: runtime.NameHashMap([]SecondaryCtorEntry),
+    class_delegates: runtime.NameHashMap([]StrFunc),
     func_defaults: std.AutoHashMap(u32, []?FuncId),
     func_type_params: std.AutoHashMap(u32, [][]const u8),
 
@@ -223,7 +223,7 @@ pub const BuildCtx = struct {
             // nested shapes; inner maps are deep-copied, the lift appending per class key.
             var it = module.registry.nested_object_aliases.iterator();
             while (it.next()) |e| {
-                var inner = std.StringHashMap([]const u8).init(a);
+                var inner = runtime.NameHashMap([]const u8).init(a);
                 var iit = e.value_ptr.iterator();
                 while (iit.next()) |ie| try inner.put(ie.key_ptr.*, ie.value_ptr.*);
                 try nested_object_aliases.put(e.key_ptr.*, inner);
@@ -256,38 +256,38 @@ pub const BuildCtx = struct {
             .nested_object_aliases = nested_object_aliases,
             .mangled_nested = mangled_nested,
             .all_decls = .empty,
-            .expect_class_ctor_params = std.StringHashMap([]const ast.ClassParam).init(a),
-            .expect_class_members = std.StringHashMap([]const Decl).init(a),
+            .expect_class_ctor_params = runtime.NameHashMap([]const ast.ClassParam).init(a),
+            .expect_class_members = runtime.NameHashMap([]const Decl).init(a),
             .decls = &.{},
             .file_classes = FileClasses.init(a),
             .stub_ids = .empty,
             .new_defs = .empty,
             .main_id = null,
             .classes = if (seed) |*s| s.classes else ClassTable.init(a),
-            .companion_singletons = if (seed) |*s| s.companion_singletons else std.StringHashMap([]const u8).init(a),
+            .companion_singletons = if (seed) |*s| s.companion_singletons else runtime.NameHashMap([]const u8).init(a),
             .enclosing_class = if (seed) |*s| s.enclosing_class else lift.EnclosingMap.init(a),
             .body_prop_inits = if (seed) |*s| s.body_prop_inits else PairFuncMap.init(a),
             .instance_prop_getters = if (seed) |*s| s.instance_prop_getters else PairFuncMap.init(a),
-            .getter_prop_names = if (seed) |*s| s.getter_prop_names else std.StringHashMap(void).init(a),
+            .getter_prop_names = if (seed) |*s| s.getter_prop_names else runtime.NameHashMap(void).init(a),
             .instance_prop_setters = if (seed) |*s| s.instance_prop_setters else PairFuncMap.init(a),
             .instance_prop_private = if (seed) |*s| s.instance_prop_private else PairFuncMap.init(a),
             .delegated_body_props = if (seed) |*s| s.delegated_body_props else StrPairSet.init(a),
-            .primary_ctor_default_thunks = if (seed) |*s| s.primary_ctor_default_thunks else std.StringHashMap([]?FuncId).init(a),
-            .parent_ctor_args = if (seed) |*s| s.parent_ctor_args else std.StringHashMap([]FuncId).init(a),
-            .parent_ctor_arg_names = if (seed) |*s| s.parent_ctor_arg_names else std.StringHashMap([]const ?[]const u8).init(a),
-            .init_blocks = if (seed) |*s| s.init_blocks else std.StringHashMap([]FuncId).init(a),
+            .primary_ctor_default_thunks = if (seed) |*s| s.primary_ctor_default_thunks else runtime.NameHashMap([]?FuncId).init(a),
+            .parent_ctor_args = if (seed) |*s| s.parent_ctor_args else runtime.NameHashMap([]FuncId).init(a),
+            .parent_ctor_arg_names = if (seed) |*s| s.parent_ctor_arg_names else runtime.NameHashMap([]const ?[]const u8).init(a),
+            .init_blocks = if (seed) |*s| s.init_blocks else runtime.NameHashMap([]FuncId).init(a),
             .top_level_props = if (seed) |*s| s.top_level_props else .empty,
-            .top_level_delegated_props = if (seed) |*s| s.top_level_delegated_props else std.StringHashMap(void).init(a),
+            .top_level_delegated_props = if (seed) |*s| s.top_level_delegated_props else runtime.NameHashMap(void).init(a),
             .extension_props = if (seed) |*s| s.extension_props else PairFuncMap.init(a),
-            .owner_keyed_ext_names = if (seed) |*s| s.owner_keyed_ext_names else std.StringHashMap(void).init(a),
-            .nullable_ext_props = if (seed) |*s| s.nullable_ext_props else std.StringHashMap(?FuncId).init(a),
+            .owner_keyed_ext_names = if (seed) |*s| s.owner_keyed_ext_names else runtime.NameHashMap(void).init(a),
+            .nullable_ext_props = if (seed) |*s| s.nullable_ext_props else runtime.NameHashMap(?FuncId).init(a),
             .extension_prop_setters = if (seed) |*s| s.extension_prop_setters else PairFuncMap.init(a),
             .extension_prop_delegates = if (seed) |*s| s.extension_prop_delegates else PairFuncMap.init(a),
             .enum_entry_arg_inits = if (seed) |*s| s.enum_entry_arg_inits else .empty,
             .enum_entry_methods = if (seed) |*s| s.enum_entry_methods else std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage).init(a),
             .enum_entry_synth_class = if (seed) |*s| s.enum_entry_synth_class else PairStrMap.init(a),
-            .secondary_ctors = if (seed) |*s| s.secondary_ctors else std.StringHashMap([]SecondaryCtorEntry).init(a),
-            .class_delegates = if (seed) |*s| s.class_delegates else std.StringHashMap([]StrFunc).init(a),
+            .secondary_ctors = if (seed) |*s| s.secondary_ctors else runtime.NameHashMap([]SecondaryCtorEntry).init(a),
+            .class_delegates = if (seed) |*s| s.class_delegates else runtime.NameHashMap([]StrFunc).init(a),
             .func_defaults = if (seed) |*s| s.func_defaults else std.AutoHashMap(u32, []?FuncId).init(a),
             .func_type_params = if (seed) |*s| s.func_type_params else std.AutoHashMap(u32, [][]const u8).init(a),
         };
@@ -575,7 +575,7 @@ fn liftFileDecls(ctx: *BuildCtx) Allocator.Error!void {
     }
 
     // package -> set of pack class/object simple names declared in it.
-    var pack_pkg_types = std.StringHashMap(StringSet).init(a);
+    var pack_pkg_types = runtime.NameHashMap(StringSet).init(a);
     defer {
         var it = pack_pkg_types.valueIterator();
         while (it.next()) |s| s.deinit();
@@ -656,7 +656,7 @@ fn liftFileDecls(ctx: *BuildCtx) Allocator.Error!void {
 
     for (pending_object_aliases.items) |pa| {
         const gop = try nested_object_aliases.getOrPut(pa.cls);
-        if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(a);
+        if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap([]const u8).init(a);
         try gop.value_ptr.put(pa.simple, pa.mangled);
     }
 }
@@ -667,7 +667,7 @@ fn liftTopLevelObject(
     o: *ast.ObjectDecl,
     actual_object_names: *const StringSet,
     user_top_type_names: *const StringSet,
-    pack_pkg_types: *const std.StringHashMap(StringSet),
+    pack_pkg_types: *const runtime.NameHashMap(StringSet),
     pending_object_aliases: *std.ArrayList(PendingAlias),
 ) Allocator.Error!void {
     const a = ctx.a;
@@ -1367,7 +1367,7 @@ fn installLiftedNameTables(ctx: *BuildCtx) Allocator.Error!void {
     {
         var it = nested_object_aliases.iterator();
         while (it.next()) |e| {
-            var inner = std.StringHashMap([]const u8).init(a);
+            var inner = runtime.NameHashMap([]const u8).init(a);
             var iit = e.value_ptr.iterator();
             while (iit.next()) |ie| try inner.put(ie.key_ptr.*, ie.value_ptr.*);
             try module.registry.nested_object_aliases.put(e.key_ptr.*, inner);
@@ -1454,7 +1454,7 @@ fn installInlineFnTables(ctx: *BuildCtx) Allocator.Error!void {
     // process heap while keys and value slices stay in the build arena.
     const tl = runtime.slab.allocator;
     {
-        var inline_fns = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(a);
+        var inline_fns = runtime.NameHashMap(std.ArrayList(FF(ast.Function))).init(a);
         // Base inline fns first, preserving whole-program declaration order per overload list.
         if (base) |bs| {
             if (bs.inline_by_name.len != 0) {
@@ -1468,7 +1468,7 @@ fn installInlineFnTables(ctx: *BuildCtx) Allocator.Error!void {
             }
         }
         for (decls) |*d| try collectInline(a, d, &inline_fns);
-        var frozen = std.StringHashMap([]const FF(ast.Function)).init(tl);
+        var frozen = runtime.NameHashMap([]const FF(ast.Function)).init(tl);
         var it = inline_fns.iterator();
         while (it.next()) |e| {
             try frozen.put(e.key_ptr.*, try e.value_ptr.toOwnedSlice(a));
@@ -1486,7 +1486,7 @@ fn installInlineFnTables(ctx: *BuildCtx) Allocator.Error!void {
 
         // Default-import host bindings shadow same-simple-name inline fns. The name domain comes from
         // `stdlib.noteBareNameMapping`, so the answer has one source.
-        var owned = std.StringHashMap([]const u8).init(a);
+        var owned = runtime.NameHashMap([]const u8).init(a);
         defer owned.deinit();
         var fqn_it = stdlib.implementations.allFqns();
         while (fqn_it.next()) |fqn| {
@@ -1580,7 +1580,7 @@ fn registerFileImports(ctx: *BuildCtx) Allocator.Error!void {
         }
         const leaf = if (imp.alias) |al| al.name else imp.path[imp.path.len - 1].name;
         const fgop = try module.registry.import_aliases.getOrPut(imp.span.file);
-        if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+        if (!fgop.found_existing) fgop.value_ptr.* = runtime.NameHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
         try module.registry.noteImportAliasName(imp.span.file, leaf);
         const lgop = try fgop.value_ptr.getOrPut(leaf);
         if (!lgop.found_existing) lgop.value_ptr.* = .empty;
@@ -3073,7 +3073,7 @@ fn lowerClassSecondaryCtors(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void 
     // Which of those names such a thunk may CALL: every function contributes its arity mask, and a
     // name that is only ever a property gets mask 0, so a call beside a same-named `val` still binds
     // the top-level function.
-    var own_arity = std.StringHashMap(u64).init(a);
+    var own_arity = runtime.NameHashMap(u64).init(a);
     defer own_arity.deinit();
     {
         var prop_names = StringSet.init(a);
@@ -3113,7 +3113,7 @@ fn lowerSecondaryCtor(
     sc: *ast.SecondaryCtor,
     sc_idx: usize,
     own_members: *StringSet,
-    own_arity: *std.StringHashMap(u64),
+    own_arity: *runtime.NameHashMap(u64),
 ) Allocator.Error!SecondaryCtorEntry {
     const a = ctx.a;
     const module = ctx.module;
@@ -3426,7 +3426,7 @@ fn lowerExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
     }
     // Class-typed typealiases collect here, the shared `type_aliases` map recording only function-typed
     // ones, so an extension receiver named by an alias expands to the class.
-    var class_aliases = std.StringHashMap([]const u8).init(a);
+    var class_aliases = runtime.NameHashMap([]const u8).init(a);
     defer class_aliases.deinit();
     for (decls) |*d| {
         if (d.* != .TypeAlias) continue;
@@ -3439,7 +3439,7 @@ fn lowerExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const std.StringHashMap([]const u8)) Allocator.Error!void {
+fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const runtime.NameHashMap([]const u8)) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const decl_pkg = ctx.decl_pkg;

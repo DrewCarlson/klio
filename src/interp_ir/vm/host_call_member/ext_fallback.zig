@@ -1112,7 +1112,7 @@ pub fn isSubtypeName(self: *VmHost, allocator: Allocator, a: []const u8, b: []co
     if (std.mem.eql(u8, a, b)) return false;
     var q: std.ArrayList([]const u8) = .empty;
     defer q.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     q.append(allocator, a) catch return false;
     while (q.pop()) |c| {
@@ -1253,7 +1253,7 @@ pub fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: 
     // the superclass whose companion declares `name`.
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
-    var seen: std.StringHashMap(void) = .init(allocator);
+    var seen: runtime.NameHashMap(void) = .init(allocator);
     defer seen.deinit();
     try queue.append(allocator, start);
     var head: usize = 0;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 const applicability = @import("applicability");
 const testing = std.testing;
 const root_ir = @import("../ir.zig");
@@ -106,7 +107,7 @@ test "resolveCall selects scope after applicability" {
         .fqn = try a.dupe(u8, "imports.pick"),
         .segs = segs,
     });
-    var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    var inner = runtime.NameHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try inner.put("pick", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
     {
@@ -778,7 +779,7 @@ test "an imported same-name upper bound cannot complete raw bound evidence" {
     segs[0] = "left";
     segs[1] = "Bound";
     try paths.append(a, .{ .fqn = try a.dupe(u8, "left.Bound"), .segs = segs });
-    var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    var imports = runtime.NameHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try imports.put("Bound", paths);
     try m.registry.import_aliases.put(FileId.from(0), imports);
     {
@@ -1628,7 +1629,7 @@ test "classIdIndexed ranks a named import above the own package" {
     segs[0] = "lib";
     segs[1] = "Config";
     try paths.append(a, .{ .fqn = try a.dupe(u8, "lib.Config"), .segs = segs });
-    var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    var inner = runtime.NameHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try inner.put("Config", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
     {

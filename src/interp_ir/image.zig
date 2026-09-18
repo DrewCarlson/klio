@@ -1175,7 +1175,7 @@ pub fn bake(
     {
         const offs = try a.alloc(u32, root.module.funcs.len);
         var bodyless: std.ArrayList(u32) = .empty;
-        var heads = std.StringHashMap(void).init(gpa);
+        var heads = runtime.NameHashMap(void).init(gpa);
         defer heads.deinit();
         var section = PlainSection(*const ir.Func, encodeFuncHeader){ .items = undefined };
         const hdr_items = try a.alloc(*const ir.Func, root.module.funcs.len);
@@ -1221,13 +1221,13 @@ pub fn bake(
     runtime.prof.phaseMark("bake lifted decls");
     if (bake_trace) tb = bakeMark("lifted decls", tb);
     {
-        var names = std.StringHashMap(void).init(gpa);
+        var names = runtime.NameHashMap(void).init(gpa);
         defer names.deinit();
-        var sinks = std.StringHashMap(void).init(gpa);
+        var sinks = runtime.NameHashMap(void).init(gpa);
         defer sinks.deinit();
-        var getters = std.StringHashMap(void).init(gpa);
+        var getters = runtime.NameHashMap(void).init(gpa);
         defer getters.deinit();
-        var inline_fns = std.StringHashMap(void).init(gpa);
+        var inline_fns = runtime.NameHashMap(void).init(gpa);
         defer inline_fns.deinit();
         try build_base.composeBaseNames(&names, root.lifted_decls);
         try build_base.composeBaseSinks(&sinks, root.lifted_decls);
@@ -1241,7 +1241,7 @@ pub fn bake(
     }
 
     {
-        var by_name = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(gpa);
+        var by_name = runtime.NameHashMap(std.ArrayList(FF(ast.Function))).init(gpa);
         defer {
             var dit = by_name.valueIterator();
             while (dit.next()) |v| v.deinit(gpa);
@@ -1299,12 +1299,12 @@ pub fn bake(
         const mg = base.built.module.borrow();
         defer mg.deinit();
         const m = mg.get();
-        var classes = std.StringHashMap(void).init(gpa);
+        var classes = runtime.NameHashMap(void).init(gpa);
         defer classes.deinit();
         for (m.classes.items) |*c| classes.put(c.name, {}) catch {};
-        var rets = std.StringHashMap([]const u8).init(gpa);
+        var rets = runtime.NameHashMap([]const u8).init(gpa);
         defer rets.deinit();
-        var ambiguous = std.StringHashMap(void).init(gpa);
+        var ambiguous = runtime.NameHashMap(void).init(gpa);
         defer ambiguous.deinit();
         for (m.funcs.items) |*f| {
             if (f.kind != .plain) continue;
@@ -1327,9 +1327,9 @@ pub fn bake(
         while (rit.next()) |e| try out.append(a, .{ .name = e.key_ptr.*, .head = e.value_ptr.* });
         root.fn_returns = try out.toOwnedSlice(a);
 
-        var ekeys = std.StringHashMap([]const u8).init(gpa);
+        var ekeys = runtime.NameHashMap([]const u8).init(gpa);
         defer ekeys.deinit();
-        var eamb = std.StringHashMap(void).init(gpa);
+        var eamb = runtime.NameHashMap(void).init(gpa);
         defer eamb.deinit();
         for (m.funcs.items) |*f| {
             if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
@@ -1477,7 +1477,7 @@ fn rootFromBase(
     return root;
 }
 
-fn setToSlice(a: Allocator, set: *const std.StringHashMap(void)) Allocator.Error![]const []const u8 {
+fn setToSlice(a: Allocator, set: *const runtime.NameHashMap(void)) Allocator.Error![]const []const u8 {
     var out = try a.alloc([]const u8, set.count());
     var it = set.keyIterator();
     var i: usize = 0;
@@ -1728,7 +1728,7 @@ fn autoMapToSlice(comptime K: type, comptime V: type, a: Allocator, m: *const st
     return out;
 }
 
-fn strMapToSlice(comptime V: type, a: Allocator, m: *const std.StringHashMap(V)) Allocator.Error![]KV([]const u8, V) {
+fn strMapToSlice(comptime V: type, a: Allocator, m: *const runtime.NameHashMap(V)) Allocator.Error![]KV([]const u8, V) {
     var out = try a.alloc(KV([]const u8, V), m.count());
     var it = m.iterator();
     var i: usize = 0;
@@ -1907,7 +1907,7 @@ fn pairFuncToSlice(a: Allocator, m: *const build.PairFuncMap) Allocator.Error![]
     return out;
 }
 
-fn nameFuncsToSlice(a: Allocator, m: *const std.StringHashMap([]FuncId)) Allocator.Error![]NameFuncs {
+fn nameFuncsToSlice(a: Allocator, m: *const runtime.NameHashMap([]FuncId)) Allocator.Error![]NameFuncs {
     var out = try a.alloc(NameFuncs, m.count());
     var it = m.iterator();
     var i: usize = 0;
@@ -1917,7 +1917,7 @@ fn nameFuncsToSlice(a: Allocator, m: *const std.StringHashMap([]FuncId)) Allocat
     return out;
 }
 
-fn nameArgNamesToSlice(a: Allocator, m: *const std.StringHashMap([]const ?[]const u8)) Allocator.Error![]NameArgNames {
+fn nameArgNamesToSlice(a: Allocator, m: *const runtime.NameHashMap([]const ?[]const u8)) Allocator.Error![]NameArgNames {
     var out = try a.alloc(NameArgNames, m.count());
     var it = m.iterator();
     var i: usize = 0;
@@ -2409,8 +2409,8 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
     };
 }
 
-fn sliceToSet(a: Allocator, items: []const []const u8) Allocator.Error!std.StringHashMap(void) {
-    var out = std.StringHashMap(void).init(a);
+fn sliceToSet(a: Allocator, items: []const []const u8) Allocator.Error!runtime.NameHashMap(void) {
+    var out = runtime.NameHashMap(void).init(a);
     try out.ensureTotalCapacity(@intCast(items.len));
     for (items) |k| try out.put(k, {});
     return out;
@@ -2521,7 +2521,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.type_aliases) |kv| r.type_aliases.putAssumeCapacity(kv.k, kv.v);
     for (ri.type_alias_types) |kv| try r.putTypeAliasType(kv.k, kv.v);
     for (ri.import_aliases) |entry| {
-        var inner = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+        var inner = runtime.NameHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
         for (entry.leaves) |le| {
             var list: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
             try list.appendSlice(a, le.paths);
@@ -2536,7 +2536,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         try r.import_wildcards.put(kv.k, list);
     }
     for (ri.nested_object_aliases) |kv| {
-        var inner = std.StringHashMap([]const u8).init(a);
+        var inner = runtime.NameHashMap([]const u8).init(a);
         for (kv.v) |skv| try inner.put(skv.k, skv.v);
         try r.nested_object_aliases.put(kv.k, inner);
     }

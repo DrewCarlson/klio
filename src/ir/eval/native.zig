@@ -643,7 +643,7 @@ pub fn NativeGlue(comptime H: type) type {
             const inst = &frame.func.blocks[block].insts[idx];
             // Recursive serving stacks a native + glue + serve slice per level, so past this depth the C
             // stack faults before the eval-depth cap can raise StackOverflow. Deeper chains flat-park.
-            const recurse_ok = ev_state.evtls.eval_depth < NATIVE_RECURSE_MAX_DEPTH;
+            const recurse_ok = ev_state.evtlsPtr().eval_depth < NATIVE_RECURSE_MAX_DEPTH;
             // A monomorphic plain call whose callee LEAF-serves is answered in place. The gate mirrors
             // execArmCall's fast path minus what the leaf bank cannot take (extensions, ambiguous fids).
             if (recurse_ok) direct: {

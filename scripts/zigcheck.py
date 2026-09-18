@@ -26,10 +26,11 @@ ZSTD_LIB = "zig-out/lib/libzstd.a"
 # module -> direct (non-dev) dependencies. Mirrors build.zig mod_list.
 GRAPH = {
     "span": [],
+    "names": [],
     "diagnostics": ["span"],
     "ast": ["span"],
-    "compose_pass": ["ast", "span"],
-    "runtime": ["ast", "span"],
+    "compose_pass": ["ast", "span", "names"],
+    "runtime": ["ast", "span", "names"],
     "types": ["ast", "diagnostics", "span"],
     "lexer": ["diagnostics", "span"],
     "pack": ["ast", "span", "types"],

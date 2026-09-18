@@ -57,12 +57,12 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
         .top_level_props = .empty,
         .enum_entry_arg_inits = .empty,
         .class_default_outer = try ObjRef(OuterTable).init(allocator, OuterTable.init(allocator)),
-        .anon_methods = try root.AnonMethods.init(allocator, std.StringHashMap(AnonMethodEntry).init(allocator)),
+        .anon_methods = try root.AnonMethods.init(allocator, runtime.NameHashMap(AnonMethodEntry).init(allocator)),
         .closures = try SharedClosures.new(allocator),
         .prog = try ObjRef(ProgramImage).init(allocator, try ProgramImage.init(allocator)),
         .out_sink = try SharedOutput.new(allocator),
         .threads = try root.ThreadTable.init(allocator, std.AutoHashMap(u64, root.ThreadEntry).init(allocator)),
-        .object_states = try root.ObjectStates.init(allocator, std.StringHashMap(root.ObjectInitState).init(allocator)),
+        .object_states = try root.ObjectStates.init(allocator, runtime.NameHashMap(root.ObjectInitState).init(allocator)),
         .singletons_by_id = try root.SingletonsById.init(allocator, std.AutoHashMap(u32, runtime.Value).init(allocator)),
         .allocator = allocator,
     };
@@ -107,7 +107,7 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
 
         prog.getter_prop_names.deinit();
         prog.getter_prop_names = built.getter_prop_names;
-        built.getter_prop_names = std.StringHashMap(void).init(allocator);
+        built.getter_prop_names = runtime.NameHashMap(void).init(allocator);
 
         prog.instance_prop_setters.deinit();
         prog.instance_prop_setters = built.instance_prop_setters;
@@ -119,15 +119,15 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
 
         prog.parent_ctor_args.deinit();
         prog.parent_ctor_args = built.parent_ctor_args;
-        built.parent_ctor_args = std.StringHashMap([]FuncId).init(allocator);
+        built.parent_ctor_args = runtime.NameHashMap([]FuncId).init(allocator);
 
         prog.parent_ctor_arg_names.deinit();
         prog.parent_ctor_arg_names = built.parent_ctor_arg_names;
-        built.parent_ctor_arg_names = std.StringHashMap([]const ?[]const u8).init(allocator);
+        built.parent_ctor_arg_names = runtime.NameHashMap([]const ?[]const u8).init(allocator);
 
         prog.init_blocks.deinit();
         prog.init_blocks = built.init_blocks;
-        built.init_blocks = std.StringHashMap([]FuncId).init(allocator);
+        built.init_blocks = runtime.NameHashMap([]FuncId).init(allocator);
 
         prog.extension_props.deinit();
         prog.extension_props = built.extension_props;
@@ -135,7 +135,7 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
 
         prog.owner_keyed_ext_names.deinit();
         prog.owner_keyed_ext_names = built.owner_keyed_ext_names;
-        built.owner_keyed_ext_names = std.StringHashMap(void).init(allocator);
+        built.owner_keyed_ext_names = runtime.NameHashMap(void).init(allocator);
         prog.nullable_ext_props.deinit();
         prog.nullable_ext_props = built.nullable_ext_props;
         built.nullable_ext_props = @TypeOf(built.nullable_ext_props).init(allocator);
@@ -150,15 +150,15 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
 
         prog.secondary_ctors.deinit();
         prog.secondary_ctors = built.secondary_ctors;
-        built.secondary_ctors = std.StringHashMap([]build.SecondaryCtorEntry).init(allocator);
+        built.secondary_ctors = runtime.NameHashMap([]build.SecondaryCtorEntry).init(allocator);
 
         prog.primary_ctor_default_thunks.deinit();
         prog.primary_ctor_default_thunks = built.primary_ctor_default_thunks;
-        built.primary_ctor_default_thunks = std.StringHashMap([]?FuncId).init(allocator);
+        built.primary_ctor_default_thunks = runtime.NameHashMap([]?FuncId).init(allocator);
 
         prog.class_delegates.deinit();
         prog.class_delegates = built.class_delegates;
-        built.class_delegates = std.StringHashMap([]build.StrFunc).init(allocator);
+        built.class_delegates = runtime.NameHashMap([]build.StrFunc).init(allocator);
 
         prog.func_defaults.deinit();
         prog.func_defaults = built.func_defaults;

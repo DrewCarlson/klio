@@ -11,7 +11,7 @@ const span = @import("span");
 pub const runtime = @import("runtime");
 
 const Allocator = std.mem.Allocator;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 const FnField = runtime.forest.ForestField(ast.Function);
 
 // Deferred inline-body decode. A stdlib image holds `inline`, object-free function
@@ -92,18 +92,18 @@ fn visibleCands(cands: []const *const ast.Function, call_file: ?span.FileId, buf
 /// lowering. A `suspend inline` builder's `suspendCoroutineUninterceptedOrReturn`
 /// must capture the caller's continuation, correct only when the body is truly
 /// inlined. Non-suspend inline fns keep the normal call path.
-threadlocal var inline_fn_asts: ?std.StringHashMap([]const FnField) = null;
+threadlocal var inline_fn_asts: ?runtime.NameHashMap([]const FnField) = null;
 
 /// Lazy per-name cache of `inline_fn_asts` candidates resolved to plain pointers,
 /// so the picking logic stays pointer-based and a name's decls decode once.
-threadlocal var inline_fn_asts_resolved: ?std.StringHashMap([]const *const ast.Function) = null;
+threadlocal var inline_fn_asts_resolved: ?runtime.NameHashMap([]const *const ast.Function) = null;
 
 /// Function-typed `typealias` tags by alias name (`RoutingHandler` ->
 /// `"Function0"`), borrowed from `module.registry.type_aliases`, so the shape-based
 /// pick recognises a parameter whose declared type aliases a function type.
-threadlocal var type_alias_tags: ?*const std.StringHashMap([]const u8) = null;
+threadlocal var type_alias_tags: ?*const runtime.NameHashMap([]const u8) = null;
 
-pub fn setTypeAliasTags(m: *const std.StringHashMap([]const u8)) void {
+pub fn setTypeAliasTags(m: *const runtime.NameHashMap([]const u8)) void {
     type_alias_tags = m;
 }
 
@@ -167,7 +167,7 @@ pub fn isTopLevelProp(name: []const u8) bool {
 /// mapping to its inline overloads in declaration order so a call site can
 /// disambiguate by trailing-arg shape. Takes ownership of `m` and drops the previous
 /// build's `FuncId`-keyed entries, which the driver re-registers.
-pub fn setInlineFnAsts(m: std.StringHashMap([]const FnField)) void {
+pub fn setInlineFnAsts(m: runtime.NameHashMap([]const FnField)) void {
     if (inline_fn_asts) |*old| old.deinit();
     inline_fn_asts = m;
     if (inline_fn_asts_resolved) |*old| old.deinit();
@@ -367,11 +367,11 @@ pub fn memberExtPropRecv(owner: []const u8, name: []const u8) ?[]const u8 {
 /// Declared supertype references, with their type arguments, by class or object
 /// simple name, so reified-type-argument inference can solve a parameter's type
 /// argument from the supertype list of a declaration an argument names.
-threadlocal var class_supertype_refs: ?std.StringHashMap([]const ast.TypeRef) = null;
+threadlocal var class_supertype_refs: ?runtime.NameHashMap([]const ast.TypeRef) = null;
 
 pub fn resetClassSupertypeRefs() void {
     if (class_supertype_refs) |*m| m.deinit();
-    class_supertype_refs = std.StringHashMap([]const ast.TypeRef).init(runtime.slab.allocator);
+    class_supertype_refs = runtime.NameHashMap([]const ast.TypeRef).init(runtime.slab.allocator);
 }
 
 /// Record `name`'s declared supertypes. First registration wins, matching the
@@ -411,7 +411,7 @@ fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
     }
     const fields = (if (inline_fn_asts) |*c| c.get(name) else null) orelse {
         if (inline_fn_asts_resolved == null) {
-            inline_fn_asts_resolved = std.StringHashMap([]const *const ast.Function).init(runtime.slab.allocator);
+            inline_fn_asts_resolved = runtime.NameHashMap([]const *const ast.Function).init(runtime.slab.allocator);
         }
         inline_fn_asts_resolved.?.put(name, &.{}) catch {};
         return null;
@@ -432,7 +432,7 @@ fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
     }
     const resolved = buf[0..n];
     if (inline_fn_asts_resolved == null) {
-        inline_fn_asts_resolved = std.StringHashMap([]const *const ast.Function).init(a);
+        inline_fn_asts_resolved = runtime.NameHashMap([]const *const ast.Function).init(a);
     }
     inline_fn_asts_resolved.?.put(name, resolved) catch return resolved;
     return resolved;
@@ -849,9 +849,9 @@ pub const ThreadState = struct {
     deferred_section: []const u8,
     deferred_alloc: Allocator,
     deferred_decode: ?DeferredDecodeFn,
-    inline_fn_asts: ?std.StringHashMap([]const FnField),
-    inline_fn_asts_resolved: ?std.StringHashMap([]const *const ast.Function),
-    type_alias_tags: ?*const std.StringHashMap([]const u8),
+    inline_fn_asts: ?runtime.NameHashMap([]const FnField),
+    inline_fn_asts_resolved: ?runtime.NameHashMap([]const *const ast.Function),
+    type_alias_tags: ?*const runtime.NameHashMap([]const u8),
     shadowed_inline_names: ?StringSet,
     inline_fn_ids: ?std.AutoHashMap(u32, FnField),
     inline_id_by_fn: ?std.AutoHashMap(usize, u32),
@@ -859,7 +859,7 @@ pub const ThreadState = struct {
     top_level_prop_names: ?StringSet,
     member_prop_asts: ?MemberMap(*const ast.Property),
     member_ext_prop_recv: ?MemberMap([]const u8),
-    class_supertype_refs: ?std.StringHashMap([]const ast.TypeRef),
+    class_supertype_refs: ?runtime.NameHashMap([]const ast.TypeRef),
 };
 
 pub fn captureThreadState() ThreadState {
@@ -992,7 +992,7 @@ test "inline fn ids register, look up, and reset with the table" {
     try testing.expect(inlineAstById(8) == null);
     // Installing the next build's simple-name table drops the previous build's
     // FuncId entries.
-    setInlineFnAsts(std.StringHashMap([]const FnField).init(testing.allocator));
+    setInlineFnAsts(runtime.NameHashMap([]const FnField).init(testing.allocator));
     try testing.expect(inlineAstById(7) == null);
 }
 

@@ -2,6 +2,7 @@
 //! class / singleton resolution, and the `KClass` reflective surface.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
@@ -238,9 +239,7 @@ pub fn enclosingSimpleFromFqn(self: *VmHost, inst: ObjRef(InstanceData)) ?[]cons
     const parent_simple = if (std.mem.findScalarLast(u8, parent_fqn, '.')) |d| parent_fqn[d + 1 ..] else parent_fqn;
     // The class table is keyed by simple name, so the entry's FQN must equal the
     // parent FQN before it counts as the enclosing class.
-    const cg = self.classes.borrow();
-    defer cg.deinit();
-    const def = cg.get().get(parent_simple) orelse return null;
+    const def = host_classes.classDefLookup(self, parent_simple) orelse return null;
     const dg = def.borrow();
     defer dg.deinit();
     if (std.mem.eql(u8, dg.get().fqn, parent_fqn)) return parent_simple;

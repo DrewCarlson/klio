@@ -1,6 +1,7 @@
 //! Member references, `super.foo(...)`, `this@Outer`, and `@Serializer` targets.
 
 const std = @import("std");
+const host_classes = @import("../host_classes.zig");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
@@ -387,9 +388,7 @@ pub fn ownerSupertypeBySuffix(self: *VmHost, class_name: []const u8, simple: []c
 }
 
 pub fn ownerHasSupertype(self: *VmHost, class_name: []const u8, q: []const u8) bool {
-    const g = self.classes.borrow();
-    defer g.deinit();
-    const d = g.get().get(class_name) orelse return false;
+    const d = host_classes.classDefLookup(self, class_name) orelse return false;
     const dg = d.borrow();
     defer dg.deinit();
     for (dg.get().supertype_names) |s| {
@@ -429,7 +428,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
         try pending.appendSlice(allocator, sups);
     }
     // A class with no declared supertype still has `Any` above it.
-    var visited: std.StringHashMap(void) = .init(allocator);
+    var visited: runtime.NameHashMap(void) = .init(allocator);
     defer visited.deinit();
 
     // Search the supertypes, superclass before interfaces at every level, and
@@ -862,9 +861,7 @@ pub fn companionOwnerClassValue(self: *VmHost, kc: *const Value) Allocator.Error
     const name = owner orelse return null;
     // The class table is the authority over a same-named by-name global.
     {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(name)) |def| return Value{ .Class = def.clone() };
+        if (host_classes.classDefLookup(self, name)) |def| return Value{ .Class = def.clone() };
     }
     const v = host_globals.lookupGlobal(self, name) orelse return null;
     if (v != .Class) return null;

@@ -408,14 +408,14 @@ pub fn evalWithCapturesChained(
     if (comptime @hasDecl(H, "plainStoredFieldIndex") and @hasDecl(H, "plainStoredScalarFieldNN") and @hasDecl(H, "resolveMemberFuncId")) {
         switch (jit_loop.methodSeamProbe(func)) {
             .run => |cl| if (args.items.len >= func.params.len and
-                ev_state.evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and cl.n_slots <= 192)
+                ev_state.evtlsPtr().jit_native_depth < NATIVE_SLOT_BANK_DEPTH and cl.n_slots <= 192)
             {
                 const banks = ev_state.native_banks.get();
-                const fslots: []i64 = &banks.slot[ev_state.evtls.jit_native_depth];
-                const ftags: []u8 = &banks.tag[ev_state.evtls.jit_native_depth];
-                ev_state.evtls.jit_native_depth += 1;
+                const fslots: []i64 = &banks.slot[ev_state.evtlsPtr().jit_native_depth];
+                const ftags: []u8 = &banks.tag[ev_state.evtlsPtr().jit_native_depth];
+                ev_state.evtlsPtr().jit_native_depth += 1;
                 const fo = jit_loop.runFunc(cl, &.{}, args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
-                ev_state.evtls.jit_native_depth -= 1;
+                ev_state.evtlsPtr().jit_native_depth -= 1;
                 if (fo == null and runtime.envOnce("KLIO_JIT_DEBUG") != null) {
                     std.debug.print("[jit]   seam run DECLINED {s}\n", .{func.name});
                 }
@@ -470,7 +470,7 @@ pub fn evalWithCapturesChained(
         }
     }
     callStatsBumpId(func.fqn, func.id.int(), module);
-    const ev: *EvalTls = &ev_state.evtls;
+    const ev: *EvalTls = ev_state.evtlsPtr();
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
     // Kotlin's SAM conversion happens at the CALL boundary: a lambda bound to a `fun interface`

@@ -21,11 +21,11 @@ const ClassId = ir.ClassId;
 const FuncId = ir.FuncId;
 const Inst = ir.Inst;
 const Terminator = ir.Terminator;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 /// File-scoped class registry, simple name to AST class, threaded through the
 /// public lowering entry points so cross-class member lookups resolve.
-pub const FileClasses = std.StringHashMap(FF(ast.Class));
+pub const FileClasses = runtime.NameHashMap(FF(ast.Class));
 
 /// Resolve each source annotation to its fully-qualified candidate names using the
 /// declaring file's imports: a qualified path yields itself, a simple name `N` the
@@ -813,7 +813,7 @@ pub fn funcArityMask(f: *const ast.Function) u64 {
     return mask;
 }
 
-pub fn mergeMemberArity(out: *std.StringHashMap(u64), name: []const u8, mask: u64) Allocator.Error!void {
+pub fn mergeMemberArity(out: *runtime.NameHashMap(u64), name: []const u8, mask: u64) Allocator.Error!void {
     const gop = try out.getOrPut(name);
     if (gop.found_existing) gop.value_ptr.* |= mask else gop.value_ptr.* = mask;
 }
@@ -821,7 +821,7 @@ pub fn mergeMemberArity(out: *std.StringHashMap(u64), name: []const u8, mask: u6
 fn collectMemberArities(
     c: *const ast.Class,
     file_classes: *const FileClasses,
-    out: *std.StringHashMap(u64),
+    out: *runtime.NameHashMap(u64),
     seen: *StringSet,
 ) Allocator.Error!void {
     {
@@ -1061,7 +1061,7 @@ const ClassLower = struct {
     class_id: ClassId,
     extra_members: *const StringSet,
     own_member_names: *StringSet,
-    own_member_arity: *std.StringHashMap(u64),
+    own_member_arity: *runtime.NameHashMap(u64),
     /// The class's method list, sealed onto the shell once every member lowers.
     methods: *std.ArrayList(FuncId),
 };
@@ -1094,7 +1094,7 @@ pub const ClassState = struct {
     class_id: ClassId,
     extra_members: *const StringSet,
     own_member_names: *StringSet,
-    own_member_arity: *std.StringHashMap(u64),
+    own_member_arity: *runtime.NameHashMap(u64),
 };
 
 pub fn beginClass(
@@ -1116,8 +1116,8 @@ pub fn beginClass(
     try collectOwnMemberNames(a, c, file_classes, own_member_names);
     // Per-member arity masks, so a method body's bare call prefers a member only
     // when one is arity-applicable.
-    const own_member_arity = try a.create(std.StringHashMap(u64));
-    own_member_arity.* = std.StringHashMap(u64).init(a);
+    const own_member_arity = try a.create(runtime.NameHashMap(u64));
+    own_member_arity.* = runtime.NameHashMap(u64).init(a);
     try collectOwnMemberArities(a, c, file_classes, own_member_arity);
     const state = try a.create(ClassState);
     state.* = .{
@@ -1249,7 +1249,7 @@ fn collectOwnMemberArities(
     a: Allocator,
     c: *const ast.Class,
     file_classes: *const FileClasses,
-    own_member_arity: *std.StringHashMap(u64),
+    own_member_arity: *runtime.NameHashMap(u64),
 ) Allocator.Error!void {
     var seen_for_arity = StringSet.init(a);
     defer seen_for_arity.deinit();
@@ -1930,7 +1930,7 @@ pub fn lowerMethodWithMemberContext(
     owner_class: []const u8,
     own_members: *const StringSet,
     enclosing_members: *const StringSet,
-    own_member_arity: ?*const std.StringHashMap(u64),
+    own_member_arity: ?*const runtime.NameHashMap(u64),
 ) Allocator.Error!Func {
     const body = try lowerMemberBody(module, f, owner_class, own_members, enclosing_members, own_member_arity);
     return placeMember(module, f, body, owner_class, own_members);
@@ -1944,7 +1944,7 @@ pub fn lowerMemberBody(
     owner_class: []const u8,
     own_members: *const StringSet,
     enclosing_members: *const StringSet,
-    own_member_arity: ?*const std.StringHashMap(u64),
+    own_member_arity: ?*const runtime.NameHashMap(u64),
 ) Allocator.Error!Func {
     // A method body lowered on its own declares its local classes into the same
     // scope stack a function body does, and must leave it as found.
@@ -2454,7 +2454,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     owner_class: ?[]const u8,
     own_members: ?*const StringSet,
     enclosing_members: ?*const StringSet,
-    own_member_arity: ?*const std.StringHashMap(u64),
+    own_member_arity: ?*const runtime.NameHashMap(u64),
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
     const prev_real_fn = build.pushCurrentRealFn(f.name.name);
@@ -2825,7 +2825,7 @@ fn installMemberNameTables(
     ctx: *BodyLower,
     own_members: ?*const StringSet,
     enclosing_members: ?*const StringSet,
-    own_member_arity: ?*const std.StringHashMap(u64),
+    own_member_arity: ?*const runtime.NameHashMap(u64),
 ) Allocator.Error!void {
     const a = ctx.a;
     const b = ctx.b;
@@ -2836,7 +2836,7 @@ fn installMemberNameTables(
         if (set.count() != 0) b.setEnclosingMembers(try cloneStringSet(a, set));
     }
     if (own_member_arity) |map| {
-        var copy = std.StringHashMap(u64).init(a);
+        var copy = runtime.NameHashMap(u64).init(a);
         var it = map.iterator();
         while (it.next()) |e| try copy.put(e.key_ptr.*, e.value_ptr.*);
         b.setOwnMemberArity(copy);
@@ -3127,7 +3127,7 @@ test "resolveAnnotationNames yields fqn candidates from imports" {
     // The registry owns and frees every fqn, segs and wildcard string on deinit, so
     // each is duped into the registry allocator.
     {
-        var named = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(ra);
+        var named = runtime.NameHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(ra);
         var test_paths: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
         try test_paths.append(ra, .{ .fqn = try ra.dupe(u8, "kotlin.test.Test"), .segs = try ra.alloc([]const u8, 0) });
         try named.put("Test", test_paths);

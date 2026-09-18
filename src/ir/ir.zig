@@ -181,9 +181,9 @@ pub const PendingBoundRef = struct {
 };
 
 pub const PendingLocalDeclTypes = struct {
-    types: std.StringHashMap(TypeRef),
-    nullable: std.StringHashMap(void),
-    call_returns: std.StringHashMap(EagerTypeHead),
+    types: runtime.NameHashMap(TypeRef),
+    nullable: runtime.NameHashMap(void),
+    call_returns: runtime.NameHashMap(EagerTypeHead),
 };
 
 pub const Module = struct {
@@ -221,7 +221,7 @@ pub const Module = struct {
     pending_accessor_dispatch_owner: ?[]const u8 = null,
     /// Lowering scratch: callable arity mask of the owner class's members. A name that is only
     /// ever a property carries mask 0, so a bare call of it is not read as a companion call.
-    pending_own_member_arity: ?*const std.StringHashMap(u64) = null,
+    pending_own_member_arity: ?*const runtime.NameHashMap(u64) = null,
     /// Implicit label of the argument lambda about to lower. Its body binds `this@<label>` so
     /// a reference from a nested scope reaches THAT receiver, not the innermost `this`.
     pending_lambda_this_label: ?[]const u8 = null,
@@ -271,7 +271,7 @@ pub const Module = struct {
     /// may consult the enclosing receiver tier. A merely untyped receiver must not.
     pending_lambda_no_receiver: bool = false,
     /// Enclosing locals with definite non-callable evidence, so a bare call is not the captured value.
-    pending_lambda_nonfn_locals: ?std.StringHashMap(void) = null,
+    pending_lambda_nonfn_locals: ?runtime.NameHashMap(void) = null,
     /// Vararg parameter names of the local `fun` about to lower: inside the body the static
     /// type is the materialized array, not the annotated element. Borrowed from the AST.
     pending_lambda_vararg_params: ?[]const []const u8 = null,
@@ -303,10 +303,10 @@ pub const Module = struct {
     class_index: std.ArrayList(ClassIndexEntry) = .empty,
     /// Simple name to first `ClassId`, an O(1) overlay on `class_index`'s scan built at the link
     /// step; null until then. First-entry-wins matches the scan's duplicate-name behavior.
-    class_id_map: ?std.StringHashMap(ClassId) = null,
+    class_id_map: ?runtime.NameHashMap(ClassId) = null,
     /// FQN to `ClassId` overlay. A duplicated FQN maps to `class_id_ambiguous` so the lookup
     /// returns null. Built with `class_id_map`; null until then.
-    class_fqn_map: ?std.StringHashMap(ClassId) = null,
+    class_fqn_map: ?runtime.NameHashMap(ClassId) = null,
     /// Allocator for the lowering-phase lookup caches below; null disables them, so lookups scan.
     lookup_cache_gpa: ?Allocator = null,
     /// See `ExtResolveCache`; created on first use from `lookup_cache_gpa`.
@@ -352,15 +352,15 @@ pub const Module = struct {
     eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
     /// Extension-candidate index: receiver head to the extension names declared on it, plus the
     /// generic-receiver names that apply to every head. Rebuilt lazily as declarations grow.
-    ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(ExtArity)) = null,
-    generic_ext_names: ?std.StringHashMap(ExtArity) = null,
+    ext_names_by_recv_head: ?runtime.NameHashMap(runtime.NameHashMap(ExtArity)) = null,
+    generic_ext_names: ?runtime.NameHashMap(ExtArity) = null,
     ext_index_decl_count: usize = 0,
     eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
-    class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
+    class_children: ?std.AutoHashMap(ClassId, runtime.NameHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name; a matching Path callee lowers to `Inst.Call`.
     func_index: std.ArrayList(FuncIndexEntry) = .empty,
     /// Simple-name index over `func_index` for O(1) name-to-FuncIds in declaration order.
-    func_name_index: std.StringHashMap(std.ArrayList(FuncId)),
+    func_name_index: runtime.NameHashMap(std.ArrayList(FuncId)),
     package: ?[]const u8 = null,
     /// Top-level function names declared `tailrec`, populated before bodies lower so a caller
     /// can emit `TailCallFunc` into a tailrec function whose body is not lowered yet.

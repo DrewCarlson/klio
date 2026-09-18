@@ -21,21 +21,17 @@ pub const StrPair = struct { a: []const u8, b: []const u8 };
 
 pub const StrPairContext = struct {
     pub fn hash(_: StrPairContext, key: StrPair) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(key.a);
-        h.update(&.{0});
-        h.update(key.b);
-        return h.final();
+        return runtime.mixHash(runtime.hashName(key.a), runtime.hashName(key.b));
     }
     pub fn eql(_: StrPairContext, x: StrPair, y: StrPair) bool {
-        return std.mem.eql(u8, x.a, y.a) and std.mem.eql(u8, x.b, y.b);
+        return runtime.eqlName(x.a, y.a) and runtime.eqlName(x.b, y.b);
     }
 };
 
 pub const PairFuncMap = std.HashMap(StrPair, FuncId, StrPairContext, std.hash_map.default_max_load_percentage);
 pub const StrPairSet = std.HashMap(StrPair, void, StrPairContext, std.hash_map.default_max_load_percentage);
 
-pub const ClassTable = std.StringHashMap(ObjRef(ClassDef));
+pub const ClassTable = runtime.NameHashMap(ObjRef(ClassDef));
 
 /// `(supertype simple name, thunk FuncId)` class-delegation entry.
 pub const StrFunc = struct { name: []const u8, func: FuncId };
@@ -101,17 +97,17 @@ pub const BuiltModule = struct {
     body_prop_inits: PairFuncMap,
     /// `(class name, property name)` → `FuncId` for body properties with a custom getter.
     instance_prop_getters: PairFuncMap,
-    getter_prop_names: std.StringHashMap(void),
+    getter_prop_names: runtime.NameHashMap(void),
     instance_prop_setters: PairFuncMap,
     /// Getter-backed `private` body properties, keyed as getters are. A private property never
     /// overrides, so the scope-qualified walk skips it off its lexical owner.
     instance_prop_private: PairFuncMap,
-    parent_ctor_args: std.StringHashMap([]FuncId),
+    parent_ctor_args: runtime.NameHashMap([]FuncId),
     /// Argument labels parallel to `parent_ctor_args`, binding a named super-ctor argument
     /// (`: Base(objects = 2)`) to the base parameter of that name.
-    parent_ctor_arg_names: std.StringHashMap([]const ?[]const u8),
+    parent_ctor_arg_names: runtime.NameHashMap([]const ?[]const u8),
     /// `init { ... }` blocks per class. Each `FuncId` takes `this`.
-    init_blocks: std.StringHashMap([]FuncId),
+    init_blocks: runtime.NameHashMap([]FuncId),
     top_level_props: std.ArrayList(NameFunc),
     /// How many leading `top_level_props` came from a baked base. Those run on
     /// first read; a program's own still run before `main`.
@@ -119,10 +115,10 @@ pub const BuiltModule = struct {
     /// Top-level extension properties, keyed by `(receiver type, prop)`.
     extension_props: PairFuncMap,
     /// Names having at least one owner-qualified key; see the Prog field.
-    owner_keyed_ext_names: std.StringHashMap(void),
+    owner_keyed_ext_names: runtime.NameHashMap(void),
     /// Getters of extension properties on a NULLABLE receiver, keyed by property name: the only
     /// dispatch key left when the receiver is null. A name on several nullable receivers is null.
-    nullable_ext_props: std.StringHashMap(?FuncId),
+    nullable_ext_props: runtime.NameHashMap(?FuncId),
     extension_prop_setters: PairFuncMap,
     /// Delegated extension properties (`val R.x by expr`) keyed by `(receiver type, prop)`; the
     /// `FuncId` is the 0-arg thunk producing the delegate, and reads and writes route through its
@@ -130,21 +126,21 @@ pub const BuiltModule = struct {
     extension_prop_delegates: PairFuncMap,
     main: ?FuncId,
     object_names: std.ArrayList([]const u8),
-    companion_singletons: std.StringHashMap([]const u8),
+    companion_singletons: runtime.NameHashMap([]const u8),
     enum_entry_arg_inits: std.ArrayList(EnumEntryArgInit),
-    secondary_ctors: std.StringHashMap([]SecondaryCtorEntry),
-    primary_ctor_default_thunks: std.StringHashMap([]?FuncId),
+    secondary_ctors: runtime.NameHashMap([]SecondaryCtorEntry),
+    primary_ctor_default_thunks: runtime.NameHashMap([]?FuncId),
     /// Class delegation entries: `class W(g) : Greeter by g`.
-    class_delegates: std.StringHashMap([]StrFunc),
+    class_delegates: runtime.NameHashMap([]StrFunc),
     /// Per-function default-arg thunks, keyed by target `FuncId.int()`.
     func_defaults: std.AutoHashMap(u32, []?FuncId),
-    enclosing_class: std.StringHashMap([]const u8),
+    enclosing_class: runtime.NameHashMap([]const u8),
     /// Pre-lowered per-entry `override fun` bodies, keyed by `(synth class, method)`.
     enum_entry_methods: std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage),
     /// `(enum class, entry)` → synth class name for entries with methods.
     enum_entry_synth_class: PairStrMap,
     func_type_params: std.AutoHashMap(u32, [][]const u8),
-    top_level_delegated_props: std.StringHashMap(void),
+    top_level_delegated_props: runtime.NameHashMap(void),
     /// Body-property `(class, prop)` pairs declared as `by <delegate>`.
     delegated_body_props: StrPairSet,
     allocator: Allocator,
@@ -195,31 +191,31 @@ pub fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) B
         .classes = ClassTable.init(allocator),
         .body_prop_inits = PairFuncMap.init(allocator),
         .instance_prop_getters = PairFuncMap.init(allocator),
-        .getter_prop_names = std.StringHashMap(void).init(allocator),
+        .getter_prop_names = runtime.NameHashMap(void).init(allocator),
         .instance_prop_setters = PairFuncMap.init(allocator),
         .instance_prop_private = PairFuncMap.init(allocator),
-        .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
-        .parent_ctor_arg_names = std.StringHashMap([]const ?[]const u8).init(allocator),
-        .init_blocks = std.StringHashMap([]FuncId).init(allocator),
+        .parent_ctor_args = runtime.NameHashMap([]FuncId).init(allocator),
+        .parent_ctor_arg_names = runtime.NameHashMap([]const ?[]const u8).init(allocator),
+        .init_blocks = runtime.NameHashMap([]FuncId).init(allocator),
         .top_level_props = .empty,
         .extension_props = PairFuncMap.init(allocator),
-        .owner_keyed_ext_names = std.StringHashMap(void).init(allocator),
-        .nullable_ext_props = std.StringHashMap(?FuncId).init(allocator),
+        .owner_keyed_ext_names = runtime.NameHashMap(void).init(allocator),
+        .nullable_ext_props = runtime.NameHashMap(?FuncId).init(allocator),
         .extension_prop_setters = PairFuncMap.init(allocator),
         .extension_prop_delegates = PairFuncMap.init(allocator),
         .main = main,
         .object_names = .empty,
-        .companion_singletons = std.StringHashMap([]const u8).init(allocator),
+        .companion_singletons = runtime.NameHashMap([]const u8).init(allocator),
         .enum_entry_arg_inits = .empty,
-        .secondary_ctors = std.StringHashMap([]SecondaryCtorEntry).init(allocator),
-        .primary_ctor_default_thunks = std.StringHashMap([]?FuncId).init(allocator),
-        .class_delegates = std.StringHashMap([]StrFunc).init(allocator),
+        .secondary_ctors = runtime.NameHashMap([]SecondaryCtorEntry).init(allocator),
+        .primary_ctor_default_thunks = runtime.NameHashMap([]?FuncId).init(allocator),
+        .class_delegates = runtime.NameHashMap([]StrFunc).init(allocator),
         .func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator),
-        .enclosing_class = std.StringHashMap([]const u8).init(allocator),
+        .enclosing_class = runtime.NameHashMap([]const u8).init(allocator),
         .enum_entry_methods = std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage).init(allocator),
         .enum_entry_synth_class = PairStrMap.init(allocator),
         .func_type_params = std.AutoHashMap(u32, [][]const u8).init(allocator),
-        .top_level_delegated_props = std.StringHashMap(void).init(allocator),
+        .top_level_delegated_props = runtime.NameHashMap(void).init(allocator),
         .delegated_body_props = StrPairSet.init(allocator),
         .allocator = allocator,
     };
@@ -239,4 +235,4 @@ pub const SpanContext = struct {
 };
 pub const SpanStrMap = std.HashMap(Span, []const u8, SpanContext, std.hash_map.default_max_load_percentage);
 
-pub const FileClasses = std.StringHashMap(FF(ast.Class));
+pub const FileClasses = runtime.NameHashMap(FF(ast.Class));

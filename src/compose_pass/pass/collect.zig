@@ -1,6 +1,7 @@
 //! Whole-compilation scans building the oracle sets the transform consults.
 
 const std = @import("std");
+const namehash = @import("names");
 const ast = @import("ast");
 const root = @import("../compose_pass.zig");
 
@@ -15,7 +16,7 @@ const isComposable = root.isComposable;
 pub const ComposableOracle = *const fn (ctx: *anyopaque, callee_name: []const u8) bool;
 
 pub const NameSetOracle = struct {
-    names: *const std.StringHashMap(void),
+    names: *const namehash.NameHashMap(void),
 
     pub fn isComposableCall(ctx: *anyopaque, callee_name: []const u8) bool {
         const self: *const NameSetOracle = @ptrCast(@alignCast(ctx));
@@ -27,13 +28,13 @@ pub const NameSetOracle = struct {
 pub fn collectComposableNames(
     a: std.mem.Allocator,
     decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(a);
+) std.mem.Allocator.Error!namehash.NameHashMap(void) {
+    var set = namehash.NameHashMap(void).init(a);
     try collectInto(&set, decls);
     return set;
 }
 
-fn collectInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+fn collectInto(set: *namehash.NameHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
             if (isComposable(f.annotations)) try set.put(f.name.name, {});
@@ -51,13 +52,13 @@ pub const ComposableParams = struct { names: []const []const u8 };
 pub fn collectComposableParamNames(
     a: std.mem.Allocator,
     decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(ComposableParams) {
-    var map = std.StringHashMap(ComposableParams).init(a);
+) std.mem.Allocator.Error!namehash.NameHashMap(ComposableParams) {
+    var map = namehash.NameHashMap(ComposableParams).init(a);
     try collectParamsInto(a, &map, decls);
     return map;
 }
 
-fn collectParamsInto(a: std.mem.Allocator, map: *std.StringHashMap(ComposableParams), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+fn collectParamsInto(a: std.mem.Allocator, map: *namehash.NameHashMap(ComposableParams), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
             if (!isComposable(f.annotations)) continue;
@@ -167,12 +168,12 @@ fn sinkContentReach(params: anytype) ?u8 {
     return required + 1;
 }
 
-fn putMinReach(set: *std.StringHashMap(u8), name: []const u8, reach: u8) std.mem.Allocator.Error!void {
+fn putMinReach(set: *namehash.NameHashMap(u8), name: []const u8, reach: u8) std.mem.Allocator.Error!void {
     const gop = try set.getOrPut(name);
     if (!gop.found_existing or reach < gop.value_ptr.*) gop.value_ptr.* = reach;
 }
 
-pub fn collectSinkContentReachInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+pub fn collectSinkContentReachInto(set: *namehash.NameHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
             if (sinkContentReach(f.params)) |r| try putMinReach(set, f.name.name, r);
@@ -189,13 +190,13 @@ pub fn collectSinkContentReachInto(set: *std.StringHashMap(u8), decls: []const a
 pub fn collectInlineFnNames(
     a: std.mem.Allocator,
     decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(a);
+) std.mem.Allocator.Error!namehash.NameHashMap(void) {
+    var set = namehash.NameHashMap(void).init(a);
     try collectInlineFnNamesInto(&set, decls);
     return set;
 }
 
-pub fn collectInlineFnNamesInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+pub fn collectInlineFnNamesInto(set: *namehash.NameHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
             if (f.is_inline) try set.put(f.name.name, {});
@@ -262,13 +263,13 @@ fn isComposableGetterProp(p: *const ast.Property) bool {
 pub fn collectComposableGetterProps(
     a: std.mem.Allocator,
     decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(a);
+) std.mem.Allocator.Error!namehash.NameHashMap(void) {
+    var set = namehash.NameHashMap(void).init(a);
     try collectComposableGetterPropsInto(&set, decls);
     return set;
 }
 
-pub fn collectComposableGetterPropsInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+pub fn collectComposableGetterPropsInto(set: *namehash.NameHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Property => |p| {
             if (isComposableGetterProp(p)) try set.put(p.name.name, {});
@@ -284,13 +285,13 @@ pub fn collectComposableGetterPropsInto(set: *std.StringHashMap(void), decls: []
 pub fn collectComposableLambdaSinks(
     a: std.mem.Allocator,
     decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(a);
+) std.mem.Allocator.Error!namehash.NameHashMap(void) {
+    var set = namehash.NameHashMap(void).init(a);
     try collectSinksInto(&set, decls);
     return set;
 }
 
-fn collectSinksInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+fn collectSinksInto(set: *namehash.NameHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
             for (f.params) |*p| if (isComposableLambdaParam(p)) {

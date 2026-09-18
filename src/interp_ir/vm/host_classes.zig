@@ -16,6 +16,7 @@ const VmHost = @import("vmhost.zig").VmHost;
 const host_instances = @import("host_instances.zig");
 const host_call_value = @import("host_call_value.zig");
 const host_call_func = @import("host_call_func.zig");
+const host_call_member = @import("host_call_member.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;
@@ -27,7 +28,7 @@ const ClassParamDef = runtime.ClassParamDef;
 const PropertyDef = runtime.PropertyDef;
 const MethodDef = runtime.MethodDef;
 const SupertypeDelegate = runtime.SupertypeDelegate;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 const AnonMethodEntry = root.AnonMethodEntry;
 const NameValue = root.NameValue;
 const ClassTable = root.ClassTable;
@@ -773,7 +774,7 @@ fn lowerAndRegisterMethods(
     host_instances.anonLowerEnter();
     defer host_instances.anonLowerExit();
     // Same-arity overloads share the `name#arity` key, so each is also indexed.
-    var overload_seen = std.StringHashMap(usize).init(allocator);
+    var overload_seen = runtime.NameHashMap(usize).init(allocator);
     defer overload_seen.deinit();
     for (class.members) |*m| {
         switch (m.*) {
@@ -1304,9 +1305,7 @@ fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Cl
 /// The `.Class` for a local class, which shadows a same-named top-level fn.
 pub fn localClassValue(self: *VmHost, allocator: Allocator, name: []const u8) Allocator.Error!MaybeValueResult {
     _ = allocator;
-    const cg = self.classes.borrow();
-    defer cg.deinit();
-    if (cg.get().get(name)) |def| {
+    if (classDefLookup(self, name)) |def| {
         return .{ .ok = .{ .Class = def.clone() } };
     }
     return .{ .ok = null };
@@ -1449,4 +1448,14 @@ test "builtin_exception_parent_match walks the known hierarchy" {
     try testing.expect(builtinExceptionParentMatch("RuntimeException", "Exception"));
     try testing.expect(builtinExceptionParentMatch("Exception", "Throwable"));
     try testing.expect(!builtinExceptionParentMatch("IllegalArgumentException", "Error"));
+}
+
+/// The registered `ClassDef` for `name`, or null. The handle is BORROWED from
+/// the class table, which owns it for the program's life; callers that keep it
+/// past the table clone it themselves.
+pub fn classDefLookup(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
+    if (name.len == 0) return null;
+    const g = self.classes.borrow();
+    defer g.deinit();
+    return g.get().get(name);
 }

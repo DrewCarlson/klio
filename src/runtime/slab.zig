@@ -20,6 +20,7 @@
 //! it with `releaseAll` in a handful of unmaps, no per-cell frees.
 
 const std = @import("std");
+const tls_fast = @import("tls_fast.zig");
 const builtin = @import("builtin");
 const trace = @import("trace.zig");
 const gc = @import("gc.zig");
@@ -158,7 +159,7 @@ pub fn releaseAll(h: *Heap) void {
     std.debug.assert(h.track_regions);
     @atomicStore(bool, &h.released, true, .release);
     // This thread's cached cells of the heap are about to vanish with it.
-    magazines[h.id] = @splat(.{});
+    magazines()[h.id] = @splat(.{});
     h.regions_lock.lock();
     // The collector's lists may still name cells minted on the heap.
     gc.forgetRanges(h.regions.items);
@@ -913,12 +914,22 @@ const Run = struct { next: usize = 0, end: usize = 0 };
 
 const Magazine = struct { head: ?*FreeCell = null, count: u16 = 0, run: Run = .{} };
 
-threadlocal var magazines: [MAX_HEAPS][class_sizes.len]Magazine = @splat(@splat(.{}));
+/// Per-thread magazines, held off the thread-local block: an allocation and a
+/// free each reach for them, and on Darwin a `threadlocal` access is a call.
+const Magazines = struct {
+    m: [MAX_HEAPS][class_sizes.len]Magazine = @splat(@splat(.{})),
+};
+
+const magazines_tls = tls_fast.PerThread(Magazines);
+
+inline fn magazines() *[MAX_HEAPS][class_sizes.len]Magazine {
+    return &magazines_tls.get().m;
+}
 
 /// Called at worker-thread exit so a dead thread strands nothing.
 pub fn flushMagazines() void {
     inline for (.{ &main_heap, &build_heap }) |h| {
-        for (&magazines[h.id], 0..) |*mag, ci| {
+        for (&magazines()[h.id], 0..) |*mag, ci| {
             if (mag.head == null and mag.run.next == mag.run.end) continue;
             // A released heap took its cells with it.
             if (@atomicLoad(bool, &h.released, .acquire)) {
@@ -950,7 +961,7 @@ fn allocSmall(h: *Heap, len: usize) ?[*]u8 {
         if (gc.program_started and (@intFromPtr(cell) & 0xff) == 0) cellTraceNote(ci, @intFromPtr(cell), len);
         return cell;
     }
-    const mag = &magazines[h.id][ci];
+    const mag = &magazines()[h.id][ci];
     if (mag.head) |cell| {
         mag.head = cell.next;
         mag.count -= 1;
@@ -1001,7 +1012,7 @@ fn freeSmall(h: *Heap, ptr: [*]u8) void {
         freeLockedOne(h, ptr, slab, cs);
         return;
     }
-    const mag = &magazines[h.id][ci];
+    const mag = &magazines()[h.id][ci];
     if (mag.count < mag_caps[ci]) {
         const cell: *FreeCell = @ptrCast(@alignCast(ptr));
         cell.next = mag.head;

@@ -38,7 +38,7 @@ pub fn valueTruthy(allocator: Allocator, v: *const Value) Allocator.Error!union(
             const s = v.display(allocator) catch "?";
             const fname: []const u8 = if (currentFrameFunc()) |cf| cf.fqn else "?";
             const fid: u32 = if (currentFrameFunc()) |cf| cf.id.int() else 0;
-            const sp: ?span.Span = if (ev_state.evtls.frame_chain) |fr| fr.cur_span else null;
+            const sp: ?span.Span = if (ev_state.evtlsPtr().frame_chain) |fr| fr.cur_span else null;
             const msg = if (sp) |p2|
                 try std.fmt.allocPrint(allocator, "non-bool in branch: {s} (in {s}#{d} at f{d}:{d})", .{ s, fname, fid, p2.file.int(), p2.start })
             else

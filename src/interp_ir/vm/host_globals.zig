@@ -4,6 +4,7 @@
 //! `VmHost` methods by `vmhost.zig`.
 
 const std = @import("std");
+const host_classes = @import("host_classes.zig");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -277,9 +278,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
             if (std.mem.find(u8, name, "$Companion$")) |sep| {
                 const outer_name = name[0..sep];
                 const outer_def: ?ObjRef(ClassDef) = blk: {
-                    const cg = self.classes.borrow();
-                    defer cg.deinit();
-                    if (cg.get().get(outer_name)) |c| break :blk c.clone();
+                    if (host_classes.classDefLookup(self, outer_name)) |c| break :blk c.clone();
                     break :blk null;
                 };
                 if (outer_def) |od| {
@@ -397,9 +396,7 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
             if (std.mem.find(u8, simple, "$Companion$")) |sep| {
                 const outer_name = simple[0..sep];
                 const outer_def: ?ObjRef(ClassDef) = blk: {
-                    const cg = self.classes.borrow();
-                    defer cg.deinit();
-                    if (cg.get().get(outer_name)) |c| break :blk c.clone();
+                    if (host_classes.classDefLookup(self, outer_name)) |c| break :blk c.clone();
                     break :blk null;
                 };
                 if (outer_def) |od| {
@@ -537,9 +534,7 @@ fn enumOwnerInitForCompanion(self: *VmHost, name: []const u8) Allocator.Error!?E
     const sep = std.mem.find(u8, name, "$Companion$") orelse return null;
     const owner_name = name[0..sep];
     const owner: ObjRef(ClassDef) = blk: {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        break :blk (cg.get().get(owner_name) orelse return null).clone();
+        break :blk (host_classes.classDefLookup(self, owner_name) orelse return null).clone();
     };
     defer owner.deinit();
     const is_enum = blk: {
@@ -893,9 +888,7 @@ pub fn objectClassDeclaresProp(self: *VmHost, class_name: []const u8, name: []co
         if (pg.get().extension_props.get(.{ .a = class_name, .b = name }) != null) return true;
     }
     var cur: ?ObjRef(ClassDef) = blk: {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(class_name)) |d| break :blk d.clone();
+        if (host_classes.classDefLookup(self, class_name)) |d| break :blk d.clone();
         break :blk null;
     };
     var depth: usize = 0;
@@ -1009,10 +1002,10 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .host = intrinsic.intrinsicHost(),
         .allocator = allocator,
     };
-    const prev_fqn_lt = runtime.leaktrack.current_fqn;
-    runtime.leaktrack.current_fqn = fqn;
+    const prev_fqn_lt = runtime.leaktrack.currentFqn();
+    runtime.leaktrack.setCurrentFqn(fqn);
     const r = try func(&ctx);
-    runtime.leaktrack.current_fqn = prev_fqn_lt;
+    runtime.leaktrack.setCurrentFqn(prev_fqn_lt);
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| switch (e) {
@@ -1223,9 +1216,7 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
         };
         if (fqn) |f| {
             const found: ?ObjRef(ClassDef) = blk: {
-                const cg = self.classes.borrow();
-                defer cg.deinit();
-                if (cg.get().get(f)) |def| break :blk def.clone();
+                if (host_classes.classDefLookup(self, f)) |def| break :blk def.clone();
                 break :blk null;
             };
             if (found) |def| {
@@ -1311,9 +1302,7 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                     }
                     // Companion unpublished: the class itself is the value.
                     const again: ?ObjRef(ClassDef) = blk: {
-                        const cg = self.classes.borrow();
-                        defer cg.deinit();
-                        if (cg.get().get(f)) |d| break :blk d.clone();
+                        if (host_classes.classDefLookup(self, f)) |d| break :blk d.clone();
                         break :blk null;
                     };
                     if (again) |d| return .{ .Class = d };
@@ -1378,9 +1367,7 @@ pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name_in: []co
     const arg_head = if (std.mem.findScalar(u8, arg_name_in, '<')) |lt| arg_name_in[0..lt] else arg_name_in;
     const arg_name = std.mem.trimEnd(u8, arg_head, "?");
     const cls_value: ?Value = blk: {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(arg_name)) |c| break :blk Value{ .Class = c.clone() };
+        if (host_classes.classDefLookup(self, arg_name)) |c| break :blk Value{ .Class = c.clone() };
         break :blk lookupGlobal(self, arg_name);
     };
     const prev = blk: {
@@ -1561,9 +1548,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
 
     // A `Value.Class` lets `Foo(args)` dispatch and reflection resolve.
     {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(name)) |def| {
+        if (host_classes.classDefLookup(self, name)) |def| {
             return .{ .Class = def.clone() };
         }
     }
@@ -1691,9 +1676,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
     if (std.mem.findScalarLast(u8, name, '.')) |dot| {
         const tail = name[dot + 1 ..];
         if (!std.mem.eql(u8, tail, name) and tail.len != 0) {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            if (cg.get().get(tail)) |def| {
+            if (host_classes.classDefLookup(self, tail)) |def| {
                 return .{ .Class = def.clone() };
             }
         }

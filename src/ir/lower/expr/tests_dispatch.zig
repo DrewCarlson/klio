@@ -1,6 +1,7 @@
 //! Expression lowering tests: paths, members, literals and the dispatch ladder.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("../../ir.zig");
 const applicability = @import("applicability");
@@ -12,7 +13,7 @@ const Expr = ast.Expr;
 const BinOp = ir.BinOp;
 const Reg = ir.Reg;
 const FuncId = ir.FuncId;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 const testing = std.testing;
 
 const expr_mod = @import("../expr.zig");
@@ -63,13 +64,13 @@ test "scope getter owner follows the class contributing an enclosing property" {
     var m = Module.default(testing.allocator);
     defer m.deinit(testing.allocator);
 
-    var inner_names = std.StringHashMap(void).init(testing.allocator);
+    var inner_names = runtime.NameHashMap(void).init(testing.allocator);
     try inner_names.put("innerValue", {});
     try m.registry.hierarchy_shadow_names.put("Outer$Inner", .{
         .names = inner_names,
         .complete = true,
     });
-    var outer_names = std.StringHashMap(void).init(testing.allocator);
+    var outer_names = runtime.NameHashMap(void).init(testing.allocator);
     try outer_names.put("receiveException", {});
     try m.registry.hierarchy_shadow_names.put("Outer", .{
         .names = outer_names,
@@ -88,7 +89,7 @@ test "scope getter owner follows the class contributing an enclosing property" {
 test "receiver scope completeness requires a complete static receiver tower" {
     var m = Module.default(testing.allocator);
     defer m.deinit(testing.allocator);
-    const owner_names = std.StringHashMap(void).init(testing.allocator);
+    const owner_names = runtime.NameHashMap(void).init(testing.allocator);
     try m.registry.hierarchy_shadow_names.put("Owner", .{
         .names = owner_names,
         .complete = true,
@@ -115,7 +116,7 @@ test "receiver scope completeness requires a complete static receiver tower" {
     defer extension_builder.deinit();
     extension_builder.setRecvTy("String");
     try testing.expect(!receiverScopeCompletePlain(&extension_builder));
-    const string_names = std.StringHashMap(void).init(testing.allocator);
+    const string_names = runtime.NameHashMap(void).init(testing.allocator);
     try m.registry.hierarchy_shadow_names.put("String", .{
         .names = string_names,
         .complete = true,
@@ -135,13 +136,13 @@ test "bare enclosing property lowers with its outer getter owner" {
 
     var m = Module.default(a);
     defer m.deinit(a);
-    var inner_names = std.StringHashMap(void).init(a);
+    var inner_names = runtime.NameHashMap(void).init(a);
     try inner_names.put("next", {});
     try m.registry.hierarchy_shadow_names.put("Outer$Inner", .{
         .names = inner_names,
         .complete = true,
     });
-    var outer_names = std.StringHashMap(void).init(a);
+    var outer_names = runtime.NameHashMap(void).init(a);
     try outer_names.put("receiveException", {});
     try m.registry.hierarchy_shadow_names.put("Outer", .{
         .names = outer_names,
@@ -425,7 +426,7 @@ test "bare is-check type normalises to the file's exact-import class FQN" {
         segs[2] = "Operation";
         segs[3] = "Marker";
         try paths.append(a, .{ .fqn = try a.dupe(u8, "com.ga.Operation.Marker"), .segs = segs });
-        var inner_map = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+        var inner_map = runtime.NameHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
         try inner_map.put("Marker", paths);
         try m.registry.import_aliases.put(span.FileId.from(0), inner_map);
         {
@@ -1087,7 +1088,7 @@ test "receiver callable emission respects members and lazy extensions" {
     var m = Module.default(a);
     defer m.deinit(a);
 
-    var names = std.StringHashMap(void).init(a);
+    var names = runtime.NameHashMap(void).init(a);
     try names.put("member", {});
     try m.registry.hierarchy_shadow_names.put("Target", .{
         .names = names,
@@ -1526,7 +1527,7 @@ test "a member reference on a scope-renamed nested class loads the lifted name" 
     const sp = dummySpan();
     // `Box` is a nested class of `Holder`, lifted to `Holder$Box`, with no binding
     // under its bare simple name.
-    var aliases = std.StringHashMap([]const u8).init(a);
+    var aliases = runtime.NameHashMap([]const u8).init(a);
     try aliases.put("Box", "Holder$Box");
     try m.registry.nested_object_aliases.put("Holder", aliases);
     _ = try m.addClass(a, .{

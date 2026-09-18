@@ -281,9 +281,9 @@ test "resumed labeled return reaches its snapshotted target frame" {
 test "enclosing chain tags subjects and projects innermost-first" {
     var chain: std.ArrayList(EnclosingEntry) = .empty;
     defer chain.deinit(chainAllocator());
-    const prev = ev_state.evtls.active_chain;
-    ev_state.evtls.active_chain = &chain;
-    defer ev_state.evtls.active_chain = prev;
+    const prev = ev_state.evtlsPtr().active_chain;
+    ev_state.evtlsPtr().active_chain = &chain;
+    defer ev_state.evtlsPtr().active_chain = prev;
 
     const receiver = Value{ .Int = 1 };
     const subject = Value{ .Int = 2 };
@@ -313,9 +313,9 @@ test "enclosing chain tags subjects and projects innermost-first" {
 }
 
 test "enclosing chain pushes are dropped with no active frame" {
-    const prev = ev_state.evtls.active_chain;
-    ev_state.evtls.active_chain = null;
-    defer ev_state.evtls.active_chain = prev;
+    const prev = ev_state.evtlsPtr().active_chain;
+    ev_state.evtlsPtr().active_chain = null;
+    defer ev_state.evtlsPtr().active_chain = prev;
 
     const v = Value{ .Int = 7 };
     pushEnclosing(&v);

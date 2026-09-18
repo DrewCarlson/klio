@@ -75,7 +75,7 @@ pub fn runFlatLoop(
     root_act: ?*Activation,
     host: *H,
 ) Allocator.Error!EvalResult {
-    const ev: *EvalTls = &ev_state.evtls;
+    const ev: *EvalTls = ev_state.evtlsPtr();
     var stack: std.ArrayList(*Activation) = .empty;
     defer stack.deinit(allocator);
     // On an allocation failure, unwind every open activation so no frame dangles on the GC chain.
@@ -114,13 +114,13 @@ pub fn runFlatLoop(
                 if (comptime @hasDecl(H, "plainStoredFieldIndex")) run: {
                     const cl = jit_loop.methodSeamPeek(site.req.func) orelse break :run;
                     if (site.req.args.items.len < site.req.func.params.len or
-                        ev_state.evtls.jit_native_depth >= NATIVE_SLOT_BANK_DEPTH or cl.n_slots > 192) break :run;
+                        ev_state.evtlsPtr().jit_native_depth >= NATIVE_SLOT_BANK_DEPTH or cl.n_slots > 192) break :run;
                     const banks = ev_state.native_banks.get();
-                    const fslots: []i64 = &banks.slot[ev_state.evtls.jit_native_depth];
-                    const ftags: []u8 = &banks.tag[ev_state.evtls.jit_native_depth];
-                    ev_state.evtls.jit_native_depth += 1;
+                    const fslots: []i64 = &banks.slot[ev_state.evtlsPtr().jit_native_depth];
+                    const ftags: []u8 = &banks.tag[ev_state.evtlsPtr().jit_native_depth];
+                    ev_state.evtlsPtr().jit_native_depth += 1;
                     const fo = jit_loop.runFunc(cl, &.{}, site.req.args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
-                    ev_state.evtls.jit_native_depth -= 1;
+                    ev_state.evtlsPtr().jit_native_depth -= 1;
                     if (fo) |o| {
                         if (o.code.inst == jit_loop.RETURN_INST) {
                             const dst = site.req.dst;
@@ -805,15 +805,15 @@ pub fn LoopTramp(comptime H: type) type {
                         jit_loop.compileCalleeForCall(lc.module, callee, argbuf[0..site.n_args], &resolveMember, &resolveVirtual, &resolveField, &resolveFieldNN, ctx_opaque);
                     if (compiled_callee) |callee_cl| {
                         if (!callee_cl.no_native_recurse and
-                            ev_state.evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192)
+                            ev_state.evtlsPtr().jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192)
                         {
                             // Per-depth rows from the thread's static bank: a stack `undefined` array is 0xaa-filled per call.
                             const banks = ev_state.native_banks.get();
-                            const fslots: []i64 = &banks.slot[ev_state.evtls.jit_native_depth];
-                            const ftags: []u8 = &banks.tag[ev_state.evtls.jit_native_depth];
-                            ev_state.evtls.jit_native_depth += 1;
+                            const fslots: []i64 = &banks.slot[ev_state.evtlsPtr().jit_native_depth];
+                            const ftags: []u8 = &banks.tag[ev_state.evtlsPtr().jit_native_depth];
+                            ev_state.evtlsPtr().jit_native_depth += 1;
                             const fo = jit_loop.runFunc(callee_cl, &.{}, argbuf[0..site.n_args], fslots[0..callee_cl.n_slots], ftags[0..callee_cl.n_regs], &call, tctx.user);
-                            ev_state.evtls.jit_native_depth -= 1;
+                            ev_state.evtlsPtr().jit_native_depth -= 1;
                             if (fo) |o| {
                                 if (o.code.inst == jit_loop.RETURN_INST) {
                                     if (site.has_result) {

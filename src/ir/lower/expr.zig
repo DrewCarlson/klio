@@ -42,7 +42,7 @@ const Terminator = ir.Terminator;
 const SpreadPart = ir.SpreadPart;
 const CatchHandler = ir.CatchHandler;
 const TypeRef = ir.TypeRef;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 const astBinop = helpers.astBinop;
 const boxedCellReg = helpers.boxedCellReg;

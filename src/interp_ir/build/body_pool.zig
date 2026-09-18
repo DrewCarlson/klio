@@ -32,9 +32,9 @@ pub const Job = struct {
 
     pub const Member = struct {
         owner_class: []const u8,
-        own_members: *const std.StringHashMap(void),
-        enclosing: *const std.StringHashMap(void),
-        own_member_arity: *const std.StringHashMap(u64),
+        own_members: *const runtime.NameHashMap(void),
+        enclosing: *const runtime.NameHashMap(void),
+        own_member_arity: *const runtime.NameHashMap(u64),
         class_fqn: []const u8,
         class_pkg: []const u8,
     };

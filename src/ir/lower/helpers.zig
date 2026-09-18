@@ -3,6 +3,7 @@
 //! mutation-analysis walks.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
@@ -20,7 +21,7 @@ const ConstId = ir.ConstId;
 const Inst = ir.Inst;
 const Module = ir.Module;
 const Reg = ir.Reg;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 /// True when `arg` is `expr as Any`, or transitively wraps one through trivial
 /// parens or binding. `is_boxed_to_any_form` itself lives in `ast_scan.zig`.

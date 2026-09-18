@@ -2,6 +2,7 @@
 //! 2-arg IR function, for default-arg producers, accessors and init blocks.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
@@ -20,7 +21,7 @@ const Const = ir.Const;
 const Terminator = ir.Terminator;
 const Expr = ast.Expr;
 const TypeRef = ast.TypeRef;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 
 const FuncBuilder = build.FuncBuilder;
 const bindParams = decl.bindParams;
@@ -117,7 +118,7 @@ fn consumePendingAccessorReceiver(b: *FuncBuilder, params: []const []const u8) A
 fn consumePendingOwnMemberArity(b: *FuncBuilder) Allocator.Error!void {
     const src = b.module.pending_own_member_arity orelse return;
     b.module.pending_own_member_arity = null;
-    var copy = std.StringHashMap(u64).init(b.allocator);
+    var copy = runtime.NameHashMap(u64).init(b.allocator);
     var it = src.iterator();
     while (it.next()) |e| try copy.put(e.key_ptr.*, e.value_ptr.*);
     b.setOwnMemberArity(copy);

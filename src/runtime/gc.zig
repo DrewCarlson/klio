@@ -4,6 +4,7 @@
 //! `value`/`objcell`; out-edges are found by comptime dispatch in `objcell`.
 
 const std = @import("std");
+const tls_fast = @import("tls_fast.zig");
 const trace = @import("trace.zig");
 const clock_mod = @import("clock.zig");
 const Allocator = std.mem.Allocator;
@@ -316,7 +317,16 @@ pub var gc_stress: bool = false;
 
 /// `KLIO_GC_STRESS_EVERY=N`: collect every N safe points; `0` disables.
 pub var gc_stress_every: usize = 0;
-threadlocal var safepoint_counter: usize = 0;
+/// The opcode-boundary poll counters. They are read and written on every
+/// instruction, and on Darwin a `threadlocal` access is a call into dyld, so
+/// they live off the thread-local block.
+const PollCounters = struct { safepoint: usize = 0, idle: usize = 0 };
+
+const poll_tls = tls_fast.PerThread(PollCounters);
+
+inline fn pollCounters() *PollCounters {
+    return poll_tls.get();
+}
 
 /// Permanent generation. Cells minted while this is true never join the sweep
 /// registry: they are immutable and reference only other permanent cells.
@@ -412,21 +422,21 @@ pub var external_accounting: bool = true;
 /// heap to the OS.
 pub inline fn pending() bool {
     if (gc_stress) return true;
+    const pc = pollCounters();
     if (gc_stress_every != 0) {
-        safepoint_counter += 1;
-        if (safepoint_counter >= gc_stress_every) return true;
+        pc.safepoint += 1;
+        if (pc.safepoint >= gc_stress_every) return true;
     }
-    idle_tick += 1;
-    if (idle_tick & 0xFFFF == 0) idleProbe();
+    pc.idle += 1;
+    if (pc.idle & 0xFFFF == 0) idleProbe();
     return gc_pending.load(.monotonic);
 }
 
-threadlocal var idle_tick: usize = 0;
 
 /// Accessors for the transpiled hot path's inlined edge guard. Stress modes
 /// are reported so the emitted code takes the full slow path on every edge.
 pub fn idleTickPtr() *usize {
-    return &idle_tick;
+    return &pollCounters().idle;
 }
 pub fn pendingFlagPtr() *const bool {
     return &gc_pending.raw;
@@ -471,8 +481,9 @@ pub fn safePoint() void {
         parkForStop();
         return;
     }
-    const sampled = gc_stress_every != 0 and safepoint_counter >= gc_stress_every;
-    if (sampled) safepoint_counter = 0;
+    const pc = pollCounters();
+    const sampled = gc_stress_every != 0 and pc.safepoint >= gc_stress_every;
+    if (sampled) pc.safepoint = 0;
     if (!gc_stress and !sampled and !gc_pending.load(.monotonic)) return;
     collectImpl(false);
 }

@@ -1,6 +1,7 @@
 //! Per-class stability inference, the input to the skip calculus.
 
 const std = @import("std");
+const namehash = @import("names");
 const ast = @import("ast");
 const root = @import("../compose_pass.zig");
 
@@ -59,13 +60,13 @@ pub fn collectClassStability(
     a: std.mem.Allocator,
     module_decls: []const Decl,
     base_decls: []const Decl,
-) std.mem.Allocator.Error!std.StringHashMap(Stability) {
+) std.mem.Allocator.Error!namehash.NameHashMap(Stability) {
     var cls = StabilityClassifier{
-        .classes = std.StringHashMap(*const ast.Class).init(a),
-        .objects = std.StringHashMap(*const ast.ObjectDecl).init(a),
-        .aliases = std.StringHashMap(*const ast.TypeAlias).init(a),
-        .memo = std.StringHashMap(Stability).init(a),
-        .in_progress = std.StringHashMap(void).init(a),
+        .classes = namehash.NameHashMap(*const ast.Class).init(a),
+        .objects = namehash.NameHashMap(*const ast.ObjectDecl).init(a),
+        .aliases = namehash.NameHashMap(*const ast.TypeAlias).init(a),
+        .memo = namehash.NameHashMap(Stability).init(a),
+        .in_progress = namehash.NameHashMap(void).init(a),
     };
     defer cls.classes.deinit();
     defer cls.objects.deinit();
@@ -83,11 +84,11 @@ pub fn collectClassStability(
 }
 
 const StabilityClassifier = struct {
-    classes: std.StringHashMap(*const ast.Class),
-    objects: std.StringHashMap(*const ast.ObjectDecl),
-    aliases: std.StringHashMap(*const ast.TypeAlias),
-    memo: std.StringHashMap(Stability),
-    in_progress: std.StringHashMap(void),
+    classes: namehash.NameHashMap(*const ast.Class),
+    objects: namehash.NameHashMap(*const ast.ObjectDecl),
+    aliases: namehash.NameHashMap(*const ast.TypeAlias),
+    memo: namehash.NameHashMap(Stability),
+    in_progress: namehash.NameHashMap(void),
 
     fn index(self: *StabilityClassifier, decls: []const Decl) std.mem.Allocator.Error!void {
         for (decls) |*d| switch (d.*) {
@@ -211,7 +212,7 @@ fn literalStable(e: *const Expr) bool {
 }
 
 /// Registry-only check at transform time: nothing recurses into declarations.
-fn typeStableFromMap(map: *const std.StringHashMap(Stability), t: *const TypeRef, tps: []const ast.TypeParam) bool {
+fn typeStableFromMap(map: *const namehash.NameHashMap(Stability), t: *const TypeRef, tps: []const ast.TypeParam) bool {
     if (t.function != null) return true;
     const n = t.name.name;
     if (isTypeParamName(n, tps)) return false;

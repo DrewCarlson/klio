@@ -43,7 +43,7 @@ const TypeRef = ir.TypeRef;
 const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
 const StrPair = ir.StrPair;
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 const AnonMethodEntry = root.AnonMethodEntry;
 const NameValue = root.NameValue;
 

@@ -7,6 +7,7 @@
 //! ranks a suspend conversion below an exact binding; disproofs are definite-only.
 
 const std = @import("std");
+const host_classes = @import("host_classes.zig");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -110,9 +111,7 @@ const Match = enum { proven, disproven, unknown };
 fn looksLikeTypeParam(self: *VmHost, pn: []const u8) bool {
     if (ir.parseClassTypeParamIdentity(pn) != null) return true;
     if (!(pn.len > 0 and pn.len <= 2 and allUppercase(pn))) return false;
-    const cg = self.classes.borrow();
-    defer cg.deinit();
-    return cg.get().get(pn) == null;
+    return host_classes.classDefLookup(self, pn) == null;
 }
 
 fn isListFamily(pn: []const u8) bool {
@@ -314,7 +313,7 @@ fn instanceIsA(self: *VmHost, v: *const Value, target: []const u8) bool {
     const a = self.allocator;
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(a);
-    var seen: std.StringHashMap(void) = .init(a);
+    var seen: runtime.NameHashMap(void) = .init(a);
     defer seen.deinit();
     queue.append(a, runtimeHead(v)) catch return false;
     var head: usize = 0;

@@ -4,6 +4,7 @@
 //! class-lowering pipeline applies.
 
 const std = @import("std");
+const runtime = @import("runtime");
 const ast = @import("ast");
 const span = @import("span");
 
@@ -18,15 +19,15 @@ const Decl = ast.Decl;
 const Span = span.Span;
 const FileId = span.FileId;
 
-const StringSet = std.StringHashMap(void);
+const StringSet = runtime.NameHashMap(void);
 /// Enclosing class name -> set of nested-object simple-name aliases.
-pub const AliasMap = std.StringHashMap(std.StringHashMap([]const u8));
+pub const AliasMap = runtime.NameHashMap(runtime.NameHashMap([]const u8));
 /// Lifted nested class name -> outer-scope visible member names.
-pub const OuterMembers = std.StringHashMap(StringSet);
+pub const OuterMembers = runtime.NameHashMap(StringSet);
 /// Inner class -> outer class name.
-pub const EnclosingMap = std.StringHashMap([]const u8);
+pub const EnclosingMap = runtime.NameHashMap([]const u8);
 /// Qualified nested name (`Outer.Inner`) -> mangled top-level name.
-pub const MangledMap = std.StringHashMap([]const u8);
+pub const MangledMap = runtime.NameHashMap([]const u8);
 
 const dummySpan = Span.init(FileId.from(0), 0, 0);
 
@@ -308,7 +309,7 @@ pub const LiftCtx = struct {
     /// Spans appended in lockstep with `object_names`. `buildClassDef` matches a class's
     /// span against these, never the simple name, which another package can share.
     object_spans: *std.ArrayList(Span),
-    companion_singletons: *std.StringHashMap([]const u8),
+    companion_singletons: *runtime.NameHashMap([]const u8),
     nested_outer_members: *OuterMembers,
     enclosing_class: *EnclosingMap,
     nested_object_aliases: *AliasMap,
@@ -322,7 +323,7 @@ pub const LiftCtx = struct {
 
 /// `BytesHexFormat.Builder` and `NumberHexFormat.Builder` cannot share flat `Builder`.
 pub fn collectDupNestedNames(a: Allocator, decls: []const ast.Decl, out: *StringSet) Allocator.Error!void {
-    var counts = std.StringHashMap(u32).init(a);
+    var counts = runtime.NameHashMap(u32).init(a);
     defer counts.deinit();
     for (decls) |*d| {
         switch (d.*) {
@@ -337,7 +338,7 @@ pub fn collectDupNestedNames(a: Allocator, decls: []const ast.Decl, out: *String
     }
 }
 
-fn countNestedNames(counts: *std.StringHashMap(u32), members: []const ast.Decl) Allocator.Error!void {
+fn countNestedNames(counts: *runtime.NameHashMap(u32), members: []const ast.Decl) Allocator.Error!void {
     for (members) |*m| {
         switch (m.*) {
             .Class => |*nc| {
@@ -513,7 +514,7 @@ fn appendChain(allocator: Allocator, chain: []const *const Class, c: *const Clas
 
 fn putAlias(ctx: *LiftCtx, cls: []const u8, simple: []const u8, mangled: []const u8) Allocator.Error!void {
     const gop = try ctx.nested_object_aliases.getOrPut(cls);
-    if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(ctx.allocator);
+    if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap([]const u8).init(ctx.allocator);
     try gop.value_ptr.put(simple, mangled);
 }
 

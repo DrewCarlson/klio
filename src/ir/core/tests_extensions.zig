@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 const applicability = @import("applicability");
 const testing = std.testing;
 const root_ir = @import("../ir.zig");
@@ -1643,7 +1644,7 @@ test "symbol index ranks a named import above the caller's own package" {
     segs[0] = "lib";
     segs[1] = "greet";
     try paths.append(a, .{ .fqn = try a.dupe(u8, "lib.greet"), .segs = segs });
-    var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    var inner = runtime.NameHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try inner.put("greet", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
     {
@@ -1685,7 +1686,7 @@ test "renamed imports enter the canonical candidate set by exact identity" {
     segs[0] = "lib";
     segs[1] = "greet";
     try paths.append(a, .{ .fqn = try a.dupe(u8, "lib.greet"), .segs = segs });
-    var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    var imports = runtime.NameHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try imports.put("hello", paths);
     try m.registry.import_aliases.put(FileId.from(0), imports);
     {
@@ -1950,7 +1951,7 @@ test "bounded spread candidates retain renamed import identity" {
     segs[0] = "lib";
     segs[1] = "merge";
     try paths.append(a, .{ .fqn = try a.dupe(u8, "lib.merge"), .segs = segs });
-    var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    var imports = runtime.NameHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try imports.put("originalMerge", paths);
     try m.registry.import_aliases.put(FileId.from(0), imports);
     {
@@ -1980,7 +1981,7 @@ test "bounded spread candidates do not widen past a fixed-only tier" {
     segs[0] = "imports";
     segs[1] = "pick";
     try paths.append(a, .{ .fqn = try a.dupe(u8, "imports.pick"), .segs = segs });
-    var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    var inner = runtime.NameHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try inner.put("pick", paths);
     try m.registry.import_aliases.put(FileId.from(0), inner);
     {
@@ -2013,7 +2014,7 @@ test "a renamed import of a typealias still expands at its reference site" {
     segs[0] = "p";
     segs[1] = "Bag";
     try paths.append(a, .{ .fqn = try a.dupe(u8, "p.Bag"), .segs = segs });
-    var per_file = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    var per_file = runtime.NameHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
     try per_file.put("Short", paths);
     try m.registry.import_aliases.put(FileId.from(1), per_file);
     {
