@@ -19,6 +19,26 @@ const Error = Allocator.Error;
 /// Stack of active `KlioComposer` values, head first; page-allocator backed and GC-rooted.
 threadlocal var composer_stack: std.ArrayList(Value) = .empty;
 
+/// Run generation, bumped at every run boundary. `Composition` pops its composer
+/// in a `finally`, so the stack balances on every ordinary path — but a hard
+/// abort does not run it: a wall-capped test and a daemon stopped at the run
+/// boundary both unwind past the `finally`, and the entries they leave belong to
+/// a run that is over. The boundary clears the thread it runs on and bumps the
+/// generation; every other thread discards its own stack the next time it
+/// touches it. Clearing another thread's list from here would race a daemon that
+/// has not yet noticed it should stop, which is precisely the case this fixes.
+var run_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
+
+threadlocal var stack_gen: u32 = 0;
+
+inline fn freshenStack() void {
+    const g = run_gen.load(.monotonic);
+    if (stack_gen != g) {
+        composer_stack.clearRetainingCapacity();
+        stack_gen = g;
+    }
+}
+
 fn stackAllocator() Allocator {
     return runtime.slab.tracedPage();
 }
@@ -47,15 +67,18 @@ pub fn gcUninstallComposeRoot() void {
 }
 
 pub fn pushComposer(v: Value) void {
+    freshenStack();
     ensureComposeRoot();
     composer_stack.append(stackAllocator(), v) catch {};
 }
 
 pub fn popComposer() void {
+    freshenStack();
     if (composer_stack.items.len != 0) _ = composer_stack.pop();
 }
 
 pub fn currentComposer() ?Value {
+    freshenStack();
     if (composer_stack.items.len == 0) return null;
     return composer_stack.items[composer_stack.items.len - 1];
 }
@@ -92,9 +115,12 @@ pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value
     return composer;
 }
 
-/// Clear the composer stack at a run boundary; `Composition` itself pops in a `finally`.
+/// Clear the composer stack at a run boundary; `Composition` itself pops in a
+/// `finally`, so this catches only what a hard abort left behind. The generation
+/// bump retires every other thread's stack without touching it.
 pub fn resetAtRunBoundary() void {
     composer_stack.clearRetainingCapacity();
+    stack_gen = run_gen.fetchAdd(1, .monotonic) + 1;
 }
 
 fn intrPushComposer(ctx: *CallCtx) Error!EvalResult {
