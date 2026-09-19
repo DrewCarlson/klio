@@ -65,8 +65,13 @@ fn envReclaim() ?AllocChoice {
 }
 
 /// Precedence: an explicit `setProfile`, then `KLIO_OPT`, then the default.
+///
+/// Split so the resolved answer is one branch; the resolution itself is cold.
 pub fn get() Config {
-    if (cached) |c| return c;
+    return cached orelse resolve();
+}
+
+fn resolve() Config {
     const base = profile_override orelse blk: {
         const v = envOnce("KLIO_OPT") orelse break :blk default_profile;
         break :blk parseProfile(v) orelse default_profile;

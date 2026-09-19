@@ -481,9 +481,16 @@ pub fn safePoint() void {
         parkForStop();
         return;
     }
-    const pc = pollCounters();
-    const sampled = gc_stress_every != 0 and pc.safepoint >= gc_stress_every;
-    if (sampled) pc.safepoint = 0;
+    // The stress counter is the only per-thread state this needs, and stress is
+    // disarmed in every ordinary run. Reading it unconditionally cost a
+    // per-thread fetch at a point the frameless walker reaches once per block,
+    // so the ordinary answer is now two atomic loads and no thread state.
+    var sampled = false;
+    if (gc_stress_every != 0) {
+        const pc = pollCounters();
+        sampled = pc.safepoint >= gc_stress_every;
+        if (sampled) pc.safepoint = 0;
+    }
     if (!gc_stress and !sampled and !gc_pending.load(.monotonic)) return;
     collectImpl(false);
 }
