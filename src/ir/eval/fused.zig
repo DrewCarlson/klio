@@ -183,12 +183,12 @@ fn bareTypeVarHead(name: []const u8) bool {
 
 fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const Func) u8 {
     if (func.is_suspend or func.is_lambda) return 2;
-    // A bare type variable marks a generic body, whose `as T` / `is T` consults the frame's
-    // reified context; the walker carries none. The Cast and InstanceOf ops are guarded below.
-    if (bareTypeVarHead(func.return_ty.name)) return 2;
-    for (func.params) |*p| {
-        if (bareTypeVarHead(p.ty.name)) return 2;
-    }
+    // A generic signature is not itself a reason to decline. What the walker cannot
+    // serve is `as T` / `is T`, which consults the frame's reified context, and the
+    // Cast and InstanceOf ops are guarded for exactly that below. The argument side
+    // is covered too: `fusedRun` applies the same `coercePlanFor` widening the framed
+    // entry does, including the type-variable peer rule.
+
     if (func.blocks.len == 0 or func.blocks.len > FUSED_MAX_BLOCKS) return 2;
     if (func.n_locals > FUSED_MAX_REGS) return 2;
     for (func.params) |*p| {
