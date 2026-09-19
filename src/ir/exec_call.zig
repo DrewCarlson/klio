@@ -470,7 +470,6 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                 if (!ambig_ok) dispatchBump(.static_decline_ambig);
                 if (ambig_ok and plan_arity >= 2 and plan_arity - 2 != call.n_args) dispatchBump(.static_decline_arity);
                 if (ambig_ok and plan_arity >= 2 and plan_arity - 2 == call.n_args) {
-                    const args_list = try readArgList(allocator, frame, call.args, call.n_args);
                     // The caller's `this` seeds the enclosing receiver: lexical
                     // scope for a member extension, dispatch visibility else.
                     var pushed_enclosing = false;
@@ -478,8 +477,9 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                         if (frameThisParam(frame)) |ct_idx| {
                             const p = frame.params.items[ct_idx];
                             if (p == .Instance) {
-                                const same = args_list.items.len > 0 and args_list.items[0] == .Instance and
-                                    ObjRef(InstanceData).ptrEq(p.Instance, args_list.items[0].Instance);
+                                const a0 = if (call.n_args > 0) frame.read(Reg.from(call.args.int())) else Value.Unit;
+                                const same = a0 == .Instance and
+                                    ObjRef(InstanceData).ptrEq(p.Instance, a0.Instance);
                                 if (!same) {
                                     if (cf.kind == .member_extension) {
                                         pushEnclosing(&frame.params.items[ct_idx]);
@@ -492,6 +492,51 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                         }
                     }
                     if (plan & ir.FAST_CALL_EXT_FLAG != 0) dispatchBump(.static_flat_fuse_ext) else dispatchBump(.static_flat_fuse);
+                    // A fully fusable callee runs from the caller's own register
+                    // run: no carrier to acquire and release, no flat request, and
+                    // no second pass through the activation seam to ask the same
+                    // question. The values stay the caller's, reachable in its
+                    // registers, exactly as the fused tier's own call arm borrows
+                    // them. A decline here has run nothing, so the carrier path
+                    // below still sees an untouched call.
+                    // The verdict byte the activation seam already memoized on the
+                    // callee: only a FULLY fusable body takes this path, so a
+                    // callee that would decline pays one byte read rather than an
+                    // argument copy and a round trip that ends in a decline. An
+                    // unasked callee (0) goes the ordinary way and is classified
+                    // there, so the memo is warm by its second call.
+                    if (call.n_args <= FUSED_ARGV_MAX and cf.fuse_state == 1) {
+                        var argv: [FUSED_ARGV_MAX]Value = undefined;
+                        {
+                            var ai: u32 = 0;
+                            while (ai < call.n_args) : (ai += 1) {
+                                argv[ai] = frame.read(Reg.from(call.args.int() + ai));
+                            }
+                            const av = argv[0..call.n_args];
+                            const composer_pushed = if (comptime @hasDecl(H, "flatPlainCallOpen"))
+                                host.flatPlainCallOpen(cf, av)
+                            else
+                                false;
+                            // The close runs before the error is propagated, so a
+                            // failure inside the body cannot leave the composer it
+                            // published on the stack. On a decline it also balances
+                            // the push before the carrier path makes its own.
+                            const attempt = eval.fusedServeArgs(H, allocator, frame.module, cf, av, host);
+                            if (composer_pushed) {
+                                if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
+                            }
+                            const served = try attempt;
+                            if (served) |res| {
+                                if (pushed_enclosing) popEnclosing();
+                                switch (res) {
+                                    .ok => |v| try frame.write(call.dst, v),
+                                    .err => |e| return raiseStep(frame, e),
+                                }
+                                return .cont;
+                            }
+                        }
+                    }
+                    const args_list = try readArgList(allocator, frame, call.args, call.n_args);
                     if (allow_flat and flatEnabled()) {
                         const composer_pushed = if (comptime @hasDecl(H, "flatPlainCallOpen"))
                             host.flatPlainCallOpen(cf, args_list.items)
@@ -3206,6 +3251,11 @@ fn stripScopeGetter(name: []const u8) []const u8 {
 }
 
 /// A positional call: no entry carries an argument name.
+/// Stack argv bound for the frameless static-call shortcut. Sized to cover the
+/// arities that occur, not the frameless tier's register maximum, so the frame
+/// this sits in stays small.
+const FUSED_ARGV_MAX: usize = 12;
+
 pub fn argNamesAllNull(names: []const ?ConstId) bool {
     for (names) |n| if (n != null) return false;
     return true;

@@ -227,6 +227,7 @@ const ev_enter = @import("eval/enter.zig");
 pub const eval = ev_enter.eval;
 pub const leafExprServe = ev_enter.leafExprServe;
 pub const evalWith = ev_enter.evalWith;
+pub const fusedServeArgs = ev_enter.fusedServeArgs;
 pub const boolThisTrap = ev_enter.boolThisTrap;
 pub const dumpFnIfRequested = ev_enter.dumpFnIfRequested;
 pub const evalWithCaptures = ev_enter.evalWithCaptures;

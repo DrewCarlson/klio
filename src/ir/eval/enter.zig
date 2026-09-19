@@ -223,6 +223,31 @@ pub fn leafExprServe(
 }
 
 /// Like `eval`, but routes non-trivial dispatch through `H`, a comptime-duck-typed concrete host.
+/// The frameless tier reached straight from a static call site, whose arguments
+/// are still a contiguous register run in the caller.
+///
+/// The activation seam asks the same question, but only after the call has been
+/// turned into a carrier list and handed back through the flat loop. A body that
+/// runs frameless needs none of that: it borrows the caller's values exactly as
+/// the fused tier's own call arm does, and the caller's registers keep them
+/// reachable for the collector. Null means nothing ran and the call takes the
+/// ordinary path.
+///
+/// The preconditions are the seam's, minus the ones a plain positional static
+/// call satisfies by construction: it carries no owning receiver, no closure, no
+/// chain seed and no captures.
+pub fn fusedServeArgs(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+) Allocator.Error!?EvalResult {
+    if (nativeModuleOk(module) and nativeFor(func.id.int(), func.fqn) != null) return null;
+    return fusedExecOpt(H, allocator, module, func, args, host, false);
+}
+
 pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), host: *H) Allocator.Error!EvalResult {
     dumpFnIfRequested(module, func);
     boolThisTrap(func, args.items);
