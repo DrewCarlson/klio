@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const span = @import("span");
 const ir = @import("../ir.zig");
 const jit_loop = @import("../jit_loop.zig");
 
@@ -236,6 +237,28 @@ pub fn leafExprServe(
 /// The preconditions are the seam's, minus the ones a plain positional static
 /// call satisfies by construction: it carries no owning receiver, no closure, no
 /// chain seed and no captures.
+/// `KLIO_FUSE_GATE=1`: which conjunct of the fused tier's entry gate turns a
+/// call away. The gate excludes any call with a receiver, which is what
+/// `engine/member-calls-frameless` exists to change, and this says what that
+/// is worth before the work starts.
+pub var fuse_gate_counts: [6]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0));
+var fuse_gate_state: u8 = 0;
+
+pub fn fuseGateProbeOn() bool {
+    if (fuse_gate_state == 0)
+        fuse_gate_state = if (runtime.envOnce("KLIO_FUSE_GATE") != null) 2 else 1;
+    return fuse_gate_state == 2;
+}
+
+pub fn fuseGateDump() void {
+    if (!fuseGateProbeOn()) return;
+    const names = [_][]const u8{ "has_receiver", "is_closure", "chain_seed", "has_captures", "native_backed", "offered" };
+    for (names, 0..) |n, i| {
+        const v = fuse_gate_counts[i].load(.monotonic);
+        if (v != 0) std.debug.print("[fuse-gate] {d:>8}  {s}\n", .{ v, n });
+    }
+}
+
 pub fn fusedServeArgs(
     comptime H: type,
     allocator: Allocator,
@@ -310,14 +333,33 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
             std.debug.print("    {d}: {s}", .{ ii, @tagName(std.meta.activeTag(inst.*)) });
             switch (inst.*) {
                 .LoadGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
-                .GetField => |x| std.debug.print(" field={s} recv=r{d} dst=r{d}", .{ constStr(module, x.field) orelse "?", x.receiver.int(), x.dst.int() }),
+                .GetField => |x| std.debug.print(" field={s} recv=r{d} dst=r{d} own={s}:{d}", .{ constStr(module, x.field) orelse "?", x.receiver.int(), x.dst.int(), @tagName(x.own_kind), x.own_slot }),
                 .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
                 .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d} func={?d} final={} class={?d} cands={d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int(), if (x.func) |f| f.int() else null, x.func_final, if (x.class) |c| c.int() else null, if (x.candidates) |cl| cl.len else 0 }),
                 .CallMember => |x| std.debug.print(" name={s} recv=r{d} resolved={?d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), if (x.x().resolved) |f| f.int() else null }),
                 .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
+                .LoadParam => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
+                .Const => |x| std.debug.print(" dst=r{d}", .{x.dst.int()}),
+                .CallValue => |x| std.debug.print(" callee=r{d} dst=r{d} args=r{d}+{d}", .{ x.callee.int(), x.dst.int(), x.args.int(), x.n_args }),
+                .ContextPush => |x| std.debug.print(" args=r{d}+{d}", .{ x.args.int(), x.n }),
+                .LoadContextParam => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
-                .AstLambda => |x| std.debug.print(" dst=r{d} body=#{?d}", .{ x.dst.int(), if (x.body_func) |bf| bf.int() else null }),
+                .AstLambda => |x| {
+                    std.debug.print(" dst=r{d} body=#{?d} caps=", .{ x.dst.int(), if (x.body_func) |bf| bf.int() else null });
+                    for (x.captured_names, x.captures) |cn, cr| std.debug.print("{s}=r{d},", .{ cn, cr.int() });
+                },
                 .Call => |x| std.debug.print(" func=#{d} dst=r{d} args=r{d}+{d} exact={}", .{ x.func.int(), x.dst.int(), x.args.int(), x.n_args, x.exact }),
+                .CallValueWithThis => |x| std.debug.print(" callee=r{d} recv=r{d} dst=r{d} args=r{d}+{d} exact={}", .{ x.callee.int(), x.receiver.int(), x.dst.int(), x.args.int(), x.n_args, x.receiver_shape_exact }),
+                .CallValueOrMember => |x| std.debug.print(" name={s} callee=r{d} this=r{d} dst=r{d}", .{ constStr(module, x.name) orelse "?", x.callee.int(), x.this_recv.int(), x.dst.int() }),
+                .CallMemberOrValue => |x| std.debug.print(" name={s} recv=r{d} fallback=r{d} dst=r{d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), x.fallback.int(), x.dst.int() }),
+                .Trace => |t| {
+                    if (span.active_map) |m| {
+                        if (m.getChecked(t.span.file)) |sf| {
+                            const lc = sf.lineCol(t.span.start);
+                            std.debug.print(" {s}:{d}", .{ sf.path, lc.line });
+                        }
+                    }
+                },
                 .BinOp => |x| std.debug.print(" op={s} dst=r{d} lhs=r{d} rhs=r{d}", .{ @tagName(x.op), x.dst.int(), x.lhs.int(), x.rhs.int() }),
                 .CallVirtual => |x| std.debug.print(" slot={d} recv=r{d} dst=r{d}", .{ x.slot.int(), x.receiver.int(), x.dst.int() }),
                 else => {},
@@ -467,6 +509,21 @@ pub fn evalWithCapturesChained(
     // `allow_materialize` is false: a body the walker cannot finish pays the tier's entry AND the
     // frame it then opens, and measured against a recomposer frame that trade is a loss of 2.9%.
     // Only a body the walker runs to completion takes this path.
+    if (fuseGateProbeOn()) {
+        const slot: usize = if (owning != null)
+            0
+        else if (closure_id != null)
+            1
+        else if (chain_seed.len != 0)
+            2
+        else if (captures.items.len != 0)
+            3
+        else if (nativeModuleOk(module) and nativeFor(func.id.int(), func.fqn) != null)
+            4
+        else
+            5;
+        _ = fuse_gate_counts[slot].fetchAdd(1, .monotonic);
+    }
     if (owning == null and closure_id == null and chain_seed.len == 0 and
         captures.items.len == 0 and
         (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
@@ -514,18 +571,6 @@ pub fn evalWithCapturesChained(
     frame.module_arc = owning;
     try frame.activateChain(chain_seed);
     defer frame.deactivateChain();
-    // Receivers are context sources: feed the frame's dispatch/extension receiver into the context
-    // stack so a contextual callee resolves it. The pushes unwind on any exit, errors included.
-    const ctx_mark: usize = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
-    if (comptime @hasDecl(H, "ctxPush")) {
-        if (module.has_context_decls) {
-            if (comptime @hasDecl(H, "ctxActivate")) host.ctxActivate(true);
-            if (func.has_receiver_param and frame.params.items.len > 0) {
-                host.ctxPush(frame.params.items[0]) catch {};
-            }
-        }
-    }
-    defer if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(ctx_mark);
     const cur = func.entry;
     const result = try runFrame(H, allocator, module, &frame, &try_stack, cur, 0, host);
     return frameBoundary(func, result);

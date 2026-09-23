@@ -1,0 +1,28 @@
+{
+ "cold": true,
+ "programs": 588,
+ "unresolved": {
+  "call_member_by_name": 599423,
+  "call_member_or_global": 359034,
+  "call_member_or_value": 478,
+  "call_new_instance": 76055,
+  "call_spread_bare_name": 770,
+  "call_spread_member_name": 377,
+  "call_value_or_member": 1719,
+  "field_read_by_name": 545043,
+  "field_rmw_by_name": 1373,
+  "field_write_by_name": 47659,
+  "name_build_object": 29670,
+  "name_member_ref_by_name": 12866,
+  "name_read_global_by_name": 83689,
+  "name_read_this_or_global": 35796,
+  "name_register_class": 34,
+  "name_write_global_by_name": 14299,
+  "name_write_this_or_global": 3481,
+  "recv_enclosing_pop": 185401,
+  "recv_enclosing_push": 185401,
+  "recv_qualified_this": 2977,
+  "type_cast_by_name": 11175,
+  "type_instanceof_by_name": 4717
+ }
+}

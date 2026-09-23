@@ -56,12 +56,23 @@ def extra_args(path):
 TIMED_OUT = "timeout"
 
 
+# A dual-compute audit reports on STDERR, and this harness compares stdout.
+# Captured stderr used to be dropped, so an audit sweep over the corpus read
+# clean whatever it found: `--grep-stderr` is how a run says what it saw.
+GREP_STDERR = None
+
+
 def run(binary, path, timeout):
     try:
         p = subprocess.run(
             [binary, "run", path] + extra_args(path),
             cwd=ROOT, capture_output=True, timeout=timeout,
         )
+        if GREP_STDERR:
+            err = p.stderr.decode("utf-8", "replace")
+            for line in err.splitlines():
+                if GREP_STDERR in line:
+                    print("  [stderr] %s: %s" % (os.path.basename(path), line))
         return p.returncode, p.stdout.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
         return TIMED_OUT, ""
@@ -74,6 +85,9 @@ def main():
     ap.add_argument("--zig", default=os.path.join(ROOT, "zig-out/bin/klio"))
     ap.add_argument("--rust", default=os.path.join(ROOT, "target/release/klio"))
     ap.add_argument("--no-rust", action="store_true", help="just check Zig exits 0")
+    ap.add_argument("--grep-stderr", default=None,
+                    help="echo captured stderr lines containing this substring "
+                         "(dual-compute audits report there, not on stdout)")
     # 60s: several compose examples legitimately run 3-6s solo and the
     # parallel wall inflates 3-8x under oversubscription; 30s sat exactly on
     # the boundary and the failing SET churned run to run. Jobs capped at 12:
@@ -85,6 +99,8 @@ def main():
                     help="run against the shared ~/.klio data home (its installed packs shadow the tree)")
     ap.add_argument("pattern", nargs="?", default="examples/*.kt")
     args = ap.parse_args()
+    global GREP_STDERR
+    GREP_STDERR = args.grep_stderr
     home = os.environ.get("KLIO_HOME")
     shared = os.path.expanduser("~/.klio")
     if not args.allow_shared_home and (not home or os.path.realpath(home) == os.path.realpath(shared)):

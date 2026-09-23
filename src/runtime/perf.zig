@@ -83,6 +83,15 @@ fn resolve() Config {
         if (b) c.jit_loop = true; // function mode rides on the loop tier
     }
     if (envReclaim()) |r| c.reclaim = r;
+    // Compiled code runs past the interpreter's site gates, so the resolution
+    // ratchet would not see what it serves. It turns the compiler off rather
+    // than report an incomplete census.
+    if (envOnce("KLIO_REQUIRE_RESOLVED")) |v| {
+        if (v.len != 0 and !std.mem.eql(u8, v, "0")) {
+            c.jit_loop = false;
+            c.jit_func = false;
+        }
+    }
     cached = c;
     return c;
 }
@@ -144,4 +153,15 @@ test "resolveBinaryProfile reads flags and defaults to fast" {
     try std.testing.expectEqual(Profile.safe, resolveBinaryProfile(&.{ "run", "--opt", "safe", "a.kt" }));
     try std.testing.expectEqual(Profile.off, resolveBinaryProfile(&.{ "run", "--opt=off", "a.kt" }));
     try std.testing.expectEqual(Profile.safe, resolveBinaryProfile(&.{ "run", "-Osafe", "a.kt" }));
+}
+
+test "the resolution ratchet turns the compiler off" {
+    setProfile(.fast);
+    defer setProfile(null);
+    try std.testing.expectEqual(true, get().jit_loop);
+    objcell.envSetForTest("KLIO_REQUIRE_RESOLVED", "1");
+    defer objcell.envResetForTest("KLIO_REQUIRE_RESOLVED");
+    setProfile(.fast);
+    try std.testing.expectEqual(false, get().jit_loop);
+    try std.testing.expectEqual(false, get().jit_func);
 }

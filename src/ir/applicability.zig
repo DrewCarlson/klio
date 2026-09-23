@@ -28,7 +28,12 @@ const TypeRef = ir.TypeRef;
 const Param = ir.Param;
 const FuncId = ir.FuncId;
 
-pub const LiteralKind = enum { numeric, string, boolean, char };
+/// `integral` and `floating` are the two numeric literal forms Kotlin keeps
+/// apart: an integer literal's type is one of the integer widths and never
+/// `Double` or `Float`, so it is evidence for an integer parameter and evidence
+/// against a floating one. `numeric` is the width-unknown form, for a caller
+/// that has a numeric literal but cannot say which.
+pub const LiteralKind = enum { numeric, integral, floating, string, boolean, char };
 
 /// One actual argument at overload-pick time. Borrows, never allocates; a null
 /// field downgrades that argument to unknown, never to disproven.
@@ -383,6 +388,22 @@ pub fn tyEvidenceScore(param_name: []const u8, arg_ty_name: []const u8, member: 
     return null;
 }
 
+/// An integer literal's possible types. `Number` counts: kotlinc types the
+/// literal as `Int` and boxes it, which a `Number` parameter accepts.
+fn isIntegralHead(pn: []const u8) bool {
+    const names = [_][]const u8{
+        "Int", "Long", "Short", "Byte", "UInt", "ULong", "UShort", "UByte", "Number",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, pn, n)) return true;
+    }
+    return false;
+}
+
+fn isFloatingHead(pn: []const u8) bool {
+    return std.mem.eql(u8, pn, "Double") or std.mem.eql(u8, pn, "Float");
+}
+
 fn isNumericHead(pn: []const u8) bool {
     const names = [_][]const u8{
         "Int",  "Long",  "Short",  "Byte",  "Double", "Float",
@@ -415,6 +436,8 @@ fn literalEvidenceScore(param_name: []const u8, kind: LiteralKind) ?i32 {
     const pn = std.mem.trimEnd(u8, simpleName(param_name), "?");
     const hit = switch (kind) {
         .numeric => isNumericHead(pn),
+        .integral => isIntegralHead(pn),
+        .floating => isFloatingHead(pn) or std.mem.eql(u8, pn, "Number"),
         .string => std.mem.eql(u8, pn, "String") or std.mem.eql(u8, pn, "CharSequence"),
         .boolean => std.mem.eql(u8, pn, "Boolean"),
         .char => std.mem.eql(u8, pn, "Char"),

@@ -176,6 +176,19 @@ pub fn convertTypeRefWithTparams(
     return convertTypeRefLossy(allocator, t);
 }
 
+/// The class a checked `Type` names, for a binding that has the type in hand
+/// but no `TypeRef`. `Unresolved` carries the declared name now, and `Generic`
+/// always did, so a lambda parameter typed from its callee's expected type can
+/// say which class it is — which a bare-name read of it then reaches.
+pub fn classNameOfType(t: *const Type) ?[]const u8 {
+    return switch (t.*) {
+        .Unresolved => |name| name,
+        .Generic => |g| g.name,
+        .Nullable => |inner| classNameOfType(inner),
+        else => null,
+    };
+}
+
 pub fn classNameFromTyperef(t: *const TypeRef) ?[]const u8 {
     if (t.function != null) return null;
     if (builtinByName(t.name.name) != null) return null;
@@ -630,8 +643,8 @@ pub fn numericRank(t: *const Type) ?u8 {
 }
 
 pub fn numericLub(a: *const Type, b: *const Type) Type {
-    const ra = numericRank(a) orelse return .Unresolved;
-    const rb = numericRank(b) orelse return .Unresolved;
+    const ra = numericRank(a) orelse return Type.unresolved;
+    const rb = numericRank(b) orelse return Type.unresolved;
     const max_rank = @max(ra, rb);
     const winner = if (ra >= rb) a.nonNull().* else b.nonNull().*;
     if (max_rank <= 3 and (winner == .Byte or winner == .Short)) {
@@ -642,7 +655,7 @@ pub fn numericLub(a: *const Type, b: *const Type) Type {
 
 /// Unifies `if`/`when`/`try` branches. The result owns its heap data.
 pub fn lub(allocator: Allocator, a: *const Type, b: *const Type) Allocator.Error!Type {
-    if (a.* == .Unresolved or b.* == .Unresolved) return .Unresolved;
+    if (a.* == .Unresolved or b.* == .Unresolved) return Type.unresolved;
     if (a.eql(b.*)) return a.clone(allocator);
     if (a.* == .Nothing) return b.clone(allocator);
     if (b.* == .Nothing) return a.clone(allocator);

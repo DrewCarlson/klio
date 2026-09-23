@@ -99,102 +99,27 @@ fn charUnitToString(allocator: Allocator, unit: u16) Allocator.Error![]u8 {
     return runtime.charUnitToString(allocator, unit);
 }
 
-/// Reader-side memo for one builder: ASCII-ness, UTF-16 length and a cursor,
-/// keyed by the builder's cell and buffer identity. Every mutating builtin and
-/// every construction invalidates it, so a read-only phase costs O(1) per read
-/// instead of re-encoding the whole buffer.
-const SbMemo = struct {
-    cell: usize = 0,
-    ptr: [*]const u8 = undefined,
-    len: usize = 0,
-    ascii: bool = false,
-    u16_len: usize = 0,
-    u16_pos: usize = 0,
-    byte_pos: usize = 0,
-};
-threadlocal var sb_memo: SbMemo = .{};
+const SbMemo = runtime.SbMemo;
 
 pub fn sbMemoInvalidate(cell: usize) void {
-    if (sb_memo.cell == cell) sb_memo.cell = 0;
+    runtime.sbMemoInvalidate(cell);
 }
 
 fn sbMut(sb: anytype) @TypeOf(sb.borrowMut()) {
-    sbMemoInvalidate(@intFromPtr(sb.cell));
+    runtime.sbMemoInvalidate(@intFromPtr(sb.cell));
     return sb.borrowMut();
 }
 
 fn sbMemoFor(sb: anytype, items: []const u8) *SbMemo {
-    const key = @intFromPtr(sb.cell);
-    if (sb_memo.cell == key and sb_memo.ptr == items.ptr and sb_memo.len == items.len) return &sb_memo;
-    var ascii = true;
-    for (items) |b| {
-        if (b >= 0x80) {
-            ascii = false;
-            break;
-        }
-    }
-    sb_memo = .{
-        .cell = key,
-        .ptr = items.ptr,
-        .len = items.len,
-        .ascii = ascii,
-        .u16_len = if (ascii) items.len else charCount(items),
-    };
-    return &sb_memo;
+    return runtime.sbMemoFor(@intFromPtr(sb.cell), items);
 }
 
 fn sbUnitAt(m: *SbMemo, s: []const u8, idx: usize) ?u16 {
-    var n: usize = 0;
-    var i: usize = 0;
-    if (m.u16_pos <= idx and m.byte_pos <= s.len) {
-        n = m.u16_pos;
-        i = m.byte_pos;
-    }
-    while (i < s.len) {
-        if (runtime.isWtf8SurrogateAt(s, i)) {
-            if (n == idx) {
-                m.u16_pos = n;
-                m.byte_pos = i;
-                const unit: u16 = (@as(u16, s[i] & 0x0F) << 12) | (@as(u16, s[i + 1] & 0x3F) << 6) | @as(u16, s[i + 2] & 0x3F);
-                return unit;
-            }
-            n += 1;
-            i += 3;
-            continue;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        const end = @min(i + len, s.len);
-        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
-        const units: usize = if (cp > 0xFFFF) 2 else 1;
-        if (idx < n + units) {
-            m.u16_pos = n;
-            m.byte_pos = i;
-            if (cp <= 0xFFFF) return @intCast(cp);
-            const v = cp - 0x10000;
-            return if (idx == n) @intCast(0xD800 + (v >> 10)) else @intCast(0xDC00 + (v & 0x3FF));
-        }
-        n += units;
-        i = end;
-    }
-    return null;
+    return runtime.sbUnitAt(m, s, idx);
 }
 
 fn charCount(s: []const u8) usize {
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        if (runtime.isWtf8SurrogateAt(s, i)) {
-            n += 1;
-            i += 3;
-            continue;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        const end = @min(i + len, s.len);
-        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
-        n += if (cp > 0xFFFF) 2 else 1;
-        i = end;
-    }
-    return n;
+    return runtime.sbCharCount(s);
 }
 
 fn bufUnits(a: Allocator, s: []const u8) Allocator.Error![]u16 {

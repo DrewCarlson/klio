@@ -798,7 +798,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
             var pushed_owner = false;
             if (mptr.registry.member_ext_owner_class.get(fid)) |owner| {
                 if (try host_call_member.memberExtOwnerInstance(self, allocator, &getter_recv, owner)) |inst| {
-                    ir.eval.pushEnclosing(&inst);
+                    ir.eval.pushDispatch(&inst);
                     pushed_owner = true;
                 }
             }

@@ -139,7 +139,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     }
     {
         const owned = try allocator.dupe(Value, args);
-        try chain.append(allocator, .{ .name = ir_name, .fqn = class_fqn, .args = owned });
+        try chain.append(allocator, .{ .name = ir_name, .fqn = class_fqn, .args = owned, .cid = ctor_select.classIdOfDef(self, class_def) });
         self.ka.pushSlice(owned);
     }
     var cur_class = ir_name;
@@ -183,6 +183,13 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     }
     var pending_super_args: ?std.ArrayList(Value) = null;
     var builtin_base: ?BuiltinBase = null;
+    // The class each iteration is at: the leaf to begin with, whose def the
+    // caller passed in, and thereafter the parent the previous iteration
+    // already resolved. Re-deriving it from `cur_class` was a name probe per
+    // ancestor per construction for a handle the loop was holding a moment
+    // before.
+    var cur_def_carry: ?ObjRef(ClassDef) = class_def.clone();
+    defer if (cur_def_carry) |d| d.deinit();
     while (true) {
         const thunks_opt = parentCtorArgThunks(self, cur_fqn, cur_class);
         if (thunks_opt == null and pending_super_args == null) break;
@@ -192,12 +199,16 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
             for (thunks) |t| std.debug.print("{d} ", .{t.int()});
             std.debug.print("\n", .{});
         }
-        const cur_def = classDefByName(self, sideTableKey(cur_fqn, cur_class));
+        const cur_def = if (cur_def_carry) |d| blk: {
+            cur_def_carry = null;
+            break :blk d;
+        } else classDefByName(self, sideTableKey(cur_fqn, cur_class));
+        // Held past the parent lookup below: the parent's id is memoized on
+        // the CHILD, so releasing the child here would cost the name probe
+        // the memo exists to remove.
+        defer if (cur_def) |d| d.deinit();
         var parent_ref: ?SuperRef = null;
-        if (cur_def) |d| {
-            parent_ref = firstNonInterfaceSuper(self, d);
-            d.deinit();
-        }
+        if (cur_def) |d| parent_ref = firstNonInterfaceSuper(self, d);
         const pref = parent_ref orelse break;
         const pname = pref.name;
 
@@ -254,14 +265,24 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
             parent_args.deinit(allocator);
             break;
         }
-        const parent_def = classDefByName(self, sideTableKey(pref.fqn, pname));
+        const parent_key = sideTableKey(pref.fqn, pname);
+        const parent_def = if (cur_def) |cd|
+            (ctor_select.superDefById(self, cd, parent_key) orelse classDefByName(self, parent_key))
+        else
+            classDefByName(self, parent_key);
         const parent_is_iface = if (parent_def) |d| classDefIsInterface(d) else true;
+        // The next iteration is this parent; hand it the handle rather than
+        // let it look the same class up by name again.
+        if (parent_def) |d| {
+            if (cur_def_carry) |old_carry| old_carry.deinit();
+            cur_def_carry = d.clone();
+        }
         if (parent_def == null or parent_is_iface) {
             if (parent_def) |d| d.deinit();
             parent_args.deinit(allocator);
             break;
         }
-        switch (try expandParentSecondaryThisArgs(self, allocator, pref.fqn, pname, &parent_args, parentCtorArgNames(self, cur_fqn, cur_class), &deferred_bodies, &pending_super_args)) {
+        switch (try expandParentSecondaryThisArgs(self, allocator, pref.fqn, pname, &parent_args, parentCtorArgNames(self, cur_fqn, cur_class), &deferred_bodies, &pending_super_args, parent_def)) {
             .ok => {},
             .err => |e| {
                 if (parent_def) |d| d.deinit();
@@ -296,7 +317,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         const packed_parent = try packPrimaryCtorVarargs(self, pref.fqn, pname, try parent_args.toOwnedSlice(allocator));
         // `chain` owns the duped copy the next iteration reads; the packed dies.
         const chain_args = try allocator.dupe(Value, packed_parent);
-        try chain.append(allocator, .{ .name = pname, .fqn = pref.fqn, .args = chain_args });
+        try chain.append(allocator, .{ .name = pname, .fqn = pref.fqn, .args = chain_args, .cid = if (cur_def_carry) |d| ctor_select.classIdOfDef(self, d) else null });
         self.ka.pushSlice(chain_args);
         if (runtime.freeScratch()) allocator.free(packed_parent);
         cur_class = pname;
@@ -304,16 +325,48 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         cur_args = chain_args;
     }
 
-    // Apply primary-param properties bottom-up so child overrides win.
+    // Every slot the class layout declares exists before construction fills
+    // any of them, so a base class's slot index means the same thing in a
+    // subclass. Initializers still run in source order; they overwrite the
+    // slot the layout gave them instead of appending one. A class with no
+    // static layout keeps the old append order.
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     errdefer fields.deinit(allocator);
+    var reserved: usize = 0;
+    {
+        const lctx = layoutCtx(self, allocator);
+        var pred = try root.class_layout.predict(&lctx, class_def);
+        switch (pred) {
+            .no_layout => {},
+            .ok => |*p| {
+                defer p.deinit(allocator);
+                try fields.ensureTotalCapacity(allocator, p.slots.len);
+                for (p.slots) |s| fields.appendAssumeCapacity(.{ .name = s.name, .value = s.seed });
+                reserved = p.slots.len;
+            },
+        }
+    }
+
+    // Apply primary-param properties bottom-up so child overrides win.
     {
         var ci: usize = chain.items.len;
         while (ci > 0) {
             ci -= 1;
             const cls_name = chain.items[ci].name;
             const cls_args = chain.items[ci].args;
-            var cls_def = classDefByName(self, sideTableKey(chain.items[ci].fqn, cls_name));
+            // The leaf of the chain IS the class being constructed and its
+            // def was passed in. Looking it up again by name is a hash probe
+            // on every construction for an answer already in hand — the arm
+            // below even falls back to it, but only once the probe has run
+            // and failed. Identity is by FQN, so a same-simple-name class in
+            // another package cannot be mistaken for it.
+            const entry_key = sideTableKey(chain.items[ci].fqn, cls_name);
+            var cls_def: ?ObjRef(ClassDef) = if (std.mem.eql(u8, entry_key, classDefFqn(class_def)))
+                class_def.clone()
+            else if (chain.items[ci].cid) |c|
+                ctor_select.classDefById(self, c)
+            else
+                classDefByName(self, entry_key);
             var use_def = false;
             if (cls_def) |d| {
                 if (classDefIsInterface(d)) {
@@ -338,13 +391,22 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                         // Dedup on the storage key: a private shadow of a base
                         // ctor property must not displace the plain cell.
                         const store_key = shadowFieldKey(self, cls_name, pp[k].name);
-                        retainFieldList(&fields, allocator, store_key);
-                        if (store_key.len != pp[k].name.len and !isPrivateShadowProp(self, cls_name, pp[k].name)) {
-                            retainFieldList(&fields, allocator, pp[k].name);
-                        }
                         // The instance owns one ref to each primary-ctor field.
                         if (runtime.reclaimEnabled()) fv.retain();
-                        try fields.append(allocator, .{ .name = store_key, .value = fv });
+                        if (reservedSlot(fields.items, reserved, store_key)) |si| {
+                            if (runtime.reclaimEnabled()) fields.items[si].value.release(allocator);
+                            fields.items[si].value = fv;
+                        } else {
+                            retainFieldList(&fields, allocator, store_key);
+                            // An override with its own cell displaces the base's
+                            // plain one, unless the layout reserved that too.
+                            if (store_key.len != pp[k].name.len and !isPrivateShadowProp(self, cls_name, pp[k].name) and
+                                reservedSlot(fields.items, reserved, pp[k].name) == null)
+                            {
+                                retainFieldList(&fields, allocator, pp[k].name);
+                            }
+                            try fields.append(allocator, .{ .name = store_key, .value = fv });
+                        }
                     }
                 }
                 dg.deinit();
@@ -360,7 +422,19 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
             ci -= 1;
             const cls_name = chain.items[ci].name;
             const cls_args = chain.items[ci].args;
-            var cls_def = classDefByName(self, sideTableKey(chain.items[ci].fqn, cls_name));
+            // The leaf of the chain IS the class being constructed and its
+            // def was passed in. Looking it up again by name is a hash probe
+            // on every construction for an answer already in hand — the arm
+            // below even falls back to it, but only once the probe has run
+            // and failed. Identity is by FQN, so a same-simple-name class in
+            // another package cannot be mistaken for it.
+            const entry_key = sideTableKey(chain.items[ci].fqn, cls_name);
+            var cls_def: ?ObjRef(ClassDef) = if (std.mem.eql(u8, entry_key, classDefFqn(class_def)))
+                class_def.clone()
+            else if (chain.items[ci].cid) |c|
+                ctor_select.classDefById(self, c)
+            else
+                classDefByName(self, entry_key);
             var use_def = false;
             if (cls_def) |d| {
                 if (classDefIsInterface(d)) {
@@ -382,14 +456,23 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                 while (k < pp.len and k < cls_args.len) : (k += 1) {
                     if (pp[k].property != null) continue;
                     const pnm = pp[k].name;
-                    var present = false;
-                    for (fields.items) |f| {
-                        if (std.mem.eql(u8, f.name, pnm)) {
-                            present = true;
-                            break;
+                    // The layout reserves one capture slot per name, at the
+                    // level this walk reaches first, so filling an empty
+                    // reserved slot is the same "first writer wins" the
+                    // presence scan gave the append order.
+                    const slot = reservedSlot(fields.items, reserved, pnm);
+                    if (slot) |si| {
+                        if (fields.items[si].value != .Null) continue;
+                    } else {
+                        var present = false;
+                        for (fields.items) |f| {
+                            if (std.mem.eql(u8, f.name, pnm)) {
+                                present = true;
+                                break;
+                            }
                         }
+                        if (present) continue;
                     }
-                    if (present) continue;
                     var owned_by_body = false;
                     for (dg.get().body_properties) |bp| {
                         if (std.mem.eql(u8, bp.name, pnm)) {
@@ -400,20 +483,22 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                     if (owned_by_body) continue;
                     const fv = cls_args[k];
                     if (runtime.reclaimEnabled()) fv.retain();
-                    try fields.append(allocator, .{ .name = pnm, .value = fv });
+                    if (slot) |si| fields.items[si].value = fv else try fields.append(allocator, .{ .name = pnm, .value = fv });
                 }
                 dg.deinit();
             }
         }
     }
 
-    // Seed non-nullable primitive `var` fields with their type zero.
+    // Seed non-nullable primitive `var` fields with their type zero. A
+    // reserved slot already holds it.
     {
         var cur: ?ObjRef(ClassDef) = class_def.clone();
         while (cur) |c| {
             const g = c.borrow();
             for (g.get().body_properties) |p| {
                 if (p.init != null or p.getter != null or p.delegate != null) continue;
+                if (reservedSlot(fields.items, reserved, shadowFieldKey(self, g.get().name, p.name)) != null) continue;
                 if (p.primitive_zero) |zv| {
                     var exists = false;
                     for (fields.items) |f| {
@@ -435,15 +520,15 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     var entry_slot: ?*Value = null;
     if (common.enum_entry_preset) |preset| {
         if (std.mem.eql(u8, preset.class_fqn, class_fqn)) {
-            try fields.append(allocator, .{ .name = "name", .value = preset.name });
-            try fields.append(allocator, .{ .name = "ordinal", .value = preset.ordinal });
+            try storeListField(&fields, allocator, reserved, "name", preset.name);
+            try storeListField(&fields, allocator, reserved, "ordinal", preset.ordinal);
             entry_slot = preset.slot;
             common.enum_entry_preset = null;
         }
     }
     if (builtin_base) |bb| {
         if (runtime.reclaimEnabled()) bb.value.retain();
-        try fields.append(allocator, .{ .name = bb.key, .value = bb.value });
+        try storeListField(&fields, allocator, reserved, bb.key, bb.value);
     }
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def.clone(),
@@ -451,6 +536,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         .outer = null,
         .identity = identity,
         .native_state = null,
+        .reserved = @intCast(reserved),
     });
     const inst_value = Value{ .Instance = inst };
     // An enum entry's initializers may name the entry while it is under
@@ -528,14 +614,12 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                     .ok => |func| {
                         switch (try evalThunk(self, func, c.args)) {
                             .ok => |v| {
-                                const key = try std.fmt.allocPrint(allocator, "__delegate__{s}", .{sf.name});
+                                const key = try delegateFieldKey(self, sf.name);
                                 const g = inst.borrowMut();
-                                const already = g.get().get(key) != null;
-                                if (!already) {
-                                    try g.get().ensureFieldsOwned(allocator, 1);
-                                    try g.get().fields.append(allocator, .{ .name = key, .value = v });
-                                    g.get().invalidateShape();
-                                }
+                                // Leaf first: a more-derived delegation already
+                                // filled the slot the layout reserved for it.
+                                const cur = g.get().get(key);
+                                if (cur == null or cur.? == .Null) try g.get().define(allocator, key, v);
                                 g.deinit();
                             },
                             .err => |e| return .{ .err = e },
@@ -561,14 +645,12 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     }
     if (throwable_message) |m| {
         const g = inst.borrowMut();
-        try g.get().fields.append(allocator, .{ .name = "message", .value = m });
-        g.get().invalidateShape();
+        try g.get().define(allocator, "message", m);
         g.deinit();
     }
     if (throwable_cause) |c| {
         const g = inst.borrowMut();
-        try g.get().fields.append(allocator, .{ .name = "cause", .value = c });
-        g.get().invalidateShape();
+        try g.get().define(allocator, "cause", c);
         g.deinit();
     }
     // JVM order: fill in the stack trace at construction for a user Throwable.
@@ -720,10 +802,11 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                             break :blk bp.getter != null or bp.delegate != null or bp.is_abstract;
                         };
                         if (!skip) {
+                            const store_key = shadowFieldKey(self, cls_name, prop_name);
                             const exists = blk: {
                                 const g = inst.borrow();
                                 defer g.deinit();
-                                break :blk g.get().get(prop_name) != null;
+                                break :blk g.get().get(prop_name) != null or g.get().get(store_key) != null;
                             };
                             if (!exists) {
                                 const g = inst.borrowMut();
@@ -788,7 +871,94 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
             }
         }
     }
+    auditLayout(self, allocator, inst_value);
     return .{ .ok = inst_value };
+}
+
+/// `KLIO_LAYOUT_AUDIT`: compare the instance just built against the layout its
+/// class would have if storage were fixed at link time. Diagnostic only.
+fn auditLayout(self: *VmHost, allocator: Allocator, inst_value: Value) void {
+    if (!root.class_layout.auditOn()) return;
+    if (inst_value != .Instance) return;
+    const ctx = layoutCtx(self, allocator);
+    root.class_layout.audit(&ctx, inst_value.Instance);
+}
+
+/// The view of the program `class_layout` predicts against: the storage key a
+/// property shadows under, and the class-delegation slots the side table holds.
+pub fn layoutCtx(self: *VmHost, allocator: Allocator) root.class_layout.Ctx {
+    return .{
+        .allocator = allocator,
+        .shadow_key = &layoutShadowKey,
+        .shadow_ctx = @ptrCast(self),
+        .delegate_keys = &layoutDelegateKeys,
+        .delegate_ctx = @ptrCast(self),
+        .published = &layoutPublished,
+        .published_ctx = @ptrCast(self),
+    };
+}
+
+/// The layout the link composed for this class, when the module names one.
+///
+/// A class built at execution — a declaration inside a function body, an object
+/// expression — carries no module identity: its `fqn` is a bare name that a
+/// top-level class of the same name would answer to, so it never consults the
+/// table and the walk describes it.
+fn layoutPublished(ctx: ?*anyopaque, def: *const ClassDef) ?root.class_layout.Result {
+    const self: *VmHost = @ptrCast(@alignCast(ctx orelse return null));
+    if (def.is_local_runtime or def.is_anonymous) return null;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const cid = module.classIdByFqn(def.fqn) orelse return null;
+    const state = module.classFieldLayoutState(cid) orelse return null;
+    if (root.class_layout.noLayoutOf(state)) |why| return .{ .no_layout = why };
+    const entry = module.classFieldLayout(cid) orelse return null;
+    const slots = self.allocator.alloc(root.class_layout.Slot, entry.slots.len) catch return null;
+    for (entry.slots, slots) |src, *dst| {
+        dst.* = .{ .name = src.name, .seed = root.class_layout.seedValue(src.seed) };
+    }
+    // The class memoizes what it is handed for the rest of the program, so the
+    // materialised slots outlive every construction that reads them.
+    return .{ .ok = .{ .slots = slots, .base_count = entry.base, .owned = false } };
+}
+
+fn layoutShadowKey(ctx: ?*anyopaque, cls: []const u8, prop: []const u8) []const u8 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx orelse return prop));
+    return ctor_select.shadowFieldKey(self, cls, prop);
+}
+
+fn layoutDelegateKeys(
+    ctx: ?*anyopaque,
+    def: *const ClassDef,
+    out: *std.ArrayList(root.class_layout.Slot),
+    a: Allocator,
+) Allocator.Error!void {
+    const self: *VmHost = @ptrCast(@alignCast(ctx orelse return));
+    next: for (classDelegateThunks(self, def.fqn, def.name)) |sf| {
+        const key = try delegateFieldKey(self, sf.name);
+        // A class delegating one interface from two levels stores one field,
+        // the most derived expression's, so the layout holds one slot.
+        for (out.items) |e| {
+            if (std.mem.eql(u8, e.name, key)) continue :next;
+        }
+        try out.append(a, .{ .name = key, .seed = .Null });
+    }
+}
+
+/// The `__delegate__<Iface>` field key, interned for the program's lifetime so
+/// the reserved slot and the store agree on one name and no construction
+/// allocates a fresh copy.
+pub fn delegateFieldKey(self: *VmHost, iface_name: []const u8) Allocator.Error![]const u8 {
+    var buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "__delegate__{s}", .{iface_name}) catch
+        return std.fmt.allocPrint(self.allocator, "__delegate__{s}", .{iface_name});
+    const canon = blk: {
+        const pg = self.prog.borrowMut();
+        defer pg.deinit();
+        break :blk pg.get().memberNameCanonical(key);
+    };
+    return canon orelse try self.allocator.dupe(u8, key);
 }
 
 pub fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u8, prop_name: []const u8, inst_value: *const Value, v: Value) Allocator.Error!EvalResult {
@@ -810,6 +980,32 @@ pub fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []con
     // delegate; a plain `ReadOnlyProperty` has neither and keeps the value.
     const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInitOwned(allocator, try allocator.dupe(u8, prop_name)) } };
     return host_call_member.provideDelegateFor(self, allocator, inst_value.*, prop_ref, v);
+}
+
+/// The index of `key` among the slots the layout reserved, which a store must
+/// keep in place: moving one to the tail would shift every slot after it.
+pub fn reservedSlot(fields: []const InstanceData.Field, reserved: usize, key: []const u8) ?usize {
+    for (fields[0..@min(reserved, fields.len)], 0..) |f, i| {
+        if (f.name.ptr == key.ptr or std.mem.eql(u8, f.name, key)) return i;
+    }
+    return null;
+}
+
+/// Store `v` under `key`: into the reserved slot when the layout holds one,
+/// appended otherwise.
+fn storeListField(
+    fields: *std.ArrayList(InstanceData.Field),
+    allocator: Allocator,
+    reserved: usize,
+    key: []const u8,
+    v: Value,
+) Allocator.Error!void {
+    if (reservedSlot(fields.items, reserved, key)) |si| {
+        if (runtime.reclaimEnabled()) fields.items[si].value.release(allocator);
+        fields.items[si].value = v;
+        return;
+    }
+    try fields.append(allocator, .{ .name = key, .value = v });
 }
 
 pub fn retainFieldList(fields: *std.ArrayList(InstanceData.Field), allocator: Allocator, key: []const u8) void {

@@ -59,28 +59,7 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     return setFieldInner(self, allocator, receiver, name, value);
 }
 
-pub fn setFieldFrom(
-    self: *VmHost,
-    allocator: Allocator,
-    receiver: *const Value,
-    name: []const u8,
-    value: Value,
-    super_owner: ?[]const u8,
-) Allocator.Error!UnitResult {
-    if (super_owner == null) return setFieldInner(self, allocator, receiver, name, value);
-    const prev = fldTls().super_write_owner;
-    fldTls().super_write_owner = super_owner;
-    defer fldTls().super_write_owner = prev;
-    return setFieldInner(self, allocator, receiver, name, value);
-}
-
 pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
-    // The marker belongs to this write; writes inside the base setter do not.
-    const super_owner: ?[]const u8 = blk: {
-        const o = self.tls.super_write_owner;
-        self.tls.super_write_owner = null;
-        break :blk o;
-    };
     // `Foo.count = 1` routes to the companion singleton instance's field.
     if (receiver.* == .Class) {
         const cls_name = blk: {
@@ -108,7 +87,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
     // One memo probe replaces the ladder below for a (class, name) pair the
     // ladder already classified from class-static facts.
     const write_cache_ok = receiver.* == .Instance and !bypass_setter and
-        super_owner == null and ir.eval.dispatchCacheStable();
+        ir.eval.dispatchCacheStable();
     if (write_cache_ok) {
         const wclass_p = blk: {
             const g = receiver.Instance.borrow();
@@ -160,7 +139,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
             var pushed_owner = false;
             if (mptr.registry.member_ext_owner_class.get(f)) |owner| {
                 if (try host_call_member.memberExtOwnerInstance(self, allocator, &setter_recv, owner)) |inst| {
-                    ir.eval.pushEnclosing(&inst);
+                    ir.eval.pushDispatch(&inst);
                     pushed_owner = true;
                 }
             }
@@ -218,22 +197,6 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
             // transitive supertype set, since the declaring base need not be
             // the first-declared one.
             const setter_fid: ?FuncId = blk: {
-                // For `super.prop = v` the writing class's own setter is the
-                // one overridden, so the search starts at its supertypes; a
-                // field-backed base has none and the store below runs.
-                if (super_owner) |owner| {
-                    const mg = self.module.borrow();
-                    defer mg.deinit();
-                    if (mg.get().registry.class_super_names.get(owner)) |chain| {
-                        for (chain) |cn| {
-                            const pg = self.prog.borrow();
-                            const hit = lookupPairFuncHop(self, pg.get().instance_prop_setters, cn, real_name);
-                            pg.deinit();
-                            if (hit) |f| break :blk f;
-                        }
-                    }
-                    break :blk null;
-                }
                 // FQN key first: it stays distinct where the simple slot clobbers.
                 const rf = classFqnOf(inst);
                 if (!std.mem.eql(u8, rf, class_name)) {
@@ -358,8 +321,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
             // A stored `override val/var` keeps its own backing cell under the
             // owner-mangled key, as on the JVM, and the read path resolves the
             // nearest such cell, so a plain write must target that same cell.
-            // `super.x = v` keeps the plain name.
-            const store_name: []const u8 = if (super_owner != null) real_name else blk: {
+            const store_name: []const u8 = blk: {
                 const any_cell = pglobal: {
                     const pg = self.module.borrow();
                     defer pg.deinit();

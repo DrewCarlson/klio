@@ -63,6 +63,9 @@ fn moduleAllocator(module: *Module) Allocator {
 pub const LoweredLambda = struct {
     func: FuncId,
     captures: [][]const u8,
+    /// How many leading parameters are context parameters: the closure's
+    /// invocation binds them positionally ahead of the value parameters.
+    n_ctx: usize = 0,
 };
 
 /// Resolve a name inside a lambda body, recording a capture and emitting
@@ -226,6 +229,8 @@ pub fn lowerLambdaBodyCapturingKindWith(
 /// The driver builds one of these and hands every phase a pointer to it. The
 /// builder is a driver local, so its teardown stays with the scope that owns it.
 const LambdaBodyCtx = struct {
+    /// Leading context parameters, ahead of the value parameters.
+    n_ctx: usize = 0,
     module: *Module,
     b: *FuncBuilder,
     params: []const ast.Ident,
@@ -247,8 +252,8 @@ const BodyReturnShape = struct {
 /// an enclosing lambda's or is rejected.
 pub fn lowerLambdaBodyCapturingKindWithIt(
     module: *Module,
-    params: []const ast.Ident,
-    param_tys: []const ?ast.TypeRef,
+    params_in: []const ast.Ident,
+    param_tys_in: []const ?ast.TypeRef,
     body: *const ast.Block,
     outer: StringSet,
     is_lambda: bool,
@@ -269,8 +274,17 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
     b.setBodySpan(body.span);
+    // The body's own file settles a shared simple name by its imports, as a
+    // declaration's name span does for a function body.
+    b.setSelfDeclSpan(body.span);
     b.it_suppressed = suppress_it;
     b.it_suppressed_span = it_span;
+    // Context parameters lead the value parameters, as the function type's
+    // runtime shape has them: an anonymous function's named ones, or the
+    // anonymous slots the expected contextual function type declares.
+    const leading = try contextLeadingParams(module, &b, body.span, params_in, param_tys_in);
+    const params = leading.params;
+    const param_tys = leading.param_tys;
     var ctx: LambdaBodyCtx = .{
         .module = module,
         .b = &b,
@@ -279,6 +293,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         .body = body,
         .is_lambda = is_lambda,
         .suppress_it = suppress_it,
+        .n_ctx = leading.n_ctx,
     };
     try adoptEnclosingReceiver(&ctx);
     try inheritEnclosingLocals(&ctx);
@@ -307,7 +322,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     try boxParamsAssignedInNestedLambdas(&ctx, names.items, &boxed);
     b.setBoxedVars(boxed);
     try decl.bindParams(&b, names.items);
-    try bindAnonContextParams(&ctx);
+    try bindLeadingContextParams(&ctx, names.items, leading.n_ctx);
     try bindInferredParamTypes(&ctx, names.items);
     try bindAnnotatedParamTypes(&ctx);
     try bindLocalContextParams(&ctx);
@@ -597,21 +612,89 @@ fn boxParamsAssignedInNestedLambdas(
     }
 }
 
-/// Bind an anonymous context function's context names from the context stack.
-fn bindAnonContextParams(ctx: *LambdaBodyCtx) Allocator.Error!void {
-    const module = ctx.module;
-    const b = ctx.b;
-    // An anonymous context function binds its context names from the context stack,
-    // which the caller's `CtxCall` fills.
+/// Synthetic context slot names are unique across the bodies one thread
+/// lowers: an inner block's slot must not shadow an enclosing block's, which
+/// the body reaches by name as a capture.
+threadlocal var ctx_slot_serial: u32 = 0;
+
+pub fn nextContextSlotName(a: Allocator) Allocator.Error![]const u8 {
+    ctx_slot_serial += 1;
+    return std.fmt.allocPrint(a, "$ctx{d}", .{ctx_slot_serial});
+}
+
+const LeadingParams = struct {
+    params: []const ast.Ident,
+    param_tys: []const ?ast.TypeRef,
+    n_ctx: usize,
+};
+
+/// The parameter list with the pending context parameters in front: an
+/// anonymous function's own, or the anonymous `$ctx<i>` slots the expected
+/// function type declares. Consumes both channels.
+fn contextLeadingParams(
+    module: *Module,
+    b: *FuncBuilder,
+    sp: ast.Span,
+    params: []const ast.Ident,
+    param_tys: []const ?ast.TypeRef,
+) Allocator.Error!LeadingParams {
+    const a = b.allocator;
+    var lead_names: std.ArrayList(ast.Ident) = .empty;
+    var lead_tys: std.ArrayList(?ast.TypeRef) = .empty;
     if (module.pending_lambda_ctx_params) |ctx_params| {
         module.pending_lambda_ctx_params = null;
-        module.has_context_decls = true;
         for (ctx_params) |cp| {
-            const r = b.allocReg();
-            const ty_c = try b.module.internConst(b.allocator, .{ .String = cp.ty.name.name });
-            try b.push(.{ .CtxLoad = .{ .dst = r, .ty = ty_c, .erased = false } });
-            try b.bind(cp.name.name, r);
+            const name = if (std.mem.eql(u8, cp.name.name, "_"))
+                try nextContextSlotName(a)
+            else
+                cp.name.name;
+            try lead_names.append(a, .{ .name = name, .span = cp.name.span });
+            try lead_tys.append(a, cp.ty);
         }
+    }
+    if (module.pending_lambda_ctx_types) |tys| {
+        module.pending_lambda_ctx_types = null;
+        for (tys) |ty| {
+            const name = try nextContextSlotName(a);
+            try lead_names.append(a, .{ .name = name, .span = sp });
+            try lead_tys.append(a, if (ty.len == 0) null else ast.TypeRef{
+                .name = .{ .name = ty, .span = sp },
+                .nullable = false,
+                .span = sp,
+                .type_args = &.{},
+                .function = null,
+                .definitely_non_null = false,
+            });
+        }
+    }
+    const n_ctx = lead_names.items.len;
+    if (n_ctx == 0) return .{ .params = params, .param_tys = param_tys, .n_ctx = 0 };
+    try lead_names.appendSlice(a, params);
+    // The value parameters' annotations stay aligned with their names.
+    var i: usize = 0;
+    while (i < params.len) : (i += 1) {
+        try lead_tys.append(a, if (i < param_tys.len) param_tys[i] else null);
+    }
+    return .{
+        .params = try lead_names.toOwnedSlice(a),
+        .param_tys = try lead_tys.toOwnedSlice(a),
+        .n_ctx = n_ctx,
+    };
+}
+
+/// The leading context parameters, once bound, are the context values this
+/// body names first; the construction site's follow, reached as captures.
+fn bindLeadingContextParams(ctx: *LambdaBodyCtx, names: []const []const u8, n_ctx: usize) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
+    var i: usize = 0;
+    while (i < n_ctx and i < names.len and i < ctx.param_tys.len) : (i += 1) {
+        const head: []const u8 = if (ctx.param_tys[i]) |t| t.name.name else "";
+        try b.addContextLocal(names[i], head);
+    }
+    if (module.pending_lambda_ctx_scope) |scope| {
+        module.pending_lambda_ctx_scope = null;
+        try b.ctx_scope.appendSlice(b.allocator, scope);
     }
 }
 
@@ -866,6 +949,11 @@ fn finishBodyFunc(
     // The receiver head may alias a span-keyed `lambda_arg_recv` entry the builder
     // frees at teardown, and the Func outlives the builder, so it must own its copy.
     extra.lambda_receiver_ty = if (b.recvTy()) |head| try b.allocator.dupe(u8, head) else null;
+    // The lexically enclosing class, recorded here because this is the only
+    // point that knows it: the body becomes a `Func` with no declaration, and
+    // every later pass that asks "what receivers are in scope at this site"
+    // has nothing to read. An empty string is "recorded, and there is none".
+    extra.lexical_owner = if (b.ownerClass()) |oc| try b.allocator.dupe(u8, oc) else "";
     try func.setExtra(b.allocator, extra);
     const placed_params = try placeDeclaredParams(ctx, names);
     func.params = placed_params;
@@ -879,7 +967,7 @@ fn finishBodyFunc(
     // probe reads the frame fn's decl_span file, and an imported companion extension
     // is in scope in the file that wrote the lambda.
     try module.decl_span.put(id.int(), body.span);
-    return .{ .func = id, .captures = captured };
+    return .{ .func = id, .captures = captured, .n_ctx = ctx.n_ctx };
 }
 
 /// Static return type of a lambda whose body is a single numeric literal, read by

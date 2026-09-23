@@ -173,6 +173,46 @@ pub fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const 
     return .{ .fields = try out.toOwnedSlice(gpa), .parent = parent, .complete = complete };
 }
 
+/// `KLIO_CGEN_LAYOUT_CHECK=1`: compare the order this file computed against the
+/// one the module published, for every class the emitter laid out.
+///
+/// The two are written independently — this one from `ir.Class` and the cgen
+/// property table, the published one from the runtime class graph — so their
+/// agreeing is much stronger evidence than either agreeing with itself. The
+/// emitter refuses far more classes than the interpreter does, so this covers
+/// the simple shapes only; `slots` past the declared prefix are the chain's
+/// captures, which the emitter never lays out.
+pub fn checkAgainstPublished(m: *const Module, table: []const ?[]const FieldInfo) void {
+    if (std.c.getenv("KLIO_CGEN_LAYOUT_CHECK") == null) return;
+    var checked: usize = 0;
+    var diverged: usize = 0;
+    var unpublished: usize = 0;
+    for (table, 0..) |slot, i| {
+        const fields = slot orelse continue;
+        const cid = ir.ClassId.from(@intCast(i));
+        const entry = m.classFieldLayout(cid) orelse {
+            unpublished += 1;
+            std.debug.print("[cgen-layout-check] class={s} kind=unpublished\n", .{m.classes.items[i].fqn});
+            continue;
+        };
+        checked += 1;
+        const declared = entry.slots[0..entry.declared];
+        var bad = false;
+        var k: usize = 0;
+        while (k < @max(fields.len, declared.len)) : (k += 1) {
+            const want: ?[]const u8 = if (k < fields.len) fields[k].name else null;
+            const got: ?[]const u8 = if (k < declared.len) declared[k].name else null;
+            if (want != null and got != null and std.mem.eql(u8, want.?, got.?)) continue;
+            bad = true;
+            std.debug.print("[cgen-layout-check] class={s} kind=mismatch slot={d} cgen={s} published={s}\n", .{
+                m.classes.items[i].fqn, k, want orelse "-", got orelse "-",
+            });
+        }
+        if (bad) diverged += 1;
+    }
+    std.debug.print("[cgen-layout-check] classes={d} diverged={d} unpublished={d}\n", .{ checked, diverged, unpublished });
+}
+
 /// Whether the name spells the BACKING FIELD rather than the property: the
 /// lowering marks a `field` read or write inside an accessor this way. The
 /// `$sgetter$<owner>` form is not one, but an ordinary property read.

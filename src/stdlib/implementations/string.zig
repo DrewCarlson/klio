@@ -257,38 +257,6 @@ fn utf16Len(s: []const u8) usize {
     return n;
 }
 
-/// The UTF-16 code unit at index `i`. On the memoized receiver the walk resumes
-/// from the last position, so a sequential `s[i]` loop stays linear.
-fn utf16UnitAt(s: []const u8, i: usize) ?u16 {
-    var n: usize = 0;
-    var it = Utf16View{ .bytes = s };
-    const memo = memoFor(s);
-    if (memo) |m| {
-        const c = m.cursor();
-        if (c.u16_pos <= i and c.byte_pos <= s.len) {
-            n = c.u16_pos;
-            it.pos = c.byte_pos;
-        }
-    }
-    while (true) {
-        const start = it.pos;
-        const u = it.next() orelse return null;
-        if (it.pending_low) |low| {
-            if (n == i or n + 1 == i) {
-                if (memo) |m| m.save(n, start);
-                return if (n == i) u else low;
-            }
-            _ = it.next();
-            n += 2;
-        } else {
-            if (n == i) {
-                if (memo) |m| m.save(n, start);
-                return u;
-            }
-            n += 1;
-        }
-    }
-}
 
 fn utf16Units(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
     var out: std.ArrayList(u16) = .empty;
@@ -585,7 +553,7 @@ pub fn string_get(ctx: *CallCtx) Allocator.Error!EvalResult {
             unit = if (ui < sd.bytes.len) @as(u16, sd.bytes[ui]) else null;
         } else {
             noteRecvData(sd);
-            unit = utf16UnitAt(sd.bytes, ui);
+            unit = sd.utf16UnitAt(ui);
         }
     }
     if (unit) |c| return .{ .ok = .{ .Char = c } };
@@ -2796,46 +2764,7 @@ fn normalizeScientific(allocator: Allocator, s: []const u8, upper: bool) Allocat
     return std.fmt.allocPrint(allocator, "{s}{c}{c}{d:0>2}", .{ mantissa, e_letter, exp_sign, exp_mag });
 }
 
-const Utf16View = struct {
-    bytes: []const u8,
-    pos: usize = 0,
-    pending_low: ?u16 = null,
-
-    fn next(self: *Utf16View) ?u16 {
-        if (self.pending_low) |low| {
-            self.pending_low = null;
-            return low;
-        }
-        if (self.pos >= self.bytes.len) return null;
-        if (isWtf8SurrogateAt(self.bytes, self.pos)) {
-            const unit = wtf8SurrogateUnit(self.bytes, self.pos);
-            self.pos += 3;
-            return unit;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(self.bytes[self.pos]) catch {
-            const unit: u16 = self.bytes[self.pos];
-            self.pos += 1;
-            return unit;
-        };
-        if (self.pos + len > self.bytes.len) {
-            const unit: u16 = self.bytes[self.pos];
-            self.pos += 1;
-            return unit;
-        }
-        const cp = std.unicode.utf8Decode(self.bytes[self.pos .. self.pos + len]) catch {
-            const unit: u16 = self.bytes[self.pos];
-            self.pos += 1;
-            return unit;
-        };
-        self.pos += len;
-        if (cp <= 0xFFFF) return @intCast(cp);
-        const adjusted = cp - 0x10000;
-        const high: u16 = @intCast(0xD800 + (adjusted >> 10));
-        const low: u16 = @intCast(0xDC00 + (adjusted & 0x3FF));
-        self.pending_low = low;
-        return high;
-    }
-};
+const Utf16View = runtime.Utf16View;
 
 fn appendScalar(allocator: Allocator, out: *std.ArrayList(u8), cp: u21) Allocator.Error!void {
     var buf: [4]u8 = undefined;

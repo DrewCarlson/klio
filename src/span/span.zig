@@ -178,6 +178,13 @@ pub const SourceMap = struct {
 /// outside a run.
 pub var active_map: ?*const SourceMap = null;
 
+/// `KLIO_FILE_IDS`: every file id with its path, so a `f<id>` in a trace can
+/// be read.
+pub fn dumpFileIds(map: *const SourceMap) void {
+    if (std.c.getenv("KLIO_FILE_IDS") == null) return;
+    for (map.files.items, 0..) |f, fi| std.debug.print("[file] f{d} {s}\n", .{ fi, f.path });
+}
+
 test "span join extends range" {
     const f = FileId.from(0);
     const a = Span.init(f, 0, 3);

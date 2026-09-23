@@ -14,6 +14,7 @@ const BinOp = ir.BinOp;
 const Reg = ir.Reg;
 const FuncId = ir.FuncId;
 const StringSet = runtime.NameHashMap(void);
+const implicit_walk = @import("implicit_walk.zig");
 const testing = std.testing;
 
 const expr_mod = @import("../expr.zig");
@@ -172,9 +173,27 @@ test "bare enclosing property lowers with its outer getter owner" {
     );
 }
 
+/// A class the super tests resolve against.
+fn superTestClass(m: *Module, name: []const u8, supertypes: []ir.ClassId) !ir.ClassId {
+    return try m.addClass(testing.allocator, .{
+        .id = ir.ClassId.from(0),
+        .name = name,
+        .fqn = name,
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = supertypes,
+    });
+}
+
 test "super property in a lambda uses the enclosing this capture" {
     var m = Module.default(testing.allocator);
     defer m.deinit(testing.allocator);
+    var no_sups = [_]ir.ClassId{};
+    const base = try superTestClass(&m, "Base", &no_sups);
+    var derived_sups = [_]ir.ClassId{base};
+    const derived = try superTestClass(&m, "Derived", &derived_sups);
     var b = try FuncBuilder.init(testing.allocator, &m);
     defer b.deinit();
     b.setOwnerClass("Derived");
@@ -197,16 +216,27 @@ test "super property in a lambda uses the enclosing this capture" {
     const func = try b.finish("f", "Derived.f", build.typeString());
     defer freeFunc(func);
 
+    // The accessor does not exist while this body lowers, so the read is
+    // left for the link pass against the class whose supertypes the plain
+    // `super` means. The receiver copy the emitter makes fuses into the
+    // capture load, which then writes the read's own receiver register.
     try testing.expectEqual(@as(usize, 2), func.blocks[0].insts.len);
     const capture = func.blocks[0].insts[0].LoadCapture;
-    const call = func.blocks[0].insts[1].CallSuper;
-    try testing.expectEqual(capture.dst, call.receiver);
+    const read = func.blocks[0].insts[1].GetField;
+    try testing.expectEqual(capture.dst, read.receiver);
+    try testing.expect(read.own_kind == .super_target);
+    try testing.expectEqual(derived, read.own_cls.?);
+    try testing.expectEqual(@as(u32, 0), read.own_slot);
     try testing.expectEqualStrings("this", func.x().capture_order[capture.idx]);
 }
 
 test "labeled super starts at the labeled outer class on this@Outer" {
     var m = Module.default(testing.allocator);
     defer m.deinit(testing.allocator);
+    var no_sups = [_]ir.ClassId{};
+    const base = try superTestClass(&m, "Base", &no_sups);
+    var outer_sups = [_]ir.ClassId{base};
+    const outer = try superTestClass(&m, "Outer", &outer_sups);
     var b = try FuncBuilder.init(testing.allocator, &m);
     defer b.deinit();
     b.setOwnerClass("Inner");
@@ -233,10 +263,10 @@ test "labeled super starts at the labeled outer class on this@Outer" {
     try testing.expectEqual(@as(usize, 2), func.blocks[0].insts.len);
     const qthis = func.blocks[0].insts[0].QualifiedThis;
     try testing.expectEqualStrings("Outer", m.consts.items[qthis.qualifier.int()].String);
-    const call = func.blocks[0].insts[1].CallSuper;
-    try testing.expectEqual(qthis.dst, call.receiver);
-    try testing.expectEqualStrings("Outer", m.consts.items[call.owner_class.int()].String);
-    try testing.expect(call.qualifier == null);
+    const read = func.blocks[0].insts[1].GetField;
+    try testing.expectEqual(qthis.dst, read.receiver);
+    try testing.expect(read.own_kind == .super_target);
+    try testing.expectEqual(outer, read.own_cls.?);
 }
 
 test "lowers int min value as int" {
@@ -1094,6 +1124,11 @@ test "receiver callable emission respects members and lazy extensions" {
         .names = names,
         .complete = true,
     });
+    // A name some class declares is in the module-wide member-name set: the
+    // collector fills it from the same declarations the hierarchy set comes
+    // from, so a fixture that names one without the other is not a module
+    // lowering can ever see.
+    try m.registry.class_member_names.put("member", {});
 
     const ext = m.nextFuncId();
     try m.funcs.append(a, .{
@@ -1115,6 +1150,10 @@ test "receiver callable emission respects members and lazy extensions" {
         .kind = .top_level_extension,
         .has_body = true,
     });
+    // Every build pipeline pairs a `func_index` append with a name-index
+    // push; a fixture that skips it hides the extension from every lookup
+    // that asks by simple name.
+    try m.rebuildFuncNameIndex(a);
 
     var b = try FuncBuilder.init(a, &m);
     defer b.deinit();
@@ -1173,6 +1212,15 @@ test "receiver callable emission respects members and lazy extensions" {
     try testing.expect(receiver_fallback.fallback_takes_receiver);
     try testing.expect(receiver_fallback.fallback_receiver_shape_known);
 
+    // `value` above is answered by the receiver's own type; this one is
+    // answered without it. No class in the module declares `unclaimed`, so no
+    // receiver can, and the in-scope callable is the only candidate left.
+    try b.bind("unclaimed", b.allocReg());
+    try b.markParam("unclaimed");
+    try b.markReceiverLambdaParam("unclaimed");
+    try b.markReceiverLambdaArity("unclaimed", 0);
+    try Expect.lower(&b, &receiver, "unclaimed", .CallValueWithThis);
+
     // A receiver-function-typed local is the same proven callable shape as a
     // parameter, even when its underlying value is an ordinary function adapted at
     // the assignment.
@@ -1184,16 +1232,22 @@ test "receiver callable emission respects members and lazy extensions" {
     ].CallValueWithThis;
     try testing.expect(typed_call.receiver_shape_exact);
 
-    // A plain local stays on the member-or-value compatibility form and never
-    // receives the call receiver positionally.
+    // A local function without a receiver is not a candidate for a call
+    // with one: the call is a member call on the receiver.
     try b.bind("plain", b.allocReg());
     try b.markLocalFn("plain");
-    try Expect.lower(&b, &receiver, "plain", .CallMemberOrValue);
-    const plain_fallback = b.blocks.items[b.cur.int()].insts[
-        b.blocks.items[b.cur.int()].insts.len - 1
-    ].CallMemberOrValue;
-    try testing.expect(!plain_fallback.fallback_takes_receiver);
-    try testing.expect(plain_fallback.fallback_receiver_shape_known);
+    try Expect.lower(&b, &receiver, "plain", .CallMember);
+
+    // Nor is a local whose declared type is a class without an `invoke`.
+    try b.bind("holder", b.allocReg());
+    try b.markParam("holder");
+    try b.setLocalDeclType("holder", "Target");
+    try Expect.lower(&b, &receiver, "holder", .CallMember);
+
+    // A local of a type lowering cannot see keeps the arbitrated form.
+    try b.bind("opaque", b.allocReg());
+    try b.markParam("opaque");
+    try Expect.lower(&b, &receiver, "opaque", .CallMemberOrValue);
 
     // An erased receiver removes the member leg but does not prove a same-named
     // local callable; exact value dispatch still needs its declared shape.
@@ -1573,4 +1627,485 @@ test "a member reference on a scope-renamed nested class loads the lifted name" 
     }
     try testing.expect(lifted);
     try testing.expect(!bare);
+}
+
+test "a bare call binds the innermost receiver whose member accepts the arguments" {
+    // `f()` inside a closure whose captured `this` is an `Inner` declaring
+    // only `f(x: Int)`, with an `Outer` declaring `f()` behind it under
+    // `this@probe`: Kotlin passes the receiver whose members refuse the
+    // arguments and binds the next, reached here through the label's
+    // capture. `f(1)` binds the `Inner` member on the captured `this`.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    try m.registry.file_packages.put(sp.file, "sample");
+    const f_in = m.nextFuncId();
+    const inner_methods = try a.dupe(ir.FuncId, &.{f_in});
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Inner",
+        .fqn = "sample.Inner",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = inner_methods,
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    try m.funcs.append(a, .{
+        .id = f_in,
+        .name = "f",
+        .fqn = "sample.Inner.f",
+        .package = "sample",
+        .params = try a.dupe(ir.Param, &.{
+            .{ .name = "this", .ty = .{ .name = "Inner", .nullable = false, .args = &.{} }, .default = null },
+            .{ .name = "x", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null },
+        }),
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    try m.func_index.append(a, .{ .name = "f", .id = f_in });
+    try m.decl_sigs.put(f_in.int(), .{
+        .enclosing_class = ir.ClassId.from(0),
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = try a.dupe(ir.TypeRef, &.{.{ .name = "Int", .nullable = false, .args = &.{} }}),
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    try m.registerMemberDecl(a, "sample.Inner", "f", f_in);
+    const f_out = m.nextFuncId();
+    const outer_methods = try a.dupe(ir.FuncId, &.{f_out});
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(1),
+        .name = "Outer",
+        .fqn = "sample.Outer",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = outer_methods,
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    try m.funcs.append(a, .{
+        .id = f_out,
+        .name = "f",
+        .fqn = "sample.Outer.f",
+        .package = "sample",
+        .params = try a.dupe(ir.Param, &.{
+            .{ .name = "this", .ty = .{ .name = "Outer", .nullable = false, .args = &.{} }, .default = null },
+        }),
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    try m.func_index.append(a, .{ .name = "f", .id = f_out });
+    try m.decl_sigs.put(f_out.int(), .{
+        .enclosing_class = ir.ClassId.from(1),
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    try m.registerMemberDecl(a, "sample.Outer", "f", f_out);
+    try m.rebuildFuncNameIndex(a);
+    for ([_][]const u8{ "Inner", "Outer" }) |cls| {
+        var names = runtime.NameHashMap(void).init(a);
+        try names.put("f", {});
+        try m.registry.hierarchy_shadow_names.put(cls, .{ .names = names, .complete = true });
+    }
+
+    const previous_package = build.setLowerSelfPackage("sample");
+    defer _ = build.setLowerSelfPackage(previous_package);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    // A closure body: `this` and the enclosing body's `this@probe` arrive
+    // through capture slots, which the walk materialises on a hit.
+    b.setRecvTy("Inner");
+    var outer = StringSet.init(a);
+    try outer.put("this", {});
+    try outer.put("this@probe", {});
+    b.setOuterNames(outer);
+    try b.setImplicitReceiverTower(&.{
+        .{ .head = "Inner", .label = null },
+        .{ .head = "Outer", .label = "probe" },
+    });
+
+    const ident = ast.Ident{ .name = "f", .span = sp };
+    const bare = try implicit_walk.walkCall(&b, ident, &.{}, &.{}, "test");
+    try testing.expect(bare == .member);
+    try testing.expectEqualStrings("Outer", bare.member.head);
+    try testing.expectEqual(b.captureReg("this@probe").?, bare.member.reg);
+
+    var one = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = sp } };
+    const args = [_]Expr{one};
+    const names = [_]?[]const u8{null};
+    _ = &one;
+    const with_arg = try implicit_walk.walkCall(&b, ident, &args, &names, "test");
+    try testing.expect(with_arg == .member);
+    try testing.expectEqualStrings("Inner", with_arg.member.head);
+    try testing.expectEqual(b.captureReg("this").?, with_arg.member.reg);
+}
+
+test "the walk answers an owner member behind an extension receiver with the dispatch register" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    try m.registry.file_packages.put(sp.file, "sample");
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Density",
+        .fqn = "sample.Density",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(1),
+        .name = "Box",
+        .fqn = "sample.Box",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    const density_names = runtime.NameHashMap(void).init(a);
+    try m.registry.hierarchy_shadow_names.put("Density", .{ .names = density_names, .complete = true });
+    var box_names = runtime.NameHashMap(void).init(a);
+    try box_names.put("count", {});
+    try m.registry.hierarchy_shadow_names.put("Box", .{ .names = box_names, .complete = true });
+    try m.registry.class_prop_type_heads.put(.{ .a = "Box", .b = "count" }, "Int");
+
+    const previous_package = build.setLowerSelfPackage("sample");
+    defer _ = build.setLowerSelfPackage(previous_package);
+
+    // `fun Density.px()` inside `Box`: `this` is the Density, and the frame
+    // loaded its dispatch receiver, the Box, into a register of its own.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        b.setOwnerClass("Box");
+        b.setRecvTy("Density");
+        try b.bind("this", b.allocReg());
+        const dispatch_reg = b.allocReg();
+        b.setDispatchThisReg(dispatch_reg);
+        const v = try implicit_walk.walk(&b, "count", null, .property, "test");
+        try testing.expect(v == .member);
+        try testing.expectEqual(dispatch_reg, v.member.reg);
+        try testing.expectEqualStrings("Box", v.member.head);
+    }
+    // The same body with no dispatch register has no value to read the
+    // owner's member off.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        b.setOwnerClass("Box");
+        b.setRecvTy("Density");
+        try b.bind("this", b.allocReg());
+        const v = try implicit_walk.walk(&b, "count", null, .property, "test");
+        try testing.expect(v == .undecided);
+        try testing.expect(v.undecided == .dispatch_receiver_unreachable);
+    }
+}
+
+test "the walk skips a subject the body's this does not reach" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    try m.registry.file_packages.put(sp.file, "sample");
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Lock",
+        .fqn = "sample.Lock",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(1),
+        .name = "Cache",
+        .fqn = "sample.Cache",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    const lock_names = runtime.NameHashMap(void).init(a);
+    try m.registry.hierarchy_shadow_names.put("Lock", .{ .names = lock_names, .complete = true });
+    var cache_names = runtime.NameHashMap(void).init(a);
+    try cache_names.put("size", {});
+    try m.registry.hierarchy_shadow_names.put("Cache", .{ .names = cache_names, .complete = true });
+    try m.registry.class_prop_type_heads.put(.{ .a = "Cache", .b = "size" }, "Int");
+
+    const previous_package = build.setLowerSelfPackage("sample");
+    defer _ = build.setLowerSelfPackage(previous_package);
+
+    // `lock.synchronized { size }` inside `Cache`: the extension splice bound
+    // the Lock as a subject and the block restored the body's own `this`, so
+    // the Lock is no receiver of the block and `size` is the Cache's.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        b.setOwnerClass("Cache");
+        const own = b.allocReg();
+        try b.bind("this", own);
+        const lock = b.allocReg();
+        try b.subject_binds.append(a, .{ .reg = lock, .head = "Lock", .prior_this = own, .label = "synchronized" });
+        const v = try implicit_walk.walk(&b, "size", null, .property, "test");
+        try testing.expect(v == .member);
+        try testing.expectEqual(own, v.member.reg);
+        try testing.expectEqualStrings("Cache", v.member.head);
+    }
+    // The same subjects with `this` bound to a register no subject and no
+    // prior names: a window rebound it without a record, and nothing here
+    // can say what it is.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        b.setOwnerClass("Cache");
+        const own = b.allocReg();
+        const lock = b.allocReg();
+        try b.subject_binds.append(a, .{ .reg = lock, .head = "Lock", .prior_this = own, .label = "synchronized" });
+        try b.bind("this", b.allocReg());
+        const v = try implicit_walk.walk(&b, "size", null, .property, "test");
+        try testing.expect(v == .undecided);
+        try testing.expect(v.undecided == .this_rebound_unknown);
+    }
+}
+
+test "a closure reads its captured this behind a subject it does not reach" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    try m.registry.file_packages.put(sp.file, "sample");
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Lock",
+        .fqn = "sample.Lock",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(1),
+        .name = "Cache",
+        .fqn = "sample.Cache",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    const lock_names = runtime.NameHashMap(void).init(a);
+    try m.registry.hierarchy_shadow_names.put("Lock", .{ .names = lock_names, .complete = true });
+    var cache_names = runtime.NameHashMap(void).init(a);
+    try cache_names.put("size", {});
+    try m.registry.hierarchy_shadow_names.put("Cache", .{ .names = cache_names, .complete = true });
+    try m.registry.class_prop_type_heads.put(.{ .a = "Cache", .b = "size" }, "Int");
+
+    const previous_package = build.setLowerSelfPackage("sample");
+    defer _ = build.setLowerSelfPackage(previous_package);
+
+    // `run { lock.synchronized { size } }` inside `Cache`: the lambda loaded
+    // its captured `this` before the Lock bound, so the Lock displaced that
+    // register and the block reads `size` off it.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        var outer = StringSet.init(a);
+        try outer.put("this", {});
+        b.setOuterNames(outer);
+        b.setOwnerClass("Cache");
+        try b.setImplicitReceiverTower(&.{.{ .head = "Cache", .label = null }});
+        const own = try b.loadCaptureHoisted("this");
+        try b.bind("this", own);
+        const lock = b.allocReg();
+        try b.subject_binds.append(a, .{ .reg = lock, .head = "Lock", .prior_this = own, .label = "synchronized" });
+        const v = try implicit_walk.walk(&b, "size", null, .property, "test");
+        try testing.expect(v == .member);
+        try testing.expectEqual(own, v.member.reg);
+        try testing.expectEqualStrings("Cache", v.member.head);
+    }
+    // The same block in a lambda that had not touched `this` when the Lock
+    // bound: the subject displaced nothing, and `size` is read off the
+    // capture, loaded on this first use.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        var outer = StringSet.init(a);
+        try outer.put("this", {});
+        b.setOuterNames(outer);
+        b.setOwnerClass("Cache");
+        try b.setImplicitReceiverTower(&.{.{ .head = "Cache", .label = null }});
+        const lock = b.allocReg();
+        try b.subject_binds.append(a, .{ .reg = lock, .head = "Lock", .prior_this = null, .label = "synchronized" });
+        const v = try implicit_walk.walk(&b, "size", null, .property, "test");
+        try testing.expect(v == .member);
+        try testing.expectEqual(b.capture_regs.get("this").?, v.member.reg);
+        try testing.expectEqualStrings("Cache", v.member.head);
+    }
+}
+
+test "an inner class reaches an outer member through its outer link" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    try m.registry.file_packages.put(sp.file, "sample");
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Outer",
+        .fqn = "sample.Outer",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(1),
+        .name = "Mid",
+        .fqn = "sample.Outer.Mid",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+        .is_inner = true,
+    });
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(2),
+        .name = "Nested",
+        .fqn = "sample.Outer.Nested",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    var outer_names = runtime.NameHashMap(void).init(a);
+    try outer_names.put("count", {});
+    try m.registry.hierarchy_shadow_names.put("Outer", .{ .names = outer_names, .complete = true });
+    try m.registry.class_prop_type_heads.put(.{ .a = "Outer", .b = "count" }, "Int");
+    const mid_names = runtime.NameHashMap(void).init(a);
+    try m.registry.hierarchy_shadow_names.put("Mid", .{ .names = mid_names, .complete = true });
+    const nested_names = runtime.NameHashMap(void).init(a);
+    try m.registry.hierarchy_shadow_names.put("Nested", .{ .names = nested_names, .complete = true });
+    try m.registry.enclosing_class.put("Mid", "Outer");
+    try m.registry.enclosing_class.put("Nested", "Outer");
+
+    const previous_package = build.setLowerSelfPackage("sample");
+    defer _ = build.setLowerSelfPackage(previous_package);
+
+    // `count` inside `inner class Mid`: one hop along the outer link from the
+    // body's own `this`, and the member binds on the Outer that hop yields.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        b.setOwnerClass("Mid");
+        const own = b.allocReg();
+        try b.bind("this", own);
+        const v = try implicit_walk.walk(&b, "count", null, .property, "test");
+        try testing.expect(v == .member);
+        try testing.expectEqualStrings("Outer", v.member.head);
+        const insts = b.blocks.items[b.cur.int()].insts;
+        try testing.expect(insts.len != 0);
+        const last = insts[insts.len - 1];
+        try testing.expect(last == .LoadOuterThis);
+        try testing.expectEqual(own, last.LoadOuterThis.src);
+        try testing.expectEqual(v.member.reg, last.LoadOuterThis.dst);
+    }
+    // A nested class has no instance of its outer: the name stays with the
+    // enclosing-member set.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        b.setOwnerClass("Nested");
+        try b.bind("this", b.allocReg());
+        var encl = StringSet.init(a);
+        try encl.put("count", {});
+        b.setEnclosingMembers(encl);
+        const v = try implicit_walk.walk(&b, "count", null, .property, "test");
+        try testing.expect(v == .undecided);
+        try testing.expect(v.undecided == .outer_class_declares);
+    }
+    // An inner class's constructor context binds `this` to the enclosing
+    // instance already: no hop, and the member binds on that register.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        b.setOwnerClass("Mid");
+        b.this_is_outer = true;
+        const outer_reg = b.allocReg();
+        try b.bind("this", outer_reg);
+        const v = try implicit_walk.walk(&b, "count", null, .property, "test");
+        try testing.expect(v == .member);
+        try testing.expectEqualStrings("Outer", v.member.head);
+        try testing.expectEqual(outer_reg, v.member.reg);
+        const insts = b.blocks.items[b.cur.int()].insts;
+        for (insts) |inst| try testing.expect(inst != .LoadOuterThis);
+    }
+    // `this@Outer` inside `inner class Mid` is the outer register, one hop;
+    // `this@Mid` is the own register; a class nothing here names is nobody's.
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        b.setOwnerClass("Mid");
+        const own = b.allocReg();
+        try b.bind("this", own);
+        const outer = (try implicit_walk.instanceOfClassReg(b: {
+            break :b &b;
+        }, "Outer")).?;
+        const insts = b.blocks.items[b.cur.int()].insts;
+        try testing.expect(insts.len == 1 and insts[0] == .LoadOuterThis);
+        try testing.expectEqual(own, insts[0].LoadOuterThis.src);
+        try testing.expectEqual(outer, insts[0].LoadOuterThis.dst);
+        try testing.expectEqual(own, (try implicit_walk.instanceOfClassReg(&b, "Mid")).?);
+        try testing.expect((try implicit_walk.instanceOfClassReg(&b, "Elsewhere")) == null);
+    }
 }

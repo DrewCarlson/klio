@@ -60,12 +60,21 @@ fn emitWarn(self: *Checker, msg: []const u8, sp: Span, code: []const u8) Allocat
     try self.diagnostics.emit(self.allocator, d);
 }
 
+var type_trace_probe: u8 = 0;
+/// `KLIO_TYPE_TRACE=1`: one `[type]` row per recorded span.
+fn typeTraceOn() bool {
+    if (type_trace_probe == 0)
+        type_trace_probe = if (std.c.getenv("KLIO_TYPE_TRACE") != null) 2 else 1;
+    return type_trace_probe == 2;
+}
+
 /// Frees any prior entry, so repeated checks of one span do not leak. The map
 /// owns the stored value.
 fn recordType(self: *Checker, sp: Span, ty: *const Type) Allocator.Error!void {
     if (self.generic_body_depth != 0) {
         try self.types_instantiation_dependent.put(sp, {});
     }
+    if (typeTraceOn()) std.debug.print("[type] f{d}:{d}-{d} {f}\n", .{ sp.file.int(), sp.start, sp.end, ty.* });
     const owned = try ty.clone(self.allocator);
     const gop = try self.types.getOrPut(sp);
     if (gop.found_existing) gop.value_ptr.deinit(self.allocator);
@@ -136,7 +145,7 @@ pub fn checkStmt(self: *Checker, stmt: *const Stmt, expected: ?*const Type) Allo
                     try expr_calls.checkUserOperatorKeyword(self, init_cls, comp, n.span);
                 }
                 try narrowing.currentFrame(self).bindings.put(n.name, .{
-                    .ty = .Unresolved,
+                    .ty = Type.unresolved,
                     .mutable = d.mutable,
                     .decl_span = n.span,
                     .class_name = null,
@@ -174,9 +183,9 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 } else if (p.delegate) |dexpr| {
                     var dt = try self.checkExpr(dexpr, null);
                     dt.deinit(a);
-                    break :blk .Unresolved;
+                    break :blk Type.unresolved;
                 } else {
-                    break :blk .Unresolved;
+                    break :blk Type.unresolved;
                 }
             };
             defer init_ty.deinit(a);
@@ -220,7 +229,7 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
             }
         },
         .Function => |*f| {
-            const sig = try decl_mod.signatureOf(self, f);
+            const sig = try decl_mod.signatureOf(self, f, &.{});
             const params = try a.alloc(Type, sig.params.len);
             for (sig.params, params) |*p, *dst| dst.* = try p.clone(a);
             const ret = try a.create(Type);
@@ -323,8 +332,63 @@ pub fn checkExpr(self: *Checker, expr: *const Expr, expected: ?*const Type) Allo
         }
     }
     const ty = try computeExprTy(self, expr, expected);
+    // A value typed by a bounded type parameter has its bound's members: the
+    // bound's class is the identity a member access on it resolves against.
+    // An unbounded parameter names no class: `T` is not `Any`, and a consumer
+    // that reads a head as the value's static type would compare it wrong.
+    if (ty == .TypeParam and !self.expr_class.contains(expr.span()) and typeParamInScope(self, ty.TypeParam)) {
+        if (typeParamBound(self, ty.TypeParam)) |bh| try self.expr_class.put(expr.span(), try self.internName(bh));
+    }
+    if (unresolved_probe_on and ty == .Unresolved and !self.expr_class.contains(expr.span()))
+        unresolved_by_kind[@intFromEnum(std.meta.activeTag(expr.*))] += 1;
     try recordType(self, expr.span(), &ty);
     return ty;
+}
+
+/// `KLIO_THIS_EXT=0` leaves `this` in an extension body without an identity,
+/// so a wrong answer can be told from a wrong reading of one.
+fn thisExtOn() bool {
+    const S = struct {
+        var state: u8 = 0;
+    };
+    if (S.state == 0) {
+        const v = std.c.getenv("KLIO_THIS_EXT");
+        S.state = if (v != null and v.?[0] == '0') 1 else 2;
+    }
+    return S.state == 2;
+}
+
+/// What bare `this` names here: the innermost of the enclosing class chain and
+/// the enclosing extension receivers. A receiver pushed onto `class_stack`
+/// AFTER an extension receiver — a class body, or a lambda with a receiver —
+/// sits inside it and wins.
+fn innermostThisClass(self: *Checker) ?[]const u8 {
+    const classes = self.class_stack.items;
+    const ext_on = thisExtOn();
+    if (ext_on and self.this_ext_stack.items.len != 0) {
+        const ext = self.this_ext_stack.items[self.this_ext_stack.items.len - 1];
+        if (classes.len <= ext.class_depth) return ext.name;
+    }
+    if (classes.len > 0) return classes[classes.len - 1];
+    return null;
+}
+
+/// `KLIO_UNRES_KIND=1`: which expression kinds reach the IR typed as a bare
+/// `Unresolved` with no recorded class, which names the conversion sites that
+/// would have to record one.
+pub var unresolved_by_kind: [@typeInfo(@typeInfo(Expr).@"union".tag_type.?).@"enum".fields.len]usize = @splat(0);
+pub var unresolved_probe_on: bool = false;
+
+pub fn setUnresolvedProbe(on: bool) void {
+    unresolved_probe_on = on;
+}
+
+pub fn dumpUnresolvedByKind() void {
+    if (!unresolved_probe_on) return;
+    inline for (@typeInfo(@typeInfo(Expr).@"union".tag_type.?).@"enum".fields) |f| {
+        if (unresolved_by_kind[f.value] != 0)
+            std.debug.print("[UNRES-KIND] {d:>8}  {s}\n", .{ unresolved_by_kind[f.value], f.name });
+    }
 }
 
 pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) Allocator.Error!Type {
@@ -389,18 +453,36 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
         .Try => |tr| return tyOfTry(self, tr, expected),
         .Lambda => |l| return expr_calls.checkLambdaShaped(self, l.params, &l.body, expected, l.implicit_it),
         .This => |t| {
-            const target: ?[]const u8 = if (t.qualifier) |q|
-                q.name
-            else if (self.class_stack.items.len > 0)
-                self.class_stack.items[self.class_stack.items.len - 1]
-            else
-                null;
+            // `this@label` names a class, or the receiver of the extension
+            // function or receiver lambda the label belongs to.
+            const target: ?[]const u8 = if (t.qualifier) |q| blk: {
+                if (root.classNamed(self, q.name) != null or self.classes.contains(q.name)) break :blk q.name;
+                var i = self.this_ext_stack.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const e = self.this_ext_stack.items[i];
+                    if (e.label) |l| if (std.mem.eql(u8, l, q.name)) break :blk e.name;
+                }
+                break :blk q.name;
+            } else innermostThisClass(self);
             if (target) |cn| {
                 try self.expr_class.put(t.span, try self.internName(cn));
             }
-            return .Unresolved;
+            return Type.unresolved;
         },
-        .Super, .PropertyRef => return .Unresolved,
+        .Super => |s| {
+            // `super.f()` resolves against the enclosing class's supertype:
+            // the qualifier's when written, else the first declared one.
+            const owner = innermostThisClass(self);
+            const target: ?[]const u8 = if (s.qualifier) |q| q.name.name else blk: {
+                const cn = owner orelse break :blk null;
+                const info = root.classNamed(self, cn) orelse break :blk null;
+                break :blk if (info.supertypes.items.len != 0) info.supertypes.items[0] else null;
+            };
+            if (target) |cn| try self.expr_class.put(s.span, try self.internName(cn));
+            return Type.unresolved;
+        },
+        .PropertyRef => return Type.unresolved,
         .MemberRef => |mr| return tyOfMemberRef(self, mr),
         .When => |w| return tyOfWhen(self, w, expected),
         .IsCheck => |ic| return tyOfIsCheck(self, ic),
@@ -411,7 +493,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             // handles. Recurse so sub-expression diagnostics still surface.
             var t = try self.checkExpr(sp_e.expr, null);
             t.deinit(a);
-            return .Unresolved;
+            return Type.unresolved;
         },
         .ObjectExpr => |oe| return tyOfObjectExpr(self, oe),
     }
@@ -528,13 +610,202 @@ fn tyOfPath(self: *Checker, p: @FieldType(Expr, "Path")) Allocator.Error!Type {
         }
         if (self.classes.contains(name)) {
             try self.expr_class.put(sp, try self.internName(name));
-            return .Unresolved;
+            path_unres[@intFromEnum(PathUnres.class_evidence)] += 1;
+            return Type.unresolved;
+        }
+        // A bare name inside a class body is `this.name` when the class or
+        // one of its supertypes declares it. The checker holds every class's
+        // member types and did not consult them here, which is why `size`,
+        // `_capacity`, `storage` and every other own-member reference came
+        // out untyped: 15 037 expressions on one compose program, the single
+        // largest source of `Type.Unresolved` in the whole checker.
+        if (try implicitReceiverMember(self, name, sp)) |t| {
+            path_unres[@intFromEnum(PathUnres.own_member)] += 1;
+            return t;
+        }
+        if (ownMemberType(self, name)) |mt| {
+            path_unres[@intFromEnum(PathUnres.own_member)] += 1;
+            return try mt.clone(a);
         }
         // Resolved by name but absent from these tables, as stdlib
         // names are. Stay tolerant.
-        return .Unresolved;
+        const why: PathUnres = if (self.prop_visibility.contains(name))
+            .known_prop_no_type
+        else if (self.fns.contains(name))
+            .names_a_function
+        else
+            .absent_from_tables;
+        path_unres[@intFromEnum(why)] += 1;
+        if (unresolved_probe_on and why == .absent_from_tables) {
+            const ext_top: []const u8 = if (self.this_ext_stack.items.len != 0) self.this_ext_stack.items[self.this_ext_stack.items.len - 1].name else "-";
+            std.debug.print("[PATH-NAME] {s} stack={d} ext={s} lambda={d}", .{ name, self.class_stack.items.len, ext_top, self.lambda_depth });
+            var si = self.class_stack.items.len;
+            var shown: usize = 0;
+            while (si > 0 and shown < 3) {
+                si -= 1;
+                shown += 1;
+                const c = self.class_stack.items[si];
+                const known = root.classNamed(self, c) != null;
+                std.debug.print(" [{s} known={}]", .{ c, known });
+            }
+            std.debug.print("\n", .{});
+        }
+        return Type.unresolved;
     }
-    return .Unresolved;
+    // A qualified path. `Class.member` reads the class's member (a companion
+    // constant, an enum entry, a nested object); a package-qualified name
+    // (`kotlin.collections.f`) is the unqualified name once the package
+    // prefix is dropped, which no binding or class of the first segment
+    // could have claimed.
+    if (p.segments.len >= 2) {
+        const first = p.segments[0].name;
+        const last = p.segments[p.segments.len - 1].name;
+        const first_bound = narrowing.lookup(self, first) != null;
+        if (!first_bound and root.classNamed(self, first) != null and p.segments.len == 2) {
+            if (try visibility.lookupMemberThroughChain(self, a, first, last)) |found| {
+                if (found[1]) |mc| try self.expr_class.put(p.span, try self.internName(mc));
+                return found[0];
+            }
+        }
+        if (!first_bound and root.packageRoot(self, first) and root.classNamed(self, first) == null and !self.fns.contains(first) and !self.prop_visibility.contains(first)) {
+            const tail: @FieldType(Expr, "Path") = .{ .segments = p.segments[p.segments.len - 1 ..], .span = p.span };
+            return tyOfPath(self, tail);
+        }
+    }
+    path_unres[@intFromEnum(PathUnres.multi_segment)] += 1;
+    return Type.unresolved;
+}
+
+/// Why a single-name `Path` came out untyped. `Path` is 51% of every
+/// `Unresolved` span the checker produces and those spans are what leave
+/// lowering with no receiver type, so this is the split that prices the
+/// whole resolution gap.
+pub const PathUnres = enum(u8) {
+    /// The name is a class; `expr_class` carries the identity, so the
+    /// conversion to a lowering head recovers it.
+    class_evidence,
+    /// A top-level property the checker knows of but has no type for.
+    known_prop_no_type,
+    /// The name is a function, read in value position.
+    names_a_function,
+    /// Not in the binding table, the class table, the property table or the
+    /// function table. The comment here says "as stdlib names are".
+    absent_from_tables,
+    /// A qualified path; only the single-segment form is typed at all.
+    multi_segment,
+    /// A member of a class on the stack, so the bare name is `this.name`.
+    own_member,
+};
+pub var path_unres: [@typeInfo(PathUnres).@"enum".fields.len]usize = @splat(0);
+
+var own_member_off_state: u8 = 0;
+
+fn ownMemberOff() bool {
+    if (own_member_off_state == 0) {
+        const v = std.c.getenv("KLIO_TC_OWN_MEMBER");
+        own_member_off_state = if (v != null and std.mem.eql(u8, std.mem.span(v.?), "0")) 2 else 1;
+    }
+    return own_member_off_state == 2;
+}
+
+/// The declared type of `name` as a member of an enclosing class, innermost
+/// first. A bare name inside a class body resolves against the implicit
+/// receiver before anything outside it, and `members` already carries the
+/// type of every primary-constructor property, body property and method.
+///
+/// `KLIO_TC_OWN_MEMBER=0` withdraws it.
+/// The implicit receivers in scope, innermost first: the enclosing classes
+/// and receiver lambdas on `class_stack`, and the extension receivers on
+/// `this_ext_stack`, each of which sits outside every class pushed after it
+/// and inside every class pushed before it. Caller owns the slice.
+pub fn implicitReceiverClassesAlloc(self: *const Checker, a: Allocator) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(a);
+    const classes = self.class_stack.items;
+    const exts = self.this_ext_stack.items;
+    var ci = classes.len;
+    var ei = exts.len;
+    while (ci > 0 or ei > 0) {
+        if (ei > 0 and exts[ei - 1].class_depth >= ci) {
+            try out.append(a, exts[ei - 1].name);
+            ei -= 1;
+        } else {
+            try out.append(a, classes[ci - 1]);
+            ci -= 1;
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// A bare name read against the implicit receivers in scope: the innermost
+/// receiver whose class chain declares it as a member, or has an extension
+/// property for it, types the read. Kotlin's own rule, and the reason
+/// `lastIndex`, `indices` and `isEmpty` inside `fun List<T>.f()` are
+/// typed at all: they are extensions on the receiver, which no class's
+/// member table lists. A member whose type is a user class comes back as
+/// `Unresolved` carrying the class, which lowering reads as identity.
+fn implicitReceiverMember(self: *Checker, name: []const u8, sp: Span) Allocator.Error!?Type {
+    if (ownMemberOff()) return null;
+    const a = self.allocator;
+    const receivers = try implicitReceiverClassesAlloc(self, a);
+    defer a.free(receivers);
+    for (receivers) |cn| {
+        if (try visibility.lookupMemberThroughChain(self, a, cn, name)) |found| {
+            if (found[1]) |mc| try self.expr_class.put(sp, try self.internName(mc));
+            return found[0];
+        }
+        const recv_ty: Type = Type.unresolved;
+        if (try lookupExtensionProperty(self, &recv_ty, cn, name)) |ep| {
+            if (ep.return_class) |rc| try self.expr_class.put(sp, try self.internName(rc));
+            return try ep.ty.clone(a);
+        }
+    }
+    return null;
+}
+
+fn ownMemberType(self: *Checker, name: []const u8) ?*const Type {
+    if (ownMemberOff()) return null;
+    // An extension body has no enclosing class and its bare names resolve
+    // against the RECEIVER: `fun Array<T>.f() { … size … }` reads
+    // `this.size`. More than half the names the checker gives up on are
+    // checked with an empty class stack, and this is why.
+    if (self.this_ext_stack.items.len != 0) {
+        const recv = self.this_ext_stack.items[self.this_ext_stack.items.len - 1].name;
+        if (memberTypeIn(self, recv, name)) |t| return t;
+    }
+    var i = self.class_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (memberTypeIn(self, self.class_stack.items[i], name)) |t| return t;
+    }
+    return null;
+}
+
+/// `name`'s declared type as a member of `cname` or its first supertype
+/// chain. An unresolved member type is no better than no answer, and
+/// returning it would hide the name from the tables below.
+fn memberTypeIn(self: *Checker, cname: []const u8, name: []const u8) ?*const Type {
+    var seen: usize = 0;
+    var cur: ?[]const u8 = cname;
+    while (cur) |c| {
+        if (seen > 16) break;
+        seen += 1;
+        const info = root.classNamed(self, c) orelse break;
+        if (info.members.getPtr(name)) |t| {
+            if (t.* == .Unresolved) break;
+            return t;
+        }
+        cur = if (info.supertypes.items.len != 0) info.supertypes.items[0] else null;
+    }
+    return null;
+}
+
+pub fn dumpPathUnres() void {
+    if (!unresolved_probe_on) return;
+    inline for (@typeInfo(PathUnres).@"enum".fields) |f| {
+        if (path_unres[f.value] != 0)
+            std.debug.print("[PATH-UNRES] {d:>8}  {s}\n", .{ path_unres[f.value], f.name });
+    }
 }
 
 fn tyOfMember(self: *Checker, expr: *const Expr, m: @FieldType(Expr, "Member")) Allocator.Error!Type {
@@ -562,7 +833,9 @@ fn tyOfMember(self: *Checker, expr: *const Expr, m: @FieldType(Expr, "Member")) 
     }
     var recv_ty = try self.checkExpr(m.receiver, null);
     defer recv_ty.deinit(a);
-    const recv_class = self.expr_class.get(m.receiver.span());
+    // A builtin or a generic names its class in the type itself:
+    // `"hi".length` reads `String`'s member.
+    const recv_class = self.expr_class.get(m.receiver.span()) orelse (if (types.tcOff("MEMBERFB")) null else expr_calls.typeClassName(recv_ty.nonNull()));
     return checkMemberAccess(self, &recv_ty, m.name.name, m.safe, m.receiver.span(), recv_class, sp);
 }
 
@@ -595,7 +868,7 @@ fn tyOfCall(self: *Checker, c: @FieldType(Expr, "Call")) Allocator.Error!Type {
     if (implicit_label) |l| {
         try self.label_stack.append(a, l);
     }
-    const result = try self.checkCall(c.callee, c.args, c.arg_names, c.type_args, sp);
+    const result = try expr_calls.checkCallInfix(self, c.callee, c.args, c.arg_names, c.type_args, sp, c.is_infix);
     if (implicit_label != null) {
         _ = self.label_stack.pop();
     }
@@ -608,7 +881,7 @@ fn tyOfCall(self: *Checker, c: @FieldType(Expr, "Call")) Allocator.Error!Type {
 fn tyOfIndex(self: *Checker, x: @FieldType(Expr, "Index")) Allocator.Error!Type {
     const a = self.allocator;
     var rt = try self.checkExpr(x.receiver, null);
-    rt.deinit(a);
+    defer rt.deinit(a);
     for (x.args) |*arg| {
         var at = try self.checkExpr(arg, null);
         at.deinit(a);
@@ -616,7 +889,56 @@ fn tyOfIndex(self: *Checker, x: @FieldType(Expr, "Index")) Allocator.Error!Type 
     // `xs[i]` dispatches `operator fun get`.
     const cls = self.expr_class.get(x.receiver.span());
     try expr_calls.checkUserOperatorKeyword(self, cls, "get", x.span);
-    return .Unresolved;
+    // The element a subscript reads: the collection's argument for the
+    // declared list and array shapes, the value for a map, a `Char` for text,
+    // a primitive array's element, and the declared `get` of anything else.
+    const core: *const Type = if (rt == .Nullable) rt.Nullable else &rt;
+    switch (core.*) {
+        .Generic => |g| {
+            const list_like = [_][]const u8{ "List", "MutableList", "ArrayList", "Array", "AbstractList", "ArrayDeque", "Collection" };
+            for (list_like) |n| {
+                if (std.mem.eql(u8, g.name, n) and g.args.len >= 1 and !g.args[0].is_star) {
+                    return try elementWithClass(self, &g.args[0].ty, x.span);
+                }
+            }
+            const map_like = [_][]const u8{ "Map", "MutableMap", "HashMap", "LinkedHashMap", "SortedMap" };
+            for (map_like) |n| {
+                if (std.mem.eql(u8, g.name, n) and g.args.len >= 2 and !g.args[1].is_star) {
+                    var v = try elementWithClass(self, &g.args[1].ty, x.span);
+                    return v.asNullable(a);
+                }
+            }
+        },
+        .String => return .Char,
+        .Unresolved => |maybe| if (maybe) |cn| {
+            const prim = [_]struct { n: []const u8, t: Type }{
+                .{ .n = "IntArray", .t = .Int },       .{ .n = "LongArray", .t = .Long },
+                .{ .n = "ShortArray", .t = .Short },   .{ .n = "ByteArray", .t = .Byte },
+                .{ .n = "CharArray", .t = .Char },     .{ .n = "BooleanArray", .t = .Boolean },
+                .{ .n = "FloatArray", .t = .Float },   .{ .n = "DoubleArray", .t = .Double },
+                .{ .n = "UIntArray", .t = .UInt },     .{ .n = "ULongArray", .t = .ULong },
+                .{ .n = "UShortArray", .t = .UShort }, .{ .n = "UByteArray", .t = .UByte },
+                .{ .n = "CharSequence", .t = .Char },  .{ .n = "StringBuilder", .t = .Char },
+            };
+            for (prim) |p| {
+                if (std.mem.eql(u8, cn, p.n)) return p.t;
+            }
+            if (try expr_calls.memberReturnOfPub(self, cn, "get", x.args.len)) |t| {
+                if (t == .Unresolved) if (t.Unresolved) |rc| try self.expr_class.put(x.span, try self.internName(rc));
+                return t;
+            }
+        },
+        else => {},
+    }
+    return Type.unresolved;
+}
+
+/// A collection element's type, recording its class identity beside it when
+/// the element is a class the checker does not model.
+fn elementWithClass(self: *Checker, elem: *const Type, sp: Span) Allocator.Error!Type {
+    if (elem.* == .Unresolved) if (elem.Unresolved) |cn| try self.expr_class.put(sp, try self.internName(cn));
+    if (elem.* == .TypeParam) if (typeParamBound(self, elem.TypeParam)) |bh| try self.expr_class.put(sp, try self.internName(bh));
+    return try elem.clone(self.allocator);
 }
 
 fn tyOfUnary(self: *Checker, u: @FieldType(Expr, "Unary")) Allocator.Error!Type {
@@ -640,7 +962,7 @@ fn tyOfUnary(self: *Checker, u: @FieldType(Expr, "Unary")) Allocator.Error!Type 
             } else {
                 var owned = t;
                 owned.deinit(a);
-                return .Unresolved;
+                return Type.unresolved;
             }
         },
         .Not => {
@@ -716,7 +1038,7 @@ fn tyOfFor(self: *Checker, f: @FieldType(Expr, "For")) Allocator.Error!Type {
     try narrowing.pushFrame(self);
     for (f.vars) |*v| {
         try narrowing.currentFrame(self).bindings.put(v.name, .{
-            .ty = .Unresolved,
+            .ty = Type.unresolved,
             .mutable = false,
             .decl_span = v.span,
             .class_name = null,
@@ -840,11 +1162,14 @@ fn tyOfTry(self: *Checker, tr: @FieldType(Expr, "Try"), expected: ?*const Type) 
         }
         try narrowing.pushFrame(self);
         const cbind = try convertTypeRefLossyH(a, &c.ty);
+        // A caught exception's type is written down; without recording which
+        // class it is, every read of the binding reaches the IR as a bare
+        // `Unresolved` and the receiver has no type.
         try narrowing.currentFrame(self).bindings.put(c.binding.name, .{
             .ty = cbind,
             .mutable = false,
             .decl_span = c.binding.span,
-            .class_name = null,
+            .class_name = try self.internOpt(helpers.classNameFromTyperef(&c.ty)),
             .decl_type_name = null,
         });
         var cty = try checkBlock(self, &c.body, expected);
@@ -887,7 +1212,7 @@ fn tyOfMemberRef(self: *Checker, mr: @FieldType(Expr, "MemberRef")) Allocator.Er
                 }
                 // A receiver pass would type `T` as a path and report
                 // a misleading unresolved reference.
-                return .Unresolved;
+                return Type.unresolved;
             }
         }
         var rty = try self.checkExpr(mr.receiver, null);
@@ -900,11 +1225,11 @@ fn tyOfMemberRef(self: *Checker, mr: @FieldType(Expr, "MemberRef")) Allocator.Er
                 codes.TYPE_NULLABLE_CLASS_LITERAL_LHS,
             );
         }
-        return .Unresolved;
+        return Type.unresolved;
     }
     var rt = try self.checkExpr(mr.receiver, null);
     rt.deinit(a);
-    return .Unresolved;
+    return Type.unresolved;
 }
 
 fn tyOfWhen(self: *Checker, w: @FieldType(Expr, "When"), expected: ?*const Type) Allocator.Error!Type {
@@ -925,9 +1250,9 @@ fn tyOfWhen(self: *Checker, w: @FieldType(Expr, "When"), expected: ?*const Type)
                 break :blk try convertTypeRefLossyH(a, t);
             } else if (w.subject) |s| {
                 if (self.types.get(s.span())) |t| break :blk try t.clone(a);
-                break :blk .Unresolved;
+                break :blk Type.unresolved;
             } else {
-                break :blk .Unresolved;
+                break :blk Type.unresolved;
             }
         };
         const class_name: ?[]const u8 = if (w.subject) |s| self.expr_class.get(s.span()) else null;
@@ -1121,18 +1446,21 @@ fn tyOfAnonFun(self: *Checker, af: @FieldType(Expr, "AnonFun")) Allocator.Error!
             p.ty.name.name
         else
             null;
+        // An annotated lambda parameter states its class as plainly as any
+        // declaration; the binding recorded the spelling for availability
+        // checks and dropped the identity that a receiver read needs.
         try narrowing.currentFrame(self).bindings.put(p.name.name, .{
             .ty = pty,
             .mutable = false,
             .decl_span = p.span,
-            .class_name = null,
+            .class_name = try self.internOpt(helpers.classNameFromTyperef(&p.ty)),
             .decl_type_name = decl_type_name,
         });
     }
     var ret_expected: Type = if (af.return_ty) |*rt|
         try convertTypeRefLossyH(a, rt)
     else
-        .Unresolved;
+        Type.unresolved;
     defer ret_expected.deinit(a);
     if (af.body) |b| {
         switch (b.*) {
@@ -1219,7 +1547,7 @@ fn tyOfObjectExpr(self: *Checker, oe: @FieldType(Expr, "ObjectExpr")) Allocator.
             else => {},
         }
     }
-    return .Unresolved;
+    return Type.unresolved;
 }
 
 /// A `break`/`continue`/`return` label must name an enclosing labelable target.
@@ -1236,6 +1564,17 @@ fn labelStackContains(self: *const Checker, name: []const u8) bool {
         if (std.mem.eql(u8, l, name)) return true;
     }
     return false;
+}
+
+/// The declared upper bound's class head of a type parameter in scope,
+/// innermost declaration first.
+pub fn typeParamBound(self: *const Checker, name: []const u8) ?[]const u8 {
+    var i = self.type_param_bounds_in_scope.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (self.type_param_bounds_in_scope.items[i].get(name)) |b| return b;
+    }
+    return null;
 }
 
 fn typeParamInScope(self: *const Checker, name: []const u8) bool {
@@ -1274,7 +1613,7 @@ pub fn checkMemberAccess(
     // `Nothing` admits no member callable, so only extensions resolve here.
     const recv_is_nothing = (recv_ty.* == .Nothing) or
         (recv_ty.* == .Nullable and recv_ty.Nullable.* == .Nothing);
-    var result: Type = .Unresolved;
+    var result: Type = Type.unresolved;
     errdefer result.deinit(a);
     var found_as_member = false;
     if (recv_class) |class| {
@@ -1285,6 +1624,18 @@ pub fn checkMemberAccess(
                 found_as_member = true;
                 if (found[1]) |cn| {
                     try self.expr_class.put(member_span, try self.internName(cn));
+                }
+                // `box.value` on a `Box<Int>` reads an `Int`: the receiver's
+                // arguments instantiate the declaring class's parameters.
+                if (try expr_calls.receiverSubst(self, recv_ty, found[2])) |subst| {
+                    var owned_subst = subst;
+                    defer expr_calls.deinitSubst(&owned_subst, a);
+                    const inst = try helpers.substituteTypeParams(a, &result, &owned_subst);
+                    result.deinit(a);
+                    result = inst;
+                    if (found[1] == null) if (helpers.classNameOfType(&result)) |cn| {
+                        try self.expr_class.put(member_span, try self.internName(cn));
+                    };
                 }
                 // Inside the declaring scope the read narrows to the field
                 // type; outside, the public type stands and is recorded.
@@ -1518,7 +1869,7 @@ pub fn lookupExtensionCandidates(
         const sigs = info.member_methods.get(name) orelse continue;
         for (sigs.items) |sig| {
             if (!extensionArityFits(&sig, n_args)) continue;
-            try out.append(a, .{ .sig = sig, .return_class = null });
+            try out.append(a, .{ .sig = sig, .return_class = null, .decl_class = key });
         }
     }
     for (keys.items) |key| {
@@ -1531,7 +1882,13 @@ pub fn lookupExtensionCandidates(
     }
 }
 
-pub const ExtensionCandidate = struct { sig: root.FnSig, return_class: ?[]const u8 };
+pub const ExtensionCandidate = struct {
+    sig: root.FnSig,
+    return_class: ?[]const u8,
+    /// The class declaring a MEMBER candidate; its type parameters are the
+    /// ones the receiver's arguments instantiate. Null for an extension.
+    decl_class: ?[]const u8 = null,
+};
 
 test {
     std.testing.refAllDecls(@This());

@@ -75,7 +75,6 @@ pub fn leafReqServable(req: FlatCallReq) bool {
         req.type_args.len == 0 and
         req.keepalive == null and
         req.typed_saved == null and
-        req.ctx_mark_override == null and
         req.pop_enclosing_n == 0 and
         req.scope_guard_ident == 0 and
         !req.composer_pushed and
@@ -357,6 +356,10 @@ fn leafRunOne(
     pin: *?usize,
     wmask: *u64,
 ) (Allocator.Error || LeafAbandon)!void {
+    // The tier has no frame to raise from, so in raise mode it declines and the
+    // framed walker re-runs the instruction, reports the site, and raises.
+    if (ev_diag.ratchetArmed() and ev_diag.unresolvedTierGate(module, inst, func.fqn, "-"))
+        return error.LeafAbandon;
     {
         switch (inst.*) {
             .Trace => {},
@@ -448,7 +451,12 @@ fn leafRunOne(
                 if (comptime !@hasDecl(H, "leafGlobalGet")) return error.LeafAbandon;
                 if (lg.func != null or lg.class != null or lg.ctor_ref) return error.LeafAbandon;
                 const gname = constStr(module, lg.name) orelse return error.LeafAbandon;
-                const v = host.leafGlobalGet(gname) orelse {
+                const slotted: ?Value = blk: {
+                    if (comptime !@hasDecl(H, "leafGlobalSlotGet")) break :blk null;
+                    const slot = lg.slot orelse break :blk null;
+                    break :blk host.leafGlobalSlotGet(slot);
+                };
+                const v = slotted orelse host.leafGlobalGet(gname) orelse {
                     if (trace) std.debug.print("[leaf] {s}: global {s} not servable\n", .{ func.name, gname });
                     return error.LeafAbandon;
                 };
@@ -532,6 +540,59 @@ fn leafTraceWant(func: *const Func) bool {
 }
 
 /// Members of a builtin receiver answered without entering the field ladder.
+/// The builtin property a site NAMED, served from the receiver's tag with no
+/// name compare. Null when the tag is not the one the site was proved
+/// against, which a proof makes impossible and which therefore falls back
+/// rather than answering wrongly.
+pub fn builtinFieldNamed(allocator: Allocator, which: ir.BuiltinField, recv: *const Value) Allocator.Error!?Value {
+    return switch (which) {
+        .none => null,
+        .array_size => switch (recv.*) {
+            .Array => |a| Value.newInt(@intCast(a.len())),
+            else => null,
+        },
+        .string_length => switch (recv.*) {
+            .String => |s| blk: {
+                const g = s.borrow();
+                defer g.deinit();
+                break :blk Value.newInt(@intCast(g.get().u16_len));
+            },
+            else => null,
+        },
+        .array_last_index => switch (recv.*) {
+            .Array => |a| Value.newInt(@as(i64, @intCast(a.len())) - 1),
+            else => null,
+        },
+        // A value class over a signed buffer shares the cell, so a write
+        // through the view lands in the original.
+        .array_storage => switch (recv.*) {
+            .Array => |a| blk: {
+                const k = a.primKind() orelse break :blk null;
+                const signed = k.signedCounterpart() orelse break :blk null;
+                if (a.storage() != .scalars) break :blk null;
+                break :blk Value{ .Array = runtime.ArrayData.scalars(a.storage().scalars.clone(), signed) };
+            },
+            else => null,
+        },
+        .scalar_data => switch (recv.*) {
+            .UByte => |x| Value{ .Byte = @bitCast(x) },
+            .UShort => |x| Value{ .Short = @bitCast(x) },
+            .UInt => |x| Value{ .Int = @bitCast(x) },
+            .ULong => |x| Value{ .Long = @bitCast(x) },
+            else => null,
+        },
+        .array_indices => switch (recv.*) {
+            .Array => |a| try Value.newRange(allocator, .{
+                .start = 0,
+                .end = @as(i64, @intCast(a.len())) - 1,
+                .step = 1,
+                .kind = .Int,
+            }),
+            else => null,
+        },
+    };
+}
+
 pub fn builtinFieldFast(comptime H: type, host: *H, allocator: Allocator, recv: *const Value, name: []const u8) Allocator.Error!?Value {
     // Every shape below is a builtin container, string or range. Deciding that
     // from the receiver's tag first spares the name compares on the receiver

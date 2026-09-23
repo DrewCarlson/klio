@@ -81,8 +81,9 @@ test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
     defer b.allocator.free(shapes);
 
     try testing.expectEqual(@as(usize, 3), shapes.len);
-    // Literal Int argument: numeric literal kind, not a lambda / spread.
-    try testing.expect(shapes[0].literal_kind == .numeric);
+    // Literal Int argument: an INTEGER literal kind, which is evidence against a
+    // floating parameter, not a lambda / spread.
+    try testing.expect(shapes[0].literal_kind == .integral);
     try testing.expect(!shapes[0].is_lambda);
     try testing.expect(!shapes[0].is_spread);
     try testing.expect(shapes[0].named == null);
@@ -682,6 +683,8 @@ test "member-or-global emission binds a composable trailing lambda by parameter"
     b.terminate(.{ .Return = result });
     const lowered = try b.finish("caller", "sample.caller", build.typeUnit());
 
+    // No receiver is in scope, so the walk proves the sole candidate is the
+    // call; the parameter binding it carries is the deferred form's exactly.
     var found = false;
     for (lowered.blocks[0].insts) |inst| switch (inst) {
         .CallMemberOrGlobal => |cmg| {
@@ -693,6 +696,18 @@ test "member-or-global emission binds a composable trailing lambda by parameter"
             try testing.expectEqualStrings("$composer", composer.String);
             try testing.expectEqualStrings("$changed", changed.String);
             try testing.expect(!cmg.trailing_lambda);
+            found = true;
+        },
+        .Call => |c| {
+            try testing.expectEqual(surface_id, c.func);
+            try testing.expectEqual(@as(usize, 3), c.arg_names.len);
+            const content = m.consts.items[c.arg_names[0].?.int()];
+            const composer = m.consts.items[c.arg_names[1].?.int()];
+            const changed = m.consts.items[c.arg_names[2].?.int()];
+            try testing.expectEqualStrings("content", content.String);
+            try testing.expectEqualStrings("$composer", composer.String);
+            try testing.expectEqualStrings("$changed", changed.String);
+            try testing.expect(!c.trailing_lambda);
             found = true;
         },
         else => {},
@@ -1461,4 +1476,127 @@ test "renamed overloaded import binds exact extension and plain identities" {
     const bound_inst = bound_insts[bound_insts.len - 1];
     try testing.expect(bound_inst == .MemberRef);
     try testing.expectEqual(ext_id, bound_inst.MemberRef.func.?);
+}
+
+test "call-bound lambda records no receiver from a plain function parameter" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+
+    var plain_fn_args = [_]ir.TypeRef{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+        build.typeUnit(),
+    };
+    var params = [_]ir.Param{
+        .{ .name = "times", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null },
+        .{
+            .name = "action",
+            .ty = .{ .name = "Function1", .nullable = false, .args = &plain_fn_args },
+            .default = null,
+        },
+    };
+    const func = Func{
+        .id = FuncId.from(7),
+        .name = "repeat",
+        .fqn = "kotlin.repeat",
+        .params = &params,
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = BlockId.from(0),
+        .is_suspend = false,
+        .low_priority = false,
+    };
+    const sp = dummySpan();
+    var times_path = [_]ast.Ident{.{ .name = "n", .span = sp }};
+    const times_arg = Expr{ .Path = .{ .segments = &times_path, .span = sp } };
+    var lam_node = ast.LambdaExpr{
+        .params = &.{},
+        .body = .{ .stmts = &.{}, .span = sp },
+        .span = sp,
+    };
+    const lambda = Expr{ .Lambda = &lam_node };
+    const args = [_]Expr{ times_arg, lambda };
+
+    try testing.expect(!b.lambdaArgNoRecv(sp));
+    try recordLambdaArgReceivers(&b, &func, &args, &.{}, &.{}, 0);
+    try testing.expect(b.lambdaArgNoRecv(sp));
+    try testing.expect(b.lambdaArgRecv(sp) == null);
+}
+
+test "trailing lambda consensus records no receiver when every namesake agrees" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    var one_arg = [_]ir.TypeRef{ .{ .name = "T", .nullable = false, .args = &.{} }, build.typeUnit() };
+    var two_args = [_]ir.TypeRef{
+        .{ .name = "K", .nullable = false, .args = &.{} },
+        .{ .name = "V", .nullable = false, .args = &.{} },
+        build.typeUnit(),
+    };
+    var recv_args = [_]ir.TypeRef{ .{ .name = "Scope", .nullable = false, .args = &.{} }, build.typeUnit() };
+    var iterable_params = [_]ir.Param{
+        .{ .name = "this", .ty = .{ .name = "Iterable", .nullable = false, .args = &.{} }, .default = null },
+        .{ .name = "action", .ty = .{ .name = "Function1", .nullable = false, .args = &one_arg }, .default = null },
+    };
+    var map_params = [_]ir.Param{
+        .{ .name = "this", .ty = .{ .name = "Map", .nullable = false, .args = &.{} }, .default = null },
+        .{ .name = "action", .ty = .{ .name = "Function2", .nullable = false, .args = &two_args }, .default = null },
+    };
+    var scope_params = [_]ir.Param{
+        .{ .name = "this", .ty = .{ .name = "Scope", .nullable = false, .args = &.{} }, .default = null },
+        .{ .name = "action", .ty = .{ .name = "Function0", .nullable = false, .args = &recv_args }, .default = null },
+    };
+    const Add = struct {
+        fn func(module: *Module, alloc: std.mem.Allocator, params: []ir.Param) !void {
+            const id = module.nextFuncId();
+            try module.funcs.append(alloc, .{
+                .id = id,
+                .name = "forEach",
+                .fqn = "sample.forEach",
+                .package = "sample",
+                .params = params,
+                .return_ty = build.typeUnit(),
+                .n_locals = 0,
+                .blocks = &.{},
+                .entry = ir.BlockId.from(0),
+                .is_suspend = false,
+                .kind = .top_level_extension,
+                .has_receiver_param = true,
+            });
+            try module.func_index.append(alloc, .{ .name = "forEach", .id = id });
+            try module.rebuildFuncNameIndex(alloc);
+        }
+    };
+    try Add.func(&m, a, &iterable_params);
+    try Add.func(&m, a, &map_params);
+
+    const sp = dummySpan();
+    var lam_node = ast.LambdaExpr{
+        .params = &.{},
+        .body = .{ .stmts = &.{}, .span = sp },
+        .span = sp,
+    };
+    const lambda = Expr{ .Lambda = &lam_node };
+    const args = [_]Expr{lambda};
+
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        try lambda_mod.recordTrailingLambdaConsensus(&b, "forEach", &args, &.{}, &.{}, true);
+        try testing.expect(b.lambdaArgNoRecv(sp));
+    }
+
+    // A namesake giving the block a receiver breaks the agreement.
+    try Add.func(&m, a, &scope_params);
+    {
+        var b = try FuncBuilder.init(a, &m);
+        defer b.deinit();
+        try lambda_mod.recordTrailingLambdaConsensus(&b, "forEach", &args, &.{}, &.{}, true);
+        try testing.expect(!b.lambdaArgNoRecv(sp));
+        try testing.expect(b.lambdaArgRecv(sp) == null);
+    }
 }

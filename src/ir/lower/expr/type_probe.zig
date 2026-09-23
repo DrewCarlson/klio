@@ -69,7 +69,7 @@ pub fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!
 pub fn localInitTypeRefNamed(b: *FuncBuilder, name: []const u8) Allocator.Error!?ir.TypeRef {
     if (b.resolve(name) == null) return null;
     const init_expr = b.localInitExpr(name) orelse {
-        if (norecvCensusOn()) audit_mod.lm_localinit[0] += 1;
+        if (norecvCensusOn()) audit_mod.lm_localinit.bump(0);
         return null;
     };
     // Deriving one local's type can reach back into it once every local in the
@@ -77,13 +77,13 @@ pub fn localInitTypeRefNamed(b: *FuncBuilder, name: []const u8) Allocator.Error!
     if (!pushInitChain(name)) return null;
     defer popInitChain();
     if (try ctorInitTypeRef(b, init_expr)) |ctor_ty| {
-        if (norecvCensusOn()) audit_mod.lm_localinit[1] += 1;
+        if (norecvCensusOn()) audit_mod.lm_localinit.bump(1);
         return ctor_ty;
     }
     // An alias takes the source local's type, whatever gave the source its own.
     if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {
         if (try localInitTypeRef(b, init_expr)) |aliased| {
-            if (norecvCensusOn()) audit_mod.lm_localinit[1] += 1;
+            if (norecvCensusOn()) audit_mod.lm_localinit.bump(1);
             return aliased;
         }
         // A bare own-member snapshot: the local's own name is not in scope inside
@@ -103,7 +103,7 @@ pub fn localInitTypeRefNamed(b: *FuncBuilder, name: []const u8) Allocator.Error!
                         if (cid.int() >= b.module.classes.items.len) break :blk head;
                         break :blk b.module.classes.items[cid.int()].fqn;
                     };
-                    if (norecvCensusOn()) audit_mod.lm_localinit[1] += 1;
+                    if (norecvCensusOn()) audit_mod.lm_localinit.bump(1);
                     return ir.TypeRef{
                         .name = try b.allocator.dupe(u8, resolved_name),
                         .nullable = false,
@@ -116,7 +116,7 @@ pub fn localInitTypeRefNamed(b: *FuncBuilder, name: []const u8) Allocator.Error!
     // A property read carries its own declared type; nothing needs resolving.
     if (init_expr.* == .Member) {
         if (argDeclTypeRef(b, init_expr)) |declared| {
-            if (norecvCensusOn()) audit_mod.lm_localinit[1] += 1;
+            if (norecvCensusOn()) audit_mod.lm_localinit.bump(1);
             return try declared.clone(b.allocator);
         }
     }
@@ -127,7 +127,7 @@ pub fn localInitTypeRefNamed(b: *FuncBuilder, name: []const u8) Allocator.Error!
     defer expr_mod.init_self_name = prev_self;
     var derived = (try staticCallReturnTypeRef(b, init_expr)) orelse {
         if (norecvCensusOn()) {
-            audit_mod.lm_localinit[2] += 1;
+            audit_mod.lm_localinit.bump(2);
             if (runtime.envOnce("KLIO_LI_NAMES") != null and init_expr.* == .Call) {
                 const c = init_expr.Call.callee;
                 if (c.* == .Path and c.Path.segments.len == 1) {
@@ -140,11 +140,11 @@ pub fn localInitTypeRefNamed(b: *FuncBuilder, name: []const u8) Allocator.Error!
         return null;
     };
     if (!staticClassifierArgsComplete(b, derived)) {
-        if (norecvCensusOn()) audit_mod.lm_localinit[3] += 1;
+        if (norecvCensusOn()) audit_mod.lm_localinit.bump(3);
         derived.deinit(b.allocator);
         return null;
     }
-    if (norecvCensusOn()) audit_mod.lm_localinit[4] += 1;
+    if (norecvCensusOn()) audit_mod.lm_localinit.bump(4);
     return derived;
 }
 
@@ -207,7 +207,7 @@ fn lambdaReturnUnderParams(
     if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) return null;
     if (expr_mod.od_depth >= 4) return null;
     var nb = try FuncBuilder.init(b.allocator, b.module);
-    nb.census_quiet = true;
+    nb.markScratch();
     defer nb.deinit();
     {
         var dit = b.local_decl_types.iterator();
@@ -461,12 +461,26 @@ pub fn paramLitKind(type_name: []const u8) ?LitKind {
     const n = std.mem.trimEnd(u8, type_name, "?");
     const eq = std.mem.eql;
     if (eq(u8, n, "Int") or eq(u8, n, "Long") or eq(u8, n, "Short") or eq(u8, n, "Byte") or
-        eq(u8, n, "UInt") or eq(u8, n, "ULong") or eq(u8, n, "UShort") or eq(u8, n, "UByte") or
-        eq(u8, n, "Double") or eq(u8, n, "Float") or eq(u8, n, "Number")) return .numeric;
+        eq(u8, n, "UInt") or eq(u8, n, "ULong") or eq(u8, n, "UShort") or eq(u8, n, "UByte"))
+        return .integral;
+    if (eq(u8, n, "Double") or eq(u8, n, "Float")) return .floating;
+    if (eq(u8, n, "Number")) return .numeric;
     if (eq(u8, n, "String") or eq(u8, n, "CharSequence")) return .string;
     if (eq(u8, n, "Boolean")) return .boolean;
     if (eq(u8, n, "Char")) return .char;
     return null;
+}
+
+/// Two numeric kinds disagree only when both name a width family and the
+/// families differ: an integer literal has no `Double` type in Kotlin. Widths
+/// inside one family stay compatible, so an `Int` argument in a `Long` slot is
+/// still no evidence against the candidate.
+pub fn litKindsDisagree(ak: LitKind, pk: LitKind) bool {
+    const a_num = ak == .numeric or ak == .integral or ak == .floating;
+    const p_num = pk == .numeric or pk == .integral or pk == .floating;
+    if (a_num and p_num)
+        return (ak == .integral and pk == .floating) or (ak == .floating and pk == .integral);
+    return ak != pk;
 }
 
 /// True when a same-name factory's declared parameter types definitely cannot
@@ -484,7 +498,7 @@ fn factorySigRejectsArgs(b: *FuncBuilder, sig: []const ir.TypeRef, args: []const
         }
         const ak = ak_opt orelse continue;
         const pk = paramLitKind(sig[i].name) orelse continue;
-        if (ak != pk) return true;
+        if (litKindsDisagree(ak, pk)) return true;
     }
     return false;
 }

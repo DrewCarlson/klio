@@ -48,6 +48,7 @@ const nuTraceWant = eval.nuTraceWant;
 const ok = eval.ok;
 const popEnclosing = eval.popEnclosing;
 const pushEnclosing = eval.pushEnclosing;
+const pushDispatch = eval.pushDispatch;
 const pushEnclosingAccess = eval.pushEnclosingAccess;
 const raiseStep = eval.raiseStep;
 const takeHostFlatArm = eval.takeHostFlatArm;
@@ -63,7 +64,6 @@ fn leafPlainReq(req: FlatCallReq) bool {
         req.type_args.len == 0 and
         req.keepalive == null and
         req.typed_saved == null and
-        req.ctx_mark_override == null and
         req.pop_enclosing_n == 0 and
         req.scope_guard_ident == 0 and
         !req.composer_pushed and
@@ -482,7 +482,13 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                                     ObjRef(InstanceData).ptrEq(p.Instance, a0.Instance);
                                 if (!same) {
                                     if (cf.kind == .member_extension) {
-                                        pushEnclosing(&frame.params.items[ct_idx]);
+                                        // A member-extension caller forwards
+                                        // its own dispatch receiver, not its
+                                        // extension receiver.
+                                        if (frame.func.kind == .member_extension and frame.dispatch_this != .Null)
+                                            pushDispatch(&frame.dispatch_this)
+                                        else
+                                            pushDispatch(&frame.params.items[ct_idx]);
                                     } else {
                                         pushEnclosingAccess(&frame.params.items[ct_idx]);
                                     }
@@ -654,7 +660,10 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                     // A member-extension's body has its declaring class's `this` in
                     // lexical scope; for a plain extension the push is visibility.
                     if (callee_fn.?.kind == .member_extension) {
-                        pushEnclosing(&frame.params.items[ct_idx]);
+                        if (frame.func.kind == .member_extension and frame.dispatch_this != .Null)
+                            pushDispatch(&frame.dispatch_this)
+                        else
+                            pushDispatch(&frame.params.items[ct_idx]);
                     } else {
                         pushEnclosingAccess(&frame.params.items[ct_idx]);
                     }
@@ -900,27 +909,6 @@ pub noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame:
     return .cont;
 }
 
-pub noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Frame, csup: anytype, host: *H) Allocator.Error!Step {
-    dispatchBump(.call_super);
-    const recv = frame.read(csup.receiver);
-    recv.retain();
-    defer recv.release(allocator);
-    const owner_str = constStr(frame.module, csup.owner_class) orelse
-        return raiseStep(frame, .{ .Type = "CallSuper: owner not a string const" });
-    const qual_str: ?[]const u8 = if (csup.qualifier) |id| constStr(frame.module, id) else null;
-    const name_str = constStr(frame.module, csup.name) orelse
-        return raiseStep(frame, .{ .Type = "CallSuper: name not a string const" });
-    const arg_values = try readArgRun(allocator, frame, csup.args, csup.n_args);
-    defer allocator.free(arg_values);
-    const names = try resolveArgNames(allocator, frame.module, csup.arg_names);
-    defer freeArgNames(allocator, names);
-    switch (try host.callSuper(allocator, &recv, owner_str, qual_str, name_str, arg_values, names)) {
-        .ok => |rv| try frame.write(csup.dst, rv),
-        .err => |e| return raiseStep(frame, e),
-    }
-    return .cont;
-}
-
 /// Execute a statically selected virtual slot. Unlike `CallMember` this arm has
 /// no name-based fallback: a missing slot is a link error the host reports.
 pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
@@ -973,6 +961,8 @@ pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame
 }
 
 pub noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, frame: *Frame, cmv: anytype, host: *H) Allocator.Error!Step {
+    const or_prev = orSiteEnter(frame, cmv.name);
+    defer or_site = or_prev;
     dispatchBump(.call_member_or_value);
     const recv = frame.read(cmv.receiver);
     recv.retain();
@@ -1129,6 +1119,8 @@ fn valueInvocable(module: *const Module, callee_v: Value) bool {
 }
 
 pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, frame: *Frame, cvm: anytype, host: *H) Allocator.Error!Step {
+    const or_prev = orSiteEnter(frame, cvm.name);
+    defer or_site = or_prev;
     dispatchBump(.call_value_or_member);
     var callee_v = frame.read(cvm.callee);
     // A boxed capture holds the callable in a cell; classify the CONTENT.
@@ -1233,6 +1225,11 @@ pub noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame
     if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
         host.setCtorArgStaticHeads(static_heads);
     }
+    // The constructor lowering named for this site, travelling the same way
+    // the heads do and consumed by the same construction.
+    if (comptime @hasDecl(H, "setCtorSitePick")) {
+        host.setCtorSitePick(if (ni.ctor_pick == ir.CTOR_PICK_NONE) null else ni.ctor_pick, ni.n_args);
+    }
     // Cleared on every exit: the slice above is freed, and no construction path
     // may leave this thread pointing at it.
     defer if (comptime @hasDecl(H, "clearCtorArgStaticHeads")) host.clearCtorArgStaticHeads();
@@ -1265,68 +1262,156 @@ pub noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame
 pub noinline fn execArmInstanceOf(comptime H: type, allocator: Allocator, frame: *Frame, io: anytype, host: *H) Allocator.Error!Step {
     _ = allocator;
     const v = frame.read(io.src);
+    // The site named the class, so the question is whether the receiver's own
+    // class is at or below it — an id comparison against a sorted ancestor
+    // list. Only an interpreted instance can answer it: a host-backed value
+    // carries no module class, and a wrong `false` there is a wrong answer,
+    // so those fall to the walk.
+    if (io.cls) |want| serve: {
+        if (v == .Instance and isCheckServeOn()) {
+            if (instanceClassId(frame, v.Instance)) |have| {
+                // Null where this module never built a closure for the class:
+                // answering `false` from an absent table would say "not a
+                // subtype" about every class the program has.
+                const is_by_id = frame.module.classIsAKnown(have, want) orelse
+                    break :serve;
+                if (isCheckAuditOn()) {
+                    const walked = host.instanceOf(&v, io.ty);
+                    if (walked != is_by_id) {
+                        const g = v.Instance.borrow();
+                        defer g.deinit();
+                        const cg = g.get().class.borrow();
+                        defer cg.deinit();
+                        const anc: usize = if (have.int() < frame.module.class_ancestors.items.len)
+                            frame.module.class_ancestors.items[have.int()].len
+                        else
+                            0;
+                        const sups: usize = if (have.int() < frame.module.classes.items.len)
+                            frame.module.classes.items[have.int()].supertypes.len
+                        else
+                            0;
+                        const c2 = &frame.module.classes.items[have.int()];
+                        std.debug.print("[ischeck-audit] {s} is {s}: id={} walk={} have={d} want={d} anc={d} sups={d} refs={d} ref0={s} rtparent={s}\n", .{
+                            cg.get().fqn,       io.ty.name, is_by_id,          walked,
+                            have.int(),         want.int(), anc,               sups,
+                            c2.supertype_refs.len,
+                            if (c2.supertype_refs.len != 0) c2.supertype_refs[0].name else "-",
+                            if (cg.get().supertype_names.len != 0) cg.get().supertype_names[0] else "-",
+                        });
+                    }
+                }
+                dispatchBump(.type_instanceof_class);
+                try frame.write(io.dst, .{ .Bool = is_by_id });
+                return .cont;
+            }
+        }
+    }
     const is = host.instanceOf(&v, io.ty);
     try frame.write(io.dst, .{ .Bool = is });
     return .cont;
 }
 
-pub noinline fn execArmCtxScope(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
-    if (comptime !@hasDecl(H, "ctxPush")) {
-        try frame.write(cs.dst, .Null);
-        return .cont;
+/// `KLIO_ISCHECK_SERVE=0` leaves the named class untested so a wrong answer
+/// can be told from a wrong naming; `audit` walks by name as well and reports
+/// every test where the two disagree.
+var ischeck_serve_state: u8 = 0;
+fn isCheckServeOn() bool {
+    if (ischeck_serve_state == 0) {
+        const val = runtime.envOnce("KLIO_ISCHECK_SERVE") orelse "1";
+        ischeck_serve_state = if (std.mem.eql(u8, val, "0"))
+            1
+        else if (std.mem.eql(u8, val, "audit"))
+            3
+        else
+            2;
     }
-    const mark = host.ctxStackLen();
-    var i: u32 = 0;
-    while (i < cs.n_ctx) : (i += 1) {
-        const v = frame.read(Reg.from(cs.ctx_args.int() + i));
-        try host.ctxPush(v);
-    }
-    var block = frame.read(cs.block);
-    const res = host.callValue(allocator, &block, &.{});
-    host.ctxStackTruncate(mark);
-    switch (try res) {
-        .ok => |rv| try frame.write(cs.dst, rv),
-        .err => |e| return raiseStep(frame, e),
-    }
-    return .cont;
+    return ischeck_serve_state != 1;
 }
 
-pub noinline fn execArmCtxCall(comptime H: type, allocator: Allocator, frame: *Frame, cc: anytype, host: *H) Allocator.Error!Step {
-    dispatchBump(.ctx_call);
-    if (comptime !@hasDecl(H, "ctxPush")) {
-        try frame.write(cc.dst, .Null);
-        return .cont;
+fn isCheckAuditOn() bool {
+    _ = isCheckServeOn();
+    return ischeck_serve_state == 3;
+}
+
+/// `KLIO_BUILTIN_AUDIT=1`: report every site the link pass called proven that
+/// still reached the by-name walk. The bit is what lets the census count such
+/// a site resolved, so it has to be checked against what runs.
+var builtin_audit_state: u8 = 0;
+pub fn builtinProvenAuditOn() bool {
+    if (builtin_audit_state == 0) {
+        builtin_audit_state = if (runtime.envOnce("KLIO_BUILTIN_AUDIT") != null) 2 else 1;
     }
-    var callee_v = frame.read(cc.callee);
-    // A callee declared with every context as a leading parameter takes them
-    // positionally; a context function reads them from the context stack.
-    const positional = blk: {
-        if (cc.n_ctx == 0) break :blk false;
-        if (comptime !@hasDecl(H, "callableDeclaredArity")) break :blk false;
-        const declared = host.callableDeclaredArity(&callee_v) orelse break :blk false;
-        break :blk declared == cc.n_args;
-    };
-    const mark = host.ctxStackLen();
-    const n_ctx: u32 = if (positional) 0 else cc.n_ctx;
-    var i: u32 = 0;
-    while (i < n_ctx) : (i += 1) {
-        const v = frame.read(Reg.from(cc.args.int() + i));
-        try host.ctxPush(v);
+    return builtin_audit_state == 2;
+}
+
+/// `KLIO_CAST_SERVE=0` leaves the named class untested; `audit` walks by name
+/// as well and reports every cast the id served that the walk would refuse.
+var cast_serve_state: u8 = 0;
+fn castServeOn() bool {
+    if (cast_serve_state == 0) {
+        const val = runtime.envOnce("KLIO_CAST_SERVE") orelse "1";
+        cast_serve_state = if (std.mem.eql(u8, val, "0"))
+            1
+        else if (std.mem.eql(u8, val, "audit"))
+            3
+        else
+            2;
     }
-    const call_n = cc.n_args - n_ctx;
-    const call_args = try readArgRun(allocator, frame, Reg.from(cc.args.int() + n_ctx), call_n);
-    defer allocator.free(call_args);
-    const res = host.callValue(allocator, &callee_v, call_args);
-    host.ctxStackTruncate(mark);
-    switch (try res) {
-        .ok => |rv| try frame.write(cc.dst, rv),
-        .err => |e| return raiseStep(frame, e),
+    return cast_serve_state != 1;
+}
+
+fn castAuditOn() bool {
+    _ = castServeOn();
+    return cast_serve_state == 3;
+}
+
+/// The module `ClassId` behind an instance's runtime class, through the def's
+/// own memo so the string-keyed probe runs once per class.
+fn instanceClassId(frame: *Frame, inst: runtime.ObjRef(runtime.InstanceData)) ?ir.ClassId {
+    const g = inst.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    const cdef = cg.get();
+    const mod_key = @intFromPtr(frame.module);
+    if (cdef.resolve_mod.load(.monotonic) == mod_key) {
+        const plus1 = cdef.resolve_cid.load(.acquire);
+        if (plus1 != 0) return ir.ClassId.from(plus1 - 1);
     }
-    return .cont;
+    const found = frame.module.classIdByFqn(cdef.fqn) orelse return null;
+    const mut = @constCast(cdef);
+    if (mut.resolve_mod.cmpxchgStrong(0, mod_key, .acq_rel, .monotonic) == null) {
+        mut.resolve_cid.store(found.int() + 1, .release);
+    }
+    return found;
 }
 
 pub noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Frame, cast: anytype, host: *H) Allocator.Error!Step {
     const v = frame.read(cast.src);
+    // A resolved cast answers the positive only. Where the value's class is at
+    // or below the one the site names, the cast succeeds and the by-name walk
+    // has nothing to add. Everything else falls through to it: a false, a
+    // module with no closure for the class, a value carrying no module class.
+    // Every path that can throw is down there, so a missing ancestor edge can
+    // cost the serve but can never turn a passing cast into a raise.
+    if (cast.cls()) |want| serve: {
+        if (v != .Instance or !castServeOn()) break :serve;
+        const have = instanceClassId(frame, v.Instance) orelse break :serve;
+        if (frame.module.classIsAKnown(have, want) != true) break :serve;
+        if (castAuditOn() and !host.instanceOf(&v, cast.ty)) {
+            const g = v.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            std.debug.print("[cast-audit] {s} as {s}: id=true walk=false have={d} want={d}\n", .{
+                cg.get().fqn, cast.ty.name, have.int(), want.int(),
+            });
+        }
+        dispatchBump(.type_cast_class);
+        v.retain();
+        try frame.write(cast.dst, v);
+        return .cont;
+    }
     if (host.instanceOf(&v, cast.ty)) {
         v.retain();
         try frame.write(cast.dst, v);
@@ -1412,6 +1497,9 @@ pub noinline fn execArmBuildObject(comptime H: type, allocator: Allocator, frame
 }
 
 pub noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, stg: anytype, host: *H) Allocator.Error!Step {
+    const or_prev = orSiteEnter(frame, stg.name);
+    defer or_site = or_prev;
+    dispatchBump(.store_this_or_global);
     const name_str = constStr(frame.module, stg.name) orelse
         return raiseStep(frame, .{ .Type = "StoreToThisOrGlobal: name not a string const" });
     const v = frame.read(stg.value);
@@ -1472,6 +1560,9 @@ pub noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocato
 }
 
 pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, lt: anytype, host: *H) Allocator.Error!Step {
+    const or_prev = orSiteEnter(frame, lt.name);
+    defer or_site = or_prev;
+    dispatchBump(.load_this_or_global);
     const name_str = constStr(frame.module, lt.name) orelse
         return raiseStep(frame, .{ .Type = "LoadFromThisOrGlobal: name not a string const" });
     var resolved: ?Value = null;
@@ -1687,7 +1778,7 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                                     }
                                 }
                                 const ev3 = er3 orelse continue;
-                                pushEnclosing(&c3.v);
+                                pushDispatch(&c3.v);
                                 defer popEnclosing();
                                 orAudit("LoadFromThisOrGlobal", bare_name, "member_ext_prop", c3.depth, &ev3);
                                 switch (try host.callFuncNamed(allocator, frame.module, gfid, &.{ev3}, &.{})) {
@@ -1821,6 +1912,79 @@ pub noinline fn execArmQualifiedThis(comptime H: type, allocator: Allocator, fra
     return .cont;
 }
 
+/// The frame's dispatch receiver. A caller that bound the call statically
+/// handed it over as a `dispatch` chain entry; a by-name caller derived it
+/// from the chain before the call and handed over the same. Neither having
+/// run, the frame derives it once from its own chain, which is what every
+/// by-name arm inside the body did per read, and says so under
+/// `KLIO_DISPATCH_TRACE`.
+pub noinline fn execArmLoadDispatchThis(comptime H: type, allocator: Allocator, frame: *Frame, ld: anytype, host: *H) Allocator.Error!Step {
+    if (frame.dispatch_this == .Null) {
+        if (comptime @hasDecl(H, "memberExtOwnerInstanceFor")) {
+            if (try host.memberExtOwnerInstanceFor(allocator, frame.module, frame.func, frame.params.items)) |v| frame.dispatch_this = v;
+        }
+        if (runtime.envOnce("KLIO_DISPATCH_TRACE") != null) {
+            std.debug.print("[dispatch-fallback] fn={s} found={}\n", .{ frame.func.fqn, frame.dispatch_this != .Null });
+        }
+    }
+    const v = frame.dispatch_this;
+    if (v == .Null) return raiseStep(frame, .{ .Type = "member extension frame has no dispatch receiver" });
+    v.retain();
+    try frame.write(ld.dst, v);
+    return .cont;
+}
+
+/// The outer instance of the inner-class instance at `src`: the instance the
+/// constructing frame's `this` was, linked at construction.
+pub noinline fn execArmLoadOuterThis(comptime H: type, allocator: Allocator, frame: *Frame, lo: anytype, host: *H) Allocator.Error!Step {
+    _ = allocator;
+    _ = host;
+    const v = frame.read(lo.src);
+    const outer: ?Value = switch (v) {
+        .Instance => |i| blk: {
+            const g = i.borrow();
+            defer g.deinit();
+            break :blk g.get().outer;
+        },
+        else => null,
+    };
+    const o = outer orelse return raiseStep(frame, .{ .Type = "inner class instance has no outer instance" });
+    if (o == .Null or o == .Unit) return raiseStep(frame, .{ .Type = "inner class instance has no outer instance" });
+    o.retain();
+    try frame.write(lo.dst, o);
+    return .cont;
+}
+
+/// The frame's `idx`th context parameter. A caller that bound the call
+/// statically handed the values over as `context` chain entries; a frame no
+/// caller served derives the value once from its chain by the declared type,
+/// the innermost receiver or context value that is one, which is what every
+/// by-name arm inside the body did per read.
+pub noinline fn execArmLoadContextParam(comptime H: type, allocator: Allocator, frame: *Frame, lc: anytype, host: *H) Allocator.Error!Step {
+    if (lc.idx < frame.ctx_values.items.len) {
+        const v = frame.ctx_values.items[lc.idx];
+        v.retain();
+        try frame.write(lc.dst, v);
+        return .cont;
+    }
+    const types = frame.func.x().ctx_types;
+    const ty_name: []const u8 = if (lc.idx < types.len) types[lc.idx] else "";
+    if (comptime @hasDecl(H, "contextValueOfType")) {
+        if (try host.contextValueOfType(allocator, ty_name)) |v| {
+            if (runtime.envOnce("KLIO_DISPATCH_TRACE") != null) {
+                std.debug.print("[context-fallback] fn={s} idx={d} ty={s} found=true\n", .{ frame.func.fqn, lc.idx, ty_name });
+            }
+            v.retain();
+            try frame.write(lc.dst, v);
+            return .cont;
+        }
+    }
+    if (runtime.envOnce("KLIO_DISPATCH_TRACE") != null) {
+        std.debug.print("[context-fallback] fn={s} idx={d} ty={s} found=false\n", .{ frame.func.fqn, lc.idx, ty_name });
+    }
+    return raiseStep(frame, .{ .Type = "contextual frame has no context value in scope" });
+}
+
 pub noinline fn execArmPropertyRef(comptime H: type, allocator: Allocator, frame: *Frame, pr: anytype, host: *H) Allocator.Error!Step {
     _ = host;
     const name_str = constStr(frame.module, pr.name) orelse
@@ -1872,6 +2036,19 @@ fn freeMissErr(allocator: Allocator, e: EvalError) void {
 /// member-vs-global. Mirrors Kotlin's resolution for an implicit receiver: the
 /// candidates innermost-first, members then extensions, then the global tiers.
 pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!Step {
+    const or_prev = orSiteEnter(frame, cmg.name);
+    defer or_site = or_prev;
+    const go_prev = or_global_only;
+    const gn_prev = or_global_only_name;
+    const gf_prev = or_global_only_func;
+    or_global_only = cmg.global_only;
+    or_global_only_name = constStr(frame.module, cmg.name) orelse "";
+    or_global_only_func = if (cmg.func) |fid| fid.int() else 0xFFFF_FFFF;
+    defer {
+        or_global_only = go_prev;
+        or_global_only_name = gn_prev;
+        or_global_only_func = gf_prev;
+    }
     dispatchBump(.call_member_or_global);
     const name_str = constStr(frame.module, cmg.name) orelse
         return raiseStep(frame, .{ .Type = "CallMemberOrGlobal: name not a string const" });
@@ -2016,6 +2193,25 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         // but the extension-fallback re-rank must not run past the pin.
         (cmg.func_final and !is_ctor_name and
             ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str)));
+    // The link pass proved no receiver in scope can answer the name, so the
+    // member walk is a longer route to the declaration the site already
+    // names. `KLIO_XORY_SERVE=0` withdraws the serve and leaves the walk.
+    if (cmg.global_only and !is_ctor_name and xoryServeOn()) go: {
+        const gf = cmg.func orelse break :go;
+        const gfd = frame.module.funcById(gf) orelse break :go;
+        // An extension needs its receiver prepended, which the global leg
+        // cannot do; the claim is about a name no receiver answers, so a
+        // receiver-taking target is not the one it named.
+        if (gfd.params.len != 0 and std.mem.eql(u8, gfd.params[0].name, "this")) break :go;
+        dispatchBump(.call_member_or_global_static);
+        switch (try host.callFuncNamed(allocator, frame.module, gf, arg_values, names)) {
+            .ok => |result| {
+                try frame.write(cmg.dst, result);
+                return .cont;
+            },
+            .err => |e| return raiseStep(frame, e),
+        }
+    }
     // A pinned EXTENSION dispatches directly with the receiver prepended: the
     // global leg cannot prepend one, and the member leg would re-rank past it.
     if (cmg.func_final and skip_member and !is_ctor_name and
@@ -2145,7 +2341,7 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             defer allocator.free(all);
             all[0] = er;
             for (arg_values, 0..) |v, i| all[i + 1] = v;
-            if (owner) |o| pushEnclosing(&o);
+            if (owner) |o| pushDispatch(&o);
             defer if (owner != null) popEnclosing();
             orAudit("CallMemberOrGlobal", name_str, "member_ext_recv", -1, &er);
             switch (try host.callFuncNamed(allocator, frame.module, t, all, &.{})) {
@@ -2259,17 +2455,20 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     if (try host.prepareMemberFlatCall(allocator, &c.v, name_str, arg_values, hint, null, false)) |prep0| {
                         var prep = prep0;
                         prep.dst = cmg.dst;
+                        arm_took_fid = prep.func.id.int();
                         orAudit("CallMemberOrGlobal", name_str, "member", c.depth, &c.v);
                         frame.flat_call = prep;
                         return .flat_call;
                     }
                 }
             }
+            if (or_global_only and xoryAuditOn()) armFidBegin();
             switch (if (committed_ext_h != null)
                 try host.callMemberMembersOnly(allocator, &c.v, name_str, arg_values, names, hint)
             else
                 try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names, hint)) {
                 .ok => |v| {
+                    if (or_global_only and xoryAuditOn()) arm_took_fid = armFidEnd();
                     orAudit("CallMemberOrGlobal", name_str, "member", c.depth, &c.v);
                     resolved = v;
                     break;
@@ -3218,12 +3417,122 @@ fn orAuditOn() bool {
     return or_audit_enabled;
 }
 
+/// The instruction currently being served, so an audit row names the SITE and
+/// not just the name. Whether an XOrY site ever takes both arms is the question
+/// that decides which of them lowering can settle, and a per-name tally cannot
+/// answer it: one name is many sites.
+threadlocal var or_site: usize = 0;
+
+/// A site key the arms can all produce: the executing function and the name
+/// constant. Two sites for one name in one function merge, which can only make
+/// a site look like it takes both arms when it does not — the safe direction
+/// for a question about what lowering may settle.
+fn orSiteEnter(frame: *Frame, name: anytype) usize {
+    const prev = or_site;
+    or_site = (@as(usize, frame.func.id.int()) << 24) | @as(usize, name.int());
+    return prev;
+}
+
+/// Whether the site being served said only its global leg can win, and the
+/// name it said it about. A resolution nests — a field read inside the call
+/// reports its own arms through the same audit — so the flag alone would
+/// blame this site for a decision another instruction made.
+threadlocal var or_global_only: bool = false;
+threadlocal var or_global_only_name: []const u8 = "";
+/// The global leg's target at the claimed site, so the audit can say whether a
+/// "member" win called the very declaration the site already named.
+threadlocal var or_global_only_func: u32 = 0xFFFF_FFFF;
+
+/// The declaration an arm actually entered, captured only while the XOrY audit
+/// is measuring one. FIRST wins: the arm's own callee is entered before
+/// anything that callee calls.
+threadlocal var arm_fid_capture: bool = false;
+threadlocal var arm_fid: u32 = 0xFFFF_FFFF;
+threadlocal var arm_took_fid: u32 = 0xFFFF_FFFF;
+
+var xory_serve_state: u8 = 0;
+
+/// Whether a site the link pass called global-only takes its named target
+/// directly. Off leaves every one on the member walk, which is what the
+/// corpus diff compares against.
+pub fn xoryServeOn() bool {
+    if (xory_serve_state == 0) {
+        xory_serve_state = if (std.mem.eql(u8, runtime.envOnce("KLIO_XORY_SERVE") orelse "1", "0")) 1 else 2;
+    }
+    return xory_serve_state == 2;
+}
+
+pub fn armFidCaptureOn() bool {
+    return arm_fid_capture;
+}
+
+pub fn noteArmFid(fid: u32) void {
+    if (arm_fid == 0xFFFF_FFFF) arm_fid = fid;
+}
+
+fn armFidBegin() void {
+    arm_fid_capture = true;
+    arm_fid = 0xFFFF_FFFF;
+}
+
+fn armFidEnd() u32 {
+    arm_fid_capture = false;
+    return arm_fid;
+}
+
+/// Which audit arms mean a RECEIVER answered, as opposed to one of the global
+/// tiers. `overload` and `global_id` are global-side picks among same-named
+/// top-level declarations, not a member win — counting them would make the
+/// audit report noise instead of the one thing it is for.
+fn armIsReceiverWin(arm: []const u8) bool {
+    const receiver_arms = [_][]const u8{
+        "member",              "member_lenient",  "member_ext_recv",
+        "smartcast_ext",       "committed_ext",   "pinned_ext_direct",
+        "enclosing_companion", "member_inline_typed", "sam_receiver_invoke",
+    };
+    for (receiver_arms) |a| {
+        if (std.mem.eql(u8, arm, a)) return true;
+    }
+    return false;
+}
+
+var xory_audit_state: u8 = 0;
+fn xoryAuditOn() bool {
+    if (xory_audit_state == 0) {
+        xory_audit_state = if (runtime.envOnce("KLIO_XORY_AUDIT") != null) 2 else 1;
+    }
+    return xory_audit_state == 2;
+}
+
 fn orAudit(inst_tag: []const u8, name: []const u8, arm: []const u8, depth: i32, recv: ?*const Value) void {
+    // A site the link pass called global-only claims no receiver in scope can
+    // answer the name. Every arm reports which leg won, so the claim is
+    // checkable against what runs rather than assumed.
+    if (or_global_only and xoryAuditOn() and armIsReceiverWin(arm) and
+        std.mem.eql(u8, inst_tag, "CallMemberOrGlobal") and
+        std.mem.eql(u8, name, or_global_only_name))
+    {
+        // A member arm that entered the very declaration the global leg names
+        // is not a refutation: the walk reached the same function by a longer
+        // route. Only a DIFFERENT target says the claim was wrong.
+        if (arm_took_fid != or_global_only_func) {
+            std.debug.print("[xory-audit] name={s} arm={s} depth={d} recv={s} took={d} site_global={d} in={s} site={x}\n", .{
+                name,
+                arm,
+                depth,
+                if (recv) |r| r.typeFqn() else "-",
+                arm_took_fid,
+                or_global_only_func,
+                if (ir.eval.currentFrameFunc()) |c| (if (c.fqn.len != 0) c.fqn else c.name) else "-",
+                or_site,
+            });
+        }
+    }
     if (!orAuditOn()) return;
     const recv_tag: []const u8 = if (recv) |r| r.typeFqn() else "-";
     std.debug.print(
-        "[KLIO_OR_AUDIT] run inst={s} name={s} arm={s} depth={d} recv={s}\n",
-        .{ inst_tag, name, arm, depth, recv_tag },
+        "[KLIO_OR_AUDIT] run inst={s} name={s} arm={s} depth={d} recv={s} site={x}\n",
+        .{ inst_tag, name, arm, depth, recv_tag, or_site },
     );
 }
 
@@ -3375,11 +3684,22 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             const g = s.borrow();
             defer g.deinit();
             const sd = g.get();
-            // ASCII in-bounds only, where the UTF-16 unit at `ui` is byte `ui`.
-            // The native's UTF-16 walk and IndexOutOfBoundsException are the
-            // contract for everything else.
-            if (!sd.ascii or ui >= sd.bytes.len) return null;
-            return .{ .Char = sd.bytes[ui] };
+            // The UTF-16 unit at `ui` is byte `ui` when every byte is ASCII;
+            // otherwise the cursor-resumed walk answers, so an in-bounds index
+            // is served here whatever the string holds. Out of bounds is the
+            // one case left, and the caller raises it.
+            if (sd.ascii) return if (ui < sd.bytes.len) .{ .Char = sd.bytes[ui] } else null;
+            return if (sd.utf16UnitAt(ui)) |u| .{ .Char = u } else null;
+        },
+        // A builder carries no immutable header, so its ASCII-ness, length and
+        // cursor live in the reader memo every mutating builtin invalidates.
+        .StringBuilder => |sb| {
+            const g = sb.borrow();
+            defer g.deinit();
+            const items = g.get().items;
+            const m = runtime.sbMemoFor(@intFromPtr(sb.cell), items);
+            if (m.ascii) return if (ui < items.len) .{ .Char = items[ui] } else null;
+            return if (runtime.sbUnitAt(m, items, ui)) |u| .{ .Char = u } else null;
         },
         else => return null,
     }
@@ -3436,17 +3756,45 @@ pub inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *con
 /// and friends are infix member functions, not operators, so they lower to a member
 /// call and reach the name ladder on every execution. A member always wins over an
 /// extension in Kotlin, so these names on an `Int` pair mean the builtin.
+/// `toString()` on the two host-backed text shapes, which is a total path:
+/// a string IS its own `toString`, and a builder's is its buffer decoded.
+/// Everything else declines, so a user override is never shadowed.
+pub fn fastToString(allocator: Allocator, recv: *const Value) ?Value {
+    switch (recv.*) {
+        .String => {
+            recv.retain();
+            return recv.*;
+        },
+        .StringBuilder => |sb| {
+            const g = sb.borrow();
+            defer g.deinit();
+            const dup = runtime.coalesceSurrogates(allocator, g.get().items) catch return null;
+            return .{ .String = runtime.strInitOwned(allocator, dup) catch return null };
+        },
+        else => return null,
+    }
+}
+
 pub inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
     if (cm.x().arg_names.len != 0 or cm.n_args > 1) return null;
+    // The site names the operation, so the ladder below is a switch rather
+    // than up to a dozen string comparisons per member call.
+    const op = cm.builtin;
+    if (op == .none) return null;
     const recv = frame.read(cm.receiver);
-    const nm = constStr(frame.module, cm.name) orelse return null;
     const arg: ?Value = if (cm.n_args == 1) frame.read(Reg.from(cm.args.int())) else null;
-    return primitiveMemberOp(&recv, nm, arg);
+    return primitiveMemberOpOf(&recv, op, arg);
 }
 
 /// The value-level core of `primitiveMemberFast`, shared with the frameless leaf
-/// walk: a pure function of the receiver, name and at most one argument.
+/// walk: a pure function of the receiver, name and at most one argument. The
+/// leaf walk holds a name and no site, so it converts once here.
 pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Value {
+    const n_args: u32 = if (arg_in != null) 1 else 0;
+    return primitiveMemberOpOf(recv_in, ir.BuiltinMember.of(nm, n_args), arg_in);
+}
+
+pub fn primitiveMemberOpOf(recv_in: *const Value, op: ir.BuiltinMember, arg_in: ?Value) ?Value {
     // No instance is a primitive, and an instance is the receiver this is asked
     // about most; deciding it here spares the name compares below.
     if (recv_in.* == .Instance) return null;
@@ -3454,7 +3802,7 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
     // `compareTo` on two same-kind primitives answers what the host intrinsic does:
     // the CODE DIFFERENCE for `Char`, and -1/0/1 for `Int`/`Long`.
     if (arg_in) |cmp_arg| {
-        if (std.mem.eql(u8, nm, "compareTo")) {
+        if (op == .compare_to) {
             const ord: ?i64 = switch (recv) {
                 .Char => |c| if (cmp_arg == .Char)
                     @as(i64, @intCast(c)) - @as(i64, @intCast(cmp_arg.Char))
@@ -3483,7 +3831,7 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
                     defer g.deinit();
                     break :blk g.get().items.len;
                 };
-                if (std.mem.eql(u8, nm, "isEmpty")) return .{ .Bool = n == 0 };
+                if (op == .is_empty) return .{ .Bool = n == 0 };
                 return null;
             },
             .Set => |st| if (st.backing == null) {
@@ -3492,7 +3840,7 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
                     defer g.deinit();
                     break :blk g.get().items.len;
                 };
-                if (std.mem.eql(u8, nm, "isEmpty")) return .{ .Bool = n == 0 };
+                if (op == .is_empty) return .{ .Bool = n == 0 };
                 return null;
             },
             else => {},
@@ -3505,9 +3853,9 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
             .Long => |l| l,
             else => unreachable,
         };
-        if (std.mem.eql(u8, nm, "toInt")) return Value.newInt(@truncate(wide));
-        if (std.mem.eql(u8, nm, "toLong")) return .{ .Long = wide };
-        if (std.mem.eql(u8, nm, "inv")) return switch (recv) {
+        if (op == .to_int) return Value.newInt(@truncate(wide));
+        if (op == .to_long) return .{ .Long = wide };
+        if (op == .inv) return switch (recv) {
             .Int => |i| Value.newInt(~i),
             .Long => |l| .{ .Long = ~l },
             else => unreachable,
@@ -3525,17 +3873,17 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
         else => null,
     };
     if (shift) |s| {
-        if (std.mem.eql(u8, nm, "shl")) return switch (recv) {
+        if (op == .shl) return switch (recv) {
             .Int => |i| Value.newInt(@as(i32, @bitCast(@as(u32, @bitCast(i)) << @truncate(s)))),
             .Long => |l| .{ .Long = @bitCast(@as(u64, @bitCast(l)) << s) },
             else => unreachable,
         };
-        if (std.mem.eql(u8, nm, "shr")) return switch (recv) {
+        if (op == .shr) return switch (recv) {
             .Int => |i| Value.newInt(i >> @truncate(s)),
             .Long => |l| .{ .Long = l >> s },
             else => unreachable,
         };
-        if (std.mem.eql(u8, nm, "ushr")) return switch (recv) {
+        if (op == .ushr) return switch (recv) {
             .Int => |i| Value.newInt(@as(i32, @bitCast(@as(u32, @bitCast(i)) >> @truncate(s)))),
             .Long => |l| .{ .Long = @bitCast(@as(u64, @bitCast(l)) >> s) },
             else => unreachable,
@@ -3554,9 +3902,9 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
         }
     }.f;
     const is_int = recv == .Int;
-    if (std.mem.eql(u8, nm, "and")) return wrap(is_int, p.a & p.b);
-    if (std.mem.eql(u8, nm, "or")) return wrap(is_int, p.a | p.b);
-    if (std.mem.eql(u8, nm, "xor")) return wrap(is_int, p.a ^ p.b);
+    if (op == .bit_and) return wrap(is_int, p.a & p.b);
+    if (op == .bit_or) return wrap(is_int, p.a | p.b);
+    if (op == .bit_xor) return wrap(is_int, p.a ^ p.b);
     return null;
 }
 
@@ -3570,20 +3918,118 @@ pub inline fn nullSiteOk(comptime H: type, host: *H, recv: *const Value, name: [
     return ok_now;
 }
 
-pub inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) ?Value {
-    if (cm.x().arg_names.len != 0 or cm.n_args == 0) return null;
+/// What the subscript path produced. An ARRAY receiver never declines, and
+/// neither does a STRING read: an index outside either is an error, and
+/// raising it here is what makes the path total. A path that can decline
+/// sends the site back to the by-name walk, which is the whole reason a site
+/// naming its operation still could not be called resolved.
+pub const SubscriptResult = union(enum) { value: Value, err: EvalError, decline };
+
+pub inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) SubscriptResult {
+    if (cm.x().arg_names.len != 0 or cm.n_args == 0) return .decline;
     // The indexed shapes are arrays, lists, maps and strings; an instance
     // receiver reaches neither serve, so its tag answers before the names do.
     const recv = frame.read(cm.receiver);
-    if (recv == .Instance) return null;
-    const nm = constStr(frame.module, cm.name) orelse return null;
-    const is_get = cm.n_args == 1 and std.mem.eql(u8, nm, "get");
-    const is_set = cm.n_args == 2 and std.mem.eql(u8, nm, "set");
-    if (!is_get and !is_set) return null;
+    if (recv == .Instance) return .decline;
+    // The operation is on the instruction: the name and the argument count
+    // decided it at lowering, and neither changes per execution.
+    const op = cm.builtin;
+    // `KLIO_SUBSCRIPT_AUDIT=1`: the site's operation against the name it was
+    // bound from. A site whose name was not yet a string constant when it was
+    // pushed would bind `.none` and quietly lose the fast path rather than
+    // answer wrongly, which is the failure this reports.
+    if (runtime.envOnce("KLIO_SUBSCRIPT_AUDIT") != null) {
+        const nm = constStr(frame.module, cm.name) orelse "";
+        const walked = ir.BuiltinMember.of(nm, cm.n_args);
+        if (walked != op) {
+            std.debug.print("[subscript-audit] name={s} nargs={d} site={s} walk={s}\n", .{
+                nm, cm.n_args, @tagName(op), @tagName(walked),
+            });
+        }
+    }
+    if (op == .none) return .decline;
     const idx_v = frame.read(Reg.from(cm.args.int()));
-    if (is_get) return fastIndexGet(&recv, &idx_v);
-    const new_val = frame.read(Reg.from(cm.args.int() + 1));
-    return fastIndexSet(allocator, &recv, &idx_v, new_val);
+    const served: ?Value = if (op == .get)
+        fastIndexGet(&recv, &idx_v)
+    else
+        fastIndexSet(allocator, &recv, &idx_v, frame.read(Reg.from(cm.args.int() + 1)));
+    if (served) |v| return .{ .value = v };
+    // An array with an `Int` index declines for one reason only, and that
+    // reason is an exception the walk would raise anyway. Raising it here
+    // keeps the path total, which is what lets the site be called resolved.
+    if (recv == .Array and idx_v == .Int and arrayIndexOob(&recv, idx_v.Int)) {
+        const msg = std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{
+            idx_v.Int, arrayLen(&recv),
+        }) catch return .decline;
+        const exc = Value.newException(allocator, .{
+            .fqn = runtime.strInit(allocator, "kotlin.ArrayIndexOutOfBoundsException") catch return .decline,
+            .message = .from(runtime.strInitOwned(allocator, msg) catch return .decline),
+            .cause = null,
+        }) catch return .decline;
+        return .{ .err = .{ .Throw = exc } };
+    }
+    // A builder read declines for the same one reason, and its native words
+    // the exception differently from the string's.
+    if (op == .get and recv == .StringBuilder and idx_v == .Int) {
+        const n: usize = blk: {
+            const g = recv.StringBuilder.borrow();
+            defer g.deinit();
+            const items = g.get().items;
+            break :blk runtime.sbMemoFor(@intFromPtr(recv.StringBuilder.cell), items).u16_len;
+        };
+        const msg = std.fmt.allocPrint(allocator, "index: {d}, length: {d}", .{ idx_v.Int, n }) catch return .decline;
+        const exc = Value.newException(allocator, .{
+            .fqn = runtime.strInit(allocator, "kotlin.IndexOutOfBoundsException") catch return .decline,
+            .message = .from(runtime.strInitOwned(allocator, msg) catch return .decline),
+            .cause = null,
+        }) catch return .decline;
+        return .{ .err = .{ .Throw = exc } };
+    }
+    // A string subscript with an `Int` index declines for one reason too, and
+    // the native raises exactly this for it.
+    if (op == .get and recv == .String and idx_v == .Int) {
+        const u16_len: usize = blk: {
+            const g = recv.String.borrow();
+            defer g.deinit();
+            break :blk g.get().u16_len;
+        };
+        const msg = if (idx_v.Int < 0)
+            std.fmt.allocPrint(allocator, "index {d} out of bounds", .{idx_v.Int}) catch return .decline
+        else
+            std.fmt.allocPrint(allocator, "index {d} out of bounds (length {d})", .{ idx_v.Int, u16_len }) catch return .decline;
+        const exc = Value.newException(allocator, .{
+            .fqn = runtime.strInit(allocator, "kotlin.IndexOutOfBoundsException") catch return .decline,
+            .message = .from(runtime.strInitOwned(allocator, msg) catch return .decline),
+            .cause = null,
+        }) catch return .decline;
+        return .{ .err = .{ .Throw = exc } };
+    }
+    return .decline;
+}
+
+fn arrayLen(recv: *const Value) usize {
+    return switch (recv.*) {
+        .Array => |arr| switch (arr.storage()) {
+            .scalars => |pb| blk: {
+                const g = pb.borrow();
+                defer g.deinit();
+                break :blk g.get().len();
+            },
+            .boxed => |vl| blk: {
+                const g = vl.borrow();
+                defer g.deinit();
+                break :blk g.get().items.len;
+            },
+        },
+        else => 0,
+    };
+}
+
+/// Whether `idx` is outside the array, which is the only reason an array
+/// subscript with an `Int` index declines.
+fn arrayIndexOob(recv: *const Value, idx: i64) bool {
+    if (idx < 0) return true;
+    return @as(usize, @intCast(idx)) >= arrayLen(recv);
 }
 
 /// Snapshot the live values of a `[]Reg`. Caller frees.

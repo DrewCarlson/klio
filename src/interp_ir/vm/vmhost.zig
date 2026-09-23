@@ -317,14 +317,30 @@ pub const VmHost = struct {
     pub const declaringClassSimpleName = host_call_member.declaringClassSimpleName;
     pub const memberRef = host_call_member.memberRef;
     pub const memberRefExact = host_call_member.memberRefExact;
-    pub const callSuper = host_call_member.callSuper;
+    pub const anyMember = host_call_member.anyMember;
+    pub const invokeMethodFuncId = host_call_member.invokeMethodFuncId;
     pub const qualifiedThis = host_call_member.qualifiedThis;
+    pub const memberExtOwnerInstanceFor = host_call_member.memberExtOwnerInstanceFor;
     pub const setCtorArgStaticHeads = host_instances.setCtorArgStaticHeads;
+    pub const setCtorSitePick = host_instances.setCtorSitePick;
     pub const newInstance = host_instances.newInstance;
     pub const newInstanceNamed = host_instances.newInstanceNamed;
     pub const classSecondaryCtorCanBind = host_instances.classSecondaryCtorCanBind;
     pub const buildObject = host_instances.buildObject;
     pub const getField = host_fields.getField;
+    /// `EnumClass.Entry` served by index: the entries are built on first use,
+    /// so the read has to run that before it can index them.
+    pub fn enumEntryAt(self: *VmHost, cls: runtime.ObjRef(runtime.ClassDef), index: u32, name: []const u8) ir.eval.EvalResult {
+        if (host_globals.ensureEnumInit(self, cls) catch return .{ .err = .{ .Type = "enum init failed" } }) |e|
+            return .{ .err = e };
+        const g = cls.borrow();
+        defer g.deinit();
+        const entries = g.get().enum_entries;
+        if (index >= entries.len) return .{ .err = .{ .Type = "enum entry index out of range" } };
+        const e = entries[index];
+        if (!std.mem.eql(u8, e.name, name)) return .{ .err = .{ .Type = "enum entry name mismatch" } };
+        return .{ .ok = e.value };
+    }
     pub const getMemberField = host_fields.getMemberField;
     pub const getMemberFieldNoExt = host_fields.getMemberFieldNoExt;
     pub const enclosingEnumEntry = host_fields.enclosingEnumEntry;
@@ -355,14 +371,8 @@ pub const VmHost = struct {
     pub const plainStoredFieldIndex = host_fields.plainStoredFieldIndex;
     pub const plainStoredScalarFieldNN = host_fields.plainStoredScalarFieldNN;
     pub const setField = host_fields.setField;
-    pub const setFieldFrom = host_fields.setFieldFrom;
     pub const instanceOf = host_classes.instanceOf;
-    pub const ctxStackLen = host_context.ctxStackLen;
-    pub const ctxPush = host_context.ctxPush;
-    pub const ctxStackTruncate = host_context.ctxStackTruncate;
-    pub const ctxResolve = host_context.ctxResolve;
-    pub const ctxActivate = host_context.ctxActivate;
-    pub const ctxIsActive = host_context.ctxIsActive;
+    pub const contextValueOfType = host_context.contextValueOfType;
     pub const isConcreteCastTarget = host_classes.isConcreteCastTarget;
     pub const isDeclaredClassNameFrom = host_classes.isDeclaredClassNameFrom;
     pub const registerClass = host_classes.registerClass;

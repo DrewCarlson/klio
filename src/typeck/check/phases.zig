@@ -78,7 +78,9 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .classes = std.StringHashMap(root.ClassInfo).init(allocator),
         .ambiguous_class_names = std.StringHashMap(void).init(allocator),
         .extension_fn_names = std.StringHashMap(void).init(allocator),
+        .package_roots = std.StringHashMap(void).init(allocator),
         .class_stack = .empty,
+        .this_ext_stack = .empty,
         .fn_return_stack = .empty,
         .label_stack = .empty,
         .fn_visibility = std.StringHashMap(std.ArrayList(root.VisFile)).init(allocator),
@@ -89,6 +91,7 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .suspend_context_stack = .empty,
         .reified_type_params = .empty,
         .type_params_in_scope = .empty,
+        .type_param_bounds_in_scope = .empty,
         .fn_annotations = std.StringHashMap(std.ArrayList([]ast.Annotation)).init(allocator),
         .prop_annotations = std.StringHashMap([]ast.Annotation).init(allocator),
         .annotation_class_names = std.StringHashMap(void).init(allocator),
@@ -116,12 +119,27 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
     };
 }
 
+var body_fixpoint_state: u8 = 0;
+
+/// Extra body passes beyond the first. `KLIO_TC_FIXPOINT=<n>`.
+fn bodyFixpointRounds() usize {
+    if (body_fixpoint_state == 0) {
+        const v = std.c.getenv("KLIO_TC_FIXPOINT");
+        body_fixpoint_rounds = if (v) |p| (std.fmt.parseInt(usize, std.mem.span(p), 10) catch 1) else 0;
+        body_fixpoint_state = 1;
+    }
+    return body_fixpoint_rounds;
+}
+
+var body_fixpoint_rounds: usize = 0;
+
 pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
     // Seed signatures of top-level functions, classes and property types so
     // forward references in bodies typecheck.
     for (file.decls) |*d| {
         try self.declareTopLevel(d);
     }
+    try inferTopLevelPropertyTypes(self, file.decls);
     // Collect dsl-marker annotation classes and the user classes carrying
     // them, so DSL-scope diagnostics can consult them as the lambda-receiver
     // stack is pushed.
@@ -155,6 +173,21 @@ pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
         }
     }
     try checkBodies(self, file.decls);
+    // `KLIO_TC_FIXPOINT=1`: check the bodies again with reporting off. A
+    // body's types depend on declarations the first pass only learns while
+    // walking, so a second pass can name expressions the first could not —
+    // the `val x = <untypable>` cascade is exactly that shape. Diagnostics
+    // are suppressed so nothing is reported twice.
+    {
+        const rounds = bodyFixpointRounds();
+        if (rounds != 0) {
+            const prev_report = self.report_diagnostics;
+            self.report_diagnostics = false;
+            defer self.report_diagnostics = prev_report;
+            var i: usize = 0;
+            while (i < rounds) : (i += 1) try checkBodies(self, file.decls);
+        }
+    }
     // Everything from here to the bodies only reports; a caller that reads
     // the resolutions and types alone skips it.
     if (!self.report_diagnostics) return;
@@ -3474,6 +3507,57 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+/// A top-level `val x = Foo()` has the type of its initializer everywhere it
+/// is read, and the bodies reading it are checked in any order and on any
+/// worker. Its initializer is typed once here, after every declaration is
+/// known and before any body runs, with its diagnostics dropped: the body
+/// pass reports them.
+fn inferTopLevelPropertyTypes(self: *Checker, decls: []const Decl) Allocator.Error!void {
+    if (root.types.tcOff("TOPPROP")) return;
+    // Two files declaring one name share the flat binding; neither type
+    // is the other's.
+    var seen = std.StringHashMap(u32).init(self.allocator);
+    defer seen.deinit();
+    for (decls) |*d| {
+        if (d.* != .Property) continue;
+        const gop = try seen.getOrPut(d.Property.name.name);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+    for (decls) |*d| {
+        if (d.* != .Property) continue;
+        const p = d.Property;
+        if (p.ty != null or p.receiver_type != null) continue;
+        if ((seen.get(p.name.name) orelse 0) > 1) continue;
+        const init = p.init orelse continue;
+        const b = self.frames.items[0].bindings.getPtr(p.name.name) orelse continue;
+        if (b.ty != .Unresolved) continue;
+        const n_diags = self.diagnostics.diagnostics.items.len;
+        const prev_report = self.report_diagnostics;
+        self.report_diagnostics = false;
+        var ty = try self.checkExpr(init, null);
+        self.report_diagnostics = prev_report;
+        {
+            const items = self.diagnostics.diagnostics.items;
+            var i = n_diags;
+            while (i < items.len) : (i += 1) items[i].deinit(self.allocator);
+            self.diagnostics.diagnostics.shrinkRetainingCapacity(n_diags);
+        }
+        const cn = self.expr_class.get(init.span()) orelse helpers.classNameOfType(&ty);
+        if (ty == .Unresolved and cn == null) {
+            ty.deinit(self.allocator);
+            continue;
+        }
+        const slot = self.frames.items[0].bindings.getPtr(p.name.name) orelse {
+            ty.deinit(self.allocator);
+            continue;
+        };
+        slot.ty.deinit(self.allocator);
+        slot.ty = ty;
+        if (slot.class_name == null) slot.class_name = try self.internOpt(cn);
+    }
+}
+
 fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
     const workers_n = bodyWorkers(self, decls.len);
     const t_start = nowNs();
@@ -3574,12 +3658,14 @@ fn forkWorker(self: *const Checker, seed: *const std.StringHashMap(root.Binding)
     try c.frames.append(a, Frame.init(a));
     c.shared_globals = seed;
     c.class_stack = .empty;
+    c.this_ext_stack = .empty;
     c.fn_return_stack = .empty;
     c.label_stack = .empty;
     c.public_inline_stack = .empty;
     c.suspend_context_stack = .empty;
     c.reified_type_params = .empty;
     c.type_params_in_scope = .empty;
+    c.type_param_bounds_in_scope = .empty;
     c.dsl_receiver_stack = .empty;
     c.cfgs = std.AutoHashMap(root.Span, root.Cfg).init(a);
     c.lowerings = std.AutoHashMap(root.Span, *root.Lowered).init(a);

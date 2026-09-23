@@ -280,7 +280,10 @@ pub const Pool = struct {
                         // Stopping wins over the backlog: queued daemon tasks are
                         // dropped, not run.
                         if (self.stopping) return;
-                        if (self.takeEligible()) |t| break :blk t;
+                        if (self.takeEligible()) |t| {
+                            _ = tasks_begun.fetchAdd(1, .release);
+                            break :blk t;
+                        }
                     }
                     // Idle park; the 1ms cap paces the abandon poll and the wait is
                     // GC-safe.
@@ -382,9 +385,23 @@ fn gcMarkPool(m: *runtime.gc.Marker) void {
     for (qi.items.items[qi.head..]) |*t| t.block.gcMark(m);
 }
 
+/// Tasks a worker has picked up. Monotonic; a caller compares against the
+/// value it read before posting, to wait for its own dispatch to have BEGUN.
+pub var tasks_begun: std.atomic.Value(u64) = .init(0);
+
 pub fn post(task: Task) Allocator.Error!void {
     return global_pool.post(task);
 }
+
+pub fn tasksBegun() u64 {
+    return tasks_begun.load(.acquire);
+}
+
+pub fn outstandingOtherCount() usize {
+    return global_pool.outstandingOther();
+}
+
+
 
 pub fn outstandingOther() usize {
     return global_pool.outstandingOther();

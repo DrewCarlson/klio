@@ -1605,7 +1605,7 @@ pub fn staticArgCompatibility(
         const builtin_identity = self.staticBuiltinIdentity(param, declared);
         if (builtin_identity == .ambiguous) return .unknown;
         if (builtin_identity == .no) return .incompatible;
-        if (kind == .numeric) {
+        if (kind == .numeric or kind == .integral or kind == .floating) {
             const numeric_target = std.mem.eql(u8, declared, "Byte") or
                 std.mem.eql(u8, declared, "Short") or
                 std.mem.eql(u8, declared, "Int") or
@@ -1619,6 +1619,11 @@ pub fn staticArgCompatibility(
             if (std.mem.eql(u8, declared, "Any") or
                 std.mem.eql(u8, declared, "Number")) return .compatible;
             if (!numeric_target) return .incompatible;
+            // An integer literal has no `Double` or `Float` type in Kotlin, so
+            // a floating slot is not a coercion the literal can make.
+            if (kind == .integral and
+                (std.mem.eql(u8, declared, "Double") or std.mem.eql(u8, declared, "Float")))
+                return .incompatible;
             if (arg.ty) |ty| {
                 if (std.mem.eql(u8, staticTypeHead(ty.name), declared)) {
                     return .compatible;
@@ -1635,7 +1640,7 @@ pub fn staticArgCompatibility(
             return .unknown;
         }
         return switch (kind) {
-            .numeric => unreachable,
+            .numeric, .integral, .floating => unreachable,
             .string => if (std.mem.eql(u8, declared, "String") or
                 std.mem.eql(u8, declared, "CharSequence") or
                 std.mem.eql(u8, declared, "Any")) .compatible else .incompatible,

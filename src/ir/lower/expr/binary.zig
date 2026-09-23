@@ -9,6 +9,7 @@ const helpers = @import("../helpers.zig");
 const ast_scan = @import("../ast_scan.zig");
 const stmt_mod = @import("../stmt.zig");
 const static_call_type = @import("../static_call_type.zig");
+const emit = @import("emit.zig");
 
 const Allocator = std.mem.Allocator;
 const FuncBuilder = build.FuncBuilder;
@@ -155,6 +156,7 @@ fn lowerResolvedBinaryOperator(
         &.{},
         &.{},
         declared_lhs_ty,
+        false,
     );
 }
 
@@ -382,6 +384,31 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         const r = try lowerExpr(b, rhs);
         try b.push(.{ .Move = .{ .dst = arg_slot, .src = r } });
         const cmp = b.allocReg();
+        // The operand's declared upper bound names the class that owns the
+        // `compareTo` this call runs, which is what `head_only` records. With
+        // a declaration to name, the call is the ordinary virtual dispatch on
+        // that slot; without one it keeps the head for the walk to read.
+        //
+        // The extension question does not arise. This arm fires only where
+        // both operands carry the ordered type, so the bound's own
+        // `compareTo` is applicable to the pair, and Kotlin ranks an
+        // applicable member above every extension.
+        const recv_head = genericCompareRecvHead(b, lhs);
+        if (recv_head) |h| {
+            if (emit.declaredSlotOnNoExt(b, h, "compareTo", 1)) |fid| {
+                try b.push(.{ .CallVirtual = .{
+                    .dst = cmp,
+                    .receiver = recv,
+                    .slot = ir.MethodSlotId.fromFunc(fid),
+                    .args = arg_slot,
+                    .n_args = 1,
+                } });
+                const zero_v = try b.emitConst(.{ .Int = 0 });
+                const dst_v = b.allocReg();
+                try b.push(.{ .BinOp = .{ .dst = dst_v, .op = astBinop(op), .lhs = cmp, .rhs = zero_v } });
+                return dst_v;
+            }
+        }
         const nm = try b.module.internConst(b.allocator, .{ .String = "compareTo" });
         try b.push(.{ .CallMember = .{
             .dst = cmp,
@@ -389,7 +416,13 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             .name = nm,
             .args = arg_slot,
             .n_args = 1,
-            .extra = try b.memberExtra(.{ .arg_names = &.{} }),
+            .extra = try b.memberExtra(.{
+                .arg_names = &.{},
+                .declared_recv = if (recv_head) |h|
+                    try b.module.internConst(b.allocator, .{ .String = h })
+                else
+                    null,
+            }),
         } });
         const zero = try b.emitConst(.{ .Int = 0 });
         const dst = b.allocReg();
@@ -444,6 +477,38 @@ fn operandTypeRefKeepingTypeParams(b: *FuncBuilder, e: *const Expr) Allocator.Er
         callee.Member.name.name,
         e.Call.span.file,
     );
+}
+
+/// The class that owns the `compareTo` a generic comparison runs: the operand's
+/// declared upper bound for a type-parameter-typed operand, and `Comparable`
+/// itself where the operand is already spelled that way.
+fn genericCompareRecvHead(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
+    if (isComparableCast(e)) return "Comparable";
+    if (e.* == .Path and e.Path.segments.len == 1) {
+        const nm = e.Path.segments[0].name;
+        if (comparableTypedLocal(b, nm)) return "Comparable";
+        if (b.isGenericTypedParam(nm)) {
+            if (b.localDeclType(nm)) |t| {
+                if (boundClassifier(b, simpleTypeHead(t))) |h| return h;
+            }
+        }
+    }
+    // Any other operand shape — an element read, a field, a call — answers
+    // through its static type, which in a generic function is the parameter
+    // the bound is recorded against.
+    const t = argDeclTypeRefLazy(b, e) orelse return null;
+    return boundClassifier(b, typeHead(std.mem.trimEnd(u8, t.name, "?")));
+}
+
+/// The classifier a head resolves to for member lookup: itself when it already
+/// names `Comparable`, else the declared upper bound of the type parameter it
+/// names. A bound recorded without its classifier names nothing.
+fn boundClassifier(b: *FuncBuilder, head: []const u8) ?[]const u8 {
+    if (head.len == 0) return null;
+    if (std.mem.eql(u8, head, "Comparable")) return "Comparable";
+    const bound = b.typeParamBound(head) orelse return null;
+    if (!bound.head_only or bound.bound.len == 0) return null;
+    return typeHead(std.mem.trimEnd(u8, bound.bound, "?"));
 }
 
 fn isGenericOperand(b: *FuncBuilder, e: *const Expr) bool {

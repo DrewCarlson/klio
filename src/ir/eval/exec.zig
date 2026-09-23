@@ -460,7 +460,16 @@ pub fn runFrameExec(
                     .gf_site => {
                         idx = code[pc + 1];
                         const inst = &binsts[idx];
-                        if (ev_inst.gfSiteFast(
+                        // The claimed-slot serve bypasses `execInst`, where the
+                        // ratchet's gate lives, so this op reports the site
+                        // itself and, in raise mode, defers to the frame arm.
+                        const gated = ev_diag.ratchetArmed() and ev_diag.unresolvedTierGate(
+                            frame.module,
+                            inst,
+                            frame.func.fqn,
+                            frame.read(inst.GetField.receiver).typeFqn(),
+                        );
+                        if (!gated and ev_inst.gfSiteFast(
                             H,
                             host,
                             frame,
@@ -1039,15 +1048,12 @@ fn instDst(inst: *const Inst) ?Reg {
         .CallValue => |x| x.dst,
         .CallValueWithThis => |x| x.dst,
         .CallSpread => |x| x.dst,
-        .CallSuper => |x| x.dst,
         .CallMember => |x| x.dst,
         .CallVirtual => |x| x.dst,
         .CallMemberOrGlobal => |x| x.dst,
         .CallValueOrMember => |x| x.dst,
         .CallMemberOrValue => |x| x.dst,
         .NewInstance => |x| x.dst,
-        .CtxScope => |x| x.dst,
-        .CtxCall => |x| x.dst,
         else => null,
     };
 }

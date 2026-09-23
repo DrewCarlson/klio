@@ -151,7 +151,7 @@ fn solveComparatorSibling(
     if (head.len == 0 or head.len <= 2) return null;
     const inputs = sel_ty.args[0 .. sel_ty.args.len - 1];
     var nb = FuncBuilder.init(b.allocator, b.module) catch return null;
-    nb.census_quiet = true;
+    nb.markScratch();
     defer nb.deinit();
     var elem_owned: ?ir.TypeRef = null;
     defer if (elem_owned) |*t| t.deinit(b.allocator);

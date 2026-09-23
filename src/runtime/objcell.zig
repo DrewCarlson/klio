@@ -92,6 +92,19 @@ pub fn envOnce(comptime name: [:0]const u8) ?[]const u8 {
     return S.value;
 }
 
+/// Test hook: force one variable's answer, bypassing the environment read, so
+/// a test can exercise a switch without mutating the process environment.
+pub fn envSetForTest(comptime name: [:0]const u8, value: ?[]const u8) void {
+    const S = EnvSlot(name);
+    S.value = value;
+    S.state.store(1, .release);
+}
+
+/// Test hook: undo `envSetForTest`, so the next ask reads the environment.
+pub fn envResetForTest(comptime name: [:0]const u8) void {
+    EnvSlot(name).state.store(0, .release);
+}
+
 pub fn envSetOnce(comptime name: [:0]const u8) bool {
     return envOnce(name) != null;
 }

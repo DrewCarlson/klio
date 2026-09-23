@@ -194,8 +194,13 @@ pub fn hasNonNullField(inst: ObjRef(InstanceData), key: []const u8) bool {
     return false;
 }
 
+/// Drop the current entry under `key` so the `pushField` that follows puts the
+/// new value at the tail, where a derived value displaces a base one. A slot
+/// the class layout reserved keeps its place: `pushField` overwrites it where
+/// it is, and removing it would shift every slot after it.
 pub fn retainField(g: *InstanceData, allocator: Allocator, key: []const u8) void {
-    var i: usize = 0;
+    if (g.reservedSlot(key) != null) return;
+    var i: usize = @min(g.reserved, g.fields.items.len);
     while (i < g.fields.items.len) {
         if (std.mem.eql(u8, g.fields.items[i].name, key)) {
             _ = g.fields.orderedRemove(i);
@@ -208,6 +213,12 @@ pub fn retainField(g: *InstanceData, allocator: Allocator, key: []const u8) void
 }
 
 pub fn pushField(g: *InstanceData, allocator: Allocator, key: []const u8, v: Value) Allocator.Error!void {
+    if (g.reservedSlot(key)) |si| {
+        // The pair the caller used to remove-then-append kept no reference of
+        // its own, so the overwrite does not release what it replaces either.
+        g.fields.items[si].value = v;
+        return;
+    }
     try g.ensureFieldsOwned(allocator, 1);
     try g.fields.append(allocator, .{ .name = key, .value = v });
     g.invalidateShape();
@@ -442,7 +453,11 @@ pub fn runSuperCtorChain(
     return .{ .ok = {} };
 }
 
-pub const ChainEntry = struct { name: []const u8, fqn: ?[]const u8 = null, args: []Value };
+/// One class in a constructor chain. `cid` is the id its `ClassDef` resolves
+/// to, recorded where the entry is built because the def is in hand there;
+/// without it the two passes over the chain reach each class by name again,
+/// once per construction.
+pub const ChainEntry = struct { name: []const u8, fqn: ?[]const u8 = null, args: []Value, cid: ?ir.ClassId = null };
 
 /// Evaluates every class-to-class delegation below an object expression's direct
 /// superclass, which the enclosing lexical scope already evaluated; the rest bind

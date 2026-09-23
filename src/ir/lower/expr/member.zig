@@ -31,8 +31,12 @@ const scopeTypeRename = paths_mod.scopeTypeRename;
 
 const emit_mod = @import("emit.zig");
 const emitFqnWithClassPrefix = emit_mod.emitFqnWithClassPrefix;
+const member_call_mod = @import("member_call.zig");
+const helpers = @import("../helpers.zig");
 
 const static_type_mod = @import("static_type.zig");
+const arg_shape_mod = @import("arg_shape.zig");
+const audit_mod = @import("audit.zig");
 const staticExprTypeRef = static_type_mod.staticExprTypeRef;
 
 const probe_mod = @import("probe.zig");
@@ -40,10 +44,93 @@ const bareTypeParamHead = probe_mod.bareTypeParamHead;
 const typeHead = probe_mod.typeHead;
 
 const block_mod = @import("block.zig");
+const implicit_walk = @import("implicit_walk.zig");
 const firstSegment = block_mod.firstSegment;
 const headIsPackage = block_mod.headIsPackage;
 
 /// `Member` lowering: safe member access, `super.<prop>`, FQN flatten, explicit
+/// The declared slot a read of `name` on `receiver`'s static type occupies.
+/// The conditions are `fieldSlotClaim`'s; all this adds is resolving the
+/// receiver's type to a class.
+pub const FieldSlotClaim = struct { cls: ir.ClassId, slot: u32 };
+
+/// The class a receiver expression's static type names, with no claim implied.
+fn receiverStaticClass(b: *FuncBuilder, receiver: *const Expr) ?ir.ClassId {
+    const declared = arg_shape_mod.argDeclTypeRefLazy(b, receiver);
+    var inferred: ?ir.TypeRef = if (declared == null) (staticExprTypeRef(b, receiver) catch null) else null;
+    defer if (inferred) |*t| t.deinit(b.allocator);
+    const ty = declared orelse inferred orelse {
+        // Which receiver SHAPE the deriver cannot type. `recv_type_unknown`
+        // is the sole blocker for the largest unresolved class and had no
+        // breakdown, so whether it is one shape or a hundred could not be
+        // read.
+        audit_mod.noteUntypedRecvShape(receiver);
+        if (receiver.* == .Path and receiver.Path.segments.len == 1) {
+            const rn = receiver.Path.segments[0].name;
+            if (b.isParam(rn) and runtime.envOnce("KLIO_UNTYPED_PARAM") != null) {
+                std.debug.print("[untyped-param] {s} declty={s} in={s}\n", .{
+                    rn,
+                    if (b.localDeclType(rn)) |t| t else "<none>",
+                    b.ownerClass() orelse "-",
+                });
+            }
+            audit_mod.noteUntypedRecvPath(if (b.isParam(rn))
+                .lambda_param
+            else if (b.resolve(rn) != null)
+                (if (b.localInitExpr(rn)) |ini| blk: {
+                    audit_mod.noteUntypedInitShape(ini);
+                    // For a call initializer, the question a fix would have
+                    // to answer: would a return-type channel reach it?
+                    if (ini.* == .Call)
+                        audit_mod.lm_untyped_init_call.bump(@intFromEnum(audit_mod.classifyCallReturn(b, ini)));
+                    break :blk .local_init_untypeable;
+                } else .local_no_init)
+            else if (b.knowsOuter(rn))
+                .captured
+            else
+                .other);
+        }
+        audit_mod.noSlotNote(.recv_type_unknown);
+        return null;
+    };
+    const cid = static_type_mod.staticTypeClassId(b, ty) orelse {
+        // Tell "no class has this name" from "several do": the second is a
+        // head that lost its package on the way here, and is fixable.
+        var head = std.mem.trimEnd(u8, ty.name, "?");
+        if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+        audit_mod.noSlotNote(if (std.mem.findScalar(u8, head, '.') == null and
+            b.module.simpleNameIsAmbiguous(probe_mod.typeHead(head)))
+            .recv_ambiguous_simple
+        else
+            .recv_not_a_class);
+        return null;
+    };
+    return cid;
+}
+
+/// As `receiverFieldSlot`, for a WRITE: the slot must also have no custom
+/// setter, which `plain` does not cover. `plain` is about reads, and a property
+/// can read straight from its slot while its setter runs code — `counter` in
+/// `examples/delegates.kt` stored the raw value past a setter that transformed
+/// it until the audit said so.
+pub fn receiverWriteSlot(b: *FuncBuilder, receiver: *const Expr, name: []const u8) ?FieldSlotClaim {
+    const c = receiverFieldSlot(b, receiver, name) orelse return null;
+    const layout = b.module.classFieldLayout(c.cls) orelse return null;
+    if (c.slot >= layout.slots.len) return null;
+    if (!layout.slots[c.slot].plain_write) return null;
+    return c;
+}
+
+pub fn receiverFieldSlot(b: *FuncBuilder, receiver: *const Expr, name: []const u8) ?FieldSlotClaim {
+    const declared = arg_shape_mod.argDeclTypeRefLazy(b, receiver);
+    var inferred: ?ir.TypeRef = if (declared == null) (staticExprTypeRef(b, receiver) catch null) else null;
+    defer if (inferred) |*t| t.deinit(b.allocator);
+    const ty = declared orelse inferred orelse return null;
+    const cid = static_type_mod.staticTypeClassId(b, ty) orelse return null;
+    const idx = static_type_mod.fieldSlotClaim(b, cid, name) orelse return null;
+    return .{ .cls = cid, .slot = idx };
+}
+
 /// `coroutineContext`, and the plain GetField.
 pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const m = expr.Member;
@@ -80,24 +167,61 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
-    // `super.<prop>`: dispatch its getter via the parent chain.
+    // `super.<prop>`: the supertype's accessor, or its cell.
     if (receiver.* == .Super) {
         const sup = receiver.Super;
         if (try superBase(b, sup)) |base| {
+            const qual: ?[]const u8 = if (sup.qualifier) |qt| qt.name.name else null;
+            // What `super.<prop>` names is fixed by the language the same
+            // way `super.f()` is: the nearest declaring class's accessor,
+            // a direct call, or the cell it stores the property in.
+            if (emit_mod.superPropertyAnswer(b, base.owner, qual, name.name, .read)) |ans| {
+                const recv_slot = b.allocReg();
+                try b.push(.{ .Move = .{ .dst = recv_slot, .src = base.this_reg } });
+                const sdst = b.allocReg();
+                switch (ans) {
+                    .accessor => |fid| try b.push(.{ .Call = .{
+                        .dst = sdst,
+                        .func = fid,
+                        .trailing_lambda = false,
+                        .args = recv_slot,
+                        .n_args = 1,
+                        .arg_names = &.{},
+                        .type_args = &.{},
+                        .exact = true,
+                    } }),
+                    .cell => |c| try b.push(.{ .GetField = .{
+                        .dst = sdst,
+                        .receiver = recv_slot,
+                        .field = try b.module.internConst(b.allocator, .{ .String = name.name }),
+                        .own_cls = c.cid,
+                        .own_slot = c.idx,
+                        .own_kind = .super_slot,
+                    } }),
+                }
+                return sdst;
+            }
+            // The accessor is created when the DECLARING class's body lowers
+            // and bodies lower from a pool, and a stored base property has
+            // no accessor at all: the link pass settles which, once every
+            // body has lowered. The receiver is copied so the settled form,
+            // a direct call, owns its argument register.
+            const start = emit_mod.superStartClass(b, base.owner, qual) orelse {
+                if (runtime.envOnce("KLIO_SUPER_WHY") != null)
+                    std.debug.print("[super-why] prop {s}.{s} qualified={} no class in={s}\n", .{ base.owner, name.name, qual != null, build.currentRealFn() orelse "-" });
+                return try member_call_mod.emitUnboundSuper(b, base.owner, name.name);
+            };
+            const recv_slot = b.allocReg();
+            try b.push(.{ .Move = .{ .dst = recv_slot, .src = base.this_reg } });
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
-            const oc = try b.module.internConst(b.allocator, .{ .String = base.owner });
-            const qual_const = try superQualifier(b, sup.qualifier);
-            const args_start = b.allocReg();
-            try b.push(.{ .CallSuper = .{
+            try b.push(.{ .GetField = .{
                 .dst = dst,
-                .receiver = base.this_reg,
-                .owner_class = oc,
-                .qualifier = qual_const,
-                .name = nm,
-                .args = args_start,
-                .n_args = 0,
-                .arg_names = &.{},
+                .receiver = recv_slot,
+                .field = nm,
+                .own_cls = start,
+                .own_kind = .super_target,
+                .own_slot = if (qual != null) 1 else 0,
             } });
             return dst;
         }
@@ -108,8 +232,14 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         defer b.allocator.free(fqn);
         const head = firstSegment(fqn);
         // A real package root flattens to an FQN LoadGlobal even inside a class
-        // method; only an ambiguous head defers to a member when `this` is in scope.
-        const head_is_real_pkg = isPkgRoot(head);
+        // method. A head some declaration's package spells is as real unless a
+        // receiver in scope is proven to declare it as a member; only a head
+        // that is neither defers to a member when `this` is in scope.
+        const head_is_real_pkg = isPkgRoot(head) or blk: {
+            if (!b.module.packageHeadDeclared(head)) break :blk false;
+            if (b.resolve("this") == null) break :blk true;
+            break :blk (try implicit_walk.walk(b, head, null, .property, "member_chain_head")) != .member;
+        };
         if (isPackageHead(head) and
             headIsPackage(b, head) and
             b.resolve(head) == null and
@@ -169,7 +299,8 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // When the receiver's static type resolves `name` to an in-scope
     // member-extension property rather than a member, Kotlin runs the extension
-    // getter, so emit a marker and let dispatch resolve the property.
+    // getter: a call to one known function on the declaring instance.
+    if (try memberExtPropGetterRead(b, receiver, name.name)) |dst| return dst;
     if (try staticExtPropReadField(b, receiver, name.name)) |marker| {
         const recv = try lowerReceiver(b, receiver);
         const dst = b.allocReg();
@@ -197,8 +328,46 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const recv = try lowerReceiver(b, receiver);
     const dst = b.allocReg();
     const field = try b.module.internConst(b.allocator, .{ .String = name.name });
-    try b.push(.{ .GetField = .{ .dst = dst, .receiver = recv, .field = field } });
+    // `recv.x` where the receiver's static type names a class whose layout
+    // fixes `x`'s slot. The runtime still proves the receiver IS that class
+    // before it serves the index, so a subtype receiver falls back rather
+    // than reading the wrong cell.
+    const claim = receiverFieldSlot(b, receiver, name.name);
+    // `EnumClass.Entry`: the receiver names an enum and the member names one of
+    // its entries, both settled here. The runtime compared the name against
+    // every entry on every read.
+    const entry = enumEntryClaim(b, receiver, name.name);
+    try b.push(.{ .GetField = .{
+        .dst = dst,
+        .receiver = recv,
+        .field = field,
+        // The receiver's static class is recorded whatever came of it: a read
+        // whose answer is a getter cannot be settled while the class body is
+        // still lowering, and `linkGetterRoutes` fills it once every body has.
+        .own_cls = if (entry) |e| e.cls else if (claim) |c| c.cls else receiverStaticClass(b, receiver),
+        .own_slot = if (entry) |e| e.slot else if (claim) |c| c.slot else 0,
+        .own_kind = if (entry != null) .enum_entry else if (claim != null) .slot else .none,
+    } });
     return dst;
+}
+
+/// The enum and entry index a `EnumClass.Entry` read names. The receiver has to
+/// be a bare class name: an enum value in a local reads its own members, not
+/// the entry table.
+fn enumEntryClaim(b: *FuncBuilder, receiver: *const Expr, name: []const u8) ?FieldSlotClaim {
+    if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
+    const head = receiver.Path.segments[0].name;
+    // A local, parameter or captured name of the same spelling is the value,
+    // not the classifier.
+    if (b.resolve(head) != null or b.knowsOuter(head)) return null;
+    const file = receiver.Path.segments[0].span.file;
+    const cid = b.module.classIdIndexed(head, b.self_package, file) orelse
+        b.module.classId(head) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const c = &b.module.classes.items[cid.int()];
+    if (!c.is_enum) return null;
+    const idx = c.enumEntryIndex(name) orelse return null;
+    return .{ .cls = cid, .slot = idx };
 }
 
 /// The statically known type head of a bare single-name receiver: a typed local or
@@ -485,6 +654,84 @@ pub fn staticTypeDeclaresProp(b: *const FuncBuilder, ty: []const u8, name: []con
     return false;
 }
 
+/// The static type head of a member read's receiver: a bare name through the
+/// shadow-aware local and member walk, any other expression through its declared
+/// or derived type. A nullable receiver reads nothing here.
+fn staticReceiverHead(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?[]const u8 {
+    switch (receiver.*) {
+        .Path => |p| if (p.segments.len == 1) return staticBareReceiverType(b, p.segments[0].name),
+        else => {},
+    }
+    if (arg_shape_mod.argDeclTypeRefLazy(b, receiver)) |t| {
+        if (t.nullable or std.mem.endsWith(u8, t.name, "?")) return null;
+        const h = typeHead(t.name);
+        return if (h.len == 0) null else h;
+    }
+    var owned = (staticExprTypeRef(b, receiver) catch null) orelse return null;
+    defer owned.deinit(b.allocator);
+    if (owned.nullable or std.mem.endsWith(u8, owned.name, "?")) return null;
+    const h = typeHead(owned.name);
+    return if (h.len == 0) null else try b.allocator.dupe(u8, h);
+}
+
+/// The getter of the member-extension property `name` on `ext_recv` that
+/// `owner` declares, under the `__ext_get_<Head>_<name>` contract and filtered
+/// to the declaring class, since two classes may extend one head with one name.
+fn memberExtGetterOn(b: *const FuncBuilder, owner: ir.ClassId, ext_recv: []const u8, name: []const u8) ?ir.FuncId {
+    if (owner.int() >= b.module.classes.items.len) return null;
+    const c = &b.module.classes.items[owner.int()];
+    var buf: [256]u8 = undefined;
+    const gname = std.fmt.bufPrint(&buf, "__ext_get_{s}_{s}", .{ typeHead(ext_recv), name }) catch return null;
+    var found: ?ir.FuncId = null;
+    for (b.module.funcsBySimpleName(gname)) |fid| {
+        const of = b.module.registry.member_ext_owner_class.get(fid) orelse continue;
+        if (!(std.mem.eql(u8, of, c.fqn) or std.mem.eql(u8, of, c.name))) continue;
+        if (found) |prev| {
+            if (prev == fid) continue;
+            return null;
+        }
+        found = fid;
+    }
+    const fid = found orelse return null;
+    const f = b.module.funcById(fid) orelse return null;
+    if (!f.hasBody() and !b.module.decl_ast_body.contains(fid.int())) return null;
+    return fid;
+}
+
+/// A qualified read the enclosing class resolves to its own member-extension
+/// property: the receiver's static type satisfies the extension receiver and
+/// declares no member of that name, so Kotlin runs the extension getter with
+/// the enclosing instance as the dispatch receiver. Both are fixed here, so the
+/// read is a call to the getter's FuncId; a body that a splice moved into
+/// another class's method keeps its declaring instance the same way.
+fn memberExtPropGetterRead(b: *FuncBuilder, receiver: *const Expr, name: []const u8) Allocator.Error!?Reg {
+    const owner = b.ownerClass() orelse return null;
+    const ext_recv = inline_state.memberExtPropRecv(owner, name) orelse return null;
+    const static_ty = (try staticReceiverHead(b, receiver)) orelse return null;
+    if (!b.module.classIsOrExtends(static_ty, ext_recv)) return null;
+    if (staticTypeDeclaresProp(b, static_ty, name)) return null;
+    const file = (b.self_decl_span orelse return null).file;
+    const owner_cid = emit_mod.ownerClassIdOf(b, file) orelse return null;
+    const fid = memberExtGetterOn(b, owner_cid, ext_recv, name) orelse return null;
+    const dispatch = (try member_call_mod.lowerMemberExtensionDispatchReceiver(b, owner_cid)) orelse return null;
+    const recv = try lowerReceiver(b, receiver);
+    const run = try helpers.lowerArgRun(b, &.{});
+    const dst = b.allocReg();
+    const method_name = try b.module.internConst(b.allocator, .{ .String = name });
+    const declared_recv = try b.module.internConst(b.allocator, .{ .String = ext_recv });
+    const ctx_handed = try probe_mod.contextHandoverBegin(b, fid, &.{});
+    try b.push(.{ .CallMember = .{
+        .dst = dst,
+        .receiver = recv,
+        .name = method_name,
+        .args = run[0],
+        .n_args = run[1],
+        .extra = try b.memberExtra(.{ .declared_recv = declared_recv, .resolved = fid, .dispatch_receiver = dispatch }),
+    } });
+    try probe_mod.contextHandoverEnd(b, ctx_handed);
+    return dst;
+}
+
 /// The interned `$extread$<name>` marker when a qualified read resolves, by the
 /// static type of the receiver, to an in-scope member-extension property whose
 /// getter must win over a same-named stored field. Null when the ordinary field
@@ -510,13 +757,6 @@ fn staticExtPropReadField(b: *FuncBuilder, receiver: *const Expr, name: []const 
 /// The `<Q>` of `super<Q>`: the supertype the call dispatches on. A `super@Label`
 /// names the class whose supertypes are walked and is carried by the owner and
 /// receiver pair, never by the qualifier.
-pub fn superQualifier(b: *FuncBuilder, qualifier: ?ast.TypeRef) Allocator.Error!?ConstId {
-    if (qualifier) |t| {
-        return try b.module.internConst(b.allocator, .{ .String = t.name.name });
-    }
-    return null;
-}
-
 const SuperBase = struct { this_reg: Reg, owner: []const u8 };
 
 /// The instance and class a `super` expression starts from. Unlabeled `super`
@@ -529,6 +769,8 @@ pub fn superBase(b: *FuncBuilder, sup: anytype) Allocator.Error!?SuperBase {
     const label = sup.label orelse return .{ .this_reg = this_reg, .owner = owner };
     const target = scopeTypeRename(b, label.name, label.span.file.int()) orelse label.name;
     if (std.mem.eql(u8, target, owner)) return .{ .this_reg = this_reg, .owner = owner };
+    if (try implicit_walk.instanceOfClassReg(b, target)) |r| return .{ .this_reg = r, .owner = target };
+    expr_mod.orEmitAudit(b, "super_labeled", "QualifiedThis", target);
     const nm = try b.module.internConst(b.allocator, .{ .String = target });
     const dst = b.allocReg();
     try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm } });

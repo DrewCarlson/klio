@@ -1,7 +1,7 @@
 //! Kotlin type system: a `Type` enum over the primitive builtins, `Unit`,
 //! `Any`, `Nothing`, nullability through `T?`, function types, integer ranges,
 //! and user-class generics as `Type.Generic`. Anything needing further
-//! type-parameter machinery is modeled as `Type.Unresolved`.
+//! type-parameter machinery is modeled as `Type.unresolved`.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -97,14 +97,32 @@ pub const Type = union(enum) {
     Intersection: []Type,
     /// A type the resolver could not name. Compatible with everything, so an
     /// unrelated error does not cascade.
-    Unresolved,
+    /// A type the checker does not model: a user class, or a name it could not
+    /// resolve. The payload is the declared name when there was one, carried so
+    /// lowering learns which class an expression is — the tag alone loses that,
+    /// and two thirds of the checker's typed spans reach the IR with no
+    /// identity because of it.
+    ///
+    /// It is METADATA. Equality, subtyping and unification ignore it, exactly
+    /// as they did when the tag was bare, so adding it cannot change a
+    /// checking decision. The slice is BORROWED from the AST, which outlives
+    /// every `Type` built from it: `clone` shares it and `deinit` leaves it,
+    /// as the payload is never allocator-owned.
+    Unresolved: ?[]const u8,
+
+    /// `Unresolved` with no name, the form every construction used before the
+    /// payload existed.
+    pub const unresolved: Type = .{ .Unresolved = null };
 
     pub fn eql(self: Type, other: Type) bool {
         if (@as(std.meta.Tag(Type), self) != @as(std.meta.Tag(Type), other)) {
             return false;
         }
         return switch (self) {
-            .Unit, .Boolean, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .Char, .String, .Any, .Nothing, .Unresolved => true,
+            .Unit, .Boolean, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .Char, .String, .Any, .Nothing => true,
+            // The name is carried, not compared: two `Unresolved` were equal
+            // before it existed and stay equal now.
+            .Unresolved => true,
             .Nullable => |inner| inner.eql(other.Nullable.*),
             .Range => |inner| inner.eql(other.Range.*),
             .TypeParam => |name| std.mem.eql(u8, name, other.TypeParam),
@@ -140,7 +158,10 @@ pub const Type = union(enum) {
     /// Deep copy; the result owns its heap data, freed with `deinit`.
     pub fn clone(self: Type, allocator: Allocator) Allocator.Error!Type {
         return switch (self) {
-            .Unit, .Boolean, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .Char, .String, .Any, .Nothing, .Unresolved => self,
+            .Unit, .Boolean, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .Char, .String, .Any, .Nothing => self,
+            // BORROWED: the name is the AST's, which outlives every `Type`
+            // built from it, so the copy shares it and `deinit` leaves it.
+            .Unresolved => self,
             .Nullable => |inner| .{ .Nullable = try boxClone(allocator, inner) },
             .Range => |inner| .{ .Range = try boxClone(allocator, inner) },
             .TypeParam => |name| .{ .TypeParam = try allocator.dupe(u8, name) },
@@ -148,6 +169,7 @@ pub const Type = union(enum) {
                 .params = try cloneSlice(allocator, f.params),
                 .return_type = try boxClone(allocator, f.return_type),
                 .is_suspend = f.is_suspend,
+                .receiver_head = if (tcOff("CLONERH")) null else f.receiver_head,
             } },
             .Generic => |gen| blk: {
                 const args = try allocator.alloc(GenericArg, gen.args.len);
@@ -304,6 +326,9 @@ pub const Type = union(enum) {
         if (other == .Any) {
             return !self.isNullable();
         }
+        if (other == .Generic and self != .Generic) {
+            return !tcOff("PERMISSIVE");
+        }
         switch (self) {
             .Function => |lf| {
                 if (other != .Function) return false;
@@ -322,10 +347,15 @@ pub const Type = union(enum) {
                 return a.isSubtypeOf(other.Range.*);
             },
             .Generic => |ag| {
-                if (other != .Generic) return false;
+                // A class the checker does not model is permissive on both
+                // sides, and so is a generic against an unrelated head: the
+                // hierarchy that would relate `MutableList<T>` to
+                // `Collection<T>` lives in the checker's class tables, not
+                // here. Only the same head compares its arguments.
+                if (other != .Generic) return !tcOff("PERMISSIVE");
                 const bg = other.Generic;
                 if (!std.mem.eql(u8, ag.name, bg.name) or ag.args.len != bg.args.len) {
-                    return false;
+                    return !tcOff("PERMISSIVE");
                 }
                 for (ag.args, bg.args) |l, r| {
                     if (l.is_star or r.is_star) continue;
@@ -489,10 +519,11 @@ pub fn convertTypeRef(allocator: Allocator, t: *const TypeRef) Allocator.Error!T
     return .{ .err = .{ .UnknownType = try allocator.dupe(u8, t.name.name) } };
 }
 
-/// Like `convertTypeRef`, but an unknown name yields `Type.Unresolved`, as does
-/// a user-defined generic (`Box<T>`), which keeps subtyping permissive while
-/// variance and bounds are enforced declaration-side. `Type.Generic` is reserved
-/// for the cases the checker builds explicitly.
+/// Like `convertTypeRef`, but an unknown name yields `Type.unresolved` carrying
+/// the name, and a parameterised reference (`Box<T>`, `List<String>`) keeps its
+/// arguments as `Type.Generic`. Subtyping between generics of unrelated heads
+/// stays permissive; the arguments are what instantiate a member read off
+/// the value.
 pub fn convertTypeRefLossy(allocator: Allocator, t: *const TypeRef) Allocator.Error!Type {
     if (std.mem.eql(u8, t.name.name, "*")) {
         return .Any;
@@ -506,10 +537,26 @@ pub fn convertTypeRefLossy(allocator: Allocator, t: *const TypeRef) Allocator.Er
             .params = params,
             .return_type = ret,
             .is_suspend = ft.is_suspend,
+            .receiver_head = if (tcOff("LOSSYRH")) null else (if (ft.receiver) |*r| r.name.name else null),
         } };
         return if (t.nullable) try func.asNullable(allocator) else func;
     }
-    const base: Type = builtinByName(t.name.name) orelse .Unresolved;
+    if (t.type_args.len != 0 and !tcOff("LOSSY")) {
+        const args = try allocator.alloc(GenericArg, t.type_args.len);
+        for (t.type_args, args) |*a, *dst| {
+            dst.* = .{
+                .variance = Variance.fromAst(a.variance),
+                .is_star = a.is_star,
+                .ty = if (a.is_star) .Any else try convertTypeRefLossy(allocator, &a.ty),
+            };
+        }
+        const g: Type = .{ .Generic = .{ .name = try allocator.dupe(u8, t.name.name), .args = args } };
+        return if (t.nullable) try g.asNullable(allocator) else g;
+    }
+    // The declared name rides along: this is the one place a NAMED type
+    // becomes `Unresolved`, and losing it here is what leaves an expression
+    // typed from a declaration with no class identity downstream.
+    const base: Type = builtinByName(t.name.name) orelse .{ .Unresolved = t.name.name };
     return if (t.nullable) try base.asNullable(allocator) else base;
 }
 
@@ -604,7 +651,7 @@ fn arena() std.heap.ArenaAllocator {
 // a receiver and an address for `*const Type` parameters.
 const t_int: Type = .Int;
 const t_string: Type = .String;
-const t_unresolved: Type = .Unresolved;
+const t_unresolved: Type = Type.unresolved;
 const t_nothing: Type = .Nothing;
 
 fn ident(name: []const u8) ast.Ident {
@@ -754,7 +801,7 @@ test "function subtyping is variance aware" {
 
 test "unresolved is compatible everywhere" {
     try testing.expect(t_unresolved.isSubtypeOf(.Int));
-    try testing.expect(t_int.isSubtypeOf(.Unresolved));
+    try testing.expect(t_int.isSubtypeOf(Type.unresolved));
 }
 
 test "unify identical returns input" {
@@ -789,7 +836,7 @@ test "unify nested function types" {
     const a = ar.allocator();
     const lhs = Type{ .Function = .{
         .params = try a.dupe(Type, &.{.Int}),
-        .return_type = box(a, .Unresolved),
+        .return_type = box(a, Type.unresolved),
         .is_suspend = false,
     } };
     const rhs = Type{ .Function = .{
@@ -835,7 +882,7 @@ test "convert type ref lossy falls back to unresolved" {
     const a = ar.allocator();
     const t1 = typeRef("Widget", false);
     const r1 = try convertTypeRefLossy(a, &t1);
-    try testing.expect(r1.eql(.Unresolved));
+    try testing.expect(r1.eql(Type.unresolved));
     const t2 = typeRef("Int", true);
     const r2 = try convertTypeRefLossy(a, &t2);
     try testing.expect(r2.eql(nullableOf(a, .Int)));
@@ -845,7 +892,7 @@ test "intersect drops any and unresolved" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    const parts = try a.dupe(Type, &.{ .Int, .Any, .Unresolved });
+    const parts = try a.dupe(Type, &.{ .Int, .Any, Type.unresolved });
     const r = try Type.intersect(a, parts);
     try testing.expect(r.eql(.Int));
 }
@@ -907,31 +954,85 @@ test {
 }
 
 
-/// One extension declaration recovered from a prebuilt image, in the flat form
-/// an image can supply: type HEADS, not full types. The checker rebuilds a
-/// `FnSig` from these, enough for overload ranking.
-pub const ExternExt = struct {
+/// A declared type as a prebuilt image spells it: the lowering's structural
+/// `TypeRef`, a head name with nullability and arguments. Markers ride in the
+/// argument list the way the lowering writes them: `#suspend` and `#non-null`
+/// flags, a `#qual:` spelling, `in#`/`out#` variance prefixes on an argument's
+/// head, `*` for a star projection; a `Function<N>` head carries its receiver,
+/// parameters and return type as arguments.
+pub const ExternType = struct {
     name: []const u8,
-    /// An image declaration has no source span, so its FuncId is the only
-    /// identity a recorded pick carries back to lowering.
+    nullable: bool = false,
+    args: []const ExternType = &.{},
+};
+
+/// One function declaration recovered from a prebuilt image: a member, an
+/// extension, a constructor or a top-level function, with its whole
+/// signature. An image declaration has no source span, so its FuncId is the
+/// identity a recorded pick carries back to lowering.
+pub const ExternFn = struct {
+    name: []const u8,
     fid: u32,
-    param_heads: [][]const u8,
-    param_nullable: []bool,
-    return_head: []const u8,
-    return_nullable: bool,
-    is_infix: bool,
+    type_params: []const []const u8 = &.{},
+    receiver: ?ExternType = null,
+    params: []const ExternType,
+    param_names: []const []const u8,
+    param_defaults: []const bool,
+    has_vararg: bool = false,
+    /// Null for an expression body with no written return type.
+    return_ty: ?ExternType = null,
+    is_suspend: bool = false,
+    has_body: bool = true,
+    visibility: ast.Visibility = .Public,
+};
+
+pub const ExternProp = struct {
+    name: []const u8,
+    /// Null when the declaration wrote none.
+    ty: ?ExternType = null,
+    is_abstract: bool = false,
+};
+
+pub const ExternClass = struct {
+    name: []const u8,
+    type_params: []const []const u8 = &.{},
+    /// With type arguments, so a subtype's arguments reach a member declared
+    /// on a supertype.
+    supertypes: []const ExternType = &.{},
+    methods: []const ExternFn = &.{},
+    props: []const ExternProp = &.{},
+    /// The primary constructor.
+    ctor: ?ExternFn = null,
+    /// Secondary constructors, in declaration order.
+    secondary_ctors: []const ExternFn = &.{},
+    has_secondary_ctors: bool = false,
+    is_interface: bool = false,
+    is_abstract: bool = false,
+    is_open: bool = false,
+    is_enum: bool = false,
 };
 
 /// Declarations the checker cannot see in source because they arrived as a
 /// prebuilt image, which is never parsed. Published by the image loader before
 /// the eager pass and consumed once by `typecheckModule`.
 pub const ExternDecls = struct {
-    classes: std.StringHashMap(void),
+    /// Keyed by simple name; a name two classes share is published as neither.
+    classes: std.StringHashMap(ExternClass),
     fn_return_class: std.StringHashMap([]const u8),
-    extensions: std.StringHashMap(std.ArrayList(ExternExt)) = undefined,
-    /// The candidate walk climbs this, since `List.min` is on `Iterable`.
-    supertypes: std.StringHashMap([][]const u8) = undefined,
+    /// Extensions keyed by the receiver's class head.
+    extensions: std.StringHashMap(std.ArrayList(ExternFn)) = undefined,
+    /// Top-level functions with no receiver, keyed by name.
+    top_level: std.StringHashMap(std.ArrayList(ExternFn)) = undefined,
     has_extensions: bool = false,
+    /// The first segment of every package the image declares in, so a
+    /// qualified path is read as package-qualified only when its head is one.
+    package_roots: ?std.StringHashMap(void) = null,
 };
 
 pub var pending_extern_decls: ?ExternDecls = null;
+
+/// `KLIO_TC_<NAME>=0` switches one checker capability off, for bisection.
+pub fn tcOff(comptime name: []const u8) bool {
+    const v = std.c.getenv("KLIO_TC_" ++ name) orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
+}

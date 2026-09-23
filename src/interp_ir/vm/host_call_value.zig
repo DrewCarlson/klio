@@ -255,10 +255,6 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
             break;
         }
     }
-    // The receiver is a context-argument source for a contextual callee in the
-    // block; the mark predates the push so activation close truncates it.
-    const ctx_mark = self.ctxStackLen();
-    if (self.ctxIsActive()) self.ctxPush(selected_this) catch {};
     // The receiver binds into the `this` slot; the displaced prior stays outer.
     const prior_this: ?Value = blk: {
         const ti = this_idx orelse break :blk null;
@@ -292,10 +288,8 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
     var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, override, args)) orelse {
         // Declined at the terminal (native form): undo the pushes.
         while (pushes > 0) : (pushes -= 1) host_call_member.popAccessEnclosing(self);
-        self.ctxStackTruncate(ctx_mark);
         return null;
     };
-    req.ctx_mark_override = ctx_mark;
     req.pop_enclosing_n = pushes;
     if (callValueTraceOn()) {
         std.debug.print("[cvt-flat] id={d} pushes={d} this_idx={?d} ncaps={d} sel_tag={s}\n", .{ id, pushes, this_idx, info.capture_names.len, @tagName(std.meta.activeTag(selected_this)) });
@@ -730,7 +724,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     var k: usize = encl.len;
                     while (k > 0) {
                         k -= 1;
-                        if (encl[k].kind == .receiver or encl[k].kind == .subject) break :blk encl[k].v;
+                        if (encl[k].kind == .receiver or encl[k].kind == .subject or encl[k].kind == .dispatch) break :blk encl[k].v;
                     }
                     break :blk .Null;
                 };
@@ -1650,10 +1644,6 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
         }
     }
     const this_value = &selected_this;
-    // A receiver-lambda's receiver is a context-argument source in that block.
-    const ctx_mark = self.ctxStackLen();
-    defer self.ctxStackTruncate(ctx_mark);
-    if (self.ctxIsActive()) self.ctxPush(this_value.*) catch {};
     // Explicit-receiver receiver-lambda call (`block(receiver, p)` for an
     // `R.(P) -> T`): bind `this_value` into the `this` capture and dispatch on the
     // main evaluator path, which splits the receiver and snapshots frames so a
@@ -1737,6 +1727,16 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                         const r = try callValue(self, allocator, callee, with_recv);
                         if (pushed) host_call_member.popAccessEnclosing(self);
                         return r;
+                    }
+                    // A lambda whose shape is settled without a receiver keeps the
+                    // `this` it captured: the value it is invoked through is the
+                    // caller's receiver, not the block's. A positional receiver
+                    // (`(R, P) -> T`) is still bound below.
+                    if (std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver and
+                        info.receiver_shape_known and !info.has_receiver and
+                        args.len == info.n_params)
+                    {
+                        return callValue(self, allocator, callee, args);
                     }
                     // Unknown shape with one declared param more than the supplied
                     // args and no leading `this`: the receiver rides positionally

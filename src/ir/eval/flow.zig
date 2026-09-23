@@ -51,9 +51,6 @@ pub const FlatCallReq = struct {
     composer_pushed: bool = false,
     /// Access-enclosing entries the dispatch pushed; teardown pops them LIFO once the caller's chain is active again.
     pop_enclosing_n: u8 = 0,
-    /// The context-parameter mark taken BEFORE the prepare pushed a receiver as a context source, so the
-    /// activation's close truncates that push away. Null: the activation reads the stack length at open.
-    ctx_mark_override: ?usize = null,
     /// A value the activation must keep alive for its whole life (the receiver-bound closure whose capture
     /// vector the frame's captures borrow). Released at teardown or parked-drop, GC-marked while live-parked.
     keepalive: ?Value = null,
@@ -92,9 +89,6 @@ pub const ParkPoint = struct {
 pub const Activation = struct {
     frame: Frame,
     try_stack: std.ArrayList(TryFrame),
-    ctx_mark: usize,
-    /// The context-parameter mark is live and must be truncated when this activation unwinds or parks.
-    ctx_armed: bool,
     composer_pushed: bool,
     pop_enclosing_n: u8,
     keepalive: ?Value,

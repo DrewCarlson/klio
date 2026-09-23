@@ -575,8 +575,8 @@ fn recordBareCallLambdaShapes(c: *CallCtx) Allocator.Error!void {
 }
 
 
-/// `context(v..., block)` and `contextOf<T>()` lower to context-stack ops, so
-/// implicit resolution is driven by the runtime stack. Only when unshadowed.
+/// `context(v..., block)` hands the block its values as leading parameters and
+/// `contextOf<T>()` is the register the type resolves to here. Only when unshadowed.
 fn tryContextIntrinsic(c: *CallCtx) Allocator.Error!?Reg {
     const b = c.b;
     const callee = c.callee;
@@ -587,25 +587,50 @@ fn tryContextIntrinsic(c: *CallCtx) Allocator.Error!?Reg {
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
         const cname = callee.Path.segments[0].name;
         if (b.resolve(cname) == null and !b.knowsOuter(cname)) {
+            // `contextOf<T>()` is the context value of that type in scope here.
             if (std.mem.eql(u8, cname, "contextOf") and args.len == 0 and ast_type_args.len == 1) {
-                b.module.has_context_decls = true;
-                const dst = b.allocReg();
-                const ty_const = try b.module.internConst(b.allocator, .{ .String = ast_type_args[0].name.name });
-                try b.push(.{ .CtxLoad = .{ .dst = dst, .ty = ty_const, .erased = false } });
-                return dst;
+                const ty_name = ast_type_args[0].name.name;
+                if (try probe_mod.contextArgOfType(b, ty_name)) |r| return r;
+                return try emitNoContextValue(b, ty_name);
             }
+            // The stdlib `context(a, b) { block }`: the block's context slots are
+            // the values, handed over ahead of its invocation.
             if (std.mem.eql(u8, cname, "context") and args.len >= 2 and lastArgIsLambda(args)) {
-                b.module.has_context_decls = true;
-                const run = try lowerArgRun(b, args);
                 const n_ctx: u32 = @intCast(args.len - 1);
-                const block_reg = Reg.from(run[0].int() + n_ctx);
+                const first = b.allocReg();
+                var k: u32 = 1;
+                while (k < n_ctx) : (k += 1) _ = b.allocReg();
+                const heads = try b.allocator.alloc([]const u8, n_ctx);
+                for (args[0..n_ctx], 0..) |*a, i| {
+                    const v = try lowerExpr(b, a);
+                    try b.push(.{ .Move = .{ .dst = Reg.from(first.int() + @as(u32, @intCast(i))), .src = v } });
+                    heads[i] = blk: {
+                        if (argDeclTypeRefLazy(b, a)) |t| break :blk typeHead(std.mem.trimEnd(u8, t.name, "?"));
+                        if (staticExprTypeRef(b, a) catch null) |t| {
+                            var owned = t;
+                            defer owned.deinit(b.allocator);
+                            break :blk try b.allocator.dupe(u8, typeHead(std.mem.trimEnd(u8, owned.name, "?")));
+                        }
+                        break :blk "";
+                    };
+                }
+                b.module.pending_lambda_ctx_types = heads;
+                // The block owns no receiver, so its tower is the receivers
+                // in scope here, which a call inside reaches as captures.
+                b.recordLambdaArgNoRecv(args[args.len - 1].span());
+                const block_reg = try lowerExpr(b, &args[args.len - 1]);
+                // The block takes the values as its leading parameters; they
+                // also ride its chain, for a callee inside it reached by name.
+                try b.push(.{ .ContextPush = .{ .args = first, .n = n_ctx } });
                 const dst = b.allocReg();
-                try b.push(.{ .CtxScope = .{
+                try b.push(.{ .CallValue = .{
                     .dst = dst,
-                    .ctx_args = run[0],
-                    .n_ctx = n_ctx,
-                    .block = block_reg,
+                    .callee = block_reg,
+                    .args = first,
+                    .n_args = n_ctx,
+                    .arg_names = &.{},
                 } });
+                try b.push(.{ .ContextPop = .{ .n = n_ctx } });
                 return dst;
             }
         }
@@ -614,9 +639,23 @@ fn tryContextIntrinsic(c: *CallCtx) Allocator.Error!?Reg {
 }
 
 
-/// Fully-positional call of a contextual function-type value: when the arg
-/// count matches the flattened `n_ctx + n_regular`, split the leading context
-/// args onto the context stack; the implicit form falls to the value path.
+/// `contextOf<T>()` with nothing of that type in scope here: kotlinc rejects
+/// the program, so the value is the diagnostic, raised where it was asked for.
+fn emitNoContextValue(b: *FuncBuilder, ty_name: []const u8) Allocator.Error!Reg {
+    if (runtime.envOnce("KLIO_DISPATCH_TRACE") != null and build.scratch_depth == 0) std.debug.print("[context-none] ty={s} fn={s}\n", .{ ty_name, build.currentRealFn() orelse "-" });
+    const msg = try std.fmt.allocPrint(b.allocator, "no context value of type {s} in scope", .{ty_name});
+    defer b.allocator.free(msg);
+    const c = try b.module.internConst(b.allocator, .{ .String = msg });
+    const r = b.allocReg();
+    try b.push(.{ .Const = .{ .dst = r, .value = c } });
+    b.terminate(.{ .Throw = r });
+    b.switchTo(try b.allocBlock());
+    return b.allocReg();
+}
+
+/// Call of a contextual function-type value: the positional form passes every
+/// argument as written, the implicit form resolves each context argument here
+/// and passes it ahead of the value arguments.
 fn tryContextualFnValueCall(c: *CallCtx) Allocator.Error!?Reg {
     const b = c.b;
     const callee = c.callee;
@@ -633,35 +672,31 @@ fn tryContextualFnValueCall(c: *CallCtx) Allocator.Error!?Reg {
             const callee_opt: ?Reg = if (!positional and !implicit) null else b.resolve(cname) orelse
                 (if (b.knowsOuter(cname)) try b.loadCaptureHoisted(cname) else null);
             if (callee_opt) |callee_reg| {
+                // A contextual function value takes its contexts as leading
+                // arguments. Positional form: they are written.
                 if (positional) {
-                    b.module.has_context_decls = true;
                     const run = try lowerArgRun(b, args);
                     const dst = b.allocReg();
-                    try b.push(.{ .CtxCall = .{
+                    try b.push(.{ .CallValue = .{
                         .dst = dst,
                         .callee = callee_reg,
                         .args = run[0],
                         .n_args = run[1],
-                        .n_ctx = @intCast(shape.n_ctx),
+                        .arg_names = &.{},
                     } });
                     return dst;
                 }
-                // Implicit form: each context argument is the innermost implicit
-                // receiver of that type in scope, else the runtime context stack.
+                // Implicit form: each is the context value or implicit receiver
+                // of that type in scope here, which kotlinc requires to exist.
                 if (implicit) {
-                    b.module.has_context_decls = true;
-                    const total = shape.n_ctx + shape.n_regular;
+                    const total = shape.n_ctx + args.len;
                     const first = b.allocReg();
                     var k: usize = 1;
                     while (k < total) : (k += 1) _ = b.allocReg();
                     for (shape.ctx_types, 0..) |ty, ci| {
                         const slot = Reg.from(first.int() + @as(u32, @intCast(ci)));
-                        if (try implicitReceiverOfType(b, ty)) |r| {
-                            try b.push(.{ .Move = .{ .dst = slot, .src = r } });
-                        } else {
-                            const ty_const = try b.module.internConst(b.allocator, .{ .String = ty });
-                            try b.push(.{ .CtxLoad = .{ .dst = slot, .ty = ty_const, .erased = false } });
-                        }
+                        const r = (try probe_mod.contextArgOfType(b, ty)) orelse return try emitNoContextValue(b, ty);
+                        try b.push(.{ .Move = .{ .dst = slot, .src = r } });
                     }
                     for (args, 0..) |*arg, ai| {
                         const slot = Reg.from(first.int() + @as(u32, @intCast(shape.n_ctx + ai)));
@@ -669,12 +704,12 @@ fn tryContextualFnValueCall(c: *CallCtx) Allocator.Error!?Reg {
                         try b.push(.{ .Move = .{ .dst = slot, .src = v } });
                     }
                     const dst = b.allocReg();
-                    try b.push(.{ .CtxCall = .{
+                    try b.push(.{ .CallValue = .{
                         .dst = dst,
                         .callee = callee_reg,
                         .args = first,
                         .n_args = @intCast(total),
-                        .n_ctx = @intCast(shape.n_ctx),
+                        .arg_names = &.{},
                     } });
                     return dst;
                 }
@@ -1636,6 +1671,9 @@ fn lowerSafeMemberCall(c: *CallCtx) Allocator.Error!Reg {
         b.switchTo(join);
         return dst;
     }
+    // The namesakes that could take the call agree on the block's shape or
+    // leave it open, as the deferred member call records.
+    try lambda_mod.recordTrailingLambdaConsensus(b, name.name, args, ast_arg_names, ast_type_args, true);
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const nm = try b.module.internConst(b.allocator, .{ .String = name.name });

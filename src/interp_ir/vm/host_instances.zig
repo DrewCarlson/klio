@@ -59,6 +59,7 @@ const ctorGuardPush = common.ctorGuardPush;
 const ctorGuardPop = common.ctorGuardPop;
 const CTOR_HEADS_MAX = common.CTOR_HEADS_MAX;
 pub const setCtorArgStaticHeads = common.setCtorArgStaticHeads;
+pub const setCtorSitePick = common.setCtorSitePick;
 pub const clearCtorArgStaticHeads = common.clearCtorArgStaticHeads;
 const CtorBounds = common.CtorBounds;
 const installCtorBounds = common.installCtorBounds;
@@ -78,7 +79,7 @@ pub const anonLowerEnter = common.anonLowerEnter;
 pub const anonLowerExit = common.anonLowerExit;
 pub const anonSiteModule = common.anonSiteModule;
 
-const ctor_select = @import("host_instances/ctor_select.zig");
+pub const ctor_select = @import("host_instances/ctor_select.zig");
 const classDefByName = ctor_select.classDefByName;
 const classDefByQualifiedSuffix = ctor_select.classDefByQualifiedSuffix;
 const sideTableKey = ctor_select.sideTableKey;

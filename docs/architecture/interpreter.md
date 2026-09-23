@@ -104,6 +104,22 @@ instead of the lowered Kotlin body. This is why shim libraries work:
 the Kotlin source documents the surface, and the native binding wins
 at dispatch. See [Native Bindings](../packs/native-bindings.md).
 
+A context parameter is a parameter. A call to a `context(T) fun`
+resolves each context argument where the call is lowered, from the
+innermost `context(...)` scope, implicit receiver or subject of that
+type, and hands the values over ahead of the call (`ContextPush`);
+the callee loads them from its frame by index (`LoadContextParam`).
+A lambda bound to a `context(T) (A) -> R` parameter takes its
+contexts as leading parameters, so `context(v) { }` and an implicit
+invocation of such a value are ordinary value calls. A frame no
+caller served derives the value once from its enclosing chain, and
+`KLIO_DISPATCH_TRACE` reports every such frame.
+
+An inner-class instance carries the instance it was constructed in as
+its outer link. A body that reads an enclosing class's member reaches
+that instance by structure, one `LoadOuterThis` per hop from its own
+`this`, and binds the member on it as on any receiver.
+
 ## Coroutines
 
 `suspend` is implemented natively (Kotlin Language Specification §18):

@@ -292,7 +292,7 @@ test "scalar types render as their tag name" {
     const i = try typeToDebug(a, .Int);
     defer a.free(i);
     try std.testing.expectEqualStrings("Int", i);
-    const u = try typeToDebug(a, .Unresolved);
+    const u = try typeToDebug(a, Type.unresolved);
     defer a.free(u);
     try std.testing.expectEqualStrings("Unresolved", u);
 }

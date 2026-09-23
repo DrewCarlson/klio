@@ -39,6 +39,16 @@ Run any program with:
 | `interface_default_dispatch.kt` | An interface member is implicitly open — a default body is always overridable by an implementer — so a call through the interface type dispatches virtually and is never resolved to the default at lowering time. |
 | `inheritance_delegation.kt`, `delegated_inheritance.kt` | Interface and inherited-delegate resolution (`by`). |
 | `interfaces.kt`            | Abstract members, default methods, multiple interfaces, marker interfaces. |
+| `indexed_operator_binding.kt` | Indexing and compound-assignment operators bound at lowering: virtual `get`, an extension `get`, `plusAssign`, and the builtin containers. |
+| `inferred_property_head_scope.kt` | A property type inferred from its initializer belongs to the class that declares it, not to a namesake nested elsewhere. |
+| `body_property_slot_read.kt` | A class's own body property is read from its layout slot; an inherited one is not, since a subclass may replace it with an accessor and contribute no cell. |
+| `property_slot_per_class.kt` | A property declared on an interface or an open class is answered per implementation — a cell, an accessor, or a delegate — and the receiver's class picks, including where a constructor property overrides a supertype's accessor. |
+| `open_class_field_slot.kt` | An open class's property is read by slot index only where no subclass answers the name differently: an accessor override, a re-stored override, a subclass that adds nothing, and an abstract base no subclass touches. |
+| `type_test_by_class.kt` | `is T` is an identity question once the site names the class: an interface reached through a chain, a sealed hierarchy, a nullable test that admits null, an erased generic argument, and a value carrying no user class. |
+| `enum_entry_by_index.kt` | `EnumClass.Entry` carries the entry's index from lowering; a shadowing local, a value receiver, or a bare entry inside the enum's own members keeps the by-name walk. |
+| `field_write_slot.kt` | A write to a plain stored property goes to its layout slot; a custom setter keeps the write on the ladder, and a getter-with-backing-field reads through the getter while its write still stores. |
+| `integer_literal_never_floats.kt` | An integer literal cannot pick a floating overload, and an unannotated `const val` over a builtin scalar's companion constant carries that scalar's type. |
+| `param_formed_lambda_in_receiver_slot.kt` | A `(T) -> Unit` literal standing where `T.() -> Unit` is declared takes the subject as its parameter, one forwarding hop from where it was written. |
 | `abstract_inner.kt`        | `abstract` classes, secondary constructors, inner classes.     |
 | `inner_outer_property.kt`  | An inner class reads public and private computed outer properties from methods and superclass constructor arguments, incl. an `AbstractMutableList` subclass. |
 | `result_payload_equality.kt` | `Result` and user value-class equality dispatch the payload's Kotlin `equals` implementation. |
@@ -92,6 +102,7 @@ Run any program with:
 | `reified.kt`                  | Reified type parameters in `inline` functions.              |
 | `generic_boxed_equality.kt`   | `==` on an operand typed by a type parameter compares by `equals`, so `NaN` equals itself and `0.0` differs from `-0.0`; a statically typed `Double` keeps the IEEE comparison. |
 | `bounds.kt`, `variance.kt`    | Generic bounds and declaration-site variance.               |
+| `generic_comparable_dispatch.kt` | A comparison on a type-parameter operand runs the upper bound's `compareTo`, over host-backed and interpreted receivers alike, and a same-named extension does not take the call from the member. |
 | `extension_functions.kt`, `extension_property.kt`, `extension_nullable_receiver.kt`, `companion_extension_property.kt` | Extensions, incl. nullable receivers and companion-object extension properties accessed via the class name. |
 | `infix_calls.kt`              | `infix` functions.                                          |
 | `scoping_fns_top_level.kt`    | `let` / `also` / `apply` / `run` / `with` / `takeIf`.       |
@@ -610,3 +621,5 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `inline_lambda_break_continue.kt` | A `break`/`continue` inside a lambda passed to an inline function targets the loop enclosing the call site, not a loop inside the inline function: the lambda is lexically the caller's, so a jump in it skips the callee's own loops and lands on the caller's loop. |
 | `fake_override_inherited_default.kt` | A class inherits a method's body from its superclass (no default) and the method's default value from an interface (a bodyless declaration); calling with the argument omitted fills the gap from the interface's default — including a default that reads another member (`tag(x = label)`) — then runs the inherited body. |
 | `inherited_default_declaration_order.kt` | When a class inherits a method's default value from more than one supertype, the first supertype in declaration order that supplies it wins — including a default reached through that supertype's own parent chain — matching kotlinc's resolution of a conflicting inherited default. |
+| `member_extension_property_splice.kt` | A read of a member-extension property (`private inline val Int.count` inside a class) binds the declaring class's getter with the receiver's static type, including when the `inline` member carrying the read is spliced into another class's method; `indices.reversed()` inside a `CharSequence` extension calls the receiver's `indices`, not a package-qualified `reversed()`. |
+| `top_level_property_slots.kt` | A plain stored top-level `val`/`var` is read and written through its root-scope slot (bound at lowering), while `const val` inlines, custom getters and setters run per access, a `Delegates.observable` delegate answers through `getValue`/`setValue`, and `lateinit` throws until assigned. |

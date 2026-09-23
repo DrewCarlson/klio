@@ -1441,6 +1441,13 @@ fn samParamMask(self: *VmHost, func: *const ir.Func) u32 {
     const cache = &sam_mask_tls.get().cache;
     const slot = &cache[(key >> 4) % cache.len];
     if (slot.valid and slot.func_p == key and slot.gen == gen) return slot.mask;
+    // This memo is the SAM subsystem's own question about a parameter's
+    // declared TYPE NAME, filled once per function. It is reached from
+    // wherever the function is called — including a constructor body — and
+    // the construction audit must not read it as the construction consulting
+    // a name, because the site it belongs to is the call, not the `new`.
+    const prev_sam = host_instances.ctor_select.samMaskEnter();
+    defer host_instances.ctor_select.samMaskLeave(prev_sam);
     var mask: u32 = 0;
     for (func.params, 0..) |*p, i| {
         if (i >= 32) break;
@@ -2376,6 +2383,9 @@ pub fn typedCallBoundary(self: *VmHost, module: *const Module, func: *const ir.F
 }
 
 fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
+    // While the XOrY audit is measuring one arm, the first declaration the arm
+    // enters is the one it resolved to.
+    if (ir.exec_call.armFidCaptureOn()) ir.exec_call.noteArmFid(func.int());
     if (hcfMissTraceEnv()) |w| {
         if (funcAt(module, func)) |tf| if (std.mem.eql(u8, w, tf.name)) {
             std.debug.print("[cfti] {s}#{d} nargs={d} nnames={d} names:", .{ tf.name, func.int(), args.len, arg_names.len });

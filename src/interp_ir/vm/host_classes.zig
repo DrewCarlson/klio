@@ -746,6 +746,13 @@ fn lowerAndRegisterMethods(
 ) Allocator.Error!void {
     var site_mod: ?ObjRef(Module) = null;
     defer if (site_mod) |m| m.deinit();
+    // The class is not in the class table, so its declaration's supertype
+    // heads are what a `super` in a member resolves against.
+    const super_heads = try allocator.alloc([]const u8, class.supertypes.len);
+    defer allocator.free(super_heads);
+    for (class.supertypes, super_heads) |*st, *h| h.* = st.name.name;
+    const prev_heads = ir.build.setOwnerSuperHeads(super_heads);
+    defer _ = ir.build.setOwnerSuperHeads(prev_heads);
     // The class's declared property types carry into the member lowerings, so a
     // body's `data.iterator()` types its receiver instead of walking by name.
     var prop_heads: std.ArrayList(ir.build.AnonPropHead) = .empty;

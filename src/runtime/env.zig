@@ -18,6 +18,11 @@ pub const VarMap = namehash.NameHashMap(Value);
 pub const Env = struct {
     parent: ?ObjRef(Env) = null,
     vars: VarMap,
+    /// The root scope's numbered top-level properties: `slot_of` maps a name to
+    /// its slot and `slots` mirrors that name's binding, so a slotted read
+    /// addresses the value without hashing the name. Only the root scope has them.
+    slot_of: ?*const namehash.NameHashMap(u32) = null,
+    slots: []?Value = &.{},
 
     pub fn init(allocator: std.mem.Allocator) Env {
         return .{ .parent = null, .vars = VarMap.init(allocator) };
@@ -28,6 +33,8 @@ pub const Env = struct {
     }
 
     pub fn deinit(self: *Env) void {
+        if (self.slots.len != 0) self.vars.allocator.free(self.slots);
+        self.slots = &.{};
         self.vars.deinit();
         if (self.parent) |p| p.deinit();
     }
@@ -37,21 +44,46 @@ pub const Env = struct {
         if (self.parent) |p| m.shade(&p.cell.hdr);
         var it = self.vars.valueIterator();
         while (it.next()) |v| v.gcMark(m);
+        for (self.slots) |s| {
+            if (s) |v| v.gcMark(m);
+        }
     }
 
     /// Shallow: the bound values and the parent are swept on their own.
     pub fn gcFinalize(self: *Env, allocator: std.mem.Allocator) void {
         _ = allocator;
+        if (self.slots.len != 0) self.vars.allocator.free(self.slots);
+        self.slots = &.{};
         self.vars.deinit();
     }
 
     pub fn define(self: *Env, name: []const u8, value: Value) !void {
         try self.vars.put(name, value);
+        if (self.slotIndex(name)) |i| self.slots[i] = value;
+    }
+
+    /// Bind a slotted name: the binding and its slot take the value together.
+    pub fn defineSlot(self: *Env, slot: u32, name: []const u8, value: Value) !void {
+        try self.vars.put(name, value);
+        if (slot < self.slots.len) self.slots[slot] = value;
+    }
+
+    /// The slotted binding, or null before it is bound.
+    pub fn slotGet(self: *const Env, slot: u32) ?Value {
+        if (slot >= self.slots.len) return null;
+        return self.slots[slot];
+    }
+
+    fn slotIndex(self: *const Env, name: []const u8) ?usize {
+        const m = self.slot_of orelse return null;
+        const s = m.get(name) orelse return null;
+        return if (s < self.slots.len) s else null;
     }
 
     /// Does not touch parent scopes.
     pub fn removeLocal(self: *Env, name: []const u8) void {
         _ = self.vars.remove(name);
+        if (self.slotIndex(name)) |i| self.slots[i] = null;
     }
 
     /// The chain hashes `name` once and reuses that word at every level: a
@@ -148,8 +180,9 @@ pub const Env = struct {
     }
 
     fn assignHashed(self: *Env, name: []const u8, value: Value, at: namehash.PrehashedName) ?RuntimeError {
-        if (self.vars.getPtrAdapted(name, at)) |slot| {
-            slot.* = value;
+        if (self.vars.getPtrAdapted(name, at)) |binding| {
+            binding.* = value;
+            if (self.slotIndex(name)) |i| self.slots[i] = value;
             return null;
         }
         if (self.parent) |p| {

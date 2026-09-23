@@ -27,6 +27,8 @@ pub const lower = @import("lower.zig");
 pub const hot_layout = @import("hot_layout.zig");
 pub const jit_loop = @import("jit_loop.zig");
 pub const disasm = @import("disasm.zig");
+pub const site_census = @import("site_census.zig");
+pub const exec_call = @import("exec_call.zig");
 
 const core_ids = @import("core/ids.zig");
 const core_inst = @import("core/inst.zig");
@@ -40,6 +42,9 @@ const m_static = @import("core/module_static.zig");
 const m_resolve_call = @import("core/module_resolve_call.zig");
 pub const remap = @import("core/remap.zig");
 const m_methods = @import("core/module_methods.zig");
+const m_fields = @import("core/module_fields.zig");
+const m_props = @import("core/module_props.zig");
+const m_regclass = @import("core/module_regclass.zig");
 const m_bare = @import("core/module_bare.zig");
 const m_calls = @import("core/module_calls.zig");
 const m_refs = @import("core/module_refs.zig");
@@ -65,6 +70,13 @@ pub const snapshot_fast = @import("snapshot_fast.zig");
 
 pub const Inst = core_inst.Inst;
 pub const CallMemberInst = core_inst.CallMemberInst;
+pub const BuiltinMember = core_inst.BuiltinMember;
+pub const COMPANION_OR_SELF = core_inst.COMPANION_OR_SELF;
+pub const SUPER_WRITE_QUALIFIED = core_inst.SUPER_WRITE_QUALIFIED;
+pub const SuperAnswer = m_fields.SuperAnswer;
+pub const SuperAccess = m_fields.SuperAccess;
+pub const CTOR_PICK_NONE = core_inst.CTOR_PICK_NONE;
+pub const BuiltinField = core_inst.BuiltinField;
 pub const CallMemberExtra = core_inst.CallMemberExtra;
 pub const CallVirtualInst = core_inst.CallVirtualInst;
 pub const CallVirtualExtra = core_inst.CallVirtualExtra;
@@ -101,6 +113,16 @@ pub const LEAF_MAX_STEPS = core_func.LEAF_MAX_STEPS;
 pub const Param = core_func.Param;
 
 pub const Class = core_class.Class;
+pub const FieldSlot = core_class.FieldSlot;
+pub const SlotSeed = core_class.SlotSeed;
+pub const DeclaredProp = core_class.DeclaredProp;
+pub const CtorArity = core_class.CtorArity;
+pub const PropTarget = m_props.PropTarget;
+pub const PropDispatchEntry = m_props.PropDispatchEntry;
+pub const PropSlotEntry = m_props.PropSlotEntry;
+pub const FieldLayout = core_class.FieldLayout;
+pub const FieldLayoutState = core_class.FieldLayoutState;
+pub const ClassFieldLayout = m_fields.ClassFieldLayout;
 pub const ClassIndexEntry = core_class.ClassIndexEntry;
 pub const FuncIndexEntry = core_class.FuncIndexEntry;
 pub const StrPair = core_class.StrPair;
@@ -114,7 +136,15 @@ pub threadlocal var pending_eager_call_fids: ?std.AutoHashMap(span.Span, u32) = 
 /// Per-expression static type heads from typeck: `Span(expr) -> {head, nullable}`.
 pub threadlocal var pending_eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null;
 
-pub const EagerTypeHead = struct { name: []const u8, nullable: bool };
+pub const EagerTypeHead = struct {
+    name: []const u8,
+    nullable: bool,
+    /// A primitive head. The map feeds two questions and they want different
+    /// answers: argument applicability treats a primitive head as exact while a
+    /// literal coerces, so `eagerTypeOf` declines these; a RECEIVER question
+    /// wants them, and `eagerRecvTypeOf` serves them.
+    primitive: bool = false,
+};
 /// Receiver-lambda channel: body-block span -> receiver class head.
 pub threadlocal var pending_eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null;
 /// Fn-typed lambda-param shapes: param ident span -> {has_receiver, arity}.
@@ -132,6 +162,18 @@ pub const StagedPicks = struct {
     recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
     param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
 };
+
+/// Frees whatever is pending on the calling thread: a program that publishes
+/// picks for a new source map must not inherit another program's, whose
+/// spans it would read as its own.
+pub fn discardPendingPicks() void {
+    var p = takePendingPicks();
+    if (p.calls) |*m| m.deinit();
+    if (p.call_fids) |*m| m.deinit();
+    if (p.types) |*m| m.deinit();
+    if (p.recv_heads) |*m| m.deinit();
+    if (p.param_shapes) |*m| m.deinit();
+}
 
 /// Moves the calling thread's pending tables out, leaving none pending.
 pub fn takePendingPicks() StagedPicks {
@@ -161,6 +203,13 @@ pub var lazy_hook: ?*const fn (*const Module, *Func) void = null;
 pub const PendingCtx = struct {
     params: []const ast.ContextParam,
     type_params: []const ast.TypeParam,
+};
+
+/// A context value in scope at a lowering site: the local it is bound to and its
+/// declared type head, which a contextual call matches its parameters against.
+pub const ContextLocal = struct {
+    name: []const u8,
+    ty: []const u8,
 };
 
 /// A local `fun`'s name plus the mangled overload cell a bare self-reference calls through.
@@ -205,8 +254,6 @@ pub const Module = struct {
     late_funcs: std.ArrayList(*Func) = .empty,
     /// Route `appendFunc` to `late_funcs`: frames may hold `*const Func` while it grows.
     funcs_live: bool = false,
-    /// Some declaration has a `context(...)` clause; gates the per-frame context-receiver push.
-    has_context_decls: bool = false,
     /// Lowering scratch: a local contextual function's context parameters for its body prologue.
     pending_ctx: ?PendingCtx = null,
     /// Reference key for the next lowered lambda (an adapted callable reference's wrapper).
@@ -219,6 +266,9 @@ pub const Module = struct {
     /// binds the receiver, and a local class in the body captures `this@<Owner>`.
     pending_accessor_this_label: ?[]const u8 = null,
     pending_accessor_dispatch_owner: ?[]const u8 = null,
+    /// The reserved id an accessor about to lower fills, when its header was
+    /// placed before the bodies so reads could bind it.
+    pending_accessor_place_id: ?FuncId = null,
     /// Lowering scratch: callable arity mask of the owner class's members. A name that is only
     /// ever a property carries mask 0, so a bare call of it is not read as a companion call.
     pending_own_member_arity: ?*const runtime.NameHashMap(u64) = null,
@@ -262,8 +312,17 @@ pub const Module = struct {
     pending_splice_solved: ?[]Module.TypeBinding = null,
     /// Instantiated value-parameter types for the pending lambda literal; the body takes ownership.
     pending_lambda_param_types: ?[]TypeRef = null,
-    /// Context parameters of the anonymous function lowered next, bound from the context stack.
+    /// Context parameters of the anonymous function lowered next, bound as its leading context slots.
     pending_lambda_ctx_params: ?[]const ast.ContextParam = null,
+    /// The thunk about to lower is an inner class's constructor context, whose
+    /// leading `this` parameter is the enclosing instance, not the owner's.
+    pending_this_is_outer: bool = false,
+    /// The context parameter type heads of the lambda literal lowered next, from its expected
+    /// function type or the call site's record of its parameter; bound as anonymous context slots.
+    pending_lambda_ctx_types: ?[]const []const u8 = null,
+    /// The context values in scope at the lambda's construction site, innermost first; the body
+    /// captures one by name when a contextual call inside needs it.
+    pending_lambda_ctx_scope: ?[]const ContextLocal = null,
     /// The local `fun` about to lower: its name and mangled overload cell. A bare self-reference
     /// calls through the cell, since the plain-name slot is shared with later same-named siblings.
     pending_lambda_self_fn: ?SelfLocalFn = null,
@@ -389,6 +448,19 @@ pub const Module = struct {
     /// Link-time virtual dispatch table. Keys pack a runtime `ClassId` in the high word and a
     /// declaration-rooted `MethodSlotId` in the low word; method names never enter dispatch.
     method_dispatch: std.AutoHashMap(u64, FuncId),
+    /// Per class, its transitive supertype closure including itself, sorted by
+    /// id so a subtype test is a binary search. Rebuilt at link time.
+    class_ancestors: std.ArrayList([]const ClassId) = .empty,
+    /// Link-time property dispatch table, the same shape as `method_dispatch`:
+    /// a runtime `ClassId` in the high word and a `PropSlotId` in the low word,
+    /// answering what a read of that property on that class runs.
+    prop_dispatch: std.AutoHashMap(u64, PropTarget),
+    /// `(root declaring class FQN, property name) -> PropSlotId`. A property
+    /// family is keyed by name because properties do not overload.
+    prop_slot_ids: StrPairMap(u32),
+    /// Link-time field layout, indexed by `ClassId`: every slot an instance of that
+    /// class holds, in order, composed from what each class in the chain publishes.
+    field_layout: std.ArrayList(ClassFieldLayout) = .empty,
     /// Ambiguous bare calls the symbol index refused to pick among, surfaced by the build
     /// driver before the program runs. Name and FQN slices borrow from the module's own data.
     resolve_diags: std.ArrayList(ResolveDiag) = .empty,
@@ -410,6 +482,11 @@ pub const Module = struct {
         arity: DeclArity,
         /// Declared user-parameter structural types, excluding any implicit receiver slot.
         sig: []const TypeRef = &.{},
+        /// Parallel to `sig`: the parameter names, and which declare a default.
+        param_names: []const []const u8 = &.{},
+        param_defaults: []const bool = &.{},
+        /// The declared return type; null for an expression body with none written.
+        return_ty: ?TypeRef = null,
         kind: FuncKind = .plain,
         visibility: ast.Visibility = .Public,
         is_inline: bool = false,
@@ -437,6 +514,10 @@ pub const Module = struct {
         /// At least one visible member accepts the supplied call shape. Stays true for an
         /// ambiguity, where `target` is null but the member still shadows a package function.
         applicable: bool = false,
+        /// The owner's hierarchy declares the name at all. Separates "this class has no such
+        /// member" from "it has one and the call shape does not fit it", which the census
+        /// needs: only the second is a resolution gap the argument shapes could close.
+        saw_candidates: bool = false,
     };
 
     pub const MemberResolveCtx = struct {
@@ -465,6 +546,14 @@ pub const Module = struct {
         /// Bounds of type parameters owned by the enclosing declaration, so a receiver such as
         /// `Array<T>` is fully static when `T` is the caller's bounded type parameter.
         actual_type_param_bounds: []const ModuleRegistry.TypeParamBound = &.{},
+        /// The receiver is an expression the call site wrote, not a head conjectured from the
+        /// implicit tower. Committing a pick on the strength of its receiver needs a receiver
+        /// that is actually there.
+        actual_receiver: bool = false,
+        /// Name of the declaration being lowered. A winner that shares it is a call the
+        /// resolver cannot tell from recursion, and Kotlin's answer at such a site is
+        /// usually a member on a narrowed receiver, so the pick is withheld.
+        enclosing_fn_name: ?[]const u8 = null,
     };
 
     pub const ExtensionResolution = struct {
@@ -482,6 +571,11 @@ pub const Module = struct {
         /// parameter's RETURN position. Only lambda-parameter typing may read it, since every
         /// candidate hands the closure the same parameter types.
         param_rep: ?FuncId = null,
+        /// `sole_unknown` is the only candidate at the best applicability tier, its declared
+        /// receiver relates to the static one, and that receiver head is a real type rather
+        /// than a type parameter. This is the shape `resolve/extensions` proposes to commit;
+        /// the per-site audit is what decides whether it may.
+        sole_unknown_best_tier: bool = false,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span plus the first two
@@ -914,11 +1008,58 @@ pub const Module = struct {
     pub const linkMethodSlots = m_methods.linkMethodSlots;
     pub const linkMethodSlotsFrom = m_methods.linkMethodSlotsFrom;
 
+    pub const classFieldLayout = m_fields.classFieldLayout;
+    pub const classFieldLayoutState = m_fields.classFieldLayoutState;
+    pub const fieldSlotIndex = m_fields.fieldSlotIndex;
+    pub const linkFieldSlots = m_fields.linkFieldSlots;
+    pub const linkGetterRoutes = m_fields.linkGetterRoutes;
+    pub const linkPropertySlots = m_props.linkPropertySlots;
+    pub const propSlotTarget = m_props.propSlotTarget;
+    pub const propSlotOf = m_props.propSlotOf;
+    pub const soleCtorForArity = m_props.soleCtorForArity;
+    pub const staticCtorPick = m_props.staticCtorPick;
+    pub const linkCtorPicks = m_props.linkCtorPicks;
+    pub const probeCtorArity = m_props.probeCtorArity;
+    pub const probeInstanceOf = m_props.probeInstanceOf;
+    pub const probeClassGraph = m_props.probeClassGraph;
+    pub const probeThisOrGlobal = m_props.probeThisOrGlobal;
+    pub const probeBuiltinMembers = m_props.probeBuiltinMembers;
+    pub const linkBuiltinMembers = m_props.linkBuiltinMembers;
+    pub const linkMemberOrGlobal = m_props.linkMemberOrGlobal;
+    pub const linkGlobalIdentities = m_props.linkGlobalIdentities;
+    pub const linkConstGlobals = m_props.linkConstGlobals;
+    pub const probeRegisterClasses = m_regclass.probeRegisterClasses;
+    pub const probeMemberByName = m_regclass.probeMemberByName;
+    pub const linkReceiverClasses = m_regclass.linkReceiverClasses;
+    pub const linkBuiltinFields = m_regclass.linkBuiltinFields;
+    pub const extensionCouldServe = m_props.extensionCouldServe;
+    pub const declaredGetterOn = m_fields.declaredGetterOn;
+    pub const declaredSetterOn = m_fields.declaredSetterOn;
+    pub const linkSuperMembers = m_fields.linkSuperMembers;
+    pub const superMemberAmong = m_fields.superMemberAmong;
+    pub const linkBuiltinMemberRegs = m_regclass.linkBuiltinMemberRegs;
+    pub const inferRegisterClasses = m_regclass.inferRegisterClasses;
+    pub const probeMemberOrGlobal = m_props.probeMemberOrGlobal;
+    pub const hierarchyDeclaresName = m_props.hierarchyDeclaresName;
+    pub const linkClassAncestors = m_props.linkClassAncestors;
+    pub const classIsA = m_props.classIsA;
+    pub const classIsAKnown = m_props.classIsAKnown;
+    pub const subclassDeclaresProp = m_fields.subclassDeclaresProp;
+    pub const getterRejectDump = m_fields.getterRejectDump;
+    pub const linkInstanceOfTargets = m_props.linkInstanceOfTargets;
+    pub const propDispatchEntries = m_props.propDispatchEntries;
+    pub const propSlotEntries = m_props.propSlotEntries;
+    pub const registerPropSlotTarget = m_props.registerPropSlotTarget;
+    pub const registerPropSlotId = m_props.registerPropSlotId;
+    pub const linkFieldSlotsFrom = m_fields.linkFieldSlotsFrom;
+    pub const baseFieldLayoutsStale = m_fields.baseFieldLayoutsStale;
+
     pub const funcCount = m_lookup.funcCount;
     pub const deinit = m_lookup.deinit;
     pub const cloneForExtend = m_lookup.cloneForExtend;
     pub const classId = m_lookup.classId;
     pub const uniqueClassIdBySimpleName = m_lookup.uniqueClassIdBySimpleName;
+    pub const simpleNameIsAmbiguous = m_lookup.simpleNameIsAmbiguous;
     pub const topUpUniqueSimpleCache = m_lookup.topUpUniqueSimpleCache;
     pub const uniqueSimpleInsert = m_lookup.uniqueSimpleInsert;
     pub const classNameCandidates = m_lookup.classNameCandidates;
@@ -926,6 +1067,10 @@ pub const Module = struct {
     pub const buildClassIdMap = m_lookup.buildClassIdMap;
     pub const installEagerCalls = m_lookup.installEagerCalls;
     pub const eagerTypeOf = m_lookup.eagerTypeOf;
+    pub const eagerRecvTypeOf = m_lookup.eagerRecvTypeOf;
+    pub const eagerEntryState = m_lookup.eagerEntryState;
+    pub const eagerRawHead = m_lookup.eagerRawHead;
+    pub const eager_miss_counts = &m_lookup.eager_miss_counts;
     pub const eagerParamShapeOf = m_lookup.eagerParamShapeOf;
     pub const ExtCouldApplyWhy = m_lookup.ExtCouldApplyWhy;
     pub const ExtArity = m_lookup.ExtArity;
@@ -1075,6 +1220,9 @@ test {
     testing.refAllDecls(@import("core/inst.zig"));
     testing.refAllDecls(@import("core/module_bare.zig"));
     testing.refAllDecls(@import("core/module_calls.zig"));
+    testing.refAllDecls(@import("core/module_fields.zig"));
+    testing.refAllDecls(@import("core/module_props.zig"));
+    testing.refAllDecls(@import("core/module_regclass.zig"));
     testing.refAllDecls(@import("core/module_lookup.zig"));
     testing.refAllDecls(@import("core/module_methods.zig"));
     testing.refAllDecls(@import("core/module_refs.zig"));
@@ -1087,4 +1235,6 @@ test {
     testing.refAllDecls(@import("core/tests_members.zig"));
     testing.refAllDecls(@import("core/tests_resolve.zig"));
     testing.refAllDecls(@import("core/tests_support.zig"));
+    _ = site_census;
+    testing.refAllDecls(site_census);
 }

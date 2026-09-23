@@ -78,6 +78,7 @@ pub fn ctorArgFnArities(b: *FuncBuilder, class_id: ir.ClassId, args: []const Exp
         while (pi > 0) : (pi -= 1) {
             if (fnTypeArityAlias(b, params[pi - 1].ty)) |ar| {
                 out[args.len - 1] = ar;
+                try recordCtorLambdaShape(b, args[args.len - 1].span(), params[pi - 1].ty);
                 break;
             }
         }
@@ -86,9 +87,25 @@ pub fn ctorArgFnArities(b: *FuncBuilder, class_id: ir.ClassId, args: []const Exp
     if (allNull(arg_names) and args.len <= params.len) {
         var i: usize = 0;
         const lead: usize = if (trailing_lambda) args.len - 1 else args.len;
-        while (i < lead) : (i += 1) out[i] = fnTypeArityAlias(b, params[i].ty) orelse -1;
+        while (i < lead) : (i += 1) {
+            out[i] = fnTypeArityAlias(b, params[i].ty) orelse -1;
+            if (args[i] == .Lambda or args[i] == .AnonFun) try recordCtorLambdaShape(b, args[i].span(), params[i].ty);
+        }
     }
     return out;
+}
+
+/// A constructor's function-typed parameter shapes the lambda bound there: its
+/// receiver when the head is a concrete class, or the fact that it has none. A
+/// class type parameter's receiver is left to the body's runtime binding.
+fn recordCtorLambdaShape(b: *FuncBuilder, sp: ast.Span, param_ty: ir.TypeRef) Allocator.Error!void {
+    if (lambda_mod.fnTypeReceiver(b, param_ty)) |receiver| {
+        if (ir.parseClassTypeParamIdentity(receiver.name) != null or b.isTypeParam(receiver.name)) return;
+        if (b.lambdaArgRecv(sp) != null) return;
+        try b.recordLambdaArgRecvOwned(sp, try receiver.clone(b.allocator));
+    } else if (lambda_mod.fnTypeNoReceiver(param_ty)) {
+        b.recordLambdaArgNoRecv(sp);
+    }
 }
 
 /// An arg-name vector naming the trailing lambda with its function parameter, so

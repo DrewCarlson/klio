@@ -1,0 +1,19 @@
+circle:2
+square:3
+other shape
+int:7
+text:hi
+list:2
+null
+unknown
+drawable=true shape=true
+drawable=false shape=true
+plain=false nullable=true
+n4
+tx
+null
+notshape=true
+up=true
+any=true
+safe=null
+cce

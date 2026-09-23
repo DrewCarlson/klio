@@ -294,6 +294,7 @@ fn resolveClassLayouts(
         slot_p.* = null;
         parent_table[i] = null;
     }
+    cgen.checkAgainstPublished(m, table);
 }
 
 fn compileReachableBodies(e: *Emit) Error!bool {

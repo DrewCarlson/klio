@@ -103,6 +103,7 @@ pub fn take() ?*Plan {
 /// gave it, as the eager placement does.
 pub fn installBody(module: *ir.Module, id: FuncId, func: ir.Func) void {
     const slot = module.funcByIdMut(id) orelse return;
+    if (runtime.envOnce("KLIO_FUNC_TRACE") != null) std.debug.print("[install] id={d} was={s} now={s}\n", .{ id.int(), slot.fqn, func.fqn });
     var placed = func;
     placed.id = id;
     placed.fqn = slot.fqn;

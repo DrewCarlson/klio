@@ -345,221 +345,43 @@ pub fn classIsInterface(self: *VmHost, class_name: []const u8) bool {
     return dg.get().is_interface;
 }
 
-/// `class_name`'s supertypes with the superclass ahead of the interfaces. Kotlin
-/// lets a source list name an interface first, but `super.m()` means the
-/// superclass's. Names are class-table owned; the returned slice is the caller's.
-pub fn supertypesClassFirst(self: *VmHost, allocator: Allocator, class_name: []const u8) Allocator.Error![]const []const u8 {
-    const sups: []const []const u8 = blk: {
-        const g = self.classes.borrow();
-        defer g.deinit();
-        const d = g.get().get(class_name) orelse break :blk &.{};
-        const dg = d.borrow();
-        defer dg.deinit();
-        break :blk dg.get().supertype_names;
-    };
-    var out: std.ArrayList([]const u8) = .empty;
-    errdefer out.deinit(allocator);
-    for (sups) |s| {
-        if (!classIsInterface(self, s)) try out.append(allocator, s);
-    }
-    for (sups) |s| {
-        if (classIsInterface(self, s)) try out.append(allocator, s);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-pub fn classIsRegistered(self: *VmHost, class_name: []const u8) bool {
-    const g = self.classes.borrow();
-    defer g.deinit();
-    return g.get().get(class_name) != null;
-}
-
-/// The registered supertype of `class_name` whose dotted name ends in `.simple`.
-pub fn ownerSupertypeBySuffix(self: *VmHost, class_name: []const u8, simple: []const u8) ?[]const u8 {
-    const g = self.classes.borrow();
-    defer g.deinit();
-    const d = g.get().get(class_name) orelse return null;
-    const dg = d.borrow();
-    defer dg.deinit();
-    for (dg.get().supertype_names) |s| {
-        if (s.len > simple.len + 1 and std.mem.endsWith(u8, s, simple) and s[s.len - simple.len - 1] == '.') return s;
-    }
-    return null;
-}
-
-pub fn ownerHasSupertype(self: *VmHost, class_name: []const u8, q: []const u8) bool {
-    const d = host_classes.classDefLookup(self, class_name) orelse return false;
-    const dg = d.borrow();
-    defer dg.deinit();
-    for (dg.get().supertype_names) |s| {
-        if (std.mem.eql(u8, s, q)) return true;
-    }
-    return false;
-}
-
-/// `[PATH]` record for a super-qualified dispatch, labelled with the static
-/// target class: a runtime-class label would collide with the virtual call's key.
-pub fn emitSuperPath(allocator: Allocator, decl_fqn: []const u8, fid: FuncId, target_class: []const u8, args: []const Value) void {
-    if (!trace.pathEnabled()) return;
-    const label = std.fmt.allocPrint(allocator, "super({s})", .{target_class}) catch return;
-    defer allocator.free(label);
-    vmhost.emitPathLabeled(allocator, "member_super", decl_fqn, fid, label, args);
-}
-
-pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    _ = arg_names;
-    // `super.m()` walks the supertypes of `owner_class`, the class the call is
-    // written in; `super<Q>` starts the walk at Q itself.
-    var pending: std.ArrayList([]const u8) = .empty;
-    defer pending.deinit(allocator);
-    if (qualifier) |q| {
-        // `q` is the const-pool super qualifier, borrowed for the program's
-        // lifetime. A simple qualifier for a nested supertype resolves by suffix.
-        if (ownerHasSupertype(self, owner_class, q) or classIsRegistered(self, q)) {
-            try pending.append(allocator, q);
-        } else if (ownerSupertypeBySuffix(self, owner_class, q)) |full| {
-            try pending.append(allocator, full);
-        } else {
-            try pending.append(allocator, q);
-        }
-    } else {
-        const sups = try supertypesClassFirst(self, allocator, owner_class);
-        defer allocator.free(sups);
-        try pending.appendSlice(allocator, sups);
-    }
-    // A class with no declared supertype still has `Any` above it.
-    var visited: runtime.NameHashMap(void) = .init(allocator);
-    defer visited.deinit();
-
-    // Search the supertypes, superclass before interfaces at every level, and
-    // dispatch the first that declares the method: the member ladder would recurse.
-    var step: usize = 0;
-    while (pending.items.len != 0) {
-        if (step > 128) break;
-        step += 1;
-        const cname = pending.orderedRemove(0);
-        if (visited.contains(cname)) continue;
-        try visited.put(cname, {});
-        {
-            const mg = self.module.borrow();
-            const m = mg.get();
-            var found_fid: ?FuncId = null;
-            for (m.classes.items) |*cls_ir| {
-                if (!std.mem.eql(u8, cls_ir.name, cname)) continue;
-                // Pick by arity and types: a wrong-arity binding re-dispatches
-                // virtually into an infinite super cycle.
-                var cands: std.ArrayList(Func) = .empty;
-                defer cands.deinit(allocator);
-                for (cls_ir.methods) |fid| {
-                    const cf = m.funcById(fid) orelse continue;
-                    if (std.mem.eql(u8, cf.name, name)) cands.append(allocator, cf.*) catch {};
-                }
-                if (cands.items.len != 0) {
-                    const chosen = pickMethodOverload(self, m, cands.items, args) orelse cands.items[0];
-                    found_fid = chosen.id;
-                }
-                break;
-            }
-            if (found_fid) |fid| {
-                const func = m.funcById(fid).?;
-                mg.deinit();
-                var all: std.ArrayList(Value) = .empty;
-                try all.append(allocator, receiver.*);
-                try all.appendSlice(allocator, args);
-                const module_ref = self.module.clone();
-                defer module_ref.deinit();
-                emitSuperPath(allocator, func.fqn, fid, cname, args);
-                return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), func, all, self);
-            }
-            mg.deinit();
-        }
-        // A property read lowers to a 0-arg CallSuper; the search starts at the
-        // parent, so `override val x get() = super.x` reads the base getter.
-        if (args.len == 0) {
-            const getter_fid: ?FuncId = blk: {
-                const pg = self.prog.borrow();
-                defer pg.deinit();
-                break :blk pg.get().instance_prop_getters.get(.{ .a = cname, .b = name });
-            };
-            if (getter_fid) |fid| {
-                const mg = self.module.borrow();
-                const m = mg.get();
-                if (m.funcById(fid)) |func| {
-                    mg.deinit();
-                    var all: std.ArrayList(Value) = .empty;
-                    try all.append(allocator, receiver.*);
-                    const module_ref = self.module.clone();
-                    defer module_ref.deinit();
-                    emitSuperPath(allocator, func.fqn, fid, cname, args);
-                    return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), func, all, self);
-                }
-                mg.deinit();
-            }
-        }
-        // A builtin collection supertype has no IR class; the instance delegates it.
-        if (receiver.* == .Instance) {
-            var kb: [96]u8 = undefined;
-            if (std.fmt.bufPrint(&kb, "__delegate__{s}", .{simpleName(cname)}) catch null) |key| {
-                const delegate: ?Value = blk: {
-                    const ig = receiver.Instance.borrow();
-                    defer ig.deinit();
-                    break :blk ig.get().get(key);
-                };
-                if (delegate) |d| return callMemberRec(self, allocator, &d, name, args);
-            }
-        }
-        const sups = try supertypesClassFirst(self, allocator, cname);
-        defer allocator.free(sups);
-        try pending.appendSlice(allocator, sups);
-    }
-
-    // A base property with no custom getter: read its backing field directly.
-    if (args.len == 0 and receiver.* == .Instance) {
-        const ig = receiver.Instance.borrow();
-        defer ig.deinit();
-        if (ig.get().get(name)) |v| return .{ .ok = v };
-    }
-
-    // The chain bottomed out at `Any` or `Throwable`: supply their semantics.
-    if (receiver.* == .Instance) {
-        const inst = receiver.Instance;
-        if (std.mem.eql(u8, name, "toString") and args.len == 0) {
-            return .{ .ok = try inheritedInstanceToString(allocator, inst, instanceIsThrowable(self, allocator, inst)) };
-        }
-        if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
+/// `Any`'s implementation for a `super` call the site already proved bottoms
+/// out there. The same three answers the walk reaches after exhausting the
+/// supertype list, without the list.
+/// `Any`'s member a super call names on an instance whose supertypes declare
+/// none of their own: `toString`, `hashCode` or `equals`, run on the receiver
+/// without dispatch.
+pub fn anyMember(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    which: ir.BuiltinMember,
+    args: []const Value,
+) Allocator.Error!?Value {
+    if (receiver.* != .Instance) return null;
+    const inst = receiver.Instance;
+    switch (which) {
+        .any_to_string => {
+            if (args.len != 0) return null;
+            return try inheritedInstanceToString(allocator, inst, instanceIsThrowable(self, allocator, inst));
+        },
+        .any_hash_code => {
+            if (args.len != 0) return null;
             const ig = inst.borrow();
             defer ig.deinit();
-            const hash: i64 = @bitCast(ig.get().identity);
-            return .{ .ok = Value.newInt(hash) };
-        }
-        if (std.mem.eql(u8, name, "equals") and args.len == 1) {
-            const same = switch (args[0]) {
+            return Value.newInt(@bitCast(ig.get().identity));
+        },
+        .any_equals => {
+            if (args.len != 1) return null;
+            return .{ .Bool = switch (args[0]) {
                 .Instance => |o| ObjRef(InstanceData).ptrEq(inst, o),
                 else => false,
-            };
-            return .{ .ok = .{ .Bool = same } };
-        }
+            } };
+        },
+        else => return null,
     }
-    // `super.Inner(args)`: an inner class of a supertype takes `this` as outer.
-    if (receiver.* == .Instance) {
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        const mod = mg.get();
-        var cur: ?ir.ClassId = mod.classId(owner_class) orelse mod.classIdByFqn(owner_class);
-        var depth: usize = 0;
-        while (cur) |cid| : (depth += 1) {
-            if (depth > 32 or cid.int() >= mod.classes.items.len) break;
-            const c = &mod.classes.items[cid.int()];
-            if (mod.classIdNestedIn(cid, name)) |nested| {
-                if (nested.int() < mod.classes.items.len and mod.classes.items[nested.int()].is_inner) {
-                    return try newInstanceById(self, allocator, nested, args, receiver);
-                }
-            }
-            cur = if (c.supertypes.len != 0) c.supertypes[0] else null;
-        }
-    }
-    return .{ .err = try typeErr(allocator, "super.{s}: no matching method up the supertype chain from `{s}`", .{ name, owner_class }) };
 }
+
 
 pub var qt_trace_init: bool = false;
 pub var qt_trace_val: ?[]const u8 = null;

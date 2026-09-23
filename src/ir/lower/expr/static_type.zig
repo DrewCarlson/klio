@@ -8,6 +8,7 @@ const applicability = @import("applicability");
 const build = @import("../../build.zig");
 const decl_mod = @import("../decl.zig");
 const inline_call = @import("../inline_call.zig");
+const inline_state = @import("../inline_state.zig");
 const static_call_type = @import("../static_call_type.zig");
 
 const Allocator = std.mem.Allocator;
@@ -18,6 +19,7 @@ const staticCallReturnTypeRef = static_call_type.staticCallReturnTypeRef;
 
 const expr_mod = @import("../expr.zig");
 
+const audit_mod = @import("audit.zig");
 const binary_mod = @import("binary.zig");
 const isPrimitiveTypeName = binary_mod.isPrimitiveTypeName;
 const numericPromotion = binary_mod.numericPromotion;
@@ -80,6 +82,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
     if (settled) return null;
     if (operatorMemberTypeRef(b, arg)) |t| return t;
     if (indexElementTypeRef(b, arg)) |t| return t;
+    if (universalMemberCallTypeRef(arg)) |t| return t;
     if (bareCallTypeRef(b, arg, &settled)) |t| return t;
     if (settled) return null;
     // A class-named receiver's property head is the static type.
@@ -103,7 +106,89 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
     }
     if (bareClassValueTypeRef(b, p)) |t| return t;
     if (topLevelPropertyTypeRef(b, p)) |t| return t;
-    return null;
+    return eagerReceiverTypeRef(b, arg);
+}
+
+/// Typeck's head for this expression, asked last. Every rung above derives a
+/// type from a declaration the builder can see; this one reads what the
+/// checker already worked out, which is the only source for an expression
+/// whose type is not written down anywhere. `KLIO_EAGER_RECV=0` puts it back.
+pub var eager_recv_counts: [2]u64 = @splat(0);
+pub var eager_recv_miss_state: [4]u64 = @splat(0);
+pub var eager_recv_miss_kind: [@typeInfo(@typeInfo(Expr).@"union".tag_type.?).@"enum".fields.len]u64 = @splat(0);
+
+fn eagerReceiverTypeRef(b: *const FuncBuilder, e: *const Expr) ?ir.TypeRef {
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_RECV") orelse "1", "0")) return null;
+    eager_recv_counts[0] +%= 1;
+    const head = b.module.eagerRecvTypeOf(e.span()) orelse {
+        // Aim at what the CONSUMER asks for: the checker's coverage as a
+        // whole is a different population from the receivers this rung is
+        // asked about, and improving one moved the other by nothing.
+        const k = @intFromEnum(std.meta.activeTag(e.*));
+        if (k < eager_recv_miss_kind.len) eager_recv_miss_kind[k] +%= 1;
+        // Did the checker never see this expression, or see it and fail to
+        // name it? The two send the work to different places, and the rung's
+        // aggregate cannot tell them apart.
+        const st = b.module.eagerEntryState(e.span());
+        eager_recv_miss_state[@intFromEnum(st)] +%= 1;
+        if (st == .named and runtime.envOnce("KLIO_EAGER_REFUSED") != null) {
+            if (b.module.eagerRawHead(e.span())) |h|
+                std.debug.print("[eager-refused] {s}\n", .{h});
+        }
+        if (runtime.envOnce("KLIO_EAGER_RECV_NAMES") != null and
+            e.* == .Path and e.Path.segments.len == 1)
+        {
+            std.debug.print("[eager-recv-name] {s} in={s}\n", .{
+                e.Path.segments[0].name,
+                build.currentRealFn() orelse "-",
+            });
+        }
+        return null;
+    };
+    var h = std.mem.trimEnd(u8, head.name, "?");
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (h.len == 0) return null;
+    eager_recv_counts[1] +%= 1;
+    return .{ .name = h, .nullable = head.nullable, .args = &.{} };
+}
+
+pub fn dispatchStatsOn() bool {
+    return runtime.envOnce("KLIO_DISPATCH_STATS") != null;
+}
+
+/// How often the deriver's last rung — typeck's own head — actually answers.
+pub fn eagerRecvDump() void {
+    if (runtime.envOnce("KLIO_DISPATCH_STATS") == null) return;
+    std.debug.print("[untyped-local] no_init={d} of_which_params={d}\n", .{ arg_shape_mod.untyped_local_no_init, arg_shape_mod.untyped_local_no_init_param });
+    if (arg_shape_mod.untyped_local_names) |*names| {
+        // The twenty most-read names.
+        var top: [20]struct { n: []const u8, c: u64 } = undefined;
+        var n_top: usize = 0;
+        var it = names.iterator();
+        while (it.next()) |e| {
+            const c = e.value_ptr.*;
+            var pos: usize = n_top;
+            while (pos > 0 and top[pos - 1].c < c) : (pos -= 1) {}
+            if (pos >= top.len) continue;
+            var k: usize = @min(n_top, top.len - 1);
+            while (k > pos) : (k -= 1) top[k] = top[k - 1];
+            top[pos] = .{ .n = e.key_ptr.*, .c = c };
+            if (n_top < top.len) n_top += 1;
+        }
+        for (top[0..n_top]) |t| std.debug.print("[untyped-local-name] {d:>8}  {s}\n", .{ t.c, t.n });
+    }
+    inline for (@typeInfo(@typeInfo(Expr).@"union".tag_type.?).@"enum".fields) |f| {
+        if (arg_shape_mod.untyped_local_init_kind[f.value] != 0)
+            std.debug.print("[untyped-local] {d:>8}  init={s}\n", .{ arg_shape_mod.untyped_local_init_kind[f.value], f.name });
+    }
+    std.debug.print("[eager-recv] asked={d} served={d}\n", .{ eager_recv_counts[0], eager_recv_counts[1] });
+    inline for (@typeInfo(@typeInfo(Expr).@"union".tag_type.?).@"enum".fields) |f| {
+        if (eager_recv_miss_kind[f.value] != 0)
+            std.debug.print("[eager-recv-miss] {d:>8}  {s}\n", .{ eager_recv_miss_kind[f.value], f.name });
+    }
+    std.debug.print("[eager-recv-state] no_map={d} never_seen={d} seen_unnamed={d} named_but_refused={d}\n", .{
+        eager_recv_miss_state[0], eager_recv_miss_state[1], eager_recv_miss_state[2], eager_recv_miss_state[3],
+    });
 }
 
 
@@ -466,6 +551,24 @@ fn indexElementTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
 /// classifier with no same-named plain function, which is a constructor call
 /// whose result head is authoritative. Collisions are left to the ordinary call
 /// resolver.
+/// `Any`'s members are every value's, whatever the receiver: `x.toString()`
+/// is a `String`, `x.hashCode()` an `Int`, `x.equals(y)` a `Boolean`, and no
+/// class can declare them otherwise.
+fn universalMemberCallTypeRef(arg: *const Expr) ?ir.TypeRef {
+    if (arg.* != .Call or arg.Call.callee.* != .Member or arg.Call.type_args.len != 0) return null;
+    const name = arg.Call.callee.Member.name.name;
+    const n = arg.Call.args.len;
+    const head: []const u8 = if (n == 0 and std.mem.eql(u8, name, "toString"))
+        "String"
+    else if (n == 0 and std.mem.eql(u8, name, "hashCode"))
+        "Int"
+    else if (n == 1 and std.mem.eql(u8, name, "equals"))
+        "Boolean"
+    else
+        return null;
+    return .{ .name = head, .nullable = false, .args = &.{} };
+}
+
 fn bareCallTypeRef(b: *FuncBuilder, arg: *const Expr, settled: *bool) ?ir.TypeRef {
     settled.* = true;
 
@@ -725,6 +828,186 @@ pub fn pushInitChain(name: []const u8) bool {
 
 pub fn popInitChain() void {
     init_chain_len -= 1;
+}
+
+/// The declared slot `name` occupies in `cid`'s published layout, when serving
+/// that slot is the whole of the read.
+///
+/// Four conditions, each one a way the slot's value is NOT the answer:
+///
+///   - the class has no published layout, or the name is not one of its slots;
+///   - the name has more than one cell, because a class in the chain privately
+///     shadows or override-cells it, and the read takes the nearest owner's;
+///   - the slot is not a plain stored property — a getter's backing slot
+///     exists, and reading it must run the getter;
+///   - the slot is a body property, whose value arrives when its initializer
+///     runs: a read that lands before that is answered by the ladder running
+///     the initializer, where the claim would serve the seed;
+///   - the owner is open, abstract or an interface, so a subclass may override
+///     the property with an accessor and the receiver be that subclass.
+///
+/// A capture is never claimed: only a declared slot's index is the same in a
+/// class and in every subclass.
+pub fn fieldSlotClaim(b: *const FuncBuilder, cid: ir.ClassId, name: []const u8) ?u32 {
+    const r = fieldSlotClaimWhy(b, cid, name);
+    audit_mod.noSlotNote(r.why);
+    return r.idx;
+}
+
+pub const SlotClaim = struct { idx: ?u32, why: audit_mod.WhyNoSlot };
+
+/// `KLIO_OPEN_SLOT=0`: refuse every open, abstract or interface receiver a
+/// field slot, as lowering did before the subclass question was asked.
+threadlocal var open_slot_state: u8 = 0;
+fn openSlotClaimEnabled() bool {
+    if (open_slot_state == 0) {
+        const v = runtime.envOnce("KLIO_OPEN_SLOT") orelse "1";
+        open_slot_state = if (std.mem.eql(u8, v, "0")) 1 else 2;
+    }
+    return open_slot_state == 2;
+}
+
+/// `KLIO_SLOT_BODY=0` puts a class's own body properties back on the by-name
+/// read. On: with the inherited ones excluded, `KLIO_SLOT_SERVE=audit` reads
+/// zero divergences over both the example corpus and the stdlib tests, and the
+/// share of field reads that claim a slot goes from 25.11% to 51.37%.
+/// Which of the three reasons a layout holds no slot of that name. The bucket
+/// is a third of all field reads, and the three want different work: naming the
+/// getter, accepting that a host class has no layout, and finding out why the
+/// deriver named a class that does not declare the name at all.
+fn whyNoSuchSlot(b: *const FuncBuilder, cid: ir.ClassId, name: []const u8) audit_mod.WhyNoSlot {
+    const c = &b.module.classes.items[cid.int()];
+    if (c.is_intrinsic_backed) return .host_backed;
+    const key = if (c.name.len != 0) c.name else c.fqn;
+    if (b.module.registry.hierarchy_shadow_names.get(key)) |h| {
+        if (h.names.contains(name)) return .accessor_or_method;
+    }
+    return .name_absent;
+}
+
+fn bodySlotClaimEnabled() bool {
+    return !std.mem.eql(u8, runtime.envOnce("KLIO_SLOT_BODY") orelse "1", "0");
+}
+
+fn inheritedBodySlotEnabled() bool {
+    return !std.mem.eql(u8, runtime.envOnce("KLIO_INHERITED_BODY_SLOT") orelse "1", "0");
+}
+
+/// The claim and the condition that decided it. One statement of the rules, so
+/// the census cannot drift from what the claim actually does.
+pub fn fieldSlotClaimWhy(b: *const FuncBuilder, cid: ir.ClassId, name: []const u8) SlotClaim {
+    if (cid.int() >= b.module.classes.items.len) return .{ .idx = null, .why = .no_class };
+    const layout = b.module.classFieldLayout(cid) orelse return .{
+        .idx = null,
+        // Four different problems wore one name. An interface holds no
+        // storage and never will; an object expression's fields are built in
+        // another order; `unavailable` means the build looked and could not
+        // describe the class; `unpublished` means nothing has written a
+        // layout yet, which is an ordering question, not a representation one.
+        .why = switch (b.module.classFieldLayoutState(cid) orelse .unpublished) {
+            .interface => .no_layout_interface,
+            .anonymous => .no_layout_object,
+            .local_runtime => .no_layout_local,
+            .unavailable => .no_layout_unavailable,
+            .unpublished => .no_layout_unpublished,
+            .ok => .no_layout,
+        },
+    };
+    const idx = b.module.fieldSlotIndex(cid, name) orelse
+        return .{ .idx = null, .why = whyNoSuchSlot(b, cid, name) };
+    if (idx >= layout.declared) return .{ .idx = null, .why = .capture_slot };
+    if (cellsForProperty(layout.slots[0..layout.declared], name) != 1)
+        return .{ .idx = null, .why = .many_cells };
+    if (!layout.slots[idx].plain) return .{ .idx = null, .why = .not_plain };
+    // A body property's slot holds its seed until the initializer runs, and a
+    // read that lands first is answered by the ladder running the initializer
+    // — where the claim would serve the seed.
+    if (!layout.slots[idx].ctor and !bodySlotClaimEnabled())
+        return .{ .idx = null, .why = .body_property };
+    const oc = &b.module.classes.items[cid.int()];
+    // Being subclassable is not on its own a reason to refuse. The layout is
+    // base-prefixed by construction — `own[i]` sits at `base + i`, and a
+    // claimed index is always inside the declared region, never among the
+    // trailing captures — so a subclass instance holds this class's cell at
+    // this class's index. What would break the read is a subclass ANSWERING
+    // the name differently: an `override val` with its own cell, or one
+    // replaced by an accessor. The build records every (ancestor, member)
+    // pair a subclass declares, so that is a question with a whole-program
+    // answer rather than a reason to give up on every open class.
+    //
+    // `KLIO_OPEN_SLOT=0` withdraws the claim, leaving the refusal as it was.
+    if (oc.is_open or oc.is_abstract or oc.is_interface) {
+        if (!openSlotClaimEnabled() or b.module.subclassDeclaresProp(oc.name, name))
+            return .{ .idx = null, .why = .subclassable };
+    }
+    // Nearest declaration wins, and the layout does not record which class
+    // that is. An INHERITED constructor cell is still the base's, so a
+    // subclass that replaces the property with an accessor answers from the
+    // accessor while the cell holds the base's value: `Counted : Tagged(…)`
+    // overrides `Tagged`'s constructor `label` with `get() = "counted:$n"`
+    // and read the constructor's `"counted"` instead.
+    if (nearestDeclaresGetter(b, cid, name)) return .{ .idx = null, .why = .accessor_or_method };
+    // An INHERITED body slot was refused outright because a class between the
+    // declarer and this one can replace the property with an accessor and
+    // contribute no cell — `Square` overriding `Shape`'s stored `sides` with
+    // `get() = 4` reads the inherited 0 — which is the divergence the
+    // dual-compute audit found when body properties first claimed. But that is
+    // the question `nearestDeclaresGetter` just answered: it walks from THIS
+    // class up and stops at the first declaration, so an intervening accessor
+    // has already refused above, and a second cell has already been refused by
+    // the cell count. `KLIO_INHERITED_BODY_SLOT=0` restores the refusal.
+    if (!layout.slots[idx].ctor and idx < layout.base and !inheritedBodySlotEnabled())
+        return .{ .idx = null, .why = .body_property };
+    // A class that delegates a supertype, or extends a builtin collection,
+    // forwards reads to the delegate cell rather than answering from its own
+    // slots: `size` on an `ArrayList` subclass is the delegate's size.
+    if (layoutHasDelegate(layout.slots)) return .{ .idx = null, .why = .has_delegate };
+    return .{ .idx = idx, .why = .claimed };
+}
+
+/// Whether the class nearest `cid` in the chain that DECLARES `name` answers
+/// it with an accessor. Kotlin resolves a property to the nearest declaration,
+/// so that one decides whether a cell or a call answers, whichever class the
+/// cell belongs to.
+fn nearestDeclaresGetter(b: *const FuncBuilder, cid: ir.ClassId, name: []const u8) bool {
+    var cur: ?ir.ClassId = cid;
+    var hops: usize = 0;
+    while (cur) |c| : (hops += 1) {
+        if (hops > 32 or c.int() >= b.module.classes.items.len) return false;
+        const cls = &b.module.classes.items[c.int()];
+        for (cls.declared_props) |prop| {
+            if (!std.mem.eql(u8, prop.name, name)) continue;
+            return prop.has_getter;
+        }
+        cur = if (cls.supertypes.len != 0) cls.supertypes[0] else null;
+    }
+    return false;
+}
+
+/// Whether the layout holds a delegate cell — a `by`-delegated supertype or a
+/// builtin-collection base. Both are spelled `__delegate__<name>`.
+fn layoutHasDelegate(slots: []const ir.FieldSlot) bool {
+    for (slots) |sl| {
+        if (std.mem.startsWith(u8, sl.name, "__delegate__")) return true;
+    }
+    return false;
+}
+
+/// How many slots hold the property `name`: its plain cell, plus one
+/// owner-mangled cell per class in the chain that shadows or override-cells it.
+/// `shadowFieldKey` spells a mangled cell `<owner>\u{1f}<prop>`.
+fn cellsForProperty(slots: []const ir.FieldSlot, name: []const u8) usize {
+    var n: usize = 0;
+    for (slots) |sl| {
+        if (std.mem.eql(u8, sl.name, name)) {
+            n += 1;
+            continue;
+        }
+        if (sl.name.len > name.len + 1 and
+            sl.name[sl.name.len - name.len - 1] == '\x1f' and
+            std.mem.eql(u8, sl.name[sl.name.len - name.len ..], name)) n += 1;
+    }
+    return n;
 }
 
 pub fn staticTypeClassId(b: *const FuncBuilder, ty: ir.TypeRef) ?ir.ClassId {
@@ -1365,12 +1648,97 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
     if (try ctorInitTypeRef(b, e)) |t| return t;
     if (try staticCallReturnTypeRef(b, e)) |t| return t;
     if (try elvisTypeRef(b, e)) |t| return t;
+    if (try implicitReceiverPropTypeRef(b, e)) |t| return t;
     // Shapes that name their own type outright. A `settled` answer is the
     // deriver's; otherwise the initializer channel below runs.
     var settled = true;
     if (try selfNamedTypeRef(b, e, &settled)) |t| return t;
     if (settled) return null;
     return try localInitTypeRef(b, e);
+}
+
+/// A class property with no declared type, typed from its initializer.
+///
+/// Kotlin infers it and every read of it wants the answer, but the registry
+/// records a head only where the initializer is a literal or a constructor
+/// call. `private val _next = atomic<Any>(this)` is neither, so the property
+/// has no recorded type at all and every `_next.compareAndSet(...)` on it
+/// resolves by name — which is most of what the coroutine and atomicfu
+/// internals do.
+///
+/// The initializer types in a scratch builder owned by the declaring class,
+/// which is the scope the initializer itself has. The depth cap is for a
+/// property whose initializer reads another inferred property.
+threadlocal var prop_init_depth: u8 = 0;
+fn inferredPropTypeRef(b: *FuncBuilder, owner: []const u8, name: []const u8) Allocator.Error!?ir.TypeRef {
+    if (prop_init_depth >= 3) return null;
+    const pa = inline_state.memberPropAst(owner, name) orelse return null;
+    // A declared type is `propTypeRefOn`'s answer, and an extension property
+    // belongs to its receiver rather than to this owner.
+    if (pa.ty != null or pa.receiver_type != null) return null;
+    const init = pa.init orelse return null;
+    prop_init_depth += 1;
+    defer prop_init_depth -= 1;
+    var nb = try FuncBuilder.init(b.allocator, b.module);
+    nb.markScratch();
+    defer nb.deinit();
+    nb.setOwnerClass(owner);
+    nb.setRecvTy(owner);
+    const out = try staticExprTypeRef(&nb, init);
+    if (runtime.envOnce("KLIO_PROPTY_TRACE")) |w| {
+        if (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, name)) {
+            std.debug.print("[propty] {s}.{s} init={s} ty={s}\n", .{
+                owner, name, @tagName(std.meta.activeTag(init.*)),
+                if (out) |t| t.name else "-",
+            });
+        }
+    }
+    return out;
+}
+
+/// The declared type of `name` read on `owner`, else the one its initializer
+/// infers.
+fn propTypeRefOrInferred(b: *FuncBuilder, owner: []const u8, name: []const u8) Allocator.Error!?ir.TypeRef {
+    if (propTypeRefOn(b, owner, name)) |t| return try t.clone(b.allocator);
+    return try inferredPropTypeRef(b, owner, name);
+}
+
+/// A bare name none of the channels above could type, read off an implicit
+/// receiver: `count.inc()` inside a method of the class that declares
+/// `val count: Counter`. The name is not a local, a parameter or a capture,
+/// and it is not a call — but a receiver in scope declares it, and so names
+/// its type.
+///
+/// Innermost first, which is Kotlin's own order: a lambda receiver that
+/// declares the name shadows the enclosing class's property. The walk stops
+/// at the owner rather than climbing to its outer, because a nested class
+/// cannot see the outer's instance members and answering from one would type
+/// the read off an object that is not there.
+///
+/// `KLIO_IMPLRECV_TY=0` withdraws the channel, so a wrong answer can be told
+/// from a wrong reading of one without a rebuild.
+fn implicitReceiverPropTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (e.* != .Path or e.Path.segments.len != 1) return null;
+    if (!implicitRecvTyOn()) return null;
+    const nm = e.Path.segments[0].name;
+    if (b.resolve(nm) != null or b.knowsOuter(nm)) return null;
+    if (b.recvTy()) |rh| {
+        if (try propTypeRefOrInferred(b, typeHead(std.mem.trimEnd(u8, rh, "?")), nm)) |t| return t;
+    }
+    if (b.spliceRecvTy()) |sh| {
+        if (try propTypeRefOrInferred(b, typeHead(std.mem.trimEnd(u8, sh, "?")), nm)) |t| return t;
+    }
+    const owner = b.ownerClass() orelse return null;
+    return try propTypeRefOrInferred(b, owner, nm);
+}
+
+threadlocal var implrecv_ty_state: u8 = 0;
+fn implicitRecvTyOn() bool {
+    if (implrecv_ty_state == 0) {
+        const val = runtime.envOnce("KLIO_IMPLRECV_TY") orelse "1";
+        implrecv_ty_state = if (std.mem.eql(u8, val, "0")) 1 else 2;
+    }
+    return implrecv_ty_state == 2;
 }
 
 /// `lhs ?: <jump>` carries the lhs type made non-null; the jump yields nothing.
@@ -1476,6 +1844,16 @@ self_named: {
             return .{ .name = try b.allocator.dupe(u8, owner), .nullable = false, .args = &.{} };
         }
         return null;
+    },
+    // A block in expression position is its last statement, when that is an
+    // expression: the branches of an `if` written with braces. A local the
+    // block declares is not in the deriver's scope, so a tail that reads one
+    // derives nothing, which is the conservative answer.
+    .Block => |blk| {
+        if (blk.stmts.len == 0) return null;
+        const last = &blk.stmts[blk.stmts.len - 1];
+        if (last.* != .Expr) return null;
+        return try staticExprTypeRef(b, &last.Expr);
     },
     // A conditional's type is what its branches agree on. Kotlin's answer is
     // their least upper bound; this takes the exact case, every branch deriving
@@ -1750,6 +2128,35 @@ fn memberReadSelfTypeRef(b: *FuncBuilder, m: @FieldType(Expr, "Member")) Allocat
 /// The instantiated return of a nullary member call, keeping a return left as a
 /// bare type parameter. `nullaryMemberReturnTypeRef` drops those; callers that
 /// want to know an expression carries `T` ask here.
+/// The declaration a zero-argument member call on `recv` reaches, with the
+/// dispatch commitment. `nullaryMemberReturnTypeRefRaw` asks the same question
+/// and keeps only the return type; a synthesized call such as a destructuring
+/// `componentN()` needs the target itself in order to bind.
+pub fn nullaryMemberResolution(
+    b: *FuncBuilder,
+    recv: ir.TypeRef,
+    name: []const u8,
+    file: span.FileId,
+) Allocator.Error!?ir.Module.MemberResolution {
+    var identity = std.mem.trimEnd(u8, recv.name, "?");
+    if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+    if (identity.len == 0) return null;
+    const owner = (if (std.mem.findScalar(u8, identity, '.') != null)
+        b.module.classIdByFqn(identity)
+    else
+        b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse return null;
+    var shape_set = try buildStaticReturnArgShapes(b, &.{}, &.{});
+    defer shape_set.deinit(b.allocator);
+    const owned_bounds = try b.typeParamBoundsSlice();
+    defer if (owned_bounds) |bounds| b.allocator.free(bounds);
+    return b.module.resolveMemberCall(owner, name, shape_set.shapes, .{
+        .caller_file = file,
+        .lexical_owner = null,
+        .actual_type_param_bounds = owned_bounds orelse &.{},
+        .receiver_type = recv,
+    });
+}
+
 pub fn nullaryMemberReturnTypeRefRaw(
     b: *FuncBuilder,
     recv: ir.TypeRef,

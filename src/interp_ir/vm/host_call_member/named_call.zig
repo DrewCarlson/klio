@@ -588,7 +588,7 @@ pub fn userMethodNamed(self: *VmHost, allocator: Allocator, receiver: *const Val
         var pushed_owner = false;
         if (mod.registry.member_ext_owner_class.get(fid)) |owner| {
             if (try memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
-                ir.eval.pushEnclosing(&inst);
+                ir.eval.pushDispatch(&inst);
                 pushed_owner = true;
             }
         }

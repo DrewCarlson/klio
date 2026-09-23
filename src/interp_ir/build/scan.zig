@@ -238,6 +238,17 @@ pub fn noteExtPropTypeHead(module: *Module, p: *const ast.Property) Allocator.Er
     );
 }
 
+/// A top-level property whose binding is its own storage: an initializer or an
+/// explicit field with one, and no accessor, delegate or `lateinit`. A `const`
+/// whose initializer is not a literal is bound and read the same way.
+fn plainStoredProp(p: *const ast.Property) bool {
+    if (p.receiver_type != null or p.is_lateinit) return false;
+    if (p.delegate != null or p.getter != null or p.setter != null) return false;
+    if (p.init != null) return true;
+    const ef = p.explicit_field orelse return false;
+    return ef.init != null;
+}
+
 pub fn notePropScope(
     a: Allocator,
     module: *Module,
@@ -265,6 +276,17 @@ pub fn notePropScope(
         if (std.mem.eql(u8, existing.fqn, fqn)) return;
     }
     try gop.value_ptr.append(a, .{ .fqn = fqn, .package = pkg });
+    // A plain stored property reads and writes through a numbered slot; a second
+    // declaration under the simple name leaves the name unbindable.
+    if (plainStoredProp(p)) {
+        const sg = try module.registry.top_level_prop_slots.getOrPut(p.name.name);
+        if (sg.found_existing) {
+            sg.value_ptr.* = ir.ModuleRegistry.ambiguous_slot;
+        } else {
+            sg.value_ptr.* = module.registry.top_level_prop_slot_count;
+            module.registry.top_level_prop_slot_count += 1;
+        }
+    }
     // The declared type head, so a bare read used as a receiver types statically.
     if (p.ty) |ty| {
         if (ty.function == null and ty.name.name.len != 0) {
@@ -347,8 +369,35 @@ pub fn promoteConstHeads(l: []const u8, r: []const u8) ?[]const u8 {
     return null;
 }
 
+/// `Long.MAX_VALUE` and its siblings. A builtin scalar's companion constants
+/// carry that scalar's own type, the width constants excepted, so an
+/// unannotated `const val` over them states its type as plainly as a literal
+/// does. `MAX_NANOS` in the stdlib's `Duration` is written exactly that way, and
+/// without this its references type as nothing and pick overloads by luck.
+fn builtinScalarConstHead(qualifier: []const u8, member: []const u8) ?[]const u8 {
+    const scalars = [_][]const u8{
+        "Int",  "Long",  "Short",  "Byte",  "Double", "Float",
+        "UInt", "ULong", "UShort", "UByte", "Char",
+    };
+    var known = false;
+    for (scalars) |sc| {
+        if (std.mem.eql(u8, sc, qualifier)) {
+            known = true;
+            break;
+        }
+    }
+    if (!known) return null;
+    const eq = std.mem.eql;
+    if (eq(u8, member, "SIZE_BITS") or eq(u8, member, "SIZE_BYTES")) return "Int";
+    if (eq(u8, member, "MAX_VALUE") or eq(u8, member, "MIN_VALUE") or
+        eq(u8, member, "NaN") or eq(u8, member, "POSITIVE_INFINITY") or
+        eq(u8, member, "NEGATIVE_INFINITY")) return qualifier;
+    return null;
+}
+
 /// The type head of a CONST-EXPRESSION initializer: literals, unary +/-, arithmetic over
-/// foldable operands, and a bare Path whose recorded declarations agree on one head.
+/// foldable operands, a builtin scalar's companion constant, and a bare Path whose
+/// recorded declarations agree on one head.
 pub fn constExprTypeHead(module: *Module, e: *const ast.Expr) ?[]const u8 {
     if (literalTypeHead(e)) |h| return h;
     switch (e.*) {
@@ -364,7 +413,13 @@ pub fn constExprTypeHead(module: *Module, e: *const ast.Expr) ?[]const u8 {
                 else => null,
             };
         },
+        .Member => |m| {
+            if (m.receiver.* != .Path or m.receiver.Path.segments.len != 1) return null;
+            return builtinScalarConstHead(m.receiver.Path.segments[0].name, m.name.name);
+        },
         .Path => |p| {
+            if (p.segments.len == 2)
+                return builtinScalarConstHead(p.segments[0].name, p.segments[1].name);
             if (p.segments.len != 1) return null;
             const list = module.registry.top_level_prop_pkgs.get(p.segments[0].name) orelse return null;
             var head: ?[]const u8 = null;
@@ -611,6 +666,56 @@ pub fn propHeadSourceExpr(prop: *const ast.Property) ?*const ast.Expr {
     return null;
 }
 
+/// Whether the class's primary constructor can bind `argc` positional
+/// arguments. A class with no primary constructor takes none; a vararg
+/// parameter makes the upper bound open.
+pub fn primaryCtorAccepts(cls: *const ir.Class, argc: usize) bool {
+    if (!cls.has_primary_ctor) return argc == 0;
+    var required: usize = 0;
+    var vararg = false;
+    for (cls.primary_params) |p| {
+        if (p.is_vararg) {
+            vararg = true;
+            continue;
+        }
+        if (!p.has_default) required += 1;
+    }
+    if (argc < required) return false;
+    return vararg or argc <= cls.primary_params.len;
+}
+
+/// Whether a top-level function of that exact name can bind `argc` arguments.
+/// Kotlin resolves `Foo(x)` to such a function when `Foo`'s constructors cannot
+/// take the call, so a head read off the class would name the wrong type.
+pub fn topLevelFnAccepts(module: *const ir.Module, nm: []const u8, argc: usize) bool {
+    for (module.funcsBySimpleName(nm)) |fid| {
+        const f = module.funcById(fid) orelse continue;
+        if (ir.Module.funcHasImplicitThis(f)) continue;
+        var required: usize = 0;
+        var vararg = false;
+        for (f.params) |p| {
+            if (p.is_vararg) {
+                vararg = true;
+                continue;
+            }
+            if (!p.has_default) required += 1;
+        }
+        if (argc >= required and (vararg or argc <= ir.Module.funcUserArity(f))) return true;
+    }
+    return false;
+}
+
+/// Whether a capitalised callee that names a class really is that class's
+/// constructor. It is not when the class cannot be constructed with this many
+/// arguments and a same-named top-level function can: Kotlin resolves
+/// `Boxy(5)` to `fun Boxy(n: Int)` when `class Boxy` has no one-argument
+/// constructor, and reading the class's head there names the wrong type.
+pub fn ctorHeadOutrankedByFactory(module: *const ir.Module, nm: []const u8, argc: usize, cid: ir.ClassId) bool {
+    if (cid.int() >= module.classes.items.len) return false;
+    if (primaryCtorAccepts(&module.classes.items[cid.int()], argc)) return false;
+    return topLevelFnAccepts(module, nm, argc);
+}
+
 /// Constructor-call head evidence for a property with no declared type. Only a name that
 /// IS a declared class counts: a same-shaped factory call may return a different type.
 pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, module: *const ir.Module, enclosing: ?*const ast.Class) ?[]const u8 {
@@ -623,6 +728,10 @@ pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, 
     if (runtime.envOnce("KLIO_PROPHEAD_TRACE") != null)
         std.debug.print("[prophead] {s} init-callee={s} class={} funcs={d}\n", .{ prop.name.name, nm, module.classId(nm) != null, module.funcsBySimpleName(nm).len });
     if (std.ascii.isUpper(nm[0])) {
+        const argc = src.Call.args.len;
+        if (module.classId(nm)) |cid| {
+            if (ctorHeadOutrankedByFactory(module, nm, argc, cid)) return null;
+        }
         for (decls) |*d| {
             if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;
         }
@@ -707,7 +816,7 @@ pub fn notePropTypeRef(
     prop_name: []const u8,
     ty: *const ast.TypeRef,
 ) Allocator.Error!void {
-    if (ty.function != null or ty.type_args.len == 0) return;
+    if (ty.function != null) return;
     for (ty.type_args) |*ta| {
         if (ta.is_star) return;
     }

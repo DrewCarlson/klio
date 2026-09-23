@@ -670,12 +670,31 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
-    // A bodyless declaration linked to a host symbol runs as that intrinsic; the
-    // fast paths below enter a frame directly, so route it through the linkage.
-    if (!f.hasBody() and host_call_func.resolvedNativeForm(self, fid) != null) {
+    // A declaration linked to a host symbol runs as that intrinsic; the fast
+    // paths below enter a frame directly, so route it through the linkage.
+    //
+    // Having a body is not a reason to skip it. `linkResolvedForms` marks
+    // every func under an installed binding's FQN native, body or not, which
+    // is what makes a placeholder body — `kotlinx.atomicfu.locks.ReentrantLock`
+    // declares one per lock member — defer to the real lock. The by-name walk
+    // asked the binding before the body, so this only ever mattered once a
+    // site bound the slot.
+    if (host_call_func.resolvedNativeForm(self, fid) != null) {
         const all = try prependReceiver(allocator, receiver, args_in);
         defer if (runtime.freeScratch()) allocator.free(all);
         return try callFuncRec(self, allocator, mod, fid, all);
+    }
+    // A pack-installed binding supersedes a declaration that has a body, and
+    // `resolved_native` does not carry it: that table is filled through the
+    // simple-name index, which holds no member methods. The by-name walk asks
+    // the binding by FQN before it runs a body, so a slot-bound call has to
+    // ask the same authority or a placeholder runs instead of the real
+    // member. `kotlinx.atomicfu.locks.ReentrantLock` declares one such
+    // placeholder per lock member.
+    if (hcm.installedBindingFor(self, f.fqn)) |intrinsic| {
+        const all = try prependReceiver(allocator, receiver, args_in);
+        defer if (runtime.freeScratch()) allocator.free(all);
+        return try hcm.dispatchIntrinsic(self, allocator, f.fqn, intrinsic, all);
     }
     // Frameless serve for the canonical getter shape on a claimed class.
     // Uses the module-owned func pointer so the shape/route memo persists.

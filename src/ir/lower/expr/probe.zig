@@ -3,6 +3,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const runtime = @import("runtime");
+const applicability = @import("applicability");
 const ir = @import("../../ir.zig");
 const build = @import("../../build.zig");
 const helpers = @import("../helpers.zig");
@@ -650,11 +651,105 @@ pub fn implicitReceiverOfType(b: *FuncBuilder, ty: []const u8) Allocator.Error!?
         const head = b.recvTy() orelse b.ownerClass() orelse return null;
         return if (receiverHeadIs(b, head, want)) this_reg else null;
     }
-    if (b.capturesThisSlot()) {
-        const head = b.enclosingRecvTy() orelse b.ownerClass() orelse return null;
-        if (receiverHeadIs(b, head, want)) return try b.loadCaptureHoisted("this");
+    if (b.knowsOuter("this") or b.capturesThisSlot()) {
+        if (b.enclosingRecvTy() orelse b.ownerClass()) |head| {
+            if (receiverHeadIs(b, head, want)) return try b.loadCaptureHoisted("this");
+        }
+    }
+    // A closure's construction site recorded the receivers behind its `this`
+    // as a tower: the innermost is the captured `this`, each further one is
+    // reached through the `this@<label>` slot its splice bound.
+    if (b.capturesThisSlot() and b.implicit_receiver_tower_known) {
+        for (b.implicit_receiver_tower.items, 0..) |entry, ti| {
+            if (entry.head.len == 0 or !receiverHeadIs(b, entry.head, want)) continue;
+            if (ti == 0) return try b.loadCaptureHoisted("this");
+            const lbl = entry.label orelse continue;
+            const slot = try std.fmt.allocPrint(b.allocator, "this@{s}", .{lbl});
+            if (b.resolve(slot)) |r| return r;
+            if (b.knowsOuter(slot)) {
+                const r = try b.loadCaptureHoisted(slot);
+                try b.bind(slot, r);
+                return r;
+            }
+        }
     }
     return null;
+}
+
+/// The register holding the context value of type `ty` a contextual call
+/// here hands over: a context value in scope, innermost first, else the
+/// innermost implicit receiver of that type. Null when nothing in scope names
+/// one, which leaves the callee to derive it from its chain.
+pub fn contextArgOfType(b: *FuncBuilder, ty: []const u8) Allocator.Error!?Reg {
+    const want = receiverTypeSimple(ty);
+    if (want.len == 0) return null;
+    if (runtime.envOnce("KLIO_DISPATCH_TRACE") != null and build.scratch_depth == 0) {
+        std.debug.print("[context-arg] want={s} scope=", .{want});
+        for (b.ctx_scope.items) |cl| std.debug.print(" {s}:{s}/{s}", .{ cl.name, cl.ty, if (b.resolve(cl.name) != null) "bound" else if (b.knowsOuter(cl.name)) "outer" else "-" });
+        std.debug.print(" subjects={d} this={} recv={s} encl={s} lam={} outer_this={} tower_known={} tower=", .{ b.subject_binds.items.len, b.resolve("this") != null, b.recvTy() orelse "-", b.enclosingRecvTy() orelse "-", b.capturesThisSlot(), b.knowsOuter("this"), b.implicit_receiver_tower_known });
+        if (b.implicit_receiver_tower_known) for (b.implicit_receiver_tower.items) |te| std.debug.print(" {s}/{s}", .{ if (te.head.len == 0) "?" else te.head, te.label orelse "-" });
+        std.debug.print("\n", .{});
+    }
+    for (b.ctx_scope.items) |cl| {
+        if (cl.ty.len == 0) continue;
+        // A context value's head may be spelled fully qualified where the
+        // parameter names the simple classifier, or the other way round.
+        const have = receiverTypeSimple(cl.ty);
+        const same = std.mem.eql(u8, applicability.simpleName(have), applicability.simpleName(want));
+        if (!same and !receiverHeadIs(b, cl.ty, want)) continue;
+        if (b.resolve(cl.name)) |r| return r;
+        if (b.knowsOuter(cl.name)) {
+            const r = try b.loadCaptureHoisted(cl.name);
+            try b.bind(cl.name, r);
+            return r;
+        }
+    }
+    const r = try implicitReceiverOfType(b, ty);
+    if (runtime.envOnce("KLIO_DISPATCH_TRACE") != null and build.scratch_depth == 0) std.debug.print("[context-arg] want={s} -> {?d}\n", .{ want, if (r) |x| x.int() else null });
+    return r;
+}
+
+/// A callee's context parameter type with the call's explicit type arguments
+/// applied: `context(ctx: T) fun <T> f()` called as `f<Int>()` takes an `Int`.
+fn substitutedCtxType(b: *FuncBuilder, func: *const ir.Func, ty: []const u8, type_args: []const ast.TypeRef) []const u8 {
+    const declared = b.module.registry.func_type_params.get(func.id) orelse return ty;
+    for (declared.items, 0..) |tp, i| {
+        if (std.mem.eql(u8, tp, ty)) {
+            if (i < type_args.len) return type_args[i].name.name;
+            return ty;
+        }
+    }
+    return ty;
+}
+
+/// Hand the contextual callee `fid` its context arguments ahead of the call:
+/// every one resolved here statically, moved into one run and pushed as
+/// `context` entries. Null when the callee takes none, or when one cannot be
+/// named here, in which case the callee derives them all from its chain.
+pub fn contextHandoverBegin(b: *FuncBuilder, fid: ir.FuncId, type_args: []const ast.TypeRef) Allocator.Error!?u32 {
+    const f = b.module.funcById(fid) orelse return null;
+    const tys = f.x().ctx_types;
+    if (tys.len == 0) return null;
+    const regs = try b.allocator.alloc(Reg, tys.len);
+    defer b.allocator.free(regs);
+    for (tys, 0..) |ty, i| {
+        const want = substitutedCtxType(b, f, ty, type_args);
+        regs[i] = (try contextArgOfType(b, want)) orelse return null;
+    }
+    const first = b.allocReg();
+    var k: usize = 1;
+    while (k < tys.len) : (k += 1) _ = b.allocReg();
+    for (regs, 0..) |r, i| {
+        try b.push(.{ .Move = .{ .dst = Reg.from(first.int() + @as(u32, @intCast(i))), .src = r } });
+    }
+    const n: u32 = @intCast(tys.len);
+    try b.push(.{ .ContextPush = .{ .args = first, .n = n } });
+    return n;
+}
+
+/// Retract the context arguments `contextHandoverBegin` pushed, once the call is emitted.
+pub fn contextHandoverEnd(b: *FuncBuilder, handed: ?u32) Allocator.Error!void {
+    if (handed) |n| try b.push(.{ .ContextPop = .{ .n = n } });
 }
 
 /// `head` names `want` or a class extending it.
@@ -718,7 +813,7 @@ pub fn ctorSigRejectsArgs(b: *FuncBuilder, params: []const ir.Param, args: []con
         }
         const ak = ak_opt orelse continue;
         const pk = paramLitKind(params[i].ty.name) orelse continue;
-        if (ak != pk) return true;
+        if (type_probe_mod.litKindsDisagree(ak, pk)) return true;
     }
     return false;
 }

@@ -8,11 +8,16 @@ const FF = runtime.forest.ForestField;
 const build = @import("../build.zig");
 
 const expr_mod = @import("expr.zig");
+const probe_mod = @import("expr/probe.zig");
+const arg_shape_mod = @import("expr/arg_shape.zig");
 const decl_mod = @import("decl.zig");
 const helpers = @import("helpers.zig");
 const literals = @import("literals.zig");
 const ast_scan = @import("ast_scan.zig");
 const lambda_body = @import("lambda_body.zig");
+const implicit_walk = @import("expr/implicit_walk.zig");
+const emit_mod = @import("expr/emit.zig");
+const member_call_mod = @import("expr/member_call.zig");
 const thunks = @import("thunks.zig");
 
 const Allocator = std.mem.Allocator;
@@ -128,7 +133,13 @@ pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
         },
     }
     switch (stmt.*) {
-        .Expr => |*e| return try lowerExpr(b, e),
+        .Expr => |*e| {
+            // A lambda literal standing as a statement or a body's tail
+            // expression with no expected type has no receiver: only an
+            // expected function type gives one, and none reaches it here.
+            if (e.* == .Lambda and b.peekExpected() == null) b.recordLambdaArgNoRecv(e.span());
+            return try lowerExpr(b, e);
+        },
         .Decl => |d| switch (d.*) {
             .Property => |p| return lowerPropertyDecl(b, p),
             .Function => |*f| return lowerLocalFnDecl(b, f),
@@ -274,6 +285,9 @@ fn lowerPropertyInit(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!Re
                 } else |_| {}
             }
             const widened: ?Expr = if (p.ty) |ty| widenNumericLiteral(e, ty) else null;
+            // A lambda literal with no expected type has no receiver: only an
+            // expected function type can give it one.
+            if (p.ty == null and e.* == .Lambda) b.recordLambdaArgNoRecv(e.span());
             // A type-annotated initializer puts its declared type in tail position so a
             // reified inline call can infer its type argument.
             const prev = b.pushExpected(ast.unbox(p.ty));
@@ -330,6 +344,15 @@ fn recordInferredLocalType(b: *FuncBuilder, p: *const ast.Property, e: *const Ex
                 // Inside an ordinary member, `val self = this` is the declaring
                 // class, no extension receiver being in scope.
                 try b.setLocalDeclType(p.name.name, owner);
+            }
+            // `val block = this` in `(R.() -> T).f()` is a receiver-function
+            // value, which the type name (`Function1`) no longer says.
+            if (b.recv_is_receiver_fn) try b.setLocalDeclRecvFn(p.name.name);
+        },
+        // A literal names its own type: `var count = 0` is an `Int` local.
+        .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => {
+            if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                try b.setLocalDeclTypeOwned(p.name.name, ct);
             }
         },
         .Path => |path| if (path.segments.len == 1) {
@@ -409,6 +432,22 @@ fn recordCallInitLocalType(b: *FuncBuilder, p: *const ast.Property, e: *const Ex
         const was_nullable = ct.nullable;
         try b.setLocalDeclTypeOwned(p.name.name, ct);
         if (was_nullable) try b.setLocalDeclNullable(p.name.name);
+    } else if (b.module.eagerTypeOf(e.span())) |th| {
+        // The checker's answer, where the derivers have none: a call whose
+        // result type is a solved type argument (`remember { Box() }`) is
+        // written nowhere the derivers read. A generic or type-parameter head
+        // is worse than none, as it is for an argument.
+        const th_head = expr_mod.typeHead(std.mem.trimEnd(u8, th.name, "?"));
+        const bare_tp_head = (th_head.len > 0 and th_head.len <= 2 and std.ascii.isUpper(th_head[0])) or
+            b.isTypeParam(th_head) or ir.parseClassTypeParamIdentity(th_head) != null;
+        if (!bare_tp_head and !arg_shape_mod.headDeclaresTypeParams(b, th.name)) {
+            try b.setLocalDeclTypeOwned(p.name.name, .{
+                .name = try b.allocator.dupe(u8, th.name),
+                .nullable = th.nullable,
+                .args = &.{},
+            });
+            if (th.nullable) try b.setLocalDeclNullable(p.name.name);
+        }
     } else if (vt) |w| {
         if (std.mem.eql(u8, w, p.name.name))
             std.debug.print("[valty] {s} = <null> mod={x} classes={d}\n", .{ p.name.name, @intFromPtr(b.module) & 0xffff, b.module.classes.items.len });
@@ -618,6 +657,16 @@ fn markRecursiveLocalExtFn(ctx: *LocalFnCtx) Allocator.Error!void {
 /// dedicated cell before the body lowers; a call inside any sibling's body
 /// then selects the applicable overload instead of recursing through the
 /// shared plain-name self-cell.
+/// The index of the local function's last user parameter when it is a
+/// function type, the composable transform's trailing pair skipped.
+fn localFnBlockParam(f: *const ast.Function) ?usize {
+    var n = f.params.len;
+    while (n > 0 and f.params[n - 1].name.name.len != 0 and f.params[n - 1].name.name[0] == '$') n -= 1;
+    if (n == 0) return null;
+    if (f.params[n - 1].is_vararg or f.params[n - 1].ty.function == null) return null;
+    return n - 1;
+}
+
 fn registerMangledOverload(ctx: *LocalFnCtx) Allocator.Error!void {
     const b = ctx.b;
     const f = ctx.f;
@@ -658,6 +707,12 @@ fn registerMangledOverload(ctx: *LocalFnCtx) Allocator.Error!void {
         try b.markLocalExtFn(mangled, @intCast(@min(f.params.len - recv_off, 127)));
     }
     if (f.params.len != 0) try b.setLocalFnParamTys(mangled, ov_tys);
+    // A trailing block bound to this function takes the shape its parameter
+    // declares, as a call of a top-level function records it.
+    if (localFnBlockParam(f)) |bp| {
+        const recv: ?ir.TypeRef = if (f.params[bp].ty.function.?.receiver) |*r| try expr_mod.loweredOwnedLocalTypeRef(b, r) else null;
+        try b.setLocalFnBlockRecv(mangled, recv);
+    }
     if (f.return_type) |rt| {
         try b.setLocalFnReturnTy(mangled, try expr_mod.loweredOwnedLocalTypeRef(b, rt));
     } else if (f.body != null and f.body.? == .Expr) {
@@ -801,7 +856,6 @@ fn publishPendingContextParams(ctx: *LocalFnCtx) void {
     const b = ctx.b;
     const f = ctx.f;
     if (f.context_params.len != 0) {
-        b.module.has_context_decls = true;
         b.module.pending_ctx = .{ .params = f.context_params, .type_params = f.type_params };
     }
 }
@@ -1058,6 +1112,7 @@ fn registerLocalFnDefaults(
                 "__default_local_{s}_{s}",
                 .{ f.name.name, p.name.name },
             );
+            b.module.pending_thunk_expected = p.ty;
             const fid = try lowerExprAsParamThunk(
                 b.module,
                 param_names[0..bind_upto],
@@ -1423,6 +1478,16 @@ fn emitCompoundSingleElement(
             const args_start = b.allocReg();
             try b.push(.{ .Move = .{ .dst = args_start, .src = v } });
             const dst = b.allocReg();
+            if (try operatorSlotRoot(b, target, single, 1)) |root| {
+                try b.push(.{ .CallVirtual = .{
+                    .dst = dst,
+                    .receiver = cur,
+                    .slot = ir.MethodSlotId.fromFunc(root),
+                    .args = args_start,
+                    .n_args = 1,
+                } });
+                return true;
+            }
             const nm = try b.module.internConst(b.allocator, .{ .String = single });
             try b.push(.{ .CallMember = .{
                 .dst = dst,
@@ -1504,6 +1569,19 @@ fn emitCompoundAssignOperator(
         const args_start = b.allocReg();
         try b.push(.{ .Move = .{ .dst = args_start, .src = v } });
         const dst = b.allocReg();
+        // Binding does not change the fall-through: the slot is taken only when
+        // the target's own class provably declares the operator, and the raise
+        // that falls through to the rebind path is the case where it does not.
+        if (try operatorSlotRoot(b, target, method_name, 1)) |root| {
+            try b.push(.{ .CallVirtual = .{
+                .dst = dst,
+                .receiver = recv,
+                .slot = ir.MethodSlotId.fromFunc(root),
+                .args = args_start,
+                .n_args = 1,
+            } });
+            return true;
+        }
         const nm = try b.module.internConst(b.allocator, .{ .String = method_name });
         try b.push(.{ .CallMember = .{
             .dst = dst,
@@ -1674,13 +1752,16 @@ pub fn cacheIndexTarget(b: *FuncBuilder, ix: *const @FieldType(ast.Expr, "Index"
     const recv_reg = try lowerExpr(b, ix.receiver);
     try b.bind("$lv$recv", recv_reg);
     const recv = try b.allocator.create(Expr);
-    recv.* = try cachedPath(b, "$lv$recv", ix.span);
+    // Each cached read stands for the expression it replaces and keeps that
+    // expression's span: a type recorded for the whole `a[i]` is the
+    // element's, and the receiver read must not answer with it.
+    recv.* = try cachedPath(b, "$lv$recv", ix.receiver.span());
     const args = try b.allocator.alloc(Expr, ix.args.len);
     for (ix.args, 0..) |*a, i| {
         const reg = try lowerExpr(b, a);
         const name = try std.fmt.allocPrint(b.allocator, "$lv$arg{d}", .{i});
         try b.bind(name, reg);
-        args[i] = try cachedPath(b, name, ix.span);
+        args[i] = try cachedPath(b, name, a.span());
     }
     return .{ .Index = .{ .receiver = recv, .args = args, .span = ix.span } };
 }
@@ -1798,40 +1879,79 @@ fn storeCombinedToBareName(
             break :blk b.module.registry.private_shadow_props.getKey(probe) orelse seg;
         };
         const field = try b.module.internConst(b.allocator, .{ .String = store_name });
+        // A bare write to an own property lands in the same slot a bare read
+        // serves, so it claims on the same conditions plus the setter one.
+        const own_claim = if (std.mem.eql(u8, store_name, seg))
+            expr_mod.ownMemberWriteSlot(b, seg, p.span.file)
+        else
+            null;
         try b.push(.{ .SetField = .{
             .receiver = this_reg,
             .field = field,
             .value = combined,
+            .own_cls = if (own_claim) |c| c.cls else null,
+            .own_slot = if (own_claim) |c| c.slot else 0,
         } });
     } else if (b.capturesThisSlot() or b.resolve("this") != null) {
         // An unqualified write whose name is not a local, param,
         // captured-outer or own-member is, by Kotlin scoping, either a
         // property of the receiver, a member or an extension-property setter
-        // on its type or a supertype, or a top-level binding. Decide at
-        // runtime, symmetric to the read side's `LoadFromThisOrGlobal`:
-        // capture `this` on demand, then `StoreToThisOrGlobal` sets the
-        // receiver's property when present.
-        const this_idx = try b.recordCapture("this");
-        const name_c = try b.module.internConst(b.allocator, .{ .String = seg });
-        expr_mod.orEmitAudit(b, "bare_name_assign", "StoreToThisOrGlobal", seg);
-        try b.push(.{ .StoreToThisOrGlobal = .{
-            .this_idx = this_idx,
-            .name = name_c,
-            .value = combined,
-            // Hand over the receiver register when lowering has one: in a
-            // spliced inline body it is the only way the runtime can reach
-            // the receiver. Ownership is still checked at run time, so
-            // passing it cannot capture a write the receiver does not declare.
-            .recv = b.resolve("this"),
-        } });
+        // on its type or a supertype, or a top-level binding. The static walk
+        // decides it from the receivers in scope; only where an input is
+        // missing does the write defer to the runtime's walk, symmetric to
+        // the read side's `LoadFromThisOrGlobal`.
+        switch (try implicit_walk.walk(b, seg, null, .property, "bare_write")) {
+            .member => |hit| {
+                expr_mod.orEmitAudit(b, "bare_name_assign_walked", "SetField", seg);
+                try implicit_walk.emitWrite(b, hit, seg, combined);
+            },
+            .global => {
+                if (try emitTopLevelSetterCall(b, seg, p.segments[0].span.file.int(), combined)) return;
+                expr_mod.orEmitAudit(b, "bare_name_assign_walked", "StoreGlobal", seg);
+                const target_name = expr_mod.filePrivatePropRename(b, seg, p.segments[0].span.file.int()) orelse seg;
+                const n = try b.module.internConst(b.allocator, .{ .String = target_name });
+                try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined, .slot = expr_mod.topLevelPropSlot(b, seg, p.segments[0].span.file.int()) } });
+            },
+            .undecided => {
+                const this_idx = try b.recordCapture("this");
+                const name_c = try b.module.internConst(b.allocator, .{ .String = seg });
+                expr_mod.orEmitAudit(b, "bare_name_assign", "StoreToThisOrGlobal", seg);
+                try b.push(.{ .StoreToThisOrGlobal = .{
+                    .this_idx = this_idx,
+                    .name = name_c,
+                    .value = combined,
+                    // Hand over the receiver register when lowering has one: in
+                    // a spliced inline body it is the only way the runtime can
+                    // reach the receiver. Ownership is still checked at run
+                    // time, so passing it cannot capture a write the receiver
+                    // does not declare.
+                    .recv = b.resolve("this"),
+                } });
+            },
+        }
     } else {
-        // Top-level binding: route through StoreGlobal so the tree-walker
-        // setter or delegate fires. A renamed file-private property writes
-        // its per-file global.
+        // Top-level binding: a custom setter is called; the rest route through
+        // StoreGlobal so the tree-walker delegate fires. A renamed file-private
+        // property writes its per-file global.
+        if (try emitTopLevelSetterCall(b, seg, p.segments[0].span.file.int(), combined)) return;
         const target_name = expr_mod.filePrivatePropRename(b, seg, p.segments[0].span.file.int()) orelse seg;
         const n = try b.module.internConst(b.allocator, .{ .String = target_name });
-        try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined } });
+        try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined, .slot = expr_mod.topLevelPropSlot(b, seg, p.segments[0].span.file.int()) } });
     }
+}
+
+/// A write to a top-level property with a custom setter calls the setter
+/// thunk with the value, which is what the by-name write ran.
+fn emitTopLevelSetterCall(b: *FuncBuilder, name: []const u8, file: u32, value: Reg) Allocator.Error!bool {
+    const fid = expr_mod.topLevelAccessorTarget(b, name, file, .setter) orelse return false;
+    expr_mod.orEmitAudit(b, "bare_name_assign", "Call", name);
+    const arg = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = arg, .src = value } });
+    const dst = b.allocReg();
+    const ctx_handed = try probe_mod.contextHandoverBegin(b, fid, &.{});
+    try b.push(.{ .Call = .{ .dst = dst, .func = fid, .args = arg, .n_args = 1, .exact = true } });
+    try probe_mod.contextHandoverEnd(b, ctx_handed);
+    return true;
 }
 
 /// Write-through for a `var x by D` delegate: when the hidden delegate
@@ -1867,18 +1987,74 @@ fn storeCombinedToMember(
         break :blk b.module.registry.private_shadow_props.getKey(probe) orelse m.name.name;
     };
     const field = try b.module.internConst(b.allocator, .{ .String = store_field_name });
-    // `super.prop = v` lowers to a SetField on `this`, super not being a
-    // value, so the setter search would find the overriding setter and
-    // re-enter it. Carry the writing class so the search starts at its
-    // supertypes, as a `super.prop` read does.
-    const super_owner: ?ir.ConstId = blk: {
-        if (m.receiver.* != .Super) break :blk null;
-        const oc = if (m.receiver.Super.label) |l|
+    // The declared slot this write lands in, on the read claim's conditions: a
+    // plain slot has no setter, so the store is the whole operation. A write
+    // under a different spelling than the property (a private shadow cell) is
+    // not the claimed slot, and `super.prop = v` starts its search above this
+    // class, so neither claims.
+    const write_claim: ?expr_mod.FieldSlotClaim = blk: {
+        if (m.receiver.* == .Super) break :blk null;
+        if (!std.mem.eql(u8, store_field_name, m.name.name)) break :blk null;
+        break :blk expr_mod.receiverWriteSlot(b, m.receiver, m.name.name);
+    };
+    // `super.prop = v` names the supertype's setter, or its cell: a virtual
+    // write would find the overriding setter and re-enter it. The setter is
+    // a direct call when it exists as this body lowers; otherwise the link
+    // pass settles the write once every accessor does, into that call or
+    // into the base's cell. The receiver and value are copied into adjacent
+    // registers so the settled call owns its argument run.
+    if (m.receiver.* == .Super) {
+        const sup = m.receiver.Super;
+        const owner: []const u8 = if (sup.label) |l|
             expr_mod.scopeTypeRename(b, l.name, l.span.file.int()) orelse l.name
         else
-            b.ownerClass() orelse break :blk null;
-        break :blk try b.module.internConst(b.allocator, .{ .String = oc });
-    };
+            b.ownerClass() orelse {
+                _ = try member_call_mod.emitUnboundSuper(b, "?", m.name.name);
+                return;
+            };
+        const qual: ?[]const u8 = if (sup.qualifier) |qt| qt.name.name else null;
+        const recv_slot = b.allocReg();
+        const val_slot = b.allocReg();
+        try b.push(.{ .Move = .{ .dst = recv_slot, .src = recv } });
+        try b.push(.{ .Move = .{ .dst = val_slot, .src = combined } });
+        const res = b.allocReg();
+        if (emit_mod.superPropertyAnswer(b, owner, qual, m.name.name, .write)) |ans| {
+            switch (ans) {
+                .accessor => |fid| try b.push(.{ .Call = .{
+                    .dst = res,
+                    .func = fid,
+                    .trailing_lambda = false,
+                    .args = recv_slot,
+                    .n_args = 2,
+                    .arg_names = &.{},
+                    .type_args = &.{},
+                    .exact = true,
+                } }),
+                .cell => |c| try b.push(.{ .SetField = .{
+                    .receiver = recv_slot,
+                    .field = field,
+                    .value = val_slot,
+                    .own_cls = c.cid,
+                    .own_slot = c.idx,
+                    .own_kind = .super_slot,
+                } }),
+            }
+            return;
+        }
+        const start = emit_mod.superStartClass(b, owner, qual) orelse {
+            _ = try member_call_mod.emitUnboundSuper(b, owner, m.name.name);
+            return;
+        };
+        try b.push(.{ .SetField = .{
+            .receiver = recv_slot,
+            .field = field,
+            .value = val_slot,
+            .own_cls = start,
+            .own_slot = res.int() | (if (qual != null) ir.SUPER_WRITE_QUALIFIED else 0),
+            .own_kind = .super_target,
+        } });
+        return;
+    }
     if (m.safe) {
         // `a?.b = v` stores only when the receiver is non-null; dropping
         // the store entirely lost updates on non-null parents.
@@ -1896,6 +2072,8 @@ fn storeCombinedToMember(
             .receiver = recv,
             .field = field,
             .value = combined,
+            .own_cls = if (write_claim) |c| c.cls else null,
+            .own_slot = if (write_claim) |c| c.slot else 0,
         } });
         b.terminate(.{ .Goto = join });
         b.switchTo(join);
@@ -1905,7 +2083,8 @@ fn storeCombinedToMember(
         .receiver = recv,
         .field = field,
         .value = combined,
-        .super_owner = super_owner,
+        .own_cls = if (write_claim) |c| c.cls else null,
+        .own_slot = if (write_claim) |c| c.slot else 0,
     } });
 }
 
@@ -1935,15 +2114,93 @@ fn storeCombinedToIndex(
     }
     try b.push(.{ .Move = .{ .dst = val_slot, .src = combined } });
     const dst = b.allocReg();
+    const n_args: u32 = @as(u32, @intCast(n_keys)) + 1;
+    if (try operatorSlotRoot(b, idx.receiver, "set", n_keys + 1)) |root| {
+        try b.push(.{ .CallVirtual = .{
+            .dst = dst,
+            .receiver = recv,
+            .slot = ir.MethodSlotId.fromFunc(root),
+            .args = key_start,
+            .n_args = n_args,
+        } });
+        return;
+    }
     const nm = try b.module.internConst(b.allocator, .{ .String = "set" });
+    // The read side records the receiver's static head and this arm did not,
+    // so every `a[i] = v` was a site that could not say what it was writing
+    // to — 2 034 of them on a compose program, none with a head, while every
+    // one of the 4 742 reads had one.
+    const static_recv: ?ir.ConstId = blk: {
+        const t = expr_mod.argDeclTypeRefLazy(b, idx.receiver) orelse break :blk null;
+        const head = std.mem.trimEnd(u8, t.name, "?");
+        if (head.len == 0) break :blk null;
+        break :blk try b.module.internConst(b.allocator, .{ .String = head });
+    };
     try b.push(.{ .CallMember = .{
         .dst = dst,
         .receiver = recv,
         .name = nm,
         .args = key_start,
-        .n_args = @as(u32, @intCast(n_keys)) + 1,
-        .extra = try b.memberExtra(.{ .arg_names = &.{} }),
+        .n_args = n_args,
+        .extra = try b.memberExtra(.{ .arg_names = &.{}, .static_recv = static_recv }),
     } });
+}
+
+/// `m[k] = v` is the `set` operator, fixed by the convention exactly as `get`
+/// is on the read side. Unlike the read side, this arm asked the receiver no
+/// question at all.
+///
+/// The assigned value is already in a register, so the member gate — which
+/// lowers its own arguments — cannot serve this site. The slot comes from the
+/// same resolution the gate would make, under a stricter admission: the
+/// receiver's own class must declare exactly one `set` of this arity, so the
+/// assigned value's unknown static type cannot pick a different overload.
+///
+/// Only an interpreted `set` binds. An indexed store on a builtin container is
+/// served off the receiver's tag with no dispatch at all, and binding one to
+/// its host-backed declaration would trade a tag test for an activation.
+fn operatorSlotRoot(
+    b: *FuncBuilder,
+    recv_expr: *const Expr,
+    name: []const u8,
+    arity: usize,
+) Allocator.Error!?ir.FuncId {
+    const declared = expr_mod.argDeclTypeRefLazy(b, recv_expr);
+    var inferred: ?ir.TypeRef = if (declared == null) try expr_mod.staticExprTypeRef(b, recv_expr) else null;
+    defer if (inferred) |*t| t.deinit(b.allocator);
+    const ty = declared orelse inferred orelse return null;
+    const cid = expr_mod.staticTypeClassId(b, ty) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    if (!ownDeclaresOneOfArity(b, cid, name, arity)) return null;
+    const r = b.module.resolveMemberCall(cid, name, &.{}, .{
+        .caller_file = exprSpan(recv_expr).file,
+        .lexical_owner = null,
+        .actual_type_param_bounds = &.{},
+        .receiver_type = ty,
+    });
+    if (r.dispatch != .virtual) return null;
+    const fid = r.target orelse return null;
+    const f = b.module.funcById(fid) orelse return null;
+    if (!ir.Module.funcHasImplicitThis(f)) return null;
+    if (ir.Module.funcUserArity(f) != arity) return null;
+    if (!b.module.declaredWithBody(fid, f)) return null;
+    return fid;
+}
+
+/// Whether the class itself declares exactly one member `name` taking `arity`
+/// value parameters. Inherited declarations are not counted, which keeps the
+/// check to what one lookup can prove.
+fn ownDeclaresOneOfArity(b: *FuncBuilder, cid: ir.ClassId, name: []const u8, arity: usize) bool {
+    const fqn = b.module.classes.items[cid.int()].fqn;
+    var seen: usize = 0;
+    for (b.module.memberDecls(fqn, name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!ir.Module.funcHasImplicitThis(f)) continue;
+        if (ir.Module.funcUserArity(f) != arity) continue;
+        seen += 1;
+        if (seen > 1) return false;
+    }
+    return seen == 1;
 }
 
 fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Reg {
@@ -1960,11 +2217,17 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
         const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{oc});
         if (!visible.contains(label)) {
             if (b.resolve("this")) |this_reg| {
-                const nm = try b.module.internConst(b.allocator, .{ .String = oc });
-                const dst = b.allocReg();
-                try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm, .soft = true } });
-                owner_label = label;
-                owner_reg = dst;
+                if (try implicit_walk.instanceOfClassReg(b, oc)) |r| {
+                    owner_label = label;
+                    owner_reg = r;
+                } else {
+                    expr_mod.orEmitAudit(b, "local_class_dispatch_owner", "QualifiedThis", oc);
+                    const nm = try b.module.internConst(b.allocator, .{ .String = oc });
+                    const dst = b.allocReg();
+                    try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm, .soft = true } });
+                    owner_label = label;
+                    owner_reg = dst;
+                }
             }
         }
     }

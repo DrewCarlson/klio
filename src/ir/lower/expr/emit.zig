@@ -34,6 +34,7 @@ const member_mod = @import("member.zig");
 const staticTypeDeclaresProp = member_mod.staticTypeDeclaresProp;
 
 const lambda_mod = @import("lambda.zig");
+const implicit_walk = @import("implicit_walk.zig");
 const argFnArities = lambda_mod.argFnArities;
 const argFnGenericFlags = lambda_mod.argFnGenericFlags;
 const argLambdaBroadMasks = lambda_mod.argLambdaBroadMasks;
@@ -53,6 +54,7 @@ const lastArgIsLambda = call_mod.lastArgIsLambda;
 const resolveThisForBareCall = call_mod.resolveThisForBareCall;
 
 const static_type_mod = @import("static_type.zig");
+const type_probe = @import("type_probe.zig");
 const staticExprTypeRef = static_type_mod.staticExprTypeRef;
 
 const bare_call_mod = @import("bare_call.zig");
@@ -60,6 +62,7 @@ const allNull = bare_call_mod.allNull;
 const lowerImplicitThisCall = bare_call_mod.lowerImplicitThisCall;
 const lowerUnresolvedBareCall = bare_call_mod.lowerUnresolvedBareCall;
 
+const core_inst = @import("../../core/inst.zig");
 const probe_mod = @import("probe.zig");
 const inReceiverContext = probe_mod.inReceiverContext;
 const isNonExt = probe_mod.isNonExt;
@@ -317,6 +320,7 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
         if (try spliceReifiedTypeArgs(b, func_id, args.len)) |stamped| type_args = stamped;
     }
     const dst = b.allocReg();
+    const ctx_handed = try probe_mod.contextHandoverBegin(b, func_id, ast_type_args);
     try b.push(.{ .Call = .{
         .dst = dst,
         .func = func_id,
@@ -327,6 +331,7 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
         .type_args = type_args,
         .exact = was_cast,
     } });
+    try probe_mod.contextHandoverEnd(b, ctx_handed);
     return dst;
 }
 
@@ -350,7 +355,7 @@ pub fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
 /// Whether an extension property or function named `name` is declared for `head`
 /// or a registered supertype: its getter has a leading `this` whose declared
 /// receiver the head is or extends.
-fn extensionPropOnHead(b: *FuncBuilder, head_in: []const u8, name: []const u8) bool {
+pub fn extensionPropOnHead(b: *FuncBuilder, head_in: []const u8, name: []const u8) bool {
     const head = typeHead(std.mem.trimEnd(u8, head_in, "?"));
     if (head.len == 0) return false;
     const simple = applicability.simpleName(head);
@@ -437,6 +442,12 @@ pub fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg
 
 /// The `CallMemberOrGlobal` emit form: member-first dispatch on the runtime
 /// implicit receiver, falling back to the resolved global. A resolved extension a
+/// The lexical owner's class id, for asking what its hierarchy declares.
+pub fn ownerClassIdOf(b: *FuncBuilder, file: ir.FileId) ?ir.ClassId {
+    const owner = b.ownerClass() orelse return null;
+    return b.module.classIdIndexed(owner, b.self_package, file) orelse b.module.classId(owner);
+}
+
 /// member could shadow defers to the pure member-first walk instead.
 pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
@@ -460,6 +471,18 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     {
         if (try lowerImplicitThisCall(b, callee, call.args, call.arg_names, ast_type_args)) |r| return r;
     }
+    if (audit_mod.orAuditOn() and callee.Path.segments.len == 1) {
+        const ocid = ownerClassIdOf(b, callee.Path.segments[0].span.file);
+        std.debug.print("[KLIO_OR_AUDIT] gate name={s} this={} own={} applicable={} rejects={} inherited={} owner={s}\n", .{
+            name0,
+            b.resolve("this") != null,
+            b.hasOwnMember(name0),
+            b.ownFunctionApplicable(name0, call.args.len),
+            ownMemberRejectsLambdas(b, name0, call.args),
+            ocid != null and b.module.classHierarchyDeclaresMember(ocid.?, name0),
+            b.ownerClass() orelse "-",
+        });
+    }
 
     if (!isNonExt(b, func_id)) {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, func_id)) |r| return r;
@@ -475,6 +498,28 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     {
         orEmitAudit(b, "bare_call_no_receiver_to_shadow", "Call", name0);
         return emitCall(b, expr, func_id, was_cast);
+    }
+    // The walk the deferred form exists to run, run here: a receiver in scope
+    // that declares the sole callable of this arity takes the call, and none
+    // declaring it at all leaves the committed global as the only candidate.
+    // Only where the resolver's pick is the sole candidate is a proven-global
+    // verdict the whole answer: with several, the runtime still ranks the
+    // overload by the values, which is a question the walk does not ask.
+    var walk_global = false;
+    switch (try implicit_walk.walkCall(b, .{ .name = name0, .span = callee.Path.segments[0].span }, args, ast_arg_names, "shadowable")) {
+        .global => {
+            // A direct call needs a body to run: the deferred form's global
+            // leg resolves a bodyless declaration by name at run time.
+            const cands = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, args.len);
+            const has_body = if (b.module.funcById(func_id)) |gf| gf.hasBody() else false;
+            walk_global = has_body and (was_cast or (cands != null and cands.?.len == 1));
+        },
+        // A receiver whose member accepts the arguments takes the call from
+        // the committed global, in Kotlin's scope order.
+        .member => |hit| {
+            if (try implicit_walk.lowerWalkedMemberCall(b, hit, .{ .name = name0, .span = callee.Path.segments[0].span }, args, ast_arg_names, ast_type_args, "shadowable")) |r| return r;
+        },
+        .undecided => {},
     }
 
     const this_idx = try b.recordCapture("this");
@@ -494,6 +539,10 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
             // Without the candidate's receiver head, bare ext-overload selection
             // inside the block has no evidence and picks the wrong sibling.
             try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, recv_off);
+            // A candidate whose parameters do not align with the arguments
+            // (a shorter overload than the runtime will pick) shaped nothing;
+            // the namesakes hosting the block can still agree on its receiver.
+            try lambda_mod.recordTrailingLambdaConsensus(b, name0, args, ast_arg_names, ast_type_args, false);
             break :blk try argFnArities(b, f, args, ast_arg_names, recv_off);
         }
         break :blk null;
@@ -531,7 +580,6 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
-    orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
     const cmg_static_recv: ?ConstId = try cmgStaticRecv(b);
     var type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
     // The deferred form keeps the reified splice substitution too, or a spliced
@@ -539,6 +587,31 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     if (type_args.len == 0) {
         if (try spliceReifiedTypeArgs(b, func_id, args.len)) |stamped| type_args = stamped;
     }
+    if (walk_global) {
+        // The same arguments the deferred form would carry, bound to the one
+        // declaration the walk proved is the only candidate.
+        orEmitAudit(b, "bare_call_walked_global", "Call", name0);
+        if (runtime.envOnce("KLIO_WALK_PROBE") != null) {
+            const gf = b.module.funcById(func_id);
+            std.debug.print("[walk-global-call] name={s} fid={d} fqn={s} hasBody={} nparams={d} nargs={d} type_args={d} trailing={}\n", .{
+                name0, func_id.int(), if (gf) |f| f.fqn else "?", if (gf) |f| f.hasBody() else false, if (gf) |f| f.params.len else 0, run[1], type_args.len, b.callTrailingLambda(),
+            });
+        }
+        const ctx_handed = try probe_mod.contextHandoverBegin(b, func_id, ast_type_args);
+        try b.push(.{ .Call = .{
+            .dst = dst,
+            .func = func_id,
+            .trailing_lambda = b.callTrailingLambda(),
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+            .type_args = type_args,
+            .exact = was_cast,
+        } });
+        try probe_mod.contextHandoverEnd(b, ctx_handed);
+        return dst;
+    }
+    orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
     try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
         .dst = dst,
         .this_idx = this_idx,
@@ -559,13 +632,19 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
 /// The class id a bare classifier read binds, innermost first: a nested class of
 /// the enclosing chain, under its lifted `Outer$Name` key, beats the
 /// package-scope pick.
-pub fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
+pub fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) Allocator.Error!?ir.ClassId {
     if (nestedClassIdAtLexicalSite(b, name0)) |cid| return cid;
     if (b.module.classIdExactImport(name0, file)) |cid| return cid;
-    // A receiver context with an unknown owner chain may still see a nested
-    // classifier the flat index cannot rank, so decline and let the name-keyed
-    // runtime path own the scoped resolution.
-    if (inReceiverContext(b)) return null;
+    // A receiver in scope may nest a classifier of the name, which outranks
+    // the flat index's pick; the walk says whether one does, and only a
+    // receiver it cannot see leaves the read to the name.
+    if (inReceiverContext(b)) {
+        switch (try implicit_walk.walk(b, name0, null, .classifier, "class_name_scoped")) {
+            .member => |hit| return implicit_walk.nestedClassifierOnChain(b, hit.cid, name0, 0),
+            .global => {},
+            .undecided => return null,
+        }
+    }
     return b.module.classIdIndexed(name0, b.self_package, file);
 }
 
@@ -600,6 +679,478 @@ pub fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassI
                 }
             }
         }
+    }
+    return null;
+}
+
+/// The innermost implicit receiver with an applicable member of this name,
+/// as a register, or null when no receiver can be proven to hold one.
+///
+/// Kotlin ranks implicit receivers innermost-first and takes the first with an
+/// APPLICABLE member, which is the ranking `EnclosingPush` exists to let the
+/// runtime perform. `subject_binds` is the same stack, kept by lowering with
+/// each subject's head beside its register, so the ranking can be done here.
+///
+/// Applicability without argument types comes from the arity key: a class
+/// whose (simple name, name, arity) names exactly one declaration has nothing
+/// to pick between. A same-named extension that could serve the receiver
+/// withdraws the answer, because a member wins only by being applicable.
+pub fn implicitReceiverDeclaring(
+    b: *FuncBuilder,
+    name: []const u8,
+    arity: usize,
+) Allocator.Error!?struct { reg: Reg, fid: ir.FuncId } {
+    const sbs = b.subject_binds.items;
+    var i = sbs.len;
+    while (i > 0) {
+        i -= 1;
+        const h = sbs[i].head orelse return null;
+        if (declaredSlotOn(b, h, name, arity)) |fid| return .{ .reg = sbs[i].reg, .fid = fid };
+    }
+    const own = b.recvTy() orelse b.enclosingRecvTy() orelse b.ownerClass() orelse return null;
+    const fid = declaredSlotOn(b, own, name, arity) orelse return null;
+    // Beneath the subjects. Inside a splice `this` IS the innermost subject,
+    // which the walk just ruled out, so the declaration's own receiver is the
+    // one bound before any subject did: `with(sb) { eachPlain { } }` names
+    // the enclosing class's method on the enclosing instance, not on `sb`.
+    if (sbs.len != 0) {
+        if (sbs[0].prior_this) |prior| return .{ .reg = prior, .fid = fid };
+        return null;
+    }
+    // An extension splice binds `this` to the spliced receiver without a
+    // subject bind, so with one active the ambient `this` is not the
+    // declaration's own receiver and nothing here records what is:
+    // `takeSnapshot().run { clearWatchSet(c) }` names the enclosing class's
+    // method, and `this` there is the snapshot.
+    if (b.spliceRecvTy() != null) return null;
+    if (b.resolve("this")) |this_reg| return .{ .reg = this_reg, .fid = fid };
+    if (b.capturesThisSlot()) return .{ .reg = try b.loadCaptureHoisted("this"), .fid = fid };
+    return null;
+}
+
+/// The sole declaration of `name` at `arity` on `head`, or null.
+///
+/// The registry keys a member declaration by the owner's SIMPLE name, so a
+/// key answers for every class of that name and two in different packages
+/// collide without either overwriting the other. The declaration found must
+/// therefore be checked to belong to this head's class or one of its
+/// ancestors; skipping that bound `clearWatchSet` on a `ReadonlySnapshot`
+/// whose chain never declared it.
+pub fn declaredSlotOn(b: *FuncBuilder, head_in: []const u8, name: []const u8, arity: usize) ?ir.FuncId {
+    const fid = declaredSlotOnNoExt(b, head_in, name, arity) orelse return null;
+    if (b.module.extensionCouldServe(classIdOfHead(b, head_in), name)) return null;
+    return fid;
+}
+
+pub fn classIdOfHead(b: *FuncBuilder, head_in: []const u8) ?ir.ClassId {
+    var head = std.mem.trimEnd(u8, head_in, "?");
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (head.len == 0) return null;
+    const simple = if (std.mem.findScalarLast(u8, head, '.')) |i| head[i + 1 ..] else head;
+    return b.module.classIdByFqn(head) orelse b.module.uniqueClassIdBySimpleName(simple);
+}
+
+/// As `declaredSlotOn`, without the extension question. A `super.f()` names a
+/// member by the language rule; no extension can take it.
+pub fn declaredSlotOnNoExt(b: *FuncBuilder, head_in: []const u8, name: []const u8, arity: usize) ?ir.FuncId {
+    var head = std.mem.trimEnd(u8, head_in, "?");
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (head.len == 0) return null;
+    const simple = if (std.mem.findScalarLast(u8, head, '.')) |i| head[i + 1 ..] else head;
+    const cid = b.module.classIdByFqn(head) orelse b.module.uniqueClassIdBySimpleName(simple) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    // The table is keyed by `Class.name`, which is NOT the FQN's last
+    // segment: two classes sharing a simple name are collision-mangled, and
+    // compose ships two `changelist.Operation`s registered as
+    // `Operation$f206` and `Operation$f222`. Keying on the tail looked up a
+    // name no writer ever used.
+    const keyed = b.module.classes.items[cid.int()].name;
+    if (keyed.len == 0) return null;
+    var kb: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "{s}\x00{s}\x00{d}", .{ keyed, name, arity }) catch return null;
+    if (b.module.registry.member_method_ambiguous.contains(key)) return null;
+    const fid = b.module.registry.member_method_fids.get(key) orelse return null;
+    const owner = (b.module.decl_sigs.get(fid.int()) orelse return null).enclosing_class orelse return null;
+    if (owner.int() != cid.int() and !(b.module.classIsAKnown(cid, owner) orelse false)) return null;
+    return fid;
+}
+
+/// The declaration `super.name(...)` names, given the class the super
+/// reference resolves against and whether it was qualified.
+///
+/// A super call is not virtual: the language fixes the target, so it binds a
+/// direct `Call`. An unqualified `super` names the SUPERCLASS of the
+/// enclosing class; a qualified one names the supertype it spells, which
+/// `superBase` has already resolved into the owner it returns. The
+/// declaration must carry a body, since `super` to an abstract member is not
+/// a call Kotlin allows.
+/// The supertype a `super` reference names. Qualified, it is the one spelled,
+/// which `superBase` already resolved into the owner it returned. Unqualified
+/// it is the superclass, and with several supertypes Kotlin allows the plain
+/// form only when ONE of them declares the member — so the sole declarer is
+/// the answer and anything else declines.
+pub const SuperMemberKind = enum { method, property };
+
+pub fn superTypeFor(
+    b: *FuncBuilder,
+    owner_head: []const u8,
+    qualifier: ?[]const u8,
+    name: []const u8,
+    arity: usize,
+    kind: SuperMemberKind,
+) ?ir.ClassId {
+    // `super<K>` names the supertype outright. `super@Outer` does NOT: the
+    // label picks which enclosing INSTANCE the call runs against, and
+    // `superBase` has already resolved it into the class whose SUPERTYPES
+    // the reference means. Treating a label as a qualifier bound
+    // `super@A.foo()` to `A.foo` itself, which called the override instead
+    // of the base.
+    var cbuf: [16]ir.ClassId = undefined;
+    const sups = superCandidates(b, owner_head, qualifier, &cbuf) orelse return null;
+    if (sups.len == 0) return null;
+    // One supertype is the answer on its own. Asking whether it declares the
+    // member is the NEXT question, and answering it here made a lookup that
+    // cannot see the declaration withdraw the supertype too.
+    if (sups.len == 1) return sups[0];
+    var buf: [256]u8 = undefined;
+    var picked: ?ir.ClassId = null;
+    for (sups) |sid| {
+        if (sid.int() >= b.module.classes.items.len) return null;
+        const declares = switch (kind) {
+            .method => nearestDeclOnChain(b, sid, name, arity) != null or chainDeclaresMethod(b, sid, name),
+            .property => b.module.declaredGetterOn(sid, name, &buf) != null,
+        };
+        if (!declares) continue;
+        if (picked != null) return null;
+        picked = sid;
+    }
+    return picked;
+}
+
+/// The classes an unqualified `super` in a member of `owner_head` means: the
+/// owner's supertypes when the owner is in the class table, else the heads
+/// its declaration listed, which is what a function-local class has, being
+/// registered at run time and lowered then. Null when the owner is not known
+/// at all, which is different from a class with no supertypes.
+pub fn ownerSupertypeIds(b: *FuncBuilder, owner_head: []const u8, buf: *[16]ir.ClassId) ?[]const ir.ClassId {
+    if (classIdOfHead(b, owner_head)) |cid| {
+        if (cid.int() >= b.module.classes.items.len) return null;
+        return b.module.classes.items[cid.int()].supertypes;
+    }
+    const oc = b.ownerClass() orelse return null;
+    if (!std.mem.eql(u8, oc, owner_head)) return null;
+    const heads = build.ownerSuperHeads();
+    if (heads.len == 0) return null;
+    var n: usize = 0;
+    for (heads) |h| {
+        if (n == buf.len) break;
+        if (classIdOfHead(b, h)) |sid| {
+            buf[n] = sid;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+/// The classes a `super` reference searches: the one it names, or the
+/// owner's supertypes.
+pub fn superCandidates(b: *FuncBuilder, owner_head: []const u8, qualifier: ?[]const u8, buf: *[16]ir.ClassId) ?[]const ir.ClassId {
+    if (qualifier) |q| {
+        buf[0] = classIdOfHead(b, q) orelse return null;
+        return buf[0..1];
+    }
+    return ownerSupertypeIds(b, owner_head, buf);
+}
+
+/// Whether `fid` names something a direct call can enter.
+///
+/// Carrying the body itself is not required: the member table hands back the
+/// reserved header and link redirects a bodyless header onto the sibling
+/// that has one. What must be refused is a declaration with no body
+/// ANYWHERE, because link settles that onto a native instead, and a
+/// collection native dispatches on the receiver's own class —
+/// `super<ArrayList>.add` reached `AbstractMutableList.add`, re-entered the
+/// subclass override, and recursed until the stack gave out.
+fn executableDecl(b: *FuncBuilder, fid: ir.FuncId) bool {
+    const f = b.module.funcById(fid) orelse return false;
+    if (f.hasBody()) return true;
+    const sig = b.module.decl_sigs.get(fid.int()) orelse return false;
+    return sig.has_body;
+}
+
+/// The `Any` member `super.name(...)` bottoms out in, when no supertype
+/// declares the name at all.
+///
+/// A class whose chain declares nothing called `toString` inherits `Any`'s,
+/// and the language fixes that: the runtime walk was discovering it by
+/// exhausting the supertype list on every execution. The chain walk alone
+/// decides. The hierarchy shadow set cannot answer this question for these
+/// three names: every class nominally declares `toString` because `Any`
+/// does, so consulting it declines every site. What matters is whether a
+/// supertype has its OWN declaration, which is what the walk looks for.
+pub fn superAnyMember(
+    b: *FuncBuilder,
+    owner_head: []const u8,
+    qualifier: ?[]const u8,
+    name: []const u8,
+    arity: usize,
+) core_inst.BuiltinMember {
+    if (qualifier != null) return .none;
+    const which: core_inst.BuiltinMember = if (arity == 0 and std.mem.eql(u8, name, "toString"))
+        .any_to_string
+    else if (arity == 0 and std.mem.eql(u8, name, "hashCode"))
+        .any_hash_code
+    else if (arity == 1 and std.mem.eql(u8, name, "equals"))
+        .any_equals
+    else
+        return .none;
+    var cbuf: [16]ir.ClassId = undefined;
+    const sups = ownerSupertypeIds(b, owner_head, &cbuf) orelse return .none;
+    for (sups) |sid| {
+        if (sid.int() >= b.module.classes.items.len) return .none;
+        if (nearestDeclOnChain(b, sid, name, arity) != null) return .none;
+        if (chainDeclaresMethod(b, sid, name)) return .none;
+    }
+    return which;
+}
+
+/// Whether some class on the chain from `cid` IMPLEMENTS a member called
+/// `name`, at any arity. Level order over class and interfaces alike. What
+/// picking the supertype an unqualified `super` means asks, and what the
+/// `Any` default has to rule out: an overload set the (name, arity) key calls
+/// ambiguous still declares the member. An abstract declaration does not
+/// count, since `super` cannot reach it and an interface restating a method
+/// its sibling class implements is not a second answer.
+fn chainDeclaresMethod(b: *FuncBuilder, cid: ir.ClassId, name: []const u8) bool {
+    var level: [32]ir.ClassId = undefined;
+    var next: [32]ir.ClassId = undefined;
+    var n: usize = 1;
+    level[0] = cid;
+    var depth: usize = 0;
+    while (depth < 16 and n != 0) : (depth += 1) {
+        var n_next: usize = 0;
+        for (level[0..n]) |c_id| {
+            if (c_id.int() >= b.module.classes.items.len) continue;
+            const c = &b.module.classes.items[c_id.int()];
+            for (b.module.memberDecls(c.fqn, name)) |fid| {
+                if (executableDecl(b, fid)) return true;
+            }
+            for (c.supertypes) |sup| {
+                if (n_next == next.len) return false;
+                next[n_next] = sup;
+                n_next += 1;
+            }
+        }
+        for (next[0..n_next], 0..) |v, i| level[i] = v;
+        n = n_next;
+    }
+    return false;
+}
+
+/// Among the overloads of `name` on the chain from `cid`, the one the call's
+/// static argument types select. The nearest level declaring an applicable
+/// candidate answers, and within it the best score wins when it is unique.
+/// This is what `nearestDeclOnChain` cannot do: two same-arity overloads make
+/// its (name, arity) key ambiguous by construction, and `placeAt(position,
+/// zIndex, layerBlock)` beside `placeAt(position, zIndex, layer)` is exactly
+/// the shape a super call in a layout node has.
+fn superOverloadOnChain(
+    b: *FuncBuilder,
+    cid: ir.ClassId,
+    name: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?ir.FuncId {
+    var shape_set = try type_probe.buildStaticReturnArgShapes(b, args, ast_arg_names);
+    defer shape_set.deinit(b.allocator);
+    const named = !allNull(ast_arg_names);
+    // The member resolver's own conventions: the declaration's parameters
+    // with `this` in front, skipped by the scorer.
+    const scope = applicability.ApplicabilityScope{ .member = true, .named = named, .recv_external = named };
+    var level: [32]ir.ClassId = undefined;
+    var next: [32]ir.ClassId = undefined;
+    var n: usize = 1;
+    level[0] = cid;
+    var depth: usize = 0;
+    while (depth < 16 and n != 0) : (depth += 1) {
+        var best: ?ir.FuncId = null;
+        var best_points: i32 = std.math.minInt(i32);
+        var tie = false;
+        var n_next: usize = 0;
+        for (level[0..n]) |c_id| {
+            if (c_id.int() >= b.module.classes.items.len) continue;
+            const c = &b.module.classes.items[c_id.int()];
+            for (b.module.memberDecls(c.fqn, name)) |fid| {
+                if (!executableDecl(b, fid)) continue;
+                const f = b.module.funcById(fid) orelse continue;
+                // A header whose value parameters are not listed yet cannot
+                // be scored, and a wrong score here binds the wrong body.
+                if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+                const sig = applicability.SigView{
+                    .params = f.params,
+                    .has_body = true,
+                    .is_member = true,
+                    .fid = fid,
+                    .package = f.package,
+                };
+                const score = applicability.applicable(&sig, shape_set.shapes, scope) orelse continue;
+                if (best == null or score.points > best_points) {
+                    best = fid;
+                    best_points = score.points;
+                    tie = false;
+                } else if (score.points == best_points and best.?.int() != fid.int()) {
+                    tie = true;
+                }
+            }
+            for (c.supertypes) |sup| {
+                if (n_next == next.len) return null;
+                next[n_next] = sup;
+                n_next += 1;
+            }
+        }
+        if (best) |fid| return if (tie) null else fid;
+        for (next[0..n_next], 0..) |v, i| level[i] = v;
+        n = n_next;
+    }
+    return null;
+}
+
+/// The declaration `super.name(args)` calls: the nearest implementation on
+/// the chain of the supertype the reference means, selected by the call's
+/// static argument types where the arity alone leaves several.
+pub fn superTargetSlot(
+    b: *FuncBuilder,
+    owner_head: []const u8,
+    qualifier: ?[]const u8,
+    name: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?ir.FuncId {
+    const why = runtime.envOnce("KLIO_SUPER_WHY") != null;
+    const arity = args.len;
+    const scid = superTypeFor(b, owner_head, qualifier, name, arity, .method) orelse {
+        if (why) {
+            const c0 = classIdOfHead(b, owner_head);
+            const n0: usize = if (c0) |cc| (if (cc.int() < b.module.classes.items.len) b.module.classes.items[cc.int()].supertypes.len else 0) else 999;
+            std.debug.print("[super-step] {s}.{s}/{d}: no supertype pick sups={d}\n", .{ owner_head, name, arity, n0 });
+        }
+        return null;
+    };
+    if (nearestDeclOnChain(b, scid, name, arity)) |fid| return fid;
+    if (try superOverloadOnChain(b, scid, name, args, ast_arg_names)) |fid| return fid;
+    if (why) std.debug.print("[super-step] {s}.{s}/{d}: no decl on chain from {s}\n", .{ owner_head, name, arity, b.module.classes.items[scid.int()].fqn });
+    return null;
+}
+
+/// The class a `super` reference resolves against: the supertype it names,
+/// or the class whose supertypes an unqualified one means.
+pub fn superStartClass(b: *FuncBuilder, owner_head: []const u8, qualifier: ?[]const u8) ?ir.ClassId {
+    return classIdOfHead(b, qualifier orelse owner_head);
+}
+
+/// What `super.<prop>` (or `super.<prop> = v`) reaches, as far as this body
+/// can see: the accessor the nearest declaring class on the supertype's
+/// chain has, when its function exists, or the cell that class stores the
+/// property in, when its layout is composed. Null leaves the access to the
+/// link pass, which asks the same question once every body has lowered.
+pub fn superPropertyAnswer(b: *FuncBuilder, owner_head: []const u8, qualifier: ?[]const u8, name: []const u8, access: ir.SuperAccess) ?ir.SuperAnswer {
+    var cbuf: [16]ir.ClassId = undefined;
+    const cands = superCandidates(b, owner_head, qualifier, &cbuf) orelse return null;
+    if (cands.len == 0) return null;
+    var buf: [256]u8 = undefined;
+    return b.module.superMemberAmong(cands, name, access, &buf);
+}
+
+/// `super.Inner(args)`: the classifier `Inner` nested in a class on the
+/// chain of the supertype the reference means. The call constructs it on
+/// this receiver, which is what the bare `Inner(args)` in the same body does.
+pub fn superNestedClass(b: *FuncBuilder, owner_head: []const u8, qualifier: ?[]const u8, name: []const u8) ?ir.ClassId {
+    var cbuf: [16]ir.ClassId = undefined;
+    const cands = superCandidates(b, owner_head, qualifier, &cbuf) orelse return null;
+    for (cands) |sid| {
+        if (nestedClassOnChain(b, sid, name)) |c| return c;
+    }
+    return null;
+}
+
+fn nestedClassOnChain(b: *FuncBuilder, cid: ir.ClassId, name: []const u8) ?ir.ClassId {
+    var cur = cid;
+    var hops: usize = 0;
+    while (hops < 32) : (hops += 1) {
+        if (cur.int() >= b.module.classes.items.len) return null;
+        const c = &b.module.classes.items[cur.int()];
+        var buf: [512]u8 = undefined;
+        const fqn = std.fmt.bufPrint(&buf, "{s}.{s}", .{ c.fqn, name }) catch return null;
+        if (b.module.classIdByFqn(fqn)) |nested| return nested;
+        if (c.supertypes.len == 0) return null;
+        cur = c.supertypes[0];
+    }
+    return null;
+}
+
+/// The host-backed class a `super` reference reaches, when the supertype it
+/// means is one: the instance holds that base as its `__delegate__<Name>`
+/// cell, and a super member runs on the delegate rather than on a body.
+pub fn superHostBackedBase(b: *FuncBuilder, owner_head: []const u8, qualifier: ?[]const u8) ?*const ir.Class {
+    var cbuf: [16]ir.ClassId = undefined;
+    const cands = superCandidates(b, owner_head, qualifier, &cbuf) orelse return null;
+    for (cands) |sid| {
+        if (hostBackedClass(b, sid)) |c| return c;
+    }
+    return null;
+}
+
+fn hostBackedClass(b: *FuncBuilder, cid: ir.ClassId) ?*const ir.Class {
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const c = &b.module.classes.items[cid.int()];
+    return if (c.is_intrinsic_backed) c else null;
+}
+
+/// The nearest IMPLEMENTATION of `name` at `arity` from `cid` upward, which
+/// is what `super` reaches: `AbstractMutableList` does not declare `iterator`
+/// itself, it inherits it.
+///
+/// The member table answers, and what it holds is a signature index whose
+/// first writer wins — the reserved HEADER, not the body. That is fine for a
+/// direct call: link settles a bodyless header onto its same-owner body
+/// sibling. `Class.methods` would hold the body directly but it is filled at
+/// the END of lowering that class and bodies lower from a pool, so reading
+/// it from inside another body is order-dependent.
+fn nearestDeclOnChain(b: *FuncBuilder, cid: ir.ClassId, name: []const u8, arity: usize) ?ir.FuncId {
+    // Level order over every supertype, not the first one only: an interface
+    // sibling can hold the implementation, and following the superclass link
+    // alone walked straight past it. Nearest wins, and a level offering two
+    // different answers decides nothing.
+    var level: [32]ir.ClassId = undefined;
+    var next: [32]ir.ClassId = undefined;
+    var n: usize = 1;
+    level[0] = cid;
+    var depth: usize = 0;
+    while (depth < 16 and n != 0) : (depth += 1) {
+        var found: ?ir.FuncId = null;
+        var n_next: usize = 0;
+        for (level[0..n]) |c_id| {
+            if (c_id.int() >= b.module.classes.items.len) continue;
+            const c = &b.module.classes.items[c_id.int()];
+            // The key existing is not the same as the class holding the
+            // implementation `super` reaches: an abstract override hid the
+            // body above it, so anything unenterable keeps the walk going.
+            if (declaredSlotOnNoExt(b, c.fqn, name, arity)) |fid| {
+                if (executableDecl(b, fid)) {
+                    if (found) |prev| {
+                        if (prev.int() != fid.int()) return null;
+                    } else found = fid;
+                }
+            }
+            for (c.supertypes) |sup| {
+                if (n_next == next.len) return null;
+                next[n_next] = sup;
+                n_next += 1;
+            }
+        }
+        if (found) |fid| return fid;
+        for (next[0..n_next], 0..) |v, i| level[i] = v;
+        n = n_next;
     }
     return null;
 }
@@ -908,6 +1459,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_
     // second time on the member path.
     const run = try lowerArgRunWithArity(b, all, arg_arity);
     const dst = b.allocReg();
+    const ctx_handed = try probe_mod.contextHandoverBegin(b, func_id, ast_type_args);
     try b.push(.{ .Call = .{
         .dst = dst,
         .func = func_id,
@@ -918,6 +1470,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_
         .type_args = type_args,
         .exact = was_cast,
     } });
+    try probe_mod.contextHandoverEnd(b, ctx_handed);
     return dst;
 }
 
@@ -942,12 +1495,21 @@ pub fn emitFqnWithClassPrefix(b: *FuncBuilder, fqn: []const u8) Allocator.Error!
             const n = try b.module.internConst(b.allocator, .{ .String = fqn[0..end] });
             try b.push(.{ .LoadGlobal = .{ .dst = cur, .name = n, .class = cid } });
             var rest = fqn[end..];
+            // Only the FIRST hop reads off the class the prefix names; past
+            // that the receiver is whatever the previous hop produced.
+            var hop_cls: ?ir.ClassId = cid;
             while (rest.len > 0) {
                 rest = rest[1..]; // skip '.'
                 const dot = std.mem.findScalar(u8, rest, '.') orelse rest.len;
                 const next = b.allocReg();
                 const field = try b.module.internConst(b.allocator, .{ .String = rest[0..dot] });
-                try b.push(.{ .GetField = .{ .dst = next, .receiver = cur, .field = field } });
+                try b.push(.{ .GetField = .{
+                    .dst = next,
+                    .receiver = cur,
+                    .field = field,
+                    .own_cls = hop_cls,
+                } });
+                hop_cls = null;
                 cur = next;
                 rest = rest[dot..];
             }

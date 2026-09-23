@@ -30,13 +30,10 @@ const execArmBuildObject = exec_call.execArmBuildObject;
 const execArmCall = exec_call.execArmCall;
 const execArmCallMemberOrValue = exec_call.execArmCallMemberOrValue;
 const execArmCallSpread = exec_call.execArmCallSpread;
-const execArmCallSuper = exec_call.execArmCallSuper;
 const execArmCallValue = exec_call.execArmCallValue;
 const execArmCallValueOrMember = exec_call.execArmCallValueOrMember;
 const execArmCallVirtual = exec_call.execArmCallVirtual;
 const execArmCast = exec_call.execArmCast;
-const execArmCtxCall = exec_call.execArmCtxCall;
-const execArmCtxScope = exec_call.execArmCtxScope;
 const execArmIndex = exec_call.execArmIndex;
 const execArmIndexSet = exec_call.execArmIndexSet;
 const execArmInstanceOf = exec_call.execArmInstanceOf;
@@ -55,6 +52,7 @@ const freeArgNames = exec_call.freeArgNames;
 const freeDispatchMissMsg = exec_call.freeDispatchMissMsg;
 const nullSiteOk = exec_call.nullSiteOk;
 const primitiveMemberFast = exec_call.primitiveMemberFast;
+const builtinProvenAuditOn = exec_call.builtinProvenAuditOn;
 const rangeIterFast = exec_call.rangeIterFast;
 const readArgRun = exec_call.readArgRun;
 const resolveArgNames = exec_call.resolveArgNames;
@@ -101,6 +99,7 @@ const ok = ev_flow.ok;
 const operatorMethod = ev_values.operatorMethod;
 const popEnclosing = ev_chain.popEnclosing;
 const pushEnclosingAccess = ev_chain.pushEnclosingAccess;
+const pushContext = ev_chain.pushContext;
 const pushEnclosingSubject = ev_chain.pushEnclosingSubject;
 const raiseStep = ev_flow.raiseStep;
 const serveOuterSlotRoute = ev_diag.serveOuterSlotRoute;
@@ -117,6 +116,11 @@ const vcallFlatEnabled = ev_flow.vcallFlatEnabled;
 pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
     if (parent.frame_count_on) parent.inst_count += 1;
     if (runtime.prof.op_prof_active) runtime.prof.current_op = @intFromEnum(inst.*);
+    if (ev_diag.ratchetArmed()) {
+        const recv: []const u8 = if (ir.site_census.siteReceiver(inst)) |r| frame.read(r).typeFqn() else "-";
+        if (ev_diag.unresolvedGate(frame.module, inst, frame.func.fqn, recv))
+            return raiseStep(frame, .{ .Type = ev_diag.requireResolvedSiteMessage(frame.module, inst, frame.func.fqn, recv) });
+    }
     switch (inst.*) {
         .SuspendResumePoint => {
             // No runtime effect on its own; the entry dispatch table reads `state`.
@@ -188,6 +192,20 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
             const v = if (lp.idx < frame.params.items.len) frame.params.items[lp.idx] else Value.Unit;
             v.retain();
             try frame.write(lp.dst, v);
+        },
+        .LoadDispatchThis => |ld| return exec_call.execArmLoadDispatchThis(H, allocator, frame, ld, host),
+        .LoadOuterThis => |lo| return exec_call.execArmLoadOuterThis(H, allocator, frame, lo, host),
+        .LoadContextParam => |lc| return exec_call.execArmLoadContextParam(H, allocator, frame, lc, host),
+        .ContextPush => |cp| {
+            var i: u32 = 0;
+            while (i < cp.n) : (i += 1) {
+                const v = frame.read(ir.Reg.from(cp.args.int() + i));
+                pushContext(&v);
+            }
+        },
+        .ContextPop => |cp| {
+            var i: u32 = 0;
+            while (i < cp.n) : (i += 1) popEnclosing();
         },
         .NotNullAssert => |nn| {
             const v = frame.read(nn.src);
@@ -280,7 +298,6 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
             }
         },
         .CallSpread => |cs| return execArmCallSpread(H, allocator, frame, cs, host),
-        .CallSuper => |csup| return execArmCallSuper(H, allocator, frame, csup, host),
         .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |*cm| return execArmCallMember(H, allocator, frame, cm, host),
         .CallVirtual => |*cv| return execArmCallVirtual(H, allocator, frame, cv, host),
@@ -288,18 +305,6 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         .CallValueOrMember => |cvm| return execArmCallValueOrMember(H, allocator, frame, cvm, host),
         .NewInstance => |ni| return execArmNewInstance(H, allocator, frame, ni, host),
         .InstanceOf => |io| return execArmInstanceOf(H, allocator, frame, io, host),
-        .CtxLoad => |cl| {
-            if (comptime !@hasDecl(H, "ctxResolve")) {
-                try frame.write(cl.dst, .Null);
-                return .cont;
-            }
-            const ty_name = constStr(frame.module, cl.ty) orelse "";
-            const v = host.ctxResolve(ty_name, cl.erased) orelse Value.Null;
-            v.retain();
-            try frame.write(cl.dst, v);
-        },
-        .CtxScope => |cs| return execArmCtxScope(H, allocator, frame, cs, host),
-        .CtxCall => |cc| return execArmCtxCall(H, allocator, frame, cc, host),
         .Cast => |cast| return execArmCast(H, allocator, frame, cast, host),
         .Lambda => |lam| return execArmLambda(H, allocator, frame, lam, host),
         .AstLambda => |al| return execArmAstLambda(H, allocator, frame, al, host),
@@ -309,7 +314,13 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
             const name_str = constStr(frame.module, sg.name) orelse
                 return raiseStep(frame, .{ .Type = "StoreGlobal: name not a string const" });
             const v = frame.read(sg.value);
-            switch (try host.storeGlobal(allocator, name_str, v)) {
+            const r = blk: {
+                if (comptime @hasDecl(H, "storeGlobalSlot")) {
+                    if (sg.slot) |slot| break :blk try host.storeGlobalSlot(allocator, slot, name_str, v);
+                }
+                break :blk try host.storeGlobal(allocator, name_str, v);
+            };
+            switch (r) {
                 .ok => {},
                 .err => |e| return raiseStep(frame, e),
             }
@@ -807,6 +818,38 @@ pub fn gfSiteFast(comptime H: type, host: *H, frame: *Frame, gf: anytype, dst: i
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
     if (parent.frame_count_on) parent.gf_slow += 1;
     const recv = frame.read(gf.receiver);
+    // `super.<prop>` on a stored property: the base's cell, served without
+    // dispatch. There is no by-name answer to fall to, since the by-name
+    // answer is the override whose body is making this read.
+    if (gf.own_kind == .super_slot) {
+        const v = superSlotValue(frame, gf, &recv) orelse
+            return raiseStep(frame, .{ .Type = "super property read: the receiver does not carry the base's cell" });
+        if (v == .Delegate) return raiseStep(frame, .{ .Type = "super property read of a delegated property" });
+        v.retain();
+        try frame.write(gf.dst, v);
+        return .cont;
+    }
+    if (gf.own_kind == .super_target)
+        return raiseStep(frame, .{ .Type = "super property read left unbound" });
+    // `EnumClass.Entry`, settled at lowering: the class and the entry's index.
+    // The runtime's own answer is a scan of the entry table for the name.
+    if ((gf.own_kind == .enum_entry) and recv == .Class) {
+        if (comptime @hasDecl(H, "enumEntryAt")) {
+            if (enumClaimMatches(frame, gf, recv.Class)) {
+                const name0 = constStr(frame.module, gf.field) orelse
+                    return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
+                switch (host.enumEntryAt(recv.Class, gf.own_slot, name0)) {
+                    .ok => |v| {
+                        dispatchBump(.field_read_enum_entry);
+                        v.retain();
+                        try frame.write(gf.dst, v);
+                        return .cont;
+                    },
+                    .err => {},
+                }
+            }
+        }
+    }
     if (gfTraceWant()) |w0| {
         if (constStr(frame.module, gf.field)) |fname| {
             if (std.mem.find(u8, fname, w0) != null) {
@@ -822,6 +865,15 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             }
         }
     }
+    // The site named the operation, so the tag test is an assertion: a proven
+    // builtin property reads the receiver's own length with no name compare.
+    if (gf.builtin_proven) {
+        if (try ev_leaf.builtinFieldNamed(allocator, gf.builtin, &recv)) |bv| {
+            dispatchBump(.field_read_builtin);
+            try frame.write(gf.dst, bv);
+            return .cont;
+        }
+    }
     const name = constStr(frame.module, gf.field) orelse
         return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
     if (try builtinFieldFast(H, host, allocator, &recv, name)) |bv| {
@@ -830,7 +882,7 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     }
     // `<class-companion-or-self>`: a bare class name in value position reads through the
     // per-class companion memo; a NON-class receiver of the sentinel is an identity read.
-    if (std.mem.eql(u8, name, "<class-companion-or-self>")) {
+    if (gf.own_kind == .companion_or_self) {
         if (recv == .Class) {
             const g = recv.Class.borrow();
             defer g.deinit();
@@ -987,8 +1039,141 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             }
         }
     }
+    // Lowering claimed a declared slot of the receiver's class layout. The
+    // ladder below exists to DISCOVER an index the class already fixed, so
+    // serve the claim instead — after proving it under one borrow, which is
+    // what keeps a stale claim a miss rather than a wrong answer.
+    var claimed_v: ?Value = null;
+    // Lowering named the accessor that answers this read. The runtime's own
+    // answer is a (class, name) memo it has to fill first, and a name walk to
+    // fill it; the target is the same either way.
+    if (gf.own_kind == .getter and recv == .Instance and slotServeOn()) {
+        if (comptime @hasDecl(H, "runFieldGetter")) {
+            // The accessor belongs to ONE class, so the receiver has to be on
+            // its chain before its identity means anything — the same proof
+            // the slot serve makes, and for the same reason: `this` at a
+            // lowering site is not always the class the deriver named.
+            if (getterServeOn() and getterClaimHolds(frame, gf, recv.Instance)) {
+                if (runtime.envOnce("KLIO_GETTER_TRACE") != null) {
+                    const g2 = recv.Instance.borrow();
+                    defer g2.deinit();
+                    const cg2 = g2.get().class.borrow();
+                    defer cg2.deinit();
+                    std.debug.print("[getter-serve] {s}.{s} -> #{d}\n", .{
+                        cg2.get().name,
+                        name,
+                        gf.own_slot,
+                    });
+                }
+                dispatchBump(.field_read_getter_named);
+                const got_g = host.runFieldGetter(allocator, @enumFromInt(gf.own_slot), recv);
+                if (getterAuditOn()) {
+                    // The claim and the ladder both run, and the claim is only
+                    // kept when they agree: an accessor named by a rule the
+                    // runtime does not share answers a read nobody checked.
+                    const served = try got_g;
+                    const walked = try host.getField(allocator, &recv, name);
+                    // An accessor may BUILD its answer — `Nodes.OnPlaced` is
+                    // `get() = NodeKind(...)` — so two calls differ by identity
+                    // while both are right. The ladder run twice is the control:
+                    // where it disagrees with itself, the comparison says
+                    // nothing and the read is skipped rather than reported.
+                    const walked2 = try host.getField(allocator, &recv, name);
+                    const idempotent = walked == .ok and walked2 == .ok and
+                        sameServedValue(&walked.ok, &walked2.ok);
+                    if (served == .ok and walked == .ok) {
+                        if (idempotent and !sameServedValue(&served.ok, &walked.ok)) {
+                            const g2 = recv.Instance.borrow();
+                            defer g2.deinit();
+                            const cg2 = g2.get().class.borrow();
+                            defer cg2.deinit();
+                            std.debug.print("[getter-audit] {s}.{s} #{d} served={s} walked={s}\n", .{
+                                cg2.get().name, name, gf.own_slot,
+                                @tagName(served.ok), @tagName(walked.ok),
+                            });
+                        }
+                    } else if (served == .ok or walked == .ok) {
+                        std.debug.print("[getter-audit] {s} one side failed\n", .{name});
+                    }
+                }
+                if (pushed_enclosing) popEnclosing();
+                switch (try got_g) {
+                    .ok => |v| {
+                        v.retain();
+                        try frame.write(gf.dst, v);
+                        return .cont;
+                    },
+                    .err => |e| return raiseStep(frame, e),
+                }
+            }
+        }
+    }
+    // The site carries a property SLOT and the receiver's runtime class picks
+    // the implementation, the way a virtual call does. Unlike the getter
+    // route this needs no proof about the chain: the table is keyed by the
+    // class that actually answers.
+    if (gf.own_kind == .prop_slot and recv == .Instance and propSlotServeOn()) {
+        if (comptime @hasDecl(H, "runFieldGetter")) {
+            if (propSlotAnswer(frame, gf, recv.Instance)) |target| {
+                const served: ?EvalResult = switch (target) {
+                    .getter => blk: {
+                        const r = host.runFieldGetter(allocator, target.getter, recv) catch |e| return e;
+                        break :blk r;
+                    },
+                    .field => |idx| blk: {
+                        const v = readFieldAt(recv.Instance, idx, name) orelse break :blk null;
+                        break :blk EvalResult{ .ok = v };
+                    },
+                };
+                if (served) |sv| {
+                    if (propSlotAuditOn()) {
+                        const walked = try host.getField(allocator, &recv, name);
+                        // The ladder run twice is the control; see the getter
+                        // audit. A property whose accessor builds its answer
+                        // cannot be compared by identity.
+                        const walked2 = try host.getField(allocator, &recv, name);
+                        const idem = walked == .ok and walked2 == .ok and
+                            sameServedValue(&walked.ok, &walked2.ok);
+                        if (sv == .ok and walked == .ok and idem and !sameServedValue(&sv.ok, &walked.ok)) {
+                            const g2 = recv.Instance.borrow();
+                            defer g2.deinit();
+                            const cg2 = g2.get().class.borrow();
+                            defer cg2.deinit();
+                            std.debug.print("[prop-slot-audit] {s}.{s} slot={d} served={s} walked={s}\n", .{
+                                cg2.get().name, name, gf.own_slot, @tagName(sv.ok), @tagName(walked.ok),
+                            });
+                        }
+                    }
+                    dispatchBump(.field_read_prop_slot);
+                    if (pushed_enclosing) popEnclosing();
+                    switch (sv) {
+                        .ok => |v| {
+                            v.retain();
+                            try frame.write(gf.dst, v);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+            }
+        }
+    }
+    if (gf.own_kind == .slot and recv == .Instance and slotServeOn()) {
+        claimed_v = serveClaimedSlot(frame, gf, &recv, name);
+        if (claimed_v) |v| {
+            if (!slotAuditOn()) {
+                // The arm pushed the enclosing `this` for the ladder's benefit
+                // and pops it after; returning here has to pop it too, or
+                // every served read leaves an entry on the receiver chain.
+                if (pushed_enclosing) popEnclosing();
+                try frame.write(gf.dst, v);
+                return .cont;
+            }
+        }
+    }
     runtime.prof.opRoute(14);
     gfStatsBump(&recv, name);
+    dispatchBump(.field_read_host_by_name);
     const t_slow = gfNow();
     const got = host.getField(allocator, &recv, name);
     parent.gf_slow_ns +%= gfNow() -% t_slow;
@@ -996,6 +1181,17 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     switch (try got) {
         // host.getField returns a borrowed field value; the register owns its ref.
         .ok => |v| {
+            // `KLIO_SLOT_SERVE=audit`: the claim ran beside the ladder. Report
+            // where they disagree and serve the ladder's answer, so the claim
+            // can be proved before anything depends on it.
+            if (claimed_v) |cv| {
+                if (!sameServedValue(&cv, &v)) {
+                    std.debug.print("[slot-audit] DIVERGE {s} in={s} claim={s} ladder={s} recv={s}\n", .{
+                        name, frame.func.fqn, ev_diag.shortValue(&cv, 0), ev_diag.shortValue(&v, 1), recv.typeFqn(),
+                    });
+                }
+                cv.release(allocator);
+            }
             v.retain();
             if (comptime @hasDecl(H, "fieldSiteRoute")) {
                 if (recv == .Instance and @atomicLoad(u64, @constCast(&gf.site_cls), .monotonic) == 0) {
@@ -1029,15 +1225,362 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     return .cont;
 }
 
+/// `KLIO_SLOT_SERVE=0` turns the claimed-slot serve off, leaving the claim
+/// emitted and unused: the switch that tells a claim bug from a lowering one.
+var slot_serve_state: u8 = 0;
+fn slotServeOn() bool {
+    if (slot_serve_state == 0) {
+        slot_serve_state = if (runtime.envOnce("KLIO_SLOT_SERVE")) |v|
+            (if (std.mem.eql(u8, v, "0")) 1 else if (std.mem.eql(u8, v, "audit")) 3 else 2)
+        else
+            2;
+    }
+    return slot_serve_state != 1;
+}
+
+/// Whether two served values are the same answer, for the audit. Identity for
+/// a heap value and equality for a scalar: the question is whether the claim
+/// reached the same cell, not whether two cells compare equal.
+fn sameServedValue(a: *const Value, b: *const Value) bool {
+    if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+    return switch (a.*) {
+        .Int => a.Int == b.Int,
+        .Long => a.Long == b.Long,
+        .Bool => a.Bool == b.Bool,
+        // NaN never equals itself, and two reads of the same `Float.NaN` slot
+        // are the same served value however they were reached: comparing them
+        // with `==` reported a divergence with no difference in it.
+        .Double => a.Double == b.Double or (std.math.isNan(a.Double) and std.math.isNan(b.Double)),
+        .Float => a.Float == b.Float or (std.math.isNan(a.Float) and std.math.isNan(b.Float)),
+        .Char => a.Char == b.Char,
+        .Null, .Unit => true,
+        // Field-by-field, so a heap value compares by the address it points at:
+        // the question is whether the claim reached the same cell.
+        else => std.meta.eql(a.*, b.*),
+    };
+}
+
+/// Whether `start` or one of its superclasses is `fqn`.
+fn classChainHasFqn(start: runtime.ObjRef(runtime.ClassDef), fqn: []const u8) bool {
+    var cur: ?runtime.ObjRef(runtime.ClassDef) = start;
+    var hops: usize = 0;
+    while (cur) |c| : (hops += 1) {
+        if (hops > runtime.ClassDef.MAX_WALK) return false;
+        const g = c.borrow();
+        const here = g.get();
+        if (std.mem.eql(u8, here.fqn, fqn)) {
+            g.deinit();
+            return true;
+        }
+        const next = here.parent;
+        g.deinit();
+        cur = next;
+    }
+    return false;
+}
+
+/// The index of the base cell a super access names, once the receiver is
+/// proved to be an instance of the class whose layout fixed it or of a
+/// subclass, where a declared slot's index holds. The stored key is the plain
+/// name or the owner-mangled one a shadowing subclass gave the base's cell.
+fn superSlotIndex(frame: *Frame, site: anytype, recv: *const Value) ?usize {
+    if (recv.* != .Instance) return null;
+    const claimed = site.own_cls orelse return null;
+    if (claimed.int() >= frame.module.classes.items.len) return null;
+    const want = frame.module.classes.items[claimed.int()].fqn;
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    const b = g.get();
+    if (!classChainHasFqn(b.class, want)) return null;
+    const idx: usize = site.own_slot;
+    if (idx >= b.fields.items.len) return null;
+    const stored = b.fields.items[idx].name;
+    const name = constStr(frame.module, site.field) orelse return null;
+    const stored_prop = if (std.mem.findScalar(u8, stored, '\u{1f}')) |sep| stored[sep + 1 ..] else stored;
+    if (!std.mem.eql(u8, stored_prop, name)) return null;
+    return idx;
+}
+
+fn superSlotValue(frame: *Frame, gf: anytype, recv: *const Value) ?Value {
+    const idx = superSlotIndex(frame, gf, recv) orelse return null;
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    return g.get().fields.items[idx].value;
+}
+
+/// Whether the receiver is the class whose accessor lowering named, or one of
+/// its subclasses: a subclass that overrides the property declares its own
+/// accessor, which the named one is not, so the chain walk stops at a class
+/// carrying a getter of its own.
+fn getterClaimHolds(frame: *Frame, gf: anytype, inst: ObjRef(InstanceData)) bool {
+    const claimed = gf.own_cls orelse return false;
+    if (claimed.int() >= frame.module.classes.items.len) return false;
+    const want = frame.module.classes.items[claimed.int()].fqn;
+    if (want.len == 0) return false;
+    const g = inst.borrow();
+    defer g.deinit();
+    return classChainHasFqn(g.get().class, want);
+}
+
+/// `KLIO_GETTER_SERVE=0` leaves the named accessor unused, so a wrong answer
+/// can be told from a wrong naming.
+var getter_serve_state: u8 = 0;
+fn getterServeOn() bool {
+    if (getter_serve_state == 0) {
+        const v = runtime.envOnce("KLIO_GETTER_SERVE") orelse "1";
+        getter_serve_state = if (std.mem.eql(u8, v, "0"))
+            1
+        else if (std.mem.eql(u8, v, "audit"))
+            3
+        else
+            2;
+    }
+    return getter_serve_state != 1;
+}
+
+/// `KLIO_GETTER_SERVE=audit` runs the named accessor AND the ladder and
+/// reports every read where they answer differently.
+fn getterAuditOn() bool {
+    _ = getterServeOn();
+    return getter_serve_state == 3;
+}
+
+/// `KLIO_PROP_SLOT_SERVE=0` leaves the property slot emitted and unserved;
+/// `audit` runs the table's answer AND the by-name walk and reports every read
+/// where they differ.
+var prop_slot_serve_state: u8 = 0;
+fn propSlotServeOn() bool {
+    if (prop_slot_serve_state == 0) {
+        const v = runtime.envOnce("KLIO_PROP_SLOT_SERVE") orelse "1";
+        prop_slot_serve_state = if (std.mem.eql(u8, v, "0"))
+            1
+        else if (std.mem.eql(u8, v, "audit"))
+            3
+        else
+            2;
+    }
+    return prop_slot_serve_state != 1;
+}
+
+fn propSlotAuditOn() bool {
+    _ = propSlotServeOn();
+    return prop_slot_serve_state == 3;
+}
+
+/// The property table's answer for this read, or null when it has none and the
+/// ladder must serve.
+fn propSlotAnswer(frame: *Frame, gf: anytype, inst: ObjRef(InstanceData)) ?ir.PropTarget {
+    const g = inst.borrow();
+    defer g.deinit();
+    const cid = runtimeClassIdOf(frame.module, g.get().class) orelse return null;
+    return frame.module.propSlotTarget(cid, @enumFromInt(gf.own_slot));
+}
+
+/// The module `ClassId` of a runtime class, through the def's own memo so the
+/// string-keyed probe runs once per class rather than once per read.
+fn runtimeClassIdOf(module: *const Module, class: ObjRef(runtime.ClassDef)) ?ir.ClassId {
+    const g = class.borrow();
+    defer g.deinit();
+    const cdef = g.get();
+    const mod_key = @intFromPtr(module);
+    if (cdef.resolve_mod.load(.monotonic) == mod_key) {
+        const plus1 = cdef.resolve_cid.load(.acquire);
+        if (plus1 != 0) return ir.ClassId.from(plus1 - 1);
+    }
+    const found = module.classIdByFqn(cdef.fqn) orelse return null;
+    const mut = @constCast(cdef);
+    if (mut.resolve_mod.cmpxchgStrong(0, mod_key, .acq_rel, .monotonic) == null) {
+        mut.resolve_cid.store(found.int() + 1, .release);
+    }
+    return found;
+}
+
+/// The value at a composed-layout index, when construction actually reserved
+/// it and left something other than a delegate cell there.
+fn readFieldAt(inst: ObjRef(InstanceData), idx: u32, name: []const u8) ?Value {
+    const g = inst.borrow();
+    defer g.deinit();
+    const b = g.get();
+    if (idx >= @min(@as(usize, b.reserved), b.fields.items.len)) return null;
+    const f = &b.fields.items[idx];
+    // The composed layout's index and the instance's field order can disagree
+    // — that is what the layout audit's `misordered` counts — so the cell has
+    // to carry the property's name before it answers for it. Without this,
+    // `TextContent.status` read the seed and every created resource replied
+    // 200 instead of 201.
+    if (!sameFieldName(f.name, name)) return null;
+    switch (f.value) {
+        // A delegate cell is not the value, and an empty one is not proof the
+        // property reads as null: a `lateinit var` holds exactly that until it
+        // is assigned, and reading it must raise rather than answer.
+        .Delegate, .Null => return null,
+        else => {},
+    }
+    f.value.retain();
+    return f.value;
+}
+
+fn slotAuditOn() bool {
+    _ = slotServeOn();
+    return slot_serve_state == 3;
+}
+
+/// Serve a `GetField` whose site claims a declared slot, and fill the site memo
+/// so later executions take the claimed route without re-proving it.
+///
+/// Every check is a proof of the claim, not a courtesy: the slot must be one
+/// construction reserved, and the name stored there must be the one being
+/// read. A `Delegate` is declined because the read is a `getValue` call, and a
+/// `Null` because an unset `lateinit` must throw — both fall to the ladder,
+/// which adjudicates them.
+/// The claimed enum is the class being read. Lowering names it by id; a
+/// same-simple-name enum elsewhere would index a different table.
+fn enumClaimMatches(frame: *Frame, gf: anytype, cls: runtime.ObjRef(runtime.ClassDef)) bool {
+    const claimed = gf.own_cls orelse return false;
+    if (claimed.int() >= frame.module.classes.items.len) return false;
+    const want = frame.module.classes.items[claimed.int()].fqn;
+    const g = cls.borrow();
+    defer g.deinit();
+    return std.mem.eql(u8, g.get().fqn, want);
+}
+
+fn serveClaimedSlot(frame: *Frame, gf: anytype, recv: *const Value, name: []const u8) ?Value {
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    const b = g.get();
+    const idx: usize = gf.own_slot;
+    if (idx >= @min(@as(usize, b.reserved), b.fields.items.len)) return null;
+    // The claim is about ONE class's layout. `this` at a lowering site is not
+    // always the owner's instance — a receiver lambda or an inline splice
+    // rebinds it — so the receiver's class has to be the claimed one before
+    // its index means anything.
+    const claimed = gf.own_cls orelse return null;
+    if (claimed.int() >= frame.module.classes.items.len) return null;
+    const cls = &frame.module.classes.items[claimed.int()];
+    {
+        const cg = b.class.borrow();
+        const same = std.mem.eql(u8, cg.get().fqn, cls.fqn);
+        cg.deinit();
+        if (!same) {
+            // An OPEN class's claim is meant for its subclasses: a declared
+            // slot sits at the same index down the chain, and the link pass
+            // only claimed because no subclass redeclares the property. The
+            // guarantee is about the chain, so the receiver has to BE on it —
+            // a matching slot name is not proof.
+            if (!cls.is_open and !cls.is_abstract and !cls.is_interface) return null;
+            if (!classChainHasFqn(b.class, cls.fqn)) return null;
+        }
+    }
+    const f = &b.fields.items[idx];
+    if (!sameFieldName(f.name, name)) return null;
+    switch (f.value) {
+        .Delegate, .Null => return null,
+        else => {},
+    }
+    if (@atomicLoad(u64, @constCast(&gf.site_cls), .monotonic) == 0) {
+        const cls_id = b.class.identity();
+        const shp = b.shapeOf();
+        if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, cls_id, .acq_rel, .monotonic) == null) {
+            if (shp > 1) @atomicStore(u64, @constCast(&gf.site_shape), shp, .monotonic);
+            @atomicStore(u64, @constCast(&gf.site_route), (@as(u64, idx) << 2) | 1, .release);
+        }
+    }
+    dispatchBump(.field_read_claimed_slot);
+    f.value.retain();
+    return f.value;
+}
+
+/// The declared slot lowering claimed for this write, re-proved against the
+/// receiver. A plain slot has no setter, so once the class matches the store is
+/// the whole operation; anything unproven falls to the ladder.
+fn claimedWriteSlot(frame: *Frame, sf: anytype, recv: *const Value, name: []const u8) ?usize {
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    const b = g.get();
+    const idx: usize = sf.own_slot;
+    if (idx >= @min(@as(usize, b.reserved), b.fields.items.len)) return null;
+    const claimed = sf.own_cls orelse return null;
+    if (claimed.int() >= frame.module.classes.items.len) return null;
+    const want_fqn = frame.module.classes.items[claimed.int()].fqn;
+    {
+        const cg = b.class.borrow();
+        defer cg.deinit();
+        if (!std.mem.eql(u8, cg.get().fqn, want_fqn)) return null;
+    }
+    const f = &b.fields.items[idx];
+    if (!sameFieldName(f.name, name)) return null;
+    // A delegate cell answers through the delegate, and a frozen instance
+    // refuses the store; both belong to the ladder.
+    if (f.value == .Delegate) return null;
+    return idx;
+}
+
+fn storeClaimedWriteSlot(allocator: Allocator, recv: *const Value, idx: usize, v: Value) void {
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    const f = &g.get().fields.items[idx];
+    v.retain();
+    const old = f.value;
+    f.value = v;
+    old.release(allocator);
+}
+
+fn claimedWriteSlotValue(recv: *const Value, idx: usize) ?Value {
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    const b = g.get();
+    if (idx >= b.fields.items.len) return null;
+    return b.fields.items[idx].value;
+}
+
 noinline fn execArmSetField(comptime H: type, allocator: Allocator, frame: *Frame, sf: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(sf.receiver);
     const v = frame.read(sf.value);
     const name = constStr(frame.module, sf.field) orelse
         return raiseStep(frame, .{ .Type = "SetField: name not a string const" });
-    const super_owner: ?[]const u8 = if (sf.super_owner) |c| constStr(frame.module, c) else null;
-    switch (try host.setFieldFrom(allocator, &recv, name, v, super_owner)) {
+    // `super.<prop> = v` on a stored property: the base's cell, stored
+    // without dispatch, on the read's terms.
+    if (sf.own_kind == .super_slot) {
+        const idx = superSlotIndex(frame, sf, &recv) orelse
+            return raiseStep(frame, .{ .Type = "super property write: the receiver does not carry the base's cell" });
+        storeClaimedWriteSlot(allocator, &recv, idx, v);
+        return .cont;
+    }
+    if (sf.own_kind == .super_target)
+        return raiseStep(frame, .{ .Type = "super property write left unbound" });
+    // Lowering proved which cell this write lands in. The ladder below exists
+    // to FIND that cell by name, so serve the claim instead.
+    var audit_idx: ?usize = null;
+    if (sf.own_cls != null and recv == .Instance and slotServeOn()) {
+        if (claimedWriteSlot(frame, sf, &recv, name)) |idx| {
+            if (!slotAuditOn()) {
+                dispatchBump(.field_write_claimed_slot);
+                storeClaimedWriteSlot(allocator, &recv, idx, v);
+                return .cont;
+            }
+            audit_idx = idx;
+        }
+    }
+    switch (try host.setField(allocator, &recv, name, v)) {
         .ok => {},
         .err => |e| return raiseStep(frame, e),
+    }
+    // `KLIO_SLOT_SERVE=audit`: a write has no value to compare, so compare the
+    // CELL. The claim is right exactly when the slot the ladder chose is the
+    // slot lowering named, which shows as the claimed slot now holding the
+    // written value.
+    if (audit_idx) |idx| {
+        const now = claimedWriteSlotValue(&recv, idx);
+        const agree = if (now) |n| sameServedValue(&n, &v) else false;
+        if (!agree) {
+            std.debug.print("[slot-audit] WRITE-DIVERGE {s} in={s} wrote={s} slot={s} recv={s}\n", .{
+                name,
+                frame.func.fqn,
+                ev_diag.shortValue(&v, 0),
+                if (now) |n| ev_diag.shortValue(&n, 1) else "<none>",
+                recv.typeFqn(),
+            });
+        }
     }
     return .cont;
 }
@@ -1165,6 +1708,22 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         parent.cm_calls += 1;
     };
     const recv = frame.read(cm.receiver);
+    // `super.toString()` and its two siblings where no supertype declares
+    // the member: `Any`'s implementation, on the receiver, without dispatch.
+    switch (cm.builtin) {
+        .any_to_string, .any_hash_code, .any_equals => {
+            const any_args = try readArgRun(allocator, frame, cm.args, cm.n_args);
+            defer allocator.free(any_args);
+            if (comptime @hasDecl(H, "anyMember")) {
+                if (try host.anyMember(allocator, &recv, cm.builtin, any_args)) |v| {
+                    try frame.write(cm.dst, v);
+                    return .cont;
+                }
+            }
+            return raiseStep(frame, .{ .Type = "super call to Any's member on a receiver that is not an instance" });
+        },
+        else => {},
+    }
     if (cmTraceWant()) |w0| {
         const want = w0;
         if (constStr(frame.module, cm.name)) |nm| {
@@ -1274,15 +1833,42 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         return raiseStep(frame, .{ .Type = "resolved member calls are unsupported by this host" });
     }
     dispatchBump(.call_member_virtual);
-    if (fastSubscript(allocator, frame, cm)) |rv| {
-        dispatchBump(.member_fast_subscript);
-        try frame.write(cm.dst, rv);
-        return .cont;
+    switch (fastSubscript(allocator, frame, cm)) {
+        .value => |rv| {
+            dispatchBump(.member_fast_subscript);
+            try frame.write(cm.dst, rv);
+            return .cont;
+        },
+        .err => |e| {
+            dispatchBump(.member_fast_subscript);
+            return raiseStep(frame, e);
+        },
+        .decline => {},
+    }
+    if (cm.builtin == .to_string) {
+        if (exec_call.fastToString(allocator, &recv)) |rv| {
+            dispatchBump(.member_prim_op);
+            try frame.write(cm.dst, rv);
+            return .cont;
+        }
     }
     if (primitiveMemberFast(frame, cm)) |rv| {
         dispatchBump(.member_prim_op);
         try frame.write(cm.dst, rv);
         return .cont;
+    }
+    // A site the link pass called proven said its operation and its receiver
+    // KIND are both fixed, which is the whole basis for the census counting
+    // it resolved. Reaching here means neither serve took it and the walk
+    // below will resolve it by name, so the claim was wrong. Reported rather
+    // than assumed: a census that grades itself is not evidence.
+    if (cm.builtin_proven and builtinProvenAuditOn()) {
+        std.debug.print("[builtin-proven-audit] {s} op={s} recv={s} in={s}\n", .{
+            constStr(frame.module, cm.name) orelse "?",
+            @tagName(cm.builtin),
+            @tagName(std.meta.activeTag(recv)),
+            frame.func.name,
+        });
     }
     if (recv == .RangeIter) {
         if (constStr(frame.module, cm.name)) |nm| {
@@ -1304,6 +1890,10 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     defer recv.release(allocator);
     const name_str = constStr(frame.module, cm.name) orelse
         return raiseStep(frame, .{ .Type = "CallMember: name not a string const" });
+    // `KLIO_EXT_AUDIT`: hand the extension serve the pick lowering withheld for
+    // THIS site, so the comparison is per site rather than per (name, receiver).
+    if (ev_diag.extAuditArmed())
+        ev_diag.extAuditPublish(frame.module, cm.x().audit_pick, cm.x().audit_pick_kind, name_str, frame.func.name);
     runtime.prof.opRoute(0);
     const cm_args_t0 = gfNow();
     const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
@@ -1336,6 +1926,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                     const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
                     const sig_p = host.memberSiteSig(arg_values) orelse break :site;
                     const fid_p = callPicGet(@intFromPtr(cm), cls_now, sig_p, gen) orelse break :site;
+                    if (ev_diag.extAuditArmed())
+                        ev_diag.extAuditServed(frame.module, @enumFromInt(fid_p), name_str);
                     if (try tryLeafMember(H, allocator, frame, recv, @enumFromInt(fid_p), arg_values, host)) |lo| switch (lo) {
                         .val => |v| {
                             if (pushed_enclosing) popEnclosing();
@@ -1374,6 +1966,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                     }
                     break :site;
                 }
+                if (ev_diag.extAuditArmed())
+                    ev_diag.extAuditServed(frame.module, @enumFromInt(@as(u32, @intCast(route >> 1))), name_str);
                 if (try tryLeafMember(H, allocator, frame, recv, @enumFromInt(@as(u32, @intCast(route >> 1))), arg_values, host)) |lo| switch (lo) {
                     .val => |v| {
                         if (pushed_enclosing) popEnclosing();
@@ -1414,6 +2008,8 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 null;
             if (prep_opt) |prep0| {
                 dispatchBump(.member_flat_prepare);
+                if (ev_diag.extAuditArmed())
+                    ev_diag.extAuditServed(frame.module, prep0.func.id, name_str);
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
@@ -1495,9 +2091,45 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     return .cont;
 }
 
+/// `KLIO_GLOBAL_ID_AUDIT`: how often a `LoadGlobal` carrying an identity is
+/// actually answered by it. `=names` also prints each declining name.
+pub var global_id_served: std.atomic.Value(u64) = .init(0);
+pub var global_id_declined: std.atomic.Value(u64) = .init(0);
+
+var global_id_audit_state: u8 = 0;
+
+pub fn globalIdAuditOn() bool {
+    if (global_id_audit_state == 0)
+        global_id_audit_state = if (runtime.envOnce("KLIO_GLOBAL_ID_AUDIT") != null) 2 else 1;
+    return global_id_audit_state == 2;
+}
+
+fn globalIdAuditNames() bool {
+    const v = runtime.envOnce("KLIO_GLOBAL_ID_AUDIT") orelse return false;
+    return std.mem.eql(u8, v, "names");
+}
+
+pub fn globalIdAuditDump() void {
+    if (!globalIdAuditOn()) return;
+    std.debug.print("[global-id] served={d} declined={d}\n", .{
+        global_id_served.load(.monotonic),
+        global_id_declined.load(.monotonic),
+    });
+}
+
 /// `LoadGlobal` semantics with no frame coupling: the framed arm and the fused tier both
 /// call this. The result is RETAINED for the caller's register.
 pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Module, lg: anytype, host: *H) Allocator.Error!EvalResult {
+    // A slotted property's binding is addressed by index; the name path below
+    // runs only until the initialiser has bound it.
+    if (lg.slot) |slot| {
+        if (comptime @hasDecl(H, "topSlotGet")) {
+            if (host.topSlotGet(slot)) |v| {
+                v.retain();
+                return ok(v);
+            }
+        }
+    }
     {
             const name_str = constStr(module, lg.name) orelse
                 return errResult(.{ .Type = "LoadGlobal: name not a string const" });
@@ -1506,6 +2138,17 @@ pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Mo
                 host.lookupGlobalById(allocator, lg.func, lg.class, lg.ctor_ref, lg.type_qualifier)
             else
                 null;
+            // `KLIO_GLOBAL_ID_AUDIT=1`: an identity that declines sends the
+            // read back to the name ladder, so a site the census calls
+            // resolved is only resolved as far as the id answers.
+            if (globalIdAuditOn() and (lg.func != null or lg.class != null)) {
+                if (by_id != null) {
+                    _ = global_id_served.fetchAdd(1, .monotonic);
+                } else {
+                    _ = global_id_declined.fetchAdd(1, .monotonic);
+                    if (globalIdAuditNames()) std.debug.print("[global-id] declined {s}\n", .{name_str});
+                }
+            }
             const lg_r: MaybeValueResult = if (by_id != null) .{ .ok = by_id } else try host.lookupGlobalThrowing(allocator, name_str);
             const found = switch (lg_r) {
                 .ok => |maybe| maybe,

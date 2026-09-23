@@ -59,7 +59,27 @@ pub fn checkCall(
     type_args: []const TypeRef,
     call_span: Span,
 ) Allocator.Error!Type {
-    const ty = try checkCallInner(self, callee, args, arg_names, type_args, call_span);
+    return checkCallInfix(self, callee, args, arg_names, type_args, call_span, false);
+}
+
+/// `is_infix` says the source wrote `a name b`, which the parser desugars to
+/// this shape; the declaration it names is a member of the first argument.
+pub fn checkCallInfix(
+    self: *Checker,
+    callee: *const Expr,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const TypeRef,
+    call_span: Span,
+    is_infix: bool,
+) Allocator.Error!Type {
+    var ty = try checkCallInner(self, callee, args, arg_names, type_args, call_span, is_infix);
+    // A result the checker does not model carries the class the call is known
+    // to produce, so the identity survives inference: `T` solved from this
+    // result is that class, not an unknown.
+    if (ty == .Unresolved and ty.Unresolved == null) {
+        if (self.expr_class.get(call_span)) |cn| ty = .{ .Unresolved = cn };
+    }
     if (!self.expr_class.contains(call_span)) {
         if (returnClassName(self, &ty)) |cn| {
             self.expr_class.put(call_span, try self.internName(cn)) catch {};
@@ -86,6 +106,13 @@ pub fn checkCall(
 fn returnClassName(self: *Checker, t: *const Type) ?[]const u8 {
     return switch (t.*) {
         .Generic => |g| if (self.classes.contains(g.name)) g.name else null,
+        // A plain user class is `Unresolved` carrying its declared name, which
+        // is where most constructor and factory results land. Reading only the
+        // generic head dropped the identity of every one of them.
+        .Unresolved => |name| if (name) |n|
+            (if (self.classes.contains(n)) n else null)
+        else
+            null,
         .Nullable => |inner| returnClassName(self, inner),
         else => null,
     };
@@ -98,6 +125,7 @@ fn checkCallInner(
     arg_names: []const ?[]const u8,
     type_args: []const TypeRef,
     call_span: Span,
+    call_is_infix: bool,
 ) Allocator.Error!Type {
     _ = @atomicRmw(u64, &call_shape_counts[0], .Add, 1, .monotonic);
     if (callee.* == .Path and callee.Path.segments.len == 1) {
@@ -169,7 +197,7 @@ fn checkCallInner(
                         var t = try expr_mod.checkExpr(self, arg, null);
                         t.deinit(self.allocator);
                     }
-                    return .Unresolved;
+                    return unresHere(@src().line);
                 }
             }
             if (self.fn_visibility.get(name)) |entries| {
@@ -224,21 +252,30 @@ fn checkCallInner(
                     acc = t;
                 }
             }
-            const elem = acc orelse Type.Unresolved;
+            const elem = acc orelse Type.unresolved;
             try putListElem(self, call_span, elem);
-            return .Unresolved;
+            return unresHere(@src().line);
         }
         if (root.classNamed(self, name)) |cls| {
             try visibility.checkClassUseVisibility(self, name, &cls, callee_span);
+            if (cls.ctors.items.len != 0 and !types.tcOff("CTOR")) {
+                return checkOverloadedCallRecImpl(self, cls.ctors.items, args, arg_names, type_args, call_span, false, "");
+            }
             if (cls.has_secondary_ctors) {
                 // Several arities exist and the runtime picks between them.
                 for (args) |*a| {
                     var t = try expr_mod.checkExpr(self, a, null);
                     t.deinit(self.allocator);
                 }
-                return .Unresolved;
+                return unresHere(@src().line);
             }
             if (cls.ctor) |sig| {
+                // A generic class is instantiated by its arguments, or by
+                // the written `<...>`.
+                if (sig.type_param_names.len != 0 and !types.tcOff("CTOR")) {
+                    const one = [_]FnSig{sig};
+                    return checkOverloadedCallRecImpl(self, &one, args, arg_names, type_args, call_span, false, "");
+                }
                 try checkArityAndArgs(self, &sig, args, callee.span());
             } else {
                 for (args) |*a| {
@@ -246,7 +283,7 @@ fn checkCallInner(
                     t.deinit(self.allocator);
                 }
             }
-            return .Unresolved;
+            return unresHere(@src().line);
         }
     }
     // Flow a seeded `List<T>` element type through the chain so each lambda
@@ -255,6 +292,21 @@ fn checkCallInner(
         _ = @atomicRmw(u64, &call_shape_counts[1], .Add, 1, .monotonic);
         const m = callee.Member;
         const mname = m.name.name;
+        // `kotlin.synchronized(...)`: a package prefix names no value, so the
+        // call is the bare call of its last segment.
+        if (m.receiver.* == .Path and m.receiver.Path.segments.len != 0) pkg: {
+            const first = m.receiver.Path.segments[0].name;
+            if (!root.packageRoot(self, first)) break :pkg;
+            if (narrowing.lookup(self, first) != null or root.classNamed(self, first) != null or
+                self.fns.contains(first) or self.prop_visibility.contains(first) or
+                self.classes.contains(first)) break :pkg;
+            for (m.receiver.Path.segments) |seg| {
+                if (seg.name.len == 0 or !std.ascii.isLower(seg.name[0])) break :pkg;
+            }
+            var segs = [_]ast.Ident{m.name};
+            const bare: Expr = .{ .Path = .{ .segments = &segs, .span = m.name.span } };
+            return checkCallInner(self, &bare, args, arg_names, type_args, call_span, call_is_infix);
+        }
         if (isScopeFn(mname)) {
             if (try checkMemberContractCall(self, m.receiver, mname, args)) |ty| {
                 return ty;
@@ -274,7 +326,7 @@ fn checkCallInner(
                 if (args.len > 0) {
                     const expect = Type{ .Function = .{
                         .params = try self.allocator.dupe(Type, &[_]Type{try elem.clone(self.allocator)}),
-                        .return_type = try newType(self.allocator, .Unresolved),
+                        .return_type = try newType(self.allocator, Type.unresolved),
                         .is_suspend = false,
                     } };
                     var expect_mut = expect;
@@ -282,12 +334,12 @@ fn checkCallInner(
                     var ty = try expr_mod.checkExpr(self, &args[0], &expect);
                     var new_elem: Type = switch (ty) {
                         .Function => |f| try f.return_type.clone(self.allocator),
-                        else => .Unresolved,
+                        else => Type.unresolved,
                     };
                     ty.deinit(self.allocator);
                     try putListElem(self, call_span, new_elem);
-                    new_elem = .Unresolved;
-                    return .Unresolved;
+                    new_elem = Type.unresolved;
+                    return unresHere(@src().line);
                 }
             } else if (std.mem.eql(u8, mname, "filter")) {
                 if (args.len > 0) {
@@ -300,7 +352,7 @@ fn checkCallInner(
                     var t = try expr_mod.checkExpr(self, &args[0], &expect);
                     t.deinit(self.allocator);
                     try putListElem(self, call_span, try elem.clone(self.allocator));
-                    return .Unresolved;
+                    return unresHere(@src().line);
                 }
             } else if (std.mem.eql(u8, mname, "forEach")) {
                 if (args.len > 0) {
@@ -337,17 +389,10 @@ fn checkCallInner(
             class_from_ty = cn;
         } else {
             // Reuse the receiver typed above; re-typing costs 2^depth.
-            class_from_ty = switch (recv_ty.nonNull().*) {
-                .Generic => |g| g.name,
-                .String => "String",
-                .Int => "Int",
-                .Long => "Long",
-                .Boolean => "Boolean",
-                .Char => "Char",
-                .Double => "Double",
-                .Float => "Float",
-                else => null,
-            };
+            // The unsigned types and a user class carried on `Unresolved`
+            // were missing, so `u.toLong()` and `thing.method()` reached the
+            // extension probe with no class and fell through untyped.
+            class_from_ty = typeClassName(recv_ty.nonNull());
         }
         if (class_from_ty) |cn| {
             // Before the extension fallback, so a private member is flagged.
@@ -361,13 +406,66 @@ fn checkCallInner(
             if (envFlag("KLIO_EAGER_AUDIT")) {
                 std.debug.print("[EAGER-MEMBER] recv_class={s} name={s} cands={d} ext_key={}\n", .{ cn, mname, cands.items.len, self.extensions.contains(cn) });
             }
+            if (cands.items.len == 0) {
+                // No extension of the name on this class: it may be a MEMBER,
+                // which this arm never looked for. `5.toLong()`, `sb.append`,
+                // `list.add` all land here. The declared SIGNATURES live in
+                // `member_methods` — `members` collapses overloads to one
+                // entry — so the pick is the ordinary overload selection over
+                // the argument types rather than an arity guess.
+                var msigs: std.ArrayList(FnSig) = .empty;
+                defer msigs.deinit(self.allocator);
+                const decl_class = try collectMemberSigs(self, cn, mname, &msigs);
+                if (msigs.items.len != 0) {
+                    if (decl_class) |dc| {
+                        if (try receiverSubst(self, &recv_ty, dc)) |subst| {
+                            var owned_subst = subst;
+                            defer deinitSubst(&owned_subst, self.allocator);
+                            for (msigs.items) |*sg| sg.* = try instantiateSig(self.allocator, sg, &owned_subst);
+                        }
+                    }
+                    call_receiver_override = &recv_ty;
+                    const ret = try checkOverloadedCallRecordedAt(
+                        self,
+                        msigs.items,
+                        args,
+                        arg_names,
+                        type_args,
+                        call_span,
+                        mname,
+                        m.name.span,
+                    );
+                    if (!self.expr_class.contains(call_span)) if (helpers.classNameOfType(&ret)) |rcn| {
+                        try self.expr_class.put(call_span, try self.internName(rcn));
+                    };
+                    return ret;
+                }
+                if (try memberReturnOf(self, cn, mname, args.len)) |ret| {
+                    for (args) |*a| {
+                        var t = try expr_mod.checkExpr(self, a, null);
+                        t.deinit(self.allocator);
+                    }
+                    return ret;
+                }
+            }
             if (cands.items.len != 0) {
                 _ = @atomicRmw(u64, &call_shape_counts[3], .Add, 1, .monotonic);
                 // Full selection, so `sb.append("x")` picks `append(String)`
                 // over an arity-matching sibling.
                 var sigs_buf: std.ArrayList(FnSig) = .empty;
                 defer sigs_buf.deinit(self.allocator);
-                for (cands.items) |c| try sigs_buf.append(self.allocator, c.sig);
+                for (cands.items) |c| {
+                    if (c.decl_class) |dc| {
+                        if (try receiverSubst(self, &recv_ty, dc)) |subst| {
+                            var owned_subst = subst;
+                            defer deinitSubst(&owned_subst, self.allocator);
+                            try sigs_buf.append(self.allocator, try instantiateSig(self.allocator, &c.sig, &owned_subst));
+                            continue;
+                        }
+                    }
+                    try sigs_buf.append(self.allocator, c.sig);
+                }
+                call_receiver_override = &recv_ty;
                 // Complete here: the image publishes every extension on the
                 // class and its supertypes, so the pick may record.
                 const ret = try checkOverloadedCallRecordedAt(
@@ -388,6 +486,8 @@ fn checkCallInner(
                     } else {
                         try self.expr_class.put(call_span, try self.internName(rcn));
                     }
+                } else if (helpers.classNameOfType(&ret)) |rcn| {
+                    try self.expr_class.put(call_span, try self.internName(rcn));
                 }
                 return ret;
             }
@@ -416,11 +516,116 @@ fn checkCallInner(
     }
     var ct = callee_ty;
     ct.deinit(self.allocator);
+    // `a and b` parses as `Call(Path["and"], [a, b])`, and the declaration it
+    // names is a MEMBER of the first argument's type — `Int.and`, `Long.shl`,
+    // `CharSequence.get`. The checker looked the name up among top-level
+    // functions only, so every infix call on a builtin came out untyped:
+    // `and`, `or`, `shl`, `shr`, `ushr`, `xor` are 1 500 of one compose
+    // program's untypable calls on their own.
+    if (call_is_infix and args.len == 2 and callee.* == .Path and callee.Path.segments.len == 1 and !types.tcOff("INFIX")) {
+        if (try infixCall(self, callee.Path.segments[0].name, &args[0], args[1..], call_span, callee.Path.segments[0].span)) |ret| {
+            return ret;
+        }
+    }
+    // A bare call against the implicit receivers in scope, innermost first:
+    // the receiver whose class chain declares a member of the name, or has
+    // an extension of it, takes the call. Not recorded as the eager pick: a
+    // member target needs the receiver the bare-call emitter does not pass.
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        if (try implicitReceiverCall(self, callee.Path.segments[0].name, args, arg_names, type_args, call_span)) |t| return t;
+    }
     for (args) |*a| {
         var t = try expr_mod.checkExpr(self, a, null);
         t.deinit(self.allocator);
     }
-    return .Unresolved;
+    // `Any`'s members are every value's, whatever the receiver's type came
+    // to: `x.toString()` is a `String`, `x.hashCode()` an `Int`, `x.equals(y)`
+    // a `Boolean`. Kotlin lets no class change those results.
+    if (callee.* == .Member and type_args.len == 0) {
+        const mn = callee.Member.name.name;
+        if (args.len == 0 and std.mem.eql(u8, mn, "toString")) return .String;
+        if (args.len == 0 and std.mem.eql(u8, mn, "hashCode")) return .Int;
+        if (args.len == 1 and std.mem.eql(u8, mn, "equals")) return .Boolean;
+    }
+    // The last exit of the call checker, and 80% of every call it cannot
+    // type. Split by what the callee is, so the shapes that dominate are
+    // named rather than guessed at.
+    if (callUnresOn()) {
+        const k: usize = switch (callee.*) {
+            .Path => |pp| if (pp.segments.len == 1) 0 else 1,
+            .Member => 2,
+            .Lambda, .AnonFun => 3,
+            else => 4,
+        };
+        _ = @atomicRmw(u64, &call_tail_shape[k], .Add, 1, .monotonic);
+        if (std.c.getenv("KLIO_CALL_UNRES_NAMES") != null) {
+            const nm: []const u8 = switch (callee.*) {
+                .Path => |pp| if (pp.segments.len != 0) pp.segments[pp.segments.len - 1].name else "?",
+                .Member => |mm| mm.name.name,
+                else => @tagName(std.meta.activeTag(callee.*)),
+            };
+            const recv_desc: []const u8 = switch (callee.*) {
+                .Member => |mm| blk: {
+                    if (self.expr_class.get(mm.receiver.span())) |rc| break :blk rc;
+                    if (self.types.getPtr(mm.receiver.span())) |rt| break :blk @tagName(std.meta.activeTag(rt.*));
+                    break :blk "untyped";
+                },
+                else => "-",
+            };
+            const recv_kind: []const u8 = switch (callee.*) {
+                .Member => |mm| @tagName(std.meta.activeTag(mm.receiver.*)),
+                else => "-",
+            };
+            const recv_name: []const u8 = switch (callee.*) {
+                .Member => |mm| switch (mm.receiver.*) {
+                    .Path => |pp| if (pp.segments.len != 0) pp.segments[pp.segments.len - 1].name else "?",
+                    .Member => |m2| m2.name.name,
+                    .Call => |cc| switch (cc.callee.*) {
+                        .Path => |pp| if (pp.segments.len != 0) pp.segments[pp.segments.len - 1].name else "?",
+                        .Member => |m3| m3.name.name,
+                        else => "?",
+                    },
+                    else => "-",
+                },
+                else => "-",
+            };
+            std.debug.print("[CALL-TAIL] {s} {s} recv={s} rk={s} rn={s}\n", .{ @tagName(std.meta.activeTag(callee.*)), nm, recv_desc, recv_kind, recv_name });
+        }
+    }
+    return unresHere(@src().line);
+}
+
+fn implicitReceiverCall(
+    self: *Checker,
+    name: []const u8,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const TypeRef,
+    call_span: Span,
+) Allocator.Error!?Type {
+    const a = self.allocator;
+    const receivers = try expr_mod.implicitReceiverClassesAlloc(self, a);
+    defer a.free(receivers);
+    for (receivers) |cn| {
+        var sigs: std.ArrayList(FnSig) = .empty;
+        defer sigs.deinit(a);
+        _ = try collectMemberSigs(self, cn, name, &sigs);
+        var cands: std.ArrayList(expr_mod.ExtensionCandidate) = .empty;
+        defer cands.deinit(a);
+        try expr_mod.lookupExtensionCandidates(self, cn, name, args.len, &cands);
+        var first_class: ?[]const u8 = null;
+        for (cands.items) |c| {
+            try sigs.append(a, c.sig);
+            if (first_class == null) first_class = c.return_class;
+        }
+        if (sigs.items.len == 0) continue;
+        const ret = try checkOverloadedCallRecImpl(self, sigs.items, args, arg_names, type_args, call_span, false, name);
+        if (ret == .Unresolved and !self.expr_class.contains(call_span)) {
+            if (first_class) |rc| try self.expr_class.put(call_span, try self.internName(rc));
+        }
+        return ret;
+    }
+    return null;
 }
 
 fn anyExtensionFitsArity(self: *const Checker, name: []const u8, n_args: usize) bool {
@@ -683,6 +888,260 @@ fn sigMentionsTypeParam(sig: *const FnSig) bool {
 }
 
 /// `KLIO_EAGER_GATES=1`: which gate drops each candidate resolution.
+/// `KLIO_CALL_UNRES=1`: which exit of the call checker returns an unnameable
+/// type, attributed by source line. `Call` is 17 314 of the checker's
+/// unresolved spans and the exits are two dozen; a census keyed by line names
+/// them without labelling each one by hand.
+/// The class a checked type names, for a member lookup. Only the forms whose
+/// members the checker indexes: a builtin's own name, a user class carried on
+/// `Unresolved`, and a generic's head.
+pub fn typeClassName(t: *const Type) ?[]const u8 {
+    return switch (t.*) {
+        .Boolean => "Boolean",
+        .Byte => "Byte",
+        .Short => "Short",
+        .Int => "Int",
+        .Long => "Long",
+        .UByte => "UByte",
+        .UShort => "UShort",
+        .UInt => "UInt",
+        .ULong => "ULong",
+        .Float => "Float",
+        .Double => "Double",
+        .Char => "Char",
+        .String => "String",
+        .Generic => |g| g.name,
+        .Unresolved => |n| n,
+        .Nullable => |inner| typeClassName(inner),
+        else => null,
+    };
+}
+
+/// The return type of `name` as a member of the first argument's class, for an
+/// infix call. Null whenever the class is unknown, the member is absent, or
+/// the member is not a one-argument function.
+/// `a name b` is `a.name(b)`: the member or extension `name` on the left
+/// operand's class, selected over the right operand like any call. `until`,
+/// `downTo` and `to` are extensions; `and`, `shl` and their kin are members.
+fn infixCall(self: *Checker, name: []const u8, lhs: *const Expr, rhs: []const Expr, call_span: Span, name_span: Span) Allocator.Error!?Type {
+    var lt = try expr_mod.checkExpr(self, lhs, null);
+    defer lt.deinit(self.allocator);
+    const cname = self.expr_class.get(lhs.span()) orelse typeClassName(lt.nonNull()) orelse return null;
+    var sigs: std.ArrayList(FnSig) = .empty;
+    defer sigs.deinit(self.allocator);
+    var msigs: std.ArrayList(FnSig) = .empty;
+    defer msigs.deinit(self.allocator);
+    const decl_class = try collectMemberSigs(self, cname, name, &msigs);
+    for (msigs.items) |*sg| {
+        var inst = sg.*;
+        if (decl_class) |dc| {
+            if (try receiverSubst(self, &lt, dc)) |subst| {
+                var owned_subst = subst;
+                defer deinitSubst(&owned_subst, self.allocator);
+                inst = try instantiateSig(self.allocator, sg, &owned_subst);
+            }
+        }
+        if (inst.params.len == 1) try sigs.append(self.allocator, inst);
+    }
+    var cands: std.ArrayList(expr_mod.ExtensionCandidate) = .empty;
+    defer cands.deinit(self.allocator);
+    try expr_mod.lookupExtensionCandidates(self, cname, name, 1, &cands);
+    for (cands.items) |c| {
+        if (c.decl_class != null) continue;
+        try sigs.append(self.allocator, c.sig);
+    }
+    if (sigs.items.len == 0) return null;
+    const no_names = [_]?[]const u8{null};
+    call_receiver_override = &lt;
+    const ret = try checkOverloadedCallRecordedAt(self, sigs.items, rhs, &no_names, &.{}, call_span, name, name_span);
+    if (!self.expr_class.contains(call_span)) if (helpers.classNameOfType(&ret)) |rcn| {
+        try self.expr_class.put(call_span, try self.internName(rcn));
+    };
+    return ret;
+}
+
+/// The return type of `name` as a member of `cname` or one of its
+/// supertypes, taking `nargs` value arguments. `members` collapses overloads
+/// to one entry, so a name with several arities answers only when the entry's
+/// own arity matches: a wrong return type is worse than none.
+/// Every declared signature of `name` on `cname` or its supertypes.
+///
+/// `ClassInfo.members` collapses overloads to one entry, which is why an
+/// arity guess off it answers `sb.append(x)` with whichever `append` was
+/// recorded last. `member_methods` is the set the class actually declares,
+/// and the ordinary overload selection ranks it by the argument types.
+/// Returns the class that declares them.
+fn collectMemberSigs(self: *Checker, cname: []const u8, name: []const u8, out: *std.ArrayList(FnSig)) Allocator.Error!?[]const u8 {
+    var seen: usize = 0;
+    var cur: ?[]const u8 = cname;
+    while (cur) |c| {
+        if (seen > 16) break;
+        seen += 1;
+        const info = root.classNamed(self, c) orelse break;
+        if (info.member_methods.get(name)) |sigs| {
+            for (sigs.items) |sg| try out.append(self.allocator, sg);
+            return c;
+        }
+        cur = if (info.supertypes.items.len != 0) info.supertypes.items[0] else null;
+    }
+    return null;
+}
+
+/// The substitution a receiver's type arguments give a member declared on
+/// `decl_class`: a `MutableMap<String, Int>` read through `Map<K, V>` maps
+/// `K` to `String` and `V` to `Int`. Null when the receiver carries no
+/// arguments, or the chain from its class to `decl_class` is unknown.
+/// The caller owns the map and its values.
+pub fn receiverSubst(self: *Checker, recv_ty: *const Type, decl_class: []const u8) Allocator.Error!?std.StringHashMap(Type) {
+    const a = self.allocator;
+    if (types.tcOff("GENERIC")) return null;
+    const core = recv_ty.nonNull();
+    if (core.* != .Generic) return null;
+    const g = core.Generic;
+    const decl_info = root.classNamed(self, decl_class) orelse return null;
+    if (decl_info.type_param_names.items.len == 0) return null;
+    const recv_info = root.classNamed(self, g.name) orelse return null;
+    // `decl_class`'s arguments spelled in the receiver class's own parameters.
+    const projected = (try decl_mod.walkSupertypeArgs(self, g.name, decl_class)) orelse return null;
+    defer {
+        for (projected) |*t| t.deinit(a);
+        a.free(projected);
+    }
+    var own = std.StringHashMap(Type).init(a);
+    defer own.deinit();
+    const n = @min(recv_info.type_param_names.items.len, g.args.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (g.args[i].is_star) continue;
+        try own.put(recv_info.type_param_names.items[i], g.args[i].ty);
+    }
+    var out = std.StringHashMap(Type).init(a);
+    errdefer deinitSubst(&out, a);
+    for (decl_info.type_param_names.items, 0..) |name, j| {
+        if (j >= projected.len) break;
+        const t = try helpers.substituteTypeParams(a, &projected[j], &own);
+        // A parameter the receiver leaves unbound stays a parameter.
+        if (t == .TypeParam) {
+            var tt = t;
+            tt.deinit(a);
+            continue;
+        }
+        try out.put(name, t);
+    }
+    if (out.count() == 0) {
+        out.deinit();
+        return null;
+    }
+    return out;
+}
+
+pub fn deinitSubst(m: *std.StringHashMap(Type), a: Allocator) void {
+    var it = m.valueIterator();
+    while (it.next()) |t| t.deinit(a);
+    m.deinit();
+}
+
+/// `sig` with `subst` applied to its parameter, return and receiver types.
+/// Everything else is shared with the declaration's record.
+fn instantiateSig(a: Allocator, sig: *const FnSig, subst: *const std.StringHashMap(Type)) Allocator.Error!FnSig {
+    var out = sig.*;
+    const params = try a.alloc(Type, sig.params.len);
+    for (sig.params, params) |*p, *dst| dst.* = try helpers.substituteTypeParams(a, p, subst);
+    out.params = params;
+    out.return_ty = try helpers.substituteTypeParams(a, &sig.return_ty, subst);
+    if (sig.receiver_ty) |*r| out.receiver_ty = try helpers.substituteTypeParams(a, r, subst);
+    const pcn = try a.alloc(?[]const u8, sig.params.len);
+    for (params, sig.param_class_names, pcn) |*p, old, *dst| dst.* = old orelse helpers.classNameOfType(p);
+    out.param_class_names = pcn;
+    if (out.return_class == null) out.return_class = helpers.classNameOfType(&out.return_ty);
+    return out;
+}
+
+/// `recv` (a `Generic`) seen as its supertype `target`: `ArrayList<Int>` as
+/// `Iterable<Int>`. Null when the hierarchy does not reach `target`. Owned.
+fn projectGeneric(self: *Checker, recv: *const Type, target: []const u8) Allocator.Error!?Type {
+    const a = self.allocator;
+    if (recv.* != .Generic) return null;
+    const g = recv.Generic;
+    const recv_info = root.classNamed(self, g.name) orelse return null;
+    const projected = (try decl_mod.walkSupertypeArgs(self, g.name, target)) orelse return null;
+    defer {
+        for (projected) |*t| t.deinit(a);
+        a.free(projected);
+    }
+    var own = std.StringHashMap(Type).init(a);
+    defer own.deinit();
+    const n = @min(recv_info.type_param_names.items.len, g.args.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (g.args[i].is_star) continue;
+        try own.put(recv_info.type_param_names.items[i], g.args[i].ty);
+    }
+    const args = try a.alloc(types.GenericArg, projected.len);
+    for (projected, args) |*t, *dst| {
+        dst.* = .{ .variance = .Invariant, .is_star = false, .ty = try helpers.substituteTypeParams(a, t, &own) };
+    }
+    return .{ .Generic = .{ .name = try a.dupe(u8, target), .args = args } };
+}
+
+/// The receiver of the member call being checked, for the extension receiver
+/// constraint. Set beside the call and consumed once, so a call nested in an
+/// argument never reads its enclosing call's receiver.
+threadlocal var call_receiver_override: ?*const Type = null;
+
+pub fn memberReturnOfPub(self: *Checker, cname: []const u8, name: []const u8, nargs: usize) Allocator.Error!?Type {
+    return memberReturnOf(self, cname, name, nargs);
+}
+
+fn memberReturnOf(self: *Checker, cname: []const u8, name: []const u8, nargs: usize) Allocator.Error!?Type {
+    var seen: usize = 0;
+    var cur: ?[]const u8 = cname;
+    while (cur) |c| {
+        if (seen > 16) break;
+        seen += 1;
+        const info = root.classNamed(self, c) orelse break;
+        if (info.members.get(name)) |m| {
+            if (m == .Function and m.Function.params.len == nargs) {
+                if (m.Function.return_type.* == .Unresolved and m.Function.return_type.Unresolved == null) break;
+                return try m.Function.return_type.clone(self.allocator);
+            }
+            break;
+        }
+        cur = if (info.supertypes.items.len != 0) info.supertypes.items[0] else null;
+    }
+    return null;
+}
+
+pub var call_unres_by_line: [4096]u32 = [_]u32{0} ** 4096;
+/// The callee shape at the call checker's last exit: bare name, qualified
+/// path, member, lambda literal, anything else.
+pub var call_tail_shape: [5]u64 = @splat(0);
+var call_unres_probe: u8 = 0;
+
+pub fn callUnresOn() bool {
+    if (call_unres_probe == 0)
+        call_unres_probe = if (std.c.getenv("KLIO_CALL_UNRES") != null) 2 else 1;
+    return call_unres_probe == 2;
+}
+
+pub inline fn unresHere(line: u32) Type {
+    if (callUnresOn()) _ = @atomicRmw(u32, &call_unres_by_line[line & 4095], .Add, 1, .monotonic);
+    return Type.unresolved;
+}
+
+pub fn dumpCallUnres() void {
+    if (!callUnresOn()) return;
+    var total: u64 = 0;
+    for (call_unres_by_line) |c| total += c;
+    std.debug.print("[CALL-UNRES] total={d}\n", .{total});
+    for (call_unres_by_line, 0..) |c, line| {
+        if (c >= 50) std.debug.print("[CALL-UNRES] {d:>8}  expr_calls.zig:{d}\n", .{ c, line });
+    }
+    std.debug.print("[CALL-TAIL] bare_name={d} qualified={d} member={d} lambda={d} other={d}\n", .{
+        call_tail_shape[0], call_tail_shape[1], call_tail_shape[2], call_tail_shape[3], call_tail_shape[4],
+    });
+}
+
 pub var eager_gate_counts: [7]u64 = @splat(0);
 /// `KLIO_EAGER_AUDIT`: [0] calls seen, [1] member callees, [2] those whose
 /// receiver class was named, [3] those that found extension candidates.
@@ -835,6 +1294,8 @@ fn checkOverloadedCallRecImpl(
     record: bool,
     record_name: []const u8,
 ) Allocator.Error!Type {
+    const recv_ty = call_receiver_override;
+    call_receiver_override = null;
     try checkCrossinlineArgReturns(self, sigs, args, arg_names);
     // Every named argument must map to a parameter of each survivor, and
     // explicit `<...>` must match its type-parameter count exactly.
@@ -921,9 +1382,6 @@ fn checkOverloadedCallRecImpl(
         try enforceSuspendColoring(self, sig.is_suspend, "function", call_span);
         // Filtering a set down to one is not a typed decision.
         if (record and sigs.len == 1 and !sig.is_extension) recordResolvedCall(self, call_span, sig, record_name);
-        if (has_type_args or sig.type_param_count == 0) {
-            return sig.return_ty.clone(self.allocator);
-        }
         // A `suspend` parameter gives the lambda a suspend context.
         const trailing_idx = trailingLambdaParamIdx(sig, args);
         var arg_tys: std.ArrayList(Type) = .empty;
@@ -931,12 +1389,26 @@ fn checkOverloadedCallRecImpl(
             for (arg_tys.items) |*t| t.deinit(self.allocator);
             arg_tys.deinit(self.allocator);
         }
+        if (has_type_args or sig.type_param_count == 0) {
+            for (args, 0..) |*a, i| {
+                const pidx = if (i + 1 == args.len) (trailing_idx orelse i) else i;
+                const hint: ?*const Type = if (pidx < sig.params.len) &sig.params[pidx] else null;
+                var t = try expr_mod.checkExpr(self, a, hint);
+                t.deinit(self.allocator);
+            }
+            if (has_type_args) return returnWithTypeArgs(self, sig, type_args);
+            return sig.return_ty.clone(self.allocator);
+        }
         for (args, 0..) |*a, i| {
+            if (a.* == .Lambda or a.* == .AnonFun) {
+                try arg_tys.append(self.allocator, Type.unresolved);
+                continue;
+            }
             const pidx = if (i + 1 == args.len) (trailing_idx orelse i) else i;
             const hint: ?*const Type = if (pidx < sig.params.len) &sig.params[pidx] else null;
             try arg_tys.append(self.allocator, try expr_mod.checkExpr(self, a, hint));
         }
-        return inferCallReturnWithArgs(self, sig, arg_tys.items, args, call_span);
+        return inferCallReturnWithArgs(self, sig, arg_tys.items, args, call_span, recv_ty);
     }
     // Lambda arguments are deferred: unhinted they would invent a synthetic
     // `it` and poison selection. `Unresolved` fits every candidate meanwhile.
@@ -947,7 +1419,7 @@ fn checkOverloadedCallRecImpl(
     }
     for (args) |*a| {
         switch (a.*) {
-            .Lambda, .AnonFun => try arg_tys.append(self.allocator, .Unresolved),
+            .Lambda, .AnonFun => try arg_tys.append(self.allocator, Type.unresolved),
             else => try arg_tys.append(self.allocator, try expr_mod.checkExpr(self, a, null)),
         }
     }
@@ -1055,7 +1527,7 @@ fn checkOverloadedCallRecImpl(
             var t = try expr_mod.checkExpr(self, a, null);
             t.deinit(self.allocator);
         }
-        return .Unresolved;
+        return unresHere(@src().line);
     }
     const sig = chosen orelse arity_match.?;
     // The arity-match fallback is a guess, and an `Unresolved` argument fits
@@ -1105,14 +1577,23 @@ fn checkOverloadedCallRecImpl(
     if (has_type_args) {
         try decl_mod.checkTypeArgBounds(self, sig, type_args);
     }
-    // Each deferred body is checked exactly once, with its declared shape.
-    {
+    // A call with written type arguments is instantiated by them; its
+    // lambdas check against the substituted parameters.
+    if (has_type_args) {
         const t_idx = trailingLambdaParamIdx(sig, args);
+        var subst = std.StringHashMap(Type).init(self.allocator);
+        defer deinitSubst(&subst, self.allocator);
+        if (type_args.len == sig.type_param_names.len) {
+            for (sig.type_param_names, type_args) |name, *ta| {
+                try subst.put(name, try root.convertTypeRefLossy(self.allocator, ta));
+            }
+        }
         for (args, 0..) |*a, i| {
             if (a.* != .Lambda and a.* != .AnonFun) continue;
             const pidx = if (i + 1 == args.len) (t_idx orelse i) else i;
-            const hint: ?*const Type = if (pidx < sig.params.len) &sig.params[pidx] else null;
-            const t = try expr_mod.checkExpr(self, a, hint);
+            var hint: ?Type = if (pidx < sig.params.len) try helpers.substituteTypeParams(self.allocator, &sig.params[pidx], &subst) else null;
+            defer if (hint) |*h| h.deinit(self.allocator);
+            const t = try expr_mod.checkExpr(self, a, if (hint) |*h| h else null);
             if (i < arg_tys.items.len) {
                 arg_tys.items[i].deinit(self.allocator);
                 arg_tys.items[i] = t;
@@ -1150,15 +1631,39 @@ fn checkOverloadedCallRecImpl(
         }
     }
     if (has_type_args) {
-        if (uncertain_pick) return .Unresolved;
-        return sig.return_ty.clone(self.allocator);
+        if (uncertain_pick) return unresHere(@src().line);
+        return returnWithTypeArgs(self, sig, type_args);
     }
-    var ret = try inferCallReturnWithArgs(self, sig, arg_tys.items, args, call_span);
+    var ret = try inferCallReturnWithArgs(self, sig, arg_tys.items, args, call_span, recv_ty);
+    // The lambdas were typed by the inference; their types check against
+    // the chosen parameters like every other argument's.
+    {
+        const sig_va = sigVarargIdx(sig);
+        const n = @min(args.len, arg_tys.items.len);
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            if (args[k] != .Lambda and args[k] != .AnonFun) continue;
+            const slot = if (sig_va != null and k >= sig_va.?) sig_va.? else k;
+            if (slot >= sig.params.len) break;
+            try checkAssignable(self, &arg_tys.items[k], &sig.params[slot], args[k].span());
+        }
+    }
     if (uncertain_pick) {
         ret.deinit(self.allocator);
-        return .Unresolved;
+        return unresHere(@src().line);
     }
     return ret;
+}
+
+/// The return type under the call's written `<...>`.
+fn returnWithTypeArgs(self: *Checker, sig: *const FnSig, type_args: []const TypeRef) Allocator.Error!Type {
+    if (type_args.len != sig.type_param_names.len) return sig.return_ty.clone(self.allocator);
+    var subst = std.StringHashMap(Type).init(self.allocator);
+    defer deinitSubst(&subst, self.allocator);
+    for (sig.type_param_names, type_args) |name, *ta| {
+        try subst.put(name, try root.convertTypeRefLossy(self.allocator, ta));
+    }
+    return helpers.substituteTypeParams(self.allocator, &sig.return_ty, &subst);
 }
 
 fn sigParamsResolved(sig: *const FnSig) bool {
@@ -1254,7 +1759,7 @@ fn lambdaReturnTiebreak(
     var open_params = try self.allocator.alloc(Type, first_fn.params.len);
     defer self.allocator.free(open_params);
     for (first_fn.params, 0..) |*pt, i| open_params[i] = pt.*;
-    var open_ret: Type = .Unresolved;
+    var open_ret: Type = Type.unresolved;
     const expected = Type{ .Function = .{
         .params = open_params,
         .return_type = &open_ret,
@@ -1415,17 +1920,36 @@ fn joinStrings(allocator: Allocator, parts: []const []const u8, sep: []const u8)
     return aw.toOwnedSlice();
 }
 
-/// One session per source-level expression: the outermost call solves and
-/// substitutes, inner ones hand back a type still carrying fresh vars.
+/// The lambda arguments of a call are checked here, once, after the receiver
+/// and the other arguments have bound what their parameter types depend on:
+/// `xs.map { it }` sees `it` as the element type, not the callee's `T`. Each
+/// lambda's type lands in its `arg_tys` slot. One inference session serves a
+/// source-level expression: the outermost call solves and substitutes, inner
+/// ones hand back a type still carrying fresh vars.
 pub fn inferCallReturnWithArgs(
     self: *Checker,
     sig: *const FnSig,
-    arg_tys: []const Type,
+    arg_tys: []Type,
     args: []const Expr,
     call_span: Span,
+    recv_ty: ?*const Type,
 ) Allocator.Error!Type {
     const constraints = types.constraints;
+    const trailing_idx = trailingLambdaParamIdx(sig, args);
     if (sig.type_param_count == 0 or sig.type_param_names.len == 0) {
+        for (args, 0..) |*arg, i| {
+            if (arg.* != .Lambda and arg.* != .AnonFun) continue;
+            const pidx = if (i + 1 == args.len) (trailing_idx orelse i) else i;
+            const hint: ?*const Type = if (pidx < sig.params.len) &sig.params[pidx] else null;
+            const t = try expr_mod.checkExpr(self, arg, hint);
+            if (i < arg_tys.len) {
+                arg_tys[i].deinit(self.allocator);
+                arg_tys[i] = t;
+            } else {
+                var owned = t;
+                owned.deinit(self.allocator);
+            }
+        }
         return sig.return_ty.clone(self.allocator);
     }
     const is_root = self.inference_session == null;
@@ -1458,17 +1982,34 @@ pub fn inferCallReturnWithArgs(
                 try session.all_vars.append(self.allocator, .{ .unique = fresh[1].TypeParam, .v = fresh[0] });
             }
         }
+        // The receiver binds an extension's parameters the same way an
+        // argument does: `xs.map { }` on a `List<Int>` fixes `Iterable<T>`'s
+        // `T` to `Int`, and `x.let { }` fixes `T` to `x`'s type.
+        if (recv_ty) |rt| if (!types.tcOff("RECV")) {
+            if (sig.receiver_ty) |*decl_recv| {
+                var r_with_vars = try helpers.substituteTypeParams(self.allocator, decl_recv, &local_subst);
+                defer r_with_vars.deinit(self.allocator);
+                const rc = rt.nonNull();
+                const dc = r_with_vars.nonNull();
+                var projected: ?Type = null;
+                defer if (projected) |*pt| pt.deinit(self.allocator);
+                if (rc.* == .Generic and dc.* == .Generic and !std.mem.eql(u8, rc.Generic.name, dc.Generic.name)) {
+                    projected = try projectGeneric(self, rc, dc.Generic.name);
+                }
+                const lhs: *const Type = if (projected) |*pt| pt else rc;
+                if (inferTraceOn()) std.debug.print("[infer] f{d}:{d}-{d} recv {f} decl {f} lhs {f}\n", .{ call_span.file.int(), call_span.start, call_span.end, rt.*, dc.*, lhs.* });
+                if (lhs.* != .Unresolved) {
+                    try session.cs.addConstraintWith(lhs.*, dc.*, .Subtype, constraints.Provenance.derived("receiver"));
+                }
+            }
+        };
         // A trailing lambda binds past defaulted middle parameters, so
         // `async { … }` constrains against `block`, not `context`.
-        const trailing_idx = trailingLambdaParamIdx(sig, args);
         for (arg_tys, 0..) |at, i| {
-            if (at == .Unresolved) {
-                continue;
-            }
+            if (at == .Unresolved) continue;
+            if (i < args.len and (args[i] == .Lambda or args[i] == .AnonFun)) continue;
             const pidx = if (i + 1 == arg_tys.len) (trailing_idx orelse i) else i;
-            if (pidx >= sig.params.len) {
-                continue;
-            }
+            if (pidx >= sig.params.len) continue;
             const p = &sig.params[pidx];
             var p_with_vars = try helpers.substituteTypeParams(self.allocator, p, &local_subst);
             defer p_with_vars.deinit(self.allocator);
@@ -1479,23 +2020,49 @@ pub fn inferCallReturnWithArgs(
                 .{ .CallSite = .{ .span = call_span, .arg_idx = i } },
             );
         }
+        // Each lambda is checked against its parameter type with everything
+        // the constraints so far have bound substituted in; a parameter still
+        // open stays its variable, which the lambda's own type then binds.
+        for (args, 0..) |*arg, i| {
+            if (arg.* != .Lambda and arg.* != .AnonFun) continue;
+            const pidx = if (i + 1 == args.len) (trailing_idx orelse i) else i;
+            if (pidx >= sig.params.len) {
+                const t = try expr_mod.checkExpr(self, arg, null);
+                if (i < arg_tys.len) {
+                    arg_tys[i].deinit(self.allocator);
+                    arg_tys[i] = t;
+                } else {
+                    var owned = t;
+                    owned.deinit(self.allocator);
+                }
+                continue;
+            }
+            var p_with_vars = try helpers.substituteTypeParams(self.allocator, &sig.params[pidx], &local_subst);
+            defer p_with_vars.deinit(self.allocator);
+            var expected = p_with_vars;
+            var expected_owned = false;
+            defer if (expected_owned) expected.deinit(self.allocator);
+            if (!types.tcOff("LAMBDA")) if (try sessionSolvedVars(self, session)) |solved| {
+                var owned_solved = solved;
+                defer deinitSubst(&owned_solved, self.allocator);
+                expected = try helpers.substituteTypeParams(self.allocator, &p_with_vars, &owned_solved);
+                expected_owned = true;
+            };
+            const t = try expr_mod.checkExpr(self, arg, &expected);
+            try session.cs.addConstraintWith(t, p_with_vars, .Subtype, .{ .CallSite = .{ .span = call_span, .arg_idx = i } });
+            if (i < arg_tys.len) {
+                arg_tys[i].deinit(self.allocator);
+                arg_tys[i] = t;
+            } else {
+                var owned = t;
+                owned.deinit(self.allocator);
+            }
+        }
     }
     // The fresh vars ride out as `TypeParam`, which downstream checks treat
     // permissively, until the root call solves and substitutes.
     var returned = try helpers.substituteTypeParams(self.allocator, &sig.return_ty, &local_subst);
     errdefer returned.deinit(self.allocator);
-    var final_subst = std.StringHashMap(Type).init(self.allocator);
-    defer {
-        var it = final_subst.valueIterator();
-        while (it.next()) |t| t.deinit(self.allocator);
-        final_subst.deinit();
-    }
-    {
-        var it = local_subst.iterator();
-        while (it.next()) |entry| {
-            try final_subst.put(entry.key_ptr.*, try entry.value_ptr.clone(self.allocator));
-        }
-    }
     if (is_root) {
         const session = &self.inference_session.?;
         if (try session.cs.solveToFixpoint()) |_| {
@@ -1516,57 +2083,39 @@ pub fn inferCallReturnWithArgs(
             }
             session.depth -= 1;
             if (session.depth == 0) {
+                self.inference_session.?.all_vars.deinit(self.allocator);
                 self.inference_session.?.cs.deinit();
                 self.inference_session = null;
             }
             returned.deinit(self.allocator);
             return sig.return_ty.clone(self.allocator);
         }
+        var final_subst = std.StringHashMap(Type).init(self.allocator);
+        defer deinitSubst(&final_subst, self.allocator);
+        {
+            var it = local_subst.iterator();
+            while (it.next()) |entry| {
+                try final_subst.put(entry.key_ptr.*, try entry.value_ptr.clone(self.allocator));
+            }
+        }
         var staged = try session.cs.solveStaged();
         defer staged.deinit();
         var legacy = try session.cs.solve();
         defer legacy.deinit();
         for (sig.type_param_names, 0..) |name, i| {
-            if (i < vars.items.len) {
-                const v = vars.items[i];
-                const pick = staged.get(v) orelse legacy.get(v);
-                if (pick) |t| {
-                    if (t != .Nothing) {
-                        if (final_subst.getPtr(name)) |existing| existing.deinit(self.allocator);
-                        try final_subst.put(name, try t.clone(self.allocator));
-                    }
-                }
+            if (i >= vars.items.len) continue;
+            const v = vars.items[i];
+            const pick = staged.get(v) orelse legacy.get(v);
+            if (inferTraceOn()) {
+                if (pick) |t| std.debug.print("[infer] f{d}:{d}-{d} solve {s} = {f}\n", .{ call_span.file.int(), call_span.start, call_span.end, name, t }) else std.debug.print("[infer] f{d}:{d}-{d} solve {s} = (none)\n", .{ call_span.file.int(), call_span.start, call_span.end, name });
             }
-        }
-    }
-    // Only meaningful at the root, where the substitution is fully solved.
-    if (is_root) {
-        const trailing_idx = trailingLambdaParamIdx(sig, args);
-        for (args, 0..) |*arg, i| {
-            if (arg.* != .Lambda) {
-                continue;
-            }
-            const pidx = if (i + 1 == args.len) (trailing_idx orelse i) else i;
-            if (pidx >= sig.params.len) {
-                continue;
-            }
-            const param_ty = &sig.params[pidx];
-            var expected = try helpers.substituteTypeParams(self.allocator, param_ty, &final_subst);
-            defer expected.deinit(self.allocator);
-            if (!helpers.expectedChanged(param_ty, &expected)) {
-                continue;
-            }
-            var refined = try expr_mod.checkExpr(self, arg, &expected);
-            defer refined.deinit(self.allocator);
-            if (expected == .Function and refined == .Function) {
-                const r_expected = expected.Function.return_type;
-                const r_refined = refined.Function.return_type;
-                if (r_expected.* == .TypeParam) {
-                    const nm = r_expected.TypeParam;
-                    if (r_refined.* != .Unresolved and r_refined.* != .Nothing) {
-                        if (final_subst.getPtr(nm)) |existing| existing.deinit(self.allocator);
-                        try final_subst.put(nm, try r_refined.clone(self.allocator));
-                    }
+            if (pick) |t| {
+                // An unknown is no solution: the parameter stays open. A class
+                // the checker does not model is `Unresolved` carrying its name,
+                // and that name IS the solution: `remember { Box() }` is a `Box`.
+                if (solutionSettles(&t)) {
+                    if (final_subst.getPtr(name)) |existing| existing.deinit(self.allocator);
+                    try final_subst.put(name, try t.clone(self.allocator));
                 }
             }
         }
@@ -1576,8 +2125,16 @@ pub fn inferCallReturnWithArgs(
     const session = &self.inference_session.?;
     session.depth -= 1;
     if (is_root) {
-        // A nested call recorded its result with vars still in flight.
+        // A nested call recorded its result with vars still in flight, and a
+        // lambda's return can carry them into this call's own result.
         refreshRecordedTypes(self, session) catch {};
+        if (try sessionSolvedVars(self, session)) |solved| {
+            var owned = solved;
+            defer deinitSubst(&owned, self.allocator);
+            const fixed = try helpers.substituteTypeParams(self.allocator, &returned, &owned);
+            returned.deinit(self.allocator);
+            returned = fixed;
+        }
         self.inference_session.?.all_vars.deinit(self.allocator);
         self.inference_session.?.cs.deinit();
         self.inference_session = null;
@@ -1585,27 +2142,57 @@ pub fn inferCallReturnWithArgs(
     return returned;
 }
 
-/// An unpinned variable is left alone, so a partially-solved call degrades to
-/// "unknown", never to wrong.
-fn refreshRecordedTypes(self: *Checker, session: *root.InferenceSession) Allocator.Error!void {
-    if (session.all_vars.items.len == 0) return;
+var infer_trace_probe: u8 = 0;
+/// `KLIO_INFER_TRACE=1`: one `[infer]` row per receiver constraint and per
+/// root solution.
+fn inferTraceOn() bool {
+    if (infer_trace_probe == 0)
+        infer_trace_probe = if (std.c.getenv("KLIO_INFER_TRACE") != null) 2 else 1;
+    return infer_trace_probe == 2;
+}
+
+/// Every variable the session pinned, by its unique name. Null when none
+/// was. The caller owns the map and its values.
+/// Whether a solved bound pins the variable: a type the checker models, or a
+/// class it does not but can name. `Nothing` is the empty lower bound and a
+/// nameless `Unresolved` says nothing at all; both leave the parameter open.
+fn solutionSettles(t: *const Type) bool {
+    return switch (t.*) {
+        .Nothing => false,
+        .Unresolved => |name| name != null,
+        else => true,
+    };
+}
+
+fn sessionSolvedVars(self: *Checker, session: *root.InferenceSession) Allocator.Error!?std.StringHashMap(Type) {
+    if (session.all_vars.items.len == 0) return null;
+    // A lambda re-checked after the root solve adds constraints of its own;
+    // they bind nothing until reduced.
+    _ = try session.cs.solveToFixpoint();
     var staged = try session.cs.solveStaged();
     defer staged.deinit();
     var legacy = try session.cs.solve();
     defer legacy.deinit();
     var subst = std.StringHashMap(Type).init(self.allocator);
-    defer {
-        var vit = subst.valueIterator();
-        while (vit.next()) |t| t.deinit(self.allocator);
-        subst.deinit();
-    }
+    errdefer deinitSubst(&subst, self.allocator);
     for (session.all_vars.items) |sv| {
         const pick = staged.get(sv.v) orelse legacy.get(sv.v) orelse continue;
-        if (pick == .Nothing or pick == .Unresolved) continue;
+        if (!solutionSettles(&pick)) continue;
         if (subst.contains(sv.unique)) continue;
         try subst.put(sv.unique, try pick.clone(self.allocator));
     }
-    if (subst.count() == 0) return;
+    if (subst.count() == 0) {
+        subst.deinit();
+        return null;
+    }
+    return subst;
+}
+
+/// An unpinned variable is left alone, so a partially-solved call degrades to
+/// "unknown", never to wrong.
+fn refreshRecordedTypes(self: *Checker, session: *root.InferenceSession) Allocator.Error!void {
+    var subst = (try sessionSolvedVars(self, session)) orelse return;
+    defer deinitSubst(&subst, self.allocator);
     for (self.types_journal.items) |sp| {
         const recorded = self.types.getPtr(sp) orelse continue;
         if (!typeMentionsTypeParam(recorded)) continue;
@@ -1878,14 +2465,14 @@ pub fn checkBinary(self: *Checker, op: BinOp, lhs: *const Expr, rhs: *const Expr
             } else if (helpers.isNumeric(&l) or helpers.isNumeric(&r)) {
                 break :blk helpers.numericLub(&l, &r);
             } else {
-                break :blk .Unresolved;
+                break :blk Type.unresolved;
             }
         },
         .Sub, .Mul, .Div, .Rem => blk: {
             if (helpers.isNumeric(&l) or helpers.isNumeric(&r)) {
                 break :blk helpers.numericLub(&l, &r);
             } else {
-                break :blk .Unresolved;
+                break :blk Type.unresolved;
             }
         },
         .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => .Boolean,
@@ -1931,7 +2518,7 @@ pub fn checkToplevelContractCall(
             defer ty.deinit(self.allocator);
             return switch (ty) {
                 .Function => |f| try f.return_type.clone(self.allocator),
-                else => .Unresolved,
+                else => Type.unresolved,
             };
         }
         return null;
@@ -1949,7 +2536,7 @@ pub fn checkToplevelContractCall(
             t.deinit(self.allocator);
             _ = self.suspend_context_stack.pop();
         }
-        return .Unresolved;
+        return unresHere(@src().line);
     }
     if (std.mem.eql(u8, name, "with") and args.len == 2) {
         var recv = try expr_mod.checkExpr(self, &args[0], null);
@@ -1965,7 +2552,7 @@ pub fn checkToplevelContractCall(
             defer ty.deinit(self.allocator);
             return switch (ty) {
                 .Function => |f| try f.return_type.clone(self.allocator),
-                else => .Unresolved,
+                else => Type.unresolved,
             };
         }
         recv.deinit(self.allocator);
@@ -1979,13 +2566,13 @@ pub fn checkToplevelContractCall(
         var elem: Type = .Nothing;
         if (lambda.* == .Lambda) {
             const lam = lambda.Lambda;
-            var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = .Unresolved, .class_name = null });
+            var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = Type.unresolved, .class_name = null });
             t.deinit(self.allocator);
             elem = try collectBuilderCallArgType(self, &lam.body, "add", 0);
         }
         if (elem == .Nothing or elem == .Unresolved) {
             elem.deinit(self.allocator);
-            return .Unresolved;
+            return unresHere(@src().line);
         }
         const head = if (std.mem.eql(u8, name, "buildList")) "List" else "Set";
         return Type{ .Generic = .{
@@ -2003,7 +2590,7 @@ pub fn checkToplevelContractCall(
         var v_ty: Type = .Nothing;
         if (lambda.* == .Lambda) {
             const lam = lambda.Lambda;
-            var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = .Unresolved, .class_name = null });
+            var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = Type.unresolved, .class_name = null });
             t.deinit(self.allocator);
             k_ty = try collectBuilderCallArgType(self, &lam.body, "put", 0);
             v_ty = try collectBuilderCallArgType(self, &lam.body, "put", 1);
@@ -2011,7 +2598,7 @@ pub fn checkToplevelContractCall(
         if (k_ty == .Nothing or k_ty == .Unresolved or v_ty == .Nothing or v_ty == .Unresolved) {
             k_ty.deinit(self.allocator);
             v_ty.deinit(self.allocator);
-            return .Unresolved;
+            return unresHere(@src().line);
         }
         return Type{ .Generic = .{
             .name = try self.allocator.dupe(u8, "Map"),
@@ -2028,14 +2615,14 @@ pub fn checkToplevelContractCall(
             // The block is `suspend SequenceScope<T>.() -> Unit`, so `yield`
             // inside it is in a suspending context.
             try self.suspend_context_stack.append(self.allocator, true);
-            var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = .Unresolved, .class_name = null });
+            var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = Type.unresolved, .class_name = null });
             t.deinit(self.allocator);
             _ = self.suspend_context_stack.pop();
             elem = try collectBuilderCallArgType(self, &lam.body, "yield", 0);
         }
         if (elem == .Nothing or elem == .Unresolved) {
             elem.deinit(self.allocator);
-            return .Unresolved;
+            return unresHere(@src().line);
         }
         const head = if (std.mem.eql(u8, name, "sequence")) "Sequence" else "Iterator";
         return Type{ .Generic = .{
@@ -2050,7 +2637,7 @@ pub fn checkToplevelContractCall(
     if (std.mem.eql(u8, name, "buildString") and args.len == 1) {
         if (args[0] == .Lambda) {
             const lam = args[0].Lambda;
-            var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = .Unresolved, .class_name = "StringBuilder" });
+            var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = Type.unresolved, .class_name = "StringBuilder" });
             t.deinit(self.allocator);
         }
         return .String;
@@ -2113,7 +2700,7 @@ pub fn checkMemberContractCall(
         defer ty.deinit(self.allocator);
         return switch (ty) {
             .Function => |f| try f.return_type.clone(self.allocator),
-            else => .Unresolved,
+            else => Type.unresolved,
         };
     } else if (std.mem.eql(u8, name, "run")) {
         var ty = try checkLambdaInPlace(self,
@@ -2125,7 +2712,7 @@ pub fn checkMemberContractCall(
         defer ty.deinit(self.allocator);
         return switch (ty) {
             .Function => |f| try f.return_type.clone(self.allocator),
-            else => .Unresolved,
+            else => Type.unresolved,
         };
     } else if (std.mem.eql(u8, name, "apply")) {
         var t = try checkLambdaInPlace(self,
@@ -2229,7 +2816,7 @@ pub fn checkLambdaInPlace(
 ) Allocator.Error!Type {
     try narrowing.pushFrame(self);
     if (params.len == 0) {
-        const ib = it_binding orelse ReceiverBinding{ .ty = .Unresolved, .class_name = null };
+        const ib = it_binding orelse ReceiverBinding{ .ty = Type.unresolved, .class_name = null };
         try narrowing.currentFrame(self).bindings.put("it", .{
             .ty = ib.ty,
             .mutable = false,
@@ -2238,12 +2825,17 @@ pub fn checkLambdaInPlace(
             .decl_type_name = null,
         });
     } else {
-        for (params) |p| {
+        for (params, 0..) |p, i| {
+            // `{ x -> ... }` names what `it` would have been, so a single
+            // parameter takes the binding the scope function supplies rather
+            // than reaching the IR with no type at all.
+            const named_it = i == 0 and params.len == 1 and it_binding != null;
+            const pt = if (named_it) try it_binding.?.ty.clone(self.allocator) else Type.unresolved;
             try narrowing.currentFrame(self).bindings.put(p.name, .{
-                .ty = .Unresolved,
+                .ty = pt,
                 .mutable = false,
                 .decl_span = p.span,
-                .class_name = null,
+                .class_name = if (named_it) try self.internOpt(it_binding.?.class_name) else null,
                 .decl_type_name = null,
             });
         }
@@ -2313,7 +2905,7 @@ pub fn checkLambdaShaped(
         for (param_tys.items) |*t| t.deinit(self.allocator);
         param_tys.deinit(self.allocator);
     }
-    var ret_expected: Type = .Unresolved;
+    var ret_expected: Type = Type.unresolved;
     var is_suspend = false;
     if (expected) |exp| {
         const nn = exp.nonNull();
@@ -2349,12 +2941,12 @@ pub fn checkLambdaShaped(
         } else {
             const count = @max(params.len, 1);
             var i: usize = 0;
-            while (i < count) : (i += 1) try param_tys.append(self.allocator, .Unresolved);
+            while (i < count) : (i += 1) try param_tys.append(self.allocator, Type.unresolved);
         }
     } else {
         const count = @max(params.len, 1);
         var i: usize = 0;
-        while (i < count) : (i += 1) try param_tys.append(self.allocator, .Unresolved);
+        while (i < count) : (i += 1) try param_tys.append(self.allocator, Type.unresolved);
     }
     defer ret_expected.deinit(self.allocator);
     try narrowing.pushFrame(self);
@@ -2383,30 +2975,49 @@ pub fn checkLambdaShaped(
         resolvedParamIsReferenced(self, params[0].span);
     const bind_it = expected_binds_it or inferred_it;
     if (bind_it) {
-        const it_ty = if (param_tys.items.len > 0) try param_tys.items[0].clone(self.allocator) else Type.Unresolved;
+        const it_ty = if (param_tys.items.len > 0) try param_tys.items[0].clone(self.allocator) else Type.unresolved;
+        // The expected function type states the parameter's class, and
+        // `Unresolved` carries it now, so `it` need not reach the IR nameless.
         try narrowing.currentFrame(self).bindings.put("it", .{
             .ty = it_ty,
             .mutable = false,
             .decl_span = null,
-            .class_name = null,
+            .class_name = try self.internOpt(helpers.classNameOfType(&it_ty)),
             .decl_type_name = null,
         });
     } else if (!effective_empty) {
         for (params, 0..) |p, i| {
-            const pt = if (i < param_tys.items.len) try param_tys.items[i].clone(self.allocator) else Type.Unresolved;
+            const pt = if (i < param_tys.items.len) try param_tys.items[i].clone(self.allocator) else Type.unresolved;
             try narrowing.currentFrame(self).bindings.put(p.name, .{
                 .ty = pt,
                 .mutable = false,
                 .decl_span = p.span,
-                .class_name = null,
+                .class_name = try self.internOpt(helpers.classNameOfType(&pt)),
                 .decl_type_name = null,
             });
         }
     }
+    // The lambda's receiver is the innermost implicit receiver of its body:
+    // `flow { emit(x) }` names `FlowCollector.emit` bare.
+    var pushed_lambda_recv = false;
+    if (expected) |exp| {
+        const ecore: *const Type = if (exp.* == .Nullable) exp.Nullable else exp;
+        if (ecore.* == .Function) if (ecore.Function.receiver_head) |h| {
+            try self.this_ext_stack.append(self.allocator, .{
+                .name = try self.internName(h),
+                .class_depth = self.class_stack.items.len,
+                .label = if (self.label_stack.items.len != 0) self.label_stack.items[self.label_stack.items.len - 1] else null,
+            });
+            pushed_lambda_recv = true;
+        };
+    }
     const actual_ret = try expr_mod.checkBlock(self, body, &ret_expected);
+    if (pushed_lambda_recv) _ = self.this_ext_stack.pop();
     _ = self.suspend_context_stack.pop();
     narrowing.popFrame(self);
-    const return_type = if (ret_expected == .Unresolved)
+    // An expected return that is still a type parameter is what the body
+    // decides: `map { it + 1 }` returns an `Int`, not `R`.
+    const return_type = if (ret_expected == .Unresolved or ret_expected == .TypeParam)
         actual_ret
     else blk: {
         var ar = actual_ret;
@@ -2420,12 +3031,12 @@ pub fn checkLambdaShaped(
     }
     if (effective_empty) {
         if (expected_binds_it or inferred_it) {
-            const first = if (param_tys.items.len > 0) try param_tys.items[0].clone(self.allocator) else Type.Unresolved;
+            const first = if (param_tys.items.len > 0) try param_tys.items[0].clone(self.allocator) else Type.unresolved;
             try params_out.append(self.allocator, first);
         }
     } else {
         for (params, 0..) |_, i| {
-            const pt = if (i < param_tys.items.len) try param_tys.items[i].clone(self.allocator) else Type.Unresolved;
+            const pt = if (i < param_tys.items.len) try param_tys.items[i].clone(self.allocator) else Type.unresolved;
             try params_out.append(self.allocator, pt);
         }
     }

@@ -10,6 +10,7 @@ const inline_state = @import("../inline_state.zig");
 const decl_mod = @import("../decl.zig");
 const inline_call = @import("../inline_call.zig");
 const lambda_body = @import("../lambda_body.zig");
+const implicit_walk = @import("implicit_walk.zig");
 
 const Allocator = std.mem.Allocator;
 const FuncBuilder = build.FuncBuilder;
@@ -375,7 +376,7 @@ fn spliceBareNameEvidence(g: *GenCtx, nm: []const u8, recv_chain: ?[]const []con
     // its class or a chain-compatible extension. A capitalized bare call
     // to a nested class name is a constructor, not a method on `this`.
     const is_scoped_class = nm.len > 0 and std.ascii.isUpper(nm[0]) and
-        (scopedClassIdForRead(b, nm, callee.Path.segments[0].span.file) != null or
+        ((scopedClassIdForRead(b, nm, callee.Path.segments[0].span.file) catch null) != null or
             b.module.classId(nm) != null or anyClassNamed(b, nm));
     // A declared member of the spliced receiver's hierarchy binds the
     // receiver as an extension namesake does.
@@ -493,6 +494,12 @@ fn emitSpliceReceiverWalk(g: *GenCtx, nm: []const u8, bound_this: Reg) Allocator
     const args = g.args;
     const ast_arg_names = g.ast_arg_names;
 
+// The walk this instruction exists to perform, done here: the innermost
+// receiver with an applicable member of the name is the one Kotlin picks,
+// and lowering holds the same stack the runtime would rank.
+if (!std.mem.eql(u8, runtime.envOnce("KLIO_ARITY_SLOT") orelse "1", "0")) {
+    if (try walkedSpliceCall(g, nm, "inline_splice_recv_walk")) |r| return r;
+}
 const run = try lowerArgRun(b, args);
 const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
 const dst = b.allocReg();
@@ -519,6 +526,48 @@ try b.push(.{ .CallMemberOrGlobal = try b.boxInst(ir.CallMemberOrGlobalInst{
 return dst;
 }
 
+/// The static walk over the receivers in scope at a spliced bare call: the
+/// innermost receiver naming the sole callable of this arity takes it as a
+/// slot call, and no receiver declaring it at all leaves the one top-level
+/// candidate, called directly. Anything else is emitted by the caller.
+fn walkedSpliceCall(g: *GenCtx, nm: []const u8, site: []const u8) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const g_type_args = g.ast_type_args;
+    switch (try implicit_walk.walkCall(b, .{ .name = nm, .span = callee.Path.segments[0].span }, args, ast_arg_names, site)) {
+        .member => |hit| {
+            return try implicit_walk.lowerWalkedMemberCall(b, hit, .{ .name = nm, .span = callee.Path.segments[0].span }, args, ast_arg_names, g_type_args, site);
+        },
+        .global => {
+            if (!allNull(ast_arg_names)) return null;
+            const cands = (try cmgCandidates(b, nm, callee.Path.segments[0].span.file, @intCast(args.len))) orelse return null;
+            if (cands.len != 1) return null;
+            const gf = b.module.funcById(cands[0]) orelse return null;
+            // A candidate taking a receiver would have been the walk's member
+            // answer; only a plain function is called with the bare arguments,
+            // and only one with a body can be called directly at all.
+            if (gf.params.len != 0 and std.mem.eql(u8, gf.params[0].name, "this")) return null;
+            if (!gf.hasBody()) return null;
+            const grun = try lowerArgRun(b, args);
+            const gdst = b.allocReg();
+            orEmitAudit(b, site, "Call", nm);
+            try b.push(.{ .Call = .{
+                .dst = gdst,
+                .func = cands[0],
+                .args = grun[0],
+                .n_args = grun[1],
+                .arg_names = &.{},
+                .type_args = &.{},
+                .exact = true,
+            } });
+            return gdst;
+        },
+        .undecided => return null,
+    }
+}
+
 /// With the spliced receiver's type unknown the call cannot be proven to bind
 /// the innermost `this`, so `CallMemberOrGlobal` tries the bound receiver, then
 /// each enclosing receiver innermost-first, before any global.
@@ -533,6 +582,7 @@ fn emitSpliceUnknownReceiver(g: *GenCtx, nm: []const u8) Allocator.Error!?Reg {
 // tries the bound receiver, then each enclosing receiver
 // innermost-first, before any global. The bound register is passed
 // directly so the splice receiver stays innermost.
+if (try walkedSpliceCall(g, nm, "inline_splice_unknown_recv")) |r| return r;
 if (b.resolve("this")) |bound_this| {
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
@@ -637,6 +687,19 @@ fn tryAnonCaptureCall(g: *GenCtx) Allocator.Error!?Reg {
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const dst = b.allocReg();
+        // A capture declared as a function of this arity is invocable, so the
+        // spliced receiver's member can never take the call.
+        if (localIsCallableAt(b, nm0, args.len) or localIsFunInterface(b, nm0)) {
+            orEmitAudit(b, "cvom_anon_capture_splice", "CallValue", nm0);
+            try b.push(.{ .CallValue = .{
+                .dst = dst,
+                .callee = callee_r,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
         // Inside a receiver splice the captured name may shadow a member of the
         // spliced receiver, which Kotlin resolves to.
         if (b.spliceRecvTy() != null) {
@@ -1155,10 +1218,9 @@ const cls = &b.module.classes.items[class_id.int()];
 // args or the expected type.
 var sam_lpt: ?[]?[]ir.TypeRef = null;
 defer if (sam_lpt) |types| deinitArgLambdaParamTypes(b.allocator, types);
-if (cls.is_fun_interface and args.len == 1 and args[0] == .Lambda and
-    cls.type_params.len != 0)
-{
-    sam_lpt = try samLambdaParamTypes(b, class_id, call.type_args);
+if (cls.is_fun_interface and args.len == 1 and args[0] == .Lambda) {
+    lambda_mod.recordSamCtorLambdaShape(b, class_id, args[0].span());
+    if (cls.type_params.len != 0) sam_lpt = try samLambdaParamTypes(b, class_id, call.type_args);
 }
 if (runtime.envOnce("KLIO_SAM_TRACE") != null and cls.is_fun_interface) {
     std.debug.print("[sam] {s} tps={d} lam={} lpt={} exp={}\n", .{ cls.name, cls.type_params.len, args.len == 1 and args[0] == .Lambda, sam_lpt != null, b.peekExpected() != null });
@@ -1344,6 +1406,21 @@ fn tryBareMemberFirst(g: *GenCtx) Allocator.Error!?Reg {
             // see, so emit the runtime-arbitrated form; its value arm falls to the
             // enclosing member when the closure's declared params refute the args.
             if (b.knowsOuter(nm0) and call.type_args.len == 0) {
+                if (localIsCallableAt(b, nm0, args.len) or localIsFunInterface(b, nm0)) {
+                    const cv1 = try resolveCapture(b, nm0);
+                    const run1 = try lowerArgRun(b, args);
+                    const an1 = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const d1 = b.allocReg();
+                    orEmitAudit(b, "cvom_bare_capture", "CallValue", nm0);
+                    try b.push(.{ .CallValue = .{
+                        .dst = d1,
+                        .callee = cv1,
+                        .args = run1[0],
+                        .n_args = run1[1],
+                        .arg_names = an1,
+                    } });
+                    return d1;
+                }
                 if (try resolveThisForBareCallNoBind(b)) |this_reg| {
                     const cv = try resolveCapture(b, nm0);
                     const run0 = try lowerArgRun(b, args);
@@ -1373,6 +1450,56 @@ fn tryBareMemberFirst(g: *GenCtx) Allocator.Error!?Reg {
 /// A bare call whose name is a bound local or captured outer does not shadow an
 /// implicit receiver's member unless the local is invokable, so emit the
 /// arbitrated form: value when callable, else the member on `this`.
+/// Whether `name` is a local whose declared type is a function of `arity`,
+/// so invoking it cannot fail over to a member.
+///
+/// `KLIO_LOCAL_CALLABLE=0` withdraws it.
+pub fn localIsCallableAt(b: *FuncBuilder, name: []const u8, arity: usize) bool {
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_LOCAL_CALLABLE") orelse "1", "0")) return false;
+    const why = runtime.envOnce("KLIO_LOCAL_CALLABLE_WHY") != null;
+    const ty = b.localDeclType(name) orelse {
+        if (why) std.debug.print("[local-callable] {s}/{d}: no declared type\n", .{ name, arity });
+        return false;
+    };
+    const head = std.mem.trimEnd(u8, ty, "?");
+    // A nullable local is not unconditionally invocable.
+    if (head.len != ty.len) return false;
+    if (!std.mem.startsWith(u8, head, "Function")) {
+        if (why) std.debug.print("[local-callable] {s}/{d}: type {s}\n", .{ name, arity, ty });
+        return false;
+    }
+    const digits = head["Function".len..];
+    if (digits.len == 0) return false;
+    const n = std.fmt.parseInt(usize, digits, 10) catch return false;
+    if (n == arity) return true;
+    // A `@Composable` function value gains the composer and the changed mask
+    // at the call, so the emitted arity runs two past the declared one. The
+    // local is invocable either way; what differs is the convention the call
+    // was lowered under.
+    if (n + 2 == arity) return true;
+    if (why) std.debug.print("[local-callable] {s}/{d}: arity {d}\n", .{ name, arity, n });
+    return false;
+}
+
+/// Whether `name` names a local of a functional-interface type, whose
+/// `invoke` the call runs. `FloatProducer` and its kind are classes, not
+/// `FunctionN`, so the arity test above never sees them.
+///
+/// Only an INTERPRETED class: an intrinsic-backed one answers yes to every
+/// member query and would make this true for everything.
+pub fn localIsFunInterface(b: *FuncBuilder, name: []const u8) bool {
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_LOCAL_CALLABLE") orelse "1", "0")) return false;
+    const ty = b.localDeclType(name) orelse return false;
+    const head = std.mem.trimEnd(u8, ty, "?");
+    if (head.len != ty.len) return false;
+    const simple = if (std.mem.findScalarLast(u8, head, '.')) |i| head[i + 1 ..] else head;
+    const cid = b.module.classIdByFqn(head) orelse b.module.uniqueClassIdBySimpleName(simple) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const c = &b.module.classes.items[cid.int()];
+    if (c.is_intrinsic_backed or c.is_stub) return false;
+    return b.module.classHierarchyDeclaresMember(cid, "invoke");
+}
+
 fn tryArbitratedBareLocal(g: *GenCtx) Allocator.Error!?Reg {
     const b = g.b;
     const callee = g.callee;
@@ -1388,6 +1515,25 @@ fn tryArbitratedBareLocal(g: *GenCtx) Allocator.Error!?Reg {
             !b.isReceiverLambdaParam(nm0) and
             (b.knowsOuter(nm0) or b.resolve(nm0) != null))
         {
+            // The value arm is the one the runtime tries first, so a local
+            // whose DECLARED type is a function of this arity settles the
+            // site: it is always invocable, and the member leg can never be
+            // reached. Nothing here needs the receiver at all.
+            if (localIsCallableAt(b, nm0, args.len) or localIsFunInterface(b, nm0)) {
+                const cv1 = try lowerExpr(b, callee);
+                const run1 = try lowerArgRun(b, args);
+                const an1 = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const d1 = b.allocReg();
+                orEmitAudit(b, "cvom_bare_local", "CallValue", nm0);
+                try b.push(.{ .CallValue = .{
+                    .dst = d1,
+                    .callee = cv1,
+                    .args = run1[0],
+                    .n_args = run1[1],
+                    .arg_names = an1,
+                } });
+                return d1;
+            }
             if (try resolveThisForBareCallNoBind(b)) |this_reg| {
                 const cv = try lowerExpr(b, callee);
                 const run0 = try lowerArgRun(b, args);

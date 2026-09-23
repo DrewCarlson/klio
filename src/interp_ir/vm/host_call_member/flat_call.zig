@@ -42,6 +42,8 @@ const dispatchIntrinsic = hcm.dispatchIntrinsic;
 const lookupIntrinsic = hcm.lookupIntrinsic;
 const simpleName = hcm.simpleName;
 
+const ext_fallback = @import("ext_fallback.zig");
+
 const member_ext_visibility = @import("member_ext_visibility.zig");
 const interfaceDelegateFor = member_ext_visibility.interfaceDelegateFor;
 const isMemberExt = member_ext_visibility.isMemberExt;
@@ -607,6 +609,7 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
         const k = instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv) orelse return null;
         const raw = extMethodCacheGet(self, k) orelse return null;
         if (raw == METHOD_MISS) return null;
+        ext_fallback.noteExtServed(self, @enumFromInt(raw), name);
         return prepareFlatFromFid(self, allocator, receiver, args, @enumFromInt(raw));
     }
     // Data-class `copy` runs before the cache in the ladder; decline so it
@@ -643,6 +646,7 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
                 }
             }
         }
+        if (fid) |f| ext_fallback.noteExtServed(self, f, name);
     }
     const target = fid orelse return null;
     return prepareFlatFromFid(self, allocator, receiver, args, target);
@@ -681,6 +685,10 @@ pub fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const 
     defer mg.deinit();
     const mod = mg.get();
     const f = mod.funcById(target) orelse return null;
+    // A pack-installed binding supersedes the declaration, body and all, and
+    // a flat frame would enter the body without asking. Decline so the call
+    // takes the route that consults it.
+    if (hcm.installedBindingFor(self, f.fqn) != null) return null;
     // The fast fully-applied shape only: no vararg anywhere, no default
     // padding, no trailing-lambda rebind.
     for (f.params) |*p| {

@@ -1,0 +1,5 @@
+literal      = Long
+const        = Long
+float        = Double
+derived      = Long
+value        = 4611686018426999999

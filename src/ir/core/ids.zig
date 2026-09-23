@@ -99,6 +99,18 @@ pub const ReifiedName = struct { name: []const u8, actual: []const u8 };
 
 /// Stable identity of one virtual override family, rooted at the declaration the
 /// static receiver type selects; linking maps `(ClassId, MethodSlotId)` to a `FuncId`.
+/// A property slot: one per (root declaring class, property name) family, so
+/// every implementation of a property answers under the same number.
+pub const PropSlotId = enum(u32) {
+    _,
+    pub fn from(v: u32) PropSlotId {
+        return @enumFromInt(v);
+    }
+    pub fn int(self: PropSlotId) u32 {
+        return @intFromEnum(self);
+    }
+};
+
 pub const MethodSlotId = enum(u32) {
     _,
     pub fn from(v: u32) MethodSlotId {

@@ -16,6 +16,10 @@
 # Targeted iteration instead of the full gate:
 #   zig build itest-<suite>                       one suite
 #   scripts/commontest-sweep.py BIN --filter F    one commontest file
+#
+# The ratchet phase compares the unresolved site census against
+# plans/resolution-ceiling.json. Lower a kind's entry when it falls; raising
+# one needs a reason in the running log.
 #   zig build klio-harness -Dharness-optimize=Debug   16s edit-loop harness
 #   KLIO_E2E_SHARD=0/16 on an itest e2e binary    the image+jit path, sharded
 set -uo pipefail
@@ -77,6 +81,13 @@ phase "compose-ui-gate" scripts/compose-ui-gate.sh
 echo "== full example corpus"
 # 180 s per example: a cold compose bake is ~70 s even locally (warm ~2 s).
 phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180
+
+# The resolution ratchet: every unresolved site kind may fall and may not
+# rise, and a kind absent from the ceiling may not appear. A lowering change
+# that re-derives one more target by name fails here the day it lands.
+echo "== resolution ratchet"
+phase "ratchet" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/site-census-sweep.py \
+  zig-out/bin/klio-harness --timeout 180 --cold --ceiling "$ROOT/plans/resolution-ceiling.json"
 
 if [ "$NO_SWEEP" = 0 ]; then
   echo "== commontest dual eager gate"

@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 const applicability = @import("applicability");
 const Allocator = std.mem.Allocator;
 const root_ir = @import("../ir.zig");
@@ -531,6 +532,14 @@ pub fn resolveBareCallIndexed(
         if (self.candidateHasImplicitThis(id, f)) continue;
         if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
         const is_stub = !f.hasBody();
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name)) {
+                std.debug.print("[bare-cand] {s}#{d} stub={} params={d} want={d} defaults=", .{ f.fqn, id.int(), is_stub, f.params.len, want_arity });
+                for (f.params) |p| std.debug.print("{s}", .{if (p.has_default) "1" else "0"});
+                if (self.stubDeclArity(id)) |da| std.debug.print(" da={d}/{d}", .{ da.required, da.total });
+                std.debug.print("\n", .{});
+            }
+        }
         // Stub and body gates accept the same shapes, so resolution never depends on whether the body has
         // replaced its header.
         const defaults_used: usize = if (is_stub) blk: {

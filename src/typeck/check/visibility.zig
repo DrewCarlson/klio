@@ -295,7 +295,7 @@ pub fn lookupMemberThroughChain(
     allocator: Allocator,
     class: []const u8,
     name: []const u8,
-) Allocator.Error!?struct { Type, ?[]const u8 } {
+) Allocator.Error!?struct { Type, ?[]const u8, []const u8 } {
     var seen = std.StringHashMap(void).init(self.allocator);
     defer seen.deinit();
     var frontier: std.ArrayList([]const u8) = .empty;
@@ -313,7 +313,7 @@ pub fn lookupMemberThroughChain(
         const info = root.classNamed(self, c) orelse continue;
         if (info.members.get(name)) |ty| {
             const cn = info.member_class.get(name);
-            return .{ try ty.clone(allocator), cn };
+            return .{ try ty.clone(allocator), cn, c };
         }
         for (info.supertypes.items) |s| {
             try frontier.append(self.allocator, s);

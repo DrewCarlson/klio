@@ -494,6 +494,22 @@ fn staticIteratorBinding(
     var out: IterBinding = .{};
     var ity = (try expr.staticExprTypeRef(b, iter)) orelse return out;
     defer ity.deinit(b.allocator);
+    // A collection typed by a type parameter names no class, and every
+    // question below is asked of a class. Kotlin resolves the `iterator`
+    // convention against the declared upper bound, and the bound REF is the
+    // one to take: it keeps the type arguments the string record drops, so
+    // `next` still answers with the element type.
+    {
+        var h = std.mem.trimEnd(u8, ity.name, "?");
+        if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
+        if (b.isTypeParam(h)) {
+            if (b.typeParamBoundRef(h)) |bref| {
+                const bound = try bref.clone(b.allocator);
+                ity.deinit(b.allocator);
+                ity = bound;
+            }
+        }
+    }
     const file = vars[0].span.file;
     out.iter_root = receiverIteratorRoot(b, ity, file);
     // A member `iterator()` first; a receiver served only by the unique top-level
@@ -506,7 +522,7 @@ fn staticIteratorBinding(
         var head = std.mem.trimEnd(u8, irt.name, "?");
         if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
         if (std.mem.findScalarLast(u8, head, '.')) |d| head = head[d + 1 ..];
-        if (iteratorFamily(b, head)) bindIteratorFamilyRoots(b, head, &out);
+        bindIteratorRoots(b, head, irt, file, &out);
     }
     return out;
 }
@@ -538,37 +554,86 @@ fn receiverIteratorRoot(b: *FuncBuilder, ity: ir.TypeRef, file: ir.FileId) ?ir.F
 /// The interface itself, or a primitive-iterator abstract class: `hasNext`
 /// roots on the interface, while `next` prefers the head class's own
 /// override, which delegates to the `nextByte()`-family.
-fn iteratorFamily(b: *FuncBuilder, head: []const u8) bool {
-    if (std.mem.eql(u8, head, "Iterator")) return true;
-    if (!std.mem.endsWith(u8, head, "Iterator")) return false;
-    // The kotlin.collections primitive-iterator family only; a pack
-    // class ending in `Iterator` has its own dispatch story.
-    const cid = b.module.uniqueClassIdBySimpleName(head) orelse return false;
-    if (cid.int() >= b.module.classes.items.len) return false;
-    return std.mem.startsWith(u8, b.module.classes.items[cid.int()].fqn, "kotlin.collections.");
-}
-
-fn bindIteratorFamilyRoots(b: *FuncBuilder, head: []const u8, out: *IterBinding) void {
-    if (b.module.uniqueClassIdBySimpleName("Iterator")) |icid| {
-        if (icid.int() < b.module.classes.items.len) {
-            const ifqn = b.module.classes.items[icid.int()].fqn;
-            const hn_decls = b.module.memberDecls(ifqn, "hasNext");
-            const nx_decls = b.module.memberDecls(ifqn, "next");
-            if (hn_decls.len != 0) out.hn_root = hn_decls[0];
-            if (nx_decls.len != 0) out.next_root = nx_decls[0];
-        }
-    }
-    if (!std.mem.eql(u8, head, "Iterator")) {
-        if (b.module.uniqueClassIdBySimpleName(head)) |hcid| {
-            if (hcid.int() < b.module.classes.items.len) {
-                const hfqn = b.module.classes.items[hcid.int()].fqn;
-                const own_next = b.module.memberDecls(hfqn, "next");
-                if (own_next.len != 0) out.next_root = own_next[0];
-                const own_hn = b.module.memberDecls(hfqn, "hasNext");
-                if (own_hn.len != 0) out.hn_root = own_hn[0];
+/// Bind `hasNext` and `next` against the iterator's own type.
+///
+/// Kotlin fixes both by the convention, so the only question is which
+/// declaration the iterator's static type reaches. This used to bind only for
+/// `Iterator` itself and the `kotlin.collections` primitive-iterator family,
+/// leaving every pack and user iterator to walk its own name twice per element.
+/// Resolving against the type's own class covers them all.
+///
+/// The resolution has to be the real one, not the first same-named member:
+/// `androidx.compose.ui.graphics.PathIterator` declares `next()` beside
+/// `next(outPoints, offset)`, and taking the declaration list's head bound the
+/// two-argument overload and returned `Nothing` from every step of the loop.
+fn bindIteratorRoots(b: *FuncBuilder, head: []const u8, ity: ir.TypeRef, file: ir.FileId, out: *IterBinding) void {
+    const hcid = iteratorClassId(b, head);
+    // Kotlin's `for` accepts the convention alone: a type with `hasNext` and
+    // `next` need not implement `Iterator`. Stamping the interface's slots on
+    // one that does not would name a slot its runtime class has no entry for,
+    // so the roots come from the interface only when the type reaches it.
+    if (std.mem.eql(u8, head, "Iterator") or implementsIterator(b, hcid)) {
+        if (b.module.uniqueClassIdBySimpleName("Iterator")) |icid| {
+            if (icid.int() < b.module.classes.items.len) {
+                const ifqn = b.module.classes.items[icid.int()].fqn;
+                const hn_decls = b.module.memberDecls(ifqn, "hasNext");
+                const nx_decls = b.module.memberDecls(ifqn, "next");
+                if (hn_decls.len != 0) out.hn_root = hn_decls[0];
+                if (nx_decls.len != 0) out.next_root = nx_decls[0];
             }
         }
     }
+    if (std.mem.eql(u8, head, "Iterator")) return;
+    const cid = hcid orelse return;
+    if (cid.int() >= b.module.classes.items.len) return;
+    if (nullarySlotRoot(b, cid, "hasNext", ity, file)) |root| out.hn_root = root;
+    if (nullarySlotRoot(b, cid, "next", ity, file)) |root| out.next_root = root;
+}
+
+/// Whether the iterator type reaches `kotlin.collections.Iterator` through its
+/// declared supertypes.
+fn implementsIterator(b: *FuncBuilder, cid: ?ir.ClassId) bool {
+    const id = cid orelse return false;
+    if (id.int() >= b.module.classes.items.len) return false;
+    const chain = b.module.registry.class_super_names.get(b.module.classes.items[id.int()].name) orelse return false;
+    for (chain) |name| {
+        if (std.mem.eql(u8, name, "Iterator")) return true;
+        if (std.mem.endsWith(u8, name, ".Iterator")) return true;
+    }
+    return false;
+}
+
+/// The slot root for a zero-argument member call, under the admission the
+/// resolved-member gate applies to a virtual slot: one committed declaration,
+/// dispatched virtually, with a receiver parameter to dispatch on and no value
+/// parameter to bind. A name the type overloads resolves here by arity rather
+/// than by declaration order.
+fn nullarySlotRoot(
+    b: *FuncBuilder,
+    owner: ir.ClassId,
+    name: []const u8,
+    ity: ir.TypeRef,
+    file: ir.FileId,
+) ?ir.FuncId {
+    const r = b.module.resolveMemberCall(owner, name, &.{}, .{
+        .caller_file = file,
+        .lexical_owner = null,
+        .actual_type_param_bounds = &.{},
+        .receiver_type = ity,
+    });
+    if (r.dispatch != .virtual) return null;
+    const fid = r.target orelse return null;
+    const f = b.module.funcById(fid) orelse return null;
+    if (!ir.Module.funcHasImplicitThis(f)) return null;
+    if (ir.Module.funcUserArity(f) != 0) return null;
+    return fid;
+}
+
+/// The class a static iterator head denotes: a dotted head names it exactly, a
+/// bare one only when it is unambiguous module-wide.
+fn iteratorClassId(b: *FuncBuilder, head: []const u8) ?ir.ClassId {
+    if (std.mem.findScalar(u8, head, '.') != null) return b.module.classIdByFqn(head);
+    return b.module.uniqueClassIdBySimpleName(head);
 }
 
 fn emitIteratorCall(b: *FuncBuilder, binding: IterBinding, it_reg: Reg, zero: Reg) Allocator.Error!void {
@@ -726,16 +791,39 @@ fn bindDestructuredLoopVars(
         if (stmt_mod.isUnderscorePlaceholder(v)) continue;
         const comp = b.allocReg();
         const comp_name = try std.fmt.allocPrint(b.allocator, "component{d}", .{i + 1});
-        const nm = try b.module.internConst(b.allocator, .{ .String = comp_name });
         const cargs = b.allocReg();
-        try b.push(.{ .CallMember = .{
-            .dst = comp,
-            .receiver = next_reg,
-            .name = nm,
-            .args = cargs,
-            .n_args = 0,
-            .extra = try b.memberExtra(.{ .arg_names = &.{} }),
-        } });
+        // Kotlin fixes `componentN` by the convention, and the element type is
+        // already in hand for the declared-type binding below, so the same
+        // resolution that names the return type names the target.
+        const comp_root: ?ir.FuncId = blk: {
+            const ety = elem_ty orelse break :blk null;
+            const r = (try expr.nullaryMemberResolution(b, ety, comp_name, iter.span().file)) orelse break :blk null;
+            if (r.dispatch != .virtual) break :blk null;
+            const fid = r.target orelse break :blk null;
+            const f = b.module.funcById(fid) orelse break :blk null;
+            if (!ir.Module.funcHasImplicitThis(f)) break :blk null;
+            if (ir.Module.funcUserArity(f) != 0) break :blk null;
+            break :blk fid;
+        };
+        if (comp_root) |root| {
+            try b.push(.{ .CallVirtual = .{
+                .dst = comp,
+                .receiver = next_reg,
+                .slot = ir.MethodSlotId.fromFunc(root),
+                .args = cargs,
+                .n_args = 0,
+            } });
+        } else {
+            const nm = try b.module.internConst(b.allocator, .{ .String = comp_name });
+            try b.push(.{ .CallMember = .{
+                .dst = comp,
+                .receiver = next_reg,
+                .name = nm,
+                .args = cargs,
+                .n_args = 0,
+                .extra = try b.memberExtra(.{ .arg_names = &.{} }),
+            } });
+        }
         try b.bind(v.name, comp);
         if (elem_ty) |ety| {
             if (try expr.nullaryMemberReturnTypeRef(b, ety, comp_name, iter.span().file)) |ct| {

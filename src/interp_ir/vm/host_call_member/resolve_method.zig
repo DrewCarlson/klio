@@ -585,7 +585,7 @@ pub fn invokeResolvedMember(
             const dispatch = dispatch_receiver orelse return .{
                 .err = .{ .Type = "resolved member extension is missing its dispatch receiver" },
             };
-            ir.eval.pushEnclosing(dispatch);
+            ir.eval.pushDispatch(dispatch);
             defer ir.eval.popEnclosing();
             return try callFuncNamedRec(self, allocator, mod, fid, all, names);
         }

@@ -1,0 +1,7 @@
+added: version=0 first=true has=true
+added: version=0 first=false has=true
+flushed: Packed(version = 1, count = 0) has=false
+added: version=1 first=true has=true
+4
+3
+true

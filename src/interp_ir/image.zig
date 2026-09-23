@@ -50,7 +50,7 @@ const BuiltModule = build.BuiltModule;
 
 /// Bump on any change to the encoded layout or to the types it reaches. A
 /// mismatch refuses the load and the caller rebakes.
-pub const FORMAT_VERSION: u32 = 60;
+pub const FORMAT_VERSION: u32 = 84;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -562,6 +562,8 @@ const RegistryImage = struct {
     top_level_lateinit_props: []const []const u8,
     top_level_prop_getters: []KV([]const u8, FuncId),
     top_level_prop_setters: []KV([]const u8, FuncId),
+    top_level_prop_slots: []KV([]const u8, u32) = &.{},
+    top_level_prop_slot_count: u32 = 0,
     hierarchy_methods: []KV([]const u8, []const []const u8),
     class_member_names: []const []const u8,
     class_super_names: []KV([]const u8, []const []const u8),
@@ -594,6 +596,7 @@ const RegistryImage = struct {
     file_modules: []KV(FileId, u32),
     top_level_const_vals: []KV([]const u8, ir.Const),
     member_method_fids: []KV([]const u8, FuncId),
+    member_method_ambiguous: []const []const u8,
     recv_fn_props: []PairStrEntry,
     private_shadow_props: []const []const u8,
     override_cell_props: []const []const u8,
@@ -617,6 +620,15 @@ const ModuleImage = struct {
     decl_span: []KV(u32, Span),
     member_decl_groups: []Module.MemberDeclGroup,
     method_dispatch: []Module.MethodDispatchEntry,
+    /// Link-time property dispatch, and the slot numbering it is keyed by.
+    /// Both are carried because the numbering is assignment order, and a
+    /// baked read's slot has to keep meaning the property it was bound to.
+    prop_dispatch: []ir.PropDispatchEntry,
+    prop_slot_ids: []ir.PropSlotEntry,
+    /// Link-time field layout per class, indexed by `ClassId`. Composed from
+    /// what each `ir.Class` publishes, and carried rather than recomposed so a
+    /// loaded base answers a slot index without walking its class table.
+    field_layout: []ir.ClassFieldLayout,
     /// Self-contained `blocks` of AST-free funcs; a deferred func holds
     /// `offset + 1` in `Func.deferred_offset`.
     deferred_func_section: []const u8,
@@ -626,14 +638,17 @@ const ModuleImage = struct {
 pub const DeclSigLite = struct {
     fid: u32,
     enclosing_class: ?ir.ClassId,
-    /// Receiver type head; empty = no declared receiver.
-    recv_head: []const u8,
-    recv_nullable: bool,
+    /// The declared receiver, whole: the checker binds an extension's type
+    /// parameters from it.
+    receiver_ty: ?ir.TypeRef,
     required: u32,
     total: u32,
     has_vararg: bool,
     /// Full structural signature; virtual-slot linking needs it to match source.
     sig: []const ir.TypeRef,
+    param_names: []const []const u8,
+    param_defaults: []const bool,
+    return_ty: ?ir.TypeRef,
     kind: ir.FuncKind,
     visibility: ast.Visibility,
     is_inline: bool,
@@ -1508,12 +1523,14 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
             try lites.append(a, .{
                 .fid = e.key_ptr.*,
                 .enclosing_class = ds.enclosing_class,
-                .recv_head = if (ds.receiver_ty) |rt| rt.name else "",
-                .recv_nullable = if (ds.receiver_ty) |rt| rt.nullable else false,
+                .receiver_ty = ds.receiver_ty,
                 .required = @intCast(ds.arity.required),
                 .total = @intCast(ds.arity.total),
                 .has_vararg = ds.arity.has_vararg,
                 .sig = ds.sig,
+                .param_names = ds.param_names,
+                .param_defaults = ds.param_defaults,
+                .return_ty = ds.return_ty,
                 .kind = ds.kind,
                 .visibility = ds.visibility,
                 .is_inline = ds.is_inline,
@@ -1527,6 +1544,9 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
     out.decl_span = try autoMapToSlice(u32, Span, a, &m.decl_span);
     out.member_decl_groups = try m.memberDeclGroups(a);
     out.method_dispatch = try m.methodDispatchEntries(a);
+    out.prop_dispatch = try m.propDispatchEntries(a);
+    out.prop_slot_ids = try m.propSlotEntries(a);
+    out.field_layout = m.field_layout.items;
 
     const r = &m.registry;
     out.registry = .{
@@ -1548,6 +1568,8 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
         .top_level_lateinit_props = try setToSlice(a, &r.top_level_lateinit_props),
         .top_level_prop_getters = try strMapToSlice(FuncId, a, &r.top_level_prop_getters),
         .top_level_prop_setters = try strMapToSlice(FuncId, a, &r.top_level_prop_setters),
+        .top_level_prop_slots = try strMapToSlice(u32, a, &r.top_level_prop_slots),
+        .top_level_prop_slot_count = r.top_level_prop_slot_count,
         .hierarchy_methods = blk: {
             var list = try a.alloc(KV([]const u8, []const []const u8), r.hierarchy_methods.count());
             var it = r.hierarchy_methods.iterator();
@@ -1686,6 +1708,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
         .file_modules = try autoMapToSlice(FileId, u32, a, &r.file_modules),
         .top_level_const_vals = try strMapToSlice(ir.Const, a, &r.top_level_const_vals),
         .member_method_fids = try strMapToSlice(FuncId, a, &r.member_method_fids),
+        .member_method_ambiguous = try setToSlice(a, &r.member_method_ambiguous),
         .recv_fn_props = try pairMapToSlice(a, &r.recv_fn_props),
         .private_shadow_props = try setToSlice(a, &r.private_shadow_props),
         .override_cell_props = try setToSlice(a, &r.override_cell_props),
@@ -2441,15 +2464,15 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (img.decl_user_arity) |kv| out.decl_user_arity.putAssumeCapacity(kv.k, kv.v);
     for (img.decl_user_sig) |kv| out.decl_user_sig.putAssumeCapacity(kv.k, kv.v);
     for (img.decl_sigs) |l| {
-        const rt: ?ir.TypeRef = if (l.recv_head.len != 0)
-            .{ .name = l.recv_head, .nullable = l.recv_nullable, .args = &.{} }
-        else
-            null;
+        const head_only: ?ir.TypeRef = if (l.receiver_ty) |rt| .{ .name = rt.name, .nullable = rt.nullable, .args = &.{} } else null;
         out.decl_sigs.putAssumeCapacity(l.fid, .{
             .enclosing_class = l.enclosing_class,
-            .receiver_ty = rt,
+            .receiver_ty = head_only,
             .arity = .{ .required = l.required, .total = l.total, .has_vararg = l.has_vararg },
             .sig = l.sig,
+            .param_names = l.param_names,
+            .param_defaults = l.param_defaults,
+            .return_ty = l.return_ty,
             .kind = l.kind,
             .visibility = l.visibility,
             .is_inline = l.is_inline,
@@ -2465,6 +2488,9 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (img.method_dispatch) |entry| {
         try out.registerMethodSlotTarget(entry.runtime_class, entry.slot, entry.target);
     }
+    for (img.prop_slot_ids) |entry| try out.registerPropSlotId(entry);
+    for (img.prop_dispatch) |entry| try out.registerPropSlotTarget(entry);
+    try out.field_layout.appendSlice(a, img.field_layout);
 
     const r = &out.registry;
     const ri = &img.registry;
@@ -2490,6 +2516,9 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.top_level_prop_getters) |kv| r.top_level_prop_getters.putAssumeCapacity(kv.k, kv.v);
     try r.top_level_prop_setters.ensureTotalCapacity(@intCast(ri.top_level_prop_setters.len));
     for (ri.top_level_prop_setters) |kv| r.top_level_prop_setters.putAssumeCapacity(kv.k, kv.v);
+    try r.top_level_prop_slots.ensureTotalCapacity(@intCast(ri.top_level_prop_slots.len));
+    for (ri.top_level_prop_slots) |kv| r.top_level_prop_slots.putAssumeCapacity(kv.k, kv.v);
+    r.top_level_prop_slot_count = ri.top_level_prop_slot_count;
     for (ri.hierarchy_methods) |kv| {
         try r.hierarchy_methods.put(kv.k, try sliceToSet(a, kv.v));
     }
@@ -2569,6 +2598,8 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.top_level_const_vals) |kv| r.top_level_const_vals.putAssumeCapacity(kv.k, kv.v);
     try r.member_method_fids.ensureTotalCapacity(@intCast(ri.member_method_fids.len));
     for (ri.member_method_fids) |kv| r.member_method_fids.putAssumeCapacity(kv.k, kv.v);
+    try r.member_method_ambiguous.ensureTotalCapacity(@intCast(ri.member_method_ambiguous.len));
+    for (ri.member_method_ambiguous) |k| r.member_method_ambiguous.putAssumeCapacity(k, {});
     try r.recv_fn_props.ensureTotalCapacity(@intCast(ri.recv_fn_props.len));
     for (ri.recv_fn_props) |pk| r.recv_fn_props.putAssumeCapacity(.{ .a = pk.a, .b = pk.b }, pk.v);
     try r.private_shadow_props.ensureTotalCapacity(@intCast(ri.private_shadow_props.len));
@@ -2583,6 +2614,11 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     }
 
     try out.rebuildFuncNameIndex(a);
+    // A loaded module runs without the build's link path — a bundle loads its
+    // image and goes — so the ancestor closure the baked `is` sites index has
+    // to be rebuilt here or every type test falls back to the by-name walk.
+    // It is a pure function of the classes and registry names just restored.
+    try out.linkClassAncestors(a);
 }
 
 fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Allocator.Error!bool {
@@ -2979,7 +3015,28 @@ test "module image preserves linked identities with lazy function headers" {
         .type_params = &.{"T"},
         .type_param_variance = &.{.Out},
         .receiver_abi = .specialized,
+        .field_layout = .{
+            .own = &.{ .{ .name = "tag", .seed = .int }, .{ .name = "label" } },
+            .state = .ok,
+        },
     });
+    const leaf = try source.addClass(a, .{
+        .id = ir.ClassId.from(1),
+        .name = "Leaf",
+        .fqn = "sample.Leaf",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .field_layout = .{
+            .own = &.{.{ .name = "extra" }},
+            .captures = &.{"seed"},
+            .super = element,
+            .state = .ok,
+        },
+    });
+    try source.linkFieldSlots(a);
     const abstract_all = FuncId.from(10);
     const element_all = FuncId.from(11);
     const min = FuncId.from(12);
@@ -3038,6 +3095,18 @@ test "module image preserves linked identities with lazy function headers" {
     );
     try testing.expectEqual(ast.Variance.Out, loaded.classes.items[element.int()].type_param_variance[0]);
     try testing.expectEqual(runtime.ReceiverAbi.specialized, loaded.classes.items[element.int()].receiver_abi);
+    // The composed layout rides the image: a loaded base answers a slot index
+    // without recomposing, and a declared slot keeps its index in the subclass.
+    const leaf_layout = loaded.classFieldLayout(leaf).?;
+    try testing.expectEqual(@as(u32, 2), leaf_layout.base);
+    try testing.expectEqual(@as(u32, 3), leaf_layout.declared);
+    try testing.expectEqual(@as(usize, 4), leaf_layout.slots.len);
+    try testing.expectEqualStrings("tag", leaf_layout.slots[0].name);
+    try testing.expectEqual(ir.SlotSeed.int, leaf_layout.slots[0].seed);
+    try testing.expectEqualStrings("seed", leaf_layout.slots[3].name);
+    try testing.expectEqual(@as(u32, 0), loaded.fieldSlotIndex(element, "tag").?);
+    try testing.expectEqual(@as(u32, 0), loaded.fieldSlotIndex(leaf, "tag").?);
+    try testing.expectEqual(@as(u32, 2), loaded.classes.items[leaf.int()].field_layout.base);
     const alias = loaded.registry.type_alias_types.get("Names").?;
     try testing.expectEqualStrings("List", alias.target.name);
     try testing.expectEqualStrings("String", alias.target.args[0].name);

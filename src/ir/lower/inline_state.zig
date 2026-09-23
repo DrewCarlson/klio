@@ -218,6 +218,46 @@ pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem
     try expr_body_members.?.put(.{ .owner = owner, .name = f.name.name, .arity = f.params.len }, FnField.fromPtr(f));
 }
 
+/// The same declarations keyed by the header stub's `FuncId`, for the ones an
+/// owner cannot reach: a top-level function's owner is the synthesized
+/// per-file class, whose name no call site spells, so `exprBodyMemberAst`
+/// never finds it. An id is exact where a name is a guess.
+var expr_body_by_id: ?std.AutoHashMap(u32, FnField) = null;
+
+/// Record an expression-bodied function with no declared return under its
+/// `FuncId`, so a caller can derive the inferred return before the function's
+/// own pass has run.
+pub fn registerExprBodyFnId(id: u32, f: FnField) std.mem.Allocator.Error!void {
+    if (expr_body_by_id == null) {
+        expr_body_by_id = std.AutoHashMap(u32, FnField).init(runtime.slab.allocator);
+    }
+    try expr_body_by_id.?.put(id, f);
+}
+
+/// `registerExprBodyFnId` from the declaration itself: only an expression body
+/// with no declared return has anything to derive.
+pub fn registerExprBodyFn(id: u32, f: *const ast.Function) std.mem.Allocator.Error!void {
+    if (f.return_type != null) return;
+    const body = f.body orelse return;
+    if (body != .Expr) return;
+    try registerExprBodyFnId(id, FnField.fromPtr(f));
+}
+
+/// The registered expression body for a resolved `FuncId`, or null.
+pub fn exprBodyFnAst(id: u32) ?*const ast.Function {
+    if (expr_body_by_id) |*m| {
+        if (m.get(id)) |ff| return ff.get();
+    }
+    return null;
+}
+
+pub fn resetExprBodyFnIds() void {
+    if (expr_body_by_id) |*m| {
+        m.deinit();
+        expr_body_by_id = null;
+    }
+}
+
 /// Drop every registered expression-body member AST. The pointers and the
 /// keys share one program's build arena, so an in-process driver must clear
 /// them at the run boundary.

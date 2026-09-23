@@ -11,6 +11,7 @@ const cfa = @import("cfa");
 
 const root = @import("../check.zig");
 const helpers = @import("helpers.zig");
+const expr_mod = @import("expr.zig");
 const expr = @import("expr.zig");
 const expr_calls = @import("expr_calls.zig");
 const narrowing = @import("narrowing.zig");
@@ -95,7 +96,7 @@ const checkAnonymousObjectEscape = phases.checkAnonymousObjectEscape;
 pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
     switch (decl.*) {
         .Function => |*f| {
-            const sig = try signatureOf(self, f);
+            const sig = try signatureOf(self, f, &.{});
             if (f.receiver_type) |recv| {
                 var return_class: ?[]const u8 = null;
                 if (f.return_type) |rt| return_class = classNameFromTyperef(rt);
@@ -122,7 +123,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
             }
         },
         .Property => |p| {
-            const ty = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
+            const ty = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else Type.unresolved;
             const cn = if (p.ty) |pt| classNameFromTyperef(pt) else null;
             if (p.receiver_type) |recv| {
                 const gop = try self.extension_properties.getOrPut(recv.name.name);
@@ -152,7 +153,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                         };
                     } else if (ef.init != null and p.ty != null) {
                         // Resolved when the initializer is checked.
-                        bound_ty = Type.Unresolved;
+                        bound_ty = Type.unresolved;
                         bound_cn = null;
                         ebf = .{
                             .public_ty = ty,
@@ -196,7 +197,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
             try root.putClassChecked(self, o.name.name, info, o.name.span.file);
             // So `Foo.bar` reads resolve.
             try self.frames.items[0].bindings.put(o.name.name, .{
-                .ty = Type.Unresolved,
+                .ty = Type.unresolved,
                 .mutable = false,
                 .decl_span = o.name.span,
                 .class_name = try self.internOpt(o.name.name),
@@ -269,9 +270,12 @@ pub fn pushFnSig(self: *Checker, name: []const u8, sig: FnSig, expect_or_actual:
     try entry.append(self.allocator, sig);
 }
 
-pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
+/// `outer_tparams` are the enclosing class's type parameters: a member's
+/// `T` is that class's, not a class named `T`.
+pub fn signatureOf(self: *Checker, f: *const Function, outer_tparams: []const []const u8) Allocator.Error!FnSig {
     var tparams = std.StringHashMap(void).init(self.allocator);
     defer tparams.deinit();
+    for (outer_tparams) |n| try tparams.put(n, {});
     for (f.type_params) |*tp| try tparams.put(tp.name.name, {});
 
     const params = try self.allocator.alloc(Type, f.params.len);
@@ -289,7 +293,11 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
     else
         Type.Unit;
     const param_class_names = try self.allocator.alloc(?[]const u8, f.params.len);
-    for (f.params, 0..) |*p, i| param_class_names[i] = classNameFromTyperef(&p.ty);
+    for (f.params, 0..) |*p, i| param_class_names[i] = if (tparams.contains(p.ty.name.name)) null else classNameFromTyperef(&p.ty);
+    const receiver_ty: ?Type = if (f.receiver_type) |rt|
+        try convertTypeRefWithTparams(self.allocator, rt, &tparams)
+    else
+        null;
     const bounds = try collectTypeParamBounds(self, f.type_params, f.where_bounds);
     const is_crossinline_param = try self.allocator.alloc(bool, f.params.len);
     if (f.is_inline) {
@@ -310,10 +318,11 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
         .type_param_names = bounds.names,
         .type_param_bounds = bounds.bounds,
         .param_class_names = param_class_names,
-        .return_class = if (f.return_type) |rt| classNameFromTyperef(rt) else null,
+        .return_class = if (f.return_type) |rt| (if (tparams.contains(rt.name.name)) null else classNameFromTyperef(rt)) else null,
         .decl_span = f.name.span,
         .is_suspend = f.is_suspend,
         .is_extension = f.receiver_type != null,
+        .receiver_ty = receiver_ty,
         .is_crossinline_param = is_crossinline_param,
         .context_types = context_types,
         .low_priority = annotationsAreLowPriority(f.annotations),
@@ -343,16 +352,23 @@ pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
     info.has_secondary_ctors = c.x().secondary_ctors.len != 0;
     info.decl_visibility = c.visibility;
     info.decl_file = c.name.span.file;
+    info.is_expect = c.is_expect;
     info.primary_ctor_visibility = c.primary_ctor_visibility;
+    for (c.type_params) |*tp| {
+        try info.type_param_names.append(self.allocator, tp.name.name);
+    }
+    var ctp = std.StringHashMap(void).init(self.allocator);
+    defer ctp.deinit();
+    for (c.type_params) |*tp| try ctp.put(tp.name.name, {});
     for (c.primary_params) |*p| {
-        const ty = try convertTypeRefLossy(self.allocator, &p.ty);
+        const ty = try helpers.convertTypeRefWithTparams(self.allocator, &p.ty, &ctp);
         if (p.property) |mutable| {
             try info.members.put(p.name.name, try ty.clone(self.allocator));
             try info.member_mutable.put(p.name.name, mutable);
             try info.concrete_members.append(self.allocator, p.name.name);
-            if (classNameFromTyperef(&p.ty)) |cn| {
+            if (!ctp.contains(p.ty.name.name)) if (classNameFromTyperef(&p.ty)) |cn| {
                 try info.member_class.put(p.name.name, cn);
-            }
+            };
             try info.member_visibility.put(p.name.name, p.visibility);
             try info.member_sigs.put(p.name.name, .{ .Property = .{
                 .ty = try ty.clone(self.allocator),
@@ -369,19 +385,29 @@ pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
     const ctor_param_class_names = try self.allocator.alloc(?[]const u8, c.primary_params.len);
     const ctor_is_crossinline = try self.allocator.alloc(bool, c.primary_params.len);
     for (c.primary_params, 0..) |*p, i| {
-        ctor_params[i] = try convertTypeRefLossy(self.allocator, &p.ty);
+        ctor_params[i] = try helpers.convertTypeRefWithTparams(self.allocator, &p.ty, &ctp);
         ctor_has_default[i] = p.default != null;
         ctor_param_names[i] = p.name.name;
         ctor_is_vararg[i] = p.is_vararg;
-        ctor_param_class_names[i] = classNameFromTyperef(&p.ty);
+        ctor_param_class_names[i] = if (ctp.contains(p.ty.name.name)) null else classNameFromTyperef(&p.ty);
         ctor_is_crossinline[i] = false;
     }
+    // A constructor call is a call: its result is the class instantiated by
+    // whatever the arguments bind its parameters to.
+    const ctor_ret: Type = if (c.type_params.len != 0) blk: {
+        const targs = try self.allocator.alloc(types.GenericArg, c.type_params.len);
+        for (c.type_params, targs) |*tp, *dst| {
+            dst.* = .{ .variance = .Invariant, .is_star = false, .ty = .{ .TypeParam = try self.allocator.dupe(u8, tp.name.name) } };
+        }
+        break :blk .{ .Generic = .{ .name = try self.allocator.dupe(u8, c.name.name), .args = targs } };
+    } else .{ .Unresolved = c.name.name };
     const ctor_sig = FnSig{
         .params = ctor_params,
         .has_default = ctor_has_default,
         .param_names = ctor_param_names,
         .is_vararg = ctor_is_vararg,
-        .return_ty = Type.Unresolved,
+        .return_ty = ctor_ret,
+        .return_class = c.name.name,
         .is_infix = false,
         .type_param_count = c.type_params.len,
         .type_param_names = ctor_bounds.names,
@@ -394,17 +420,48 @@ pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
     if (c.primary_params.len != 0 or !c.is_interface) {
         info.ctor = ctor_sig;
     }
-    try collectMembers(self, c.members, &info);
-    {
-        for (c.type_params) |*tp| {
-            try info.type_param_names.append(self.allocator, tp.name.name);
+    if (c.x().secondary_ctors.len != 0) {
+        if (c.has_primary_ctor) try info.ctors.append(self.allocator, ctor_sig);
+        for (c.x().secondary_ctors) |*sc| {
+            const n = sc.params.len;
+            const sparams = try self.allocator.alloc(Type, n);
+            const sdefault = try self.allocator.alloc(bool, n);
+            const snames = try self.allocator.alloc([]const u8, n);
+            const svararg = try self.allocator.alloc(bool, n);
+            const sclasses = try self.allocator.alloc(?[]const u8, n);
+            const scross = try self.allocator.alloc(bool, n);
+            for (sc.params, 0..) |*p, i| {
+                sparams[i] = try helpers.convertTypeRefWithTparams(self.allocator, &p.ty, &ctp);
+                sdefault[i] = p.default != null;
+                snames[i] = p.name.name;
+                svararg[i] = p.is_vararg;
+                sclasses[i] = if (ctp.contains(p.ty.name.name)) null else classNameFromTyperef(&p.ty);
+                scross[i] = false;
+            }
+            try info.ctors.append(self.allocator, .{
+                .params = sparams,
+                .has_default = sdefault,
+                .param_names = snames,
+                .is_vararg = svararg,
+                .return_ty = try ctor_ret.clone(self.allocator),
+                .return_class = c.name.name,
+                .is_infix = false,
+                .type_param_count = c.type_params.len,
+                .type_param_names = ctor_bounds.names,
+                .type_param_bounds = ctor_bounds.bounds,
+                .param_class_names = sclasses,
+                .decl_span = null,
+                .is_suspend = false,
+                .is_crossinline_param = scross,
+            });
         }
     }
+    try collectMembers(self, c.members, &info);
     for (c.supertypes) |*s| {
         try info.supertypes.append(self.allocator, s.name.name);
         const type_args = try self.allocator.alloc(Type, s.type_args.len);
         for (s.type_args, 0..) |*ta, i| {
-            type_args[i] = if (ta.is_star) Type.Unresolved else try convertTypeRefLossy(self.allocator, &ta.ty);
+            type_args[i] = if (ta.is_star) Type.unresolved else try helpers.convertTypeRefWithTparams(self.allocator, &ta.ty, &ctp);
         }
         try info.typed_supertypes.append(self.allocator, .{ .name = s.name.name, .args = type_args });
     }
@@ -449,10 +506,13 @@ pub fn walkSupertypeArgs(self: *Checker, subclass: []const u8, target: []const u
 }
 
 pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) Allocator.Error!void {
+    var ctp = std.StringHashMap(void).init(self.allocator);
+    defer ctp.deinit();
+    for (info.type_param_names.items) |n| try ctp.put(n, {});
     for (members) |*m| {
         switch (m.*) {
             .Function => |*f| {
-                const sig = try signatureOf(self, f);
+                const sig = try signatureOf(self, f, info.type_param_names.items);
                 {
                     const gop = try info.member_methods.getOrPut(f.name.name);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -476,9 +536,7 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                     .is_suspend = f.is_suspend,
                 } };
                 try info.members.put(f.name.name, ty);
-                if (f.return_type) |rt| {
-                    if (classNameFromTyperef(rt)) |cn| try info.member_class.put(f.name.name, cn);
-                }
+                if (sig.return_class) |cn| try info.member_class.put(f.name.name, cn);
                 // Kotlin makes these implicitly `open`.
                 const implicit_open = info.is_interface or info.is_abstract or f.is_abstract;
                 try info.member_flags.put(f.name.name, .{
@@ -497,7 +555,7 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                 try info.member_visibility.put(f.name.name, f.visibility);
             },
             .Property => |p| {
-                const ty = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
+                const ty = if (p.ty) |pt| try helpers.convertTypeRefWithTparams(self.allocator, pt, &ctp) else Type.unresolved;
                 try info.member_sigs.put(p.name.name, .{ .Property = .{
                     .ty = try ty.clone(self.allocator),
                     .mutable = p.mutable,
@@ -506,12 +564,12 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                 try info.members.put(p.name.name, ty);
                 try info.member_mutable.put(p.name.name, p.mutable);
                 if (p.ty) |pt| {
-                    if (classNameFromTyperef(pt)) |cn| try info.member_class.put(p.name.name, cn);
+                    if (!ctp.contains(pt.name.name)) if (classNameFromTyperef(pt)) |cn| try info.member_class.put(p.name.name, cn);
                 }
                 if (p.explicit_field) |ef| {
                     // `members` keeps the public type; the declaring scope
                     // reads the field type.
-                    const fty = if (ef.ty) |ft| try convertTypeRefLossy(self.allocator, ft) else Type.Unresolved;
+                    const fty = if (ef.ty) |ft| try convertTypeRefLossy(self.allocator, ft) else Type.unresolved;
                     const fcn = if (ef.ty) |ft| classNameFromTyperef(ft) else null;
                     const disp = if (p.ty) |pt| try helpers.typeRefDisplay(self.allocator, pt) else p.name.name;
                     try info.member_ebf.put(p.name.name, .{
@@ -536,7 +594,9 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                 }
                 try info.member_visibility.put(p.name.name, p.visibility);
             },
-            .Class, .Object, .TypeAlias => {},
+            // A companion's members answer `Foo.bar` on the class itself.
+            .Class => |*nc| if (nc.is_companion and !types.tcOff("COMPANION")) try collectMembers(self, nc.members, info),
+            .Object, .TypeAlias => {},
         }
     }
 }
@@ -835,14 +895,37 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
     try checkOperatorSignature(self, f);
     try checkCircularBounds(self, f.type_params, f.where_bounds);
     try pushFrame(self);
+    // The function's own type parameters and bounds are in scope for its
+    // parameters: `destination: C` is a `TypeParam` whose members are its
+    // bound's.
+    var all_tps = std.StringHashMap(void).init(self.allocator);
+    for (f.type_params) |*tp| try all_tps.put(tp.name.name, {});
+    try self.type_params_in_scope.append(self.allocator, all_tps);
+    var fn_bounds = std.StringHashMap([]const u8).init(self.allocator);
+    for (f.type_params) |*tp| {
+        const ub = tp.upper_bound orelse continue;
+        if (ub.function != null) continue;
+        try fn_bounds.put(tp.name.name, try self.internName(ub.name.name));
+    }
+    try self.type_param_bounds_in_scope.append(self.allocator, fn_bounds);
+    // A parameter declared by a type parameter is a `TypeParam`, not a class
+    // of that name: its class identity is the parameter's bound, if any.
+    var tps_merged = try typeParamsInScopeMerged(self);
+    defer tps_merged.deinit();
     for (f.params) |*p| {
-        const declared = try convertTypeRefLossy(self.allocator, &p.ty);
+        const declared = try helpers.convertTypeRefWithTparams(self.allocator, &p.ty, &tps_merged);
         // `vararg x: T` binds the packed array in the body, not an element.
         const ty = if (p.is_vararg)
             try helpers.varargParamType(self.allocator, &declared)
         else
             declared;
-        const cn = if (p.is_vararg) null else classNameFromTyperef(&p.ty);
+        const is_tp_name = p.ty.function == null and p.ty.type_args.len == 0 and tps_merged.contains(p.ty.name.name);
+        const cn: ?[]const u8 = if (p.is_vararg)
+            null
+        else if (is_tp_name)
+            expr_mod.typeParamBound(self, p.ty.name.name)
+        else
+            classNameFromTyperef(&p.ty);
         const decl_type_name: ?[]const u8 = if (p.is_vararg)
             null
         else if (builtinByName(p.ty.name.name) == null) p.ty.name.name else null;
@@ -874,17 +957,52 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
         if (tp.is_reified) try reified.put(tp.name.name, {});
     }
     try self.reified_type_params.append(self.allocator, reified);
-    var all_tps = std.StringHashMap(void).init(self.allocator);
-    for (f.type_params) |*tp| try all_tps.put(tp.name.name, {});
-    try self.type_params_in_scope.append(self.allocator, all_tps);
 
     // Off inside a non-private inline function: the spliced body may run
     // outside the declaring scope.
     const suppress_field_narrow = f.is_inline and f.visibility != .Private;
     if (suppress_field_narrow) self.field_narrow_off += 1;
+    // In `fun Foo.bar()`, bare `this` is the extension receiver, not the
+    // enclosing class — which is why the identity cannot come off
+    // `class_stack`, and why nothing else may read this entry.
+    var pushed_this_ext = false;
+    if (f.receiver_type) |recv| {
+        // A builtin's own class carries its members too: `fun Char.foo()`
+        // reads `this` as a `Char`.
+        const recv_name: ?[]const u8 = classNameFromTyperef(recv) orelse
+            (if (recv.function == null and builtinByName(recv.name.name) != null and root.classNamed(self, recv.name.name) != null) recv.name.name else null);
+        if (recv_name) |rn| {
+            // `fun <T> T.foo()` receives a type PARAMETER, which names no
+            // class; recording it would hand lowering a head that is only
+            // accidentally a class name.
+            var is_tp = false;
+            _ = &is_tp;
+            var tp_bound: ?[]const u8 = null;
+            for (f.type_params) |*tp| {
+                if (std.mem.eql(u8, tp.name.name, rn)) {
+                    is_tp = true;
+                    if (tp.upper_bound) |*ub| {
+                        if (ub.function == null) tp_bound = ub.name.name;
+                    }
+                }
+            }
+            // `fun <T : Foo> T.bar()` receives a value of the bound's class,
+            // which is the identity `this` has inside the body.
+            const ext_name: ?[]const u8 = if (!is_tp) rn else tp_bound;
+            if (ext_name) |en| {
+                try self.this_ext_stack.append(self.allocator, .{
+                    .name = try self.internName(en),
+                    .class_depth = self.class_stack.items.len,
+                    .label = f.name.name,
+                });
+                pushed_this_ext = true;
+            }
+        }
+    }
     if (f.body) |*body| {
         try checkFunctionBody(self, f, body, &declared_return);
     }
+    if (pushed_this_ext) _ = self.this_ext_stack.pop();
     if (suppress_field_narrow) self.field_narrow_off -= 1;
 
     {
@@ -901,6 +1019,8 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
     {
         var s = self.type_params_in_scope.pop().?;
         s.deinit();
+        var bs = self.type_param_bounds_in_scope.pop().?;
+        bs.deinit();
     }
     popFrame(self);
     if (f.body != null) {
@@ -993,6 +1113,13 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     var class_tps = std.StringHashMap(void).init(self.allocator);
     for (c.type_params) |*tp| try class_tps.put(tp.name.name, {});
     try self.type_params_in_scope.append(self.allocator, class_tps);
+    var class_bounds = std.StringHashMap([]const u8).init(self.allocator);
+    for (c.type_params) |*tp| {
+        const ub = tp.upper_bound orelse continue;
+        if (ub.function != null) continue;
+        try class_bounds.put(tp.name.name, try self.internName(ub.name.name));
+    }
+    try self.type_param_bounds_in_scope.append(self.allocator, class_bounds);
     try self.reified_type_params.append(self.allocator, std.StringHashMap(void).init(self.allocator));
     try checkCircularBounds(self, c.type_params, c.x().where_bounds);
     try checkDataOrEnumFinality(self, c);
@@ -1032,6 +1159,8 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     {
         var s = self.type_params_in_scope.pop().?;
         s.deinit();
+        var bs = self.type_param_bounds_in_scope.pop().?;
+        bs.deinit();
     }
     {
         var s = self.reified_type_params.pop().?;
@@ -1318,7 +1447,7 @@ fn checkOverrideSignatures(self: *Checker, c: *const Class, inherited: *std.Stri
                 const got = inherited_sigs.get(p.name.name) orelse continue;
                 if (got != .Property) continue;
                 const base = got.Property;
-                var derived_ty = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
+                var derived_ty = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else Type.unresolved;
                 defer derived_ty.deinit(self.allocator);
                 // Mutability cannot strengthen.
                 if (base.mutable and !p.mutable) {
@@ -1471,17 +1600,48 @@ fn bindPrimaryConstructorParams(self: *Checker, c: *const Class) Allocator.Error
 }
 
 /// Body property initializers and accessors; collects the ones left unassigned.
+fn propBindOn() bool {
+    const S = struct {
+        var state: u8 = 0;
+    };
+    if (S.state == 0) {
+        const v = std.c.getenv("KLIO_TC_PROP_BIND");
+        S.state = if (v != null and v.?[0] == '0') 1 else 2;
+    }
+    return S.state == 2;
+}
+
+/// The class a checked type names, for the `class_name` a binding carries.
+fn inferredClassName(t: *const Type) ?[]const u8 {
+    return switch (t.*) {
+        .Unresolved => |n| n,
+        .Generic => |g| g.name,
+        .Nullable => |inner| inferredClassName(inner),
+        else => null,
+    };
+}
+
 fn checkBodyProperties(self: *Checker, c: *const Class, uninitialized_properties: *std.ArrayList(UninitProperty)) Allocator.Error!void {
     for (c.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
+        // A property with no declared type takes its initializer's, which is
+        // Kotlin's own rule. The type was already being computed here for the
+        // assignability check and then dropped on the floor, so every
+        // inferred-type property read bare inside its own class came out
+        // untyped — `_size`, `_capacity`, `metadata`, and 23 037 reads like
+        // them on one compose program.
+        var inferred: ?Type = null;
+        defer if (inferred) |*t| t.deinit(self.allocator);
         if (p.init) |init| {
             var want: ?Type = if (p.ty) |pt| try convertTypeRefLossy(self.allocator, pt) else null;
             var ity = try self.checkExpr(init, if (want) |*a| a else null);
-            defer ity.deinit(self.allocator);
             if (want) |*a| {
+                defer ity.deinit(self.allocator);
                 try checkAssignable(self, &ity, a, init.span());
                 a.deinit(self.allocator);
+            } else {
+                inferred = ity;
             }
         }
         // Against the field type, not the property type.
@@ -1498,7 +1658,12 @@ fn checkBodyProperties(self: *Checker, c: *const Class, uninitialized_properties
         }
         const ef_has_init = if (p.explicit_field) |ef| ef.init != null else false;
         const has_init = p.init != null or ef_has_init or p.delegate != null or p.is_lateinit or p.is_abstract or p.getter != null or c.is_interface or c.is_abstract;
-        if (!has_init) {
+        // Bind EVERY body property, not only the ones the definite-assignment
+        // pass tracks. The binding was written for that pass and inherited its
+        // `!has_init` guard, so a property that initialized itself — which is
+        // most of them — was never in scope for the class's own methods at
+        // all. `KLIO_TC_PROP_BIND=0` restores the old scope.
+        if (propBindOn()) {
             // Inside the declaring scope an explicit field is seen and
             // assigned at the field type.
             const narrow_tr: ?*const ast.TypeRef = if (p.explicit_field) |ef|
@@ -1506,14 +1671,27 @@ fn checkBodyProperties(self: *Checker, c: *const Class, uninitialized_properties
             else
                 null;
             const bind_tr: ?*const ast.TypeRef = narrow_tr orelse (if (p.ty) |pt| @as(?*const ast.TypeRef, pt) else null);
-            const pty = if (bind_tr) |tr| try convertTypeRefLossy(self.allocator, tr) else Type.Unresolved;
+            const pty: Type = if (bind_tr) |tr|
+                try convertTypeRefLossy(self.allocator, tr)
+            else if (inferred) |*t|
+                try t.clone(self.allocator)
+            else
+                Type.unresolved;
+            const cls_name: ?[]const u8 = if (bind_tr) |tr|
+                classNameFromTyperef(tr)
+            else if (inferred) |*t|
+                inferredClassName(t)
+            else
+                null;
             try currentFrame(self).bindings.put(p.name.name, .{
                 .ty = pty,
                 .mutable = p.mutable,
                 .decl_span = p.name.span,
-                .class_name = try self.internOpt(if (bind_tr) |tr| classNameFromTyperef(tr) else null),
+                .class_name = try self.internOpt(cls_name),
                 .decl_type_name = null,
             });
+        }
+        if (!has_init) {
             try uninitialized_properties.append(self.allocator, .{
                 .name = p.name.name,
                 .sp = if (p.explicit_field) |ef| ef.span else p.name.span,
@@ -2005,6 +2183,18 @@ fn fieldTypeRefConforms(self: *Checker, ft: *const TypeRef, pt: *const TypeRef) 
     return !(fname_known and pname_known);
 }
 
+/// Every type-parameter name in scope, from every enclosing function and
+/// class, as one set. Caller owns it.
+fn typeParamsInScopeMerged(self: *const Checker) Allocator.Error!std.StringHashMap(void) {
+    var out = std.StringHashMap(void).init(self.allocator);
+    errdefer out.deinit();
+    for (self.type_params_in_scope.items) |*s| {
+        var it = s.keyIterator();
+        while (it.next()) |k| try out.put(k.*, {});
+    }
+    return out;
+}
+
 fn typeParamInScope(self: *const Checker, name: []const u8) bool {
     for (self.type_params_in_scope.items) |s| {
         if (s.contains(name)) return true;
@@ -2193,7 +2383,7 @@ pub fn checkAccessor(self: *Checker, a: *const Accessor) Allocator.Error!void {
     try pushFrame(self);
     for (a.params) |p| {
         try currentFrame(self).bindings.put(p.name, .{
-            .ty = Type.Unresolved,
+            .ty = Type.unresolved,
             .mutable = false,
             .decl_span = p.span,
             .class_name = null,

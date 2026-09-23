@@ -1,7 +1,7 @@
 //! Context parameters (Kotlin 2.4): declaration-position rules plus the
 //! static context-argument resolution behind the missing, ambiguous and
-//! excluded-form diagnostics. This pass is the compile-time contract; runtime
-//! resolution runs off the lowered `CtxLoad`/`CtxScope` ops.
+//! excluded-form diagnostics. This pass is the compile-time contract; lowering
+//! binds each context argument to a register or a frame slot.
 //!
 //! Free functions over `*Checker`, driven from `phases.run`.
 

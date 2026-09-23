@@ -488,7 +488,7 @@ test "smartcast assumeIs records class name" {
     const a = std.testing.allocator;
     var f = SmartCastFact.unknown();
     defer f.deinit(a);
-    try f.assumeIs(a, .Unresolved, try a.dupe(u8, "Foo"));
+    try f.assumeIs(a, Type.unresolved, try a.dupe(u8, "Foo"));
     try std.testing.expect(f.narrowed_class != null);
     try std.testing.expectEqualStrings("Foo", f.narrowed_class.?);
 }

@@ -135,43 +135,54 @@ pub fn bindParams(b: *FuncBuilder, names: []const []const u8) Allocator.Error!vo
             try b.bind(name, dst);
         }
         try b.markParam(name);
+        // A synthesized accessor's body runs with `this` of its owner class.
+        // The builder already carried that as the RECEIVER type, but the bound
+        // parameter itself had no declared type, so a read written `this.x`
+        // inside `__get_<Class>_<prop>` typed its receiver as nothing and
+        // resolved by name — which is most of what an accessor body does.
+        // Done here rather than at the four accessor entries so a fifth cannot
+        // miss it.
+        if (std.mem.eql(u8, name, "this") and b.resolve(name) != null) {
+            if (b.localDeclType(name) == null) {
+                if (b.ownerClass()) |oc| try b.setLocalDeclType(name, oc);
+            }
+        }
     }
 }
 
 /// Emit the prologue binding a contextual declaration's context parameters, each
-/// loading the nearest in-scope context value of its declared type; `_` parameters
-/// resolve for `contextOf` and nested calls but are not bound by name. The caller
-/// flags the module as context-using, excluding the stdlib intrinsics, so the
-/// runtime feeds receivers into the context stack only for a real declaration.
+/// loading the frame's context slot of that index, which the caller handed over
+/// ahead of the call; `_` parameters resolve for `contextOf` and nested calls but
+/// are not bound by name.
 pub fn emitContextParamLoads(
     b: *FuncBuilder,
     context_params: []const ast.ContextParam,
     type_params: []const ast.TypeParam,
 ) Allocator.Error!void {
     if (context_params.len == 0) return;
+    _ = type_params;
     for (context_params) |*cp| {
         const dst = b.allocReg();
-        var erased = cp.ty.function != null;
-        for (type_params) |*tp| {
-            if (std.mem.eql(u8, tp.name.name, cp.ty.name.name)) {
-                erased = true;
-                break;
-            }
-        }
+        const idx: u16 = @intCast(b.ctx_types.items.len);
+        try b.push(.{ .LoadContextParam = .{ .dst = dst, .idx = idx } });
         const ty_name = try loweredTypeName(b.allocator, &cp.ty);
-        const ty_const = try b.module.internConst(b.allocator, .{ .String = ty_name });
-        try b.push(.{ .CtxLoad = .{ .dst = dst, .ty = ty_const, .erased = erased } });
-        if (!std.mem.eql(u8, cp.name.name, "_")) {
-            try b.bind(cp.name.name, dst);
-            try b.setLocalDeclTypeOwned(
-                cp.name.name,
-                try loweredTypeRef(b.allocator, &cp.ty, true),
-            );
-            if (cp.ty.nullable) try b.setLocalDeclNullable(cp.name.name);
-            if (cp.ty.function) |ft| {
-                if (ft.receiver != null) try b.setLocalDeclRecvFn(cp.name.name);
-            }
+        try b.ctx_types.append(b.allocator, ty_name);
+        // An anonymous context parameter is still a value in scope: bound under
+        // a synthetic name, so a contextual call inside can hand it over.
+        const bind_name = if (std.mem.eql(u8, cp.name.name, "_"))
+            try @import("lambda_body.zig").nextContextSlotName(b.allocator)
+        else
+            cp.name.name;
+        try b.bind(bind_name, dst);
+        try b.setLocalDeclTypeOwned(
+            bind_name,
+            try loweredTypeRef(b.allocator, &cp.ty, true),
+        );
+        if (cp.ty.nullable) try b.setLocalDeclNullable(bind_name);
+        if (cp.ty.function) |ft| {
+            if (ft.receiver != null) try b.setLocalDeclRecvFn(bind_name);
         }
+        try b.addContextLocal(bind_name, cp.ty.name.name);
     }
 }
 
@@ -589,6 +600,20 @@ fn reservedHeaderParams(ctx: *HeaderReserve, f: *const ast.Function) Allocator.E
 
 /// Append the bodyless func the reserved id names, carrying the declaration's
 /// modifiers so overload resolution ranks it before any body lowers.
+/// The context parameter type heads a declaration's header carries, so a call
+/// lowered before the body hands the values over. Null without any.
+pub fn headerCtxExtra(a: Allocator, f: *const ast.Function) Allocator.Error!?*const ir.FuncExtra {
+    return ctxExtraFor(a, f.context_params);
+}
+
+/// The context parameter types a header declares, for a caller to hand over.
+pub fn ctxExtraFor(a: Allocator, context_params: []const ast.ContextParam) Allocator.Error!?*const ir.FuncExtra {
+    if (context_params.len == 0) return null;
+    const tys = try a.alloc([]const u8, context_params.len);
+    for (context_params, tys) |*cp, *out| out.* = try loweredTypeName(a, &cp.ty);
+    return build.funcExtraOn(a, .{ .ctx_types = tys });
+}
+
 fn appendReservedHeaderFunc(
     ctx: *HeaderReserve,
     f: *const ast.Function,
@@ -624,6 +649,7 @@ fn appendReservedHeaderFunc(
         .is_override = f.is_override,
         .is_open = f.is_open,
         .is_final = f.is_final,
+        .extra = try headerCtxExtra(a, f),
     });
 }
 
@@ -681,6 +707,7 @@ fn recordReservedHeaderDecl(
     try module.decl_user_params.put(id.int(), @intCast(f.params.len));
     try module.decl_user_arity.put(id.int(), arity);
     try module.decl_user_sig.put(id.int(), sig);
+    const pn = try declParamNames(a, f);
     try module.decl_sigs.put(id.int(), .{
         .enclosing_class = owner_id,
         .receiver_ty = if (f.receiver_type) |rt|
@@ -689,6 +716,9 @@ fn recordReservedHeaderDecl(
             null,
         .arity = arity,
         .sig = sig,
+        .param_names = pn.names,
+        .param_defaults = pn.defaults,
+        .return_ty = if (f.return_type) |rt| try loweredMemberTypeRef(module, a, owner_id, f, rt, true) else null,
         .kind = if (f.receiver_type != null) .member_extension else .instance_method,
         .visibility = f.visibility,
         .is_inline = f.is_inline,
@@ -697,21 +727,112 @@ fn recordReservedHeaderDecl(
     });
     try module.decl_span.put(id.int(), f.span);
     if (f.body != null) try module.decl_ast_body.put(id.int(), {});
-    try module.registry.member_method_fids.put(decl_key, id);
+    try memberNameIndexPush(module, f.name.name, id);
+    blk: {
+        const gop = try module.registry.member_method_fids.getOrPut(decl_key);
+        if (gop.found_existing and gop.value_ptr.*.int() != id.int()) {
+            // A body and its reserved header are one declaration, not two
+            // claims on the key, and what this names has to be executable.
+            // The map's own key, not the caller's: the caller frees its copy
+            // on the existing path.
+            const prev = module.funcById(gop.value_ptr.*);
+            const prev_has_body = prev != null and prev.?.hasBody();
+            const now_has_body = f.body != null;
+            if (prev_has_body and !now_has_body) break :blk;
+            if (!(!prev_has_body and now_has_body))
+                try module.registry.member_method_ambiguous.put(gop.key_ptr.*, {});
+        }
+        gop.value_ptr.* = id;
+    }
     try module.registerMemberDecl(a, ctx.class_fqn, f.name.name, id);
 }
 
-/// Key the reserved header by (class, name, declared arity) so a body lowered
+/// Key the reserved header by (class, name, call arity) so a body lowered
 /// later in the same class reaches its signature.
 fn recordReservedHeaderFid(ctx: *HeaderReserve, f: *const ast.Function, id: FuncId) Allocator.Error!void {
-    const a = ctx.a;
-    const key = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ ctx.c.name.name, f.name.name, f.params.len });
-    const gop = try ctx.module.registry.member_method_fids.getOrPut(key);
-    if (gop.found_existing) {
-        a.free(key);
-    } else {
-        gop.value_ptr.* = id;
+    try recordMemberArityRange(ctx.module, ctx.a, ctx.c.name.name, f, id);
+}
+
+/// The call arities a declaration answers: a parameter carrying a default is
+/// one the call need not pass, so `f(a, b = 1, c = 2)` is named by 1, 2 and 3
+/// arguments alike.
+const CallArities = struct { required: u32, total: u32 };
+
+fn callArities(f: *const ast.Function) CallArities {
+    var required: u32 = 0;
+    for (f.params) |*p| {
+        if (p.default == null and !p.is_vararg) required += 1;
     }
+    return .{ .required = required, .total = @intCast(f.params.len) };
+}
+
+/// Register one member declaration under every call arity it answers.
+///
+/// Keying only the declared total left every call that omitted a defaulted
+/// argument unable to name its target, which is most calls into a library
+/// whose entry points are defaults-heavy.
+fn recordMemberArityRange(
+    module: *Module,
+    a: Allocator,
+    owner_name: []const u8,
+    f: *const ast.Function,
+    id: FuncId,
+) Allocator.Error!void {
+    const ar = callArities(f);
+    var n: u32 = ar.required;
+    while (n <= ar.total) : (n += 1) {
+        try recordMemberArityKey(module, a, owner_name, f.name.name, n, ar.total, id);
+    }
+}
+
+/// Claim `(owner, name, arity)` for `id`, whose declaration spells `total`
+/// parameters.
+///
+/// Kotlin ranks the declaration that spells the argument over one that reaches
+/// the same count through its defaults, so an exact claim takes the key from a
+/// derived one and a derived claim never disturbs an exact. Between two claims
+/// of equal standing a body supersedes a reserved header -- they are one
+/// declaration, not two claims -- and anything else is a genuine overload
+/// collision the key cannot name.
+fn recordMemberArityKey(
+    module: *Module,
+    a: Allocator,
+    owner_name: []const u8,
+    name: []const u8,
+    arity: u32,
+    total: u32,
+    id: FuncId,
+) Allocator.Error!void {
+    const key = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ owner_name, name, arity });
+    try memberNameIndexPush(module, name, id);
+    const gop = try module.registry.member_method_fids.getOrPut(key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = id;
+        return;
+    }
+    a.free(key);
+    if (gop.value_ptr.*.int() == id.int()) return;
+
+    const now_exact = total == arity;
+    const prev_exact = if (module.decl_sigs.get(gop.value_ptr.*.int())) |sg|
+        sg.arity.total == arity
+    else
+        true;
+    if (now_exact != prev_exact) {
+        if (now_exact) gop.value_ptr.* = id;
+        return;
+    }
+
+    const prev = module.funcById(gop.value_ptr.*);
+    const now = module.funcById(id);
+    const prev_has_body = prev != null and prev.?.hasBody();
+    const now_has_body = now != null and now.?.hasBody();
+    if (prev_has_body != now_has_body) {
+        if (now_has_body) gop.value_ptr.* = id;
+        return;
+    }
+    // The map's own key, not the caller's: the caller freed its copy above.
+    try module.registry.member_method_ambiguous.put(gop.key_ptr.*, {});
 }
 
 /// Names captured by the anonymous object whose method is being lowered. They reach
@@ -853,7 +974,7 @@ fn collectMemberArities(
 /// A declared type head that may denote something invokable: a function type
 /// spelling, `Any`, a bare single-upper-case type parameter, or a `K*` reflection
 /// type.
-fn isFunctionTypeName(name: []const u8) bool {
+pub fn isFunctionTypeName(name: []const u8) bool {
     const head = std.mem.trimEnd(u8, name, "?");
     if (std.mem.startsWith(u8, head, "Function") or std.mem.startsWith(u8, head, "KFunction") or std.mem.startsWith(u8, head, "Suspend")) return true;
     if (std.mem.eql(u8, head, "Any") or std.mem.eql(u8, head, "Nothing")) return true;
@@ -938,6 +1059,7 @@ fn recordAbstractMemberDefaults(
                 "__default_abstract_{s}_{s}",
                 .{ f.name.name, p.name.name },
             );
+            module.pending_thunk_expected = p.ty;
             const fid = try mod.lowerExprAsParamThunk(
                 module,
                 name_refs[0..bind_upto],
@@ -1215,6 +1337,14 @@ fn registerClassShell(module: *Module, a: Allocator, c: *const ast.Class) Alloca
         .is_annotation = c.is_annotation,
         .is_value = c.is_value,
         .receiver_abi = runtime.classifierReceiverAbi(class_fqn),
+        // Recorded where the flag is set, not in the layout publish: that
+        // publish runs after the reads lower, so an `EnumClass.Entry` read
+        // would find the table empty and stay by name.
+        .enum_entry_names = try enumEntryNames(a, c),
+        .declared_props = try declaredProps(a, c),
+        .secondary_ctor_arities = try secondaryCtorArities(a, c),
+        .primary_ctor_sig = try primaryCtorSig(a, c),
+        .secondary_ctor_count = @intCast(@min(c.x().secondary_ctors.len, std.math.maxInt(u16))),
     });
     if (!module.registry.class_type_param_bounds.contains(class_fqn)) {
         if (try loweredClassTypeParamBounds(a, c)) |bounds| {
@@ -1324,27 +1454,32 @@ fn placeConcreteMember(ctx: *ClassLower, f: *const ast.Function, body: Func) All
     // also pushes its default-arg thunk funcs.
     const placed = try placeMember(ctx.module, f, body, ctx.c.name.name, ctx.own_member_names);
     try ctx.methods.append(ctx.a, placed.id);
-    try recordMemberMethodFid(ctx, f.name.name, f.params.len, placed.id);
+    try recordMemberArityRange(ctx.module, ctx.a, ctx.c.name.name, f, placed.id);
     try recordMemberDeclSig(ctx, f, placed.id);
 }
 
-/// Record this method by (class, name, declared arity) so a sibling body
-/// lowered later reaches its signature, owner-scoped so an unrelated
-/// class's namesake is never mistaken for it.
+/// Record this method by (class, name, call arity) so a sibling body lowered
+/// later reaches its signature, owner-scoped so an unrelated class's namesake
+/// is never mistaken for it.
 fn recordMemberMethodFid(
     ctx: *ClassLower,
     name: []const u8,
-    arity: usize,
+    arity: u32,
     id: FuncId,
 ) Allocator.Error!void {
-    const a = ctx.a;
-    const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ ctx.c.name.name, name, arity });
-    const gop = try ctx.module.registry.member_method_fids.getOrPut(ukey);
-    if (gop.found_existing) {
-        a.free(ukey);
-    } else {
-        gop.value_ptr.* = id;
+    try recordMemberArityKey(ctx.module, ctx.a, ctx.c.name.name, name, arity, arity, id);
+}
+
+/// The parameter names and default flags a `DeclSig` carries beside its types.
+pub fn declParamNames(a: Allocator, f: *const ast.Function) Allocator.Error!struct { names: []const []const u8, defaults: []const bool } {
+    const names = try a.alloc([]const u8, f.params.len);
+    const defaults = try a.alloc(bool, f.params.len);
+    for (f.params, names, defaults) |*p, *n, *d| {
+        // Owned: the record outlives the AST, which a bake frees.
+        n.* = try a.dupe(u8, p.name.name);
+        d.* = p.default != null;
     }
+    return .{ .names = names, .defaults = defaults };
 }
 
 /// Unified declaration record: the member half of the canonical index,
@@ -1363,11 +1498,15 @@ fn recordMemberDeclSig(ctx: *ClassLower, f: *const ast.Function, id: FuncId) All
     for (f.params, 0..) |*p, i| {
         msig[i] = try loweredTypeRef(a, &p.ty, true);
     }
+    const pn = try declParamNames(a, f);
     try module.decl_sigs.put(id.int(), .{
         .enclosing_class = ctx.class_id,
         .receiver_ty = if (f.receiver_type) |rt| try loweredTypeRef(a, rt, true) else null,
         .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
         .sig = msig,
+        .param_names = pn.names,
+        .param_defaults = pn.defaults,
+        .return_ty = if (f.return_type) |rt| try loweredTypeRef(a, rt, true) else null,
         .kind = if (f.receiver_type != null) .member_extension else .instance_method,
         .visibility = f.visibility,
         .is_inline = f.is_inline,
@@ -1583,6 +1722,18 @@ pub fn loweredTypeRef(allocator: Allocator, ty: *const ast.TypeRef, own_names: b
         var ret = try loweredTypeRef(allocator, &ft.ret, own_names);
         errdefer if (own_names) ret.deinit(allocator);
         try args.append(allocator, ret);
+        // The context parameters ride as tail markers, which every arity
+        // decoder skips and the lambda binder reads.
+        for (ft.context_params) |*cp| {
+            const cname = try loweredTypeName(allocator, cp);
+            var marker = ir.TypeRef{
+                .name = try std.fmt.allocPrint(allocator, "#ctx:{s}", .{cname}),
+                .nullable = false,
+                .args = &.{},
+            };
+            errdefer if (own_names) marker.deinit(allocator);
+            try args.append(allocator, marker);
+        }
     } else {
         head = if (own_names) try allocator.dupe(u8, ty.name.name) else ty.name.name;
         head_owned = own_names;
@@ -1739,6 +1890,7 @@ pub fn recordMethodParamDefaults(
             // Pass the owner class and own-member set so a default expression naming
             // an enclosing-class member routes through `this.<member>` instead of an
             // unresolved global lookup.
+            module.pending_thunk_expected = p.ty;
             const fid = try mod.lowerExprAsParamThunkScoped(
                 module,
                 name_refs[0..bind_upto],
@@ -1821,7 +1973,11 @@ fn retainExpectMemberHeader(
     for (f.params, 0..) |*p, i| {
         msig[i] = try loweredTypeRef(a, &p.ty, true);
     }
+    const pn = try declParamNames(a, f);
     try module.decl_sigs.put(id.int(), .{
+        .param_names = pn.names,
+        .param_defaults = pn.defaults,
+        .return_ty = if (f.return_type) |rt| try loweredTypeRef(a, rt, true) else null,
         .enclosing_class = class_id,
         .receiver_ty = null,
         .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
@@ -1834,6 +1990,7 @@ fn retainExpectMemberHeader(
         .host_symbol = member_fqn,
     });
     try module.registry.member_method_fids.put(ukey, id);
+    try memberNameIndexPush(module, f.name.name, id);
     try funcNameIndexPush(module, f.name.name, id);
     return id;
 }
@@ -1899,7 +2056,11 @@ pub fn retainLocalClassMemberHeader(
     for (f.params, 0..) |*p, i| {
         msig[i] = try loweredTypeRef(a, &p.ty, true);
     }
+    const pn = try declParamNames(a, f);
     try module.decl_sigs.put(id.int(), .{
+        .param_names = pn.names,
+        .param_defaults = pn.defaults,
+        .return_ty = if (f.return_type) |rt| try loweredTypeRef(a, rt, true) else null,
         .enclosing_class = null,
         .receiver_ty = null,
         .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
@@ -1911,6 +2072,7 @@ pub fn retainLocalClassMemberHeader(
         .has_body = false,
     });
     try module.registry.member_method_fids.put(ukey, id);
+    try memberNameIndexPush(module, f.name.name, id);
 }
 
 pub fn lowerMethod(
@@ -2025,7 +2187,8 @@ pub fn placeMember(
             const stub = module.funcById(id).?;
             placed.fqn = stub.fqn;
             placed.package = stub.package;
-            module.funcByIdMut(id).?.* = placed;
+            if (runtime.envOnce("KLIO_FUNC_TRACE") != null) std.debug.print("[place] id={d} was={s} now={s}\n", .{ id.int(), module.funcByIdMut(id).?.fqn, placed.fqn });
+        module.funcByIdMut(id).?.* = placed;
         } else {
             try module.recordFuncDeclSpan(a, f.name.span, id);
             try module.appendFunc(placed);
@@ -2063,6 +2226,7 @@ pub fn placeMember(
         const stub = module.funcById(id).?;
         placed.fqn = stub.fqn;
         placed.package = stub.package;
+        if (runtime.envOnce("KLIO_FUNC_TRACE") != null) std.debug.print("[place] id={d} was={s} now={s}\n", .{ id.int(), module.funcByIdMut(id).?.fqn, placed.fqn });
         module.funcByIdMut(id).?.* = placed;
     } else {
         try module.recordFuncDeclSpan(a, f.name.span, id);
@@ -2160,6 +2324,129 @@ pub fn concreteBoundArgs(
     }
     const out = try allocator.alloc([]const u8, upper.type_args.len);
     for (upper.type_args, out) |*ta, *dst| dst.* = ta.ty.name.name;
+    return out;
+}
+
+/// Entry names in declaration order, so `EnumClass.Entry` is an index rather
+/// than a scan of the entry table on every read.
+/// What each secondary constructor's parameter list accepts.
+/// A declared type as the runtime's constructor entry spells it: the last
+/// segment, without type arguments or the nullable mark. A function-typed
+/// parameter keeps its arity-tagged lowered name, which is what lets a lambda
+/// argument prefer a function slot over a same-position class slot.
+fn ctorParamHead(a: Allocator, ty: *const ast.TypeRef) Allocator.Error![]const u8 {
+    if (ty.function != null) return loweredTypeName(a, ty);
+    var h = ty.name.name;
+    if (std.mem.findScalarLast(u8, h, '.')) |i| h = h[i + 1 ..];
+    if (std.mem.findScalar(u8, h, '<')) |i| h = h[0..i];
+    if (h.len > 0 and h[h.len - 1] == '?') h = h[0 .. h.len - 1];
+    return a.dupe(u8, h);
+}
+
+/// The primary constructor's signature. Its parameter heads are the strings
+/// the runtime's `ClassDef` carries — the declared name verbatim — because the
+/// scoring compares against those, not against a normalised head.
+fn primaryCtorSig(a: Allocator, c: *const ast.Class) Allocator.Error!?ir.CtorArity {
+    if (!c.has_primary_ctor) return null;
+    const ps = c.primary_params;
+    var required: u16 = 0;
+    var vararg = false;
+    const heads = try a.alloc([]const u8, ps.len);
+    const names = try a.alloc([]const u8, ps.len);
+    const defaults = try a.alloc(bool, ps.len);
+    for (ps, 0..) |*p, i| {
+        heads[i] = try a.dupe(u8, p.ty.name.name);
+        names[i] = try a.dupe(u8, p.name.name);
+        defaults[i] = p.default != null;
+        if (p.is_vararg) {
+            vararg = true;
+            continue;
+        }
+        if (p.default == null) required += 1;
+    }
+    return .{
+        .required = required,
+        .total = @intCast(ps.len),
+        .vararg = vararg,
+        .param_heads = heads,
+        .param_names = names,
+        .param_defaults = defaults,
+    };
+}
+
+fn secondaryCtorArities(a: Allocator, c: *const ast.Class) Allocator.Error![]const ir.CtorArity {
+    const secs = c.x().secondary_ctors;
+    if (secs.len == 0) return &.{};
+    const out = try a.alloc(ir.CtorArity, secs.len);
+    for (secs, out) |*sec, *slot| {
+        var required: u16 = 0;
+        var vararg = false;
+        const heads = try a.alloc([]const u8, sec.params.len);
+        const names = try a.alloc([]const u8, sec.params.len);
+        const defaults = try a.alloc(bool, sec.params.len);
+        for (sec.params, 0..) |*p, i| {
+            heads[i] = try ctorParamHead(a, &p.ty);
+            names[i] = try a.dupe(u8, p.name.name);
+            defaults[i] = p.default != null;
+            if (p.is_vararg) {
+                vararg = true;
+                continue;
+            }
+            if (p.default == null) required += 1;
+        }
+        slot.* = .{
+            .required = required,
+            .total = @intCast(sec.params.len),
+            .vararg = vararg,
+            .low_priority = annotationsAreLowPriority(sec.annotations),
+            .param_heads = heads,
+            .param_names = names,
+            .param_defaults = defaults,
+        };
+    }
+    return out;
+}
+
+/// Every property the class body declares, with how this class answers it.
+///
+/// Recorded here for the same reason `enum_entry_names` is: the layout publish
+/// runs after the reads lower, and neither a published layout nor the accessor
+/// contract can reconstruct the set — an accessor-only property contributes no
+/// slot, and an abstract one contributes no function.
+fn declaredProps(a: Allocator, c: *const ast.Class) Allocator.Error![]const ir.DeclaredProp {
+    var out: std.ArrayList(ir.DeclaredProp) = .empty;
+    errdefer out.deinit(a);
+    // A primary-constructor `val`/`var` is a declared property as much as a
+    // body one, and overriding a supertype's accessor with one is ordinary
+    // Kotlin: `TextContent(… , override val status: HttpStatusCode? = null)`
+    // overrides `OutgoingContent`'s `get() = null`. Leaving these out let the
+    // walk reach the base's accessor and every created resource replied 200.
+    for (c.primary_params) |*pp| {
+        if (pp.property == null) continue;
+        try out.append(a, .{ .name = pp.name.name, .has_getter = false, .is_abstract = false });
+    }
+    for (c.members) |*m| {
+        if (m.* != .Property) continue;
+        const prop = m.Property;
+        // An extension property is not a member of this class's instances.
+        if (prop.receiver_type != null) continue;
+        const has_getter = prop.getter != null;
+        try out.append(a, .{
+            .name = prop.name.name,
+            .has_getter = has_getter,
+            .is_abstract = prop.is_abstract or
+                (!has_getter and prop.init == null and prop.delegate == null and c.is_interface),
+        });
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn enumEntryNames(a: Allocator, c: *const ast.Class) Allocator.Error![]const []const u8 {
+    if (!c.is_enum) return &.{};
+    const entries = c.x().enum_entries;
+    if (entries.len == 0) return &.{};
+    const out = try a.alloc([]const u8, entries.len);
+    for (entries, out) |*e, *slot| slot.* = e.name.name;
     return out;
 }
 
@@ -2495,7 +2782,6 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     try recordParamDeclTypes(&ctx);
     try bindLabeledReceiverAliases(&ctx);
     try emitContextParamLoads(&b, f.context_params, f.type_params);
-    markContextDeclGate(&ctx);
     try markFunctionTypedParams(&ctx);
     try installTypeParamScope(&ctx);
     try markAnyTypedParams(&ctx);
@@ -2659,22 +2945,20 @@ fn bindLabeledReceiverAliases(ctx: *BodyLower) Allocator.Error!void {
                         try b.bind(clabel, this_reg);
                     }
                 }
+            } else if (ctx.owner_class) |oc| {
+                // A member extension's dispatch receiver is the value the
+                // caller handed the frame: `this@<Owner>` in the body, and
+                // the register a bare owner member is read off.
+                const dreg = b.allocReg();
+                try b.push(.{ .LoadDispatchThis = .{ .dst = dreg } });
+                if (!std.mem.eql(u8, oc, f.name.name)) {
+                    const clabel = try std.fmt.allocPrint(a, "this@{s}", .{oc});
+                    try b.bind(clabel, dreg);
+                    try b.setLocalDeclType(clabel, oc);
+                }
+                b.setDispatchThisReg(dreg);
             }
         }
-    }
-}
-
-/// A user contextual declaration makes receivers context sources; the stdlib
-/// intrinsics resolve without the runtime receiver stack, so they must not flip
-/// the module-wide gate.
-fn markContextDeclGate(ctx: *BodyLower) void {
-    const b = ctx.b;
-    const f = ctx.f;
-    if (f.context_params.len != 0 and
-        !std.mem.eql(u8, f.name.name, "context") and
-        !std.mem.eql(u8, f.name.name, "contextOf"))
-    {
-        b.module.has_context_decls = true;
     }
 }
 
@@ -2814,6 +3098,7 @@ fn installOwnerAndReceiverType(ctx: *BodyLower) Allocator.Error!void {
     }
     if (ctx.f.receiver_type) |receiver| {
         b.setRecvTypeRefOwned(try loweredTypeRef(b.allocator, receiver, true));
+        b.recv_is_receiver_fn = if (receiver.function) |ft| ft.receiver != null else false;
     } else {
         b.setRecvTy(null);
     }
@@ -3098,6 +3383,16 @@ fn funcNameIndexPush(module: *Module, name: []const u8, id: FuncId) Allocator.Er
     const a = module.registry.allocator;
     const gop = try module.func_name_index.getOrPut(name);
     if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(a, id);
+}
+
+/// A member declaration under its simple name, for the namesake set a call
+/// whose receiver is decided at run time still agrees a block's shape over.
+pub fn memberNameIndexPush(module: *Module, name: []const u8, id: FuncId) Allocator.Error!void {
+    const a = module.registry.allocator;
+    const gop = try module.registry.member_fids_by_name.getOrPut(name);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    for (gop.value_ptr.items) |have| if (have == id) return;
     try gop.value_ptr.append(a, id);
 }
 

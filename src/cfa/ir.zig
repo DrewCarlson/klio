@@ -185,7 +185,7 @@ pub const Node = union(enum) {
     Assume: struct { reg: Reg, polarity: bool },
     /// Emitted on the arms of an `is` / `!is` check, both polarities feeding
     /// the smart-cast lattice. `class_name` carries the source simple name,
-    /// since `ty` is `Type.Unresolved` for any non-builtin.
+    /// since `ty` is `Type.unresolved` for any non-builtin.
     AssumeIs: struct {
         reg: Reg,
         ty: Type,

@@ -2364,6 +2364,13 @@ pub fn coroutineStartRootOrSuspended(self: anytype, scope: ?*const Value, block:
 pub fn coroutineLaunch(self: anytype, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     _ = scope;
     if (coroTop()) |top| {
+        // A dispatch onto the PUMP is what `yield()` performs, through
+        // `Yield.kt`'s `dispatchYield` into `KlioDispatcher.dispatch`. It is
+        // the round-trip kotlinx relies on to give a `Dispatchers.Default`
+        // worker time to start its body, so outstanding pool work is let
+        // reach its own first suspension here. A `main` that never suspends
+        // never arrives, which is what keeps a queued daemon dropped.
+        intrinsic_host.awaitPoolQuiescent();
         try top.enqueueLaunch(block.*);
         return null;
     }

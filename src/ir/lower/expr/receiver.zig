@@ -360,7 +360,7 @@ pub fn overloadPickByLambdaReturnFull(
     // Bind the lambda's value parameters from the agreed declared types; a sole
     // bare-type-parameter param is the receiver's element.
     var nb = try FuncBuilder.init(b.allocator, b.module);
-    nb.census_quiet = true;
+    nb.markScratch();
     defer nb.deinit();
     // The lambda body's calls resolve in the caller's lexical class scope, so
     // `it.toLong()` binds the enclosing class's private member extension.

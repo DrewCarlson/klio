@@ -36,6 +36,18 @@ Task 4 and the safe-tier decision) closed 2026-09-07; records in git history.
 Standing gates: every library census at baseline, compose plugin 1390 / 0,
 stdlib sweep 117 files clean, CI green (unit plus eight shards).
 
+## The interpreter architecture campaign
+
+`resolved-interpreter.md`: close the resolution gap and rebuild the
+execution path on it. The diagnosis is that 0.5% of member calls reach
+the runtime knowing what they call (`call_member_resolved` 21 933 against
+`call_member_virtual` 1 646 999), so the tiers, verdict bytes, site memos,
+signature folds and receiver-chain hashes are all compensation for a
+decision Kotlin makes statically. Five sections, ordered so each unblocks
+the next: the ratchet (censuses plus `KLIO_REQUIRE_RESOLVED`), resolution
+at lowering, slot- and table-indexed representation, one execution engine
+in place of five tiers, and a contiguous value stack. Not started.
+
 ## Deferred fronts
 
 Not in the active plan. Each reopens only with the trigger named on it;
@@ -176,7 +188,8 @@ against the code.
 ## Doc register
 
 Open: `conformance-backlog.md` (active), `kotlinc-box-conformance.md`,
-`pack-suites-to-green.md`, `safe-tier-allocation-fill.md`, and this file.
+`pack-suites-to-green.md`, `resolved-interpreter.md`,
+`safe-tier-allocation-fill.md`, and this file.
 
 Reference (not campaigns): `docs/design/` (architecture summary,
 coroutine model, GC, JIT, diagnostics, benchmarks, stdlib, intrinsics,

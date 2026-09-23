@@ -171,12 +171,6 @@ pub const NullHost = struct {
         }
     }
 
-    /// The bare-IR host has no class table, so a `super.prop = v` write has nothing to walk past: store the field.
-    pub fn setFieldFrom(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value, super_owner: ?[]const u8) Allocator.Error!UnitResult {
-        _ = super_owner;
-        return setField(self, allocator, receiver, name, value);
-    }
-
     pub fn setField(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
         _ = self;
         switch (receiver.*) {
@@ -256,11 +250,6 @@ pub const NullHost = struct {
 
     pub fn callValueWithThisExact(self: *NullHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
         return self.callValueWithThis(allocator, callee, this_value, args, arg_names);
-    }
-
-    pub fn callSuper(self: *NullHost, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        _ = .{ self, allocator, receiver, owner_class, qualifier, name, args, arg_names };
-        return errResult(.{ .Unsupported = "Host.call_super" });
     }
 
     pub fn qualifiedThis(self: *NullHost, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {

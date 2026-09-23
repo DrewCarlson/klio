@@ -308,6 +308,7 @@ pub fn runDumpIr(
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
     span.active_map = &map;
+    span.dumpFileIds(&map);
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
         io.printStderr(gpa, "error: lowering failed\n", .{});
         return 1;
@@ -357,6 +358,7 @@ pub fn runTranspileDump(
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
     span.active_map = &map;
+    span.dumpFileIds(&map);
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
         io.printStderr(gpa, "error: lowering failed\n", .{});
         return 1;
@@ -430,8 +432,11 @@ pub fn runTranspileNative(
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
     // Program sources only: checking pack sources binds calls never reached.
-    if (computeEagerCalls(gpa, user_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    if (eagerCallsOn()) {
+        if (computeEagerCalls(gpa, user_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    }
     span.active_map = &map;
+    span.dumpFileIds(&map);
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
         io.printStderr(gpa, "error: lowering failed\n", .{});
         return 1;
@@ -617,9 +622,11 @@ pub fn runTranspile(
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
-    if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    if (eagerCallsOn()) {
+        if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    }
     span.active_map = &map;
-    span.active_map = &map;
+    span.dumpFileIds(&map);
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
         io.printStderr(gpa, "error: lowering failed\n", .{});
         return 1;
@@ -3268,9 +3275,12 @@ pub fn runTestFiles(
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
-    if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    if (eagerCallsOn()) {
+        if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    }
     // Installed before lowering so lowering diagnostics resolve spans too.
     span.active_map = &map;
+    span.dumpFileIds(&map);
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
     return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter, format, list_only);
 }
@@ -3407,22 +3417,25 @@ fn runTestsOnBuilt(
         defer mg.deinit();
         ir.eval.fnProfDump(mg.get());
         ir.eval.frameCountDump(mg.get());
+        ir.site_census.dump(mg.get());
     }
+    interp_ir.class_layout.auditDump();
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
     ir.eval.ext_fb_counts = &interp_ir.VmHost.extFbCounts;
     ir.eval.dispatchStatsDump();
-    if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) {
-        ir.lower.expr.lowerSitesDump();
-        ir.lower.expr.lowerNoRecvDump();
-        ir.lower.expr.lowerDeclineDump();
-        ir.lower.expr.lowerPromoDump();
-        ir.lower.expr.lowerLocalInitDump();
-        ir.lower.expr.lowerNoClassDump();
-    }
+    interp_ir.ctorNameProbeDump();
+    interp_ir.ctorPickAuditDump();
+    interp_ir.ProgramImage.nameIdentityProbeDump();
+    ir.eval.fused.classifyRejectDump();
+    ir.eval.fused.heavyReasonDump();
+    ir.eval.fuseGateDump();
+    lowerCensusDump();
     ir.eval.probeStatsDump();
     ir.eval.opProfDump();
-    return if (report.failed > 0) 1 else 0;
+    const unresolved = ir.eval.unresolvedDump();
+    if (report.failed > 0) return 1;
+    return if (ir.eval.requireResolvedFails() and unresolved > 0) 1 else 0;
 }
 
 /// Collect `.kt` files from `path`, sorted for deterministic test ordering.
@@ -3489,11 +3502,18 @@ pub const EagerCallOptions = struct {
     diagnostics: bool = true,
 };
 
+/// `KLIO_EAGER_CALLS=0` leaves the checker's tables unpublished, so lowering
+/// runs on its own derivers alone.
+pub fn eagerCallsOn() bool {
+    return !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_CALLS") orelse "1", "0");
+}
+
 pub fn computeEagerCalls(
     gpa: std.mem.Allocator,
     combined: []const KotlinFile,
     native_fqns: []const []const u8,
 ) ?std.AutoHashMap(span_mod.Span, span_mod.Span) {
+    if (span_mod.active_map) |am| span_mod.dumpFileIds(am);
     return computeEagerCallsOpts(gpa, combined, native_fqns, .{});
 }
 
@@ -3504,6 +3524,7 @@ pub fn computeEagerCallsOpts(
     opts: EagerCallOptions,
 ) ?std.AutoHashMap(span_mod.Span, span_mod.Span) {
     const audit = runtime.envOnce("KLIO_EAGER_AUDIT") != null;
+    typeck.check.Checker.setUnresolvedProbe(audit);
     if (audit) {
         var ndecl: usize = 0;
         for (combined) |*kf| ndecl += kf.decls.len;
@@ -3605,36 +3626,69 @@ pub fn computeEagerCallsOpts(
         std.debug.print("[EAGER-GATES] entered={d} vararg={d} type_param={d} ext_name={d} member_shadow={d} pkg_visibility={d} recorded={d}\n", .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6] });
     }
     if (audit) std.debug.print("[EAGER] {d} call resolutions recorded ({d} by image FuncId; typeck resolved {d}; {d} carried no decl span, {d} named a decl outside the checked sources)\n", .{ n, n_fid, seen_total, no_decl_span, not_declared });
+    // The base's republished picks are pending under other files' spans and stay.
     if (out_fids.count() != 0) {
-        if (ir.pending_eager_call_fids) |*old_m| old_m.deinit();
-        ir.pending_eager_call_fids = out_fids;
+        if (ir.pending_eager_call_fids) |*old_m| {
+            var fit = out_fids.iterator();
+            while (fit.next()) |e| old_m.put(e.key_ptr.*, e.value_ptr.*) catch {};
+            out_fids.deinit();
+        } else ir.pending_eager_call_fids = out_fids;
     } else out_fids.deinit();
     // Only decisive heads enter: Function/TypeParam/Unresolved would override.
     var tout = std.AutoHashMap(span_mod.Span, ir.EagerTypeHead).init(gpa);
     tout.ensureTotalCapacity(tc.types.count() + tc.expr_class.count()) catch {};
     var tit = tc.types.iterator();
     var tn: usize = 0;
+    var dropped_by_variant: [@typeInfo(@typeInfo(typeck.check.Type).@"union".tag_type.?).@"enum".fields.len]usize = @splat(0);
+    // A type inside a generic body is true only for the last instantiation — of
+    // the whole TYPE. `eagerHeadOf` keeps only a concrete class head and refuses
+    // a type parameter, and `List<T>`'s head is `List` under every
+    // instantiation, so an instantiation-dependent entry can still carry a
+    // stable head. `KLIO_EAGER_IDEP=0` puts them back out.
+    const keep_idep = !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_IDEP") orelse "1", "0");
+    // `KLIO_EAGER_SEEN=1` records a span the checker VISITED but could not
+    // name, as an empty head. `eagerTypeOf` then separates "the checker never
+    // saw this expression" (`no_entry`) from "it saw it and had no name for
+    // it" (`empty_head`) — the split that says whether the gap is in the
+    // checker or in what reaches it.
+    const keep_seen = runtime.envOnce("KLIO_EAGER_SEEN") != null;
     while (tit.next()) |e| {
-        // A type inside a generic body is true only for the last instantiation.
-        if (tc.types_instantiation_dependent.contains(e.key_ptr.*)) continue;
-        var head = eagerHeadOf(e.value_ptr, false) orelse continue;
+        if (!keep_idep and tc.types_instantiation_dependent.contains(e.key_ptr.*)) continue;
+        var head = eagerHeadOf(e.value_ptr, false) orelse {
+            if (audit) dropped_by_variant[@intFromEnum(std.meta.activeTag(e.value_ptr.*))] += 1;
+            if (keep_seen) tout.put(e.key_ptr.*, .{ .name = "", .nullable = false }) catch {};
+            continue;
+        };
         head.name = internName(gpa, &names, head.name) catch continue;
         tout.put(e.key_ptr.*, head) catch continue;
         tn += 1;
     }
-    // A plain user class is `Type.Unresolved` in `tc.types`, so identity lives in
+    // A plain user class is `Type.unresolved` in `tc.types`, so identity lives in
     // `expr_class`. Unresolvable heads are dropped on read in `eagerTypeOf`.
     var cn_added: usize = 0;
     {
         var cit = tc.expr_class.iterator();
         while (cit.next()) |e| {
-            if (tout.contains(e.key_ptr.*)) continue;
+            // An empty head is the `KLIO_EAGER_SEEN` placeholder, not an answer.
+            if (tout.get(e.key_ptr.*)) |h| {
+                if (h.name.len != 0) continue;
+            }
             const name = internName(gpa, &names, e.value_ptr.*) catch continue;
             tout.put(e.key_ptr.*, .{ .name = name, .nullable = false }) catch continue;
             cn_added += 1;
         }
     }
-    if (audit) std.debug.print("[EAGER] {d} type heads recorded ({d} excluded as instantiation-dependent, {d} from class evidence)\n", .{ tn + cn_added, tc.types_instantiation_dependent.count(), cn_added });
+    if (audit) {
+        inline for (@typeInfo(@typeInfo(typeck.check.Type).@"union".tag_type.?).@"enum".fields) |f| {
+            if (dropped_by_variant[f.value] != 0)
+                std.debug.print("[EAGER-DROP] {d:>8}  {s}\n", .{ dropped_by_variant[f.value], f.name });
+        }
+    }
+    if (audit) typeck.check.Checker.dumpUnresolvedByKind();
+    if (audit) typeck.check.expr.dumpPathUnres();
+    if (audit) typeck.check.expr_calls.dumpCallUnres();
+    if (audit) std.debug.print("[EAGER] {d} type heads recorded of {d} typeck spans ({d} instantiation-dependent, {d} from class evidence, {d} class-evidence spans)\n", .{ tn + cn_added, tc.types.count(), tc.types_instantiation_dependent.count(), cn_added, tc.expr_class.count() });
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_TYPES") orelse "1", "0")) tout.clearRetainingCapacity();
     ir.pending_eager_types = tout;
     var rout = std.AutoHashMap(span_mod.Span, []const u8).init(gpa);
     rout.ensureTotalCapacity(tc.lambda_recv_heads.count()) catch {};
@@ -3644,15 +3698,25 @@ pub fn computeEagerCallsOpts(
         rout.put(e.key_ptr.*, name) catch {};
     }
     if (audit) std.debug.print("[EAGER] {d} lambda receiver heads recorded\n", .{rout.count()});
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_SHAPES") orelse "1", "0")) rout.clearRetainingCapacity();
     ir.pending_eager_recv_heads = rout;
     var pout = std.AutoHashMap(span_mod.Span, ir.EagerParamShape).init(gpa);
     pout.ensureTotalCapacity(tc.lambda_param_shapes.count()) catch {};
     var pit = tc.lambda_param_shapes.iterator();
     while (pit.next()) |e| pout.put(e.key_ptr.*, .{ .has_receiver = e.value_ptr.has_receiver, .arity = e.value_ptr.arity }) catch {};
     if (audit) std.debug.print("[EAGER] {d} param shapes recorded\n", .{pout.count()});
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_SHAPES") orelse "1", "0")) pout.clearRetainingCapacity();
     ir.pending_eager_param_shapes = pout;
     runtime.prof.phaseMark("stage tables");
     if (tracing) std.debug.print("[stdlib-image]   stage tables: {d}ms\n", .{(runtime.clockMonotonicNanos() - t_check_end) / 1_000_000});
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_DECLS") orelse "1", "0")) out.clearRetainingCapacity();
+    if (runtime.envOnce("KLIO_EAGER_DISCARD") != null) {
+        out.clearRetainingCapacity();
+        if (ir.pending_eager_types) |*m| m.clearRetainingCapacity();
+        if (ir.pending_eager_recv_heads) |*m| m.clearRetainingCapacity();
+        if (ir.pending_eager_param_shapes) |*m| m.clearRetainingCapacity();
+        if (ir.pending_eager_call_fids) |*m| m.clearRetainingCapacity();
+    }
     return out;
 }
 
@@ -3665,15 +3729,52 @@ fn internName(gpa: std.mem.Allocator, names: *std.StringHashMap([]const u8), s: 
     return owned;
 }
 
+/// Primitive heads are MARKED rather than dropped. Applicability treats a
+/// primitive head as exact while a literal coerces — an `Int` literal fills a
+/// `vararg Byte` — so the argument reader still declines them; a receiver
+/// question wants exactly these, and dropping them at export left the receiver
+/// deriver with nothing to read.
 fn eagerHeadOf(t: *const typeck.check.Type, nullable: bool) ?ir.EagerTypeHead {
-    // Primitive heads stay out: applicability treats them as exact, but a literal
-    // coerces (an Int literal fills a `vararg Byte`) and a head lacks literalness.
     return switch (t.*) {
         .String => .{ .name = "String", .nullable = nullable },
         .Nullable => |inner| eagerHeadOf(inner, true),
         .Generic => |g| .{ .name = g.name, .nullable = nullable },
+        // A plain user class: the checker models it as `Unresolved` and now
+        // carries which one, so the head no longer has to come from the
+        // separate `expr_class` evidence that covered a third of them.
+        .Unresolved => |name| if (name) |n| .{ .name = n, .nullable = nullable } else null,
+        .Boolean => .{ .name = "Boolean", .nullable = nullable, .primitive = true },
+        .Byte => .{ .name = "Byte", .nullable = nullable, .primitive = true },
+        .Short => .{ .name = "Short", .nullable = nullable, .primitive = true },
+        .Int => .{ .name = "Int", .nullable = nullable, .primitive = true },
+        .Long => .{ .name = "Long", .nullable = nullable, .primitive = true },
+        .UByte => .{ .name = "UByte", .nullable = nullable, .primitive = true },
+        .UShort => .{ .name = "UShort", .nullable = nullable, .primitive = true },
+        .UInt => .{ .name = "UInt", .nullable = nullable, .primitive = true },
+        .ULong => .{ .name = "ULong", .nullable = nullable, .primitive = true },
+        .Float => .{ .name = "Float", .nullable = nullable, .primitive = true },
+        .Double => .{ .name = "Double", .nullable = nullable, .primitive = true },
+        .Char => .{ .name = "Char", .nullable = nullable, .primitive = true },
+        // A function type's head is the `FunctionN` spelling the rest of the
+        // pipeline already uses, and it is what lets a lambda ARGUMENT be
+        // scored. `Unit`, `Nothing` and `Any` were added here too and MEASURED
+        // WORSE: they are answers a consumer accepts in place of a better one
+        // it would otherwise derive, and the census fell 4.38% -> 4.51%.
+        .Function => |ft| .{ .name = functionHeadName(ft.params.len), .nullable = nullable },
         else => null,
     };
+}
+
+/// `FunctionN` for an arity the pipeline spells that way everywhere else.
+/// Static strings, so the head needs no interning and no allocation.
+fn functionHeadName(n: usize) []const u8 {
+    const names = [_][]const u8{
+        "Function0",  "Function1",  "Function2",  "Function3",
+        "Function4",  "Function5",  "Function6",  "Function7",
+        "Function8",  "Function9",  "Function10", "Function11",
+        "Function12", "Function13", "Function14", "Function15",
+    };
+    return if (n < names.len) names[n] else "Function";
 }
 
 fn runBuilt(
@@ -3689,7 +3790,9 @@ fn runBuilt(
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
-    if (computeEagerCalls(gpa, all_asts, &.{})) |ec| ir.pending_eager_calls = ec;
+    if (eagerCallsOn()) {
+        if (computeEagerCalls(gpa, all_asts, &.{})) |ec| ir.pending_eager_calls = ec;
+    }
     // Installed before lowering so diagnostics can name a file and a line.
     span.active_map = map;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch |e| {
@@ -3841,24 +3944,26 @@ pub fn runBuiltModuleArgs(
         defer mg.deinit();
         ir.eval.fnProfDump(mg.get());
         ir.eval.frameCountDump(mg.get());
+        ir.site_census.dump(mg.get());
     }
+    interp_ir.class_layout.auditDump();
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
     ir.eval.ext_fb_counts = &interp_ir.VmHost.extFbCounts;
     ir.eval.dispatchStatsDump();
+    interp_ir.ctorNameProbeDump();
+    interp_ir.ctorPickAuditDump();
+    interp_ir.ProgramImage.nameIdentityProbeDump();
+    ir.eval.fused.classifyRejectDump();
+    ir.eval.fused.heavyReasonDump();
+    ir.eval.fuseGateDump();
     ir.eval.opProfDump();
     if (runtime.envOnce("KLIO_DECL_AUDIT") != null) declAudit(gpa, &built);
     // Reported for `run` too: the stdlib's own tests are generic throughout.
-    if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) {
-        ir.lower.expr.lowerSitesDump();
-        ir.lower.expr.lowerNoRecvDump();
-        ir.lower.expr.lowerDeclineDump();
-        ir.lower.expr.lowerPromoDump();
-        ir.lower.expr.lowerLocalInitDump();
-        ir.lower.expr.lowerNoClassDump();
-    }
+    lowerCensusDump();
+    const unresolved = ir.eval.unresolvedDump();
     return switch (res) {
-        .ok => 0,
+        .ok => if (ir.eval.requireResolvedFails() and unresolved > 0) 1 else 0,
         .err => |e| blk: {
             switch (e) {
                 .InvalidMain => io.writeStderr("runtime error: main function not found in module\n"),
@@ -4081,4 +4186,26 @@ fn renderToStderr(
 test "diag format variants exist" {
     try std.testing.expectEqual(DiagFormat.Plain, DiagFormat.Plain);
     try std.testing.expect(DiagFormat.Json != DiagFormat.Sarif);
+}
+
+
+/// The lowering census, printed wherever lowering actually ran. Nearly every
+/// library site is lowered into the image by `bake-image`, not by `run`, so a
+/// census read only from a run reports a small fraction of the program.
+pub fn lowerCensusDump() void {
+    ir.build.emitCensusDump();
+    ir.lower.expr.dumpScopeWhy();
+    ir.eval.globalIdAuditDump();
+    if (runtime.envOnce("KLIO_DISPATCH_STATS") == null) return;
+    ir.lower.expr.lowerSitesDump();
+    ir.lower.expr.lowerNoRecvDump();
+    ir.lower.expr.lowerDeclineDump();
+    ir.lower.expr.lowerPromoDump();
+    ir.lower.expr.lowerLocalInitDump();
+    ir.lower.expr.lowerNoClassDump();
+    ir.lower.expr.lowerNoExtDump();
+    ir.lower.expr.lowerNoSlotDump();
+    ir.lower.expr.untypedRecvDump();
+    ir.lower.expr.eagerRecvDump();
+    ir.lower.expr.lowerFallbackDump();
 }

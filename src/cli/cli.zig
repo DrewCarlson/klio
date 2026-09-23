@@ -273,11 +273,17 @@ fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: [
     defer deinitRequestedFeatures(&requested);
     if (stdlib_cache) |dir| {
         if (program != null or out != null) return usageBakeImage(gpa);
-        return stdlib_image.bakeStdlibCache(gpa, dir, &requested, self_exe, probe);
+        const cache_rc = stdlib_image.bakeStdlibCache(gpa, dir, &requested, self_exe, probe);
+        commands.lowerCensusDump();
+        return cache_rc;
     }
     if (probe != null) return usageBakeImage(gpa);
     if (program == null or out == null) return usageBakeImage(gpa);
-    return bundle.bakeImage(gpa, &.{program.?}, &requested, out.?);
+    const rc = bundle.bakeImage(gpa, &.{program.?}, &requested, out.?);
+    // Nearly every library site is lowered here, not at `run`, so the lowering
+    // census is only complete when read from a bake.
+    commands.lowerCensusDump();
+    return rc;
 }
 
 fn runRunImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {

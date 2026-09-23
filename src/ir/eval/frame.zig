@@ -118,6 +118,12 @@ pub const Frame = struct {
     step_err: ?EvalError = null,
     /// Out-of-band payload for `Step.flat_call`, set and consumed within one dispatch step.
     flat_call: ?FlatCallReq = null,
+    /// The dispatch receiver a caller handed this member-extension frame, borrowed from the chain entry it
+    /// pushed; `Null` until one arrives, or when the caller pushed none.
+    dispatch_this: Value = .Null,
+    /// The context arguments a caller handed this contextual frame, in declaration order, borrowed from
+    /// the `context` chain entries it pushed; empty when the caller pushed none.
+    ctx_values: std.ArrayList(Value) = .empty,
     pending_finally: PendingFinallyState = .{},
     /// The per-thread evaluator state, resolved once when the frame is built: macOS reaches a thread-local
     /// through a call the compiler cannot hoist, so every access site would otherwise pay its own.
@@ -221,8 +227,16 @@ pub const Frame = struct {
             try self.enclosing_this.append(chainAllocator(), e);
         }
         if (self.tls.active_chain) |caller| {
-            for (caller.items[@min(self.tls.active_chain_base, caller.items.len)..]) |e| {
+            const base = @min(self.tls.active_chain_base, caller.items.len);
+            // The caller's own context values stay visible to a callee that
+            // derives one from its chain: the by-name paths' fallback.
+            for (caller.items[0..base]) |e| {
+                if (e.kind == .context or e.kind == .access_context) try self.enclosing_this.append(chainAllocator(), .{ .v = e.v, .kind = .access_context });
+            }
+            for (caller.items[base..]) |e| {
                 if (e.kind == .access) continue;
+                if (e.kind == .dispatch) self.dispatch_this = e.v;
+                if (e.kind == .context) try self.ctx_values.append(self.allocator, e.v);
                 try self.enclosing_this.append(chainAllocator(), e);
             }
         }
@@ -239,6 +253,10 @@ pub const Frame = struct {
     /// Seed this frame's chain from a saved snapshot slice (resume path) and make it active.
     pub fn activateChainFrom(self: *Frame, saved: []const EnclosingEntry) Allocator.Error!void {
         try self.enclosing_this.appendSlice(chainAllocator(), saved);
+        for (saved) |e| {
+            if (e.kind == .dispatch) self.dispatch_this = e.v;
+            if (e.kind == .context) try self.ctx_values.append(self.allocator, e.v);
+        }
         self.activateAs();
     }
 
@@ -286,6 +304,7 @@ pub const Frame = struct {
             }
             self.pending_finally.release(self.allocator);
         }
+        self.ctx_values.deinit(self.allocator);
         // Args before regs: `releaseRegs` runs the depth-0 pool drain, so the outermost frame's own carriers must
         // already be pooled. The pools belong to the thread tearing the frame down, not the one that built it.
         const ev: *EvalTls = ev_state.evtlsPtr();

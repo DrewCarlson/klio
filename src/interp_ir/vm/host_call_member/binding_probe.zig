@@ -660,7 +660,7 @@ pub fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const
                 var it = std.mem.splitScalar(u8, ctx_types, '|');
                 while (it.next()) |ty| {
                     if (ty.len == 0) continue;
-                    const v = self.ctxResolve(ty, false) orelse break :blk args;
+                    const v = (try self.contextValueOfType(allocator, ty)) orelse break :blk args;
                     try with_ctx.append(allocator, v);
                 }
                 try with_ctx.appendSlice(allocator, args);
@@ -711,7 +711,7 @@ pub fn enclosingAnonMemberExtDispatch(self: *VmHost, allocator: Allocator, recei
         hg.deinit();
         if (!is_member_ext) continue;
         if (!receiverImplementsType(self, receiver, recv_ty)) continue;
-        ir.eval.pushEnclosing(&e.v);
+        ir.eval.pushDispatch(&e.v);
         defer ir.eval.popEnclosing();
         return try invokeAnonMethod(self, allocator, receiver, hit, args, null);
     }
@@ -748,7 +748,7 @@ pub fn enclosingNamedMemberExtDispatch(self: *VmHost, allocator: Allocator, rece
             if (!receiverImplementsType(self, receiver, f.params[0].ty.name)) continue;
             const all = try prependReceiver(allocator, receiver, args);
             defer if (runtime.freeScratch()) allocator.free(all);
-            ir.eval.pushEnclosing(&e.v);
+            ir.eval.pushDispatch(&e.v);
             defer ir.eval.popEnclosing();
             return try callFuncRec(self, allocator, mptr, fid, all);
         }
@@ -775,7 +775,7 @@ pub fn enclosingNamedMemberExtDispatch(self: *VmHost, allocator: Allocator, rece
                 if (!receiverImplementsType(self, receiver, f.params[0].ty.name)) continue;
                 const all = try prependReceiver(allocator, receiver, args);
                 defer if (runtime.freeScratch()) allocator.free(all);
-                ir.eval.pushEnclosing(&d);
+                ir.eval.pushDispatch(&d);
                 defer ir.eval.popEnclosing();
                 return try callFuncRec(self, allocator, mptr, fid, all);
             }

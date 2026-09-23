@@ -35,6 +35,7 @@ const ev_activation = @import("activation.zig");
 const ev_chain = @import("chain.zig");
 const ev_enter = @import("enter.zig");
 const ev_exec = @import("exec.zig");
+const ev_diag = @import("diag.zig");
 const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
 const ev_inst = @import("inst.zig");
@@ -82,7 +83,20 @@ pub const FUSED_MAX_REGS: usize = 128;
 
 pub const FUSED_BANK_DEPTH: usize = 24;
 
-const FUSED_MAX_BLOCKS: usize = 64;
+/// `KLIO_FUSE_MAX_BLOCKS` overrides, so the cap can be priced rather than
+/// assumed: it is a bound on classification work, not a storage limit, and
+/// it was the only one of the three that rejected anything.
+const FUSED_MAX_BLOCKS_DEFAULT: usize = 64;
+var fused_max_blocks_cached: usize = 0;
+fn fusedMaxBlocks() usize {
+    if (fused_max_blocks_cached == 0) {
+        fused_max_blocks_cached = FUSED_MAX_BLOCKS_DEFAULT;
+        if (runtime.envOnce("KLIO_FUSE_MAX_BLOCKS")) |v| {
+            fused_max_blocks_cached = std.fmt.parseInt(usize, v, 10) catch FUSED_MAX_BLOCKS_DEFAULT;
+        }
+    }
+    return fused_max_blocks_cached;
+}
 
 const FUSED_MAX_INSTS: usize = 256;
 
@@ -181,18 +195,76 @@ fn bareTypeVarHead(name: []const u8) bool {
     return head.len > 0 and head.len <= 2 and std.ascii.isUpper(head[0]);
 }
 
+/// Why `fusedClassify` refused a body. `classify` is 4 960 of a compose
+/// program's 5 406 fused declines and had no breakdown, so which of its
+/// dozen conditions actually costs the frames could not be read.
+pub const ClassifyReject = enum(u8) {
+    suspend_or_lambda,
+    block_count,
+    register_count,
+    vararg_or_default_param,
+    handler_block,
+    inst_count,
+    terminator,
+    type_var_cast,
+    type_var_instanceof,
+    suspend_resume_point,
+    unsupported_inst,
+    heavy_entry_prefix,
+};
+pub var classify_rejects: [@typeInfo(ClassifyReject).@"enum".fields.len]std.atomic.Value(usize) =
+    @splat(std.atomic.Value(usize).init(0));
+
+fn reject(r: ClassifyReject) u8 {
+    _ = classify_rejects[@intFromEnum(r)].fetchAdd(1, .monotonic);
+    return 2;
+}
+
+pub fn classifyRejectDump() void {
+    if (runtime.envOnce("KLIO_FUSE_CLASSIFY") == null) return;
+    inline for (@typeInfo(ClassifyReject).@"enum".fields) |f| {
+        const n = classify_rejects[f.value].load(.monotonic);
+        if (n != 0) std.debug.print("[fuse-classify] {d:>8}  {s}\n", .{ n, f.name });
+    }
+}
+
+/// `KLIO_FUSE_HEAVY=1`: what makes a body heavy, which is what the entry
+/// declines when it may not materialize. Resolution is supposed to have
+/// made the dispatch cases tractable, so they are counted apart by whether
+/// the site names its target.
+pub var heavy_reasons: [7]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0));
+var heavy_probe_state: u8 = 0;
+
+pub fn heavyProbeOn() bool {
+    if (heavy_probe_state == 0)
+        heavy_probe_state = if (runtime.envOnce("KLIO_FUSE_HEAVY") != null) 2 else 1;
+    return heavy_probe_state == 2;
+}
+
+pub fn heavyReasonDump() void {
+    if (!heavyProbeOn()) return;
+    const names = [_][]const u8{
+        "call_virtual_slot",  "call_member_resolved", "call_member_by_name",
+        "call_named_or_typeargs", "call_no_callee", "call_arity", "call_callee_not_fusable",
+    };
+    for (names, 0..) |n, i| {
+        const v = heavy_reasons[i].load(.monotonic);
+        if (v != 0) std.debug.print("[fuse-heavy] {d:>8}  {s}\n", .{ v, n });
+    }
+}
+
 fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const Func) u8 {
-    if (func.is_suspend or func.is_lambda) return 2;
+    if (func.is_suspend or func.is_lambda) return reject(.suspend_or_lambda);
     // A generic signature is not itself a reason to decline. What the walker cannot
     // serve is `as T` / `is T`, which consults the frame's reified context, and the
     // Cast and InstanceOf ops are guarded for exactly that below. The argument side
     // is covered too: `fusedRun` applies the same `coercePlanFor` widening the framed
     // entry does, including the type-variable peer rule.
 
-    if (func.blocks.len == 0 or func.blocks.len > FUSED_MAX_BLOCKS) return 2;
-    if (func.n_locals > FUSED_MAX_REGS) return 2;
+    if (func.blocks.len == 0 or func.blocks.len > fusedMaxBlocks()) return reject(.block_count);
+    if (func.n_locals > FUSED_MAX_REGS) return reject(.register_count);
     for (func.params) |*p| {
-        if (p.is_vararg or p.default != null) return 2;
+        if (p.is_vararg or p.default != null) return reject(.vararg_or_default_param);
     }
     var heavy = false;
     var total: usize = 0;
@@ -200,12 +272,12 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
     var entry_prefix: usize = 0;
     var entry_heavy = false;
     for (func.blocks, 0..) |*b, bi| {
-        if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return 2;
+        if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return reject(.handler_block);
         total += b.insts.len;
-        if (total > FUSED_MAX_INSTS) return 2;
+        if (total > FUSED_MAX_INSTS) return reject(.inst_count);
         switch (b.terminator) {
             .Return, .Goto, .Branch, .Switch, .Throw, .Unreachable => {},
-            else => return 2,
+            else => return reject(.terminator),
         }
         const is_entry = bi == func.entry.int();
         for (b.insts) |*inst| {
@@ -221,13 +293,36 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                 }
             };
             switch (inst.*) {
-                .Trace, .Const, .Move, .LoadParam, .BinOp, .Not, .GetField, .SetField, .Index, .IndexSet, .NotNullAssert, .LateinitCheck, .MakeCell, .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
-                .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return 2,
-                .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return 2,
+                .Trace, .Const, .Move, .LoadParam, .BinOp, .Not, .Index, .IndexSet, .NotNullAssert, .LateinitCheck, .MakeCell, .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
+                // The dispatch receiver and the context values live on the
+                // frame; the body runs framed.
+                .LoadDispatchThis, .LoadOuterThis, .LoadContextParam, .ContextPush, .ContextPop => {
+                    heavy = true;
+                },
+                // A super access is served from its bound kind, which the
+                // by-name arms below do not read; it runs framed.
+                .GetField => |gf| if (gf.own_kind == .super_slot or gf.own_kind == .super_target) {
+                    heavy = true;
+                },
+                .SetField => |sf| if (sf.own_kind == .super_slot or sf.own_kind == .super_target) {
+                    heavy = true;
+                },
+                .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return reject(.type_var_cast),
+                .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return reject(.type_var_instanceof),
                 // Open-world but non-suspending, so nothing beneath needs materialization.
                 .LoadGlobal => {},
-                // Dynamic dispatch stays framed: fused-first execution never stamps the site memos.
-                .CallVirtual, .CallMember => heavy = true,
+                // Dynamic dispatch stays framed: fused-first execution never
+                // stamps the site memos. Resolution changes what that costs,
+                // so count how many of these name their target already.
+                .CallVirtual => {
+                    heavy = true;
+                    if (heavyProbeOn()) _ = heavy_reasons[0].fetchAdd(1, .monotonic);
+                },
+                .CallMember => |cm| {
+                    heavy = true;
+                    if (heavyProbeOn())
+                        _ = heavy_reasons[if (cm.x().resolved != null) 1 else 2].fetchAdd(1, .monotonic);
+                },
                 .NewInstance => |ni| {
                     if (ni.arg_names.len != 0) {
                         for (ni.arg_names) |an| {
@@ -238,26 +333,32 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                 .Call => |c| blk: {
                     if (c.arg_names.len != 0 or c.type_args.len != 0) {
                         heavy = true;
+                        if (heavyProbeOn()) _ = heavy_reasons[3].fetchAdd(1, .monotonic);
                         break :blk;
                     }
                     const callee = module.funcById(c.func) orelse {
                         heavy = true;
+                        if (heavyProbeOn()) _ = heavy_reasons[4].fetchAdd(1, .monotonic);
                         break :blk;
                     };
                     _ = module.ensureFuncBody(@constCast(callee));
                     if (callee.params.len != c.n_args) {
                         heavy = true;
+                        if (heavyProbeOn()) _ = heavy_reasons[5].fetchAdd(1, .monotonic);
                         break :blk;
                     }
-                    if (fusedVerdict(H, host, module, callee) != 1) heavy = true;
+                    if (fusedVerdict(H, host, module, callee) != 1) {
+                        heavy = true;
+                        if (heavyProbeOn()) _ = heavy_reasons[6].fetchAdd(1, .monotonic);
+                    }
                 },
                 // A resumable body: never fused, never materialized mid-flight.
-                .SuspendResumePoint => return 2,
+                .SuspendResumePoint => return reject(.suspend_resume_point),
                 else => heavy = true,
             }
         }
     }
-    if (heavy and entry_heavy and entry_prefix < fused_min_prefix) return 2;
+    if (heavy and entry_heavy and entry_prefix < fused_min_prefix) return reject(.heavy_entry_prefix);
     return if (heavy) 4 else 1;
 }
 
@@ -586,16 +687,6 @@ fn fusedMaterializeAndRun(
     frame.activateAs();
     ev.active_chain_base = @min(wbase, frame.enclosing_this.items.len);
     defer frame.deactivateChain();
-    const ctx_mark: usize = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
-    if (comptime @hasDecl(H, "ctxPush")) {
-        if (module.has_context_decls) {
-            if (comptime @hasDecl(H, "ctxActivate")) host.ctxActivate(true);
-            if (func.has_receiver_param and frame.params.items.len > 0) {
-                host.ctxPush(frame.params.items[0]) catch {};
-            }
-        }
-    }
-    defer if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(ctx_mark);
     // Bank slots MOVE into the frame with no retain: the walker never resumes after a
     // materialization, and the pinned bank is zeroed behind it so it stops rooting them.
     const n = @min(regs.len, frame.regs.items.len);
@@ -644,6 +735,11 @@ fn fusedInst(
     pushed_enclosing: *usize,
     mark: *FusedMark,
 ) FusedFail!void {
+    if (ev_diag.ratchetArmed()) {
+        const recv: []const u8 = if (ir.site_census.siteReceiver(inst)) |r| fusedRead(regs, r).typeFqn() else "-";
+        if (ev_diag.unresolvedGate(module, inst, func.fqn, recv))
+            return fusedRaise(.{ .Type = ev_diag.requireResolvedSiteMessage(module, inst, func.fqn, recv) });
+    }
     switch (inst.*) {
         // The walker's cur_span, so span-derived context sees the executing call site.
         .Trace => |t| mark.span = t.span,
@@ -732,8 +828,7 @@ fn fusedInst(
             const v = fusedRead(regs, sf.value);
             const fname = constStr(module, sf.field) orelse
                 return fusedRaise(.{ .Type = "SetField: name not a string const" });
-            const super_owner: ?[]const u8 = if (sf.super_owner) |c| constStr(module, c) else null;
-            switch (try host.setFieldFrom(allocator, &recv, fname, v, super_owner)) {
+            switch (try host.setField(allocator, &recv, fname, v)) {
                 .ok => {},
                 .err => |e| return fusedRaise(e),
             }
@@ -861,6 +956,13 @@ fn fusedInst(
             if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
                 host.setCtorArgStaticHeads(static_heads);
             }
+            if (comptime @hasDecl(H, "setCtorSitePick")) {
+                host.setCtorSitePick(if (ni.ctor_pick == ir.CTOR_PICK_NONE) null else ni.ctor_pick, ni.n_args);
+            }
+            // Cleared on every exit for the reason the heads are: a route that
+            // returns before consuming must not hand this site's answer to the
+            // next construction.
+            defer if (comptime @hasDecl(H, "clearCtorArgStaticHeads")) host.clearCtorArgStaticHeads();
             // A bare `Inner(args)` inside a member is `this@Outer.Inner`: `this` is the outer hint.
             var outer_hint: ?Value = null;
             if (args.len > 0 and func.params.len > 0 and

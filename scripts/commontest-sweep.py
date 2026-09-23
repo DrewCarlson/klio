@@ -31,6 +31,7 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SWEEP_GREP = re.compile(os.environ["KLIO_SWEEP_GREP"]) if os.environ.get("KLIO_SWEEP_GREP") else None
 TEST_ROOT = os.path.join(ROOT, "kotlin/libraries/stdlib/test")
 ACTUALS = [
     "tests/stdlib_commontest_actuals/PlatformActuals.kt",
@@ -215,6 +216,13 @@ def run_one(binary, target, support, targets, provider, texts, eager):
         p = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=900, env=env)
     except subprocess.TimeoutExpired:
         return target, -1, [("__TIMEOUT__", timeout_detail(target, 900))]
+    # `KLIO_SWEEP_GREP=<regex>`: echo the child's matching stderr lines. A
+    # per-site audit only means something over the corpus that exercises the
+    # shape, and for extension dispatch that is these tests, not the examples.
+    if SWEEP_GREP is not None:
+        for line in p.stderr.decode("utf-8", "replace").splitlines():
+            if SWEEP_GREP.search(line):
+                print(line, flush=True)
     passed = None
     m = re.search(rb"(\d+) passed,", p.stdout)
     if m:
@@ -292,6 +300,13 @@ def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, ea
     except subprocess.TimeoutExpired:
         return tdir, -1, [("__TIMEOUT__", timeout_detail(tdir, 1800))]
     run_dir_times[tdir] = time.monotonic() - t0
+    # `KLIO_SWEEP_GREP=<regex>`: echo the child's matching stderr lines. A
+    # per-site audit only means something over the corpus that exercises the
+    # shape, and for extension dispatch that is these tests, not the examples.
+    if SWEEP_GREP is not None:
+        for line in p.stderr.decode("utf-8", "replace").splitlines():
+            if SWEEP_GREP.search(line):
+                print(line, flush=True)
     passed = None
     m = re.search(rb"(\d+) passed,", p.stdout)
     if m:

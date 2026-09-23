@@ -797,7 +797,21 @@ fn resolveExtensionCallUncached(
         named_maps.append(sa, named_map) catch return .{};
         named_skips.append(sa, named_map_skips) catch return .{};
     }
+    // `KLIO_EXT_AUDIT=cands`: the candidates that survived scope, visibility
+    // and shape filtering, with their tiers. Joined against the declaration the
+    // runtime's walk serves, this separates "lowering never saw it" from
+    // "lowering saw it and ranked it lower" — two different bugs.
+    if (runtime.envOnce("KLIO_EXT_AUDIT")) |mode| {
+        if (std.mem.eql(u8, mode, "cands")) {
+            const rh = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?")));
+            for (ids.items, tiers.items) |fid, t| {
+                const f = self.funcById(fid) orelse continue;
+                std.debug.print("[KLIO_EXT_AUDIT] cand name={s} recv={s} fqn={s} tier={d}\n", .{ name, rh, f.fqn, t });
+            }
+        }
+    }
     if (ids.items.len == 0) {
+        root_ir.lower.expr.noExtNote(.no_candidates);
         return .{ .applicable = unknown_best_tier != 255 };
     }
 
@@ -882,6 +896,7 @@ fn resolveExtensionCallUncached(
         if (runtime.envSetOnce("KLIO_REX_TRACE")) {
             if (applicability.trace_call_span) |sp| std.debug.print("[rex-exit] {s} unknown-tier {d}<={d} at=f{d}:{d}\n", .{ name, unknown_best_tier, best_tier, sp.file.int(), sp.start });
         }
+        root_ir.lower.expr.noExtNote(.unknown_visibility_tier);
         return .{ .applicable = true };
     }
 
@@ -1004,11 +1019,55 @@ fn resolveExtensionCallUncached(
     if (tied or
         (best_unknown and !receiver_supplies_lambda and !renamed_best and
             !sole_survivor and !refuted_member_strict_winner))
+    withheld: {
+        const recv_head = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?")));
+        const sole = if (!tied) best else null;
+        // The one shape an unknown argument verdict does not put in doubt: the
+        // winner is alone at the best applicability tier, its declared receiver
+        // relates to the static one, and that head is a real type. The per-site
+        // audit measures this against the declaration the runtime walk serves.
+        // A winner named like the declaration being lowered is the shape that
+        // recurses: `Sequence<T>.flatten(iterator)` reaching itself at
+        // `(this as TransformingSequence<*, T>).flatten(iterator)`, where
+        // Kotlin binds the member the narrowed receiver declares. Withhold.
+        const winner_is_enclosing_name = if (sole) |bfid| blk: {
+            const encl = ctx.enclosing_fn_name orelse break :blk false;
+            const wf = self.funcById(bfid) orelse break :blk false;
+            break :blk std.mem.eql(u8, wf.name, encl);
+        } else false;
+        const sole_best_tier = if (sole) |bfid|
+            ctx.actual_receiver and !winner_is_enclosing_name and
+                winnerIsUniqueBestTier(ids.items, tiers.items, bfid) and !bareTypeParamHead(recv_head) and
+                winner_recv_related
+        else
+            false;
+        if (!tied and ranked_sigs.items.len == 1 and runtime.envOnce("KLIO_EXT_AUDIT") != null) {
+            if (best) |bfid| {
+                const bf = self.funcById(bfid);
+                std.debug.print("[KLIO_EXT_AUDIT] would name={s} recv={s} fqn={s} argsknown={d} recvrel={d} besttier={d}\n", .{
+                    name,
+                    recv_head,
+                    if (bf) |f| f.fqn else "?",
+                    @intFromBool(refuted_args_authoritative),
+                    @intFromBool(winner_recv_related),
+                    @intFromBool(sole_best_tier),
+                });
+            }
+        }
+        if (sole_best_tier and extCommitEnabled()) break :withheld;
+        if (tied)
+            root_ir.lower.expr.noExtNote(.tied)
+        else if (ranked_sigs.items.len == 1)
+            root_ir.lower.expr.noExtNote(.unknown_args_singleton)
+        else
+            root_ir.lower.expr.noExtNote(.unknown_args);
         return .{
             .applicable = true,
-            .sole_unknown = if (!tied) best else null,
+            .sole_unknown = sole,
+            .sole_unknown_best_tier = sole_best_tier,
             .param_rep = if (tied) self.tiedLambdaParamRep(tied_ids.items) else null,
         };
+    }
     // A winner whose named arguments skipped defaulted parameters still commits:
     // the Call carries the names. `KLIO_NAMED_COMMIT=0` demotes it to typing.
     if (best) |target| {
@@ -1036,12 +1095,75 @@ fn resolveExtensionCallUncached(
 
 /// Resolve one member name against the declarations owned by the static receiver
 /// class, and classify it as a direct call or a virtual method slot.
+/// Whether a receiver head names a type parameter rather than a class. Such a
+/// head is not a receiver identity at all: two sites that share it can mean
+/// different types, so a pick keyed on it is not a function of the key.
+/// `KLIO_EXT_COMMIT=0` puts the withheld best-tier winner back on the runtime
+/// walk, so one binary runs a program both ways.
+///
+/// On, and the reason is measured per site rather than per name. Over the
+/// example corpus the pick names the declaration the runtime serves at 11587 of
+/// 11587 executed sites; over the stdlib tests, at 690644 of 690668. The 24
+/// that differ are `Array<T>.getOrNull` against the `List` overload the by-name
+/// walk serves on a receiver declared `Array<T>`, where lowering is right and
+/// the walk is not, so committing fixes them.
+fn extCommitEnabled() bool {
+    return !std.mem.eql(u8, runtime.envOnce("KLIO_EXT_COMMIT") orelse "1", "0");
+}
+
+fn bareTypeParamHead(h: []const u8) bool {
+    if (h.len == 0) return true;
+    if (root_ir.parseClassTypeParamIdentity(h) != null) return true;
+    return h.len <= 2 and std.ascii.isUpper(h[0]);
+}
+
+/// Whether the ranked winner is also the one candidate at the best scope tier.
+///
+/// The ranked set is a filtered subset of the candidates, so its sole member
+/// need not be the declaration Kotlin means: `contains` on an `IntRange`
+/// leaves `androidx.collection.contains` (tier 66) alone in the ranked set
+/// while `kotlin.ranges.contains` (tier 65) is what the runtime serves, and
+/// `forEachIndexed` on an `IntArray` leaves the `kotlin.collections` one while
+/// a member extension at tier 0 is the answer. A pick is only defensible when
+/// nothing better-scoped exists.
+fn winnerIsUniqueBestTier(ids: []const FuncId, tiers: []const u8, winner: FuncId) bool {
+    if (ids.len != tiers.len or ids.len == 0) return false;
+    var min_t: u8 = 255;
+    for (tiers) |t| min_t = @min(min_t, t);
+    var at_min: usize = 0;
+    var winner_at_min = false;
+    for (ids, tiers) |fid, t| {
+        if (t != min_t) continue;
+        at_min += 1;
+        if (fid.int() == winner.int()) winner_at_min = true;
+    }
+    return at_min == 1 and winner_at_min;
+}
+
 pub fn resolveMemberCall(
     self: *const Module,
     owner: ClassId,
     name: []const u8,
     args: []const applicability.ArgShape,
     ctx: MemberResolveCtx,
+) MemberResolution {
+    var saw = false;
+    var r = resolveMemberCallSeen(self, owner, name, args, ctx, &saw);
+    r.saw_candidates = saw;
+    return r;
+}
+
+/// `resolveMemberCall`, reporting separately whether the hierarchy declares the
+/// name at all. Every exit below the candidate collection has seen one; the two
+/// above it have not, and the difference is what separates "this class has no
+/// such member" from "it has one the call shape does not fit".
+fn resolveMemberCallSeen(
+    self: *const Module,
+    owner: ClassId,
+    name: []const u8,
+    args: []const applicability.ArgShape,
+    ctx: MemberResolveCtx,
+    saw_candidates: *bool,
 ) MemberResolution {
     if (owner.int() >= self.classes.items.len) return .{};
     const class = &self.classes.items[owner.int()];
@@ -1052,6 +1174,8 @@ pub fn resolveMemberCall(
     var seen = std.AutoHashMap(u32, void).init(sa);
     self.collectMemberCandidates(sa, owner, name, 0, &seen, &candidates) catch return .{};
     if (candidates.items.len == 0) return .{};
+    // Every exit below has seen the name declared somewhere in the hierarchy.
+    saw_candidates.* = true;
 
     var named = false;
     for (args) |arg| {

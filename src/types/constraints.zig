@@ -1170,6 +1170,12 @@ fn tarjanScc(
 }
 
 fn lubPair(a: Type, b: Type) Type {
+    // Two unmodelled classes are equal to `eql`, which ignores the name they
+    // carry; the join keeps the name only when both carry the same one.
+    if (a == .Unresolved and b == .Unresolved) {
+        if (a.Unresolved) |an| if (b.Unresolved) |bn| if (std.mem.eql(u8, an, bn)) return a;
+        return .{ .Unresolved = null };
+    }
     if (a.eql(b)) {
         return a;
     }

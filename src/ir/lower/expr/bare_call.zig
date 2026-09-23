@@ -12,6 +12,7 @@ const inline_state = @import("../inline_state.zig");
 const decl_mod = @import("../decl.zig");
 const ast_scan = @import("../ast_scan.zig");
 const inline_call = @import("../inline_call.zig");
+const implicit_walk = @import("implicit_walk.zig");
 const lambda_body = @import("../lambda_body.zig");
 const static_call_type = @import("../static_call_type.zig");
 
@@ -488,6 +489,19 @@ fn eagerPinnedResolution(
                 }
             }
         }
+        // A member of a host-backed class, or a declaration that never gets a
+        // body, is served by the runtime's intrinsic for the receiver's value,
+        // never by the declaration the checker named: binding it would call the
+        // stub. A reserved header whose body is still lowering is a target: the
+        // body lands under that id.
+        if (b.module.funcById(eager_fid)) |ef| {
+            if (!b.module.declaredWithBody(eager_fid, ef)) break :eager;
+            if (b.module.decl_sigs.get(eager_fid.int())) |ds| {
+                if (ds.enclosing_class) |cid| {
+                    if (cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_intrinsic_backed) break :eager;
+                }
+            }
+        } else break :eager;
     // The typeck pick is type-derived and overload-precise where the lazy engine
     // is shape-based. `target_final` pins it against runtime value-typed re-picks.
         if (res.target == null or res.target.?.int() != eager_fid.int()) {
@@ -504,7 +518,13 @@ fn eagerPinnedResolution(
                 const lazy_str: i64 = if (lazy) |l| @intCast(l.int()) else -1;
                 const efqn: []const u8 = if (b.module.funcById(eager_fid)) |f| f.fqn else "?";
                 const lfqn: []const u8 = if (lazy) |l| (if (b.module.funcById(l)) |f| f.fqn else "?") else "-";
-                std.debug.print("[EAGER-AUDIT] call '{s}': eager={d}({s}) lazy={d}({s})\n", .{ name0, eager_fid.int(), efqn, lazy_str, lfqn });
+                // Whether the pick came through the image's FuncId channel or a
+                // declaration span, and the id the named function carries, so a
+                // pick naming a slot another body took is visible.
+                const via_fids = if (b.module.eager_call_fids) |*fm| fm.contains(segments[0].span) else false;
+                const decl_fid: i64 = if (b.module.eager_calls) |*ec| (if (ec.get(segments[0].span)) |d| (if (b.module.funcByDeclSpan(d)) |x| @as(i64, @intCast(x.int())) else -2) else -3) else -4;
+                const self_id: i64 = if (b.module.funcById(eager_fid)) |f| @as(i64, @intCast(f.id.int())) else -1;
+                std.debug.print("[EAGER-AUDIT] call '{s}': eager={d}({s}) self_id={d} lazy={d}({s}) via_fids={} decl_fid={d} f{d}:{d}\n", .{ name0, eager_fid.int(), efqn, self_id, lazy_str, lfqn, via_fids, decl_fid, segments[0].span.file.int(), segments[0].span.start });
             }
         }
     }
@@ -583,8 +603,11 @@ fn traceBareResolutionMiss(
 
     if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
         if (std.mem.eql(u8, w, name0) and res_final.target == null) {
-            std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={} known_none={} at=f{d}:{d}\n", .{
+            std.debug.print("[bare] {s} -> NONE reason={s} tier={d} cands={d} recv_ty={s} encl_recv={s} pkg={s} shadowed={} known_none={} at=f{d}:{d}\n", .{
                 name0,
+                if (res_final.reason) |r| @tagName(r) else "-",
+                res_final.tier,
+                res_final.candidate_set.len,
                 b.recvTy() orelse "-",
                 b.enclosingRecvTy() orelse "-",
                 b.self_package,
@@ -828,31 +851,83 @@ pub fn resolveCtxFor(
 /// A lambda or thunk body's receiver scope is complete when its implicit-receiver
 /// tower enumerates every level and each entry's class is free of outer-receiver
 /// escapes with a complete hierarchy shadow set.
+/// Why a receiver scope was called incomplete, counted under
+/// `KLIO_SCOPE_WHY=1`. Each refusal keeps a site on a by-name instruction, so
+/// the tally says which condition the resolved emit is actually waiting on
+/// rather than which one is easiest to see.
+const ScopeWhy = enum {
+    tower_empty,
+    tower_entry_no_class,
+    tower_entry_nested,
+    tower_entry_companion,
+    tower_entry_shadow_missing,
+    tower_ok,
+    plain_no_hierarchy,
+    plain_hierarchy_incomplete,
+    plain_owner_nested,
+    plain_owner_companion,
+    plain_owner_shadow_missing,
+    plain_ok,
+    plain_recv_only,
+};
+var scope_why: [@typeInfo(ScopeWhy).@"enum".fields.len]usize = @splat(0);
+var scope_why_mutex: runtime.SpinMutex = .{};
+
+fn noteScopeWhy(w: ScopeWhy) void {
+    if (runtime.envOnce("KLIO_SCOPE_WHY") == null) return;
+    scope_why_mutex.lock();
+    defer scope_why_mutex.unlock();
+    scope_why[@intFromEnum(w)] += 1;
+}
+
+pub fn dumpScopeWhy() void {
+    if (runtime.envOnce("KLIO_SCOPE_WHY") == null) return;
+    inline for (@typeInfo(ScopeWhy).@"enum".fields) |f| {
+        if (scope_why[f.value] != 0)
+            std.debug.print("[scope-why] {s: <28} {d}\n", .{ f.name, scope_why[f.value] });
+    }
+}
+
 fn towerScopeComplete(b: *FuncBuilder) bool {
     const items = b.implicit_receiver_tower.items;
-    if (items.len == 0) return false;
+    if (items.len == 0) {
+        noteScopeWhy(.tower_empty);
+        return false;
+    }
     for (items) |entry| {
         var head = std.mem.trimEnd(u8, entry.head, "?");
         if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
         const cid = (if (std.mem.findScalar(u8, head, '.') != null)
             b.module.classIdByFqn(head)
         else
-            b.module.uniqueClassIdBySimpleName(typeHead(head))) orelse return false;
-        if (cid.int() >= b.module.classes.items.len) return false;
+            b.module.uniqueClassIdBySimpleName(typeHead(head))) orelse {
+            noteScopeWhy(.tower_entry_no_class);
+            return false;
+        };
+        if (cid.int() >= b.module.classes.items.len) {
+            noteScopeWhy(.tower_entry_no_class);
+            return false;
+        }
         const lifted = b.module.classes.items[cid.int()].name;
         const fqn = b.module.classes.items[cid.int()].fqn;
         if (b.module.registry.enclosing_class.get(lifted) != null or
             b.module.registry.enclosing_class.get(fqn) != null)
         {
+            noteScopeWhy(.tower_entry_nested);
             return false;
         }
         if (b.module.registry.companion_singletons.contains(lifted) or
             b.module.registry.companion_singletons.contains(fqn))
         {
+            noteScopeWhy(.tower_entry_companion);
             return false;
         }
-        if (ownerChainShadowContains(b, lifted, "") == null) return false;
+        if (ownerChainShadowContains(b, lifted, "") == null) {
+            noteScopeWhy(.tower_entry_shadow_missing);
+            return false;
+        }
     }
+    noteScopeWhy(.tower_ok);
     return true;
 }
 
@@ -873,10 +948,25 @@ pub fn receiverScopeCompletePlain(b: *FuncBuilder) bool {
         const head = typeHead(receiver.name);
         const hierarchy = b.module.registry.hierarchy_shadow_names.get(head) orelse
             b.module.registry.hierarchy_shadow_names.get(receiver.name) orelse
+            {
+                noteScopeWhy(.plain_no_hierarchy);
+                return false;
+            };
+        if (!hierarchy.complete) {
+            noteScopeWhy(.plain_hierarchy_incomplete);
             return false;
-        if (!hierarchy.complete) return false;
+        }
     }
-    const owner_name = owner orelse return recv != null;
+    const owner_name = owner orelse {
+        noteScopeWhy(.plain_recv_only);
+        // A body with no owner class and no captured `this` has no implicit
+        // receiver, so answering "complete and empty" here looks like it
+        // should let the resolver rule the receiver leg out. Measured: it
+        // moves ONE site on the corpus. These 11 396 consultations come from
+        // sites that resolve by another route already, so the refusal is not
+        // what holds them.
+        return recv != null;
+    };
     const owner_id = b.module.classId(owner_name);
     const owner_fqn = if (owner_id) |id|
         (if (id.int() < b.module.classes.items.len)
@@ -888,14 +978,21 @@ pub fn receiverScopeCompletePlain(b: *FuncBuilder) bool {
     if (b.module.registry.enclosing_class.get(owner_name) != null or
         b.module.registry.enclosing_class.get(owner_fqn) != null)
     {
+        noteScopeWhy(.plain_owner_nested);
         return false;
     }
     if (b.module.registry.companion_singletons.contains(owner_name) or
         b.module.registry.companion_singletons.contains(owner_fqn))
     {
+        noteScopeWhy(.plain_owner_companion);
         return false;
     }
-    return ownerChainShadowContains(b, owner_name, "") != null;
+    if (ownerChainShadowContains(b, owner_name, "") == null) {
+        noteScopeWhy(.plain_owner_shadow_missing);
+        return false;
+    }
+    noteScopeWhy(.plain_ok);
+    return true;
 }
 
 pub fn allNull(names: []const ?[]const u8) bool {
@@ -1074,6 +1171,7 @@ fn emitPrivateMemberCall(
     for (ast_arg_names, 0..) |n, i| user_arg_names[i + 1] = n;
     const arg_names = try internArgNames(b.allocator, b.module, user_arg_names);
     const dst = b.allocReg();
+    const ctx_handed = try probe_mod.contextHandoverBegin(b, fid, ast_type_args);
     try b.push(.{ .Call = .{
         .dst = dst,
         .func = fid,
@@ -1084,6 +1182,7 @@ fn emitPrivateMemberCall(
         .type_args = &.{},
         .exact = true,
     } });
+    try probe_mod.contextHandoverEnd(b, ctx_handed);
     return dst;
 }
 
@@ -1659,6 +1758,7 @@ fn tryBareMemberOnReceiver(
             ast_arg_names,
             ast_type_args,
             recv_ty,
+            false,
         )) |reg| {
             orEmitAudit(b, "unresolved_bare_call", "Call/bare-extension", name0);
             return reg;
@@ -1694,7 +1794,28 @@ fn tryOuterReceiverExtension(
             head_name[i + 1 ..]
         else
             head_name;
-        for (b.implicit_receiver_tower.items) |entry| {
+        // The composed tower, not the stored one: a spliced inline body lowers in
+        // the caller's function scope, where the stored tower is empty and the
+        // receivers in scope are the splice window's subject and the function's
+        // own. Reading the raw list there loses every receiver but the innermost
+        // and leaves the call to a by-name walk over the runtime chain.
+        const tower = try b.collectReceiverTowerLabeled(b.allocator, null, null);
+        defer b.allocator.free(tower);
+        const tower_trace = if (runtime.envOnce("KLIO_BARE_TRACE")) |w| std.mem.eql(u8, w, name0) else false;
+        if (tower_trace) {
+            std.debug.print("[bare-tower] {s} inner={s} entries={d}\n", .{ name0, inner_tail, tower.len });
+            for (tower) |e| {
+                var sb: [160]u8 = undefined;
+                const sl = if (e.label) |l| (std.fmt.bufPrint(&sb, "this@{s}", .{l}) catch "?") else "-";
+                std.debug.print("[bare-tower]   head={s} label={s} slot_resolves={} knows_outer={}\n", .{
+                    e.head,
+                    e.label orelse "-",
+                    e.label != null and b.resolve(sl) != null,
+                    e.label != null and b.knowsOuter(sl),
+                });
+            }
+        }
+        for (tower) |entry| {
             const lbl = entry.label orelse continue;
             const entry_tail = if (std.mem.findScalarLast(u8, entry.head, '.')) |i|
                 entry.head[i + 1 ..]
@@ -1737,6 +1858,12 @@ fn tryOuterReceiverExtension(
                 ast_arg_names,
                 ast_type_args,
                 outer_ty,
+                // Unmeasured: the per-site audit stamps explicit-receiver member
+                // calls, and a tower entry is a head the walk chose, not one the
+                // call site wrote. `Long.nanoseconds` is `toDuration(unit)` over
+                // an implicit receiver, and committing there bound the `Double`
+                // overload of a name whose three declarations share one fqn.
+                false,
             )) |reg| {
                 orEmitAudit(b, "unresolved_bare_call", "Call/bare-tower-extension", name0);
                 return reg;
@@ -1800,6 +1927,7 @@ fn tryTypeArgumentedGlobal(
                     const gnames = try internArgNames(b.allocator, b.module, ast_arg_names);
                     const gtargs = try internTypeArgs(b.allocator, b.module, ast_type_args);
                     const gdst = b.allocReg();
+                    const ctx_handed = try probe_mod.contextHandoverBegin(b, gid, ast_type_args);
                     try b.push(.{ .Call = .{
                         .dst = gdst,
                         .func = gid,
@@ -1810,6 +1938,7 @@ fn tryTypeArgumentedGlobal(
                         .type_args = gtargs,
                         .exact = false,
                     } });
+                    try probe_mod.contextHandoverEnd(b, ctx_handed);
                     return gdst;
                 }
             }
@@ -1831,6 +1960,14 @@ fn emitDeferredBareCall(
     const name0 = callee.Path.segments[0].name;
     var ext_hint = ext_hint_in;
 
+    // The receivers in scope, statically: the innermost whose member accepts
+    // the arguments takes the call on its own register.
+    switch (try implicit_walk.walkCall(b, .{ .name = name0, .span = callee.Path.segments[0].span }, args, ast_arg_names, "unresolved_bare_call")) {
+        .member => |hit| {
+            if (try implicit_walk.lowerWalkedMemberCall(b, hit, .{ .name = name0, .span = callee.Path.segments[0].span }, args, ast_arg_names, ast_type_args, "unresolved_bare_call")) |r| return r;
+        },
+        .global, .undecided => {},
+    }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
@@ -1970,11 +2107,21 @@ fn deferredTrailingLambdaArity(
                     const tl = b.module.func_name_index.get(name0) orelse break :blk2 false;
                     break :blk2 tl.items.len == 1 and tl.items[0] == fid;
                 };
-                if (member_pick or single_toplevel)
-                    try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
+                if (member_pick or single_toplevel) {
+                    // A member's `T.() -> R` block names the class's parameter,
+                    // which the implicit receiver's own arguments instantiate.
+                    try lambda_mod.recordLambdaArgReceiversForCallReceiver(b, f, args, ast_arg_names, ast_type_args, if (off == 1) b.recvTypeRef() else null, off);
+                } else {
+                    // Several namesakes: the block's shape is still settled
+                    // where every candidate hosting it agrees on its receiver,
+                    // and a block none of them gives a receiver owns none.
+                    try lambda_mod.recordTrailingLambdaConsensus(b, name0, args, ast_arg_names, ast_type_args, false);
+                }
                 return try argFnArities(b, f, args, ast_arg_names, off);
             }
         }
+        // No single host, but the namesakes can still agree on the block's receiver.
+        try lambda_mod.recordTrailingLambdaConsensus(b, name0, args, ast_arg_names, ast_type_args, false);
     }
     return null;
 }
@@ -2114,6 +2261,7 @@ pub fn lowerFqnFlattenCall(
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
             const dst = b.allocReg();
+            const ctx_handed = try probe_mod.contextHandoverBegin(b, func_id, ast_type_args);
             try b.push(.{ .Call = .{
                 .dst = dst,
                 .func = func_id,
@@ -2124,6 +2272,7 @@ pub fn lowerFqnFlattenCall(
                 .type_args = type_args,
                 .exact = true,
             } });
+            try probe_mod.contextHandoverEnd(b, ctx_handed);
             return dst;
         }
     }
@@ -2224,6 +2373,7 @@ pub fn lowerFqnGlobalCall(
                 const run = try lowerArgRun(b, args);
                 const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
                 const dst = b.allocReg();
+                const ctx_handed = try probe_mod.contextHandoverBegin(b, only.?, &.{});
                 try b.push(.{ .Call = .{
                     .dst = dst,
                     .func = only.?,
@@ -2234,6 +2384,7 @@ pub fn lowerFqnGlobalCall(
                     .type_args = &.{},
                     .exact = false,
                 } });
+                try probe_mod.contextHandoverEnd(b, ctx_handed);
                 return dst;
             }
         }

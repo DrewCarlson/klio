@@ -16,6 +16,7 @@ const Func = ir.Func;
 const Inst = ir.Inst;
 const Module = ir.Module;
 const UnOp = ir.UnOp;
+const FuncId = ir.FuncId;
 
 const parent = @import("../eval.zig");
 const ev_flow = @import("flow.zig");
@@ -356,8 +357,6 @@ pub const DispatchKind = enum(u8) {
     call_member_or_value,
     call_value_or_member,
     call_spread,
-    call_super,
-    ctx_call,
     /// Where a name-based member dispatch ended up.
     served_intrinsic,
     served_user_body,
@@ -381,6 +380,29 @@ pub const DispatchKind = enum(u8) {
     static_decline_arity,
     /// By-name member calls replayed from their instruction-site memo.
     member_site_flat,
+    /// Name reads and writes that search the implicit receivers before the global.
+    load_this_or_global,
+    store_this_or_global,
+    /// A field read served from the slot lowering claimed, on its first
+    /// execution, without the discovery ladder.
+    field_read_claimed_slot,
+    /// A read served through the accessor lowering named.
+    field_read_getter_named,
+    field_read_prop_slot,
+    type_instanceof_class,
+    type_cast_class,
+    /// `EnumClass.Entry` served by the index lowering named.
+    field_read_enum_entry,
+    /// A write served from the declared slot lowering named, the mirror of
+    /// `field_read_claimed_slot`: a plain slot has no setter, so the store is it.
+    field_write_claimed_slot,
+    /// A field read that reached the host by name, past the site memo.
+    field_read_host_by_name,
+    /// A builtin property the site named, served from the receiver's tag.
+    field_read_builtin,
+    /// A member-or-global site whose global leg the link pass proved is the
+    /// only one that can win, taken directly.
+    call_member_or_global_static,
     /// Every interpreter frame constructed: the denominator for the rest.
     frame_push,
     /// Frames the flattened engine's simple-inst subset can execute end to end.
@@ -388,6 +410,49 @@ pub const DispatchKind = enum(u8) {
 };
 
 const DISPATCH_KINDS = @typeInfo(DispatchKind).@"enum".fields.len;
+
+/// What each executed dispatch says about resolution. This is the runtime half
+/// of the static verdict in `ir/site_census.zig`: the static census says how
+/// many SITES re-derive their target, this says how many TIMES one did.
+///
+/// `bookkeeping` covers counters that are not themselves a dispatch decision —
+/// the tails downstream of one, the fusion admissions and declines, and the
+/// frame denominators. Counting them in the split would count the same call
+/// twice.
+pub const DispatchVerdict = enum(u8) { resolved, unresolved, dynamic_by_design, bookkeeping };
+
+const dispatch_verdicts: [DISPATCH_KINDS]DispatchVerdict = blk: {
+    var t: [DISPATCH_KINDS]DispatchVerdict = @splat(.bookkeeping);
+    const K = DispatchKind;
+    t[@intFromEnum(K.call_static)] = .resolved;
+    t[@intFromEnum(K.call_member_resolved)] = .resolved;
+    t[@intFromEnum(K.call_virtual_slot)] = .resolved;
+    t[@intFromEnum(K.call_member_virtual)] = .unresolved;
+    t[@intFromEnum(K.call_member_or_global)] = .unresolved;
+    t[@intFromEnum(K.call_member_or_value)] = .unresolved;
+    t[@intFromEnum(K.call_value_or_member)] = .unresolved;
+    // Every `CallSpread` form but the slot-bound one dispatches by name, and the
+    // counter does not separate them; the static census does.
+    t[@intFromEnum(K.call_spread)] = .unresolved;
+    t[@intFromEnum(K.load_this_or_global)] = .unresolved;
+    t[@intFromEnum(K.store_this_or_global)] = .unresolved;
+    t[@intFromEnum(K.field_read_host_by_name)] = .unresolved;
+    t[@intFromEnum(K.field_read_claimed_slot)] = .resolved;
+    t[@intFromEnum(K.field_read_getter_named)] = .resolved;
+    t[@intFromEnum(K.field_read_prop_slot)] = .resolved;
+    t[@intFromEnum(K.type_instanceof_class)] = .resolved;
+    t[@intFromEnum(K.type_cast_class)] = .resolved;
+    t[@intFromEnum(K.field_read_enum_entry)] = .resolved;
+    t[@intFromEnum(K.field_read_builtin)] = .resolved;
+    t[@intFromEnum(K.call_member_or_global_static)] = .resolved;
+    t[@intFromEnum(K.field_write_claimed_slot)] = .resolved;
+    t[@intFromEnum(K.call_value)] = .dynamic_by_design;
+    break :blk t;
+};
+
+pub fn dispatchVerdictOf(k: DispatchKind) DispatchVerdict {
+    return dispatch_verdicts[@intFromEnum(k)];
+}
 
 var dispatch_counts: [DISPATCH_KINDS]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
 
@@ -419,6 +484,24 @@ pub fn dispatchStatsDump() void {
     if (total == 0) return;
     std.debug.print("[dispatch-stats] total={d}\n", .{total});
     if (parent.dispatch_replay_hits) |f| std.debug.print("[dispatch-stats] replay-hits={d}\n", .{f()});
+    {
+        var by_verdict: [4]u64 = @splat(0);
+        inline for (@typeInfo(DispatchKind).@"enum".fields) |f| {
+            by_verdict[@intFromEnum(dispatch_verdicts[f.value])] += dispatch_counts[f.value].load(.monotonic);
+        }
+        var decided: u64 = 0;
+        for (by_verdict[0..3]) |n| decided += n;
+        inline for (@typeInfo(DispatchVerdict).@"enum".fields) |f| {
+            if (f.value < 3) {
+                const n = by_verdict[f.value];
+                std.debug.print("[dispatch-verdict] {s}={d} ({d:.2}% of {d} decided)\n", .{
+                    f.name, n,
+                    if (decided == 0) @as(f64, 0) else @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(decided)),
+                    decided,
+                });
+            }
+        }
+    }
     inline for (@typeInfo(DispatchKind).@"enum".fields) |f| {
         const n = dispatch_counts[f.value].load(.monotonic);
         if (n != 0) std.debug.print("[dispatch-stats] {d:>12} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
@@ -721,13 +804,13 @@ pub fn dumpFrameChainForDiagAlways() void {
             if (span.active_map) |m| {
                 if (m.getChecked(sp.file)) |sf| {
                     const lc = sf.lineCol(sp.start);
-                    std.debug.print("  {s} ({s}:{d})\n", .{ label, sf.path, lc.line });
+                    std.debug.print("  {s}#{d} ({s}:{d})\n", .{ label, f.func.id.int(), sf.path, lc.line });
                     printed = true;
                 }
             }
-            if (!printed) std.debug.print("  {s} (f{d}@{d})\n", .{ label, @intFromEnum(sp.file), sp.start });
+            if (!printed) std.debug.print("  {s}#{d} (f{d}@{d})\n", .{ label, f.func.id.int(), @intFromEnum(sp.file), sp.start });
         } else {
-            std.debug.print("  {s}\n", .{label});
+            std.debug.print("  {s}#{d}\n", .{ label, f.func.id.int() });
         }
         depth += 1;
         if (depth >= 40) break;
@@ -742,8 +825,8 @@ pub fn dumpCurrentFrameParamsForDiag() void {
         if (depth >= 12) break;
         depth += 1;
         const label = if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name;
-        std.debug.print("[frame-params] {s} ({d} params, {d} bound):\n", .{
-            label, fr.func.params.len, fr.params.items.len,
+        std.debug.print("[frame-params] {s}#{d} ({d} params, {d} bound):\n", .{
+            label, fr.func.id.int(), fr.func.params.len, fr.params.items.len,
         });
         for (fr.func.params, 0..) |p, i| {
             if (i >= fr.params.items.len) break;
@@ -828,13 +911,13 @@ pub fn spinDumpMaybe() void {
             if (span.active_map) |m| {
                 if (m.getChecked(sp.file)) |sf| {
                     const lc = sf.lineCol(sp.start);
-                    std.debug.print("  {s} ({s}:{d})\n", .{ label, sf.path, lc.line });
+                    std.debug.print("  {s}#{d} ({s}:{d})\n", .{ label, f.func.id.int(), sf.path, lc.line });
                     printed = true;
                 }
             }
-            if (!printed) std.debug.print("  {s} (f{d}@{d})\n", .{ label, @intFromEnum(sp.file), sp.start });
+            if (!printed) std.debug.print("  {s}#{d} (f{d}@{d})\n", .{ label, f.func.id.int(), @intFromEnum(sp.file), sp.start });
         } else {
-            std.debug.print("  {s}\n", .{label});
+            std.debug.print("  {s}#{d}\n", .{ label, f.func.id.int() });
         }
         depth += 1;
         if (depth >= 32) {
@@ -1055,4 +1138,383 @@ pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
         },
         else => {},
     }
+}
+
+// ---------------------------------------------------------------------------
+// The resolution ratchet.
+//
+// A dispatch that re-derives its target from a name is a site lowering did not
+// bind. `KLIO_REQUIRE_RESOLVED` turns that from a cost into a failure, so a
+// construct that has been resolved once stays resolved.
+//
+//   KLIO_REQUIRE_RESOLVED=1      count every name-based resolution, name the
+//                                responsible sites, and exit non-zero
+//   KLIO_REQUIRE_RESOLVED=raise  raise at the first one instead of serving it
+//
+// Under `KLIO_DISPATCH_STATS` (or `KLIO_UNRESOLVED_SITES`) the site table is
+// collected without failing the run, which is the executed half of the census:
+// which name, in which function, re-derived its target and how often.
+// ---------------------------------------------------------------------------
+
+/// 0 unread, 1 off, 2 record only, 3 record and fail at exit, 4 raise.
+pub var require_resolved_state: u8 = 0;
+
+fn requireResolvedInit() void {
+    if (runtime.envOnce("KLIO_REQUIRE_RESOLVED")) |v| {
+        if (std.mem.eql(u8, v, "raise")) {
+            require_resolved_state = 4;
+            return;
+        }
+        if (v.len != 0 and !std.mem.eql(u8, v, "0")) {
+            require_resolved_state = 3;
+            return;
+        }
+    }
+    const recording = runtime.envOnce("KLIO_UNRESOLVED_SITES") != null or
+        runtime.envOnce("KLIO_DISPATCH_STATS") != null;
+    require_resolved_state = if (recording) 2 else 1;
+}
+
+/// Whether anything at all wants to hear about a name-based resolution: the
+/// single predictable compare the by-name paths pay when nothing does.
+pub inline fn ratchetArmed() bool {
+    return require_resolved_state != 1;
+}
+
+/// Whether a run that resolved anything by name must exit non-zero. Both
+/// `KLIO_REQUIRE_RESOLVED` settings fail the run; the recording-only modes that
+/// `KLIO_DISPATCH_STATS` turns on do not.
+pub fn requireResolvedFails() bool {
+    if (require_resolved_state == 0) requireResolvedInit();
+    return require_resolved_state >= 3;
+}
+
+/// Whether an unresolved dispatch must raise rather than serve the call.
+pub fn requireResolvedRaises() bool {
+    if (require_resolved_state == 0) requireResolvedInit();
+    return require_resolved_state == 4;
+}
+
+var unresolved_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var unresolved_sites: ?runtime.NameHashMap(u64) = null;
+var unresolved_mutex: runtime.SpinMutex = .{};
+
+/// Count one execution of an unresolved site, and record the site that caused
+/// it. `kind` names the site class (a `site_census.SiteKind` tag), `name` the
+/// identifier being resolved, `in_fn` the function whose body holds the site,
+/// `recv` the receiver's runtime type where there is one.
+pub fn unresolvedNoteSlow(kind: []const u8, name: []const u8, in_fn: []const u8, recv: []const u8) void {
+    if (require_resolved_state == 0) requireResolvedInit();
+    if (require_resolved_state == 1) return;
+    _ = unresolved_total.fetchAdd(1, .monotonic);
+    var buf: [320]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s} {s}.{s} @{s}", .{ kind, recv, name, in_fn }) catch return;
+    unresolved_mutex.lock();
+    defer unresolved_mutex.unlock();
+    if (unresolved_sites == null) unresolved_sites = runtime.NameHashMap(u64).init(std.heap.page_allocator);
+    const gop = unresolved_sites.?.getOrPut(key) catch return;
+    if (!gop.found_existing) {
+        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
+        gop.value_ptr.* = 0;
+    }
+    gop.value_ptr.* += 1;
+}
+
+/// One tier's gate on an executing instruction: report an unresolved site and
+/// say whether the tier must refuse to serve it. `recv` is the receiver's
+/// runtime type where the tier can read it.
+///
+/// Every interpreter tier calls this over the same classifier, so the executed
+/// census covers the tiers by construction rather than by a list of hand-placed
+/// hooks that a new tier could miss.
+pub fn unresolvedGate(module: *const Module, inst: *const Inst, in_fn: []const u8, recv: []const u8) bool {
+    // The first instruction of a run reaches here with the switch unread, since
+    // `ratchetArmed` reads one byte and does not pay for the env probe.
+    if (require_resolved_state == 0) requireResolvedInit();
+    if (require_resolved_state == 1) return false;
+    const kind = ir.site_census.refine(module, inst);
+    if (ir.site_census.verdictOf(kind) != .unresolved) return false;
+    unresolvedNoteSlow(@tagName(kind), ir.site_census.siteName(module, inst), in_fn, recv);
+    return requireResolvedRaises();
+}
+
+/// The class table refines two site kinds, so a caller that skips it reports a
+/// resolved site as unresolved: a construction of a class with one constructor
+/// names its target as exactly as a `Call` does.
+pub fn isUnresolvedSite(module: *const Module, inst: *const Inst) bool {
+    return ir.site_census.verdictOf(ir.site_census.refine(module, inst)) == .unresolved;
+}
+
+/// The same gate for a tier that cannot raise. It records and serves when the
+/// ratchet is only counting; in raise mode it records nothing and answers true,
+/// so the tier declines and the framed walker reports the site exactly once.
+pub fn unresolvedTierGate(module: *const Module, inst: *const Inst, in_fn: []const u8, recv: []const u8) bool {
+    if (require_resolved_state == 0) requireResolvedInit();
+    if (require_resolved_state == 1) return false;
+    if (!isUnresolvedSite(module, inst)) return false;
+    if (requireResolvedRaises()) return true;
+    unresolvedNoteSlow(@tagName(ir.site_census.refine(module, inst)), ir.site_census.siteName(module, inst), in_fn, recv);
+    return false;
+}
+
+pub fn unresolvedCount() u64 {
+    return unresolved_total.load(.monotonic);
+}
+
+/// Report the sites that re-derived a target, most frequent first. Returns the
+/// total, so a caller can turn `KLIO_REQUIRE_RESOLVED=1` into an exit code.
+pub fn unresolvedDump() u64 {
+    if (require_resolved_state == 0) requireResolvedInit();
+    if (require_resolved_state == 1) return 0;
+    const total = unresolved_total.load(.monotonic);
+    unresolved_mutex.lock();
+    defer unresolved_mutex.unlock();
+    const sites = &(unresolved_sites orelse {
+        std.debug.print("[unresolved] total=0\n", .{});
+        return 0;
+    });
+    const Entry = struct { key: []const u8, n: u64 };
+    var list = std.ArrayList(Entry).initCapacity(std.heap.page_allocator, sites.count()) catch return total;
+    defer list.deinit(std.heap.page_allocator);
+    var it = sites.iterator();
+    while (it.next()) |e| list.appendAssumeCapacity(.{ .key = e.key_ptr.*, .n = e.value_ptr.* });
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn gt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.gt);
+    std.debug.print("[unresolved] total={d} distinct={d}\n", .{ total, list.items.len });
+    const top = @min(list.items.len, unresolvedTopN());
+    for (list.items[0..top]) |e| std.debug.print("[unresolved] {d:>12}  {s}\n", .{ e.n, e.key });
+    return total;
+}
+
+/// How many site rows `unresolvedDump` prints; `KLIO_UNRESOLVED_SITES=<n>` widens it.
+fn unresolvedTopN() usize {
+    const S = struct {
+        var n: ?usize = null;
+    };
+    if (S.n) |n| return n;
+    var n: usize = 40;
+    if (runtime.envOnce("KLIO_UNRESOLVED_SITES")) |v| {
+        n = std.fmt.parseInt(usize, v, 10) catch 40;
+    }
+    S.n = n;
+    return n;
+}
+
+/// Test hook: force the ratchet's state, bypassing the environment read.
+pub fn setRequireResolvedForTest(state: u8) void {
+    require_resolved_state = state;
+}
+
+test "the ratchet is inert when off" {
+    setRequireResolvedForTest(1);
+    defer setRequireResolvedForTest(0);
+    const before = unresolvedCount();
+    unresolvedNoteSlow("call_member_by_name", "size", "kotlin.collections.foo", "List");
+    try std.testing.expectEqual(before, unresolvedCount());
+    try std.testing.expect(!requireResolvedRaises());
+}
+
+test "recording names the site that re-derived a target" {
+    setRequireResolvedForTest(2);
+    defer {
+        setRequireResolvedForTest(0);
+        unresolved_total.store(0, .monotonic);
+        if (unresolved_sites) |*m| m.clearRetainingCapacity();
+    }
+    unresolved_total.store(0, .monotonic);
+    if (unresolved_sites) |*m| m.clearRetainingCapacity();
+    unresolvedNoteSlow("call_member_by_name", "size", "pkg.caller", "List");
+    unresolvedNoteSlow("call_member_by_name", "size", "pkg.caller", "List");
+    unresolvedNoteSlow("call_member_or_global", "helper", "pkg.caller", "-");
+    try std.testing.expectEqual(@as(u64, 3), unresolvedCount());
+    unresolved_mutex.lock();
+    defer unresolved_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 2), unresolved_sites.?.count());
+    try std.testing.expectEqual(@as(u64, 2), unresolved_sites.?.get("call_member_by_name List.size @pkg.caller").?);
+}
+
+test "raise mode is distinguishable from counting" {
+    setRequireResolvedForTest(4);
+    defer setRequireResolvedForTest(0);
+    try std.testing.expect(requireResolvedRaises());
+    setRequireResolvedForTest(3);
+    try std.testing.expect(!requireResolvedRaises());
+}
+
+var require_resolved_messages: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+/// The message a ratchet violation raises with. The throwable borrows the slice,
+/// so it is duped; raise mode is a diagnostic run and a program that catches its
+/// way past a thousand of them has already answered the question, so past that
+/// the message degrades to a shared one rather than growing without bound.
+pub fn requireResolvedSiteMessage(module: *const Module, inst: *const Inst, in_fn: []const u8, recv: []const u8) []const u8 {
+    return requireResolvedMessage(
+        @tagName(ir.site_census.refine(module, inst)),
+        ir.site_census.siteName(module, inst),
+        recv,
+        in_fn,
+    );
+}
+
+pub fn requireResolvedMessage(what: []const u8, name: []const u8, recv: []const u8, in_fn: []const u8) []const u8 {
+    const fixed = "a target resolved by name at run time; bind it at lowering or clear KLIO_REQUIRE_RESOLVED";
+    if (require_resolved_messages.fetchAdd(1, .monotonic) >= 1000) return fixed;
+    var buf: [384]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "{s} `{s}` on {s} in {s} resolved by name at run time; bind it at lowering or clear KLIO_REQUIRE_RESOLVED",
+        .{ what, name, recv, in_fn },
+    ) catch return fixed;
+    return std.heap.page_allocator.dupe(u8, msg) catch fixed;
+}
+
+test "every dispatch kind that the ratchet hooks is an unresolved verdict" {
+    // The hooks and the verdict table must agree: a kind the by-name paths
+    // report must not be counted as resolved work.
+    const hooked = [_]DispatchKind{
+        .call_member_virtual, .call_member_or_global, .call_member_or_value,
+        .call_value_or_member, .load_this_or_global,
+        .store_this_or_global, .field_read_host_by_name,
+    };
+    for (hooked) |k| try std.testing.expectEqual(DispatchVerdict.unresolved, dispatchVerdictOf(k));
+    try std.testing.expectEqual(DispatchVerdict.resolved, dispatchVerdictOf(.call_member_resolved));
+    try std.testing.expectEqual(DispatchVerdict.resolved, dispatchVerdictOf(.call_virtual_slot));
+    try std.testing.expectEqual(DispatchVerdict.resolved, dispatchVerdictOf(.call_static));
+    // The tails downstream of a by-name member call are bookkeeping, or the
+    // split would count one call as several.
+    for ([_]DispatchKind{ .member_ladder, .member_site_flat, .member_fast_subscript, .frame_push }) |k|
+        try std.testing.expectEqual(DispatchVerdict.bookkeeping, dispatchVerdictOf(k));
+}
+
+/// A one-line rendering of a value for a diagnostic: the tag, plus the payload
+/// for the scalars a divergence is usually about.
+///
+/// `slot` picks one of two per-thread buffers, because the caller that needs
+/// this is comparing two values in ONE `print` — with a single buffer the
+/// second call overwrites the first and both arguments render the same, which
+/// turned a real divergence into "these two identical values differ".
+pub fn shortValue(v: *const Value, comptime slot: usize) []const u8 {
+    const S = struct {
+        threadlocal var bufs: [2][96]u8 = undefined;
+    };
+    const buf = &S.bufs[slot];
+    return switch (v.*) {
+        .Int => |x| std.fmt.bufPrint(buf, "Int:{d}", .{x}) catch "Int",
+        .Long => |x| std.fmt.bufPrint(buf, "Long:{d}", .{x}) catch "Long",
+        .Short => |x| std.fmt.bufPrint(buf, "Short:{d}", .{x}) catch "Short",
+        .Byte => |x| std.fmt.bufPrint(buf, "Byte:{d}", .{x}) catch "Byte",
+        .Bool => |x| if (x) "Bool:true" else "Bool:false",
+        .Double => |x| std.fmt.bufPrint(buf, "Double:{d}", .{x}) catch "Double",
+        .Float => |x| std.fmt.bufPrint(buf, "Float:{d}", .{x}) catch "Float",
+        .Char => |x| std.fmt.bufPrint(buf, "Char:{d}", .{x}) catch "Char",
+        else => @tagName(std.meta.activeTag(v.*)),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// `KLIO_EXT_AUDIT`, per site. The aggregated form of this audit keys on
+// (name, receiver head), which merges call sites that see different candidate
+// sets: a divergence there proves a commit criterion unsound, but an absence of
+// divergence proves nothing. This channel carries the resolver's withheld pick
+// from the instruction to the moment the by-name walk serves it, so every
+// executed site reports for itself.
+// ---------------------------------------------------------------------------
+
+/// The pick the executing tier published for the site it is about to serve, as
+/// `FuncId + 1`; 0 means the site carried no stamp. Identity, not the qualified
+/// name: `kotlin.time.toDuration` is three declarations under one name, and a
+/// comparison by name reports the wrong overload as agreement. The name rides
+/// along only so a stamp nothing served can still name itself.
+threadlocal var ext_audit_pick: u32 = 0;
+threadlocal var ext_audit_fqn: []const u8 = "";
+threadlocal var ext_audit_name: []const u8 = "";
+threadlocal var ext_audit_in_fn: []const u8 = "";
+threadlocal var ext_audit_kind: u8 = 0;
+
+var ext_audit_state: u8 = 0;
+
+/// Whether the per-site extension audit is on. One cached compare, which the
+/// member-call arm and each extension serve pay on every call.
+pub inline fn extAuditArmed() bool {
+    if (ext_audit_state == 0)
+        ext_audit_state = if (runtime.envOnce("KLIO_EXT_AUDIT") != null) 2 else 1;
+    return ext_audit_state == 2;
+}
+
+/// Announce the stamped pick for the call about to be dispatched. A stamp still
+/// standing here was never served: the site resolved as a member, a builtin or a
+/// host intrinsic instead, which is a fact about coverage rather than a
+/// divergence, so it gets its own row.
+pub fn extAuditPublish(module: *const Module, pick: ?FuncId, kind: u8, name: []const u8, in_fn: []const u8) void {
+    if (ext_audit_pick != 0)
+        extAuditRow(ext_audit_name, "not-served", ext_audit_fqn, "-", ext_audit_kind, ext_audit_in_fn);
+    const fid = pick orelse {
+        ext_audit_pick = 0;
+        return;
+    };
+    ext_audit_pick = fid.int() + 1;
+    ext_audit_fqn = if (module.funcById(fid)) |f| f.fqn else "?";
+    ext_audit_name = name;
+    ext_audit_in_fn = in_fn;
+    ext_audit_kind = kind;
+}
+
+pub const ExtAuditExpect = struct { fid: FuncId, fqn: []const u8, kind: u8, in_fn: []const u8 };
+
+/// Take the published pick if it was published for this name. Taking clears it:
+/// the extension body this serve is about to run resolves extensions of its own,
+/// and those belong to their own sites.
+pub fn extAuditTake(name: []const u8) ?ExtAuditExpect {
+    if (ext_audit_pick == 0) return null;
+    if (!std.mem.eql(u8, ext_audit_name, name)) return null;
+    const out: ExtAuditExpect = .{
+        .fid = @enumFromInt(ext_audit_pick - 1),
+        .fqn = ext_audit_fqn,
+        .kind = ext_audit_kind,
+        .in_fn = ext_audit_in_fn,
+    };
+    ext_audit_pick = 0;
+    return out;
+}
+
+/// Compare one serve against the site's stamp. Every route that produces a
+/// target for a stamped call reports here, the by-name walk and the memos that
+/// replay its verdict alike: the question is whether committing the pick would
+/// run the same declaration, not which mechanism found it.
+pub fn extAuditServed(module: *const Module, fid: FuncId, name: []const u8) void {
+    const exp = extAuditTake(name) orelse return;
+    const agree = exp.fid.int() == fid.int();
+    const served = if (module.funcById(fid)) |f| f.fqn else "?";
+    // Two overloads of one name print the same, so say which declaration when
+    // the names collide, by id and by the receiver that separates them;
+    // otherwise the row reads as a divergence with no difference in it.
+    var buf_w: [256]u8 = undefined;
+    var buf_s: [256]u8 = undefined;
+    const collide = !agree and std.mem.eql(u8, exp.fqn, served);
+    const want = if (collide)
+        (std.fmt.bufPrint(&buf_w, "{s}#{d}({s})", .{ exp.fqn, exp.fid.int(), declaredRecvName(module, exp.fid) }) catch exp.fqn)
+    else
+        exp.fqn;
+    const got = if (collide)
+        (std.fmt.bufPrint(&buf_s, "{s}#{d}({s})", .{ served, fid.int(), declaredRecvName(module, fid) }) catch served)
+    else
+        served;
+    extAuditRow(name, if (agree) "agree" else "diverge", want, got, exp.kind, exp.in_fn);
+}
+
+fn declaredRecvName(module: *const Module, fid: FuncId) []const u8 {
+    const f = module.funcById(fid) orelse return "?";
+    if (f.params.len == 0) return "-";
+    return f.params[0].ty.name;
+}
+
+/// One row for one executed site. No join and no aggregation: the sweep counts
+/// the verdicts and prints the divergent rows.
+pub fn extAuditRow(name: []const u8, verdict: []const u8, lowering: []const u8, served: []const u8, kind: u8, in_fn: []const u8) void {
+    std.debug.print("[KLIO_EXT_AUDIT] site name={s} {s} lowering={s} runtime={s} kind={d} in={s}\n", .{
+        name, verdict, lowering, served, kind, in_fn,
+    });
 }

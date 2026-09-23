@@ -4,6 +4,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const runtime = @import("runtime");
+const span_mod = @import("span");
 const ir = @import("../../ir.zig");
 const applicability = @import("applicability");
 const build = @import("../../build.zig");
@@ -45,6 +46,7 @@ const simpleTypeHead = type_probe_mod.simpleTypeHead;
 const probe_mod = @import("probe.zig");
 const bareTypeParamHead = probe_mod.bareTypeParamHead;
 const eagerLambdaRecvHead = probe_mod.eagerLambdaRecvHead;
+const implicit_walk = @import("implicit_walk.zig");
 const typeHead = probe_mod.typeHead;
 
 const audit_mod = @import("audit.zig");
@@ -86,7 +88,7 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     else
         b.module.eagerRecvHeadOf(lam.body.span);
     const lambda_receiver_shape_known = expected_shape_known or
-        recorded_recv != null or eager_shape != null;
+        recorded_recv != null or eager_shape != null or b.lambdaArgNoRecv(expr.span());
     const lambda_has_receiver = receiver_head != null or
         (eager_shape != null and eager_shape.?.has_receiver);
     b.module.pending_lambda_no_receiver = lambda_receiver_shape_known and !lambda_has_receiver;
@@ -182,11 +184,29 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     b.module.pending_lambda_this_label = b.pending_lambda_label;
     // The receiver in scope at the body's site: a `T.() -> R` lambda rebinds the
     // implicit `this` to `T`, a plain block captures the enclosing `this`.
-    b.module.pending_lambda_receiver_tower = try b.collectReceiverTowerLabeled(
-        b.allocator,
-        receiver_head,
-        b.pending_lambda_label,
-    );
+    // The tower is the body's list of receivers only when this lambda's own
+    // receiver is settled: a shape still unknown may carry a receiver the list
+    // would not name, and a list that omits it says "no receiver" to a walk.
+    b.module.pending_lambda_receiver_tower = if (lambda_receiver_shape_known or receiver_head != null)
+        try b.collectReceiverTowerLabeled(
+            b.allocator,
+            receiver_head,
+            b.pending_lambda_label,
+        )
+    else
+        null;
+    if (b.module.pending_lambda_receiver_tower == null and implicit_walk.probeOn() and build.scratch_depth == 0) {
+        const sp = expr.span();
+        // `KLIO_SHAPE_STACK=<label>`: the lowering stack that reached a
+        // shapeless literal of that label, naming the call path that
+        // recorded nothing for it.
+        if (runtime.envOnce("KLIO_SHAPE_STACK")) |want| {
+            if (std.mem.eql(u8, want, b.pending_lambda_label orelse "-")) std.debug.dumpCurrentStackTrace(.{});
+        }
+        std.debug.print("[lambda-shape] unknown fn={s} f{d}:{d}-{d} label={s} expected={} arity={d}\n", .{
+            build.currentRealFn() orelse "-", sp.file.int(), sp.start, sp.end, b.pending_lambda_label orelse "-", b.peekExpected() != null, expected_arity,
+        });
+    }
     b.module.pending_lambda_enclosing_recv = blk: {
         if (receiver_head) |rr| break :blk rr;
         break :blk b.enclosingRecvTy();
@@ -233,8 +253,21 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (b.module.pending_lambda_self_fn == null) b.module.pending_lambda_self_fn = b.selfLocalFn();
     // Non-callable-local evidence flows in transitively.
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+    // Context parameters: the expected function type's, else the record the
+    // call site made from its callee's parameter type. The body captures a
+    // context value of the enclosing scope by name when a call needs one.
+    // The `context(a, b) { }` shortcut names the block's slots itself.
+    if (b.module.pending_lambda_ctx_types == null) b.module.pending_lambda_ctx_types = try lambdaCtxTypesFor(b, expr, if (lam.implicit_it) 0 else lam.params.len, expected_arity);
+    b.module.pending_lambda_ctx_scope = if (b.ctx_scope.items.len == 0) null else try b.allocator.dupe(ir.ContextLocal, b.ctx_scope.items);
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
-    if (runtime.envOnce("KLIO_LAMINH") != null) std.debug.print("[laminh] produce lambda b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
+    if (runtime.envOnce("KLIO_LAMINH")) |w| {
+        std.debug.print("[laminh] produce lambda b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
+        // A name: whether the snapshot carries it, and whether the producing
+        // builder sees it bound at all.
+        if (!std.mem.eql(u8, w, "1")) std.debug.print("[laminh]   {s} typed={} bound={} outer={} init_expr={} in={s}\n", .{
+            w, b.localDeclTypeRef(w) != null, b.resolve(w) != null, b.knowsOuter(w), b.localInitExpr(w) != null, build.currentRealFn() orelse "-",
+        });
+    }
     // Fold active inline-splice param types into the snapshot: a nested closure
     // in a spliced body captures the callee's parameter by name.
     if (b.module.pending_lambda_local_decl_types) |*locals| {
@@ -315,10 +348,11 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const captures = try b.allocator.alloc(Reg, captured_names.len);
     for (captured_names, captures) |n, *c| c.* = try resolveCapture(b, n);
 
-    const param_names = if (suppress_it)
+    const user_param_names = if (suppress_it)
         try b.allocator.alloc([]const u8, 0)
     else
         try lambdaParamNames(b.allocator, lam.params);
+    const param_names = try withLeadingContextNames(b, body_func, lowered.n_ctx, user_param_names);
     const body_ast = lam.body;
     const dst = b.allocReg();
     try b.push(.{ .AstLambda = try b.boxInst(ir.AstLambdaInst{
@@ -379,6 +413,11 @@ pub fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.module.pending_lambda_own_recv_type = try loweredOwnedLocalTypeRef(b, receiver);
     }
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+    // Context parameters: the expected function type's, else the record the
+    // call site made from its callee's parameter type. The body captures a
+    // context value of the enclosing scope by name when a call needs one.
+    if (b.module.pending_lambda_ctx_types == null) b.module.pending_lambda_ctx_types = try lambdaCtxTypesFor(b, expr, af.params.len, b.pending_lambda_arity);
+    b.module.pending_lambda_ctx_scope = if (b.ctx_scope.items.len == 0) null else try b.allocator.dupe(ir.ContextLocal, b.ctx_scope.items);
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
     if (runtime.envOnce("KLIO_LAMINH") != null) std.debug.print("[laminh] produce anonfun b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
     if (af.context_params.len != 0) b.module.pending_lambda_ctx_params = af.context_params;
@@ -404,9 +443,10 @@ pub fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const captures = try b.allocator.alloc(Reg, captured_names.len);
     for (captured_names, captures) |n, *c| c.* = try resolveCapture(b, n);
     const dst = b.allocReg();
+    const closure_param_names = try withLeadingContextNames(b, lowered.func, lowered.n_ctx, param_names);
     try b.push(.{ .AstLambda = try b.boxInst(ir.AstLambdaInst{
         .dst = dst,
-        .params = param_names,
+        .params = closure_param_names,
         .body_ast = body_block,
         .captures = captures,
         .captured_names = captured_names,
@@ -870,6 +910,100 @@ pub fn fnTypeReceiverHead(b: *FuncBuilder, ty: ir.TypeRef) ?[]const u8 {
     return if (fnTypeReceiver(b, ty)) |receiver| receiver.name else null;
 }
 
+/// The context parameter type heads a lowered function type declares, in
+/// order: the `#ctx:` markers its argument list ends with.
+pub fn fnTypeCtxTypes(ty: ir.TypeRef) []const []const u8 {
+    var n: usize = 0;
+    for (ty.args) |a| {
+        if (std.mem.startsWith(u8, a.name, "#ctx:")) n += 1;
+    }
+    if (n == 0) return &.{};
+    // The markers are contiguous at the tail; hand back a view of their names
+    // through a small stable table built on first use per type.
+    return ctxMarkerNames(ty, n);
+}
+
+fn ctxMarkerNames(ty: ir.TypeRef, n: usize) []const []const u8 {
+    const out = std.heap.page_allocator.alloc([]const u8, n) catch return &.{};
+    var i: usize = 0;
+    for (ty.args) |a| {
+        if (std.mem.startsWith(u8, a.name, "#ctx:")) {
+            out[i] = a.name["#ctx:".len..];
+            i += 1;
+        }
+    }
+    return out;
+}
+
+/// The closure's parameter names with the body's leading context parameters
+/// in front, read off the lowered body, so the invocation binds them positionally.
+fn withLeadingContextNames(b: *FuncBuilder, body_func: FuncId, n_ctx: usize, user_names: [][]const u8) Allocator.Error![][]const u8 {
+    if (n_ctx == 0) return user_names;
+    const f = b.module.funcById(body_func) orelse return user_names;
+    if (f.params.len < n_ctx) return user_names;
+    const out = try b.allocator.alloc([]const u8, n_ctx + user_names.len);
+    for (f.params[0..n_ctx], 0..) |p, i| out[i] = p.name;
+    for (user_names, 0..) |n, i| out[n_ctx + i] = n;
+    return out;
+}
+
+/// The context parameter type heads the lambda literal at `expr` binds: its
+/// expected function type's, else what the call site recorded for it.
+fn lambdaCtxTypesFor(b: *FuncBuilder, expr: *const Expr, own_params: usize, expected_arity: i16) Allocator.Error!?[]const []const u8 {
+    const tys: []const []const u8 = blk: {
+        if (b.peekExpected()) |exp| {
+            if (exp.function) |ft| {
+                if (ft.context_params.len != 0) {
+                    const out = try b.allocator.alloc([]const u8, ft.context_params.len);
+                    for (ft.context_params, 0..) |*cp, i| out[i] = try decl_mod.loweredTypeName(b.allocator, cp);
+                    break :blk out;
+                }
+            }
+        }
+        break :blk b.lambdaArgCtxTypes(expr.span()) orelse return null;
+    };
+    // A literal whose own parameters already cover the contexts takes them
+    // as those parameters: `fun(g: Greeter, name: String)` is a
+    // `context(Greeter) (String) -> String` as written.
+    if (runtime.envOnce("KLIO_DISPATCH_TRACE") != null and build.scratch_depth == 0) std.debug.print("[lambda-ctx] span={d}..{d} own={d} arity={d} tys={d} expected={} fn={s}\n", .{ expr.span().start, expr.span().end, own_params, expected_arity, tys.len, b.peekExpected() != null, build.currentRealFn() orelse "-" });
+    if (expected_arity >= 0 and own_params == tys.len + @as(usize, @intCast(expected_arity))) return null;
+    return tys;
+}
+
+/// A `Function{N}` parameter type whose decoded shape has no receiver: the
+/// block bound there owns none, which is as much a fact as a receiver is.
+/// An alias gives arity without shape, so it answers false.
+pub fn fnTypeNoReceiver(ty: ir.TypeRef) bool {
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return false;
+    const arity = fnTypeArity(ty) orelse return false;
+    const n: usize = if (arity < 0) 0 else @intCast(arity);
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    return hi - lo == n + 1;
+}
+
+/// The shape a lambda argument takes from the parameter it binds: the
+/// receiver, substituted from call evidence, or the fact that it has none.
+fn recordArgLambdaShape(
+    b: *FuncBuilder,
+    func: *const Func,
+    call_span: ast.Span,
+    param_ty: ir.TypeRef,
+    params: []const ir.Param,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const ast.TypeRef,
+    call_receiver: ?ir.TypeRef,
+) Allocator.Error!void {
+    if (fnTypeReceiver(b, param_ty)) |receiver| {
+        try recordCallBoundLambdaReceiver(b, func, call_span, receiver, params, args, arg_names, type_args, call_receiver);
+    } else if (fnTypeNoReceiver(param_ty)) {
+        b.recordLambdaArgNoRecv(call_span);
+    }
+}
+
 fn funcDeclaresTypeParam(b: *const FuncBuilder, func: *const Func, name: []const u8) bool {
     const params = b.module.registry.func_type_params.get(func.id) orelse return false;
     for (params.items) |param| {
@@ -943,8 +1077,15 @@ pub fn callBoundLambdaReceiverType(
         const param_ty = params[pi].ty;
         if (param_ty.nullable or param_ty.args.len != 0 or
             !std.mem.eql(u8, param_ty.name, head)) continue;
-        const actual = argDeclTypeRefLazy(b, arg) orelse continue;
-        if (b.isTypeParam(actual.name)) continue;
+        const actual: ir.TypeRef = blk: {
+            const declared = argDeclTypeRefLazy(b, arg) orelse continue;
+            if (!b.isTypeParam(declared.name)) break :blk declared;
+            // The caller's own type parameter: the classifier its bound names
+            // is where the block's members come from.
+            const tb = b.typeParamBound(declared.name) orelse continue;
+            if (!tb.head_only) continue;
+            break :blk ir.TypeRef{ .name = tb.bound, .nullable = false, .args = &.{} };
+        };
         if (bound) |existing| {
             if (!existing.eql(actual)) return declared_receiver.clone(b.allocator);
         } else {
@@ -1098,9 +1239,7 @@ pub fn recordLambdaArgReceiversForCallReceiver(
         for (args, map) |*a, m| {
             if (a.* != .Lambda and a.* != .AnonFun) continue;
             if (m) |pi| if (pi < params.len) {
-                if (fnTypeReceiver(b, params[pi].ty)) |receiver| {
-                    try recordCallBoundLambdaReceiver(b, func, a.span(), receiver, params, args, arg_names, type_args, call_receiver);
-                }
+                try recordArgLambdaShape(b, func, a.span(), params[pi].ty, params, args, arg_names, type_args, call_receiver);
             };
         }
         return;
@@ -1112,12 +1251,11 @@ pub fn recordLambdaArgReceiversForCallReceiver(
         const n_after = params.len - vp - 1;
         if (args.len < vp + n_after) break;
         const vararg_end = args.len - n_after;
-        if (fnTypeReceiver(b, varargFnElemTy(b, params[vp].ty))) |receiver| {
-            var vi: usize = vp;
-            while (vi < vararg_end) : (vi += 1) {
-                if (args[vi] != .Lambda and args[vi] != .AnonFun) continue;
-                try recordCallBoundLambdaReceiver(b, func, args[vi].span(), receiver, params, args, arg_names, type_args, call_receiver);
-            }
+        const elem_ty = varargFnElemTy(b, params[vp].ty);
+        var vi: usize = vp;
+        while (vi < vararg_end) : (vi += 1) {
+            if (args[vi] != .Lambda and args[vi] != .AnonFun) continue;
+            try recordArgLambdaShape(b, func, args[vi].span(), elem_ty, params, args, arg_names, type_args, call_receiver);
         }
         var k: usize = 0;
         while (k < n_after) : (k += 1) {
@@ -1125,9 +1263,7 @@ pub fn recordLambdaArgReceiversForCallReceiver(
             const pi = vp + 1 + k;
             if (ai >= args.len or pi >= params.len) break;
             if (args[ai] != .Lambda and args[ai] != .AnonFun) continue;
-            if (fnTypeReceiver(b, params[pi].ty)) |receiver| {
-                try recordCallBoundLambdaReceiver(b, func, args[ai].span(), receiver, params, args, arg_names, type_args, call_receiver);
-            }
+            try recordArgLambdaShape(b, func, args[ai].span(), params[pi].ty, params, args, arg_names, type_args, call_receiver);
         }
         return;
     }
@@ -1136,32 +1272,155 @@ pub fn recordLambdaArgReceiversForCallReceiver(
         var i: usize = 0;
         while (i + 1 < args.len) : (i += 1) {
             if ((args[i] == .Lambda or args[i] == .AnonFun)) {
-                if (fnTypeReceiver(b, params[i].ty)) |receiver| {
-                    try recordCallBoundLambdaReceiver(b, func, args[i].span(), receiver, params, args, arg_names, type_args, call_receiver);
-                }
+                try recordArgLambdaShape(b, func, args[i].span(), params[i].ty, params, args, arg_names, type_args, call_receiver);
             }
         }
-        if (fnTypeReceiver(b, params[params.len - 1].ty)) |receiver| {
-            try recordCallBoundLambdaReceiver(
-                b,
-                func,
-                args[args.len - 1].span(),
-                receiver,
-                params,
-                args,
-                arg_names,
-                type_args,
-                call_receiver,
-            );
-        }
+        try recordArgLambdaShape(b, func, args[args.len - 1].span(), params[params.len - 1].ty, params, args, arg_names, type_args, call_receiver);
     } else if (args.len == params.len) {
         for (args, params) |*a, p| {
             if (a.* != .Lambda and a.* != .AnonFun) continue;
-            if (fnTypeReceiver(b, p.ty)) |receiver| {
-                try recordCallBoundLambdaReceiver(b, func, a.span(), receiver, params, args, arg_names, type_args, call_receiver);
+            try recordArgLambdaShape(b, func, a.span(), p.ty, params, args, arg_names, type_args, call_receiver);
+        }
+    }
+}
+
+/// The trailing lambda of an unbound call still has a static shape where every
+/// namesake hosting it at this arity agrees: the same receiver head, recorded
+/// through the first such candidate, or none at all, recorded as such. A call
+/// with an explicit receiver considers only candidates that take one.
+pub fn recordTrailingLambdaConsensus(
+    b: *FuncBuilder,
+    name0: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    on_receiver: bool,
+) Allocator.Error!void {
+    if (args.len == 0) return;
+    const last_arg = args[args.len - 1];
+    if (last_arg != .Lambda and last_arg != .AnonFun) return;
+    const trace = implicit_walk.probeOn() and build.scratch_depth == 0;
+    // A trailing block binds the last parameter whatever the other arguments
+    // are named; a named block is placed by its name and not agreed here.
+    if (ast_arg_names.len == args.len and ast_arg_names[args.len - 1] != null) {
+        if (trace) std.debug.print("[consensus] {s}: named block\n", .{name0});
+        return;
+    }
+    // The namesakes: top-level declarations, and every class's member of the
+    // name, since the runtime picks among both when the receiver is its call.
+    const top = b.module.func_name_index.get(name0);
+    const members = b.module.registry.member_fids_by_name.get(name0);
+    if (top == null and members == null) {
+        if (trace) std.debug.print("[consensus] {s}: no namesake in the index\n", .{name0});
+        return;
+    }
+    var agreed: ?FuncId = null;
+    var agreed_head: ?[]const u8 = null;
+    var any = false;
+    var skipped: usize = 0;
+    var total: usize = 0;
+    var which: usize = 0;
+    while (which < 2) : (which += 1) {
+        const list = (if (which == 0) top else members) orelse continue;
+        for (list.items) |fid| {
+            total += 1;
+            const f = b.module.funcById(fid) orelse continue;
+            const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            if (on_receiver and off == 0) {
+                skipped += 1;
+                continue;
+            }
+            // The composable transform appends its `$composer`/`$changed`
+            // parameters after the block; the block is the last user one.
+            var n_user = f.params.len;
+            while (n_user > off and f.params[n_user - 1].name.len != 0 and f.params[n_user - 1].name[0] == '$') n_user -= 1;
+            if (n_user - off < args.len) {
+                skipped += 1;
+                continue;
+            }
+            const last = f.params[n_user - 1];
+            if (last.is_vararg) {
+                skipped += 1;
+                continue;
+            }
+            const shape = blockParamShape(b, last.ty) orelse {
+                if (trace) std.debug.print("[consensus] {s}: {s} last={s}/{d} not a function type\n", .{ name0, f.fqn, last.ty.name, last.ty.args.len });
+                skipped += 1;
+                continue;
+            };
+            if (!shape.known) {
+                if (trace) std.debug.print("[consensus] {s}: {s} last={s}/{d} shape undecodable\n", .{ name0, f.fqn, last.ty.name, last.ty.args.len });
+                return;
+            }
+            const head = shape.head;
+            if (any) {
+                const same = if (head == null or agreed_head == null) (head == null and agreed_head == null) else std.mem.eql(u8, head.?, agreed_head.?);
+                if (!same) {
+                    if (trace) std.debug.print("[consensus] {s}: {s} head={?s} disagrees with {?s}\n", .{ name0, f.fqn, head, agreed_head });
+                    return;
+                }
+            } else {
+                any = true;
+                agreed = fid;
+                agreed_head = head;
             }
         }
     }
+    const fid = agreed orelse {
+        if (trace) std.debug.print("[consensus] {s}: no candidate of {d} ({d} skipped, on_receiver={})\n", .{ name0, total, skipped, on_receiver });
+        return;
+    };
+    if (agreed_head) |head| {
+        // A receiver spelled as the callee's type parameter is the call
+        // receiver's own type, which a by-name receiver does not know; a
+        // classifier is the same receiver whichever namesake runs.
+        if (on_receiver and (typeParamShapedName(head) or ir.parseClassTypeParamIdentity(head) != null)) {
+            if (trace) std.debug.print("[consensus] {s}: agreed receiver {s} on a by-name receiver, unrecorded\n", .{ name0, head });
+            return;
+        }
+        const f = b.module.funcById(fid) orelse return;
+        const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
+    } else {
+        b.recordLambdaArgNoRecv(last_arg.span());
+    }
+}
+
+/// The receiver a block parameter of type `ty` hands its literal: a function
+/// type's declared receiver, an alias's target's, and none for a fun
+/// interface whose abstract method is no extension, since a literal there
+/// converts to the interface. Null when `ty` binds no block at all;
+/// `known` false when it does but its receiver cannot be read.
+const BlockShape = struct { head: ?[]const u8, known: bool };
+fn blockParamShape(b: *FuncBuilder, ty: ir.TypeRef) ?BlockShape {
+    if (fnTypeArity(ty) != null) {
+        const head = fnTypeReceiverHead(b, ty);
+        return .{ .head = head, .known = head != null or fnTypeNoReceiver(ty) };
+    }
+    if (b.module.registry.type_aliases.get(ty.name) != null) {
+        if (b.module.registry.recv_fn_aliases.get(ty.name) == null) return .{ .head = null, .known = true };
+        if (b.module.registry.type_alias_types.get(ty.name)) |shape| {
+            const head = fnTypeReceiverHead(b, shape.target);
+            return .{ .head = head, .known = head != null };
+        }
+        return .{ .head = null, .known = false };
+    }
+    if (b.module.classId(ty.name)) |cid| {
+        if (cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_fun_interface) {
+            const sam = samAbstractMethod(b, cid) orelse return .{ .head = null, .known = false };
+            const mf = b.module.funcById(sam) orelse return .{ .head = null, .known = false };
+            if (samExtensionReceiver(mf)) |recv| return .{ .head = recv.name, .known = true };
+            return .{ .head = null, .known = true };
+        }
+    }
+    return null;
+}
+
+/// A bare type-parameter spelling: one or two capitals, `T`, `R`, `T1`.
+fn typeParamShapedName(h: []const u8) bool {
+    if (h.len == 0 or h.len > 2) return false;
+    if (!std.ascii.isUpper(h[0])) return false;
+    return h.len == 1 or std.ascii.isDigit(h[1]) or std.ascii.isUpper(h[1]);
 }
 
 /// Bitmask of which of a `Function{N}` parameter's value parameters are declared
@@ -1627,6 +1886,10 @@ pub fn argLambdaParamTypesRecv(
             if (arg.* != .Lambda and arg.* != .AnonFun and !callable_ref) continue;
             const pi = mapped orelse continue;
             if ((arg.* == .Lambda or callable_ref) and fnTypeReturnsUnit(b, params[pi].ty)) unit_mask[ai] = true;
+            {
+                const ctys = fnTypeCtxTypes(params[pi].ty);
+                if (ctys.len != 0) b.recordLambdaArgCtxTypes(arg.span(), ctys);
+            }
             slot.* = try instantiatedLambdaValueParams(
                 b,
                 func,
@@ -1653,6 +1916,10 @@ pub fn argLambdaParamTypesRecv(
                 null;
             if (pi) |param_index| {
                 if ((arg.* == .Lambda or callable_ref) and fnTypeReturnsUnit(b, params[param_index].ty)) unit_mask[i] = true;
+                {
+                    const ctys = fnTypeCtxTypes(params[param_index].ty);
+                    if (ctys.len != 0) b.recordLambdaArgCtxTypes(arg.span(), ctys);
+                }
                 slot.* = try instantiatedLambdaValueParams(
                     b,
                     func,
@@ -1887,6 +2154,8 @@ pub fn ctorLambdaParamTypes(
         const is_array_ctor = std.mem.eql(u8, n, "Array") or
             (std.mem.endsWith(u8, n, "Array") and isPrimitiveTypeName(n[0 .. n.len - "Array".len]));
         if (is_array_ctor and args.len == 2 and args[args.len - 1] == .Lambda) {
+            // `(Int) -> T`: the block owns no receiver.
+            b.recordLambdaArgNoRecv(args[args.len - 1].span());
             const out0 = try b.allocator.alloc(?[]ir.TypeRef, args.len);
             @memset(out0, null);
             errdefer deinitArgLambdaParamTypes(b.allocator, out0);
@@ -1944,11 +2213,9 @@ pub fn ctorLambdaParamTypes(
 /// The lambda-param types a fun-interface SAM conversion hands its sole lambda
 /// argument: the interface's single abstract method's value-param types, under the
 /// class's type params as bound by explicit type arguments or the expected type.
-pub fn samLambdaParamTypes(
-    b: *FuncBuilder,
-    class_id: ir.ClassId,
-    ast_type_args: []const ast.TypeRef,
-) Allocator.Error!?[]?[]ir.TypeRef {
+/// The single abstract method of a fun interface, from the class row's
+/// method list or, for an image row that carries none, the member registry.
+fn samAbstractMethod(b: *FuncBuilder, class_id: ir.ClassId) ?FuncId {
     if (class_id.int() >= b.module.classes.items.len) return null;
     const cls = &b.module.classes.items[class_id.int()];
     const st = runtime.envOnce("KLIO_SAM_TRACE") != null;
@@ -1962,8 +2229,6 @@ pub fn samLambdaParamTypes(
         }
         sam_fid = mfid;
     }
-    // An image class row can carry no method list; the member registry still
-    // records the interface's declared methods.
     if (sam_fid == null) {
         var prefix_buf: [160]u8 = undefined;
         const prefix = std.fmt.bufPrint(&prefix_buf, "{s}\x00", .{cls.name}) catch return null;
@@ -1979,6 +2244,43 @@ pub fn samLambdaParamTypes(
             sam_fid = e.value_ptr.*;
         }
     }
+    return sam_fid;
+}
+
+/// A fun-interface conversion's lambda has the shape of the interface's
+/// single abstract method, whose leading `this` is the interface instance
+/// and no receiver of the block: the block owns none. A member extension
+/// as the abstract method would hand the block its extension receiver,
+/// which stays unrecorded. Recorded by the literal's span before it lowers.
+pub fn recordSamCtorLambdaShape(b: *FuncBuilder, class_id: ir.ClassId, sp: span_mod.Span) void {
+    const fid = samAbstractMethod(b, class_id) orelse return;
+    const mf = b.module.funcById(fid) orelse return;
+    if (samExtensionReceiver(mf)) |recv| {
+        b.recordLambdaArgRecvOwned(sp, recv.clone(b.allocator) catch return) catch return;
+        return;
+    }
+    b.recordLambdaArgNoRecv(sp);
+}
+
+/// The extension receiver a fun interface's abstract method declares, when
+/// it is a member extension (`fun interface H { fun Scope.invoke() }`): its
+/// leading `this` parameter is that receiver, the interface instance being
+/// the frame's dispatch receiver.
+fn samExtensionReceiver(mf: *const ir.Func) ?ir.TypeRef {
+    if (mf.kind != .member_extension) return null;
+    if (mf.params.len == 0 or !std.mem.eql(u8, mf.params[0].name, "this")) return null;
+    return mf.params[0].ty;
+}
+
+pub fn samLambdaParamTypes(
+    b: *FuncBuilder,
+    class_id: ir.ClassId,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?[]?[]ir.TypeRef {
+    if (class_id.int() >= b.module.classes.items.len) return null;
+    const cls = &b.module.classes.items[class_id.int()];
+    const st = runtime.envOnce("KLIO_SAM_TRACE") != null;
+    const sam_fid: ?FuncId = samAbstractMethod(b, class_id);
     if (st) std.debug.print("[sam-in] methods={d} sam={}\n", .{ cls.methods.len, sam_fid != null });
     const mf = b.module.funcById(sam_fid orelse return null) orelse return null;
     const base: usize = if (mf.params.len != 0 and std.mem.eql(u8, mf.params[0].name, "this")) 1 else 0;

@@ -154,7 +154,8 @@ pub fn lowerWhenWithSubjectReg(
                 if (body_blk) |blk| {
                     b.switchTo(blk);
                     b.tail_pos = when_tail;
-                    const v = try lowerExpr(b, &branch.body);
+                    if (branch.body == .Lambda and b.peekExpected() == null) b.recordLambdaArgNoRecv(branch.body.span());
+                const v = try lowerExpr(b, &branch.body);
                     try b.push(.{ .Move = .{ .dst = result, .src = v } });
                     b.terminate(.{ .Goto = join });
                 }
@@ -171,6 +172,7 @@ pub fn lowerWhenWithSubjectReg(
                 b.terminate(.{ .Goto = body_blk });
                 b.switchTo(body_blk);
                 b.tail_pos = when_tail;
+                if (branch.body == .Lambda and b.peekExpected() == null) b.recordLambdaArgNoRecv(branch.body.span());
                 const v = try lowerExpr(b, &branch.body);
                 try b.push(.{ .Move = .{ .dst = result, .src = v } });
                 b.terminate(.{ .Goto = join });
@@ -235,7 +237,8 @@ pub fn lowerWhenWithSubjectReg(
             break :blk b.setThisNarrow(head);
         };
         b.tail_pos = when_tail;
-        const v = try lowerExpr(b, &branch.body);
+        if (branch.body == .Lambda and b.peekExpected() == null) b.recordLambdaArgNoRecv(branch.body.span());
+                const v = try lowerExpr(b, &branch.body);
         if (narrowed_this) |prev| _ = b.setThisNarrow(prev);
         if (narrowed) |n| b.restoreLocal(n);
         var cn = cond_narrowed.items.len;

@@ -72,6 +72,18 @@ pub const ModuleRegistry = struct {
     /// `"<class>\x00<method>\x00<userArity>"` -> the lowered method's FuncId, filled as each body
     /// lowers, so a body reaches a sibling member's signature before `Class.methods` is patched.
     member_method_fids: runtime.NameHashMap(FuncId),
+    /// Keys of `member_method_fids` that more than one declaration claimed.
+    /// The table's writer overwrites, so a key in here holds an arbitrary one
+    /// of them and no consumer may bind through it. Same-arity overloads and
+    /// two classes sharing a simple name both land here.
+    member_method_ambiguous: runtime.NameHashMap(void),
+    /// Simple member name -> every member declaration of that name, any class: the
+    /// namesake set a trailing lambda's shape is agreed over when the call's
+    /// receiver is decided at run time.
+    member_fids_by_name: runtime.NameHashMap(std.ArrayList(FuncId)),
+    /// Class name -> its `this@<Class>` label, one string per class for the
+    /// module's life, so a builder record or a capture list can hold it.
+    this_labels: runtime.NameHashMap([]const u8),
     /// Every member name declared by any class: only these can be shadowed by a runtime receiver.
     class_member_names: runtime.NameHashMap(void),
     /// Class -> transitive supertype simple names, nearest first, recorded from the AST before body
@@ -86,6 +98,13 @@ pub const ModuleRegistry = struct {
     evidence_supers_gen: u32 = 0,
     /// Body-property `(class, prop)` pairs declared with `by`.
     delegated_body_props: StrPairSet,
+    /// `"<ancestor>\u{1f}<member>"` for every member name a STRICT subclass
+    /// declares. A declared slot's index is the same in every subclass, so an
+    /// open class's slot is still a valid index; what a subclass can change is
+    /// whether the slot is the ANSWER, by overriding the property. Read from
+    /// the AST members, which is the only complete record — a layout misses an
+    /// accessor-only override, and so does the getter naming contract.
+    subclass_declares_prop: runtime.NameHashMap(void),
     /// (class, property) pairs whose declared type is a receiver function type; the value is the
     /// receiver's simple head, so a bare invoke binds the innermost implicit receiver of that type.
     recv_fn_props: StrPairMap([]const u8),
@@ -166,8 +185,15 @@ pub const ModuleRegistry = struct {
     /// Top-level `var` custom setters: a `StoreGlobal` invokes the thunk, whose own `field =` write
     /// lands on the `__klio_topfield__<name>` storage binding.
     top_level_prop_setters: runtime.NameHashMap(FuncId),
+    /// Top-level property -> its index in the root scope's slot table: every plain stored property
+    /// (an initializer, no accessor, delegate or `lateinit`) declared once under its simple name.
+    /// `ambiguous_slot` marks a name two declarations share, which no site binds.
+    top_level_prop_slots: runtime.NameHashMap(u32),
+    top_level_prop_slot_count: u32 = 0,
 
     allocator: Allocator,
+
+    pub const ambiguous_slot: u32 = std.math.maxInt(u32);
 
     pub const TypeAliasShape = struct {
         type_params: []const []const u8,
@@ -236,9 +262,13 @@ pub const ModuleRegistry = struct {
             .private_shadow_props = runtime.NameHashMap(void).init(allocator),
             .override_cell_props = runtime.NameHashMap(void).init(allocator),
             .member_method_fids = runtime.NameHashMap(FuncId).init(allocator),
+            .member_method_ambiguous = runtime.NameHashMap(void).init(allocator),
+            .member_fids_by_name = runtime.NameHashMap(std.ArrayList(FuncId)).init(allocator),
+            .this_labels = runtime.NameHashMap([]const u8).init(allocator),
             .class_member_names = runtime.NameHashMap(void).init(allocator),
             .class_super_names = runtime.NameHashMap([]const []const u8).init(allocator),
             .delegated_body_props = StrPairSet.init(allocator),
+            .subclass_declares_prop = runtime.NameHashMap(void).init(allocator),
             .recv_fn_props = StrPairMap([]const u8).init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .class_prop_type_refs = StrPairMap(TypeRef).init(allocator),
@@ -270,6 +300,7 @@ pub const ModuleRegistry = struct {
             .callable_extension_props = runtime.NameHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
             .top_level_prop_getters = runtime.NameHashMap(FuncId).init(allocator),
             .top_level_prop_setters = runtime.NameHashMap(FuncId).init(allocator),
+            .top_level_prop_slots = runtime.NameHashMap(u32).init(allocator),
             .allocator = allocator,
         };
     }
@@ -290,6 +321,13 @@ pub const ModuleRegistry = struct {
         const gop = try self.import_alias_bloom.getOrPut(file);
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* |= importAliasBit(name);
+    }
+
+    /// The `this@<Class>` label for `class_name`, owned by the registry.
+    pub fn thisLabelFor(self: *ModuleRegistry, class_name: []const u8) Allocator.Error![]const u8 {
+        const gop = try self.this_labels.getOrPut(class_name);
+        if (!gop.found_existing) gop.value_ptr.* = try std.fmt.allocPrint(self.allocator, "this@{s}", .{class_name});
+        return gop.value_ptr.*;
     }
 
     /// The one way to register a structural alias, so the simple-name index
@@ -358,9 +396,20 @@ pub const ModuleRegistry = struct {
             self.hierarchy_methods.deinit();
         }
         {
+            self.member_method_ambiguous.deinit();
             var it = self.member_method_fids.keyIterator();
             while (it.next()) |k| self.allocator.free(k.*);
             self.member_method_fids.deinit();
+        }
+        {
+            var it = self.member_fids_by_name.valueIterator();
+            while (it.next()) |list| list.deinit(self.allocator);
+            self.member_fids_by_name.deinit();
+        }
+        {
+            var it = self.this_labels.valueIterator();
+            while (it.next()) |v| self.allocator.free(v.*);
+            self.this_labels.deinit();
         }
         self.class_member_names.deinit();
         self.host_shadowed_fqns.deinit();
@@ -372,6 +421,7 @@ pub const ModuleRegistry = struct {
         self.dropEvidenceSupers();
         self.evidence_supers.deinit(self.allocator);
         self.delegated_body_props.deinit();
+        self.subclass_declares_prop.deinit();
         self.recv_fn_props.deinit();
         self.class_prop_type_heads.deinit();
         self.class_prop_type_refs.deinit();
@@ -444,6 +494,7 @@ pub const ModuleRegistry = struct {
         }
         self.top_level_prop_getters.deinit();
         self.top_level_prop_setters.deinit();
+        self.top_level_prop_slots.deinit();
     }
 
     pub fn noteClassChainChange(self: *ModuleRegistry) void {
@@ -518,6 +569,22 @@ pub const ModuleRegistry = struct {
             while (it.next()) |e| try out.member_method_fids.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
+            var it = self.member_fids_by_name.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(FuncId) = .empty;
+                try list.appendSlice(out.allocator, e.value_ptr.items);
+                try out.member_fids_by_name.put(e.key_ptr.*, list);
+            }
+        }
+        {
+            var it = self.this_labels.iterator();
+            while (it.next()) |e| try out.this_labels.put(e.key_ptr.*, try out.allocator.dupe(u8, e.value_ptr.*));
+        }
+        {
+            var it = self.member_method_ambiguous.keyIterator();
+            while (it.next()) |k| try out.member_method_ambiguous.put(k.*, {});
+        }
+        {
             var it = self.private_shadow_props.keyIterator();
             while (it.next()) |k| try out.private_shadow_props.put(k.*, {});
         }
@@ -540,6 +607,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.delegated_body_props.keyIterator();
             while (it.next()) |k| try out.delegated_body_props.put(k.*, {});
+        }
+        {
+            var it = self.subclass_declares_prop.keyIterator();
+            while (it.next()) |k| try out.subclass_declares_prop.put(k.*, {});
         }
         {
             var it = self.class_prop_type_heads.iterator();
@@ -660,6 +731,11 @@ pub const ModuleRegistry = struct {
             while (it.next()) |e| try out.top_level_prop_getters.put(e.key_ptr.*, e.value_ptr.*);
             var sit = self.top_level_prop_setters.iterator();
             while (sit.next()) |e| try out.top_level_prop_setters.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.top_level_prop_slots.iterator();
+            while (it.next()) |e| try out.top_level_prop_slots.put(e.key_ptr.*, e.value_ptr.*);
+            out.top_level_prop_slot_count = self.top_level_prop_slot_count;
         }
         return out;
     }

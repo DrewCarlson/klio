@@ -686,7 +686,9 @@ pub fn spliceInlineLambda(
 const ShadowSave = struct { name: []const u8, ty: ?ir.TypeRef, init: ?*const ast.Expr };
 
 /// A caller binding hidden for the duration of a spliced lambda body.
-const HiddenBind = struct { name: []const u8, h: build.HiddenBinding };
+/// A callee parameter taken out of scope while a caller's lambda body lowers:
+/// its register binding, and the declared type the splice recorded for it.
+const HiddenBind = struct { name: []const u8, h: ?build.HiddenBinding, ty: ?ast.TypeRef = null };
 
 /// Where a spliced lambda literal takes its subject from: the caller's supplied
 /// receiver, the first positional argument when a receiver-formed literal is
@@ -849,6 +851,53 @@ fn bindSplicedLambdaParams(
     }
 }
 
+/// A param-formed literal standing where a receiver-form function type is
+/// declared. Kotlin lets `(T) -> Unit` serve a `T.() -> Unit` parameter, so the
+/// subject plays both roles, and the call supplies no argument for the literal's
+/// own parameter. `SmallPersistentVector.addAll` reaches `apply` that way, one
+/// forwarding hop from where the literal was written, and without this its `it`
+/// binds to nothing and lowers as a field read on the subject.
+///
+/// A parameter the literal names itself always takes the subject: a
+/// receiver-form literal cannot declare one. The injected `it` takes it only
+/// when nothing the body can see already owns that name, since `apply { }`
+/// gives a literal no `it` of its own and an inner `it` there means the
+/// enclosing lambda's.
+///
+/// Called after the body's resolve window is open: a lambda spliced from
+/// another splice sees its enclosing names only through that window, so asking
+/// before it opens answers for a scope the body never lowers in.
+fn bindSubjectAsLambdaParam(
+    b: *FuncBuilder,
+    lam: *const Expr,
+    eff_arg_regs: []const Reg,
+    subject: ?Reg,
+    shadow_saves: *std.ArrayList(ShadowSave),
+) Allocator.Error!void {
+    if (eff_arg_regs.len != 0) return;
+    const subj = subject orelse return;
+    const params = lam.Lambda.params;
+    if (params.len > 1) return;
+    const pname = if (params.len == 1) params[0].name else "it";
+    const injected = params.len == 0 or std.mem.eql(u8, pname, "it");
+    if (injected and b.resolve(pname) != null) return;
+    try shadow_saves.append(b.allocator, .{
+        .name = pname,
+        .ty = if (b.localDeclTypeRef(pname)) |t| try t.clone(b.allocator) else null,
+        .init = b.localInitExpr(pname),
+    });
+    try b.bind(pname, subj);
+    b.clearLocalDeclType(pname);
+    if (params.len == 1 and lam.Lambda.param_tys.len == 1) {
+        if (lam.Lambda.param_tys[0]) |*annotated| {
+            try b.setLocalDeclTypeOwned(
+                pname,
+                try expr_lower.loweredOwnedLocalTypeRef(b, annotated),
+            );
+        }
+    }
+}
+
 /// The owner splice's localize target, captured before the new frame is pushed
 /// and duplicated so restoring does not alias the frame's own snapshot. The target
 /// for an unlabeled `return` belongs to the frame the lambda was defined under.
@@ -943,8 +992,10 @@ fn hideEnclosingParamBindings(
     out: *std.ArrayList(HiddenBind),
 ) Allocator.Error!void {
     for (keys) |k| {
-        if (b.hideBinding(k)) |h| {
-            try out.append(b.allocator, .{ .name = k, .h = h });
+        const h = b.hideBinding(k);
+        const ty = b.hideSpliceParamTy(k);
+        if (h != null or ty != null) {
+            try out.append(b.allocator, .{ .name = k, .h = h, .ty = ty });
         }
     }
 }
@@ -962,17 +1013,20 @@ fn splicedSubjectHead(
     receiver: ?Reg,
     recv_seat: bool,
     subject_reg: ?Reg,
+    head_hint: *bool,
 ) Allocator.Error!?[]const u8 {
     var recv_head: ?[]const u8 = null;
+    head_hint.* = false;
     if (subject_reg != null) {
-        recv_head = b.receiverLambdaRecvHead(lambda_name);
-        if (recv_head == null) {
-            if (b.lambdaArgRecv(lam.Lambda.span)) |rt| {
-                const h0 = expr_lower.typeHead(std.mem.trimEnd(u8, rt.name, "?"));
-                const bare_tp0 = (h0.len > 0 and h0.len <= 2 and std.ascii.isUpper(h0[0])) or
-                    b.isTypeParam(h0) or ir.parseClassTypeParamIdentity(h0) != null;
-                if (!bare_tp0 and h0.len != 0) recv_head = h0;
-            }
+        // The call site's record for THIS lambda, keyed by its span, is exact.
+        // The by-name table is keyed by the callee's parameter name, and a
+        // nested splice whose own parameter shares the name — `rotate(block)`
+        // around `with(x, block)` — answers for the wrong lambda.
+        if (b.lambdaArgRecv(lam.Lambda.span)) |rt| {
+            const h0 = expr_lower.typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+            const bare_tp0 = (h0.len > 0 and h0.len <= 2 and std.ascii.isUpper(h0[0])) or
+                b.isTypeParam(h0) or ir.parseClassTypeParamIdentity(h0) != null;
+            if (!bare_tp0 and h0.len != 0) recv_head = h0;
         }
         const subj_expr: ?*const Expr = receiver_expr orelse
             (if (recv_seat and arg_exprs.len != 0) &arg_exprs[0] else null);
@@ -991,6 +1045,13 @@ fn splicedSubjectHead(
                 if (!bare_tp and h.len != 0) recv_head = h;
             }
         };
+        // A hint, never a fact: the by-name table describes the receiver-lambda
+        // PARAMETERS in scope and an enclosing splice's parameter of the same
+        // name answers for this literal.
+        if (recv_head == null) {
+            recv_head = b.receiverLambdaRecvHead(lambda_name);
+            head_hint.* = recv_head != null;
+        }
     // A bare invocation of a generic receiver-formed param has no receiver expression
     // to type and binds the callee's own substituted subject, so inherit the
     // enclosing window's head. An explicit `receiver.block()` binds an expression
@@ -999,6 +1060,7 @@ fn splicedSubjectHead(
             receiver != null)
         {
             recv_head = b.spliceRecvTy();
+            head_hint.* = recv_head != null;
         }
     }
     return recv_head;
@@ -1140,7 +1202,10 @@ fn restoreSplicedLambdaContext(
     prev_splice: ?build.SpliceWindow,
 ) Allocator.Error!void {
     for (lam_boxed_here) |n| b.unmarkBoxed(n);
-    for (hidden_binds) |hb| b.restoreHiddenBinding(hb.name, hb.h);
+    for (hidden_binds) |hb| {
+        if (hb.h) |h| b.restoreHiddenBinding(hb.name, h);
+        if (hb.ty) |t| b.restoreSpliceParamTy(hb.name, t);
+    }
     for (suspended_rlp) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
@@ -1226,6 +1291,7 @@ pub fn spliceInlineLambdaOn(
     // lambda's own, skipping the inline fn's parameter scopes in between.
     const prev_splice = b.lambda_splice_resolve;
     const pushed_band = try openSpliceResolveWindow(b, splice_caller_depth, lambda_own_base);
+    try bindSubjectAsLambdaParam(b, lam, eff_arg_regs, receiver, &shadow_saves);
     var suspended_rlp: std.ArrayList([]const u8) = .empty;
     defer suspended_rlp.deinit(b.allocator);
     try suspendEnclosingRlpMarks(b, enclosing_subst_keys.items, &suspended_rlp);
@@ -1237,6 +1303,7 @@ pub fn spliceInlineLambdaOn(
     // A seated subject, invoked with value-arity plus one positional args, is a
     // subject exactly like a supplied receiver.
     const subject_reg: ?Reg = receiver orelse if (recv_seat) arg_regs[0] else null;
+    var recv_head_hint = false;
     const recv_head = try splicedSubjectHead(
         b,
         lambda_name,
@@ -1247,6 +1314,7 @@ pub fn spliceInlineLambdaOn(
         receiver,
         recv_seat,
         subject_reg,
+        &recv_head_hint,
     );
     const lam_prev_splice_recv = b.spliceRecvTy();
     const lam_prev_recv_from_window = b.splice_recv_from_window;
@@ -1256,6 +1324,8 @@ pub fn spliceInlineLambdaOn(
             .reg = subject_reg.?,
             .head = recv_head,
             .prior_this = subject_prior_this,
+            .head_hint = recv_head_hint,
+            .label = b.currentInlineFn(),
         });
     }
     defer if (subject_bind_pushed) {
@@ -3286,18 +3356,22 @@ fn lowerInlineArgValue(
         try b.popScope();
         break :blk rr;
     } else if (slot_is_default[i]) coerced orelse try lowerExpr(b, a) else blk: {
-        var hidden_params: std.ArrayList(struct { name: []const u8, h: build.HiddenBinding }) = .empty;
+        var hidden_params: std.ArrayList(HiddenBind) = .empty;
         defer hidden_params.deinit(b.allocator);
         for (ctx.bound_param_names.items) |nm| {
-            if (b.hideBinding(nm)) |h| {
-                hidden_params.append(b.allocator, .{ .name = nm, .h = h }) catch break;
+            const h = b.hideBinding(nm);
+            const ty = b.hideSpliceParamTy(nm);
+            if (h != null or ty != null) {
+                hidden_params.append(b.allocator, .{ .name = nm, .h = h, .ty = ty }) catch break;
             }
         }
         const rr = coerced orelse try lowerExpr(b, a);
         var hi = hidden_params.items.len;
         while (hi > 0) {
             hi -= 1;
-            b.restoreHiddenBinding(hidden_params.items[hi].name, hidden_params.items[hi].h);
+            const hp = hidden_params.items[hi];
+            if (hp.h) |h| b.restoreHiddenBinding(hp.name, h);
+            if (hp.ty) |t| b.restoreSpliceParamTy(hp.name, t);
         }
         break :blk rr;
     };
@@ -3384,6 +3458,46 @@ fn recordInlineParamDeclType(
 /// Bind one inline parameter: lower its argument in the right scope, seat the
 /// register, box it where a nested closure writes it, record its static type and
 /// enter it in the splice substitution map unless it is `noinline`.
+/// The receiver a spliced callee's `T.() -> R` block owns, with the callee's
+/// type parameter instantiated from the argument bound to a parameter declared
+/// as that bare parameter: `with(density) { }` seats `Density`. An argument
+/// typed by the caller's own type parameter contributes that parameter's
+/// bound. Null when no argument names it, or two disagree.
+fn spliceBoundLambdaReceiver(ctx: *InlineArgBind, rty: *const ast.TypeRef) Allocator.Error!?ir.TypeRef {
+    const b = ctx.b;
+    const f = ctx.f;
+    if (rty.type_args.len != 0 or rty.function != null) return null;
+    const head = rty.name.name;
+    var callee_param = false;
+    for (f.type_params) |tp| {
+        if (std.mem.eql(u8, tp.name.name, head)) {
+            callee_param = true;
+            break;
+        }
+    }
+    if (!callee_param) return null;
+    var bound: ?ir.TypeRef = null;
+    for (f.params, 0..) |*p, i| {
+        if (p.ty.function != null or p.ty.nullable or p.ty.type_args.len != 0) continue;
+        if (!std.mem.eql(u8, p.ty.name.name, head)) continue;
+        if (i >= ctx.ordered.len or ctx.slot_is_default[i]) continue;
+        const a = ctx.ordered[i] orelse continue;
+        if (a.* == .Lambda or a.* == .AnonFun or a.* == .Spread) continue;
+        const actual: ir.TypeRef = blk: {
+            const declared = expr_lower.argDeclTypeRefLazy(b, a) orelse continue;
+            if (!b.isTypeParam(declared.name)) break :blk declared;
+            const tb = b.typeParamBound(declared.name) orelse continue;
+            if (!tb.head_only) continue;
+            break :blk ir.TypeRef{ .name = tb.bound, .nullable = false, .args = &.{} };
+        };
+        if (bound) |existing| {
+            if (!existing.eql(actual)) return null;
+        } else bound = actual;
+    }
+    const found = bound orelse return null;
+    return try found.clone(b.allocator);
+}
+
 fn bindInlineArg(ctx: *InlineArgBind, p: *const ast.Param, i: usize) Allocator.Error!void {
     const b = ctx.b;
     const f = ctx.f;
@@ -3424,7 +3538,8 @@ fn bindInlineArg(ctx: *InlineArgBind, p: *const ast.Param, i: usize) Allocator.E
     // must know it is receiver-formed, so the supplied argument seats as `this`.
     if (lam_ty_push and a.* == .Lambda) {
         if (p.ty.function.?.receiver) |*rty| {
-            const lowered_recv = try expr_lower.loweredOwnedLocalTypeRef(b, rty);
+            const lowered_recv = (try spliceBoundLambdaReceiver(ctx, rty)) orelse
+                try expr_lower.loweredOwnedLocalTypeRef(b, rty);
             try b.recordLambdaArgRecvOwned(a.Lambda.span, lowered_recv);
             b.recordLambdaArgArity(a.Lambda.span, @intCast(p.ty.function.?.params.len));
         }
@@ -3611,6 +3726,7 @@ fn bindSpliceReceiverSubject(
             // The body floor hides the caller's `this`; the subject record keeps it
             // for reads a nested window must bind beneath the subjects.
             .prior_this = b.resolveIgnoringFloor("this"),
+            .label = fname,
         });
         try b.bind("this", receiver);
         if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {

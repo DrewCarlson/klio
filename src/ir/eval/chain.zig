@@ -23,7 +23,7 @@ pub const EnclosingChainIter = struct {
         while (self.idx > 0) {
             self.idx -= 1;
             const e = chain.items[self.idx];
-            if (e.kind == .receiver or e.kind == .subject) return e.v;
+            if (e.kind == .receiver or e.kind == .subject or e.kind == .dispatch) return e.v;
         }
         return null;
     }
@@ -38,6 +38,20 @@ pub fn enclosingChainIter() EnclosingChainIter {
 pub fn pushEnclosing(v: *const Value) void {
     const chain = ev_state.evtlsPtr().active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .receiver }) catch {};
+}
+
+/// Push the dispatch receiver of the member extension about to be invoked: the callee frame takes it as its
+/// `this@Owner`, and every walk sees it as a receiver.
+pub fn pushDispatch(v: *const Value) void {
+    const chain = ev_state.evtlsPtr().active_chain orelse return;
+    chain.append(chainAllocator(), .{ .v = v.*, .kind = .dispatch }) catch {};
+}
+
+/// Push a context argument for the contextual callee about to be invoked: the callee frame takes the
+/// pushes in order as its context parameters. Never an implicit receiver.
+pub fn pushContext(v: *const Value) void {
+    const chain = ev_state.evtlsPtr().active_chain orelse return;
+    chain.append(chainAllocator(), .{ .v = v.*, .kind = .context }) catch {};
 }
 
 /// Push a receiver-lambda subject (`with(x) { … }`'s `x`): a receiver inside the lambda body, but its `outer` links are not.

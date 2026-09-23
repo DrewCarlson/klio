@@ -16,6 +16,30 @@ const probe_mod = @import("probe.zig");
 const fqnOf = probe_mod.fqnOf;
 const inReceiverContext = probe_mod.inReceiverContext;
 
+/// Census counters are process-wide, not per thread. Lowering runs on the
+/// worker pool: a `threadlocal` counter read from the main thread reports one
+/// worker's share as if it were the whole program, which under-counted the
+/// site census by two orders of magnitude.
+fn Census(comptime n: usize) type {
+    return struct {
+        cells: [n]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+
+        pub fn bump(self: *@This(), i: usize) void {
+            _ = self.cells[i].fetchAdd(1, .monotonic);
+        }
+
+        pub fn get(self: *const @This(), i: usize) u64 {
+            return self.cells[i].load(.monotonic);
+        }
+
+        pub fn total(self: *const @This()) u64 {
+            var t: u64 = 0;
+            for (&self.cells) |*c| t += c.load(.monotonic);
+            return t;
+        }
+    };
+}
+
 threadlocal var or_audit_checked: bool = false;
 threadlocal var or_audit_enabled: bool = false;
 
@@ -101,20 +125,252 @@ pub fn refAudit(b: *FuncBuilder, name: []const u8, index_pick: ?FuncId) void {
 }
 
 /// Per-site census of the static member-call gate, under `KLIO_DISPATCH_STATS`.
-pub threadlocal var lm_sites: [7]u64 = @splat(0);
+pub var lm_sites: Census(@typeInfo(LmReason).@"enum".fields.len) = .{};
 /// Unbound member sites the checker did resolve, and why each was refused:
 /// [0] map hit, [1] no such func, [2] not an extension, [3] arity mismatch. A zero
 /// at [0] means the two sets do not intersect at all.
-pub threadlocal var lm_eager_norecv: [4]u64 = @splat(0);
-pub const LmReason = enum(u8) { no_receiver_type, nullable_or_generic, no_class_id, resolver_declined, bound_static, bound_virtual, dynamic_by_design };
+pub var lm_eager_norecv: Census(4) = .{};
+pub const LmReason = enum(u8) {
+    no_receiver_type,
+    nullable_or_generic,
+    no_class_id,
+    resolver_declined,
+    bound_static,
+    bound_virtual,
+    dynamic_by_design,
+    /// The call carries an explicit type-argument list, which the gate does not
+    /// bind; the emitter falls to the by-name form.
+    explicit_type_args,
+    /// `super.m()`, resolved against the parent by name.
+    super_receiver,
+    /// A recursive call whose own return type is still being derived.
+    self_recursive_undecided,
+    /// The owner's hierarchy declares no member of that name at all. Kotlin
+    /// resolves such a call to an extension, so this is not necessarily a gap.
+    no_member_by_name,
+    /// The same, on a host-backed owner. A builtin's members are not in the
+    /// class table at all, so no declaration could ever be found: resolving one
+    /// of these means naming the intrinsic, not a `FuncId`.
+    no_member_stub_owner,
+    /// The hierarchy declares the name and no declaration accepts the call
+    /// shape. This is a real gap: the argument shapes lowering could prove
+    /// would close it.
+    member_shape_refused,
+    /// A visible member accepts the shape, but more than one could, so the
+    /// resolver named none.
+    ambiguous_member,
+    /// The pick names an interpreted body a host binding supersedes.
+    host_shadowed,
+    /// A member the argument shapes refute, which falls to the extension path.
+    member_arg_refuted,
+};
 pub fn lmNote(comptime r: LmReason) void {
-    lm_sites[@intFromEnum(r)] += 1;
+    lm_sites.bump(@intFromEnum(r));
+}
+
+/// Why the extension resolver withheld a target. The member gate's census says
+/// how often the receiver's class declares no such member — 29.90% of
+/// consultations on a compose program — but not how many of those Kotlin's
+/// extension rules would have decided. This is that half.
+pub const WhyNoExtTarget = enum(u8) {
+    /// No candidate survived the scope and shape filters.
+    no_candidates,
+    /// A declaration at or inside the winning tier whose visibility metadata is
+    /// not complete, so the ranked set cannot be compared against it.
+    unknown_visibility_tier,
+    /// Two candidates at the same tier accept the call.
+    tied,
+    /// One candidate leads, but an argument's type is unknown, so the pick is
+    /// left to the runtime's values.
+    unknown_args,
+    /// `unknown_args` where exactly one candidate was ranked: nothing for the
+    /// argument types to choose between.
+    unknown_args_singleton,
+};
+pub var lm_no_ext: Census(@typeInfo(WhyNoExtTarget).@"enum".fields.len) = .{};
+
+pub fn noExtNote(k: WhyNoExtTarget) void {
+    lm_no_ext.bump(@intFromEnum(k));
+}
+
+pub fn lowerNoExtDump() void {
+    const total = lm_no_ext.total();
+    if (total == 0) return;
+    std.debug.print("[no-ext] total={d}\n", .{total});
+    inline for (@typeInfo(WhyNoExtTarget).@"enum".fields) |f| {
+        const n = lm_no_ext.get(f.value);
+        if (n != 0) std.debug.print("[no-ext] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
+/// Why a field read did not claim a slot. `field_read_by_name` is the largest
+/// unresolved site class by a wide margin, and the claim's conditions are
+/// written down in one place; this says which of them each read fails, so the
+/// next one to relax is the one the corpus actually pays for.
+pub const WhyNoSlot = enum(u8) {
+    /// The claim held.
+    claimed,
+    /// The receiver's class is not known statically, so there is no layout to
+    /// index. This is `resolve/receiver-types`, not a layout question.
+    no_class,
+    /// The class has no published layout: it is anonymous, or built before the
+    /// layout pass could reach it.
+    no_layout,
+    /// The layout has no slot of that name and the hierarchy declares it, so an
+    /// accessor or a method answers the read. Resolving these means naming the
+    /// getter, not a slot index.
+    accessor_or_method,
+    /// The class is intrinsic-backed, so its members are not in the class table
+    /// at all and no layout could hold them.
+    host_backed,
+    /// The receiver's static TYPE is unknown, so there is no class to ask.
+    /// This is `resolve/receiver-types`, not a representation question.
+    recv_type_unknown,
+    /// The receiver has a static type that names no class in the table: a
+    /// builtin, a type parameter, a function type. No layout can hold these,
+    /// and naming their members means naming an intrinsic.
+    recv_not_a_class,
+    /// The receiver's type is a SIMPLE name that several packages declare,
+    /// so no unique class answers it. `AtomicInt` is declared by
+    /// `kotlin.concurrent`, `androidx.compose.ui.platform` and
+    /// `kotlinx.atomicfu`; a read through one of them can never be bound
+    /// while the deriver carries the head without its package.
+    recv_ambiguous_simple,
+    /// The layout has no slot and nothing in the hierarchy declares the name:
+    /// an outer-`this` hop, a capture under another spelling, or a read whose
+    /// receiver class the deriver named wrongly.
+    name_absent,
+    /// The slot is a trailing capture rather than a declared property.
+    capture_slot,
+    /// More than one cell holds the property: a shadowing or override cell, and
+    /// which one a read means depends on the runtime class.
+    many_cells,
+    /// The slot is not plain storage — a getter, a delegate, a lateinit.
+    not_plain,
+    /// A body property, whose slot holds its seed until the initializer runs.
+    body_property,
+    /// The class is open, abstract or an interface, so a subclass's layout may
+    /// place the property elsewhere.
+    subclassable,
+    /// The layout carries a delegate cell, which answers reads instead of the
+    /// class's own slots.
+    has_delegate,
+    /// `no_layout`, split by the state that caused it, because they are four
+    /// different problems: an interface holds no storage and never will, an
+    /// object expression's fields are built in another order, `unavailable`
+    /// means the build looked and could not describe the class, and
+    /// `unpublished` means nothing has written a layout for it yet — which is
+    /// an ordering question rather than a representation one.
+    no_layout_interface,
+    no_layout_object,
+    no_layout_local,
+    no_layout_unavailable,
+    no_layout_unpublished,
+};
+pub var lm_no_slot: Census(@typeInfo(WhyNoSlot).@"enum".fields.len) = .{};
+
+pub fn noSlotNote(k: WhyNoSlot) void {
+    lm_no_slot.bump(@intFromEnum(k));
+}
+
+/// Receiver shapes the deriver could not type, indexed by `ast.Expr` tag.
+/// The sole blocker for `field_read_by_name` is a receiver with no class,
+/// and this says what those receivers are written as.
+pub var untyped_recv_shape: Census(@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields.len) = .{};
+/// The same for a single-segment `Path`, split by what the name is, since a
+/// bare name is the shape a breakdown by tag cannot tell apart.
+pub const UntypedPath = enum(u8) {
+    /// A local whose declaration recorded an initializer the deriver could
+    /// not type.
+    local_init_untypeable,
+    /// A local whose binding form recorded no initializer at all: a loop
+    /// variable, a destructured component, a catch parameter.
+    local_no_init,
+    captured,
+    /// A parameter with no declared type, which in practice means a lambda's:
+    /// `it` and its named siblings, typed by the callee's expected signature
+    /// rather than by anything at the declaration.
+    lambda_param,
+    other,
+};
+pub var untyped_recv_path: Census(5) = .{};
+
+/// The INITIALIZER shape behind a local the deriver could not type, which
+/// is the largest sub-bucket of the largest unresolved class.
+pub var untyped_init_shape: Census(@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields.len) = .{};
+/// `classifyCallReturn` for those of them that are calls.
+pub var lm_untyped_init_call: Census(5) = .{};
+
+pub fn noteUntypedInitShape(init: *const ast.Expr) void {
+    if (!norecvCensusOn()) return;
+    untyped_init_shape.bump(@intFromEnum(std.meta.activeTag(init.*)));
+}
+
+pub fn noteUntypedRecvShape(receiver: *const ast.Expr) void {
+    if (!norecvCensusOn()) return;
+    untyped_recv_shape.bump(@intFromEnum(std.meta.activeTag(receiver.*)));
+}
+
+pub fn noteUntypedRecvPath(which: UntypedPath) void {
+    if (!norecvCensusOn()) return;
+    untyped_recv_path.bump(@intFromEnum(which));
+}
+
+pub fn untypedRecvDump() void {
+    const total = untyped_recv_shape.total();
+    if (total == 0) return;
+    std.debug.print("[untyped-recv] total={d}\n", .{total});
+    inline for (@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields) |f| {
+        const n = untyped_recv_shape.get(f.value);
+        if (n != 0) std.debug.print("[untyped-recv] {d:>8}  {s}\n", .{ n, f.name });
+    }
+    inline for (@typeInfo(UntypedPath).@"enum".fields) |f| {
+        const n = untyped_recv_path.get(f.value);
+        if (n != 0) std.debug.print("[untyped-path] {d:>8}  {s}\n", .{ n, f.name });
+    }
+    inline for (@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields) |f| {
+        const n = untyped_init_shape.get(f.value);
+        if (n != 0) std.debug.print("[untyped-init] {d:>8}  {s}\n", .{ n, f.name });
+    }
+    inline for (@typeInfo(NoRecvCall).@"enum".fields) |f| {
+        const n = lm_untyped_init_call.get(f.value);
+        if (n != 0) std.debug.print("[untyped-init-call] {d:>8}  {s}\n", .{ n, f.name });
+    }
+}
+
+pub fn lowerNoSlotDump() void {
+    const total = lm_no_slot.total();
+    if (total == 0) return;
+    std.debug.print("[no-slot] total={d}\n", .{total});
+    inline for (@typeInfo(WhyNoSlot).@"enum".fields) |f| {
+        const n = lm_no_slot.get(f.value);
+        if (n != 0) std.debug.print("[no-slot] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
+/// What became of a member call the gate declined: the extension path bound it,
+/// or it fell through to a by-name `CallMember`.
+pub const FallbackEnd = enum(u8) { extension_bound, by_name };
+pub var lm_fallback: Census(2) = .{};
+
+pub fn fallbackNote(k: FallbackEnd) void {
+    lm_fallback.bump(@intFromEnum(k));
+}
+
+pub fn lowerFallbackDump() void {
+    const total = lm_fallback.total();
+    if (total == 0) return;
+    std.debug.print("[fallback] extension_bound={d} by_name={d} bound={d:.2}%\n", .{
+        lm_fallback.get(0),
+        lm_fallback.get(1),
+        @as(f64, @floatFromInt(lm_fallback.get(0))) * 100.0 / @as(f64, @floatFromInt(total)),
+    });
 }
 
 /// Breakdown of the `no_receiver_type` bucket by receiver-expression shape, indexed
 /// by `ast.Expr` tag, which decides whether the fix belongs in typeck's inference or
 /// in an AST probe lowering is not consulting.
-pub threadlocal var lm_norecv: [@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields.len]u64 = @splat(0);
+pub var lm_norecv: Census(@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields.len) = .{};
 
 /// Whether the `no_receiver_type` breakdown is being collected. Classifying a site
 /// walks same-named declarations, so it happens only when asked for. Resolved once
@@ -129,7 +385,7 @@ pub fn norecvCensusOn() bool {
 
 /// Of the `no_receiver_type` sites, how many typeck did record a type head for,
 /// simply not consulted for the receiver position, versus how many it cannot answer.
-pub threadlocal var lm_norecv_eager: [2]u64 = @splat(0);
+pub var lm_norecv_eager: Census(2) = .{};
 
 /// Sub-census of the `Path` shape: what kind of name the untyped receiver is, which
 /// decides where the missing type has to come from.
@@ -143,14 +399,14 @@ pub const NoRecvPath = enum(u8) {
     /// Neither local, capture, nor member: a top-level property or unknown.
     unknown,
 };
-pub threadlocal var lm_norecv_path: [4]u64 = @splat(0);
+pub var lm_norecv_path: Census(4) = .{};
 
 /// Of the locals with no recorded declared type, whether an initializer was
 /// recorded at all. None means the binding form registered none (loop variable,
 /// lambda parameter, destructured component, catch parameter); one that still yields
 /// no type means the initializer's own type is unknown.
 pub const NoRecvInit = enum(u8) { no_init_recorded, init_yields_no_type };
-pub threadlocal var lm_norecv_init: [2]u64 = @splat(0);
+pub var lm_norecv_init: Census(2) = .{};
 
 /// Why a `Call` initializer yields no type. `argDeclTypeRefLazy` has channels for a
 /// local function, a function-typed parameter, and a constructor, but none for a
@@ -167,7 +423,7 @@ pub const NoRecvCall = enum(u8) {
     /// Unique, but the return type names nothing resolvable to a class.
     unique_unresolvable,
 };
-pub threadlocal var lm_norecv_call: [5]u64 = @splat(0);
+pub var lm_norecv_call: Census(5) = .{};
 
 /// Breakdown of the `resolver_declined` bucket: sites where lowering had a receiver
 /// type and the resolver still refused to name a declaration.
@@ -196,11 +452,11 @@ pub const DeclineKind = enum(u8) {
     /// parameters.
     arg_mapping_failed,
 };
-pub threadlocal var lm_decline: [11]u64 = @splat(0);
+pub var lm_decline: Census(11) = .{};
 
 pub fn declineNote(k: DeclineKind) void {
     lmNote(.resolver_declined);
-    if (norecvCensusOn()) lm_decline[@intFromEnum(k)] += 1;
+    if (norecvCensusOn()) lm_decline.bump(@intFromEnum(k));
 }
 
 /// Why a `target_known_deferred` site had to ask the extension question at all, the
@@ -219,30 +475,29 @@ pub const PromoBlock = enum(u8) {
     /// The extension index could not be rebuilt.
     ext_index_stale,
 };
-pub threadlocal var lm_promo: [6]u64 = @splat(0);
+pub var lm_promo: Census(6) = .{};
 
 /// Why `localInitTypeRef` did or did not answer: no initializer, a constructor, no
 /// derivable return type, incomplete type arguments, derived.
-pub threadlocal var lm_localinit: [5]u64 = @splat(0);
+pub var lm_localinit: Census(5) = .{};
 
 pub fn lowerLocalInitDump() void {
-    var total: u64 = 0;
-    for (lm_localinit) |n| total += n;
+    const total = lm_localinit.total();
     if (total == 0) return;
     const names = [_][]const u8{ "no_initializer", "constructor", "no_return_type", "args_incomplete", "derived" };
     std.debug.print("[localinit] total={d}\n", .{total});
-    for (names, lm_localinit) |n, c| {
+    for (names, 0..) |n, i| {
+        const c = lm_localinit.get(i);
         if (c != 0) std.debug.print("[localinit] {d:>10} {s}\n", .{ c, n });
     }
 }
 
 pub fn lowerPromoDump() void {
-    var total: u64 = 0;
-    for (lm_promo) |n| total += n;
+    const total = lm_promo.total();
     if (total == 0) return;
     std.debug.print("[promo-blocked] total={d}\n", .{total});
     inline for (@typeInfo(PromoBlock).@"enum".fields) |f| {
-        const n = lm_promo[f.value];
+        const n = lm_promo.get(f.value);
         if (n != 0) std.debug.print("[promo-blocked] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
     }
 }
@@ -257,17 +512,22 @@ pub const NoClassKind = enum(u8) {
     /// A bare head several classes declare, so the simple-name lookup refuses.
     simple_ambiguous,
 };
-pub threadlocal var lm_noclass: [3]u64 = @splat(0);
+pub var lm_noclass: Census(3) = .{};
 
 /// The heads behind the `no_class_id` count, captured into a fixed buffer so the
 /// dump can name them; the per-site env trace loses rows that fire before
 /// diagnostics settle.
-threadlocal var lm_noclass_heads: [32][64]u8 = undefined;
-threadlocal var lm_noclass_head_lens: [32]u8 = @splat(0);
-threadlocal var lm_noclass_head_counts: [32]u32 = @splat(0);
-threadlocal var lm_noclass_head_n: usize = 0;
+var lm_noclass_heads: [32][64]u8 = undefined;
+var lm_noclass_head_lens: [32]u8 = @splat(0);
+var lm_noclass_head_counts: [32]u32 = @splat(0);
+var lm_noclass_head_n: usize = 0;
+/// The head table is shared, like the counters, so lowering threads do not each
+/// keep a private list the dump never reads.
+var lm_noclass_mutex: runtime.SpinMutex = .{};
 
 pub fn noteNoClassHead(head: []const u8) void {
+    lm_noclass_mutex.lock();
+    defer lm_noclass_mutex.unlock();
     const n = @min(head.len, 64);
     for (lm_noclass_heads[0..lm_noclass_head_n], lm_noclass_head_lens[0..lm_noclass_head_n], 0..) |*buf, len, i| {
         if (std.mem.eql(u8, buf[0..len], head[0..n])) {
@@ -283,26 +543,26 @@ pub fn noteNoClassHead(head: []const u8) void {
 }
 
 pub fn lowerNoClassDump() void {
-    var total: u64 = 0;
-    for (lm_noclass) |n| total += n;
+    const total = lm_noclass.total();
     if (total == 0) return;
     std.debug.print("[no-class] total={d}\n", .{total});
     inline for (@typeInfo(NoClassKind).@"enum".fields) |f| {
-        const n = lm_noclass[f.value];
+        const n = lm_noclass.get(f.value);
         if (n != 0) std.debug.print("[no-class] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
     }
+    lm_noclass_mutex.lock();
+    defer lm_noclass_mutex.unlock();
     for (lm_noclass_heads[0..lm_noclass_head_n], lm_noclass_head_lens[0..lm_noclass_head_n], lm_noclass_head_counts[0..lm_noclass_head_n]) |*buf, len, count| {
         std.debug.print("[no-class-head] {d:>10}  {s}\n", .{ count, buf[0..len] });
     }
 }
 
 pub fn lowerDeclineDump() void {
-    var total: u64 = 0;
-    for (lm_decline) |n| total += n;
+    const total = lm_decline.total();
     if (total == 0) return;
     std.debug.print("[decline] total={d}\n", .{total});
     inline for (@typeInfo(DeclineKind).@"enum".fields) |f| {
-        const n = lm_decline[f.value];
+        const n = lm_decline.get(f.value);
         if (n != 0) std.debug.print("[decline] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
     }
 }
@@ -326,29 +586,41 @@ pub fn classifyCallReturn(b: *FuncBuilder, e: *const ast.Expr) NoRecvCall {
         } else seen = f.return_ty;
     }
     const ret = seen orelse return .no_func;
-    return if (staticTypeClassId(b, ret) != null) .unique_concrete else .unique_unresolvable;
+    if (staticTypeClassId(b, ret) != null) return .unique_concrete;
+    // Tell a head that no class answers from one that SEVERAL do. The second
+    // is a head that lost its package, and is the same defect the receiver
+    // side found in `AtomicInt`.
+    if (runtime.envOnce("KLIO_RET_HEAD") != null) {
+        var h = std.mem.trimEnd(u8, ret.name, "?");
+        if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
+        std.debug.print("[ret-head] {s} ambiguous={}\n", .{ h, b.module.simpleNameIsAmbiguous(h) });
+    }
+    return .unique_unresolvable;
 }
 
 pub fn lowerNoRecvDump() void {
-    var total: u64 = 0;
-    for (lm_norecv) |n| total += n;
+    const total = lm_norecv.total();
     if (total == 0) return;
     std.debug.print("[no-recv] total={d}\n", .{total});
     inline for (@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields) |f| {
-        const n = lm_norecv[f.value];
+        const n = lm_norecv.get(f.value);
         if (n != 0) std.debug.print("[no-recv] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
     }
-    std.debug.print("[no-recv] eager-has-head={d} eager-no-head={d}\n", .{ lm_norecv_eager[0], lm_norecv_eager[1] });
+    std.debug.print("[no-recv] eager-has-head={d} eager-no-head={d}\n", .{ lm_norecv_eager.get(0), lm_norecv_eager.get(1) });
+    const em = ir.Module.eager_miss_counts;
+    std.debug.print("[eager-miss] no_map={d} no_entry={d} empty={d} unresolvable_fqn={d} ambiguous_simple={d} ok={d} primitive_for_arg={d}\n", .{
+        em[0], em[1], em[2], em[3], em[4], em[5], em[6],
+    });
     inline for (@typeInfo(NoRecvPath).@"enum".fields) |f| {
-        const n = lm_norecv_path[f.value];
+        const n = lm_norecv_path.get(f.value);
         if (n != 0) std.debug.print("[no-recv-path] {d:>10}  {s}\n", .{ n, f.name });
     }
     inline for (@typeInfo(NoRecvInit).@"enum".fields) |f| {
-        const n = lm_norecv_init[f.value];
+        const n = lm_norecv_init.get(f.value);
         if (n != 0) std.debug.print("[no-recv-init] {d:>10}  {s}\n", .{ n, f.name });
     }
     inline for (@typeInfo(NoRecvCall).@"enum".fields) |f| {
-        const n = lm_norecv_call[f.value];
+        const n = lm_norecv_call.get(f.value);
         if (n != 0) std.debug.print("[no-recv-call] {d:>10}  {s}\n", .{ n, f.name });
     }
 }
@@ -356,16 +628,14 @@ pub fn lowerNoRecvDump() void {
 /// Report the static member-call gate's per-site coverage, at the end of a run
 /// alongside the executed-dispatch census.
 pub fn lowerSitesDump() void {
-    var total: u64 = 0;
-    for (lm_sites) |n| total += n;
+    const total = lm_sites.total();
     if (total == 0) return;
     std.debug.print("[lower-sites] total={d}\n", .{total});
     inline for (@typeInfo(LmReason).@"enum".fields) |f| {
-        const n = lm_sites[f.value];
+        const n = lm_sites.get(f.value);
         if (n != 0) std.debug.print("[lower-sites] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
     }
-    {
-        const e = lm_eager_norecv;
-        std.debug.print("[eager-norecv] hits={d} nofunc={d} not_ext={d} arity={d}\n", .{ e[0], e[1], e[2], e[3] });
-    }
+    std.debug.print("[eager-norecv] hits={d} nofunc={d} not_ext={d} arity={d}\n", .{
+        lm_eager_norecv.get(0), lm_eager_norecv.get(1), lm_eager_norecv.get(2), lm_eager_norecv.get(3),
+    });
 }

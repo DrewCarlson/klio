@@ -22,6 +22,8 @@ const vmhost = @import("vm/vmhost.zig");
 const run_mod = @import("vm/run.zig");
 
 pub const VmHost = vmhost.VmHost;
+pub const ctorNameProbeDump = @import("vm/host_instances/ctor_select.zig").ctorNameProbeDump;
+pub const ctorPickAuditDump = @import("vm/host_instances/ctor_select.zig").ctorPickAuditDump;
 pub const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
 /// Composer-stack intrinsics the loader merges into the host bindings.
@@ -192,6 +194,17 @@ pub const ProgramImage = struct {
     member_names: runtime.NameHashMap(void),
     /// Module `canonicalizeProgramNames` last processed; the pass runs once.
     canonicalized_module_identity: usize = 0,
+    /// `ClassId` -> the runtime `ClassDef` it names, filled once per module.
+    ///
+    /// A construction site carries the id, and the path from it to the object
+    /// was reaching the class table by FQN and then by simple name — three
+    /// string-hash probes per construction, measured, for a mapping that
+    /// cannot change for a class the build knows. A null slot means the fill
+    /// found none, and the caller still asks by name: a class registered at
+    /// execution (a local class) has no row here.
+    class_defs_by_id: std.ArrayList(?ObjRef(ClassDef)) = .empty,
+    /// Which module `class_defs_by_id` describes; a different one refills.
+    class_defs_module_identity: usize = 0,
     /// Monomorphic inline cache for user-class instance-method dispatch. The
     /// `FuncId` for `(class identity, name pointer, arity)` is invariant when
     /// the name is unambiguous at that arity; both key pointers stay stable.
@@ -350,7 +363,19 @@ pub const ProgramImage = struct {
         };
     }
 
+    /// Release the id-indexed class handles. Separate from `deinit` so a
+    /// refill can drop the previous module's rows.
+    pub fn clearClassDefsById(self: *ProgramImage) void {
+        for (self.class_defs_by_id.items) |*slot| {
+            if (slot.*) |*d| d.deinit();
+        }
+        self.class_defs_by_id.clearRetainingCapacity();
+        self.class_defs_module_identity = 0;
+    }
+
     pub fn deinit(self: *ProgramImage) void {
+        self.clearClassDefsById();
+        self.class_defs_by_id.deinit(self.allocator);
         self.top_level_prop_inits.deinit();
         self.body_prop_inits.deinit();
         self.instance_prop_getters.deinit();
@@ -420,8 +445,27 @@ pub const ProgramImage = struct {
         return null;
     }
 
+    /// `KLIO_NAMEID_PROBE=1`: how often a dispatch path hashes a name to get
+    /// its canonical pointer. A `GetField`'s name is a module constant and
+    /// already program-lifetime stable, so a site-driven read should not be
+    /// paying for this at all.
+    pub var name_identity_probes: std.atomic.Value(usize) = .init(0);
+    var name_identity_probe_state: u8 = 0;
+
+    pub fn nameIdentityProbeOn() bool {
+        if (name_identity_probe_state == 0)
+            name_identity_probe_state = if (std.c.getenv("KLIO_NAMEID_PROBE") != null) 2 else 1;
+        return name_identity_probe_state == 2;
+    }
+
+    pub fn nameIdentityProbeDump() void {
+        if (!nameIdentityProbeOn()) return;
+        std.debug.print("[nameid] canonicalizations={d}\n", .{name_identity_probes.load(.monotonic)});
+    }
+
     /// Program-lifetime pointer identity; null means the caller must not cache.
     pub fn memberNameIdentity(self: *ProgramImage, name: []const u8) ?usize {
+        if (nameIdentityProbeOn()) _ = name_identity_probes.fetchAdd(1, .monotonic);
         const c = self.memberNameCanonical(name) orelse return null;
         return @intFromPtr(c.ptr);
     }
@@ -1138,6 +1182,7 @@ pub const ObjectInitState = union(enum) {
 pub const ObjectStates = ObjRef(runtime.NameHashMap(ObjectInitState));
 /// `ClassId.int()` → published singleton, authoritative for id-committed reads;
 /// name reads go through `globals`. Published to the id table first.
+pub const class_layout = @import("class_layout.zig");
 pub const SingletonsById = ObjRef(std.AutoHashMap(u32, runtime.Value));
 
 /// Vm-level errors, carried as data.
@@ -1476,6 +1521,7 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+    testing.refAllDecls(class_layout);
     _ = build;
     _ = vmhost;
     _ = run_mod;

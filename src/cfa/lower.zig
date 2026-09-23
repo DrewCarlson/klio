@@ -5,7 +5,7 @@
 //! terminator-emitting form leaves the current block set to a fresh dead block
 //! with no predecessors, so later statements still lower and reachability prunes
 //! them. No type information is consulted: every `Eval` carries
-//! `Type.Unresolved`.
+//! `Type.unresolved`.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -305,7 +305,7 @@ pub const Lowering = struct {
                     const sp = p.name.span;
                     try self.b.push(a, cur.*, .{ .DeclLocal = .{
                         .place = .{ .name = try a.dupe(u8, p.name.name) },
-                        .declared_ty = .Unresolved,
+                        .declared_ty = Type.unresolved,
                         .span = sp,
                     } });
                     if (p.init) |init_expr| {
@@ -355,7 +355,7 @@ pub const Lowering = struct {
                     }
                     try self.b.push(a, cur.*, .{ .DeclLocal = .{
                         .place = .{ .name = try a.dupe(u8, n.name) },
-                        .declared_ty = .Unresolved,
+                        .declared_ty = Type.unresolved,
                         .span = dd.span,
                     } });
                     try self.b.push(a, cur.*, .{ .Assign = .{
@@ -402,7 +402,7 @@ pub const Lowering = struct {
         try self.span_to_pos.put(.{ .start = sp.start, .end = sp.end }, .{ .block = cur, .node_idx = pos });
         try self.b.push(a, cur, .{ .Eval = .{
             .reg = reg,
-            .expr = .{ .span = sp, .ty = .Unresolved },
+            .expr = .{ .span = sp, .ty = Type.unresolved },
         } });
         return try self.recordReg(sp, reg);
     }

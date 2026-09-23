@@ -84,6 +84,39 @@ pub const StringData = struct {
         @constCast(&self.cursor).store(w, .monotonic);
     }
 
+    /// The UTF-16 code unit at index `i`, or null when `i` is past the end.
+    ///
+    /// The walk resumes from `cursor`, so a sequential `s[i]` loop over a
+    /// non-ASCII string stays linear rather than quadratic.
+    pub fn utf16UnitAt(self: *const StringData, i: usize) ?u16 {
+        if (self.ascii) return if (i < self.bytes.len) @as(u16, self.bytes[i]) else null;
+        var n: usize = 0;
+        var it = Utf16View{ .bytes = self.bytes };
+        const c = self.cursorGet();
+        if (c.u16_pos <= i and c.byte_pos <= self.bytes.len) {
+            n = c.u16_pos;
+            it.pos = c.byte_pos;
+        }
+        while (true) {
+            const start = it.pos;
+            const u = it.next() orelse return null;
+            if (it.pending_low) |low| {
+                if (n == i or n + 1 == i) {
+                    self.cursorSet(n, start);
+                    return if (n == i) u else low;
+                }
+                _ = it.next();
+                n += 2;
+            } else {
+                if (n == i) {
+                    self.cursorSet(n, start);
+                    return u;
+                }
+                n += 1;
+            }
+        }
+    }
+
     /// Nothing ever takes an exclusive borrow of an immutable string, so this
     /// marker elides the reader lock; see `objcell.LockFor`.
     pub const objref_immutable = true;
@@ -98,6 +131,146 @@ pub const StringData = struct {
         return self.bytes.len;
     }
 };
+
+/// A string's UTF-16 code units, decoded from its WTF-8 bytes. An astral
+/// scalar yields its surrogate pair across two `next` calls.
+pub const Utf16View = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+    pending_low: ?u16 = null,
+
+    pub fn next(self: *Utf16View) ?u16 {
+        if (self.pending_low) |low| {
+            self.pending_low = null;
+            return low;
+        }
+        if (self.pos >= self.bytes.len) return null;
+        if (float_fmt.isWtf8SurrogateAt(self.bytes, self.pos)) {
+            const unit = float_fmt.wtf8SurrogateUnit(self.bytes, self.pos);
+            self.pos += 3;
+            return unit;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(self.bytes[self.pos]) catch {
+            const unit: u16 = self.bytes[self.pos];
+            self.pos += 1;
+            return unit;
+        };
+        if (self.pos + len > self.bytes.len) {
+            const unit: u16 = self.bytes[self.pos];
+            self.pos += 1;
+            return unit;
+        }
+        const cp = std.unicode.utf8Decode(self.bytes[self.pos .. self.pos + len]) catch {
+            const unit: u16 = self.bytes[self.pos];
+            self.pos += 1;
+            return unit;
+        };
+        self.pos += len;
+        if (cp <= 0xFFFF) return @intCast(cp);
+        const adjusted = cp - 0x10000;
+        const high: u16 = @intCast(0xD800 + (adjusted >> 10));
+        const low: u16 = @intCast(0xDC00 + (adjusted & 0x3FF));
+        self.pending_low = low;
+        return high;
+    }
+};
+
+/// Reader-side memo for one string builder: ASCII-ness, UTF-16 length and a
+/// cursor, keyed by the builder's cell and buffer identity. Every mutating
+/// builtin and every construction invalidates it, so a read-only phase costs
+/// O(1) per read instead of re-encoding the whole buffer.
+///
+/// A builder has no immutable header to hang this on the way `StringData`
+/// does, so it lives here, beside the walk both readers share.
+pub const SbMemo = struct {
+    cell: usize = 0,
+    ptr: [*]const u8 = undefined,
+    len: usize = 0,
+    ascii: bool = false,
+    u16_len: usize = 0,
+    u16_pos: usize = 0,
+    byte_pos: usize = 0,
+};
+threadlocal var sb_memo: SbMemo = .{};
+
+pub fn sbMemoInvalidate(cell: usize) void {
+    if (sb_memo.cell == cell) sb_memo.cell = 0;
+}
+
+pub fn sbMemoFor(cell: usize, items: []const u8) *SbMemo {
+    if (sb_memo.cell == cell and sb_memo.ptr == items.ptr and sb_memo.len == items.len) return &sb_memo;
+    var ascii = true;
+    for (items) |b| {
+        if (b >= 0x80) {
+            ascii = false;
+            break;
+        }
+    }
+    sb_memo = .{
+        .cell = cell,
+        .ptr = items.ptr,
+        .len = items.len,
+        .ascii = ascii,
+        .u16_len = if (ascii) items.len else sbCharCount(items),
+    };
+    return &sb_memo;
+}
+
+/// The builder's length in UTF-16 code units.
+pub fn sbCharCount(s: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (float_fmt.isWtf8SurrogateAt(s, i)) {
+            n += 1;
+            i += 3;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + len, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        n += if (cp > 0xFFFF) 2 else 1;
+        i = end;
+    }
+    return n;
+}
+
+/// The UTF-16 code unit at `idx` in a builder's buffer, resuming from the
+/// memo's cursor so a sequential read stays linear.
+pub fn sbUnitAt(m: *SbMemo, s: []const u8, idx: usize) ?u16 {
+    var n: usize = 0;
+    var i: usize = 0;
+    if (m.u16_pos <= idx and m.byte_pos <= s.len) {
+        n = m.u16_pos;
+        i = m.byte_pos;
+    }
+    while (i < s.len) {
+        if (float_fmt.isWtf8SurrogateAt(s, i)) {
+            if (n == idx) {
+                m.u16_pos = n;
+                m.byte_pos = i;
+                return (@as(u16, s[i] & 0x0F) << 12) | (@as(u16, s[i + 1] & 0x3F) << 6) | @as(u16, s[i + 2] & 0x3F);
+            }
+            n += 1;
+            i += 3;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + len, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        const units: usize = if (cp > 0xFFFF) 2 else 1;
+        if (idx < n + units) {
+            m.u16_pos = n;
+            m.byte_pos = i;
+            if (cp <= 0xFFFF) return @intCast(cp);
+            const v = cp - 0x10000;
+            return if (idx == n) @intCast(0xD800 + (v >> 10)) else @intCast(0xDC00 + (v & 0x3FF));
+        }
+        n += units;
+        i = end;
+    }
+    return null;
+}
 
 pub const StringRef = ObjRef(StringData);
 

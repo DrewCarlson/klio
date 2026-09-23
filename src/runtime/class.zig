@@ -18,7 +18,14 @@ pub const ImplicitReceiver = struct {
     v: Value,
     kind: Kind = .receiver,
 
-    pub const Kind = enum { receiver, subject, access };
+    /// `dispatch`: the owner instance a caller hands a member extension for
+    /// this call, a receiver to every walk and the frame's `this@Owner`.
+    /// `context`: a context argument the caller hands the contextual callee,
+    /// in declaration order; never an implicit receiver.
+    /// `access_context`: a context value inherited from a caller's frame, for a
+    /// callee deriving one it was not handed; never a receiver, never handed on
+    /// as the callee's own.
+    pub const Kind = enum { receiver, subject, access, dispatch, context, access_context };
 
     pub fn isSubject(self: ImplicitReceiver) bool {
         return self.kind == .subject;
@@ -109,11 +116,41 @@ pub const ClassDef = struct {
     resolve_mod: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     resolve_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
+    /// The same, for this class's first non-interface supertype. The ctor
+    /// chain walks parents once per construction and reached each by name;
+    /// the parent a class has cannot change, so the id is memoized beside
+    /// the strings `first_super_*` already keep. Same validity gate:
+    /// `super_cid_mod` claims the resolving module and `super_cid` is the id
+    /// plus 1, zero meaning "not resolved here".
+    super_cid_mod: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    super_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// Which primary-constructor parameters declare a `fun interface`, one
+    /// bit each, single-fill. Construction converts a lambda argument to the
+    /// interface, and deciding which parameters need it resolved every
+    /// parameter's declared type BY NAME on every construction — including
+    /// the ones whose type is not a class at all, whose lookup could only
+    /// ever fail. 0 = uncomputed, 1 = filled.
+    ctor_sam_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    ctor_sam_mask: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
     /// Memo for the `<class-companion-or-self>` read: 0 = unresolved, 1 = the
     /// class value itself, 2 = `companion_read_value`, a borrowed copy of a
     /// process-stable singleton the shared registry keeps alive.
     companion_read_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     companion_read_value: Value = .Null,
+
+    /// Memo for the field layout construction reserves: 0 = uncomputed,
+    /// 1 = a writer is computing it, 2 = `layout_slots` holds it,
+    /// 3 = the class has none and `layout_no` says why. The layout is a
+    /// function of the declaration chain, so one walk per class serves every
+    /// construction.
+    layout_state: u8 = 0,
+    layout_no: u8 = 0,
+    layout_base_count: u32 = 0,
+    /// Program-lifetime, base classes first. Seeds are scalars or null, so
+    /// they hold no cell the collector must trace.
+    layout_slots: []const LayoutSlot = &.{},
 
     pub const EnumEntry = struct {
         name: []const u8,
@@ -222,6 +259,31 @@ pub const ClassDef = struct {
 
 pub const MethodHit = struct { method: MethodDef, class: ObjRef(ClassDef) };
 pub const PropertyHit = struct { property: PropertyDef, class: ObjRef(ClassDef) };
+
+/// One slot of a class's predicted field layout: the key construction stores
+/// under, and the value the slot holds until an initializer replaces it — the
+/// JVM zero of a declared primitive, null otherwise.
+pub const LayoutSlot = struct {
+    name: []const u8,
+    seed: Value = .Null,
+    /// A plain stored property: no accessor, no delegate. A read of one is the
+    /// slot's value, where a read of a property with a getter must run the
+    /// getter even though the backing slot exists.
+    plain: bool = false,
+    /// A primary-constructor property. Its slot is written before any user
+    /// code runs, so a read of it can never land before its value does — where
+    /// a body property's read can, and the discovery ladder answers that one
+    /// by running the initializer while the slot still holds its seed.
+    ctor: bool = false,
+    /// A plain stored WRITE: no custom setter, so storing the value is the
+    /// whole operation. Separate from `plain`, which is about reads — a
+    /// property can read straight from its slot while its setter runs code.
+    plain_write: bool = false,
+    /// Declared type head of the property this slot holds, empty where the
+    /// declaration left the type to inference. Only the head, so `Int?` and
+    /// `Int` both read as `Int`; a consumer that cares about null re-proves.
+    type_head: []const u8 = "",
+};
 
 pub const SupertypeDelegate = struct {
     interface_name: []const u8,
@@ -451,6 +513,11 @@ pub const InstanceData = struct {
     /// with the runtime allocator would cross allocators. The first growth
     /// re-buffers and clears this, and teardown skips the arena-owned spine.
     fields_foreign: bool = false,
+    /// How many leading `fields` entries construction reserved from the
+    /// class's predicted layout. Their index is the class's, so a store under
+    /// one of those names overwrites it where it is instead of moving it to
+    /// the tail; zero means the whole list is in append order.
+    reserved: u32 = 0,
     /// For an anonymous-object instance, the values it captured, seeding the
     /// method-body env at dispatch. Held per instance, so they are reclaimed
     /// with it; names are borrowed, the slice and values owned.
@@ -522,6 +589,16 @@ pub const InstanceData = struct {
         try self.fields.append(allocator, .{ .name = name, .value = v });
         // The layout changed, so the memoized shape id no longer describes it.
         self.shape.store(SHAPE_UNSET, .release);
+    }
+
+    /// The index of `name` among the reserved slots, which a store must keep
+    /// in place. Null for a name the layout did not reserve.
+    pub fn reservedSlot(self: *const InstanceData, name: []const u8) ?usize {
+        const n = @min(@as(usize, self.reserved), self.fields.items.len);
+        for (self.fields.items[0..n], 0..) |f, i| {
+            if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) return i;
+        }
+        return null;
     }
 
     /// Any out-of-band field-list mutation must drop the memoized layout id.

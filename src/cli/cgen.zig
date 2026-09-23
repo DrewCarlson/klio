@@ -87,6 +87,7 @@ pub const cOp = mod_types.cOp;
 const mod_layout = @import("cgen/layout.zig");
 pub const classFields = mod_layout.classFields;
 pub const classFieldsAt = mod_layout.classFieldsAt;
+pub const checkAgainstPublished = mod_layout.checkAgainstPublished;
 pub const isBackingAccess = mod_layout.isBackingAccess;
 pub const plainFieldName = mod_layout.plainFieldName;
 pub const fieldIndex = mod_layout.fieldIndex;

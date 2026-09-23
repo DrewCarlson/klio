@@ -120,7 +120,7 @@ test "t02_anonymous_param_bridge" {
     try assertKlio("t02", src, "hello\n");
 }
 
-// `with` puts its receiver on the context stack, satisfying `u: Users`.
+// `with` makes its receiver the implicit receiver satisfying `u: Users`.
 test "t03_contextual_property_getter" {
     const src =
         \\class Users { fun byId(i: Int) = "User $i" }
@@ -236,7 +236,7 @@ test "t13_contextof_through_contextual_function_type" {
     try assertKlio("t13", src, "go\n");
 }
 
-// A fully-positional call splits its leading arguments onto the context stack.
+// A fully-positional call passes its leading arguments as the contexts.
 test "t14_invocation_contextual_function_type" {
     const src =
         \\fun call(f: context(String, Int) (Boolean) -> Unit) {

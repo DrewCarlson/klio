@@ -95,6 +95,42 @@ pub fn classDefName(d: ObjRef(ClassDef)) []const u8 {
     return g.get().name;
 }
 
+/// One bit per primary-constructor parameter that declares a `fun
+/// interface`. Single-fill on the class, because the answer cannot change.
+///
+/// The declared type heads are copied out under the guard and resolved
+/// after it is released: `classDefByName` borrows the class table, and
+/// holding this def's guard across that is a lock order this code does not
+/// otherwise take.
+pub fn ctorSamMask(self: *VmHost, class_def: ObjRef(ClassDef)) u32 {
+    {
+        const g = class_def.borrow();
+        defer g.deinit();
+        if (g.get().ctor_sam_state.load(.acquire) == 1) return g.get().ctor_sam_mask.load(.acquire);
+    }
+    var heads: [32]?[]const u8 = @splat(null);
+    var n: usize = 0;
+    {
+        const g = class_def.borrow();
+        defer g.deinit();
+        n = @min(g.get().primary_params.len, 32);
+        for (g.get().primary_params[0..n], 0..) |*pp, i| heads[i] = pp.declared_type;
+    }
+    var mask: u32 = 0;
+    for (heads[0..n], 0..) |head_opt, i| {
+        const dt = head_opt orelse continue;
+        if (dt.len == 0 or std.mem.startsWith(u8, dt, "Function")) continue;
+        const pd = classDefByName(self, dt) orelse continue;
+        defer pd.deinit();
+        if (classDefIsFunInterface(pd)) mask |= @as(u32, 1) << @intCast(i);
+    }
+    const g = class_def.borrowMut();
+    defer g.deinit();
+    g.get().ctor_sam_mask.store(mask, .release);
+    g.get().ctor_sam_state.store(1, .release);
+    return mask;
+}
+
 pub fn classDefFqn(d: ObjRef(ClassDef)) []const u8 {
     const g = d.borrow();
     defer g.deinit();
@@ -273,6 +309,17 @@ pub fn funcParamHasDefault(self: *VmHost, fid: FuncId, idx: usize) bool {
 
 /// Returns null to fall through to the primary-ctor path.
 pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value) Allocator.Error!?EvalResult {
+    return dispatchSecondaryCtorForced(self, allocator, class, class_def, args, outer_hint, null, null);
+}
+
+/// `forced` names the secondary the SITE resolved, as an index into the
+/// class's declaration-order list. The scoring below is skipped for it: the
+/// question it answers was already answered at lowering.
+///
+/// `took` receives the index this call settled on. It is an out-parameter
+/// rather than a thread slot because a delegating constructor re-enters here,
+/// and the caller must read its own answer, not the delegation's.
+pub fn dispatchSecondaryCtorForced(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value, forced: ?usize, took: ?*?usize) Allocator.Error!?EvalResult {
     const ctor_keepalive = self.ka.mark();
     defer self.ka.restore(ctor_keepalive);
     self.ka.pushSlice(args);
@@ -282,13 +329,15 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
     // A defaulted secondary is a candidate only when the primary cannot take the call.
     const primary_takes = primaryCanTake(self, class_def, args.len);
-    var chosen: ?root.build.SecondaryCtorEntry = if (primary_takes)
+    var chosen: ?root.build.SecondaryCtorEntry = if (forced) |fi|
+        (if (fi < entries.len) entries[fi] else null)
+    else if (primary_takes)
         chooseSecondaryCtor(self, entries, args)
     else
         chooseSecondaryCtorDefaulted(self, entries, args);
     // Below constructs further values; the site's heads describe this call.
     common.ctor_static_heads = null;
-    if (chosen == null) {
+    if (chosen == null and forced == null) {
         for (entries) |e| {
             // A hidden binary-compat ctor must not swallow a call the primary serves.
             if (e.low_priority) continue;
@@ -318,6 +367,17 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
         }
     }
     const entry = chosen orelse return null;
+    if (took) |slot| {
+        slot.* = null;
+        for (entries, 0..) |*e, i| {
+            if (e.param_count == entry.param_count and e.body == entry.body and
+                e.param_names.ptr == entry.param_names.ptr)
+            {
+                slot.* = i;
+                break;
+            }
+        }
+    }
     const packed_args: ?[]Value = try packSecondaryVarargs(self, allocator, entry, args);
     defer if (packed_args) |pk| allocator.free(pk);
     const sargs: []const Value = packed_args orelse args;
@@ -690,8 +750,13 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
 
     // Implicit SAM conversion at the constructor boundary: a raw callable bound
     // to a fun-interface parameter wraps, so its method binds through the class.
+    // Which parameters those are is a property of the CLASS, so it is decided
+    // once; asking per construction resolved every declared type by name,
+    // including types that name no class and could only ever miss.
+    const sam_mask = ctorSamMask(self, class_def);
     for (effective.items, 0..) |a, i| {
         if (a != .IrClosure) continue;
+        if (i >= 32 or sam_mask & (@as(u32, 1) << @intCast(i)) == 0) continue;
         const declared: ?[]const u8 = blk: {
             const dg = class_def.borrow();
             defer dg.deinit();
@@ -699,7 +764,6 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             break :blk null;
         };
         const dt = declared orelse continue;
-        if (dt.len == 0 or std.mem.startsWith(u8, dt, "Function")) continue;
         const pd = classDefByName(self, dt) orelse continue;
         defer pd.deinit();
         if (!classDefIsFunInterface(pd)) continue;

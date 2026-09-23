@@ -81,7 +81,7 @@ pub fn invokeMemberExtFuncId(
     if (funcAt(mod, fid) == null) {
         return .{ .err = .{ .Type = "resolved member target is missing" } };
     }
-    ir.eval.pushEnclosing(dispatch_receiver);
+    ir.eval.pushDispatch(dispatch_receiver);
     defer ir.eval.popEnclosing();
     return try callFuncRec(self, allocator, mod, fid, all);
 }

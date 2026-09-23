@@ -2216,6 +2216,27 @@ test "infer_call_return_propagates_arg_type" {
     try testing.expect(!c.hasErrors());
 }
 
+test "infer_generic_return_from_lambda_class_result" {
+    // `rem { Box() }` solves `T` from the lambda's result, a class the
+    // checker does not model: the name it carries is the solution, and the
+    // call's class evidence names `Box`.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const box = b.class("Box");
+    var rem = b.funExpr("rem", &.{b.param("calc", b.tyFun(&.{}, b.ty("T")))}, b.ty("T"), b.call(b.path("calc"), &.{}));
+    rem.type_params = b.slice(TypeParam, &.{b.typeParam("T")});
+    const make = b.call(b.path("rem"), &.{b.lambda(&.{}, &.{b.exprStmt(b.call(b.path("Box"), &.{}))})});
+    const main = b.funBlock("main", &.{}, null, &.{
+        b.valDecl("x", null, make),
+    });
+    const f = b.file(&.{ .{ .Class = box }, .{ .Function = rem }, .{ .Function = main } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(!c.hasErrors());
+    const cls = c.tc.expr_class.get(make.Call.span) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("Box", cls);
+}
+
 test "opt_in_marker_propagates" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();

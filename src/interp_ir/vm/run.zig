@@ -14,6 +14,8 @@ const stdlib = @import("stdlib");
 const root = @import("../interp_ir.zig");
 const build = @import("../build.zig");
 const vmhost = @import("vmhost.zig");
+const super_chain = @import("host_instances/super_chain.zig");
+const ctor_path = @import("host_instances/ctor_path.zig");
 const trace = @import("trace.zig");
 
 const Allocator = std.mem.Allocator;
@@ -68,6 +70,69 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
     };
 }
 
+/// Resolve every class's runtime `ClassDef` by id, here, where the module and
+/// the class table are both in hand for the only time.
+///
+/// Filling on first construction instead left one name probe per class — the
+/// audit reported it as `class=Plain probes=1` — and "never re-derives by
+/// name" is not "re-derives once". The cost is two map lookups per declared
+/// class, once, against a construction path that then never consults a name.
+/// Fill every class's first-non-interface-supertype memo here rather than at
+/// its first construction.
+///
+/// The memo is single-fill and cheap after that, but filling it resolves
+/// supertypes BY NAME, and doing so during execution is the runtime deriving
+/// a target from a string — once per class, but during a run. Every other
+/// memo this campaign added is built by a link pass for the same reason.
+fn primeSuperMemos(vm: *Vm, out: Output) void {
+    if (std.c.getenv("KLIO_SUPER_MEMO_LINK")) |v| {
+        if (v[0] == '0') return;
+    }
+    var host = vmMakeHost(vm, out);
+    const cg = vm.classes.borrow();
+    defer cg.deinit();
+    var it = cg.get().valueIterator();
+    while (it.next()) |d| {
+        _ = super_chain.firstNonInterfaceSuper(&host, d.*);
+        // Same reason: deciding which primary-ctor parameters take a SAM
+        // conversion resolves their declared types by name.
+        _ = ctor_path.ctorSamMask(&host, d.*);
+    }
+}
+
+fn fillClassDefsAtLink(allocator: Allocator, vm: *Vm) Allocator.Error!void {
+    // `KLIO_CTOR_ID_LINK=0` leaves the table to fill on first construction,
+    // which is also how `KLIO_CTOR_NAME_AUDIT` is shown to fire at all: with
+    // it off the audit reports `probes=1` for a class's first construction.
+    if (std.c.getenv("KLIO_CTOR_ID_LINK")) |v| {
+        if (v[0] == '0') return;
+    }
+    const mod_id = @intFromPtr(vm.module.asPtrConst());
+    const mg = vm.module.borrow();
+    defer mg.deinit();
+    const classes = mg.get().classes.items;
+    const cg = vm.classes.borrow();
+    defer cg.deinit();
+    const table = cg.get();
+    const pg = vm.prog.borrowMut();
+    defer pg.deinit();
+    const img = pg.get();
+    img.clearClassDefsById();
+    try img.class_defs_by_id.ensureTotalCapacity(allocator, classes.len);
+    for (classes) |*c| {
+        const found = table.get(c.fqn) orelse table.get(c.name);
+        img.class_defs_by_id.appendAssumeCapacity(if (found) |d| d.clone() else null);
+    }
+    img.class_defs_module_identity = mod_id;
+    if (std.c.getenv("KLIO_CTOR_NAME_PROBE") != null) {
+        var found_n: usize = 0;
+        for (img.class_defs_by_id.items) |slot| {
+            if (slot != null) found_n += 1;
+        }
+        std.debug.print("[ctor-link-fill] classes={d} resolved={d}\n", .{ classes.len, found_n });
+    }
+}
+
 pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Error!struct { vm: Vm, main: ?FuncId } {
     var vm = try vmNew(allocator, built.module.clone());
     vm.classes.deinit();
@@ -75,6 +140,7 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
     const taken = built.classes;
     built.classes = ClassTable.init(allocator);
     vm.classes = try ObjRef(ClassTable).init(allocator, taken);
+    try fillClassDefsAtLink(allocator, &vm);
 
     // Copy the enum-entry thunks rather than move the list: the built list is arena-owned
     // and the Vm frees its containers with the VM allocator, which misreads that buffer.
@@ -95,6 +161,23 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         // The Vm owns the ordered list; the image borrows its slice for per-file clinit.
         prog.top_level_props_ordered = vm.top_level_props.items;
         vm.base_top_level_props = built.base_top_level_props;
+    }
+    // Number the root scope's top-level properties: a slotted read addresses
+    // the binding by index, and the by-name path only ever initialises it.
+    {
+        const reg = &vm.module.asPtr().registry;
+        const g = vm.globals.borrowMut();
+        defer g.deinit();
+        const root_env = g.get();
+        if (root_env.slots.len != 0) allocator.free(root_env.slots);
+        root_env.slots = try allocator.alloc(?Value, reg.top_level_prop_slot_count);
+        @memset(root_env.slots, null);
+        root_env.slot_of = &reg.top_level_prop_slots;
+    }
+    {
+        const pg = vm.prog.borrowMut();
+        defer pg.deinit();
+        const prog = pg.get();
 
         // Move each dispatch-time side table into the image, swapping a fresh empty in.
         prog.body_prop_inits.deinit();
@@ -355,6 +438,10 @@ pub fn gcUnregisterVm(vm: *const Vm) void {
 
 pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     gcRegisterVm(self);
+    // Before the program runs, not during it: filling this memo resolves
+    // supertypes by name, and a name resolved while executing is the thing
+    // the census counts against the construction site.
+    primeSuperMemos(self, out);
     // Stream output from here so a run that hangs or is killed still shows its prints.
     self.out_sink.attach(out);
     // Close the permanent generation: cells minted up to here are immortal and
@@ -585,7 +672,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
             if (by_id) |want| {
                 if (df.id.int() != want) continue;
             } else if (!std.mem.eql(u8, df.name, w)) continue;
-            std.debug.print("[dumpfn] {s}#{d} blocks={d}\n", .{ df.fqn, df.id.int(), df.blocks.len });
+            std.debug.print("[dumpfn] {s}#{d} blocks={d} recv_ty={?s} owner={?s} label={?s} ncaps={d} params={d}\n", .{ df.fqn, df.id.int(), df.blocks.len, df.x().lambda_receiver_ty, df.x().lexical_owner, df.x().implicit_label, df.x().capture_order.len, df.params.len });
             for (df.blocks, 0..) |blk, bi| {
                 std.debug.print("[dumpfn] b{d}: catches={d} fin={?} fin_done={?} done_for={?} pop={d}\n", .{
                     bi,
@@ -647,14 +734,21 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                                     break :blk cs[cm.name.int()].String;
                                 break :blk "?";
                             };
-                            std.debug.print("[dumpfn]   CallMember dst=r{d} recv=r{d} name={s} n={d} trailing={} static_recv={} declared_recv={} resolved={?d}\n", .{
+                            const head_of = struct {
+                                fn f(consts: []const ir.Const, id: ?ir.ConstId) []const u8 {
+                                    const c = id orelse return "-";
+                                    if (c.int() < consts.len and consts[c.int()] == .String) return consts[c.int()].String;
+                                    return "?";
+                                }
+                            }.f;
+                            std.debug.print("[dumpfn]   CallMember dst=r{d} recv=r{d} name={s} n={d} trailing={} static_recv={s} declared_recv={s} resolved={?d}\n", .{
                                 cm.dst.int(),
                                 cm.receiver.int(),
                                 nm,
                                 cm.n_args,
                                 cm.x().trailing_lambda,
-                                cm.x().static_recv != null,
-                                cm.x().declared_recv != null,
+                                head_of(dmg.get().consts.items, cm.x().static_recv),
+                                head_of(dmg.get().consts.items, cm.x().declared_recv),
                                 if (cm.x().resolved) |r| r.int() else null,
                             });
                         },

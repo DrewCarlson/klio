@@ -19,6 +19,23 @@ per stage, not per edit.
 - Non-ReleaseSafe harness builds get their own names so they can never
   shadow the sweep binary.
 
+## A dual-compute audit needs stderr, and its own control
+
+Two ways an audit sweep reads clean while finding nothing:
+
+- **The harness drops the channel.** Audits print to stderr;
+  `scripts/corpus_check.py` compares stdout and used to discard stderr
+  entirely. Pass `--grep-stderr <substring>` to echo matching lines, and
+  `KLIO_SWEEP_GREP=<regex>` for `scripts/commontest-sweep.py`. Without one of
+  those, an audit sweep over either corpus measures nothing.
+- **The comparator asks the wrong question.** Comparing two heap values by
+  identity is right for a claim about a CELL and wrong for one about a CALL:
+  an accessor that builds its answer (`get() = NodeKind(...)`) returns a
+  different object every time, and both are correct. Run the discovery path
+  TWICE first; where it disagrees with itself the read is not idempotent and
+  the comparison is meaningless, so skip it rather than report it.
+
+
 ## Steps by scope
 
 | Question | Command | Cost |
@@ -80,7 +97,15 @@ stale packs.
   five times slower per child.
 - Never rebuild `zig-out/bin/klio-harness` (and never `git stash`) while a
   lane is using it; build to another prefix (`zig build klio-harness
-  --prefix <dir>`) to test an edit alongside running lanes.
+  --prefix <dir>`) to test an edit alongside running lanes. The failure mode
+  is silence, not an error: a sweep execs the harness hundreds of times, so a
+  rebuild part-way through measures two different binaries and reports a
+  clean-looking number that is wrong. A candidate criterion measured 0
+  divergences and then 5 from an identical tree this way. Before a sweep that
+  has to be trusted, snapshot what you are measuring — `cp
+  zig-out/bin/klio-harness zig-out/lib/libklio_skia.dylib /tmp/snap/` and pass
+  the copy — and treat a number that moves between two runs of one tree as a
+  measurement bug, not a flake.
 - A ratchet's `BASELINE` is the measured pass floor and `MAX_FAILED` the
   measured failure ceiling with no slack; count `[box-crash]` lines as well
   as `[box-fail]` lines when clustering a census.
@@ -99,3 +124,35 @@ stale packs.
 - When CI is red, `gh run view <id> --log-failed` names the failing
   suite and tests; reproduce with the matching census or suite locally
   before changing anything.
+
+## The resolution ratchet
+
+`plans/resolution-ceiling.json` records, per unresolved site kind, how many
+sites the corpus holds. The gate's `ratchet` phase re-runs the census and
+fails when any kind is ABOVE its entry, or when a kind absent from the file
+appears at all.
+
+    KLIO_HOME=$PWD/.klio-local python3 scripts/site-census-sweep.py \
+      --timeout 180 --ceiling plans/resolution-ceiling.json
+
+A kind that FELL is reported and passes: lower its entry in the same commit
+that lowered it, with `--write-ceiling`. A kind that ROSE fails, and the fix
+is to stop re-deriving that target by name — not to raise the number. If a
+rise is genuinely intended, say why in `plans/resolved-interpreter.md` and
+re-record.
+
+The counts are summed per program over a pinned program set, so the ceiling
+carries the program count and refuses to compare against a different one.
+
+The phase runs `--cold`, clearing the bake cache first, and the ceiling
+records which state it was taken in. A WARM sweep counts 23 more unresolved
+sites than a cold one, because resolution a fresh lowering reaches does not
+entirely survive the image round-trip, and the two are refused against each
+other.
+
+The TOTAL is checked exactly and is stable cold. The per-kind split drifts
+by a few even cold — six sites trade between `call_member_by_name` and
+`call_new_instance` at an unchanged total, a classification flipping on
+whether a class was registered when the site was classified, which depends on
+the body pool's shard order — so a kind may rise by `max(64, ceiling/1000)`
+without failing, reported as `drift`. A real regression moves the total.

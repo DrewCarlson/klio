@@ -353,7 +353,7 @@ const slotNameOrNull = slot_ops.slotNameOrNull;
 
 const virtual_tail = @import("host_call_member/virtual_tail.zig");
 pub const invokeVirtualMember = virtual_tail.invokeVirtualMember;
-const invokeMethodFuncId = virtual_tail.invokeMethodFuncId;
+pub const invokeMethodFuncId = virtual_tail.invokeMethodFuncId;
 const methodArgSigRelaxed = virtual_tail.methodArgSigRelaxed;
 const instanceMethodKeyRelaxed = virtual_tail.instanceMethodKeyRelaxed;
 const methodArgSig = virtual_tail.methodArgSig;
@@ -467,6 +467,15 @@ const extensionFnFallbackWalk = ext_fallback.extensionFnFallbackWalk;
 const maybeWarnLenientExtBind = ext_fallback.maybeWarnLenientExtBind;
 pub const resetLenientWarned = ext_fallback.resetLenientWarned;
 pub const memberExtOwnerInstance = ext_fallback.memberExtOwnerInstance;
+
+/// The dispatch receiver a member-extension frame derives for itself when no
+/// caller handed one over: the innermost enclosing instance of its owner class,
+/// off the frame's own extension receiver.
+pub fn memberExtOwnerInstanceFor(self: *VmHost, allocator: Allocator, module: *const Module, func: *const ir.Func, params: []const Value) Allocator.Error!?Value {
+    if (func.kind != .member_extension or params.len == 0) return null;
+    const owner = module.registry.member_ext_owner_class.get(func.id) orelse return null;
+    return memberExtOwnerInstance(self, allocator, &params[0], owner);
+}
 const instanceOuterLink = ext_fallback.instanceOuterLink;
 const ExtKey = ext_fallback.ExtKey;
 const extKeyGreater = ext_fallback.extKeyGreater;
@@ -517,12 +526,7 @@ const firstSupertypeName = member_ref_super.firstSupertypeName;
 const receiverPropCanHoldCallable = member_ref_super.receiverPropCanHoldCallable;
 const classIsFunInterface = member_ref_super.classIsFunInterface;
 const classIsInterface = member_ref_super.classIsInterface;
-const supertypesClassFirst = member_ref_super.supertypesClassFirst;
-const classIsRegistered = member_ref_super.classIsRegistered;
-const ownerSupertypeBySuffix = member_ref_super.ownerSupertypeBySuffix;
-const ownerHasSupertype = member_ref_super.ownerHasSupertype;
-const emitSuperPath = member_ref_super.emitSuperPath;
-pub const callSuper = member_ref_super.callSuper;
+pub const anyMember = member_ref_super.anyMember;
 const qtTraceWant = member_ref_super.qtTraceWant;
 pub const qualifiedThis = member_ref_super.qualifiedThis;
 pub const serializerForClassTarget = member_ref_super.serializerForClassTarget;
@@ -813,6 +817,21 @@ pub fn callFuncIndexedRec(
     const r = host_call_func.callFuncIndexed(self, allocator, module, func, defaults_from, receiver, args, arg_params);
     host_call_func.setTrailingLambdaCall(false);
     return r;
+}
+
+/// The PACK-installed binding for `fqn`, if any. Narrower than
+/// `lookupIntrinsic`, which also answers from the shipped table: a shipped
+/// implementation beside a body-bearing declaration is the ordinary case and
+/// the body wins, while an installed binding is the pack replacing it.
+pub fn installedBindingFor(self: *VmHost, fqn: []const u8) ?StdlibFn {
+    const img = self.prog.asPtrConst();
+    if (@atomicLoad(bool, &img.resolved_linked, .acquire))
+        return img.installed_bindings.asPtrConst().resolve(fqn);
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    const bg = pg.get().installed_bindings.borrow();
+    defer bg.deinit();
+    return bg.get().resolve(fqn);
 }
 
 /// A pack-installed binding shadows the shipped implementation.

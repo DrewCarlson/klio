@@ -7,6 +7,8 @@ const runtime = @import("runtime");
 const ir = @import("../../ir.zig");
 const build = @import("../../build.zig");
 const helpers = @import("../helpers.zig");
+const call_general = @import("call_general.zig");
+const emit_mod = @import("emit.zig");
 const lambda_body = @import("../lambda_body.zig");
 
 const Allocator = std.mem.Allocator;
@@ -514,6 +516,13 @@ pub fn lowerSelectedLocalOverloadCall(
         }
     }
     const lfp: ?[]const ?[]const u8 = if (allNull(ast_arg_names)) b.localFnParamTys(mangled) else null;
+    // The trailing block's shape is the local function's declared one.
+    if (args.len != 0 and allNull(ast_arg_names) and (args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun)) {
+        if (b.localFnBlockRecv(mangled)) |recv| {
+            const sp = args[args.len - 1].span();
+            if (recv) |r| try b.recordLambdaArgRecvOwned(sp, try r.clone(b.allocator)) else b.recordLambdaArgNoRecv(sp);
+        }
+    }
     const run = try lowerArgRunFull(b, args, null, lfp);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
@@ -525,6 +534,10 @@ pub fn lowerSelectedLocalOverloadCall(
             }
         }
     }
+    // A local declared as a function of this arity is invocable, so the
+    // member the hierarchy declares can never take the call and the site is
+    // a plain value invoke.
+    if (member_declared and call_general.localIsCallableAt(b, bare, args.len)) member_declared = false;
     if (member_declared) {
         if (try resolveThisForBareCallNoBind(b)) |this_reg| {
             const name = try b.module.internConst(b.allocator, .{ .String = bare });
@@ -552,6 +565,38 @@ pub fn lowerSelectedLocalOverloadCall(
 }
 
 /// A single-name callee bound as a local / parameter / receiver-lambda-param.
+/// Scalar and string classifiers, which declare no `invoke` operator.
+///
+/// Asking the class table is no use: an intrinsic-backed class answers "yes"
+/// to every member query, which is the right conservative answer for
+/// dispatch and useless as a negative test. That these carry no `invoke` is
+/// a fact about Kotlin rather than about the table.
+const no_invoke_heads = [_][]const u8{
+    "Int",     "Long", "Short",  "Byte", "Double", "Float",
+    "Boolean", "Char", "String", "UInt", "ULong",  "UShort",
+    "UByte",
+};
+
+fn localCannotBeInvoked(b: *FuncBuilder, name: []const u8) bool {
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_LOCAL_UNCALLABLE") orelse "1", "0")) return false;
+    const ty = b.localDeclType(name) orelse return false;
+    const head = std.mem.trimEnd(u8, ty, "?");
+    if (std.mem.startsWith(u8, head, "Function")) return false;
+    if (std.mem.find(u8, head, "function") != null) return false;
+    const simple = if (std.mem.findScalarLast(u8, head, '.')) |i| head[i + 1 ..] else head;
+    for (no_invoke_heads) |h| {
+        if (std.mem.eql(u8, h, simple)) return true;
+    }
+    // An INTERPRETED class answers this honestly. An intrinsic-backed one or
+    // a stub says yes to every member query, so only a class with a real
+    // declaration table can be asked whether it carries `invoke`.
+    const cid = b.module.classIdByFqn(head) orelse b.module.uniqueClassIdBySimpleName(simple) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const c = &b.module.classes.items[cid.int()];
+    if (c.is_intrinsic_backed or c.is_stub) return false;
+    return !b.module.classHierarchyDeclaresMember(cid, "invoke");
+}
+
 pub fn lowerValueInvocation(
     b: *FuncBuilder,
     callee: *const Expr,
@@ -668,8 +713,32 @@ pub fn lowerValueInvocation(
                 }
             }
         }
+        if (call_general.localIsCallableAt(b, name0, args.len) or call_general.localIsFunInterface(b, name0)) break :blk false;
         break :blk member_declared and b.resolve(name0) != null and !b.isLocalExtFn(name0);
     };
+    // A local typed as a classifier with no `invoke` cannot take the call,
+    // so the member is the only candidate. The member path has to be ENTERED,
+    // not fallen into: declining here reaches an arm that invokes the local
+    // anyway, which is the thing just ruled out.
+    if (redirect_to_member and localCannotBeInvoked(b, name0)) {
+        if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+            if (b.ownerClass()) |oc| {
+                if (emit_mod.declaredSlotOn(b, oc, name0, args.len)) |fid| {
+                    const run2 = try lowerArgRun(b, args);
+                    const d2 = b.allocReg();
+                    orEmitAudit(b, "cvom_redirect_member", "CallVirtual", name0);
+                    try b.push(.{ .CallVirtual = .{
+                        .dst = d2,
+                        .receiver = this_reg,
+                        .slot = ir.MethodSlotId.fromFunc(fid),
+                        .args = run2[0],
+                        .n_args = run2[1],
+                    } });
+                    return d2;
+                }
+            }
+        }
+    }
     if (redirect_to_member) {
         if (try resolveThisForBareCallNoBind(b)) |this_reg| {
             var callee_reg = b.resolve(name0).?;

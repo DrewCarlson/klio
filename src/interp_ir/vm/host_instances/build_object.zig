@@ -81,6 +81,7 @@ const funcAt = ctor_select.funcAt;
 const nextInstanceId = ctor_select.nextInstanceId;
 const trivialInitServe = ctor_select.trivialInitServe;
 
+const materialize = @import("materialize.zig");
 const super_chain = @import("super_chain.zig");
 const ChainEntry = super_chain.ChainEntry;
 const bindThrowableArgs = super_chain.bindThrowableArgs;
@@ -870,7 +871,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             // A superclass ctor call may select a secondary constructor; expanding
             // it before padding gives the primary's fields the delegated values.
             var obj_super_args: ?std.ArrayList(Value) = null;
-            switch (try expandParentSecondaryThisArgs(self, allocator, classDefFqn(pdef), classDefName(pdef), &ordered, null, &obj_bodies_run, &obj_super_args)) {
+            switch (try expandParentSecondaryThisArgs(self, allocator, classDefFqn(pdef), classDefName(pdef), &ordered, null, &obj_bodies_run, &obj_super_args, pdef)) {
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
@@ -1165,7 +1166,17 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             }
         }
     }
+    auditLayout(self, allocator, inst_value);
     return .{ .ok = inst_value };
+}
+
+/// `KLIO_LAYOUT_AUDIT`: compare the instance just built against the layout its
+/// class would have if storage were fixed at link time. Diagnostic only.
+fn auditLayout(self: *VmHost, allocator: Allocator, inst_value: Value) void {
+    if (!root.class_layout.auditOn()) return;
+    if (inst_value != .Instance) return;
+    const ctx = materialize.layoutCtx(self, allocator);
+    root.class_layout.audit(&ctx, inst_value.Instance);
 }
 
 /// Run one lowered anon-object thunk with `capture_pairs` layered over globals.

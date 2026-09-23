@@ -261,7 +261,7 @@ pub fn serveCachedMemberExt(self: *VmHost, allocator: Allocator, receiver: *cons
     }
     const all = try prependReceiver(allocator, receiver, args);
     defer if (runtime.freeScratch()) allocator.free(all);
-    ir.eval.pushEnclosing(&inst);
+    ir.eval.pushDispatch(&inst);
     const r = try callFuncRec(self, allocator, mod, fid, all);
     ir.eval.popEnclosing();
     mg.deinit();
@@ -270,6 +270,17 @@ pub fn serveCachedMemberExt(self: *VmHost, allocator: Allocator, receiver: *cons
 
 pub fn extFbCounts() [4]u64 {
     return .{ hcm.ext_fb_total, hcm.ext_fb_plain_hit, hcm.ext_fb_chain_hit, hcm.ext_fb_walk };
+}
+
+/// `KLIO_EXT_AUDIT`: report the site whose stamped pick this serve answers.
+/// Called wherever an extension declaration is chosen — the candidate walk and
+/// each cache that replays its verdict — so a cached answer is audited as the
+/// decision it repeats.
+pub fn noteExtServed(self: *VmHost, fid: FuncId, name: []const u8) void {
+    if (!ir.eval.extAuditArmed()) return;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    ir.eval.extAuditServed(mg.get(), fid, name);
 }
 
 pub fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
@@ -289,6 +300,7 @@ pub fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const
             hcm.ext_fb_plain_hit += 1;
             if (fid == METHOD_MISS) return null;
             if (missTraceWant(name)) std.debug.print("[extfb] PLAIN-HIT fid={d} name={s} member_ext={}\n", .{ fid, name, isMemberExtFid(self, @enumFromInt(fid)) });
+            noteExtServed(self, @enumFromInt(fid), name);
             if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
         }
     }
@@ -306,6 +318,7 @@ pub fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const
             hcm.ext_fb_chain_hit += 1;
             if (fid == METHOD_MISS) return null;
             const f: FuncId = @enumFromInt(fid);
+            noteExtServed(self, f, name);
             if (isMemberExtFid(self, f)) {
                 if (try serveCachedMemberExt(self, allocator, receiver, f, args)) |r| return r;
             } else if (try invokeMethodFuncId(self, allocator, receiver, f, args)) |r| return r;
@@ -571,7 +584,11 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                     // reflection heads outrank the class-shaped hint.
                     const class_reflection_proves = receiver.* == .Class and
                         receiver.isRuntimeType(simpleName(rty.name));
-                    const runtime_proves = !self_repick and
+                    // A null receiver carries no type, so every nullable-receiver
+                    // candidate proves against it equally. Reading that as proof
+                    // lets an arbitrary one outrank the declared head, which is
+                    // the only evidence a null value leaves.
+                    const runtime_proves = !self_repick and receiver.* != .Null and
                         (committedExtReceiverProven(self, allocator, c.fid, receiver) or
                             class_reflection_proves);
                     if (!is_companion_recv and !runtime_proves and staticReceiverApplicable(self, allocator, dn, c.fid, rty) == false) {
@@ -830,6 +847,16 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                 },
             });
         }
+        // `KLIO_EXT_AUDIT`: the declaration this walk actually serves, so a
+        // sweep can join it against the one lowering would have committed.
+        if (runtime.envOnce("KLIO_EXT_AUDIT") != null) {
+            std.debug.print("[KLIO_EXT_AUDIT] ran name={s} recv={s} fqn={s}\n", .{
+                name,
+                static_recv orelse declared_recv orelse receiver.typeFqn(),
+                c.func.fqn,
+            });
+            noteExtServed(self, c.fid, name);
+        }
         const all = try prependReceiver(allocator, receiver, args);
         defer if (runtime.freeScratch()) allocator.free(all);
         const mg = self.module.borrow();
@@ -851,7 +878,7 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                     }
                 }
                 if (sam_target == null) {
-                    ir.eval.pushEnclosing(&inst);
+                    ir.eval.pushDispatch(&inst);
                     pushed_owner = true;
                 }
             }

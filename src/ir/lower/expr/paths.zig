@@ -27,6 +27,8 @@ const expr_mod = @import("../expr.zig");
 const lowerExpr = expr_mod.lowerExpr;
 
 const emit_mod = @import("emit.zig");
+const implicit_walk = @import("implicit_walk.zig");
+const member_call_mod = @import("member_call.zig");
 const classIdAtLexicalSite = emit_mod.classIdAtLexicalSite;
 const emitFqnWithClassPrefix = emit_mod.emitFqnWithClassPrefix;
 const narrowedThisDeclares = emit_mod.narrowedThisDeclares;
@@ -38,6 +40,7 @@ const lateinitLocalRead = type_probe_mod.lateinitLocalRead;
 const lowerDelegateRead = type_probe_mod.lowerDelegateRead;
 
 const probe_mod = @import("probe.zig");
+const static_type_mod = @import("static_type.zig");
 const anyReceiverClassDeclares = probe_mod.anyReceiverClassDeclares;
 const inReceiverContext = probe_mod.inReceiverContext;
 const ownCompanionNamed = probe_mod.ownCompanionNamed;
@@ -292,7 +295,12 @@ pub fn loweredTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8
 pub fn loweredOwnedLocalTypeRef(b: *const FuncBuilder, ty: *const ast.TypeRef) Allocator.Error!TypeRef {
     var lowered = try decl_mod.loweredTypeRef(b.allocator, ty, true);
     errdefer lowered.deinit(b.allocator);
-    const resolved_head = loweredTypeName(b, ty);
+    // A function type is already spelled `FunctionN` by the lowering above,
+    // and the head resolution below is for mangled nested classes and scope
+    // renames — neither of which a function type has. Overwriting it put
+    // `<function>` in place of the arity, and the arity is the whole content:
+    // `lateinit var fib: (Int) -> Long` recorded a type nothing could test.
+    const resolved_head = if (ty.function != null) lowered.name else loweredTypeName(b, ty);
     if (!std.mem.eql(u8, lowered.name, resolved_head)) {
         const owned_head = try b.allocator.dupe(u8, resolved_head);
         b.allocator.free(lowered.name);
@@ -424,6 +432,10 @@ fn bareAliasTargetName(b: *FuncBuilder, seg: *const ast.Ident) ?[]const u8 {
         if (p.segs.len == 0) continue;
         const target = p.segs[p.segs.len - 1];
         if (std.mem.eql(u8, target, seg.name)) continue;
+        // A member of a CLASS is not loadable by its bare name: `import
+        // Dir.East as Sunrise` binds `Dir.East`, and reading `East` as a global
+        // finds nothing. The qualified rewrite owns that shape.
+        if (p.segs.len >= 2 and b.module.classId(p.segs[p.segs.len - 2]) != null) continue;
     // The import itself is the evidence: the target may be a compiler intrinsic
     // with no registry row.
         return target;
@@ -508,7 +520,7 @@ fn lowerBareName(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!R
     if (try tryLambdaCapture(b, name0)) |r| return r;
     if (try tryUnboundIt(b, segments)) |r| return r;
     if (try tryCoroutineContextMember(b, name0)) |r| return r;
-    if (try tryOwnMemberRead(b, name0)) |r| return r;
+    if (try tryOwnMemberRead(b, name0, segments[0].span.file)) |r| return r;
     if (try tryOwnCompanionRead(b, segments)) |r| return r;
     if (try tryAnonScopeClass(b, name0)) |r| return r;
     if (try tryTopLevelConstInline(b, segments)) |r| return r;
@@ -646,14 +658,28 @@ fn tryCoroutineContextMember(b: *FuncBuilder, name0: []const u8) Allocator.Error
 /// Member read on `this` when the owning class declares the name. A
 /// companioned class name is its companion singleton, and a nested classifier
 /// is a class reference, so both are excepted.
-fn tryOwnMemberRead(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+fn tryOwnMemberRead(b: *FuncBuilder, name0: []const u8, file: ir.FileId) Allocator.Error!?Reg {
     if (b.hasOwnMember(name0) and !classWithCompanion(b, name0) and
         !spliceSubjectHidesOwnMember(b, name0))
     {
         if (b.resolve("this")) |this_reg| {
             const dst = b.allocReg();
             const nm = try sgetterName(b, name0);
-            try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
+            const claim = ownMemberSlot(b, name0, file);
+            // The receiver is `this`, so the class is the owner whether or not
+            // the SLOT claim held. Recording it only on a claim left the
+            // accessor cases with no class at all, and `linkGetterRoutes`
+            // reads `own_cls` to find a getter or a property slot — so a
+            // read the slot could not answer was not offered to the passes
+            // that exist for exactly that.
+            try b.push(.{ .GetField = .{
+                .dst = dst,
+                .receiver = this_reg,
+                .field = nm,
+                .own_cls = if (claim) |c| c.cls else emit_mod.ownerClassIdOf(b, file),
+                .own_kind = if (claim != null) .slot else .none,
+                .own_slot = if (claim) |c| c.slot else 0,
+            } });
             return dst;
         }
     // Superclass-ctor delegation thunk: a bare own-member is a companion access.
@@ -770,21 +796,30 @@ fn tryClassReference(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Err
     {
         const n = try b.module.internConst(b.allocator, .{ .String = name0 });
         const cls = b.allocReg();
-        if (inReceiverContext(b)) {
+        const scoped = try scopedClassIdForRead(b, name0, segments[0].span.file);
+        const class_walk: implicit_walk.Verdict = if (inReceiverContext(b) and classRefNeedsReceiverWalk(b, name0))
+            try implicit_walk.walk(b, name0, null, .property, "class_name_value")
+        else
+            .global;
+        if (class_walk == .member) {
+            orEmitAudit(b, "class_name_walked", "GetField", name0);
+            const r = try implicit_walk.emitRead(b, class_walk.member, name0);
+            try b.push(.{ .Move = .{ .dst = cls, .src = r } });
+        } else if (class_walk == .undecided) {
             const this_idx = try b.recordCapture("this");
             orEmitAudit(b, "class_name_value", "LoadFromThisOrGlobal", name0);
             try b.push(.{ .LoadFromThisOrGlobal = .{
                 .dst = cls,
                 .this_idx = this_idx,
                 .name = n,
-                .class = scopedClassIdForRead(b, name0, segments[0].span.file),
+                .class = scoped,
             } });
         } else {
-            orEmitAudit(b, "class_name_value", "LoadGlobal", name0);
+            orEmitAudit(b, "class_name_value", if (scoped != null) "LoadGlobal/class" else "LoadGlobal", name0);
             try b.push(.{ .LoadGlobal = .{
                 .dst = cls,
                 .name = n,
-                .class = scopedClassIdForRead(b, name0, segments[0].span.file),
+                .class = scoped,
             } });
         }
         const dst = b.allocReg();
@@ -796,12 +831,91 @@ fn tryClassReference(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Err
 }
 
 
+/// Whether reading a classifier name in a receiver context still has to walk
+/// the implicit receivers before the global.
+///
+/// It does only when one of them could declare the name, and the owner's
+/// hierarchy shadow set answers that exactly: false proves no receiver in the
+/// chain declares it, and null means the set is incomplete, where the walk
+/// stays. Without this the read of an `object`'s own name from inside one of
+/// its members walks every receiver on every execution — two million times in
+/// one corpus program — to reach a global whose identity lowering already
+/// recorded on the instruction.
+fn classRefNeedsReceiverWalk(b: *const FuncBuilder, name0: []const u8) bool {
+    const owner = b.ownerClass() orelse return true;
+    return probe_mod.ownerChainShadowContains(b, owner, name0) orelse true;
+}
+
+/// The declared slot a read of `name` on the enclosing class occupies.
+///
+/// Only a DECLARED slot is claimed. Its index is the same in the class and in
+/// every subclass, which is the property the published layout exists to
+/// guarantee; a captured constructor parameter sits in a trailing section
+/// whose position depends on the whole chain, so its index is not claimable.
+///
+/// The answer is a hint: the runtime proves it by reading the slot's name
+/// before serving, so a stale claim costs a miss. `KLIO_SLOT_TRACE` says why
+/// a read did not get one.
+/// The declared slot a read of `name` on the enclosing class occupies.
+///
+/// The conditions live in `fieldSlotClaim`; this adds the one specific to a
+/// bare read: the scope-qualified spelling `sgetterOwner` picks must name the
+/// lexical owner. It walks the enclosing chain and can name an OUTER class,
+/// whose read is a hop off a different instance and not a slot of `this`.
+///
+/// `KLIO_SLOT_TRACE` says why a read did not get one.
+/// The lexical owner's class id, with no claim implied.
+fn lexicalOwnerClassId(b: *FuncBuilder, file: ir.FileId) ?ir.ClassId {
+    const owner = b.ownerClass() orelse return null;
+    return b.module.classIdIndexed(owner, b.self_package, file) orelse b.module.classId(owner);
+}
+
+pub fn ownMemberWriteSlot(b: *FuncBuilder, name: []const u8, file: ir.FileId) ?struct { cls: ir.ClassId, slot: u32 } {
+    const c = ownMemberSlot(b, name, file) orelse return null;
+    const layout = b.module.classFieldLayout(c.cls) orelse return null;
+    if (c.slot >= layout.slots.len) return null;
+    if (!layout.slots[c.slot].plain_write) return null;
+    return .{ .cls = c.cls, .slot = c.slot };
+}
+
+fn ownMemberSlot(b: *FuncBuilder, name: []const u8, file: ir.FileId) ?struct { cls: ir.ClassId, slot: u32 } {
+    const tr = runtime.envOnce("KLIO_SLOT_TRACE") != null;
+    const owner = b.ownerClass() orelse {
+        if (tr) std.debug.print("[slot] {s} no-owner\n", .{name});
+        return null;
+    };
+    if (sgetterOwner(b, name)) |sg| {
+        if (!std.mem.eql(u8, sg, owner)) {
+            if (tr) std.debug.print("[slot] {s} owner={s} sgetter-owner={s}\n", .{ name, owner, sg });
+            return null;
+        }
+    }
+    const cid = b.module.classIdIndexed(owner, b.self_package, file) orelse
+        b.module.classId(owner) orelse {
+            if (tr) std.debug.print("[slot] {s} owner={s} no-class-id\n", .{ name, owner });
+            return null;
+        };
+    const idx = static_type_mod.fieldSlotClaim(b, cid, name) orelse {
+        if (tr) std.debug.print("[slot] {s} owner={s} refused\n", .{ name, owner });
+        return null;
+    };
+    if (tr) std.debug.print("[slot] {s} owner={s} CLAIM idx={d}\n", .{ name, owner, idx });
+    return .{ .cls = cid, .slot = idx };
+}
+
 /// Outside any receiver context nothing can shadow a builtin type name.
 fn tryBuiltinTypeName(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
     if (isBuiltinTypeName(name0)) {
         const name = try b.module.internConst(b.allocator, .{ .String = name0 });
         const dst = b.allocReg();
-        if (inReceiverContext(b)) {
+        const bt_walk: implicit_walk.Verdict = if (inReceiverContext(b))
+            try implicit_walk.walk(b, name0, null, .property, "builtin_type_name")
+        else
+            .global;
+        if (bt_walk == .member) {
+            const r = try implicit_walk.emitRead(b, bt_walk.member, name0);
+            try b.push(.{ .Move = .{ .dst = dst, .src = r } });
+        } else if (bt_walk == .undecided) {
             const this_idx = try b.recordCapture("this");
             orEmitAudit(b, "builtin_type_name", "LoadFromThisOrGlobal", name0);
             try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = name } });
@@ -862,7 +976,7 @@ fn tryTopLevelPropRead(b: *FuncBuilder, segments: []const ast.Ident) Allocator.E
     const class_over_unimported_prop = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file) != null and
         (b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 0) >= 4;
     if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-        if (std.mem.eql(u8, w, name0) and isTopLevelProp(name0)) std.debug.print("[tlp] {s} narrow={?s} recvTy={?s} in_recv_ctx={} narrowed_declares={}\n", .{ name0, b.thisNarrow(), b.recvTy(), inReceiverContext(b), narrowedThisDeclares(b, name0, segments[0].span.file) });
+        if (std.mem.eql(u8, w, name0) and isTopLevelProp(name0)) std.debug.print("[tlp] {s} narrow={?s} recvTy={?s} in_recv_ctx={} narrowed_declares={} slot={?d} rename={?s} decls={d}\n", .{ name0, b.thisNarrow(), b.recvTy(), inReceiverContext(b), narrowedThisDeclares(b, name0, segments[0].span.file), b.module.registry.top_level_prop_slots.get(name0), filePrivatePropRename(b, name0, segments[0].span.file.int()), if (b.module.registry.top_level_prop_pkgs.get(name0)) |l| l.items.len else 0 });
     }
     if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
         !narrowedThisDeclares(b, name0, segments[0].span.file) and
@@ -881,13 +995,58 @@ fn tryTopLevelPropRead(b: *FuncBuilder, segments: []const ast.Ident) Allocator.E
         if (b.module.topLevelPropFqn(name0)) |pfqn| {
             _ = try recordOutOfScopeRef(b, name0, segments[0].span, pfqn, b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file));
         }
-        orEmitAudit(b, "top_level_prop", "LoadGlobal", name0);
+        // A property with a custom getter is read by calling it: the runtime's
+        // by-name read ran the same thunk after missing the binding.
+        if (topLevelAccessorTarget(b, name0, segments[0].span.file.int(), .getter)) |fid| {
+            orEmitAudit(b, "top_level_prop", "Call", name0);
+            const dst = b.allocReg();
+            const ctx_handed = try probe_mod.contextHandoverBegin(b, fid, &.{});
+            try b.push(.{ .Call = .{ .dst = dst, .func = fid, .args = b.allocReg(), .n_args = 0, .exact = true } });
+            try probe_mod.contextHandoverEnd(b, ctx_handed);
+            return dst;
+        }
+        const slot = topLevelPropSlot(b, name0, segments[0].span.file.int());
+        orEmitAudit(b, "top_level_prop", if (slot != null) "LoadGlobal/slot" else "LoadGlobal", name0);
         const dst = b.allocReg();
         const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-        try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
+        try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .slot = slot } });
         return dst;
     }
     return null;
+}
+
+pub const TopLevelAccessor = enum { getter, setter };
+
+/// The custom accessor a bare top-level property read or write calls: the
+/// name's one declaration has that accessor, its header is reserved, and no
+/// file-private rename stands between the site and the declaration.
+pub fn topLevelAccessorTarget(b: *FuncBuilder, name: []const u8, file: u32, which: TopLevelAccessor) ?ir.FuncId {
+    if (filePrivatePropRename(b, name, file) != null) return null;
+    const decls = b.module.registry.top_level_prop_pkgs.get(name) orelse return null;
+    if (decls.items.len != 1) return null;
+    const fid = switch (which) {
+        .getter => b.module.registry.top_level_prop_getters.get(name),
+        .setter => b.module.registry.top_level_prop_setters.get(name),
+    } orelse {
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| if (std.mem.eql(u8, w, name)) std.debug.print("[tlp-acc] {s}: no accessor registered\n", .{name});
+        return null;
+    };
+    const f = b.module.funcById(fid) orelse return null;
+    if (!b.module.declaredWithBody(fid, f)) {
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| if (std.mem.eql(u8, w, name)) std.debug.print("[tlp-acc] {s}: accessor #{d} has no body\n", .{ name, fid.int() });
+        return null;
+    }
+    return fid;
+}
+
+/// The slot a bare top-level property read or write addresses: the name's own
+/// declaration when it is plain storage declared once, and no file-private
+/// rename stands between the site and the binding.
+pub fn topLevelPropSlot(b: *FuncBuilder, name: []const u8, file: u32) ?u32 {
+    if (filePrivatePropRename(b, name, file) != null) return null;
+    const s = b.module.registry.top_level_prop_slots.get(name) orelse return null;
+    if (s == ir.ModuleRegistry.ambiguous_slot) return null;
+    return s;
 }
 
 
@@ -966,6 +1125,8 @@ const BareThisEvidence = struct {
     receiver_is_owner: bool,
     /// An implicit receiver, or a smart-cast `this`, declares the name.
     recv_declares: bool,
+    /// The reading site's file, for the scoped classifier lookups.
+    file: ir.FileId,
 };
 
 fn bareThisReadEvidence(b: *FuncBuilder, segments: []const ast.Ident, this_reg: Reg) BareThisEvidence {
@@ -1057,6 +1218,7 @@ const recv_declares = narrow_declares or blk: {
         .splice_receiver_first = splice_receiver_first,
         .receiver_is_owner = receiver_is_owner,
         .recv_declares = recv_declares,
+        .file = segments[0].span.file,
     };
 }
 
@@ -1079,7 +1241,26 @@ if ((!is_known_global or splice_receiver_first or recv_declares) and
     // lacks the name; kotlinc ranks implicit receivers by static type,
     // so the read binds the innermost subject that declares it.
     const target = subjectCorrectedBareThis(b, name0, this_reg);
-    try b.push(.{ .GetField = .{ .dst = dst, .receiver = target, .field = nm } });
+    // A corrected subject is a different instance than the lexical `this`, so
+    // the owner's slot index does not describe it.
+    const claim = if (target == this_reg) ownMemberSlot(b, name0, ev.file) else null;
+    // Without a slot the owner class is still the read's, and a later pass can
+    // turn it into the accessor that answers. A corrected subject is a
+    // different instance, so only the lexical `this` carries one.
+    const own_cls: ?ir.ClassId = if (claim) |c|
+        c.cls
+    else if (target == this_reg)
+        lexicalOwnerClassId(b, ev.file)
+    else
+        null;
+    try b.push(.{ .GetField = .{
+        .dst = dst,
+        .receiver = target,
+        .field = nm,
+        .own_cls = own_cls,
+        .own_slot = if (claim) |c| c.slot else 0,
+        .own_kind = if (claim != null) .slot else .none,
+    } });
     return dst;
 }
     return null;
@@ -1160,12 +1341,26 @@ fn tryNoReceiverGlobalRead(b: *FuncBuilder, segments: []const ast.Ident) Allocat
 fn emitBareThisOrGlobal(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!Reg {
     const name0 = segments[0].name;
 
+    const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
+    switch (try implicit_walk.walk(b, name0, null, .property, "bare_read")) {
+        .member => |hit| {
+            orEmitAudit(b, "bare_name_walked", "GetField", name0);
+            return try implicit_walk.emitRead(b, hit, name0);
+        },
+        .global => {
+            orEmitAudit(b, "bare_name_walked", "LoadGlobal", name0);
+            const dst = b.allocReg();
+            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .func = ref_pick } });
+            return dst;
+        },
+        .undecided => {},
+    }
     const this_idx = try b.recordCapture("this");
     const dst = b.allocReg();
     const name = try sgetterName(b, name0);
     // The index's unique pick rides as the exact global arm; the runtime member
     // probe still runs first.
-    const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
     orEmitAudit(b, "bare_name_fallthrough", "LoadFromThisOrGlobal", name0);
     try b.push(.{ .LoadFromThisOrGlobal = .{
         .dst = dst,
@@ -1216,9 +1411,16 @@ fn lowerDottedPath(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error
 
     const first = segments[0];
     var cur: Reg = undefined;
+    const head_walk: implicit_walk.Verdict = if (b.resolve(first.name) == null and inReceiverContext(b))
+        try implicit_walk.walk(b, first.name, null, .property, "multi_seg_head")
+    else
+        .global;
     if (b.resolve(first.name)) |r| {
         cur = r;
-    } else if (inReceiverContext(b)) {
+    } else if (head_walk == .member) {
+        orEmitAudit(b, "multi_seg_head_walked", "GetField", first.name);
+        cur = try implicit_walk.emitRead(b, head_walk.member, first.name);
+    } else if (head_walk == .undecided) {
         // Unresolved head: route through `this` or the enclosing receiver, with a
         // known class riding as the exact global arm.
         const this_idx = try b.recordCapture("this");
@@ -1236,21 +1438,49 @@ fn lowerDottedPath(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error
         // No receiver context: the head is a static global.
         const dst = b.allocReg();
         const n = try b.module.internConst(b.allocator, .{ .String = first.name });
-        orEmitAudit(b, "multi_seg_head", "LoadGlobal", first.name);
+        const head_cid = b.module.classIdIndexed(first.name, b.self_package, first.span.file);
+        orEmitAudit(b, "multi_seg_head", if (head_cid != null) "LoadGlobal/class" else "LoadGlobal", first.name);
         try b.push(.{ .LoadGlobal = .{
             .dst = dst,
             .name = n,
-            .class = b.module.classIdIndexed(first.name, b.self_package, first.span.file),
+            .class = head_cid,
         } });
         cur = dst;
     }
+    // `EnumClass.Entry` is the common two-segment shape, and only the FIRST hop
+    // can be one: past that the receiver is a value, not the classifier.
+    var head_cls: ?ir.ClassId = if (b.resolve(first.name) == null and !b.knowsOuter(first.name))
+        (b.module.classIdIndexed(first.name, b.self_package, first.span.file) orelse
+            b.module.classId(first.name))
+    else
+        null;
     for (segments[1..]) |seg| {
         const next = b.allocReg();
         const field = try b.module.internConst(b.allocator, .{ .String = seg.name });
-        try b.push(.{ .GetField = .{ .dst = next, .receiver = cur, .field = field } });
+        const entry = enumEntryOf(b, head_cls, seg.name);
+        try b.push(.{ .GetField = .{
+            .dst = next,
+            .receiver = cur,
+            .field = field,
+            .own_cls = if (entry != null) head_cls else null,
+            .own_slot = entry orelse 0,
+            .own_kind = if (entry != null) .enum_entry else .none,
+        } });
         cur = next;
+        head_cls = null;
     }
     return cur;
+}
+
+/// The index of `name` among `cid`'s enum entries. Null when the class is not
+/// an enum, or when its entry names are not published yet — a read lowered
+/// before the publish stays by name, which costs coverage and not correctness.
+pub fn enumEntryOf(b: *const FuncBuilder, cid: ?ir.ClassId, name: []const u8) ?u32 {
+    const id = cid orelse return null;
+    if (id.int() >= b.module.classes.items.len) return null;
+    const c = &b.module.classes.items[id.int()];
+    if (!c.is_enum) return null;
+    return c.enumEntryIndex(name);
 }
 
 
@@ -1432,22 +1662,42 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
             return lowerExpr(b, &path);
         }
     }
+    // `"$x"` where `x` is the enclosing class's own member reads it off
+    // `this`, whose class is the owner — no derivation needed, and recording
+    // it is the difference between the read binding a slot and staying on
+    // the name. String interpolation was the single largest emitter of
+    // classless field reads on a compose program.
+    const owner_cid = emit_mod.ownerClassIdOf(b, ident.span.file);
     if (b.hasOwnMember(ident.name) and b.resolve("this") != null) {
         const this_reg = b.resolve("this").?;
         const dst = b.allocReg();
         const nm = try b.module.internConst(b.allocator, .{ .String = ident.name });
-        try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
+        try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm, .own_cls = owner_cid } });
         return dst;
     }
+    // Only where `this` IS the owner's instance: a member extension's `this`
+    // is its extension receiver and a receiver lambda's is its own, and a
+    // read of the owner's member there is the walk's to place.
     if (b.resolve("this")) |this_reg| {
-        const dst = b.allocReg();
-        const n = try b.module.internConst(b.allocator, .{ .String = ident.name });
-        try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = n } });
-        return dst;
+        const this_is_owner = if (owner_cid) |oc| (oc.int() < b.module.classes.items.len and
+            member_call_mod.thisIsOwnerInstance(b, &b.module.classes.items[oc.int()])) else false;
+        if (this_is_owner) {
+            const dst = b.allocReg();
+            const n = try b.module.internConst(b.allocator, .{ .String = ident.name });
+            try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = n, .own_cls = owner_cid } });
+            return dst;
+        }
     }
     const n = try b.module.internConst(b.allocator, .{ .String = ident.name });
     const dst = b.allocReg();
-    if (inReceiverContext(b)) {
+    const interp_walk: implicit_walk.Verdict = if (inReceiverContext(b))
+        try implicit_walk.walk(b, ident.name, null, .property, "short_interp")
+    else
+        .global;
+    if (interp_walk == .member) {
+        const r = try implicit_walk.emitRead(b, interp_walk.member, ident.name);
+        try b.push(.{ .Move = .{ .dst = dst, .src = r } });
+    } else if (interp_walk == .undecided) {
         const this_idx = try b.recordCapture("this");
         orEmitAudit(b, "short_interp", "LoadFromThisOrGlobal", ident.name);
         try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = n } });

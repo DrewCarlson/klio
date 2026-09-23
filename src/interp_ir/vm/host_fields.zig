@@ -91,7 +91,6 @@ pub const FieldsTls = struct {
     owner_keyed_memo_set: [1024]OwnerKeyedSlot = @splat(.{}),
     tl_field_read_cache: [TL_FIELD_CACHE_SIZE]TlFieldReadEntry = @splat(.{}),
     tl_field_write_cache: [TL_FIELD_CACHE_SIZE]TlFieldWriteEntry = @splat(.{}),
-    super_write_owner: ?[]const u8 = null,
     anon_key_buf: [512]u8 = undefined,
 };
 /// One copy per thread; see `runtime.tls_fast.PerThread`.
@@ -295,7 +294,6 @@ const lateinitReadError = field_cache.lateinitReadError;
 
 const set_field = @import("host_fields/set_field.zig");
 pub const setField = set_field.setField;
-pub const setFieldFrom = set_field.setFieldFrom;
 const setFieldInner = set_field.setFieldInner;
 const setCompanionParentWalk = set_field.setCompanionParentWalk;
 const evalSetter = set_field.evalSetter;

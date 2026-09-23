@@ -6,7 +6,7 @@ const span = @import("span");
 const ast = @import("ast");
 const diagnostics = @import("diagnostics");
 const resolver = @import("resolver");
-const types = @import("types");
+pub const types = @import("types");
 const cfa = @import("cfa");
 
 const Allocator = std.mem.Allocator;
@@ -56,7 +56,7 @@ pub const Lowered = cfa.lower.Lowered;
 /// The per-aspect free functions over `*Checker`.
 const phases = @import("check/phases.zig");
 const decl = @import("check/decl.zig");
-const expr = @import("check/expr.zig");
+pub const expr = @import("check/expr.zig");
 pub const expr_calls = @import("check/expr_calls.zig");
 const annotations = @import("check/annotations.zig");
 const visibility = @import("check/visibility.zig");
@@ -81,7 +81,7 @@ pub const TypeCheck = struct {
     resolved_calls: std.AutoHashMap(Span, ResolvedCall),
     lambda_recv_heads: std.AutoHashMap(Span, []const u8),
     lambda_param_shapes: std.AutoHashMap(Span, ParamShape),
-    /// A plain user class types as `Type.Unresolved`, so a receiver's class
+    /// A plain user class types as `Type.unresolved`, so a receiver's class
     /// identity lives here instead.
     expr_class: std.AutoHashMap(Span, []const u8),
     /// Ranking only. Separate from `expr_class`, which lowering reads as type
@@ -293,17 +293,24 @@ pub fn typecheckModuleOpts(
     defer destroyQueryScratch(allocator, tc.query_scratch);
     defer destroySolveMemo(allocator, tc.solve_memo);
     if (types.pending_extern_decls) |ed| {
-        var cit = ed.classes.keyIterator();
-        while (cit.next()) |k| {
-            if (tc.classes.contains(k.*)) continue;
-            var info = ClassInfo.init(allocator);
-            // The candidate walk climbs supertypes.
-            if (ed.has_extensions) {
-                if (ed.supertypes.get(k.*)) |sups| {
-                    for (sups) |s| try info.supertypes.append(allocator, s);
+        var cit = ed.classes.iterator();
+        const trace_class = std.c.getenv("KLIO_EXTERN_TRACE");
+        while (cit.next()) |e| {
+            if (tc.classes.contains(e.key_ptr.*)) continue;
+            const info = try externClassInfo(allocator, e.value_ptr);
+            if (trace_class) |tcn| {
+                if (std.mem.eql(u8, std.mem.span(tcn), e.key_ptr.*)) {
+                    std.debug.print("[extern-class] {s} tparams={d} supers={d} props={d} methods={d}\n", .{ e.key_ptr.*, info.type_param_names.items.len, info.typed_supertypes.items.len, e.value_ptr.props.len, e.value_ptr.methods.len });
+                    for (info.typed_supertypes.items) |st| {
+                        std.debug.print("[extern-class]   super {s} args={d}", .{ st.name, st.args.len });
+                        for (st.args) |*a| std.debug.print(" {f}", .{a.*});
+                        std.debug.print("\n", .{});
+                    }
+                    var mit = info.members.iterator();
+                    while (mit.next()) |me| std.debug.print("[extern-class]   member {s}: {f}\n", .{ me.key_ptr.*, me.value_ptr.* });
                 }
             }
-            try tc.classes.put(k.*, info);
+            try tc.classes.put(e.key_ptr.*, info);
         }
         tc.extern_fn_return_class = ed.fn_return_class;
         // Without these a member call on an image type finds no candidates.
@@ -313,50 +320,42 @@ pub fn typecheckModuleOpts(
                 const gop = try tc.extensions.getOrPut(entry.key_ptr.*);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 for (entry.value_ptr.items) |*x| {
-                    const params = try allocator.alloc(Type, x.param_heads.len);
-                    for (x.param_heads, x.param_nullable, params) |h, nl, *out| {
-                        out.* = try externHeadType(allocator, h, nl);
-                    }
-                    const defaults = try allocator.alloc(bool, x.param_heads.len);
-                    @memset(defaults, false);
-                    const varargs = try allocator.alloc(bool, x.param_heads.len);
-                    @memset(varargs, false);
-                    const pnames = try allocator.alloc([]const u8, x.param_heads.len);
-                    @memset(pnames, "");
-                    const crossinline = try allocator.alloc(bool, x.param_heads.len);
-                    @memset(crossinline, false);
-                    const pclasses = try allocator.alloc(?[]const u8, x.param_heads.len);
-                    for (x.param_heads, pclasses) |h, *pc| {
-                        pc.* = if (ed.classes.contains(h)) h else null;
-                    }
+                    const sig = try externFnSig(allocator, x, &.{});
                     try gop.value_ptr.append(allocator, .{
                         .name = x.name,
-                        .sig = .{
-                            .params = params,
-                            .has_default = defaults,
-                            .param_names = pnames,
-                            .is_vararg = varargs,
-                            .return_ty = try externHeadType(allocator, x.return_head, x.return_nullable),
-                            .is_infix = x.is_infix,
-                            .type_param_count = 0,
-                            .type_param_names = &.{},
-                            .type_param_bounds = &.{},
-                            .param_class_names = pclasses,
-                            .decl_span = null,
-                            .is_suspend = false,
-                            .is_extension = true,
-                            .is_crossinline_param = crossinline,
-                            .extern_fid = x.fid,
-                        },
-                        .return_class = if (ed.classes.contains(x.return_head)) x.return_head else null,
+                        .sig = sig,
+                        .return_class = sig.return_class,
                     });
                 }
             }
         }
+        // Top-level functions, so `listOf(1, 2)` types as `List<Int>` and a
+        // bare call's pick can name its image declaration.
+        if (ed.has_extensions and !types.tcOff("TOPFN")) {
+            var tit = ed.top_level.iterator();
+            while (tit.next()) |entry| {
+                for (entry.value_ptr.items) |*x| {
+                    var sig = try externFnSig(allocator, x, &.{});
+                    // The image's top-level functions type a call; which one a
+                    // bare name binds is decided by the caller's package and
+                    // imports, which lowering holds and this table does not.
+                    sig.extern_fid = null;
+                    try decl.pushFnSig(&tc, entry.key_ptr.*, sig, false);
+                }
+            }
+        }
+        if (ed.package_roots) |pr| {
+            var rit = pr.keyIterator();
+            while (rit.next()) |k| try tc.package_roots.put(k.*, {});
+        }
         types.pending_extern_decls = null;
     }
     for (files) |*f| {
+        for (f.imports) |*imp| {
+            if (imp.path.len != 0) try tc.package_roots.put(imp.path[0].name, {});
+        }
         const pkg = f.package orelse continue;
+        if (pkg.path.len != 0) try tc.package_roots.put(pkg.path[0].name, {});
         var dotted: std.ArrayList(u8) = .empty;
         for (pkg.path, 0..) |id, i| {
             if (i != 0) try dotted.append(allocator, '.');
@@ -571,7 +570,7 @@ pub const Binding = struct {
     /// Set for a user class, not a builtin or function type.
     class_name: ?[]const u8,
     /// The bare-identifier spelling (`t: T`) that `convertTypeRefLossy`
-    /// collapsed to `Type.Unresolved`, for runtime-availability checks.
+    /// collapsed to `Type.unresolved`, for runtime-availability checks.
     decl_type_name: ?[]const u8,
     /// `ty` above is then the narrowed field type and this the public view,
     /// which reads outside the declaring file see.
@@ -605,49 +604,255 @@ pub const EbfOutside = struct {
 
 /// Builtins become their exact type, anything else an argument-less `Generic`
 /// that ranking compares by name. A short all-caps head stays a type parameter.
-fn externHeadType(allocator: Allocator, head: []const u8, nullable: bool) Allocator.Error!Type {
-    const base: Type = if (std.mem.eql(u8, head, "Unit"))
-        .Unit
-    else if (std.mem.eql(u8, head, "Boolean"))
-        .Boolean
-    else if (std.mem.eql(u8, head, "Byte"))
-        .Byte
-    else if (std.mem.eql(u8, head, "Short"))
-        .Short
-    else if (std.mem.eql(u8, head, "Int"))
-        .Int
-    else if (std.mem.eql(u8, head, "Long"))
-        .Long
-    else if (std.mem.eql(u8, head, "UByte"))
-        .UByte
-    else if (std.mem.eql(u8, head, "UShort"))
-        .UShort
-    else if (std.mem.eql(u8, head, "UInt"))
-        .UInt
-    else if (std.mem.eql(u8, head, "ULong"))
-        .ULong
-    else if (std.mem.eql(u8, head, "Float"))
-        .Float
-    else if (std.mem.eql(u8, head, "Double"))
-        .Double
-    else if (std.mem.eql(u8, head, "Char"))
-        .Char
-    else if (std.mem.eql(u8, head, "String"))
-        .String
-    else if (std.mem.eql(u8, head, "Any"))
-        .Any
-    else if (std.mem.eql(u8, head, "Nothing"))
-        .Nothing
-    else if (head.len == 0)
-        .Unresolved
-    else if (head.len <= 2 and std.ascii.isUpper(head[0]))
-        Type{ .TypeParam = head }
-    else
-        Type{ .Generic = .{ .name = head, .args = &.{} } };
-    if (!nullable) return base;
-    const inner = try allocator.create(Type);
-    inner.* = base;
-    return Type{ .Nullable = inner };
+/// The simple name of an image head: the last segment of a qualified one.
+fn externSimpleName(name: []const u8) []const u8 {
+    var n = name;
+    if (std.mem.startsWith(u8, n, "out#")) n = n[4..];
+    if (std.mem.startsWith(u8, n, "in#")) n = n[3..];
+    if (std.mem.findScalarLast(u8, n, '.')) |d| n = n[d + 1 ..];
+    return n;
+}
+
+/// A class-owned type parameter is spelled by identity in a member's
+/// signature (`$class$<owner><len>:<name>`); the name is its tail.
+fn classOwnedParamName(name: []const u8) ?[]const u8 {
+    const prefix = "$class$\x00";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const rest = name[prefix.len..];
+    const sep = std.mem.indexOfScalar(u8, rest, 0) orelse return null;
+    const after = rest[sep + 1 ..];
+    const colon = std.mem.indexOfScalar(u8, after, ':') orelse return null;
+    return after[colon + 1 ..];
+}
+
+/// A `#suspend`, `#non-null` or `#qual:` argument is a flag, not a type.
+fn externIsMarker(t: *const types.ExternType) bool {
+    return t.name.len != 0 and t.name[0] == '#';
+}
+
+/// The checker's type for an image type. Type-parameter names in `tparams`
+/// become `TypeParam`; a parameterised head becomes `Generic`; a
+/// `Function<N>` head becomes the function type it spells; anything else
+/// the checker does not model is `Unresolved` carrying its simple name.
+fn externType(allocator: Allocator, t: *const types.ExternType, tparams: *const std.StringHashMap(void)) Allocator.Error!Type {
+    if (std.mem.eql(u8, t.name, "*")) return .Any;
+    const simple = classOwnedParamName(t.name) orelse externSimpleName(t.name);
+    var is_suspend = false;
+    var real: usize = 0;
+    for (t.args) |*a| {
+        if (externIsMarker(a)) {
+            if (std.mem.eql(u8, a.name, "#suspend")) is_suspend = true;
+        } else real += 1;
+    }
+    const base: Type = blk: {
+        if (std.mem.startsWith(u8, simple, "Function") and simple.len > "Function".len) arity: {
+            const n = std.fmt.parseInt(usize, simple["Function".len..], 10) catch break :arity;
+            if (real < n + 1) break :arity;
+            const has_receiver = real == n + 2;
+            const params = try allocator.alloc(Type, n);
+            var receiver_head: ?[]const u8 = null;
+            var ret: Type = Type.unresolved;
+            var idx: usize = 0;
+            for (t.args) |*a| {
+                if (externIsMarker(a)) continue;
+                if (has_receiver and idx == 0) {
+                    receiver_head = externSimpleName(a.name);
+                } else if (idx < real - 1) {
+                    params[idx - @intFromBool(has_receiver)] = try externType(allocator, a, tparams);
+                } else {
+                    ret = try externType(allocator, a, tparams);
+                }
+                idx += 1;
+            }
+            const boxed = try allocator.create(Type);
+            boxed.* = ret;
+            break :blk .{ .Function = .{ .params = params, .return_type = boxed, .is_suspend = is_suspend, .receiver_head = receiver_head } };
+        }
+        if (types.builtinByName(simple)) |b| {
+            if (real == 0) break :blk b;
+        }
+        if (real == 0 and tparams.contains(simple)) break :blk .{ .TypeParam = try allocator.dupe(u8, simple) };
+        if (real != 0) {
+            const args = try allocator.alloc(GenericArg, real);
+            var i: usize = 0;
+            for (t.args) |*a| {
+                if (externIsMarker(a)) continue;
+                args[i] = try externArg(allocator, a, tparams);
+                i += 1;
+            }
+            break :blk .{ .Generic = .{ .name = try allocator.dupe(u8, simple), .args = args } };
+        }
+        break :blk .{ .Unresolved = simple };
+    };
+    return if (t.nullable) try base.asNullable(allocator) else base;
+}
+
+fn externArg(allocator: Allocator, t: *const types.ExternType, tparams: *const std.StringHashMap(void)) Allocator.Error!GenericArg {
+    if (std.mem.eql(u8, t.name, "*")) return .{ .variance = .Invariant, .is_star = true, .ty = .Any };
+    const variance: types.Variance = if (std.mem.startsWith(u8, t.name, "out#")) .Out else if (std.mem.startsWith(u8, t.name, "in#")) .In else .Invariant;
+    return .{ .variance = variance, .is_star = false, .ty = try externType(allocator, t, tparams) };
+}
+
+/// An image declaration's `FnSig`. `outer_tparams` are the declaring class's
+/// type parameters.
+fn externFnSig(allocator: Allocator, ef: *const types.ExternFn, outer_tparams: []const []const u8) Allocator.Error!FnSig {
+    var tparams = std.StringHashMap(void).init(allocator);
+    defer tparams.deinit();
+    for (outer_tparams) |n| try tparams.put(n, {});
+    for (ef.type_params) |n| try tparams.put(n, {});
+    const n = ef.params.len;
+    const params = try allocator.alloc(Type, n);
+    for (ef.params, params) |*p, *dst| dst.* = try externType(allocator, p, &tparams);
+    const has_default = try allocator.alloc(bool, n);
+    if (ef.param_defaults.len == n) @memcpy(has_default, ef.param_defaults) else @memset(has_default, false);
+    const pnames = try allocator.alloc([]const u8, n);
+    if (ef.param_names.len == n) @memcpy(pnames, ef.param_names) else @memset(pnames, "");
+    const varargs = try allocator.alloc(bool, n);
+    @memset(varargs, false);
+    if (ef.has_vararg and n != 0) varargs[n - 1] = true;
+    const crossinline = try allocator.alloc(bool, n);
+    @memset(crossinline, false);
+    const pclasses = try allocator.alloc(?[]const u8, n);
+    for (params, pclasses) |*p, *pc| pc.* = helpers.classNameOfType(p);
+    const return_ty: Type = if (ef.return_ty) |*rt| try externType(allocator, rt, &tparams) else Type.unresolved;
+    const bounds = try allocator.alloc([]Type, ef.type_params.len);
+    for (bounds) |*b| b.* = &.{};
+    return .{
+        .params = params,
+        .has_default = has_default,
+        .param_names = pnames,
+        .is_vararg = varargs,
+        .return_ty = return_ty,
+        .is_infix = false,
+        .type_param_count = ef.type_params.len,
+        .type_param_names = @constCast(ef.type_params),
+        .type_param_bounds = bounds,
+        .param_class_names = pclasses,
+        .return_class = helpers.classNameOfType(&return_ty),
+        .decl_span = null,
+        .is_suspend = ef.is_suspend,
+        .is_extension = ef.receiver != null,
+        .receiver_ty = if (ef.receiver) |*r| try externType(allocator, r, &tparams) else null,
+        .is_crossinline_param = crossinline,
+        .extern_fid = ef.fid,
+    };
+}
+
+/// An image class as the checker's `ClassInfo`: its parameters, typed
+/// supertypes, properties, methods and primary constructor.
+fn externClassInfo(allocator: Allocator, ec: *const types.ExternClass) Allocator.Error!ClassInfo {
+    var info = ClassInfo.init(allocator);
+    if (types.tcOff("EXTERN")) {
+        for (ec.supertypes) |*st| try info.supertypes.append(allocator, externSimpleName(st.name));
+        return info;
+    }
+    info.is_interface = ec.is_interface;
+    info.is_abstract = ec.is_abstract;
+    info.is_open = ec.is_open or ec.is_abstract or ec.is_interface;
+    info.is_enum = ec.is_enum;
+    info.has_secondary_ctors = ec.has_secondary_ctors;
+    var ctp = std.StringHashMap(void).init(allocator);
+    defer ctp.deinit();
+    for (ec.type_params) |n| {
+        try info.type_param_names.append(allocator, n);
+        try ctp.put(n, {});
+    }
+    for (ec.supertypes) |*st| {
+        const simple = externSimpleName(st.name);
+        try info.supertypes.append(allocator, simple);
+        var real: usize = 0;
+        for (st.args) |*a| {
+            if (!externIsMarker(a)) real += 1;
+        }
+        const targs = try allocator.alloc(Type, real);
+        var i: usize = 0;
+        for (st.args) |*a| {
+            if (externIsMarker(a)) continue;
+            targs[i] = if (std.mem.eql(u8, a.name, "*")) Type.unresolved else try externType(allocator, a, &ctp);
+            i += 1;
+        }
+        try info.typed_supertypes.append(allocator, .{ .name = simple, .args = targs });
+    }
+    const implicit_open = ec.is_interface or ec.is_abstract;
+    for (ec.props) |*p| {
+        const ty: Type = if (p.ty) |*t| try externType(allocator, t, &ctp) else Type.unresolved;
+        try info.members.put(p.name, ty);
+        try info.member_mutable.put(p.name, false);
+        try info.member_sigs.put(p.name, .{ .Property = .{ .ty = try ty.clone(allocator), .mutable = false, .visibility = .Public } });
+        if (ty != .TypeParam) if (helpers.classNameOfType(&ty)) |cn| try info.member_class.put(p.name, cn);
+        try info.member_visibility.put(p.name, .Public);
+        try info.member_flags.put(p.name, .{
+            .is_open = implicit_open,
+            .is_override = false,
+            .is_abstract = p.is_abstract,
+            .is_operator = false,
+            .is_infix = false,
+            .has_default_body = false,
+        });
+        if (p.is_abstract) try info.abstract_members.append(allocator, p.name) else try info.concrete_members.append(allocator, p.name);
+    }
+    for (ec.methods) |*ef| {
+        const sig = try externFnSig(allocator, ef, ec.type_params);
+        {
+            const gop = try info.member_methods.getOrPut(ef.name);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(allocator, sig);
+        }
+        const param_types = try allocator.alloc(Type, sig.params.len);
+        for (sig.params, param_types) |*p, *dst| dst.* = try p.clone(allocator);
+        try info.member_sigs.put(ef.name, .{ .Function = .{
+            .param_types = param_types,
+            .return_ty = try sig.return_ty.clone(allocator),
+            .visibility = .Public,
+            .is_suspend = ef.is_suspend,
+        } });
+        const ret = try allocator.create(Type);
+        ret.* = try sig.return_ty.clone(allocator);
+        const fn_params = try allocator.alloc(Type, sig.params.len);
+        for (sig.params, fn_params) |*p, *dst| dst.* = try p.clone(allocator);
+        try info.members.put(ef.name, .{ .Function = .{ .params = fn_params, .return_type = ret, .is_suspend = ef.is_suspend } });
+        if (sig.return_class) |cn| try info.member_class.put(ef.name, cn);
+        try info.member_flags.put(ef.name, .{
+            .is_open = implicit_open or !ef.has_body,
+            .is_override = false,
+            .is_abstract = !ef.has_body and implicit_open,
+            .is_operator = false,
+            .is_infix = false,
+            .has_default_body = ef.has_body,
+        });
+        if (ef.has_body) try info.concrete_members.append(allocator, ef.name) else try info.abstract_members.append(allocator, ef.name);
+        try info.member_visibility.put(ef.name, .Public);
+    }
+    if (ec.ctor) |*ctor| {
+        info.ctor = try externCtorSig(allocator, ec, ctor);
+        if (ec.secondary_ctors.len != 0) try info.ctors.append(allocator, info.ctor.?);
+    }
+    for (ec.secondary_ctors) |*sc| {
+        try info.ctors.append(allocator, try externCtorSig(allocator, ec, sc));
+    }
+    return info;
+}
+
+/// A constructor's signature returns the class, instantiated by its own
+/// type parameters.
+fn externCtorSig(allocator: Allocator, ec: *const types.ExternClass, ctor: *const types.ExternFn) Allocator.Error!FnSig {
+    var sig = try externFnSig(allocator, ctor, &.{});
+    sig.return_ty = try classInstanceType(allocator, ec.name, ec.type_params);
+    sig.return_class = ec.name;
+    sig.type_param_count = ec.type_params.len;
+    sig.type_param_names = @constCast(ec.type_params);
+    const bounds = try allocator.alloc([]Type, ec.type_params.len);
+    for (bounds) |*b| b.* = &.{};
+    sig.type_param_bounds = bounds;
+    return sig;
+}
+
+/// `Box<T>` for a generic class, the bare class otherwise.
+pub fn classInstanceType(allocator: Allocator, name: []const u8, type_params: []const []const u8) Allocator.Error!Type {
+    if (type_params.len == 0) return .{ .Unresolved = name };
+    const targs = try allocator.alloc(GenericArg, type_params.len);
+    for (type_params, targs) |n, *dst| dst.* = .{ .variance = .Invariant, .is_star = false, .ty = .{ .TypeParam = try allocator.dupe(u8, n) } };
+    return .{ .Generic = .{ .name = try allocator.dupe(u8, name), .args = targs } };
 }
 
 pub const ExtensionSig = struct {
@@ -678,7 +883,7 @@ pub const FnSig = struct {
     type_param_names: [][]const u8,
     /// Upper bounds per type parameter, in declaration order.
     type_param_bounds: [][]Type,
-    /// A plain user class types as `Type.Unresolved`, so return-class identity
+    /// A plain user class types as `Type.unresolved`, so return-class identity
     /// travels beside the type.
     return_class: ?[]const u8 = null,
     /// Identity of an image declaration, which has no `decl_span`.
@@ -691,6 +896,9 @@ pub const FnSig = struct {
     /// A bare call to an extension inside a receiver scope competes with
     /// candidates the flat name registry cannot see, so its pick never records.
     is_extension: bool = false,
+    /// Declared extension receiver, with the function's own type parameters
+    /// as `TypeParam`: the receiver a call is made on binds them.
+    receiver_ty: ?Type = null,
     is_crossinline_param: []bool,
     /// Two overloads whose context type-sets differ are shadowed contextual
     /// overloads, not conflicting ones.
@@ -738,6 +946,18 @@ pub fn putClassChecked(self: anytype, name: []const u8, info: ClassInfo, decl_fi
             (if (decl_file) |nf| ef.int() == nf.int() else false)
         else
             decl_file == null;
+        // An `expect` and its `actual` are one class. The actual carries
+        // the bodies; where it declares no members of its own the expect's
+        // member surface stands in, so keep whichever declares more.
+        if (!same and (existing.is_expect != info.is_expect)) {
+            const keep_existing = if (existing.is_expect)
+                info.members.count() == 0 and info.member_methods.count() == 0
+            else
+                true;
+            if (keep_existing) return;
+            try self.classes.put(name, info);
+            return;
+        }
         if (!same) {
             try self.ambiguous_class_names.put(name, {});
         }
@@ -746,6 +966,13 @@ pub fn putClassChecked(self: anytype, name: []const u8, info: ClassInfo, decl_fi
 }
 
 /// Null when the simple name is ambiguous across packages.
+/// Whether `first` can head a package-qualified path: the root of a package
+/// some checked file, one of its imports, or the image declares in.
+pub fn packageRoot(self: *const Checker, first: []const u8) bool {
+    if (types.tcOff("PKGROOT")) return true;
+    return self.package_roots.contains(first);
+}
+
 pub fn classNamed(self: anytype, name: []const u8) ?ClassInfo {
     if (self.ambiguous_class_names.contains(name)) return null;
     return self.classes.get(name);
@@ -761,6 +988,9 @@ pub const ClassInfo = struct {
     member_methods: std.StringHashMap(std.ArrayList(FnSig)),
     member_mutable: std.StringHashMap(bool),
     ctor: ?FnSig = null,
+    /// Every constructor, primary first, when the class declares more than
+    /// the primary one; a construction then selects among them.
+    ctors: std.ArrayList(FnSig) = .empty,
     abstract_members: std.ArrayList([]const u8) = .empty,
     concrete_members: std.ArrayList([]const u8) = .empty,
     member_flags: std.StringHashMap(MemberFlags),
@@ -784,6 +1014,9 @@ pub const ClassInfo = struct {
     member_visibility: std.StringHashMap(Visibility),
     decl_visibility: Visibility = .Public,
     decl_file: ?FileId = null,
+    /// An `expect` declaration: its `actual` is the same class, not a
+    /// namesake competing for the simple name.
+    is_expect: bool = false,
     /// Set only when it diverges from the class's own visibility.
     primary_ctor_visibility: ?Visibility = null,
 
@@ -883,6 +1116,10 @@ pub const Checker = struct {
     /// stay out of the eager call channel.
     extension_fn_names: std.StringHashMap(void),
     extension_properties: std.StringHashMap(std.ArrayList(ExtensionPropSig)),
+    /// The first segment of every package a checked file, its imports or the
+    /// image declares. A qualified path whose head is not one of these names
+    /// a value in scope, never a package.
+    package_roots: std.StringHashMap(void),
     classes: std.StringHashMap(ClassInfo),
     /// For functions known only from a prebuilt image.
     extern_fn_return_class: ?std.StringHashMap([]const u8) = null,
@@ -893,6 +1130,14 @@ pub const Checker = struct {
     ambiguous_class_names: std.StringHashMap(void),
     /// Enclosing class name while a class body is checked.
     class_stack: std.ArrayList([]const u8),
+    /// The extension receivers whose bodies enclose the expression being
+    /// checked, each with the `class_stack` depth at which it was pushed.
+    ///
+    /// Deliberately NOT `class_stack`: that one decides private-member
+    /// visibility, and an extension body must not see its receiver's privates.
+    /// This channel records identity only — it answers what `this` IS, and
+    /// nothing reads it to make a checking decision.
+    this_ext_stack: std.ArrayList(ThisExtRecv),
     /// Enclosing function's declared/inferred return type for `return`.
     fn_return_stack: std.ArrayList(Type),
     /// Lexically active jump labels bound by enclosing loops or `Labeled`.
@@ -909,6 +1154,11 @@ pub const Checker = struct {
     reified_type_params: std.ArrayList(std.StringHashMap(void)),
     /// Every type-parameter name in scope, per enclosing function or class.
     type_params_in_scope: std.ArrayList(std.StringHashMap(void)),
+    /// Parallel to `type_params_in_scope`: the upper bound's class head for
+    /// each parameter that declares one. A value typed by the parameter has
+    /// that class's members, which is what a member access on it resolves
+    /// against.
+    type_param_bounds_in_scope: std.ArrayList(std.StringHashMap([]const u8)),
     /// Parallel to `fns`, one entry per overload.
     fn_annotations: std.StringHashMap(std.ArrayList([]Annotation)),
     prop_annotations: std.StringHashMap([]Annotation),
@@ -984,12 +1234,24 @@ pub const Checker = struct {
     pub const declareTopLevel = decl.declareTopLevel;
     pub const checkDecl = decl.checkDecl;
     pub const checkExpr = expr.checkExpr;
+    pub const dumpUnresolvedByKind = expr.dumpUnresolvedByKind;
+    pub const setUnresolvedProbe = expr.setUnresolvedProbe;
     pub const checkCall = expr_calls.checkCall;
     pub const checkVisibility = visibility.checkVisibility;
     pub const narrow = narrowing.narrow;
 };
 
 /// An implicit `this` class name plus its applied dsl-marker names.
+/// An extension receiver in scope, and how deep `class_stack` was when it
+/// became the innermost `this`.
+pub const ThisExtRecv = struct {
+    name: []const u8,
+    class_depth: usize,
+    /// The label `this@label` names it by: the extension function's name,
+    /// or the callee a receiver lambda was passed to.
+    label: ?[]const u8 = null,
+};
+
 pub const DslReceiver = struct {
     name: []const u8,
     markers: std.StringHashMap(void),

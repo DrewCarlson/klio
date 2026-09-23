@@ -11,6 +11,7 @@ const compose_pass = @import("compose_pass");
 const stdlib = @import("stdlib");
 const lift = @import("lift.zig");
 const prune = @import("../prune.zig");
+const class_layout = @import("../class_layout.zig");
 const body_pool = @import("body_pool.zig");
 pub const lazy = @import("lazy.zig");
 const image = @import("../image.zig");
@@ -55,6 +56,7 @@ const cloneBuiltForRun = build_clone.cloneBuiltForRun;
 const adoptBuiltForRun = build_clone.adoptBuiltForRun;
 
 const build_scan = @import("scan.zig");
+const new_instance_mod = @import("../vm/host_instances/new_instance.zig");
 const boundTypeRecordComplete = build_scan.boundTypeRecordComplete;
 const classPropHead = build_scan.classPropHead;
 const collectClassMemberNamesInto = build_scan.collectClassMemberNamesInto;
@@ -118,6 +120,10 @@ pub const BuildCtx = struct {
     module_ref: ObjRef(Module),
     module: *Module,
     file: *const KotlinFile,
+    /// Set whenever a round of property-type inference learned a new head, so
+    /// the pass can run again: one property's inferred type is another's
+    /// evidence, and a single round stops at the first link of every chain.
+    inferred_prop_heads_grew: bool = false,
     fqn_overrides: *const SpanStrMap,
     func_fqn_overrides: *const SpanStrMap,
     decl_pkg: *const SpanStrMap,
@@ -199,6 +205,9 @@ pub const BuildCtx = struct {
         // The ObjRef holds the only handle during the build and nothing else borrows it, so a
         // raw pointer into the cell is a stable `*Module` for the lowering driver.
         const module: *Module = &module_ref.cell.data;
+        // A cloned or fresh module took this thread's pending pick tables in
+        // `Module.init`; an owned base is extended in place and takes them here.
+        if (base != null and own_base) module.adoptPicks(ir.takePendingPicks());
         const a = module.registry.allocator;
         const base_funcs_len = module.funcs.items.len;
         const base_classes_len = module.classes.items.len;
@@ -478,10 +487,16 @@ pub fn buildModuleWithOverrides(
     try registerTopLevelFuncHeaders(ctx);
     phase.mark("registerTopLevelFuncHeaders");
     phase.mark("registerTopLevelFuncHeaders");
+    try registerMemberExtPropHeaders(ctx);
+    phase.mark("registerMemberExtPropHeaders");
+    try registerTopLevelAccessorHeaders(ctx);
+    phase.mark("registerTopLevelAccessorHeaders");
     try registerCallableExtensionProps(ctx);
     phase.mark("registerCallableExtensionProps");
     try registerReceiverFnPropHeads(ctx);
     phase.mark("registerReceiverFnPropHeads");
+    try registerInferredPropertyTypeHeads(ctx);
+    phase.mark("registerInferredPropertyTypeHeads");
 
     // The bodies read the stage's picks, so it finishes first and the module
     // takes its tables, which the stage left in the shared hand-off.
@@ -493,6 +508,23 @@ pub fn buildModuleWithOverrides(
         }
     }
 
+    // The runtime class defs are built before any body lowers, not after. They
+    // are a function of the declarations, which are final here, and the field
+    // layout is read off them: a `GetField` can only carry a slot if the
+    // layout table exists at the moment the read is emitted.
+    try buildRuntimeClassDefs(ctx);
+    phase.mark("buildRuntimeClassDefs");
+    try registerEnumEntries(ctx);
+    phase.mark("registerEnumEntries");
+    try linkRuntimeSupertypes(ctx);
+    phase.mark("linkRuntimeSupertypes");
+    // With every class registered and every supertype linked, each class can
+    // say what it adds to its superclass's slots and the chains compose. This
+    // runs BEFORE any body lowers so a field read can carry its slot; the
+    // classes lowering itself creates are published by the pass at the end.
+    try publishFieldLayoutsAndLink(ctx);
+    phase.mark("publishFieldLayouts");
+
     // Lower every body and thunk against the now-complete header set.
     try lowerClassBodies(ctx);
     phase.mark("lowerClassBodies");
@@ -503,12 +535,6 @@ pub fn buildModuleWithOverrides(
     try lowerClassMemberThunks(ctx);
     phase.mark("lowerClassMemberThunks");
     phase.mark("lowerClassMemberThunks");
-    try buildRuntimeClassDefs(ctx);
-    phase.mark("buildRuntimeClassDefs");
-    try registerEnumEntries(ctx);
-    phase.mark("registerEnumEntries");
-    try linkRuntimeSupertypes(ctx);
-    phase.mark("linkRuntimeSupertypes");
     try lowerParentCtorArgThunks(ctx);
     phase.mark("lowerParentCtorArgThunks");
     try lowerInitBlockThunks(ctx);
@@ -1052,6 +1078,68 @@ fn registerHierarchyShadowNames(ctx: *BuildCtx) Allocator.Error!void {
             try module.registry.hierarchy_shadow_names.put(cname.*, .{ .names = names, .complete = complete });
         }
     }
+    try registerSubclassDeclaredNames(ctx);
+    if (runtime.envOnce("KLIO_SHADOW_PROBE") != null) {
+        var complete: usize = 0;
+        var incomplete: usize = 0;
+        var it = module.registry.hierarchy_shadow_names.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.complete) complete += 1 else incomplete += 1;
+        }
+        std.debug.print("[shadow-probe] classes={d} complete={d} incomplete={d}\n", .{ module.registry.hierarchy_shadow_names.count(), complete, incomplete });
+    }
+}
+
+/// `(ancestor, member name)` for every name a STRICT subclass declares, read
+/// from the AST members — the authoritative record, and the only one.
+///
+/// A published layout misses an accessor-only override, which contributes no
+/// slot; the `__get_<Class>_<prop>` contract misses one too, because an
+/// `override var x get() = ... set(...) = ...` produces no function under it.
+/// Both proxies were tried and both let `TransparentObserverMutableSnapshot`'s
+/// `invalid` through, where an open-class slot claim then served a stale cell.
+fn registerSubclassDeclaredNames(ctx: *BuildCtx) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    const file_classes = &ctx.file_classes;
+    var it = file_classes.iterator();
+    while (it.next()) |e| {
+        const ref = e.value_ptr.*;
+        const c = ref.get();
+        var own = StringSet.init(a);
+        defer own.deinit();
+        try collectClassMemberNamesInto(&own, c.primary_params, c.members);
+        if (own.count() == 0) continue;
+        var seen = StringSet.init(a);
+        defer seen.deinit();
+        var ancestors = StringSet.init(a);
+        defer ancestors.deinit();
+        try collectAncestorNames(c, file_classes, &ancestors, &seen);
+        var ait = ancestors.keyIterator();
+        while (ait.next()) |anc| {
+            var oit = own.keyIterator();
+            while (oit.next()) |nm| {
+                const key = try std.fmt.allocPrint(a, "{s}\u{1f}{s}", .{ anc.*, nm.* });
+                if (module.registry.subclass_declares_prop.contains(key)) {
+                    a.free(key);
+                    continue;
+                }
+                try module.registry.subclass_declares_prop.put(key, {});
+            }
+        }
+    }
+}
+
+/// Every transitive supertype simple name of `c`, itself excluded.
+fn collectAncestorNames(c: *const ast.Class, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!void {
+    for (c.supertypes) |*st| {
+        const nm = st.name.name;
+        const gop = try seen.getOrPut(nm);
+        if (gop.found_existing) continue;
+        try out.put(nm, {});
+        const ref = by_name.get(nm) orelse continue;
+        try collectAncestorNames(ref.get(), by_name, out, seen);
+    }
 }
 
 fn registerMemberNameUniverse(ctx: *BuildCtx) Allocator.Error!void {
@@ -1070,6 +1158,20 @@ fn registerMemberNameUniverse(ctx: *BuildCtx) Allocator.Error!void {
     // A bare `data` in an unsigned extension is `this.data`, so it must shadow a same-named
     // cross-package top-level the way a declared member would.
     try module.registry.class_member_names.put("data", {});
+    // A host classifier's members are declared nowhere this walk can see them,
+    // and a universe missing them answers "no receiver has this name" about
+    // names `String`, `KClass` and the array families all serve. The natives
+    // table is where those declarations are, keyed `pkg.Classifier.member`, so
+    // a capitalized owner segment is what marks one.
+    var fqn_it = stdlib.implementations.allFqns();
+    while (fqn_it.next()) |fqn| {
+        const last_dot = std.mem.findScalarLast(u8, fqn, '.') orelse continue;
+        const owner = fqn[0..last_dot];
+        const owner_dot = std.mem.findScalarLast(u8, owner, '.');
+        const owner_simple = if (owner_dot) |d| owner[d + 1 ..] else owner;
+        if (owner_simple.len == 0 or !std.ascii.isUpper(owner_simple[0])) continue;
+        try module.registry.class_member_names.put(fqn[last_dot + 1 ..], {});
+    }
 }
 
 fn registerPropertyTypeHeads(ctx: *BuildCtx) Allocator.Error!void {
@@ -1240,6 +1342,229 @@ fn registerObjectPropTypeHeads(ctx: *BuildCtx, o: *ast.ObjectDecl) Allocator.Err
             try putClassPropHead(module, o.name.name, ofqn, prop.name.name, head);
         }
     }
+}
+
+/// Property type heads that a declaration does not state and the early table
+/// pass cannot infer.
+///
+/// That pass runs before any class shell is reserved, so its constructor-call
+/// channel asks a module that knows none of this build's classes: a property
+/// initialised from a class declared alongside it goes untyped, and every call
+/// on it dispatches by name. In one compose program that is 729 member-call
+/// sites with no receiver type, `changeListWriter` alone accounting for 148.
+///
+/// This runs after the class shells and the file import scopes exist, and
+/// resolves the initializer's callee the way Kotlin resolves a name: the file's
+/// named imports, then its own package, then a module-wide simple name only
+/// when it denotes one class. The head recorded is the class's FQN, because two
+/// packages declare `ComposerChangeListWriter` and a simple head would bind
+/// whichever the class list happened to hold first.
+///
+/// Additive: a head the earlier pass recorded is never replaced.
+fn registerInferredPropertyTypeHeads(ctx: *BuildCtx) Allocator.Error!void {
+    // Iterate to stability. A property's inferred head is evidence for the next
+    // property's initializer, so one round settles only the first link of every
+    // chain; the census showed the rest of them as receivers with no type. The
+    // cap is a guard, not a budget — the corpus settles in a handful of rounds.
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        ctx.inferred_prop_heads_grew = false;
+        for (ctx.decls) |*d| {
+            switch (d.*) {
+                .Class => |*c| try inferClassPropHeads(ctx, c),
+                .Object => |*o| try inferObjectPropHeads(ctx, o),
+                else => {},
+            }
+        }
+        if (!ctx.inferred_prop_heads_grew) break;
+    }
+    if (runtime.envOnce("KLIO_INFER_ROUNDS") != null)
+        std.debug.print("[infer-rounds] {d}\n", .{round + 1});
+}
+
+fn inferClassPropHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void {
+    const cfqn = try declFqnAt(ctx.a, ctx.module, ctx.fqn_overrides, c.span, ctx.package_prefix, c.name.name);
+    for (c.members) |*m| {
+        switch (m.*) {
+            .Property => |prop| {
+                if (declaredMemberPropType(c, prop) != null) continue;
+                try fillPropHead(ctx, c.name.name, cfqn, prop);
+            },
+            // A companion registers under `{Owner}$Companion`, the key the
+            // declared-type pass and `barePathSelfTypeRef` both use.
+            //
+            // A nested class does NOT recurse. Lowering keys a nested owner by
+            // its lifted name (`Outer$Nested`), so a row under the nested
+            // class's simple name is never read for it — and that simple name
+            // is the key of any top-level class spelled the same, whose own
+            // property of that name would then resolve to the nested class's
+            // type. The declared-type pass has the same key, but it records
+            // far fewer rows; filling every gap turned a latent collision into
+            // an observable one.
+            .Class => |*nested| {
+                if (!nested.is_companion) continue;
+                var ckey_buf: [192]u8 = undefined;
+                const ckey = std.fmt.bufPrint(&ckey_buf, "{s}$Companion", .{c.name.name}) catch continue;
+                const owned = try ctx.a.dupe(u8, ckey);
+                for (nested.members) |*cm| {
+                    if (cm.* != .Property) continue;
+                    if (declaredMemberPropType(nested, cm.Property) != null) continue;
+                    try fillPropHead(ctx, owned, owned, cm.Property);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+fn inferObjectPropHeads(ctx: *BuildCtx, o: *ast.ObjectDecl) Allocator.Error!void {
+    const ofqn = try declFqnAt(ctx.a, ctx.module, ctx.fqn_overrides, o.span, ctx.package_prefix, o.name.name);
+    for (o.members) |*m| {
+        if (m.* != .Property) continue;
+        const prop = m.Property;
+        if (prop.ty != null) continue;
+        try fillPropHead(ctx, o.name.name, ofqn, prop);
+    }
+}
+
+fn fillPropHead(ctx: *BuildCtx, simple: []const u8, fqn: []const u8, prop: *const ast.Property) Allocator.Error!void {
+    const module = ctx.module;
+    if (module.registry.class_prop_type_heads.get(.{ .a = simple, .b = prop.name.name }) != null) return;
+    const head = inferredPropHead(module, simple, prop) orelse return;
+    try putClassPropHead(module, simple, fqn, prop.name.name, head);
+    ctx.inferred_prop_heads_grew = true;
+}
+
+/// The type head of an unannotated property, from whichever channel its
+/// initializer offers. A constructor call names its class; a literal or an
+/// arithmetic fold over literals names a builtin; a call to a function with a
+/// DECLARED return type names that. Each is a fact the declaration already
+/// carries, so none of them waits on a resolution.
+fn inferredPropHead(module: *ir.Module, owner: []const u8, prop: *const ast.Property) ?[]const u8 {
+    if (inferredCtorHead(module, prop)) |h| return h;
+    const src = build_scan.propHeadSourceExpr(prop) orelse return null;
+    if (build_scan.constExprTypeHead(module, src)) |h| return h;
+    if (declaredReturnHead(module, src)) |h| return h;
+    return classifierMemberHead(module, owner, src, 0);
+}
+
+/// `val x = Owner.prop`, where `Owner` names a class or object: the head is
+/// whatever that class records for `prop`. The dominant shape by a wide margin
+/// — 5 012 of 6 972 initializers the inference could not type on a compose
+/// program are a `Member` — and the one the iteration is for, since the head it
+/// reads may itself have been inferred on an earlier round.
+fn classifierMemberHead(module: *ir.Module, owner: []const u8, src: *const ast.Expr, depth: u8) ?[]const u8 {
+    if (depth > 4) return null;
+    if (src.* != .Member) return null;
+    const m = src.Member;
+    if (m.safe) return null;
+    const recv_head = classifierHeadOf(module, owner, m.receiver, depth) orelse return null;
+    // Under the FQN first: a lifted twin (`SlotTable` in two packages) records
+    // its rows under its mangled name and its FQN, and never under the bare
+    // tail, which would be the other twin's key if it were anyone's.
+    if (module.registry.class_prop_type_heads.get(.{ .a = recv_head, .b = m.name.name })) |h| return h;
+    const simple = if (std.mem.findScalarLast(u8, recv_head, '.')) |d| recv_head[d + 1 ..] else recv_head;
+    return module.registry.class_prop_type_heads.get(.{ .a = simple, .b = m.name.name });
+}
+
+/// The class a receiver expression names: a bare classifier, the declaring
+/// class's own property whose head is recorded (`table` in `private val
+/// addressSpace = table.addressSpace`, the constructor property beside it),
+/// or a member read whose own head is recorded. A package segment or an
+/// unrecorded local stops the walk.
+fn classifierHeadOf(module: *ir.Module, owner: []const u8, e: *const ast.Expr, depth: u8) ?[]const u8 {
+    switch (e.*) {
+        .Path => |p| {
+            if (p.segments.len != 1) return null;
+            const nm = p.segments[0].name;
+            if (nm.len == 0) return null;
+            if (!std.ascii.isUpper(nm[0])) {
+                // The recorded head is the declaration's spelling, `SlotTable`
+                // for `val table: SlotTable`; the rows it keys are under the
+                // class's row name and FQN, so resolve it where it was written.
+                const h = module.registry.class_prop_type_heads.get(.{ .a = owner, .b = nm }) orelse return null;
+                if (std.mem.findScalar(u8, h, '.') != null) return h;
+                const cid = classIdInFileScope(module, h, p.segments[0].span.file) orelse return h;
+                if (cid.int() >= module.classes.items.len) return h;
+                const c = &module.classes.items[cid.int()];
+                return if (c.fqn.len == 0) h else c.fqn;
+            }
+            const cid = classIdInFileScope(module, nm, p.segments[0].span.file) orelse return null;
+            if (cid.int() >= module.classes.items.len) return null;
+            const c = &module.classes.items[cid.int()];
+            return if (c.fqn.len == 0) null else c.fqn;
+        },
+        .Member => return classifierMemberHead(module, owner, e, depth + 1),
+        else => return null,
+    }
+}
+
+/// The declared return head of `f(...)` where `f` is a plain single-name callee
+/// and every visible declaration of that name agrees. An inferred return is no
+/// answer: `return_ty` is a `Unit` placeholder until `return_ty_declared`.
+fn declaredReturnHead(module: *ir.Module, src: *const ast.Expr) ?[]const u8 {
+    if (src.* != .Call) return null;
+    const callee = src.Call.callee;
+    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const nm = callee.Path.segments[0].name;
+    if (nm.len == 0 or std.ascii.isUpper(nm[0])) return null;
+    var head: ?[]const u8 = null;
+    for (module.funcsBySimpleName(nm)) |fid| {
+        const f = module.funcById(fid) orelse return null;
+        if (!f.return_ty_declared) return null;
+        const h = std.mem.trimEnd(u8, f.return_ty.name, "?");
+        if (h.len == 0) return null;
+        if (head) |prev| {
+            if (!std.mem.eql(u8, prev, h)) return null;
+        } else head = h;
+    }
+    const h = head orelse return null;
+    // Only a head that names a real class: a type parameter or a builtin the
+    // class table does not carry is no receiver type.
+    if (module.classId(h) == null and module.classIdByFqn(h) == null) return null;
+    return h;
+}
+
+/// The FQN of the class a property's initializer constructs, resolved in the
+/// file that declares the property. Only a name that IS a class counts: a
+/// same-shaped factory call may return something else entirely.
+fn inferredCtorHead(module: *ir.Module, prop: *const ast.Property) ?[]const u8 {
+    const src = propHeadSourceExpr(prop) orelse return null;
+    if (src.* != .Call) return null;
+    const callee = src.Call.callee;
+    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const seg = callee.Path.segments[0];
+    const nm = seg.name;
+    if (nm.len == 0 or !std.ascii.isUpper(nm[0])) return null;
+    // A short all-caps head is a type parameter, not a class.
+    if (nm.len <= 2) return null;
+    const cid = classIdInFileScope(module, nm, seg.span.file) orelse return null;
+    if (cid.int() >= module.classes.items.len) return null;
+    // A capitalised callee that names a class is not always its constructor:
+    // Kotlin resolves `Boxy(5)` to `fun Boxy(n: Int)` when `class Boxy` has no
+    // one-argument constructor, and the class's head would name the wrong type.
+    if (build_scan.ctorHeadOutrankedByFactory(module, nm, src.Call.args.len, cid)) return null;
+    const cls = &module.classes.items[cid.int()];
+    // An interface head is kept deliberately: a `fun interface` constructor
+    // call names exactly that type.
+    if (cls.fqn.len == 0) return null;
+    return cls.fqn;
+}
+
+/// Kotlin's resolution order for an unqualified classifier: the file's named
+/// imports, its own package, then a module-wide simple name only when one class
+/// answers to it.
+fn classIdInFileScope(module: *ir.Module, name: []const u8, file: ir.FileId) ?ir.ClassId {
+    if (module.classIdExactImport(name, file)) |cid| return cid;
+    if (module.packageOfFile(file)) |pkg| {
+        if (pkg.len != 0) {
+            var buf: [256]u8 = undefined;
+            if (std.fmt.bufPrint(&buf, "{s}.{s}", .{ pkg, name })) |fqn| {
+                if (module.classIdByFqn(fqn)) |cid| return cid;
+            } else |_| {}
+        }
+    }
+    return module.uniqueClassIdBySimpleName(name);
 }
 
 fn registerClassSuperNameChains(ctx: *BuildCtx) Allocator.Error!void {
@@ -1425,6 +1750,7 @@ fn installMemberAstTables(ctx: *BuildCtx) Allocator.Error!void {
             ir.lower.resetMemberExtPropRecv();
             // Same lifetime rule: the registered expression-body member ASTs point into the previous build's arena.
             ir.lower.resetExprBodyMembers();
+            ir.lower.resetExprBodyFnIds();
             var fcit = file_classes.iterator();
             while (fcit.next()) |e| {
                 registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
@@ -1794,6 +2120,10 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
         f.name.name,
     );
     const stub_params = try headerStubParams(ctx, f, receiver_ty);
+    // A top-level expression body with no declared return is derivable from
+    // its AST by a caller lowered before it, under the id no call site can
+    // misname the way it can a per-file owner.
+    try ir.lower.registerExprBodyFn(id.int(), f);
     try module.funcs.append(a, .{
         .id = id,
         .name = f.name.name,
@@ -1815,6 +2145,7 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
         .low_priority = ir.lower.decl.isLowPriorityOverload(f),
         .deprecated_error = ir.lower.decl.annotationsAreDeprecatedError(f.annotations),
         .is_expect = f.is_expect,
+            .extra = try ir.lower.decl.headerCtxExtra(a, f),
     });
     try module.func_index.append(a, .{ .name = f.name.name, .id = id });
     try module.recordFuncDeclSpan(a, f.name.span, id);
@@ -1849,10 +2180,14 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
         try module.decl_user_sig.put(id.int(), sig);
         decl_sig = sig;
     }
+    const pn = try ir.lower.decl.declParamNames(a, f);
     try module.decl_sigs.put(id.int(), .{
         .receiver_ty = receiver_ty,
         .arity = arity,
         .sig = decl_sig,
+        .param_names = pn.names,
+        .param_defaults = pn.defaults,
+        .return_ty = if (f.return_type) |rt| try ir.lower.decl.loweredTypeRef(a, rt, true) else null,
         .kind = if (f.receiver_type != null) .top_level_extension else .plain,
         .visibility = f.visibility,
         .is_inline = f.is_inline,
@@ -1867,6 +2202,14 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
     // declaration the symbol index resolved.
     if (f.is_inline and f.body != null) {
         try ir.lower.registerInlineFnId(id.int(), FF(ast.Function).fromPtr(f));
+    }
+    // An expression body with no declared return is the only shape whose type
+    // a caller has to derive, and the id is how a top-level one is reached:
+    // its owner is the synthesized per-file class, which no call site names.
+    if (f.return_type == null) {
+        if (f.body) |*fb| {
+            if (fb.* == .Expr) try ir.lower.registerExprBodyFnId(id.int(), FF(ast.Function).fromPtr(f));
+        }
     }
     try stub_ids.append(a, id);
 }
@@ -2231,7 +2574,8 @@ pub fn placeBody(ctx: *BuildCtx, job: body_pool.Job, func: ir.Func) Allocator.Er
     placed.id = id;
     placed.fqn = module.funcByIdMut(id).?.fqn;
     placed.package = module.funcByIdMut(id).?.package;
-    module.funcByIdMut(id).?.* = placed;
+    if (runtime.envOnce("KLIO_FUNC_TRACE") != null) std.debug.print("[place-top] id={d} was={s} now={s}\n", .{ id.int(), module.funcByIdMut(id).?.fqn, placed.fqn });
+        module.funcByIdMut(id).?.* = placed;
     // Kotlin scopes a private top-level declaration to its FILE, so dispatch never binds a private
     // extension from another file.
     if (f.visibility == .Private) {
@@ -2308,11 +2652,11 @@ fn lowerFunctionDefaultThunks(ctx: *BuildCtx, f: *const ast.Function, id: FuncId
                 // A default referencing a CONTEXT parameter resolves as the body does: the thunk runs at call
                 // time with the context on the stack, so the params are stashed for its `consumePendingCtx`.
                 if (f.context_params.len != 0) {
-                    module.has_context_decls = true;
                     module.pending_ctx = .{ .params = f.context_params, .type_params = f.type_params };
                 }
                 const thunk_name = try std.fmt.allocPrint(a, "__default_{s}_{s}", .{ f.name.name, p.name.name });
                 const target_expr: *const ast.Expr = if (widened) |*w| w else default_expr;
+                module.pending_thunk_expected = p.ty;
                 const fid = try ir.lower.lowerExprAsParamThunk(module, name_refs.items[0..bind_upto], target_expr, thunk_name);
                 try slots.append(a, fid);
             } else {
@@ -2431,6 +2775,8 @@ fn lowerPrimaryCtorDefaultThunks(ctx: *BuildCtx, c: *ast.Class, own_members: *St
             if (p.default) |*e| {
                 const nm = try std.fmt.allocPrint(a, "__ctor_default_{s}_{s}", .{ c.name.name, p.name.name });
                 module.pending_param_types = ctor_default_types;
+                module.pending_this_is_outer = c.is_inner;
+                module.pending_thunk_expected = p.ty;
                 slots[i] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(module, ctor_default_params.items, e, nm, c.name.name, own_members, ctor_enclosing);
             } else {
                 slots[i] = null;
@@ -2536,6 +2882,19 @@ fn lowerBodyPropertyGetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property
                 break :blk try ir.lower.lowerAccessorBlock(module, c.name.name, own_members, &.{"this"}, &rewritten, nm);
             },
         };
+        // The accessor's own visibility, which a bare read of the property
+        // binds by: a private accessor is the declaring class's alone, and a
+        // same-named private property in a subclass is another declaration.
+        if (module.decl_sigs.getPtr(fid.int())) |sig| {
+            sig.visibility = p.visibility;
+        } else {
+            try module.decl_sigs.put(fid.int(), .{
+                .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+                .kind = .instance_method,
+                .visibility = p.visibility,
+                .has_body = true,
+            });
+        }
         // A PRIVATE class's accessors register under the FQN key only: the simple slot is shared
         // program-wide, and a private namesake must never capture dispatch for an unrelated public class.
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
@@ -2744,6 +3103,7 @@ fn lowerEnumEntry(
         for (0..slot_count) |idx| {
             const nm = try std.fmt.allocPrint(a, "__enum_arg_{s}_{s}_{d}", .{ c.name.name, entry.name.name, idx });
             const arg_expr = slot_exprs[idx] orelse &c.primary_params[idx].default.?;
+            if (idx < c.primary_params.len) module.pending_thunk_expected = c.primary_params[idx].ty;
             fids[idx] = try ir.lower.lowerExprAsParamThunkScoped(module, &enum_this, arg_expr, nm, c.name.name, &enum_scope);
         }
         try enum_entry_arg_inits.append(a, .{ .class_name = c.name.name, .entry_name = entry.name.name, .funcs = fids });
@@ -2883,6 +3243,7 @@ fn lowerParentCtorArgThunks(ctx: *BuildCtx) Allocator.Error!void {
         for (parent_args, 0..) |*e, idx| {
             const nm = try std.fmt.allocPrint(a, "__parent_ctor_arg_{s}_{d}", .{ c.name.name, idx });
             module.pending_param_types = parent_arg_types;
+            module.pending_this_is_outer = c.is_inner;
             module.pending_thunk_expected = parentCtorParamExpected(a, module, c, first_idx, idx);
             fids[idx] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(
                 module,
@@ -3173,6 +3534,7 @@ fn lowerSecondaryCtor(
         const e = &delegation_args[src_idx];
         const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_arg{d}", .{ c.name.name, sc_idx, arg_idx });
         module.pending_param_types = sc_thunk_types;
+        module.pending_this_is_outer = c.is_inner;
         module.pending_own_member_arity = own_arity;
         arg_fids[arg_idx] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(module, sc_thunk_params, e, nm, c.name.name, own_members, sc_enclosing);
     }
@@ -3181,7 +3543,9 @@ fn lowerSecondaryCtor(
         if (p.default) |e| {
             const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_def{d}", .{ c.name.name, sc_idx, p_idx });
             module.pending_param_types = sc_thunk_types;
+            module.pending_this_is_outer = c.is_inner;
             module.pending_own_member_arity = own_arity;
+            module.pending_thunk_expected = p.ty;
             default_arg_thunks[p_idx] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(module, sc_thunk_params, e, nm, c.name.name, own_members, sc_enclosing);
         } else {
             default_arg_thunks[p_idx] = null;
@@ -3333,13 +3697,13 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
             try module.registry.top_level_lateinit_props.put(p.name.name, {});
         }
         if (p.delegate == null) {
-            if (p.context_params.len != 0) module.has_context_decls = true;
             if (p.getter) |getter| {
                 // With storage the getter re-runs on each plain-name read and its `field` reads the raw key;
                 // without storage it is the field-less computed-property form.
                 if (p.context_params.len != 0)
                     module.pending_ctx = .{ .params = p.context_params, .type_params = &.{} };
                 const nm = try std.fmt.allocPrint(a, "__top_prop_get_{s}", .{p.name.name});
+                module.pending_accessor_place_id = module.funcByDeclSpan(getter.span);
                 const fid = switch (getter.body) {
                     .Expr => |body| blk: {
                         const rewritten = try lift.substituteFieldWithGlobal(a, p.name.name, &body);
@@ -3351,6 +3715,7 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
                         break :blk try ir.lower.lowerBlockAsThunk(module, &rewritten.Block, nm);
                     },
                 };
+                module.pending_accessor_place_id = null;
                 try module.registry.top_level_prop_getters.put(p.name.name, fid);
             }
             if (p.setter) |setter| {
@@ -3358,6 +3723,7 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
                 if (p.context_params.len != 0)
                     module.pending_ctx = .{ .params = p.context_params, .type_params = &.{} };
                 const nm = try std.fmt.allocPrint(a, "__top_prop_set_{s}", .{p.name.name});
+                module.pending_accessor_place_id = module.funcByDeclSpan(setter.span);
                 const fid = switch (setter.body) {
                     .Expr => |body| blk: {
                         const rewritten = try lift.substituteFieldWithGlobal(a, p.name.name, &body);
@@ -3369,6 +3735,7 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
                         break :blk try ir.lower.lowerBlockAsUnaryThunk(module, value_param, &rewritten.Block, nm);
                     },
                 };
+                module.pending_accessor_place_id = null;
                 try module.registry.top_level_prop_setters.put(p.name.name, fid);
             }
         }
@@ -3376,13 +3743,14 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
 }
 
 /// Lower every extension property: file-level, and the member extensions a class owns.
-fn lowerExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
+/// Every extension property the file declares, top-level and member, with the
+/// declaring class of a member one.
+fn collectExtPropDecls(ctx: *BuildCtx, out: *std.ArrayList(ExtPropDecl)) Allocator.Error!void {
     const a = ctx.a;
     const decls = ctx.decls;
     const fqn_overrides = ctx.fqn_overrides;
     const package_prefix = ctx.package_prefix;
-    var ext_prop_decls: std.ArrayList(ExtPropDecl) = .empty;
-    defer ext_prop_decls.deinit(a);
+    const ext_prop_decls = out;
     for (decls) |*d| {
         switch (d.*) {
             .Property => |p| if (p.receiver_type != null) try ext_prop_decls.append(a, .{ .p = p, .owner = null }),
@@ -3424,16 +3792,157 @@ fn lowerExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
             else => {},
         }
     }
-    // Class-typed typealiases collect here, the shared `type_aliases` map recording only function-typed
-    // ones, so an extension receiver named by an alias expands to the class.
-    var class_aliases = runtime.NameHashMap([]const u8).init(a);
-    defer class_aliases.deinit();
-    for (decls) |*d| {
+}
+
+/// Class-typed typealiases, the shared `type_aliases` map recording only function-typed
+/// ones, so an extension receiver named by an alias expands to the class.
+fn collectClassAliases(ctx: *BuildCtx) Allocator.Error!runtime.NameHashMap([]const u8) {
+    var class_aliases = runtime.NameHashMap([]const u8).init(ctx.a);
+    for (ctx.decls) |*d| {
         if (d.* != .TypeAlias) continue;
         const ta = &d.TypeAlias;
         if (ta.target.function != null) continue;
         try class_aliases.put(ta.name.name, ta.target.name.name);
     }
+    return class_aliases;
+}
+
+/// The receiver head an extension property keys and names its accessors by: a
+/// typealias expands to its class, a member extension on the owner's type
+/// parameter keys on the parameter's upper bound, a function type on `Function`.
+fn extPropReceiverName(epd: ExtPropDecl, class_aliases: *const runtime.NameHashMap([]const u8)) []const u8 {
+    const recv = epd.p.receiver_type orelse return "";
+    var recv_name = recv.name.name;
+    {
+        var hops: usize = 0;
+        while (class_aliases.get(recv_name)) |t| : (hops += 1) {
+            if (hops > 8 or std.mem.eql(u8, t, recv_name)) break;
+            recv_name = t;
+        }
+    }
+    for (epd.owner_type_params) |*tp| {
+        if (!std.mem.eql(u8, tp.name.name, recv_name)) continue;
+        recv_name = if (tp.upper_bound) |ub| ub.name.name else "Any";
+        break;
+    }
+    if (recv.function != null) recv_name = "Function";
+    return recv_name;
+}
+
+/// Reserve every member-extension property getter's identity before any body
+/// lowers: a read the enclosing class resolves to its own extension property
+/// binds the getter's FuncId, and a class body lowers before the accessor does.
+fn registerMemberExtPropHeaders(ctx: *BuildCtx) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    var ext_prop_decls: std.ArrayList(ExtPropDecl) = .empty;
+    defer ext_prop_decls.deinit(a);
+    try collectExtPropDecls(ctx, &ext_prop_decls);
+    var class_aliases = try collectClassAliases(ctx);
+    defer class_aliases.deinit();
+    for (ext_prop_decls.items) |epd| {
+        const owner = epd.owner orelse continue;
+        const p = epd.p;
+        if (p.getter == null) continue;
+        const recv = p.receiver_type orelse continue;
+        const recv_name = extPropReceiverName(epd, &class_aliases);
+        const nm = try std.fmt.allocPrint(a, "__ext_get_{s}_{s}", .{ recv_name, p.name.name });
+        const params = try a.alloc(Param, 1);
+        params[0] = .{
+            .name = "this",
+            .ty = try ir.lower.decl.loweredTypeRef(a, recv, true),
+            .default = null,
+            .is_property = false,
+            .is_vararg = false,
+            .has_default = false,
+        };
+        const id = try reserveAccessorHeader(ctx, nm, params, p, p.name.span, .member_extension);
+        try module.registry.member_ext_owner_class.put(id, owner);
+    }
+}
+
+/// Reserve a top-level custom accessor's identity before the bodies lower: a
+/// read of a property with a getter is a call to it and a write to one with a
+/// setter a call to that, and the sites need the FuncId while the class bodies
+/// and top-level functions lower, before `lowerTopLevelProps` places the thunk.
+/// A property the host implements under its FQN keeps its by-name protocol:
+/// the host's binding is what every read of that name finds, and the source
+/// accessor never runs. A contextual accessor's header carries its context
+/// types so a reader hands them over.
+fn registerTopLevelAccessorHeaders(ctx: *BuildCtx) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    for (ctx.decls) |*d| {
+        if (d.* != .Property) continue;
+        const p = d.Property;
+        if (p.receiver_type != null or p.is_const) continue;
+        const fqn = try resolveFqn(a, ctx.func_fqn_overrides, p.span, ctx.package_prefix, p.name.name);
+        if (stdlib.declarationHostSymbol(fqn, null, p.name.name) != null) continue;
+        if (p.getter) |getter| {
+            const nm = try std.fmt.allocPrint(a, "__top_prop_get_{s}", .{p.name.name});
+            const id = try reserveAccessorHeader(ctx, nm, &.{}, p, getter.span, .plain);
+            try module.registry.top_level_prop_getters.put(p.name.name, id);
+        }
+        if (p.setter) |setter| {
+            const nm = try std.fmt.allocPrint(a, "__top_prop_set_{s}", .{p.name.name});
+            const params = try a.alloc(Param, 1);
+            params[0] = .{
+                .name = if (setter.params.len != 0) setter.params[0].name else "value",
+                .ty = if (p.ty) |pt| try ir.lower.decl.loweredTypeRef(a, pt, true) else ir.build.typeUnit(),
+                .default = null,
+                .is_property = false,
+                .is_vararg = false,
+                .has_default = false,
+            };
+            const id = try reserveAccessorHeader(ctx, nm, params, p, setter.span, .plain);
+            try module.registry.top_level_prop_setters.put(p.name.name, id);
+        }
+    }
+}
+
+/// Append a bodyless header for an accessor thunk named `nm`, indexed under the
+/// name and keyed by `decl_span` so `pushFunc` places the lowered body into it.
+fn reserveAccessorHeader(ctx: *BuildCtx, nm: []const u8, params: []Param, p: *const ast.Property, decl_span: ast.Span, kind: ir.FuncKind) Allocator.Error!FuncId {
+    const a = ctx.a;
+    const module = ctx.module;
+    const id = module.nextFuncId();
+    try module.appendFunc(.{
+        .id = id,
+        .name = nm,
+        .fqn = nm,
+        .package = try declPackage(a, ctx.decl_pkg, ctx.func_fqn_overrides, p.span, ctx.package_prefix, p.name.name),
+        .params = params,
+        .return_ty = if (p.ty) |pt| try ir.lower.decl.loweredTypeRef(a, pt, true) else ir.build.typeUnit(),
+        .return_ty_declared = p.ty != null,
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .is_tailrec = false,
+        .is_lambda = false,
+        .is_inline = false,
+        .low_priority = false,
+        .deprecated_error = false,
+        .is_expect = false,
+        .kind = kind,
+        .extra = try ir.lower.decl.ctxExtraFor(a, p.context_params),
+    });
+    try module.func_index.append(a, .{ .name = nm, .id = id });
+    const gop = try module.func_name_index.getOrPut(nm);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(a, id);
+    try module.recordFuncDeclSpan(a, decl_span, id);
+    try module.decl_ast_body.put(id.int(), {});
+    return id;
+}
+
+fn lowerExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
+    const a = ctx.a;
+    var ext_prop_decls: std.ArrayList(ExtPropDecl) = .empty;
+    defer ext_prop_decls.deinit(a);
+    try collectExtPropDecls(ctx, &ext_prop_decls);
+    var class_aliases = try collectClassAliases(ctx);
+    defer class_aliases.deinit();
     for (ext_prop_decls.items) |epd| {
         try lowerExtensionProp(ctx, epd, &class_aliases);
     }
@@ -3448,25 +3957,9 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const ru
     const package_prefix = ctx.package_prefix;
     const p = epd.p;
     const recv = p.receiver_type orelse return;
-    // A typealias receiver expands to the underlying type, so the extension dispatches on the class.
-    var recv_name = recv.name.name;
-    {
-        var hops: usize = 0;
-        while (class_aliases.get(recv_name)) |t| : (hops += 1) {
-            if (hops > 8 or std.mem.eql(u8, t, recv_name)) break;
-            recv_name = t;
-        }
-    }
-    // A member-extension property on the enclosing class's TYPE PARAMETER keys on the parameter's
-    // UPPER BOUND: every receiver it dispatches on is a subtype of the bound.
-    for (epd.owner_type_params) |*tp| {
-        if (!std.mem.eql(u8, tp.name.name, recv_name)) continue;
-        recv_name = if (tp.upper_bound) |ub| ub.name.name else "Any";
-        break;
-    }
+    const recv_name = extPropReceiverName(epd, class_aliases);
     // A `val X.Companion.foo` records `qualified_path = "X.Companion"` and is keyed under that path,
-    // so it never collides with a plain `val X.foo`. A function-type receiver keys under `Function`.
-    if (recv.function != null) recv_name = "Function";
+    // so it never collides with a plain `val X.foo`.
     const recv_key: []const u8 = if (recv.x().qualified_path) |qp|
         (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv_name)
     else
@@ -3527,10 +4020,18 @@ fn lowerExtensionPropGetter(
     const nm = try std.fmt.allocPrint(a, "__ext_get_{s}_{s}", .{ recv_name, p.name.name });
     module.pending_accessor_this_label = p.name.name;
     module.pending_accessor_dispatch_owner = dispatch_owner;
+    module.pending_accessor_place_id = if (epd.owner != null) module.funcByDeclSpan(p.name.span) else null;
     const fid = switch (getter.body) {
         .Expr => |body| try ir.lower.lowerAccessorExprWithExpected(module, recv_name, &empty_members, &.{"this"}, &body, nm, ast.unbox(p.ty)),
         .Block => |blk| try ir.lower.lowerAccessorBlockRet(module, recv_name, &empty_members, &.{"this"}, &blk, nm, ast.unbox(p.ty)),
     };
+    module.pending_accessor_place_id = null;
+    // A member-extension accessor runs as a member extension: its dispatch
+    // receiver is the declaring instance, seeded on the enclosing chain, and
+    // the flat activation that serves a plain method cannot carry one.
+    if (epd.owner != null) {
+        if (module.funcByIdMut(fid)) |gf| gf.kind = .member_extension;
+    }
     if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
         if (std.mem.eql(u8, w, p.name.name))
             std.debug.print("[extprop-reg] key=({s},{s}) fid={d} owner={s}\n", .{ recv_key, p.name.name, fid.int(), epd.owner orelse "<top>" });
@@ -3748,6 +4249,284 @@ fn materialiseRegistry(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
+/// Write each class's own field slots onto its `ir.Class`, so the layout stops
+/// being a runtime discovery and becomes a property of the declaration that the
+/// image carries and the lowering can read.
+///
+/// Only a class with no layout yet is described: a base image's classes arrive
+/// with theirs, and re-deriving them would walk the whole class table.
+/// Fill every unpublished class's own slots and compose the chains.
+///
+/// Runs twice: once with the declarations final and before any body lowers, so
+/// a field read can carry its slot, and once at the end for the classes
+/// lowering itself creates. The second pass skips what the first published.
+fn publishFieldLayoutsAndLink(ctx: *BuildCtx) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    markIntrinsicBackedClasses(module);
+    // Staleness is read before the publish, which is what would erase it.
+    const first_class = if (ctx.base != null) ctx.base_classes_len else 0;
+    const base_stale = first_class != 0 and module.baseFieldLayoutsStale(first_class);
+    try publishFieldLayouts(ctx);
+    if (first_class != 0 and !base_stale) {
+        try module.linkFieldSlotsFrom(a, first_class);
+    } else {
+        try module.linkFieldSlots(a);
+    }
+    if (class_layout.auditOn()) {
+        std.debug.print("[layout-link] classes={d} first={d} base_stale={}\n", .{
+            module.classes.items.len, first_class, base_stale,
+        });
+    }
+}
+
+/// Answer, once per class, whether construction routes through a host
+/// intrinsic. The runtime asked this by scanning a thirty-entry name table on
+/// every construction, for every class; it is a function of the FQN and never
+/// changes.
+fn markIntrinsicBackedClasses(module: *ir.Module) void {
+    for (module.classes.items) |*c| {
+        if (c.is_intrinsic_backed) continue;
+        if (c.fqn.len == 0) continue;
+        c.is_intrinsic_backed = new_instance_mod.isIntrinsicClass(c.fqn);
+    }
+}
+
+fn publishFieldLayouts(ctx: *BuildCtx) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    const lctx = class_layout.Ctx{
+        .allocator = a,
+        .shadow_key = &publishShadowKey,
+        .shadow_ctx = @ptrCast(module),
+        .delegate_keys = &publishDelegateKeys,
+        .delegate_ctx = @ptrCast(ctx),
+    };
+    var slots: std.ArrayList(class_layout.Slot) = .empty;
+    defer slots.deinit(a);
+    for (module.classes.items) |*c| {
+        if (c.field_layout.state != .unpublished) continue;
+        slots.clearRetainingCapacity();
+        c.field_layout = try classOwnFieldLayout(ctx, &lctx, c, &slots);
+    }
+}
+
+fn classOwnFieldLayout(
+    ctx: *BuildCtx,
+    lctx: *const class_layout.Ctx,
+    c: *const ir.Class,
+    slots: *std.ArrayList(class_layout.Slot),
+) Allocator.Error!ir.FieldLayout {
+    const a = ctx.a;
+    const module = ctx.module;
+    const def = ctx.classes.get(c.fqn) orelse ctx.classes.get(c.name) orelse
+        return .{ .state = .unavailable };
+    const g = def.borrow();
+    defer g.deinit();
+    const d = g.get();
+    // An alias entry can answer for a different declaration; only the class's
+    // own definition may describe it.
+    if (!std.mem.eql(u8, d.fqn, c.fqn)) return .{ .state = .unavailable };
+    if (d.is_interface) return .{ .state = .interface };
+    if (d.is_anonymous) return .{ .state = .anonymous };
+    if (d.is_local_runtime) return .{ .state = .local_runtime };
+
+    // Everything that can refuse runs before anything is allocated, so a class
+    // the table cannot describe costs nothing and keeps the runtime's walk.
+    var super: ?ir.ClassId = null;
+    if (d.parent) |parent| {
+        const pg = parent.borrow();
+        const pfqn = pg.get().fqn;
+        pg.deinit();
+        super = module.classIdByFqn(pfqn) orelse return .{ .state = .unavailable };
+    }
+    try class_layout.appendOwnSlots(lctx, d, slots);
+    for (slots.items) |slot| {
+        if (class_layout.seedKind(slot.seed) == null) return .{ .state = .unavailable };
+    }
+
+    const own = try a.alloc(ir.FieldSlot, slots.items.len);
+    for (slots.items, own) |slot, *out| {
+        out.* = .{ .name = slot.name, .seed = class_layout.seedKind(slot.seed).?, .plain = slot.plain, .ctor = slot.ctor, .plain_write = slot.plain_write, .type_head = slot.type_head };
+    }
+
+    // A plain constructor parameter this class's own body shadows with a
+    // property of the same name never becomes a field; whether one of the rest
+    // does depends on the whole chain, which the composition decides.
+    var captures: std.ArrayList([]const u8) = .empty;
+    errdefer captures.deinit(a);
+    next: for (d.primary_params) |p| {
+        if (p.property != null) continue;
+        for (d.body_properties) |*bp| {
+            if (std.mem.eql(u8, bp.name, p.name)) continue :next;
+        }
+        try captures.append(a, p.name);
+    }
+    return .{
+        .own = own,
+        .captures = try captures.toOwnedSlice(a),
+        .super = super,
+        .state = .ok,
+    };
+}
+
+/// `ctor_select.shadowFieldKey` against the module alone: the same two registry
+/// sets decide the storage key, with no program image to hand.
+fn publishShadowKey(ctx: ?*anyopaque, cls: []const u8, prop: []const u8) []const u8 {
+    const module: *const Module = @ptrCast(@alignCast(ctx orelse return prop));
+    var buf: [256]u8 = undefined;
+    const probe = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ cls, prop }) catch return prop;
+    if (module.registry.private_shadow_props.getKey(probe)) |k| return k;
+    return module.registry.override_cell_props.getKey(probe) orelse prop;
+}
+
+fn publishDelegateKeys(
+    ctx_in: ?*anyopaque,
+    def: *const ClassDef,
+    out: *std.ArrayList(class_layout.Slot),
+    a: Allocator,
+) Allocator.Error!void {
+    const ctx: *BuildCtx = @ptrCast(@alignCast(ctx_in orelse return));
+    next: for (classDelegates(ctx, def)) |sf| {
+        const field_key = try std.fmt.allocPrint(ctx.a, "__delegate__{s}", .{sf.name});
+        // A class delegating one interface from two levels stores one field, the
+        // most derived expression's, so the layout holds one slot. The walk
+        // dedups against the whole chain it has accumulated; here the chain's
+        // levels are described one at a time, so the ancestors are consulted.
+        for (out.items) |e| {
+            if (std.mem.eql(u8, e.name, field_key)) {
+                ctx.a.free(field_key);
+                continue :next;
+            }
+        }
+        if (ancestorDelegatesInterface(ctx, def, sf.name)) {
+            ctx.a.free(field_key);
+            continue :next;
+        }
+        try out.append(a, .{ .name = field_key, .seed = .Null });
+    }
+}
+
+fn classDelegates(ctx: *BuildCtx, def: *const ClassDef) []const StrFunc {
+    const key = if (def.fqn.len != 0) def.fqn else def.name;
+    return ctx.class_delegates.get(key) orelse &.{};
+}
+
+fn ancestorDelegatesInterface(ctx: *BuildCtx, def: *const ClassDef, iface: []const u8) bool {
+    var depth: usize = 0;
+    var cur: ?ObjRef(ClassDef) = if (def.parent) |p| p.clone() else null;
+    defer if (cur) |c| c.deinit();
+    while (cur) |c| : (depth += 1) {
+        if (depth >= ClassDef.MAX_WALK) return false;
+        const g = c.borrow();
+        const d = g.get();
+        for (classDelegates(ctx, d)) |sf| {
+            if (std.mem.eql(u8, sf.name, iface)) {
+                g.deinit();
+                return true;
+            }
+        }
+        const next = if (d.parent) |p| p.clone() else null;
+        g.deinit();
+        c.deinit();
+        cur = next;
+    }
+    return false;
+}
+
+/// `KLIO_INTRINSIC_PROBE=1`: how many member-call sites name a host intrinsic
+/// that a stable id could point at.
+///
+/// This is the question the whole resolution campaign arrives at. 84% of what
+/// the member-call gate leaves unresolved has a KNOWN receiver and no
+/// `FuncId` to name, because the target is Zig behind an FQN-keyed table.
+/// Nothing can bind those until the table has ids; this counts how many sites
+/// would take one.
+fn probeIntrinsicMembers(module: *ir.Module) void {
+    if (runtime.envOnce("KLIO_INTRINSIC_PROBE") == null) return;
+    var sites: usize = 0;
+    var with_head: usize = 0;
+    var hit_qualified: usize = 0;
+    var hit_simple: usize = 0;
+    var miss: usize = 0;
+    var buf: [512]u8 = undefined;
+    for (module.funcs.items) |*f| {
+        for (f.blocks) |*b| {
+            for (b.insts) |*inst| {
+                if (inst.* != .CallMember) continue;
+                const cm = &inst.CallMember;
+                sites += 1;
+                if (cm.x().resolved != null) continue;
+                // A proven site is already answered without a name; what this
+                // counts is what an intrinsic INDEX would still have to cover.
+                if (cm.builtin_proven) continue;
+                const sr = cm.x().static_recv orelse continue;
+                const head = switch (module.consts.items[sr.int()]) {
+                    .String => |str| str,
+                    else => continue,
+                };
+                const name = switch (module.consts.items[cm.name.int()]) {
+                    .String => |str| str,
+                    else => continue,
+                };
+                with_head += 1;
+                // The table keys members as `<package>.<Class>.<member>`. A
+                // site's head is sometimes written out and sometimes simple,
+                // so both spellings are tried before calling it a miss.
+                const q = std.fmt.bufPrint(&buf, "{s}.{s}", .{ head, name }) catch continue;
+                if (stdlib.implementation(q) != null) {
+                    hit_qualified += 1;
+                    continue;
+                }
+                const simple = if (std.mem.findScalarLast(u8, head, '.')) |i| head[i + 1 ..] else head;
+                const q2 = std.fmt.bufPrint(&buf, "kotlin.{s}.{s}", .{ simple, name }) catch continue;
+                if (stdlib.implementation(q2) != null) {
+                    hit_simple += 1;
+                    continue;
+                }
+                const q3 = std.fmt.bufPrint(&buf, "kotlin.collections.{s}.{s}", .{ simple, name }) catch continue;
+                if (stdlib.implementation(q3) != null) {
+                    hit_simple += 1;
+                    continue;
+                }
+                miss += 1;
+                if (runtime.envOnce("KLIO_INTRINSIC_NAMES") != null)
+                    std.debug.print("[intrinsic-miss] {s}.{s}\n", .{ head, name });
+            }
+        }
+    }
+    std.debug.print("[intrinsic-probe] member_sites={d} unresolved_with_head={d} hit_as_written={d} hit_by_simple_name={d} miss={d}\n", .{
+        sites, with_head, hit_qualified, hit_simple, miss,
+    });
+}
+
+/// Whether `indices` and `lastIndex` still mean the stdlib extension
+/// properties everywhere in this build.
+///
+/// The runtime asks the same question once per dispatch-cache generation and
+/// over the same three records; asking it here instead is what lets a read of
+/// either name on an array carry a proven builtin rather than a name.
+///
+/// A declaration outside the stdlib packages answers no. Scoping would in fact
+/// keep a user's extension out of a stdlib body, but nothing here records
+/// which scope a site was lowered in, so the verdict stays name-global and
+/// over-declines.
+fn indexPropsUnshadowed(ctx: *BuildCtx) bool {
+    const names = [_][]const u8{ "indices", "lastIndex" };
+    for (names) |n| {
+        if (ctx.owner_keyed_ext_names.contains(n)) return false;
+        if (ctx.nullable_ext_props.contains(n)) return false;
+    }
+    var it = ctx.extension_props.iterator();
+    while (it.next()) |e| {
+        const b = e.key_ptr.b;
+        if (!std.mem.eql(u8, b, "indices") and !std.mem.eql(u8, b, "lastIndex")) continue;
+        const f = ctx.module.funcById(e.value_ptr.*) orelse return false;
+        if (!stdlib.isKnownPackage(f.package)) return false;
+    }
+    return true;
+}
+
 fn finishModule(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -3762,6 +4541,94 @@ fn finishModule(ctx: *BuildCtx) Allocator.Error!void {
     } else {
         try module.linkMethodSlots(a);
     }
+
+    // Again for the classes lowering created: a function-local class, an object
+    // expression. A class the earlier pass published is skipped.
+    try publishFieldLayoutsAndLink(ctx);
+
+    // Every property accessor now exists, which is the earliest a field read
+    // whose answer is a getter can name it.
+    // The property table first: the site pass below reads it, and it needs
+    // only the accessors the bodies created and the layouts the publish above
+    // composed.
+    if (!std.mem.eql(u8, runtime.envOnce("KLIO_PROP_SLOT") orelse "1", "0"))
+        try module.linkPropertySlots();
+
+    // Two rounds, because each pass is the other's input: the register pass
+    // names a read's receiver so the route pass can bind it, and a bound read
+    // is a getter call whose declared return names the next register.
+    {
+        const route_on = !std.mem.eql(u8, runtime.envOnce("KLIO_GETTER_ROUTE") orelse "1", "0");
+        var round: usize = 0;
+        while (round < 2) : (round += 1) {
+            module.linkReceiverClasses(a);
+            if (route_on) module.linkGetterRoutes();
+            module.linkSuperMembers();
+        }
+        module.linkBuiltinFields(a, indexPropsUnshadowed(ctx));
+    }
+    if (runtime.envOnce("KLIO_SCOPE_WHY") != null) {
+        // How much of the member-method table the ambiguity set withdraws.
+        std.debug.print("[member-table] keys={d} ambiguous={d}\n", .{
+            module.registry.member_method_fids.count(),
+            module.registry.member_method_ambiguous.count(),
+        });
+        if (runtime.envOnce("KLIO_FUNC_FIND")) |fwant| {
+            var n2: usize = 0;
+            for (module.funcs.items) |*ff| {
+                if (std.mem.find(u8, ff.name, fwant) == null) continue;
+                n2 += 1;
+                if (n2 <= 10)
+                    std.debug.print("[func-find] {s} id={d} hasBody={} params={d} fqn={s}\n", .{ ff.name, ff.id.int(), ff.hasBody(), ff.params.len, ff.fqn });
+            }
+            std.debug.print("[func-find] total={d}\n", .{n2});
+        }
+        if (runtime.envOnce("KLIO_MEMBER_TABLE_FIND")) |want| {
+            var it = module.registry.member_method_fids.iterator();
+            var n: usize = 0;
+            while (it.next()) |e| {
+                if (std.mem.find(u8, e.key_ptr.*, want) == null) continue;
+                n += 1;
+                if (n > 8) continue;
+                var pretty: [256]u8 = undefined;
+                const len = @min(e.key_ptr.len, pretty.len);
+                @memcpy(pretty[0..len], e.key_ptr.*[0..len]);
+                for (pretty[0..len]) |*ch| {
+                    if (ch.* == 0) ch.* = '|';
+                }
+                const tf = module.funcById(e.value_ptr.*);
+                const sig = module.decl_sigs.get(e.value_ptr.*.int());
+                std.debug.print("[member-table-find] {s}  fid={d} hasBody={} sigBody={?} fqn={s}\n", .{
+                    pretty[0..len],
+                    e.value_ptr.*.int(),
+                    tf != null and tf.?.hasBody(),
+                    if (sig) |sg| sg.has_body else null,
+                    if (tf) |t| t.fqn else "?",
+                });
+            }
+            std.debug.print("[member-table-find] total={d}\n", .{n});
+        }
+    }
+
+    try module.linkClassAncestors(a);
+    if (!std.mem.eql(u8, runtime.envOnce("KLIO_ISCHECK") orelse "1", "0"))
+        module.linkInstanceOfTargets();
+    module.linkCtorPicks();
+    module.probeCtorArity();
+    module.probeInstanceOf();
+    module.probeClassGraph();
+    module.probeThisOrGlobal();
+    module.linkBuiltinMembers();
+    module.linkBuiltinMemberRegs(a);
+    module.probeBuiltinMembers();
+    module.linkMemberOrGlobal();
+    module.linkConstGlobals(a);
+    module.linkGlobalIdentities();
+    module.probeRegisterClasses(a);
+    module.probeMemberByName(a);
+    module.probeMemberOrGlobal();
+    ir.Module.getterRejectDump();
+    probeIntrinsicMembers(module);
 
     // Debug-only frame-dump hook for intrinsics below the ir layer.
     ir.eval.installDebugFrameDump();

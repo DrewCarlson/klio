@@ -335,9 +335,10 @@ Nothing runs one program through two of these and diffs the output.
 
 ### 3.2 Instruction decode — nine call shapes
 
-`eval.zig` decodes nine call-shaped instructions (`src/ir/eval.zig:818-828`):
-`Call` (FuncId), `CallValue`, `CallValueWithThis`, `CallSpread`, `CallSuper`,
+`eval.zig` decodes eight call-shaped instructions (`src/ir/eval.zig:818-828`):
+`Call` (FuncId), `CallValue`, `CallValueWithThis`, `CallSpread`,
 `CallMember`, `CallMemberOrGlobal`, `CallMemberOrValue`, `CallValueOrMember`.
+A `super` member access is a `Call` to the declaration the language names.
 Three of them encode *unresolved* dispatch the lowerer could not classify
 (`eval.zig:1250`, `1277`, `1298`) and re-derive resolution at runtime by probing
 in different orders. `execCallMemberOrGlobal` (`eval.zig:1616-1832`) is a ~220-
@@ -500,7 +501,10 @@ class.
   nesting tower and companion; an extension receiver as `.subject`, itself
   only), and the only caller entries that cross the frame boundary are the
   in-flight pushes the dispatch made for this very call (a bound
-  receiver-lambda subject, a displaced `this`, a member-extension owner) —
+  receiver-lambda subject, a displaced `this`, a member-extension owner as
+  a `.dispatch` entry, which the callee frame also takes as its
+  `dispatch_this` and the body reads through `LoadDispatchThis` as
+  `this@<Owner>`) —
   tracked past `active_chain_base`, with `.access` entries (dispatch-time
   visibility for the extension-owner filters) never transferring.
 - **Inner-class outer receiver: DONE (item-6 close-out).** The

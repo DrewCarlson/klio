@@ -65,7 +65,248 @@ const bindThrowableArgs = super_chain.bindThrowableArgs;
 const isBuiltinThrowableName = super_chain.isBuiltinThrowableName;
 
 /// Look up a runtime `ClassDef` by simple name; the handle is fresh, caller frees.
+/// `KLIO_CTOR_NAME_PROBE=1`: how many name-keyed lookups one program's
+/// constructions make. A site carrying a `ClassId` is only resolved if the
+/// path from it to the object never consults a name, so this counts what
+/// would have to go.
+pub var ctor_name_probes: std.atomic.Value(usize) = .init(0);
+pub var ctor_count: std.atomic.Value(usize) = .init(0);
+
+var ctor_probe_state: u8 = 0;
+pub fn ctorNameProbeOn() bool {
+    if (ctor_probe_state == 0)
+        ctor_probe_state = if (std.c.getenv("KLIO_CTOR_NAME_PROBE") != null) 2 else 1;
+    return ctor_probe_state == 2;
+}
+
+var ctor_audit_state: u8 = 0;
+pub fn ctorNameAuditOn() bool {
+    if (ctor_audit_state == 0)
+        ctor_audit_state = if (std.c.getenv("KLIO_CTOR_NAME_AUDIT") != null) 2 else 1;
+    return ctor_audit_state == 2;
+}
+
+threadlocal var ctor_audit_depth: usize = 0;
+threadlocal var sampled: usize = 0;
+
+/// True when this is the outermost construction on the thread.
+pub fn ctorAuditEnter() bool {
+    ctor_audit_depth += 1;
+    return ctor_audit_depth == 1;
+}
+
+pub fn ctorAuditLeave() void {
+    if (ctor_audit_depth != 0) ctor_audit_depth -= 1;
+}
+
+/// Set while the SAM parameter mask is being computed, so the probes it
+/// makes are not attributed to a construction that happens to be running the
+/// function it is asked about.
+threadlocal var in_sam_mask: bool = false;
+
+pub fn samMaskEnter() bool {
+    const prev = in_sam_mask;
+    in_sam_mask = true;
+    return prev;
+}
+
+pub fn samMaskLeave(prev: bool) void {
+    in_sam_mask = prev;
+}
+
+var ctor_pick_audit_state: u8 = 0;
+
+/// `KLIO_CTOR_PICK_AUDIT=1`: run the lowering-side constructor pick beside the
+/// value scoring on every construction and report where the two disagree.
+pub fn ctorPickAuditOn() bool {
+    if (ctor_pick_audit_state == 0)
+        ctor_pick_audit_state = if (std.c.getenv("KLIO_CTOR_PICK_AUDIT") != null) 2 else 1;
+    return ctor_pick_audit_state == 2;
+}
+
+/// `KLIO_CTOR_PICK_AUDIT=all` also names the constructions the site left open.
+pub fn ctorPickAuditAll() bool {
+    const v = std.c.getenv("KLIO_CTOR_PICK_AUDIT") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "all");
+}
+
+var ctor_pick_serve_state: u8 = 0;
+
+/// Whether a construction takes the constructor its site named. Off leaves
+/// every construction on the value scoring, which is what the audit compares
+/// against.
+pub fn ctorPickServeOn() bool {
+    if (ctor_pick_serve_state == 0) {
+        const v = std.c.getenv("KLIO_CTOR_PICK_SERVE");
+        const off = (v != null and std.mem.eql(u8, std.mem.span(v.?), "0")) or ctorPickAuditOn();
+        ctor_pick_serve_state = if (off) 1 else 2;
+    }
+    return ctor_pick_serve_state == 2;
+}
+
+pub var ctor_pick_agree: std.atomic.Value(usize) = .init(0);
+pub var ctor_pick_differ: std.atomic.Value(usize) = .init(0);
+pub var ctor_pick_undecided: std.atomic.Value(usize) = .init(0);
+
+pub fn ctorPickAuditDump() void {
+    if (!ctorPickAuditOn()) return;
+    std.debug.print("[ctor-pick] agree={d} differ={d} static_undecided={d}\n", .{
+        ctor_pick_agree.load(.monotonic),
+        ctor_pick_differ.load(.monotonic),
+        ctor_pick_undecided.load(.monotonic),
+    });
+}
+
+pub fn ctorNameProbeDump() void {
+    if (std.c.getenv("KLIO_CTOR_NAME_PROBE") == null) return;
+    std.debug.print("[ctor-name] constructions={d} class_def_by_name_probes={d}\n", .{ ctor_count.load(.monotonic), ctor_name_probes.load(.monotonic) });
+}
+
+/// The runtime `ClassDef` a `ClassId` names, without going through the class
+/// table's string keys.
+///
+/// The index is filled once per module from the ids the build already has. A
+/// null answer is not "no such class": a class registered while the program
+/// runs has no row, so the caller falls back to the name lookup and the
+/// contract is unchanged.
+/// The module `ClassId` a `ClassDef` resolves to, through the def's own memo
+/// so the fqn probe runs once per class rather than once per use.
+pub fn classIdOfDef(self: *VmHost, def: ObjRef(ClassDef)) ?ir.ClassId {
+    const mod_id = @intFromPtr(self.module.asPtrConst());
+    {
+        const g = def.borrow();
+        defer g.deinit();
+        if (g.get().resolve_mod.load(.monotonic) == mod_id) {
+            const plus1 = g.get().resolve_cid.load(.acquire);
+            if (plus1 != 0) return ir.ClassId.from(plus1 - 1);
+        }
+    }
+    const fqn = classDefFqnOf(def);
+    const cid = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().classIdByFqn(fqn) orelse return null;
+    };
+    const g = def.borrowMut();
+    defer g.deinit();
+    const d = g.get();
+    if (d.resolve_mod.cmpxchgStrong(0, mod_id, .acq_rel, .monotonic) == null or
+        d.resolve_mod.load(.monotonic) == mod_id)
+    {
+        d.resolve_cid.store(cid.int() + 1, .release);
+    }
+    return cid;
+}
+
+fn classDefFqnOf(d: ObjRef(ClassDef)) []const u8 {
+    const g = d.borrow();
+    defer g.deinit();
+    return g.get().fqn;
+}
+
+/// The `ClassDef` of `child`'s first non-interface supertype, by id.
+///
+/// The ctor chain walks parents once per construction and reached each by
+/// name. A class's parent cannot change, so the id is resolved once and
+/// memoized on the child beside the strings `first_super_*` already keep.
+/// Null means "not answerable by id here" and the caller keeps its name
+/// path: a parent outside this module, or a class registered at execution.
+pub fn superDefById(self: *VmHost, child: ObjRef(ClassDef), parent_key: []const u8) ?ObjRef(ClassDef) {
+    const mod_id = @intFromPtr(self.module.asPtrConst());
+    {
+        const g = child.borrow();
+        defer g.deinit();
+        if (g.get().super_cid_mod.load(.monotonic) == mod_id) {
+            const plus1 = g.get().super_cid.load(.acquire);
+            if (plus1 != 0) return classDefById(self, ir.ClassId.from(plus1 - 1));
+            return null;
+        }
+    }
+    const cid: ?ir.ClassId = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const m = mg.get();
+        break :blk m.classIdByFqn(parent_key) orelse m.uniqueClassIdBySimpleName(parent_key);
+    };
+    {
+        const g = child.borrowMut();
+        defer g.deinit();
+        const d = g.get();
+        if (d.super_cid_mod.cmpxchgStrong(0, mod_id, .acq_rel, .monotonic) == null or
+            d.super_cid_mod.load(.monotonic) == mod_id)
+        {
+            d.super_cid.store(if (cid) |c| c.int() + 1 else 0, .release);
+            d.super_cid_mod.store(mod_id, .release);
+        }
+    }
+    const c = cid orelse return null;
+    return classDefById(self, c);
+}
+
+pub fn classDefById(self: *VmHost, class: ir.ClassId) ?ObjRef(ClassDef) {
+    const mod_id = @intFromPtr(self.module.asPtrConst());
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        const img = pg.get();
+        // The table describes ONE module. Another module's id takes the name
+        // path rather than claiming it: rebuilding the table per module made
+        // two modules clear it between each other's constructions. Per-module
+        // tables were then built and measured — they changed the audit by
+        // nothing, because the probes a layered run makes inside a
+        // construction are its ctor BODY's member calls, not this lookup.
+        if (img.class_defs_module_identity != mod_id) return null;
+        if (class.int() < img.class_defs_by_id.items.len) {
+            if (img.class_defs_by_id.items[class.int()]) |d| return d.clone();
+        }
+    }
+    // An empty slot: a class registered while the program runs. Resolve it
+    // once and keep it.
+    const names = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const m = mg.get();
+        if (class.int() >= m.classes.items.len) return null;
+        const c = &m.classes.items[class.int()];
+        break :blk .{ c.fqn, c.name };
+    };
+    const found = classDefByName(self, names[0]) orelse classDefByName(self, names[1]) orelse return null;
+    {
+        const pg = self.prog.borrowMut();
+        defer pg.deinit();
+        const img = pg.get();
+        if (img.class_defs_module_identity == mod_id and
+            class.int() < img.class_defs_by_id.items.len and
+            img.class_defs_by_id.items[class.int()] == null)
+        {
+            img.class_defs_by_id.items[class.int()] = found.clone();
+        }
+    }
+    return found;
+}
+
 pub fn classDefByName(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
+    // Either knob arms the counter. Counting only under the PROBE knob made
+    // the audit silently measure nothing whenever it ran alone, which is the
+    // failure mode an audit is supposed to be immune to.
+    if ((ctorNameProbeOn() or ctorNameAuditOn()) and !in_sam_mask) {
+        const n = ctor_name_probes.fetchAdd(1, .monotonic);
+        // `KLIO_CTOR_NAME_PROBE=2` names the callers of the first few probes,
+        // because guessing which of a dozen call sites runs per construction
+        // has been wrong twice.
+        const v = std.c.getenv("KLIO_CTOR_NAME_PROBE");
+        _ = &sampled;
+        if (v != null and v.?[0] == '2' and ctor_audit_depth > 0 and sampled < 3) {
+            std.debug.print("[ctor-name-site] probe={d} name={s} ret=0x{x}\n", .{ n, name, @returnAddress() });
+            sampled += 1;
+            std.debug.dumpCurrentStackTrace(.{});
+        }
+        // `=3` prints only the immediate caller, so a sweep can tally which
+        // call sites a whole corpus reaches without a stack dump each time.
+        if (v != null and v.?[0] == '3') {
+            std.debug.print("[ctor-name-ret] 0x{x}\n", .{@returnAddress()});
+        }
+    }
     const g = self.classes.borrow();
     defer g.deinit();
     if (g.get().get(name)) |d| return d.clone();
@@ -178,15 +419,44 @@ pub fn paramAcceptsArg(self: *VmHost, declared_in: []const u8, arg: *const Value
         if (instanceOfClassName(arg, declared)) return true;
         // Disqualify only when `declared` names a real class: a typealias has no
         // ClassDef, so its mismatch is unconfirmed and must not reject.
-        const kd = classDefByName(self, declared);
-        if (kd) |d| d.deinit();
-        return kd == null;
+        return !namesAClass(self, declared);
     }
     // A builtin value against a definitely-different builtin kind cannot match; kind 0 accepts.
     const gk = builtinTypeKind(valueTypeHead(arg.*));
     const dk = builtinTypeKind(declared);
     if (gk != 0 and dk != 0 and gk != dk) return false;
     return true;
+}
+
+/// Whether `name` is a registered class, memoized by the name's identity.
+///
+/// Secondary-constructor scoring asks this of every declared parameter type
+/// on every construction, and the answer is a property of the program. The
+/// strings are the class table's and a declaration's own, so pointer
+/// identity keys it; the length and the dispatch generation guard an
+/// address the allocator reused.
+const ClassNameMemo = struct {
+    ptr: usize = 0,
+    len: usize = 0,
+    gen: u32 = 0,
+    is_class: bool = false,
+    valid: bool = false,
+};
+const NameMemoTls = struct { cache: [512]ClassNameMemo = @splat(.{}) };
+const name_memo_tls = runtime.tls_fast.PerThread(NameMemoTls);
+
+fn namesAClass(self: *VmHost, name: []const u8) bool {
+    const gen = host_call_member.dispatchCacheGen();
+    const key = @intFromPtr(name.ptr);
+    const cache = &name_memo_tls.get().cache;
+    const slot = &cache[(key >> 3) % cache.len];
+    if (slot.valid and slot.ptr == key and slot.len == name.len and slot.gen == gen)
+        return slot.is_class;
+    const d = classDefByName(self, name);
+    const is_class = d != null;
+    if (d) |dd| dd.deinit();
+    slot.* = .{ .ptr = key, .len = name.len, .gen = gen, .is_class = is_class, .valid = true };
+    return is_class;
 }
 
 /// Coarse bucket for a builtin type head; a cross-kind mismatch disqualifies a
@@ -369,12 +639,21 @@ pub fn expandParentSecondaryThisArgs(
     arg_names: ?[]const ?[]const u8,
     bodies: *std.ArrayList(DeferredCtorBody),
     super_args: *?std.ArrayList(Value),
+    /// The class's def where the caller already holds it. The walk climbs on
+    /// its second turn and looks the next one up by name, but the first turn
+    /// is the class the caller just resolved, and it ran on every
+    /// construction with a parent.
+    def_hint: ?ObjRef(ClassDef),
 ) Allocator.Error!UnitOrErr {
     var depth: usize = 0;
     var names = arg_names;
+    // The loop climbs `this(...)` delegations WITHIN one class — it never
+    // reassigns `class_name` or `class_fqn` — so resolving the def per turn
+    // asked for the same class over and over. One resolution, and the
+    // caller's handle serves even that when it has one.
+    const def = if (def_hint) |h| h.clone() else (classDefByName(self, sideTableKey(class_fqn, class_name)) orelse return .{ .ok = {} });
+    defer def.deinit();
     while (depth < 64) : (depth += 1) {
-        const def = classDefByName(self, sideTableKey(class_fqn, class_name)) orelse return .{ .ok = {} };
-        defer def.deinit();
         const prev_bounds = installCtorBounds(def);
         defer common.ctor_bounds = prev_bounds;
         const primary_count = classDefPrimaryParamCount(def);

@@ -115,6 +115,8 @@ pub const loweredTypeName = paths_mod.loweredTypeName;
 pub const loweredOwnedLocalTypeRef = paths_mod.loweredOwnedLocalTypeRef;
 pub const loweredCheckTypeName = paths_mod.loweredCheckTypeName;
 pub const filePrivatePropRename = paths_mod.filePrivatePropRename;
+pub const topLevelPropSlot = paths_mod.topLevelPropSlot;
+pub const topLevelAccessorTarget = paths_mod.topLevelAccessorTarget;
 const lowerPath = paths_mod.lowerPath;
 pub const ImportRewrite = paths_mod.ImportRewrite;
 pub const importCompanionRewrite = paths_mod.importCompanionRewrite;
@@ -123,6 +125,10 @@ const lowerStringTemplate = paths_mod.lowerStringTemplate;
 const member_mod = @import("expr/member.zig");
 const lowerMember = member_mod.lowerMember;
 pub const staticBareReceiverType = member_mod.staticBareReceiverType;
+pub const receiverFieldSlot = member_mod.receiverFieldSlot;
+pub const receiverWriteSlot = member_mod.receiverWriteSlot;
+pub const ownMemberWriteSlot = paths_mod.ownMemberWriteSlot;
+pub const FieldSlotClaim = member_mod.FieldSlotClaim;
 const superBase = member_mod.superBase;
 
 const control_mod = @import("expr/control.zig");
@@ -182,6 +188,7 @@ pub const staticExprTypeRef = static_type_mod.staticExprTypeRef;
 pub const tyMemoCall = static_type_mod.tyMemoCall;
 pub const tyMemoCallEnter = static_type_mod.tyMemoCallEnter;
 pub const tyMemoCallLeave = static_type_mod.tyMemoCallLeave;
+pub const nullaryMemberResolution = static_type_mod.nullaryMemberResolution;
 pub const nullaryMemberReturnTypeRef = static_type_mod.nullaryMemberReturnTypeRef;
 
 const type_probe_mod = @import("expr/type_probe.zig");
@@ -194,9 +201,11 @@ pub const lateinitMarkerName = type_probe_mod.lateinitMarkerName;
 
 const bare_call_mod = @import("expr/bare_call.zig");
 pub const resolveCtxFor = bare_call_mod.resolveCtxFor;
+pub const dumpScopeWhy = bare_call_mod.dumpScopeWhy;
 pub const allNull = bare_call_mod.allNull;
 
 const probe_mod = @import("expr/probe.zig");
+const implicit_walk = @import("expr/implicit_walk.zig");
 const recordOutOfScopeRef = probe_mod.recordOutOfScopeRef;
 const classFqnOf = probe_mod.classFqnOf;
 const inReceiverContext = probe_mod.inReceiverContext;
@@ -225,6 +234,13 @@ pub const lowerNoClassDump = audit_mod.lowerNoClassDump;
 pub const lowerDeclineDump = audit_mod.lowerDeclineDump;
 pub const lowerNoRecvDump = audit_mod.lowerNoRecvDump;
 pub const lowerSitesDump = audit_mod.lowerSitesDump;
+pub const lowerNoSlotDump = audit_mod.lowerNoSlotDump;
+pub const untypedRecvDump = audit_mod.untypedRecvDump;
+pub const eagerRecvDump = static_type_mod.eagerRecvDump;
+pub const noExtNote = audit_mod.noExtNote;
+pub const fallbackNote = audit_mod.fallbackNote;
+pub const lowerNoExtDump = audit_mod.lowerNoExtDump;
+pub const lowerFallbackDump = audit_mod.lowerFallbackDump;
 
 const refs_mod = @import("expr/refs.zig");
 const localExtRefClosure = refs_mod.localExtRefClosure;
@@ -439,6 +455,9 @@ fn lowerIf(b: *FuncBuilder, f: @FieldType(Expr, "If"), tail_here: bool) Allocato
     const this_nn = condNarrowsThisNotNull(f.cond, true);
     const prev_this_narrow = if (this_nn) b.setThisNarrow(b.recvTy()) else null;
     b.tail_pos = tail_here;
+    // A branch that is a lambda literal with no expected type has no
+    // receiver: only an expected function type gives one.
+    if (f.then_branch.* == .Lambda and b.peekExpected() == null) b.recordLambdaArgNoRecv(f.then_branch.span());
     const t_val = try lowerExpr(b, f.then_branch);
     if (this_nn) _ = b.setThisNarrow(prev_this_narrow);
     var nn = not_null.items.len;
@@ -453,6 +472,7 @@ fn lowerIf(b: *FuncBuilder, f: @FieldType(Expr, "If"), tail_here: bool) Allocato
     defer else_not_null.deinit(b.allocator);
     try narrowNullCheckAll(b, f.cond, false, &else_not_null);
     b.tail_pos = tail_here;
+    if (f.else_branch) |e| if (e.* == .Lambda and b.peekExpected() == null) b.recordLambdaArgNoRecv(e.span());
     const f_val = if (f.else_branch) |e| try lowerExpr(b, e) else try b.emitConst(.Unit);
     var en = else_not_null.items.len;
     while (en > 0) : (en -= 1) b.restoreLocal(else_not_null.items[en - 1]);
@@ -497,6 +517,7 @@ fn lowerWhile(b: *FuncBuilder, w: @FieldType(Expr, "While")) Allocator.Error!Reg
 fn lowerIndex(b: *FuncBuilder, ix: @FieldType(Expr, "Index")) Allocator.Error!Reg {
     // the unhinted walk.
     const recv = try lowerReceiver(b, ix.receiver);
+    if (try bindIndexedOperator(b, ix.receiver, recv, "get", ix.args, bracketSpan(ix.receiver))) |r| return r;
     const run = try lowerArgRun(b, ix.args);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = "get" });
@@ -515,6 +536,76 @@ fn lowerIndex(b: *FuncBuilder, ix: @FieldType(Expr, "Index")) Allocator.Error!Re
         .extra = try b.memberExtra(.{ .arg_names = &.{}, .static_recv = static_recv }),
     } });
     return dst;
+}
+
+
+/// Bind an indexing operator to its declaration. Kotlin fixes `get` and `set`
+/// by the convention, so the only reason these dispatch by name is that the
+/// arm never asked the resolver — the same question `lowerBinary` asks for
+/// every other operator.
+///
+/// It asks only when the operator is an INTERPRETED member. An index on a
+/// builtin container is served by the evaluator's subscript fast path off the
+/// receiver's tag, with no dispatch at all, so binding one to its stub
+/// declaration would trade a tag test for an activation.
+///
+/// `recv` is already lowered, so the gate must not evaluate the receiver twice.
+fn bindIndexedOperator(
+    b: *FuncBuilder,
+    receiver: *const Expr,
+    recv: Reg,
+    comptime name: []const u8,
+    args: []const Expr,
+    span_at: ir.Span,
+) Allocator.Error!?Reg {
+    const declared = argDeclTypeRef(b, receiver);
+    var inferred: ?ir.TypeRef = if (declared == null) try staticExprTypeRef(b, receiver) else null;
+    defer if (inferred) |*t| t.deinit(b.allocator);
+    const ty = declared orelse inferred orelse return null;
+    if (!indexedOperatorIsInterpreted(b, ty, name, span_at.file)) return null;
+    const ident = ast.Ident{ .name = name, .span = span_at };
+    return switch (try member_call_mod.lowerResolvedMemberCall(
+        b,
+        receiver,
+        ident,
+        args,
+        &.{},
+        &.{},
+        ty,
+        .{ .reg = recv },
+    )) {
+        .lowered => |reg| reg,
+        .deferred, .none => null,
+    };
+}
+
+/// Whether the receiver's static type declares `name` as a member with a body.
+/// A bodyless declaration is host-backed: the runtime serves it from a native,
+/// and the subscript fast path serves it sooner still.
+fn indexedOperatorIsInterpreted(b: *FuncBuilder, ty: ir.TypeRef, name: []const u8, file: ir.FileId) bool {
+    const cid = staticTypeClassId(b, ty) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    // The resolver, not the declaration list's head: an overloaded `get` whose
+    // first declaration is host-backed would answer for the wrong overload.
+    // Argument shapes are not supplied, so this decides admission only — the
+    // gate below resolves the call itself.
+    const r = b.module.resolveMemberCall(cid, name, &.{}, .{
+        .caller_file = file,
+        .lexical_owner = null,
+        .actual_type_param_bounds = &.{},
+        .receiver_type = ty,
+    });
+    const fid = r.target orelse return false;
+    const f = b.module.funcById(fid) orelse return false;
+    return b.module.declaredWithBody(fid, f);
+}
+
+/// A zero-width span where the `[` sits: the synthesized `get`/`set` name needs
+/// a span, and reusing the receiver's would let a span-keyed side table answer
+/// for the receiver expression instead. No real expression spans zero bytes.
+fn bracketSpan(receiver: *const Expr) ir.Span {
+    const s = exprSpan(receiver);
+    return .{ .file = s.file, .start = s.end, .end = s.end };
 }
 
 
@@ -972,10 +1063,15 @@ fn tryBoundExtensionRef(b: *FuncBuilder, pr: @FieldType(Expr, "PropertyRef"), pi
             (innermost_lambda_recv == null and b.recvTy() == null and
                 (if (b.ownerClass()) |own| std.mem.eql(u8, own, target_cls_v) else false));
         if (!direct) {
-            const qnm = try b.module.internConst(b.allocator, .{ .String = target_cls_v });
-            const qreg = b.allocReg();
-            try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
-            recv_reg = qreg;
+            if (try implicit_walk.instanceOfClassReg(b, target_cls_v)) |r| {
+                recv_reg = r;
+            } else {
+                orEmitAudit(b, "member_ref_ext_target", "QualifiedThis", target_cls_v);
+                const qnm = try b.module.internConst(b.allocator, .{ .String = target_cls_v });
+                const qreg = b.allocReg();
+                try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
+                recv_reg = qreg;
+            }
         }
         try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv_reg, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
         return dst;
@@ -1029,10 +1125,15 @@ fn emitCallableRef(b: *FuncBuilder, pr: @FieldType(Expr, "PropertyRef"), pick: C
                 if (b.ownerClass()) |own| {
                     const ext_recv = b.recvTy();
                     if (ext_recv != null and !std.mem.eql(u8, ext_recv.?, own)) {
-                        const qnm = try b.module.internConst(b.allocator, .{ .String = own });
-                        const qreg = b.allocReg();
-                        try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
-                        recv_reg = qreg;
+                        if (try implicit_walk.instanceOfClassReg(b, own)) |r| {
+                            recv_reg = r;
+                        } else {
+                            orEmitAudit(b, "member_ref_owner_behind_ext", "QualifiedThis", own);
+                            const qnm = try b.module.internConst(b.allocator, .{ .String = own });
+                            const qreg = b.allocReg();
+                            try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
+                            recv_reg = qreg;
+                        }
                     }
                 }
             } else if (enclosingClassDeclaringMember(b, pr.name.name)) |decl| {
@@ -1040,10 +1141,15 @@ fn emitCallableRef(b: *FuncBuilder, pr: @FieldType(Expr, "PropertyRef"), pick: C
                 // instance.
                 const own = b.ownerClass() orelse decl;
                 if (!std.mem.eql(u8, decl, own)) {
-                    const qnm = try b.module.internConst(b.allocator, .{ .String = decl });
-                    const qreg = b.allocReg();
-                    try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
-                    recv_reg = qreg;
+                    if (try implicit_walk.instanceOfClassReg(b, decl)) |r| {
+                        recv_reg = r;
+                    } else {
+                        orEmitAudit(b, "member_ref_enclosing_decl", "QualifiedThis", decl);
+                        const qnm = try b.module.internConst(b.allocator, .{ .String = decl });
+                        const qreg = b.allocReg();
+                        try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
+                        recv_reg = qreg;
+                    }
                 }
             }
             try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv_reg, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
@@ -1347,11 +1453,15 @@ fn lowerQualifiedThis(b: *FuncBuilder, q: ast.Ident) Allocator.Error!Reg {
             }
         }
     }
-    // A class-name label walks at runtime from the nearest `this`
-    // over the class and outer chain.
+    // A class-name label names an instance in scope: the owner's, an
+    // enclosing class's through the outer links, or a closure tower's.
+    if (try implicit_walk.instanceOfClassReg(b, q.name)) |r| return r;
+    // Otherwise it walks at runtime from the nearest `this` over the class
+    // and outer chain.
     const this_reg = b.resolve("this") orelse blk: {
         break :blk try b.loadCaptureHoisted("this");
     };
+    orEmitAudit(b, "labeled_this", "QualifiedThis", q.name);
     const nm = try b.module.internConst(b.allocator, .{ .String = q.name });
     const dst = b.allocReg();
     try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm } });

@@ -45,15 +45,33 @@ fn pushFuncSpanned(module: *Module, func_in: Func, body_span: ast.Span) Allocato
 
 /// Assign the next `FuncId` to `func` and append it to the module.
 fn pushFunc(module: *Module, func_in: Func) Allocator.Error!FuncId {
+    // A header reserved before the bodies lowered takes the body in place; the
+    // header pass already indexed the name. The body's own lambdas and local
+    // classes push first, so only the function carrying the header's name fills it.
+    if (module.pending_accessor_place_id) |reserved| {
+        if (module.funcByIdMut(reserved)) |slot| {
+            if (std.mem.eql(u8, slot.name, func_in.name)) {
+                module.pending_accessor_place_id = null;
+                var placed = func_in;
+                placed.id = reserved;
+                if (runtime.envOnce("KLIO_FUNC_TRACE") != null) std.debug.print("[place-acc] id={d} was={s} now={s}\n", .{ reserved.int(), slot.fqn, placed.fqn });
+                slot.* = placed;
+                return reserved;
+            }
+        } else module.pending_accessor_place_id = null;
+    }
     // FuncId indexes module.funcs; the IR caps the func count at u32.
     const id = module.nextFuncId();
     var func = func_in;
     func.id = id;
     try module.appendFunc(func);
-    // An extension-property getter is looked up by name under the
-    // `__ext_get_<Head>_<name>` contract, so without the index entry no accessor is
-    // findable. Mangled names never collide with user identifiers.
-    if (std.mem.startsWith(u8, func.name, "__ext_get_")) {
+    // An accessor is looked up by name under the `__get_<Class>_<prop>`,
+    // `__set_<Class>_<prop>` and `__ext_get_<Head>_<prop>` contracts, so without
+    // the index entry no accessor is findable. Mangled names never collide with
+    // user identifiers.
+    if (std.mem.startsWith(u8, func.name, "__ext_get_") or std.mem.startsWith(u8, func.name, "__get_") or
+        std.mem.startsWith(u8, func.name, "__set_") or std.mem.startsWith(u8, func.name, "__ext_set_"))
+    {
         const a = moduleAllocator(module);
         try module.func_index.append(a, .{ .name = func.name, .id = id });
         const gop = try module.func_name_index.getOrPut(func.name);
@@ -78,6 +96,8 @@ fn cloneOwnMembers(allocator: Allocator, src: *const StringSet) Allocator.Error!
 /// prologue, and `recordThunkParamTypes` the declared type of each bound parameter,
 /// when the declaration lowering stashed them; both are no-ops otherwise.
 fn consumePendingParamTypes(b: *FuncBuilder, params: []const []const u8) Allocator.Error!void {
+    b.this_is_outer = b.module.pending_this_is_outer;
+    b.module.pending_this_is_outer = false;
     const types = b.module.pending_param_types orelse return;
     b.module.pending_param_types = null;
     for (params, 0..) |name, i| {
@@ -156,6 +176,9 @@ pub fn lowerExprAsThunkTyped(module: *Module, expr: *const Expr, name: []const u
     try consumePendingCtx(&b);
     const prev = b.pushExpected(expected);
     const widened: ?Expr = if (expected) |*ty| literals.widenNumericLiteral(expr, ty) else null;
+    // A lambda literal with no expected type has no receiver: only an
+    // expected function type can give it one.
+    if (expected == null and expr.* == .Lambda) b.recordLambdaArgNoRecv(expr.span());
     const v = try lowerExpr(&b, if (widened) |*w| w else expr);
     b.restoreExpected(prev);
     b.terminate(.{ .Return = v });
@@ -450,6 +473,16 @@ fn lowerAccessorExprFull(
     if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
     try bindParams(&b, params);
     try consumePendingAccessorReceiver(&b, params);
+    // The instance `this` holds answers to its class-name label, as a method
+    // body's does: the owner's, or the enclosing class's in an inner class's
+    // constructor context, so a closure built here captures it by that slot.
+    if (leadsWithThis(params)) if (b.resolve("this")) |this_reg| {
+        const labeled: ?[]const u8 = if (b.this_is_outer) b.module.registry.enclosing_class.get(owner_class) else owner_class;
+        if (labeled) |lc| if (lc.len != 0) {
+            const clabel = try b.module.registry.thisLabelFor(lc);
+            if (b.resolve(clabel) == null) try b.bind(clabel, this_reg);
+        };
+    };
     if (declared_params) |typed| {
         try b.setLocalDeclType("this", owner_class);
         for (typed) |p| {
@@ -464,6 +497,7 @@ fn lowerAccessorExprFull(
     // `var first: Long = 0`: the initializer literal takes the property's declared
     // type, as a local `val x: Long = 0` does.
     const widened: ?Expr = if (expected) |*ty| literals.widenNumericLiteral(expr, ty) else null;
+    if (expected == null and expr.* == .Lambda) b.recordLambdaArgNoRecv(expr.span());
     const v = try lowerExpr(&b, if (widened) |*w| w else expr);
     b.restoreExpected(prev);
     b.terminate(.{ .Return = v });

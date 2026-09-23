@@ -588,6 +588,7 @@ fn acceptsScalarOrEscape(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, inst
         .Not => |nt| if (isRecvReg(recv_regs, nt.src.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4235\n", .{func.name}); return false; },
         .UnOp => |u| if (isRecvReg(recv_regs, u.operand.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4236\n", .{func.name}); return false; },
         .GetField => |gf| {
+            if (gf.own_kind == .super_slot or gf.own_kind == .super_target) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4238\n", .{func.name}); return false; }
             if (!is_method or !isRecvReg(recv_regs, gf.receiver.int())) {
                 if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4239 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return false; }
                 ctx.n_escapes += 1;
@@ -602,7 +603,7 @@ fn acceptsScalarOrEscape(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, inst
                 escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(inst_i) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4249\n", .{func.name}); return false; };
                 return true;
             }
-            if (sf.super_owner != null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4252\n", .{func.name}); return false; }
+            if (sf.own_kind == .super_slot or sf.own_kind == .super_target) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4252\n", .{func.name}); return false; }
             if (isRecvReg(recv_regs, sf.value.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4253\n", .{func.name}); return false; }
         },
         .Const, .Trace, .LoadParam => {},

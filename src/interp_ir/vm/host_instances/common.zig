@@ -119,11 +119,36 @@ pub fn setCtorArgStaticHeads(self: *VmHost, heads: []const ?[]const u8) void {
     ctor_static_heads = ctor_static_heads_buf[0..heads.len];
 }
 
+/// The constructor the SITE named, consumed by the construction it belongs to
+/// the way the heads are: a delegation or default underneath builds its own
+/// instances and must not inherit this site's answer.
+///
+/// The argument count travels with it. A construction the site did not emit —
+/// an intrinsic route that returns before consuming, a delegation, a default
+/// thunk — would otherwise take an answer meant for a different call, and the
+/// count is the cheapest thing that catches it.
+pub const CtorSitePick = struct { pick: u16, n_args: u32 };
+
+pub threadlocal var ctor_site_pick: ?CtorSitePick = null;
+
+pub fn setCtorSitePick(self: *VmHost, pick: ?u16, n_args: u32) void {
+    _ = self;
+    ctor_site_pick = if (pick) |p| .{ .pick = p, .n_args = n_args } else null;
+}
+
+pub fn takeCtorSitePick(n_args: usize) ?u16 {
+    const v = ctor_site_pick orelse return null;
+    ctor_site_pick = null;
+    if (v.n_args != n_args) return null;
+    return v.pick;
+}
+
 /// Forget heads left installed by a path that never took them: the slice they
 /// name is freed when the site returns.
 pub fn clearCtorArgStaticHeads(self: *VmHost) void {
     _ = self;
     ctor_static_heads = null;
+    ctor_site_pick = null;
 }
 
 /// Type-parameter bounds of the class under construction, so a constructor

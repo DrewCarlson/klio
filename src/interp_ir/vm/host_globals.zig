@@ -1859,6 +1859,47 @@ pub fn rootGlobals(self: *VmHost) ObjRef(runtime.Env) {
     }
 }
 
+/// A slotted top-level property's binding, or null before its initialiser ran
+/// or when the binding is a cell or delegate the by-name read has to unwrap.
+pub fn topSlotGet(self: *VmHost, slot: u32) ?Value {
+    const root_env = rootGlobals(self);
+    defer root_env.deinit();
+    const g = root_env.borrow();
+    defer g.deinit();
+    const v = g.get().slotGet(slot) orelse return null;
+    return switch (v) {
+        .Cell, .Delegate => null,
+        else => v,
+    };
+}
+
+/// A slotted read a frameless leaf can serve: scalars only, like `leafGlobalGet`.
+pub fn leafGlobalSlotGet(self: *VmHost, slot: u32) ?Value {
+    const v = topSlotGet(self, slot) orelse return null;
+    return switch (v) {
+        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char => v,
+        else => null,
+    };
+}
+
+/// A slotted top-level write. The property is plain storage, with no setter,
+/// delegate or `lateinit` gate, so the root binding and its slot take the
+/// value; a binding that became a cell keeps the by-name write.
+pub fn storeGlobalSlot(self: *VmHost, allocator: Allocator, slot: u32, name: []const u8, value: Value) Allocator.Error!UnitResult {
+    const root_env = rootGlobals(self);
+    defer root_env.deinit();
+    {
+        const g = root_env.borrowMut();
+        defer g.deinit();
+        const cur = g.get().slotGet(slot);
+        if (cur == null or (cur.? != .Cell and cur.? != .Delegate)) {
+            g.get().defineSlot(slot, name, value) catch {};
+            return .{ .ok = {} };
+        }
+    }
+    return storeGlobal(self, allocator, name, value);
+}
+
 /// Bind a top-level name in the root globals scope.
 pub fn defineRootGlobal(self: *VmHost, name: []const u8, value: Value) void {
     const root_env = rootGlobals(self);

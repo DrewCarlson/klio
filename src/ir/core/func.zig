@@ -129,12 +129,23 @@ pub const FuncExtra = struct {
     implicit_label: ?[]const u8 = null,
     /// Resolved fully-qualified names of each source annotation; empty for the baked image.
     annotation_names: []const []const u8 = &.{},
+    /// The class whose members this body's bare names resolve against, for a
+    /// body that is not itself a declaration. A lambda runs in a frame whose
+    /// implicit receiver its own signature does not spell, and nothing else
+    /// records it. Empty means "recorded, and there is none"; null means "not
+    /// recorded", which is what a caller must refuse to reason from.
+    lexical_owner: ?[]const u8 = null,
+    /// The declared type head of each context parameter, in declaration order: the
+    /// caller hands the values over as `context` chain entries in this order, and a
+    /// frame no caller served derives each from its chain by the type.
+    ctx_types: []const []const u8 = &.{},
 
     pub const hashed_by_content = {};
 
     pub fn isDefault(self: *const FuncExtra) bool {
         return self.ref_key.len == 0 and self.lambda_receiver_ty == null and self.capture_order.len == 0 and
-            self.implicit_label == null and self.annotation_names.len == 0;
+            self.implicit_label == null and self.annotation_names.len == 0 and self.lexical_owner == null and
+            self.ctx_types.len == 0;
     }
 };
 
@@ -463,9 +474,6 @@ pub const Func = struct {
             var written: RegSet = regSetEmpty();
             var expo: RegSet = regSetEmpty();
             for (b.insts) |*inst| {
-                // `CtxScope.ctx_args` is a run of `n_ctx` registers the `args`+`n_args` convention
-                // does not cover, so its tail goes unreported as uses. Keep the eager fill.
-                if (inst.* == .CtxScope) return false;
                 var c: Ctx = .{};
                 visitInstRegs(inst, &c, Ctx.visit);
                 if (c.oob) return false;

@@ -7,6 +7,9 @@ const ast = @import("ast");
 const ir = @import("ir.zig");
 const span_mod = @import("span");
 
+/// Depth of scratch builders on this thread; probes and the census are silent inside one.
+pub threadlocal var scratch_depth: u32 = 0;
+
 const Allocator = std.mem.Allocator;
 
 const Block = ir.Block;
@@ -195,6 +198,22 @@ pub fn popCurrentOwnerClass(prev: ?[]const u8) void {
 
 pub fn currentOwnerClass() ?[]const u8 {
     return current_owner_class;
+}
+
+/// The supertype heads the owner class's declaration lists, for a class
+/// that is not in the class table while its members lower: a function-local
+/// class is registered at run time and lowered then, and a `super` in one of
+/// its members still has to name the supertype the declaration wrote.
+threadlocal var current_owner_super_heads: []const []const u8 = &.{};
+
+pub fn setOwnerSuperHeads(heads: []const []const u8) []const []const u8 {
+    const prev = current_owner_super_heads;
+    current_owner_super_heads = heads;
+    return prev;
+}
+
+pub fn ownerSuperHeads() []const []const u8 {
+    return current_owner_super_heads;
 }
 
 /// File-keyed type renames: FileId -> (simple type name -> mangled lift name).
@@ -445,6 +464,9 @@ pub const FuncBuilder = struct {
     module: *Module,
     /// A scratch/probe builder: its sites stay out of the dispatch census.
     census_quiet: bool = false,
+    /// This body's `this` is the owner's enclosing instance: an inner class's
+    /// constructor argument, default or delegation thunk binds it so.
+    this_is_outer: bool = false,
     /// A lambda declared receiverless: the enclosing tier is its next receiver link.
     own_recv_known_none: bool = false,
     blocks: std.ArrayList(Block) = .empty,
@@ -463,6 +485,11 @@ pub const FuncBuilder = struct {
     /// scope chain: references lower as `LoadCapture` and record the name.
     outer_names: StringSet,
     capture_order: std.ArrayList([]const u8) = .empty,
+    /// The declared type heads of this body's context parameters, in order.
+    ctx_types: std.ArrayList([]const u8) = .empty,
+    /// The context values this body can name, innermost first: its own context
+    /// parameters, then those of the bodies enclosing it, reached as captures.
+    ctx_scope: std.ArrayList(ir.ContextLocal) = .empty,
     capture_regs: StringRegMap,
     capture_loads_emitted: StringSet,
     /// Loop context stack; `label` matches `break@label`, a bare jump the innermost.
@@ -491,13 +518,16 @@ pub const FuncBuilder = struct {
     broad_coll_locals: StringSet,
     /// Locals initialized by `object : T {}`, kept out of `local_init_exprs`.
     object_init_locals: StringSet,
-    /// Simple name of the owning class; `super.method()` starts `CallSuper` here.
+    /// Simple name of the owning class; `super.method()` resolves against its supertypes.
     owner_class: ?[]const u8 = null,
     /// Declaring package of the function lowered; a bare call prefers its sibling.
     self_package: []const u8 = "",
     /// Declared receiver-type name of the enclosing extension function, so a bare
     /// call prefers an overload whose `this`-param matches. Null for plain fns.
     recv_ty: ?[]const u8 = null,
+    /// The extension receiver's declared type is a function type with a
+    /// receiver (`(R.() -> T).f()`), so `this` here is a receiver-function value.
+    recv_is_receiver_fn: bool = false,
     recv_type_ref: ?TypeRef = null,
     splice_recv_ty: ?[]const u8 = null,
     /// Depth of spliced receiver-lambda regions that pushed a subject on the chain.
@@ -523,8 +553,14 @@ pub const FuncBuilder = struct {
     /// Implicit receiver entries, innermost first; a receiver lambda prepends its
     /// head and keeps the outer tower. An entry may carry its `this@<label>`.
     implicit_receiver_tower: std.ArrayList(ir.ReceiverTowerEntry) = .empty,
+    /// Whether the construction site recorded the tower at all. An empty
+    /// tower from a site that recorded one means no receiver is in scope; an
+    /// empty tower from a site that never did means nothing is known.
+    implicit_receiver_tower_known: bool = false,
     /// The label binding this body's own receiver; null when it has none.
     own_this_label: ?[]const u8 = null,
+    /// The register a member-extension body loaded its dispatch receiver into.
+    dispatch_this_reg: ?Reg = null,
     /// The declaring class when `owner_class` names the extension receiver instead.
     dispatch_owner: ?[]const u8 = null,
     /// The LOCAL `fun` whose body this builder lowers: a bare self-call binds
@@ -570,6 +606,10 @@ pub const FuncBuilder = struct {
     /// Declared parameter type name per positional parameter of a local function,
     /// leading `this` dropped, so a numeric literal argument coerces at the call.
     local_fn_param_tys: runtime.NameHashMap([]const ?[]const u8),
+    /// A local function whose last user parameter is a function type: the
+    /// receiver that block declares, null for none. Absent when the last
+    /// parameter binds no block.
+    local_fn_block_recv: runtime.NameHashMap(?TypeRef),
     /// Local fns declared as extensions, whose bare call prepends the implicit
     /// receiver. The value is the value-parameter count, or -1 when unknown.
     local_ext_fns: runtime.NameHashMap(i8),
@@ -686,6 +726,13 @@ pub const FuncBuilder = struct {
     /// A lambda argument's expected value-parameter arity, keyed by the lambda's
     /// span and authoritative for `lowerLambda` whichever branch lowers the arg.
     lambda_arg_arity: std.AutoHashMap(span_mod.Span, i16) = undefined,
+    /// Lambda arguments whose parameter is known to take NO receiver: every
+    /// candidate the call could bind agrees, so the closure's `this` is the
+    /// enclosing one and its receiver tower is complete.
+    lambda_arg_no_recv: std.AutoHashMap(span_mod.Span, void) = undefined,
+    /// The context parameter type heads a lambda argument's parameter declares,
+    /// keyed by the lambda's span, so the body binds them as context slots.
+    lambda_arg_ctx_types: std.AutoHashMap(span_mod.Span, []const []const u8) = undefined,
     /// Receiver type of a receiver-lambda argument, keyed by span, for deferred calls.
     lambda_arg_recv: std.AutoHashMap(span_mod.Span, TypeRef) = undefined,
 
@@ -741,12 +788,15 @@ pub const FuncBuilder = struct {
             .owned_type_param_names = .empty,
             .own_member_arity = runtime.NameHashMap(u64).init(allocator),
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
+            .lambda_arg_no_recv = std.AutoHashMap(span_mod.Span, void).init(allocator),
+            .lambda_arg_ctx_types = std.AutoHashMap(span_mod.Span, []const []const u8).init(allocator),
             .lambda_arg_recv = std.AutoHashMap(span_mod.Span, TypeRef).init(allocator),
             .enclosing_members = StringSet.init(allocator),
             .param_names = StringSet.init(allocator),
             .local_fns = StringSet.init(allocator),
             .local_fn_return_tys = runtime.NameHashMap(TypeRef).init(allocator),
             .local_fn_param_tys = runtime.NameHashMap([]const ?[]const u8).init(allocator),
+            .local_fn_block_recv = runtime.NameHashMap(?TypeRef).init(allocator),
             .fn_value_param_arities = runtime.NameHashMap([]const i16).init(allocator),
             .local_decl_types = runtime.NameHashMap(TypeRef).init(allocator),
             .local_ast_tys = runtime.NameHashMap(*const ast.TypeRef).init(allocator),
@@ -789,7 +839,19 @@ pub const FuncBuilder = struct {
         return self;
     }
 
+    /// A builder that lowers only to type an expression, its output discarded:
+    /// the census and the lowering probes skip what it and its nested bodies
+    /// emit. Counted per thread so a body lowered inside it is quiet too.
+    pub fn thisIsOuter(self: *const FuncBuilder) bool {
+        return self.this_is_outer;
+    }
+    pub fn markScratch(self: *FuncBuilder) void {
+        if (self.census_quiet) return;
+        self.census_quiet = true;
+        scratch_depth += 1;
+    }
     pub fn deinit(self: *FuncBuilder) void {
+        if (self.census_quiet) scratch_depth -= 1;
         const a = self.allocator;
         for (self.inst_lists.items) |*l| l.deinit(a);
         self.inst_lists.deinit(a);
@@ -805,6 +867,10 @@ pub const FuncBuilder = struct {
         for (self.scopes.items) |*s| s.deinit();
         self.scopes.deinit(a);
         self.lambda_arg_arity.deinit();
+        self.lambda_arg_no_recv.deinit();
+        self.lambda_arg_ctx_types.deinit();
+        self.ctx_types.deinit(self.allocator);
+        self.ctx_scope.deinit(self.allocator);
         {
             var it = self.lambda_arg_recv.valueIterator();
             while (it.next()) |receiver| receiver.deinit(a);
@@ -844,6 +910,11 @@ pub const FuncBuilder = struct {
             var it = self.local_fn_param_tys.valueIterator();
             while (it.next()) |v| self.allocator.free(v.*);
             self.local_fn_param_tys.deinit();
+        }
+        {
+            var it = self.local_fn_block_recv.valueIterator();
+            while (it.next()) |v| if (v.*) |*t| t.deinit(self.allocator);
+            self.local_fn_block_recv.deinit();
         }
         {
             var it = self.fn_value_param_arities.valueIterator();
@@ -1426,12 +1497,19 @@ pub const FuncBuilder = struct {
     pub fn setImplicitReceiverTower(self: *FuncBuilder, entries: []const ir.ReceiverTowerEntry) Allocator.Error!void {
         self.implicit_receiver_tower.clearRetainingCapacity();
         try self.implicit_receiver_tower.appendSlice(self.allocator, entries);
+        self.implicit_receiver_tower_known = true;
     }
     pub fn setOwnThisLabel(self: *FuncBuilder, label: ?[]const u8) void {
         self.own_this_label = label;
     }
     pub fn setDispatchOwner(self: *FuncBuilder, owner: ?[]const u8) void {
         self.dispatch_owner = owner;
+    }
+    pub fn setDispatchThisReg(self: *FuncBuilder, r: ?Reg) void {
+        self.dispatch_this_reg = r;
+    }
+    pub fn dispatchThisReg(self: *const FuncBuilder) ?Reg {
+        return self.dispatch_this_reg;
     }
     /// The class a `this@<Class>` here names: the dispatch owner, else the owner.
     pub fn dispatchClass(self: *const FuncBuilder) ?[]const u8 {
@@ -1469,18 +1547,72 @@ pub const FuncBuilder = struct {
             .head = head,
             .label = innermost_label,
         });
+        // The spliced subjects in scope here, innermost first: a closure built
+        // inside `with(x) { }` sees `x` as an implicit receiver, and a subject
+        // whose head is unknown or only a hint leaves the tower unable to say
+        // what the closure's `this` is, which `tower_unknowable` reports.
+        //
+        // Only the subjects `this` reaches: the receiver of an inline function
+        // whose block takes it as a PARAMETER (`x.let { scope -> }`) is bound
+        // for the function's own body and hidden from the block by its resolve
+        // window, and is no receiver of the block. The innermost subject in
+        // scope is the one `this` names now; each further one is the `this`
+        // the nearer subject displaced.
+        var expect: ?Reg = self.resolve("this") orelse self.capture_regs.get("this");
+        var hidden_subject = false;
+        if (runtime.envOnce("KLIO_WALK_PROBE") != null and self.subject_binds.items.len != 0) {
+            std.debug.print("[tower] fn={s} this={?d} subjects=", .{ currentRealFn() orelse "-", if (expect) |e| e.int() else null });
+            for (self.subject_binds.items) |sb| std.debug.print(" r{d}:{s}/{s}(prior={?d})", .{ sb.reg.int(), sb.head orelse "?", sb.label orelse "-", if (sb.prior_this) |pt| pt.int() else null });
+            std.debug.print(" innermost={s} recv={s} encl={s} owner={s} inherited=", .{ innermost orelse "-", self.recv_ty orelse "-", self.enclosing_recv_ty orelse "-", self.owner_class orelse "-" });
+            for (self.implicit_receiver_tower.items) |te| std.debug.print(" {s}/{s}", .{ if (te.head.len == 0) "?" else te.head, te.label orelse "-" });
+            std.debug.print("\n", .{});
+        }
+        var si = self.subject_binds.items.len;
+        while (si > 0) {
+            si -= 1;
+            const sb = self.subject_binds.items[si];
+            const reach = expect orelse break;
+            if (sb.reg != reach) {
+                hidden_subject = true;
+                continue;
+            }
+            const head = if (sb.head_hint) null else sb.head;
+            try appendTowerEntry(&out, allocator, .{ .head = head orelse "", .label = sb.label });
+            expect = sb.prior_this;
+        }
         // An inline splice window's receiver is an implicit receiver too, labeled
         // by the spliced function. Under the receiver-formed splice it is the
-        // `with`/`apply` subject, ranked ahead of the lexical owner.
-        const splice_head = self.spliceRecvTy() orelse self.spliceHintRecv();
+        // `with`/`apply` subject, ranked ahead of the lexical owner. A window
+        // whose subject `this` does not reach is the same hidden receiver.
+        const splice_head = if (hidden_subject) null else (self.spliceRecvTy() orelse self.spliceHintRecv());
         const splice_first = rfsSpliceFirst();
         if (splice_first) if (splice_head) |head| {
             try appendTowerEntry(&out, allocator, .{ .head = head, .label = self.currentInlineFn() });
         };
-        const current = self.recv_ty orelse self.enclosing_recv_ty orelse self.owner_class;
+        // In an inner class's constructor context `this` is the enclosing
+        // instance, so a closure built there sees the enclosing class first.
+        const current = if (self.this_is_outer)
+            (if (self.owner_class) |oc| self.module.registry.enclosing_class.get(oc) else null)
+        else
+            self.recv_ty orelse self.enclosing_recv_ty orelse self.owner_class;
         if (current) |head| {
-            const label: ?[]const u8 = if (self.recv_ty != null) self.own_this_label else null;
+            // An extension body answers to `this@<fn>`, a plain method body to
+            // `this@<Owner>`; a lambda inheriting an enclosing receiver type
+            // bound no label of its own.
+            const label: ?[]const u8 = if (self.recv_ty != null)
+                self.own_this_label
+            else if (self.enclosing_recv_ty == null)
+                self.owner_class
+            else
+                null;
             try appendTowerEntry(&out, allocator, .{ .head = head, .label = label });
+            // A member extension body has two receivers: behind its extension
+            // receiver stands the owner instance, the dispatch receiver, which
+            // the body binds as `this@<Owner>` and a closure captures by that
+            // slot.
+            if (self.recv_ty != null) if (self.owner_class) |oc| {
+                if (!std.mem.eql(u8, oc, head)) try appendTowerEntry(&out, allocator, .{ .head = oc, .label = oc });
+            };
         }
         if (!splice_first) if (splice_head) |head| {
             try appendTowerEntry(&out, allocator, .{ .head = head, .label = self.currentInlineFn() });
@@ -1683,6 +1815,22 @@ pub const FuncBuilder = struct {
 
     pub fn lambdaArgArity(self: *const FuncBuilder, sp: span_mod.Span) ?i16 {
         return self.lambda_arg_arity.get(sp);
+    }
+    pub fn recordLambdaArgNoRecv(self: *FuncBuilder, sp: span_mod.Span) void {
+        self.lambda_arg_no_recv.put(sp, {}) catch {};
+    }
+    pub fn lambdaArgNoRecv(self: *const FuncBuilder, sp: span_mod.Span) bool {
+        return self.lambda_arg_no_recv.contains(sp);
+    }
+    pub fn recordLambdaArgCtxTypes(self: *FuncBuilder, sp: span_mod.Span, tys: []const []const u8) void {
+        self.lambda_arg_ctx_types.put(sp, tys) catch {};
+    }
+    pub fn lambdaArgCtxTypes(self: *const FuncBuilder, sp: span_mod.Span) ?[]const []const u8 {
+        return self.lambda_arg_ctx_types.get(sp);
+    }
+    /// A context value this body can name from here on.
+    pub fn addContextLocal(self: *FuncBuilder, name: []const u8, ty: []const u8) Allocator.Error!void {
+        try self.ctx_scope.append(self.allocator, .{ .name = name, .ty = ty });
     }
 
     pub fn recordLambdaArgRecvOwned(
@@ -1938,6 +2086,18 @@ pub const FuncBuilder = struct {
     pub fn localFnParamTys(self: *const FuncBuilder, name: []const u8) ?[]const ?[]const u8 {
         return self.local_fn_param_tys.get(name);
     }
+    /// Takes ownership of `recv`.
+    pub fn setLocalFnBlockRecv(self: *FuncBuilder, name: []const u8, recv: ?TypeRef) Allocator.Error!void {
+        if (self.local_fn_block_recv.fetchPut(name, recv) catch null) |old| {
+            if (old.value) |*t| {
+                var owned = t.*;
+                owned.deinit(self.allocator);
+            }
+        }
+    }
+    pub fn localFnBlockRecv(self: *const FuncBuilder, name: []const u8) ??TypeRef {
+        return self.local_fn_block_recv.get(name);
+    }
     /// Record, for the function-typed local or parameter `name`, the arity of
     /// each of its own parameters (`-1` for a parameter that is not a function
     /// type). Takes a copy.
@@ -2094,7 +2254,8 @@ pub const FuncBuilder = struct {
         return self.receiver_lambda_arity.get(name);
     }
     /// Param `name` has type `context(C..) (A..) -> R`; a positional call
-    /// supplying `n_ctx + n_regular` arguments lowers to `CtxCall`.
+    /// supplies `n_ctx + n_regular` arguments, an implicit one resolves each
+    /// context argument statically ahead of the value call.
     pub fn markContextFnParam(self: *FuncBuilder, name: []const u8, ctx_types: []const []const u8, n_regular: usize) Allocator.Error!void {
         try self.context_fn_params.put(name, .{ .n_ctx = ctx_types.len, .n_regular = n_regular, .ctx_types = ctx_types });
     }
@@ -2122,9 +2283,14 @@ pub const FuncBuilder = struct {
     pub fn isReceiverLambdaParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.receiver_lambda_params.contains(name);
     }
-    /// The caller owns the returned set.
+    /// The receiver-callable names a nested body inherits: the receiver-lambda
+    /// params and the locals declared with a receiver-function type, which a
+    /// captured `recv.name()` binds the same way. The caller owns the set.
     pub fn receiverLambdaParamNames(self: *const FuncBuilder) Allocator.Error!StringSet {
-        return cloneStringSet(self.allocator, &self.receiver_lambda_params);
+        var out = try cloneStringSet(self.allocator, &self.receiver_lambda_params);
+        var it = self.local_decl_recv_fn.keyIterator();
+        while (it.next()) |k| try out.put(k.*, {});
+        return out;
     }
     /// The innermost frame's substitution map, keyed by the inline fn's lambda params.
     pub fn innermostInlineLambdaSubst(self: *const FuncBuilder) ?*const runtime.NameHashMap(*const ast.Expr) {
@@ -2440,6 +2606,13 @@ pub const FuncBuilder = struct {
     }
     pub fn spliceParamTy(self: *const FuncBuilder, name: []const u8) ?ast.TypeRef {
         return self.splice_param_tys.get(name);
+    }
+    /// Take `name`'s splice-param type out of scope, as `hideBinding` does for
+    /// its register: a caller's lambda body spliced into the callee sees the
+    /// caller's `block`, not the callee's. Restored with `restoreSpliceParamTy`.
+    pub fn hideSpliceParamTy(self: *FuncBuilder, name: []const u8) ?ast.TypeRef {
+        if (self.splice_param_tys.fetchRemove(name)) |kv| return kv.value;
+        return null;
     }
     pub fn spliceParamTyIterator(self: *const FuncBuilder) runtime.NameHashMap(ast.TypeRef).Iterator {
         return self.splice_param_tys.iterator();
@@ -2786,6 +2959,7 @@ pub const FuncBuilder = struct {
 
     threadlocal var push_trace_checked: bool = false;
     threadlocal var gf_trace: ?[]const u8 = null;
+    threadlocal var gf_stack_left: usize = 12;
     threadlocal var lg_trace: ?[]const u8 = null;
     fn pushTraceInit() void {
         if (push_trace_checked) return;
@@ -2822,7 +2996,41 @@ pub const FuncBuilder = struct {
         return p;
     }
 
-    pub fn push(self: *FuncBuilder, inst: Inst) Allocator.Error!void {
+    pub fn push(self: *FuncBuilder, raw: Inst) Allocator.Error!void {
+        var inst = raw;
+        // The builtin operation a member call names is decided by the name and
+        // the argument count, both of which are here. Bound once, centrally,
+        // because a new emitter that forgot it would silently put the site
+        // back on the string compare.
+        // The `<class-companion-or-self>` read is a fixed spelling, and the
+        // evaluator was comparing the string on every field read to notice it.
+        if (inst == .GetField and inst.GetField.own_kind == .none) {
+            const cs = self.module.consts.items;
+            const fi = inst.GetField.field.int();
+            if (fi < cs.len and cs[fi] == .String and
+                std.mem.eql(u8, cs[fi].String, ir.COMPANION_OR_SELF))
+            {
+                inst.GetField.own_kind = .companion_or_self;
+            }
+        }
+        if (inst == .GetField and inst.GetField.builtin == .none) {
+            const cs = self.module.consts.items;
+            const fi = inst.GetField.field.int();
+            if (fi < cs.len and cs[fi] == .String) {
+                inst.GetField.builtin = ir.BuiltinField.of(cs[fi].String);
+            }
+        }
+        if (inst == .CallMember and inst.CallMember.builtin == .none) {
+            const cs = self.module.consts.items;
+            const ni = inst.CallMember.name.int();
+            if (ni < cs.len and cs[ni] == .String) {
+                inst.CallMember.builtin = ir.BuiltinMember.of(cs[ni].String, inst.CallMember.n_args);
+            }
+        }
+        // Which lowering arm emitted an instruction the site census calls
+        // unresolved. The per-gate counters answer for one gate; this answers
+        // for every emission, since nothing reaches a block without it.
+        if (emitCensusOn()) noteEmitSite(&inst, @returnAddress());
         // KLIO_GF_TRACE=<field> / KLIO_LG_TRACE=<name>: print the emitter of a
         // field read or global load; the return address symbolizes with addr2line.
         pushTraceInit();
@@ -2830,7 +3038,20 @@ pub const FuncBuilder = struct {
             if (gf_trace) |w| {
                 const cs = self.module.consts.items;
                 const nm = if (inst.GetField.field.int() < cs.len and cs[inst.GetField.field.int()] == .String) cs[inst.GetField.field.int()].String else "?";
-                if (std.mem.eql(u8, w, nm)) std.debug.print("[gf] {s} recv=r{d} in={s} ret=0x{x}\n", .{ nm, inst.GetField.receiver.int(), currentRealFn() orelse "-", @returnAddress() });
+                if (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, nm)) std.debug.print("[gf] {s} recv=r{d} kind={s} own_cls={s} in={s} ret=0x{x}\n", .{
+                    nm,
+                    inst.GetField.receiver.int(),
+                    @tagName(inst.GetField.own_kind),
+                    if (inst.GetField.own_cls) |c| (if (c.int() < self.module.classes.items.len) self.module.classes.items[c.int()].name else "?") else "<none>",
+                    currentRealFn() orelse "-",
+                    @returnAddress(),
+                });
+                if (inst.GetField.own_cls == null and inst.GetField.own_kind == .none and gf_stack_left > 0 and
+                    runtime.envOnce("KLIO_GF_STACK") != null)
+                {
+                    gf_stack_left -= 1;
+                    std.debug.dumpCurrentStackTrace(.{});
+                }
             }
         }
         if (inst == .LoadGlobal) {
@@ -3030,6 +3251,7 @@ pub const FuncBuilder = struct {
         self.fuseSingleUseMoves(blocks);
         self.blocks = .empty;
         const capture_order = try self.allocator.dupe([]const u8, self.capture_order.items);
+        const ctx_types: []const []const u8 = if (self.ctx_types.items.len == 0) &.{} else try self.allocator.dupe([]const u8, self.ctx_types.items);
         return Func{
             .id = FuncId.from(0), // assigned by the caller when adding to Module
             .name = name,
@@ -3043,7 +3265,7 @@ pub const FuncBuilder = struct {
             .is_tailrec = self.tailrec_self != null,
             .is_lambda = false,
             .is_inline = self.is_inline,
-            .extra = try self.funcExtra(.{ .capture_order = capture_order }),
+            .extra = try self.funcExtra(.{ .capture_order = capture_order, .ctx_types = ctx_types }),
             .low_priority = false,
             // The declaring package in effect for this lowering. Explicit decl
             // paths overwrite it after `finish`; the synthetic paths (init blocks,
@@ -3085,6 +3307,12 @@ pub const SubjectBind = struct {
     head: ?[]const u8,
     /// The scope `this` visible just before this subject bound.
     prior_this: ?Reg,
+    /// `head` was inherited from the enclosing window rather than derived
+    /// from the subject: a hint for ranking, not a fact about the value.
+    head_hint: bool = false,
+    /// The inline function whose `this@<label>` names this subject, when the
+    /// splice bound one; a closure built inside reaches the subject by it.
+    label: ?[]const u8 = null,
 };
 
 pub const LoopFrame = struct {
@@ -3355,3 +3583,75 @@ test "finish carries tailrec and inline flags" {
     try testing.expect(func.is_inline);
 }
 
+// ---------------------------------------------------------------------------
+// Emitter census: for every instruction the site census calls unresolved, which
+// lowering arm pushed it.
+//
+// The `[lower-sites]` counters answer for the one gate that calls them, and a
+// compose program emits four times as many by-name member calls as that gate
+// ever sees. `push` is the only way an instruction reaches a block, so a
+// counter keyed by its return address is exhaustive over emitters, and needs no
+// call-site upkeep as arms are added or moved.
+//
+// `KLIO_EMIT_CENSUS=1`; symbolize with `scripts/emit_census_symbolize.py`.
+// ---------------------------------------------------------------------------
+
+var emit_census_state: u8 = 0;
+
+pub fn emitCensusOn() bool {
+    if (emit_census_state == 0) {
+        emit_census_state = if (runtime.envOnce("KLIO_EMIT_CENSUS") != null) 2 else 1;
+    }
+    return emit_census_state == 2;
+}
+
+const EmitKey = struct { kind: u8, addr: usize };
+const EmitMap = std.AutoHashMapUnmanaged(EmitKey, u64);
+var emit_sites: EmitMap = .empty;
+var emit_mutex: runtime.SpinMutex = .{};
+
+fn noteEmitSite(inst: *const Inst, ret: usize) void {
+    const kind = ir.site_census.classify(inst);
+    if (ir.site_census.verdictOf(kind) != .unresolved) return;
+    emit_mutex.lock();
+    defer emit_mutex.unlock();
+    const gop = emit_sites.getOrPut(std.heap.page_allocator, .{
+        .kind = @intFromEnum(kind),
+        .addr = ret,
+    }) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+
+/// One address in this file, so a symbolizer can slide the rest.
+fn emitCensusAnchor() usize {
+    return @intFromPtr(&noteEmitSite);
+}
+
+pub fn emitCensusDump() void {
+    if (!emitCensusOn()) return;
+    emit_mutex.lock();
+    defer emit_mutex.unlock();
+    const Entry = struct { kind: u8, addr: usize, n: u64 };
+    var list = std.ArrayList(Entry).initCapacity(std.heap.page_allocator, emit_sites.count()) catch return;
+    defer list.deinit(std.heap.page_allocator);
+    var total: u64 = 0;
+    var it = emit_sites.iterator();
+    while (it.next()) |e| {
+        list.appendAssumeCapacity(.{ .kind = e.key_ptr.kind, .addr = e.key_ptr.addr, .n = e.value_ptr.* });
+        total += e.value_ptr.*;
+    }
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn gt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.gt);
+    std.debug.print("[emit-census] total={d} distinct={d} anchor noteEmitSite=0x{x}\n", .{ total, list.items.len, emitCensusAnchor() });
+    for (list.items) |e| {
+        std.debug.print("[emit-census] {d:>10} {s} 0x{x}\n", .{
+            e.n,
+            @tagName(@as(ir.site_census.SiteKind, @enumFromInt(e.kind))),
+            e.addr,
+        });
+    }
+}

@@ -524,9 +524,13 @@ fn finishFromBase(gpa: Allocator, base: *interp_ir.build.StdlibBase, r: *const L
     map.files.appendSlice(map.arena.allocator(), r.dep_map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, r.paths, r.user.texts) orelse return null;
     publishExternDecls(gpa, base);
+    ir_mod.discardPendingPicks();
     publishBaseEagerCalls(gpa, base);
-    if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    if (@import("commands.zig").eagerCallsOn()) {
+        if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    }
     span.active_map = map;
+    span.dumpFileIds(map);
     // The base is baked after the run, so the run module clones its tables
     // rather than taking them, and clones all of them: bodies lower into it
     // as the program runs.
@@ -626,6 +630,7 @@ fn checkBaseSources(gpa: Allocator, base: *interp_ir.build.StdlibBase, asts: []c
 /// Republish the base's baked eager call resolutions under the user program's.
 fn publishBaseEagerCalls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibBase) void {
     if (sb.eager_calls.len == 0) return;
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_BASE_EAGER") orelse "1", "0")) return;
     var m = ir_mod.pending_eager_call_fids orelse std.AutoHashMap(span.Span, u32).init(gpa);
     for (sb.eager_calls) |ec| m.put(ec.call, ec.fid) catch {};
     ir_mod.pending_eager_call_fids = m;
@@ -641,6 +646,47 @@ fn headOf(name: []const u8) []const u8 {
     return h;
 }
 
+/// The image's structural type, copied into the shape the checker reads.
+fn externTypeOf(gpa: std.mem.Allocator, t: *const ir_mod.TypeRef) types_mod.ExternType {
+    const args = gpa.alloc(types_mod.ExternType, t.args.len) catch return .{ .name = t.name, .nullable = t.nullable };
+    for (t.args, args) |*src, *dst| dst.* = externTypeOf(gpa, src);
+    return .{ .name = t.name, .nullable = t.nullable, .args = args };
+}
+
+/// One declaration's whole signature from its `DeclSig`; null for a private
+/// one, which no program can name.
+fn externFnOf(gpa: std.mem.Allocator, m: *const ir_mod.Module, name: []const u8, fid: u32, ds: *const ir_mod.Module.DeclSig) ?types_mod.ExternFn {
+    if (ds.visibility == .Private) return null;
+    const n = ds.sig.len;
+    const params = gpa.alloc(types_mod.ExternType, n) catch return null;
+    for (ds.sig, params) |*p, *dst| dst.* = externTypeOf(gpa, p);
+    const names: []const []const u8 = if (ds.param_names.len == n) ds.param_names else blk: {
+        const out = gpa.alloc([]const u8, n) catch return null;
+        @memset(out, "");
+        break :blk out;
+    };
+    const defaults: []const bool = if (ds.param_defaults.len == n) ds.param_defaults else blk: {
+        const out = gpa.alloc(bool, n) catch return null;
+        for (out, 0..) |*d, i| d.* = i >= ds.arity.required;
+        break :blk out;
+    };
+    const tps: []const []const u8 = if (m.registry.func_type_params.get(ir_mod.FuncId.from(fid))) |list| list.items else &.{};
+    return .{
+        .name = name,
+        .fid = fid,
+        .type_params = tps,
+        .receiver = if (ds.receiver_ty) |*rt| externTypeOf(gpa, rt) else null,
+        .params = params,
+        .param_names = names,
+        .param_defaults = defaults,
+        .has_vararg = ds.arity.has_vararg,
+        .return_ty = if (ds.return_ty) |*rt| externTypeOf(gpa, rt) else null,
+        .is_suspend = ds.is_suspend,
+        .has_body = ds.has_body,
+        .visibility = ds.visibility,
+    };
+}
+
 /// Publish the image's own declarations for the checker (`types.ExternDecls`).
 fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibBase) void {
     const mg = sb.built.module.borrow();
@@ -648,16 +694,133 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     const m = mg.get();
     // Simple names are the only spelling the checker's class table uses, so a name
     // two classes share identifies nothing and is dropped from every published map.
-    var classes = std.StringHashMap(void).init(gpa);
     var ambiguous_names = std.StringHashMap(void).init(gpa);
     defer ambiguous_names.deinit();
-    for (m.classes.items) |*c| {
-        const gop = classes.getOrPut(c.name) catch continue;
-        if (gop.found_existing) ambiguous_names.put(c.name, {}) catch {};
-    }
     {
-        var ait = ambiguous_names.keyIterator();
-        while (ait.next()) |k| _ = classes.remove(k.*);
+        var seen = std.StringHashMap(void).init(gpa);
+        defer seen.deinit();
+        for (m.classes.items) |*c| {
+            const gop = seen.getOrPut(c.name) catch continue;
+            if (gop.found_existing) ambiguous_names.put(c.name, {}) catch {};
+        }
+    }
+    // Member declarations by owner: the declaration records carry no name of
+    // their own, and the member index is what the image loads eagerly.
+    var members_by_owner = std.StringHashMap(std.ArrayList(types_mod.ExternFn)).init(gpa);
+    defer members_by_owner.deinit();
+    {
+        var it = m.member_name_index.iterator();
+        while (it.next()) |e| {
+            const owner_fqn = e.key_ptr.a;
+            const name = e.key_ptr.b;
+            for (e.value_ptr.items) |fid| {
+                const ds = m.decl_sigs.get(fid.int()) orelse continue;
+                if (ds.receiver_ty != null) continue;
+                const ef = externFnOf(gpa, m, name, fid.int(), &ds) orelse continue;
+                const gop = members_by_owner.getOrPut(owner_fqn) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                gop.value_ptr.append(gpa, ef) catch {};
+            }
+        }
+    }
+    var classes = std.StringHashMap(types_mod.ExternClass).init(gpa);
+    for (m.classes.items) |*c| {
+        if (ambiguous_names.contains(c.name)) continue;
+        var props: std.ArrayList(types_mod.ExternProp) = .empty;
+        for (c.primary_params) |*pp| {
+            if (!pp.is_property) continue;
+            props.append(gpa, .{ .name = pp.name, .ty = externTypeOf(gpa, &pp.ty) }) catch {};
+        }
+        for (c.declared_props) |*dp| {
+            const ty: ?types_mod.ExternType = if (m.registry.class_prop_type_refs.get(.{ .a = c.name, .b = dp.name })) |*tr| externTypeOf(gpa, tr) else null;
+            props.append(gpa, .{ .name = dp.name, .ty = ty, .is_abstract = dp.is_abstract }) catch {};
+        }
+        const ctor: ?types_mod.ExternFn = if (c.has_primary_ctor and !c.is_interface) blk: {
+            const n = c.primary_params.len;
+            const params = gpa.alloc(types_mod.ExternType, n) catch break :blk null;
+            const names = gpa.alloc([]const u8, n) catch break :blk null;
+            const defaults = gpa.alloc(bool, n) catch break :blk null;
+            var has_vararg = false;
+            for (c.primary_params, params, names, defaults) |*pp, *pt, *pn, *pd| {
+                pt.* = externTypeOf(gpa, &pp.ty);
+                pn.* = pp.name;
+                pd.* = pp.default != null;
+                if (pp.is_vararg) has_vararg = true;
+            }
+            break :blk .{
+                .name = c.name,
+                .fid = 0,
+                .type_params = c.type_params,
+                .params = params,
+                .param_names = names,
+                .param_defaults = defaults,
+                .has_vararg = has_vararg,
+            };
+        } else null;
+        var secondaries: std.ArrayList(types_mod.ExternFn) = .empty;
+        for (c.secondary_ctor_arities) |*ca| {
+            if (ca.low_priority) continue;
+            const n = ca.param_heads.len;
+            const params = gpa.alloc(types_mod.ExternType, n) catch continue;
+            for (ca.param_heads, params) |h, *pt| pt.* = .{ .name = h };
+            const names = gpa.alloc([]const u8, n) catch continue;
+            if (ca.param_names.len == n) @memcpy(names, ca.param_names) else @memset(names, "");
+            const defaults = gpa.alloc(bool, n) catch continue;
+            if (ca.param_defaults.len == n) @memcpy(defaults, ca.param_defaults) else @memset(defaults, false);
+            secondaries.append(gpa, .{
+                .name = c.name,
+                .fid = 0,
+                .type_params = c.type_params,
+                .params = params,
+                .param_names = names,
+                .param_defaults = defaults,
+                .has_vararg = ca.vararg,
+            }) catch {};
+        }
+        const supers = gpa.alloc(types_mod.ExternType, c.supertypes.len) catch continue;
+        var n_supers: usize = 0;
+        for (c.supertypes, 0..) |sid, i| {
+            if (i < c.supertype_refs.len) {
+                supers[n_supers] = externTypeOf(gpa, &c.supertype_refs[i]);
+            } else {
+                if (sid.int() >= m.classes.items.len) continue;
+                supers[n_supers] = .{ .name = m.classes.items[sid.int()].name };
+            }
+            n_supers += 1;
+        }
+        var methods: []const types_mod.ExternFn = if (members_by_owner.get(c.fqn)) |list| list.items else &.{};
+        // A companion's members answer `Foo.bar` on the class itself.
+        if (c.companion) |cid| if (cid.int() < m.classes.items.len) {
+            const comp = &m.classes.items[cid.int()];
+            if (members_by_owner.get(comp.fqn)) |list| {
+                const merged = gpa.alloc(types_mod.ExternFn, methods.len + list.items.len) catch break;
+                @memcpy(merged[0..methods.len], methods);
+                @memcpy(merged[methods.len..], list.items);
+                methods = merged;
+            }
+            for (comp.primary_params) |*pp| {
+                if (!pp.is_property) continue;
+                props.append(gpa, .{ .name = pp.name, .ty = externTypeOf(gpa, &pp.ty) }) catch {};
+            }
+            for (comp.declared_props) |*dp| {
+                const ty: ?types_mod.ExternType = if (m.registry.class_prop_type_refs.get(.{ .a = comp.name, .b = dp.name })) |*tr| externTypeOf(gpa, tr) else null;
+                props.append(gpa, .{ .name = dp.name, .ty = ty, .is_abstract = dp.is_abstract }) catch {};
+            }
+        };
+        classes.put(c.name, .{
+            .name = c.name,
+            .type_params = c.type_params,
+            .supertypes = supers[0..n_supers],
+            .methods = methods,
+            .props = props.items,
+            .ctor = ctor,
+            .secondary_ctors = secondaries.items,
+            .has_secondary_ctors = c.secondary_ctor_count != 0,
+            .is_interface = c.is_interface,
+            .is_abstract = c.is_abstract,
+            .is_open = c.is_open,
+            .is_enum = c.is_enum,
+        }) catch {};
     }
     // Return heads ride the baked index, since a cached load's funcs are lazy; the
     // run that builds the base derives them from the funcs. Both publish the same.
@@ -685,106 +848,86 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
             } else gop.value_ptr.* = head;
         }
     }
-    // Extensions keyed by the receiver's class head, from the name index and the
-    // declaration signatures: on a cached image the funcs are lazy and
-    // `m.funcs.items` is empty, while the index and signatures are eager.
-    var ext_rets = std.StringHashMap([]const u8).init(gpa);
-    defer ext_rets.deinit();
-    if (sb.ext_returns.len != 0) {
-        for (sb.ext_returns) |er| ext_rets.put(er.key, er.head) catch {};
-    } else {
-        var eamb = std.StringHashMap(void).init(gpa);
-        defer eamb.deinit();
-        for (m.funcs.items) |*f| {
-            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
-            if (f.name.len == 0) continue;
-            const rh = headOf(f.params[0].ty.name);
-            const h = headOf(f.return_ty.name);
-            if (rh.len == 0 or h.len == 0 or !classes.contains(h)) continue;
-            const key = std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ rh, f.name }) catch continue;
-            if (eamb.contains(key)) continue;
-            const gop = ext_rets.getOrPut(key) catch continue;
-            if (gop.found_existing) {
-                if (!std.mem.eql(u8, gop.value_ptr.*, h)) {
-                    _ = ext_rets.remove(key);
-                    eamb.put(key, {}) catch {};
-                }
-            } else gop.value_ptr.* = h;
-        }
-    }
-    var exts = std.StringHashMap(std.ArrayList(types_mod.ExternExt)).init(gpa);
+    // Extensions keyed by the receiver's class head, and receiver-less
+    // top-level functions by name, from the name index and the declaration
+    // signatures: on a cached image the funcs are lazy and `m.funcs.items` is
+    // empty, while the index and signatures are eager.
+    var exts = std.StringHashMap(std.ArrayList(types_mod.ExternFn)).init(gpa);
+    var tops = std.StringHashMap(std.ArrayList(types_mod.ExternFn)).init(gpa);
     var nit = m.func_name_index.iterator();
     while (nit.next()) |entry| {
         const fname = entry.key_ptr.*;
         if (fname.len == 0) continue;
         for (entry.value_ptr.items) |fid| {
             const sig = m.decl_sigs.get(fid.int()) orelse continue;
-            const recv = sig.receiver_ty orelse continue;
-            const recv_head = headOf(recv.name);
-            if (recv_head.len == 0 or ambiguous_names.contains(recv_head)) continue;
-            const n = sig.sig.len;
-            const heads = gpa.alloc([]const u8, n) catch continue;
-            const nulls = gpa.alloc(bool, n) catch {
-                gpa.free(heads);
-                continue;
-            };
-            for (sig.sig, heads, nulls) |*p, *h, *nl| {
-                h.* = headOf(p.name);
-                nl.* = p.nullable;
+            if (sig.receiver_ty) |recv| {
+                var recv_head = headOf(recv.name);
+                if (recv_head.len == 0 or ambiguous_names.contains(recv_head)) continue;
+                const ef = externFnOf(gpa, m, fname, fid.int(), &sig) orelse continue;
+                // `fun <T> T.also(...)` receives anything: it is an extension
+                // on `Any`, the key every receiver's candidate walk reaches.
+                for (ef.type_params) |tp| {
+                    if (std.mem.eql(u8, tp, recv_head)) recv_head = "Any";
+                }
+                const gop = exts.getOrPut(recv_head) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                gop.value_ptr.append(gpa, ef) catch {};
+            } else if (sig.kind == .plain and sig.enclosing_class == null) {
+                const ef = externFnOf(gpa, m, fname, fid.int(), &sig) orelse continue;
+                const gop = tops.getOrPut(fname) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                gop.value_ptr.append(gpa, ef) catch {};
             }
-            const gop = exts.getOrPut(recv_head) catch {
-                gpa.free(heads);
-                gpa.free(nulls);
-                continue;
-            };
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            gop.value_ptr.append(gpa, .{
-                .name = fname,
-                .fid = fid.int(),
-                .param_heads = heads,
-                .param_nullable = nulls,
-                // From the baked index, as ranking evidence only.
-                .return_head = blk_r: {
-                    const key = std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ recv_head, fname }) catch break :blk_r "";
-                    defer gpa.free(key);
-                    const h = ext_rets.get(key) orelse break :blk_r "";
-                    if (ambiguous_names.contains(h)) break :blk_r "";
-                    break :blk_r h;
-                },
-                .return_nullable = false,
-                .is_infix = false,
-            }) catch {};
         }
     }
     if (runtime.envOnce("KLIO_EAGER_AUDIT") != null) {
         var n_ext: usize = 0;
         var eit = exts.valueIterator();
         while (eit.next()) |l| n_ext += l.items.len;
-        std.debug.print("[EAGER-EXTERN] published classes={d} fn_returns={d} ext_recvs={d} exts={d} (module funcs={d})\n", .{ classes.count(), rets.count(), exts.count(), n_ext, m.funcs.items.len });
+        var n_top: usize = 0;
+        var tit = tops.valueIterator();
+        while (tit.next()) |l| n_top += l.items.len;
+        var n_members: usize = 0;
+        var n_props: usize = 0;
+        var cit = classes.valueIterator();
+        while (cit.next()) |c| {
+            n_members += c.methods.len;
+            n_props += c.props.len;
+        }
+        std.debug.print("[EAGER-EXTERN] published classes={d} members={d} props={d} fn_returns={d} ext_recvs={d} exts={d} top_level={d} (module funcs={d})\n", .{ classes.count(), n_members, n_props, rets.count(), exts.count(), n_ext, n_top, m.funcs.items.len });
+        var ait = ambiguous_names.keyIterator();
+        var n_amb: usize = 0;
+        while (ait.next()) |k| : (n_amb += 1) {
+            if (n_amb < 40) std.debug.print("[EAGER-EXTERN] ambiguous {s}\n", .{k.*});
+        }
+        std.debug.print("[EAGER-EXTERN] ambiguous total={d}\n", .{n_amb});
     }
-    var supers = std.StringHashMap([][]const u8).init(gpa);
-    for (m.classes.items) |*c| {
-        if (c.supertypes.len == 0 or ambiguous_names.contains(c.name)) continue;
-        const names = gpa.alloc([]const u8, c.supertypes.len) catch continue;
-        var n: usize = 0;
-        for (c.supertypes) |sid| {
-            if (sid.int() >= m.classes.items.len) continue;
-            names[n] = m.classes.items[sid.int()].name;
-            n += 1;
+    var roots = std.StringHashMap(void).init(gpa);
+    {
+        var fi: u32 = 0;
+        while (fi < m.funcCount()) : (fi += 1) {
+            const f = m.funcById(ir_mod.FuncId.from(fi)) orelse continue;
+            if (packageRootOf(f.package)) |r| roots.put(r, {}) catch {};
         }
-        if (n == 0) {
-            gpa.free(names);
-            continue;
+        for (m.classes.items) |*c| {
+            if (packageRootOf(c.package)) |r| roots.put(r, {}) catch {};
         }
-        supers.put(c.name, names[0..n]) catch gpa.free(names);
     }
     types_mod.pending_extern_decls = .{
         .classes = classes,
         .fn_return_class = rets,
         .extensions = exts,
-        .supertypes = supers,
+        .top_level = tops,
         .has_extensions = true,
+        .package_roots = roots,
     };
+}
+
+/// The first segment of a dotted package, or null for the default package.
+fn packageRootOf(pkg: []const u8) ?[]const u8 {
+    if (pkg.len == 0) return null;
+    const dot = std.mem.findScalar(u8, pkg, '.') orelse return pkg;
+    return pkg[0..dot];
 }
 
 /// Assemble the program against a cached (or freshly baked) stdlib image. Null
@@ -1026,13 +1169,17 @@ fn finishFromLoaded(
     publishExternDecls(gpa, loaded.base);
     runtime.prof.phaseMark("extend extern");
     const te_extern = runtime.clockMonotonicNanos();
+    ir_mod.discardPendingPicks();
     publishBaseEagerCalls(gpa, loaded.base);
     runtime.prof.phaseMark("extend eager");
     const te_eager = runtime.clockMonotonicNanos();
-    if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    if (@import("commands.zig").eagerCallsOn()) {
+        if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    }
     runtime.prof.phaseMark("extend user-check");
     const te_user_check = runtime.clockMonotonicNanos();
     span.active_map = map;
+    span.dumpFileIds(map);
     // Loaded for this run alone: nothing reads the base after this.
     const built = interp_ir.build.buildModuleFilesExtendOwned(gpa, loaded.base, user2.asts) catch return null;
     runtime.prof.phaseMark("extend build");

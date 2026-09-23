@@ -31,7 +31,9 @@ const typeHead = probe_mod.typeHead;
 
 /// Whether a single-segment class-name call resolves to the constructor rather
 /// than a same-named factory function.
-pub const LitKind = enum { numeric, string, boolean, char };
+/// `integral` and `floating` are the two numeric literal forms Kotlin keeps
+/// apart; `numeric` is the width-unknown rung a declared `Number` sits on.
+pub const LitKind = enum { numeric, integral, floating, string, boolean, char };
 
 /// Whether an expression's static type head is definitely a list-family value: a
 /// call to a list factory, or a `listOf(...) + x` chain. Routes
@@ -53,13 +55,17 @@ pub fn staticListHead(e: *const Expr) bool {
 /// argument's type is not a known literal, so it can never disprove a candidate.
 pub fn argLitKind(e: *const Expr) ?LitKind {
     return switch (e.*) {
-        .IntLit, .FloatLit => .numeric,
+        .IntLit => .integral,
+        .FloatLit => .floating,
         .BoolLit => .boolean,
         .CharLit => .char,
         .StringTemplate => .string,
     // A signed literal is a literal: `nextInt(-1)` carries numeric evidence.
-        .Unary => |u| if ((u.op == .Neg or u.op == .Pos) and
-            (u.expr.* == .IntLit or u.expr.* == .FloatLit)) .numeric else null,
+        .Unary => |u| if (u.op == .Neg or u.op == .Pos) (switch (u.expr.*) {
+            .IntLit => .integral,
+            .FloatLit => .floating,
+            else => null,
+        }) else null,
         else => null,
     };
 }
@@ -217,6 +223,8 @@ pub fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) appli
         .lambda_is_literal = literal_callable,
         .literal_kind = if (argEvidenceLitKind(b, arg)) |k| switch (k) {
             .numeric => .numeric,
+            .integral => .integral,
+            .floating => .floating,
             .string => .string,
             .boolean => .boolean,
             .char => .char,
@@ -370,7 +378,40 @@ fn narrowNullCheck(
     return b.narrowLocalNotNull(value.Path.segments[0].name);
 }
 
+/// `KLIO_DISPATCH_STATS`: reads of a bound local whose type nothing recorded,
+/// by the shape of its initializer. The histogram says which initializer
+/// shapes the derivers miss most, weighted by the reads that ask.
+pub var untyped_local_init_kind: [@typeInfo(@typeInfo(Expr).@"union".tag_type.?).@"enum".fields.len]u64 = @splat(0);
+pub var untyped_local_no_init: u64 = 0;
+pub var untyped_local_no_init_param: u64 = 0;
+/// The names read most without a type and without an initializer: what the
+/// shape behind `no_init` is, `it` and a loop variable being different work.
+pub var untyped_local_names: ?std.StringHashMap(u64) = null;
+/// Bodies lower on worker threads; the name map is one for the process.
+var untyped_local_names_lock: runtime.SpinMutex = .{};
+
 pub fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (static_type_mod.dispatchStatsOn() and arg.* == .Path and arg.Path.segments.len == 1) {
+        const nm0 = arg.Path.segments[0].name;
+        if (b.resolve(nm0) != null and b.localDeclTypeRef(nm0) == null) {
+            if (b.localInitExpr(nm0)) |ie| {
+                untyped_local_init_kind[@intFromEnum(std.meta.activeTag(ie.*))] +%= 1;
+            } else {
+                untyped_local_names_lock.lock();
+                defer untyped_local_names_lock.unlock();
+                untyped_local_no_init +%= 1;
+                if (b.isParam(nm0)) untyped_local_no_init_param +%= 1;
+                if (untyped_local_names == null) untyped_local_names = std.StringHashMap(u64).init(std.heap.page_allocator);
+                // The name is a slice of the build arena, gone by the time the
+                // dump runs; the map keeps its own copy.
+                if (untyped_local_names.?.getPtr(nm0)) |v| {
+                    v.* +%= 1;
+                } else if (std.heap.page_allocator.dupe(u8, nm0)) |owned| {
+                    untyped_local_names.?.put(owned, 1) catch {};
+                } else |_| {}
+            }
+        }
+    }
     if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
             std.debug.print("[valty] READ {s} decl={s} b={x} fn={s} ndecl={d}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", @intFromPtr(b) & 0xffff, build.currentRealFn() orelse "-", b.localDeclTypeCount() });
@@ -474,7 +515,7 @@ fn typeheadAuditOn() bool {
 /// Whether the class named by an eager type head declares type parameters, in
 /// which case a head without arguments is incomplete evidence. Builtin container
 /// heads are listed explicitly, the class table not answering for them.
-fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
+pub fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
     const generic_builtins = [_][]const u8{
         "Array",           "List",                    "MutableList", "Set",               "MutableSet",
         "Map",             "MutableMap",              "Collection",  "MutableCollection", "Iterable",

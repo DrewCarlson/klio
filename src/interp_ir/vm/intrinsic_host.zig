@@ -644,6 +644,22 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
         }
     }
 
+    // Any other class value called with receiver syntax is its constructor
+    // with the receiver as the leading argument: `65.f()` with `f = ::Char`
+    // is `Char(65)`, exactly as the member-or-value fallback serves it.
+    if (callable.* == .Class) {
+        const adapted = try self.allocator.alloc(Value, args.len + 1);
+        defer self.allocator.free(adapted);
+        adapted[0] = this_value.*;
+        @memcpy(adapted[1..], args);
+        const names = try self.allocator.alloc(?[]const u8, args.len + 1);
+        defer self.allocator.free(names);
+        @memset(names, null);
+        var host = vmHost(self, out);
+        const r = try host.callValueNamed(self.allocator, callable, adapted, names);
+        return flattenEval(r);
+    }
+
     // With receiver syntax (`recv.refValue()`) the receiver is the reference's leading arg.
     if (callable.* == .Instance) {
         var with_recv: std.ArrayList(Value) = .empty;
@@ -939,6 +955,29 @@ pub fn coroutineDispatchPooled(self: *VmIntrinsicHost, block: *const Value, io_k
         return e;
     };
     return null;
+}
+
+/// Let outstanding pool work reach its own first suspension.
+///
+/// Called where a coroutine DISPATCHES ONTO THE PUMP — which is what
+/// `yield()` does, through `Yield.kt`'s `dispatchYield` into
+/// `KlioDispatcher.dispatch` — so it is the point where kotlinx's dispatch
+/// round-trip gives a `Dispatchers.Default` worker time to start. Placing it
+/// at the pooled dispatch instead was measured WRONG: a `main` that launches
+/// a daemon and returns without suspending must drop that task, and waiting
+/// there ran it.
+///
+/// Bounded, skipped on a pool worker, and a no-op when the pool has nothing
+/// outstanding. `KLIO_DISPATCH_HANDOFF=0` withdraws it.
+pub fn awaitPoolQuiescent() void {
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_DISPATCH_HANDOFF") orelse "1", "0")) return;
+    if (scheduler.onPoolWorker()) return;
+    if (scheduler.outstandingOtherCount() == 0) return;
+    const deadline = ir.eval.nowMonotonicMs() + 5;
+    while (scheduler.outstandingOtherCount() != 0) {
+        if (ir.eval.nowMonotonicMs() >= deadline) return;
+        runtime.clockSleepMicros(50);
+    }
 }
 
 /// Join the thread `spawnOsThread` returned, propagating the body's error. Idempotent.

@@ -528,8 +528,6 @@ pub fn openActivation(comptime H: type, allocator: Allocator, caller_module: *co
     act.* = .{
         .frame = try Frame.newWithCaptures(ev, allocator, module, req.func, req.args, req.captures),
         .try_stack = .empty,
-        .ctx_mark = 0,
-        .ctx_armed = true,
         .composer_pushed = req.composer_pushed,
         .pop_enclosing_n = req.pop_enclosing_n,
         .keepalive = req.keepalive,
@@ -547,25 +545,11 @@ pub fn openActivation(comptime H: type, allocator: Allocator, caller_module: *co
     gcPushFrame(&act.frame);
     act.frame.module_arc = req.owning;
     try act.frame.activateChain(req.chain);
-    act.ctx_mark = req.ctx_mark_override orelse
-        (if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0);
-    if (comptime @hasDecl(H, "ctxPush")) {
-        if (module.has_context_decls) {
-            if (comptime @hasDecl(H, "ctxActivate")) host.ctxActivate(true);
-            if (req.func.has_receiver_param and act.frame.params.items.len > 0) {
-                host.ctxPush(act.frame.params.items[0]) catch {};
-            }
-        }
-    }
     return act;
 }
 
 /// Tear down a flat activation: `evalWithCapturesChained`'s exit defers in LIFO order, then the host's post-call unwinds.
 pub fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, host: *H) void {
-    if (act.ctx_armed) {
-        if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(act.ctx_mark);
-        act.ctx_armed = false;
-    }
     act.frame.deactivateChain();
     gcPopFrame(&act.frame);
     act.frame.deinit();
@@ -605,10 +589,6 @@ pub fn liveParkActivation(
     state: *SuspendState,
     host: *H,
 ) Allocator.Error!void {
-    if (act.ctx_armed) {
-        if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(act.ctx_mark);
-        act.ctx_armed = false;
-    }
     if (act.composer_pushed) {
         if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
         act.composer_pushed = false;

@@ -60,6 +60,11 @@ pub const CallMemberOrGlobalInst = struct {
     /// Lowering-resolved top-level function for a bare call a runtime receiver member
     /// can shadow; the global leg calls exactly this declaration.
     func: ?FuncId = null,
+    /// No receiver in scope at this site can answer the name, so only the
+    /// global leg can win and the hedge is dead. Set by a link pass from
+    /// whole-program knowledge; `KLIO_XORY_AUDIT` reports any site marked
+    /// this way whose member leg wins anyway.
+    global_only: bool = false,
     /// Call-site evidence committed `func` among a return-variant family: the global leg must
     /// not value-re-rank past it, a closure argument carrying no return type. The member
     /// leg still runs first.
@@ -130,6 +135,52 @@ pub const BuildObjectInst = struct {
 /// The lowering facts a member call rarely carries, out of line so the
 /// instruction stays 64 bytes: the hot path reads the receiver, the name,
 /// the argument run and the site memo inline.
+/// What a `GetField`'s `own_cls`/`own_slot` pair resolved to.
+/// `Cast.cls_raw` when the site named no class.
+pub const NO_CLASS: u32 = std.math.maxInt(u32);
+
+pub const OwnKind = enum(u8) {
+    /// Nothing yet. `own_cls` may still name the receiver's static class, which
+    /// is what a link pass needs to resolve the read.
+    none,
+    /// `own_slot` is a declared field-layout index.
+    slot,
+    /// `own_cls` names an enum and `own_slot` is an entry index.
+    enum_entry,
+    /// `own_slot` is the `FuncId` of the property getter that answers the read.
+    getter,
+    /// `own_slot` is a `PropSlotId`: the receiver's runtime class indexes the
+    /// property table with it, so an interface or abstract receiver resolves
+    /// without the site knowing which implementation answers.
+    prop_slot,
+    /// The read is the `<class-companion-or-self>` sentinel: a bare class name
+    /// in value position, answered from the class's own companion memo. The
+    /// spelling is fixed at lowering, so the runtime should not be comparing
+    /// the string on every field read to find out.
+    companion_or_self,
+    /// `super.<prop>` (or `super.<prop> = v`) whose answer is not known
+    /// while the body lowers: `own_cls` is the class the reference resolves
+    /// against, `own_slot` is 1 when the reference named that class itself
+    /// (`super<K>`) and 0 when it means the class's supertypes. The link
+    /// pass settles it into a direct accessor call or `super_slot`; it must
+    /// never reach execution, because the only by-name answer is a virtual
+    /// one and that re-enters the override making the super access.
+    super_target,
+    /// `own_slot` is a declared field-layout index of `own_cls`, a base of
+    /// the receiver's class, and the cell is served WITHOUT dispatch and
+    /// without the value-kind declines a claimed slot makes: `super.x` on a
+    /// stored property is the base's cell whatever it holds.
+    super_slot,
+};
+
+/// The sentinel field name a bare class name in value position reads through.
+pub const COMPANION_OR_SELF = "<class-companion-or-self>";
+
+/// Set in a pending super write's `own_slot` when the reference named the
+/// class itself (`super<K>.prop = v`) rather than its supertypes; the low
+/// bits are the result register the settled call writes.
+pub const SUPER_WRITE_QUALIFIED: u32 = 1 << 31;
+
 pub const CallMemberExtra = struct {
     arg_names: []?ConstId = &.{},
     /// Trailing-lambda syntax bit; see `Inst.Call.trailing_lambda`.
@@ -146,16 +197,127 @@ pub const CallMemberExtra = struct {
     /// Dispatch receiver for a resolved member-extension target, picked by the implicit
     /// receiver tower; the extension receiver stays in `receiver`. Null for plain members.
     dispatch_receiver: ?Reg = null,
+    /// The extension declaration the resolver ranked first and then withheld, carried so
+    /// the runtime can say whether committing it here would name what the by-name walk
+    /// serves. Filled only under `KLIO_EXT_AUDIT`; null in every normal lowering.
+    audit_pick: ?FuncId = null,
+    /// Which resolver withheld `audit_pick`, so the audit can judge each criterion on
+    /// its own rows: 0 an extension pick, 1 an extension pick that is the sole candidate
+    /// at the best applicability tier over a named receiver head, 2 the member gate's
+    /// named-but-undispatched declaration.
+    audit_pick_kind: u8 = 0,
 
     pub const hashed_by_content = {};
 
     pub fn isDefault(self: *const CallMemberExtra) bool {
         return self.arg_names.len == 0 and !self.trailing_lambda and self.static_recv == null and
-            self.declared_recv == null and self.resolved == null and self.dispatch_receiver == null;
+            self.declared_recv == null and self.resolved == null and self.dispatch_receiver == null and
+            self.audit_pick == null;
     }
 };
 
 pub const no_member_extra: CallMemberExtra = .{};
+
+/// A member the interpreter answers itself rather than through a `FuncId`.
+///
+/// An indexed read on an array is the shape: `kotlin.FloatArray.get` runs
+/// 19 572 times in one compose program and there is no function to name, so
+/// the site carried a string and `fastSubscript` interned and compared it on
+/// every one of the 939 154 subscripts the corpus executes. The operation is
+/// a property of the SITE — the name and the argument count both fix it — so
+/// it belongs on the instruction.
+pub const BuiltinMember = enum(u8) {
+    none,
+    /// `recv[i]`, one argument.
+    get,
+    /// `recv[i] = v`, two.
+    set,
+    compare_to,
+    is_empty,
+    to_int,
+    to_long,
+    inv,
+    shl,
+    shr,
+    ushr,
+    bit_and,
+    bit_or,
+    bit_xor,
+    /// Appended, not inserted: the tag is serialized, so an existing value
+    /// keeps its number.
+    to_string,
+    /// `super.toString()`, `super.hashCode()` and `super.equals(x)` where no
+    /// supertype declares the member: the language names `Any`'s
+    /// implementation, and it runs on the receiver WITHOUT dispatch, since
+    /// the override that would answer a virtual call is the very body
+    /// making the super call. Never bound from a name by `of`; only the
+    /// super-call emitter sets them, and `builtin_proven` goes with them
+    /// because the operation cannot fall through to the by-name walk.
+    any_to_string,
+    any_hash_code,
+    any_equals,
+
+    /// The operation a member call names, from the two things that decide it.
+    /// The receiver's own shape is checked where the operation runs: an
+    /// `Instance` declaring `operator fun get` is a real call, not this, and a
+    /// `List` with a live backing computes its own length.
+    pub fn of(name: []const u8, n_args: u32) BuiltinMember {
+        return switch (n_args) {
+            0 => if (std.mem.eql(u8, name, "isEmpty")) .is_empty
+                else if (std.mem.eql(u8, name, "toInt")) .to_int
+                else if (std.mem.eql(u8, name, "toLong")) .to_long
+                else if (std.mem.eql(u8, name, "inv")) .inv
+                else if (std.mem.eql(u8, name, "toString")) .to_string
+                else .none,
+            1 => if (std.mem.eql(u8, name, "get")) .get
+                else if (std.mem.eql(u8, name, "compareTo")) .compare_to
+                else if (std.mem.eql(u8, name, "shl")) .shl
+                else if (std.mem.eql(u8, name, "shr")) .shr
+                else if (std.mem.eql(u8, name, "ushr")) .ushr
+                else if (std.mem.eql(u8, name, "and")) .bit_and
+                else if (std.mem.eql(u8, name, "or")) .bit_or
+                else if (std.mem.eql(u8, name, "xor")) .bit_xor
+                else .none,
+            2 => if (std.mem.eql(u8, name, "set")) .set else .none,
+            else => .none,
+        };
+    }
+};
+
+/// A property the interpreter answers from the receiver's own representation
+/// rather than through a declaration.
+///
+/// `arr.size` on a primitive array and `s.length` on a String are declared
+/// MEMBERS of a host-backed classifier, so no user extension can shadow them
+/// and there is no function to name. Bound from the field name where the
+/// instruction is pushed; `builtin_proven` is what lets the census call the
+/// site resolved, and a link pass sets it once the receiver's static head is
+/// known to be one of those classifiers.
+pub const BuiltinField = enum(u8) {
+    none,
+    /// `size` on an array.
+    array_size,
+    /// `length` on a String.
+    string_length,
+    /// `lastIndex` on an array: the stdlib extension property.
+    array_last_index,
+    /// `indices` on an array: the stdlib extension property.
+    array_indices,
+    /// `storage` on an unsigned array: the signed buffer the view is over.
+    array_storage,
+    /// `data` on an unsigned scalar: its signed counterpart.
+    scalar_data,
+
+    pub fn of(name: []const u8) BuiltinField {
+        if (std.mem.eql(u8, name, "size")) return .array_size;
+        if (std.mem.eql(u8, name, "length")) return .string_length;
+        if (std.mem.eql(u8, name, "lastIndex")) return .array_last_index;
+        if (std.mem.eql(u8, name, "indices")) return .array_indices;
+        if (std.mem.eql(u8, name, "storage")) return .array_storage;
+        if (std.mem.eql(u8, name, "data")) return .scalar_data;
+        return .none;
+    }
+};
 
 pub const CallMemberInst = struct {
     dst: Reg,
@@ -163,6 +325,16 @@ pub const CallMemberInst = struct {
     name: ConstId,
     args: Reg,
     n_args: u32,
+    /// The builtin operation `name` denotes, bound where the instruction is
+    /// pushed so no emitter can leave it unset.
+    builtin: BuiltinMember = .none,
+    /// `builtin` is set AND the site's static receiver head names a type no
+    /// interpreted instance can wear, so the operation cannot fall through to
+    /// the by-name walk. Set by a link pass, because it needs the receiver
+    /// head resolved against the class table. This is the bit that lets the
+    /// census call such a site resolved: the runtime's tag test is then an
+    /// assertion, not a derivation.
+    builtin_proven: bool = false,
     /// Site memo, single-fill (see `GetField.site_cls`): the first Instance class whose
     /// by-name dispatch flat-resolved claims it, `site_sig` the argument signature it was
     /// keyed under, `site_route` the packed target (`FuncId << 1 | 1`, never 0 if filled).
@@ -219,11 +391,27 @@ pub const CallVirtualInst = struct {
     }
 };
 
+/// `NewInstance.ctor_pick` when lowering named no constructor.
+pub const CTOR_PICK_NONE: u16 = std.math.maxInt(u16);
+
 pub const Inst = union(enum) {
     Const: struct { dst: Reg, value: ConstId },
     /// Suspend-resume marker: `state` picks the resume block from the entry dispatch table.
     SuspendResumePoint: struct { state: u32 },
     LoadParam: struct { dst: Reg, idx: u16 },
+    /// The dispatch receiver of a member-extension frame: the owner instance the
+    /// caller handed over for this call, which the body names `this@Owner`.
+    LoadDispatchThis: struct { dst: Reg },
+    /// The outer instance an inner-class instance at `src` was constructed in:
+    /// one hop out along the instance's outer link, by structure, not by name.
+    LoadOuterThis: struct { dst: Reg, src: Reg },
+    /// The `idx`th context parameter of a contextual frame: the value the caller
+    /// handed over for this call, in declaration order.
+    LoadContextParam: struct { dst: Reg, idx: u16 },
+    /// Hand the contextual callee its `n` context arguments from the run at
+    /// `args`, in its declaration order, ahead of the call; `ContextPop` retracts them.
+    ContextPush: struct { args: Reg, n: u32 },
+    ContextPop: struct { n: u32 },
     LoadCapture: struct { dst: Reg, idx: u16 },
     Move: struct { dst: Reg, src: Reg },
     /// Box `src` into a capture cell for a `var` a nested lambda captures (Kotlin `Ref`).
@@ -245,14 +433,43 @@ pub const Inst = union(enum) {
         /// Serving a null stored slot: 0 = unasked, 1 = an unset-`lateinit` shape the ladder
         /// must adjudicate, 2 = a plain null this site may serve.
         null_ok: u8 = 0,
+        /// Lowering's claim: the receiver holds this read at declared slot
+        /// `own_slot` of `own_cls`'s published layout. A HINT, never an index
+        /// taken on trust — the runtime proves it by reading the slot's name,
+        /// so a stale claim costs a miss and not a wrong answer. Only a
+        /// DECLARED slot is claimed: its index is the same in the class and in
+        /// every subclass, where a capture's is not.
+        own_cls: ?ClassId = null,
+        own_slot: u32 = 0,
+        /// What `own_cls` and `own_slot` mean, so the class can be recorded
+        /// before anything is resolved from it: a read whose receiver class
+        /// lowering knows but whose answer is a getter cannot be settled while
+        /// the class body is still lowering, and a later link pass fills it.
+        own_kind: OwnKind = .none,
+        /// The builtin property the field name denotes, bound where the
+        /// instruction is pushed so no emitter can leave it unset.
+        builtin: BuiltinField = .none,
+        /// `builtin` is set AND the receiver's static head names the host
+        /// classifier that declares it, so the read cannot fall through to the
+        /// by-name ladder. Set by a link pass, because it needs the head.
+        builtin_proven: bool = false,
     },
     SetField: struct {
         receiver: Reg,
         field: ConstId,
         value: Reg,
-        /// `super.prop = v`: the class whose body wrote it. The setter search starts at its
-        /// supertypes, so an overriding setter reaches the base accessor instead of recursing.
-        super_owner: ?ConstId = null,
+        /// The declared slot lowering proved this write lands in, and the class whose layout
+        /// fixed it, on `GetField.own_cls`'s conditions. A plain slot has no setter, so the
+        /// store is the whole operation. Re-proved against the receiver before use, so a
+        /// stale claim costs a miss and not a write to the wrong cell.
+        own_cls: ?ClassId = null,
+        own_slot: u32 = 0,
+        /// `.none` with an `own_cls` is the claim above. `.super_target` is a
+        /// `super.prop = v` the link pass settles: into a direct setter call,
+        /// for which `own_slot` carries the pre-allocated result register
+        /// under `SUPER_WRITE_QUALIFIED` and `value` is the register after
+        /// `receiver`, or into `.super_slot`.
+        own_kind: OwnKind = .none,
     },
     /// `recv.field <op>= value`. A field value carrying the in-place operator (the
     /// `plusAssign` family) is dispatched with NO write-back, since Kotlin mutates in
@@ -315,18 +532,6 @@ pub const Inst = union(enum) {
         /// intrinsic container creator (`emptyList<String>()`) can stamp its element type.
         type_args: []ConstId = &.{},
     },
-    /// `super.method(args)`: resolved against the parent of `owner_class`, not the leaf
-    /// class. A non-null `qualifier` is `super<Qual>.method()`, dispatched on `Qual`.
-    CallSuper: struct {
-        dst: Reg,
-        receiver: Reg,
-        owner_class: ConstId,
-        qualifier: ?ConstId = null,
-        name: ConstId,
-        args: Reg,
-        n_args: u32,
-        arg_names: []?ConstId = &.{},
-    },
     /// `name(args)` where `name` is both an in-scope value and a member of the enclosing
     /// class: invoke `callee` if invocable, else dispatch `name` on `this_recv`.
     CallValueOrMember: struct {
@@ -374,6 +579,10 @@ pub const Inst = union(enum) {
         /// Declared type head of each argument where lowering knows one. Kotlin picks a
         /// constructor overload from static types, which an interpreted value cannot supply.
         arg_static_heads: []?ConstId = &.{},
+        /// The constructor this construction reaches, numbered 0 for the
+        /// primary and 1 + i for the i'th secondary, or `CTOR_PICK_NONE` where
+        /// lowering could not settle it and the runtime's scoring decides.
+        ctor_pick: u16 = CTOR_PICK_NONE,
     },
     NewList: struct { dst: Reg, args: Reg, n_args: u32 },
     /// `this@Qualifier`: walk the receiver's outer chain for an instance of `qualifier`.
@@ -420,24 +629,26 @@ pub const Inst = union(enum) {
         src: Reg,
         ty: TypeRef,
         safe: bool,
+        /// The class `ty` names, on the same terms as `InstanceOf.cls`: the
+        /// cast's first question is whether the value already IS that class.
+        /// A raw id with a sentinel rather than an optional — `ClassId` fills
+        /// its integer, so `?ClassId` has no niche and costs eight bytes here,
+        /// which is more than the union has left.
+        cls_raw: u32 = NO_CLASS,
+
+        pub fn cls(self: @This()) ?ClassId {
+            return if (self.cls_raw == NO_CLASS) null else ClassId.from(self.cls_raw);
+        }
     },
-    InstanceOf: struct { dst: Reg, src: Reg, ty: TypeRef },
-    /// Resolve the nearest in-scope context value whose runtime type is a subtype of `ty`;
-    /// `erased` takes the innermost value regardless. Writes `.Null` when none is in scope.
-    CtxLoad: struct { dst: Reg, ty: ConstId, erased: bool = false },
-    /// The stdlib `context(v..., block)`: push the `n_ctx` values at `ctx_args`, invoke
-    /// `block` with no value args, then pop. They serve context resolution, not receivers.
-    CtxScope: struct { dst: Reg, ctx_args: Reg, n_ctx: u32, block: Reg },
-    /// Fully-positional invocation of a contextual function-type value: the leading `n_ctx`
-    /// args push as contexts, `callee` runs with the rest, then they pop. `args` is one
-    /// contiguous run so the register visitor keeps every operand live.
-    CtxCall: struct {
+    InstanceOf: struct {
         dst: Reg,
-        callee: Reg,
-        args: Reg,
-        n_args: u32,
-        n_ctx: u32,
-        arg_names: []?ConstId = &.{},
+        src: Reg,
+        ty: TypeRef,
+        /// The class `ty` names, when it names exactly one and the test is the
+        /// plain identity question — not `is T?`, which admits null, and not
+        /// `is List<String>`, whose argument is erased. Null leaves the test to
+        /// the by-name walk.
+        cls: ?ClassId = null,
     },
     NotNullAssert: struct { dst: Reg, src: Reg },
     /// Read of a local `lateinit var`: `src` still holding the declaration's `Null` means
@@ -454,7 +665,9 @@ pub const Inst = union(enum) {
     /// index found one. `ctor_ref`: `::C` denotes the CONSTRUCTOR, not a published companion.
     /// `type_qualifier`: the CLASS value, never the object's singleton — `Alias<T>::m`
     /// writes a type, so the reference it qualifies is unbound.
-    LoadGlobal: struct { dst: Reg, name: ConstId, func: ?FuncId = null, class: ?ClassId = null, ctor_ref: bool = false, type_qualifier: bool = false },
+    /// A slotted top-level property carries its index in the root scope's slot table, so the read
+    /// addresses the binding without its name; the name stays for the read that initialises it.
+    LoadGlobal: struct { dst: Reg, name: ConstId, func: ?FuncId = null, class: ?ClassId = null, ctor_ref: bool = false, type_qualifier: bool = false, slot: ?u32 = null },
     /// Bare-name read in a receiver context that is no local, capture, or own member: the
     /// runtime searches the implicit receivers innermost first, then the global.
     /// enclosing-`this` chain, each dispatch receiver's nesting tower) innermost first.
@@ -482,7 +695,8 @@ pub const Inst = union(enum) {
     },
     /// Write a top-level binding, routed through `Host.store_global` so a delegated
     /// top-level property's setter (or a plain top-level `var`) is updated.
-    StoreGlobal: struct { name: ConstId, value: Reg },
+    /// `slot`: the same index for a plain stored `var`, whose write has no setter or delegate to run.
+    StoreGlobal: struct { name: ConstId, value: Reg, slot: ?u32 = null },
     /// Register a class declared inside a function body; it lives for the call's duration.
     RegisterClass: struct {
         class: FF(ast.Class),
@@ -594,17 +808,6 @@ pub fn visitPayloadRegs(payload: anytype, ctx: anytype, comptime cb: fn (@TypeOf
                             continue;
                         }
                     }
-                    // `CtxScope` pairs its context-value run with `n_ctx`, while `CtxCall`'s single
-                    // `args` run already spans its context prefix.
-                    if (comptime std.mem.eql(u8, f.name, "ctx_args")) {
-                        if (comptime @hasField(P, "n_ctx")) {
-                            var k: u32 = 0;
-                            while (k < payload.n_ctx) : (k += 1) {
-                                cb(ctx, Reg.from(@field(payload, f.name).int() + k), false);
-                            }
-                            continue;
-                        }
-                    }
                     cb(ctx, @field(payload, f.name), is_def);
                 } else if (f.type == ?Reg) {
                     if (@field(payload, f.name)) |r| cb(ctx, r, is_def);
@@ -706,3 +909,11 @@ pub const LrAbsorb = struct {
     handler: BlockId,
     value_reg: Reg,
 };
+
+test "the instruction union stays 64 bytes" {
+    // The evaluator's dispatch loop reads instructions linearly, so a union
+    // that outgrows a cache line costs every arm and not just the one that
+    // grew it. `represent/field-slots` adds a slot claim to `GetField`; this
+    // is the budget it has to fit in, and it does.
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(Inst));
+}

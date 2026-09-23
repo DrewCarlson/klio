@@ -51,7 +51,6 @@ fn classify(inst: *const Inst) ?Kind {
         .CallMember => |c| if (c.x().resolved != null) .direct else .dyn_unbound,
         .CallValue,
         .CallValueWithThis,
-        .CallSuper,
         .CallValueOrMember,
         .CallMemberOrValue,
         => .dyn_unbound,
@@ -109,12 +108,17 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
             try w.writeAll(")");
         },
         .LoadParam => |c| try w.print("r{d} <- LoadParam #{d}", .{ reg(c.dst), c.idx }),
+        .LoadDispatchThis => |c| try w.print("r{d} <- LoadDispatchThis", .{reg(c.dst)}),
+        .LoadOuterThis => |c| try w.print("r{d} <- LoadOuterThis r{d}", .{ reg(c.dst), reg(c.src) }),
+        .LoadContextParam => |c| try w.print("r{d} <- LoadContextParam #{d}", .{ reg(c.dst), c.idx }),
+        .ContextPush => |c| try w.print("ContextPush r{d}+{d}", .{ reg(c.args), c.n }),
+        .ContextPop => |c| try w.print("ContextPop {d}", .{c.n}),
         .LoadCapture => |c| try w.print("r{d} <- LoadCapture #{d}", .{ reg(c.dst), c.idx }),
         .Move => |c| try w.print("r{d} <- Move r{d}", .{ reg(c.dst), reg(c.src) }),
         .MakeCell => |c| try w.print("r{d} <- MakeCell r{d}", .{ reg(c.dst), reg(c.src) }),
         .CellGet => |c| try w.print("r{d} <- CellGet r{d}", .{ reg(c.dst), reg(c.cell) }),
         .CellSet => |c| try w.print("CellSet r{d} <- r{d}", .{ reg(c.cell), reg(c.value) }),
-        .GetField => |c| try w.print("r{d} <- GetField r{d}.'{s}'        [DYN field]", .{ reg(c.dst), reg(c.receiver), constStr(m, c.field) }),
+        .GetField => |c| try w.print("r{d} <- GetField r{d}.'{s}' own={s}:{d}        [DYN field]", .{ reg(c.dst), reg(c.receiver), constStr(m, c.field), @tagName(c.own_kind), c.own_slot }),
         .SetField => |c| try w.print("SetField r{d}.'{s}' <- r{d}        [DYN field]", .{ reg(c.receiver), constStr(m, c.field), reg(c.value) }),
         .CompoundField => |c| try w.print("CompoundField r{d}.'{s}' {s}= r{d}        [DYN field]", .{ reg(c.receiver), constStr(m, c.field), @tagName(c.op), reg(c.value) }),
         .Index => |c| try w.print("r{d} <- Index r{d}[r{d}]", .{ reg(c.dst), reg(c.receiver), reg(c.index) }),
@@ -208,6 +212,7 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         },
         .LoadGlobal => |c| {
             try w.print("r{d} <- LoadGlobal '{s}'", .{ reg(c.dst), constStr(m, c.name) });
+            if (c.slot) |s| try w.print(" slot={d}", .{s});
             if (c.func) |f| try w.print("        [bound -> {s}#{d}]", .{ funcName(m, f), f.int() }) else if (c.class) |cl| try w.print("        [bound -> class {s}]", .{className(m, cl)}) else try w.writeAll("        [unbound]");
         },
         .LoadFromThisOrGlobal => |c| {
@@ -225,7 +230,10 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
                 try w.writeAll("        [unbound]");
         },
         .StoreToThisOrGlobal => |c| try w.print("StoreToThisOrGlobal this.'{s}' <- r{d}", .{ constStr(m, c.name), reg(c.value) }),
-        .StoreGlobal => |c| try w.print("StoreGlobal '{s}' <- r{d}", .{ constStr(m, c.name), reg(c.value) }),
+        .StoreGlobal => |c| {
+            try w.print("StoreGlobal '{s}' <- r{d}", .{ constStr(m, c.name), reg(c.value) });
+            if (c.slot) |s| try w.print(" slot={d}", .{s});
+        },
         .BinOp => |c| try w.print("r{d} <- BinOp {s} r{d}, r{d}", .{ reg(c.dst), @tagName(c.op), reg(c.lhs), reg(c.rhs) }),
         .UnOp => |c| try w.print("r{d} <- UnOp {s} r{d}", .{ reg(c.dst), @tagName(c.op), reg(c.operand) }),
         .Not => |c| try w.print("r{d} <- Not r{d}", .{ reg(c.dst), reg(c.src) }),

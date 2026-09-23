@@ -621,7 +621,15 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     }
     const fid = pick orelse return null;
     const f = b.module.funcById(fid) orelse return null;
-    if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
+    if (!f.return_ty_declared or f.return_ty.name.len == 0) {
+        // An un-annotated expression body derives its return from its AST.
+        if (!f.return_ty_declared) {
+            if (inline_state.exprBodyFnAst(fid.int())) |fa| {
+                if (try exprBodyDerivedReturn(b, fa)) |t| return t;
+            }
+        }
+        return null;
+    }
     if (bareTypeParamHead(f.return_ty.name) or
         ir.parseClassTypeParamIdentity(f.return_ty.name) != null) return null;
     if (staticTypeClassId(b, f.return_ty) == null) return null;
@@ -655,7 +663,7 @@ fn scalarOverloadUnproven(b: *FuncBuilder, call: anytype, target: FuncId) Alloca
     if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return false;
     if (call.args.len != 1) return false;
     const tf = b.module.funcById(target) orelse return false;
-    if (!isPrimitiveTypeName(typeHead(std.mem.trimEnd(u8, tf.return_ty.name, "?")))) return false;
+    const target_head = typeHead(std.mem.trimEnd(u8, tf.return_ty.name, "?"));
     const nm = call.callee.Path.segments[0].name;
     const cands = b.module.funcsBySimpleName(nm);
     if (cands.len < 2) return false;
@@ -663,21 +671,50 @@ fn scalarOverloadUnproven(b: *FuncBuilder, call: anytype, target: FuncId) Alloca
     for (cands) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         const has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
-        if (f.params.len - @intFromBool(has_this) != 1) return false;
-        const rh = typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
-        if (!isPrimitiveTypeName(rh)) return false;
-        if (!std.mem.eql(u8, rh, typeHead(std.mem.trimEnd(u8, tf.return_ty.name, "?")))) disagree = true;
+        // Only the overloads a one-argument call could have taken. A longer
+        // one is a different call, not a reason to stop looking.
+        if (f.params.len - @intFromBool(has_this) != 1) continue;
+        if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?")), target_head)) disagree = true;
     }
     if (!disagree) return false;
     if (expr.od_depth >= 3) return true;
     expr.od_depth += 1;
     var arg_ty = staticExprTypeRef(b, &call.args[0]) catch null;
     expr.od_depth -= 1;
-    if (arg_ty) |*t| {
-        defer t.deinit(b.allocator);
-        return !isPrimitiveTypeName(typeHead(std.mem.trimEnd(u8, t.name, "?")));
+    const t = &(arg_ty orelse return true);
+    defer t.deinit(b.allocator);
+    const arg_head = typeHead(std.mem.trimEnd(u8, t.name, "?"));
+    const tp = targetSoleParamHead(b, tf) orelse return true;
+    // Proven when the argument is exactly what the chosen overload takes.
+    if (std.mem.eql(u8, tp, arg_head)) return false;
+    // A type-parameter parameter accepts anything, so on its own it proves
+    // nothing — but it is the RIGHT answer wherever no concrete overload in
+    // the family claims this argument's type. `atomic` is the shape: `Int`,
+    // `Long` and `Boolean` have their own declarations and everything else is
+    // the generic `atomic(initial: T): AtomicRef<T>`, so an argument of any
+    // other type proves the generic one. Refusing there withdraws the answer
+    // for every `atomic(node)` in the coroutine internals.
+    if (b.module.funcTypeParamIndex(target, tp) != null or bareTypeParamHead(tp)) {
+        for (cands) |fid| {
+            const f = b.module.funcById(fid) orelse continue;
+            const ht = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+            if (f.params.len - @intFromBool(ht) != 1) continue;
+            const ph = typeHead(std.mem.trimEnd(u8, f.params[@intFromBool(ht)].ty.name, "?"));
+            if (std.mem.eql(u8, ph, arg_head)) return true;
+        }
+        return false;
     }
     return true;
+}
+
+/// The declared head of the one value parameter of `f`, past an implicit
+/// `this`. Null when it does not have exactly one.
+fn targetSoleParamHead(b: *const FuncBuilder, f: *const ir.Func) ?[]const u8 {
+    _ = b;
+    const has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+    const vals = f.params[@intFromBool(has_this)..];
+    if (vals.len != 1) return null;
+    return typeHead(std.mem.trimEnd(u8, vals[0].ty.name, "?"));
 }
 
 /// The nearest class every head is or extends, walking the first head's supertype
@@ -892,7 +929,7 @@ fn scopeFunctionReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator
         const stmts2 = lam.body.stmts;
         if (stmts2.len == 0 or stmts2[stmts2.len - 1] != .Expr) break :scope_fns;
         var nb2 = FuncBuilder.init(b.allocator, b.module) catch break :scope_fns;
-        nb2.census_quiet = true;
+        nb2.markScratch();
         defer nb2.deinit();
         // The lambda's free names resolve in the enclosing scope, so seed the probe
         // builder with its declared types; the receiver-bound parameter shadows.
@@ -1740,7 +1777,7 @@ const fa_hit = inline_state.exprBodyMemberAst(head, member.name.name, memberArgC
             expr.od_depth += 1;
             defer expr.od_depth -= 1;
             var nb = try FuncBuilder.init(b.allocator, b.module);
-nb.census_quiet = true;
+nb.markScratch();
             defer nb.deinit();
             nb.setOwnerClass(head);
             nb.setRecvTy(head);
@@ -1886,7 +1923,8 @@ fn declOrderExprBodyReturnTypeRef(b: *FuncBuilder, target: FuncId) Allocator.Err
     expr.od_depth += 1;
     defer expr.od_depth -= 1;
     const dsg = b.module.decl_sigs.get(target.int()) orelse return null;
-    const oid = dsg.enclosing_class orelse return null;
+    const oid = dsg.enclosing_class orelse
+        return try topLevelExprBodyReturnTypeRef(b, target);
     if (oid.int() >= b.module.classes.items.len) return null;
     const oc = &b.module.classes.items[oid.int()];
     const tf = b.module.funcById(target) orelse return null;
@@ -1896,7 +1934,7 @@ fn declOrderExprBodyReturnTypeRef(b: *FuncBuilder, target: FuncId) Allocator.Err
     if (fa.body) |*fbody| {
         if (fbody.* == .Expr) {
             var nb = try FuncBuilder.init(b.allocator, b.module);
-            nb.census_quiet = true;
+            nb.markScratch();
             defer nb.deinit();
             nb.setOwnerClass(oc.name);
             nb.setRecvTy(oc.name);
@@ -1914,6 +1952,34 @@ fn declOrderExprBodyReturnTypeRef(b: *FuncBuilder, target: FuncId) Allocator.Err
         }
     }
     return null;
+}
+
+/// The same derivation for a target with no enclosing class. `h1(hash)` in
+/// androidx.collection is `internal inline fun h1(hash: Int) = hash ushr 7`:
+/// one declaration, an expression body, no declared return, and nothing above
+/// types it — so `h1(hash) and probeMask` had no receiver type and the `and`
+/// resolved by name. The owner channel cannot reach it because a top-level
+/// function's owner is the synthesized per-file class, so the id is the key.
+///
+/// The body types in a builder with no owner and no receiver, which is what
+/// the declaration itself has: a top-level body sees its parameters and the
+/// file's own scope, and reading it against some caller's `this` would answer
+/// for a receiver that is not there.
+fn topLevelExprBodyReturnTypeRef(b: *FuncBuilder, target: FuncId) Allocator.Error!?ir.TypeRef {
+    const fa = inline_state.exprBodyFnAst(target.int()) orelse return null;
+    // An extension's body reads its receiver, which this builder has no way to
+    // name; leave those to the channels that carry one.
+    if (fa.receiver_type != null) return null;
+    const fbody = &(fa.body orelse return null);
+    if (fbody.* != .Expr) return null;
+    var nb = try FuncBuilder.init(b.allocator, b.module);
+    nb.markScratch();
+    defer nb.deinit();
+    for (fa.params) |*ap| {
+        try nb.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb, &ap.ty));
+        if (ap.ty.nullable) try nb.setLocalDeclNullable(ap.name.name);
+    }
+    return try staticExprTypeRef(&nb, &fbody.Expr);
 }
 
 /// `KLIO_BARERET` outcome lines for a resolved call: the bare form keyed by the
@@ -2239,7 +2305,7 @@ fn enrichLambdaArgShapes(
         }
         const value_params = pty.args.len - 1;
         var nb = try FuncBuilder.init(b.allocator, b.module);
-    nb.census_quiet = true;
+    nb.markScratch();
         defer nb.deinit();
         // The block's decls and tail read the enclosing scope's names too, so seed
         // the probe builder with the enclosing builder's declared types first; the
@@ -2642,12 +2708,11 @@ fn ownMemberDeclaredReturn(
     safe_call: bool,
 ) Allocator.Error!OwnMemberReturn {
     const call = call_expr.Call;
-    var probe: usize = call.args.len;
-    while (probe <= call.args.len + 3) : (probe += 1) {
-        const key = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ recv_head, mname, probe }) catch break;
+    {
+        const key = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ recv_head, mname, call.args.len }) catch return .none;
         defer b.allocator.free(key);
-        const fid = b.module.registry.member_method_fids.get(key) orelse continue;
-        const f = b.module.funcById(fid) orelse continue;
+        const fid = b.module.registry.member_method_fids.get(key) orelse return .none;
+        const f = b.module.funcById(fid) orelse return .none;
         // An expression body with no annotation records `Unit` as a placeholder,
         // so an undeclared return is not a fact.
         if (!f.return_ty_declared or f.return_ty.name.len == 0) return .refuse;
@@ -2820,34 +2885,19 @@ fn underivedCandidateReturn(
         const owner: ?[]const u8 = blk_own: {
             break :blk_own b.module.registry.member_ext_owner_class.get(fid) orelse b.ownerClass();
         };
-        if (owner) |ow| {
-            if (inline_state.exprBodyMemberAst(ow, mname, call.args.len)) |fa| {
-                if (fa.body) |*fbody| {
-                    if (fbody.* == .Expr and expr.od_depth < 3) {
-                        expr.od_depth += 1;
-                        defer expr.od_depth -= 1;
-                        var nb3 = try FuncBuilder.init(b.allocator, b.module);
-                        nb3.census_quiet = true;
-                        defer nb3.deinit();
-                        if (fa.receiver_type) |frt| {
-                            nb3.setRecvTypeRefOwned(try loweredOwnedLocalTypeRef(&nb3, frt));
-                        }
-                        for (fa.params) |*ap| {
-                            try nb3.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb3, &ap.ty));
-                        }
-                        if (try staticExprTypeRef(&nb3, &fbody.Expr)) |derived| {
-                            var out2 = derived;
-                            const oh2 = typeHead(std.mem.trimEnd(u8, out2.name, "?"));
-                            if (oh2.len > 2 and !b.isTypeParam(oh2) and
-                                ir.parseClassTypeParamIdentity(oh2) == null)
-                            {
-                                if (st.agreed) |*old| old.deinit(b.allocator);
-                                return .{ .answer = out2 };
-                            }
-                            out2.deinit(b.allocator);
-                        }
-                    }
-                }
+        // A class member's body under its owner, a top-level function's under
+        // its id: `IntArray.isNode(address) = ... != 0` in a file has no owner
+        // a call site could spell.
+        const fa_opt: ?*const ast.Function = blk_fa: {
+            if (owner) |ow| {
+                if (inline_state.exprBodyMemberAst(ow, mname, call.args.len)) |fa| break :blk_fa fa;
+            }
+            break :blk_fa inline_state.exprBodyFnAst(fid.int());
+        };
+        if (fa_opt) |fa| {
+            if (try exprBodyDerivedReturn(b, fa)) |out2| {
+                if (st.agreed) |*old| old.deinit(b.allocator);
+                return .{ .answer = out2 };
             }
         }
     }
@@ -2892,6 +2942,36 @@ fn underivedCandidateReturn(
     return .refuse;
     }
     return .next;
+}
+
+/// The return an un-annotated expression body names, derived from its AST in
+/// a throwaway builder that knows only the declaration's receiver and
+/// parameter types: what a caller lowered before the body's own pass can
+/// see. A type-parameter head is refused, since nothing here instantiates it.
+fn exprBodyDerivedReturn(b: *FuncBuilder, fa: *const ast.Function) Allocator.Error!?ir.TypeRef {
+    const fbody = &(fa.body orelse return null);
+    if (fbody.* != .Expr or expr.od_depth >= 3) return null;
+    expr.od_depth += 1;
+    defer expr.od_depth -= 1;
+    var nb3 = try FuncBuilder.init(b.allocator, b.module);
+    nb3.markScratch();
+    defer nb3.deinit();
+    if (fa.receiver_type) |frt| {
+        nb3.setRecvTypeRefOwned(try loweredOwnedLocalTypeRef(&nb3, frt));
+    }
+    for (fa.params) |*ap| {
+        try nb3.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb3, &ap.ty));
+    }
+    const derived = try staticExprTypeRef(&nb3, &fbody.Expr);
+    if (runtime.envOnce("KLIO_EBD_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fa.name.name))
+            std.debug.print("[ebd] {s} recv={s} body={s} derived={s}\n", .{ fa.name.name, if (fa.receiver_type) |rt| rt.name.name else "-", @tagName(std.meta.activeTag(fbody.Expr)), if (derived) |d| d.name else "-" });
+    }
+    var out2 = derived orelse return null;
+    const oh2 = typeHead(std.mem.trimEnd(u8, out2.name, "?"));
+    if (oh2.len > 2 and !b.isTypeParam(oh2) and ir.parseClassTypeParamIdentity(oh2) == null) return out2;
+    out2.deinit(b.allocator);
+    return null;
 }
 
 /// Weigh one same-named declaration as an extension of the receiver: an identity
@@ -3038,12 +3118,11 @@ fn bareMemberReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     const recv_head = b.spliceRecvTy() orelse b.recvTy() orelse b.ownerClass() orelse return null;
     const rh = typeHead(std.mem.trimEnd(u8, recv_head, "?"));
     if (rh.len == 0) return null;
-    var probe: usize = call.args.len;
-    while (probe <= call.args.len + 3) : (probe += 1) {
-        const key = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ rh, nm, probe }) catch return null;
+    {
+        const key = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ rh, nm, call.args.len }) catch return null;
         defer b.allocator.free(key);
-        const fid = b.module.registry.member_method_fids.get(key) orelse continue;
-        const f = b.module.funcById(fid) orelse continue;
+        const fid = b.module.registry.member_method_fids.get(key) orelse return null;
+        const f = b.module.funcById(fid) orelse return null;
         if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
         // Instantiate through the full implicit receiver when it carries arguments,
         // so the return keeps the caller's element type.

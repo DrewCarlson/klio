@@ -15,10 +15,14 @@
 #
 # Prints the `[lower-sites]` census and the `[decline]` / `[no-recv]` splits.
 #
-# The stdlib image cache is cleared first. Lowering is on demand, so a warm
-# run lowers only part of the program and reports a site total roughly half a
-# cold run's — two measurements taken at different cache states are not
-# comparable at all.
+# The stdlib image cache is cleared first, and that is not a nicety: a warm
+# run loads pre-lowered IR from the image and lowers almost nothing, so the
+# census reports a hundred-odd sites for a program with twenty thousand. Two
+# measurements taken at different cache states are not comparable at all.
+#
+# The counters are process-wide. They used to be `threadlocal`, and since
+# lowering runs on the worker pool, every census before that fix reported one
+# worker's share as the whole program.
 set -e
 BIN=${1:-zig-out/bin/klio-harness}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
