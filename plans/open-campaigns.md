@@ -38,15 +38,16 @@ stdlib sweep 117 files clean, CI green (unit plus eight shards).
 
 ## The interpreter architecture campaign
 
-`resolved-interpreter.md`: close the resolution gap and rebuild the
-execution path on it. The diagnosis is that 0.5% of member calls reach
-the runtime knowing what they call (`call_member_resolved` 21 933 against
-`call_member_virtual` 1 646 999), so the tiers, verdict bytes, site memos,
-signature folds and receiver-chain hashes are all compensation for a
-decision Kotlin makes statically. Five sections, ordered so each unblocks
-the next: the ratchet (censuses plus `KLIO_REQUIRE_RESOLVED`), resolution
-at lowering, slot- and table-indexed representation, one execution engine
-in place of five tiers, and a contiguous value stack. Not started.
+`resolved-interpreter.md`: a fully resolved IR, produced by a new
+frontend. Nothing in the pipeline produced resolution (three name-keyed
+resolvers; lowering guessed with about 34k lines of derivers and ladders),
+so the first campaign moved the site census from 9.40% to 1.85% unresolved
+and the execution costs not at all. The plan now builds `sema`, a
+symbol-identity frontend measured by its own census and a kotlinc oracle,
+then cuts over in one sweep: the IR loses every by-name variant under a
+comptime guard, lowering translates sema's records, and about 80k lines of
+lowering guesses and runtime by-name resolution are deleted. One engine and
+the value stack follow. Foundations in progress.
 
 ## Deferred fronts
 

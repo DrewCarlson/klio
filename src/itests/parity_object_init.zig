@@ -4,15 +4,14 @@
 //! against kotlinc-native 2.3.10 unless a test names kotlinc JVM 2.3.21.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const TMP_DIR = "/tmp/klio_itest_object_init";
 
-// A file-scoped arena backs every run: the pipeline installs process-global
-// state owned by the run's allocator, which outlives any per-test arena.
+// One arena for the file's runs, reset per program.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-fn runProgram(name: []const u8, src: []const u8) !parity.SResult([]u8) {
+fn runProgram(name: []const u8, src: []const u8) !klio_child.Result {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
 
@@ -24,7 +23,7 @@ fn runProgram(name: []const u8, src: []const u8) !parity.SResult([]u8) {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    return parity.runWithPacks(a, io, path);
+    return klio_child.runFile(a, path);
 }
 
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
@@ -54,6 +53,8 @@ fn assertKlioError(name: []const u8, src: []const u8, expected_fragment: []const
     }
 }
 
+// The frame lines below are kotlinc 2.4.20's, from running each program
+// under the file name the test writes it to.
 test "uncaught exception reports a stack trace with source positions" {
     const src =
         \\
@@ -70,11 +71,11 @@ test "uncaught exception reports a stack trace with source positions" {
         },
         .err => |m| {
             const needles = [_][]const u8{
-                "uncaught kotlin.RuntimeException: boom",
-                "at inner (",
-                "at outer (",
-                "at main (",
-                ".kt:",
+                "Exception in thread \"main\" java.lang.RuntimeException: boom\n",
+                "\tat Stack_trace_captureKt.inner(stack_trace_capture.kt:2)\n",
+                "\tat Stack_trace_captureKt.outer(stack_trace_capture.kt:3)\n",
+                "\tat Stack_trace_captureKt.main(stack_trace_capture.kt:4)\n",
+                "\tat Stack_trace_captureKt.main(stack_trace_capture.kt)",
             };
             for (needles) |n| {
                 if (std.mem.find(u8, m, n) == null) {
@@ -102,8 +103,9 @@ test "stack trace is captured at construction, not at throw" {
             return error.ExpectedRunFailure;
         },
         .err => |m| {
-            if (std.mem.find(u8, m, "at make (") == null) {
-                std.debug.print("trace missing construction frame `at make (`:\n{s}\n", .{m});
+            const at_make = "\tat Stack_trace_constructKt.make(stack_trace_construct.kt:2)\n";
+            if (std.mem.find(u8, m, at_make) == null) {
+                std.debug.print("trace missing construction frame `{s}`:\n{s}\n", .{ at_make, m });
                 return error.MissingConstructionFrame;
             }
             if (std.mem.find(u8, m, "thrower") != null) {
@@ -130,8 +132,9 @@ test "user exception subclass captures at construction" {
             return error.ExpectedRunFailure;
         },
         .err => |m| {
-            if (std.mem.find(u8, m, "at make (") == null) {
-                std.debug.print("trace missing construction frame `at make (`:\n{s}\n", .{m});
+            const at_make = "\tat Stack_trace_user_constructKt.make(stack_trace_user_construct.kt:3)\n";
+            if (std.mem.find(u8, m, at_make) == null) {
+                std.debug.print("trace missing construction frame `{s}`:\n{s}\n", .{ at_make, m });
                 return error.MissingConstructionFrame;
             }
             if (std.mem.find(u8, m, "thrower") != null) {
@@ -158,9 +161,9 @@ test "uncaught exception reports the cause chain" {
         },
         .err => |m| {
             const needles = [_][]const u8{
-                "uncaught kotlin.IllegalStateException: outer",
-                "Caused by: kotlin.NumberFormatException: bad",
-                "at root (",
+                "Exception in thread \"main\" java.lang.IllegalStateException: outer\n",
+                "Caused by: java.lang.NumberFormatException: bad\n",
+                "\tat Stack_trace_causeKt.root(stack_trace_cause.kt:2)\n\t... 3 more",
             };
             for (needles) |n| {
                 if (std.mem.find(u8, m, n) == null) {
@@ -326,8 +329,10 @@ test "anon_object_method_retains_lexical_receiver_chain" {
     );
 }
 
-// The access site sees FileFailedToInitializeException wrapping the user
-// exception; a second access rethrows it without the cause.
+// The first access sees ExceptionInInitializerError with the user exception
+// as its cause; a later access throws NoClassDefFoundError caused by that
+// error, and the initializer never runs again. Pinned against kotlinc JVM
+// 2.4.20, as are the other init-failure tests below.
 test "object_init_throw_propagates_and_is_not_retried" {
     const src =
         \\
@@ -350,7 +355,7 @@ test "object_init_throw_propagates_and_is_not_retried" {
     try assertKlio(
         "object_init_throw",
         src,
-        "main-start\nc1: FileFailedToInitializeException cause=IllegalStateException\nc2: FileFailedToInitializeException cause=none\nmain-end\n",
+        "main-start\nc1: ExceptionInInitializerError cause=IllegalStateException\nc2: NoClassDefFoundError cause=ExceptionInInitializerError\nmain-end\n",
     );
 }
 
@@ -382,7 +387,7 @@ test "object_init_failure_uncaught_aborts" {
     try assertKlioError(
         "object_init_uncaught",
         src,
-        "uncaught kotlin.native.internal.FileFailedToInitializeException",
+        "java.lang.ExceptionInInitializerError",
     );
 }
 
@@ -456,7 +461,7 @@ test "companion_init_failure_at_instantiation_site" {
     try assertKlio(
         "companion_init_failure",
         src,
-        "ctor: FileFailedToInitializeException cause=IllegalStateException\nagain: FileFailedToInitializeException cause=none\nend\n",
+        "ctor: ExceptionInInitializerError cause=IllegalStateException\nagain: NoClassDefFoundError cause=ExceptionInInitializerError\nend\n",
     );
 }
 
@@ -527,10 +532,9 @@ test "top_level_prop_init_stays_eager_and_drives_object" {
     try assertKlio("top_level_drives_object", src, "t-init\no-init\nmain 1\n");
 }
 
-// Known divergence: `b`'s initializer is a HOF call whose inferred type the
-// lowering cannot recover without a type checker, so the forward read drives it
-// (klio prints 11) where kotlinc reads the inferred field default (1). The side
-// effects and their order match.
+// The file is initializing when `O` reads `b`, so the read sees `b`'s
+// default, 0, and `O.v` is 1; `b`'s initializer then runs once, in file order.
+// kotlinc JVM 2.4.20 prints exactly this.
 test "forward_referenced_top_level_prop_initializes_once" {
     const src =
         \\
@@ -540,7 +544,7 @@ test "forward_referenced_top_level_prop_initializes_once" {
         \\fun main() { println("main " + a + " " + b) }
         \\
     ;
-    try assertKlio("forward_ref_once", src, "a-init\nb-init\nmain 11 10\n");
+    try assertKlio("forward_ref_once", src, "a-init\nb-init\nmain 1 10\n");
 }
 
 // kotlinc (JVM 2.3.21): an `Int`-annotated forward read observes the typed
@@ -610,10 +614,10 @@ test "forward_read_through_function_call_sees_typed_default" {
     try assertKlio("forward_ref_fn_default", src, "init b\n0\n42\n");
 }
 
-/// Run `src` under both in-process load modes (`EmbeddedOnly` and
-/// `SourcePacks`) and assert stdout equals `expected` in each.
+/// Run `src` over the cached base image and over a base analyzed afresh,
+/// and assert stdout equals `expected` in each.
 fn assertKlioBothModes(name: []const u8, src: []const u8, expected: []const u8) !void {
-    const modes = [_]parity.LoadMode{ .EmbeddedOnly, .SourcePacks };
+    const modes = [_]klio_child.Mode{ .image, .cold };
     for (modes) |mode| {
         _ = file_arena.reset(.retain_capacity);
         const a = file_arena.allocator();
@@ -626,7 +630,7 @@ fn assertKlioBothModes(name: []const u8, src: []const u8, expected: []const u8) 
         const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-        const res = try parity.runInMode(a, io, path, mode);
+        const res = try klio_child.run(a, &.{path}, .{ .mode = mode });
         switch (res) {
             .ok => |got| std.testing.expectEqualStrings(expected, got) catch |e| {
                 std.debug.print("mode {s}: output mismatch for `{s}`\n", .{ @tagName(mode), name });

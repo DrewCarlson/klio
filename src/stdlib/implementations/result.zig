@@ -276,7 +276,9 @@ pub fn coro_resume(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const ok = ctx.args.len > 1 and ctx.args[1] == .Bool and ctx.args[1].Bool;
     const payload = if (ctx.args.len > 2) ctx.args[2] else Value.Null;
     const result = try makeResult(ctx.allocator, ok, payload);
-    ctx.host.coroutineResumeContinuation(slot, result, ctx.out);
+    // A coroutine resumed on this stack whose completion threw throws out
+    // of the resumer's `resumeWith`.
+    if (ctx.host.coroutineResumeContinuation(slot, result, ctx.out)) |thrown| return .{ .err = .{ .Thrown = thrown } };
     return .{ .ok = Value.Unit };
 }
 
@@ -379,7 +381,7 @@ pub fn result_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // `toString()`, commonly the thrown exception, uses it.
     const inner: []const u8 = blk: {
         if (recv.payload.* == .Instance) {
-            if (try ctx.host.invokeMethod(recv.payload, "toString", &.{}, ctx.out)) |res| {
+            if (try ctx.host.callWellKnown(recv.payload, .to_string, &.{}, ctx.out)) |res| {
                 switch (res) {
                     .ok => |v| if (v == .String) {
                         const g = v.String.borrow();

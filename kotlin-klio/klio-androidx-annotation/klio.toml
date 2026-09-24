@@ -1,0 +1,19 @@
+# androidx.annotation — the androidx annotation library every compose module
+# and androidx.collection declare as a dependency (`androidx.annotation:annotation`).
+# Documentation and lint markers with no runtime behaviour: range and size
+# constraints, visibility and restriction markers, call-site checks. The sparse
+# compose-multiplatform-core checkout does not carry the library's sources, so
+# klioMain declares the members the vendored packs import, with upstream's
+# signatures, so the importing files resolve verbatim.
+[library]
+id = "androidx.annotation"
+version = "1.8.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "klioMain"
+
+[deps]
+stdlib = "*"

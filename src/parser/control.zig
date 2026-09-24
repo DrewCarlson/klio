@@ -279,6 +279,8 @@ pub const DestructEntries = struct {
     sources: []Ident,
     by_name: bool,
     any_var: bool,
+    /// Where an entry carries its own `val`/`var`, the first such keyword.
+    keyword_at: ?Span = null,
 };
 
 /// The entries of a destructuring group up to and including `close`: positional
@@ -292,6 +294,7 @@ pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what
     // name too; `[a, b]` stays positional.
     var by_name = !positional and root.language.name_based_short_form;
     var any_var = false;
+    var keyword_at: ?Span = null;
     while (true) {
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == std.meta.activeTag(close)) break;
@@ -299,7 +302,8 @@ pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what
         if (std.meta.activeTag(support.peekKind(p).*) == .Keyword) {
             const kw = support.peekKind(p).Keyword;
             if (kw == .Val or kw == .Var) {
-                _ = support.bump(p);
+                const kw_tok = support.bump(p);
+                if (keyword_at == null) keyword_at = kw_tok.span;
                 if (kw == .Var) any_var = true;
                 if (!positional) by_name = true;
             }
@@ -339,6 +343,7 @@ pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what
         .sources = sources.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .by_name = by_name,
         .any_var = any_var,
+        .keyword_at = keyword_at,
     };
 }
 

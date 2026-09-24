@@ -24,7 +24,7 @@
 package androidx.compose.foundation.text.input.internal.selection
 
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.internal.nativeClipboardHasText
+import androidx.compose.foundation.internal.hasText
 import androidx.compose.foundation.text.DesktopTextContextMenuItems
 import androidx.compose.foundation.text.DesktopTextContextMenuItems.Copy
 import androidx.compose.foundation.text.DesktopTextContextMenuItems.Cut
@@ -35,11 +35,9 @@ import androidx.compose.foundation.text.contextmenu.builder.TextContextMenuBuild
 import androidx.compose.foundation.text.contextmenu.builder.item
 import androidx.compose.foundation.text.contextmenu.modifier.addTextContextMenuComponentsWithLocalization
 import androidx.compose.foundation.text.selection.MouseSelectionObserver
-import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.platform.Clipboard
-import androidx.compose.ui.platform.awtClipboard
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
@@ -106,9 +104,11 @@ internal actual class ClipboardPasteState actual constructor(private val clipboa
     actual val hasText: Boolean get() = _hasText
     actual val hasClip: Boolean get() = _hasClip
 
-    @OptIn(ExperimentalComposeUiApi::class)
+    // Desktop asks the AWT clipboard for its data flavors; klio's clipboard holds
+    // one ClipEntry, so a clip is present when there is an entry.
     actual suspend fun update() {
-        _hasClip = clipboard.awtClipboard?.availableDataFlavors?.isNotEmpty() ?: false
-        _hasText = clipboard.nativeClipboardHasText()
+        val entry = clipboard.getClipEntry()
+        _hasClip = entry != null
+        _hasText = entry.hasText()
     }
 }

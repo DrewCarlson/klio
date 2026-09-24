@@ -2,12 +2,11 @@
 //! abstract/final/open interplay, companion through subclass.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const TMP_DIR = "/tmp/klio_itest_parity_inheritance_dispatch";
 
-// One file-scoped arena, reset per program: the pipeline's process-global
-// tables point into it and must outlive each test.
+// One arena for the file's runs, reset per program.
 var shared_arena: ?std.heap.ArenaAllocator = null;
 
 fn arenaAllocator() std.mem.Allocator {
@@ -29,7 +28,7 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    const res = try parity.runWithPacks(a, io, path);
+    const res = try klio_child.runFile(a, path);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {
@@ -107,17 +106,47 @@ test "open_property_overridden_with_init" {
     try assertKlio("open_property", src, "sub\n");
 }
 
+// A superclass's companion is in scope in the subclass's body; kotlinc
+// 2.4.20 does not reach it through the subclass's name (`Sub.bye()` is an
+// unresolved reference), which the next test pins.
 test "companion_inherited_via_class_ref" {
+    const src =
+        \\
+        \\open class Base { companion object { fun bye(): String = "BB" } }
+        \\class Sub : Base() {
+        \\    fun viaInheritedCompanion(): String = bye()
+        \\}
+        \\fun main() {
+        \\    println(Sub().viaInheritedCompanion())
+        \\    println(Base.bye())
+        \\}
+        \\
+    ;
+    try assertKlio("companion_inherit", src, "BB\nBB\n");
+}
+
+test "a superclass's companion is not reached through the subclass's name" {
+    const a = arenaAllocator();
     const src =
         \\
         \\open class Base { companion object { fun bye(): String = "BB" } }
         \\class Sub : Base()
         \\fun main() {
-        \\    println(Sub.bye())  // Kotlin allows accessing inherited companion thru class ref
+        \\    println(Sub.bye())
         \\}
         \\
     ;
-    try assertKlio("companion_inherit", src, "BB\n");
+    const path = try klio_child.writeProgram(a, TMP_DIR, "companion_inherit_rejected.kt", src);
+    switch (try klio_child.runFile(a, path)) {
+        .ok => |got| {
+            std.debug.print("companion_inherit_rejected: expected a rejection, ran with output:\n{s}\n", .{got});
+            return error.ExpectedRejection;
+        },
+        .err => |m| if (std.mem.find(u8, m, "unresolved reference `bye`") == null) {
+            std.debug.print("companion_inherit_rejected: rejection missing `unresolved reference `bye``:\n{s}\n", .{m});
+            return error.WrongRejection;
+        },
+    }
 }
 
 test "polymorphic_collection_dispatch" {

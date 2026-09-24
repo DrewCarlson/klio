@@ -1,7 +1,8 @@
 // Sibling vararg overloads discriminated by the Pair's SECOND component:
 // a Pair<String, List<String>> argument declines the Pair<String, String>
 // overload so the Iterable sibling binds. And assertEquals-style generic
-// peers widen Int range literals to Long when the other side is Long.
+// peers keep an Int range an IntRange when the other side is a LongRange:
+// only a bare literal takes its type from the peer, so the lists differ.
 
 class Sink2 {
     val flat = mutableListOf<String>()

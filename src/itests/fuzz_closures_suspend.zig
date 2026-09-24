@@ -1,11 +1,13 @@
 //! Property fuzzer for closures plus suspend: it emits valid Kotlin from a
 //! constrained grammar and asserts per program that the interpreter does not
-//! crash and that stdout is byte-identical across both pack-load modes. Every
-//! delay is distinct, so wakeup order is total and stdout is comparable.
-//! A failing seed is persisted under `tests/corpus/fuzz_failures/`.
+//! crash and that stdout is byte-identical over the cached base image and a
+//! base analyzed afresh. Every delay is distinct, so wakeup order is total and
+//! stdout is comparable. A failing seed is persisted under
+//! `tests/corpus/fuzz_failures/`.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
+const kotlinc_support = @import("kotlinc_support");
 const runtime = @import("runtime");
 
 const FAILURE_CORPUS = "tests/corpus/fuzz_failures";
@@ -100,7 +102,7 @@ fn emitProgram(a: std.mem.Allocator, shape: Shape) std.mem.Allocator.Error![]u8 
     return buf.toOwnedSlice(a);
 }
 
-const MODES = [_]parity.LoadMode{ .SourcePacks, .CompiledPacks };
+const MODES = [_]klio_child.Mode{ .image, .cold };
 
 /// Caller deletes the file and frees the returned path.
 fn writeTempProgram(gpa: std.mem.Allocator, io: std.Io, seed: u64, src: []const u8) std.mem.Allocator.Error![]u8 {
@@ -138,19 +140,19 @@ const Failure = struct {
 
 /// Returns a `Failure` on a crash or cross-mode divergence, with its strings
 /// duped into `outer` because the caller destroys `seed_arena` on return.
-fn runSeed(seed_arena: std.mem.Allocator, outer: std.mem.Allocator, io: std.Io, seed: u64) std.mem.Allocator.Error!?Failure {
+fn runSeed(seed_arena: std.mem.Allocator, outer: std.mem.Allocator, io: std.Io, seed: u64) !?Failure {
     const shape = shapeFromSeed(seed);
     const src = try emitProgram(seed_arena, shape);
     const path = try writeTempProgram(seed_arena, io, seed, src);
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var baseline: ?[]u8 = null;
-    var baseline_mode: parity.LoadMode = undefined;
+    var baseline_mode: klio_child.Mode = undefined;
     for (MODES) |mode| {
         if (FUZZ_TRACE) std.debug.print("fuzz: seed=0x{x} mode={s}\n", .{ seed, @tagName(mode) });
-        // runInMode reports interpreter errors as `.err`; a real panic takes
-        // the process down, which is the crash this hunts for.
-        const res = try parity.runInMode(seed_arena, io, path, mode);
+        // An interpreter error or a crash of the child is `.err`, which the
+        // grammar's valid programs never earn.
+        const res = try klio_child.run(seed_arena, &.{path}, .{ .mode = mode });
         const got: []u8 = switch (res) {
             .ok => |o| o,
             .err => |e| try std.fmt.allocPrint(seed_arena, "<err> {s}", .{e}),
@@ -179,7 +181,7 @@ fn runSeed(seed_arena: std.mem.Allocator, outer: std.mem.Allocator, io: std.Io, 
 }
 
 fn envU64(gpa: std.mem.Allocator, io: std.Io, name: []const u8, default: u64) u64 {
-    const v = parityGetEnv(gpa, io, name) orelse return default;
+    const v = getEnv(gpa, io, name) orelse return default;
     defer gpa.free(v);
     const t = std.mem.trim(u8, v, " \t\r\n");
     if (std.mem.startsWith(u8, t, "0x") or std.mem.startsWith(u8, t, "0X")) {
@@ -189,24 +191,24 @@ fn envU64(gpa: std.mem.Allocator, io: std.Io, name: []const u8, default: u64) u6
 }
 
 fn envFlag(gpa: std.mem.Allocator, io: std.Io, name: []const u8) bool {
-    const v = parityGetEnv(gpa, io, name) orelse return false;
+    const v = getEnv(gpa, io, name) orelse return false;
     defer gpa.free(v);
     return v.len != 0 and !std.mem.eql(u8, v, "0");
 }
 
-fn parityGetEnv(gpa: std.mem.Allocator, io: std.Io, name: []const u8) ?[]u8 {
+fn getEnv(gpa: std.mem.Allocator, io: std.Io, name: []const u8) ?[]u8 {
     _ = io;
     return runtime.procEnvGetVar(gpa, name) catch null;
 }
 
 /// Diff a failing program against kotlinc, quiet when kotlinc is absent.
 fn kotlincShrinkReport(gpa: std.mem.Allocator, io: std.Io, path: []const u8) void {
-    const report = parity.check(gpa, io, path) catch return;
+    const report = kotlinc_support.check(gpa, io, path) catch return;
     switch (report) {
         .err => return,
         .ok => |rep| {
             if (rep.matched) return;
-            const diff = parity.renderDiff(gpa, &rep) catch return;
+            const diff = kotlinc_support.renderDiff(gpa, &rep) catch return;
             defer gpa.free(diff);
             std.debug.print("fuzz: kotlinc parity diff:\n{s}\n", .{diff});
         },

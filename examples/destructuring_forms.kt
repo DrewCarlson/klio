@@ -1,4 +1,5 @@
-// Kotlin 2.4 destructuring. The positional short form `[a, b]` reads
+// kotlinc: -language-version 2.5
+// Kotlin 2.5 destructuring. The positional short form `[a, b]` reads
 // `componentN` exactly as `(a, b)` does; the name-based full form
 // `(val a, val b)` reads properties by name, and `val n = prop` renames.
 // Both work in declarations, `for` loops, and lambda parameters, and a

@@ -178,7 +178,7 @@ pub fn runHostFreeSlotOp(allocator: Allocator, op: HostSlotOp, receiver: *const 
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
             defer if (runtime.freeScratch()) allocator.free(msg);
-            return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
+            return .{ .err = try throwExc(allocator, "java.lang.ArrayIndexOutOfBoundsException", msg) };
         },
         else => return null,
     }

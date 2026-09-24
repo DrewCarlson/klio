@@ -504,7 +504,7 @@ pub fn string_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (other == .Instance or other == .List or other == .Set or other == .Map or
         other == .Pair or other == .Triple or other == .Result)
     {
-        const mr = try ctx.host.invokeMethod(&other, "toString", &.{}, ctx.out);
+        const mr = try ctx.host.callWellKnown(&other, .to_string, &.{}, ctx.out);
         if (mr) |res| {
             switch (res) {
                 .ok => |val| {

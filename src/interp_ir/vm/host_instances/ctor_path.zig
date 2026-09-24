@@ -20,7 +20,7 @@ const host_call_value = @import("../host_call_value.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-const build = @import("../../build.zig");
+const tables = @import("../../tables.zig");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -218,7 +218,7 @@ pub fn throwInstantiation(self: *VmHost, allocator: Allocator, comptime fmt: []c
     _ = self;
     const msg = try std.fmt.allocPrint(allocator, fmt, .{name});
     return .{ .err = .{ .Throw = try Value.newException(allocator, .{
-        .fqn = try runtime.strInitOwned(allocator, try allocator.dupe(u8, "kotlin.InstantiationError")),
+        .fqn = try runtime.strInitOwned(allocator, try allocator.dupe(u8, "java.lang.InstantiationError")),
         .message = .from(try runtime.strInitOwned(allocator, msg)),
         .cause = null,
     }) } };
@@ -329,7 +329,7 @@ pub fn dispatchSecondaryCtorForced(self: *VmHost, allocator: Allocator, class: C
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
     // A defaulted secondary is a candidate only when the primary cannot take the call.
     const primary_takes = primaryCanTake(self, class_def, args.len);
-    var chosen: ?root.build.SecondaryCtorEntry = if (forced) |fi|
+    var chosen: ?root.tables.SecondaryCtorEntry = if (forced) |fi|
         (if (fi < entries.len) entries[fi] else null)
     else if (primary_takes)
         chooseSecondaryCtor(self, entries, args)

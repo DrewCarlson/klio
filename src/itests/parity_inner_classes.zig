@@ -2,12 +2,11 @@
 //! its outer, and how its body reaches outer members.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const TMP_DIR = "/tmp/klio_itest_parity_inner_classes";
 
-// The pipeline's process-global state points into the run allocator, so one
-// file-scoped arena must outlive every test here.
+// One arena for the file's runs, reset per program.
 var shared_arena: ?std.heap.ArenaAllocator = null;
 
 fn arenaAllocator() std.mem.Allocator {
@@ -29,7 +28,7 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    const res = try parity.runWithPacks(a, io, path);
+    const res = try klio_child.runFile(a, path);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {

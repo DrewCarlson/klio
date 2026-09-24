@@ -4,56 +4,55 @@ klio has two entry paths through the front end: **execution**
 (`klio run`) and **diagnostics** (`klio check`). They share the
 lexer and parser; they diverge after the AST.
 
-## Execution path (`klio run`)
+## Execution path (`klio run`, `klio test`)
 
 ```
 .kt bytes
    │
    ▼  lexer            UTF-8 source → tokens
    ▼  parser           tokens → ast.KotlinFile
-   ▼  (pack loading)   merge installed pack ASTs into the module
-   ▼  ast passes       typealias expansion, @Serializable and @Composable plugins
-   ▼  ir               AST → register IR (lowering)
-   ▼  interp_ir        build the IR module, then Vm.run
+   ▼  (pack loading)   the stdlib and the program's declared packs, as sources
+   ▼  @Serializable    the serialization plugin splices its members into the files
+   ▼  sema             symbols, headers and bodies: every name bound to a symbol
+   ▼  bridge           sema's symbols → IR ids (classes, functions, fields, slots)
+   ▼  lower            sema's records → register IR (`ir/lower/sema`, with @Composable)
+   ▼  interp_ir        the Vm runs the lowered module
    ▼
 program output
 ```
 
 The Vm executes the lowered IR directly. There is no AST evaluator
-and no bytecode VM — `ir` lowers every supported construct
+and no bytecode VM — `ir/lower/sema` lowers every supported construct
 (classes, lambdas, suspend state machines, reflection, delegates) to
-structured IR instructions, and the Vm dispatches on them. Under the
+IR instructions that name their targets by id, and the Vm dispatches on
+them. Under the
 default `fast` profile, hot loops and functions additionally compile
 to native code through the tiered JIT; see
 [Performance](performance.md).
 
-Before lowering, whole-program AST passes rewrite the parsed files in
-place. The first is typealias expansion (`ast.alias_expand`): every
-reference to a `typealias` — a type position, a constructor call
-`Alias(args)` / `recv.Alias(args)`, a supertype of a class or object
-literal, a value read of an aliased object or companion, a callable
-reference `::Alias` — becomes the aliased type with the alias's type
-parameters substituted, resolved with Kotlin's scoping (enclosing class
-body, explicit imports, own package, star imports; the target itself
-resolves in the alias's declaring file). Lowering and the runtime then
-only ever see the target. An alias name the program also declares as a
-classifier, function or value is left for the lowering's scope model.
-`KLIO_ALIAS_EXPAND=0` skips the pass. The `@Serializable` and
-`@Composable` plugin passes follow.
+Every node sema will record a fact on carries an `ast.NodeId`: each
+expression, block, assignment, destructuring declaration, catch clause,
+declaration, parameter and `$name` template part. The parser numbers a
+file's nodes in source order from 1 (a node before its children) and
+leaves the next free id in `KotlinFile.node_count`; 0 is `none`, the id of
+a node a later pass built. The `@Serializable` pass parses each snippet it
+splices into a file with ids continuing from that file's count. In Debug
+builds `ast.checkIds` runs after the parse and after that pass and panics
+on an id held by two nodes, which is what a pass copying an `Expr` leaves.
 
-With `KLIO_EAGER=1` the run path also executes the resolver and type
-checker ahead of lowering, and lowering consumes their answers
-(call targets, receiver types) instead of deferring those decisions
-to runtime; files the checker cannot finish fall back to the lazy
-path.
+A pack file's class typealiases are expanded in its function signatures
+and constructor parameters as it loads (`ast.expandFileClassAliases`);
+every other alias is resolved by sema.
 
 | Module       | Responsibility                                                              |
 |--------------|------------------------------------------------------------------------------|
 | `span`       | Source map, file ids, byte and (line, column) positions.                     |
 | `lexer`      | UTF-8 source → tokens. Raw strings, templates, escapes; `L00xx` diagnostics. |
 | `parser`     | Tokens → `ast.KotlinFile`. Error recovery; `P00xx` diagnostics.              |
-| `ir`         | Lowers the AST to the register IR (`Module`, `Func`, `Inst`).                |
-| `interp_ir`  | Builds the IR module from one or more files and runs it on the Vm.           |
+| `sema`       | Symbols, declaration headers and body analysis; the records lowering reads.  |
+| `ir`         | The register IR (`Module`, `Func`, `Inst`), the bridge and the lowering.     |
+| `lower_driver` | Drives sema, the bridge and lowering over a base and a program.            |
+| `interp_ir`  | The Vm that runs the lowered module.                                         |
 | `runtime`    | Runtime `Value`, instance data, and the `Output` sink.                       |
 
 ## Diagnostics path (`klio check`)
@@ -76,10 +75,8 @@ non-zero on any error.
 | `cfa`       | Control- and data-flow analyses (definite assignment, reachability) used by type checking. |
 | `types`     | Kotlin `Type` model, variance, inference constraint kinds.                    |
 
-Type-checking does not gate execution: a program that type-checks
-clean and a program that merely parses both run through the same Vm
-(under `KLIO_EAGER=1` the checker runs on the run path too, but as
-an accuracy upgrade for lowering, never as a gate).
+`klio run` does not run the resolver or the type checker; sema reports
+the errors that stop a program from running.
 
 ## Stdlib and packs
 
@@ -89,25 +86,22 @@ binary by `stdlib_pack` as a byte slice. At startup the loader:
 1. Decodes the embedded stdlib pack and registers its native
    bindings against `stdlib`'s `HostBindings`.
 2. Enumerates `~/.klio/packs/` and `$KLIO_PACKS`, topologically
-   sorts packs by their declared dependencies, and merges each
-   pack's parsed AST into the IR module so its top-level
-   declarations become part of the program.
-3. Hands the resolved binding table to the Vm via
-   `set_installed_bindings`.
+   sorts packs by their declared dependencies, and adds each pack's
+   parsed sources to the base the program is analyzed over.
 
 See [Pack Format](../packs/format.md) for the on-disk layout.
 
-To avoid re-lowering the stdlib (and selected packs) on every run, the
-CLI bakes the lowered dependency base — the IR module, its registry
-side tables, the runtime `ClassDef` graph, and the post-lift AST the
-extend path consumes — to a content-addressed image under
-`~/.klio/cache` and extends it with just the user program's
-declarations on later runs (`src/interp_ir/image.zig`,
-`src/cli/stdlib_image.zig`). The image's wire format is the pack
+To avoid analyzing and lowering the stdlib (and selected packs) on every
+run, the CLI bakes the base's bridge and lowered bodies to a
+content-addressed image, `$KLIO_HOME/.klio/cache/sema-base-<key>.klio-sema`
+(`src/lower_driver/base_image.zig`, `src/cli/sema_base_cache.zig`), and
+later runs analyze and lower only the program over it. The image is
+written in the value codec of `src/interp_ir/codec.zig`: the pack
 codec's postcard style plus a shared-graph protocol (slice and AST-node
-define/backref registries) so cross-references like
-`ClassDef.methods[].decl` and inline-function ASTs decode pointing into
-the same decoded tree they did in memory.
+define/backref registries), so cross-references decode pointing into the
+same decoded tree they did in memory. `klio bake-image` and `klio bundle`
+write a self-contained image (`src/cli/sema_image.zig`) that carries the
+base image with the sources it was baked from.
 
 ## Diagnostics model
 

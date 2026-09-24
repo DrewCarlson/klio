@@ -54,13 +54,13 @@ klio/
 
 - **Front end** (`lexer` → `parser`) produces the AST that
   both entry paths share.
-- **Execution** (`ir` → `interp_ir` + `runtime` +
-  `stdlib`, with `jit` compiling hot code) lowers the AST to IR and
-  runs it. This is the `klio run` path.
+- **Execution** (`sema` → the bridge and lowering in `ir` →
+  `interp_ir` + `runtime` + `stdlib`, with `jit` compiling hot code)
+  analyzes the AST, lowers it to IR and runs it. This is the `klio run`
+  path; `lower_driver` drives it.
 - **Diagnostics** (`resolver` → `typeck`, backed by
-  `types` and `cfa`) type-checks the AST for `klio check`. It gates
-  nothing on the run path (under `KLIO_EAGER=1` it runs there too,
-  feeding lowering).
+  `types` and `cfa`) type-checks the AST for `klio check`. It does not
+  run on the `klio run` path.
 - **Packs** ride on top of execution. Each library has a pack
   definition under `kotlin-klio/klio-<name>/` (a `klio.toml`, the
   upstream sources as a submodule, and klio-authored actuals) and,

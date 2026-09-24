@@ -2,7 +2,6 @@ const std = @import("std");
 const span = @import("span");
 const runtime = @import("runtime");
 const applicability = @import("applicability");
-const types_mod = @import("types");
 const Allocator = std.mem.Allocator;
 const root_ir = @import("../ir.zig");
 const core_class = @import("class.zig");
@@ -18,8 +17,6 @@ const Const = core_consts.Const;
 const ConstId = core_ids.ConstId;
 const DeclArity = Module.DeclArity;
 const DeclSig = Module.DeclSig;
-const EagerParamShape = root_ir.EagerParamShape;
-const EagerTypeHead = root_ir.EagerTypeHead;
 const FileId = root_ir.FileId;
 const Func = core_func.Func;
 const FuncId = core_ids.FuncId;
@@ -38,11 +35,10 @@ const rankLowPriority = core_func.rankLowPriority;
 const staticTypeHead = Module.staticTypeHead;
 
 pub fn init(allocator: Allocator) Module {
-    var out__ = Module{
+    return Module{
         .lookup_cache_gpa = allocator,
         .func_name_index = runtime.NameHashMap(std.ArrayList(FuncId)).init(allocator),
         .registry = ModuleRegistry.init(allocator),
-        .decl_user_params = std.AutoHashMap(u32, u32).init(allocator),
         .decl_user_arity = std.AutoHashMap(u32, DeclArity).init(allocator),
         .decl_user_sig = std.AutoHashMap(u32, []TypeRef).init(allocator),
         .decl_span = std.AutoHashMap(u32, Span).init(allocator),
@@ -53,28 +49,6 @@ pub fn init(allocator: Allocator) Module {
         .prop_dispatch = std.AutoHashMap(u64, root_ir.PropTarget).init(allocator),
         .prop_slot_ids = StrPairMap(u32).init(allocator),
     };
-    out__.adoptPicks(root_ir.takePendingPicks());
-    return out__;
-}
-
-/// Takes the stage's pick tables the module lowers its bodies with. A table
-/// the module already holds keeps its entries and gains the given ones: the
-/// keys are spans, so a base's picks and a program's never collide.
-pub fn adoptPicks(self: *Module, p: root_ir.StagedPicks) void {
-    mergePicks(&self.eager_call_fids, p.call_fids);
-    mergePicks(&self.eager_calls, p.calls);
-    mergePicks(&self.eager_types, p.types);
-    mergePicks(&self.eager_recv_heads, p.recv_heads);
-    mergePicks(&self.eager_param_shapes, p.param_shapes);
-}
-
-fn mergePicks(dst: anytype, src: anytype) void {
-    var s = src orelse return;
-    if (dst.*) |*d| {
-        var it = s.iterator();
-        while (it.next()) |e| d.put(e.key_ptr.*, e.value_ptr.*) catch {};
-        s.deinit();
-    } else dst.* = s;
 }
 
 pub fn default(allocator: Allocator) Module {
@@ -84,24 +58,18 @@ pub fn default(allocator: Allocator) Module {
 /// Materialise `func`'s deferred `blocks` from the lazy-IR section, clearing `deferred_offset`.
 /// Decoded into the module's process-lifetime arena, so the patch outlives a per-program build.
 pub fn ensureFuncBody(self: *const Module, func: *Func) bool {
-    if (func.blocks.len != 0) return true;
-    // A body a lazy build deferred lowers here, on its first execution.
-    if (root_ir.lazy_hook) |hook| {
-        hook(self, func);
-        if (func.blocks.len != 0) return true;
-    }
-    if (func.deferred_offset == 0) return false;
+    // `deferred_offset` is the publication flag: it clears, with release, only after
+    // `blocks` is written, so a reader that sees it clear sees the blocks.
+    if (@atomicLoad(u32, &func.deferred_offset, .acquire) == 0) return func.blocks.len != 0;
     const decode = self.deferred_func_decode orelse return false;
-    // The header lock serializes decode and publication: the two-word `blocks` write
-    // must not tear, and its release edge orders the blocks ahead of any downstream memo.
+    // The header lock serializes decode and publication.
     const mut: *Module = @constCast(self);
     while (mut.func_header_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
     defer mut.func_header_lock.store(false, .release);
-    if (func.blocks.len != 0) return true;
-    if (func.deferred_offset == 0) return false;
+    if (func.deferred_offset == 0) return func.blocks.len != 0;
     if (decode(self.deferred_func_arena, self.deferred_func_section, func.deferred_offset - 1)) |blocks| {
         func.blocks = blocks;
-        func.deferred_offset = 0;
+        @atomicStore(u32, &func.deferred_offset, 0, .release);
     }
     return func.blocks.len != 0;
 }
@@ -273,17 +241,12 @@ pub fn deinit(self: *Module, allocator: Allocator) void {
     if (self.class_fqn_map) |*m| m.deinit();
     if (self.class_parent) |*m| m.deinit();
     if (self.func_by_decl_span) |*m| m.deinit();
-    if (self.eager_calls) |*m| m.deinit();
-    if (self.eager_call_fids) |*m| m.deinit();
-    if (self.eager_types) |*m| m.deinit();
-    if (self.eager_recv_heads) |*m| m.deinit();
     if (self.ext_names_by_recv_head) |*m| {
         var vit = m.valueIterator();
         while (vit.next()) |v| v.deinit();
         m.deinit();
     }
     if (self.generic_ext_names) |*m| m.deinit();
-    if (self.eager_param_shapes) |*m| m.deinit();
     if (self.class_children) |*m| {
         var itc = m.valueIterator();
         while (itc.next()) |v| v.deinit();
@@ -311,9 +274,7 @@ pub fn deinit(self: *Module, allocator: Allocator) void {
     var it = self.func_name_index.valueIterator();
     while (it.next()) |list| list.deinit(allocator);
     self.func_name_index.deinit();
-    self.tailrec_fn_names.deinit(allocator);
     self.registry.deinit();
-    self.decl_user_params.deinit();
     self.decl_user_arity.deinit();
     {
         var sig_it = self.decl_user_sig.valueIterator();
@@ -334,119 +295,6 @@ pub fn deinit(self: *Module, allocator: Allocator) void {
     self.method_dispatch.deinit();
     self.prop_dispatch.deinit();
     self.prop_slot_ids.deinit();
-    self.resolve_diags.deinit(allocator);
-    if (self.pending_lambda_nonfn_locals) |*names| names.deinit();
-    if (self.pending_lambda_local_decl_types) |*locals| {
-        var type_it = locals.types.valueIterator();
-        while (type_it.next()) |ty| ty.deinit(allocator);
-        locals.types.deinit();
-        locals.nullable.deinit();
-        locals.call_returns.deinit();
-    }
-    if (self.pending_lambda_own_recv_type) |*receiver| receiver.deinit(allocator);
-    if (self.pending_lambda_type_params) |params| allocator.free(params);
-    if (self.pending_lambda_type_param_bounds) |bounds| allocator.free(bounds);
-    if (self.pending_lambda_type_param_bound_refs) |refs| {
-        for (refs) |*r| r.ref.deinit(allocator);
-        allocator.free(refs);
-    }
-    if (self.pending_lambda_param_types) |types| {
-        for (types) |*ty| ty.deinit(allocator);
-        allocator.free(types);
-    }
-}
-
-/// Clone for EXTENSION: container spines are copied onto `a`, leaf data (instructions, strings,
-/// params, registry values) is shared with the arena-owned original, which must stay immutable.
-/// The extend clone with every registry table, for a module a program runs
-/// in and lowers into at run time.
-pub fn cloneForExtendComplete(self: *const Module, a: Allocator) Allocator.Error!Module {
-    var out = try self.cloneForExtend(a);
-    out.registry = try self.registry.cloneComplete(a);
-    return out;
-}
-
-pub fn cloneForExtend(self: *const Module, a: Allocator) Allocator.Error!Module {
-    var out = Module.init(a);
-    // Base funcs (ids 0..base_n) are delegated through the shared lazy header section, so
-    // `funcs.items` is empty here; an eager base has no section, copies them, and keeps base_n 0.
-    try out.funcs.appendSlice(a, self.funcs.items);
-    out.func_header_section = self.func_header_section;
-    out.func_header_offsets = self.func_header_offsets;
-    out.func_header_decode = self.func_header_decode;
-    out.func_cache = self.func_cache;
-    out.func_fqn_heads = self.func_fqn_heads;
-    out.bodyless_func_ids = self.bodyless_func_ids;
-    // Carry the lazy-IR section so a deferred base function materialises in the extending run.
-    // It decodes into the base's process-lifetime arena, not `a`, which a gc backend reclaims.
-    out.deferred_func_section = self.deferred_func_section;
-    out.deferred_func_arena = self.deferred_func_arena;
-    out.deferred_func_decode = self.deferred_func_decode;
-    try out.classes.appendSlice(a, self.classes.items);
-    // The composed layouts are leaf data of the immutable original; an extending
-    // build appends past them and never rewrites one.
-    try out.field_layout.appendSlice(a, self.field_layout.items);
-    try out.consts.appendSlice(a, self.consts.items);
-    try out.top_level.appendSlice(a, self.top_level.items);
-    try out.class_index.appendSlice(a, self.class_index.items);
-    try out.func_index.appendSlice(a, self.func_index.items);
-    {
-        var it = self.func_name_index.iterator();
-        while (it.next()) |e| {
-            var list: std.ArrayList(FuncId) = .empty;
-            try list.appendSlice(a, e.value_ptr.items);
-            try out.func_name_index.put(e.key_ptr.*, list);
-        }
-    }
-    out.package = self.package;
-    try out.tailrec_fn_names.appendSlice(a, self.tailrec_fn_names.items);
-    out.registry = try self.registry.cloneForExtend(a);
-    {
-        var it = self.decl_user_params.iterator();
-        while (it.next()) |e| try out.decl_user_params.put(e.key_ptr.*, e.value_ptr.*);
-    }
-    {
-        var it = self.decl_user_arity.iterator();
-        while (it.next()) |e| try out.decl_user_arity.put(e.key_ptr.*, e.value_ptr.*);
-    }
-    {
-        var it = self.decl_user_sig.iterator();
-        while (it.next()) |e| try out.decl_user_sig.put(e.key_ptr.*, e.value_ptr.*);
-    }
-    {
-        var it = self.decl_span.iterator();
-        while (it.next()) |e| try out.decl_span.put(e.key_ptr.*, e.value_ptr.*);
-    }
-    {
-        var it = self.decl_ast_body.keyIterator();
-        while (it.next()) |k| try out.decl_ast_body.put(k.*, {});
-    }
-    {
-        var it = self.decl_sigs.iterator();
-        while (it.next()) |e| try out.decl_sigs.put(e.key_ptr.*, e.value_ptr.*);
-    }
-    {
-        var it = self.member_name_index.iterator();
-        while (it.next()) |e| {
-            var list: std.ArrayList(FuncId) = .empty;
-            try list.appendSlice(a, e.value_ptr.items);
-            try out.member_name_index.put(e.key_ptr.*, list);
-        }
-    }
-    {
-        var it = self.method_dispatch.iterator();
-        while (it.next()) |e| try out.method_dispatch.put(e.key_ptr.*, e.value_ptr.*);
-    }
-    {
-        var it = self.prop_dispatch.iterator();
-        while (it.next()) |e| try out.prop_dispatch.put(e.key_ptr.*, e.value_ptr.*);
-    }
-    {
-        var it = self.prop_slot_ids.iterator();
-        while (it.next()) |e| try out.prop_slot_ids.put(e.key_ptr.*, e.value_ptr.*);
-    }
-    try out.resolve_diags.appendSlice(a, self.resolve_diags.items);
-    return out;
 }
 
 pub fn classId(self: *const Module, name: []const u8) ?ClassId {
@@ -629,125 +477,6 @@ pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void
     self.class_children = cm;
 }
 
-/// Install the eager per-call resolution (driver-owned map).
-pub fn installEagerCalls(self: *Module, m: std.AutoHashMap(span.Span, span.Span)) void {
-    if (self.eager_calls) |*old_m| old_m.deinit();
-    self.eager_calls = m;
-}
-
-/// Typeck's static type head for the expression at `sp`, if recorded AND resolvable here. An
-/// unresolvable head displaces a virtual bind that would have succeeded, so it is declined.
-/// Diagnostic split of `eagerTypeOf`'s refusals: whether the span carried no
-/// entry at all, or carried one the resolvability check declined.
-pub const EagerMiss = enum(u8) { no_map, no_entry, empty_head, unresolvable_fqn, ambiguous_simple, ok, primitive_for_arg };
-pub var eager_miss_counts: [7]u32 = @splat(0);
-
-/// Whether the checker VISITED a span and what it made of it. `absent` means
-/// the expression never reached the checker; `empty` means it did and the
-/// checker had no name for it. Only meaningful with `KLIO_EAGER_SEEN`, which
-/// is what records the second case.
-pub const EagerEntry = enum { no_map, absent, empty, named };
-
-pub fn eagerEntryState(self: *const Module, sp: span.Span) EagerEntry {
-    const et = &(self.eager_types orelse return .no_map);
-    const head = et.get(sp) orelse return .absent;
-    return if (head.name.len == 0) .empty else .named;
-}
-
-/// The head the checker recorded, before any resolvability rule.
-pub fn eagerRawHead(self: *const Module, sp: span.Span) ?[]const u8 {
-    const et = &(self.eager_types orelse return null);
-    const head = et.get(sp) orelse return null;
-    return if (head.name.len == 0) null else head.name;
-}
-
-pub fn eagerTypeOf(self: *const Module, sp: span.Span) ?EagerTypeHead {
-    const et = &(self.eager_types orelse {
-        eager_miss_counts[@intFromEnum(EagerMiss.no_map)] +%= 1;
-        return null;
-    });
-    const head = et.get(sp) orelse {
-        eager_miss_counts[@intFromEnum(EagerMiss.no_entry)] +%= 1;
-        if (runtime.envOnce("KLIO_EAGER_KEYS") != null and eager_miss_counts[@intFromEnum(EagerMiss.no_entry)] <= 8) {
-            std.debug.print("[eager-key] miss file={d} start={d} end={d} map_n={d}\n", .{ sp.file, sp.start, sp.end, et.count() });
-            var it = et.iterator();
-            var shown: usize = 0;
-            while (it.next()) |e| {
-                if (e.key_ptr.file != sp.file) continue;
-                std.debug.print("[eager-key]   same-file key start={d} end={d}\n", .{ e.key_ptr.start, e.key_ptr.end });
-                shown += 1;
-                if (shown >= 3) break;
-            }
-            if (shown == 0) std.debug.print("[eager-key]   NO key in the map for file={d}\n", .{sp.file});
-        }
-        return null;
-    };
-    if (head.primitive) {
-        eager_miss_counts[@intFromEnum(EagerMiss.primitive_for_arg)] +%= 1;
-        return null;
-    }
-    var h = std.mem.trimEnd(u8, head.name, "?");
-    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
-    if (h.len == 0) {
-        eager_miss_counts[@intFromEnum(EagerMiss.empty_head)] +%= 1;
-        return null;
-    }
-    if (types_mod.builtinByName(h) != null or applicability.builtinSupersOf(h).len != 0) {
-        eager_miss_counts[@intFromEnum(EagerMiss.ok)] +%= 1;
-        return head;
-    }
-    if (std.mem.findScalar(u8, h, '.') != null) {
-        if (self.classIdByFqn(h) != null) {
-            eager_miss_counts[@intFromEnum(EagerMiss.ok)] +%= 1;
-            return head;
-        }
-        eager_miss_counts[@intFromEnum(EagerMiss.unresolvable_fqn)] +%= 1;
-        return null;
-    }
-    if (self.uniqueClassIdBySimpleName(h) != null) {
-        eager_miss_counts[@intFromEnum(EagerMiss.ok)] +%= 1;
-        return head;
-    }
-    eager_miss_counts[@intFromEnum(EagerMiss.ambiguous_simple)] +%= 1;
-    return null;
-}
-
-/// Typeck's head for a RECEIVER at `sp`. Same map, and the same resolvability
-/// rule, except that a primitive head is an answer here: `5.toString()` has an
-/// `Int` receiver, and nothing about that is a literal-coercion question.
-pub fn eagerRecvTypeOf(self: *const Module, sp: span.Span) ?EagerTypeHead {
-    const et = &(self.eager_types orelse return null);
-    const head = et.get(sp) orelse return null;
-    var h = std.mem.trimEnd(u8, head.name, "?");
-    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
-    if (h.len == 0) return null;
-    if (head.primitive) return head;
-    if (types_mod.builtinByName(h) != null or applicability.builtinSupersOf(h).len != 0) return head;
-    if (std.mem.findScalar(u8, h, '.') != null) {
-        return if (self.classIdByFqn(h) != null) head else null;
-    }
-    // ~1 050 receivers a compose program loses here carry a head the checker
-    // DID resolve, refused only because two packages spell the class the
-    // same, and THREE rules for settling it have now been measured and
-    // rejected: the span file's package (+395 served, three corpus programs
-    // broken), its alias imports (nothing), and its whole scope requiring
-    // agreement (+458 served, census 20 649 -> 20 681, WORSE). Each raises
-    // what this rung answers and none improves what lowering resolves,
-    // because a head the module cannot uniquely name is not reliably the
-    // right class and forcing it through costs more than declining. The fix
-    // belongs in the producer: the checker should record the FQN it
-    // resolved rather than a simple name for the consumer to guess at.
-    return if (self.uniqueClassIdBySimpleName(h) != null) head else null;
-}
-
-/// Retired as a consumer: the lookup always declines. The `{has_receiver, arity}` payload cannot
-/// express real parameter types, and its body-span key collides across compose-synthesized lambdas.
-pub fn eagerParamShapeOf(self: *const Module, sp: span.Span) ?EagerParamShape {
-    if (true) return null;
-    const m = &(self.eager_param_shapes orelse return null);
-    return m.get(sp);
-}
-
 /// Which conservatism made `extCouldApply` answer yes. Diagnostic only.
 pub const ExtCouldApplyWhy = enum { none, index_stale, generic_receiver, own_head, builtin_super, declared_super };
 
@@ -867,48 +596,7 @@ pub fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void
     self.ext_index_decl_count = self.func_index.items.len;
 }
 
-/// The receiver class head typeck bound for the lambda body at `sp`.
-pub fn eagerRecvHeadOf(self: *const Module, sp: span.Span) ?[]const u8 {
-    const m = &(self.eager_recv_heads orelse return null);
-    return m.get(sp);
-}
-
-/// The IMAGE-declared target the checker picked for this call, and only that: the span map beside
-/// it names SOURCE declarations, whose candidate set the checker sees only in part once packs load.
-/// A recorded image FuncId names a declaration only in a module built on the
-/// image that numbered it: the base range is the image's own. A module that
-/// lowered the base from source numbers its functions itself, and there the
-/// same number is whatever happens to sit at that index.
-fn imageFidValid(self: *const Module, fid: u32) bool {
-    const base_n: u32 = @intCast(self.func_header_offsets.len);
-    return base_n != 0 and fid < base_n and self.funcById(FuncId.from(fid)) != null;
-}
-
-pub fn eagerExternCallTarget(self: *const Module, callee_span: span.Span) ?FuncId {
-    const fm = &(self.eager_call_fids orelse return null);
-    const fid = fm.get(callee_span) orelse return null;
-    if (!imageFidValid(self, fid)) return null;
-    return FuncId.from(fid);
-}
-
-pub fn eagerCallTarget(self: *const Module, callee_span: span.Span) ?FuncId {
-    if (self.eager_call_fids) |*fm| {
-        if (fm.get(callee_span)) |fid| {
-            if (imageFidValid(self, fid)) return FuncId.from(fid);
-        }
-    }
-    const ec = &(self.eager_calls orelse return null);
-    const decl = ec.get(callee_span) orelse return null;
-    const got = self.funcByDeclSpan(decl);
-    if (got == null and runtime.envSetOnce("KLIO_EAGER_HITS")) {
-        const n: usize = if (self.func_by_decl_span) |m| m.count() else 0;
-        std.debug.print("[EAGER-MISS2] decl f{d}:{d}-{d} not lowered (map n={d})\n", .{ decl.file.int(), decl.start, decl.end, n });
-    }
-    return got;
-}
-
 pub fn recordFuncDeclSpan(self: *Module, allocator: Allocator, decl_span: span.Span, id: FuncId) Allocator.Error!void {
-    if (self.anon_side) return;
     if (self.func_by_decl_span == null) {
         self.func_by_decl_span = std.AutoHashMap(span.Span, FuncId).init(allocator);
     }
@@ -916,7 +604,6 @@ pub fn recordFuncDeclSpan(self: *Module, allocator: Allocator, decl_span: span.S
 }
 
 pub fn funcByDeclSpan(self: *const Module, decl_span: span.Span) ?FuncId {
-    if (self.anon_side) return null;
     const m = &(self.func_by_decl_span orelse return null);
     return m.get(decl_span);
 }

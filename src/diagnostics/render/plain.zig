@@ -62,9 +62,11 @@ fn renderOne(
         try out.append(allocator, '\n');
     }
     for (d.secondary.items) |sec| {
-        const slc = file.lineCol(sec.span.start);
+        // A secondary label may point into another file.
+        const sfile = sources.getChecked(sec.span.file) orelse file;
+        const slc = sfile.lineCol(sec.span.start);
         try printLine(allocator, out, "    {s}:{d}:{d}: {s}", .{
-            file.path, slc.line, slc.col, sec.message,
+            sfile.path, slc.line, slc.col, sec.message,
         });
     }
     for (d.notes.items) |note| {

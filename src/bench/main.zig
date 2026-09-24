@@ -124,6 +124,13 @@ pub fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) u8 {
 
     const budget_ns: u64 = if (args.full) 1500 * std.time.ns_per_ms else 250 * std.time.ns_per_ms;
 
+    var base_arena = std.heap.ArenaAllocator.init(allocator);
+    defer base_arena.deinit();
+    const base_src = bench.BaseSources.load(base_arena.allocator(), io) catch |e| {
+        printErr("[bench] cannot load the base sources: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+
     var records: std.ArrayList(BenchRecord) = .empty;
     defer {
         for (records.items) |rec| {
@@ -150,14 +157,12 @@ pub fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) u8 {
             printErr("[bench] {s}\n", .{label});
         }
 
-        const stages = bench.timePipelineStages(allocator, &prog, budget_ns) catch continue;
-        const stage_pairs = [_]struct { name: []const u8, t: bench.Timing }{
-            .{ .name = "lex", .t = stages.lex },
-            .{ .name = "parse", .t = stages.parse },
-            .{ .name = "resolve", .t = stages.resolve },
-            .{ .name = "typeck", .t = stages.typeck },
-            .{ .name = "e2e", .t = stages.e2e },
-        };
+        const stages = bench.timePipelineStages(allocator, &base_src, &prog, budget_ns) catch continue;
+        var stage_pairs: [bench.n_stages + 3]struct { name: []const u8, t: bench.Timing } = undefined;
+        stage_pairs[0] = .{ .name = "lex", .t = stages.lex };
+        stage_pairs[1] = .{ .name = "parse", .t = stages.parse };
+        for (stages.stages, 0..) |t, i| stage_pairs[2 + i] = .{ .name = @tagName(@as(bench.Stage, @enumFromInt(i))), .t = t };
+        stage_pairs[stage_pairs.len - 1] = .{ .name = "e2e", .t = stages.e2e };
         for (stage_pairs) |sp| {
             var rec = BenchRecord{
                 .stage = allocator.dupe(u8, sp.name) catch continue,

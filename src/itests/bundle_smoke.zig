@@ -96,12 +96,12 @@ fn ctx() !*Ctx {
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-bundle",
     };
-    const pack_files = [_][]const u8{
-        "target/packs/kotlinx.serialization.klio-pack",
-        "target/packs/klio.bundle.klio-pack",
-    };
-    for (pack_dirs) |d| {
-        const r = try runChild(a, io, build_env, null, &.{ bin, "pack", "build", d });
+    // Built into this suite's own directory: the shared target/packs is
+    // rewritten by every other suite that builds a pack.
+    var pack_files: [pack_dirs.len][]const u8 = undefined;
+    for (pack_dirs, &pack_files) |d, *f| {
+        f.* = try std.fmt.allocPrint(a, "{s}/{s}.klio-pack", .{ TMP_ROOT, std.fs.path.basename(d) });
+        const r = try runChild(a, io, build_env, null, &.{ bin, "pack", "build", d, "--out", f.* });
         if (r.code != 0) {
             std.debug.print("bundle_smoke: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
             return error.TestUnexpectedResult;
@@ -372,8 +372,8 @@ test "KLIO_BUNDLE_INSPECT prints the manifest and exits 0" {
     try std.testing.expect(std.mem.startsWith(u8, got.stdout, "bundle: hello_inspect\n"));
     try std.testing.expect(std.mem.find(u8, got.stdout, "klio: ") != null);
     try std.testing.expect(std.mem.find(u8, got.stdout, "flavor: headless\n") != null);
-    try std.testing.expect(std.mem.find(u8, got.stdout, "entry: main\n") != null);
-    try std.testing.expect(std.mem.find(u8, got.stdout, "  program-image ") != null);
+    try std.testing.expect(std.mem.find(u8, got.stdout, "entry: program-src\n") != null);
+    try std.testing.expect(std.mem.find(u8, got.stdout, "  sema-image ") != null);
     try std.testing.expect(std.mem.find(u8, got.stdout, "  program-src ") != null);
 }
 
@@ -440,34 +440,22 @@ test "project mode: [application] table, multi-file sources, includes, discovere
     try std.testing.expect(std.mem.find(u8, desktop, "Exec=") != null);
 }
 
-test "program-image is the default entry; the src fallback is byte-identical" {
+test "a bundle carries its base as a sema image and boots from the program's sources" {
     const c = try ctx();
-    const pi = try bundleProgram(c, "examples/hello.kt", "hello_pi", &.{});
-    const pi_abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, pi, c.a);
+    const b = try bundleProgram(c, "examples/hello.kt", "hello_sema", &.{});
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, b, c.a);
     try c.run_env.put("KLIO_BUNDLE_INSPECT", "1");
-    const inspect_pi = try runChild(c.a, c.io, c.run_env, null, &.{pi_abs});
-    try std.testing.expect(std.mem.find(u8, inspect_pi.stdout, "entry: main\n") != null);
-    try std.testing.expect(std.mem.find(u8, inspect_pi.stdout, "  program-image ") != null);
-    try std.testing.expect(std.mem.find(u8, inspect_pi.stdout, "  base-image ") == null);
-
-    try c.build_env.put("KLIO_BUNDLE_PROGRAM_IMAGE", "0");
-    const src = try bundleProgram(c, "examples/hello.kt", "hello_srcboot", &.{});
-    _ = c.build_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_PROGRAM_IMAGE"));
-    const src_abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, src, c.a);
-    const inspect_src = try runChild(c.a, c.io, c.run_env, null, &.{src_abs});
-    // Disabling by env is a choice, not a bake refusal, so the base image
-    // stays present.
-    try std.testing.expect(std.mem.find(u8, inspect_src.stdout, "entry: program-src\n") != null);
-    try std.testing.expect(std.mem.find(u8, inspect_src.stdout, "  base-image ") != null);
-    try std.testing.expect(std.mem.find(u8, inspect_src.stdout, "  program-image ") == null);
+    const inspect = try runChild(c.a, c.io, c.run_env, null, &.{abs});
     _ = c.run_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
+    try std.testing.expect(std.mem.find(u8, inspect.stdout, "entry: program-src\n") != null);
+    try std.testing.expect(std.mem.find(u8, inspect.stdout, "  sema-image ") != null);
+    try std.testing.expect(std.mem.find(u8, inspect.stdout, "  program-src ") != null);
+    try std.testing.expect(std.mem.find(u8, inspect.stdout, "  program-image ") == null);
+    try std.testing.expect(std.mem.find(u8, inspect.stdout, "  base-image ") == null);
 
-    const got_pi = try runChild(c.a, c.io, c.run_env, null, &.{pi_abs});
-    const got_src = try runChild(c.a, c.io, c.run_env, null, &.{src_abs});
-    try std.testing.expectEqual(@as(u32, 0), got_pi.code);
-    try std.testing.expectEqual(@as(u32, 0), got_src.code);
-    try std.testing.expectEqualStrings(got_pi.stdout, got_src.stdout);
-    try std.testing.expectEqualStrings("2\n", got_pi.stdout);
+    const got = try runChild(c.a, c.io, c.run_env, null, &.{abs});
+    try std.testing.expectEqual(@as(u32, 0), got.code);
+    try std.testing.expectEqualStrings("2\n", got.stdout);
 }
 
 test "bundle boot is at least as fast as a warm klio run" {
@@ -487,8 +475,9 @@ test "bundle boot is at least as fast as a warm klio run" {
         _ = try runChild(c.a, c.io, c.run_env, null, &.{abs});
         bundle_min = @min(bundle_min, runtime.clockMonotonicNanos() - t0);
     }
-    // The bundle skips the pack-cache walk and all parsing and lowering, so
-    // re-lowering at boot would land far outside this bound.
+    // The bundle skips the pack-cache walk and the base's analysis and
+    // lowering, which its image holds; re-analyzing the base at boot would
+    // land far outside this bound.
     if (bundle_min > run_min + run_min / 3) {
         std.debug.print("bundle_smoke: bundle boot {d}ms > warm run {d}ms\n", .{
             bundle_min / 1_000_000, run_min / 1_000_000,
@@ -505,7 +494,7 @@ test "--dry-run prints the plan and writes nothing" {
     });
     try std.testing.expectEqual(@as(u32, 0), r.code);
     try std.testing.expect(std.mem.find(u8, r.stdout, "flavor: headless\n") != null);
-    try std.testing.expect(std.mem.find(u8, r.stdout, "program-image ") != null);
+    try std.testing.expect(std.mem.find(u8, r.stdout, "sema-image ") != null);
     try std.testing.expect(std.mem.find(u8, r.stdout, "projected size: ") != null);
     try std.testing.expect((std.Io.Dir.cwd().statFile(c.io, out, .{}) catch null) == null);
 }

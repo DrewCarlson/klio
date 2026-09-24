@@ -8,7 +8,7 @@
 package androidx.compose.ui.input.pointer
 
 import androidx.collection.LongSparseArray
-import androidx.compose.ui.InternalCoreApi
+import androidx.compose.ui.node.InternalCoreApi
 
 /**
  * klio actual, mirroring the skiko shape: the platform PointerEvent actual

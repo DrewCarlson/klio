@@ -1,10 +1,11 @@
-//! Cross-program isolation gate for the once-per-process stdlib base, which is
-//! lowered once and cloned per program. Each test runs a probe, a polluter
-//! that redefines the same top-level names and installs packs, then the probe
-//! again: every probe run must be byte-identical to the first.
+//! Cross-program isolation gate for the base the data home caches: its image
+//! is baked once and every later program builds over it. Each test runs a
+//! probe, a polluter that redefines the same top-level names and pulls in a
+//! pack, then the probe again: every probe run must be byte-identical to the
+//! first. The base is built from the image or afresh (`klio_child.Mode`).
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const TMP_DIR = "/tmp/klio_itest_stdlib_isolation";
 
@@ -17,8 +18,9 @@ fn writeProgram(a: std.mem.Allocator, io: std.Io, name: []const u8, src: []const
     return path;
 }
 
-fn runProgram(a: std.mem.Allocator, io: std.Io, path: []const u8, mode: parity.LoadMode) ![]const u8 {
-    switch (try parity.runInMode(a, io, path, mode)) {
+fn runProgram(a: std.mem.Allocator, io: std.Io, path: []const u8, mode: klio_child.Mode) ![]const u8 {
+    _ = io;
+    switch (try klio_child.run(a, &.{path}, .{ .mode = mode })) {
         .ok => |out| return out,
         .err => |e| {
             std.debug.print("klio run failed for {s}: {s}\n", .{ path, e });
@@ -79,7 +81,7 @@ const POLLUTER_EXPECTED =
     "polluter-registry-init\n" ++
     "polluter 41 99 2 3\n";
 
-/// Redeclaring the stdlib name `log` forces the whole-program fallback build.
+/// Redeclares the stdlib name `log`.
 const FALLBACK_SRC =
     \\fun log(s: String): String { println("local-log:" + s); return s }
     \\fun main() { println("fallback " + log("ok")) }
@@ -90,7 +92,7 @@ const FALLBACK_EXPECTED =
     "local-log:ok\n" ++
     "fallback ok\n";
 
-fn assertSequence(mode: parity.LoadMode, polluter_mode: parity.LoadMode) !void {
+fn assertSequence(mode: klio_child.Mode, polluter_mode: klio_child.Mode) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -116,16 +118,16 @@ fn assertSequence(mode: parity.LoadMode, polluter_mode: parity.LoadMode) !void {
     try std.testing.expectEqualStrings(first, third);
 }
 
-test "stdlib base stays pristine across programs (embedded mode)" {
-    try assertSequence(.EmbeddedOnly, .SourcePacks);
+test "stdlib base stays pristine across programs (probe on a fresh base)" {
+    try assertSequence(.cold, .image);
 }
 
-test "stdlib base stays pristine across programs (source packs)" {
-    try assertSequence(.SourcePacks, .SourcePacks);
+test "stdlib base stays pristine across programs (base image)" {
+    try assertSequence(.image, .image);
 }
 
-test "stdlib base stays pristine across programs (compiled packs)" {
-    try assertSequence(.CompiledPacks, .CompiledPacks);
+test "stdlib base stays pristine across programs (polluter on a fresh base)" {
+    try assertSequence(.image, .cold);
 }
 
 test "repeated alternating modes stay deterministic" {
@@ -140,11 +142,11 @@ test "repeated alternating modes stay deterministic" {
 
     var i: usize = 0;
     while (i < 3) : (i += 1) {
-        for ([_]parity.LoadMode{ .EmbeddedOnly, .SourcePacks, .CompiledPacks }) |mode| {
+        for ([_]klio_child.Mode{ .image, .cold }) |mode| {
             const out = try runProgram(a, io, probe, mode);
             try std.testing.expectEqualStrings(PROBE_EXPECTED, out);
         }
-        const pout = try runProgram(a, io, polluter, .SourcePacks);
+        const pout = try runProgram(a, io, polluter, .image);
         try std.testing.expectEqualStrings(POLLUTER_EXPECTED, pout);
     }
 }

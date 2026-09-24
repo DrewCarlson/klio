@@ -40,8 +40,16 @@ pub const Marker = struct {
     /// Minor collections sweep only the nursery, so marking stops at each
     /// tenured cell; tenure or the remembered set covers its children.
     minor: bool = false,
+    /// `KLIO_GC_VERIFY`: the tenured cell being checked. A child it reaches
+    /// that is an unmarked nursery cell is an edge no write barrier
+    /// recorded; it is reported, not marked.
+    verify_from: ?*GcHeader = null,
 
     pub fn shade(self: *Marker, h: *GcHeader) void {
+        if (self.verify_from) |from| {
+            if (h.gc_gen == 0 and h.gc_mark != self.epoch) verifyReport(from, h);
+            return;
+        }
         if (gc_poison and h.gc_trace == poisonTrap) {
             std.debug.print("\n[GC-POISON-SHADE] root reached SWEPT cell: type={s} ctx={s}:{d}\n", .{ h.gc_type, poison_ctx_name, poison_ctx_idx });
             trace.dumpCurrent(.{});
@@ -364,8 +372,9 @@ pub fn register(h: *GcHeader, bytes: usize) void {
 /// advance the Appel trigger.
 pub fn noteExternalBytes(bytes: usize) void {
     if (!gc_enabled) return;
-    ext_delta += @as(isize, @intCast(@min(bytes, std.math.maxInt(isize))));
-    if (ext_delta >= EXT_FLUSH) flushExternalDelta();
+    const ext = ext_tls.get();
+    ext.delta += @as(isize, @intCast(@min(bytes, std.math.maxInt(isize))));
+    if (ext.delta >= EXT_FLUSH) flushExternalDelta();
 }
 
 /// External bytes released. External buffers are freed explicitly and never
@@ -373,19 +382,23 @@ pub fn noteExternalBytes(bytes: usize) void {
 /// stay on gross accounting.
 pub fn noteExternalFreed(bytes: usize) void {
     if (!gc_enabled) return;
-    ext_delta -= @as(isize, @intCast(@min(bytes, std.math.maxInt(isize))));
-    if (ext_delta <= -EXT_FLUSH) flushExternalDelta();
+    const ext = ext_tls.get();
+    ext.delta -= @as(isize, @intCast(@min(bytes, std.math.maxInt(isize))));
+    if (ext.delta <= -EXT_FLUSH) flushExternalDelta();
 }
 
 /// Per-thread net unflushed external bytes: deltas batch thread-locally and
-/// reach the shared counters `EXT_FLUSH` bytes at a time.
-threadlocal var ext_delta: isize = 0;
+/// reach the shared counters `EXT_FLUSH` bytes at a time. Every arg carrier
+/// taken or returned moves it, so it lives off the thread-local block.
+const ExtDelta = struct { delta: isize = 0 };
+const ext_tls = tls_fast.PerThread(ExtDelta);
 const EXT_FLUSH: isize = 256 * 1024;
 
 pub fn flushExternalDelta() void {
-    const d = ext_delta;
+    const ext = ext_tls.get();
+    const d = ext.delta;
     if (d == 0) return;
-    ext_delta = 0;
+    ext.delta = 0;
     if (d > 0) {
         const b: usize = @intCast(d);
         _ = external_live.fetchAdd(b, .monotonic);
@@ -521,6 +534,10 @@ pub var sweepClosureHook: ?*const fn (epoch: usize) void = null;
 /// non-capturing lambda literal a singleton, so `structuralEq` compares by it.
 pub var closureSingletonHook: ?*const fn (id: u64) u64 = null;
 
+/// Writes what a closure id's `toString` answers, for the host's display of
+/// a closure; false when the host renders it itself.
+pub var closureTextHook: ?*const fn (id: u64, w: *std.Io.Writer) std.Io.Writer.Error!bool = null;
+
 /// Marks the Values reachable from a parked lazy-`sequence{}` continuation, an
 /// `ir.eval.SuspendState` box held opaquely because `runtime` cannot import
 /// `ir`.
@@ -585,6 +602,9 @@ fn markThreadRoots(m: *Marker) void {
 // region. `gc_lock` keeps collection single-collector.
 
 var stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// Bumped as each stop is raised, after `stopped_count` is reset: a thread
+/// still parked for the previous stop sees it change and counts itself again.
+var stop_gen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var parked_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var mutators: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var gc_lock: SpinLock = .{};
@@ -654,10 +674,22 @@ fn parkForStop() void {
     // Increment only for a stop actually in progress: a thread that lost the
     // `gc_lock` race just before the winner raised `stop_flag` would otherwise
     // satisfy the rendezvous and run on through the mark.
-    if (!stop_flag.load(.acquire)) return;
-    // Counted for this stop only; the next raise resets the tally.
-    _ = stopped_count.fetchAdd(1, .acq_rel);
-    spinWait(stopFlagSet);
+    while (stop_flag.load(.acquire)) {
+        // Counted for this stop only; the next raise resets the tally. A stop
+        // raised again before this thread saw the last one end has a tally
+        // without it, so a new generation counts it again.
+        const gen = stop_gen.load(.acquire);
+        _ = stopped_count.fetchAdd(1, .acq_rel);
+        var rounds: u32 = 0;
+        while (stop_flag.load(.acquire) and stop_gen.load(.acquire) == gen) {
+            rounds +|= 1;
+            if (rounds <= 256) {
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        }
+    }
 }
 
 /// Depth of blocking-primitive brackets. Inside one the thread holds no
@@ -713,9 +745,15 @@ pub fn enterBlockingSafe() void {
 /// Wait out an in-progress collection before touching the heap again.
 pub fn exitBlockingSafe() void {
     if (!gc_enabled) return;
-    spinWait(stopFlagSet);
     blocking_safe_depth -|= 1;
     parkUnpublish();
+    // Inside an outer bracket the thread is still counted parked.
+    if (park_depth != 0) return;
+    // Counted as running from the unpublish on. A stop that counted this
+    // thread parked may be marking now, and one raised since needs it parked:
+    // it waits either out as a stopped thread, never between a check and the
+    // unpublish.
+    if (is_mutator) parkForStop() else spinWait(stopFlagSet);
 }
 
 /// `KLIO_GC_DEBUG`: one `[kgc]` line per collection.
@@ -786,7 +824,10 @@ fn collectImpl(force_major: bool) void {
     mutator_lock.lock();
     const others = mutators.load(.acquire) -| 1;
     stopped_count.store(0, .release);
-    if (others != 0) stop_flag.store(true, .release);
+    if (others != 0) {
+        _ = stop_gen.fetchAdd(1, .acq_rel);
+        stop_flag.store(true, .release);
+    }
     mutator_lock.unlock();
     if (others != 0) {
         // Threads in blocking-safe brackets cannot run, so they count parked.
@@ -820,6 +861,7 @@ fn collectImpl(force_major: bool) void {
     // cells the root scan cannot reach. Traced directly, not shaded.
     if (!major) traceRemembered(&marker);
     const marked = marker.drainCounted();
+    if (!major and verifyOn()) verifyTenured(cur_epoch);
     // Drain the remembered set: after a minor every survivor is tenured, after
     // a major the fresh full mark subsumes it. Cleared before the sweep.
     remembered_lock.lock();
@@ -871,6 +913,41 @@ fn collectImpl(force_major: bool) void {
         .{ cur_epoch, if (major) "major" else "minor", marked, live_bytes, freed },
     );
     if (gc_hist) liveTypeHistogram();
+}
+
+var verify_init: bool = false;
+var verify_on: bool = false;
+fn verifyOn() bool {
+    if (!verify_init) {
+        verify_on = std.c.getenv("KLIO_GC_VERIFY") != null;
+        verify_init = true;
+    }
+    return verify_on;
+}
+var verify_reports: usize = 0;
+
+/// Names what holds an unrecorded edge (a class and field), set by the
+/// runtime module that knows the payload types.
+pub var verify_describe: ?*const fn (from: *GcHeader, to: *GcHeader) void = null;
+
+fn verifyReport(from: *GcHeader, to: *GcHeader) void {
+    verify_reports += 1;
+    if (verify_reports > 20) return;
+    std.debug.print("[gc-verify] tenured {s} ({*}, remembered={}) -> unmarked nursery {s} ({*})\n", .{ from.gc_type, from, from.gc_remembered, to.gc_type, to });
+    if (verify_describe) |f| f(from, to);
+    if (verify_reports == 1) trace.dumpCurrent(.{});
+}
+
+/// After a minor mark: every tenured cell's children that are nursery
+/// cells must be marked, or a store into it skipped the write barrier. A
+/// tenured cell that is already unreachable is walked too, so its stale
+/// edges report as well.
+fn verifyTenured(epoch: usize) void {
+    var cur = tenured;
+    while (cur) |t| : (cur = t.gc_next) {
+        var vm: Marker = .{ .epoch = epoch, .arena = std.heap.page_allocator, .verify_from = t };
+        t.gc_trace(t, &vm);
+    }
 }
 
 /// Top live-cell payload types by count, bucketed on `gc_type` pointer
@@ -1049,6 +1126,105 @@ test "write barrier records a tenured cell once and skips nursery cells" {
     remembered.clearRetainingCapacity();
     old.gc_remembered = false;
     remembered_lock.unlock();
+}
+
+/// Raises a stop as `collectImpl` does, for the handshake tests.
+fn testRaiseStop() void {
+    mutator_lock.lock();
+    stopped_count.store(0, .release);
+    _ = stop_gen.fetchAdd(1, .acq_rel);
+    stop_flag.store(true, .release);
+    mutator_lock.unlock();
+}
+
+fn testSleepMs(ms: u32) void {
+    const ts = std.c.timespec{ .sec = 0, .nsec = @as(c_long, ms) * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+/// Waits up to two seconds for `pred`.
+fn testWaitFor(comptime pred: fn () bool) bool {
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        if (pred()) return true;
+        testSleepMs(1);
+    }
+    return pred();
+}
+
+test "a thread parked for a stop counts itself for the next one raised before it saw the first end" {
+    const prev = gc_enabled;
+    gc_enabled = true;
+    defer gc_enabled = prev;
+    const T = struct {
+        var ready = std.atomic.Value(bool).init(false);
+        fn run() void {
+            enterMutator();
+            ready.store(true, .release);
+            while (!stop_flag.load(.acquire)) std.atomic.spinLoopHint();
+            parkForStop();
+            exitMutator();
+        }
+        fn isReady() bool {
+            return ready.load(.acquire);
+        }
+        fn oneStopped() bool {
+            return stopped_count.load(.acquire) == 1;
+        }
+    };
+    const t = try std.Thread.spawn(.{}, T.run, .{});
+    try std.testing.expect(testWaitFor(T.isReady));
+    testRaiseStop();
+    try std.testing.expect(testWaitFor(T.oneStopped));
+    // The stop ends and the next is raised before the parked thread looks.
+    mutator_lock.lock();
+    stopped_count.store(0, .release);
+    _ = stop_gen.fetchAdd(1, .acq_rel);
+    mutator_lock.unlock();
+    const counted = testWaitFor(T.oneStopped);
+    stop_flag.store(false, .release);
+    t.join();
+    try std.testing.expect(counted);
+}
+
+test "a thread leaving a blocking bracket during a stop stays counted and waits it out" {
+    const prev = gc_enabled;
+    gc_enabled = true;
+    defer gc_enabled = prev;
+    const T = struct {
+        var parked = std.atomic.Value(bool).init(false);
+        var go = std.atomic.Value(bool).init(false);
+        var left = std.atomic.Value(bool).init(false);
+        fn run() void {
+            enterMutator();
+            enterBlockingSafe();
+            parked.store(true, .release);
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            exitBlockingSafe();
+            left.store(true, .release);
+            exitMutator();
+        }
+        fn isParked() bool {
+            return parked.load(.acquire);
+        }
+        fn hasLeft() bool {
+            return left.load(.acquire);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, T.run, .{});
+    try std.testing.expect(testWaitFor(T.isParked));
+    testRaiseStop();
+    try std.testing.expectEqual(@as(usize, 1), parked_count.load(.acquire) + stopped_count.load(.acquire));
+    T.go.store(true, .release);
+    testSleepMs(20);
+    const ran_during_stop = T.left.load(.acquire);
+    const counted = parked_count.load(.acquire) + stopped_count.load(.acquire);
+    stop_flag.store(false, .release);
+    try std.testing.expect(testWaitFor(T.hasLeft));
+    t.join();
+    try std.testing.expect(!ran_during_stop);
+    try std.testing.expectEqual(@as(usize, 1), counted);
+    try std.testing.expectEqual(@as(usize, 0), parked_count.load(.acquire));
 }
 
 test "marker shades, drains, and stops at fixpoint without recursion" {

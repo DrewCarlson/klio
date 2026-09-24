@@ -12,5 +12,5 @@ anon: first
 anon: init first=1
 anon: second
 main: anon sum=3
-main: broken -> [FileFailedToInitializeException/IllegalStateException, FileFailedToInitializeException/none]
+main: broken -> [ExceptionInInitializerError/IllegalStateException, NoClassDefFoundError/ExceptionInInitializerError]
 main: end

@@ -2,11 +2,11 @@
 //! kotlinx-io byte surface built on them.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const TMP_DIR = "/tmp/klio_itest_array_bulk_ops";
 
-// One arena for the whole file: process-global lowering/VM state outlives any per-test arena.
+// One arena for the file's runs, reset per program.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
@@ -21,7 +21,7 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    const res = try parity.runWithPacks(a, io, path);
+    const res = try klio_child.runFile(a, path);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {
@@ -218,7 +218,6 @@ test "kotlinx_io_bytestring_encode_decode" {
     const src =
         \\import kotlinx.io.bytestring.encodeToByteString
         \\import kotlinx.io.bytestring.decodeToString
-        \\import kotlinx.io.bytestring.substring
         \\
         \\fun main() {
         \\    val bs = "hello".encodeToByteString()

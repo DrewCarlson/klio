@@ -126,6 +126,7 @@ include = [
     "androidx/compose/material3/internal/FloatProducer.kt",
     "androidx/compose/material3/internal/Icons.kt",
     "androidx/compose/material3/internal/InternalMutatorMutex.kt",
+    "androidx/compose/material3/internal/KeyboardUtil.kt",
     "androidx/compose/material3/internal/LayoutUtil.kt",
     "androidx/compose/material3/internal/LinearWavyProgressModifiers.kt",
     "androidx/compose/material3/internal/MappedInteractionSource.kt",
@@ -273,6 +274,7 @@ root = "klioMain"
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 "androidx.compose.runtime" = "*"
 "androidx.compose.runtime.saveable" = "*"
 "androidx.compose.ui" = "*"

@@ -2,12 +2,11 @@
 //! extensions on nullable and interface receivers.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const TMP_DIR = "/tmp/klio_itest_extension_resolution";
 
-// The pipeline's process-global state points into the run allocator, so one
-// file-scoped arena must outlive every test here.
+// One arena for the file's runs, reset per program.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
@@ -23,7 +22,7 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    const res = try parity.runWithPacks(a, io, path);
+    const res = try klio_child.runFile(a, path);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {
@@ -319,7 +318,10 @@ test "member_extension_unary_operator_on_primitive" {
         \\}
         \\
     ;
-    try assertKlio("member_ext_unary_primitive", src, "1,2,3\n");
+    // kotlinc 2.4.20 prints an empty line: `Int`'s own member `unaryPlus`
+    // shadows the member extension ("this extension is shadowed by a
+    // member"), so `+1` adds nothing.
+    try assertKlio("member_ext_unary_primitive", src, "\n");
 }
 
 test "bare_ext_inline_call_in_class_method_binds_enclosing_class_receiver" {

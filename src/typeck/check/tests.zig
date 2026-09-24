@@ -230,8 +230,7 @@ const Builder = struct {
         return .{ .Call = .{
             .callee = self.dup(Expr, callee),
             .args = self.slice(Expr, args),
-            .arg_names = names,
-            .type_args = self.slice(TypeRef, type_args),
+            .extra = ast.callExtra(self.a(), .{ .arg_names = names, .type_args = self.slice(TypeRef, type_args) }) catch unreachable,
             .is_infix = false,
             .span = self.ts(),
         } };
@@ -2247,7 +2246,7 @@ test "opt_in_marker_propagates" {
     risky.annotations = b.slice(Annotation, &.{b.annotation("Experimental", &.{})});
     const unsafe = b.funExpr("unsafe", &.{}, b.ty("Int"), b.call(b.path("risky"), &.{}));
     var safe = b.funExpr("safe", &.{}, b.ty("Int"), b.call(b.path("risky"), &.{}));
-    const opt_in_arg: Expr = .{ .MemberRef = .{ .receiver = b.dup(Expr, b.path("Experimental")), .name = b.ident("class"), .span = b.ts() } };
+    const opt_in_arg: Expr = .{ .MemberRef = b.dup(ast.MemberRefExpr, .{ .receiver = b.dup(Expr, b.path("Experimental")), .name = b.ident("class"), .span = b.ts() }) };
     safe.annotations = b.slice(Annotation, &.{b.annotation("OptIn", &.{opt_in_arg})});
     const f = b.file(&.{ .{ .Class = experimental }, .{ .Function = risky }, .{ .Function = unsafe }, .{ .Function = safe } });
     var c = checkFile(testing.allocator, &f);

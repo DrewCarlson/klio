@@ -980,6 +980,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
         .singletons_by_id = self.singletons_by_id.clone(),
+        .resolved_state = self.resolved_state,
         .allocator = self.allocator,
     };
     defer {
@@ -1061,7 +1062,7 @@ fn looksConst(tail: []const u8) bool {
 }
 
 /// Synthetic `Thread` static surface: a direct call errors; the static-call
-/// probe routes `sleep`/`currentThread` to `kotlin.concurrent.Thread.*`.
+/// probe routes `sleep`/`currentThread` to `java.lang.Thread.*`.
 fn threadStaticStub(ctx: *CallCtx) Allocator.Error!runtime.EvalResult {
     _ = ctx;
     return .{ .err = .{ .Type = "Thread: use Thread.sleep(ms) / Thread.currentThread()" } };
@@ -1651,7 +1652,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
     }
 
     if (std.mem.eql(u8, name, "Thread")) {
-        return Value.internIntrinsic("kotlin.concurrent.Thread", threadStaticStub);
+        return Value.internIntrinsic("java.lang.Thread", threadStaticStub);
     }
 
     if (std.mem.eql(u8, name, "Delegates")) {

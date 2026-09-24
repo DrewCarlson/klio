@@ -8,28 +8,21 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-const span = @import("span");
-const SourceMap = span.SourceMap;
-
 const pack = @import("pack");
 const bf = pack.bundle_format;
 
 const interp_ir = @import("interp_ir");
-const image = interp_ir.image;
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
-const HostBindings = stdlib.HostBindings;
-const ir_mod = @import("ir");
 
 const compose_ui = @import("compose_ui");
 
 const io = @import("io.zig");
-const commands = @import("commands.zig");
-const pack_cache = @import("pack_cache.zig");
-const stdlib_image = @import("stdlib_image.zig");
 const bundle = @import("bundle.zig");
 const shim_extract = @import("shim_extract.zig");
 const macho_sign = @import("macho_sign.zig");
+const sema_image = @import("sema_image.zig");
+const image_cmd = @import("image_cmd.zig");
 
 const ProbeState = union(enum) {
     unknown,
@@ -183,7 +176,7 @@ pub fn run(gpa: Allocator, argv: []const []const u8) u8 {
         });
         return 1;
     }
-    if (manifest.image_format_version != image.FORMAT_VERSION) {
+    if (manifest.image_format_version != sema_image.bundle_payload_version) {
         io.printStderr(gpa, "error: this bundle was produced by klio {s} but the runtime is {s}; rebundle with a matching klio\n", .{
             manifest.klio_version, bundle.VERSION,
         });
@@ -248,87 +241,33 @@ fn bootRest(
 ) u8 {
     for (manifest.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
 
-    if (manifest.entry.len != 0) {
-        if (bf.findSection(table, bf.section_names.PROGRAM_IMAGE)) |pi_section| {
-            const pi_bytes = bf.sectionStored(bytes, pi_section);
-            const loaded = (image.load(gpa, pi_bytes) catch null) orelse {
-                io.printStderr(gpa, "error: bundle program image rejected ({s}); rebundle\n", .{image.lastLoadFailure()});
-                return 1;
-            };
-            for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
-            const bindings = replayBindings(gpa, loaded.binding_fqns, manifest) orelse return 1;
-            return commands.runBuiltModuleArgs(gpa, loaded.base.built, bindings, loaded.map, "error: no main function found", argv[1..]);
-        }
-        io.writeStderr("error: bundle names an entry but carries no program image; rebundle\n");
-        return 1;
-    }
-
-    const image_section = bf.findSection(table, bf.section_names.BASE_IMAGE) orelse {
-        io.writeStderr("error: bundle carries no base image; rebundle\n");
+    const image_section = bf.findSection(table, bf.section_names.SEMA_IMAGE) orelse {
+        io.writeStderr("error: bundle carries no sema image; rebundle\n");
         return 1;
     };
-    const image_bytes = bf.sectionStored(bytes, image_section);
-    const loaded = (image.load(gpa, image_bytes) catch null) orelse {
-        io.printStderr(gpa, "error: bundle base image rejected ({s}); rebundle\n", .{image.lastLoadFailure()});
-        return 1;
-    };
-    for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
+    const sources = programSources(gpa, bytes, table) orelse return 1;
+    return image_cmd.runOnImage(gpa, bf.sectionStored(bytes, image_section), sources.paths, sources.texts, argv[1..], "rebundle");
+}
 
+/// The program's source files the bundle carries, by path and text.
+fn programSources(gpa: Allocator, bytes: []const u8, table: *const bf.SectionTable) ?struct { paths: []const []const u8, texts: []const []const u8 } {
     const src_section = bf.findSection(table, bf.section_names.PROGRAM_SRC) orelse {
         io.writeStderr("error: bundle carries no program sources; rebundle\n");
-        return 1;
+        return null;
     };
-    const src_bytes = (bf.sectionBytes(gpa, bytes, src_section) catch return 1) orelse return 1;
+    const src_bytes = (bf.sectionBytes(gpa, bytes, src_section) catch return null) orelse return null;
     var perr: pack.PackError = undefined;
-    const sources = (pack.read.decode(bf.ProgramSources, gpa, src_bytes.slice(), &perr) catch return 1) orelse {
+    const sources = (pack.read.decode(bf.ProgramSources, gpa, src_bytes.slice(), &perr) catch return null) orelse {
         io.writeStderr("error: bundle program sources are malformed; rebundle\n");
-        return 1;
+        return null;
     };
-
-    const paths = gpa.alloc([]const u8, sources.files.len) catch return 1;
-    const texts = gpa.alloc([]const u8, sources.files.len) catch return 1;
+    const paths = gpa.alloc([]const u8, sources.files.len) catch return null;
+    const texts = gpa.alloc([]const u8, sources.files.len) catch return null;
     for (sources.files, 0..) |f, i| {
         paths[i] = f.path;
         texts[i] = f.bytes;
     }
-
-    const map = gpa.create(SourceMap) catch return 1;
-    map.* = SourceMap.init(gpa);
-    map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return 1;
-    const user = stdlib_image.parseUserFiles(gpa, map, paths, texts) orelse {
-        io.writeStderr("error: embedded program sources fail to parse; rebundle\n");
-        return 1;
-    };
-
-    if (!interp_ir.build.canExtendBase(loaded.base, user.asts)) {
-        io.writeStderr("error: embedded program cannot extend the bundle base; rebundle\n");
-        return 1;
-    }
-    if (commands.computeEagerCalls(gpa, user.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
-    span.active_map = map;
-    const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user.asts) catch return 1;
-
-    const bindings = replayBindings(gpa, loaded.binding_fqns, manifest) orelse return 1;
-    return commands.runBuiltModuleArgs(gpa, built, bindings, map, "error: no main function found", argv[1..]);
-}
-
-fn replayBindings(
-    gpa: Allocator,
-    binding_fqns: []const []const u8,
-    manifest: *const bf.BundleManifest,
-) ?HostBindings {
-    var bindings = pack_cache.mergedHostBindings(gpa);
-    for (binding_fqns) |fqn| {
-        if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
-    }
-    for (manifest.pack_bindings) |pb| {
-        const f = bindings.resolve(pb.host_symbol) orelse {
-            io.printStderr(gpa, "error: bundle host binding `{s}` does not resolve in this runtime; rebundle with a matching klio\n", .{pb.host_symbol});
-            return null;
-        };
-        bindings.register(gpa.dupe(u8, pb.fqn) catch return null, f) catch {};
-    }
-    return bindings;
+    return .{ .paths = paths, .texts = texts };
 }
 
 /// The mmap-backed resource table served to `klio.bundle.Resources`.

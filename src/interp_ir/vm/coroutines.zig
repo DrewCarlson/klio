@@ -1728,8 +1728,10 @@ threadlocal var drive_count: usize = 0;
 
 /// Drive a persisted continuation to quiescence on the calling thread under a
 /// fresh pump, so a coroutine continues on whichever thread its resume arrived.
-/// A new indefinite park is re-persisted.
-pub fn driveResumed(self: anytype, state_in: SuspendState, value: Value, scope_delta: []const Value, out: Output) Allocator.Error!void {
+/// A new indefinite park is re-persisted. A throw escaping the resumed step
+/// is returned: it runs on the resumer's stack, so the resumer's `resumeWith`
+/// throws it, as the JVM runs an undispatched coroutine.
+pub fn driveResumed(self: anytype, state_in: SuspendState, value: Value, scope_delta: []const Value, out: Output) Allocator.Error!?Value {
     const a = self.allocator;
     drive_depth += 1;
     drive_count += 1;
@@ -1755,19 +1757,26 @@ pub fn driveResumed(self: anytype, state_in: SuspendState, value: Value, scope_d
         .ok => |v| root_value = v,
         .err => |e| switch (e) {
             .Suspended => |st| root_token = try park(a, st, root_scope_base),
-            else => {
-                // The terminal outcome goes through the completion continuation in
-                // the frames; an error escaping raw has no awaiting caller here.
+            .Throw => |v| {
+                const mark = runtime.keepaliveMark();
+                runtime.keepalivePush(v);
+                defer runtime.keepaliveRestore(mark);
                 try pumpExit(self, out, true);
-                return;
+                return v;
+            },
+            else => {
+                // An internal error has no Kotlin caller to throw to.
+                try pumpExit(self, out, true);
+                return null;
             },
         },
     }
     const scope = activeCoroScope() orelse Value.Unit;
     if (try pumpLoop(self, &scope, out, true, false, &root_token, &root_value)) |_| {
-        return;
+        return null;
     }
     try pumpExit(self, out, true);
+    return null;
 }
 
 /// The shared driver pump: start queued launches, resume ready coroutines, advance
@@ -2111,7 +2120,7 @@ fn pumpExit(self: anytype, out: Output, persist: bool) Allocator.Error!void {
     defer if (leftovers.len != 0) a.free(leftovers);
     for (leftovers) |entry| {
         if (PersistedParked.take(entry.slot)) |pe| {
-            try driveResumed(self, pe.state, entry.value, pe.scope_delta, out);
+            _ = try driveResumed(self, pe.state, entry.value, pe.scope_delta, out);
             coroStackAllocator().free(pe.scope_delta);
         }
         // No persisted state: the waiter was abandoned with its driver.
@@ -2326,6 +2335,9 @@ pub fn coroutineStartRootOrSuspended(self: anytype, scope: ?*const Value, block:
         }
     }
 
+    // A fresh root has not parked yet: an earlier start's park must not
+    // make this one's synchronous throw read as its suspended tail's.
+    root_suspension_hit = false;
     try coroPush(a);
     if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     const scope_depth = active_scope_stack.items.len;
@@ -2459,7 +2471,7 @@ pub fn coroutinePopScope() void {
 pub fn coroutineResumeSlotValue(self: anytype, slot: i64, value: Value) void {
     // The waiter may be parked on this thread's pump, on a live pump on another
     // OS thread, or persisted after its pump exited.
-    coroutineResumeExternal(self, slot, value, self.out_sink.output()) catch {};
+    _ = coroutineResumeExternal(self, slot, value, self.out_sink.output()) catch null;
 }
 
 fn parkedFuncName(self: anytype, st: *const SuspendState) []const u8 {
@@ -2639,7 +2651,10 @@ fn syncResumeDelivery() bool {
 /// A Kotlin `Continuation.resumeWith`, run on the caller's stack; the interceptor
 /// already decided whether to dispatch, so only a step this thread's pumps do not
 /// own falls back to the queue or mailbox route.
-pub fn coroutineResumeContinuation(self: anytype, slot: i64, value: Value, out: Output) Allocator.Error!void {
+/// The throw the resumed coroutine let escape on this stack, which the
+/// resumer's `resumeWith` throws; null when it parked, finished or ran
+/// elsewhere.
+pub fn coroutineResumeContinuation(self: anytype, slot: i64, value: Value, out: Output) Allocator.Error!?Value {
     // `KLIO_RESUME_TRACE`: name the resumer, since diagnosing a double delivery
     // needs to know which Kotlin code performed each `resumeWith`.
     if (runtime.envOnce("KLIO_RESUME_TRACE") != null) {
@@ -2651,7 +2666,7 @@ pub fn coroutineResumeContinuation(self: anytype, slot: i64, value: Value, out: 
     const prev = kotlin_resume_delivery;
     kotlin_resume_delivery = true;
     defer kotlin_resume_delivery = prev;
-    if (try coroutineResumeInline(self, slot, value, out)) return;
+    if (try coroutineResumeInline(self, slot, value, out)) return null;
     return coroutineResumeExternal(self, slot, value, out);
 }
 
@@ -2699,7 +2714,7 @@ fn resumePersistedOnTop(self: anytype, pe: PersistedParked.Entry, value: Value, 
     return true;
 }
 
-pub fn coroutineResumeExternal(self: anytype, slot: i64, value: Value, out: Output) Allocator.Error!void {
+pub fn coroutineResumeExternal(self: anytype, slot: i64, value: Value, out: Output) Allocator.Error!?Value {
     if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} tid={d}\n", .{ slot, std.Thread.getCurrentId() });
     // Only the registered owner's pump may serve inline: a coroutine that re-parked
     // on another pump leaves a stale binding that would eat the resume.
@@ -2718,7 +2733,7 @@ pub fn coroutineResumeExternal(self: anytype, slot: i64, value: Value, out: Outp
             }
             if (p.resumeSlotValue(slot, value) catch false) {
                 if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} routed=inline-samethread\n", .{slot});
-                return;
+                return null;
             }
         }
     }
@@ -2756,39 +2771,41 @@ pub fn coroutineResumeExternal(self: anytype, slot: i64, value: Value, out: Outp
                     }
                     if (pumpDiagEnabled()) std.debug.print("[sync] done slot={d} turns={d} spins={d}\n", .{ slot, ww.cell.data.turns.load(.acquire), spins });
                 }
-                return;
+                return null;
             }
             // Mailbox closed: the owner exited and persisted its parked
             // coroutines strictly before closing.
             if (PersistedParked.take(slot)) |pe| {
-                if (try resumePersistedOnTop(self, pe, value, out)) return;
+                if (try resumePersistedOnTop(self, pe, value, out)) return null;
                 if (coroTop()) |top| {
                     try top.adoptPersisted(pe.state, pe.scope_delta, value);
                 } else {
-                    try driveResumed(self, pe.state, value, pe.scope_delta, out);
+                    const thrown = try driveResumed(self, pe.state, value, pe.scope_delta, out);
                     coroStackAllocator().free(pe.scope_delta);
+                    return thrown;
                 }
+                return null;
             }
             // No persisted state either: the waiter was abandoned with its driver.
             if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} DROPPED mailbox-closed no-persist\n", .{slot});
-            return;
+            return null;
         }
         // The owning root already returned, so the state was persisted. Adopt it
         // onto a live pump rather than nesting a fresh drive per unwind hop, which
         // stacks native drivers thousands deep; otherwise claim and drive it here.
         if (PersistedParked.take(slot)) |pe| {
-            if (try resumePersistedOnTop(self, pe, value, out)) return;
+            if (try resumePersistedOnTop(self, pe, value, out)) return null;
             if (coroTop()) |top| {
                 try top.adoptPersisted(pe.state, pe.scope_delta, value);
-                return;
+                return null;
             }
-            try driveResumed(self, pe.state, value, pe.scope_delta, out);
+            const thrown = try driveResumed(self, pe.state, value, pe.scope_delta, out);
             coroStackAllocator().free(pe.scope_delta);
-            return;
+            return thrown;
         }
         if (try SlotOwners.stashPendingIfUnowned(slot, value)) {
             if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} stashed-unowned\n", .{slot});
-            return;
+            return null;
         }
         // An owner registered between the miss and the stash; retry.
     }

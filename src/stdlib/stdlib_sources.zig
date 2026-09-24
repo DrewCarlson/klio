@@ -161,6 +161,11 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "unsigned/src/kotlin/UShortArray.kt",
     "unsigned/src/kotlin/UIntArray.kt",
     "unsigned/src/kotlin/ULongArray.kt",
+    // `toString(radix)`, the `String.toU*` parsers and the bit operations on
+    // the unsigned types. The host binds each of them under its
+    // receiver-qualified name, so the source declares them for resolution.
+    "unsigned/src/kotlin/UStrings.kt",
+    "unsigned/src/kotlin/UNumbers.kt",
     "src/kotlin/util/KotlinVersion.kt",
     "src/kotlin/collections/PrimitiveIterators.kt",
     "src/kotlin/collections/Arrays.kt",
@@ -182,7 +187,9 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/io/encoding/Base64.kt",
     "src/kotlin/coroutines/CoroutinesH.kt",
     "src/kotlin/coroutines/CoroutinesIntrinsicsH.kt",
-    "src/kotlin/coroutines/intrinsics/Intrinsics.kt",
+    // `src/kotlin/coroutines/intrinsics/Intrinsics.kt` is not listed: klio's
+    // `kotlin-coroutines/Intrinsics.kt` takes its place and implements its
+    // `suspendCoroutineUninterceptedOrReturn` intrinsic.
     "common/src/kotlin/collections/AbstractMutableCollection.kt",
     "common/src/kotlin/collections/AbstractMutableList.kt",
     "common/src/kotlin/collections/AbstractMutableMap.kt",
@@ -221,6 +228,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-time/Actuals.kt",
     "kotlin-coroutines/Actuals.kt",
     "kotlin-coroutines/Intrinsics.kt",
+    "kotlin-coroutines/CoroutineStackFrame.kt",
     "kotlin-collections/CollectionsActuals.kt",
     "kotlin-collections/PlatformFactories.kt",
     "kotlin-collections/AbstractMutableCollection.kt",
@@ -244,9 +252,38 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-random/RandomActuals.kt",
     "kotlin-text/TextActuals.kt",
     "kotlin-text/StringFormat.kt",
+    "kotlin-text/StringsPlatform.kt",
+    "kotlin-text/StringBuilderPlatform.kt",
+    "kotlin-util/ExceptionsPlatform.kt",
+    "kotlin-util/AssertionsPlatform.kt",
+    "java-lang/StackTraceElement.kt",
+    "java-lang/Thread.kt",
+    "java-lang/VirtualMachineError.kt",
+    "java-lang/ClassInit.kt",
+    "java-lang/Exceptions.kt",
+    "java-util/Exceptions.kt",
+    "java-security/Exceptions.kt",
     "kotlin-collections/MapActuals.kt",
     "kotlin-uuid/UuidActuals.kt",
     "kotlin-reflect/ReflectActuals.kt",
+};
+
+/// The `actual`s only the sema pipeline adds to the base: declarations the
+/// name-resolving interpreter serves from the host, which the pipeline needs
+/// as Kotlin. The binary carries them for runs outside a checkout.
+pub const SEMA_ACTUALS_DIR = "kotlin-klio/kotlin-sema";
+pub const SEMA_ACTUAL_FILES = [_][]const u8{
+    "CancellationException.kt",
+    "CharacterCodingException.kt",
+    "Collections.kt",
+    "Enum.kt",
+    "Exceptions.kt",
+    "FileInit.kt",
+    "KlioType.kt",
+    "Library.kt",
+    "Regex.kt",
+    "Spread.kt",
+    "Unit.kt",
 };
 
 pub const UPSTREAM_STDLIB_ROOT = "kotlin/libraries/stdlib";

@@ -33,6 +33,7 @@ const ev_inst = @import("inst.zig");
 const ev_leaf = @import("leaf.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
+const ev_resolved = @import("resolved.zig");
 
 const Activation = ev_flow.Activation;
 const EvalError = ev_state.EvalError;
@@ -106,8 +107,12 @@ pub fn runFlatLoop(
                 }
                 break :blk_cm f.module;
             };
+            // A module lowered from sema calls by its tables alone: the seam,
+            // the host routes and the leaf tier serve the name-resolving
+            // lowering only.
+            const resolved_mod = f.module.resolved != null;
             // A host-served compose helper answers before any activation opens; `discardFlatReq` undoes the request.
-            if (site.req.captures.items.len == 0 and site.req.closure_id == null and
+            if (!resolved_mod and site.req.captures.items.len == 0 and site.req.closure_id == null and
                 site.req.type_args.len == 0 and !site.req.composer_pushed)
             {
                 // The seam method tier: a deopt-free compiled method body serves the request natively.
@@ -207,7 +212,7 @@ pub fn runFlatLoop(
                     },
                 }
             }
-            if (leafReqServable(site.req)) {
+            if (!resolved_mod and leafReqServable(site.req)) {
                 // A leaf-expression callee needs no activation: serve it straight into the caller's register.
                 if (try leafExprServe(H, allocator, callee_mod, site.req.func, site.req.args.items, host)) |lr| {
                     const dst = site.req.dst;
@@ -222,7 +227,12 @@ pub fn runFlatLoop(
             if (ev.eval_depth >= maxEvalDepth()) {
                 dumpFrameChainForDiag();
                 discardFlatReq(H, allocator, site.req, host);
-                runwind = .{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" };
+                // Kotlin code catches it as `java.lang.StackOverflowError`.
+                if (try ev_resolved.stackOverflowError(H, allocator, f.module, host)) |exc| {
+                    rthrow = exc;
+                } else {
+                    runwind = .{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" };
+                }
                 cur = site.ret_block;
                 ridx = site.ret_idx;
                 continue;
@@ -388,7 +398,7 @@ pub fn runFlatLoop(
             if (stack.items.len == 0) return res;
             const act = stack.pop().?;
             ev.eval_depth -= 1;
-            res = frameBoundary(act.frame.func, res);
+            if (act.frame.module.resolved == null) res = frameBoundary(act.frame.func, res);
             // A no-driver root's completion drains its pump (launched children, timers) first.
             if (act.root_pump) {
                 if (comptime @hasDecl(H, "rootPumpFlatComplete")) {

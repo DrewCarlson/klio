@@ -4,7 +4,7 @@
 // is dropped instead of binding a null parameter.
 
 class Runner {
-    fun <T> enter(block: () -> T): T = block()
+    inline fun <T> enter(block: () -> T): T = block()
 
     companion object {
         inline fun <R> withThing(block: () -> R): R {

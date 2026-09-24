@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and install the five packs `scripts/compose-test.sh` needs into the
+# Build and install the six packs `scripts/compose-test.sh` needs into the
 # compose itest scratch home, in the dependency order the itest uses.
 #
 # The scratch home lives in /tmp, so anything that prunes /tmp leaves it
@@ -13,6 +13,7 @@ BIN=${1:-zig-out/bin/klio-harness}
 HOME_DIR=${COMPOSE_ITEST_HOME:-/tmp/klio_itest_compose_plugin_home}
 
 PACKS=(
+  "kotlin-klio/klio-androidx-annotation:target/packs/androidx.annotation.klio-pack"
   "kotlin-klio/klio-kotlinx-atomicfu:target/packs/kotlinx.atomicfu.klio-pack"
   "kotlin-klio/klio-kotlin-test:target/packs/kotlin.test.klio-pack"
   "kotlin-klio/klio-kotlinx-coroutines:target/packs/kotlinx.coroutines.klio-pack"

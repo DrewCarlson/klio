@@ -29,24 +29,24 @@ GRAPH = {
     "names": [],
     "diagnostics": ["span"],
     "ast": ["span"],
-    "compose_pass": ["ast", "span", "names"],
     "runtime": ["ast", "span", "names"],
     "types": ["ast", "diagnostics", "span"],
     "lexer": ["diagnostics", "span"],
     "pack": ["ast", "span", "types"],
     "parser": ["ast", "diagnostics", "lexer", "span"],
     "jit": [],
-    "ir": ["span", "ast", "types", "runtime", "diagnostics", "jit", "applicability", "compose_pass"],
+    "ir": ["span", "ast", "runtime", "diagnostics", "jit", "applicability", "sema"],
     "applicability": ["ir", "span"],
     "stdlib": ["runtime", "pack"],
     "cfa": ["ast", "diagnostics", "lexer", "parser", "span", "types"],
     "resolver": ["span", "ast", "diagnostics", "types", "stdlib"],
     "serialization_pass": ["ast", "span", "lexer", "parser", "diagnostics"],
-    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability", "compose_pass", "serialization_pass"],
+    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability"],
     "stdlib_pack": ["pack", "stdlib", "stdlib_embedded"],
     # build.zig generates the real embedded pack; isolated checks use the
     # no-bytes stub so the cwd source checkout stays the pack source.
     "stdlib_embedded": [],
+    "sema_actuals_embedded": [],
     "stdlib_gen": ["pack", "stdlib"],
     "kotlinx_atomicfu": ["runtime", "stdlib"],
     "kotlinx_coroutines": ["runtime", "stdlib"],
@@ -57,21 +57,26 @@ GRAPH = {
     "compose_ui": ["runtime", "stdlib"],
     "ktor_client": ["runtime", "stdlib"],
     "typeck": ["span", "ast", "diagnostics", "resolver", "types", "cfa"],
+    "sema": ["span", "ast", "lexer", "parser"],
+    "lower_driver": ["span", "ast", "lexer", "parser", "sema", "ir", "runtime", "stdlib", "interp_ir"],
     "diagnostics_gen": [],
-    "cli": ["span", "diagnostics", "lexer", "parser", "resolver", "typeck", "ir", "interp_ir", "ast", "pack", "stdlib", "stdlib_pack", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "compose_ui", "ktor_client", "runtime", "types", "test_runner"],
+    "cli": ["sema_actuals_embedded", "span", "diagnostics", "lexer", "parser", "resolver", "typeck", "sema", "serialization_pass", "ir", "interp_ir", "lower_driver", "ast", "pack", "stdlib", "stdlib_pack", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "compose_ui", "ktor_client", "runtime", "types", "test_runner"],
     "test_runner": ["ast", "ir", "runtime", "interp_ir", "span"],
-    "parity": ["ast", "interp_ir", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "compose_ui", "lexer", "pack", "parser", "resolver", "runtime", "span", "stdlib", "stdlib_pack", "typeck"],
-    "e2e": ["parity", "ir", "parser"],
-    "itests": ["parity", "typeck", "resolver", "parser", "lexer", "cfa", "runtime", "ast", "span", "diagnostics", "types", "pack", "ir", "interp_ir", "stdlib"],
-    "bench": ["ast", "interp_ir", "lexer", "parity", "parser", "resolver", "runtime", "span", "typeck"],
+    "klio_child": ["runtime"],
+    "kotlinc_support": ["runtime", "klio_child"],
+    "e2e": ["runtime", "klio_child"],
+    "itests": ["klio_child", "kotlinc_support", "typeck", "resolver", "parser", "lexer", "cfa", "runtime", "ast", "span", "diagnostics", "types", "pack", "ir", "interp_ir", "stdlib"],
+    "bench": ["ast", "ir", "klio_child", "kotlinc_support", "lexer", "lower_driver", "pack", "parser", "runtime", "sema", "span", "stdlib", "stdlib_pack"],
 }
 
 
 # Modules whose root source does not follow the src/<mod>/<mod>.zig pattern.
 PATH_OVERRIDES = {
     "stdlib_embedded": "src/stdlib_pack/embedded_stub.zig",
+    "sema_actuals_embedded": "src/cli/sema_actuals_stub.zig",
     "applicability": "src/ir/applicability.zig",
-    "compose_pass": "src/compose_pass/compose_pass.zig",
+    "klio_child": "src/itests/klio_child.zig",
+    "kotlinc_support": "src/itests/kotlinc_support.zig",
 }
 
 
@@ -140,7 +145,9 @@ def itest_shards():
     mirroring build.zig's itests_files. itests.zig is the monolithic
     aggregate root; running it as one process trips the RSS watchdog."""
     files = sorted(glob.glob("src/itests/*.zig"))
-    return [f for f in files if os.path.basename(f) != "itests.zig"]
+    # Module roots the suites import by name are checked as their own modules.
+    module_roots = set(PATH_OVERRIDES.values())
+    return [f for f in files if os.path.basename(f) != "itests.zig" and f not in module_roots]
 
 
 def run_itest_shards(build_only, mods, jobs):

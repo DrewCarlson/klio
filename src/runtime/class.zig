@@ -5,6 +5,7 @@ const std = @import("std");
 const ast = @import("ast");
 const span = @import("span");
 const objcell = @import("objcell.zig");
+const gc_mod = @import("gc.zig");
 const env_mod = @import("env.zig");
 const value_mod = @import("value.zig");
 const forest = @import("forest.zig");
@@ -109,6 +110,10 @@ pub const ClassDef = struct {
     first_super_index: u8 = 0,
     first_super_fqn: ?[]const u8 = null,
 
+    /// The `ClassId` of this class in code lowered from sema, which the
+    /// bridge assigns; `maxInt(u32)` for a class that code never makes.
+    ir_class: u32 = std.math.maxInt(u32),
+
     /// Memo for the ir-module `ClassId` this class resolves to, so virtual
     /// dispatch skips the string-keyed probe. `resolve_mod` is claimed by the
     /// first resolving module's pointer identity, and `resolve_cid`, the id plus
@@ -160,6 +165,46 @@ pub const ClassDef = struct {
     pub const NestedClass = struct { name: []const u8, class: ObjRef(ClassDef) };
 
     pub const MAX_WALK = 128;
+
+    /// A class only code lowered from sema makes: display names and its
+    /// `ir_class`, every by-name table empty.
+    pub fn minimal(allocator: std.mem.Allocator, name: []const u8, fqn: []const u8, ir_class: u32) !ObjRef(ClassDef) {
+        return ObjRef(ClassDef).init(allocator, .{
+            .name = name,
+            .fqn = fqn,
+            .annotation_names = &.{},
+            .primary_params = &.{},
+            .methods = &.{},
+            .body_properties = &.{},
+            .init_blocks = &.{},
+            .init_block_property_positions = &.{},
+            .is_data = false,
+            .is_value = false,
+            .is_object = false,
+            .is_enum = false,
+            .is_sealed = false,
+            .supertype_names = &.{},
+            .parent = null,
+            .interfaces = &.{},
+            .is_interface = false,
+            .is_fun_interface = false,
+            .parent_ctor_args = &.{},
+            .is_open = false,
+            .is_abstract = false,
+            .is_inner = false,
+            .is_anonymous = false,
+            .secondary_ctors = &.{},
+            .enum_entries = &.{},
+            .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+            .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+            .nested_classes = &.{},
+            .captured_env = try ObjRef(Env).init(allocator, Env.init(allocator)),
+            .supertype_delegates = &.{},
+            .delegate_forwarders = &.{},
+            .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+            .ir_class = ir_class,
+        });
+    }
 
     /// Method, property and init bodies are AST-backed and hold no Value
     /// cells.
@@ -500,6 +545,24 @@ fn internShape(fields: []const InstanceData.Field) usize {
     return @intFromPtr(rec);
 }
 
+/// `KLIO_GC_VERIFY`: for an instance holding an edge no write barrier
+/// recorded, its class and the field that holds the target.
+pub fn describeGcEdge(from: *gc_mod.GcHeader, to: *gc_mod.GcHeader) void {
+    const Ref = objcell.ObjRef(InstanceData);
+    if (!std.mem.eql(u8, std.mem.span(from.gc_type), @typeName(InstanceData))) return;
+    const cb: *Ref.Cell = @fieldParentPtr("hdr", @as(*align(16) gc_mod.GcHeader, @alignCast(from)));
+    const d = &cb.data;
+    const cls = d.class.asPtrConst().name;
+    for (d.fields.items) |f| {
+        if (f.value != .Instance) continue;
+        if (&f.value.Instance.cell.hdr != @as(*align(16) gc_mod.GcHeader, @alignCast(to))) continue;
+        const tcls = f.value.Instance.asPtrConst().class.asPtrConst().name;
+        std.debug.print("[gc-verify]   {s}.{s} holds a {s}\n", .{ cls, f.name, tcls });
+        return;
+    }
+    std.debug.print("[gc-verify]   {s}: the edge is outside its fields (outer, captures or native state)\n", .{cls});
+}
+
 pub const InstanceData = struct {
     class: ObjRef(ClassDef),
     fields: std.ArrayList(Field),
@@ -518,6 +581,9 @@ pub const InstanceData = struct {
     /// one of those names overwrites it where it is instead of moving it to
     /// the tail; zero means the whole list is in append order.
     reserved: u32 = 0,
+    /// The class's id in the tables of code lowered from sema, written once
+    /// at construction; `maxInt` for an instance they do not cover.
+    class_id: u32 = std.math.maxInt(u32),
     /// For an anonymous-object instance, the values it captured, seeding the
     /// method-body env at dispatch. Held per instance, so they are reclaimed
     /// with it; names are borrowed, the slice and values owned.
@@ -572,6 +638,21 @@ pub const InstanceData = struct {
             }
         }
         return false;
+    }
+
+    /// Stores `v` into slot `idx` of `inst` under its exclusive borrow, whose
+    /// write barrier records a tenured instance before it can hold a nursery
+    /// value. Retains `v` and hands back the replaced value for the caller to
+    /// release; null for an index past the last field.
+    pub fn storeSlot(inst: ObjRef(InstanceData), idx: usize, v: Value) ?Value {
+        const g = inst.borrowMut();
+        defer g.deinit();
+        const fields = g.get().fields.items;
+        if (idx >= fields.len) return null;
+        v.retain();
+        const old = fields[idx].value;
+        fields[idx].value = v;
+        return old;
     }
 
     /// Adopts one owned reference to `v`; a caller passing an alias retains
@@ -1401,4 +1482,32 @@ test "ensureNativeState creates once and returns the same payload" {
     defer second.deinit();
     try testing.expect(ObjRef(NativeBox).ptrEq(first, second));
     try testing.expectEqual(@as(u32, 99), InstanceData.nativeStatePtr(Payload, second).n);
+}
+
+test "a slot store into a tenured instance joins the remembered set" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Holder", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+    var fields: std.ArrayList(InstanceData.Field) = .empty;
+    try fields.append(allocator, .{ .name = "head", .value = .Null });
+    const inst = try ObjRef(InstanceData).init(allocator, .{
+        .class = fx.handle.clone(),
+        .fields = fields,
+        .outer = null,
+        .identity = 0,
+        .native_state = null,
+    });
+    defer inst.deinit();
+    const hdr = &inst.cell.hdr;
+    defer gc_mod.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(gc_mod.GcHeader) }});
+    hdr.gc_gen = 1;
+    hdr.gc_remembered = false;
+
+    const old = InstanceData.storeSlot(inst, 0, .{ .Int = 7 }) orelse return error.TestUnexpectedResult;
+    try testing.expect(old == .Null);
+    try testing.expect(hdr.gc_remembered);
+    try testing.expect(InstanceData.storeSlot(inst, 1, .Unit) == null);
+    const g = inst.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(i32, 7), g.get().fields.items[0].value.Int);
 }

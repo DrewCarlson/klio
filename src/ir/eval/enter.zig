@@ -128,64 +128,14 @@ pub fn coerceGenericIntPeersToLong(module: *const Module, func: *const Func, par
         const iv = params[i];
         const ti = func.params[i].ty;
         if (ti.nullable or !isFuncTypeParam(module, func, ti.name)) continue;
-        if (iv == .Int) {
-            var j: usize = 0;
-            while (j < n) : (j += 1) {
-                if (j == i or params[j] != .Long) continue;
-                if (std.mem.eql(u8, func.params[j].ty.name, ti.name)) {
-                    params[i] = .{ .Long = @as(i64, iv.Int) };
-                    break;
-                }
+        if (iv != .Int) continue;
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            if (j == i or params[j] != .Long) continue;
+            if (std.mem.eql(u8, func.params[j].ty.name, ti.name)) {
+                params[i] = .{ .Long = @as(i64, iv.Int) };
+                break;
             }
-            continue;
-        }
-        // The same literal flow one level down: retag Int-kind elements when the peer bound to the same `T` carries Long content.
-        if (iv == .Range or iv == .List) {
-            var j: usize = 0;
-            while (j < n) : (j += 1) {
-                if (j == i) continue;
-                if (!std.mem.eql(u8, func.params[j].ty.name, ti.name)) continue;
-                if (iv == .Range and params[j] == .Range) {
-                    if (iv.Range.kind == .Int and params[j].Range.kind == .Long and !iv.Range.progression) {
-                        iv.Range.kind = .Long;
-                    }
-                    break;
-                }
-                if (iv == .List and params[j] == .List) {
-                    if (peerListIsLongContent(&params[j])) widenIntListContentToLong(&params[i]);
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Whether every element of the peer list is Long-kind content, the evidence inference typed the literal side `Long`.
-fn peerListIsLongContent(v: *const Value) bool {
-    const g = v.List.items.borrow();
-    defer g.deinit();
-    const items = g.get().items;
-    if (items.len == 0) return false;
-    for (items) |*e| {
-        switch (e.*) {
-            .Long => {},
-            .Range => |r| if (r.kind != .Long) return false,
-            else => return false,
-        }
-    }
-    return true;
-}
-
-fn widenIntListContentToLong(v: *Value) void {
-    const g = v.List.items.borrowMut();
-    defer g.deinit();
-    for (g.get().items) |*e| {
-        switch (e.*) {
-            .Int => |x| e.* = .{ .Long = @as(i64, x) },
-            .Range => |r| if (r.kind == .Int and !r.progression) {
-                r.kind = .Long;
-            },
-            else => {},
         }
     }
 }
@@ -344,10 +294,6 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
                 .ContextPush => |x| std.debug.print(" args=r{d}+{d}", .{ x.args.int(), x.n }),
                 .LoadContextParam => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
-                .AstLambda => |x| {
-                    std.debug.print(" dst=r{d} body=#{?d} caps=", .{ x.dst.int(), if (x.body_func) |bf| bf.int() else null });
-                    for (x.captured_names, x.captures) |cn, cr| std.debug.print("{s}=r{d},", .{ cn, cr.int() });
-                },
                 .Call => |x| std.debug.print(" func=#{d} dst=r{d} args=r{d}+{d} exact={}", .{ x.func.int(), x.dst.int(), x.args.int(), x.n_args, x.exact }),
                 .CallValueWithThis => |x| std.debug.print(" callee=r{d} recv=r{d} dst=r{d} args=r{d}+{d} exact={}", .{ x.callee.int(), x.receiver.int(), x.dst.int(), x.args.int(), x.n_args, x.receiver_shape_exact }),
                 .CallValueOrMember => |x| std.debug.print(" name={s} callee=r{d} this=r{d} dst=r{d}", .{ constStr(module, x.name) orelse "?", x.callee.int(), x.this_recv.int(), x.dst.int() }),

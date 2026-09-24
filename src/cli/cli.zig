@@ -2,6 +2,14 @@
 //! `src/main.zig` owns `pub fn main` and calls `cli.run(gpa)` for the exit code.
 
 const std = @import("std");
+const sema_cmd = @import("sema_cmd.zig");
+const sema_run = @import("sema_run.zig");
+const transpile = @import("transpile.zig");
+const sema_test = @import("sema_test.zig");
+const dump_cmd = @import("dump_cmd.zig");
+/// Exported for `klio_rt`, which boots a program over a sema image.
+pub const image_cmd = @import("image_cmd.zig");
+pub const sema_image = @import("sema_image.zig");
 const parser = @import("parser");
 
 const ir = @import("ir");
@@ -12,9 +20,17 @@ const runtime = @import("runtime");
 
 const io = @import("io.zig");
 
-/// Exported for the `klio_rt` C-ABI library, which drives `runFileIrVm` directly.
-pub const commands = @import("commands.zig");
-const DiagFormat = commands.DiagFormat;
+const check_cmd = @import("check_cmd.zig");
+const DiagFormat = check_cmd.DiagFormat;
+const repl = @import("repl.zig");
+const test_report = @import("test_report.zig");
+const leaf_library = @import("leaf_library.zig");
+/// What a natively compiled program and `klio_rt` agree on.
+pub const cgen_abi = @import("cgen/rt_abi.zig");
+/// The run path `klio_rt` boots a program through.
+pub const sema_run_cmd = sema_run;
+/// How the run binds natives, which a natively compiled program binds the same way.
+pub const sema_cmd_mod = sema_cmd;
 
 const pack_cache = @import("pack_cache.zig");
 const resolver = @import("resolver");
@@ -24,8 +40,6 @@ const pack_build = @import("pack_build.zig");
 const project = @import("project.zig");
 const ide = @import("ide.zig");
 const PackCmd = pack_build.PackCmd;
-
-const stdlib_image = @import("stdlib_image.zig");
 
 const unimplemented = @import("unimplemented.zig");
 
@@ -47,8 +61,10 @@ const USAGE =
     \\Commands:
     \\  lex <file>                 Lex a source file and print tokens.
     \\  parse <file>               Parse a source file and print the AST.
-    \\  dump-ir <file> [--func N]  Lower a file and print its IR (no execution),
-    \\                             tallying DIRECT vs DYNAMIC call sites.
+    \\  dump-ir <file> [--func N]  Lower a program and print its IR (no execution),
+    \\                             tallying DIRECT vs DYNAMIC call sites; --all for
+    \\                             the base's functions too.
+    \\  transpile-dump <file>      Print the program's functions as bytecode streams.
     \\  run <file...> [options]    Run one or more `.kt` source files.
     \\                             --language=+Feature[,+Other] enables a parser-gated
     \\                             language feature (kotlinc `-XXLanguage:+Feature`).
@@ -57,18 +73,19 @@ const USAGE =
     \\                             composed `[[test]]` sets; default `.`.
     \\                             --all / --feature X select feature modules.
     \\  check <file...> [options]  Type-check `.kt` files and emit diagnostics.
-    \\  bake [file...] [options]   Bake the stdlib image cache (`klio run` does
-    \\                             this automatically on first use).
+    \\  bake [file...] [options]   Bake the base image the programs run on into the
+    \\                             cache (`klio run` does this on first use).
     \\  bundle <file|dir> [opts]   Package a program (with its baked
     \\                             dependencies, resources, and rendering
     \\                             backend) into one self-contained executable.
-    \\  bake-image <file> -o <p>   Bake the dependency base (stdlib + the
-    \\                             program's packs) to a standalone .klio-image.
-    \\  run-image <base> <file>    Run a program against a pre-baked base image.
-    \\  transpile <file> [-o out]  Emit the program as C over the klio_rt per-op
-    \\                             ABI plus its pinned base image (out.c +
-    \\                             out.klio-image; compile with zig cc +
-    \\                             libklio_rt.a).
+    \\  bake-image <file> -o <p>   Bake the program's base (stdlib + its packs) to
+    \\                             a self-contained image, sources included.
+    \\  run-image <base> <file>    Run a program over a baked image, with no data
+    \\                             home or pack install.
+    \\  transpile <file> [-o out]  Emit a C launcher and the program's sema image
+    \\                             (out.c + out.klio-image; compile with zig cc +
+    \\                             libklio_rt.a); --native compiles the program
+    \\                             itself to C.
     \\  repl                       Start an interactive REPL.
     \\  pack <subcommand>          Build or inspect a `.klio-pack` artifact.
     \\  ide <subcommand>           Emit the project model an editor builds its
@@ -81,10 +98,9 @@ const USAGE =
     \\
     \\Run options:
     \\  --virtual-time             Use deterministic virtual time for coroutines.
-    \\  --lazy-bodies              On a cold run, start before the stdlib's bodies lower:
-    \\                             each lowers on its first call and the image completes
-    \\                             after the program (KLIO_LAZY_BODIES=1, or lazy_bodies
-    \\                             under [application] in klio.toml).
+    \\  --lazy-bodies              No effect, kept for existing scripts: a run's base
+    \\                             comes from its base image, baked once, so no stdlib
+    \\                             body is left to lower lazily.
     \\  --feature <pack>/<feature> Enable a pack feature (repeatable).
     \\
     \\Test options:
@@ -120,8 +136,8 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     // machine, and arm the opt-in wall-clock deadline. Both are call-once.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
-    commands.loadLeafLibrary();
-    defer commands.leafDiagDump();
+    leaf_library.loadLeafLibrary();
+    defer leaf_library.leafDiagDump();
 
     // An appended bundle payload takes over: argv[1..] belongs to the embedded program.
     if (bundle_boot.bundleModeActive()) {
@@ -153,13 +169,7 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     } else if (std.mem.eql(u8, cmd, "dump-ir")) {
         return runDumpIrCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "transpile-dump")) {
-        if (rest.len != 1) {
-            printErr(gpa, "usage: klio transpile-dump <file.kt>\n", .{});
-            return 2;
-        }
-        var features = commands.RequestedFeatures.init(gpa);
-        defer features.deinit();
-        return commands.runTranspileDump(gpa, rest[0], &features);
+        return runTranspileDumpCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "transpile")) {
         var files: std.ArrayList([]const u8) = .empty;
         defer files.deinit(gpa);
@@ -199,10 +209,8 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
             printErr(gpa, "usage: klio transpile <file.kt> [more.kt ...] [-o out.c] [--feature <pack>/<feat>] [--language=<spec>]\n", .{});
             return 2;
         }
-        var requested = parseRequestedFeatures(gpa, feature_specs.items);
-        defer deinitRequestedFeatures(&requested);
-        if (native) return commands.runTranspileNative(gpa, files.items, out, &requested);
-        return commands.runTranspile(gpa, files.items, out, &requested);
+        if (native) return transpile.runNative(gpa, files.items, out, feature_specs.items);
+        return transpile.runLauncher(gpa, files.items, out, feature_specs.items);
     }
     if (std.c.getenv("KLIO_LANGUAGE")) |env_specs| applyLanguageSpecs(std.mem.span(env_specs));
     if (std.mem.eql(u8, cmd, "run")) {
@@ -211,8 +219,10 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
         return runTestCmd(gpa, rest, argv[0]);
     } else if (std.mem.eql(u8, cmd, "check")) {
         return runCheckCmd(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "sema")) {
+        return sema_cmd.run(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "repl")) {
-        return commands.runRepl(gpa);
+        return repl.runRepl(gpa);
     } else if (std.mem.eql(u8, cmd, "pack")) {
         return runPackCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "ide")) {
@@ -222,7 +232,7 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     } else if (std.mem.eql(u8, cmd, "bundle")) {
         return bundle.runBundle(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "bake-image")) {
-        return runBakeImageCmd(gpa, rest, argv[0]);
+        return runBakeImageCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "run-image")) {
         return runRunImageCmd(gpa, rest);
     }
@@ -232,16 +242,15 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
 }
 
 fn usageBakeImage(gpa: std.mem.Allocator) u8 {
-    printErr(gpa, "usage: klio bake-image <program.kt> -o <base.klio-image> [--feature <pack>/<feat>]\n       klio bake-image --stdlib-cache <dir>\n", .{});
+    printErr(gpa, "usage: klio bake-image <program.kt...> -o <base.klio-image> [--feature <pack>/<feat>]\n       klio bake-image --stdlib-cache <dir>\n", .{});
     return 2;
 }
 
-fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []const u8) u8 {
+fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var out: ?[]const u8 = null;
-    var program: ?[]const u8 = null;
+    var programs: std.ArrayList([]const u8) = .empty;
+    defer programs.deinit(gpa);
     var stdlib_cache: ?[]const u8 = null;
-    // The child half of `--stdlib-cache`: one probe's image in this process.
-    var probe: ?[]const u8 = null;
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
     var i: usize = 0;
@@ -255,35 +264,26 @@ fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: [
             i += 1;
             if (i >= args.len) return usageBakeImage(gpa);
             stdlib_cache = args[i];
-        } else if (std.mem.eql(u8, a, "--probe")) {
-            i += 1;
-            if (i >= args.len) return usageBakeImage(gpa);
-            probe = args[i];
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
             if (i >= args.len) return usageBakeImage(gpa);
             feature_specs.append(gpa, args[i]) catch return 1;
-        } else if (program == null) {
-            program = a;
-        } else {
+        } else if (optionValue(a, "--feature=")) |v| {
+            feature_specs.append(gpa, v) catch return 1;
+        } else if (optionValue(a, "--language=")) |v| {
+            applyLanguageSpecs(v);
+        } else if (std.mem.startsWith(u8, a, "--")) {
             return usageBakeImage(gpa);
+        } else {
+            programs.append(gpa, a) catch return 1;
         }
     }
-    var requested = parseRequestedFeatures(gpa, feature_specs.items);
-    defer deinitRequestedFeatures(&requested);
     if (stdlib_cache) |dir| {
-        if (program != null or out != null) return usageBakeImage(gpa);
-        const cache_rc = stdlib_image.bakeStdlibCache(gpa, dir, &requested, self_exe, probe);
-        commands.lowerCensusDump();
-        return cache_rc;
+        if (programs.items.len != 0 or out != null) return usageBakeImage(gpa);
+        return image_cmd.bakeStdlibCache(gpa, dir);
     }
-    if (probe != null) return usageBakeImage(gpa);
-    if (program == null or out == null) return usageBakeImage(gpa);
-    const rc = bundle.bakeImage(gpa, &.{program.?}, &requested, out.?);
-    // Nearly every library site is lowered here, not at `run`, so the lowering
-    // census is only complete when read from a bake.
-    commands.lowerCensusDump();
-    return rc;
+    if (programs.items.len == 0 or out == null) return usageBakeImage(gpa);
+    return image_cmd.bakeImage(gpa, programs.items, feature_specs.items, out.?);
 }
 
 fn runRunImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -291,7 +291,7 @@ fn runRunImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         printErr(gpa, "usage: klio run-image <base.klio-image> <program.kt> [args...]\n", .{});
         return 2;
     }
-    return bundle.runImage(gpa, args[0], &.{args[1]}, args[2..]);
+    return image_cmd.runImage(gpa, args[0], &.{args[1]}, args[2..]);
 }
 
 fn runLexCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -299,7 +299,7 @@ fn runLexCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         printErr(gpa, "usage: klio lex <file.kt>\n", .{});
         return 2;
     }
-    return commands.runLex(gpa, args[0]);
+    return check_cmd.runLex(gpa, args[0]);
 }
 
 fn runParseCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -307,11 +307,16 @@ fn runParseCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         printErr(gpa, "usage: klio parse <file.kt>\n", .{});
         return 2;
     }
-    return commands.runParse(gpa, args[0]);
+    return check_cmd.runParse(gpa, args[0]);
 }
 
+const dump_ir_usage = "usage: klio dump-ir <file.kt...> [--func NAME] [--all] [--feature <pack>/<feat>]\n";
+
 fn runDumpIrCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
-    var file: ?[]const u8 = null;
+    var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(gpa);
+    var feature_specs: std.ArrayList([]const u8) = .empty;
+    defer feature_specs.deinit(gpa);
     var opts: ir.disasm.Options = .{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -321,34 +326,70 @@ fn runDumpIrCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, a, "--func")) {
             i += 1;
             if (i >= args.len) {
-                printErr(gpa, "usage: klio dump-ir <file.kt> [--func NAME] [--all]\n", .{});
+                printErr(gpa, dump_ir_usage, .{});
                 return 2;
             }
             opts.func_filter = args[i];
         } else if (optionValue(a, "--func=")) |v| {
             opts.func_filter = v;
+        } else if (std.mem.eql(u8, a, "--feature")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, dump_ir_usage, .{});
+                return 2;
+            }
+            feature_specs.append(gpa, args[i]) catch return 2;
+        } else if (optionValue(a, "--feature=")) |v| {
+            feature_specs.append(gpa, v) catch return 2;
+        } else if (optionValue(a, "--language=")) |v| {
+            applyLanguageSpecs(v);
         } else if (std.mem.startsWith(u8, a, "--")) {
             printErr(gpa, "error: unknown option `{s}`\n", .{a});
             return 2;
         } else {
-            file = a;
+            files.append(gpa, a) catch return 2;
         }
     }
-    if (file == null) {
-        printErr(gpa, "usage: klio dump-ir <file.kt> [--func NAME] [--all]\n", .{});
+    if (files.items.len == 0) {
+        printErr(gpa, dump_ir_usage, .{});
         return 2;
     }
-    var requested = parseRequestedFeatures(gpa, &.{});
-    defer deinitRequestedFeatures(&requested);
-    return commands.runDumpIr(gpa, file.?, opts, &requested);
+    return dump_cmd.dumpIr(gpa, files.items, feature_specs.items, opts);
 }
 
-/// `KLIO_LAZY_BODIES`: `1`/`true` on, `0`/`false` off, null otherwise.
-fn lazyBodiesFromEnv() ?bool {
-    const v = runtime.envOnce("KLIO_LAZY_BODIES") orelse return null;
-    if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) return true;
-    if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) return false;
-    return null;
+const transpile_dump_usage = "usage: klio transpile-dump <file.kt...> [--feature <pack>/<feat>]\n";
+
+fn runTranspileDumpCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(gpa);
+    var feature_specs: std.ArrayList([]const u8) = .empty;
+    defer feature_specs.deinit(gpa);
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--feature")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, transpile_dump_usage, .{});
+                return 2;
+            }
+            feature_specs.append(gpa, args[i]) catch return 2;
+        } else if (optionValue(a, "--feature=")) |v| {
+            feature_specs.append(gpa, v) catch return 2;
+        } else if (optionValue(a, "--language=")) |v| {
+            applyLanguageSpecs(v);
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            printErr(gpa, "error: unknown option `{s}`\n", .{a});
+            return 2;
+        } else {
+            files.append(gpa, a) catch return 2;
+        }
+    }
+    if (files.items.len == 0) {
+        printErr(gpa, transpile_dump_usage, .{});
+        return 2;
+    }
+    return dump_cmd.transpileDump(gpa, files.items, feature_specs.items);
 }
 
 fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -357,17 +398,15 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
     var virtual_time = false;
-    var lazy_bodies: ?bool = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--virtual-time")) {
             virtual_time = true;
-        } else if (std.mem.eql(u8, a, "--lazy-bodies")) {
-            lazy_bodies = true;
-        } else if (std.mem.eql(u8, a, "--no-lazy-bodies")) {
-            lazy_bodies = false;
+        } else if (std.mem.eql(u8, a, "--lazy-bodies") or std.mem.eql(u8, a, "--no-lazy-bodies")) {
+            // Accepted for existing scripts: the base image leaves no body
+            // to lower lazily.
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
             if (i >= args.len) {
@@ -395,9 +434,6 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     if (virtual_time) {
         interp_ir.setCoroutineTimeMode(.Virtual);
     }
-    // The flag, then the environment, then the working directory's klio.toml.
-    runtime.lazy_bodies = lazy_bodies orelse lazyBodiesFromEnv() orelse project.lazyBodiesFromToml(gpa, ".") orelse false;
-
     if (files.items.len == 0) {
         printErr(gpa, "usage: klio run <file.kt> [<file2.kt> ...]\n", .{});
         return 2;
@@ -408,12 +444,7 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     for (project.declaredFeatureSpecs(gpa, files.items)) |spec| {
         feature_specs.append(gpa, spec) catch return 2;
     }
-    var requested = parseRequestedFeatures(gpa, feature_specs.items);
-    defer deinitRequestedFeatures(&requested);
-    if (files.items.len == 1) {
-        return commands.runFileIrVm(gpa, files.items[0], &requested);
-    }
-    return commands.runModuleFiles(gpa, files.items, &requested);
+    return sema_run.run(gpa, files.items, feature_specs.items);
 }
 
 fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []const u8) u8 {
@@ -430,7 +461,7 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
     var test_group: ?[]const u8 = null;
     var virtual_time = false;
     var filter: ?[]const u8 = null;
-    var test_format: commands.TestFormat = .plain;
+    var test_format: test_report.TestFormat = .plain;
     var list_only = false;
     var isolate = false;
     var jobs: usize = 1;
@@ -549,8 +580,12 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
         interp_ir.setCoroutineTimeMode(.Virtual);
     }
 
-    var requested = parseRequestedFeatures(gpa, feature_specs.items);
-    defer deinitRequestedFeatures(&requested);
+    const sema_opts: sema_test.Options = .{
+        .only_files = only_files.items,
+        .filter = filter,
+        .format = test_format,
+        .list_only = list_only,
+    };
 
     if (paths.items.len == 0) paths.append(gpa, ".") catch return 2;
 
@@ -579,7 +614,7 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
             base.append(gpa, "--filter") catch return 2;
             base.append(gpa, f) catch return 2;
         }
-        return commands.runTestsIsolated(gpa, self_exe, base.items, timeout_s);
+        return test_report.runTestsIsolated(gpa, self_exe, base.items, timeout_s);
     }
 
     // Project mode: a directory carrying `klio.toml` with `[[test]]` sets runs that
@@ -625,27 +660,31 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
                 if (list_only) base.append(gpa, "--list") catch return 2;
                 base.append(gpa, "--format") catch return 2;
                 base.append(gpa, @tagName(test_format)) catch return 2;
-                return commands.runTestGroups(gpa, self_exe, names.items, base.items);
+                return test_report.runTestGroups(gpa, self_exe, names.items, base.items);
             };
 
             for (plan.groups) |group| {
                 if (!std.mem.eql(u8, group.name, only)) continue;
-                activateFeatures(gpa, &requested, plan.pack_id, group.active_features);
-                return commands.runTestFiles(
-                    gpa,
-                    group.roots,
-                    &requested,
-                    only_files.items,
-                    filter,
-                    test_format,
-                    list_only,
-                );
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                const specs = groupFeatureSpecs(arena.allocator(), feature_specs.items, plan.pack_id, group.active_features) catch return 2;
+                return sema_test.run(gpa, group.roots, specs, sema_opts);
             }
             printErr(gpa, "error: no test group named `{s}`\n", .{only});
             return 2;
         }
     }
-    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter, test_format, list_only);
+    return sema_test.run(gpa, paths.items, feature_specs.items, sema_opts);
+}
+
+/// The feature requests a project's test group runs under on the sema
+/// pipeline: the command line's, then each feature the group activates, as
+/// `<pack>/<feature>` of the project's own pack.
+fn groupFeatureSpecs(a: std.mem.Allocator, given: []const []const u8, pack_id: []const u8, active: []const []const u8) ![]const []const u8 {
+    var specs: std.ArrayList([]const u8) = .empty;
+    try specs.appendSlice(a, given);
+    for (active) |f| try specs.append(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ pack_id, f }));
+    return specs.items;
 }
 
 /// `<pack>/<feat>` keeps its cross-pack meaning; a bare `<feat>` selects the project's own.
@@ -659,21 +698,6 @@ fn addFeatureSpec(
         feature_specs.append(gpa, v) catch {};
     } else {
         project_features.append(gpa, v) catch {};
-    }
-}
-
-/// Files the pack loader with these under `pack_id`, so its feature sources load.
-fn activateFeatures(
-    gpa: std.mem.Allocator,
-    requested: *RequestedFeatures,
-    pack_id: []const u8,
-    features: []const []const u8,
-) void {
-    if (pack_id.len == 0 or features.len == 0) return;
-    const gop = requested.getOrPut(pack_id) catch return;
-    if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(gpa);
-    for (features) |f| {
-        if (!gop.value_ptr.contains(f)) gop.value_ptr.put(f, {}) catch {};
     }
 }
 
@@ -720,11 +744,7 @@ fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         }
     }
 
-    var requested = parseRequestedFeatures(gpa, feature_specs.items);
-    defer deinitRequestedFeatures(&requested);
-    const code = stdlib_image.runBake(gpa, files.items, &requested);
-    stdlib_image.finishBackgroundBake();
-    return code;
+    return image_cmd.bake(gpa, files.items, feature_specs.items);
 }
 
 fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -785,7 +805,7 @@ fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     if (want_unimplemented) {
         return unimplemented.runCheckUnimplemented(gpa, files.items, &requested);
     }
-    return commands.runCheck(gpa, files.items, format, &requested);
+    return check_cmd.runCheck(gpa, files.items, format, &requested);
 }
 
 fn runPackCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -914,7 +934,7 @@ fn perfOptValue(a: []const u8, args: []const []const u8, i: *usize) ?[]const u8 
 }
 
 /// A spec with no `/` names no pack, so it is reported and skipped.
-fn parseRequestedFeatures(gpa: std.mem.Allocator, specs: []const []const u8) RequestedFeatures {
+pub fn parseRequestedFeatures(gpa: std.mem.Allocator, specs: []const []const u8) RequestedFeatures {
     var out = RequestedFeatures.init(gpa);
     for (specs) |spec| {
         if (std.mem.findScalar(u8, spec, '/')) |slash| {
@@ -958,11 +978,13 @@ fn printErr(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) voi
 
 test {
     std.testing.refAllDecls(@This());
-    std.testing.refAllDecls(commands);
     std.testing.refAllDecls(pack_cache);
     std.testing.refAllDecls(pack_build);
     std.testing.refAllDecls(unimplemented);
-    std.testing.refAllDecls(stdlib_image);
+    std.testing.refAllDecls(check_cmd);
+    std.testing.refAllDecls(repl);
+    std.testing.refAllDecls(test_report);
+    std.testing.refAllDecls(leaf_library);
     std.testing.refAllDecls(io);
     std.testing.refAllDecls(bundle);
     std.testing.refAllDecls(bundle_boot);
@@ -981,6 +1003,15 @@ test "parseFormat maps known formats" {
 test "optionValue extracts =value" {
     try std.testing.expectEqualStrings("json", optionValue("--format=json", "--format=").?);
     try std.testing.expect(optionValue("--format", "--format=") == null);
+}
+
+test "a project's test group asks for its features of the project's pack" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const specs = try groupFeatureSpecs(arena.allocator(), &.{"kotlinx.io/core"}, "kotlinx.coroutines", &.{"test"});
+    try std.testing.expectEqual(@as(usize, 2), specs.len);
+    try std.testing.expectEqualStrings("kotlinx.io/core", specs[0]);
+    try std.testing.expectEqualStrings("kotlinx.coroutines/test", specs[1]);
 }
 
 test "parseRequestedFeatures splits pack/feature" {

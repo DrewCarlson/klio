@@ -3074,7 +3074,10 @@ pub const Value = union(enum) {
                     try writer.print(" step {d}", .{-r.step});
                 }
             },
-            .IrClosure => |c| try writer.print("{{ir-closure#{d}}}", .{c.asPtr().id}),
+            .IrClosure => |c| {
+                if (objcell.gc.closureTextHook) |h| if (try h(c.asPtr().id, writer)) return;
+                try writer.print("{{ir-closure#{d}}}", .{c.asPtr().id});
+            },
             .Intrinsic => |i| try writer.print("fun {s}(...)", .{i.fqn}),
             .BoundMethod => |m| try writer.print("fun {s}(...)", .{m.fqn}),
             .Exception => |e| {

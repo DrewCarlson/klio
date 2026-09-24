@@ -23,7 +23,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Recomposer
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.autofill.AutofillTree
 import androidx.compose.ui.node.MeasureAndLayoutDelegate
@@ -223,7 +225,7 @@ internal class KlioGraphicsContext : GraphicsContext {
 
     override fun releaseGraphicsLayer(layer: GraphicsLayer) {}
 
-    override val shadowContext: androidx.compose.ui.graphics.ShadowContext
+    override val shadowContext: androidx.compose.ui.graphics.shadow.ShadowContext
         get() = throw UnsupportedOperationException("klio: drop-shadow context not yet supported")
 }
 
@@ -390,6 +392,9 @@ internal class KlioComposeOwner(
     override val clipboard: Clipboard = KlioClipboard
     override val accessibilityManager: AccessibilityManager = KlioAccessibilityManager
     override val graphicsContext: GraphicsContext = KlioGraphicsContext()
+    // No window-level retain scenario (configuration changes) exists here.
+    override val retainedValuesStore: androidx.compose.runtime.retain.RetainedValuesStore =
+        androidx.compose.runtime.retain.ForgetfulRetainedValuesStore
     override val textToolbar: TextToolbar = KlioTextToolbar
 
     @Suppress("DEPRECATION")

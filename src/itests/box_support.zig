@@ -6,6 +6,7 @@
 //! unrecognized directive excludes the test under `unknown:<NAME>`.
 const std = @import("std");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
 pub const CORPUS = "kotlin/compiler/testData/codegen/box";
 pub const HELPERS_DIR = "kotlin/compiler/testData/diagnostics/helpers/coroutines";
@@ -37,8 +38,14 @@ const BACKEND_NAME = "KLIO";
 /// `Any?.toString()` over a nullable unsigned took the inline-class one, and
 /// initialising a superclass's companion first took three more, and a written type
 /// argument on an object qualifier took the callable-reference one.
-pub const BASELINE: usize = 6064;
-pub const MAX_FAILED: usize = 329;
+///
+/// Honoring `IGNORE_BACKEND: JVM_IR`, the tests kotlinc's own JVM backend does
+/// not pass, excluded 42 selected tests: 28 that passed on the name-resolving
+/// pipeline and 14 that failed there. The floor and the ceiling drop by those.
+///
+/// On the sema pipeline the census measured 6245 passed and 107 failed.
+pub const BASELINE: usize = 6245;
+pub const MAX_FAILED: usize = 107;
 
 /// Directives binding a test to a framework feature with no klio counterpart:
 /// a backend restriction, a second module, reflection, JDK classes, compiler
@@ -187,6 +194,12 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
                     // Muted on every backend under the current frontend; the
                     // K1 and multi-module spellings stay selected.
                     reason = reason orelse try std.fmt.allocPrint(a, "{s}:ANY", .{d.name});
+                } else if ((std.mem.eql(u8, d.name, "IGNORE_BACKEND") or std.mem.eql(u8, d.name, "IGNORE_BACKEND_K2")) and
+                    namesJvmBackend(d.value))
+                {
+                    // kotlinc's JVM backend does not pass it, and klio answers
+                    // as that backend does.
+                    reason = reason orelse try std.fmt.allocPrint(a, "{s}:JVM", .{d.name});
                 } else if (std.mem.eql(u8, d.name, "DONT_TARGET_EXACT_BACKEND") and namesJvmBackend(d.value)) {
                     // Asserts a non-JVM backend's behavior.
                     reason = reason orelse "DONT_TARGET_EXACT_BACKEND:JVM";
@@ -267,16 +280,26 @@ pub fn stripDiagnosticMarkup(a: std.mem.Allocator, text: []const u8) ![]const u8
     return out.toOwnedSlice(a);
 }
 
+/// The package of the synthesized entry. kotlinc's harness calls `box()`
+/// without a `main` of its own, so the entry stays out of the test's
+/// packages: a test that declares its own `main` keeps it, with no
+/// conflicting overload. Passed last, it is the `main` the run takes.
+const ENTRY_PACKAGE = "klio.box.entry";
+
 pub fn synthesizedMain(a: std.mem.Allocator, c: *const Case) ![]const u8 {
-    const import_line = if (c.package) |p| try std.fmt.allocPrint(a, "import {s}.box\n", .{p}) else "";
+    const box_fqn = if (c.package) |p| try std.fmt.allocPrint(a, "{s}.box", .{p}) else "box";
     return std.fmt.allocPrint(a,
-        \\{s}fun main() {{
+        \\package {s}
+        \\
+        \\import {s}
+        \\
+        \\fun main() {{
         \\    val r = box()
         \\    if (r != "OK") throw AssertionError("box() returned " + r)
         \\    kotlin.io.println("BOX-OK")
         \\}}
         \\
-    , .{import_line});
+    , .{ ENTRY_PACKAGE, box_fqn });
 }
 
 pub const Summary = struct {
@@ -324,20 +347,6 @@ fn runChild(a: std.mem.Allocator, env: *std.process.Environ.Map, argv: []const [
         return e;
     };
     return .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr };
-}
-
-/// Installed into the scratch home once per census.
-fn installKotlinTest(a: std.mem.Allocator, env: *std.process.Environ.Map, bin: []const u8, cap_ms: i64) !void {
-    const b = try runChild(a, env, &.{ bin, "pack", "build", "kotlin-klio/klio-kotlin-test" }, cap_ms);
-    if (b.term != .exited or b.term.exited != 0) {
-        std.debug.print("box_conformance: kotlin.test pack build failed:\n{s}\n", .{b.stderr});
-        return error.PackBuildFailed;
-    }
-    const i = try runChild(a, env, &.{ bin, "pack", "install", "target/packs/kotlin.test.klio-pack" }, cap_ms);
-    if (i.term != .exited or i.term.exited != 0) {
-        std.debug.print("box_conformance: kotlin.test pack install failed:\n{s}\n", .{i.stderr});
-        return error.PackInstallFailed;
-    }
 }
 
 fn firstLine(s: []const u8) []const u8 {
@@ -425,14 +434,15 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
     };
     var env = std.process.Environ.Map.init(a);
     runtime.procEnvPutAllInto(a, &env);
-    try env.put("HOME", SCRATCH_HOME);
+    const home = try klio_child.home(a);
+    try env.put("HOME", home);
+    try env.put("KLIO_HOME", home);
     const bin = klioBin(&env);
     const slowdown: i64 = if (std.mem.endsWith(u8, bin, "-Debug")) 4 else 1;
     const timeout_ms: i64 = @as(i64, @intCast(envUsize("KLIO_BOX_TIMEOUT_MS", 60_000))) * slowdown;
     const filter: ?[]const u8 = if (std.c.getenv("KLIO_BOX_FILTER")) |v| std.mem.span(v) else null;
 
     std.Io.Dir.cwd().createDirPath(io, SCRATCH_HOME) catch {};
-    try installKotlinTest(a, &env, bin, 120_000 * slowdown);
 
     var files: std.ArrayList([]const u8) = .empty;
     try collectKt(a, io, CORPUS, &files);
@@ -445,8 +455,11 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
     var summary: Summary = .{ .total = files.items.len };
     var reasons = std.StringHashMap(usize).init(a);
     var jobs: std.ArrayList(Job) = .empty;
-    const cases_dir = SCRATCH_HOME ++ "/cases";
+    // A run of its own: two censuses at once must not rewrite each other's cases.
+    const cases_dir = try std.fmt.allocPrint(a, "{s}/cases-{d}", .{ SCRATCH_HOME, std.c.getpid() });
+    std.Io.Dir.cwd().deleteTree(io, cases_dir) catch {};
     std.Io.Dir.cwd().createDirPath(io, cases_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, cases_dir) catch {};
     for (files.items) |path| {
         const rel = path[CORPUS.len + 1 ..];
         if (filter) |f| if (std.mem.find(u8, rel, f) == null) continue;
@@ -550,6 +563,32 @@ test "a test that does not target the JVM backend is excluded" {
     try std.testing.expect(not_js.reason == null);
 }
 
+test "a test kotlinc's JVM backend is muted on is excluded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const jvm_ir = try parseCase(a, "x/a.kt", "// IGNORE_BACKEND: JS_IR, JVM_IR\nfun box() = \"OK\"\n");
+    try std.testing.expectEqualStrings("IGNORE_BACKEND:JVM", jvm_ir.reason.?);
+    const k2 = try parseCase(a, "x/b.kt", "// IGNORE_BACKEND_K2: JVM\nfun box() = \"OK\"\n");
+    try std.testing.expectEqualStrings("IGNORE_BACKEND_K2:JVM", k2.reason.?);
+    const k1 = try parseCase(a, "x/c.kt", "// IGNORE_BACKEND_K1: JVM_IR\nfun box() = \"OK\"\n");
+    try std.testing.expect(k1.reason == null);
+    const js = try parseCase(a, "x/d.kt", "// IGNORE_BACKEND: JS_IR, NATIVE\nfun box() = \"OK\"\n");
+    try std.testing.expect(js.reason == null);
+    const serialize = try parseCase(a, "x/e.kt", "// IGNORE_BACKEND: JVM_IR_SERIALIZE\nfun box() = \"OK\"\n");
+    try std.testing.expect(serialize.reason == null);
+}
+
+test "the entry is in a package of its own, so a test's own main is no overload of it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const c = try parseCase(arena.allocator(), "x/m.kt", "fun box(): String { main(); return \"OK\" }\nfun main() {}\n");
+    try std.testing.expect(c.reason == null);
+    const m = try synthesizedMain(arena.allocator(), &c);
+    try std.testing.expect(std.mem.startsWith(u8, m, "package " ++ ENTRY_PACKAGE ++ "\n\nimport box\n"));
+    try std.testing.expect(std.mem.find(u8, m, "fun main()") != null);
+}
+
 test "directive lines parse and ordinary comments do not" {
     const d = parseDirective("// LANGUAGE: +ContextParameters").?;
     try std.testing.expectEqualStrings("LANGUAGE", d.name);
@@ -590,7 +629,7 @@ test "a case splits FILE sections, finds the box package, and selects by directi
     try std.testing.expectEqual(@as(usize, 2), c.sections.len);
     try std.testing.expectEqualStrings("foo", c.package.?);
     const m = try synthesizedMain(arena.allocator(), &c);
-    try std.testing.expect(std.mem.startsWith(u8, m, "import foo.box\n"));
+    try std.testing.expect(std.mem.startsWith(u8, m, "package " ++ ENTRY_PACKAGE ++ "\n\nimport foo.box\n"));
 
     const jvm = try parseCase(arena.allocator(), "x/z.kt", "// TARGET_BACKEND: JVM\nfun box() = \"OK\"\n");
     try std.testing.expectEqualStrings("TARGET_BACKEND", jvm.reason.?);

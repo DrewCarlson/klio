@@ -31,5 +31,6 @@ include = [
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 "androidx.collection" = "*"
 

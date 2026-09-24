@@ -331,7 +331,7 @@ pub fn parseType(p: *Parser) ?TypeRef {
             @memcpy(combined[own.len..], type_annotations);
             break :blk combined;
         };
-        ty.extra = support.typeRefExtra(p, .{ .annotations = anns, .qualified_path = ty.x().qualified_path });
+        ty.extra = support.typeRefExtra(p, .{ .annotations = anns, .qualified_path = ty.x().qualified_path, .qualifier_args = ty.x().qualifier_args });
     }
     if (peekKind(p).isQuestion()) {
         const q = support.bump(p);
@@ -389,7 +389,7 @@ pub fn parseType(p: *Parser) ?TypeRef {
         // Annotations before the receiver head annotate the whole function type,
         // so they are hoisted onto the outer TypeRef.
         var recv_ty = ty;
-        recv_ty.extra = support.typeRefExtra(p, .{ .qualified_path = ty.x().qualified_path });
+        recv_ty.extra = support.typeRefExtra(p, .{ .qualified_path = ty.x().qualified_path, .qualifier_args = ty.x().qualifier_args });
         func.* = .{
             .receiver = recv_ty,
             .params = params,
@@ -428,6 +428,8 @@ pub fn parseSimpleType(p: *Parser) ?TypeRef {
         parseTypeArgs(p)
     else
         &.{};
+    var quals: std.ArrayList([]TypeArg) = .empty;
+    var any_qual_args = false;
     // Qualified or nested type path `A.B.C`, each segment able to carry its own
     // type arguments. Types resolve by simple name, so the path collapses to its
     // last segment and `qualified_path` keeps the full dotted form. Stop before
@@ -438,6 +440,8 @@ pub fn parseSimpleType(p: *Parser) ?TypeRef {
     {
         _ = support.bump(p); // '.'
         name = support.parseIdent(p, "type") orelse return null;
+        quals.append(p.allocator, type_args) catch @panic("OOM in parseSimpleType");
+        if (type_args.len != 0) any_qual_args = true;
         path.append(p.allocator, '.') catch @panic("OOM in parseSimpleType");
         path.appendSlice(p.allocator, name.name) catch @panic("OOM in parseSimpleType");
         segments += 1;
@@ -458,7 +462,10 @@ pub fn parseSimpleType(p: *Parser) ?TypeRef {
         .type_args = type_args,
         .function = null,
         .definitely_non_null = false,
-        .extra = support.typeRefExtra(p, .{ .qualified_path = qualified_path }),
+        .extra = support.typeRefExtra(p, .{
+            .qualified_path = qualified_path,
+            .qualifier_args = if (any_qual_args) (quals.toOwnedSlice(p.allocator) catch @panic("OOM in parseSimpleType")) else &.{},
+        }),
     };
 }
 
@@ -490,6 +497,13 @@ pub fn parseQualifiedType(p: *Parser) ?TypeRef {
             parseTypeArgs(p)
         else
             &.{};
+        // The segment just passed keeps its arguments as a qualifier's.
+        const prev_quals = head.x().qualifier_args;
+        const quals = p.allocator.alloc([]TypeArg, prev_quals.len + 1) catch @panic("OOM in parseQualifiedType");
+        @memcpy(quals[0..prev_quals.len], prev_quals);
+        quals[prev_quals.len] = head.type_args;
+        var any_qual_args = head.type_args.len != 0;
+        for (prev_quals) |q| any_qual_args = any_qual_args or q.len != 0;
         head = TypeRef{
             .name = new_name,
             .nullable = false,
@@ -497,7 +511,7 @@ pub fn parseQualifiedType(p: *Parser) ?TypeRef {
             .type_args = type_args,
             .function = null,
             .definitely_non_null = false,
-            .extra = support.typeRefExtra(p, .{ .qualified_path = dotted }),
+            .extra = support.typeRefExtra(p, .{ .qualified_path = dotted, .qualifier_args = if (any_qual_args) quals else &.{} }),
         };
     }
     if (peekKind(p).isQuestion()) {

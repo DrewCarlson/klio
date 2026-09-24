@@ -13,8 +13,12 @@ the matching actuals plus a small set of native helpers:
 - ISO-8601 rendering and parsing of `Instant`
 - tz id validation
 
-The pack depends on `kotlinx.serialization` so the datetime value
-types stay reflectively `@Serializable`.
+The pack depends on `kotlinx.serialization`: `LocalDate`, `LocalTime`,
+`LocalDateTime`, `DateTimePeriod` / `DatePeriod` and the `DateTimeUnit`
+hierarchy are `@Serializable` through the upstream serializers in
+`kotlinx.datetime.serializers` (ISO strings by default, with the
+component and ISO 8601 serializers available to name explicitly).
+`examples/datetime_serializers.kt` round-trips each through JSON.
 
 ## Surface
 

@@ -13,7 +13,7 @@
 class Row(val id: Long)
 
 class Table {
-    private val rows = mutableListOf(1L, 2L, 3L)
+    @PublishedApi internal val rows = mutableListOf(1L, 2L, 3L)
 
     inline fun forEachIndexed(block: (index: Int, element: Long) -> Unit) {
         var i = 0

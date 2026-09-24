@@ -18,6 +18,12 @@ include = [
     "androidx/compose/ui/util/MathHelpers.kt",
     "androidx/compose/ui/util/ListUtils.kt",
     "androidx/compose/ui/util/InlineClassHelper.kt",
+    "androidx/compose/ui/util/Trace.kt",
+    # The compose-ui opt-in markers every ui module annotates with.
+    "androidx/compose/ui/ExperimentalComposeUiApi.kt",
+    "androidx/compose/ui/ExperimentalIndirectPointerApi.kt",
+    "androidx/compose/ui/ExperimentalMediaQueryApi.kt",
+    "androidx/compose/ui/InternalComposeUiApi.kt",
 ]
 
 # klioMain: the platform `expect` actuals (float bits, fastRoundToInt, tracing).

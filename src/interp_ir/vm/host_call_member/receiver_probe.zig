@@ -6,6 +6,7 @@ const ir = @import("ir");
 const runtime = @import("runtime");
 const applicability = @import("applicability");
 const vmhost = @import("../vmhost.zig");
+const host_resolved = @import("../host_resolved.zig");
 const host_classes = @import("../host_classes.zig");
 const VmHost = vmhost.VmHost;
 const overload_match = @import("../overload_match.zig");
@@ -955,6 +956,8 @@ pub fn headNamesRegisteredClass(self: *VmHost, head: []const u8) bool {
 /// Head-name check against the receiver's runtime type: the class hierarchy for an
 /// Instance, the runtime type-name sets otherwise. Callers handle generics and shapes.
 pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
+    // An instance lowered from sema answers from the resolved tables.
+    if (host_resolved.implementsHead(self, receiver, pn)) |yes| return yes;
     switch (receiver.*) {
         .Instance => |inst| {
             const a = self.allocator;

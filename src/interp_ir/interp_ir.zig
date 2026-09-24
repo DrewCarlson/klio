@@ -1,5 +1,5 @@
 //! IR-native interpreter: `Vm` executes a frozen `ir.Module` end-to-end, with
-//! no AST evaluator behind it. `build_module` lowers the driver's AST.
+//! no AST evaluator behind it.
 
 const std = @import("std");
 
@@ -14,9 +14,9 @@ const Allocator = std.mem.Allocator;
 
 pub const Output = runtime.Output;
 
-pub const build = @import("build.zig");
-pub const image = @import("image.zig");
-pub const prune = @import("prune.zig");
+pub const tables = @import("tables.zig");
+/// The value codec the base image is written in.
+pub const codec = @import("codec.zig");
 
 const vmhost = @import("vm/vmhost.zig");
 const run_mod = @import("vm/run.zig");
@@ -44,6 +44,12 @@ pub const member_dispatch = @import("vm/host_call_member.zig");
 
 /// Field reads for the same consumers, through `hostFreeProperty`.
 pub const member_fields = @import("vm/host_fields.zig");
+/// The members the VM implements over host values, for the bridge to bind
+/// (`bridge.Options.host_fns`).
+pub const hostMemberFn = @import("vm/host_members.zig").resolve;
+/// The fast paths the VM puts in front of declarations with bodies
+/// (`bridge.Options.host_tries`).
+pub const hostMemberTry = @import("vm/host_members.zig").resolveTry;
 
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
@@ -110,21 +116,21 @@ pub const NameValue = struct {
     value: Value,
 };
 
-pub const ClassTable = build.ClassTable;
+pub const ClassTable = tables.ClassTable;
 pub const OuterTable = runtime.NameHashMap(Value);
 pub const AnonMethods = ObjRef(runtime.NameHashMap(AnonMethodEntry));
 
 /// `(class, member)` → `FuncId` registry table (shared with `build`).
-pub const PairFuncMap = build.PairFuncMap;
-pub const StrPair = build.StrPair;
-pub const StrFunc = build.StrFunc;
-pub const NameFunc = build.NameFunc;
-pub const EnumEntryArgInit = build.EnumEntryArgInit;
+pub const PairFuncMap = tables.PairFuncMap;
+pub const StrPair = tables.StrPair;
+pub const StrFunc = tables.StrFunc;
+pub const NameFunc = tables.NameFunc;
+pub const EnumEntryArgInit = tables.EnumEntryArgInit;
 
 /// A top-level property's initializer thunk and pre-init default category.
-pub const TopLevelPropInit = struct { func: FuncId, default: build.TypedDefault, file: u32 = 0 };
+pub const TopLevelPropInit = struct { func: FuncId, default: tables.TypedDefault, file: u32 = 0 };
 
-/// Program metadata built once by `build.build_module` and shared by handle
+/// Program metadata built once and shared by handle
 /// with every OS thread. Declaration tables are fixed; caches fill in lazily.
 pub const ProgramImage = struct {
     top_level_prop_inits: runtime.NameHashMap(TopLevelPropInit),
@@ -153,7 +159,7 @@ pub const ProgramImage = struct {
     nullable_ext_props: runtime.NameHashMap(?FuncId),
     extension_prop_setters: PairFuncMap,
     extension_prop_delegates: PairFuncMap,
-    secondary_ctors: runtime.NameHashMap([]build.SecondaryCtorEntry),
+    secondary_ctors: runtime.NameHashMap([]tables.SecondaryCtorEntry),
     primary_ctor_default_thunks: runtime.NameHashMap([]?FuncId),
     /// Every top-level `object` and synthesised companion. Startup defers any
     /// whose initializer throws to `lookupGlobal`, as Kotlin's lazy init does.
@@ -331,7 +337,7 @@ pub const ProgramImage = struct {
             .nullable_ext_props = runtime.NameHashMap(?FuncId).init(allocator),
             .extension_prop_setters = PairFuncMap.init(allocator),
             .extension_prop_delegates = PairFuncMap.init(allocator),
-            .secondary_ctors = runtime.NameHashMap([]build.SecondaryCtorEntry).init(allocator),
+            .secondary_ctors = runtime.NameHashMap([]tables.SecondaryCtorEntry).init(allocator),
             .primary_ctor_default_thunks = runtime.NameHashMap([]?FuncId).init(allocator),
             .object_names = runtime.NameHashMap(void).init(allocator),
             .class_delegates = runtime.NameHashMap([]StrFunc).init(allocator),
@@ -543,254 +549,6 @@ pub const ProgramImage = struct {
         self.resolved_redirect.clearRetainingCapacity();
     }
 
-    /// Resolve each symbol's single executable form once: a top-level `FuncId`
-    /// whose FQN maps to a binding in `installed_bindings` records it, one with
-    /// no match runs its lowered body. A pure function of `(FuncId → fqn,
-    /// bindings)`, so it is load-order free and idempotent.
-    pub fn linkResolvedForms(self: *ProgramImage, module: *const Module) Allocator.Error!void {
-        // Unpublish first: the steady-state fast paths read these tables
-        // unguarded behind this flag and must go back on the locked path.
-        @atomicStore(bool, &self.resolved_linked, false, .release);
-        self.resolved_native.clearRetainingCapacity();
-        self.vararg_spread_adapters.clearRetainingCapacity();
-        self.clearResolvedRedirects();
-        self.default_import_globals.clearRetainingCapacity();
-        self.pack_bare_aliases.clearRetainingCapacity();
-        self.any_member_globals.clearRetainingCapacity();
-        const bg = self.installed_bindings.borrow();
-        defer bg.deinit();
-        const bindings = bg.get();
-
-        // The declaration manifest is authoritative for bodyless decls: join
-        // each to its exact host symbol first. A body-bearing declaration keeps
-        // its Kotlin body, which accepts user subtypes the native form may not.
-        {
-            var decl_it = module.decl_sigs.iterator();
-            while (decl_it.next()) |entry| {
-                const symbol = entry.value_ptr.host_symbol orelse continue;
-                if (entry.value_ptr.has_body and !intrinsicOverridesBody(symbol)) continue;
-                const intrinsic = bindings.resolve(symbol) orelse
-                    stdlib.implementation(symbol) orelse continue;
-                try self.resolved_native.put(entry.key_ptr.*, intrinsic);
-                // Record the trailing vararg's slot so a packed frame unpacks.
-                if (module.funcById(FuncId.from(entry.key_ptr.*))) |vf| {
-                    if (vf.params.len != 0 and vf.params[vf.params.len - 1].is_vararg) {
-                        try self.vararg_spread_adapters.put(entry.key_ptr.*, @intCast(vf.params.len - 1));
-                    }
-                }
-            }
-        }
-
-        // One deterministic name → FQN edge per simple name. Cross-package ties
-        // resolve by `bare_probe_packages` order; FQNs are unique per table.
-        {
-            var fqn_it = stdlib.implementations.allFqns();
-            while (fqn_it.next()) |fqn| {
-                try stdlib.noteBareNameMapping(&self.default_import_globals, &bare_probe_packages, fqn);
-                try stdlib.noteBareNameMapping(&self.any_member_globals, &any_member_prefixes, fqn);
-            }
-            var key_it = bindings.table.keyIterator();
-            while (key_it.next()) |k| {
-                try stdlib.noteBareNameMapping(&self.default_import_globals, &bare_probe_packages, k.*);
-                try stdlib.noteBareNameMapping(&self.any_member_globals, &any_member_prefixes, k.*);
-                try notePackAlias(&self.pack_bare_aliases, k.*);
-            }
-        }
-
-        if (!bindings.isEmpty()) {
-            // Mark every func under an installed binding's fqn native, through
-            // the simple-name index. One exception: a body-bearing generic
-            // overload whose FQN group holds a same-arity concrete sibling keeps
-            // its body, since the intrinsic implements the concrete family's
-            // semantics (`minOf(Double, Double)` propagates NaN).
-            var bk = bindings.table.keyIterator();
-            while (bk.next()) |fqn_k| {
-                const fqn = fqn_k.*;
-                const intrinsic = bindings.resolve(fqn) orelse continue;
-                const simple = if (std.mem.findScalarLast(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
-                for (module.funcsBySimpleName(simple)) |cand| {
-                    const cf = module.funcById(cand) orelse continue;
-                    if (std.mem.eql(u8, cf.fqn, fqn)) {
-                        if (genericOverloadKeepsBody(module, cand, cf)) continue;
-                        try self.resolved_native.put(cand.int(), intrinsic);
-                    }
-                }
-                // A member-form binding (`<pkg>.<Class>.<name>`) is not in the
-                // simple-name index, so settle it here like a top-level form.
-                // Concrete classes only: an interface or abstract method must
-                // dispatch virtually, its intrinsic serving only host receivers.
-                if (std.mem.findScalarLast(u8, fqn, '.')) |dot| {
-                    const owner_fqn = fqn[0..dot];
-                    if (module.classIdByFqn(owner_fqn)) |cid| {
-                        if (cid.int() < module.classes.items.len) {
-                            const cls = &module.classes.items[cid.int()];
-                            if (!cls.is_interface and !cls.is_abstract) {
-                                for (cls.methods) |mid| {
-                                    const mf = module.funcById(mid) orelse continue;
-                                    if (!std.mem.eql(u8, mf.name, simple)) continue;
-                                    if (genericOverloadKeepsBody(module, mid, mf)) continue;
-                                    try self.resolved_native.put(mid.int(), intrinsic);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Bodyless decls, in dispatch order. Base funcs come from the baked id
-        // list so the lazy table is not swept; this run's own sit past it.
-        for (module.bodyless_func_ids) |bid| {
-            try self.linkBodyless(module, bindings, FuncId.from(bid));
-        }
-        const base_n: u32 = @intCast(module.func_header_offsets.len);
-        for (module.funcs.items, 0..) |*f, j| {
-            if (f.hasBody()) continue;
-            try self.linkBodyless(module, bindings, FuncId.from(base_n + @as(u32, @intCast(j))));
-        }
-        @atomicStore(bool, &self.resolved_linked, true, .release);
-    }
-
-    /// Settle one bodyless func's form: same-simple-name body siblings in
-    /// declaration order, plus the exact-fqn and bare-name native fallback.
-    fn linkBodyless(self: *ProgramImage, module: *const Module, bindings: anytype, fid: FuncId) !void {
-        const f = module.funcById(fid) orelse return;
-        if (f.hasBody()) return;
-        if (self.resolved_native.contains(fid.int())) return;
-        const receiver_formed = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
-        var sibs: std.ArrayList(FuncId) = .empty;
-        errdefer sibs.deinit(self.allocator);
-        for (module.funcsBySimpleName(f.name)) |cand| {
-            if (cand.int() == fid.int()) continue;
-            const cf = module.funcById(cand) orelse continue;
-            if (!cf.hasBody()) continue;
-            // An `actual` declares its `expect`'s package, so only a
-            // same-package sibling can settle a bodyless decl; linking a
-            // stranger would run its body for an unimplemented expect.
-            if (!std.mem.eql(u8, cf.package, f.package)) continue;
-            // Same package is not enough for a member: `kotlin.Double.equals`
-            // and `kotlin.String.equals` share `kotlin` and reject each other's
-            // receiver, so a receiver-formed header needs its own class's decl.
-            if (receiver_formed and
-                !std.mem.eql(u8, declaringOwnerOfFqn(cf.fqn), declaringOwnerOfFqn(f.fqn))) continue;
-            try sibs.append(self.allocator, cand);
-        }
-        if (sibs.items.len != 0) {
-            try self.resolved_redirect.put(fid.int(), try sibs.toOwnedSlice(self.allocator));
-        }
-        if (self.bodylessNativeForm(bindings, f.fqn, f.name, receiver_formed)) |intrinsic| {
-            try self.resolved_native.put(fid.int(), intrinsic);
-        }
-    }
-
-    /// Symbols whose host implementation serves even though the Kotlin
-    /// declaration has a body. `Sequence.sumOf`'s overloads differ only in the
-    /// selector's return type, which Kotlin picks by inference; the host form
-    /// reads the kind from the first value it computes instead.
-    fn intrinsicOverridesBody(symbol: []const u8) bool {
-        const overrides = [_][]const u8{
-            "kotlin.sequences.Sequence.sumOf",
-        };
-        for (overrides) |o| {
-            if (std.mem.eql(u8, o, symbol)) return true;
-        }
-        return false;
-    }
-
-    /// Everything before an FQN's last component: a member's class, or a package.
-    fn declaringOwnerOfFqn(fqn: []const u8) []const u8 {
-        const dot = std.mem.findScalarLast(u8, fqn, '.') orelse return "";
-        return fqn[0..dot];
-    }
-
-    /// User arity of a func (value params, excluding a synthesized `this`).
-    fn funcValueArity(f: *const ir.Func) usize {
-        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return f.params.len - 1;
-        return f.params.len;
-    }
-
-    fn typeUsesTypeParam(ty: *const ir.TypeRef, type_params: []const []const u8) bool {
-        var head = ty.name;
-        if (std.mem.startsWith(u8, head, "in#")) head = head["in#".len..];
-        if (std.mem.startsWith(u8, head, "out#")) head = head["out#".len..];
-        for (type_params) |tp| {
-            if (std.mem.eql(u8, head, tp)) return true;
-        }
-        for (ty.args) |*arg| {
-            if (typeUsesTypeParam(arg, type_params)) return true;
-        }
-        return false;
-    }
-
-    /// Whether every value parameter of `f` depends on one of the function's own
-    /// type parameters, counting structural uses such as `Comparator<in T>`.
-    fn funcHasGenericSig(module: *const Module, fid: FuncId, f: *const ir.Func) bool {
-        const tps = module.registry.func_type_params.get(fid) orelse return false;
-        if (tps.items.len == 0) return false;
-        const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        if (f.params.len == off) return false;
-        for (f.params[off..]) |*p| {
-            if (!typeUsesTypeParam(&p.ty, tps.items)) return false;
-        }
-        return true;
-    }
-
-    /// A body-bearing, non-extension, generic-signature overload whose FQN group
-    /// holds a same-arity non-generic sibling keeps its Kotlin body. Bodyless
-    /// stubs, extensions, and all-generic families are marked as usual.
-    fn genericOverloadKeepsBody(module: *const Module, fid: FuncId, f: *const ir.Func) bool {
-        if (!f.hasBody()) return false;
-        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return false;
-        if (!funcHasGenericSig(module, fid, f)) return false;
-        const arity = funcValueArity(f);
-        for (module.funcsBySimpleName(f.name)) |sid| {
-            if (sid.int() == fid.int()) continue;
-            const g = module.funcById(sid) orelse continue;
-            if (!std.mem.eql(u8, g.fqn, f.fqn)) continue;
-            if (funcValueArity(g) != arity) continue;
-            if (!funcHasGenericSig(module, sid, g)) return true;
-        }
-        return false;
-    }
-
-    /// The native form for a bodyless decl: the declared FQN against the overlay
-    /// then the embedded registry, then the bare-name map's FQN against both.
-    fn bodylessNativeForm(
-        self: *const ProgramImage,
-        bindings: *const HostBindings,
-        fqn: []const u8,
-        name: []const u8,
-        receiver_formed: bool,
-    ) ?StdlibFn {
-        if (bindings.resolve(fqn)) |i| return i;
-        if (stdlib.implementation(fqn)) |i| return i;
-        // The bare-name map names top-level functions, so it cannot settle a
-        // member header; a member's implementation is receiver-qualified.
-        if (receiver_formed) return null;
-        if (self.default_import_globals.get(name)) |mapped| {
-            if (bindings.resolve(mapped)) |i| return i;
-            if (stdlib.implementation(mapped)) |i| return i;
-        }
-        return null;
-    }
-
-    /// Record a package-level binding's bare-name alias. An uppercase parent
-    /// segment is a member form a bare name cannot mean; smallest FQN wins.
-    fn notePackAlias(map: *runtime.NameHashMap([]const u8), fqn: []const u8) Allocator.Error!void {
-        const dot = std.mem.findScalarLast(u8, fqn, '.') orelse return;
-        const pkg = fqn[0..dot];
-        const name = fqn[dot + 1 ..];
-        if (name.len == 0 or pkg.len == 0) return;
-        const parent_start = if (std.mem.findScalarLast(u8, pkg, '.')) |d| d + 1 else 0;
-        const parent = pkg[parent_start..];
-        if (parent.len == 0 or std.ascii.isUpper(parent[0])) return;
-        const gop = try map.getOrPut(name);
-        if (gop.found_existing) {
-            if (std.mem.order(u8, fqn, gop.value_ptr.*) != .lt) return;
-        }
-        gop.value_ptr.* = fqn;
-    }
-
     pub fn defaultImportGlobal(self: *const ProgramImage, name: []const u8) ?[]const u8 {
         return self.default_import_globals.get(name);
     }
@@ -983,6 +741,11 @@ pub const ClosureInfo = struct {
     /// receiver scope is lexical, so every invocation seeds the frame from this.
     chain: []const ir.eval.EnclosingEntry = &.{},
 
+    /// Set for a closure lowered from sema: what it is beside its body,
+    /// which then takes the call's arguments exactly and reads neither
+    /// `capture_names` nor `chain`.
+    resolved: ?ir.resolved.Callable = null,
+
     /// Epoch in which a live value last marked this closure. Post-sweep
     /// reclamation frees an unmarked slot's `capture_names` and `chain`.
     mark_epoch: usize = 0,
@@ -1042,9 +805,29 @@ fn closureSingletonThunk(id: u64) u64 {
     return h | 1;
 }
 
+/// The module a closure lowered from sema belongs to when its slot names
+/// none, for the display hook.
+var active_module: ?*const Module = null;
+
+/// A closure lowered from sema renders as its `toString` answers.
+fn closureTextThunk(id: u64, w: *std.Io.Writer) std.Io.Writer.Error!bool {
+    const sc = active_closures orelse return false;
+    const info = sc.get(id) orelse return false;
+    const kind = info.resolved orelse return false;
+    const module = info.module orelse active_module orelse return false;
+    const func = module.funcById(info.body_func) orelse return false;
+    const body: ir.resolved.ClosureBody = .{ .id = id, .func = func, .module = module, .kind = kind };
+    const text = ir.eval.resolved_ops.closureText(std.heap.page_allocator, module, body) catch return false;
+    defer std.heap.page_allocator.free(text);
+    try w.writeAll(text);
+    return true;
+}
+
 /// Install the closure-liveness hook; idempotent across Vms sharing a spine.
-pub fn gcInstallClosureHook(closures: SharedClosures) void {
+pub fn gcInstallClosureHook(closures: SharedClosures, module: *const Module) void {
     active_closures = closures;
+    if (module.resolved != null) active_module = module;
+    runtime.gc.closureTextHook = closureTextThunk;
     runtime.gc.markClosureHook = markClosureThunk;
     runtime.gc.sweepClosureHook = sweepClosuresThunk;
     runtime.gc.closureSingletonHook = closureSingletonThunk;
@@ -1057,6 +840,8 @@ pub fn gcInstallClosureHook(closures: SharedClosures) void {
 /// Clear program-owned closure hooks before the run's phase arena is released.
 pub fn gcResetProgramHooks() void {
     active_closures = null;
+    active_module = null;
+    runtime.gc.closureTextHook = null;
     runtime.gc.markClosureHook = null;
     runtime.gc.sweepClosureHook = null;
     runtime.gc.closureSingletonHook = null;
@@ -1148,6 +933,8 @@ pub const SharedClosures = struct {
 /// One spawned OS thread; an error result carries a thrown Kotlin Throwable.
 pub const ThreadEntry = struct {
     handle: ?std.Thread,
+    /// The thread's name, as `Thread.name` answers it.
+    name: []const u8 = "",
     result: ?ThreadResult = null,
     finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -1237,6 +1024,10 @@ pub const Vm = struct {
     threads: ThreadTable,
     object_states: ObjectStates,
     singletons_by_id: SingletonsById,
+    /// The run state of code lowered from sema: statics, init units and
+    /// singletons. Allocated by the first run of a module that has
+    /// `resolved` tables.
+    resolved_state: ?ir.resolved.StateRef = null,
     allocator: Allocator,
     /// Where the enum-entry ctor-arg patch allocates, defaulting to `allocator`.
     /// The parity drivers point it at the base cache arena, which outlives the
@@ -1246,23 +1037,28 @@ pub const Vm = struct {
     program_args: []const []const u8 = &.{},
 
     pub const new = run_mod.vmNew;
-    pub const fromBuilt = run_mod.vmFromBuilt;
-    pub const setInstalledBindings = run_mod.vmSetInstalledBindings;
     pub const makeHost = run_mod.vmMakeHost;
     pub const spawnChild = run_mod.vmSpawnChild;
     pub const runThreadBlock = run_mod.vmRunThreadBlock;
     pub const run = run_mod.vmRun;
-    pub const runInner = run_mod.vmRunInner;
     pub const deinit = run_mod.vmDeinit;
     // Embedder entry points: prepare startup, then invoke functions or methods.
     pub const prepare = run_mod.vmPrepare;
+    pub const prepareResolved = run_mod.vmPrepareResolved;
     pub const runCalls = run_mod.vmRunCalls;
     pub const callNoArg = run_mod.vmCallNoArg;
+    pub const callMain = run_mod.vmCallMain;
+    pub const callArgs = run_mod.vmCallArgs;
+    pub const newResolved = run_mod.vmNewResolved;
     pub const construct = run_mod.vmConstruct;
     pub const callMethod = run_mod.vmCallMethod;
+    pub const throwableText = run_mod.vmThrowableText;
+    pub const uncaughtText = run_mod.vmUncaughtText;
+    pub const threadUncaughtText = run_mod.vmThreadUncaughtText;
 };
 
 pub const CallOutcome = run_mod.CallOutcome;
+pub const uncaught_prefix = run_mod.uncaught_prefix;
 
 /// `Send` capture of the shared program state for a new OS thread. Every field
 /// is an owned shared handle, so the seed outlives the spawning call.
@@ -1279,6 +1075,10 @@ pub const SendableVmSeed = struct {
     threads: ThreadTable,
     object_states: ObjectStates,
     singletons_by_id: SingletonsById,
+    /// The run state of code lowered from sema: statics, init units and
+    /// singletons. Allocated by the first run of a module that has
+    /// `resolved` tables.
+    resolved_state: ?ir.resolved.StateRef = null,
     allocator: Allocator,
 
     pub fn materialize(self: SendableVmSeed) Allocator.Error!Vm {
@@ -1297,6 +1097,7 @@ pub const SendableVmSeed = struct {
             .threads = self.threads,
             .object_states = self.object_states,
             .singletons_by_id = self.singletons_by_id,
+            .resolved_state = self.resolved_state,
             .allocator = self.allocator,
         };
     }
@@ -1522,9 +1323,10 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
     testing.refAllDecls(class_layout);
-    _ = build;
+    _ = codec;
     _ = vmhost;
     _ = run_mod;
+    _ = @import("vm/host_members.zig");
 }
 
 test "value_is_callable / value_is_builtin classification" {
@@ -1552,366 +1354,6 @@ test "ext_decl_recv_is_user_class rejects builtins and type params" {
     try testing.expect(!extDeclRecvIsUserClass("ULong"));
     try testing.expect(!extDeclRecvIsUserClass("Iterator"));
     try testing.expect(!extDeclRecvIsUserClass("Comparator"));
-}
-
-fn linkTestNativeFn(ctx: *runtime.CallCtx) std.mem.Allocator.Error!runtime.EvalResult {
-    _ = ctx;
-    return .{ .ok = Value.Unit };
-}
-
-fn pushLinkTestFunc(m: *Module, a: Allocator, name: []const u8, fqn: []const u8) Allocator.Error!FuncId {
-    return pushLinkTestFuncOpts(m, a, name, fqn, false);
-}
-
-fn pushLinkTestFuncParams(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, n_params: usize, last_vararg: bool) Allocator.Error!FuncId {
-    const id = try pushLinkTestFuncOpts(m, a, name, fqn, false);
-    const params = try a.alloc(ir.Param, n_params);
-    for (params, 0..) |*pp, i| {
-        pp.* = .{
-            .name = "p",
-            .ty = .{ .name = "Int", .nullable = false, .args = &.{} },
-            .default = null,
-            .is_vararg = last_vararg and i == n_params - 1,
-        };
-    }
-    m.funcByIdMut(id).?.params = params;
-    return id;
-}
-
-fn pushLinkTestFuncPkg(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, bodyless: bool) Allocator.Error!FuncId {
-    const id = m.nextFuncId();
-    const blocks = try a.alloc(ir.Block, if (bodyless) 0 else 1);
-    if (!bodyless) {
-        blocks[0] = .{ .id = ir.BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
-    }
-    try m.funcs.append(a, .{
-        .id = id,
-        .name = name,
-        .fqn = fqn,
-        .package = package,
-        .params = &.{},
-        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
-        .n_locals = 0,
-        .blocks = blocks,
-        .entry = ir.BlockId.from(0),
-        .is_suspend = false,
-        .is_expect = bodyless,
-    });
-    try m.func_index.append(a, .{ .name = name, .id = id });
-    return id;
-}
-
-fn pushLinkTestFuncOpts(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, bodyless: bool) Allocator.Error!FuncId {
-    const id = m.nextFuncId();
-    const blocks = try a.alloc(ir.Block, if (bodyless) 0 else 1);
-    if (!bodyless) {
-        blocks[0] = .{ .id = ir.BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
-    }
-    try m.funcs.append(a, .{
-        .id = id,
-        .name = name,
-        .fqn = fqn,
-        .package = "",
-        .params = &.{},
-        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
-        .n_locals = 0,
-        .blocks = blocks,
-        .entry = ir.BlockId.from(0),
-        .is_suspend = false,
-    });
-    try m.func_index.append(a, .{ .name = name, .id = id });
-    return id;
-}
-
-test "linkResolvedForms binds one form per symbol from the installed overlay" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| a.free(f.blocks);
-        m.deinit(a);
-    }
-    // Two body-bearing funcs; only the first's FQN has a native binding.
-    const shimmed = try pushLinkTestFunc(&m, a, "now", "kotlinx.datetime.now");
-    const plain = try pushLinkTestFunc(&m, a, "plain", "app.plain");
-    try m.rebuildFuncNameIndex(a);
-
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-
-    try prog.linkResolvedForms(&m);
-    try testing.expect(prog.resolved_linked);
-    try testing.expect(prog.resolvedNativeForm(shimmed) == null);
-    try testing.expect(prog.resolvedNativeForm(plain) == null);
-
-    {
-        const bg = prog.installed_bindings.borrowMut();
-        defer bg.deinit();
-        try bg.get().register("kotlinx.datetime.now", linkTestNativeFn);
-    }
-    try prog.linkResolvedForms(&m);
-    const resolved = prog.resolvedNativeForm(shimmed);
-    try testing.expect(resolved != null);
-    try testing.expect(resolved.? == linkTestNativeFn);
-    try testing.expect(prog.resolvedNativeForm(plain) == null);
-
-    {
-        const bg = prog.installed_bindings.borrowMut();
-        defer bg.deinit();
-        _ = bg.get().table.remove("kotlinx.datetime.now");
-    }
-    try prog.linkResolvedForms(&m);
-    try testing.expect(prog.resolvedNativeForm(shimmed) == null);
-}
-
-test "linkResolvedForms settles a member-form binding onto the class method" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| a.free(f.blocks);
-        m.deinit(a);
-    }
-    // Member funcs are not in the simple-name index, so the member leg must
-    // resolve the binding key's class prefix and mark the method native.
-    const lock_m = try pushLinkTestFunc(&m, a, "lock", "kx.locks.ReentrantLock.lock");
-    _ = m.func_index.pop();
-    try m.rebuildFuncNameIndex(a);
-    const methods = try a.alloc(FuncId, 1);
-    defer a.free(methods);
-    methods[0] = lock_m;
-    try m.classes.append(a, .{
-        .id = ir.ClassId.from(0),
-        .name = "ReentrantLock",
-        .fqn = "kx.locks.ReentrantLock",
-        .primary_params = &.{},
-        .methods = methods,
-        .init_block = null,
-        .companion = null,
-        .supertypes = &.{},
-    });
-    defer _ = m.classes.pop();
-
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-    {
-        const bg = prog.installed_bindings.borrowMut();
-        defer bg.deinit();
-        try bg.get().register("kx.locks.ReentrantLock.lock", linkTestNativeFn);
-    }
-    try prog.linkResolvedForms(&m);
-    const resolved = prog.resolvedNativeForm(lock_m);
-    try testing.expect(resolved != null);
-    try testing.expect(resolved.? == linkTestNativeFn);
-}
-
-test "linkResolvedForms keeps a structurally generic overload body" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| {
-            a.free(f.blocks);
-            if (f.params.len != 0) a.free(f.params);
-        }
-        m.deinit(a);
-    }
-
-    const fqn = "kotlin.comparisons.choose";
-    const generic = try pushLinkTestFuncParams(&m, a, "choose", fqn, 3, false);
-    const concrete = try pushLinkTestFuncParams(&m, a, "choose", fqn, 3, false);
-    var comparator_args = [_]ir.TypeRef{.{ .name = "in#T", .nullable = false, .args = &.{} }};
-    const gp = @constCast(m.funcById(generic).?.params);
-    gp[0].ty = .{ .name = "T", .nullable = false, .args = &.{} };
-    gp[1].ty = .{ .name = "T", .nullable = false, .args = &.{} };
-    gp[1].is_vararg = true;
-    gp[2].ty = .{ .name = "Comparator", .nullable = false, .args = &comparator_args };
-    var type_params: std.ArrayList([]const u8) = .empty;
-    try type_params.append(a, "T");
-    try m.registry.func_type_params.put(generic, type_params);
-    try m.rebuildFuncNameIndex(a);
-
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-    {
-        const bg = prog.installed_bindings.borrowMut();
-        defer bg.deinit();
-        try bg.get().register(fqn, linkTestNativeFn);
-    }
-    try prog.linkResolvedForms(&m);
-
-    try testing.expect(prog.resolvedNativeForm(generic) == null);
-    try testing.expect(prog.resolvedNativeForm(concrete) != null);
-}
-
-test "a bodyless expect never links to a same-named function in another package" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| a.free(f.blocks);
-        m.deinit(a);
-    }
-    // An `actual` declares its `expect`'s package; linking a same-named function
-    // from another package would silently run a stranger's body.
-    const expect_fn = try pushLinkTestFuncPkg(&m, a, "getStr", "p1.getStr", "p1", true);
-    const same_pkg = try pushLinkTestFuncPkg(&m, a, "getStr", "p1.getStr", "p1", false);
-    _ = try pushLinkTestFuncPkg(&m, a, "getStr", "p2.getStr", "p2", false);
-    try m.rebuildFuncNameIndex(a);
-
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-    try prog.linkResolvedForms(&m);
-
-    const redirects = prog.resolvedRedirects(expect_fn);
-    for (redirects) |r| {
-        const g = m.funcById(r).?;
-        try testing.expectEqualStrings("p1", g.package);
-    }
-    try testing.expectEqual(same_pkg.int(), prog.resolvedRedirectTarget(&m, expect_fn, 0).?.int());
-}
-
-test "linkResolvedForms settles bodyless decls: sibling redirect, FQN native, map native" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| a.free(f.blocks);
-        m.deinit(a);
-    }
-    const expect_fn = try pushLinkTestFuncOpts(&m, a, "ping", "app.ping", true);
-    const actual_fn = try pushLinkTestFunc(&m, a, "ping", "app.ping.impl");
-    const abs_decl = try pushLinkTestFuncOpts(&m, a, "abs", "kotlin.math.abs", true);
-    // Bodyless decl whose FQN is unknown but whose simple name maps implicitly.
-    const sqrt_decl = try pushLinkTestFuncOpts(&m, a, "sqrt", "mylib.sqrt", true);
-    // Body-bearing func: the embedded registry must not shadow its body.
-    const body_abs = try pushLinkTestFunc(&m, a, "abs", "kotlin.math.abs");
-    try m.rebuildFuncNameIndex(a);
-
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-    try prog.linkResolvedForms(&m);
-
-    const redirects = prog.resolvedRedirects(expect_fn);
-    try testing.expect(redirects.len >= 1);
-    try testing.expectEqual(actual_fn.int(), redirects[0].int());
-    try testing.expect(prog.resolvedNativeForm(actual_fn) == null);
-    try testing.expectEqual(actual_fn.int(), prog.resolvedRedirectTarget(&m, expect_fn, 0).?.int());
-    try testing.expect(prog.resolvedRedirectTarget(&m, expect_fn, 1) == null);
-
-    try testing.expect(prog.resolvedNativeForm(abs_decl) != null);
-    try testing.expect(prog.resolvedNativeForm(body_abs) == null);
-
-    try testing.expect(prog.resolvedNativeForm(sqrt_decl) != null);
-    try testing.expectEqualStrings("kotlin.math.sqrt", prog.defaultImportGlobal("sqrt").?);
-}
-
-test "linkResolvedForms joins a receiver declaration through its exact host symbol" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| a.free(f.blocks);
-        m.deinit(a);
-    }
-    const repeat = try pushLinkTestFuncOpts(&m, a, "repeat", "kotlin.text.repeat", true);
-    const repeat_body = try pushLinkTestFunc(&m, a, "repeat", "kotlin.text.repeat");
-    try m.decl_sigs.put(repeat.int(), .{
-        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
-        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
-        .sig = &.{.{ .name = "Int", .nullable = false, .args = &.{} }},
-        .kind = .top_level_extension,
-        .host_symbol = "kotlin.String.repeat",
-    });
-    try m.decl_sigs.put(repeat_body.int(), .{
-        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
-        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
-        .sig = &.{.{ .name = "Int", .nullable = false, .args = &.{} }},
-        .kind = .top_level_extension,
-        .has_body = true,
-        .host_symbol = "kotlin.String.repeat",
-    });
-    try m.rebuildFuncNameIndex(a);
-
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-    try prog.linkResolvedForms(&m);
-
-    try testing.expect(prog.resolvedNativeForm(repeat) != null);
-    try testing.expect(prog.resolvedNativeForm(repeat).? ==
-        stdlib.implementation("kotlin.String.repeat").?);
-    try testing.expect(prog.resolvedNativeForm(repeat_body) == null);
-}
-
-test "bodyless redirect dispatch picks by exact arity, then vararg" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| {
-            a.free(f.blocks);
-            if (f.params.len != 0) a.free(f.params);
-        }
-        m.deinit(a);
-    }
-    const stub = try pushLinkTestFuncOpts(&m, a, "pick", "app.pick", true);
-    const two = try pushLinkTestFuncParams(&m, a, "pick", "app.pick.two", 2, false);
-    const vararg = try pushLinkTestFuncParams(&m, a, "pick", "app.pick.va", 1, true);
-    try m.rebuildFuncNameIndex(a);
-
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-    try prog.linkResolvedForms(&m);
-
-    try testing.expectEqual(two.int(), prog.resolvedRedirectTarget(&m, stub, 2).?.int());
-    try testing.expectEqual(vararg.int(), prog.resolvedRedirectTarget(&m, stub, 3).?.int());
-    try testing.expectEqual(vararg.int(), prog.resolvedRedirectTarget(&m, stub, 0).?.int());
-    try testing.expect(prog.resolvedRedirectTarget(&m, two, 2) == null);
-}
-
-test "link-time bare-name maps are deterministic and package-ranked" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer m.deinit(a);
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-    {
-        const bg = prog.installed_bindings.borrowMut();
-        defer bg.deinit();
-        try bg.get().register("kotlinx.coroutines.runBlocking", linkTestNativeFn);
-        try bg.get().register("kotlinx.coroutines.Job.join", linkTestNativeFn);
-        try bg.get().register("kotlinx.serialization.encode", linkTestNativeFn);
-        try bg.get().register("kotlinx.io.encode", linkTestNativeFn);
-    }
-    try prog.linkResolvedForms(&m);
-
-    try testing.expectEqualStrings("kotlinx.coroutines.runBlocking", prog.packBareAlias("runBlocking").?);
-    try testing.expect(prog.packBareAlias("join") == null);
-    try testing.expectEqualStrings("kotlinx.io.encode", prog.packBareAlias("encode").?);
-
-    try testing.expectEqualStrings("kotlin.math.min", prog.defaultImportGlobal("min").?);
-    try testing.expectEqualStrings("kotlin.intArrayOf", prog.defaultImportGlobal("intArrayOf").?);
-
-    // `kotlin.io`'s receiver-less globals must not become member edges: serving
-    // `println` member-style would print the receiver. No `use` edge exists.
-    try testing.expect(prog.anyMemberGlobal("println") == null);
-    try testing.expect(prog.anyMemberGlobal("print") == null);
-    try testing.expect(prog.anyMemberGlobal("use") == null);
-}
-
-test "link-time bare-name maps rank a cross-package collision first-package-wins" {
-    const a = testing.allocator;
-    var m = Module.default(a);
-    defer m.deinit(a);
-    var prog = try ProgramImage.init(a);
-    defer prog.deinit();
-    {
-        const bg = prog.installed_bindings.borrowMut();
-        defer bg.deinit();
-        try bg.get().register("kotlin.io.zzzCollide", linkTestNativeFn);
-        try bg.get().register("kotlin.math.zzzCollide", linkTestNativeFn);
-        try bg.get().register("kotlin.Any.zzzUse", linkTestNativeFn);
-        try bg.get().register("kotlin.AutoCloseable.zzzUse", linkTestNativeFn);
-    }
-    try prog.linkResolvedForms(&m);
-    try testing.expectEqualStrings("kotlin.math.zzzCollide", prog.defaultImportGlobal("zzzCollide").?);
-    try testing.expectEqualStrings("kotlin.AutoCloseable.zzzUse", prog.anyMemberGlobal("zzzUse").?);
-    // The one real cross-package collision: StringBuilder is registered under
-    // both `kotlin` and `kotlin.text`, and `kotlin` ranks first.
-    try testing.expectEqualStrings("kotlin.StringBuilder", prog.defaultImportGlobal("StringBuilder").?);
 }
 
 test "shared closures push is append-stable" {

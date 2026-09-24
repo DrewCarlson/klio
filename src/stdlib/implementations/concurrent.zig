@@ -233,17 +233,24 @@ pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     const body = block orelse return .{ .err = .{ .Arity = "thread expects a block" } };
+    // `thread(start, isDaemon, contextClassLoader, name, priority, block)`: the
+    // JVM numbers the thread before a given name replaces "Thread-N".
+    const number = runtime.nextThreadNumber();
+    const name: []const u8 = if (ctx.args.len > 3 and ctx.args[3] == .String)
+        try ctx.allocator.dupe(u8, ctx.args[3].String.asPtrConst().bytes)
+    else
+        try std.fmt.allocPrint(ctx.allocator, "Thread-{d}", .{number});
     // A leading positional or named `false` means the caller will `.start()` it
     // explicitly; with no deferred-start handle the body spawns anyway and the
     // later `.start()` is a no-op.
-    const spawned = try ctx.host.spawnOsThread(&body, ctx.out);
+    const spawned = try ctx.host.spawnOsThread(&body, name, ctx.out);
     const id: u64 = switch (spawned) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
     const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
     return .{ .ok = try Value.newBoundMethod(ctx.allocator, .{
-        .fqn = "kotlin.concurrent.Thread",
+        .fqn = "java.lang.Thread",
         .func = threadHandleStub,
         .receiver = receiver,
     }) };
@@ -284,7 +291,7 @@ pub fn concurrent_thread_current(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
     const id: u64 = std.Thread.getCurrentId();
     const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
     return .{ .ok = try Value.newBoundMethod(ctx.allocator, .{
-        .fqn = "kotlin.concurrent.Thread",
+        .fqn = "java.lang.Thread",
         .func = threadHandleStub,
         .receiver = receiver,
     }) };
@@ -471,7 +478,7 @@ test "currentThread yields a Thread BoundMethod handle" {
     const r = try concurrent_thread_current(&ctx);
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .BoundMethod);
-    try testing.expectEqualStrings("kotlin.concurrent.Thread", r.ok.BoundMethod.fqn);
+    try testing.expectEqualStrings("java.lang.Thread", r.ok.BoundMethod.fqn);
     runtime.boundMethodRefOf(r.ok.BoundMethod).deinit();
 }
 

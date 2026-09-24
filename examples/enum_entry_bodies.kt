@@ -1,7 +1,8 @@
 // An enum entry with a body is an instance of its own anonymous subclass:
 // the body's properties, `init` blocks, overrides, functions, and nested
 // classes belong to that entry alone, `super` reaches the enum's members,
-// and the entry keeps its name and ordinal.
+// and the entry keeps its name and ordinal. Outside the body an entry has
+// the enum's type, so its own members are reached through an override.
 enum class Op(val symbol: String) {
     ADD("+") {
         override fun apply(a: Int, b: Int) = a + b
@@ -23,11 +24,12 @@ enum class Op(val symbol: String) {
             uses += 1
             return -a
         }
-        fun sign(a: Int) = Sign().of(a)
+        override fun signOf(a: Int) = Sign().of(a)
     };
 
     abstract fun apply(a: Int, b: Int): Int
     open fun describe() = "$name $symbol"
+    open fun signOf(a: Int) = "unsigned"
 }
 
 enum class Shape {
@@ -45,7 +47,7 @@ fun main() {
     for (op in Op.entries) println("${op.ordinal} ${op.describe()} -> ${op.apply(6, 3)}")
     println(Op.NEG.apply(6, 3))
     println(Op.valueOf("MUL").apply(4, 5))
-    println(Op.NEG.sign(-1))
+    println(Op.NEG.signOf(-1))
     println(Shape.SQUARE.sides + Shape.CIRCLE.sides)
     println(Op.MUL is Op)
     println(Op.MUL == Op.valueOf("MUL"))

@@ -23,6 +23,8 @@ root = "upstream/collection/collection/src/jbMain/kotlin"
 
 [deps]
 stdlib = "*"
+# The range markers (`@IntRange`) the sources annotate parameters with.
+"androidx.annotation" = "*"
 # The `Lock` actual (jbMain) uses kotlinx.atomicfu.locks.
 "kotlinx.atomicfu" = "*"
 

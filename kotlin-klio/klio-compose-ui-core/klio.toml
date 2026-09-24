@@ -259,15 +259,31 @@ include = [
 # skikoMain: the upstream non-JVM actuals that are already java-free. Autofill has
 # no platform behind it off Android, so upstream's own skiko actuals answer null,
 # which is exactly what klio can serve. A text field reaches these on every
-# semantics pass (`FillableData.createFromText`).
+# semantics pass (`FillableData.createFromText`). TranslationsCache is the
+# locale lookup the desktop platform strings below go through.
+# CompositionLocals.skiko.kt is not vendored: beside the LocalLifecycleOwner
+# actual and LocalPlatformPrefetchScheduler it provides the locals of a skiko
+# ComposeScene's PlatformContext, which klio's host does not have; klioMain's
+# CompositionLocals.klio.kt keeps the first two.
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui/src/skikoMain/kotlin"
 include = [
-    "androidx/compose/ui/platform/CompositionLocals.skiko.kt",
     "androidx/compose/ui/platform/PlatformPrefetchScheduler.skiko.kt",
     "androidx/compose/ui/autofill/ContentDataType.skiko.kt",
     "androidx/compose/ui/autofill/ContentType.skiko.kt",
     "androidx/compose/ui/autofill/FillableData.skiko.kt",
+    "androidx/compose/ui/platform/TranslationsCache.skiko.kt",
+    "androidx/compose/ui/input/pointer/PointerButton.skiko.kt",
+]
+
+# desktopMain: the java-free localization of the platform strings (copy, cut,
+# paste, select all) that LocalLocalization serves the text context menus.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui/src/desktopMain/kotlin"
+include = [
+    "androidx/compose/ui/platform/PlatformLocalization.desktop.kt",
+    "androidx/compose/ui/platform/Strings.kt",
+    "androidx/compose/ui/platform/l10n/",
 ]
 
 # klioMain: platform-primitive actuals (atomics, sync, refs, identity hash).
@@ -276,6 +292,7 @@ root = "klioMain"
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 "androidx.compose.runtime" = "*"
 "androidx.compose.ui.util" = "*"
 "androidx.compose.ui.geometry" = "*"

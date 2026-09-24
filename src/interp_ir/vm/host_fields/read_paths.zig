@@ -5,6 +5,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const vmhost = @import("../vmhost.zig");
+const host_resolved = @import("../host_resolved.zig");
 const VmHost = vmhost.VmHost;
 const root = @import("../../interp_ir.zig");
 const host_call_member = @import("../host_call_member.zig");
@@ -48,6 +49,9 @@ const fieldWriteCacheGet = field_cache.fieldWriteCacheGet;
 const storedNullIsLateinit = field_cache.storedNullIsLateinit;
 
 pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+    // An instance lowered from sema answers a base member a native reads
+    // (`Map.entries` when a host map copies or compares it) through its slot.
+    if (try host_resolved.wellKnownCall(self, allocator, receiver, name, &.{}, .getter)) |r| return r;
     return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true, false));
 }
 
@@ -234,6 +238,11 @@ pub fn hostModulePtr(self: *VmHost) *const Module {
 }
 
 pub fn funcRunsItsBody(self: *VmHost, fid: FuncId) bool {
+    // A body the host fronts with a fast path runs only where the call asks
+    // the fast path first, which the fused and leaf tiers do not.
+    if (self.module.asPtrConst().resolved) |r| {
+        if (fid.int() < r.func_try.len and r.func_try[fid.int()] != .none) return false;
+    }
     const pg = self.prog.borrow();
     defer pg.deinit();
     return pg.get().resolvedNativeForm(fid) == null and

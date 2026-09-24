@@ -15,7 +15,7 @@ class PipeLike3 {
         val pipeline = pipeline()
         pipeline.intercept {
             val secondary = pipeline()
-            println("secondary made: $secondary")
+            println("secondary made: ${secondary::class.simpleName}, a new one: ${secondary !== pipeline}")
         }
         pipeline.execute(Ctx3("x"))
         println("ok")

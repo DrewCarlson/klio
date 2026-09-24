@@ -327,7 +327,7 @@ fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_strin
                 else => try display(a, r),
             };
         } else if (allow_instance_to_string and v == .Instance) blk: {
-            const m = try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out);
+            const m = try ctx.host.callWellKnown(&v, .to_string, &.{}, ctx.out);
             if (m) |mr| {
                 if (mr == .ok and mr.ok == .String) {
                     const g = mr.ok.String.borrow();
@@ -380,7 +380,7 @@ fn elemPiece(ctx: *CallCtx, v: Value) Error![]u8 {
     if (v == .Instance or v == .List or v == .Set or v == .Map or
         v == .Pair or v == .Triple or v == .Result)
     {
-        if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |mr| {
+        if (try ctx.host.callWellKnown(&v, .to_string, &.{}, ctx.out)) |mr| {
             if (mr == .ok and mr.ok == .String) {
                 const g = mr.ok.String.borrow();
                 defer g.deinit();

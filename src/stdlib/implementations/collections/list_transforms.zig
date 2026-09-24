@@ -74,7 +74,7 @@ const sublistBackingOf = views_mod.sublistBackingOf;
 
 fn compareHostAware(ctx: *CallCtx, x: Value, y: Value) Error!CompareOutcome {
     if (x == .Instance) {
-        if (try ctx.host.invokeMethod(&x, "compareTo", &.{y}, ctx.out)) |m| {
+        if (try ctx.host.callWellKnown(&x, .compare_to, &.{y}, ctx.out)) |m| {
             if (m == .ok and m.ok == .Int) return .{ .order = i32ToOrdering(m.ok.Int) };
         }
     }
@@ -352,7 +352,7 @@ pub fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enu
     const keepalive = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(keepalive);
     runtime.keepalivePush(inst);
-    const entries_r = (try ctx.host.getProperty(&inst, "entries", ctx.out)) orelse
+    const entries_r = (try ctx.host.callWellKnown(&inst, .entries, &.{}, ctx.out)) orelse
         return .{ .err = typeErr(try fmt(a, "{s} requires a Map or a collection of Pairs", .{who})) };
     const entries_val = switch (entries_r) {
         .ok => |v| v,
@@ -382,14 +382,14 @@ pub fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enu
                 val = p.second.asPtr().*;
             },
             else => {
-                const kr = (try ctx.host.getProperty(&entry, "key", ctx.out)) orelse
+                const kr = (try ctx.host.callWellKnown(&entry, .entry_key, &.{}, ctx.out)) orelse
                     return .{ .err = typeErr(try fmt(a, "{s} entry is missing key", .{who})) };
                 key = switch (kr) {
                     .ok => |v| v,
                     .err => |e| return .{ .err = .{ .err = e } },
                 };
                 runtime.keepalivePush(key);
-                const vr = (try ctx.host.getProperty(&entry, "value", ctx.out)) orelse
+                const vr = (try ctx.host.callWellKnown(&entry, .entry_value, &.{}, ctx.out)) orelse
                     return .{ .err = typeErr(try fmt(a, "{s} entry is missing value", .{who})) };
                 val = switch (vr) {
                     .ok => |v| v,

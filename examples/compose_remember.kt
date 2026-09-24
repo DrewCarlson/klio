@@ -1,7 +1,7 @@
 // Compose runtime: a @Composable tree composes in source order, and `remember`
 // memoizes a value across recompositions of the same content. A state write
-// bumps a generation that flows to each Item as a parameter, forcing it to
-// recompose; its remembered id survives, so no fresh ids are allocated.
+// bumps a generation that flows to each Item as a parameter it reads, forcing
+// it to recompose; its remembered id survives, so no fresh ids are allocated.
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.Recomposer
@@ -50,7 +50,7 @@ suspend fun settle(recomposer: Recomposer, clock: BroadcastFrameClock) {
 @Composable
 fun Item(label: String, generation: Int) {
     val id = remember { freshId() }
-    println("Item $label -> id $id")
+    println("Item $label (gen=$generation) -> id $id")
 }
 
 @Composable

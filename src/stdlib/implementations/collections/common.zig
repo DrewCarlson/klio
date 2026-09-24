@@ -374,7 +374,7 @@ pub fn eqBoxed(x: *const Value, y: *const Value) bool {
 /// do; otherwise structural equality.
 pub fn eqBoxedH(host: IntrinsicHost, out: Output, x: *const Value, y: *const Value) Error!bool {
     if (x.* == .Instance or y.* == .Instance) {
-        if (try host.invokeMethod(x, "equals", &.{y.*}, out)) |m| {
+        if (try host.callWellKnown(x, .equals, &.{y.*}, out)) |m| {
             if (m == .ok and m.ok == .Bool) return m.ok.Bool;
         }
     }
@@ -802,7 +802,7 @@ pub fn iterableItemsCtx(ctx: *CallCtx, v: Value, what: []const u8) Error!ItemsOu
 /// slice. Null when it has no `iterator()`, so the caller can fall back.
 fn drainViaIterator(ctx: *CallCtx, v: Value) Error!?ItemsOutcome {
     const a = ctx.allocator;
-    const iter_opt = try ctx.host.invokeMethod(&v, "iterator", &.{}, ctx.out);
+    const iter_opt = try ctx.host.callWellKnown(&v, .iterator, &.{}, ctx.out);
     const iter_res = iter_opt orelse return null;
     const iter = switch (iter_res) {
         .ok => |x| x,
@@ -810,13 +810,13 @@ fn drainViaIterator(ctx: *CallCtx, v: Value) Error!?ItemsOutcome {
     };
     var out: std.ArrayList(Value) = .empty;
     while (true) {
-        const hn = (try ctx.host.invokeMethod(&iter, "hasNext", &.{}, ctx.out)) orelse return null;
+        const hn = (try ctx.host.callWellKnown(&iter, .has_next, &.{}, ctx.out)) orelse return null;
         const has = switch (hn) {
             .ok => |x| x == .Bool and x.Bool,
             .err => |e| return ItemsOutcome{ .err = .{ .err = e } },
         };
         if (!has) break;
-        const nx = (try ctx.host.invokeMethod(&iter, "next", &.{}, ctx.out)) orelse return null;
+        const nx = (try ctx.host.callWellKnown(&iter, .next, &.{}, ctx.out)) orelse return null;
         switch (nx) {
             .ok => |item| try out.append(a, item),
             .err => |e| return ItemsOutcome{ .err = .{ .err = e } },

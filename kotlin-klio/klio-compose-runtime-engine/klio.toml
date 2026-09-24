@@ -222,6 +222,8 @@ include = [
     "androidx/compose/runtime/HostIntrinsics.kt",
     "androidx/compose/runtime/Stability.kt",
     "androidx/compose/runtime/StateObservation.kt",
+    "androidx/compose/runtime/annotation/Annotations.kt",
+    "androidx/compose/runtime/retain/Retain.kt",
 ]
 # Engine-only actuals for upstream expects the implicit-composer pack does
 # not ship (invokeComposable). Not referenced by the original pack.
@@ -230,6 +232,7 @@ root = "engineMain"
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 # The coroutine-backed effects (rememberCoroutineScope / LaunchedEffect /
 # produceState) build on the kotlinx.coroutines pack.
 "kotlinx.coroutines" = "*"

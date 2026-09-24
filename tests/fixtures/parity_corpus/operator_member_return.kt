@@ -1,5 +1,7 @@
 // An arithmetic operator on a CLASS is a member call, and its declared
 // return types the local it initializes.
+import kotlin.time.toDuration
+
 class Money(val cents: Long) {
     operator fun div(n: Int): Money = Money(cents / n)
     operator fun plus(other: Money): Money = Money(cents + other.cents)

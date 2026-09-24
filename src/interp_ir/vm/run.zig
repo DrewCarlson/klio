@@ -4,7 +4,6 @@
 //! `host_globals.ensureObjectSingleton`, not at startup.
 
 const std = @import("std");
-const host_instances = @import("host_instances.zig");
 const host_globals = @import("host_globals.zig");
 
 const ir = @import("ir");
@@ -12,10 +11,7 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 
 const root = @import("../interp_ir.zig");
-const build = @import("../build.zig");
 const vmhost = @import("vmhost.zig");
-const super_chain = @import("host_instances/super_chain.zig");
-const ctor_path = @import("host_instances/ctor_path.zig");
 const trace = @import("trace.zig");
 
 const Allocator = std.mem.Allocator;
@@ -70,254 +66,6 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
     };
 }
 
-/// Resolve every class's runtime `ClassDef` by id, here, where the module and
-/// the class table are both in hand for the only time.
-///
-/// Filling on first construction instead left one name probe per class — the
-/// audit reported it as `class=Plain probes=1` — and "never re-derives by
-/// name" is not "re-derives once". The cost is two map lookups per declared
-/// class, once, against a construction path that then never consults a name.
-/// Fill every class's first-non-interface-supertype memo here rather than at
-/// its first construction.
-///
-/// The memo is single-fill and cheap after that, but filling it resolves
-/// supertypes BY NAME, and doing so during execution is the runtime deriving
-/// a target from a string — once per class, but during a run. Every other
-/// memo this campaign added is built by a link pass for the same reason.
-fn primeSuperMemos(vm: *Vm, out: Output) void {
-    if (std.c.getenv("KLIO_SUPER_MEMO_LINK")) |v| {
-        if (v[0] == '0') return;
-    }
-    var host = vmMakeHost(vm, out);
-    const cg = vm.classes.borrow();
-    defer cg.deinit();
-    var it = cg.get().valueIterator();
-    while (it.next()) |d| {
-        _ = super_chain.firstNonInterfaceSuper(&host, d.*);
-        // Same reason: deciding which primary-ctor parameters take a SAM
-        // conversion resolves their declared types by name.
-        _ = ctor_path.ctorSamMask(&host, d.*);
-    }
-}
-
-fn fillClassDefsAtLink(allocator: Allocator, vm: *Vm) Allocator.Error!void {
-    // `KLIO_CTOR_ID_LINK=0` leaves the table to fill on first construction,
-    // which is also how `KLIO_CTOR_NAME_AUDIT` is shown to fire at all: with
-    // it off the audit reports `probes=1` for a class's first construction.
-    if (std.c.getenv("KLIO_CTOR_ID_LINK")) |v| {
-        if (v[0] == '0') return;
-    }
-    const mod_id = @intFromPtr(vm.module.asPtrConst());
-    const mg = vm.module.borrow();
-    defer mg.deinit();
-    const classes = mg.get().classes.items;
-    const cg = vm.classes.borrow();
-    defer cg.deinit();
-    const table = cg.get();
-    const pg = vm.prog.borrowMut();
-    defer pg.deinit();
-    const img = pg.get();
-    img.clearClassDefsById();
-    try img.class_defs_by_id.ensureTotalCapacity(allocator, classes.len);
-    for (classes) |*c| {
-        const found = table.get(c.fqn) orelse table.get(c.name);
-        img.class_defs_by_id.appendAssumeCapacity(if (found) |d| d.clone() else null);
-    }
-    img.class_defs_module_identity = mod_id;
-    if (std.c.getenv("KLIO_CTOR_NAME_PROBE") != null) {
-        var found_n: usize = 0;
-        for (img.class_defs_by_id.items) |slot| {
-            if (slot != null) found_n += 1;
-        }
-        std.debug.print("[ctor-link-fill] classes={d} resolved={d}\n", .{ classes.len, found_n });
-    }
-}
-
-pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Error!struct { vm: Vm, main: ?FuncId } {
-    var vm = try vmNew(allocator, built.module.clone());
-    vm.classes.deinit();
-    // Take the built class table, leaving an empty map so `built.deinit` is a no-op.
-    const taken = built.classes;
-    built.classes = ClassTable.init(allocator);
-    vm.classes = try ObjRef(ClassTable).init(allocator, taken);
-    try fillClassDefsAtLink(allocator, &vm);
-
-    // Copy the enum-entry thunks rather than move the list: the built list is arena-owned
-    // and the Vm frees its containers with the VM allocator, which misreads that buffer.
-    vm.enum_entry_arg_inits.deinit(allocator);
-    vm.enum_entry_arg_inits = .empty;
-    try vm.enum_entry_arg_inits.appendSlice(allocator, built.enum_entry_arg_inits.items);
-
-    vm.top_level_props.deinit(allocator);
-    vm.top_level_props = .empty;
-    {
-        const pg = vm.prog.borrowMut();
-        defer pg.deinit();
-        const prog = pg.get();
-        for (built.top_level_props.items) |nf| {
-            try vm.top_level_props.append(allocator, nf);
-            try prog.top_level_prop_inits.put(nf.name, .{ .func = nf.func, .default = nf.default, .file = nf.file });
-        }
-        // The Vm owns the ordered list; the image borrows its slice for per-file clinit.
-        prog.top_level_props_ordered = vm.top_level_props.items;
-        vm.base_top_level_props = built.base_top_level_props;
-    }
-    // Number the root scope's top-level properties: a slotted read addresses
-    // the binding by index, and the by-name path only ever initialises it.
-    {
-        const reg = &vm.module.asPtr().registry;
-        const g = vm.globals.borrowMut();
-        defer g.deinit();
-        const root_env = g.get();
-        if (root_env.slots.len != 0) allocator.free(root_env.slots);
-        root_env.slots = try allocator.alloc(?Value, reg.top_level_prop_slot_count);
-        @memset(root_env.slots, null);
-        root_env.slot_of = &reg.top_level_prop_slots;
-    }
-    {
-        const pg = vm.prog.borrowMut();
-        defer pg.deinit();
-        const prog = pg.get();
-
-        // Move each dispatch-time side table into the image, swapping a fresh empty in.
-        prog.body_prop_inits.deinit();
-        prog.body_prop_inits = built.body_prop_inits;
-        built.body_prop_inits = build.PairFuncMap.init(allocator);
-
-        prog.instance_prop_getters.deinit();
-        prog.instance_prop_getters = built.instance_prop_getters;
-        built.instance_prop_getters = build.PairFuncMap.init(allocator);
-
-        prog.getter_prop_names.deinit();
-        prog.getter_prop_names = built.getter_prop_names;
-        built.getter_prop_names = runtime.NameHashMap(void).init(allocator);
-
-        prog.instance_prop_setters.deinit();
-        prog.instance_prop_setters = built.instance_prop_setters;
-        built.instance_prop_setters = build.PairFuncMap.init(allocator);
-
-        prog.instance_prop_private.deinit();
-        prog.instance_prop_private = built.instance_prop_private;
-        built.instance_prop_private = build.PairFuncMap.init(allocator);
-
-        prog.parent_ctor_args.deinit();
-        prog.parent_ctor_args = built.parent_ctor_args;
-        built.parent_ctor_args = runtime.NameHashMap([]FuncId).init(allocator);
-
-        prog.parent_ctor_arg_names.deinit();
-        prog.parent_ctor_arg_names = built.parent_ctor_arg_names;
-        built.parent_ctor_arg_names = runtime.NameHashMap([]const ?[]const u8).init(allocator);
-
-        prog.init_blocks.deinit();
-        prog.init_blocks = built.init_blocks;
-        built.init_blocks = runtime.NameHashMap([]FuncId).init(allocator);
-
-        prog.extension_props.deinit();
-        prog.extension_props = built.extension_props;
-        built.extension_props = build.PairFuncMap.init(allocator);
-
-        prog.owner_keyed_ext_names.deinit();
-        prog.owner_keyed_ext_names = built.owner_keyed_ext_names;
-        built.owner_keyed_ext_names = runtime.NameHashMap(void).init(allocator);
-        prog.nullable_ext_props.deinit();
-        prog.nullable_ext_props = built.nullable_ext_props;
-        built.nullable_ext_props = @TypeOf(built.nullable_ext_props).init(allocator);
-
-        prog.extension_prop_setters.deinit();
-        prog.extension_prop_setters = built.extension_prop_setters;
-        built.extension_prop_setters = build.PairFuncMap.init(allocator);
-
-        prog.extension_prop_delegates.deinit();
-        prog.extension_prop_delegates = built.extension_prop_delegates;
-        built.extension_prop_delegates = build.PairFuncMap.init(allocator);
-
-        prog.secondary_ctors.deinit();
-        prog.secondary_ctors = built.secondary_ctors;
-        built.secondary_ctors = runtime.NameHashMap([]build.SecondaryCtorEntry).init(allocator);
-
-        prog.primary_ctor_default_thunks.deinit();
-        prog.primary_ctor_default_thunks = built.primary_ctor_default_thunks;
-        built.primary_ctor_default_thunks = runtime.NameHashMap([]?FuncId).init(allocator);
-
-        prog.class_delegates.deinit();
-        prog.class_delegates = built.class_delegates;
-        built.class_delegates = runtime.NameHashMap([]build.StrFunc).init(allocator);
-
-        prog.func_defaults.deinit();
-        prog.func_defaults = built.func_defaults;
-        built.func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator);
-
-        for (built.object_names.items) |n| try prog.object_names.put(n, {});
-    }
-
-    // Enum-entry overrides share the `anon_methods` table with anon-object methods.
-    {
-        const ag = vm.anon_methods.borrowMut();
-        defer ag.deinit();
-        var it = built.enum_entry_methods.iterator();
-        while (it.next()) |e| {
-            const key = try anonMethodKey(allocator, e.key_ptr.a, e.key_ptr.b);
-            try ag.get().put(key, .{
-                .module = e.value_ptr.module.clone(),
-                .func = e.value_ptr.func,
-                .captures = &.{},
-            });
-        }
-    }
-
-    return .{ .vm = vm, .main = built.main };
-}
-
-/// `(class, method)` key for `anon_methods`, `\u{1f}`-joined as elsewhere in the Vm.
-fn anonMethodKey(allocator: Allocator, class: []const u8, method: []const u8) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class, method });
-}
-
-/// Install pack-provided host bindings, probed before `stdlib.implementation`
-/// during dispatch so they shadow it. Call before `run`.
-pub fn vmSetInstalledBindings(self: *Vm, bindings: stdlib.HostBindings) Allocator.Error!void {
-    {
-        const g = self.prog.borrowMut();
-        defer g.deinit();
-        g.get().installed_bindings.deinit();
-        g.get().installed_bindings = try ObjRef(stdlib.HostBindings).init(self.allocator, bindings);
-    }
-    try linkProgramForms(self);
-}
-
-/// Resolve every symbol's executable form once against `installed_bindings`.
-fn linkProgramForms(self: *Vm) Allocator.Error!void {
-    const module_ref = self.module.clone();
-    defer module_ref.deinit();
-    {
-        // Build the name->ClassId overlay once here so `classId` is O(1) at run time.
-        const mm = module_ref.borrowMut();
-        defer mm.deinit();
-        try mm.get().buildClassIdMap(self.allocator);
-        // Host-shadow set: a non-stdlib overlay fqn names a pack declaration whose
-        // host binding is authoritative over its body, so a static bind defers to the walk.
-        {
-            const reg = &mm.get().registry;
-            const bg = self.prog.borrow();
-            defer bg.deinit();
-            const ig = bg.get().installed_bindings.borrow();
-            defer ig.deinit();
-            var kit = ig.get().table.iterator();
-            while (kit.next()) |entry| {
-                const fqn = entry.key_ptr.*;
-                if (std.mem.startsWith(u8, fqn, "kotlin.")) continue;
-                const owned = reg.allocator.dupe(u8, fqn) catch continue;
-                reg.host_shadowed_fqns.put(owned, {}) catch reg.allocator.free(owned);
-            }
-        }
-    }
-    const mg = module_ref.borrow();
-    defer mg.deinit();
-    const g = self.prog.borrowMut();
-    defer g.deinit();
-    try g.get().linkResolvedForms(mg.get());
-}
-
 /// Borrowed view of this Vm's shared handles; copies bump no refcount and own nothing.
 fn sharedHandles(self: *Vm) vmhost.SharedHandles {
     return .{
@@ -333,6 +81,7 @@ fn sharedHandles(self: *Vm) vmhost.SharedHandles {
         .threads = self.threads,
         .object_states = self.object_states,
         .singletons_by_id = self.singletons_by_id,
+        .resolved_state = self.resolved_state,
         .allocator = self.allocator,
     };
 }
@@ -363,6 +112,7 @@ pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
         .singletons_by_id = self.singletons_by_id.clone(),
+        .resolved_state = if (self.resolved_state) |rs| rs.clone() else null,
         .allocator = self.allocator,
     };
 }
@@ -401,6 +151,7 @@ fn gcMarkAllVms(m: *runtime.gc.Marker) void {
         m.shade(&vm.singletons_by_id.cell.hdr);
         m.shade(&vm.anon_methods.cell.hdr);
         m.shade(&vm.prog.cell.hdr);
+        if (vm.resolved_state) |st| m.shade(&st.cell.hdr);
     }
 }
 
@@ -411,7 +162,7 @@ pub fn gcRegisterVm(vm: *const Vm) void {
     runtime.gc.freeSuspendHook = ir.eval.freeSuspendStateOpaque;
     // All Vms share one closure side table by handle clone; install it with the
     // liveness and lambda-identity hooks in every mode (GC hooks are inert when off).
-    root.gcInstallClosureHook(vm.closures);
+    root.gcInstallClosureHook(vm.closures, vm.module.asPtrConst());
     if (!runtime.gc.gc_enabled) return;
     if (!gc_vm_root_registered.swap(true, .monotonic)) runtime.gc.registerRoot(gcMarkAllVms);
     gcVmsLock();
@@ -438,10 +189,6 @@ pub fn gcUnregisterVm(vm: *const Vm) void {
 
 pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     gcRegisterVm(self);
-    // Before the program runs, not during it: filling this memo resolves
-    // supertypes by name, and a name resolved while executing is the thing
-    // the census counts against the construction site.
-    primeSuperMemos(self, out);
     // Stream output from here so a run that hangs or is killed still shows its prints.
     self.out_sink.attach(out);
     // Close the permanent generation: cells minted up to here are immortal and
@@ -461,7 +208,7 @@ pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
 /// flags, dispatcher pool and run-scoped registries belong to the outermost run.
 var live_vm_runs = std.atomic.Value(usize).init(0);
 
-pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
+fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     _ = live_vm_runs.fetchAdd(1, .acq_rel);
     defer _ = live_vm_runs.fetchSub(1, .acq_rel);
     const result = try vmRunBody(self, main);
@@ -478,11 +225,9 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     const module = mg.get();
     const sink = self.out_sink.output();
 
-    const t_prep = runtime.clockMonotonicNanos();
-    if (try vmPrepareInner(self, module, sink)) |verr| return .{ .err = verr };
-    if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
-        std.debug.print("[run]   vmPrepareInner {d}ms\n", .{(runtime.clockMonotonicNanos() - t_prep) / 1_000_000});
-    }
+    // The module initializes its statics and objects on first touch through
+    // its own tables.
+    try vmPrepareResolved(self);
 
     const func = module.funcById(main) orelse return .{ .err = .InvalidMain };
     // A `suspend fun main` runs on the cooperative pump, so `delay` parks, not escapes.
@@ -515,6 +260,14 @@ fn programArgsValue(a: Allocator, argv: []const []const u8) Allocator.Error!Valu
         try list.append(a, .{ .String = try runtime.strInit(a, s) });
     }
     return runtime.ArrayData.fromBoxedList(try runtime.ValueList.init(a, list));
+}
+
+/// Allocates the run state of a module lowered from sema, once per Vm: its
+/// statics at their seeds, every init unit idle, no singleton built.
+pub fn vmPrepareResolved(self: *Vm) Allocator.Error!void {
+    if (self.resolved_state != null) return;
+    const r = self.module.asPtrConst().resolved orelse return;
+    self.resolved_state = try ir.resolved.stateNew(self.allocator, r);
 }
 
 /// Call outcome: `threw` is an uncaught Throwable, `failed` an interpreter error.
@@ -551,226 +304,9 @@ fn outcomeFromRuntime(self: *Vm, r: runtime.EvalResult) CallOutcome {
     };
 }
 
-/// Pre-main startup pipeline; null on success, else the failing `VmError`.
-fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Error!?VmError {
-    // Canonicalize name-bearing strings once per module so hot-path compares exit on
-    // pointer equality; prepare is single-threaded, so the const cast is sound.
-    {
-        const need = blk: {
-            const pg = self.prog.borrow();
-            defer pg.deinit();
-            break :blk pg.get().canonicalized_module_identity != self.module.identity();
-        };
-        if (need) {
-            const pg = self.prog.borrowMut();
-            defer pg.deinit();
-            const cg = self.classes.borrowMut();
-            defer cg.deinit();
-            pg.get().canonicalizeProgramNames(@constCast(module), cg.get());
-            pg.get().canonicalized_module_identity = self.module.identity();
-        }
-    }
-    // Settle each symbol's executable form before user code runs; idempotent when linked.
-    {
-        const linked = blk: {
-            const g = self.prog.borrow();
-            defer g.deinit();
-            break :blk g.get().resolved_linked;
-        };
-        if (!linked) {
-            const g = self.prog.borrowMut();
-            defer g.deinit();
-            try g.get().linkResolvedForms(module);
-        }
-    }
-
-    // Enum classes initialize on first use; their entry thunks ride the program image.
-    {
-        const pg = self.prog.borrowMut();
-        defer pg.deinit();
-        pg.get().enum_entry_arg_inits = self.enum_entry_arg_inits.items;
-        pg.get().patch_allocator = self.patch_allocator;
-    }
-
-    // Top-level `const val`s are compile-time constants; bind them before the
-    // object and companion initializers, which run first and may read one.
-    {
-        var it = module.registry.class_const_inits.iterator();
-        while (it.next()) |e| {
-            if (e.key_ptr.a.len != 0) continue;
-            const v = try ir.eval.constToValue(self.allocator, e.value_ptr);
-            const g = self.globals.borrowMut();
-            g.get().define(e.key_ptr.b, v) catch {};
-            g.deinit();
-        }
-    }
-
-    // `object` singletons and companions are not constructed here: Kotlin initializes
-    // one at first access, and every read path routes through `ensureObjectSingleton`.
-
-    // Run top-level property initialisers before main so global reads see the
-    // initial values; one already driven on demand is not re-run. While the pass
-    // is mid-flight a forward read of a later annotated property observes its
-    // declared type's default (JVM <clinit> semantics); the flag scopes that here.
-    {
-        const t_tlp = runtime.clockMonotonicNanos();
-        defer if (runtime.envOnce("KLIO_TRACE_RUN") != null) {
-            std.debug.print("[run]   top-level prop inits {d}ms ({d} props)\n", .{
-                (runtime.clockMonotonicNanos() - t_tlp) / 1_000_000,
-                self.top_level_props.items.len,
-            });
-        };
-        vmhost.host_impl.setStartupInitsActive(true);
-        defer vmhost.host_impl.setStartupInitsActive(false);
-        // A baked base's property initialisers run when something first reads
-        // one, the way Kotlin runs a file's on first touch of that file. The
-        // stdlib's tables are most of them and a program that never reads one
-        // should not pay to build it.
-        for (self.top_level_props.items[@min(self.base_top_level_props, self.top_level_props.items.len)..]) |nf| {
-            const init_func = module.funcById(nf.func) orelse return .InvalidMain;
-            {
-                const g = self.globals.borrow();
-                const exists = g.get().lookup(nf.name) != null;
-                g.deinit();
-                if (exists) continue;
-            }
-            // This prop's file `<clinit>` is running, so a same-file forward read
-            // defaults while a cross-file read drives. Guarding the prop itself keeps
-            // a re-entrant drive of this file out of an unresolved cycle.
-            vmhost.host_impl.pushInitFile(nf.file);
-            defer vmhost.host_impl.popInitFile(nf.file);
-            vmhost.host_impl.pushInitProp(nf.name);
-            defer vmhost.host_impl.popInitProp(nf.name);
-            var host = vmMakeHost(self, sink);
-            const r = try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host);
-            switch (r) {
-                .ok => |v| {
-                    const g = self.globals.borrowMut();
-                    defer g.deinit();
-                    g.get().define(nf.name, v) catch {};
-                },
-                // A top-level `val` whose initializer names a not-yet-consumed
-                // symbol defers to on-access (`CalleeFailed` is the body-exit re-tag
-                // of that condition); past its turn, a later read drives it.
-                .err => |e| switch (e) {
-                    .Unbound, .Unimplemented, .CalleeFailed => {
-                        if (runtime.envOnce("KLIO_TOPPROP_TRACE") != null) std.debug.print("[topprop-defer] {s}: {s}\n", .{ nf.name, @tagName(e) });
-                        vmhost.host_impl.noteStartupDeferred(nf.name);
-                    },
-                    else => return vmErrorFromEval(self.allocator, e),
-                },
-            }
-        }
-    }
-
-    if (runtime.envOnce("KLIO_DUMP_FN")) |w| {
-        const dmg = self.module.borrow();
-        defer dmg.deinit();
-        // Accepts a numeric FuncId or a function simple name.
-        const by_id: ?u32 = std.fmt.parseInt(u32, w, 10) catch null;
-        for (dmg.get().funcs.items) |*df| {
-            if (by_id) |want| {
-                if (df.id.int() != want) continue;
-            } else if (!std.mem.eql(u8, df.name, w)) continue;
-            std.debug.print("[dumpfn] {s}#{d} blocks={d} recv_ty={?s} owner={?s} label={?s} ncaps={d} params={d}\n", .{ df.fqn, df.id.int(), df.blocks.len, df.x().lambda_receiver_ty, df.x().lexical_owner, df.x().implicit_label, df.x().capture_order.len, df.params.len });
-            for (df.blocks, 0..) |blk, bi| {
-                std.debug.print("[dumpfn] b{d}: catches={d} fin={?} fin_done={?} done_for={?} pop={d}\n", .{
-                    bi,
-                    blk.h().catches.len,
-                    if (blk.h().finally) |x| @intFromEnum(x) else null,
-                    if (blk.h().finally_done) |x| @intFromEnum(x) else null,
-                    if (blk.h().finally_done_for) |x| @intFromEnum(x) else null,
-                    blk.h().pop_on_exit.len,
-                });
-                for (blk.insts) |inst| {
-                    switch (inst) {
-                        .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
-                        .Call => |c| std.debug.print("[dumpfn]   Call func=#{d} n_args={d} exact={}\n", .{ c.func.int(), c.n_args, c.exact }),
-                        .NewInstance => |ni| {
-                            const cls = dmg.get().classes.items;
-                            const nm = if (ni.class.int() < cls.len) cls[ni.class.int()].fqn else "?";
-                            std.debug.print("[dumpfn]   NewInstance dst=r{d} class={s} n_args={d}\n", .{ ni.dst.int(), nm, ni.n_args });
-                        },
-                        .GetField => |gf| {
-                            const cs = dmg.get().consts.items;
-                            const nm = if (gf.field.int() < cs.len and cs[gf.field.int()] == .String) cs[gf.field.int()].String else "?";
-                            std.debug.print("[dumpfn]   GetField dst=r{d} recv=r{d} field={s}\n", .{ gf.dst.int(), gf.receiver.int(), nm });
-                        },
-                        .LoadFromThisOrGlobal => |lg| {
-                            const cs = dmg.get().consts.items;
-                            const nm = if (lg.name.int() < cs.len and cs[lg.name.int()] == .String) cs[lg.name.int()].String else "?";
-                            std.debug.print("[dumpfn]   LoadFromThisOrGlobal dst=r{d} name={s}\n", .{ lg.dst.int(), nm });
-                        },
-                        .CallMemberOrGlobal => |cg| {
-                            const nm = blk: {
-                                const cs = dmg.get().consts.items;
-                                if (cg.name.int() < cs.len and cs[cg.name.int()] == .String)
-                                    break :blk cs[cg.name.int()].String;
-                                break :blk "?";
-                            };
-                            std.debug.print("[dumpfn]   CallMemberOrGlobal dst=r{d} name={s} n_args={d} func={?d} final={} class={?d} cands={d}\n", .{
-                                cg.dst.int(),
-                                nm,
-                                cg.n_args,
-                                if (cg.func) |f| f.int() else null,
-                                cg.func_final,
-                                if (cg.class) |c| c.int() else null,
-                                if (cg.candidates) |cl| cl.len else 0,
-                            });
-                        },
-                        .MakeCell => |mc| std.debug.print("[dumpfn]   MakeCell dst=r{d}\n", .{mc.dst.int()}),
-                        .CellSet => |cs| std.debug.print("[dumpfn]   CellSet cell=r{d} value=r{d}\n", .{ cs.cell.int(), cs.value.int() }),
-                        .CellGet => |cg2| std.debug.print("[dumpfn]   CellGet dst=r{d} cell=r{d}\n", .{ cg2.dst.int(), cg2.cell.int() }),
-                        .LoadCapture => |lc| std.debug.print("[dumpfn]   LoadCapture dst=r{d} idx={d}\n", .{ lc.dst.int(), lc.idx }),
-                        .AstLambda => |al| {
-                            std.debug.print("[dumpfn]   AstLambda dst=r{d} body=#{?d} caps=", .{ al.dst.int(), if (al.body_func) |bf| bf.int() else null });
-                            for (al.captures) |cr| std.debug.print("r{d} ", .{cr.int()});
-                            std.debug.print("\n", .{});
-                        },
-                        .CallMember => |cm| {
-                            const nm = blk: {
-                                const cs = dmg.get().consts.items;
-                                if (cm.name.int() < cs.len and cs[cm.name.int()] == .String)
-                                    break :blk cs[cm.name.int()].String;
-                                break :blk "?";
-                            };
-                            const head_of = struct {
-                                fn f(consts: []const ir.Const, id: ?ir.ConstId) []const u8 {
-                                    const c = id orelse return "-";
-                                    if (c.int() < consts.len and consts[c.int()] == .String) return consts[c.int()].String;
-                                    return "?";
-                                }
-                            }.f;
-                            std.debug.print("[dumpfn]   CallMember dst=r{d} recv=r{d} name={s} n={d} trailing={} static_recv={s} declared_recv={s} resolved={?d}\n", .{
-                                cm.dst.int(),
-                                cm.receiver.int(),
-                                nm,
-                                cm.n_args,
-                                cm.x().trailing_lambda,
-                                head_of(dmg.get().consts.items, cm.x().static_recv),
-                                head_of(dmg.get().consts.items, cm.x().declared_recv),
-                                if (cm.x().resolved) |r| r.int() else null,
-                            });
-                        },
-                        .CallValue => |cv| std.debug.print("[dumpfn]   CallValue dst=r{d} callee=r{d} args=r{d} n={d}\n", .{ cv.dst.int(), cv.callee.int(), cv.args.int(), cv.n_args }),
-                        .Move => |mv| std.debug.print("[dumpfn]   Move dst=r{d} src=r{d}\n", .{ mv.dst.int(), mv.src.int() }),
-                        .UnOp => |uo| std.debug.print("[dumpfn]   UnOp dst=r{d} op={s} operand=r{d}\n", .{ uo.dst.int(), @tagName(uo.op), uo.operand.int() }),
-                        else => std.debug.print("[dumpfn]   {s}\n", .{@tagName(std.meta.activeTag(inst))}),
-                    }
-                }
-                std.debug.print("[dumpfn]   -> {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))});
-            }
-        }
-    }
-    return null;
-}
-
 pub fn vmPrepare(self: *Vm) Allocator.Error!?VmError {
-    const module_ref = self.module.clone();
-    defer module_ref.deinit();
-    const mg = module_ref.borrow();
-    defer mg.deinit();
-    return vmPrepareInner(self, mg.get(), self.out_sink.output());
+    try vmPrepareResolved(self);
+    return null;
 }
 
 pub fn vmCallNoArg(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
@@ -783,6 +319,75 @@ pub fn vmCallNoArg(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
     var host = vmMakeHost(self, self.out_sink.output());
     const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, .empty, &host);
     return outcomeFromEval(self, r);
+}
+
+/// Runs a program's `main` as `vmRunBody` does: a `suspend fun main` on the
+/// cooperative pump, so a suspension parks instead of escaping, and
+/// `main(args)` with the program's arguments.
+pub fn vmCallMain(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const mg = module_ref.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const func = module.funcById(func_id) orelse return .{ .failed = "main not found" };
+    const sink = self.out_sink.output();
+    // The file declaring `main` is initialized before it runs, as the JVM
+    // initializes the class whose `main` it launches.
+    if (module.resolved != null) {
+        var init_host = vmMakeHost(self, sink);
+        if (try ir.eval.resolved_ops.ensureFacade(VmHost, self.allocator, module, &init_host, func_id)) |e| return outcomeFromEval(self, .{ .err = e });
+    }
+    if (func.is_suspend) {
+        var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
+        return outcomeFromRuntime(self, try vmhost.coroutines.driveSuspendMain(&intrinsic, func_id, sink));
+    }
+    var host = vmMakeHost(self, sink);
+    var args: std.ArrayList(Value) = .empty;
+    if (func.params.len >= 1) try args.append(self.allocator, try programArgsValue(self.allocator, self.program_args));
+    const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, args, &host);
+    return outcomeFromEval(self, r);
+}
+
+/// Calls `func_id` of a module lowered from sema with `args`.
+pub fn vmCallArgs(self: *Vm, func_id: FuncId, args: []const Value) Allocator.Error!CallOutcome {
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const mg = module_ref.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const func = module.funcById(func_id) orelse return .{ .failed = "function not found" };
+    var host = vmMakeHost(self, self.out_sink.output());
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendSlice(self.allocator, args);
+    for (list.items) |v| v.retain();
+    return outcomeFromEval(self, try ir.eval.evalWith(VmHost, self.allocator, module, func, list, &host));
+}
+
+/// An instance of `class` of a module lowered from sema, built as
+/// `RNewInstance` builds it with the constructor `ctor` and no arguments.
+pub fn vmNewResolved(self: *Vm, class: ir.ClassId, ctor: FuncId) Allocator.Error!CallOutcome {
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const mg = module_ref.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const r = module.resolved orelse return .{ .failed = "the module has no resolved tables" };
+    if (class.int() >= r.classes.len) return .{ .failed = "class not in the tables" };
+    // A host-backed class's constructor makes the host value itself.
+    if (ctor.int() < r.func_native.len and r.func_native[ctor.int()] != .none) {
+        var host = vmMakeHost(self, self.out_sink.output());
+        return outcomeFromEval(self, try host.callNative(self.allocator, r.func_native[ctor.int()], &.{}));
+    }
+    const st = self.resolved_state orelse return .{ .failed = "no resolved state" };
+    const identity = blk: {
+        const g = st.borrowMut();
+        defer g.deinit();
+        g.get().next_identity += 1;
+        break :blk g.get().next_identity;
+    };
+    const inst = try ir.resolved.instantiate(self.allocator, r, class, identity);
+    return vmCallArgs(self, ctor, &.{inst});
 }
 
 pub fn vmConstruct(self: *Vm, class_id: ir.ClassId) Allocator.Error!CallOutcome {
@@ -802,6 +407,45 @@ pub fn vmCallMethod(self: *Vm, receiver: *const Value, name: []const u8) Allocat
     return outcomeFromEval(self, r);
 }
 
+/// A throwable's `toString()`, which heads its stack trace: its class's own
+/// through the `Any.toString` slot. Null for a value the tables do not
+/// class, or when the call does not answer a string.
+pub fn vmThrowableText(self: *Vm, allocator: Allocator, v: *const Value) Allocator.Error!?[]const u8 {
+    const r = self.module.asPtrConst().resolved orelse return null;
+    if (v.* != .Instance) return null;
+    const cls = ir.resolved.classOf(r, v) orelse return null;
+    const slot = r.well_known.get(.to_string) orelse return null;
+    const target = ir.resolved.slotTarget(r, cls, slot) orelse return null;
+    switch (try vmCallArgs(self, target, &.{v.*})) {
+        .ok => |t| if (t == .String) return try allocator.dupe(u8, t.String.asPtrConst().bytes),
+        else => {},
+    }
+    return null;
+}
+
+fn throwableHeader(ctx: *anyopaque, allocator: Allocator, v: *const Value) Allocator.Error!?[]const u8 {
+    const self: *Vm = @ptrCast(@alignCast(ctx));
+    return vmThrowableText(self, allocator, v);
+}
+
+/// An uncaught throwable as the JVM reports one that ends `main`:
+/// `Exception in thread "main" ` and its stack trace, each header its
+/// `toString()`.
+pub fn vmUncaughtText(self: *Vm, allocator: Allocator, v: *const Value) Allocator.Error![]const u8 {
+    return vmThreadUncaughtText(self, allocator, v, "main");
+}
+
+/// `vmUncaughtText` for a throwable that ends the thread `thread`.
+pub fn vmThreadUncaughtText(self: *Vm, allocator: Allocator, v: *const Value, thread: []const u8) Allocator.Error![]const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    try text.print(allocator, "Exception in thread \"{s}\" ", .{thread});
+    try ir.eval.formatThrowableWith(allocator, v, &text, .{ .ctx = self, .render = throwableHeader });
+    return text.items;
+}
+
+/// What the JVM's default handler prints ahead of a trace that ends `main`.
+pub const uncaught_prefix = "Exception in thread \"main\" ";
+
 /// Prepare the Vm, run `body`, then drain workers; a startup `VmError` skips `body`.
 pub fn vmRunCalls(
     self: *Vm,
@@ -818,6 +462,10 @@ pub fn vmRunCalls(
     defer vmhost.coroutines.gcThreadExit();
     _ = live_vm_runs.fetchAdd(1, .acq_rel);
     defer _ = live_vm_runs.fetchSub(1, .acq_rel);
+    // The thread running the program is the JVM's "main".
+    const tid = std.Thread.getCurrentId();
+    runtime.setThreadName(tid, "main");
+    defer runtime.clearThreadName(tid);
     const prep = try vmPrepare(self);
     if (prep == null) try body(ctx, self);
     _ = joinAllThreads(self, .{ .ok = .{ .Unit = {} } });
@@ -881,7 +529,11 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
             };
             if (handle) |h| {
                 // join() establishes happens-before with the worker's writes.
+                // Blocked, the joining thread counts as parked for a
+                // collection the worker starts.
+                runtime.gc.enterBlockingSafe();
                 h.join();
+                runtime.gc.exitBlockingSafe();
             }
             const g = self.threads.borrow();
             defer g.deinit();
@@ -930,14 +582,14 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
             var buf: std.ArrayList(u8) = .empty;
             switch (v) {
                 .Exception, .Instance => {
-                    buf.appendSlice(allocator, "uncaught ") catch return .{ .Eval = "uncaught exception" };
+                    buf.appendSlice(allocator, uncaught_prefix) catch return .{ .Eval = uncaught_prefix };
                     ir.eval.formatThrowable(allocator, &v, &buf, false, 0) catch {};
                 },
                 else => {
-                    buf.appendSlice(allocator, "uncaught throw") catch return .{ .Eval = "uncaught throw" };
+                    buf.appendSlice(allocator, uncaught_prefix ++ "<thrown value>") catch return .{ .Eval = uncaught_prefix };
                 },
             }
-            const out = buf.toOwnedSlice(allocator) catch "uncaught exception";
+            const out = buf.toOwnedSlice(allocator) catch uncaught_prefix;
             return .{ .Eval = out };
         },
         .Unsupported => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
@@ -946,7 +598,7 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
         .Unimplemented => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .CalleeFailed => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .Arity => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
-        .StackOverflow => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "uncaught java.lang.StackOverflowError: {s}", .{s}) catch s },
+        .StackOverflow => |s| return .{ .Eval = std.fmt.allocPrint(allocator, uncaught_prefix ++ "java.lang.StackOverflowError: {s}", .{s}) catch s },
         else => return .{ .Eval = "IR eval error" },
     }
 }
@@ -971,6 +623,7 @@ pub fn vmDeinit(self: *Vm) void {
         self.threads.deinit();
         self.object_states.deinit();
         self.singletons_by_id.deinit();
+        if (self.resolved_state) |st| st.deinit();
     }
     vmhost.resetReceiverThreadLocals();
 }
@@ -979,38 +632,4 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
-}
-
-/// Free a `Func` body from `FuncBuilder.finish`; module `deinit` frees the list only.
-fn freeFunc(func: ir.Func) void {
-    func.freeBuilt(testing.allocator);
-}
-
-test "vm runs a simple main returning an int const" {
-    const FuncBuilder = ir.build.FuncBuilder;
-    var module = Module.default(testing.allocator);
-    var b = try FuncBuilder.init(testing.allocator, &module);
-    const r = try b.emitConst(.{ .Int = 42 });
-    b.terminate(.{ .Return = r });
-    const main_func = try b.finish("main", "main", ir.build.typeInt());
-    b.deinit();
-    const main_id = module.nextFuncId();
-    var placed = main_func;
-    placed.id = main_id;
-    try module.funcs.append(testing.allocator, placed);
-    try module.func_index.append(testing.allocator, .{ .name = "main", .id = main_id });
-    try module.top_level.append(testing.allocator, main_id);
-    try module.rebuildFuncNameIndex(testing.allocator);
-
-    const module_ref = try ObjRef(Module).init(testing.allocator, module);
-    var vm = try vmNew(testing.allocator, module_ref);
-
-    var cap = runtime.CaptureOutput.init(testing.allocator);
-    defer cap.deinit();
-    const res = try vmRun(&vm, main_id, cap.output());
-    try testing.expect(res == .ok);
-    try testing.expect(res.ok == .Int and res.ok.Int == 42);
-
-    vmDeinit(&vm);
-    freeFunc(placed);
 }

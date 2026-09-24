@@ -41,16 +41,17 @@ Two ways an audit sweep reads clean while finding nothing:
 | Question | Command | Cost |
 | --- | --- | --- |
 | Does one program behave? | `KLIO_HOME=$PWD/.klio-local zig-out/bin/klio-harness run file.kt` (add the `// Run with:` header flags an example declares, e.g. `--feature kotlinx.serialization/json`) | seconds |
-| One stdlib commontest file, both eager modes | `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest --eager both` | ~15 s |
+| One stdlib commontest file | `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest` | ~15 s |
 | The whole stdlib commontest | `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness` (per-directory batching; `--no-batch` isolates a hang) | minutes |
 | One box conformance directory | `KLIO_ITEST_BIN=zig-out/bin/klio-harness KLIO_BOX_FILTER=ranges/ KLIO_BOX_JOBS=4 zig-out/bin/klio-census box` (`KLIO_BOX_FILTER` is a path substring: use `enum/`, not `enum`) | ~1 min |
 | One box test by hand | copy the file, append `fun main() { println(box()) }`, run it through the harness | seconds |
 | One library census | `KLIO_ITEST_BIN=zig-out/bin/klio-harness zig-out/bin/klio-census <coroutines|datetime|serialization|serialization_json|io|atomicfu|ktor|compose_ui|box>` | minutes |
-| One compose plugin class | `HOME=/tmp/klio_itest_compose_plugin_home KLIO_COMPOSE_PLUGIN=1 zig-out/bin/klio-harness test <the plugin file list> --filter=<Class[.test]>` (never the whole list in one process) | seconds |
+| One compose plugin class | `zig build klio-test-home`, then `HOME=$PWD/zig-out/klio-test-home KLIO_COMPOSE_PLUGIN=1 zig-out/bin/klio-harness test <the plugin file list> --filter=<Class[.test]>` (never the whole list in one process) | seconds |
 | The example corpus on the CLI route | `KLIO_BIN=zig-out/bin/klio-harness scripts/refresh-local-packs.sh` then `KLIO_HOME=$PWD/.klio-local python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180 --list-fail --jobs 4` | minutes |
 | The threaded litmus set | `python3 scripts/litmus-sweep.py [harness] [--filter substr]` | ~40 s |
-| The in-process e2e corpus (both JIT modes) | `zig build itest-e2e -Dharness-optimize=ReleaseSafe` | ~10 min |
-| The pinned parity corpus | `zig build itest-parity_corpus_pinned -Dharness-optimize=ReleaseSafe` | minutes |
+| The e2e corpus (both JIT modes) | `zig build itest-e2e` | ~5 min |
+| The parity suites | `zig build itest-group_parity_core itest-group_parity_types itest-group_parity_shapes` (the pinned parity corpus is in `core`) | ~2 min |
+| The sema census | `python3 scripts/sema-census.py --home $PWD/.klio-local` | ~30 s |
 | The whole local gate | `scripts/stack.sh` | ~23 min warm |
 | The CI shape | `taskset -c 0-3 zig build itest -Ditest-shard=K/8 -Dharness-optimize=ReleaseSafe` | 12-21 min per shard |
 
@@ -66,9 +67,9 @@ library censuses (coroutines, io, androidx collection, ktor, datetime,
 serialization, serialization json, compose ui, atomicfu), the example
 corpus lowered from the tree (`itest-check_examples`), the box conformance
 census, the stdlib commontest sweep, the compose-ui gate, and the threaded
-litmus last. It does not run the in-process e2e corpus, the pinned parity
-corpus, or the CLI-route corpus check; run those three separately when a
-change touches lowering, reification, or pack loading.
+litmus last. It does not run the e2e corpus, the parity suites, or the
+CLI-route corpus check; run those three separately when a change touches
+lowering, reification, or pack loading.
 
 Two suites that are not in the stdlib sweep have caught lowering
 regressions the sweep passed: the coroutines census (an inline reified
@@ -125,34 +126,21 @@ stale packs.
   suite and tests; reproduce with the matching census or suite locally
   before changing anything.
 
-## The resolution ratchet
+## The sema census
 
-`plans/resolution-ceiling.json` records, per unresolved site kind, how many
-sites the corpus holds. The gate's `ratchet` phase re-runs the census and
-fails when any kind is ABOVE its entry, or when a kind absent from the file
-appears at all.
+`scripts/sema-census.py` runs `klio sema` over the base source set
+(`--bodies base --lower`), over every pack installed in the home it is
+given with all of the pack's features (`--bodies all --lower`), and over
+the example corpus (`--each`, a multi-file example directory as one
+program). Every unresolved or unrecorded reference it finds, every body of
+the base and the packs that does not lower (`lower_unrecorded`,
+`lower_bridge`, `lower_lowering`, `lower_unsupported`) and every bodyless
+declaration no native binds (`lower_unbound_native`) must be listed in
+`tests/sema-census-open.txt`; a site not listed fails the gate, and so does
+a listed site that no longer occurs, so the list only shrinks. A body that
+does not lower produces no diagnostic when a program runs; the run fails
+later with "has no body", so this list is where those gaps show. When a fix
+closes a site, delete its line in the same commit; `--update-open` rewrites
+the file from a run.
 
-    KLIO_HOME=$PWD/.klio-local python3 scripts/site-census-sweep.py \
-      --timeout 180 --ceiling plans/resolution-ceiling.json
-
-A kind that FELL is reported and passes: lower its entry in the same commit
-that lowered it, with `--write-ceiling`. A kind that ROSE fails, and the fix
-is to stop re-deriving that target by name — not to raise the number. If a
-rise is genuinely intended, say why in `plans/resolved-interpreter.md` and
-re-record.
-
-The counts are summed per program over a pinned program set, so the ceiling
-carries the program count and refuses to compare against a different one.
-
-The phase runs `--cold`, clearing the bake cache first, and the ceiling
-records which state it was taken in. A WARM sweep counts 23 more unresolved
-sites than a cold one, because resolution a fresh lowering reaches does not
-entirely survive the image round-trip, and the two are refused against each
-other.
-
-The TOTAL is checked exactly and is stable cold. The per-kind split drifts
-by a few even cold — six sites trade between `call_member_by_name` and
-`call_new_instance` at an unchanged total, a classification flipping on
-whether a class was registered when the site was classified, which depends on
-the body pool's shard order — so a kind may rise by `max(64, ceiling/1000)`
-without failing, reported as `drift`. A real regression moves the total.
+    python3 scripts/sema-census.py --klio zig-out/bin/klio-harness --home $PWD/.klio-local

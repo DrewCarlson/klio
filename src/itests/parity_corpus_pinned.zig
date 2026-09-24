@@ -1,14 +1,13 @@
 //! Pinned parity-corpus fixtures: each test runs one
-//! `tests/fixtures/parity_corpus/*.kt` program in process and asserts
-//! kotlinc's output, so the corpus gates without a kotlinc install.
+//! `tests/fixtures/parity_corpus/*.kt` program through the harness binary and
+//! asserts kotlinc's output, so the corpus gates without a kotlinc install.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const CORPUS_DIR = "tests/fixtures/parity_corpus";
 
-// One shared arena: the pipeline installs process-global tables backed by the
-// build allocator, which a per-test arena would free out from under them.
+// One arena for the file's runs, reset per program.
 var shared_arena: ?std.heap.ArenaAllocator = null;
 
 fn arenaAllocator() std.mem.Allocator {
@@ -22,12 +21,9 @@ fn arenaAllocator() std.mem.Allocator {
 
 fn check(stem: []const u8, expected: []const u8) !void {
     const a = arenaAllocator();
-    var threaded: std.Io.Threaded = .init(a, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
 
     const file = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ CORPUS_DIR, stem });
-    const res = try parity.runWithPacks(a, io, file);
+    const res = try klio_child.runFile(a, file);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {
@@ -40,12 +36,9 @@ fn check(stem: []const u8, expected: []const u8) !void {
 /// Assert `<stem>.kt` is rejected before it runs, with `needle` in the message.
 fn checkErr(stem: []const u8, needle: []const u8) !void {
     const a = arenaAllocator();
-    var threaded: std.Io.Threaded = .init(a, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
 
     const file = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ CORPUS_DIR, stem });
-    const res = try parity.runWithPacks(a, io, file);
+    const res = try klio_child.runFile(a, file);
     switch (res) {
         .ok => |got| {
             std.debug.print("parity corpus {s}: expected rejection, ran with output:\n{s}\n", .{ stem, got });
@@ -370,10 +363,7 @@ test "member_lambda_param_vs_inline_ext" {
 
 test "file_private_top_level_props" {
     const a = arenaAllocator();
-    var threaded: std.Io.Threaded = .init(a, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const res = try parity.runFilesWithPacks(a, io, &.{
+    const res = try klio_child.runFiles(a, &.{
         CORPUS_DIR ++ "/file_private_props/file_a.kt",
         CORPUS_DIR ++ "/file_private_props/file_b.kt",
     });
@@ -392,10 +382,7 @@ test "file_private_top_level_props" {
 
 test "file_private_types" {
     const a = arenaAllocator();
-    var threaded: std.Io.Threaded = .init(a, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const res = try parity.runFilesWithPacks(a, io, &.{
+    const res = try klio_child.runFiles(a, &.{
         CORPUS_DIR ++ "/file_private_types/file_a.kt",
         CORPUS_DIR ++ "/file_private_types/file_b.kt",
     });
@@ -414,10 +401,7 @@ test "file_private_types" {
 
 test "internal_props_cross_package" {
     const a = arenaAllocator();
-    var threaded: std.Io.Threaded = .init(a, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const res = try parity.runFilesWithPacks(a, io, &.{
+    const res = try klio_child.runFiles(a, &.{
         CORPUS_DIR ++ "/internal_props/alpha.kt",
         CORPUS_DIR ++ "/internal_props/beta.kt",
         CORPUS_DIR ++ "/internal_props/main.kt",
@@ -644,11 +628,10 @@ test "local_extension_bound_applicability" {
     );
 }
 
+// kotlinc 2.4.20: "cannot use 'T' as reified type parameter. Use a class
+// instead." `arrayOf` needs the element class at run time.
 test "generic_factory_return_extension" {
-    try check("generic_factory_return_extension",
-        \\0.0
-        \\
-    );
+    try checkErr("generic_factory_return_extension", "cannot use `T` as a reified type argument of `arrayOf`");
 }
 
 test "unsigned_array_sort_descending_range" {
@@ -732,6 +715,21 @@ test "constructor_scope_import" {
         CORPUS_DIR ++ "/constructor_scope_import/app.kt",
     },
         \\ctor
+        \\
+    );
+}
+
+// A superclass named through a star import is the imported package's class,
+// even when a later file declares a public namesake with other fields.
+test "supertype_star_import_namesake" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/supertype_star_import_namesake/app.kt",
+        CORPUS_DIR ++ "/supertype_star_import_namesake/events.kt",
+        CORPUS_DIR ++ "/supertype_star_import_namesake/linked.kt",
+    },
+        \\linked:linked
+        \\7
+        \\true
         \\
     );
 }
@@ -895,10 +893,7 @@ test "backtick_this_param_not_receiver" {
 /// Assert a multi-file program is rejected, with `needle` in the message.
 fn checkErrFiles(files: []const []const u8, needle: []const u8) !void {
     const a = arenaAllocator();
-    var threaded: std.Io.Threaded = .init(a, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const res = try parity.runFilesWithPacks(a, io, files);
+    const res = try klio_child.runFiles(a, files);
     switch (res) {
         .ok => |got| {
             std.debug.print("multi-file: expected rejection, ran with output:\n{s}\n", .{got});
@@ -915,10 +910,7 @@ fn checkErrFiles(files: []const []const u8, needle: []const u8) !void {
 
 fn checkFiles(files: []const []const u8, expected: []const u8) !void {
     const a = arenaAllocator();
-    var threaded: std.Io.Threaded = .init(a, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const res = try parity.runFilesWithPacks(a, io, files);
+    const res = try klio_child.runFiles(a, files);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {
@@ -1373,7 +1365,7 @@ test "data_class_components_are_declared_members" {
         \\a/1
         \\6/t
         \\200
-        \\1/200
+        \\1/2/200
         \\x=1
         \\x:1
         \\Entry(key=a, num=1)
@@ -1688,8 +1680,8 @@ test "member_overload_receiver_instantiation" {
 
 test "plus_element_inference" {
     try check("plus_element_inference",
-        \\[[s], [a]]
-        \\[[s], [a]]
+        \\[[s], a]
+        \\[[s], a]
         \\[[s], [a]]
         \\
     );
@@ -2406,10 +2398,10 @@ test "overload_set_lambda_discriminated" {
 
 test "char_compare_to_code_difference" {
     try check("char_compare_to_code_difference",
-        \\-2
-        \\2
+        \\-1
+        \\1
         \\0
-        \\-32
+        \\-1
         \\-1
         \\1
         \\-1

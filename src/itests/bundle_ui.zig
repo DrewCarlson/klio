@@ -115,6 +115,7 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     const bin = try klioBin(a, io, &build_env);
 
     const pack_dirs = [_][]const u8{
+        "kotlin-klio/klio-androidx-annotation",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-coroutines",
@@ -122,16 +123,12 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
         "kotlin-klio/klio-compose-runtime-engine",
         "kotlin-klio/klio-compose-ui",
     };
-    const pack_files = [_][]const u8{
-        "target/packs/kotlinx.atomicfu.klio-pack",
-        "target/packs/kotlinx.io.klio-pack",
-        "target/packs/kotlinx.coroutines.klio-pack",
-        "target/packs/androidx.collection.klio-pack",
-        "target/packs/androidx.compose.runtime.klio-pack",
-        "target/packs/klio.compose.ui.klio-pack",
-    };
-    for (pack_dirs) |d| {
-        const r = try runChild(a, io, &build_env, &.{ bin, "pack", "build", d });
+    // Built into this suite's own directory: the shared target/packs is
+    // rewritten by every other suite that builds a pack.
+    var pack_files: [pack_dirs.len][]const u8 = undefined;
+    for (pack_dirs, &pack_files) |d, *f| {
+        f.* = try std.fmt.allocPrint(a, "{s}/{s}.klio-pack", .{ TMP_ROOT, std.fs.path.basename(d) });
+        const r = try runChild(a, io, &build_env, &.{ bin, "pack", "build", d, "--out", f.* });
         if (r.code != 0) {
             std.debug.print("bundle_ui: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
             return error.TestUnexpectedResult;

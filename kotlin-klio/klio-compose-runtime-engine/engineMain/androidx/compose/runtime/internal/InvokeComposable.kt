@@ -19,5 +19,11 @@ import androidx.compose.runtime.Composer
 private const val rootContentKey = 0x10a7f001
 
 internal actual fun invokeComposable(composer: Composer, composable: @Composable () -> Unit) {
+    // Content the lowering already made a composable lambda has its scope.
+    val content: Any = composable
+    if (content is ComposableLambdaImpl) {
+        content.invoke(composer, 1)
+        return
+    }
     ComposableLambdaImpl(rootContentKey, true, composable).invoke(composer, 1)
 }

@@ -1,12 +1,11 @@
 //! Parity for lambdas and dispatch: receiver lambdas, implicit-receiver
 //! resolution, callable references, and scope-function chaining.
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const TMP_DIR = "/tmp/klio_itest_lambdas_and_dispatch";
 
-// The pipeline's process-global state points into the run allocator, so one
-// file-scoped arena must outlive every test here.
+// One arena for the file's runs, reset per program.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
@@ -28,7 +27,7 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
         return error.KlioRunFailed;
     };
 
-    const res = try parity.runWithPacks(a, io, path);
+    const res = try klio_child.runFile(a, path);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {
@@ -57,7 +56,7 @@ fn assertKlioUnresolved(name: []const u8, src: []const u8, unresolved: []const u
         return error.KlioRunFailed;
     };
 
-    const res = try parity.runWithPacks(a, io, path);
+    const res = try klio_child.runFile(a, path);
     switch (res) {
         .ok => |got| {
             std.debug.print("lambdas_and_dispatch {s}: expected unresolved `{s}`, program ran: {s}\n", .{ name, unresolved, got });
@@ -346,8 +345,8 @@ test "iterable_max_of_or_null_with_transform" {
 test "invoke_operator_instance_used_as_lambda_value" {
     const src =
         \\
-        \\class Tagger(val prefix: String) {
-        \\    operator fun invoke(s: String): String = "$prefix:$s"
+        \\class Tagger(val prefix: String) : (String) -> String {
+        \\    override operator fun invoke(s: String): String = "$prefix:$s"
         \\}
         \\fun main() {
         \\    val t = Tagger("note")

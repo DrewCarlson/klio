@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
@@ -18,6 +19,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    try map.put("KLIO_HOME", home);
     // Widens borrow-acquisition windows so a real race reproduces reliably.
     try map.put("KLIO_RACE_JITTER", "1");
     return map;
@@ -43,41 +45,8 @@ fn runKlio(
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, home) catch {};
-    const pack_dirs = [_][]const u8{
-        "kotlin-klio/klio-kotlinx-atomicfu",
-        "kotlin-klio/klio-kotlinx-coroutines",
-        "kotlin-klio/klio-kotlinx-io",
-        "kotlin-klio/klio-ktor",
-    };
-    const pack_files = [_][]const u8{
-        "target/packs/kotlinx.atomicfu.klio-pack",
-        "target/packs/kotlinx.coroutines.klio-pack",
-        "target/packs/kotlinx.io.klio-pack",
-        "target/packs/io.ktor.klio-pack",
-    };
-    for (pack_dirs) |d| {
-        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", d });
-        if (!r.ok) {
-            std.debug.print("concurrency_stress: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
-            return error.PackBuildFailed;
-        }
-    }
-    for (pack_files) |f| {
-        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", f });
-        if (!r.ok) {
-            std.debug.print("concurrency_stress: pack install {s} failed:\n{s}\n", .{ f, r.stderr });
-            return error.PackInstallFailed;
-        }
-    }
-}
-
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-var packs_installed = false;
 
-const SCRATCH_HOME = "/tmp/klio_itest_concstress_home";
 const TMP_DIR = "/tmp/klio_itest_concstress";
 
 fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
@@ -87,11 +56,7 @@ fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var env = try envWithHome(a, SCRATCH_HOME);
-    if (!packs_installed) {
-        try installPacks(a, io, &env, SCRATCH_HOME);
-        packs_installed = true;
-    }
+    var env = try envWithHome(a, try klio_child.home(a));
 
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, TMP_DIR) catch {};

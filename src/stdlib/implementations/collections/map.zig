@@ -263,7 +263,7 @@ fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!?usize {
     };
     defer if (runtime.freeScratch()) ctx.allocator.free(keys);
     for (keys, 0..) |k, i| {
-        if (try ctx.host.invokeMethod(&k, "equals", &.{key}, ctx.out)) |m| {
+        if (try ctx.host.callWellKnown(&k, .equals, &.{key}, ctx.out)) |m| {
             if (m == .ok and m.ok == .Bool) {
                 if (m.ok.Bool) return i;
                 continue;
@@ -793,7 +793,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
         // `MutableMap.putAll(pairs: Iterable<Pair>)` passes.
         .Instance => {
             const is_map = blk: {
-                const er = (try ctx.host.getProperty(&arg, "entries", ctx.out)) orelse break :blk false;
+                const er = (try ctx.host.callWellKnown(&arg, .entries, &.{}, ctx.out)) orelse break :blk false;
                 break :blk er == .ok;
             };
             if (is_map) {

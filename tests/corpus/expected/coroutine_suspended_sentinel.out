@@ -1,0 +1,6 @@
+body start
+without suspending: 7
+start returned the sentinel: true
+resumed with 21
+completed with 42
+done

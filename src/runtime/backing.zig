@@ -17,6 +17,7 @@ fn envOn(comptime name: [:0]const u8) ?bool {
 pub fn configureGcFromEnv() void {
     // Reference counting is neutralized, so the collector alone frees.
     gc.gc_enabled = true;
+    gc.verify_describe = @import("class.zig").describeGcEdge;
     if (envOn("KLIO_GC_STRESS")) |v| gc.gc_stress = v;
     if (envOn("KLIO_GC_DEBUG")) |v| gc.gc_debug = v;
     if (envOn("KLIO_GC_HIST")) |v| gc.gc_hist = v;

@@ -30,6 +30,113 @@ pub const CallCtx = struct {
     allocator: std.mem.Allocator,
 };
 
+/// A member of the base a native calls on a value it was given, named by
+/// the declaration rather than by its name: the value's class answers with
+/// its own implementation, as a Kotlin call through that member would.
+pub const WellKnown = enum(u8) {
+    /// `Any.toString()`, `equals(other)`, `hashCode()`.
+    to_string,
+    equals,
+    hash_code,
+    /// `Comparable.compareTo(other)`, `Comparator.compare(a, b)`.
+    compare_to,
+    compare,
+    /// `Iterable.iterator()`, `Iterator.hasNext()`, `Iterator.next()`.
+    iterator,
+    has_next,
+    next,
+    /// `Collection.size`, `contains(element)`, `isEmpty()`.
+    size,
+    contains,
+    is_empty,
+    /// `AbstractCollection.toArray()`, which `toTypedArray` copies through.
+    to_array,
+    /// `List.get(index)`.
+    list_get,
+    /// `Map.size`, `get(key)`, `containsKey(key)`, `entries`, `keys`,
+    /// `values`.
+    map_size,
+    map_get,
+    contains_key,
+    entries,
+    keys,
+    values,
+    /// `Map.Entry.key`, `Map.Entry.value`.
+    entry_key,
+    entry_value,
+    /// `CharSequence.length`, `CharSequence.get(index)`.
+    length,
+    char_at,
+    /// `Grouping.sourceIterator()`, `Grouping.keyOf(element)`.
+    source_iterator,
+    key_of,
+    /// `Continuation.context`, `CoroutineScope.coroutineContext`.
+    context,
+    coroutine_context,
+    /// `Random.nextInt(until)`, which a shuffle draws from.
+    next_int,
+    /// `CoroutineContext.get(key)`.
+    context_get,
+    /// `CoroutineExceptionHandler.handleException(context, exception)`.
+    handle_exception,
+
+    /// The member's name, for a host that answers by name.
+    pub fn memberName(m: WellKnown) []const u8 {
+        return switch (m) {
+            .to_string => "toString",
+            .equals => "equals",
+            .hash_code => "hashCode",
+            .compare_to => "compareTo",
+            .compare => "compare",
+            .iterator => "iterator",
+            .has_next => "hasNext",
+            .next => "next",
+            .size, .map_size => "size",
+            .contains => "contains",
+            .is_empty => "isEmpty",
+            .to_array => "toArray",
+            .list_get, .map_get, .char_at => "get",
+            .contains_key => "containsKey",
+            .entries => "entries",
+            .keys => "keys",
+            .values => "values",
+            .entry_key => "key",
+            .entry_value => "value",
+            .length => "length",
+            .source_iterator => "sourceIterator",
+            .key_of => "keyOf",
+            .context => "context",
+            .coroutine_context => "coroutineContext",
+            .next_int => "nextInt",
+            .context_get => "get",
+            .handle_exception => "handleException",
+        };
+    }
+
+    /// Whether the member is a property, read through its getter.
+    pub fn isProperty(m: WellKnown) bool {
+        return switch (m) {
+            .size, .map_size, .entries, .keys, .values, .entry_key, .entry_value, .length, .context, .coroutine_context => true,
+            else => false,
+        };
+    }
+};
+
+/// An object of the base or a pack a native needs, named by its
+/// declaration.
+pub const WellKnownObject = enum(u8) {
+    /// `CoroutineExceptionHandler.Key`, the context key of a coroutine's
+    /// exception handler.
+    coroutine_exception_handler_key,
+
+    /// The object's FQN, as sema spells a nested class's.
+    pub fn fqn(o: WellKnownObject) []const u8 {
+        return switch (o) {
+            .coroutine_exception_handler_key => "kotlinx.coroutines.CoroutineExceptionHandler.Key",
+        };
+    }
+};
+
 /// Optional slots fall back to the wrapper methods below.
 pub const IntrinsicHost = struct {
     ctx: *anyopaque,
@@ -42,6 +149,12 @@ pub const IntrinsicHost = struct {
         invoke_callable_with_this: *const fn (ctx: *anyopaque, callable: *const Value, args: []const Value, this_value: *const Value, out: Output) std.mem.Allocator.Error!EvalResult,
         /// Null answers null, falling back to structural rendering.
         invoke_method: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
+        /// `member` of an instance whose class the host's tables cover, by
+        /// its slot; null for any other value, which the native serves.
+        call_well_known: ?*const fn (ctx: *anyopaque, receiver: *const Value, member: WellKnown, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
+        /// `object`, made on first use; null when the host's tables do not
+        /// declare it.
+        well_known_object: ?*const fn (ctx: *anyopaque, object: WellKnownObject) std.mem.Allocator.Error!?Value = null,
         /// The constructor's defaults fill every unnamed parameter.
         construct_named: ?*const fn (ctx: *anyopaque, class: *const Value, names: []const []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
         /// Resolves custom getters and stored fields, where `invoke_method`
@@ -78,10 +191,13 @@ pub const IntrinsicHost = struct {
         /// Run on the caller's stack, unlike `coroutine_resume_external`, which
         /// the pump queue defers because a native park passes through no
         /// interceptor.
-        coroutine_resume_continuation: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
+        /// The throw the resumed coroutine let escape on this stack, for the
+        /// resumer's `resumeWith` to throw.
+        coroutine_resume_continuation: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) ?Value = null,
         /// Null runs the block inline on the calling thread.
         coroutine_dispatch_pooled: ?*const fn (ctx: *anyopaque, block: *const Value, io: bool, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
-        spawn_os_thread: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!HostResultU64 = null,
+        /// `name` is the thread's, as `Thread.name` answers it.
+        spawn_os_thread: ?*const fn (ctx: *anyopaque, block: *const Value, name: []const u8, out: Output) std.mem.Allocator.Error!HostResultU64 = null,
         join_os_thread: ?*const fn (ctx: *anyopaque, id: u64) std.mem.Allocator.Error!?RuntimeError = null,
         os_thread_alive: ?*const fn (ctx: *anyopaque, id: u64) bool = null,
         /// Answers the next yielded value, or `.done`. Null answers `.done`;
@@ -111,6 +227,21 @@ pub const IntrinsicHost = struct {
 
     pub fn invokeMethod(self: IntrinsicHost, receiver: *const Value, name: []const u8, args: []const Value, out: Output) !?EvalResult {
         if (self.vtable.invoke_method) |f| return f(self.ctx, receiver, name, args, out);
+        return null;
+    }
+
+    /// `member` of `receiver` through its class's slot, when the host's
+    /// tables cover it; else by the member's name, for a host that answers
+    /// by name. Null when neither answers.
+    pub fn callWellKnown(self: IntrinsicHost, receiver: *const Value, member: WellKnown, args: []const Value, out: Output) !?EvalResult {
+        if (self.vtable.call_well_known) |f| if (try f(self.ctx, receiver, member, args, out)) |r| return r;
+        if (member.isProperty()) return self.getProperty(receiver, member.memberName(), out);
+        return self.invokeMethod(receiver, member.memberName(), args, out);
+    }
+
+    /// `object` from the host's tables; null when they do not declare it.
+    pub fn wellKnownObject(self: IntrinsicHost, object: WellKnownObject) !?Value {
+        if (self.vtable.well_known_object) |f| return f(self.ctx, object);
         return null;
     }
 
@@ -233,12 +364,10 @@ pub const IntrinsicHost = struct {
         }
     }
 
-    pub fn coroutineResumeContinuation(self: IntrinsicHost, slot: i64, value: Value, out: Output) void {
-        if (self.vtable.coroutine_resume_continuation) |f| {
-            f(self.ctx, slot, value, out);
-        } else {
-            self.coroutineResumeExternal(slot, value, out);
-        }
+    pub fn coroutineResumeContinuation(self: IntrinsicHost, slot: i64, value: Value, out: Output) ?Value {
+        if (self.vtable.coroutine_resume_continuation) |f| return f(self.ctx, slot, value, out);
+        self.coroutineResumeExternal(slot, value, out);
+        return null;
     }
 
     pub fn coroutineDispatchPooled(self: IntrinsicHost, block: *const Value, io_kind: bool, out: Output) !?RuntimeError {
@@ -250,8 +379,8 @@ pub const IntrinsicHost = struct {
         };
     }
 
-    pub fn spawnOsThread(self: IntrinsicHost, block: *const Value, out: Output) !HostResultU64 {
-        if (self.vtable.spawn_os_thread) |f| return f(self.ctx, block, out);
+    pub fn spawnOsThread(self: IntrinsicHost, block: *const Value, name: []const u8, out: Output) !HostResultU64 {
+        if (self.vtable.spawn_os_thread) |f| return f(self.ctx, block, name, out);
         const r = try self.invokeCallable(block, &.{}, out);
         return switch (r) {
             .ok => .{ .ok = 0 },

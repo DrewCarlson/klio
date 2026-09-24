@@ -334,13 +334,6 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
         const nr = promoteUByteUShort(r) orelse r.*;
         return applyBinop(allocator, op, &nl, &nr);
     }
-    if ((op == .Less or op == .LessEq or op == .Greater or op == .GreaterEq) and
-        (l.* == .Float or r.* == .Float))
-    {
-        const nl = widenFloat(l);
-        const nr = widenFloat(r);
-        return applyBinop(allocator, op, &nl, &nr);
-    }
     switch (op) {
         .Add => {
             if (l.* == .Int and r.* == .Int) return ok(.{ .Int = l.Int +% r.Int });
@@ -538,6 +531,14 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
                             return ok(.{ .Bool = if (op == .NotEq) !eq else eq });
                         }
                     }
+                    // A Double against a Float compares as Double under IEEE, as
+                    // `scalarBin` does: `0.0 == -0.0F`, and NaN equals nothing.
+                    if ((lc == .Double and rc == .Float) or (lc == .Float and rc == .Double)) {
+                        const a: f64 = if (lc == .Double) lc.Double else @floatCast(lc.Float);
+                        const b: f64 = if (rc == .Double) rc.Double else @floatCast(rc.Float);
+                        const eq = a == b;
+                        return ok(.{ .Bool = if (op == .NotEq) !eq else eq });
+                    }
                 }
             }
             const eq = if (op == .BoxedEq or op == .BoxedNotEq)
@@ -610,6 +611,38 @@ fn invertOrder(o: std.math.Order) std.math.Order {
 }
 
 /// Comparison dispatch for `<`, `<=`, `>`, `>=`; `null` for an unhandled operand pairing.
+/// A signed number as one of the three kinds a mixed comparison widens
+/// through; null for any other value.
+const Widened = union(enum) { Long: i64, Float: f32, Double: f64 };
+
+fn widenedSigned(v: *const Value) ?Widened {
+    return switch (v.*) {
+        .Byte => |x| .{ .Long = x },
+        .Short => |x| .{ .Long = x },
+        .Int => |x| .{ .Long = x },
+        .Long => |x| .{ .Long = x },
+        .Float => |x| .{ .Float = x },
+        .Double => |x| .{ .Double = x },
+        else => null,
+    };
+}
+
+fn asF64Of(w: Widened) f64 {
+    return switch (w) {
+        .Long => |x| @floatFromInt(x),
+        .Float => |x| x,
+        .Double => |x| x,
+    };
+}
+
+fn asF32Of(w: Widened) f32 {
+    return switch (w) {
+        .Long => |x| @floatFromInt(x),
+        .Float => |x| x,
+        .Double => |x| @floatCast(x),
+    };
+}
+
 fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?bool {
     const Pair = struct {
         fn cmpOrder(o: BinOp, order: std.math.Order) bool {
@@ -652,10 +685,14 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
     if (asUnsigned(r)) |ru| {
         if (asSignedI64(l)) |li| return Pair.cmpOrder(op, invertOrder(cmpU64I64(ru, li)));
     }
-    if (l.* == .Int and r.* == .Double) return Pair.cmpFloat(op, @as(f64, @floatFromInt(l.Int)), r.Double);
-    if (l.* == .Double and r.* == .Int) return Pair.cmpFloat(op, l.Double, @as(f64, @floatFromInt(r.Int)));
-    if (l.* == .Long and r.* == .Double) return Pair.cmpFloat(op, @as(f64, @floatFromInt(l.Long)), r.Double);
-    if (l.* == .Double and r.* == .Long) return Pair.cmpFloat(op, l.Double, @as(f64, @floatFromInt(r.Long)));
+    // Mixed signed operands widen as the JVM's comparisons do: to Double when
+    // either side is one, else to Float when either side is one (`i2f`
+    // rounds, so `16777217 > 16777216f` is false), else to Long.
+    if (widenedSigned(l)) |lw| if (widenedSigned(r)) |rw| {
+        if (lw == .Double or rw == .Double) return Pair.cmpFloat(op, asF64Of(lw), asF64Of(rw));
+        if (lw == .Float or rw == .Float) return Pair.cmpFloat(op, @as(f64, asF32Of(lw)), @as(f64, asF32Of(rw)));
+        return Pair.cmpOrder(op, std.math.order(lw.Long, rw.Long));
+    };
     if (l.* == .String and r.* == .String) {
         const lg = l.String.borrow();
         defer lg.deinit();
@@ -736,13 +773,6 @@ fn promoteUByteUShort(v: *const Value) ?Value {
         .UByte => |b| .{ .UInt = @as(u32, b) },
         .UShort => |s| .{ .UInt = @as(u32, s) },
         else => null,
-    };
-}
-
-fn widenFloat(v: *const Value) Value {
-    return switch (v.*) {
-        .Float => |f| .{ .Double = @as(f64, f) },
-        else => v.*,
     };
 }
 

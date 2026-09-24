@@ -868,7 +868,7 @@ fn tyOfCall(self: *Checker, c: @FieldType(Expr, "Call")) Allocator.Error!Type {
     if (implicit_label) |l| {
         try self.label_stack.append(a, l);
     }
-    const result = try expr_calls.checkCallInfix(self, c.callee, c.args, c.arg_names, c.type_args, sp, c.is_infix);
+    const result = try expr_calls.checkCallInfix(self, c.callee, c.args, c.argNames(), c.typeArgs(), sp, c.is_infix);
     if (implicit_label != null) {
         _ = self.label_stack.pop();
     }

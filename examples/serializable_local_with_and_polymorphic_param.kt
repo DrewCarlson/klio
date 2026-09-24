@@ -5,6 +5,7 @@
 // element whose type is a TYPE PARAMETER (`V`), which serializes over the
 // parameter's bound (`Any`) — the base the caller's module registers under.
 import kotlinx.serialization.*
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.descriptors.*
 import kotlinx.serialization.encoding.*
 import kotlinx.serialization.json.*

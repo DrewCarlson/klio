@@ -451,7 +451,7 @@ fn walkExpr(ctx: *Ctx, e: *const Expr) Allocator.Error!void {
             for (w.branches) |*br| try walkExpr(ctx, &br.body);
         },
         .PropertyRef => |*r| try checkCallableRef(ctx, r.name.name, r.span),
-        .MemberRef => |*r| try checkCallableRef(ctx, r.name.name, r.span),
+        .MemberRef => |r| try checkCallableRef(ctx, r.name.name, r.span),
         else => {},
     }
 }
@@ -498,8 +498,8 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
     // which 2.4 excludes without the opt-in flag.
     if (callee_name) |nm| {
         if (ctx.callees.get(nm)) |sig| {
-            try resolveContextArgs(ctx, sig, nm, c.type_args, call_span);
-            for (c.arg_names) |maybe| {
+            try resolveContextArgs(ctx, sig, nm, c.typeArgs(), call_span);
+            for (c.argNames()) |maybe| {
                 if (maybe) |an| {
                     for (sig.names) |pn| {
                         if (std.mem.eql(u8, pn, an)) {

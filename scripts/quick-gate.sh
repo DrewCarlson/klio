@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The FAST per-commit battery over the installed ReleaseSafe harness —
 # the iteration-speed complement to gate.sh (which drives the itest
-# binaries and is the CI/pre-commit gate). Order: census suite, unit
-# tests, commontest sweep, examples corpus, threaded litmus. The litmus
+# binaries and is the CI/pre-commit gate). Order: the sema census (base,
+# the packs installed in .klio-local, the example corpus), unit tests,
+# commontest sweep, examples corpus, threaded litmus. The litmus
 # phase is NOT optional: a member-binding regression once hid across
 # ten commits because the quick loop skipped it (atomicfu CAS, 42->36).
 #
@@ -26,7 +27,7 @@ phase() {
   fi
 }
 phase "harness" zig build klio-harness
-phase "census" scripts/dispatch-census.sh
+phase "census" python3 scripts/sema-census.py --klio zig-out/bin/klio-harness --home "$ROOT/.klio-local"
 phase "unit" zig build test
 phase "sweep" python3 scripts/commontest-sweep.py zig-out/bin/klio-harness
 phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --no-rust

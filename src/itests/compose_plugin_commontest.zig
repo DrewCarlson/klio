@@ -1,7 +1,7 @@
 //! Run the upstream Compose runtime's own test suite through `klio test`
 //! against the installed engine pack with the `@Composable` lowering plugin:
 //! `androidx.compose.runtime` resolves to the upstream gapbuffer/linkbuffer
-//! engine and every composable lowers through `compose_pass`.
+//! engine and every composable lowers through `ir/lower/sema/compose.zig`.
 //!
 //! Every `.kt` under the roots compiles into every child (the fixtures are
 //! cross-file), isolation is one child per test class via `--filter`, and the
@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
 /// Pass-count floor, a ratchet: raise as fixes land, never lower. Set to
 /// `1390 - MAX_FAILED`, so it tolerates exactly the failures the ceiling below
@@ -29,23 +30,11 @@ const ROOTS = [_][]const u8{
     // klio-owned actuals for the test sources' platform expects.
     "tests/compose_commontest_actuals",
 };
-const SCRATCH_HOME = "/tmp/klio_itest_compose_plugin_home";
 
 /// The runtime's own test fixtures (`CompositionTest`, `TestMonotonicFrameClock`)
 /// drive composition through kotlinx-coroutines-test's `runTest`, which is the
 /// coroutines pack's `test` module.
 const CHILD_FEATURES = [_][]const u8{ "--feature", "kotlinx.coroutines/test" };
-
-const Pack = struct { dir: []const u8, artifact: []const u8 };
-/// Dependency order. The last entry supplies `androidx.compose.runtime` from
-/// the engine pack, whose sources are the upstream Composer and SlotTable.
-const PACKS = [_]Pack{
-    .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
-    .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-    .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
-    .{ .dir = "kotlin-klio/klio-androidx-collection", .artifact = "target/packs/androidx.collection.klio-pack" },
-    .{ .dir = "kotlin-klio/klio-compose-runtime-engine", .artifact = "target/packs/androidx.compose.runtime.klio-pack" },
-};
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
@@ -56,6 +45,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    try map.put("KLIO_HOME", home);
     // runTest's own per-test budget. It must never fire before klio's wall cap
     // below, the suite's hang guard: if it does, a slow but progressing test
     // reports `UncompletedCoroutinesError` instead of passing or hitting the cap.
@@ -129,21 +119,6 @@ fn runKlio(
     errdefer allocator.free(stdout_slice);
     const stderr_slice = try mr.toOwnedSlice(1);
     return .{ .term = term, .stdout = stdout_slice, .stderr = stderr_slice };
-}
-
-fn installPacks(allocator: std.mem.Allocator, env: *std.process.Environ.Map) !void {
-    for (PACKS) |p| {
-        const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", p.dir }, 600_000);
-        if (b.term != .exited or b.term.exited != 0) {
-            std.debug.print("compose_plugin_commontest: pack build {s} failed:\n{s}\n", .{ p.dir, b.stderr });
-            return error.PackBuildFailed;
-        }
-        const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", p.artifact }, 120_000);
-        if (i.term != .exited or i.term.exited != 0) {
-            std.debug.print("compose_plugin_commontest: pack install {s} failed:\n{s}\n", .{ p.artifact, i.stderr });
-            return error.PackInstallFailed;
-        }
-    }
 }
 
 fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList([]u8)) !void {
@@ -292,9 +267,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
         return error.SkipZigTest;
     };
 
-    std.Io.Dir.cwd().createDirPath(io, SCRATCH_HOME) catch {};
-    var env = try envWithHome(a, SCRATCH_HOME);
-    try installPacks(a, &env);
+    var env = try envWithHome(a, try klio_child.home(a));
 
     var all: std.ArrayList([]u8) = .empty;
     for (ROOTS) |root| try collectKt(a, io, root, &all);

@@ -4,7 +4,6 @@
 //! module through the public `Vm` embedder entry points only.
 
 const std = @import("std");
-const ast = @import("ast");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const interp_ir = @import("interp_ir");
@@ -51,102 +50,29 @@ pub const Report = struct {
     }
 };
 
-const TopTest = struct { display: []const u8, fid: ?ir.FuncId, ignored: bool };
-const Method = struct { display: []const u8, name: []const u8, ignored: bool };
-const ClassTests = struct {
-    cid: ?ir.ClassId,
-    class_name: []const u8,
-    methods: []Method,
-    befores: [][]const u8,
-    afters: [][]const u8,
+/// The tests of a module lowered from sema, found by sema and named by id: a top-level `@Test` function, and per
+/// test class its no-argument constructor and each `@Test`,
+/// `@BeforeTest` and `@AfterTest` method's implementation for that class.
+pub const ResolvedPlan = struct {
+    top: []const ResolvedTop,
+    classes: []const ResolvedClass,
+};
+
+pub const ResolvedTop = struct { display: []const u8, fid: ir.FuncId, ignored: bool };
+
+pub const ResolvedClass = struct {
+    cid: ir.ClassId,
+    /// Null when the class has no constructor taking no arguments.
+    ctor: ?ir.FuncId,
+    methods: []const ResolvedMethod,
+    befores: []const ir.FuncId,
+    afters: []const ir.FuncId,
     class_ignored: bool,
 };
 
-const Plan = struct {
-    top: []TopTest,
-    classes: []ClassTests,
-};
+pub const ResolvedMethod = struct { display: []const u8, fid: ir.FuncId, ignored: bool };
 
-fn joinPath(gpa: Allocator, path: []const ast.Ident) []const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    for (path, 0..) |id, i| {
-        if (i != 0) buf.append(gpa, '.') catch return "";
-        buf.appendSlice(gpa, id.name) catch return "";
-    }
-    return buf.toOwnedSlice(gpa) catch "";
-}
-
-/// Whether `import kotlin.test.<simple>` or `import kotlin.test.*` is in scope.
-fn importsKotlinTest(imports: []const ast.ImportDecl, simple: []const u8) bool {
-    for (imports) |imp| {
-        if (imp.path.len == 0) continue;
-        if (imp.wildcard) {
-            if (pathEquals(imp.path, &.{ "kotlin", "test" })) return true;
-            continue;
-        }
-        if (imp.alias != null) continue;
-        if (imp.path.len == 3 and
-            std.mem.eql(u8, imp.path[0].name, "kotlin") and
-            std.mem.eql(u8, imp.path[1].name, "test") and
-            std.mem.eql(u8, imp.path[2].name, simple)) return true;
-    }
-    return false;
-}
-
-fn pathEquals(path: []const ast.Ident, segs: []const []const u8) bool {
-    if (path.len != segs.len) return false;
-    for (path, segs) |id, s| {
-        if (!std.mem.eql(u8, id.name, s)) return false;
-    }
-    return true;
-}
-
-/// Whether any annotation in `annos` resolves to `kotlin.test.<simple>`.
-fn hasKotlinTestAnno(
-    annos: []const ast.Annotation,
-    imports: []const ast.ImportDecl,
-    simple: []const u8,
-) bool {
-    for (annos) |an| {
-        if (an.path.len == 0) continue;
-        const leaf = an.path[an.path.len - 1].name;
-        if (!std.mem.eql(u8, leaf, simple)) continue;
-        if (an.path.len > 1) {
-            // Qualified use site: accept `kotlin.test.X`.
-            if (an.path.len == 3 and
-                std.mem.eql(u8, an.path[0].name, "kotlin") and
-                std.mem.eql(u8, an.path[1].name, "test")) return true;
-            continue;
-        }
-        if (importsKotlinTest(imports, simple)) return true;
-    }
-    return false;
-}
-
-fn filePackage(gpa: Allocator, file: *const ast.KotlinFile) []const u8 {
-    const pkg = file.package orelse return "";
-    return joinPath(gpa, pkg.path);
-}
-
-fn qualify(gpa: Allocator, pkg: []const u8, name: []const u8) []const u8 {
-    if (pkg.len == 0) return gpa.dupe(u8, name) catch "";
-    return std.fmt.allocPrint(gpa, "{s}.{s}", .{ pkg, name }) catch "";
-}
-
-/// A class declaration plus its file's imports, needed to resolve annotations.
-const ClassEntry = struct { cls: *const ast.Class, imports: []const ast.ImportDecl };
-
-fn fileSelected(only_fids: []const u32, fid: u32) bool {
-    if (only_fids.len == 0) return true;
-    for (only_fids) |x| if (x == fid) return true;
-    return false;
-}
-
-/// `filter == null` runs everything. Otherwise a test runs when its display
-/// name contains any comma-separated substring. A `=` token matches the whole
-/// display name; a `!` token excludes regardless of positive tokens, so
-/// `Recomposer,!validatePotentialDeadlock` runs a class minus one test.
-fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
+pub fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
     const pat = filter orelse return true;
     var any_pos = false;
     var any_neg = false;
@@ -170,7 +96,7 @@ fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
     return pos_hit or (!any_pos and any_neg);
 }
 
-fn filterHasNegation(filter: ?[]const u8) bool {
+pub fn filterHasNegation(filter: ?[]const u8) bool {
     const pat = filter orelse return false;
     var it = std.mem.splitScalar(u8, pat, ',');
     while (it.next()) |p| {
@@ -193,173 +119,9 @@ test "filterMatches negation carves one test out of a class" {
     try std.testing.expect(filterMatches("!Snapshot", "RecomposerTests"));
 }
 
-fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile, only_fids: []const u32, filter: ?[]const u8) Allocator.Error!Plan {
-    var top: std.ArrayList(TopTest) = .empty;
-    var classes: std.ArrayList(ClassTests) = .empty;
-
-    // Index by simple name so a concrete class pulls in `@Test` methods it
-    // inherits from abstract bases, across every file.
-    var index = std.StringHashMap(ClassEntry).init(gpa);
-    defer index.deinit();
-    for (user_asts) |*file| {
-        for (file.decls) |*d| {
-            if (d.* == .Class) try index.put(d.Class.name.name, .{ .cls = &d.Class, .imports = file.imports });
-        }
-    }
-
-    for (user_asts) |*file| {
-        // `--only-file` compiles every file but discovers only in the selected ones.
-        if (!fileSelected(only_fids, file.span.file.int())) continue;
-        const pkg = filePackage(gpa, file);
-        defer gpa.free(pkg);
-        for (file.decls) |*d| {
-            switch (d.*) {
-                .Function => |*f| {
-                    if (!hasKotlinTestAnno(f.annotations, file.imports, "Test")) continue;
-                    if (!filterMatches(filter, f.name.name)) continue;
-                    const fqn = qualify(gpa, pkg, f.name.name);
-                    defer gpa.free(fqn);
-                    try top.append(gpa, .{
-                        .display = try gpa.dupe(u8, f.name.name),
-                        .fid = module.funcIdByFqn(fqn),
-                        .ignored = hasKotlinTestAnno(f.annotations, file.imports, "Ignore"),
-                    });
-                },
-                .Class => |*c| {
-                    // Abstract classes run their tests through concrete subclasses.
-                    if (c.is_abstract) continue;
-                    const ct = try discoverClass(gpa, module, &index, file, c, pkg, filter);
-                    if (ct) |found| try classes.append(gpa, found);
-                },
-                else => {},
-            }
-        }
-    }
-    return .{
-        .top = try top.toOwnedSlice(gpa),
-        .classes = try classes.toOwnedSlice(gpa),
-    };
-}
-
-/// `@Test`/`@BeforeTest`/`@AfterTest` of `cls` and its supertypes in `index`,
-/// de-duplicated by name so a most-derived override runs once.
-fn collectClassMethods(
-    gpa: Allocator,
-    index: *const std.StringHashMap(ClassEntry),
-    cls: *const ast.Class,
-    imports: anytype,
-    display_class: []const u8,
-    methods: *std.ArrayList(Method),
-    befores: *std.ArrayList([]const u8),
-    afters: *std.ArrayList([]const u8),
-    seen: *std.StringHashMap(void),
-    visited: *std.StringHashMap(void),
-) Allocator.Error!void {
-    if (visited.contains(cls.name.name)) return;
-    try visited.put(cls.name.name, {});
-    // Collect from the concrete class decl, not `index.get` by simple name,
-    // which would resolve a same-named class in another package.
-    for (cls.members) |*m| {
-        if (m.* != .Function) continue;
-        const f = &m.Function;
-        if (hasKotlinTestAnno(f.annotations, imports, "BeforeTest") and !seen.contains(f.name.name)) {
-            try befores.append(gpa, try gpa.dupe(u8, f.name.name));
-        }
-        if (hasKotlinTestAnno(f.annotations, imports, "AfterTest") and !seen.contains(f.name.name)) {
-            try afters.append(gpa, try gpa.dupe(u8, f.name.name));
-        }
-        if (hasKotlinTestAnno(f.annotations, imports, "Test") and !seen.contains(f.name.name)) {
-            try methods.append(gpa, .{
-                .display = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ display_class, f.name.name }),
-                .name = try gpa.dupe(u8, f.name.name),
-                .ignored = hasKotlinTestAnno(f.annotations, imports, "Ignore"),
-            });
-        }
-        if (hasKotlinTestAnno(f.annotations, imports, "Test") or
-            hasKotlinTestAnno(f.annotations, imports, "BeforeTest") or
-            hasKotlinTestAnno(f.annotations, imports, "AfterTest"))
-        {
-            try seen.put(f.name.name, {});
-        }
-    }
-    for (cls.supertypes) |*st| {
-        const sup = index.get(st.name.name) orelse continue;
-        try collectClassMethods(gpa, index, sup.cls, sup.imports, display_class, methods, befores, afters, seen, visited);
-    }
-}
-
-fn discoverClass(
-    gpa: Allocator,
-    module: *const ir.Module,
-    index: *const std.StringHashMap(ClassEntry),
-    file: *const ast.KotlinFile,
-    c: *const ast.Class,
-    pkg: []const u8,
-    filter: ?[]const u8,
-) Allocator.Error!?ClassTests {
-    var methods: std.ArrayList(Method) = .empty;
-    var befores: std.ArrayList([]const u8) = .empty;
-    var afters: std.ArrayList([]const u8) = .empty;
-    var seen = std.StringHashMap(void).init(gpa);
-    defer seen.deinit();
-    var visited = std.StringHashMap(void).init(gpa);
-    defer visited.deinit();
-    try collectClassMethods(gpa, index, c, file.imports, c.name.name, &methods, &befores, &afters, &seen, &visited);
-    // A class whose name matches keeps all methods; otherwise filter per method.
-    if (filter) |pat| {
-        if (!filterMatches(pat, c.name.name) or filterHasNegation(pat)) {
-            var kept: usize = 0;
-            for (methods.items) |m| {
-                if (filterMatches(pat, m.display)) {
-                    methods.items[kept] = m;
-                    kept += 1;
-                } else {
-                    gpa.free(m.display);
-                    gpa.free(m.name);
-                }
-            }
-            methods.shrinkRetainingCapacity(kept);
-        }
-    }
-    if (methods.items.len == 0) {
-        methods.deinit(gpa);
-        befores.deinit(gpa);
-        afters.deinit(gpa);
-        return null;
-    }
-    const fqn = qualify(gpa, pkg, c.name.name);
-    defer gpa.free(fqn);
-    return .{
-        .cid = module.classIdByFqn(fqn),
-        .class_name = try gpa.dupe(u8, c.name.name),
-        .methods = try methods.toOwnedSlice(gpa),
-        .befores = try befores.toOwnedSlice(gpa),
-        .afters = try afters.toOwnedSlice(gpa),
-        .class_ignored = hasKotlinTestAnno(c.annotations, file.imports, "Ignore"),
-    };
-}
-
-fn freePlan(gpa: Allocator, plan: *Plan) void {
-    for (plan.top) |t| gpa.free(t.display);
-    gpa.free(plan.top);
-    for (plan.classes) |ct| {
-        gpa.free(ct.class_name);
-        for (ct.methods) |m| {
-            gpa.free(m.display);
-            gpa.free(m.name);
-        }
-        gpa.free(ct.methods);
-        for (ct.befores) |b| gpa.free(b);
-        gpa.free(ct.befores);
-        for (ct.afters) |a| gpa.free(a);
-        gpa.free(ct.afters);
-    }
-    gpa.free(plan.classes);
-}
-
 const RunState = struct {
     gpa: Allocator,
-    plan: *const Plan,
+    plan: *const ResolvedPlan,
     results: std.ArrayList(TestResult),
     /// Stamped when a test starts running; the delta at `record` is its own time,
     /// not the gap since the previous result.
@@ -579,15 +341,6 @@ fn record(st: *RunState, display: []const u8, outcome: Outcome, detail: ?[]const
     };
 }
 
-/// Non-`ok` becomes a failure detail owned by `gpa`. Null on success.
-fn failureDetail(st: *RunState, oc: interp_ir.CallOutcome) ?[]const u8 {
-    return switch (oc) {
-        .ok => null,
-        .threw => |v| describeThrow(st.gpa, v),
-        .failed => |m| st.gpa.dupe(u8, m) catch "interpreter error",
-    };
-}
-
 /// Per-test wall cap in seconds, 300 when `KLIO_TEST_WALL_CAP` is unset, so a
 /// wedged test fails instead of hanging the run. `0` disables the cap.
 fn wallCapSeconds() i64 {
@@ -621,14 +374,14 @@ fn wallCapForTest(name: []const u8) i64 {
 fn armWallDeadlineFor(name: []const u8) void {
     const cap = wallCapForTest(name);
     if (cap <= 0) return;
-    ir.eval.wall_cap_thrown.store(false, .monotonic);
+    ir.eval.wall_cap_fires.store(0, .monotonic);
     ir.eval.test_wall_deadline_ms.store(ir.eval.nowMonotonicMs() + cap * 1000, .monotonic);
 }
 
 fn armWallDeadline() void {
     const cap = wallCapSeconds();
     if (cap <= 0) return;
-    ir.eval.wall_cap_thrown.store(false, .monotonic);
+    ir.eval.wall_cap_fires.store(0, .monotonic);
     ir.eval.test_wall_deadline_ms.store(ir.eval.nowMonotonicMs() + cap * 1000, .monotonic);
 }
 
@@ -660,134 +413,96 @@ fn drainWallCapAbandon() void {
     runtime.clearAbandon();
 }
 
-fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
+/// A throwable of a module lowered from sema, rendered by its `toString`.
+fn resolvedFailure(st: *RunState, vm: *Vm, oc: interp_ir.CallOutcome) ?[]const u8 {
+    return switch (oc) {
+        .ok => null,
+        .threw => |v| blk: {
+            if (v == .Instance) {
+                const r = vm.callMethod(&v, "toString") catch break :blk describeThrow(st.gpa, v);
+                if (r == .ok and r.ok == .String) break :blk r.ok.display(st.gpa) catch "exception";
+            }
+            break :blk describeThrow(st.gpa, v);
+        },
+        .failed => |m| st.gpa.dupe(u8, m) catch "interpreter error",
+    };
+}
+
+fn runResolvedBody(st: *RunState, vm: *Vm) Allocator.Error!void {
     defer clearWallDeadline();
-    for (st.plan.top) |t| {
+    const plan = st.plan;
+    for (plan.top) |t| {
         if (t.ignored) {
             try record(st, t.display, .skipped, null);
             continue;
         }
-        const fid = t.fid orelse {
-            try record(st, t.display, .failed, try st.gpa.dupe(u8, "test function not found in built module"));
-            continue;
-        };
-        if (ir.eval.evalDepthNow() != 0) std.debug.print("[depth-leak] {d} before {s}\n", .{ ir.eval.evalDepthNow(), t.display });
         beginTest(st, t.display);
         armWallDeadlineFor(t.display);
-        const oc = try vm.callNoArg(fid);
+        const oc = try vm.callArgs(t.fid, &.{});
         clearWallDeadline();
         drainWallCapAbandon();
-        if (failureDetail(st, oc)) |d| {
-            try record(st, t.display, .failed, d);
-        } else {
-            try record(st, t.display, .passed, null);
-        }
+        if (resolvedFailure(st, vm, oc)) |d| try record(st, t.display, .failed, d) else try record(st, t.display, .passed, null);
     }
-
-    for (st.plan.classes) |ct| {
+    for (plan.classes) |ct| {
         for (ct.methods) |m| {
             if (ct.class_ignored or m.ignored) {
                 try record(st, m.display, .skipped, null);
                 continue;
             }
-            const cid = ct.cid orelse {
-                try record(st, m.display, .failed, try st.gpa.dupe(u8, "test class not found in built module"));
+            const ctor = ct.ctor orelse {
+                try record(st, m.display, .failed, try st.gpa.dupe(u8, "test class has no constructor without arguments"));
                 continue;
             };
-            // Fresh instance per test (JUnit semantics).
-            if (ir.eval.evalDepthNow() != 0) std.debug.print("[depth-leak] {d} before {s}\n", .{ ir.eval.evalDepthNow(), m.display });
+            // A fresh instance per test, as JUnit makes one.
             beginTest(st, m.display);
             armWallDeadlineFor(m.display);
-            const inst = try vm.construct(cid);
+            const made = try vm.newResolved(ct.cid, ctor);
             drainWallCapAbandon();
-            switch (inst) {
-                .ok => |receiver| {
-                    var detail: ?[]const u8 = null;
-                    // @BeforeTest then @Test, stopping at the first failure.
-                    for (ct.befores) |b| {
-                        if (failureDetail(st, try vm.callMethod(&receiver, b))) |d| {
-                            detail = d;
-                            break;
-                        }
-                    }
-                    if (detail == null) {
-                        detail = failureDetail(st, try vm.callMethod(&receiver, m.name));
-                    }
-                    // @AfterTest always runs on a fresh budget, un-abandoned.
-                    drainWallCapAbandon();
-                    armWallDeadline();
-                    for (ct.afters) |a| {
-                        const ad = failureDetail(st, try vm.callMethod(&receiver, a));
-                        if (ad) |d| {
-                            if (detail == null) detail = d else st.gpa.free(d);
-                        }
-                    }
+            const receiver = switch (made) {
+                .ok => |v| v,
+                else => {
                     clearWallDeadline();
-                    drainWallCapAbandon();
-                    if (detail) |d| try record(st, m.display, .failed, d) else try record(st, m.display, .passed, null);
+                    try record(st, m.display, .failed, resolvedFailure(st, vm, made));
+                    continue;
                 },
-                .threw => |v| try record(st, m.display, .failed, describeThrow(st.gpa, v)),
-                .failed => |msg| try record(st, m.display, .failed, try st.gpa.dupe(u8, msg)),
+            };
+            var detail: ?[]const u8 = null;
+            // @BeforeTest, then @Test, stopping at the first failure.
+            for (ct.befores) |b| {
+                if (resolvedFailure(st, vm, try vm.callArgs(b, &.{receiver}))) |d| {
+                    detail = d;
+                    break;
+                }
             }
+            if (detail == null) detail = resolvedFailure(st, vm, try vm.callArgs(m.fid, &.{receiver}));
+            // @AfterTest always runs, on a fresh budget.
+            drainWallCapAbandon();
+            armWallDeadline();
+            for (ct.afters) |a| {
+                if (resolvedFailure(st, vm, try vm.callArgs(a, &.{receiver}))) |d| {
+                    if (detail == null) detail = d else st.gpa.free(d);
+                }
+            }
+            clearWallDeadline();
+            drainWallCapAbandon();
+            if (detail) |d| try record(st, m.display, .failed, d) else try record(st, m.display, .passed, null);
         }
     }
 }
 
-/// Display names without running them. Caller owns each string and the slice.
-pub fn listTests(
-    gpa: Allocator,
-    vm: *Vm,
-    user_asts: []const ast.KotlinFile,
-    only_fids: []const u32,
-    filter: ?[]const u8,
-) Allocator.Error![][]const u8 {
-    var plan: Plan = blk: {
-        const mg = vm.module.borrow();
-        defer mg.deinit();
-        break :blk try discover(gpa, mg.get(), user_asts, only_fids, filter);
-    };
-    defer freePlan(gpa, &plan);
-    var names: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (names.items) |n| gpa.free(n);
-        names.deinit(gpa);
-    }
-    for (plan.top) |t| try names.append(gpa, try gpa.dupe(u8, t.display));
-    for (plan.classes) |c| for (c.methods) |m| try names.append(gpa, try gpa.dupe(u8, m.display));
-    return names.toOwnedSlice(gpa);
-}
-
-/// Run every `@Test` in `user_asts` against `vm`. Caller owns the `Report`.
-pub fn runTests(
-    gpa: Allocator,
-    vm: *Vm,
-    user_asts: []const ast.KotlinFile,
-    out: Output,
-    only_fids: []const u32,
-    filter: ?[]const u8,
-) Allocator.Error!Report {
-    var plan: Plan = blk: {
-        const mg = vm.module.borrow();
-        defer mg.deinit();
-        break :blk try discover(gpa, mg.get(), user_asts, only_fids, filter);
-    };
-    defer freePlan(gpa, &plan);
-
-    // Stamp the clock at run start so the first duration is real, not 0ms.
+/// Runs the tests of `plan` against `vm`, a module lowered from sema.
+/// Caller owns the `Report`.
+pub fn runResolvedTests(gpa: Allocator, vm: *Vm, plan: *const ResolvedPlan, out: Output) Allocator.Error!Report {
     var st = RunState{
         .gpa = gpa,
-        .plan = &plan,
+        .plan = plan,
         .results = .empty,
         .test_started_ns = runtime.clockMonotonicNanos(),
         .out = out,
     };
-    const prep = try vm.runCalls(out, *RunState, &st, runBody);
+    const prep = try vm.runCalls(out, *RunState, &st, runResolvedBody);
     finishReporting(&st);
-    if (prep) |_| {
-        // Surface one failing entry so the caller exits non-zero.
-        try record(&st, "<startup>", .failed, try gpa.dupe(u8, "module initialization failed"));
-    }
-
+    if (prep) |_| try record(&st, "<startup>", .failed, try gpa.dupe(u8, "module initialization failed"));
     var passed: usize = 0;
     var failed: usize = 0;
     var skipped: usize = 0;
@@ -796,12 +511,7 @@ pub fn runTests(
         .failed => failed += 1,
         .skipped => skipped += 1,
     };
-    return .{
-        .results = try st.results.toOwnedSlice(gpa),
-        .passed = passed,
-        .failed = failed,
-        .skipped = skipped,
-    };
+    return .{ .results = try st.results.toOwnedSlice(gpa), .passed = passed, .failed = failed, .skipped = skipped };
 }
 
 test {

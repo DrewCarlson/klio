@@ -3,8 +3,8 @@
 // initializes at the first instantiation of its owning class; an object
 // the program never references never initializes; object-literal init
 // blocks interleave with property initializers in declaration order; an
-// init failure surfaces at the access site as
-// FileFailedToInitializeException and is never retried.
+// init failure surfaces at the first access as ExceptionInInitializerError,
+// is never retried, and every later access throws NoClassDefFoundError.
 
 object NeverTouched {
     init { println("never-touched-init (must not print)") }

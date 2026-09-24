@@ -1,25 +1,42 @@
 // klio platform layer for kotlin.coroutines.intrinsics.
 // See the sibling Actuals.kt header for the overall model.
+//
+// This file takes the place of upstream's common
+// `kotlin/coroutines/intrinsics/Intrinsics.kt`, whose
+// `suspendCoroutineUninterceptedOrReturn` body is a placeholder every backend
+// replaces with an intrinsic. klio's implementation is the Kotlin body below;
+// the file's other declarations are carried over from upstream unchanged.
 
 package kotlin.coroutines.intrinsics
 
+import kotlin.contracts.InvocationKind
+import kotlin.contracts.contract
+import kotlin.internal.InlineOnly
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.KlioContinuation
+import kotlin.coroutines.coroutineContext
 import kotlin.coroutines.__klio_co_newSlot
 import kotlin.coroutines.__klio_co_armSlot
 import kotlin.coroutines.__klio_co_disarmSlot
 import kotlin.coroutines.__klio_co_park
 import kotlin.coroutines.__klio_co_runRoot
+import kotlin.coroutines.__klio_co_pushScope
+import kotlin.coroutines.__klio_co_popScope
+import kotlin.coroutines.__klio_co_startRootOrSuspended
+import kotlin.coroutines.__klio_co_lastRootParkedOnce
 
 // Obtains the current continuation and either suspends or returns a
 // value immediately. klio model: hand the block a slot-backed
 // continuation; if the block parks (returns COROUTINE_SUSPENDED),
 // suspend on the slot and yield the resumed Result; otherwise the
 // block's value is the result.
-public fun <T> suspendCoroutineUninterceptedOrReturn(block: (Continuation<T>) -> Any?): T {
+@SinceKotlin("1.3")
+@InlineOnly
+public suspend inline fun <T> suspendCoroutineUninterceptedOrReturn(crossinline block: (Continuation<T>) -> Any?): T {
+    contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }
     val slot = __klio_co_newSlot()
     // The continuation carries the suspending coroutine's real context
     // (the suspend-implicit `coroutineContext`, resolved by the host to
@@ -44,9 +61,20 @@ public fun <T> suspendCoroutineUninterceptedOrReturn(block: (Continuation<T>) ->
     }
 }
 
+/**
+ * This value is used as a return value of [suspendCoroutineUninterceptedOrReturn] `block` argument to state that
+ * the execution was suspended and will not return any result immediately.
+ */
+@SinceKotlin("1.3")
+public val COROUTINE_SUSPENDED: Any get() = CoroutineSingletons.COROUTINE_SUSPENDED
+
+@SinceKotlin("1.3")
+@PublishedApi // This class is Published API via serialized representation of SafeContinuation, don't rename/move
+internal enum class CoroutineSingletons { COROUTINE_SUSPENDED, UNDECIDED, RESUMED }
+
 // klio installs no implicit interceptor; one applies only when the
 // continuation's context carries it. Mirrors the upstream contract.
-public fun <T> Continuation<T>.intercepted(): Continuation<T> {
+public actual fun <T> Continuation<T>.intercepted(): Continuation<T> {
     val interceptor = context[ContinuationInterceptor]
     return interceptor?.interceptContinuation(this) ?: this
 }
@@ -54,14 +82,14 @@ public fun <T> Continuation<T>.intercepted(): Continuation<T> {
 // Running a `suspend` lambda is just invoking it: klio executes the
 // body inline and parks cooperatively at suspension points. These
 // route the lambda's terminal outcome to `completion`.
-public fun <T> (suspend () -> T).createCoroutineUnintercepted(
+public actual fun <T> (suspend () -> T).createCoroutineUnintercepted(
     completion: Continuation<T>
 ): Continuation<Unit> {
     val block = this
     return KlioStartContinuation(completion) { block() }
 }
 
-public fun <R, T> (suspend R.() -> T).createCoroutineUnintercepted(
+public actual fun <R, T> (suspend R.() -> T).createCoroutineUnintercepted(
     receiver: R,
     completion: Continuation<T>
 ): Continuation<Unit> {
@@ -69,14 +97,14 @@ public fun <R, T> (suspend R.() -> T).createCoroutineUnintercepted(
     return KlioStartContinuation(completion) { receiver.block() }
 }
 
-public fun <T> (suspend () -> T).startCoroutineUninterceptedOrReturn(
+public actual inline fun <T> (suspend () -> T).startCoroutineUninterceptedOrReturn(
     completion: Continuation<T>
 ): Any? {
     val block = this
     return startBlock(completion) { block() }
 }
 
-public fun <R, T> (suspend R.() -> T).startCoroutineUninterceptedOrReturn(
+public actual inline fun <R, T> (suspend R.() -> T).startCoroutineUninterceptedOrReturn(
     receiver: R,
     completion: Continuation<T>
 ): Any? {
@@ -84,39 +112,15 @@ public fun <R, T> (suspend R.() -> T).startCoroutineUninterceptedOrReturn(
     return startBlock(completion) { receiver.block() }
 }
 
-// Receiver lambda with one value parameter — the shape of a ktor
-// `PipelineInterceptor` (`suspend PipelineContext<…>.(TSubject) -> Unit`).
-// `pipelineStartCoroutineUninterceptedOrReturn`'s actual routes here.
-public fun <R, P, T> (suspend R.(P) -> T).startCoroutineUninterceptedOrReturn(
+// Receiver lambda with one value parameter: DeepRecursive's `runCallLoop`
+// starts its `suspend DeepRecursiveScope<*, *>.(Any?) -> Any?` blocks here.
+internal actual inline fun <R, P, T> (suspend R.(P) -> T).startCoroutineUninterceptedOrReturn(
     receiver: R,
     param: P,
     completion: Continuation<T>
 ): Any? {
     val block = this
     return startBlock(completion) { receiver.block(param) }
-}
-
-// One VALUE parameter, no receiver — the shape kotlinx's
-// `startCoroutineUndispatched` starts (`suspend (R) -> T` from
-// `CoroutineStart.UNDISPATCHED`). Without this overload the start fell
-// through to an inline invoke with no coroutine boundary: the child's
-// first suspension parked the CALLER's frames along with its own, and
-// runTest's teardown then existed as two runnable copies (the double
-// `leave()` that masked every throwing test body's real failure).
-public fun <P, T> (suspend (P) -> T).startCoroutineUninterceptedOrReturn(
-    param: P,
-    completion: Continuation<T>
-): Any? {
-    val block = this
-    return startBlock(completion) { block(param) }
-}
-
-public fun <P, T> (suspend (P) -> T).createCoroutineUnintercepted(
-    param: P,
-    completion: Continuation<T>
-): Continuation<Unit> {
-    val block = this
-    return KlioStartContinuation(completion) { block(param) }
 }
 
 public fun <R, P, T> (suspend R.(P) -> T).createCoroutineUnintercepted(
@@ -128,6 +132,7 @@ public fun <R, P, T> (suspend R.(P) -> T).createCoroutineUnintercepted(
     return KlioStartContinuation(completion) { receiver.block(param) }
 }
 
+@PublishedApi
 internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {
     // `startCoroutineUninterceptedOrReturn` semantics: run the
     // coroutine in the current activation and return its result

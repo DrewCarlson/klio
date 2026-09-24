@@ -184,16 +184,6 @@ pub const SiteKind = enum(u8) {
     name_member_ref_by_name,
     /// `Lambda`: a `FuncId` for the body.
     name_lambda_resolved,
-    /// `AstLambda` carrying a `body_func`: the body is lowered, and the syntax
-    /// tree rides along for the paths that still read it.
-    name_ast_lambda_resolved,
-    /// `AstLambda` without one: a body still held only as a syntax tree, lowered
-    /// on demand at execution.
-    name_ast_lambda,
-    /// `BuildObject`: an `object { … }` whose class is synthesised at execution.
-    name_build_object,
-    /// `RegisterClass`: a function-local class declared at execution.
-    name_register_class,
 
     // ---- receivers ----
     /// `QualifiedThis`: `this@Q`, walked along the dynamic enclosing chain.
@@ -297,10 +287,6 @@ const rows: [kind_count]Row = blk: {
     t[@intFromEnum(SiteKind.name_member_ref_resolved)] = .{ .class = C.name, .verdict = V.resolved };
     t[@intFromEnum(SiteKind.name_member_ref_by_name)] = .{ .class = C.name, .verdict = V.unresolved };
     t[@intFromEnum(SiteKind.name_lambda_resolved)] = .{ .class = C.name, .verdict = V.resolved };
-    t[@intFromEnum(SiteKind.name_ast_lambda_resolved)] = .{ .class = C.name, .verdict = V.resolved };
-    t[@intFromEnum(SiteKind.name_ast_lambda)] = .{ .class = C.name, .verdict = V.unresolved };
-    t[@intFromEnum(SiteKind.name_build_object)] = .{ .class = C.name, .verdict = V.unresolved };
-    t[@intFromEnum(SiteKind.name_register_class)] = .{ .class = C.name, .verdict = V.unresolved };
 
     t[@intFromEnum(SiteKind.recv_qualified_this)] = .{ .class = C.receiver, .verdict = V.unresolved };
     t[@intFromEnum(SiteKind.recv_enclosing_push)] = .{ .class = C.receiver, .verdict = V.unresolved };
@@ -421,9 +407,6 @@ pub fn classify(inst: *const Inst) SiteKind {
         .PropertyRef => .name_property_ref,
         .MemberRef => |mr| if (mr.func != null) .name_member_ref_resolved else .name_member_ref_by_name,
         .Lambda => .name_lambda_resolved,
-        .AstLambda => |al| if (al.body_func != null) .name_ast_lambda_resolved else .name_ast_lambda,
-        .BuildObject => .name_build_object,
-        .RegisterClass => .name_register_class,
 
         .QualifiedThis => .recv_qualified_this,
         .EnclosingPush => .recv_enclosing_push,
@@ -442,6 +425,32 @@ pub fn classify(inst: *const Inst) SiteKind {
         .NotNullAssert,
         .LateinitCheck,
         .Trace,
+        => .plain_inst,
+
+        // Lowered from sema: every operand is an id.
+        .CallStatic,
+        .RCallVirtual,
+        .CallInterface,
+        .CallNative,
+        .RCallValue,
+        .RNewInstance,
+        .GetFieldSlot,
+        .SetFieldSlot,
+        .LoadStatic,
+        .StoreStatic,
+        .LoadObject,
+        .MakeClosure,
+        .FunctionRef,
+        .RPropertyRef,
+        .ClassLiteral,
+        .ClassOf,
+        .RInstanceOf,
+        .RCast,
+        .InstanceOfDyn,
+        .CastDyn,
+        .ArrayGet,
+        .ArraySet,
+        .NewArray,
         => .plain_inst,
     };
 }
@@ -565,9 +574,6 @@ pub fn ratchetHooked(k: SiteKind) bool {
         .name_write_this_or_global,
         .name_write_global_by_name,
         .name_member_ref_by_name,
-        .name_ast_lambda,
-        .name_build_object,
-        .name_register_class,
         .recv_qualified_this,
         .recv_enclosing_push,
         .recv_enclosing_pop,
@@ -609,7 +615,6 @@ pub fn ratchetHooked(k: SiteKind) bool {
         .field_write_slot_claimed,
         .name_read_global_resolved,
         .name_write_global_slot,
-        .name_ast_lambda_resolved,
         .name_property_ref,
         .name_member_ref_resolved,
         .name_lambda_resolved,

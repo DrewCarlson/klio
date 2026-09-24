@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
 /// `KLIO_ITEST_BIN` when the build run step sets it, else the Debug install.
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
@@ -15,6 +16,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    try map.put("KLIO_HOME", home);
     return map;
 }
 
@@ -38,29 +40,8 @@ fn runKlio(
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, home) catch {};
-    {
-        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", "kotlin-klio/klio-kotlinx-serialization" });
-        if (!r.ok) {
-            std.debug.print("json_reified_inline: pack build failed:\n{s}\n", .{r.stderr});
-            return error.PackBuildFailed;
-        }
-    }
-    {
-        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", "target/packs/kotlinx.serialization.klio-pack" });
-        if (!r.ok) {
-            std.debug.print("json_reified_inline: pack install failed:\n{s}\n", .{r.stderr});
-            return error.PackInstallFailed;
-        }
-    }
-}
-
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-var packs_installed = false;
 
-const SCRATCH_HOME = "/tmp/klio_itest_json_home";
 const TMP_DIR = "/tmp/klio_itest_json";
 
 fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
@@ -70,11 +51,7 @@ fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var env = try envWithHome(a, SCRATCH_HOME);
-    if (!packs_installed) {
-        try installPacks(a, io, &env, SCRATCH_HOME);
-        packs_installed = true;
-    }
+    var env = try envWithHome(a, try klio_child.home(a));
 
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, TMP_DIR) catch {};

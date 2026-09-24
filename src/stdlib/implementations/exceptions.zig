@@ -140,7 +140,7 @@ pub fn excn_cancellation(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 1 and (ctx.args[0] == .Exception or ctx.args[0] == .Instance)) {
         const cause = ctx.args[0];
         var message: ?StringRef = null;
-        if (try ctx.host.invokeMethod(&cause, "toString", &.{}, ctx.out)) |m| {
+        if (try ctx.host.callWellKnown(&cause, .to_string, &.{}, ctx.out)) |m| {
             if (m == .ok and m.ok == .String) {
                 const g = m.ok.String.borrow();
                 defer g.deinit();

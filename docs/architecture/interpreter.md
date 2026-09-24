@@ -83,11 +83,13 @@ The claiming thread constructs and publishes into globals only after
 construction completes; other threads racing the same name wait, and
 the constructing thread's own re-entrant reads observe the in-flight
 instance (an object may reference itself during its own init). A
-throw during initialization propagates to the access site wrapped in
-`FileFailedToInitializeException` (an `Error`, not an `Exception`)
-with the user throwable as its cause; the initializer is never
-retried — every later access throws the same wrapper without the
-cause. Top-level property initializers stay eager (file order at
+failed initialization fails as JVM class initialization does: the
+first access throws `ExceptionInInitializerError` (no message, the
+user throwable as its cause), or rethrows the throwable itself when it
+is an `Error`; the initializer is never retried, and every later
+access throws `NoClassDefFoundError("Could not initialize class X")`
+caused by an `ExceptionInInitializerError` naming the first failure.
+Top-level property initializers stay eager (file order at
 program start), matching kotlinc's main-file semantics.
 
 ## Dispatch and intrinsics

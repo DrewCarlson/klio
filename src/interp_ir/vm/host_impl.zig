@@ -6,7 +6,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 
-const build = @import("../build.zig");
+const tables = @import("../tables.zig");
 const vmhost = @import("vmhost.zig");
 const VmHost = vmhost.VmHost;
 
@@ -53,7 +53,7 @@ pub fn pendingTypedDefault(self: *VmHost, name: []const u8) ?Value {
 }
 
 /// Null for `.none`: no annotation to default from.
-fn typedDefaultValue(kind: build.TypedDefault) ?Value {
+fn typedDefaultValue(kind: tables.TypedDefault) ?Value {
     return switch (kind) {
         .none => null,
         .int => .{ .Int = 0 },
@@ -225,8 +225,12 @@ pub fn joinSpawned(self: *VmHost, id: u64) JoinResult {
         break :blk h;
     };
     const h = handle orelse return .{ .ok = {} };
-    // join() establishes happens-before with the worker's writes.
+    // join() establishes happens-before with the worker's writes. The joining
+    // thread is blocked, so it counts as parked for a collection the worker
+    // starts; otherwise the collector waits on it forever.
+    runtime.gc.enterBlockingSafe();
     h.join();
+    runtime.gc.exitBlockingSafe();
     const g = self.threads.borrow();
     defer g.deinit();
     const entry = g.get().getPtr(id) orelse return .{ .ok = {} };
@@ -234,6 +238,14 @@ pub fn joinSpawned(self: *VmHost, id: u64) JoinResult {
         .ok => .{ .ok = {} },
         .err => |e| .{ .err = e },
     };
+}
+
+/// The name `thread { }` handle `id` was started with.
+pub fn threadNameOf(self: *VmHost, id: u64) ?[]const u8 {
+    const g = self.threads.borrow();
+    defer g.deinit();
+    const entry = g.get().getPtr(id) orelse return null;
+    return if (entry.name.len != 0) entry.name else null;
 }
 
 pub fn threadAlive(self: *VmHost, id: u64) bool {

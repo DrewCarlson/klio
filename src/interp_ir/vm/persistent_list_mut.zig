@@ -275,3 +275,29 @@ pub fn tryAddAll(a: Allocator, inst: ObjRef(InstanceData), elements: *const Valu
     try writeState(a, inst, all.items, &st.owner, st.modc + 1);
     return .{ .Bool = true };
 }
+
+/// Serve `builder.addAll(index, elements)`: Bool on success, null bails (an index out
+/// of range bails so the body throws).
+pub fn tryInsertAll(a: Allocator, inst: ObjRef(InstanceData), index_v: *const Value, elements: *const Value) Allocator.Error!?Value {
+    const index_i = asIntIndex(index_v) orelse return null;
+    if (elements.* != .List and elements.* != .Array) return null;
+    if (!isBuilderClass(inst)) return null;
+    const st = readState(inst) orelse return null;
+    if (index_i < 0 or index_i > st.total) return null;
+    const index: usize = @intCast(index_i);
+    if (index == st.total) return tryAddAll(a, inst, elements);
+
+    var added: std.ArrayList(Value) = .empty;
+    defer added.deinit(a);
+    if (!try collectionItems(a, elements, &added)) return null;
+    if (added.items.len == 0) return .{ .Bool = false };
+
+    var all: std.ArrayList(Value) = .empty;
+    defer all.deinit(a);
+    try all.ensureTotalCapacity(a, st.total + added.items.len);
+    if (!try collectAll(a, &st, &all)) return null;
+    if (all.items.len != st.total) return null;
+    try all.insertSlice(a, index, added.items);
+    try writeState(a, inst, all.items, &st.owner, st.modc + 1);
+    return .{ .Bool = true };
+}

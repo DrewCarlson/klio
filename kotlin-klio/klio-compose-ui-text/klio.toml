@@ -94,11 +94,20 @@ include = [
     "androidx/compose/ui/text/UrlAnnotation.kt",
 ]
 
+# skikoMain: the text-editing interfaces (TextEditorState, TextEditingScope) the
+# foundation text input session is written against. Plain interfaces.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-text/src/skikoMain/kotlin"
+include = [
+    "androidx/compose/ui/text/input/PlatformTextInputService2.kt",
+]
+
 [[source]]
 root = "klioMain"
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 "androidx.compose.runtime" = "*"
 "androidx.compose.runtime.saveable" = "*"
 "androidx.compose.ui.util" = "*"

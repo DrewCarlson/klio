@@ -46,7 +46,7 @@ class Untagged(val n: Int)
 fun annotationsOf(s: KSerializer<*>): List<Annotation> = s.descriptor.annotations
 
 fun names(s: KSerializer<*>): String =
-    annotationsOf(s).map { it::class.simpleName }.sorted().toString()
+    annotationsOf(s).mapNotNull { it::class.simpleName }.sorted().toString()
 
 fun discriminators(s: KSerializer<*>): String =
     annotationsOf(s).filterIsInstance<Discriminator>().map { it.value }.toString()

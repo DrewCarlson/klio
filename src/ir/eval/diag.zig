@@ -38,12 +38,14 @@ pub fn wallCapAbandon() void {
     runtime.setRunBoundaryAbandon(true);
 }
 
-/// FIRST fire: extend the deadline by an unwind budget and throw a CATCHABLE
-/// exception so teardown runs. SECOND fire: hard abort plus cohort abandonment.
+/// Each of the first `wall_cap_catchable_fires` fires extends the deadline by an
+/// unwind budget and throws a CATCHABLE exception, so the test ends through its
+/// own teardown even when it catches one; after them, a hard abort plus cohort
+/// abandonment, which runs no `finally`.
 pub fn wallCapFire(allocator: Allocator) Allocator.Error!EvalResult {
-    if (!parent.wall_cap_thrown.swap(true, .acq_rel)) {
+    if (parent.wall_cap_fires.fetchAdd(1, .acq_rel) < parent.wall_cap_catchable_fires) {
         const dl = parent.test_wall_deadline_ms.load(.monotonic);
-        if (dl != 0) parent.test_wall_deadline_ms.store(dl + 20_000, .monotonic);
+        if (dl != 0) parent.test_wall_deadline_ms.store(dl + parent.wall_cap_unwind_ms.load(.monotonic), .monotonic);
         std.debug.print("[wall-cap] test wall-clock deadline exceeded — throwing; hang location follows:\n", .{});
         dumpFrameChainForDiagAlways();
         return errResult(.{ .Throw = try Value.newException(allocator, .{
@@ -927,33 +929,54 @@ pub fn spinDumpMaybe() void {
     }
 }
 
-/// One frame as `<fqn> (<file>:<line>)`, or `<fqn> (native)` when the position
-/// does not resolve. Caller owns the returned slice.
+/// One frame as `StackTraceElement.toString` renders it on the JVM,
+/// `<Class>.<method>(<File>.kt:<line>)`, or `(Unknown Source)` when the
+/// position does not resolve. Caller owns the returned slice.
 fn frameToString(allocator: Allocator, fr: runtime.StackFrame) Allocator.Error![]u8 {
     if (fr.has_pos) {
         if (span.active_map) |m| {
             if (m.getChecked(span.FileId.from(fr.file_id))) |sf| {
+                const file = std.fs.path.basename(sf.path);
+                if (fr.offset == ev_state.NO_LINE) return std.fmt.allocPrint(allocator, "{s}({s})", .{ fr.fqn, file });
                 const lc = sf.lineCol(fr.offset);
-                return std.fmt.allocPrint(allocator, "{s} ({s}:{d})", .{ fr.fqn, sf.path, lc.line });
+                return std.fmt.allocPrint(allocator, "{s}({s}:{d})", .{ fr.fqn, file, lc.line });
             }
         }
     }
-    return std.fmt.allocPrint(allocator, "{s} (native)", .{fr.fqn});
+    return std.fmt.allocPrint(allocator, "{s}(Unknown Source)", .{fr.fqn});
 }
 
 pub fn formatStackTrace(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8)) Allocator.Error!void {
-    return formatStackTraceIndented(allocator, trace, out, "");
+    return formatFrames(allocator, trace.frames, out, "");
 }
 
-fn formatStackTraceIndented(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8), indent: []const u8) Allocator.Error!void {
-    for (trace.frames) |fr| {
+/// `frames`, one per line as `printStackTrace` prints them: `<prefix>\tat
+/// <frame>`.
+fn formatFrames(allocator: Allocator, frames: []const runtime.StackFrame, out: *std.ArrayList(u8), prefix: []const u8) Allocator.Error!void {
+    for (frames) |fr| {
         try out.appendSlice(allocator, "\n");
-        try out.appendSlice(allocator, indent);
-        try out.appendSlice(allocator, "    at ");
+        try out.appendSlice(allocator, prefix);
+        try out.appendSlice(allocator, "\tat ");
         const s = try frameToString(allocator, fr);
         defer allocator.free(s);
         try out.appendSlice(allocator, s);
     }
+}
+
+/// The frame's source line, 0 without one.
+fn frameLine(fr: runtime.StackFrame) u32 {
+    if (!fr.has_pos or fr.offset == ev_state.NO_LINE) return 0;
+    const m = span.active_map orelse return 0;
+    const sf = m.getChecked(span.FileId.from(fr.file_id)) orelse return 0;
+    return sf.lineCol(fr.offset).line;
+}
+
+/// Whether two frames are one call site, as `StackTraceElement.equals`
+/// compares them: the function, the file and the line.
+fn sameFrame(x: runtime.StackFrame, y: runtime.StackFrame) bool {
+    if (!std.mem.eql(u8, x.fqn, y.fqn) or x.has_pos != y.has_pos) return false;
+    if (!x.has_pos) return true;
+    return x.file_id == y.file_id and frameLine(x) == frameLine(y);
 }
 
 /// `Throwable.stackTrace`: an `Array` of rendered frames, null when none captured.
@@ -988,9 +1011,23 @@ pub fn stackTraceArray(allocator: Allocator, v: *const Value) Allocator.Error!?V
 pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8), is_cause: bool, depth: u8) Allocator.Error!void {
     _ = depth;
     if (is_cause) try out.appendSlice(allocator, "\nCaused by: ");
+    try formatThrowableWith(allocator, v, out, null);
+}
+
+/// Renders a throwable's header line, its `toString()`, for a caller that
+/// can run program code; null leaves the class and message.
+pub const HeaderRenderer = struct {
+    ctx: *anyopaque,
+    render: *const fn (ctx: *anyopaque, allocator: Allocator, v: *const Value) Allocator.Error!?[]const u8,
+};
+
+/// `formatThrowable`, each header line rendered by `header` when given. A
+/// cause's or a suppressed throwable's frames that end the same as its
+/// enclosing throwable's print as `... n more`, as the JVM prints them.
+pub fn formatThrowableWith(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8), header: ?HeaderRenderer) Allocator.Error!void {
     var deja: std.ArrayList(u64) = .empty;
     defer deja.deinit(allocator);
-    try formatThrowableEnclosed(allocator, v, out, "", &deja, 0);
+    try formatThrowableEnclosed(allocator, v, out, .{ .deja = &deja, .header = header }, "", "", &.{}, 0);
 }
 
 /// Identity for the dejaVu set; `0` opts out of cycle tracking and prints in full.
@@ -1000,6 +1037,14 @@ fn throwableIdentity(v: *const Value) u64 {
         .Instance => |inst| inst.identity(),
         else => 0,
     };
+}
+
+fn appendHeader(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8), header: ?HeaderRenderer) Allocator.Error!void {
+    if (header) |h| if (try h.render(h.ctx, allocator, v)) |text| {
+        try out.appendSlice(allocator, text);
+        return;
+    };
+    try appendThrowableHeader(allocator, v, out);
 }
 
 fn appendThrowableHeader(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8)) Allocator.Error!void {
@@ -1038,32 +1083,43 @@ fn appendThrowableHeader(allocator: Allocator, v: *const Value, out: *std.ArrayL
     }
 }
 
+const Rendering = struct {
+    deja: *std.ArrayList(u64),
+    header: ?HeaderRenderer,
+};
+
+/// `<prefix><caption><header>`, then the frames `enclosing` does not end
+/// with, then the suppressed throwables and the cause.
 fn formatThrowableEnclosed(
     allocator: Allocator,
     v: *const Value,
     out: *std.ArrayList(u8),
-    indent: []const u8,
-    deja: *std.ArrayList(u64),
+    how: Rendering,
+    prefix: []const u8,
+    caption: []const u8,
+    enclosing: []const runtime.StackFrame,
     depth: u8,
 ) Allocator.Error!void {
     if (depth > 16) return;
+    try out.appendSlice(allocator, prefix);
+    try out.appendSlice(allocator, caption);
     if (v.* != .Exception and v.* != .Instance) {
         try out.appendSlice(allocator, "<thrown value>");
         return;
     }
     const id = throwableIdentity(v);
     if (id != 0) {
-        for (deja.items) |seen| {
+        for (how.deja.items) |seen| {
             if (seen == id) {
                 try out.appendSlice(allocator, "[CIRCULAR REFERENCE: ");
-                try appendThrowableHeader(allocator, v, out);
+                try appendHeader(allocator, v, out, how.header);
                 try out.appendSlice(allocator, "]");
                 return;
             }
         }
-        try deja.append(allocator, id);
+        try how.deja.append(allocator, id);
     }
-    try appendThrowableHeader(allocator, v, out);
+    try appendHeader(allocator, v, out, how.header);
 
     var stk: ?runtime.StackRef = null;
     var cause: ?Value = null;
@@ -1086,10 +1142,20 @@ fn formatThrowableEnclosed(
         },
         else => unreachable,
     }
-    if (stk) |s| {
-        const sg = s.borrow();
-        defer sg.deinit();
-        try formatStackTraceIndented(allocator, sg.get(), out, indent);
+    const sg = if (stk) |st| st.borrow() else null;
+    defer if (sg) |g| g.deinit();
+    const frames: []const runtime.StackFrame = if (sg) |g| g.get().frames else &.{};
+    var m = frames.len;
+    var n = enclosing.len;
+    while (m > 0 and n > 0 and sameFrame(frames[m - 1], enclosing[n - 1])) {
+        m -= 1;
+        n -= 1;
+    }
+    try formatFrames(allocator, frames[0..m], out, prefix);
+    if (m != frames.len) {
+        const more = try std.fmt.allocPrint(allocator, "\n{s}\t... {d} more", .{ prefix, frames.len - m });
+        defer allocator.free(more);
+        try out.appendSlice(allocator, more);
     }
 
     // Suppressed sections, one tab deeper than this throwable.
@@ -1104,21 +1170,17 @@ fn formatThrowableEnclosed(
         }
     }
     if (suppressed.items.len != 0) {
-        const inner = try std.fmt.allocPrint(allocator, "{s}\t", .{indent});
+        const inner = try std.fmt.allocPrint(allocator, "{s}\t", .{prefix});
         defer allocator.free(inner);
         for (suppressed.items) |*s| {
             try out.appendSlice(allocator, "\n");
-            try out.appendSlice(allocator, inner);
-            try out.appendSlice(allocator, "Suppressed: ");
-            try formatThrowableEnclosed(allocator, s, out, inner, deja, depth + 1);
+            try formatThrowableEnclosed(allocator, s, out, how, inner, "Suppressed: ", frames, depth + 1);
         }
     }
 
     if (cause) |c| {
         try out.appendSlice(allocator, "\n");
-        try out.appendSlice(allocator, indent);
-        try out.appendSlice(allocator, "Caused by: ");
-        try formatThrowableEnclosed(allocator, &c, out, indent, deja, depth + 1);
+        try formatThrowableEnclosed(allocator, &c, out, how, prefix, "Caused by: ", frames, depth + 1);
     }
 }
 

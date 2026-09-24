@@ -3,24 +3,28 @@
 
 package kotlinx.coroutines
 
-public actual open class CancellationException actual constructor(
-    message: String?
-) : IllegalStateException(message)
+// The cause travels through the constructor, as it does on the JVM through
+// `initCause`: the internal constructor takes a `Unit` marker so it cannot
+// clash with the `CancellationException(message, cause)` factory below.
+public actual open class CancellationException internal constructor(
+    message: String?,
+    cause: Throwable?,
+    @Suppress("UNUSED_PARAMETER") withCause: Unit,
+) : IllegalStateException(message, cause) {
+    public actual constructor(message: String?) : this(message, null, Unit)
+}
 
 public actual fun CancellationException(
     message: String?,
     cause: Throwable?
-): CancellationException = CancellationException(message).apply {
-    if (cause != null) initCause(cause)
-}
+): CancellationException = CancellationException(message, cause, Unit)
 
 internal actual class JobCancellationException actual constructor(
     message: String,
     cause: Throwable?,
     job: Job
-) : CancellationException(message) {
+) : CancellationException(message, cause, Unit) {
     internal actual val job: Job = job
-    init { if (cause != null) initCause(cause) }
     override fun toString(): String = "${super.toString()}; job=$job"
 }
 

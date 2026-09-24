@@ -2,10 +2,9 @@
 //! builders, channels, `select`, and flows.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
-// The pipeline's process-global state points into the run allocator, so one
-// file-scoped arena must outlive every test here.
+// One arena for the file's runs, reset per program.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 fn writeSrc(a: std.mem.Allocator, io: std.Io, name: []const u8, src: []const u8) ![]const u8 {
@@ -24,7 +23,7 @@ fn assertKlio(name: []const u8, src: []const u8, want: []const u8) !void {
     const io = threaded.io();
 
     const file = try writeSrc(a, io, name, src);
-    const res = try parity.runWithPacks(a, io, file);
+    const res = try klio_child.runFile(a, file);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(want, got),
         .err => |m| {
@@ -107,7 +106,7 @@ test "cancellation_propagates_to_children" {
     const io = threaded.io();
 
     const file = try writeSrc(a, io, "cancel_children", src);
-    const res = try parity.runWithPacks(a, io, file);
+    const res = try klio_child.runFile(a, file);
     const raw = switch (res) {
         .ok => |got| got,
         .err => |m| {
@@ -514,7 +513,7 @@ fn runSmoke(stem: []const u8) !void {
     const want = try expected(a, src);
     try std.testing.expect(want.len != 0);
 
-    const res = try parity.runWithPacks(a, io, file);
+    const res = try klio_child.runFile(a, file);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(want, got),
         .err => |m| {

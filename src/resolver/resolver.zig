@@ -1322,8 +1322,6 @@ fn callExpr(callee: *Expr, args: []Expr) Expr {
     return .{ .Call = .{
         .callee = callee,
         .args = args,
-        .arg_names = &.{},
-        .type_args = &.{},
         .is_infix = false,
         .span = ts(),
     } };

@@ -1,10 +1,10 @@
 Screen (gen=0) {
-Item first -> id 1
-Item second -> id 2
+Item first (gen=0) -> id 1
+Item second (gen=0) -> id 2
 }
 allocations after first compose = 2
 Screen (gen=1) {
-Item first -> id 1
-Item second -> id 2
+Item first (gen=1) -> id 1
+Item second (gen=1) -> id 2
 }
 allocations after second compose = 2

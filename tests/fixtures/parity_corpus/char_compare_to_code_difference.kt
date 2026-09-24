@@ -1,6 +1,6 @@
-// kotlinc compiles `Char.compareTo` to `Character.compare`, which returns the
-// code difference. `Int`/`Long` compile to `Integer.compare`/`Long.compare`,
-// which return the sign.
+// kotlinc 2.4.20 compiles `Char.compareTo` to `Intrinsics.compare`, which
+// returns the sign, as `Integer.compare`/`Long.compare` do for `Int`/`Long`:
+// `'a'.compareTo('c')` is -1, not the code difference.
 fun main() {
     println('a'.compareTo('c'))
     println('c'.compareTo('a'))

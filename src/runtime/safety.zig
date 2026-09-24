@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const proc_env = @import("proc_env.zig");
+const tls_fast = @import("tls_fast.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -201,11 +202,72 @@ pub fn runCapped(
     return .{ .done = .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr } };
 }
 
-/// Each Kotlin call re-enters the evaluator through the host, so the
-/// nested-call chain is stack-heavy. `KLIO_MAX_EVAL_DEPTH` defaults well below
-/// this stack's frame ceiling and turns unbounded recursion into a clean
-/// `StackOverflowError`.
+/// A Kotlin call the host makes (a native calling back a lambda) re-enters
+/// the evaluator on the native stack, so that chain is stack-heavy. The
+/// evaluator raises `StackOverflowError` when the stack is down to its
+/// reserve (`stackLow`), well before it faults.
 pub const INTERPRET_STACK_SIZE: usize = 256 * 1024 * 1024;
+
+/// The stack of a thread the runtime starts to run Kotlin code: a
+/// dispatcher's worker or a `thread { }`.
+pub const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// The calling thread's stack as the evaluator guards it.
+const StackBounds = struct {
+    /// Below this address a new native activation raises
+    /// `StackOverflowError`: the stack's end plus `reserve`. 0 where the
+    /// thread's stack is not known.
+    floor: usize = 0,
+    /// The room kept below `floor` for building and throwing the error.
+    reserve: usize = 0,
+};
+
+const stack_bounds = tls_fast.PerThread(StackBounds);
+
+/// A sixteenth of the stack, at most 4 MiB: several native activations and
+/// the error's constructor chain.
+fn stackReserve(size: usize) usize {
+    return @min(4 * 1024 * 1024, size / 16);
+}
+
+/// Records the calling thread's stack as `size` bytes from `low`, and
+/// answers the bounds it had, for `restoreStack`.
+pub fn setStack(low: usize, size: usize) StackBounds {
+    const b = stack_bounds.get();
+    const prev = b.*;
+    const reserve = stackReserve(size);
+    b.* = .{ .floor = low + reserve, .reserve = reserve };
+    return prev;
+}
+
+pub fn restoreStack(prev: StackBounds) void {
+    stack_bounds.get().* = prev;
+}
+
+/// Records the stack of a thread just started on `size` bytes: its entry
+/// frame stands for the stack's top.
+pub fn enterThreadStack(size: usize) void {
+    _ = setStack(@frameAddress() -| size, size);
+}
+
+/// Whether the calling thread's stack is down to its reserve.
+pub fn stackLow() bool {
+    const f = stack_bounds.get().floor;
+    return f != 0 and @frameAddress() < f;
+}
+
+/// Opens half the reserve to build a `StackOverflowError` in; `closeReserve`
+/// with the answer shuts it again.
+pub fn openReserve() usize {
+    const b = stack_bounds.get();
+    const floor = b.floor;
+    if (floor != 0) b.floor = floor - b.reserve / 2;
+    return floor;
+}
+
+pub fn closeReserve(floor: usize) void {
+    stack_bounds.get().floor = floor;
+}
 
 /// If the thread cannot be spawned, `func` runs inline on the current stack.
 pub fn runOnBigStack(
@@ -218,6 +280,7 @@ pub fn runOnBigStack(
         ctx: Ctx,
         result: Ret = undefined,
         fn entry(self: *@This()) void {
+            enterThreadStack(INTERPRET_STACK_SIZE);
             self.result = func(self.ctx);
         }
     };
@@ -302,6 +365,8 @@ pub fn runOnBigStackMainThread(
     const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack.ptr) + stack.len, 16);
     on_big_stack = true;
     defer on_big_stack = false;
+    const prev = setStack(@intFromPtr(stack.ptr), stack.len);
+    defer restoreStack(prev);
     callOnStack(sp_top, Runner.entry, &runner);
     return runner.result;
 }
@@ -347,6 +412,8 @@ pub fn runOnPersistentBigStack(
     };
     var runner = Runner{ .ctx = ctx };
     const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack.ptr) + stack.len, 16);
+    const prev = setStack(@intFromPtr(stack.ptr), stack.len);
+    defer restoreStack(prev);
     callOnStack(sp_top, Runner.entry, &runner);
     return runner.result;
 }

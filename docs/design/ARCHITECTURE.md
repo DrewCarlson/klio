@@ -13,18 +13,17 @@ source text
   ▼  span        (SourceMap, FileId, Span)
   ▼  lexer       (token stream, trivia preserved)
   ▼  parser      (AST + diagnostics)
-  ▼  ir          (AST → register IR lowering; applicability = the
-  │               shared overload-resolution engine; jit_loop = the
-  │               native compiler over the IR)
+  ▼  sema        (symbols, headers and bodies: every name bound)
+  ▼  ir          (bridge: sema's symbols → IR ids; lower/sema: sema's
+  │               records → register IR; jit_loop = the native
+  │               compiler over the IR)
   ▼  interp_ir   (the Vm: executes IR; JIT tiers compile hot code)
   ▼  cli         (binary: run / test / check / lex / parse / dump-ir /
                   bake / repl / pack)
 ```
 
 `resolver` and `typeck` (backed by `types` and `cfa`) serve the
-`klio check` diagnostics path, and under `KLIO_EAGER=1` they run
-ahead of lowering on the run path so lowering consumes type-derived
-resolution answers. `runtime` owns the `Value` model, the `ObjRef`
+`klio check` diagnostics path. `runtime` owns the `Value` model, the `ObjRef`
 cell protocol, the tracing GC, and the perf profiles; `stdlib` owns
 the native intrinsics and symbol index; `pack` / `stdlib_pack` own
 the `.klio-pack` format and the embedded stdlib.

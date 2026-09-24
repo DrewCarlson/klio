@@ -37,5 +37,5 @@ fun main() {
         polymorphic(Any::class) { subclass(ints) }
     }
     println("byValue  = " + (poly.getPolymorphic(Any::class, 42) === ints))
-    println("byName   = " + (poly.getPolymorphic(Any::class, "kotlin.Int") === ints))
+    println("byName   = " + (poly.getPolymorphic(Any::class, serializedClassName = "kotlin.Int") === ints))
 }

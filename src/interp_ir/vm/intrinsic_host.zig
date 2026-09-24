@@ -84,6 +84,7 @@ fn spawnSeed(self: *VmIntrinsicHost) SendableVmSeed {
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
         .singletons_by_id = self.singletons_by_id.clone(),
+        .resolved_state = if (self.resolved_state) |rs| rs.clone() else null,
         .allocator = self.allocator,
     };
 }
@@ -331,11 +332,11 @@ pub fn activeCoroScope(self: *VmIntrinsicHost) ?Value {
 }
 
 pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) void {
-    coroutines.coroutineResumeExternal(self, slot, value, out) catch {};
+    _ = coroutines.coroutineResumeExternal(self, slot, value, out) catch null;
 }
 
-pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) void {
-    coroutines.coroutineResumeContinuation(self, slot, value, out) catch {};
+pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) ?Value {
+    return coroutines.coroutineResumeContinuation(self, slot, value, out) catch null;
 }
 
 pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error!?RuntimeError {
@@ -419,6 +420,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
             const msg = try std.fmt.allocPrint(self.allocator, "unknown IrClosure id {d}", .{id});
             return .{ .err = .{ .Type = msg } };
         };
+        if (info.resolved != null) return invokeResolvedClosure(self, callable, null, args, out);
         // A receiver lambda invoked as a plain value with one extra leading arg is
         // the ABI's flattened form: bind arg 0 as the receiver, never as a positional.
         if (info.receiver_shape_known and info.has_receiver and args.len == info.n_params + 1) {
@@ -531,12 +533,41 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
     return .{ .err = .{ .Unimplemented = msg } };
 }
 
+/// Runs a closure lowered from sema exactly: its body takes `this_value`
+/// (a receiver lambda's receiver, its first parameter) and then `args`; a
+/// bound property reference's receiver comes first of all.
+fn invokeResolvedClosure(self: *VmIntrinsicHost, callable: *const Value, this_value: ?*const Value, args: []const Value, out: Output) Allocator.Error!RuntimeEvalResult {
+    var host = vmHost(self, out);
+    const body = host.resolvedClosure(callable) orelse return .{ .err = .{ .Type = "closure body is not in the module" } };
+    const given = args.len + @intFromBool(this_value != null);
+    if (given != body.arity()) {
+        const msg = try std.fmt.allocPrint(self.allocator, "closure of {s} takes {d} arguments, called with {d}", .{ body.func.fqn, body.arity(), given });
+        return .{ .err = .{ .Type = msg } };
+    }
+    var params: std.ArrayList(Value) = .empty;
+    var caps: std.ArrayList(Value) = .empty;
+    {
+        const g = callable.IrClosure.borrow();
+        defer g.deinit();
+        const closure_caps = g.get().captures;
+        switch (body.kind) {
+            .property_ref => |p| if (p.bound and closure_caps.len != 0) try params.append(self.allocator, closure_caps[0]),
+            else => try caps.appendSlice(self.allocator, closure_caps),
+        }
+    }
+    if (this_value) |t| try params.append(self.allocator, t.*);
+    try params.appendSlice(self.allocator, args);
+    const result = try ir.eval.evalWithCapturesChained(VmHost, self.allocator, body.module, body.owning, body.func, params, caps, &.{}, body.id, &host);
+    return flattenEval(result);
+}
+
 pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, args: []const Value, this_value: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     // Receiver-typed lambda dispatch: bind the receiver as the lambda's implicit
     // `this` and as the injected `it` by overriding the captures cell for the call.
     if (callable.* == .IrClosure) {
         const id = callable.IrClosure.asPtr().id;
         const info = self.closures.get(@intCast(id));
+        if (info) |inf| if (inf.resolved != null) return invokeResolvedClosure(self, callable, this_value, args, out);
         if (info) |inf| {
             var this_idx: ?usize = null;
             var prior_this: ?Value = null;
@@ -676,6 +707,25 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
         ir.eval.dumpFrameChainForDiagAlways();
     }
     return .{ .err = .{ .Unimplemented = msg } };
+}
+
+/// `member` of an instance lowered from sema through its class's slot
+/// (`host_resolved.callWellKnown`); null for any other value.
+pub fn callWellKnown(self: *VmIntrinsicHost, receiver: *const Value, member: runtime.WellKnown, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
+    var host = vmHost(self, out);
+    const r = (try vmhost.host_resolved.callWellKnown(&host, self.allocator, receiver, member, args)) orelse return null;
+    return flattenEval(r);
+}
+
+/// `object` from the tables (`host_resolved.wellKnownObject`); null when
+/// they do not declare it or making it failed.
+pub fn wellKnownObject(self: *VmIntrinsicHost, object: runtime.WellKnownObject) Allocator.Error!?Value {
+    var host = vmHost(self, self.out_sink.output());
+    const r = (try vmhost.host_resolved.wellKnownObject(&host, self.allocator, object)) orelse return null;
+    return switch (r) {
+        .ok => |v| v,
+        .err => null,
+    };
 }
 
 pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []const u8, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
@@ -838,6 +888,7 @@ const WorkerArgs = struct {
     reclaim: bool,
     threads: root.ThreadTable,
     id: u64,
+    name: []const u8,
 };
 
 fn publishThreadResult(threads: root.ThreadTable, id: u64, result: ThreadResult) void {
@@ -850,6 +901,10 @@ fn publishThreadResult(threads: root.ThreadTable, id: u64, result: ThreadResult)
 }
 
 fn workerEntry(wargs: WorkerArgs) void {
+    runtime.enterThreadStack(runtime.WORKER_STACK_SIZE);
+    const tid = std.Thread.getCurrentId();
+    runtime.setThreadName(tid, wargs.name);
+    defer runtime.clearThreadName(tid);
     var args = wargs;
     defer runtime.slab.flushMagazines();
     assertSpawnAllocatorInvariant(args.seed.allocator, "workerEntry");
@@ -879,14 +934,31 @@ fn workerEntry(wargs: WorkerArgs) void {
         .ok => publishThreadResult(args.threads, args.id, .{ .ok = {} }),
         .err => |e| switch (e) {
             .Return => publishThreadResult(args.threads, args.id, .{ .ok = {} }),
+            // A throwable that ends the thread goes to its uncaught handler,
+            // which by default prints it as the JVM's does; the thread that
+            // joins it carries on.
+            .Thrown => |v| {
+                reportUncaught(&vm, v, args.name);
+                publishThreadResult(args.threads, args.id, .{ .ok = {} });
+            },
             else => publishThreadResult(args.threads, args.id, .{ .err = e }),
         },
     }
 }
 
+/// `Exception in thread "<name>" ` and the throwable's stack trace on
+/// stderr, as the JVM's default uncaught handler prints them.
+fn reportUncaught(vm: *root.Vm, v: Value, name: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const text = vm.threadUncaughtText(arena.allocator(), &v, name) catch return;
+    std.debug.print("{s}\n", .{text});
+}
+
 /// Spawn a worker thread for `block`. Every cell the child reaches orders concurrent
 /// borrows through its own lock, and `Thread.spawn`/`join` bracket the happens-before.
-fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!HostResultU64 {
+fn startWorker(self: *VmIntrinsicHost, block: *const Value, name_in: []const u8) Allocator.Error!HostResultU64 {
+    const name = try self.allocator.dupe(u8, name_in);
     const id = blk: {
         const g = self.instance_id_counter.borrowMut();
         defer g.deinit();
@@ -897,7 +969,7 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!Host
     {
         const g = self.threads.borrowMut();
         defer g.deinit();
-        try g.get().put(id, .{ .handle = null, .result = null });
+        try g.get().put(id, .{ .handle = null, .result = null, .name = name });
     }
 
     // The block and the graph its captures reach cross to a worker that may outlive
@@ -910,9 +982,10 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!Host
         .reclaim = runtime.reclaimEnabled(),
         .threads = self.threads.clone(),
         .id = id,
+        .name = name,
     };
 
-    const handle = std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, workerEntry, .{wargs}) catch {
+    const handle = std.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, workerEntry, .{wargs}) catch {
         block.release(self.allocator);
         const g = self.threads.borrowMut();
         defer g.deinit();
@@ -928,9 +1001,9 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!Host
 }
 
 /// Spawn `block` on a real OS thread, returning an id joined through the thread table.
-pub fn spawnOsThread(self: *VmIntrinsicHost, block: *const Value, out: Output) Allocator.Error!HostResultU64 {
+pub fn spawnOsThread(self: *VmIntrinsicHost, block: *const Value, name: []const u8, out: Output) Allocator.Error!HostResultU64 {
     _ = out;
-    return startWorker(self, block);
+    return startWorker(self, block, name);
 }
 
 /// Post a dispatcher runnable onto the shared worker pool; `Dispatchers.Default`

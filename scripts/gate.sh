@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # The full local verification gate, one entry point. Order: fast unit
-# tests, then the program-running litmus suites (parity set + e2e +
-# examples + the ktor/concurrency gates) through the build system (it
-# wires KLIO_ITEST_BIN and the parity base images itself), then the
-# stdlib-commontest dual eager gate via scripts/commontest-sweep.py.
+# tests, then the program-running litmus suites (the parity groups, the
+# threaded litmus, e2e, the examples and the ktor/concurrency gates)
+# through the build system (it wires KLIO_ITEST_BIN and the shared test
+# home itself), the packs, the compose-ui gate, the CLI corpus, the sema
+# census, the native C backend (scripts/native-c-check.sh), then the stdlib
+# commontest sweep via scripts/commontest-sweep.py.
 #
 # Usage: gate.sh [--no-sweep]
-#   --no-sweep   skip the commontest dual gate (the slow tail)
+#   --no-sweep   skip the commontest sweep (the slow tail)
 #
 # Every phase runs under a hard timeout (GATE_PHASE_TIMEOUT, seconds;
 # default 1200) and prints its wall time. A crashed itest binary can
@@ -16,12 +18,12 @@
 # Targeted iteration instead of the full gate:
 #   zig build itest-<suite>                       one suite
 #   scripts/commontest-sweep.py BIN --filter F    one commontest file
-#
-# The ratchet phase compares the unresolved site census against
-# plans/resolution-ceiling.json. Lower a kind's entry when it falls; raising
-# one needs a reason in the running log.
 #   zig build klio-harness -Dharness-optimize=Debug   16s edit-loop harness
-#   KLIO_E2E_SHARD=0/16 on an itest e2e binary    the image+jit path, sharded
+#   KLIO_E2E_SHARD=0/16 on an itest e2e binary    the corpus, sharded
+#
+# The sema census phase fails on any unresolved or unrecorded reference in
+# the base, the installed packs or the example corpus that
+# tests/sema-census-open.txt does not list, and on a listed one that is gone.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -54,13 +56,14 @@ echo "== unit"
 phase "unit" zig build test
 
 echo "== litmus + ktor + e2e (build-system run steps)"
-# ktor_client_get is excluded while its replay failure is open; re-add it
-# the moment it goes green.
+# The parity groups and the language-feature group run every migrated
+# suite through the harness in the shared test home. ktor_client_get is
+# excluded while its replay failure is open; re-add it the moment it goes
+# green.
 phase "litmus" zig build \
-  itest-parity_threaded_litmus itest-parity_corpus_pinned \
-  itest-parity_lambdas_and_dispatch itest-parity_inheritance_dispatch \
-  itest-parity_extension_resolution itest-parity_object_init \
-  itest-check_examples itest-e2e \
+  itest-parity_threaded_litmus itest-group_parity_core \
+  itest-group_parity_types itest-group_parity_shapes \
+  itest-group_lang_features itest-e2e \
   itest-ktor_server itest-ktor_channel_async itest-concurrency_stress \
   itest-bundle_smoke \
   --summary failures
@@ -82,22 +85,26 @@ echo "== full example corpus"
 # 180 s per example: a cold compose bake is ~70 s even locally (warm ~2 s).
 phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180
 
-# The resolution ratchet: every unresolved site kind may fall and may not
-# rise, and a kind absent from the ceiling may not appear. A lowering change
-# that re-derives one more target by name fails here the day it lands.
-echo "== resolution ratchet"
-phase "ratchet" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/site-census-sweep.py \
-  zig-out/bin/klio-harness --timeout 180 --cold --ceiling "$ROOT/plans/resolution-ceiling.json"
+# The sema census over the base, every installed pack with all of its
+# features, and the example corpus, against the packs just installed.
+echo "== sema census"
+phase "sema-census" python3 scripts/sema-census.py \
+  --klio zig-out/bin/klio-harness --home "$ROOT/.klio-local"
+
+# Every program `klio transpile --native` accepts compiles warning-clean and
+# prints what the interpreter prints. native_coroutines stays refused until
+# the backend takes kotlinx.coroutines' constructors.
+echo "== native C backend"
+phase "native-c-build" zig build install klio-rt
+phase "native-c" env NATIVE_C_ALLOW_REFUSED=native_coroutines scripts/native-c-check.sh
 
 if [ "$NO_SWEEP" = 0 ]; then
-  echo "== commontest dual eager gate"
-  phase "harness-build" zig build klio-harness
-  if [ ! -d /tmp/klio_itest_stdlibtest_home ]; then
-    # One harness suite run installs the kotlin.test pack the sweep
-    # children need.
-    zig build itest-stdlib_commontest >/dev/null 2>&1 || true
-  fi
-  phase "sweep" python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --eager both
+  echo "== stdlib commontest sweep"
+  # The sweep's children run in the build's test home, which holds the
+  # kotlin.test pack they need.
+  phase "harness-build" zig build klio-harness klio-test-home
+  phase "sweep" python3 scripts/commontest-sweep.py zig-out/bin/klio-harness \
+    --home "$ROOT/zig-out/klio-test-home"
 fi
 
 [ "$fail" = 0 ] && echo "GATE GREEN" || echo "GATE RED"

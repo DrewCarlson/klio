@@ -6,7 +6,7 @@ import androidx.compose.runtime.Composition
 import androidx.compose.runtime.Recomposer
 import androidx.compose.runtime.Applier
 import androidx.compose.runtime.BroadcastFrameClock
-import androidx.compose.runtime.SnapshotStateList
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.runtime.MutableIntState
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateListOf

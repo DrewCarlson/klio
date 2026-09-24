@@ -38,8 +38,9 @@ ACTUALS = [
     "tests/stdlib_commontest_actuals/EncodingActuals.kt",
     "tests/stdlib_commontest_actuals/JsCollectionFactories.kt",
 ]
-# The scratch HOME the stdlib_commontest itest installs the kotlin.test
-# pack into; running that suite once populates it. Override with --home.
+# The children's HOME, which needs the kotlin.test pack (installed from
+# ~/.klio/packs when missing). `--home zig-out/klio-test-home` runs them in
+# the build's test home, which holds every shipped pack.
 CHILD_HOME = "/tmp/klio_itest_stdlibtest_home"
 TEST_FILTER = None
 
@@ -129,6 +130,7 @@ def collect():
 
 
 def imported_test_name(line):
+    """The fully qualified name a `test.*` import names, or None."""
     t = line.strip()
     if not t.startswith("import "):
         return None
@@ -142,7 +144,12 @@ def imported_test_name(line):
     name = rest[dot + 1:]
     if not name or name == "*":
         return None
-    return name
+    return rest
+
+
+def package_of(content):
+    m = re.search(r"^package\s+([A-Za-z0-9_.]+)", content, re.MULTILINE)
+    return m.group(1) if m else ""
 
 
 def _word(line, w):
@@ -150,9 +157,11 @@ def _word(line, w):
 
 
 def declares_top_level(content, name):
+    """Whether a line that starts at column 0 declares `name`: a nested class of
+    the same simple name is not the file's top-level declaration."""
     kws = ("val", "var", "fun", "class", "object", "interface", "typealias", "enum")
     for line in content.splitlines():
-        if not _word(line, name):
+        if not line or line[0].isspace() or not _word(line, name):
             continue
         if any(_word(line, kw) for kw in kws):
             return True
@@ -167,14 +176,19 @@ def build_providers(targets):
             n = imported_test_name(line)
             if n:
                 imported.add(n)
+    # An import names a package and a declaration in it, so a provider is a
+    # file of that package declaring the name at top level.
     provider, ambiguous = {}, set()
     for t in targets:
-        for n in imported:
-            if declares_top_level(texts[t], n):
-                if n in provider:
-                    ambiguous.add(n)
-                else:
-                    provider[n] = t
+        pkg = package_of(texts[t])
+        for fqn in imported:
+            pkg_of_name, _, name = fqn.rpartition(".")
+            if pkg_of_name != pkg or not declares_top_level(texts[t], name):
+                continue
+            if fqn in provider:
+                ambiguous.add(fqn)
+            else:
+                provider[fqn] = t
     for n in ambiguous:
         provider.pop(n, None)
     return provider, texts

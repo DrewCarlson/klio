@@ -1,6 +1,7 @@
 // Named parameters inside function types, including the parenthesized
 // nullable form after a type-use annotation — the ContextMenuUi.kt shape:
 // `leadingIcon: @Composable ((iconColor: Color) -> Unit)? = null`.
+@Target(AnnotationTarget.TYPE)
 annotation class Marked
 
 fun renderLeading(leading: @Marked ((iconColor: Int) -> Unit)? = null) {

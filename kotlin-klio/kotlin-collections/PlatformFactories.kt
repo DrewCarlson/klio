@@ -1,6 +1,6 @@
 /*
- * klio-authored declarations for the platform collection factories the
- * interpreter serves natively.
+ * klio-authored declarations for the platform collection factories and
+ * conversions the interpreter serves natively.
  *
  * These exist so the symbol table has NO HOLES: a callable the runtime can
  * dispatch must also be a declaration the resolver can see, or a bare call to
@@ -32,6 +32,32 @@ public fun <K : Comparable<K>, V> sortedMapOf(vararg pairs: Pair<K, V>): Mutable
 public fun <K, V> sortedMapOf(comparator: Comparator<in K>, vararg pairs: Pair<K, V>): MutableMap<K, V> {
     val out = LinkedHashMap<K, V>()
     for (p in pairs.sortedWith(compareBy(comparator) { it.first })) out[p.first] = p.second
+    return out
+}
+
+/** This map's entries ordered by the natural order of their keys. */
+public fun <K : Comparable<K>, V> Map<out K, V>.toSortedMap(): MutableMap<K, V> =
+    toSortedMap(naturalOrder<K>())
+
+/**
+ * This map's entries ordered by [comparator] over their keys. Keys the
+ * comparator finds equal are one entry, as in a sorted map: the first key
+ * with the last value.
+ */
+@Suppress("UNCHECKED_CAST")
+public fun <K, V> Map<out K, V>.toSortedMap(comparator: Comparator<in K>): MutableMap<K, V> {
+    val out = LinkedHashMap<K, V>()
+    var first = true
+    var last: K? = null
+    for (e in entries.sortedWith(compareBy(comparator) { it.key })) {
+        if (!first && comparator.compare(last as K, e.key) == 0) {
+            out[last as K] = e.value
+            continue
+        }
+        out[e.key] = e.value
+        last = e.key
+        first = false
+    }
     return out
 }
 

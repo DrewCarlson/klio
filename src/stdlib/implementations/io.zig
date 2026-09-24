@@ -25,7 +25,7 @@ pub fn renderViaUserToString(ctx: *CallCtx, v: *const Value) std.mem.Allocator.E
         v.* == .List or v.* == .Set or v.* == .Map or
         v.* == .Pair or v.* == .Triple or v.* == .MapEntry)
     {
-        if (try ctx.host.invokeMethod(v, "toString", &.{}, ctx.out)) |res| {
+        if (try ctx.host.callWellKnown(v, .to_string, &.{}, ctx.out)) |res| {
             if (res == .ok and res.ok == .String) {
                 const g = res.ok.String.borrow();
                 const rendered = try ctx.allocator.dupe(u8, g.get().bytes);

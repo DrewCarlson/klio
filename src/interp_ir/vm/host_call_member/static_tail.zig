@@ -331,10 +331,10 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
         if (try instanceBindingProbe(self, allocator, receiver, name, args)) |r| return r;
     }
 
-    // `kotlin.concurrent.Thread` handle members.
+    // `java.lang.Thread` handle members.
     if (receiver.* == .BoundMethod) {
         const bm = receiver.BoundMethod;
-        if (std.mem.eql(u8, bm.fqn, "kotlin.concurrent.Thread")) {
+        if (std.mem.eql(u8, bm.fqn, "java.lang.Thread")) {
             const id: u64 = switch (bm.receiver.asPtr().*) {
                 .Long => |v| @bitCast(v),
                 else => 0,
@@ -389,10 +389,11 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
         const cname = cg.get().name;
         const cfqn = cg.get().fqn;
         cg.deinit();
-        // `Any.toString` on a class value is the class label, never a same-named
-        // number intrinsic that expects a value receiver.
+        // `Any.toString` on a class value is the class label with the qualified
+        // name (`class kotlin.Any`), never a same-named number intrinsic that
+        // expects a value receiver.
         if (std.mem.eql(u8, name, "toString") and args.len == 0) {
-            const label = try std.fmt.allocPrint(allocator, "class {s}", .{cname});
+            const label = try std.fmt.allocPrint(allocator, "class {s}", .{cfqn});
             return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, label) } };
         }
         const probe_simple = try hcm.joinDot(allocator, cname, name);
@@ -881,7 +882,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
             defer if (runtime.freeScratch()) allocator.free(msg);
-            return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
+            return .{ .err = try throwExc(allocator, "java.lang.ArrayIndexOutOfBoundsException", msg) };
         }
     }
     if (std.mem.eql(u8, name, "set") and args.len == 2 and receiver.* == .Array) {
@@ -894,7 +895,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
             defer if (runtime.freeScratch()) allocator.free(msg);
-            return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
+            return .{ .err = try throwExc(allocator, "java.lang.ArrayIndexOutOfBoundsException", msg) };
         }
     }
 

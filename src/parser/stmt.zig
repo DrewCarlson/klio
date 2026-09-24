@@ -140,6 +140,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                             .is_annotation = false,
                             .is_expect = flags.is_expect,
                             .is_actual = flags.is_actual,
+                            .is_external = flags.is_external,
                         },
                         visibility,
                         annotations,
@@ -210,6 +211,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                         .is_annotation = flags.is_annotation,
                         .is_expect = flags.is_expect,
                         .is_actual = flags.is_actual,
+                        .is_external = flags.is_external,
                     },
                     visibility,
                     annotations,
@@ -249,9 +251,12 @@ pub fn parseStmt(p: *Parser) ?Stmt {
 fn parseFallthroughStmt(p: *Parser, save: usize) ?Stmt {
     p.pos = save;
     // A statement may carry leading annotations; they are runtime no-ops, so
-    // discard them and let the expression parser see the statement.
+    // discard them and let the expression parser see the statement. On a
+    // function literal they stay, for the literal keeps them
+    // (`@Composable { ... }` as a lambda's result is a composable lambda).
     _ = file.parseAnnotations(p);
     support.skipNl(p);
+    if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) p.pos = save;
     return parseExprOrAssignStmt(p);
 }
 
@@ -266,6 +271,11 @@ pub fn parseDestructuringDecl(p: *Parser) ?Stmt {
         bracket,
         "destructured name",
     ) orelse return null;
+    // `val` or `var` is written once: on the declaration (`val [a, b]`) or
+    // on each entry (`[val a, val b]`), never both.
+    if (entries.keyword_at) |sp| {
+        support.err(p, "E0308", "a destructuring declared with `val` or `var` cannot repeat it on its entries; write `[val a, val b] = p` or `val [a, b] = p`", sp);
+    }
     if (entries.any_var) mutable = true;
     _ = support.expect(p, .Eq, "`=`") orelse return null;
     support.skipNl(p);

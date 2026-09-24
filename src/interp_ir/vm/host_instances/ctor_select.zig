@@ -19,7 +19,7 @@ const host_call_value = @import("../host_call_value.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-const build = @import("../../build.zig");
+const tables = @import("../../tables.zig");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -346,7 +346,7 @@ pub fn sideTableKey(fqn: ?[]const u8, name: []const u8) []const u8 {
     return if (f.len != 0) f else name;
 }
 
-pub fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const root.build.SecondaryCtorEntry {
+pub fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const root.tables.SecondaryCtorEntry {
     const g = self.prog.borrow();
     defer g.deinit();
     const key = sideTableKey(fqn, name);
@@ -534,21 +534,21 @@ pub fn isCallableArg(v: *const Value) bool {
 
 /// A secondary ctor with defaulted extra parameters is a candidate only when no
 /// primary takes the call; exact-arity callers keep `exact_arity`.
-pub fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
+pub fn chooseSecondaryCtor(self: *VmHost, entries: []const root.tables.SecondaryCtorEntry, args: []const Value) ?root.tables.SecondaryCtorEntry {
     return chooseSecondaryCtorArity(self, entries, args, true);
 }
 
-pub fn chooseSecondaryCtorDefaulted(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
+pub fn chooseSecondaryCtorDefaulted(self: *VmHost, entries: []const root.tables.SecondaryCtorEntry, args: []const Value) ?root.tables.SecondaryCtorEntry {
     return chooseSecondaryCtorArity(self, entries, args, false);
 }
 
-pub fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value, exact_arity: bool) ?root.build.SecondaryCtorEntry {
+pub fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.tables.SecondaryCtorEntry, args: []const Value, exact_arity: bool) ?root.tables.SecondaryCtorEntry {
     // Two passes: a `@Deprecated(level = HIDDEN)` constructor is no source-level
     // candidate, so it is reached only when the class has no other secondary.
     var pass: usize = 0;
     while (pass < 2) : (pass += 1) {
         const want_low = pass == 1;
-        var best: ?root.build.SecondaryCtorEntry = null;
+        var best: ?root.tables.SecondaryCtorEntry = null;
         var best_score: i32 = -1;
         for (entries) |e| {
             if (e.low_priority != want_low) continue;
@@ -594,8 +594,8 @@ pub fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.Secon
 pub const DeferredCtorBody = struct { fqn: ?[]const u8, name: []const u8, body: FuncId, args: []Value };
 
 /// `chooseSecondaryCtor` restricted to the constructors source can name.
-pub fn chooseOrdinarySecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
-    var ordinary: std.ArrayList(root.build.SecondaryCtorEntry) = .empty;
+pub fn chooseOrdinarySecondaryCtor(self: *VmHost, entries: []const root.tables.SecondaryCtorEntry, args: []const Value) ?root.tables.SecondaryCtorEntry {
+    var ordinary: std.ArrayList(root.tables.SecondaryCtorEntry) = .empty;
     defer ordinary.deinit(self.allocator);
     for (entries) |e| if (!e.low_priority) {
         ordinary.append(self.allocator, e) catch return null;
@@ -660,7 +660,7 @@ pub fn expandParentSecondaryThisArgs(
         const entries = secondaryCtors(self, class_fqn, class_name);
         // Named header arguments bind by name; an omitted parameter takes its
         // default, evaluated in parameter order with the values bound so far.
-        var entry_opt: ?root.build.SecondaryCtorEntry = null;
+        var entry_opt: ?root.tables.SecondaryCtorEntry = null;
         if (names) |nm| {
             var any_named = false;
             for (nm) |n| if (n != null) {
@@ -869,7 +869,7 @@ pub fn primaryDefaultThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?
     return g.get().primary_ctor_default_thunks.get(sideTableKey(fqn, name));
 }
 
-pub fn classDelegateThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const root.build.StrFunc {
+pub fn classDelegateThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const root.tables.StrFunc {
     const g = self.prog.borrow();
     defer g.deinit();
     return g.get().class_delegates.get(sideTableKey(fqn, name)) orelse &.{};

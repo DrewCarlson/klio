@@ -6,6 +6,7 @@ const ir = @import("ir");
 const runtime = @import("runtime");
 const applicability = @import("applicability");
 const vmhost = @import("../vmhost.zig");
+const host_resolved = @import("../host_resolved.zig");
 const VmHost = vmhost.VmHost;
 const trace = @import("../trace.zig");
 const persistent_list_eq = @import("../persistent_list_eq.zig");
@@ -218,6 +219,8 @@ pub fn provideDelegateFor(self: *VmHost, allocator: Allocator, this_ref: Value, 
 }
 
 pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
+    // An instance lowered from sema answers through its class's slots.
+    if (try host_resolved.wellKnownCall(self, allocator, receiver, name, args, .function)) |wk| return wk;
     const r = try callMemberInner(self, allocator, receiver, name, args, false);
     // A raw callable asked for a member nothing serves stands in for a SAM
     // instance, so the call invokes the callable. Direct dispatch only: the

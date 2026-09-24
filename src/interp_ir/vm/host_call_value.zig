@@ -26,7 +26,6 @@ const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const ValueList = runtime.ValueList;
-const ValueSlice = runtime.ValueSlice;
 const IrClosureRef = runtime.IrClosureRef;
 const InstanceData = runtime.InstanceData;
 const StdlibFn = runtime.StdlibFn;
@@ -2044,45 +2043,6 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
     return .{ .ok = .{ .IrClosure = caps_ref } };
 }
 
-pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module: *const Module, params: []const []const u8, body: *const ast.Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
-    _ = body;
-    _ = absorb_return;
-    const fid = body_func orelse return .{ .err = .{ .Unimplemented = "Vm: lambda lower did not provide body_func" } };
-    // Canonical capture store for the HOF invoke path; a captured `var` is a
-    // shared `Value.Cell`, so writes are visible by reference.
-    var cell_list: std.ArrayList(Value) = .empty;
-    try cell_list.appendSlice(allocator, captures);
-    const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
-    var chain = try ir.eval.captureChainAlloc(allocator);
-    // A closure capturing `this` whose creation-time chain is empty (an AstLambda
-    // in a property getter, whose accessor frame binds the receiver only as a
-    // parameter) resolves `this@Class` against nothing, so seed the chain.
-    if (chain.len == 0) {
-        for (captured_names, 0..) |cn, i| {
-            if (std.mem.eql(u8, cn, "this") and i < captures.len and captures[i] == .Instance) {
-                const seeded = try allocator.alloc(ir.eval.EnclosingEntry, 1);
-                seeded[0] = .{ .v = captures[i], .kind = .receiver };
-                allocator.free(chain);
-                chain = seeded;
-                break;
-            }
-        }
-    }
-    const id = try self.closures.push(.{
-        .body_func = fid,
-        .module = if (module == self.module.asPtr()) null else module,
-        .n_params = params.len,
-        .receiver_shape_known = if (module.funcById(fid)) |f| f.lambda_receiver_shape_known else false,
-        .has_receiver = if (module.funcById(fid)) |f| f.lambda_has_receiver else false,
-        .capture_names = try allocator.dupe([]const u8, captured_names),
-        .captures = cell,
-        .chain = chain,
-    });
-    if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
-    const caps_ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = try allocator.dupe(Value, captures) });
-    return .{ .ok = .{ .IrClosure = caps_ref } };
-}
-
 pub fn callableReceiverShape(self: *VmHost, v: *const Value) ?ReceiverShape {
     _ = self;
     _ = v;
@@ -2277,6 +2237,7 @@ fn makeIntrinsicHost(self: *VmHost) VmIntrinsicHost {
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
         .singletons_by_id = self.singletons_by_id.clone(),
+        .resolved_state = self.resolved_state,
         .allocator = self.allocator,
     };
 }

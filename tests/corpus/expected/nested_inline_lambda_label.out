@@ -1,0 +1,8 @@
+plain: left the literal at 21
+42
+plain: ran through with 21
+42
+suspending: left the literal at 21
+suspending: ran through with 21
+completed: true
+63, 63, 5, caught refused

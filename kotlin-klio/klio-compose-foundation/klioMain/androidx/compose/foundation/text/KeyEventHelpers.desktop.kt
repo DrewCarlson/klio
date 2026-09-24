@@ -24,8 +24,11 @@
 package androidx.compose.foundation.text
 
 import androidx.compose.ui.input.key.KeyEvent
-import org.jetbrains.skiko.orderEmojiAndSymbolsPopup
 
 internal actual fun KeyEvent.cancelsTextSelection(): Boolean = false
 
-internal actual fun showCharacterPalette() = orderEmojiAndSymbolsPopup()
+// Desktop opens the system emoji and symbols palette through skiko; klio has no
+// such platform panel.
+internal actual fun showCharacterPalette() {
+    throw UnsupportedOperationException("klio: the system character palette is not supported")
+}

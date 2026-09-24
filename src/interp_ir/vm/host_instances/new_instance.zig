@@ -19,7 +19,7 @@ const host_call_value = @import("../host_call_value.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-const build = @import("../../build.zig");
+const tables = @import("../../tables.zig");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -400,7 +400,7 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
         secondaryCtors(self, class_fqn, class_name)
     else
         &.{};
-    var chosen: ?root.build.SecondaryCtorEntry = null;
+    var chosen: ?root.tables.SecondaryCtorEntry = null;
     for (entries) |e| {
         if (e.param_count < args.len) continue;
         var all_named_match = true;

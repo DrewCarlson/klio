@@ -13,7 +13,7 @@ const applicability = @import("applicability");
 
 const vmhost = @import("vmhost.zig");
 const host_classes = @import("host_classes.zig");
-const ClassTable = @import("../build.zig").ClassTable;
+const ClassTable = @import("../tables.zig").ClassTable;
 const host_globals = @import("host_globals.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -203,7 +203,7 @@ const dispatchWithReceiver = flat_call.dispatchWithReceiver;
 const instanceInvokeWantsPair = flat_call.instanceInvokeWantsPair;
 pub const provideDelegateFor = flat_call.provideDelegateFor;
 pub const callMember = flat_call.callMember;
-const callMemberInner = flat_call.callMemberInner;
+pub const callMemberInner = flat_call.callMemberInner;
 pub const callableFieldArity = flat_call.callableFieldArity;
 pub const debugClassNameOf = flat_call.debugClassNameOf;
 const supertypeHead = flat_call.supertypeHead;
@@ -890,6 +890,7 @@ pub fn makeIntrinsicHost(self: *VmHost) VmIntrinsicHost {
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
         .singletons_by_id = self.singletons_by_id.clone(),
+        .resolved_state = self.resolved_state,
         .allocator = self.allocator,
     };
 }

@@ -17,7 +17,6 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.Parameters
 import io.ktor.http.RequestConnectionPoint
 import io.ktor.http.content.OutgoingContent
-import io.ktor.http.encodeParameters
 import io.ktor.http.parseQueryString
 import io.ktor.http.withEmptyStringForValuelessKeys
 import io.ktor.server.application.Application
@@ -32,8 +31,10 @@ import io.ktor.server.engine.BaseApplicationRequest
 import io.ktor.server.engine.BaseApplicationResponse
 import io.ktor.server.engine.__kktor_serve
 import io.ktor.server.request.RequestCookies
+import io.ktor.server.request.encodeParameters
 import io.ktor.server.response.ResponseHeaders
-import io.ktor.util.InternalAPI
+import io.ktor.util.pipeline.execute
+import io.ktor.utils.io.InternalAPI
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
 import kotlinx.coroutines.Dispatchers
@@ -165,7 +166,7 @@ internal class KlioApplicationRequest(
 
     @OptIn(InternalAPI::class)
     override val queryParameters: Parameters by lazy {
-        encodeParameters(rawQueryParameters)
+        encodeParameters(rawQueryParameters).withEmptyStringForValuelessKeys()
     }
 
     override val local: RequestConnectionPoint =

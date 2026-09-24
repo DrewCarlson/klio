@@ -1990,7 +1990,13 @@ pub fn match_named_group_get(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     defer g.deinit();
     const mv = g.get().get("__mgc") orelse return typeErr("not a MatchNamedGroupCollection");
     if (mv != .Match) return typeErr("not a MatchNamedGroupCollection");
-    const md = mv.Match.asPtr();
+    return matchGroupOf(ctx.allocator, mv.Match.asPtr(), key);
+}
+
+/// Group `key` of match `md`: by index, or by the name a named group
+/// declares, null for a group that did not participate. A name no group
+/// declares throws `IllegalArgumentException`.
+pub fn matchGroupOf(a: std.mem.Allocator, md: *const MatchData, key: Value) std.mem.Allocator.Error!EvalResult {
     var idx: ?usize = null;
     if (key.isIntegral()) {
         const n = key.asI64() orelse return typeErr("bad group index");
@@ -2012,12 +2018,12 @@ pub fn match_named_group_get(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         // A name no group declares is invalid, unlike a declared group that did
         // not participate, which yields null.
         if (!found) {
-            const msg = try std.fmt.allocPrint(ctx.allocator, "No group with name <{s}>", .{name});
-            defer ctx.allocator.free(msg);
-            return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg) } };
+            const msg = try std.fmt.allocPrint(a, "No group with name <{s}>", .{name});
+            defer a.free(msg);
+            return .{ .err = .{ .Thrown = try makeException(a, "kotlin.IllegalArgumentException", msg) } };
         }
     } else return typeErr("MatchNamedGroupCollection.get key must be Int or String");
-    if (idx) |i| return ok(try matchGroupValue(ctx.allocator, md.groups[i]));
+    if (idx) |i| return ok(try matchGroupValue(a, md.groups[i]));
     return ok(.Null);
 }
 
@@ -2044,7 +2050,7 @@ pub fn match_named_group_iterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalRes
         }
     }
     const list = try makeList(ctx.allocator, items.items, false);
-    return (try ctx.host.invokeMethod(&list, "iterator", &.{}, ctx.out)) orelse return typeErr("iterator");
+    return (try ctx.host.callWellKnown(&list, .iterator, &.{}, ctx.out)) orelse return typeErr("iterator");
 }
 
 pub fn match_result_next(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

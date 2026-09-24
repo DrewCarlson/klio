@@ -238,25 +238,25 @@ pub fn mergedPullOne(
     const rit = iter_right.*.?;
     runtime.keepalivePush(lit);
     runtime.keepalivePush(rit);
-    const lh = (try host.invokeMethod(&lit, "hasNext", &.{}, out)) orelse
+    const lh = (try host.callWellKnown(&lit, .has_next, &.{}, out)) orelse
         return .{ .err = .{ .Type = "zip: iterator lacks hasNext" } };
     switch (lh) {
         .ok => |x| if (!(x == .Bool and x.Bool)) return .done,
         .err => |e| return .{ .err = e },
     }
-    const rh = (try host.invokeMethod(&rit, "hasNext", &.{}, out)) orelse
+    const rh = (try host.callWellKnown(&rit, .has_next, &.{}, out)) orelse
         return .{ .err = .{ .Type = "zip: iterator lacks hasNext" } };
     switch (rh) {
         .ok => |x| if (!(x == .Bool and x.Bool)) return .done,
         .err => |e| return .{ .err = e },
     }
-    const av = switch ((try host.invokeMethod(&lit, "next", &.{}, out)) orelse
+    const av = switch ((try host.callWellKnown(&lit, .next, &.{}, out)) orelse
         return .{ .err = .{ .Type = "zip: iterator lacks next" } }) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
     runtime.keepalivePush(av);
-    const bv = switch ((try host.invokeMethod(&rit, "next", &.{}, out)) orelse
+    const bv = switch ((try host.callWellKnown(&rit, .next, &.{}, out)) orelse
         return .{ .err = .{ .Type = "zip: iterator lacks next" } }) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
@@ -354,6 +354,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             while (true) {
                 if (takeCapReached(seq.ops, st.taken)) break;
                 const candidate = if (cur) |v| v else blk: {
+                    if (gen.seed != null) break;
                     const output_keepalive = runtime.keepaliveMark();
                     runtime.keepalivePushSlice(output.items);
                     const called = seqCall(host, gen.next.asPtr(), &.{}, out);
@@ -379,7 +380,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 }
                 const output_keepalive = runtime.keepaliveMark();
                 runtime.keepalivePushSlice(output.items);
-                const called = seqCall(host, gen.next.asPtr(), &.{candidate}, out);
+                const called = seqCall(host, gen.next.asPtr(), if (gen.seed == null) &.{} else &.{candidate}, out);
                 runtime.keepaliveRestore(output_keepalive);
                 const nxt = switch (try called) {
                     .value => |v| v,
@@ -402,7 +403,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 runtime.keepalivePushSlice(output.items);
                 defer runtime.keepaliveRestore(loop_keepalive);
                 if (takeCapReached(seq.ops, st.taken)) break;
-                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse {
+                const hn = (try host.callWellKnown(&iter, .has_next, &.{}, out)) orelse {
                     if (runtime.envSetOnce("KLIO_SEQ_DIAG")) {
                         std.debug.print("[seq-diag] iterator lacks hasNext: iter kind={s} fqn={s}\n", .{ @tagName(std.meta.activeTag(iter)), iter.typeFqn() });
                     }
@@ -413,7 +414,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                     .err => |e| return .{ .err = e },
                 };
                 if (!has) break;
-                const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                const nx = (try host.callWellKnown(&iter, .next, &.{}, out)) orelse
                     return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
                 const item = switch (nx) {
                     .ok => |x| x,
@@ -495,6 +496,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             } else null;
             while (items.items.len < limit) {
                 const candidate = if (cur) |v| v else blk: {
+                    if (gen.seed != null) break;
                     const items_keepalive = runtime.keepaliveMark();
                     runtime.keepalivePushSlice(items.items);
                     const called = seqCall(host, gen.next.asPtr(), &.{}, out);
@@ -509,7 +511,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 try items.append(a, candidate);
                 const items_keepalive = runtime.keepaliveMark();
                 runtime.keepalivePushSlice(items.items);
-                const called = seqCall(host, gen.next.asPtr(), &.{candidate}, out);
+                const called = seqCall(host, gen.next.asPtr(), if (gen.seed == null) &.{} else &.{candidate}, out);
                 runtime.keepaliveRestore(items_keepalive);
                 const nxt = switch (try called) {
                     .value => |v| v,
@@ -531,7 +533,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 const loop_keepalive = runtime.keepaliveMark();
                 runtime.keepalivePushSlice(items.items);
                 defer runtime.keepaliveRestore(loop_keepalive);
-                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse {
+                const hn = (try host.callWellKnown(&iter, .has_next, &.{}, out)) orelse {
                     if (runtime.envSetOnce("KLIO_SEQ_DIAG")) {
                         std.debug.print("[seq-diag] iterator lacks hasNext: iter kind={s} fqn={s}\n", .{ @tagName(std.meta.activeTag(iter)), iter.typeFqn() });
                     }
@@ -542,7 +544,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                     .err => |e| return .{ .err = e },
                 };
                 if (!has) break;
-                const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                const nx = (try host.callWellKnown(&iter, .next, &.{}, out)) orelse
                     return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
                 switch (nx) {
                     .ok => |item| try items.append(a, item),
@@ -780,7 +782,7 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
             while (i < items.len) : (i += 1) {
                 var j = i;
                 while (j > 0) {
-                    const m = try host.invokeMethod(&comparator, "compare", &.{ items[j - 1], items[j] }, out);
+                    const m = try host.callWellKnown(&comparator, .compare, &.{ items[j - 1], items[j] }, out);
                     const ord_val = if (m) |mr| switch (mr) {
                         .ok => |v| v,
                         .err => |e| return .{ .err = e },

@@ -12,10 +12,14 @@ the live list.
 | `klio check <files...>` | Resolve + type-check, emit diagnostics. Exits non-zero on error. `--format plain\|json\|sarif`. |
 | `klio lex <file>`       | Print the lexer's token stream.                                                          |
 | `klio parse <file>`     | Print the parser's AST.                                                                  |
-| `klio dump-ir <file>`   | Lower a file and print its IR without executing (`--func N` for one function); tallies DIRECT vs DYNAMIC call sites. |
+| `klio dump-ir <file>`   | Lower a program and print its functions' IR without executing (`--func N` for one function, `--all` for the base's too); tallies DIRECT vs DYNAMIC call sites. |
+| `klio transpile-dump <file>` | Print the program's functions as the bytecode streams the transpiler reads.         |
 | `klio repl`             | Placeholder prompt — currently echoes input; not yet a live evaluator.                   |
-| `klio bake [files...]`  | Pre-bake the stdlib image cache (see below). `klio run` does this automatically on first use. |
+| `klio bake [files...]`  | Pre-bake the base image cache (see below). `klio run` does this automatically on first use. |
+| `klio bake-image <files...> -o <out>` | Write the programs' base (stdlib and packs) as one self-contained image, sources included. |
+| `klio run-image <image> <file> [args...]` | Run a program over such an image, with no data home, pack install or checkout. |
 | `klio bundle <file\|dir>` | Package a program into one self-contained executable; see [Bundling programs](../BUNDLE.md). |
+| `klio transpile <files...> [-o out.c]` | Write a C launcher (`out.c`) and the program's sema image beside it (`out.klio-image`). `zig cc out.c -I<include> -L<lib> -lklio_rt -lzstd` builds a binary that runs the program with no data home: a compiler with `#embed` builds the image in, and the program's sources are in the C. `--native` compiles the program itself to C over the same runtime. |
 
 `klio run` takes `--virtual-time` (deterministic virtual time
 for coroutines) and `--feature <pack>/<feature>` (enable a
@@ -31,25 +35,27 @@ interpreter over a never-free arena. `klio run` defaults to `fast`,
 `klio test` to `safe`. See
 [Performance](../architecture/performance.md).
 
-### The stdlib image cache
+### The base image cache
 
-The first `klio run` lowers the embedded stdlib (and any packs the
-program imports) and bakes the result to
-`~/.klio/cache/stdlib-<key>.klio-image`; every later run loads that
-image and lowers only the user program, cutting startup from seconds to
-tens of milliseconds. The build bakes the stdlib-only image as well and
-installs it under `share/klio/cache` beside `bin/klio`; a run whose own
-cache misses reads that copy, so a freshly built klio's first run of an
-import-free program is already warm. The cache is content-addressed — the key
-hashes the interpreter binary's identity, every stdlib source the bake
-consumed, the stdlib load gate, and each selected pack's content hash
-and feature set — so editing a stdlib source, swapping a pack, or
-rebuilding `klio` transparently rebakes; a stale image can never be
-served. Programs that redeclare a stdlib top-level name (or otherwise
-fail the reuse gate) automatically fall back to the whole-program
-build with identical behavior. `klio bake` pre-warms the cache (with
-files, for exactly those programs' dependency sets; without, for both
-stdlib gate variants). Old images beyond a small keep-count are pruned.
+A program runs over its base: the stdlib, the sema actuals and the packs
+it imports. The first `klio run` of a base analyzes and lowers it and
+bakes the result to `~/.klio/cache/sema-base-<key>.klio-sema`; every
+later run over the same base loads that image and analyzes and lowers
+only the program. The key hashes the interpreter binary's identity and
+the path and text of every base file, so editing a stdlib source,
+installing a different pack or rebuilding `klio` bakes afresh; a stale
+image is never served. The build bakes the image of the base a program
+without packs runs on and installs it under `share/klio/cache` beside
+`bin/klio`; a run whose own cache misses reads that copy, so a freshly
+built klio's first run of such a program is already warm. `klio bake`
+pre-warms the cache (with files, for the base those programs run on
+together; without, for the base without packs).
+
+`klio bake-image` writes a base as one self-contained file: the base
+image with the text of every base file and the pack features it was
+loaded with. `klio run-image` runs a program over it without reading
+the data home, the pack cache or a checkout; a bundle carries the same
+image.
 
 ## Working with packs
 
@@ -92,17 +98,15 @@ The interpreter resolves its stdlib pack in this order:
   `--opt`. The granular overrides `KLIO_JIT`, `KLIO_FUNC_JIT`, and
   `KLIO_RECLAIM` layer on top for diagnosis
   ([details](../architecture/performance.md)).
-- `KLIO_EAGER=1` — run the resolver and type checker ahead of
-  lowering on the `run`/`test` path, so lowering consumes
-  type-derived resolution answers; files the checker cannot finish
-  fall back to lazy lowering.
 - `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack` — use an on-disk
   stdlib pack instead of the checkout or the embedded bytes. Useful
   when iterating on a pack without rebuilding the binary.
-- `KLIO_STDLIB_IMAGE=0` — disable the stdlib image cache (every run
-  lowers the full dependency set, as before).
-- `KLIO_TRACE_STDLIB_IMAGE=1` — print one `hit`/`baked`/`fallback`
-  line per run with the cache key and timing breakdown.
+- `KLIO_SEMA_IMAGE=0` — disable the base image cache (every run
+  analyzes and lowers its whole base).
+- `KLIO_STDLIB_IMAGE_SHIPPED=0` — ignore the base image the build
+  installed beside the binary.
+- `KLIO_SEMA_TIMING=1` — print the milliseconds each step of a run
+  takes, the base image's bake or load among them.
 - `KLIO_PACKS=path1:path2:...` — colon-separated extra packs to load
   at startup, in addition to `~/.klio/packs`.
 - `HOME` — determines `~/.klio/packs` and `~/.klio/cache`.

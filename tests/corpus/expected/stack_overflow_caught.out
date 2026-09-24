@@ -1,0 +1,4 @@
+1000
+caught StackOverflowError message=null
+outer caught true finally=true
+10

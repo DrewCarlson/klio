@@ -21,6 +21,8 @@ internal fun __kxco_spawn(block: () -> Unit) {}
 internal fun __kxco_spawnTimeout(block: () -> Unit) {}
 internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
+// `__kxco_dispatch` onto the elastic blocking-work view of the pool.
+internal fun __kxco_dispatchIo(block: () -> Unit): Long = 0L
 internal fun __kxco_newSlot(): Long = 0L
 internal fun __kxco_parkSlot(slot: Long) {}
 internal fun __kxco_armSlot(slot: Long) {}

@@ -141,11 +141,10 @@ pub fn atExpressionAnnotation(p: *const Parser) bool {
 }
 
 /// Kotlin allows an annotation on the body expression; it is discarded.
+/// A function's `= expr` body. An annotation that opens it is the
+/// expression's, as anywhere else: `= @Composable { ... }` keeps it on the
+/// literal.
 pub fn parseExprBody(p: *Parser) ?Expr {
-    if (support.peekKind(p).isAt()) {
-        _ = parseAnnotations(p);
-        support.skipNl(p);
-    }
     return parseExpr(p);
 }
 
@@ -352,14 +351,10 @@ pub fn parseInfixFn(p: *Parser) ?Expr {
         const args = p.allocator.alloc(Expr, 2) catch @panic("OOM");
         args[0] = lhs;
         args[1] = rhs;
-        const arg_names = p.allocator.alloc(?[]const u8, 2) catch @panic("OOM");
-        arg_names[0] = null;
-        arg_names[1] = null;
         lhs = Expr{ .Call = .{
             .callee = boxExpr(p, callee),
             .args = args,
-            .arg_names = arg_names,
-            .type_args = &.{},
+            .extra = support.positionalCallExtra(p, 2),
             .is_infix = true,
             .span = sp,
         } };
@@ -519,9 +514,11 @@ pub fn parsePrefix(p: *Parser) ?Expr {
     if (std.meta.activeTag(support.peekKind(p).*) == .BangBang) {
         _ = support.bump(p);
         const e = parsePrefix(p) orelse return null;
-        const inner_sp = start.join(e.span());
-        const inner = Expr{ .Unary = .{ .op = .Not, .expr = boxExpr(p, e), .span = inner_sp } };
-        return Expr{ .Unary = .{ .op = .Not, .expr = boxExpr(p, inner), .span = inner_sp } };
+        // The second `!` starts one character in, so each negation has a
+        // span of its own.
+        const inner_start = Span.init(start.file, start.start + 1, start.start + 1);
+        const inner = Expr{ .Unary = .{ .op = .Not, .expr = boxExpr(p, e), .span = inner_start.join(e.span()) } };
+        return Expr{ .Unary = .{ .op = .Not, .expr = boxExpr(p, inner), .span = start.join(e.span()) } };
     }
     return parsePostfix(p);
 }
@@ -544,6 +541,8 @@ const PostfixChain = struct {
     p: *Parser,
     expr: Expr,
     pending_type_args: []TypeRef = &.{},
+    /// A `?` just before `::`: the reference's qualifier type is nullable.
+    nullable_receiver: bool = false,
 
     /// The pending type arguments, cleared so a later call cannot reuse them.
     fn takeTypeArgs(chain: *PostfixChain) []TypeRef {
@@ -626,8 +625,7 @@ fn memberOrParenthesizedCallee(chain: *PostfixChain) Step {
         chain.expr = Expr{ .Call = .{
             .callee = boxExpr(p, callee),
             .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-            .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
-            .type_args = &.{},
+            .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), &.{}),
             .is_infix = false,
             .span = sp,
         } };
@@ -644,13 +642,14 @@ fn memberOrParenthesizedCallee(chain: *PostfixChain) Step {
     return .advance;
 }
 
-/// `Any?::toString`: the `?` makes the receiver type nullable without changing
-/// member resolution, and is valid only before `::`.
+/// `Any?::toString`: the `?` makes the qualifier type nullable, and is valid
+/// only before `::`.
 fn nullableReceiverMark(chain: *PostfixChain) Step {
     const p = chain.p;
     const after = kindAt(p, p.pos + 1);
     if (after == null or std.meta.activeTag(after.?) != .ColonColon) return .stop;
     _ = support.bump(p);
+    chain.nullable_receiver = true;
     return .advance;
 }
 
@@ -679,12 +678,14 @@ fn callableReference(chain: *PostfixChain) Step {
     }
     const qualifier_type_args = chain.takeTypeArgs();
     const sp = chain.expr.span().join(name.span);
-    chain.expr = Expr{ .MemberRef = .{
+    chain.expr = Expr{ .MemberRef = support.boxed(p, ast.MemberRefExpr{
         .receiver = boxExpr(p, chain.expr),
         .name = name,
         .qualifier_type_args = qualifier_type_args,
+        .nullable_receiver = chain.nullable_receiver,
         .span = sp,
-    } };
+    }) };
+    chain.nullable_receiver = false;
     return .advance;
 }
 
@@ -712,8 +713,7 @@ fn callArguments(chain: *PostfixChain) Step {
     chain.expr = Expr{ .Call = .{
         .callee = boxExpr(p, chain.expr),
         .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-        .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
-        .type_args = type_args,
+        .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), type_args),
         .is_infix = false,
         .span = sp,
     } };
@@ -866,14 +866,13 @@ fn appendTrailingLambda(
                 args.appendSlice(p.allocator, c.args) catch @panic("OOM");
                 args.append(p.allocator, lam) catch @panic("OOM");
                 var arg_names: std.ArrayList(?[]const u8) = .empty;
-                arg_names.appendSlice(p.allocator, c.arg_names) catch @panic("OOM");
+                arg_names.appendSlice(p.allocator, c.argNames()) catch @panic("OOM");
                 arg_names.append(p.allocator, null) catch @panic("OOM");
-                const type_args = if (c.type_args.len == 0) extra_type_args else c.type_args;
+                const type_args = if (c.typeArgs().len == 0) extra_type_args else c.typeArgs();
                 return Expr{ .Call = .{
                     .callee = c.callee,
                     .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                    .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                    .type_args = type_args,
+                    .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), type_args),
                     .is_infix = c.is_infix,
                     .has_trailing_lambda = true,
                     .span = sp,
@@ -884,13 +883,10 @@ fn appendTrailingLambda(
     }
     const args = p.allocator.alloc(Expr, 1) catch @panic("OOM");
     args[0] = lam;
-    const arg_names = p.allocator.alloc(?[]const u8, 1) catch @panic("OOM");
-    arg_names[0] = null;
     return Expr{ .Call = .{
         .callee = boxExpr(p, expr),
         .args = args,
-        .arg_names = arg_names,
-        .type_args = extra_type_args,
+        .extra = support.callExtra(p, &.{null}, extra_type_args),
         .is_infix = false,
         .has_trailing_lambda = true,
         .span = sp,
@@ -957,8 +953,11 @@ pub fn nextNonNewlineIsChainContinuation(p: *const Parser) bool {
     }
     const next = kindAt(p, i);
     if (next == null) return false;
+    // Only a member access continues past a line break: `a\n[0]` and
+    // `a\n!!` are two statements, as in kotlinc's grammar, so a line may
+    // open with a positional destructuring `[val a, val b] = p`.
     return switch (next.?) {
-        .Dot, .QuestionDot, .BangBang, .LBracket => true,
+        .Dot, .QuestionDot => true,
         else => false,
     };
 }

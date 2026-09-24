@@ -20,6 +20,7 @@ it is built on.
 | `io`                          | `utils.io.*`: `ByteChannel`, locks, charsets           |                                           |                                    |
 | `utils`                       | `util.*`: collections, pipeline, date, log             | `io`                                      |                                    |
 | `http`                        | `http.*`: URLs, headers, status, content               | `utils`                                   |                                    |
+| `http-cio`                    | `http.cio.*`: the CIO message parser, multipart reader | `http`                                    |                                    |
 | `events`                      | `events.*`: the event bus                              | `utils`                                   |                                    |
 | `sse`                         | `sse.*`: the `ServerSentEvent` model                   | `utils`                                   |                                    |
 | `websockets`                  | `websocket.*`: the frame model                         | `http`                                    |                                    |
@@ -28,7 +29,7 @@ it is built on.
 | `serialization-kotlinx-json`  | `serialization.kotlinx.json.*`: `json()`               | `serialization-kotlinx`                   | `kotlinx.serialization/json-io`    |
 | `test-dispatcher`             | `test.dispatcher.*`: `testSuspend` runners             | `utils`                                   | `kotlinx.coroutines/test`          |
 | `test-base`                   | `test.*`: `runTest`, `runTestWithData`                 | `test-dispatcher`                         |                                    |
-| `client-core`                 | `client.*`: `HttpClient` + default plugins             | `http`, `events`, `sse`, `serialization`  |                                    |
+| `client-core`                 | `client.*`: `HttpClient` + default plugins             | `http`, `http-cio`, `events`, `sse`, `serialization` |                         |
 | `server-core`                 | `server.*`: `embeddedServer`, routing, pipeline        | `http`, `events`, `serialization`, `websockets` |                              |
 | `client-content-negotiation`  | `client.plugins.contentnegotiation.*`                  | `client-core`, `serialization`            |                                    |
 | `server-content-negotiation`  | `server.plugins.contentnegotiation.*`: typed `receive`/`respond` | `server-core`                   |                                    |

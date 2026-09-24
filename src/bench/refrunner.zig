@@ -3,7 +3,7 @@
 //! by source-content hash.
 
 const std = @import("std");
-const parity = @import("parity");
+const kotlinc_support = @import("kotlinc_support");
 
 pub const KOTLIN_JVM_VERSION: []const u8 = "2.4.20";
 
@@ -106,8 +106,8 @@ fn procEnvMap(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
 }
 
 /// Caller owns the returned path; `label` prefixes any install error.
-fn findKotlinc(allocator: std.mem.Allocator, kind: parity.KotlincKind, label: []const u8) std.mem.Allocator.Error!RefResultPath {
-    const r = try parity.findKotlincKind(allocator, kind);
+fn findKotlinc(allocator: std.mem.Allocator, kind: kotlinc_support.KotlincKind, label: []const u8) std.mem.Allocator.Error!RefResultPath {
+    const r = try kotlinc_support.findKotlincKind(allocator, kind);
     switch (r) {
         .ok => |path| return .{ .ok = path },
         .err => |e| {
@@ -175,7 +175,7 @@ pub fn timeKotlincNative(allocator: std.mem.Allocator, io: std.Io, file: []const
     defer samples.deinit(allocator);
     var i: u32 = 0;
     while (i < iters) : (i += 1) {
-        var t = std.time.Timer.start() catch unreachable;
+        var t = @import("bench.zig").Timer.start();
         const out = std.process.run(allocator, io, .{
             .argv = &.{exe},
             .environ_map = &env,
@@ -386,7 +386,7 @@ pub fn timeKotlincJvm(allocator: std.mem.Allocator, io: std.Io, file: []const u8
     defer samples.deinit(allocator);
     var i: u32 = 0;
     while (i < iters) : (i += 1) {
-        var t = std.time.Timer.start() catch unreachable;
+        var t = @import("bench.zig").Timer.start();
         const out = std.process.run(allocator, io, .{
             .argv = &.{ java_path, "-jar", jar },
             .environ_map = &env,

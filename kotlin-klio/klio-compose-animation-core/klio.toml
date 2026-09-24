@@ -58,6 +58,7 @@ root = "klioMain"
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 "androidx.compose.runtime" = "*"
 "androidx.compose.ui.unit" = "*"
 "androidx.compose.ui.util" = "*"

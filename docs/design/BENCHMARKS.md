@@ -1,6 +1,6 @@
 # Benchmarks
 
-KLIO ships a benchmark harness (`src/bench/`) that times every stage of the pipeline (`lex → parse → resolve → typeck → e2e`) plus end-to-end runs. The goal is to make every performance- or memory-shaped change measurable in numbers before and after the diff, so optimization work targets real bottlenecks rather than guesses.
+KLIO ships a benchmark harness (`src/bench/`) that times every stage of the pipeline (`lex → parse → headers → bodies → records → bridge → lower`) plus end-to-end runs. The goal is to make every performance- or memory-shaped change measurable in numbers before and after the diff, so optimization work targets real bottlenecks rather than guesses.
 
 ## Layout
 
@@ -15,6 +15,13 @@ benches-baseline/HEAD.json    checked-in baseline (numbers from main)
 ```
 
 ## Running
+
+`lex` and `parse` time the workload alone. `headers`, `bodies`,
+`records`, `bridge` and `lower` time the stages sema and lowering run over
+the stdlib base and the workload together, as a run with no base image does
+(`KLIO_SEMA_IMAGE=0`); each is its own number, not a running total. `e2e`
+spawns the harness (`KLIO_ITEST_BIN`) on the workload, over the base image
+it caches in `/tmp/klio_bench_home`, as a user runs it.
 
 The bench module runs as a program-running suite through the build
 system (it rides the integration tier, not the fast unit step):

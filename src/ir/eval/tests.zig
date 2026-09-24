@@ -23,6 +23,8 @@ const ev_flow = @import("flow.zig");
 const ev_host = @import("host.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
+const ev_values = @import("values.zig");
+const ev_exec = @import("exec.zig");
 
 const EnclosingEntry = ev_state.EnclosingEntry;
 const NullHost = ev_host.NullHost;
@@ -42,106 +44,85 @@ const resetSuspendLivenessCache = ev_snapshot.resetSuspendLivenessCache;
 const resumeContinuation = ev_activation.resumeContinuation;
 const suspendLiveRegs = ev_snapshot.suspendLiveRegs;
 
-const FuncBuilder = ir.build.FuncBuilder;
+const hand = @import("hand.zig");
+const Hand = hand.Hand;
 
-fn freeFunc(func: Func) void {
-    func.freeBuilt(testing.allocator);
-}
-
-fn lit(b: *FuncBuilder, v: i32) Allocator.Error!Reg {
-    return b.emitConst(.{ .Int = v });
-}
+const type_int: ir.TypeRef = .{ .name = "kotlin.Int", .nullable = false, .args = &.{} };
+const type_bool: ir.TypeRef = .{ .name = "kotlin.Boolean", .nullable = false, .args = &.{} };
 
 test "eval_int_const" {
-    var m = Module.default(testing.allocator);
-    defer m.deinit(testing.allocator);
-    var b = try FuncBuilder.init(testing.allocator, &m);
-    defer b.deinit();
-    const r = try lit(&b, 7);
-    b.terminate(.{ .Return = r });
-    const func = try b.finish("f", "test.f", ir.build.typeInt());
-    defer freeFunc(func);
-    const res = try eval(testing.allocator, &m, &func, .empty);
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const f = try h.func("f", 0);
+    const c7 = try h.constant(.{ .Int = 7 });
+    try h.body(f, &.{.{ .insts = &.{hand.konst(0, c7)}, .term = hand.ret(0) }});
+    try h.finish();
+    const res = try eval(a, h.m, h.funcPtr(f), .empty);
     try testing.expect(res == .ok);
     try testing.expect(res.ok == .Int and res.ok.Int == 7);
 }
 
 test "eval reports a bodyless function instead of indexing empty blocks" {
-    var m = Module.default(testing.allocator);
-    defer m.deinit(testing.allocator);
-    var b = try FuncBuilder.init(testing.allocator, &m);
-    defer b.deinit();
-    const r = try lit(&b, 7);
-    b.terminate(.{ .Return = r });
-    var func = try b.finish("missing", "test.missing", ir.build.typeInt());
-    const blocks = func.blocks;
-    defer {
-        func.blocks = blocks;
-        freeFunc(func);
-    }
-    func.blocks = &.{};
-
-    const result = try eval(testing.allocator, &m, &func, .empty);
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const f = try h.func("missing", 0);
+    try h.finish();
+    const result = try eval(a, h.m, h.funcPtr(f), .empty);
     try testing.expect(result == .err);
     try testing.expect(result.err == .CalleeFailed);
     try testing.expectEqualStrings("virtual method target is not executable", result.err.CalleeFailed);
 }
 
 test "eval_int_add" {
-    var module = Module.default(testing.allocator);
-    defer module.deinit(testing.allocator);
-    var builder = try FuncBuilder.init(testing.allocator, &module);
-    defer builder.deinit();
-    const lhs = try lit(&builder, 2);
-    const rhs = try lit(&builder, 40);
-    const dst = builder.allocReg();
-    try builder.push(.{ .BinOp = .{ .dst = dst, .op = .Add, .lhs = lhs, .rhs = rhs } });
-    builder.terminate(.{ .Return = dst });
-    const func = try builder.finish("f", "test.f", ir.build.typeInt());
-    defer freeFunc(func);
-    const result = try eval(testing.allocator, &module, &func, .empty);
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const f = try h.func("f", 0);
+    const c2 = try h.constant(.{ .Int = 2 });
+    const c40 = try h.constant(.{ .Int = 40 });
+    try h.body(f, &.{.{ .insts = &.{ hand.konst(0, c2), hand.konst(1, c40), hand.bin(2, .Add, 0, 1) }, .term = hand.ret(2) }});
+    try h.finish();
+    const result = try eval(a, h.m, h.funcPtr(f), .empty);
     try testing.expect(result == .ok);
     try testing.expect(result.ok == .Int and result.ok.Int == 42);
 }
 
 test "eval_load_param" {
-    var m = Module.default(testing.allocator);
-    defer m.deinit(testing.allocator);
-    var b = try FuncBuilder.init(testing.allocator, &m);
-    defer b.deinit();
-    const p = b.allocReg();
-    try b.push(.{ .LoadParam = .{ .dst = p, .idx = 0 } });
-    b.terminate(.{ .Return = p });
-    const func = try b.finish("f", "test.f", ir.build.typeInt());
-    defer freeFunc(func);
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const f = try h.func("f", 1);
+    try h.body(f, &.{.{ .insts = &.{hand.param(0, 0)}, .term = hand.ret(0) }});
+    try h.finish();
     var args: std.ArrayList(Value) = .empty;
-    try args.append(testing.allocator, .{ .Int = 99 });
-    const v = try eval(testing.allocator, &m, &func, args);
+    try args.append(a, .{ .Int = 99 });
+    const v = try eval(a, h.m, h.funcPtr(f), args);
     try testing.expect(v == .ok);
     try testing.expect(v.ok == .Int and v.ok.Int == 99);
 }
 
 test "eval_branch" {
-    var m = Module.default(testing.allocator);
-    defer m.deinit(testing.allocator);
-    var b = try FuncBuilder.init(testing.allocator, &m);
-    defer b.deinit();
-    const cond = try b.emitConst(.{ .Bool = true });
-    const t_blk = try b.allocBlock();
-    const f_blk = try b.allocBlock();
-    b.terminate(.{ .Branch = .{ .cond = cond, .t = t_blk, .f = f_blk } });
-
-    b.switchTo(t_blk);
-    const t_val = try lit(&b, 1);
-    b.terminate(.{ .Return = t_val });
-
-    b.switchTo(f_blk);
-    const f_val = try lit(&b, 0);
-    b.terminate(.{ .Return = f_val });
-
-    const func = try b.finish("f", "test.f", ir.build.typeInt());
-    defer freeFunc(func);
-    const v = try eval(testing.allocator, &m, &func, .empty);
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const f = try h.func("f", 0);
+    const t = try h.constant(.{ .Bool = true });
+    const c1 = try h.constant(.{ .Int = 1 });
+    const c0 = try h.constant(.{ .Int = 0 });
+    try h.body(f, &.{
+        .{ .insts = &.{hand.konst(0, t)}, .term = .{ .Branch = .{ .cond = hand.reg(0), .t = .from(1), .f = .from(2) } } },
+        .{ .insts = &.{hand.konst(1, c1)}, .term = hand.ret(1) },
+        .{ .insts = &.{hand.konst(2, c0)}, .term = hand.ret(2) },
+    });
+    try h.finish();
+    const v = try eval(a, h.m, h.funcPtr(f), .empty);
     try testing.expect(v == .ok);
     try testing.expect(v.ok == .Int and v.ok.Int == 1);
 }
@@ -206,7 +187,7 @@ test "resumed labeled return reaches its snapshotted target frame" {
         .name = "<lambda>",
         .fqn = "test.hasNext.<lambda>",
         .params = &.{},
-        .return_ty = ir.build.typeBool(),
+        .return_ty = type_bool,
         .n_locals = 1,
         .blocks = @constCast(&inner_blocks),
         .entry = .from(0),
@@ -218,7 +199,7 @@ test "resumed labeled return reaches its snapshotted target frame" {
         .name = "hasNext",
         .fqn = "test.hasNext",
         .params = &.{},
-        .return_ty = ir.build.typeBool(),
+        .return_ty = type_bool,
         .n_locals = 1,
         .blocks = @constCast(&outer_blocks),
         .entry = .from(0),
@@ -276,6 +257,87 @@ test "resumed labeled return reaches its snapshotted target frame" {
     state.frames = .empty;
     try testing.expect(result == .ok);
     try testing.expect(result.ok == .Bool and result.ok.Bool);
+}
+
+test "a resume value is made while the parked frames are rooted" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    const blocks = [_]ir.Block{.{
+        .id = .from(0),
+        .insts = &.{},
+        .terminator = .{ .Return = .from(0) },
+    }};
+    try m.funcs.append(testing.allocator, .{
+        .id = .from(0),
+        .name = "awaitValue",
+        .fqn = "test.awaitValue",
+        .params = &.{},
+        .return_ty = type_int,
+        .n_locals = 1,
+        .blocks = @constCast(&blocks),
+        .entry = .from(0),
+        .is_suspend = true,
+    });
+    var state = SuspendState{ .token = 1 };
+    try state.frames.append(testing.allocator, .{
+        .func = .from(0),
+        .module = null,
+        .block = .from(0),
+        .inst_idx = 0,
+        .regs = .{ .dense = try testing.allocator.dupe(Value, &.{Value.Unit}) },
+        .params = try testing.allocator.alloc(Value, 0),
+        .captures = try testing.allocator.alloc(Value, 0),
+        .enclosing_this = try testing.allocator.alloc(EnclosingEntry, 0),
+        .try_stack = try testing.allocator.alloc(TryFrame, 0),
+        .is_lambda = false,
+        .resume_reg = .from(0),
+    });
+    var host = nullHost();
+    host.resume_as = .{ .Int = 7 };
+    const result = try resumeContinuation(NullHost, testing.allocator, &m, &state, .{ .Int = 1 }, &host);
+    state.frames = .empty;
+    try testing.expect(host.resume_rooted);
+    try testing.expect(result == .ok and result.ok == .Int and result.ok.Int == 7);
+    try testing.expect(ev_state.evtlsPtr().resuming == null);
+}
+
+test "mixed signed comparisons widen to Double, then Float, then Long" {
+    const nan = std.math.nan(f32);
+    const cases = [_]struct { op: BinOp, l: Value, r: Value, want: bool }{
+        // `i2f` rounds 16777217 to 16777216f.
+        .{ .op = .Greater, .l = .{ .Int = 16777217 }, .r = .{ .Float = 16777216.0 }, .want = false },
+        .{ .op = .Greater, .l = .{ .Int = 16777217 }, .r = .{ .Double = 16777216.0 }, .want = true },
+        .{ .op = .LessEq, .l = .{ .Float = 2.5 }, .r = .{ .Double = 2.5 }, .want = true },
+        .{ .op = .Less, .l = .{ .Float = 0.1 }, .r = .{ .Double = 0.1 }, .want = false },
+        .{ .op = .Less, .l = .{ .Short = 2 }, .r = .{ .Long = 3 }, .want = true },
+        .{ .op = .Less, .l = .{ .Int = 1 }, .r = .{ .Float = nan }, .want = false },
+        .{ .op = .Greater, .l = .{ .Int = 1 }, .r = .{ .Float = nan }, .want = false },
+    };
+    for (cases) |c| {
+        const r = try ev_values.applyBinop(testing.allocator, c.op, &c.l, &c.r);
+        try testing.expect(r == .ok and r.ok == .Bool);
+        try testing.expectEqual(c.want, r.ok.Bool);
+    }
+}
+
+test "a Double equals a Float as a number, and boxed equality keeps the kind" {
+    const nan = std.math.nan(f32);
+    const cases = [_]struct { op: BinOp, l: Value, r: Value, want: bool }{
+        .{ .op = .Eq, .l = .{ .Double = 0.0 }, .r = .{ .Float = -0.0 }, .want = true },
+        .{ .op = .NotEq, .l = .{ .Double = 0.0 }, .r = .{ .Float = -0.0 }, .want = false },
+        .{ .op = .Eq, .l = .{ .Float = 1.0 }, .r = .{ .Double = 1.0 }, .want = true },
+        .{ .op = .Eq, .l = .{ .Float = 0.1 }, .r = .{ .Double = 0.1 }, .want = false },
+        .{ .op = .Eq, .l = .{ .Double = std.math.nan(f64) }, .r = .{ .Float = nan }, .want = false },
+        .{ .op = .NotEq, .l = .{ .Float = nan }, .r = .{ .Double = 1.0 }, .want = true },
+        .{ .op = .BoxedEq, .l = .{ .Double = 1.0 }, .r = .{ .Float = 1.0 }, .want = false },
+    };
+    for (cases) |c| {
+        const r = try ev_values.applyBinop(testing.allocator, c.op, &c.l, &c.r);
+        try testing.expect(r == .ok and r.ok == .Bool);
+        try testing.expectEqual(c.want, r.ok.Bool);
+        // The scalar path every tier tries first answers the same.
+        if (ev_exec.scalarBin(c.op, c.l, c.r)) |v| try testing.expectEqual(c.want, v.Bool);
+    }
 }
 
 test "enclosing chain tags subjects and projects innermost-first" {

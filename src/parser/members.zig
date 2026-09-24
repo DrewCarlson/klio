@@ -98,6 +98,7 @@ pub fn parseFun(p: *Parser, flags: ModifierFlags) ?Function {
         .is_infix = flags.is_infix,
         .is_tailrec = flags.is_tailrec,
         .is_suspend = flags.is_suspend,
+        .is_external = flags.is_external,
         .is_expect = flags.is_expect,
         .is_actual = flags.is_actual,
         .visibility = flags.visibility,
@@ -513,6 +514,7 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         skipNl(p);
     }
     var receiver_type = parsePropertyReceiver(p) orelse return null;
+    const receiver_written = receiver_type;
     // A bare type-parameter receiver extends its upper bound; an unbounded
     // parameter extends `Any`.
     if (receiver_type) |*rt| {
@@ -619,6 +621,8 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         .visibility = flags.visibility,
         .annotations = flags.annotations.items,
         .span = kw_tok.span.join(end),
+        .type_params = prop_type_params,
+        .receiver_written = support.boxedOpt(p, receiver_written),
     };
 }
 

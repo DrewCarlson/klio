@@ -1,21 +1,18 @@
 //! Shared driver for library `commonTest` suites: discover a library's upstream
-//! common test tree, build and install its pack (plus deps), and run every
-//! `@Test`-bearing file through a child `klio test` against the pack. A file
+//! common test tree and run every `@Test`-bearing file through a child
+//! `klio test` in the shared test home, where every shipped pack is installed
+//! (`klio_child.home`). A file
 //! without `@Test` is a shared fixture compiled into every test file's module,
 //! and passes are counted per `PASSED` line so a killed file still counts.
 
 const std = @import("std");
 const runtime = @import("runtime");
-
-pub const Pack = struct { dir: []const u8, artifact: []const u8 };
+const klio_child = @import("klio_child");
 
 pub const Config = struct {
     name: []const u8,
     /// Common test directories, discovered recursively.
     test_roots: []const []const u8,
-    scratch_home: []const u8,
-    /// Packs to build and install, dependencies first.
-    packs: []const Pack,
     /// Ratchet floor on total passing cases: raise as fixes land, never lower.
     baseline: usize,
     /// klio-authored actuals added to every test file's module.
@@ -98,6 +95,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    try map.put("KLIO_HOME", home);
     return map;
 }
 
@@ -133,22 +131,6 @@ fn runKlio(
         return error.SpawnFailed;
     };
     return .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr };
-}
-
-fn installPacks(allocator: std.mem.Allocator, env: *std.process.Environ.Map, cfg: Config) !void {
-    const pack_cap: i64 = 120_000 * harnessSlowdown(env);
-    for (cfg.packs) |p| {
-        const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", p.dir }, pack_cap);
-        if (b.term != .exited or b.term.exited != 0) {
-            std.debug.print("{s}_commontest: pack build {s} failed:\n{s}\n", .{ cfg.name, p.dir, b.stderr });
-            return error.PackBuildFailed;
-        }
-        const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", p.artifact }, pack_cap);
-        if (i.term != .exited or i.term.exited != 0) {
-            std.debug.print("{s}_commontest: pack install {s} failed:\n{s}\n", .{ cfg.name, p.artifact, i.stderr });
-            return error.PackInstallFailed;
-        }
-    }
 }
 
 fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList([]u8)) !void {
@@ -422,12 +404,6 @@ pub const suites = [_]Config{
     .{
         .name = "coroutines",
         .test_roots = &.{"kotlin-klio/klio-kotlinx-coroutines/upstream/kotlinx-coroutines-core/common/test"},
-        .scratch_home = "/tmp/klio_itest_coroutines_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
-        },
         .extra_support = &.{
             "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/TestBase.common.kt",
             "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/LaunchFlow.kt",
@@ -447,12 +423,6 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test",
             "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test",
         },
-        .scratch_home = "/tmp/klio_itest_datetime_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-datetime", .artifact = "target/packs/kotlinx.datetime.klio-pack" },
-        },
         .whole_source_set = true,
         .timeout_ms = 1_000_000,
         // These two are compute-bound and run for minutes.
@@ -465,11 +435,6 @@ pub const suites = [_]Config{
     .{
         .name = "serialization",
         .test_roots = &.{"kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest"},
-        .scratch_home = "/tmp/klio_itest_serialization_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
-        },
         .extra_support = &.{"kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt"},
         .baseline = 138,
         .max_failed = 0,
@@ -478,12 +443,6 @@ pub const suites = [_]Config{
     .{
         .name = "serialization_json",
         .test_roots = &.{"kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-tests/commonTest/src"},
-        .scratch_home = "/tmp/klio_itest_serialization_json_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
-        },
         .extra_support = &.{
             "kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt",
             "kotlin-klio/klio-kotlinx-serialization/klioTest/json/StreamSupport.kt",
@@ -507,23 +466,23 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-kotlinx-io/upstream/bytestring/common/test",
         },
         .extra_support = &.{"kotlin-klio/klio-kotlinx-io/klioTest/kotlinx/io/TestActuals.kt"},
-        .scratch_home = "/tmp/klio_itest_io_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
-        },
         .baseline = 1191,
         .max_failed = 0,
         .max_incomplete = 0,
     },
     .{
+        // The census form of `itest-androidx_collection_commontest`, which
+        // also runs its inline-receiver smoke first.
+        .name = "androidx_collection",
+        .test_roots = &.{"kotlin-klio/klio-androidx-collection/upstream/collection/collection/src/commonTest/kotlin"},
+        // Above the compute-heavy tail: a 1M-iteration stress test.
+        .timeout_ms = 180_000,
+        .baseline = 1841,
+        .max_failed = 0,
+    },
+    .{
         .name = "atomicfu",
         .test_roots = &.{"kotlin-klio/klio-kotlinx-atomicfu/upstream/atomicfu/src/commonTest/kotlin"},
-        .scratch_home = "/tmp/klio_itest_atomicfu_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
-        },
         .whole_source_set = true,
         .baseline = 67,
         .max_failed = 0,
@@ -536,17 +495,9 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-utils/common/test",
             "kotlin-klio/klio-ktor/upstream/ktor-http/common/test",
         },
-        .scratch_home = "/tmp/klio_itest_ktor_home",
         // Pinning http (which pulls utils and io) keeps the load from
-        // activating serialization, whose sources need a pack this home lacks.
+        // activating serialization.
         .extra_args = &.{ "--feature", "io.ktor/http", "--feature", "io.ktor/test-base" },
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-ktor", .artifact = "target/packs/io.ktor.klio-pack" },
-        },
         .baseline = 464,
         .max_failed = 0,
         .max_incomplete = 2,
@@ -562,20 +513,6 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-graphics/src/commonTest/kotlin",
             "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-text/src/commonTest/kotlin",
             "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui/src/commonTest/kotlin",
-        },
-        .scratch_home = "/tmp/klio_itest_compose_ui_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-androidx-collection", .artifact = "target/packs/androidx.collection.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-compose-runtime-engine", .artifact = "target/packs/androidx.compose.runtime.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-compose-ui-util", .artifact = "target/packs/androidx.compose.ui.util.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-compose-ui-geometry", .artifact = "target/packs/androidx.compose.ui.geometry.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-compose-ui-unit", .artifact = "target/packs/androidx.compose.ui.unit.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-compose-ui-graphics", .artifact = "target/packs/androidx.compose.ui.graphics.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-compose-ui-text", .artifact = "target/packs/androidx.compose.ui.text.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-compose-ui-core", .artifact = "target/packs/androidx.compose.ui.klio-pack" },
         },
         .extra_support = &.{
             "tests/compose_ui_commontest_actuals/androidx/kruth/Kruth.kt",
@@ -614,12 +551,10 @@ pub fn runSuite(cfg: Config) !void {
         return error.SkipZigTest;
     }
 
-    std.Io.Dir.cwd().createDirPath(io, cfg.scratch_home) catch {};
-    var env = try envWithHome(a, cfg.scratch_home);
+    var env = try envWithHome(a, try klio_child.home(a));
     for (cfg.extra_env) |kv| try env.put(kv[0], kv[1]);
     const slowdown = harnessSlowdown(&env);
     if (slowdown != 1) try scaleWallCaps(a, &env, slowdown);
-    try installPacks(a, &env, cfg);
 
     var all: std.ArrayList([]u8) = .empty;
     for (cfg.test_roots) |root| try collectKt(a, io, root, &all);

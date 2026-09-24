@@ -250,6 +250,105 @@ fn annotationCallText(a: Allocator, an: *const ast.Annotation) ?[]const u8 {
     return body;
 }
 
+/// A classifier path from the file's top level for `name` as written in
+/// `scope` (a nested path, innermost last): the nearest enclosing scope that
+/// declares it, else `name` itself.
+fn qualifyInScope(a: Allocator, idx: *const Index, scope_in: []const u8, name: []const u8) Allocator.Error![]const u8 {
+    var scope = scope_in;
+    while (scope.len != 0) {
+        const cand = try std.fmt.allocPrint(a, "{s}.{s}", .{ scope, name });
+        if (idx.all_paths.contains(cand)) return cand;
+        scope = if (std.mem.findScalarLast(u8, scope, '.')) |d| scope[0..d] else "";
+    }
+    return name;
+}
+
+/// Source text copied out of a declaration (an annotation call, a
+/// property's default value), re-spelled for the generated file: every name
+/// that starts a reference (the annotation class itself, an enum or object
+/// in an argument or a default) and names a classifier nested in an
+/// enclosing class of `scope` takes that class's path, since the generated
+/// file sits at the top level. Named-argument labels, member selections and
+/// literals stay as written.
+fn qualifySourceText(a: Allocator, idx: *const Index, text: []const u8, scope: []const u8) Allocator.Error![]const u8 {
+    if (scope.len == 0) return text;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '"' or c == '\'') {
+            // A string or char literal, raw strings included, copied whole.
+            const raw = c == '"' and std.mem.startsWith(u8, text[i..], "\"\"\"");
+            var j = i + (if (raw) @as(usize, 3) else 1);
+            while (j < text.len) {
+                if (raw) {
+                    if (std.mem.startsWith(u8, text[j..], "\"\"\"")) {
+                        j += 3;
+                        break;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if (text[j] == '\\') {
+                    j += 2;
+                    continue;
+                }
+                if (text[j] == c) {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            j = @min(j, text.len);
+            try out.appendSlice(a, text[i..j]);
+            i = j;
+            continue;
+        }
+        if (std.ascii.isAlphabetic(c) or c == '_' or c == '`') {
+            var j = i;
+            if (c == '`') {
+                j += 1;
+                while (j < text.len and text[j] != '`') j += 1;
+                j = @min(j + 1, text.len);
+            } else {
+                while (j < text.len and (std.ascii.isAlphanumeric(text[j]) or text[j] == '_')) j += 1;
+            }
+            const word = text[i..j];
+            // Preceded by `.` or `::`: a member of something already spelled.
+            var p = i;
+            while (p > 0 and text[p - 1] == ' ') p -= 1;
+            const selected = p > 0 and (text[p - 1] == '.' or text[p - 1] == ':');
+            // Followed by a lone `=`: a named argument's label.
+            var n = j;
+            while (n < text.len and text[n] == ' ') n += 1;
+            const label = n < text.len and text[n] == '=' and !(n + 1 < text.len and text[n + 1] == '=');
+            if (selected or label or word[0] == '`') {
+                try out.appendSlice(a, word);
+            } else {
+                try out.appendSlice(a, try qualifyInScope(a, idx, scope, word));
+            }
+            i = j;
+            continue;
+        }
+        if (std.ascii.isDigit(c)) {
+            // A number literal, suffixes and hex digits included.
+            var j = i;
+            while (j < text.len and (std.ascii.isAlphanumeric(text[j]) or text[j] == '_' or text[j] == '.')) j += 1;
+            try out.appendSlice(a, text[i..j]);
+            i = j;
+            continue;
+        }
+        try out.append(a, c);
+        i += 1;
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// The enclosing scope of the declaration at `path`.
+fn parentPath(path: []const u8) []const u8 {
+    return if (std.mem.findScalarLast(u8, path, '.')) |d| path[0..d] else "";
+}
+
 /// Only a `@SerialInfo`-marked annotation class reaches the serial descriptor,
 /// so a stdlib marker never becomes a runtime construction.
 fn isSerialInfoAnnotation(idx: *const Index, n: []const u8) bool {
@@ -659,28 +758,28 @@ const Gen = struct {
         if (eq(u8, head, "List") or eq(u8, head, "MutableList") or eq(u8, head, "ArrayList") or
             eq(u8, head, "Collection") or eq(u8, head, "MutableCollection") or eq(u8, head, "Iterable"))
         {
-            return std.fmt.allocPrint(a, "ArrayListSerializer({s})", .{try self.typeArgSerializer(t, 0)});
+            return self.asDeclared(t, !eq(u8, head, "List"), try std.fmt.allocPrint(a, "ArrayListSerializer({s})", .{try self.typeArgSerializer(t, 0)}));
         }
         if (eq(u8, head, "Set") or eq(u8, head, "MutableSet") or eq(u8, head, "LinkedHashSet")) {
-            return std.fmt.allocPrint(a, "LinkedHashSetSerializer({s})", .{try self.typeArgSerializer(t, 0)});
+            return self.asDeclared(t, !eq(u8, head, "Set"), try std.fmt.allocPrint(a, "LinkedHashSetSerializer({s})", .{try self.typeArgSerializer(t, 0)}));
         }
         if (eq(u8, head, "HashSet")) {
-            return std.fmt.allocPrint(a, "HashSetSerializer({s})", .{try self.typeArgSerializer(t, 0)});
+            return self.asDeclared(t, true, try std.fmt.allocPrint(a, "HashSetSerializer({s})", .{try self.typeArgSerializer(t, 0)}));
         }
         if (eq(u8, head, "Map") or eq(u8, head, "MutableMap") or eq(u8, head, "LinkedHashMap")) {
-            return std.fmt.allocPrint(a, "LinkedHashMapSerializer({s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1) });
+            return self.asDeclared(t, !eq(u8, head, "Map"), try std.fmt.allocPrint(a, "LinkedHashMapSerializer({s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1) }));
         }
         if (eq(u8, head, "HashMap")) {
-            return std.fmt.allocPrint(a, "HashMapSerializer({s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1) });
+            return self.asDeclared(t, true, try std.fmt.allocPrint(a, "HashMapSerializer({s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1) }));
         }
         if (eq(u8, head, "Entry")) {
-            return std.fmt.allocPrint(a, "MapEntrySerializer({s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1) });
+            return std.fmt.allocPrint(a, "kotlinx.serialization.builtins.MapEntrySerializer({s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1) });
         }
         if (eq(u8, head, "Pair")) {
-            return std.fmt.allocPrint(a, "PairSerializer({s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1) });
+            return std.fmt.allocPrint(a, "kotlinx.serialization.builtins.PairSerializer({s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1) });
         }
         if (eq(u8, head, "Triple")) {
-            return std.fmt.allocPrint(a, "TripleSerializer({s}, {s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1), try self.typeArgSerializer(t, 2) });
+            return std.fmt.allocPrint(a, "kotlinx.serialization.builtins.TripleSerializer({s}, {s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1), try self.typeArgSerializer(t, 2) });
         }
         if (eq(u8, head, "Array")) {
             const elem_head = if (t.type_args.len != 0 and !t.type_args[0].is_star) try self.qualifyTy(&t.type_args[0].ty) else "Any";
@@ -711,7 +810,7 @@ const Gen = struct {
                 if (class_anns.len != 0) marked = true;
                 if (marked) {
                     var out: std.ArrayList(u8) = .empty;
-                    try writeAnnotatedEnumSerializer(&out, a, cn, serial, qn, class_anns);
+                    try writeAnnotatedEnumSerializer(&out, a, self.idx, cn, serial, qn, class_anns);
                     return out.items;
                 }
                 return std.fmt.allocPrint(a, "createSimpleEnumSerializer(\"{s}\", {s}.values())", .{ try kq(a, serial), qn });
@@ -732,6 +831,9 @@ const Gen = struct {
     }
 
     fn customSerializerRef(self: *const Gen, t: ?*const ast.TypeRef, w: []const u8) Allocator.Error![]const u8 {
+        if (t) |ty| {
+            if (try self.classArgSerializerRef(w, try self.qualifyTy(ty))) |ref| return ref;
+        }
         const q = try self.qualify(w);
         if (self.idx.objects.contains(q) or self.idx.objects.contains(w) or self.idx.objects.contains(simpleHead(w))) return q;
         if (!self.idx.class_nodes.contains(q) and !self.idx.class_nodes.contains(w) and
@@ -764,6 +866,30 @@ const Gen = struct {
             return out.toOwnedSlice(self.a);
         }
         return std.fmt.allocPrint(self.a, "{s}()", .{q});
+    }
+
+    /// A collection serializer for a declared type other than the one it
+    /// serializes (`ArrayListSerializer` is a `KSerializer<List<E>>` for a
+    /// `Collection<E>` or an `ArrayList<E>`), cast to the declared type so
+    /// the element's encode and decode take it; the plugin's code carries the
+    /// value across unchecked the same way.
+    fn asDeclared(self: *const Gen, t: *const ast.TypeRef, adapt: bool, ser: []const u8) Allocator.Error![]const u8 {
+        if (!adapt) return ser;
+        var non_null = t.*;
+        non_null.nullable = false;
+        return std.fmt.allocPrint(self.a, "({s} as KSerializer<{s}>)", .{ ser, try self.typeText(&non_null) });
+    }
+
+    /// The library serializers the plugin constructs from the serialized
+    /// class itself rather than from type-argument serializers:
+    /// `@Serializable(with = PolymorphicSerializer::class)` on `I` is
+    /// `PolymorphicSerializer(I::class)`.
+    fn classArgSerializerRef(self: *const Gen, w: []const u8, target: []const u8) Allocator.Error!?[]const u8 {
+        const head = simpleHead(w);
+        if (std.mem.eql(u8, head, "PolymorphicSerializer") or std.mem.eql(u8, head, "ContextualSerializer")) {
+            return try std.fmt.allocPrint(self.a, "{s}({s}::class)", .{ head, target });
+        }
+        return null;
     }
 
     fn serializerClassIsGeneric(self: *const Gen, q: []const u8) bool {
@@ -799,6 +925,14 @@ fn encodeDefaultMode(annotations: []const ast.Annotation) @TypeOf(@as(Elem, unde
         if (std.mem.endsWith(u8, p, "NEVER")) return .never;
     }
     return .always;
+}
+
+/// A property's default value as the generated file spells it: written in
+/// the class's scope, so a nested enum or class it names takes its path.
+fn defaultText(g: *const Gen, e: ?*const ast.Expr) Allocator.Error!?[]const u8 {
+    const x = e orelse return null;
+    const txt = exprText(x) orelse return null;
+    return try qualifySourceText(g.a, g.idx, txt, g.scope_path);
 }
 
 fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Error![]Elem {
@@ -838,7 +972,7 @@ fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Erro
             .serial_name = sn,
             .ty = &p.ty,
             .annotations = p.annotations,
-            .default_text = if (p.default) |*d| exprText(d) else null,
+            .default_text = try defaultText(g, if (p.default) |*d| d else null),
             .in_ctor = true,
             .required = hasAnnotation(p.annotations, "Required"),
             .encode_default = encodeDefaultMode(p.annotations),
@@ -894,7 +1028,7 @@ fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Erro
             .serial_name = sn,
             .ty = ty,
             .annotations = p.annotations,
-            .default_text = if (p.init) |i| exprText(i) else null,
+            .default_text = try defaultText(g, p.init),
             .in_ctor = false,
             .required = hasAnnotation(p.annotations, "Required"),
             .encode_default = encodeDefaultMode(p.annotations),
@@ -942,11 +1076,41 @@ fn typeParamList(a: Allocator, c: *const ast.Class) Allocator.Error![]const u8 {
     return out.toOwnedSlice(a);
 }
 
+/// A class's type parameters as a generated declaration names them, bounds
+/// included (`<V : Any>`) and qualified for the generated file: a
+/// declaration over the class's type needs its arguments within their
+/// bounds.
+fn typeParamDecls(a: Allocator, c: *const ast.Class, g: *const Gen) Allocator.Error![]const u8 {
+    if (c.type_params.len == 0) return "";
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '<');
+    for (c.type_params, 0..) |*tp, i| {
+        if (i > 0) try out.appendSlice(a, ", ");
+        try out.appendSlice(a, tp.name.name);
+        if (tp.upper_bound) |*b| try wp(&out, a, " : {s}", .{try g.typeText(b)});
+    }
+    try out.append(a, '>');
+    return out.toOwnedSlice(a);
+}
+
+/// The `typeSerial<i>` parameters of a generic class's `serializer(...)`.
+/// Qualified, since the text is also spliced into the user's file.
 fn typeSerialParams(a: Allocator, c: *const ast.Class) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (c.type_params, 0..) |*tp, i| {
         if (i > 0) try out.appendSlice(a, ", ");
-        try wp(&out, a, "typeSerial{d}: KSerializer<{s}>", .{ i, tp.name.name });
+        try wp(&out, a, "typeSerial{d}: kotlinx.serialization.KSerializer<{s}>", .{ i, tp.name.name });
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// The generated serializer class's constructor: the type parameters'
+/// serializers as properties, since its members read them.
+fn typeSerialProps(a: Allocator, c: *const ast.Class) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (c.type_params, 0..) |*tp, i| {
+        if (i > 0) try out.appendSlice(a, ", ");
+        try wp(&out, a, "private val typeSerial{d}: KSerializer<{s}>", .{ i, tp.name.name });
     }
     return out.toOwnedSlice(a);
 }
@@ -960,13 +1124,45 @@ fn typeSerialArgs(a: Allocator, c: *const ast.Class) Allocator.Error![]const u8 
     return out.toOwnedSlice(a);
 }
 
+fn hasBoundedTypeParam(c: *const ast.Class) bool {
+    for (c.type_params) |*tp| {
+        if (tp.upper_bound != null) return true;
+    }
+    return false;
+}
+
+/// The call of a generated generic declaration `callee` (a serializer class
+/// or factory, declared with the class's bounds) from a spliced
+/// `serializer(typeSerial0, ...)`, whose type parameters are unbounded as
+/// the plugin declares them: `Query.SimpleQuery.serializer(String.serializer())`
+/// compiles for `SimpleQuery<T : Output>`. With a bound in the way the
+/// callee is instantiated at `Nothing`, which is within every bound, and the
+/// result cast back; the arguments are erased at run time either way.
+fn splicedGenericCall(a: Allocator, c: *const ast.Class, path: []const u8, callee: []const u8) Allocator.Error![]const u8 {
+    const tps = try typeParamList(a, c);
+    if (!hasBoundedTypeParam(c)) return std.fmt.allocPrint(a, "`{s}`{s}({s})", .{ callee, tps, try typeSerialArgs(a, c) });
+    var nothings: std.ArrayList(u8) = .empty;
+    var args: std.ArrayList(u8) = .empty;
+    try nothings.append(a, '<');
+    for (c.type_params, 0..) |_, i| {
+        if (i > 0) {
+            try nothings.appendSlice(a, ", ");
+            try args.appendSlice(a, ", ");
+        }
+        try nothings.appendSlice(a, "kotlin.Nothing");
+        try wp(&args, a, "typeSerial{d} as kotlinx.serialization.KSerializer<kotlin.Nothing>", .{i});
+    }
+    try nothings.append(a, '>');
+    return std.fmt.allocPrint(a, "(`{s}`{s}({s}) as kotlinx.serialization.KSerializer<{s}{s}>)", .{ callee, nothings.items, args.items, path, tps });
+}
+
 fn genClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *const ast.Class, info: *const Info) Allocator.Error!void {
     const gn = try genNameFor(a, info);
     const tps = try typeParamList(a, c);
     const self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps });
     const generic = c.type_params.len != 0;
     if (generic) {
-        try wp(w, a, "class `{s}`{s}({s}) : GeneratedSerializer<{s}> {{\n", .{ gn, tps, try typeSerialParams(a, c), self_ty });
+        try wp(w, a, "class `{s}`{s}({s}) : GeneratedSerializer<{s}> {{\n", .{ gn, try typeParamDecls(a, c, g), try typeSerialProps(a, c), self_ty });
     } else {
         try wp(w, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ gn, self_ty });
     }
@@ -1055,10 +1251,9 @@ fn writeElementAnnotations(b: *const BodyGen, e: *const Elem) Allocator.Error!vo
             std.mem.eql(u8, n, "Required") or std.mem.eql(u8, n, "EncodeDefault") or std.mem.eql(u8, n, "Contextual") or
             std.mem.eql(u8, n, "Polymorphic") or std.mem.eql(u8, n, "OptIn") or std.mem.eql(u8, n, "Suppress")) continue;
         if (!isSerialInfoAnnotation(b.g.idx, n)) continue;
-        if (sourceOf(an.span)) |txt| {
-            const body = if (txt.len > 0 and txt[0] == '@') txt[1..] else txt;
-            const call = if (std.mem.findScalar(u8, body, '(') == null) try std.fmt.allocPrint(a, "{s}()", .{body}) else body;
-            try wp(w, a, "        `$dd`.pushAnnotation({s})\n", .{call});
+        if (annotationCallText(a, an)) |call| {
+            // A property's annotations are spelled in its class's body.
+            try wp(w, a, "        `$dd`.pushAnnotation({s})\n", .{try qualifySourceText(a, b.g.idx, call, b.info.path)});
         }
     }
 }
@@ -1089,11 +1284,14 @@ fn writeSerialize(b: *const BodyGen) Allocator.Error!void {
     for (b.elems, 0..) |*e, i| {
         const enc = try encodeElementCall(b, e, i);
         if (elemOptional(e) and e.encode_default != .always) {
+            // The default is typed as the property is declared, as its
+            // initializer was: `emptyMap()` alone infers nothing.
             const dflt = e.default_text.?;
+            const tt = try b.g.typeText(e.ty);
             if (e.encode_default == .never) {
-                try wp(w, a, "        if (value.run {{ {s} != ({s}) }}) {s}\n", .{ e.name, dflt, enc });
+                try wp(w, a, "        if (value.run {{ val `$default`: {s} = ({s}); {s} != `$default` }}) {s}\n", .{ tt, dflt, e.name, enc });
             } else {
-                try wp(w, a, "        if (`$out`.shouldEncodeElementDefault(`$d`, {d}) || value.run {{ {s} != ({s}) }}) {s}\n", .{ i, e.name, dflt, enc });
+                try wp(w, a, "        if (`$out`.shouldEncodeElementDefault(`$d`, {d}) || value.run {{ val `$default`: {s} = ({s}); {s} != `$default` }}) {s}\n", .{ i, tt, dflt, e.name, enc });
             }
         } else {
             try wp(w, a, "        {s}\n", .{enc});
@@ -1254,11 +1452,13 @@ fn writeCtorLocals(b: *const BodyGen) Allocator.Error!void {
     }
 }
 
-/// The constructor call, named argument per constructor element.
+/// The constructor call, named argument per constructor element. A generic
+/// class is instantiated at the serializer's own type parameters, which no
+/// argument may mention (`SimpleQuery<T>(rawQuery = rawQuery)`).
 fn writeInstanceCall(b: *const BodyGen) Allocator.Error!void {
     const w = b.w;
     const a = b.a;
-    try wp(w, a, "            val `$inst` = {s}(", .{b.info.path});
+    try wp(w, a, "            val `$inst` = {s}{s}(", .{ b.info.path, try typeParamList(a, b.c) });
     var first = true;
     for (b.elems) |*e| {
         if (!e.in_ctor) continue;
@@ -1352,7 +1552,7 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
     const tps = try typeParamList(a, c);
     const self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps });
     if (c.type_params.len != 0) {
-        try wp(w, a, "class `{s}`{s}({s}) : GeneratedSerializer<{s}> {{\n", .{ gn, tps, try typeSerialParams(a, c), self_ty });
+        try wp(w, a, "class `{s}`{s}({s}) : GeneratedSerializer<{s}> {{\n", .{ gn, try typeParamDecls(a, c, g), try typeSerialProps(a, c), self_ty });
     } else {
         try wp(w, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ gn, self_ty });
     }
@@ -1378,7 +1578,7 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
     try w.appendSlice(a, "    }\n}\n\n");
 }
 
-fn writeAnnotatedEnumSerializer(w: *std.ArrayList(u8), a: Allocator, c: *const ast.Class, serial: []const u8, path: []const u8, class_anns: []const []const u8) Allocator.Error!void {
+fn writeAnnotatedEnumSerializer(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *const ast.Class, serial: []const u8, path: []const u8, class_anns: []const []const u8) Allocator.Error!void {
     try wp(w, a, "createAnnotatedEnumSerializer(\"{s}\", {s}.values(), arrayOf<String?>(", .{ try kq(a, serial), path });
     for (c.x().enum_entries, 0..) |*en, i| {
         if (i > 0) try w.appendSlice(a, ", ");
@@ -1397,11 +1597,8 @@ fn writeAnnotatedEnumSerializer(w: *std.ArrayList(u8), a: Allocator, c: *const a
         for (en.annotations) |*an| {
             const n = annotationSimpleName(an);
             if (std.mem.eql(u8, n, "SerialName")) continue;
-            if (sourceOf(an.span)) |txt| {
-                const body = if (txt.len > 0 and txt[0] == '@') txt[1..] else txt;
-                const call = if (std.mem.findScalar(u8, body, '(') == null) try std.fmt.allocPrint(a, "{s}()", .{body}) else body;
-                try anns.append(a, call);
-            }
+            // An entry's annotations are spelled in the enum's body.
+            if (annotationCallText(a, an)) |call| try anns.append(a, try qualifySourceText(a, idx, call, path));
         }
         if (anns.items.len == 0) {
             try w.appendSlice(a, "null");
@@ -1442,7 +1639,7 @@ fn genEnumFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *co
         return;
     }
     try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ ", .{ gn, info.path });
-    try writeAnnotatedEnumSerializer(w, a, c, serial, info.path, class_anns);
+    try writeAnnotatedEnumSerializer(w, a, idx, c, serial, info.path, class_anns);
     try w.appendSlice(a, " }\n");
     try wp(w, a, "fun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, gn });
 }
@@ -1569,7 +1766,57 @@ fn genObjectFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
     }
 }
 
-fn genWithFactory(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, info: *const Info) Allocator.Error!void {
+/// The custom serializer a generic class names, as its factory returns it.
+/// A serializer class that is not itself generic takes the type-argument
+/// serializers and serves every instantiation, as the plugin passes them
+/// unchecked: the arguments are cast to its constructor's parameter types
+/// and the result to the instantiation's serializer, so the source is
+/// well-typed Kotlin.
+fn uncheckedCustomRef(a: Allocator, g: *const Gen, info: *const Info, tps: []const u8) Allocator.Error![]const u8 {
+    const w = info.with.?;
+    const ref = try g.customSerializerRef(null, w);
+    const q = try g.qualify(w);
+    const cn: ?*const ast.Class = g.idx.class_nodes.get(q) orelse g.idx.class_nodes.get(w) orelse g.idx.class_nodes.get(simpleHead(w));
+    const is_object = g.idx.objects.contains(q) or g.idx.objects.contains(w) or g.idx.objects.contains(simpleHead(w));
+    if (!is_object and cn != null and cn.?.type_params.len != 0 and hasBoundedTypeParam(cn.?)) {
+        // A generic serializer whose type parameters are bounded where the
+        // class's are not (`ParametrizedSerializer<T : Any>` for
+        // `ParametrizedWithCustom<T>`): the plugin passes the type-argument
+        // serializers unchecked, so it is instantiated at `Nothing`, within
+        // every bound, and cast back.
+        var out: std.ArrayList(u8) = .empty;
+        try wp(&out, a, "({s}<", .{q});
+        for (cn.?.type_params, 0..) |_, i| {
+            if (i > 0) try out.appendSlice(a, ", ");
+            try out.appendSlice(a, "Nothing");
+        }
+        try out.appendSlice(a, ">(");
+        for (g.type_params, 0..) |_, i| {
+            if (i > 0) try out.appendSlice(a, ", ");
+            try wp(&out, a, "typeSerial{d} as KSerializer<Nothing>", .{i});
+        }
+        try wp(&out, a, ") as KSerializer<{s}<{s}>>)", .{ info.path, tps });
+        return out.toOwnedSlice(a);
+    }
+    if (!is_object and (cn == null or cn.?.type_params.len != 0)) return ref;
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '(');
+    if (is_object) {
+        try out.appendSlice(a, ref);
+    } else {
+        try wp(&out, a, "{s}(", .{q});
+        for (g.type_params, 0..) |_, i| {
+            if (i > 0) try out.appendSlice(a, ", ");
+            try wp(&out, a, "typeSerial{d}", .{i});
+            if (i < cn.?.primary_params.len) try wp(&out, a, " as {s}", .{try g.typeText(&cn.?.primary_params[i].ty)});
+        }
+        try out.append(a, ')');
+    }
+    try wp(&out, a, " as KSerializer<{s}<{s}>>)", .{ info.path, tps });
+    return out.toOwnedSlice(a);
+}
+
+fn genWithFactory(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, info: *const Info, c: ?*const ast.Class) Allocator.Error!void {
     const gn = try genNameFor(a, info);
     if (g.type_params.len != 0) {
         // The factory takes the type-argument serializers, so it is a function
@@ -1584,10 +1831,12 @@ fn genWithFactory(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, info: *con
             try tps.appendSlice(a, tp);
             try wp(&params, a, "typeSerial{d}: KSerializer<{s}>", .{ i, tp });
         }
-        try wp(w, a, "fun <{s}> `{s}Impl`({s}): KSerializer<{s}<{s}>> = {s}\n\n", .{ tps.items, gn, params.items, info.path, tps.items, try g.customSerializerRef(null, info.with.?) });
+        const decls = if (c) |cls| try typeParamDecls(a, cls, g) else try std.fmt.allocPrint(a, "<{s}>", .{tps.items});
+        try wp(w, a, "fun {s} `{s}Impl`({s}): KSerializer<{s}<{s}>> = {s}\n\n", .{ decls, gn, params.items, info.path, tps.items, try uncheckedCustomRef(a, g, info, tps.items) });
         return;
     }
-    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ {s} }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try g.customSerializerRef(null, info.with.?), gn, info.path, gn });
+    const ref = (try g.classArgSerializerRef(info.with.?, info.path)) orelse try g.customSerializerRef(null, info.with.?);
+    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ {s} }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, ref, gn, info.path, gn });
 }
 
 fn genMemberSplice(a: Allocator, c: ?*const ast.Class, info: *const Info, kept: ?*const Info) Allocator.Error![]const u8 {
@@ -1609,59 +1858,52 @@ fn genMemberSplice(a: Allocator, c: ?*const ast.Class, info: *const Info, kept: 
     }
     if (info.is_object_decl) {
         if (kept != null) {
-            try wp(&out, a, "object {s} {{ fun serializer(): KSerializer<{s}> = `{s}Impl`()\nval `$generatedSerializerCache`: KSerializer<{s}> by lazy {{ kotlinx.serialization.internal.ObjectSerializer(\"{s}\", {s}) }}\nfun generatedSerializer(): KSerializer<{s}> = `$generatedSerializerCache` }}", .{ last, info.path, gn, info.path, try serialNameOf(a, info), info.path, info.path });
+            try wp(&out, a, "object {s} {{ fun serializer(): kotlinx.serialization.KSerializer<{s}> = `{s}Impl`()\nval `$generatedSerializerCache`: kotlinx.serialization.KSerializer<{s}> by lazy {{ kotlinx.serialization.internal.ObjectSerializer(\"{s}\", {s}) }}\nfun generatedSerializer(): kotlinx.serialization.KSerializer<{s}> = `$generatedSerializerCache` }}", .{ last, info.path, gn, info.path, try serialNameOf(a, info), info.path, info.path });
         } else {
-            try wp(&out, a, "object {s} {{ fun serializer(): KSerializer<{s}> = `{s}Impl`() }}", .{ last, info.path, gn });
+            try wp(&out, a, "object {s} {{ fun serializer(): kotlinx.serialization.KSerializer<{s}> = `{s}Impl`() }}", .{ last, info.path, gn });
         }
         var k: usize = 0;
         while (k < depth) : (k += 1) try out.appendSlice(a, " }");
         return out.toOwnedSlice(a);
     }
     try wp(&out, a, "class {s} {{ companion object {{ ", .{last});
+    // A generic class's `serializer(...)` takes its type parameters without
+    // their bounds, as the plugin declares it.
     switch (info.kind) {
-        .class => {
+        .class, .value_class => {
             if (c != null and c.?.type_params.len != 0) {
-                try wp(&out, a, "fun {s} serializer({s}): KSerializer<{s}{s}> = `{s}`{s}({s})", .{
-                    try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), gn, try typeParamList(a, c.?), try typeSerialArgs(a, c.?),
+                try wp(&out, a, "fun {s} serializer({s}): kotlinx.serialization.KSerializer<{s}{s}> = {s}", .{
+                    try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), try splicedGenericCall(a, c.?, info.path, gn),
                 });
             } else {
-                try wp(&out, a, "fun serializer(): KSerializer<{s}> = `{s}`", .{ info.path, gn });
-            }
-        },
-        .value_class => {
-            if (c != null and c.?.type_params.len != 0) {
-                try wp(&out, a, "fun {s} serializer({s}): KSerializer<{s}{s}> = `{s}`{s}({s})", .{
-                    try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), gn, try typeParamList(a, c.?), try typeSerialArgs(a, c.?),
-                });
-            } else {
-                try wp(&out, a, "fun serializer(): KSerializer<{s}> = `{s}`", .{ info.path, gn });
+                try wp(&out, a, "fun serializer(): kotlinx.serialization.KSerializer<{s}> = `{s}`", .{ info.path, gn });
             }
         },
         else => {
             if (c != null and c.?.type_params.len != 0 and info.with != null) {
-                try wp(&out, a, "fun {s} serializer({s}): KSerializer<{s}{s}> = `{s}Impl`({s})", .{
-                    try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), gn, try typeSerialArgs(a, c.?),
+                try wp(&out, a, "fun {s} serializer({s}): kotlinx.serialization.KSerializer<{s}{s}> = {s}", .{
+                    try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), try splicedGenericCall(a, c.?, info.path, try std.fmt.allocPrint(a, "{s}Impl", .{gn})),
                 });
             } else if (c != null and c.?.type_params.len != 0) {
-                try wp(&out, a, "fun {s} serializer({s}): KSerializer<{s}{s}> = `{s}Impl`() as KSerializer<{s}{s}>", .{
+                try wp(&out, a, "fun {s} serializer({s}): kotlinx.serialization.KSerializer<{s}{s}> = `{s}Impl`() as kotlinx.serialization.KSerializer<{s}{s}>", .{
                     try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), gn, info.path, try typeParamList(a, c.?),
                 });
             } else {
-                try wp(&out, a, "fun serializer(): KSerializer<{s}> = `{s}Impl`()", .{ info.path, gn });
+                try wp(&out, a, "fun serializer(): kotlinx.serialization.KSerializer<{s}> = `{s}Impl`()", .{ info.path, gn });
             }
         },
     }
     if (kept) |ki| {
         const kn = try genNameFor(a, ki);
         switch (ki.kind) {
-            .enum_class => try wp(&out, a, " fun generatedSerializer(): KSerializer<{s}> = `{s}Impl`()", .{ info.path, kn }),
+            .enum_class => try wp(&out, a, " fun generatedSerializer(): kotlinx.serialization.KSerializer<{s}> = `{s}Impl`()", .{ info.path, kn }),
             else => {
                 if (c != null and c.?.type_params.len != 0) {
-                    try wp(&out, a, " fun {s} generatedSerializer({s}): KSerializer<{s}{s}> = `{s}`{s}({s})", .{
-                        try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), kn, try typeParamList(a, c.?), try typeSerialArgs(a, c.?),
+                    try wp(&out, a, " fun {s} generatedSerializer({s}): kotlinx.serialization.KSerializer<{s}{s}> = {s}", .{
+                        try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), try splicedGenericCall(a, c.?, info.path, kn),
                     });
                 } else {
-                    try wp(&out, a, " fun generatedSerializer(): KSerializer<{s}> = `{s}`", .{ info.path, kn });
+                    try wp(&out, a, " fun generatedSerializer(): kotlinx.serialization.KSerializer<{s}> = `{s}`", .{ info.path, kn });
                 }
             },
         }
@@ -1675,10 +1917,23 @@ fn genMemberSplice(a: Allocator, c: ?*const ast.Class, info: *const Info, kept: 
 // Parsing generated text and splicing it into the original declarations.
 
 fn parseSnippet(a: Allocator, file: FileId, src: []const u8) ?ast.KotlinFile {
+    return parseSnippetFrom(a, file, src, 1);
+}
+
+/// A snippet spliced into the file `ctx` transforms: its nodes take ids after
+/// the file's, and the file's `node_count` moves past them.
+fn parseSplice(ctx: *Ctx, src: []const u8) ?ast.KotlinFile {
+    const kf = parseSnippetFrom(ctx.a, ctx.file.span.file, src, ctx.file.node_count) orelse return null;
+    ctx.file.node_count = kf.node_count;
+    return kf;
+}
+
+fn parseSnippetFrom(a: Allocator, file: FileId, src: []const u8, first_node_id: u32) ?ast.KotlinFile {
     var lx = lexer_mod.Lexer.init(a, file, src) catch return null;
     var lexed = lx.tokenize() catch return null;
     if (lexed.diagnostics.hasErrors()) return null;
     var p = parser_mod.Parser.new(a, file, src, lexed.tokens, lexed.strings);
+    p.first_node_id = @max(first_node_id, 1);
     const kf = p.parseFile();
     if (p.diagnostics.hasErrors()) {
         if (std.c.getenv("KLIO_SERIAL_DUMP") != null) {
@@ -1742,6 +1997,26 @@ fn starImport(a: Allocator, sp: Span, pkg: []const []const u8) Allocator.Error!a
     return .{ .path = path, .alias = null, .wildcard = true, .span = sp };
 }
 
+/// Star-imports the packages generated code names into a file that holds
+/// a local class's serializer. An extension call such as `Int.serializer()`
+/// has no qualified spelling, so the file must import what the code uses;
+/// star imports rank below the file's explicit imports and its own package.
+fn addGenImports(a: Allocator, f: *ast.KotlinFile) Allocator.Error!void {
+    var out: std.ArrayList(ast.ImportDecl) = .empty;
+    try out.appendSlice(a, f.imports);
+    const sp = Span.init(f.span.file, f.span.end, f.span.end);
+    for (gen_imports) |pkg| {
+        const have = for (f.imports) |imp| {
+            if (!imp.wildcard or imp.path.len != pkg.len) continue;
+            for (imp.path, pkg) |seg, want| {
+                if (!std.mem.eql(u8, seg.name, want)) break;
+            } else break true;
+        } else false;
+        if (!have) try out.append(a, try starImport(a, sp, pkg));
+    }
+    f.imports = out.items;
+}
+
 fn nameImport(a: Allocator, sp: Span, pkg: []const []const u8) Allocator.Error!ast.ImportDecl {
     const path = try a.alloc(ast.Ident, pkg.len);
     for (pkg, 0..) |seg, i| path[i] = .{ .name = seg, .span = sp };
@@ -1755,6 +2030,9 @@ const Ctx = struct {
     pkg: []const u8,
     gen: std.ArrayList(u8),
     generated_any: bool = false,
+    /// A local class got its serializer spliced into the file, whose text
+    /// needs the generated code's imports.
+    local_artifacts: bool = false,
     pad: []const u8,
     /// Extra padding so successive snippets in one file never share offsets,
     /// which a span-keyed registry would merge.
@@ -1828,6 +2106,9 @@ fn processFunctionLocals(ctx: *Ctx, f: *ast.Function, outer: []const u8) Allocat
     const dbg = std.c.getenv("KLIO_SERIAL_DUMP") != null;
     if (dbg) std.debug.print("[serial-pass] fn {s} body={s}\n", .{ f.name.name, if (f.body) |b| @tagName(std.meta.activeTag(b)) else "none" });
     if (f.body) |*fb| {
+        // A local class's splice writes into the body, which the original file
+        // shares until copied.
+        if (ast.bodyDeclares(.{}, fb)) fb.* = try ast.clone(ctx.a, ast.FunctionBody, fb);
         switch (fb.*) {
             .Block => |*blk| try processLocalStmts(ctx, f, blk.stmts, outer),
             .Expr => |*e| try walkLocalExpr(ctx, f, e, outer),
@@ -1945,17 +2226,18 @@ fn processLocalStmts(ctx: *Ctx, f: *ast.Function, stmts: []ast.Stmt, outer: []co
                 if (local_gen.items.len != 0) {
                     const artifacts = try snippetPadded(ctx, local_gen.items);
                     if (dbg) std.debug.print("[serial-pass] local artifacts for {s}:\n{s}\n", .{ c.name.name, local_gen.items });
-                    if (parseSnippet(ctx.a, ctx.file.span.file, artifacts)) |snip_val| {
+                    if (parseSplice(ctx, artifacts)) |snip_val| {
                         if (dbg) std.debug.print("[serial-pass] local artifacts parsed: {d} decls\n", .{snip_val.decls.len});
                         try appendMembers(ctx.a, &c.members, snip_val.decls);
+                        ctx.local_artifacts = true;
                     } else if (dbg) std.debug.print("[serial-pass] local artifacts FAILED to parse\n", .{});
                 }
                 const splice_text: []const u8 = if (info.kind == .with_custom)
-                    try std.fmt.allocPrint(ctx.a, "class {s} {{ companion object {{ fun serializer(): KSerializer<{s}> = {s} }} }}", .{ c.name.name, c.name.name, try g.customSerializerRef(null, info.with.?) })
+                    try std.fmt.allocPrint(ctx.a, "class {s} {{ companion object {{ fun serializer(): kotlinx.serialization.KSerializer<{s}> = {s} }} }}", .{ c.name.name, c.name.name, try g.customSerializerRef(null, info.with.?) })
                 else
                     try genMemberSplice(ctx.a, c, &info, null);
                 const splice_src = try snippetPadded(ctx, splice_text);
-                if (parseSnippet(ctx.a, ctx.file.span.file, splice_src)) |snip_val| {
+                if (parseSplice(ctx, splice_src)) |snip_val| {
                     var snip = snip_val;
                     try spliceInto(ctx.a, &c.members, false, &snip);
                 }
@@ -1969,7 +2251,14 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
     for (decls) |*d| {
         switch (d.*) {
             .Class => |*c| {
+                // An `expect class` gets no serializer: its `actual` carries
+                // the annotation and the generated code, as the compiler
+                // plugin generates for the actual alone.
+                if (c.is_expect) continue;
                 const path = joinPath(ctx.a, outer, c.name.name);
+                // A nested splice writes into `c.members`, which the original
+                // file shares until copied.
+                c.members = try ctx.a.dupe(ast.Decl, c.members);
                 try processDecls(ctx, c.members, path);
                 if (companionForClassTarget(ctx.a, c.members)) |target_written| {
                     if (findCompanion(c.members)) |comp| {
@@ -1984,7 +2273,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                 if (companionIsSerializer(c.members)) {
                     ctx.generated_any = true;
                     const splice_src = try snippetPadded(ctx, try genSelfSerializerSplice(ctx.a, &info));
-                    if (parseSnippet(ctx.a, ctx.file.span.file, splice_src)) |snip_val| {
+                    if (parseSplice(ctx, splice_src)) |snip_val| {
                         var snip = snip_val;
                         try spliceInto(ctx.a, &c.members, false, &snip);
                     }
@@ -1999,7 +2288,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                     .enum_class => try genEnumFactory(&ctx.gen, ctx.a, ctx.idx, c, &info),
                     .sealed, .interface_sealed => try genSealedFactory(&ctx.gen, ctx.a, ctx.idx, &info),
                     .polymorphic => try genPolymorphicFactory(&ctx.gen, ctx.a, ctx.idx, &info),
-                    .with_custom => try genWithFactory(&ctx.gen, ctx.a, &g, &info),
+                    .with_custom => try genWithFactory(&ctx.gen, ctx.a, &g, &info, c),
                     .object => {},
                 }
                 // `@KeepGeneratedSerializer` beside a custom `with=` still emits
@@ -2021,7 +2310,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                 }
                 ctx.generated_any = true;
                 const splice_src = try snippetPadded(ctx, try genMemberSplice(ctx.a, c, &info, if (kept_info) |*k| k else null));
-                const parsed_splice = parseSnippet(ctx.a, ctx.file.span.file, splice_src);
+                const parsed_splice = parseSplice(ctx, splice_src);
                 if (std.c.getenv("KLIO_SERIAL_DUMP") != null) std.debug.print("[serial-pass] member splice for {s} parsed={}:\n{s}\n", .{ path, parsed_splice != null, splice_src });
                 if (parsed_splice) |snip_val| {
                     var snip = snip_val;
@@ -2031,6 +2320,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
             .Function => |*f| try processFunctionLocals(ctx, f, outer),
             .Object => |*o| {
                 const path = joinPath(ctx.a, outer, o.name.name);
+                o.members = try ctx.a.dupe(ast.Decl, o.members);
                 try processDecls(ctx, o.members, path);
                 if (serializerForClassTarget(ctx.a, o.annotations)) |target_written| {
                     try genForClassObject(ctx, o, path, target_written);
@@ -2040,7 +2330,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                 const info = ctx.idx.by_path.get(path) orelse continue;
                 const g = Gen{ .a = ctx.a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = &.{}, .scope_path = path, .file = &ctx.settings };
                 switch (info.kind) {
-                    .with_custom => try genWithFactory(&ctx.gen, ctx.a, &g, &info),
+                    .with_custom => try genWithFactory(&ctx.gen, ctx.a, &g, &info, null),
                     else => try genObjectFactory(&ctx.gen, ctx.a, ctx.idx, &info),
                 }
                 ctx.generated_any = true;
@@ -2052,7 +2342,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                     kept_obj = kept;
                 }
                 const splice_src = try snippetPadded(ctx, try genMemberSplice(ctx.a, null, &info, if (kept_obj) |*k| k else null));
-                if (parseSnippet(ctx.a, ctx.file.span.file, splice_src)) |snip_val| {
+                if (parseSplice(ctx, splice_src)) |snip_val| {
                     var snip = snip_val;
                     try spliceInto(ctx.a, &o.members, true, &snip);
                 }
@@ -2095,6 +2385,15 @@ fn serializerForClassTarget(a: Allocator, annotations: []const ast.Annotation) ?
 
 /// Fill a `@Serializer(forClass = X::class)` object with X's generated members,
 /// keeping its own name and supertypes.
+fn declaresMember(members: []const ast.Decl, name: []const u8, kind: enum { property, function }) bool {
+    for (members) |*d| switch (d.*) {
+        .Property => |p| if (kind == .property and std.mem.eql(u8, p.name.name, name)) return true,
+        .Function => |*f| if (kind == .function and std.mem.eql(u8, f.name.name, name)) return true,
+        else => {},
+    };
+    return false;
+}
+
 fn genForClassObject(ctx: *Ctx, o: *ast.ObjectDecl, obj_path: []const u8, target_written: []const u8) Allocator.Error!void {
     const a = ctx.a;
     const scope = if (std.mem.findScalarLast(u8, obj_path, '.')) |d| obj_path[0..d] else "";
@@ -2123,13 +2422,20 @@ fn genForClassObject(ctx: *Ctx, o: *ast.ObjectDecl, obj_path: []const u8, target
     try genClassSerializerBody(&ctx.gen, a, &g, c, &info);
     try ctx.gen.appendSlice(a, "}\n\n");
     ctx.generated_any = true;
-    const splice = try std.fmt.allocPrint(a,
-        "object {s} : kotlinx.serialization.KSerializer<{s}> {{ override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n" ++
-            "override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: {s}) = `{s}`.serialize(encoder, value)\n" ++
-            "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder) }}",
-        .{ o.name.name, info.path, impl_name, info.path, impl_name, info.path, impl_name });
+    // The plugin fills in only what the object leaves out: a descriptor or
+    // a serialize/deserialize the object declares is its own.
+    var splice_w: std.ArrayList(u8) = .empty;
+    try wp(&splice_w, a, "object {s} : kotlinx.serialization.KSerializer<{s}> {{ ", .{ o.name.name, info.path });
+    if (!declaresMember(o.members, "descriptor", .property))
+        try wp(&splice_w, a, "override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n", .{impl_name});
+    if (!declaresMember(o.members, "serialize", .function))
+        try wp(&splice_w, a, "override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: {s}) = `{s}`.serialize(encoder, value)\n", .{ info.path, impl_name });
+    if (!declaresMember(o.members, "deserialize", .function))
+        try wp(&splice_w, a, "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder)\n", .{ info.path, impl_name });
+    try splice_w.appendSlice(a, "}");
+    const splice = splice_w.items;
     const splice_src = try snippetPadded(ctx, splice);
-    if (parseSnippet(a, ctx.file.span.file, splice_src)) |snip_val| {
+    if (parseSplice(ctx, splice_src)) |snip_val| {
         var snip = snip_val;
         // A bodiless object declares no serializer supertype, so the splice
         // supplies the `KSerializer<X>` it must have.
@@ -2148,6 +2454,28 @@ fn declaresSerializerSupertype(supertypes: []const ast.TypeRef) bool {
             std.mem.eql(u8, head, "SerializationStrategy") or std.mem.eql(u8, head, "DeserializationStrategy")) return true;
     }
     return false;
+}
+
+fn appendClassSupertypes(a: Allocator, c: *ast.Class, extra: []const ast.TypeRef) Allocator.Error!void {
+    if (extra.len == 0) return;
+    var sups: std.ArrayList(ast.TypeRef) = .empty;
+    try sups.appendSlice(a, c.supertypes);
+    try sups.appendSlice(a, extra);
+    c.supertypes = sups.items;
+    var sargs: std.ArrayList(?[]ast.Expr) = .empty;
+    try sargs.appendSlice(a, c.supertype_args);
+    while (sargs.items.len < c.supertypes.len) try sargs.append(a, null);
+    c.supertype_args = sargs.items;
+    var dels: std.ArrayList(?ast.Expr) = .empty;
+    try dels.appendSlice(a, c.supertype_delegates);
+    while (dels.items.len < c.supertypes.len) try dels.append(a, null);
+    c.supertype_delegates = dels.items;
+    if (c.x().supertype_arg_names.len != 0) {
+        var names: std.ArrayList(?[]const ?[]const u8) = .empty;
+        try names.appendSlice(a, c.x().supertype_arg_names);
+        while (names.items.len < c.supertypes.len) try names.append(a, null);
+        (try c.xMut(a)).supertype_arg_names = names.items;
+    }
 }
 
 fn appendSupertypes(a: Allocator, o: *ast.ObjectDecl, extra: []const ast.TypeRef) Allocator.Error!void {
@@ -2188,7 +2516,7 @@ fn genSelfSerializerSplice(a: Allocator, info: *const Info) Allocator.Error![]co
             depth += 1;
         }
     }
-    try wp(&out, a, "class {s} {{ companion object {{ fun serializer(): KSerializer<{s}> = this }} }}", .{ last, info.path });
+    try wp(&out, a, "class {s} {{ companion object {{ fun serializer(): kotlinx.serialization.KSerializer<{s}> = this }} }}", .{ last, info.path });
     var k: usize = 0;
     while (k < depth) : (k += 1) try out.appendSlice(a, " }");
     return out.toOwnedSlice(a);
@@ -2231,22 +2559,30 @@ fn genForClassCompanion(ctx: *Ctx, comp: *ast.Decl, class_path: []const u8, targ
         try std.fmt.allocPrint(a, "\nfun generatedSerializer(): kotlinx.serialization.KSerializer<{s}> = `{s}`", .{ info.path, impl_name })
     else
         "";
-    try wp(&out, a,
-        "class {s} {{ companion object {{ fun serializer(): kotlinx.serialization.KSerializer<{s}> = this\n" ++
-            "override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n" ++
-            "override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: {s}) = `{s}`.serialize(encoder, value)\n" ++
-            "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder){s} }} }}",
-        .{ last, info.path, impl_name, info.path, impl_name, info.path, impl_name, kept_member });
+    // As for an object serializer, the companion keeps what it declares.
+    const own = companionMembers(comp).*;
+    try wp(&out, a, "class {s} {{ companion object : kotlinx.serialization.KSerializer<{s}> {{ fun serializer(): kotlinx.serialization.KSerializer<{s}> = this\n", .{ last, info.path, info.path });
+    if (!declaresMember(own, "descriptor", .property))
+        try wp(&out, a, "override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n", .{impl_name});
+    if (!declaresMember(own, "serialize", .function))
+        try wp(&out, a, "override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: {s}) = `{s}`.serialize(encoder, value)\n", .{ info.path, impl_name });
+    if (!declaresMember(own, "deserialize", .function))
+        try wp(&out, a, "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder)\n", .{ info.path, impl_name });
+    try wp(&out, a, "{s} }} }}", .{kept_member});
     var k: usize = 0;
     while (k < depth) : (k += 1) try out.appendSlice(a, " }");
     const splice_src = try snippetPadded(ctx, out.items);
-    if (parseSnippet(a, ctx.file.span.file, splice_src)) |snip_val| {
+    if (parseSplice(ctx, splice_src)) |snip_val| {
         var snip = snip_val;
         const wrapper = innermostWrapper(&snip);
         if (wrapper) |w| {
             if (w.* == .Class) {
                 if (findCompanion(w.Class.members)) |gen_comp| {
                     try appendMembers(a, companionMembers(comp), companionMembers(gen_comp).*);
+                    // A companion that names no serializer supertype takes
+                    // the `KSerializer<X>` the plugin gives it.
+                    if (comp.* == .Class and !declaresSerializerSupertype(comp.Class.supertypes))
+                        try appendClassSupertypes(a, &comp.Class, gen_comp.Class.supertypes);
                 }
             }
         }
@@ -2281,7 +2617,8 @@ const gen_imports = [_][]const []const u8{
 
 /// Returns the originals followed by one generated sibling file per original
 /// that declared serializable classes. Copies are shallow: decl arrays are
-/// replaced, never mutated, so the caller's originals stay valid.
+/// replaced, never mutated, so the caller's originals stay valid. Spliced
+/// nodes take ids after the file's own.
 pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.Error![]ast.KotlinFile {
     var any = false;
     for (files_in) |*f| {
@@ -2312,6 +2649,17 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
     for (files_in) |*f| try indexAnnotationClasses(&idx, f.decls);
     for (files_in) |*f| {
         try indexDecls(&idx, f.decls, "", packageText(a, f));
+    }
+    // A class's annotations are spelled in the scope around it; qualify them
+    // there once every path is known, so a subclass that inherits one keeps
+    // the declaring scope's meaning.
+    {
+        var it = idx.class_annotations.iterator();
+        while (it.next()) |entry| {
+            const calls = try a.dupe([]const u8, entry.value_ptr.*);
+            for (calls) |*call| call.* = try qualifySourceText(a, &idx, call.*, parentPath(entry.key_ptr.*));
+            entry.value_ptr.* = calls;
+        }
     }
     // Resolve each subclass supertype to a declaration path, enclosing scopes
     // first, so two files' same-named sealed parents keep separate lists.
@@ -2345,6 +2693,8 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
         @memset(pad, ' ');
         var ctx = Ctx{ .a = a, .idx = &idx, .file = f, .pkg = packageText(a, f), .gen = .empty, .pad = pad, .settings = try fileSettings(a, &idx, f) };
         try processDecls(&ctx, f.decls, "");
+        ast.node_ids.assertValid(f, "the serialization pass");
+        if (ctx.local_artifacts) try addGenImports(a, f);
         if (!ctx.generated_any) continue;
         var src: std.ArrayList(u8) = .empty;
         if (ctx.pkg.len != 0) try wp(&src, a, "package {s}\n\n", .{ctx.pkg});
@@ -2379,7 +2729,7 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
     return out.toOwnedSlice(a);
 }
 
-fn fileMentionsSerializable(f: *const ast.KotlinFile) bool {
+pub fn fileMentionsSerializable(f: *const ast.KotlinFile) bool {
     if (declsMentionSerializable(f.decls)) return true;
     // A class in a lambda, a block or an expression body is local too; the
     // source-text scan catches nestings the decl walk misses.
@@ -2417,4 +2767,348 @@ test "genName mangles nested paths" {
     const n = try genName(a, "Outer.Inner");
     defer a.free(n);
     try std.testing.expectEqualStrings("Outer_Inner$serializer", n);
+}
+
+test "an expect class gets no serializer; its actual does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const common =
+        \\package demo
+        \\import kotlinx.serialization.*
+        \\
+        \\@Serializable(with = DaySerializer::class)
+        \\expect class Day
+    ;
+    const platform =
+        \\package demo
+        \\import kotlinx.serialization.*
+        \\import kotlinx.serialization.descriptors.*
+        \\import kotlinx.serialization.encoding.*
+        \\
+        \\@Serializable(with = DaySerializer::class)
+        \\actual class Day(val n: Int)
+        \\
+        \\object DaySerializer : KSerializer<Day> {
+        \\    override val descriptor = PrimitiveSerialDescriptor("demo.Day", PrimitiveKind.INT)
+        \\    override fun serialize(encoder: Encoder, value: Day) = encoder.encodeInt(value.n)
+        \\    override fun deserialize(decoder: Decoder): Day = Day(decoder.decodeInt())
+        \\}
+    ;
+    var map = span_mod.SourceMap.init(a);
+    const common_id = try map.add("common.kt", common);
+    const platform_id = try map.add("platform.kt", platform);
+    const prev_map = span_mod.active_map;
+    span_mod.active_map = &map;
+    defer span_mod.active_map = prev_map;
+    const originals = [_]ast.KotlinFile{
+        parseSnippetFrom(a, common_id, common, 1).?,
+        parseSnippetFrom(a, platform_id, platform, 1).?,
+    };
+    const out = try transformFiles(a, &originals);
+    // One generated file, the actual's: the expect contributes none, so the
+    // two cannot declare the same serializer twice.
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    var impls: usize = 0;
+    for (out[2].decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (std.mem.eql(u8, f.name.name, "Day$serializerImpl")) impls += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), impls);
+}
+
+test "spliced nodes number after the file's own, on every run over the same originals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\import kotlinx.serialization.*
+        \\
+        \\@Serializable data class Point(val x: Int, val y: Int)
+        \\class Outer { @Serializable data class Inner(val name: String) }
+        \\@Serializable sealed class Shape {
+        \\    @Serializable data class Circle(val r: Double) : Shape()
+        \\}
+        \\fun main() {
+        \\    @Serializable data class Local(val v: Int)
+        \\    println(Local(1))
+        \\}
+    ;
+    var map = span_mod.SourceMap.init(a);
+    const fid = try map.add("points.kt", src);
+    const prev_map = span_mod.active_map;
+    span_mod.active_map = &map;
+    defer span_mod.active_map = prev_map;
+    const parsed = parseSnippetFrom(a, fid, src, 1).?;
+    const originals = [_]ast.KotlinFile{parsed};
+    for (0..2) |_| {
+        const out = try transformFiles(a, &originals);
+        try std.testing.expectEqual(@as(usize, 2), out.len);
+        try std.testing.expect(out[0].node_count > parsed.node_count);
+        for (out) |*f| try std.testing.expect(try ast.checkIds(std.testing.allocator, f, .{ .require_all = true }) == null);
+        // The original keeps its own count and ids.
+        try std.testing.expect(try ast.checkIds(std.testing.allocator, &originals[0], .{ .require_all = true }) == null);
+    }
+}
+
+/// Runs the pass over one source file and returns the text it generated.
+fn generatedFor(a: Allocator, src: []const u8) ![]const u8 {
+    var map = span_mod.SourceMap.init(a);
+    const prev_map = span_mod.active_map;
+    span_mod.active_map = &map;
+    defer span_mod.active_map = prev_map;
+    const id = try map.add("test.kt", src);
+    const file = parseSnippetFrom(a, id, map.get(id).source, 1) orelse return error.TestUnexpectedResult;
+    _ = try transformFiles(a, &.{file});
+    for (map.files.items) |f| {
+        if (std.mem.startsWith(u8, f.path, "<generated-serializers-")) return f.source;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "a non-generic custom serializer of a generic class is cast to each instantiation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\@Serializable(with = BoxSerializer::class)
+        \\data class Box<T>(val t: T)
+        \\class BoxSerializer(val inner: KSerializer<Any>) : KSerializer<Box<Any>> {
+        \\    override val descriptor = TODO()
+        \\}
+        \\@Serializable(with = PairSerializer::class)
+        \\data class Duo<A>(val a: A)
+        \\class PairSerializer<A>(val inner: KSerializer<A>) : KSerializer<Duo<A>> {
+        \\    override val descriptor = TODO()
+        \\}
+        \\@Serializable(with = BoundSerializer::class)
+        \\data class Loose<T>(val t: T)
+        \\class BoundSerializer<T : Any>(val inner: KSerializer<T>) : KSerializer<Loose<T>> {
+        \\    override val descriptor = TODO()
+        \\}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "= (BoxSerializer(typeSerial0 as KSerializer<Any>) as KSerializer<Box<T>>)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "= PairSerializer(typeSerial0)") != null);
+    // A bound the class does not share is met at `Nothing`.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "= (BoundSerializer<Nothing>(typeSerial0 as KSerializer<Nothing>) as KSerializer<Loose<T>>)") != null);
+}
+
+test "a generated serializer declares its class's type parameter bounds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\@Serializable
+        \\data class ValueHolder<V : Any>(@Polymorphic val value: V)
+        \\@Serializable(with = HolderSerializer::class)
+        \\data class Custom<T : CharSequence>(val t: T)
+        \\class HolderSerializer<T : CharSequence>(val inner: KSerializer<T>) : KSerializer<Custom<T>> {
+        \\    override val descriptor = TODO()
+        \\}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "class `ValueHolder$serializer`<V : Any>(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "fun <T : CharSequence> `Custom$serializerImpl`(") != null);
+}
+
+test "a forClass serializer keeps the members it declares" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\import kotlinx.serialization.*
+        \\import kotlinx.serialization.descriptors.*
+        \\@Serializable class C
+        \\@Serializer(forClass = C::class)
+        \\object CSerializer : KSerializer<C> {
+        \\    override val descriptor: SerialDescriptor = buildSerialDescriptor("AnotherName", StructureKind.OBJECT)
+        \\}
+        \\class D(val x: Int) {
+        \\    @Serializer(forClass = D::class)
+        \\    companion object {
+        \\        override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: D) {}
+        \\    }
+        \\}
+    ;
+    var map = span_mod.SourceMap.init(a);
+    const fid = try map.add("f.kt", src);
+    const prev_map = span_mod.active_map;
+    span_mod.active_map = &map;
+    defer span_mod.active_map = prev_map;
+    const out = try transformFiles(a, &.{parseSnippetFrom(a, fid, src, 1).?});
+    const count = struct {
+        fn of(ms: []const ast.Decl, name: []const u8) usize {
+            var n: usize = 0;
+            for (ms) |*m| switch (m.*) {
+                .Property => |p| n += @intFromBool(std.mem.eql(u8, p.name.name, name)),
+                .Function => |*f| n += @intFromBool(std.mem.eql(u8, f.name.name, name)),
+                else => {},
+            };
+            return n;
+        }
+    }.of;
+    var checked: usize = 0;
+    for (out[0].decls) |*d| switch (d.*) {
+        .Object => |*o| if (std.mem.eql(u8, o.name.name, "CSerializer")) {
+            // The declared descriptor stays the only one; the rest are filled in.
+            try std.testing.expectEqual(@as(usize, 1), count(o.members, "descriptor"));
+            try std.testing.expectEqual(@as(usize, 1), count(o.members, "serialize"));
+            try std.testing.expectEqual(@as(usize, 1), count(o.members, "deserialize"));
+            checked += 1;
+        },
+        .Class => |*c| if (std.mem.eql(u8, c.name.name, "D")) {
+            const comp = findCompanion(@constCast(c.members)).?;
+            const ms = companionMembers(comp).*;
+            try std.testing.expectEqual(@as(usize, 1), count(ms, "serialize"));
+            try std.testing.expectEqual(@as(usize, 1), count(ms, "descriptor"));
+            // It names no serializer supertype, so it takes `KSerializer<D>`.
+            try std.testing.expect(declaresSerializerSupertype(comp.Class.supertypes));
+            checked += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), checked);
+}
+
+test "a spliced serializer() takes its type parameters without the class's bounds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\import kotlinx.serialization.*
+        \\interface Output
+        \\@Serializable sealed class Query<T : Output> {
+        \\    @Serializable data class SimpleQuery<T : Output>(val raw: String) : Query<T>()
+        \\}
+        \\@Serializable data class Box<T>(val t: T)
+    ;
+    var map = span_mod.SourceMap.init(a);
+    const fid = try map.add("q.kt", src);
+    const prev_map = span_mod.active_map;
+    span_mod.active_map = &map;
+    defer span_mod.active_map = prev_map;
+    const out = try transformFiles(a, &.{parseSnippetFrom(a, fid, src, 1).?});
+    // `Query.SimpleQuery.serializer(String.serializer())` compiles with the
+    // plugin, so no spliced `serializer` bounds its `T`.
+    var seen: usize = 0;
+    const Walk = struct {
+        fn decls(ds: []const ast.Decl, n: *usize) !void {
+            for (ds) |*d| switch (d.*) {
+                .Class => |*c| try decls(c.members, n),
+                .Object => |*o| try decls(o.members, n),
+                .Function => |*f| if (std.mem.eql(u8, f.name.name, "serializer") and f.type_params.len != 0) {
+                    n.* += 1;
+                    for (f.type_params) |*tp| try std.testing.expect(tp.upper_bound == null);
+                },
+                else => {},
+            };
+        }
+    };
+    try Walk.decls(out[0].decls, &seen);
+    try std.testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "an optional element is compared with its default typed as it is declared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\@Serializable
+        \\data class Media(val name: String, val extensions: Map<String, String?> = emptyMap())
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "val `$default`: Map<String, String?> = (emptyMap()); extensions != `$default`") != null);
+}
+
+test "a default value naming a nested class is spelled by its path in the generated file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\class Outer {
+        \\    enum class E { FIRST, SECOND }
+        \\    @Serializable class Foo(val x: Int = 1)
+        \\    @Serializable
+        \\    data class Holder(val e: E = E.SECOND, val foo: Foo = Foo(), val n: Int = 3) {
+        \\        val tag: String = "E.FIRST"
+        \\    }
+        \\}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "= (Outer.E.SECOND)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "= (Outer.Foo())") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "= (\"E.FIRST\")") != null);
+}
+
+test "a collection serializer is cast to a declared type it does not name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\@Serializable
+        \\data class Wrapper(val c: Collection<String>, val l: List<Int>, val m: HashMap<String, Int>?, val s: MutableSet<Long>)
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "(ArrayListSerializer(String.serializer()) as KSerializer<Collection<String>>)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "ArrayListSerializer(Int.serializer()), value.l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "(HashMapSerializer(String.serializer(), Int.serializer()) as KSerializer<HashMap<String, Int>>)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "(LinkedHashSetSerializer(Long.serializer()) as KSerializer<MutableSet<Long>>)") != null);
+}
+
+test "a generic class is constructed at its serializer's type parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\interface Output
+        \\@Serializable sealed class Query<T : Output> {
+        \\    @Serializable data class SimpleQuery<T : Output>(val rawQuery: String) : Query<T>()
+        \\}
+        \\@Serializable open class Rec<T : Rec<T>>()
+    );
+    // No argument mentions `T`, so the call names it.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "val `$inst` = Query.SimpleQuery<T>(rawQuery = rawQuery)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "val `$inst` = Rec<T>()") != null);
+}
+
+test "with = PolymorphicSerializer is constructed from the annotated class" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\class Outer {
+        \\    @Serializable(PolymorphicSerializer::class)
+        \\    interface I3
+        \\    @Serializable
+        \\    class Holder(@Serializable(with = PolymorphicSerializer::class) val i: I3)
+        \\}
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "by lazy { PolymorphicSerializer(Outer.I3::class) }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "PolymorphicSerializer(Outer.I3::class)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "PolymorphicSerializer()") == null);
+}
+
+test "an annotation nested in an enclosing class is spelled by its path in the generated file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\class Outer {
+        \\    @SerialInfo annotation class Tag(val text: String)
+        \\    @SerialInfo annotation class Order(val order: Kind = Kind.A)
+        \\    enum class Kind { A, B }
+        \\    @Tag("on class")
+        \\    @Serializable
+        \\    enum class Entries { @Tag("on A") A, @Order(order = Kind.B) B }
+        \\    @Tag("data")
+        \\    @Serializable
+        \\    data class Holder(@Order(Kind.B) val x: Int, @Tag("s \"Kind\"") val s: String)
+        \\}
+    );
+    // Class annotations take the scope around the class, entries and
+    // properties the class's own body.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Outer.Tag(\"on class\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Outer.Tag(\"on A\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Outer.Order(order = Outer.Kind.B)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pushAnnotation(Outer.Order(Outer.Kind.B))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pushAnnotation(Outer.Tag(\"s \\\"Kind\\\"\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pushClassAnnotation(Outer.Tag(\"data\"))") != null);
 }

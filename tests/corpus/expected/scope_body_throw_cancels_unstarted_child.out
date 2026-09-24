@@ -1,4 +1,4 @@
-caught kotlin.RuntimeException: boom
+caught java.lang.RuntimeException: boom
 caught CancellationException
 producer closed
 first=42

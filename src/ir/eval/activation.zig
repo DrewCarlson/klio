@@ -24,6 +24,7 @@ const ev_frame = @import("frame.zig");
 const ev_loop = @import("loop.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
+const ev_resolved = @import("resolved.zig");
 
 const Activation = ev_flow.Activation;
 const EnclosingEntry = ev_state.EnclosingEntry;
@@ -164,13 +165,12 @@ pub fn resumeContinuation(
     // Root the not-yet-rebuilt outer snapshots for the resume's duration: they are out of the park
     // registry and not yet on the frame chain, so an inner frame's collection would sweep them.
     var resume_node = ResumeFrames{ .prev = ev_state.evtlsPtr().resuming, .frames = &frames, .head = &head, .tails = &tails };
-    if (runtime.gc.gc_enabled) {
-        gcInstallFrameRoot();
-        ev_state.evtlsPtr().resuming = &resume_node;
-    }
-    defer if (runtime.gc.gc_enabled) {
-        ev_state.evtlsPtr().resuming = resume_node.prev;
-    };
+    if (runtime.gc.gc_enabled) gcInstallFrameRoot();
+    ev_state.evtlsPtr().resuming = &resume_node;
+    defer ev_state.evtlsPtr().resuming = resume_node.prev;
+    // The host's value as the resumed code reads it. Asked only now: making it can run Kotlin,
+    // and a collection then must see the parked frames.
+    if (comptime @hasDecl(H, "resumeValue")) carry = try host.resumeValue(allocator, carry);
     var first = true;
     var pending_throw_from_inner: ?Value = null;
     var pending_unwind_from_inner: ?EvalError = null;
@@ -395,9 +395,13 @@ pub fn runFrame(
     resume_idx: usize,
     host: *H,
 ) Allocator.Error!EvalResult {
-    // Every nested Kotlin call re-enters here, so bounding this depth raises a catchable `StackOverflowError` before the native stack faults.
-    if (ev_state.evtlsPtr().eval_depth >= maxEvalDepth()) {
+    // A Kotlin call the host makes re-enters here on the native stack, so a
+    // stack down to its reserve, like a depth past the cap, raises a
+    // catchable `StackOverflowError` before the native stack faults.
+    if (ev_state.evtlsPtr().eval_depth >= maxEvalDepth() or runtime.stackLow()) {
         dumpFrameChainForDiag();
+        // Kotlin code catches it as `java.lang.StackOverflowError`.
+        if (try ev_resolved.stackOverflowError(H, allocator, module, host)) |exc| return errResult(.{ .Throw = exc });
         return errResult(.{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" });
     }
     if (ev_state.evtlsPtr().eval_depth == 0) _ = parent.threads_in_eval.fetchAdd(1, .monotonic);
@@ -516,12 +520,16 @@ pub fn actFree(ev: *EvalTls, allocator: Allocator, act: *Activation) void {
 /// Open a flat activation for a direct interpreted call: the entry sequence `evalWithCapturesChained` performs recursively.
 pub fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const Module, req: FlatCallReq, host: *H) Allocator.Error!*Activation {
     const ev: *EvalTls = ev_state.evtlsPtr();
-    boolThisTrap(req.func, req.args.items);
     const module = req.run_module orelse caller_module;
-    dumpFnIfRequested(module, req.func);
-    // SAM conversion at the call boundary; the flat activation is the other way in.
-    if (comptime @hasDecl(H, "samConvertActivationArgs")) {
-        try host.samConvertActivationArgs(allocator, req.func, req.args.items);
+    // A module lowered from sema passes arguments as sema typed and
+    // converted them.
+    if (module.resolved == null) {
+        boolThisTrap(req.func, req.args.items);
+        dumpFnIfRequested(module, req.func);
+        // SAM conversion at the call boundary; the flat activation is the other way in.
+        if (comptime @hasDecl(H, "samConvertActivationArgs")) {
+            try host.samConvertActivationArgs(allocator, req.func, req.args.items);
+        }
     }
     const act = try actAlloc(ev, allocator);
     errdefer actFree(ev, allocator, act);

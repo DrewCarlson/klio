@@ -163,7 +163,7 @@ pub const Pool = struct {
                 // Spawn under the lock so a concurrent shutdown never sees a
                 // reserved-but-unstarted handle.
                 self.worker_seq += 1;
-                const handle = std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, workerMain, .{ self, self.worker_seq }) catch null;
+                const handle = std.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, workerMain, .{ self, self.worker_seq }) catch null;
                 if (handle) |h| {
                     self.workers.append(a, h) catch {
                         // Untracked worker: runs detached and exits on the stopping flag.
@@ -222,7 +222,11 @@ pub const Pool = struct {
             handles.appendSlice(a, self.workers.items) catch {};
             self.workers.clearRetainingCapacity();
         }
+        // Blocked, the joining thread counts as parked for a collection a
+        // finishing worker starts.
+        runtime.gc.enterBlockingSafe();
         for (handles.items) |h| h.join();
+        runtime.gc.exitBlockingSafe();
         self.mutex.lock();
         defer self.mutex.unlock();
         while (self.queue_default.pop()) |t| {
@@ -260,6 +264,7 @@ pub const Pool = struct {
     }
 
     fn workerMain(self: *Pool, seq: usize) void {
+        runtime.enterThreadStack(runtime.WORKER_STACK_SIZE);
         const tid = std.Thread.getCurrentId();
         var name_buf: [64]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "DefaultDispatcher-worker-{d}", .{seq}) catch "DefaultDispatcher-worker";

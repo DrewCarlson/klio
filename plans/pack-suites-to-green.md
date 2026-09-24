@@ -29,16 +29,117 @@ The stdlib `js/` directory stays out: klio is its own runtime and claims
 neither the JS backend's tests nor its intrinsics, so `stdlib_commontest`
 skips the directory by name and it counts toward nothing.
 
+## On the sema pipeline
+
+`klio test` runs the sema pipeline by default now (`--legacy-pipeline` or
+`KLIO_SEMA_PIPELINE=0` is the old one), so these are the censuses as they
+run. The floors are the old path's counts above.
+
+| Suite | Passed | Failed | Floor | What is left |
+|-------|-------:|-------:|------:|--------------|
+| kotlinx.coroutines core | 1299 | 0 | 1299 | none |
+| kotlinx.atomicfu | 67 | 0 | 67 | none |
+| kotlinx.coroutines test | 73 | 0 | 73 | none (two upstream `@Ignore`s skipped) |
+| androidx.collection | 1841 | 0 | 1841 | none |
+| io.ktor | 461 | 3 | 464 | a lambda passed through `listOf` for an extension function type gets no candidate (sema), `SuspendFunctionGunTest` x3 |
+| kotlinx.io | 1191 | 0 | 1191 | none |
+| kotlinx.datetime | 519 | 0 | 519 | none |
+| kotlinx.serialization core | 138 | 0 | 138 | none |
+| kotlinx.serialization json | 747 | 0 | 747 | none |
+| Compose UI | 452 | 0 | 452 | none |
+| Compose runtime (plugin) | 1393 | 11 | 1385 | see below |
+
+**Compose runtime on the sema pipeline** (the itest shards run one at a
+time, before the wall-cap fix below; the classes were re-run one child
+each after it):
+
+| Tests | Cause |
+|-------|-------|
+| `MutableVectorTest.sortWith` | Sema: a SAM-constructor argument (`Comparator { p0, p1 -> p0 - p1 }`) passed to a member of `Box<T>` takes its type argument from the lambda body instead of the expected `Comparator<T>`. |
+| `SnapshotStateListTests.concurrentGlobalModifications_addAll`, `concurrentMixingWriteApply_addAll_removeRange`, `concurrentMixingWriteApply_addAll_clear`, `SnapshotStateMapTests.concurrentMixingWriteApply_clear` | Throughput. All four pass with the tests' 30 s `runTest` timeout raised. The old path served `PersistentVectorBuilder.addAll`/`removeRange` and the persistent map mutators from host code by name (`vm/persistent_list_mut.zig`, `persistent_map_mut.zig`); the sema pipeline runs the upstream Kotlin, whose `removeRange` is `AbstractMutableList`'s one-`remove`-per-element walk: a removeRange round is 22.6 s against 1.8 s, one map round 4.1 s of the 30 s budget for ten. Those natives are try-then-fall-back-to-the-body serves of members with Kotlin bodies (one, `removeRange`, not declared by the builder at all), which the bridge has no binding for. |
+| `CompositionTests.derivedStateOfLeak` | Throughput (31 300 recompositions); recorded, not chased. |
+| `CompositionTests` x4, `PausableCompositionTests.rememberObserverThrashing` | Fixed: poisoned by `derivedStateOfLeak`'s wall-cap hard abort, which left the test thread inside the composition's snapshot. The wall cap now throws a catchable timeout up to three times before it hard-aborts, so a test that catches one still ends through its own `finally` blocks. |
+
+Measured 2026-09-24 on the packs branch rebased on `c0ec677a`. What moved
+them there: the VM allocating on the process allocator, so the collector
+frees (io's `AbstractSourceTest`, 744 cases, had run past the RSS cap);
+natives reading a user `Map`'s `entries` through the well-known slot table
+(json's `JsonObject` is a `Map` by delegation); and the serialization pass
+generating code that resolves from the top level of its file: nested
+annotation classes, enums and defaults spelled by path, unbounded
+`serializer()` type parameters as the plugin declares them, bounded
+serializers instantiated at `Nothing`, generic classes constructed at the
+serializer's type parameters, `with = PolymorphicSerializer`, a `forClass`
+serializer keeping its own members and supertype, and collection
+serializers cast to the declared type. Datetime closed with sema's integer
+literal arithmetic and sealed-constructor visibility, serialization with
+the annotation class's implicit constructor and class literals typed at
+once.
+
+The Compose, material3 and Mosaic examples (50, and three interactive
+windows checked by `KLIO_SKIA_DUMP` screenshots) run the same on both
+pipelines, windows included, pixel for pixel. What they needed on this one:
+an increment or compound assignment through `?.` stopping at a null
+receiver (`parent?.globallyPositionedObservers++`), a receiver that may be
+null reading the extension declared on its nullable type
+(`RowColumnParentData?.weight`), and `fun f() = @Composable { ... }`
+keeping its annotation.
+
+On the old path serialization json reads 733/14 (`hasInterfaceContextualSerializers`
+read on a `MutableList`); the pack changes above do not move it, and the
+old path is going away.
+
+The coroutines test group's two skipped cases are upstream `@Ignore`s.
+`klio test <pack> --test-group <g>` runs the group's roots with the group's
+features requested of the project's pack on this pipeline too, and
+`klio-census androidx_collection` runs that suite the way the itest does.
+
+The coroutines suite holds 1299/0 with `KLIO_GC_THRESHOLD_KB=256`. Under
+`KLIO_GC_STRESS_EVERY=25` seven heavy files run past the census's child
+timeout; none crashes.
+
+**io.ktor, seven failures on this pipeline:**
+
+| Tests | Cause |
+|-------|-------|
+| `ByteReadChannelOperationsTest.testReadPacketBig`, `ReadLineTest` "exceeding limit after several buffers" | Sema types a constant expression over integer literals (`8192 * 2`) as `Int`; kotlinc gives it an integer literal type, so it becomes `Long` against a `Long` parameter or type variable. |
+| `SuspendFunctionGunTest` x3 | Sema finds no applicable candidate for a lambda passed through a generic call whose expected element type is an extension function type: `G(listOf({ _ -> }))` for `List<String.(Int) -> Unit>`. |
+| `CaseInsensitiveMapTest` x2 | A host entry's `equals` reads the other entry's `key` and `value` as fields by name; ktor's entry exposes `value` through a getter. |
+
+What the new path needed, each a general fix rather than a coroutines one:
+
+- **A resumed coroutine's frames were unrooted while its value was made.** A
+  host `Result` becomes the base's `Result` instance before the resumed code
+  reads it, and the constructors that runs are safe points. The host did it
+  after the pump had taken the activation out of its parked table and before
+  `resumeContinuation` rooted the frames; a collection there swept a SharedFlow
+  collector's registers. `KLIO_GC_STRESS=1` over a SharedFlow with two
+  collectors reproduced it in twenty lines; the old path never converts.
+- **Every two instances of one data class were equal to the host.** The
+  bridge's class defs listed no constructor properties, and the host's
+  structural equality compares by them, so `MutableSet.remove` took the first
+  element of the class and a map's entries all showed the first value.
+  Calling the class's `equals` slot from the host is the end state.
+- **A closure's `toString` invoked the closure** through the host's by-name
+  member call; it now answers as kotlinc does without kotlin-reflect. A
+  suspend lambda still prints the plain lambda's form where kotlinc prints
+  `Function1<kotlin.coroutines.Continuation<? super kotlin.Unit>, ...>`, and
+  `println` of a closure goes through the host's display, which prints
+  `{ir-closure#N}`.
+- **An interface member a grandparent class implements had no vtable entry**
+  (`DeferredCoroutine.getCompletionExceptionOrNull`).
+
 ## What is left
 
-**kotlinx.coroutines core, one failure.**
+**kotlinx.coroutines core, one failure on the old path.**
 `TimeoutTest.testSharedFlowCancelledNoTimeout` fails with `call_value on
 kotlin.Nothing`, deterministically and in isolation. It predates the interpreter
 pass below — the binary built from the commit before it fails the same way — so
 it arrived with an earlier commit in this campaign. The frame chain reaches
 `withDelaySkipping`'s `get(ContinuationInterceptor)` on a `RunningInRunTest`
 context; the read misses as a member and the bare-name fallback is what needs
-following next.
+following next. It passes on the sema pipeline, as does
+`JobExtensionsTest.testIsCancelled`, the old path's second failure today.
 
 **Compose runtime, two failures, both wall-clock.**
 

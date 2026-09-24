@@ -108,7 +108,7 @@ fn reportUndeliveredUnhandled(ctx: *CallCtx, err: RuntimeError, scope_in: Value)
     if (err != .Thrown) return;
     var scope = scope_in;
     if (scope == .Unit) scope = ctx.host.activeCoroScope() orelse return;
-    const ctx_res = (ctx.host.getProperty(&scope, "coroutineContext", ctx.out) catch return) orelse return;
+    const ctx_res = (ctx.host.callWellKnown(&scope, .coroutine_context, &.{}, ctx.out) catch return) orelse return;
     const coro_ctx = switch (ctx_res) {
         .ok => |v| v,
         .err => return,
@@ -117,19 +117,23 @@ fn reportUndeliveredUnhandled(ctx: *CallCtx, err: RuntimeError, scope_in: Value)
     // `handleCoroutineException`, whose no-handler tail re-enters the runtime
     // from inside a cancellation unwind. The context key is the interface's
     // companion.
-    var key = ctx.host.lookupGlobal("CoroutineExceptionHandler") orelse return;
-    if (key == .Class) {
-        if (ctx.host.getProperty(&key, "Key", ctx.out) catch null) |r| {
-            if (r == .ok and r.ok != .Null) key = r.ok;
+    const key = (ctx.host.wellKnownObject(.coroutine_exception_handler_key) catch return) orelse blk: {
+        // A host that finds objects by name: the interface's companion.
+        var k = ctx.host.lookupGlobal("CoroutineExceptionHandler") orelse return;
+        if (k == .Class) {
+            if (ctx.host.getProperty(&k, "Key", ctx.out) catch null) |r| {
+                if (r == .ok and r.ok != .Null) k = r.ok;
+            }
         }
-    }
-    const got = (ctx.host.invokeMethod(&coro_ctx, "get", &.{key}, ctx.out) catch return) orelse return;
+        break :blk k;
+    };
+    const got = (ctx.host.callWellKnown(&coro_ctx, .context_get, &.{key}, ctx.out) catch return) orelse return;
     const handler = switch (got) {
         .ok => |v| v,
         .err => return,
     };
     if (handler == .Null) return;
-    _ = ctx.host.invokeMethod(&handler, "handleException", &.{ coro_ctx, err.Thrown }, ctx.out) catch return;
+    _ = ctx.host.callWellKnown(&handler, .handle_exception, &.{ coro_ctx, err.Thrown }, ctx.out) catch return;
 }
 
 fn makeSuccessResult(allocator: std.mem.Allocator, payload: Value) std.mem.Allocator.Error!Value {

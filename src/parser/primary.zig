@@ -79,9 +79,8 @@ pub fn parsePrimary(p: *Parser) ?Expr {
             const tok = support.bump(p);
             return Expr{ .CharLit = .{ .value = c, .span = tok.span } };
         },
-        // Kotlin permits a collection literal only as an annotation argument;
-        // klio accepts it as a `listOf(...)` expression, annotation arguments
-        // being runtime-inert.
+        // A collection literal: a call marked as one, whose callee names
+        // `listOf`; the type expected of it chooses the function it calls.
         .LBracket => {
             const lb = support.bump(p);
             support.skipNl(p);
@@ -103,18 +102,15 @@ pub fn parsePrimary(p: *Parser) ?Expr {
             }
             const rb = support.expect(p, .RBracket, "`]`") orelse return null;
             const sp = lb.span.join(rb.span);
-            const n = elems.items.len;
             const seg = p.allocator.alloc(Ident, 1) catch @panic("OOM in primary");
             seg[0] = Ident{ .name = "listOf", .span = lb.span };
             const callee = box(p, Expr{ .Path = .{ .segments = seg, .span = lb.span } });
-            const arg_names = p.allocator.alloc(?[]const u8, n) catch @panic("OOM in primary");
-            for (arg_names) |*an| an.* = null;
             return Expr{ .Call = .{
                 .callee = callee,
+                .extra = support.positionalCallExtra(p, elems.items.len),
                 .args = elems.toOwnedSlice(p.allocator) catch @panic("OOM in primary"),
-                .arg_names = arg_names,
-                .type_args = &.{},
                 .is_infix = false,
+                .collection_literal = true,
                 .span = sp,
             } };
         },

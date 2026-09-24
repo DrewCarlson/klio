@@ -44,6 +44,6 @@ fun main() {
     println(take2(::target) == take2Value(::target))
     println(takeTwoStrings(::join) == takeTwoStrings(::join))
     println(takeTwoStrings(::join) == takeArray(::join))
-    println(::f == "f")
+    println((::f as Any) == "f")
     println(::f.equals(42))
 }

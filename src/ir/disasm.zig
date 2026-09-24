@@ -17,6 +17,9 @@ pub const Options = struct {
     func_filter: ?[]const u8 = null,
     /// Dump every appended function, not just `module.top_level`.
     all: bool = false,
+    /// A module lowered from sema numbers the program's functions after the
+    /// base's: the default set is then every function from this id on.
+    program_from: ?u32 = null,
 };
 
 const Kind = enum { direct, virtual, dyn_bound, dyn_unbound };
@@ -54,6 +57,8 @@ fn classify(inst: *const Inst) ?Kind {
         .CallValueOrMember,
         .CallMemberOrValue,
         => .dyn_unbound,
+        .CallStatic, .RNewInstance, .CallNative => .direct,
+        .RCallVirtual, .CallInterface => .virtual,
         else => null,
     };
 }
@@ -83,6 +88,101 @@ fn className(m: *const Module, id: ir.ClassId) []const u8 {
     return "<class?>";
 }
 
+fn slotName(m: *const Module, slot: ir.MethodSlotId) []const u8 {
+    return funcName(m, ir.FuncId.from(slot.int()));
+}
+
+fn staticName(m: *const Module, id: ir.StaticId) []const u8 {
+    const r = m.resolved orelse return "<static?>";
+    return if (id.int() < r.statics.len) r.statics[id.int()].name else "<static?>";
+}
+
+fn nativeName(m: *const Module, id: ir.NativeId) []const u8 {
+    const r = m.resolved orelse return "<native?>";
+    return if (id.int() < r.natives.len) r.natives[id.int()].name else "<native?>";
+}
+
+fn regList(w: *std.Io.Writer, regs: []const ir.Reg) !void {
+    try w.writeByte('[');
+    for (regs, 0..) |r, i| {
+        if (i != 0) try w.writeAll(", ");
+        try w.print("r{d}", .{reg(r)});
+    }
+    try w.writeByte(']');
+}
+
+fn nullMark(nullable: bool) []const u8 {
+    return if (nullable) "?" else "";
+}
+
+/// The instructions lowered from sema: every operand is an id, printed with
+/// the display name beside it.
+fn dumpResolved(w: *std.Io.Writer, m: *const Module, inst: *const Inst) !bool {
+    switch (inst.*) {
+        .CallStatic => |c| {
+            try w.print("r{d} <- CallStatic {s}#{d} ", .{ reg(c.dst), funcName(m, c.func), c.func.int() });
+            try argRun(w, c.args, c.n_args);
+            try w.writeAll("        [DIRECT]");
+        },
+        .RCallVirtual => |c| {
+            try w.print("r{d} <- CallVirtual slot {s}#{d} ", .{ reg(c.dst), slotName(m, c.slot), c.slot.int() });
+            try argRun(w, c.args, c.n_args);
+            try w.writeAll("        [VIRTUAL]");
+        },
+        .CallInterface => |c| {
+            try w.print("r{d} <- CallInterface {s}#{d} slot {s}#{d} ", .{ reg(c.dst), className(m, c.iface), c.iface.int(), slotName(m, c.slot), c.slot.int() });
+            try argRun(w, c.args, c.n_args);
+            try w.writeAll("        [VIRTUAL]");
+        },
+        .CallNative => |c| {
+            try w.print("r{d} <- CallNative {s}#{d} ", .{ reg(c.dst), nativeName(m, c.native), c.native.int() });
+            try argRun(w, c.args, c.n_args);
+            try w.writeAll("        [DIRECT]");
+        },
+        .RCallValue => |c| {
+            try w.print("r{d} <- CallValue r{d} ", .{ reg(c.dst), reg(c.callee) });
+            try argRun(w, c.args, c.n_args);
+        },
+        .RNewInstance => |c| {
+            try w.print("r{d} <- NewInstance {s}#{d} ctor {s}#{d} ", .{ reg(c.dst), className(m, c.class), c.class.int(), funcName(m, c.ctor), c.ctor.int() });
+            try argRun(w, c.args, c.n_args);
+            try w.writeAll("        [DIRECT]");
+        },
+        .GetFieldSlot => |c| try w.print("r{d} <- GetFieldSlot r{d}.#{d}", .{ reg(c.dst), reg(c.obj), c.slot }),
+        .SetFieldSlot => |c| try w.print("SetFieldSlot r{d}.#{d} <- r{d}", .{ reg(c.obj), c.slot, reg(c.value) }),
+        .LoadStatic => |c| try w.print("r{d} <- LoadStatic {s}#{d}", .{ reg(c.dst), staticName(m, c.static), c.static.int() }),
+        .StoreStatic => |c| try w.print("StoreStatic {s}#{d} <- r{d}", .{ staticName(m, c.static), c.static.int(), reg(c.value) }),
+        .LoadObject => |c| try w.print("r{d} <- LoadObject {s}#{d}", .{ reg(c.dst), className(m, c.class), c.class.int() }),
+        .MakeClosure => |c| {
+            try w.print("r{d} <- MakeClosure {s}#{d} captures=", .{ reg(c.dst), funcName(m, c.func), c.func.int() });
+            try regList(w, c.captures);
+        },
+        .FunctionRef => |c| {
+            try w.print("r{d} <- FunctionRef {s}#{d} adapter {s}#{d}", .{ reg(c.dst), funcName(m, c.target), c.target.int(), funcName(m, c.adapter), c.adapter.int() });
+            if (c.bound) |b| try w.print(" bound=r{d}", .{reg(b)});
+        },
+        .RPropertyRef => |c| {
+            try w.print("r{d} <- PropertyRef '{s}' get {s}#{d}", .{ reg(c.dst), constStr(m, c.name), funcName(m, c.getter), c.getter.int() });
+            if (c.setter != ir.NO_FUNC) try w.print(" set {s}#{d}", .{ funcName(m, ir.FuncId.from(c.setter)), c.setter });
+            if (c.bound) |b| try w.print(" bound=r{d}", .{reg(b)});
+        },
+        .ClassLiteral => |c| try w.print("r{d} <- ClassLiteral {s}#{d}", .{ reg(c.dst), className(m, c.class), c.class.int() }),
+        .ClassOf => |c| try w.print("r{d} <- ClassOf r{d}", .{ reg(c.dst), reg(c.src) }),
+        .RInstanceOf => |c| try w.print("r{d} <- InstanceOf r{d} is {s}#{d}{s}", .{ reg(c.dst), reg(c.src), className(m, c.class), c.class.int(), nullMark(c.nullable) }),
+        .RCast => |c| try w.print("r{d} <- Cast r{d} as{s} {s}#{d}{s}", .{ reg(c.dst), reg(c.src), nullMark(c.safe), className(m, c.class), c.class.int(), nullMark(c.nullable) }),
+        .InstanceOfDyn => |c| try w.print("r{d} <- InstanceOfDyn r{d} is r{d}{s}", .{ reg(c.dst), reg(c.src), reg(c.ty), nullMark(c.nullable) }),
+        .CastDyn => |c| try w.print("r{d} <- CastDyn r{d} as{s} r{d}{s}", .{ reg(c.dst), reg(c.src), nullMark(c.safe), reg(c.ty), nullMark(c.nullable) }),
+        .ArrayGet => |c| try w.print("r{d} <- ArrayGet r{d}[r{d}]", .{ reg(c.dst), reg(c.array), reg(c.index) }),
+        .ArraySet => |c| try w.print("ArraySet r{d}[r{d}] <- r{d}", .{ reg(c.array), reg(c.index), reg(c.value) }),
+        .NewArray => |c| {
+            try w.print("r{d} <- NewArray {s}#{d} ", .{ reg(c.dst), className(m, c.class), c.class.int() });
+            try argRun(w, c.args, c.n_args);
+        },
+        else => return false,
+    }
+    return true;
+}
+
 fn argRun(w: *std.Io.Writer, args: ir.Reg, n: u32) !void {
     if (n == 0) {
         try w.writeAll("()");
@@ -93,6 +193,10 @@ fn argRun(w: *std.Io.Writer, args: ir.Reg, n: u32) !void {
 
 fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tally) !void {
     if (classify(inst)) |k| tally.add(k);
+    if (try dumpResolved(w, m, inst)) {
+        try w.writeAll("\n");
+        return;
+    }
     switch (inst.*) {
         .Const => |c| {
             try w.print("r{d} <- Const c{d} ({s}", .{ reg(c.dst), c.value.int(), constLabel(m, c.value) });
@@ -242,17 +346,6 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .NotNullAssert => |c| try w.print("r{d} <- NotNullAssert r{d}", .{ reg(c.dst), reg(c.src) }),
         .LateinitCheck => |c| try w.print("r{d} <- LateinitCheck r{d} '{s}'", .{ reg(c.dst), reg(c.src), constStr(m, c.name) }),
         .Lambda => |c| try w.print("r{d} <- Lambda {s}#{d}", .{ reg(c.dst), funcName(m, c.body_func), c.body_func.int() }),
-        .AstLambda => |c| {
-            try w.print(
-                "r{d} <- AstLambda {s}#{d} captures={d}",
-                .{ reg(c.dst), if (c.body_func) |fid| funcName(m, fid) else "<deferred>", if (c.body_func) |fid| fid.int() else 0, c.captured_names.len },
-            );
-            // Register paired with name, so a wrong `this` capture is visible.
-            for (c.captures, 0..) |cr, i| {
-                try w.print("{s}r{d}:{s}", .{ if (i == 0) " [" else ", ", reg(cr), if (i < c.captured_names.len) c.captured_names[i] else "?" });
-            }
-            if (c.captures.len != 0) try w.writeAll("]");
-        },
         else => try w.print("{s}", .{@tagName(inst.*)}),
     }
     try w.writeAll("\n");
@@ -336,6 +429,11 @@ pub fn dumpModule(w: *std.Io.Writer, m: *const Module, opts: Options) !void {
             try dumpFunc(w, m, f, &mod_tally);
             dumped += 1;
         }
+    } else if (opts.program_from) |from| {
+        for (m.funcs.items[@min(from, m.funcs.items.len)..]) |*f| {
+            try dumpFunc(w, m, f, &mod_tally);
+            dumped += 1;
+        }
     } else {
         // `buildModuleFiles` links the whole stdlib and any gated packs into one
         // module, so the default set is the user script: no package header, no
@@ -354,4 +452,37 @@ pub fn dumpModule(w: *std.Io.Writer, m: *const Module, opts: Options) !void {
     try w.print("module rollup: {d} functions, {d} direct, {d} virtual, {d} dynamic ({d} bound, {d} unbound)\n", .{
         dumped, mod_tally.direct, mod_tally.virtual, mod_tally.dyn_bound + mod_tally.dyn_unbound, mod_tally.dyn_bound, mod_tally.dyn_unbound,
     });
+}
+
+test "a program's functions are the default set when they follow a base" {
+    const hand = ir.eval.hand;
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try hand.Hand.init(a);
+    _ = try hand.dispatch(&h);
+    const n = h.m.funcs.items.len;
+    try std.testing.expect(n > 2);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try dumpModule(&aw.writer, h.m, .{ .program_from = @intCast(n - 2) });
+    const out = aw.written();
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "func #"));
+    const first = try std.fmt.allocPrint(a, "func #{d} ", .{n - 2});
+    try std.testing.expect(std.mem.startsWith(u8, out, first));
+    try std.testing.expect(std.mem.find(u8, out, "module rollup: 2 functions") != null);
+}
+
+test "the instructions lowered from sema print their ids beside display names" {
+    const hand = ir.eval.hand;
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try hand.Hand.init(a);
+    _ = try hand.dispatch(&h);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try dumpModule(&aw.writer, h.m, .{ .func_filter = "main" });
+    const out = aw.written();
+    try std.testing.expect(std.mem.find(u8, out, "r0 <- NewInstance Base#0 ctor <init>#0 ()        [DIRECT]") != null);
+    try std.testing.expect(std.mem.find(u8, out, "r5 <- CallVirtual slot Base.name#1 (r0..+1)        [VIRTUAL]") != null);
+    try std.testing.expect(std.mem.find(u8, out, "r8 <- CallInterface C#5 slot A.v#4 (r3..+1)        [VIRTUAL]") != null);
 }

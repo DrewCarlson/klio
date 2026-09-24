@@ -1,15 +1,14 @@
-//! Bare-call resolution. An unqualified call whose candidate set holds two
-//! same-package same-arity functions with identical full parameter signatures
-//! is rejected at lowering as conflicting overloads naming both sites; a
-//! cross-package tie reports as an ambiguous reference the caller can qualify.
+//! Bare-call resolution. Two functions of one package with one signature are
+//! conflicting overloads, reported at each declaration with the other's
+//! location, and a call to them is ambiguous; a cross-package tie reports as
+//! an ambiguous reference the caller can qualify.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 
 const TMP_DIR = "/tmp/klio_itest_resolve_ambiguity";
 
-// A file-scoped arena backs every run: the pipeline installs process-global
-// state owned by the run's allocator, so the test allocator is never used.
+// One arena for the file's runs, reset per program.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 const RunResult = union(enum) {
@@ -41,7 +40,7 @@ fn runKlioFiles(name: []const u8, srcs: []const []const u8) !RunResult {
         try paths.append(a, path);
     }
 
-    return switch (try parity.runFilesWithPacks(a, io, paths.items)) {
+    return switch (try klio_child.runFiles(a, paths.items)) {
         .ok => |got| .{ .ok = got },
         .err => |m| .{ .err = m },
     };
@@ -82,8 +81,8 @@ fn expectOutput(name: []const u8, src: []const u8, expected: []const u8) !void {
     }
 }
 
-/// Assert the program is rejected at lowering with exactly this diagnostic.
-/// `expected_fmt` takes the program's on-disk path once per `{s}` placeholder.
+/// Assert the program is rejected before it runs with exactly these
+/// diagnostics. `%PATH%` in `expected_fmt` stands for the program's path.
 fn expectExactErr(name: []const u8, src: []const u8, comptime expected_fmt: []const u8) !void {
     const a = file_arena.allocator();
     switch (try runKlio(name, src)) {
@@ -119,10 +118,19 @@ test "two same-package same-signature funcs are conflicting overloads" {
         \\fun main() { println(greet("k")) }
         \\
     ;
-    try expectExactErr(
-        "same_sig_same_pkg",
-        src,
-        "%PATH%:4: error: conflicting overloads of `greet`: identical signatures declared at %PATH%:2 and %PATH%:3 — rename or remove one of the declarations",
+    try expectExactErr("same_sig_same_pkg", src,
+        \\%PATH%:2:5: error: conflicting overloads: `greet(String)` is declared twice
+        \\fun greet(who: String): String = "hi " + who
+        \\    ^^^^^
+        \\    %PATH%:3:5: also declared here
+        \\%PATH%:3:5: error: conflicting overloads: `greet(String)` is declared twice
+        \\fun greet(name: String): String = "yo " + name
+        \\    ^^^^^
+        \\    %PATH%:2:5: also declared here
+        \\%PATH%:4:22: error: `greet` is ambiguous: `fun greet(who: String): String`, `fun greet(name: String): String`
+        \\fun main() { println(greet("k")) }
+        \\                     ^^^^^
+        \\
     );
 }
 
@@ -133,10 +141,19 @@ test "two same-signature funcs in the default package conflict" {
         \\fun main() { println(pick(1)) }
         \\
     ;
-    try expectExactErr(
-        "same_sig_default_pkg",
-        src,
-        "%PATH%:3: error: conflicting overloads of `pick`: identical signatures declared at %PATH%:1 and %PATH%:2 — rename or remove one of the declarations",
+    try expectExactErr("same_sig_default_pkg", src,
+        \\%PATH%:1:5: error: conflicting overloads: `pick(Int)` is declared twice
+        \\fun pick(n: Int): Int = n + 1
+        \\    ^^^^
+        \\    %PATH%:2:5: also declared here
+        \\%PATH%:2:5: error: conflicting overloads: `pick(Int)` is declared twice
+        \\fun pick(m: Int): Int = m + 2
+        \\    ^^^^
+        \\    %PATH%:1:5: also declared here
+        \\%PATH%:3:22: error: `pick` is ambiguous: `fun pick(n: Int): Int`, `fun pick(m: Int): Int`
+        \\fun main() { println(pick(1)) }
+        \\                     ^^^^
+        \\
     );
 }
 
@@ -147,10 +164,19 @@ test "the conflicting-overloads diagnostic fires for a forward reference too" {
         \\fun tag(b: Int): String = "b" + b
         \\
     ;
-    try expectExactErr(
-        "same_sig_forward",
-        src,
-        "%PATH%:1: error: conflicting overloads of `tag`: identical signatures declared at %PATH%:2 and %PATH%:3 — rename or remove one of the declarations",
+    try expectExactErr("same_sig_forward", src,
+        \\%PATH%:2:5: error: conflicting overloads: `tag(Int)` is declared twice
+        \\fun tag(a: Int): String = "a" + a
+        \\    ^^^
+        \\    %PATH%:3:5: also declared here
+        \\%PATH%:3:5: error: conflicting overloads: `tag(Int)` is declared twice
+        \\fun tag(b: Int): String = "b" + b
+        \\    ^^^
+        \\    %PATH%:2:5: also declared here
+        \\%PATH%:1:22: error: `tag` is ambiguous: `fun tag(a: Int): String`, `fun tag(b: Int): String`
+        \\fun main() { println(tag(7)) }
+        \\                     ^^^
+        \\
     );
 }
 
@@ -228,11 +254,8 @@ test "exact-arity overload outranks a reified vararg inline sibling" {
 
 test "a named import outranks a same-package reified inline namesake, and strict mode accepts it" {
     // kotlinc: the explicit `import lib2.greet` outranks the caller's
-    // own-package declaration, and the audit grades the suppressed splice as a
-    // tier correction rather than a divergence.
-    const ir = @import("ir");
-    ir.lower.expr.setResolveStrictForTest(true);
-    defer ir.lower.expr.resetResolveStrictForTest();
+    // own-package declaration. Resolution is strict: a reference it cannot
+    // bind fails the program.
     const lib2 =
         \\package lib2
         \\fun greet(): String = "lib-noninline"
@@ -281,9 +304,10 @@ test "expect/actual top-level pair binds the actual body" {
     try expectOutput("expect_actual_toplevel", src, "klio\nhello, expect/actual\n42\n");
 }
 
-test "an expect decl over an embedded intrinsic is dropped at build and the call binds the intrinsic" {
-    // `retainDecl` drops an `expect` whose `kotlin.{name}` FQN is an embedded
-    // intrinsic, so the declaration never reaches the VM.
+test "an expect of the program no actual implements is reported, even over a library function" {
+    // kotlinc 2.4.20 -Xmulti-platform: "the 'expect' declaration 'intArrayOf'
+    // has no 'actual' declaration in module '<main> for JVM'". The library's
+    // `kotlin.intArrayOf` is another package's and another module's.
     const src =
         \\expect fun intArrayOf(vararg elements: Int): IntArray
         \\fun main() {
@@ -293,7 +317,12 @@ test "an expect decl over an embedded intrinsic is dropped at build and the call
         \\}
         \\
     ;
-    try expectOutput("expect_native_backed", src, "3\n5\n");
+    try expectExactErr("expect_no_actual_over_library", src,
+        \\%PATH%:1:12: error: `intArrayOf` is an `expect` with no `actual`
+        \\expect fun intArrayOf(vararg elements: Int): IntArray
+        \\           ^^^^^^^^^^
+        \\
+    );
 }
 
 test "default-param twins conflict in either declaration order" {
@@ -310,15 +339,33 @@ test "default-param twins conflict in either declaration order" {
         \\fun g(a: Int, b: Int = 1): Int = a + b
         \\
     ;
-    try expectExactErr(
-        "default_twins_decls_first",
-        decls_first,
-        "%PATH%:3: error: conflicting overloads of `g`: identical signatures declared at %PATH%:1 and %PATH%:2 — rename or remove one of the declarations",
+    try expectExactErr("default_twins_decls_first", decls_first,
+        \\%PATH%:1:5: error: conflicting overloads: `g(Int, Int)` is declared twice
+        \\fun g(x: Int, y: Int = 0): Int = x + y
+        \\    ^
+        \\    %PATH%:2:5: also declared here
+        \\%PATH%:2:5: error: conflicting overloads: `g(Int, Int)` is declared twice
+        \\fun g(a: Int, b: Int = 1): Int = a + b
+        \\    ^
+        \\    %PATH%:1:5: also declared here
+        \\%PATH%:3:22: error: `g` is ambiguous: `fun g(x: Int, y: Int): Int`, `fun g(a: Int, b: Int): Int`
+        \\fun main() { println(g(1, 2)) }
+        \\                     ^
+        \\
     );
-    try expectExactErr(
-        "default_twins_decls_last",
-        decls_last,
-        "%PATH%:1: error: conflicting overloads of `g`: identical signatures declared at %PATH%:2 and %PATH%:3 — rename or remove one of the declarations",
+    try expectExactErr("default_twins_decls_last", decls_last,
+        \\%PATH%:2:5: error: conflicting overloads: `g(Int, Int)` is declared twice
+        \\fun g(x: Int, y: Int = 0): Int = x + y
+        \\    ^
+        \\    %PATH%:3:5: also declared here
+        \\%PATH%:3:5: error: conflicting overloads: `g(Int, Int)` is declared twice
+        \\fun g(a: Int, b: Int = 1): Int = a + b
+        \\    ^
+        \\    %PATH%:2:5: also declared here
+        \\%PATH%:1:22: error: `g` is ambiguous: `fun g(x: Int, y: Int): Int`, `fun g(a: Int, b: Int): Int`
+        \\fun main() { println(g(1, 2)) }
+        \\                     ^
+        \\
     );
 }
 

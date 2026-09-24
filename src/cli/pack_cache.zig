@@ -47,6 +47,9 @@ pub const RequestedFeatures = std.StringHashMap(std.StringHashMap(void));
 pub const LoadedPacks = struct {
     asts: []const KotlinFile,
     bindings: HostBindings,
+    /// Parallel to `asts`: the library each file came from, `stdlib` for
+    /// the embedded stdlib's. Empty when nothing loaded from the cache.
+    lib_ids: []const []const u8 = &.{},
 };
 
 /// What the embedded-stdlib source load did. Strings owned by the loader.
@@ -124,6 +127,9 @@ pub const LoadOptions = struct {
     /// line are that library, and loading the installed copy as well would
     /// declare every one of its declarations twice.
     exclude_lib_ids: []const []const u8 = &.{},
+    /// Every installed pack with every feature, whatever the imports: what
+    /// ships, as a census measures it.
+    all: bool = false,
 };
 
 /// `ok` is an owned path, `err` an owned message; the caller frees whichever is set.
@@ -548,6 +554,26 @@ const ParsePool = struct {
         return jobs[x].src.len > jobs[y].src.len;
     }
 };
+
+/// Parses the files registered at `fids` in `map` as a pack's sources parse
+/// when the pack loads into a run's arena: lexed, parsed whole, one after
+/// another, and alias-expanded. By position, null for a file that does not
+/// parse, which the loader skips.
+pub fn parsePackSources(allocator: Allocator, map: *const SourceMap, fids: []const span.FileId) Allocator.Error![]?KotlinFile {
+    var jobs: std.ArrayList(ParseJob) = .empty;
+    defer jobs.deinit(allocator);
+    for (fids) |fid| {
+        const sf = map.get(fid);
+        try jobs.append(allocator, .{ .fid = fid, .src = sf.source, .rel_path = sf.path });
+    }
+    _ = runParseJobsOn(allocator, &jobs, 1);
+    const out = try allocator.alloc(?KotlinFile, fids.len);
+    for (jobs.items[0..fids.len], out) |job, *o| o.* = switch (job.result) {
+        .ok => |f| f,
+        else => null,
+    };
+    return out;
+}
 
 /// Lex and parse every job, fanning out over a pool when the allocator can
 /// serve one; the calling thread drains alongside. Returns the thread count.
@@ -1519,6 +1545,8 @@ fn loadInstalledPacksImpl(
 ) Allocator.Error!LoadedPacks {
     var out_asts: std.ArrayList(KotlinFile) = .empty;
     errdefer out_asts.deinit(gpa);
+    var out_libs: std.ArrayList([]const u8) = .empty;
+    errdefer out_libs.deinit(gpa);
     var out_bindings = mergedHostBindingsInit(gpa);
     errdefer out_bindings.deinit();
 
@@ -1591,6 +1619,16 @@ fn loadInstalledPacksImpl(
     // Feature requests accumulate across passes: the CLI seed plus pack deps.
     var feature_reqs = try cloneRequestedFeatures(gpa, requested_features);
     defer deinitRequestedFeatures(&feature_reqs);
+    if (opts.all) for (candidates) |*c| {
+        const lib_id = c.manifest.library_id;
+        const dup = try gpa.dupe(u8, lib_id);
+        const gop = try known_prefixes.getOrPut(dup);
+        if (gop.found_existing) gpa.free(dup) else gop.value_ptr.* = {};
+        const names = try gpa.alloc([]const u8, c.manifest.features.len);
+        defer gpa.free(names);
+        for (c.manifest.features, names) |f, *n| n.* = f.name;
+        try addFeatureSlice(gpa, &feature_reqs, lib_id, names);
+    };
 
     var feature_hints: std.ArrayList(FeatureHint) = .empty;
     defer {
@@ -1749,6 +1787,10 @@ fn loadInstalledPacksImpl(
                 &new_imports,
                 opts.asts_needed,
             );
+            if (out_libs.items.len < out_asts.items.len) {
+                const owned = try gpa.dupe(u8, lib_id);
+                while (out_libs.items.len < out_asts.items.len) try out_libs.append(gpa, owned);
+            }
         }
         if (!progressed) break;
         for (new_imports.items) |imp| {
@@ -1831,7 +1873,8 @@ fn loadInstalledPacksImpl(
         );
     }
 
-    return .{ .asts = try out_asts.toOwnedSlice(gpa), .bindings = out_bindings };
+    while (out_libs.items.len < out_asts.items.len) try out_libs.append(gpa, "stdlib");
+    return .{ .asts = try out_asts.toOwnedSlice(gpa), .bindings = out_bindings, .lib_ids = try out_libs.toOwnedSlice(gpa) };
 }
 
 /// Deep-copy a `RequestedFeatures`. Free with `deinitRequestedFeatures`.

@@ -41,7 +41,7 @@ pub const FUSED_YIELD_BACK_EDGES: u32 = 128;
 /// somewhere (consult the per-thread state), bit 31 means DECLINED and is sticky, so a
 /// never-compiled body stops walking the state map on every activation.
 const PROBE_COMPILED: u32 = 1 << 30;
-const PROBE_DECLINED: u32 = 1 << 31;
+pub const PROBE_DECLINED: u32 = 1 << 31;
 const PROBE_COUNT_MASK: u32 = PROBE_COMPILED - 1;
 
 inline fn probeWord(func: *const Func) *std.atomic.Value(u32) {

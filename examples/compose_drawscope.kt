@@ -10,6 +10,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.klioRenderToPng
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 
 fun main() {
     val drew = klioRenderToPng(200, 160, density = 1f, path = "/tmp/klio_compose_drawscope.png") {

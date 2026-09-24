@@ -93,6 +93,9 @@ pub const Parser = struct {
     in_accessor_body: bool,
     /// Set when any annotation named `Composable` is parsed.
     saw_composable: bool = false,
+    /// The first `NodeId` the file's numbering hands out; a snippet spliced
+    /// into another file continues from that file's `node_count`.
+    first_node_id: u32 = 1,
     /// Per token: inside an unclosed `(` or `[`, but not `{`, where Kotlin
     /// treats newlines as soft. Precomputed for O(1) lookup; allocated from
     /// `allocator`.
@@ -174,6 +177,7 @@ pub const ClassModifiers = struct {
     is_annotation: bool = false,
     is_expect: bool = false,
     is_actual: bool = false,
+    is_external: bool = false,
 };
 
 pub const ModifierFlags = struct {
@@ -197,6 +201,7 @@ pub const ModifierFlags = struct {
     is_suspend: bool = false,
     is_expect: bool = false,
     is_actual: bool = false,
+    is_external: bool = false,
     /// Set when the modifier was consumed, so a rejection on a constructor or
     /// accessor can point at it.
     suspend_span: ?span.Span = null,
@@ -1108,7 +1113,7 @@ test "generic_call_with_labeled_trailing_lambda" {
     // `val r = <Call>`: the initializer is a Call, not a comparison Binary.
     const init = stmts[0].Decl.Property.init.?;
     try testing.expect(init.* == .Call);
-    try testing.expect(init.Call.type_args.len == 1);
+    try testing.expect(init.Call.typeArgs().len == 1);
 }
 
 test "const_val_flag_captured" {
@@ -1269,6 +1274,18 @@ test "delegation_supertype_parsed" {
     try testing.expect(c.supertype_delegates[0].? == .Path);
 }
 
+test "delegation_by_on_the_next_line" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), "interface G { fun g(): String }\nval impl = object : G { override fun g() = \"hi\" }\nobject D : G\nby impl\nfun main() = println(D.g())\n");
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const d = out.file.decls[2].Object;
+    try testing.expectEqual(@as(usize, 1), d.supertype_delegates.len);
+    try testing.expect(d.supertype_delegates[0].? == .Path);
+    try testing.expectEqual(@as(usize, 4), out.file.decls.len);
+}
+
 test "delegation_with_class_body_not_consumed_as_lambda" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1387,6 +1404,20 @@ test "annotated_lambda_literal_keeps_its_annotations" {
     );
     try testing.expect(!out.parser.diagnostics.hasErrors());
     const lam = out.file.decls[0].Property.init.?.Lambda;
+    try testing.expectEqual(@as(usize, 1), lam.annotations.len);
+    try testing.expectEqualStrings("Composable", lam.annotations[0].path[lam.annotations[0].path.len - 1].name);
+}
+
+test "annotated_lambda_literal_as_expression_body_keeps_its_annotations" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(
+        arena.allocator(),
+        "fun content() = @Composable { x() }\n",
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const lam = out.file.decls[0].Function.body.?.Expr.Lambda;
     try testing.expectEqual(@as(usize, 1), lam.annotations.len);
     try testing.expectEqualStrings("Composable", lam.annotations[0].path[lam.annotations[0].path.len - 1].name);
 }
@@ -1834,4 +1865,183 @@ test "annotation on a receiver function type annotates the function type" {
     try testing.expectEqual(@as(usize, 0), recv.x().annotations.len);
     try testing.expectEqualStrings("Int", recv.name.name);
     try testing.expectEqual(@as(usize, 1), ty.function.?.params.len);
+}
+
+const ids_program =
+    \\@Target(AnnotationTarget.FUNCTION) annotation class Marker(val n: Int = 1)
+    \\
+    \\class Box<T>(val value: T) : Comparable<Box<T>> {
+    \\    init { println(value) }
+    \\    constructor(a: Int, b: Int) : this(a as T)
+    \\    override fun compareTo(other: Box<T>): Int = 0
+    \\    override fun toString() = super.toString()
+    \\    var size: Int = 0
+    \\        get() = field + 1
+    \\        set(v) { field = v }
+    \\    companion object { const val K = 3 }
+    \\}
+    \\
+    \\enum class Color(val rgb: Int) { RED(1), GREEN(2) { override fun toString() = "g" }, BLUE(3) }
+    \\
+    \\val <T : @Suppress("bound") Any> T.tag: @Suppress("type") String get() = "t"
+    \\
+    \\@Marker(2)
+    \\fun main(args: Array<String>) {
+    \\    val xs = listOf(1, 2, 3)
+    \\    var total = 0
+    \\    total += 1
+    \\    for (x in xs) total += x
+    \\    val (a, b) = Pair(1, "two")
+    \\    val s = "a=$a b=${b.length}"
+    \\    val f = { y: Int -> y * 2 }
+    \\    val g = fun(z: Int): Int { return z + 1 }
+    \\    val o = object : Runnable { override fun run() {} }
+    \\    try { check(total > 0) } catch (e: IllegalStateException) { throw e } finally { println("done") }
+    \\    when (val c = xs.size) {
+    \\        1, 2 -> println(c)
+    \\        in 3..5 -> println("mid")
+    \\        is Int -> {}
+    \\        else -> {}
+    \\    }
+    \\    val r = xs.map(Box<Int>::value)
+    \\    loop@ while (total < 100) {
+    \\        total *= 2
+    \\        if (total > 50) break@loop else continue@loop
+    \\    }
+    \\    do { total-- } while (total > 0)
+    \\    val t = xs[0] as? Int ?: 0
+    \\    println(-t, !true, t!!, s, f(1), g(2), o, r, 'c', 1.5, null, 1 shl 2, *arrayOf(1), ::main)
+    \\}
+    \\
+;
+
+fn exprHolder(holder: []const u8) bool {
+    return std.mem.startsWith(u8, holder, "ast.Expr") or std.mem.endsWith(u8, holder, "Expr") or
+        std.mem.eql(u8, holder, "ast.ObjectLiteral") or std.mem.eql(u8, holder, "ast.Block") or
+        std.mem.eql(u8, holder, "ast.StringPart.ShortInterp");
+}
+
+test "node ids: dense from 1, unique, and in source order" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), ids_program);
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const kf = out.file;
+    try testing.expect(try ast.checkIds(testing.allocator, &kf, .{ .require_all = true }) == null);
+
+    const entries = try ast.node_ids.collect(testing.allocator, &kf);
+    defer testing.allocator.free(entries);
+    std.mem.sort(ast.node_ids.Entry, entries, {}, struct {
+        fn lt(_: void, x: ast.node_ids.Entry, y: ast.node_ids.Entry) bool {
+            return x.id.int() < y.id.int();
+        }
+    }.lt);
+    for (entries, 1..) |e, want| try testing.expectEqual(@as(u32, @intCast(want)), e.id.int());
+    try testing.expectEqual(@as(u32, @intCast(entries.len + 1)), kf.node_count);
+
+    // A node before its children, siblings as written: expression starts
+    // never go backwards in id order.
+    var last: u32 = 0;
+    for (entries) |e| {
+        if (!exprHolder(e.holder)) continue;
+        const start = e.span.?.start;
+        if (start < last) {
+            std.debug.print("id {d} ({s}) starts at {d}, before {d}\n", .{ e.id.int(), e.holder, start, last });
+            return error.TestUnexpectedResult;
+        }
+        last = start;
+    }
+}
+
+test "node ids: statements, local declarations, catches and template names carry one" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), ids_program);
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const main_fn = out.file.decls[out.file.decls.len - 1].Function;
+    const tag = out.file.decls[3].Property;
+    try testing.expect(tag.id != .none and tag.getter.?.id != .none);
+    try testing.expect(main_fn.id != .none);
+    for (main_fn.params) |p| try testing.expect(p.id != .none);
+    var saw = struct { local: bool = false, destructuring: bool = false, assign: bool = false, catch_: bool = false, short: bool = false }{};
+    for (main_fn.body.?.Block.stmts) |st| switch (st) {
+        .Decl => |d| if (d.* == .Property) {
+            try testing.expect(d.Property.id != .none);
+            saw.local = true;
+            if (d.Property.init) |ini| if (ini.* == .StringTemplate) {
+                for (ini.StringTemplate.parts) |part| if (part == .ShortInterp) {
+                    try testing.expect(part.ShortInterp.id != .none);
+                    saw.short = true;
+                };
+            };
+        },
+        .DestructuringDecl => |dd| {
+            try testing.expect(dd.id != .none);
+            saw.destructuring = true;
+        },
+        .Assign => |as| {
+            try testing.expect(as.id != .none);
+            saw.assign = true;
+        },
+        .Expr => |e| {
+            try testing.expect(e.id() != .none);
+            if (e == .Try) for (e.Try.catches) |c| {
+                try testing.expect(c.id != .none);
+                saw.catch_ = true;
+            };
+        },
+    };
+    try testing.expect(saw.local and saw.destructuring and saw.assign and saw.catch_ and saw.short);
+
+    // Class members, accessors, constructors and enum entries.
+    const box = out.file.decls[1].Class;
+    try testing.expect(box.id != .none);
+    for (box.primary_params) |cp| try testing.expect(cp.id != .none);
+    for (box.x().secondary_ctors) |sc| try testing.expect(sc.id != .none);
+    for (box.x().init_blocks) |ib| try testing.expect(ib.id != .none);
+    const color = out.file.decls[2].Class;
+    for (color.x().enum_entries) |entry| try testing.expect(entry.id != .none);
+    var saw_accessor = false;
+    for (box.members) |m| if (m == .Property) if (m.Property.getter) |g| {
+        try testing.expect(g.id != .none);
+        saw_accessor = true;
+    };
+    try testing.expect(saw_accessor);
+}
+
+test "node ids: a snippet continues from the id it is given" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "fun f() = 1\n";
+    const id = span.FileId.from(0);
+    var lx = try lexer.Lexer.init(a, id, src);
+    const lexed = try lx.tokenize();
+    const p = Parser.new(a, id, src, lexed.tokens, lexed.strings);
+    p.first_node_id = 40;
+    const kf = p.parseFile();
+    try testing.expectEqual(ast.NodeId.from(40), kf.decls[0].Function.id);
+    try testing.expectEqual(ast.NodeId.from(41), kf.decls[0].Function.body.?.Expr.id());
+    try testing.expectEqual(@as(u32, 42), kf.node_count);
+}
+
+test "a line opening with a bracket destructures; val on both levels is refused" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const good = try parse(arena.allocator(),
+        \\fun main() {
+        \\    val p = P(1, 2)
+        \\    [val a, val b] = p
+        \\}
+    );
+    try testing.expect(!good.parser.diagnostics.hasErrors());
+    const body = good.file.decls[0].Function.body.?.Block.stmts;
+    try testing.expectEqual(@as(usize, 2), body.len);
+    try testing.expect(body[1] == .DestructuringDecl);
+    const bad = try parse(arena.allocator(), "fun main() {\n    val [val a, val b] = p\n}\n");
+    try testing.expect(bad.parser.diagnostics.hasErrors());
 }

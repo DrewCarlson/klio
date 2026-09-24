@@ -9,6 +9,7 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 
 const vmhost = @import("vmhost.zig");
+const host_resolved = @import("host_resolved.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -108,6 +109,7 @@ pub fn currentTls() *FieldsTls {
 const ResolvePair = struct { id: usize, name: []const u8 };
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+    if (try host_resolved.wellKnownCall(self, allocator, receiver, name, &.{}, .getter)) |r| return r;
     return lexicalReceiverFallback(self, allocator, receiver, name, unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false, false)));
 }
 

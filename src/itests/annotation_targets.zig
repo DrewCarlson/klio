@@ -1,23 +1,21 @@
 //! Annotation use-site targeting: the acceptance matrix for the `@all:`
 //! property meta-target, and the defaulting rule for target-less property
 //! annotations under language version 2.4. Diagnostic rows assert the
-//! compiler-named diagnostic; placement rows assert the per-anchor annotation
-//! records the runtime class metadata exposes to reflective consumers.
+//! compiler-named diagnostic, accepted rows that the checker reports no
+//! error. Which anchors each row places on is the placement rule's, tested in
+//! `ast/annotation_targets.zig`.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 const lexer = @import("lexer");
 const parser = @import("parser");
 const resolver = @import("resolver");
 const typeck = @import("typeck");
-const interp_ir = @import("interp_ir");
-const runtime = @import("runtime");
 const span = @import("span");
 const diagnostics = @import("diagnostics");
 
 const FileId = span.FileId;
 const Diagnostic = diagnostics.Diagnostic;
-const PropertyAnchors = runtime.PropertyAnchors;
 
 const TMP_DIR = "/tmp/klio_itest_annotation_targets";
 
@@ -104,68 +102,13 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    const res = try parity.runWithPacks(a, io, path);
+    const res = try klio_child.runFile(a, path);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {
             std.debug.print("klio run failed for `{s}`: {s}\n", .{ name, m });
             return error.KlioRunFailed;
         },
-    }
-}
-
-const Lowered = struct {
-    built: interp_ir.build.BuiltModule,
-
-    fn ctorAnchors(self: *const Lowered, class_name: []const u8, prop: []const u8) !PropertyAnchors {
-        const def = self.built.classes.get(class_name) orelse return error.ClassNotFound;
-        const cd = def.asPtr();
-        for (cd.primary_params) |*p| {
-            if (std.mem.eql(u8, p.name, prop)) return p.anchors;
-        }
-        return error.PropertyNotFound;
-    }
-
-    fn bodyAnchors(self: *const Lowered, class_name: []const u8, prop: []const u8) !PropertyAnchors {
-        const def = self.built.classes.get(class_name) orelse return error.ClassNotFound;
-        const cd = def.asPtr();
-        for (cd.body_properties) |*p| {
-            if (std.mem.eql(u8, p.name, prop)) return p.anchors;
-        }
-        return error.PropertyNotFound;
-    }
-};
-
-/// Lower `src`, tolerating parser diagnostics so the bracket-error row runs.
-fn lower(a: std.mem.Allocator, src: []const u8) !Lowered {
-    var lx = try lexer.Lexer.init(a, FileId.from(0), src);
-    const lexed = try lx.tokenize();
-    const p = parser.Parser.new(a, FileId.from(0), src, lexed.tokens, lexed.strings);
-    const kf = p.parseFile();
-    const built = try interp_ir.build.buildModule(a, &kf);
-    return .{ .built = built };
-}
-
-fn hasRecord(records: []const runtime.AnnotationRecord, name: []const u8) bool {
-    for (records) |*rec| {
-        if (rec.is(name)) return true;
-    }
-    return false;
-}
-
-/// Assert `name` is present on every anchor in `expect` and absent elsewhere.
-fn assertPlacement(anchors: PropertyAnchors, name: []const u8, expect: []const []const u8) !void {
-    const anchor_fields = [_][]const u8{ "param", "property", "field", "get", "set", "setparam", "delegate" };
-    inline for (anchor_fields) |fname| {
-        const got = hasRecord(@field(anchors, fname), name);
-        var want = false;
-        for (expect) |e| {
-            if (std.mem.eql(u8, e, fname)) want = true;
-        }
-        if (got != want) {
-            std.debug.print("anchor `{s}`: expected {}, got {} for @{s}\n", .{ fname, want, got, name });
-            return error.WrongPlacement;
-        }
     }
 }
 
@@ -176,8 +119,6 @@ test "a01_all_on_ctor_val" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_A, "class U(@all:Wide val e: String)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("U", "e"), "Wide", &.{ "param", "property", "field", "get" });
 }
 
 // On a `var`, VALUE_PARAMETER also covers the setter parameter.
@@ -186,8 +127,6 @@ test "a02_all_on_ctor_var" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_A, "class U(@all:Wide var e: String)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("U", "e"), "Wide", &.{ "param", "property", "field", "get", "setparam" });
 }
 
 test "a03_all_on_member_property" {
@@ -195,8 +134,6 @@ test "a03_all_on_member_property" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_A, "class U { @all:Wide val e: String = \"x\" }\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.bodyAnchors("U", "e"), "Wide", &.{ "property", "field", "get" });
 }
 
 // With no backing field only `get` receives the annotation; `field` is
@@ -206,8 +143,6 @@ test "a04_all_getter_only_no_backing_field" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_A, "class U { @all:GetOnly val e: String get() = \"x\" }\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.bodyAnchors("U", "e"), "GetOnly", &.{"get"});
 }
 
 test "a05_all_nothing_applicable" {
@@ -231,15 +166,12 @@ test "a07_all_on_local_property" {
     try assertDiag(src, "INAPPLICABLE_ALL_TARGET", "cannot be applied to local properties, only member or top-level properties are allowed.");
 }
 
-// Bracket syntax is forbidden under `@all:`, and the sibling entry in the
-// same bracket still applies.
+// Bracket syntax is forbidden under `@all:`.
 test "a08_all_multi_annotation_bracket" {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     const src = cat(a, DECLS_A, "class U(@all:Wide val e: String, @all:[Wide FieldOnly] val f: String)\nfun main() {}\n");
     try assertDiag(src, "INAPPLICABLE_ALL_TARGET_IN_MULTI_ANNOTATION", "Multiple annotation syntax with '@all:' use-site target is forbidden");
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("U", "e"), "Wide", &.{ "param", "property", "field", "get" });
 }
 
 test "a09_all_param_only" {
@@ -247,8 +179,6 @@ test "a09_all_param_only" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_A, "class U(@all:ParamOnly val e: String)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("U", "e"), "ParamOnly", &.{"param"});
 }
 
 // `@all:` and `@field:` both resolve to the backing field, so the record repeats.
@@ -266,7 +196,7 @@ test "a11_all_on_plain_ctor_param" {
     try assertDiag(src, "INAPPLICABLE_ALL_TARGET", "constructor parameters without corresponding property (consider adding val/var)");
 }
 
-// A top-level property keeps no runtime anchor table, so this asserts output.
+// A top-level property runs through `klio run`, so this asserts output.
 test "a12_all_on_top_level_property" {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -282,8 +212,6 @@ test "b01_ppf_ctor_val" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C(@PPF val x: Int)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("C", "x"), "PPF", &.{ "param", "property" });
 }
 
 test "b02_pf_ctor_val" {
@@ -291,8 +219,6 @@ test "b02_pf_ctor_val" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C(@PF val x: Int)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("C", "x"), "PF", &.{ "param", "field" });
 }
 
 test "b03_p_ctor_val" {
@@ -300,8 +226,6 @@ test "b03_p_ctor_val" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C(@P val x: Int)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("C", "x"), "P", &.{"param"});
 }
 
 test "b04_rf_ctor_val" {
@@ -309,8 +233,6 @@ test "b04_rf_ctor_val" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C(@RF val x: Int)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("C", "x"), "RF", &.{"property"});
 }
 
 test "b05_ppf_member_property" {
@@ -318,8 +240,6 @@ test "b05_ppf_member_property" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C { @PPF val x = 1 }\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.bodyAnchors("C", "x"), "PPF", &.{"property"});
 }
 
 test "b06_f_member_property" {
@@ -327,8 +247,6 @@ test "b06_f_member_property" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C { @F val x = 1 }\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.bodyAnchors("C", "x"), "F", &.{"field"});
 }
 
 test "b07_f_no_backing_field" {
@@ -351,8 +269,6 @@ test "b09_rf_delegated_property" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C { @RF val x: Int by lazy { 1 } }\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.bodyAnchors("C", "x"), "RF", &.{"property"});
 }
 
 // A property of an annotation class has no backing field, so field is skipped.
@@ -361,8 +277,6 @@ test "b10_pf_annotation_class_ctor" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "annotation class Meta(@PF val x: Int)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("Meta", "x"), "PF", &.{"param"});
 }
 
 // `var` changes nothing: defaulting never targets the setter parameter.
@@ -371,8 +285,6 @@ test "b11_pf_ctor_var" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C(@PF var x: Int)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("C", "x"), "PF", &.{ "param", "field" });
 }
 
 test "b12_explicit_param_target" {
@@ -380,25 +292,4 @@ test "b12_explicit_param_target" {
     const a = file_arena.allocator();
     const src = cat(a, DECLS_B, "class C(@param:PPF val x: Int)\nfun main() {}\n");
     try assertNoErrors(src);
-    const l = try lower(a, src);
-    try assertPlacement(try l.ctorAnchors("C", "x"), "PPF", &.{"param"});
-}
-
-// Resolved constructor arguments ride along on the anchor records, the surface
-// `@SerialName` reads.
-test "anchor_records_carry_string_args" {
-    _ = file_arena.reset(.retain_capacity);
-    const a = file_arena.allocator();
-    const src =
-        \\@Target(AnnotationTarget.PROPERTY) annotation class Named(val value: String)
-        \\class C(@Named("wire") val x: Int)
-        \\fun main() {}
-        \\
-    ;
-    const l = try lower(a, src);
-    const anchors = try l.ctorAnchors("C", "x");
-    try std.testing.expectEqual(@as(usize, 1), anchors.property.len);
-    const rec = &anchors.property[0];
-    try std.testing.expect(rec.is("Named"));
-    try std.testing.expectEqualStrings("wire", rec.stringArg("value").?);
 }

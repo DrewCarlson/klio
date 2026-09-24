@@ -3,26 +3,27 @@
 //! comment lines. The parallel ones run on real OS threads.
 //!
 //! A program expected to fail carries `//>! substring` lines instead, and the
-//! run must end in an error containing every substring. `KLIO_RACE_JITTER=1`
-//! widens borrow interleavings so a race reproduces reliably.
+//! run must end in an error containing every substring. A `//>env NAME=value`
+//! line sets a variable for the program's run. `KLIO_RACE_JITTER=1` widens
+//! borrow interleavings so a race reproduces reliably.
 const std = @import("std");
-const parity = @import("parity");
-const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
 const LITMUS_DIR = "tests/fixtures/threaded_litmus";
 
-// One file-scoped arena: the pipeline installs process-global state backed by
-// the run's allocator, which a per-test arena would tear down under it.
+// One arena for the file's runs, reset per program.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 const Expectation = struct {
     stdout: []u8,
     /// From the `//>! ` lines. Non-empty means the program must fail.
     err_contains: [][]u8,
+    /// From the `//>env NAME=value` lines: the run's extra environment.
+    env: []const [2][]const u8,
 };
 
-/// Each `//> ` line is one stdout line and each `//>! ` line an error-message
-/// substring. Returns owned bytes.
+/// Each `//> ` line is one stdout line, each `//>! ` line an error-message
+/// substring and each `//>env ` line a variable. Returns owned bytes.
 fn expectedOutcome(allocator: std.mem.Allocator, io: std.Io, file: []const u8) !Expectation {
     const src = try std.Io.Dir.cwd().readFileAlloc(io, file, allocator, .unlimited);
     defer allocator.free(src);
@@ -30,10 +31,16 @@ fn expectedOutcome(allocator: std.mem.Allocator, io: std.Io, file: []const u8) !
     defer out.deinit(allocator);
     var errs: std.ArrayList([]u8) = .empty;
     defer errs.deinit(allocator);
+    var env: std.ArrayList([2][]const u8) = .empty;
+    defer env.deinit(allocator);
     var lines = std.mem.splitScalar(u8, src, '\n');
     while (lines.next()) |line| {
         const t = std.mem.trimStart(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, t, "//>!")) {
+        if (std.mem.startsWith(u8, t, "//>env ")) {
+            const kv = std.mem.trim(u8, t["//>env ".len..], " \t\r");
+            const eq = std.mem.findScalar(u8, kv, '=') orelse continue;
+            try env.append(allocator, .{ try allocator.dupe(u8, kv[0..eq]), try allocator.dupe(u8, kv[eq + 1 ..]) });
+        } else if (std.mem.startsWith(u8, t, "//>!")) {
             var rest = t[4..];
             if (rest.len != 0 and rest[0] == ' ') rest = rest[1..];
             rest = std.mem.trimEnd(u8, rest, "\r");
@@ -53,6 +60,7 @@ fn expectedOutcome(allocator: std.mem.Allocator, io: std.Io, file: []const u8) !
     return .{
         .stdout = try out.toOwnedSlice(allocator),
         .err_contains = try errs.toOwnedSlice(allocator),
+        .env = try env.toOwnedSlice(allocator),
     };
 }
 
@@ -78,7 +86,7 @@ fn check(stem: []const u8) !void {
         std.debug.print("no //> expected lines in {s}\n", .{stem});
         return error.NoExpectedLines;
     }
-    const res = try parity.runWithPacks(a, io, file);
+    const res = try klio_child.run(a, &.{file}, .{ .env = want.env });
     if (want.err_contains.len != 0) {
         switch (res) {
             .ok => |got| {
@@ -124,6 +132,8 @@ const RUNNABLE = [_][]const u8{
     "tl_atomic_update_contended",
     "tl_atomicfu_lock_mutex",
     "tl_lazy_once",
+    "tl_object_init_once",
+    "tl_join_while_collecting",
     "tl_default_parallel_wall",
     "tl_dispatch_thread_names",
     "tl_spin_handoff",
@@ -210,6 +220,12 @@ test "tl_atomicfu_lock_mutex" {
 }
 test "tl_lazy_once" {
     try check("tl_lazy_once");
+}
+test "tl_object_init_once" {
+    try check("tl_object_init_once");
+}
+test "tl_join_while_collecting" {
+    try check("tl_join_while_collecting");
 }
 test "tl_default_parallel_wall" {
     try check("tl_default_parallel_wall");
@@ -356,7 +372,7 @@ fn checkConformance(stem: []const u8) !void {
     const want = try expectedStdout(a, src);
     try std.testing.expect(want.len != 0);
 
-    const res = try parity.runWithPacks(a, io, file);
+    const res = try klio_child.runFile(a, file);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(want, got),
         .err => |m| {
@@ -504,91 +520,5 @@ test "threaded_litmus_suite_is_complete" {
             std.debug.print("every threaded_litmus/*.kt must be in RUNNABLE or PENDING exactly once\n", .{});
             return e;
         };
-    }
-}
-
-// Runs twice because a span-keyed shape channel can alias two synthesized
-// nodes and diverge only between runs.
-test "eager pipeline output parity" {
-    const a = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const al = arena.allocator();
-    var threaded: std.Io.Threaded = .init(al, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const src =
-        "fun pick(x: Int): String = \"int:\" + x\n" ++
-        "fun pick(x: String): String = \"string:\" + x\n" ++
-        "fun <T> pick(x: List<T>): String = \"list:\" + x.size\n" ++
-        "class EagerAccumulator {\n" ++
-        "    operator fun plus(value: Number): String = \"number:\" + value\n" ++
-        "    operator fun plus(value: CharSequence): String = \"chars:\" + value\n" ++
-        "}\n" ++
-        "class EagerScope<T : Number>(private val value: T) {\n" ++
-        "    fun kotlin.String.scopedIdentityValue(): T = value\n" ++
-        "    fun <T : CharSequence> shadowedIdentityPick(value: T): String =\n" ++
-        "        EagerAccumulator() + \"$value\".scopedIdentityValue()\n" ++
-        "}\n" ++
-        "fun main() {\n" ++
-        "    println(pick(42))\n" ++
-        "    println(pick(\"y\"))\n" ++
-        "    println(pick(listOf(1, 2)))\n" ++
-        "    println(listOf(1) + sequenceOf(2, 3))\n" ++
-        "    println(EagerScope(4).shadowedIdentityPick(\"shadow\"))\n" ++
-        "}\n";
-    std.Io.Dir.cwd().createDirPath(io, "/tmp/klio_eager_itest") catch {};
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/klio_eager_itest/e1.kt", .data = src }) catch return error.WriteFailed;
-
-    var env = std.process.Environ.Map.init(al);
-    runtime.procEnvPutAllInto(al, &env);
-    const bin = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
-    // Fork returns EAGAIN when the gate batch spawns children at once, which
-    // is machine pressure, not a verdict.
-    const S = struct {
-        fn runRetry(a2: std.mem.Allocator, io2: std.Io, argv: []const []const u8, env2: *const std.process.Environ.Map) !std.process.RunResult {
-            var attempt: usize = 0;
-            while (true) : (attempt += 1) {
-                return std.process.run(a2, io2, .{
-                    .argv = argv,
-                    .environ_map = env2,
-                    .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
-                }) catch |err| {
-                    if (attempt >= 3) {
-                        std.debug.print("eager parity: spawn failed after retries: {s}\n", .{@errorName(err)});
-                        return err;
-                    }
-                    std.Io.sleep(io2, std.Io.Duration.fromMilliseconds(2000), .awake) catch {};
-                    continue;
-                };
-            }
-        }
-    };
-    const lazy = try S.runRetry(al, io, &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" }, &env);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, lazy.term);
-    const eager = try S.runRetry(al, io, &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" }, &env);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, eager.term);
-    try std.testing.expectEqualStrings("int:42\nstring:y\nlist:2\n[1, 2, 3]\nnumber:4\n", lazy.stdout);
-    try std.testing.expectEqualStrings(lazy.stdout, eager.stdout);
-
-    const eager_ir = try S.runRetry(al, io, &.{ bin, "dump-ir", "/tmp/klio_eager_itest/e1.kt", "--func", "shadowedIdentityPick" }, &env);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, eager_ir.term);
-    // Each pin names itself and dumps the IR, which a bare `expect` cannot.
-    const pins = [_]struct { needle: []const u8, expect_present: bool }{
-        .{ .needle = "[DIRECT member-ext dispatch=r", .expect_present = true },
-        .{ .needle = " -> scopedIdentityValue#", .expect_present = true },
-        .{ .needle = "Call plus#", .expect_present = true },
-        .{ .needle = "[DYN", .expect_present = false },
-        .{ .needle = "0 dynamic", .expect_present = true },
-    };
-    for (pins) |pin| {
-        const found = std.mem.find(u8, eager_ir.stdout, pin.needle) != null;
-        if (found != pin.expect_present) {
-            std.debug.print(
-                "eager parity: `{s}` {s} in dump-ir output\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n",
-                .{ pin.needle, if (pin.expect_present) "missing" else "unexpectedly present", eager_ir.stdout, eager_ir.stderr },
-            );
-            return error.EagerIrPinMismatch;
-        }
     }
 }

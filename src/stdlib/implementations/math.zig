@@ -196,7 +196,7 @@ pub fn cmp_extreme(ctx: *CallCtx, want_min: bool, what: []const u8) std.mem.Allo
         var i: usize = 1;
         while (i < vals.len) : (i += 1) {
             const pair = [_]Value{ acc, vals[i] };
-            const r = if (try ctx.host.invokeMethod(&cmp, "compare", &pair, ctx.out)) |m|
+            const r = if (try ctx.host.callWellKnown(&cmp, .compare, &pair, ctx.out)) |m|
                 m
             else
                 try ctx.host.invokeCallable(&cmp, &pair, ctx.out);
@@ -947,7 +947,7 @@ fn i32_to_ordering(n: i32) std.math.Order {
 
 fn compare_host_aware(a: *const Value, b: *const Value, host: IntrinsicHost, out: Output) std.mem.Allocator.Error!OrderResult {
     if (a.* == .Instance) {
-        if (try host.invokeMethod(a, "compareTo", b[0..1], out)) |r| {
+        if (try host.callWellKnown(a, .compare_to, b[0..1], out)) |r| {
             switch (r) {
                 .ok => |val| if (val == .Int) return .{ .ok = i32_to_ordering(val.Int) },
                 .err => {},

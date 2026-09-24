@@ -1,0 +1,10 @@
+class kotlin.Any
+class kotlin.String
+class demo.reflect.Circle
+class demo.reflect.Circle
+template: class demo.reflect.Circle
+concat: class kotlin.Any
+class kotlin.Int (Int)
+class kotlin.collections.List (List)
+class demo.reflect.Circle (Circle)
+class demo.reflect.Shape and class demo.reflect.Circle

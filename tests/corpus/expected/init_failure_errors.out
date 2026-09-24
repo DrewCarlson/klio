@@ -1,0 +1,7 @@
+first: ExceptionInInitializerError msg=null cause=IllegalStateException
+later: NoClassDefFoundError msg=Could not initialize class Config cause=ExceptionInInitializerError
+error first: AssertionError msg=fatal cause=none
+error later: NoClassDefFoundError msg=Could not initialize class Fatal cause=ExceptionInInitializerError
+companion first: ExceptionInInitializerError msg=null cause=IllegalArgumentException
+companion later: NoClassDefFoundError msg=Could not initialize class Holder cause=ExceptionInInitializerError
+end

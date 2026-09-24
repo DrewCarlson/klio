@@ -5,7 +5,8 @@
 // class's companion, and a local — read plainly, in a string template,
 // through a member access, from a lambda, an anonymous object or a local
 // function that captures it, or by a compound assignment. `::name.isInitialized`
-// answers without throwing, and a same-named plain local shadows the
+// answers without throwing where the backing field is accessible (a member's
+// check lives inside its class), and a same-named plain local shadows the
 // lateinit without inheriting its check.
 // Run with: klio run examples/lateinit_uninitialized_access.kt
 lateinit var top: String
@@ -20,6 +21,7 @@ class Box {
     lateinit var value: String
     fun readValue() = value
     fun initialized() = ::value.isInitialized
+    fun initializedViaThis() = this::value.isInitialized
     fun fromCompanion() = tag
     companion object {
         lateinit var tag: String
@@ -51,11 +53,11 @@ fun main() {
     Holder.name = "holder"
     probe("Holder.read") { Holder.read() }
     val b = Box()
-    println("box initialized: ${b.initialized()} ${b::value.isInitialized}")
+    println("box initialized: ${b.initialized()} ${b.initializedViaThis()}")
     probe("box.readValue") { b.readValue() }
     probe("box.value") { b.value }
     b.value = "boxed"
-    println("box initialized: ${b.initialized()} ${b::value.isInitialized}")
+    println("box initialized: ${b.initialized()} ${b.initializedViaThis()}")
     probe("box.value") { b.value }
     probe("Box.tag via instance") { b.fromCompanion() }
     probe("Box.tag") { Box.tag }

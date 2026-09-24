@@ -8,6 +8,9 @@
 #
 # With no arguments it checks every example the backend accepts, and reports the
 # ones it refuses (that list is the backlog for widening it).
+#
+# NATIVE_C_ALLOW_REFUSED names gate programs (space separated, without `.kt`)
+# whose refusal is known and does not fail the gate.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 KLIO=${KLIO:-zig-out/bin/klio}
@@ -23,7 +26,7 @@ if [ $# -gt 0 ]; then
   progs=("$@")
   strict=0
 else
-  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt examples/native_try_catch.kt examples/native_exception_hierarchy.kt examples/native_properties.kt examples/native_enums.kt examples/native_default_args.kt examples/native_member_dispatch.kt examples/native_math_print.kt examples/native_arrays.kt examples/native_scope_functions.kt examples/native_inferred_properties.kt examples/native_function_values.kt examples/native_data_and_virtual_props.kt examples/field_zero_before_init.kt examples/backing_field_in_nested_scope.kt examples/native_ranges_and_bare_calls.kt examples/native_unsigned.kt examples/native_divide_by_zero.kt examples/native_coroutines.kt examples/native_stdlib_calls.kt examples/native_iteration.kt examples/native_companions.kt examples/native_ranges.kt examples/native_varargs.kt examples/native_type_tests.kt examples/native_generics.kt examples/native_ctor_defaults.kt examples/data_object.kt examples/non_capturing_lambda_identity.kt examples/native_enum_entries.kt examples/native_list_elements.kt examples/native_to_string.kt examples/native_function_refs.kt
+  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt examples/native_try_catch.kt examples/native_exception_hierarchy.kt examples/native_properties.kt examples/native_enums.kt examples/native_default_args.kt examples/native_member_dispatch.kt examples/native_math_print.kt examples/native_arrays.kt examples/native_scope_functions.kt examples/native_inferred_properties.kt examples/native_function_values.kt examples/native_data_and_virtual_props.kt examples/field_zero_before_init.kt examples/backing_field_in_nested_scope.kt examples/native_ranges_and_bare_calls.kt examples/native_unsigned.kt examples/native_divide_by_zero.kt examples/native_coroutines.kt examples/native_stdlib_calls.kt examples/native_iteration.kt examples/native_companions.kt examples/native_ranges.kt examples/native_varargs.kt examples/native_type_tests.kt examples/native_generics.kt examples/native_ctor_defaults.kt examples/data_object.kt examples/non_capturing_lambda_identity.kt examples/native_enum_entries.kt examples/native_list_elements.kt examples/native_to_string.kt examples/native_function_refs.kt examples/native_init_failure.kt
     # A program whose point is to leave through an uncaught throw cannot live
     # in examples/: the corpus requires an example to exit zero.
     tests/fixtures/native_c/native_throw.kt)
@@ -46,8 +49,14 @@ for kt in "${progs[@]}"; do
     continue
   fi
   if [ "$emit_rc" -ne 0 ]; then
-    refused=$((refused + 1))
-    echo "  REFUSED $name: $(grep -m1 -oE 'refuse .*' "$WORK/emit.log" || tail -1 "$WORK/emit.log")"
+    why=$(grep -m1 -oE 'refuse .*' "$WORK/emit.log" || tail -1 "$WORK/emit.log")
+    case " ${NATIVE_C_ALLOW_REFUSED:-} " in
+      *" $name "*) echo "  REFUSED $name (allowed): $why" ;;
+      *)
+        refused=$((refused + 1))
+        echo "  REFUSED $name: $why"
+        ;;
+    esac
     continue
   fi
   # A program that only computes needs nothing; one that allocates links the

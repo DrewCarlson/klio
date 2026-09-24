@@ -182,6 +182,8 @@ pub const PropertyHit = class_mod.PropertyHit;
 pub const StdlibFn = host_mod.StdlibFn;
 pub const CallCtx = host_mod.CallCtx;
 pub const IntrinsicHost = host_mod.IntrinsicHost;
+pub const WellKnown = host_mod.WellKnown;
+pub const WellKnownObject = host_mod.WellKnownObject;
 pub const NoopHost = host_mod.NoopHost;
 pub const HostResultU64 = host_mod.HostResultU64;
 pub const BuilderStepResult = host_mod.BuilderStepResult;
@@ -223,14 +225,6 @@ pub const clockMonotonicNanos = clock_mod.monotonicNanos;
 /// `main`'s first instruction, for traces that place a phase in the process's life.
 pub var process_start_ns: u64 = 0;
 
-/// Lazy bodies for a cold run: the base build lowers its headers, the
-/// program runs, each body lowers on its first call, and the image
-/// completes after the run. Set by `klio run --lazy-bodies`,
-/// `KLIO_LAZY_BODIES=1`, or `lazy_bodies = true` under `[application]` in
-/// the working directory's klio.toml. Off by default: the run keeps the
-/// build resident for its whole duration and the image lands only once
-/// the program ends.
-pub var lazy_bodies: bool = false;
 pub const clockSleepMillis = clock_mod.sleepMillis;
 pub const clockSleepMicros = clock_mod.sleepMicros;
 pub const EventGate = clock_mod.EventGate;
@@ -240,6 +234,7 @@ pub const floatToString = float_fmt_mod.floatToString;
 pub const doubleToString = float_fmt_mod.doubleToString;
 
 pub const setThreadName = threads_mod.setThreadName;
+pub const nextThreadNumber = threads_mod.nextThreadNumber;
 pub const clearThreadName = threads_mod.clearThreadName;
 pub const threadName = threads_mod.threadName;
 pub const registerRunBoundaryHook = threads_mod.registerRunBoundaryHook;
@@ -269,6 +264,11 @@ pub const tls_fast = @import("tls_fast.zig");
 pub const runOnPersistentBigStack = safety_mod.runOnPersistentBigStack;
 pub const currentRssKb = safety_mod.currentRssKb;
 pub const INTERPRET_STACK_SIZE = safety_mod.INTERPRET_STACK_SIZE;
+pub const WORKER_STACK_SIZE = safety_mod.WORKER_STACK_SIZE;
+pub const enterThreadStack = safety_mod.enterThreadStack;
+pub const stackLow = safety_mod.stackLow;
+pub const openStackReserve = safety_mod.openReserve;
+pub const closeStackReserve = safety_mod.closeReserve;
 
 test {
     std.testing.refAllDecls(@This());

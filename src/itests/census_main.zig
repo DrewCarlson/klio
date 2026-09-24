@@ -3,7 +3,10 @@
 //! ceilings as the itest gates.
 //!
 //! Usage: klio-census <suite>[,<suite>...] | all. Env: KLIO_ITEST_BIN (child
-//! binary), KLIO_ITEST_JOBS (workers), KLIO_CENSUS_NAMES, KLIO_CENSUS_TIMES.
+//! binary), KLIO_ITEST_HOME (the data home with every pack installed, as
+//! `zig build klio-test-home` makes it; unset, the packs are installed into
+//! /tmp/klio_itest_home on first use), KLIO_ITEST_JOBS (workers),
+//! KLIO_CENSUS_NAMES, KLIO_CENSUS_TIMES.
 
 const std = @import("std");
 const support = @import("commontest_support.zig");

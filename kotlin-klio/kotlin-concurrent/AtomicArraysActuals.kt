@@ -1,12 +1,11 @@
 /*
  * klio-authored actuals for the `kotlin.concurrent.atomics` array types.
  *
- * Same execution contract as AtomicsActuals.kt: the composite per-element
- * read-modify-write methods execute as host bindings under the receiver's
- * exclusive borrow (src/stdlib/implementations/atomics.zig), the bodies here
- * being the semantic reference; `loadAt`/`storeAt` are a single element
- * access under the cell lock; the inline `updateAt` family splices into
- * callers and is written as compare-and-set loops, thread-correct as source.
+ * Same execution contract as AtomicsActuals.kt: every per-element write
+ * (`storeAt` and the read-modify-write methods) holds the array's monitor, so
+ * it is one step against every other write; `loadAt` is a single element
+ * read; the inline `updateAt` family splices into callers as compare-and-set
+ * loops.
  */
 
 package kotlin.concurrent.atomics
@@ -53,8 +52,10 @@ public actual class AtomicIntArray {
      * [AtomicIntArray] at the given [index].
      */
     public actual fun storeAt(index: Int, newValue: Int) {
-        checkBounds(index)
-        array[index] = newValue
+        synchronized(this) {
+            checkBounds(index)
+            array[index] = newValue
+        }
     }
 
     /**
@@ -62,10 +63,12 @@ public actual class AtomicIntArray {
      * [AtomicIntArray] at the given [index] and returns the old value.
      */
     public actual fun exchangeAt(index: Int, newValue: Int): Int {
-        checkBounds(index)
-        val oldValue = array[index]
-        array[index] = newValue
-        return oldValue
+        synchronized(this) {
+            checkBounds(index)
+            val oldValue = array[index]
+            array[index] = newValue
+            return oldValue
+        }
     }
 
     /**
@@ -75,10 +78,12 @@ public actual class AtomicIntArray {
      * current value differed.
      */
     public actual fun compareAndSetAt(index: Int, expectedValue: Int, newValue: Int): Boolean {
-        checkBounds(index)
-        if (array[index] != expectedValue) return false
-        array[index] = newValue
-        return true
+        synchronized(this) {
+            checkBounds(index)
+            if (array[index] != expectedValue) return false
+            array[index] = newValue
+            return true
+        }
     }
 
     /**
@@ -87,12 +92,14 @@ public actual class AtomicIntArray {
      * [expected value][expectedValue]; returns the witnessed value either way.
      */
     public actual fun compareAndExchangeAt(index: Int, expectedValue: Int, newValue: Int): Int {
-        checkBounds(index)
-        val oldValue = array[index]
-        if (oldValue == expectedValue) {
-            array[index] = newValue
+        synchronized(this) {
+            checkBounds(index)
+            val oldValue = array[index]
+            if (oldValue == expectedValue) {
+                array[index] = newValue
+            }
+            return oldValue
         }
-        return oldValue
     }
 
     /**
@@ -100,10 +107,12 @@ public actual class AtomicIntArray {
      * [AtomicIntArray] at the given [index] and returns the old value.
      */
     public actual fun fetchAndAddAt(index: Int, delta: Int): Int {
-        checkBounds(index)
-        val oldValue = array[index]
-        array[index] += delta
-        return oldValue
+        synchronized(this) {
+            checkBounds(index)
+            val oldValue = array[index]
+            array[index] += delta
+            return oldValue
+        }
     }
 
     /**
@@ -111,9 +120,11 @@ public actual class AtomicIntArray {
      * [AtomicIntArray] at the given [index] and returns the new value.
      */
     public actual fun addAndFetchAt(index: Int, delta: Int): Int {
-        checkBounds(index)
-        array[index] += delta
-        return array[index]
+        synchronized(this) {
+            checkBounds(index)
+            array[index] += delta
+            return array[index]
+        }
     }
 
     /** Returns the string representation of the underlying array. */
@@ -162,8 +173,10 @@ public actual class AtomicLongArray {
      * [AtomicLongArray] at the given [index].
      */
     public actual fun storeAt(index: Int, newValue: Long) {
-        checkBounds(index)
-        array[index] = newValue
+        synchronized(this) {
+            checkBounds(index)
+            array[index] = newValue
+        }
     }
 
     /**
@@ -171,10 +184,12 @@ public actual class AtomicLongArray {
      * [AtomicLongArray] at the given [index] and returns the old value.
      */
     public actual fun exchangeAt(index: Int, newValue: Long): Long {
-        checkBounds(index)
-        val oldValue = array[index]
-        array[index] = newValue
-        return oldValue
+        synchronized(this) {
+            checkBounds(index)
+            val oldValue = array[index]
+            array[index] = newValue
+            return oldValue
+        }
     }
 
     /**
@@ -184,10 +199,12 @@ public actual class AtomicLongArray {
      * current value differed.
      */
     public actual fun compareAndSetAt(index: Int, expectedValue: Long, newValue: Long): Boolean {
-        checkBounds(index)
-        if (array[index] != expectedValue) return false
-        array[index] = newValue
-        return true
+        synchronized(this) {
+            checkBounds(index)
+            if (array[index] != expectedValue) return false
+            array[index] = newValue
+            return true
+        }
     }
 
     /**
@@ -196,12 +213,14 @@ public actual class AtomicLongArray {
      * [expected value][expectedValue]; returns the witnessed value either way.
      */
     public actual fun compareAndExchangeAt(index: Int, expectedValue: Long, newValue: Long): Long {
-        checkBounds(index)
-        val oldValue = array[index]
-        if (oldValue == expectedValue) {
-            array[index] = newValue
+        synchronized(this) {
+            checkBounds(index)
+            val oldValue = array[index]
+            if (oldValue == expectedValue) {
+                array[index] = newValue
+            }
+            return oldValue
         }
-        return oldValue
     }
 
     /**
@@ -209,10 +228,12 @@ public actual class AtomicLongArray {
      * [AtomicLongArray] at the given [index] and returns the old value.
      */
     public actual fun fetchAndAddAt(index: Int, delta: Long): Long {
-        checkBounds(index)
-        val oldValue = array[index]
-        array[index] += delta
-        return oldValue
+        synchronized(this) {
+            checkBounds(index)
+            val oldValue = array[index]
+            array[index] += delta
+            return oldValue
+        }
     }
 
     /**
@@ -220,9 +241,11 @@ public actual class AtomicLongArray {
      * [AtomicLongArray] at the given [index] and returns the new value.
      */
     public actual fun addAndFetchAt(index: Int, delta: Long): Long {
-        checkBounds(index)
-        array[index] += delta
-        return array[index]
+        synchronized(this) {
+            checkBounds(index)
+            array[index] += delta
+            return array[index]
+        }
     }
 
     /** Returns the string representation of the underlying array. */
@@ -264,8 +287,10 @@ public actual class AtomicArray<T> {
      * [AtomicArray] at the given [index].
      */
     public actual fun storeAt(index: Int, newValue: T) {
-        checkBounds(index)
-        array[index] = newValue
+        synchronized(this) {
+            checkBounds(index)
+            array[index] = newValue
+        }
     }
 
     /**
@@ -273,10 +298,12 @@ public actual class AtomicArray<T> {
      * [AtomicArray] at the given [index] and returns the old value.
      */
     public actual fun exchangeAt(index: Int, newValue: T): T {
-        checkBounds(index)
-        val oldValue = array[index]
-        array[index] = newValue
-        return oldValue
+        synchronized(this) {
+            checkBounds(index)
+            val oldValue = array[index]
+            array[index] = newValue
+            return oldValue
+        }
     }
 
     /**
@@ -286,10 +313,12 @@ public actual class AtomicArray<T> {
      * false when the current value differed.
      */
     public actual fun compareAndSetAt(index: Int, expectedValue: T, newValue: T): Boolean {
-        checkBounds(index)
-        if (array[index] !== expectedValue) return false
-        array[index] = newValue
-        return true
+        synchronized(this) {
+            checkBounds(index)
+            if (array[index] !== expectedValue) return false
+            array[index] = newValue
+            return true
+        }
     }
 
     /**
@@ -299,12 +328,14 @@ public actual class AtomicArray<T> {
      * either way.
      */
     public actual fun compareAndExchangeAt(index: Int, expectedValue: T, newValue: T): T {
-        checkBounds(index)
-        val oldValue = array[index]
-        if (oldValue === expectedValue) {
-            array[index] = newValue
+        synchronized(this) {
+            checkBounds(index)
+            val oldValue = array[index]
+            if (oldValue === expectedValue) {
+                array[index] = newValue
+            }
+            return oldValue
         }
-        return oldValue
     }
 
     /** Returns the string representation of the underlying array. */

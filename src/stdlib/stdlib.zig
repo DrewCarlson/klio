@@ -523,6 +523,11 @@ pub fn implementation(fqn: []const u8) ?StdlibFn {
     return implementations.lookup(fqn);
 }
 
+/// The host's constructor of a class whose values it makes (`IntRange`).
+pub fn constructorNative(class_fqn: []const u8) ?StdlibFn {
+    return implementations.constructor(class_fqn);
+}
+
 pub fn declarationHostSymbol(
     source_fqn: []const u8,
     receiver_name: ?[]const u8,
@@ -795,8 +800,11 @@ test "every hand-written intrinsic is accounted for against the mined index" {
     // source the sparse checkout omits.
     //
     // The unknown bucket is a ratchet rather than zero, since the mined index is
-    // built from whatever upstream sources are present. It must not grow.
-    const UNKNOWN_CEILING: usize = 141;
+    // built from whatever upstream sources are present. It grows only by a
+    // JVM-only declaration klio implements, recorded here: `java.lang`'s
+    // `StackTraceElement.className`, `methodName`, `fileName` and `lineNumber`
+    // took it from 141 to 145.
+    const UNKNOWN_CEILING: usize = 145;
     if (a.unmatched > UNKNOWN_CEILING) {
         std.debug.print(
             "\n[stdlib-table] {d} intrinsics name nothing the mined index knows (was {d})\n",

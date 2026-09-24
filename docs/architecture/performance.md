@@ -94,16 +94,16 @@ native stack or by the active intrinsic FQN.
 The full design, including the root-completeness analysis, is in
 `docs/design/GC.md`; the JIT design record is `docs/design/JIT-DESIGN.md`.
 
-## The stdlib image cache
+## The base image cache
 
-Independent of the profile, `klio run` bakes the lowered stdlib (and
-selected packs) to a content-addressed image under `~/.klio/cache`
-on first use and extends it with just the user program on later
-runs, cutting startup to tens of milliseconds. The build bakes the
-stdlib-only image too, with the binary it just linked, and installs it
-under `share/klio/cache` beside `bin/klio`; a run whose own cache misses
-reads that copy, so a rebuilt klio's first run of an import-free program
-is a warm one. A program that pulls packs in keys its own image and bakes
-it on its first run. See the [CLI tour](../getting-started/cli.md) for
-the cache keys and `KLIO_STDLIB_IMAGE` / `KLIO_TRACE_STDLIB_IMAGE`
-controls.
+Independent of the profile, `klio run` bakes the analyzed and lowered
+base (the stdlib and the program's declared packs) to a
+content-addressed image, `$KLIO_HOME/.klio/cache/sema-base-<key>.klio-sema`,
+on first use, and later runs analyze and lower just the program over
+it. The build bakes the stdlib-only image too, with the binary it just
+linked, and installs it under `share/klio/cache` beside `bin/klio`; a run
+whose own cache misses reads that copy, so a rebuilt klio's first run of
+an import-free program is a warm one. A program that pulls packs in keys
+its own image and bakes it on its first run. `KLIO_SEMA_IMAGE=0` turns
+the cache off; [Cold start](../development/cold-start.md) covers what a
+cold run does and how to measure it.

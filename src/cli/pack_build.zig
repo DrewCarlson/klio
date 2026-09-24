@@ -1067,8 +1067,8 @@ pub const ApplicationToml = struct {
     icon: []const u8 = "",
     main: []const u8 = "",
     include: [][]const u8 = &.{},
-    /// `lazy_bodies = true`: a cold run lowers the stdlib's bodies on first
-    /// call and completes its image after the program. Null when unset.
+    /// `lazy_bodies`: accepted, with no effect; a run's base comes from its
+    /// base image.
     lazy_bodies: ?bool = null,
 };
 
@@ -2061,6 +2061,33 @@ test "buildAstBundle accepts a clean file" {
     try std.testing.expect(err == null);
     try std.testing.expectEqual(@as(usize, 1), bundle.files.len);
     try std.testing.expectEqualStrings("ok/Good.kt", bundle.files[0].rel_path);
+}
+
+test "a pack's frozen AST keeps its node ids and call labels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files = [_]schema.SourceFile{
+        .{ .rel_path = "ok/Calls.kt", .bytes = "package ok\nfun f(y: Int) = g(x = y, 2) + h<Int>(\"$y\")\n" },
+    };
+    var err: ?Failure = null;
+    const bundle = buildAstBundle(std.testing.allocator, a, &files, &err);
+    try std.testing.expect(err == null);
+    var perr: schema.PackError = undefined;
+    const bytes = (try schema.encode(schema.AstBundle, a, &bundle, &perr)).?;
+    const back = (try schema.decode(schema.AstBundle, a, bytes.items, &perr)).?;
+    const before = &bundle.files[0].kotlin_file;
+    const after = &back.files[0].kotlin_file;
+    try std.testing.expectEqual(before.node_count, after.node_count);
+    try std.testing.expect(try ast.checkIds(std.testing.allocator, after, .{ .require_all = true }) == null);
+    const want = try ast.node_ids.collect(a, before);
+    const got = try ast.node_ids.collect(a, after);
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqual(w.id, g.id);
+    const sum = after.decls[0].Function.body.?.Expr.Binary;
+    try std.testing.expectEqualStrings("x", sum.lhs.Call.argNames()[0].?);
+    try std.testing.expect(sum.lhs.Call.argNames()[1] == null);
+    try std.testing.expectEqualStrings("Int", sum.rhs.Call.typeArgs()[0].name.name);
 }
 
 test "featureClaim picks the longest covering prefix" {

@@ -1,3 +1,4 @@
+// kotlinc: -language-version 2.5
 // Positional destructuring: bare `_` skips its component, a backtick-escaped
 // `_` is a real name, single-element `[b]` reads component1, and the full form
 // carries a `val`/`var` per entry. String templates interpolate escaped names.
@@ -17,7 +18,7 @@ fun main() {
     println("b=$b")
 
     // Full form: an explicit `val` per entry.
-    val [val a, val c] = p
+    [val a, val c] = p
     println("a=$a c=$c")
 
     // A backtick-escaped `_` binds and reads like any other name.

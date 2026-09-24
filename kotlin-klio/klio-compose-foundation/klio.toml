@@ -260,6 +260,7 @@ include = [
     "androidx/compose/foundation/text/TextFieldPressGestureFilter.kt",
     "androidx/compose/foundation/text/TextFieldScroll.kt",
     "androidx/compose/foundation/text/TextFieldSize.kt",
+    "androidx/compose/foundation/text/TextFieldDefaultSizeModifier.kt",
     "androidx/compose/foundation/text/TextLayoutHelper.kt",
     "androidx/compose/foundation/text/TextLayoutResultProxy.kt",
     "androidx/compose/foundation/text/TextLinkScope.kt",
@@ -391,6 +392,8 @@ include = [
     "androidx/compose/foundation/text/contextmenu/builder/TextContextMenuBuilderScope.skiko.kt",
     "androidx/compose/foundation/text/contextmenu/data/TextContextMenuData.skiko.kt",
     "androidx/compose/foundation/text/contextmenu/internal/DefaultTextContextMenuDropdownProvider.skiko.kt",
+    # The context-menu string translations ContextMenuStrings.skiko.kt reads.
+    "androidx/compose/foundation/text/l10n/",
     "androidx/compose/foundation/text/handwriting/StylusHandwriting.skiko.kt",
     "androidx/compose/foundation/text/input/internal/LegacyPlatformTextInputServiceAdapter.skiko.kt",
     "androidx/compose/foundation/text/input/internal/TextFieldDragAndDropNode.skiko.kt",
@@ -403,11 +406,15 @@ include = [
     "androidx/compose/foundation/text/selection/SelectionHandles.skiko.kt",
 ]
 
+# klioMain: the platform actuals, the java-free desktopMain files adapted to
+# klio's platform, and internal stand-ins for the two skia ICU calls
+# StringHelpers.skiko.kt makes (org.jetbrains.skia).
 [[source]]
 root = "klioMain"
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 "androidx.compose.runtime" = "*"
 "androidx.compose.runtime.saveable" = "*"
 "androidx.compose.ui" = "*"

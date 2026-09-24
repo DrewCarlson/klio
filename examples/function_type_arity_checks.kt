@@ -28,7 +28,7 @@ fun main() {
     println(l1 is Function1<*, *>)
     println((ext as Any) is Function1<*, *>)
     println(MyFun() is Function<*>)
-    println(MyFun() is Function0<*>)
+    println((MyFun() as Any) is Function0<*>)
     println(isA<Function0<*>>(f0))
     println(isA<Function1<*, *>>(f0))
     println(isA<(Int, Int) -> Int>(f2))

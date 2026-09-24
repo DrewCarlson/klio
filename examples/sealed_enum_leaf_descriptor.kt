@@ -4,6 +4,7 @@
 // the sealed descriptor lists its subclasses ordered by serial name — so a
 // diamond of sealed interfaces reports `[E, X, Y]` for leaves declared X, Y, E.
 import kotlinx.serialization.*
+import kotlinx.serialization.descriptors.elementDescriptors
 import kotlinx.serialization.json.*
 
 @Serializable sealed interface A

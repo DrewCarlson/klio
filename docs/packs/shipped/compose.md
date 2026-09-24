@@ -20,7 +20,7 @@ each upstream module is its own pack.
 | `androidx.compose.ui.text`           | ui/ui-text                     | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, coroutines |
 | `androidx.compose.ui`                | ui/ui                          | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, ui.text, coroutines |
 | `androidx.compose.animation.core`    | animation/animation-core       | runtime, ui, ui.unit, ui.util, ui.geometry, ui.graphics, collection, coroutines |
-| `androidx.compose.animation`         | animation/animation            | runtime, animation.core, ui.unit, ui.util, ui.geometry, ui.graphics |
+| `androidx.compose.animation`         | animation/animation            | runtime, animation.core, ui, ui.*, foundation.layout, collection, coroutines |
 | `androidx.compose.foundation.layout` | foundation/foundation-layout   | runtime, ui, ui.unit, ui.geometry, ui.graphics, ui.util  |
 | `androidx.compose.foundation`        | foundation/foundation          | runtime, runtime.saveable, ui, ui.*, foundation.layout, animation.core, animation, coroutines |
 | `androidx.compose.material.ripple`   | material/material-ripple       | runtime, animation.core, foundation, ui, ui.*, coroutines |
@@ -29,12 +29,39 @@ each upstream module is its own pack.
 Two libraries from the same checkout ship beside them: `androidx.collection`
 (`kotlin-klio/klio-androidx-collection`, the collections the runtime is built
 on) and `androidx.graphics.shapes` (`kotlin-klio/klio-graphics-shapes`, the
-rounded-polygon shapes material3 draws). `klio.compose.ui`
+rounded-polygon shapes material3 draws). `androidx.annotation`
+(`kotlin-klio/klio-androidx-annotation`) holds the androidx annotation
+library's markers (`@IntRange`, `@VisibleForTesting`, `@RestrictTo`, ...) that
+every module above and androidx.collection import; the checkout does not carry
+that library, so the pack declares them in klio sources with upstream's
+signatures. `klio.compose.ui`
 (`kotlin-klio/klio-compose-ui`) is klio's own windowing and rendering layer
 (`runApp`, the Skia backend) over the runtime, not an upstream module.
 
 The runtime's page, [androidx.compose.runtime](compose-runtime.md), covers
 how `@Composable` code runs without the Compose compiler plugin.
+
+## Closed source sets
+
+Each pack compiles the way kotlinc would compile its module: every import
+its files make, and every same-package name they use, resolves within the
+pack or a pack it declares in `[deps]`. `klio sema --bodies all` over a
+program that loads the packs checks it (no `unresolved_import` sites). A
+pack's `include` list may leave a file out only when nothing else in the
+pack reaches it. Where upstream reaches code the checkout does not carry or
+klio cannot run, the pack's `klioMain` declares it with upstream's
+signature:
+
+- libraries outside the checkout: the androidx annotation markers (the
+  `androidx.annotation` pack), compose's runtime-annotation markers and
+  runtime-retain's store (runtime pack), and the lifecycle, savedstate and
+  lifecycle-runtime-compose slices the saveable pack carries;
+- platform code: a `GraphicsLayer` that holds a layer's properties (klio
+  composites no offscreen layers), a Kotlin `PathMeasure`, code-point stand-ins
+  for the two skia ICU calls foundation's text helpers make, and adapted
+  copies of the desktop files that are java-free once their AWT and skiko
+  calls are replaced. A body klio cannot serve throws
+  `UnsupportedOperationException` naming what is missing.
 
 ## Install
 

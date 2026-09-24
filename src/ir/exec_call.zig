@@ -18,7 +18,6 @@ const ValueList = runtime.ValueList;
 const ObjRef = runtime.ObjRef;
 const InstanceData = runtime.InstanceData;
 
-const Const = ir.Const;
 const Func = ir.Func;
 const FuncId = ir.FuncId;
 const ConstId = ir.ConstId;
@@ -47,7 +46,6 @@ const missTraceWant = eval.missTraceWant;
 const nuTraceWant = eval.nuTraceWant;
 const ok = eval.ok;
 const popEnclosing = eval.popEnclosing;
-const pushEnclosing = eval.pushEnclosing;
 const pushDispatch = eval.pushDispatch;
 const pushEnclosingAccess = eval.pushEnclosingAccess;
 const raiseStep = eval.raiseStep;
@@ -1451,46 +1449,6 @@ pub noinline fn execArmLambda(comptime H: type, allocator: Allocator, frame: *Fr
     defer allocator.free(cap_values);
     switch (try host.buildClosure(allocator, frame.module, lam.body_func, cap_values)) {
         .ok => |v| try frame.write(lam.dst, v),
-        .err => |e| return raiseStep(frame, e),
-    }
-    return .cont;
-}
-
-pub noinline fn execArmAstLambda(comptime H: type, allocator: Allocator, frame: *Frame, al: anytype, host: *H) Allocator.Error!Step {
-    const cap_values = try readRegSlice(allocator, frame, al.captures);
-    defer allocator.free(cap_values);
-    switch (try host.buildAstLambdaWithFlagFuncid(allocator, frame.module, al.params, &al.body_ast, al.captured_names, cap_values, al.absorb_return, al.body_func)) {
-        .ok => |v| try frame.write(al.dst, v),
-        .err => |e| return raiseStep(frame, e),
-    }
-    return .cont;
-}
-
-pub noinline fn execArmRegisterClass(comptime H: type, allocator: Allocator, frame: *Frame, rc: anytype, host: *H) Allocator.Error!Step {
-    const cap_values = try readRegSlice(allocator, frame, rc.captures);
-    defer allocator.free(cap_values);
-    switch (try host.registerClassCaptured(allocator, rc.class.get(), rc.captured_names, cap_values)) {
-        .ok => {},
-        .err => |e| return raiseStep(frame, e),
-    }
-    // Binding the declaration name to the registered class value makes a call to
-    // the local class construct it, shadowing a same-named top-level function.
-    if (rc.dst) |d| {
-        if (@hasDecl(H, "localClassValue")) {
-            switch (try host.localClassValue(allocator, rc.class.get().name.name)) {
-                .ok => |maybe| if (maybe) |v| try frame.write(d, v),
-                .err => |e| return raiseStep(frame, e),
-            }
-        }
-    }
-    return .cont;
-}
-
-pub noinline fn execArmBuildObject(comptime H: type, allocator: Allocator, frame: *Frame, bobj: anytype, host: *H) Allocator.Error!Step {
-    const cap_values = try readRegSlice(allocator, frame, bobj.captures);
-    defer allocator.free(cap_values);
-    switch (try host.buildObject(allocator, bobj.ast.get(), bobj.captured_names, cap_values, bobj.scope_renames, bobj.scope_classes)) {
-        .ok => |v| try frame.write(bobj.dst, v),
         .err => |e| return raiseStep(frame, e),
     }
     return .cont;
@@ -3962,7 +3920,7 @@ pub inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anyty
             idx_v.Int, arrayLen(&recv),
         }) catch return .decline;
         const exc = Value.newException(allocator, .{
-            .fqn = runtime.strInit(allocator, "kotlin.ArrayIndexOutOfBoundsException") catch return .decline,
+            .fqn = runtime.strInit(allocator, "java.lang.ArrayIndexOutOfBoundsException") catch return .decline,
             .message = .from(runtime.strInitOwned(allocator, msg) catch return .decline),
             .cause = null,
         }) catch return .decline;

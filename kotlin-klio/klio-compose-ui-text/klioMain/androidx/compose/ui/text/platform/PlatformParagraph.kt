@@ -33,6 +33,7 @@ import androidx.compose.ui.graphics.klioFontAscent
 import androidx.compose.ui.graphics.klioFontDescent
 import androidx.compose.ui.graphics.klioFontLeading
 import androidx.compose.ui.graphics.klioTextWidth
+import androidx.compose.ui.graphics.takeOrElse
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.Paragraph
 import androidx.compose.ui.text.ParagraphIntrinsics

@@ -42,8 +42,6 @@ const callerThisValue = exec_call.callerThisValue;
 const constStr = exec_call.constStr;
 const declaringClassName = exec_call.declaringClassName;
 const envVarSet = exec_call.envVarSet;
-const execArmAstLambda = exec_call.execArmAstLambda;
-const execArmBuildObject = exec_call.execArmBuildObject;
 const execArmCall = exec_call.execArmCall;
 const execArmCallMemberOrValue = exec_call.execArmCallMemberOrValue;
 const execArmCallSpread = exec_call.execArmCallSpread;
@@ -61,7 +59,6 @@ const execArmNewInstance = exec_call.execArmNewInstance;
 const execArmNewList = exec_call.execArmNewList;
 const execArmPropertyRef = exec_call.execArmPropertyRef;
 const execArmQualifiedThis = exec_call.execArmQualifiedThis;
-const execArmRegisterClass = exec_call.execArmRegisterClass;
 const execArmStoreToThisOrGlobal = exec_call.execArmStoreToThisOrGlobal;
 const execCallMemberOrGlobal = exec_call.execCallMemberOrGlobal;
 const fastIndexGet = exec_call.fastIndexGet;
@@ -151,6 +148,8 @@ pub const dumpCurrentFrameParamsForDiag = ev_diag.dumpCurrentFrameParamsForDiag;
 pub const formatStackTrace = ev_diag.formatStackTrace;
 pub const stackTraceArray = ev_diag.stackTraceArray;
 pub const formatThrowable = ev_diag.formatThrowable;
+pub const formatThrowableWith = ev_diag.formatThrowableWith;
+pub const HeaderRenderer = ev_diag.HeaderRenderer;
 pub const attachStackTrace = ev_diag.attachStackTrace;
 
 /// Per-test wall-clock deadline in monotonic milliseconds, 0 = disarmed; the eval loop's counter gate checks it on every thread.
@@ -161,8 +160,18 @@ pub var test_wall_deadline_ms = std.atomic.Value(i64).init(0);
 /// has left interpreted code before it clears the abandonment flags, so no straggler runs on into a later test.
 pub var threads_in_eval = std.atomic.Value(u32).init(0);
 
-/// The wall cap has already thrown its catchable timeout on some thread; a second expiry hard-aborts. The test runner resets it when it arms a deadline.
-pub var wall_cap_thrown = std.atomic.Value(bool).init(false);
+/// How many times the wall cap has fired for the current test, on any thread. The first `wall_cap_catchable_fires`
+/// throw a catchable timeout; the next hard-aborts. The test runner resets it when it arms a deadline.
+pub var wall_cap_fires = std.atomic.Value(u32).init(0);
+
+/// Fires that throw a catchable timeout before the wall cap hard-aborts. A test may catch the first and go on
+/// (a harness that runs the body once per configuration records the failure and starts the next run), and only
+/// a throw unwinds through the program's `finally` blocks, which restore the state its classmates run against.
+pub const wall_cap_catchable_fires: u32 = 3;
+
+/// How far each catchable fire moves the deadline: the time the program has to unwind through its handlers
+/// before the next fire.
+pub var wall_cap_unwind_ms = std.atomic.Value(i64).init(20_000);
 
 /// Installed by the VM host: named member calls the builtin intrinsic replay served outright, which `member_ladder` (a route count) does not measure.
 pub var dispatch_replay_hits: ?*const fn () u64 = null;
@@ -306,6 +315,7 @@ pub const nativeOpGotoExit = ev_native.nativeOpGotoExit;
 const ev_inst = @import("eval/inst.zig");
 
 pub const armNow = ev_inst.armNow;
+pub const binopValue = ev_inst.binopValue;
 pub const globalIdAuditDump = ev_inst.globalIdAuditDump;
 pub const armIsOn = ev_inst.armIsOn;
 
@@ -338,6 +348,13 @@ pub const ReceiverShape = ev_host.ReceiverShape;
 pub const NullHost = ev_host.NullHost;
 pub const nullHost = ev_host.nullHost;
 
+/// Hand-built modules of code lowered from sema, for the VM's tests.
+pub const hand = @import("eval/hand.zig");
+
+/// The arms of the resolved instructions, for the host's reads outside a
+/// frame (`staticValue`).
+pub const resolved_ops = @import("eval/resolved.zig");
+
 const testing = std.testing;
 
 const ev_tests = @import("eval/tests.zig");
@@ -352,11 +369,13 @@ test {
     testing.refAllDecls(@import("eval/flow.zig"));
     testing.refAllDecls(@import("eval/frame.zig"));
     testing.refAllDecls(@import("eval/fused.zig"));
+    testing.refAllDecls(@import("eval/hand.zig"));
     testing.refAllDecls(@import("eval/host.zig"));
     testing.refAllDecls(@import("eval/inst.zig"));
     testing.refAllDecls(@import("eval/leaf.zig"));
     testing.refAllDecls(@import("eval/loop.zig"));
     testing.refAllDecls(@import("eval/native.zig"));
+    testing.refAllDecls(@import("eval/resolved.zig"));
     testing.refAllDecls(@import("eval/snapshot.zig"));
     testing.refAllDecls(@import("eval/state.zig"));
     testing.refAllDecls(@import("eval/tests.zig"));

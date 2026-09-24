@@ -25,8 +25,6 @@ const argNamesAllNull = exec_call.argNamesAllNull;
 const callerThisValue = exec_call.callerThisValue;
 const constStr = exec_call.constStr;
 const envVarSet = exec_call.envVarSet;
-const execArmAstLambda = exec_call.execArmAstLambda;
-const execArmBuildObject = exec_call.execArmBuildObject;
 const execArmCall = exec_call.execArmCall;
 const execArmCallMemberOrValue = exec_call.execArmCallMemberOrValue;
 const execArmCallSpread = exec_call.execArmCallSpread;
@@ -44,7 +42,6 @@ const execArmNewInstance = exec_call.execArmNewInstance;
 const execArmNewList = exec_call.execArmNewList;
 const execArmPropertyRef = exec_call.execArmPropertyRef;
 const execArmQualifiedThis = exec_call.execArmQualifiedThis;
-const execArmRegisterClass = exec_call.execArmRegisterClass;
 const execArmStoreToThisOrGlobal = exec_call.execArmStoreToThisOrGlobal;
 const execCallMemberOrGlobal = exec_call.execCallMemberOrGlobal;
 const fastSubscript = exec_call.fastSubscript;
@@ -65,6 +62,7 @@ const ev_frame = @import("frame.zig");
 const ev_host = @import("host.zig");
 const ev_leaf = @import("leaf.zig");
 const ev_native = @import("native.zig");
+const ev_resolved = @import("resolved.zig");
 const ev_state = @import("state.zig");
 const ev_values = @import("values.zig");
 
@@ -210,6 +208,8 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         .NotNullAssert => |nn| {
             const v = frame.read(nn.src);
             if (v == .Null) {
+                // Code lowered from sema catches the base's class, not a host exception.
+                if (frame.module.resolved) |r| return ev_resolved.throwNotNull(H, allocator, frame, host, r);
                 const exc = try Value.newException(allocator, .{
                     .fqn = try runtime.strInit(allocator, "kotlin.NullPointerException"),
                     .message = .{},
@@ -223,6 +223,7 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         .LateinitCheck => |lc| {
             const v = frame.read(lc.src);
             if (v == .Null) {
+                if (frame.module.resolved) |r| return ev_resolved.throwUninitialized(H, allocator, frame, host, r, constStr(frame.module, lc.name) orelse "?");
                 return raiseStep(frame, try lateinitThrow(allocator, constStr(frame.module, lc.name) orelse "?"));
             }
             v.retain();
@@ -307,9 +308,29 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         .InstanceOf => |io| return execArmInstanceOf(H, allocator, frame, io, host),
         .Cast => |cast| return execArmCast(H, allocator, frame, cast, host),
         .Lambda => |lam| return execArmLambda(H, allocator, frame, lam, host),
-        .AstLambda => |al| return execArmAstLambda(H, allocator, frame, al, host),
-        .RegisterClass => |rc| return execArmRegisterClass(H, allocator, frame, rc, host),
-        .BuildObject => |bobj| return execArmBuildObject(H, allocator, frame, bobj, host),
+        .CallStatic => |x| return ev_resolved.execCallStatic(H, allocator, frame, x, host),
+        .RCallVirtual => |x| return ev_resolved.execRCallVirtual(H, allocator, frame, x, host),
+        .CallInterface => |x| return ev_resolved.execCallInterface(H, allocator, frame, x, host),
+        .CallNative => |x| return ev_resolved.execCallNative(H, allocator, frame, x, host),
+        .RCallValue => |x| return ev_resolved.execRCallValue(H, allocator, frame, x, host),
+        .RNewInstance => |x| return ev_resolved.execRNewInstance(H, allocator, frame, x, host),
+        .GetFieldSlot => |x| return ev_resolved.execGetFieldSlot(H, allocator, frame, x, host),
+        .SetFieldSlot => |x| return ev_resolved.execSetFieldSlot(H, allocator, frame, x, host),
+        .LoadStatic => |x| return ev_resolved.execLoadStatic(H, allocator, frame, x, host),
+        .StoreStatic => |x| return ev_resolved.execStoreStatic(H, allocator, frame, x, host),
+        .LoadObject => |x| return ev_resolved.execLoadObject(H, allocator, frame, x, host),
+        .MakeClosure => |x| return ev_resolved.execMakeClosure(H, allocator, frame, x, host),
+        .FunctionRef => |x| return ev_resolved.execFunctionRef(H, allocator, frame, x, host),
+        .RPropertyRef => |x| return ev_resolved.execRPropertyRef(H, allocator, frame, x, host),
+        .ClassLiteral => |x| return ev_resolved.execClassLiteral(H, allocator, frame, x, host),
+        .ClassOf => |x| return ev_resolved.execClassOf(H, allocator, frame, x, host),
+        .RInstanceOf => |x| return ev_resolved.execRInstanceOf(H, allocator, frame, x, host),
+        .RCast => |x| return ev_resolved.execRCast(H, allocator, frame, x, host),
+        .InstanceOfDyn => |x| return ev_resolved.execInstanceOfDyn(H, allocator, frame, x, host),
+        .CastDyn => |x| return ev_resolved.execCastDyn(H, allocator, frame, x, host),
+        .ArrayGet => |x| return ev_resolved.execArrayGet(H, allocator, frame, x, host),
+        .ArraySet => |x| return ev_resolved.execArraySet(H, allocator, frame, x, host),
+        .NewArray => |x| return ev_resolved.execNewArray(H, allocator, frame, x, host),
         .StoreGlobal => |sg| {
             const name_str = constStr(frame.module, sg.name) orelse
                 return raiseStep(frame, .{ .Type = "StoreGlobal: name not a string const" });
@@ -433,7 +454,13 @@ pub noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Fra
     const r = frame.read(bo.rhs);
     switch (try binopValue(H, allocator, l, r, @TypeOf(bo), bo, host)) {
         .ok => |v| try frame.write(bo.dst, v),
-        .err => |e| return raiseStep(frame, e),
+        .err => |e| {
+            // Code lowered from sema catches the base's ArithmeticException, not a host exception.
+            if (frame.module.resolved) |res| {
+                if (ev_resolved.integralDivByZero(bo.op, l, r)) return ev_resolved.throwArithmetic(H, allocator, frame, host, res);
+            }
+            return raiseStep(frame, e);
+        },
     }
     return .cont;
 }
@@ -1516,12 +1543,7 @@ fn claimedWriteSlot(frame: *Frame, sf: anytype, recv: *const Value, name: []cons
 }
 
 fn storeClaimedWriteSlot(allocator: Allocator, recv: *const Value, idx: usize, v: Value) void {
-    const g = recv.Instance.borrow();
-    defer g.deinit();
-    const f = &g.get().fields.items[idx];
-    v.retain();
-    const old = f.value;
-    f.value = v;
+    const old = runtime.InstanceData.storeSlot(recv.Instance, idx, v) orelse unreachable;
     old.release(allocator);
 }
 

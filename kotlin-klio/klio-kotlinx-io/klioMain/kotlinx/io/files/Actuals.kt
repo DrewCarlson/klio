@@ -14,14 +14,17 @@ import kotlinx.io.Buffer
 import kotlinx.io.IOException
 import kotlinx.io.RawSink
 import kotlinx.io.RawSource
+import kotlinx.io.readByteArray
 
 // A path is a wrapper around its string form. The constructor is
-// `private` so the only same-named (String)-callable is the
-// `Path(path: String)` factory below — a 2-arg constructor would
-// otherwise be chosen by arity over the common `Path(base: String,
-// vararg parts: String)` builder for a `Path(base, *parts)` call,
-// dropping the parts. The companion builds normalized instances.
-public actual class Path private constructor(internal val pathString: String) {
+// `private` and takes the already-normalized form: a `(String)` constructor
+// would clash with the `Path(path: String)` factory below, and a
+// two-parameter one would compete with the common `Path(base: String,
+// vararg parts: String)` builder. The companion builds normalized
+// instances.
+public actual class Path private constructor(normalized: NormalizedPath) {
+    internal val pathString: String = normalized.value
+
     public actual val name: String
         get() {
             if (pathString.isEmpty()) return ""
@@ -50,9 +53,11 @@ public actual class Path private constructor(internal val pathString: String) {
 
     internal companion object {
         // Builds a Path from an already-normalized path string.
-        internal fun of(normalized: String): Path = Path(normalized)
+        internal fun of(normalized: String): Path = Path(NormalizedPath(normalized))
     }
 }
+
+internal class NormalizedPath(val value: String)
 
 public actual val SystemPathSeparator: Char = '/'
 

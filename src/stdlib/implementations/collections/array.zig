@@ -167,7 +167,7 @@ pub fn array_content_to_string(ctx: *CallCtx) Error!EvalResult {
     for (items, 0..) |v, i| {
         if (i > 0) try out.appendSlice(a, ", ");
         if (v == .Instance) {
-            if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |m| {
+            if (try ctx.host.callWellKnown(&v, .to_string, &.{}, ctx.out)) |m| {
                 if (m == .ok and m.ok == .String) {
                     const g = m.ok.String.borrow();
                     defer g.deinit();
@@ -194,7 +194,7 @@ fn longHash(bits: i64) i32 {
 fn valueHashDispatch(ctx: *CallCtx, v: Value) i32 {
     switch (v) {
         .Instance, .Exception => {
-            const r = ctx.host.invokeMethod(&v, "hashCode", &.{}, ctx.out) catch return kotlinValueHash(v);
+            const r = ctx.host.callWellKnown(&v, .hash_code, &.{}, ctx.out) catch return kotlinValueHash(v);
             if (r) |res| switch (res) {
                 .ok => |hv| if (hv == .Int) return @truncate(hv.Int),
                 .err => {},

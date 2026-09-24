@@ -32,6 +32,20 @@ pub fn setThreadName(id: u64, name: []const u8) void {
     gop.value_ptr.* = copy;
 }
 
+/// The JVM's thread counter. A `Thread` made without a name takes
+/// "Thread-N" from it, and Kotlin's `thread { }` makes one before it names
+/// it, so every `thread { }` takes a number.
+var thread_number = std.atomic.Value(u64).init(0);
+
+pub fn nextThreadNumber() u64 {
+    registerRunBoundaryHook(resetThreadNumber);
+    return thread_number.fetchAdd(1, .monotonic);
+}
+
+fn resetThreadNumber() void {
+    thread_number.store(0, .monotonic);
+}
+
 pub fn clearThreadName(id: u64) void {
     names_mutex.lock();
     defer names_mutex.unlock();

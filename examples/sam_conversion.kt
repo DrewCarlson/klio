@@ -1,7 +1,9 @@
-// M26: SAM conversion via `fun interface`. A single-abstract-method
+// SAM conversion via `fun interface`. A single-abstract-method
 // interface can be constructed from a lambda using the
 // `Interface { lambda }` form. The synthesized instance dispatches
-// the abstract method through the lambda body.
+// the abstract method through the lambda body. The abstract method cannot
+// declare default values; a concrete member of the interface can, and
+// forwards to it.
 
 fun interface IntPredicate {
     fun test(x: Int): Boolean
@@ -16,7 +18,8 @@ fun interface IntCombiner {
 }
 
 fun interface DefaultCombiner {
-    fun combine(left: Int, middle: Int = 3, right: Int): Int
+    fun combineAll(left: Int, middle: Int, right: Int): Int
+    fun combine(left: Int, middle: Int = 3, right: Int): Int = combineAll(left, middle, right)
 }
 
 fun interface IntFolder {

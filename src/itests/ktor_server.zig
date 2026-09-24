@@ -6,6 +6,7 @@
 const std = @import("std");
 const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 const net = std.Io.net;
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
@@ -17,6 +18,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    try map.put("KLIO_HOME", home);
     return map;
 }
 
@@ -38,40 +40,6 @@ fn runKlio(
         else => false,
     };
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
-}
-
-/// Installs the packs into a scratch HOME, once per test process.
-fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, home) catch {};
-    const pack_dirs = [_][]const u8{
-        "kotlin-klio/klio-kotlinx-atomicfu",
-        "kotlin-klio/klio-kotlinx-coroutines",
-        "kotlin-klio/klio-kotlinx-io",
-        "kotlin-klio/klio-kotlinx-serialization",
-        "kotlin-klio/klio-ktor",
-    };
-    const pack_files = [_][]const u8{
-        "target/packs/kotlinx.atomicfu.klio-pack",
-        "target/packs/kotlinx.coroutines.klio-pack",
-        "target/packs/kotlinx.io.klio-pack",
-        "target/packs/kotlinx.serialization.klio-pack",
-        "target/packs/io.ktor.klio-pack",
-    };
-    for (pack_dirs) |d| {
-        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", d });
-        if (!r.ok) {
-            std.debug.print("ktor_server: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
-            return error.PackBuildFailed;
-        }
-    }
-    for (pack_files) |f| {
-        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", f });
-        if (!r.ok) {
-            std.debug.print("ktor_server: pack install {s} failed:\n{s}\n", .{ f, r.stderr });
-            return error.PackInstallFailed;
-        }
-    }
 }
 
 /// An ephemeral free port: bind one, read the assigned port, release it.
@@ -172,7 +140,6 @@ fn headerOf(resp: []const u8, name: []const u8) ?[]const u8 {
 
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-const SCRATCH_HOME = "/tmp/klio_itest_ktorsrv_home";
 const TMP_DIR = "/tmp/klio_itest_ktorsrv";
 
 const SERVER_SRC =
@@ -187,8 +154,8 @@ const SERVER_SRC =
     \\import io.ktor.server.response.respond
     \\import io.ktor.server.request.receiveText
     \\import io.ktor.server.request.receive
+    \\import io.ktor.server.application.install
     \\import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
-    \\import io.ktor.server.plugins.contentnegotiation.install
     \\import io.ktor.serialization.kotlinx.json.json
     \\import io.ktor.http.HttpStatusCode
     \\import io.ktor.http.ContentType
@@ -257,8 +224,7 @@ test "server: routing, params, headers, status codes, and typed JSON" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var env = try envWithHome(a, SCRATCH_HOME);
-    try installPacks(a, io, &env, SCRATCH_HOME);
+    var env = try envWithHome(a, try klio_child.home(a));
 
     const port = try freePort(io);
     const cwd = std.Io.Dir.cwd();
@@ -346,8 +312,7 @@ test "server: start(wait = false) is non-blocking and the daemon serve abandons 
     defer threaded.deinit();
     const io = threaded.io();
 
-    var env = try envWithHome(a, SCRATCH_HOME);
-    try installPacks(a, io, &env, SCRATCH_HOME);
+    var env = try envWithHome(a, try klio_child.home(a));
 
     const port = try freePort(io);
     const cwd = std.Io.Dir.cwd();

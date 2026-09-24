@@ -1,15 +1,12 @@
 /*
  * klio-authored actuals for `kotlin.concurrent.atomics`.
  *
- * KLIO runs real worker threads. The composite read-modify-write methods
- * (`exchange`, `compareAndSet`, `compareAndExchange`, `fetchAndAdd`,
- * `addAndFetch`) execute as host bindings under the receiver cell's exclusive
- * borrow (see src/stdlib/implementations/atomics.zig); the bodies written here
- * are the semantic reference the bindings implement. `load` and `store` are a
- * single field access, already atomic under the cell lock. The inline
- * `update`/`fetchAndUpdate`/`updateAndFetch` extensions splice into callers,
- * so they cannot be host-shadowed — they are written as compare-and-set loops
- * and are thread-correct as source.
+ * KLIO runs real worker threads. Every write (`store`, `exchange`,
+ * `compareAndSet`, `compareAndExchange`, `fetchAndAdd`, `addAndFetch`) holds
+ * the instance's monitor, so a read-modify-write is one step against every
+ * other write; `load` is a single field read. The inline
+ * `update`/`fetchAndUpdate`/`updateAndFetch` extensions splice into callers
+ * as compare-and-set loops.
  */
 
 package kotlin.concurrent.atomics
@@ -31,16 +28,18 @@ public actual class AtomicInt public actual constructor(private var value: Int) 
     public actual fun load(): Int = value
 
     /** Atomically stores the [new value][newValue] into this [AtomicInt]. */
-    public actual fun store(newValue: Int) { value = newValue }
+    public actual fun store(newValue: Int) { synchronized(this) { value = newValue } }
 
     /**
      * Atomically stores the given [new value][newValue] into this [AtomicInt]
      * and returns the old value.
      */
     public actual fun exchange(newValue: Int): Int {
-        val oldValue = value
-        value = newValue
-        return oldValue
+        synchronized(this) {
+            val oldValue = value
+            value = newValue
+            return oldValue
+        }
     }
 
     /**
@@ -49,9 +48,11 @@ public actual class AtomicInt public actual constructor(private var value: Int) 
      * true on success, false when the current value differed.
      */
     public actual fun compareAndSet(expectedValue: Int, newValue: Int): Boolean {
-        if (value != expectedValue) return false
-        value = newValue
-        return true
+        synchronized(this) {
+            if (value != expectedValue) return false
+            value = newValue
+            return true
+        }
     }
 
     /**
@@ -60,11 +61,13 @@ public actual class AtomicInt public actual constructor(private var value: Int) 
      * the witnessed value either way.
      */
     public actual fun compareAndExchange(expectedValue: Int, newValue: Int): Int {
-        val oldValue = value
-        if (oldValue == expectedValue) {
-            value = newValue
+        synchronized(this) {
+            val oldValue = value
+            if (oldValue == expectedValue) {
+                value = newValue
+            }
+            return oldValue
         }
-        return oldValue
     }
 
     /**
@@ -72,9 +75,11 @@ public actual class AtomicInt public actual constructor(private var value: Int) 
      * returns the old value.
      */
     public actual fun fetchAndAdd(delta: Int): Int {
-        val oldValue = value
-        value += delta
-        return oldValue
+        synchronized(this) {
+            val oldValue = value
+            value += delta
+            return oldValue
+        }
     }
 
     /**
@@ -82,8 +87,10 @@ public actual class AtomicInt public actual constructor(private var value: Int) 
      * returns the new value.
      */
     public actual fun addAndFetch(delta: Int): Int {
-        value += delta
-        return value
+        synchronized(this) {
+            value += delta
+            return value
+        }
     }
 
     /** Returns the string representation of the underlying [Int] value. */
@@ -103,16 +110,18 @@ public actual class AtomicLong public actual constructor(private var value: Long
     public actual fun load(): Long = value
 
     /** Atomically stores the [new value][newValue] into this [AtomicLong]. */
-    public actual fun store(newValue: Long) { value = newValue }
+    public actual fun store(newValue: Long) { synchronized(this) { value = newValue } }
 
     /**
      * Atomically stores the given [new value][newValue] into this [AtomicLong]
      * and returns the old value.
      */
     public actual fun exchange(newValue: Long): Long {
-        val oldValue = value
-        value = newValue
-        return oldValue
+        synchronized(this) {
+            val oldValue = value
+            value = newValue
+            return oldValue
+        }
     }
 
     /**
@@ -121,9 +130,11 @@ public actual class AtomicLong public actual constructor(private var value: Long
      * true on success, false when the current value differed.
      */
     public actual fun compareAndSet(expectedValue: Long, newValue: Long): Boolean {
-        if (value != expectedValue) return false
-        value = newValue
-        return true
+        synchronized(this) {
+            if (value != expectedValue) return false
+            value = newValue
+            return true
+        }
     }
 
     /**
@@ -132,11 +143,13 @@ public actual class AtomicLong public actual constructor(private var value: Long
      * the witnessed value either way.
      */
     public actual fun compareAndExchange(expectedValue: Long, newValue: Long): Long {
-        val oldValue = value
-        if (oldValue == expectedValue) {
-            value = newValue
+        synchronized(this) {
+            val oldValue = value
+            if (oldValue == expectedValue) {
+                value = newValue
+            }
+            return oldValue
         }
-        return oldValue
     }
 
     /**
@@ -144,9 +157,11 @@ public actual class AtomicLong public actual constructor(private var value: Long
      * returns the old value.
      */
     public actual fun fetchAndAdd(delta: Long): Long {
-        val oldValue = value
-        value += delta
-        return oldValue
+        synchronized(this) {
+            val oldValue = value
+            value += delta
+            return oldValue
+        }
     }
 
     /**
@@ -154,8 +169,10 @@ public actual class AtomicLong public actual constructor(private var value: Long
      * returns the new value.
      */
     public actual fun addAndFetch(delta: Long): Long {
-        value += delta
-        return value
+        synchronized(this) {
+            value += delta
+            return value
+        }
     }
 
     /** Returns the string representation of the underlying [Long] value. */
@@ -175,16 +192,18 @@ public actual class AtomicBoolean public actual constructor(private var value: B
     public actual fun load(): Boolean = value
 
     /** Atomically stores the [new value][newValue] into this [AtomicBoolean]. */
-    public actual fun store(newValue: Boolean) { value = newValue }
+    public actual fun store(newValue: Boolean) { synchronized(this) { value = newValue } }
 
     /**
      * Atomically stores the given [new value][newValue] into this
      * [AtomicBoolean] and returns the old value.
      */
     public actual fun exchange(newValue: Boolean): Boolean {
-        val oldValue = value
-        value = newValue
-        return oldValue
+        synchronized(this) {
+            val oldValue = value
+            value = newValue
+            return oldValue
+        }
     }
 
     /**
@@ -194,9 +213,11 @@ public actual class AtomicBoolean public actual constructor(private var value: B
      * current value differed.
      */
     public actual fun compareAndSet(expectedValue: Boolean, newValue: Boolean): Boolean {
-        if (value != expectedValue) return false
-        value = newValue
-        return true
+        synchronized(this) {
+            if (value != expectedValue) return false
+            value = newValue
+            return true
+        }
     }
 
     /**
@@ -205,11 +226,13 @@ public actual class AtomicBoolean public actual constructor(private var value: B
      * [expected value][expectedValue]; returns the witnessed value either way.
      */
     public actual fun compareAndExchange(expectedValue: Boolean, newValue: Boolean): Boolean {
-        val oldValue = value
-        if (oldValue == expectedValue) {
-            value = newValue
+        synchronized(this) {
+            val oldValue = value
+            if (oldValue == expectedValue) {
+                value = newValue
+            }
+            return oldValue
         }
-        return oldValue
     }
 
     /** Returns the string representation of the underlying [Boolean] value. */
@@ -229,16 +252,18 @@ public actual class AtomicReference<T> public actual constructor(private var val
     public actual fun load(): T = value
 
     /** Atomically stores the [new value][newValue] into this [AtomicReference]. */
-    public actual fun store(newValue: T) { value = newValue }
+    public actual fun store(newValue: T) { synchronized(this) { value = newValue } }
 
     /**
      * Atomically stores the given [new value][newValue] into this
      * [AtomicReference] and returns the old value.
      */
     public actual fun exchange(newValue: T): T {
-        val oldValue = value
-        value = newValue
-        return oldValue
+        synchronized(this) {
+            val oldValue = value
+            value = newValue
+            return oldValue
+        }
     }
 
     /**
@@ -248,9 +273,11 @@ public actual class AtomicReference<T> public actual constructor(private var val
      * current value differed.
      */
     public actual fun compareAndSet(expectedValue: T, newValue: T): Boolean {
-        if (value !== expectedValue) return false
-        value = newValue
-        return true
+        synchronized(this) {
+            if (value !== expectedValue) return false
+            value = newValue
+            return true
+        }
     }
 
     /**
@@ -259,11 +286,13 @@ public actual class AtomicReference<T> public actual constructor(private var val
      * [expected value][expectedValue]; returns the witnessed value either way.
      */
     public actual fun compareAndExchange(expectedValue: T, newValue: T): T {
-        val oldValue = value
-        if (oldValue === expectedValue) {
-            value = newValue
+        synchronized(this) {
+            val oldValue = value
+            if (oldValue === expectedValue) {
+                value = newValue
+            }
+            return oldValue
         }
-        return oldValue
     }
 
     /** Returns the string representation of the underlying value. */

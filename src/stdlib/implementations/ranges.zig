@@ -55,6 +55,43 @@ pub fn ranges_range_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
     }));
 }
+/// The constructors of the range and progression classes: `IntRange(a, b)`
+/// is the value `a..b` makes, and a progression's `(start, endInclusive,
+/// step)` stores the last element `step` reaches.
+pub fn range_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len != 2 and ctx.args.len != 3) return typeErr("a range constructor takes two or three arguments");
+    const pair: [2]i64 = .{
+        argToI64(ctx.args[0]) orelse return typeErr("a range constructor takes integral bounds"),
+        argToI64(ctx.args[1]) orelse return typeErr("a range constructor takes integral bounds"),
+    };
+    const kind = rangeKindForArgs(ctx.args[0], ctx.args[1]);
+    if (ctx.args.len == 2) {
+        return ok(try Value.newRange(ctx.allocator, .{ .start = pair[0], .end = pair[1], .step = 1, .kind = kind }));
+    }
+    const step = ctx.args[2].asI64() orelse return typeErr("a progression's step is integral");
+    const min: i64 = if (ctx.args[2] == .Long) std.math.minInt(i64) else std.math.minInt(i32);
+    if (step == 0 or step == min) {
+        const msg = if (step == 0)
+            "Step must be non-zero."
+        else if (ctx.args[2] == .Long)
+            "Step must be greater than Long.MIN_VALUE to avoid overflow on negation."
+        else
+            "Step must be greater than Int.MIN_VALUE to avoid overflow on negation.";
+        return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
+            .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
+            .message = .from(try runtime.strInit(ctx.allocator, msg)),
+            .cause = null,
+        }) } };
+    }
+    return ok(try Value.newRange(ctx.allocator, .{
+        .start = pair[0],
+        .end = normalizeProgressionEnd(pair[0], pair[1], step, kind),
+        .step = step,
+        .kind = kind,
+        .progression = true,
+    }));
+}
+
 pub fn ranges_range_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ranges_until(ctx);
 }

@@ -3,7 +3,7 @@
 //! declarations are outside 2.4, so they are pinned to their rejections.
 
 const std = @import("std");
-const parity = @import("parity");
+const klio_child = @import("klio_child");
 const lexer = @import("lexer");
 const parser = @import("parser");
 const resolver = @import("resolver");
@@ -30,7 +30,7 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    const res = try parity.runWithPacks(a, io, path);
+    const res = try klio_child.runFile(a, path);
     switch (res) {
         .ok => |got| try std.testing.expectEqualStrings(expected, got),
         .err => |m| {

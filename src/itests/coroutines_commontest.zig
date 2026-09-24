@@ -1,5 +1,5 @@
 //! kotlinx-coroutines' own `commonTest` sources through a child `klio test`.
-//! Roots, packs, and ratchet bounds live in `commontest_support.suites`.
+//! Roots and ratchet bounds live in `commontest_support.suites`.
 
 const support = @import("commontest_support.zig");
 

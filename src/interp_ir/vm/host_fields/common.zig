@@ -239,6 +239,7 @@ pub fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, f
         .threads = self.threads,
         .object_states = self.object_states,
         .singletons_by_id = self.singletons_by_id,
+        .resolved_state = self.resolved_state,
         .allocator = allocator,
     };
     stdlib.implementations.string.clearRecvMemo();

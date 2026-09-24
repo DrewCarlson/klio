@@ -41,11 +41,14 @@ class Outer<T> {
     typealias TAtoInner2<S> = Outer<String>.Inner2<S>
     typealias TAtoNested = Nested<String>
 
+    // The nested aliases name `Outer<String>`'s inner classes, so they are
+    // constructed on an `Outer<String>` receiver, not on `this: Outer<T>`.
     fun fromInside(): String {
-        val a = TAtoInner("inside")
-        val b = TAtoInner2(7)
+        val self = Outer<String>()
+        val a = self.TAtoInner("inside")
+        val b = self.TAtoInner2(7)
         val c = TAtoNested("nested")
-        val ref = ::TAtoInner
+        val ref = self::TAtoInner
         return a.p + "/" + b.p + "/" + c.p + "/" + ref("ref").p
     }
 }

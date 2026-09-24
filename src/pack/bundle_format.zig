@@ -46,6 +46,9 @@ pub const HASH_LEN: usize = 32;
 
 pub const section_names = struct {
     pub const MANIFEST: []const u8 = "manifest";
+    /// The program's base as a self-contained sema image; its sources in
+    /// `program-src` build over it at boot.
+    pub const SEMA_IMAGE: []const u8 = "sema-image";
     pub const BASE_IMAGE: []const u8 = "base-image";
     pub const PROGRAM_SRC: []const u8 = "program-src";
     pub const PROGRAM_IMAGE: []const u8 = "program-image";

@@ -1,0 +1,6 @@
+main
+Thread-0
+Thread-1 alive=false
+in worker
+Thread-3
+main done

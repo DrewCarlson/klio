@@ -8,10 +8,11 @@ data class Entry(val key: String, val num: Int)
 
 data class Boxed<T>(val item: T, val tag: String)
 
-// A hand-written accessor wins over the synthesized one, and destructuring
-// goes through it.
+// A hand-written accessor past the synthesized ones, and destructuring goes
+// through it. (Redeclaring a synthesized `componentN` is a conflicting
+// overload in kotlinc.)
 data class Custom(val a: Int, val b: Int) {
-    fun component2(): Int = b * 100
+    operator fun component3(): Int = b * 100
 }
 
 fun main() {
@@ -26,9 +27,9 @@ fun main() {
     val (items, tag) = Boxed(listOf(1, 2, 3), "t")
     println(items.sum().toString() + "/" + tag)
 
-    println(Custom(1, 2).component2())
-    val (p, q) = Custom(1, 2)
-    println(p.toString() + "/" + q)
+    println(Custom(1, 2).component3())
+    val (p, q, r) = Custom(1, 2)
+    println(p.toString() + "/" + q + "/" + r)
 
     // The real `Map.Entry` still resolves to its own accessors.
     val m = mapOf("x" to 1)

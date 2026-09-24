@@ -1,7 +1,8 @@
 // A class declared inside a LOCAL class — one declared in a function body.
 //
-// Kotlin allows a local class to nest further declarations, `inner` or plain,
-// and declaration order inside the body does not matter. kotlinx-io's own
+// Kotlin allows a local class to nest `inner` classes (a plain nested class
+// is not allowed in a local one), and declaration order inside the body does
+// not matter. kotlinx-io's own
 // rawSourceSample does this: a decrypting source declared inside a test
 // function, holding an `inner class` for its cipher key.
 //
@@ -24,10 +25,8 @@ fun buildSource(seed: String): String {
             val label = "k(" + k + ")"
         }
 
-        // A plain nested class, for contrast with the `inner` one. Reached
-        // from inside the local class; qualified access from outside
-        // (`Decrypting.Marker()`) is a separate gap and not shown here.
-        private class Marker {
+        // A second inner class, one that reads nothing of its outer instance.
+        private inner class Marker {
             val name = "marker"
         }
 

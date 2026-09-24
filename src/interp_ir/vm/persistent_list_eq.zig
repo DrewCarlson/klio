@@ -49,6 +49,12 @@ fn eqVal(a: *const Value, b: *const Value) ?bool {
         else => false,
     };
     if (!hostable) return null;
+    // Boxed `equals`: every NaN equals itself and the zeros differ by sign.
+    switch (a.*) {
+        .Double => |x| return b.* == .Double and (if (std.math.isNan(x)) std.math.isNan(b.Double) else @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.Double))),
+        .Float => |x| return b.* == .Float and (if (std.math.isNan(x)) std.math.isNan(b.Float) else @as(u32, @bitCast(x)) == @as(u32, @bitCast(b.Float))),
+        else => {},
+    }
     return Value.structuralEq(a, b);
 }
 

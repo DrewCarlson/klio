@@ -1,0 +1,6 @@
+In<A>, In<B>: class=In argument=Nothing array=true true
+In<B>, In<A>: class=In argument=Nothing array=true true
+In<Int>, In<String>: class=In argument=* array=true true
+In<String>, In<Int>: class=In argument=* array=true true
+In<C>, In<A>: class=In argument=Nothing array=true true
+Box<A>, Box<A>: class=Box argument=A array=true false

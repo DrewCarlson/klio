@@ -57,7 +57,7 @@ fn pickIndex(ctx: *CallCtx, n: usize) Error!IndexOutcome {
     if (n <= 1) return .{ .idx = 0 };
     if (ctx.args.len > 1 and ctx.args[1] == .Instance) {
         const arg = ctx.args[1];
-        if (try ctx.host.invokeMethod(&arg, "nextInt", &.{Value.newInt(@intCast(n))}, ctx.out)) |res| {
+        if (try ctx.host.callWellKnown(&arg, .next_int, &.{Value.newInt(@intCast(n))}, ctx.out)) |res| {
             switch (res) {
                 .ok => |v| if (v.asI64()) |iv| {
                     const m = @mod(iv, @as(i64, @intCast(n)));
@@ -426,7 +426,7 @@ pub fn coll_grouping_source_iterator(ctx: *CallCtx) Error!EvalResult {
         defer g.deinit();
         break :blk (g.get().get("__grouping_src") orelse return typeErr("not a Grouping"));
     };
-    return (try ctx.host.invokeMethod(&src, "iterator", &.{}, ctx.out)) orelse
+    return (try ctx.host.callWellKnown(&src, .iterator, &.{}, ctx.out)) orelse
         typeErr("Grouping source is not iterable");
 }
 
@@ -454,19 +454,19 @@ const GroupingParts = union(enum) {
 /// statically bound `groupingBy` splices its inline body instead of building
 /// `__grouping_src`.
 fn groupingItemsViaProtocol(ctx: *CallCtx, recv: Value) Error!?[]Value {
-    const it = switch ((try ctx.host.invokeMethod(&recv, "sourceIterator", &.{}, ctx.out)) orelse return null) {
+    const it = switch ((try ctx.host.callWellKnown(&recv, .source_iterator, &.{}, ctx.out)) orelse return null) {
         .ok => |v| v,
         .err => return null,
     };
     var items: std.ArrayList(Value) = .empty;
     errdefer items.deinit(ctx.allocator);
     while (true) {
-        const more = switch ((try ctx.host.invokeMethod(&it, "hasNext", &.{}, ctx.out)) orelse return null) {
+        const more = switch ((try ctx.host.callWellKnown(&it, .has_next, &.{}, ctx.out)) orelse return null) {
             .ok => |v| v,
             .err => return null,
         };
         if (more != .Bool or !more.Bool) break;
-        const next = switch ((try ctx.host.invokeMethod(&it, "next", &.{}, ctx.out)) orelse return null) {
+        const next = switch ((try ctx.host.callWellKnown(&it, .next, &.{}, ctx.out)) orelse return null) {
             .ok => |v| v,
             .err => return null,
         };
@@ -507,7 +507,7 @@ fn groupingKeyOf(ctx: *CallCtx, key: ?Value, receiver: Value, element: Value) Er
             .err => |e| .{ .err = e },
         };
     }
-    const r = (try ctx.host.invokeMethod(&receiver, "keyOf", &.{element}, ctx.out)) orelse
+    const r = (try ctx.host.callWellKnown(&receiver, .key_of, &.{element}, ctx.out)) orelse
         return .{ .err = typeErr("Grouping has no keyOf") };
     return switch (r) {
         .ok => |val| .{ .value = val },
@@ -840,7 +840,7 @@ const CmpResult = union(enum) { n: i64, err: EvalResult };
 
 pub fn invokeComparatorCompare(ctx: *CallCtx, comparator: Value, x: Value, y: Value) Error!CmpResult {
     const args = [_]Value{ x, y };
-    const r = if (try ctx.host.invokeMethod(&comparator, "compare", &args, ctx.out)) |m|
+    const r = if (try ctx.host.callWellKnown(&comparator, .compare, &args, ctx.out)) |m|
         m
     else
         try ctx.host.invokeCallable(&comparator, &args, ctx.out);

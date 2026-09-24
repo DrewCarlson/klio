@@ -107,9 +107,13 @@ pub const EvalError = union(enum) {
     StackOverflow: []const u8,
 };
 
-/// Activation-depth cap that turns runaway recursion into `StackOverflow`
-/// before the 256 MiB interpret stack faults. `KLIO_MAX_EVAL_DEPTH` overrides.
-pub const DEFAULT_MAX_EVAL_DEPTH: usize = 2_000;
+/// Activation-depth cap that turns runaway recursion into a
+/// `StackOverflowError`. A call the evaluator makes itself keeps its frame on
+/// the heap, so this bounds a runaway program's time and memory, not the
+/// native stack (`runtime.stackLow` guards that). It sits above the depth a
+/// JVM reaches at its default 2 MiB stack, about 40,000 small frames.
+/// `KLIO_MAX_EVAL_DEPTH` overrides.
+pub const DEFAULT_MAX_EVAL_DEPTH: usize = 100_000;
 
 /// The evaluator's per-thread state, held off the thread-local block. Darwin
 /// resolves every `threadlocal` access through a call into dyld, and the
@@ -389,7 +393,6 @@ pub fn classifyFlattenable(f: *const Func) u8 {
                 .StoreToThisOrGlobal,
                 .StoreGlobal,
                 .Lambda,
-                .AstLambda,
                 .PropertyRef,
                 .MemberRef,
                 .QualifiedThis,
@@ -472,7 +475,9 @@ pub fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Valu
         regs.* = .empty;
         // Leaves the traced set; shrink the external-live estimate to match.
         if (gc_pool and runtime.gc.external_accounting) runtime.gc.noteExternalFreed(buf.len * @sizeOf(Value));
-        ev.regs_pool.append(ra, buf) catch {
+        // The list outlives the run whose allocator made its buffers, so it
+        // lives on the process allocator; the buffers drain at depth 0.
+        ev.regs_pool.append(std.heap.c_allocator, buf) catch {
             ra.free(buf);
         };
         return;
@@ -754,7 +759,12 @@ pub fn gcUninstallFrameRoot() void {
     }
 }
 
-/// Capture the live call stack, innermost first. Labels borrow program-lifetime
+/// The most frames a captured stack keeps, the innermost ones, as the JVM
+/// keeps at most `-XX:MaxJavaStackTraceDepth` (1024).
+pub const MAX_STACK_TRACE_DEPTH: usize = 1024;
+
+/// Capture the live call stack, innermost first, at most
+/// `MAX_STACK_TRACE_DEPTH` frames of it. Labels borrow program-lifetime
 /// module memory; only the frame slice is owned by the returned cell.
 pub fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
     // The live stack is the frame chain with fused activations layered on: a
@@ -762,43 +772,83 @@ pub fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
     var frame_n: usize = 0;
     {
         var cur = evtlsPtr().frame_chain;
-        while (cur) |f| : (cur = f.gc_link) frame_n += 1;
+        while (cur) |f| : (cur = f.gc_link) {
+            frame_n += 1;
+            if (frame_n >= MAX_STACK_TRACE_DEPTH) break;
+        }
     }
-    const total = fusedTls().depth + frame_n;
+    const total = @min(fusedTls().depth + frame_n, MAX_STACK_TRACE_DEPTH);
     if (total == 0) return null;
     const frames = try allocator.alloc(runtime.StackFrame, total);
     errdefer allocator.free(frames);
     var i: usize = 0;
     var fi: usize = fusedTls().depth;
     var fr = evtlsPtr().frame_chain;
-    while (true) {
-        while (fi > 0 and fusedTls().marks[fi - 1].head == fr) {
+    while (i < total) {
+        while (fi > 0 and i < total and fusedTls().marks[fi - 1].head == fr) {
             const mk = &fusedTls().marks[fi - 1];
-            const label = if (mk.func.fqn.len != 0) mk.func.fqn else mk.func.name;
-            if (mk.span) |sp| {
-                frames[i] = .{ .fqn = label, .file_id = @intFromEnum(sp.file), .offset = sp.start, .has_pos = true };
-            } else {
-                frames[i] = .{ .fqn = label, .file_id = 0, .offset = 0, .has_pos = false };
-            }
+            frames[i] = stackFrame(mk.mod, mk.func, mk.span);
             i += 1;
             fi -= 1;
         }
+        if (i == total) break;
         const f = fr orelse break;
-        const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
-        if (f.cur_span) |sp| {
-            frames[i] = .{ .fqn = label, .file_id = @intFromEnum(sp.file), .offset = sp.start, .has_pos = true };
-        } else {
-            frames[i] = .{ .fqn = label, .file_id = 0, .offset = 0, .has_pos = false };
-        }
+        frames[i] = stackFrame(f.module, f.func, f.cur_span);
         i += 1;
         fr = f.gc_link;
     }
-    // Every fused mark's head is a live frame or null, so `i == total` here.
+    // A trace that reaches a parameterless `main` ends with kotlinc's
+    // synthetic `main(String[])` that calls it: its file, no line.
+    if (i != 0 and i < MAX_STACK_TRACE_DEPTH and fr == null) if (bottomFunc()) |bottom| {
+        if (bottom.module.resolved) |r| if (r.frame_namer) |fnm| if (fnm.entry_bridge(fnm.ctx, bottom.func.id)) {
+            const last = frames[i - 1];
+            const grown = try allocator.realloc(frames, i + 1);
+            grown[i] = .{ .fqn = last.fqn, .file_id = last.file_id, .offset = NO_LINE, .has_pos = last.has_pos };
+            return try runtime.StackRef.init(allocator, .{ .frames = grown });
+        };
+    };
+    // Every fused mark's head is a live frame or null, so `i == total` here
+    // unless the frames ran out first.
     if (i != total) {
         const shrunk = try allocator.realloc(frames, i);
         return try runtime.StackRef.init(allocator, .{ .frames = shrunk });
     }
     return try runtime.StackRef.init(allocator, .{ .frames = frames });
+}
+
+/// A captured frame's `offset` when it has a file but no line, as the
+/// synthetic `main(String[])` frame has.
+pub const NO_LINE: u32 = std.math.maxInt(u32);
+
+/// The outermost frame of the chain.
+fn bottomFunc() ?*const Frame {
+    var cur = evtlsPtr().frame_chain;
+    var last: ?*const Frame = null;
+    while (cur) |f| : (cur = f.gc_link) last = f;
+    return last;
+}
+
+/// One captured frame: its function as a JVM frame names it (the module's
+/// `frame_namer`, else its FQN) and where it is. A frame that has not
+/// reached a position yet stands at its function's first one, as the JVM's
+/// line table puts a frame at its method's first line.
+fn stackFrame(module: *const Module, func: *const ir.Func, at: ?ir.Span) runtime.StackFrame {
+    var label = if (func.fqn.len != 0) func.fqn else func.name;
+    if (module.resolved) |r| if (r.frame_namer) |fnm| {
+        if (fnm.name(fnm.ctx, func.id)) |n| label = n;
+    };
+    const sp = at orelse firstSpan(func) orelse return .{ .fqn = label, .file_id = 0, .offset = 0, .has_pos = false };
+    return .{ .fqn = label, .file_id = @intFromEnum(sp.file), .offset = sp.start, .has_pos = true };
+}
+
+/// The span of `func`'s first positioned instruction.
+fn firstSpan(func: *const ir.Func) ?ir.Span {
+    for (func.blocks) |*b| {
+        for (b.insts) |*inst| {
+            if (inst.* == .Trace) return inst.Trace.span;
+        }
+    }
+    return null;
 }
 
 /// Print the active frame chain to stderr; env-gated call sites only.

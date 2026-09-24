@@ -22,6 +22,8 @@ pub const CURATED_UPSTREAM_SOURCES = stdlib_sources.CURATED_UPSTREAM_SOURCES;
 pub const KLIO_STDLIB_ACTUAL_FILES = stdlib_sources.KLIO_STDLIB_ACTUAL_FILES;
 pub const UPSTREAM_STDLIB_ROOT = stdlib_sources.UPSTREAM_STDLIB_ROOT;
 pub const KLIO_STDLIB_DIR = stdlib_sources.KLIO_STDLIB_DIR;
+pub const SEMA_ACTUALS_DIR = stdlib_sources.SEMA_ACTUALS_DIR;
+pub const SEMA_ACTUAL_FILES = stdlib_sources.SEMA_ACTUAL_FILES;
 /// Build a deterministic pack for the in-process Kotlin standard library. On
 /// failure `result` is set and null is returned.
 pub fn buildStdlibPack(

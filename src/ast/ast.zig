@@ -4,9 +4,39 @@ const span = @import("span");
 
 pub const Span = span.Span;
 
+/// A node's identity within its file: dense, assigned in source order by
+/// `node_ids.assign`, below `KotlinFile.node_count`. Ids start at 1; `none`
+/// marks a node no numbering has reached, such as one a later pass built.
+pub const NodeId = enum(u32) {
+    none = 0,
+    _,
+
+    pub fn from(v: u32) NodeId {
+        return @enumFromInt(v);
+    }
+
+    pub fn int(self: NodeId) u32 {
+        return @intFromEnum(self);
+    }
+};
+
+pub const node_ids = @import("node_ids.zig");
+pub const assignIds = node_ids.assign;
+pub const checkIds = node_ids.check;
+pub const clone = @import("clone.zig").clone;
+
 pub const Ident = struct {
     name: []const u8,
     span: Span,
+    /// Set only on a `$name` template part, which is a name reference of its
+    /// own; `none` on every other identifier. Fills the struct's padding.
+    id: NodeId = .none,
+
+    /// The `_` placeholder, which binds nothing; a backtick-escaped
+    /// `` `_` `` is an ordinary name (its span also covers the backticks).
+    pub fn isPlaceholder(self: Ident) bool {
+        return std.mem.eql(u8, self.name, "_") and self.span.end -| self.span.start <= 1;
+    }
 };
 
 /// The value behind an optional boxed node, for a reader that wants the
@@ -47,7 +77,6 @@ pub const AnnotationUseSite = enum {
 };
 
 pub const annotation_targets = @import("annotation_targets.zig");
-pub const alias_expand = @import("alias_expand.zig");
 
 pub const Annotation = struct {
     use_site: ?AnnotationUseSite,
@@ -126,6 +155,8 @@ pub const KotlinFile = struct {
     /// The parser saw a `@Composable` annotation somewhere in the file, so the
     /// compose pass has something to do.
     has_composable: bool = false,
+    /// The next free `NodeId`; every numbered node in the file is below it.
+    node_count: u32 = 0,
 };
 
 fn rewriteAliasedTypeName(ty: *TypeRef, aliases: *const std.StringHashMap([]const u8)) void {
@@ -164,6 +195,12 @@ pub fn expandFileClassAliases(allocator: std.mem.Allocator, file: *KotlinFile) v
         if (ta.target.function != null) continue;
         if (ta.target.name.name.len == 0) continue;
         if (std.mem.eql(u8, ta.target.name.name, ta.name.name)) continue;
+        // Only a plain simple class name can stand in for the alias: a
+        // qualified, generic or nullable target (`kotlinx.io.Source`,
+        // `AnnotatedString.Range<LinkAnnotation>`) would lose its qualifier,
+        // arguments or `?` in a bare name.
+        if (ta.type_params.len != 0 or ta.target.type_args.len != 0 or ta.target.nullable) continue;
+        if (ta.target.x().qualified_path != null or std.mem.indexOfScalar(u8, ta.target.name.name, '.') != null) continue;
         aliases.put(ta.name.name, ta.target.name.name) catch return;
     }
     if (aliases.count() == 0) return;
@@ -205,6 +242,7 @@ pub const TypeAlias = struct {
     visibility: Visibility,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
 };
 
 pub const Function = struct {
@@ -231,9 +269,12 @@ pub const Function = struct {
     /// Bodyless: lowering is skipped, dispatch goes through the `actual`.
     is_expect: bool,
     is_actual: bool,
+    /// Bodyless: the host implements it.
+    is_external: bool = false,
     visibility: Visibility,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
 };
 
 pub const Variance = enum {
@@ -282,6 +323,7 @@ pub const Param = struct {
     is_noinline: bool,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
 };
 
 pub const Property = struct {
@@ -314,6 +356,12 @@ pub const Property = struct {
     visibility: Visibility,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
+    /// `val <T> T.foo`: the property's own type parameters.
+    type_params: []TypeParam = &.{},
+    /// The receiver as written. `receiver_type` has a bare type-parameter
+    /// receiver replaced by its bound, which only the IR lowering reads.
+    receiver_written: ?*TypeRef = null,
 };
 
 /// Member and top-level `val` properties only.
@@ -334,6 +382,7 @@ pub const Accessor = struct {
     is_inline: bool,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
 };
 
 /// What a class rarely carries: where bounds, init blocks, named
@@ -389,12 +438,15 @@ pub const Class = struct {
     is_expect: bool,
     /// Matched to an `expect class` by simple name.
     is_actual: bool,
+    /// Its members are the host's.
+    is_external: bool = false,
     members: []Decl,
     visibility: Visibility,
     /// From `class Foo private constructor(...)`; `None` inherits the class visibility.
     primary_ctor_visibility: ?Visibility,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
     /// Null when every rare field is empty; read through `x()`, written
     /// through `xMut()`.
     extra: ?*const ClassExtra = null,
@@ -429,6 +481,7 @@ pub const EnumEntry = struct {
     body_members: []Decl,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
 };
 
 pub const ClassParam = struct {
@@ -441,6 +494,10 @@ pub const ClassParam = struct {
     is_vararg: bool,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
+    is_override: bool = false,
+    is_open: bool = false,
+    is_final: bool = false,
 };
 
 pub const SecondaryCtor = struct {
@@ -452,6 +509,7 @@ pub const SecondaryCtor = struct {
     visibility: Visibility,
     annotations: []Annotation,
     span: Span,
+    id: NodeId = .none,
 };
 
 pub const CtorDelegation = union(enum) {
@@ -479,6 +537,7 @@ pub const ObjectDecl = struct {
     is_actual: bool,
     visibility: Visibility,
     span: Span,
+    id: NodeId = .none,
 };
 
 /// What a type reference rarely carries: its annotations and, for a
@@ -490,9 +549,13 @@ pub const TypeRefExtra = struct {
     /// `name` keeps only the last segment, so this distinguishes `Outer.Inner`
     /// from a same-named top-level class.
     qualified_path: ?[]const u8 = null,
+    /// The type arguments written on each segment before the last, in path
+    /// order (`Outer<String>.Inner` has `[[String]]`); empty when none has
+    /// any.
+    qualifier_args: []const []TypeArg = &.{},
 
     pub fn isDefault(self: *const TypeRefExtra) bool {
-        return self.annotations.len == 0 and self.qualified_path == null;
+        return self.annotations.len == 0 and self.qualified_path == null and self.qualifier_args.len == 0;
     }
 };
 
@@ -540,6 +603,7 @@ pub const FunctionTypeRef = struct {
 pub const Block = struct {
     stmts: []Stmt,
     span: Span,
+    id: NodeId = .none,
 };
 
 /// `Stmt` payloads are boxed for the same reason as the expression's: a
@@ -550,6 +614,7 @@ pub const AssignStmt = struct {
     op: AssignOp,
     value: Expr,
     span: Span,
+    id: NodeId = .none,
 };
 
 /// Each name receives `expr.componentN()`; `_` evaluates its component for
@@ -563,6 +628,7 @@ pub const DestructuringDeclStmt = struct {
     sources: []Ident = &.{},
     init: Expr,
     span: Span,
+    id: NodeId = .none,
 };
 
 pub const Stmt = union(enum) {
@@ -599,7 +665,7 @@ pub const FloatLitKind = enum {
 
 /// The `Expr` variants below are boxed: each is far larger than a call or a
 /// path, and an inline payload would size every expression by the largest.
-/// Boxed, an expression is 80 bytes where it was 288.
+/// Boxed, an expression is 72 bytes where it was 288.
 /// `vars` holds one name, or more for `for ((k, v) in m)`, where each element
 /// supplies the matching component.
     
@@ -614,6 +680,7 @@ pub const ForExpr = struct {
     iter: *Expr,
     body: *Expr,
     span: Span,
+    id: NodeId = .none,
 };
 
     
@@ -622,16 +689,31 @@ pub const TryExpr = struct {
     catches: []Catch,
     finally: ?Block,
     span: Span,
+    id: NodeId = .none,
 };
 
 /// `qualifier` carries `super<Base>.foo()`, needed when several supertypes
 /// supply a matching member; `label` carries `super@Outer.foo()`, dispatching
 /// through the outer class's parent.
     
+/// `receiver::name`, a callable reference or a class literal on a receiver.
+pub const MemberRefExpr = struct {
+    receiver: *Expr,
+    name: Ident,
+    /// `Alias<Any>::foo`: written type arguments make the qualifier a type, so
+    /// the reference is unbound even where the qualifier names an object.
+    qualifier_type_args: []TypeRef = &.{},
+    /// `A?::foo`: the qualifier type is nullable.
+    nullable_receiver: bool = false,
+    span: Span,
+    id: NodeId = .none,
+};
+
 pub const SuperExpr = struct {
     qualifier: ?TypeRef,
     label: ?Ident,
     span: Span,
+    id: NodeId = .none,
 };
 
 /// `subject` is `None` for the subject-free `when { cond -> ... }`. The first
@@ -643,6 +725,7 @@ pub const WhenExpr = struct {
     subject_binding: ?WhenBinding,
     branches: []WhenBranch,
     span: Span,
+    id: NodeId = .none,
 };
 
     
@@ -651,6 +734,7 @@ pub const IsCheckExpr = struct {
     ty: TypeRef,
     negated: bool,
     span: Span,
+    id: NodeId = .none,
 };
 
 /// Under `safe` a failed cast yields `null` instead of throwing `kotlin.ClassCastException`.
@@ -660,6 +744,7 @@ pub const AsExpr = struct {
     ty: TypeRef,
     safe: bool,
     span: Span,
+    id: NodeId = .none,
 };
 
     
@@ -671,6 +756,7 @@ pub const AnonFunExpr = struct {
     body: ?*FunctionBody,
     is_suspend: bool,
     span: Span,
+    id: NodeId = .none,
 };
 
 /// Captures the enclosing scope for its method bodies; each occurrence gives
@@ -686,6 +772,7 @@ pub const ObjectLiteral = struct {
     /// See `Class.init_block_positions`.
     init_block_positions: []usize,
     span: Span,
+    id: NodeId = .none,
 };
 
 pub const LambdaExpr = struct {
@@ -698,101 +785,203 @@ pub const LambdaExpr = struct {
     annotations: []Annotation = &.{},
     body: Block,
     span: Span,
+    id: NodeId = .none,
     /// The parser injected the single `it`; real arity comes from the expected
     /// type, so `{ x() }` is `() -> R` in value position and `(T) -> R` where
     /// one parameter is expected.
     implicit_it: bool = false,
 };
 
+/// What a call carries beside its callee and arguments: the argument labels
+/// and written type arguments. Out of line so the call's node id fits in a
+/// 72-byte `Expr`.
+pub const CallExtra = struct {
+    /// Parallel to the call's `args`, `null` per positional argument; empty
+    /// on a call built without labels.
+    arg_names: []const ?[]const u8 = &.{},
+    type_args: []TypeRef = &.{},
+
+    pub fn isDefault(self: *const CallExtra) bool {
+        return self.arg_names.len == 0 and self.type_args.len == 0;
+    }
+};
+
+/// A boxed `CallExtra`, or null when both fields are empty.
+pub fn callExtra(allocator: std.mem.Allocator, e: CallExtra) std.mem.Allocator.Error!?*const CallExtra {
+    if (e.isDefault()) return null;
+    const p = try allocator.create(CallExtra);
+    p.* = e;
+    return p;
+}
+
+/// Calls with up to this many arguments, all positional, share one label
+/// list and one box per count instead of allocating their own.
+pub const shared_positional_max = 64;
+
+const all_positional = [_]?[]const u8{null} ** shared_positional_max;
+
+const positional_extras: [shared_positional_max]CallExtra = blk: {
+    var out: [shared_positional_max]CallExtra = undefined;
+    for (&out, 1..) |*e, n| e.* = .{ .arg_names = all_positional[0..n] };
+    break :blk out;
+};
+
+/// `n` null labels, shared; null when `n` exceeds `shared_positional_max`.
+pub fn positionalNames(n: usize) ?[]const ?[]const u8 {
+    return if (n <= shared_positional_max) all_positional[0..n] else null;
+}
+
+/// The shared box for a call of `n` positional arguments and no type
+/// arguments: null for none, and for a count past `shared_positional_max`.
+pub fn positionalExtra(n: usize) ?*const CallExtra {
+    return if (n >= 1 and n <= shared_positional_max) &positional_extras[n - 1] else null;
+}
+
+/// Whether `e` is a shared positional box, which nothing may free.
+pub fn isSharedCallExtra(e: *const CallExtra) bool {
+    const lo = @intFromPtr(&positional_extras);
+    const at = @intFromPtr(e);
+    return at >= lo and at < lo + @sizeOf(@TypeOf(positional_extras));
+}
+
+/// Whether `names` is a shared positional label list, which nothing may free.
+pub fn isSharedNames(names: []const ?[]const u8) bool {
+    const lo = @intFromPtr(&all_positional);
+    const at = @intFromPtr(names.ptr);
+    return names.len != 0 and at >= lo and at < lo + @sizeOf(@TypeOf(all_positional));
+}
+
 pub const Expr = union(enum) {
     IntLit: struct {
         value: i64,
         kind: IntLitKind,
         span: Span,
+        id: NodeId = .none,
     },
     FloatLit: struct {
         value: f64,
         kind: FloatLitKind,
         span: Span,
+        id: NodeId = .none,
     },
     BoolLit: struct {
         value: bool,
         span: Span,
+        id: NodeId = .none,
     },
     NullLit: struct {
         span: Span,
+        id: NodeId = .none,
     },
     CharLit: struct {
         value: u16,
         span: Span,
+        id: NodeId = .none,
     },
     StringTemplate: struct {
         parts: []StringPart,
         span: Span,
+        id: NodeId = .none,
     },
     Path: struct {
         segments: []Ident,
         span: Span,
+        id: NodeId = .none,
     },
     Member: struct {
         receiver: *Expr,
         name: Ident,
         safe: bool,
         span: Span,
+        id: NodeId = .none,
     },
-    /// `arg_names` is parallel to `args`: the label where the source wrote
-    /// `label = arg`, `None` where positional. `type_args` holds call-site type
-    /// arguments, consumed by reified type parameters.
+    /// `argNames()` is parallel to `args`: the label where the source wrote
+    /// `label = arg`, `null` where positional. `typeArgs()` holds call-site
+    /// type arguments, consumed by reified type parameters.
     Call: struct {
         callee: *Expr,
         args: []Expr,
-        arg_names: []?[]const u8,
-        type_args: []TypeRef,
+        span: Span,
+        id: NodeId = .none,
         is_infix: bool,
-    /// A trailing lambda binds to the LAST parameter; a parenthesized
-    /// `f(x, { ... })` binds positionally and leaves this false.
+        /// A trailing lambda binds to the LAST parameter; a parenthesized
+        /// `f(x, { ... })` binds positionally and leaves this false.
         has_trailing_lambda: bool = false,
         /// Parentheses enclose the whole call, so a following lambda invokes its result.
         grouped: bool = false,
-        span: Span,
+        /// A collection literal `[a, b]`: the callee names `listOf`, and
+        /// the type expected of the literal chooses the function it calls.
+        collection_literal: bool = false,
+        /// Null when the call has no named argument and no type argument;
+        /// read through `argNames()` and `typeArgs()`.
+        extra: ?*const CallExtra = null,
+
+        pub fn argNames(self: *const @This()) []const ?[]const u8 {
+            return if (self.extra) |e| e.arg_names else &.{};
+        }
+
+        pub fn typeArgs(self: *const @This()) []TypeRef {
+            return if (self.extra) |e| e.type_args else &.{};
+        }
+
+        /// Writes a new box, so a copy of this call sharing the old one keeps it.
+        pub fn setTypeArgs(self: *@This(), allocator: std.mem.Allocator, type_args: []TypeRef) std.mem.Allocator.Error!void {
+            var e: CallExtra = if (self.extra) |x| x.* else .{};
+            e.type_args = type_args;
+            self.extra = try callExtra(allocator, e);
+        }
+
+        /// Writes a new box, as `setTypeArgs` does.
+        pub fn setArgNames(self: *@This(), allocator: std.mem.Allocator, arg_names: []const ?[]const u8) std.mem.Allocator.Error!void {
+            var e: CallExtra = if (self.extra) |x| x.* else .{};
+            e.arg_names = arg_names;
+            self.extra = try callExtra(allocator, e);
+        }
     },
     Index: struct {
         receiver: *Expr,
         args: []Expr,
         span: Span,
+        id: NodeId = .none,
     },
     Binary: struct {
         op: BinOp,
         lhs: *Expr,
         rhs: *Expr,
         span: Span,
+        id: NodeId = .none,
     },
     Unary: struct {
         op: UnOp,
         expr: *Expr,
         span: Span,
+        id: NodeId = .none,
     },
     Postfix: struct {
         op: PostfixOp,
         expr: *Expr,
         span: Span,
+        id: NodeId = .none,
     },
     If: struct {
         cond: *Expr,
         then_branch: *Expr,
         else_branch: ?*Expr,
         span: Span,
+        id: NodeId = .none,
     },
     While: struct {
         cond: *Expr,
         body: *Expr,
         span: Span,
+        id: NodeId = .none,
     },
     /// The body is optional, covering `do; while (c)`.
     DoWhile: struct {
         body: ?*Expr,
         cond: *Expr,
         span: Span,
+        id: NodeId = .none,
     },
     /// `vars` holds one name, or more for `for ((k, v) in m)`, where each element
     /// supplies the matching component.
@@ -801,30 +990,36 @@ pub const Expr = union(enum) {
         value: ?*Expr,
         label: ?Ident,
         span: Span,
+        id: NodeId = .none,
     },
     Break: struct {
         label: ?Ident,
         span: Span,
+        id: NodeId = .none,
     },
     Continue: struct {
         label: ?Ident,
         span: Span,
+        id: NodeId = .none,
     },
     Labeled: struct {
         label: Ident,
         expr: *Expr,
         span: Span,
+        id: NodeId = .none,
     },
     Block: Block,
     Throw: struct {
         value: *Expr,
         span: Span,
+        id: NodeId = .none,
     },
     Try: *TryExpr,
     Lambda: *LambdaExpr,
     This: struct {
         qualifier: ?Ident,
         span: Span,
+        id: NodeId = .none,
     },
     /// `qualifier` carries `super<Base>.foo()`, needed when several supertypes
     /// supply a matching member; `label` carries `super@Outer.foo()`, dispatching
@@ -833,15 +1028,9 @@ pub const Expr = union(enum) {
     PropertyRef: struct {
         name: Ident,
         span: Span,
+        id: NodeId = .none,
     },
-    MemberRef: struct {
-        receiver: *Expr,
-        name: Ident,
-        /// `Alias<Any>::foo`: written type arguments make the qualifier a type, so
-        /// the reference is unbound even where the qualifier names an object.
-        qualifier_type_args: []TypeRef = &.{},
-        span: Span,
-    },
+    MemberRef: *MemberRefExpr,
     /// `subject` is `None` for the subject-free `when { cond -> ... }`. The first
     /// match supplies the result; no match and no `else` throws
     /// `kotlin.NoWhenBranchMatchedException`.
@@ -855,10 +1044,24 @@ pub const Expr = union(enum) {
     Spread: struct {
         expr: *Expr,
         span: Span,
+        id: NodeId = .none,
     },
     /// Captures the enclosing scope for its method bodies; each occurrence gives
     /// a fresh `ClassDef` and one instance.
     ObjectExpr: *ObjectLiteral,
+
+    /// The node's id; `none` before numbering and on nodes a later pass built.
+    pub fn id(self: *const Expr) NodeId {
+        return switch (self.*) {
+            inline else => |*payload| if (comptime @typeInfo(@TypeOf(payload.*)) == .pointer) payload.*.id else payload.id,
+        };
+    }
+
+    pub fn idPtr(self: *Expr) *NodeId {
+        return switch (self.*) {
+            inline else => |*payload| if (comptime @typeInfo(@TypeOf(payload.*)) == .pointer) &payload.*.id else &payload.id,
+        };
+    }
 
     pub fn span(self: *const Expr) Span {
         return switch (self.*) {
@@ -937,10 +1140,12 @@ pub const Catch = struct {
     ty: TypeRef,
     body: Block,
     span: Span,
+    id: NodeId = .none,
 };
 
 pub const StringPart = union(enum) {
     Text: []const u8,
+    /// `$name`; the identifier's `id` is the part's node id.
     ShortInterp: Ident,
     /// Boxed so a `StringPart` stays pointer-sized; most parts are plain `Text`.
     Interp: *Expr,
@@ -1014,9 +1219,9 @@ test "recursive expr nodes box through pointers" {
 }
 
 // Whether a body declares something, exhaustive over every `Stmt` and `Expr`
-// case. Two passes read it: lowering, whose instructions point into an object
-// expression or a local classifier, and the type checker, whose workers share
-// the signature and class tables a local declaration writes.
+// case. Two passes read it: the `@Serializable` pass, which copies a body
+// before splicing into a local class, and the type checker, whose workers
+// share the signature and class tables a local declaration writes.
 
 /// What a walk counts as a declaration inside a body.
 pub const Declares = struct {
@@ -1091,7 +1296,6 @@ fn declHas(comptime opts: Declares, d: *const Decl) bool {
             true
         else if (f.body) |*b| bodyHas(opts, b) else false,
         .Property => propertyHas(opts, d.Property),
-        // Declared inside a body: an `Inst.RegisterClass` points at it.
         .Class, .Object => true,
         .TypeAlias => false,
     };
@@ -1141,7 +1345,7 @@ fn exprHas(comptime opts: Declares, e: *const Expr) bool {
             return false;
         },
         .Lambda => |x| blockHas(opts, &x.body),
-        .MemberRef => |*x| exprHas(opts, x.receiver),
+        .MemberRef => |x| exprHas(opts, x.receiver),
         .When => |x| {
             if (optExprHas(opts, x.subject)) return true;
             for (x.branches) |*br| {
@@ -1229,7 +1433,58 @@ test "a local function inside a lambda answers" {
     _ = &lambda_expr;
 }
 
+test "an expression is 72 bytes" {
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(Expr));
+}
+
+test "an expression's id reads through inline and boxed payloads" {
+    const f = span.FileId.from(0);
+    var lit = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = Span.init(f, 0, 1), .id = .from(3) } };
+    try std.testing.expectEqual(NodeId.from(3), lit.id());
+    lit.idPtr().* = .from(4);
+    try std.testing.expectEqual(NodeId.from(4), lit.id());
+    var as = AsExpr{ .expr = &lit, .ty = undefined, .safe = false, .span = Span.init(f, 0, 6), .id = .from(5) };
+    const cast = Expr{ .As = &as };
+    try std.testing.expectEqual(NodeId.from(5), cast.id());
+}
+
+test "a call's rare fields default empty and a write leaves a shared box alone" {
+    const f = span.FileId.from(0);
+    var callee = Expr{ .Path = .{ .segments = &.{}, .span = Span.init(f, 0, 1) } };
+    var names = [_]?[]const u8{"x"};
+    var a = Expr{ .Call = .{ .callee = &callee, .args = &.{}, .is_infix = false, .span = Span.init(f, 0, 3) } };
+    try std.testing.expectEqual(@as(usize, 0), a.Call.argNames().len);
+    try std.testing.expectEqual(@as(usize, 0), a.Call.typeArgs().len);
+    try std.testing.expect(try callExtra(std.testing.allocator, .{}) == null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try a.Call.setArgNames(arena.allocator(), &names);
+    var b = a;
+    try b.Call.setArgNames(arena.allocator(), &.{});
+    try std.testing.expectEqualStrings("x", a.Call.argNames()[0].?);
+    try std.testing.expectEqual(@as(usize, 0), b.Call.argNames().len);
+}
+
+test "positional calls share their label list and box" {
+    const e = positionalExtra(3).?;
+    try std.testing.expectEqual(@as(usize, 3), e.arg_names.len);
+    for (e.arg_names) |n| try std.testing.expect(n == null);
+    try std.testing.expect(positionalExtra(3) == e);
+    try std.testing.expect(positionalExtra(0) == null);
+    try std.testing.expect(positionalExtra(shared_positional_max + 1) == null);
+    try std.testing.expectEqual(@as(usize, shared_positional_max), positionalNames(shared_positional_max).?.len);
+    try std.testing.expect(positionalNames(shared_positional_max + 1) == null);
+    try std.testing.expect(isSharedCallExtra(e));
+    try std.testing.expect(isSharedNames(e.arg_names));
+    const own = CallExtra{ .arg_names = &.{null} };
+    try std.testing.expect(!isSharedCallExtra(&own));
+    var names = [_]?[]const u8{null};
+    try std.testing.expect(!isSharedNames(&names));
+}
+
 test {
     _ = annotation_targets;
-    _ = alias_expand;
+    _ = node_ids;
+    _ = @import("clone.zig");
 }

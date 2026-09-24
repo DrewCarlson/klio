@@ -13,7 +13,7 @@
 //> [101, 102, 103]
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-fun main() = runBlocking {
+fun main(): Unit = runBlocking {
     flow {
         emit(1)
         emit(2)

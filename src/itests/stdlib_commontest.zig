@@ -7,6 +7,7 @@
 const std = @import("std");
 const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
 /// Pass floor. Rises as fixes land, falls only with a root-caused record.
 const BASELINE: usize = 2301;
@@ -21,7 +22,6 @@ const ACTUALS = [_][]const u8{
     "tests/stdlib_commontest_actuals/EncodingActuals.kt",
     "tests/stdlib_commontest_actuals/JsCollectionFactories.kt",
 };
-const SCRATCH_HOME = "/tmp/klio_itest_stdlibtest_home";
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
@@ -32,6 +32,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    try map.put("KLIO_HOME", home);
     return map;
 }
 
@@ -56,20 +57,6 @@ fn runKlio(
         return error.SpawnFailed;
     };
     return .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr };
-}
-
-fn installKotlinTestPack(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
-    std.Io.Dir.cwd().createDirPath(io, home) catch {};
-    const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", "kotlin-klio/klio-kotlin-test" });
-    if (b.term != .exited or b.term.exited != 0) {
-        std.debug.print("stdlib_commontest: pack build failed:\n{s}\n", .{b.stderr});
-        return error.PackBuildFailed;
-    }
-    const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", "target/packs/kotlin.test.klio-pack" });
-    if (i.term != .exited or i.term.exited != 0) {
-        std.debug.print("stdlib_commontest: pack install failed:\n{s}\n", .{i.stderr});
-        return error.PackInstallFailed;
-    }
 }
 
 fn workerCount() usize {
@@ -183,11 +170,10 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
         return error.SkipZigTest;
     };
 
-    var env = try envWithHome(a, SCRATCH_HOME);
+    var env = try envWithHome(a, try klio_child.home(a));
     // The wall caps are tuned on ReleaseSafe; Debug runs several times slower.
     const slowdown = census_support.harnessSlowdown(&env);
     if (slowdown != 1) try census_support.scaleWallCaps(a, &env, slowdown);
-    try installKotlinTestPack(a, io, &env, SCRATCH_HOME);
 
     var all: std.ArrayList([]u8) = .empty;
     try collectKt(a, io, TEST_ROOT, &all);

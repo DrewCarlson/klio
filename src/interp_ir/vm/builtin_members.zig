@@ -9,8 +9,10 @@ const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 
+const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_call_member = @import("host_call_member.zig");
+const host_resolved = @import("host_resolved.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -62,11 +64,16 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
     if (a.* != .Instance and b.* == .Instance) {
         switch (a.*) {
             .Set => if (receiverImplementsHead(self, b, "Set")) {
+                // What the host holds across the Kotlin calls below is rooted
+                // for the collector: the drained elements have no other owner.
+                const mark = runtime.keepaliveMark();
+                defer runtime.keepaliveRestore(mark);
                 const dr = try drainIterableToList(self, allocator, b);
                 const drained = switch (dr) {
                     .ok => |v| v,
                     .err => return false,
                 };
+                runtime.keepalivePush(drained);
                 defer if (runtime.reclaimEnabled()) drained.release(allocator);
                 const ga = a.Set.items.borrow();
                 defer ga.deinit();
@@ -88,11 +95,14 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                 return true;
             },
             .List => if (receiverImplementsHead(self, b, "List")) {
+                const mark = runtime.keepaliveMark();
+                defer runtime.keepaliveRestore(mark);
                 const dr = try drainIterableToList(self, allocator, b);
                 const drained = switch (dr) {
                     .ok => |v| v,
                     .err => return false,
                 };
+                runtime.keepalivePush(drained);
                 defer if (runtime.reclaimEnabled()) drained.release(allocator);
                 a.refreshArrayView();
                 a.refreshSublistView();
@@ -109,17 +119,23 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                 return true;
             },
             .Map => if (receiverImplementsHead(self, b, "Map")) {
-                const er = try self.callMember(allocator, b, "entries", &.{});
+                // `entries` is a property: read as one, a class lowered from
+                // sema answers it through its slot.
+                const mark = runtime.keepaliveMark();
+                defer runtime.keepaliveRestore(mark);
+                const er = try getFieldRec(self, allocator, b, "entries");
                 const entries_val = switch (er) {
                     .ok => |v| v,
                     .err => return false,
                 };
+                runtime.keepalivePush(entries_val);
                 defer if (runtime.reclaimEnabled()) entries_val.release(allocator);
                 const dr = try drainIterableToList(self, allocator, &entries_val);
                 const drained = switch (dr) {
                     .ok => |v| v,
                     .err => return false,
                 };
+                runtime.keepalivePush(drained);
                 defer if (runtime.reclaimEnabled()) drained.release(allocator);
                 const ga = a.Map.entries.borrow();
                 defer ga.deinit();
@@ -131,11 +147,14 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                 for (pa) |*ka| {
                     var found = false;
                     for (xb) |*eb| {
+                        const entry_mark = runtime.keepaliveMark();
+                        defer runtime.keepaliveRestore(entry_mark);
                         const kr = try self.getField(allocator, eb, "key");
                         const key = switch (kr) {
                             .ok => |v| v,
                             .err => continue,
                         };
+                        runtime.keepalivePush(key);
                         defer if (runtime.reclaimEnabled()) key.release(allocator);
                         if (!try deepValueEquals(self, allocator, &ka.key, &key)) continue;
                         const vr = try self.getField(allocator, eb, "value");
@@ -143,6 +162,7 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                             .ok => |v| v,
                             .err => continue,
                         };
+                        runtime.keepalivePush(val);
                         defer if (runtime.reclaimEnabled()) val.release(allocator);
                         if (try deepValueEquals(self, allocator, &ka.value, &val)) {
                             found = true;
@@ -631,6 +651,11 @@ pub fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const
     };
     // `iter` is owned (host-returns-owned): release it on every exit path.
     defer if (runtime.reclaimEnabled()) iter.release(allocator);
+    // The iterator and the elements drained so far have no other owner
+    // across the `hasNext`/`next` calls, which may collect.
+    const mark = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(mark);
+    runtime.keepalivePush(iter);
     var items: std.ArrayList(Value) = .empty;
     var guard: usize = 0;
     while (guard < 1_000_000) : (guard += 1) {
@@ -648,7 +673,10 @@ pub fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const
         if (!has) break;
         const nx_r = try callMemberRec(self, allocator, &iter, "next", &.{});
         switch (nx_r) {
-            .ok => |v| try items.append(allocator, v),
+            .ok => |v| {
+                runtime.keepalivePush(v);
+                try items.append(allocator, v);
+            },
             .err => |e| {
                 items.deinit(allocator);
                 return .{ .err = e };
@@ -1436,7 +1464,10 @@ pub fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
             if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return extractOwned(me.key);
             if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "value")) return extractOwned(me.value);
             // `Map.Entry` equality is by key and value, builtin or user alike.
-            if (std.mem.eql(u8, name, "equals") and args.len == 1) return .{ .ok = boolVal(Value.structuralEqBoxed(receiver, &args[0])) };
+            if (std.mem.eql(u8, name, "equals") and args.len == 1) {
+                if (try host_resolved.entryEquals(self, allocator, me.key.asPtr(), me.value.asPtr(), &args[0])) |r| return r;
+                return .{ .ok = boolVal(Value.structuralEqBoxed(receiver, &args[0])) };
+            }
             if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
             if (std.mem.eql(u8, name, "setValue")) {
                 // No backing means a read-only map's entry: mutation throws.
@@ -1941,7 +1972,9 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
             var intrinsic = makeIntrinsicHost(self);
             defer deinitIntrinsicHost(&intrinsic);
             const ihost = intrinsic.intrinsicHost();
-            const arg: []const Value = if (st.gen_cur) |c| &.{c} else &.{};
+            // The nullary form's `next` takes nothing; the seeded forms' the
+            // previous element.
+            const arg: []const Value = if (gen.seed == null) &.{} else if (st.gen_cur) |c| &.{c} else &.{};
             const r = try ihost.invokeCallable(&gen.next.asPtr().*, arg, out);
             switch (r) {
                 .ok => |nv| {
@@ -2580,6 +2613,20 @@ pub fn closureRefEquals(self: *VmHost, allocator: Allocator, a: *const Value, b:
     if (ca.asPtr().id == cb.asPtr().id) return true;
     const ia = self.closures.get(@intCast(ca.asPtr().id)) orelse return Value.structuralEq(a, b);
     const ib = self.closures.get(@intCast(cb.asPtr().id)) orelse return Value.structuralEq(a, b);
+    if (ia.resolved != null or ib.resolved != null) {
+        if (!resolvedSameTarget(ia, ib)) return false;
+        const ga = ca.borrow();
+        defer ga.deinit();
+        const gb = cb.borrow();
+        defer gb.deinit();
+        const xa = ga.get().captures;
+        const xb = gb.get().captures;
+        if (xa.len != xb.len) return false;
+        for (xa, xb) |*x, *y| {
+            if (!try deepValueEquals(self, allocator, x, y)) return false;
+        }
+        return true;
+    }
     const same_body = ia.body_func == ib.body_func and
         (@intFromPtr(ia.module orelse @as(*const ir.Module, @ptrFromInt(8))) == @intFromPtr(ib.module orelse @as(*const ir.Module, @ptrFromInt(8))));
     if (ia.is_ref and ib.is_ref) return same_body;
@@ -2609,10 +2656,35 @@ pub fn closureRefEquals(self: *VmHost, allocator: Allocator, a: *const Value, b:
     return false;
 }
 
+/// Whether two closures lowered from sema reference one declaration: a
+/// function reference its target, a property reference its getter. A lambda
+/// equals only itself.
+fn resolvedSameTarget(ia: root.ClosureInfo, ib: root.ClosureInfo) bool {
+    const ka = ia.resolved orelse return false;
+    const kb = ib.resolved orelse return false;
+    return switch (ka) {
+        .lambda => false,
+        .function_ref => |ta| kb == .function_ref and kb.function_ref == ta,
+        .property_ref => kb == .property_ref and ia.body_func == ib.body_func and ia.module == ib.module,
+    };
+}
+
 /// Hash of a callable reference, consistent with `closureRefEquals`.
 pub fn closureRefHash(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error!i32 {
     const c = v.IrClosure;
     const info = self.closures.get(@intCast(c.asPtr().id)) orelse return kotlinHashCode(v);
+    if (info.resolved) |kind| {
+        const target: u32 = switch (kind) {
+            .lambda => return kotlinHashCode(v),
+            .function_ref => |t| t.int(),
+            .property_ref => info.body_func.int(),
+        };
+        var h: i32 = @truncate(@as(i64, target) *% 31 +% 17);
+        const g = c.borrow();
+        defer g.deinit();
+        for (g.get().captures) |*x| h = h *% 31 +% try hashWithDispatch(self, allocator, x);
+        return h;
+    }
     const by_body: i32 = @truncate(@as(i64, @intCast(info.body_func.int())) *% 31 +% 17);
     if (info.is_ref) return by_body;
     const key_hash: ?i32 = blk: {

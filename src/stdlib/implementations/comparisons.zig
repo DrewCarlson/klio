@@ -96,7 +96,7 @@ fn compareViaCompareTo(
     b: *const Value,
 ) std.mem.Allocator.Error!?CmpResult {
     if (a.* != .Instance) return null;
-    const r = (try ctx.host.invokeMethod(a, "compareTo", &.{b.*}, ctx.out)) orelse return null;
+    const r = (try ctx.host.callWellKnown(a, .compare_to, &.{b.*}, ctx.out)) orelse return null;
     switch (r) {
         .ok => |v| {
             const n = v.asI64() orelse return null;

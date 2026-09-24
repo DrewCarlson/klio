@@ -1,0 +1,3 @@
+deep 1024
+shallow 12
+overflow 1024 runaway

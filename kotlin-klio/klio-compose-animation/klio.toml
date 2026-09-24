@@ -1,9 +1,12 @@
 # androidx.compose.animation — the upstream `animation` module, the layer above
-# animation-core: single-value animations over Color, and the spline-based
-# fling decay physics the foundation scroll containers use. Vendored verbatim
-# from compose-multiplatform-core (the sparse submodule hosted by
-# ../klio-compose-runtime). klioMain supplies the platform fling-friction
-# constant. A dependency of compose.foundation and material3.
+# animation-core: single-value animations over Color, the spline-based fling
+# decay physics the foundation scroll containers use, and the composable
+# transition and visibility surface (AnimatedVisibility, EnterTransition /
+# ExitTransition, Crossfade, AnimatedContent, the shared-element transitions).
+# Vendored verbatim from compose-multiplatform-core (the sparse submodule hosted
+# by ../klio-compose-runtime). klioMain supplies the platform actuals: the fling
+# friction constant and the density-aware spline decay. A dependency of
+# compose.foundation and material3.
 [library]
 id = "androidx.compose.animation"
 version = "1.12.0"
@@ -11,27 +14,24 @@ abi = 1
 implicit_packages = []
 auto_bindings = true
 
-# The self-contained files klio consumes today; the composable transition and
-# visibility surface (AnimatedVisibility, Crossfade, AnimatedContent) joins as
-# foundation grows into it.
+# The whole commonMain source set.
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/animation/animation/src/commonMain/kotlin"
-include = [
-    "androidx/compose/animation/ColorVectorConverter.kt",
-    "androidx/compose/animation/FlingCalculator.kt",
-    "androidx/compose/animation/SingleValueAnimation.kt",
-    "androidx/compose/animation/SplineBasedDecay.kt",
-    "androidx/compose/animation/SplineBasedFloatDecayAnimationSpec.kt",
-]
 
 [[source]]
 root = "klioMain"
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 "androidx.compose.runtime" = "*"
 "androidx.compose.animation.core" = "*"
+"androidx.compose.ui" = "*"
 "androidx.compose.ui.unit" = "*"
 "androidx.compose.ui.util" = "*"
 "androidx.compose.ui.geometry" = "*"
 "androidx.compose.ui.graphics" = "*"
+"androidx.compose.ui.text" = "*"
+"androidx.compose.foundation.layout" = "*"
+"androidx.collection" = "*"
+"kotlinx.coroutines" = "*"

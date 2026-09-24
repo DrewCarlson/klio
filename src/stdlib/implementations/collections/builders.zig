@@ -76,7 +76,7 @@ fn arraySizeArg(a: Allocator, v: Value, what: []const u8) Error!SizeOutcome {
     // error, which would unwind past `assertFailsWith`.
     if (n < 0) {
         const msg = try fmt(a, "{d}", .{n});
-        const e = try thrown(a, "kotlin.NegativeArraySizeException", msg);
+        const e = try thrown(a, "java.lang.NegativeArraySizeException", msg);
         if (runtime.freeScratch()) a.free(msg);
         return .{ .err = e };
     }
@@ -254,6 +254,27 @@ pub fn coll_list_of_not_null(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_array_of(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeArray(ctx.allocator, ctx.args, null));
+}
+
+/// `kotlin.__klio_arrayConcat(parts)`: a new array holding the elements of
+/// each array in `parts` in order, packed when the parts are primitive
+/// arrays. Code lowered from sema spreads arrays into a vararg with it.
+pub fn coll_array_concat(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 1 or ctx.args[0] != .Array) return .{ .err = .{ .Type = "__klio_arrayConcat takes an array of arrays" } };
+    const parts = ctx.args[0].Array;
+    var items: std.ArrayList(Value) = .empty;
+    var kind: ?PrimitiveArrayKind = null;
+    var i: usize = 0;
+    while (i < parts.len()) : (i += 1) {
+        const p = parts.get(i);
+        if (p != .Array) return .{ .err = .{ .Type = "__klio_arrayConcat joins arrays" } };
+        if (i == 0) kind = p.Array.primKind();
+        var j: usize = 0;
+        while (j < p.Array.len()) : (j += 1) try items.append(a, p.Array.get(j));
+    }
+    defer items.deinit(a);
+    return ok(try makeArray(a, items.items, kind));
 }
 
 pub fn coll_array_of_nulls(ctx: *CallCtx) Error!EvalResult {
@@ -529,7 +550,7 @@ pub fn materialiseIterableInstance(ctx: *CallCtx, value: Value) Error!ItemsOutco
     const keepalive = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(keepalive);
     runtime.keepalivePush(value);
-    const iter = (try ctx.host.invokeMethod(&value, "iterator", &.{}, ctx.out)) orelse
+    const iter = (try ctx.host.callWellKnown(&value, .iterator, &.{}, ctx.out)) orelse
         return .{ .err = typeErr("value is not iterable") };
     const iter_v = switch (iter) {
         .ok => |v| v,
@@ -541,14 +562,14 @@ pub fn materialiseIterableInstance(ctx: *CallCtx, value: Value) Error!ItemsOutco
     while (true) {
         runtime.keepaliveRestore(loop_keepalive);
         runtime.keepalivePushSlice(items.items);
-        const has_r = (try ctx.host.invokeMethod(&iter_v, "hasNext", &.{}, ctx.out)) orelse
+        const has_r = (try ctx.host.callWellKnown(&iter_v, .has_next, &.{}, ctx.out)) orelse
             return .{ .err = typeErr("iterator is missing hasNext()") };
         const has = switch (has_r) {
             .ok => |v| v,
             .err => |e| return .{ .err = .{ .err = e } },
         };
         if (!(has == .Bool and has.Bool)) break;
-        const item_r = (try ctx.host.invokeMethod(&iter_v, "next", &.{}, ctx.out)) orelse
+        const item_r = (try ctx.host.callWellKnown(&iter_v, .next, &.{}, ctx.out)) orelse
             return .{ .err = typeErr("iterator is missing next()") };
         const item = switch (item_r) {
             .ok => |v| v,
@@ -569,7 +590,7 @@ pub fn coll_to_typed_array(ctx: *CallCtx) Error!EvalResult {
     if (recv == .Instance) {
         // Dispatch through the collection's `toArray()` override before falling
         // back to iteration, so a user override observes the call.
-        if (try ctx.host.invokeMethod(&recv, "toArray", &.{}, ctx.out)) |r| switch (r) {
+        if (try ctx.host.callWellKnown(&recv, .to_array, &.{}, ctx.out)) |r| switch (r) {
             .ok => |v| {
                 if (v == .Array) return ok(v);
             },

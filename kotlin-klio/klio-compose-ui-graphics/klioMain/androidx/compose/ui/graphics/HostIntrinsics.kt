@@ -50,6 +50,8 @@ internal fun __skia_c_draw_path(handle: Long, pathText: String, argb: Int, style
 // (honouring its transform/clip); measure a run's advance width; read a font
 // vertical metric (which: 0 ascent<0, 1 descent>0, 2 leading) at a pixel size.
 internal fun __skia_c_draw_text(handle: Long, text: String, x: Float, y: Float, sizePx: Float, argb: Int): Long = error("intrinsic __skia_c_draw_text not installed")
+// A styled run: flags bit0 bold, bit1 italic, bit2 underline, bit3 strikethrough.
+internal fun __skia_c_draw_text2(handle: Long, text: String, x: Float, y: Float, sizePx: Float, argb: Int, flags: Int): Long = error("intrinsic __skia_c_draw_text2 not installed")
 internal fun __composeui_text_width(text: String, sizePx: Float): Float = error("intrinsic __composeui_text_width not installed")
 internal fun __composeui_font_metric(sizePx: Float, which: Int): Float = error("intrinsic __composeui_font_metric not installed")
 internal fun __skia_c_concat(handle: Long, sx: Float, kx: Float, tx: Float, ky: Float, sy: Float, ty: Float): Long = error("intrinsic __skia_c_concat not installed")

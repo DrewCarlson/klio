@@ -44,7 +44,7 @@ pub fn pair_second(ctx: *CallCtx) Error!EvalResult {
 fn displayElemH(ctx: *CallCtx, v: Value) Error!union(enum) { ok: []u8, err: EvalResult } {
     const a = ctx.allocator;
     if (v == .Instance) {
-        if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |m| {
+        if (try ctx.host.callWellKnown(&v, .to_string, &.{}, ctx.out)) |m| {
             switch (m) {
                 .ok => |sv| if (sv == .String) {
                     const g = sv.String.borrow();

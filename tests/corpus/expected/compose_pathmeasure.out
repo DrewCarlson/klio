@@ -1,0 +1,14 @@
+no path: length=0.0 position=Unspecified
+line: length=50.0
+  at 25: (15.0, 20.0), tangent (0.6, 0.8)
+  at 99 pins to the end: (30.0, 40.0)
+  10..20 -> true: Move 6.0,8.0; Line 6.0,8.0 12.0,16.0;
+open corner: length=20.0, at 15: (10.0, 5.0)
+forced closed: length=34.142, at 25: (6.464, 6.464)
+  5..15: Move 5.0,0.0; Line 5.0,0.0 10.0,0.0; Line 10.0,0.0 10.0,5.0;
+  15..5 -> false
+arch: length=147.9, middle (50.0, 50.0), tangent (1.0, 0.0)
+  first half: Move 0.0,0.0; Quadratic 0.0,0.0 25.0,50.0 50.0,50.0;
+circle: within 0.5 of pi*100: true
+second contour: length=20.0, starts at (5.0, 5.0)
+cleared: length=0.0

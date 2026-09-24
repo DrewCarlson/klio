@@ -21,7 +21,7 @@ const host_call_value = @import("host_call_value.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-const build = @import("../build.zig");
+const tables = @import("../tables.zig");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -65,19 +65,6 @@ const CtorBounds = common.CtorBounds;
 const installCtorBounds = common.installCtorBounds;
 const boundHead = common.boundHead;
 const takeCtorStaticHeads = common.takeCtorStaticHeads;
-const anonSiteName = common.anonSiteName;
-const AnonComplexInit = common.AnonComplexInit;
-const AnonInitThunk = common.AnonInitThunk;
-const AnonSuperArgThunk = common.AnonSuperArgThunk;
-const AnonDelegateThunk = common.AnonDelegateThunk;
-const AnonSiteThunks = common.AnonSiteThunks;
-const gcMarkAnonSites = common.gcMarkAnonSites;
-const anonSiteThunksGet = common.anonSiteThunksGet;
-pub const resetAnonSiteCache = common.resetAnonSiteCache;
-const anonSiteThunksPut = common.anonSiteThunksPut;
-pub const anonLowerEnter = common.anonLowerEnter;
-pub const anonLowerExit = common.anonLowerExit;
-pub const anonSiteModule = common.anonSiteModule;
 
 pub const ctor_select = @import("host_instances/ctor_select.zig");
 const classDefByName = ctor_select.classDefByName;
@@ -202,25 +189,10 @@ const retainFieldList = materialize.retainFieldList;
 const isThrowableDirectName = materialize.isThrowableDirectName;
 const isThrowableChainName = materialize.isThrowableChainName;
 
-const build_object = @import("host_instances/build_object.zig");
-const anonKey = build_object.anonKey;
-const buildCapturePairs = build_object.buildCapturePairs;
-const findCapture = build_object.findCapture;
-const snapshotCapture = build_object.snapshotCapture;
-const bareCaptureResolvable = build_object.bareCaptureResolvable;
-const capturedDelegateOf = build_object.capturedDelegateOf;
-pub const synthSetterThunk = build_object.synthSetterThunk;
-pub const synthThunk = build_object.synthThunk;
-const inheritAnonTypeParams = build_object.inheritAnonTypeParams;
-pub const buildObject = build_object.buildObject;
-const runAnonThunk = build_object.runAnonThunk;
-const evalSuperArg = build_object.evalSuperArg;
-
 const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
-    testing.refAllDecls(@import("host_instances/build_object.zig"));
     testing.refAllDecls(@import("host_instances/common.zig"));
     testing.refAllDecls(@import("host_instances/ctor_defaults.zig"));
     testing.refAllDecls(@import("host_instances/ctor_path.zig"));

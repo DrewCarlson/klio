@@ -51,17 +51,14 @@ changed.
 
 | was | lines | now | files | largest child |
 |---|---|---|---|---|
-| `ir/lower/expr.zig` | 27008 | `ir/lower/expr/` | 24 | 2229 |
 | `ir/ir.zig` | 17236 | `ir/core/` | 18 | 2365 |
 | `interp_ir/vm/host_call_member.zig` | 16968 | `.../host_call_member/` | 16 | 2112 |
 | `ir/eval.zig` | 13546 | `ir/eval/` | 17 | 1706 |
 | `stdlib/implementations/collections.zig` | 8222 | `.../collections/` | 13 | 1118 |
 | `cli/cgen.zig` | 8016 | `cli/cgen/` | 8 | 1848 |
 | `ir/jit_loop.zig` | 7304 | `ir/jit_loop/` | 10 | 1561 |
-| `interp_ir/build.zig` | 6495 | `interp_ir/build/` | 7 | 2988 |
 | `interp_ir/vm/host_instances.zig` | 6150 | `.../host_instances/` | 8 | 1399 |
 | `interp_ir/vm/host_fields.zig` | 5826 | `.../host_fields/` | 10 | 1572 |
-| `compose_pass/compose_pass.zig` | 5294 | `compose_pass/pass/` | 9 | 1829 |
 
 ### What a split has to get right
 

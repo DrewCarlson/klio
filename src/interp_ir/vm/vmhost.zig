@@ -57,6 +57,7 @@ const builtin_members = @import("builtin_members.zig");
 pub const host_globals = @import("host_globals.zig");
 pub const host_instances = @import("host_instances.zig");
 pub const host_impl = @import("host_impl.zig");
+pub const host_resolved = @import("host_resolved.zig");
 pub const intrinsic_host = @import("intrinsic_host.zig");
 pub const coroutines = @import("coroutines.zig");
 pub const compose = @import("compose.zig");
@@ -136,11 +137,9 @@ pub fn resetReceiverThreadLocals() void {
     compose.resetAtRunBoundary();
 }
 
-/// Drop the process-global anon-`object` site caches, whose keys and thunk sub-modules
-/// belong to the finished run. PROGRAM boundary only, never a Vm deinit: a transient Vm
-/// tears down while the classes registry still holds the site names as live keys.
+/// Drop the process-global caches that belong to the finished run. PROGRAM boundary
+/// only, never a Vm deinit.
 pub fn resetRunGlobalCaches() void {
-    host_instances.resetAnonSiteCache();
     host_call_member.resetStaticApplicabilityCache();
     // Invalidate every pointer-keyed dispatch cache in one stroke: entries carry a
     // generation stamp, so stale ones never hit, including on parked pool workers a
@@ -171,6 +170,9 @@ pub const SharedHandles = struct {
     threads: ThreadTable,
     object_states: ObjectStates,
     singletons_by_id: root.SingletonsById,
+    /// The run state of code lowered from sema, null for a module lowered
+    /// the other way.
+    resolved_state: ?ir.resolved.StateRef,
     allocator: Allocator,
 
     pub fn fromHost(host: *const VmHost) SharedHandles {
@@ -187,6 +189,7 @@ pub const SharedHandles = struct {
             .threads = host.threads,
             .object_states = host.object_states,
             .singletons_by_id = host.singletons_by_id,
+            .resolved_state = host.resolved_state,
             .allocator = host.allocator,
         };
     }
@@ -205,6 +208,7 @@ pub const SharedHandles = struct {
             .threads = host.threads,
             .object_states = host.object_states,
             .singletons_by_id = host.singletons_by_id,
+            .resolved_state = host.resolved_state,
             .allocator = host.allocator,
         };
     }
@@ -225,6 +229,9 @@ pub const VmHost = struct {
     threads: ThreadTable,
     object_states: ObjectStates,
     singletons_by_id: root.SingletonsById,
+    /// The run state of code lowered from sema, null for a module lowered
+    /// the other way.
+    resolved_state: ?ir.resolved.StateRef,
     allocator: Allocator,
     /// This thread's field caches: a view is stack-local to its building thread.
     tls: *host_fields.FieldsTls,
@@ -249,12 +256,24 @@ pub const VmHost = struct {
             .threads = state.threads,
             .object_states = state.object_states,
             .singletons_by_id = state.singletons_by_id,
+            .resolved_state = state.resolved_state,
             .allocator = state.allocator,
             .tls = host_fields.currentTls(),
             .ka = runtime.keepaliveHandle(),
         };
     }
 
+    pub const resolvedState = host_resolved.resolvedState;
+    pub const callNative = host_resolved.callNative;
+    pub const callNativeSite = host_resolved.callNativeSite;
+    pub const tryNative = host_resolved.tryNative;
+    pub const callWellKnown = host_resolved.callWellKnown;
+    pub const wellKnownObject = host_resolved.wellKnownObject;
+    pub const caughtValue = host_resolved.caughtValue;
+    pub const runResolved = host_resolved.runResolved;
+    pub const makeResolvedClosure = host_resolved.makeResolvedClosure;
+    pub const resolvedClosure = host_resolved.resolvedClosure;
+    pub const resumeValue = host_resolved.resumeValue;
     pub const callValue = host_call_value.callValue;
     pub const callableDeclaredArity = host_call_func.callableDeclaredArity;
     pub const prepareClosureFlatCall = host_call_value.prepareClosureFlatCall;
@@ -326,7 +345,6 @@ pub const VmHost = struct {
     pub const newInstance = host_instances.newInstance;
     pub const newInstanceNamed = host_instances.newInstanceNamed;
     pub const classSecondaryCtorCanBind = host_instances.classSecondaryCtorCanBind;
-    pub const buildObject = host_instances.buildObject;
     pub const getField = host_fields.getField;
     /// `EnumClass.Entry` served by index: the entries are built on first use,
     /// so the read has to run that before it can index them.
@@ -375,9 +393,6 @@ pub const VmHost = struct {
     pub const contextValueOfType = host_context.contextValueOfType;
     pub const isConcreteCastTarget = host_classes.isConcreteCastTarget;
     pub const isDeclaredClassNameFrom = host_classes.isDeclaredClassNameFrom;
-    pub const registerClass = host_classes.registerClass;
-    pub const registerClassCaptured = host_classes.registerClassCaptured;
-    pub const localClassValue = host_classes.localClassValue;
     pub const lookupGlobal = host_globals.lookupGlobal;
     pub const composeSnapshotGlobals = host_globals.composeSnapshotGlobals;
     pub const lookupGlobalById = host_globals.lookupGlobalById;
@@ -387,7 +402,6 @@ pub const VmHost = struct {
     pub const isShadowingCapture = host_globals.isShadowingCapture;
     pub const scopedLocalBinds = host_globals.scopedLocalBinds;
     pub const buildClosure = host_call_value.buildClosure;
-    pub const buildAstLambdaWithFlagFuncid = host_call_value.buildAstLambdaWithFlagFuncid;
     pub const callableReceiverShape = host_call_value.callableReceiverShape;
     pub const callableAcceptsArgs = host_call_value.callableAcceptsArgs;
     pub const callableAcceptsCall = host_call_value.callableAcceptsCall;
@@ -432,6 +446,9 @@ pub const VmIntrinsicHost = struct {
     threads: ThreadTable,
     object_states: ObjectStates,
     singletons_by_id: root.SingletonsById,
+    /// The run state of code lowered from sema, null for a module lowered
+    /// the other way.
+    resolved_state: ?ir.resolved.StateRef,
     allocator: Allocator,
 
     /// Borrows handles by value, under `VmHost.borrowed`'s non-owning contract.
@@ -449,6 +466,7 @@ pub const VmIntrinsicHost = struct {
             .threads = state.threads,
             .object_states = state.object_states,
             .singletons_by_id = state.singletons_by_id,
+            .resolved_state = state.resolved_state,
             .allocator = state.allocator,
         };
     }
@@ -470,6 +488,12 @@ fn ivInvokeCallableWithThis(ctx: *anyopaque, callable: *const Value, args: []con
 }
 fn ivInvokeMethod(ctx: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
     return intrinsic_host.invokeMethod(ip(ctx), receiver, name, args, out);
+}
+fn ivWellKnownObject(ctx: *anyopaque, object: runtime.WellKnownObject) Allocator.Error!?Value {
+    return intrinsic_host.wellKnownObject(ip(ctx), object);
+}
+fn ivCallWellKnown(ctx: *anyopaque, receiver: *const Value, member: runtime.WellKnown, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
+    return intrinsic_host.callWellKnown(ip(ctx), receiver, member, args, out);
 }
 fn ivGetProperty(ctx: *anyopaque, receiver: *const Value, name: []const u8, out: Output) Allocator.Error!?RuntimeEvalResult {
     return intrinsic_host.getProperty(ip(ctx), receiver, name, out);
@@ -539,8 +563,8 @@ fn ivLookupGlobalFunc(ctx: *anyopaque, name: []const u8) ?Value {
 fn ivCoroutineResumeExternal(ctx: *anyopaque, slot: i64, value: Value, out: Output) void {
     intrinsic_host.coroutineResumeExternal(ip(ctx), slot, value, out);
 }
-fn ivCoroutineResumeContinuation(ctx: *anyopaque, slot: i64, value: Value, out: Output) void {
-    intrinsic_host.coroutineResumeContinuation(ip(ctx), slot, value, out);
+fn ivCoroutineResumeContinuation(ctx: *anyopaque, slot: i64, value: Value, out: Output) ?Value {
+    return intrinsic_host.coroutineResumeContinuation(ip(ctx), slot, value, out);
 }
 fn ivCoroutineDrainToIdle(ctx: *anyopaque, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineDrainToIdle(ip(ctx), out);
@@ -548,8 +572,8 @@ fn ivCoroutineDrainToIdle(ctx: *anyopaque, out: Output) Allocator.Error!?Runtime
 fn ivCoroutineDispatchPooled(ctx: *anyopaque, block: *const Value, io_kind: bool, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineDispatchPooled(ip(ctx), block, io_kind, out);
 }
-fn ivSpawnOsThread(ctx: *anyopaque, block: *const Value, out: Output) Allocator.Error!HostResultU64 {
-    return intrinsic_host.spawnOsThread(ip(ctx), block, out);
+fn ivSpawnOsThread(ctx: *anyopaque, block: *const Value, name: []const u8, out: Output) Allocator.Error!HostResultU64 {
+    return intrinsic_host.spawnOsThread(ip(ctx), block, name, out);
 }
 fn ivJoinOsThread(ctx: *anyopaque, id: u64) Allocator.Error!?RuntimeError {
     return intrinsic_host.joinOsThread(ip(ctx), id);
@@ -579,6 +603,7 @@ fn ivPersist(ctx: *anyopaque) IntrinsicHost {
         .threads = src.threads.clone(),
         .object_states = src.object_states.clone(),
         .singletons_by_id = src.singletons_by_id.clone(),
+        .resolved_state = if (src.resolved_state) |rs| rs.clone() else null,
         .allocator = src.allocator,
     };
     return .{ .ctx = p, .vtable = &intrinsic_vtable };
@@ -600,6 +625,8 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .invoke_callable = ivInvokeCallable,
     .invoke_callable_with_this = ivInvokeCallableWithThis,
     .invoke_method = ivInvokeMethod,
+    .call_well_known = ivCallWellKnown,
+    .well_known_object = ivWellKnownObject,
     .get_property = ivGetProperty,
     .construct_named = ivConstructNamed,
     .lookup_global = ivLookupGlobal,
@@ -645,6 +672,7 @@ test {
     _ = host_globals;
     _ = host_instances;
     _ = host_impl;
+    _ = host_resolved;
     _ = intrinsic_host;
     _ = coroutines;
     _ = trace;

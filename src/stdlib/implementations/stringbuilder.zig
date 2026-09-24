@@ -187,7 +187,7 @@ fn appendOverflowGuard(ctx: *CallCtx, sb: StringBuilderRef, v: *const Value) All
         },
         .Instance => blk: {
             if (!instanceIsCharSequence(v)) return null;
-            const r = ctx.host.getProperty(v, "length", ctx.out) catch return null;
+            const r = ctx.host.callWellKnown(v, .length, &.{}, ctx.out) catch return null;
             const res = r orelse return null;
             switch (res) {
                 .ok => |lv| break :blk lv.asI64() orelse return null,
@@ -202,7 +202,7 @@ fn appendOverflowGuard(ctx: *CallCtx, sb: StringBuilderRef, v: *const Value) All
         break :blk @intCast(g.get().items.len);
     };
     if (cur + add > std.math.maxInt(i32)) {
-        return try thrown(ctx.allocator, "kotlin.OutOfMemoryError", "Requested character sequence exceeds the maximum length");
+        return try thrown(ctx.allocator, "java.lang.OutOfMemoryError", "Requested character sequence exceeds the maximum length");
     }
     return null;
 }
@@ -248,7 +248,7 @@ fn renderPiece(ctx: *CallCtx, v: Value) Allocator.Error![]u8 {
         // `append(Any?)` calls the value's `toString()`, so a user override and a
         // container's own rendering fire.
         .Instance, .List, .Set, .Map, .Pair, .Triple, .Result => {
-            if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |res| {
+            if (try ctx.host.callWellKnown(&v, .to_string, &.{}, ctx.out)) |res| {
                 switch (res) {
                     .ok => |sv| if (sv == .String) {
                         const g = sv.String.borrow();
@@ -447,7 +447,7 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                     buf.deinit(a);
                     const msg = try std.fmt.allocPrint(a, "{d}", .{n});
                     defer if (runtime.freeScratch()) a.free(msg);
-                    return thrown(a, "kotlin.NegativeArraySizeException", msg);
+                    return thrown(a, "java.lang.NegativeArraySizeException", msg);
                 }
                 try buf.ensureTotalCapacityPrecise(a, @intCast(n));
             },
@@ -1114,7 +1114,7 @@ test "string builder ctor negative capacity throws" {
     try testing.expect(r == .err);
     try testing.expect(r.err == .Thrown);
     defer freeSb(r.err.Thrown, a);
-    try testing.expectEqualStrings("kotlin.NegativeArraySizeException", r.err.Thrown.exceptionFqn().?);
+    try testing.expectEqualStrings("java.lang.NegativeArraySizeException", r.err.Thrown.exceptionFqn().?);
 }
 
 test "append concatenates values" {

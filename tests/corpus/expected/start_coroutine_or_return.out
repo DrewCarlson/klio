@@ -1,0 +1,4 @@
+direct: returned value, completion got null
+suspends: returned suspended, completion got resumed
+throws: returned threw early, completion got null
+suspends again: returned suspended, completion got resumed!

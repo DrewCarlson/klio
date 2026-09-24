@@ -12,7 +12,6 @@ const ast = @import("ast");
 const runtime = @import("runtime");
 pub fn runtimeEnvSetOnce(comptime n: [:0]const u8) bool { return runtime.envSetOnce(n); }
 const applicability = @import("applicability");
-const types_mod = @import("types");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -20,10 +19,8 @@ const Allocator = std.mem.Allocator;
 pub const Span = span.Span;
 pub const FileId = span.FileId;
 
-pub const build = @import("build.zig");
 pub const eval = @import("eval.zig");
 pub const bc = @import("bc.zig");
-pub const lower = @import("lower.zig");
 pub const hot_layout = @import("hot_layout.zig");
 pub const jit_loop = @import("jit_loop.zig");
 pub const disasm = @import("disasm.zig");
@@ -63,10 +60,18 @@ pub const classTypeParamIdentity = core_ids.classTypeParamIdentity;
 pub const ClassTypeParamIdentity = core_ids.ClassTypeParamIdentity;
 pub const parseClassTypeParamIdentity = core_ids.parseClassTypeParamIdentity;
 pub const ConstId = core_ids.ConstId;
-pub const ScopeRename = core_ids.ScopeRename;
-pub const ScopeClassRef = core_ids.ScopeClassRef;
+pub const NativeId = core_ids.NativeId;
+pub const StaticId = core_ids.StaticId;
+pub const NO_FUNC = core_ids.NO_FUNC;
 
 pub const snapshot_fast = @import("snapshot_fast.zig");
+
+/// Identities and run-time tables for code lowered from sema.
+pub const bridge = @import("core/bridge.zig");
+pub const resolved = @import("core/resolved.zig");
+pub const Resolved = resolved.Resolved;
+/// Lowering from sema's records.
+pub const lower_sema = @import("lower/sema/mod.zig");
 
 pub const Inst = core_inst.Inst;
 pub const CallMemberInst = core_inst.CallMemberInst;
@@ -76,14 +81,14 @@ pub const SUPER_WRITE_QUALIFIED = core_inst.SUPER_WRITE_QUALIFIED;
 pub const SuperAnswer = m_fields.SuperAnswer;
 pub const SuperAccess = m_fields.SuperAccess;
 pub const CTOR_PICK_NONE = core_inst.CTOR_PICK_NONE;
+pub const NO_UNIT = core_inst.NO_UNIT;
+pub const NO_CLASS = core_inst.NO_CLASS;
 pub const BuiltinField = core_inst.BuiltinField;
 pub const CallMemberExtra = core_inst.CallMemberExtra;
 pub const CallVirtualInst = core_inst.CallVirtualInst;
 pub const CallVirtualExtra = core_inst.CallVirtualExtra;
 pub const CallSpreadInst = core_inst.CallSpreadInst;
 pub const CallMemberOrGlobalInst = core_inst.CallMemberOrGlobalInst;
-pub const AstLambdaInst = core_inst.AstLambdaInst;
-pub const BuildObjectInst = core_inst.BuildObjectInst;
 pub const SpreadPart = core_inst.SpreadPart;
 pub const BinOp = core_inst.BinOp;
 pub const UnOp = core_inst.UnOp;
@@ -128,113 +133,6 @@ pub const FuncIndexEntry = core_class.FuncIndexEntry;
 pub const StrPair = core_class.StrPair;
 const StrPairMap = core_class.StrPairMap;
 
-/// The eager pipeline's hand-off: the driver computes the per-call resolution before
-/// the module exists and parks it here; the next module on this thread adopts it.
-pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null;
-/// Companion for picks whose declaration came from a prebuilt image: a FuncId, not a span.
-pub threadlocal var pending_eager_call_fids: ?std.AutoHashMap(span.Span, u32) = null;
-/// Per-expression static type heads from typeck: `Span(expr) -> {head, nullable}`.
-pub threadlocal var pending_eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null;
-
-pub const EagerTypeHead = struct {
-    name: []const u8,
-    nullable: bool,
-    /// A primitive head. The map feeds two questions and they want different
-    /// answers: argument applicability treats a primitive head as exact while a
-    /// literal coerces, so `eagerTypeOf` declines these; a RECEIVER question
-    /// wants them, and `eagerRecvTypeOf` serves them.
-    primitive: bool = false,
-};
-/// Receiver-lambda channel: body-block span -> receiver class head.
-pub threadlocal var pending_eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null;
-/// Fn-typed lambda-param shapes: param ident span -> {has_receiver, arity}.
-pub threadlocal var pending_eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null;
-
-pub const EagerParamShape = struct { has_receiver: bool, arity: u16 };
-
-/// The five pick tables as one value, for a stage that ran on another
-/// thread: it moves its thread's tables here and the build adopts them into
-/// the module it is building.
-pub const StagedPicks = struct {
-    calls: ?std.AutoHashMap(span.Span, span.Span) = null,
-    call_fids: ?std.AutoHashMap(span.Span, u32) = null,
-    types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
-    recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
-    param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
-};
-
-/// Frees whatever is pending on the calling thread: a program that publishes
-/// picks for a new source map must not inherit another program's, whose
-/// spans it would read as its own.
-pub fn discardPendingPicks() void {
-    var p = takePendingPicks();
-    if (p.calls) |*m| m.deinit();
-    if (p.call_fids) |*m| m.deinit();
-    if (p.types) |*m| m.deinit();
-    if (p.recv_heads) |*m| m.deinit();
-    if (p.param_shapes) |*m| m.deinit();
-}
-
-/// Moves the calling thread's pending tables out, leaving none pending.
-pub fn takePendingPicks() StagedPicks {
-    const out: StagedPicks = .{
-        .calls = pending_eager_calls,
-        .call_fids = pending_eager_call_fids,
-        .types = pending_eager_types,
-        .recv_heads = pending_eager_recv_heads,
-        .param_shapes = pending_eager_param_shapes,
-    };
-    pending_eager_calls = null;
-    pending_eager_call_fids = null;
-    pending_eager_types = null;
-    pending_eager_recv_heads = null;
-    pending_eager_param_shapes = null;
-    return out;
-}
-
-/// Written by a stage thread before it is joined, read by the build after.
-pub var staged_picks: ?StagedPicks = null;
-
-/// Installed while a lazy build's program runs: a function about to
-/// execute with no blocks is handed here to lower first.
-pub var lazy_hook: ?*const fn (*const Module, *Func) void = null;
-
-/// Context parameters of a local contextual function, threaded into its body lowering.
-pub const PendingCtx = struct {
-    params: []const ast.ContextParam,
-    type_params: []const ast.TypeParam,
-};
-
-/// A context value in scope at a lowering site: the local it is bound to and its
-/// declared type head, which a contextual call matches its parameters against.
-pub const ContextLocal = struct {
-    name: []const u8,
-    ty: []const u8,
-};
-
-/// A local `fun`'s name plus the mangled overload cell a bare self-reference calls through.
-pub const SelfLocalFn = struct {
-    name: []const u8,
-    mangled: []const u8,
-};
-
-pub const RecvHeadKV = struct { name: []const u8, head: ?[]const u8 };
-/// A function-typed local or parameter and the value-parameter arity of each
-/// of its own parameters; `-1` marks a parameter that is not a function type.
-pub const FnValueAritiesKV = struct { name: []const u8, arities: []const i16 };
-
-/// One type-parameter bound ref with type arguments; owned by the module allocator.
-pub const PendingBoundRef = struct {
-    param: []const u8,
-    ref: TypeRef,
-};
-
-pub const PendingLocalDeclTypes = struct {
-    types: runtime.NameHashMap(TypeRef),
-    nullable: runtime.NameHashMap(void),
-    call_returns: runtime.NameHashMap(EagerTypeHead),
-};
-
 pub const Module = struct {
     /// A `Module` may be written only during single-threaded setup, before any interpreter
     /// thread runs; the sole writer is the class-id overlay `linkProgramForms` builds at `Vm`
@@ -254,88 +152,6 @@ pub const Module = struct {
     late_funcs: std.ArrayList(*Func) = .empty,
     /// Route `appendFunc` to `late_funcs`: frames may hold `*const Func` while it grows.
     funcs_live: bool = false,
-    /// Lowering scratch: a local contextual function's context parameters for its body prologue.
-    pending_ctx: ?PendingCtx = null,
-    /// Reference key for the next lowered lambda (an adapted callable reference's wrapper).
-    pending_ref_key: ?[]const u8 = null,
-    /// Lowering scratch: declared types of a synthesized parameter thunk's params, by position.
-    pending_param_types: ?[]const ?ast.TypeRef = null,
-    /// Expected type of the next parameter-thunk expression, instantiated by the supertype args.
-    pending_thunk_expected: ?ast.TypeRef = null,
-    /// A member extension property accessor's receiver label (the property name): `this@<prop>`
-    /// binds the receiver, and a local class in the body captures `this@<Owner>`.
-    pending_accessor_this_label: ?[]const u8 = null,
-    pending_accessor_dispatch_owner: ?[]const u8 = null,
-    /// The reserved id an accessor about to lower fills, when its header was
-    /// placed before the bodies so reads could bind it.
-    pending_accessor_place_id: ?FuncId = null,
-    /// Lowering scratch: callable arity mask of the owner class's members. A name that is only
-    /// ever a property carries mask 0, so a bare call of it is not read as a companion call.
-    pending_own_member_arity: ?*const runtime.NameHashMap(u64) = null,
-    /// Implicit label of the argument lambda about to lower. Its body binds `this@<label>` so
-    /// a reference from a nested scope reaches THAT receiver, not the innermost `this`.
-    pending_lambda_this_label: ?[]const u8 = null,
-    /// Receiver type in scope at the lambda body about to lower, carried in as `enclosing_recv_ty`.
-    pending_lambda_enclosing_recv: ?[]const u8 = null,
-    /// Full implicit receiver tower for the lambda body about to lower, innermost first.
-    pending_lambda_receiver_tower: ?[]const ReceiverTowerEntry = null,
-    /// Structural type of `pending_lambda_own_recv`, transferred into the body's builder.
-    pending_lambda_own_recv_type: ?TypeRef = null,
-    /// Declared extension receiver of the local function whose body is about to lower, so its
-    /// bare calls resolve exactly as in a top-level extension body.
-    pending_lambda_own_recv: ?[]const u8 = null,
-    /// The pending body belongs to a LOCAL `fun` with a block body: fall-through returns Unit,
-    /// never the tail statement's value. A lambda literal yields its last expression instead.
-    pending_lambda_fn_block_body: bool = false,
-    /// The pending lambda literal binds a `(...) -> Unit` parameter: its tail expression runs
-    /// for effect and the lambda returns Unit. Consumed on entry so it never leaks inward.
-    pending_lambda_unit: bool = false,
-    /// Non-reified type-parameter names in scope, so an `x as T` inside the lambda stays erased.
-    pending_lambda_type_params: ?[]const []const u8 = null,
-    /// The enclosing splice's reified type-parameter substitutions, carried into a lambda body
-    /// lowered inside it; the runtime's bound class value cannot carry nullability.
-    pending_lambda_reified_names: ?[]const ReifiedName = null,
-    /// Effective upper bounds parallel to the type-parameter names carried into the body.
-    pending_lambda_type_param_bounds: ?[]const ModuleRegistry.TypeParamBound = null,
-    /// Full bound refs with type arguments for the pending body; the lambda body takes ownership.
-    pending_lambda_type_param_bound_refs: ?[]PendingBoundRef = null,
-    /// Contextual fn-type parameters of the enclosing builder, so a nested implicit call splits contexts.
-    pending_lambda_ctx_fn_shapes: ?[]PendingCtxFnShape = null,
-    /// Receiver-lambda param names to the enclosing builder's declared receiver heads, so a
-    /// captured receiver-fn param invoked bare re-selects by its head. Slices are borrowed.
-    pending_lambda_recv_heads: ?[]RecvHeadKV = null,
-    /// Captured function-typed callables' own parameter arities, so a call
-    /// through one inside a nested lambda still shapes its lambda arguments.
-    pending_lambda_fn_value_arities: ?[]FnValueAritiesKV = null,
-    /// The caller's solved fn-type-parameter bindings for an inline splice; tys owned by the
-    /// lowering allocator.
-    pending_splice_solved: ?[]Module.TypeBinding = null,
-    /// Instantiated value-parameter types for the pending lambda literal; the body takes ownership.
-    pending_lambda_param_types: ?[]TypeRef = null,
-    /// Context parameters of the anonymous function lowered next, bound as its leading context slots.
-    pending_lambda_ctx_params: ?[]const ast.ContextParam = null,
-    /// The thunk about to lower is an inner class's constructor context, whose
-    /// leading `this` parameter is the enclosing instance, not the owner's.
-    pending_this_is_outer: bool = false,
-    /// The context parameter type heads of the lambda literal lowered next, from its expected
-    /// function type or the call site's record of its parameter; bound as anonymous context slots.
-    pending_lambda_ctx_types: ?[]const []const u8 = null,
-    /// The context values in scope at the lambda's construction site, innermost first; the body
-    /// captures one by name when a contextual call inside needs it.
-    pending_lambda_ctx_scope: ?[]const ContextLocal = null,
-    /// The local `fun` about to lower: its name and mangled overload cell. A bare self-reference
-    /// calls through the cell, since the plain-name slot is shared with later same-named siblings.
-    pending_lambda_self_fn: ?SelfLocalFn = null,
-    /// The next lambda body's declared shape is KNOWN to take no receiver, so its bare calls
-    /// may consult the enclosing receiver tier. A merely untyped receiver must not.
-    pending_lambda_no_receiver: bool = false,
-    /// Enclosing locals with definite non-callable evidence, so a bare call is not the captured value.
-    pending_lambda_nonfn_locals: ?runtime.NameHashMap(void) = null,
-    /// Vararg parameter names of the local `fun` about to lower: inside the body the static
-    /// type is the materialized array, not the annotated element. Borrowed from the AST.
-    pending_lambda_vararg_params: ?[]const []const u8 = null,
-    /// Declared type heads of enclosing locals the lambda captures, preserving the compile-time type.
-    pending_lambda_local_decl_types: ?PendingLocalDeclTypes = null,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each self-contained and
     /// decoded on first execution. Borrows the image buffer; empty unless image-loaded.
     deferred_func_section: []const u8 = &.{},
@@ -352,8 +168,6 @@ pub const Module = struct {
     func_header_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Distinct first FQN segment of every lazy base func. Borrowed from the image.
     func_fqn_heads: []const []const u8 = &.{},
-    /// Ids of the lazy base's bodyless funcs. Borrowed from the image.
-    bodyless_func_ids: []const u32 = &.{},
     classes: std.ArrayList(Class) = .empty,
     consts: std.ArrayList(Const) = .empty,
     /// Top-level (file-scope) function ids, in declaration order.
@@ -400,34 +214,19 @@ pub const Module = struct {
     class_parent: ?std.AutoHashMap(ClassId, ClassId) = null,
     /// Each lowered declaration's AST name-span to its FuncId, composed with typeck's call records.
     func_by_decl_span: ?std.AutoHashMap(span.Span, FuncId) = null,
-    /// A per-anon-site image clone that runtime-synthesized members lower into. Decl-span
-    /// reservations are off on it: synthesized thunks share their property ident's span.
-    anon_side: bool = false,
-    /// The eager pipeline's per-call resolution, `Span(callee) -> Span(decl)`; absent spans go lazy.
-    eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null,
-    eager_call_fids: ?std.AutoHashMap(span.Span, u32) = null,
-    /// Typeck's per-expression static type heads.
-    eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
-    eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
     /// Extension-candidate index: receiver head to the extension names declared on it, plus the
     /// generic-receiver names that apply to every head. Rebuilt lazily as declarations grow.
     ext_names_by_recv_head: ?runtime.NameHashMap(runtime.NameHashMap(ExtArity)) = null,
     generic_ext_names: ?runtime.NameHashMap(ExtArity) = null,
     ext_index_decl_count: usize = 0,
-    eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, runtime.NameHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name; a matching Path callee lowers to `Inst.Call`.
     func_index: std.ArrayList(FuncIndexEntry) = .empty,
     /// Simple-name index over `func_index` for O(1) name-to-FuncIds in declaration order.
     func_name_index: runtime.NameHashMap(std.ArrayList(FuncId)),
     package: ?[]const u8 = null,
-    /// Top-level function names declared `tailrec`, populated before bodies lower so a caller
-    /// can emit `TailCallFunc` into a tailrec function whose body is not lowered yet.
-    tailrec_fn_names: std.ArrayList([]const u8) = .empty,
     /// Per-class and per-function side tables the build produces and the Vm reads at dispatch.
     registry: ModuleRegistry,
-    /// Declared user-parameter count (excluding an implicit extension `this`) per top-level `FuncId`.
-    decl_user_params: std.AutoHashMap(u32, u32),
     /// Declared user parameters' `(required, total, has_vararg)` per top-level `FuncId`.
     decl_user_arity: std.AutoHashMap(u32, DeclArity),
     /// Declared user parameters' full structural types per top-level `FuncId`, recorded at header
@@ -461,9 +260,9 @@ pub const Module = struct {
     /// Link-time field layout, indexed by `ClassId`: every slot an instance of that
     /// class holds, in order, composed from what each class in the chain publishes.
     field_layout: std.ArrayList(ClassFieldLayout) = .empty,
-    /// Ambiguous bare calls the symbol index refused to pick among, surfaced by the build
-    /// driver before the program runs. Name and FQN slices borrow from the module's own data.
-    resolve_diags: std.ArrayList(ResolveDiag) = .empty,
+    /// The run-time tables of code lowered from sema; null for a module lowered
+    /// the other way.
+    resolved: ?*Resolved = null,
 
     /// `(required, total, has_vararg)` for a top-level function's declared user parameters.
     /// `has_vararg` is true for a vararg at ANY position, which Kotlin allows.
@@ -578,89 +377,11 @@ pub const Module = struct {
         sole_unknown_best_tier: bool = false,
     };
 
-    /// One ambiguous bare-call diagnostic: the call-site name and span plus the first two
-    /// identical-signature candidates' FQNs and declaration spans (null with no phase-1 record).
-    pub const ResolveDiag = struct {
-        name: []const u8,
-        fqn_a: []const u8,
-        fqn_b: []const u8,
-        span: Span,
-        span_a: ?Span = null,
-        span_b: ?Span = null,
-        kind: Kind = .ambiguous,
-
-        pub const Kind = enum {
-            /// Two in-scope candidates nothing can tell apart.
-            ambiguous,
-            /// Every candidate lives in a package the caller neither declares, imports, nor sees by
-            /// default. Kotlin does not resolve such a reference at all.
-            unresolved,
-            /// A simple in-scope reference resolves to nothing: notably an `it` in a lambda that
-            /// declares no parameters, is not invoked with one argument, and has no enclosing `it`.
-            unresolved_local,
-        };
-
-        /// Render the diagnostic with call and declaration sites located as `path:line`. Identical
-        /// FQNs are conflicting overloads, fixable only declaration-side; distinct ones are a tie.
-        pub fn render(self: ResolveDiag, allocator: Allocator, map: *const span.SourceMap) Allocator.Error![]u8 {
-            const call_loc = try locOf(allocator, map, self.span);
-            defer allocator.free(call_loc);
-            if (self.kind == .unresolved_local) {
-                return std.fmt.allocPrint(
-                    allocator,
-                    "{s}: error: unresolved reference `{s}`",
-                    .{ call_loc, self.name },
-                );
-            }
-            if (self.kind == .unresolved) {
-                if (self.fqn_b.len != 0 and !std.mem.eql(u8, self.fqn_a, self.fqn_b)) {
-                    return std.fmt.allocPrint(
-                        allocator,
-                        "{s}: error: unresolved reference `{s}`: candidates `{s}` and `{s}` exist but neither package is imported here — add an import for one or qualify the call",
-                        .{ call_loc, self.name, self.fqn_a, self.fqn_b },
-                    );
-                }
-                return std.fmt.allocPrint(
-                    allocator,
-                    "{s}: error: unresolved reference `{s}`: `{s}` is declared in package `{s}`, which is not imported here — add `import {s}` or qualify the call",
-                    .{ call_loc, self.name, self.fqn_a, packageOfFqn(self.fqn_a, self.name), self.fqn_a },
-                );
-            }
-            if (std.mem.eql(u8, self.fqn_a, self.fqn_b) and self.span_a != null and self.span_b != null) {
-                const loc_a = try locOf(allocator, map, self.span_a.?);
-                defer allocator.free(loc_a);
-                const loc_b = try locOf(allocator, map, self.span_b.?);
-                defer allocator.free(loc_b);
-                return std.fmt.allocPrint(
-                    allocator,
-                    "{s}: error: conflicting overloads of `{s}`: identical signatures declared at {s} and {s} — rename or remove one of the declarations",
-                    .{ call_loc, self.name, loc_a, loc_b },
-                );
-            }
-            return std.fmt.allocPrint(
-                allocator,
-                "{s}: error: ambiguous reference `{s}`: candidates `{s}`, `{s}` — qualify the call or import one explicitly",
-                .{ call_loc, self.name, self.fqn_a, self.fqn_b },
-            );
-        }
-
-        fn locOf(allocator: Allocator, map: *const span.SourceMap, s: Span) Allocator.Error![]u8 {
-            if (s.file.int() >= map.files.items.len) {
-                return std.fmt.allocPrint(allocator, "?:{d}", .{s.start});
-            }
-            const sf = map.get(s.file);
-            const lc = sf.lineCol(s.start);
-            return std.fmt.allocPrint(allocator, "{s}:{d}", .{ sf.path, lc.line });
-        }
-    };
-
     pub const init = m_lookup.init;
     pub const default = m_lookup.default;
     pub const ensureFuncBody = m_lookup.ensureFuncBody;
     pub const funcById = m_lookup.funcById;
     pub const funcByIdMut = m_lookup.funcByIdMut;
-    pub const adoptPicks = m_lookup.adoptPicks;
-    pub const cloneForExtendComplete = m_lookup.cloneForExtendComplete;
     pub const appendedFuncCount = m_lookup.appendedFuncCount;
     pub const appendFunc = m_lookup.appendFunc;
     pub const nextFuncId = m_lookup.nextFuncId;
@@ -1056,7 +777,6 @@ pub const Module = struct {
 
     pub const funcCount = m_lookup.funcCount;
     pub const deinit = m_lookup.deinit;
-    pub const cloneForExtend = m_lookup.cloneForExtend;
     pub const classId = m_lookup.classId;
     pub const uniqueClassIdBySimpleName = m_lookup.uniqueClassIdBySimpleName;
     pub const simpleNameIsAmbiguous = m_lookup.simpleNameIsAmbiguous;
@@ -1065,22 +785,12 @@ pub const Module = struct {
     pub const classNameCandidates = m_lookup.classNameCandidates;
     pub const topUpClassNameCache = m_lookup.topUpClassNameCache;
     pub const buildClassIdMap = m_lookup.buildClassIdMap;
-    pub const installEagerCalls = m_lookup.installEagerCalls;
-    pub const eagerTypeOf = m_lookup.eagerTypeOf;
-    pub const eagerRecvTypeOf = m_lookup.eagerRecvTypeOf;
-    pub const eagerEntryState = m_lookup.eagerEntryState;
-    pub const eagerRawHead = m_lookup.eagerRawHead;
-    pub const eager_miss_counts = &m_lookup.eager_miss_counts;
-    pub const eagerParamShapeOf = m_lookup.eagerParamShapeOf;
     pub const ExtCouldApplyWhy = m_lookup.ExtCouldApplyWhy;
     pub const ExtArity = m_lookup.ExtArity;
     pub const extCouldApply = m_lookup.extCouldApply;
     pub const extCouldApplyWhy = m_lookup.extCouldApplyWhy;
     pub const mergeExtArity = m_lookup.mergeExtArity;
     pub const rebuildExtIndex = m_lookup.rebuildExtIndex;
-    pub const eagerRecvHeadOf = m_lookup.eagerRecvHeadOf;
-    pub const eagerExternCallTarget = m_lookup.eagerExternCallTarget;
-    pub const eagerCallTarget = m_lookup.eagerCallTarget;
     pub const recordFuncDeclSpan = m_lookup.recordFuncDeclSpan;
     pub const funcByDeclSpan = m_lookup.funcByDeclSpan;
     pub const classDirectChild = m_lookup.classDirectChild;
@@ -1237,4 +947,7 @@ test {
     testing.refAllDecls(@import("core/tests_support.zig"));
     _ = site_census;
     testing.refAllDecls(site_census);
+    testing.refAllDecls(resolved);
+    testing.refAllDecls(bridge);
+    _ = lower_sema;
 }

@@ -43,6 +43,57 @@ pub const ReceiverShape = struct { n_params: usize, first_is_this: bool };
 /// No-op host for ir's own tests and the default for the bare `eval` entry: every method returns the
 /// trait default (`Unsupported`/`null`/`false`/empty). The evaluator is generic over the host type.
 pub const NullHost = struct {
+    /// The run state code lowered from sema reads; null until a test sets
+    /// one, and every static, singleton and construction then fails.
+    resolved_state: ?ir.resolved.StateRef = null,
+    /// What a resumed activation receives in place of its resume value;
+    /// null passes the value through.
+    resume_as: ?Value = null,
+    /// Whether the parked frames were on the thread's resume root when the
+    /// resume value was asked for.
+    resume_rooted: bool = false,
+
+    pub fn resolvedState(self: *NullHost) ?ir.resolved.StateRef {
+        return self.resolved_state;
+    }
+
+    pub fn resumeValue(self: *NullHost, allocator: Allocator, v: Value) Allocator.Error!Value {
+        _ = allocator;
+        const node = ev_state.evtlsPtr().resuming;
+        self.resume_rooted = node != null and node.?.head.* < node.?.frames.items.len;
+        return self.resume_as orelse v;
+    }
+
+    pub fn callNative(self: *NullHost, allocator: Allocator, id: ir.NativeId, args: []const Value) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, args };
+        _ = id;
+        return errResult(.{ .Unsupported = "Host.call_native" });
+    }
+
+    /// No fast path answers here: every body runs.
+    pub fn tryNative(self: *NullHost, allocator: Allocator, id: ir.NativeId, args: []const Value) Allocator.Error!?EvalResult {
+        _ = .{ self, allocator, id, args };
+        return null;
+    }
+
+    /// Runs `f` in `module` recursively; needs no host service of its own.
+    pub fn runResolved(self: *NullHost, allocator: Allocator, module: *const Module, f: FuncId, args: []const Value) Allocator.Error!EvalResult {
+        const func = module.funcById(f) orelse return errResult(.{ .Unsupported = "Host.run_resolved: no such function" });
+        var list: std.ArrayList(Value) = .empty;
+        try list.appendSlice(allocator, args);
+        return ev_enter.evalWith(NullHost, allocator, module, func, list, self);
+    }
+
+    pub fn makeResolvedClosure(self: *NullHost, allocator: Allocator, module: *const Module, func: FuncId, captures: []const Value, kind: ir.resolved.Callable) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, module, func, captures, kind };
+        return errResult(.{ .Unsupported = "Host.make_resolved_closure" });
+    }
+
+    pub fn resolvedClosure(self: *NullHost, v: *const Value) ?ir.resolved.ClosureBody {
+        _ = .{ self, v };
+        return null;
+    }
+
     pub fn callValue(self: *NullHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
         _ = .{ self, allocator, callee, args };
         return errResult(.{ .Unsupported = "Host.call_value" });
@@ -228,21 +279,6 @@ pub const NullHost = struct {
         return .{ .err = .{ .Unsupported = "Host.store_global" } };
     }
 
-    pub fn registerClass(self: *NullHost, allocator: Allocator, class: *const @import("ast").Class) Allocator.Error!UnitResult {
-        _ = .{ self, allocator, class };
-        return .{ .err = .{ .Unsupported = "Host.register_class" } };
-    }
-
-    pub fn registerClassCaptured(self: *NullHost, allocator: Allocator, class: *const @import("ast").Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
-        _ = .{ captured_names, captures };
-        return self.registerClass(allocator, class);
-    }
-
-    pub fn buildObject(self: *NullHost, allocator: Allocator, ast: *const @import("ast").Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename, scope_classes: []const ir.ScopeClassRef) Allocator.Error!EvalResult {
-        _ = .{ self, allocator, ast, captured_names, captures, scope_renames, scope_classes };
-        return errResult(.{ .Unsupported = "Host.build_object" });
-    }
-
     pub fn callValueWithThis(self: *NullHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
         _ = .{ self, allocator, callee, this_value, args, arg_names };
         return errResult(.{ .Unsupported = "Host.call_value_with_this" });
@@ -270,21 +306,6 @@ pub const NullHost = struct {
     pub fn buildClosure(self: *NullHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
         _ = .{ self, allocator, module, body_func, captures };
         return errResult(.{ .Unsupported = "Host.build_closure" });
-    }
-
-    pub fn buildAstLambda(self: *NullHost, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
-        _ = .{ self, allocator, params, body, captured_names, captures };
-        return errResult(.{ .Unsupported = "Host.build_ast_lambda" });
-    }
-
-    pub fn buildAstLambdaWithFlag(self: *NullHost, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool) Allocator.Error!EvalResult {
-        _ = absorb_return;
-        return self.buildAstLambda(allocator, params, body, captured_names, captures);
-    }
-
-    pub fn buildAstLambdaWithFlagFuncid(self: *NullHost, allocator: Allocator, module: *const Module, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
-        _ = .{ module, body_func };
-        return self.buildAstLambdaWithFlag(allocator, params, body, captured_names, captures, absorb_return);
     }
 
     pub fn callFunc(self: *NullHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult {

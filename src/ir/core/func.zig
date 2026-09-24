@@ -295,8 +295,6 @@ pub const Func = struct {
                 .CallVirtual => |cv| if (cv.extra) |e| a.destroy(e),
                 .CallSpread => |p| a.destroy(p),
                 .CallMemberOrGlobal => |p| a.destroy(p),
-                .AstLambda => |p| a.destroy(p),
-                .BuildObject => |p| a.destroy(p),
                 else => {},
             };
             if (b.insts.len != 0) a.free(b.insts);
@@ -313,7 +311,11 @@ pub const Func = struct {
     /// True when this function has an IR body: present blocks, or blocks deferred to the
     /// image's lazy-IR section. Every bodyless check uses this, never a bare `blocks.len`.
     pub fn hasBody(self: *const Func) bool {
-        return self.blocks.len != 0 or self.deferred_offset != 0 or self.lazy_deferred;
+        // The offset first: a decode on another thread writes the blocks
+        // before it clears the offset (`Module.ensureFuncBody`), so blocks
+        // read after a cleared offset are the published ones.
+        if (@atomicLoad(u32, &self.deferred_offset, .acquire) != 0) return true;
+        return self.blocks.len != 0 or self.lazy_deferred;
     }
 
     /// The GetField name ConstId when the body is exactly `LoadParam #0; GetField; return`,

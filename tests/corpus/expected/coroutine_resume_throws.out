@@ -1,0 +1,5 @@
+completion succeeded: false
+caught boom
+completion succeeded: true
+value: fine
+done

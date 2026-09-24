@@ -12,6 +12,7 @@ const Value = runtime.Value;
 
 const BinOp = ir.BinOp;
 const BlockId = ir.BlockId;
+const ClassId = ir.ClassId;
 const Func = ir.Func;
 const Inst = ir.Inst;
 const Module = ir.Module;
@@ -667,7 +668,7 @@ pub fn runFrameExec(
                 if (tf.finally_entry) |fin0| {
                     if (std.meta.eql(fin0, cur)) continue;
                 }
-                if (findCatch(H, host, &exc, tf.catches)) |h| {
+                if (findCatch(H, host, frame.module, &exc, tf.catches)) |h| {
                     // A catch belonging to a try nested inside the active finally handles the new throw
                     // without replacing the exception or return that caused the finally. Once the scan
                     // crosses the saved depth the throw is escaping, and Kotlin replaces the prior flow.
@@ -675,7 +676,7 @@ pub fn runFrameExec(
                         if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
                     }
                     truncChainTo(frame, tf.chain_len);
-                    try frame.write(h.exception_reg, exc);
+                    try frame.write(h.exception_reg, try caughtValue(H, host, allocator, exc));
                     cur = h.handler;
                     routed = true;
                     break;
@@ -753,9 +754,9 @@ pub fn runFrameExec(
                 if (try_stack.items.len > pr.depth) try_stack.shrinkRetainingCapacity(pr.depth);
                 var routed = false;
                 while (try_stack.pop()) |tf| {
-                    if (findCatch(H, host, &exc, tf.catches)) |h| {
+                    if (findCatch(H, host, frame.module, &exc, tf.catches)) |h| {
                         truncChainTo(frame, tf.chain_len);
-                    try frame.write(h.exception_reg, exc);
+                    try frame.write(h.exception_reg, try caughtValue(H, host, allocator, exc));
                         cur = h.handler;
                         routed = true;
                         break;
@@ -909,12 +910,12 @@ pub fn runFrameExec(
                     if (tf.finally_entry) |fin0| {
                         if (std.meta.eql(fin0, cur)) continue;
                     }
-                    if (findCatch(H, host, &exc, tf.catches)) |h| {
+                    if (findCatch(H, host, frame.module, &exc, tf.catches)) |h| {
                         if (pending_depth) |depth| {
                             if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
                         }
                         truncChainTo(frame, tf.chain_len);
-                    try frame.write(h.exception_reg, exc);
+                    try frame.write(h.exception_reg, try caughtValue(H, host, allocator, exc));
                         cur = h.handler;
                         routed = true;
                         break;
@@ -1034,8 +1035,24 @@ fn rpositionByFinallyEntry(items: []const TryFrame, cur: BlockId) ?usize {
     return null;
 }
 
-fn findCatch(comptime H: type, host: *H, exc: *const Value, catches: []const ir.CatchHandler) ?ir.CatchHandler {
+/// The first handler that takes `exc`. A handler lowered from sema names its
+/// class and matches by the class tables; any other matches by type name.
+/// The value a catch handler binds: what was thrown, or for a host
+/// exception caught in code lowered from sema, the instance the host makes
+/// of it, which that code reads like any other.
+fn caughtValue(comptime H: type, host: *H, allocator: Allocator, exc: Value) Allocator.Error!Value {
+    if (comptime @hasDecl(H, "caughtValue")) return host.caughtValue(allocator, exc);
+    return exc;
+}
+
+fn findCatch(comptime H: type, host: *H, module: *const Module, exc: *const Value, catches: []const ir.CatchHandler) ?ir.CatchHandler {
     for (catches) |h| {
+        if (h.class_raw != ir.NO_CLASS) {
+            const r = module.resolved orelse continue;
+            const have = ir.resolved.classOf(r, exc) orelse continue;
+            if (ir.resolved.isA(module, have, ClassId.from(h.class_raw))) return h;
+            continue;
+        }
         if (host.instanceOf(exc, typeRefName(h.type_name))) return h;
     }
     return null;
@@ -1054,6 +1071,14 @@ fn instDst(inst: *const Inst) ?Reg {
         .CallValueOrMember => |x| x.dst,
         .CallMemberOrValue => |x| x.dst,
         .NewInstance => |x| x.dst,
+        .CallStatic => |x| x.dst,
+        .RCallVirtual => |x| x.dst,
+        .CallInterface => |x| x.dst,
+        .CallNative => |x| x.dst,
+        .RCallValue => |x| x.dst,
+        .RNewInstance => |x| x.dst,
+        .LoadObject => |x| x.dst,
+        .LoadStatic => |x| x.dst,
         else => null,
     };
 }

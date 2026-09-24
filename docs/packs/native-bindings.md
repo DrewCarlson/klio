@@ -113,6 +113,10 @@ internal fun __kxdt_currentTimeMillis(): Long = 0L  // stub body
 
 The Zig binding registered as
 `"kotlinx.datetime.__kxdt_currentTimeMillis"` wins at call sites.
+Every native a Kotlin source calls, the stdlib's `__klio_*` included,
+has such a declaration with the parameter and return types the binding
+uses, visible from the call site by the ordinary Kotlin rules (the same
+package or an import); `klio sema` reports a call with none.
 The stub body only fires if the binding fails to install — useful as
 a fallback when consumers run a pack without its host module
 compiled in.

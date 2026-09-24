@@ -1,7 +1,8 @@
 // `Char` arithmetic spelled as calls: `plus(Int)` and `minus(Int)` yield
 // a Char, `minus(Char)` and `compareTo(Char)` an Int; a comparison
 // between a Char and a number has no builtin order, so `x < y` resolves
-// to the program's `compareTo` extension.
+// to the program's `compareTo` extension. A `Short.plus(Int)` call is an
+// `Int`, narrowed back explicitly.
 operator fun Int.compareTo(c: Char) = this - c.code
 
 fun main() {
@@ -12,6 +13,6 @@ fun main() {
     println(65 < 'B')
     println(70 < 'B')
     println(1u.plus(2u))
-    val b: Byte = 1.plus(1)
+    val b: Short = 1.toShort().plus(1).toShort()
     println(b)
 }

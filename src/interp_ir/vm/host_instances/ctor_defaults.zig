@@ -19,7 +19,7 @@ const host_call_value = @import("../host_call_value.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-const build = @import("../../build.zig");
+const tables = @import("../../tables.zig");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -192,7 +192,7 @@ pub fn scoreCtorHeadsVararg(self: *VmHost, heads: []const []const u8, vararg_at:
 
 /// Packs a `vararg` secondary constructor's trailing args into its array slot,
 /// primitive-typed where the element type is. Null for a spread or no vararg.
-pub fn packSecondaryVarargs(self: *VmHost, allocator: Allocator, e: root.build.SecondaryCtorEntry, args: []const Value) Allocator.Error!?[]Value {
+pub fn packSecondaryVarargs(self: *VmHost, allocator: Allocator, e: root.tables.SecondaryCtorEntry, args: []const Value) Allocator.Error!?[]Value {
     _ = self;
     const v = e.vararg_index orelse return null;
     if (args.len < v) return null;

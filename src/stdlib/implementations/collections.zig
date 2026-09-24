@@ -107,6 +107,7 @@ pub const coll_list_of = builders_mod.coll_list_of;
 pub const coll_list_of_not_null = builders_mod.coll_list_of_not_null;
 pub const coll_array_of = builders_mod.coll_array_of;
 pub const coll_array_of_nulls = builders_mod.coll_array_of_nulls;
+pub const coll_array_concat = builders_mod.coll_array_concat;
 pub const coll_empty_array = builders_mod.coll_empty_array;
 pub const coll_int_array_of = builders_mod.coll_int_array_of;
 pub const coll_long_array_of = builders_mod.coll_long_array_of;

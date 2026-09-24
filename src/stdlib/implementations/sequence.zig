@@ -193,7 +193,7 @@ pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (arg) {
         .Iterator, .RangeIter, .SeqIter => iter = arg,
         .List, .Set, .Array, .Sequence, .Map, .String, .Range => {
-            const r = (try ctx.host.invokeMethod(&arg, "iterator", &.{}, ctx.out)) orelse
+            const r = (try ctx.host.callWellKnown(&arg, .iterator, &.{}, ctx.out)) orelse
                 return err(.{ .Type = "yieldAll: argument is not iterable" });
             switch (r) {
                 .ok => |it| iter = it,
@@ -201,12 +201,14 @@ pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             }
         },
         .Instance => {
-            const r = (try ctx.host.invokeMethod(&arg, "iterator", &.{}, ctx.out)) orelse
-                return err(.{ .Type = "yieldAll: argument is not iterable" });
-            switch (r) {
-                .ok => |it| iter = it,
-                .err => |e| return err(e),
-            }
+            // An iterable's iterator, or an iterator itself: `yieldAll`
+            // takes either.
+            if (try ctx.host.callWellKnown(&arg, .iterator, &.{}, ctx.out)) |r| {
+                switch (r) {
+                    .ok => |it| iter = it,
+                    .err => |e| return err(e),
+                }
+            } else iter = arg;
         },
         else => return err(.{ .Type = "yieldAll: expected an Iterable/Iterator/Sequence" }),
     }
@@ -346,12 +348,14 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return ok(.{ .Sequence = data });
     }
     if (args.len == 2 and isLambdaLike(args[1])) {
+        // `generateSequence(null, next)` is empty.
+        if (args[0] == .Null) {
+            return ok(try makeSequence(ctx.allocator, &.{}));
+        }
         var seed: ?ValueBox = null;
         const seed_is_fn = isLambdaLike(args[0]);
-        if (args[0] != .Null) {
-            args[0].retain();
-            seed = try Value.boxRef(ctx.allocator, args[0]);
-        }
+        args[0].retain();
+        seed = try Value.boxRef(ctx.allocator, args[0]);
         args[1].retain();
         const next = try Value.boxRef(ctx.allocator, args[1]);
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
@@ -695,6 +699,8 @@ fn materialiseSequenceBounded(
                     if (cur) |v| {
                         candidate = v;
                     } else {
+                        // Only the nullary form starts from `next()`.
+                        if (gen.seed != null) break;
                         const r = try invokeCallable(host, gen.next.asPtr(), &.{}, out);
                         switch (r) {
                             .ok => |rv| {
@@ -721,7 +727,10 @@ fn materialiseSequenceBounded(
                         },
                     }
                     if (max) |m| if (output.items.len >= m) break;
-                    const nr = try invokeCallable(host, gen.next.asPtr(), &.{candidate}, out);
+                    const nr = if (gen.seed == null)
+                        try invokeCallable(host, gen.next.asPtr(), &.{}, out)
+                    else
+                        try invokeCallable(host, gen.next.asPtr(), &.{candidate}, out);
                     switch (nr) {
                         .ok => |nv| {
                             if (nv == .Null) break;
@@ -745,7 +754,7 @@ fn materialiseSequenceBounded(
                 };
                 while (true) {
                     if (takeCapReached(seq.ops, st.taken)) break;
-                    const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse {
+                    const hn = (try host.callWellKnown(&iter, .has_next, &.{}, out)) orelse {
                         if (runtime.envSetOnce("KLIO_SEQ_DIAG")) {
                             std.debug.print("[seq-diag] iterator lacks hasNext: iter kind={s} fqn={s}\n", .{ @tagName(std.meta.activeTag(iter)), iter.typeFqn() });
                         }
@@ -759,7 +768,7 @@ fn materialiseSequenceBounded(
                         },
                     };
                     if (!has) break;
-                    const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                    const nx = (try host.callWellKnown(&iter, .next, &.{}, out)) orelse
                         return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
                     const item = switch (nx) {
                         .ok => |x| x,
@@ -854,6 +863,7 @@ fn materialiseSequenceBounded(
                 if (cur) |v| {
                     candidate = v;
                 } else {
+                    if (gen.seed != null) break;
                     const r = try invokeCallable(host, gen.next.asPtr(), &.{}, out);
                     switch (r) {
                         .ok => |rv| {
@@ -867,7 +877,10 @@ fn materialiseSequenceBounded(
                     }
                 }
                 try items.append(allocator, candidate);
-                const nr = try invokeCallable(host, gen.next.asPtr(), &.{candidate}, out);
+                const nr = if (gen.seed == null)
+                    try invokeCallable(host, gen.next.asPtr(), &.{}, out)
+                else
+                    try invokeCallable(host, gen.next.asPtr(), &.{candidate}, out);
                 switch (nr) {
                     .ok => |nv| {
                         if (nv == .Null) break;
@@ -890,7 +903,7 @@ fn materialiseSequenceBounded(
                 },
             };
             while (true) {
-                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse {
+                const hn = (try host.callWellKnown(&iter, .has_next, &.{}, out)) orelse {
                     if (runtime.envSetOnce("KLIO_SEQ_DIAG")) {
                         std.debug.print("[seq-diag] iterator lacks hasNext: iter kind={s} fqn={s}\n", .{ @tagName(std.meta.activeTag(iter)), iter.typeFqn() });
                     }
@@ -904,7 +917,7 @@ fn materialiseSequenceBounded(
                     },
                 };
                 if (!has) break;
-                const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                const nx = (try host.callWellKnown(&iter, .next, &.{}, out)) orelse
                     return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
                 switch (nx) {
                     .ok => |item| try items.append(allocator, item),
@@ -1193,7 +1206,7 @@ fn applyBufferedOp(
                 while (j > 0) {
                     const a = items.items[j - 1];
                     const b = items.items[j];
-                    const mr = try host.invokeMethod(&comparator, "compare", &.{ a, b }, out);
+                    const mr = try host.callWellKnown(&comparator, .compare, &.{ a, b }, out);
                     if (mr) |res| {
                         switch (res) {
                             .ok => |v| {
@@ -1514,7 +1527,7 @@ fn compareValuesVia(
     const builtin = compareValues(a, b);
     if (builtin == .order) return builtin;
     if (a.* != .Instance) return builtin;
-    const r = (try host.invokeMethod(a, "compareTo", &.{b.*}, out)) orelse return builtin;
+    const r = (try host.callWellKnown(a, .compare_to, &.{b.*}, out)) orelse return builtin;
     switch (r) {
         .ok => |v| {
             const n = v.asI64() orelse return builtin;

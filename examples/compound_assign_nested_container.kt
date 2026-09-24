@@ -46,9 +46,10 @@ fun main() {
     b.rows += listOf("y")
     println("property  = ${b.rows} size=${b.rows.size}")
 
-    // A `MutableList<Any>` element type is not a container, so the iterable
-    // overload wins there, exactly as Kotlin resolves it.
+    // A `MutableList<Any>` takes a list both as one element and as elements,
+    // so `+=` with a list is ambiguous there and does not compile; appending
+    // the elements is spelled `addAll`.
     val anys: MutableList<Any> = ArrayList()
-    anys += listOf(1, 2)
+    anys.addAll(listOf(1, 2))
     println("anys      = $anys size=${anys.size}")
 }

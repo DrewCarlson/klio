@@ -1,5 +1,5 @@
-//! Annotation use-site targeting (Kotlin 2.4), shared by typeck for diagnostics
-//! and by lowering for per-anchor records. `useSiteSet` derives the allowed
+//! Annotation use-site targeting (Kotlin 2.4), which typeck checks
+//! annotations against. `useSiteSet` derives the allowed
 //! target set U(A) from `@Target`; `expandAll` implements the `@all:`
 //! meta-target; `defaultPlacement` the rule for a target-less annotation.
 

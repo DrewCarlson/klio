@@ -11,6 +11,7 @@
 const std = @import("std");
 const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
 /// Pass floor, at the low-water mark rather than the best run: a killed file
 /// keeps only the passes it already printed.
@@ -23,15 +24,6 @@ const MAX_FAILED: usize = 0;
 
 const TEST_ROOT = "kotlin-klio/klio-androidx-collection/upstream/collection/collection/src/commonTest/kotlin";
 const INLINE_RECEIVER_FIXTURE = "tests/fixtures/androidx_collection_inline_receiver.kt";
-const SCRATCH_HOME = "/tmp/klio_itest_androidx_home";
-
-const Pack = struct { dir: []const u8, artifact: []const u8 };
-/// Dependency order: atomicfu and kotlin.test before androidx.
-const PACKS = [_]Pack{
-    .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
-    .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-    .{ .dir = "kotlin-klio/klio-androidx-collection", .artifact = "target/packs/androidx.collection.klio-pack" },
-};
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
@@ -42,6 +34,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    try map.put("KLIO_HOME", home);
     return map;
 }
 
@@ -75,21 +68,6 @@ fn runKlio(
         return error.SpawnFailed;
     };
     return .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr };
-}
-
-fn installPacks(allocator: std.mem.Allocator, env: *std.process.Environ.Map) !void {
-    for (PACKS) |p| {
-        const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", p.dir }, 120_000 * census_support.harnessSlowdown(env));
-        if (b.term != .exited or b.term.exited != 0) {
-            std.debug.print("androidx_commontest: pack build {s} failed:\n{s}\n", .{ p.dir, b.stderr });
-            return error.PackBuildFailed;
-        }
-        const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", p.artifact }, 120_000 * census_support.harnessSlowdown(env));
-        if (i.term != .exited or i.term.exited != 0) {
-            std.debug.print("androidx_commontest: pack install {s} failed:\n{s}\n", .{ p.artifact, i.stderr });
-            return error.PackInstallFailed;
-        }
-    }
 }
 
 fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList([]u8)) !void {
@@ -191,12 +169,10 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
         return error.SkipZigTest;
     };
 
-    std.Io.Dir.cwd().createDirPath(io, SCRATCH_HOME) catch {};
-    var env = try envWithHome(a, SCRATCH_HOME);
+    var env = try envWithHome(a, try klio_child.home(a));
     // The deadlines are tuned on ReleaseSafe; Debug runs several times slower.
     const slowdown = census_support.harnessSlowdown(&env);
     if (slowdown != 1) try census_support.scaleWallCaps(a, &env, slowdown);
-    try installPacks(a, &env);
     const smoke = try runKlio(
         a,
         &env,

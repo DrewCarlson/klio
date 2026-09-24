@@ -6,9 +6,6 @@
 # value classes (BlendMode / StrokeCap / PathFillType / …). The Skia-backed
 # Canvas / Paint / Path / DrawScope layer is vendored on top of the native shim
 # separately.
-#
-# The klioMain layer supplies the androidx.annotation range/size marker stubs the
-# vendored graphics sources import.
 [library]
 id = "androidx.compose.ui.graphics"
 version = "1.12.0"
@@ -66,6 +63,15 @@ include = [
     "androidx/compose/ui/graphics/Shadow.kt",
     "androidx/compose/ui/graphics/Interpolatable.kt",
     "androidx/compose/ui/graphics/RenderEffect.kt",
+    "androidx/compose/ui/graphics/PathMeasure.kt",
+    "androidx/compose/ui/graphics/Degrees.kt",
+    "androidx/compose/ui/graphics/IntervalTree.kt",
+    # The layer surface the ui engine and animation reference: klioMain's
+    # GraphicsLayer actual holds a layer's properties; klio draws without
+    # offscreen layers, so the ui host's GraphicsContext creates none.
+    "androidx/compose/ui/graphics/GraphicsContext.kt",
+    "androidx/compose/ui/graphics/layer/GraphicsLayer.kt",
+    "androidx/compose/ui/graphics/layer/CompositingStrategy.kt",
     "androidx/compose/ui/graphics/vector/PathNode.kt",
     "androidx/compose/ui/graphics/vector/PathBuilder.kt",
     "androidx/compose/ui/graphics/vector/FastFloatParser.kt",
@@ -104,12 +110,14 @@ include = [
     "androidx/compose/ui/graphics/colorspace/Xyz.kt",
 ]
 
-# klioMain: the androidx.annotation range/size marker stubs.
+# klioMain: the platform actuals (Path command buffer and measure, Paint, Canvas
+# over the Skia shim, ImageBitmap, RenderEffect, GraphicsLayer).
 [[source]]
 root = "klioMain"
 
 [deps]
 stdlib = "*"
+"androidx.annotation" = "*"
 "androidx.compose.runtime" = "*"
 "androidx.compose.ui.util" = "*"
 "androidx.compose.ui.geometry" = "*"

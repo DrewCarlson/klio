@@ -9,28 +9,23 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-const ast = @import("ast");
-const KotlinFile = ast.KotlinFile;
-const span = @import("span");
-const SourceMap = span.SourceMap;
 
 const pack = @import("pack");
 const bf = pack.bundle_format;
 
-const interp_ir = @import("interp_ir");
-const image = interp_ir.image;
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
-const HostBindings = stdlib.HostBindings;
 
 const io = @import("io.zig");
-const commands = @import("commands.zig");
 const pack_cache = @import("pack_cache.zig");
-const RequestedFeatures = pack_cache.RequestedFeatures;
-const stdlib_image = @import("stdlib_image.zig");
 const project = @import("project.zig");
 const macho_sign = @import("macho_sign.zig");
-const ir = @import("ir");
+const lower_driver = @import("lower_driver");
+const sema_cmd = @import("sema_cmd.zig");
+const sema_run = @import("sema_run.zig");
+const sema_image = @import("sema_image.zig");
+const image_cmd = @import("image_cmd.zig");
+const pipeline = lower_driver.pipeline;
 
 pub const Options = struct {
     input: []const u8 = "",
@@ -71,136 +66,6 @@ const USAGE =
     \\                             and projected size without writing
     \\
 ;
-
-/// Bake the dependency base (embedded stdlib plus the program's packs) to a
-/// standalone `.klio-image`. The program's own code is not baked in.
-pub fn bakeImage(gpa: Allocator, paths: []const []const u8, requested: *RequestedFeatures, out_path: []const u8) u8 {
-    var scratch_map = SourceMap.init(gpa);
-    const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
-        return commands.runCheck(gpa, paths, .Plain, requested);
-    };
-    var report = pack_cache.EmbeddedReport{};
-    var selection = pack_cache.Selection{};
-    const deps = stdlib_image.bundleDepLoad(gpa, user.asts, requested, &report, &selection) orelse return 1;
-    const bb = stdlib_image.bundleBaseImage(gpa, &deps, &report, &selection) orelse {
-        io.writeStderr("error: the dependency base for this program cannot bake to an image\n");
-        return 1;
-    };
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = out_path, .data = bb.bytes }) catch {
-        io.printStderr(gpa, "error: cannot write {s}\n", .{out_path});
-        return 1;
-    };
-    io.printStdout(gpa, "wrote {s} ({d} bytes)\n", .{ out_path, bb.bytes.len });
-    return 0;
-}
-
-/// Bake dependencies and user files, lowered as one module, to an image file.
-/// A bundle boots from it: loading runs `main` with no parse and no lowering.
-pub fn bakeProgramImageFile(gpa: Allocator, paths: []const []const u8, requested: *RequestedFeatures, out_path: []const u8) u8 {
-    var scratch_map = SourceMap.init(gpa);
-    const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
-        return commands.runCheck(gpa, paths, .Plain, requested);
-    };
-    var report = pack_cache.EmbeddedReport{};
-    var selection = pack_cache.Selection{};
-    const deps = stdlib_image.bundleDepLoad(gpa, user.asts, requested, &report, &selection) orelse return 1;
-    const bytes = bakeProgramImage(gpa, &deps, paths, user.texts, &report) orelse {
-        io.writeStderr("error: this program cannot bake to a whole-program image\n");
-        return 1;
-    };
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = out_path, .data = bytes }) catch {
-        io.printStderr(gpa, "error: cannot write {s}\n", .{out_path});
-        return 1;
-    };
-    io.printStdout(gpa, "wrote {s} ({d} bytes)\n", .{ out_path, bytes.len });
-    return 0;
-}
-
-/// Load a whole-program image: complete module, so this neither parses nor lowers.
-pub fn loadProgramImage(gpa: Allocator, image_path: []const u8) ?ImageAssembly {
-    const bytes = blk: {
-        var threaded: std.Io.Threaded = .init(gpa, .{});
-        defer threaded.deinit();
-        break :blk std.Io.Dir.cwd().readFileAlloc(threaded.io(), image_path, gpa, .unlimited) catch {
-            io.printStderr(gpa, "error: cannot read program image {s}\n", .{image_path});
-            return null;
-        };
-    };
-    const loaded = (image.load(gpa, bytes) catch null) orelse {
-        io.printStderr(gpa, "error: program image rejected ({s})\n", .{image.lastLoadFailure()});
-        return null;
-    };
-    for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
-    span.active_map = loaded.map;
-    return .{ .built = loaded.base.built, .map = loaded.map, .binding_fqns = loaded.binding_fqns };
-}
-
-/// Run a whole-program image: the entry a transpiled binary calls.
-pub fn runProgramImage(gpa: Allocator, image_path: []const u8, program_args: []const []const u8) u8 {
-    const asm_r = loadProgramImage(gpa, image_path) orelse return 1;
-    var bindings = pack_cache.mergedHostBindings(gpa);
-    for (asm_r.binding_fqns) |fqn| {
-        if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
-    }
-    return commands.runBuiltModuleArgs(gpa, asm_r.built, bindings, asm_r.map, "error: no main function found", program_args);
-}
-
-/// A program assembled against an explicit base image: the module `run-image`
-/// executes, in the fid/const space the transpiler emits against.
-pub const ImageAssembly = struct {
-    built: interp_ir.build.BuiltModule,
-    map: *SourceMap,
-    binding_fqns: []const []const u8,
-};
-
-pub fn assembleImageBuild(gpa: Allocator, base_path: []const u8, paths: []const []const u8) ?ImageAssembly {
-    // The image buffer must outlive the base (decoded slices borrow it), so it is
-    // read into the process-lifetime allocator and never freed.
-    const bytes = blk: {
-        var threaded: std.Io.Threaded = .init(gpa, .{});
-        defer threaded.deinit();
-        break :blk std.Io.Dir.cwd().readFileAlloc(threaded.io(), base_path, gpa, .unlimited) catch {
-            io.printStderr(gpa, "error: cannot read base image {s}\n", .{base_path});
-            return null;
-        };
-    };
-    const loaded = (image.load(gpa, bytes) catch null) orelse {
-        io.printStderr(gpa, "error: base image rejected ({s})\n", .{image.lastLoadFailure()});
-        return null;
-    };
-    for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
-
-    const map = gpa.create(SourceMap) catch return null;
-    map.* = SourceMap.init(gpa);
-    map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return null;
-    const user = stdlib_image.parseUserFiles(gpa, map, paths, null) orelse {
-        io.writeStderr("error: program fails to parse\n");
-        return null;
-    };
-    if (!interp_ir.build.canExtendBase(loaded.base, user.asts)) {
-        io.writeStderr("error: program cannot extend the base image (it redeclares a base name)\n");
-        return null;
-    }
-    if (commands.computeEagerCalls(gpa, user.asts, &.{})) |ec| ir.pending_eager_calls = ec;
-    span.active_map = map;
-    const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user.asts) catch return null;
-    return .{ .built = built, .map = map, .binding_fqns = loaded.binding_fqns };
-}
-
-/// Run a program against a pre-baked dependency base, so only the program parses
-/// and lowers. Mirrors the bundle base-image + program-src boot.
-pub fn runImage(gpa: Allocator, base_path: []const u8, paths: []const []const u8, program_args: []const []const u8) u8 {
-    const asm_r = assembleImageBuild(gpa, base_path, paths) orelse return 1;
-    var bindings = pack_cache.mergedHostBindings(gpa);
-    for (asm_r.binding_fqns) |fqn| {
-        if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
-    }
-    return commands.runBuiltModuleArgs(gpa, asm_r.built, bindings, asm_r.map, "error: no main function found", program_args);
-}
 
 pub fn runBundle(gpa: Allocator, args: []const []const u8) u8 {
     var opts = Options{};
@@ -340,78 +205,26 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     const out_path = opts.output orelse defaultOutput(gpa, main_path, target) catch return 2;
     const app_name = opts.name orelse std.fs.path.basename(out_path);
 
-    var requested = RequestedFeatures.init(gpa);
     for (opts.feature_specs.items) |spec| {
-        const slash = std.mem.findScalar(u8, spec, '/') orelse {
+        if (std.mem.findScalar(u8, spec, '/') == null) {
             io.printStderr(gpa, "error: --feature `{s}` must be `<pack>/<feature>`\n", .{spec});
             return 2;
-        };
-        const gop = requested.getOrPut(spec[0..slash]) catch return 2;
-        if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(gpa);
-        gop.value_ptr.put(spec[slash + 1 ..], {}) catch return 2;
+        }
     }
 
-    var scratch_map = SourceMap.init(gpa);
-    const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
-        return commands.runCheck(gpa, paths, .Plain, &requested);
+    var prog_result = program(gpa, paths, opts.feature_specs.items);
+    const prog = switch (prog_result) {
+        .ok => |*p| p,
+        .exit => |code| return code,
     };
 
-    // Lowering mutates the parsed ASTs and baking strips dead AST bodies, so each
-    // bake attempt below gets its own dependency load.
-    var report = pack_cache.EmbeddedReport{};
-    var selection = pack_cache.Selection{};
-    const deps = stdlib_image.bundleDepLoad(gpa, user.asts, &requested, &report, &selection) orelse return 1;
-
-    // A bake refusal falls back to the program-src boot. A successful bake is also
-    // the verification: the program lowers cleanly and has a main.
-    var program_image: ?[]const u8 = null;
-    var program_src_fallback = false;
-    if (programImageEnabled()) {
-        program_image = bakeProgramImage(gpa, &deps, paths, user.texts, &report);
-        program_src_fallback = program_image == null;
-    }
-
-    var base_image: ?[]const u8 = null;
-    if (program_image == null) {
-        const deps2 = stdlib_image.bundleDepLoad(gpa, user.asts, &requested, null, null) orelse return 1;
-        const bb = stdlib_image.bundleBaseImage(gpa, &deps2, &report, &selection) orelse {
-            io.writeStderr("error: the dependency base for this program cannot bake to an image; bundling requires a bakeable base\n");
-            return 1;
-        };
-        base_image = bb.bytes;
-        if (!interp_ir.build.canExtendBase(bb.base, user.asts)) {
-            io.writeStderr("error: the program redeclares a name from its dependency base and cannot bundle; rename the declaration\n");
-            return 1;
-        }
-        const map = gpa.create(SourceMap) catch return 1;
-        map.* = SourceMap.init(gpa);
-        map.files.appendSlice(map.arena.allocator(), bb.map.files.items) catch return 1;
-        const user2 = stdlib_image.parseUserFiles(gpa, map, paths, user.texts) orelse return 1;
-        span.active_map = map;
-        var built = interp_ir.build.buildModuleFilesExtend(gpa, bb.base, user2.asts) catch return 1;
-        const mg = built.module.borrow();
-        defer mg.deinit();
-        const rdiags = mg.get().resolve_diags.items;
-        if (rdiags.len != 0) {
-            for (rdiags) |d| {
-                const msg = d.render(gpa, map) catch return 1;
-                io.printStderr(gpa, "{s}\n", .{msg});
-            }
-            return 1;
-        }
-        if (built.main == null) {
-            io.writeStderr("error: no main function found\n");
-            return 1;
-        }
-    }
-
-    const is_ui = opts.ui orelse detectUiFlavor(&selection);
+    const is_ui = opts.ui orelse detectUiFlavor(&prog.selection);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const program_src = encodeProgramSources(arena, paths, user.texts) catch return 1;
+    const program_src = encodeProgramSources(arena, paths, prog.texts) catch return 1;
 
     var resources_blob: std.ArrayList(u8) = .empty;
     var resource_entries: std.ArrayList(bf.ResourceEntry) = .empty;
@@ -428,7 +241,7 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
             io.printStderr(gpa, "error: this is a UI bundle but no Skia backend library was found for {s}; build it (zig build skia-lib) or set KLIO_SKIA_LIB\n", .{target});
             return 1;
         };
-        if (programOpensWindow(user.texts)) {
+        if (programOpensWindow(prog.texts)) {
             switch (skiaWindowSupport(shim_bytes.?)) {
                 .ok => {},
                 .stub => {
@@ -453,11 +266,7 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     const manifest = buildManifest(arena, .{
         .flavor = if (is_ui) bf.Flavor.ui else bf.Flavor.headless,
         .name = app_name,
-        .entry = if (program_image != null) "main" else "",
-        .program_src_fallback = program_src_fallback,
-        .report = &report,
-        .selection = &selection,
-        .bindings = &deps.bindings,
+        .selection = &prog.selection,
         .resources = resource_entries.items,
     }) catch return 1;
     var perr: pack.PackError = undefined;
@@ -480,13 +289,8 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     var w = bf.Writer.init(gpa);
     defer w.deinit();
     w.addSection(bf.section_names.MANIFEST, manifest_bytes.items, .none, false) catch return 1;
-    if (base_image) |bi| {
-        w.addSection(bf.section_names.BASE_IMAGE, bi, .none, true) catch return 1;
-    }
+    w.addSection(bf.section_names.SEMA_IMAGE, prog.sema_image, .none, true) catch return 1;
     w.addSection(bf.section_names.PROGRAM_SRC, program_src, .none, false) catch return 1;
-    if (program_image) |pi| {
-        w.addSection(bf.section_names.PROGRAM_IMAGE, pi, .none, true) catch return 1;
-    }
     if (resource_entries.items.len != 0) {
         w.addSection(bf.section_names.RESOURCES, resources_blob.items, .none, false) catch return 1;
     }
@@ -580,6 +384,60 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         packs_summary.items,
     });
     return 0;
+}
+
+/// What a bundle carries of its program, and what the manifest says of it.
+const Program = struct {
+    texts: [][]const u8,
+    selection: pack_cache.Selection = .{},
+    /// The base's image and sources, over which the program's sources build
+    /// at boot.
+    sema_image: []const u8 = &.{},
+};
+
+const ProgramResult = union(enum) { ok: Program, exit: u8 };
+
+/// The program's payload: a sema image of its base. Bundling is the check a
+/// run makes: the program builds over that image and has a `main`, or the
+/// bundle is refused with why.
+fn program(gpa: Allocator, paths: []const []const u8, feature_specs: []const []const u8) ProgramResult {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const texts = gpa.alloc([]const u8, paths.len) catch return .{ .exit = 2 };
+    for (paths, texts) |path, *t| {
+        t.* = std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, gpa, .unlimited) catch {
+            io.printStderr(gpa, "error: cannot read {s}: ReadFailed\n", .{path});
+            return .{ .exit = 1 };
+        };
+    }
+    // A bundle's resources are read through `klio.bundle`: the bundler's own
+    // library, which a project using them need not declare.
+    project.implicit_dependencies = &.{"klio.bundle"};
+    // Lives as long as the process: the bundle is its last use.
+    const mem = sema_run.RunMemory.init() catch return .{ .exit = 2 };
+    var prog: Program = .{ .texts = texts };
+    const baked = image_cmd.bakeFor(gpa, mem, paths, texts, feature_specs, &prog.selection) catch |e| switch (e) {
+        error.Reported => return .{ .exit = 1 },
+        else => {
+            io.printStderr(gpa, "error: the base image for this program did not bake: {s}\n", .{@errorName(e)});
+            return .{ .exit = 1 };
+        },
+    };
+    const built = pipeline.buildOnBase(mem.arena(), baked.src, sema_cmd.hostBinding(gpa), baked.base) catch |e| {
+        io.printStderr(gpa, "error: the program does not build over its base image: {s}\n", .{@errorName(e)});
+        return .{ .exit = 1 };
+    };
+    if (sema_run.reportProgramErrors(gpa, mem.arena(), mem.map, baked.src.program, &built) != 0) return .{ .exit = 1 };
+    const found = pipeline.mainOf(built.s) catch {
+        io.writeStderr("error: out of memory\n");
+        return .{ .exit = 1 };
+    };
+    if (found == null) {
+        io.writeStderr("error: no main function found\n");
+        return .{ .exit = 1 };
+    }
+    prog.sema_image = baked.bytes;
+    return .{ .ok = prog };
 }
 
 pub const VERSION = @import("cli.zig").VERSION;
@@ -760,44 +618,10 @@ fn rebuildHint(target: []const u8) []const u8 {
     return "rebuild the backend with `zig build skia-lib -Dskia` after installing libsdl2-dev (or `scripts/fetch-sdl.sh` + `-Dsdl-static`), or use a UI-enabled klio build.";
 }
 
-/// `KLIO_BUNDLE_PROGRAM_IMAGE=0` forces the program-src boot; the bake is on by default.
-fn programImageEnabled() bool {
-    const v = runtime.envOnce("KLIO_BUNDLE_PROGRAM_IMAGE") orelse return true;
-    return v.len == 0 or !std.mem.eql(u8, v, "0");
-}
-
-/// Lower deps + program as one module and bake it, equal to the extend path.
-fn bakeProgramImage(
-    gpa: Allocator,
-    deps: *const stdlib_image.BundleDeps,
-    paths: []const []const u8,
-    texts: [][]const u8,
-    report: *const pack_cache.EmbeddedReport,
-) ?[]const u8 {
-    // User FileIds continue after the deps', so one map covers the whole module.
-    const dep_file_count = deps.map.files.items.len;
-    const user = stdlib_image.parseUserFiles(gpa, deps.map, paths, texts) orelse return null;
-    var all: std.ArrayList(KotlinFile) = .empty;
-    defer all.deinit(gpa);
-    all.appendSlice(gpa, deps.asts) catch return null;
-    all.appendSlice(gpa, user.asts) catch return null;
-    span.active_map = deps.map;
-    const pb = (interp_ir.build.buildProgramBase(gpa, all.items) catch return null) orelse return null;
-    pb.user_file_start = @intCast(dep_file_count);
-    return (image.bake(gpa, gpa, pb, deps.map, .{
-        .known_packages = report.known_packages.items,
-        .binding_fqns = report.binding_fqns.items,
-    }) catch return null) orelse null;
-}
-
 const ManifestInputs = struct {
     flavor: bf.Flavor,
     name: []const u8,
-    entry: []const u8,
-    program_src_fallback: bool,
-    report: *const pack_cache.EmbeddedReport,
     selection: *const pack_cache.Selection,
-    bindings: *const HostBindings,
     resources: []const bf.ResourceEntry,
 };
 
@@ -827,57 +651,21 @@ fn buildManifest(arena: Allocator, in: ManifestInputs) !bf.BundleManifest {
 
     const known = try stdlib.knownPackagesSnapshot(arena);
 
-    const fqns = try arena.alloc([]const u8, in.report.binding_fqns.items.len);
-    for (in.report.binding_fqns.items, 0..) |f, i| fqns[i] = f;
-
-    const pairs = try harvestPackBindings(arena, in.bindings);
-
+    // Natives bind through the binary's own table at boot: there are no
+    // pack bindings to replay, and the program builds from its sources.
     return .{
         .klio_version = VERSION,
-        .image_format_version = image.FORMAT_VERSION,
+        .image_format_version = sema_image.bundle_payload_version,
         .flavor = in.flavor,
         .name = in.name,
-        .entry = in.entry,
-        .program_src_fallback = in.program_src_fallback,
+        .entry = "",
+        .program_src_fallback = false,
         .packs = packs.items,
         .known_packages = known,
-        .binding_fqns = fqns,
-        .pack_bindings = pairs,
+        .binding_fqns = &.{},
+        .pack_bindings = &.{},
         .resources = in.resources,
     };
-}
-
-/// The host bindings the pack load added beyond the in-binary defaults, as
-/// replayable `(fqn, host_symbol)` pairs that boot re-resolves and registers.
-fn harvestPackBindings(arena: Allocator, bindings: *const HostBindings) ![]bf.BindingPair {
-    var merged = pack_cache.mergedHostBindings(arena);
-    defer merged.deinit();
-    var rev = std.AutoHashMap(usize, []const u8).init(arena);
-    defer rev.deinit();
-    {
-        var it = merged.table.iterator();
-        while (it.next()) |e| {
-            try rev.put(@intFromPtr(e.value_ptr.*), e.key_ptr.*);
-        }
-    }
-    var out: std.ArrayList(bf.BindingPair) = .empty;
-    var it = bindings.table.iterator();
-    while (it.next()) |e| {
-        if (merged.resolve(e.key_ptr.*)) |f| {
-            if (f == e.value_ptr.*) continue;
-        }
-        const sym = rev.get(@intFromPtr(e.value_ptr.*)) orelse continue;
-        try out.append(arena, .{
-            .fqn = try arena.dupe(u8, e.key_ptr.*),
-            .host_symbol = try arena.dupe(u8, sym),
-        });
-    }
-    std.mem.sort(bf.BindingPair, out.items, {}, struct {
-        fn lt(_: void, x: bf.BindingPair, y: bf.BindingPair) bool {
-            return std.mem.lessThan(u8, x.fqn, y.fqn);
-        }
-    }.lt);
-    return out.toOwnedSlice(arena);
 }
 
 pub fn selfExePath(arena: Allocator) ?[]const u8 {

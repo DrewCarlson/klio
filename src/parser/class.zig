@@ -165,6 +165,7 @@ pub fn parseClass(
         .is_value = mods.is_value,
         .is_annotation = mods.is_annotation,
         .is_expect = mods.is_expect,
+        .is_external = mods.is_external,
         .is_actual = mods.is_actual,
         .members = class_members,
         .visibility = visibility,
@@ -598,7 +599,7 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
             args_list.append(p.allocator, args.toOwnedSlice(p.allocator) catch @panic("OOM")) catch @panic("OOM");
             names_list.append(p.allocator, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM")) catch @panic("OOM");
             delegates.append(p.allocator, null) catch @panic("OOM");
-        } else if (eqlOpt(support.peekIdentText(p), "by")) {
+        } else if (delegationFollows(p)) {
             _ = support.bump(p);
             support.skipNl(p);
             const prev = p.suppress_trailing_lambda;
@@ -785,6 +786,9 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
         support.skipNl(p);
         const annotations = file.parseAnnotations(p);
         var visibility: Visibility = .Public;
+        var is_override = false;
+        var is_open = false;
+        var is_final = false;
         while (std.meta.activeTag(support.peekKind(p).*) == .Ident) {
             const t = support.text(p, support.currentSpan(p));
             if (std.mem.eql(u8, t, "public")) {
@@ -803,10 +807,19 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
                 visibility = .Internal;
                 _ = support.bump(p);
                 support.skipNl(p);
-            } else if (std.mem.eql(u8, t, "override") or
-                std.mem.eql(u8, t, "final") or
-                std.mem.eql(u8, t, "open") or
-                std.mem.eql(u8, t, "abstract") or
+            } else if (std.mem.eql(u8, t, "override")) {
+                is_override = true;
+                _ = support.bump(p);
+                support.skipNl(p);
+            } else if (std.mem.eql(u8, t, "open")) {
+                is_open = true;
+                _ = support.bump(p);
+                support.skipNl(p);
+            } else if (std.mem.eql(u8, t, "final")) {
+                is_final = true;
+                _ = support.bump(p);
+                support.skipNl(p);
+            } else if (std.mem.eql(u8, t, "abstract") or
                 std.mem.eql(u8, t, "lateinit") or
                 std.mem.eql(u8, t, "actual") or
                 std.mem.eql(u8, t, "expect"))
@@ -897,6 +910,9 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
             .is_vararg = is_vararg,
             .annotations = annotations,
             .span = start.join(end),
+            .is_override = is_override,
+            .is_open = is_open,
+            .is_final = is_final,
         }) catch @panic("OOM");
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
@@ -942,4 +958,14 @@ fn ownedArgsList(p: *Parser, list: *std.ArrayList(?[]Expr)) []?[]Expr {
 
 fn ownedDelegates(p: *Parser, list: *std.ArrayList(?Expr)) []?Expr {
     return list.toOwnedSlice(p.allocator) catch @panic("OOM");
+}
+
+/// Whether `by` comes next, on this line or a later one (`: G\nby impl`);
+/// newlines before it are consumed only when it does.
+fn delegationFollows(p: *Parser) bool {
+    const save = p.pos;
+    support.skipNl(p);
+    if (eqlOpt(support.peekIdentText(p), "by")) return true;
+    p.pos = save;
+    return false;
 }

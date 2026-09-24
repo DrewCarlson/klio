@@ -174,6 +174,34 @@ pub fn parseClassTypeParamIdentity(raw_name: []const u8) ?ClassTypeParamIdentity
     return .{ .owner = ClassId.from(owner_int), .param = param };
 }
 
+/// A host function a bodyless declaration is bound to: an index into
+/// `Resolved.natives`.
+pub const NativeId = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+    pub fn from(v: u32) NativeId {
+        return @enumFromInt(v);
+    }
+    pub fn int(self: NativeId) u32 {
+        return @intFromEnum(self);
+    }
+};
+
+/// A top-level property with storage, or an enum entry: an index into
+/// `Resolved.statics`.
+pub const StaticId = enum(u32) {
+    _,
+    pub fn from(v: u32) StaticId {
+        return @enumFromInt(v);
+    }
+    pub fn int(self: StaticId) u32 {
+        return @intFromEnum(self);
+    }
+};
+
+/// A `FuncId` field left empty (a property reference with no setter).
+pub const NO_FUNC: u32 = std.math.maxInt(u32);
+
 /// Constant pool index for literals too large to fit in a `u32`.
 pub const ConstId = enum(u32) {
     _,
@@ -183,14 +211,4 @@ pub const ConstId = enum(u32) {
     pub fn int(self: ConstId) u32 {
         return @intFromEnum(self);
     }
-};
-
-/// A `BuildObject` type rename: the simple name a reference uses, and the mangled lift name.
-pub const ScopeRename = struct { name: []const u8, renamed: []const u8 };
-
-/// A classifier resolved at an anonymous-object site, so its lowered members use the exact FQN.
-pub const ScopeClassRef = struct {
-    name: []const u8,
-    fqn: []const u8,
-    has_companion: bool,
 };

@@ -1,7 +1,5 @@
 const std = @import("std");
-const ast = @import("ast");
 const runtime = @import("runtime");
-const FF = runtime.forest.ForestField;
 const root_ir = @import("../ir.zig");
 const core_ids = @import("ids.zig");
 
@@ -10,9 +8,10 @@ const ClassId = core_ids.ClassId;
 const ConstId = core_ids.ConstId;
 const FuncId = core_ids.FuncId;
 const MethodSlotId = core_ids.MethodSlotId;
+const NativeId = core_ids.NativeId;
+const StaticId = core_ids.StaticId;
+const NO_FUNC = core_ids.NO_FUNC;
 const Reg = core_ids.Reg;
-const ScopeClassRef = core_ids.ScopeClassRef;
-const ScopeRename = core_ids.ScopeRename;
 const Span = root_ir.Span;
 const TypeRef = core_ids.TypeRef;
 
@@ -90,43 +89,6 @@ pub const CallMemberOrGlobalInst = struct {
     /// stored as `FuncId + 1` (0 = unclaimed). Claimed only for a plain positional call
     /// the overload terminal answered with a fused activation, so a replay is exact.
     global_fid: u32 = 0,
-
-    /// Owned by the instruction out of line; the walkers follow the pointer.
-    pub const hashed_by_content = {};
-};
-
-/// Materialise a closure from a stashed AST `Block` plus captured registers indexed
-/// by name; the VM builds an `IrClosure` over `body_func` and the captured values.
-pub const AstLambdaInst = struct {
-    dst: Reg,
-    params: [][]const u8,
-    body_ast: ast.Block,
-    captures: []Reg,
-    captured_names: [][]const u8,
-    /// True for an anonymous function expression, whose `return` exits the function
-    /// itself; false for a lambda, where the enclosing function is the return target.
-    absorb_return: bool = false,
-    /// `FuncId` of the IR-lowered body, emitted alongside the AST snapshot so call
-    /// sites can dispatch without the tree walker. Null when only the AST form exists.
-    body_func: ?FuncId = null,
-
-    /// Owned by the instruction out of line; the walkers follow the pointer.
-    pub const hashed_by_content = {};
-};
-
-/// Build an anonymous-object instance from an `object { … }` AST node: synthesise a
-/// `ClassDef`, fill its env from `captures`, run its init pipeline, return the instance.
-pub const BuildObjectInst = struct {
-    dst: Reg,
-    ast: FF(ast.Expr),
-    captured_names: [][]const u8,
-    captures: []Reg,
-    /// Scope-true type renames visible at the object expression's lexical site. Member bodies
-    /// lower at runtime into a fresh side module with none of the build's scope registries,
-    /// so the renames must ride on the instruction.
-    scope_renames: []const ScopeRename = &.{},
-    /// Exact classifier identities referenced by the object subtree.
-    scope_classes: []const ScopeClassRef = &.{},
 
     /// Owned by the instruction out of line; the walkers follow the pointer.
     pub const hashed_by_content = {};
@@ -394,6 +356,9 @@ pub const CallVirtualInst = struct {
 /// `NewInstance.ctor_pick` when lowering named no constructor.
 pub const CTOR_PICK_NONE: u16 = std.math.maxInt(u16);
 
+/// `CallStatic.init` when the call runs no init unit first.
+pub const NO_UNIT: u32 = std.math.maxInt(u32);
+
 pub const Inst = union(enum) {
     Const: struct { dst: Reg, value: ConstId },
     /// Suspend-resume marker: `state` picks the resume block from the entry dispatch table.
@@ -568,8 +533,6 @@ pub const Inst = union(enum) {
     /// Boxed: rare and large.
     CallSpread: *CallSpreadInst,
     CallMemberOrGlobal: *CallMemberOrGlobalInst,
-    AstLambda: *AstLambdaInst,
-    BuildObject: *BuildObjectInst,
     NewInstance: struct {
         dst: Reg,
         class: ClassId,
@@ -697,16 +660,6 @@ pub const Inst = union(enum) {
     /// top-level property's setter (or a plain top-level `var`) is updated.
     /// `slot`: the same index for a plain stored `var`, whose write has no setter or delegate to run.
     StoreGlobal: struct { name: ConstId, value: Reg, slot: ?u32 = null },
-    /// Register a class declared inside a function body; it lives for the call's duration.
-    RegisterClass: struct {
-        class: FF(ast.Class),
-        /// Capture-name slots so the class methods see the enclosing function's locals.
-        captured_names: [][]const u8,
-        captures: []Reg,
-        /// Receives the registered class as a `.Class` value, so a later `C(args)` constructs
-        /// the local class rather than a same-named top-level function, as Kotlin requires.
-        dst: ?Reg = null,
-    },
     /// Materialise a lambda value: `captures` lists the registers the evaluator snapshots
     /// into a closure env, and `body_func` is the body lowered as a separate Func.
     Lambda: struct {
@@ -714,6 +667,57 @@ pub const Inst = union(enum) {
         body_func: FuncId,
         captures: []Reg,
     },
+
+    // Lowered from sema: every operand is an id, and nothing here is looked
+    // up by name. The `R` variants replace same-named ones of another shape.
+
+    /// Run `func` over the argument run: its native when it has one, else its body.
+    /// `init`: the init unit the call runs first, the file of the facade that
+    /// declares `func` when the caller is not code of that facade; `NO_UNIT`
+    /// for none.
+    CallStatic: struct { dst: Reg, func: FuncId, args: Reg, n_args: u32, init: u32 = NO_UNIT },
+    /// Run the implementation of `slot` for the class of `args[0]`.
+    RCallVirtual: struct { dst: Reg, slot: MethodSlotId, args: Reg, n_args: u32 },
+    /// As `RCallVirtual`, through a member of interface `iface`.
+    CallInterface: struct { dst: Reg, iface: ClassId, slot: MethodSlotId, args: Reg, n_args: u32 },
+    /// Run host function `native` over the argument run.
+    /// `direct`: a `super` call, which runs the native as it is. Otherwise a
+    /// Kotlin receiver whose class overrides the member the native
+    /// implements runs its override (`resolved.NativeRt.slot`).
+    CallNative: struct { dst: Reg, native: NativeId, args: Reg, n_args: u32, direct: bool = false },
+    /// Invoke the function value in `callee` with the argument run.
+    RCallValue: struct { dst: Reg, callee: Reg, args: Reg, n_args: u32 },
+    /// Allocate an instance of `class` with its slots seeded, then run `ctor`
+    /// with the instance prepended; `dst` receives the constructor's `this`.
+    RNewInstance: struct { dst: Reg, class: ClassId, ctor: FuncId, args: Reg, n_args: u32 },
+    GetFieldSlot: struct { dst: Reg, obj: Reg, slot: u32 },
+    SetFieldSlot: struct { obj: Reg, slot: u32, value: Reg },
+    /// Read a static, running its init unit on first touch.
+    LoadStatic: struct { dst: Reg, static: StaticId },
+    StoreStatic: struct { static: StaticId, value: Reg },
+    /// The singleton of an object or companion, constructed on first use.
+    LoadObject: struct { dst: Reg, class: ClassId },
+    /// A closure over `func` capturing the registers' values.
+    MakeClosure: struct { dst: Reg, func: FuncId, captures: []const Reg },
+    /// A callable reference: a closure over `adapter` with `bound` as capture
+    /// 0; equality and `name` answer from `target`.
+    FunctionRef: struct { dst: Reg, adapter: FuncId, target: FuncId, bound: ?Reg },
+    /// A property reference; `setter` is `NO_FUNC` for a read-only property.
+    RPropertyRef: struct { dst: Reg, getter: FuncId, setter: u32 = NO_FUNC, bound: ?Reg, name: ConstId },
+    /// The `KClass` of `class`.
+    ClassLiteral: struct { dst: Reg, class: ClassId },
+    /// The `KClass` of the run-time class of `src`.
+    ClassOf: struct { dst: Reg, src: Reg },
+    RInstanceOf: struct { dst: Reg, src: Reg, class: ClassId, nullable: bool },
+    /// A failed cast throws `ClassCastException`, or gives null when `safe`.
+    RCast: struct { dst: Reg, src: Reg, class: ClassId, nullable: bool, safe: bool },
+    /// As `RInstanceOf`, against the reified type value in `ty`.
+    InstanceOfDyn: struct { dst: Reg, src: Reg, ty: Reg, nullable: bool },
+    CastDyn: struct { dst: Reg, src: Reg, ty: Reg, nullable: bool, safe: bool },
+    ArrayGet: struct { dst: Reg, array: Reg, index: Reg },
+    ArraySet: struct { array: Reg, index: Reg, value: Reg },
+    /// An array of `class` holding the argument run.
+    NewArray: struct { dst: Reg, class: ClassId, args: Reg, n_args: u32 },
 };
 
 pub const SpreadPart = struct {
@@ -899,6 +903,9 @@ pub const CatchHandler = struct {
     type_name: []const u8,
     handler: BlockId,
     exception_reg: Reg,
+    /// The caught class, for a handler lowered from sema: it matches by
+    /// `Module.classIsA` and `type_name` is not read. `NO_CLASS` otherwise.
+    class_raw: u32 = NO_CLASS,
 };
 
 /// Absorption point for a labeled return targeting an inline function spliced into the

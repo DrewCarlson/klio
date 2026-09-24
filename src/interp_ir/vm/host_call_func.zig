@@ -529,7 +529,7 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
 }
 
 /// Run `func` through a `CallCtx` on a borrowed `VmIntrinsicHost`.
-fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+pub fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(allocator, "intrinsic_call_func", fqn, null, null, args);
     const keepalive = self.ka.mark();
     defer self.ka.restore(keepalive);
@@ -547,6 +547,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
         .singletons_by_id = self.singletons_by_id.clone(),
+        .resolved_state = self.resolved_state,
         .allocator = self.allocator,
     };
     defer {
@@ -563,6 +564,31 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         intrinsic.object_states.deinit();
         intrinsic.singletons_by_id.deinit();
     }
+    stdlib.implementations.string.clearRecvMemo();
+    var ctx = CallCtx{
+        .args = args,
+        .out = self.out,
+        .host = intrinsic.intrinsicHost(),
+        .allocator = allocator,
+    };
+    const prev_fqn_lt = runtime.leaktrack.currentFqn();
+    runtime.leaktrack.setCurrentFqn(fqn);
+    const r = try func(&ctx);
+    runtime.leaktrack.setCurrentFqn(prev_fqn_lt);
+    return switch (r) {
+        .ok => |v| .{ .ok = v },
+        .err => |e| .{ .err = runtimeErrorToEval(allocator, e) },
+    };
+}
+
+/// Runs stdlib native `func` over `args` on a view of this host's handles
+/// that takes no references: a member the bridge bound to the native once
+/// (`host_members`), which lives no longer than this host does.
+pub fn callStdlibBorrowed(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+    const keepalive = self.ka.mark();
+    defer self.ka.restore(keepalive);
+    self.ka.pushSlice(args);
+    var intrinsic = VmIntrinsicHost.borrowed(vmhost.SharedHandles.fromHost(self));
     stdlib.implementations.string.clearRecvMemo();
     var ctx = CallCtx{
         .args = args,

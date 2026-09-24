@@ -1,18 +1,13 @@
-//! Gate for the baked stdlib image: the `klio run` image path (bake on miss,
-//! hit on rerun) must match the whole-program build byte for byte. Scenarios
-//! run the real `klio` binary (KLIO_ITEST_BIN) against a scratch HOME, so the
-//! image cache under test never touches `~/.klio`.
+//! Gate for the base image `klio run` caches (`sema-base-<key>.klio-sema`):
+//! a run over the image (baked on a miss, read on a hit) must match a run
+//! over a base analyzed afresh (`KLIO_SEMA_IMAGE=0`) byte for byte. The
+//! scenarios run the real `klio` binary (KLIO_ITEST_BIN) against a scratch
+//! HOME, so the cache under test never touches `~/.klio`. The image's own
+//! encoding round trips are the `lower_driver` module's tests.
 
 const std = @import("std");
-const interp_ir = @import("interp_ir");
 const stdlib = @import("stdlib");
-const span = @import("span");
-const lexer = @import("lexer");
-const parser = @import("parser");
-const ast = @import("ast");
 const runtime = @import("runtime");
-
-const SourceMap = span.SourceMap;
 
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
@@ -29,12 +24,10 @@ fn baseEnv(a: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
     errdefer map.deinit();
     runtime.procEnvPutAllInto(a, &map);
     try map.put("HOME", home);
-    // The build ships an image beside the binary; these tests watch the
-    // cache under their own home bake, reject and rebake.
-    try map.put("KLIO_STDLIB_IMAGE_SHIPPED", "0");
-    // The comparisons assert byte-identical stderr; keep tracing off.
-    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_TRACE_STDLIB_IMAGE"));
-    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_STDLIB_IMAGE"));
+    try map.put("KLIO_HOME", home);
+    // The comparisons assert byte-identical stderr and watch this cache.
+    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_SEMA_IMAGE"));
+    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_SEMA_TIMING"));
     _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_PACK_DIAG"));
     return map;
 }
@@ -70,28 +63,29 @@ fn writeProgram(a: std.mem.Allocator, io: std.Io, name: []const u8, src: []const
     return path;
 }
 
-/// Run `argv` cold, warm, and with the cache disabled; all three must agree.
-fn assertImageMatchesLegacy(
+/// Run `argv` over a fresh base, then over the image twice (the first bakes
+/// it on a miss, the second reads it); all three must agree.
+fn assertImageMatchesCold(
     a: std.mem.Allocator,
     io: std.Io,
     env: *std.process.Environ.Map,
     cwd: ?[]const u8,
     argv: []const []const u8,
 ) !void {
-    try env.put("KLIO_STDLIB_IMAGE", "0");
-    const legacy = try runKlio(a, io, env, cwd, argv);
-    _ = env.array_hash_map.swapRemove(@as([]const u8, "KLIO_STDLIB_IMAGE"));
+    try env.put("KLIO_SEMA_IMAGE", "0");
+    const fresh = try runKlio(a, io, env, cwd, argv);
+    _ = env.array_hash_map.swapRemove(@as([]const u8, "KLIO_SEMA_IMAGE"));
     const cold = try runKlio(a, io, env, cwd, argv);
     const warm = try runKlio(a, io, env, cwd, argv);
 
     for ([_]RunResult{ cold, warm }) |got| {
-        if (got.code != legacy.code or
-            !std.mem.eql(u8, got.stdout, legacy.stdout) or
-            !std.mem.eql(u8, got.stderr, legacy.stderr))
+        if (got.code != fresh.code or
+            !std.mem.eql(u8, got.stdout, fresh.stdout) or
+            !std.mem.eql(u8, got.stderr, fresh.stderr))
         {
             std.debug.print(
-                "stdlib_image mismatch for {s}\nlegacy code={d} stdout:\n{s}\nstderr:\n{s}\nimage code={d} stdout:\n{s}\nstderr:\n{s}\n",
-                .{ argv[argv.len - 1], legacy.code, legacy.stdout, legacy.stderr, got.code, got.stdout, got.stderr },
+                "stdlib_image mismatch for {s}\nfresh base code={d} stdout:\n{s}\nstderr:\n{s}\nimage code={d} stdout:\n{s}\nstderr:\n{s}\n",
+                .{ argv[argv.len - 1], fresh.code, fresh.stdout, fresh.stderr, got.code, got.stdout, got.stderr },
             );
             return error.TestUnexpectedResult;
         }
@@ -105,6 +99,10 @@ fn freshHome(a: std.mem.Allocator, io: std.Io, name: []const u8) ![]const u8 {
     return home;
 }
 
+fn isImage(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "sema-base-") and std.mem.endsWith(u8, name, ".klio-sema");
+}
+
 fn countImages(a: std.mem.Allocator, io: std.Io, home: []const u8) usize {
     const cache = std.fmt.allocPrint(a, "{s}/.klio/cache", .{home}) catch return 0;
     var dir = std.Io.Dir.cwd().openDir(io, cache, .{ .iterate = true }) catch return 0;
@@ -112,7 +110,7 @@ fn countImages(a: std.mem.Allocator, io: std.Io, home: []const u8) usize {
     var n: usize = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (std.mem.endsWith(u8, entry.name, ".klio-image")) n += 1;
+        if (isImage(entry.name)) n += 1;
     }
     return n;
 }
@@ -123,7 +121,7 @@ fn firstImagePath(a: std.mem.Allocator, io: std.Io, home: []const u8) ?[]const u
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (std.mem.endsWith(u8, entry.name, ".klio-image")) {
+        if (isImage(entry.name)) {
             return std.fmt.allocPrint(a, "{s}/{s}", .{ cache, entry.name }) catch null;
         }
     }
@@ -148,7 +146,7 @@ const P_BASIC =
     \\
 ;
 
-/// Redeclares a stdlib top-level name, forcing the whole-program fallback.
+/// Redeclares a stdlib top-level name.
 const P_FALLBACK =
     \\fun listOf(x: Int): Int = x + 1
     \\fun main() {
@@ -172,8 +170,7 @@ const P_KX =
     \\
 ;
 
-/// A package member reached by fully-qualified name with no `import`: both
-/// paths must harvest the prefix to load the gated sources.
+/// A package member reached by fully-qualified name with no `import`.
 const P_QUALIFIED_IMPLICIT =
     \\fun main() {
     \\    println(kotlin.math.max(3, 7))
@@ -191,7 +188,7 @@ const P_QUALIFIED_GATED =
     \\
 ;
 
-test "image path is byte-identical to legacy: basic, fallback, no-main" {
+test "image path is byte-identical to a fresh base: basic, redeclared stdlib name, no-main" {
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -203,17 +200,17 @@ test "image path is byte-identical to legacy: basic, fallback, no-main" {
     const bin = try klioBin(a, io, &env);
 
     const basic = try writeProgram(a, io, "basic.kt", P_BASIC);
-    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", basic });
+    try assertImageMatchesCold(a, io, &env, null, &.{ bin, "run", basic });
     try std.testing.expect(countImages(a, io, home) >= 1);
 
     const fallback = try writeProgram(a, io, "fallback.kt", P_FALLBACK);
-    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", fallback });
+    try assertImageMatchesCold(a, io, &env, null, &.{ bin, "run", fallback });
 
     const no_main = try writeProgram(a, io, "no_main.kt", P_NO_MAIN);
-    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", no_main });
+    try assertImageMatchesCold(a, io, &env, null, &.{ bin, "run", no_main });
 }
 
-test "fully-qualified unimported reference: image path matches legacy" {
+test "fully-qualified unimported reference: image path matches a fresh base" {
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -225,10 +222,10 @@ test "fully-qualified unimported reference: image path matches legacy" {
     const bin = try klioBin(a, io, &env);
 
     const implicit = try writeProgram(a, io, "qualified_implicit.kt", P_QUALIFIED_IMPLICIT);
-    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", implicit });
+    try assertImageMatchesCold(a, io, &env, null, &.{ bin, "run", implicit });
 
     const gated = try writeProgram(a, io, "qualified_gated.kt", P_QUALIFIED_GATED);
-    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", gated });
+    try assertImageMatchesCold(a, io, &env, null, &.{ bin, "run", gated });
 }
 
 test "corrupted image is rejected and rebaked transparently" {
@@ -349,7 +346,7 @@ test "outside a checkout the embedded pack serves the stdlib" {
     try std.testing.expectEqual(@as(usize, 1), countImages(a, io, home));
 }
 
-test "pack-using program: image path matches legacy with installed packs" {
+test "pack-using program: image path matches a fresh base with installed packs" {
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -365,13 +362,10 @@ test "pack-using program: image path matches legacy with installed packs" {
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
     };
-    const pack_files = [_][]const u8{
-        "target/packs/kotlinx.atomicfu.klio-pack",
-        "target/packs/kotlinx.coroutines.klio-pack",
-        "target/packs/kotlinx.io.klio-pack",
-    };
-    for (pack_dirs) |d| {
-        const r = try runKlio(a, io, &env, null, &.{ bin, "pack", "build", d });
+    var pack_files: [pack_dirs.len][]const u8 = undefined;
+    for (pack_dirs, &pack_files) |d, *f| {
+        f.* = try std.fmt.allocPrint(a, "{s}/{s}.klio-pack", .{ home, std.fs.path.basename(d) });
+        const r = try runKlio(a, io, &env, null, &.{ bin, "pack", "build", d, "--out", f.* });
         if (r.code != 0) {
             std.debug.print("stdlib_image: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
             return error.TestUnexpectedResult;
@@ -386,400 +380,5 @@ test "pack-using program: image path matches legacy with installed packs" {
     }
 
     const kx = try writeProgram(a, io, "kx.kt", P_KX);
-    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", kx });
-}
-
-// In-process round trip: bake a lowered base, then compare the loaded tables.
-
-fn parseOne(a: std.mem.Allocator, map: *SourceMap, name: []const u8, src: []const u8) !ast.KotlinFile {
-    const fid = try map.add(name, src);
-    const srcf = map.get(fid).source;
-    var lx = try lexer.Lexer.init(a, fid, srcf);
-    const lexed = try lx.tokenize();
-    try std.testing.expect(!lexed.diagnostics.hasErrors());
-    const p = parser.Parser.new(a, fid, srcf, lexed.tokens, lexed.strings);
-    const file_ast = p.parseFile();
-    try std.testing.expect(!p.diagnostics.hasErrors());
-    return file_ast;
-}
-
-const DEP_SRC =
-    \\package dep.lib
-    \\
-    \\enum class Mode(val tag: Int) {
-    \\    FAST(1),
-    \\    SLOW(2) { override fun describe(): String = "slow" };
-    \\    open fun describe(): String = "mode " + tag
-    \\}
-    \\open class Box(val size: Int) {
-    \\    open fun grow(by: Int = 1): Box = Box(size + by)
-    \\}
-    \\class BigBox(size: Int) : Box(size) {
-    \\    override fun grow(by: Int): Box = BigBox(size + by * 2)
-    \\}
-    \\object Counter { var hits = 0 }
-    \\inline fun twice(block: () -> Int): Int = block() + block()
-    \\fun depHelper(x: Int): Int = twice { x } + Mode.FAST.tag
-    \\val depConst = 40 + 2
-    \\
-;
-
-test "bake/load round-trips the lowered base tables" {
-    const a = file_arena.allocator();
-
-    var map = SourceMap.init(a);
-    const dep = try parseOne(a, &map, "dep.kt", DEP_SRC);
-    var files = [_]ast.KotlinFile{dep};
-    const base = (try interp_ir.build.buildStdlibBase(a, &files)) orelse
-        return error.TestUnexpectedResult;
-    base.user_file_start = @intCast(map.files.items.len);
-
-    const known = [_][]const u8{"dep.lib"};
-    const fqns = [_][]const u8{"dep.lib.depHelper"};
-    const bytes = (try interp_ir.image.bake(a, a, base, &map, .{
-        .known_packages = &known,
-        .binding_fqns = &fqns,
-    })) orelse return error.TestUnexpectedResult;
-
-    const loaded = (try interp_ir.image.load(a, bytes)) orelse {
-        std.debug.print("image load failed: {s}\n", .{interp_ir.image.lastLoadFailure()});
-        return error.TestUnexpectedResult;
-    };
-    const got = loaded.base;
-
-    {
-        const mg0 = base.built.module.borrow();
-        defer mg0.deinit();
-        const mg1 = got.built.module.borrow();
-        defer mg1.deinit();
-        const m0 = mg0.get();
-        const m1 = mg1.get();
-        // Loaded funcs are lazy per-func sections; funcById decodes them.
-        try std.testing.expectEqual(m0.funcCount(), m1.funcCount());
-        for (m0.funcs.items) |*f0| {
-            const f1 = m1.funcById(f0.id).?;
-            try std.testing.expectEqualStrings(f0.name, f1.name);
-            try std.testing.expectEqualStrings(f0.fqn, f1.fqn);
-            try std.testing.expectEqual(f0.id, f1.id);
-            // Both sides defer bodies, so materialise before comparing.
-            _ = m0.ensureFuncBody(@constCast(f0));
-            _ = m1.ensureFuncBody(@constCast(f1));
-            if (f0.blocks.len != f1.blocks.len)
-                std.debug.print("round-trip block mismatch: {s}#{d} fresh={d} decoded={d}\n", .{ f0.fqn, f0.id.int(), f0.blocks.len, f1.blocks.len });
-            try std.testing.expectEqual(f0.blocks.len, f1.blocks.len);
-            if (f0.params.len != f1.params.len)
-                std.debug.print("round-trip param mismatch: {s}#{d} fresh={d} decoded={d}\n", .{ f0.fqn, f0.id.int(), f0.params.len, f1.params.len });
-            try std.testing.expectEqual(f0.params.len, f1.params.len);
-            for (f0.blocks, f1.blocks) |b0, b1| {
-                if (b0.insts.len != b1.insts.len)
-                    std.debug.print("round-trip inst mismatch: {s}#{d} fresh={d} decoded={d} blocks={d}\n", .{ f0.fqn, f0.id.int(), b0.insts.len, b1.insts.len, f0.blocks.len });
-                try std.testing.expectEqual(b0.insts.len, b1.insts.len);
-                try std.testing.expectEqual(
-                    @as(std.meta.Tag(@TypeOf(b0.terminator)), b0.terminator),
-                    @as(std.meta.Tag(@TypeOf(b1.terminator)), b1.terminator),
-                );
-            }
-        }
-        const eqn = struct {
-            fn check(label: []const u8, av: usize, bv: usize) !void {
-                if (av != bv) std.debug.print("round-trip table mismatch: {s} fresh={d} decoded={d}\n", .{ label, av, bv });
-                try std.testing.expectEqual(av, bv);
-            }
-        }.check;
-        try eqn("consts", m0.consts.items.len, m1.consts.items.len);
-        for (m0.consts.items, m1.consts.items) |c0, c1| {
-            try std.testing.expect(c0.eql(c1));
-        }
-        try eqn("classes", m0.classes.items.len, m1.classes.items.len);
-        try eqn("top_level", m0.top_level.items.len, m1.top_level.items.len);
-        try eqn("func_index", m0.func_index.items.len, m1.func_index.items.len);
-        try eqn("func_name_index", m0.func_name_index.count(), m1.func_name_index.count());
-        try eqn("class_member_names", m0.registry.class_member_names.count(), m1.registry.class_member_names.count());
-        try eqn("hierarchy_methods", m0.registry.hierarchy_methods.count(), m1.registry.hierarchy_methods.count());
-        try eqn("class_const_inits", m0.registry.class_const_inits.count(), m1.registry.class_const_inits.count());
-        try eqn("decl_user_arity", m0.decl_user_arity.count(), m1.decl_user_arity.count());
-    }
-
-    try std.testing.expectEqual(base.built.classes.count(), got.built.classes.count());
-    {
-        var it = base.built.classes.iterator();
-        while (it.next()) |entry| {
-            const other = got.built.classes.get(entry.key_ptr.*) orelse return error.TestUnexpectedResult;
-            const g0 = entry.value_ptr.borrow();
-            defer g0.deinit();
-            const g1 = other.borrow();
-            defer g1.deinit();
-            try std.testing.expectEqualStrings(g0.get().fqn, g1.get().fqn);
-            try std.testing.expectEqual(g0.get().methods.len, g1.get().methods.len);
-            try std.testing.expectEqual(g0.get().enum_entries.len, g1.get().enum_entries.len);
-            try std.testing.expectEqual(g0.get().parent != null, g1.get().parent != null);
-            for (g0.get().enum_entries, g1.get().enum_entries) |e0, e1| {
-                try std.testing.expectEqualStrings(e0.name, e1.name);
-            }
-        }
-    }
-
-    try std.testing.expectEqual(base.decl_names.count(), got.decl_names.count());
-    try std.testing.expect(got.decl_names.contains("depHelper"));
-    try std.testing.expect(got.decl_names.contains("Mode"));
-    try std.testing.expectEqual(base.packages.count(), got.packages.count());
-    try std.testing.expect(got.packages.contains("dep.lib"));
-    try std.testing.expectEqual(base.type_names.count(), got.type_names.count());
-    try std.testing.expectEqual(base.inline_ids.len, got.inline_ids.len);
-    for (base.inline_ids, got.inline_ids) |x0, x1| {
-        try std.testing.expectEqual(x0.id, x1.id);
-        try std.testing.expectEqualStrings(x0.f.get().name.name, x1.f.get().name.name);
-    }
-    try std.testing.expectEqual(base.enum_id_next, got.enum_id_next);
-    try std.testing.expectEqual(base.user_file_start, got.user_file_start);
-    // The image drops the eager forest: decls decode on first
-    // `ForestField.get()`, leaving `lifted_decls` empty.
-    try std.testing.expectEqual(@as(usize, 0), got.lifted_decls.len);
-    try std.testing.expectEqual(@as(usize, 1), loaded.known_packages.len);
-    try std.testing.expectEqualStrings("dep.lib", loaded.known_packages[0]);
-    try std.testing.expectEqual(@as(usize, 1), loaded.binding_fqns.len);
-
-    try std.testing.expectEqual(map.files.items.len, loaded.map.files.items.len);
-    try std.testing.expectEqualStrings(map.files.items[0].path, loaded.map.files.items[0].path);
-
-    // This base is dep-only, so the program stays inside that surface: a bare
-    // `println` would record a resolve diagnostic and fail the check below.
-    const USER_SRC =
-        \\import dep.lib.*
-        \\fun main(): Int {
-        \\    val a = depHelper(20) + depConst
-        \\    val b = BigBox(3).grow(2).size
-        \\    val c = Mode.SLOW.describe()
-        \\    return a + b + c.length
-        \\}
-        \\
-    ;
-    {
-        var user_map0 = SourceMap.init(a);
-        try user_map0.files.appendSlice(user_map0.arena.allocator(), map.files.items);
-        const uf0 = try parseOne(a, &user_map0, "user.kt", USER_SRC);
-        var user_map1 = SourceMap.init(a);
-        try user_map1.files.appendSlice(user_map1.arena.allocator(), loaded.map.files.items);
-        const uf1 = try parseOne(a, &user_map1, "user.kt", USER_SRC);
-
-        var files0 = [_]ast.KotlinFile{uf0};
-        var files1 = [_]ast.KotlinFile{uf1};
-        try std.testing.expect(interp_ir.build.canExtendBase(base, &files0));
-        try std.testing.expect(interp_ir.build.canExtendBase(got, &files1));
-        var built0 = try interp_ir.build.buildModuleFilesExtend(a, base, &files0);
-        var built1 = try interp_ir.build.buildModuleFilesExtend(a, got, &files1);
-        defer built0.deinit();
-        defer built1.deinit();
-        try std.testing.expect(built0.main != null);
-        try std.testing.expect(built1.main != null);
-        const bg0 = built0.module.borrow();
-        defer bg0.deinit();
-        const bg1 = built1.module.borrow();
-        defer bg1.deinit();
-        try std.testing.expectEqual(bg0.get().funcCount(), bg1.get().funcCount());
-        for (bg0.get().resolve_diags.items) |d|
-            std.debug.print("round-trip resolve diag: {s} kind={s} file={d} at={d}\n", .{ d.name, @tagName(d.kind), d.span.file.int(), d.span.start });
-        try std.testing.expectEqual(@as(usize, 0), bg0.get().resolve_diags.items.len);
-        try std.testing.expectEqual(@as(usize, 0), bg1.get().resolve_diags.items.len);
-    }
-}
-
-test "an image's base materialises and bakes again to the same base" {
-    const a = file_arena.allocator();
-    var map = SourceMap.init(a);
-    const dep = try parseOne(a, &map, "dep.kt", DEP_SRC);
-    var files = [_]ast.KotlinFile{dep};
-    const base = (try interp_ir.build.buildStdlibBase(a, &files)) orelse
-        return error.TestUnexpectedResult;
-    base.user_file_start = @intCast(map.files.items.len);
-    const known = [_][]const u8{"dep.lib"};
-    const fqns = [_][]const u8{"dep.lib.depHelper"};
-    const extras: interp_ir.image.BakeExtras = .{ .known_packages = &known, .binding_fqns = &fqns };
-    const bytes = (try interp_ir.image.bake(a, a, base, &map, extras)) orelse return error.TestUnexpectedResult;
-    const loaded = (try interp_ir.image.load(a, bytes)) orelse {
-        std.debug.print("image load failed: {s}\n", .{interp_ir.image.lastLoadFailure()});
-        return error.TestUnexpectedResult;
-    };
-    // Everything the image kept lazy comes into memory, and the base bakes
-    // again exactly as the original did.
-    try std.testing.expect(try interp_ir.image.materialize(a, loaded.base));
-    try std.testing.expectEqual(base.lifted_decls.len, loaded.base.lifted_decls.len);
-    const bytes2 = (try interp_ir.image.bake(a, a, loaded.base, loaded.map, extras)) orelse return error.TestUnexpectedResult;
-    const loaded2 = (try interp_ir.image.load(a, bytes2)) orelse {
-        std.debug.print("second image load failed: {s}\n", .{interp_ir.image.lastLoadFailure()});
-        return error.TestUnexpectedResult;
-    };
-    const got = loaded2.base;
-    {
-        const mg0 = base.built.module.borrow();
-        defer mg0.deinit();
-        const mg1 = got.built.module.borrow();
-        defer mg1.deinit();
-        const m0 = mg0.get();
-        const m1 = mg1.get();
-        try std.testing.expectEqual(m0.funcCount(), m1.funcCount());
-        try std.testing.expectEqual(m0.classes.items.len, m1.classes.items.len);
-        for (m0.funcs.items) |*f0| {
-            const f1 = m1.funcById(f0.id).?;
-            try std.testing.expectEqualStrings(f0.name, f1.name);
-            try std.testing.expectEqualStrings(f0.fqn, f1.fqn);
-            _ = m0.ensureFuncBody(@constCast(f0));
-            _ = m1.ensureFuncBody(@constCast(f1));
-            try std.testing.expectEqual(f0.blocks.len, f1.blocks.len);
-            for (f0.blocks, f1.blocks) |*b0, *b1| try std.testing.expectEqual(b0.insts.len, b1.insts.len);
-        }
-        try std.testing.expectEqual(m0.registry.hierarchy_methods.count(), m1.registry.hierarchy_methods.count());
-        try std.testing.expectEqual(m0.registry.member_trailing_lambda_shapes.count(), m1.registry.member_trailing_lambda_shapes.count());
-    }
-    try std.testing.expectEqual(base.inline_ids.len, got.inline_ids.len);
-    try std.testing.expectEqual(loaded.base.inline_by_name.len, got.inline_by_name.len);
-    // A program extends the re-baked base as it extends the original.
-    const USER_SRC =
-        \\import dep.lib.*
-        \\fun main(): Int {
-        \\    val a = depHelper(20) + depConst
-        \\    val b = BigBox(3).grow(2).size
-        \\    val c = Mode.SLOW.describe()
-        \\    return a + b + c.length
-        \\}
-        \\
-    ;
-    var user_map0 = SourceMap.init(a);
-    try user_map0.files.appendSlice(user_map0.arena.allocator(), map.files.items);
-    const uf0 = try parseOne(a, &user_map0, "user.kt", USER_SRC);
-    var user_map2 = SourceMap.init(a);
-    try user_map2.files.appendSlice(user_map2.arena.allocator(), loaded2.map.files.items);
-    const uf2 = try parseOne(a, &user_map2, "user.kt", USER_SRC);
-    var files0 = [_]ast.KotlinFile{uf0};
-    var files2 = [_]ast.KotlinFile{uf2};
-    try std.testing.expect(interp_ir.build.canExtendBase(got, &files2));
-    var built0 = try interp_ir.build.buildModuleFilesExtend(a, base, &files0);
-    var built2 = try interp_ir.build.buildModuleFilesExtend(a, got, &files2);
-    defer built0.deinit();
-    defer built2.deinit();
-    try std.testing.expect(built2.main != null);
-    const bg0 = built0.module.borrow();
-    defer bg0.deinit();
-    const bg2 = built2.module.borrow();
-    defer bg2.deinit();
-    try std.testing.expectEqual(bg0.get().funcCount(), bg2.get().funcCount());
-    try std.testing.expectEqual(@as(usize, 0), bg2.get().resolve_diags.items.len);
-}
-
-const DEP2_SRC =
-    \\package dep.more
-    \\import dep.lib.*
-    \\
-    \\class Wide(val box: BigBox) {
-    \\    fun width(): Int = box.grow(1).size * 2
-    \\    inline fun twice(f: (Int) -> Int): Int = f(f(width()))
-    \\}
-    \\
-    \\enum class Speed { STOP, GO }
-    \\
-    \\fun wideOf(n: Int): Wide = Wide(BigBox(n))
-    \\
-    \\val moreConst = depConst + 1
-    \\
-;
-
-test "a base built on top of an image equals the base built from every file at once" {
-    const a = file_arena.allocator();
-    var map_all = SourceMap.init(a);
-    const dep_a = try parseOne(a, &map_all, "dep.kt", DEP_SRC);
-    const dep2_a = try parseOne(a, &map_all, "dep2.kt", DEP2_SRC);
-    var files_all = [_]ast.KotlinFile{ dep_a, dep2_a };
-    const whole = (try interp_ir.build.buildStdlibBase(a, &files_all)) orelse return error.TestUnexpectedResult;
-
-    var map = SourceMap.init(a);
-    const dep = try parseOne(a, &map, "dep.kt", DEP_SRC);
-    var files = [_]ast.KotlinFile{dep};
-    const first = (try interp_ir.build.buildStdlibBase(a, &files)) orelse return error.TestUnexpectedResult;
-    first.user_file_start = @intCast(map.files.items.len);
-    const bytes = (try interp_ir.image.bake(a, a, first, &map, .{})) orelse return error.TestUnexpectedResult;
-    const loaded = (try interp_ir.image.load(a, bytes)) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(try interp_ir.image.materialize(a, loaded.base));
-    // The second file parses onto the loaded map, so its spans follow the image's.
-    const dep2 = try parseOne(a, loaded.map, "dep2.kt", DEP2_SRC);
-    var files2 = [_]ast.KotlinFile{dep2};
-    const on_top = (try interp_ir.build.buildStdlibBaseOnTop(a, loaded.base, &files2)) orelse return error.TestUnexpectedResult;
-    try interp_ir.build.stripStdlibBase(a, on_top);
-    try std.testing.expectEqual(whole.lifted_decls.len, on_top.lifted_decls.len);
-    {
-        const mg0 = whole.built.module.borrow();
-        defer mg0.deinit();
-        const mg1 = on_top.built.module.borrow();
-        defer mg1.deinit();
-        const m0 = mg0.get();
-        const m1 = mg1.get();
-        try std.testing.expectEqual(m0.funcCount(), m1.funcCount());
-        try std.testing.expectEqual(m0.classes.items.len, m1.classes.items.len);
-        // The two builds number the functions differently: the extend reserves
-        // an inline member's header on its own path. The sets must agree, so
-        // each function is found on the other side by fqn and arity, and its
-        // body compared shape for shape.
-        const FuncT = std.meta.Elem(@TypeOf(m1.funcs.items));
-        var by_sig = std.StringHashMap(*const FuncT).init(a);
-        for (m1.funcs.items) |*f1| {
-            const key = try std.fmt.allocPrint(a, "{s}/{d}/{s}", .{ f1.fqn, f1.params.len, @tagName(f1.kind) });
-            try by_sig.put(key, f1);
-        }
-        for (m0.funcs.items) |*f0| {
-            const key = try std.fmt.allocPrint(a, "{s}/{d}/{s}", .{ f0.fqn, f0.params.len, @tagName(f0.kind) });
-            const f1 = by_sig.get(key) orelse {
-                std.debug.print("on-top build lacks {s}\n", .{key});
-                return error.TestUnexpectedResult;
-            };
-            try std.testing.expectEqualStrings(f0.name, f1.name);
-            _ = m0.ensureFuncBody(@constCast(f0));
-            _ = m1.ensureFuncBody(@constCast(f1));
-            try std.testing.expectEqual(f0.blocks.len, f1.blocks.len);
-            for (f0.blocks, f1.blocks) |*b0, *b1| try std.testing.expectEqual(b0.insts.len, b1.insts.len);
-        }
-        try std.testing.expectEqual(m0.registry.hierarchy_methods.count(), m1.registry.hierarchy_methods.count());
-    }
-    try std.testing.expectEqual(whole.enum_id_next, on_top.enum_id_next);
-    try std.testing.expectEqual(whole.decl_names.count(), on_top.decl_names.count());
-    try std.testing.expectEqual(whole.packages.count(), on_top.packages.count());
-    // The on-top base bakes, loads, and serves a program as the whole one does.
-    on_top.user_file_start = @intCast(loaded.map.files.items.len);
-    const bytes2 = (try interp_ir.image.bake(a, a, on_top, loaded.map, .{})) orelse return error.TestUnexpectedResult;
-    const loaded2 = (try interp_ir.image.load(a, bytes2)) orelse {
-        std.debug.print("layered image load failed: {s}\n", .{interp_ir.image.lastLoadFailure()});
-        return error.TestUnexpectedResult;
-    };
-    const USER_SRC =
-        \\import dep.lib.*
-        \\import dep.more.*
-        \\fun main(): Int {
-        \\    val w = wideOf(2)
-        \\    val a = w.twice { it + moreConst }
-        \\    val b = Speed.GO.ordinal + Mode.SLOW.describe().length
-        \\    return a + b
-        \\}
-        \\
-    ;
-    var user_map0 = SourceMap.init(a);
-    try user_map0.files.appendSlice(user_map0.arena.allocator(), map_all.files.items);
-    const uf0 = try parseOne(a, &user_map0, "user.kt", USER_SRC);
-    var user_map2 = SourceMap.init(a);
-    try user_map2.files.appendSlice(user_map2.arena.allocator(), loaded2.map.files.items);
-    const uf2 = try parseOne(a, &user_map2, "user.kt", USER_SRC);
-    var files0 = [_]ast.KotlinFile{uf0};
-    var ufiles2 = [_]ast.KotlinFile{uf2};
-    try std.testing.expect(interp_ir.build.canExtendBase(whole, &files0));
-    try std.testing.expect(interp_ir.build.canExtendBase(loaded2.base, &ufiles2));
-    var built0 = try interp_ir.build.buildModuleFilesExtend(a, whole, &files0);
-    var built2 = try interp_ir.build.buildModuleFilesExtend(a, loaded2.base, &ufiles2);
-    defer built0.deinit();
-    defer built2.deinit();
-    try std.testing.expect(built0.main != null);
-    try std.testing.expect(built2.main != null);
-    const bg0 = built0.module.borrow();
-    defer bg0.deinit();
-    const bg2 = built2.module.borrow();
-    defer bg2.deinit();
-    try std.testing.expectEqual(bg0.get().funcCount(), bg2.get().funcCount());
-    try std.testing.expectEqual(@as(usize, 0), bg0.get().resolve_diags.items.len);
-    try std.testing.expectEqual(@as(usize, 0), bg2.get().resolve_diags.items.len);
+    try assertImageMatchesCold(a, io, &env, null, &.{ bin, "run", kx });
 }

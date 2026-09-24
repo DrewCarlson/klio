@@ -1,8 +1,9 @@
 // A bare reference to an interface's own companion object resolves to that
-// companion — from the interface's own default member, from an implementing
-// class's method, and through a companion that carries a supertype (the
-// CoroutineContext.Element pattern, where `companion object Key :
-// CoroutineContext.Key<…>` is also a classifier).
+// companion from the interface's own default member, including through a
+// companion that carries a supertype (the CoroutineContext.Element pattern,
+// where `companion object Key : CoroutineContext.Key<…>` is also a
+// classifier). An interface's companion is not in an implementing class's
+// scope, so an implementor names it through the interface.
 import kotlin.coroutines.CoroutineContext
 
 interface Named {
@@ -13,7 +14,7 @@ interface Named {
 }
 
 class Widget : Named {
-    fun viaImpl(): String = Tag.label           // bare companion from an implementor
+    fun viaImpl(): String = Named.Tag.label     // qualified from an implementor
 }
 
 interface Element : CoroutineContext.Element {

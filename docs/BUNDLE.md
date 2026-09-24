@@ -97,15 +97,17 @@ Bundle size is dominated by the stub — a byte-for-byte copy of the
 `klio` binary doing the bundling. Measured on linux-x64 with a
 release build (`zig build -Doptimize=ReleaseFast`, stripped):
 
-| Bundle                                   | Size    | Startup                                  |
-|------------------------------------------|---------|-------------------------------------------|
-| hello world                               | 22.3 MB | 20 ms (warm `klio run`: 27 ms)             |
-| kotlinx.serialization CLI tool            | 23.4 MB | 24 ms                                      |
-| Compose UI app (klio.compose.ui + shim)   | 44.3 MB | 119 ms first launch, 100 ms warm           |
+| Bundle                                   | Size    |
+|------------------------------------------|---------|
+| hello world                               | 22.3 MB |
+| kotlinx.serialization CLI tool            | 23.4 MB |
+| Compose UI app (klio.compose.ui + shim)   | 44.3 MB |
 
-A bundle starts faster than `klio run` runs the same file: the
-program is baked as a whole-program IR image that boot mmaps straight
-out of the executable and runs, with zero parsing or lowering.
+A bundle carries its base (the stdlib and the packs the program
+imports) as a sema image: the base image a run keeps in its cache,
+with the text of every base file. Boot registers those files, checks
+them against the image, and analyzes and lowers only the program,
+which is what a warm `klio run` does, without the pack-cache walk.
 
 macOS bundles are the same shape (stub-dominated); the ad-hoc code
 signature adds the CodeDirectory's page hashes (~0.8% of the file, 32
@@ -203,15 +205,15 @@ bundled myapp (22.4 MB): stdlib + klio.bundle
 $ klio bundle app/main.kt --include app/assets --dry-run
 bundle (dry run): main
 flavor: headless
-entry: main
+entry: program-src
 packs:
   klio.bundle 0.1.0
 sections:
   manifest 411 bytes
+  sema-image 951552 bytes
   program-src 263 bytes
-  program-image 8421445 bytes
   resources 30 bytes
-projected size: 22.4 MB (stub 14.4 MB + payload 8.1 MB)
+projected size: 15.3 MB (stub 14.4 MB + payload 0.9 MB)
 ```
 
 `KLIO_BUNDLE_INSPECT=1 ./myapp` prints the same manifest from a
@@ -221,15 +223,15 @@ the only bundle-mode CLI affordance:
 ```sh
 $ KLIO_BUNDLE_INSPECT=1 ./resapp
 bundle: resapp
-klio: 0.1.0 (image format 21)
+klio: 0.1.0 (image format 1000001)
 flavor: headless
-entry: main
+entry: program-src
 packs:
   klio.bundle 0.1.0
 sections:
   manifest 413 bytes (413 uncompressed)
+  sema-image 951552 bytes (951552 uncompressed)
   program-src 263 bytes (263 uncompressed)
-  program-image 8421445 bytes (8421445 uncompressed)
   resources 30 bytes (30 uncompressed)
 resources:
   assets/greeting.txt 30 bytes
@@ -391,24 +393,26 @@ payload area, and a 72-byte trailer. The trailer's position is per-OS
 re-signed Mach-O), and boot reads it from the right place for the host
 binary format.
 
-- **Sections**: `manifest` (encoded `BundleManifest`),
-  `program-image` (deps + program lowered as one module and baked,
-  uncompressed and 16 KiB-aligned so boot mmaps it straight out of
-  the file and runs with zero parsing or lowering), `program-src`
-  (the user sources), `resources` (zstd per entry), `skia-shim` (UI
-  flavor only, zstd), `icon` (raw PNG). When the program bake refuses
-  (a base outside the image codec's serializable surface) the bundle
-  instead carries `base-image` (the dependency base alone) and boots
-  by parsing `program-src` against it — the always-works path,
-  recorded in the manifest and reported by `--dry-run`; startup is
-  the only difference. `KLIO_BUNDLE_PROGRAM_IMAGE=0` at bundle time
-  forces that path.
+- **Sections**: `manifest` (encoded `BundleManifest`), `sema-image`
+  (the program's base as a self-contained sema image: the base image
+  with the text of every base file and the pack features, compressed
+  as a whole, stored 16 KiB-aligned; boot decompresses it out of the
+  mapped file), `program-src` (the user sources, which build over the
+  image at boot), `resources` (zstd per entry), `skia-shim` (UI flavor only,
+  zstd), `icon` (raw PNG). Bundling builds the program over the image
+  first, so a program that does not resolve, lower or declare `main`
+  is refused at bundle time with the error `klio run` would print.
+  Bundling loads the base back from the image and builds the program
+  over it before it writes anything, so an image that would not load at
+  boot is refused at bundle time.
 - **Trailer**: magic `"KBND\0KL1"`, payload offset/length,
   section-table offset/length, and a blake3 hash of the whole payload
   area, verified at boot before anything decodes.
 - **Versioning**: the manifest carries the producing klio version and
-  the image format version; a stub refuses a payload from a different
-  version with an actionable error. A bundle is only ever assembled
+  the payload format version (`1000001` for a sema image; the sema
+  image checks its own format and the base image's again at boot); a
+  stub refuses a payload from a different version with an actionable
+  error. A bundle is only ever assembled
   by the same-version binary that boots it.
 - **Determinism**: two `klio bundle` runs over identical inputs (same
   sources, packs, features, output name) produce byte-identical
@@ -431,9 +435,10 @@ Bundle-time errors:
   — an arm64 macOS stub must carry the linker's ad-hoc signature (its
   `__TEXT`/`__LINKEDIT` layout is read to re-sign); the provided stub
   is not a normal `klio` binary.
-- `error: the program redeclares a name from its dependency base and cannot bundle; rename the declaration`
-  — a top-level declaration in the program collides with one in the
-  stdlib/pack base; bundling requires the extendable base.
+- `<file>:<line>:<col>: error: unresolved reference ...` (or another
+  program diagnostic), `error: no main function found`
+  — the program does not build over its base; the same errors
+  `klio run` reports, at bundle time.
 - `error: no cached stub for <target> (klio <version>); connect once to fetch it, or pass --stub <path>`
   — cross-target bundling could not resolve the target's stub (see
   the resolution order above).
@@ -457,14 +462,14 @@ Boot-time errors (from the bundled executable itself):
   `error: bundle carries no manifest; rebundle` — the payload
   structure does not decode; the file was damaged or assembled by a
   broken tool.
-- `error: bundle program image rejected (<reason>); rebundle`,
-  `error: bundle names an entry but carries no program image; rebundle`
-  — the whole-program image is missing or fails to load.
-- `error: bundle carries no base image; rebundle`,
+- `error: bundle carries no sema image; rebundle`,
   `error: bundle carries no program sources; rebundle`,
-  `error: embedded program sources fail to parse; rebundle`,
-  `error: embedded program cannot extend the bundle base; rebundle`
-  — the program-src boot path is incomplete or inconsistent.
+  `error: bundle program sources are malformed; rebundle`
+  — the payload is incomplete.
+- `error: base image rejected (<reason>); rebake it with this klio`,
+  `error: the base image was baked by another klio or from another base; rebake it`
+  — the sema image does not decode, or its base does not match the
+  image inside it: a damaged file or a different klio. Rebundle.
 
 Boot-time warnings (UI bundles; the program continues headless):
 

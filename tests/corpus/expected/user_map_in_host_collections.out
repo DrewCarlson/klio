@@ -1,0 +1,12 @@
+[ann=3, bob=5]
+[ann=3, bob=5, cy=1]
+true
+true
+false
+{"key":42}
+true
+true
+true
+[key=42]
+true
+43

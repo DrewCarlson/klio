@@ -102,14 +102,18 @@ pub fn parseFile(p: *Parser) KotlinFile {
         }
     }
     const end = support.currentSpan(p);
-    return .{
+    var kf: KotlinFile = .{
         .package = package,
         .file_annotations = file_annotations,
         .imports = imports,
         .decls = decls.toOwnedSlice(p.allocator) catch @panic("OOM in parseFile"),
         .has_composable = p.saw_composable,
         .span = start.join(end),
+        .node_count = p.first_node_id,
     };
+    ast.assignIds(&kf);
+    ast.node_ids.assertValid(&kf, "parse");
+    return kf;
 }
 
 pub fn parsePackageHeader(p: *Parser) ?PackageHeader {
@@ -251,6 +255,7 @@ pub fn parseTopDecl(p: *Parser) ?Decl {
                             .is_annotation = false,
                             .is_expect = flags.is_expect,
                             .is_actual = flags.is_actual,
+                            .is_external = flags.is_external,
                         },
                         visibility,
                         annotations,
@@ -299,6 +304,7 @@ pub fn parseTopDecl(p: *Parser) ?Decl {
                         .is_annotation = flags.is_annotation,
                         .is_expect = flags.is_expect,
                         .is_actual = flags.is_actual,
+                        .is_external = flags.is_external,
                     },
                     visibility,
                     annotations,
@@ -494,6 +500,7 @@ pub fn skipModifiersWithFlagsLevel(p: *Parser, at_stmt_level: bool) ModifierFlag
                     flags.is_final = true;
                     _ = support.bump(p);
                 } else if (std.mem.eql(u8, t, "external")) {
+                    flags.is_external = true;
                     _ = support.bump(p);
                 } else {
                     return flags;

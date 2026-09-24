@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 const net = std.Io.net;
 
 const FIXED_BODY = "{\"name\":\"Ada\",\"age\":36,\"roles\":[\"ADMIN\",\"USER\"]}";
@@ -118,6 +119,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    try map.put("KLIO_HOME", home);
     return map;
 }
 
@@ -141,44 +143,8 @@ fn runKlio(
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-/// Images land in `target/packs/`, installs in `<home>/.klio/packs`.
-fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, home) catch {};
-    const pack_dirs = [_][]const u8{
-        "kotlin-klio/klio-kotlinx-atomicfu",
-        "kotlin-klio/klio-kotlinx-coroutines",
-        "kotlin-klio/klio-kotlinx-io",
-        "kotlin-klio/klio-kotlinx-serialization",
-        "kotlin-klio/klio-ktor",
-    };
-    const pack_files = [_][]const u8{
-        "target/packs/kotlinx.atomicfu.klio-pack",
-        "target/packs/kotlinx.coroutines.klio-pack",
-        "target/packs/kotlinx.io.klio-pack",
-        "target/packs/kotlinx.serialization.klio-pack",
-        "target/packs/io.ktor.klio-pack",
-    };
-    for (pack_dirs) |d| {
-        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", d });
-        if (!r.ok) {
-            std.debug.print("ktor_client_get: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
-            return error.PackBuildFailed;
-        }
-    }
-    for (pack_files) |f| {
-        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", f });
-        if (!r.ok) {
-            std.debug.print("ktor_client_get: pack install {s} failed:\n{s}\n", .{ f, r.stderr });
-            return error.PackInstallFailed;
-        }
-    }
-}
-
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-var packs_installed = false;
 
-const SCRATCH_HOME = "/tmp/klio_itest_ktor_home";
 const TMP_DIR = "/tmp/klio_itest_ktor";
 
 fn runProgram(name: []const u8, src: []const u8, feature: []const u8, expected: []const u8) !void {
@@ -188,11 +154,7 @@ fn runProgram(name: []const u8, src: []const u8, feature: []const u8, expected: 
     defer threaded.deinit();
     const io = threaded.io();
 
-    var env = try envWithHome(a, SCRATCH_HOME);
-    if (!packs_installed) {
-        try installPacks(a, io, &env, SCRATCH_HOME);
-        packs_installed = true;
-    }
+    var env = try envWithHome(a, try klio_child.home(a));
 
     var server: Server = undefined;
     try server.start(io);
@@ -238,6 +200,7 @@ test "client GET single-sends with status and body (default engine)" {
 test "client GET with explicit engine and followRedirects off" {
     try runProgram("get_explicit",
         \\import io.ktor.client.*
+        \\import io.ktor.client.engine.klio.KlioClient
         \\import io.ktor.client.request.*
         \\import io.ktor.client.statement.*
         \\

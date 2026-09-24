@@ -45,6 +45,7 @@ const ev_native = @import("native.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 const ev_values = @import("values.zig");
+const ev_resolved = @import("resolved.zig");
 
 const EnclosingEntry = ev_state.EnclosingEntry;
 const EvalError = ev_state.EvalError;
@@ -210,6 +211,8 @@ pub const ClassifyReject = enum(u8) {
     type_var_instanceof,
     suspend_resume_point,
     unsupported_inst,
+    /// An instruction lowered from sema, which only the frame interpreter runs.
+    resolved_inst,
     heavy_entry_prefix,
 };
 pub var classify_rejects: [@typeInfo(ClassifyReject).@"enum".fields.len]std.atomic.Value(usize) =
@@ -354,12 +357,67 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                 },
                 // A resumable body: never fused, never materialized mid-flight.
                 .SuspendResumePoint => return reject(.suspend_resume_point),
+                // A static call lowered from sema: its target is its id,
+                // run fused when it fuses, or its native.
+                .CallStatic => |cs| blk: {
+                    const callee = module.funcById(cs.func) orelse {
+                        heavy = true;
+                        break :blk;
+                    };
+                    // A suspending native parks its caller, which only a
+                    // frame can do.
+                    if (staticNative(module, cs.func) != null) {
+                        if (callee.is_suspend) heavy = true;
+                        break :blk;
+                    }
+                    _ = module.ensureFuncBody(@constCast(callee));
+                    if (callee.params.len != cs.n_args or fusedVerdict(H, host, module, callee) != 1) heavy = true;
+                },
+                // Lowered from sema: only the frame interpreter runs these.
+                .RCallVirtual,
+                .CallInterface,
+                .CallNative,
+                .RCallValue,
+                .RNewInstance,
+                .GetFieldSlot,
+                .SetFieldSlot,
+                .LoadStatic,
+                .StoreStatic,
+                .LoadObject,
+                .MakeClosure,
+                .FunctionRef,
+                .RPropertyRef,
+                .ClassLiteral,
+                .ClassOf,
+                .RInstanceOf,
+                .RCast,
+                .InstanceOfDyn,
+                .CastDyn,
+                .ArrayGet,
+                .ArraySet,
+                .NewArray,
+                => return reject(.resolved_inst),
                 else => heavy = true,
             }
         }
     }
     if (heavy and entry_heavy and entry_prefix < fused_min_prefix) return reject(.heavy_entry_prefix);
     return if (heavy) 4 else 1;
+}
+
+fn isCallInst(inst: *const ir.Inst) bool {
+    return switch (inst.*) {
+        .Call, .CallStatic => true,
+        else => false,
+    };
+}
+
+/// The native a static call lowered from sema runs, if its target is one.
+fn staticNative(module: *const Module, func: ir.FuncId) ?ir.NativeId {
+    const r = module.resolved orelse return null;
+    if (func.int() >= r.func_native.len) return null;
+    const nid = r.func_native[func.int()];
+    return if (nid == .none) null else nid;
 }
 
 /// A heavy body whose fusable entry prefix is shorter than this runs framed outright.
@@ -547,7 +605,14 @@ fn fusedRun(
         const blk_id = cur.int();
         for (blk.insts, 0..) |*inst, idx| {
             fusedInst(H, allocator, module, func, eff_args, host, inst, regs, reclaim, &pushed_enclosing, mark) catch |e| switch (e) {
-                error.Raise => return .{ .err = fused_err },
+                // Code lowered from sema throws the base's exception classes,
+                // which the framed arms build: an instruction's own failure
+                // runs there. A call's failure is its callee's throwable.
+                error.Raise => if (module.resolved == null or isCallInst(inst)) return .{ .err = fused_err } else {
+                    const moved_pushes = pushed_enclosing;
+                    pushed_enclosing = 0;
+                    return try fusedMaterializeAndRun(H, allocator, module, func, args_in, regs, cur, idx, moved_pushes, host);
+                },
                 // A heavy op: build the real Frame from the bank and run the remainder framed, starting AT
                 // this instruction, no side effect of which has run. The frame owns any suspension beneath it.
                 error.Materialize => {
@@ -601,6 +666,11 @@ fn fusedRun(
             },
             .Unreachable => return .{ .err = .{ .Type = "unreachable block executed" } },
             else => unreachable,
+        }
+        // A back edge takes the framed loop's edge guards, so a fused spin
+        // loop meets the wall cap and abandonment like any other.
+        if (cur.int() <= blk_id) {
+            if (ev_exec.fusedEdgeGuard(allocator, ev)) |er| return er;
         }
         if (jit_yield_on and cur.int() <= blk_id) {
             back_edges +|= 1;
@@ -998,6 +1068,39 @@ fn fusedInst(
         .EnclosingPop => {
             popEnclosing();
             if (pushed_enclosing.* > 0) pushed_enclosing.* -= 1;
+        },
+        .CallStatic => |cs| {
+            var argv: [FUSED_MAX_REGS]Value = undefined;
+            if (cs.n_args > FUSED_MAX_REGS) return error.Materialize;
+            // A callee's file not yet initialized: the framed arm runs its
+            // init unit first.
+            if (cs.init != ir.NO_UNIT) {
+                if (comptime !@hasDecl(H, "resolvedState")) return error.Materialize;
+                if (ev_resolved.unitPending(H, host, cs.init)) return error.Materialize;
+            }
+            var i: u32 = 0;
+            while (i < cs.n_args) : (i += 1) argv[i] = fusedRead(regs, Reg.from(cs.args.int() + i));
+            const r = if (staticNative(module, cs.func)) |nid| blk: {
+                if (comptime !@hasDecl(H, "callNative")) return error.Materialize;
+                // As `ev_resolved.runFunc` calls it: a receiver's override answers.
+                if (comptime @hasDecl(H, "callNativeSite")) break :blk try host.callNativeSite(allocator, nid, argv[0..cs.n_args]);
+                break :blk try host.callNative(allocator, nid, argv[0..cs.n_args]);
+            } else blk: {
+                const callee = module.funcById(cs.func) orelse return error.Materialize;
+                if (callee.params.len != cs.n_args) return error.Materialize;
+                if (try fusedExec(H, allocator, module, callee, argv[0..cs.n_args], host)) |res| break :blk res;
+                // A runtime gate declined what the classifier admitted: the
+                // callee runs framed, still without suspending.
+                if (fusedVerdict(H, host, module, callee) != 1) return error.Materialize;
+                var arg_list: std.ArrayList(Value) = .empty;
+                try arg_list.appendSlice(allocator, argv[0..cs.n_args]);
+                if (runtime.reclaimEnabled()) for (arg_list.items) |v| v.retain();
+                break :blk try evalWithCapturesChained(H, allocator, module, null, callee, arg_list, .empty, &.{}, null, host);
+            };
+            switch (r) {
+                .ok => |v| fusedWrite(allocator, regs, cs.dst, v, reclaim, false),
+                .err => |e| return fusedRaise(e),
+            }
         },
         .Call => |c| {
             const callee = module.funcById(c.func) orelse

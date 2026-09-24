@@ -26,6 +26,7 @@ pub const ranges = @import("implementations/ranges.zig");
 pub const regexp = @import("implementations/regexp.zig");
 pub const result = @import("implementations/result.zig");
 pub const sequence = @import("implementations/sequence.zig");
+pub const stacktrace = @import("implementations/stacktrace.zig");
 pub const string = @import("implementations/string.zig");
 pub const stringbuilder = @import("implementations/stringbuilder.zig");
 pub const time = @import("implementations/time.zig");
@@ -118,8 +119,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.__klioMonitorEnter", .f = concurrent.concurrent_monitor_enter },
     .{ .fqn = "kotlin.__klioMonitorExit", .f = concurrent.concurrent_monitor_exit },
     .{ .fqn = "kotlin.concurrent.thread", .f = concurrent.concurrent_thread },
-    .{ .fqn = "kotlin.concurrent.Thread.sleep", .f = concurrent.concurrent_thread_sleep },
-    .{ .fqn = "kotlin.concurrent.Thread.currentThread", .f = concurrent.concurrent_thread_current },
+    .{ .fqn = "java.lang.Thread.sleep", .f = concurrent.concurrent_thread_sleep },
+    .{ .fqn = "java.lang.Thread.currentThread", .f = concurrent.concurrent_thread_current },
     .{ .fqn = "kotlin.time.__klio_time_systemMillis", .f = time.time_system_millis },
     .{ .fqn = "kotlin.time.__klio_time_monotonicNanos", .f = time.time_monotonic_nanos },
     .{ .fqn = "kotlin.system.exitProcess", .f = bundle.system_exit_process },
@@ -529,6 +530,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.collections.listOfNotNull", .f = collections.coll_list_of_not_null },
     .{ .fqn = "kotlin.arrayOf", .f = collections.coll_array_of },
     .{ .fqn = "kotlin.arrayOfNulls", .f = collections.coll_array_of_nulls },
+    .{ .fqn = "kotlin.__klio_arrayConcat", .f = collections.coll_array_concat },
     .{ .fqn = "kotlin.emptyArray", .f = collections.coll_empty_array },
     .{ .fqn = "kotlin.intArrayOf", .f = collections.coll_int_array_of },
     .{ .fqn = "kotlin.longArrayOf", .f = collections.coll_long_array_of },
@@ -1059,12 +1061,20 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.collections.Map.Entry.key", .f = sequence.map_entry_key },
     .{ .fqn = "kotlin.collections.Map.Entry.toString", .f = sequence.map_entry_to_string },
     .{ .fqn = "kotlin.collections.Map.Entry.value", .f = sequence.map_entry_value },
+    .{ .fqn = "java.lang.StackTraceElement.className", .f = stacktrace.class_name },
+    .{ .fqn = "java.lang.StackTraceElement.methodName", .f = stacktrace.method_name },
+    .{ .fqn = "java.lang.StackTraceElement.fileName", .f = stacktrace.file_name },
+    .{ .fqn = "java.lang.StackTraceElement.lineNumber", .f = stacktrace.line_number },
     .{ .fqn = "kotlin.ranges.downTo", .f = ranges.ranges_down_to, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.ranges.step", .f = ranges.ranges_step, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.ranges.until", .f = ranges.ranges_until, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.Int.rangeTo", .f = ranges.ranges_range_to, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.Long.rangeTo", .f = ranges.ranges_range_to, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.Char.rangeTo", .f = ranges.ranges_range_to, .applicable = rangeBuilderApplicable },
+    .{ .fqn = "kotlin.Byte.rangeTo", .f = ranges.ranges_range_to, .applicable = rangeBuilderApplicable },
+    .{ .fqn = "kotlin.Short.rangeTo", .f = ranges.ranges_range_to, .applicable = rangeBuilderApplicable },
+    .{ .fqn = "kotlin.Byte.rangeUntil", .f = ranges.ranges_range_until, .applicable = rangeBuilderApplicable },
+    .{ .fqn = "kotlin.Short.rangeUntil", .f = ranges.ranges_range_until, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.Int.rangeUntil", .f = ranges.ranges_range_until, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.Long.rangeUntil", .f = ranges.ranges_range_until, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.Char.rangeUntil", .f = ranges.ranges_range_until, .applicable = rangeBuilderApplicable },
@@ -1538,6 +1548,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.text.MatchGroup.value", .f = regexp.match_group_value },
     .{ .fqn = "kotlin.text.MatchGroup.range", .f = regexp.match_group_range },
     .{ .fqn = "kotlin.String", .f = stringbuilder.string_ctor },
+    .{ .fqn = "kotlin.text.String", .f = stringbuilder.string_ctor },
     .{ .fqn = "kotlin.text.StringBuilder", .f = stringbuilder.string_builder_ctor },
     .{ .fqn = "kotlin.StringBuilder", .f = stringbuilder.string_builder_ctor },
     .{ .fqn = "kotlin.text.StringBuilder.set", .f = stringbuilder.string_builder_set },
@@ -1691,7 +1702,7 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.__klioMonitorEnter", .names = &.{"lock"} },
     .{ .fqn = "kotlin.__klioMonitorExit", .names = &.{"lock"} },
     .{ .fqn = "kotlin.concurrent.thread", .names = &.{"start", "isDaemon", "contextClassLoader", "name", "priority", "block"} },
-    .{ .fqn = "kotlin.concurrent.Thread.sleep", .names = &.{"millis"} },
+    .{ .fqn = "java.lang.Thread.sleep", .names = &.{"millis"} },
     // kotlinx-io's `Segment.writeTo` calls `copyInto` with named arguments, and
     // without an entry here the named offsets are dropped and nothing is copied.
     .{ .fqn = "kotlin.Array.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
@@ -1774,6 +1785,36 @@ pub fn lookup(fqn: []const u8) ?StdlibFn {
     return table_map.get(fqn);
 }
 
+/// The host's constructors of the classes whose values it makes, by class
+/// FQN, for code that constructs one from its declaration: `IntRange(a, b)`
+/// is the value `a..b` makes, and an unsigned value class's constructor
+/// reinterprets its signed payload as the host's unsigned value.
+const constructors = std.StaticStringMap(StdlibFn).initComptime(.{
+    .{ "kotlin.UByte", numeric.ctor_ubyte },
+    .{ "kotlin.UShort", numeric.ctor_ushort },
+    .{ "kotlin.UInt", numeric.ctor_uint },
+    .{ "kotlin.ULong", numeric.ctor_ulong },
+    // An unsigned array over a signed one shares its buffer.
+    .{ "kotlin.UByteArray", collections.array_ctor_ubyte },
+    .{ "kotlin.UShortArray", collections.array_ctor_ushort },
+    .{ "kotlin.UIntArray", collections.array_ctor_uint },
+    .{ "kotlin.ULongArray", collections.array_ctor_ulong },
+    .{ "kotlin.ranges.IntRange", ranges.range_ctor },
+    .{ "kotlin.ranges.LongRange", ranges.range_ctor },
+    .{ "kotlin.ranges.CharRange", ranges.range_ctor },
+    .{ "kotlin.ranges.UIntRange", ranges.range_ctor },
+    .{ "kotlin.ranges.ULongRange", ranges.range_ctor },
+    .{ "kotlin.ranges.IntProgression", ranges.range_ctor },
+    .{ "kotlin.ranges.LongProgression", ranges.range_ctor },
+    .{ "kotlin.ranges.CharProgression", ranges.range_ctor },
+    .{ "kotlin.ranges.UIntProgression", ranges.range_ctor },
+    .{ "kotlin.ranges.ULongProgression", ranges.range_ctor },
+});
+
+pub fn constructor(class_fqn: []const u8) ?StdlibFn {
+    return constructors.get(class_fqn);
+}
+
 /// Resolve one Kotlin source declaration to the host ABI symbol implementing it.
 /// A receiver-formed declaration may use the runtime receiver-qualified form,
 /// which resolves only when exactly one registered symbol carries that receiver
@@ -1805,7 +1846,12 @@ pub fn declarationHostSymbol(
         {
             continue;
         }
-        if (found != null and !std.mem.eql(u8, found.?, fqn)) return null;
+        // Two names of one native (`kotlin.Array.sortWith` and
+        // `kotlin.collections.Array.sortWith`) are one answer.
+        if (found) |f| {
+            if (std.mem.eql(u8, f, fqn) or lookup(f) == lookup(fqn)) continue;
+            return null;
+        }
         found = fqn;
     }
     return found;

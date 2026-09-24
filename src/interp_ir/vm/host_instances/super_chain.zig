@@ -19,7 +19,7 @@ const host_call_value = @import("../host_call_value.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-const build = @import("../../build.zig");
+const tables = @import("../../tables.zig");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -45,8 +45,7 @@ const StringSet = runtime.NameHashMap(void);
 const AnonMethodEntry = root.AnonMethodEntry;
 const NameValue = root.NameValue;
 
-const build_object = @import("build_object.zig");
-const anonKey = build_object.anonKey;
+const anonKey = @import("../host_call_member/reflect_anon.zig").anonKey;
 
 const common = @import("common.zig");
 const installCtorBounds = common.installCtorBounds;
@@ -120,6 +119,7 @@ pub fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: [
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
         .singletons_by_id = self.singletons_by_id.clone(),
+        .resolved_state = self.resolved_state,
         .allocator = self.allocator,
     };
     defer {
@@ -307,7 +307,7 @@ pub fn runSuperCtorChain(
     defer common.ctor_bounds = prev_bounds;
     // A secondary ctor takes the call when the primary cannot, else exact fit.
     const primary_takes = if (chain_def) |d| primaryCanTake(self, d, args.len) else true;
-    const chosen: ?root.build.SecondaryCtorEntry = if (primary_takes)
+    const chosen: ?root.tables.SecondaryCtorEntry = if (primary_takes)
         chooseSecondaryCtor(self, entries, args)
     else
         chooseSecondaryCtorDefaulted(self, entries, args);

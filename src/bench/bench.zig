@@ -4,24 +4,24 @@
 const std = @import("std");
 
 const ast = @import("ast");
-const interp_ir = @import("interp_ir");
+const ir = @import("ir");
+const klio_child = @import("klio_child");
 const lexer = @import("lexer");
+const lower_driver = @import("lower_driver");
+const pack = @import("pack");
 const parser = @import("parser");
-const resolver = @import("resolver");
 const runtime = @import("runtime");
+const sema = @import("sema");
 const span = @import("span");
-const typeck = @import("typeck");
+const stdlib = @import("stdlib");
+const stdlib_pack = @import("stdlib_pack");
 
 const KotlinFile = ast.KotlinFile;
-const Vm = interp_ir.Vm;
-const buildModule = interp_ir.build.buildModule;
-const Output = runtime.Output;
 const LexResult = lexer.LexResult;
 const Lexer = lexer.Lexer;
-const Resolution = resolver.Resolution;
 const FileId = span.FileId;
 const SourceMap = span.SourceMap;
-const TypeCheck = typeck.TypeCheck;
+const bridge = ir.bridge;
 
 pub const refrunner = @import("refrunner.zig");
 pub const schema = @import("schema.zig");
@@ -30,51 +30,6 @@ pub const main = @import("main.zig");
 pub const BenchRecord = schema.BenchRecord;
 pub const BenchReport = schema.BenchReport;
 pub const RegressionLevel = schema.RegressionLevel;
-
-/// Captures lines: every embedded newline flushes one line, newline trimmed.
-const CaptureOutput = struct {
-    lines: std.ArrayList([]const u8) = .empty,
-    cur: std.ArrayList(u8) = .empty,
-    allocator: std.mem.Allocator,
-
-    fn init(allocator: std.mem.Allocator) CaptureOutput {
-        return .{ .lines = .empty, .cur = .empty, .allocator = allocator };
-    }
-
-    fn deinit(self: *CaptureOutput) void {
-        for (self.lines.items) |l| self.allocator.free(l);
-        self.lines.deinit(self.allocator);
-        self.cur.deinit(self.allocator);
-    }
-
-    fn vtWrite(ctx: *anyopaque, s: []const u8) void {
-        const self: *CaptureOutput = @ptrCast(@alignCast(ctx));
-        self.cur.appendSlice(self.allocator, s) catch return;
-        while (std.mem.findScalar(u8, self.cur.items, '\n')) |idx| {
-            const line = self.allocator.dupe(u8, self.cur.items[0..idx]) catch return;
-            self.lines.append(self.allocator, line) catch {};
-            const rest = self.cur.items[idx + 1 ..];
-            std.mem.copyForwards(u8, self.cur.items[0..rest.len], rest);
-            self.cur.shrinkRetainingCapacity(rest.len);
-        }
-    }
-
-    fn vtWriteln(ctx: *anyopaque, s: []const u8) void {
-        vtWrite(ctx, s);
-        vtWrite(ctx, "\n");
-    }
-
-    const vtable: Output.VTable = .{ .writeln = vtWriteln, .write = vtWrite };
-
-    fn output(self: *CaptureOutput) Output {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
-
-    /// Caller owns the returned bytes.
-    fn join(self: *const CaptureOutput, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
-        return std.mem.join(allocator, "\n", self.lines.items);
-    }
-};
 
 /// Bench corpus path, relative to the process cwd. Caller owns the result.
 pub fn corpusRoot(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
@@ -172,68 +127,129 @@ pub fn parse(allocator: std.mem.Allocator, lexed: *const Lexed) KotlinFile {
     return p.parseFile();
 }
 
-pub fn resolveOnly(allocator: std.mem.Allocator, file: *const KotlinFile) !Resolution {
-    return resolver.resolve(allocator, file);
-}
+/// The base a program is analyzed against: the stdlib sources and the
+/// declarations sema needs as Kotlin, read once.
+pub const BaseSources = struct {
+    files: []const Source,
 
-pub fn typeckOnly(allocator: std.mem.Allocator, file: *const KotlinFile, res: *const Resolution) !TypeCheck {
-    return typeck.typecheck(allocator, file, res);
-}
+    pub const Source = struct { path: []const u8, text: []const u8 };
 
-/// Captured stdout owned by the caller, or a static failure description
-/// (except the allocated `runtime: ...` form).
-pub const RunOutcome = union(enum) {
-    ok: []u8,
-    err: []const u8,
+    pub fn load(a: std.mem.Allocator, io: std.Io) !BaseSources {
+        var out: std.ArrayList(Source) = .empty;
+        var perr: pack.PackError = undefined;
+        var src = (try stdlib_pack.stdlibSources(a, null, &perr)) orelse return error.StdlibSourcesMissing;
+        for (src.files) |sf| try out.append(a, .{ .path = try a.dupe(u8, sf.rel_path), .text = try a.dupe(u8, sf.bytes) });
+        src.deinit();
+        for (stdlib.pack_builder.SEMA_ACTUAL_FILES) |name| {
+            const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ stdlib.pack_builder.SEMA_ACTUALS_DIR, name });
+            const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
+            try out.append(a, .{ .path = path, .text = text });
+        }
+        return .{ .files = out.items };
+    }
 };
 
-pub fn runFull(allocator: std.mem.Allocator, prog: *const Program) std.mem.Allocator.Error!RunOutcome {
-    var map = SourceMap.init(allocator);
-    defer map.deinit();
-    var lexed = lex(allocator, &map, prog) catch return .{ .err = "lex errors" };
-    defer lexed.result.deinit(allocator);
-    if (lexed.result.diagnostics.hasErrors()) {
-        return .{ .err = "lex errors" };
-    }
-    var ast_file = parse(allocator, &lexed);
-    _ = resolveOnly(allocator, &ast_file) catch return .{ .err = "resolve error" };
+/// The stages sema and lowering run over the base and a program, as a cold
+/// `klio run` (`KLIO_SEMA_IMAGE=0`) runs them.
+pub const Stage = enum { headers, bodies, records, bridge, lower };
+pub const n_stages = std.meta.fields(Stage).len;
 
-    var cap = CaptureOutput.init(allocator);
-    defer cap.deinit();
-
-    var built = buildModule(allocator, &ast_file) catch return .{ .err = "build error" };
-    const main_id = built.main orelse {
-        built.deinit();
-        return .{ .err = "no main function in module" };
-    };
-    const fb = Vm.fromBuilt(allocator, &built) catch {
-        built.deinit();
-        return .{ .err = "build error" };
-    };
-    built.deinit();
-    var vm = fb.vm;
-    defer vm.deinit();
-    const result = vm.run(main_id, cap.output()) catch return .{ .err = "out of memory" };
-    switch (result) {
-        .err => |e| {
-            switch (e) {
-                .InvalidMain => return .{ .err = "no main function in module" },
-                .Eval => |s| {
-                    const msg = std.fmt.allocPrint(allocator, "runtime: {s}", .{s}) catch "runtime error";
-                    return .{ .err = msg };
-                },
-            }
-        },
-        .ok => {},
-    }
-    const out = cap.join(allocator) catch return .{ .err = "out of memory" };
-    return .{ .ok = out };
+fn hostNative(fqn: []const u8) ?runtime.StdlibFn {
+    return stdlib.implementation(fqn);
 }
+
+/// Parses the base and `prog` into `a` (untimed), then runs every stage and
+/// returns each one's nanoseconds.
+pub fn runStages(a: std.mem.Allocator, base: *const BaseSources, prog: *const Program) ![n_stages]u64 {
+    var map = SourceMap.init(a);
+    var base_files: std.ArrayList(sema.SourceFile) = .empty;
+    for (base.files) |f| try lower_driver.parseInto(a, &map, &base_files, f.path, f.text, .base);
+    var program: std.ArrayList(sema.SourceFile) = .empty;
+    try lower_driver.parseInto(a, &map, &program, prog.path, prog.source, .program);
+
+    var ns: [n_stages]u64 = undefined;
+    var t = Timer.start();
+    const s = try sema.Sema.init(a);
+    try s.addFiles(base_files.items);
+    const base_layer: bridge.Layer = .{ .syms = @intCast(s.syms.count()), .files = @intCast(s.files.items.len) };
+    try s.addFiles(program.items);
+    const program_layer: bridge.Layer = .{ .syms = @intCast(s.syms.count()), .files = @intCast(s.files.items.len) };
+    try sema.headers.resolveAllHeaders(s);
+    ns[@intFromEnum(Stage.headers)] = t.lap();
+    try s.resolveBodies(&.{ .base, .pack, .program });
+    ns[@intFromEnum(Stage.bodies)] = t.lap();
+    const out = try sema.output.build(s);
+    ns[@intFromEnum(Stage.records)] = t.lap();
+    const saved_perm = runtime.gc.alloc_perm;
+    runtime.gc.alloc_perm = true;
+    defer runtime.gc.alloc_perm = saved_perm;
+    const br = try bridge.build(a, s, .{
+        .natives = hostNative,
+        .host_symbol = stdlib.declarationHostSymbol,
+        .host_members = true,
+        .spread_varargs = true,
+        .constructors = stdlib.constructorNative,
+        .records = out.files,
+        .layers = try a.dupe(bridge.Layer, &.{ base_layer, program_layer }),
+    });
+    ns[@intFromEnum(Stage.bridge)] = t.lap();
+    _ = try ir.lower_sema.lowerProgram(a, s, br);
+    ns[@intFromEnum(Stage.lower)] = t.lap();
+    return ns;
+}
+
+/// Captured stdout owned by the caller, or a failure description owned by
+/// the caller.
+pub const RunOutcome = union(enum) {
+    ok: []u8,
+    err: []u8,
+};
+
+/// Where the end-to-end runs keep their base image: a home of their own, so
+/// a bench never installs packs it does not use.
+pub const E2E_HOME = "/tmp/klio_bench_home";
+
+/// Runs `prog` as a user does, through the harness binary (`KLIO_ITEST_BIN`)
+/// over the base image cached in `E2E_HOME`.
+pub fn runFull(allocator: std.mem.Allocator, prog: *const Program) !RunOutcome {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env = try klio_child.envFor(a, E2E_HOME);
+    const r = try klio_child.runKlio(a, &env, &.{ klio_child.bin(), "run", prog.path }, .{});
+    if (r.exitedZero()) return .{ .ok = try allocator.dupe(u8, r.stdout) };
+    return .{ .err = try std.fmt.allocPrint(allocator, "exit {d}: {s}", .{ r.code(), r.stderr }) };
+}
+
+/// Nanoseconds on the monotonic clock since `start` or the last `lap`.
+pub const Timer = struct {
+    last: u64,
+
+    pub fn start() Timer {
+        return .{ .last = runtime.clockMonotonicNanos() };
+    }
+
+    pub fn read(self: *const Timer) u64 {
+        return runtime.clockMonotonicNanos() - self.last;
+    }
+
+    pub fn lap(self: *Timer) u64 {
+        const now = runtime.clockMonotonicNanos();
+        defer self.last = now;
+        return now - self.last;
+    }
+};
 
 pub const Timing = struct {
     iters: u64,
     median_ns: u64,
     p99_ns: u64,
+
+    fn of(samples: []u64) Timing {
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        const n = samples.len;
+        return .{ .iters = n, .median_ns = samples[n / 2], .p99_ns = samples[@min(n * 99 / 100, n - 1)] };
+    }
 };
 
 /// Time `ctx.call()` over at least `min_total_ns`; returns median, p99, iters.
@@ -243,32 +259,23 @@ pub fn timeIters(
     min_total_ns: u64,
     min_iters: u32,
 ) std.mem.Allocator.Error!Timing {
-    var samples: std.ArrayList(u128) = .empty;
+    var samples: std.ArrayList(u64) = .empty;
     defer samples.deinit(allocator);
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
     const start_all = timer.read();
     while (samples.items.len < min_iters or (timer.read() - start_all) < min_total_ns) {
-        var t = std.time.Timer.start() catch unreachable;
+        var t = Timer.start();
         ctx.call();
         try samples.append(allocator, t.read());
         if (samples.items.len > 10_000) break;
     }
-    std.mem.sort(u128, samples.items, {}, std.sort.asc(u128));
-    const n = samples.items.len;
-    const median = samples.items[n / 2];
-    const p99 = samples.items[@min(n * 99 / 100, n - 1)];
-    return .{
-        .iters = @intCast(n),
-        .median_ns = @truncate(median),
-        .p99_ns = @truncate(p99),
-    };
+    return Timing.of(samples.items);
 }
 
 pub const StageTimings = struct {
     lex: Timing,
     parse: Timing,
-    resolve: Timing,
-    typeck: Timing,
+    stages: [n_stages]Timing,
     e2e: Timing,
 };
 
@@ -276,9 +283,10 @@ pub const StageTimings = struct {
 /// effects do not help the next.
 pub fn timePipelineStages(
     allocator: std.mem.Allocator,
+    base: *const BaseSources,
     prog: *const Program,
     budget_per_stage_ns: u64,
-) std.mem.Allocator.Error!StageTimings {
+) !StageTimings {
     const lex_ctx = struct {
         a: std.mem.Allocator,
         p: *const Program,
@@ -305,63 +313,42 @@ pub fn timePipelineStages(
     }{ .a = allocator, .p = prog };
     const parse_t = try timeIters(allocator, parse_ctx, budget_per_stage_ns, 5);
 
-    const resolve_ctx = struct {
-        a: std.mem.Allocator,
-        p: *const Program,
-        fn call(self: @This()) void {
-            var arena = std.heap.ArenaAllocator.init(self.a);
-            defer arena.deinit();
-            const aa = arena.allocator();
-            var map = SourceMap.init(aa);
-            var lexed = lex(aa, &map, self.p) catch return;
-            const file = parse(aa, &lexed);
-            _ = resolveOnly(aa, &file) catch return;
-        }
-    }{ .a = allocator, .p = prog };
-    const resolve_t = try timeIters(allocator, resolve_ctx, budget_per_stage_ns, 5);
+    // One pass times every stage; the budget bounds the passes.
+    var samples: [n_stages]std.ArrayList(u64) = @splat(.empty);
+    defer for (&samples) |*s| s.deinit(allocator);
+    var timer = Timer.start();
+    while (samples[0].items.len < 3 or timer.read() < budget_per_stage_ns * n_stages) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const ns = try runStages(arena.allocator(), base, prog);
+        for (&samples, ns) |*s, v| try s.append(allocator, v);
+        if (samples[0].items.len >= 50) break;
+    }
+    var stages: [n_stages]Timing = undefined;
+    for (&stages, &samples) |*st, *s| st.* = Timing.of(s.items);
 
-    const typeck_ctx = struct {
-        a: std.mem.Allocator,
-        p: *const Program,
-        fn call(self: @This()) void {
-            var arena = std.heap.ArenaAllocator.init(self.a);
-            defer arena.deinit();
-            const aa = arena.allocator();
-            var map = SourceMap.init(aa);
-            var lexed = lex(aa, &map, self.p) catch return;
-            const file = parse(aa, &lexed);
-            const res = resolveOnly(aa, &file) catch return;
-            _ = typeckOnly(aa, &file, &res) catch return;
-        }
-    }{ .a = allocator, .p = prog };
-    const typeck_t = try timeIters(allocator, typeck_ctx, budget_per_stage_ns, 5);
-
-    const interp_ctx = struct {
+    const e2e_ctx = struct {
         a: std.mem.Allocator,
         p: *const Program,
         fn call(self: @This()) void {
             const outcome = runFull(self.a, self.p) catch return;
             switch (outcome) {
-                .ok => |s| self.a.free(s),
-                .err => |s| {
-                    if (std.mem.startsWith(u8, s, "runtime: ")) self.a.free(s);
-                },
+                inline else => |s| self.a.free(s),
             }
         }
     }{ .a = allocator, .p = prog };
-    const interp_t = try timeIters(allocator, interp_ctx, budget_per_stage_ns, 3);
+    const e2e_t = try timeIters(allocator, e2e_ctx, budget_per_stage_ns, 3);
 
     return .{
         .lex = lex_t,
         .parse = parse_t,
-        .resolve = resolve_t,
-        .typeck = typeck_t,
-        .e2e = interp_t,
+        .stages = stages,
+        .e2e = e2e_t,
     };
 }
 
 pub fn quickRunNs(ctx: anytype) u64 {
-    var t = std.time.Timer.start() catch unreachable;
+    var t = Timer.start();
     ctx.call();
     return @truncate(t.read());
 }
@@ -393,4 +380,26 @@ test "collect_kt_finds_corpus" {
         testing.allocator.free(files);
     }
     try testing.expect(files.len != 0);
+}
+
+test "every stage runs over the base and a bench program, and the harness runs it" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const files = try collectKt(a, io, try corpusRoot(a));
+    const prog = try Program.load(a, io, files[0]);
+    const base = try BaseSources.load(a, io);
+    const ns = try runStages(a, &base, &prog);
+    for (ns) |v| try testing.expect(v > 0);
+    switch (try runFull(a, &prog)) {
+        .ok => {},
+        .err => |e| {
+            std.debug.print("bench: {s} through the harness: {s}\n", .{ prog.path, e });
+            return error.TestUnexpectedResult;
+        },
+    }
 }

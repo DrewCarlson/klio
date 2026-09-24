@@ -811,7 +811,6 @@ fn resolveExtensionCallUncached(
         }
     }
     if (ids.items.len == 0) {
-        root_ir.lower.expr.noExtNote(.no_candidates);
         return .{ .applicable = unknown_best_tier != 255 };
     }
 
@@ -896,7 +895,6 @@ fn resolveExtensionCallUncached(
         if (runtime.envSetOnce("KLIO_REX_TRACE")) {
             if (applicability.trace_call_span) |sp| std.debug.print("[rex-exit] {s} unknown-tier {d}<={d} at=f{d}:{d}\n", .{ name, unknown_best_tier, best_tier, sp.file.int(), sp.start });
         }
-        root_ir.lower.expr.noExtNote(.unknown_visibility_tier);
         return .{ .applicable = true };
     }
 
@@ -1055,12 +1053,6 @@ fn resolveExtensionCallUncached(
             }
         }
         if (sole_best_tier and extCommitEnabled()) break :withheld;
-        if (tied)
-            root_ir.lower.expr.noExtNote(.tied)
-        else if (ranked_sigs.items.len == 1)
-            root_ir.lower.expr.noExtNote(.unknown_args_singleton)
-        else
-            root_ir.lower.expr.noExtNote(.unknown_args);
         return .{
             .applicable = true,
             .sole_unknown = sole,

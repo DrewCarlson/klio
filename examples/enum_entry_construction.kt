@@ -1,7 +1,8 @@
 // An enum entry with a body may name itself while it is being constructed:
-// in its own initializers and in the constructors and delegations of its
-// inner classes the name is the instance under construction, as kotlinc
-// binds it. Entry constructors take `vararg` parameters like any
+// in the constructors and delegations of its inner classes the name is the
+// instance under construction, as kotlinc binds it. Its own property
+// initializers reach it as `this`: kotlinc rejects the entry's name there as
+// an uninitialized entry. Entry constructors take `vararg` parameters like any
 // constructor: an entry supplying nothing gets the empty array, through the
 // primary constructor or a secondary one, and a subclass header omitting a
 // parent's vararg does the same.
@@ -16,7 +17,7 @@ enum class Kind : Greeter {
         inner class Wrapper : Holder(PLAIN)
 
         val wrapper = Wrapper()
-        val viaCall = PLAIN.greet()
+        val viaCall = this.greet()
 
         inner class Forward : Greeter by PLAIN
 

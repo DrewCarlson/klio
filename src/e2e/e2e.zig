@@ -1,39 +1,25 @@
-//! End-to-end corpus test: every `examples/*.kt` through the in-process klio
-//! pipeline, asserted against the byte-exact expected stdout under
-//! `tests/corpus/expected/`. Needs no external reference at test time.
+//! End-to-end corpus test: every `examples/*.kt` through the `klio` binary
+//! (`KLIO_ITEST_BIN`, the harness build.zig installs beside the suite),
+//! asserted against the byte-exact expected stdout under
+//! `tests/corpus/expected/`. The programs run in the shared test home, where
+//! every shipped pack is installed as a user installs them (`klio_child`),
+//! each with the arguments its `Run with:` header names.
+
 const std = @import("std");
-const parity = @import("parity");
-const jit = @import("ir").jit_loop;
+const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
-const parser = @import("parser");
 const EXAMPLES = "examples";
-
-/// Apply the `--language=` specs an example declares in its `Run with:` header
-/// comment. They apply to the parser for this example only.
-fn applyRunDirective(io: std.Io, a: std.mem.Allocator, path: []const u8) void {
-    const src = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return;
-    var lines = std.mem.splitScalar(u8, src, '\n');
-    var n: usize = 0;
-    while (lines.next()) |line| : (n += 1) {
-        if (n >= 12) break;
-        const at = std.mem.find(u8, line, "Run with:") orelse continue;
-        var it = std.mem.tokenizeAny(u8, line[at + "Run with:".len ..], " \t");
-        while (it.next()) |arg| {
-            if (std.mem.startsWith(u8, arg, "--language=")) {
-                var specs = std.mem.tokenizeAny(u8, arg["--language=".len..], ",");
-                while (specs.next()) |spec| _ = parser.setLanguageFeature(spec);
-            }
-        }
-        return;
-    }
-}
-
 const EXPECTED = "tests/corpus/expected";
+const RUN_TIMEOUT_MS: i64 = 180_000;
+
+fn klioBin() []const u8 {
+    return klio_child.bin();
+}
 
 /// `KLIO_E2E_SHARD=K/N` runs only the programs hashing into shard K of N.
 fn shardSkip(stem: []const u8) bool {
-    const spec = std.c.getenv("KLIO_E2E_SHARD") orelse return false;
-    const s = std.mem.span(spec);
+    const s = runtime.envOnce("KLIO_E2E_SHARD") orelse return false;
     const slash = std.mem.findScalar(u8, s, '/') orelse return false;
     const k = std.fmt.parseInt(u64, s[0..slash], 10) catch return false;
     const n = std.fmt.parseInt(u64, s[slash + 1 ..], 10) catch return false;
@@ -46,101 +32,106 @@ fn shardSkip(stem: []const u8) bool {
 /// SKIP notices are silent by default: stderr from a passing `zig build` run
 /// step is rendered as a failed command. `KLIO_ITEST_VERBOSE` surfaces them.
 fn verbose() bool {
-    return std.c.getenv("KLIO_ITEST_VERBOSE") != null;
+    return klio_child.verbose();
 }
 
-fn runCorpus(jit_on: bool) !void {
-    jit.setEnabledForTest(jit_on);
-    defer jit.setEnabledForTest(false);
-
-    // Grouping by base key lets one cached base cover the run with one rebuild
-    // per pack mask, staying under the RSS watchdog.
-    parity.base_cache_max = if (std.c.getenv("KLIO_E2E_NO_EVICT") != null) 0 else 1;
-
-    var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer list_arena.deinit();
-    const la = list_arena.allocator();
-    var threaded: std.Io.Threaded = .init(la, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const files = parity.collectKt(la, io, EXAMPLES) catch |e| {
-        std.debug.print("e2e: collectKt failed ({s}); skipping\n", .{@errorName(e)});
-        return error.SkipZigTest;
-    };
-    if (files.len == 0) {
-        std.debug.print("e2e: no examples found; skipping\n", .{});
-        return error.SkipZigTest;
+fn interactive(src: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| : (n += 1) {
+        if (n >= 12) break;
+        if (std.mem.find(u8, line, "corpus: interactive") != null) return true;
     }
-    parity.groupByBaseKey(la, io, files);
+    return false;
+}
 
-    var run_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer run_arena.deinit();
+const Case = struct { path: []const u8, stem: []const u8, expected: []const u8, args: []const []const u8 };
 
-    var failures: usize = 0;
-    for (files) |kt| {
-        // Module memory is recycled, so a reused `*Func` must not keep stale code.
-        jit.resetForTest();
-        _ = run_arena.reset(.retain_capacity);
-        const a = run_arena.allocator();
-        const base = std.fs.path.basename(kt);
-        const stem = base[0 .. base.len - ".kt".len];
-        if (std.c.getenv("KLIO_E2E_FILTER")) |f| {
-            if (std.mem.find(u8, stem, std.mem.span(f)) == null) continue;
+const Shared = struct {
+    cases: []const Case,
+    next: std.atomic.Value(usize) = .init(0),
+    failures: std.atomic.Value(usize) = .init(0),
+    jit: []const u8,
+    lock: runtime.SpinMutex = .{},
+};
+
+fn worker(sh: *Shared) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    while (true) {
+        const i = sh.next.fetchAdd(1, .monotonic);
+        if (i >= sh.cases.len) return;
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        const c = sh.cases[i];
+        const failed = runCase(a, sh, c) catch |e| blk: {
+            sh.lock.lock();
+            defer sh.lock.unlock();
+            std.debug.print("e2e FAIL {s} (jit={s}): {s}\n", .{ c.stem, sh.jit, @errorName(e) });
+            break :blk true;
+        };
+        if (failed) _ = sh.failures.fetchAdd(1, .monotonic);
+    }
+}
+
+fn runCase(a: std.mem.Allocator, sh: *Shared, c: Case) !bool {
+    var env = try klio_child.baseEnv(a);
+    try env.put("KLIO_JIT", sh.jit);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(a, &.{ klioBin(), "run", c.path });
+    try argv.appendSlice(a, c.args);
+    const r = try klio_child.runKlio(a, &env, argv.items, .{ .timeout_ms = RUN_TIMEOUT_MS });
+    const ok = r.term == .exited and r.term.exited == 0 and std.mem.eql(u8, r.stdout, c.expected);
+    if (ok) return false;
+    sh.lock.lock();
+    defer sh.lock.unlock();
+    const code: i64 = switch (r.term) {
+        .exited => |x| x,
+        else => -1,
+    };
+    const err_head = r.stderr[0..@min(r.stderr.len, 600)];
+    std.debug.print("e2e FAIL {s} (jit={s}) exit {d}:\n  got:  {s}\n  want: {s}\n  stderr: {s}\n", .{ c.stem, sh.jit, code, r.stdout, c.expected, err_head });
+    return true;
+}
+
+fn cases(a: std.mem.Allocator, io: std.Io, only: ?[]const []const u8) ![]Case {
+    var out: std.ArrayList(Case) = .empty;
+    var dir = try std.Io.Dir.cwd().openDir(io, EXAMPLES, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".kt")) continue;
+        const stem = try a.dupe(u8, e.name[0 .. e.name.len - ".kt".len]);
+        if (only) |names| {
+            var hit = false;
+            for (names) |n| {
+                if (std.mem.eql(u8, n, stem)) hit = true;
+            }
+            if (!hit) continue;
+        }
+        if (runtime.envOnce("KLIO_E2E_FILTER")) |f| {
+            if (std.mem.find(u8, stem, f) == null) continue;
         }
         if (shardSkip(stem)) continue;
-        if (std.c.getenv("KLIO_E2E_TRACE") != null) std.debug.print("e2e RUN {s} (jit={})\n", .{ stem, jit_on });
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ EXAMPLES, e.name });
+        const src = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
+        if (interactive(src)) continue;
         const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
-
-        const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {
-            if (verbose()) std.debug.print("e2e SKIP {s}: no expected ({s})\n", .{ stem, @errorName(e) });
+        const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |err| {
+            if (verbose()) std.debug.print("e2e SKIP {s}: no expected ({s})\n", .{ stem, @errorName(err) });
             continue;
         };
-
-        applyRunDirective(io, a, kt);
-        defer parser.language = .{};
-        const res = parity.runWithPacks(a, io, kt) catch |e| {
-            failures += 1;
-            std.debug.print("e2e FAIL {s} (jit={}): run error {s}\n", .{ stem, jit_on, @errorName(e) });
-            continue;
-        };
-        switch (res) {
-            .ok => |got| {
-                if (!std.mem.eql(u8, got, expected)) {
-                    failures += 1;
-                    std.debug.print("e2e FAIL {s} (jit={}):\n  got:  {s}\n  want: {s}\n", .{ stem, jit_on, got, expected });
-                }
-            },
-            .err => |msg| {
-                failures += 1;
-                std.debug.print("e2e FAIL {s} (jit={}): klio error: {s}\n", .{ stem, jit_on, msg });
-            },
+        try out.append(a, .{ .path = path, .stem = stem, .expected = expected, .args = try klio_child.runArgs(a, src) });
+    }
+    std.mem.sort(Case, out.items, {}, struct {
+        fn lt(_: void, x: Case, y: Case) bool {
+            return std.mem.lessThan(u8, x.stem, y.stem);
         }
-    }
-
-    if (failures != 0) {
-        std.debug.print("e2e (jit={}): {d}/{d} corpus programs failed\n", .{ jit_on, failures, files.len });
-        return error.CorpusMismatch;
-    }
+    }.lt);
+    return out.items;
 }
 
-test "e2e corpus matches expected output (jit on)" {
-    try runCorpus(true);
-}
-
-test "e2e corpus matches expected output (jit off)" {
-    try runCorpus(false);
-}
-
-// The whole-function JIT is opt-in via `KLIO_FUNC_JIT`, so the passes above
-// never exercise it. This small main-thread-only set bounds retention.
-test "function-JIT recursion matches the interpreter" {
-    jit.setEnabledForTest(true);
-    jit.setFuncEnabledForTest(true);
-    defer jit.setEnabledForTest(false);
-    defer jit.setFuncEnabledForTest(false);
-    parity.base_cache_max = if (std.c.getenv("KLIO_E2E_NO_EVICT") != null) 0 else 2;
-
+fn runCorpus(jit: []const u8, only: ?[]const []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -148,28 +139,61 @@ test "function-JIT recursion matches the interpreter" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const cases = [_][]const u8{ "jit_recursion", "jit_inline_call_loop", "jit_char_tag_static_call" };
-    for (cases) |stem| {
-        jit.resetForTest();
-        const kt = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ EXAMPLES, stem });
-        const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
-        const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {
-            if (verbose()) std.debug.print("func-jit SKIP {s}: no expected ({s})\n", .{ stem, @errorName(e) });
-            continue;
-        };
-        const res = parity.runWithPacks(a, io, kt) catch |e| {
-            std.debug.print("func-jit FAIL {s}: run error {s}\n", .{ stem, @errorName(e) });
-            return error.FuncJitMismatch;
-        };
-        switch (res) {
-            .ok => |got| if (!std.mem.eql(u8, got, expected)) {
-                std.debug.print("func-jit FAIL {s}:\n  got:  {s}\n  want: {s}\n", .{ stem, got, expected });
-                return error.FuncJitMismatch;
-            },
-            .err => |msg| {
-                std.debug.print("func-jit FAIL {s}: klio error: {s}\n", .{ stem, msg });
-                return error.FuncJitMismatch;
-            },
-        }
+    const list = cases(a, io, only) catch |e| {
+        std.debug.print("e2e: cannot list the examples ({s}); skipping\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    if (list.len == 0) return error.SkipZigTest;
+    // Installs the packs before the workers start when no home was named.
+    _ = try klio_child.home(a);
+
+    var sh: Shared = .{ .cases = list, .jit = jit };
+    const cores = std.Thread.getCpuCount() catch 4;
+    const n = std.math.clamp(cores / 2, 1, 8);
+    const threads = try a.alloc(std.Thread, n);
+    for (threads) |*t| t.* = try std.Thread.spawn(.{}, worker, .{&sh});
+    for (threads) |t| t.join();
+    const failures = sh.failures.load(.monotonic);
+    if (failures != 0) {
+        std.debug.print("e2e (jit={s}): {d}/{d} corpus programs failed\n", .{ jit, failures, list.len });
+        return error.CorpusMismatch;
     }
+}
+
+test "e2e corpus matches expected output (jit on)" {
+    try runCorpus("1", null);
+}
+
+test "e2e corpus matches expected output (jit off)" {
+    try runCorpus("0", null);
+}
+
+// The whole-function JIT is opt-in via `KLIO_FUNC_JIT`, so the passes above
+// never exercise it.
+test "function-JIT recursion matches the interpreter" {
+    try runCorpusFuncJit();
+}
+
+fn runCorpusFuncJit() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const list = try cases(a, io, &.{ "jit_recursion", "jit_inline_call_loop", "jit_char_tag_static_call" });
+    var failed = false;
+    for (list) |c| {
+        var env = try klio_child.baseEnv(a);
+        try env.put("KLIO_JIT", "1");
+        try env.put("KLIO_FUNC_JIT", "1");
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(a, &.{ klioBin(), "run", c.path });
+        try argv.appendSlice(a, c.args);
+        const r = try klio_child.runKlio(a, &env, argv.items, .{ .timeout_ms = RUN_TIMEOUT_MS });
+        if (r.exitedZero() and std.mem.eql(u8, r.stdout, c.expected)) continue;
+        std.debug.print("func-jit FAIL {s}:\n  got:  {s}\n  want: {s}\n  stderr: {s}\n", .{ c.stem, r.stdout, c.expected, r.stderr[0..@min(r.stderr.len, 600)] });
+        failed = true;
+    }
+    if (failed) return error.FuncJitMismatch;
 }

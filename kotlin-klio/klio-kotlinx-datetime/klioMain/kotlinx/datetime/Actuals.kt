@@ -21,7 +21,12 @@
 package kotlinx.datetime
 
 import kotlinx.datetime.internal.isLeapYear
+import kotlinx.datetime.internal.monthLength
 import kotlinx.datetime.format.*
+import kotlinx.datetime.serializers.LocalDateSerializer
+import kotlinx.datetime.serializers.LocalDateTimeSerializer
+import kotlinx.datetime.serializers.LocalTimeSerializer
+import kotlinx.serialization.Serializable
 import kotlin.time.Instant
 
 // --- internal native helpers (bound natively by the klio host) ----
@@ -78,12 +83,15 @@ internal fun __kxdt_addPeriod(
 
 // `actual` for upstream `expect class LocalDate` (LocalDate.kt).
 // format-DSL / LocalDateRange members are intentionally absent.
+@Serializable(with = LocalDateSerializer::class)
 actual class LocalDate(
     val year: Int,
-    val monthNumber: Int,
+    month: Int,
     val day: Int,
 ) : Comparable<LocalDate> {
     constructor(year: Int, month: Month, day: Int) : this(year, month.number, day)
+
+    val monthNumber: Int = month
 
     // kotlinx-datetime validates at construction; the format DSL's
     // `parseOrNull` relies on the IllegalArgumentException to report a
@@ -233,7 +241,7 @@ actual class LocalDate(
     }
 }
 
-fun LocalDate.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalDate>): LocalDate? =
+actual fun LocalDate.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalDate>): LocalDate? =
     format.parseOrNull(input)
 
 // `isLeapYear` is consumed from `kotlinx.datetime.internal` (imported above)
@@ -246,7 +254,7 @@ fun LocalDate.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<
 internal const val MIN_EPOCH_DAY: Long = -365243219162L
 internal const val MAX_EPOCH_DAY: Long = 365241780471L
 
-private fun daysInMonth(year: Int, month: Int): Int = when (month) {
+internal fun daysInMonth(year: Int, month: Int): Int = when (month) {
     1, 3, 5, 7, 8, 10, 12 -> 31
     4, 6, 9, 11 -> 30
     else -> if (isLeapYear(year)) 29 else 28
@@ -397,6 +405,7 @@ actual fun LocalDate.periodUntil(other: LocalDate): DatePeriod {
 }
 
 // `actual` for upstream `expect class LocalTime` (LocalTime.kt).
+@Serializable(LocalTimeSerializer::class)
 actual class LocalTime(
     val hour: Int,
     val minute: Int,
@@ -452,6 +461,17 @@ actual class LocalTime(
             if (secondOfDay < 0 || secondOfDay > 86_399)
                 throw IllegalArgumentException("Invalid value: secondOfDay=$secondOfDay")
             return LocalTime(secondOfDay / 3600, (secondOfDay % 3600) / 60, secondOfDay % 60, 0)
+        }
+
+        // The tz rules model (`MonthDayTime`) renders a transition time through this.
+        internal fun ofSecondOfDay(secondOfDay: Int, nanoOfSecond: Int): LocalTime {
+            require(secondOfDay in 0 until 86_400) {
+                "Invalid time: secondOfDay must be between 0 and 86400, got $secondOfDay"
+            }
+            require(nanoOfSecond in 0 until 1_000_000_000) {
+                "Invalid time: nanosecondOfSecond must be between 0 and 1000000000, got $nanoOfSecond"
+            }
+            return LocalTime(secondOfDay / 3600, (secondOfDay % 3600) / 60, secondOfDay % 60, nanoOfSecond)
         }
 
         fun fromMillisecondOfDay(millisecondOfDay: Int): LocalTime {
@@ -515,11 +535,12 @@ actual class LocalTime(
     }
 }
 
-fun LocalTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalTime>): LocalTime? =
+actual fun LocalTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalTime>): LocalTime? =
     format.parseOrNull(input)
 
 
 // `actual` for upstream `expect class LocalDateTime` (LocalDateTime.kt).
+@Serializable(with = LocalDateTimeSerializer::class)
 actual class LocalDateTime(
     val date: LocalDate,
     val time: LocalTime,
@@ -587,7 +608,7 @@ actual class LocalDateTime(
     }
 }
 
-fun LocalDateTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalDateTime>): LocalDateTime? =
+actual fun LocalDateTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalDateTime>): LocalDateTime? =
     format.parseOrNull(input)
 
 

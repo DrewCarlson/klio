@@ -19,7 +19,7 @@ const host_call_value = @import("../host_call_value.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-const build = @import("../../build.zig");
+const tables = @import("../../tables.zig");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -45,8 +45,7 @@ const StringSet = runtime.NameHashMap(void);
 const AnonMethodEntry = root.AnonMethodEntry;
 const NameValue = root.NameValue;
 
-const build_object = @import("build_object.zig");
-const anonKey = build_object.anonKey;
+const anonKey = @import("../host_call_member/reflect_anon.zig").anonKey;
 
 const common = @import("common.zig");
 const typeErr = common.typeErr;

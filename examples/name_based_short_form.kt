@@ -1,3 +1,4 @@
+// kotlinc: -Xname-based-destructuring=complete
 // Run with: klio run --language=+EnableNameBasedDestructuringShortForm examples/name_based_short_form.kt
 // With the short form enabled, a parenthesized destructuring `(a, b = prop)`
 // binds by property name instead of by position: `(second)` reads

@@ -310,9 +310,9 @@ pub fn char_compare_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Char.compareTo requires a Char");
     }
     const b = ctx.args[1].Char;
-    // kotlinc compiles `Char.compareTo` to `Character.compare`, which returns the
-    // code difference, not a sign: `'a'.compareTo('c')` is -2 on the JVM.
-    const result: i32 = @as(i32, @intCast(a)) - @as(i32, @intCast(b));
+    // kotlinc compiles `Char.compareTo` to `Intrinsics.compare`, which returns
+    // -1, 0 or 1: `'a'.compareTo('c')` is -1 on the JVM.
+    const result: i32 = if (a < b) -1 else if (a > b) 1 else 0;
     return ok(.{ .Int = result });
 }
 
@@ -789,6 +789,10 @@ test "compareTo returns the ordering sign" {
     const gt = [_]Value{ .{ .Char = 'b' }, .{ .Char = 'a' } };
     var c3 = noopCtx(&gt);
     try testing.expectEqual(@as(i32, 1), (try char_compare_to(&c3)).ok.Int);
+    // The sign, not the code difference: 'A' against 'a' is -1, not -32.
+    const far = [_]Value{ .{ .Char = 'A' }, .{ .Char = 'a' } };
+    var c4 = noopCtx(&far);
+    try testing.expectEqual(@as(i32, -1), (try char_compare_to(&c4)).ok.Int);
 }
 
 test "isISOControl covers C0 and C1 ranges" {
