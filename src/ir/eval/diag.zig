@@ -60,11 +60,6 @@ pub fn wallCapFire(allocator: Allocator) Allocator.Error!EvalResult {
     return errResult(.{ .Type = "test wall-clock deadline exceeded" });
 }
 
-/// Per-test invariant probe: a nonzero depth between tests is an unwind leak.
-pub fn evalDepthNow() usize {
-    return ev_state.evtlsPtr().eval_depth;
-}
-
 /// Whether dispatch caches may be populated: a capped or abandoned run aborts
 /// walks mid-probe, and caching those outcomes poisons every later execution.
 pub fn dispatchCacheStable() bool {
@@ -82,40 +77,7 @@ var call_stats_state: u8 = 0;
 
 var call_stats_mutex: runtime.SpinMutex = .{};
 
-/// Outer-hop stored-slot field route (tag 3): hop `outer` links, check the
-/// destination class identity (low 32 bits), read the slot; returns a retained ref.
-pub fn serveOuterSlotRoute(recv: *const Value, name: []const u8, route: u64) ?Value {
-    const hops: u64 = (route >> 2) & 63;
-    const idx: usize = @intCast((route >> 8) & 0xFFFFFF);
-    const want_cls: u32 = @intCast(route >> 32);
-    var cur: Value = recv.*;
-    var h: u64 = 0;
-    while (h < hops) : (h += 1) {
-        if (cur != .Instance) return null;
-        const g = cur.Instance.borrow();
-        const o = g.get().outer;
-        g.deinit();
-        cur = o orelse return null;
-    }
-    if (cur != .Instance) return null;
-    const g = cur.Instance.borrow();
-    defer g.deinit();
-    const b = g.get();
-    if (@as(u32, @truncate(@as(u64, @intCast(b.class.identity())))) != want_cls) return null;
-    if (idx >= b.fields.items.len) return null;
-    const f = &b.fields.items[idx];
-    if (!std.mem.eql(u8, f.name, name)) return null;
-    const v = f.value;
-    if (v == .Null or v == .Delegate) return null;
-    v.retain();
-    return v;
-}
-
 var call_stats: ?runtime.NameHashMap(u64) = null;
-
-fn callStatsBump(fqn: []const u8) void {
-    callStatsBumpId(fqn, 0, null);
-}
 
 /// Census bump keyed by FuncId, so `KLIO_CALL_STATS_LAMBDA` splits `<lambda>`.
 pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
@@ -202,51 +164,6 @@ fn lambdaStatsOn() bool {
     return S.state == 2;
 }
 
-/// `KLIO_CALL_STATS` tap for slow-ladder GetField; keys are `<gf>Type.name`.
-pub fn gfStatsBump(recv: *const Value, name: []const u8) void {
-    if (call_stats_state == 0)
-        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
-    if (call_stats_state != 2) return;
-    var buf: [256]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "<gf>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
-    call_stats_mutex.lock();
-    defer call_stats_mutex.unlock();
-    if (call_stats == null) call_stats = runtime.NameHashMap(u64).init(std.heap.page_allocator);
-    const gop = call_stats.?.getOrPut(key) catch return;
-    if (!gop.found_existing) {
-        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
-        gop.value_ptr.* = 0;
-    }
-    gop.value_ptr.* += 1;
-}
-
-/// `KLIO_CALL_STATS` tap for the slow name ladder; keys `<ladder>Type.name@fn`.
-pub fn ladderStatsBump(recv: *const Value, name: []const u8, in_fn: []const u8) void {
-    if (call_stats_state == 0)
-        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
-    if (call_stats_state != 2) return;
-    var buf: [256]u8 = undefined;
-    // `typeFqn` reports `<instance>` for an interpreted object, naming nothing.
-    const recv_name: []const u8 = if (recv.* == .Instance) blk: {
-        const g = recv.Instance.borrow();
-        defer g.deinit();
-        const cg = g.get().class.borrow();
-        defer cg.deinit();
-        const nm = cg.get().name;
-        break :blk if (nm.len != 0) nm else recv.typeFqn();
-    } else recv.typeFqn();
-    const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}@{s}", .{ recv_name, name, in_fn }) catch return;
-    call_stats_mutex.lock();
-    defer call_stats_mutex.unlock();
-    if (call_stats == null) call_stats = runtime.NameHashMap(u64).init(std.heap.page_allocator);
-    const gop = call_stats.?.getOrPut(key) catch return;
-    if (!gop.found_existing) {
-        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
-        gop.value_ptr.* = 0;
-    }
-    gop.value_ptr.* += 1;
-}
-
 /// Host-route sub-tag names for the op profiler; order is the route-index contract.
 pub const op_route_names = [_][]const u8{
     "route:member-arg-prep", // 0
@@ -324,30 +241,6 @@ pub fn callStatsProbe(name: []const u8) void {
     gop.value_ptr.* += 1;
 }
 
-pub fn probeStatsDump() void {
-    if (call_stats_state != 2) return;
-    call_stats_mutex.lock();
-    defer call_stats_mutex.unlock();
-    const stats = &(probe_stats orelse return);
-    const Entry = struct { fqn: []const u8, n: u64 };
-    var list = std.ArrayList(Entry).initCapacity(std.heap.page_allocator, stats.count()) catch return;
-    defer list.deinit(std.heap.page_allocator);
-    var it = stats.iterator();
-    var total: u64 = 0;
-    while (it.next()) |e| {
-        list.appendAssumeCapacity(.{ .fqn = e.key_ptr.*, .n = e.value_ptr.* });
-        total += e.value_ptr.*;
-    }
-    std.mem.sort(Entry, list.items, {}, struct {
-        fn lt(_: void, a: Entry, b: Entry) bool {
-            return a.n > b.n;
-        }
-    }.lt);
-    std.debug.print("[probe-stats] total={d} distinct={d}\n", .{ total, list.items.len });
-    const top = @min(list.items.len, 40);
-    for (list.items[0..top]) |e| std.debug.print("[probe-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
-}
-
 /// `KLIO_DISPATCH_STATS=1`: executed-instruction census over the call forms.
 pub const DispatchKind = enum(u8) {
     call_static,
@@ -407,8 +300,6 @@ pub const DispatchKind = enum(u8) {
     call_member_or_global_static,
     /// Every interpreter frame constructed: the denominator for the rest.
     frame_push,
-    /// Frames the flattened engine's simple-inst subset can execute end to end.
-    frame_push_flattenable,
 };
 
 const DISPATCH_KINDS = @typeInfo(DispatchKind).@"enum".fields.len;
@@ -470,44 +361,6 @@ pub inline fn dispatchBump(comptime k: DispatchKind) void {
 
 pub fn dispatchNote(comptime k: DispatchKind) void {
     dispatchBump(k);
-}
-
-pub fn dispatchStatsDump() void {
-    if (dispatch_stats_state != 2) return;
-    if (parent.ext_fb_counts) |f| {
-        const c = f();
-        if (c[0] != 0) std.debug.print(
-            "[ext-fb] total={d} plain-hit={d} chain-hit={d} walk={d}\n",
-            .{ c[0], c[1], c[2], c[3] },
-        );
-    }
-    var total: u64 = 0;
-    for (&dispatch_counts) |*c| total += c.load(.monotonic);
-    if (total == 0) return;
-    std.debug.print("[dispatch-stats] total={d}\n", .{total});
-    if (parent.dispatch_replay_hits) |f| std.debug.print("[dispatch-stats] replay-hits={d}\n", .{f()});
-    {
-        var by_verdict: [4]u64 = @splat(0);
-        inline for (@typeInfo(DispatchKind).@"enum".fields) |f| {
-            by_verdict[@intFromEnum(dispatch_verdicts[f.value])] += dispatch_counts[f.value].load(.monotonic);
-        }
-        var decided: u64 = 0;
-        for (by_verdict[0..3]) |n| decided += n;
-        inline for (@typeInfo(DispatchVerdict).@"enum".fields) |f| {
-            if (f.value < 3) {
-                const n = by_verdict[f.value];
-                std.debug.print("[dispatch-verdict] {s}={d} ({d:.2}% of {d} decided)\n", .{
-                    f.name, n,
-                    if (decided == 0) @as(f64, 0) else @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(decided)),
-                    decided,
-                });
-            }
-        }
-    }
-    inline for (@typeInfo(DispatchKind).@"enum".fields) |f| {
-        const n = dispatch_counts[f.value].load(.monotonic);
-        if (n != 0) std.debug.print("[dispatch-stats] {d:>12} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
-    }
 }
 
 pub fn callStatsDump() void {
@@ -580,16 +433,15 @@ fn fuseClassify(func: *const Func) u8 {
     if (func.n_locals > 128) return 255;
     var total: usize = 0;
     for (func.blocks) |*b| {
-        if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return 255;
+        if (b.h().catches.len != 0 or b.h().finally != null) return 255;
         total += b.insts.len;
         if (total > 256) return 255;
         switch (b.terminator) {
-            .Return, .Goto, .Branch, .Throw, .Unreachable, .Switch => {},
-            else => return 255,
+            .Return, .Goto, .Branch, .Throw, .Unreachable => {},
         }
         for (b.insts) |*inst| {
             switch (inst.*) {
-                .Const, .Move, .LoadParam, .LoadCapture, .BinOp, .UnOp, .Not, .Trace, .GetField, .SetField, .Index, .IndexSet, .Cast, .InstanceOf, .NotNullAssert, .LateinitCheck, .Call, .MakeCell, .CellGet, .CellSet, .QualifiedThis, .EnclosingPush, .EnclosingPop => {},
+                .Const, .Move, .LoadParam, .LoadCapture, .BinOp, .UnOp, .Not, .Trace, .NotNullAssert, .LateinitCheck, .MakeCell, .CellGet, .CellSet => {},
                 else => return 2 + @as(u8, @intFromEnum(std.meta.activeTag(inst.*))),
             }
         }
@@ -789,11 +641,6 @@ pub fn funcFirstLoc(func: *const ir.Func) FuncLoc {
     return fallback;
 }
 
-/// Install the runtime-layer frame-dump hook (idempotent).
-pub fn installDebugFrameDump() void {
-    runtime.debug_frame_dump = &dumpFrameChainForDiagAlways;
-}
-
 /// Ungated frame-chain dump for diagnostics that gate at their own call site.
 pub fn dumpFrameChainForDiagAlways() void {
     std.debug.print("[errtrace] frame chain (innermost first):\n", .{});
@@ -943,10 +790,6 @@ fn frameToString(allocator: Allocator, fr: runtime.StackFrame) Allocator.Error![
         }
     }
     return std.fmt.allocPrint(allocator, "{s}(Unknown Source)", .{fr.fqn});
-}
-
-pub fn formatStackTrace(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8)) Allocator.Error!void {
-    return formatFrames(allocator, trace.frames, out, "");
 }
 
 /// `frames`, one per line as `printStackTrace` prints them: `<prefix>\tat
@@ -1236,20 +1079,6 @@ fn requireResolvedInit() void {
     require_resolved_state = if (recording) 2 else 1;
 }
 
-/// Whether anything at all wants to hear about a name-based resolution: the
-/// single predictable compare the by-name paths pay when nothing does.
-pub inline fn ratchetArmed() bool {
-    return require_resolved_state != 1;
-}
-
-/// Whether a run that resolved anything by name must exit non-zero. Both
-/// `KLIO_REQUIRE_RESOLVED` settings fail the run; the recording-only modes that
-/// `KLIO_DISPATCH_STATS` turns on do not.
-pub fn requireResolvedFails() bool {
-    if (require_resolved_state == 0) requireResolvedInit();
-    return require_resolved_state >= 3;
-}
-
 /// Whether an unresolved dispatch must raise rather than serve the call.
 pub fn requireResolvedRaises() bool {
     if (require_resolved_state == 0) requireResolvedInit();
@@ -1281,87 +1110,8 @@ pub fn unresolvedNoteSlow(kind: []const u8, name: []const u8, in_fn: []const u8,
     gop.value_ptr.* += 1;
 }
 
-/// One tier's gate on an executing instruction: report an unresolved site and
-/// say whether the tier must refuse to serve it. `recv` is the receiver's
-/// runtime type where the tier can read it.
-///
-/// Every interpreter tier calls this over the same classifier, so the executed
-/// census covers the tiers by construction rather than by a list of hand-placed
-/// hooks that a new tier could miss.
-pub fn unresolvedGate(module: *const Module, inst: *const Inst, in_fn: []const u8, recv: []const u8) bool {
-    // The first instruction of a run reaches here with the switch unread, since
-    // `ratchetArmed` reads one byte and does not pay for the env probe.
-    if (require_resolved_state == 0) requireResolvedInit();
-    if (require_resolved_state == 1) return false;
-    const kind = ir.site_census.refine(module, inst);
-    if (ir.site_census.verdictOf(kind) != .unresolved) return false;
-    unresolvedNoteSlow(@tagName(kind), ir.site_census.siteName(module, inst), in_fn, recv);
-    return requireResolvedRaises();
-}
-
-/// The class table refines two site kinds, so a caller that skips it reports a
-/// resolved site as unresolved: a construction of a class with one constructor
-/// names its target as exactly as a `Call` does.
-pub fn isUnresolvedSite(module: *const Module, inst: *const Inst) bool {
-    return ir.site_census.verdictOf(ir.site_census.refine(module, inst)) == .unresolved;
-}
-
-/// The same gate for a tier that cannot raise. It records and serves when the
-/// ratchet is only counting; in raise mode it records nothing and answers true,
-/// so the tier declines and the framed walker reports the site exactly once.
-pub fn unresolvedTierGate(module: *const Module, inst: *const Inst, in_fn: []const u8, recv: []const u8) bool {
-    if (require_resolved_state == 0) requireResolvedInit();
-    if (require_resolved_state == 1) return false;
-    if (!isUnresolvedSite(module, inst)) return false;
-    if (requireResolvedRaises()) return true;
-    unresolvedNoteSlow(@tagName(ir.site_census.refine(module, inst)), ir.site_census.siteName(module, inst), in_fn, recv);
-    return false;
-}
-
 pub fn unresolvedCount() u64 {
     return unresolved_total.load(.monotonic);
-}
-
-/// Report the sites that re-derived a target, most frequent first. Returns the
-/// total, so a caller can turn `KLIO_REQUIRE_RESOLVED=1` into an exit code.
-pub fn unresolvedDump() u64 {
-    if (require_resolved_state == 0) requireResolvedInit();
-    if (require_resolved_state == 1) return 0;
-    const total = unresolved_total.load(.monotonic);
-    unresolved_mutex.lock();
-    defer unresolved_mutex.unlock();
-    const sites = &(unresolved_sites orelse {
-        std.debug.print("[unresolved] total=0\n", .{});
-        return 0;
-    });
-    const Entry = struct { key: []const u8, n: u64 };
-    var list = std.ArrayList(Entry).initCapacity(std.heap.page_allocator, sites.count()) catch return total;
-    defer list.deinit(std.heap.page_allocator);
-    var it = sites.iterator();
-    while (it.next()) |e| list.appendAssumeCapacity(.{ .key = e.key_ptr.*, .n = e.value_ptr.* });
-    std.mem.sort(Entry, list.items, {}, struct {
-        fn gt(_: void, a: Entry, b: Entry) bool {
-            return a.n > b.n;
-        }
-    }.gt);
-    std.debug.print("[unresolved] total={d} distinct={d}\n", .{ total, list.items.len });
-    const top = @min(list.items.len, unresolvedTopN());
-    for (list.items[0..top]) |e| std.debug.print("[unresolved] {d:>12}  {s}\n", .{ e.n, e.key });
-    return total;
-}
-
-/// How many site rows `unresolvedDump` prints; `KLIO_UNRESOLVED_SITES=<n>` widens it.
-fn unresolvedTopN() usize {
-    const S = struct {
-        var n: ?usize = null;
-    };
-    if (S.n) |n| return n;
-    var n: usize = 40;
-    if (runtime.envOnce("KLIO_UNRESOLVED_SITES")) |v| {
-        n = std.fmt.parseInt(usize, v, 10) catch 40;
-    }
-    S.n = n;
-    return n;
 }
 
 /// Test hook: force the ratchet's state, bypassing the environment read.
@@ -1405,33 +1155,6 @@ test "raise mode is distinguishable from counting" {
     try std.testing.expect(!requireResolvedRaises());
 }
 
-var require_resolved_messages: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-
-/// The message a ratchet violation raises with. The throwable borrows the slice,
-/// so it is duped; raise mode is a diagnostic run and a program that catches its
-/// way past a thousand of them has already answered the question, so past that
-/// the message degrades to a shared one rather than growing without bound.
-pub fn requireResolvedSiteMessage(module: *const Module, inst: *const Inst, in_fn: []const u8, recv: []const u8) []const u8 {
-    return requireResolvedMessage(
-        @tagName(ir.site_census.refine(module, inst)),
-        ir.site_census.siteName(module, inst),
-        recv,
-        in_fn,
-    );
-}
-
-pub fn requireResolvedMessage(what: []const u8, name: []const u8, recv: []const u8, in_fn: []const u8) []const u8 {
-    const fixed = "a target resolved by name at run time; bind it at lowering or clear KLIO_REQUIRE_RESOLVED";
-    if (require_resolved_messages.fetchAdd(1, .monotonic) >= 1000) return fixed;
-    var buf: [384]u8 = undefined;
-    const msg = std.fmt.bufPrint(
-        &buf,
-        "{s} `{s}` on {s} in {s} resolved by name at run time; bind it at lowering or clear KLIO_REQUIRE_RESOLVED",
-        .{ what, name, recv, in_fn },
-    ) catch return fixed;
-    return std.heap.page_allocator.dupe(u8, msg) catch fixed;
-}
-
 test "every dispatch kind that the ratchet hooks is an unresolved verdict" {
     // The hooks and the verdict table must agree: a kind the by-name paths
     // report must not be counted as resolved work.
@@ -1448,31 +1171,6 @@ test "every dispatch kind that the ratchet hooks is an unresolved verdict" {
     // split would count one call as several.
     for ([_]DispatchKind{ .member_ladder, .member_site_flat, .member_fast_subscript, .frame_push }) |k|
         try std.testing.expectEqual(DispatchVerdict.bookkeeping, dispatchVerdictOf(k));
-}
-
-/// A one-line rendering of a value for a diagnostic: the tag, plus the payload
-/// for the scalars a divergence is usually about.
-///
-/// `slot` picks one of two per-thread buffers, because the caller that needs
-/// this is comparing two values in ONE `print` — with a single buffer the
-/// second call overwrites the first and both arguments render the same, which
-/// turned a real divergence into "these two identical values differ".
-pub fn shortValue(v: *const Value, comptime slot: usize) []const u8 {
-    const S = struct {
-        threadlocal var bufs: [2][96]u8 = undefined;
-    };
-    const buf = &S.bufs[slot];
-    return switch (v.*) {
-        .Int => |x| std.fmt.bufPrint(buf, "Int:{d}", .{x}) catch "Int",
-        .Long => |x| std.fmt.bufPrint(buf, "Long:{d}", .{x}) catch "Long",
-        .Short => |x| std.fmt.bufPrint(buf, "Short:{d}", .{x}) catch "Short",
-        .Byte => |x| std.fmt.bufPrint(buf, "Byte:{d}", .{x}) catch "Byte",
-        .Bool => |x| if (x) "Bool:true" else "Bool:false",
-        .Double => |x| std.fmt.bufPrint(buf, "Double:{d}", .{x}) catch "Double",
-        .Float => |x| std.fmt.bufPrint(buf, "Float:{d}", .{x}) catch "Float",
-        .Char => |x| std.fmt.bufPrint(buf, "Char:{d}", .{x}) catch "Char",
-        else => @tagName(std.meta.activeTag(v.*)),
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1503,24 +1201,6 @@ pub inline fn extAuditArmed() bool {
     if (ext_audit_state == 0)
         ext_audit_state = if (runtime.envOnce("KLIO_EXT_AUDIT") != null) 2 else 1;
     return ext_audit_state == 2;
-}
-
-/// Announce the stamped pick for the call about to be dispatched. A stamp still
-/// standing here was never served: the site resolved as a member, a builtin or a
-/// host intrinsic instead, which is a fact about coverage rather than a
-/// divergence, so it gets its own row.
-pub fn extAuditPublish(module: *const Module, pick: ?FuncId, kind: u8, name: []const u8, in_fn: []const u8) void {
-    if (ext_audit_pick != 0)
-        extAuditRow(ext_audit_name, "not-served", ext_audit_fqn, "-", ext_audit_kind, ext_audit_in_fn);
-    const fid = pick orelse {
-        ext_audit_pick = 0;
-        return;
-    };
-    ext_audit_pick = fid.int() + 1;
-    ext_audit_fqn = if (module.funcById(fid)) |f| f.fqn else "?";
-    ext_audit_name = name;
-    ext_audit_in_fn = in_fn;
-    ext_audit_kind = kind;
 }
 
 pub const ExtAuditExpect = struct { fid: FuncId, fqn: []const u8, kind: u8, in_fn: []const u8 };

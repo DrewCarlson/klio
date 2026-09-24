@@ -1409,18 +1409,3 @@ pub fn internalVisibleFrom(
     return caller_module.? == declaration_module.?;
 }
 
-/// Rebuild the owner-scoped index from serialized declaration records: pack
-/// images do not serialize this derived table.
-pub fn rebuildMemberNameIndex(self: *Module, allocator: Allocator) Allocator.Error!void {
-    var old_it = self.member_name_index.valueIterator();
-    while (old_it.next()) |list| list.deinit(allocator);
-    self.member_name_index.clearRetainingCapacity();
-    var sig_it = self.decl_sigs.iterator();
-    while (sig_it.next()) |entry| {
-        const owner = entry.value_ptr.enclosing_class orelse continue;
-        if (owner.int() >= self.classes.items.len) continue;
-        const fid = FuncId.from(entry.key_ptr.*);
-        const f = self.funcById(fid) orelse continue;
-        try self.registerMemberDecl(allocator, self.classes.items[owner.int()].fqn, f.name, fid);
-    }
-}

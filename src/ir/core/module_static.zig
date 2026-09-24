@@ -814,15 +814,6 @@ pub fn staticReceiverCompatibilityWith(
     return .incompatible;
 }
 
-/// Identity-aware, nullability-aware comparison of two concrete call-site types.
-pub fn staticTypeCompatibility(
-    self: *const Module,
-    actual: TypeRef,
-    declared: TypeRef,
-) StaticCompatibility {
-    return self.staticReceiverCompatibility(null, actual, declared);
-}
-
 pub fn staticAliasType(
     self: *const Module,
     allocator: Allocator,
@@ -1341,19 +1332,6 @@ pub fn staticGenericReceiverApplicable(
     actual_bounds: []const ModuleRegistry.TypeParamBound,
 ) Allocator.Error!bool {
     return self.staticGenericReceiverApplicableMode(allocator, actual, pattern, declared_params, actual_bounds, .prove);
-}
-
-/// Could-apply variant: an INCOMPLETE bound record (head-only `Comparable` standing in for
-/// `Comparable<T>`) does not refute, so the sole local candidate cannot vanish. `prove` still declines.
-pub fn staticGenericReceiverCouldApply(
-    self: *const Module,
-    allocator: Allocator,
-    actual: TypeRef,
-    pattern: TypeRef,
-    declared_params: []const ModuleRegistry.TypeParamBound,
-    actual_bounds: []const ModuleRegistry.TypeParamBound,
-) Allocator.Error!bool {
-    return self.staticGenericReceiverApplicableMode(allocator, actual, pattern, declared_params, actual_bounds, .could_apply);
 }
 
 pub fn staticGenericReceiverApplicableMode(
@@ -1973,10 +1951,6 @@ pub fn tiedLambdaParamRep(self: *const Module, fids: []const FuncId) ?FuncId {
         }
     }
     return fids[0];
-}
-
-pub fn staticReceiverCouldAccept(self: *const Module, fid: FuncId, receiver: TypeRef, param: TypeRef) bool {
-    return self.staticReceiverCompatibility(fid, receiver, param) != .incompatible;
 }
 
 pub fn memberExtensionOwnerIsObject(self: *const Module, fid: FuncId) ?[]const u8 {

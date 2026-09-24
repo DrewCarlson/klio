@@ -353,14 +353,6 @@ fn implicitStatic(nr: *const records.NameRec) bool {
     return true;
 }
 
-fn lastNameStartOf(e: *const ast.Expr) u32 {
-    return switch (e.*) {
-        .Path => |p| p.segments[p.segments.len - 1].span.start,
-        .Member => |m| m.name.span.start,
-        else => e.span().start,
-    };
-}
-
 /// Whether a name read is static, its receiver (if any) being so when
 /// `recv_static`.
 fn staticRead(b: *Builder, nr: *const records.NameRec, recv_static: bool) Error!bool {
@@ -1141,24 +1133,6 @@ fn arraySize(b: *Builder, arr_t: sema.TypeId) ?ir.FuncId {
         if (g.int() != bridge.NONE) return g;
     }
     return null;
-}
-
-/// The element type of an array type: `T` of `Array<T>`, the primitive of
-/// a primitive array.
-fn elementType(s: *sema.Sema, arr_t: sema.TypeId) sema.TypeId {
-    const args = s.types.argsOf(arr_t);
-    if (args.len == 1) return args[0].ty;
-    const cls = s.types.classSym(arr_t);
-    const bi = s.builtins;
-    const pairs = .{
-        .{ "int_array", "int" },       .{ "long_array", "long" },   .{ "short_array", "short" },
-        .{ "byte_array", "byte" },     .{ "char_array", "char" },   .{ "boolean_array", "boolean" },
-        .{ "float_array", "float" },   .{ "double_array", "double" },
-    };
-    inline for (pairs) |pr| {
-        if (@hasField(@TypeOf(bi), pr[0]) and @field(bi, pr[0]) == cls) return s.types.class(@field(bi, pr[1]), &.{}, false) catch .none;
-    }
-    return .none;
 }
 
 fn orInto(b: *Builder, dst: Reg, bits: i32) Error!void {

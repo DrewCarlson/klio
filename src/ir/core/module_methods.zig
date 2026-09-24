@@ -30,37 +30,6 @@ pub fn methodSlotTarget(self: *const Module, runtime_class: ClassId, slot: Metho
     return self.method_dispatch.get(methodDispatchKey(runtime_class, slot));
 }
 
-pub const MethodDispatchEntry = struct {
-    runtime_class: ClassId,
-    slot: MethodSlotId,
-    target: FuncId,
-};
-
-pub fn methodDispatchEntries(self: *const Module, allocator: Allocator) Allocator.Error![]MethodDispatchEntry {
-    const entries = try allocator.alloc(MethodDispatchEntry, self.method_dispatch.count());
-    var it = self.method_dispatch.iterator();
-    var i: usize = 0;
-    while (it.next()) |entry| : (i += 1) {
-        const runtime_class = ClassId.from(@intCast(entry.key_ptr.* >> 32));
-        const slot = MethodSlotId.from(@truncate(entry.key_ptr.*));
-        entries[i] = .{
-            .runtime_class = runtime_class,
-            .slot = slot,
-            .target = entry.value_ptr.*,
-        };
-    }
-    return entries;
-}
-
-pub fn registerMethodSlotTarget(
-    self: *Module,
-    runtime_class: ClassId,
-    slot: MethodSlotId,
-    target: FuncId,
-) Allocator.Error!void {
-    try self.method_dispatch.put(methodDispatchKey(runtime_class, slot), target);
-}
-
 pub const TypeBinding = struct {
     name: []const u8,
     ty: TypeRef,
@@ -87,11 +56,6 @@ pub fn widenBinding(bindings: []TypeBinding, name: []const u8, ty: TypeRef) void
     for (bindings) |*binding| {
         if (std.mem.eql(u8, binding.name, name)) binding.ty = ty;
     }
-}
-
-/// Substitute `ty` through a solved binding set; the result is arena-scoped.
-pub fn substituteBoundType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
-    return substituteType(allocator, ty, bindings);
 }
 
 pub fn substituteType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
@@ -694,16 +658,6 @@ pub fn instantiatedTypeFromReceiverImpl(
     return try substituted.clone(allocator);
 }
 
-pub fn instantiatedTypeFromReceiver(
-    self: *const Module,
-    allocator: Allocator,
-    fid: FuncId,
-    ty: TypeRef,
-    receiver: TypeRef,
-) Allocator.Error!?TypeRef {
-    return self.instantiatedTypeFromReceiverImpl(allocator, fid, ty, receiver, true);
-}
-
 /// `instantiatedTypeFromReceiver` without the completeness requirement: the parameters the receiver
 /// does bind substitute, the rest stay as written for a consumer that guards bare heads itself.
 pub fn instantiatedTypeFromReceiverPartial(
@@ -714,34 +668,6 @@ pub fn instantiatedTypeFromReceiverPartial(
     receiver: TypeRef,
 ) Allocator.Error!?TypeRef {
     return self.instantiatedTypeFromReceiverImpl(allocator, fid, ty, receiver, false);
-}
-
-/// Instantiate a type owned by a resolved declaration from explicit call-site type arguments; null
-/// while any declaration type parameter `ty` uses stays unbound.
-pub fn instantiatedDeclarationType(
-    self: *const Module,
-    allocator: Allocator,
-    fid: FuncId,
-    ty: TypeRef,
-    explicit_type_args: []const TypeRef,
-) Allocator.Error!?TypeRef {
-    const type_params_list = self.registry.func_type_params.get(fid);
-    const type_params: []const []const u8 = if (type_params_list) |list|
-        list.items
-    else
-        &.{};
-    if (explicit_type_args.len > type_params.len) return null;
-
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const a = scratch.allocator();
-    var bindings: std.ArrayList(TypeBinding) = .empty;
-    for (explicit_type_args, 0..) |explicit, i| {
-        try bindings.append(a, .{ .name = type_params[i], .ty = explicit });
-    }
-    if (!returnTypeBindingsComplete(ty, type_params, bindings.items)) return null;
-    const substituted = try substituteType(a, ty, bindings.items);
-    return try substituted.clone(allocator);
 }
 
 pub fn ancestorBindings(

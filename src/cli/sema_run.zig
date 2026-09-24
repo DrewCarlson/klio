@@ -267,6 +267,17 @@ pub fn reportProgramErrors(gpa: Allocator, arena: Allocator, map: *const span.So
     return n;
 }
 
+/// Whether a program site sema reported lies within `sp` or holds it.
+fn reportedAt(s: *sema.Sema, sp: span.Span) bool {
+    for (s.census.sites.items) |site| {
+        const fc = s.fileOf(site.file) orelse continue;
+        if (fc.origin != .program) continue;
+        if (site.sp.file.int() != sp.file.int()) continue;
+        if (site.sp.start <= sp.end and sp.start <= site.sp.end) return true;
+    }
+    return false;
+}
+
 fn inProgram(map: *const span.SourceMap, program: []const sema.SourceFile, sp: span.Span) bool {
     const file = if (sp.file.int() < map.files.items.len) map.get(sp.file).path else "";
     for (program) |p| {
@@ -315,12 +326,13 @@ pub fn programDiagnostics(arena: Allocator, map: *const span.SourceMap, program:
         }
         try diagnostics.render.plain.render(arena, &.{d}, map, out);
     }
-    // What did not lower follows from what did not resolve when anything
-    // did not; alone, it is klio's to fix.
+    // What did not lower follows from what did not resolve where sema
+    // reported something at its place; anywhere else, it is klio's to fix,
+    // and shown whatever sema found elsewhere.
     for (built.prog.errors.items) |le| {
         if (!inProgram(map, program, le.span)) continue;
         n += 1;
-        if (shown != 0) continue;
+        if (shown != 0 and reportedAt(s, le.span)) continue;
         const f = built.br.m.funcs.items[le.func.int()];
         var d = diagnostics.Diagnostic.err(try std.fmt.allocPrint(arena, "klio cannot run `{s}`: {s}", .{ f.fqn, le.msg }), le.span);
         d.severity = severity;

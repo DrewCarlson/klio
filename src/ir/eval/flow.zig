@@ -114,28 +114,6 @@ pub fn flatEnabled() bool {
     return b;
 }
 
-/// `KLIO_FLAT_VCALL=0` keeps slot-bound and lowering-resolved member calls on the recursive invoker.
-var vcall_flat_cached: ?bool = null;
-
-pub fn vcallFlatEnabled() bool {
-    if (vcall_flat_cached) |b| return b;
-    const raw = runtime.envOnce("KLIO_FLAT_VCALL");
-    const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
-    vcall_flat_cached = b;
-    return b;
-}
-
-/// `KLIO_MEMBER_SITE=0` disables the CallMember instruction-site memo.
-var member_site_cached: ?bool = null;
-
-pub fn memberSiteEnabled() bool {
-    if (member_site_cached) |b| return b;
-    const raw = runtime.envOnce("KLIO_MEMBER_SITE");
-    const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
-    member_site_cached = b;
-    return b;
-}
-
 /// Trace gates cached once: `getenvSlice` locks and probes a hashmap per consult, and the env never changes mid-run.
 var cv_trace_cached: ?bool = null;
 
@@ -147,31 +125,6 @@ pub fn cvTraceOn() bool {
 }
 
 var lr_trace_cached: ?bool = null;
-
-var gf_trace_init: bool = false;
-
-var gf_trace_val: ?[]const u8 = null;
-
-/// `KLIO_GF_TRACE`, cached once: the raw getenv is a full environ scan and this gate sits on every GetField.
-pub fn gfTraceWant() ?[]const u8 {
-    if (!gf_trace_init) {
-        gf_trace_val = runtime.envOnce("KLIO_GF_TRACE");
-        gf_trace_init = true;
-    }
-    return gf_trace_val;
-}
-
-var cm_trace_init: bool = false;
-
-var cm_trace_val: ?[]const u8 = null;
-
-pub fn cmTraceWant() ?[]const u8 {
-    if (!cm_trace_init) {
-        cm_trace_val = runtime.envOnce("KLIO_CM_TRACE");
-        cm_trace_init = true;
-    }
-    return cm_trace_val;
-}
 
 var chain_trace_init: bool = false;
 
@@ -229,20 +182,6 @@ var nu_trace_init: bool = false;
 
 var nu_trace_val: ?[]const u8 = null;
 
-pub fn nuTraceWant() ?[]const u8 {
-    if (!nu_trace_init) {
-        nu_trace_val = runtime.envOnce("KLIO_NU_TRACE");
-        nu_trace_init = true;
-    }
-    return nu_trace_val;
-}
-
-/// Host-to-driver flat-call handoff for ladders whose pick lives deep in host code: the exec arm arms the slot,
-/// the host terminal takes the arm (one-shot) and stashes a flat request, and the arm pushes the activation.
-pub fn armHostFlatReq() void {
-    ev_state.evtlsPtr().host_flat_armed = true;
-}
-
 pub fn takeHostFlatArm() bool {
     const a = ev_state.evtlsPtr().host_flat_armed;
     ev_state.evtlsPtr().host_flat_armed = false;
@@ -251,12 +190,6 @@ pub fn takeHostFlatArm() bool {
 
 pub fn stashHostFlatReq(req: FlatCallReq) void {
     ev_state.evtlsPtr().host_flat_req = req;
-}
-
-pub fn takeHostFlatReq() ?FlatCallReq {
-    const r = ev_state.evtlsPtr().host_flat_req;
-    ev_state.evtlsPtr().host_flat_req = null;
-    return r;
 }
 
 /// Stash a control-flow `EvalError` on the frame and signal `Step.raised`.

@@ -317,19 +317,6 @@ pub fn currentFrameFunc() ?*const ir.Func {
 
 pub const FusedMark = struct { func: *const ir.Func, mod: *const Module, head: ?*Frame, recv: ?Value, span: ?ir.Span = null };
 
-/// Type-parameter names the innermost frame's function declares; an `object`
-/// expression lowered at run time inherits them as its members' type variables.
-pub fn currentFrameTypeParams() []const []const u8 {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain) {
-        const mk = &fusedTls().marks[fusedTls().depth - 1];
-        const tps = mk.mod.registry.func_type_params.get(mk.func.id) orelse return &.{};
-        return tps.items;
-    }
-    const fr = evtlsPtr().frame_chain orelse return &.{};
-    const tps = fr.module.registry.func_type_params.get(fr.func.id) orelse return &.{};
-    return tps.items;
-}
-
 /// Bound on the per-thread register-buffer free list.
 const REGS_POOL_MAX: usize = 128;
 
@@ -338,61 +325,6 @@ const REGS_POOL_MAX: usize = 128;
 pub inline fn regsAlloc(fallback: Allocator) Allocator {
     if (!runtime.reclaimEnabled() and runtime.gc.gc_enabled) return std.heap.c_allocator;
     return fallback;
-}
-
-/// Whether every instruction of `f` is in the flattened engine's simple subset
-/// (moves, consts, arithmetic, branches, returns, exact calls), no catch/finally.
-pub fn classifyFlattenable(f: *const Func) u8 {
-    for (f.blocks) |*blk| {
-        if (blk.h().catches.len != 0 or blk.h().finally != null or blk.h().lr_absorb != null) return 2;
-        for (blk.insts) |*inst| {
-            switch (inst.*) {
-                .Move,
-                .Const,
-                .BinOp,
-                .UnOp,
-                .Not,
-                .Trace,
-                .LoadParam,
-                .LoadCapture,
-                .MakeCell,
-                .CellGet,
-                .CellSet,
-                .GetField,
-                .SetField,
-                .Index,
-                .IndexSet,
-                .CallValue,
-                .CallValueOrMember,
-                .CallMemberOrValue,
-                .CallMember,
-                .CallVirtual,
-                .CallMemberOrGlobal,
-                .NewInstance,
-                .NewList,
-                .Cast,
-                .InstanceOf,
-                .NotNullAssert,
-                .LateinitCheck,
-                .LoadGlobal,
-                .LoadFromThisOrGlobal,
-                .StoreToThisOrGlobal,
-                .StoreGlobal,
-                .Lambda,
-                .PropertyRef,
-                .MemberRef,
-                .QualifiedThis,
-                => {},
-                .Call => {},
-                else => return 2,
-            }
-        }
-        switch (blk.terminator) {
-            .Goto, .Branch, .Return => {},
-            else => return 2,
-        }
-    }
-    return 1;
 }
 
 pub var fill_census: [FRAME_CENSUS_SLOTS]u32 = @splat(0);
@@ -499,9 +431,6 @@ fn argsClassPooled(ev: *const EvalTls) bool {
     }
     return false;
 }
-
-/// Bound on the per-thread arg-carrier free list.
-const ARGS_POOL_MAX: usize = 64;
 
 /// One size class's buffers; a fixed array, since recycling must never allocate.
 const ArgsBucket = struct {

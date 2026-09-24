@@ -37,8 +37,6 @@ pub const TryFrame = struct {
     finally_entry: ?BlockId,
     /// Post-finally sentinel block; pop and pending return/rethrow key off this, not `finally_entry`.
     finally_done: ?BlockId,
-    /// Labeled-return absorption for a splice region (see `ir.LrAbsorb`).
-    lr_absorb: ?ir.LrAbsorb = null,
 };
 
 const PendingRethrow = struct { key: BlockId, exc: Value, depth: usize };
@@ -245,13 +243,6 @@ fn blockSuccessorLive(func: *const Func, block: *const ir.Block, reg: usize, liv
         .Goto => |bid| liveAt(live_in, n_regs, bid, reg, func.blocks.len),
         .Branch => |br| liveAt(live_in, n_regs, br.t, reg, func.blocks.len) or
             liveAt(live_in, n_regs, br.f, reg, func.blocks.len),
-        .Switch => |sw| blk: {
-            if (liveAt(live_in, n_regs, sw.default, reg, func.blocks.len)) break :blk true;
-            for (sw.arms) |arm| {
-                if (liveAt(live_in, n_regs, arm.target, reg, func.blocks.len)) break :blk true;
-            }
-            break :blk false;
-        },
         else => false,
     };
 }

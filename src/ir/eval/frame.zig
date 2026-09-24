@@ -36,7 +36,6 @@ const chainAcquire = ev_chain.chainAcquire;
 const chainAllocator = ev_chain.chainAllocator;
 const chainRelease = ev_chain.chainRelease;
 const chainTraceOn = ev_flow.chainTraceOn;
-const classifyFlattenable = ev_state.classifyFlattenable;
 const coerceGenericIntPeersToLong = ev_enter.coerceGenericIntPeersToLong;
 const coerceIntArgsToLong = ev_enter.coerceIntArgsToLong;
 const coercePlanFor = ev_enter.coercePlanFor;
@@ -165,12 +164,6 @@ pub const Frame = struct {
         if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
         if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
         dispatchBump(.frame_push);
-        if (ev_diag.dispatch_stats_state == 2) {
-            if (func.flat_class == 0) {
-                @constCast(func).flat_class = classifyFlattenable(func);
-            }
-            if (func.flat_class == 1) dispatchBump(.frame_push_flattenable);
-        }
         if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
             for (params.items, 0..) |*pv, pi| {
                 const payload: i64 = switch (pv.*) {

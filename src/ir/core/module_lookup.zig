@@ -74,45 +74,6 @@ pub fn ensureFuncBody(self: *const Module, func: *Func) bool {
     return func.blocks.len != 0;
 }
 
-/// Frees the caches only lowering reads: the extension resolution ring, the
-/// receiver verdicts and the supertype-name closures. A later lowering
-/// against this module rebuilds them on demand.
-pub fn dropLoweringCaches(self: *Module) void {
-    const cg = self.lookup_cache_gpa orelse return;
-    if (self.ext_resolve_cache) |c| {
-        c.arena.deinit();
-        cg.destroy(c);
-        self.ext_resolve_cache = null;
-    }
-    if (self.recv_verdict_cache) |c| {
-        c.clear(cg);
-        c.map.deinit(cg);
-        cg.destroy(c);
-        self.recv_verdict_cache = null;
-    }
-    self.registry.dropEvidenceSupers();
-}
-
-/// Fills every lookup cache a body lowering would otherwise fill on first
-/// use, so copies of the module made after this share them without writing.
-pub fn warmLookupCaches(self: *Module) Allocator.Error!void {
-    const gpa = self.lookup_cache_gpa orelse return;
-    try self.topUpUniqueSimpleCache();
-    try self.topUpClassNameCache(gpa);
-    try self.topUpClassFqnCache();
-    try self.topUpPkgHeads();
-    if (self.ext_names_by_recv_head == null or self.ext_index_decl_count != self.func_index.items.len) {
-        try self.rebuildExtIndex(gpa);
-    }
-}
-
-/// Whether `f` has a body: lowered already, or declared with one and not yet
-/// placed. Resolution asks this rather than `hasBody`, so a caller's answer
-/// does not depend on where its callee is declared.
-pub fn declaredWithBody(self: *const Module, id: FuncId, f: *const Func) bool {
-    return f.hasBody() or self.decl_ast_body.contains(id.int());
-}
-
 /// Look up a function by id. Eager build: direct table index. Lazy (loaded image, with
 /// `func_header_offsets`): decode the header on first touch, memoised in `func_cache`.
 pub fn funcById(self: *const Module, id: FuncId) ?*const Func {
@@ -159,19 +120,6 @@ pub fn appendedFuncCount(self: *const Module) usize {
     return self.funcs.items.len + self.late_funcs.items.len;
 }
 
-/// Append a lowered func at the id `nextFuncId` reported; its address stays stable.
-pub fn appendFunc(self: *Module, func: Func) Allocator.Error!void {
-    const a = self.func_name_index.allocator;
-    if (runtime.envOnce("KLIO_FUNC_TRACE") != null) std.debug.print("[append] id={d} next={d} fqn={s}\n", .{ func.id.int(), self.nextFuncId().int(), func.fqn });
-    if (self.funcs_live) {
-        const cell = try a.create(Func);
-        cell.* = func;
-        try self.late_funcs.append(a, cell);
-    } else {
-        try self.funcs.append(a, func);
-    }
-}
-
 /// The id the next appended func takes: first id past the lazy base range, plus appends so far.
 pub fn nextFuncId(self: *const Module) FuncId {
     return FuncId.from(@intCast(self.func_header_offsets.len + self.appendedFuncCount()));
@@ -198,26 +146,6 @@ pub fn registerMemberDecl(
 pub fn memberDecls(self: *const Module, owner_fqn: []const u8, name: []const u8) []const FuncId {
     const list = self.member_name_index.get(.{ .a = owner_fqn, .b = name }) orelse return &.{};
     return list.items;
-}
-
-pub const MemberDeclGroup = struct {
-    owner_fqn: []const u8,
-    name: []const u8,
-    fids: []const FuncId,
-};
-
-pub fn memberDeclGroups(self: *const Module, allocator: Allocator) Allocator.Error![]MemberDeclGroup {
-    const groups = try allocator.alloc(MemberDeclGroup, self.member_name_index.count());
-    var it = self.member_name_index.iterator();
-    var i: usize = 0;
-    while (it.next()) |entry| : (i += 1) {
-        groups[i] = .{
-            .owner_fqn = entry.key_ptr.a,
-            .name = entry.key_ptr.b,
-            .fids = entry.value_ptr.items,
-        };
-    }
-    return groups;
 }
 
 /// Functions addressable by id: eager table length, or the lazy offset-table length.
@@ -310,26 +238,6 @@ pub fn classId(self: *const Module, name: []const u8) ?ClassId {
     return null;
 }
 
-/// Resolve a simple classifier head only when it denotes one class identity module-wide.
-/// Whether several classes share this simple name, which is why
-/// `uniqueClassIdBySimpleName` declines. Distinct from "no class is called
-/// that": an ambiguous head is a head that lost its package on the way
-/// here, and the read it came from is bindable once it carries one.
-pub fn simpleNameIsAmbiguous(self: *const Module, name: []const u8) bool {
-    if (self.class_fqn_map != null and self.unique_simple_cache_n == self.classes.items.len) {
-        const info = self.unique_simple_cache.get(name) orelse return false;
-        return info.id == class_id_ambiguous;
-    }
-    var seen: usize = 0;
-    for (self.classes.items) |*c| {
-        if (std.mem.eql(u8, c.name, name)) {
-            seen += 1;
-            if (seen > 1) return true;
-        }
-    }
-    return false;
-}
-
 pub fn uniqueClassIdBySimpleName(self: *const Module, name: []const u8) ?ClassId {
 
     if (self.class_fqn_map != null) {
@@ -417,64 +325,6 @@ pub fn topUpClassNameCache(self: *Module, gpa: Allocator) Allocator.Error!void {
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(gpa, entry.id);
     }
-}
-
-/// Build the `class_id_map` overlay from `class_index`, first entry winning a duplicate
-/// simple name as the scan does. Idempotent; call once after finalize, before concurrency.
-pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void {
-    var m = runtime.NameHashMap(ClassId).init(allocator);
-    try m.ensureTotalCapacity(@intCast(self.class_index.items.len));
-    for (self.class_index.items) |entry| {
-        const gop = m.getOrPutAssumeCapacity(entry.name);
-        if (!gop.found_existing) gop.value_ptr.* = entry.id;
-    }
-    if (self.class_id_map) |*old| old.deinit();
-    self.class_id_map = m;
-
-    var fm = runtime.NameHashMap(ClassId).init(allocator);
-    try fm.ensureTotalCapacity(@intCast(self.classes.items.len));
-    for (self.classes.items) |c| {
-        const gop = fm.getOrPutAssumeCapacity(c.fqn);
-        gop.value_ptr.* = if (gop.found_existing) class_id_ambiguous else c.id;
-    }
-    if (self.class_fqn_map) |*old| old.deinit();
-    self.class_fqn_map = fm;
-
-    // Complete the simple-name cache while still single-threaded, so the finalized
-    // read paths consult it lock-free instead of scanning per dispatch.
-    if (self.lookup_cache_gpa == null) self.lookup_cache_gpa = allocator;
-    self.topUpUniqueSimpleCache() catch {
-        self.unique_simple_cache.clearRetainingCapacity();
-        self.unique_simple_cache_n = 0;
-    };
-
-    // The nesting tree: a class's parent is the class whose FQN is its own minus the last segment,
-    // keyed by that segment. Lifted `$` names alias in, so `Outer$Companion$Key` and `Key` agree.
-    var pm = std.AutoHashMap(ClassId, ClassId).init(allocator);
-    var cm = std.AutoHashMap(ClassId, runtime.NameHashMap(ClassId)).init(allocator);
-    for (self.classes.items) |c| {
-        const dot = std.mem.findScalarLast(u8, c.fqn, '.') orelse continue;
-        const parent_fqn = c.fqn[0..dot];
-        const seg = c.fqn[dot + 1 ..];
-        const pid = blk: {
-            const got = fm.get(parent_fqn) orelse break :blk null;
-            if (got.int() == class_id_ambiguous.int()) break :blk null;
-            break :blk got;
-        } orelse continue;
-        try pm.put(c.id, pid);
-        const gop = try cm.getOrPut(pid);
-        if (!gop.found_existing) gop.value_ptr.* = runtime.NameHashMap(ClassId).init(allocator);
-        const cg = try gop.value_ptr.getOrPut(seg);
-        if (!cg.found_existing) cg.value_ptr.* = c.id;
-    }
-    if (self.class_parent) |*old| old.deinit();
-    self.class_parent = pm;
-    if (self.class_children) |*old| {
-        var it = old.valueIterator();
-        while (it.next()) |v| v.deinit();
-        old.deinit();
-    }
-    self.class_children = cm;
 }
 
 /// Which conservatism made `extCouldApply` answer yes. Diagnostic only.
@@ -594,18 +444,6 @@ pub fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void
     self.ext_names_by_recv_head = idx;
     self.generic_ext_names = gen;
     self.ext_index_decl_count = self.func_index.items.len;
-}
-
-pub fn recordFuncDeclSpan(self: *Module, allocator: Allocator, decl_span: span.Span, id: FuncId) Allocator.Error!void {
-    if (self.func_by_decl_span == null) {
-        self.func_by_decl_span = std.AutoHashMap(span.Span, FuncId).init(allocator);
-    }
-    try self.func_by_decl_span.?.put(decl_span, id);
-}
-
-pub fn funcByDeclSpan(self: *const Module, decl_span: span.Span) ?FuncId {
-    const m = &(self.func_by_decl_span orelse return null);
-    return m.get(decl_span);
 }
 
 /// The DIRECT child class named `name` of `owner`, with no enclosing-chain walk.
@@ -782,62 +620,6 @@ pub fn funcId(self: *const Module, name: []const u8) ?FuncId {
     return first_user orelse first_body orelse first orelse first_lp;
 }
 
-/// `funcId`'s pick restricted to what a BARE call under `ctx_owner` can bind: a member extension
-/// out of that scope is no candidate, so an unrelated class's `with` cannot outrank `kotlin.with`.
-pub fn funcIdForBareCall(self: *const Module, name: []const u8, ctx_owner: ?[]const u8) ?FuncId {
-    const candidates = self.funcsBySimpleName(name);
-    var first: ?FuncId = null;
-    var first_user: ?FuncId = null;
-    var first_body: ?FuncId = null;
-    var first_lp: ?FuncId = null;
-    for (candidates) |id| {
-        if (self.memberExtOutOfScope(id, ctx_owner)) continue;
-        if (self.funcById(id)) |f| {
-            if (rankLowPriority(f)) {
-                if (first_lp == null) first_lp = id;
-                continue;
-            }
-        }
-        if (first == null) first = id;
-        if (self.funcById(id)) |f| {
-            if (first_body == null and f.hasBody()) first_body = id;
-            if (first_user != null) continue;
-            if (!isShippedPackage(f.package)) first_user = id;
-        }
-    }
-    return first_user orelse first_body orelse first orelse first_lp;
-}
-
-/// Overload pick for a call carrying a `*spread` argument. Kotlin binds a spread only to a `vararg`
-/// parameter, so fixed-arity overloads are not candidates; the rest order as `funcIdForBareCall`.
-pub fn funcIdForSpreadCall(self: *const Module, name: []const u8, ctx_owner: ?[]const u8) ?FuncId {
-    const candidates = self.funcsBySimpleName(name);
-    var first: ?FuncId = null;
-    var first_user: ?FuncId = null;
-    var first_body: ?FuncId = null;
-    var first_lp: ?FuncId = null;
-    for (candidates) |id| {
-        if (self.memberExtOutOfScope(id, ctx_owner)) continue;
-        const f = self.funcById(id) orelse continue;
-        var has_vararg = false;
-        for (f.params) |p| {
-            if (p.is_vararg) {
-                has_vararg = true;
-                break;
-            }
-        }
-        if (!has_vararg) continue;
-        if (rankLowPriority(f)) {
-            if (first_lp == null) first_lp = id;
-            continue;
-        }
-        if (first == null) first = id;
-        if (first_body == null and f.hasBody()) first_body = id;
-        if (first_user == null and !isShippedPackage(f.package)) first_user = id;
-    }
-    return first_user orelse first_body orelse first orelse first_lp;
-}
-
 /// Whether any top-level function with this simple name exists, with no order-based pick.
 pub fn hasFuncNamed(self: *const Module, name: []const u8) bool {
     return self.funcsBySimpleName(name).len != 0;
@@ -901,13 +683,6 @@ pub fn topUpPkgHeads(self: *Module) Allocator.Error!void {
 /// The declared package of source file `file`; a spliced inline body carries donor-file spans.
 pub fn packageOfFile(self: *const Module, file: FileId) ?[]const u8 {
     return self.registry.file_packages.get(file);
-}
-
-/// The segment path of the first non-wildcard import in `file` whose leaf is `name`.
-pub fn importAliasIn(self: *const Module, file: FileId, name: []const u8) ?[]const []const u8 {
-    const paths = self.importAliasPathsIn(file, name);
-    if (paths.len == 0) return null;
-    return paths[0].segs;
 }
 
 /// Every non-wildcard import in `file` binding leaf `name`, in declaration order. Kotlin keeps
@@ -1143,37 +918,6 @@ pub fn reserveClass(self: *Module, allocator: Allocator, name: []const u8, is_in
         .id = id,
         .name = name,
         .fqn = name,
-        .primary_params = &.{},
-        .methods = &.{},
-        .init_block = null,
-        .companion = null,
-        .supertypes = &.{},
-        .is_inner = is_inner,
-        .is_stub = true,
-    });
-    return id;
-}
-
-/// Reserve a class placeholder keyed by FULLY-QUALIFIED name plus package, so two same-simple-name
-/// classes across packages each get a stub; only an exact-FQN re-reservation dedups.
-pub fn reserveClassFqn(self: *Module, allocator: Allocator, name: []const u8, fqn: []const u8, pkg: []const u8, is_inner: bool) Allocator.Error!ClassId {
-    // Only scan on a simple-name collision; otherwise this is definitely a new class.
-    if (self.classIndexEntryByName(name) != null) {
-        for (self.class_index.items) |entry| {
-            if (!std.mem.eql(u8, entry.name, name)) continue;
-            if (std.mem.eql(u8, self.classes.items[entry.id.int()].fqn, fqn)) return entry.id;
-        }
-    }
-    const id = ClassId.from(@intCast(self.classes.items.len));
-    try self.class_index.append(allocator, .{ .name = name, .id = id });
-    if (runtime.envOnce("KLIO_CIDX_TRACE")) |w| {
-        if (std.mem.find(u8, name, w) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
-    }
-    try self.classes.append(allocator, .{
-        .id = id,
-        .name = name,
-        .fqn = fqn,
-        .package = pkg,
         .primary_params = &.{},
         .methods = &.{},
         .init_block = null,

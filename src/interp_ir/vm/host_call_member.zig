@@ -526,7 +526,6 @@ const firstSupertypeName = member_ref_super.firstSupertypeName;
 const receiverPropCanHoldCallable = member_ref_super.receiverPropCanHoldCallable;
 const classIsFunInterface = member_ref_super.classIsFunInterface;
 const classIsInterface = member_ref_super.classIsInterface;
-pub const anyMember = member_ref_super.anyMember;
 const qtTraceWant = member_ref_super.qtTraceWant;
 pub const qualifiedThis = member_ref_super.qualifiedThis;
 pub const serializerForClassTarget = member_ref_super.serializerForClassTarget;

@@ -26,7 +26,7 @@ const ClassId = ir.ClassId;
 const magic = "KLIOSEMB";
 
 /// Bumped with any change to the layout below.
-pub const version: u32 = 22;
+pub const version: u32 = 23;
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };

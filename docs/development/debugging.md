@@ -15,7 +15,7 @@ Four idioms cover almost every variable:
 - **Truthy flags**: non-empty and not `"0"` enables; `=0` or empty
   disables. Used where a default-on feature needs an off switch
   (`KLIO_SEMA_IMAGE=0`) and by a few gates
-  (`KLIO_OR_AUDIT`, `KLIO_TRACE_PATH`, `KLIO_TRACE_INVARIANTS`).
+  (`KLIO_TRACE_PATH`, `KLIO_TRACE_INVARIANTS`).
   The tables below say "`0`/empty off" for these.
 - **Name filters**: the value is a function/type name the trace is
   restricted to, matched exactly (`KLIO_MISS_TRACE=maxOf`) or as a
@@ -67,33 +67,12 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_SUBTYPE_TRACE` | `<substr>` | Instance-supertype search during overload scoring, for target types containing the substring | `[sub]` |
 | `KLIO_SHADOW_TRACE` | set | Whether an imported pack extension shadows a member call (probe plus each candidate) | `[shadow]` |
 | `KLIO_EXT_AUDIT` | `1` | Dual-compute audit for extension dispatch: the declaration a commit at lowering would name (`would`) beside the one the runtime's by-name walk serves (`ran`). Join them with `scripts/ext_audit_sweep.py` | `[KLIO_EXT_AUDIT]` |
-| `KLIO_SLOT_SERVE` | `0`; `audit` | `0` leaves the field-slot claim emitted and unserved, which tells a claim bug from a lowering one. `audit` computes the claim AND runs the discovery ladder, reports every disagreement, and serves the ladder's answer — the dual compute that proved the claim before it was trusted | `[slot-audit]` |
-| `KLIO_PROP_SLOT_SERVE` | `0`; `audit` | `0` leaves the property-slot read on the by-name ladder. `audit` serves the property table's answer AND runs the walk, reporting every read where they differ | `[prop-slot-audit]` |
-| `KLIO_PROP_SLOT_PROBE` | set | Per-build family and entry counts from the property-slot linker | `[prop-slot]` |
-| `KLIO_THIS_PROBE` | set | How many implicit-receiver reads and writes are in a function that pushes no enclosing receiver, so the chain they search is statically empty, and how many of those already name a target | `[this-probe]` |
-| `KLIO_SUBSCRIPT_AUDIT` | `1` | The builtin operation a member-call site was bound to, against the name it was bound from, on every subscript. Reports a LOST fast path rather than a wrong answer: a site bound `.none` falls back silently | `[subscript-audit]` |
-| `KLIO_SGETTER_SLOT` | `0` | Leaves a scope-qualified read (`$sgetter$<owner>\u{1f}<prop>`) to the runtime's per-execution name decode instead of binding it to the owner's property slot at link time | |
-| `KLIO_BUILTIN_PROBE` | set | How many member-call sites name a builtin operation, how many also carry a static receiver head, and how many of those heads are types no instance can wear | `[builtin-probe]`, `[builtin-link]` |
-| `KLIO_BUILTIN_AUDIT` | `1` | Reports every site the link pass marked proven that still reached the by-name walk. Caught `String.get` doing exactly that, since the fast path serves only an ASCII in-bounds index | `[builtin-proven-audit]` |
-| `KLIO_BUILTIN_PROVEN` | `0` | Leaves the proven bit clear on every site, so a census claim can be told from a serve | |
-| `KLIO_XORY_PROBE` | set | How many member-or-global sites could commit to their global leg: pushless, no receiver in scope declaring the name, no extension of the name, a resolved global target | `[xory-probe]`, `[xory-link]` |
-| `KLIO_XORY_AUDIT` | set | Reports every site marked global-only whose RECEIVER arm wins anyway. Found the inline-splice receiver that makes the whole claim unsound | `[xory-audit]` |
-| `KLIO_OPEN_SLOT` | `0` | Restores the blanket refusal of a field slot on an open, abstract or interface receiver. With it on, such a receiver claims unless a subclass declares the name | |
 | `KLIO_FUSE_HEAVY` | set | What makes a body heavy, which is what the fused entry declines when it may not materialize. Dispatch cases are split by whether the site names its target | `[fuse-heavy]` |
 | `KLIO_FUSE_CLASSIFY` | set | Why `fusedClassify` refused a body, split by condition. `classify` dominates the decline census and is memoized per function, so the decline count and the rejection count are different questions | `[fuse-classify]` |
 | `KLIO_FUSE_GATE` | set | Which conjunct of the fused tier's entry gate turns a call away — receiver, closure, chain seed, captures, native — against how many are offered | `[fuse-gate]` |
 | `KLIO_FUSE_MAX_BLOCKS` | count | Overrides the fused walker's block cap, so it can be priced rather than assumed. Raising it 64 to 4096 changed 5 406 frames to 5 407 | |
-| `KLIO_ISCHECK_SERVE` | `0`; `audit` | `0` leaves `is T` on the by-name walk even where the site names its class, so a wrong answer can be told from a wrong naming. `audit` answers by id AND walks, reporting every test where they differ — the dual compute that found the class graph was missing 111 classes' supertypes | `[ischeck-audit]` |
-| `KLIO_CAST_SERVE` | `0`; `audit` | The same for `as T`, which serves the POSITIVE only: a `false` or a module with no ancestor closure falls through to the walk, so the serve can never turn a passing cast into a raise. `audit` reports every cast the id served that the walk would refuse | `[cast-audit]` |
-| `KLIO_ISCHECK_PROBE` | set | Per-build counts from the type-test link pass: how many `is` and `as` sites bound a class, and how many sites name a builtin, a type parameter, or an ambiguous head | `[ischeck-link]`, `[ischeck]` |
-| `KLIO_GRAPH_PROBE` | set | How complete the class graph is: classes whose ancestor closure is only themselves and `Any`, split by whether the registry still remembers a supertype name for them — which tells a dropped forward reference from a genuine root | `[graph]` |
 | `KLIO_THIS_EXT` | `0` | Leaves bare `this` in an extension function body without a recorded class identity, so a wrong answer can be told from a wrong reading of one | |
-| `KLIO_GETTER_SERVE` | `0`; `audit` | `0` leaves the named accessor unused, so a wrong answer can be told from a wrong naming. `audit` runs the named accessor AND the by-name walk and reports every read where they answer differently — the dual compute that caught an ancestor's `get() = false` being served for a subclass's stored `isSrgb` | `[getter-audit]` |
-| `KLIO_GETTER_WHY` | set | Why the getter route found no accessor, split by guard. Its declines are not losses: they fall through to the property-slot table | `[getter-why]` |
-| `KLIO_GETTER_TRACE` | set | One line per read served by a named accessor: the receiver's runtime class, the property, and the `FuncId` | `[getter-serve]` |
-| `KLIO_GETTER_PROBE` | set | Per-build counts from the getter-route link pass: unresolved reads seen, how many carry a class, and how many bound a getter, an open-class slot, or a companion slot | `[getter-link]` |
 | `KLIO_DISPATCH_TRACE` | set | Runtime: a member-extension frame that had to derive its own dispatch receiver from the enclosing chain because no caller handed one over (`[dispatch-fallback] fn= found=`), and a contextual frame that had to derive a context parameter the same way (`[context-fallback] fn= idx= ty= found=`); a producer is missing at whichever call site reached it. Static: how a context argument resolved at a call site, the scope, the subjects and the receiver tower it saw (`[context-arg] want= ...` then `-> <reg>` or `-> null`), a `contextOf<T>()` with nothing of that type in scope (`[context-none] ty= fn=`), and the context types a lambda literal was given from its expected type (`[lambda-ctx]`) | `[dispatch-fallback]`, `[context-fallback]`, `[context-arg]`, `[context-none]`, `[lambda-ctx]` |
-| `KLIO_SUPER_WHY` | set | Static: why a `super` member access did not bind where it was emitted (`[super-step]`, `[super-why]`), what the link pass settled the rest into and which it left open (`[super-open]`, `[super-link]`) | `[super-why]`, `[super-step]`, `[super-open]`, `[super-link]` |
 | `KLIO_SLOT_TRACE` | set | Why a field read on the enclosing `this` did or did not claim a declared slot of its class's published layout: no owner, no class id, no layout (with the state), not a slot, or a capture | `[slot]` |
 | `KLIO_CGEN_REACH` | set | What `klio transpile --native <file.kt>` reaches from `main`: every function (program or base) with its instruction count, every native with its binding, the classes it constructs, the slots it dispatches, its statics and closures, and a count of each instruction kind. The backlog for widening the native backend | `[reach]` |
 | `KLIO_CGEN_DUMP` | `<substring>` | The resolved instructions of every function whose name or FQN contains the substring, as `klio transpile --native` sees them | (none) |
@@ -126,7 +105,6 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_RMC_TRACE` | `<name>` | Per-candidate member-args-compatibility verdict during member resolution | `[rmc]` |
 | `KLIO_SCORE_TRACE` | set | The applicability scorer's per-argument refusals: parameter vs argument type at each null score | `[score-null]` |
 | `KLIO_SMAC_TRACE` | `<fn name>` | Static member-args compatibility: entry state and each argument's instantiated-parameter verdict with route | `[smac]`, `[smac-arg]` |
-| `KLIO_TLP_TRACE` | `<prop name>` | The tiered top-level property type-head lookup: each declaration's package, tier, and head | `[tlp]` |
 
 The `0`-to-disable rows above exist so one binary can be compared against
 itself: `scripts/examples-ab.sh KLIO_SOME_GATE` runs the examples corpus both
@@ -144,7 +122,6 @@ comparison into a three-hour one.
 | `KLIO_TRACE_CHAIN` | set | Adds the enclosing-`this` chain to each traced dispatch (with `KLIO_TRACE_RESOLVE`) | `[RESOLVE]   chain=` |
 | `KLIO_TRACE_PATH` | set; `0`/empty off | One structured record per terminal dispatch site (proves single-path dispatch; see `scripts/assert_single_path.py`) | `[PATH]` |
 | `KLIO_TRACE_INVARIANTS` | set; `0`/empty off | Detect-only dispatch invariant checks, one machine-readable line per violation | `[INVARIANT]` |
-| `KLIO_UNRESOLVED_TRACE` | set | The unresolved bare name, function, and span just before an `Unbound` error | `[unresolved]` |
 | `KLIO_INIT_DEBUG` | set | `object`/companion initializer first-failure and the cause take/swallow/restash steps | `[init-debug]` |
 | `KLIO_BARRIER_TRACE` | set | The type-safe collection bridge (erased-bound check on generic members called through an erased signature): each refusal reason | `[barrier]` |
 | `KLIO_CFN_TRACE` | `<substr of a fn name>` | Named-argument call binding: the declared parameter list vs the supplied names, on both the named and the typed entry | `[cfn]`, `[cft]` |
@@ -180,7 +157,6 @@ sweep scripts grep.
 |----------|--------|--------------------|------------|
 | `KLIO_EAGER_AUDIT` | set | Eager-pipeline bookkeeping (skip reasons, record counts) and eager-vs-lazy pick disagreements | `[EAGER]`, `[EAGER-AUDIT]` |
 | `KLIO_EAGER_HITS` | set | Per-call eager record/probe/hit/miss logging (high volume) | `[EAGER-REC]`, `[REC-MSC]`, `[EAGER-PROBE]`, `[EAGER-HIT]`, `[EAGER-MISS2]` |
-| `KLIO_OR_AUDIT` | set; `0`/empty off | Member-vs-global audit: each `*OrGlobal` emission decision and the runtime arm that actually bound (`scripts/or_audit_sweep.py` asserts the lenient-arm residue); a `QualifiedThis` the structural lookup could not place prints its producer as `site=` (`labeled_this`, `super_labeled`, `member_ref_enclosing_decl`, `member_ref_owner_behind_ext`, `member_ref_ext_target`, `inner_ctor_outer`, `local_class_dispatch_owner`) | `[KLIO_OR_AUDIT]` |
 | `KLIO_LINK_AUDIT` | set (any value enables) | Re-derives what the deleted per-call dispatch ladder would have chosen and logs any disagreement with the link-settled tables | `[KLIO_LINK_AUDIT]` |
 
 `scripts/commontest-sweep.py` accepts `--eager` for compatibility and
@@ -250,20 +226,7 @@ engine runtime are the only compose path; the lowering always runs.
 | `KLIO_COMPOSER_BIND_TRACE` | set | Each call that threads the `$composer, $changed` pair: the owning declaration and the composer's class (a non-Composer instance in the pair slot also dumps the frame chain) | `[composer-bind-fn]`, `[composer-bind]` |
 | `KLIO_RSS_LOG` | set | Prints process RSS on each rendered Compose UI frame | `[rss]` |
 | `KLIO_CTOR_TRACE` | set | Every secondary-constructor side-table lookup: the key, how many entries it found, and each entry's parameter/default counts. The table that decides whether a defaulted secondary constructor can take a call | `[ctor]` |
-| `KLIO_CTOR_PICK` | `0` disables | The link pass that names the constructor each construction site reaches. Off leaves every construction on the runtime's value scoring | — |
 | `KLIO_CTOR_PICK_SERVE` | `0` disables | Whether a construction takes the constructor its site named. Off with the pass still on measures the pass without serving it | — |
-| `KLIO_CTOR_PICK_PROBE` | set | One line per link pass: how many sites had one constructor to reach, how many the pass named, and how many it left open | `[ctor-pick-link]` |
-| `KLIO_CTOR_PICK_WHY` | class simple name, or `*` | Every constructor slot of that class as a pick reads it: required/total, vararg, low-priority, whether it accepts the call's count | `[ctor-why]` |
-| `KLIO_GLOBAL_ID` | `0` disables | The link pass that binds the class a bare global read names when the name uniquely names an `object` | — |
-| `KLIO_GLOBAL_ID_PROBE` | set | One line per link pass: how many global reads were bound, and the unbound ones split by why | `[global-id-link]` |
-| `KLIO_REGCLASS` | `0` disables | The link pass that records, on a field read the receiver deriver left classless, the class the receiver REGISTER's own definitions name | — |
-| `KLIO_REGCLASS_PROBE` | set | How many classless field reads the register pass filled, and how many field reads and member calls would still gain a class | `[regclass-link]`, `[regclass]` |
-| `KLIO_REGCLASS_PARAM` | set | For a classless read whose receiver is a parameter, the parameter's declared type and the field name: which heads the register pass cannot turn into a class | `[regclass-param]` |
-| `KLIO_BUILTIN_FIELD` | `0` disables | The link pass that proves a builtin property (`size` on an array, `length` on a String) against the receiver's static head, so the read is served from the tag with no name compare | `[builtin-field]` |
-| `KLIO_XORY_SERVE` | `0` disables | Whether a member-or-global site the link pass proved global-only takes its named target directly instead of walking the receivers | — |
-| `KLIO_XORY_WHY` | callee name, or `*` | Each site the claim is made at: the name, the function holding it, its owner class and that class's method count | `[xory-why]` |
-| `KLIO_CONST_GLOBAL` | `0` disables | The link pass that replaces a bare read of a `const val` with the constant itself | — |
-| `KLIO_CONST_GLOBAL_PROBE` | set | How many `const val` reads the pass inlined | `[const-global]` |
 | `KLIO_TC_OWN_MEMBER` | `0` disables | The checker resolving a bare name against an enclosing class's members before giving up on it | — |
 | `KLIO_CALL_UNRES` | set | Which exit of the call checker returns an unnameable type, by source line, plus the callee shape at its last exit | `[CALL-UNRES]`, `[CALL-TAIL]` |
 | `KLIO_CALL_UNRES_NAMES` | set | With the above: the callee name at each last-exit give-up | `[CALL-TAIL]` |
@@ -274,7 +237,6 @@ engine runtime are the only compose path; the lowering always runs.
 | `KLIO_INFER_TRACE` | set | Each receiver constraint and solved variable of a generic call's inference session | `[infer]` |
 | `KLIO_EXTERN_TRACE` | `<Class>` | The class info the checker imports from the image for that class: type parameters, typed supertypes, member types | `[extern-class]` |
 | `KLIO_FILE_IDS` | set | Every file id the front end assigns with its path, so a `f<id>:<start>-<end>` span in any trace can be read | `[file]` |
-| `KLIO_FUNC_TRACE` | set | Every function table append and every body placed into a reserved header slot, with the old and new names | `[append]`, `[install]`, `[place]`, `[place-top]`, `[place-acc]` |
 | `KLIO_RUN_STATS` | set | One line when the program's `main` returns: the boot/exec time split, RSS at `main` and at exit, RSS + mapped bytes after a forced final collection, and the live cell count that collection kept. Works the same for `klio run`, a bundle, and a transpiled binary, so the three are comparable | `[run-stats]` |
 
 ## Compose UI and Skia
@@ -300,11 +262,6 @@ variables override individual fields on top of it.
 |----------|--------|--------------------|------------|
 | `KLIO_OPT` | `fast`/`safe`/`off` (aliases: `full`, `on`, `balanced`, `none`, `interp`) | Selects the performance profile, which picks the memory backend: `fast` and `safe` the tracing collector, `off` an arena | none |
 | `KLIO_FLAT` | `0` off (default on) | The flat call driver; `0` falls back to native recursion for every call (bisect) | none |
-| `KLIO_FLAT_VCALL` | `0` off (default on) | The fused virtual flat path; `0` keeps slot-bound and lowering-resolved member calls on the recursive invoker (bisect) | none |
-| `KLIO_MEMBER_SITE` | `0` off (default on) | The `CallMember` instruction-site memo — the by-name replay path; `0` disables for bisection | none |
-| `KLIO_NATIVE_TRACE` | set | In a transpiled binary (`klio transpile` + libklio_rt): one line per native activation with its entry block and outcome, plus a miss line for user-package functions with no (or an fqn-guarded) native table entry — the engagement oracle: output parity alone cannot distinguish native execution from silent fallback to interpretation | `[native]`, `[native-miss]` |
-| `KLIO_CM_TRACE` | `<member name>` | At every CallMember execution of that name: the executing frame, whether lowering resolved it, and the full enclosing-`this` chain with entry kinds — the receiver-visibility debugger for member-extension dispatch | `[cmarm]` |
-| `KLIO_GF_TRACE` | `<substr of a field name>` | Every GetField execution whose field name matches: field, receiver class, executing frame — pairs with `KLIO_CM_TRACE` to separate a wrong read from a wrong dispatch | `[gfarm]` |
 | `KLIO_RSEL_TRACE` | set | Every compatibility receiver re-selection at a receiver-lambda invoke: the recorded head, the passed receiver, and what was selected | `[rsel]` |
 | `KLIO_RECLAIM` | `gc`, `arena`, `smp`/`free`/`1`, `debug`, `0` | Memory backend override (and whether refcount teardown is active); the profile default is the tracing GC | none |
 | `KLIO_PROF` | set; value = sampling interval in microseconds (default 1000, floor 100) | Statistical SIGPROF profiler on Linux and macOS; prints a by-function sample histogram to stderr at the end of the run. On macOS the in-process symbolizer resolves nothing: dump raw addresses with `KLIO_PROF_RAW` and fold them with `scripts/prof_symbolize.py`. The timer is per process, so a phase on ten threads is undercounted; the shares within a phase still hold | `[prof]` |

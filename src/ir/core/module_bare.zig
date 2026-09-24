@@ -121,31 +121,6 @@ pub fn bareCallCandidates(
     return out.toOwnedSlice(allocator);
 }
 
-pub fn hasBareCallCandidate(
-    self: *const Module,
-    name: []const u8,
-    caller_file: FileId,
-) bool {
-    var candidate_it = self.bareCallCandidateIterator(name, caller_file);
-    return candidate_it.next() != null;
-}
-
-/// Whether any bare-call candidate for `name` is a PLAIN function rather than an extension: an
-/// extension namesake must not talk a caller out of the enclosing class's own member.
-pub fn hasNonExtensionBareCallCandidate(
-    self: *const Module,
-    name: []const u8,
-    caller_file: FileId,
-) bool {
-    var candidate_it = self.bareCallCandidateIterator(name, caller_file);
-    while (candidate_it.next()) |cand| {
-        const f = self.funcById(cand) orelse continue;
-        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
-        if (!is_ext) return true;
-    }
-    return false;
-}
-
 /// Whether file `file` declares `import <pkg>.*`; a wildcard import is file-scoped like a named one.
 pub fn importWildcardIn(self: *const Module, file: FileId, pkg: []const u8) bool {
     if (pkg.len == 0) return false;

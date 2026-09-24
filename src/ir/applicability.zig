@@ -261,11 +261,6 @@ pub fn paramNameMatchesArg(param_name: []const u8, arg_name: []const u8) bool {
         std.mem.endsWith(u8, param_name, composable_arg_suffix);
 }
 
-/// Compose's generated markers: their absence must not disqualify a candidate.
-pub fn isGeneratedComposeArg(name: []const u8) bool {
-    return std.mem.eql(u8, name, "$composer") or std.mem.eql(u8, name, "$changed");
-}
-
 fn allAsciiUpper(s: []const u8) bool {
     for (s) |c| {
         if (!std.ascii.isUpper(c)) return false;
@@ -680,11 +675,6 @@ pub threadlocal var trace_call_span: ?ir.Span = null;
 
 /// Source name of the call being scored; names stay stable across rebuilds.
 pub threadlocal var trace_call_name: ?[]const u8 = null;
-
-/// Whether any `[extkey]` tracing is on, so callers can skip keeping the span.
-pub fn extKeyTraceEnabled() bool {
-    return envOnce("KLIO_EXTKEY_TRACE") != null;
-}
 
 /// `KLIO_EXTKEY_TRACE=<name|fid>[,...]` gate: a numeric token selects one
 /// candidate by `FuncId`, anything else every candidate of that call name.
@@ -1643,7 +1633,6 @@ test "applicable: bodyless candidate is never selectable" {
     try testing.expect(applicable(&sig, &args, .{}) == null);
 }
 
-
 test "applicable member: receiver slot skipped, base 0 (no under-application -1), exact_arity" {
     const p = [_]Param{
         .{ .name = "this", .ty = tref("Box"), .default = null },
@@ -1770,7 +1759,6 @@ test "applicable member vs global: instance subtype tier formula differs" {
     try testing.expectEqual(@as(i32, 72), applicable(&sig, &args, mscope).?.points); // 75 - min(3,20)
 }
 
-
 test "applicable extension: ext_key mirrors ExtKey tuple" {
     const p = [_]Param{
         .{ .name = "this", .ty = tref("Animal"), .default = null },
@@ -1842,7 +1830,6 @@ test "applicable extension: trailing lambda binds to the last function-typed par
     const bad_sc = applicable(&bad_sig, &args, scope).?;
     try testing.expectEqual(@as(i32, 0), bad_sc.ext_key.?[0]);
 }
-
 
 test "applicable named: reordered named args bind by name and record the binding" {
     const p = [_]Param{
@@ -2055,7 +2042,6 @@ test "applicable named: defaulted trailing param stays fillable for named Int ar
     };
     try testing.expect(applicable(&.{ .params = &factory }, &args, .{ .named = true }) != null);
 }
-
 
 test "applicable: unbindable trailing-lambda reading falls through to the positional fill" {
     // The gap param is not defaulted, so the positional fill must bind both.

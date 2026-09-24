@@ -26,7 +26,7 @@ const FuncId = ir.FuncId;
 
 /// Bump on any change to the encoded layout or to the types it reaches. A
 /// mismatch refuses the load and the caller rebakes.
-pub const FORMAT_VERSION: u32 = 91;
+pub const FORMAT_VERSION: u32 = 92;
 
 // Watched AST node types: pointed at from the IR.
 
@@ -616,28 +616,6 @@ test "codec preserves explicit receiver-lambda shape" {
     try testing.expect(got.lambda_receiver_shape_known);
     try testing.expect(got.lambda_has_receiver);
     try testing.expectEqualStrings("String", got.x().lambda_receiver_ty.?);
-}
-
-test "codec preserves both receivers of an exact member extension call" {
-    const a = testing.allocator;
-    const extra = ir.CallMemberExtra{ .resolved = ir.FuncId.from(5), .dispatch_receiver = ir.Reg.from(6) };
-    const inst = ir.Inst{ .CallMember = .{
-        .dst = ir.Reg.from(1),
-        .receiver = ir.Reg.from(2),
-        .name = ir.ConstId.from(3),
-        .args = ir.Reg.from(4),
-        .n_args = 0,
-        .extra = &extra,
-    } };
-    const bytes = try encodeOne(ir.Inst, a, &inst);
-    defer a.free(bytes);
-    const got = try decodeOne(ir.Inst, a, bytes);
-    try testing.expect(got == .CallMember);
-    // The decode boxed the extra facts; the test owns that box.
-    defer if (got.CallMember.extra) |e| a.destroy(e);
-    try testing.expectEqual(ir.Reg.from(2), got.CallMember.receiver);
-    try testing.expectEqual(ir.FuncId.from(5), got.CallMember.x().resolved.?);
-    try testing.expectEqual(ir.Reg.from(6), got.CallMember.x().dispatch_receiver.?);
 }
 
 test "codec resolves watched AST pointers to the decoded tree" {

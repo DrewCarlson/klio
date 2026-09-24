@@ -345,43 +345,6 @@ pub fn classIsInterface(self: *VmHost, class_name: []const u8) bool {
     return dg.get().is_interface;
 }
 
-/// `Any`'s implementation for a `super` call the site already proved bottoms
-/// out there. The same three answers the walk reaches after exhausting the
-/// supertype list, without the list.
-/// `Any`'s member a super call names on an instance whose supertypes declare
-/// none of their own: `toString`, `hashCode` or `equals`, run on the receiver
-/// without dispatch.
-pub fn anyMember(
-    self: *VmHost,
-    allocator: Allocator,
-    receiver: *const Value,
-    which: ir.BuiltinMember,
-    args: []const Value,
-) Allocator.Error!?Value {
-    if (receiver.* != .Instance) return null;
-    const inst = receiver.Instance;
-    switch (which) {
-        .any_to_string => {
-            if (args.len != 0) return null;
-            return try inheritedInstanceToString(allocator, inst, instanceIsThrowable(self, allocator, inst));
-        },
-        .any_hash_code => {
-            if (args.len != 0) return null;
-            const ig = inst.borrow();
-            defer ig.deinit();
-            return Value.newInt(@bitCast(ig.get().identity));
-        },
-        .any_equals => {
-            if (args.len != 1) return null;
-            return .{ .Bool = switch (args[0]) {
-                .Instance => |o| ObjRef(InstanceData).ptrEq(inst, o),
-                else => false,
-            } };
-        },
-        else => return null,
-    }
-}
-
 
 pub var qt_trace_init: bool = false;
 pub var qt_trace_val: ?[]const u8 = null;

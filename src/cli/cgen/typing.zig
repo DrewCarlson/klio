@@ -221,7 +221,7 @@ fn step(ctx: Ctx, kinds: []Kind, cls: []Cls, inst: *const ir.Inst) Allocator.Err
             const t = kindOf(kinds, x.src) orelse return false;
             return define(kinds, cls, x.dst, T.ty(t), clsOf(cls, x.src));
         },
-        inline .LoadCapture, .LoadDispatchThis, .LoadOuterThis, .LoadContextParam, .MakeCell, .CellGet => |x| return define(kinds, cls, x.dst, T.ty(.object), .many),
+        inline .LoadCapture, .MakeCell, .CellGet => |x| return define(kinds, cls, x.dst, T.ty(.object), .many),
         .GetFieldSlot => |x| {
             const t: Ty = switch (clsOf(cls, x.obj)) {
                 .known => |c| sigs.fieldTy(c, x.slot),

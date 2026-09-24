@@ -190,7 +190,7 @@ pub fn runFlatLoop(
             }
             if (!resolved_mod and leafReqServable(site.req)) {
                 // A leaf-expression callee needs no activation: serve it straight into the caller's register.
-                if (try leafExprServe(H, allocator, callee_mod, site.req.func, site.req.args.items, host)) |lr| {
+                if (try leafExprServe(H, allocator, callee_mod, site.req.func, site.req.args.items)) |lr| {
                     const dst = site.req.dst;
                     discardFlatReq(H, allocator, site.req, host);
                     try f.write(dst, lr.ok);

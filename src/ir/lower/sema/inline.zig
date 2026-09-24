@@ -313,10 +313,6 @@ fn simulate(a: Allocator, f: *const ir.Func) Error![]const []const Frame {
                 try seed(a, incoming, &work, x.t, out.items);
                 try seed(a, incoming, &work, x.f, out.items);
             },
-            .Switch => |x| {
-                for (x.arms) |arm| try seed(a, incoming, &work, arm.target, out.items);
-                try seed(a, incoming, &work, x.default, out.items);
-            },
             else => {},
         }
     }
@@ -600,10 +596,6 @@ fn replayRegion(b: *Builder, inst: *const Instance, fr: Frame) Error!void {
         switch (blk.terminator) {
             .Goto => |t| try succ.append(a, t),
             .Branch => |x| try succ.appendSlice(a, &.{ x.t, x.f }),
-            .Switch => |x| {
-                for (x.arms) |arm| try succ.append(a, arm.target);
-                try succ.append(a, x.default);
-            },
             else => {},
         }
         const h = blk.h();
@@ -640,7 +632,6 @@ fn mapInst(b: *Builder, inst: *const Instance, tg: Target, x: Inst) Error!Inst {
 
 fn mapTerminator(b: *Builder, inst: *const Instance, tg: Target, t: Terminator) Error!Terminator {
     return switch (t) {
-        .TailJump, .TailCallFunc, .NonLocalReturn, .LabeledReturn => b.fail(b.cur_span, "an inline function's body ends in `{s}`", .{@tagName(t)}),
         inline else => |payload, tag| @unionInit(Terminator, @tagName(tag), try mapValue(@TypeOf(payload), b, inst, tg, payload)),
     };
 }

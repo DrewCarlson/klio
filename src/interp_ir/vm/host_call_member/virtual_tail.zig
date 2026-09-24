@@ -647,23 +647,6 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
             }
         }
     }
-    // Scalar-replay leaf on the resolved member: the receiver rides as param 0,
-    // opaque when non-scalar; a bail falls through to the ordinary invoke.
-    leaf: {
-        if (receiver.* == .Null) break :leaf;
-        const mg2 = self.module.borrow();
-        defer mg2.deinit();
-        const m2 = mg2.get();
-        const lf = m2.funcById(fid) orelse break :leaf;
-        if (args_in.len + 1 > 8) break :leaf;
-        var all: [8]Value = undefined;
-        all[0] = receiver.*;
-        for (args_in, 0..) |a, i| all[i + 1] = a;
-        if (try ir.eval.tryLeafValues(VmHost, allocator, m2, lf, all[0 .. args_in.len + 1], self, null)) |lo| switch (lo) {
-            .val => |v| return .{ .ok = v },
-            .raise => |e| return .{ .err = e },
-        };
-    }
     ir.eval.dispatchNote(.served_user_body);
     runtime.prof.opRoute(4);
     const mg = self.module.borrow();
@@ -696,13 +679,6 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
         defer if (runtime.freeScratch()) allocator.free(all);
         return try hcm.dispatchIntrinsic(self, allocator, f.fqn, intrinsic, all);
     }
-    // Frameless serve for the canonical getter shape on a claimed class.
-    // Uses the module-owned func pointer so the shape/route memo persists.
-    if (args_in.len == 0) {
-        if (mod.funcById(fid)) |fp| {
-            if (vmhost.host_fields.accessorFastGet(self, mod, fp, receiver)) |r| return r;
-        }
-    }
     // The wider leaf shape: a body of argument and field reads combined with
     // primitive operators runs without a frame.
     if (mod.funcById(fid)) |fp| {
@@ -715,12 +691,12 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
                 var argbuf: [8]Value = undefined;
                 argbuf[0] = receiver.*;
                 for (args_in, 0..) |a, i| argbuf[i + 1] = a;
-                if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
+                if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1])) |r| return r;
             } else {
                 var argbuf: [ir.LEAF_MAX_REGS]Value = undefined;
                 argbuf[0] = receiver.*;
                 for (args_in, 0..) |a, i| argbuf[i + 1] = a;
-                if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
+                if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1])) |r| return r;
             }
         }
     }

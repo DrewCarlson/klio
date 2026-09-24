@@ -29,7 +29,6 @@ const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
 const ev_inst = @import("inst.zig");
 const ev_loop = @import("loop.zig");
-const ev_native = @import("native.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 const ev_values = @import("values.zig");
@@ -39,10 +38,6 @@ const EvalResult = ev_flow.EvalResult;
 const EvalTls = ev_state.EvalTls;
 const FlatCallSite = ev_flow.FlatCallSite;
 const Frame = ev_frame.Frame;
-const NATIVE_RECURSE_MAX_DEPTH = ev_native.NATIVE_RECURSE_MAX_DEPTH;
-const NativeCtx = ev_native.NativeCtx;
-const NativeFn = ev_native.NativeFn;
-const NativeGlue = ev_native.NativeGlue;
 const ParkPoint = ev_flow.ParkPoint;
 const PendingFinallyState = ev_snapshot.PendingFinallyState;
 const RegMask = ev_frame.RegMask;
@@ -51,7 +46,6 @@ const TryFrame = ev_snapshot.TryFrame;
 const attachStackTrace = ev_diag.attachStackTrace;
 const cmgTraceWant = ev_flow.cmgTraceWant;
 const coerceIntArgsToLong = ev_enter.coerceIntArgsToLong;
-const constMatches = ev_values.constMatches;
 const constToValue = ev_values.constToValue;
 const currentFrameFunc = ev_state.currentFrameFunc;
 const displayThrow = ev_state.displayThrow;
@@ -63,9 +57,6 @@ const errResult = ev_flow.errResult;
 const execArmBinOp = ev_inst.execArmBinOp;
 const execInst = ev_inst.execInst;
 const lrTraceOn = ev_flow.lrTraceOn;
-const nativeFor = ev_native.nativeFor;
-const nativeModuleOk = ev_native.nativeModuleOk;
-const nearestFinally = ev_enter.nearestFinally;
 const nowMonotonicMs = ev_diag.nowMonotonicMs;
 const ok = ev_flow.ok;
 const regsAlloc = ev_state.regsAlloc;
@@ -133,16 +124,9 @@ pub fn runFrameExec(
         }
         return errResult(.{ .Type = "virtual method target is not executable" });
     }
-    dumpFnIfRequested(frame.module, func);
+    dumpFnIfRequested(func);
     // The bytecode tier's per-func stream table, one lookup per activation.
     const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, true, module.consts.items) else null;
-    // The C transpiler's native table; empty in every non-transpiled process.
-    const native_fn: ?NativeFn = if (nativeModuleOk(module)) nativeFor(func.id.int(), func.fqn) else null;
-    if (native_fn == null and ev_native.native_any.load(.acquire) and
-        func.package.len == 0 and runtime.envOnce("KLIO_NATIVE_TRACE") != null)
-    {
-        std.debug.print("[native-miss] fn={s} fid={d}\n", .{ func.fqn, func.id.int() });
-    }
     while (true) {
         // Daemon abandonment: a pool task at the run boundary stops at its next block, bypassing user catch/finally.
         if (runtime.shouldAbandon()) {
@@ -186,14 +170,13 @@ pub fn runFrameExec(
         const finally = block.h().finally;
         const finally_done = block.h().finally_done;
         const has_catches = block.h().catches.len != 0;
-        if (resume_idx == 0 and (has_catches or finally != null or block.h().lr_absorb != null)) {
+        if (resume_idx == 0 and (has_catches or finally != null)) {
             try try_stack.append(allocator, .{
                 .body = cur,
                 .chain_len = frame.enclosing_this.items.len,
                 .catches = block.h().catches,
                 .finally_entry = finally,
                 .finally_done = finally_done,
-                .lr_absorb = block.h().lr_absorb,
             });
         }
         var thrown: ?Value = null;
@@ -221,50 +204,7 @@ pub fn runFrameExec(
         // non-simple op escapes to `execInst`, and control flow funnels through the same
         // `afterStep` the walker uses. Fresh block entries only: a mid-block or throw-carrying
         // resume goes through the stream's idx_pc machinery, whose coordinates the walker shares.
-        var native_ran = false;
-        if (native_fn) |nf| native_run: {
-            if (thrown != null or unwound != null) break :native_run;
-            if (start_idx != 0) break :native_run;
-            if (frame.regs.items.len < func.n_locals) break :native_run;
-            // The emitted C reads and writes raw register bytes with no mask maintenance.
-            frame.materializeRegs();
-            // Every native level stacks kf, glue and serve frames for any call form. Past this
-            // depth a deep chain runs the stream instead, so the C stack stays bounded.
-            if (ev_state.evtlsPtr().eval_depth > NATIVE_RECURSE_MAX_DEPTH) break :native_run;
-            var nctx: NativeCtx = .{
-                .frame = frame,
-                .allocator = allocator,
-                .ftls = ftls,
-                .host = @ptrCast(host),
-                .flat_out = flat_out,
-                .park_out = park_out,
-                .thrown = &thrown,
-                .unwound = &unwound,
-                .ret_v = &ret_v,
-                .arm_bin = &NativeGlue(H).armBin,
-                .escape = &NativeGlue(H).escape,
-                .call = &NativeGlue(H).call,
-                .field_route = &NativeGlue(H).fieldRoute,
-                .field_write_route = &NativeGlue(H).fieldWriteRoute,
-            };
-            nf(@ptrCast(&nctx), cur.int());
-            if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
-                std.debug.print("[native] fn={s} entry=b{d} outcome={s}\n", .{
-                    func.fqn, cur.int(), @tagName(nctx.outcome),
-                });
-            }
-            switch (nctx.outcome) {
-                .none => break :native_run,
-                .term => bc_term = @enumFromInt(nctx.out_block),
-                .goto => bc_goto = @enumFromInt(nctx.out_block),
-                .brk => cur = @enumFromInt(nctx.out_block),
-                .ret => return ret_v,
-                .oom => return error.OutOfMemory,
-            }
-            ran_bc = true;
-            native_ran = true;
-        }
-        if (!native_ran and bc_streams != null) bc_run: {
+        if (bc_streams != null) bc_run: {
             const bs = bc_streams.?;
             // A resume carrying a throw/unwind skips the instruction surface entirely: an EMPTY
             // block's `start_idx` is 0 too, and a fused terminator op must not run first.
@@ -362,37 +302,6 @@ pub fn runFrameExec(
                         const r = try execInst(H, allocator, frame, inst, host);
                         switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
                             .cont => pc += 5,
-                            .brk => break :bc_loop,
-                            .ret => return ret_v,
-                        }
-                    },
-                    .gf_site => {
-                        idx = code[pc + 1];
-                        const inst = &binsts[idx];
-                        // The claimed-slot serve bypasses `execInst`, where the
-                        // ratchet's gate lives, so this op reports the site
-                        // itself and, in raise mode, defers to the frame arm.
-                        const gated = ev_diag.ratchetArmed() and ev_diag.unresolvedTierGate(
-                            frame.module,
-                            inst,
-                            frame.func.fqn,
-                            frame.read(inst.GetField.receiver).typeFqn(),
-                        );
-                        if (!gated and ev_inst.gfSiteFast(
-                            H,
-                            host,
-                            frame,
-                            &inst.GetField,
-                            @enumFromInt(code[pc + 2]),
-                            @enumFromInt(code[pc + 3]),
-                            allocator,
-                        )) {
-                            pc += 4;
-                            continue :bc_loop;
-                        }
-                        const r = try execInst(H, allocator, frame, inst, host);
-                        switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                            .cont => pc += 4,
                             .brk => break :bc_loop,
                             .ret => return ret_v,
                         }
@@ -524,18 +433,10 @@ pub fn runFrameExec(
         }
         if (unwound) |e| {
             // Mid-block non-local return: route through the armed finally blocks only, never a
-            // catch. A splice region's absorption ends it at the region's join.
+            // catch.
             frame.pending_finally.release(allocator);
             var routed = false;
             while (try_stack.pop()) |tf| {
-                if (e == .LabeledReturn) if (tf.lr_absorb) |ab| {
-                    if (std.mem.eql(u8, ab.label, e.LabeledReturn.label)) {
-                        try frame.write(ab.value_reg, e.LabeledReturn.value);
-                        cur = ab.handler;
-                        routed = true;
-                        break;
-                    }
-                };
                 if (tf.finally_entry) |fin| {
                     if (std.meta.eql(fin, cur)) continue;
                     const key = tf.finally_done orelse fin;
@@ -678,14 +579,6 @@ pub fn runFrameExec(
                 if (try_stack.items.len > pu.depth) try_stack.shrinkRetainingCapacity(pu.depth);
                 var routed = false;
                 while (try_stack.pop()) |tf| {
-                    if (e == .LabeledReturn) if (tf.lr_absorb) |ab| {
-                        if (std.mem.eql(u8, ab.label, e.LabeledReturn.label)) {
-                            try frame.write(ab.value_reg, e.LabeledReturn.value);
-                            cur = ab.handler;
-                            routed = true;
-                            break;
-                        }
-                    };
                     if (tf.finally_entry) |fin2| {
                         const key = tf.finally_done orelse fin2;
                         frame.pending_finally.unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
@@ -738,50 +631,6 @@ pub fn runFrameExec(
                 }
                 return ok(v);
             },
-            .NonLocalReturn => |maybe_r| {
-                const v = if (maybe_r) |r| frame.read(r) else Value.Unit;
-                v.retain();
-                const e = EvalError{ .NonLocalReturn = v };
-                if (nearestFinally(try_stack, cur)) |c| {
-                    frame.pending_finally.unwind = .{ .key = c.key, .err = e, .depth = try_stack.items.len };
-                    cur = c.jump;
-                    continue;
-                }
-                return unwindTerminal(frame, e);
-            },
-            .LabeledReturn => |lr| {
-                if (lrTraceOn()) {
-                    if (frame.cur_span) |sp| std.debug.print("[lr-raise] label={s} span={d}:{d} in_fn={s}\n", .{ lr.label, sp.file.int(), sp.start, frame.func.name });
-                    dumpFrameChainForDiagAlways();
-                }
-                const v = if (lr.value) |r| frame.read(r) else Value.Unit;
-                v.retain();
-                const e = EvalError{ .LabeledReturn = .{ .label = lr.label, .value = v } };
-                // Innermost-first: a splice region's absorption ends the unwind at its join, after
-                // the armed finallys inside it run.
-                var routed = false;
-                while (try_stack.pop()) |tf| {
-                    if (tf.lr_absorb) |ab| {
-                        if (std.mem.eql(u8, ab.label, lr.label)) {
-                            try frame.write(ab.value_reg, v);
-                            cur = ab.handler;
-                            routed = true;
-                            break;
-                        }
-                        continue;
-                    }
-                    if (tf.finally_entry) |fin| {
-                        if (std.meta.eql(fin, cur)) continue;
-                        const key = tf.finally_done orelse fin;
-                        frame.pending_finally.unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
-                        cur = fin;
-                        routed = true;
-                        break;
-                    }
-                }
-                if (!routed) return unwindTerminal(frame, e);
-                continue;
-            },
             .Throw => |r| {
                 var exc = frame.read(r);
                 exc.retain();
@@ -827,82 +676,19 @@ pub fn runFrameExec(
             .Unreachable => {
                 return errResult(.{ .Type = "reached Terminator.Unreachable" });
             },
-            .TailJump => |tj| {
-                var new_params: std.ArrayList(Value) = .empty;
-                var k: u8 = 0;
-                while (k < tj.n_args) : (k += 1) {
-                    try new_params.append(allocator, frame.read(Reg.from(tj.args.int() + @as(u32, k))));
-                }
-                coerceIntArgsToLong(frame.func, new_params.items);
-                frame.params.deinit(allocator);
-                frame.params = new_params;
-                const n = frame.regs.items.len;
-                frame.regs.clearRetainingCapacity();
-                if (!runtime.reclaimEnabled() and frame.func.frameNoFill()) {
-                    frame.regs.items.len = n;
-                    frame.wmask = RegMask.none;
-                } else {
-                    try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, n);
-                    frame.wmask.setAll();
-                }
-                try_stack.clearRetainingCapacity();
-                cur = frame.func.entry;
-            },
-            .TailCallFunc => |tc| {
-                var new_params: std.ArrayList(Value) = .empty;
-                var k: u8 = 0;
-                while (k < tc.n_args) : (k += 1) {
-                    try new_params.append(allocator, frame.read(Reg.from(tc.args.int() + @as(u32, k))));
-                }
-                const new_func = module.funcById(tc.func).?;
-                coerceIntArgsToLong(@constCast(new_func), new_params.items);
-                frame.func = new_func;
-                frame.params.deinit(allocator);
-                frame.params = new_params;
-                frame.regs.clearRetainingCapacity();
-                if (!runtime.reclaimEnabled() and new_func.frameNoFill()) {
-                    try frame.regs.ensureTotalCapacity(regsAlloc(allocator), new_func.n_locals);
-                    frame.regs.items.len = new_func.n_locals;
-                    frame.wmask = RegMask.none;
-                } else {
-                    try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, new_func.n_locals);
-                    frame.wmask.setAll();
-                }
-                try_stack.clearRetainingCapacity();
-                cur = new_func.entry;
-            },
-            .Switch => |sw| {
-                const v = frame.read(sw.reg);
-                var next = sw.default;
-                for (sw.arms) |arm| {
-                    if (constMatches(frame.module, arm.key, &v)) {
-                        next = arm.target;
-                        break;
-                    }
-                }
-                if (cmgTraceWant()) |w| if (std.mem.eql(u8, w, frame.func.name)) {
-                    std.debug.print("[switch] {s} v={s}", .{ frame.func.name, @tagName(std.meta.activeTag(v)) });
-                    if (v == .Int) std.debug.print(":{d}", .{v.Int});
-                    std.debug.print(" -> b{d} (default b{d}, {d} arms)\n", .{ next.int(), sw.default.int(), sw.arms.len });
-                };
-                cur = next;
-            },
         }
     }
 }
 
 fn isReturnLike(term: Terminator) bool {
     return switch (term) {
-        .Return, .NonLocalReturn, .LabeledReturn, .Throw => true,
+        .Return, .Throw => true,
         else => false,
     };
 }
 
 fn replacesPendingBeforeRouting(term: Terminator) bool {
-    return switch (term) {
-        .Return, .NonLocalReturn, .LabeledReturn => true,
-        else => false,
-    };
+    return term == .Return;
 }
 
 fn rpositionByBody(items: []const TryFrame, body: BlockId) ?usize {
@@ -951,16 +737,6 @@ fn findCatch(comptime H: type, host: *H, module: *const Module, exc: *const Valu
 /// Destination register of a value-producing instruction, for routing a resume value back.
 fn instDst(inst: *const Inst) ?Reg {
     return switch (inst.*) {
-        .Call => |x| x.dst,
-        .CallValue => |x| x.dst,
-        .CallValueWithThis => |x| x.dst,
-        .CallSpread => |x| x.dst,
-        .CallMember => |x| x.dst,
-        .CallVirtual => |x| x.dst,
-        .CallMemberOrGlobal => |x| x.dst,
-        .CallValueOrMember => |x| x.dst,
-        .CallMemberOrValue => |x| x.dst,
-        .NewInstance => |x| x.dst,
         .CallStatic => |x| x.dst,
         .RCallVirtual => |x| x.dst,
         .CallInterface => |x| x.dst,

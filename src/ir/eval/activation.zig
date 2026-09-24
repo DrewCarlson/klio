@@ -58,69 +58,11 @@ const runFlatLoop = ev_loop.runFlatLoop;
 const snapshotRegisters = ev_snapshot.snapshotRegisters;
 const traceEnclosingEntries = ev_chain.traceEnclosingEntries;
 
-/// Start or extend the suspension a compiled body is building; called per emitted frame as it unwinds, innermost first, the order the driver replays.
-pub fn pushNativePark(
-    allocator: Allocator,
-    call: *const fn (?*anyopaque, runtime.CValue) callconv(.c) runtime.CValue,
-    frame: ?*anyopaque,
-    wake_in_millis: i64,
-) Allocator.Error!void {
-    const state = ev_state.evtlsPtr().in_flight_suspend orelse blk: {
-        const st = try allocator.create(SuspendState);
-        st.* = .{ .token = 0, .frames = .empty, .wake_in_millis = wake_in_millis, .pending_resume_reg = null };
-        ev_state.evtlsPtr().in_flight_suspend = st;
-        break :blk st;
-    };
-    if (wake_in_millis != 0) state.wake_in_millis = wake_in_millis;
-    try state.frames.append(allocator, .{
-        .func = FuncId.from(0),
-        .module = null,
-        .block = BlockId.from(0),
-        .inst_idx = 0,
-        .regs = .{ .dense = &.{} },
-        .params = &.{},
-        .captures = &.{},
-        .enclosing_this = &.{},
-        .try_stack = &.{},
-        .is_lambda = false,
-        .resume_reg = null,
-        .native = .{ .call = call, .frame = frame },
-    });
-}
-
 pub fn takeInFlightSuspend(allocator: Allocator) ?*SuspendState {
     _ = allocator;
     const st = ev_state.evtlsPtr().in_flight_suspend;
     ev_state.evtlsPtr().in_flight_suspend = null;
     return st;
-}
-
-/// Replay a suspension whose frames are all compiled continuations. Each entry is a call, so
-/// there is no frame to rebuild and no host needed to resolve a FuncId or re-enter a body.
-pub fn resumeNativeContinuation(
-    allocator: Allocator,
-    state: *SuspendState,
-    resume_value: Value,
-) Allocator.Error!EvalResult {
-    var carry = resume_value;
-    var frames = state.frames;
-    state.frames = .empty;
-    defer frames.deinit(allocator);
-    state.gc_quiesced = false;
-    for (frames.items, 0..) |snap, i| {
-        const nr = snap.native orelse return errResult(.{ .Type = "interpreted frame in a compiled suspension" });
-        const produced = runtime.fromC(nr.call(nr.frame, runtime.toC(carry)));
-        if (produced == .CoroutineSuspended) {
-            const st = takeInFlightSuspend(allocator) orelse
-                return errResult(.{ .Type = "compiled body suspended without a continuation" });
-            // The frames OUTSIDE this one have not run yet: they still wait on the value it will produce,
-            // so they belong to the new suspension, outermost last.
-            for (frames.items[i + 1 ..]) |outer| try st.frames.append(allocator, outer);
-            return errResult(.{ .Suspended = st });
-        }
-        carry = produced;
-    }
-    return ok(carry);
 }
 
 /// Resume a parked coroutine: `resume_value` lands in the innermost frame's resume register,
@@ -520,7 +462,7 @@ pub fn openActivation(comptime H: type, allocator: Allocator, caller_module: *co
     // converted them.
     if (module.resolved == null) {
         boolThisTrap(req.func, req.args.items);
-        dumpFnIfRequested(module, req.func);
+        dumpFnIfRequested(req.func);
         // SAM conversion at the call boundary; the flat activation is the other way in.
         if (comptime @hasDecl(H, "samConvertActivationArgs")) {
             try host.samConvertActivationArgs(allocator, req.func, req.args.items);

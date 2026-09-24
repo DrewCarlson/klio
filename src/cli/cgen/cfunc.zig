@@ -150,7 +150,6 @@ fn succ(blk: *const ir.Block, i: u32) ?u32 {
             1 => br.f.int(),
             else => null,
         },
-        .Switch => |sw| if (k < sw.arms.len) sw.arms[k].target.int() else if (k == sw.arms.len) sw.default.int() else null,
         else => null,
     };
 }
@@ -257,25 +256,6 @@ fn writeTerminator(fx: *Fn, blk: *const ir.Block, bi: usize) Error!void {
             try writeJump(fx, bi, br.f);
             try w.writeAll(" }\n");
         },
-        .Switch => |sw| {
-            const t = fx.ty(sw.reg);
-            for (sw.arms) |arm| {
-                const c = fx.p.m.consts.items[arm.key.int()];
-                if (t != .object and c != .String and c != .Null) {
-                    try w.print("  if ({s} == ", .{try fx.reg(sw.reg)});
-                    try ctype.writeScalar(w, c);
-                } else {
-                    try w.print("  if (klio_nat_bool(klio_r_binop({d}u, {s}, ", .{ @intFromEnum(ir.BinOp.Eq), try fx.boxed(sw.reg) });
-                    try writeConstValue(fx, c);
-                    try w.writeAll("))");
-                }
-                try w.writeAll(") { ");
-                try writeJump(fx, bi, arm.target);
-                try w.writeAll(" }\n  ");
-            }
-            try writeJump(fx, bi, sw.default);
-            try w.writeAll("\n");
-        },
         .Return => |r| {
             if (r) |x| {
                 try writeReturnValue(fx, try fx.reg(x), fx.ty(x));
@@ -283,7 +263,6 @@ fn writeTerminator(fx: *Fn, blk: *const ir.Block, bi: usize) Error!void {
         },
         .Throw => |r| try w.print("  kthrow({s});\n", .{try fx.boxed(r)}),
         .Unreachable => try w.writeAll("  klio_r_unreachable();\n"),
-        else => fx.p.refuse("`{s}`: a {s} terminator", .{ fx.b.f.fqn, @tagName(blk.terminator) }),
     }
 }
 

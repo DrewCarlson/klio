@@ -46,17 +46,6 @@ const Tally = struct {
 /// Null when the instruction is not a call site.
 fn classify(inst: *const Inst) ?Kind {
     return switch (inst.*) {
-        .Call => .direct,
-        .NewInstance => .direct,
-        .CallMemberOrGlobal => |c| if (c.func != null or c.class != null or c.candidates != null) .dyn_bound else .dyn_unbound,
-        .CallSpread => |c| if (c.virtual_slot != null) .virtual else if (c.candidates != null) .dyn_bound else .dyn_unbound,
-        .CallVirtual => .virtual,
-        .CallMember => |c| if (c.x().resolved != null) .direct else .dyn_unbound,
-        .CallValue,
-        .CallValueWithThis,
-        .CallValueOrMember,
-        .CallMemberOrValue,
-        => .dyn_unbound,
         .CallStatic, .RNewInstance, .CallNative => .direct,
         .RCallVirtual, .CallInterface => .virtual,
         else => null,
@@ -212,140 +201,16 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
             try w.writeAll(")");
         },
         .LoadParam => |c| try w.print("r{d} <- LoadParam #{d}", .{ reg(c.dst), c.idx }),
-        .LoadDispatchThis => |c| try w.print("r{d} <- LoadDispatchThis", .{reg(c.dst)}),
-        .LoadOuterThis => |c| try w.print("r{d} <- LoadOuterThis r{d}", .{ reg(c.dst), reg(c.src) }),
-        .LoadContextParam => |c| try w.print("r{d} <- LoadContextParam #{d}", .{ reg(c.dst), c.idx }),
-        .ContextPush => |c| try w.print("ContextPush r{d}+{d}", .{ reg(c.args), c.n }),
-        .ContextPop => |c| try w.print("ContextPop {d}", .{c.n}),
         .LoadCapture => |c| try w.print("r{d} <- LoadCapture #{d}", .{ reg(c.dst), c.idx }),
         .Move => |c| try w.print("r{d} <- Move r{d}", .{ reg(c.dst), reg(c.src) }),
         .MakeCell => |c| try w.print("r{d} <- MakeCell r{d}", .{ reg(c.dst), reg(c.src) }),
         .CellGet => |c| try w.print("r{d} <- CellGet r{d}", .{ reg(c.dst), reg(c.cell) }),
         .CellSet => |c| try w.print("CellSet r{d} <- r{d}", .{ reg(c.cell), reg(c.value) }),
-        .GetField => |c| try w.print("r{d} <- GetField r{d}.'{s}' own={s}:{d}        [DYN field]", .{ reg(c.dst), reg(c.receiver), constStr(m, c.field), @tagName(c.own_kind), c.own_slot }),
-        .SetField => |c| try w.print("SetField r{d}.'{s}' <- r{d}        [DYN field]", .{ reg(c.receiver), constStr(m, c.field), reg(c.value) }),
-        .CompoundField => |c| try w.print("CompoundField r{d}.'{s}' {s}= r{d}        [DYN field]", .{ reg(c.receiver), constStr(m, c.field), @tagName(c.op), reg(c.value) }),
-        .Index => |c| try w.print("r{d} <- Index r{d}[r{d}]", .{ reg(c.dst), reg(c.receiver), reg(c.index) }),
-        .IndexSet => |c| try w.print("IndexSet r{d}[r{d}] <- r{d}", .{ reg(c.receiver), reg(c.index), reg(c.value) }),
-        .Call => |c| {
-            try w.print("r{d} <- Call {s}#{d} ", .{ reg(c.dst), funcName(m, c.func), c.func.int() });
-            try argRun(w, c.args, c.n_args);
-            try w.writeAll("        [DIRECT]");
-        },
-        .CallMember => |c| {
-            try w.print("r{d} <- CallMember r{d}.'{s}' ", .{ reg(c.dst), reg(c.receiver), constStr(m, c.name) });
-            try argRun(w, c.args, c.n_args);
-            if (c.x().resolved) |target| {
-                if (c.x().dispatch_receiver) |dispatch| {
-                    try w.print(
-                        "        [DIRECT member-ext dispatch=r{d} -> {s}#{d}]",
-                        .{ reg(dispatch), funcName(m, target), target.int() },
-                    );
-                } else {
-                    try w.print(
-                        "        [DIRECT -> {s}#{d}]",
-                        .{ funcName(m, target), target.int() },
-                    );
-                }
-            } else {
-                try w.print("        [DYN member '{s}']", .{constStr(m, c.name)});
-            }
-        },
-        .CallMemberOrValue => |c| {
-            try w.print("r{d} <- CallMemberOrValue r{d}.'{s}' fallback=r{d} ", .{ reg(c.dst), reg(c.receiver), constStr(m, c.name), reg(c.fallback) });
-            try argRun(w, c.args, c.n_args);
-            try w.print("        [DYN member-or-value '{s}']", .{constStr(m, c.name)});
-        },
-        .CallVirtual => |c| {
-            try w.print("r{d} <- CallVirtual slot#{d} r{d} ", .{ reg(c.dst), c.slot.int(), reg(c.receiver) });
-            try argRun(w, c.args, c.n_args);
-            if (c.x().arg_params) |params| {
-                try w.writeAll(" params=[");
-                for (params, 0..) |param, i| {
-                    if (i != 0) try w.writeByte(',');
-                    try w.print("{d}", .{param});
-                }
-                try w.writeByte(']');
-            }
-            try w.writeAll("        [VIRTUAL]");
-        },
-        .CallMemberOrGlobal => |c| {
-            try w.print("r{d} <- CallMemberOrGlobal this.'{s}' ", .{ reg(c.dst), constStr(m, c.name) });
-            try argRun(w, c.args, c.n_args);
-            if (c.func) |f| {
-                try w.print("        [DYN-bound -> {s}#{d}]", .{ funcName(m, f), f.int() });
-            } else if (c.class) |cl| {
-                try w.print("        [DYN-bound -> class {s}]", .{className(m, cl)});
-            } else if (c.candidates) |ids| {
-                try w.print("        [DYN-bounded {d} candidates]", .{ids.len});
-            } else {
-                try w.print("        [DYN-unbound '{s}']", .{constStr(m, c.name)});
-            }
-        },
-        .CallValue => |c| try w.print("r{d} <- CallValue r{d} (n={d})        [DYN value]", .{ reg(c.dst), reg(c.callee), c.n_args }),
-        .CallValueWithThis => |c| try w.print(
-            "r{d} <- CallValueWithThis r{d} receiver=r{d} (n={d})        [DYN receiver value]",
-            .{ reg(c.dst), reg(c.callee), reg(c.receiver), c.n_args },
-        ),
-        .CallSpread => |c| {
-            try w.print("r{d} <- CallSpread r{d} (parts={d})", .{ reg(c.dst), reg(c.callee), c.parts.len });
-            if (c.virtual_slot) |slot| {
-                try w.print(" slot#{d}", .{slot.int()});
-                if (c.arg_params) |params| {
-                    try w.writeAll(" params=[");
-                    for (params, 0..) |param, i| {
-                        if (i != 0) try w.writeByte(',');
-                        try w.print("{d}", .{param});
-                    }
-                    try w.writeByte(']');
-                }
-                try w.writeAll("        [VIRTUAL]");
-            } else if (c.member) |mid| {
-                try w.print("        [DYN member '{s}']", .{constStr(m, mid)});
-            } else if (c.candidates) |ids| {
-                const name = if (c.name) |nid| constStr(m, nid) else "<missing-name>";
-                try w.print("        [DYN-bounded '{s}' {d} candidates]", .{ name, ids.len });
-            } else {
-                try w.writeAll("        [DYN value]");
-            }
-        },
-        .NewInstance => |c| {
-            try w.print("r{d} <- NewInstance {s}#{d} ", .{ reg(c.dst), className(m, c.class), c.class.int() });
-            try argRun(w, c.args, c.n_args);
-            try w.writeAll("        [DIRECT]");
-        },
-        .LoadGlobal => |c| {
-            try w.print("r{d} <- LoadGlobal '{s}'", .{ reg(c.dst), constStr(m, c.name) });
-            if (c.slot) |s| try w.print(" slot={d}", .{s});
-            if (c.func) |f| try w.print("        [bound -> {s}#{d}]", .{ funcName(m, f), f.int() }) else if (c.class) |cl| try w.print("        [bound -> class {s}]", .{className(m, cl)}) else try w.writeAll("        [unbound]");
-        },
-        .LoadFromThisOrGlobal => |c| {
-            try w.print("r{d} <- LoadFromThisOrGlobal this.'{s}'", .{ reg(c.dst), constStr(m, c.name) });
-            if (c.func) |f| try w.print("        [bound -> {s}#{d}]", .{ funcName(m, f), f.int() }) else if (c.class) |cl| try w.print("        [bound -> class {s}]", .{className(m, cl)}) else try w.writeAll("        [unbound]");
-        },
-        .MemberRef => |c| {
-            try w.print(
-                "r{d} <- MemberRef r{d}.'{s}'",
-                .{ reg(c.dst), reg(c.receiver), constStr(m, c.name) },
-            );
-            if (c.func) |f|
-                try w.print("        [bound -> {s}#{d}]", .{ funcName(m, f), f.int() })
-            else
-                try w.writeAll("        [unbound]");
-        },
-        .StoreToThisOrGlobal => |c| try w.print("StoreToThisOrGlobal this.'{s}' <- r{d}", .{ constStr(m, c.name), reg(c.value) }),
-        .StoreGlobal => |c| {
-            try w.print("StoreGlobal '{s}' <- r{d}", .{ constStr(m, c.name), reg(c.value) });
-            if (c.slot) |s| try w.print(" slot={d}", .{s});
-        },
         .BinOp => |c| try w.print("r{d} <- BinOp {s} r{d}, r{d}", .{ reg(c.dst), @tagName(c.op), reg(c.lhs), reg(c.rhs) }),
         .UnOp => |c| try w.print("r{d} <- UnOp {s} r{d}", .{ reg(c.dst), @tagName(c.op), reg(c.operand) }),
         .Not => |c| try w.print("r{d} <- Not r{d}", .{ reg(c.dst), reg(c.src) }),
-        .Cast => |c| try w.print("r{d} <- Cast r{d}", .{ reg(c.dst), reg(c.src) }),
-        .InstanceOf => |c| try w.print("r{d} <- InstanceOf r{d}", .{ reg(c.dst), reg(c.src) }),
         .NotNullAssert => |c| try w.print("r{d} <- NotNullAssert r{d}", .{ reg(c.dst), reg(c.src) }),
         .LateinitCheck => |c| try w.print("r{d} <- LateinitCheck r{d} '{s}'", .{ reg(c.dst), reg(c.src), constStr(m, c.name) }),
-        .Lambda => |c| try w.print("r{d} <- Lambda {s}#{d}", .{ reg(c.dst), funcName(m, c.body_func), c.body_func.int() }),
         else => try w.print("{s}", .{@tagName(inst.*)}),
     }
     try w.writeAll("\n");
@@ -364,7 +229,6 @@ fn dumpTerminator(w: *std.Io.Writer, t: *const ir.Terminator) !void {
         .Return => |r| if (r) |rr| try w.print("    return r{d}\n", .{reg(rr)}) else try w.writeAll("    return unit\n"),
         .Throw => |r| try w.print("    throw r{d}\n", .{reg(r)}),
         .Unreachable => try w.writeAll("    unreachable\n"),
-        else => try w.print("    {s}\n", .{@tagName(t.*)}),
     }
 }
 

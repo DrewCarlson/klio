@@ -28,9 +28,6 @@ const ImplicitKind = sema.records.ImplicitKind;
 const Receiver = sema.records.Receiver;
 const CaptureKey = bridge.CaptureKey;
 
-/// An implicit receiver, by kind and owner.
-pub const RecvKey = struct { kind: ImplicitKind, owner: Sym };
-
 /// Where a value the body did not compute is read from.
 pub const Slot = union(enum) {
     /// `LoadParam idx`.

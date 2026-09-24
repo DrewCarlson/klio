@@ -296,8 +296,6 @@ pub fn StrPairMap(comptime V: type) type {
 
 pub const StrPairSet = StrPairMap(void);
 
-pub const FuncIdMap = std.AutoHashMap;
-
 pub fn headAllUpper(s_: []const u8) bool {
     for (s_) |c| {
         if (!std.ascii.isUpper(c)) return false;

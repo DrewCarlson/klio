@@ -853,3 +853,12 @@ measurement.
   evaluator made every benchmark faster: fib 1.03 to 0.96 s, bench_oo
   1.46 to 1.27 s, bench_fn 3.13 to 2.97 s. The 37 `examples/jit_*.kt`
   stay as interpreter programs; their headers still describe the JIT.
+- 2026-09-24: the by-name instructions leave the IR (-15k lines): every
+  name-carrying `Inst` variant and terminator, their eval arms, most of
+  `exec_call`, the old transpiled-native table, `site_census`, the
+  module's link passes and 43 knobs. `@sizeOf(Inst)` is at most 32 bytes.
+  fib 0.97 to 0.87 s; bench_fn and bench_oo unchanged. The leaf tier now
+  runs only `LoadParam`, `Const`, `Move`, `Not`, `BinOp` and `Trace`.
+  Klio names its exceptions the Kotlin way: kotlin.* where Kotlin has the
+  class, klio.* for the JVM-only ones, and frames name Kotlin
+  declarations.

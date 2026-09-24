@@ -221,6 +221,25 @@ test "a closure in a reified function captures the type a call's argument passes
     , "a\n1\n");
 }
 
+test "a delegate's call solves a reified argument it left open, the property's type expected" {
+    try expectRun(
+        \\import kotlin.reflect.KProperty
+        \\class MState<T>(var v: T)
+        \\fun <T> mstate(v: T) = MState(v)
+        \\operator fun <T> MState<T>.getValue(thisRef: Any?, p: KProperty<*>): T = v
+        \\operator fun <T> MState<T>.setValue(thisRef: Any?, p: KProperty<*>, value: T) { v = value }
+        \\inline fun <reified T> none(): Array<T> = arrayOfNulls<T>(0) as Array<T>
+        \\class Holder<T>(val t: T)
+        \\fun run2(block: () -> Unit) = block()
+        \\fun main() = run2 {
+        \\    var provided: Array<Holder<Int>> by mstate(none())
+        \\    println(provided.size)
+        \\    provided = arrayOf(Holder(1))
+        \\    println(provided.size)
+        \\}
+    , "0\n1\n");
+}
+
 test "a reified type parameter tests, casts, names its class and passes on" {
     try expectRun(
         \\inline fun <reified T> isA(x: Any?): Boolean = x is T

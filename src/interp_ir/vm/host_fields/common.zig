@@ -29,7 +29,6 @@ const fldTls = host_fields.fldTls;
 const missTraceEnvCached = host_fields.missTraceEnvCached;
 
 const read_paths = @import("read_paths.zig");
-const accessorFastGet = read_paths.accessorFastGet;
 
 const get_field_inner = @import("get_field_inner.zig");
 const getFieldInner = get_field_inner.getFieldInner;
@@ -119,7 +118,6 @@ pub fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiv
         const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
         return errRes(.{ .Type = msg });
     };
-    if (accessorFastGet(self, mptr, func, &receiver)) |r| return r;
     // Host-served compose snapshot getters, classified once per Func like the
     // static-call routes in `hostStaticServe`.
     {
@@ -150,13 +148,7 @@ pub fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiv
         }
     }
     // Frameless serve for the wider leaf shape: stored reads plus arithmetic.
-    if (try ir.eval.leafExprServe(VmHost, allocator, mptr, func, &.{receiver}, self)) |r| return r;
-    // A branchy accessor the frameless evaluator declines still serves its
-    // compiled leaf; the getter path is a commit point like any other.
-    if (try ir.eval.tryLeafValues(VmHost, allocator, mptr, func, &.{receiver}, self, null)) |lo| switch (lo) {
-        .val => |v| return .{ .ok = v },
-        .raise => |e| return errRes(e),
-    };
+    if (try ir.eval.leafExprServe(VmHost, allocator, mptr, func, &.{receiver})) |r| return r;
     if (missTraceEnvCached()) |w| {
         if (std.mem.find(u8, func.name, w) != null) {
             const rc: []const u8 = if (receiver == .Instance) className(receiver.Instance) else receiver.typeFqn();

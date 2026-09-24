@@ -617,20 +617,6 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
     try all.append(allocator, receiver.*);
     try all.appendSlice(allocator, args);
 
-    // Scalar-replay leaf, receiver riding as opaque param 0; a bail falls through
-    // to the framed invoke. The gate takes the module's own Func record so the
-    // leaf_route memo it writes survives.
-    if (receiver.* != .Null and all.items.len == f.params.len) {
-        const lfp = module_rc.funcById(hit.func) orelse unreachable;
-        if (try ir.eval.tryLeafValues(VmHost, allocator, module_rc, lfp, all.items, self, null)) |lo| {
-            all.deinit(allocator);
-            switch (lo) {
-                .val => |v| return .{ .ok = v },
-                .raise => |e| return .{ .err = e },
-            }
-        }
-    }
-
     if (padding_inst) |inst| {
         if (all.items.len < f.params.len) {
             var supertypes: [][]const u8 = &.{};

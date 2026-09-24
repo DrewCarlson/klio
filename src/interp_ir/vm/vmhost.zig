@@ -337,7 +337,6 @@ pub const VmHost = struct {
     pub const declaringClassSimpleName = host_call_member.declaringClassSimpleName;
     pub const memberRef = host_call_member.memberRef;
     pub const memberRefExact = host_call_member.memberRefExact;
-    pub const anyMember = host_call_member.anyMember;
     pub const invokeMethodFuncId = host_call_member.invokeMethodFuncId;
     pub const qualifiedThis = host_call_member.qualifiedThis;
     pub const memberExtOwnerInstanceFor = host_call_member.memberExtOwnerInstanceFor;

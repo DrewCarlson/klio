@@ -75,7 +75,9 @@ pub fn run(a: Allocator, s: *sema.Sema, map: *const span.SourceMap, records: []c
             out.counts[@intFromEnum(Kind.unbound_native)] += 1;
         }
     }
+    var failed: std.AutoHashMapUnmanaged(u32, void) = .empty;
     for (prog.errors.items) |le| {
+        try failed.put(a, le.func.int(), {});
         const k = classify(le.msg);
         out.counts[@intFromEnum(k)] += 1;
         try entries.append(a, .{
@@ -85,6 +87,17 @@ pub fn run(a: Allocator, s: *sema.Sema, map: *const span.SourceMap, records: []c
             .msg = le.msg,
             .file = le.span.file.int(),
         });
+    }
+    // A body tried and not lowered, with no error of its own to say why:
+    // it runs as a function with no body, so it is counted whatever the
+    // cause.
+    i = 0;
+    while (i < n) : (i += 1) {
+        const f = ir.FuncId.from(i);
+        if (i >= prog.attempted.bit_length or !prog.attempted.isSet(i) or prog.isLowered(f)) continue;
+        if (failed.contains(i)) continue;
+        out.counts[@intFromEnum(Kind.lowering)] += 1;
+        try entries.append(a, .{ .kind = .lowering, .func = br.m.funcs.items[i].fqn, .where = "", .msg = "the body did not lower, and no error says why" });
     }
     out.entries = entries.items;
     return out;

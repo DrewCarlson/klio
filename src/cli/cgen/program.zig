@@ -260,7 +260,7 @@ pub fn build(gpa: Allocator, a: Allocator, br: *ir.bridge.Bridge, main: FuncId) 
         for (func.blocks) |*blk| {
             const h = blk.h();
             if (h.catches.len != 0 or h.pop_on_exit.len != 0 or h.catch_done_for != null) has_try = true;
-            if (h.finally != null or h.finally_done != null or h.lr_absorb != null) p.refuse("`{s}` has a `finally`", .{func.fqn});
+            if (h.finally != null or h.finally_done != null) p.refuse("`{s}` has a `finally`", .{func.fqn});
         }
         try p.body_index.put(a, id.int(), @intCast(p.bodies.items.len));
         try p.bodies.append(a, .{ .id = id, .f = func, .sig = sg, .t = t, .slot = slot, .n_slots = n_slots, .closure = closure, .has_try = has_try });

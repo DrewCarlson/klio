@@ -2357,12 +2357,17 @@ fn complete(ctx: *Ctx, app_in: Applied, call_args: []Arg, trailing: bool, id: as
 /// that does not fit is reported where the property checks it.
 fn expectDelegateValue(ctx: *Ctx, sys: *infer.System, ret: TypeId, de: *const body.DelegateExpect) Allocator.Error!void {
     var trial = try sys.clone();
+    // The copy replaces the call's system, so it records its solutions as
+    // the call's does: a trial copy never would, and a variable an argument
+    // left open (`emptyArray()`'s `T`) would never be solved.
+    trial.trial = sys.trial;
     const v = (try delegateValueType(ctx, &trial, ret, de.this_ref)) orelse return;
     var fit = try trial.clone();
     if (!try fit.constrain(v, de.declared)) return;
     if (de.mutable and !try fit.constrain(de.declared, v)) return;
     _ = try trial.constrain(v, de.declared);
     if (de.mutable) _ = try trial.constrain(de.declared, v);
+    trial.trial = sys.trial;
     sys.* = trial;
 }
 

@@ -53,13 +53,6 @@ pub const Reg = enum(u32) {
     }
 };
 
-/// One contextual function-type parameter shape carried into a lambda body.
-pub const PendingCtxFnShape = struct {
-    name: []const u8,
-    ctx_types: []const []const u8,
-    n_regular: usize,
-};
-
 /// One implicit-receiver tower entry: the receiver's type head plus the `this@<label>` that addresses its value, null when unbound.
 pub const ReceiverTowerEntry = struct {
     head: []const u8,
@@ -93,22 +86,6 @@ pub const VirtNativeSite = struct {
     native: *u64,
     name_ptr: *u64,
     name_len: *u32,
-};
-
-pub const ReifiedName = struct { name: []const u8, actual: []const u8 };
-
-/// Stable identity of one virtual override family, rooted at the declaration the
-/// static receiver type selects; linking maps `(ClassId, MethodSlotId)` to a `FuncId`.
-/// A property slot: one per (root declaring class, property name) family, so
-/// every implementation of a property answers under the same number.
-pub const PropSlotId = enum(u32) {
-    _,
-    pub fn from(v: u32) PropSlotId {
-        return @enumFromInt(v);
-    }
-    pub fn int(self: PropSlotId) u32 {
-        return @intFromEnum(self);
-    }
 };
 
 pub const MethodSlotId = enum(u32) {

@@ -2,31 +2,6 @@ const std = @import("std");
 const applicability = @import("applicability");
 const Allocator = std.mem.Allocator;
 
-/// A stdlib host-served global alias (`min`, `listOf`, ...). A bare call to such
-/// a name whose overload set has no applicable body candidate routes to the runtime
-/// global rather than a declared-arity fallback. `resolveCall` and the lowerer share
-/// this list so both classify the same names.
-pub fn isAliasName(name: []const u8) bool {
-    const names = [_][]const u8{
-        "maxOf",           "minOf",      "max",                 "min",
-        "print",           "println",    "listOf",              "mutableListOf",
-        "arrayListOf",     "setOf",      "mutableSetOf",        "hashSetOf",
-        "linkedSetOf",     "mapOf",      "mutableMapOf",        "hashMapOf",
-        "linkedMapOf",     "arrayOf",    "arrayOfNulls",        "emptyArray",
-        "emptyList",       "emptySet",   "emptyMap",            "listOfNotNull",
-        "setOfNotNull",    "buildList",  "buildSet",            "buildMap",
-        "buildString",     "TODO",       "error",               "compareValues",
-        "compareValuesBy", "compareBy",  "compareByDescending", "naturalOrder",
-        "reverseOrder",    "sequenceOf", "emptySequence",       "generateSequence",
-        "sequence",        "iterator",   "readLine",            "sortedSetOf",
-        "sortedMapOf",
-    };
-    for (names) |n| {
-        if (std.mem.eql(u8, name, n)) return true;
-    }
-    return false;
-}
-
 pub fn allShapeNamesNull(args: []const applicability.ArgShape) bool {
     for (args) |a| {
         if (a.named != null) return false;
@@ -76,10 +51,6 @@ pub fn packageOfFqn(fqn: []const u8, simple: []const u8) []const u8 {
 /// ships. User-package candidates outrank shipped ones in the order-based fallbacks.
 pub fn isShippedPackage(pkg: []const u8) bool {
     return pkgHeadIs(pkg, "kotlin") or pkgHeadIs(pkg, "kotlinx") or pkgHeadIs(pkg, "java");
-}
-
-pub fn shippedFqnHead(fqn: []const u8) bool {
-    return isShippedPackage(fqn);
 }
 
 pub fn pkgHeadIs(pkg: []const u8, head: []const u8) bool {

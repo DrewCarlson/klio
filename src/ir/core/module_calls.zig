@@ -102,11 +102,6 @@ pub fn funcIsInline(self: *const Module, id: FuncId) bool {
     return f.is_inline;
 }
 
-pub fn isNonExtFid(self: *const Module, id: FuncId) bool {
-    const f = self.funcById(id) orelse return true;
-    return !funcHasImplicitThis(f);
-}
-
 /// A member extension (`fun A.f()` declared in class B) needs two receivers, so
 /// a bare call binds one only inside B, a subclass, or when B is an `object`.
 pub fn memberExtOutOfScope(self: *const Module, id: FuncId, ctx_owner: ?[]const u8) bool {
@@ -283,19 +278,6 @@ pub fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, own
         owner_cur = self.registry.enclosing_class.get(oc);
     }
     return false;
-}
-
-pub fn declSigScore(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) ?applicability.Score {
-    const sv = self.sigViewForApplicability(fid, callShapesHaveComposerPair(args)) orelse return .{ .points = 0 };
-    const named = !allShapeNamesNull(args);
-    return applicability.applicable(&sv, args, .{
-        .named = named,
-        .recv_external = named,
-    });
-}
-
-pub fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
-    return self.declSigScore(fid, args) != null;
 }
 
 pub const ApplicableBarePick = struct {

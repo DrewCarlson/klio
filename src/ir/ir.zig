@@ -10,9 +10,7 @@ const std = @import("std");
 const span = @import("span");
 const ast = @import("ast");
 const runtime = @import("runtime");
-pub fn runtimeEnvSetOnce(comptime n: [:0]const u8) bool { return runtime.envSetOnce(n); }
 const applicability = @import("applicability");
-const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
 
@@ -21,9 +19,7 @@ pub const FileId = span.FileId;
 
 pub const eval = @import("eval.zig");
 pub const bc = @import("bc.zig");
-pub const hot_layout = @import("hot_layout.zig");
 pub const disasm = @import("disasm.zig");
-pub const site_census = @import("site_census.zig");
 pub const exec_call = @import("exec_call.zig");
 
 const core_ids = @import("core/ids.zig");
@@ -36,23 +32,19 @@ const core_consts = @import("core/consts.zig");
 const m_lookup = @import("core/module_lookup.zig");
 const m_static = @import("core/module_static.zig");
 const m_resolve_call = @import("core/module_resolve_call.zig");
-pub const remap = @import("core/remap.zig");
 const m_methods = @import("core/module_methods.zig");
 const m_fields = @import("core/module_fields.zig");
 const m_props = @import("core/module_props.zig");
-const m_regclass = @import("core/module_regclass.zig");
 const m_bare = @import("core/module_bare.zig");
 const m_calls = @import("core/module_calls.zig");
 const m_refs = @import("core/module_refs.zig");
 
 pub const TypeRef = core_ids.TypeRef;
 pub const Reg = core_ids.Reg;
-pub const PendingCtxFnShape = core_ids.PendingCtxFnShape;
 pub const ReceiverTowerEntry = core_ids.ReceiverTowerEntry;
 pub const BlockId = core_ids.BlockId;
 pub const FuncId = core_ids.FuncId;
 pub const VirtNativeSite = core_ids.VirtNativeSite;
-pub const ReifiedName = core_ids.ReifiedName;
 pub const MethodSlotId = core_ids.MethodSlotId;
 pub const ClassId = core_ids.ClassId;
 pub const classTypeParamIdentity = core_ids.classTypeParamIdentity;
@@ -73,38 +65,20 @@ pub const Resolved = resolved.Resolved;
 pub const lower_sema = @import("lower/sema/mod.zig");
 
 pub const Inst = core_inst.Inst;
-pub const CallMemberInst = core_inst.CallMemberInst;
-pub const BuiltinMember = core_inst.BuiltinMember;
-pub const COMPANION_OR_SELF = core_inst.COMPANION_OR_SELF;
-pub const SUPER_WRITE_QUALIFIED = core_inst.SUPER_WRITE_QUALIFIED;
-pub const SuperAnswer = m_fields.SuperAnswer;
-pub const SuperAccess = m_fields.SuperAccess;
-pub const CTOR_PICK_NONE = core_inst.CTOR_PICK_NONE;
 pub const NO_UNIT = core_inst.NO_UNIT;
 pub const NO_CLASS = core_inst.NO_CLASS;
-pub const BuiltinField = core_inst.BuiltinField;
-pub const CallMemberExtra = core_inst.CallMemberExtra;
-pub const CallVirtualInst = core_inst.CallVirtualInst;
-pub const CallVirtualExtra = core_inst.CallVirtualExtra;
-pub const CallSpreadInst = core_inst.CallSpreadInst;
-pub const CallMemberOrGlobalInst = core_inst.CallMemberOrGlobalInst;
-pub const SpreadPart = core_inst.SpreadPart;
 pub const BinOp = core_inst.BinOp;
 pub const UnOp = core_inst.UnOp;
 pub const visitInstRegs = core_inst.visitInstRegs;
 pub const visitTerminatorRegs = core_inst.visitTerminatorRegs;
-pub const setInstDst = core_inst.setInstDst;
 pub const Terminator = core_inst.Terminator;
-pub const SwitchArm = core_inst.SwitchArm;
 pub const CatchHandler = core_inst.CatchHandler;
-pub const LrAbsorb = core_inst.LrAbsorb;
 
 pub const Block = core_func.Block;
 pub const BlockHandlers = core_func.BlockHandlers;
 pub const FuncKind = core_func.FuncKind;
 pub const FAST_CALL_EXT_FLAG = core_func.FAST_CALL_EXT_FLAG;
 pub const FAST_CALL_AMBIG_FLAG = core_func.FAST_CALL_AMBIG_FLAG;
-pub const setSuppressDeprecationError = core_func.setSuppressDeprecationError;
 pub const rankLowPriority = core_func.rankLowPriority;
 pub const Func = core_func.Func;
 pub const FuncExtra = core_func.FuncExtra;
@@ -122,8 +96,6 @@ pub const SlotSeed = core_class.SlotSeed;
 pub const DeclaredProp = core_class.DeclaredProp;
 pub const CtorArity = core_class.CtorArity;
 pub const PropTarget = m_props.PropTarget;
-pub const PropDispatchEntry = m_props.PropDispatchEntry;
-pub const PropSlotEntry = m_props.PropSlotEntry;
 pub const FieldLayout = core_class.FieldLayout;
 pub const FieldLayoutState = core_class.FieldLayoutState;
 pub const ClassFieldLayout = m_fields.ClassFieldLayout;
@@ -382,12 +354,9 @@ pub const Module = struct {
     pub const funcById = m_lookup.funcById;
     pub const funcByIdMut = m_lookup.funcByIdMut;
     pub const appendedFuncCount = m_lookup.appendedFuncCount;
-    pub const appendFunc = m_lookup.appendFunc;
     pub const nextFuncId = m_lookup.nextFuncId;
     pub const registerMemberDecl = m_lookup.registerMemberDecl;
     pub const memberDecls = m_lookup.memberDecls;
-    pub const MemberDeclGroup = m_lookup.MemberDeclGroup;
-    pub const memberDeclGroups = m_lookup.memberDeclGroups;
 
     pub const MemberCandidate = m_static.MemberCandidate;
     pub const classIdIsOrExtendsDepth = m_static.classIdIsOrExtendsDepth;
@@ -632,7 +601,6 @@ pub const Module = struct {
     pub const staticTypeDisproofComplete = m_static.staticTypeDisproofComplete;
     pub const staticReceiverCompatibility = m_static.staticReceiverCompatibility;
     pub const staticReceiverCompatibilityWith = m_static.staticReceiverCompatibilityWith;
-    pub const staticTypeCompatibility = m_static.staticTypeCompatibility;
     pub const staticAliasType = m_static.staticAliasType;
     pub const scopedTypeAliasFqn = m_static.scopedTypeAliasFqn;
     pub const resolveTypeAliasAt = m_static.resolveTypeAliasAt;
@@ -647,7 +615,6 @@ pub const Module = struct {
     pub const staticTypeProofComplete = m_static.staticTypeProofComplete;
     pub const bindReceiverTypeParams = m_static.bindReceiverTypeParams;
     pub const staticGenericReceiverApplicable = m_static.staticGenericReceiverApplicable;
-    pub const staticGenericReceiverCouldApply = m_static.staticGenericReceiverCouldApply;
     pub const staticGenericReceiverApplicableMode = m_static.staticGenericReceiverApplicableMode;
     pub const staticArgCompatibility = m_static.staticArgCompatibility;
     pub const lambdaRefuteOn = m_static.lambdaRefuteOn;
@@ -661,7 +628,6 @@ pub const Module = struct {
     pub const extensionKeyEquivalent = m_static.extensionKeyEquivalent;
     pub const functionParamArgsAgree = m_static.functionParamArgsAgree;
     pub const tiedLambdaParamRep = m_static.tiedLambdaParamRep;
-    pub const staticReceiverCouldAccept = m_static.staticReceiverCouldAccept;
     pub const memberExtensionOwnerIsObject = m_static.memberExtensionOwnerIsObject;
     pub const scopedClassId = m_static.scopedClassId;
     pub const dispatchOwnerInChain = m_static.dispatchOwnerInChain;
@@ -675,26 +641,18 @@ pub const Module = struct {
 
     pub const resolveExtensionCall = m_resolve_call.resolveExtensionCall;
     pub const extResolveCache = m_resolve_call.extResolveCache;
-    pub const declaredWithBody = m_lookup.declaredWithBody;
-    pub const warmLookupCaches = m_lookup.warmLookupCaches;
-    pub const dropLoweringCaches = m_lookup.dropLoweringCaches;
     pub const recvVerdictCache = m_resolve_call.recvVerdictCache;
     pub const resolveMemberCall = m_resolve_call.resolveMemberCall;
     pub const dispatchForTarget = m_resolve_call.dispatchForTarget;
     pub const methodIsFinal = m_resolve_call.methodIsFinal;
     pub const internalVisibleFrom = m_resolve_call.internalVisibleFrom;
-    pub const rebuildMemberNameIndex = m_resolve_call.rebuildMemberNameIndex;
 
     pub const methodDispatchKey = m_methods.methodDispatchKey;
     pub const methodSlotTarget = m_methods.methodSlotTarget;
-    pub const MethodDispatchEntry = m_methods.MethodDispatchEntry;
-    pub const methodDispatchEntries = m_methods.methodDispatchEntries;
-    pub const registerMethodSlotTarget = m_methods.registerMethodSlotTarget;
     pub const TypeBinding = m_methods.TypeBinding;
     pub const bindingType = m_methods.bindingType;
     pub const bindingIsExplicit = m_methods.bindingIsExplicit;
     pub const widenBinding = m_methods.widenBinding;
-    pub const substituteBoundType = m_methods.substituteBoundType;
     pub const substituteType = m_methods.substituteType;
     pub const callTypeParam = m_methods.callTypeParam;
     pub const callTypeRefParam = m_methods.callTypeRefParam;
@@ -709,9 +667,7 @@ pub const Module = struct {
     pub const solveCallBindings = m_methods.solveCallBindings;
     pub const instantiatedCallReturnTypeScoped = m_methods.instantiatedCallReturnTypeScoped;
     pub const instantiatedTypeFromReceiverImpl = m_methods.instantiatedTypeFromReceiverImpl;
-    pub const instantiatedTypeFromReceiver = m_methods.instantiatedTypeFromReceiver;
     pub const instantiatedTypeFromReceiverPartial = m_methods.instantiatedTypeFromReceiverPartial;
-    pub const instantiatedDeclarationType = m_methods.instantiatedDeclarationType;
     pub const ancestorBindings = m_methods.ancestorBindings;
     pub const funcTypeParamIndex = m_methods.funcTypeParamIndex;
     pub const overridesTraceOn = m_methods.overridesTraceOn;
@@ -730,68 +686,22 @@ pub const Module = struct {
 
     pub const classFieldLayout = m_fields.classFieldLayout;
     pub const classFieldLayoutState = m_fields.classFieldLayoutState;
-    pub const fieldSlotIndex = m_fields.fieldSlotIndex;
-    pub const linkFieldSlots = m_fields.linkFieldSlots;
-    pub const linkGetterRoutes = m_fields.linkGetterRoutes;
-    pub const linkPropertySlots = m_props.linkPropertySlots;
-    pub const propSlotTarget = m_props.propSlotTarget;
-    pub const propSlotOf = m_props.propSlotOf;
-    pub const soleCtorForArity = m_props.soleCtorForArity;
-    pub const staticCtorPick = m_props.staticCtorPick;
-    pub const linkCtorPicks = m_props.linkCtorPicks;
-    pub const probeCtorArity = m_props.probeCtorArity;
-    pub const probeInstanceOf = m_props.probeInstanceOf;
-    pub const probeClassGraph = m_props.probeClassGraph;
-    pub const probeThisOrGlobal = m_props.probeThisOrGlobal;
-    pub const probeBuiltinMembers = m_props.probeBuiltinMembers;
-    pub const linkBuiltinMembers = m_props.linkBuiltinMembers;
-    pub const linkMemberOrGlobal = m_props.linkMemberOrGlobal;
-    pub const linkGlobalIdentities = m_props.linkGlobalIdentities;
-    pub const linkConstGlobals = m_props.linkConstGlobals;
-    pub const probeRegisterClasses = m_regclass.probeRegisterClasses;
-    pub const probeMemberByName = m_regclass.probeMemberByName;
-    pub const linkReceiverClasses = m_regclass.linkReceiverClasses;
-    pub const linkBuiltinFields = m_regclass.linkBuiltinFields;
-    pub const extensionCouldServe = m_props.extensionCouldServe;
-    pub const declaredGetterOn = m_fields.declaredGetterOn;
-    pub const declaredSetterOn = m_fields.declaredSetterOn;
-    pub const linkSuperMembers = m_fields.linkSuperMembers;
-    pub const superMemberAmong = m_fields.superMemberAmong;
-    pub const linkBuiltinMemberRegs = m_regclass.linkBuiltinMemberRegs;
-    pub const inferRegisterClasses = m_regclass.inferRegisterClasses;
-    pub const probeMemberOrGlobal = m_props.probeMemberOrGlobal;
-    pub const hierarchyDeclaresName = m_props.hierarchyDeclaresName;
-    pub const linkClassAncestors = m_props.linkClassAncestors;
     pub const classIsA = m_props.classIsA;
-    pub const classIsAKnown = m_props.classIsAKnown;
-    pub const subclassDeclaresProp = m_fields.subclassDeclaresProp;
-    pub const getterRejectDump = m_fields.getterRejectDump;
-    pub const linkInstanceOfTargets = m_props.linkInstanceOfTargets;
-    pub const propDispatchEntries = m_props.propDispatchEntries;
-    pub const propSlotEntries = m_props.propSlotEntries;
-    pub const registerPropSlotTarget = m_props.registerPropSlotTarget;
-    pub const registerPropSlotId = m_props.registerPropSlotId;
-    pub const linkFieldSlotsFrom = m_fields.linkFieldSlotsFrom;
-    pub const baseFieldLayoutsStale = m_fields.baseFieldLayoutsStale;
 
     pub const funcCount = m_lookup.funcCount;
     pub const deinit = m_lookup.deinit;
     pub const classId = m_lookup.classId;
     pub const uniqueClassIdBySimpleName = m_lookup.uniqueClassIdBySimpleName;
-    pub const simpleNameIsAmbiguous = m_lookup.simpleNameIsAmbiguous;
     pub const topUpUniqueSimpleCache = m_lookup.topUpUniqueSimpleCache;
     pub const uniqueSimpleInsert = m_lookup.uniqueSimpleInsert;
     pub const classNameCandidates = m_lookup.classNameCandidates;
     pub const topUpClassNameCache = m_lookup.topUpClassNameCache;
-    pub const buildClassIdMap = m_lookup.buildClassIdMap;
     pub const ExtCouldApplyWhy = m_lookup.ExtCouldApplyWhy;
     pub const ExtArity = m_lookup.ExtArity;
     pub const extCouldApply = m_lookup.extCouldApply;
     pub const extCouldApplyWhy = m_lookup.extCouldApplyWhy;
     pub const mergeExtArity = m_lookup.mergeExtArity;
     pub const rebuildExtIndex = m_lookup.rebuildExtIndex;
-    pub const recordFuncDeclSpan = m_lookup.recordFuncDeclSpan;
-    pub const funcByDeclSpan = m_lookup.funcByDeclSpan;
     pub const classDirectChild = m_lookup.classDirectChild;
     pub const classIdNestedIn = m_lookup.classIdNestedIn;
     pub const classIdByQualifiedSuffix = m_lookup.classIdByQualifiedSuffix;
@@ -800,22 +710,17 @@ pub const Module = struct {
     pub const rebuildFuncNameIndex = m_lookup.rebuildFuncNameIndex;
     pub const funcsBySimpleName = m_lookup.funcsBySimpleName;
     pub const funcId = m_lookup.funcId;
-    pub const funcIdForBareCall = m_lookup.funcIdForBareCall;
-    pub const funcIdForSpreadCall = m_lookup.funcIdForSpreadCall;
     pub const hasFuncNamed = m_lookup.hasFuncNamed;
     pub const funcIdByFqn = m_lookup.funcIdByFqn;
     pub const packageHeadDeclared = m_lookup.packageHeadDeclared;
     pub const topUpPkgHeads = m_lookup.topUpPkgHeads;
     pub const packageOfFile = m_lookup.packageOfFile;
-    pub const importAliasIn = m_lookup.importAliasIn;
     pub const importAliasPathsIn = m_lookup.importAliasPathsIn;
 
     pub const BareCallCandidateIterator = m_bare.BareCallCandidateIterator;
     pub const bareCallCandidateIterator = m_bare.bareCallCandidateIterator;
     pub const renamedImportDenotesFunc = m_bare.renamedImportDenotesFunc;
     pub const bareCallCandidates = m_bare.bareCallCandidates;
-    pub const hasBareCallCandidate = m_bare.hasBareCallCandidate;
-    pub const hasNonExtensionBareCallCandidate = m_bare.hasNonExtensionBareCallCandidate;
     pub const importWildcardIn = m_bare.importWildcardIn;
     pub const default_import_packages = m_bare.default_import_packages;
     pub const isDefaultImportPackage = m_bare.isDefaultImportPackage;
@@ -848,13 +753,10 @@ pub const Module = struct {
     pub const Resolution = m_calls.Resolution;
     pub const ResolveCtx = m_calls.ResolveCtx;
     pub const funcIsInline = m_calls.funcIsInline;
-    pub const isNonExtFid = m_calls.isNonExtFid;
     pub const memberExtOutOfScope = m_calls.memberExtOutOfScope;
     pub const evidenceSubtypeCb = m_calls.evidenceSubtypeCb;
     pub const ownerDeclaresMember = m_calls.ownerDeclaresMember;
     pub const extReceiverPlausible = m_calls.extReceiverPlausible;
-    pub const declSigScore = m_calls.declSigScore;
-    pub const declSigCompatible = m_calls.declSigCompatible;
     pub const ApplicableBarePick = m_calls.ApplicableBarePick;
     pub const bareScoreGreater = m_calls.bareScoreGreater;
     pub const bareScoreEqual = m_calls.bareScoreEqual;
@@ -880,16 +782,7 @@ pub const Module = struct {
 
     pub const resolveBareRefIndexed = m_refs.resolveBareRefIndexed;
     pub const resolveBareRefExpected = m_refs.resolveBareRefExpected;
-    pub const bareRefTier = m_refs.bareRefTier;
-    pub const classRefTier = m_refs.classRefTier;
-    pub const topLevelPropRefTier = m_refs.topLevelPropRefTier;
-    pub const topLevelPropTypeRef = m_refs.topLevelPropTypeRef;
-    pub const topLevelPropTypeHeadTiered = m_refs.topLevelPropTypeHeadTiered;
-    pub const topLevelPropHeadFor = m_refs.topLevelPropHeadFor;
-    pub const topLevelPropTypeHead = m_refs.topLevelPropTypeHead;
     pub const resolveCallableExtensionProperty = m_refs.resolveCallableExtensionProperty;
-    pub const topLevelConstLiteral = m_refs.topLevelConstLiteral;
-    pub const topLevelPropFqn = m_refs.topLevelPropFqn;
 
     pub const addClass = m_lookup.addClass;
     pub const classIndexEntryByName = m_lookup.classIndexEntryByName;
@@ -904,15 +797,11 @@ pub const Module = struct {
     pub const fixupStubClaimCaches = m_lookup.fixupStubClaimCaches;
     pub const classIsOrExtends = m_lookup.classIsOrExtends;
     pub const reserveClass = m_lookup.reserveClass;
-    pub const reserveClassFqn = m_lookup.reserveClassFqn;
     pub const internConst = m_lookup.internConst;
     pub const topUpConstDedup = m_lookup.topUpConstDedup;
 };
 
-pub const isAliasName = core_names.isAliasName;
-
 pub const packageOfFqn = core_names.packageOfFqn;
-pub const shippedFqnHead = core_names.shippedFqnHead;
 
 pub const ModuleRegistry = core_registry.ModuleRegistry;
 
@@ -931,12 +820,10 @@ test {
     testing.refAllDecls(@import("core/module_calls.zig"));
     testing.refAllDecls(@import("core/module_fields.zig"));
     testing.refAllDecls(@import("core/module_props.zig"));
-    testing.refAllDecls(@import("core/module_regclass.zig"));
     testing.refAllDecls(@import("core/module_lookup.zig"));
     testing.refAllDecls(@import("core/module_methods.zig"));
     testing.refAllDecls(@import("core/module_refs.zig"));
     testing.refAllDecls(@import("core/module_resolve_call.zig"));
-    testing.refAllDecls(@import("core/remap.zig"));
     testing.refAllDecls(@import("core/module_static.zig"));
     testing.refAllDecls(@import("core/names.zig"));
     testing.refAllDecls(@import("core/registry.zig"));
@@ -944,8 +831,6 @@ test {
     testing.refAllDecls(@import("core/tests_members.zig"));
     testing.refAllDecls(@import("core/tests_resolve.zig"));
     testing.refAllDecls(@import("core/tests_support.zig"));
-    _ = site_census;
-    testing.refAllDecls(site_census);
     testing.refAllDecls(resolved);
     testing.refAllDecls(bridge);
     _ = lower_sema;

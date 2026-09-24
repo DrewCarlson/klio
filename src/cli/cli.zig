@@ -24,7 +24,6 @@ const check_cmd = @import("check_cmd.zig");
 const DiagFormat = check_cmd.DiagFormat;
 const repl = @import("repl.zig");
 const test_report = @import("test_report.zig");
-const leaf_library = @import("leaf_library.zig");
 /// What a natively compiled program and `klio_rt` agree on.
 pub const cgen_abi = @import("cgen/rt_abi.zig");
 /// The run path `klio_rt` boots a program through.
@@ -136,8 +135,6 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     // machine, and arm the opt-in wall-clock deadline. Both are call-once.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
-    leaf_library.loadLeafLibrary();
-    defer leaf_library.leafDiagDump();
 
     // An appended bundle payload takes over: argv[1..] belongs to the embedded program.
     if (bundle_boot.bundleModeActive()) {
@@ -984,7 +981,6 @@ test {
     std.testing.refAllDecls(check_cmd);
     std.testing.refAllDecls(repl);
     std.testing.refAllDecls(test_report);
-    std.testing.refAllDecls(leaf_library);
     std.testing.refAllDecls(io);
     std.testing.refAllDecls(bundle);
     std.testing.refAllDecls(bundle_boot);

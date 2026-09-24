@@ -47,13 +47,6 @@ pub fn pushDispatch(v: *const Value) void {
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .dispatch }) catch {};
 }
 
-/// Push a context argument for the contextual callee about to be invoked: the callee frame takes the
-/// pushes in order as its context parameters. Never an implicit receiver.
-pub fn pushContext(v: *const Value) void {
-    const chain = ev_state.evtlsPtr().active_chain orelse return;
-    chain.append(chainAllocator(), .{ .v = v.*, .kind = .context }) catch {};
-}
-
 /// Push a receiver-lambda subject (`with(x) { … }`'s `x`): a receiver inside the lambda body, but its `outer` links are not.
 pub fn pushEnclosingSubject(v: *const Value) void {
     const chain = ev_state.evtlsPtr().active_chain orelse return;

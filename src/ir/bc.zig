@@ -41,10 +41,6 @@ pub const Op = enum(u32) {
     /// inst_idx, kind, dst, operand: a unary operator, with the scalar tags
     /// served inline and every other shape falling to the instruction's arm.
     un,
-    /// inst_idx, dst, receiver: a field read whose site has claimed a plain
-    /// stored slot for the receiver's class serves it inline; every other shape
-    /// falls to the instruction's own arm, exactly as `bin` does.
-    gf_site,
     /// inst_idx, kind, dst, lhs, rhs, t_block, f_block: the block's last
     /// instruction is a BinOp whose dst is the Branch condition. The compare
     /// still writes dst, so register state matches the unfused form;
@@ -58,7 +54,6 @@ pub const Stream = struct {
     /// resume machinery's (block, idx) coordinates enter mid-stream.
     idx_pc: []const u32,
 };
-
 
 pub fn enabled() bool {
     return true;
@@ -97,9 +92,6 @@ var cache: ?std.AutoHashMap(CacheKey, *const FuncStreams) = null;
 /// every cached FuncStreams, so a Func surviving the reset must not serve its
 /// memoized pointer into freed memory.
 var stream_gen = std.atomic.Value(u32).init(1);
-pub fn streamGen() u32 {
-    return stream_gen.load(.monotonic);
-}
 
 /// Drop every cached stream table, freeing the streams. Keys are blocks
 /// pointers, stable only for one program's life: an in-process driver reuses
@@ -173,8 +165,7 @@ fn fusible(func: *const ir.Func) bool {
     for (func.blocks) |*blk| {
         if (blk.h().catches.len != 0 or blk.h().finally != null or
             blk.h().finally_done != null or blk.h().finally_done_for != null or
-            blk.h().catch_done_for != null or blk.h().pop_on_exit.len != 0 or
-            blk.h().lr_absorb != null)
+            blk.h().catch_done_for != null or blk.h().pop_on_exit.len != 0)
         {
             return false;
         }
@@ -197,7 +188,7 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const, n_locals: u
     if (!fuse) {
         const dedicated = for (insts) |*inst| {
             switch (inst.*) {
-                .Const, .Move, .LoadParam, .CellGet, .BinOp, .GetField, .UnOp => break true,
+                .Const, .Move, .LoadParam, .CellGet, .BinOp, .UnOp => break true,
                 else => {},
             }
         } else false;
@@ -289,18 +280,6 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const, n_locals: u
                     @intFromEnum(u.op),
                     u.dst.int(),
                     u.operand.int(),
-                }) catch return null;
-            },
-            .GetField => |gf| {
-                if (!regOk(n_locals, gf.dst.int()) or !regOk(n_locals, gf.receiver.int())) {
-                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
-                    continue;
-                }
-                code.appendSlice(a, &.{
-                    @intFromEnum(Op.gf_site),
-                    @intCast(i),
-                    gf.dst.int(),
-                    gf.receiver.int(),
                 }) catch return null;
             },
             .BinOp => |bo| {
@@ -463,10 +442,6 @@ pub fn dumpStream(w: anytype, s: *const Stream) !void {
             .un => {
                 try w.print("  {d:>4}: un         r{d} <- op{d} r{d}\n", .{ pc, code[pc + 3], code[pc + 2], code[pc + 4] });
                 pc += 5;
-            },
-            .gf_site => {
-                try w.print("  {d:>4}: gf_site    r{d} <- r{d}.#{d}\n", .{ pc, code[pc + 2], code[pc + 3], code[pc + 1] });
-                pc += 4;
             },
             .const_int => {
                 try w.print("  {d:>4}: const_int  r{d} <- {d}\n", .{ pc, code[pc + 1], @as(i32, @bitCast(code[pc + 2])) });

@@ -48,7 +48,6 @@ const hand = @import("hand.zig");
 const Hand = hand.Hand;
 
 const type_int: ir.TypeRef = .{ .name = "kotlin.Int", .nullable = false, .args = &.{} };
-const type_bool: ir.TypeRef = .{ .name = "kotlin.Boolean", .nullable = false, .args = &.{} };
 
 test "eval_int_const" {
     var mem = hand.TestMemory.init();
@@ -163,100 +162,6 @@ test "suspend liveness keeps only values read on reachable resume paths" {
     try testing.expectEqualSlices(u32, &.{ 0, 1 }, before_move);
     const before_term = try suspendLiveRegs(&func, .from(0), entry_insts.len);
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, before_term);
-}
-
-test "resumed labeled return reaches its snapshotted target frame" {
-    var m = Module.default(testing.allocator);
-    defer m.deinit(testing.allocator);
-
-    const inner_blocks = [_]ir.Block{.{
-        .id = .from(0),
-        .insts = &.{},
-        .terminator = .{ .LabeledReturn = .{
-            .label = "hasNext",
-            .value = .from(0),
-        } },
-    }};
-    const outer_blocks = [_]ir.Block{.{
-        .id = .from(0),
-        .insts = &.{},
-        .terminator = .{ .Return = .from(0) },
-    }};
-    try m.funcs.append(testing.allocator, .{
-        .id = .from(0),
-        .name = "<lambda>",
-        .fqn = "test.hasNext.<lambda>",
-        .params = &.{},
-        .return_ty = type_bool,
-        .n_locals = 1,
-        .blocks = @constCast(&inner_blocks),
-        .entry = .from(0),
-        .is_suspend = false,
-        .is_lambda = true,
-    });
-    try m.funcs.append(testing.allocator, .{
-        .id = .from(1),
-        .name = "hasNext",
-        .fqn = "test.hasNext",
-        .params = &.{},
-        .return_ty = type_bool,
-        .n_locals = 1,
-        .blocks = @constCast(&outer_blocks),
-        .entry = .from(0),
-        .is_suspend = true,
-    });
-
-    var state = SuspendState{ .token = 1 };
-    const inner_regs = try testing.allocator.dupe(Value, &.{.{ .Bool = true }});
-    const outer_regs = try testing.allocator.dupe(Value, &.{Value.Unit});
-    const inner_params = try testing.allocator.alloc(Value, 0);
-    const inner_captures = try testing.allocator.alloc(Value, 0);
-    const inner_enclosing = try testing.allocator.alloc(EnclosingEntry, 0);
-    const inner_try = try testing.allocator.alloc(TryFrame, 0);
-    const outer_params = try testing.allocator.alloc(Value, 0);
-    const outer_captures = try testing.allocator.alloc(Value, 0);
-    const outer_enclosing = try testing.allocator.alloc(EnclosingEntry, 0);
-    const outer_try = try testing.allocator.alloc(TryFrame, 0);
-    try state.frames.append(testing.allocator, .{
-        .func = .from(0),
-        .module = null,
-        .block = .from(0),
-        .inst_idx = 0,
-        .regs = .{ .dense = inner_regs },
-        .params = inner_params,
-        .captures = inner_captures,
-        .enclosing_this = inner_enclosing,
-        .try_stack = inner_try,
-        .is_lambda = true,
-        .resume_reg = null,
-    });
-    try state.frames.append(testing.allocator, .{
-        .func = .from(1),
-        .module = null,
-        .block = .from(0),
-        .inst_idx = 0,
-        .regs = .{ .dense = outer_regs },
-        .params = outer_params,
-        .captures = outer_captures,
-        .enclosing_this = outer_enclosing,
-        .try_stack = outer_try,
-        .is_lambda = false,
-        .resume_reg = .from(0),
-    });
-
-    var host = nullHost();
-    const result = try resumeContinuation(
-        NullHost,
-        testing.allocator,
-        &m,
-        &state,
-        Value.Unit,
-        &host,
-    );
-    // `resumeContinuation` consumes the frame list; clear the moved handle.
-    state.frames = .empty;
-    try testing.expect(result == .ok);
-    try testing.expect(result.ok == .Bool and result.ok.Bool);
 }
 
 test "a resume value is made while the parked frames are rooted" {

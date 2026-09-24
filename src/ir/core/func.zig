@@ -10,7 +10,6 @@ const CatchHandler = core_inst.CatchHandler;
 const ConstId = core_ids.ConstId;
 const FuncId = core_ids.FuncId;
 const Inst = core_inst.Inst;
-const LrAbsorb = core_inst.LrAbsorb;
 const Module = root_ir.Module;
 const Reg = core_ids.Reg;
 const Terminator = core_inst.Terminator;
@@ -37,8 +36,6 @@ pub const BlockHandlers = struct {
     /// When this block is the JOIN of a catch-only try, the try body's entry block. Normal
     /// flow arriving here pops that body's `TryFrame`, which otherwise only a throw does.
     catch_done_for: ?BlockId = null,
-    /// Entering this block arms a labeled-return absorption region (see `LrAbsorb`).
-    lr_absorb: ?LrAbsorb = null,
     /// Try-region body entries whose `TryFrame` this block pops when it exits via `Goto`:
     /// an inline `return` replays its finallys inline and bypasses the sentinel that pops them.
     pop_on_exit: []const BlockId = &.{},
@@ -48,7 +45,7 @@ pub const BlockHandlers = struct {
 
     pub fn any(self: *const BlockHandlers) bool {
         return self.catches.len != 0 or self.finally != null or self.finally_done != null or
-            self.finally_done_for != null or self.catch_done_for != null or self.lr_absorb != null or
+            self.finally_done_for != null or self.catch_done_for != null or
             self.pop_on_exit.len != 0;
     }
 };
@@ -98,12 +95,6 @@ pub const FAST_CALL_AMBIG_FLAG: u16 = 0x2000;
 /// Whether the declaration currently lowering carries `@Suppress("DEPRECATION_ERROR")`,
 /// under which kotlinc restores `@Deprecated(level = ERROR)` candidates to ordinary rank.
 pub threadlocal var suppress_deprecation_error: bool = false;
-
-pub fn setSuppressDeprecationError(v: bool) bool {
-    const prev = suppress_deprecation_error;
-    suppress_deprecation_error = v;
-    return prev;
-}
 
 /// Effective low-priority rank at the site: a deprecation-ERROR overload ranks ordinary under the suppression.
 pub fn rankLowPriority(f: *const Func) bool {
@@ -178,8 +169,6 @@ pub const Func = struct {
     /// Argument-coercion walks that can apply to the declared params, computed on first frame
     /// entry: bit0 = computed, bit1 = a non-vararg `Long` param, bit2 = 2+ params with a type variable.
     coerce_plan: u8 = 0,
-    /// Flattening verdict: 0 unknown, 1 flattenable (simple subset, no catches or finally), 2 not.
-    flat_class: u8 = 0,
     /// Index of `"this"` in `capture_order`: -2 = not yet computed, -1 = no `this` capture.
     this_cap_idx: i32 = -2,
     /// Accessor-shape memo: 0 = unknown, 1 = not an accessor, 2 = the body is exactly
@@ -313,52 +302,6 @@ pub const Func = struct {
         return self.blocks.len != 0 or self.lazy_deferred;
     }
 
-    /// The GetField name ConstId when the body is exactly `LoadParam #0; GetField; return`,
-    /// else null. An image body decodes lazily, so classification needs the module in hand.
-    pub fn accessorFieldConstIn(self: *const Func, module: *const Module) ?ConstId {
-        if (self.acc_state == 0 and self.blocks.len == 0) {
-            _ = module.ensureFuncBody(@constCast(self));
-        }
-        return self.accessorFieldConst();
-    }
-
-    pub fn accessorFieldConst(self: *const Func) ?ConstId {
-        switch (self.acc_state) {
-            1 => return null,
-            2 => return @enumFromInt(self.acc_field),
-            else => {},
-        }
-        if (self.blocks.len == 0) return null;
-        const verdict: ?ConstId = blk: {
-            if (self.params.len != 1 or self.is_suspend or self.blocks.len != 1) break :blk null;
-            const b = &self.blocks[0];
-            if (b.h().catches.len != 0 or b.insts.len != 2) break :blk null;
-            const lp = switch (b.insts[0]) {
-                .LoadParam => |lp| lp,
-                else => break :blk null,
-            };
-            if (lp.idx != 0) break :blk null;
-            const gf = switch (b.insts[1]) {
-                .GetField => |gf| gf,
-                else => break :blk null,
-            };
-            if (gf.receiver != lp.dst) break :blk null;
-            const ret = switch (b.terminator) {
-                .Return => |r| r orelse break :blk null,
-                else => break :blk null,
-            };
-            if (ret != gf.dst) break :blk null;
-            break :blk gf.field;
-        };
-        if (verdict) |f| {
-            @constCast(self).acc_field = @intCast(f.int());
-            @constCast(self).acc_state = 2;
-            return f;
-        }
-        @constCast(self).acc_state = 1;
-        return null;
-    }
-
     /// Whether this body is a leaf expression: one block, no handlers, a `Return` of a register,
     /// and only parameter loads, constants, stored-field reads, moves and primitive operators,
     /// so it evaluates without building a frame.
@@ -446,7 +389,7 @@ pub const Func = struct {
         const entry_idx = self.entry.int();
         if (entry_idx >= nb) return false;
         for (self.blocks) |*b| {
-            if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return false;
+            if (b.h().catches.len != 0 or b.h().finally != null) return false;
         }
         const Ctx = struct {
             uses: RegSet = regSetEmpty(),
@@ -507,17 +450,7 @@ pub const Func = struct {
                             if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
                         }
                     },
-                    .Switch => |sw| {
-                        for (sw.arms) |arm| {
-                            const t = arm.target;
-                            if (t.int() >= nb) return false;
-                            if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
-                        }
-                        const t = sw.default;
-                        if (t.int() >= nb) return false;
-                        if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
-                    },
-                    .Return, .Throw, .Unreachable, .TailJump, .TailCallFunc, .NonLocalReturn, .LabeledReturn => {},
+                    .Return, .Throw, .Unreachable => {},
                 }
             }
             if (!changed) break;
@@ -537,7 +470,7 @@ pub const Func = struct {
         var total: usize = 0;
         for (self.blocks) |*b| {
             // A finally-carrying body needs the try-stack machinery the frameless walk skips.
-            if (b.h().catches.len != 0 or b.h().finally != null or b.h().lr_absorb != null) return false;
+            if (b.h().catches.len != 0 or b.h().finally != null) return false;
             total += b.insts.len;
             if (total > LEAF_MAX_INSTS) return false;
             switch (b.terminator) {
@@ -545,7 +478,6 @@ pub const Func = struct {
                 .Return, .Goto, .Branch => {},
                 // A guard's failing arm never runs on the path this serves; let the walk abandon there.
                 .Throw, .Unreachable => {},
-                else => return false,
             }
         }
         for (self.params) |*p| {
@@ -575,9 +507,6 @@ inline fn regSetEmpty() RegSet {
 }
 inline fn regSetFull() RegSet {
     return @splat(~@as(u64, 0));
-}
-inline fn regSetHas(a: RegSet, i: usize) bool {
-    return (a[i >> 6] >> @as(u6, @truncate(i))) & 1 != 0;
 }
 inline fn regSetSet(a: *RegSet, i: usize) void {
     a[i >> 6] |= @as(u64, 1) << @as(u6, @truncate(i));

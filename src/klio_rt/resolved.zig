@@ -638,15 +638,15 @@ fn raiseValue(which: Raise, msg: Value) noreturn {
 
 fn raiseName(which: Raise) []const u8 {
     return switch (which) {
-        .npe => "java.lang.NullPointerException",
-        .class_cast => "java.lang.ClassCastException",
-        .arithmetic => "java.lang.ArithmeticException",
+        .npe => "kotlin.NullPointerException",
+        .class_cast => "kotlin.ClassCastException",
+        .arithmetic => "kotlin.ArithmeticException",
         .uninitialized => "kotlin.UninitializedPropertyAccessException",
-        .index => "java.lang.IndexOutOfBoundsException",
-        .array_index => "java.lang.ArrayIndexOutOfBoundsException",
-        .string_index => "java.lang.StringIndexOutOfBoundsException",
-        .init_failed => "java.lang.ExceptionInInitializerError",
-        .no_class_def => "java.lang.NoClassDefFoundError",
+        .index => "kotlin.IndexOutOfBoundsException",
+        .array_index => "klio.ArrayIndexOutOfBoundsException",
+        .string_index => "klio.StringIndexOutOfBoundsException",
+        .init_failed => "klio.ExceptionInInitializerError",
+        .no_class_def => "klio.NoClassDefFoundError",
     };
 }
 
@@ -675,30 +675,30 @@ export fn klio_r_raise(which: u32, message: CValue) noreturn {
     raiseValue(@enumFromInt(which), fromC(message));
 }
 
-/// By the JVM class an initializer belongs to: the `toString()` of what it
-/// threw first, which every later use's error names.
+/// By the unit an initializer belongs to: the `toString()` of what it threw
+/// first, which every later use's error names.
 var init_failures: std.StringHashMapUnmanaged([]const u8) = .empty;
 
-/// The initializer of the JVM class `name_z` (an object's, a companion's,
-/// a file's or an enum's) threw `cause`, or `cause` is null on a later use
-/// of one that did. It fails as JVM class initialization does. The first use
-/// gets `ExceptionInInitializerError` over the throw, or the throw itself
-/// when it is an `Error`. Every later use gets `NoClassDefFoundError("Could
-/// not initialize class <name>")`, caused by an `ExceptionInInitializerError`
-/// naming the first failure.
+/// The initializer of `name_z` (an object's, a companion's, a file's or an
+/// enum's, named with its noun: `object pkg.Config`) threw `cause`, or
+/// `cause` is null on a later use of one that did. The first use gets
+/// `ExceptionInInitializerError` over the throw, or the throw itself when it
+/// is an `Error`. Every later use gets `NoClassDefFoundError("Could not
+/// initialize <name>")`, caused by an `ExceptionInInitializerError` naming
+/// the first failure.
 export fn klio_r_init_failed(cause: CValue, name_z: [*:0]const u8) noreturn {
     const a = alloc();
     const c = fromC(cause);
     const name = std.mem.span(name_z);
     if (c != .Null) {
         const text = fromC(klio_r_to_string(cause));
-        const owned = std.heap.smp_allocator.dupe(u8, if (text == .String) text.String.asPtrConst().bytes else "java.lang.Throwable") catch @panic("init failure: out of memory");
+        const owned = std.heap.smp_allocator.dupe(u8, if (text == .String) text.String.asPtrConst().bytes else "kotlin.Throwable") catch @panic("init failure: out of memory");
         init_failures.put(std.heap.smp_allocator, name, owned) catch @panic("init failure: out of memory");
         if (isError(c)) throwValue(c);
         const rz = tables.base.init_failed orelse uncaughtCaused(raiseName(.init_failed), owned);
         throwValue(build(rz, &.{ .Null, c }));
     }
-    const text = std.fmt.allocPrint(a, "Could not initialize class {s}", .{name}) catch @panic("init failure: out of memory");
+    const text = std.fmt.allocPrint(a, "Could not initialize {s}", .{name}) catch @panic("init failure: out of memory");
     const nc = tables.base.no_class_def orelse uncaughtText(raiseName(.no_class_def), text);
     var first: Value = .Null;
     if (init_failures.get(name)) |t| if (tables.base.init_failed) |rz| {

@@ -64,56 +64,6 @@ pub fn getMemberFieldNoExt(self: *VmHost, allocator: Allocator, receiver: *const
 
 pub const FieldSiteClaim = struct { cls: u64, route: u64 };
 
-/// Frameless accessor-getter serve: a `LoadParam #0; GetField; return` body
-/// whose class claimed the func's route as a plain stored slot reads that slot
-/// with no frame, returning what the (class, name) memo would inside GetField,
-/// re-verified by name. Every other shape takes the frame path.
-pub fn accessorFastGet(self: *VmHost, mod: *const Module, f: *const ir.Func, receiver: *const Value) ?EvalResult {
-    if (receiver.* != .Instance) return null;
-    const fc = f.accessorFieldConstIn(mod) orelse return null;
-    const claimed = @atomicLoad(u64, @constCast(&f.acc_cls), .acquire);
-    if (claimed == 1) return null;
-    if (fc.int() >= mod.consts.items.len) return null;
-    const fname: []const u8 = switch (mod.consts.items[fc.int()]) {
-        .String => |s| s,
-        else => return null,
-    };
-    var cls: u64 = 0;
-    {
-        const g = receiver.Instance.borrow();
-        defer g.deinit();
-        cls = @intCast(g.get().class.identity());
-    }
-    if (claimed == 0) {
-        // First resolution claims the func once the memo routes the read to a
-        // stored slot; that call itself still takes the frame path.
-        if (fieldSiteRoute(self, receiver, fname)) |r| {
-            if (r.route & 3 == 1) {
-                if (@cmpxchgStrong(u64, @constCast(&f.acc_cls), 0, r.cls, .acq_rel, .monotonic) == null) {
-                    @atomicStore(u64, @constCast(&f.acc_route), r.route, .release);
-                }
-            } else {
-                _ = @cmpxchgStrong(u64, @constCast(&f.acc_cls), 0, 1, .acq_rel, .monotonic);
-            }
-        }
-        return null;
-    }
-    if (claimed != cls) return null;
-    const route = @atomicLoad(u64, @constCast(&f.acc_route), .acquire);
-    if (route == 0 or route & 3 != 1) return null;
-    const idx: usize = @intCast(route >> 2);
-    const g = receiver.Instance.borrow();
-    defer g.deinit();
-    const fields = g.get().fields.items;
-    if (idx >= fields.len) return null;
-    const fld = &fields[idx];
-    if (!std.mem.eql(u8, fld.name, fname) and !sgetterNameMatches(fname, fld.name)) return null;
-    const v = fld.value;
-    if (v == .Null or v == .Delegate) return null;
-    v.retain();
-    return ok(v);
-}
-
 /// Whether a stored null is plain and not an unset `lateinit`, whose read must
 /// throw. Decided from the class, so a site memo can serve nulls.
 pub fn storedNullServable(self: *VmHost, receiver: *const Value, name: []const u8) bool {

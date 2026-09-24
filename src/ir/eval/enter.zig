@@ -28,7 +28,6 @@ const ev_fused = @import("fused.zig");
 const ev_host = @import("host.zig");
 const ev_leaf = @import("leaf.zig");
 const ev_loop = @import("loop.zig");
-const ev_native = @import("native.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 
@@ -37,7 +36,6 @@ const EvalError = ev_state.EvalError;
 const EvalResult = ev_flow.EvalResult;
 const EvalTls = ev_state.EvalTls;
 const Frame = ev_frame.Frame;
-const LEAF_MAX_DEPTH = ev_leaf.LEAF_MAX_DEPTH;
 const NullHost = ev_host.NullHost;
 const TryFrame = ev_snapshot.TryFrame;
 const callStatsBumpId = ev_diag.callStatsBumpId;
@@ -49,8 +47,6 @@ const gcPopFrame = ev_state.gcPopFrame;
 const gcPushFrame = ev_state.gcPushFrame;
 const leafExprServeAt = ev_leaf.leafExprServeAt;
 const lrTraceOn = ev_flow.lrTraceOn;
-const nativeFor = ev_native.nativeFor;
-const nativeModuleOk = ev_native.nativeModuleOk;
 const nullHost = ev_host.nullHost;
 const ok = ev_flow.ok;
 const runFrame = ev_activation.runFrame;
@@ -165,9 +161,8 @@ pub fn leafExprServe(
     module: *const Module,
     func: *const Func,
     args: []const Value,
-    host: *H,
 ) Allocator.Error!?EvalResult {
-    return leafExprServeAt(H, allocator, module, func, args, host, LEAF_MAX_DEPTH);
+    return leafExprServeAt(H, allocator, module, func, args);
 }
 
 /// Like `eval`, but routes non-trivial dispatch through `H`, a comptime-duck-typed concrete host.
@@ -206,20 +201,8 @@ pub fn fuseGateDump() void {
     }
 }
 
-pub fn fusedServeArgs(
-    comptime H: type,
-    allocator: Allocator,
-    module: *const Module,
-    func: *const Func,
-    args: []const Value,
-    host: *H,
-) Allocator.Error!?EvalResult {
-    if (nativeModuleOk(module) and nativeFor(func.id.int(), func.fqn) != null) return null;
-    return fusedExecOpt(H, allocator, module, func, args, host, false);
-}
-
 pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), host: *H) Allocator.Error!EvalResult {
-    dumpFnIfRequested(module, func);
+    dumpFnIfRequested(func);
     boolThisTrap(func, args.items);
     return evalWithCaptures(H, allocator, module, func, args, .empty, host);
 }
@@ -253,7 +236,7 @@ var dump_fn_done: bool = false;
 /// Cached `KLIO_DUMP_FN` value; an empty slice means unset.
 var dump_fn_want: ?[]const u8 = null;
 
-pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
+pub fn dumpFnIfRequested(func: *const Func) void {
     const want = dump_fn_want orelse blk: {
         const w = runtime.envOnce("KLIO_DUMP_FN") orelse "";
         dump_fn_want = w;
@@ -279,22 +262,10 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
         for (blk.insts, 0..) |*inst, ii| {
             std.debug.print("    {d}: {s}", .{ ii, @tagName(std.meta.activeTag(inst.*)) });
             switch (inst.*) {
-                .LoadGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
-                .GetField => |x| std.debug.print(" field={s} recv=r{d} dst=r{d} own={s}:{d}", .{ constStr(module, x.field) orelse "?", x.receiver.int(), x.dst.int(), @tagName(x.own_kind), x.own_slot }),
-                .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
-                .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d} func={?d} final={} class={?d} cands={d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int(), if (x.func) |f| f.int() else null, x.func_final, if (x.class) |c| c.int() else null, if (x.candidates) |cl| cl.len else 0 }),
-                .CallMember => |x| std.debug.print(" name={s} recv=r{d} resolved={?d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), if (x.x().resolved) |f| f.int() else null }),
                 .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .LoadParam => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Const => |x| std.debug.print(" dst=r{d}", .{x.dst.int()}),
-                .CallValue => |x| std.debug.print(" callee=r{d} dst=r{d} args=r{d}+{d}", .{ x.callee.int(), x.dst.int(), x.args.int(), x.n_args }),
-                .ContextPush => |x| std.debug.print(" args=r{d}+{d}", .{ x.args.int(), x.n }),
-                .LoadContextParam => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
-                .Call => |x| std.debug.print(" func=#{d} dst=r{d} args=r{d}+{d} exact={}", .{ x.func.int(), x.dst.int(), x.args.int(), x.n_args, x.exact }),
-                .CallValueWithThis => |x| std.debug.print(" callee=r{d} recv=r{d} dst=r{d} args=r{d}+{d} exact={}", .{ x.callee.int(), x.receiver.int(), x.dst.int(), x.args.int(), x.n_args, x.receiver_shape_exact }),
-                .CallValueOrMember => |x| std.debug.print(" name={s} callee=r{d} this=r{d} dst=r{d}", .{ constStr(module, x.name) orelse "?", x.callee.int(), x.this_recv.int(), x.dst.int() }),
-                .CallMemberOrValue => |x| std.debug.print(" name={s} recv=r{d} fallback=r{d} dst=r{d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), x.fallback.int(), x.dst.int() }),
                 .Trace => |t| {
                     if (span.active_map) |m| {
                         if (m.getChecked(t.span.file)) |sf| {
@@ -304,7 +275,6 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
                     }
                 },
                 .BinOp => |x| std.debug.print(" op={s} dst=r{d} lhs=r{d} rhs=r{d}", .{ @tagName(x.op), x.dst.int(), x.lhs.int(), x.rhs.int() }),
-                .CallVirtual => |x| std.debug.print(" slot={d} recv=r{d} dst=r{d}", .{ x.slot.int(), x.receiver.int(), x.dst.int() }),
                 else => {},
             }
             std.debug.print("\n", .{});
@@ -334,19 +304,6 @@ pub fn evalWithCapturesIn(
     host: *H,
 ) Allocator.Error!EvalResult {
     return evalWithCapturesChained(H, allocator, module, owning, func, args, captures, &.{}, null, host);
-}
-
-/// Pop try frames until one with a finally is found, skipping the frame whose finally is
-/// currently executing (`cur`); catch clauses never intercept a non-local return.
-pub fn nearestFinally(try_stack: *std.ArrayList(TryFrame), cur: BlockId) ?struct { jump: BlockId, key: BlockId } {
-    while (try_stack.pop()) |tf| {
-        if (tf.finally_entry) |fin| {
-            if (std.meta.eql(fin, cur)) continue;
-            const key = tf.finally_done orelse fin;
-            return .{ .jump = fin, .key = key };
-        }
-    }
-    return null;
 }
 
 /// Where a non-local return goes once this frame's finallys have run: a labeled return to the
@@ -397,15 +354,14 @@ pub fn evalWithCapturesChained(
     closure_id: ?u64,
     host: *H,
 ) Allocator.Error!EvalResult {
-    dumpFnIfRequested(module, func);
+    dumpFnIfRequested(func);
     boolThisTrap(func, args.items);
     // The recursive call seam, the one point every interpreted call passes through. A leaf callee
-    // needs no frame; one with a registered transpiled body goes framed so its emitted C runs.
+    // needs no frame.
     if (owning == null and closure_id == null and chain_seed.len == 0 and
-        captures.items.len == 0 and func.leafExprBody() and
-        (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
+        captures.items.len == 0 and func.leafExprBody())
     {
-        if (try leafExprServe(H, allocator, module, func, args.items, host)) |lr| {
+        if (try leafExprServe(H, allocator, module, func, args.items)) |lr| {
             var a = args;
             a.deinit(allocator);
             var c = captures;
@@ -426,16 +382,11 @@ pub fn evalWithCapturesChained(
             2
         else if (captures.items.len != 0)
             3
-        else if (nativeModuleOk(module) and nativeFor(func.id.int(), func.fqn) != null)
-            4
         else
             5;
         _ = fuse_gate_counts[slot].fetchAdd(1, .monotonic);
     }
-    if (owning == null and closure_id == null and chain_seed.len == 0 and
-        captures.items.len == 0 and
-        (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
-    {
+    if (owning == null and closure_id == null and chain_seed.len == 0 and captures.items.len == 0) {
         if (try fusedExecOpt(H, allocator, module, func, args.items, host, false)) |fr| {
             var a = args;
             a.deinit(allocator);

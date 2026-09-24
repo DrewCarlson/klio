@@ -151,7 +151,6 @@ const read_paths = @import("host_fields/read_paths.zig");
 pub const getMemberField = read_paths.getMemberField;
 pub const getMemberFieldNoExt = read_paths.getMemberFieldNoExt;
 pub const FieldSiteClaim = read_paths.FieldSiteClaim;
-pub const accessorFastGet = read_paths.accessorFastGet;
 pub const storedNullServable = read_paths.storedNullServable;
 pub const fieldWriteSiteRoute = read_paths.fieldWriteSiteRoute;
 pub const fieldSiteRoute = read_paths.fieldSiteRoute;
