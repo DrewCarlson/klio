@@ -29,6 +29,14 @@ include = [
     "androidx/graphics/shapes/Utils.kt",
 ]
 
+# jvmMain: the desktop's number formatting for a shape's toString, which
+# formats to three decimals with `String.format` as klio does too.
+[[source]]
+root = "../klio-compose-runtime/upstream/graphics/graphics-shapes/src/jvmMain/kotlin"
+include = [
+    "androidx/graphics/shapes/Format.jvm.kt",
+]
+
 [deps]
 stdlib = "*"
 "androidx.annotation" = "*"

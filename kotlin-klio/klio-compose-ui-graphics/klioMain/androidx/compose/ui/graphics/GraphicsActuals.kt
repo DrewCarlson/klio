@@ -93,11 +93,58 @@ internal actual fun ActualImageShader(
 internal actual fun ActualCompositeShader(dst: Shader, src: Shader, blendMode: BlendMode): Shader =
     throw NotImplementedError("composite shaders are not yet supported")
 
-// The platform color-filter handle + its factories (pending the Skia shim).
-internal actual class NativeColorFilter
+/**
+ * The platform color filter: a tint, the color and blend mode the Skia shim
+ * blends a draw's colors with (skiko's is `ColorFilter.makeBlend`). The
+ * matrix and lighting filters are not drawn yet.
+ */
+internal actual class NativeColorFilter internal constructor(internal val argb: Int, internal val mode: Int)
 
 internal actual fun actualTintColorFilter(color: Color, blendMode: BlendMode): NativeColorFilter =
-    throw NotImplementedError("color filters are not yet supported")
+    NativeColorFilter(color.klioArgb(), blendMode.skiaCode())
+
+/** The color as packed 0xAARRGGBB, from its own channels. */
+internal fun Color.klioArgb(): Int {
+    val a = (alpha * 255f + 0.5f).toInt().coerceIn(0, 255)
+    val r = (red * 255f + 0.5f).toInt().coerceIn(0, 255)
+    val g = (green * 255f + 0.5f).toInt().coerceIn(0, 255)
+    val b = (blue * 255f + 0.5f).toInt().coerceIn(0, 255)
+    return (a shl 24) or (r shl 16) or (g shl 8) or b
+}
+
+/** The blend mode's index in Skia's SkBlendMode, which Compose's order follows. */
+internal fun BlendMode.skiaCode(): Int = when (this) {
+    BlendMode.Clear -> 0
+    BlendMode.Src -> 1
+    BlendMode.Dst -> 2
+    BlendMode.SrcOver -> 3
+    BlendMode.DstOver -> 4
+    BlendMode.SrcIn -> 5
+    BlendMode.DstIn -> 6
+    BlendMode.SrcOut -> 7
+    BlendMode.DstOut -> 8
+    BlendMode.SrcAtop -> 9
+    BlendMode.DstAtop -> 10
+    BlendMode.Xor -> 11
+    BlendMode.Plus -> 12
+    BlendMode.Modulate -> 13
+    BlendMode.Screen -> 14
+    BlendMode.Overlay -> 15
+    BlendMode.Darken -> 16
+    BlendMode.Lighten -> 17
+    BlendMode.ColorDodge -> 18
+    BlendMode.ColorBurn -> 19
+    BlendMode.Hardlight -> 20
+    BlendMode.Softlight -> 21
+    BlendMode.Difference -> 22
+    BlendMode.Exclusion -> 23
+    BlendMode.Multiply -> 24
+    BlendMode.Hue -> 25
+    BlendMode.Saturation -> 26
+    BlendMode.Color -> 27
+    BlendMode.Luminosity -> 28
+    else -> 3
+}
 
 internal actual fun actualColorMatrixColorFilter(colorMatrix: ColorMatrix): NativeColorFilter =
     throw NotImplementedError("color filters are not yet supported")
@@ -137,3 +184,9 @@ internal actual fun ActualImageBitmap(
 
 internal actual fun createImageBitmap(bytes: ByteArray): ImageBitmap =
     throw NotImplementedError("ImageBitmap decoding is not yet supported")
+
+/** Every tile mode draws through the Skia shim, as skiko's actual answers. */
+actual fun TileMode.isSupported(): Boolean = true
+
+/** Every blend mode draws through the Skia shim, as skiko's actual answers. */
+actual fun BlendMode.isSupported(): Boolean = true

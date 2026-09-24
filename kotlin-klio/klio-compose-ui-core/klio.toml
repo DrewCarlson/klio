@@ -275,9 +275,15 @@ include = [
     "androidx/compose/ui/platform/TranslationsCache.skiko.kt",
     "androidx/compose/ui/input/pointer/PointerButton.skiko.kt",
     "androidx/compose/ui/SystemTheme.kt",
+    "androidx/compose/ui/platform/PlatformWindowInsets.skiko.kt",
+    "androidx/compose/ui/platform/PlatformWindowInsetsProviderNode.skiko.kt",
+    "androidx/compose/ui/layout/WindowInsetsRulers.skiko.kt",
+    "androidx/compose/ui/viewinterop/InteropViewFactoryHolder.skiko.kt",
+    "androidx/compose/ui/input/key/KeyEvent.skiko.kt",
 ]
 
-# desktopMain: the java-free localization of the platform strings (copy, cut,
+# desktopMain: the java-free desktop actuals: the velocity tracker, focusability,
+# and the localization of the platform strings (copy, cut,
 # paste, select all) that LocalLocalization serves the text context menus.
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui/src/desktopMain/kotlin"
@@ -285,6 +291,16 @@ include = [
     "androidx/compose/ui/platform/PlatformLocalization.desktop.kt",
     "androidx/compose/ui/platform/Strings.kt",
     "androidx/compose/ui/platform/l10n/",
+    "androidx/compose/ui/input/pointer/util/PlatformVelocityTracker.desktop.kt",
+    "androidx/compose/ui/focus/Focusability.desktop.kt",
+]
+
+# nonJvmMain: the actuals every non-JVM target shares that klio can take as
+# they are.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui/src/nonJvmMain/kotlin"
+include = [
+    "androidx/compose/ui/platform/Actuals.nonJvm.kt",
 ]
 
 # klioMain: platform-primitive actuals (atomics, sync, refs, identity hash).

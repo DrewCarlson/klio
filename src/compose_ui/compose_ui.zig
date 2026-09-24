@@ -81,6 +81,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_c_clip_rect", canvasClipRect);
     try b.register("androidx.compose.ui.graphics.__skia_c_clip_path", canvasClipPath);
     try b.register("androidx.compose.ui.graphics.__skia_c_set_shader", canvasSetShader);
+    try b.register("androidx.compose.ui.graphics.__skia_c_set_blur", canvasSetBlur);
+    try b.register("androidx.compose.ui.graphics.__skia_c_set_color_filter", canvasSetColorFilter);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_rect", canvasDrawRect);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_rrect", canvasDrawRRect);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_oval", canvasDrawOval);
@@ -164,6 +166,8 @@ const Skia = struct {
     cClipRect: ?CClipRectFn,
     cClipPath: ?CClipPathFn,
     cSetShader: ?CSetShaderFn,
+    cSetBlur: ?CRotateFn,
+    cSetColorFilter: ?CSetColorFilterFn,
     cDrawRect: ?CDrawRectFn,
     cDrawRRect: ?CDrawRRectFn,
     cDrawOval: ?CDrawRectFn,
@@ -220,6 +224,7 @@ const CRotateFn = *const fn (?*SkSurface, f32) callconv(.c) void;
 const CClipRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int) callconv(.c) void;
 const CClipPathFn = *const fn (?*SkSurface, [*:0]const u8, c_int) callconv(.c) void;
 const CSetShaderFn = *const fn (?*SkSurface, [*:0]const u8) callconv(.c) void;
+const CSetColorFilterFn = *const fn (?*SkSurface, u32, c_int) callconv(.c) void;
 // The trailing (argb, style, strokeWidth, cap, join, aa) is the packed paint.
 const CDrawRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
 const CDrawRRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
@@ -313,6 +318,8 @@ fn loadSkia() ?*Skia {
         .cClipRect = lib.lookup(CClipRectFn, "klio_skia_c_clip_rect"),
         .cClipPath = lib.lookup(CClipPathFn, "klio_skia_c_clip_path"),
         .cSetShader = lib.lookup(CSetShaderFn, "klio_skia_c_set_shader"),
+        .cSetBlur = lib.lookup(CRotateFn, "klio_skia_c_set_blur"),
+        .cSetColorFilter = lib.lookup(CSetColorFilterFn, "klio_skia_c_set_color_filter"),
         .cDrawRect = lib.lookup(CDrawRectFn, "klio_skia_c_draw_rect"),
         .cDrawRRect = lib.lookup(CDrawRRectFn, "klio_skia_c_draw_rrect"),
         .cDrawOval = lib.lookup(CDrawRectFn, "klio_skia_c_draw_oval"),
@@ -395,6 +402,8 @@ fn loadSkiaStatic() ?*Skia {
         .cClipRect = externSym(CClipRectFn, "klio_skia_c_clip_rect"),
         .cClipPath = externSym(CClipPathFn, "klio_skia_c_clip_path"),
         .cSetShader = externSym(CSetShaderFn, "klio_skia_c_set_shader"),
+        .cSetBlur = externSym(CRotateFn, "klio_skia_c_set_blur"),
+        .cSetColorFilter = externSym(CSetColorFilterFn, "klio_skia_c_set_color_filter"),
         .cDrawRect = externSym(CDrawRectFn, "klio_skia_c_draw_rect"),
         .cDrawRRect = externSym(CDrawRRectFn, "klio_skia_c_draw_rrect"),
         .cDrawOval = externSym(CDrawRectFn, "klio_skia_c_draw_oval"),
@@ -1372,6 +1381,21 @@ fn canvasSetShader(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+/// Arm the next draw's blur by its sigma; zero clears it.
+fn canvasSetBlur(ctx: *CallCtx) Error!EvalResult {
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (ctx.args.len >= 2) if (surfArg(ctx.args[0])) |s| if (skia.cSetBlur) |f| f(s, argFloat(ctx.args[1]));
+    return ok(Value.newLong(0));
+}
+
+/// Arm the next draw's tint, (argb, blend mode); a negative mode clears it.
+fn canvasSetColorFilter(ctx: *CallCtx) Error!EvalResult {
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (ctx.args.len >= 3) if (surfArg(ctx.args[0])) |s| if (skia.cSetColorFilter) |f|
+        f(s, argU32(ctx.args[1]), @intCast(argInt(ctx.args[2])));
+    return ok(Value.newLong(0));
+}
+
 /// The trailing paint args are (argb, style, strokeWidth, cap, join, aa).
 fn canvasDrawRect(ctx: *CallCtx) Error!EvalResult {
     if (runtime.envOnce("KLIO_DRAW_TRACE") != null and ctx.args.len >= 11) {
@@ -1512,11 +1536,13 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_new") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_path") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_shader") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_blur") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_color_filter") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_text") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 77), b.len());
+    try testing.expectEqual(@as(usize, 79), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

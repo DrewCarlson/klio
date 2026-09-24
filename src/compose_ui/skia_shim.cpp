@@ -27,6 +27,10 @@
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkImage.h"
 #include "include/core/SkImageInfo.h"
+#include "include/core/SkBlurTypes.h"
+#include "include/core/SkMaskFilter.h"
+#include "include/core/SkColorFilter.h"
+#include "include/core/SkBlendMode.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPath.h"
 #include "include/core/SkPathBuilder.h"
@@ -208,6 +212,15 @@ std::vector<std::string> wrapLines(const char* utf8, float width, const SkFont& 
 }
 
 inline SkColor toColor(uint32_t argb) { return static_cast<SkColor>(argb); }
+
+// A blur and a color filter for the next draw's paint, as a Canvas actual's
+// paint carries them: a shadow's blur (Paint.setBlurFilter) is the
+// normal-style Gaussian mask filter of its sigma, as skiko's
+// MaskFilter.makeBlur(NORMAL, sigma), and a tint is the blend color filter of
+// its color and mode, as skiko's ColorFilter.makeBlend. The canvas arms them
+// before a draw and clears them after.
+thread_local sk_sp<SkMaskFilter> g_pendingBlur;
+thread_local sk_sp<SkColorFilter> g_pendingColorFilter;
 
 inline void fillPaint(SkPaint& p, uint32_t argb) {
     p.setAntiAlias(true);
@@ -500,7 +513,11 @@ void klio_skia_c_draw_surface(KlioSurface* dst, KlioSurface* src, float x, float
     if (!dst || !src) return;
     sk_sp<SkImage> img = src->surface->makeImageSnapshot();
     if (!img) return;
-    dst->surface->getCanvas()->drawImage(img, x, y, SkSamplingOptions(SkFilterMode::kLinear), nullptr);
+    // A tinted image draw (a shadow's) filters the image's colors.
+    SkPaint paint;
+    if (g_pendingColorFilter) paint.setColorFilter(g_pendingColorFilter);
+    dst->surface->getCanvas()->drawImage(img, x, y, SkSamplingOptions(SkFilterMode::kLinear),
+                                         g_pendingColorFilter ? &paint : nullptr);
 }
 
 void klio_skia_c_draw_surface_rect(
@@ -510,12 +527,14 @@ void klio_skia_c_draw_surface_rect(
     if (!dst || !src) return;
     sk_sp<SkImage> img = src->surface->makeImageSnapshot();
     if (!img) return;
+    SkPaint paint;
+    if (g_pendingColorFilter) paint.setColorFilter(g_pendingColorFilter);
     dst->surface->getCanvas()->drawImageRect(
         img,
         SkRect::MakeLTRB(sl, st, sr, sb),
         SkRect::MakeLTRB(dl, dt, dr, db),
         SkSamplingOptions(SkFilterMode::kLinear),
-        nullptr,
+        g_pendingColorFilter ? &paint : nullptr,
         SkCanvas::kStrict_SrcRectConstraint);
 }
 
@@ -1118,11 +1137,24 @@ extern "C" void klio_skia_c_set_shader(KlioSurface* /*s*/, const char* text) {
     g_pendingShader = makeShaderFromText(text);
 }
 
+// A sigma of zero or less clears the pending blur.
+extern "C" void klio_skia_c_set_blur(KlioSurface* /*s*/, float sigma) {
+    g_pendingBlur = sigma > 0 ? SkMaskFilter::MakeBlur(kNormal_SkBlurStyle, sigma) : nullptr;
+}
+
+// `mode` is Compose's BlendMode, whose order is SkBlendMode's; a negative
+// mode clears the pending color filter.
+extern "C" void klio_skia_c_set_color_filter(KlioSurface* /*s*/, uint32_t argb, int mode) {
+    g_pendingColorFilter = mode >= 0 ? SkColorFilters::Blend(toColor(argb), static_cast<SkBlendMode>(mode)) : nullptr;
+}
+
 SkPaint klioCanvasPaint(uint32_t argb, int style, float strokeWidth, int cap, int join, int aa) {
     SkPaint p;
     p.setAntiAlias(aa != 0);
     p.setColor(toColor(argb));
     if (g_pendingShader) p.setShader(g_pendingShader);
+    if (g_pendingBlur) p.setMaskFilter(g_pendingBlur);
+    if (g_pendingColorFilter) p.setColorFilter(g_pendingColorFilter);
     if (style == 1) {  // Stroke (0 = Fill; compose has no separate FillAndStroke)
         p.setStyle(SkPaint::kStroke_Style);
         p.setStrokeWidth(strokeWidth);

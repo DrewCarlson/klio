@@ -37,6 +37,15 @@ import androidx.lifecycle.LifecycleOwner
 actual val LocalLifecycleOwner get() = androidx.lifecycle.compose.LocalLifecycleOwner
 
 /**
+ * The window insets of the current scene, which klio's host provides as none,
+ * as a desktop window has.
+ */
+@InternalComposeUiApi
+val LocalPlatformWindowInsets = staticCompositionLocalOf<PlatformWindowInsets> {
+    error("CompositionLocal LocalPlatformWindowInsets not present")
+}
+
+/**
  * The CompositionLocal providing prefetch scheduler associated with the current scene.
  */
 @InternalComposeUiApi

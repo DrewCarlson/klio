@@ -27,6 +27,9 @@ internal class KlioPaint : Paint {
     override var shader: Shader? = null
     override var colorFilter: ColorFilter? = null
     override var pathEffect: PathEffect? = null
+
+    /** A shadow's blur (`Paint.setBlurFilter`), which the canvas applies to the draw. */
+    var blurFilter: androidx.compose.ui.graphics.shadow.BlurFilter? = null
 }
 
 /** The klio [Paint] factory actual. */

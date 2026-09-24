@@ -87,6 +87,9 @@ sparse=(
   "compose/material3/material3/src/desktopMain"
   "compose/material3/material3/src/jvmAndAndroidMain"
   "compose/material3/material3/src/nonJvmMain"
+  "compose/runtime/runtime/src/desktopMain"
+  "compose/runtime/runtime/src/jvmAndAndroidMain"
+  "compose/runtime/runtime/src/nonJvmMain"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)

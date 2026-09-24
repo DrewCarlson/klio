@@ -1,0 +1,7 @@
+Key: A
+Key: Enter
+Key: Shift
+Key: NumPad-5
+true KeyDown 97 true false
+systemBars top=0 left=0
+padded size 100 x 50

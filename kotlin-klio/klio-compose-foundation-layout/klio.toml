@@ -45,6 +45,15 @@ include = [
     "androidx/compose/foundation/layout/internal/JvmDefaultWithCompatibility.kt",
 ]
 
+# skikoMain: the window insets actuals, read from the scene's platform insets
+# (none on a desktop window).
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/foundation/foundation-layout/src/skikoMain/kotlin"
+include = [
+    "androidx/compose/foundation/layout/WindowInsets.skiko.kt",
+    "androidx/compose/foundation/layout/WindowInsetsPadding.skiko.kt",
+]
+
 [deps]
 stdlib = "*"
 "androidx.annotation" = "*"

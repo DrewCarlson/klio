@@ -64,7 +64,9 @@ import androidx.compose.ui.node.OwnerSnapshotObserver
 import androidx.compose.ui.node.RootForTest
 import androidx.compose.ui.platform.AccessibilityManager
 import androidx.compose.ui.InternalComposeUiApi
+import androidx.compose.ui.platform.EmptyPlatformWindowInsets
 import androidx.compose.ui.platform.LocalPlatformPrefetchScheduler
+import androidx.compose.ui.platform.LocalPlatformWindowInsets
 import androidx.compose.ui.platform.PlatformPrefetchRequest
 import androidx.compose.ui.platform.PlatformPrefetchScheduler
 import androidx.compose.ui.platform.Clipboard
@@ -225,8 +227,8 @@ internal class KlioGraphicsContext : GraphicsContext {
 
     override fun releaseGraphicsLayer(layer: GraphicsLayer) {}
 
-    override val shadowContext: androidx.compose.ui.graphics.shadow.ShadowContext
-        get() = throw UnsupportedOperationException("klio: drop-shadow context not yet supported")
+    // The shadow context is GraphicsContext's own: its painters render a
+    // shadow into an ImageBitmap through a blurred paint and draw it back.
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +563,7 @@ internal object KlioPrefetchScheduler : PlatformPrefetchScheduler {
 internal fun ProvideKlioCompositionLocals(owner: KlioComposeOwner, content: @Composable () -> Unit) {
     CompositionLocalProvider(
         LocalPlatformPrefetchScheduler provides KlioPrefetchScheduler,
+        LocalPlatformWindowInsets provides EmptyPlatformWindowInsets,
         LocalDensity provides owner.density,
         LocalLayoutDirection provides owner.layoutDirection,
         LocalFontFamilyResolver providesDefault owner.fontFamilyResolver,
