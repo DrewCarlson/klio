@@ -269,6 +269,14 @@ include = [
     "androidx/compose/material3/internal/ripple/Ripple.skiko.kt",
 ]
 
+# nonJvmMain: the date picker's two inline string formatters, which fill a
+# template through internal.formatString (the JVM's use String.format).
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/material3/material3/src/nonJvmMain/kotlin"
+include = [
+    "androidx/compose/material3/DatePicker.nonJvm.kt",
+]
+
 [[source]]
 root = "klioMain"
 

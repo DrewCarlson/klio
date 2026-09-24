@@ -1,13 +1,9 @@
 # Known unresolved, unrecorded or unlowered sites of scripts/sema-census.py:
 # <reason> <path:line:col>, then the first scope and the detail after tabs.
 # The gate fails on any other site and on a listed one that is gone.
-lower_lowering ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/DatePicker.kt:2366:25	pack:androidx.compose.material3	inline function `androidx.compose.material3.formatDatePickerNavigateToYearString` has no body to instantiate
-lower_lowering ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/DatePicker.kt:727:13	pack:androidx.compose.material3	inline function `androidx.compose.material3.formatHeadlineDescription` has no body to instantiate
 lower_unbound_native ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/AlertDialog.kt:95:8	pack:androidx.compose.material3	androidx.compose.material3.AlertDialog
 lower_unbound_native ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/CalendarLocale.kt:35:49	pack:androidx.compose.material3	androidx.compose.material3.defaultLocale
 lower_unbound_native ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/CalendarLocale.kt:52:17	pack:androidx.compose.material3	androidx.compose.material3.toLocalString
-lower_unbound_native ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/DatePicker.kt:2379:24	pack:androidx.compose.material3	androidx.compose.material3.formatDatePickerNavigateToYearString
-lower_unbound_native ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/DatePicker.kt:809:24	pack:androidx.compose.material3	androidx.compose.material3.formatHeadlineDescription
 lower_unbound_native ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/DatePickerDialog.kt:51:8	pack:androidx.compose.material3	androidx.compose.material3.DatePickerDialog
 lower_unbound_native ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/ExposedDropdownMenu.kt:1525:5	pack:androidx.compose.material3	androidx.compose.material3.WindowBoundsCalculator.getVisibleWindowBounds
 lower_unbound_native ../klio-compose-runtime/upstream/compose/material3/material3/src/commonMain/kotlin/androidx/compose/material3/ExposedDropdownMenu.kt:1528:29	pack:androidx.compose.material3	androidx.compose.material3.platformWindowBoundsCalculator
