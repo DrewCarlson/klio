@@ -405,6 +405,8 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-compose-ui-graphics",
         "kotlin-klio/klio-compose-ui-text",
         "kotlin-klio/klio-compose-ui-core",
+        "kotlin-klio/klio-navigationevent",
+        "kotlin-klio/klio-navigationevent-compose",
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-atomicfu",

@@ -280,6 +280,13 @@ include = [
     "androidx/compose/ui/layout/WindowInsetsRulers.skiko.kt",
     "androidx/compose/ui/viewinterop/InteropViewFactoryHolder.skiko.kt",
     "androidx/compose/ui/input/key/KeyEvent.skiko.kt",
+    # The layers Popup draws in, above the content in the same window, with
+    # the back handler a focusable one registers (navigationevent).
+    "androidx/compose/ui/scene/ComposeSceneLayer.skiko.kt",
+    "androidx/compose/ui/window/ComposeSceneLayerMeasurePolicy.kt",
+    "androidx/compose/ui/window/OnBackClickEventHandler.kt",
+    "androidx/compose/ui/window/Popup.skiko.kt",
+    "androidx/compose/ui/layout/EmptyLayout.skiko.kt",
 ]
 
 # desktopMain: the java-free desktop actuals: the velocity tracker, focusability,
@@ -320,4 +327,6 @@ stdlib = "*"
 "androidx.compose.runtime.saveable" = "*"
 "androidx.compose.ui.text" = "*"
 "kotlinx.coroutines" = "*"
+"androidx.navigationevent" = "*"
+"androidx.navigationevent.compose" = "*"
 

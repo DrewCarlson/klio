@@ -224,6 +224,8 @@ include = [
     "androidx/compose/runtime/StateObservation.kt",
     "androidx/compose/runtime/annotation/Annotations.kt",
     "androidx/compose/runtime/retain/Retain.kt",
+    # The desktop's DefaultMonotonicFrameClock, timed without System.nanoTime.
+    "androidx/compose/runtime/ActualDesktop.klio.kt",
 ]
 # Engine-only actuals for upstream expects the implicit-composer pack does
 # not ship (invokeComposable). Not referenced by the original pack.

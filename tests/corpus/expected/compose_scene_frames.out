@@ -1,0 +1,6 @@
+compose count=0
+frame after a write
+compose count=1
+click
+compose count=11
+frame with nothing written

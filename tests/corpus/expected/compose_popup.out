@@ -1,0 +1,45 @@
+--- placement ---
+top-start + (10, 70) at Offset(50.0, 110.0) size 50 x 50
+bottom-end at Offset(70.0, 70.0) size 30 x 30
+clipped at Offset(150.0, 40.0) size 50 x 50
+unclipped at Offset(190.0, 40.0) size 50 x 50
+--- plain popup ---
+click inside
+popup clicked
+click outside
+dismiss requested
+content clicked
+shown=false
+click outside again
+content clicked
+--- focusable popup ---
+click inside
+popup clicked
+click outside
+dismiss requested
+shown=false
+click outside again
+content clicked
+--- kept on outside click ---
+click inside
+popup clicked
+click outside
+content clicked
+shown=true
+click outside again
+content clicked
+--- hover ---
+hover content
+content Enter
+hover content again
+content Move
+hover popup
+content Exit
+popup Enter
+hover content
+popup Exit
+content Enter
+--- locals and state ---
+popup sees label=from the caller count=0
+popup sees label=from the caller count=1
+popup sees label=from the caller count=2

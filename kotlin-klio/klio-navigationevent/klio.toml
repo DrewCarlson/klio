@@ -1,0 +1,35 @@
+# androidx.navigationevent — back and forward navigation events and their
+# dispatcher, vendored verbatim from the compose-multiplatform-core submodule.
+# The skiko Popup and Dialog register a handler on the dispatcher so a back
+# event dismisses them. One klio pack per upstream Gradle module: the compose
+# locals are androidx.navigationevent.compose's pack.
+[library]
+id = "androidx.navigationevent"
+version = "1.1.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/navigationevent/navigationevent/src/commonMain/kotlin"
+include = [
+    "androidx/navigationevent/",
+]
+
+# nativeMain: the lock the dispatcher's shared state takes, over
+# kotlinx.atomicfu's SynchronizedObject. The jvmAndAndroidMain actual is the
+# JVM's monitor through kotlin.synchronized; the native one is the non-JVM
+# form.
+[[source]]
+root = "../klio-compose-runtime/upstream/navigationevent/navigationevent/src/nativeMain/kotlin"
+include = [
+    "androidx/navigationevent/internal/SynchronizedObject.native.kt",
+]
+
+[deps]
+stdlib = "*"
+"androidx.annotation" = "*"
+"androidx.collection" = "*"
+"androidx.compose.runtime" = "*"
+"kotlinx.coroutines" = "*"
+"kotlinx.atomicfu" = "*"

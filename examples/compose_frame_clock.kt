@@ -3,12 +3,15 @@
 // inside runBlocking fans a frame to withFrameNanos awaiters each pass: a
 // LaunchedEffect awaits frames and advances animation state, and each advance
 // recomposes the content that reads it. coroutineContext[MonotonicFrameClock]
-// resolves to the recomposer's clock.
+// resolves to the recomposer's clock. Code with no clock in its context can
+// take the platform's DefaultMonotonicFrameClock, a frame every sixtieth of a
+// second on the desktop.
 //
 // Driven through the real androidx.compose.runtime API: a `Recomposer` runs on
 // the calling coroutine (`runRecomposeAndApplyChanges`) and frames are dispatched
 // through a `BroadcastFrameClock` the recomposer fans out to its awaiters.
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DefaultMonotonicFrameClock
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.Applier
 import androidx.compose.runtime.BroadcastFrameClock
@@ -84,6 +87,13 @@ fun main() {
         composition.dispose()
         recomposer.close()
         runner.cancelAndJoin()
+    }
+    runBlocking {
+        @Suppress("DEPRECATION")
+        val clock = DefaultMonotonicFrameClock
+        val first = clock.withFrameNanos { it }
+        val second = clock.withFrameNanos { it }
+        println("default clock advances: ${second > first}")
     }
     println("done")
 }

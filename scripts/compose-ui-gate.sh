@@ -42,7 +42,7 @@ rm -rf .klio-local/cache
 # ReleaseSafe pack builds (the script's default KLIO_BIN is the Debug
 # CLI — 8x slower), trimmed to the compose closure the family needs.
 export KLIO_BIN="$BIN"
-export PACK_FILTER="klio-compose-,klio-kotlin-test,klio-kotlinx-coroutines,klio-kotlinx-atomicfu,klio-androidx-collection,klio-androidx-annotation"
+export PACK_FILTER="klio-compose-,klio-kotlin-test,klio-kotlinx-coroutines,klio-kotlinx-atomicfu,klio-androidx-collection,klio-androidx-annotation,klio-navigationevent"
 if ! scripts/install-local-packs.sh >/tmp/compose-ui-gate-packs.log 2>&1; then
   echo "compose-ui-gate: pack install FAILED (see /tmp/compose-ui-gate-packs.log)"
   exit 1

@@ -18,6 +18,7 @@ package androidx.compose.ui.klio
 import androidx.collection.MutableIntObjectMap
 import androidx.collection.mutableIntObjectMapOf
 import androidx.compose.runtime.AbstractApplier
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
@@ -51,9 +52,7 @@ import androidx.compose.ui.input.pointer.PointerInputEvent
 import androidx.compose.ui.input.pointer.PointerInputEventData
 import androidx.compose.ui.input.pointer.PointerButtons
 import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.ui.input.pointer.PointerInputEventProcessor
 import androidx.compose.ui.input.pointer.PointerType
-import androidx.compose.ui.input.pointer.PositionCalculator
 import androidx.compose.ui.layout.RootMeasurePolicy
 import androidx.compose.ui.modifier.ModifierLocalManager
 import androidx.compose.ui.node.LayoutNode
@@ -67,6 +66,10 @@ import androidx.compose.ui.InternalComposeUiApi
 import androidx.compose.ui.platform.EmptyPlatformWindowInsets
 import androidx.compose.ui.platform.LocalPlatformPrefetchScheduler
 import androidx.compose.ui.platform.LocalPlatformWindowInsets
+import androidx.compose.ui.scene.LocalComposeSceneContext
+import androidx.compose.runtime.HostDefaultKey
+import androidx.compose.runtime.HostDefaultProvider
+import androidx.compose.runtime.LocalHostDefaultProvider
 import androidx.compose.ui.platform.PlatformPrefetchRequest
 import androidx.compose.ui.platform.PlatformPrefetchScheduler
 import androidx.compose.ui.platform.Clipboard
@@ -89,7 +92,6 @@ import androidx.compose.ui.platform.TextToolbar
 import androidx.compose.ui.platform.TextToolbarStatus
 import androidx.compose.ui.platform.UriHandler
 import androidx.compose.ui.platform.ViewConfiguration
-import androidx.compose.ui.platform.WindowInfo
 import androidx.compose.ui.platform.WindowInfoImpl
 import androidx.compose.ui.semantics.EmptySemanticsModifier
 import androidx.compose.ui.semantics.SemanticsOwner
@@ -358,6 +360,8 @@ internal object KlioPlatformTextInputService : androidx.compose.ui.text.input.Pl
 internal class KlioComposeOwner(
     density: Density,
     layoutDirection: LayoutDirection,
+    /** The window this owner is in; a scene's layers share their content's. */
+    override val windowInfo: WindowInfoImpl = WindowInfoImpl(),
 ) : Owner {
 
     private val platformFocusOwner = object : PlatformFocusOwner {
@@ -413,7 +417,6 @@ internal class KlioComposeOwner(
     override val pointerIconService: PointerIconService = KlioPointerIconService
 
     override val semanticsOwner = SemanticsOwner(root, rootSemanticsNode, layoutNodes)
-    override val windowInfo: WindowInfo = WindowInfoImpl()
 
     override val fontLoader: androidx.compose.ui.text.font.Font.ResourceLoader
         get() = throw UnsupportedOperationException("klio: use fontFamilyResolver")
@@ -421,6 +424,14 @@ internal class KlioComposeOwner(
 
     private var _layoutDirection by mutableStateOf(layoutDirection)
     override val layoutDirection: LayoutDirection get() = _layoutDirection
+
+    fun setLayoutDirection(value: LayoutDirection) {
+        _layoutDirection = value
+        root.layoutDirection = value
+    }
+
+    /** The scene this owner draws in: its host's, or its layer's host's. */
+    var scene: KlioScene? = null
     override val localeList: LocaleList get() = LocaleList.current
 
     override var showLayoutBounds: Boolean = false
@@ -558,12 +569,20 @@ internal object KlioPrefetchScheduler : PlatformPrefetchScheduler {
     ) {}
 }
 
+/** The defaults of a host without a scene: none. */
+private object NoHostDefaults : HostDefaultProvider {
+    @Suppress("UNCHECKED_CAST")
+    override fun <T> getHostDefault(key: HostDefaultKey<T>): T = null as T
+}
+
 @OptIn(InternalComposeUiApi::class)
 @Composable
 internal fun ProvideKlioCompositionLocals(owner: KlioComposeOwner, content: @Composable () -> Unit) {
     CompositionLocalProvider(
         LocalPlatformPrefetchScheduler provides KlioPrefetchScheduler,
         LocalPlatformWindowInsets provides EmptyPlatformWindowInsets,
+        LocalComposeSceneContext provides owner.scene,
+        LocalHostDefaultProvider provides (owner.scene?.hostDefaultProvider ?: NoHostDefaults),
         LocalDensity provides owner.density,
         LocalLayoutDirection provides owner.layoutDirection,
         LocalFontFamilyResolver providesDefault owner.fontFamilyResolver,
@@ -594,6 +613,11 @@ internal class KlioRecomposerDriver {
     private var frameNanos = 0L
 
     fun frame(): Boolean {
+        // Writes to the global snapshot since the last frame (a click handler's,
+        // or the program's own between frames) invalidate what read them only
+        // once they are applied, as skiko's FrameRecomposer applies them at the
+        // start of each frame.
+        Snapshot.sendApplyNotifications()
         // Idle fast path: with nothing invalidated and no frame-clock awaiter, a
         // sendFrame only wakes the recomposer's coroutine to find no work — an
         // expensive resume/suspend under the interpreter for zero benefit. Skip it
@@ -632,8 +656,8 @@ class KlioComposeScene(
     private val recomposerDriver = KlioRecomposerDriver()
     private val recomposer = recomposerDriver.recomposer
     internal val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+    private val scene = KlioScene(owner, width, height)
     private val composition = Composition(KlioUiApplier(owner.root), recomposer)
-    private val pointerProcessor = PointerInputEventProcessor(owner.root)
     private var uptime = 0L
 
     /** Set (or replace) the scene's content and run the first frame. */
@@ -644,16 +668,10 @@ class KlioComposeScene(
         frame()
     }
 
-    private object IdentityPositions : PositionCalculator {
-        override fun screenToLocal(positionOnScreen: Offset): Offset = positionOnScreen
-        override fun localToScreen(localPosition: Offset): Offset = localPosition
-    }
-
     /** Recompose pending invalidations and run measure + layout. */
     fun frame() {
         recomposerDriver.frame()
-        owner.setRootConstraints(Constraints(maxWidth = width, maxHeight = height))
-        owner.measureAndLayoutForFrame()
+        scene.measureAndLayout(width, height)
     }
 
     private fun pointer(x: Float, y: Float, down: Boolean, hover: Boolean) {
@@ -676,14 +694,13 @@ class KlioComposeScene(
             hover -> PointerEventType.Move
             else -> PointerEventType.Release
         }
-        pointerProcessor.process(
+        scene.processPointer(
             PointerInputEvent(
                 eventType,
                 uptime,
                 listOf(data),
                 buttons = PointerButtons(isPrimaryPressed = down),
             ),
-            IdentityPositions,
         )
     }
 
@@ -709,10 +726,11 @@ class KlioComposeScene(
     /** Rasterize the current frame to a PNG. False without a Skia backend. */
     fun renderToPng(path: String): Boolean {
         frame()
-        return klioDrawToPng(width, height, path) { owner.drawTo(this) }
+        return klioDrawToPng(width, height, path) { scene.draw(this) }
     }
 
     fun dispose() {
+        scene.dispose()
         composition.dispose()
         recomposerDriver.close()
     }
@@ -728,14 +746,15 @@ fun renderComposeToPng(
     val recomposerDriver = KlioRecomposerDriver()
     val recomposer = recomposerDriver.recomposer
     val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+    val scene = KlioScene(owner, width, height)
     val composition = Composition(KlioUiApplier(owner.root), recomposer)
     composition.setContent {
         ProvideKlioCompositionLocals(owner) { content() }
     }
     recomposerDriver.frame()
-    owner.setRootConstraints(Constraints(maxWidth = width, maxHeight = height))
-    owner.measureAndLayoutForFrame()
-    val ok = klioDrawToPng(width, height, path) { owner.drawTo(this) }
+    scene.measureAndLayout(width, height)
+    val ok = klioDrawToPng(width, height, path) { scene.draw(this) }
+    scene.dispose()
     composition.dispose()
     recomposerDriver.close()
     return ok

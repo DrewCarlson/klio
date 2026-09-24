@@ -1,0 +1,29 @@
+# androidx.navigationevent.compose — the composition locals and handlers of
+# androidx.navigationevent, vendored verbatim: LocalNavigationEventDispatcherOwner,
+# whose value comes from the host's defaults, which the skiko Popup and Dialog
+# read to register their back handler.
+[library]
+id = "androidx.navigationevent.compose"
+version = "1.1.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/navigationevent/navigationevent-compose/src/commonMain/kotlin"
+include = [
+    "androidx/navigationevent/compose/",
+]
+
+# nonAndroidMain: the host-default key a non-Android host answers the owner by.
+[[source]]
+root = "../klio-compose-runtime/upstream/navigationevent/navigationevent-compose/src/nonAndroidMain/kotlin"
+include = [
+    "androidx/navigationevent/compose/LocalNavigationEventDispatcherOwner.nonAndroid.kt",
+]
+
+[deps]
+stdlib = "*"
+"androidx.compose.runtime" = "*"
+"androidx.navigationevent" = "*"
+"kotlinx.coroutines" = "*"

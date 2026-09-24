@@ -27,25 +27,17 @@ import androidx.compose.ui.input.pointer.PointerInputEvent
 import androidx.compose.ui.input.pointer.PointerInputEventData
 import androidx.compose.ui.input.pointer.PointerButtons
 import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.ui.input.pointer.PointerInputEventProcessor
 import androidx.compose.ui.input.pointer.PointerType
-import androidx.compose.ui.input.pointer.PositionCalculator
 import androidx.compose.ui.klio.KlioComposeOwner
 import androidx.compose.ui.klio.KlioRecomposerDriver
+import androidx.compose.ui.klio.KlioScene
 import androidx.compose.ui.klio.KlioUiApplier
 import androidx.compose.ui.klio.ProvideKlioCompositionLocals
-import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 
 /** Opaque white, the background a desktop compose window starts from. */
 private val WINDOW_BACKGROUND: Int = 0xFFFFFFFF.toInt()
-
-/** The window's coordinate space IS the root's: screen == local. */
-private object IdentityPositionCalculator : PositionCalculator {
-    override fun screenToLocal(positionOnScreen: Offset): Offset = positionOnScreen
-    override fun localToScreen(localPosition: Offset): Offset = localPosition
-}
 
 /**
  * Open a native window and run [content] through the real compose.ui engine
@@ -67,25 +59,24 @@ fun runComposeWindow(
     val recomposerDriver = KlioRecomposerDriver()
     val recomposer = recomposerDriver.recomposer
     val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+    val scene = KlioScene(owner, width, height)
     val composition = Composition(KlioUiApplier(owner.root), recomposer)
     composition.setContent {
         ProvideKlioCompositionLocals(owner) { content() }
     }
-    val pointerProcessor = PointerInputEventProcessor(owner.root)
     var w = width
     var h = height
     var uptime = 0L
 
     fun renderFrame() {
         recomposerDriver.frame()
-        owner.setRootConstraints(Constraints(maxWidth = w, maxHeight = h))
-        owner.measureAndLayoutForFrame()
+        scene.measureAndLayout(w, h)
         val surface = __composeui_winSurface(handle)
         if (surface == 0L) return
         // Desktop windows start white: content that draws no background of its
         // own (the default LocalContentColor is black) stays readable.
         __composeui_winClear(handle, WINDOW_BACKGROUND)
-        klioDrawToSurface(surface) { owner.drawTo(this) }
+        klioDrawToSurface(surface) { scene.draw(this) }
         __composeui_winPresent(handle)
     }
 
@@ -109,14 +100,13 @@ fun runComposeWindow(
             hover -> PointerEventType.Move
             else -> PointerEventType.Release
         }
-        pointerProcessor.process(
+        scene.processPointer(
             PointerInputEvent(
                 eventType,
                 uptime,
                 listOf(data),
                 buttons = PointerButtons(isPrimaryPressed = down),
             ),
-            IdentityPositionCalculator,
         )
     }
 
@@ -163,6 +153,7 @@ fun runComposeWindow(
         frame += 1
     }
     __composeui_winClose(handle)
+    scene.dispose()
     composition.dispose()
     recomposerDriver.close()
     return true
@@ -190,7 +181,7 @@ internal class KlioWindowHolder(
     val handle: Long,
     val owner: KlioComposeOwner,
     val composition: Composition,
-    val processor: PointerInputEventProcessor,
+    val scene: KlioScene,
     var w: Int,
     var h: Int,
     var title: String,
@@ -216,12 +207,13 @@ internal class KlioApplicationScope(
         val handle = __composeui_winOpen(width, height, title)
         if (handle == 0L) return null
         val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+        val scene = KlioScene(owner, width, height)
         val composition = Composition(KlioUiApplier(owner.root), recomposer)
         composition.setContent {
             ProvideKlioCompositionLocals(owner) { content() }
         }
         val holder = KlioWindowHolder(
-            handle, owner, composition, PointerInputEventProcessor(owner.root),
+            handle, owner, composition, scene,
             width, height, title,
         )
         windows.add(holder)
@@ -232,6 +224,7 @@ internal class KlioApplicationScope(
         if (holder.closed) return
         holder.closed = true
         __composeui_winClose(holder.handle)
+        holder.scene.dispose()
         holder.composition.dispose()
     }
 }
@@ -283,12 +276,11 @@ fun ApplicationScope.Window(
 }
 
 private fun renderWindowFrame(holder: KlioWindowHolder) {
-    holder.owner.setRootConstraints(Constraints(maxWidth = holder.w, maxHeight = holder.h))
-    holder.owner.measureAndLayoutForFrame()
+    holder.scene.measureAndLayout(holder.w, holder.h)
     val surface = __composeui_winSurface(holder.handle)
     if (surface == 0L) return
     __composeui_winClear(holder.handle, WINDOW_BACKGROUND)
-    klioDrawToSurface(surface) { holder.owner.drawTo(this) }
+    klioDrawToSurface(surface) { holder.scene.draw(this) }
     __composeui_winPresent(holder.handle)
     holder.dirty = false
 }
@@ -313,14 +305,13 @@ private fun dispatchWindowPointer(holder: KlioWindowHolder, x: Int, y: Int, down
         hover -> PointerEventType.Move
         else -> PointerEventType.Release
     }
-    holder.processor.process(
+    holder.scene.processPointer(
         PointerInputEvent(
             eventType,
             holder.uptime,
             listOf(data),
             buttons = PointerButtons(isPrimaryPressed = down),
         ),
-        IdentityPositionCalculator,
     )
 }
 
@@ -435,14 +426,13 @@ private fun inputHosted(scope: KlioApplicationScope, phase: Int) {
                 ),
             )
         }
-        holder.processor.process(
+        holder.scene.processPointer(
             PointerInputEvent(
                 eventType,
                 holder.uptime,
                 pointers,
                 buttons = PointerButtons(isPrimaryPressed = anyDown),
             ),
-            IdentityPositionCalculator,
         )
         holder.dirty = true
     }
