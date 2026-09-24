@@ -69,6 +69,24 @@ sparse=(
   # internal Trace/precondition helpers klio ships to run the real MVCC
   # snapshot core.
   "compose/runtime/runtime/src/nonAndroidMain"
+  # The platform source sets the desktop build compiles beside commonMain,
+  # and the non-JVM ones, for the actuals the ui, layout, graphics, shapes
+  # and material3 packs take from upstream.
+  "compose/foundation/foundation-layout/src/skikoMain"
+  "compose/foundation/foundation-layout/src/jvmAndAndroidMain"
+  "compose/foundation/foundation-layout/src/nonJvmMain"
+  "compose/ui/ui-graphics/src/skikoMain"
+  "compose/ui/ui-graphics/src/skikoExcludingWebMain"
+  "compose/ui/ui-graphics/src/desktopMain"
+  "compose/ui/ui-graphics/src/jvmAndAndroidMain"
+  "compose/ui/ui-graphics/src/nonJvmMain"
+  "compose/ui/ui/src/jvmAndAndroidMain"
+  "compose/ui/ui/src/nonJvmMain"
+  "graphics/graphics-shapes/src/jvmMain"
+  "graphics/graphics-shapes/src/nonJvmMain"
+  "compose/material3/material3/src/desktopMain"
+  "compose/material3/material3/src/jvmAndAndroidMain"
+  "compose/material3/material3/src/nonJvmMain"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)

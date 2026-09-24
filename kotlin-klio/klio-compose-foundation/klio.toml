@@ -374,7 +374,17 @@ include = [
 # files klio can lex + parse and whose dependencies the pack carries.
 root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/skikoMain/kotlin"
 include = [
+    "androidx/compose/foundation/BasicTooltip.skiko.kt",
     "androidx/compose/foundation/ComposeFoundationFlags.skiko.kt",
+    "androidx/compose/foundation/DarkTheme.skiko.kt",
+    "androidx/compose/foundation/content/TransferableContent.skiko.kt",
+    "androidx/compose/foundation/content/internal/DragAndDropRequestPermission.skiko.kt",
+    "androidx/compose/foundation/content/internal/ReceiveContentDragAndDropNode.skiko.kt",
+    "androidx/compose/foundation/contextmenu/ContextMenuUi.skiko.kt",
+    "androidx/compose/foundation/internal/PlatformUtils.kt",
+    "androidx/compose/foundation/platform/Synchronization.skiko.kt",
+    "androidx/compose/foundation/text/BasicTextField.skiko.kt",
+    "androidx/compose/foundation/text/CoreTextField.skiko.kt",
     "androidx/compose/foundation/lazy/layout/PrefetchScheduler.skiko.kt",
     "androidx/compose/foundation/text/AutofillHighlight.skiko.kt",
     "androidx/compose/foundation/text/BasicSecureTextField.skiko.kt",
@@ -406,6 +416,13 @@ include = [
     "androidx/compose/foundation/text/selection/SelectionHandles.skiko.kt",
 ]
 
+# desktopMain: the desktop actuals that are already java-free.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/desktopMain/kotlin"
+include = [
+    "androidx/compose/foundation/Overscroll.desktop.kt",
+]
+
 # klioMain: the platform actuals, the java-free desktopMain files adapted to
 # klio's platform, and internal stand-ins for the two skia ICU calls
 # StringHelpers.skiko.kt makes (org.jetbrains.skia).
@@ -428,4 +445,5 @@ stdlib = "*"
 "androidx.compose.animation" = "*"
 "androidx.collection" = "*"
 "kotlinx.coroutines" = "*"
+"kotlinx.atomicfu" = "*"
 

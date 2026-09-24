@@ -274,6 +274,7 @@ include = [
     "androidx/compose/ui/autofill/FillableData.skiko.kt",
     "androidx/compose/ui/platform/TranslationsCache.skiko.kt",
     "androidx/compose/ui/input/pointer/PointerButton.skiko.kt",
+    "androidx/compose/ui/SystemTheme.kt",
 ]
 
 # desktopMain: the java-free localization of the platform strings (copy, cut,
