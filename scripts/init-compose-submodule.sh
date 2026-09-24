@@ -90,6 +90,12 @@ sparse=(
   "compose/runtime/runtime/src/desktopMain"
   "compose/runtime/runtime/src/jvmAndAndroidMain"
   "compose/runtime/runtime/src/nonJvmMain"
+  # The back-event dispatch the ui's Popup and Dialog register with.
+  "navigationevent/navigationevent/src/commonMain"
+  "navigationevent/navigationevent/src/jvmAndAndroidMain"
+  "navigationevent/navigationevent/src/nativeMain"
+  "navigationevent/navigationevent-compose/src/commonMain"
+  "navigationevent/navigationevent-compose/src/nonAndroidMain"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)
