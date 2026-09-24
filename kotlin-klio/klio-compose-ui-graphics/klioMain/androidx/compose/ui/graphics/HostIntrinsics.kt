@@ -63,3 +63,16 @@ internal fun __skia_c_concat(handle: Long, sx: Float, kx: Float, tx: Float, ky: 
 internal fun __skia_surf_pixel(handle: Long, x: Int, y: Int): Long = error("intrinsic __skia_surf_pixel not installed")
 internal fun __skia_c_draw_surface(dst: Long, src: Long, x: Float, y: Float): Long = error("intrinsic __skia_c_draw_surface not installed")
 internal fun __skia_c_draw_surface_rect(dst: Long, src: Long, sl: Float, st: Float, sr: Float, sb: Float, dl: Float, dt: Float, dr: Float, db: Float): Long = error("intrinsic __skia_c_draw_surface_rect not installed")
+
+// Canvas.saveLayer: the draws up to the matching restore composite back through
+// the layer's alpha, blend mode (skiaCode), the armed color filter and a blur of
+// (blurX, blurY) sigma with the edge tile mode. hasBounds 0 covers the clip.
+internal fun __skia_c_save_layer(handle: Long, l: Float, t: Float, r: Float, b: Float, hasBounds: Int, alpha: Float, blendMode: Int, blurX: Float, blurY: Float, tileMode: Int): Long = error("intrinsic __skia_c_save_layer not installed")
+
+// Picture recording, for GraphicsLayer: begin returns a handle that draws like a
+// surface's (0 headless); end frees it and returns the picture it drew, which
+// draw_picture replays onto a canvas under its transform and clip.
+internal fun __skia_rec_begin(width: Float, height: Float): Long = error("intrinsic __skia_rec_begin not installed")
+internal fun __skia_rec_end(handle: Long): Long = error("intrinsic __skia_rec_end not installed")
+internal fun __skia_picture_free(picture: Long): Long = error("intrinsic __skia_picture_free not installed")
+internal fun __skia_c_draw_picture(handle: Long, picture: Long): Long = error("intrinsic __skia_c_draw_picture not installed")

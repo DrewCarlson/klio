@@ -39,6 +39,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.GraphicsContext
+import androidx.compose.ui.graphics.KlioGraphicsContext
 import androidx.compose.ui.graphics.Matrix
 import androidx.compose.ui.graphics.klioDrawToPng
 import androidx.compose.ui.graphics.layer.GraphicsLayer
@@ -216,21 +217,6 @@ internal class KlioOwnedLayer(
     override fun transform(matrix: Matrix) {}
     override fun inverseTransform(matrix: Matrix) {}
     override val underlyingMatrix: Matrix = Matrix()
-}
-
-// ---------------------------------------------------------------------------
-// Minimal graphics context. GraphicsLayer compositing is a distinct advanced
-// path; the Text/Surface/Button render path does not create graphics layers.
-// ---------------------------------------------------------------------------
-
-internal class KlioGraphicsContext : GraphicsContext {
-    override fun createGraphicsLayer(): GraphicsLayer =
-        throw UnsupportedOperationException("klio: GraphicsLayer compositing not yet supported")
-
-    override fun releaseGraphicsLayer(layer: GraphicsLayer) {}
-
-    // The shadow context is GraphicsContext's own: its painters render a
-    // shadow into an ImageBitmap through a blurred paint and draw it back.
 }
 
 // ---------------------------------------------------------------------------

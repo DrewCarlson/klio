@@ -67,8 +67,8 @@ include = [
     "androidx/compose/ui/graphics/Degrees.kt",
     "androidx/compose/ui/graphics/IntervalTree.kt",
     # The layer surface the ui engine and animation reference: klioMain's
-    # GraphicsLayer actual holds a layer's properties; klio draws without
-    # offscreen layers, so the ui host's GraphicsContext creates none.
+    # GraphicsLayer actual records into a Skia picture and replays it, and
+    # its KlioGraphicsContext is the one the ui host creates layers with.
     "androidx/compose/ui/graphics/GraphicsContext.kt",
     "androidx/compose/ui/graphics/layer/GraphicsLayer.kt",
     "androidx/compose/ui/graphics/layer/CompositingStrategy.kt",
@@ -111,7 +111,8 @@ include = [
 ]
 
 # klioMain: the platform actuals (Path command buffer and measure, Paint, Canvas
-# over the Skia shim, ImageBitmap, RenderEffect, GraphicsLayer).
+# over the Skia shim, ImageBitmap, RenderEffect, GraphicsLayer) and the
+# GraphicsContext that creates the layers.
 [[source]]
 root = "klioMain"
 

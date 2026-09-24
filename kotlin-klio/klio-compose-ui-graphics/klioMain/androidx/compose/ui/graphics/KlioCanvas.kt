@@ -107,9 +107,16 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
 
     override fun restore() { __skia_c_restore(handle) }
 
-    // saveLayer's compositing (bounds + paint alpha/blend) is approximated by a
-    // plain save for now; the transform/clip stack is preserved either way.
-    override fun saveLayer(bounds: Rect, paint: Paint) { __skia_c_save(handle) }
+    // An offscreen layer over the bounds, composited back at the matching
+    // restore through the paint's alpha, blend mode and color filter.
+    override fun saveLayer(bounds: Rect, paint: Paint) {
+        val cf = beginColorFilter(paint)
+        __skia_c_save_layer(
+            handle, bounds.left, bounds.top, bounds.right, bounds.bottom, 1,
+            paint.color.alpha * paint.alpha, paint.blendMode.skiaCode(), 0f, 0f, 0,
+        )
+        endColorFilter(cf)
+    }
 
     override fun translate(dx: Float, dy: Float) { __skia_c_translate(handle, dx, dy) }
 

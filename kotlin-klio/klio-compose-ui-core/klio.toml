@@ -287,6 +287,12 @@ include = [
     "androidx/compose/ui/window/OnBackClickEventHandler.kt",
     "androidx/compose/ui/window/Popup.skiko.kt",
     "androidx/compose/ui/layout/EmptyLayout.skiko.kt",
+    # Dialog: a focusable layer with a scrim, faded and scaled in and out
+    # through a GraphicsLayer over the frame clock, unless the skiko flag
+    # turns the animation off.
+    "androidx/compose/ui/window/Dialog.skiko.kt",
+    "androidx/compose/ui/animation/Animation.skiko.kt",
+    "androidx/compose/ui/ComposeUiFlags.skiko.kt",
 ]
 
 # desktopMain: the java-free desktop actuals: the velocity tracker, focusability,

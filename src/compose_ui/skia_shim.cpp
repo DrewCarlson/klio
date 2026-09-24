@@ -34,6 +34,8 @@
 #include "include/core/SkPaint.h"
 #include "include/core/SkPath.h"
 #include "include/core/SkPathBuilder.h"
+#include "include/core/SkPicture.h"
+#include "include/core/SkPictureRecorder.h"
 #include "include/core/SkPixmap.h"
 #include "include/core/SkRRect.h"
 #include "include/core/SkRect.h"
@@ -44,6 +46,7 @@
 #include "include/codec/SkPngDecoder.h"
 #include "include/encode/SkPngEncoder.h"
 #include "include/effects/SkGradient.h"
+#include "include/effects/SkImageFilters.h"
 #include "include/pathops/SkPathOps.h"
 #include "modules/skparagraph/include/DartTypes.h"
 #include "modules/skparagraph/include/FontCollection.h"
@@ -127,9 +130,25 @@ EGLint eglGetError(void);
 
 namespace {
 
+// A drawing target: a raster or GPU surface, or a picture being recorded. While
+// a recording is open its canvas takes the draws, and the handle has no pixels.
 struct KlioSurface {
     sk_sp<SkSurface> surface;
+    std::unique_ptr<SkPictureRecorder> recorder;
+    SkCanvas* recording = nullptr;
 };
+
+// A recorded picture: what a GraphicsLayer drew, replayed on each draw of it.
+struct KlioPicture {
+    sk_sp<SkPicture> picture;
+};
+
+// The canvas a handle's draws go to.
+SkCanvas* canvasOf(KlioSurface* s) {
+    if (!s) return nullptr;
+    if (s->recording) return s->recording;
+    return s->surface ? s->surface->getCanvas() : nullptr;
+}
 
 // Common system font paths tried (in order) for text rendering, since the empty
 // SkFontMgr ships no faces. $KLIO_SKIA_FONT overrides. A miss leaves text unpainted
@@ -238,6 +257,7 @@ inline void strokePaint(SkPaint& p, uint32_t argb, float width) {
 // Snapshot a surface's pixels: the fast peekPixels path for raster surfaces, or a
 // GPU→CPU readback for Ganesh surfaces. `backing` owns the pixels when read back.
 bool surfaceToPixmap(KlioSurface* s, SkPixmap& pm, SkBitmap& backing) {
+    if (!s->surface) return false;
     if (s->surface->peekPixels(&pm)) return true;
     if (!backing.tryAllocPixels(s->surface->imageInfo())) return false;
     if (!s->surface->readPixels(backing.pixmap(), 0, 0)) return false;
@@ -327,14 +347,14 @@ KlioSurface* klio_skia_new(int width, int height) {
 void klio_skia_free(KlioSurface* s) { delete s; }
 
 void klio_skia_clear(KlioSurface* s, uint32_t argb) {
-    if (s) s->surface->getCanvas()->clear(toColor(argb));
+    if (auto* c = canvasOf(s)) c->clear(toColor(argb));
 }
 
 void klio_skia_fill_rect(KlioSurface* s, float x, float y, float w, float h, uint32_t argb) {
     if (!s) return;
     SkPaint p;
     fillPaint(p, argb);
-    s->surface->getCanvas()->drawRect(SkRect::MakeXYWH(x, y, w, h), p);
+    if (auto* c = canvasOf(s)) c->drawRect(SkRect::MakeXYWH(x, y, w, h), p);
 }
 
 void klio_skia_stroke_rect(KlioSurface* s, float x, float y, float w, float h, float width, uint32_t argb) {
@@ -343,28 +363,28 @@ void klio_skia_stroke_rect(KlioSurface* s, float x, float y, float w, float h, f
     strokePaint(p, argb, width);
     // Inset by half the stroke so the outline stays inside the rect bounds.
     float half = width * 0.5f;
-    s->surface->getCanvas()->drawRect(SkRect::MakeXYWH(x + half, y + half, w - width, h - width), p);
+    if (auto* c = canvasOf(s)) c->drawRect(SkRect::MakeXYWH(x + half, y + half, w - width, h - width), p);
 }
 
 void klio_skia_fill_rrect(KlioSurface* s, float x, float y, float w, float h, float rx, float ry, uint32_t argb) {
     if (!s) return;
     SkPaint p;
     fillPaint(p, argb);
-    s->surface->getCanvas()->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, w, h), rx, ry), p);
+    if (auto* c = canvasOf(s)) c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, w, h), rx, ry), p);
 }
 
 void klio_skia_fill_circle(KlioSurface* s, float cx, float cy, float r, uint32_t argb) {
     if (!s) return;
     SkPaint p;
     fillPaint(p, argb);
-    s->surface->getCanvas()->drawCircle(cx, cy, r, p);
+    if (auto* c = canvasOf(s)) c->drawCircle(cx, cy, r, p);
 }
 
 void klio_skia_draw_line(KlioSurface* s, float x0, float y0, float x1, float y1, float width, uint32_t argb) {
     if (!s) return;
     SkPaint p;
     strokePaint(p, argb, width);
-    s->surface->getCanvas()->drawLine(x0, y0, x1, y1, p);
+    if (auto* c = canvasOf(s)) c->drawLine(x0, y0, x1, y1, p);
 }
 
 // Baseline-left text. `x`,`y` is the baseline origin. No-op if no typeface.
@@ -374,7 +394,7 @@ void klio_skia_draw_text(KlioSurface* s, const char* utf8, float x, float y, flo
     font.setEdging(SkFont::Edging::kAntiAlias);
     SkPaint p;
     fillPaint(p, argb);
-    s->surface->getCanvas()->drawSimpleText(
+    if (auto* c = canvasOf(s)) c->drawSimpleText(
         utf8, std::strlen(utf8), SkTextEncoding::kUTF8, x, y, font, p);
 }
 
@@ -390,7 +410,8 @@ void klio_skia_c_draw_text2(KlioSurface* s, const char* utf8, float x, float y, 
     SkPaint p;
     fillPaint(p, argb);
     const size_t len = std::strlen(utf8);
-    SkCanvas* canvas = s->surface->getCanvas();
+    SkCanvas* canvas = canvasOf(s);
+    if (!canvas) return;
     canvas->drawSimpleText(utf8, len, SkTextEncoding::kUTF8, x, y, font, p);
     if (flags & (4 | 8)) {
         const float w = font.measureText(utf8, len, SkTextEncoding::kUTF8);
@@ -422,7 +443,7 @@ void klio_skia_draw_paragraph(KlioSurface* s, const char* utf8, float x, float y
         float lx = x;
         if (align == 1) lx = x + (width - lw) * 0.5f;
         else if (align == 2) lx = x + (width - lw);
-        s->surface->getCanvas()->drawSimpleText(line.c_str(), line.size(), SkTextEncoding::kUTF8, lx, baseline, font, p);
+        if (auto* c = canvasOf(s)) c->drawSimpleText(line.c_str(), line.size(), SkTextEncoding::kUTF8, lx, baseline, font, p);
         baseline += size * kLineSpacing;
     }
 }
@@ -510,13 +531,13 @@ uint32_t klio_skia_surf_pixel(KlioSurface* s, int x, int y) {
 // at (x, y); the rect form maps `src`'s (sl,st,sr,sb) onto `dst`'s (dl,dt,dr,db)
 // with bilinear sampling. Backs Canvas.drawImage / drawImageRect.
 void klio_skia_c_draw_surface(KlioSurface* dst, KlioSurface* src, float x, float y) {
-    if (!dst || !src) return;
+    if (!dst || !src || !src->surface || !canvasOf(dst)) return;
     sk_sp<SkImage> img = src->surface->makeImageSnapshot();
     if (!img) return;
     // A tinted image draw (a shadow's) filters the image's colors.
     SkPaint paint;
     if (g_pendingColorFilter) paint.setColorFilter(g_pendingColorFilter);
-    dst->surface->getCanvas()->drawImage(img, x, y, SkSamplingOptions(SkFilterMode::kLinear),
+    canvasOf(dst)->drawImage(img, x, y, SkSamplingOptions(SkFilterMode::kLinear),
                                          g_pendingColorFilter ? &paint : nullptr);
 }
 
@@ -524,12 +545,12 @@ void klio_skia_c_draw_surface_rect(
     KlioSurface* dst, KlioSurface* src,
     float sl, float st, float sr, float sb,
     float dl, float dt, float dr, float db) {
-    if (!dst || !src) return;
+    if (!dst || !src || !src->surface || !canvasOf(dst)) return;
     sk_sp<SkImage> img = src->surface->makeImageSnapshot();
     if (!img) return;
     SkPaint paint;
     if (g_pendingColorFilter) paint.setColorFilter(g_pendingColorFilter);
-    dst->surface->getCanvas()->drawImageRect(
+    canvasOf(dst)->drawImageRect(
         img,
         SkRect::MakeLTRB(sl, st, sr, sb),
         SkRect::MakeLTRB(dl, dt, dr, db),
@@ -935,7 +956,7 @@ int klio_skia_para_line_for(KlioPara* p, int offset) {
 
 void klio_skia_para_paint(KlioPara* p, KlioSurface* s, float x, float y) {
     if (!p || !s) return;
-    p->para->paint(s->surface->getCanvas(), x, y);
+    if (auto* c = canvasOf(s)) p->para->paint(c, x, y);
 }
 
 void klio_skia_para_free(KlioPara* p) { delete p; }
@@ -1168,7 +1189,7 @@ SkPaint klioCanvasPaint(uint32_t argb, int style, float strokeWidth, int cap, in
     return p;
 }
 
-SkCanvas* klioCanvasOf(KlioSurface* s) { return s ? s->surface->getCanvas() : nullptr; }
+SkCanvas* klioCanvasOf(KlioSurface* s) { return canvasOf(s); }
 
 }  // namespace
 
@@ -1233,6 +1254,51 @@ void klio_skia_c_draw_path(KlioSurface* s, const char* pathText,
                            uint32_t argb, int style, float sw, int cap, int join, int aa) {
     if (auto* c = klioCanvasOf(s))
         c->drawPath(klioBuildPath(pathText), klioCanvasPaint(argb, style, sw, cap, join, aa));
+}
+
+// Open an offscreen layer (Canvas.saveLayer): the draws up to the matching
+// restore composite back through its alpha, blend mode (Compose's BlendMode,
+// whose order is SkBlendMode's), the pending color filter and, for a sigma
+// above zero, a blur with the given edge tile mode. Without bounds the layer
+// covers the clip.
+void klio_skia_c_save_layer(KlioSurface* s, float l, float t, float r, float b, int hasBounds,
+                            float alpha, int blendMode, float blurX, float blurY, int tile) {
+    auto* c = klioCanvasOf(s);
+    if (!c) return;
+    SkPaint p;
+    p.setAlphaf(alpha);
+    p.setBlendMode(static_cast<SkBlendMode>(blendMode));
+    if (g_pendingColorFilter) p.setColorFilter(g_pendingColorFilter);
+    if (blurX > 0 || blurY > 0) p.setImageFilter(SkImageFilters::Blur(blurX, blurY, tileModeFrom(tile), nullptr));
+    const SkRect bounds = SkRect::MakeLTRB(l, t, r, b);
+    c->saveLayer(hasBounds ? &bounds : nullptr, &p);
+}
+
+// Begin recording a picture over (0, 0, width, height). The handle draws like a
+// surface's until klio_skia_rec_end turns what it drew into a picture.
+KlioSurface* klio_skia_rec_begin(float width, float height) {
+    auto* s = new KlioSurface();
+    s->recorder = std::make_unique<SkPictureRecorder>();
+    s->recording = s->recorder->beginRecording(SkRect::MakeWH(width, height));
+    ensureFonts();
+    return s;
+}
+
+// End a recording and free its handle; returns the picture it drew.
+KlioPicture* klio_skia_rec_end(KlioSurface* s) {
+    if (!s || !s->recorder) return nullptr;
+    auto* p = new KlioPicture();
+    p->picture = s->recorder->finishRecordingAsPicture();
+    delete s;
+    return p;
+}
+
+void klio_skia_picture_free(KlioPicture* p) { delete p; }
+
+// Replay a recorded picture onto a canvas, under its current transform and clip.
+void klio_skia_c_draw_picture(KlioSurface* s, KlioPicture* p) {
+    auto* c = klioCanvasOf(s);
+    if (c && p && p->picture) c->drawPicture(p->picture);
 }
 
 }  // extern "C"

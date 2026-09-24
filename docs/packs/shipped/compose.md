@@ -58,8 +58,9 @@ signature:
   `androidx.annotation` pack), compose's runtime-annotation markers and
   runtime-retain's store (runtime pack), and the lifecycle, savedstate and
   lifecycle-runtime-compose slices the saveable pack carries;
-- platform code: a `GraphicsLayer` that holds a layer's properties (klio
-  composites no offscreen layers), a Kotlin `PathMeasure`, code-point stand-ins
+- platform code: a `GraphicsLayer` that records into a Skia picture through
+  klio's shim and replays it under its transform, clip and offscreen layer
+  (skiko's does the same through a skiko RenderNode), a Kotlin `PathMeasure`, code-point stand-ins
   for the two skia ICU calls foundation's text helpers make, and adapted
   copies of the desktop files that are java-free once their AWT and skiko
   calls are replaced. A body klio cannot serve throws

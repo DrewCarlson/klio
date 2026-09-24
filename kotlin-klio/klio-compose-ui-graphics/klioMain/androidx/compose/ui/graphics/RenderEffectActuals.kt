@@ -38,6 +38,27 @@ actual class BlurEffect actual constructor(
         return "BlurEffect(renderEffect=$renderEffect, radiusX=$radiusX, radiusY=$radiusY, " +
             "edgeTreatment=$edgeTreatment)"
     }
+
+    // The blur the Skia shim's layer applies: skiko's sigmas for the radii and
+    // its edge tile mode (Clamp 0, Repeated 1, Mirror 2, Decal 3). A blur over
+    // another effect blurs without it.
+    internal val klioBlurSigmaX: Float get() = convertRadiusToSigma(radiusX)
+    internal val klioBlurSigmaY: Float get() = convertRadiusToSigma(radiusY)
+    internal val klioBlurTileCode: Int
+        get() = when (edgeTreatment) {
+            TileMode.Repeated -> 1
+            TileMode.Mirror -> 2
+            TileMode.Decal -> 3
+            else -> 0
+        }
+
+    private companion object {
+        // skiko's radius-to-sigma scale, 1 / sqrt(3) (SkBlurMask's high quality).
+        const val BlurSigmaScale = 0.57735f
+
+        fun convertRadiusToSigma(radius: Float): Float =
+            if (radius > 0) BlurSigmaScale * radius + 0.5f else 0.0f
+    }
 }
 
 @Immutable

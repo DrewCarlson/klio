@@ -97,6 +97,11 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_text2", canvasDrawText2);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface", canvasDrawSurface);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface_rect", canvasDrawSurfaceRect);
+    try b.register("androidx.compose.ui.graphics.__skia_c_save_layer", canvasSaveLayer);
+    try b.register("androidx.compose.ui.graphics.__skia_rec_begin", recBegin);
+    try b.register("androidx.compose.ui.graphics.__skia_rec_end", recEnd);
+    try b.register("androidx.compose.ui.graphics.__skia_picture_free", pictureFree);
+    try b.register("androidx.compose.ui.graphics.__skia_c_draw_picture", canvasDrawPicture);
     try b.register("androidx.compose.ui.text.platform.__skia_para_new", paraNew);
     try b.register("androidx.compose.ui.text.platform.__skia_para_layout", paraLayout);
     try b.register("androidx.compose.ui.text.platform.__skia_para_metric", paraMetric);
@@ -181,6 +186,11 @@ const Skia = struct {
     cDrawText2: ?CDrawText2Fn,
     cDrawSurface: ?CDrawSurfaceFn,
     cDrawSurfaceRect: ?CDrawSurfaceRectFn,
+    cSaveLayer: ?CSaveLayerFn,
+    recBegin: ?RecBeginFn,
+    recEnd: ?RecEndFn,
+    pictureFree: ?PictureFreeFn,
+    cDrawPicture: ?CDrawPictureFn,
     paraNew: ?ParaNewFn,
     paraLayout: ?ParaLayoutFn,
     paraMetric: ?ParaMetricFn,
@@ -238,6 +248,13 @@ const SurfPixelFn = *const fn (?*SkSurface, c_int, c_int) callconv(.c) u32;
 const CDrawText2Fn = *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, u32, c_int) callconv(.c) void;
 const CDrawSurfaceFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32) callconv(.c) void;
 const CDrawSurfaceRectFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32, f32, f32, f32, f32, f32, f32) callconv(.c) void;
+// (l, t, r, b, hasBounds, alpha, blendMode, blurX, blurY, tileMode)
+const CSaveLayerFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int, f32, c_int, f32, f32, c_int) callconv(.c) void;
+const SkPicture = anyopaque;
+const RecBeginFn = *const fn (f32, f32) callconv(.c) ?*SkSurface;
+const RecEndFn = *const fn (?*SkSurface) callconv(.c) ?*SkPicture;
+const PictureFreeFn = *const fn (?*SkPicture) callconv(.c) void;
+const CDrawPictureFn = *const fn (?*SkSurface, ?*SkPicture) callconv(.c) void;
 const KlioPara = anyopaque;
 const ParaNewFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) ?*KlioPara;
 const ParaLayoutFn = *const fn (?*KlioPara, f32) callconv(.c) void;
@@ -333,6 +350,11 @@ fn loadSkia() ?*Skia {
         .cDrawText2 = lib.lookup(CDrawText2Fn, "klio_skia_c_draw_text2"),
         .cDrawSurface = lib.lookup(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
         .cDrawSurfaceRect = lib.lookup(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
+        .cSaveLayer = lib.lookup(CSaveLayerFn, "klio_skia_c_save_layer"),
+        .recBegin = lib.lookup(RecBeginFn, "klio_skia_rec_begin"),
+        .recEnd = lib.lookup(RecEndFn, "klio_skia_rec_end"),
+        .pictureFree = lib.lookup(PictureFreeFn, "klio_skia_picture_free"),
+        .cDrawPicture = lib.lookup(CDrawPictureFn, "klio_skia_c_draw_picture"),
         .paraNew = lib.lookup(ParaNewFn, "klio_skia_para_new"),
         .paraLayout = lib.lookup(ParaLayoutFn, "klio_skia_para_layout"),
         .paraMetric = lib.lookup(ParaMetricFn, "klio_skia_para_metric"),
@@ -417,6 +439,11 @@ fn loadSkiaStatic() ?*Skia {
         .cDrawText2 = externSym(CDrawText2Fn, "klio_skia_c_draw_text2"),
         .cDrawSurface = externSym(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
         .cDrawSurfaceRect = externSym(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
+        .cSaveLayer = externSym(CSaveLayerFn, "klio_skia_c_save_layer"),
+        .recBegin = externSym(RecBeginFn, "klio_skia_rec_begin"),
+        .recEnd = externSym(RecEndFn, "klio_skia_rec_end"),
+        .pictureFree = externSym(PictureFreeFn, "klio_skia_picture_free"),
+        .cDrawPicture = externSym(CDrawPictureFn, "klio_skia_c_draw_picture"),
         .paraNew = externSym(ParaNewFn, "klio_skia_para_new"),
         .paraLayout = externSym(ParaLayoutFn, "klio_skia_para_layout"),
         .paraMetric = externSym(ParaMetricFn, "klio_skia_para_metric"),
@@ -1142,6 +1169,65 @@ fn canvasDrawSurface(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+/// Canvas.saveLayer: (handle, l, t, r, b, hasBounds, alpha, blendMode, blurX,
+/// blurY, tileMode); the pending color filter joins the layer's paint.
+fn canvasSaveLayer(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 11) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    if (skia.cSaveLayer) |f| f(
+        surf,
+        argFloat(a[1]),
+        argFloat(a[2]),
+        argFloat(a[3]),
+        argFloat(a[4]),
+        @intCast(argInt(a[5])),
+        argFloat(a[6]),
+        @intCast(argInt(a[7])),
+        argFloat(a[8]),
+        argFloat(a[9]),
+        @intCast(argInt(a[10])),
+    );
+    return ok(Value.newLong(0));
+}
+
+/// Begin recording a picture of (width, height): returns a handle that draws
+/// like a surface's, or 0 without the Skia backend.
+fn recBegin(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.recBegin orelse return ok(Value.newLong(0));
+    const h = f(argFloat(ctx.args[0]), argFloat(ctx.args[1])) orelse return ok(Value.newLong(0));
+    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(h)))));
+}
+
+/// End a recording, freeing its handle: returns the picture's handle.
+fn recEnd(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const rec = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.recEnd orelse return ok(Value.newLong(0));
+    const p = f(rec) orelse return ok(Value.newLong(0));
+    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(p)))));
+}
+
+fn pictureFree(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (surfArg(ctx.args[0])) |p| if (skia.pictureFree) |f| f(p);
+    return ok(Value.newLong(0));
+}
+
+fn canvasDrawPicture(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const pic = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
+    if (skia.cDrawPicture) |f| f(surf, pic);
+    return ok(Value.newLong(0));
+}
+
 fn canvasDrawSurfaceRect(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 10) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1542,7 +1628,12 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 79), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_save_layer") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_rec_begin") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_rec_end") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_picture_free") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_picture") != null);
+    try testing.expectEqual(@as(usize, 84), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {
@@ -1560,6 +1651,21 @@ test "skiaRender guards arg shapes and no-ops without the library" {
     const args = [_]Value{ path, Value.newInt(4), Value.newInt(4), list };
     var ctx = host.ctx(&args);
     _ = (try skiaRender(&ctx)).ok.Long;
+}
+
+test "picture recording and layer bindings answer 0 for short args or a null handle" {
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c0 = host.ctx(&none);
+    try testing.expectEqual(@as(i64, 0), (try recBegin(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try recEnd(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try canvasSaveLayer(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try canvasDrawPicture(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try pictureFree(&c0)).ok.Long);
+    const null_handle = [_]Value{Value.newLong(0)};
+    var c1 = host.ctx(&null_handle);
+    try testing.expectEqual(@as(i64, 0), (try recEnd(&c1)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try pictureFree(&c1)).ok.Long);
 }
 
 const TestHost = struct {

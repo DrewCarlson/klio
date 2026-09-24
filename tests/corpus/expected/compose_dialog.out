@@ -1,0 +1,24 @@
+--- dialog ---
+dialog at Offset(60.0, 60.0) size 80 x 80
+click inside
+dialog clicked
+click outside
+dismiss requested
+shown=false
+click outside again
+content clicked
+--- kept on outside click ---
+dialog at Offset(60.0, 60.0) size 80 x 80
+click inside
+dialog clicked
+click outside
+shown=true
+click outside again
+--- platform default width ---
+default width at Offset(130.0, 230.0) size 440 x 40
+full width at Offset(0.0, 230.0) size 700 x 40
+--- without the animation ---
+click outside
+dismiss requested
+click outside in the next frame
+content clicked
