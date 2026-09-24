@@ -235,16 +235,30 @@ receiver or global path.
 |----|------|--------|
 | `green/corpus` | `itest-e2e`, the example corpus and the stdlib commontest sweep at their floors. | done: corpus 551/551 |
 | `green/packs` | Every pack suite in `plans/pack-suites-to-green.md` at or above its floor, compose runtime at 100%. | doing |
-| `green/box` | The kotlinc box corpus at or above its ratchet. | doing: 6245/107 ratchet, the old path 6019 |
+| `green/box` | The kotlinc box corpus at or above its ratchet. | doing: 6262/90 ratchet, the old path 6019 |
 | `green/measure` | Re-take the headline costs, the executed dispatch census and `benchRecompose`, before and after, in the log below. | todo |
 
-### After the cutover
+### Speed
+
+After `cut/runtime`, and part of done. The acceptance is the compose
+runtime's throughput-bound tests: `derivedStateOfLeak`,
+`validatePotentialDeadlock` and `resumeOnBackgroundThread` pass under the
+fleet's 10 s runTest cap, with before and after numbers for them, fib,
+bench_oo, bench_fn and `benchRecompose` in the log.
+
+| Id | Item | Size | Status |
+|----|------|-----:|--------|
+| `engine/one` | One interpreter loop over one representation. The leaf, fused, bytecode and framed tiers merge; the per-`Func` verdict bytes and their classification go. | -5k | todo |
+| `stack/value-stack` | One contiguous per-thread value stack; frames are windows into it; arguments stay where the caller computed them; the collector scans the stack; `Frame` becomes a header. No allocation on the call path. | todo | todo |
+
+### After done
+
+The long tail: the box failures left under the ratchet and any suite item
+outside the floors, then `retire/typeck`.
 
 | Id | Item | Size | Status |
 |----|------|-----:|--------|
 | `retire/typeck` | The checker's diagnostics run over sema's records; `src/typeck`'s resolution core, `src/types`' string `Type` and `src/resolver` go. | +5k / -15k | todo |
-| `engine/one` | One interpreter loop over one representation. The leaf, fused, bytecode and framed tiers merge; the per-`Func` verdict bytes and their classification go. The JIT stays as a separate seam. | -5k | todo |
-| `stack/value-stack` | One contiguous per-thread value stack; frames are windows into it; arguments stay where the caller computed them; the collector scans the stack; `Frame` becomes a header. No allocation on the call path. | todo | todo |
 
 ## Instruments
 
@@ -412,13 +426,14 @@ construction, and each gets a test.
 
 ## Done means
 
-1. Every item above is `done`.
+1. Every item in Cutover, Green and Speed is `done`.
 2. `Inst` declares only resolved variants and the name guard compiles.
 3. The sema census reads zero over the base, every pack and the corpus, and
    the oracle agrees with kotlinc on the corpus.
 4. `scripts/gate.sh` is green, run with nothing else touching `.zig-cache`.
 5. Every suite count in `plans/pack-suites-to-green.md` is at or above its
-   floor, and the compose runtime suite is at 100%.
+   floor, and the compose runtime suite is at 100%, its throughput-bound
+   tests included.
 6. The log carries measured before and after numbers for the trivial
    instruction, the cheapest activation, the executed dispatch census and
    `benchRecompose`.
@@ -830,3 +845,11 @@ measurement.
   and 100 bodyless declarations have no native, nearly all compose
   platform surfaces (popups, dialogs, clipboard, atomics) and 3 ktor
   transforms.
+- 2026-09-24: natives call back into Kotlin only through well-known slots
+  and objects: `invoke_method`, `get_property`, `construct_named`,
+  `lookup_global` and `lookup_global_func` left `IntrinsicHost`. The JIT
+  left the build for `archive/jit/` (unchanged sources, the last commit
+  that compiled them in its README), and taking its hooks out of the
+  evaluator made every benchmark faster: fib 1.03 to 0.96 s, bench_oo
+  1.46 to 1.27 s, bench_fn 3.13 to 2.97 s. The 37 `examples/jit_*.kt`
+  stay as interpreter programs; their headers still describe the JIT.

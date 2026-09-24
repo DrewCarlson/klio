@@ -15,9 +15,8 @@ source text
   ▼  parser      (AST + diagnostics)
   ▼  sema        (symbols, headers and bodies: every name bound)
   ▼  ir          (bridge: sema's symbols → IR ids; lower/sema: sema's
-  │               records → register IR; jit_loop = the native
-  │               compiler over the IR)
-  ▼  interp_ir   (the Vm: executes IR; JIT tiers compile hot code)
+  │               records → register IR)
+  ▼  interp_ir   (the Vm: executes IR)
   ▼  cli         (binary: run / test / check / lex / parse / dump-ir /
                   bake / repl / pack)
 ```

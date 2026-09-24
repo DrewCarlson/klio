@@ -324,13 +324,17 @@ pub fn parseElvis(p: *Parser) ?Expr {
 pub fn parseInfixFn(p: *Parser) ?Expr {
     var lhs = parseRange(p) orelse return null;
     while (true) {
+        const before = p.pos;
         support.skipSoftNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) != .Ident) {
             break;
         }
         const name_span = support.currentSpan(p);
         const name = support.text(p, name_span);
-        if (!root.isValidInfixName(name)) {
+        // On the operand's line any name is an infix call (`A()!! infix "K"`,
+        // `x where { ... }`); past a line break a modifier or contextual
+        // keyword starts the next declaration.
+        if (p.pos != before and !root.isValidInfixName(name)) {
             break;
         }
         if (!lookaheadInfixRhsStarter(p)) {

@@ -242,10 +242,10 @@ test "a main that does not return Unit is not run" {
     );
     const r = try klio(c, null, &.{ "run", path });
     // kotlinc 2.4.20 compiles it and the JVM launcher refuses it: "Error:
-    // Main method not found in class Main_anyKt".
+    // Main method not found in class Main_anyKt". klio names the file.
     try expectCode(r, 1);
     try std.testing.expectEqualStrings("", r.stdout);
-    try std.testing.expectEqualStrings("error: no `main` function in class Main_anyKt\n", r.stderr);
+    try std.testing.expectEqualStrings("error: no `main` function in main_any.kt\n", r.stderr);
 }
 
 test "a suspend main is the entry point" {
@@ -282,14 +282,16 @@ test "an uncaught throwable prints its class, message, frames and causes" {
     const r = try klio(c, null, &.{ "run", path });
     try expectCode(r, 1);
     try std.testing.expectEqualStrings("start\n", r.stdout);
-    // kotlinc 2.4.20 prints exactly these lines.
+    // kotlinc 2.4.20 prints these lines but for the names: the JVM's
+    // java.lang.IllegalStateException for the cause, and each frame's
+    // function in the file's facade class, `UncaughtKt.outer`.
     try std.testing.expectEqualStrings("Exception in thread \"main\" Boom: outer wrapped\n" ++
-        "\tat UncaughtKt.outer(uncaught.kt:8)\n" ++
-        "\tat UncaughtKt.main(uncaught.kt:12)\n" ++
-        "Caused by: java.lang.IllegalStateException: inner failed at 2\n" ++
-        "\tat UncaughtKt.inner(uncaught.kt:4)\n" ++
-        "\tat UncaughtKt.inner(uncaught.kt:5)\n" ++
-        "\tat UncaughtKt.inner(uncaught.kt:5)\n" ++
+        "\tat outer(uncaught.kt:8)\n" ++
+        "\tat main(uncaught.kt:12)\n" ++
+        "Caused by: kotlin.IllegalStateException: inner failed at 2\n" ++
+        "\tat inner(uncaught.kt:4)\n" ++
+        "\tat inner(uncaught.kt:5)\n" ++
+        "\tat inner(uncaught.kt:5)\n" ++
         "\t... 2 more\n", r.stderr);
 }
 
@@ -308,12 +310,14 @@ test "an uncaught throwable on a thread prints under the thread's name and the r
     );
     const r = try klio(c, null, &.{ "run", path });
     // kotlinc 2.4.20: exit 0, the same stdout, and the same stderr lines but
-    // for the frame of the JVM's own `Thread.run` below the lambda.
+    // for the names (java.lang.IllegalStateException, and the frames'
+    // `Thread_uncaughtKt.fail` and `Thread_uncaughtKt.main$lambda$1`) and the
+    // frame of the JVM's own `Thread.run` below the lambda.
     try expectCode(r, 0);
     try std.testing.expectEqualStrings("Thread-0\nThread-1 main\n", r.stdout);
-    try std.testing.expectEqualStrings("Exception in thread \"Thread-1\" java.lang.IllegalStateException: boom\n" ++
-        "\tat Thread_uncaughtKt.fail(thread_uncaught.kt:2)\n" ++
-        "\tat Thread_uncaughtKt.main$lambda$1(thread_uncaught.kt:5)\n", r.stderr);
+    try std.testing.expectEqualStrings("Exception in thread \"Thread-1\" kotlin.IllegalStateException: boom\n" ++
+        "\tat fail(thread_uncaught.kt:2)\n" ++
+        "\tat main.<anonymous>(thread_uncaught.kt:5)\n", r.stderr);
 }
 
 test "an uncaught throwable's header is its toString" {
@@ -327,11 +331,11 @@ test "an uncaught throwable's header is its toString" {
     );
     const r = try klio(c, null, &.{ "run", path });
     try expectCode(r, 1);
-    // kotlinc 2.4.20 prints exactly this, the synthetic `main(String[])`
-    // that calls a parameterless `main` included.
+    // kotlinc 2.4.20 prints the same header, and names the frame
+    // `Custom_to_stringKt.main`, under which it adds the frame of the
+    // synthetic `main(String[])` the JVM enters by.
     try std.testing.expectEqualStrings("Exception in thread \"main\" Custom<boom>\n" ++
-        "\tat Custom_to_stringKt.main(custom_to_string.kt:4)\n" ++
-        "\tat Custom_to_stringKt.main(custom_to_string.kt)\n", r.stderr);
+        "\tat main(custom_to_string.kt:4)\n", r.stderr);
 }
 
 test "KLIO_FN_PROF names the program's functions" {

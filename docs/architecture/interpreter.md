@@ -87,8 +87,9 @@ failed initialization fails as JVM class initialization does: the
 first access throws `ExceptionInInitializerError` (no message, the
 user throwable as its cause), or rethrows the throwable itself when it
 is an `Error`; the initializer is never retried, and every later
-access throws `NoClassDefFoundError("Could not initialize class X")`
-caused by an `ExceptionInInitializerError` naming the first failure.
+access throws `NoClassDefFoundError("Could not initialize object X")`
+(`file x.kt`, `enum class X`) caused by an `ExceptionInInitializerError`
+naming the first failure.
 Top-level property initializers stay eager (file order at
 program start), matching kotlinc's main-file semantics.
 

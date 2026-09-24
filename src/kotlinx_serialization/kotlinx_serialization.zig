@@ -45,36 +45,13 @@ fn classOf(v: *const Value) ?ObjRef(ClassDef) {
     };
 }
 
-/// Read the class's `Companion`, initializing it, and call its generated
-/// `serializer(...)` with the type-argument serializers. An `object` carries
-/// `serializer()` on itself. Null when neither resolves.
+/// The serializer a class's companion (or an object itself) generates, with
+/// the type-argument serializers. The VM answers the call from its tables
+/// (`ir.resolved.HostOp.generated_serializer`) before this body runs, so
+/// a host without them finds none.
 fn companionSerializer(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len == 0) return ok(.Null);
-    const cls_val = ctx.args[0];
-    if (cls_val != .Class) return ok(.Null);
-    var args: std.ArrayList(Value) = .empty;
-    defer args.deinit(ctx.allocator);
-    if (ctx.args.len > 1 and ctx.args[1] == .List) {
-        const g = ctx.args[1].List.items.borrow();
-        defer g.deinit();
-        for (g.get().items) |v| try args.append(ctx.allocator, v);
-    }
-    const is_object = blk: {
-        const g = cls_val.Class.borrow();
-        defer g.deinit();
-        break :blk g.get().is_object;
-    };
-    if (is_object) {
-        const inst = (try ctx.host.getProperty(&cls_val, "objectInstance", ctx.out)) orelse return ok(.Null);
-        if (inst != .ok) return ok(.Null);
-        const r = (try ctx.host.invokeMethod(&inst.ok, "serializer", args.items, ctx.out)) orelse return ok(.Null);
-        return r;
-    }
-    const comp = (try ctx.host.getProperty(&cls_val, "$companion", ctx.out)) orelse return ok(.Null);
-    if (comp != .ok) return ok(.Null);
-    if (comp.ok == .Null) return ok(.Null);
-    const r = (try ctx.host.invokeMethod(&comp.ok, "serializer", args.items, ctx.out)) orelse return ok(.Null);
-    return r;
+    _ = ctx;
+    return ok(.Null);
 }
 
 fn isInterfaceClass(ctx: *CallCtx) Error!EvalResult {

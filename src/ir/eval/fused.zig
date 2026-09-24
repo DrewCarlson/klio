@@ -5,7 +5,6 @@ const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("../ir.zig");
 const span = @import("span");
-const jit_loop = @import("../jit_loop.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -54,7 +53,6 @@ const EvalTls = ev_state.EvalTls;
 const Frame = ev_frame.Frame;
 const FusedMark = ev_state.FusedMark;
 const LEAF_BANK_DEPTH = ev_leaf.LEAF_BANK_DEPTH;
-const LoopTramp = ev_loop.LoopTramp;
 const TryFrame = ev_snapshot.TryFrame;
 const binopValue = ev_inst.binopValue;
 const builtinFieldFast = ev_leaf.builtinFieldFast;
@@ -500,8 +498,6 @@ pub fn fusedExecOpt(
         fusedDecline("bank-depth", func);
         return null;
     }
-    // A hot fully-fusable body yields so the function JIT can count it; a fused body opens no frame.
-    if (jit_loop.fusedShouldYieldToFuncTier(func)) return null;
     // A memoized verdict reaches this thread without ordering against the body's lazy decode;
     // re-ensure (idempotent) so the walker never indexes an empty block table.
     if (func.blocks.len == 0 and !module.ensureFuncBody(@constCast(func))) return null;
@@ -593,10 +589,6 @@ fn fusedRun(
     };
 
     var cur: BlockId = func.entry;
-    // The loop JIT counts block entries in the framed loop and never sees a fused body's own
-    // back edges: count them here and materialize at the loop header, before it runs.
-    const jit_yield_on = jit_loop.enabled();
-    var back_edges: u32 = 0;
     walk: while (true) {
         // Once per block, UNCONDITIONAL: `pending()` never sees another thread's stop flag, so
         // gating on it lets a fused spin loop skip the rendezvous. The pinned bank keeps it root-exact.
@@ -671,47 +663,6 @@ fn fusedRun(
         // loop meets the wall cap and abandonment like any other.
         if (cur.int() <= blk_id) {
             if (ev_exec.fusedEdgeGuard(allocator, ev)) |er| return er;
-        }
-        if (jit_yield_on and cur.int() <= blk_id) {
-            back_edges +|= 1;
-            if (back_edges >= jit_loop.FUSED_YIELD_BACK_EDGES) {
-                if (jit_loop.loopDeclined(func, cur.int())) {
-                    // Already refused: stay fused rather than pay a materialization to be refused again.
-                    back_edges = 0;
-                    continue :walk;
-                }
-                // Leaving the bank for a frame is one-way, so commit only to compiled code: compile first
-                // and stay on the walk when the tier refuses. The compile-time resolvers need no frame.
-                var rctx: LoopTramp(H).ResolveCtx = .{ .host = host, .allocator = allocator };
-                const pre_member: ?jit_loop.MemberResolver =
-                    if (comptime @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).preMember else null;
-                const pre_virtual: ?jit_loop.VirtResolver =
-                    if (comptime @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).preVirtual else null;
-                const pre_field: ?jit_loop.FieldResolver =
-                    if (comptime @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).preField else null;
-                const pre_field_nn: ?jit_loop.FieldResolver =
-                    if (comptime @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).preFieldNN else null;
-                if (!jit_loop.compileHotLoopFor(module, func, cur, regs, pre_member, pre_virtual, pre_field, pre_field_nn, @ptrCast(&rctx))) {
-                    back_edges = 0;
-                    continue :walk;
-                }
-                if (jit_loop.debugEnabled())
-                    std.debug.print("[jit]   fused body {s} yields its hot loop at b{d}\n", .{ func.name, cur.int() });
-                const moved_pushes = pushed_enclosing;
-                pushed_enclosing = 0;
-                return try fusedMaterializeAndRun(
-                    H,
-                    allocator,
-                    module,
-                    func,
-                    args_in,
-                    regs,
-                    cur,
-                    0,
-                    moved_pushes,
-                    host,
-                );
-            }
         }
         continue :walk;
     }

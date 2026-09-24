@@ -1,8 +1,6 @@
-// A self-call helper that BRANCHES: the splice covers the callee's whole block
-// graph, so an `if`/`when` helper inlines as well as a straight-line one. Both
-// a value-returning helper and a `Unit` mutator are exercised. Output must match
-// with the JIT off (--opt safe) or on, and with the splice disabled
-// (KLIO_FJ_SELF_INLINE=0).
+// A method calling sibling methods that branch: a value-returning helper
+// built from `if`-returns (a clamp) and a `Unit` mutator whose body is also
+// an `if`/`else`, both called from a third method on the same receiver.
 class Window(var lo: Int, var hi: Int) {
     fun clamp(v: Int): Int {
         if (v < lo) return lo

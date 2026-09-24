@@ -3920,7 +3920,7 @@ pub inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anyty
             idx_v.Int, arrayLen(&recv),
         }) catch return .decline;
         const exc = Value.newException(allocator, .{
-            .fqn = runtime.strInit(allocator, "java.lang.ArrayIndexOutOfBoundsException") catch return .decline,
+            .fqn = runtime.strInit(allocator, "klio.ArrayIndexOutOfBoundsException") catch return .decline,
             .message = .from(runtime.strInitOwned(allocator, msg) catch return .decline),
             .cause = null,
         }) catch return .decline;

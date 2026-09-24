@@ -1,8 +1,5 @@
-// A hot outer loop whose body calls a function that itself runs a hot inner loop.
-// The outer loop trampolines the call; the callee's own loop compiles too (its
-// parameter's type is seeded from the live argument), so the inner loop runs
-// natively while re-entered from inside the outer native loop. Output must match
-// with the JIT off (default) or on (KLIO_JIT=1).
+// An outer loop whose body calls a function that itself runs its own inner
+// loop over the outer loop's current value.
 fun inner(n: Int): Int {
     var t = 0
     var a = 0

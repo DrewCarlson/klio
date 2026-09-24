@@ -1,9 +1,6 @@
-// Hot loop calling small pure functions each iteration. The loop JIT inlines a
-// small single-block scalar callee directly into the native code (its registers
-// remapped into an extended register space), so the calls become native
-// arithmetic with no dispatch at all. Covers Int, Long, and Double results,
-// numeric conversions inside the callee, and the same callee inlined at more than
-// one site. Output must match with the JIT off (default) or on (KLIO_JIT=1).
+// Small pure functions called in a loop: Int, Long, and Double results,
+// numeric conversions inside the callee, and the same function called from
+// more than one call site.
 fun sq(x: Int) = x * x
 fun lmix(a: Int, b: Int) = a.toLong() * b.toLong()
 fun scaled(x: Int) = x.toDouble() * 1.5

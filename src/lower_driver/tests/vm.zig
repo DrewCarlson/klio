@@ -684,6 +684,65 @@ test "a well-known member runs the instance's own implementation, and names a me
     try testing.expectEqual(@as(i32, 7), g.ok.Int);
 }
 
+test "a host value whose class declares a well-known member with a Kotlin body runs the VM's member of the root" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    // `Pair.toString` has a Kotlin body, which never reads a host pair.
+    const text = try h.constant(.{ .String = "the body" });
+    const to_string = try h.func("Any.toString", 1);
+    const pair_c = try h.class("Pair", .{});
+    h.r.host_class.by_tag[@intFromEnum(std.meta.Tag(Value).Pair)] = pair_c;
+    const pair_to_string = try h.func("Pair.toString", 1);
+    try h.body(pair_to_string, &.{.{ .insts = &.{konst(0, text)}, .term = ret(0) }});
+    try h.dispatch(pair_c, to_string, pair_to_string);
+    const slots = try a.alloc(ir.NativeId, 16);
+    @memset(slots, .none);
+    slots[to_string.int()] = try hostMember(&h, "kotlin.Any.toString");
+    h.r.host_slot = slots;
+    h.r.well_known.set(.to_string, slot(to_string));
+    try h.finish();
+
+    const module_ref = try runtime.ObjRef(ir.Module).init(a, h.m.*);
+    var vm = try interp_ir.Vm.new(a, module_ref);
+    defer vm.deinit();
+    try vm.prepareResolved();
+    var cap = runtime.CaptureOutput.init(a);
+    var host = vm.makeHost(cap.output());
+    const pair = try Value.newPair(a, .{ .first = try Value.boxRef(a, .{ .Int = 1 }), .second = try Value.boxRef(a, .{ .Int = 2 }) });
+    const r = (try host.callWellKnown(a, &pair, .to_string, &.{})).?;
+    try testing.expect(r == .ok and r.ok == .String);
+    try testing.expectEqualStrings("(1, 2)", r.ok.String.asPtr().bytes);
+}
+
+test "a well-known static reads its property, its file initialized first" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    // The file's init unit writes 41 into the property.
+    const unit_fn = try h.func("<file init>", 0);
+    const unit = try h.initUnit(unit_fn);
+    const st = try h.static("sync", .int, unit);
+    const c41 = try h.constant(.{ .Int = 41 });
+    try h.body(unit_fn, &.{.{ .insts = &.{ konst(0, c41), hand.storeStatic(st, 0) }, .term = .{ .Return = null } }});
+    h.r.well_known_statics.set(.compose_snapshot_map_sync, st);
+    try h.finish();
+
+    const module_ref = try runtime.ObjRef(ir.Module).init(a, h.m.*);
+    var vm = try interp_ir.Vm.new(a, module_ref);
+    defer vm.deinit();
+    try vm.prepareResolved();
+    var cap = runtime.CaptureOutput.init(a);
+    var host = vm.makeHost(cap.output());
+    const r = (try host.wellKnownStatic(a, .compose_snapshot_map_sync)).?;
+    try testing.expect(r == .ok);
+    try testing.expectEqual(@as(i32, 41), r.ok.Int);
+    // A property the tables do not name has no value.
+    try testing.expect((try host.wellKnownStatic(a, .compose_global_snapshot)) == null);
+}
+
 test "an instance the tables make carries its class in its header" {
     var mem = hand.TestMemory.init();
     defer mem.deinit();
@@ -805,7 +864,7 @@ test "a call that suspends resumes into its call's register" {
     try testing.expectEqual(@as(i32, 52), third.ok.Int);
 }
 
-test "a body lowered from sema runs fused or framed, off the leaf tier and the JIT" {
+test "a body lowered from sema runs fused or framed, off the leaf tier" {
     var mem = hand.TestMemory.init();
     defer mem.deinit();
     const a = mem.allocator();
@@ -817,7 +876,6 @@ test "a body lowered from sema runs fused or framed, off the leaf tier and the J
         // A chain of static calls fuses.
         try testing.expectEqual(@as(u8, 1), f.fuse_state);
         try testing.expectEqual(@as(u8, 1), f.leaf_hopeless);
-        try testing.expect(f.func_jit_probe.load(.monotonic) & (1 << 31) != 0);
         try testing.expectEqual(@as(u8, 1), f.host_route);
     }
 }

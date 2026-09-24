@@ -1088,21 +1088,21 @@ test "an expect class's defaults name the actual class's members" {
     try std.testing.expectEqual(actual, fx.s.syms.owner(r.target));
 }
 
-test "java.lang is a default import below kotlin's" {
+test "klio is a default import below kotlin's" {
     var fx = try fixture(&.{
         \\package app
         \\fun use() = IllegalStateException("x")
     ,
-        \\package java.lang
+        \\package klio
         \\open class IllegalStateException(message: String?) : Throwable()
     ,
         \\package kotlin
-        \\typealias IllegalStateException = java.lang.IllegalStateException
+        \\open class IllegalStateException(message: String?) : Throwable()
     });
     defer fx.deinit();
     try fx.resolve();
     try fx.expectClean();
-    try fx.expectRef("= ^IllegalStateException(", .ctor, "java/lang/IllegalStateException.<init>");
+    try fx.expectRef("= ^IllegalStateException(", .ctor, "kotlin/IllegalStateException.<init>");
 }
 
 test "an import that names nothing is reported though nothing uses it" {
@@ -2417,13 +2417,13 @@ test "a property of extension-function type invoked bare takes an implicit recei
     try std.testing.expect(c.args[0] == .receiver);
 }
 
-test "java.lang and kotlin.jvm are imported by default" {
+test "klio and kotlin.jvm are imported by default" {
     var fx = try fixture(&.{
         \\package demo
         \\object O { @JvmStatic fun f() {} }
         \\fun use() { Thread().start() }
     ,
-        \\package java.lang
+        \\package klio
         \\class Thread { fun start() {} }
     ,
         \\package kotlin.jvm
@@ -2432,7 +2432,7 @@ test "java.lang and kotlin.jvm are imported by default" {
     defer fx.deinit();
     try fx.resolve();
     try fx.expectClean();
-    try fx.expectRef("^Thread().start()", .ctor, "java/lang/Thread.<init>");
+    try fx.expectRef("^Thread().start()", .ctor, "klio/Thread.<init>");
 }
 
 test "smart casts follow the data flow: assignments, branch merges, elvis jumps and safe chains" {
@@ -5905,6 +5905,350 @@ test "a variable below one fixed to a type is at most that type" {
     const out = try sema_mod.output.build(fx.s);
     const c = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt("passThrough(^none())", .call)).node);
     try std.testing.expectEqualStrings("kotlin.Int", fx.typeText(c.type_args[0]));
+}
+
+test "type parameters bounded by each other wait for the lambda that gives one" {
+    var fx = try fixture(&.{
+        \\package app
+        \\interface Service<Self : Service<Self, TEvent>, in TEvent : Event<Self>>
+        \\interface Event<out T : Service<out T, *>>
+        \\fun <TService : Service<TService, TEvent>, TEvent : Event<TService>> event(handler: (TEvent) -> Unit) {}
+        \\class SomeService : Service<SomeService, SomeService.SomeEvent> {
+        \\    class SomeEvent : Event<SomeService>
+        \\}
+        \\fun use() {
+        \\    event { someEvent: SomeService.SomeEvent -> }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const c = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt("^event {", .call)).node);
+    try std.testing.expectEqualStrings("app.SomeService", fx.typeText(c.type_args[0]));
+}
+
+test "a type parameter and its definitely non-null form join to the parameter" {
+    var fx = try fixture(&.{
+        \\package app
+        \\interface Spec<T>
+        \\class Spring<T>(val t: T?) : Spec<T>
+        \\fun <T> spring(t: T?): Spring<T> = Spring(t)
+        \\fun <T, N : Any> use(spec: Spec<T>, th: T?, n: N) {
+        \\    val j = if (th != null) spring(th) else spec
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const fr = &out.files[3];
+    try std.testing.expectEqualStrings("app.Spec<out T>", fx.typeText(fr.typeOf(try fx.exprAt("= ^if (th != null)"))));
+    const s = fx.s;
+    const pkg = s.syms.package_by_fqn.get(s.names.lookup("app").?).?;
+    const f = sema_mod.scope.membersOf(s, pkg, s.names.lookup("use").?)[0];
+    const tps = s.syms.functionInfo(f).type_params;
+    const t = try s.types.intern(.{ .param = .{ .sym = tps[0], .nullable = false } });
+    const t_q = try s.types.makeNullable(t);
+    const t_nn = try s.types.definitelyNotNull(t);
+    const n = try s.types.intern(.{ .param = .{ .sym = tps[1], .nullable = false } });
+    const n_nn = try s.types.definitelyNotNull(n);
+    try std.testing.expect(try subtyping.isSubtype(s, t_nn, t));
+    try std.testing.expect(!try subtyping.isSubtype(s, t, t_nn));
+    try std.testing.expect(!try subtyping.isSubtype(s, t_q, t));
+    try std.testing.expect(try subtyping.isSubtype(s, t, t_q));
+    try std.testing.expect(try subtyping.isSubtype(s, n, n_nn));
+    try std.testing.expectEqualStrings("T", fx.typeText(try subtyping.commonSupertype(s, &.{ t_nn, t })));
+    try std.testing.expectEqualStrings("T?", fx.typeText(try subtyping.commonSupertype(s, &.{ t_nn, t_q })));
+}
+
+test "a delegate's getValue takes its type parameters from the property's type" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Holder<V>(val v: V)
+        \\operator fun <V, V1 : V> Holder<V>.getValue(thisRef: Any?, p: Any?): V1 = TODO()
+        \\fun use(h: Holder<Any?>) {
+        \\    val n: Int by h
+        \\    val s: String? by h
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const fr = &out.files[3];
+    const n = try sema_mod.output.callOf(fx.s, fr, (try fx.refAt("Int by ^h", .get_value)).node, .get_value);
+    try std.testing.expectEqualStrings("kotlin.Int", fx.typeText(n.type_args[1]));
+    const q = try sema_mod.output.callOf(fx.s, fr, (try fx.refAt("String? by ^h", .get_value)).node, .get_value);
+    try std.testing.expectEqualStrings("kotlin.String?", fx.typeText(q.type_args[1]));
+}
+
+test "a delegate whose getValue returns what the property cannot hold is reported" {
+    var fx = try fixture(&.{
+        \\package app
+        \\interface P
+        \\interface B
+        \\class Box<T>(val v: T) { operator fun getValue(thisRef: Any?, p: Any?): T = v }
+        \\fun <T> box(f: () -> T): Box<T> = Box(f())
+        \\fun enc(): B = TODO()
+        \\fun pee(): P = TODO()
+        \\abstract class Base { abstract val q: P }
+        \\class C : Base() {
+        \\    override val q: P by box { enc() }
+        \\    val ok: P by box { pee() }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectMessages(&fx, &.{"the delegate's `getValue` returns `B`, but the property is a `P`"});
+}
+
+test "a member an object inherits is imported from the object" {
+    var fx = try fixture(&.{
+        \\package app
+        \\import app.C.f
+        \\import app.C.fromClass
+        \\import app.C.fromInterface
+        \\import app.C.genericFromSuper
+        \\interface I<G> {
+        \\    fun <T> T.fromInterface(): T = this
+        \\    fun genericFromSuper(g: G) = g
+        \\}
+        \\open class BaseClass {
+        \\    val <T> T.fromClass: T get() = this
+        \\}
+        \\object C : BaseClass(), I<String> {
+        \\    fun f(s: Int) = 1
+        \\}
+        \\fun use() {
+        \\    f(1)
+        \\    9.fromInterface()
+        \\    "10".fromClass
+        \\    genericFromSuper("11")
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const c = fx.class("app.C");
+    for ([_][]const u8{ "^f(1)", "9.^fromInterface()", "\"10\".^fromClass", "^genericFromSuper(\"11\")" }) |needle| {
+        const r = try fx.ref(needle);
+        try std.testing.expect(r.dispatch == .implicit and r.dispatch.implicit.kind == .object and r.dispatch.implicit.owner == c);
+    }
+    try fx.expectTarget("\"10\".^fromClass", "app/BaseClass.fromClass");
+    try fx.expectTarget("^genericFromSuper(\"11\")", "app/I.genericFromSuper");
+    const out = try sema_mod.output.build(fx.s);
+    try std.testing.expectEqualStrings("kotlin.String", fx.typeText(out.files[3].typeOf(try fx.exprAt("^genericFromSuper(\"11\")"))));
+}
+
+test "an import of a name an object and its supertypes do not declare is unresolved" {
+    var fx = try fixture(&.{
+        \\package app
+        \\import app.O.nope
+        \\open class Base { fun yes() = 1 }
+        \\object O : Base()
+        \\fun use() = O.yes()
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectMessages(&fx, &.{"unresolved import `app.O.nope`"});
+}
+
+test "a reference on a class is bound to its companion when the class's own member does not fit" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class A {
+        \\    fun instance() = true
+        \\    companion object : A() { fun companion() = true }
+        \\}
+        \\fun call(f: () -> Boolean) = f()
+        \\fun callParameter(f: (A) -> Boolean, p: A) = f(p)
+        \\fun use() {
+        \\    call(A::instance)
+        \\    callParameter(A::instance, A)
+        \\    val u = A::instance
+        \\    call(A::companion)
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const comp = fx.class("app.A.Companion");
+    for ([_][]const u8{ "call(A::^instance)", "call(A::^companion)" }) |needle| {
+        const r = try fx.refAt(needle, .ref);
+        try std.testing.expect(r.detail.ref.bound == .implicit and r.detail.ref.bound.implicit.owner == comp);
+    }
+    try std.testing.expectEqual(comp, (try fx.refAt("call(^A::instance)", .object)).target);
+    try std.testing.expectEqual(comp, (try fx.refAt("call(^A::companion)", .object)).target);
+    for ([_][]const u8{ "callParameter(A::^instance", "u = A::^instance" }) |needle| {
+        const r = try fx.refAt(needle, .ref);
+        try std.testing.expect(r.detail.ref.bound != .implicit);
+    }
+}
+
+test "a private member of a supertype is not inherited" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class X(private val n: String) {
+        \\    fun foo(): String = object : X("inner") { fun print(): String = n }.print()
+        \\}
+        \\interface A { val c: String get() = "OK" }
+        \\interface B { private val c: String get() = "FAIL" }
+        \\open class C { private val c: String = "FAIL" }
+        \\open class D : C(), A, B { val b = c }
+        \\fun use() = D().c
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const n = try fx.ref("String = ^n }");
+    try std.testing.expect(n.dispatch == .implicit and n.dispatch.implicit.owner == fx.class("app.X"));
+    try fx.expectTarget("val b = ^c", "app/A.c");
+    try fx.expectTarget("D().^c", "app/A.c");
+}
+
+test "a delegate's call takes the property's type before its references are resolved" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class IC<T : String>(val ok: T? = null)
+        \\class Lz<T>(val v: T)
+        \\fun <T> lz(f: () -> T): Lz<T> = Lz(f())
+        \\operator fun <T> Lz<T>.getValue(thisRef: Any?, p: Any?): T = v
+        \\fun use() {
+        \\    val c: IC<String> by lz(::IC)
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const fr = &out.files[3];
+    const c = try sema_mod.output.call(fx.s, fr, (try fx.refAt("^lz(::IC)", .call)).node);
+    try std.testing.expectEqualStrings("app.IC<kotlin.String>", fx.typeText(c.type_args[0]));
+}
+
+test "a delegate's provideDelegate is inferred through to its getValue" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Lz<T>(val v: T)
+        \\operator fun <T> Lz<T>.getValue(thisRef: Any?, p: Any?): T = v
+        \\interface DelegateProvider<out T> {
+        \\    operator fun provideDelegate(receiver: Any?, prop: Any?): Lz<T>
+        \\}
+        \\fun <Value : Any> delegate(): DelegateProvider<Value> = TODO()
+        \\fun use() {
+        \\    val value: String by delegate()
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const c = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt("by ^delegate()", .call)).node);
+    try std.testing.expectEqualStrings("kotlin.String", fx.typeText(c.type_args[0]));
+}
+
+test "a data class inherits the Any members a superclass makes final" {
+    var fx = try fixture(&.{
+        \\package app
+        \\abstract class Base {
+        \\    final override fun toString() = "OK"
+        \\    final override fun hashCode() = 42
+        \\}
+        \\open class Open { override fun toString() = "open" }
+        \\data class D(val x: String) : Base()
+        \\data object O : Open()
+        \\fun use(d: D) = d.toString() + d.hashCode() + d.equals(d) + O.toString()
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("d.^toString()", "app/Base.toString");
+    try fx.expectTarget("d.^hashCode()", "app/Base.hashCode");
+    try fx.expectTarget("d.^equals(d)", "app/D.equals");
+    try fx.expectTarget("O.^toString()", "app/O.toString");
+}
+
+test "a builder's variable is inferred from what an anonymous function, a getter and a delegation declare" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class TargetType
+        \\interface Buildee<TV>
+        \\fun <PTV> build(instructions: Buildee<PTV>.() -> Unit): Buildee<PTV> = TODO()
+        \\fun a() = build { fun(): Buildee<TargetType> = this }
+        \\fun b() = build {
+        \\    class LocalClass {
+        \\        val p: Buildee<TargetType>
+        \\            get() = this@build
+        \\    }
+        \\}
+        \\fun c() = build { class Source : Buildee<TargetType> by this@build }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const fr = &out.files[3];
+    for ([_][]const u8{ "a() = ^build", "b() = ^build", "c() = ^build" }) |n| {
+        const c = try sema_mod.output.call(fx.s, fr, (try fx.refAt(n, .call)).node);
+        try std.testing.expectEqualStrings("app.TargetType", fx.typeText(c.type_args[0]));
+    }
+}
+
+test "a value smart cast to a subclass keeps the private members of its class" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class Base {
+        \\    fun foo(): String = when (this) {
+        \\        is Derived -> baz()
+        \\        else -> "fail"
+        \\    }
+        \\    fun other(x: Base) = if (x is Derived) x.baz() else "no"
+        \\    private fun baz(): String = "OK"
+        \\}
+        \\class Derived : Base()
+        \\abstract class Base2 {
+        \\    fun foo(): String = when (this) {
+        \\        is Derived2 -> qux()
+        \\        else -> "fail"
+        \\    }
+        \\    private fun Derived2.qux(): String = "OK"
+        \\}
+        \\class Derived2 : Base2()
+        \\abstract class Snap {
+        \\    abstract val obs: Int
+        \\    private fun p() = 1
+        \\    fun f(x: Snap?) { if (x is Mut) x.obs = 2 }
+        \\}
+        \\class Mut : Snap() { override var obs: Int = 0 }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("-> ^baz()", "app/Base.baz");
+    try fx.expectTarget("x.^baz()", "app/Base.baz");
+    try fx.expectTarget("-> ^qux()", "app/Base2.qux");
+    // The override the subclass declares is still the member.
+    try fx.expectTarget("x.^obs = 2", "app/Mut.obs");
+}
+
+test "a builder's variable stays open for every lambda of the call" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class TargetTypeBase
+        \\class TargetType : TargetTypeBase()
+        \\fun consumeTargetTypeBase(value: TargetTypeBase) {}
+        \\fun consumeTargetType(value: TargetType) {}
+        \\class Buildee<TV>
+        \\fun <PTV> parallelBuild(a: Buildee<PTV>.(PTV) -> Unit, b: Buildee<PTV>.(PTV) -> Unit): Buildee<PTV> = TODO()
+        \\fun use() = parallelBuild({ consumeTargetTypeBase(it) }, { consumeTargetType(it) })
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const c = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt("= ^parallelBuild(", .call)).node);
+    try std.testing.expectEqualStrings("app.TargetType", fx.typeText(c.type_args[0]));
 }
 
 test "a vararg parameter's default is typed as its array" {

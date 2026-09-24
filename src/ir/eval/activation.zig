@@ -4,7 +4,6 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("../ir.zig");
-const jit_loop = @import("../jit_loop.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -408,11 +407,7 @@ pub fn runFrame(
     ev_state.evtlsPtr().eval_depth += 1;
     defer {
         ev_state.evtlsPtr().eval_depth -= 1;
-        // Back at the outermost activation with no native JIT frame on the stack, so the JIT cache may be trimmed.
-        if (ev_state.evtlsPtr().eval_depth == 0) {
-            _ = parent.threads_in_eval.fetchSub(1, .monotonic);
-            jit_loop.evictIfOverBudget();
-        }
+        if (ev_state.evtlsPtr().eval_depth == 0) _ = parent.threads_in_eval.fetchSub(1, .monotonic);
     }
     return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, null, host);
 }

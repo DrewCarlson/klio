@@ -92,6 +92,12 @@ fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool) Allo
             for (scope.membersOf(s, c.sym, n)) |m| {
                 if (!wanted(s, m, want)) continue;
                 if (!scope.visible(s, m)) continue;
+                // A private member is not inherited: a subclass's `n` is
+                // not its superclass's `private val n`, even where the
+                // superclass's body could read it (an object expression
+                // extending the class it is written in reads the outer
+                // instance's `n`).
+                if (depth > 0 and s.syms.flags(m).visibility == .private) continue;
                 if (!every) if (try sameDepthConflict(s, out.items, m, subst, depth)) |i| {
                     // Two supertypes at the same distance declare the
                     // member: the one with the more specific result is
@@ -99,7 +105,14 @@ fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool) Allo
                     // `iterator()` over `List`'s).
                     const cand: Member = .{ .sym = m, .subst = subst, .depth = depth };
                     const other = out.items[i];
-                    if (try moreSpecificResult(s, cand, other)) out.items[i] = cand;
+                    // Of two where one overrides the other (the parts of
+                    // an intersection, one a smart cast narrowed to its
+                    // subclass), the override is the member.
+                    if (try overridesTransitively(s, m, other.sym)) {
+                        out.items[i] = cand;
+                    } else if (!try overridesTransitively(s, other.sym, m)) {
+                        if (try moreSpecificResult(s, cand, other)) out.items[i] = cand;
+                    }
                     try takeDefaults(s, &out.items[i], if (out.items[i].sym == m) other.sym else m);
                     continue;
                 };

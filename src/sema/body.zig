@@ -83,6 +83,18 @@ pub const Scope = struct {
     ret: TypeId = .none,
 };
 
+/// What a delegated property with a written type expects of the call its
+/// delegate expression makes: that its `getValue`, through its
+/// `provideDelegate` when it has one, returns the property's type (and,
+/// for a `var`, that its `setValue` takes it).
+pub const DelegateExpect = struct {
+    /// The called name of the delegate expression's call.
+    anchor: Span,
+    declared: TypeId,
+    mutable: bool,
+    this_ref: TypeId,
+};
+
 /// What a generic call may leave open for the expression that uses its
 /// result.
 pub const ArgMode = enum {
@@ -125,6 +137,10 @@ pub const Ctx = struct {
     /// The innermost `try` being resolved: what its body and catches
     /// assign, for the smart casts its catches and finally see.
     try_log: ?*TryLog = null,
+    /// A delegated property's written type, for the call its delegate
+    /// expression makes: taken by that call before its lambdas and
+    /// references are analyzed.
+    delegate_expect: ?*const DelegateExpect = null,
 
     pub fn arena(self: *const Ctx) Allocator {
         return self.s.arena;
@@ -303,6 +319,7 @@ fn fileScope(s: *Sema) Allocator.Error!*Scope {
 
 pub fn resolveFile(s: *Sema, file: u32) Allocator.Error!void {
     const fc = s.files.items[file];
+    try scope_mod.checkInheritedImports(s, file);
     var ctx = Ctx{ .s = s, .file = file, .scope = try fileScope(s) };
     for (fc.ast.decls) |*d| {
         const sym = declSym(s, fc.package, d) orelse continue;
@@ -563,6 +580,18 @@ fn typedValue(ctx: *Ctx, e: *const Expr, declared: TypeId) Allocator.Error!void 
     try infer.noteExpected(ctx.s, t, declared);
 }
 
+/// A delegated property whose type is written takes what its delegate's
+/// `getValue` returns only when that fits it: kotlinc refuses `val q: P
+/// by lazy { enc(raw) }` for an `enc` returning a `B`.
+fn checkDelegateValue(ctx: *Ctx, d: *const Expr, got: TypeId, declared: TypeId) Allocator.Error!void {
+    const s = ctx.s;
+    if (got == .none or declared == .none or s.types.isErr(got) or s.types.isErr(declared)) return;
+    const g = try infer.zonk(s, got);
+    if (infer.hasOpenVar(s, g) or try subtyping.isSubtype(s, g, declared)) return;
+    const msg = try std.fmt.allocPrint(s.arena, "the delegate's `getValue` returns `{s}`, but the property is a `{s}`", .{ try sema_mod.diagnose.typeText(s, s.arena, g), try sema_mod.diagnose.typeText(s, s.arena, declared) });
+    try ctx.reportFacts(.type_mismatch, d.span(), .{ .message = msg }, "{s}", .{msg});
+}
+
 /// The type an expression body gives a function that does not write one.
 pub fn inferReturnType(s: *Sema, f: Sym) Allocator.Error!TypeId {
     const info = s.syms.functionInfo(f);
@@ -651,7 +680,7 @@ fn resolvePropertyIn(ctx: *Ctx, p: Sym) Allocator.Error!void {
     const declared = s.syms.propertyInfo(p).ty;
     if (pd.delegate) |d| {
         const t = try calls.delegateAccess(ctx, d, delegate_t, p, pd.mutable, host);
-        if (s.syms.propertyInfo(p).ty == .none) s.syms.propertyInfo(p).ty = t;
+        if (s.syms.propertyInfo(p).ty == .none) s.syms.propertyInfo(p).ty = t else try checkDelegateValue(ctx, d, t, declared);
     }
     if (pd.init) |i| {
         const t = try expr(ctx, i, declared);
@@ -671,7 +700,9 @@ fn resolvePropertyIn(ctx: *Ctx, p: Sym) Allocator.Error!void {
         gsc.label = sym.name;
         const field_t = s.syms.propertyInfo(p).ty;
         const t = try accessorBody(ctx, g, field_t);
-        if (s.syms.propertyInfo(p).ty == .none) s.syms.propertyInfo(p).ty = t;
+        if (s.syms.propertyInfo(p).ty == .none) {
+            s.syms.propertyInfo(p).ty = t;
+        } else if (g.body == .Expr) try infer.noteExpected(s, t, field_t);
         ctx.pop(gsc);
     }
     if (pd.setter) |st| {
@@ -787,12 +818,21 @@ fn delegateExpr(ctx: *Ctx, d: *const Expr, declared_in: TypeId, mutable: bool, t
     const s = ctx.s;
     const declared: TypeId = if (declared_in == .none or s.types.isErr(declared_in)) .none else declared_in;
     const saved = ctx.in_arg;
+    const saved_expect = ctx.delegate_expect;
     ctx.in_arg = .arg;
+    // The written type reaches the delegate's call as kotlinc's delegate
+    // inference has it, before the call's lambdas and references are
+    // analyzed: `val v: IC<String> by lazy(::IC)` makes `::IC` an
+    // `() -> IC<String>`.
+    const expect: DelegateExpect = .{ .anchor = if (d.* == .Call) lastNameSpan(d.Call.callee) else d.span(), .declared = declared, .mutable = mutable, .this_ref = this_ref };
+    if (declared != .none and d.* == .Call) ctx.delegate_expect = &expect;
     const dt = expr(ctx, d, .none) catch |e| {
         ctx.in_arg = saved;
+        ctx.delegate_expect = saved_expect;
         return e;
     };
     ctx.in_arg = saved;
+    ctx.delegate_expect = saved_expect;
     const z = try infer.zonk(s, dt);
     if (!infer.hasOpenVar(s, z)) return z;
     var sys = infer.System.init(s);
@@ -1095,7 +1135,7 @@ fn superCalls(ctx: *Ctx, cls: Sym, supertypes: []const ast.TypeRef, args: []cons
         if (i < delegates.len) {
             // `: I<V> by Impl(x)`: the delegate is expected to be the
             // interface it implements.
-            if (delegates[i]) |*d| _ = try expr(ctx, d, try headers.resolveTypeRef(s, tctx, tr));
+            if (delegates[i]) |*d| try typedValue(ctx, d, try headers.resolveTypeRef(s, tctx, tr));
         }
     }
 }
@@ -1238,7 +1278,7 @@ fn localDecl(ctx: *Ctx, d: *const ast.Decl) Allocator.Error!void {
                 s.syms.getMut(sym).decl = .{ .local_prop = p };
                 try ctx.addRef(.{ .file = ctx.file, .anchor = p.name.span, .kind = .decl, .target = sym });
                 const vt = try calls.delegateAccess(ctx, del, dt, sym, p.mutable, try calls.thisRefType(ctx));
-                if (t == .none) s.syms.localInfo(sym).ty = vt;
+                if (t == .none) s.syms.localInfo(sym).ty = vt else try checkDelegateValue(ctx, del, vt, t);
                 try ctx.declareLocal(s.syms.name(sym), sym);
                 return;
             }
@@ -2896,8 +2936,11 @@ pub fn nonNullFacts(ctx: *Ctx, e: *const Expr) Allocator.Error![]const Narrow {
 
 /// A subject of type `current` narrowed by `is t`: the tested type when it
 /// is a subtype of what the subject already is, else the intersection of
-/// both, so members of each stay reachable. A bare generic type (`is List`
-/// on an `Iterable<T>`) takes its arguments from the subject.
+/// both, so members of each stay reachable. A subtype of a class that
+/// declares private members is intersected with the class too: the
+/// subtype does not inherit them, and `is Derived -> baz()` in `Base`
+/// still calls `Base`'s private `baz`. A bare generic type (`is List` on an
+/// `Iterable<T>`) takes its arguments from the subject.
 fn intersectNarrow(ctx: *Ctx, current: TypeId, t_in: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
     if (s.types.isErr(current) or s.types.isErr(t_in)) return t_in;
@@ -2907,9 +2950,26 @@ fn intersectNarrow(ctx: *Ctx, current: TypeId, t_in: TypeId) Allocator.Error!Typ
     // `b is Double?` is a `Double?`, not a `Double`.
     const keep_null = s.types.isNullable(t) and try subtyping.admitsNull(s, current);
     const t_nn = try s.types.makeNotNull(t);
-    if (try subtyping.isSubtype(s, t_nn, cur_nn)) return if (keep_null) s.types.makeNullable(t_nn) else t_nn;
+    if (try subtyping.isSubtype(s, t_nn, cur_nn)) {
+        if (keep_null) return s.types.makeNullable(t_nn);
+        const cur_cls = s.types.classSym(cur_nn);
+        if (cur_cls != .none and cur_cls != s.types.classSym(t_nn) and declaresPrivate(s, cur_cls)) {
+            return s.types.intern(.{ .intersection = &.{ cur_nn, t_nn } });
+        }
+        return t_nn;
+    }
     if (try subtyping.isSubtype(s, cur_nn, t_nn)) return if (keep_null) s.types.makeNullable(cur_nn) else cur_nn;
     return s.types.intern(.{ .intersection = &.{ cur_nn, t_nn } });
+}
+
+/// Whether class `cls` declares a private function or property.
+fn declaresPrivate(s: *Sema, cls: Sym) bool {
+    var it = s.syms.classInfo(cls).members.iterator();
+    while (it.next()) |e| for (e.value_ptr.items) |m| {
+        const k = s.syms.kind(m);
+        if ((k == .function or k == .property) and s.syms.flags(m).visibility == .private) return true;
+    };
+    return false;
 }
 
 /// `is C` written without type arguments for a generic `C`: the arguments
@@ -3271,9 +3331,10 @@ pub fn nameAccess(ctx: *Ctx, id: ast.Ident, access: Access) Allocator.Error!Type
     }
     if (try calls.topLevelProperty(ctx, n)) |p| {
         // A property imported from an object is read on the object.
-        const cx = (try calls.propertyContexts(ctx, p, &calls.empty_subst)) orelse &.{};
-        try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = kind, .target = p, .dispatch = calls.importedOwner(s, p), .contexts = cx });
-        const t = try headers.propertyType(s, p);
+        const subst = calls.importedSubst(ctx, p);
+        const cx = (try calls.propertyContexts(ctx, p, subst)) orelse &.{};
+        try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = kind, .target = p, .dispatch = calls.importedOwner(ctx, p), .contexts = cx });
+        const t = try s.types.substitute(try headers.propertyType(s, p), subst);
         return if (access == .read) narrowedType(ctx, p, t) else t;
     }
     var cls = try classifierInScope(ctx, n);

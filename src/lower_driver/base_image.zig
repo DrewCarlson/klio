@@ -26,7 +26,7 @@ const ClassId = ir.ClassId;
 const magic = "KLIOSEMB";
 
 /// Bumped with any change to the layout below.
-pub const version: u32 = 19;
+pub const version: u32 = 22;
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };
@@ -111,7 +111,6 @@ const ClassRtImage = struct {
     seeds: []const ir.SlotSeed,
     object_ctor: u32,
     init_name: []const u8,
-    jvm_name: []const u8,
     host_slot: u32,
     vtable: []const resolved.VSlot,
     itables: []const resolved.ITable,
@@ -171,6 +170,7 @@ const ResolvedImage = struct {
     slot_iface: []const u32,
     well_known: resolved.WellKnownSlots,
     well_known_objects: resolved.WellKnownObjects,
+    well_known_statics: resolved.WellKnownStatics,
     host_class: resolved.HostClasses,
     exceptions: ExceptionsImage,
     base: resolved.BaseClasses,
@@ -288,7 +288,7 @@ fn resolvedImage(a: Allocator, m: *const ir.Module) !ResolvedImage {
         const def = rt.def.asPtrConst();
         const primary = try a.alloc(bridge.PrimaryProperty, def.primary_params.len);
         for (def.primary_params, primary) |p, *pp| pp.* = .{ .name = p.name, .mutable = p.property orelse false };
-        out.* = .{ .seeds = rt.seeds, .object_ctor = rt.object_ctor, .init_name = rt.init_name, .jvm_name = rt.jvm_name, .host_slot = rt.host_slot, .vtable = rt.vtable, .itables = rt.itables, .throwable = rt.throwable, .flags = .{ .is_data = def.is_data, .is_sealed = def.is_sealed, .is_anonymous = def.is_anonymous, .primary = primary } };
+        out.* = .{ .seeds = rt.seeds, .object_ctor = rt.object_ctor, .init_name = rt.init_name, .host_slot = rt.host_slot, .vtable = rt.vtable, .itables = rt.itables, .throwable = rt.throwable, .flags = .{ .is_data = def.is_data, .is_sealed = def.is_sealed, .is_anonymous = def.is_anonymous, .primary = primary } };
     }
     const natives = try a.alloc(NativeRtImage, r.natives.len);
     for (r.natives, natives) |rt, *out| out.* = project(NativeRtImage, rt);
@@ -314,6 +314,7 @@ fn resolvedImage(a: Allocator, m: *const ir.Module) !ResolvedImage {
         .slot_iface = r.slot_iface,
         .well_known = r.well_known,
         .well_known_objects = r.well_known_objects,
+        .well_known_statics = r.well_known_statics,
         .host_class = r.host_class,
         .exceptions = .{ .fixed = fixed, .by_fqn = by_fqn.items },
         .base = r.base,
@@ -408,7 +409,6 @@ fn loadResolved(a: Allocator, img: *const ResolvedImage, m: *const ir.Module, br
             .seeds = ci.seeds,
             .object_ctor = ci.object_ctor,
             .init_name = ci.init_name,
-            .jvm_name = ci.jvm_name,
             .host_slot = ci.host_slot,
             .vtable = ci.vtable,
             .itables = ci.itables,
@@ -437,6 +437,7 @@ fn loadResolved(a: Allocator, img: *const ResolvedImage, m: *const ir.Module, br
     r.slot_iface = img.slot_iface;
     r.well_known = img.well_known;
     r.well_known_objects = img.well_known_objects;
+    r.well_known_statics = img.well_known_statics;
     r.host_class = img.host_class;
     r.base = img.base;
     r.serializers = img.serializers;

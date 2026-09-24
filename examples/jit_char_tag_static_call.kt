@@ -1,7 +1,7 @@
-// A hot loop whose trampolined `next()` produces a Char that a native Move
-// carries into a STATIC call's argument slot (`isWhitespace` baked as an
-// extension): the rebox must use the producer's live tag, not the slot's
-// static Int default. Printed values prove chars stay chars under the JIT.
+// Iterating a `String` with `for (c in s)` and calling `Char.isWhitespace()`
+// on each character, over a `trimIndent()`-normalized multi-line string.
+// Checks whitespace and non-whitespace classification, including a bare
+// space and a non-whitespace letter.
 fun main() {
     var blanks = 0
     var glyphs = 0

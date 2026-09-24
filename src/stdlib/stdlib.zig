@@ -801,7 +801,7 @@ test "every hand-written intrinsic is accounted for against the mined index" {
     //
     // The unknown bucket is a ratchet rather than zero, since the mined index is
     // built from whatever upstream sources are present. It grows only by a
-    // JVM-only declaration klio implements, recorded here: `java.lang`'s
+    // JVM-only declaration klio implements, recorded here: `klio`'s
     // `StackTraceElement.className`, `methodName`, `fileName` and `lineNumber`
     // took it from 141 to 145.
     const UNKNOWN_CEILING: usize = 145;

@@ -100,12 +100,18 @@ pub fn classify(msg: []const u8) Kind {
 }
 
 /// The declaration a `FuncId` runs when it is bodyless, abstract-free, and
-/// neither a native nor an operation of the primitive table binds it.
+/// neither a native nor an operation of the primitive table binds it: a
+/// function, or the accessor of an `expect` or `external` property, which
+/// reports the property.
 fn unbound(s: *sema.Sema, br: *const bridge.Bridge, prog: *const lower.Program, f: ir.FuncId) !?Sym {
     const i = f.int();
     if (br.m.resolved) |r| if (i < r.func_native.len and r.func_native[i] != .none) return null;
     const sym = switch (br.origin[i]) {
         .decl => |d| d,
+        .getter, .setter => |prop| {
+            if (!lower.body.bodylessAccessor(s, prop, br.origin[i] == .setter)) return null;
+            return if (try noActualByDesign(s, prop)) null else prop;
+        },
         else => return null,
     };
     if (s.syms.kind(sym) != .function) return null;
@@ -114,7 +120,39 @@ fn unbound(s: *sema.Sema, br: *const bridge.Bridge, prog: *const lower.Program, 
     if (prog.prims.get(sym) != null) return null;
     // The lowering makes these at each call.
     if (lower.call.enumIntrinsicOf(s, sym) != null) return null;
+    if (try noActualByDesign(s, sym)) return null;
     return sym;
+}
+
+/// Whether `sym` is an `expect` its declaration marks as having no actual,
+/// `@Suppress("NO_ACTUAL_FOR_EXPECT")`: kotlinc's own marker for an expect
+/// that every use resolves past. The compose runtime's
+/// `AbstractMutableList<*>.modCount` is one. On the JVM each use inside a
+/// subclass resolves to `java.util.AbstractList`'s protected `modCount`
+/// field, and in klio to `kotlin.collections.AbstractMutableList`'s
+/// protected `modCount`, a member, which wins over the extension; so the
+/// expect is never reached and no platform supplies an actual for it.
+fn noActualByDesign(s: *sema.Sema, sym: Sym) !bool {
+    if (!s.syms.flags(sym).expect) return false;
+    const anns = switch (s.syms.get(sym).decl) {
+        .property => |pd| pd.annotations,
+        .function => |fd| fd.annotations,
+        else => return false,
+    };
+    const suppress = s.classByFqn("kotlin.Suppress");
+    if (suppress == .none) return false;
+    const ctx: sema.headers.TypeCtx = .{ .decl = sym, .file = s.syms.get(sym).file };
+    for (anns) |*ann| {
+        if (try sema.headers.annotationClass(s, ctx, ann) != suppress) continue;
+        for (ann.args) |*arg| {
+            const t = switch (arg.*) {
+                .StringTemplate => |t| t,
+                else => continue,
+            };
+            if (t.parts.len == 1 and t.parts[0] == .Text and std.mem.eql(u8, t.parts[0].Text, "NO_ACTUAL_FOR_EXPECT")) return true;
+        }
+    }
+    return false;
 }
 
 fn declWhere(a: Allocator, s: *sema.Sema, map: *const span.SourceMap, sym: Sym) ![]const u8 {
@@ -208,6 +246,34 @@ test "the census lists each failure as a site a gate can match" {
     try print(a, &out, r, 100);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "  lower_bridge src/E.kt:48:35: `engineConfig` has no getter\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "  lower_unbound_native src/D.kt:7:1: p.Digest\n") != null);
+}
+
+test "an expect property without an actual is a bodyless declaration no native binds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const driver = @import("lower_driver.zig");
+    const an = try driver.analyze(a, &.{
+        \\package demo
+        \\expect val unbound: Int
+        \\expect var String.tally: Int
+        \\@Suppress("NO_ACTUAL_FOR_EXPECT")
+        \\expect var String.designed: Int
+        \\fun main() {}
+    });
+    const files = [_]u32{an.baseFiles()};
+    const r = try run(a, an.s, &an.map, an.out.files, &an.layers, &files, .{ .natives = driver.natives.resolve });
+    var got: std.ArrayList(u8) = .empty;
+    for (r.entries) |e| try got.print(a, "{s} {s} {s}\n", .{ @tagName(e.kind), e.where, e.func });
+    // No accessor lowers over storage the expect never had; each of the
+    // expect's accessors is bodyless, and the one kotlinc's marker says has
+    // no actual by design is not reported.
+    try std.testing.expectEqualStrings(
+        "unbound_native test0.kt:2:8 demo.unbound.<get>\n" ++
+            "unbound_native test0.kt:3:8 demo.tally.<get>\n" ++
+            "unbound_native test0.kt:3:8 demo.tally.<set>\n",
+        got.items,
+    );
 }
 
 test "a lowering error's message says its kind" {

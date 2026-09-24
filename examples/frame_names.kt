@@ -1,11 +1,12 @@
-// A stack frame names what the JVM runs: the class and method kotlinc
-// compiles each function to, and the file and line. A top-level function
-// runs in its file's facade (`Jvm_frame_namesKt`), a member in its class,
-// a companion's in `Box$Companion`, a property's accessor in `getProp`, a
-// lambda in `main$lambda$0` (numbered in source order within the function,
-// a nested one after its own), a local function in `outer$local`, and an
-// object's, a companion's, an enum's or a file's initialization in the
-// class's `<clinit>`.
+// A stack frame names its function by its Kotlin qualified name, then the
+// file and line. A top-level function is its package's (`main` in the root
+// package), a member its class's (`Box.Companion.comp`, `Box.Nested.n`), an
+// accessor `<get-prop>` or `<set-prop>`, a lambda `<anonymous>` within what
+// encloses it (`main.<anonymous>`, nested ones one level each), and a local
+// function its container's (`outer.local`). An object's or companion's
+// initialization runs in its `<init>`, an enum's entries in
+// `<init-entries>`, and a file's top-level initializers in
+// `frame_names.kt.<init>`.
 fun trace(): String = Throwable().stackTrace[1].toString()
 
 fun call(f: () -> String): String = f()

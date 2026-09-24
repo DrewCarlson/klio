@@ -184,6 +184,7 @@ pub const CallCtx = host_mod.CallCtx;
 pub const IntrinsicHost = host_mod.IntrinsicHost;
 pub const WellKnown = host_mod.WellKnown;
 pub const WellKnownObject = host_mod.WellKnownObject;
+pub const WellKnownStatic = host_mod.WellKnownStatic;
 pub const NoopHost = host_mod.NoopHost;
 pub const HostResultU64 = host_mod.HostResultU64;
 pub const BuilderStepResult = host_mod.BuilderStepResult;

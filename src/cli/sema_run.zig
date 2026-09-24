@@ -209,7 +209,7 @@ pub fn runBuilt(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, pr
         return 2;
     };
     const main_sym = found orelse {
-        io.printStderr(gpa, "error: no `main` function in class {s}\n", .{pipeline.mainClassName(arena, s) catch ""});
+        io.printStderr(gpa, "error: no `main` function in {s}\n", .{pipeline.mainFileName(s)});
         return 1;
     };
     const main = built.br.funcOfOpt(main_sym) orelse {

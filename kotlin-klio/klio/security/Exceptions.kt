@@ -1,8 +1,8 @@
 /*
- * The `java.security` exceptions a message digest raises: asking for an
- * algorithm the platform does not provide is a `NoSuchAlgorithmException`.
+ * The security exceptions a message digest raises: asking for an algorithm
+ * klio does not provide is a `NoSuchAlgorithmException`.
  */
-package java.security
+package klio.security
 
 public open class GeneralSecurityException : Exception {
     public constructor() : super()

@@ -334,7 +334,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
     // `java.lang.Thread` handle members.
     if (receiver.* == .BoundMethod) {
         const bm = receiver.BoundMethod;
-        if (std.mem.eql(u8, bm.fqn, "java.lang.Thread")) {
+        if (std.mem.eql(u8, bm.fqn, "klio.Thread")) {
             const id: u64 = switch (bm.receiver.asPtr().*) {
                 .Long => |v| @bitCast(v),
                 else => 0,
@@ -882,7 +882,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
             defer if (runtime.freeScratch()) allocator.free(msg);
-            return .{ .err = try throwExc(allocator, "java.lang.ArrayIndexOutOfBoundsException", msg) };
+            return .{ .err = try throwExc(allocator, "klio.ArrayIndexOutOfBoundsException", msg) };
         }
     }
     if (std.mem.eql(u8, name, "set") and args.len == 2 and receiver.* == .Array) {
@@ -895,7 +895,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
             defer if (runtime.freeScratch()) allocator.free(msg);
-            return .{ .err = try throwExc(allocator, "java.lang.ArrayIndexOutOfBoundsException", msg) };
+            return .{ .err = try throwExc(allocator, "klio.ArrayIndexOutOfBoundsException", msg) };
         }
     }
 

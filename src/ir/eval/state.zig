@@ -132,8 +132,6 @@ pub inline fn evtlsPtr() *EvalTls {
 pub const EvalTls = struct {
     /// Activation depth: native recursion across the host call-back boundary.
     eval_depth: usize = 0,
-    /// Native-recursion depth for the JIT (see `NATIVE_SLOT_BANK_DEPTH`).
-    jit_native_depth: usize = 0,
     /// Resolved depth cap; `0` = not yet read from the env.
     eval_depth_cap: usize = 0,
     /// The executing frame's chain: always a live Frame's `enclosing_this`,
@@ -169,18 +167,6 @@ pub const EvalTls = struct {
     chain_pool: [CHAIN_POOL_MAX][]EnclosingEntry = undefined,
     chain_pool_len: usize = 0,
 };
-
-/// Nesting levels of the native-to-native JIT slot/tag banks. Deeper recursion
-/// falls back to the frame path, whose `eval_depth` bound raises StackOverflow.
-pub const NATIVE_SLOT_BANK_DEPTH: usize = 192;
-
-/// One disjoint slot/tag row per nesting level, so re-entrancy is safe.
-/// Per-thread statics zero once; a stack buffer is 0xaa-filled per call.
-pub const NativeBanks = struct {
-    slot: [NATIVE_SLOT_BANK_DEPTH][192]i64 = @splat(@splat(0)),
-    tag: [NATIVE_SLOT_BANK_DEPTH][192]u8 = @splat(@splat(0)),
-};
-pub const native_banks = runtime.tls_fast.PerThread(NativeBanks);
 
 /// One implicit receiver on the enclosing-`this` chain. A `receiver` carries
 /// its whole class-nesting tower, a `subject` only itself, an `access` one dispatch.
@@ -797,16 +783,6 @@ pub fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
         i += 1;
         fr = f.gc_link;
     }
-    // A trace that reaches a parameterless `main` ends with kotlinc's
-    // synthetic `main(String[])` that calls it: its file, no line.
-    if (i != 0 and i < MAX_STACK_TRACE_DEPTH and fr == null) if (bottomFunc()) |bottom| {
-        if (bottom.module.resolved) |r| if (r.frame_namer) |fnm| if (fnm.entry_bridge(fnm.ctx, bottom.func.id)) {
-            const last = frames[i - 1];
-            const grown = try allocator.realloc(frames, i + 1);
-            grown[i] = .{ .fqn = last.fqn, .file_id = last.file_id, .offset = NO_LINE, .has_pos = last.has_pos };
-            return try runtime.StackRef.init(allocator, .{ .frames = grown });
-        };
-    };
     // Every fused mark's head is a live frame or null, so `i == total` here
     // unless the frames ran out first.
     if (i != total) {
@@ -816,22 +792,9 @@ pub fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
     return try runtime.StackRef.init(allocator, .{ .frames = frames });
 }
 
-/// A captured frame's `offset` when it has a file but no line, as the
-/// synthetic `main(String[])` frame has.
-pub const NO_LINE: u32 = std.math.maxInt(u32);
-
-/// The outermost frame of the chain.
-fn bottomFunc() ?*const Frame {
-    var cur = evtlsPtr().frame_chain;
-    var last: ?*const Frame = null;
-    while (cur) |f| : (cur = f.gc_link) last = f;
-    return last;
-}
-
-/// One captured frame: its function as a JVM frame names it (the module's
+/// One captured frame: its function by its Kotlin name (the module's
 /// `frame_namer`, else its FQN) and where it is. A frame that has not
-/// reached a position yet stands at its function's first one, as the JVM's
-/// line table puts a frame at its method's first line.
+/// reached a position yet stands at its function's first one.
 fn stackFrame(module: *const Module, func: *const ir.Func, at: ?ir.Span) runtime.StackFrame {
     var label = if (func.fqn.len != 0) func.fqn else func.name;
     if (module.resolved) |r| if (r.frame_namer) |fnm| {

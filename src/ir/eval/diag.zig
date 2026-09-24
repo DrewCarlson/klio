@@ -929,15 +929,14 @@ pub fn spinDumpMaybe() void {
     }
 }
 
-/// One frame as `StackTraceElement.toString` renders it on the JVM,
-/// `<Class>.<method>(<File>.kt:<line>)`, or `(Unknown Source)` when the
+/// One frame as a trace prints it, its function's Kotlin name and where it
+/// is, `pkg.Outer.f(<File>.kt:<line>)`, or `(Unknown Source)` when the
 /// position does not resolve. Caller owns the returned slice.
 fn frameToString(allocator: Allocator, fr: runtime.StackFrame) Allocator.Error![]u8 {
     if (fr.has_pos) {
         if (span.active_map) |m| {
             if (m.getChecked(span.FileId.from(fr.file_id))) |sf| {
                 const file = std.fs.path.basename(sf.path);
-                if (fr.offset == ev_state.NO_LINE) return std.fmt.allocPrint(allocator, "{s}({s})", .{ fr.fqn, file });
                 const lc = sf.lineCol(fr.offset);
                 return std.fmt.allocPrint(allocator, "{s}({s}:{d})", .{ fr.fqn, file, lc.line });
             }
@@ -965,7 +964,7 @@ fn formatFrames(allocator: Allocator, frames: []const runtime.StackFrame, out: *
 
 /// The frame's source line, 0 without one.
 fn frameLine(fr: runtime.StackFrame) u32 {
-    if (!fr.has_pos or fr.offset == ev_state.NO_LINE) return 0;
+    if (!fr.has_pos) return 0;
     const m = span.active_map orelse return 0;
     const sf = m.getChecked(span.FileId.from(fr.file_id)) orelse return 0;
     return sf.lineCol(fr.offset).line;

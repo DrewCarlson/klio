@@ -547,12 +547,12 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
                 .function => {
                     try headers.functionHeader(s, m);
                     if (s.syms.functionInfo(m).receiver != .none) continue;
-                    try level.append(s.arena, .{ .sym = m, .subst = &empty_subst, .dispatch = importedOwner(s, m) });
+                    try level.append(s.arena, .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m) });
                 },
                 .property => {
                     try headers.propertyHeader(s, m);
                     if (s.syms.propertyInfo(m).receiver != .none) continue;
-                    try appendInvokes(ctx, &level, try headers.propertyType(s, m), m, importedOwner(s, m));
+                    try appendInvokes(ctx, &level, try s.types.substitute(try headers.propertyType(s, m), importedSubst(ctx, m)), m, importedOwner(ctx, m));
                 },
                 .class => {
                     try appendCallableCtors(ctx, &level, m, .none);
@@ -1173,7 +1173,7 @@ fn extensionFunctions(ctx: *Ctx, n: Name) Allocator.Error![]const ExtCand {
             if ((try seen.getOrPut(s.arena, m)).found_existing) continue;
             try headers.functionHeader(s, m);
             if (s.syms.functionInfo(m).receiver == .none) continue;
-            try out.append(s.arena, .{ .sym = m, .subst = &empty_subst, .dispatch = importedOwner(s, m), .tier = tier });
+            try out.append(s.arena, .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m), .tier = tier });
             any = true;
         }
         if (any) tier += 1;
@@ -1201,11 +1201,28 @@ fn appendExtensionLevels(ctx: *Ctx, levels: *std.ArrayList(Level), n: Name, recv
 /// Top-level declarations named `n`, one slice per precedence tier:
 /// explicit imports, the file's package, star imports, default imports.
 /// A member imported by name from an object (`import Obj.f`) is called or
-/// read on that object; a top-level declaration has no dispatch receiver.
-pub fn importedOwner(s: *Sema, m: Sym) Receiver {
+/// read on that object, which may inherit it; a top-level declaration has
+/// no dispatch receiver.
+pub fn importedOwner(ctx: *Ctx, m: Sym) Receiver {
+    const s = ctx.s;
+    if (objectImport(ctx, m)) |oi| return .{ .implicit = .{ .kind = .object, .owner = oi.object } };
     const owner = s.syms.owner(m);
     if (owner == .none or s.syms.kind(owner) != .class) return .none;
     return .{ .implicit = .{ .kind = .object, .owner = owner } };
+}
+
+/// The type arguments a member imported from an object takes from the
+/// object's supertypes (`genericFromSuper(g: G)` of an `object C :
+/// I<String>` takes a `String`).
+pub fn importedSubst(ctx: *Ctx, m: Sym) *const types.Subst {
+    if (objectImport(ctx, m)) |oi| return oi.subst;
+    return &empty_subst;
+}
+
+fn objectImport(ctx: *Ctx, m: Sym) ?scope_mod.ObjectImport {
+    const fc = ctx.s.fileOf(ctx.file) orelse return null;
+    const fi = fc.imports orelse return null;
+    return fi.object_members.get(m);
 }
 
 pub fn topLevelTiers(ctx: *Ctx, n: Name) Allocator.Error![]const []const Sym {
@@ -1214,9 +1231,14 @@ pub fn topLevelTiers(ctx: *Ctx, n: Name) Allocator.Error![]const []const Sym {
     const fi = try scope_mod.fileImports(s, ctx.file);
     if (fi.explicit.getPtr(n)) |targets| {
         var list: std.ArrayList(Sym) = .empty;
-        for (targets.items) |t| {
+        for (targets.items) |*t| {
+            const on_object = try scope_mod.objectMembers(s, fi, t);
+            if (on_object) |ms| try list.appendSlice(s.arena, ms);
             for (scope_mod.membersOf(s, t.container, t.member)) |m| {
-                if (scope_mod.visible(s, m)) try list.append(s.arena, m);
+                if (!scope_mod.visible(s, m)) continue;
+                // An object's functions and properties came from the lookup.
+                if (on_object != null and (s.syms.kind(m) == .function or s.syms.kind(m) == .property)) continue;
+                try list.append(s.arena, m);
             }
         }
         try tiers.append(s.arena, list.items);
@@ -2274,6 +2296,10 @@ fn complete(ctx: *Ctx, app_in: Applied, call_args: []Arg, trailing: bool, id: as
     const s = ctx.s;
     var app = app_in;
     const cand = app.cand;
+    if (ctx.delegate_expect) |de| if (de.anchor.start == id.span.start and de.anchor.end == id.span.end) {
+        ctx.delegate_expect = null;
+        try expectDelegateValue(ctx, &app.sys, try candReturn(ctx, cand, &app.sys), de);
+    };
     try postponedInOrder(ctx, &app, try ctx.intern(id.name));
     // In argument position the variables the result mentions are the
     // enclosing call's to fix, with what it expects of the argument.
@@ -2307,6 +2333,20 @@ fn complete(ctx: *Ctx, app_in: Applied, call_args: []Arg, trailing: bool, id: as
     if (try takesForeignDefault(ctx, &app)) app.cand.sym = cand.defaults;
     try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = kind, .target = app.cand.sym, .dispatch = cand.dispatch, .extension = ext, .contexts = app.contexts, .detail = .{ .call = try callDetail(ctx, &app, form, ext) } });
     return ret;
+}
+
+/// Constrains a delegate's call so what its `getValue` returns is the
+/// property's written type, when the call's system allows it: a delegate
+/// that does not fit is reported where the property checks it.
+fn expectDelegateValue(ctx: *Ctx, sys: *infer.System, ret: TypeId, de: *const body.DelegateExpect) Allocator.Error!void {
+    var trial = try sys.clone();
+    const v = (try delegateValueType(ctx, &trial, ret, de.this_ref)) orelse return;
+    var fit = try trial.clone();
+    if (!try fit.constrain(v, de.declared)) return;
+    if (de.mutable and !try fit.constrain(de.declared, v)) return;
+    _ = try trial.constrain(v, de.declared);
+    if (de.mutable) _ = try trial.constrain(de.declared, v);
+    sys.* = trial;
 }
 
 /// Whether the call leaves a parameter to a default that only
@@ -3022,7 +3062,7 @@ pub fn anonymousFunction(ctx: *Ctx, f: *const ast.AnonFunExpr, expected: TypeId)
             },
             .Expr => |*e| {
                 const t = try body.expr(ctx, e, ret);
-                if (ret == .none) ret = t;
+                if (ret == .none) ret = t else try infer.noteExpected(s, t, ret);
             },
         }
     }
@@ -3089,7 +3129,7 @@ pub fn extensionProperty(ctx: *Ctx, rt: TypeId, n: Name) Allocator.Error!?ExtPro
             try headers.propertyHeader(s, m);
             if (s.syms.propertyInfo(m).receiver == .none) continue;
             // `import Duration.Companion.seconds`: read on the companion.
-            try candidates.append(s.arena, .{ .sym = m, .subst = &empty_subst, .dispatch = importedOwner(s, m), .tier = tier });
+            try candidates.append(s.arena, .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m), .tier = tier });
         }
         tier += 1;
     }
@@ -3213,9 +3253,6 @@ pub fn propertyOn(ctx: *Ctx, t: TypeId, n: Name, sp: Span) Allocator.Error!TypeI
 
 // ----------------------------------------------------------- operators ----
 
-/// An operator convention on a receiver of type `rt`: the `operator`
-/// members named `n`, then `operator` extensions. Records the reference at
-/// `anchor` with `kind`.
 /// An integer literal used as a receiver takes its default type.
 pub fn literalReceiver(s: *Sema, t: TypeId) Allocator.Error!TypeId {
     return switch (s.types.get(t)) {
@@ -3224,7 +3261,18 @@ pub fn literalReceiver(s: *Sema, t: TypeId) Allocator.Error!TypeId {
     };
 }
 
+/// An operator convention on a receiver of type `rt`: the `operator`
+/// members named `n`, then `operator` extensions. Records the reference at
+/// `anchor` with `kind`.
 pub fn operatorCall(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: []const Arg, kind: RefKind) Allocator.Error!TypeId {
+    return operatorCallExpecting(ctx, anchor, rt_in, n, pre_args, kind, .none);
+}
+
+/// `operatorCall` whose result is expected to be `expected`, which
+/// constrains the candidate's type parameters as a call's expected type
+/// does: a delegate's `getValue` takes the property's type (`val n: Int by
+/// map` makes `Map.getValue`'s `V1` an `Int`).
+pub fn operatorCallExpecting(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: []const Arg, kind: RefKind, expected: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
     const rt = try literalReceiver(s, rt_in);
     if (s.types.isErr(rt)) {
@@ -3252,7 +3300,7 @@ pub fn operatorCall(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: [
             // An indexed assignment's value binds to `set`'s last
             // parameter, as a trailing lambda does, whatever the
             // parameters before it default or absorb.
-            if (try check(ctx, cand, args, kind == .set, &.{}, .none)) |ap| try applicable.append(s.arena, ap);
+            if (try check(ctx, cand, args, kind == .set, &.{}, expected)) |ap| try applicable.append(s.arena, ap);
         }
         if (applicable.items.len != 0) {
             try dropLowPriority(ctx, &applicable);
@@ -3532,7 +3580,12 @@ pub fn delegateAccess(ctx: *Ctx, del: *const Expr, del_t_in: TypeId, prop: Sym, 
     if (try hasOperator(ctx, del_t, wk.provideDelegate)) {
         del_t = try operatorCall(ctx, anchor, del_t, wk.provideDelegate, &provide_args, .provide_delegate);
     }
-    const vt = try operatorCall(ctx, anchor, del_t, wk.getValue, &pd_args, .get_value);
+    const declared: TypeId = switch (s.syms.kind(prop)) {
+        .property => s.syms.propertyInfo(prop).ty,
+        .local => s.syms.localInfo(prop).ty,
+        else => .none,
+    };
+    const vt = try operatorCallExpecting(ctx, anchor, del_t, wk.getValue, &pd_args, .get_value, declared);
     if (mutable) {
         const value_t = if (s.syms.kind(prop) == .property) s.syms.propertyInfo(prop).ty else vt;
         const set_args = [_]Arg{ .{ .expr = dummy, .ty = this_ref }, .{ .expr = dummy, .ty = kprop }, .{ .expr = dummy, .ty = if (value_t != .none) value_t else vt } };
@@ -3545,11 +3598,23 @@ pub fn delegateAccess(ctx: *Ctx, del: *const Expr, del_t_in: TypeId, prop: Sym, 
 /// arguments may still be open in `sys`, which takes in the chosen
 /// candidate's own variables and what the property's owner, `this_ref`,
 /// passed as its `thisRef` says of them (`ReadOnlyProperty { ... }` is a
-/// `ReadOnlyProperty` of the class declaring the property). Null when no
-/// candidate takes the delegate.
+/// `ReadOnlyProperty` of the class declaring the property). A delegate
+/// with a `provideDelegate` is first what that returns: `val v: String by
+/// delegate()` for a `delegate<V>()` whose `provideDelegate` returns a
+/// `Lazy<V>` makes `V` a `String`. Null when no candidate takes the
+/// delegate.
 pub fn delegateValueType(ctx: *Ctx, sys: *infer.System, del_t: TypeId, this_ref: TypeId) Allocator.Error!?TypeId {
+    const provided = (try operatorResultIn(ctx, sys, del_t, wk.provideDelegate, this_ref)) orelse del_t;
+    return operatorResultIn(ctx, sys, provided, wk.getValue, this_ref);
+}
+
+/// What the operator `n` (`getValue`, `provideDelegate`) returns on a
+/// receiver of type `recv_t` in `sys`, its first parameter taking
+/// `this_ref` when it can. Null when no operator of that name takes the
+/// receiver.
+fn operatorResultIn(ctx: *Ctx, sys: *infer.System, recv_t: TypeId, n: Name, this_ref: TypeId) Allocator.Error!?TypeId {
     const s = ctx.s;
-    for (try members.lookup(s, del_t, wk.getValue, .function)) |m| {
+    for (try members.lookup(s, recv_t, n, .function)) |m| {
         if (!try members.isOperator(s, m.sym)) continue;
         try headers.functionHeader(s, m.sym);
         const fi = s.syms.functionInfo(m.sym);
@@ -3565,7 +3630,7 @@ pub fn delegateValueType(ctx: *Ctx, sys: *infer.System, del_t: TypeId, this_ref:
         sys.* = trial;
         return ret;
     }
-    for (try extensionFunctions(ctx, wk.getValue)) |x| {
+    for (try extensionFunctions(ctx, n)) |x| {
         if (!try members.isOperator(s, x.sym)) continue;
         try headers.functionHeader(s, x.sym);
         const fi = s.syms.functionInfo(x.sym);
@@ -3573,13 +3638,13 @@ pub fn delegateValueType(ctx: *Ctx, sys: *infer.System, del_t: TypeId, this_ref:
         // `State<T>.getValue` on a `MutableState<?1>`: the extension's own
         // type parameters written as the receiver's arguments are the
         // delegate's arguments, so the result speaks of `?1` itself.
-        if (try receiverBinding(s, fi, x.subst, del_t)) |sub| {
+        if (try receiverBinding(s, fi, x.subst, recv_t)) |sub| {
             return try s.types.substitute(try s.types.substitute(fi.ret, x.subst), sub);
         }
         var trial = try sys.clone();
         trial.trial = false;
         try trial.addTypeParams(fi.type_params);
-        if (!try trial.constrain(del_t, try trial.open(try s.types.substitute(fi.receiver, x.subst)))) continue;
+        if (!try trial.constrain(recv_t, try trial.open(try s.types.substitute(fi.receiver, x.subst)))) continue;
         if (fi.params.len != 0) {
             const pt = try trial.open(try s.types.substitute(try headers.paramType(s, fi.params[0]), x.subst));
             var probe = try trial.clone();
@@ -3847,16 +3912,21 @@ pub fn callableRef(ctx: *Ctx, e: *const Expr, recv: ?*const Expr, name: ast.Iden
     if (recv != null and std.mem.eql(u8, name.name, "class")) return classLiteral(ctx, recv.?, e.span());
     const n = try ctx.intern(name.name);
     const nullable_lhs = e.* == .MemberRef and e.MemberRef.nullable_receiver;
-    const levels = (try refLevels(ctx, recv, qualifierTypeArgs(e), nullable_lhs, n)) orelse {
+    const set = (try refLevels(ctx, recv, qualifierTypeArgs(e), nullable_lhs, n)) orelse {
         try ctx.report(.receiver_unresolved, name.span, "{s}", .{name.name});
         return s.types.errType();
     };
     const expected: TypeId = if (expected_in != .none) try infer.zonk(s, expected_in) else .none;
-    const chosen = (try chooseRef(ctx, levels, expected)) orelse {
+    const chosen = (try chooseRef(ctx, set.levels, expected)) orelse {
         try ctx.reportFacts(.unresolved_name, name.span, .{ .name = name.name }, "::{s}", .{name.name});
         return s.types.errType();
     };
     const c = chosen.c;
+    // A class named on the left whose companion the reference is bound to
+    // names that companion.
+    if (set.companion != .none and (isObjectSource(c.dispatch, set.companion) or isObjectSource(c.extension, set.companion))) {
+        try ctx.addRef(.{ .file = ctx.file, .anchor = body.lastNameSpan(recv.?), .kind = .object, .target = set.companion });
+    }
     // The function type the reference adapts to: the expected one, or a
     // fun interface's method.
     var fn_expected = expected;
@@ -3888,13 +3958,24 @@ fn qualifierTypeArgs(e: *const Expr) []const ast.TypeRef {
     return if (e.* == .MemberRef) e.MemberRef.qualifier_type_args else &.{};
 }
 
+/// A reference's candidate levels, and the companion of a class named on
+/// the left whose levels follow the class's own.
+const RefSet = struct {
+    levels: []const RefLevel,
+    companion: Sym = .none,
+};
+
+fn isObjectSource(r: Receiver, obj: Sym) bool {
+    return r == .implicit and r.implicit.kind == .object and r.implicit.owner == obj;
+}
+
 /// `nullable_lhs`: the qualifier was written `A?`.
-fn refLevels(ctx: *Ctx, recv: ?*const Expr, q_args: []const ast.TypeRef, nullable_lhs: bool, n: Name) Allocator.Error!?[]const RefLevel {
+fn refLevels(ctx: *Ctx, recv: ?*const Expr, q_args: []const ast.TypeRef, nullable_lhs: bool, n: Name) Allocator.Error!?RefSet {
     const s = ctx.s;
     var levels: std.ArrayList(RefLevel) = .empty;
     const r = recv orelse {
         try scopeRefLevels(ctx, &levels, n);
-        return levels.items;
+        return .{ .levels = levels.items };
     };
     var static_cls: Sym = .none;
     if (try body.asQualifier(ctx, r)) |q| {
@@ -3914,19 +3995,21 @@ fn refLevels(ctx: *Ctx, recv: ?*const Expr, q_args: []const ast.TypeRef, nullabl
         // type are its candidates.
         const qt = try qualifierType(ctx, r, static_cls, q_args);
         try unboundRefLevels(ctx, &levels, static_cls, if (nullable_lhs) try s.types.makeNullable(qt) else qt, n);
-        // `C::x` with nothing named `x` on the type `C` names the companion
-        // object's `x`, bound to the companion.
+        // `C::x` is also the companion's `x`, bound to the companion, below
+        // what the type `C` offers: `call(A::instance)` for a `call(f: () ->
+        // Boolean)` binds `instance` to a companion that extends `A`, where
+        // `A::instance` with nothing expected takes an `A`.
         const comp = s.syms.classInfo(static_cls).companion;
-        if (levels.items.len == 0 and comp != .none) {
+        if (comp != .none) {
             try boundRefLevels(ctx, &levels, try headers.selfType(s, comp), .{ .implicit = .{ .kind = .object, .owner = comp } }, n);
-            if (levels.items.len != 0) try ctx.addRef(.{ .file = ctx.file, .anchor = body.lastNameSpan(r), .kind = .object, .target = comp });
+            return .{ .levels = levels.items, .companion = comp };
         }
     } else {
         const rt = try literalReceiver(s, try body.receiverExpr(ctx, r));
         if (s.types.isErr(rt)) return null;
         try boundRefLevels(ctx, &levels, rt, .expr, n);
     }
-    return levels.items;
+    return .{ .levels = levels.items };
 }
 
 /// Whether a value of class `at` (its arguments unknown) can be passed
@@ -4095,7 +4178,7 @@ fn refApplies(ctx: *Ctx, e: *const Expr, pt: TypeId) Allocator.Error!bool {
     s.census.muted += 1;
     defer s.census.muted -= 1;
     const nullable_lhs = e.* == .MemberRef and e.MemberRef.nullable_receiver;
-    const levels = (try refLevels(ctx, recv, qualifierTypeArgs(e), nullable_lhs, try ctx.intern(name.name))) orelse return true;
+    const levels = ((try refLevels(ctx, recv, qualifierTypeArgs(e), nullable_lhs, try ctx.intern(name.name))) orelse return true).levels;
     for (levels) |level| for (level.items) |cand| {
         if (try refFit(ctx, cand, target) != null) return true;
     };
@@ -4281,12 +4364,12 @@ fn scopeRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), n: Name) Allocato
                 .function => {
                     try headers.functionHeader(s, m);
                     if (s.syms.functionInfo(m).receiver != .none) continue;
-                    try level.append(s.arena, .{ .sym = m, .dispatch = importedOwner(s, m) });
+                    try level.append(s.arena, .{ .sym = m, .dispatch = importedOwner(ctx, m) });
                 },
                 .property => {
                     try headers.propertyHeader(s, m);
                     if (s.syms.propertyInfo(m).receiver != .none) continue;
-                    try level.append(s.arena, .{ .sym = m, .dispatch = importedOwner(s, m) });
+                    try level.append(s.arena, .{ .sym = m, .dispatch = importedOwner(ctx, m) });
                 },
                 .class => try ctorRefCands(ctx, &level, m, .{}),
                 .type_alias => {

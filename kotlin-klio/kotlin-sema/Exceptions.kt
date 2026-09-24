@@ -20,29 +20,97 @@ public actual open class Throwable actual constructor(
     internal val suppressedList: MutableList<Throwable> = ArrayList()
 
     override fun toString(): String {
-        val name = this.__klioJvmClassName()
+        val kClass = this::class
+        val name = kClass.qualifiedName ?: kClass.simpleName ?: "Throwable"
         val m = message
         return if (m != null) "$name: $m" else name
     }
 }
 
-/** The receiver's JVM class name, as `getClass().getName()` answers it. */
-internal external fun Any.__klioJvmClassName(): String
+public actual open class Error : Throwable {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+    public actual constructor(message: String?, cause: Throwable?) : super(message, cause)
+    public actual constructor(cause: Throwable?) : super(cause)
+}
 
-public actual typealias Error = java.lang.Error
-public actual typealias Exception = java.lang.Exception
-public actual typealias RuntimeException = java.lang.RuntimeException
-public actual typealias IllegalArgumentException = java.lang.IllegalArgumentException
-public actual typealias IllegalStateException = java.lang.IllegalStateException
-public actual typealias IndexOutOfBoundsException = java.lang.IndexOutOfBoundsException
-public actual typealias ConcurrentModificationException = java.util.ConcurrentModificationException
-public actual typealias UnsupportedOperationException = java.lang.UnsupportedOperationException
-public actual typealias NumberFormatException = java.lang.NumberFormatException
-public actual typealias NullPointerException = java.lang.NullPointerException
-public actual typealias ClassCastException = java.lang.ClassCastException
-public actual typealias AssertionError = java.lang.AssertionError
-public actual typealias NoSuchElementException = java.util.NoSuchElementException
-public actual typealias ArithmeticException = java.lang.ArithmeticException
+public actual open class Exception : Throwable {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+    public actual constructor(message: String?, cause: Throwable?) : super(message, cause)
+    public actual constructor(cause: Throwable?) : super(cause)
+}
+
+public actual open class RuntimeException : Exception {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+    public actual constructor(message: String?, cause: Throwable?) : super(message, cause)
+    public actual constructor(cause: Throwable?) : super(cause)
+}
+
+public actual open class IllegalArgumentException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+    public actual constructor(message: String?, cause: Throwable?) : super(message, cause)
+    public actual constructor(cause: Throwable?) : super(cause)
+}
+
+public actual open class IllegalStateException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+    public actual constructor(message: String?, cause: Throwable?) : super(message, cause)
+    public actual constructor(cause: Throwable?) : super(cause)
+}
+
+public actual open class IndexOutOfBoundsException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+}
+
+public actual open class ConcurrentModificationException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+    public actual constructor(message: String?, cause: Throwable?) : super(message, cause)
+    public actual constructor(cause: Throwable?) : super(cause)
+}
+
+public actual open class UnsupportedOperationException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+    public actual constructor(message: String?, cause: Throwable?) : super(message, cause)
+    public actual constructor(cause: Throwable?) : super(cause)
+}
+
+public actual open class NumberFormatException : IllegalArgumentException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+}
+
+public actual open class NullPointerException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+}
+
+public actual open class ClassCastException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+}
+
+public actual open class AssertionError : Error {
+    public actual constructor() : super()
+    public actual constructor(message: Any?) : super(message?.toString(), message as? Throwable)
+    public actual constructor(message: String?, cause: Throwable?) : super(message, cause)
+}
+
+public actual open class NoSuchElementException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+}
+
+public actual open class ArithmeticException : RuntimeException {
+    public actual constructor() : super()
+    public actual constructor(message: String?) : super(message)
+}
 
 @Suppress("DEPRECATION_ERROR")
 public actual open class NoWhenBranchMatchedException : RuntimeException {
@@ -61,8 +129,8 @@ public actual class UninitializedPropertyAccessException : RuntimeException {
 }
 
 /**
- * The frames the throw captured, innermost first, each as the JVM's
- * `StackTraceElement` renders it: `Class.method(File.kt:line)`.
+ * The frames the throw captured, innermost first, each its function's Kotlin
+ * name and where it is: `pkg.Outer.f(File.kt:line)`.
  */
 internal external fun Throwable.__klioStackFrames(): Array<String>
 
@@ -70,10 +138,10 @@ internal external fun Throwable.__klioStackFrames(): Array<String>
 internal external fun __klioPrintErr(text: String)
 
 /**
- * The throwable as the JVM's `printStackTrace` renders it: its `toString`,
- * a tab before each frame, then each suppressed exception one tab deeper and
- * each cause, whose frames that end the way the enclosing throwable's end
- * fold into `... n more`. Every line ends with a line break.
+ * The throwable as `printStackTrace` renders it: its `toString`, a tab
+ * before each frame, then each suppressed exception one tab deeper and each
+ * cause, whose frames that end the way the enclosing throwable's end fold
+ * into `... n more`. Every line ends with a line break.
  */
 public actual fun Throwable.stackTraceToString(): String {
     val sb = StringBuilder()

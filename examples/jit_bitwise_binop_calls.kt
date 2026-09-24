@@ -1,11 +1,8 @@
-// Bitwise/shift operators written as OPERATORS (not the call-shaped spelling)
-// inside a function called from a hot loop. Two gaps met here: the operator
-// form left its destination untyped, and the emitter's bitwise codegen was
-// unreachable from it — so one `xor` made a whole arithmetic helper
-// uncompilable, and its caller trampolined per iteration. Values are checked
-// across negative operands and every shift count (including `ushr`, whose 32-bit
-// form must clear the sign-extended high half first), and must match with the
-// JIT off (--opt safe) or on.
+// Bitwise/shift operators written as infix operators (`and`, `or`, `xor`,
+// `shl`, `shr`, `ushr`), not the named-function call spelling, used inside a
+// helper function called from nested loops. Checks negative operands and
+// every shift count, including `ushr`, whose 32-bit form must clear the
+// sign-extended high half.
 fun mixI(a: Int, b: Int): Int {
     var x = a and b
     x = x or (a xor b)

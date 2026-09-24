@@ -1,6 +1,5 @@
-// Hot Float (f32) arithmetic, comparison, and Int→Float conversion over a
-// FloatArray. The loop JIT compiles these to single-precision SSE2 (addss/mulss/
-// ucomiss/cvtsi2ss …); output is identical with the JIT off or on.
+// Float (f32) arithmetic, comparison, and Int-to-Float conversion over a
+// FloatArray.
 fun main() {
     val n = 2000
     val a = FloatArray(n)

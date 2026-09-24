@@ -1,16 +1,6 @@
-// Two things the whole-function tier used to refuse.
-//
-// `k.toLong()` on a scalar lowers to a VIRTUAL call, and the call-site pass
-// treated it as a member call on a non-object receiver — which declined the
-// whole method, so anything converting a number never compiled.
-//
-// `blend` also divides, so it can deopt. A direct call into a callee like that
-// is still native: the caller tests the resume code the callee returns and
-// re-runs the whole call interpreted when it is not RETURN. That answer is only
-// correct because the callee writes no field before it can deopt.
-//
-// Output must match with the JIT off (--opt safe) or on, and with direct calls
-// disabled (KLIO_FJ_DIRECT=0).
+// A method (`step`) delegating to another method (`blend`) that mixes Long
+// addition, multiplication, division, remainder, and bitwise shifts with an
+// Int-to-Long conversion (`k.toLong()`). Run across a large iteration range.
 class Ratio(var num: Long, var den: Long) {
     fun blend(k: Int): Long {
         var r = num + k

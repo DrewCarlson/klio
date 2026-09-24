@@ -1400,13 +1400,13 @@ fn clearYieldIter(scope: *const Value) void {
 /// `.done` when the iterator is exhausted, where the caller clears it and
 /// resumes the block.
 fn drainOne(self: anytype, it: *const Value, out: Output) Allocator.Error!union(enum) { value: Value, done, err: RuntimeError } {
-    const hn = (try intrinsic_host.invokeMethod(self, it, "hasNext", &.{}, out)) orelse
+    const hn = (try intrinsic_host.callWellKnown(self, it, .has_next, &.{}, out)) orelse
         return .{ .err = .{ .Type = "yieldAll: argument is not an Iterator" } };
     switch (hn) {
         .ok => |b| if (!(b == .Bool and b.Bool)) return .done,
         .err => |e| return .{ .err = e },
     }
-    const nx = (try intrinsic_host.invokeMethod(self, it, "next", &.{}, out)) orelse
+    const nx = (try intrinsic_host.callWellKnown(self, it, .next, &.{}, out)) orelse
         return .{ .err = .{ .Type = "yieldAll: Iterator has no next()" } };
     return switch (nx) {
         .ok => |v| .{ .value = v },

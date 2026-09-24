@@ -1,8 +1,5 @@
-// A hot loop indexing a list of objects and dispatching a method on each element.
-// The element's class varies per iteration (the list is polymorphic), so the
-// loop JIT reads the element with a direct subscript into a boxed register and
-// dispatches the method dynamically, re-checking the receiver's class each call.
-// Output must match with the JIT off (default) or on (KLIO_JIT=1).
+// Indexing a `List` of objects whose runtime class varies per element
+// (polymorphic dispatch) and calling an overridden method on each one.
 open class Hitter { open fun hit(x: Int): Int = x + 1 }
 class Plus2 : Hitter() { override fun hit(x: Int): Int = x + 2 }
 class Plus3 : Hitter() { override fun hit(x: Int): Int = x + 3 }

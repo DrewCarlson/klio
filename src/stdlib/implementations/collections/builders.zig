@@ -76,7 +76,7 @@ fn arraySizeArg(a: Allocator, v: Value, what: []const u8) Error!SizeOutcome {
     // error, which would unwind past `assertFailsWith`.
     if (n < 0) {
         const msg = try fmt(a, "{d}", .{n});
-        const e = try thrown(a, "java.lang.NegativeArraySizeException", msg);
+        const e = try thrown(a, "klio.NegativeArraySizeException", msg);
         if (runtime.freeScratch()) a.free(msg);
         return .{ .err = e };
     }

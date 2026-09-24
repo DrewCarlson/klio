@@ -1,5 +1,9 @@
 # KLIO JIT — tiered native compiler (design)
 
+This JIT compiled the old interpreter's instructions and no longer builds;
+its sources are kept for reference in `archive/jit/`. What follows is the
+design record as it stood.
+
 Goal: close the remaining gap to node-class throughput. The interpreter, after
 the CPU-efficiency campaign, sits at interpreter class (~CPython, ~15× node). A
 tracing/method JIT that emits native machine code for hot IR is the only path to

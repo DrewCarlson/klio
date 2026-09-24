@@ -1,12 +1,11 @@
-java.lang.IllegalStateException
+kotlin.IllegalStateException
 deliberate
-Stack_traceKt.innermost(stack_trace.kt:7)
-Stack_traceKt.middle(stack_trace.kt:8)
-Stack_traceKt.outer(stack_trace.kt:9)
-Stack_traceKt.main(stack_trace.kt:21)
-Stack_traceKt.main(stack_trace.kt)
+innermost(stack_trace.kt:7)
+middle(stack_trace.kt:8)
+outer(stack_trace.kt:9)
+main(stack_trace.kt:21)
 has source positions: true
-frame count: 5
+frame count: 4
 outer: config failed
 cause: bad int
 renders caused-by: true

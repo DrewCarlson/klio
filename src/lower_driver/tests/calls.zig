@@ -1864,8 +1864,10 @@ test "an initializer that sets a field to its default is dropped, as on the JVM"
     }, "1 5 set 7 -0.0\n9\n4 true z 1 4\n");
 }
 
-// kotlinc 2.4.20 prints the same for these two files as Test0Kt and Test1Kt.
-test "a failed initializer throws ExceptionInInitializerError, then NoClassDefFoundError naming its JVM class" {
+// kotlinc 2.4.20 prints the same but for the names, which the JVM gives as
+// its classes: `Could not initialize class cfg.Test1Kt` and `... class
+// Outer$Inner`.
+test "a failed initializer throws ExceptionInInitializerError, then NoClassDefFoundError naming the file or object" {
     try driver.expectOutput(&.{
         \\import cfg.limit
         \\class Outer {
@@ -1875,9 +1877,9 @@ test "a failed initializer throws ExceptionInInitializerError, then NoClassDefFo
         \\}
         \\fun compute(): Int { throw IllegalStateException("bad") }
         \\fun report(tag: String, e: Throwable) {
-        \\    println(tag + " " + (e is java.lang.ExceptionInInitializerError) + " " + (e is java.lang.NoClassDefFoundError) + " " + e.message)
+        \\    println(tag + " " + (e is ExceptionInInitializerError) + " " + (e is NoClassDefFoundError) + " " + e.message)
         \\    val c = e.cause
-        \\    println("  cause " + (c is IllegalStateException) + " " + (c is java.lang.ExceptionInInitializerError))
+        \\    println("  cause " + (c is IllegalStateException) + " " + (c is ExceptionInInitializerError))
         \\}
         \\fun main() {
         \\    try { println(limit) } catch (e: Throwable) { report("file first", e) }
@@ -1892,17 +1894,17 @@ test "a failed initializer throws ExceptionInInitializerError, then NoClassDefFo
     },
         \\file first true false null
         \\  cause true false
-        \\file later false true Could not initialize class cfg.Test1Kt
+        \\file later false true Could not initialize file cfg.test1.kt
         \\  cause false true
         \\object first true false null
         \\  cause true false
-        \\object later false true Could not initialize class Outer$Inner
+        \\object later false true Could not initialize object Outer.Inner
         \\  cause false true
         \\
     );
 }
 
-test "a file's JvmName annotation does not rename its facade" {
+test "a file's JvmName annotation does not rename the file" {
     try driver.expectOutput(&.{
         \\import cfg.limit
         \\fun main() {
@@ -1914,5 +1916,5 @@ test "a file's JvmName annotation does not rename its facade" {
         \\package cfg
         \\val limit: Int = fail()
         \\fun fail(): Int { throw IllegalStateException("bad") }
-    }, "Could not initialize class cfg.Test1Kt\n");
+    }, "Could not initialize file cfg.test1.kt\n");
 }

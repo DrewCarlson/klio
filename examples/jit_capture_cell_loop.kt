@@ -1,7 +1,6 @@
-// A hot loop that mutates `var`s captured by a nested lambda. Capture makes
-// each `var` a boxed cell; the loop body reads and writes them through CellGet/
-// CellSet. Exercises the JIT's capture-cell caching (output must match with the
-// JIT off or on).
+// A loop that mutates `var`s captured by a nested lambda. A captured `var`
+// stays a live, shared reference: the lambda sees every update made to it
+// after capture, and reads it back after the loop finishes.
 fun main() {
     var sum = 0
     var count = 0

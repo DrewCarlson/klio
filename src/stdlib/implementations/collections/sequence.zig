@@ -215,7 +215,7 @@ pub fn mergedPullOne(
     if (iter_left.*) |v| runtime.keepalivePush(v);
     if (iter_right.*) |v| runtime.keepalivePush(v);
     if (iter_left.* == null) {
-        const li = (try host.invokeMethod(&mz.left.asPtr().*, "iterator", &.{}, out)) orelse
+        const li = (try host.callWellKnown(&mz.left.asPtr().*, .sequence_iterator, &.{}, out)) orelse
             return .{ .err = .{ .Type = "zip: receiver lacks iterator()" } };
         switch (li) {
             .ok => |v| {
@@ -224,7 +224,7 @@ pub fn mergedPullOne(
             },
             .err => |e| return .{ .err = e },
         }
-        const ri = (try host.invokeMethod(&mz.right.asPtr().*, "iterator", &.{}, out)) orelse
+        const ri = (try host.callWellKnown(&mz.right.asPtr().*, .sequence_iterator, &.{}, out)) orelse
             return .{ .err = .{ .Type = "zip: argument lacks iterator()" } };
         switch (ri) {
             .ok => |v| {

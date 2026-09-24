@@ -48,6 +48,7 @@ pub fn message(s: *Sema, a: Allocator, site: Site) Allocator.Error![]const u8 {
         .expect_no_actual => std.fmt.allocPrint(a, "`{s}` is an `expect` with no `actual`", .{n}),
         .invisible => invisible(s, a, n, site.syms),
         .reified_param => std.fmt.allocPrint(a, "cannot use `{s}` as a reified type argument of `{s}`; use a class instead", .{ if (site.syms.len != 0) s.str(s.syms.name(site.syms[0])) else "?", n }),
+        .type_mismatch => site.detail,
     };
 }
 

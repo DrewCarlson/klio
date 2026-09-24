@@ -1,9 +1,5 @@
-// Null-safe chains in a hot loop whose final value is a nullable scalar
-// (`Int?` from a `?.` on a scalar field) folded with `?:`. The loop JIT keeps the
-// nullable scalar in a register typed by its scalar kind plus a companion
-// null-flag slot, so the null tests, the Elvis default, and the surrounding
-// arithmetic all run natively. Output must match with the JIT off (default) or
-// on (KLIO_JIT=1).
+// Null-safe chains (`?.`) over a linked structure ending in a nullable Int
+// field, folded with the Elvis operator `?:`, evaluated in a loop.
 class Link(val v: Int, val next: Link?)
 
 fun main() {

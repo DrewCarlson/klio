@@ -204,6 +204,23 @@ test "a jump out of a lambda leaves the inline function's catch frame behind" {
     try std.testing.expectEqualStrings("kotlin.IllegalStateException", o.diag);
 }
 
+test "a closure in a reified function captures the type a call's argument passes on" {
+    try expectRun(
+        \\inline fun <reified T : Any> make(x: Any): T = x as T
+        \\fun runIt(f: () -> Unit) { f() }
+        \\inline fun <reified R : Any> outer(x: Any) {
+        \\    runIt { println(make<R>(x)) }
+        \\}
+        \\inline fun <reified R : Any> sinkInto(x: Any, crossinline sink: (R) -> Unit) {
+        \\    runIt { sink(make(x)) }
+        \\}
+        \\fun main() {
+        \\    outer<String>("a")
+        \\    sinkInto<String>("b") { println(it.length) }
+        \\}
+    , "a\n1\n");
+}
+
 test "a reified type parameter tests, casts, names its class and passes on" {
     try expectRun(
         \\inline fun <reified T> isA(x: Any?): Boolean = x is T

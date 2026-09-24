@@ -56,7 +56,6 @@ changed.
 | `ir/eval.zig` | 13546 | `ir/eval/` | 17 | 1706 |
 | `stdlib/implementations/collections.zig` | 8222 | `.../collections/` | 13 | 1118 |
 | `cli/cgen.zig` | 8016 | `cli/cgen/` | 8 | 1848 |
-| `ir/jit_loop.zig` | 7304 | `ir/jit_loop/` | 10 | 1561 |
 | `interp_ir/vm/host_instances.zig` | 6150 | `.../host_instances/` | 8 | 1399 |
 | `interp_ir/vm/host_fields.zig` | 5826 | `.../host_fields/` | 10 | 1572 |
 
@@ -100,8 +99,8 @@ helper, in which case prove the collapse is byte-identical at every call
 site, or it is a dropped condition.
 
 Where the code generates something, compare the generated artifact
-directly: the emitted C, the synthesized Kotlin, the JIT's gate-decision
-trace under `KLIO_JIT_DEBUG=1`. That is stronger than any test.
+directly: the emitted C, the synthesized Kotlin. That is stronger than any
+test.
 
 ### The labelled-block trap
 

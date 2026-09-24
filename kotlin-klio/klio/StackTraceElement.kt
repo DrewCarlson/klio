@@ -1,9 +1,9 @@
 /*
- * The `java.lang` element type of the JVM `Throwable.stackTrace` array. The
- * host renders each captured frame as its text, `function (file:line)`, and
- * the members read the parts back.
+ * The element type of the `Throwable.stackTrace` array. The host renders
+ * each captured frame as its text, `function(File.kt:line)`, and the members
+ * read the parts back.
  */
-package java.lang
+package klio
 
 /**
  * One frame of a throwable's captured stack.

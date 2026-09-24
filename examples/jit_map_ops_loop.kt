@@ -1,8 +1,6 @@
-// Hot loops storing into and loading from a loop-invariant map. The loop JIT
-// trampolines `map[key] = value` and `map[key]` (the latter yielding a nullable
-// scalar, folded with `?:`), keeping the map boxed in the register array while the
-// keys, the Elvis default, and the accumulation run natively. A missing key reads
-// back as null. Output must match with the JIT off (default) or on (KLIO_JIT=1).
+// Storing into and loading from a `HashMap<Int, Int>` in a loop: `map[key] =
+// value`, then `map[key] ?: default` where about half the keys are absent, so
+// a missing key reads back as null and falls through to the Elvis default.
 fun main() {
     val m = HashMap<Int, Int>()
     var i = 0

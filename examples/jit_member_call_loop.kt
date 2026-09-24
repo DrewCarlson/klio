@@ -1,9 +1,6 @@
-// A hot loop calling methods on a loop-invariant object each iteration. The loop
-// JIT trampolines the member call: the receiver stays boxed in the frame's
-// registers (read by the host, its class re-checked at loop entry) while scalar
-// args and a scalar result move through slots. Covers an Int- and a Long-returning
-// method and a Unit side-effecting method. Output must match with the JIT off
-// (default) or on (KLIO_JIT=1).
+// Methods called on the same object each iteration of a loop: an
+// Int-returning method, a Long-returning method, and a Unit method with a
+// side effect on a field.
 class Calc(val k: Int) {
     var total = 0
     fun sq(x: Int): Int = x * x + k

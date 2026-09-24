@@ -1,8 +1,8 @@
-// Indexing a `List` / reference `Array` of a uniform scalar kind inside a hot
-// loop, alongside calls that resize and rebind those receivers. The subscript
-// reads the element buffer directly; each call refreshes the cached buffer, so a
-// grown list and a rebound register both read through correctly. Output must
-// match with the JIT off (--opt safe) or on (default).
+// Indexing a `List`/`Array` of a uniform scalar kind, alongside calls that
+// grow a `MutableList` and rebind a top-level `var` to a different list
+// mid-run. Covers Int, Long, and Double element lists, an `IntArray`, a
+// `subList` view, and out-of-range indexing throwing
+// `IndexOutOfBoundsException`.
 val grow = mutableListOf(1, 2, 3)
 
 fun bump(x: Int): Int {

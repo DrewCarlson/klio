@@ -1,9 +1,7 @@
-// A self-call helper too big for the splice still runs native: the caller calls
-// straight into the callee's compiled code. The callee is a deopt-free method
-// body over the same receiver, so the call needs no frame, no boxing and no
-// host callback — it seeds the callee's argument slots and receiver field base
-// inside the caller's own slot array and calls it. Output must match with the
-// JIT off (--opt safe) or on, and with direct calls disabled (KLIO_FJ_DIRECT=0).
+// A method (`step`) delegating to a sibling method (`mix`) on the same
+// receiver, which combines the receiver's two fields with the call argument
+// through Long arithmetic and bitwise shifts, then stores the result back
+// into a field. Run across a large iteration range.
 class Hash(var acc: Long, var salt: Int) {
     fun mix(n: Int): Long {
         var r = acc + n

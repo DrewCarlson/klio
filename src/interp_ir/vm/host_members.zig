@@ -161,7 +161,7 @@ fn arrayOf(a: Allocator, args: []const Value, comptime what: []const u8) Allocat
 
 fn arrayIndexError(a: Allocator, index: i64, len: usize) Allocator.Error!EvalResult {
     const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ index, len });
-    return .{ .err = try throwExc(a, "java.lang.ArrayIndexOutOfBoundsException", msg) };
+    return .{ .err = try throwExc(a, "klio.ArrayIndexOutOfBoundsException", msg) };
 }
 
 fn arraySize(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!EvalResult {
@@ -492,7 +492,7 @@ fn comparatorCompare(h: *anyopaque, a: Allocator, args: []const Value) Allocator
 fn threadId(v: *const Value) ?u64 {
     if (v.* != .BoundMethod) return null;
     const bm = v.BoundMethod;
-    if (!std.mem.eql(u8, bm.fqn, "java.lang.Thread")) return null;
+    if (!std.mem.eql(u8, bm.fqn, "klio.Thread")) return null;
     return switch (bm.receiver.asPtr().*) {
         .Long => |x| @bitCast(x),
         else => 0,
@@ -702,11 +702,11 @@ const other_members = [_]Entry{
     .{ "get kotlin.text.MatchGroup.range", native("kotlin.text.MatchGroup.range", impl.regexp.match_group_range) },
     .{ "kotlin.text.concatToString", concatToString },
     .{ "kotlin.collections.toTypedArray", native("kotlin.collections.Collection.toTypedArray", coll.coll_to_typed_array) },
-    .{ "get java.lang.Thread.name", threadName },
-    .{ "get java.lang.Thread.isAlive", threadIsAlive },
-    .{ "java.lang.Thread.join", threadJoin },
-    .{ "java.lang.Thread.start", threadNoOp },
-    .{ "java.lang.Thread.interrupt", threadNoOp },
+    .{ "get klio.Thread.name", threadName },
+    .{ "get klio.Thread.isAlive", threadIsAlive },
+    .{ "klio.Thread.join", threadJoin },
+    .{ "klio.Thread.start", threadNoOp },
+    .{ "klio.Thread.interrupt", threadNoOp },
 };
 
 const entries = list_members ++ setMembers("HashSet") ++ setMembers("LinkedHashSet") ++
@@ -787,6 +787,15 @@ fn tryMapBuilder(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Err
     return answered(try persistent_map_mut.tryBuilder(vm(h), a, inst));
 }
 
+/// `SnapshotStateMap.put(key, value)` end to end: the current record's map
+/// rebuilt under the map's lock through the builder fast paths, and the
+/// record updated as `mutate` would, while no write observer is registered.
+fn trySnapshotMapPut(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!?EvalResult {
+    const inst = instanceArg(args, 3) orelse return null;
+    if (!persistent_map_mut.isSnapshotMapClass(inst)) return null;
+    return answered(try persistent_map_mut.trySnapshotMapPut(vm(h), a, inst, &args[1], &args[2]));
+}
+
 /// `indexOf` on a persistent vector, scanning its leaves; an element that
 /// needs its own `equals` declines.
 fn tryVectorIndexOf(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!?EvalResult {
@@ -833,6 +842,7 @@ const tries = std.StaticStringMap(HostTry).initComptime(.{
     .{ immutable ++ "immutableMap.PersistentHashMapBuilder.put", tryMapBuilderPut },
     .{ immutable ++ "immutableMap.PersistentHashMapBuilder.build", tryMapBuilderBuild },
     .{ immutable ++ "immutableMap.PersistentHashMap.builder", tryMapBuilder },
+    .{ "androidx.compose.runtime.snapshots.SnapshotStateMap.put", trySnapshotMapPut },
     .{ immutable ++ "immutableList.AbstractPersistentList.contains", tryVectorContains },
     .{ immutable ++ "immutableList.SmallPersistentVector.indexOf", tryVectorIndexOf },
     .{ "kotlin.collections.AbstractList.indexOf", tryVectorIndexOf },

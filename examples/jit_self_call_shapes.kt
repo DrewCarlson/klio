@@ -1,10 +1,6 @@
-// Self-call shapes the whole-function tier splices: `this.helper(...)` lowers
-// to a static call with the receiver moved into arg 0, and inlining a callee
-// that never touches `this` makes both the move and the call disappear — so
-// the method still compiles frameless. Covers Int/Long/Double/Boolean callees,
-// a nested self-call, one feeding a field write, and one in a branch condition.
-// Output must match with the JIT off (--opt safe) or on, and with the splice
-// disabled (KLIO_FJ_SELF_INLINE=0).
+// Self-call shapes (`this.helper(...)`, written bare) covering Int, Long,
+// Double, and Boolean-returning helpers: a nested self-call, one feeding a
+// field write, and one used as a branch condition.
 class Shapes(var acc: Long, var n: Int) {
     fun addI(a: Int, b: Int): Int = a + b
     fun mulL(a: Long, b: Long): Long = a * b

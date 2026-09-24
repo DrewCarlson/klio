@@ -1,9 +1,6 @@
-// The accessor-delegation shape: a method calling sibling methods that READ and
-// WRITE `this`-fields. The splice turns those field ops into the caller's own
-// native field sites — the receiver is the caller's `this`, so they ride the same
-// entry field-base and the method still compiles frameless. A mutator returning
-// `Unit` counts too. Output must match with the JIT off (--opt safe) or on, and
-// with the splice disabled (KLIO_FJ_SELF_INLINE=0).
+// A method calling sibling methods that read and write the same receiver's
+// `this`-fields: a mutator taking an argument, a `Unit` counter increment,
+// and a method computing a result from the current field values.
 class Grid(var w: Int, var h: Int) {
     var touched = 0
     fun area(): Int = w * h

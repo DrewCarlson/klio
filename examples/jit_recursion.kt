@@ -1,9 +1,7 @@
-// Recursive scalar functions with no enclosing loop: the whole-function JIT
-// (opt-in, KLIO_JIT=1 KLIO_FUNC_JIT=1) compiles each body to native code and
-// recurses natively through the call trampoline (no interpreter frame per call),
-// while a div-by-zero still raises a catchable ArithmeticException via the deopt
-// fallback. Output is identical with the JIT off (default), the loop JIT on
-// (KLIO_JIT=1), or the function JIT also on (KLIO_FUNC_JIT=1).
+// Recursive scalar functions with no enclosing loop: `fib`, `fact`, a
+// two-argument Ackermann function, and mutually recursive `isEven`/`isOdd`.
+// A recursive function that eventually divides by zero raises a catchable
+// `ArithmeticException`.
 fun fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)
 
 fun fact(n: Long): Long = if (n <= 1L) 1L else n * fact(n - 1L)

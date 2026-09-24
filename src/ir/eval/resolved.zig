@@ -220,12 +220,12 @@ test "a fault spec names one function by its qualified name" {
 /// reserve opens for it the same way.
 const overflow_headroom: usize = 64;
 
-/// The `java.lang.StackOverflowError` a call past the evaluation-depth cap
+/// The `klio.StackOverflowError` a call past the evaluation-depth cap
 /// throws in a module lowered from sema, built with a null message as the
 /// JVM's is; null when the tables name no such class.
 pub fn stackOverflowError(comptime H: type, a: Allocator, module: *const ir.Module, host: *H) Allocator.Error!?Value {
     const r = module.resolved orelse return null;
-    const raised = r.exceptions.by_fqn.get("java.lang.StackOverflowError") orelse return null;
+    const raised = r.exceptions.by_fqn.get("klio.StackOverflowError") orelse return null;
     if (raised.class.int() >= r.classes.len) return null;
     const st = host.resolvedState() orelse return null;
     const tls = ev_state.evtlsPtr();
@@ -959,7 +959,7 @@ fn laterInitFailure(comptime H: type, a: Allocator, module: *const ir.Module, ho
             .err => |e| return e,
         }
     };
-    const msg = try std.fmt.allocPrint(a, "Could not initialize class {s}", .{name});
+    const msg = try std.fmt.allocPrint(a, "Could not initialize {s}", .{name});
     return switch (try buildThrowable(H, a, module, host, r, nc, msg, cause)) {
         .ok => |exc| .{ .Throw = exc },
         .err => |e| e,
@@ -994,7 +994,7 @@ fn isErrorValue(module: *const ir.Module, r: *const Resolved, v: *const Value) b
 /// What `toString` answers for throwable `v`, through the base's
 /// `Any.toString` slot; its class name when that fails.
 fn throwableText(comptime H: type, a: Allocator, module: *const ir.Module, host: *H, r: *const Resolved, v: Value) Allocator.Error![]const u8 {
-    const cls = ir.resolved.classOf(r, &v) orelse return "java.lang.Throwable";
+    const cls = ir.resolved.classOf(r, &v) orelse return "kotlin.Throwable";
     if (r.well_known.get(.to_string)) |slot| if (ir.resolved.slotTarget(r, cls, slot)) |target| {
         switch (try host.runResolved(a, module, target, &.{v})) {
             .ok => |t| if (t == .String) return try a.dupe(u8, t.String.asPtrConst().bytes),

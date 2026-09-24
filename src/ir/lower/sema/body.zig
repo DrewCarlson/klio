@@ -115,6 +115,19 @@ fn fileOf(s: *sema.Sema, sym: Sym) u32 {
     return if (sym == .none) sema.symbols.NO_FILE else s.syms.get(sym).file;
 }
 
+/// Whether `prop`'s getter (or setter) has nothing to lower: an `expect` or
+/// `external` property declares no storage and, without a written
+/// accessor, no body, so like a bodyless function its native runs.
+pub fn bodylessAccessor(s: *sema.Sema, prop: Sym, setter: bool) bool {
+    const fl = s.syms.flags(prop);
+    if (!fl.expect and !fl.external) return false;
+    const pd = switch (s.syms.get(prop).decl) {
+        .property => |x| x,
+        else => return true,
+    };
+    return (if (setter) pd.setter else pd.getter) == null;
+}
+
 fn planOf(p: *Program, origin: bridge.FuncOrigin) ?Plan {
     const s = p.s;
     return switch (origin) {
@@ -131,8 +144,8 @@ fn planOf(p: *Program, origin: bridge.FuncOrigin) ?Plan {
             if (kind == .function and !flags.has_body and !flags.synthetic and p.prims.get(sym) == null) break :blk null;
             break :blk .{ .kind = kind, .owner = sym, .file = fileOf(s, sym) };
         },
-        .getter => |prop| .{ .kind = .getter, .owner = prop, .file = fileOf(s, prop) },
-        .setter => |prop| .{ .kind = .setter, .owner = prop, .file = fileOf(s, prop) },
+        .getter => |prop| if (bodylessAccessor(s, prop, false)) null else .{ .kind = .getter, .owner = prop, .file = fileOf(s, prop) },
+        .setter => |prop| if (bodylessAccessor(s, prop, true)) null else .{ .kind = .setter, .owner = prop, .file = fileOf(s, prop) },
         .defaults => |t| .{ .kind = .defaults, .owner = t, .file = fileOf(s, t) },
         .init_unit => .{ .kind = .init_unit, .owner = .none, .file = sema.symbols.NO_FILE },
         .lambda => |sym| .{

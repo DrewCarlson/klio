@@ -1,8 +1,6 @@
-// A hot integer loop of bitwise infix ops (`and`/`or`/`xor`/`shl`/`shr`), which
-// Kotlin lowers to member calls. The JIT emits native bitwise/shift ops with
-// Int (32-bit) and Long (64-bit) count masking and sign-extension; the output
-// must match with the JIT off or on, including negative operands and shift
-// counts past the type width.
+// Int and Long bitwise infix ops (`and`/`or`/`xor`/`shl`/`shr`) in a tight
+// loop, including negative operands and shift counts past the type width:
+// Int shift counts mask to 5 bits, Long shift counts mask to 6.
 fun main() {
     var acc = 0
     var i = 0

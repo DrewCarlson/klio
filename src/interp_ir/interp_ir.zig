@@ -35,7 +35,6 @@ pub const coroutines_diag = @import("vm/coroutines.zig");
 pub const resetReceiverThreadLocals = vmhost.resetReceiverThreadLocals;
 pub const resetRunGlobalCaches = vmhost.resetRunGlobalCaches;
 /// Drop this thread's per-function JIT state between programs.
-pub const resetJitForTest = ir.jit_loop.resetForTest;
 pub const resetLenientWarned = @import("vm/host_call_member.zig").resetLenientWarned;
 
 /// Member dispatch for consumers holding a declaration rather than a live

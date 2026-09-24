@@ -2423,7 +2423,7 @@ fn formatKotlin(allocator: Allocator, fmt: []const u8, args: []const Value) Allo
         }
         i += 1;
         if (i >= chars.len) {
-            return .{ .err = .{ .Thrown = try makeException(allocator, "java.util.UnknownFormatConversionException", "trailing %") } };
+            return .{ .err = .{ .Thrown = try makeException(allocator, "klio.UnknownFormatConversionException", "trailing %") } };
         }
         const start_i = i;
         var idx_override: ?usize = null;
@@ -2466,7 +2466,7 @@ fn formatKotlin(allocator: Allocator, fmt: []const u8, args: []const Value) Allo
             if (i > pstart) precision = parseUsizeScalars(chars[pstart..i]) orelse 0;
         }
         if (i >= chars.len) {
-            return .{ .err = .{ .Thrown = try makeException(allocator, "java.util.UnknownFormatConversionException", "incomplete format specifier") } };
+            return .{ .err = .{ .Thrown = try makeException(allocator, "klio.UnknownFormatConversionException", "incomplete format specifier") } };
         }
         const conv = chars[i];
         i += 1;
@@ -2684,7 +2684,7 @@ fn formatConv(
         },
         else => {
             const msg = try std.fmt.allocPrint(allocator, "conversion: {u}", .{conv});
-            const exc = try makeException(allocator, "java.util.UnknownFormatConversionException", msg);
+            const exc = try makeException(allocator, "klio.UnknownFormatConversionException", msg);
             if (runtime.freeScratch()) allocator.free(msg);
             return .{ .err = .{ .Thrown = exc } };
         },

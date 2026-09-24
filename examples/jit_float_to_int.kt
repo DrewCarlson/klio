@@ -1,7 +1,6 @@
-// Float/Double -> Int/Long conversions in a hot loop, including the edge cases
-// Kotlin clamps: NaN -> 0, overflow -> Int/Long.MIN_VALUE/MAX_VALUE, else
-// truncate toward zero. The loop JIT compiles these (cvtt*2si + clamp); output is
-// identical with the JIT off or on.
+// Float/Double -> Int/Long conversions, including the edge cases Kotlin
+// clamps: NaN -> 0, overflow -> Int/Long.MIN_VALUE/MAX_VALUE, and otherwise
+// truncation toward zero.
 fun main() {
     val xs = DoubleArray(10)
     xs[0] = 3.9; xs[1] = -3.9

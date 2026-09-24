@@ -1,10 +1,6 @@
-// A hot loop whose body calls a top-level function each iteration. The loop JIT
-// trampolines the call: a native call site reboxes the scalar args, runs the
-// callee through the interpreter, and reboxes the scalar result, so the loop's
-// control flow and arithmetic stay native while the call dispatches normally.
-// Covers an Int- and a Long-returning callee, a Double-returning callee, and a
-// Unit-returning callee invoked only for its side effect. Output must match with
-// the JIT off (default) or on (KLIO_JIT=1).
+// A loop whose body calls a top-level function each iteration: an
+// Int-returning callee, a Long-returning callee, a Double-returning callee,
+// and a Unit-returning callee invoked only for its side effect.
 fun sq(x: Int): Int = x * x
 fun addl(a: Long, b: Long): Long = a + b
 fun half(x: Int): Double = x.toDouble() * 0.5

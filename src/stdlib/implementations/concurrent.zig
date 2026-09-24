@@ -250,7 +250,7 @@ pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
     return .{ .ok = try Value.newBoundMethod(ctx.allocator, .{
-        .fqn = "java.lang.Thread",
+        .fqn = "klio.Thread",
         .func = threadHandleStub,
         .receiver = receiver,
     }) };
@@ -291,7 +291,7 @@ pub fn concurrent_thread_current(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
     const id: u64 = std.Thread.getCurrentId();
     const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
     return .{ .ok = try Value.newBoundMethod(ctx.allocator, .{
-        .fqn = "java.lang.Thread",
+        .fqn = "klio.Thread",
         .func = threadHandleStub,
         .receiver = receiver,
     }) };
@@ -478,7 +478,7 @@ test "currentThread yields a Thread BoundMethod handle" {
     const r = try concurrent_thread_current(&ctx);
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .BoundMethod);
-    try testing.expectEqualStrings("java.lang.Thread", r.ok.BoundMethod.fqn);
+    try testing.expectEqualStrings("klio.Thread", r.ok.BoundMethod.fqn);
     runtime.boundMethodRefOf(r.ok.BoundMethod).deinit();
 }
 

@@ -2,14 +2,14 @@
  * klio actuals for the pure-Kotlin ktor-utils crypto surface. The upstream
  * posix actuals reach cinterop (`secureRandom` over getrandom/urandom); klio
  * backs the nonce generator with the stdlib PRNG and reuses the common
- * `Sha1` implementation for `sha1`. `Digest` answers as the JVM's does, over
+ * `Sha1` implementation for `sha1`. `Digest` answers as the JVM's does over
  * `MessageDigest`: the host computes the algorithms the JVM provides, and
  * any other name is a `NoSuchAlgorithmException`.
  */
 
 package io.ktor.util
 
-import java.security.NoSuchAlgorithmException
+import klio.security.NoSuchAlgorithmException
 import kotlin.random.Random
 
 public actual suspend fun generateNonceSuspend(length: Int): String = generateNonceBlocking(length)

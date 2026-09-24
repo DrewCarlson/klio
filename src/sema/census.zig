@@ -51,6 +51,9 @@ pub const Reason = enum(u8) {
     invisible,
     /// A type parameter that is not reified passed for a reified one.
     reified_param,
+    /// A value whose type does not fit the type its place declares: a
+    /// delegate's `getValue` returning what its property cannot hold.
+    type_mismatch,
 };
 
 /// What one tentative resolution recorded. `refs` holds the analysis's

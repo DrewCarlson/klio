@@ -1,7 +1,7 @@
 // A failing object initializer fails as the JVM's class initialization does:
 // the first use gets an ExceptionInInitializerError over what the
 // initializer threw (an Error it throws is rethrown itself), and every later
-// use a NoClassDefFoundError naming the class.
+// use a NoClassDefFoundError naming the object.
 object Config {
     val items = mutableListOf("a")
     init { if (items.size == 1) throw IllegalStateException("boom") }

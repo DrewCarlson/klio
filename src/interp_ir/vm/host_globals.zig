@@ -1652,7 +1652,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
     }
 
     if (std.mem.eql(u8, name, "Thread")) {
-        return Value.internIntrinsic("java.lang.Thread", threadStaticStub);
+        return Value.internIntrinsic("klio.Thread", threadStaticStub);
     }
 
     if (std.mem.eql(u8, name, "Delegates")) {

@@ -219,8 +219,9 @@ pub const ModifierFlags = struct {
 };
 
 /// Reserved soft modifiers and contextual keywords, never to be tentatively
-/// consumed as an infix function name: without the guard, `val x = foo` followed
-/// by `private fun ...` misreads across the line break.
+/// consumed as an infix function name across a line break: without the guard,
+/// `val x = foo` followed by `private fun ...` misreads. On the operand's own
+/// line they name infix calls as any identifier does.
 pub fn isValidInfixName(name: []const u8) bool {
     const reserved = [_][]const u8{
         "private",  "public",      "protected", "internal", "open",
@@ -239,7 +240,8 @@ pub fn isValidInfixName(name: []const u8) bool {
 
 pub fn isTrailingLambdaCallable(e: *const Expr) bool {
     return switch (e.*) {
-        .Path, .Call, .Member => true,
+        // `x("aaa")[42] { ... }` invokes what the index gives.
+        .Path, .Call, .Member, .Index => true,
         else => false,
     };
 }
@@ -1009,6 +1011,53 @@ test "infix_call_user_defined" {
     try testing.expect(call.is_infix);
     try testing.expectEqual(@as(usize, 2), call.args.len);
     try testing.expectEqualStrings("plus2", call.callee.Path.segments[0].name);
+}
+
+test "a contextual keyword on the operand's line names an infix call" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun a() = A()!! infix "K"
+        \\fun b() = x where { it % 2 == 0 }
+        \\class C {
+        \\    val x = foo
+        \\    private fun g() = 1
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    for (out.file.decls[0..2], [_][]const u8{ "infix", "where" }) |d, want| {
+        const call = d.Function.body.?.Expr.Call;
+        try testing.expect(call.is_infix);
+        try testing.expectEqualStrings(want, call.callee.Path.segments[0].name);
+    }
+    // Past a line break a modifier starts the next member.
+    try testing.expectEqual(@as(usize, 2), out.file.decls[2].Class.members.len);
+}
+
+test "a delegate may start the line after the property's type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\object X {
+        \\    public var O: String
+        \\        by Delegates.observable("O") { prop, old, new -> }
+        \\        private set
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Object.members[0].Property;
+    try testing.expect(p.delegate != null);
+    try testing.expect(p.setter_visibility != null);
+}
+
+test "a lambda after an index invokes what the index gives" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), "fun foo() = x(\"aaa\")[42] { \"s\" }\n");
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const call = out.file.decls[0].Function.body.?.Expr.Call;
+    try testing.expect(call.has_trailing_lambda);
+    try testing.expect(call.callee.* == .Index);
 }
 
 test "infix_call_no_newline_break" {

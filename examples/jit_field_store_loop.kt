@@ -1,8 +1,6 @@
-// Hot loop writing scalar fields of a loop-invariant object each iteration (read,
-// compute, store back). The loop JIT compiles the field stores as direct writes
-// into the boxed receiver's stored fields (plain stored properties — no custom
-// setter), so read/modify/write of `Int` and `Long` fields runs natively. Output
-// must match with the JIT off (default) or on (KLIO_JIT=1).
+// Writing scalar fields (Int, Long) of an object across a loop: each
+// iteration reads the current field, computes a new value, and stores it
+// back, on plain stored properties with no custom setter.
 class Point(var x: Int, var y: Long)
 
 fun main() {

@@ -41,7 +41,13 @@ pub fn isSubtype(s: *Sema, a: TypeId, b: TypeId) Allocator.Error!bool {
     const a_nn = try ts.makeNotNull(a);
     switch (ts.get(a_nn)) {
         .param => |p| {
-            if (tb == .param and tb.param.sym == p.sym) return !ts.isNullable(a) or tb.param.nullable or !tb.param.dnn;
+            // `T` fits `T?`, and fits `T & Any` only when it has no null
+            // to lose (a `T : Any`).
+            if (tb == .param and tb.param.sym == p.sym) {
+                if (tb.param.nullable) return true;
+                if (ts.isNullable(a)) return false;
+                return !tb.param.dnn or (ta == .param and ta.param.dnn) or !try admitsNull(s, a_nn);
+            }
             // `E & Any` fits through its bound without the null: `E : T?`
             // makes `E & Any` a `T`.
             const dnn = ta == .param and ta.param.dnn;
@@ -235,8 +241,13 @@ fn commonSupertypeAt(s: *Sema, list: []const TypeId, depth: u8) Allocator.Error!
     if (non_nothing.items.len == 0) return if (any_nullable) s.t.nothing_q else s.t.nothing;
     const first = non_nothing.items[0];
     var result: TypeId = s.t.any;
-    if (try allFit(s, non_nothing.items, first)) {
-        result = first;
+    // One type every other fits below is the answer: `T & Any` and `T`
+    // join to `T`.
+    const top: ?TypeId = for (non_nothing.items) |c| {
+        if (try allFit(s, non_nothing.items, c)) break c;
+    } else null;
+    if (top) |t| {
+        result = t;
     } else {
         // The classes every type extends, found from the first type's
         // hierarchy; the minimal ones, each with its arguments joined, are

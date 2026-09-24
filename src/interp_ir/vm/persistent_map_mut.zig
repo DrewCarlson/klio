@@ -9,11 +9,10 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("ir");
-const span_mod = @import("span");
 
 const vmhost = @import("vmhost.zig");
 const host_instances = @import("host_instances.zig");
-const host_globals = @import("host_globals.zig");
+const host_resolved = @import("host_resolved.zig");
 const concurrent = @import("stdlib").implementations.concurrent;
 
 const VmHost = vmhost.VmHost;
@@ -661,65 +660,26 @@ pub fn isSnapshotMapClass(inst: ObjRef(InstanceData)) bool {
     return classMatches(inst, &ssm_class_hit, SSM_FQN);
 }
 
-/// A file-private top-level global (`<prefix>$f<N>`, N the file whose path ends in
-/// `file_base`), scanned once per dispatch gen; the memo holds the mangled name.
-const FpName = struct { gen: u32 = 0, ok: bool = false, buf: [64]u8 = undefined, len: usize = 0 };
-
-fn filePrivateGlobal(self: *VmHost, memo: *FpName, comptime prefix: []const u8, comptime file_base: []const u8) ?Value {
-    const gen = cacheGen();
-    if (memo.gen != gen) {
-        memo.gen = gen;
-        memo.ok = false;
-        var level: ?runtime.ObjRef(runtime.Env) = self.globals;
-        outer: while (level) |lv| {
-            const g = lv.borrow();
-            var it = g.get().vars.iterator();
-            while (it.next()) |ent| {
-                const k = ent.key_ptr.*;
-                if (!std.mem.startsWith(u8, k, prefix ++ "$f")) continue;
-                const n = std.fmt.parseInt(u32, k[prefix.len + 2 ..], 10) catch continue;
-                if (span_mod.active_map) |am| {
-                    if (am.getChecked(span_mod.FileId.from(n))) |sf| {
-                        if (std.mem.endsWith(u8, sf.path, file_base) and k.len <= memo.buf.len) {
-                            @memcpy(memo.buf[0..k.len], k);
-                            memo.len = k.len;
-                            memo.ok = true;
-                            g.deinit();
-                            break :outer;
-                        }
-                    }
-                }
-            }
-            const parent = g.get().parent;
-            g.deinit();
-            level = parent;
-        }
-    }
-    if (!memo.ok) {
-        // The `$f<N>` mangle appears only on a name collision, so a plain hit is
-        // unambiguous.
-        const g = self.globals.borrow();
-        defer g.deinit();
-        return g.get().lookup(prefix);
-    }
-    const g = self.globals.borrow();
-    defer g.deinit();
-    return g.get().lookup(memo.buf[0..memo.len]);
+/// Top-level property `w`'s value, its file initialized first; null when
+/// the tables lack it or its initializer failed.
+fn staticOf(self: *VmHost, a: Allocator, w: runtime.WellKnownStatic) Allocator.Error!?Value {
+    const r = (try host_resolved.wellKnownStatic(self, a, w)) orelse return null;
+    return switch (r) {
+        .ok => |v| v,
+        .err => null,
+    };
 }
 
-threadlocal var sync_name: FpName = .{};
-threadlocal var gwo_name: FpName = .{};
-
-fn snapshotMapSync(self: *VmHost) ?Value {
-    const v = filePrivateGlobal(self, &sync_name, "sync", "SnapshotStateMap.kt") orelse return null;
+fn snapshotMapSync(self: *VmHost, a: Allocator) Allocator.Error!?Value {
+    const v = (try staticOf(self, a, .compose_snapshot_map_sync)) orelse return null;
     if (v != .Instance) return null;
     return v;
 }
 
 /// notifyWrite is a provable no-op only while `globalWriteObservers` (Snapshot.kt) is
 /// empty.
-fn globalWriteObserversEmpty(self: *VmHost) bool {
-    const v = filePrivateGlobal(self, &gwo_name, "globalWriteObservers", "Snapshot.kt") orelse {
+fn globalWriteObserversEmpty(self: *VmHost, a: Allocator) Allocator.Error!bool {
+    const v = (try staticOf(self, a, .compose_global_write_observers)) orelse {
         ssmTrace("gwo-unresolved");
         return false;
     };
@@ -1061,11 +1021,20 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         ssmTrace("key");
         return null;
     }
-    const globals = host_globals.composeSnapshotGlobals(self) orelse {
+    const ts = (try staticOf(self, a, .compose_thread_snapshot)) orelse {
         ssmTrace("globals");
         return null;
     };
-    const sync_obj = snapshotMapSync(self) orelse {
+    const gs = (try staticOf(self, a, .compose_global_snapshot)) orelse {
+        ssmTrace("globals");
+        return null;
+    };
+    if (ts != .Instance or gs != .Instance) {
+        ssmTrace("globals");
+        return null;
+    }
+    const globals: struct { ts: Value, gs: Value } = .{ .ts = ts, .gs = gs };
+    const sync_obj = (try snapshotMapSync(self, a)) orelse {
         ssmTrace("sync-global");
         return null;
     };
@@ -1073,7 +1042,7 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         ssmTrace("sync-identity");
         return null;
     };
-    if (!globalWriteObserversEmpty(self)) {
+    if (!try globalWriteObserversEmpty(self, a)) {
         ssmTrace("write-observers");
         return null;
     }

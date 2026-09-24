@@ -51,7 +51,6 @@ const Shared = struct {
     cases: []const Case,
     next: std.atomic.Value(usize) = .init(0),
     failures: std.atomic.Value(usize) = .init(0),
-    jit: []const u8,
     lock: runtime.SpinMutex = .{},
 };
 
@@ -67,7 +66,7 @@ fn worker(sh: *Shared) void {
         const failed = runCase(a, sh, c) catch |e| blk: {
             sh.lock.lock();
             defer sh.lock.unlock();
-            std.debug.print("e2e FAIL {s} (jit={s}): {s}\n", .{ c.stem, sh.jit, @errorName(e) });
+            std.debug.print("e2e FAIL {s}: {s}\n", .{ c.stem, @errorName(e) });
             break :blk true;
         };
         if (failed) _ = sh.failures.fetchAdd(1, .monotonic);
@@ -76,7 +75,6 @@ fn worker(sh: *Shared) void {
 
 fn runCase(a: std.mem.Allocator, sh: *Shared, c: Case) !bool {
     var env = try klio_child.baseEnv(a);
-    try env.put("KLIO_JIT", sh.jit);
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(a, &.{ klioBin(), "run", c.path });
     try argv.appendSlice(a, c.args);
@@ -90,7 +88,7 @@ fn runCase(a: std.mem.Allocator, sh: *Shared, c: Case) !bool {
         else => -1,
     };
     const err_head = r.stderr[0..@min(r.stderr.len, 600)];
-    std.debug.print("e2e FAIL {s} (jit={s}) exit {d}:\n  got:  {s}\n  want: {s}\n  stderr: {s}\n", .{ c.stem, sh.jit, code, r.stdout, c.expected, err_head });
+    std.debug.print("e2e FAIL {s} exit {d}:\n  got:  {s}\n  want: {s}\n  stderr: {s}\n", .{ c.stem, code, r.stdout, c.expected, err_head });
     return true;
 }
 
@@ -131,7 +129,7 @@ fn cases(a: std.mem.Allocator, io: std.Io, only: ?[]const []const u8) ![]Case {
     return out.items;
 }
 
-fn runCorpus(jit: []const u8, only: ?[]const []const u8) !void {
+fn runCorpus(only: ?[]const []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -147,7 +145,7 @@ fn runCorpus(jit: []const u8, only: ?[]const []const u8) !void {
     // Installs the packs before the workers start when no home was named.
     _ = try klio_child.home(a);
 
-    var sh: Shared = .{ .cases = list, .jit = jit };
+    var sh: Shared = .{ .cases = list };
     const cores = std.Thread.getCpuCount() catch 4;
     const n = std.math.clamp(cores / 2, 1, 8);
     const threads = try a.alloc(std.Thread, n);
@@ -155,45 +153,11 @@ fn runCorpus(jit: []const u8, only: ?[]const []const u8) !void {
     for (threads) |t| t.join();
     const failures = sh.failures.load(.monotonic);
     if (failures != 0) {
-        std.debug.print("e2e (jit={s}): {d}/{d} corpus programs failed\n", .{ jit, failures, list.len });
+        std.debug.print("e2e: {d}/{d} corpus programs failed\n", .{ failures, list.len });
         return error.CorpusMismatch;
     }
 }
 
-test "e2e corpus matches expected output (jit on)" {
-    try runCorpus("1", null);
-}
-
-test "e2e corpus matches expected output (jit off)" {
-    try runCorpus("0", null);
-}
-
-// The whole-function JIT is opt-in via `KLIO_FUNC_JIT`, so the passes above
-// never exercise it.
-test "function-JIT recursion matches the interpreter" {
-    try runCorpusFuncJit();
-}
-
-fn runCorpusFuncJit() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var threaded: std.Io.Threaded = .init(a, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const list = try cases(a, io, &.{ "jit_recursion", "jit_inline_call_loop", "jit_char_tag_static_call" });
-    var failed = false;
-    for (list) |c| {
-        var env = try klio_child.baseEnv(a);
-        try env.put("KLIO_JIT", "1");
-        try env.put("KLIO_FUNC_JIT", "1");
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(a, &.{ klioBin(), "run", c.path });
-        try argv.appendSlice(a, c.args);
-        const r = try klio_child.runKlio(a, &env, argv.items, .{ .timeout_ms = RUN_TIMEOUT_MS });
-        if (r.exitedZero() and std.mem.eql(u8, r.stdout, c.expected)) continue;
-        std.debug.print("func-jit FAIL {s}:\n  got:  {s}\n  want: {s}\n  stderr: {s}\n", .{ c.stem, r.stdout, c.expected, r.stderr[0..@min(r.stderr.len, 600)] });
-        failed = true;
-    }
-    if (failed) return error.FuncJitMismatch;
+test "e2e corpus matches expected output" {
+    try runCorpus(null);
 }

@@ -1,6 +1,4 @@
-// A hot loop mixing an Int counter with Double arithmetic via `i.toDouble()`.
-// The loop JIT compiles the int→double conversion (cvtsi2sd) inline with the
-// SSE2 arithmetic; output is identical with the JIT off or on.
+// A loop mixing an Int counter with Double arithmetic via `i.toDouble()`.
 fun main() {
     val n = 100000
     var sum = 0.0

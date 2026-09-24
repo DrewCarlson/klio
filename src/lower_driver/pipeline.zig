@@ -172,14 +172,14 @@ fn fileTakesArgs(s: *sema.Sema, file: u32) bool {
     return false;
 }
 
-/// The class a JVM launcher is told to run for the program: the file
-/// facade of its last file, `MainKt` for `main.kt`.
-pub fn mainClassName(a: Allocator, s: *sema.Sema) Allocator.Error![]const u8 {
+/// The file a run looks for its entry point in last, the program's last
+/// file, by its name (`main.kt`).
+pub fn mainFileName(s: *sema.Sema) []const u8 {
     var last: ?u32 = null;
     for (s.files.items, 0..) |f, i| {
         if (f.origin == .program) last = @intCast(i);
     }
-    return bridge.facadeName(s, a, last orelse return "");
+    return std.fs.path.basename(s.files.items[last orelse return ""].path);
 }
 
 /// Whether `sym` has an entry point's name and parameters, and if so

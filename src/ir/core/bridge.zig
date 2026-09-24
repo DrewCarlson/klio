@@ -264,7 +264,7 @@ pub const Bridge = struct {
     /// (lambdas, local functions) were the bake's.
     image_funcs: u32 = 0,
     image_prefix: u32 = 0,
-    /// JVM frame names, made on first ask (`jvmFrameName`).
+    /// Frame names, made on first ask (`frameName`).
     frame_names: FrameNames = .{},
 
     /// Asserts `s` has one.
@@ -1181,7 +1181,7 @@ const Build = struct {
         var lookup = fqn;
         var f = if (by_name) null else b.opts.natives(fqn);
         // A companion's member is the host's under its class's name, the
-        // JVM's static (`java.lang.Thread.currentThread`).
+        // static (`klio.Thread.currentThread`).
         if (f == null and !by_name) if (companionStatic(s, decl)) |outer| {
             lookup = try std.fmt.allocPrint(b.a, "{s}.{s}", .{ s.str(s.syms.classInfo(outer).fqn), s.str(s.syms.name(decl)) });
             f = b.opts.natives(lookup);
@@ -1255,7 +1255,6 @@ const Build = struct {
             .{ "kotlin.stackTrace", .stack_frames },
             .{ "kotlin.__klioStackFrames", .stack_frames },
             .{ "kotlin.__klioPrintErr", .print_err },
-            .{ "kotlin.__klioJvmClassName", .jvm_class_name },
         });
         const fqn = try b.qualName(decl);
         const op = ops.get(fqn) orelse return false;
@@ -1621,9 +1620,12 @@ const Build = struct {
 
     /// The reified type parameters type `t` mentions, as captures of scope
     /// `at`.
-    fn reifiedKeys(b: *Build, t: TypeId, at: u32, depth: u32) Error!void {
+    fn reifiedKeys(b: *Build, t_in: TypeId, at: u32, depth: u32) Error!void {
         const s = b.s;
-        if (t == .none or depth > 16) return;
+        if (t_in == .none or depth > 16) return;
+        // A call's type arguments are recorded before an enclosing call
+        // fixes them (`println(make<R>(x))`): read them solved.
+        const t = try sema.infer.zonk(s, t_in);
         switch (s.types.get(t)) {
             .param => |p| if (s.syms.flags(p.sym).reified) {
                 _ = try b.addUp(at, .{ .local = p.sym });
@@ -2472,7 +2474,10 @@ const Build = struct {
             .getter => |p| std.fmt.allocPrint(b.a, "<get-{s}>", .{s.str(s.syms.name(p))}),
             .setter => |p| std.fmt.allocPrint(b.a, "<set-{s}>", .{s.str(s.syms.name(p))}),
             .defaults => |d| std.fmt.allocPrint(b.a, "{s}$default", .{s.str(s.syms.name(d))}),
-            .init_unit => "<clinit>",
+            .init_unit => |u| switch (b.units.items[u]) {
+                .file => "<init>",
+                .enum_class => "<init-entries>",
+            },
             .sam_ctor => "<init>",
             .sam_method => |iface| if (try b.samAbstract(iface)) |am| s.str(s.syms.name(am)) else "invoke",
             .sam_equals => "equals",
@@ -2490,8 +2495,8 @@ const Build = struct {
             .setter => |p| std.fmt.allocPrint(b.a, "{s}.<set>", .{try b.qualName(p)}),
             .defaults => |d| std.fmt.allocPrint(b.a, "{s}$default", .{try b.qualName(d)}),
             .init_unit => |u| switch (b.units.items[u]) {
-                .file => |f| std.fmt.allocPrint(b.a, "{s}.<clinit>", .{s.files.items[f].path}),
-                .enum_class => |e| std.fmt.allocPrint(b.a, "{s}.<clinit>", .{try b.qualName(e)}),
+                .file => |f| std.fmt.allocPrint(b.a, "{s}.<init>", .{try kotlinFileName(s, b.a, f)}),
+                .enum_class => |e| std.fmt.allocPrint(b.a, "{s}.<init-entries>", .{try b.qualName(e)}),
             },
             .sam_ctor => |iface| std.fmt.allocPrint(b.a, "{s}$sam.<init>", .{try b.qualName(iface)}),
             .sam_method, .sam_equals, .sam_hash_code => |iface| std.fmt.allocPrint(b.a, "{s}$sam.{s}", .{ try b.qualName(iface), try b.funcName(origin) }),
@@ -2567,7 +2572,6 @@ const Build = struct {
             for (layout, seeds) |sl, *sd| sd.* = sl.seed;
             var object_ctor: u32 = ir.NO_FUNC;
             var init_name: []const u8 = "";
-            var jvm_name: []const u8 = "";
             var flags: ClassDefFlags = .{};
             switch (b.class_origins.items[idx]) {
                 .decl => |c| {
@@ -2575,9 +2579,7 @@ const Build = struct {
                     if ((info.kind == .object or info.kind == .companion) and info.primary_ctor != .none) {
                         if (b.br.funcOfOpt(info.primary_ctor)) |f| object_ctor = f.int();
                     }
-                    if (info.kind == .object) init_name = try b.binaryName(c);
-                    if (info.kind == .companion) init_name = try b.binaryName(s.syms.owner(c));
-                    jvm_name = try b.jvmClassName(c);
+                    if (info.kind == .object or info.kind == .companion) init_name = try std.fmt.allocPrint(b.a, "object {s}", .{try kotlinName(s, b.a, c)});
                     flags.is_data = s.syms.flags(c).data;
                     flags.is_sealed = s.syms.flags(c).modality == .sealed;
                     flags.is_anonymous = info.kind == .anonymous;
@@ -2586,11 +2588,11 @@ const Build = struct {
                 .sam => flags.is_anonymous = true,
             }
             const def = try classDefOf(a, b.br.m, idx, layout, flags);
-            rt.* = .{ .def = def, .seeds = seeds, .object_ctor = object_ctor, .init_name = init_name, .jvm_name = jvm_name, .host_slot = b.host_slots.items[idx], .throwable = throwable != null and
+            rt.* = .{ .def = def, .seeds = seeds, .object_ctor = object_ctor, .init_name = init_name, .host_slot = b.host_slots.items[idx], .throwable = throwable != null and
                 std.mem.indexOfScalar(ClassId, b.br.m.class_ancestors.items[idx], throwable.?) != null };
         }
         r.statics = b.statics.items;
-        r.frame_namer = .{ .ctx = b.br, .name = jvmFrameName, .entry_bridge = isBridgedMain };
+        r.frame_namer = .{ .ctx = b.br, .name = frameName };
         const units = try a.alloc(resolved.InitUnitRt, b.unit_funcs.items.len);
         for (units, b.unit_funcs.items, 0..) |*u, f, i| {
             const name = if (i < base.init_units.len) base.init_units[i].name else try b.unitName(@intCast(i));
@@ -2620,11 +2622,28 @@ const Build = struct {
         for (std.enums.values(runtime.WellKnownObject)) |o| {
             r.well_known_objects.set(o, b.br.classOfOpt(s.classByFqn(o.fqn())));
         }
+        for (std.enums.values(runtime.WellKnownStatic)) |w| r.well_known_statics.set(w, b.wellKnownStatic(w));
         r.host_class = try b.hostClasses();
         r.exceptions = try b.exceptions(base.exceptions);
         r.base = b.baseClasses();
         r.serializers = try b.serializers(base.serializers);
         b.br.m.resolved = r;
+    }
+
+    /// The static of the top-level property `w` names, declared in its file.
+    fn wellKnownStatic(b: *const Build, w: runtime.WellKnownStatic) ?StaticId {
+        const s = b.s;
+        const d = w.declaration();
+        const pn = s.names.lookup(d.package) orelse return null;
+        const pkg = s.syms.package_by_fqn.get(pn) orelse return null;
+        const n = s.names.lookup(d.name) orelse return null;
+        for (sema.scope.membersOf(s, pkg, n)) |p| {
+            if (s.syms.kind(p) != .property) continue;
+            const f = s.syms.get(p).file;
+            if (f >= s.files.items.len or !std.mem.endsWith(u8, s.files.items[f].path, d.file)) continue;
+            return b.br.staticOf(p);
+        }
+        return null;
     }
 
     /// Each new class's vtable and interface tables, from its dispatch
@@ -2787,8 +2806,8 @@ const Build = struct {
             .empty_coroutine_context = b.br.classOfOpt(b.s.classByFqn("kotlin.coroutines.EmptyCoroutineContext")),
             .result = b.primaryOf("kotlin.Result"),
             .result_failure = b.primaryOf("kotlin.Result.Failure"),
-            .init_failed = b.primaryOf("java.lang.ExceptionInInitializerError"),
-            .no_class_def = b.primaryOf("java.lang.NoClassDefFoundError"),
+            .init_failed = b.primaryOf("klio.ExceptionInInitializerError"),
+            .no_class_def = b.primaryOf("klio.NoClassDefFoundError"),
             .match_groups = b.primaryOf("kotlin.text.KlioMatchGroups"),
             .ktype = b.ktypeLayout(),
             .coroutine_suspended = b.entryStatic("kotlin.coroutines.intrinsics.CoroutineSingletons", "COROUTINE_SUSPENDED"),
@@ -2827,43 +2846,13 @@ const Build = struct {
         };
     }
 
-    /// The JVM class init unit `u` initializes, as a failure names it: a
-    /// file's facade (`pkg.MainKt`) or an enum class's binary name.
+    /// What init unit `u` initializes, as a failure names it: `file
+    /// cfg.limits.kt` or `enum class pkg.Color`.
     fn unitName(b: *Build, u: u32) Error![]const u8 {
         return switch (b.units.items[u]) {
-            .enum_class => |e| b.binaryName(e),
-            .file => |f| facadeName(b.s, b.a, f),
+            .enum_class => |e| std.fmt.allocPrint(b.a, "enum class {s}", .{try kotlinName(b.s, b.a, e)}),
+            .file => |f| std.fmt.allocPrint(b.a, "file {s}", .{try kotlinFileName(b.s, b.a, f)}),
         };
-    }
-
-    fn binaryName(b: *Build, cls: Sym) Error![]const u8 {
-        return binaryNameOf(b.s, b.a, cls);
-    }
-
-    /// The JVM name of class `cls`: its binary name, or the Java class a
-    /// Kotlin builtin maps to.
-    fn jvmClassName(b: *Build, cls: Sym) Error![]const u8 {
-        const s = b.s;
-        const mapped = std.StaticStringMap([]const u8).initComptime(.{
-            .{ "kotlin.Any", "java.lang.Object" },
-            .{ "kotlin.Throwable", "java.lang.Throwable" },
-            .{ "kotlin.String", "java.lang.String" },
-            .{ "kotlin.CharSequence", "java.lang.CharSequence" },
-            .{ "kotlin.Number", "java.lang.Number" },
-            .{ "kotlin.Comparable", "java.lang.Comparable" },
-            .{ "kotlin.Enum", "java.lang.Enum" },
-        });
-        if (mapped.get(s.str(s.syms.classInfo(cls).fqn))) |j| return j;
-        return b.binaryName(cls);
-    }
-
-    /// The class `fqn` names, through a type alias (`kotlin.IllegalStateException`
-    /// names `java.lang.IllegalStateException`); `.none` where there is none.
-    fn classNamed(b: *Build, fqn: []const u8) Error!Sym {
-        const s = b.s;
-        const sym = s.classByFqn(fqn);
-        if (sym == .none or s.syms.kind(sym) != .type_alias) return sym;
-        return s.types.classSym(try sema.headers.aliasTarget(s, sym));
     }
 
     /// Class `fqn` and its primary constructor, when the base declares both.
@@ -3082,8 +3071,8 @@ const Build = struct {
         e.arithmetic = try b.raised("kotlin.ArithmeticException");
         e.uninitialized_property = try b.raised("kotlin.UninitializedPropertyAccessException");
         e.index_out_of_bounds = try b.raised("kotlin.IndexOutOfBoundsException");
-        e.array_index_out_of_bounds = try b.raised("java.lang.ArrayIndexOutOfBoundsException");
-        e.string_index_out_of_bounds = try b.raised("java.lang.StringIndexOutOfBoundsException");
+        e.array_index_out_of_bounds = try b.raised("klio.ArrayIndexOutOfBoundsException");
+        e.string_index_out_of_bounds = try b.raised("klio.StringIndexOutOfBoundsException");
         const s = b.s;
         const throwable = s.builtins.throwable;
         const tc = if (throwable != .none) b.br.classOfOpt(throwable) else null;
@@ -3097,27 +3086,14 @@ const Build = struct {
                 const fqn = s.str(s.syms.classInfo(sym).fqn);
                 if (try b.raised(fqn)) |r| try e.by_fqn.put(b.a, fqn, r);
             }
-            // A type alias of a throwable names it too: the host raises
-            // `kotlin.IllegalStateException`, which is `java.lang`'s.
-            i = b.firstSym();
-            while (i < b.n) : (i += 1) {
-                const sym = Sym.from(i);
-                if (s.syms.kind(sym) != .type_alias or s.syms.flags(sym).superseded) continue;
-                const owner = s.syms.owner(sym);
-                if (owner == .none or s.syms.kind(owner) != .package) continue;
-                const pkg = s.str(s.syms.packageInfo(owner).fqn);
-                const fqn = if (pkg.len == 0) s.str(s.syms.name(sym)) else try std.fmt.allocPrint(b.a, "{s}.{s}", .{ pkg, s.str(s.syms.name(sym)) });
-                if (e.by_fqn.contains(fqn)) continue;
-                if (try b.raised(fqn)) |r| try e.by_fqn.put(b.a, fqn, r);
-            }
         }
         return e;
     }
 
     fn raised(b: *Build, fqn: []const u8) Error!?resolved.Raised {
         const s = b.s;
-        const cls = try b.classNamed(fqn);
-        if (cls == .none or s.syms.kind(cls) != .class) return null;
+        const cls = s.classByFqn(fqn);
+        if (cls == .none) return null;
         const c = b.br.classOfOpt(cls) orelse return null;
         const string_q = try s.types.makeNullable(s.t.string);
         for (sema.symbols.Symbols.members(&s.syms.classInfo(cls).members, sema.wk.init)) |ctor| {
@@ -3452,6 +3428,7 @@ fn wellKnownDeclaration(member: runtime.WellKnown) struct { class: []const u8, a
         .compare_to => .{ .class = "kotlin.Comparable", .arity = 1 },
         .compare => .{ .class = "kotlin.Comparator", .arity = 2 },
         .iterator => .{ .class = "kotlin.collections.Iterable" },
+        .sequence_iterator => .{ .class = "kotlin.sequences.Sequence" },
         .has_next, .next => .{ .class = "kotlin.collections.Iterator" },
         .size, .is_empty => .{ .class = "kotlin.collections.Collection" },
         .contains => .{ .class = "kotlin.collections.Collection", .arity = 1 },
@@ -3549,56 +3526,55 @@ pub fn rebindNative(rt: *resolved.NativeRt, natives: NativeResolver, constructor
     return true;
 }
 
-/// The JVM class of file `f`'s top-level declarations: its package, then
-/// its name capitalized with `Kt` (`pkg.MainKt`). `@file:JvmName` is a JVM
-/// interop annotation and names nothing here.
-pub fn facadeName(s: *sema.Sema, a: Allocator, f: u32) Allocator.Error![]const u8 {
+/// The Kotlin qualified name of declaration `sym`: its package, then the
+/// classes and functions that enclose it, then its own name. A constructor
+/// is `<init>` and a lambda literal or anonymous function `<anonymous>`, so
+/// `pkg.Outer.Inner.f`, `pkg.Box.<init>`, `pkg.outer.local` and
+/// `pkg.main.<anonymous>`. A declaration of the root package has no prefix.
+pub fn kotlinName(s: *sema.Sema, a: Allocator, sym: Sym) Allocator.Error![]const u8 {
+    const own: []const u8 = switch (s.syms.get(sym).decl) {
+        .lambda, .anon_fun => "<anonymous>",
+        else => switch (s.syms.kind(sym)) {
+            .package => return s.str(s.syms.packageInfo(sym).fqn),
+            .constructor => "<init>",
+            else => s.str(s.syms.name(sym)),
+        },
+    };
+    const owner = s.syms.owner(sym);
+    if (owner == .none) return own;
+    const prefix = try kotlinName(s, a, owner);
+    if (prefix.len == 0) return own;
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, own });
+}
+
+/// File `f` as Kotlin names it: its package, then its file name
+/// (`cfg.limits.kt`), the file name alone in the root package.
+pub fn kotlinFileName(s: *sema.Sema, a: Allocator, f: u32) Allocator.Error![]const u8 {
     if (f >= s.files.items.len) return "";
     const fc = s.files.items[f];
-    const pkg = if (fc.package != .none) s.str(s.syms.packageInfo(fc.package).fqn) else "";
-    var facade: std.ArrayList(u8) = .empty;
-    if (pkg.len != 0) {
-        try facade.appendSlice(a, pkg);
-        try facade.append(a, '.');
-    }
     const base = std.fs.path.basename(fc.path);
-    const stem = if (std.mem.endsWith(u8, base, ".kt")) base[0 .. base.len - 3] else base;
-    for (stem, 0..) |c, i| {
-        const ok_char = std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
-        try facade.append(a, if (!ok_char) '_' else if (i == 0) std.ascii.toUpper(c) else c);
-    }
-    try facade.appendSlice(a, "Kt");
-    return facade.items;
+    const pkg = if (fc.package != .none) s.str(s.syms.packageInfo(fc.package).fqn) else "";
+    if (pkg.len == 0) return base;
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ pkg, base });
 }
 
-/// A class's JVM binary name: its package, then its nesting joined by `$`.
-fn binaryNameOf(s: *sema.Sema, a: Allocator, cls: Sym) Allocator.Error![]const u8 {
-    const owner = s.syms.owner(cls);
-    const n = s.str(s.syms.name(cls));
-    if (owner != .none and s.syms.kind(owner) == .class) return std.fmt.allocPrint(a, "{s}${s}", .{ try binaryNameOf(s, a, owner), n });
-    if (owner != .none and s.syms.kind(owner) == .package) {
-        const pkg = s.str(s.syms.packageInfo(owner).fqn);
-        if (pkg.len != 0) return std.fmt.allocPrint(a, "{s}.{s}", .{ pkg, n });
-    }
-    return n;
-}
-
-/// The JVM frame names a bridge has made, and the index of each lambda
-/// literal among its siblings, counted on the first lambda asked about.
+/// The frame names a bridge has made.
 pub const FrameNames = struct {
     lock: runtime.SpinMutex = .{},
     names: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
-    lambda_index: std.AutoHashMapUnmanaged(u32, u32) = .empty,
-    lambdas_counted: bool = false,
 };
 
-/// `Class.method` for function `f`, as a JVM stack frame names it:
-/// `MainKt.run` for a top-level function, `Box.member` and `Box.<init>`,
-/// `Box.getProp`, `Obj.<clinit>` for an object's initialization,
-/// `MainKt.main$lambda$0` for a lambda, `MainKt.outer$local` for a local
-/// function. Null where the bridge cannot say (a SAM class's or an
-/// adapter's function, a base lambda loaded from its image).
-pub fn jvmFrameName(ctx: *anyopaque, f: FuncId) ?[]const u8 {
+/// Function `f` as a stack frame names it, its Kotlin qualified
+/// declaration: `pkg.run` for a top-level function, `pkg.Box.member` and
+/// `pkg.Box.<init>`, `pkg.Box.<get-prop>` and `<set-prop>` for accessors,
+/// `pkg.main.<anonymous>` for a lambda, `pkg.outer.local` for a local
+/// function, `pkg.f$default` for the stub that fills `f`'s defaults. An
+/// object's or companion's initialization runs in its `<init>`, an enum
+/// class's entries in its `<init-entries>`, and a file's top-level
+/// initializers in `pkg.main.kt.<init>`. Null where the bridge cannot say
+/// (a SAM class's or an adapter's function, a base lambda loaded from its
+/// image).
+pub fn frameName(ctx: *anyopaque, f: FuncId) ?[]const u8 {
     const br: *Bridge = @ptrCast(@alignCast(ctx));
     const fn_ = &br.frame_names;
     fn_.lock.lock();
@@ -3610,75 +3586,59 @@ pub fn jvmFrameName(ctx: *anyopaque, f: FuncId) ?[]const u8 {
     return n;
 }
 
-/// Whether `f` is a program's parameterless top-level `main`, which kotlinc
-/// runs from a synthetic `main(String[])` of the same facade.
-pub fn isBridgedMain(ctx: *anyopaque, f: FuncId) bool {
-    const br: *Bridge = @ptrCast(@alignCast(ctx));
-    if (f.int() >= br.origin.len) return false;
-    const d = switch (br.origin[f.int()]) {
-        .decl => |d| d,
-        else => return false,
-    };
-    if (!frameSymValid(br, f, d)) return false;
-    const s = br.s;
-    if (s.syms.kind(d) != .function or !std.mem.eql(u8, s.str(s.syms.name(d)), "main")) return false;
-    const owner = s.syms.owner(d);
-    if (owner == .none or s.syms.kind(owner) != .package) return false;
-    const info = s.syms.functionInfo(d);
-    if (info.params.len != 0 or info.receiver != .none) return false;
-    const fc = s.fileOf(s.syms.get(d).file) orelse return false;
-    return fc.origin == .program;
-}
-
 fn frameNameOf(br: *Bridge, a: Allocator, f: FuncId) Allocator.Error!?[]const u8 {
     if (f.int() >= br.origin.len) return null;
     const s = br.s;
     switch (br.origin[f.int()]) {
         .decl => |d| {
             if (!frameSymValid(br, f, d)) return null;
-            switch (s.syms.kind(d)) {
-                .constructor => {
-                    const cls = s.syms.owner(d);
-                    const kind = s.syms.classInfo(cls).kind;
-                    // An object initializes in its class initializer, a
-                    // companion in its outer class's.
-                    if (kind == .object) return try std.fmt.allocPrint(a, "{s}.<clinit>", .{try binaryNameOf(s, a, cls)});
-                    if (kind == .companion) return try std.fmt.allocPrint(a, "{s}.<clinit>", .{try binaryNameOf(s, a, s.syms.owner(cls))});
-                    return try std.fmt.allocPrint(a, "{s}.<init>", .{try binaryNameOf(s, a, cls)});
-                },
-                .function => return try std.fmt.allocPrint(a, "{s}.{s}", .{ try frameClass(br, a, d), try methodName(br, a, d) }),
-                else => return null,
-            }
+            return switch (s.syms.kind(d)) {
+                .constructor, .function => try kotlinName(s, a, d),
+                else => null,
+            };
         },
         .getter, .setter => |p| {
             if (!frameSymValid(br, f, p)) return null;
-            const n = s.str(s.syms.name(p));
-            const is_getter = br.origin[f.int()] == .getter;
-            // `isOn` is its own getter, and `setOn` its setter.
-            const is_prefixed = n.len > 2 and std.mem.startsWith(u8, n, "is") and std.ascii.isUpper(n[2]);
-            const accessor = if (is_getter)
-                (if (is_prefixed) try a.dupe(u8, n) else try std.fmt.allocPrint(a, "get{c}{s}", .{ std.ascii.toUpper(n[0]), n[1..] }))
-            else if (is_prefixed)
-                try std.fmt.allocPrint(a, "set{s}", .{n[2..]})
-            else
-                try std.fmt.allocPrint(a, "set{c}{s}", .{ std.ascii.toUpper(n[0]), n[1..] });
-            return try std.fmt.allocPrint(a, "{s}.{s}", .{ try frameClass(br, a, p), accessor });
+            const kind = if (br.origin[f.int()] == .getter) "get" else "set";
+            const owner = try kotlinName(s, a, s.syms.owner(p));
+            const accessor = try std.fmt.allocPrint(a, "<{s}-{s}>", .{ kind, s.str(s.syms.name(p)) });
+            if (owner.len == 0) return accessor;
+            return try std.fmt.allocPrint(a, "{s}.{s}", .{ owner, accessor });
         },
         .defaults => |d| {
             if (!frameSymValid(br, f, d)) return null;
-            if (s.syms.kind(d) == .constructor) return try std.fmt.allocPrint(a, "{s}.<init>", .{try binaryNameOf(s, a, s.syms.owner(d))});
-            return try std.fmt.allocPrint(a, "{s}.{s}$default", .{ try frameClass(br, a, d), try methodName(br, a, d) });
+            if (s.syms.kind(d) == .constructor) return try kotlinName(s, a, d);
+            return try std.fmt.allocPrint(a, "{s}$default", .{try kotlinName(s, a, d)});
         },
         .init_unit => |u| {
             if (u >= br.units.len) return null;
             return switch (br.units[u]) {
-                .file => |file| try std.fmt.allocPrint(a, "{s}.<clinit>", .{try facadeName(s, a, file)}),
-                .enum_class => |e| try std.fmt.allocPrint(a, "{s}.<clinit>", .{try binaryNameOf(s, a, e)}),
+                .file => |file| try std.fmt.allocPrint(a, "{s}.<init>", .{try kotlinFileName(s, a, file)}),
+                .enum_class => |e| try std.fmt.allocPrint(a, "{s}.<init-entries>", .{try kotlinName(s, a, e)}),
             };
         },
         .lambda => |l| {
             if (!frameSymValid(br, f, l)) return null;
-            return try std.fmt.allocPrint(a, "{s}.{s}", .{ try frameClass(br, a, l), try methodName(br, a, l) });
+            return try kotlinName(s, a, l);
+        },
+        // A fun interface's wrapper class stands for the interface: its
+        // constructor and members are the interface's.
+        .sam_ctor => |iface| return try std.fmt.allocPrint(a, "{s}.<init>", .{try kotlinName(s, a, iface)}),
+        .sam_method, .sam_equals, .sam_hash_code => |iface| {
+            const method = br.m.funcs.items[f.int()].name;
+            return try std.fmt.allocPrint(a, "{s}.{s}", .{ try kotlinName(s, a, iface), method });
+        },
+        // A reference's adapter forwards to the function it references.
+        .adapter => |ai| {
+            if (ai >= br.adapters.len) return null;
+            const target = br.adapters[ai].target;
+            if (!frameSymValid(br, f, target)) return null;
+            return try kotlinName(s, a, target);
+        },
+        // A composable's restart runs it again from the lambda its scope keeps.
+        .restart => |r| {
+            if (!frameSymValid(br, f, r)) return null;
+            return try std.fmt.allocPrint(a, "{s}.<anonymous>", .{try kotlinName(s, a, r)});
         },
         else => return null,
     }
@@ -3689,82 +3649,6 @@ fn frameNameOf(br: *Bridge, a: Allocator, f: FuncId) Allocator.Error!?[]const u8
 fn frameSymValid(br: *const Bridge, f: FuncId, sym: Sym) bool {
     if (br.image_funcs == 0 or f.int() >= br.image_funcs) return true;
     return sym.int() < br.image_prefix;
-}
-
-/// The JVM class a frame of `sym` runs in: its nearest enclosing class,
-/// or its file's facade.
-fn frameClass(br: *Bridge, a: Allocator, sym: Sym) Allocator.Error![]const u8 {
-    const s = br.s;
-    var cur = s.syms.owner(sym);
-    while (cur != .none) : (cur = s.syms.owner(cur)) {
-        switch (s.syms.kind(cur)) {
-            .class => return binaryNameOf(s, a, cur),
-            .package => break,
-            else => {},
-        }
-    }
-    return facadeName(s, a, s.syms.get(sym).file);
-}
-
-/// The JVM method a function, lambda or property's code runs in: its name,
-/// a local function's after its container's (`outer$local`), a lambda's
-/// `$lambda$` and its index among its container's lambda literals
-/// (`main$lambda$0`, then `main$lambda$0$0` for one inside it).
-fn methodName(br: *Bridge, a: Allocator, sym: Sym) Allocator.Error![]const u8 {
-    const s = br.s;
-    const owner = s.syms.owner(sym);
-    switch (s.syms.get(sym).decl) {
-        .lambda, .anon_fun => {
-            const parent = try methodName(br, a, owner);
-            const idx = try lambdaIndex(br, sym);
-            const nested = switch (s.syms.get(owner).decl) {
-                .lambda, .anon_fun => true,
-                else => false,
-            };
-            return std.fmt.allocPrint(a, "{s}{s}{d}", .{ parent, if (nested) "$" else "$lambda$", idx });
-        },
-        else => {},
-    }
-    const n = s.str(s.syms.name(sym));
-    switch (s.syms.kind(sym)) {
-        .constructor => return "<init>",
-        .class => return "_init_",
-        .package => return "",
-        else => {},
-    }
-    if (owner != .none) switch (s.syms.kind(owner)) {
-        .function => return std.fmt.allocPrint(a, "{s}${s}", .{ try methodName(br, a, owner), n }),
-        else => {},
-    };
-    return n;
-}
-
-/// The index of lambda literal `sym` among the lambda literals its
-/// container declares, in source order, as kotlinc numbers them: every
-/// literal counts, the ones an inline call splices in too.
-fn lambdaIndex(br: *Bridge, sym: Sym) Allocator.Error!u32 {
-    const s = br.s;
-    const fn_ = &br.frame_names;
-    if (!fn_.lambdas_counted) {
-        fn_.lambdas_counted = true;
-        const a = std.heap.smp_allocator;
-        var next: std.AutoHashMapUnmanaged(u32, u32) = .empty;
-        defer next.deinit(a);
-        var i: u32 = 1;
-        const n: u32 = @intCast(s.syms.count());
-        while (i < n) : (i += 1) {
-            const l = Sym.from(i);
-            switch (s.syms.get(l).decl) {
-                .lambda, .anon_fun => {},
-                else => continue,
-            }
-            const gop = try next.getOrPut(a, s.syms.owner(l).int());
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            try fn_.lambda_index.put(a, i, gop.value_ptr.*);
-            gop.value_ptr.* += 1;
-        }
-    }
-    return fn_.lambda_index.get(sym.int()) orelse 0;
 }
 
 fn minimalClassDef(a: Allocator, name: []const u8, fqn: []const u8) Allocator.Error!runtime.ClassDef {

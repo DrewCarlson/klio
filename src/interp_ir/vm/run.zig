@@ -598,7 +598,7 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
         .Unimplemented => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .CalleeFailed => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .Arity => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
-        .StackOverflow => |s| return .{ .Eval = std.fmt.allocPrint(allocator, uncaught_prefix ++ "java.lang.StackOverflowError: {s}", .{s}) catch s },
+        .StackOverflow => |s| return .{ .Eval = std.fmt.allocPrint(allocator, uncaught_prefix ++ "klio.StackOverflowError: {s}", .{s}) catch s },
         else => return .{ .Eval = "IR eval error" },
     }
 }

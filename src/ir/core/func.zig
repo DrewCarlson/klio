@@ -218,11 +218,6 @@ pub const Func = struct {
     /// `*const bc.FuncStreams`. `bc_memo_fuse` says which allow_fuse variant it holds.
     bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     bc_memo_fuse: u8 = 0,
-    /// The loop JIT owns a block here: its deopts resume at instruction indices, so these streams stop fusing.
-    bc_jit_owned: bool = false,
-    /// Function-JIT hotness probe shared across threads: low bits count activations, bit 30 =
-    /// some thread compiled a body, bit 31 = compilation declined (sticky). See `jit_loop`.
-    func_jit_probe: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// `bc.streamGen()` at fill time; a stale generation must fall to the shared path.
     bc_memo_gen: u32 = 0,
     /// The frameless leaf serve hit a structurally unsupported instruction here, so every

@@ -36,8 +36,7 @@ const mod_list = [_]Mod{
     // generated serializer declarations for every `@Serializable` class as
     // ordinary Kotlin (parsed from generated source) before lowering.
     .{ .name = "serialization_pass", .deps = &.{ "ast", "span", "lexer", "parser", "diagnostics" }, .src = "src/serialization_pass/serialization_pass.zig", .tested = true },
-    .{ .name = "jit", .tested = true },
-    .{ .name = "ir", .deps = &.{ "span", "ast", "runtime", "diagnostics", "jit", "applicability", "sema" }, .tested = true },
+    .{ .name = "ir", .deps = &.{ "span", "ast", "runtime", "diagnostics", "applicability", "sema" }, .tested = true },
     // Shared overload-resolution applicability engine. Lives inside the ir
     // module's directory but is its own module (it depends on ir for TypeRef /
     // Param / FuncId) so the runtime scorers can import it. `ir` in turn
@@ -550,14 +549,9 @@ pub fn build(b: *std.Build) void {
     // libc; flow it into every artifact that imports compose_ui.
     mods.get("compose_ui").?.link_libc = true;
 
-    // ir (eval/jit_loop) selects std.heap.c_allocator on the GC-off path, so its
-    // test build needs libc too.
+    // ir (eval) selects std.heap.c_allocator on the GC-off path, so its test
+    // build needs libc too.
     mods.get("ir").?.link_libc = true;
-
-    // The AArch64 JIT backend uses Darwin's per-thread MAP_JIT write toggle and
-    // instruction-cache invalidate from libSystem. Link libc into every artifact
-    // that pulls in the jit module so those externs resolve on Apple targets.
-    if (target.result.os.tag.isDarwin()) mods.get("jit").?.link_libc = true;
 
     // Second per-(module, optimize) universe for the harness binaries.
     // Zig modules are keyed by (root source, optimize), so the harness
@@ -588,7 +582,6 @@ pub fn build(b: *std.Build) void {
         pack_harness.linkLibrary(zstd_harness);
         harness_mods.get("compose_ui").?.link_libc = true;
         harness_mods.get("ir").?.link_libc = true;
-        if (target.result.os.tag.isDarwin()) harness_mods.get("jit").?.link_libc = true;
         if (apple_sdk) |sdk| {
             var it = harness_mods.valueIterator();
             while (it.next()) |m| wireAppleSdk(b, m.*, sdk);

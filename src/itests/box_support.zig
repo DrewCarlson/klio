@@ -43,9 +43,9 @@ const BACKEND_NAME = "KLIO";
 /// not pass, excluded 42 selected tests: 28 that passed on the name-resolving
 /// pipeline and 14 that failed there. The floor and the ceiling drop by those.
 ///
-/// On the sema pipeline the census measured 6245 passed and 107 failed.
-pub const BASELINE: usize = 6245;
-pub const MAX_FAILED: usize = 107;
+/// On the sema pipeline the census measured 6262 passed and 90 failed.
+pub const BASELINE: usize = 6262;
+pub const MAX_FAILED: usize = 90;
 
 /// Directives binding a test to a framework feature with no klio counterpart:
 /// a backend restriction, a second module, reflection, JDK classes, compiler

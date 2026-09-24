@@ -21,7 +21,8 @@ pub const files: []const File = &.{
     .{ .path = "mini/kotlin/io/Console.kt", .source = io },
     .{ .path = "mini/kotlin/reflect/Reflect.kt", .source = reflect },
     .{ .path = "mini/kotlin/coroutines/Continuation.kt", .source = coroutines },
-    .{ .path = "mini/java/lang/ClassInit.kt", .source = class_init },
+    .{ .path = "mini/klio/Throwables.kt", .source = klio_throwables },
+    .{ .path = "mini/klio/test/HostBound.kt", .source = host_bound },
 };
 
 pub const core =
@@ -41,6 +42,8 @@ pub const core =
     \\
     \\public interface Annotation
     \\public annotation class UnsafeVariance
+    \\
+    \\public annotation class Suppress(vararg val names: String)
     \\
     \\public interface Comparable<in T> {
     \\    public operator fun compareTo(other: T): Int
@@ -351,11 +354,19 @@ pub const throwables =
     \\
 ;
 
-/// The `java.lang` throwables the VM raises that Kotlin has no name for:
-/// a failed object's or file's initialization, an array or string index
-/// out of range.
-pub const class_init =
-    \\package java.lang
+/// A library's `expect` the host implements, as a pack's
+/// `io.ktor.util.date.getTimeMillis` is.
+pub const host_bound =
+    \\package klio.test
+    \\
+    \\public expect val hostAnswer: Int
+    \\
+;
+
+/// The throwables klio raises that Kotlin has no common name for: a failed
+/// object's or file's initialization, an array or string index out of range.
+pub const klio_throwables =
+    \\package klio
     \\
     \\public open class LinkageError(message: String?, cause: Throwable?) : Error(message, cause)
     \\

@@ -62,13 +62,6 @@ pub fn callNative(self: *VmHost, allocator: Allocator, id: NativeId, args: []con
             if (try ir.eval.stackTraceArray(allocator, &run[0])) |arr| return .{ .ok = arr };
             return .{ .ok = runtime.ArrayData.fromBoxedList(try runtime.ValueList.initOwned(allocator, .empty)) };
         },
-        .jvm_class_name => {
-            if (run.len == 0) return fail(allocator, "a JVM class name of nothing", .{});
-            const c = ir.resolved.classOf(r, &run[0]) orelse return fail(allocator, "a JVM class name of a value outside the tables", .{});
-            const rt = &r.classes[c.int()];
-            const name = if (rt.jvm_name.len != 0) rt.jvm_name else rt.def.asPtrConst().fqn;
-            return .{ .ok = .{ .String = try runtime.strInit(allocator, name) } };
-        },
         .print_err => {
             if (run.len != 0 and run[0] == .String) {
                 const g = run[0].String.borrow();
@@ -335,6 +328,15 @@ pub fn wellKnownObject(self: *VmHost, allocator: Allocator, object: runtime.Well
     return try objectValue(self, allocator, module, cls);
 }
 
+/// The value of top-level property `w`, its file initialized first; null
+/// when the tables do not declare it.
+pub fn wellKnownStatic(self: *VmHost, allocator: Allocator, w: runtime.WellKnownStatic) Allocator.Error!?EvalResult {
+    const module = self.module.asPtrConst();
+    const r = module.resolved orelse return null;
+    const id = r.well_known_statics.get(w) orelse return null;
+    return try ir.eval.resolved_ops.staticValue(VmHost, allocator, module, self, id);
+}
+
 /// Runs the implementation `recv`'s class has for `slot` over `recv` and
 /// `args`; null when the class is not in the tables or has none. A host
 /// value runs only what the host implements (a bound native, or the VM's
@@ -345,8 +347,11 @@ fn callSlot(self: *VmHost, allocator: Allocator, module: *const Module, recv: *c
     const cls = ir.resolved.classOf(r, recv) orelse return null;
     const host_value = recv.* != .Instance;
     const target = ir.resolved.slotTarget(r, cls, slot);
-    const native: NativeId = if (target) |f|
-        (if (f.int() < r.func_native.len) r.func_native[f.int()] else .none)
+    // A host value whose class declares the member with a Kotlin body
+    // (`Pair.toString`) runs the VM's member of the slot's root instead.
+    const bound: NativeId = if (target) |f| (if (f.int() < r.func_native.len) r.func_native[f.int()] else .none) else .none;
+    const native: NativeId = if (bound != .none)
+        bound
     else if (host_value and slot.int() < r.host_slot.len)
         r.host_slot[slot.int()]
     else

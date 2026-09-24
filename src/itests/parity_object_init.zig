@@ -71,11 +71,10 @@ test "uncaught exception reports a stack trace with source positions" {
         },
         .err => |m| {
             const needles = [_][]const u8{
-                "Exception in thread \"main\" java.lang.RuntimeException: boom\n",
-                "\tat Stack_trace_captureKt.inner(stack_trace_capture.kt:2)\n",
-                "\tat Stack_trace_captureKt.outer(stack_trace_capture.kt:3)\n",
-                "\tat Stack_trace_captureKt.main(stack_trace_capture.kt:4)\n",
-                "\tat Stack_trace_captureKt.main(stack_trace_capture.kt)",
+                "Exception in thread \"main\" kotlin.RuntimeException: boom\n",
+                "\tat inner(stack_trace_capture.kt:2)\n",
+                "\tat outer(stack_trace_capture.kt:3)\n",
+                "\tat main(stack_trace_capture.kt:4)",
             };
             for (needles) |n| {
                 if (std.mem.find(u8, m, n) == null) {
@@ -103,7 +102,7 @@ test "stack trace is captured at construction, not at throw" {
             return error.ExpectedRunFailure;
         },
         .err => |m| {
-            const at_make = "\tat Stack_trace_constructKt.make(stack_trace_construct.kt:2)\n";
+            const at_make = "\tat make(stack_trace_construct.kt:2)\n";
             if (std.mem.find(u8, m, at_make) == null) {
                 std.debug.print("trace missing construction frame `{s}`:\n{s}\n", .{ at_make, m });
                 return error.MissingConstructionFrame;
@@ -132,7 +131,7 @@ test "user exception subclass captures at construction" {
             return error.ExpectedRunFailure;
         },
         .err => |m| {
-            const at_make = "\tat Stack_trace_user_constructKt.make(stack_trace_user_construct.kt:3)\n";
+            const at_make = "\tat make(stack_trace_user_construct.kt:3)\n";
             if (std.mem.find(u8, m, at_make) == null) {
                 std.debug.print("trace missing construction frame `{s}`:\n{s}\n", .{ at_make, m });
                 return error.MissingConstructionFrame;
@@ -161,9 +160,9 @@ test "uncaught exception reports the cause chain" {
         },
         .err => |m| {
             const needles = [_][]const u8{
-                "Exception in thread \"main\" java.lang.IllegalStateException: outer\n",
-                "Caused by: java.lang.NumberFormatException: bad\n",
-                "\tat Stack_trace_causeKt.root(stack_trace_cause.kt:2)\n\t... 3 more",
+                "Exception in thread \"main\" kotlin.IllegalStateException: outer\n",
+                "Caused by: kotlin.NumberFormatException: bad\n",
+                "\tat root(stack_trace_cause.kt:2)\n\t... 2 more",
             };
             for (needles) |n| {
                 if (std.mem.find(u8, m, n) == null) {
@@ -387,7 +386,7 @@ test "object_init_failure_uncaught_aborts" {
     try assertKlioError(
         "object_init_uncaught",
         src,
-        "java.lang.ExceptionInInitializerError",
+        "klio.ExceptionInInitializerError",
     );
 }
 

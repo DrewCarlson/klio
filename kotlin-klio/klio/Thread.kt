@@ -1,10 +1,9 @@
 /*
- * The `java.lang.Thread` surface the interpreter serves: the handle
- * `kotlin.concurrent.thread` returns and the static `currentThread` / `sleep`.
- * These are headers: the bodies are the host's. The JVM's statics are
- * companion members here, which is how Kotlin source calls them.
+ * The thread surface the interpreter serves: the handle
+ * `kotlin.concurrent.thread` returns and `currentThread` / `sleep` on its
+ * companion. These are headers: the bodies are the host's.
  */
-package java.lang
+package klio
 
 public external class Thread {
     /** A stable per-thread name; two reads on one thread agree. */

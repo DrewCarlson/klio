@@ -52,6 +52,7 @@ const table = std.StaticStringMap(StdlibFn).initComptime(.{
     .{ "kotlin.Float.hashCode", valueHashCode },
     .{ "kotlin.Double.equals", valueEquals },
     .{ "kotlin.Double.hashCode", valueHashCode },
+    .{ "klio.test.hostAnswer", hostAnswer },
 });
 
 /// The native for the declaration `fqn`: this table first, then
@@ -247,6 +248,11 @@ fn indexArg(ctx: *CallCtx, len: usize) ?usize {
     if (v != .Int or v.Int < 0) return null;
     const i: usize = @intCast(v.Int);
     return if (i < len) i else null;
+}
+
+fn hostAnswer(ctx: *CallCtx) Allocator.Error!EvalResult {
+    _ = ctx;
+    return ok(.{ .Int = 42 });
 }
 
 fn arraySize(ctx: *CallCtx) Allocator.Error!EvalResult {

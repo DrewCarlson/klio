@@ -4,7 +4,7 @@
 // ignoring case. `build()` returns the digest of what was added and starts
 // over, and a name the JVM does not know throws `NoSuchAlgorithmException`.
 import io.ktor.util.Digest
-import java.security.NoSuchAlgorithmException
+import klio.security.NoSuchAlgorithmException
 import kotlinx.coroutines.runBlocking
 
 fun hex(bytes: ByteArray): String = bytes.joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }

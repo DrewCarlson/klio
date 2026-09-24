@@ -130,31 +130,6 @@ pub fn construct(self: *VmIntrinsicHost, class_id: ClassId, args: []const Value,
     return host.newInstance(self.allocator, class_id, args, null);
 }
 
-/// Named construction: parameters not in `names` take their declared defaults.
-/// Null when `class` is not a resolvable class; the caller then goes positional.
-pub fn constructNamed(self: *VmIntrinsicHost, class: *const Value, names: []const []const u8, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
-    if (class.* != .Class) return null;
-    var name: []const u8 = undefined;
-    var fqn: []const u8 = undefined;
-    {
-        const dg = class.Class.borrow();
-        defer dg.deinit();
-        name = dg.get().name;
-        fqn = dg.get().fqn;
-    }
-    const class_id = blk: {
-        const module_g = self.module.borrow();
-        defer module_g.deinit();
-        break :blk module_g.get().classIdByFqn(fqn) orelse module_g.get().classId(name);
-    } orelse return null;
-    const arg_names = try self.allocator.alloc(?[]const u8, names.len);
-    defer self.allocator.free(arg_names);
-    for (names, arg_names) |n, *slot| slot.* = n;
-    var host = vmHost(self, out);
-    const r = try host_instances.newInstanceNamed(&host, self.allocator, class_id, args, arg_names, null);
-    return flattenEval(r);
-}
-
 /// Evaluate an `IrClosure` with the raw `EvalError` out, so the driver sees `Suspended`.
 pub fn evalClosureRaw(
     self: *VmIntrinsicHost,
@@ -726,74 +701,6 @@ pub fn wellKnownObject(self: *VmIntrinsicHost, object: runtime.WellKnownObject) 
         .ok => |v| v,
         .err => null,
     };
-}
-
-pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []const u8, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
-    // Route through call_member so a user override method wins the dispatch.
-    var host = vmHost(self, out);
-    const r = try host.callMember(self.allocator, receiver, name, args);
-    return switch (r) {
-        .ok => |v| RuntimeEvalResult{ .ok = v },
-        .err => |e| switch (e) {
-            .Throw => |v| RuntimeEvalResult{ .err = .{ .Thrown = v } },
-            // A body that ran and failed must propagate: falling through to
-            // another dispatch hides the failure and can re-run side effects.
-            .CalleeFailed => |m| RuntimeEvalResult{ .err = .{ .CalleeFailed = m } },
-            else => blk: {
-                if (runtime.envOnce("KLIO_SELDBG") != null) {
-                    std.debug.print("[seldbg] invokeMethod {s}: err={s}", .{ name, @tagName(std.meta.activeTag(e)) });
-                    switch (e) {
-                        .Unimplemented, .Type, .CalleeFailed => |m| std.debug.print(" {s}", .{m}),
-                        else => {},
-                    }
-                    std.debug.print("\n", .{});
-                }
-                break :blk null;
-            },
-        },
-    };
-}
-
-pub fn getProperty(self: *VmIntrinsicHost, receiver: *const Value, name: []const u8, out: Output) Allocator.Error!?RuntimeEvalResult {
-    // Route through the field path so custom getters, stored fields and ctor-property
-    // params resolve, member-strict: a capability sniff must not walk the receiver chain.
-    var host = vmHost(self, out);
-    const r = try vmhost.host_fields.getMemberField(&host, self.allocator, receiver, name);
-    return switch (r) {
-        .ok => |v| RuntimeEvalResult{ .ok = v },
-        .err => |e| switch (e) {
-            .Throw => |v| RuntimeEvalResult{ .err = .{ .Thrown = v } },
-            else => null,
-        },
-    };
-}
-
-pub fn lookupGlobal(self: *VmIntrinsicHost, name: []const u8) ?Value {
-    {
-        const g = self.globals.borrow();
-        defer g.deinit();
-        if (g.get().lookup(name)) |v| return v;
-    }
-    // A pack native's first `object`/companion reference drives the lazy first-access gate.
-    {
-        const state = vmhost.SharedHandles.fromIntrinsic(self);
-        var host = VmHost.borrowed(state, state.globals, self.out_sink.output());
-        if (vmhost.host_globals.objectSingletonQuiet(&host, name)) |v| return v;
-    }
-    const cg = self.classes.borrow();
-    defer cg.deinit();
-    if (cg.get().get(name)) |def| {
-        return .{ .Class = def.clone() };
-    }
-    return null;
-}
-
-/// Resolve a top-level Kotlin function value by name. Separate from
-/// `lookupGlobal` so the heavier module-function search runs only when needed.
-pub fn lookupGlobalFunc(self: *VmIntrinsicHost, name: []const u8) ?Value {
-    const state = vmhost.SharedHandles.fromIntrinsic(self);
-    var host = VmHost.borrowed(state, state.globals, self.out_sink.output());
-    return vmhost.host_globals.lookupGlobal(&host, name);
 }
 
 pub fn allocInstanceId(self: *VmIntrinsicHost) u64 {

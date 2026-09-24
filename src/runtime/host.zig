@@ -79,6 +79,8 @@ pub const WellKnown = enum(u8) {
     context_get,
     /// `CoroutineExceptionHandler.handleException(context, exception)`.
     handle_exception,
+    /// `Sequence.iterator()`.
+    sequence_iterator,
 
     /// The member's name, for a host that answers by name.
     pub fn memberName(m: WellKnown) []const u8 {
@@ -88,7 +90,7 @@ pub const WellKnown = enum(u8) {
             .hash_code => "hashCode",
             .compare_to => "compareTo",
             .compare => "compare",
-            .iterator => "iterator",
+            .iterator, .sequence_iterator => "iterator",
             .has_next => "hasNext",
             .next => "next",
             .size, .map_size => "size",
@@ -122,17 +124,45 @@ pub const WellKnown = enum(u8) {
     }
 };
 
+/// A top-level property of the base or a pack a host fast path reads, named
+/// by its declaration: its package, its name and the file declaring it,
+/// since a file-private property's name can repeat across files.
+pub const WellKnownStatic = enum(u8) {
+    /// Compose's current snapshot per thread and its global snapshot.
+    compose_thread_snapshot,
+    compose_global_snapshot,
+    /// Compose's global write observers, notified on every state write.
+    compose_global_write_observers,
+    /// The lock `SnapshotStateMap` mutates its state records under.
+    compose_snapshot_map_sync,
+
+    pub const Declaration = struct { package: []const u8, name: []const u8, file: []const u8 };
+
+    pub fn declaration(w: WellKnownStatic) Declaration {
+        const snapshots = "androidx.compose.runtime.snapshots";
+        return switch (w) {
+            .compose_thread_snapshot => .{ .package = snapshots, .name = "threadSnapshot", .file = "/Snapshot.kt" },
+            .compose_global_snapshot => .{ .package = snapshots, .name = "globalSnapshot", .file = "/Snapshot.kt" },
+            .compose_global_write_observers => .{ .package = snapshots, .name = "globalWriteObservers", .file = "/Snapshot.kt" },
+            .compose_snapshot_map_sync => .{ .package = snapshots, .name = "sync", .file = "/SnapshotStateMap.kt" },
+        };
+    }
+};
+
 /// An object of the base or a pack a native needs, named by its
 /// declaration.
 pub const WellKnownObject = enum(u8) {
     /// `CoroutineExceptionHandler.Key`, the context key of a coroutine's
     /// exception handler.
     coroutine_exception_handler_key,
+    /// `GlobalScope`, the scope a launch the host starts on its own runs in.
+    global_scope,
 
     /// The object's FQN, as sema spells a nested class's.
     pub fn fqn(o: WellKnownObject) []const u8 {
         return switch (o) {
             .coroutine_exception_handler_key => "kotlinx.coroutines.CoroutineExceptionHandler.Key",
+            .global_scope => "kotlinx.coroutines.GlobalScope",
         };
     }
 };
@@ -147,20 +177,12 @@ pub const IntrinsicHost = struct {
         invoke_callable: *const fn (ctx: *anyopaque, callable: *const Value, args: []const Value, out: Output) std.mem.Allocator.Error!EvalResult,
         /// Required.
         invoke_callable_with_this: *const fn (ctx: *anyopaque, callable: *const Value, args: []const Value, this_value: *const Value, out: Output) std.mem.Allocator.Error!EvalResult,
-        /// Null answers null, falling back to structural rendering.
-        invoke_method: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
         /// `member` of an instance whose class the host's tables cover, by
         /// its slot; null for any other value, which the native serves.
         call_well_known: ?*const fn (ctx: *anyopaque, receiver: *const Value, member: WellKnown, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
         /// `object`, made on first use; null when the host's tables do not
         /// declare it.
         well_known_object: ?*const fn (ctx: *anyopaque, object: WellKnownObject) std.mem.Allocator.Error!?Value = null,
-        /// The constructor's defaults fill every unnamed parameter.
-        construct_named: ?*const fn (ctx: *anyopaque, class: *const Value, names: []const []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
-        /// Resolves custom getters and stored fields, where `invoke_method`
-        /// dispatches only functions.
-        get_property: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, out: Output) std.mem.Allocator.Error!?EvalResult = null,
-        lookup_global: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
         alloc_instance_id: ?*const fn (ctx: *anyopaque) u64 = null,
         new_synth_instance: ?*const fn (ctx: *anyopaque, class_fqn: []const u8, identity: u64, fields: []const InstanceData.Field) std.mem.Allocator.Error!Value = null,
         run_blocking: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
@@ -184,8 +206,6 @@ pub const IntrinsicHost = struct {
         coroutine_pop_scope: ?*const fn (ctx: *anyopaque) void = null,
         coroutine_resume_slot_value: ?*const fn (ctx: *anyopaque, slot: i64, value: Value) void = null,
         active_coro_scope: ?*const fn (ctx: *anyopaque) ?Value = null,
-        /// The heavier module-function lookup, distinct from `lookup_global`.
-        lookup_global_func: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
         coroutine_drain_to_idle: ?*const fn (ctx: *anyopaque, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_resume_external: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
         /// Run on the caller's stack, unlike `coroutine_resume_external`, which
@@ -225,38 +245,16 @@ pub const IntrinsicHost = struct {
         return self.vtable.invoke_callable_with_this(self.ctx, callable, args, this_value, out);
     }
 
-    pub fn invokeMethod(self: IntrinsicHost, receiver: *const Value, name: []const u8, args: []const Value, out: Output) !?EvalResult {
-        if (self.vtable.invoke_method) |f| return f(self.ctx, receiver, name, args, out);
-        return null;
-    }
-
-    /// `member` of `receiver` through its class's slot, when the host's
-    /// tables cover it; else by the member's name, for a host that answers
-    /// by name. Null when neither answers.
+    /// `member` of `receiver` through its class's slot; null when the
+    /// host's tables do not cover the value, which the native then serves.
     pub fn callWellKnown(self: IntrinsicHost, receiver: *const Value, member: WellKnown, args: []const Value, out: Output) !?EvalResult {
-        if (self.vtable.call_well_known) |f| if (try f(self.ctx, receiver, member, args, out)) |r| return r;
-        if (member.isProperty()) return self.getProperty(receiver, member.memberName(), out);
-        return self.invokeMethod(receiver, member.memberName(), args, out);
+        if (self.vtable.call_well_known) |f| return f(self.ctx, receiver, member, args, out);
+        return null;
     }
 
     /// `object` from the host's tables; null when they do not declare it.
     pub fn wellKnownObject(self: IntrinsicHost, object: WellKnownObject) !?Value {
         if (self.vtable.well_known_object) |f| return f(self.ctx, object);
-        return null;
-    }
-
-    pub fn getProperty(self: IntrinsicHost, receiver: *const Value, name: []const u8, out: Output) !?EvalResult {
-        if (self.vtable.get_property) |f| return f(self.ctx, receiver, name, out);
-        return null;
-    }
-
-    pub fn constructNamed(self: IntrinsicHost, class: *const Value, names: []const []const u8, args: []const Value, out: Output) !?EvalResult {
-        if (self.vtable.construct_named) |f| return f(self.ctx, class, names, args, out);
-        return null;
-    }
-
-    pub fn lookupGlobal(self: IntrinsicHost, name: []const u8) ?Value {
-        if (self.vtable.lookup_global) |f| return f(self.ctx, name);
         return null;
     }
 
@@ -343,11 +341,6 @@ pub const IntrinsicHost = struct {
 
     pub fn activeCoroScope(self: IntrinsicHost) ?Value {
         if (self.vtable.active_coro_scope) |f| return f(self.ctx);
-        return null;
-    }
-
-    pub fn lookupGlobalFunc(self: IntrinsicHost, name: []const u8) ?Value {
-        if (self.vtable.lookup_global_func) |f| return f(self.ctx, name);
         return null;
     }
 

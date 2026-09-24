@@ -1,7 +1,9 @@
-//! `java.lang.StackTraceElement` members. The host renders each captured frame
-//! as the JVM's `StackTraceElement.toString` does, `Class.method(File.kt:line)`,
-//! or `Class.method(Unknown Source)` for a frame without a position, and an
-//! element is that text; its members read the parts back.
+//! `klio.StackTraceElement` members. The host renders each captured frame
+//! as its function's Kotlin name and where it is, `pkg.Outer.f(File.kt:line)`,
+//! or `pkg.Outer.f(Unknown Source)` for a frame without a position, and an
+//! element is that text; its members read the parts back. `className` is
+//! the name's qualifier, so a top-level function's is its package, and
+//! `methodName` its last segment.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -13,7 +15,7 @@ const Allocator = std.mem.Allocator;
 
 /// A rendered frame split into its parts.
 pub const Frame = struct {
-    /// `Class.method`.
+    /// The function's Kotlin name, `pkg.Outer.f`.
     fqn: []const u8,
     /// Null for a frame without a source position.
     path: ?[]const u8,
@@ -104,12 +106,12 @@ test "a rendered frame parses into its function, file and line" {
     try std.testing.expectEqualStrings("demo.Box.run", f.fqn);
     try std.testing.expectEqualStrings("Box.kt", f.path.?);
     try std.testing.expectEqual(@as(i32, 42), f.line);
-    const u = parse("demo.MainKt.main$lambda$0(Unknown Source)");
-    try std.testing.expectEqualStrings("demo.MainKt.main$lambda$0", u.fqn);
+    const u = parse("demo.main.<anonymous>(Unknown Source)");
+    try std.testing.expectEqualStrings("demo.main.<anonymous>", u.fqn);
     try std.testing.expect(u.path == null);
     try std.testing.expectEqual(@as(i32, -1), u.line);
-    const n = parse("java.lang.Thread.sleep(Native Method)");
-    try std.testing.expectEqualStrings("java.lang.Thread.sleep", n.fqn);
+    const n = parse("klio.Thread.sleep(Native Method)");
+    try std.testing.expectEqualStrings("klio.Thread.sleep", n.fqn);
     try std.testing.expect(n.path == null);
     try std.testing.expectEqual(@as(i32, -2), n.line);
 }
@@ -118,9 +120,17 @@ test "the members read the parts of the element" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const args = [_]Value{.{ .String = try runtime.strInit(a, "demo.Outer$Box.run(Box.kt:42)") }};
-    try std.testing.expectEqualStrings("demo.Outer$Box", (try classNameOf(a, &args)).ok.String.asPtr().bytes);
+    const args = [_]Value{.{ .String = try runtime.strInit(a, "demo.Outer.Box.run(Box.kt:42)") }};
+    try std.testing.expectEqualStrings("demo.Outer.Box", (try classNameOf(a, &args)).ok.String.asPtr().bytes);
     try std.testing.expectEqualStrings("run", (try methodNameOf(a, &args)).ok.String.asPtr().bytes);
     try std.testing.expectEqualStrings("Box.kt", (try fileNameOf(a, &args)).ok.String.asPtr().bytes);
     try std.testing.expectEqual(@as(i32, 42), (try lineNumberOf(a, &args)).ok.Int);
+    // A top-level function's qualifier is its package; the root package's
+    // functions have none.
+    const top = [_]Value{.{ .String = try runtime.strInit(a, "demo.main(main.kt:3)") }};
+    try std.testing.expectEqualStrings("demo", (try classNameOf(a, &top)).ok.String.asPtr().bytes);
+    try std.testing.expectEqualStrings("main", (try methodNameOf(a, &top)).ok.String.asPtr().bytes);
+    const root = [_]Value{.{ .String = try runtime.strInit(a, "main(main.kt:3)") }};
+    try std.testing.expectEqualStrings("", (try classNameOf(a, &root)).ok.String.asPtr().bytes);
+    try std.testing.expectEqualStrings("main", (try methodNameOf(a, &root)).ok.String.asPtr().bytes);
 }

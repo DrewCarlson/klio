@@ -1,9 +1,5 @@
-// A hot loop reading scalar fields of a loop-invariant object each iteration, and
-// a field mutated through a method call then read back. The loop JIT trampolines
-// the field read as a direct stored-field load (no getter, no allocation) while
-// the receiver stays boxed and its class is re-checked at loop entry; a property
-// with a custom getter falls back to the interpreter. Output must match with the
-// JIT off (default) or on (KLIO_JIT=1).
+// Reading scalar fields (Int, Long, Double) of an object across a loop, plus
+// a field mutated through a method call and read back the same iteration.
 class Point(var x: Int, var y: Long, val scale: Double)
 
 class Counter(var n: Int) {

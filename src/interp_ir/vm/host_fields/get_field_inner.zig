@@ -621,7 +621,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
     }
     if (receiver.* == .BoundMethod) {
         const bm = receiver.BoundMethod;
-        if (std.mem.eql(u8, bm.fqn, "java.lang.Thread")) {
+        if (std.mem.eql(u8, bm.fqn, "klio.Thread")) {
             const id: u64 = switch (bm.receiver.asPtr().*) {
                 .Long => |v| @bitCast(v),
                 else => 0,

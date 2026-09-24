@@ -1,7 +1,6 @@
-// Hot Double arithmetic + comparison over a DoubleArray. The loop JIT compiles
-// these to native SSE2 (addsd/mulsd/ucomisd …); output is identical with the
-// JIT off or on, including IEEE/Kotlin NaN comparison semantics (any comparison
-// with NaN is false except `!=`).
+// Double arithmetic and comparison over a DoubleArray, including a NaN
+// element: Kotlin's NaN comparison semantics say any comparison with NaN is
+// false except `!=`, so `v == v` is false only for that element.
 fun main() {
     val n = 1000
     val a = DoubleArray(n)

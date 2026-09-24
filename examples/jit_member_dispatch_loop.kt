@@ -1,8 +1,5 @@
-// A hot loop whose body is nothing but member calls on one object: the shape
-// where the whole-function tier must NOT take the body off the fused walk. It
-// compiles the method but the seam refuses a unit that can deopt, so yielding
-// for it would buy a framed activation per call and run the compiled code
-// never. Output must match with the JIT off (--opt safe) or on (default).
+// A loop whose body is nothing but member calls (`bump`, `value`) on one
+// object, mutating and then reading back an Int field.
 class Counter {
     var n = 0
     fun bump(k: Int) { n += k }

@@ -1,0 +1,20 @@
+kotlin.Throwable: t
+kotlin.Throwable
+kotlin.Error: e
+kotlin.Exception
+demo.Outer.Inner: in
+demo.Outer.Inner
+demo.Plain
+kotlin.NoSuchElementException: n
+kotlin.ConcurrentModificationException
+true
+kotlin.AssertionError: as
+kotlin.UninitializedPropertyAccessException: u
+true
+klio.ArrayIndexOutOfBoundsException
+kotlin.NumberFormatException: For input string: "abc"
+kotlin.NoSuchElementException
+kotlin.ClassCastException
+kotlin.ArithmeticException: / by zero
+kotlin.IllegalStateException: boom
+kotlin.IllegalArgumentException: req

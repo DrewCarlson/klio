@@ -1,16 +1,6 @@
-// Calling a method on an object held OUTSIDE a loop — the most ordinary shape
-// in Kotlin — used to defeat the loop tier twice over. The receiver register
-// had no in-body instruction to infer its type from, so the loop bailed as
-// untyped; and a static call to anything with a receiver parameter was refused
-// outright. `c.bump(1)` lowers to exactly that: a static call with the receiver
-// moved into argument 0.
-//
-// Both gates are now openings rather than refusals. The receiver's field buffer
-// is already cached at loop entry for native field access, so the call reuses
-// it and needs no per-iteration guard.
-//
-// Output must match with the JIT off (--opt safe) or on, and with direct calls
-// disabled (KLIO_FJ_DIRECT=0).
+// Calling methods on an object held outside the loop, the ordinary shape of
+// repeatedly calling a receiver's members: a mutator taking an argument, a
+// no-argument mutator, and reading the final field values back afterward.
 class Counter {
     var n = 0
     var hits = 0

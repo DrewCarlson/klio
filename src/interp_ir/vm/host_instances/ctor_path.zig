@@ -218,7 +218,7 @@ pub fn throwInstantiation(self: *VmHost, allocator: Allocator, comptime fmt: []c
     _ = self;
     const msg = try std.fmt.allocPrint(allocator, fmt, .{name});
     return .{ .err = .{ .Throw = try Value.newException(allocator, .{
-        .fqn = try runtime.strInitOwned(allocator, try allocator.dupe(u8, "java.lang.InstantiationError")),
+        .fqn = try runtime.strInitOwned(allocator, try allocator.dupe(u8, "klio.InstantiationError")),
         .message = .from(try runtime.strInitOwned(allocator, msg)),
         .cause = null,
     }) } };

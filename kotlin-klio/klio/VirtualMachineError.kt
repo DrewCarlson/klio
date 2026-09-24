@@ -1,8 +1,8 @@
 /*
- * The `java.lang` errors the VM itself raises: running out of stack is a
+ * The errors the interpreter itself raises: running out of stack is a
  * `StackOverflowError`, which Kotlin code catches like any other throwable.
  */
-package java.lang
+package klio
 
 /**
  * The broken or exhausted state of the virtual machine.

@@ -1,10 +1,6 @@
-// Methods called on a receiver the loop REBINDS each iteration (a linked-list
-// cursor). `node.m()` lowers to a static call with the receiver moved into arg 0;
-// lowering has already chosen the body, so the loop JIT splices it in place with
-// no dispatch guard, and the body's `this`-field accesses read whichever receiver
-// the iteration holds. Covers a no-arg method, one taking arguments, one that
-// mutates a field, and a second class walked by the same shape.
-// Output must match with the JIT off (--opt safe) or on (default).
+// Methods called on a receiver a loop rebinds each iteration while walking a
+// linked-list cursor: a no-argument method, one taking arguments, one that
+// mutates a field, and a second, unrelated class walked by the same shape.
 class Node(val v: Int, var acc: Int, val next: Node?) {
     fun weight(): Int = v * 2
     fun scaled(m: Int, o: Int): Int = v * m + o

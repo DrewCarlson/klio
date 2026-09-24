@@ -269,6 +269,7 @@ pub const VmHost = struct {
     pub const tryNative = host_resolved.tryNative;
     pub const callWellKnown = host_resolved.callWellKnown;
     pub const wellKnownObject = host_resolved.wellKnownObject;
+    pub const wellKnownStatic = host_resolved.wellKnownStatic;
     pub const caughtValue = host_resolved.caughtValue;
     pub const runResolved = host_resolved.runResolved;
     pub const makeResolvedClosure = host_resolved.makeResolvedClosure;
@@ -486,23 +487,11 @@ fn ivInvokeCallable(ctx: *anyopaque, callable: *const Value, args: []const Value
 fn ivInvokeCallableWithThis(ctx: *anyopaque, callable: *const Value, args: []const Value, this_value: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     return intrinsic_host.invokeCallableWithThis(ip(ctx), callable, args, this_value, out);
 }
-fn ivInvokeMethod(ctx: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
-    return intrinsic_host.invokeMethod(ip(ctx), receiver, name, args, out);
-}
 fn ivWellKnownObject(ctx: *anyopaque, object: runtime.WellKnownObject) Allocator.Error!?Value {
     return intrinsic_host.wellKnownObject(ip(ctx), object);
 }
 fn ivCallWellKnown(ctx: *anyopaque, receiver: *const Value, member: runtime.WellKnown, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
     return intrinsic_host.callWellKnown(ip(ctx), receiver, member, args, out);
-}
-fn ivGetProperty(ctx: *anyopaque, receiver: *const Value, name: []const u8, out: Output) Allocator.Error!?RuntimeEvalResult {
-    return intrinsic_host.getProperty(ip(ctx), receiver, name, out);
-}
-fn ivConstructNamed(ctx: *anyopaque, class: *const Value, names: []const []const u8, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
-    return intrinsic_host.constructNamed(ip(ctx), class, names, args, out);
-}
-fn ivLookupGlobal(ctx: *anyopaque, name: []const u8) ?Value {
-    return intrinsic_host.lookupGlobal(ip(ctx), name);
 }
 fn ivAllocInstanceId(ctx: *anyopaque) u64 {
     return intrinsic_host.allocInstanceId(ip(ctx));
@@ -556,9 +545,6 @@ fn ivMarkSlotOwnerSchedulerBacked(ctx: *anyopaque, slot: i64) void {
 }
 fn ivActiveCoroScope(ctx: *anyopaque) ?Value {
     return intrinsic_host.activeCoroScope(ip(ctx));
-}
-fn ivLookupGlobalFunc(ctx: *anyopaque, name: []const u8) ?Value {
-    return intrinsic_host.lookupGlobalFunc(ip(ctx), name);
 }
 fn ivCoroutineResumeExternal(ctx: *anyopaque, slot: i64, value: Value, out: Output) void {
     intrinsic_host.coroutineResumeExternal(ip(ctx), slot, value, out);
@@ -624,12 +610,8 @@ fn ivCallableReturnTy(ctx: *anyopaque, callable: *const Value) ?[]const u8 {
 const intrinsic_vtable: IntrinsicHost.VTable = .{
     .invoke_callable = ivInvokeCallable,
     .invoke_callable_with_this = ivInvokeCallableWithThis,
-    .invoke_method = ivInvokeMethod,
     .call_well_known = ivCallWellKnown,
     .well_known_object = ivWellKnownObject,
-    .get_property = ivGetProperty,
-    .construct_named = ivConstructNamed,
-    .lookup_global = ivLookupGlobal,
     .alloc_instance_id = ivAllocInstanceId,
     .new_synth_instance = ivNewSynthInstance,
     .run_blocking = ivRunBlocking,
@@ -647,7 +629,6 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .coroutine_resume_slot_value = ivCoroutineResumeSlotValue,
     .mark_slot_owner_scheduler_backed = ivMarkSlotOwnerSchedulerBacked,
     .active_coro_scope = ivActiveCoroScope,
-    .lookup_global_func = ivLookupGlobalFunc,
     .coroutine_resume_external = ivCoroutineResumeExternal,
     .coroutine_dispatch_pooled = ivCoroutineDispatchPooled,
     .coroutine_resume_continuation = ivCoroutineResumeContinuation,

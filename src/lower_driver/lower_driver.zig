@@ -489,6 +489,13 @@ test "a file's main taking the arguments runs over its parameterless one" {
     }, "no arguments\n") catch |e| return skipUnbuilt(e);
 }
 
+test "the accessor of a bodyless expect property runs its native" {
+    expectOutput(&.{
+        \\import klio.test.hostAnswer
+        \\fun main() { println(hostAnswer + 1) }
+    }, "43\n") catch |e| return skipUnbuilt(e);
+}
+
 test "a main that does not return Unit is no entry point" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

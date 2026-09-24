@@ -11,17 +11,20 @@ const sema_mod = @import("sema.zig");
 const symbols = @import("symbols.zig");
 const names_mod = @import("names.zig");
 const headers = @import("headers.zig");
+const members = @import("members.zig");
+const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 const Sema = sema_mod.Sema;
 const Sym = symbols.Sym;
 const Name = names_mod.Name;
+const Span = @import("span").Span;
 
 /// Packages every file imports implicitly, in two levels: the common set,
-/// then below it the JVM platform's `java.lang` and `kotlin.jvm`. A name
-/// the first level declares is never looked up in the second
-/// (`IllegalStateException` is `kotlin.IllegalStateException`, an alias of
-/// `java.lang`'s class, not both).
+/// then below it klio's own `klio` (the throwables and types Kotlin has no
+/// common name for) and `kotlin.jvm`. A name the first level declares is
+/// never looked up in the second (`IllegalStateException` is
+/// `kotlin.IllegalStateException` even where `klio` declares one too).
 pub const default_imports = [_][]const u8{
     "kotlin",
     "kotlin.annotation",
@@ -34,21 +37,44 @@ pub const default_imports = [_][]const u8{
 };
 
 pub const default_low_imports = [_][]const u8{
-    "java.lang",
+    "klio",
     "kotlin.jvm",
 };
 
 /// What `import a.b.C` binds `C` (or its alias) to: every declaration named
-/// `member` in `container`, a package or a class.
+/// `member` in `container`, a package or a class. An object's members
+/// include those it inherits (`import Obj.f` for an `f` its superclass
+/// declares).
 pub const ImportTarget = struct {
     container: Sym,
     member: Name,
+    /// An object's functions and properties named `member`, found once.
+    on_object: ?[]const Sym = null,
+};
+
+/// A member imported from an object: the object it is called or read on,
+/// and its declaring class's type parameters as the object sees them.
+pub const ObjectImport = struct {
+    object: Sym,
+    subst: *const types.Subst,
+};
+
+/// An import from an object of a name the object does not declare, which
+/// its supertypes may: checked once they are resolved.
+pub const InheritedImport = struct {
+    container: Sym,
+    member: Name,
+    span: Span,
+    text: []const u8,
 };
 
 pub const FileImports = struct {
     explicit: std.AutoHashMapUnmanaged(Name, std.ArrayList(ImportTarget)) = .empty,
     /// Packages and classes imported with `.*`.
     star: std.ArrayList(Sym) = .empty,
+    /// The object each member imported from an object is used on.
+    object_members: std.AutoHashMapUnmanaged(Sym, ObjectImport) = .empty,
+    inherited: std.ArrayList(InheritedImport) = .empty,
 };
 
 /// Default-import packages that exist, resolved once per analysis.
@@ -116,8 +142,11 @@ pub fn fileImports(s: *Sema, file: u32) Allocator.Error!*FileImports {
             continue;
         }
         if (!containerDeclares(s, r.container, member)) {
-            try s.census.reportFmt(.unresolved_import, file, imp.span, "{s}", .{try pathStr(s, imp.path)});
-            continue;
+            if (!isObject(s, r.container)) {
+                try s.census.reportFmt(.unresolved_import, file, imp.span, "{s}", .{try pathStr(s, imp.path)});
+                continue;
+            }
+            try fi.inherited.append(s.arena, .{ .container = r.container, .member = member, .span = imp.span, .text = try pathStr(s, imp.path) });
         }
         const bound = if (imp.alias) |a| try s.names.intern(a.name) else member;
         const gop = try fi.explicit.getOrPut(s.arena, bound);
@@ -142,6 +171,41 @@ pub fn pathStr(s: *Sema, path: []const ast.Ident) Allocator.Error![]const u8 {
 
 fn containerDeclares(s: *Sema, container: Sym, n: Name) bool {
     return membersOf(s, container, n).len != 0;
+}
+
+/// An object or a companion object: a container whose members can be
+/// imported.
+fn isObject(s: *Sema, sym: Sym) bool {
+    if (s.syms.kind(sym) != .class) return false;
+    const k = s.syms.classInfo(sym).kind;
+    return k == .object or k == .companion;
+}
+
+/// The functions and properties an import from an object names, the ones
+/// it inherits included; null for a target that is not an object. Each is
+/// recorded in `fi.object_members` with the object it is used on.
+pub fn objectMembers(s: *Sema, fi: *FileImports, t: *ImportTarget) Allocator.Error!?[]const Sym {
+    if (!isObject(s, t.container)) return null;
+    if (t.on_object) |hit| return hit;
+    var out: std.ArrayList(Sym) = .empty;
+    for (try members.lookup(s, try headers.selfType(s, t.container), t.member, .callable)) |m| {
+        if (!visible(s, m.sym)) continue;
+        try out.append(s.arena, m.sym);
+        try fi.object_members.put(s.arena, m.sym, .{ .object = t.container, .subst = m.subst });
+    }
+    t.on_object = out.items;
+    return out.items;
+}
+
+/// Reports the imports from an object of a name neither it nor its
+/// supertypes declare, once the supertypes can be resolved.
+pub fn checkInheritedImports(s: *Sema, file: u32) Allocator.Error!void {
+    const fi = try fileImports(s, file);
+    for (fi.inherited.items) |imp| {
+        if ((try members.lookup(s, try headers.selfType(s, imp.container), imp.member, .callable)).len != 0) continue;
+        try s.census.reportFmt(.unresolved_import, file, imp.span, "{s}", .{imp.text});
+    }
+    fi.inherited.clearRetainingCapacity();
 }
 
 /// Everything `container` (a package or a class) declares under `n`,

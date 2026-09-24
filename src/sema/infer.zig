@@ -41,6 +41,12 @@ pub const Var = struct {
     /// lambda passed to it (builder inference): this system constrains it
     /// but never fixes it, and hands what it learned to that call's.
     foreign: bool = false,
+    /// Its declared bounds were constrained with the type it was fixed to.
+    bounds_applied: bool = false,
+    /// A lambda of the call was analyzed with it open, its body inferring
+    /// it (builder inference): the call's other lambdas are too, whatever
+    /// that body said of it.
+    postponed: bool = false,
 };
 
 pub const System = struct {
@@ -169,9 +175,16 @@ pub const System = struct {
         for (found.items) |id| {
             const i = trial.index.get(id) orelse continue;
             const v = trial.vars.items[i];
-            if (!v.uninferred or v.foreign) continue;
+            if (v.foreign) continue;
+            // `parallelBuild({ base(it) }, { derived(it) })`: the second
+            // lambda's `it` is still the variable the first left open, not
+            // the `TargetTypeBase` the first said it is at most.
+            if (!v.uninferred and !v.postponed) continue;
             if (std.mem.indexOfScalar(u32, out.items, id) == null) try out.append(s.arena, id);
         }
+        for (out.items) |id| if (self.index.get(id)) |i| {
+            self.vars.items[i].postponed = true;
+        };
         return out.items;
     }
 
@@ -764,6 +777,26 @@ pub const System = struct {
         // round, from the innermost out.
         while (progress) {
             progress = false;
+            // A variable fixed to a type puts that type below its declared
+            // bounds, which may name variables still open: `TEvent` fixed
+            // to `SomeEvent` below `Event<TService>` makes `TService` at
+            // least `SomeService`.
+            var vi: usize = 0;
+            while (vi < self.vars.items.len) : (vi += 1) {
+                const v = &self.vars.items[vi];
+                if (v.fixed == .none or v.bounds_applied) continue;
+                v.bounds_applied = true;
+                const fixed = v.fixed;
+                for (try s.arena.dupe(TypeId, v.declared.items)) |db| {
+                    const z = try zonk(s, db);
+                    if (!self.mentionsOtherUnfixed(z, self.vars.items[vi].id)) continue;
+                    var trial = try self.clone();
+                    if (try trial.constrain(fixed, z)) {
+                        _ = try self.constrain(fixed, z);
+                        progress = true;
+                    }
+                }
+            }
             for (self.vars.items) |*v| {
                 if (v.fixed != .none or v.foreign) continue;
                 if (leave_open and self.keptOpen(v, keep_reach)) continue;
@@ -897,6 +930,10 @@ pub const System = struct {
             }
             if (v.lower.items.len == 0 and v.upper.items.len == 0 and !bound_by_var) v.uninferred = true;
             if (leave_open and v.uninferred) continue;
+            // Bounded only by its declared bounds over variables still open
+            // (`TService : Service<TService, TEvent>` before a lambda gives
+            // `TEvent`): nothing is known of it yet.
+            if (leave_open and bound_by_var and v.lower.items.len == 0 and v.upper.items.len == 0 and try self.declaredWaitsOnOpen(v)) continue;
             // Only below variables still open (`R <: T` for an open `T :
             // Comparable<T>`): nothing is known of it yet either.
             if (leave_open and v.lower.items.len == 0 and try self.onlyBelowOpen(v) and reaches(reach, v.id)) continue;
@@ -1012,6 +1049,33 @@ pub const System = struct {
             }
         }
         return seen;
+    }
+
+    fn declaredWaitsOnOpen(self: *const System, v: *const Var) Allocator.Error!bool {
+        for (v.declared.items) |db| {
+            if (self.mentionsOtherUnfixed(try zonk(self.s, db), v.id)) return true;
+        }
+        return false;
+    }
+
+    fn mentionsOtherUnfixed(self: *const System, t: TypeId, id: u32) bool {
+        const ts = &self.s.types;
+        switch (ts.get(t)) {
+            .variable => |v| {
+                if (v.id == id) return false;
+                const i = self.anyVarIndex(t) orelse return false;
+                return self.vars.items[i].fixed == .none;
+            },
+            .class => |c| {
+                for (c.args) |a| if (a.variance != .star and self.mentionsOtherUnfixed(a.ty, id)) return true;
+                return false;
+            },
+            .intersection => |parts| {
+                for (parts) |p| if (self.mentionsOtherUnfixed(p, id)) return true;
+                return false;
+            },
+            else => return false,
+        }
     }
 
     fn onlyBelowOpen(self: *const System, v: *const Var) Allocator.Error!bool {

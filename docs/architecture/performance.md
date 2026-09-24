@@ -1,66 +1,33 @@
-# Performance: profiles, JIT, and GC
+# Performance: profiles and GC
 
 klio bundles its performance controls into one profile, selected with
 `--opt <profile>` on any command or the `KLIO_OPT` environment
 variable. The profile is resolved once at process start
-(`src/runtime/perf.zig`) and gates two independent subsystems: the
-JIT tiers and the memory backend.
+(`src/runtime/perf.zig`) and picks the memory backend.
 
 ## Profiles
 
-| Profile | Loop JIT | Function JIT | Memory backend    |
-|---------|----------|--------------|-------------------|
-| `fast`  | on       | on           | tracing GC        |
-| `safe`  | off      | off          | tracing GC        |
-| `off`   | off      | off          | never-free arena  |
+| Profile | Memory backend    |
+|---------|-------------------|
+| `fast`  | tracing GC        |
+| `safe`  | tracing GC        |
+| `off`   | never-free arena  |
 
 - `klio run` defaults to `fast`.
-- `klio test` defaults to `safe`: test programs are dispatch-heavy
-  rather than loop-heavy, so the JIT's per-block tracking costs more
-  than it saves there.
 - Aliases are accepted: `full`/`on` for `fast`, `balanced` for
   `safe`, `none`/`interp` for `off`.
 
 ```sh
-klio run --opt safe program.kt
+klio run --opt off program.kt
 KLIO_OPT=off klio run program.kt
 ```
 
-Granular environment variables override individual fields on top of
-the profile, mainly for diagnosis: `KLIO_JIT` (loop tier),
-`KLIO_FUNC_JIT` (function tier; implies the loop tier), and
-`KLIO_RECLAIM` (`gc`, `arena`, `smp`, `debug`).
+`KLIO_RECLAIM` (`gc`, `arena`, `smp`, `debug`) overrides the backend on
+top of the profile, mainly for diagnosis.
 
-## The JIT
-
-The `jit` module (`src/jit/`) is a tiered native compiler. The
-compilation logic lives in `src/ir/jit_loop.zig` and is
-architecture-neutral: it programs a fixed-role register machine
-against an emitter API, and the backend is selected at comptime per
-target:
-
-- **x86-64** (`src/jit/jit.zig`) — System V calling convention.
-- **AArch64** (`src/jit/arm64.zig`) — mirrors the x86-64 emitter API
-  method-for-method (AAPCS64), so Apple Silicon and other ARM64
-  hosts get native code, not a fallback.
-
-Two tiers exist. The **loop tier** compiles hot loop bodies; the
-**function tier** compiles whole functions, including native
-recursion, and rides on the loop tier. Executable memory is managed
-W^X — pages are never writable and executable at once, using
-`MAP_JIT` and per-thread write protection on macOS.
-
-Per-function counters, compile attempts, inferred return types, and compiler
-scratch use the runtime's packed slab allocator. They must not use the OS page
-allocator: macOS rounds each small allocation to a 16 KB page, and a framework
-that first-touches thousands of cold functions would otherwise reserve several
-pages per function without producing native code. Only finalized executable
-buffers use the dedicated W^X mapping path.
-
-The JIT is strictly additive: any IR shape the compiler does not
-support falls back to the interpreter with identical semantics. The
-parity and stdlib-commontest suites are the gate that the compiled
-and interpreted paths agree.
+The arm64 function and loop JIT that once compiled the old
+interpreter's instructions is kept for reference in `archive/jit/`;
+nothing builds it.
 
 ## The garbage collector
 
@@ -92,7 +59,7 @@ ownership and must be freed when a fallback consumes or rejects them. The
 native stack or by the active intrinsic FQN.
 
 The full design, including the root-completeness analysis, is in
-`docs/design/GC.md`; the JIT design record is `docs/design/JIT-DESIGN.md`.
+`docs/design/GC.md`.
 
 ## The base image cache
 

@@ -95,8 +95,7 @@ The interpreter resolves its stdlib pack in this order:
 ## Environment variables
 
 - `KLIO_OPT=fast|safe|off` — the performance profile, same values as
-  `--opt`. The granular overrides `KLIO_JIT`, `KLIO_FUNC_JIT`, and
-  `KLIO_RECLAIM` layer on top for diagnosis
+  `--opt`. `KLIO_RECLAIM` overrides its memory backend for diagnosis
   ([details](../architecture/performance.md)).
 - `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack` — use an on-disk
   stdlib pack instead of the checkout or the embedded bytes. Useful

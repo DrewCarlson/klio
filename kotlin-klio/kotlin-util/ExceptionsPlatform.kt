@@ -5,7 +5,7 @@
  */
 package kotlin
 
-import java.lang.StackTraceElement
+import klio.StackTraceElement
 
 /**
  * Returns an array of stack trace elements representing the stack trace

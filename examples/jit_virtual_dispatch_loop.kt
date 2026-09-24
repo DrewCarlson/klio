@@ -1,7 +1,5 @@
-// A hot loop dispatching through an interface to two implementations: the
-// polymorphic shape the whole-function tier DOES win on (the interpreter pays
-// full virtual dispatch per call). Output must match with the JIT off
-// (--opt safe) or on (default).
+// A loop dispatching through an interface (`Op`) to two implementations,
+// alternating by index.
 interface Op { fun apply(a: Int): Int }
 class Inc : Op { override fun apply(a: Int): Int = a + 1 }
 class Dbl : Op { override fun apply(a: Int): Int = a * 2 }

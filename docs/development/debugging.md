@@ -249,9 +249,6 @@ engine runtime are the only compose path; the lowering always runs.
 |----------|--------|--------------------|------------|
 | `KLIO_COMPOSER_BIND_TRACE` | set | Each call that threads the `$composer, $changed` pair: the owning declaration and the composer's class (a non-Composer instance in the pair slot also dumps the frame chain) | `[composer-bind-fn]`, `[composer-bind]` |
 | `KLIO_RSS_LOG` | set | Prints process RSS on each rendered Compose UI frame | `[rss]` |
-| `KLIO_FJ_ESCAPE` | `1` enables | Lets a compiled body call back into the interpreter for one instruction instead of declining the whole function. Off: it widened acceptance with execution time unchanged, because an escaped instruction costs what the interpreter would have | — |
-| `KLIO_FJ_SELF_INLINE` | `0` disables | The whole-function tier splices a self call (`this.helper(...)`) whose callee is scalar control flow over its own registers, reading and writing `this` only through the field sites. On by default: the receiver Move such a call needs is otherwise what makes the whole method uncompilable | `[jit] inlining self-call` |
-| `KLIO_FJ_DIRECT` | `0` disables | A self call the splice cannot take goes STRAIGHT into the callee's compiled code — a deopt-free method body over the same receiver, so no frame, no boxing, no host callback. On by default; without it such a call is a trampoline site, which also costs the caller its frameless seam | `[jit] direct call` |
 | `KLIO_CTOR_TRACE` | set | Every secondary-constructor side-table lookup: the key, how many entries it found, and each entry's parameter/default counts. The table that decides whether a defaulted secondary constructor can take a call | `[ctor]` |
 | `KLIO_CTOR_PICK` | `0` disables | The link pass that names the constructor each construction site reaches. Off leaves every construction on the runtime's value scoring | — |
 | `KLIO_CTOR_PICK_SERVE` | `0` disables | Whether a construction takes the constructor its site named. Off with the pass still on measures the pass without serving it | — |
@@ -293,7 +290,7 @@ engine runtime are the only compose path; the lowering always runs.
 | `KLIO_PARA_TRACE` | set | Traces SkParagraph text-layout construction (font/unicode readiness, lengths) | `[para]` |
 | `KLIO_DRAW_TRACE` | set | Each canvas rect draw with its surface, geometry, and color | `[draw]` |
 
-## Performance profile, JIT, and profiler
+## Performance profile and profiler
 
 The profile itself (`--opt` / `KLIO_OPT`) is documented in
 [Performance](../architecture/performance.md); the granular
@@ -301,8 +298,7 @@ variables override individual fields on top of it.
 
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
-| `KLIO_OPT` | `fast`/`safe`/`off` (aliases: `full`, `on`, `balanced`, `none`, `interp`) | Selects the performance profile: JIT tiers plus memory backend. `klio run` defaults to `fast`, `klio test` to `safe` | none |
-| `KLIO_JIT` | `1` on, `0` off | Loop-tier JIT override on top of the profile (on by default under `fast`) | none |
+| `KLIO_OPT` | `fast`/`safe`/`off` (aliases: `full`, `on`, `balanced`, `none`, `interp`) | Selects the performance profile, which picks the memory backend: `fast` and `safe` the tracing collector, `off` an arena | none |
 | `KLIO_FLAT` | `0` off (default on) | The flat call driver; `0` falls back to native recursion for every call (bisect) | none |
 | `KLIO_FLAT_VCALL` | `0` off (default on) | The fused virtual flat path; `0` keeps slot-bound and lowering-resolved member calls on the recursive invoker (bisect) | none |
 | `KLIO_MEMBER_SITE` | `0` off (default on) | The `CallMember` instruction-site memo — the by-name replay path; `0` disables for bisection | none |
@@ -310,8 +306,6 @@ variables override individual fields on top of it.
 | `KLIO_CM_TRACE` | `<member name>` | At every CallMember execution of that name: the executing frame, whether lowering resolved it, and the full enclosing-`this` chain with entry kinds — the receiver-visibility debugger for member-extension dispatch | `[cmarm]` |
 | `KLIO_GF_TRACE` | `<substr of a field name>` | Every GetField execution whose field name matches: field, receiver class, executing frame — pairs with `KLIO_CM_TRACE` to separate a wrong read from a wrong dispatch | `[gfarm]` |
 | `KLIO_RSEL_TRACE` | set | Every compatibility receiver re-selection at a receiver-lambda invoke: the recorded head, the passed receiver, and what was selected | `[rsel]` |
-| `KLIO_FUNC_JIT` | `1` on, `0` off | Whole-function JIT override; turning it on also forces the loop tier on | none |
-| `KLIO_JIT_DEBUG` | set; `0`/empty off | Per-decision JIT tracing: compile, bail, inline, evict | `[jit]` |
 | `KLIO_RECLAIM` | `gc`, `arena`, `smp`/`free`/`1`, `debug`, `0` | Memory backend override (and whether refcount teardown is active); the profile default is the tracing GC | none |
 | `KLIO_PROF` | set; value = sampling interval in microseconds (default 1000, floor 100) | Statistical SIGPROF profiler on Linux and macOS; prints a by-function sample histogram to stderr at the end of the run. On macOS the in-process symbolizer resolves nothing: dump raw addresses with `KLIO_PROF_RAW` and fold them with `scripts/prof_symbolize.py`. The timer is per process, so a phase on ten threads is undercounted; the shares within a phase still hold | `[prof]` |
 | `KLIO_PROF_ALL` | set (needs `KLIO_PROF`) | Widens profiling to the whole process, including startup and image decode | `[prof]` |
@@ -490,7 +484,7 @@ usually the root cause), `[errtrace]` dumps the frame chain, and in
 Darwin resolves every `threadlocal` access through a `_tlv_get_addr` CALL rather
 than a register-relative load, and LLVM can only hoist that call within a
 function — so in an interpreter the cost lands on every hot helper. It measured
-25% of samples on a member-call loop, with the JIT on and off alike.
+25% of samples on a member-call loop.
 
 `src/runtime/tls_fast.zig` answers it: the thread that calls `claimOwner()` at
 process entry reads the hot per-thread structures (the fused walker's banks,
@@ -502,7 +496,7 @@ exactly as before.
 
 Two things to know before extending it:
 
-- It is NOT a win everywhere. The evaluator's own `EvalTls` is read on the JIT's
+- It is NOT a win everywhere. The evaluator's own `EvalTls` is read on the
   per-call seam, where the compare that replaces the call costs more than the
   call did; it is deliberately left a plain threadlocal, and the comment at its
   declaration says so with the numbers.

@@ -9,7 +9,6 @@ const root_ir = @import("../ir.zig");
 const ids = @import("ids.zig");
 const class_mod = @import("class.zig");
 const func_mod = @import("func.zig");
-const jit_cache = @import("../jit_loop/cache.zig");
 const snapshot_fast = @import("../snapshot_fast.zig");
 const compose_fast = @import("../compose_fast.zig");
 
@@ -67,6 +66,8 @@ pub const Resolved = struct {
     well_known: WellKnownSlots = .initFill(null),
     /// The objects natives need a reference to.
     well_known_objects: WellKnownObjects = .initFill(null),
+    /// The top-level properties host fast paths read.
+    well_known_statics: WellKnownStatics = .initFill(null),
     host_class: HostClasses = .{},
     /// The classes of the exceptions the VM raises itself.
     exceptions: Exceptions = .{},
@@ -221,15 +222,9 @@ pub const ClassRt = struct {
     seeds: []const SlotSeed = &.{},
     /// Objects and companions: the constructor `LoadObject` runs.
     object_ctor: u32 = NO_FUNC,
-    /// Objects and companions: the JVM class whose initialization builds
-    /// the singleton, as a failure names it: the object's binary name, or
-    /// for a companion its outer class's.
+    /// Objects and companions: the singleton as a failed initialization
+    /// names it, `object pkg.Outer.Inner` or `object pkg.Box.Companion`.
     init_name: []const u8 = "",
-    /// The class's JVM name, as `getClass().getName()` answers it: its
-    /// package, then its nesting joined by `$`, and `java.lang.Throwable`
-    /// for `kotlin.Throwable`. Empty where the builder gives none; the
-    /// class's Kotlin FQN then stands in.
-    jvm_name: []const u8 = "",
     /// A class extending one whose constructor is the host's (a program's
     /// `ArrayList` subclass): the slot holding the host value its
     /// superclass constructor made, which the host's members act on.
@@ -337,25 +332,21 @@ pub fn hostKey(buf: []u8, fqn: []const u8, kind: MemberKind) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, fqn }) catch null;
 }
 
-/// Names a function as a JVM stack frame does, `Class.method`, for a
-/// throwable's trace; null where the namer cannot say.
+/// Names a function as a stack frame shows it, its Kotlin qualified
+/// declaration (`pkg.Outer.f`), for a throwable's trace; null where the
+/// namer cannot say.
 pub const FrameNamer = struct {
     ctx: *anyopaque,
     name: *const fn (ctx: *anyopaque, f: FuncId) ?[]const u8,
-    /// Whether `f` is a parameterless `main`, which kotlinc calls from a
-    /// synthetic `main(String[])`: a trace that reaches it ends with that
-    /// frame, its file and no line.
-    entry_bridge: *const fn (ctx: *anyopaque, f: FuncId) bool,
 };
 
 /// The compiler intrinsics the host answers: `coroutineContext` is the
 /// active coroutine's context; `generated_serializer` is the serializer
 /// the serialization plugin generates for a class (`Resolved.serializers`);
 /// `stack_frames` is the frames a throwable's throw captured, each
-/// rendered `Class.method(File.kt:line)`; `print_err` writes a line to
-/// standard error; `jvm_class_name` is a value's JVM class name
-/// (`ClassRt.jvm_name`).
-pub const HostOp = enum { none, coroutine_context, generated_serializer, stack_frames, print_err, jvm_class_name };
+/// rendered `pkg.f(File.kt:line)`; `print_err` writes a line to standard
+/// error.
+pub const HostOp = enum { none, coroutine_context, generated_serializer, stack_frames, print_err };
 
 /// Where a class's generated `serializer(...)` lives: on its companion, or
 /// on an object itself.
@@ -373,6 +364,10 @@ pub const WellKnownSlots = std.enums.EnumArray(runtime.WellKnown, ?MethodSlotId)
 /// By `runtime.WellKnownObject`: the object's class, null where no source
 /// declares it.
 pub const WellKnownObjects = std.enums.EnumArray(runtime.WellKnownObject, ?ClassId);
+
+/// By `runtime.WellKnownStatic`: the property's static, null where no
+/// source declares it.
+pub const WellKnownStatics = std.enums.EnumArray(runtime.WellKnownStatic, ?ids.StaticId);
 
 /// What a closure lowered from sema is, beside the function its body runs.
 pub const Callable = union(enum) {
@@ -591,7 +586,7 @@ pub fn isContinuationForm(r: *const Resolved, sub: ClassId, sup: ClassId) bool {
     return false;
 }
 
-/// Keeps the leaf, fused and function-JIT tiers and the name-classified
+/// Keeps the leaf and fused tiers and the name-classified
 /// host serves off a body lowered from sema, so the frame interpreter runs it.
 pub fn declineTiers(f: *func_mod.Func) void {
     f.leaf_hopeless = 1;
@@ -599,7 +594,6 @@ pub fn declineTiers(f: *func_mod.Func) void {
     // The fused tier runs the static calls lowered from sema and classifies
     // the body on its first call.
     f.fuse_state = 0;
-    _ = f.func_jit_probe.fetchOr(jit_cache.PROBE_DECLINED, .monotonic);
     f.host_route = @intFromEnum(snapshot_fast.Route.none);
     f.compose_route = @intFromEnum(compose_fast.Route.none);
     f.throw_route = 1;
@@ -721,7 +715,6 @@ test "declined tiers stay declined and no name classifies the body" {
     try std.testing.expectEqual(@as(u8, 1), f.leaf_hopeless);
     // The fused tier classifies the body on its first call.
     try std.testing.expectEqual(@as(u8, 0), f.fuse_state);
-    try std.testing.expect(f.func_jit_probe.load(.monotonic) & jit_cache.PROBE_DECLINED != 0);
     try std.testing.expectEqual(@intFromEnum(snapshot_fast.Route.none), f.host_route);
     try std.testing.expectEqual(@intFromEnum(compose_fast.Route.none), f.compose_route);
     try std.testing.expectEqual(@as(u8, 1), f.throw_route);

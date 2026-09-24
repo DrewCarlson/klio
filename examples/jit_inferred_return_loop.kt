@@ -1,10 +1,7 @@
-// Functions with inferred (expression-body) return types — no `: T` annotation —
-// called in hot loops. The loop JIT infers each callee's scalar return type from
-// its body (parameters carry declared types, arithmetic promotes per Kotlin's
-// rules), so the result can be slot-typed and the call trampolined. Covers an
-// Int-inferred top-level function, an Int+Long -> Long promotion, and a
-// polymorphic method with an inferred return. Output must match with the JIT off
-// (default) or on (KLIO_JIT=1).
+// Functions and methods with inferred (expression-body) return types, no
+// `: T` annotation, called in loops: an Int-inferred top-level function, an
+// Int+Long -> Long promotion, and a polymorphic method with an inferred
+// return type.
 fun sq(x: Int) = x * x
 fun mix(a: Int, b: Long) = a + b
 

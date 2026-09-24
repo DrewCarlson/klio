@@ -1,7 +1,7 @@
 // A failing object initializer compiled to C fails as JVM class
 // initialization does: the first use gets an ExceptionInInitializerError
 // over what the initializer threw (an Error is rethrown itself), and every
-// later use a NoClassDefFoundError naming the class, caused by an
+// later use a NoClassDefFoundError naming the object, caused by an
 // ExceptionInInitializerError that names the first failure.
 object Config {
     val items = mutableListOf("a")

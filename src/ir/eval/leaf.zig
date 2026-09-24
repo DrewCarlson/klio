@@ -139,7 +139,7 @@ pub fn leafExprServeAt(
     var pin: ?usize = null;
     defer if (pin) |m| runtime.keepaliveRestore(m);
     const fs: ?*const bc.FuncStreams = if (bc.enabled())
-        bc.funcStreams(func, !func.bc_jit_owned, module.consts.items)
+        bc.funcStreams(func, true, module.consts.items)
     else
         null;
     const out = (if (fs) |f|

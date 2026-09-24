@@ -1,10 +1,5 @@
-// `i.toLong()` on a scalar lowers to a virtual call and `xor`/`shr` to member
-// calls, so both used to be registered as trampoline sites: a host callback per
-// iteration to do two instructions' worth of work, which made the compiled loop
-// SLOWER than the interpreter. The emitter has always had an inline form for
-// them; the site passes just did not recognize the call spelling.
-//
-// Output must match with the JIT off (--opt safe) or on.
+// `Int.toLong()`, `xor`, and `shr` combined in a loop, plus a separate loop
+// doing `Int.toDouble()` conversion and division.
 fun main() {
     var i = 0
     var acc = 0L

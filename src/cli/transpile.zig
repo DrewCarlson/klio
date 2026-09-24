@@ -68,7 +68,7 @@ pub fn buildProgram(gpa: Allocator, arena: Allocator, map: *span.SourceMap, path
         io.printStderr(gpa, "error: out of memory\n", .{});
         return null;
     }) orelse {
-        io.printStderr(gpa, "error: no `main` function in class {s}\n", .{pipeline.mainClassName(arena, s) catch ""});
+        io.printStderr(gpa, "error: no `main` function in {s}\n", .{pipeline.mainFileName(s)});
         return null;
     };
     const main = built.br.funcOfOpt(main_sym) orelse {

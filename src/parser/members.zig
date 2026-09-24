@@ -550,14 +550,13 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         _ = bump(p);
         skipNl(p);
         init = exprmod.parseExpr(p);
-    } else if (explicit_field == null) {
-        if (peekIdentText(p)) |t| {
-            if (std.mem.eql(u8, t, "by")) {
-                _ = bump(p);
-                skipNl(p);
-                delegate = exprmod.parseExpr(p);
-            }
-        }
+    } else if (explicit_field == null and nextSignificantIsBy(p)) {
+        // `by` may start the next line: `var o: String` then `by
+        // Delegates.observable("O") { ... }`.
+        skipNl(p);
+        _ = bump(p);
+        skipNl(p);
+        delegate = exprmod.parseExpr(p);
     }
     if (allow_accessors and explicit_field == null and (init != null or delegate != null)) {
         if (scanFieldClause(p, false)) |scan| {

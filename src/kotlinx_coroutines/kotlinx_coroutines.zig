@@ -117,16 +117,7 @@ fn reportUndeliveredUnhandled(ctx: *CallCtx, err: RuntimeError, scope_in: Value)
     // `handleCoroutineException`, whose no-handler tail re-enters the runtime
     // from inside a cancellation unwind. The context key is the interface's
     // companion.
-    const key = (ctx.host.wellKnownObject(.coroutine_exception_handler_key) catch return) orelse blk: {
-        // A host that finds objects by name: the interface's companion.
-        var k = ctx.host.lookupGlobal("CoroutineExceptionHandler") orelse return;
-        if (k == .Class) {
-            if (ctx.host.getProperty(&k, "Key", ctx.out) catch null) |r| {
-                if (r == .ok and r.ok != .Null) k = r.ok;
-            }
-        }
-        break :blk k;
-    };
+    const key = (ctx.host.wellKnownObject(.coroutine_exception_handler_key) catch return) orelse return;
     const got = (ctx.host.callWellKnown(&coro_ctx, .context_get, &.{key}, ctx.out) catch return) orelse return;
     const handler = switch (got) {
         .ok => |v| v,
@@ -316,7 +307,7 @@ fn spawnLaunchBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return .{ .err = .{ .Type = "__kxco_spawn: expected the launch block as the first arg" } };
     }
     const lam = ctx.args[0];
-    const scope = ctx.host.lookupGlobal("GlobalScope") orelse Value.Null;
+    const scope = (try ctx.host.wellKnownObject(.global_scope)) orelse Value.Null;
     if (try ctx.host.coroutineLaunch(&lam, &scope, ctx.out)) |e| {
         return .{ .err = e };
     }

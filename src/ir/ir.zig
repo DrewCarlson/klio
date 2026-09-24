@@ -22,7 +22,6 @@ pub const FileId = span.FileId;
 pub const eval = @import("eval.zig");
 pub const bc = @import("bc.zig");
 pub const hot_layout = @import("hot_layout.zig");
-pub const jit_loop = @import("jit_loop.zig");
 pub const disasm = @import("disasm.zig");
 pub const site_census = @import("site_census.zig");
 pub const exec_call = @import("exec_call.zig");

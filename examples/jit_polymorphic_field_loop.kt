@@ -1,8 +1,7 @@
-// The same hot loop entered with receivers of different classes. The loop JIT
-// caches a loop-invariant receiver's field buffer at entry and reads the field by
-// its resolved index, so entry proves the receiver still has the class those
-// indices were resolved against: `v` is field 1 on `A` and field 0 on `B`.
-// Output must match with the JIT off (--opt safe) or on (default).
+// The same loop run over receivers of different classes implementing a
+// shared interface (`HasV`), where the interface property sits at a
+// different field index on each implementing class (`v` is field 1 on `A`
+// and field 0 on `B`).
 interface HasV {
     val v: Int
 }

@@ -9,7 +9,6 @@ const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("ir.zig");
 const span = @import("span");
-const jit_loop = @import("jit_loop.zig");
 const bc = @import("bc.zig");
 
 const Allocator = std.mem.Allocator;

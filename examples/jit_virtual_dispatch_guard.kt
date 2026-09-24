@@ -1,3 +1,6 @@
+// Interface dispatch through a `List<Op>` to different implementations,
+// including one swapped into the list mid-run (`ops[0] = Neg()`), so later
+// iterations dispatch to a different concrete class than earlier ones.
 interface Op { fun apply(a: Int): Int }
 class Inc : Op { override fun apply(a: Int): Int = a + 1 }
 class Dbl : Op { override fun apply(a: Int): Int = a * 2 }

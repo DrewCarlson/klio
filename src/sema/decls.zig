@@ -507,18 +507,19 @@ pub fn synthesizeMembers(s: *Sema, cls: Sym) Allocator.Error!void {
         }
     }
     // A data class, data object or value class gets `equals`, `hashCode`
-    // and `toString` of its own unless it declares them.
+    // and `toString` of its own unless it declares them or a superclass
+    // makes them final.
     if (s.syms.flags(cls).data or s.syms.flags(cls).value) {
         const any_q = s.t.any_q;
-        if (symbols.Symbols.members(&s.syms.classInfo(cls).members, wk.equals).len == 0) {
+        if (symbols.Symbols.members(&s.syms.classInfo(cls).members, wk.equals).len == 0 and !try inheritsFinal(s, cls, wk.equals, 1)) {
             const f = try synthFunction(s, cls, file, wk.equals, &.{.{ .name = try s.names.intern("other"), .ty = any_q }}, s.t.boolean, .{ .override = true, .operator = true, .modality = .open });
             s.syms.functionInfo(f).synth = .data_equals;
         }
-        if (symbols.Symbols.members(&s.syms.classInfo(cls).members, wk.hashCode).len == 0) {
+        if (symbols.Symbols.members(&s.syms.classInfo(cls).members, wk.hashCode).len == 0 and !try inheritsFinal(s, cls, wk.hashCode, 0)) {
             const f = try synthFunction(s, cls, file, wk.hashCode, &.{}, s.t.int, .{ .override = true, .modality = .open });
             s.syms.functionInfo(f).synth = .data_hash_code;
         }
-        if (symbols.Symbols.members(&s.syms.classInfo(cls).members, wk.toString).len == 0) {
+        if (symbols.Symbols.members(&s.syms.classInfo(cls).members, wk.toString).len == 0 and !try inheritsFinal(s, cls, wk.toString, 0)) {
             const f = try synthFunction(s, cls, file, wk.toString, &.{}, s.t.string, .{ .override = true, .modality = .open });
             s.syms.functionInfo(f).synth = .data_to_string;
         }
@@ -560,6 +561,26 @@ pub fn synthesizeMembers(s: *Sema, cls: Sym) Allocator.Error!void {
 /// The members a class gets from `: I by d`: each member of `I` (not of
 /// `Any`) the class does not declare itself, as a synthetic override whose
 /// signature is `I`'s as the class sees it, forwarding to the delegate.
+/// Whether a superclass of `cls` makes its `Any` member `n` (taking
+/// `arity` parameters) final: a data class then inherits it rather than
+/// generating its own (`data class D(val x: String) : Base()` for a
+/// `Base` with `final override fun toString()` prints what `Base` does).
+fn inheritsFinal(s: *Sema, cls: Sym, n: Name, arity: usize) Allocator.Error!bool {
+    const headers = @import("headers.zig");
+    const members = @import("members.zig");
+    for (try headers.supertypes(s, cls)) |st| {
+        for (try members.lookup(s, st, n, .function)) |m| {
+            if (s.syms.owner(m.sym) == s.builtins.any) continue;
+            if (s.syms.flags(m.sym).modality != .final) continue;
+            try headers.functionHeader(s, m.sym);
+            const info = s.syms.functionInfo(m.sym);
+            if (info.receiver != .none or info.params.len != arity) continue;
+            return true;
+        }
+    }
+    return false;
+}
+
 fn synthesizeDelegation(s: *Sema, cls: Sym) Allocator.Error!void {
     const headers = @import("headers.zig");
     const members = @import("members.zig");

@@ -1,11 +1,11 @@
 /*
- * The `java.lang` errors a failed class initialization raises, as the JVM
- * raises them for an object's, a companion's or a file's initializer: the
- * first use that runs the failing initializer gets an
- * `ExceptionInInitializerError` over what it threw (an `Error` it throws is
- * rethrown itself), and every later use a `NoClassDefFoundError`.
+ * The errors a failed initialization raises, for an object's, a companion's
+ * or a file's initializer: the first use that runs the failing initializer
+ * gets an `ExceptionInInitializerError` over what it threw (an `Error` it
+ * throws is rethrown itself), and every later use a `NoClassDefFoundError`.
+ * Kotlin has no common name for them; these are klio's.
  */
-package java.lang
+package klio
 
 /**
  * A class's dependence on another class that changed incompatibly, or whose

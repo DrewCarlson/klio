@@ -1,9 +1,7 @@
-// Loop-carried variables that a hot loop only ever WRITES, and only on a branch
-// the run may never take. The loop JIT keeps scalars in slots and writes every
-// written register back when the loop exits, so each of these has to start from
-// its live-in value: an unseeded slot reports zero, turning an untouched `true`
-// into `false` and an untouched running total into 0.
-// Output must match with the JIT off (--opt safe) or on (default).
+// Loop-carried variables (Boolean, Int, Double, Long) that a loop only ever
+// writes, and only on a branch the run may never take. Checks that an
+// untaken branch leaves the variable at its original value, and that a
+// branch which does fire still overwrites it correctly.
 fun main() {
     val bytes = ByteArray(500) { (it % 64).toByte() }
     val ints = IntArray(500) { it % 64 }

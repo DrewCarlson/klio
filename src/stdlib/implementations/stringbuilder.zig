@@ -202,7 +202,7 @@ fn appendOverflowGuard(ctx: *CallCtx, sb: StringBuilderRef, v: *const Value) All
         break :blk @intCast(g.get().items.len);
     };
     if (cur + add > std.math.maxInt(i32)) {
-        return try thrown(ctx.allocator, "java.lang.OutOfMemoryError", "Requested character sequence exceeds the maximum length");
+        return try thrown(ctx.allocator, "klio.OutOfMemoryError", "Requested character sequence exceeds the maximum length");
     }
     return null;
 }
@@ -447,7 +447,7 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                     buf.deinit(a);
                     const msg = try std.fmt.allocPrint(a, "{d}", .{n});
                     defer if (runtime.freeScratch()) a.free(msg);
-                    return thrown(a, "java.lang.NegativeArraySizeException", msg);
+                    return thrown(a, "klio.NegativeArraySizeException", msg);
                 }
                 try buf.ensureTotalCapacityPrecise(a, @intCast(n));
             },
@@ -1114,7 +1114,7 @@ test "string builder ctor negative capacity throws" {
     try testing.expect(r == .err);
     try testing.expect(r.err == .Thrown);
     defer freeSb(r.err.Thrown, a);
-    try testing.expectEqualStrings("java.lang.NegativeArraySizeException", r.err.Thrown.exceptionFqn().?);
+    try testing.expectEqualStrings("klio.NegativeArraySizeException", r.err.Thrown.exceptionFqn().?);
 }
 
 test "append concatenates values" {

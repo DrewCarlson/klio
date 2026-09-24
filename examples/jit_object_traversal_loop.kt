@@ -1,10 +1,6 @@
-// A hot loop that walks a linked structure: the cursor is a boxed object register
-// reassigned through an object field each iteration, the loop guard is an
-// object-vs-null test, and the body reads a scalar field and calls a method on the
-// node. The loop JIT keeps the cursor in the frame's register array (a GC root, so
-// it survives the method call) and drives the traversal natively, delegating each
-// object operation to a callback. Output must match with the JIT off (default) or
-// on (KLIO_JIT=1).
+// Walking a linked structure built from `Node` objects: the loop guard is a
+// null check on the `next` link, and the body reads a scalar field and calls
+// a method on each node.
 class Node(val v: Int, val next: Node?) {
     fun weight(): Int = v * 2
 }

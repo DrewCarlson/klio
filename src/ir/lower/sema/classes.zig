@@ -1194,10 +1194,8 @@ fn enumValueOf(b: *Builder, cls: Sym) Error!void {
 fn newThrowable(b: *Builder, fqn: []const u8, message: Reg) Error!Reg {
     const s = b.p.s;
     const br = b.p.br;
-    var cls = s.classByFqn(fqn);
-    // `kotlin.IllegalArgumentException` is a type alias of `java.lang`'s.
-    if (cls != .none and s.syms.kind(cls) == .type_alias) cls = s.types.classSym(try sema.headers.aliasTarget(s, cls));
-    if (cls == .none or s.syms.kind(cls) != .class) return b.fail(b.cur_span, "the base declares no `{s}`", .{fqn});
+    const cls = s.classByFqn(fqn);
+    if (cls == .none) return b.fail(b.cur_span, "the base declares no `{s}`", .{fqn});
     for (sema.symbols.Symbols.members(&s.syms.classInfo(cls).members, sema.wk.init)) |ctor| {
         if (s.syms.kind(ctor) != .constructor or s.syms.functionInfo(ctor).params.len != 1) continue;
         const f = br.funcOfOpt(ctor) orelse continue;

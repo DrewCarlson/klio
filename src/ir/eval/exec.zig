@@ -3,7 +3,6 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("../ir.zig");
-const jit_loop = @import("../jit_loop.zig");
 const bc = @import("../bc.zig");
 
 const Allocator = std.mem.Allocator;
@@ -40,7 +39,6 @@ const EvalResult = ev_flow.EvalResult;
 const EvalTls = ev_state.EvalTls;
 const FlatCallSite = ev_flow.FlatCallSite;
 const Frame = ev_frame.Frame;
-const LoopTramp = ev_loop.LoopTramp;
 const NATIVE_RECURSE_MAX_DEPTH = ev_native.NATIVE_RECURSE_MAX_DEPTH;
 const NativeCtx = ev_native.NativeCtx;
 const NativeFn = ev_native.NativeFn;
@@ -136,19 +134,8 @@ pub fn runFrameExec(
         return errResult(.{ .Type = "virtual method target is not executable" });
     }
     dumpFnIfRequested(frame.module, func);
-    const jit_on = jit_loop.enabled();
-    const tramp_ok = comptime @hasDecl(H, "callFunc");
-    var loop_ctx: if (tramp_ok) LoopTramp(H).Ctx else void =
-        if (tramp_ok) .{ .host = host, .allocator = allocator, .module = frame.module, .frame = frame } else {};
-    const tramp_fn: ?jit_loop.TrampFn = if (comptime tramp_ok) &LoopTramp(H).call else null;
-    const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
-    const member_resolver: ?jit_loop.MemberResolver =
-        if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
-    const virt_resolver: ?jit_loop.VirtResolver =
-        if (comptime tramp_ok and @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).resolveVirtual else null;
-    // The bytecode tier's per-func stream table, one lookup per activation. Fusion is per
-    // FUNCTION: only a function the loop JIT compiled into needs the unfused stream.
-    var bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !func.bc_jit_owned, module.consts.items) else null;
+    // The bytecode tier's per-func stream table, one lookup per activation.
+    const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, true, module.consts.items) else null;
     // The C transpiler's native table; empty in every non-transpiled process.
     const native_fn: ?NativeFn = if (nativeModuleOk(module)) nativeFor(func.id.int(), func.fqn) else null;
     if (native_fn == null and ev_native.native_any.load(.acquire) and
@@ -156,12 +143,6 @@ pub fn runFrameExec(
     {
         std.debug.print("[native-miss] fn={s} fid={d}\n", .{ func.fqn, func.id.int() });
     }
-    // The loop JIT's per-function state, one lookup per activation.
-    const jit_fj: ?*jit_loop.FuncJit = if (jit_on) jit_loop.forFunc(func) else null;
-    const field_resolver: ?jit_loop.FieldResolver =
-        if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
-    const field_nn_resolver: ?jit_loop.FieldResolver =
-        if (comptime tramp_ok and @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).resolveFieldNN else null;
     while (true) {
         // Daemon abandonment: a pool task at the run boundary stops at its next block, bypassing user catch/finally.
         if (runtime.shouldAbandon()) {
@@ -183,79 +164,6 @@ pub fn runFrameExec(
             resume_throw == null and resume_unwind == null)
         {
             runtime.gc.safePoint();
-        }
-        // Loop JIT (KLIO_JIT): a hot loop header compiles to native code and resumes at its exit block.
-        if (jit_fj != null and resume_idx == 0 and resume_throw == null and resume_unwind == null) {
-            // Compiled code reads and writes the raw register slice with no mask maintenance.
-            frame.materializeRegs();
-            if (jit_loop.maybeRunHotPre(jit_fj.?, frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |res| {
-                if (res.inst == jit_loop.THROW_INST) {
-                    // A trampolined call left an error pending: a throw resumes through the try-stack.
-                    if (comptime tramp_ok) {
-                        const e = loop_ctx.pending.?;
-                        loop_ctx.pending = null;
-                        switch (e) {
-                            .Throw => |exc| {
-                                resume_throw = exc;
-                                cur = res.block;
-                                continue;
-                            },
-                            // A trampolined callee SUSPENDED mid-loop: park this frame at the call site as
-                            // the interpreted path would. The native exit already reboxed the loop
-                            // registers, so the snapshot resumes right after the call.
-                            .Suspended => {
-                                park_out.* = .{
-                                    .block = res.block,
-                                    .inst_idx = @as(usize, loop_ctx.pending_suspend_inst) + 1,
-                                    .resume_reg = loop_ctx.pending_suspend_dst,
-                                };
-                                return errResult(e);
-                            },
-                            else => return errResult(e),
-                        }
-                    } else unreachable;
-                }
-                if (res.inst == jit_loop.DEOPT_INST) {
-                    // A field read deopted: re-execute it in the interpreter.
-                    if (comptime tramp_ok) {
-                        cur = res.block;
-                        resume_idx = loop_ctx.pending_deopt_inst;
-                        continue;
-                    } else unreachable;
-                }
-                cur = res.block;
-                resume_idx = res.inst;
-                continue;
-            }
-            // Whole-function JIT: run the whole body natively at the function entry.
-            if (comptime tramp_ok) {
-                // FRESH entry only: a resume would re-run the body and double its effects.
-                if (cur.int() == func.entry.int() and resume_idx == 0 and
-                    resume_throw == null and resume_unwind == null)
-                {
-                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, frame.captures.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
-                        if (fo.code.inst == jit_loop.RETURN_INST) {
-                            return ok(fo.value);
-                        }
-                        if (fo.code.inst == jit_loop.THROW_INST) {
-                            const e = loop_ctx.pending.?;
-                            loop_ctx.pending = null;
-                            switch (e) {
-                                .Throw => |exc| {
-                                    resume_throw = exc;
-                                    cur = fo.code.block;
-                                    continue;
-                                },
-                                else => return errResult(e),
-                            }
-                        }
-                        // Deopt: a handler-issued one carries the sentinel, a native one encodes it directly.
-                        cur = fo.code.block;
-                        resume_idx = if (fo.code.inst == jit_loop.DEOPT_INST) loop_ctx.pending_deopt_inst else fo.code.inst;
-                        continue;
-                    }
-                }
-            }
         }
         const block = &func.blocks[cur.int()];
         // Normal flow into a catch-only try's join pops the body's entry (see `Block.catch_done_for`).
@@ -517,15 +425,6 @@ pub fn runFrameExec(
                             return er;
                         }
                         const nb: BlockId = @enumFromInt(target);
-                        if (jit_fj) |fj| {
-                            // A back edge the stream follows itself, counted here so the JIT probe still sees it.
-                            if (nb.int() <= bcur.int() and jit_loop.streamBackEdge(fj, nb.int())) {
-                                if (bs.fused) bc_streams = bc.funcStreams(func, false, module.consts.items);
-                                cur = bcur;
-                                bc_goto = nb;
-                                break :bc_loop;
-                            }
-                        }
                         if (bs.streams[nb.int()]) |ns| {
                             bcur = nb;
                             binsts = frame.func.blocks[nb.int()].insts;
@@ -574,15 +473,6 @@ pub fn runFrameExec(
                             return er;
                         }
                         const nb: BlockId = @enumFromInt(if (taken.?) code[pc + 6] else code[pc + 7]);
-                        if (jit_fj) |fj| {
-                            // Same back-edge accounting: the frame loop's JIT probe never sees this edge.
-                            if (nb.int() <= bcur.int() and jit_loop.streamBackEdge(fj, nb.int())) {
-                                if (bs.fused) bc_streams = bc.funcStreams(func, false, module.consts.items);
-                                cur = bcur;
-                                bc_goto = nb;
-                                break :bc_loop;
-                            }
-                        }
                         if (bs.streams[nb.int()]) |ns| {
                             bcur = nb;
                             binsts = frame.func.blocks[nb.int()].insts;

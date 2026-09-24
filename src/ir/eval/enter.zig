@@ -5,7 +5,6 @@ const std = @import("std");
 const runtime = @import("runtime");
 const span = @import("span");
 const ir = @import("../ir.zig");
-const jit_loop = @import("../jit_loop.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -39,8 +38,6 @@ const EvalResult = ev_flow.EvalResult;
 const EvalTls = ev_state.EvalTls;
 const Frame = ev_frame.Frame;
 const LEAF_MAX_DEPTH = ev_leaf.LEAF_MAX_DEPTH;
-const LoopTramp = ev_loop.LoopTramp;
-const NATIVE_SLOT_BANK_DEPTH = ev_state.NATIVE_SLOT_BANK_DEPTH;
 const NullHost = ev_host.NullHost;
 const TryFrame = ev_snapshot.TryFrame;
 const callStatsBumpId = ev_diag.callStatsBumpId;
@@ -414,41 +411,6 @@ pub fn evalWithCapturesChained(
             var c = captures;
             c.deinit(allocator);
             return lr;
-        }
-    }
-    // The method tier at the seam: a deopt-free compiled body consults neither the chain nor any
-    // register file, so it runs frameless even under a chain seed. The seam also triggers the compile.
-    if (comptime @hasDecl(H, "plainStoredFieldIndex") and @hasDecl(H, "plainStoredScalarFieldNN") and @hasDecl(H, "resolveMemberFuncId")) {
-        switch (jit_loop.methodSeamProbe(func)) {
-            .run => |cl| if (args.items.len >= func.params.len and
-                ev_state.evtlsPtr().jit_native_depth < NATIVE_SLOT_BANK_DEPTH and cl.n_slots <= 192)
-            {
-                const banks = ev_state.native_banks.get();
-                const fslots: []i64 = &banks.slot[ev_state.evtlsPtr().jit_native_depth];
-                const ftags: []u8 = &banks.tag[ev_state.evtlsPtr().jit_native_depth];
-                ev_state.evtlsPtr().jit_native_depth += 1;
-                const fo = jit_loop.runFunc(cl, &.{}, args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
-                ev_state.evtlsPtr().jit_native_depth -= 1;
-                if (fo == null and runtime.envOnce("KLIO_JIT_DEBUG") != null) {
-                    std.debug.print("[jit]   seam run DECLINED {s}\n", .{func.name});
-                }
-                if (fo) |o| {
-                    if (o.code.inst == jit_loop.RETURN_INST) {
-                        var aa = args;
-                        aa.deinit(allocator);
-                        var cc = captures;
-                        cc.deinit(allocator);
-                        return ok(o.value);
-                    }
-                }
-                // Guard or kind decline: the body never executed, so run it framed.
-            },
-            .compile => {
-                // Compile-only resolver context: the resolvers read host and allocator, never `frame`.
-                var cctx: LoopTramp(H).Ctx = .{ .host = host, .allocator = allocator, .module = module, .frame = undefined };
-                jit_loop.methodSeamCompile(module, func, args.items, &LoopTramp(H).resolveMember, &LoopTramp(H).resolveVirtual, &LoopTramp(H).resolveField, &LoopTramp(H).resolveFieldNN, @ptrCast(&cctx));
-            },
-            .no => {},
         }
     }
     // The fused tier at the same seam: no Frame at all, raising real errors rather than abandoning.

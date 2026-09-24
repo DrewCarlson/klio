@@ -1,10 +1,8 @@
-// Kotlin's exceptions are the JVM's: `IllegalStateException` is a type
-// alias of `java.lang.IllegalStateException`, and `NoSuchElementException`
-// of `java.util`'s, so an instance's class, its `toString` and its
-// `::class.qualifiedName` name the JVM class. `toString` names the class as
-// `getClass().getName()` does: a nested class after `$`, and
-// `java.lang.Throwable` for `Throwable`, whose `qualifiedName` stays
-// `kotlin.Throwable`.
+// A throwable's `toString` names its class by its Kotlin qualified name:
+// `kotlin.IllegalStateException`, a nested class as `demo.Outer.Inner`, and
+// `kotlin.Throwable` for `Throwable`. The exceptions Kotlin has no common
+// name for, such as an array index out of range, are klio's own, in package
+// `klio`, and `catch` finds them by their Kotlin supertypes too.
 package demo
 
 class Outer {
