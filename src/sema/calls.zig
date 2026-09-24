@@ -672,10 +672,27 @@ fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, ar
             level.shrinkRetainingCapacity(kept);
         }
     }
-    // No candidate at all: the diagnostic names the type looked on.
+    // No candidate at all: a supertype's private function, which the
+    // receiver does not inherit, is the one named, and it is invisible.
     const none = for (levels.items) |level| {
         if (level.items.len != 0) break false;
     } else true;
+    if (none and members_apply) {
+        var hidden = newLevel();
+        for (try members.lookupWithPrivate(s, rt, n, .function)) |m| {
+            try headers.functionHeader(s, m.sym);
+            if (s.syms.functionInfo(m.sym).receiver != .none) continue;
+            try hidden.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv_src, .defaults = m.defaults });
+        }
+        if (hidden.items.len != 0) {
+            // Where the member's class could see it, the call's own check
+            // does not refuse it; the receiver's type still does.
+            if (!generatedFile(ctx) and try memberVisible(ctx, hidden.items[0].sym)) {
+                try ctx.reportFacts(.invisible, id.span, .{ .name = id.name, .syms = try ctx.arena().dupe(Sym, &.{hidden.items[0].sym}) }, "{s}", .{id.name});
+            }
+            return resolveLevels(ctx, &.{hidden}, id, args, trailing, type_args, expected);
+        }
+    }
     if (none) {
         try finishArgsBlind(ctx, args);
         try ctx.reportFacts(.unresolved_call, id.span, .{ .name = id.name, .on = try sema_mod.diagnose.typeText(s, s.arena, rt) }, "{s}", .{id.name});
@@ -3241,8 +3258,25 @@ pub fn propertyAccess(ctx: *Ctx, t_in: TypeId, n: Name, sp: Span, access: body.A
         try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = kind, .target = ext.sym, .extension = recv, .dispatch = ext.dispatch, .contexts = ext.contexts });
         return ext.ty;
     }
+    // Nothing else answers: a supertype's private property, which the
+    // receiver does not inherit, is the one named, and it is invisible
+    // but to a compiler plugin's generated code.
+    const hidden = try members.withoutExtensionProperties(s, try members.lookupWithPrivate(s, t, n, .property));
+    if (hidden.len != 0) {
+        const m = hidden[0];
+        if (!generatedFile(ctx)) try ctx.reportFacts(.invisible, sp, .{ .name = s.str(n), .syms = try ctx.arena().dupe(Sym, &.{m.sym}) }, "{s}", .{s.str(n)});
+        const cx = (try propertyContexts(ctx, m.sym, m.subst)) orelse &.{};
+        try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = kind, .target = m.sym, .dispatch = recv, .contexts = cx });
+        return members.memberType(s, m);
+    }
     try ctx.reportFacts(.unresolved_member, sp, .{ .name = s.str(n), .on = try sema_mod.diagnose.typeText(s, s.arena, t) }, "{s}.{s}", .{ try sema_mod.render.typeStr(s, s.arena, t), s.str(n) });
     return s.types.errType();
+}
+
+/// Whether the code being resolved is a compiler plugin's.
+fn generatedFile(ctx: *const Ctx) bool {
+    const fc = ctx.s.fileOf(ctx.file) orelse return false;
+    return fc.generated;
 }
 
 /// A member or extension property `n` on `t` read by a destructuring by

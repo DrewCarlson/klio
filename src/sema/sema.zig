@@ -45,6 +45,10 @@ pub const SourceFile = struct {
     /// Where the file comes from: the base library set, a pack, or the
     /// program. The census reports each separately.
     origin: Origin,
+    /// Written by a compiler plugin (the serializers kotlinx.serialization
+    /// generates), whose code reads what the plugin's own bytecode may:
+    /// a superclass's private property.
+    generated: bool = false,
 };
 
 pub const Origin = enum(u8) { base, pack, program };
@@ -53,6 +57,7 @@ pub const FileCtx = struct {
     ast: *const ast.KotlinFile,
     path: []const u8,
     origin: Origin,
+    generated: bool = false,
     package: Sym,
     /// Built on first use by `scope.fileScope`.
     imports: ?*scope.FileImports = null,

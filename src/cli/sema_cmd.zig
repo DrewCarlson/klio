@@ -1098,7 +1098,7 @@ const Serial = struct {
             sf.* = if (k < pack_files.len)
                 .{ .ast = f, .path = pack_files[k].path, .origin = .pack }
             else
-                .{ .ast = f, .path = map.get(f.span.file).path, .origin = .pack };
+                .{ .ast = f, .path = map.get(f.span.file).path, .origin = .pack, .generated = true };
         }
         return .{ .pack_originals = originals, .packs = packs, .n_pack_generated = out.len - pack_files.len };
     }
@@ -1119,7 +1119,7 @@ const Serial = struct {
         var files: std.ArrayList(sema.SourceFile) = .empty;
         for (programs, out[n_p..input.len]) |p, *f| try files.append(a, .{ .ast = f, .path = p.path, .origin = .program });
         for (out[input.len + self.n_pack_generated ..]) |*f| {
-            try files.append(a, .{ .ast = f, .path = map.get(f.span.file).path, .origin = .program });
+            try files.append(a, .{ .ast = f, .path = map.get(f.span.file).path, .origin = .program, .generated = true });
         }
         return files.items;
     }

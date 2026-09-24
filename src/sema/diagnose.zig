@@ -126,11 +126,63 @@ fn ambiguous(s: *Sema, a: Allocator, n: []const u8, cands: []const Sym) Allocato
     return buf.items;
 }
 
+/// kotlinc's `cannot access 'val x: String': it is private in 'Base'.`,
+/// the declaration rendered as kotlinc renders it.
 fn invisible(s: *Sema, a: Allocator, n: []const u8, syms: []const Sym) Allocator.Error![]const u8 {
-    if (syms.len == 0) return std.fmt.allocPrint(a, "cannot access `{s}`", .{n});
+    if (syms.len == 0) return std.fmt.allocPrint(a, "cannot access '{s}'.", .{n});
     const m = syms[0];
     const vis = if (s.syms.flags(m).visibility == .private) "private" else "protected";
-    return std.fmt.allocPrint(a, "cannot access `{s}`: it is {s} in `{s}`", .{ n, vis, s.str(s.syms.name(s.syms.owner(m))) });
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(a, "cannot access '");
+    try writeDeclaration(s, a, &buf, m);
+    try buf.print(a, "': it is {s} in '{s}'.", .{ vis, s.str(s.syms.name(s.syms.owner(m))) });
+    return buf.items;
+}
+
+/// `val x: String`, `var n: Int`, `fun f(x: Int): String`,
+/// `constructor(x: Int)`: a declaration as kotlinc's diagnostics show it.
+fn writeDeclaration(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), m: Sym) Allocator.Error!void {
+    switch (s.syms.kind(m)) {
+        .property => {
+            try headers.propertyHeader(s, m);
+            try buf.appendSlice(a, if (s.syms.flags(m).mutable) "var " else "val ");
+            const recv = s.syms.propertyInfo(m).receiver;
+            if (recv != .none) {
+                try writeType(s, a, buf, recv);
+                try buf.append(a, '.');
+            }
+            try buf.appendSlice(a, s.str(s.syms.name(m)));
+            try buf.appendSlice(a, ": ");
+            try writeType(s, a, buf, try headers.propertyType(s, m));
+        },
+        .function, .constructor => {
+            try headers.functionHeader(s, m);
+            const info = s.syms.functionInfo(m);
+            if (s.syms.kind(m) == .constructor) {
+                try buf.appendSlice(a, "constructor");
+            } else {
+                try buf.appendSlice(a, "fun ");
+                if (info.receiver != .none) {
+                    try writeType(s, a, buf, info.receiver);
+                    try buf.append(a, '.');
+                }
+                try buf.appendSlice(a, s.str(s.syms.name(m)));
+            }
+            try buf.append(a, '(');
+            for (info.params, 0..) |p, i| {
+                if (i != 0) try buf.appendSlice(a, ", ");
+                if (s.syms.flags(p).vararg) try buf.appendSlice(a, "vararg ");
+                try buf.print(a, "{s}: ", .{s.str(s.syms.name(p))});
+                try writeType(s, a, buf, try headers.paramType(s, p));
+            }
+            try buf.append(a, ')');
+            if (s.syms.kind(m) == .function) {
+                try buf.appendSlice(a, ": ");
+                try writeType(s, a, buf, try headers.returnType(s, m));
+            }
+        },
+        else => try buf.appendSlice(a, s.str(s.syms.name(m))),
+    }
 }
 
 fn uninferred(s: *Sema, a: Allocator, n: []const u8, tps: []const Sym) Allocator.Error![]const u8 {

@@ -70,7 +70,7 @@ pub fn collectFile(s: *Sema, f: sema_mod.SourceFile) Allocator.Error!void {
     const pkg_path: []const ast.Ident = if (f.ast.package) |p| p.path else &.{};
     const pkg = try packageFor(s, pkg_path);
     const file_index: u32 = @intCast(s.files.items.len);
-    try s.files.append(s.arena, .{ .ast = f.ast, .path = f.path, .origin = f.origin, .package = pkg });
+    try s.files.append(s.arena, .{ .ast = f.ast, .path = f.path, .origin = f.origin, .generated = f.generated, .package = pkg });
     const ctx = Ctx{ .s = s, .file = file_index, .prefix = packageFqnStr(s, pkg) };
     for (f.ast.decls) |*d| try collectDecl(ctx, d, pkg, .top_level);
     // An import alias binds a name the way a declaration does; interned

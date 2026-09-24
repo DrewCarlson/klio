@@ -234,6 +234,33 @@ pub fn fixture(sources: []const []const u8) !Fixture {
     return fx;
 }
 
+/// `fixture`, with `generated` added after `sources` as a compiler
+/// plugin's files.
+pub fn fixtureGenerated(sources: []const []const u8, generated: []const []const u8) !Fixture {
+    const arena = try std.testing.allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var fx = Fixture{ .arena = arena, .map = undefined, .s = undefined };
+    errdefer fx.deinit();
+    const a = fx.arena.allocator();
+    fx.map = span.SourceMap.init(a);
+    var files: std.ArrayList(sema_mod.SourceFile) = .empty;
+    try addSource(a, &fx.map, &files, "mini/kotlin.kt", mini_kotlin, .base);
+    try addSource(a, &fx.map, &files, "mini/collections.kt", mini_collections, .base);
+    try addSource(a, &fx.map, &files, "mini/standard.kt", mini_standard, .base);
+    for (sources, 0..) |src, i| {
+        const path = try std.fmt.allocPrint(a, "test{d}.kt", .{i});
+        try addSource(a, &fx.map, &files, path, src, .program);
+    }
+    for (generated, 0..) |src, i| {
+        const path = try std.fmt.allocPrint(a, "generated{d}.kt", .{i});
+        try addSource(a, &fx.map, &files, path, src, .program);
+        files.items[files.items.len - 1].generated = true;
+    }
+    fx.s = try Sema.init(a);
+    try fx.s.addFiles(files.items);
+    return fx;
+}
+
 fn addSource(a: std.mem.Allocator, map: *span.SourceMap, files: *std.ArrayList(sema_mod.SourceFile), path: []const u8, src: []const u8, origin: sema_mod.Origin) !void {
     const id = try map.add(path, src);
     const text = map.get(id).source;
@@ -4813,7 +4840,7 @@ test "a member extension the call cannot see does not shadow the library's" {
     try fx.expectRef("{ \"a\".^trimmed()", .call, "app/trimmed");
     try fx.expectRef("\"a\".^padded() }", .call, "app/padded");
     try fx.expectRef("b.^secret() }", .call, "app/Base.secret");
-    try expectMessages(&fx, &.{"cannot access `secret`: it is private in `Base`"});
+    try expectMessages(&fx, &.{"cannot access 'fun secret(): Int': it is private in 'Base'."});
 }
 
 test "a type parameter that is not reified cannot be a reified type argument" {
@@ -6249,6 +6276,44 @@ test "a builder's variable stays open for every lambda of the call" {
     const out = try sema_mod.output.build(fx.s);
     const c = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt("= ^parallelBuild(", .call)).node);
     try std.testing.expectEqualStrings("app.TargetType", fx.typeText(c.type_args[0]));
+}
+
+test "a supertype's private member is found and refused as invisible" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class Base {
+        \\    private val privateState: String = "B"
+        \\    private var counter: Int = 0
+        \\    private fun helper(x: Int): String = "h"
+        \\}
+        \\class Derived(val derivedState: Int) : Base()
+        \\fun write(value: Derived) = value.privateState
+        \\fun bump(value: Derived) { value.counter = 2 }
+        \\fun call(value: Derived) = value.helper(1)
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectTarget("value.^privateState", "app/Base.privateState");
+    try fx.expectTarget("value.^helper(1)", "app/Base.helper");
+    try expectMessages(&fx, &.{
+        "cannot access 'val privateState: String': it is private in 'Base'.",
+        "cannot access 'var counter: Int': it is private in 'Base'.",
+        "cannot access 'fun helper(x: Int): String': it is private in 'Base'.",
+    });
+}
+
+test "a compiler plugin's generated code reads a supertype's private property" {
+    var fx = try fixtureGenerated(&.{
+        \\package app
+        \\open class Base { private val privateState: String = "B" }
+        \\class Derived(val derivedState: Int) : Base()
+    }, &.{
+        \\package app
+        \\fun write(value: Derived) = value.privateState
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectMessages(&fx, &.{});
 }
 
 test "a vararg parameter's default is typed as its array" {

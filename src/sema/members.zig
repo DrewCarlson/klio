@@ -36,7 +36,7 @@ pub const Member = struct {
 
 pub const Want = enum { callable, function, property, classifier };
 
-pub const LookupKey = struct { recv: TypeId, name: Name, want: Want, every: bool = false };
+pub const LookupKey = struct { recv: TypeId, name: Name, want: Want, every: bool = false, with_private: bool = false };
 
 fn wanted(s: *Sema, m: Sym, want: Want) bool {
     const k = s.syms.kind(m);
@@ -55,7 +55,18 @@ pub fn lookup(s: *Sema, recv: TypeId, n: Name, want: Want) Allocator.Error![]con
     // collected: kept per receiver type, name and kind.
     const key: LookupKey = .{ .recv = recv, .name = n, .want = want };
     if (s.lookup_memo.get(key)) |hit| return hit;
-    const found = try lookupUncached(s, recv, n, want, false);
+    const found = try lookupUncached(s, recv, n, want, false, false);
+    try s.lookup_memo.put(s.arena, key, found);
+    return found;
+}
+
+/// `lookup`, taking a supertype's private members too, which a subtype
+/// does not inherit: what an access names when nothing else answers.
+/// kotlinc finds such a member and refuses it as invisible.
+pub fn lookupWithPrivate(s: *Sema, recv: TypeId, n: Name, want: Want) Allocator.Error![]const Member {
+    const key: LookupKey = .{ .recv = recv, .name = n, .want = want, .with_private = true };
+    if (s.lookup_memo.get(key)) |hit| return hit;
+    const found = try lookupUncached(s, recv, n, want, false, true);
     try s.lookup_memo.put(s.arena, key, found);
     return found;
 }
@@ -67,12 +78,12 @@ pub fn lookup(s: *Sema, recv: TypeId, n: Name, want: Want) Allocator.Error![]con
 pub fn lookupEvery(s: *Sema, recv: TypeId, n: Name, want: Want) Allocator.Error![]const Member {
     const key: LookupKey = .{ .recv = recv, .name = n, .want = want, .every = true };
     if (s.lookup_memo.get(key)) |hit| return hit;
-    const found = try lookupUncached(s, recv, n, want, true);
+    const found = try lookupUncached(s, recv, n, want, true, false);
     try s.lookup_memo.put(s.arena, key, found);
     return found;
 }
 
-fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool) Allocator.Error![]const Member {
+fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool, with_private: bool) Allocator.Error![]const Member {
     var out: std.ArrayList(Member) = .empty;
     var seen: std.AutoHashMapUnmanaged(Sym, void) = .empty;
     var frontier: std.ArrayList(TypeId) = .empty;
@@ -97,7 +108,7 @@ fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool) Allo
                 // superclass's body could read it (an object expression
                 // extending the class it is written in reads the outer
                 // instance's `n`).
-                if (depth > 0 and s.syms.flags(m).visibility == .private) continue;
+                if (depth > 0 and !with_private and s.syms.flags(m).visibility == .private) continue;
                 if (!every) if (try sameDepthConflict(s, out.items, m, subst, depth)) |i| {
                     // Two supertypes at the same distance declare the
                     // member: the one with the more specific result is
