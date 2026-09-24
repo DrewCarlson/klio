@@ -109,21 +109,29 @@ pub fn lowerWhen(b: *Builder, e: *const ast.Expr) Error!Reg {
     for (w.branches) |*br| {
         const body_blk = try b.newBlock();
         const next = try b.newBlock();
+        // A guard runs once a pattern matches; the branch runs when it holds,
+        // and the next branch tests when it does not.
+        const matched = if (br.guard != null) try b.newBlock() else body_blk;
         for (br.patterns, 0..) |*pat, i| {
             const last = i + 1 == br.patterns.len;
             const fail_to = if (last) next else try b.newBlock();
             switch (pat.kind) {
                 .Else => {
-                    has_else = true;
-                    b.terminate(.{ .Goto = body_blk });
+                    if (br.guard == null) has_else = true;
+                    b.terminate(.{ .Goto = matched });
                 },
                 else => {
-                    if (pat.kind == .Value and pat.kind.Value == .NullLit) has_null = true;
+                    if (pat.kind == .Value and pat.kind.Value == .NullLit and br.guard == null) has_null = true;
                     const hit = try pattern(b, w.id, pat, subject, subject_t);
-                    b.terminate(.{ .Branch = .{ .cond = hit, .t = body_blk, .f = fail_to } });
+                    b.terminate(.{ .Branch = .{ .cond = hit, .t = matched, .f = fail_to } });
                 },
             }
             b.switchTo(fail_to);
+        }
+        if (br.guard) |g| {
+            b.switchTo(matched);
+            const holds = try body.lowerExpr(b, &g.expr);
+            b.terminate(.{ .Branch = .{ .cond = holds, .t = body_blk, .f = next } });
         }
         // `fail_to` of the last pattern is `next`, where the next branch tests.
         b.switchTo(body_blk);

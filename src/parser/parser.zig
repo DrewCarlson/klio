@@ -1060,6 +1060,67 @@ test "a lambda after an index invokes what the index gives" {
     try testing.expect(call.callee.* == .Index);
 }
 
+test "a lambda inside a delegation's parentheses follows its call" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\data class B(val a: A?) {
+        \\    companion object : C<B, OtherB> by C.inlinefun(
+        \\        fooParam = {
+        \\            OtherB().apply {
+        \\                a = it.a?.let(A::foo)
+        \\            }
+        \\        }
+        \\    )
+        \\}
+        \\class D(x: I) : I by x { fun f() = 1 }
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const comp = out.file.decls[0].Class.members[0].Class;
+    const lam = comp.supertype_delegates[0].?.Call.args[0].Lambda;
+    try testing.expect(lam.body.stmts[lam.body.stmts.len - 1].Expr.Call.has_trailing_lambda);
+    // The class body's `{` still closes the delegate expression.
+    try testing.expectEqual(@as(usize, 1), out.file.decls[1].Class.members.len);
+}
+
+test "a when branch takes a guard after its condition or else" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun f(x: Any) = when (x) {
+        \\    is String if x.length > 2 -> 1
+        \\    else if x is Int -> 2
+        \\    else -> 3
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const w = out.file.decls[0].Function.body.?.Expr.When;
+    try testing.expectEqual(@as(usize, 3), w.branches.len);
+    try testing.expect(w.branches[0].guard.?.expr == .Binary);
+    try testing.expect(w.branches[1].patterns[0].kind == .Else);
+    try testing.expect(w.branches[1].guard.?.expr == .IsCheck);
+    try testing.expect(w.branches[2].guard == null);
+}
+
+test "a primary constructor keeps the annotations written before `constructor`" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class Baz
+        \\@Suppress("X")
+        \\@kotlin.internal.LowPriorityInOverloadResolution
+        \\constructor(val s: String)
+        \\@Deprecated("d")
+        \\class Next
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const c = out.file.decls[0].Class;
+    try testing.expectEqual(@as(usize, 2), c.x().primary_ctor_annotations.len);
+    try testing.expectEqual(@as(usize, 1), c.primary_params.len);
+    // An annotation not followed by `constructor` is the next declaration's.
+    try testing.expectEqual(@as(usize, 1), out.file.decls[1].Class.annotations.len);
+}
+
 test "infix_call_no_newline_break" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

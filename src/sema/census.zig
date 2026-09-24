@@ -54,6 +54,12 @@ pub const Reason = enum(u8) {
     /// A value whose type does not fit the type its place declares: a
     /// delegate's `getValue` returning what its property cannot hold.
     type_mismatch,
+    /// A `when` whose value is used, or whose subject is an enum, a sealed
+    /// type or a `Boolean`, that a subject's value can fall through.
+    non_exhaustive_when,
+    /// A `when` guard where none may stand: in a `when` without a subject,
+    /// or after several conditions.
+    when_guard,
 };
 
 /// What one tentative resolution recorded. `refs` holds the analysis's

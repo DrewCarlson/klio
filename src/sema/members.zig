@@ -205,6 +205,16 @@ fn moreSpecificResult(s: *Sema, a: Member, b: Member) Allocator.Error!bool {
     const at = try memberType(s, a);
     const bt = try memberType(s, b);
     if (s.types.isErr(at) or s.types.isErr(bt)) return false;
+    // Of two properties, a `var` is more specific than a `val` whose type
+    // it fits, and a `val` never more than a `var`: `abstract class C :
+    // A(), B` with `A`'s `val x: String` and `B`'s `var x: String` has a
+    // settable `x`.
+    if (s.syms.kind(a.sym) == .property and s.syms.kind(b.sym) == .property) {
+        const a_var = s.syms.flags(a.sym).mutable;
+        const b_var = s.syms.flags(b.sym).mutable;
+        if (a_var != b_var) return a_var and try subtyping.isSubtype(s, at, bt);
+        if (a_var) return false;
+    }
     return (try subtyping.isSubtype(s, at, bt)) and !(try subtyping.isSubtype(s, bt, at));
 }
 

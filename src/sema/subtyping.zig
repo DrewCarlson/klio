@@ -356,7 +356,7 @@ fn emptyIntersection(s: *Sema, parts: []const TypeId) Allocator.Error!bool {
     return false;
 }
 
-fn isSubclass(s: *Sema, sub: Sym, sup: Sym) Allocator.Error!bool {
+pub fn isSubclass(s: *Sema, sub: Sym, sup: Sym) Allocator.Error!bool {
     return try supertypeWithClass(s, try headers.selfType(s, sub), sup) != null;
 }
 

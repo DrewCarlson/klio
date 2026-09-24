@@ -235,7 +235,7 @@ receiver or global path.
 |----|------|--------|
 | `green/corpus` | `itest-e2e`, the example corpus and the stdlib commontest sweep at their floors. | done: corpus 551/551 |
 | `green/packs` | Every pack suite in `plans/pack-suites-to-green.md` at or above its floor, compose runtime at 100%. | doing |
-| `green/box` | The kotlinc box corpus at or above its ratchet. | doing: 6262/90 ratchet, the old path 6019 |
+| `green/box` | The kotlinc box corpus at or above its ratchet. | doing: 6266/86 ratchet, the old path 6019 |
 | `green/measure` | Re-take the headline costs, the executed dispatch census and `benchRecompose`, before and after, in the log below. | todo |
 
 ### Speed
@@ -254,7 +254,11 @@ bench_oo, bench_fn and `benchRecompose` in the log.
 ### After done
 
 The long tail: the box failures left under the ratchet and any suite item
-outside the floors, then `retire/typeck`.
+outside the floors, then `retire/typeck`. Pack completeness waits here too:
+the compose and material3 platform natives still unbound, and the host's
+owned layers over upstream's `GraphicsLayerOwnerLayer` (layer alpha, color
+filter, blend, render effect, shadows, and hit testing through layer
+transforms).
 
 | Id | Item | Size | Status |
 |----|------|-----:|--------|
@@ -428,8 +432,10 @@ construction, and each gets a test.
 
 1. Every item in Cutover, Green and Speed is `done`.
 2. `Inst` declares only resolved variants and the name guard compiles.
-3. The sema census reads zero over the base, every pack and the corpus, and
-   the oracle agrees with kotlinc on the corpus.
+3. The sema census reads zero sema sites and zero lowering failures over the
+   base, every pack and the corpus, and the oracle agrees with kotlinc on
+   the corpus. A pack declaration with no native (`lower_unbound_native`)
+   is pack completeness, tracked after done.
 4. `scripts/gate.sh` is green, run with nothing else touching `.zig-cache`.
 5. Every suite count in `plans/pack-suites-to-green.md` is at or above its
    floor, and the compose runtime suite is at 100%, its throughput-bound

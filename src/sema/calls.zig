@@ -2041,10 +2041,14 @@ fn dropLowPriority(ctx: *Ctx, apps: *std.ArrayList(Applied)) Allocator.Error!voi
     }
 }
 
-/// Whether a function is annotated with the annotation class `cls`.
+/// Whether a function or constructor is annotated with the annotation
+/// class `cls`.
 fn hasAnnotation(s: *Sema, sym: Sym, cls: Sym) Allocator.Error!bool {
     const anns: []const ast.Annotation = switch (s.syms.get(sym).decl) {
         .function => |f| f.annotations,
+        .secondary_ctor => |sc| sc.annotations,
+        // A primary constructor's are written before `constructor`.
+        .class => |c| if (s.syms.kind(sym) == .constructor) c.x().primary_ctor_annotations else return false,
         else => return false,
     };
     return headers.annotatedWith(s, .{ .decl = sym, .file = s.syms.get(sym).file }, anns, cls);
@@ -3079,7 +3083,7 @@ pub fn anonymousFunction(ctx: *Ctx, f: *const ast.AnonFunExpr, expected: TypeId)
     if (f.body) |b| {
         switch (b.*) {
             .Block => |*blk| {
-                _ = try body.block(ctx, blk, .none);
+                _ = try body.bodyBlock(ctx, blk);
                 if (ret == .none) ret = s.t.unit;
             },
             .Expr => |*e| {

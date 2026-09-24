@@ -85,6 +85,7 @@ Run any program with:
 | `collection_contract_equality.kt` | `==` dispatches on the LEFT operand: a native collection's equals is the collection contract, so `setOf(1) == MySet([1])` is true without an equals override on MySet (and stays identity-false the other way), nested Pairs included. |
 | `smart_cast_field.kt`, `as_cast.kt` | Smart casts and `as` / `as?`.                         |
 | `when_binding.kt`          | `when` with a bound subject.                                    |
+| `when_guards.kt`           | `when` guards: `is T if cond ->` and `else if cond ->`, the guard seeing the pattern's smart cast. |
 | `qualified_this.kt`        | Qualified `this@Label` through inner/outer chains.             |
 | `qualified_namesake_delegation.kt` | A user function sharing a stdlib function's name delegates to it fully qualified; the qualified call binds the FQN target exactly, never re-picking the user function. |
 | `receiver_lambda_reassign.kt` | A receiver lambda keeps its receiver context when reassigned to a typed local or assigned into a field declared `Scope.() -> R`. |

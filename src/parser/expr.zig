@@ -729,6 +729,9 @@ fn callArguments(chain: *PostfixChain) Step {
 fn indexArguments(chain: *PostfixChain) Step {
     const p = chain.p;
     _ = support.bump(p);
+    const suppressed = p.suppress_trailing_lambda;
+    p.suppress_trailing_lambda = false;
+    defer p.suppress_trailing_lambda = suppressed;
     var args: std.ArrayList(Expr) = .empty;
     while (true) {
         support.skipNl(p);
@@ -829,6 +832,11 @@ fn chainContinuation(chain: *PostfixChain) Step {
 /// Value arguments up to the closing `)`, which is left unconsumed. False when
 /// an argument failed to parse.
 fn parseCallArgs(p: *Parser, args: *std.ArrayList(Expr), arg_names: *std.ArrayList(?[]const u8)) bool {
+    // Inside the parentheses a lambda follows its call again: a class's
+    // `by C.make(f = { x.apply { ... } })` has its body's `{` only after them.
+    const suppressed = p.suppress_trailing_lambda;
+    p.suppress_trailing_lambda = false;
+    defer p.suppress_trailing_lambda = suppressed;
     while (true) {
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .RParen) break;

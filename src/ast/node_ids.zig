@@ -111,6 +111,7 @@ pub const Numbering = struct {
         self.take(&c.id);
         self.annotations(c.annotations);
         self.typeParams(c.type_params);
+        self.annotations(c.x().primary_ctor_annotations);
         for (c.primary_params) |*cp| {
             self.take(&cp.id);
             self.annotations(cp.annotations);
@@ -376,6 +377,7 @@ pub const Numbering = struct {
                         .IsType, .NotIsType => |*t| self.typeRef(t),
                         .Else => {},
                     };
+                    if (br.guard) |g| self.expr(&g.expr);
                     self.expr(&br.body);
                 }
             },

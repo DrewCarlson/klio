@@ -155,6 +155,9 @@ pub fn parsePrimary(p: *Parser) ?Expr {
         .LParen => {
             _ = support.bump(p);
             support.skipNl(p);
+            const suppressed = p.suppress_trailing_lambda;
+            p.suppress_trailing_lambda = false;
+            defer p.suppress_trailing_lambda = suppressed;
             var inner = exprmod.parseExpr(p) orelse return null;
             support.skipNl(p);
             support.rejectTrailingAssignment(p);

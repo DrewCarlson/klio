@@ -676,6 +676,54 @@ fn expectRun(src: []const u8, want: []const u8) !void {
     };
 }
 
+test "a when guard runs once its pattern matches, and a failed guard falls through" {
+    try expectRun(
+        \\sealed interface S
+        \\data class A(val n: Int) : S
+        \\data class B(val s: String) : S
+        \\object C : S
+        \\fun log(tag: String, v: Boolean): Boolean { println("eval " + tag); return v }
+        \\fun f(x: S): String = when (x) {
+        \\    is A if log("a>0", x.n > 0) -> "A+" + x.n
+        \\    is A -> "A" + x.n
+        \\    is B if x.s.length == 0 -> "B empty"
+        \\    C -> "C"
+        \\    else if log("else guard", x is B && x.s.length > 3) -> "long B"
+        \\    else -> "other"
+        \\}
+        \\fun g(x: Any?): String = when (x) {
+        \\    is String if x.length > 2 -> "str:" + x
+        \\    is Int if x > 10 -> "big"
+        \\    null -> "null"
+        \\    else -> "else"
+        \\}
+        \\fun h(x: S): Int {
+        \\    var r = 0
+        \\    when (x) {
+        \\        is A if x.n == 1 -> r = 1
+        \\        is A -> r = 2
+        \\        is B -> r = 3
+        \\        C -> r = 4
+        \\    }
+        \\    return r
+        \\}
+        \\fun main() {
+        \\    println(f(A(1)))
+        \\    println(f(A(-1)))
+        \\    println(f(B("")))
+        \\    println(f(B("abcd")))
+        \\    println(f(B("ab")))
+        \\    println(f(C))
+        \\    println(g("abc"))
+        \\    println(g("ab"))
+        \\    println(g(20))
+        \\    println(g(5))
+        \\    println(g(null))
+        \\    println(h(A(1)) + h(A(2)) + h(B("")) + h(C))
+        \\}
+    , "eval a>0\nA+1\neval a>0\nA-1\nB empty\neval else guard\nlong B\neval else guard\nother\nC\nstr:abc\nelse\nbig\nelse\nnull\n10\n");
+}
+
 test "when with a subject tests values, ranges and types, null narrowing later branches" {
     try expectRun(
         \\sealed class Shape

@@ -28,6 +28,7 @@ pub const output = @import("output.zig");
 pub const members = @import("members.zig");
 pub const infer = @import("infer.zig");
 pub const diagnose = @import("diagnose.zig");
+pub const exhaustive = @import("exhaustive.zig");
 
 const Allocator = std.mem.Allocator;
 pub const Name = names.Name;
@@ -154,6 +155,9 @@ pub const Sema = struct {
     /// What a local `val` being not null says about the values its
     /// initializer read: `val a = b?.f()` makes `b` not null with `a`.
     nonnull_implies: std.AutoHashMapUnmanaged(Sym, []const @import("body.zig").Narrow) = .empty,
+    /// Each sealed class's direct subtypes, found in its package once asked
+    /// for.
+    sealed_inheritors: std.AutoHashMapUnmanaged(Sym, []const Sym) = .empty,
     /// `members.lookup`'s answers, keyed by receiver type, name and kind;
     /// cleared when a layer adds declarations.
     lookup_memo: std.AutoHashMapUnmanaged(@import("members.zig").LookupKey, []const @import("members.zig").Member) = .empty,

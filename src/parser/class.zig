@@ -103,7 +103,7 @@ pub fn parseClass(
         );
         skipNlIfHeaderContinues(p);
     }
-    skipPrimaryCtorAnnotations(p);
+    const primary_ctor_annotations = primaryCtorAnnotations(p);
     const primary_ctor_visibility = parsePrimaryCtorHeader(p);
     var primary_params: []ClassParam = &.{};
     var has_primary_ctor = false;
@@ -152,6 +152,7 @@ pub fn parseClass(
             .supertype_arg_names = sup.arg_names,
             .secondary_ctors = secondary_ctors,
             .enum_entries = enum_entries,
+            .primary_ctor_annotations = primary_ctor_annotations,
         }),
         .is_data = mods.is_data,
         .is_companion = mods.is_companion,
@@ -209,15 +210,18 @@ fn skipNlIfHeaderContinues(p: *Parser) void {
 /// annotated, so a leading `@...` run is consumed only when followed by
 /// `[visibility] constructor`; otherwise the `@` belongs to the NEXT
 /// declaration.
-fn skipPrimaryCtorAnnotations(p: *Parser) void {
+/// The annotations of a primary constructor written with `constructor`
+/// (`class Baz @LowPriorityInOverloadResolution constructor(...)`); none,
+/// and nothing consumed, when the `@` annotates what follows instead.
+fn primaryCtorAnnotations(p: *Parser) []Annotation {
     if (!support.peekKind(p).isAt()) {
-        return;
+        return &.{};
     }
     const ann_save = p.pos;
+    var anns: std.ArrayList(Annotation) = .empty;
     while (support.peekKind(p).isAt()) {
-        if (file.parseAnnotationSet(p) == null) {
-            break;
-        }
+        const set = file.parseAnnotationSet(p) orelse break;
+        anns.appendSlice(p.allocator, set) catch @panic("OOM");
         support.skipNl(p);
     }
     var probe = p.pos;
@@ -242,7 +246,9 @@ fn skipPrimaryCtorAnnotations(p: *Parser) void {
         std.mem.eql(u8, support.text(p, p.tokens[probe].span), "constructor");
     if (!is_primary_ctor) {
         p.pos = ann_save; // the `@` annotates the next decl
+        return &.{};
     }
+    return anns.items;
 }
 
 /// Nothing is committed until the modifier run terminates in `constructor`.

@@ -1782,6 +1782,28 @@ test "a low-priority overload yields to any other applicable candidate" {
     try fx.expectRef("= ^Date(2024", .ctor, "demo/Date.<init>");
 }
 
+test "a low-priority primary constructor yields to a function of its class's name" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\import kotlin.internal.*
+        \\class MyString(val value: String)
+        \\class Baz
+        \\@LowPriorityInOverloadResolution
+        \\constructor(val s: String) {
+        \\    constructor(s: MyString): this(s.value)
+        \\}
+        \\fun Baz(s: String) = Baz(MyString(s + "!"))
+        \\fun use() = Baz("hello")
+    ,
+        \\package kotlin.internal
+        \\internal annotation class LowPriorityInOverloadResolution
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectRef("= ^Baz(\"hello\")", .call, "demo/Baz");
+}
+
 test "a function reference is a KFunctionN: invocable, a FunctionN, and named" {
     var fx = try fixture(&.{
         \\package demo
@@ -6314,6 +6336,181 @@ test "a compiler plugin's generated code reads a supertype's private property" {
     defer fx.deinit();
     try fx.resolve();
     try expectMessages(&fx, &.{});
+}
+
+test "a class inheriting a val and a var of one type has the var" {
+    var fx = try fixture(&.{
+        \\package app
+        \\abstract class A { abstract val x: String }
+        \\interface B { var x: String }
+        \\abstract class C : A(), B
+        \\fun test(c: C) { c.x = "OK" }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("c.^x = ", "app/B.x");
+}
+
+test "a when that a value can fall through is reported where it must match" {
+    var fx = try fixture(&.{
+        \\package app
+        \\sealed interface S
+        \\data class A(val n: Int) : S
+        \\data class B(val s: String) : S
+        \\object C : S
+        \\sealed class T : S
+        \\class T1 : T()
+        \\class T2 : T()
+        \\enum class E { X, Y, Z }
+        \\fun p() {}
+        \\fun f1(x: S): String = when (x) {
+        \\    is A -> "A"
+        \\}
+        \\fun f2(x: S?): String = when (x) {
+        \\    is A -> "A"
+        \\    is B -> "B"
+        \\    C -> "C"
+        \\    is T -> "T"
+        \\}
+        \\fun f3(e: E?): String = when (e) {
+        \\    E.X -> "x"
+        \\}
+        \\fun f4(b: Boolean?): String = when (b) {
+        \\    true -> "t"
+        \\    false -> "f"
+        \\}
+        \\fun f5(x: Any): String = when {
+        \\    x is String -> "s"
+        \\}
+        \\fun f6(x: S) {
+        \\    when (x) {
+        \\        is A -> p()
+        \\    }
+        \\}
+        \\fun ok1(x: S): String = when (x) {
+        \\    !is A -> "n"
+        \\    is A -> "a"
+        \\}
+        \\fun <V : S> ok2(x: V): String = when (x) {
+        \\    is A -> "A"
+        \\    is B -> "B"
+        \\    C -> "C"
+        \\    is T -> "T"
+        \\}
+        \\fun ok3(x: Any): String = if (x is S) when (x) {
+        \\    is A, is B, C, is T -> "x"
+        \\} else "no"
+        \\fun ok4(x: S?): String = when (x) {
+        \\    is A? -> "a"
+        \\    is B, C, is T1, is T2 -> "b"
+        \\}
+        \\fun ok5(i: Int) {
+        \\    when (i) {
+        \\        1 -> p()
+        \\    }
+        \\    run { when (i) { 1 -> p() } }
+        \\    if (i > 0) when (i) { 1 -> p() }
+        \\    while (i > 5) when (i) { 1 -> p() }
+        \\}
+        \\fun ok6(e: E): Int {
+        \\    val r = when (e) {
+        \\        E.X -> 1
+        \\        E.Y -> 2
+        \\        E.Z -> 3
+        \\    }
+        \\    return r
+        \\}
+        \\fun ok7(x: Any): String = when (x) {
+        \\    is Any -> "any"
+        \\}
+        \\fun d1(b: Boolean): Int {
+        \\    if (b == false) return 1
+        \\    return when (b) { true -> 2 }
+        \\}
+        \\fun d2(b: Boolean?): Int {
+        \\    if ((b == true) == false) return 1
+        \\    return when (b) { true -> 2 }
+        \\}
+        \\fun d3(b: Boolean?): Int {
+        \\    if ((b == true) == true) return 1
+        \\    return when (b) {
+        \\        null -> 2
+        \\        false -> 3
+        \\    }
+        \\}
+        \\fun d4(e: E): Int {
+        \\    if (e == E.X) return 1
+        \\    if (e == E.Y) return 2
+        \\    return when (e) { E.Z -> 3 }
+        \\}
+        \\fun d5(x: S): String {
+        \\    if (x is A) return "a"
+        \\    (x is B) && throw Throwable()
+        \\    return when (x) {
+        \\        C -> "c"
+        \\        is T -> "t"
+        \\    }
+        \\}
+        \\fun d6(x: S): String {
+        \\    var y = x
+        \\    if (y is A) return "a"
+        \\    y = x
+        \\    return when (y) {
+        \\        is B -> "b"
+        \\        C -> "c"
+        \\        is T -> "t"
+        \\    }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectMessages(&fx, &.{
+        "'when' expression must be exhaustive. Add the 'is B', 'C', 'is T1', 'is T2' branches or an 'else' branch.",
+        "'when' expression must be exhaustive. Add the 'null' branch or an 'else' branch.",
+        "'when' expression must be exhaustive. Add the 'Y', 'Z', 'null' branches or an 'else' branch.",
+        "'when' expression must be exhaustive. Add the 'null' branch or an 'else' branch.",
+        "'when' expression must be exhaustive. Add an 'else' branch.",
+        "'when' expression must be exhaustive. Add the 'is B', 'C', 'is T1', 'is T2' branches or an 'else' branch.",
+        // Past an assignment, what was ruled out before no longer is.
+        "'when' expression must be exhaustive. Add the 'is A' branch or an 'else' branch.",
+    });
+}
+
+test "a when guard sees its pattern's smart cast and gives the body its own" {
+    var fx = try fixture(&.{
+        \\package app
+        \\sealed interface S
+        \\class A(val n: Int) : S
+        \\class B(val s: String) : S
+        \\fun f(x: S, y: String?): Int = when (x) {
+        \\    is A if x.n > 0 -> x.n
+        \\    is B if y != null -> y.length
+        \\    is A -> 0
+        \\    is B -> 1
+        \\}
+        \\fun g(x: S): Int = when (x) {
+        \\    is A if x.n > 0 -> 1
+        \\    is B -> 2
+        \\}
+        \\fun h(i: Int): Int = when {
+        \\    i > 0 if i < 10 -> 1
+        \\    else -> 2
+        \\}
+        \\fun k(x: S): Int = when (x) {
+        \\    is A, is B if true -> 1
+        \\    else -> 2
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectTarget("if x.^n > 0 -> x.n", "app/A.n");
+    try fx.expectTarget("-> y.^length", "kotlin/String.length");
+    try expectMessages(&fx, &.{
+        "'when' expression must be exhaustive. Add the 'is A' branch or an 'else' branch.",
+        "guard statements are only allowed in 'when' with subject.",
+        "use of comma in 'when' condition with guard statement is not allowed.",
+    });
 }
 
 test "a vararg parameter's default is typed as its array" {

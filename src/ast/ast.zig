@@ -121,6 +121,7 @@ pub fn exprUsesField(e: *const Expr) bool {
         .When => |w| (if (w.subject) |s| exprUsesField(s) else false) or blk: {
             for (w.branches) |*b| {
                 if (exprUsesField(&b.body)) break :blk true;
+                if (b.guard) |g| if (exprUsesField(&g.expr)) break :blk true;
             }
             break :blk false;
         },
@@ -402,11 +403,15 @@ pub const ClassExtra = struct {
     secondary_ctors: []SecondaryCtor = &.{},
     /// Entries of an enum class; its post-`;` declarations are `members`.
     enum_entries: []EnumEntry = &.{},
+    /// `class Baz @Ann constructor(...)`: the primary constructor's own
+    /// annotations.
+    primary_ctor_annotations: []Annotation = &.{},
 
     pub fn isDefault(self: *const ClassExtra) bool {
         return self.where_bounds.len == 0 and self.init_blocks.len == 0 and
             self.init_block_positions.len == 0 and self.supertype_arg_names.len == 0 and
-            self.secondary_ctors.len == 0 and self.enum_entries.len == 0;
+            self.secondary_ctors.len == 0 and self.enum_entries.len == 0 and
+            self.primary_ctor_annotations.len == 0;
     }
 };
 
@@ -1117,6 +1122,15 @@ pub const WhenBranch = struct {
     patterns: []WhenPattern,
     body: Expr,
     span: Span,
+    /// `is T if cond ->`, `else if cond ->`: the branch fires only when the
+    /// guard holds too.
+    guard: ?*WhenGuard = null,
+};
+
+pub const WhenGuard = struct {
+    expr: Expr,
+    /// From `if` to the guard's end.
+    span: Span,
 };
 
 pub const WhenPattern = struct {
@@ -1350,6 +1364,7 @@ fn exprHas(comptime opts: Declares, e: *const Expr) bool {
             if (optExprHas(opts, x.subject)) return true;
             for (x.branches) |*br| {
                 if (exprHas(opts, &br.body)) return true;
+                if (br.guard) |g| if (exprHas(opts, &g.expr)) return true;
                 for (br.patterns) |*p| switch (p.kind) {
                     .Value => |*ve| if (exprHas(opts, ve)) return true,
                     .InRange => |*ie| if (exprHas(opts, ie)) return true,

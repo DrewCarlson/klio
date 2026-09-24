@@ -160,6 +160,7 @@ fn walkExpr(
                     .NotInRange => |ie| try walkExpr(allocator, out, &ie),
                     .IsType, .NotIsType, .Else => {},
                 };
+                if (br.guard) |g| try walkExpr(allocator, out, &g.expr);
                 try walkExpr(allocator, out, &br.body);
             }
         },

@@ -24,6 +24,7 @@ const records = @import("records.zig");
 const infer = @import("infer.zig");
 const calls = @import("calls.zig");
 const census_mod = @import("census.zig");
+const exhaustive = @import("exhaustive.zig");
 
 const Allocator = std.mem.Allocator;
 const Sema = sema_mod.Sema;
@@ -46,7 +47,24 @@ pub const Recv = struct {
     label: Name,
 };
 
-pub const Narrow = struct { sym: Sym, ty: TypeId };
+pub const Narrow = struct {
+    sym: Sym,
+    ty: TypeId,
+    /// A value `sym` is known not to be (`v !is A`, `e != Enum.A`, `b !=
+    /// false`), which a `when` over it then need not match. `ty` stays what
+    /// the value already is.
+    excluded: Excluded = .none,
+    /// An assignment: what was known of the value before holds no more.
+    reset: bool = false,
+};
+
+pub const Excluded = union(enum) {
+    none,
+    type: TypeId,
+    /// An enum entry or an object.
+    value: Sym,
+    boolean: bool,
+};
 
 /// A value a call's context parameter can take from the scope: a context
 /// parameter of the enclosing function or accessor, or a context of a
@@ -141,6 +159,13 @@ pub const Ctx = struct {
     /// expression makes: taken by that call before its lambdas and
     /// references are analyzed.
     delegate_expect: ?*const DelegateExpect = null,
+    /// Whether the value of the expression about to be resolved is used:
+    /// false for a statement, the last statement of a body or a lambda,
+    /// and the branches of an `if`, `when` or `try` whose value is not.
+    used: bool = true,
+    /// `used` as it stood for the expression `expr` is resolving, for the
+    /// forms that hand it to their branches.
+    self_used: bool = true,
 
     pub fn arena(self: *const Ctx) Allocator {
         return self.s.arena;
@@ -500,7 +525,7 @@ fn resolveFunction(ctx: *Ctx, f: Sym) Allocator.Error!void {
     if (fd.body) |*b| {
         const ret = s.syms.functionInfo(f).ret;
         switch (b.*) {
-            .Block => |*blk| _ = try block(ctx, blk, .none),
+            .Block => |*blk| _ = try bodyBlock(ctx, blk),
             .Expr => |*e| {
                 const t = try expr(ctx, e, ret);
                 if (s.syms.functionInfo(f).ret == .none) s.syms.functionInfo(f).ret = try escapingType(s, f, t);
@@ -751,7 +776,7 @@ fn accessorBody(ctx: *Ctx, acc: *const ast.Accessor, field_t: TypeId) Allocator.
     ctx.scope.ret = field_t;
     return switch (acc.body) {
         .Block => |*b| blk: {
-            _ = try block(ctx, b, .none);
+            _ = try bodyBlock(ctx, b);
             break :blk if (field_t != .none) field_t else s.types.errType();
         },
         .Expr => |*e| try expr(ctx, e, field_t),
@@ -1029,13 +1054,13 @@ fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
     if (primary == .none) {
         switch (s.syms.get(cls).decl) {
             .class => |c| {
-                for (c.x().init_blocks) |*b| _ = try block(ctx, b, .none);
+                for (c.x().init_blocks) |*b| _ = try bodyBlock(ctx, b);
             },
             .object => |o| for (o.init_blocks) |*b| {
-                _ = try block(ctx, b, .none);
+                _ = try bodyBlock(ctx, b);
             },
             .object_literal => |o| for (o.init_blocks) |*b| {
-                _ = try block(ctx, b, .none);
+                _ = try bodyBlock(ctx, b);
             },
             else => {},
         }
@@ -1044,13 +1069,13 @@ fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
     const sc = try pushPlainCtorParams(ctx, primary);
     switch (s.syms.get(cls).decl) {
         .class => |c| {
-            for (c.x().init_blocks) |*b| _ = try block(ctx, b, .none);
+            for (c.x().init_blocks) |*b| _ = try bodyBlock(ctx, b);
         },
         .object => |o| for (o.init_blocks) |*b| {
-            _ = try block(ctx, b, .none);
+            _ = try bodyBlock(ctx, b);
         },
         .object_literal => |o| for (o.init_blocks) |*b| {
-            _ = try block(ctx, b, .none);
+            _ = try bodyBlock(ctx, b);
         },
         else => {},
     }
@@ -1073,7 +1098,7 @@ fn resolveFunctionInClass(ctx: *Ctx, f: Sym) Allocator.Error!void {
     if (fd.body) |*b| {
         const ret = s.syms.functionInfo(f).ret;
         switch (b.*) {
-            .Block => |*blk| _ = try block(ctx, blk, .none),
+            .Block => |*blk| _ = try bodyBlock(ctx, blk),
             .Expr => |*e| {
                 const t = try expr(ctx, e, ret);
                 if (s.syms.functionInfo(f).ret == .none) s.syms.functionInfo(f).ret = try escapingType(s, f, try widenForDecl(s, t)) else try infer.noteExpected(s, t, ret);
@@ -1100,7 +1125,7 @@ fn secondaryCtor(ctx: *Ctx, cls: Sym, ctor: Sym) Allocator.Error!void {
         },
         .None => {},
     }
-    if (sc_decl.body) |*b| _ = try block(ctx, b, .none);
+    if (sc_decl.body) |*b| _ = try bodyBlock(ctx, b);
     ctx.pop(sc);
 }
 
@@ -1170,11 +1195,17 @@ pub fn lambdaStatements(ctx: *Ctx, sc: *const Scope, stmts: []const ast.Stmt, ex
     var last: TypeId = s.t.unit;
     const saved_arg = ctx.in_arg;
     defer ctx.in_arg = saved_arg;
+    // A lambda's last statement is its result, but a `when` there need not
+    // be exhaustive: kotlinc takes one that is not as a statement.
+    const saved_used = ctx.used;
+    ctx.used = false;
+    defer ctx.used = saved_used;
     for (stmts, 0..) |*st, i| {
         const is_last = i + 1 == stmts.len;
         const coerced = is_last and sc.unit_return;
         ctx.in_arg = if (is_last and !coerced) saved_arg else .none;
         const exp: TypeId = if (!is_last) .none else if (coerced) s.t.unit else expected;
+        ctx.used = false;
         last = try stmt(ctx, st, exp);
         if (coerced) last = s.t.unit;
     }
@@ -1188,18 +1219,36 @@ pub fn blockIn(ctx: *Ctx, stmts: []const ast.Stmt, expected: TypeId) Allocator.E
     var last: TypeId = s.t.unit;
     const saved_arg = ctx.in_arg;
     defer ctx.in_arg = saved_arg;
+    // Only the last statement's value is the block's, used where the
+    // block's is.
+    const last_used = ctx.used;
+    defer ctx.used = last_used;
     for (stmts, 0..) |*st, i| {
         const is_last = i + 1 == stmts.len;
         // Only the block's result can leave inference open for its user.
         ctx.in_arg = if (is_last) saved_arg else .none;
+        ctx.used = is_last and last_used;
         last = try stmt(ctx, st, if (is_last) expected else .none);
     }
     return last;
 }
 
+/// A body whose value nothing uses: a function's, an accessor's, an
+/// initializer's, a loop's, a `finally`.
+pub fn bodyBlock(ctx: *Ctx, b: *const ast.Block) Allocator.Error!TypeId {
+    const saved = ctx.used;
+    ctx.used = false;
+    defer ctx.used = saved;
+    return block(ctx, b, .none);
+}
+
 fn stmt(ctx: *Ctx, st: *const ast.Stmt, expected: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
     if (st.* != .Expr) ctx.in_arg = .none;
+    // A declaration's initializer and an assignment's value are used.
+    const saved_used = ctx.used;
+    defer ctx.used = saved_used;
+    if (st.* != .Expr) ctx.used = true;
     switch (st.*) {
         .Expr => |*e| return expr(ctx, e, expected),
         .Decl => |d| {
@@ -1368,7 +1417,7 @@ pub fn resolveLocalFunctionBody(ctx: *Ctx, sym: Sym) Allocator.Error!void {
     try resolveParamDefaults(ctx, s.syms.functionInfo(sym).params);
     if (f.body) |*b| {
         switch (b.*) {
-            .Block => |*blk| _ = try block(ctx, blk, .none),
+            .Block => |*blk| _ = try bodyBlock(ctx, blk),
             .Expr => |*e| {
                 const ret = s.syms.functionInfo(sym).ret;
                 const t = try expr(ctx, e, ret);
@@ -1570,6 +1619,8 @@ pub const TryLog = struct {
 /// agree on, then what the finally assigns.
 fn tryExpr(ctx: *Ctx, t: *const ast.TryExpr, expected: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
+    // The body's and the catches' values are used where the `try`'s is.
+    const used = ctx.self_used;
     var branch_types: std.ArrayList(TypeId) = .empty;
     var outs: std.ArrayList(BranchOut) = .empty;
     var log: TryLog = .{ .parent = ctx.try_log };
@@ -1580,7 +1631,9 @@ fn tryExpr(ctx: *Ctx, t: *const ast.TryExpr, expected: TypeId) Allocator.Error!T
     ctx.try_log = &log;
     {
         const sc = try ctx.push(.block, .none);
+        ctx.used = used;
         const bt = try block(ctx, &t.body, expected);
+        ctx.used = true;
         try branch_types.append(s.arena, bt);
         try outs.append(s.arena, if (isNothingType(s, try s.types.makeNotNull(bt))) null else try ctx.arena().dupe(Narrow, sc.narrow.items));
         ctx.pop(sc);
@@ -1597,7 +1650,9 @@ fn tryExpr(ctx: *Ctx, t: *const ast.TryExpr, expected: TypeId) Allocator.Error!T
             defer ctx.leaveNode(saved_node);
             try typeTestRef(ctx, .catch_, ct, c.ty.span, sym);
         }
+        ctx.used = used;
         const ctt = try blockIn(ctx, c.body.stmts, expected);
+        ctx.used = true;
         try branch_types.append(s.arena, ctt);
         const completes = !isNothingType(s, try s.types.makeNotNull(ctt)) and !(c.body.stmts.len != 0 and switch (c.body.stmts[c.body.stmts.len - 1]) {
             .Expr => |*last| jumps(last),
@@ -1621,7 +1676,7 @@ fn tryExpr(ctx: *Ctx, t: *const ast.TryExpr, expected: TypeId) Allocator.Error!T
         const sc = try ctx.push(.block, .none);
         try applyFacts(ctx, finally_entry);
         const facts_end = sc.narrow.items.len;
-        _ = try block(ctx, f, .none);
+        _ = try bodyBlock(ctx, f);
         // Only what the finally itself establishes holds after it.
         own = try ctx.arena().dupe(Narrow, sc.narrow.items[facts_end..]);
         ctx.pop(sc);
@@ -1667,7 +1722,7 @@ fn narrowAfterAssign(ctx: *Ctx, target: *const Expr, vt_in: TypeId) Allocator.Er
         const vt = try widenForDecl(s, try infer.zonk(s, vt_in));
         if (!infer.hasOpenVar(s, vt) and !isNothingType(s, try s.types.makeNotNull(vt)) and try subtyping.isSubtype(s, vt, declared)) t = vt;
     }
-    try ctx.scope.narrow.append(s.arena, .{ .sym = loc, .ty = t });
+    try ctx.scope.narrow.append(s.arena, .{ .sym = loc, .ty = t, .reset = true });
     var log = ctx.try_log;
     while (log) |l| : (log = l.parent) try l.assigned.append(s.arena, .{ .sym = loc, .ty = t });
 }
@@ -1687,6 +1742,11 @@ pub fn expr(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId 
     const id = e.id();
     const saved = ctx.enterNode(id);
     defer ctx.leaveNode(saved);
+    // Its operands' values are used, whether or not its own is.
+    const used = ctx.used;
+    defer ctx.used = used;
+    ctx.self_used = used;
+    ctx.used = true;
     // Only the forms whose type is a call's keep an argument's partial
     // inference; every other form's parts complete on their own.
     const saved_arg = ctx.in_arg;
@@ -1827,18 +1887,22 @@ fn exprInner(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId
             const facts = try condition(ctx, w.cond);
             const sc = try ctx.push(.block, .none);
             try applyFacts(ctx, facts.when_true);
+            ctx.used = false;
             _ = try expr(ctx, w.body, .none);
+            ctx.used = true;
             ctx.pop(sc);
             return s.t.unit;
         },
         .DoWhile => |w| {
             const sc = try ctx.push(.block, .none);
             if (w.body) |b| {
+                ctx.used = false;
                 switch (b.*) {
                     // Locals of a do-while body are visible in its condition.
                     .Block => |*blk| _ = try blockIn(ctx, blk.stmts, .none),
                     else => _ = try expr(ctx, b, .none),
                 }
+                ctx.used = true;
             }
             _ = try condition(ctx, w.cond);
             ctx.pop(sc);
@@ -1864,9 +1928,13 @@ fn exprInner(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId
         .Labeled => |l| {
             // `lit@{ ... }` and `lit@fun() { ... }` name the literal.
             if (l.expr.* == .Lambda or l.expr.* == .AnonFun) ctx.lambda_label = try ctx.intern(l.label.name);
+            ctx.used = ctx.self_used;
             return expr(ctx, l.expr, expected);
         },
-        .Block => |*b| return block(ctx, b, expected),
+        .Block => |*b| {
+            ctx.used = ctx.self_used;
+            return block(ctx, b, expected);
+        },
         .Throw => |t| {
             _ = try expr(ctx, t.value, s.t.throwable);
             return s.t.nothing;
@@ -2218,6 +2286,8 @@ pub fn adoptLiteralBranch(ctx: *Ctx, e: *const Expr, joined: TypeId) Allocator.E
 
 fn ifExpr(ctx: *Ctx, cond: *const Expr, then_b: *const Expr, else_b: ?*const Expr, expected_in: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
+    // The branches' values are used where the `if`'s is.
+    const used = ctx.self_used;
     const expected = try branchExpected(s, expected_in);
     const facts = try condition(ctx, cond);
     var list: std.ArrayList(TypeId) = .empty;
@@ -2229,7 +2299,9 @@ fn ifExpr(ctx: *Ctx, cond: *const Expr, then_b: *const Expr, else_b: ?*const Exp
     {
         const sc = try ctx.push(.block, .none);
         try applyFacts(ctx, facts.when_true);
+        ctx.used = used;
         const t = try expr(ctx, then_b, expected);
+        ctx.used = true;
         try list.append(s.arena, t);
         outs[0] = try branchOut(ctx, sc, then_b, t);
         ctx.pop(sc);
@@ -2237,7 +2309,9 @@ fn ifExpr(ctx: *Ctx, cond: *const Expr, then_b: *const Expr, else_b: ?*const Exp
     if (else_b) |eb| {
         const sc = try ctx.push(.block, .none);
         try applyFacts(ctx, facts.when_false);
+        ctx.used = used;
         const t = try expr(ctx, eb, expected);
+        ctx.used = true;
         try list.append(s.arena, t);
         outs[1] = try branchOut(ctx, sc, eb, t);
         ctx.pop(sc);
@@ -2257,6 +2331,8 @@ fn ifExpr(ctx: *Ctx, cond: *const Expr, then_b: *const Expr, else_b: ?*const Exp
 
 fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
+    // The branches' values are used where the `when`'s is.
+    const used = ctx.self_used;
     const expected = try branchExpected(s, expected_in);
     // Popped by hand once the branches' facts are merged.
     const outer = try ctx.push(.block, .none);
@@ -2279,6 +2355,8 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
     var list: std.ArrayList(TypeId) = .empty;
     var outs: std.ArrayList(BranchOut) = .empty;
     var has_else = false;
+    // What the patterns cover of the subject's values.
+    var covers: std.ArrayList(exhaustive.Cover) = .empty;
     // Without a subject, a branch is reached only when every earlier
     // condition was false.
     var prior_false: std.ArrayList(Narrow) = .empty;
@@ -2286,11 +2364,24 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
         const sc = try ctx.push(.block, .none);
         try applyFacts(ctx, prior_false.items);
         var narrowed: TypeId = .none;
+        // A guarded branch covers nothing: its patterns may match and its
+        // guard fail. What it would cover is kept apart.
+        const covers_before = covers.items.len;
+        const prior_before = prior_false.items.len;
         for (br.patterns) |*pat| {
             switch (pat.kind) {
                 .Value => |*v| {
                     if (w.subject != null) {
+                        const refs_before = ctx.refCount();
                         _ = try expr(ctx, v, subject_t);
+                        try covers.append(s.arena, switch (v.*) {
+                            .NullLit => .null_,
+                            .BoolLit => |b| .{ .bool_ = b.value },
+                            else => blk: {
+                                const named = objectNamedSince(ctx, refs_before, v);
+                                break :blk if (named != .none) .{ .value = named } else .none;
+                            },
+                        });
                         // `null ->` is an identity test, not a call.
                         if (v.* != .NullLit) try calls.equalsRef(ctx, v.span(), subject_t);
                         // `null -> ...` (alone or among other patterns):
@@ -2313,22 +2404,57 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                 .IsType => |*tr| {
                     const t = try isCheckType(ctx, tr, false);
                     try typeTestRef(ctx, .is_, t, pat.span, .none);
+                    try covers.append(s.arena, .{ .is_type = t });
                     if (br.patterns.len == 1) narrowed = t;
                 },
-                .NotIsType => |*tr| try typeTestRef(ctx, .not_is, try resolveTypeInBody(ctx, tr), pat.span, .none),
-                .Else => has_else = true,
+                .NotIsType => |*tr| {
+                    const t = try resolveTypeInBody(ctx, tr);
+                    try typeTestRef(ctx, .not_is, t, pat.span, .none);
+                    try covers.append(s.arena, .{ .not_is = t });
+                },
+                .Else => if (br.guard == null) {
+                    has_else = true;
+                },
             }
         }
         if (narrowed != .none and subject_sym != .none) {
             try ctx.scope.narrow.append(s.arena, .{ .sym = subject_sym, .ty = try intersectNarrow(ctx, subject_t, narrowed) });
         }
+        if (br.guard) |g| {
+            covers.shrinkRetainingCapacity(covers_before);
+            prior_false.shrinkRetainingCapacity(prior_before);
+            if (w.subject == null) {
+                try ctx.reportFacts(.when_guard, g.span, .{ .message = "guard statements are only allowed in 'when' with subject." }, "guard", .{});
+            } else if (br.patterns.len > 1) {
+                try ctx.reportFacts(.when_guard, g.span, .{ .message = "use of comma in 'when' condition with guard statement is not allowed." }, "guard", .{});
+            }
+            // The guard sees what the patterns establish; the body sees
+            // what the guard does too.
+            const facts = try condition(ctx, &g.expr);
+            try applyFacts(ctx, facts.when_true);
+        }
         const saved_arg = ctx.in_arg;
         if (try openExpected(s, expected) and ctx.in_arg == .none) ctx.in_arg = .branch;
+        ctx.used = used;
         const bt = try expr(ctx, &br.body, expected);
+        ctx.used = true;
         try list.append(s.arena, bt);
         ctx.in_arg = saved_arg;
         try outs.append(s.arena, try branchOut(ctx, sc, &br.body, bt));
         ctx.pop(sc);
+    }
+    // A `when` whose value is used must match every subject; so must one
+    // over an enum, a sealed type or a `Boolean` as a statement.
+    if (!has_else and (used or (w.subject != null and try exhaustive.requiredForStatement(s, subject_t)))) {
+        const subject_for_cases: TypeId = if (w.subject != null) subject_t else .none;
+        // A case the smart casts in scope rule out need not be matched:
+        // past `if (v is A) return`, a `when (v)` covers `A`.
+        try covers.appendSlice(s.arena, try excludedCovers(ctx, subject_sym));
+        const missing: ?[]const []const u8 = if (subject_for_cases == .none) &.{} else try exhaustive.missing(s, subject_for_cases, covers.items);
+        if (missing) |names| {
+            const msg = try exhaustive.message(s, names);
+            try ctx.reportFacts(.non_exhaustive_when, Span.init(w.span.file, w.span.start, w.span.start + 4), .{ .message = msg }, "{s}", .{msg});
+        }
     }
     // A `when` without `else` may match nothing and fall through.
     if (!has_else) try outs.append(s.arena, prior_false.items);
@@ -2354,7 +2480,9 @@ fn forLoop(ctx: *Ctx, f: *const ast.ForExpr) Allocator.Error!TypeId {
     } else {
         try destructure(ctx, f.vars, f.by_name, f.var_sources, elem, f.iter.span(), false);
     }
+    ctx.used = false;
     _ = try expr(ctx, f.body, .none);
+    ctx.used = true;
     return s.t.unit;
 }
 
@@ -2413,6 +2541,27 @@ pub fn thisReceiver(ctx: *Ctx, qualifier: ?ast.Ident) Allocator.Error!?Recv {
     return null;
 }
 
+/// The object or enum entry expression `e`, resolved since the reference
+/// list held `since`, names; `.none` for anything else.
+fn objectNamedSince(ctx: *const Ctx, since: usize, e: *const Expr) Sym {
+    const list = if (ctx.s.census.buffer) |b| b.refs.items else ctx.s.refs.items;
+    const at = lastNameSpan(e).start;
+    var i = list.len;
+    while (i > since) {
+        i -= 1;
+        const r = list[i];
+        if (r.kind != .object or r.anchor.start != at) continue;
+        const k = ctx.s.syms.kind(r.target);
+        if (k == .enum_entry) return r.target;
+        if (k == .class) {
+            const ck = ctx.s.syms.classInfo(r.target).kind;
+            if (ck == .object or ck == .companion) return r.target;
+        }
+        return .none;
+    }
+    return .none;
+}
+
 /// A receiver's type with the smart casts on `this` applied.
 pub fn narrowedReceiver(ctx: *Ctx, r: Recv) Allocator.Error!TypeId {
     return narrowedType(ctx, r.owner, r.ty);
@@ -2458,11 +2607,24 @@ fn conditionInner(ctx: *Ctx, cond: *const Expr) Allocator.Error!TypedFacts {
         },
         .Binary => |b| switch (b.op) {
             .Eq, .Neq, .IdentEq, .IdentNeq => {
+                // `(b == true) == false`: a condition compared with a
+                // Boolean literal is that condition or its negation.
+                if (b.op == .Eq or b.op == .Neq) if (boolComparison(b.lhs, b.rhs)) |bc| if (conditionForm(bc.other)) {
+                    const inner = try conditionTyped(ctx, bc.other);
+                    _ = try expr(ctx, bc.lit, .none);
+                    try calls.equalsRef(ctx, cond.span(), inner.ty);
+                    const same = bc.value == (b.op == .Eq);
+                    return .{ .facts = if (same) inner.facts else .{ .when_true = inner.facts.when_false, .when_false = inner.facts.when_true }, .ty = b_t };
+                };
+                const refs_before = ctx.refCount();
                 const lt = try expr(ctx, b.lhs, .none);
+                const refs_mid = ctx.refCount();
                 _ = try expr(ctx, b.rhs, .none);
                 // `x == null` is an identity test, not a call.
                 if ((b.op == .Eq or b.op == .Neq) and b.lhs.* != .NullLit and b.rhs.* != .NullLit) try calls.equalsRef(ctx, cond.span(), lt);
-                return .{ .facts = try nullFacts(ctx, b.op, b.lhs, b.rhs), .ty = b_t };
+                const nf = try nullFacts(ctx, b.op, b.lhs, b.rhs);
+                const vf = try valueFacts(ctx, b.op, b.lhs, b.rhs, objectNamedSince(ctx, refs_before, b.lhs), objectNamedSince(ctx, refs_mid, b.rhs));
+                return .{ .facts = .{ .when_true = try concat(ctx, nf.when_true, vf.when_true), .when_false = try concat(ctx, nf.when_false, vf.when_false) }, .ty = b_t };
             },
             .And => {
                 const l = try condition(ctx, b.lhs);
@@ -2470,7 +2632,10 @@ fn conditionInner(ctx: *Ctx, cond: *const Expr) Allocator.Error!TypedFacts {
                 try applyFacts(ctx, l.when_true);
                 const r = try condition(ctx, b.rhs);
                 ctx.pop(sc);
-                return .{ .facts = .{ .when_true = try concat(ctx, l.when_true, r.when_true) }, .ty = b_t };
+                // `(x is A) && throw ...` completes only when the left
+                // side was false.
+                const when_false: []const Narrow = if (jumps(b.rhs)) l.when_false else &.{};
+                return .{ .facts = .{ .when_true = try concat(ctx, l.when_true, r.when_true), .when_false = when_false }, .ty = b_t };
             },
             .Or => {
                 const l = try condition(ctx, b.lhs);
@@ -2478,7 +2643,8 @@ fn conditionInner(ctx: *Ctx, cond: *const Expr) Allocator.Error!TypedFacts {
                 try applyFacts(ctx, l.when_false);
                 const r = try condition(ctx, b.rhs);
                 ctx.pop(sc);
-                return .{ .facts = .{ .when_false = try concat(ctx, l.when_false, r.when_false) }, .ty = b_t };
+                const when_true: []const Narrow = if (jumps(b.rhs)) l.when_true else &.{};
+                return .{ .facts = .{ .when_false = try concat(ctx, l.when_false, r.when_false), .when_true = when_true }, .ty = b_t };
             },
             else => {},
         },
@@ -2662,7 +2828,14 @@ fn isFacts(ctx: *Ctx, e: *const Expr, t: TypeId, negated: bool) Allocator.Error!
     if (non_null) try out.appendSlice(s.arena, try nonNullFacts(ctx, e));
     const subj = (try subjectOf(ctx, e)) orelse try safeSubject(ctx, e);
     if (subj) |sj| try out.append(s.arena, .{ .sym = sj.sym, .ty = try intersectNarrow(ctx, sj.ty, t) });
-    return if (negated) .{ .when_false = out.items } else .{ .when_true = out.items };
+    // On the other outcome the value is not a `t`.
+    var not: []const Narrow = &.{};
+    if (subj) |sj| if (!s.types.isErr(t)) {
+        const one = try s.arena.alloc(Narrow, 1);
+        one[0] = .{ .sym = sj.sym, .ty = sj.ty, .excluded = .{ .type = t } };
+        not = one;
+    };
+    return if (negated) .{ .when_false = out.items, .when_true = not } else .{ .when_true = out.items, .when_false = not };
 }
 
 /// `r?.m` for a stable `r` and a stable property `m`: the path `r.m`.
@@ -2843,6 +3016,103 @@ pub fn subjectOf(ctx: *Ctx, e: *const Expr) Allocator.Error!?Subject {
     }
     if (e.* == .Labeled) return subjectOf(ctx, e.Labeled.expr);
     return .{ .sym = sym, .ty = try narrowedType(ctx, sym, try symbolType(ctx, sym)) };
+}
+
+const BoolComparison = struct { lit: *const Expr, other: *const Expr, value: bool };
+
+/// `c == true`, `false != c`: the literal side and the other.
+fn boolComparison(lhs: *const Expr, rhs: *const Expr) ?BoolComparison {
+    if (rhs.* == .BoolLit) return .{ .lit = rhs, .other = lhs, .value = rhs.BoolLit.value };
+    if (lhs.* == .BoolLit) return .{ .lit = lhs, .other = rhs, .value = lhs.BoolLit.value };
+    return null;
+}
+
+/// A condition whose outcomes say something: a type test, a comparison,
+/// a conjunction or disjunction, a negation.
+fn conditionForm(e: *const Expr) bool {
+    return switch (e.*) {
+        .IsCheck => true,
+        .Binary => |b| switch (b.op) {
+            .Eq, .Neq, .IdentEq, .IdentNeq, .And, .Or => true,
+            else => false,
+        },
+        .Unary => |u| u.op == .Not,
+        else => false,
+    };
+}
+
+/// `e == Enum.A`, `b == false`, `v == Obj`: a stable value compared with
+/// an enum entry, a Boolean literal or an object is that value, or is not.
+/// Equal to an entry, it is none of the others; equal to a Boolean, it is
+/// not the other one.
+fn valueFacts(ctx: *Ctx, op: ast.BinOp, lhs: *const Expr, rhs: *const Expr, lhs_named: Sym, rhs_named: Sym) Allocator.Error!Facts {
+    const s = ctx.s;
+    const eq = op == .Eq or op == .IdentEq;
+    var subj_e: *const Expr = lhs;
+    var value: Excluded = .none;
+    if (rhs.* == .BoolLit) {
+        value = .{ .boolean = rhs.BoolLit.value };
+    } else if (lhs.* == .BoolLit) {
+        subj_e = rhs;
+        value = .{ .boolean = lhs.BoolLit.value };
+    } else if (rhs_named != .none) {
+        value = .{ .value = rhs_named };
+    } else if (lhs_named != .none) {
+        subj_e = rhs;
+        value = .{ .value = lhs_named };
+    } else return .{};
+    const sj = (try subjectOf(ctx, subj_e)) orelse return .{};
+    var is_facts: std.ArrayList(Narrow) = .empty;
+    var not_facts: std.ArrayList(Narrow) = .empty;
+    switch (value) {
+        .boolean => |v| {
+            try is_facts.append(s.arena, .{ .sym = sj.sym, .ty = sj.ty, .excluded = .{ .boolean = !v } });
+            try not_facts.append(s.arena, .{ .sym = sj.sym, .ty = sj.ty, .excluded = .{ .boolean = v } });
+        },
+        .value => |v| {
+            try not_facts.append(s.arena, .{ .sym = sj.sym, .ty = sj.ty, .excluded = .{ .value = v } });
+            if (s.syms.kind(v) == .enum_entry) {
+                for (s.syms.classInfo(s.syms.entryInfo(v).enum_class).enum_entries) |other| {
+                    if (other != v) try is_facts.append(s.arena, .{ .sym = sj.sym, .ty = sj.ty, .excluded = .{ .value = other } });
+                }
+            }
+        },
+        else => {},
+    }
+    return if (eq) .{ .when_true = is_facts.items, .when_false = not_facts.items } else .{ .when_true = not_facts.items, .when_false = is_facts.items };
+}
+
+/// What the smart casts in scope rule out of `sym`'s values, as the
+/// patterns of a `when` over it would cover them.
+fn excludedCovers(ctx: *Ctx, sym: Sym) Allocator.Error![]const exhaustive.Cover {
+    var out: std.ArrayList(exhaustive.Cover) = .empty;
+    if (sym == .none) return out.items;
+    var sc: ?*Scope = ctx.scope;
+    while (sc) |c| : (sc = c.parent) {
+        var i = c.narrow.items.len;
+        while (i > 0) {
+            i -= 1;
+            const n = c.narrow.items[i];
+            if (n.sym != sym) continue;
+            if (n.reset) return out.items;
+            try out.append(ctx.arena(), switch (n.excluded) {
+                .none => continue,
+                .type => |t| .{ .is_type = t },
+                .value => |v| .{ .value = v },
+                .boolean => |b| .{ .bool_ = b },
+            });
+        }
+    }
+    return out.items;
+}
+
+fn excludedEqual(a: Excluded, b: Excluded) bool {
+    return switch (a) {
+        .none => b == .none,
+        .type => |t| b == .type and b.type == t,
+        .value => |v| b == .value and b.value == v,
+        .boolean => |x| b == .boolean and b.boolean == x,
+    };
 }
 
 /// `x == null`, `x != null`, `x === null`, `x !== null`: the subject is
@@ -3045,7 +3315,8 @@ pub fn narrowedType(ctx: *Ctx, sym: Sym, declared: TypeId) Allocator.Error!TypeI
         while (i > 0) {
             i -= 1;
             const n = c.narrow.items[i];
-            if (n.sym == sym) return n.ty;
+            // What a value is not leaves its type alone.
+            if (n.sym == sym and n.excluded == .none) return n.ty;
         }
     }
     return (try fieldCast(ctx, sym)) orelse declared;
@@ -3123,6 +3394,18 @@ fn mergeBranches(ctx: *Ctx, outs: []const BranchOut, inner: ?*const Scope) Alloc
         if (t == before or s.types.isErr(t)) continue;
         try merged.append(s.arena, .{ .sym = n.sym, .ty = t });
     };
+    // What every path that completes rules out still holds.
+    for (live.items[0]) |n| {
+        if (n.excluded == .none) continue;
+        if (inner) |sc| if (declaresLocal(sc, n.sym)) continue;
+        const everywhere = for (live.items[1..]) |o| {
+            const has = for (o) |m| {
+                if (m.sym == n.sym and excludedEqual(m.excluded, n.excluded)) break true;
+            } else false;
+            if (!has) break false;
+        } else true;
+        if (everywhere) try merged.append(s.arena, n);
+    }
     return merged.items;
 }
 
@@ -3130,7 +3413,7 @@ fn lastNarrow(out: []const Narrow, sym: Sym) ?TypeId {
     var i = out.len;
     while (i > 0) {
         i -= 1;
-        if (out[i].sym == sym) return out[i].ty;
+        if (out[i].sym == sym and out[i].excluded == .none) return out[i].ty;
     }
     return null;
 }
@@ -3676,7 +3959,9 @@ fn binary(ctx: *Ctx, e: *const Expr, op: ast.BinOp, lhs: *const Expr, rhs: *cons
     const s = ctx.s;
     switch (op) {
         .And, .Or => {
-            _ = try condition(ctx, e);
+            const f = try condition(ctx, e);
+            // Past `(x is A) && throw ...` the left side was false.
+            if (jumps(rhs)) try applyFacts(ctx, if (op == .And) f.when_false else f.when_true);
             return s.t.boolean;
         },
         .Eq, .Neq => {

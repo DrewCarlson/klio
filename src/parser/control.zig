@@ -662,6 +662,21 @@ pub fn parseWhenBranch(p: *Parser, has_subject: bool) ?WhenBranch {
         break;
     }
     support.skipNl(p);
+    // `is T if cond ->`: a guard the branch also needs.
+    var guard: ?*ast.WhenGuard = null;
+    const at_if = switch (support.peekKind(p).*) {
+        .Keyword => |k| k == .If,
+        else => false,
+    };
+    if (at_if) {
+        const if_tok = support.bump(p);
+        support.skipNl(p);
+        const ge = parseExpr(p) orelse return null;
+        const g = p.allocator.create(ast.WhenGuard) catch @panic("OOM in parser");
+        g.* = .{ .expr = ge, .span = if_tok.span.join(ge.span()) };
+        guard = g;
+        support.skipNl(p);
+    }
     _ = support.expect(p, .Arrow, "`->`") orelse return null;
     support.skipNl(p);
     const body = parseControlStructureBody(p) orelse return null;
@@ -670,6 +685,7 @@ pub fn parseWhenBranch(p: *Parser, has_subject: bool) ?WhenBranch {
         .patterns = patterns.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .body = body,
         .span = sp,
+        .guard = guard,
     };
 }
 
@@ -759,6 +775,9 @@ pub fn parseWhenPattern(p: *Parser, has_subject: bool) ?WhenPattern {
 
 pub fn parseLambdaLiteral(p: *Parser) ?Expr {
     const lbrace = support.bump(p);
+    const suppressed = p.suppress_trailing_lambda;
+    p.suppress_trailing_lambda = false;
+    defer p.suppress_trailing_lambda = suppressed;
     var header = parseLambdaHeader(p);
     // A header-less lambda gets the implicit `it`, as a trailing lambda does;
     // otherwise a non-trailing `f({ it.x }, y)` loses both its `it` and the
