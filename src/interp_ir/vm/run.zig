@@ -114,6 +114,7 @@ pub fn gcUnregisterVm(vm: *const Vm) void {
     for (gc_vms.items, 0..) |registered, i| {
         if (registered == vm) {
             _ = gc_vms.swapRemove(i);
+            if (gc_vms.items.len == 0) root.gcRetireClosureTable();
             return;
         }
     }

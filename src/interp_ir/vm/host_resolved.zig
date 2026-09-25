@@ -511,7 +511,7 @@ pub fn makeResolvedClosure(
         .resolved = kind,
     });
     if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
-    const ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = try allocator.dupe(Value, captures) });
+    const ref = try IrClosureRef.init(allocator, .{ .id = id, .table = self.closures.generation(), .captures = try allocator.dupe(Value, captures) });
     return .{ .ok = .{ .IrClosure = ref } };
 }
 
@@ -534,7 +534,7 @@ pub fn callResolvedClosure(self: *VmHost, allocator: Allocator, callee: *const V
     }
     if (this_value) |t| try params.append(allocator, t.*);
     try params.appendSlice(allocator, args);
-    return try ir.eval.evalClosure(VmHost, allocator, body.module, body.owning, body.func, params, caps, body.id, self);
+    return try ir.eval.evalClosure(VmHost, allocator, body.module, body.owning, body.func, params, caps, callee.IrClosure, self);
 }
 
 /// The body of a closure lowered from sema, or null for any other value.

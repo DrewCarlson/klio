@@ -608,7 +608,7 @@ fn runLoop(
                                         break :blocks er;
                                     }
                                     ev.eval_depth += 1;
-                                    const act = openStreamActivation(ev, allocator, t.run_module orelse frame.module, sc.func, t.params, t.captures, t.area, t.closure_id, t.owning, t.dst, sc.no_fill, reclaim) catch |e| {
+                                    const act = openStreamActivation(ev, allocator, t.run_module orelse frame.module, sc.func, t.params, t.captures, t.area, t.closure, t.owning, t.dst, sc.no_fill, reclaim) catch |e| {
                                         ev.eval_depth -= 1;
                                         if (t.area) |m| ev.vstack.restore(m);
                                         return e;
@@ -1367,7 +1367,7 @@ const StreamTarget = struct {
     area: ?ev_state.VsMark = null,
     run_module: ?*const Module = null,
     owning: ?*const Module = null,
-    closure_id: ?u64 = null,
+    closure: ?runtime.IrClosureRef = null,
     dst: Reg,
 };
 
@@ -1421,7 +1421,7 @@ inline fn closureTarget(comptime H: type, frame: *Frame, ev: *EvalTls, host: *H,
         .area = caps.mark,
         .run_module = body.module,
         .owning = body.owning,
-        .closure_id = body.id,
+        .closure = callee.IrClosure,
         .dst = @enumFromInt(op[5]),
     };
 }

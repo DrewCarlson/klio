@@ -192,7 +192,7 @@ pub fn evalClosureRaw(
     const state = vmhost.SharedHandles.fromIntrinsic(self);
     var host = VmHost.borrowed(state, out);
     vmhost.emitPath(self.allocator, "coroutine_closure", func.fqn, info.body_func, this_value, args);
-    return ir.eval.evalClosure(VmHost, self.allocator, module, info.module, func, args_owned, caps_owned, @intCast(id), &host);
+    return ir.eval.evalClosure(VmHost, self.allocator, module, info.module, func, args_owned, caps_owned, callable.IrClosure, &host);
 }
 
 /// Evaluate a top-level no-arg function as a coroutine driver root, raw `EvalError` out.
@@ -351,7 +351,7 @@ fn invokeResolvedClosure(self: *VmIntrinsicHost, callable: *const Value, this_va
     }
     if (this_value) |t| try params.append(self.allocator, t.*);
     try params.appendSlice(self.allocator, args);
-    const result = try ir.eval.evalClosure(VmHost, self.allocator, body.module, body.owning, body.func, params, caps, body.id, &host);
+    const result = try ir.eval.evalClosure(VmHost, self.allocator, body.module, body.owning, body.func, params, caps, callable.IrClosure, &host);
     return flattenEval(result);
 }
 

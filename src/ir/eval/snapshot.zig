@@ -95,8 +95,8 @@ pub const FrameSnapshot = struct {
     is_lambda: bool,
     /// Register the resumed value is written into before execution continues (the suspending call's destination).
     resume_reg: ?Reg,
-    /// Closure side-table id of a suspended closure body, rooting the slot and its captures while parked.
-    closure_id: ?u64 = null,
+    /// The closure of a suspended closure body, rooting its cell, table slot and captures while parked.
+    closure: ?runtime.IrClosureRef = null,
     /// A LIVE-parked flat activation, moved by pointer with no copies or retains, so its ownership graph is
     /// what execution left. The slice fields above are then empty and resume goes through `resumeLiveActivation`.
     live: ?*Activation = null,
@@ -472,7 +472,7 @@ pub fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
         for (act.frame.params) |v| v.gcMark(m);
         for (act.frame.captures) |v| v.gcMark(m);
         if (act.frame.pending) |p| p.gcMark(m);
-        markFrameClosure(act.frame.closure_id, m);
+        markFrameClosure(act.frame.closure, m);
         return;
     }
     switch (snap.regs) {
@@ -482,7 +482,7 @@ pub fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
     for (snap.params) |v| v.gcMark(m);
     for (snap.captures) |v| v.gcMark(m);
     snap.pending_finally.gcMark(m);
-    markFrameClosure(snap.closure_id, m);
+    markFrameClosure(snap.closure, m);
 }
 
 /// `runtime.gc.markSuspendHook` thunk: mark a builder continuation held as an opaque `*SuspendState`.

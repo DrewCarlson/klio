@@ -710,12 +710,12 @@ pub fn execRCallValue(comptime H: type, a: Allocator, frame: *Frame, x: anytype,
                     .params = params,
                     .captures = caps.vals,
                     .area = caps.mark,
-                    .closure_id = body.id,
+                    .closure = c,
                     .dst = x.dst,
                 };
                 return .flat_call;
             }
-            const res = try ev_enter.evalView(H, a, body.module, body.owning, body.func, params, caps.vals, caps.mark, body.id, host);
+            const res = try ev_enter.evalView(H, a, body.module, body.owning, body.func, params, caps.vals, caps.mark, c, host);
             return land(frame, res, x.dst);
         },
         .Instance => {

@@ -122,6 +122,11 @@ pub const ValueBox = value_mod.ValueBox;
 pub const ValueSlice = value_mod.ValueSlice;
 pub const IrClosureData = value_mod.IrClosureData;
 pub const IrClosureRef = value_mod.IrClosureRef;
+/// Installs (or, with null, removes) the hook that frees a swept closure's
+/// table slot.
+pub fn setClosureReleaseHook(f: ?*const fn (table: u64, id: u64) void) void {
+    value_mod.closureReleaseHook = f;
+}
 pub const ExceptionData = value_mod.ExceptionData;
 pub const CValue = value_mod.CValue;
 pub const NativeResume = value_mod.NativeResume;

@@ -395,7 +395,7 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         for (f.params) |v| v.gcMark(m);
         for (f.captures) |v| v.gcMark(m);
         if (f.pending) |p| p.gcMark(m);
-        markFrameClosure(f.closure_id, m);
+        markFrameClosure(f.closure, m);
     }
     // Not-yet-rebuilt snapshots of every in-flight resume on this thread.
     var r = anchor.resuming.*;
@@ -416,12 +416,11 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
     }
 }
 
-/// Root the side-table slot of a closure whose body is on the stack or parked:
-/// the frame holds only copies of the captures, so nothing else spares the slot.
-pub inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
-    if (closure_id) |id| {
-        if (runtime.gc.markClosureHook) |hook| hook(id, m);
-    }
+/// Root the closure whose body is on the stack or parked: its cell, which holds
+/// its table slot, and through it the slot's capture store. The frame holds
+/// only copies of the captures, so nothing else may spare them.
+pub inline fn markFrameClosure(closure: ?runtime.IrClosureRef, m: *runtime.gc.Marker) void {
+    if (closure) |c| (runtime.Value{ .IrClosure = c }).gcMark(m);
 }
 
 /// Link this thread's frame-chain root node (idempotent per thread).

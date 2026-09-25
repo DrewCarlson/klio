@@ -116,9 +116,10 @@ pub const Frame = struct {
     owns_params_caps: bool = false,
     /// Intrusive link onto the per-thread GC frame chain (see `evtlsPtr().frame_chain`).
     gc_link: ?*Frame = null,
-    /// The closure side-table id when this frame runs a closure body. The body holds only a copy of its capture
-    /// values, so the frame re-roots the slot through `markClosureHook`; otherwise a collection sweeps the store.
-    closure_id: ?u64 = null,
+    /// The closure whose body this frame runs. The body holds only a copy of its capture values, and the
+    /// closure's cell is its table slot's one holder: the frame roots the cell, so neither the slot nor its
+    /// capture store is freed while the body runs, even when nothing else references the closure.
+    closure: ?runtime.IrClosureRef = null,
     /// The control flow a running `finally` paused, allocated the first time the frame enters a
     /// finally with one; most frames never do.
     pending: ?*PendingFinallyState = null,
@@ -217,7 +218,7 @@ pub const Frame = struct {
         self.allocator = allocator;
         self.owns_params_caps = false;
         self.gc_link = null;
-        self.closure_id = null;
+        self.closure = null;
         self.pending = null;
         self.tls = ev;
         self.cur_span = null;

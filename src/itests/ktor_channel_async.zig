@@ -166,7 +166,7 @@ test "writer parks on flush past CHANNEL_MAX_SIZE and the reader resumes it" {
 
 test "writer parks past CHANNEL_MAX_SIZE survives repeated GC mid-write (reclaim=gc)" {
     // The parked writer's block lives only in the pump's drained-launched
-    // slice, so the keepalive and the frame's `closure_id` are its only roots.
+    // slice, so the keepalive and the frame's `closure` are its only roots.
     try runProgramGc("channel_writer_parks_gc",
         \\import io.ktor.utils.io.*
         \\import kotlinx.coroutines.*

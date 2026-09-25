@@ -219,7 +219,7 @@ fn frameMatchesLabel(func: *const Func, label: []const u8) bool {
     return false;
 }
 
-/// Runs `func` over `args` and `captures` as closure `closure_id` (null for a
+/// Runs `func` over `args` and `captures` as the body of `closure` (null for a
 /// plain call), reading its ids against `module`; `owning` is the sub-module
 /// a suspension resumes in. The lists' values are borrowed: they move into an
 /// argument area and the lists are freed.
@@ -231,7 +231,7 @@ pub fn evalClosure(
     func: *const Func,
     args: std.ArrayList(Value),
     captures: std.ArrayList(Value),
-    closure_id: ?u64,
+    closure: ?runtime.IrClosureRef,
     host: *H,
 ) Allocator.Error!EvalResult {
     var a = args;
@@ -240,7 +240,7 @@ pub fn evalClosure(
     defer c.deinit(allocator);
     const ar = try ArgArea.push(ev_state.evtlsPtr(), a.items, c.items);
     const np = a.items.len;
-    return evalView(H, allocator, module, owning, func, ar.vals[0..np], ar.vals[np..], ar.mark, closure_id, host);
+    return evalView(H, allocator, module, owning, func, ar.vals[0..np], ar.vals[np..], ar.mark, closure, host);
 }
 
 /// `evalClosure` over parameter and capture views: a run of the caller's
@@ -254,7 +254,7 @@ pub fn evalView(
     params: []const Value,
     captures: []const Value,
     at: ?VsMark,
-    closure_id: ?u64,
+    closure: ?runtime.IrClosureRef,
     host: *H,
 ) Allocator.Error!EvalResult {
     const ev: *EvalTls = ev_state.evtlsPtr();
@@ -268,7 +268,7 @@ pub fn evalView(
         if (at) |m| ev.vstack.restore(m);
         return e;
     };
-    frame.closure_id = closure_id;
+    frame.closure = closure;
     defer frame.deinitIn(ev);
     gcPushFrame(&frame);
     defer gcPopFrame(&frame);

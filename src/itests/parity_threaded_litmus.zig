@@ -138,6 +138,7 @@ const RUNNABLE = [_][]const u8{
     "tl_dispatch_thread_names",
     "tl_spin_handoff",
     "tl_gc_array_publish",
+    "tl_gc_closure_slots",
     "tl_gc_thread_start",
     "tl_gc_sweep_promote",
     "tl_gc_major_slices",
@@ -243,6 +244,9 @@ test "tl_spin_handoff" {
 }
 test "tl_gc_array_publish" {
     try check("tl_gc_array_publish");
+}
+test "tl_gc_closure_slots" {
+    try check("tl_gc_closure_slots");
 }
 test "tl_gc_thread_start" {
     try check("tl_gc_thread_start");

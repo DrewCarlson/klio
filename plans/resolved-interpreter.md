@@ -233,10 +233,10 @@ receiver or global path.
 
 | Id | Item | Status |
 |----|------|--------|
-| `green/corpus` | `itest-e2e`, the example corpus and the stdlib commontest sweep at their floors. | done: corpus 551/551 |
-| `green/packs` | Every pack suite in `plans/pack-suites-to-green.md` at or above its floor, compose runtime at 100%. | doing |
-| `green/box` | The kotlinc box corpus at or above its ratchet. | doing: 6268/84 ratchet, the old path 6019 |
-| `green/measure` | Re-take the headline costs, the executed dispatch census and `benchRecompose`, before and after, in the log below. | todo |
+| `green/corpus` | `itest-e2e`, the example corpus and the stdlib commontest sweep at their floors. | done |
+| `green/packs` | Every pack suite in `plans/pack-suites-to-green.md` at or above its floor, compose runtime at 100%. | done |
+| `green/box` | The kotlinc box corpus at or above its ratchet. | done |
+| `green/measure` | Re-take the headline costs, the executed dispatch census and `benchRecompose`, before and after, in the log below. | done |
 
 ### Speed
 
@@ -257,7 +257,7 @@ where the callee's parameters live) follows done.
 | `lower/copies` | Sema's lowering reads a local in its register and writes an expression's result into the assigned local, so a statement costs one op, not four. | small | done |
 | `stack/value-stack` | One contiguous per-thread value stack; frames are windows into it; arguments stay where the caller computed them; the collector scans the stack; `Frame` becomes a header. No allocation on the call path. | todo | done |
 | `engine/one` | One interpreter loop over one representation. The fused and framed/bytecode tiers merge; calls, returns, field slots and allocation stay in the stream instead of escaping to the instruction executor; the per-`Func` verdict bytes and their classification go. | -5k | done |
-| `runtime/gc-threads` | The collector's marking and pauses, contended monitors' spin and yield, reference counting on cell borrows and allocation cost, measured on `validatePotentialDeadlock` and the fleet: no lock or wait that is not needed, no CPU spent spinning where a thread can park. Every object stays shareable across threads with the JVM memory model's visibility and ordering; nothing assumes an object is confined to one thread unless the runtime proves it. In order: a large array remembers the index range its stores dirty, so a minor retraces that range and not the whole array; sweep leaves the pause; stop and blocking-safe waiters park through the OS instead of yield loops; then mostly-concurrent major marking (a short stop to scan roots, marking on the collector thread with the existing object-granular barrier recording every mutable borrow while it runs, cells allocated during marking born marked, a short remark) with concurrent sweep. Minor collections stay stop-the-world. Done when validatePotentialDeadlock spends under 1% of its run stopped (about 4.1 s, 8.2%, before concurrent marking), no major pause exceeds 10 ms, and minor pauses keep their sub-millisecond median, measured with `KLIO_GC_DEBUG` on the plain (non-verify) run and on the fleet. | +2-3k | doing |
+| `runtime/gc-threads` | The collector's marking and pauses, contended monitors' spin and yield, reference counting on cell borrows and allocation cost, measured on `validatePotentialDeadlock` and the fleet: no lock or wait that is not needed, no CPU spent spinning where a thread can park. Every object stays shareable across threads with the JVM memory model's visibility and ordering; nothing assumes an object is confined to one thread unless the runtime proves it. In order: a large array remembers the index range its stores dirty, so a minor retraces that range and not the whole array; sweep leaves the pause; stop and blocking-safe waiters park through the OS instead of yield loops; then mostly-concurrent major marking (a short stop to scan roots, marking on the collector thread with the existing object-granular barrier recording every mutable borrow while it runs, cells allocated during marking born marked, a short remark) with concurrent sweep. Minor collections stay stop-the-world. Done when validatePotentialDeadlock spends under 1% of its run stopped (about 4.1 s, 8.2%, before concurrent marking), no major pause exceeds 10 ms, and minor pauses keep their sub-millisecond median, measured with `KLIO_GC_DEBUG` on the plain (non-verify) run and on the fleet. | +2-3k | done |
 
 ### After done
 
@@ -272,6 +272,16 @@ upstream commonTest suite. Compose parity runs alongside the same way, in
 `plans/compose-parity.md`: every missing runtime, ui, foundation,
 animation and material3 API, the owned-layer adoption, and those modules'
 upstream commonTest suites.
+
+Portability: klio builds and runs on macOS, Linux and Windows (the
+release workflow ships all three, x64 and arm64). On 2026-09-26 main did
+not cross-compile for Windows: 111 errors across the runtime (safety,
+clock, slab, prof, gc, leaktrack), the cli (sema_cmd, sema_base_cache,
+shim_extract), the test runner and the Ktor natives. Each is being given a
+real Windows implementation, Linux is verified in a container, and the gate
+gains a cross-compile phase for Windows and Linux so portability cannot
+regress silently. Everything the Ktor and compose work adds must work on
+all three.
 
 The front end's memory and time for large projects, after
 `runtime/gc-threads` and measured on a large build (the compose packs)
@@ -1157,3 +1167,25 @@ measurement.
   derivedStateOfLeak 0.44%; the fleet 0.65%, longest 16.4 ms, the remarks
   over 10 ms all the closure-table pass. The done-line pause table is taken
   once the closure release-on-sweep lands.
+- 2026-09-25: a closure's table slot is released when its cell is swept,
+  on the sweeper thread, so the remark no longer walks the closure table
+  (closures_us 69-72 ms a run to 0). validatePotentialDeadlock on the
+  default meets the pause line: 0.61-0.77% stopped, remark median 0.26 ms,
+  longest pause 0.64 ms. The fleet does not yet: 0.56% stopped but two
+  pauses over 10 ms on a loaded machine, an initial stop carrying slice
+  work and a whole-cell remembered-set retrace (13.3 ms), and a remark that
+  is rendezvous time (10.9 ms).
+- 2026-09-26: runtime/gc-threads is done. A wait that makes no progress
+  (a contended monitor, another thread's initializer) counts as parked, so
+  a rendezvous no longer waits on a spinning thread; a store records the
+  write barrier only where it makes an edge and only over what it stored.
+  The final row on main plus these (load about 3.7): fib 0.24 s, bench_oo
+  0.47 s, bench_fn 2.03 s, trivial instruction 1.88 ns, cheapest
+  activation 24.08 ns, benchRecompose 319 us a frame,
+  resumeOnBackgroundThread 2.65 s, derivedStateOfLeak 33.84 s,
+  validatePotentialDeadlock 37.11 s; validatePotentialDeadlock stopped
+  0.58%, the fleet 0.42%, no pause over 10 ms, minor medians 0.2-0.3 ms.
+  The full gate was green on that tree. Pool dispatchers' timers moved to a
+  timer thread (withTimeout on a limitedParallelism(1) view resumes). The
+  gate is re-run on main with the Ktor, sema and coroutine work that
+  landed alongside.

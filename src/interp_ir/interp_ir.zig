@@ -140,19 +140,42 @@ pub const ClosureInfo = struct {
     /// `capture_names`.
     resolved: ?ir.resolved.Callable = null,
 
-    /// Epoch in which a live value last marked this closure. Post-sweep
-    /// reclamation frees an unmarked slot's `capture_names` and `chain`.
-    mark_epoch: usize = 0,
-    /// True once the metadata is freed and the id is back on the free list.
+    /// True once the closure's cell is swept, its metadata freed and its id
+    /// back on the free list.
     reclaimed: bool = false,
+};
 
-    /// No-op tracer. The capture store and chain live only while a value
-    /// references the closure id, so the permanent spine must not pin them.
-    pub fn gcTrace(self: *const ClosureInfo, m: *runtime.gc.Marker) void {
+/// The closure slots and the reclaimed ids, written only under the table's
+/// exclusive borrow.
+pub const ClosureTable = struct {
+    /// Tells this table from every other a process makes, for a sweep that
+    /// finalizes an earlier program's closure after a later program's table
+    /// took its place, perhaps at the same address.
+    gen: u64,
+    slots: std.ArrayList(ClosureInfo) = .empty,
+    /// Reclaimed ids; `push` reuses one before extending `slots`.
+    free: std.ArrayList(u64) = .empty,
+
+    /// Traces nothing. A closure's capture store lives only while a value
+    /// references its id, through `markClosureHook`, so the table must not
+    /// pin it.
+    pub fn gcTrace(self: *const ClosureTable, m: *runtime.gc.Marker) void {
         _ = self;
         _ = m;
     }
+
+    pub fn deinit(self: *ClosureTable, a: Allocator) void {
+        self.slots.deinit(a);
+        self.free.deinit(a);
+    }
+
+    pub fn gcFinalize(self: *ClosureTable, a: Allocator) void {
+        self.deinit(a);
+    }
 };
+
+/// The generation the next closure table takes; 0 names no table.
+var table_gens = std.atomic.Value(u64).init(0);
 
 /// The process-wide closure side-table `markClosureHook` consults. Every Vm
 /// shares one spine by handle clone, so one handle serves every collector.
@@ -160,33 +183,34 @@ var active_closures: ?SharedClosures = null;
 
 fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
     const sc = active_closures orelse return;
-    // Mark the slot live for this epoch, then shade its capture store. The
-    // spine's shared borrow is held throughout: a mark may run beside a `push`
-    // that reallocates the spine, which takes the exclusive borrow.
+    // Shade the slot's capture store. The table's shared borrow is held
+    // throughout: a mark may run beside a `push` that reallocates the slots,
+    // which takes the exclusive borrow.
     const g = sc.obj.borrow();
     defer g.deinit();
-    const list = g.get();
-    if (id >= list.items.len) return;
-    const info = &list.items[id];
-    // Only a mark writes the epoch, and only `reclaimDead` reads it, with the
-    // world stopped.
-    @atomicStore(usize, @constCast(&info.mark_epoch), m.epoch, .monotonic);
-    m.shade(&info.captures.cell.hdr);
+    const slots = g.get().slots.items;
+    if (id >= slots.len) return;
+    m.shade(&slots[id].captures.cell.hdr);
 }
 
-/// Free the owned metadata of every closure slot unreferenced in the finished
-/// collection. Stop-the-world, after the sweep, so the spine is stable.
-fn sweepClosuresThunk(epoch: usize) void {
-    const sc = active_closures orelse return;
-    sc.reclaimDead(epoch);
-    if (runtime.gc.gc_debug) {
-        const g = sc.obj.borrow();
-        const fg = sc.free_ids.borrow();
-        const mb = runtime.slab.mapped_bytes.load(.monotonic);
-        std.debug.print("[clos] spine={d} free={d} slab_mapped={d}MB\n", .{ g.get().items.len, fg.get().items.len, mb / (1024 * 1024) });
-        fg.deinit();
-        g.deinit();
-    }
+/// The table swept closures release their slots into: the running program's,
+/// or null. Read by the thread that sweeps, which may be the sweeper.
+var release_table = std.atomic.Value(?*anyopaque).init(null);
+
+/// The program's last Vm is gone: a later sweep releases into no table, since
+/// this one's memory may leave with the program's heap.
+pub fn gcRetireClosureTable() void {
+    release_table.store(null, .release);
+}
+
+/// Frees the slot of a closure whose cell was swept, when its table is the
+/// running program's. Runs on the sweeper thread, or on the collector inside
+/// the stop; neither holds a cell lock, and the table's lock is held by others
+/// only between their safe points.
+fn releaseClosureThunk(table: u64, id: u64) void {
+    const cell = release_table.load(.acquire) orelse return;
+    const sc: SharedClosures = .{ .obj = .{ .cell = @ptrCast(@alignCast(cell)) } };
+    sc.release(table, id);
 }
 
 /// Singleton identity for a closure id: non-zero and stable per (module, body
@@ -228,8 +252,9 @@ pub fn gcInstallClosureHook(closures: SharedClosures, module: *const Module) voi
     if (module.resolved != null) active_module = module;
     runtime.gc.closureTextHook = closureTextThunk;
     runtime.gc.markClosureHook = markClosureThunk;
-    runtime.gc.sweepClosureHook = sweepClosuresThunk;
     runtime.gc.closureSingletonHook = closureSingletonThunk;
+    release_table.store(@ptrCast(closures.obj.cell), .release);
+    runtime.setClosureReleaseHook(releaseClosureThunk);
     // A lazy `sequence {}` builder parks its continuation as an opaque
     // `*ir.eval.SuspendState`, which the GC needs these hooks to reach.
     runtime.gc.markSuspendHook = ir.eval.gcMarkSuspendStateOpaque;
@@ -242,57 +267,59 @@ pub fn gcResetProgramHooks() void {
     active_module = null;
     runtime.gc.closureTextHook = null;
     runtime.gc.markClosureHook = null;
-    runtime.gc.sweepClosureHook = null;
     runtime.gc.closureSingletonHook = null;
+    release_table.store(null, .release);
 }
 
 /// Lambda/closure side-table shared across every OS thread of one program. A
-/// slot id stays valid for as long as a live value references it.
+/// closure's slot is held by its one cell, the `IrClosure` value's: it is
+/// released when the collector sweeps that cell, and a frame running or
+/// parking the closure's body holds the cell.
 pub const SharedClosures = struct {
-    obj: ObjRef(std.ArrayList(ClosureInfo)),
-    /// Slot ids reclaimed by `reclaimDead`; `push` reuses one before extending
-    /// the spine. Sound because a slot is freed only after a full mark proved no
-    /// live value references its id. Writer lock or stop-the-world only.
-    free_ids: ObjRef(std.ArrayList(u64)),
+    obj: ObjRef(ClosureTable),
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedClosures {
-        const obj = try ObjRef(std.ArrayList(ClosureInfo)).init(allocator, .empty);
-        const free_ids = try ObjRef(std.ArrayList(u64)).init(allocator, .empty);
-        return .{ .obj = obj, .free_ids = free_ids };
+        const gen = table_gens.fetchAdd(1, .monotonic) + 1;
+        return .{ .obj = try ObjRef(ClosureTable).init(allocator, .{ .gen = gen }) };
     }
 
     pub fn clone(self: SharedClosures) SharedClosures {
-        return .{ .obj = self.obj.clone(), .free_ids = self.free_ids.clone() };
+        return .{ .obj = self.obj.clone() };
     }
 
     pub fn deinit(self: SharedClosures) void {
         self.obj.deinit();
-        self.free_ids.deinit();
+    }
+
+    /// The generation a closure made from this table records.
+    pub fn generation(self: SharedClosures) u64 {
+        return self.obj.asPtrConst().gen;
     }
 
     pub fn get(self: SharedClosures, id: usize) ?ClosureInfo {
         const g = self.obj.borrow();
         defer g.deinit();
-        const list = g.get();
-        if (id >= list.items.len) return null;
-        return list.items[id];
+        const slots = g.get().slots.items;
+        if (id >= slots.len) return null;
+        return slots[id];
     }
 
-    /// Free the owned metadata of every slot not marked in `epoch` and free its
-    /// id. The capture-store cell is swept separately. Stop-the-world only.
-    pub fn reclaimDead(self: SharedClosures, epoch: usize) void {
+    /// Free slot `id`'s owned metadata and its id, when `gen` is this table's
+    /// and the slot is held. The capture-store cell is swept separately.
+    pub fn release(self: SharedClosures, gen: u64, id: u64) void {
         const g = self.obj.borrowMut();
         defer g.deinit();
-        const fg = self.free_ids.borrowMut();
-        defer fg.deinit();
+        const t = g.get();
+        if (gen != t.gen or id >= t.slots.items.len) return;
+        const info = &t.slots.items[@intCast(id)];
+        if (info.reclaimed) return;
         const a = self.obj.cell.allocator;
-        for (g.get().items, 0..) |*info, idx| {
-            if (info.reclaimed or info.mark_epoch == epoch) continue;
-            if (info.capture_names.len != 0) a.free(info.capture_names);
-            info.capture_names = &.{};
-            info.reclaimed = true;
-            fg.get().append(a, @intCast(idx)) catch {};
-        }
+        // An id that cannot be listed stays held: a reused slot must be on the
+        // list, and a lost one only makes the table longer.
+        t.free.append(a, id) catch return;
+        if (info.capture_names.len != 0) a.free(info.capture_names);
+        info.capture_names = &.{};
+        info.reclaimed = true;
     }
 
     /// Bind `info` to a slot and return its id, reusing a reclaimed slot first.
@@ -300,17 +327,13 @@ pub const SharedClosures = struct {
     pub fn push(self: SharedClosures, info: ClosureInfo) Allocator.Error!u64 {
         const g = self.obj.borrowMut();
         defer g.deinit();
-        const list = g.get();
-        {
-            const fg = self.free_ids.borrowMut();
-            defer fg.deinit();
-            if (fg.get().pop()) |id| {
-                list.items[@intCast(id)] = info;
-                return id;
-            }
+        const t = g.get();
+        if (t.free.pop()) |id| {
+            t.slots.items[@intCast(id)] = info;
+            return id;
         }
-        const id: u64 = list.items.len;
-        try list.append(self.obj.cell.allocator, info);
+        const id: u64 = t.slots.items.len;
+        try t.slots.append(self.obj.cell.allocator, info);
         return id;
     }
 };
@@ -581,7 +604,98 @@ test "shared closures push is append-stable" {
     try testing.expect(sc.get(2) == null);
 }
 
-test "a mark of a closure's slot runs beside pushes that reallocate the spine" {
+/// A closure cell over a slot of `sc` taken for it, as `makeResolvedClosure` makes one.
+fn testClosure(sc: SharedClosures, caps: ObjRef(std.ArrayList(Value)), names: [][]const u8) !runtime.IrClosureRef {
+    const id = try sc.push(.{ .body_func = .from(0), .n_params = 0, .capture_names = names, .captures = caps });
+    return runtime.IrClosureRef.init(sc.obj.cell.allocator, .{ .id = id, .table = sc.generation(), .captures = try sc.obj.cell.allocator.alloc(Value, 0) });
+}
+
+/// What the collector does to a closure cell it sweeps.
+fn sweepCell(c: runtime.IrClosureRef) void {
+    c.cell.hdr.gc_finalize(&c.cell.hdr);
+}
+
+test "a swept closure's slot is reused and a live one's is not" {
+    const a = testing.allocator;
+    const sc = try SharedClosures.new(a);
+    defer sc.deinit();
+    release_table.store(@ptrCast(sc.obj.cell), .release);
+    defer release_table.store(null, .release);
+    runtime.setClosureReleaseHook(releaseClosureThunk);
+    defer runtime.setClosureReleaseHook(null);
+    const caps = try ObjRef(std.ArrayList(Value)).init(a, .empty);
+    defer caps.deinit();
+
+    const live = try testClosure(sc, caps, &.{});
+    defer sweepCell(live);
+    const names = try a.alloc([]const u8, 2);
+    @memset(names, "");
+    const dead = try testClosure(sc, caps, names);
+    const live_id = live.asPtrConst().id;
+    const dead_id = dead.asPtrConst().id;
+
+    sweepCell(dead);
+    // The swept closure's names are freed (the allocator checks) and its id
+    // is the next one taken; the live closure's slot is untouched.
+    try testing.expect(sc.get(dead_id).?.reclaimed);
+    try testing.expectEqual(@as(usize, 0), sc.get(dead_id).?.capture_names.len);
+    try testing.expect(!sc.get(live_id).?.reclaimed);
+    const next = try testClosure(sc, caps, &.{});
+    defer sweepCell(next);
+    try testing.expectEqual(dead_id, next.asPtrConst().id);
+    try testing.expect(!sc.get(dead_id).?.reclaimed);
+    const fresh = try testClosure(sc, caps, &.{});
+    defer sweepCell(fresh);
+    try testing.expect(fresh.asPtrConst().id != live_id);
+    try testing.expect(fresh.asPtrConst().id != dead_id);
+}
+
+test "a closure swept after its program's table was replaced leaves the new table alone" {
+    const a = testing.allocator;
+    const old = try SharedClosures.new(a);
+    defer old.deinit();
+    const new = try SharedClosures.new(a);
+    defer new.deinit();
+    try testing.expect(old.generation() != new.generation());
+    runtime.setClosureReleaseHook(releaseClosureThunk);
+    defer runtime.setClosureReleaseHook(null);
+    defer release_table.store(null, .release);
+    const caps = try ObjRef(std.ArrayList(Value)).init(a, .empty);
+    defer caps.deinit();
+
+    release_table.store(@ptrCast(old.obj.cell), .release);
+    const stale = try testClosure(old, caps, &.{});
+    // The next program's table takes over, and its first closure takes the
+    // same id the stale one holds.
+    release_table.store(@ptrCast(new.obj.cell), .release);
+    const current = try testClosure(new, caps, &.{});
+    defer sweepCell(current);
+    try testing.expectEqual(stale.asPtrConst().id, current.asPtrConst().id);
+    sweepCell(stale);
+    try testing.expect(!new.get(current.asPtrConst().id).?.reclaimed);
+    // With no program's table installed, a sweep releases nothing.
+    release_table.store(null, .release);
+    const orphan = try testClosure(new, caps, &.{});
+    sweepCell(orphan);
+    try testing.expect(!new.get(orphan.asPtrConst().id).?.reclaimed);
+}
+
+test "a closure's slot is released once, however often its release runs" {
+    const a = testing.allocator;
+    const sc = try SharedClosures.new(a);
+    defer sc.deinit();
+    const caps = try ObjRef(std.ArrayList(Value)).init(a, .empty);
+    defer caps.deinit();
+    const id = try sc.push(.{ .body_func = .from(0), .n_params = 0, .capture_names = &.{}, .captures = caps });
+    sc.release(sc.generation(), id);
+    sc.release(sc.generation(), id);
+    sc.release(sc.generation(), id + 10);
+    const g = sc.obj.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 1), g.get().free.items.len);
+}
+
+test "a mark of a closure's slot runs beside pushes and releases that change the table" {
     const a = std.heap.smp_allocator;
     const sc = try SharedClosures.new(a);
     defer sc.deinit();
@@ -589,20 +703,27 @@ test "a mark of a closure's slot runs beside pushes that reallocate the spine" {
     defer active_closures = null;
     const caps = try ObjRef(std.ArrayList(Value)).init(a, .empty);
     defer caps.deinit();
+    const other = try ObjRef(std.ArrayList(Value)).init(a, .empty);
+    defer other.deinit();
     _ = try sc.push(.{ .body_func = .from(0), .n_params = 0, .capture_names = &.{}, .captures = caps });
 
-    const Pusher = struct {
+    // A mutator making closures and a sweeper releasing every other one: the
+    // slots grow, and freed ids are taken again.
+    const Churn = struct {
         fn run(s: SharedClosures, c: ObjRef(std.ArrayList(Value)), stop: *std.atomic.Value(bool)) void {
             while (!stop.load(.monotonic)) {
-                _ = s.push(.{ .body_func = .from(1), .n_params = 0, .capture_names = &.{}, .captures = c }) catch return;
+                const keep = s.push(.{ .body_func = .from(1), .n_params = 0, .capture_names = &.{}, .captures = c }) catch return;
+                const drop = s.push(.{ .body_func = .from(1), .n_params = 0, .capture_names = &.{}, .captures = c }) catch return;
+                _ = keep;
+                s.release(s.generation(), drop);
             }
         }
     };
     var stop = std.atomic.Value(bool).init(false);
-    const t = try std.Thread.spawn(.{}, Pusher.run, .{ sc, caps, &stop });
-    // Each mark writes slot 0's epoch and shades its capture store while the
-    // spine grows under it; a mark that let go of the spine first would write
-    // into a buffer the push has freed.
+    const t = try std.Thread.spawn(.{}, Churn.run, .{ sc, other, &stop });
+    // Each mark reads slot 0 and shades its capture store while the slots are
+    // reallocated under it; a mark that let go of the table first would read
+    // a buffer the push has freed.
     var epoch: usize = 1;
     while (epoch < 20_000) : (epoch += 1) {
         var m: runtime.gc.Marker = .{ .epoch = epoch, .arena = a };
@@ -613,7 +734,7 @@ test "a mark of a closure's slot runs beside pushes that reallocate the spine" {
     }
     stop.store(true, .monotonic);
     t.join();
-    try testing.expectEqual(@as(usize, epoch - 1), sc.get(0).?.mark_epoch);
+    try testing.expect(!sc.get(0).?.reclaimed);
 }
 
 test "a thread's error result keeps the values it carries reachable" {

@@ -185,7 +185,7 @@ pub fn resumeContinuation(
             ev.vstack.restore(area.mark);
             return e;
         };
-        frame.closure_id = snap.closure_id;
+        frame.closure = snap.closure;
         frame.pfSet(snap.pending_finally) catch |e| {
             frame.deinitIn(ev);
             return e;
@@ -387,7 +387,7 @@ pub fn snapshotSuspendedFrame(
         .pending_finally = frame.pf(),
         .is_lambda = frame.func.is_lambda,
         .resume_reg = resume_reg,
-        .closure_id = frame.closure_id,
+        .closure = frame.closure,
     };
     if (resumeTraceOn()) {
         std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} pending={}/{}/{} caps={d}\n", .{
@@ -450,7 +450,7 @@ pub inline fn openStreamActivation(
     params: []const Value,
     captures: []const Value,
     area: ?ev_state.VsMark,
-    closure_id: ?u64,
+    closure: ?runtime.IrClosureRef,
     owning: ?*const Module,
     dst: Reg,
     no_fill: bool,
@@ -463,7 +463,7 @@ pub inline fn openStreamActivation(
         .params = params,
         .captures = captures,
         .area = area,
-        .closure_id = closure_id,
+        .closure = closure,
         .dst = dst,
     });
     const act: *Activation = if (ev.act_pool_len > 0) blk: {
@@ -476,7 +476,7 @@ pub inline fn openStreamActivation(
     };
     errdefer actFree(ev, allocator, act);
     try act.frame.enterStream(ev, allocator, module, func, params, captures, area, no_fill, false);
-    act.frame.closure_id = closure_id;
+    act.frame.closure = closure;
     act.frame.module_arc = owning;
     act.try_stack = .empty;
     act.ret_dst = dst;
@@ -513,7 +513,7 @@ pub fn openActivation(ev: *EvalTls, allocator: Allocator, caller_module: *const 
     const act = try actAlloc(ev, allocator);
     errdefer actFree(ev, allocator, act);
     try act.frame.enter(ev, allocator, module, req.func, req.params, req.captures, req.area);
-    act.frame.closure_id = req.closure_id;
+    act.frame.closure = req.closure;
     act.frame.module_arc = req.owning;
     act.try_stack = .empty;
     act.ret_idx = 0;
@@ -567,7 +567,7 @@ pub fn liveParkActivation(
         .pending_finally = .{},
         .is_lambda = act.frame.func.is_lambda,
         .resume_reg = resume_reg,
-        .closure_id = act.frame.closure_id,
+        .closure = act.frame.closure,
     });
 }
 

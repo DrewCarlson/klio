@@ -48,7 +48,7 @@ pub const FlatCallReq = struct {
     captures: []const Value = &.{},
     /// Where the value stack stood before the call pushed an argument area; null when it pushed none.
     area: ?VsMark = null,
-    closure_id: ?u64 = null,
+    closure: ?runtime.IrClosureRef = null,
     dst: Reg,
 };
 

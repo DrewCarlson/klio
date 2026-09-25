@@ -337,7 +337,12 @@ pub const ValueSlice = ObjRef([]Value);
 pub const IrClosureData = struct {
     pub const objref_immutable = true;
 
+    /// The closure's slot in its program's closure table. This cell is the
+    /// id's only holder, so the slot is released when the cell is swept.
     id: u64,
+    /// The generation of the closure table `id` indexes: a sweep releases the
+    /// slot only into that table, never into a later program's. 0 names none.
+    table: u64 = 0,
     captures: []Value,
 
     /// Without this hook the captures read as a leaf and are swept while live.
@@ -346,10 +351,15 @@ pub const IrClosureData = struct {
     }
 
     pub fn gcFinalize(self: *IrClosureData, a: std.mem.Allocator) void {
+        if (closureReleaseHook) |f| f(self.table, self.id);
         a.free(self.captures);
     }
 };
 pub const IrClosureRef = ObjRef(IrClosureData);
+
+/// Frees the closure-table slot of a swept closure: `(table generation, id)`.
+/// Set by the interpreter; it runs on whichever thread sweeps the cell.
+pub var closureReleaseHook: ?*const fn (table: u64, id: u64) void = null;
 pub const MapPair = struct {
     key: Value,
     value: Value,
