@@ -79,6 +79,36 @@ test "static_operator_resolution" {
     );
 }
 
+test "charsequence_content_equals_custom" {
+    try check("charsequence_content_equals_custom",
+        \\true
+        \\true
+        \\true
+        \\true
+        \\false
+        \\false
+        \\true
+        \\false
+        \\false
+        \\reads after a first-character mismatch: 1
+        \\false
+        \\false
+        \\
+    );
+}
+
+test "stringbuilder_range_custom_charsequence" {
+    try check("stringbuilder_range_custom_charsequence",
+        \\[el] reads=2
+        \\[]
+        \\[axyb]
+        \\[ell]
+        \\[!tail]
+        \\out of range
+        \\
+    );
+}
+
 test "annotated_expression_body" {
     try check("annotated_expression_body",
         \\neg

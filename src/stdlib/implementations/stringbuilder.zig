@@ -299,6 +299,45 @@ fn valueToUtf16(allocator: Allocator, v: Value) Allocator.Error!?[]u16 {
     }
 }
 
+const UnitsResult = union(enum) { ok: []u16, err: RuntimeError };
+
+/// The UTF-16 units in [start, end) of a program's own CharSequence, read as a
+/// builder reads one: its `length` first, the range checked against it, then
+/// `get` for each index of the range. The caller frees the units.
+fn userSeqRange(ctx: *CallCtx, v: *const Value, start_arg: ?Value, end_arg: ?Value) Allocator.Error!UnitsResult {
+    const a = ctx.allocator;
+    const lr = (try ctx.host.callWellKnown(v, .length, &.{}, ctx.out)) orelse
+        return .{ .err = .{ .Type = "the CharSequence has no length" } };
+    const vlen: i64 = switch (lr) {
+        .ok => |lv| lv.asI64() orelse 0,
+        .err => |e| return .{ .err = e },
+    };
+    const start = if (start_arg) |sa| (sa.asI64() orelse 0) else 0;
+    const end = if (end_arg) |ea| (ea.asI64() orelse vlen) else vlen;
+    if (start < 0 or start > end or end > vlen) {
+        const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
+        defer if (runtime.freeScratch()) a.free(msg);
+        return .{ .err = try rangeOob(a, msg) };
+    }
+    const out = try a.alloc(u16, @intCast(end - start));
+    errdefer a.free(out);
+    var i = start;
+    while (i < end) : (i += 1) {
+        const cr = (try ctx.host.callWellKnown(v, .char_at, &.{Value.newInt(i)}, ctx.out)) orelse {
+            a.free(out);
+            return .{ .err = .{ .Type = "the CharSequence has no get" } };
+        };
+        switch (cr) {
+            .ok => |cv| out[@intCast(i - start)] = if (cv == .Char) cv.Char else 0,
+            .err => |e| {
+                a.free(out);
+                return .{ .err = e };
+            },
+        }
+    }
+    return .{ .ok = out };
+}
+
 fn rangeOob(allocator: Allocator, msg: []const u8) Allocator.Error!RuntimeError {
     return .{ .Thrown = try makeException(allocator, "kotlin.IndexOutOfBoundsException", msg) };
 }
@@ -534,6 +573,15 @@ pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
         try gb.get().appendSlice(a, d.bytes[range[0]..range[1]]);
         return okSb(sb);
     }
+    if (ctx.args.len > 1 and ctx.args[1] == .Instance) {
+        const r = try userSeqRange(ctx, &ctx.args[1], if (ctx.args.len > 2) ctx.args[2] else null, if (ctx.args.len > 3) ctx.args[3] else null);
+        const units = switch (r) {
+            .ok => |u| u,
+            .err => |e| return errResult(e),
+        };
+        defer a.free(units);
+        return appendUnits(a, sb, units);
+    }
     const value = if (ctx.args.len > 1) (try valueToUtf16(a, ctx.args[1])) else null;
     if (value == null) return errResult(.{ .Type = "appendRange value must be a CharArray/CharSequence" });
     defer a.free(value.?);
@@ -545,8 +593,10 @@ pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
         defer if (runtime.freeScratch()) a.free(msg);
         return errResult(try rangeOob(a, msg));
     }
-    const slice = value.?[@intCast(start)..@intCast(end)];
+    return appendUnits(a, sb, value.?[@intCast(start)..@intCast(end)]);
+}
 
+fn appendUnits(a: Allocator, sb: StringBuilderRef, slice: []const u16) Allocator.Error!EvalResult {
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
@@ -564,12 +614,21 @@ pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.insertRange"));
     const index = if (ctx.args.len > 1) (ctx.args[1].asI64() orelse 0) else 0;
-    const value = if (ctx.args.len > 2) (try valueToUtf16(a, ctx.args[2])) else null;
+    // A program's own CharSequence gives the range it is asked for.
+    const user_units: ?[]u16 = if (ctx.args.len > 2 and ctx.args[2] == .Instance) blk: {
+        const r = try userSeqRange(ctx, &ctx.args[2], if (ctx.args.len > 3) ctx.args[3] else null, if (ctx.args.len > 4) ctx.args[4] else null);
+        break :blk switch (r) {
+            .ok => |u| u,
+            .err => |e| return errResult(e),
+        };
+    } else null;
+    defer if (user_units) |u| a.free(u);
+    const value = if (user_units != null) try a.dupe(u16, user_units.?) else if (ctx.args.len > 2) (try valueToUtf16(a, ctx.args[2])) else null;
     if (value == null) return errResult(.{ .Type = "insertRange value must be a CharArray/CharSequence" });
     defer a.free(value.?);
     const vlen: i64 = @intCast(value.?.len);
-    const start = if (ctx.args.len > 3) (ctx.args[3].asI64() orelse 0) else 0;
-    const end = if (ctx.args.len > 4) (ctx.args[4].asI64() orelse vlen) else vlen;
+    const start = if (user_units != null) 0 else if (ctx.args.len > 3) (ctx.args[3].asI64() orelse 0) else 0;
+    const end = if (user_units != null) vlen else if (ctx.args.len > 4) (ctx.args[4].asI64() orelse vlen) else vlen;
     if (start < 0 or start > end or end > vlen) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
         defer if (runtime.freeScratch()) a.free(msg);
@@ -622,9 +681,11 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     return okSb(sb);
 }
 
+// A program's own CharSequence is an instance; `append(vararg String?)` never
+// takes one, so an instance with two Ints after it is the subrange overload.
 fn isCharSeqOrArray(v: Value) bool {
     return switch (v) {
-        .String, .StringBuilder, .Array => true,
+        .String, .StringBuilder, .Array, .Instance => true,
         else => false,
     };
 }

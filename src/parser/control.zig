@@ -657,6 +657,9 @@ pub fn parseWhenBranch(p: *Parser, has_subject: bool) ?WhenBranch {
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
             _ = support.bump(p);
+            support.skipNl(p);
+            // A trailing comma after the last condition, before `->`.
+            if (std.meta.activeTag(support.peekKind(p).*) == .Arrow) break;
             continue;
         }
         break;

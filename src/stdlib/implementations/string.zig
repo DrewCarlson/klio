@@ -953,6 +953,9 @@ pub fn char_sequence_content_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args[0] == .Null) {
         return .{ .ok = .{ .Bool = ctx.args.len >= 2 and ctx.args[1] == .Null } };
     }
+    if (ctx.args[0] == .Instance or (ctx.args.len >= 2 and ctx.args[1] == .Instance)) {
+        return contentEqualsByChars(ctx);
+    }
     const ar = try charSeqToString(ctx.allocator, ctx.args[0], "contentEquals");
     const a = switch (ar) {
         .ok => |v| v,
@@ -972,6 +975,81 @@ pub fn char_sequence_content_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
     else
         std.mem.eql(u8, a, other);
     return .{ .ok = .{ .Bool = eq } };
+}
+
+/// A CharSequence read the way the common `contentEqualsImpl` reads one: a
+/// String's or StringBuilder's UTF-16 units directly, a user CharSequence's
+/// through its `length` and `get`.
+const SeqView = struct {
+    units: ?[]u16 = null,
+    instance: ?*const Value = null,
+    len: i64 = 0,
+};
+
+fn seqView(ctx: *CallCtx, v: *const Value) Allocator.Error!union(enum) { ok: SeqView, err: RuntimeError } {
+    if (v.* == .Instance) {
+        const r = (try ctx.host.callWellKnown(v, .length, &.{}, ctx.out)) orelse
+            return .{ .err = .{ .Type = "contentEquals: the CharSequence has no length" } };
+        return switch (r) {
+            .ok => |lv| .{ .ok = .{ .instance = v, .len = lv.asI64() orelse 0 } },
+            .err => |e| .{ .err = e },
+        };
+    }
+    const sr = try charSeqToString(ctx.allocator, v.*, "contentEquals");
+    const bytes = switch (sr) {
+        .ok => |x| x,
+        .err => |e| return .{ .err = e },
+    };
+    defer ctx.allocator.free(bytes);
+    const units = try utf16Units(ctx.allocator, bytes);
+    return .{ .ok = .{ .units = units, .len = @intCast(units.len) } };
+}
+
+fn seqCharAt(ctx: *CallCtx, view: SeqView, i: i64) Allocator.Error!union(enum) { ok: u16, err: RuntimeError } {
+    if (view.units) |u| return .{ .ok = u[@intCast(i)] };
+    const r = (try ctx.host.callWellKnown(view.instance.?, .char_at, &.{Value.newInt(i)}, ctx.out)) orelse
+        return .{ .err = .{ .Type = "contentEquals: the CharSequence has no get" } };
+    return switch (r) {
+        .ok => |cv| .{ .ok = if (cv == .Char) cv.Char else 0 },
+        .err => |e| .{ .err = e },
+    };
+}
+
+/// `contentEquals` when a side is a user CharSequence, as the common
+/// `contentEqualsImpl` (and its ignore-case twin) compares: the same object is
+/// equal, lengths are compared first, then the characters one by one through
+/// `get`, up to the first that differs.
+fn contentEqualsByChars(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[1] == .Null) return .{ .ok = .{ .Bool = false } };
+    const a = &ctx.args[0];
+    const b = &ctx.args[1];
+    if (Value.referenceEq(a, b)) return .{ .ok = .{ .Bool = true } };
+    const ignore_case = ctx.args.len > 2 and ctx.args[2] == .Bool and ctx.args[2].Bool;
+    const va = switch (try seqView(ctx, a)) {
+        .ok => |x| x,
+        .err => |e| return .{ .err = e },
+    };
+    defer if (va.units) |u| ctx.allocator.free(u);
+    const vb = switch (try seqView(ctx, b)) {
+        .ok => |x| x,
+        .err => |e| return .{ .err = e },
+    };
+    defer if (vb.units) |u| ctx.allocator.free(u);
+    if (va.len != vb.len) return .{ .ok = .{ .Bool = false } };
+    var i: i64 = 0;
+    while (i < va.len) : (i += 1) {
+        const ca = switch (try seqCharAt(ctx, va, i)) {
+            .ok => |x| x,
+            .err => |e| return .{ .err = e },
+        };
+        const cb = switch (try seqCharAt(ctx, vb, i)) {
+            .ok => |x| x,
+            .err => |e| return .{ .err = e },
+        };
+        const same = if (ignore_case) char.charEqIgnoreCase(ca, cb) else ca == cb;
+        if (!same) return .{ .ok = .{ .Bool = false } };
+    }
+    return .{ .ok = .{ .Bool = true } };
 }
 
 pub fn char_sequence_element_at(ctx: *CallCtx) Allocator.Error!EvalResult {

@@ -1102,6 +1102,28 @@ test "a when branch takes a guard after its condition or else" {
     try testing.expect(w.branches[2].guard == null);
 }
 
+test "a when branch's conditions may end with a comma, and `->` may start a line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun f(x: Int) = when (x) {
+        \\    1,
+        \\    2,
+        \\        -> "low"
+        \\    3
+        \\        -> "three"
+        \\    4, -> "four"
+        \\    else -> "high"
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const w = out.file.decls[0].Function.body.?.Expr.When;
+    try testing.expectEqual(@as(usize, 4), w.branches.len);
+    try testing.expectEqual(@as(usize, 2), w.branches[0].patterns.len);
+    try testing.expectEqual(@as(usize, 1), w.branches[1].patterns.len);
+    try testing.expectEqual(@as(usize, 1), w.branches[2].patterns.len);
+}
+
 test "a primary constructor keeps the annotations written before `constructor`" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
