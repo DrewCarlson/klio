@@ -15,13 +15,23 @@ where the upstream one needs the JVM, AWT or a native platform API.
    files the pack includes. The inventory script walks the upstream tree at
    the pinned commit and each pack's `klio.toml`.
 2. **Sema census.** `scripts/sema-census.py` over every installed pack: no
-   compose site unresolved, unlowered or unbound (`tests/sema-census-open.txt`
-   carries none).
+   compose site unresolved, unlowered or unbound. `tests/sema-census-open.txt`
+   carries one: ComposeSceneInputHandler's import of RootNodeOwner (named
+   only in its KDoc), which resolves when the upstream scene lands.
 3. **Upstream suites.** Each module's upstream test sets as a ratcheted
    census in `src/itests/commontest_support.zig`.
 4. **Examples and pixels.** A deterministic example per feature area under
    `examples/`, with pixel checks read back from the rendered frame for
    anything that draws.
+5. **The JVM oracle.** Compose Desktop 1.12.0 itself, resolved from Maven
+   Central and Google Maven and run headless through ImageComposeScene: an
+   example written against `KlioComposeScene` runs unchanged on it (a
+   same-API class over ImageComposeScene stands in), and its output is the
+   expected output. Pixel values, text metrics and event sequences are
+   compared exactly. `scripts/compose-oracle.py` runs an example on both and
+   diffs them; `scripts/compose-oracle-fetch.py` resolves the classpath into
+   target/parity-cache. The expected outputs are committed with the
+   examples.
 
 ## Where the suites stand
 
@@ -55,9 +65,11 @@ Not run yet, and what each needs:
 3. **The upstream scene.** RootNodeOwner, OwnedLayerManager,
    GraphicsLayerOwnerLayer, BaseComposeScene, CanvasLayersComposeScene and
    the input and focus handlers from ui's skikoMain, in place of
-   KlioComposeHost and KlioScene. Layer alpha, color filter, blend mode,
-   render effect and shadows, and hit testing through layer transforms, come
-   with it; each property gets a pixel check, and hit testing a test.
+   KlioComposeHost and KlioScene. The layers are done: GraphicsLayerOwnerLayer
+   and OwnedLayerManager run verbatim over skiko's RenderNode, with every
+   graphicsLayer property and hit testing through layer transforms checked
+   against Compose Desktop (compose_graphics_layer). The rest waits for the
+   lifecycle and savedstate checkout.
 4. **The ui-test skiko harness**, then the foundation, material3 and ui
    skikoTest suites, each with its own ratchet.
 5. **Desktop and skiko public APIs.** Scrollbars, TooltipArea, ContextMenuArea,
@@ -68,9 +80,13 @@ Not run yet, and what each needs:
    skikoMain run verbatim in place of KlioCanvas, KlioPath and
    PlatformParagraph. Its API surface and mapping onto libklio_skia go to
    review before it is built.
-7. **The long tail.** A host locale service for `Locale.current`, the
-   remaining nonJvm actuals taken verbatim, the desktop window API's
-   signatures (WindowState, DialogWindow, ...).
+7. **The long tail.** The remaining nonJvm actuals taken verbatim, the
+   desktop window API's AWT-bound rest (dialog modality, window
+   transparency, a menu bar drawn in SDL windows and a tray on their hosts,
+   which have no native ones). `Window(icon)` draws its painter at 192 pixels, as
+   the desktop does, and sets it on SDL and Win32 windows; a macOS window
+   has no icon of its own. The `window` of a WindowScope is AWT's own window
+   and has no klio counterpart.
 
 ## Inventory
 
@@ -80,18 +96,20 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 |--------|-----------:|----------:|-----------:|------------------------:|
 | runtime | 188 / 188 | n/a | 6 / 9, nonAndroid 10 / 10 | jvmAndAndroid 3 java-free; klio actuals |
 | runtime-saveable | 7 / 9 | n/a | n/a | n/a |
-| ui | 241 / 244 | 20 / 92 | 1 / 8 | 79 / 175 |
+| ui | 244 / 244 | 46 / 92 | 8 / 8 | 86 / 175 |
 | ui-graphics | 82 / 82 | 0 / 19 | 1 / 1 | 0 / 7 |
 | ui-text | 79 / 79 | 2 / 28 | 4 / 5 | 0 / 15 |
 | ui-unit, ui-util, ui-geometry | complete | n/a | complete, ui-unit nonAndroid 2 / 2 | n/a |
-| foundation | 354 / 354 | 126 / 127 | 8 / 8 | 26 / 37 |
+| foundation | 354 / 354 | 126 / 127 | 8 / 8 | 27 / 37 |
 | foundation-layout | 32 / 32 | 2 / 2 | 1 / 1 | n/a |
 | animation, animation-core | complete | n/a | complete, animation nonAndroid 2 / 2 | n/a |
 | material3 | 251 / 251 | 97 / 97 | 4 / 4 | 0 / 2 (java.text) |
 | material-ripple | 4 / 4 | nonAndroid 1 / 1 | n/a | n/a |
 | graphics-shapes | 16 / 16 | n/a | 0 / 1 | jvmMain 1 / 1 |
 
-klio actuals that stay: runtime's thread id, identity hash, weak reference
+klio actuals that stay: ui-text's Locale and string delegate (the
+desktop's wrap java.util.Locale and the JVM's casing; klio reads tags and
+cases as those do); runtime's thread id, identity hash, weak reference
 (strong: the collector has no weak references), locks over atomicfu, the
 desktop frame clock and the error logger; animation-core's current-thread
 token; ui-util's tracing; ui-text's code-point direction helpers (they ask
@@ -100,18 +118,17 @@ runtime-annotation (klio's `Stable`/`Immutable`/lint markers stand in) and
 runtime-retain (klio carries only the store interface the ui owner exposes;
 the `retain` composables are missing). foundation's desktopMain files left:
 TooltipArea, ContextMenuProvider, BasicContextMenuRepresentation and
-text/ContextMenu (with the upstream scene); DesktopScrollable,
-ClipboardUtils, KeyEventHelpers, TextFieldKeyInput and
-TextFieldSelectionState, adapted in klioMain with their AWT calls replaced;
-WindowDraggableArea (AWT window dragging).
+text/ContextMenu (with the upstream scene and a Swing-free popup menu);
+DesktopScrollable, KeyEventHelpers and TextFieldKeyInput, adapted in
+klioMain with their AWT calls replaced; ClipboardUtils, adapted over
+klio.datatransfer; WindowDraggableArea (AWT window dragging).
 
 Public API still missing (beyond the scene internals): ui's
-`ImageComposeScene`, `renderComposeScene`, `Modifier.onPointerEvent`,
-`PointerButtons`/`PointerKeyboardModifiers` helpers, `MeshGradient*`; the skia
-interop (`asComposeCanvas`, `toComposeImageBitmap`, ...); ui-text's
-`FontRasterizationSettings`, `PlatformFont`/`SystemFont`/`FontLoader`;
-foundation's `Modifier.onClick`, `PointerMatcher`, `Modifier.onDrag`,
-`TooltipArea`, `ContextMenuArea`; runtime-saveable's `rememberSerializable`;
+`ImageComposeScene`, `renderComposeScene`; the skia interop
+(`asComposeCanvas`, `toComposeImageBitmap`, ...) and ui-text's deprecated
+Typeface-based `FontLoader`, which come with the binding layer; foundation's
+`Modifier.onClick`, `PointerMatcher`, `Modifier.onDrag`, `TooltipArea`,
+`ContextMenuArea`; runtime-saveable's `rememberSerializable`;
 runtime-retain's `retain`, `RetainedEffect` and the stores.
 
 ## Log
@@ -147,6 +164,161 @@ runtime-retain's `retain`, `RetainedEffect` and the stores.
   nonAndroidMain actuals, and the ThreadContextElement-backed tracing context
   and snapshot context element from jvmAndAndroidMain. The runtime's error
   logger writes on standard error as the desktop's does.
-- Open, routed to sema: inside `with(painter)`, a private member of the
-  receiver captures a name the enclosing class declares, so `Modifier.paint`
-  loses its tint and alpha (material3 icons draw untinted).
+- 2026-09-26: the JVM oracle. Checked against Compose Desktop 1.12.0:
+  - Graphics layers draw through skiko's RenderNode (vendored in
+    src/compose_ui/skiko) under upstream's GraphicsLayerOwnerLayer: alpha,
+    scale, translation, the rotations through the camera, the transform
+    origin, shape clips, shadows lit as RootNodeOwner lights them, color
+    filters, blend modes, blurs and both compositing strategies, and clicks
+    through transformed layers.
+  - Canvas concats a 4x4 matrix and draws points.
+  - Every ui-graphics shader, color filter, path effect and render effect;
+    vertices; image decoding; the mesh gradient painter.
+  - Modifier.onPointerEvent.
+  - Text shapes with the platform's fonts through skiko's generic-family
+    aliases and the program's loaded fonts (SystemFont, LoadedFont,
+    `Font(identity, data)`).
+  - ui's nonJvmMain whole and more skikoMain files verbatim (actuals, locks,
+    applier, pointer events, haptic feedback types, rotary events, the text
+    input session contract); the host serves text input sessions.
+- 2026-09-26: `scripts/compose-oracle.py` runs an example on Compose
+  Desktop and on klio and diffs them; 44 of the headless compose examples
+  print the same on both. Of the rest, compose_foundation_platform differed
+  only by the clipboard (now the desktop's), compose_pathmeasure is open
+  below, two stop on the lowering gap below, and the others use klio's own
+  UI toolkit or open windows. Paint reads back and
+  draws as skiko's SkiaBackedPaint: the alpha shares the color's 8 bits, the
+  join and miter limit report Compose's defaults until set while the skia
+  paint draws with its own, and a canvas's alpha multiplier folds into the
+  color once per draw. Images sample by the paint's filter quality.
+- 2026-09-26: scenes take input through skiko's ComposeSceneInputHandler,
+  SyntheticEventSender and ComposeScenePointer, verbatim: the tracked button
+  and modifier state, the synthetic moves before a press or release, the
+  pointer re-sent after a relayout, and the owners' results merged as
+  CanvasLayersComposeScene merges them. The owner takes pointer, key and
+  rotary input as RootNodeOwner does (Tab and Shift+Tab move focus).
+  KlioComposeScene sends pointer and key events with ImageComposeScene's
+  signatures, and windows send theirs through the same handler. On macOS a
+  key's text is the toolkit's glyph once a scene has opened, as AWT's is.
+  The parser takes a when branch whose conditions end with a comma.
+- 2026-09-26: a native window's input reaches its content as Compose
+  Desktop delivers AWT's. The shim's backends (Cocoa, SDL, Win32) report
+  presses and releases of every mouse button with the buttons held, moves,
+  drags outside the window, enters and exits, wheel scrolls, key presses and
+  releases numbered by AWT's key codes and locations with their modifiers,
+  typed text, and focus; the window sends them through its scene's input
+  handler, typed characters as key events whose platform event marks them
+  typed, which foundation's `isTypedEvent` reads. A window's compositions
+  run on the window loop's dispatcher, a Delay whose timers the loop fires,
+  as a desktop window's run on the AWT event thread; a focused text field's
+  cursor blinks and typing edits it. Scenes provide ui's own common
+  composition locals (the software keyboard controller, text input service,
+  pointer icon service, retained values store and locale list among them),
+  and ui-text has skiko's deprecated `FontLoader`. `KLIO_WIN_INPUT` scripts
+  a window's input and `KLIO_SKIA_DUMP_AT` picks the frame to dump, so
+  compose_window_input checks the whole path; its sequence is the one
+  Compose Desktop prints for the same events through ImageComposeScene.
+  The stdlib's `contentEquals` and StringBuilder's range appends and
+  inserts read a program's own CharSequence, which TextFieldState's buffer
+  is.
+- 2026-09-26: Compose Desktop's window API with desktop's signatures:
+  `application(exitProcessOnExit)`, `awaitApplication`, `launchApplication`,
+  `Window` and `DialogWindow` (both overloads each), `singleWindowApplication`,
+  the window scopes, and desktop's java-free WindowState, DialogState,
+  WindowPlacement, WindowSize, WindowDecoration and menu marker verbatim
+  (WindowPosition and Notification adapted: their equals read javaClass).
+  An application runs until its content is gone and its effects end, as
+  desktop's does; a window is created and its content set when the
+  composition applies, composes as a child of where it is called, and syncs
+  its state both ways as desktop's listeners do (frame size, position,
+  placement, minimized). The close button asks, it does not close. The
+  shim's backends set resizable, decoration, always-on-top, visibility,
+  placement, minimized, position and frame size, and report moves and
+  placement changes. A window's onPreviewKeyEvent and onKeyEvent wrap its
+  content's key handling; a disabled window takes no input, an unfocusable
+  one no keys. klio's own `application(maxFrames)`, `ApplicationScope.Window
+  (width, height)` and `runComposeWindow` are gone; the examples and the
+  iOS scenes use desktop's API.
+- 2026-09-26: a window's input handlers run before its next event: the
+  scene flushes its compositions' dispatcher after each input event, as
+  BaseComposeScene flushes its FrameRecomposer's trampoline, so a drag
+  resumed by a press sees the moves after it. `Modifier.onClick` with a
+  PointerMatcher (buttons, double clicks) and `Modifier.onDrag` work in
+  windows, where huge delays are the loop's timers; compose_window_pointer
+  checks them against Compose Desktop. Scripted input can be timed
+  (`<t>ms`).
+- 2026-09-26: the clipboard is Compose Desktop's. `klio.datatransfer` has
+  the java.awt.datatransfer types the desktop's clipboard is written against
+  (DataFlavor with stringFlavor, Transferable, ClipboardOwner,
+  StringSelection, UnsupportedFlavorException, Clipboard), and its system
+  clipboard is the host's through the Skia shim (NSPasteboard, UIPasteboard,
+  the Win32 clipboard, SDL's): while no other application changes it, the
+  transferable a program put there is the one it reads back, and once one
+  does, the owner is told and the contents are the host's text. ui's
+  PlatformClipboard and foundation's ClipboardUtils are the desktop's over
+  it, TextFieldSelectionState.desktop.kt runs verbatim, and the owner takes
+  its clipboards from the platform factories. `KLIO_CLIPBOARD` picks the
+  host's, a private one (the test runners use it, so a run never touches
+  the user's) or none (a headless desktop's; the oracle runs klio so, as its
+  JVM is headless). compose_clipboard and compose_window_clipboard (Select
+  All, Copy, Paste and Cut in a window's text fields) check it; a
+  ClipEntry of a plain AnnotatedString empties the clipboard, as on the
+  desktop, so compose_foundation_platform prints what Compose Desktop does.
+  The deprecated `Modifier.pointerMoveFilter` is desktopMain's.
+- 2026-09-26: Compose's Locale is the desktop's. A language tag reads as
+  the JVM's `Locale.forLanguageTag` reads it, and `Locale.current` is the
+  host's as the JVM's default is (macOS: the first preferred language with
+  the current region, through the Skia shim; Windows: the user's UI
+  language; elsewhere LC_ALL, LC_MESSAGES or LANG); `KLIO_LOCALE` sets it,
+  and the test runners pin en-US. ui-text's string delegate cases for a
+  locale as the JVM does (Turkish and Azerbaijani i, Lithuanian dot above),
+  and the stdlib's `uppercase()` and `lowercase()` take SpecialCasing's
+  expansions (ŉ, ǰ, և) and the final sigma, as the JVM's root casing does.
+  compose_locale checks them against Compose Desktop.
+- 2026-09-26: `FrameWindowScope.MenuBar` with the desktop's MenuBarScope
+  and MenuScope (Menu, Separator, Item, CheckboxItem, RadioButtonItem with
+  icons, mnemonics and KeyShortcut). The menus compose into a tree the Skia
+  shim makes native: on macOS the application's main menu while the window
+  is key, as the desktop's screen menu bar is, on Win32 the window's menu
+  bar (mnemonics marked, shortcuts shown). A check box or radio button item
+  keeps the state its composition gives it and a click calls back, as the
+  desktop's ComposeState makes Swing's items behave; shortcuts match as a
+  menu bar's accelerators, after the content leaves the key (on macOS
+  whatever the content did). Scripted input chooses items by path through
+  the native menus (`menu File/Open`) and `KLIO_MENU_DUMP` prints them;
+  compose_window_menu checks it. Window(icon) is drawn and set on SDL and
+  Win32 windows.
+- 2026-09-26: `ApplicationScope.Tray` with the desktop's TrayState,
+  rememberTrayState and isTraySupported. The tray is the platform's own: a
+  status item in the macOS menu bar (a left click shows the menu, a right
+  click is the action, as the desktop's macOS tray has them), a Windows
+  notification area icon (a right click shows the menu, a double click is
+  the action); its menu is the desktop's AWT popup menu, which takes no
+  icons, mnemonics, shortcuts or radio button items and says so as the
+  desktop's does, and a notification shows as the platform's (none for a
+  macOS process without an application bundle, as the desktop's). With only
+  trays open the application loop runs the platform's events. SDL hosts
+  have no tray: Tray says so on standard error, as the desktop's does.
+  compose_tray checks it (`corpus: tray`).
+- 2026-09-26: with sema resolving a setter deferred while another
+  declaration was typed (the draw context's setters, 231b2e70), the
+  graphics layer examples, LazyColumn, material3 text and the windows run
+  again; compose_foundation_lazy's expected output is Compose Desktop's
+  (eight rows fit). Open: a WindowState position the program sets is
+  reported back as the old one (compose_window_state).
+- Open, routed to coroutines: a delay of `Long.MAX_VALUE / 2` under
+  Dispatchers.Unconfined overflows the scheduler's clock. `Modifier.onClick`
+  (whose tap detector waits that long when there is no long click) crashes
+  on its first press, so its PointerMatcher example waits for the fix.
+- Open, routed to coroutines: a launch on Dispatchers.Unconfined does not
+  return across a delay, so in a headless scene (Unconfined, as
+  ImageComposeScene's default) a focused text field's cursor blink never
+  gives the frame back. Windows are clear of it: they run on their loop.
+- Open, needs the skia binding layer: klio's paragraph layer differs from
+  skiko's SkiaParagraph in line tops, line height trims, text indent,
+  baseline shift and ellipsis flags; the layout example that shows it waits
+  for the verbatim ui-text skikoMain.
+- Open, needs the skia binding layer: PathMeasure measures klio's own path
+  (arcs as cubics) with a Kotlin contour measure, where skiko measures the
+  SkPath (arcs as conics) with SkContourMeasure; lengths differ in the first
+  decimal (compose_pathmeasure). The path moves onto SkPath with the layer.

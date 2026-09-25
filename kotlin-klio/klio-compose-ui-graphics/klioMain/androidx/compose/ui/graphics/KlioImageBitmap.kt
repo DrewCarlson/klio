@@ -23,8 +23,9 @@ internal class KlioImageBitmap(
     override val config: ImageBitmapConfig,
     override val hasAlpha: Boolean,
     override val colorSpace: ColorSpace,
+    /** The surface holding the pixels: a new one, or one a decode filled. */
+    internal val handle: Long = __skia_surf_new(width, height),
 ) : ImageBitmap {
-    internal val handle: Long = __skia_surf_new(width, height)
 
     override fun readPixels(
         buffer: IntArray,

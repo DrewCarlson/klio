@@ -405,6 +405,7 @@ include = [
     "androidx/compose/foundation/text/input/internal/TextFieldCoreModifier.desktop.kt",
     "androidx/compose/foundation/text/input/internal/TextFieldKeyEventHandler.desktop.kt",
     "androidx/compose/foundation/text/input/internal/selection/TextFieldMagnifierNode.desktop.kt",
+    "androidx/compose/foundation/text/input/internal/selection/TextFieldSelectionState.desktop.kt",
     "androidx/compose/foundation/text/modifiers/SelectionController.desktop.kt",
     "androidx/compose/foundation/text/selection/DefaultTextSelectionColors.desktop.kt",
     "androidx/compose/foundation/text/selection/SelectionGestures.desktop.kt",

@@ -1,0 +1,12 @@
+# Scripted input for compose_tray.kt's tray (KLIO_WIN_INPUT): at the given
+# milliseconds after the tray's first poll, its action, or its menu's item
+# chosen by its titles' path, as a click would.
+200ms tray action
+300ms tray menu Mute
+400ms tray menu Mute
+500ms tray menu Send/Info
+# A disabled item, and a path that is not there: nothing.
+600ms tray menu Update
+650ms tray menu Help
+700ms tray action
+800ms tray menu Quit

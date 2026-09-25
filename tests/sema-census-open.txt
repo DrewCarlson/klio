@@ -26,3 +26,5 @@ no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/se
 no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:623:23	pack:io.ktor	complete(io.ktor.websocket.Frame & T)
 no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:627:24	pack:io.ktor	complete(io.ktor.websocket.Frame & T)
 no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:651:48	pack:io.ktor	readText()
+# androidx.compose.ui: ComposeSceneInputHandler imports RootNodeOwner for its KDoc; RootNodeOwner comes with the upstream scene.
+unresolved_import ../klio-compose-runtime/upstream/compose/ui/ui/src/skikoMain/kotlin/androidx/compose/ui/scene/ComposeSceneInputHandler.skiko.kt:38:1	pack:androidx.compose.animation.core	androidx.compose.ui.node.RootNodeOwner

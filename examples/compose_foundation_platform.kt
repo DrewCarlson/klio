@@ -1,8 +1,9 @@
 // The platform pieces of androidx.compose.foundation that klio supplies. A
 // MutatorMutex keeps its current mutator in an atomic reference: a mutation of
 // higher priority cancels the one running, waits for it to let go, then runs.
-// A composition reaches the clipboard through LocalClipboard, and a ClipEntry
-// carries the AnnotatedString that was copied.
+// A composition reaches the clipboard through LocalClipboard; a ClipEntry of
+// an AnnotatedString, which is not a transferable, empties it, as on the
+// desktop (compose_clipboard copies text).
 import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.MutatorMutex
 import androidx.compose.runtime.LaunchedEffect

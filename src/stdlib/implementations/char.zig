@@ -507,6 +507,13 @@ pub fn singleCaseChar(c: u21, map: []const CaseEntry) u21 {
     return c;
 }
 
+/// The full case mapping of a scalar, SpecialCasing's unconditional
+/// expansions included (`ß` upper-cases to "SS", `ŉ` to "ʼN"), or null when
+/// it maps to itself.
+pub fn fullCase(c: u21, upper: bool) ?[]const u21 {
+    return lookupCase(c, if (upper) &uppercase_map else &lowercase_map);
+}
+
 pub fn lowerScalar(c: u21) u21 {
     return singleCaseChar(c, &lowercase_map);
 }

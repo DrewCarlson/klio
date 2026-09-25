@@ -20,14 +20,20 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.rememberWindowState
 
 fun main() {
     application {
-        // width/height are placeholders: a hosted (mobile) Window fills the
-        // device surface, so these matter only on desktop.
-        Window(onCloseRequest = ::exitApplication, title = "klio", width = 390, height = 844) {
+        // The size is a placeholder: a hosted (mobile) Window fills the device
+        // surface, so it matters only on desktop.
+        Window(
+            onCloseRequest = ::exitApplication,
+            title = "klio",
+            state = rememberWindowState(width = 390.dp, height = 844.dp),
+        ) {
             // One circle per active finger (multi-touch); a bar that tracks
             // accumulated scroll (wheel / trackpad). Both read the raw pointer
             // stream, so no CompositionLocal-heavy widgets are involved.

@@ -95,13 +95,16 @@ pub fn runKlio(a: Allocator, env: *const Environ.Map, argv: []const []const u8, 
     return .{ .term = term, .stdout = out, .stderr = err_out };
 }
 
-/// The parent's environment with `home` as the data home, and the base
-/// image cache on.
+/// The parent's environment with `home` as the data home, the base image
+/// cache on, a clipboard of the program's own, so a test run neither reads
+/// nor replaces the user's, and the en-US locale whatever the host's.
 pub fn envFor(a: Allocator, home_dir: []const u8) !Environ.Map {
     var map = Environ.Map.init(a);
     runtime.procEnvPutAllInto(a, &map);
     try map.put("HOME", home_dir);
     try map.put("KLIO_HOME", home_dir);
+    try map.put("KLIO_CLIPBOARD", "private");
+    try map.put("KLIO_LOCALE", "en-US");
     _ = map.swapRemove("KLIO_SEMA_IMAGE");
     return map;
 }

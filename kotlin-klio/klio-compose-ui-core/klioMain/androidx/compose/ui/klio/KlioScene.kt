@@ -7,11 +7,13 @@
 
 // A klio host's scene: its content's owner and the layers Popup and Dialog
 // open above it, each with an owner and composition of its own, in the one
-// window coordinate space. It lays them out, draws them in order and routes
-// pointer input to them as skiko's CanvasLayersComposeScene does.
+// window coordinate space. It lays them out, draws them in order, takes input
+// through skiko's ComposeSceneInputHandler as BaseComposeScene does, and
+// routes it to its owners as CanvasLayersComposeScene does.
 
 package androidx.compose.ui.klio
 
+import androidx.compose.ui.platform.DefaultUiApplier
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.CompositionContext
@@ -26,16 +28,21 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Paint
-import androidx.compose.ui.input.InputMode
 import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.currentTimeMillis
 import androidx.compose.ui.input.pointer.PointerButton
+import androidx.compose.ui.input.pointer.PointerButtons
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerInputEvent
-import androidx.compose.ui.input.pointer.PointerInputEventProcessor
+import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
 import androidx.compose.ui.input.pointer.PointerType
-import androidx.compose.ui.input.pointer.PositionCalculator
+import androidx.compose.ui.input.rotary.RotaryScrollEvent
 import androidx.compose.ui.scene.ComposeSceneContext
+import androidx.compose.ui.scene.ComposeSceneInputHandler
 import androidx.compose.ui.scene.ComposeSceneLayer
+import androidx.compose.ui.scene.ComposeScenePointer
+import androidx.compose.ui.scene.PointerEventResult
+import androidx.compose.ui.scene.merging
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.DpSize
@@ -50,15 +57,25 @@ import androidx.navigationevent.compose.NavigationEventDispatcherOwnerHostDefaul
 
 private val PointerInputEvent.isGestureInProgress: Boolean get() = pointers.any { it.down }
 
-/** The scene's coordinate space is the window's: screen == local. */
-private object ScenePositions : PositionCalculator {
-    override fun screenToLocal(positionOnScreen: Offset): Offset = positionOnScreen
-    override fun localToScreen(localPosition: Offset): Offset = localPosition
-}
+private fun PointerInputEvent.isMouseOrSingleTouch() = button != null || pointers.size == 1
 
 @OptIn(InternalComposeUiApi::class)
 internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : ComposeSceneContext {
-    private val mainProcessor = PointerInputEventProcessor(main.root)
+    /** The scene's input: the pointer and key state it tracks and the synthetic events it adds. */
+    val inputHandler: ComposeSceneInputHandler = ComposeSceneInputHandler(
+        prepareForPointerInputEvent = ::doMeasureAndLayout,
+        processPointerInputEvent = ::processPointerInputEvent,
+        cancelPointerInput = ::processCancelPointerInput,
+        processKeyEvent = ::processKeyEvent,
+    )
+
+    /**
+     * A pointer position update a layout asked for, run with the work the next
+     * frame or input event flushes first, as BaseComposeScene dispatches it to
+     * its FrameRecomposer.
+     */
+    private var pointerUpdateScheduled = false
+
     private val layers = ArrayList<KlioSceneLayer>()
     private var focusedLayer: KlioSceneLayer? = null
     private var gestureOwner: KlioComposeOwner? = null
@@ -82,6 +99,9 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
 
     init {
         main.scene = this
+        main.onPointerUpdate = inputHandler::onPointerUpdate
+        // The platform toolkit starts with the first scene, and its key texts with it.
+        androidx.compose.ui.input.key.platformKeyTextsLoaded = true
         // The window is focused and sized before its first composition, as a
         // skiko ImageComposeScene's is: Popup and Dialog place by its size.
         main.windowInfo.isWindowFocused = true
@@ -93,7 +113,11 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
         this.height = height
         main.windowInfo.containerSize = IntSize(width, height)
         main.windowInfo.containerDpSize = with(main.density) { DpSize(width.toDp(), height.toDp()) }
+        main.setContainerSize(IntSize(width, height))
     }
+
+    /** Whether a layer of the content or of a layer above it changed since the last draw. */
+    val needsDraw: Boolean get() = main.needsDraw || layers.any { it.owner.needsDraw }
 
     /** Measures and lays out the content and every layer over a window of this size. */
     fun measureAndLayout(width: Int, height: Int) {
@@ -101,6 +125,41 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
         main.setRootConstraints(Constraints(maxWidth = width, maxHeight = height))
         main.measureAndLayoutForFrame()
         for (layer in layers.toList()) layer.measureAndLayout(width, height)
+        // Synthetic events are sent after measure and layout complete.
+        if (inputHandler.needUpdatePointerPosition) pointerUpdateScheduled = true
+    }
+
+    /** Lays out what is pending in every owner at its current size. */
+    private fun doMeasureAndLayout() {
+        main.measureAndLayoutForFrame()
+        for (layer in layers.toList()) layer.owner.measureAndLayoutForFrame()
+    }
+
+    /**
+     * Runs the work its compositions' dispatcher has queued, as a
+     * FrameRecomposer's trampoline dispatcher is flushed: a window's loop
+     * dispatcher's queue. Headless, compositions run on Dispatchers.Unconfined
+     * and nothing waits.
+     */
+    var flushDispatcher: () -> Unit = {}
+
+    /**
+     * Runs the work queued for the start of the next frame or input event: the
+     * pointer update a layout scheduled, and the work the compositions'
+     * dispatcher queued, so an input handler resumed by one event runs before
+     * the next event comes.
+     */
+    fun performTrampolineDispatch() {
+        if (pointerUpdateScheduled) {
+            pointerUpdateScheduled = false
+            inputHandler.updatePointerPosition()
+        }
+        flushDispatcher()
+    }
+
+    /** New content: the pointer state tracked for the old content is dropped. */
+    fun onChangeContent() {
+        inputHandler.onChangeContent()
     }
 
     /** Draws the content, then each layer above it with its scrim under it. */
@@ -121,84 +180,161 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
         consumePointerInputOutside: Boolean,
     ): ComposeSceneLayer = KlioSceneLayer(density, layoutDirection, focusable, consumePointerInputOutside)
 
-    // --- pointer input ------------------------------------------------------
+    // --- input ----------------------------------------------------------------
+
+    /** Sends a mouse, touch or stylus event at [position], as ComposeScene's sendPointerEvent. */
+    fun sendPointerEvent(
+        eventType: PointerEventType,
+        position: Offset,
+        scrollDelta: Offset = Offset.Zero,
+        timeMillis: Long = currentTimeMillis(),
+        type: PointerType = PointerType.Mouse,
+        buttons: PointerButtons? = null,
+        keyboardModifiers: PointerKeyboardModifiers? = null,
+        nativeEvent: Any? = null,
+        button: PointerButton? = null,
+        scaleGestureFactor: Float = 1f,
+        panGestureOffset: Offset = Offset.Zero,
+    ): PointerEventResult = inputHandler.onPointerEvent(
+        eventType = eventType,
+        position = position,
+        scrollDelta = scrollDelta,
+        timeMillis = timeMillis,
+        type = type,
+        buttons = buttons,
+        keyboardModifiers = keyboardModifiers,
+        nativeEvent = nativeEvent,
+        button = button,
+        scaleGestureFactor = scaleGestureFactor,
+        panGestureOffset = panGestureOffset,
+    ).also {
+        performTrampolineDispatch()
+    }
+
+    /** Sends an event of several pointers, as ComposeScene's sendPointerEvent. */
+    fun sendPointerEvent(
+        eventType: PointerEventType,
+        pointers: List<ComposeScenePointer>,
+        buttons: PointerButtons = PointerButtons(),
+        keyboardModifiers: PointerKeyboardModifiers = PointerKeyboardModifiers(),
+        scrollDelta: Offset = Offset.Zero,
+        timeMillis: Long = currentTimeMillis(),
+        nativeEvent: Any? = null,
+        button: PointerButton? = null,
+        scaleGestureFactor: Float = 1f,
+        panGestureOffset: Offset = Offset.Zero,
+    ): PointerEventResult = inputHandler.onPointerEvent(
+        eventType = eventType,
+        pointers = pointers,
+        buttons = buttons,
+        keyboardModifiers = keyboardModifiers,
+        scrollDelta = scrollDelta,
+        timeMillis = timeMillis,
+        nativeEvent = nativeEvent,
+        button = button,
+        scaleGestureFactor = scaleGestureFactor,
+        panGestureOffset = panGestureOffset,
+    ).also {
+        performTrampolineDispatch()
+    }
+
+    fun cancelPointerInput() {
+        inputHandler.cancelPointerInput()
+    }
+
+    /** Sends a key event to the focused layer, or the content; true when it was consumed. */
+    fun sendKeyEvent(keyEvent: KeyEvent): Boolean =
+        inputHandler.onKeyEvent(keyEvent).also {
+            performTrampolineDispatch()
+        }
+
+    fun sendRotaryScrollEvent(
+        verticalScrollPixels: Float,
+        horizontalScrollPixels: Float,
+        timeMillis: Long = currentTimeMillis(),
+    ): Boolean {
+        val event = RotaryScrollEvent(
+            verticalScrollPixels = verticalScrollPixels,
+            horizontalScrollPixels = horizontalScrollPixels,
+            uptimeMillis = timeMillis
+        )
+        return processRotaryScrollEvent(event).also {
+            performTrampolineDispatch()
+        }
+    }
+
+    private fun processKeyEvent(keyEvent: KeyEvent): Boolean =
+        focusedLayer?.onKeyEvent(keyEvent) ?: main.onKeyEvent(keyEvent)
+
+    private fun processRotaryScrollEvent(event: RotaryScrollEvent): Boolean =
+        focusedLayer?.onRotaryEvent(event) ?: main.onRotaryEvent(event)
+
+    private fun processCancelPointerInput() {
+        main.onCancelPointerInput()
+        for (layer in layers.toList()) layer.owner.onCancelPointerInput()
+        // Every ongoing gesture is cancelled.
+        gestureOwner = null
+    }
 
     /** Routes a pointer event to the owners that take it. */
-    fun processPointer(event: PointerInputEvent) {
-        when (event.eventType) {
+    private fun processPointerInputEvent(event: PointerInputEvent): PointerEventResult {
+        val result = when (event.eventType) {
             PointerEventType.Press -> processPress(event)
             PointerEventType.Release -> processRelease(event)
-            PointerEventType.Move,
-            PointerEventType.Enter,
+            PointerEventType.Move -> processMove(event)
+            PointerEventType.Enter -> processMove(event)
             PointerEventType.Exit -> processMove(event)
-            PointerEventType.Scroll,
+            PointerEventType.Scroll -> processHoveredEvent(event)
             PointerEventType.PanStart,
             PointerEventType.PanMove,
-            PointerEventType.PanEnd,
+            PointerEventType.PanEnd -> processHoveredEvent(event)
             PointerEventType.ScaleStart,
             PointerEventType.ScaleChange,
             PointerEventType.ScaleEnd -> processHoveredEvent(event)
-            PointerEventType.Unknown -> {
-                // No side effects from an event of no known type.
-                gestureOwner?.let { send(it, event) } ?: processHoveredEvent(event)
-                return
-            }
-            else -> {}
+            // No side effects from an event of no known type.
+            PointerEventType.Unknown -> return processUnknownEvent(event)
+            else -> PointerEventResult(anyMovementConsumed = false)
         }
-        // A gesture ends with its last pressed pointer.
+        // A gesture ends with its last pressed pointer or button.
         if (!event.isGestureInProgress) gestureOwner = null
+        return result
     }
 
-    private fun processorOf(owner: KlioComposeOwner): PointerInputEventProcessor =
-        if (owner === main) mainProcessor else layers.first { it.owner === owner }.processor
-
-    private fun send(owner: KlioComposeOwner, event: PointerInputEvent) {
-        if (event.button != null) owner.inputModeManager.requestInputMode(InputMode.Touch)
-        val isInBounds = event.eventType != PointerEventType.Exit &&
-            event.pointers.all { isInBounds(it.position) }
-        processorOf(owner).process(event, ScenePositions, isInBounds = isInBounds)
-    }
-
-    /** Every owner covers the whole window, so this is the window's bounds. */
-    private fun isInBounds(position: Offset): Boolean =
-        position.x >= 0f && position.x < width && position.y >= 0f && position.y < height
-
-    private fun processPress(event: PointerInputEvent) {
-        gestureOwner?.let {
-            send(it, event)
-            return
-        }
+    private fun processPress(event: PointerInputEvent): PointerEventResult {
+        gestureOwner?.let { return it.onPointerInput(event) }
         val position = event.pointers.first().position
         for (layer in layers.asReversed().toList()) {
             // Within a layer, it takes the press; outside, it hears of it.
             if (layer.contains(position)) {
-                send(layer.owner, event)
+                val result = layer.owner.onPointerInput(event)
                 gestureOwner = layer.owner
-                return
+                return result
             }
             layer.onOutsidePointerEvent(event)
             // A layer that takes the input around it stops it here.
-            if (layer.consumePointerInputOutside) return
+            if (layer.consumePointerInputOutside) return PointerEventResult(anyMovementConsumed = false)
         }
-        send(main, event)
+        val result = main.onPointerInput(event)
         gestureOwner = main
+        return result
     }
 
-    private fun processRelease(event: PointerInputEvent) {
+    private fun processRelease(event: PointerInputEvent): PointerEventResult {
         // The owner the gesture started in takes its release, wherever it is.
-        gestureOwner?.let { send(it, event) }
+        val result = gestureOwner?.onPointerInput(event)
         if (!event.isGestureInProgress) {
             val owner = hoveredOwner(event)
             if (isInteractive(owner)) {
-                processHover(event, owner)
+                processHover(event, owner)?.let { return it }
             } else if (gestureOwner == null) {
                 // Released outside the focused layer, below it or over nothing.
                 focusedLayer?.onOutsidePointerEvent(event)
             }
         }
+        return result ?: PointerEventResult(anyMovementConsumed = false)
     }
 
-    private fun processMove(event: PointerInputEvent) {
+    private fun processMove(event: PointerInputEvent): PointerEventResult {
         var owner = when {
             event.isGestureInProgress -> gestureOwner
             // An Exit leaves every owner; none is entered or moved over.
@@ -207,28 +343,37 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
         }
         // A blocked owner is left, not moved over.
         if (!isInteractive(owner)) owner = null
-        if (processHover(event, owner)) return
-        owner?.let { send(it, event.copy(eventType = PointerEventType.Move)) }
+        processHover(event, owner)?.let { return it }
+        return owner?.onPointerInput(event.copy(eventType = PointerEventType.Move))
+            ?: PointerEventResult(anyMovementConsumed = false)
     }
 
     /**
      * Moves the hover from the owner last under a mouse to [owner]: an Exit to
-     * the one and an Enter to the other, in place of the Move. False when the
+     * the one and an Enter to the other, in place of the Move. Null when the
      * owner is the same, or the pointer is not a mouse.
      */
-    private fun processHover(event: PointerInputEvent, owner: KlioComposeOwner?): Boolean {
-        if (event.pointers.any { it.type != PointerType.Mouse }) return false
-        if (owner === lastHoverOwner) return false
-        lastHoverOwner?.let { send(it, event.copy(eventType = PointerEventType.Exit)) }
-        owner?.let { send(it, event.copy(eventType = PointerEventType.Enter)) }
+    private fun processHover(event: PointerInputEvent, owner: KlioComposeOwner?): PointerEventResult? {
+        if (event.pointers.any { it.type != PointerType.Mouse }) return null
+        if (owner === lastHoverOwner) return null
+        val lastHoverOwnerResult =
+            lastHoverOwner?.onPointerInput(event.copy(eventType = PointerEventType.Exit))
+                ?: PointerEventResult(anyMovementConsumed = false)
+        val ownerResult = owner?.onPointerInput(event.copy(eventType = PointerEventType.Enter))
+            ?: PointerEventResult(anyMovementConsumed = false)
         lastHoverOwner = owner
-        return true
+        // Changing the hover replaces the Move, so it counts as consumed.
+        return lastHoverOwnerResult.merging(ownerResult)
     }
 
-    private fun processHoveredEvent(event: PointerInputEvent) {
+    private fun processHoveredEvent(event: PointerInputEvent): PointerEventResult {
         val owner = hoveredOwner(event)
-        if (isInteractive(owner)) send(owner, event)
+        return if (isInteractive(owner)) owner.onPointerInput(event)
+        else PointerEventResult(anyMovementConsumed = false)
     }
+
+    private fun processUnknownEvent(event: PointerInputEvent): PointerEventResult =
+        gestureOwner?.onPointerInput(event) ?: processHoveredEvent(event)
 
     /** The owner under the pointer: the topmost layer holding it, else the content. */
     private fun hoveredOwner(event: PointerInputEvent): KlioComposeOwner {
@@ -279,8 +424,10 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
         override var consumePointerInputOutside: Boolean,
     ) : ComposeSceneLayer {
         val owner = KlioComposeOwner(density, layoutDirection, main.windowInfo, main.coroutineContext)
-            .also { it.scene = this@KlioScene }
-        val processor = PointerInputEventProcessor(owner.root)
+            .also {
+                it.scene = this@KlioScene
+                it.onPointerUpdate = inputHandler::onPointerUpdate
+            }
         private var composition: Composition? = null
         private var closed = false
         private var outsidePointerCallback: ((PointerEventType, PointerButton?) -> Unit)? = null
@@ -307,16 +454,19 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
             set(value) {
                 field = value
                 if (value) requestFocus(this) else releaseFocus(this)
+                inputHandler.onPointerUpdate()
             }
 
         init {
             layers.add(this)
             if (focusable) requestFocus(this)
+            inputHandler.onPointerUpdate()
         }
 
         fun contains(point: Offset): Boolean = boundsInWindow.contains(point.round())
 
         fun measureAndLayout(width: Int, height: Int) {
+            owner.setContainerSize(IntSize(width, height))
             owner.setRootConstraints(Constraints(maxWidth = width, maxHeight = height))
             owner.measureAndLayoutForFrame()
         }
@@ -334,6 +484,7 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
             layers.remove(this)
             releaseFocus(this)
             onOwnerRemoved(owner)
+            inputHandler.onPointerUpdate()
             composition?.dispose()
             composition = null
             owner.dispose()
@@ -342,7 +493,7 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
         override fun setContent(parentCompositionContext: CompositionContext, content: @Composable () -> Unit) {
             check(!closed) { "KlioSceneLayer is closed" }
             composition?.dispose()
-            composition = Composition(KlioUiApplier(owner.root), parentCompositionContext).also {
+            composition = Composition(DefaultUiApplier(owner.root), parentCompositionContext).also {
                 it.setContent { ProvideKlioCompositionLocals(owner) { content() } }
             }
         }
@@ -355,6 +506,16 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
             this.onKeyEvent = onKeyEvent
         }
 
+        fun onKeyEvent(keyEvent: KeyEvent): Boolean {
+            return onPreviewKeyEvent?.invoke(keyEvent) == true ||
+                owner.onKeyEvent(keyEvent) ||
+                onKeyEvent?.invoke(keyEvent) == true
+        }
+
+        fun onRotaryEvent(event: RotaryScrollEvent): Boolean {
+            return owner.onRotaryEvent(event)
+        }
+
         override fun setOutsidePointerEventListener(
             onOutsidePointerEvent: ((eventType: PointerEventType, button: PointerButton?) -> Unit)?,
         ) {
@@ -364,7 +525,7 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
         override fun calculateLocalPosition(positionInWindow: IntOffset): IntOffset = positionInWindow
 
         fun onOutsidePointerEvent(event: PointerInputEvent) {
-            if (event.button == null && event.pointers.size != 1) return
+            if (!event.isMouseOrSingleTouch()) return
             outsidePointerCallback?.invoke(event.eventType, event.button)
         }
     }

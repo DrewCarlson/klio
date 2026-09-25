@@ -17,7 +17,6 @@ package androidx.compose.ui.klio
 
 import androidx.collection.MutableIntObjectMap
 import androidx.collection.mutableIntObjectMapOf
-import androidx.compose.runtime.AbstractApplier
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.Composable
@@ -39,15 +38,28 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.GraphicsContext
-import androidx.compose.ui.graphics.KlioGraphicsContext
+import androidx.compose.ui.graphics.SkiaGraphicsContext
 import androidx.compose.ui.graphics.Matrix
 import androidx.compose.ui.graphics.klioDrawToPng
 import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.input.InputMode
 import androidx.compose.ui.input.InputModeManager
 import androidx.compose.ui.input.InputModeManagerImpl
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.PointerIconService
+import androidx.compose.ui.input.pointer.PointerInputEventProcessor
+import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
+import androidx.compose.ui.input.pointer.PositionCalculator
+import androidx.compose.ui.input.rotary.RotaryScrollEvent
+import androidx.compose.ui.scene.ComposeScenePointer
+import androidx.compose.ui.scene.PointerEventResult
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputEvent
 import androidx.compose.ui.input.pointer.PointerInputEventData
@@ -58,7 +70,10 @@ import androidx.compose.ui.layout.RootMeasurePolicy
 import androidx.compose.ui.modifier.ModifierLocalManager
 import androidx.compose.ui.node.LayoutNode
 import androidx.compose.ui.node.LayoutNodeDrawScope
+import androidx.compose.ui.node.GraphicsLayerOwnerLayer
 import androidx.compose.ui.node.OwnedLayer
+import androidx.compose.ui.node.OwnedLayerManager
+import androidx.compose.ui.node.setLightingInfo
 import androidx.compose.ui.node.Owner
 import androidx.compose.ui.node.OwnerSnapshotObserver
 import androidx.compose.ui.node.RootForTest
@@ -75,9 +90,15 @@ import androidx.compose.ui.platform.PlatformPrefetchRequest
 import androidx.compose.ui.platform.PlatformPrefetchScheduler
 import androidx.compose.ui.platform.Clipboard
 import androidx.compose.ui.platform.ClipboardManager
+import androidx.compose.ui.platform.DefaultAccessibilityManager
+import androidx.compose.ui.platform.DefaultHapticFeedback
+import androidx.compose.ui.platform.DefaultTextToolbar
+import androidx.compose.ui.platform.DefaultUiApplier
 import androidx.compose.ui.platform.LocalAccessibilityManager
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.createPlatformClipboard
+import androidx.compose.ui.platform.createPlatformClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalFontFamilyResolver
@@ -89,8 +110,8 @@ import androidx.compose.ui.platform.LocalTextToolbar
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.platform.ProvideCommonCompositionLocals
 import androidx.compose.ui.platform.TextToolbar
-import androidx.compose.ui.platform.TextToolbarStatus
 import androidx.compose.ui.platform.UriHandler
 import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.platform.WindowInfoImpl
@@ -116,155 +137,22 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.SessionMutex
+import androidx.compose.ui.platform.PlatformTextInputMethodRequest
+import androidx.compose.ui.platform.PlatformTextInputSessionScope
+import androidx.compose.ui.text.InternalTextApi
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 // ---------------------------------------------------------------------------
-// The applier that builds the LayoutNode tree from emitted ComposeNodes.
+// Platform services. The haptic feedback, accessibility manager and text
+// toolbar are skikoMain's defaults; the rest construct and satisfy the
+// CompositionLocals / Owner surface.
 // ---------------------------------------------------------------------------
-
-internal class KlioUiApplier(root: LayoutNode) : AbstractApplier<LayoutNode>(root) {
-    override fun insertTopDown(index: Int, instance: LayoutNode) {
-        // no-op: the tree is built bottom-up
-    }
-
-    override fun insertBottomUp(index: Int, instance: LayoutNode) {
-        current.insertAt(index, instance)
-    }
-
-    override fun remove(index: Int, count: Int) {
-        current.removeAt(index, count)
-    }
-
-    override fun move(from: Int, to: Int, count: Int) {
-        current.move(from, to, count)
-    }
-
-    override fun onClear() {
-        root.removeAll()
-    }
-
-    override fun onEndChanges() {
-        super.onEndChanges()
-        (root.owner as? KlioComposeOwner)?.onEndApplyChanges()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// A direct-draw OwnedLayer: applies the node's placement offset and its
-// graphicsLayer transform to the canvas, then replays the node's draw block.
-// (No display-list caching; klio draws immediately to a raster surface.)
-// ---------------------------------------------------------------------------
-
-internal class KlioOwnedLayer(
-    private val drawBlock: (Canvas, GraphicsLayer?) -> Unit,
-) : OwnedLayer {
-    private var size = IntSize.Zero
-    private var position = IntOffset.Zero
-    private var translationX = 0f
-    private var translationY = 0f
-    private var scaleX = 1f
-    private var scaleY = 1f
-    private var rotationZ = 0f
-    private var pivotFractionX = 0.5f
-    private var pivotFractionY = 0.5f
-    private var clip = false
-
-    override var frameRate: Float = 0f
-    override var isFrameRateFromParent: Boolean = false
-
-    override fun updateLayerProperties(scope: androidx.compose.ui.graphics.ReusableGraphicsLayerScope) {
-        translationX = scope.translationX
-        translationY = scope.translationY
-        scaleX = scope.scaleX
-        scaleY = scope.scaleY
-        rotationZ = scope.rotationZ
-        pivotFractionX = scope.transformOrigin.pivotFractionX
-        pivotFractionY = scope.transformOrigin.pivotFractionY
-        clip = scope.clip
-    }
-
-    override fun isInLayer(position: Offset): Boolean = true
-    override fun move(position: IntOffset) { this.position = position }
-    override fun resize(size: IntSize) { this.size = size }
-
-    override fun drawLayer(canvas: Canvas, parentLayer: GraphicsLayer?) {
-        canvas.save()
-        canvas.translate(position.x.toFloat(), position.y.toFloat())
-        val hasTransform =
-            translationX != 0f || translationY != 0f || scaleX != 1f || scaleY != 1f || rotationZ != 0f
-        if (hasTransform) {
-            val cx = pivotFractionX * size.width
-            val cy = pivotFractionY * size.height
-            canvas.translate(cx + translationX, cy + translationY)
-            if (rotationZ != 0f) canvas.rotate(rotationZ)
-            if (scaleX != 1f || scaleY != 1f) canvas.scale(scaleX, scaleY)
-            canvas.translate(-cx, -cy)
-        }
-        if (clip) {
-            canvas.clipRect(0f, 0f, size.width.toFloat(), size.height.toFloat())
-        }
-        drawBlock(canvas, parentLayer)
-        canvas.restore()
-    }
-
-    override fun updateDisplayList() {}
-    override fun invalidate() {}
-    override fun destroy() {}
-    override fun mapOffset(point: Offset, inverse: Boolean): Offset = point
-    override fun mapBounds(rect: androidx.compose.ui.geometry.MutableRect, inverse: Boolean) {}
-    override fun reuseLayer(drawBlock: (Canvas, GraphicsLayer?) -> Unit, invalidateParentLayer: () -> Unit) {}
-    override fun transform(matrix: Matrix) {}
-    override fun inverseTransform(matrix: Matrix) {}
-    override val underlyingMatrix: Matrix = Matrix()
-}
-
-// ---------------------------------------------------------------------------
-// Minimal platform services. These construct and satisfy the CompositionLocals /
-// Owner surface; the ones on the render path (density, layout direction, font
-// resolver, view configuration, window info, graphics) are fully real.
-// ---------------------------------------------------------------------------
-
-internal object KlioHapticFeedback : androidx.compose.ui.hapticfeedback.HapticFeedback {
-    override fun performHapticFeedback(hapticFeedbackType: androidx.compose.ui.hapticfeedback.HapticFeedbackType) {}
-}
-
-internal object KlioAccessibilityManager : AccessibilityManager {
-    override fun calculateRecommendedTimeoutMillis(
-        originalTimeoutMillis: Long,
-        containsIcons: Boolean,
-        containsText: Boolean,
-        containsControls: Boolean,
-    ): Long = originalTimeoutMillis
-}
-
-internal object KlioTextToolbar : TextToolbar {
-    override fun showMenu(
-        rect: Rect,
-        onCopyRequested: (() -> Unit)?,
-        onPasteRequested: (() -> Unit)?,
-        onCutRequested: (() -> Unit)?,
-        onSelectAllRequested: (() -> Unit)?,
-    ) {}
-
-    override fun hide() {}
-    override val status: TextToolbarStatus get() = TextToolbarStatus.Hidden
-}
-
-internal object KlioClipboard : Clipboard {
-    private var entry: androidx.compose.ui.platform.ClipEntry? = null
-    override suspend fun getClipEntry(): androidx.compose.ui.platform.ClipEntry? = entry
-    override suspend fun setClipEntry(clipEntry: androidx.compose.ui.platform.ClipEntry?) { entry = clipEntry }
-    override val nativeClipboard: androidx.compose.ui.platform.NativeClipboard
-        get() = throw UnsupportedOperationException("klio: no native clipboard")
-}
-
-@Suppress("DEPRECATION")
-internal object KlioClipboardManager : ClipboardManager {
-    private var text: androidx.compose.ui.text.AnnotatedString? = null
-    override fun getText(): androidx.compose.ui.text.AnnotatedString? = text
-    override fun setText(annotatedString: androidx.compose.ui.text.AnnotatedString) { text = annotatedString }
-}
 
 internal object KlioViewConfiguration : ViewConfiguration {
     override val longPressTimeoutMillis: Long = 500L
@@ -294,17 +182,50 @@ internal object KlioPlatformTextInputService : androidx.compose.ui.text.input.Pl
     private var imeAction: ((ImeAction) -> Unit)? = null
     private var callbackInstalled = false
 
+    /** The text field an input method session serves, over the legacy one. */
+    private var request: PlatformTextInputMethodRequest? = null
+
     // The platform (iOS UIKeyInput) invokes this with a kind after staging any
     // text: 0=commit inserted text, 1=backspace, 2=ime action (enter/done).
     private fun onKey(kind: Int) {
-        val edit = editCommand ?: return
+        val request = request
+        val edit = request?.onEditCommand ?: editCommand ?: return
         when (kind) {
             0 -> {
                 val text = __composeui_textInput()
                 if (text.isNotEmpty()) edit(listOf(CommitTextCommand(text, 1)))
             }
             1 -> edit(listOf(BackspaceCommand()))
-            2 -> imeAction?.invoke(ImeAction.Done)
+            2 -> if (request != null) {
+                request.onImeAction?.invoke(request.imeOptions.imeAction)
+            } else {
+                imeAction?.invoke(ImeAction.Done)
+            }
+        }
+    }
+
+    private fun installCallback() {
+        if (!callbackInstalled) {
+            __composeui_setTextCallback { kind -> onKey(kind) }
+            callbackInstalled = true
+        }
+    }
+
+    /**
+     * An input method session for [request], as a skiko PlatformContext starts
+     * one: the platform's text reaches the field until the session is cancelled.
+     */
+    suspend fun startInputMethod(request: PlatformTextInputMethodRequest): Nothing {
+        this.request = request
+        installCallback()
+        __composeui_showKeyboard()
+        try {
+            awaitCancellation()
+        } finally {
+            if (this.request === request) {
+                this.request = null
+                __composeui_hideKeyboard()
+            }
         }
     }
 
@@ -316,10 +237,7 @@ internal object KlioPlatformTextInputService : androidx.compose.ui.text.input.Pl
     ) {
         editCommand = onEditCommand
         imeAction = onImeActionPerformed
-        if (!callbackInstalled) {
-            __composeui_setTextCallback { kind -> onKey(kind) }
-            callbackInstalled = true
-        }
+        installCallback()
         __composeui_showKeyboard()
     }
 
@@ -379,20 +297,22 @@ internal class KlioComposeOwner(
         override val semanticsOwner: SemanticsOwner get() = this@KlioComposeOwner.semanticsOwner
         @Suppress("DEPRECATION")
         override val textInputService: TextInputService get() = this@KlioComposeOwner.textInputService
-        override fun sendKeyEvent(keyEvent: androidx.compose.ui.input.key.KeyEvent): Boolean = false
+        override fun sendKeyEvent(keyEvent: KeyEvent): Boolean =
+            scene?.sendKeyEvent(keyEvent) ?: onKeyEvent(keyEvent)
     }
 
-    override val hapticFeedBack = KlioHapticFeedback
+    override val hapticFeedBack = DefaultHapticFeedback
     override val inputModeManager: InputModeManager = InputModeManagerImpl(InputMode.Keyboard) { true }
     @Suppress("DEPRECATION")
-    override val clipboardManager: ClipboardManager = KlioClipboardManager
-    override val clipboard: Clipboard = KlioClipboard
-    override val accessibilityManager: AccessibilityManager = KlioAccessibilityManager
-    override val graphicsContext: GraphicsContext = KlioGraphicsContext()
+    override val clipboardManager: ClipboardManager = createPlatformClipboardManager()
+    override val clipboard: Clipboard = createPlatformClipboard()
+    override val accessibilityManager: AccessibilityManager = DefaultAccessibilityManager()
+    private val skiaGraphicsContext = SkiaGraphicsContext()
+    override val graphicsContext: GraphicsContext get() = skiaGraphicsContext
     // No window-level retain scenario (configuration changes) exists here.
     override val retainedValuesStore: androidx.compose.runtime.retain.RetainedValuesStore =
         androidx.compose.runtime.retain.ForgetfulRetainedValuesStore
-    override val textToolbar: TextToolbar = KlioTextToolbar
+    override val textToolbar: TextToolbar = DefaultTextToolbar()
 
     @Suppress("DEPRECATION")
     override val autofillTree = AutofillTree()
@@ -409,8 +329,9 @@ internal class KlioComposeOwner(
 
     override val semanticsOwner = SemanticsOwner(root, rootSemanticsNode, layoutNodes)
 
-    override val fontLoader: androidx.compose.ui.text.font.Font.ResourceLoader
-        get() = throw UnsupportedOperationException("klio: use fontFamilyResolver")
+    @Suppress("DEPRECATION")
+    override val fontLoader: androidx.compose.ui.text.font.Font.ResourceLoader =
+        androidx.compose.ui.text.platform.FontLoader()
     override val fontFamilyResolver: FontFamily.Resolver = createFontFamilyResolver()
 
     private var _layoutDirection by mutableStateOf(layoutDirection)
@@ -454,19 +375,124 @@ internal class KlioComposeOwner(
 
     fun dispose() {
         _snapshotObserver.stopObserving()
+        skiaGraphicsContext.dispose()
+    }
+
+    /**
+     * Whether a layer changed since the owner last drew: a window's loop draws
+     * again while it is set, as RootNodeOwner requests a draw.
+     */
+    var needsDraw: Boolean = true
+        private set
+
+    private var lightingSize: IntSize? = null
+
+    /**
+     * Places the light the layers' shadows are cast by for a window of this
+     * size, as RootNodeOwner does when its container size changes.
+     */
+    fun setContainerSize(size: IntSize) {
+        if (lightingSize == size) return
+        lightingSize = size
+        skiaGraphicsContext.setLightingInfo(
+            canvasOffset = Offset.Zero,
+            density = density,
+            containerSize = size,
+        )
+    }
+
+    /** RootNodeOwner's OwnedLayerManagerImpl: the dirty layers, redrawn before the root. */
+    private val ownedLayerManager = object : OwnedLayerManager {
+        // OwnedLayers that are dirty and should be redrawn.
+        private val dirtyLayers = mutableListOf<OwnedLayer>()
+
+        // OwnedLayers that invalidated themselves during their last draw. They are
+        // redrawn in the next frame.
+        private var postponedDirtyLayers: MutableList<OwnedLayer>? = null
+
+        private var isDrawingContent = false
+
+        override fun createLayer(
+            drawBlock: (canvas: Canvas, parentLayer: GraphicsLayer?) -> Unit,
+            invalidateParentLayer: () -> Unit,
+            explicitLayer: GraphicsLayer?,
+        ): OwnedLayer = GraphicsLayerOwnerLayer(
+            graphicsLayer = explicitLayer ?: skiaGraphicsContext.createGraphicsLayer(),
+            context = if (explicitLayer != null) null else skiaGraphicsContext,
+            layerManager = this,
+            drawBlock = drawBlock,
+            invalidateParentLayer = invalidateParentLayer,
+        )
+
+        override fun recycle(layer: OwnedLayer): Boolean {
+            dirtyLayers -= layer
+            return false
+        }
+
+        override fun notifyLayerIsDirty(layer: OwnedLayer, isDirty: Boolean) {
+            if (!isDirty) {
+                if (!isDrawingContent) {
+                    dirtyLayers.remove(layer)
+                    postponedDirtyLayers?.remove(layer)
+                }
+            } else if (!isDrawingContent) {
+                dirtyLayers += layer
+            } else {
+                val postponed =
+                    postponedDirtyLayers
+                        ?: mutableListOf<OwnedLayer>().also { postponedDirtyLayers = it }
+                postponed += layer
+            }
+        }
+
+        override fun invalidate() {
+            needsDraw = true
+        }
+
+        fun draw(canvas: Canvas) {
+            isDrawingContent = true
+            needsDraw = false
+
+            // Drawing forms the frame's render commands, so the display lists
+            // are brought up to date before it.
+            if (dirtyLayers.isNotEmpty()) {
+                for (i in 0 until dirtyLayers.size) {
+                    dirtyLayers[i].updateDisplayList()
+                }
+            }
+            dirtyLayers.clear()
+
+            root.draw(canvas = canvas, graphicsLayer = null)
+
+            // Layers invalidated while drawing are redrawn in the next frame.
+            postponedDirtyLayers?.let { postponed ->
+                if (postponed.isNotEmpty()) needsDraw = true
+                dirtyLayers.addAll(postponed)
+                postponed.clear()
+            }
+
+            isDrawingContent = false
+        }
     }
 
     fun setRootConstraints(constraints: Constraints) {
         measureAndLayoutDelegate.updateRootConstraints(constraints)
     }
 
+    /**
+     * What a relayout tells its scene, so the pointer's position is sent again
+     * over the moved content: the scene's input handler's onPointerUpdate, as
+     * RootNodeOwner is given it.
+     */
+    var onPointerUpdate: () -> Unit = {}
+
     fun measureAndLayoutForFrame() {
-        measureAndLayoutDelegate.measureAndLayout(null)
+        measureAndLayoutDelegate.measureAndLayout(onPointerUpdate)
         measureAndLayoutDelegate.dispatchOnPositionedCallbacks()
     }
 
     fun drawTo(canvas: Canvas) {
-        root.draw(canvas, null)
+        ownedLayerManager.draw(canvas)
     }
 
     // --- Owner ---------------------------------------------------------------
@@ -500,12 +526,68 @@ internal class KlioComposeOwner(
     }
 
     override fun measureAndLayout(sendPointerUpdate: Boolean) {
-        measureAndLayoutDelegate.measureAndLayout(null)
+        measureAndLayoutDelegate.measureAndLayout(if (sendPointerUpdate) onPointerUpdate else null)
         measureAndLayoutDelegate.dispatchOnPositionedCallbacks()
     }
 
     override fun measureAndLayout(layoutNode: LayoutNode, constraints: Constraints) {
         measureAndLayoutDelegate.measureAndLayout(layoutNode, constraints)
+        onPointerUpdate()
+    }
+
+    // --- input, as RootNodeOwner takes it ------------------------------------
+
+    private val pointerInputEventProcessor = PointerInputEventProcessor(root)
+
+    /** Every owner covers its window, so a position is in bounds within the window. */
+    private fun isInBounds(position: Offset): Boolean {
+        val size = windowInfo.containerSize
+        return position.x >= 0f && position.x < size.width &&
+            position.y >= 0f && position.y < size.height
+    }
+
+    fun onPointerInput(event: PointerInputEvent): PointerEventResult {
+        if (event.button != null) {
+            inputModeManager.requestInputMode(InputMode.Touch)
+        }
+        val isInBounds = event.eventType != PointerEventType.Exit &&
+            event.pointers.all { isInBounds(it.position) }
+        val result = pointerInputEventProcessor.process(
+            event,
+            IdentityPositionCalculator,
+            isInBounds = isInBounds
+        )
+        return PointerEventResult(value = result.value)
+    }
+
+    fun onCancelPointerInput() {
+        pointerInputEventProcessor.processCancel()
+    }
+
+    fun onKeyEvent(keyEvent: KeyEvent): Boolean {
+        return focusOwner.dispatchKeyEvent(keyEvent) || handleFocusKeys(keyEvent)
+    }
+
+    private fun handleFocusKeys(keyEvent: KeyEvent): Boolean {
+        val focusDirection = getFocusDirection(keyEvent)
+        if (focusDirection == null || keyEvent.type != KeyEventType.KeyDown) return false
+
+        inputModeManager.requestInputMode(InputMode.Keyboard)
+        // Consume the key event if we moved focus.
+        return focusOwner.moveFocus(focusDirection)
+    }
+
+    private fun getFocusDirection(keyEvent: KeyEvent): FocusDirection? {
+        return when (keyEvent.key) {
+            Key.Tab -> if (keyEvent.isShiftPressed) FocusDirection.Previous else FocusDirection.Next
+            Key.DirectionCenter -> FocusDirection.Enter
+            Key.Back -> FocusDirection.Exit
+            else -> null
+        }
+    }
+
+    fun onRotaryEvent(event: RotaryScrollEvent): Boolean {
+        return focusOwner.dispatchRotaryEvent(event)
     }
 
     override fun forceMeasureTheSubtree(layoutNode: LayoutNode, affectsLookahead: Boolean) {
@@ -516,7 +598,48 @@ internal class KlioComposeOwner(
         drawBlock: (Canvas, GraphicsLayer?) -> Unit,
         invalidateParentLayer: () -> Unit,
         explicitLayer: GraphicsLayer?,
-    ): OwnedLayer = KlioOwnedLayer(drawBlock)
+    ): OwnedLayer = ownedLayerManager.createLayer(drawBlock, invalidateParentLayer, explicitLayer)
+
+    // RootNodeOwner's text input sessions: a new session cancels the one before
+    // it, and an input method request is served until its session ends.
+    private val textInputSessionMutex = SessionMutex<TextInputSession>()
+
+    private inner class TextInputSession(
+        coroutineScope: CoroutineScope,
+    ) : PlatformTextInputSessionScope, CoroutineScope by coroutineScope {
+        private val innerSessionMutex = SessionMutex<Nothing?>()
+
+        @OptIn(InternalTextApi::class)
+        override suspend fun startInputMethod(request: PlatformTextInputMethodRequest): Nothing {
+            innerSessionMutex.withSessionCancellingPrevious<Nothing>(
+                sessionInitializer = { null }
+            ) {
+                coroutineScope {
+                    // The legacy TextInputService is started and stopped with the
+                    // session, as RootNodeOwner does, for LocalTextInputService's
+                    // keyboard show and hide.
+                    launch(start = CoroutineStart.UNDISPATCHED) {
+                        suspendCancellableCoroutine<Nothing> {
+                            textInputService.startInput()
+                            it.invokeOnCancellation {
+                                textInputService.stopInput()
+                            }
+                        }
+                    }
+                    KlioPlatformTextInputService.startInputMethod(request)
+                }
+            }
+        }
+    }
+
+    override suspend fun textInputSession(
+        session: suspend PlatformTextInputSessionScope.() -> Nothing
+    ): Nothing {
+        textInputSessionMutex.withSessionCancellingPrevious<Nothing>(
+            sessionInitializer = ::TextInputSession,
+            session = session
+        )
+    }
 
     override fun onSemanticsChange() {}
     override fun onLayoutChange(layoutNode: LayoutNode) {}
@@ -544,10 +667,15 @@ internal class KlioComposeOwner(
     }
 }
 
+private object IdentityPositionCalculator : PositionCalculator {
+    override fun screenToLocal(positionOnScreen: Offset): Offset = positionOnScreen
+    override fun localToScreen(localPosition: Offset): Offset = localPosition
+}
+
 // ---------------------------------------------------------------------------
-// Provide the platform CompositionLocals from the owner (klio's analogue of
-// ProvideCommonCompositionLocals — the retain/autofill locals klio does not
-// model are omitted).
+// Provide the CompositionLocals from the owner: ui's own
+// ProvideCommonCompositionLocals, inside the scene's (the ones skiko's
+// ProvidePlatformCompositionLocals gives a scene's content).
 // ---------------------------------------------------------------------------
 
 // Prefetching is a latency optimisation: a lazy layout still composes every item
@@ -578,31 +706,26 @@ internal fun ProvideKlioCompositionLocals(owner: KlioComposeOwner, content: @Com
         LocalPlatformWindowInsets provides EmptyPlatformWindowInsets,
         LocalComposeSceneContext provides owner.scene,
         LocalHostDefaultProvider provides (owner.scene?.hostDefaultProvider ?: NoHostDefaults),
-        LocalDensity provides owner.density,
-        LocalLayoutDirection provides owner.layoutDirection,
-        LocalFontFamilyResolver providesDefault owner.fontFamilyResolver,
-        LocalViewConfiguration provides owner.viewConfiguration,
-        LocalWindowInfo provides owner.windowInfo,
-        LocalHapticFeedback provides owner.hapticFeedBack,
-        LocalInputModeManager provides owner.inputModeManager,
-        LocalTextToolbar provides owner.textToolbar,
-        LocalClipboardManager provides owner.clipboardManager,
-        LocalClipboard provides owner.clipboard,
-        LocalAccessibilityManager provides owner.accessibilityManager,
-        LocalFocusManager provides owner.focusOwner,
-        LocalGraphicsContext provides owner.graphicsContext,
-        LocalUriHandler provides (KlioUriHandler() as UriHandler),
-        content = content,
-    )
+    ) {
+        ProvideCommonCompositionLocals(owner, KlioUriHandler(), content)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Headless render entry point.
 // ---------------------------------------------------------------------------
 
-internal class KlioRecomposerDriver {
+/**
+ * A host's recomposer and frame clock. Headless, its compositions run on
+ * Dispatchers.Unconfined, as an ImageComposeScene's do by default, and each
+ * frame is 16.67 ms after the one before; a window's run on its loop's
+ * [loop] dispatcher, whose work each frame runs, at the loop's clock.
+ */
+internal class KlioRecomposerDriver(
+    private val loop: androidx.compose.ui.window.KlioLoopDispatcher? = null,
+) {
     private val frameClock = BroadcastFrameClock()
-    private val effectScope = CoroutineScope(frameClock + Dispatchers.Unconfined)
+    private val effectScope = CoroutineScope(frameClock + (loop ?: Dispatchers.Unconfined))
     val recomposer = Recomposer(effectScope.coroutineContext)
     private val runner = effectScope.launch { recomposer.runRecomposeAndApplyChanges() }
 
@@ -610,20 +733,31 @@ internal class KlioRecomposerDriver {
     val effectContext: kotlin.coroutines.CoroutineContext get() = effectScope.coroutineContext
     private var frameNanos = 0L
 
+    /** Whether the recomposer has shut down: it was closed and its compositions' effects ended. */
+    val isShutDown: Boolean get() = runner.isCompleted
+
+    /** Whether a frame has work: invalidations, frame awaiters or the loop's due work. */
+    val hasPendingWork: Boolean
+        get() = recomposer.hasPendingWork || frameClock.hasAwaiters || loop?.hasTasks == true
+
     fun frame(): Boolean {
+        loop?.runPending()
         // Writes to the global snapshot since the last frame (a click handler's,
         // or the program's own between frames) invalidate what read them only
         // once they are applied, as skiko's FrameRecomposer applies them at the
         // start of each frame.
         Snapshot.sendApplyNotifications()
+        loop?.runPending()
         // Idle fast path: with nothing invalidated and no frame-clock awaiter, a
         // sendFrame only wakes the recomposer's coroutine to find no work — an
         // expensive resume/suspend under the interpreter for zero benefit. Skip it
         // so a static scene between changes costs nothing.
         if (!recomposer.hasPendingWork && !frameClock.hasAwaiters) return false
         val before = recomposer.changeCount
+        if (loop != null) frameNanos = loop.nowNanos()
         frameClock.sendFrame(frameNanos)
-        frameNanos += 16_666_666L
+        loop?.runPending()
+        if (loop == null) frameNanos += 16_666_666L
         return recomposer.changeCount != before
     }
 
@@ -640,11 +774,10 @@ internal class KlioRecomposerDriver {
  * is present. This is klio's `renderComposeScene` equivalent.
  */
 /**
- * A headless composition over the real ui engine — klio's analogue of
+ * A headless composition over the real ui engine, klio's analogue of
  * `ImageComposeScene`: compose once, then re-render frames, rasterize to PNG,
- * and dispatch synthetic pointer input through the engine's own hit testing
- * (`PointerInputEventProcessor`), driving `clickable`/`Button` semantics
- * exactly as a native window does.
+ * and send pointer and key input through the scene's input handler and the
+ * engine's own hit testing, as ImageComposeScene sends it.
  */
 class KlioComposeScene(
     private var width: Int,
@@ -659,11 +792,11 @@ class KlioComposeScene(
         coroutineContext = recomposerDriver.effectContext,
     )
     private val scene = KlioScene(owner, width, height)
-    private val composition = Composition(KlioUiApplier(owner.root), recomposer)
-    private var uptime = 0L
+    private val composition = Composition(DefaultUiApplier(owner.root), recomposer)
 
     /** Set (or replace) the scene's content and run the first frame. */
     fun setContent(content: @Composable () -> Unit) {
+        scene.onChangeContent()
         composition.setContent {
             ProvideKlioCompositionLocals(owner) { content() }
         }
@@ -672,52 +805,84 @@ class KlioComposeScene(
 
     /** Recompose pending invalidations and run measure + layout. */
     fun frame() {
+        scene.performTrampolineDispatch()
         recomposerDriver.frame()
         scene.measureAndLayout(width, height)
     }
 
-    private fun pointer(x: Float, y: Float, down: Boolean, hover: Boolean) {
-        uptime += 8
-        val position = Offset(x, y)
-        val data = PointerInputEventData(
-            id = PointerId(0),
-            uptime = uptime,
-            positionOnScreen = position,
-            position = position,
-            down = down,
-            pressure = 1f,
-            type = PointerType.Mouse,
-            activeHover = hover,
-            scaleGestureFactor = 1f,
-            panGestureOffset = Offset.Zero,
-        )
-        val eventType = when {
-            down -> PointerEventType.Press
-            hover -> PointerEventType.Move
-            else -> PointerEventType.Release
-        }
-        scene.processPointer(
-            PointerInputEvent(
-                eventType,
-                uptime,
-                listOf(data),
-                buttons = PointerButtons(isPrimaryPressed = down),
-            ),
-        )
-    }
-
-    /** Press + release at ([x], [y]) through the engine's hit testing, then re-frame. */
+    /** Press and release the primary button at ([x], [y]), then run a frame. */
     fun click(x: Float, y: Float) {
-        pointer(x, y, down = true, hover = false)
-        pointer(x, y, down = false, hover = false)
+        sendPointerEvent(PointerEventType.Press, Offset(x, y))
+        sendPointerEvent(PointerEventType.Release, Offset(x, y))
         frame()
     }
 
-    /** Move the hover pointer to ([x], [y]), then re-frame. */
+    /** Move the mouse to ([x], [y]), then run a frame. */
     fun hover(x: Float, y: Float) {
-        pointer(x, y, down = false, hover = true)
+        sendPointerEvent(PointerEventType.Move, Offset(x, y))
         frame()
     }
+
+    /**
+     * Sends a pointer event to the content, as ImageComposeScene's
+     * sendPointerEvent: [buttons] and [keyboardModifiers] default to the state
+     * the scene tracks from the events before, [button] is the button whose
+     * state this event changes.
+     */
+    fun sendPointerEvent(
+        eventType: PointerEventType,
+        position: Offset,
+        scrollDelta: Offset = Offset(0f, 0f),
+        timeMillis: Long = androidx.compose.ui.currentTimeMillis(),
+        type: PointerType = PointerType.Mouse,
+        buttons: PointerButtons? = null,
+        keyboardModifiers: PointerKeyboardModifiers? = null,
+        nativeEvent: Any? = null,
+        button: PointerButton? = null,
+    ) {
+        scene.sendPointerEvent(
+            eventType,
+            position,
+            scrollDelta,
+            timeMillis,
+            type,
+            buttons,
+            keyboardModifiers,
+            nativeEvent,
+            button,
+        )
+    }
+
+    /** Sends an event of several pointers, as ImageComposeScene's sendPointerEvent. */
+    @androidx.compose.ui.ExperimentalComposeUiApi
+    fun sendPointerEvent(
+        eventType: PointerEventType,
+        pointers: List<ComposeScenePointer>,
+        buttons: PointerButtons = PointerButtons(),
+        keyboardModifiers: PointerKeyboardModifiers = PointerKeyboardModifiers(),
+        scrollDelta: Offset = Offset(0f, 0f),
+        timeMillis: Long = androidx.compose.ui.currentTimeMillis(),
+        nativeEvent: Any? = null,
+        button: PointerButton? = null,
+        scaleGestureFactor: Float = 1f,
+        panGestureOffset: Offset = Offset.Zero,
+    ) {
+        scene.sendPointerEvent(
+            eventType,
+            pointers,
+            buttons,
+            keyboardModifiers,
+            scrollDelta,
+            timeMillis,
+            nativeEvent,
+            button,
+            scaleGestureFactor,
+            panGestureOffset,
+        )
+    }
+
+    /** Sends a key event to the focused content; true when it was consumed. */
+    fun sendKeyEvent(event: KeyEvent): Boolean = scene.sendKeyEvent(event)
 
     fun resize(newWidth: Int, newHeight: Int) {
         width = newWidth
@@ -760,7 +925,7 @@ fun renderComposeToPng(
     val recomposer = recomposerDriver.recomposer
     val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr, coroutineContext = recomposerDriver.effectContext)
     val scene = KlioScene(owner, width, height)
-    val composition = Composition(KlioUiApplier(owner.root), recomposer)
+    val composition = Composition(DefaultUiApplier(owner.root), recomposer)
     composition.setContent {
         ProvideKlioCompositionLocals(owner) { content() }
     }

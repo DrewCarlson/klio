@@ -1,0 +1,9 @@
+open
+open recent plan.md
+new
+word wrap -> true
+word wrap -> false
+zoom 150%
+zoom 150%
+zoom 200%
+close

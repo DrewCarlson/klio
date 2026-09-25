@@ -22,13 +22,13 @@ import androidx.compose.ui.unit.LayoutDirection
 actual class NativeCanvas
 
 /**
- * The paint colour as packed 0xAARRGGBB with the paint alpha folded in. Reads the
- * colour's own channels (avoiding `toArgb`, whose colourspace conversion is a
- * deferred path); correct for sRGB colours, which is the common case.
+ * A paint of another implementation's colour as packed 0xAARRGGBB with its
+ * alpha, times [alphaMultiplier], folded in. Reads the colour's own channels;
+ * correct for sRGB colours.
  */
-private fun Paint.argb(): Int {
+private fun Paint.foreignArgb(alphaMultiplier: Float): Int {
     val c = color
-    val a = ((c.alpha * alpha) * 255f + 0.5f).toInt().coerceIn(0, 255)
+    val a = ((c.alpha * alpha * alphaMultiplier) * 255f + 0.5f).toInt().coerceIn(0, 255)
     val r = (c.red * 255f + 0.5f).toInt().coerceIn(0, 255)
     val g = (c.green * 255f + 0.5f).toInt().coerceIn(0, 255)
     val b = (c.blue * 255f + 0.5f).toInt().coerceIn(0, 255)
@@ -43,7 +43,9 @@ private fun Paint.capCode(): Int = when (strokeCap) {
     else -> 0
 }
 
-private fun Paint.joinCode(): Int = when (strokeJoin) {
+// The join the skia paint draws with, which for klio's paint is its skia
+// state's, not the Compose property's default.
+private fun Paint.joinCode(): Int = when (if (this is KlioPaint) skiaStrokeJoin else strokeJoin) {
     StrokeJoin.Round -> 1
     StrokeJoin.Bevel -> 2
     else -> 0
@@ -53,24 +55,58 @@ private fun Paint.aaCode(): Int = if (isAntiAlias) 1 else 0
 
 private fun ClipOp.code(): Int = if (this == ClipOp.Difference) 0 else 1
 
+// How an image samples, as skiko's canvas maps a paint's filter quality:
+// 0 nearest, 1 linear, 2 linear with the nearest mipmap, 3 cubic (1/3, 1/3).
+private fun FilterQuality.samplingCode(): Int = when (this) {
+    FilterQuality.Low -> 1
+    FilterQuality.Medium -> 2
+    FilterQuality.High -> 3
+    else -> 0
+}
+
 /**
  * The klio [Canvas] actual: drives an SkCanvas on an offscreen surface (identified
  * by [handle]) through the Skia shim. Transforms and clips mutate the canvas
- * state; shapes and paths draw with the paint's fill/stroke geometry. Image,
- * point, and vertex draws need surfaces not yet vendored and throw pending.
+ * state; shapes, paths, points and images draw with the paint's geometry, color,
+ * shader, filters and blend mode. Vertex draws throw pending.
  */
 internal class KlioCanvas(private val handle: Long) : Canvas {
     // The surface handle, exposed within the pack so the ui-text Paragraph engine
     // can draw glyph runs onto this exact canvas (same transform/clip state).
     internal val nativeHandle: Long get() = handle
 
-    // A gradient brush sets paint.shader; arm it on the shim for the next draw
-    // (the shader defines the pixels, overriding the flat colour) and clear it
-    // after so a later solid draw isn't tinted.
+    /**
+     * What every paint's alpha is multiplied by, as skiko's canvas does: a
+     * layer recorded under the ModulateAlpha strategy draws its content with
+     * the layer's alpha here instead of through an offscreen layer.
+     */
+    internal var alphaMultiplier: Float = 1f
+        set(value) {
+            field = value.coerceIn(0f, 1f)
+        }
+
+    /**
+     * Folds the canvas's alpha multiplier into [paint]'s color, once per draw,
+     * as skiko's canvas does before it hands the skia paint to a draw.
+     */
+    private fun applyAlphaMultiplier(paint: Paint) {
+        if (paint is KlioPaint) paint.alphaMultiplier = alphaMultiplier
+    }
+
+    /** The color the draw uses, after [applyAlphaMultiplier]. */
+    private fun Paint.argb(): Int = if (this is KlioPaint) skiaColor else foreignArgb(alphaMultiplier)
+
+    /** The alpha an image or a layer composites with, after [applyAlphaMultiplier]. */
+    private fun Paint.drawAlpha(): Float =
+        if (this is KlioPaint) Color(skiaColor).alpha else color.alpha * alpha * alphaMultiplier
+
+    // A brush sets paint.shader; arm it on the shim for the next draw (the
+    // shader defines the pixels, overriding the flat colour) and clear it after
+    // so a later solid draw isn't tinted.
     private fun beginShader(paint: Paint): Boolean {
-        val text = paint.shader?.klioText ?: ""
-        if (text.isEmpty()) return false
-        __skia_c_set_shader(handle, text)
+        val spec = paint.shader?.klioSpec ?: ""
+        if (spec.isEmpty()) return false
+        __skia_c_set_shader(handle, spec)
         return true
     }
 
@@ -91,29 +127,64 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         if (active) __skia_c_set_blur(handle, 0f)
     }
 
-    // A paint's tint (ColorFilter.tint) blends the draw's colors; armed and
-    // cleared around the draw the same way.
+    // A paint's color filter (a tint, a color matrix, a lighting filter) and
+    // path effect (dashes, rounded corners, stamps); armed and cleared around
+    // the draw the same way.
     private fun beginColorFilter(paint: Paint): Boolean {
         val f = paint.colorFilter?.nativeColorFilter ?: return false
-        __skia_c_set_color_filter(handle, f.argb, f.mode)
+        __skia_c_set_color_filter(handle, f.spec)
         return true
     }
 
     private fun endColorFilter(active: Boolean) {
-        if (active) __skia_c_set_color_filter(handle, 0, -1)
+        if (active) __skia_c_set_color_filter(handle, "")
+    }
+
+    private fun beginPathEffect(paint: Paint): Boolean {
+        val effect = paint.pathEffect as? KlioPathEffect ?: return false
+        __skia_c_set_path_effect(handle, effect.spec)
+        return true
+    }
+
+    private fun endPathEffect(active: Boolean) {
+        if (active) __skia_c_set_path_effect(handle, "")
     }
 
     // A paint's blend mode (BlendMode.Clear, a SrcIn tint mask, ...) and, for an
     // image, the alpha it composites with (a shape's is folded into its color).
+    // A paint's blend mode (BlendMode.Clear, a SrcIn tint mask, ...), for an
+    // image the alpha it composites with (a shape's is folded into its color),
+    // and the stroke miter limit.
     private fun beginPaintState(paint: Paint, image: Boolean): Boolean {
-        val alpha = if (image) paint.alpha else 1f
-        if (paint.blendMode == BlendMode.SrcOver && alpha == 1f) return false
-        __skia_c_set_paint_state(handle, paint.blendMode.skiaCode(), alpha)
+        val alpha = if (image) paint.drawAlpha() else 1f
+        val miter = if (paint is KlioPaint) paint.skiaStrokeMiter else paint.strokeMiterLimit
+        if (paint.blendMode == BlendMode.SrcOver && alpha == 1f && miter == 4f) return false
+        __skia_c_set_paint_state(handle, paint.blendMode.skiaCode(), alpha, miter)
         return true
     }
 
     private fun endPaintState(active: Boolean) {
-        if (active) __skia_c_set_paint_state(handle, -1, 1f)
+        if (active) __skia_c_set_paint_state(handle, -1, 1f, 4f)
+    }
+
+    /**
+     * Arms every effect of [paint] for one shape draw, runs it, and clears them.
+     * [apply] folds in the alpha multiplier first; a draw of many shapes with
+     * one paint folds it in once, before the first.
+     */
+    private inline fun withPaint(paint: Paint, apply: Boolean = true, draw: () -> Unit) {
+        if (apply) applyAlphaMultiplier(paint)
+        val sh = beginShader(paint)
+        val bl = beginBlur(paint)
+        val cf = beginColorFilter(paint)
+        val pe = beginPathEffect(paint)
+        val ps = beginPaintState(paint, image = false)
+        draw()
+        endPaintState(ps)
+        endPathEffect(pe)
+        endColorFilter(cf)
+        endBlur(bl)
+        endShader(sh)
     }
 
     override fun save() { __skia_c_save(handle) }
@@ -123,10 +194,11 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
     // An offscreen layer over the bounds, composited back at the matching
     // restore through the paint's alpha, blend mode and color filter.
     override fun saveLayer(bounds: Rect, paint: Paint) {
+        applyAlphaMultiplier(paint)
         val cf = beginColorFilter(paint)
         __skia_c_save_layer(
             handle, bounds.left, bounds.top, bounds.right, bounds.bottom, 1,
-            paint.color.alpha * paint.alpha, paint.blendMode.skiaCode(), 0f, 0f, 0,
+            paint.drawAlpha(), paint.blendMode.skiaCode(), "",
         )
         endColorFilter(cf)
     }
@@ -139,14 +211,15 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
 
     override fun skew(sx: Float, sy: Float) { __skia_c_skew(handle, sx, sy) }
 
-    // Concat the matrix's 2D affine part (scale/skew/rotate/translate) onto the
-    // canvas. Layer transforms from graphicsLayer{} reach the canvas this way.
+    // Concat the whole 4x4 matrix onto the canvas, perspective included, as
+    // skiko's canvas concats its Matrix44; an identity matrix is skipped.
     override fun concat(matrix: Matrix) {
+        if (matrix.isIdentity()) return
         val v = matrix.values
-        __skia_c_concat(
+        __skia_c_concat44(
             handle,
-            v[Matrix.ScaleX], v[Matrix.SkewX], v[Matrix.TranslateX],
-            v[Matrix.SkewY], v[Matrix.ScaleY], v[Matrix.TranslateY],
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+            v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15],
         )
     }
 
@@ -159,58 +232,24 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         __skia_c_clip_path(handle, t, clipOp.code())
     }
 
-    override fun drawLine(p1: Offset, p2: Offset, paint: Paint) {
-        val ps = beginPaintState(paint, image = false)
+    override fun drawLine(p1: Offset, p2: Offset, paint: Paint) = withPaint(paint) {
         __skia_c_draw_line(handle, p1.x, p1.y, p2.x, p2.y, paint.argb(), paint.strokeWidth, paint.capCode(), paint.aaCode())
-        endPaintState(ps)
     }
 
-    override fun drawRect(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) {
-        val sh = beginShader(paint)
-        val bl = beginBlur(paint)
-        val cf = beginColorFilter(paint)
-        val ps = beginPaintState(paint, image = false)
+    override fun drawRect(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) = withPaint(paint) {
         __skia_c_draw_rect(handle, left, top, right, bottom, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
-        endPaintState(ps)
-        endColorFilter(cf)
-        endBlur(bl)
-        endShader(sh)
     }
 
-    override fun drawRoundRect(left: Float, top: Float, right: Float, bottom: Float, radiusX: Float, radiusY: Float, paint: Paint) {
-        val sh = beginShader(paint)
-        val bl = beginBlur(paint)
-        val cf = beginColorFilter(paint)
-        val ps = beginPaintState(paint, image = false)
+    override fun drawRoundRect(left: Float, top: Float, right: Float, bottom: Float, radiusX: Float, radiusY: Float, paint: Paint) = withPaint(paint) {
         __skia_c_draw_rrect(handle, left, top, right, bottom, radiusX, radiusY, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
-        endPaintState(ps)
-        endColorFilter(cf)
-        endBlur(bl)
-        endShader(sh)
     }
 
-    override fun drawOval(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) {
-        val sh = beginShader(paint)
-        val bl = beginBlur(paint)
-        val cf = beginColorFilter(paint)
-        val ps = beginPaintState(paint, image = false)
+    override fun drawOval(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) = withPaint(paint) {
         __skia_c_draw_oval(handle, left, top, right, bottom, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
-        endPaintState(ps)
-        endColorFilter(cf)
-        endBlur(bl)
-        endShader(sh)
     }
 
-    override fun drawCircle(center: Offset, radius: Float, paint: Paint) {
-        val sh = beginShader(paint)
-        val bl = beginBlur(paint)
-        val cf = beginColorFilter(paint)
-        val ps = beginPaintState(paint, image = false)
+    override fun drawCircle(center: Offset, radius: Float, paint: Paint) = withPaint(paint) {
         __skia_c_draw_circle(handle, center.x, center.y, radius, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
-        endPaintState(ps)
-        endColorFilter(cf)
-        endBlur(bl)
-        endShader(sh)
     }
 
     override fun drawArc(left: Float, top: Float, right: Float, bottom: Float, startAngle: Float, sweepAngle: Float, useCenter: Boolean, paint: Paint) {
@@ -228,23 +267,18 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
 
     override fun drawPath(path: Path, paint: Paint) {
         val t = (path as? KlioPath)?.serialize() ?: return
-        val sh = beginShader(paint)
-        val bl = beginBlur(paint)
-        val cf = beginColorFilter(paint)
-        val ps = beginPaintState(paint, image = false)
-        __skia_c_draw_path(handle, t, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
-        endPaintState(ps)
-        endColorFilter(cf)
-        endBlur(bl)
-        endShader(sh)
+        withPaint(paint) {
+            __skia_c_draw_path(handle, t, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        }
     }
 
     override fun drawImage(image: ImageBitmap, topLeftOffset: Offset, paint: Paint) {
         val src = image.klioSurfaceHandle()
         if (src == 0L) return
+        applyAlphaMultiplier(paint)
         val cf = beginColorFilter(paint)
         val ps = beginPaintState(paint, image = true)
-        __skia_c_draw_surface(handle, src, topLeftOffset.x, topLeftOffset.y)
+        __skia_c_draw_surface(handle, src, topLeftOffset.x, topLeftOffset.y, paint.filterQuality.samplingCode())
         endPaintState(ps)
         endColorFilter(cf)
     }
@@ -259,6 +293,7 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
     ) {
         val src = image.klioSurfaceHandle()
         if (src == 0L) return
+        applyAlphaMultiplier(paint)
         val cf = beginColorFilter(paint)
         val ps = beginPaintState(paint, image = true)
         __skia_c_draw_surface_rect(
@@ -272,19 +307,97 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
             dstOffset.y.toFloat(),
             (dstOffset.x + dstSize.width).toFloat(),
             (dstOffset.y + dstSize.height).toFloat(),
+            paint.filterQuality.samplingCode(),
         )
         endPaintState(ps)
         endColorFilter(cf)
     }
 
-    override fun drawPoints(pointMode: PointMode, points: List<Offset>, paint: Paint): Unit =
-        throw NotImplementedError("Canvas.drawPoints is not yet supported")
+    override fun drawPoints(pointMode: PointMode, points: List<Offset>, paint: Paint) {
+        when (pointMode) {
+            // A line between each pair of points; an odd last point is ignored.
+            PointMode.Lines -> drawLines(points, paint, 2)
+            // A line between each adjacent pair.
+            PointMode.Polygon -> drawLines(points, paint, 1)
+            // A dot at each point.
+            else -> {
+                applyAlphaMultiplier(paint)
+                for (p in points) drawPoint(p.x, p.y, paint)
+            }
+        }
+    }
 
-    override fun drawRawPoints(pointMode: PointMode, points: FloatArray, paint: Paint): Unit =
-        throw NotImplementedError("Canvas.drawRawPoints is not yet supported")
+    private fun drawLines(points: List<Offset>, paint: Paint, stepBy: Int) {
+        if (points.size < 2) return
+        applyAlphaMultiplier(paint)
+        var i = 0
+        while (i < points.size - 1) {
+            val p1 = points[i]
+            val p2 = points[i + 1]
+            drawSegment(p1.x, p1.y, p2.x, p2.y, paint)
+            i += stepBy
+        }
+    }
 
-    override fun drawVertices(vertices: Vertices, blendMode: BlendMode, paint: Paint): Unit =
-        throw NotImplementedError("Canvas.drawVertices is not yet supported")
+    // One segment or dot of a many-shape draw, whose alpha multiplier is folded in.
+    private fun drawSegment(x1: Float, y1: Float, x2: Float, y2: Float, paint: Paint) = withPaint(paint, apply = false) {
+        __skia_c_draw_line(handle, x1, y1, x2, y2, paint.argb(), paint.strokeWidth, paint.capCode(), paint.aaCode())
+    }
+
+    private fun drawPoint(x: Float, y: Float, paint: Paint) = withPaint(paint, apply = false) {
+        __skia_c_draw_point(handle, x, y, paint.argb(), paint.strokeWidth, paint.capCode(), paint.aaCode())
+    }
+
+    /** @throws IllegalArgumentException if [points] holds an odd number of values */
+    override fun drawRawPoints(pointMode: PointMode, points: FloatArray, paint: Paint) {
+        if (points.size % 2 != 0) {
+            throw IllegalArgumentException("points must have an even number of values")
+        }
+        when (pointMode) {
+            PointMode.Lines -> drawRawLines(points, paint, 2)
+            PointMode.Polygon -> drawRawLines(points, paint, 1)
+            else -> {
+                applyAlphaMultiplier(paint)
+                var i = 0
+                while (i < points.size - 1) {
+                    drawPoint(points[i], points[i + 1], paint)
+                    i += 2
+                }
+            }
+        }
+    }
+
+    // The values are x, y pairs; a line joins pair i to pair i + 1, stepping by
+    // stepBy pairs.
+    private fun drawRawLines(points: FloatArray, paint: Paint, stepBy: Int) {
+        if (points.size < 4 || points.size % 2 != 0) return
+        applyAlphaMultiplier(paint)
+        var i = 0
+        while (i < points.size - 3) {
+            drawSegment(points[i], points[i + 1], points[i + 2], points[i + 3], paint)
+            i += stepBy * 2
+        }
+    }
+
+    // The vertices' colors blend with the paint's shader by blendMode, as
+    // skiko's canvas draws them.
+    override fun drawVertices(vertices: Vertices, blendMode: BlendMode, paint: Paint) {
+        val mode = when (vertices.vertexMode) {
+            VertexMode.TriangleStrip -> 1
+            VertexMode.TriangleFan -> 2
+            else -> 0
+        }
+        val colors = vertices.colors.joinToString(" ") { (it.toLong() and 0xFFFFFFFFL).toString() }
+        val indices = vertices.indices.joinToString(" ") { (it.toInt() and 0xFFFF).toString() }
+        withPaint(paint) {
+            __skia_c_draw_vertices(
+                handle, mode,
+                vertices.positions.joinToString(" "),
+                vertices.textureCoordinates.joinToString(" "),
+                colors, indices, blendMode.skiaCode(), paint.argb(),
+            )
+        }
+    }
 
     override fun enableZ() {}
 

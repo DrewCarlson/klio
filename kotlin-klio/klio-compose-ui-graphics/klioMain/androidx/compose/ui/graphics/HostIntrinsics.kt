@@ -40,10 +40,13 @@ internal fun __skia_c_clip_rect(handle: Long, l: Float, t: Float, r: Float, b: F
 internal fun __skia_c_clip_path(handle: Long, pathText: String, clipOp: Int): Long = error("intrinsic __skia_c_clip_path not installed")
 internal fun __skia_c_set_shader(handle: Long, gradientText: String): Long = error("intrinsic __skia_c_set_shader not installed")
 internal fun __skia_c_set_blur(handle: Long, sigma: Float): Long = error("intrinsic __skia_c_set_blur not installed")
-internal fun __skia_c_set_color_filter(handle: Long, argb: Int, mode: Int): Long = error("intrinsic __skia_c_set_color_filter not installed")
-// The next draws' blend mode (skiaCode) and the alpha an image draw composites
-// with; a negative mode resets both.
-internal fun __skia_c_set_paint_state(handle: Long, mode: Int, imageAlpha: Float): Long = error("intrinsic __skia_c_set_paint_state not installed")
+// The next draws' color filter and path effect, as effect specs (see
+// KlioEffects.kt); an empty spec clears one.
+internal fun __skia_c_set_color_filter(handle: Long, spec: String): Long = error("intrinsic __skia_c_set_color_filter not installed")
+internal fun __skia_c_set_path_effect(handle: Long, spec: String): Long = error("intrinsic __skia_c_set_path_effect not installed")
+// The next draws' blend mode (skiaCode), the alpha an image draw composites
+// with and the stroke miter limit; a negative mode resets them.
+internal fun __skia_c_set_paint_state(handle: Long, mode: Int, imageAlpha: Float, miter: Float): Long = error("intrinsic __skia_c_set_paint_state not installed")
 internal fun __skia_c_draw_rect(handle: Long, l: Float, t: Float, r: Float, b: Float, argb: Int, style: Int, sw: Float, cap: Int, join: Int, aa: Int): Long = error("intrinsic __skia_c_draw_rect not installed")
 internal fun __skia_c_draw_rrect(handle: Long, l: Float, t: Float, r: Float, b: Float, rx: Float, ry: Float, argb: Int, style: Int, sw: Float, cap: Int, join: Int, aa: Int): Long = error("intrinsic __skia_c_draw_rrect not installed")
 internal fun __skia_c_draw_oval(handle: Long, l: Float, t: Float, r: Float, b: Float, argb: Int, style: Int, sw: Float, cap: Int, join: Int, aa: Int): Long = error("intrinsic __skia_c_draw_oval not installed")
@@ -59,23 +62,61 @@ internal fun __skia_c_draw_text(handle: Long, text: String, x: Float, y: Float, 
 internal fun __skia_c_draw_text2(handle: Long, text: String, x: Float, y: Float, sizePx: Float, argb: Int, flags: Int): Long = error("intrinsic __skia_c_draw_text2 not installed")
 internal fun __composeui_text_width(text: String, sizePx: Float): Float = error("intrinsic __composeui_text_width not installed")
 internal fun __composeui_font_metric(sizePx: Float, which: Int): Float = error("intrinsic __composeui_font_metric not installed")
-internal fun __skia_c_concat(handle: Long, sx: Float, kx: Float, tx: Float, ky: Float, sy: Float, ty: Float): Long = error("intrinsic __skia_c_concat not installed")
 
 // ImageBitmap: read one pixel as ARGB (0 when headless / out of range); blit a
 // source surface onto a canvas surface (plain offset, or src-rect → dst-rect).
 internal fun __skia_surf_pixel(handle: Long, x: Int, y: Int): Long = error("intrinsic __skia_surf_pixel not installed")
-internal fun __skia_c_draw_surface(dst: Long, src: Long, x: Float, y: Float): Long = error("intrinsic __skia_c_draw_surface not installed")
-internal fun __skia_c_draw_surface_rect(dst: Long, src: Long, sl: Float, st: Float, sr: Float, sb: Float, dl: Float, dt: Float, dr: Float, db: Float): Long = error("intrinsic __skia_c_draw_surface_rect not installed")
+// A surface's width (which 0) or height (which 1); 0 headless.
+internal fun __skia_surf_size(handle: Long, which: Int): Int = error("intrinsic __skia_surf_size not installed")
+// Decode encoded image bytes into a new surface of the image's size; 0 when they
+// do not decode or headless.
+internal fun __skia_image_decode(bytes: ByteArray): Long = error("intrinsic __skia_image_decode not installed")
+// [sampling]: 0 nearest, 1 linear, 2 linear with the nearest mipmap, 3 cubic.
+internal fun __skia_c_draw_surface(dst: Long, src: Long, x: Float, y: Float, sampling: Int): Long = error("intrinsic __skia_c_draw_surface not installed")
+internal fun __skia_c_draw_surface_rect(dst: Long, src: Long, sl: Float, st: Float, sr: Float, sb: Float, dl: Float, dt: Float, dr: Float, db: Float, sampling: Int): Long = error("intrinsic __skia_c_draw_surface_rect not installed")
 
 // Canvas.saveLayer: the draws up to the matching restore composite back through
-// the layer's alpha, blend mode (skiaCode), the armed color filter and a blur of
-// (blurX, blurY) sigma with the edge tile mode. hasBounds 0 covers the clip.
-internal fun __skia_c_save_layer(handle: Long, l: Float, t: Float, r: Float, b: Float, hasBounds: Int, alpha: Float, blendMode: Int, blurX: Float, blurY: Float, tileMode: Int): Long = error("intrinsic __skia_c_save_layer not installed")
+// the layer's alpha, blend mode (skiaCode), the armed color filter and the image
+// filter spec ("" for none). hasBounds 0 covers the clip.
+internal fun __skia_c_save_layer(handle: Long, l: Float, t: Float, r: Float, b: Float, hasBounds: Int, alpha: Float, blendMode: Int, imageFilter: String): Long = error("intrinsic __skia_c_save_layer not installed")
 
-// Picture recording, for GraphicsLayer: begin returns a handle that draws like a
-// surface's (0 headless); end frees it and returns the picture it drew, which
-// draw_picture replays onto a canvas under its transform and clip.
-internal fun __skia_rec_begin(width: Float, height: Float): Long = error("intrinsic __skia_rec_begin not installed")
+// Canvas.drawVertices: mode 0 triangles, 1 a strip, 2 a fan; the arrays as
+// whitespace-separated numbers ("" for none), the colors as ARGB.
+internal fun __skia_c_draw_vertices(
+    handle: Long, mode: Int, positions: String, texCoords: String, colors: String, indices: String,
+    blendMode: Int, argb: Int,
+): Long = error("intrinsic __skia_c_draw_vertices not installed")
+
+// Picture recording, for GraphicsLayer: begin returns a handle over the bounds
+// (l, t, r, b) that draws like a surface's (0 headless); end frees it and
+// returns the picture it drew, which draw_picture replays onto a canvas under
+// its transform and clip.
+internal fun __skia_rec_begin(l: Float, t: Float, r: Float, b: Float): Long = error("intrinsic __skia_rec_begin not installed")
 internal fun __skia_rec_end(handle: Long): Long = error("intrinsic __skia_rec_end not installed")
 internal fun __skia_picture_free(picture: Long): Long = error("intrinsic __skia_picture_free not installed")
 internal fun __skia_c_draw_picture(handle: Long, picture: Long): Long = error("intrinsic __skia_c_draw_picture not installed")
+
+// Canvas.concat of a whole Matrix: its 16 values, column-major, perspective included.
+internal fun __skia_c_concat44(
+    handle: Long,
+    m0: Float, m1: Float, m2: Float, m3: Float, m4: Float, m5: Float, m6: Float, m7: Float,
+    m8: Float, m9: Float, m10: Float, m11: Float, m12: Float, m13: Float, m14: Float, m15: Float,
+): Long = error("intrinsic __skia_c_concat44 not installed")
+
+// A GraphicsLayer's transform about its pivot, projected through its camera for
+// a rotation about X or Y, as skiko's RenderNode computes it.
+internal fun __skia_c_layer_transform(
+    handle: Long, pivotX: Float, pivotY: Float, translationX: Float, translationY: Float,
+    rotationX: Float, rotationY: Float, rotationZ: Float, scaleX: Float, scaleY: Float, cameraDistance: Float,
+): Long = error("intrinsic __skia_c_layer_transform not installed")
+
+// A GraphicsLayer's shadow under its outline path (serialized), lit from the
+// light's position and radius, in the ambient and spot colors (ARGB).
+internal fun __skia_c_draw_shadow(
+    handle: Long, path: String, elevation: Float, lightX: Float, lightY: Float, lightZ: Float,
+    lightRadius: Float, ambient: Int, spot: Int, transparentOccluder: Int,
+): Long = error("intrinsic __skia_c_draw_shadow not installed")
+
+// A point the stroke width across, round under a round cap, square otherwise.
+internal fun __skia_c_draw_point(handle: Long, x: Float, y: Float, argb: Int, strokeWidth: Float, cap: Int, aa: Int): Long =
+    error("intrinsic __skia_c_draw_point not installed")

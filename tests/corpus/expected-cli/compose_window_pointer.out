@@ -1,0 +1,9 @@
+secondary click
+tertiary click
+primary click
+double click
+drag start at Offset(10.0, 10.0)
+drag by Offset(19.9, 9.9)
+drag by Offset(30.0, 30.0)
+drag end
+window opened=true

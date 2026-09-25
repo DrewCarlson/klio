@@ -9,6 +9,7 @@ const runtime = @import("runtime");
 const text = @import("../text.zig");
 const regexp = @import("regexp.zig");
 const char = @import("char.zig");
+const unicode_category = @import("unicode_category.zig");
 
 const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
@@ -471,7 +472,7 @@ pub fn string_uppercase(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    return .{ .ok = try newString(ctx.allocator, try mapCase(ctx.allocator, s, true)) };
+    return .{ .ok = try newString(ctx.allocator, try fullCaseString(ctx.allocator, s, true)) };
 }
 
 pub fn string_lowercase(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -480,7 +481,7 @@ pub fn string_lowercase(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    return .{ .ok = try newString(ctx.allocator, try mapCase(ctx.allocator, s, false)) };
+    return .{ .ok = try newString(ctx.allocator, try fullCaseString(ctx.allocator, s, false)) };
 }
 
 pub fn string_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -2960,6 +2961,149 @@ fn utf8Lossy(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+/// `String.uppercase()` and `lowercase()` as the JVM's root-locale
+/// `toUpperCase` and `toLowerCase` map a string: each scalar by its full
+/// mapping (SpecialCasing's expansions included), and a capital sigma to the
+/// final form when it ends a word, as ConditionalSpecialCasing decides it.
+fn fullCaseString(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    // The scalars, decoded once a capital sigma needs their context
+    // (decodeScalars counts a byte that does not decode as one, as this loop
+    // does).
+    var scalars: ?[]u21 = null;
+    defer if (scalars) |sc| allocator.free(sc);
+    var index: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            try out.append(allocator, s[i]);
+            i += 1;
+            index += 1;
+            continue;
+        };
+        const end = @min(i + len, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch {
+            try out.append(allocator, s[i]);
+            i += 1;
+            index += 1;
+            continue;
+        };
+        i = end;
+        defer index += 1;
+        if (cp < 0x80) {
+            try out.append(allocator, if (upper) std.ascii.toUpper(@intCast(cp)) else std.ascii.toLower(@intCast(cp)));
+            continue;
+        }
+        if (!upper and cp == 0x03A3) {
+            if (scalars == null) scalars = try decodeScalars(allocator, s);
+            try appendScalar(allocator, &out, if (isFinalSigma(scalars.?, index)) 0x03C2 else 0x03C3);
+            continue;
+        }
+        if (char.fullCase(cp, upper)) |seq| {
+            for (seq) |mc| try appendScalar(allocator, &out, mc);
+        } else {
+            try appendScalar(allocator, &out, cp);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Cased as ConditionalSpecialCasing counts it: an upper, lower or title case
+/// letter, or one of the modifier letters and marks it names.
+fn isCasedScalar(c: u21) bool {
+    if (char.ktIsUpperCase(c) or char.ktIsLowerCase(c)) return true;
+    if (c <= 0xFFFF and unicode_category.categoryValue(@intCast(c)) == 3) return true;
+    return (c >= 0x02B0 and c <= 0x02B8) or (c >= 0x02C0 and c <= 0x02C1) or
+        (c >= 0x02E0 and c <= 0x02E4) or c == 0x0345 or c == 0x037A or
+        (c >= 0x1D2C and c <= 0x1D61) or (c >= 0x2160 and c <= 0x217F) or
+        (c >= 0x24B6 and c <= 0x24E9);
+}
+
+/// Whether the capital sigma at `k` ends a word: a cased letter comes before
+/// it in its word and none after it, as the JVM decides it with its word
+/// boundaries.
+fn isFinalSigma(sc: []const u21, k: usize) bool {
+    var i = k;
+    while (i > 0 and !isWordBoundary(sc, i)) : (i -= 1) {
+        if (isCasedScalar(sc[i - 1])) {
+            var j = k + 1;
+            while (j < sc.len and !isWordBoundary(sc, j)) : (j += 1) {
+                if (isCasedScalar(sc[j])) return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+const WordClass = enum { letter, numeric, mid_letter, mid_num, mid_num_let, extend, other };
+
+fn wordClass(c: u21) WordClass {
+    switch (c) {
+        '_' => return .letter,
+        ':', 0x00B7, 0x0387, 0x05F4, 0x2027, 0xFE13, 0xFE55, 0xFF1A => return .mid_letter,
+        '.', '\'', 0x2018, 0x2019, 0x2024, 0xFE52, 0xFF07, 0xFF0E => return .mid_num_let,
+        ',', ';', 0x037E, 0x0589, 0x060C, 0x060D, 0x066C, 0x07F8, 0x2044, 0xFE10, 0xFE14, 0xFE50, 0xFE54, 0xFF0C, 0xFF1B => return .mid_num,
+        else => {},
+    }
+    if (char.ktIsDigit(c)) return .numeric;
+    if (char.ktIsLetter(c)) return .letter;
+    if (c <= 0xFFFF) {
+        // Marks and format characters stay with the character before them.
+        switch (unicode_category.categoryValue(@intCast(c))) {
+            6, 7, 8, 16 => return .extend,
+            else => {},
+        }
+    }
+    return .other;
+}
+
+/// The class of the base before position `i` (marks skipped), and its index.
+fn baseBefore(sc: []const u21, i: usize) ?struct { class: WordClass, at: usize } {
+    var j = i;
+    while (j > 0) {
+        j -= 1;
+        const cls = wordClass(sc[j]);
+        if (cls != .extend) return .{ .class = cls, .at = j };
+    }
+    return null;
+}
+
+fn baseAfter(sc: []const u21, i: usize) ?WordClass {
+    var j = i;
+    while (j < sc.len) : (j += 1) {
+        const cls = wordClass(sc[j]);
+        if (cls != .extend) return cls;
+    }
+    return null;
+}
+
+/// A word boundary between scalars `i - 1` and `i`: none between letters and
+/// digits, before a mark, or at a mid-word punctuation between two letters
+/// (or a mid-number one between two digits); one anywhere else.
+fn isWordBoundary(sc: []const u21, i: usize) bool {
+    if (i == 0 or i >= sc.len) return true;
+    if (wordClass(sc[i]) == .extend) return false;
+    const before = baseBefore(sc, i) orelse return true;
+    const b = wordClass(sc[i]);
+    const a = before.class;
+    const word_a = a == .letter or a == .numeric;
+    const word_b = b == .letter or b == .numeric;
+    if (word_a and word_b) return false;
+    // letter (MidLetter | MidNumLet) letter
+    if (a == .letter and (b == .mid_letter or b == .mid_num_let) and baseAfter(sc, i + 1) == .letter) return false;
+    if ((a == .mid_letter or a == .mid_num_let) and b == .letter) {
+        if (baseBefore(sc, before.at)) |p| if (p.class == .letter) return false;
+    }
+    // digit (MidNum | MidNumLet) digit
+    if (a == .numeric and (b == .mid_num or b == .mid_num_let) and baseAfter(sc, i + 1) == .numeric) return false;
+    if ((a == .mid_num or a == .mid_num_let) and b == .numeric) {
+        if (baseBefore(sc, before.at)) |p| if (p.class == .numeric) return false;
+    }
+    return true;
+}
+
 fn mapCase(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -3323,6 +3467,39 @@ test "uppercase and lowercase" {
     {
         var ctx = ctxFor(a, &.{try strVal(a, "Hello")});
         try expectStr(a, try string_lowercase(&ctx), "hello");
+    }
+}
+
+test "uppercase expands as SpecialCasing does and lowercase ends a word with a final sigma" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][3][]const u8{
+        // input, uppercase, lowercase
+        .{ "stra\u{df}e", "STRASSE", "stra\u{df}e" },
+        .{ "\u{149}", "\u{2bc}N", "\u{149}" },
+        .{ "\u{1f0}", "J\u{30c}", "\u{1f0}" },
+        .{ "\u{587}", "\u{535}\u{552}", "\u{587}" },
+        .{ "\u{39f}\u{394}\u{39f}\u{3a3} \u{39f}\u{394}\u{39f}\u{3a3}", "\u{39f}\u{394}\u{39f}\u{3a3} \u{39f}\u{394}\u{39f}\u{3a3}", "\u{3bf}\u{3b4}\u{3bf}\u{3c2} \u{3bf}\u{3b4}\u{3bf}\u{3c2}" },
+        // A sigma alone, or before a letter, is not final.
+        .{ "\u{3a3}", "\u{3a3}", "\u{3c3}" },
+        .{ "\u{391}\u{3a3}\u{391}", "\u{391}\u{3a3}\u{391}", "\u{3b1}\u{3c3}\u{3b1}" },
+        // Punctuation ends the word; an apostrophe between letters does not.
+        .{ "\u{391}\u{3a3}.", "\u{391}\u{3a3}.", "\u{3b1}\u{3c2}." },
+        .{ "\u{391}\u{3a3}'\u{391}", "\u{391}\u{3a3}'\u{391}", "\u{3b1}\u{3c3}'\u{3b1}" },
+        // A mark stays with its letter.
+        .{ "\u{391}\u{301}\u{3a3}", "\u{391}\u{301}\u{3a3}", "\u{3b1}\u{301}\u{3c2}" },
+        .{ "\u{130}", "\u{130}", "i\u{307}" },
+    };
+    for (cases) |c| {
+        {
+            var ctx = ctxFor(a, &.{try strVal(a, c[0])});
+            try expectStr(a, try string_uppercase(&ctx), c[1]);
+        }
+        {
+            var ctx = ctxFor(a, &.{try strVal(a, c[0])});
+            try expectStr(a, try string_lowercase(&ctx), c[2]);
+        }
     }
 }
 

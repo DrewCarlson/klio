@@ -1,0 +1,14 @@
+-- move outside
+-- move in
+Enter at Offset(10.0, 20.0) pressed=false primary=false
+-- move within
+Move at Offset(30.0, 40.0) pressed=false primary=false
+-- click
+Press at Offset(30.0, 40.0) pressed=true primary=true
+Release at Offset(30.0, 40.0) pressed=false primary=false
+-- move out
+Exit at Offset(140.0, 140.0) pressed=false primary=false
+-- the filter box
+filter: enter
+filter: move at Offset(20.0, 20.0)
+filter: exit

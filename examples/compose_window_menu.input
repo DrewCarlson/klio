@@ -1,0 +1,22 @@
+# Scripted input for compose_window_menu.kt's window (KLIO_WIN_INPUT): at the
+# given milliseconds after the window's first event poll, a menu item chosen
+# by its titles' path, or a key as the platform would report it (AWT key
+# codes; modifiers 1 shift, 2 control).
+200ms menu File/Open
+300ms menu File/Open Recent/plan.md
+# Ctrl+Shift+N is New's shortcut.
+400ms key 78 14 3
+# Word Wrap twice, then the zoom levels.
+500ms menu View/Word Wrap
+600ms menu View/Word Wrap
+700ms menu View/Zoom 150%
+800ms menu View/Zoom 150%
+900ms menu View/Zoom 200%
+# A disabled item, its shortcut, and an item of a disabled menu: nothing.
+1000ms menu File/Print
+1050ms key 80 16 3
+1100ms menu Help/About
+# A path that is not there: nothing.
+1150ms menu File/Save
+# Ctrl+Shift+W is Close's shortcut.
+1200ms key 87 23 3

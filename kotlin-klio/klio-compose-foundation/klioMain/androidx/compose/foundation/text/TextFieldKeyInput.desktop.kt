@@ -1,10 +1,8 @@
-// Vendored from compose-multiplatform-core desktopMain (v1.12.0),
-// androidx/compose/foundation/text/TextFieldKeyInput.desktop.kt.
-//
-// COPIED, not linked: the desktop source set as a whole depends on JVM APIs
-// (java.awt clipboard, Swing context menus), which klio cannot satisfy — so the
-// pack must not point at it. These files are the java-free subset, vendored so we
-// own them and can adapt them to klio's platform surface.
+// Adapted from compose-multiplatform-core desktopMain (v1.12.0),
+// androidx/compose/foundation/text/TextFieldKeyInput.desktop.kt: the typed
+// event is the platform event a klio window sends behind a key event, where
+// the desktop's is the AWT event, and the printable check reads Unicode's
+// blocks from the ranges where the JDK's differ from "any block".
 /*
  * Copyright 2021 The Android Open Source Project
  *
@@ -24,14 +22,30 @@
 package androidx.compose.foundation.text
 
 import androidx.compose.foundation.InternalFoundationApi
+import androidx.compose.ui.InternalComposeUiApi
 import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KlioNativeKeyEvent
+import androidx.compose.ui.input.key.klioNativeEventOrNull
+
+/**
+ * Not a control character, not the undefined character, in a Unicode block and
+ * not in the Specials block (U+FFF0..U+FFFF). The Basic Multilingual Plane's
+ * one range outside every block is U+2FE0..U+2FEF.
+ */
+private fun Char.isPrintable(): Boolean {
+    val inBlock = code !in 0x2FE0..0x2FEF
+    val special = code in 0xFFF0..0xFFFF
+    return !isISOControl() &&
+        this != KlioNativeKeyEvent.CHAR_UNDEFINED &&
+        inBlock &&
+        !special
+}
 
 // This API was never supposed to be public, but currently there are some external usages of it,
 // so it cannot be removed from the public right now.
 // However, starting with 1.9 it's marked as NOT a public-stable API with compatibility guarantees.
-//
-// Desktop answers from the AWT event behind the key event (a KEY_TYPED event
-// carrying a printable char). klio has no native key event behind a KeyEvent.
+@OptIn(InternalComposeUiApi::class)
 @InternalFoundationApi
 actual val KeyEvent.isTypedEvent: Boolean
-    get() = throw UnsupportedOperationException("klio: typed key events are not supported")
+    get() = klioNativeEventOrNull?.id == KlioNativeKeyEvent.KEY_TYPED &&
+        klioNativeEventOrNull?.keyChar?.isPrintable() == true

@@ -33,6 +33,9 @@ fi
 
 EXAMPLES=(
   compose_window
+  compose_window_input
+  compose_window_clipboard
+  compose_window_menu
   compose_multiwindow
   compose_material3_text
   compose_foundation_draw
@@ -51,6 +54,10 @@ if ! scripts/install-local-packs.sh >/tmp/compose-ui-gate-packs.log 2>&1; then
 fi
 
 pass=0
+# The examples run with a clipboard of their own, not the user's, and in the
+# en-US locale whatever the host's.
+export KLIO_CLIPBOARD=private
+export KLIO_LOCALE=en-US
 rc=0
 skipped=0
 for name in "${EXAMPLES[@]}"; do
@@ -58,6 +65,12 @@ for name in "${EXAMPLES[@]}"; do
     echo "compose-ui-gate: SKIP $name (renders through the Skia shim, which this host cannot build)"
     skipped=$((skipped + 1))
     continue
+  fi
+  # An example's window takes its scripted input from <name>.input.
+  if [ -f "examples/$name.input" ]; then
+    export KLIO_WIN_INPUT="$PWD/examples/$name.input"
+  else
+    unset KLIO_WIN_INPUT
   fi
   out=$(timeout 400 "$BIN" run "examples/$name.kt" 2>/tmp/compose-ui-gate-$name.err)
   erc=$?

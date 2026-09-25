@@ -34,6 +34,7 @@ fn rssLog() void {
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("androidx.compose.foundation.__composeui_hostOs", hostOs);
+    try b.register("androidx.compose.ui.input.key.__composeui_hostOs", hostOs);
     try b.register("klio.compose.ui.__composeui_skiaRender", skiaRender);
     try b.register("klio.compose.ui.__composeui_measureText", measureText);
     try b.register("klio.compose.ui.__composeui_winOpen", winOpen);
@@ -48,6 +49,29 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winSetTitle", winSetTitle);
     try b.register("androidx.compose.ui.window.__composeui_winSetSize", winSetSize);
     try b.register("androidx.compose.ui.window.__composeui_winPoll", winPoll);
+    try b.register("androidx.compose.ui.window.__composeui_winPollEvent", winPollEvent);
+    try b.register("androidx.compose.ui.window.__composeui_winPostEvent", winPostEvent);
+    try b.register("androidx.compose.ui.window.__composeui_winSetFlag", winSetFlag);
+    try b.register("androidx.compose.ui.window.__composeui_winSetPosition", winSetPosition);
+    try b.register("androidx.compose.ui.window.__composeui_winPosition", winPosition);
+    try b.register("androidx.compose.ui.window.__composeui_screenBounds", screenBounds);
+    try b.register("androidx.compose.ui.window.__composeui_winSetFrameSize", winSetFrameSize);
+    try b.register("androidx.compose.ui.window.__composeui_winFrameSize", winFrameSize);
+    try b.register("androidx.compose.ui.window.__composeui_iconSurface", surfNew);
+    try b.register("androidx.compose.ui.window.__composeui_iconSurfaceFree", surfFree);
+    try b.register("androidx.compose.ui.window.__composeui_winSetIconSurface", winSetIconSurface);
+    try b.register("androidx.compose.ui.window.__composeui_winSetMenu", winSetMenu);
+    try b.register("androidx.compose.ui.window.__composeui_winSetMenuIcon", winSetMenuIcon);
+    try b.register("androidx.compose.ui.window.__composeui_traySupported", traySupported);
+    try b.register("androidx.compose.ui.window.__composeui_trayOpen", trayOpen);
+    try b.register("androidx.compose.ui.window.__composeui_trayClose", trayClose);
+    try b.register("androidx.compose.ui.window.__composeui_traySetIcon", traySetIcon);
+    try b.register("androidx.compose.ui.window.__composeui_traySetTooltip", traySetTooltip);
+    try b.register("androidx.compose.ui.window.__composeui_traySetMenu", traySetMenu);
+    try b.register("androidx.compose.ui.window.__composeui_trayNotify", trayNotify);
+    try b.register("androidx.compose.ui.window.__composeui_trayPollEvent", trayPollEvent);
+    try b.register("androidx.compose.ui.window.__composeui_appWait", appWait);
+    try b.register("androidx.compose.ui.window.__composeui_printErr", printErr);
     try b.register("androidx.compose.ui.window.__composeui_winClose", winClose);
     try b.register("androidx.compose.ui.window.__composeui_winSurface", winSurfaceOf);
     try b.register("androidx.compose.ui.window.__composeui_winPresent", winPresent);
@@ -68,6 +92,11 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_hideKeyboard", hideKeyboard);
     try b.register("androidx.compose.ui.window.__composeui_setTextCallback", setTextCallback);
     try b.register("androidx.compose.ui.window.__composeui_textInput", textInput);
+    try b.register("klio.datatransfer.__klio_clipMode", clipMode);
+    try b.register("androidx.compose.ui.text.intl.__composeui_hostLocale", hostLocale);
+    try b.register("klio.datatransfer.__klio_clipChangeCount", clipChangeCount);
+    try b.register("klio.datatransfer.__klio_clipText", clipText);
+    try b.register("klio.datatransfer.__klio_clipSetText", clipSetText);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -93,8 +122,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_text", canvasDrawText);
     try b.register("androidx.compose.ui.graphics.__composeui_text_width", textWidth);
     try b.register("androidx.compose.ui.graphics.__composeui_font_metric", fontMetric);
-    try b.register("androidx.compose.ui.graphics.__skia_c_concat", canvasConcat);
     try b.register("androidx.compose.ui.graphics.__skia_surf_pixel", surfPixel);
+    try b.register("androidx.compose.ui.graphics.__skia_surf_size", surfSize);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_text2", canvasDrawText2);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface", canvasDrawSurface);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface_rect", canvasDrawSurfaceRect);
@@ -103,6 +132,26 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_rec_end", recEnd);
     try b.register("androidx.compose.ui.graphics.__skia_picture_free", pictureFree);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_picture", canvasDrawPicture);
+    try b.register("androidx.compose.ui.graphics.__skia_c_concat44", canvasConcat44);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_context_new", rnContextNew);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_context_free", rnContextFree);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_context_set_lighting", rnContextSetLighting);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_new", rnNew);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_free", rnFree);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_float", rnSetFloat);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_color", rnSetColor);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_bounds", rnSetBounds);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_pivot", rnSetPivot);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_clip", rnSetClip);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_outline", rnSetOutline);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_layer_paint", rnSetLayerPaint);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_begin_recording", rnBeginRecording);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_end_recording", rnEndRecording);
+    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_draw_into", rnDrawInto);
+    try b.register("androidx.compose.ui.graphics.__skia_c_draw_point", canvasDrawPoint);
+    try b.register("androidx.compose.ui.graphics.__skia_c_set_path_effect", canvasSetPathEffect);
+    try b.register("androidx.compose.ui.graphics.__skia_c_draw_vertices", canvasDrawVertices);
+    try b.register("androidx.compose.ui.graphics.__skia_image_decode", imageDecode);
     try b.register("androidx.compose.ui.text.platform.__skia_para_new", paraNew);
     try b.register("androidx.compose.ui.text.platform.__skia_para_layout", paraLayout);
     try b.register("androidx.compose.ui.text.platform.__skia_para_metric", paraMetric);
@@ -116,6 +165,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.text.platform.__skia_para_paint", paraPaint);
     try b.register("androidx.compose.ui.text.platform.__skia_para_free", paraFree);
     try b.register("androidx.compose.ui.text.platform.__skia_font_register", fontRegister);
+    try b.register("androidx.compose.ui.text.platform.__skia_font_register_data", fontRegisterData);
     try b.register("androidx.compose.ui.text.platform.__skia_para_ph_count", paraPhCount);
     try b.register("androidx.compose.ui.text.platform.__skia_para_ph_rect", paraPhRect);
     try b.register("androidx.compose.material3.internal.__klio_icu_date", icuDate);
@@ -184,8 +234,8 @@ const Skia = struct {
     cDrawPath: ?CDrawPathFn,
     cMeasureTextWidth: ?CMeasureTextWidthFn,
     cFontMetric: ?CFontMetricFn,
-    cConcat: ?CConcatFn,
     surfPixel: ?SurfPixelFn,
+    surfSize: ?SurfSizeFn,
     cDrawText2: ?CDrawText2Fn,
     cDrawSurface: ?CDrawSurfaceFn,
     cDrawSurfaceRect: ?CDrawSurfaceRectFn,
@@ -194,6 +244,12 @@ const Skia = struct {
     recEnd: ?RecEndFn,
     pictureFree: ?PictureFreeFn,
     cDrawPicture: ?CDrawPictureFn,
+    cConcat44: ?CConcat44Fn,
+    rn: RenderNodeFns,
+    cDrawPoint: ?CDrawPointFn,
+    cSetPathEffect: ?CSetShaderFn,
+    cDrawVertices: ?CDrawVerticesFn,
+    imageDecode: ?ImageDecodeFn,
     paraNew: ?ParaNewFn,
     paraLayout: ?ParaLayoutFn,
     paraMetric: ?ParaMetricFn,
@@ -207,6 +263,7 @@ const Skia = struct {
     paraPaint: ?ParaPaintFn,
     paraFree: ?ParaFreeFn,
     fontRegister: ?FontRegisterFn,
+    fontRegisterData: ?FontRegisterDataFn,
     paraPhCount: ?ParaPhCountFn,
     paraPhRect: ?ParaPhRectFn,
     icuDate: ?IcuDateFn,
@@ -220,12 +277,87 @@ const Skia = struct {
     winClose: *const fn (?*SkWindow) callconv(.c) void,
     /// Optional: only native live-resize backends export this.
     winSetResizeCb: ?ResizeCbFn,
+    winPollEvent: ?WinPollEventFn,
+    winPostEvent: ?WinPostEventFn,
+    winSetFlag: ?*const fn (?*SkWindow, c_int, c_int) callconv(.c) void,
+    winSetPosition: ?*const fn (?*SkWindow, c_int, c_int) callconv(.c) void,
+    winGetPosition: ?*const fn (?*SkWindow, *c_int, *c_int) callconv(.c) void,
+    screenBounds: ?*const fn (*c_int, *c_int, *c_int, *c_int) callconv(.c) void,
+    winSetFrameSize: ?*const fn (?*SkWindow, c_int, c_int) callconv(.c) void,
+    winGetFrameSize: ?*const fn (?*SkWindow, *c_int, *c_int) callconv(.c) void,
     winSetTitle: ?*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void,
     winSetSize: ?*const fn (?*SkWindow, c_int, c_int) callconv(.c) void,
     winSetIconPng: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
+    winSetIconSurface: ?*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void,
+    winSetMenu: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
+    winSetMenuIcon: ?*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void,
+    tray: TrayFns,
+    clipChangeCount: ?ClipChangeCountFn,
+    clipGetText: ?ClipGetTextFn,
+    clipSetText: ?ClipSetTextFn,
+    hostLocale: ?HostLocaleFn,
 };
 
+const HostLocaleFn = *const fn () callconv(.c) ?[*:0]u8;
+
+/// The Skia shim's tray icon and application-wait functions.
+const TrayFns = struct {
+    supported: ?*const fn () callconv(.c) c_int = null,
+    open: ?*const fn () callconv(.c) ?*anyopaque = null,
+    close: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    setIcon: ?*const fn (?*anyopaque, ?*SkSurface) callconv(.c) void = null,
+    setTooltip: ?*const fn (?*anyopaque, ?[*]const u8, usize) callconv(.c) void = null,
+    setMenu: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+    notify: ?*const fn (?*anyopaque, [*]const u8, usize, [*]const u8, usize, c_int) callconv(.c) void = null,
+    pollEvent: ?*const fn (?*anyopaque, [*]f64) callconv(.c) c_int = null,
+    appWait: ?*const fn (c_int) callconv(.c) void = null,
+
+    fn fromLib(lib: *std.DynLib) TrayFns {
+        var t: TrayFns = .{};
+        inline for (.{
+            .{ "supported", "klio_tray_supported" },
+            .{ "open", "klio_tray_open" },
+            .{ "close", "klio_tray_close" },
+            .{ "setIcon", "klio_tray_set_icon" },
+            .{ "setTooltip", "klio_tray_set_tooltip" },
+            .{ "setMenu", "klio_tray_set_menu" },
+            .{ "notify", "klio_tray_notify" },
+            .{ "pollEvent", "klio_tray_poll_event" },
+            .{ "appWait", "klio_app_wait" },
+        }) |f| {
+            @field(t, f[0]) = lib.lookup(@typeInfo(@FieldType(TrayFns, f[0])).optional.child, f[1]);
+        }
+        return t;
+    }
+
+    fn fromExtern() TrayFns {
+        var t: TrayFns = .{};
+        inline for (.{
+            .{ "supported", "klio_tray_supported" },
+            .{ "open", "klio_tray_open" },
+            .{ "close", "klio_tray_close" },
+            .{ "setIcon", "klio_tray_set_icon" },
+            .{ "setTooltip", "klio_tray_set_tooltip" },
+            .{ "setMenu", "klio_tray_set_menu" },
+            .{ "notify", "klio_tray_notify" },
+            .{ "pollEvent", "klio_tray_poll_event" },
+            .{ "appWait", "klio_app_wait" },
+        }) |f| {
+            @field(t, f[0]) = externSym(@typeInfo(@FieldType(TrayFns, f[0])).optional.child, f[1]);
+        }
+        return t;
+    }
+};
+
+const ClipChangeCountFn = *const fn () callconv(.c) c_longlong;
+const ClipGetTextFn = *const fn (*usize) callconv(.c) ?[*]u8;
+const ClipSetTextFn = *const fn (?[*]const u8, usize) callconv(.c) void;
+
 const WinAttachFn = *const fn (?*anyopaque, c_int, c_int, f64) callconv(.c) ?*SkWindow;
+const WinPollEventFn = *const fn (?*SkWindow, c_int, [*]f64) callconv(.c) c_int;
+const WinPostEventFn = *const fn (?*SkWindow, c_int, [*]const f64) callconv(.c) void;
+/// The values of one window event (src/compose_ui/window_events.h).
+const win_event_values = 12;
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
 const PathOpFn = *const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) ?[*:0]u8;
 const FreeCstrFn = *const fn ([*:0]u8) callconv(.c) void;
@@ -239,8 +371,10 @@ const CRotateFn = *const fn (?*SkSurface, f32) callconv(.c) void;
 const CClipRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int) callconv(.c) void;
 const CClipPathFn = *const fn (?*SkSurface, [*:0]const u8, c_int) callconv(.c) void;
 const CSetShaderFn = *const fn (?*SkSurface, [*:0]const u8) callconv(.c) void;
-const CSetColorFilterFn = *const fn (?*SkSurface, u32, c_int) callconv(.c) void;
-const CSetPaintStateFn = *const fn (?*SkSurface, c_int, f32) callconv(.c) void;
+// A color filter spec (see skia_shim.cpp's Spec).
+const CSetColorFilterFn = *const fn (?*SkSurface, [*:0]const u8) callconv(.c) void;
+// (blendMode, imageAlpha, strokeMiter)
+const CSetPaintStateFn = *const fn (?*SkSurface, c_int, f32, f32) callconv(.c) void;
 // The trailing (argb, style, strokeWidth, cap, join, aa) is the packed paint.
 const CDrawRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
 const CDrawRRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
@@ -249,18 +383,84 @@ const CDrawLineFn = *const fn (?*SkSurface, f32, f32, f32, f32, u32, f32, c_int,
 const CDrawPathFn = *const fn (?*SkSurface, [*:0]const u8, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
 const CMeasureTextWidthFn = *const fn ([*:0]const u8, f32) callconv(.c) f32;
 const CFontMetricFn = *const fn (f32, c_int) callconv(.c) f32;
-const CConcatFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32) callconv(.c) void;
 const SurfPixelFn = *const fn (?*SkSurface, c_int, c_int) callconv(.c) u32;
+const SurfSizeFn = *const fn (?*SkSurface, c_int) callconv(.c) c_int;
 const CDrawText2Fn = *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, u32, c_int) callconv(.c) void;
-const CDrawSurfaceFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32) callconv(.c) void;
-const CDrawSurfaceRectFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32, f32, f32, f32, f32, f32, f32) callconv(.c) void;
-// (l, t, r, b, hasBounds, alpha, blendMode, blurX, blurY, tileMode)
-const CSaveLayerFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int, f32, c_int, f32, f32, c_int) callconv(.c) void;
+const CDrawSurfaceFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32, c_int) callconv(.c) void;
+const CDrawSurfaceRectFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32, f32, f32, f32, f32, f32, f32, c_int) callconv(.c) void;
+// (l, t, r, b, hasBounds, alpha, blendMode, imageFilterSpec)
+const CSaveLayerFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int, f32, c_int, [*:0]const u8) callconv(.c) void;
 const SkPicture = anyopaque;
-const RecBeginFn = *const fn (f32, f32) callconv(.c) ?*SkSurface;
+// (left, top, right, bottom) of the recording's bounds.
+const RecBeginFn = *const fn (f32, f32, f32, f32) callconv(.c) ?*SkSurface;
 const RecEndFn = *const fn (?*SkSurface) callconv(.c) ?*SkPicture;
 const PictureFreeFn = *const fn (?*SkPicture) callconv(.c) void;
 const CDrawPictureFn = *const fn (?*SkSurface, ?*SkPicture) callconv(.c) void;
+// A Compose Matrix's 16 values, column-major.
+const CConcat44Fn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) callconv(.c) void;
+
+/// Graphics layer nodes (skiko's RenderNode, `klio_rn_*` in skia_shim.cpp).
+/// Each is optional so a shim without them draws layers as nothing.
+const RenderNodeFns = struct {
+    contextNew: ?*const fn (c_int) callconv(.c) ?*anyopaque = null,
+    contextFree: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    contextSetLighting: ?*const fn (?*anyopaque, f32, f32, f32, f32, f32, f32) callconv(.c) void = null,
+    new: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque = null,
+    free: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    setFloat: ?*const fn (?*anyopaque, c_int, f32) callconv(.c) void = null,
+    setColor: ?*const fn (?*anyopaque, c_int, u32) callconv(.c) void = null,
+    setBounds: ?*const fn (?*anyopaque, f32, f32, f32, f32) callconv(.c) void = null,
+    setPivot: ?*const fn (?*anyopaque, f32, f32) callconv(.c) void = null,
+    setClip: ?*const fn (?*anyopaque, c_int) callconv(.c) void = null,
+    // (kind, l, t, r, b, the 8 corner radii, path)
+    setOutline: ?*const fn (?*anyopaque, c_int, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, ?[*:0]const u8) callconv(.c) void = null,
+    // (has, alpha, blendMode, colorFilterSpec, imageFilterSpec)
+    setLayerPaint: ?*const fn (?*anyopaque, c_int, f32, c_int, [*:0]const u8, [*:0]const u8) callconv(.c) void = null,
+    beginRecording: ?*const fn (?*anyopaque) callconv(.c) ?*SkSurface = null,
+    endRecording: ?*const fn (?*anyopaque, ?*SkSurface) callconv(.c) void = null,
+    drawInto: ?*const fn (?*anyopaque, ?*SkSurface) callconv(.c) void = null,
+
+    const names = .{
+        .{ "contextNew", "klio_rn_context_new" },
+        .{ "contextFree", "klio_rn_context_free" },
+        .{ "contextSetLighting", "klio_rn_context_set_lighting" },
+        .{ "new", "klio_rn_new" },
+        .{ "free", "klio_rn_free" },
+        .{ "setFloat", "klio_rn_set_float" },
+        .{ "setColor", "klio_rn_set_color" },
+        .{ "setBounds", "klio_rn_set_bounds" },
+        .{ "setPivot", "klio_rn_set_pivot" },
+        .{ "setClip", "klio_rn_set_clip" },
+        .{ "setOutline", "klio_rn_set_outline" },
+        .{ "setLayerPaint", "klio_rn_set_layer_paint" },
+        .{ "beginRecording", "klio_rn_begin_recording" },
+        .{ "endRecording", "klio_rn_end_recording" },
+        .{ "drawInto", "klio_rn_draw_into" },
+    };
+
+    fn fromLib(lib: anytype) RenderNodeFns {
+        var r: RenderNodeFns = .{};
+        inline for (names) |n| {
+            const T = @typeInfo(@FieldType(RenderNodeFns, n[0])).optional.child;
+            @field(r, n[0]) = lib.lookup(T, n[1]);
+        }
+        return r;
+    }
+
+    fn fromExtern() RenderNodeFns {
+        var r: RenderNodeFns = .{};
+        inline for (names) |n| {
+            const T = @typeInfo(@FieldType(RenderNodeFns, n[0])).optional.child;
+            @field(r, n[0]) = externSym(T, n[1]);
+        }
+        return r;
+    }
+};
+// (x, y, argb, strokeWidth, cap, aa)
+const CDrawPointFn = *const fn (?*SkSurface, f32, f32, u32, f32, c_int, c_int) callconv(.c) void;
+// (mode, positions, texCoords, colors, indices, blendMode, argb): the arrays as number text.
+const CDrawVerticesFn = *const fn (?*SkSurface, c_int, [*:0]const u8, [*:0]const u8, [*:0]const u8, [*:0]const u8, c_int, u32) callconv(.c) void;
+const ImageDecodeFn = *const fn ([*]const u8, usize) callconv(.c) ?*SkSurface;
 const KlioPara = anyopaque;
 const ParaNewFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) ?*KlioPara;
 const ParaLayoutFn = *const fn (?*KlioPara, f32) callconv(.c) void;
@@ -275,6 +475,7 @@ const ParaLineForFn = *const fn (?*KlioPara, c_int) callconv(.c) c_int;
 const ParaPaintFn = *const fn (?*KlioPara, ?*SkSurface, f32, f32) callconv(.c) void;
 const ParaFreeFn = *const fn (?*KlioPara) callconv(.c) void;
 const FontRegisterFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) i32;
+const FontRegisterDataFn = *const fn ([*]const u8, usize, [*:0]const u8) callconv(.c) i32;
 const ParaPhCountFn = *const fn (?*KlioPara) callconv(.c) i32;
 const ParaPhRectFn = *const fn (?*KlioPara, i32, i32) callconv(.c) f32;
 
@@ -352,16 +553,22 @@ fn loadSkia() ?*Skia {
         .cDrawPath = lib.lookup(CDrawPathFn, "klio_skia_c_draw_path"),
         .cMeasureTextWidth = lib.lookup(CMeasureTextWidthFn, "klio_skia_measure_text_width"),
         .cFontMetric = lib.lookup(CFontMetricFn, "klio_skia_font_metric"),
-        .cConcat = lib.lookup(CConcatFn, "klio_skia_c_concat"),
         .surfPixel = lib.lookup(SurfPixelFn, "klio_skia_surf_pixel"),
+        .surfSize = lib.lookup(SurfSizeFn, "klio_skia_surf_size"),
         .cDrawText2 = lib.lookup(CDrawText2Fn, "klio_skia_c_draw_text2"),
         .cDrawSurface = lib.lookup(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
         .cDrawSurfaceRect = lib.lookup(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
         .cSaveLayer = lib.lookup(CSaveLayerFn, "klio_skia_c_save_layer"),
-        .recBegin = lib.lookup(RecBeginFn, "klio_skia_rec_begin"),
+        .recBegin = lib.lookup(RecBeginFn, "klio_skia_rec_begin_bounds"),
         .recEnd = lib.lookup(RecEndFn, "klio_skia_rec_end"),
         .pictureFree = lib.lookup(PictureFreeFn, "klio_skia_picture_free"),
         .cDrawPicture = lib.lookup(CDrawPictureFn, "klio_skia_c_draw_picture"),
+        .cConcat44 = lib.lookup(CConcat44Fn, "klio_skia_c_concat44"),
+        .rn = RenderNodeFns.fromLib(&lib),
+        .cDrawPoint = lib.lookup(CDrawPointFn, "klio_skia_c_draw_point"),
+        .cSetPathEffect = lib.lookup(CSetShaderFn, "klio_skia_c_set_path_effect"),
+        .cDrawVertices = lib.lookup(CDrawVerticesFn, "klio_skia_c_draw_vertices"),
+        .imageDecode = lib.lookup(ImageDecodeFn, "klio_skia_image_decode"),
         .paraNew = lib.lookup(ParaNewFn, "klio_skia_para_new"),
         .paraLayout = lib.lookup(ParaLayoutFn, "klio_skia_para_layout"),
         .paraMetric = lib.lookup(ParaMetricFn, "klio_skia_para_metric"),
@@ -375,6 +582,7 @@ fn loadSkia() ?*Skia {
         .paraPaint = lib.lookup(ParaPaintFn, "klio_skia_para_paint"),
         .paraFree = lib.lookup(ParaFreeFn, "klio_skia_para_free"),
         .fontRegister = lib.lookup(FontRegisterFn, "klio_skia_font_register"),
+        .fontRegisterData = lib.lookup(FontRegisterDataFn, "klio_skia_font_register_data"),
         .paraPhCount = lib.lookup(ParaPhCountFn, "klio_skia_para_ph_count"),
         .paraPhRect = lib.lookup(ParaPhRectFn, "klio_skia_para_ph_rect"),
         .icuDate = lib.lookup(IcuDateFn, "klio_icu_date"),
@@ -385,9 +593,25 @@ fn loadSkia() ?*Skia {
         .winPoll = F.get(&lib, "winPoll", "klio_win_poll") orelse return skiaLoadFail(&lib),
         .winClose = F.get(&lib, "winClose", "klio_win_close") orelse return skiaLoadFail(&lib),
         .winSetResizeCb = lib.lookup(ResizeCbFn, "klio_win_set_resize_cb"),
+        .winPollEvent = lib.lookup(WinPollEventFn, "klio_win_poll_event"),
+        .winPostEvent = lib.lookup(WinPostEventFn, "klio_win_post_event"),
+        .winSetFlag = lib.lookup(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_flag"),
+        .winSetPosition = lib.lookup(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_position"),
+        .winGetPosition = lib.lookup(*const fn (?*SkWindow, *c_int, *c_int) callconv(.c) void, "klio_win_get_position"),
+        .screenBounds = lib.lookup(*const fn (*c_int, *c_int, *c_int, *c_int) callconv(.c) void, "klio_win_screen_bounds"),
+        .winSetFrameSize = lib.lookup(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_frame_size"),
+        .winGetFrameSize = lib.lookup(*const fn (?*SkWindow, *c_int, *c_int) callconv(.c) void, "klio_win_get_frame_size"),
         .winSetTitle = lib.lookup(*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void, "klio_win_set_title"),
         .winSetSize = lib.lookup(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_size"),
         .winSetIconPng = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_icon_png"),
+        .winSetIconSurface = lib.lookup(*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void, "klio_win_set_icon_surface"),
+        .winSetMenu = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_menu"),
+        .winSetMenuIcon = lib.lookup(*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void, "klio_win_set_menu_icon"),
+        .tray = TrayFns.fromLib(&lib),
+        .clipChangeCount = lib.lookup(ClipChangeCountFn, "klio_clip_change_count"),
+        .clipGetText = lib.lookup(ClipGetTextFn, "klio_clip_get_text"),
+        .clipSetText = lib.lookup(ClipSetTextFn, "klio_clip_set_text"),
+        .hostLocale = lib.lookup(HostLocaleFn, "klio_host_locale"),
     };
     skia_state = s;
     return &skia_state.?;
@@ -443,16 +667,22 @@ fn loadSkiaStatic() ?*Skia {
         .cDrawPath = externSym(CDrawPathFn, "klio_skia_c_draw_path"),
         .cMeasureTextWidth = externSym(CMeasureTextWidthFn, "klio_skia_measure_text_width"),
         .cFontMetric = externSym(CFontMetricFn, "klio_skia_font_metric"),
-        .cConcat = externSym(CConcatFn, "klio_skia_c_concat"),
         .surfPixel = externSym(SurfPixelFn, "klio_skia_surf_pixel"),
+        .surfSize = externSym(SurfSizeFn, "klio_skia_surf_size"),
         .cDrawText2 = externSym(CDrawText2Fn, "klio_skia_c_draw_text2"),
         .cDrawSurface = externSym(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
         .cDrawSurfaceRect = externSym(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
         .cSaveLayer = externSym(CSaveLayerFn, "klio_skia_c_save_layer"),
-        .recBegin = externSym(RecBeginFn, "klio_skia_rec_begin"),
+        .recBegin = externSym(RecBeginFn, "klio_skia_rec_begin_bounds"),
         .recEnd = externSym(RecEndFn, "klio_skia_rec_end"),
         .pictureFree = externSym(PictureFreeFn, "klio_skia_picture_free"),
         .cDrawPicture = externSym(CDrawPictureFn, "klio_skia_c_draw_picture"),
+        .cConcat44 = externSym(CConcat44Fn, "klio_skia_c_concat44"),
+        .rn = RenderNodeFns.fromExtern(),
+        .cDrawPoint = externSym(CDrawPointFn, "klio_skia_c_draw_point"),
+        .cSetPathEffect = externSym(CSetShaderFn, "klio_skia_c_set_path_effect"),
+        .cDrawVertices = externSym(CDrawVerticesFn, "klio_skia_c_draw_vertices"),
+        .imageDecode = externSym(ImageDecodeFn, "klio_skia_image_decode"),
         .paraNew = externSym(ParaNewFn, "klio_skia_para_new"),
         .paraLayout = externSym(ParaLayoutFn, "klio_skia_para_layout"),
         .paraMetric = externSym(ParaMetricFn, "klio_skia_para_metric"),
@@ -466,6 +696,7 @@ fn loadSkiaStatic() ?*Skia {
         .paraPaint = externSym(ParaPaintFn, "klio_skia_para_paint"),
         .paraFree = externSym(ParaFreeFn, "klio_skia_para_free"),
         .fontRegister = externSym(FontRegisterFn, "klio_skia_font_register"),
+        .fontRegisterData = externSym(FontRegisterDataFn, "klio_skia_font_register_data"),
         .paraPhCount = externSym(ParaPhCountFn, "klio_skia_para_ph_count"),
         .paraPhRect = externSym(ParaPhRectFn, "klio_skia_para_ph_rect"),
         .icuDate = externSym(IcuDateFn, "klio_icu_date"),
@@ -476,9 +707,25 @@ fn loadSkiaStatic() ?*Skia {
         .winPoll = externSym(@FieldType(Skia, "winPoll"), "klio_win_poll"),
         .winClose = externSym(@FieldType(Skia, "winClose"), "klio_win_close"),
         .winSetResizeCb = externSym(ResizeCbFn, "klio_win_set_resize_cb"),
+        .winPollEvent = externSym(WinPollEventFn, "klio_win_poll_event"),
+        .winPostEvent = externSym(WinPostEventFn, "klio_win_post_event"),
+        .winSetFlag = externSym(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_flag"),
+        .winSetPosition = externSym(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_position"),
+        .winGetPosition = externSym(*const fn (?*SkWindow, *c_int, *c_int) callconv(.c) void, "klio_win_get_position"),
+        .screenBounds = externSym(*const fn (*c_int, *c_int, *c_int, *c_int) callconv(.c) void, "klio_win_screen_bounds"),
+        .winSetFrameSize = externSym(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_frame_size"),
+        .winGetFrameSize = externSym(*const fn (?*SkWindow, *c_int, *c_int) callconv(.c) void, "klio_win_get_frame_size"),
         .winSetTitle = externSym(*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void, "klio_win_set_title"),
         .winSetSize = externSym(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_size"),
         .winSetIconPng = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_icon_png"),
+        .winSetIconSurface = externSym(*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void, "klio_win_set_icon_surface"),
+        .winSetMenu = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_menu"),
+        .winSetMenuIcon = externSym(*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void, "klio_win_set_menu_icon"),
+        .tray = TrayFns.fromExtern(),
+        .clipChangeCount = externSym(ClipChangeCountFn, "klio_clip_change_count"),
+        .clipGetText = externSym(ClipGetTextFn, "klio_clip_get_text"),
+        .clipSetText = externSym(ClipSetTextFn, "klio_clip_set_text"),
+        .hostLocale = externSym(HostLocaleFn, "klio_host_locale"),
     };
     skia_state = s;
     return &skia_state.?;
@@ -704,6 +951,164 @@ fn winSetTitle(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
+/// Sets a window's icon from a surface the painter was drawn on.
+fn winSetIconSurface(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
+    const f = skia.winSetIconSurface orelse return ok(Value.newLong(0));
+    f(win, surf);
+    return ok(Value.newLong(1));
+}
+
+/// Sets a window's menu bar from its entries (window_events.h's spec); an
+/// empty spec removes it.
+fn winSetMenu(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.winSetMenu orelse return ok(Value.newLong(0));
+    const g = ctx.args[1].String.borrow();
+    defer g.deinit();
+    const bytes = g.get().bytes;
+    f(win, bytes.ptr, bytes.len);
+    return ok(Value.newLong(1));
+}
+
+/// Sets the icon of a window's menu item from a surface its painter was
+/// drawn on.
+fn winSetMenuIcon(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[2]) orelse return ok(Value.newLong(0));
+    const f = skia.winSetMenuIcon orelse return ok(Value.newLong(0));
+    f(win, @intCast(argInt(ctx.args[1])), surf);
+    return ok(Value.newLong(1));
+}
+
+// A tray icon's bindings: the handle is the shim's tray as a Long.
+
+fn trayArg(v: Value) ?*anyopaque {
+    const h: u64 = @bitCast(argInt(v));
+    if (h == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(h)));
+}
+
+fn traySupported(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    const skia = loadSkia() orelse return ok(Value{ .Bool = false });
+    const f = skia.tray.supported orelse return ok(Value{ .Bool = false });
+    return ok(Value{ .Bool = f() != 0 });
+}
+
+fn trayOpen(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.tray.open orelse return ok(Value.newLong(0));
+    const tray = f() orelse return ok(Value.newLong(0));
+    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(tray)))));
+}
+
+fn trayClose(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.tray.close orelse return ok(Value.newLong(0));
+    f(trayArg(ctx.args[0]) orelse return ok(Value.newLong(0)));
+    return ok(Value.newLong(1));
+}
+
+fn traySetIcon(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.tray.setIcon orelse return ok(Value.newLong(0));
+    const tray = trayArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    f(tray, surfArg(ctx.args[1]) orelse return ok(Value.newLong(0)));
+    return ok(Value.newLong(1));
+}
+
+fn traySetTooltip(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.tray.setTooltip orelse return ok(Value.newLong(0));
+    const tray = trayArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    if (ctx.args[1] != .String) {
+        f(tray, null, 0);
+        return ok(Value.newLong(1));
+    }
+    const g = ctx.args[1].String.borrow();
+    defer g.deinit();
+    const bytes = g.get().bytes;
+    f(tray, bytes.ptr, bytes.len);
+    return ok(Value.newLong(1));
+}
+
+fn traySetMenu(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.tray.setMenu orelse return ok(Value.newLong(0));
+    const tray = trayArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const g = ctx.args[1].String.borrow();
+    defer g.deinit();
+    const bytes = g.get().bytes;
+    f(tray, bytes.ptr, bytes.len);
+    return ok(Value.newLong(1));
+}
+
+fn trayNotify(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 4 or ctx.args[1] != .String or ctx.args[2] != .String) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.tray.notify orelse return ok(Value.newLong(0));
+    const tray = trayArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const tg = ctx.args[1].String.borrow();
+    defer tg.deinit();
+    const mg = ctx.args[2].String.borrow();
+    defer mg.deinit();
+    const title = tg.get().bytes;
+    const message = mg.get().bytes;
+    f(tray, title.ptr, title.len, message.ptr, message.len, @intCast(argInt(ctx.args[3])));
+    return ok(Value.newLong(1));
+}
+
+/// A tray's next event, its values written into the DoubleArray (as a
+/// window's poll writes them); KLIO_EV_NONE when it has none.
+fn trayPollEvent(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[1] != .Array) return ok(Value.newInt(0));
+    const skia = loadSkia() orelse return ok(Value.newInt(0));
+    const f = skia.tray.pollEvent orelse return ok(Value.newInt(0));
+    const tray = trayArg(ctx.args[0]) orelse return ok(Value.newInt(0));
+    var values = [_]f64{0} ** win_event_values;
+    const kind = f(tray, &values);
+    const arr = ctx.args[1].Array;
+    const n = @min(arr.len(), win_event_values);
+    for (0..n) |i| arr.set(ctx.allocator, i, Value{ .Double = values[i] });
+    return ok(Value.newInt(kind));
+}
+
+/// Runs the platform's events for up to the timeout while no window polls
+/// them; without the shim, sleeps.
+fn appWait(ctx: *CallCtx) Error!EvalResult {
+    const ms: i64 = if (ctx.args.len > 0) @max(0, argInt(ctx.args[0])) else 0;
+    if (loadSkia()) |skia| {
+        if (skia.tray.appWait) |f| {
+            f(@intCast(@min(ms, std.math.maxInt(c_int))));
+            return ok(Value.newLong(1));
+        }
+    }
+    runtime.clockSleepMillis(ms);
+    return ok(Value.newLong(0));
+}
+
+/// Writes a line on standard error, as the desktop's System.err.println.
+fn printErr(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1 or ctx.args[0] != .String) return ok(Value.newLong(0));
+    const g = ctx.args[0].String.borrow();
+    defer g.deinit();
+    std.debug.print("{s}\n", .{g.get().bytes});
+    return ok(Value.newLong(1));
+}
+
 fn winSetSize(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -801,6 +1206,123 @@ fn winPoll(ctx: *CallCtx) Error!EvalResult {
         (@as(i64, @intCast(std.math.clamp(x, 0, 0xFFFF))) << 16) |
         @as(i64, @intCast(std.math.clamp(y, 0, 0xFFFF)));
     return ok(Value.newLong(packed_ev));
+}
+
+/// `__composeui_winPollEvent(handle, timeoutMs, onResize?, out: DoubleArray): Int`:
+/// wait up to timeoutMs for the window's next input event, write its values
+/// into `out` and return its type (window_events.h's KLIO_EV_*): 0 none, 2
+/// close. A supplied `onResize` runs during a live resize.
+fn winPollEvent(ctx: *CallCtx) Error!EvalResult {
+    const closed = Value.newInt(2);
+    if (ctx.args.len < 4 or ctx.args[3] != .Array) return ok(closed);
+    const skia = loadSkia() orelse return ok(closed);
+    const poll = skia.winPollEvent orelse return ok(closed);
+    const win = winHandle(ctx.args[0]) orelse return ok(closed);
+    const timeout: c_int = @intCast(@max(0, argInt(ctx.args[1])));
+    var rc: ResizeCb = undefined;
+    const has_cb = ctx.args[2] != .Null and skia.winSetResizeCb != null;
+    if (has_cb) {
+        rc = .{ .host = ctx.host, .callback = ctx.args[2], .out = ctx.out };
+        skia.winSetResizeCb.?(win, resizeTrampoline, &rc);
+    }
+    var values = [_]f64{0} ** win_event_values;
+    const t = poll(win, timeout, &values);
+    if (has_cb) skia.winSetResizeCb.?(win, null, null);
+    const arr = ctx.args[3].Array;
+    const n = @min(arr.len(), win_event_values);
+    for (0..n) |i| arr.set(ctx.allocator, i, Value{ .Double = values[i] });
+    return ok(Value.newInt(t));
+}
+
+/// `__composeui_winPostEvent(handle, type, values: DoubleArray)`: queue an
+/// event on the window as if its platform had sent it.
+fn winPostEvent(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3 or ctx.args[2] != .Array) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const post = skia.winPostEvent orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    var values = [_]f64{0} ** win_event_values;
+    const arr = ctx.args[2].Array;
+    const n = @min(arr.len(), win_event_values);
+    for (0..n) |i| values[i] = arr.get(i).asF64() orelse 0;
+    post(win, @intCast(argInt(ctx.args[1])), &values);
+    return ok(Value.newLong(1));
+}
+
+/// `__composeui_winSetFlag(handle, which, value)`: set one of a window's
+/// KLIO_WIN_* properties (window_events.h).
+fn winSetFlag(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.winSetFlag orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    f(win, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])));
+    return ok(Value.newLong(1));
+}
+
+/// `__composeui_winSetPosition(handle, x, y)`: move the window frame's
+/// top-left to (x, y) on the screen.
+fn winSetPosition(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.winSetPosition orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    f(win, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])));
+    return ok(Value.newLong(1));
+}
+
+/// `__composeui_winPosition(handle): Long`: the window frame's top-left, x in
+/// the high 32 bits and y in the low.
+fn winPosition(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.winGetPosition orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    var x: c_int = 0;
+    var y: c_int = 0;
+    f(win, &x, &y);
+    return ok(Value.newLong(packPoint(x, y)));
+}
+
+/// `__composeui_winSetFrameSize(handle, w, h)`: resize the window's frame,
+/// title bar and border included.
+fn winSetFrameSize(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.winSetFrameSize orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    f(win, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])));
+    return ok(Value.newLong(1));
+}
+
+/// `__composeui_winFrameSize(handle): Long`: the window frame's width in the
+/// high 32 bits and height in the low.
+fn winFrameSize(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.winGetFrameSize orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    var w: c_int = 0;
+    var h: c_int = 0;
+    f(win, &w, &h);
+    return ok(Value.newLong(packPoint(w, h)));
+}
+
+fn packPoint(x: c_int, y: c_int) i64 {
+    return (@as(i64, x) << 32) | @as(i64, @as(u32, @bitCast(y)));
+}
+
+/// `__composeui_screenBounds(which): Int`: the main screen's area for windows,
+/// which 0 x, 1 y, 2 width, 3 height; 0 without a windowing backend.
+fn screenBounds(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newInt(0));
+    const skia = loadSkia() orelse return ok(Value.newInt(0));
+    const f = skia.screenBounds orelse return ok(Value.newInt(0));
+    var b: [4]c_int = .{ 0, 0, 0, 0 };
+    f(&b[0], &b[1], &b[2], &b[3]);
+    const which = argInt(ctx.args[0]);
+    if (which < 0 or which > 3) return ok(Value.newInt(0));
+    return ok(Value.newInt(b[@intCast(which)]));
 }
 
 // OS-driven frame loop (mobile): the platform owns the run loop and calls
@@ -1056,6 +1578,109 @@ pub export fn klio_dispatch_key(kind: c_int) void {
     markFrameDirty();
 }
 
+// The clipboard klio.datatransfer's systemClipboard() answers with, as
+// KLIO_CLIPBOARD picks it: unset or "system" the host's (none when the host
+// has no clipboard the shim reaches), "private" one of the program's own that
+// nothing outside it reads or changes, "none" no clipboard, as a headless
+// desktop has.
+pub const ClipboardMode = enum(i32) { none = 0, system = 1, private = 2 };
+
+pub fn clipboardModeFor(setting: ?[]const u8, host_has_clipboard: bool) ClipboardMode {
+    if (setting) |s| {
+        if (std.mem.eql(u8, s, "none")) return .none;
+        if (std.mem.eql(u8, s, "private")) return .private;
+    }
+    return if (host_has_clipboard) .system else .none;
+}
+
+fn hostClipboard() ?*Skia {
+    const skia = loadSkia() orelse return null;
+    const count = skia.clipChangeCount orelse return null;
+    if (skia.clipGetText == null or skia.clipSetText == null) return null;
+    if (count() < 0) return null;
+    return skia;
+}
+
+fn clipMode(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    const setting = runtime.envOnce("KLIO_CLIPBOARD");
+    const host = if (setting != null and !std.mem.eql(u8, setting.?, "system")) false else hostClipboard() != null;
+    return ok(Value.newInt(@intFromEnum(clipboardModeFor(setting, host))));
+}
+
+fn clipChangeCount(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    const skia = hostClipboard() orelse return ok(Value.newLong(-1));
+    return ok(Value.newLong(skia.clipChangeCount.?()));
+}
+
+fn clipText(ctx: *CallCtx) Error!EvalResult {
+    const skia = hostClipboard() orelse return ok(Value.Null);
+    var len: usize = 0;
+    const text = skia.clipGetText.?(&len) orelse return ok(Value.Null);
+    defer if (skia.freeCstr) |free_fn| free_fn(@ptrCast(text));
+    const a = ctx.allocator;
+    const owned = try a.dupe(u8, text[0..len]);
+    return ok(Value{ .String = try runtime.strInitOwned(a, owned) });
+}
+
+fn clipSetText(ctx: *CallCtx) Error!EvalResult {
+    const skia = hostClipboard() orelse return ok(Value.newLong(0));
+    const set = skia.clipSetText.?;
+    if (ctx.args.len < 1 or ctx.args[0] != .String) {
+        set(null, 0);
+        return ok(Value.newLong(1));
+    }
+    const g = ctx.args[0].String.borrow();
+    defer g.deinit();
+    const bytes = g.get().bytes;
+    set(bytes.ptr, bytes.len);
+    return ok(Value.newLong(1));
+}
+
+/// The host's default locale as a language tag, as the JVM takes its default:
+/// `KLIO_LOCALE` when set (the JVM's -Duser.language and -Duser.country);
+/// else the platform's, from the Skia shim on macOS (the first preferred
+/// language with the current region), iOS and Windows (the user's UI
+/// language); else LC_ALL, LC_MESSAGES or LANG, read as the JVM reads a
+/// POSIX locale name.
+fn hostLocale(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (runtime.envOnce("KLIO_LOCALE")) |tag| {
+        if (tag.len > 0) return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, tag)) });
+    }
+    if (loadSkia()) |skia| {
+        if (skia.hostLocale) |f| {
+            if (f()) |tag| {
+                defer if (skia.freeCstr) |free_fn| free_fn(tag);
+                const s = std.mem.span(tag);
+                if (s.len > 0) return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, s)) });
+            }
+        }
+    }
+    const name = runtime.envOnce("LC_ALL") orelse runtime.envOnce("LC_MESSAGES") orelse runtime.envOnce("LANG");
+    var buf: [64]u8 = undefined;
+    const tag = posixLocaleTag(name, &buf);
+    return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, tag)) });
+}
+
+/// A POSIX locale name (`language_COUNTRY.encoding@modifier`) as a language
+/// tag. No name, an empty one, C and POSIX (with any encoding) read as
+/// en_US, as the JVM reads them.
+pub fn posixLocaleTag(name: ?[]const u8, buf: []u8) []const u8 {
+    var n = name orelse "";
+    if (n.len == 0) n = "C";
+    // The encoding and modifier go.
+    if (std.mem.indexOfAny(u8, n, ".@")) |i| n = n[0..i];
+    if (n.len == 0 or std.mem.eql(u8, n, "C") or std.mem.eql(u8, n, "POSIX")) n = "en_US";
+    if (n.len > buf.len) return "en-US";
+    @memcpy(buf[0..n.len], n);
+    for (buf[0..n.len]) |*c| {
+        if (c.* == '_') c.* = '-';
+    }
+    return buf[0..n.len];
+}
+
 fn textInput(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, staged_text[0..staged_text_len])) });
@@ -1210,22 +1835,62 @@ fn surfPixel(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@intCast(f(surf, x, y))));
 }
 
+/// Register a font's bytes (a ByteArray) under a family name: true when they
+/// load as a typeface.
+fn fontRegisterData(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .Array) return ok(Value{ .Bool = false });
+    const skia = loadSkia() orelse return ok(Value{ .Bool = false });
+    const f = skia.fontRegisterData orelse return ok(Value{ .Bool = false });
+    const family = (try specArg(ctx.allocator, ctx.args[1])) orelse return ok(Value{ .Bool = false });
+    defer ctx.allocator.free(family);
+    const arr = ctx.args[0].Array;
+    const bytes = try ctx.allocator.alloc(u8, arr.len());
+    defer ctx.allocator.free(bytes);
+    for (bytes, 0..) |*b, i| b.* = switch (arr.get(i)) {
+        .Byte => |x| @bitCast(x),
+        else => 0,
+    };
+    return ok(Value{ .Bool = f(bytes.ptr, bytes.len, family.ptr) != 0 });
+}
+
+/// A surface's width (which 0) or height (which 1).
+fn surfSize(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newInt(0));
+    const skia = loadSkia() orelse return ok(Value.newInt(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newInt(0));
+    const f = skia.surfSize orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(f(surf, @intCast(argInt(ctx.args[1])))));
+}
+
+/// Canvas.drawImage: (dst, src, x, y, sampling), sampling as the paint's
+/// filter quality maps (0 nearest, 1 linear, 2 linear + nearest mipmap, 3 cubic).
 fn canvasDrawSurface(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 4) return ok(Value.newLong(0));
+    if (ctx.args.len < 5) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     const dst = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
     const src = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
-    if (skia.cDrawSurface) |f| f(dst, src, argFloat(ctx.args[2]), argFloat(ctx.args[3]));
+    if (skia.cDrawSurface) |f| f(dst, src, argFloat(ctx.args[2]), argFloat(ctx.args[3]), @intCast(argInt(ctx.args[4])));
     return ok(Value.newLong(0));
 }
 
-/// Canvas.saveLayer: (handle, l, t, r, b, hasBounds, alpha, blendMode, blurX,
-/// blurY, tileMode); the pending color filter joins the layer's paint.
+/// A string argument as a sentinel-terminated copy; null when it is not a
+/// string. The caller frees it.
+fn specArg(allocator: std.mem.Allocator, v: Value) !?[:0]u8 {
+    if (v != .String) return null;
+    const g = v.String.borrow();
+    defer g.deinit();
+    return try allocator.dupeZ(u8, g.get().bytes);
+}
+
+/// Canvas.saveLayer: (handle, l, t, r, b, hasBounds, alpha, blendMode,
+/// imageFilterSpec); the pending color filter joins the layer's paint.
 fn canvasSaveLayer(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 11) return ok(Value.newLong(0));
+    if (ctx.args.len < 9) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
     const a = ctx.args;
+    const filter = (try specArg(ctx.allocator, a[8])) orelse return ok(Value.newLong(0));
+    defer ctx.allocator.free(filter);
     if (skia.cSaveLayer) |f| f(
         surf,
         argFloat(a[1]),
@@ -1235,21 +1900,227 @@ fn canvasSaveLayer(ctx: *CallCtx) Error!EvalResult {
         @intCast(argInt(a[5])),
         argFloat(a[6]),
         @intCast(argInt(a[7])),
-        argFloat(a[8]),
-        argFloat(a[9]),
-        @intCast(argInt(a[10])),
+        filter.ptr,
     );
     return ok(Value.newLong(0));
 }
 
-/// Begin recording a picture of (width, height): returns a handle that draws
-/// like a surface's, or 0 without the Skia backend.
-fn recBegin(ctx: *CallCtx) Error!EvalResult {
+/// Arm the next draws' path effect spec; an empty spec clears it.
+fn canvasSetPathEffect(ctx: *CallCtx) Error!EvalResult {
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.cSetPathEffect orelse return ok(Value.newLong(0));
+    const spec = (try specArg(ctx.allocator, ctx.args[1])) orelse return ok(Value.newLong(0));
+    defer ctx.allocator.free(spec);
+    f(surf, spec.ptr);
+    return ok(Value.newLong(0));
+}
+
+/// Canvas.drawVertices: (handle, mode, positions, texCoords, colors, indices,
+/// blendMode, argb), the arrays as whitespace-separated number text.
+fn canvasDrawVertices(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 8) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.cDrawVertices orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    var texts: [4][:0]u8 = undefined;
+    var n: usize = 0;
+    defer for (texts[0..n]) |t| ctx.allocator.free(t);
+    for (a[2..6]) |v| {
+        texts[n] = (try specArg(ctx.allocator, v)) orelse return ok(Value.newLong(0));
+        n += 1;
+    }
+    f(surf, @intCast(argInt(a[1])), texts[0].ptr, texts[1].ptr, texts[2].ptr, texts[3].ptr, @intCast(argInt(a[6])), argU32(a[7]));
+    return ok(Value.newLong(0));
+}
+
+/// Decode an encoded image (a ByteArray) into a new surface of its size: the
+/// surface's handle, or 0 when the bytes do not decode or there is no Skia.
+fn imageDecode(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1 or ctx.args[0] != .Array) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.imageDecode orelse return ok(Value.newLong(0));
+    const arr = ctx.args[0].Array;
+    const bytes = try ctx.allocator.alloc(u8, arr.len());
+    defer ctx.allocator.free(bytes);
+    for (bytes, 0..) |*b, i| b.* = switch (arr.get(i)) {
+        .Byte => |x| @bitCast(x),
+        else => 0,
+    };
+    return ok(handleOf(f(bytes.ptr, bytes.len)));
+}
+
+/// Begin recording a picture over (left, top, right, bottom): returns a handle
+/// that draws like a surface's, or 0 without the Skia backend.
+fn recBegin(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 4) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     const f = skia.recBegin orelse return ok(Value.newLong(0));
-    const h = f(argFloat(ctx.args[0]), argFloat(ctx.args[1])) orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    const h = f(argFloat(a[0]), argFloat(a[1]), argFloat(a[2]), argFloat(a[3])) orelse return ok(Value.newLong(0));
     return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(h)))));
+}
+
+/// Concat a Compose Matrix (its 16 values) onto the canvas, perspective included.
+fn canvasConcat44(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 17) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.cConcat44 orelse return ok(Value.newLong(0));
+    var m: [16]f32 = undefined;
+    for (&m, ctx.args[1..17]) |*d, v| d.* = argFloat(v);
+    f(surf, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+    return ok(Value.newLong(0));
+}
+
+// Graphics layer nodes. A node or context handle is its pointer as a Long; 0
+// without the Skia backend, which every entry point then answers with 0.
+
+fn handleOf(p: ?*anyopaque) Value {
+    return Value.newLong(if (p) |q| @bitCast(@as(u64, @intFromPtr(q))) else 0);
+}
+
+fn rnFns(ctx: *CallCtx, min_args: usize) ?*RenderNodeFns {
+    if (ctx.args.len < min_args) return null;
+    const skia = loadSkia() orelse return null;
+    return &skia.rn;
+}
+
+fn rnContextNew(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
+    const f = rn.contextNew orelse return ok(Value.newLong(0));
+    return ok(handleOf(f(@intCast(argInt(ctx.args[0])))));
+}
+
+fn rnContextFree(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
+    if (rn.contextFree) |f| if (surfArg(ctx.args[0])) |p| f(p);
+    return ok(Value.newLong(0));
+}
+
+fn rnContextSetLighting(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 7) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    if (rn.contextSetLighting) |f| f(p, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argFloat(a[5]), argFloat(a[6]));
+    return ok(Value.newLong(0));
+}
+
+fn rnNew(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
+    const context = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = rn.new orelse return ok(Value.newLong(0));
+    return ok(handleOf(f(context)));
+}
+
+fn rnFree(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
+    if (rn.free) |f| if (surfArg(ctx.args[0])) |p| f(p);
+    return ok(Value.newLong(0));
+}
+
+fn rnSetFloat(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 3) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    if (rn.setFloat) |f| f(p, @intCast(argInt(ctx.args[1])), argFloat(ctx.args[2]));
+    return ok(Value.newLong(0));
+}
+
+fn rnSetColor(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 3) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    if (rn.setColor) |f| f(p, @intCast(argInt(ctx.args[1])), argU32(ctx.args[2]));
+    return ok(Value.newLong(0));
+}
+
+fn rnSetBounds(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 5) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    if (rn.setBounds) |f| f(p, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]));
+    return ok(Value.newLong(0));
+}
+
+fn rnSetPivot(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 3) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    if (rn.setPivot) |f| f(p, argFloat(ctx.args[1]), argFloat(ctx.args[2]));
+    return ok(Value.newLong(0));
+}
+
+fn rnSetClip(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 2) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    if (rn.setClip) |f| f(p, @intCast(argInt(ctx.args[1])));
+    return ok(Value.newLong(0));
+}
+
+/// (node, kind, l, t, r, b, 8 corner radii, path): the outline a node clips to
+/// and casts its shadow from.
+fn rnSetOutline(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 15) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = rn.setOutline orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    var path: ?[:0]u8 = null;
+    defer if (path) |t| ctx.allocator.free(t);
+    if (a[14] == .String) {
+        const g = a[14].String.borrow();
+        defer g.deinit();
+        path = try ctx.allocator.dupeZ(u8, g.get().bytes);
+    }
+    var v: [12]f32 = undefined;
+    for (&v, a[2..14]) |*d, x| d.* = argFloat(x);
+    f(p, @intCast(argInt(a[1])), v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], if (path) |t| t.ptr else null);
+    return ok(Value.newLong(0));
+}
+
+fn rnSetLayerPaint(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 6) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = rn.setLayerPaint orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    const color_filter = (try specArg(ctx.allocator, a[4])) orelse return ok(Value.newLong(0));
+    defer ctx.allocator.free(color_filter);
+    const image_filter = (try specArg(ctx.allocator, a[5])) orelse return ok(Value.newLong(0));
+    defer ctx.allocator.free(image_filter);
+    f(p, @intCast(argInt(a[1])), argFloat(a[2]), @intCast(argInt(a[3])), color_filter.ptr, image_filter.ptr);
+    return ok(Value.newLong(0));
+}
+
+fn rnBeginRecording(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = rn.beginRecording orelse return ok(Value.newLong(0));
+    return ok(handleOf(f(p)));
+}
+
+fn rnEndRecording(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 2) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    if (rn.endRecording) |f| f(p, surfArg(ctx.args[1]));
+    return ok(Value.newLong(0));
+}
+
+fn rnDrawInto(ctx: *CallCtx) Error!EvalResult {
+    const rn = rnFns(ctx, 2) orelse return ok(Value.newLong(0));
+    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
+    if (rn.drawInto) |f| f(p, surf);
+    return ok(Value.newLong(0));
+}
+
+/// Draw a point the stroke width across, round or square by the cap.
+fn canvasDrawPoint(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 7) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.cDrawPoint orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    f(surf, argFloat(a[1]), argFloat(a[2]), argU32(a[3]), argFloat(a[4]), @intCast(argInt(a[5])), @intCast(argInt(a[6])));
+    return ok(Value.newLong(0));
 }
 
 /// End a recording, freeing its handle: returns the picture's handle.
@@ -1279,7 +2150,7 @@ fn canvasDrawPicture(ctx: *CallCtx) Error!EvalResult {
 }
 
 fn canvasDrawSurfaceRect(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 10) return ok(Value.newLong(0));
+    if (ctx.args.len < 11) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     const dst = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
     const src = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
@@ -1294,6 +2165,7 @@ fn canvasDrawSurfaceRect(ctx: *CallCtx) Error!EvalResult {
         argFloat(ctx.args[7]),
         argFloat(ctx.args[8]),
         argFloat(ctx.args[9]),
+        @intCast(argInt(ctx.args[10])),
     );
     return ok(Value.newLong(0));
 }
@@ -1524,20 +2396,24 @@ fn canvasSetBlur(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-/// Arm the next draw's tint, (argb, blend mode); a negative mode clears it.
+/// Arm the next draws' color filter spec; an empty spec clears it.
 fn canvasSetColorFilter(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 3) if (surfArg(ctx.args[0])) |s| if (skia.cSetColorFilter) |f|
-        f(s, argU32(ctx.args[1]), @intCast(argInt(ctx.args[2])));
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.cSetColorFilter orelse return ok(Value.newLong(0));
+    const spec = (try specArg(ctx.allocator, ctx.args[1])) orelse return ok(Value.newLong(0));
+    defer ctx.allocator.free(spec);
+    f(surf, spec.ptr);
     return ok(Value.newLong(0));
 }
 
-/// Arm the next draws' blend mode and an image draw's alpha, (mode, alpha); a
-/// negative mode resets them.
+/// Arm the next draws' blend mode, an image draw's alpha and the stroke miter
+/// limit, (mode, alpha, miter); a negative mode resets them.
 fn canvasSetPaintState(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 3) if (surfArg(ctx.args[0])) |s| if (skia.cSetPaintState) |f|
-        f(s, @intCast(argInt(ctx.args[1])), argFloat(ctx.args[2]));
+    if (ctx.args.len >= 4) if (surfArg(ctx.args[0])) |s| if (skia.cSetPaintState) |f|
+        f(s, @intCast(argInt(ctx.args[1])), argFloat(ctx.args[2]), argFloat(ctx.args[3]));
     return ok(Value.newLong(0));
 }
 
@@ -1656,16 +2532,6 @@ fn fontMetric(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Float = f(argFloat(ctx.args[0]), @intCast(argInt(ctx.args[1]))) });
 }
 
-fn canvasConcat(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 7) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cConcat orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    f(surf, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argFloat(a[5]), argFloat(a[6]));
-    return ok(Value.newLong(0));
-}
-
 const testing = std.testing;
 
 test "a resident callback is marked by the callbacks' root" {
@@ -1699,15 +2565,77 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_text") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_save_layer") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_rec_begin") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_rec_end") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_picture_free") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_picture") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat44") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.layer.__skia_rn_new") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.layer.__skia_rn_set_outline") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.layer.__skia_rn_draw_into") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_point") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_paint_state") != null);
     try testing.expect(b.resolve("androidx.compose.material3.internal.__klio_icu_date") != null);
-    try testing.expectEqual(@as(usize, 86), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_path_effect") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_vertices") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_image_decode") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_size") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.text.platform.__skia_font_register_data") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.input.key.__composeui_hostOs") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winPollEvent") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winPostEvent") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetFlag") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_screenBounds") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winFrameSize") != null);
+    try testing.expect(b.resolve("klio.datatransfer.__klio_clipMode") != null);
+    try testing.expect(b.resolve("klio.datatransfer.__klio_clipChangeCount") != null);
+    try testing.expect(b.resolve("klio.datatransfer.__klio_clipText") != null);
+    try testing.expect(b.resolve("klio.datatransfer.__klio_clipSetText") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.text.intl.__composeui_hostLocale") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetIconSurface") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetMenu") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_trayPollEvent") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_appWait") != null);
+    try testing.expectEqual(@as(usize, 136), b.len());
+}
+
+test "a POSIX locale name reads as the JVM reads it" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("de-DE", posixLocaleTag("de_DE.UTF-8", &buf));
+    try testing.expectEqualStrings("sr-RS", posixLocaleTag("sr_RS@latin", &buf));
+    try testing.expectEqualStrings("fr", posixLocaleTag("fr", &buf));
+    try testing.expectEqualStrings("en-US", posixLocaleTag("C.UTF-8", &buf));
+    try testing.expectEqualStrings("en-US", posixLocaleTag("POSIX", &buf));
+    try testing.expectEqualStrings("en-US", posixLocaleTag("", &buf));
+    try testing.expectEqualStrings("en-US", posixLocaleTag(null, &buf));
+    var small: [2]u8 = undefined;
+    try testing.expectEqualStrings("en-US", posixLocaleTag("de_DE", &small));
+}
+
+test "KLIO_CLIPBOARD picks the host's clipboard, the program's own, or none" {
+    try testing.expectEqual(ClipboardMode.system, clipboardModeFor(null, true));
+    try testing.expectEqual(ClipboardMode.system, clipboardModeFor("system", true));
+    // A host without a clipboard has none, as a headless desktop has.
+    try testing.expectEqual(ClipboardMode.none, clipboardModeFor(null, false));
+    try testing.expectEqual(ClipboardMode.none, clipboardModeFor("system", false));
+    try testing.expectEqual(ClipboardMode.private, clipboardModeFor("private", true));
+    try testing.expectEqual(ClipboardMode.private, clipboardModeFor("private", false));
+    try testing.expectEqual(ClipboardMode.none, clipboardModeFor("none", true));
+    // An unknown setting leaves the host's.
+    try testing.expectEqual(ClipboardMode.system, clipboardModeFor("other", true));
+}
+
+test "the clipboard bindings answer no clipboard without the library" {
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c0 = host.ctx(&none);
+    // The Skia shim is absent in the unit-test environment.
+    if (loadSkia() == null) {
+        try testing.expectEqual(@as(i64, -1), (try clipChangeCount(&c0)).ok.Long);
+        try testing.expect((try clipText(&c0)).ok == .Null);
+        try testing.expectEqual(@as(i64, 0), (try clipSetText(&c0)).ok.Long);
+    }
 }
 
 test "the ICU date and paint state bindings answer null or 0 for short args" {
@@ -1739,6 +2667,37 @@ test "skiaRender guards arg shapes and no-ops without the library" {
     _ = (try skiaRender(&ctx)).ok.Long;
 }
 
+test "a window position packs x high and y low, negatives kept" {
+    const v = packPoint(-5, -7);
+    try testing.expectEqual(@as(i32, -5), @as(i32, @truncate(v >> 32)));
+    try testing.expectEqual(@as(i32, -7), @as(i32, @truncate(v)));
+    try testing.expectEqual(@as(i64, (3 << 32) | 4), packPoint(3, 4));
+}
+
+test "window control bindings answer 0 for short args" {
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c0 = host.ctx(&none);
+    try testing.expectEqual(@as(i64, 0), (try winSetFlag(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try winSetPosition(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try winPosition(&c0)).ok.Long);
+    try testing.expectEqual(@as(i32, 0), (try screenBounds(&c0)).ok.Int);
+    try testing.expectEqual(@as(i64, 0), (try winSetFrameSize(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try winFrameSize(&c0)).ok.Long);
+}
+
+test "window event bindings report a closed window for short args or no event array" {
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c0 = host.ctx(&none);
+    try testing.expectEqual(@as(i32, 2), (try winPollEvent(&c0)).ok.Int);
+    try testing.expectEqual(@as(i64, 0), (try winPostEvent(&c0)).ok.Long);
+    // The values must come in a DoubleArray.
+    const no_array = [_]Value{ Value.newLong(0), Value.newInt(0), .Null, Value.newInt(3) };
+    var c1 = host.ctx(&no_array);
+    try testing.expectEqual(@as(i32, 2), (try winPollEvent(&c1)).ok.Int);
+}
+
 test "picture recording and layer bindings answer 0 for short args or a null handle" {
     var host: TestHost = .{};
     const none = [_]Value{};
@@ -1748,6 +2707,29 @@ test "picture recording and layer bindings answer 0 for short args or a null han
     try testing.expectEqual(@as(i64, 0), (try canvasSaveLayer(&c0)).ok.Long);
     try testing.expectEqual(@as(i64, 0), (try canvasDrawPicture(&c0)).ok.Long);
     try testing.expectEqual(@as(i64, 0), (try pictureFree(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try canvasConcat44(&c0)).ok.Long);
+    inline for (.{ rnContextNew, rnContextFree, rnContextSetLighting, rnNew, rnFree, rnSetFloat, rnSetColor, rnSetBounds, rnSetPivot, rnSetClip, rnSetOutline, rnSetLayerPaint, rnBeginRecording, rnEndRecording, rnDrawInto }) |f| {
+        try testing.expectEqual(@as(i64, 0), (try f(&c0)).ok.Long);
+    }
+    try testing.expectEqual(@as(i64, 0), (try canvasDrawPoint(&c0)).ok.Long);
+    // Two floats were a recording's size; the bounds take four.
+    const size_only = [_]Value{ .{ .Float = 10 }, .{ .Float = 10 } };
+    var c2 = host.ctx(&size_only);
+    try testing.expectEqual(@as(i64, 0), (try recBegin(&c2)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try canvasSetPathEffect(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try canvasDrawVertices(&c0)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try imageDecode(&c0)).ok.Long);
+    // Bytes that are not a ByteArray decode to nothing.
+    const not_bytes = [_]Value{Value.newInt(7)};
+    var c4 = host.ctx(&not_bytes);
+    try testing.expectEqual(@as(i64, 0), (try imageDecode(&c4)).ok.Long);
+    try testing.expect(!(try fontRegisterData(&c4)).ok.Bool);
+    // A null node answers 0 without reaching the library.
+    var zeros: [15]Value = undefined;
+    for (&zeros) |*v| v.* = Value.newLong(0);
+    var c3 = host.ctx(&zeros);
+    try testing.expectEqual(@as(i64, 0), (try rnSetOutline(&c3)).ok.Long);
+    try testing.expectEqual(@as(i64, 0), (try rnBeginRecording(&c3)).ok.Long);
     const null_handle = [_]Value{Value.newLong(0)};
     var c1 = host.ctx(&null_handle);
     try testing.expectEqual(@as(i64, 0), (try recEnd(&c1)).ok.Long);

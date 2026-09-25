@@ -24,11 +24,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.rememberWindowState
 
 @OptIn(ExperimentalMaterial3Api::class)
 fun main() {
     application {
-        Window(onCloseRequest = ::exitApplication, title = "klio M3", width = 390, height = 844) {
+        Window(
+            onCloseRequest = ::exitApplication,
+            title = "klio M3",
+            state = rememberWindowState(width = 390.dp, height = 844.dp),
+        ) {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 var count by remember { mutableStateOf(0) }
                 Scaffold(

@@ -7,6 +7,7 @@
 // pass; this shim replays them onto a headless raster SkSurface and encodes PNG.
 // Colors are 0xAARRGGBB (Compose's packed ARGB). Coordinates are pixels.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "window_events.h"
 
 #include "include/core/SkBitmap.h"
 #include "include/core/SkCanvas.h"
@@ -47,7 +50,14 @@
 #include "include/encode/SkPngEncoder.h"
 #include "include/effects/SkGradient.h"
 #include "include/effects/SkImageFilters.h"
+#include "include/effects/Sk1DPathEffect.h"
+#include "include/effects/SkCornerPathEffect.h"
+#include "include/effects/SkDashPathEffect.h"
 #include "include/pathops/SkPathOps.h"
+#include "include/core/SkM44.h"
+#include "include/core/SkVertices.h"
+#include "node/RenderNode.h"
+#include "node/RenderNodeContext.h"
 #include "modules/skparagraph/include/DartTypes.h"
 #include "modules/skparagraph/include/FontCollection.h"
 #include "modules/skparagraph/include/Paragraph.h"
@@ -245,6 +255,8 @@ thread_local sk_sp<SkColorFilter> g_pendingColorFilter;
 // opaque when nothing is armed.
 thread_local SkBlendMode g_pendingBlend = SkBlendMode::kSrcOver;
 thread_local float g_pendingImageAlpha = 1.0f;
+// The stroke miter limit of the next draws.
+thread_local float g_pendingMiter = 4.0f;
 
 // The paint an image draw composites through: the armed tint, blend and alpha.
 inline SkPaint imagePaint() {
@@ -532,6 +544,12 @@ void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
 
 // One pixel as ARGB (unpremultiplied), or 0 when out of range / unreadable.
 // Backs ImageBitmap.readPixels; per-pixel readback keeps the ABI scalar-only.
+// A surface's width (which 0) or height (which 1); 0 for none.
+int klio_skia_surf_size(KlioSurface* s, int which) {
+    if (!s || !s->surface) return 0;
+    return which == 0 ? s->surface->width() : s->surface->height();
+}
+
 uint32_t klio_skia_surf_pixel(KlioSurface* s, int x, int y) {
     if (!s) return 0;
     SkPixmap pm;
@@ -544,19 +562,40 @@ uint32_t klio_skia_surf_pixel(KlioSurface* s, int x, int y) {
 // Blit `src`'s current contents onto `dst`: the plain form places the snapshot
 // at (x, y); the rect form maps `src`'s (sl,st,sr,sb) onto `dst`'s (dl,dt,dr,db)
 // with bilinear sampling. Backs Canvas.drawImage / drawImageRect.
-void klio_skia_c_draw_surface(KlioSurface* dst, KlioSurface* src, float x, float y) {
+// How an image draw samples, as skiko maps a paint's filter quality: 0 nearest,
+// 1 linear, 2 linear with the nearest mipmap, 3 the cubic (1/3, 1/3) resampler.
+static SkSamplingOptions imageSampling(int sampling) {
+    switch (sampling) {
+        case 1: return SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNone);
+        case 2: return SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNearest);
+        case 3: return SkSamplingOptions(SkCubicResampler{1.0f / 3.0f, 1.0f / 3.0f});
+        default: return SkSamplingOptions(SkFilterMode::kNearest, SkMipmapMode::kNone);
+    }
+}
+
+// Draws the whole image as skiko does, through drawImageRect with the strict
+// source constraint.
+void klio_skia_c_draw_surface(KlioSurface* dst, KlioSurface* src, float x, float y, int sampling) {
     if (!dst || !src || !src->surface || !canvasOf(dst)) return;
     sk_sp<SkImage> img = src->surface->makeImageSnapshot();
     if (!img) return;
     // A tinted image draw (a shadow's, an icon's) filters the image's colors.
     const SkPaint paint = imagePaint();
-    canvasOf(dst)->drawImage(img, x, y, SkSamplingOptions(SkFilterMode::kLinear), &paint);
+    const float w = static_cast<float>(img->width());
+    const float h = static_cast<float>(img->height());
+    canvasOf(dst)->drawImageRect(
+        img,
+        SkRect::MakeLTRB(0, 0, w, h),
+        SkRect::MakeLTRB(x, y, x + w, y + h),
+        imageSampling(sampling),
+        &paint,
+        SkCanvas::kStrict_SrcRectConstraint);
 }
 
 void klio_skia_c_draw_surface_rect(
     KlioSurface* dst, KlioSurface* src,
     float sl, float st, float sr, float sb,
-    float dl, float dt, float dr, float db) {
+    float dl, float dt, float dr, float db, int sampling) {
     if (!dst || !src || !src->surface || !canvasOf(dst)) return;
     sk_sp<SkImage> img = src->surface->makeImageSnapshot();
     if (!img) return;
@@ -565,7 +604,7 @@ void klio_skia_c_draw_surface_rect(
         img,
         SkRect::MakeLTRB(sl, st, sr, sb),
         SkRect::MakeLTRB(dl, dt, dr, db),
-        SkSamplingOptions(SkFilterMode::kLinear),
+        imageSampling(sampling),
         &paint,
         SkCanvas::kStrict_SrcRectConstraint);
 }
@@ -633,9 +672,11 @@ sk_sp<skia::textlayout::TypefaceFontProvider> g_paraProvider;
 sk_sp<SkUnicode> g_paraUnicode;
 bool g_para_tried = false;
 
-// The paragraph font collection: the bundled/env typeface registered under
-// its own family name plus the generic aliases compose programs use, and set
-// as the collection default so an unknown family falls back to it.
+// The paragraph font collection, as skiko's FontCache builds it: the platform's
+// font manager answers family names, and the fonts a program registers (and
+// the bundled face, under "klio") are the asset font manager's. Every run lists
+// "klio" last, so a host without system fonts still shapes with the bundled
+// face.
 void ensureParaFonts() {
     if (g_para_tried) return;
     g_para_tried = true;
@@ -643,12 +684,13 @@ void ensureParaFonts() {
     if (!g_typeface) return;
     auto provider = sk_make_sp<skia::textlayout::TypefaceFontProvider>();
     provider->registerTypeface(g_typeface, SkString("klio"));
-    provider->registerTypeface(g_typeface, SkString("sans-serif"));
-    provider->registerTypeface(g_typeface, SkString("serif"));
-    provider->registerTypeface(g_typeface, SkString("monospace"));
-    provider->registerTypeface(g_typeface, SkString("cursive"));
     auto fonts = sk_make_sp<skia::textlayout::FontCollection>();
-    fonts->setDefaultFontManager(provider, "klio");
+    if (g_fontMgr && g_fontMgr->countFamilies() > 0) {
+        fonts->setDefaultFontManager(g_fontMgr);
+        fonts->setAssetFontManager(provider);
+    } else {
+        fonts->setDefaultFontManager(provider, "klio");
+    }
     g_paraUnicode = SkUnicodes::ICU::Make();
     if (!g_paraUnicode) return;
     g_paraProvider = provider;
@@ -659,6 +701,18 @@ void ensureParaFonts() {
 // font provider, so a run spec naming that family shapes with the real face.
 // Returns 1 on success. The collection's paragraph cache is cleared so
 // already-consulted family lookups re-resolve.
+// Register a font from its bytes under `family`, as a LoadedFont is: 1 when the
+// bytes load as a typeface.
+extern "C" int32_t klio_skia_font_register_data(const uint8_t* bytes, size_t len, const char* family) {
+    ensureParaFonts();
+    if (!g_paraProvider || !g_paraFonts || !g_fontMgr || !bytes || len == 0) return 0;
+    sk_sp<SkTypeface> tf = g_fontMgr->makeFromData(SkData::MakeWithCopy(bytes, len));
+    if (!tf) return 0;
+    g_paraProvider->registerTypeface(tf, SkString(family));
+    g_paraFonts->clearCaches();
+    return 1;
+}
+
 extern "C" int32_t klio_skia_font_register(const char* path, const char* family) {
     ensureParaFonts();
     if (!g_paraProvider || !g_paraFonts || !g_fontMgr) return 0;
@@ -669,6 +723,75 @@ extern "C" int32_t klio_skia_font_register(const char* path, const char* family)
     return 1;
 }
 
+// The fonts a generic family names on this platform, in skiko's order
+// (PlatformFont.skiko.kt's GenericFontFamiliesMapping); another name stands
+// for itself.
+std::vector<SkString> familyAliases(const std::string& family) {
+    struct Generic { const char* name; std::vector<const char*> aliases; };
+#if defined(__APPLE__)
+    static const Generic kGeneric[] = {
+        {"sans-serif", {".AppleSystemUIFont", "Helvetica Neue", "Helvetica"}},
+        {"serif", {".AppleSystemUIFontSerif", "Times", "Times New Roman"}},
+        {"monospace", {".AppleSystemUIFontMonospaced", "Menlo", "Courier"}},
+        {"cursive", {"Apple Chancery", "Snell Roundhand"}},
+    };
+#elif defined(_WIN32)
+    static const Generic kGeneric[] = {
+        {"sans-serif", {"Segoe UI", "Arial"}},
+        {"serif", {"Times New Roman"}},
+        {"monospace", {"Consolas"}},
+        {"cursive", {"Comic Sans MS"}},
+    };
+#else
+    static const Generic kGeneric[] = {
+        {"sans-serif", {"Noto Sans", "DejaVu Sans", "Arial"}},
+        {"serif", {"Noto Serif", "DejaVu Serif", "Times New Roman"}},
+        {"monospace", {"Noto Sans Mono", "DejaVu Sans Mono", "Consolas"}},
+        {"cursive", {"Comic Sans MS"}},
+    };
+#endif
+    std::vector<SkString> out;
+    if (family.empty() || family == "-") return out;
+    // The spec lists names separated by '|', each percent-encoded.
+    size_t start = 0;
+    while (start <= family.size()) {
+        size_t bar = family.find('|', start);
+        const std::string enc = family.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+        std::string name;
+        for (size_t i = 0; i < enc.size(); ++i) {
+            if (enc[i] == '%' && i + 2 < enc.size()) {
+                const std::string hex = enc.substr(i + 1, 2);
+                name.push_back(static_cast<char>(strtol(hex.c_str(), nullptr, 16)));
+                i += 2;
+            } else {
+                name.push_back(enc[i]);
+            }
+        }
+        bool generic = false;
+        for (const auto& g : kGeneric) {
+            if (name == g.name) {
+                for (const char* a : g.aliases) out.push_back(SkString(a));
+                generic = true;
+                break;
+            }
+        }
+        if (!generic && !name.empty()) out.push_back(SkString(name.c_str()));
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    return out;
+}
+
+// The platform's default glyph hinting, as skiko's FontRasterizationSettings
+// picks it (ignored by macOS's rasterizer).
+SkFontHinting platformHinting() {
+#if defined(__APPLE__) || defined(_WIN32)
+    return SkFontHinting::kNormal;
+#else
+    return SkFontHinting::kSlight;
+#endif
+}
+
 skia::textlayout::TextStyle runStyle(float size, int weight, int italic, int deco, uint32_t argb, const char* family) {
     skia::textlayout::TextStyle ts;
     ts.setColor(toColor(argb));
@@ -677,10 +800,12 @@ skia::textlayout::TextStyle runStyle(float size, int weight, int italic, int dec
                                 italic != 0 ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
     ts.setDecoration(static_cast<skia::textlayout::TextDecoration>(deco));
     ts.setDecorationColor(toColor(argb));
-    std::vector<SkString> fams;
-    if (family && family[0] != '\0' && !(family[0] == '-' && family[1] == '\0')) fams.push_back(SkString(family));
+    std::vector<SkString> fams = familyAliases(family ? std::string(family) : std::string());
     fams.push_back(SkString("klio"));
     ts.setFontFamilies(fams);
+    ts.setFontEdging(SkFont::Edging::kAntiAlias);
+    ts.setSubpixel(true);
+    ts.setFontHinting(platformHinting());
     return ts;
 }
 
@@ -724,13 +849,20 @@ KlioPara* klio_skia_para_new(const char* utf8, const char* spec) {
             int align = 0, maxLines = 0, ellipsis = 0, dir = 0, weight = 400, italic = 0, deco = 0;
             unsigned long long argb = 0xFF000000ULL;
             float letterSp = 0, lineH = 0;
-            ls >> size >> align >> maxLines >> ellipsis >> dir >> weight >> italic >> deco >> argb >> letterSp >> lineH;
+            std::string fam;
+            int heightBehavior = 3;
+            ls >> size >> align >> maxLines >> ellipsis >> dir >> weight >> italic >> deco >> argb >> letterSp >> lineH
+               >> fam >> heightBehavior;
+            // As skiko's ParagraphBuilder: tabs shape as spaces, and the first
+            // ascent and last descent follow the line height style.
+            ps.setReplaceTabCharacters(true);
+            ps.setTextHeightBehavior(static_cast<skia::textlayout::TextHeightBehavior>(heightBehavior));
             ps.setTextAlign(static_cast<skia::textlayout::TextAlign>(align));
             ps.setTextDirection(dir != 0 ? skia::textlayout::TextDirection::kRtl
                                          : skia::textlayout::TextDirection::kLtr);
             if (maxLines > 0) ps.setMaxLines(static_cast<size_t>(maxLines));
             if (ellipsis != 0) ps.setEllipsis(std::u16string(u"…"));
-            base = runStyle(size, weight, italic, deco, static_cast<uint32_t>(argb), nullptr);
+            base = runStyle(size, weight, italic, deco, static_cast<uint32_t>(argb), fam.c_str());
             if (letterSp != 0) base.setLetterSpacing(letterSp);
             if (lineH > 0 && size > 0) {
                 base.setHeight(lineH / size);
@@ -1099,6 +1231,7 @@ namespace {
 // A shader parsed from klio's serialized gradient text, applied to the next
 // draw's paint. A gradient brush sets this before the draw and clears it after.
 static thread_local sk_sp<SkShader> g_pendingShader;
+static thread_local sk_sp<SkPathEffect> g_pendingPathEffect;
 
 static SkTileMode tileModeFrom(int m) {
     switch (m) {
@@ -1109,60 +1242,211 @@ static SkTileMode tileModeFrom(int m) {
     }
 }
 
-// Text: "L|fromX,fromY|toX,toY|tile|argb0,pos0;argb1,pos1;…" (L linear, R radial:
-// "R|cx,cy|radius|tile|stops…"). Returns null on a malformed string.
+// The effects a paint or a layer carries, as klio's Kotlin side describes
+// them: whitespace-separated tokens in prefix form, so they nest.
+//   shader:        lin x0 y0 x1 y1 tile <colors> <stops>
+//                  rad cx cy radius tile <colors> <stops>
+//                  sweep cx cy <colors> <stops>
+//                  img <image handle> tileX tileY
+//                  blend mode <dst shader> <src shader>
+//                  local m0 .. m8 <shader>      (SkMatrix::setAll order)
+//   colors:        n r g b a ...               (unpremultiplied floats)
+//   stops:         - | n p ...
+//   color filter:  blend argb mode | matrix m0 .. m19 | light mulArgb addArgb
+//   path effect:   dash phase n i ... | corner radius | compose <outer> <inner>
+//                  | path1d advance phase style len <len bytes of path text>
+//   image filter:  none | blur sx sy tile <input> | offset dx dy <input>
+// A malformed spec gives null, drawing without the effect.
+struct Spec {
+    const char* p;
+
+    void skipSpace() { while (*p == ' ') ++p; }
+    bool atEnd() { skipSpace(); return *p == 0; }
+    std::string word() {
+        skipSpace();
+        const char* b = p;
+        while (*p && *p != ' ') ++p;
+        return std::string(b, p - b);
+    }
+    float f() { skipSpace(); char* e = nullptr; float v = strtof(p, &e); p = e ? e : p; return v; }
+    long long i() { skipSpace(); char* e = nullptr; long long v = strtoll(p, &e, 10); p = e ? e : p; return v; }
+    std::string raw(size_t n) {
+        if (*p == ' ') ++p;
+        size_t have = strnlen(p, n);
+        std::string out(p, have);
+        p += have;
+        return out;
+    }
+};
+
+static sk_sp<SkShader> parseShader(Spec& sp);
+
+static bool parseGradient(Spec& sp, std::vector<SkColor4f>& colors, std::vector<SkScalar>& pos, bool& hasPos) {
+    long long n = sp.i();
+    if (n < 0 || n > 4096) return false;
+    for (long long k = 0; k < n; ++k) {
+        float r = sp.f(), g = sp.f(), b = sp.f(), a = sp.f();
+        colors.push_back(SkColor4f{r, g, b, a});
+    }
+    sp.skipSpace();
+    if (*sp.p == '-') {
+        ++sp.p;
+        hasPos = false;
+        return true;
+    }
+    long long m = sp.i();
+    if (m != n) return false;
+    for (long long k = 0; k < m; ++k) pos.push_back(sp.f());
+    hasPos = true;
+    return true;
+}
+
+// skiko's gradients interpolate in premultiplied colors.
+static SkGradient makeGradient(const std::vector<SkColor4f>& colors, const std::vector<SkScalar>& pos,
+                               bool hasPos, SkTileMode tile) {
+    SkGradient::Interpolation interp;
+    interp.fInPremul = SkGradient::Interpolation::InPremul::kYes;
+    SkGradient::Colors gc(SkSpan<const SkColor4f>(colors.data(), colors.size()),
+                          hasPos ? SkSpan<const SkScalar>(pos.data(), pos.size()) : SkSpan<const SkScalar>(),
+                          tile, nullptr);
+    return SkGradient(gc, interp);
+}
+
+static sk_sp<SkShader> parseShader(Spec& sp) {
+    const std::string kind = sp.word();
+    if (kind == "lin" || kind == "rad" || kind == "sweep") {
+        float a = sp.f(), b = sp.f(), c = 0, d = 0;
+        int tile = 0;
+        if (kind == "lin") { c = sp.f(); d = sp.f(); tile = (int)sp.i(); }
+        else if (kind == "rad") { c = sp.f(); tile = (int)sp.i(); }
+        std::vector<SkColor4f> colors;
+        std::vector<SkScalar> pos;
+        bool hasPos = false;
+        if (!parseGradient(sp, colors, pos, hasPos) || colors.empty()) return nullptr;
+        SkGradient grad = makeGradient(colors, pos, hasPos, tileModeFrom(tile));
+        if (kind == "lin") {
+            SkPoint pts[2] = {{a, b}, {c, d}};
+            return SkShaders::LinearGradient(pts, grad, nullptr);
+        }
+        if (kind == "rad") return SkShaders::RadialGradient(SkPoint{a, b}, c, grad, nullptr);
+        return SkShaders::SweepGradient(SkPoint{a, b}, grad, nullptr);
+    }
+    if (kind == "img") {
+        auto* surf = reinterpret_cast<KlioSurface*>((uintptr_t)sp.i());
+        const int tx = (int)sp.i(), ty = (int)sp.i();
+        if (!surf || !surf->surface) return nullptr;
+        sk_sp<SkImage> image = surf->surface->makeImageSnapshot();
+        if (!image) return nullptr;
+        return image->makeShader(tileModeFrom(tx), tileModeFrom(ty), SkSamplingOptions());
+    }
+    if (kind == "blend") {
+        const int mode = (int)sp.i();
+        sk_sp<SkShader> dst = parseShader(sp);
+        sk_sp<SkShader> src = parseShader(sp);
+        if (!dst || !src) return nullptr;
+        return SkShaders::Blend(static_cast<SkBlendMode>(mode), dst, src);
+    }
+    if (kind == "local") {
+        float m[9];
+        for (float& v : m) v = sp.f();
+        sk_sp<SkShader> inner = parseShader(sp);
+        if (!inner) return nullptr;
+        SkMatrix local;
+        local.setAll(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
+        return inner->makeWithLocalMatrix(local);
+    }
+    return nullptr;
+}
+
+static sk_sp<SkColorFilter> parseColorFilter(Spec& sp) {
+    const std::string kind = sp.word();
+    if (kind == "blend") {
+        const uint32_t argb = (uint32_t)sp.i();
+        const int mode = (int)sp.i();
+        return SkColorFilters::Blend(toColor(argb), static_cast<SkBlendMode>(mode));
+    }
+    if (kind == "matrix") {
+        float m[20];
+        for (float& v : m) v = sp.f();
+        return SkColorFilters::Matrix(m);
+    }
+    if (kind == "light") {
+        const uint32_t mul = (uint32_t)sp.i();
+        const uint32_t add = (uint32_t)sp.i();
+        return SkColorFilters::Lighting(toColor(mul), toColor(add));
+    }
+    return nullptr;
+}
+
+static sk_sp<SkPathEffect> parsePathEffect(Spec& sp) {
+    const std::string kind = sp.word();
+    if (kind == "dash") {
+        const float phase = sp.f();
+        const long long n = sp.i();
+        if (n < 0 || n > 4096) return nullptr;
+        std::vector<SkScalar> intervals;
+        for (long long k = 0; k < n; ++k) intervals.push_back(sp.f());
+        return SkDashPathEffect::Make(SkSpan<const SkScalar>(intervals.data(), intervals.size()), phase);
+    }
+    if (kind == "corner") return SkCornerPathEffect::Make(sp.f());
+    if (kind == "compose") {
+        sk_sp<SkPathEffect> outer = parsePathEffect(sp);
+        sk_sp<SkPathEffect> inner = parsePathEffect(sp);
+        if (!outer || !inner) return nullptr;
+        return SkPathEffect::MakeCompose(outer, inner);
+    }
+    if (kind == "path1d") {
+        const float advance = sp.f(), phase = sp.f();
+        const int style = (int)sp.i();
+        const long long len = sp.i();
+        if (len < 0) return nullptr;
+        const std::string text = sp.raw((size_t)len);
+        SkPath1DPathEffect::Style st = style == 1 ? SkPath1DPathEffect::kRotate_Style
+                                     : style == 2 ? SkPath1DPathEffect::kMorph_Style
+                                                  : SkPath1DPathEffect::kTranslate_Style;
+        return SkPath1DPathEffect::Make(klioBuildPath(text.c_str()), advance, phase, st);
+    }
+    return nullptr;
+}
+
+static sk_sp<SkImageFilter> parseImageFilter(Spec& sp) {
+    const std::string kind = sp.word();
+    if (kind == "blur") {
+        const float sx = sp.f(), sy = sp.f();
+        const int tile = (int)sp.i();
+        sk_sp<SkImageFilter> input = parseImageFilter(sp);
+        return SkImageFilters::Blur(sx, sy, tileModeFrom(tile), input, nullptr);
+    }
+    if (kind == "offset") {
+        const float dx = sp.f(), dy = sp.f();
+        sk_sp<SkImageFilter> input = parseImageFilter(sp);
+        return SkImageFilters::Offset(dx, dy, input, nullptr);
+    }
+    return nullptr;
+}
+
 static sk_sp<SkShader> makeShaderFromText(const char* text) {
     if (!text || !*text) return nullptr;
-    std::string s(text);
-    std::vector<std::string> parts;
-    size_t start = 0;
-    while (true) {
-        size_t bar = s.find('|', start);
-        parts.push_back(s.substr(start, bar == std::string::npos ? std::string::npos : bar - start));
-        if (bar == std::string::npos) break;
-        start = bar + 1;
-    }
-    if (parts.size() < 5) return nullptr;
-    const bool linear = parts[0] == "L";
-    std::vector<SkColor4f> colors;
-    std::vector<SkScalar> pos;
-    {
-        std::string& stops = parts[4];
-        size_t p = 0;
-        while (p < stops.size()) {
-            size_t semi = stops.find(';', p);
-            std::string tok = stops.substr(p, semi == std::string::npos ? std::string::npos : semi - p);
-            if (!tok.empty()) {
-                size_t comma = tok.find(',');
-                if (comma != std::string::npos) {
-                    uint32_t argb = (uint32_t)strtoul(tok.substr(0, comma).c_str(), nullptr, 10);
-                    float sp = strtof(tok.substr(comma + 1).c_str(), nullptr);
-                    colors.push_back(SkColor4f::FromColor(toColor(argb)));
-                    pos.push_back(sp);
-                }
-            }
-            if (semi == std::string::npos) break;
-            p = semi + 1;
-        }
-    }
-    if (colors.size() < 2) return nullptr;
-    const int tile = atoi(parts[3].c_str());
-    SkGradient::Colors gc(SkSpan<const SkColor4f>(colors.data(), colors.size()),
-                          SkSpan<const SkScalar>(pos.data(), pos.size()),
-                          tileModeFrom(tile), nullptr);
-    SkGradient grad(gc, SkGradient::Interpolation{});
-    if (linear) {
-        float fx = 0, fy = 0, tx = 0, ty = 0;
-        sscanf(parts[1].c_str(), "%f,%f", &fx, &fy);
-        sscanf(parts[2].c_str(), "%f,%f", &tx, &ty);
-        SkPoint pts[2] = {{fx, fy}, {tx, ty}};
-        return SkShaders::LinearGradient(pts, grad, nullptr);
-    } else {
-        float cx = 0, cy = 0, radius = 0;
-        sscanf(parts[1].c_str(), "%f,%f", &cx, &cy);
-        radius = strtof(parts[2].c_str(), nullptr);
-        return SkShaders::RadialGradient(SkPoint{cx, cy}, radius, grad, nullptr);
-    }
+    Spec sp{text};
+    return parseShader(sp);
+}
+
+static sk_sp<SkColorFilter> makeColorFilterFromText(const char* text) {
+    if (!text || !*text) return nullptr;
+    Spec sp{text};
+    return parseColorFilter(sp);
+}
+
+static sk_sp<SkPathEffect> makePathEffectFromText(const char* text) {
+    if (!text || !*text) return nullptr;
+    Spec sp{text};
+    return parsePathEffect(sp);
+}
+
+static sk_sp<SkImageFilter> makeImageFilterFromText(const char* text) {
+    if (!text || !*text) return nullptr;
+    Spec sp{text};
+    return parseImageFilter(sp);
 }
 
 extern "C" void klio_skia_c_set_shader(KlioSurface* /*s*/, const char* text) {
@@ -1174,18 +1458,23 @@ extern "C" void klio_skia_c_set_blur(KlioSurface* /*s*/, float sigma) {
     g_pendingBlur = sigma > 0 ? SkMaskFilter::MakeBlur(kNormal_SkBlurStyle, sigma) : nullptr;
 }
 
-// `mode` is Compose's BlendMode, whose order is SkBlendMode's; a negative
-// mode clears the pending color filter.
-extern "C" void klio_skia_c_set_color_filter(KlioSurface* /*s*/, uint32_t argb, int mode) {
-    g_pendingColorFilter = mode >= 0 ? SkColorFilters::Blend(toColor(argb), static_cast<SkBlendMode>(mode)) : nullptr;
+// The color filter spec for the next draws; an empty spec clears it.
+extern "C" void klio_skia_c_set_color_filter(KlioSurface* /*s*/, const char* spec) {
+    g_pendingColorFilter = makeColorFilterFromText(spec);
+}
+
+// The path effect spec for the next draws; an empty spec clears it.
+extern "C" void klio_skia_c_set_path_effect(KlioSurface* /*s*/, const char* spec) {
+    g_pendingPathEffect = makePathEffectFromText(spec);
 }
 
 // `mode` is Compose's BlendMode (SkBlendMode's order) for the next draws, and
 // `imageAlpha` the alpha an image draw composites with; a negative mode resets
 // both to SrcOver and opaque.
-extern "C" void klio_skia_c_set_paint_state(KlioSurface* /*s*/, int mode, float imageAlpha) {
+extern "C" void klio_skia_c_set_paint_state(KlioSurface* /*s*/, int mode, float imageAlpha, float miter) {
     g_pendingBlend = mode >= 0 ? static_cast<SkBlendMode>(mode) : SkBlendMode::kSrcOver;
     g_pendingImageAlpha = mode >= 0 ? imageAlpha : 1.0f;
+    g_pendingMiter = mode >= 0 ? miter : 4.0f;
 }
 
 SkPaint klioCanvasPaint(uint32_t argb, int style, float strokeWidth, int cap, int join, int aa) {
@@ -1196,6 +1485,8 @@ SkPaint klioCanvasPaint(uint32_t argb, int style, float strokeWidth, int cap, in
     if (g_pendingShader) p.setShader(g_pendingShader);
     if (g_pendingBlur) p.setMaskFilter(g_pendingBlur);
     if (g_pendingColorFilter) p.setColorFilter(g_pendingColorFilter);
+    if (g_pendingPathEffect) p.setPathEffect(g_pendingPathEffect);
+    p.setStrokeMiter(g_pendingMiter);
     if (style == 1) {  // Stroke (0 = Fill; compose has no separate FillAndStroke)
         p.setStyle(SkPaint::kStroke_Style);
         p.setStrokeWidth(strokeWidth);
@@ -1221,16 +1512,6 @@ void klio_skia_c_translate(KlioSurface* s, float dx, float dy) { if (auto* c = k
 void klio_skia_c_scale(KlioSurface* s, float sx, float sy) { if (auto* c = klioCanvasOf(s)) c->scale(sx, sy); }
 void klio_skia_c_rotate(KlioSurface* s, float deg) { if (auto* c = klioCanvasOf(s)) c->rotate(deg); }
 void klio_skia_c_skew(KlioSurface* s, float sx, float sy) { if (auto* c = klioCanvasOf(s)) c->skew(sx, sy); }
-
-// Concat a 2D affine transform (Compose Matrix's affine components: scaleX,
-// skewX, transX, skewY, scaleY, transY) onto the canvas.
-void klio_skia_c_concat(KlioSurface* s, float sx, float kx, float tx, float ky, float sy, float ty) {
-    if (auto* c = klioCanvasOf(s)) {
-        SkMatrix m;
-        m.setAll(sx, kx, tx, ky, sy, ty, 0, 0, 1);
-        c->concat(m);
-    }
-}
 
 // clipOp: 0 difference, 1 intersect (matching ClipOp).
 void klio_skia_c_clip_rect(KlioSurface* s, float l, float t, float r, float b, int clipOp) {
@@ -1278,28 +1559,28 @@ void klio_skia_c_draw_path(KlioSurface* s, const char* pathText,
 
 // Open an offscreen layer (Canvas.saveLayer): the draws up to the matching
 // restore composite back through its alpha, blend mode (Compose's BlendMode,
-// whose order is SkBlendMode's), the pending color filter and, for a sigma
-// above zero, a blur with the given edge tile mode. Without bounds the layer
-// covers the clip.
+// whose order is SkBlendMode's), the pending color filter and the image filter
+// spec. Without bounds the layer covers the clip.
 void klio_skia_c_save_layer(KlioSurface* s, float l, float t, float r, float b, int hasBounds,
-                            float alpha, int blendMode, float blurX, float blurY, int tile) {
+                            float alpha, int blendMode, const char* imageFilter) {
     auto* c = klioCanvasOf(s);
     if (!c) return;
     SkPaint p;
     p.setAlphaf(alpha);
     p.setBlendMode(static_cast<SkBlendMode>(blendMode));
     if (g_pendingColorFilter) p.setColorFilter(g_pendingColorFilter);
-    if (blurX > 0 || blurY > 0) p.setImageFilter(SkImageFilters::Blur(blurX, blurY, tileModeFrom(tile), nullptr));
+    if (auto f = makeImageFilterFromText(imageFilter)) p.setImageFilter(f);
     const SkRect bounds = SkRect::MakeLTRB(l, t, r, b);
     c->saveLayer(hasBounds ? &bounds : nullptr, &p);
 }
 
-// Begin recording a picture over (0, 0, width, height). The handle draws like a
-// surface's until klio_skia_rec_end turns what it drew into a picture.
-KlioSurface* klio_skia_rec_begin(float width, float height) {
+// Begin recording a picture over (l, t, r, b): draws wholly outside the bounds
+// are dropped. The handle draws like a surface's until klio_skia_rec_end turns
+// what it drew into a picture.
+KlioSurface* klio_skia_rec_begin_bounds(float l, float t, float r, float b) {
     auto* s = new KlioSurface();
     s->recorder = std::make_unique<SkPictureRecorder>();
-    s->recording = s->recorder->beginRecording(SkRect::MakeWH(width, height));
+    s->recording = s->recorder->beginRecording(SkRect::MakeLTRB(l, t, r, b));
     ensureFonts();
     return s;
 }
@@ -1319,6 +1600,240 @@ void klio_skia_picture_free(KlioPicture* p) { delete p; }
 void klio_skia_c_draw_picture(KlioSurface* s, KlioPicture* p) {
     auto* c = klioCanvasOf(s);
     if (c && p && p->picture) c->drawPicture(p->picture);
+}
+
+// Concat a Compose Matrix onto the canvas as a 4x4 transform, perspective
+// included, as skiko's canvas concats its Matrix44. Compose's values are the
+// column-major storage SkM44 keeps.
+void klio_skia_c_concat44(KlioSurface* s,
+                          float m0, float m1, float m2, float m3, float m4, float m5, float m6, float m7,
+                          float m8, float m9, float m10, float m11, float m12, float m13, float m14, float m15) {
+    auto* c = klioCanvasOf(s);
+    if (!c) return;
+    const SkScalar v[16] = {m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15};
+    c->concat(SkM44::ColMajor(v));
+}
+
+// ---------------------------------------------------------------------------
+// Graphics layers: skiko's RenderNode (src/compose_ui/skiko, from skiko
+// v0.150.1), an SkDrawable that draws its recorded content at its bounds' origin
+// under its transform, shadow, clip and layer paint. A parent layer's recording
+// draws a child by reference, so a child that records again shows in its
+// parent without the parent recording again. The nodes of one context share its
+// light, which the scene sets from its size and density.
+// ---------------------------------------------------------------------------
+
+void* klio_rn_context_new(int measureDrawBounds) {
+    return sk_make_sp<skiko::node::RenderNodeContext>(measureDrawBounds != 0).release();
+}
+
+void klio_rn_context_free(void* ctx) {
+    if (ctx) static_cast<skiko::node::RenderNodeContext*>(ctx)->unref();
+}
+
+void klio_rn_context_set_lighting(void* ctx, float centerX, float centerY, float centerZ,
+                                  float radius, float ambientShadowAlpha, float spotShadowAlpha) {
+    if (!ctx) return;
+    static_cast<skiko::node::RenderNodeContext*>(ctx)->setLightingInfo(
+        skiko::node::LightGeometry{SkPoint3{centerX, centerY, centerZ}, radius},
+        skiko::node::LightInfo{ambientShadowAlpha, spotShadowAlpha});
+}
+
+void* klio_rn_new(void* ctx) {
+    if (!ctx) return nullptr;
+    auto* context = static_cast<skiko::node::RenderNodeContext*>(ctx);
+    return sk_make_sp<skiko::node::RenderNode>(sk_ref_sp(context)).release();
+}
+
+void klio_rn_free(void* node) {
+    if (node) static_cast<skiko::node::RenderNode*>(node)->unref();
+}
+
+// The node's scalar properties, by `which`: 0 alpha, 1 scaleX, 2 scaleY,
+// 3 translationX, 4 translationY, 5 shadowElevation, 6 rotationX, 7 rotationY,
+// 8 rotationZ, 9 cameraDistance.
+void klio_rn_set_float(void* node, int which, float v) {
+    auto* n = static_cast<skiko::node::RenderNode*>(node);
+    if (!n) return;
+    switch (which) {
+        case 0: n->setAlpha(v); break;
+        case 1: n->setScaleX(v); break;
+        case 2: n->setScaleY(v); break;
+        case 3: n->setTranslationX(v); break;
+        case 4: n->setTranslationY(v); break;
+        case 5: n->setShadowElevation(v); break;
+        case 6: n->setRotationX(v); break;
+        case 7: n->setRotationY(v); break;
+        case 8: n->setRotationZ(v); break;
+        case 9: n->setCameraDistance(v); break;
+        default: break;
+    }
+}
+
+// The shadow colors, by `which`: 0 ambient, 1 spot.
+void klio_rn_set_color(void* node, int which, uint32_t argb) {
+    auto* n = static_cast<skiko::node::RenderNode*>(node);
+    if (!n) return;
+    if (which == 0) n->setAmbientShadowColor(toColor(argb));
+    else n->setSpotShadowColor(toColor(argb));
+}
+
+void klio_rn_set_bounds(void* node, float l, float t, float r, float b) {
+    if (auto* n = static_cast<skiko::node::RenderNode*>(node)) n->setBounds(SkRect::MakeLTRB(l, t, r, b));
+}
+
+// A NaN pivot is the bounds' center.
+void klio_rn_set_pivot(void* node, float x, float y) {
+    if (auto* n = static_cast<skiko::node::RenderNode*>(node)) n->setPivot(SkPoint::Make(x, y));
+}
+
+void klio_rn_set_clip(void* node, int clip) {
+    if (auto* n = static_cast<skiko::node::RenderNode*>(node)) n->setClip(clip != 0);
+}
+
+// The outline the node clips to and casts its shadow from: 0 none, 1 the
+// rect (l, t, r, b), 2 that rect with the corner radii (x, y) of the top-left,
+// top-right, bottom-right and bottom-left corners, 3 the serialized path.
+void klio_rn_set_outline(void* node, int kind, float l, float t, float r, float b,
+                         float tlx, float tly, float trx, float try_, float brx, float bry, float blx, float bly,
+                         const char* pathText) {
+    auto* n = static_cast<skiko::node::RenderNode*>(node);
+    if (!n) return;
+    switch (kind) {
+        case 1:
+            n->setClipRect(SkRect::MakeLTRB(l, t, r, b), SkClipOp::kIntersect, true);
+            break;
+        case 2: {
+            SkRRect rr;
+            const SkVector radii[4] = {{tlx, tly}, {trx, try_}, {brx, bry}, {blx, bly}};
+            rr.setRectRadii(SkRect::MakeLTRB(l, t, r, b), radii);
+            n->setClipRRect(rr, SkClipOp::kIntersect, true);
+            break;
+        }
+        case 3:
+            n->setClipPath(klioBuildPath(pathText ? pathText : ""), SkClipOp::kIntersect, true);
+            break;
+        default:
+            n->setClipPath(std::nullopt);
+            break;
+    }
+}
+
+// The paint the node's content composites through (an offscreen layer over its
+// bounds), or none: its alpha, blend mode, color filter spec and image filter
+// spec.
+void klio_rn_set_layer_paint(void* node, int has, float alpha, int blendMode, const char* colorFilter,
+                             const char* imageFilter) {
+    auto* n = static_cast<skiko::node::RenderNode*>(node);
+    if (!n) return;
+    if (!has) {
+        n->setLayerPaint(std::nullopt);
+        return;
+    }
+    SkPaint p;
+    p.setAlphaf(alpha);
+    p.setBlendMode(static_cast<SkBlendMode>(blendMode));
+    if (auto f = makeColorFilterFromText(colorFilter)) p.setColorFilter(f);
+    if (auto f = makeImageFilterFromText(imageFilter)) p.setImageFilter(f);
+    n->setLayerPaint(p);
+}
+
+// Begin recording the node's content: a handle that draws like a surface's
+// until klio_rn_end_recording.
+KlioSurface* klio_rn_begin_recording(void* node) {
+    auto* n = static_cast<skiko::node::RenderNode*>(node);
+    if (!n) return nullptr;
+    auto* s = new KlioSurface();
+    s->recording = n->beginRecording();
+    ensureFonts();
+    return s;
+}
+
+void klio_rn_end_recording(void* node, KlioSurface* rec) {
+    if (auto* n = static_cast<skiko::node::RenderNode*>(node)) n->endRecording();
+    delete rec;
+}
+
+void klio_rn_draw_into(void* node, KlioSurface* s) {
+    auto* n = static_cast<skiko::node::RenderNode*>(node);
+    auto* c = klioCanvasOf(s);
+    if (n && c) n->drawInto(c);
+}
+
+// Decode encoded image bytes (PNG, JPEG, WebP, GIF, BMP, ICO) into a new
+// raster surface of the image's size holding its pixels; null when the bytes
+// do not decode.
+KlioSurface* klio_skia_image_decode(const uint8_t* bytes, size_t len) {
+    if (!bytes || len == 0) return nullptr;
+    sk_sp<SkData> data = SkData::MakeWithCopy(bytes, len);
+    std::unique_ptr<SkCodec> codec = SkCodec::MakeFromData(data);
+    if (!codec) return nullptr;
+    auto [image, result] = codec->getImage();
+    if (!image) return nullptr;
+    auto* s = new KlioSurface();
+    s->surface = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(image->width(), image->height()));
+    if (!s->surface) {
+        delete s;
+        return nullptr;
+    }
+    SkCanvas* c = s->surface->getCanvas();
+    c->clear(SK_ColorTRANSPARENT);
+    SkPaint paint;
+    paint.setBlendMode(SkBlendMode::kSrc);
+    c->drawImage(image, 0, 0, SkSamplingOptions(), &paint);
+    return s;
+}
+
+// Canvas.drawVertices: mode 0 triangles, 1 a strip, 2 a fan; the positions,
+// texture coordinates (empty for none), colors (ARGB, empty for none) and
+// indices (empty for none) as whitespace-separated numbers, blended with the
+// paint's shader by the blend mode.
+void klio_skia_c_draw_vertices(KlioSurface* s, int mode, const char* positions, const char* texs,
+                               const char* colors, const char* indices, int blendMode, uint32_t argb) {
+    auto* c = klioCanvasOf(s);
+    if (!c) return;
+    auto floats = [](const char* t) {
+        std::vector<float> v;
+        Spec sp{t ? t : ""};
+        while (!sp.atEnd()) v.push_back(sp.f());
+        return v;
+    };
+    auto ints = [](const char* t) {
+        std::vector<long long> v;
+        Spec sp{t ? t : ""};
+        while (!sp.atEnd()) v.push_back(sp.i());
+        return v;
+    };
+    const std::vector<float> pos = floats(positions);
+    const std::vector<float> tex = floats(texs);
+    const std::vector<long long> col = ints(colors);
+    const std::vector<long long> idx = ints(indices);
+    const int count = (int)(pos.size() / 2);
+    if (count == 0) return;
+    std::vector<SkPoint> pts(count), uvs;
+    for (int k = 0; k < count; ++k) pts[k] = {pos[2 * k], pos[2 * k + 1]};
+    if ((int)(tex.size() / 2) == count) {
+        uvs.resize(count);
+        for (int k = 0; k < count; ++k) uvs[k] = {tex[2 * k], tex[2 * k + 1]};
+    }
+    std::vector<SkColor> cols;
+    if ((int)col.size() == count) for (long long v : col) cols.push_back(toColor((uint32_t)v));
+    std::vector<uint16_t> ind;
+    for (long long v : idx) ind.push_back((uint16_t)v);
+    const SkVertices::VertexMode vm = mode == 1 ? SkVertices::kTriangleStrip_VertexMode
+                                    : mode == 2 ? SkVertices::kTriangleFan_VertexMode
+                                                : SkVertices::kTriangles_VertexMode;
+    sk_sp<SkVertices> v = SkVertices::MakeCopy(vm, count, pts.data(), uvs.empty() ? nullptr : uvs.data(),
+                                               cols.empty() ? nullptr : cols.data(), (int)ind.size(),
+                                               ind.empty() ? nullptr : ind.data());
+    if (!v) return;
+    c->drawVertices(v, static_cast<SkBlendMode>(blendMode), klioCanvasPaint(argb, 0, 0, 0, 0, 1));
+}
+
+// A point, as SkCanvas::drawPoint draws one: a dot the stroke width across,
+// round under a round cap and square otherwise.
+void klio_skia_c_draw_point(KlioSurface* s, float x, float y, uint32_t argb, float sw, int cap, int aa) {
+    if (auto* c = klioCanvasOf(s)) c->drawPoint(x, y, klioCanvasPaint(argb, 1, sw, cap, 0, aa));
 }
 
 }  // extern "C"
@@ -1362,6 +1877,11 @@ struct KlioWindow {
     Uint32 id = 0;                     // SDL window id (event routing key)
     std::vector<KlioPendingEv> pending;
     size_t pendingHead = 0;
+    std::deque<KlioEv> events;         // klio_win_poll_event's queue
+    int buttons = 0;                   // the mouse buttons held, one bit per KLIO_BTN_* - 1
+    KlioScriptState script;            // its progress through the scripted input
+    std::vector<KlioMenuEntry> menuEntries;  // its menu bar, which SDL does not show
+    KlioFrameReport frameReport;       // the frame and placement last reported
 #if defined(KLIO_GPU)
     SDL_GLContext gl = nullptr;
     sk_sp<GrDirectContext> grContext;  // per-window GL context for the on-screen GPU
@@ -1375,6 +1895,15 @@ static std::unordered_map<Uint32, KlioWindow*>& klioSdlWindows() {
     return m;
 }
 static int klioSdlOpenCount = 0;
+// The open windows hold one reference on SDL's video subsystem, taken when the
+// first opens and given back when the last closes; the clipboard holds its own.
+static bool klioSdlWindowsHoldVideo = false;
+
+static void klioSdlReleaseVideo() {
+    if (!klioSdlWindowsHoldVideo) return;
+    klioSdlWindowsHoldVideo = false;
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+}
 
 extern "C" void klio_win_close(KlioWindow* kw);  // used by the open error paths
 
@@ -1522,8 +2051,10 @@ extern "C" {
 KlioWindow* klio_win_open(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return nullptr;
     SDL_SetMainReady();
-    if (SDL_WasInit(SDL_INIT_VIDEO) == 0 && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
-        return nullptr;
+    if (!klioSdlWindowsHoldVideo) {
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) return nullptr;
+        klioSdlWindowsHoldVideo = true;
+    }
 #if defined(KLIO_GPU)
     // Try an on-screen GPU window (Ganesh over SDL's GL context) first; fall back to
     // the raster renderer if any GL/Skia bring-up step fails.
@@ -1588,6 +2119,16 @@ void klio_win_set_icon_png(KlioWindow* kw, const unsigned char* png, size_t len)
     if (!surf) return;
     SDL_SetWindowIcon(kw->win, surf);
     SDL_FreeSurface(surf);
+}
+
+// A window's icon (Compose's Window(icon)) from a drawn surface.
+void klio_win_set_icon_surface(KlioWindow* kw, KlioSurface* s) {
+    if (!kw || !s) return;
+    size_t len = 0;
+    uint8_t* png = klio_skia_encode_png(s, &len);
+    if (!png) return;
+    klio_win_set_icon_png(kw, png, len);
+    klio_skia_free_buffer(png);
 }
 
 // Resize the native window; the surface follows via the routed
@@ -1687,6 +2228,389 @@ static int klioSdlClassify(KlioWindow* kw, const SDL_Event& ev, int* outA, int* 
     }
 }
 
+// The modifiers the desktop reports, from SDL's.
+static int klioSdlMods(Uint16 mod) {
+    int m = 0;
+    if (mod & KMOD_SHIFT) m |= KLIO_MOD_SHIFT;
+    if (mod & KMOD_CTRL) m |= KLIO_MOD_CTRL;
+    if (mod & KMOD_ALT) m |= KLIO_MOD_ALT;
+    if (mod & KMOD_GUI) m |= KLIO_MOD_META;
+    if (mod & KMOD_MODE) m |= KLIO_MOD_ALT_GRAPH;
+    if (mod & KMOD_CAPS) m |= KLIO_MOD_CAPS_LOCK;
+    if (mod & KMOD_NUM) m |= KLIO_MOD_NUM_LOCK;
+    return m;
+}
+
+static int klioSdlButton(Uint8 b) {
+    switch (b) {
+        case SDL_BUTTON_LEFT: return KLIO_BTN_PRIMARY;
+        case SDL_BUTTON_RIGHT: return KLIO_BTN_SECONDARY;
+        case SDL_BUTTON_MIDDLE: return KLIO_BTN_TERTIARY;
+        case SDL_BUTTON_X1: return KLIO_BTN_BACK;
+        case SDL_BUTTON_X2: return KLIO_BTN_FORWARD;
+        default: return KLIO_BTN_NONE;
+    }
+}
+
+// An SDL key as AWT's key code and location, as the desktop's X11 toolkit
+// numbers the key.
+static void klioSdlKey(SDL_Keycode k, int* vk, int* loc) {
+    *loc = KLIO_LOC_STANDARD;
+    if (k >= SDLK_a && k <= SDLK_z) {
+        *vk = VKK_A + (k - SDLK_a);
+        return;
+    }
+    if (k >= SDLK_0 && k <= SDLK_9) {
+        *vk = VKK_0 + (k - SDLK_0);
+        return;
+    }
+    if (k >= SDLK_F1 && k <= SDLK_F12) {
+        *vk = klioVkFunction(1 + (k - SDLK_F1));
+        return;
+    }
+    if (k >= SDLK_F13 && k <= SDLK_F24) {
+        *vk = klioVkFunction(13 + (k - SDLK_F13));
+        return;
+    }
+    if (k >= SDLK_KP_1 && k <= SDLK_KP_9) {
+        *vk = VKK_NUMPAD0 + 1 + (k - SDLK_KP_1);
+        *loc = KLIO_LOC_NUMPAD;
+        return;
+    }
+    switch (k) {
+        case SDLK_RETURN: *vk = VKK_ENTER; return;
+        case SDLK_ESCAPE: *vk = VKK_ESCAPE; return;
+        case SDLK_BACKSPACE: *vk = VKK_BACK_SPACE; return;
+        case SDLK_TAB: *vk = VKK_TAB; return;
+        case SDLK_SPACE: *vk = VKK_SPACE; return;
+        case SDLK_MINUS: *vk = VKK_MINUS; return;
+        case SDLK_EQUALS: *vk = VKK_EQUALS; return;
+        case SDLK_LEFTBRACKET: *vk = VKK_OPEN_BRACKET; return;
+        case SDLK_RIGHTBRACKET: *vk = VKK_CLOSE_BRACKET; return;
+        case SDLK_BACKSLASH: *vk = VKK_BACK_SLASH; return;
+        case SDLK_SEMICOLON: *vk = VKK_SEMICOLON; return;
+        case SDLK_QUOTE: *vk = VKK_QUOTE; return;
+        case SDLK_BACKQUOTE: *vk = VKK_BACK_QUOTE; return;
+        case SDLK_COMMA: *vk = VKK_COMMA; return;
+        case SDLK_PERIOD: *vk = VKK_PERIOD; return;
+        case SDLK_SLASH: *vk = VKK_SLASH; return;
+        case SDLK_CAPSLOCK: *vk = VKK_CAPS_LOCK; return;
+        case SDLK_PRINTSCREEN: *vk = VKK_PRINTSCREEN; return;
+        case SDLK_SCROLLLOCK: *vk = VKK_SCROLL_LOCK; return;
+        case SDLK_PAUSE: *vk = VKK_PAUSE; return;
+        case SDLK_INSERT: *vk = VKK_INSERT; return;
+        case SDLK_HOME: *vk = VKK_HOME; return;
+        case SDLK_PAGEUP: *vk = VKK_PAGE_UP; return;
+        case SDLK_DELETE: *vk = VKK_DELETE; return;
+        case SDLK_END: *vk = VKK_END; return;
+        case SDLK_PAGEDOWN: *vk = VKK_PAGE_DOWN; return;
+        case SDLK_RIGHT: *vk = VKK_RIGHT; return;
+        case SDLK_LEFT: *vk = VKK_LEFT; return;
+        case SDLK_DOWN: *vk = VKK_DOWN; return;
+        case SDLK_UP: *vk = VKK_UP; return;
+        case SDLK_NUMLOCKCLEAR: *vk = VKK_NUM_LOCK; *loc = KLIO_LOC_NUMPAD; return;
+        case SDLK_KP_DIVIDE: *vk = VKK_DIVIDE; *loc = KLIO_LOC_NUMPAD; return;
+        case SDLK_KP_MULTIPLY: *vk = VKK_MULTIPLY; *loc = KLIO_LOC_NUMPAD; return;
+        case SDLK_KP_MINUS: *vk = VKK_SUBTRACT; *loc = KLIO_LOC_NUMPAD; return;
+        case SDLK_KP_PLUS: *vk = VKK_ADD; *loc = KLIO_LOC_NUMPAD; return;
+        case SDLK_KP_ENTER: *vk = VKK_ENTER; *loc = KLIO_LOC_NUMPAD; return;
+        case SDLK_KP_0: *vk = VKK_NUMPAD0; *loc = KLIO_LOC_NUMPAD; return;
+        case SDLK_KP_PERIOD: *vk = VKK_DECIMAL; *loc = KLIO_LOC_NUMPAD; return;
+        case SDLK_LCTRL: *vk = VKK_CONTROL; *loc = KLIO_LOC_LEFT; return;
+        case SDLK_RCTRL: *vk = VKK_CONTROL; *loc = KLIO_LOC_RIGHT; return;
+        case SDLK_LSHIFT: *vk = VKK_SHIFT; *loc = KLIO_LOC_LEFT; return;
+        case SDLK_RSHIFT: *vk = VKK_SHIFT; *loc = KLIO_LOC_RIGHT; return;
+        case SDLK_LALT: *vk = VKK_ALT; *loc = KLIO_LOC_LEFT; return;
+        case SDLK_RALT: *vk = VKK_ALT; *loc = KLIO_LOC_RIGHT; return;
+        case SDLK_LGUI: *vk = VKK_WINDOWS; *loc = KLIO_LOC_LEFT; return;
+        case SDLK_RGUI: *vk = VKK_WINDOWS; *loc = KLIO_LOC_RIGHT; return;
+        case SDLK_MODE: *vk = VKK_ALT_GRAPH; return;
+        case SDLK_APPLICATION: *vk = VKK_CONTEXT_MENU; return;
+        case SDLK_HELP: *vk = VKK_HELP; return;
+        default: *vk = VKK_UNDEFINED; return;
+    }
+}
+
+// The character a key types unshifted, or none: SDL names a printable key by
+// it; letters take the case Shift and Caps Lock give them.
+static unsigned klioSdlKeyChar(SDL_Keycode k, Uint16 mod) {
+    if (k >= SDLK_a && k <= SDLK_z) {
+        const bool upper = ((mod & KMOD_SHIFT) != 0) != ((mod & KMOD_CAPS) != 0);
+        return static_cast<unsigned>(upper ? k - 32 : k);
+    }
+    if (k >= 0x20 && k < 0x7F) return static_cast<unsigned>(k);
+    return 0;
+}
+
+// The window frame's top-left on the screen: SDL places the client area, the
+// desktop the frame around it.
+static void klioSdlTopLeft(KlioWindow* kw, int* x, int* y) {
+    SDL_GetWindowPosition(kw->win, x, y);
+    int top = 0;
+    int left = 0;
+    if (SDL_GetWindowBordersSize(kw->win, &top, &left, nullptr, nullptr) == 0) {
+        *x -= left;
+        *y -= top;
+    }
+}
+
+static void klioSdlReportFrame(KlioWindow* kw) {
+    const Uint32 flags = SDL_GetWindowFlags(kw->win);
+    int placement = KLIO_PLACEMENT_FLOATING;
+    if ((flags & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP) placement = KLIO_PLACEMENT_FULLSCREEN;
+    else if (flags & SDL_WINDOW_MAXIMIZED) placement = KLIO_PLACEMENT_MAXIMIZED;
+    int x = 0;
+    int y = 0;
+    klioSdlTopLeft(kw, &x, &y);
+    klioReportFrame(kw->frameReport, kw->events, x, y, placement, (flags & SDL_WINDOW_MINIMIZED) != 0);
+}
+
+// Translates one SDL event into the events of its window.
+static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
+    switch (ev.type) {
+        case SDL_WINDOWEVENT: {
+            int mx = 0;
+            int my = 0;
+            switch (ev.window.event) {
+                case SDL_WINDOWEVENT_CLOSE:
+                    kw->events.push_back(klioSimpleEv(KLIO_EV_CLOSE));
+                    return;
+                case SDL_WINDOWEVENT_SIZE_CHANGED: {
+                    const int nw = ev.window.data1;
+                    const int nh = ev.window.data2;
+                    if (nw > 0 && nh > 0 && (nw != kw->w || nh != kw->h)) {
+                        klioSdlSizeTo(kw, nw, nh);
+                        kw->events.push_back(klioSimpleEv(KLIO_EV_RESIZE, nw, nh));
+                    }
+                    return;
+                }
+                case SDL_WINDOWEVENT_ENTER:
+                    SDL_GetMouseState(&mx, &my);
+                    kw->events.push_back(klioPointerEv(KLIO_PTR_ENTER, mx, my, KLIO_BTN_NONE, kw->buttons,
+                                                       klioSdlMods(SDL_GetModState())));
+                    return;
+                case SDL_WINDOWEVENT_LEAVE:
+                    SDL_GetMouseState(&mx, &my);
+                    kw->events.push_back(klioPointerEv(KLIO_PTR_EXIT, mx, my, KLIO_BTN_NONE, kw->buttons,
+                                                       klioSdlMods(SDL_GetModState())));
+                    return;
+                case SDL_WINDOWEVENT_FOCUS_GAINED:
+                    kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
+                    return;
+                case SDL_WINDOWEVENT_FOCUS_LOST:
+                    kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
+                    return;
+                case SDL_WINDOWEVENT_MOVED:
+                case SDL_WINDOWEVENT_MINIMIZED:
+                case SDL_WINDOWEVENT_MAXIMIZED:
+                case SDL_WINDOWEVENT_RESTORED:
+                    klioSdlReportFrame(kw);
+                    return;
+                default:
+                    return;
+            }
+        }
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP: {
+            const int button = klioSdlButton(ev.button.button);
+            if (button == KLIO_BTN_NONE) return;
+            const bool down = ev.type == SDL_MOUSEBUTTONDOWN;
+            if (down) {
+                kw->buttons |= 1 << (button - 1);
+            } else {
+                if (!(kw->buttons & (1 << (button - 1)))) return;
+                kw->buttons &= ~(1 << (button - 1));
+            }
+            // A drag goes on outside the window until its buttons are released.
+            SDL_CaptureMouse(kw->buttons != 0 ? SDL_TRUE : SDL_FALSE);
+            kw->events.push_back(klioPointerEv(down ? KLIO_PTR_PRESS : KLIO_PTR_RELEASE, ev.button.x,
+                                               ev.button.y, button, kw->buttons,
+                                               klioSdlMods(SDL_GetModState())));
+            return;
+        }
+        case SDL_MOUSEMOTION:
+            kw->events.push_back(klioPointerEv(KLIO_PTR_MOVE, ev.motion.x, ev.motion.y, KLIO_BTN_NONE,
+                                               kw->buttons, klioSdlMods(SDL_GetModState())));
+            return;
+        case SDL_MOUSEWHEEL: {
+            int mx = 0;
+            int my = 0;
+            SDL_GetMouseState(&mx, &my);
+            // AWT's wheel rotation is positive away from the user; SDL's is not.
+            const double flip = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0 : 1.0;
+            kw->events.push_back(klioPointerEv(KLIO_PTR_SCROLL, mx, my, KLIO_BTN_NONE, kw->buttons,
+                                               klioSdlMods(SDL_GetModState()),
+                                               flip * ev.wheel.preciseX, -flip * ev.wheel.preciseY));
+            return;
+        }
+        case SDL_KEYDOWN:
+        case SDL_KEYUP: {
+            int vk = 0;
+            int loc = KLIO_LOC_STANDARD;
+            klioSdlKey(ev.key.keysym.sym, &vk, &loc);
+            const unsigned c = klioSdlKeyChar(ev.key.keysym.sym, ev.key.keysym.mod);
+            kw->events.push_back(klioKeyEv(ev.type == SDL_KEYDOWN, vk, loc, klioAwtKeyChar(vk, c),
+                                           klioSdlMods(ev.key.keysym.mod)));
+            return;
+        }
+        case SDL_TEXTINPUT:
+            klioPushText(kw->events, ev.text.text);
+            return;
+        default:
+            return;
+    }
+}
+
+// Waits up to timeoutMs for the window's next input event and writes its
+// values to out (KLIO_EV_VALUES doubles); returns its type (window_events.h),
+// or KLIO_EV_NONE when none came. SDL's queue is the process's: an event for
+// another window is translated onto that window's queue.
+int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
+    if (!kw) return KLIO_EV_CLOSE;
+    klioScriptTick(kw->script, kw->events);
+    if (!kw->frameReport.reported) klioSdlReportFrame(kw);
+    int wait = timeoutMs;
+    while (kw->events.empty()) {
+        SDL_Event ev;
+        const int got = wait > 0 ? SDL_WaitEventTimeout(&ev, wait) : SDL_PollEvent(&ev);
+        wait = 0;
+        if (!got) break;
+        if (ev.type == SDL_QUIT) {
+            kw->events.push_back(klioSimpleEv(KLIO_EV_CLOSE));
+            break;
+        }
+        Uint32 wid;
+        switch (ev.type) {
+            case SDL_WINDOWEVENT: wid = ev.window.windowID; break;
+            case SDL_MOUSEBUTTONDOWN:
+            case SDL_MOUSEBUTTONUP: wid = ev.button.windowID; break;
+            case SDL_MOUSEMOTION: wid = ev.motion.windowID; break;
+            case SDL_MOUSEWHEEL: wid = ev.wheel.windowID; break;
+            case SDL_TEXTINPUT: wid = ev.text.windowID; break;
+            case SDL_KEYDOWN:
+            case SDL_KEYUP: wid = ev.key.windowID; break;
+            default: wid = kw->id; break;
+        }
+        auto it = klioSdlWindows().find(wid);
+        if (it == klioSdlWindows().end()) continue;  // a closed window's straggler
+        klioSdlTranslate(it->second, ev);
+    }
+    for (;;) {
+        const int type = klioPopEv(kw->events, out);
+        if (type != KLIO_EV_MENU_PATH) return type;
+        const size_t at = static_cast<size_t>(out[0]);
+        if (at >= klioScriptTexts().size()) continue;
+        const int id = klioMenuEnabledItem(kw->menuEntries, klioScriptTexts()[at]);
+        if (id >= 0) kw->events.push_back(klioSimpleEv(KLIO_EV_MENU, id));
+    }
+}
+
+// A window's menu bar. SDL has no native menus, so the window keeps its
+// entries (their shortcuts are the program's) and shows none.
+void klio_win_set_menu(KlioWindow* kw, const char* spec, size_t len) {
+    if (!kw) return;
+    kw->menuEntries = klioParseMenu(spec, len);
+    klioDumpMenuEntries(kw->menuEntries);
+}
+
+void klio_win_set_menu_icon(KlioWindow*, int, KlioSurface*) {}
+
+// No tray icons: the desktop's Tray says so on standard error.
+int klio_tray_supported(void) { return 0; }
+void* klio_tray_open(void) { return nullptr; }
+void klio_tray_close(void*) {}
+void klio_tray_set_icon(void*, void*) {}
+void klio_tray_set_tooltip(void*, const char*, size_t) {}
+void klio_tray_set_menu(void*, const char*, size_t) {}
+void klio_tray_notify(void*, const char*, size_t, const char*, size_t, int) {}
+int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
+void klio_app_wait(int timeoutMs) {
+    if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+}
+
+
+// Queues an event on the window as if its platform had sent it (the values as
+// klio_win_poll_event reports them), for programs that drive a window's input.
+void klio_win_post_event(KlioWindow* kw, int type, const double* values) {
+    if (!kw || !values) return;
+    KlioEv e;
+    e.type = type;
+    for (int i = 0; i < KLIO_EV_VALUES; i++) e.v[i] = values[i];
+    kw->events.push_back(e);
+}
+
+// Sets one of a window's KLIO_WIN_* properties.
+void klio_win_set_flag(KlioWindow* kw, int which, int value) {
+    if (!kw || !kw->win) return;
+    const SDL_bool on = value ? SDL_TRUE : SDL_FALSE;
+    switch (which) {
+        case KLIO_WIN_RESIZABLE: SDL_SetWindowResizable(kw->win, on); break;
+        case KLIO_WIN_DECORATED: SDL_SetWindowBordered(kw->win, on); break;
+        case KLIO_WIN_ALWAYS_ON_TOP: SDL_SetWindowAlwaysOnTop(kw->win, on); break;
+        case KLIO_WIN_VISIBLE:
+            if (value) SDL_ShowWindow(kw->win);
+            else SDL_HideWindow(kw->win);
+            break;
+        case KLIO_WIN_MINIMIZED:
+            if (value) SDL_MinimizeWindow(kw->win);
+            else SDL_RestoreWindow(kw->win);
+            break;
+        case KLIO_WIN_PLACEMENT:
+            if (value == KLIO_PLACEMENT_FULLSCREEN) {
+                SDL_SetWindowFullscreen(kw->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+            } else {
+                SDL_SetWindowFullscreen(kw->win, 0);
+                if (value == KLIO_PLACEMENT_MAXIMIZED) SDL_MaximizeWindow(kw->win);
+                else SDL_RestoreWindow(kw->win);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+// Moves the window frame's top-left to (x, y) on the screen.
+void klio_win_set_position(KlioWindow* kw, int x, int y) {
+    if (!kw || !kw->win) return;
+    int top = 0;
+    int left = 0;
+    SDL_GetWindowBordersSize(kw->win, &top, &left, nullptr, nullptr);
+    SDL_SetWindowPosition(kw->win, x + left, y + top);
+}
+
+void klio_win_get_position(KlioWindow* kw, int* x, int* y) {
+    if (!kw || !kw->win || !x || !y) return;
+    klioSdlTopLeft(kw, x, y);
+}
+
+// Resizes the window's frame, its border included: SDL sizes the client area.
+void klio_win_set_frame_size(KlioWindow* kw, int w, int h) {
+    if (!kw || !kw->win || w <= 0 || h <= 0) return;
+    int top = 0, left = 0, bottom = 0, right = 0;
+    SDL_GetWindowBordersSize(kw->win, &top, &left, &bottom, &right);
+    SDL_SetWindowSize(kw->win, w - left - right, h - top - bottom);
+}
+
+void klio_win_get_frame_size(KlioWindow* kw, int* w, int* h) {
+    if (!kw || !kw->win || !w || !h) return;
+    int top = 0, left = 0, bottom = 0, right = 0;
+    SDL_GetWindowBordersSize(kw->win, &top, &left, &bottom, &right);
+    SDL_GetWindowSize(kw->win, w, h);
+    *w += left + right;
+    *h += top + bottom;
+}
+
+// The primary display's area for windows.
+void klio_win_screen_bounds(int* x, int* y, int* w, int* h) {
+    if (!x || !y || !w || !h) return;
+    SDL_Rect r = {0, 0, 0, 0};
+    if (SDL_WasInit(SDL_INIT_VIDEO) == 0 || SDL_GetDisplayUsableBounds(0, &r) != 0) r = {0, 0, 0, 0};
+    *x = r.x;
+    *y = r.y;
+    *w = r.w;
+    *h = r.h;
+}
+
 int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
     if (!kw) return 2;
     // Deliver events routed here by another window's earlier poll first.
@@ -1749,7 +2673,7 @@ void klio_win_close(KlioWindow* kw) {
         kw->grContext.reset();
         if (kw->gl) SDL_GL_DeleteContext(kw->gl);
         if (kw->win) SDL_DestroyWindow(kw->win);
-        if (last) SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        if (last) klioSdlReleaseVideo();
         delete kw;
         return;
     }
@@ -1757,9 +2681,73 @@ void klio_win_close(KlioWindow* kw) {
     if (kw->tex) SDL_DestroyTexture(kw->tex);
     if (kw->renderer) SDL_DestroyRenderer(kw->renderer);
     if (kw->win) SDL_DestroyWindow(kw->win);
-    if (last) SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    if (last) klioSdlReleaseVideo();
     delete kw;
 }
+
+// The host clipboard, as text: a count that moves whenever any application
+// changes it (-1 when the host has none), its text as malloc'd UTF-8 that
+// klio_skia_free_cstr frees (null when it holds no text), and replacing its
+// contents with a text (null empties it).
+// SDL has no change count, so the shim keeps one: it moves when the
+// clipboard's text differs from the text it last saw.
+static bool klioSdlClipReady() {
+    static int ready = -1;
+    if (ready < 0) {
+        SDL_SetMainReady();
+        ready = SDL_InitSubSystem(SDL_INIT_VIDEO) == 0 ? 1 : 0;
+    }
+    return ready == 1;
+}
+
+static std::string& klioSdlClipSeen() {
+    static std::string seen;
+    return seen;
+}
+
+static long long klioSdlClipCount = 0;
+
+static std::string klioSdlClipNow() {
+    if (!SDL_HasClipboardText()) return std::string();
+    char* t = SDL_GetClipboardText();
+    std::string s = t ? t : "";
+    if (t) SDL_free(t);
+    return s;
+}
+
+long long klio_clip_change_count(void) {
+    if (!klioSdlClipReady()) return -1;
+    const std::string now = klioSdlClipNow();
+    if (now != klioSdlClipSeen()) {
+        klioSdlClipSeen() = now;
+        ++klioSdlClipCount;
+    }
+    return klioSdlClipCount;
+}
+
+char* klio_clip_get_text(size_t* len) {
+    if (!klioSdlClipReady() || !SDL_HasClipboardText()) return nullptr;
+    const std::string now = klioSdlClipNow();
+    char* out = static_cast<char*>(std::malloc(now.size() + 1));
+    if (!out) return nullptr;
+    std::memcpy(out, now.data(), now.size());
+    out[now.size()] = 0;
+    if (len) *len = now.size();
+    return out;
+}
+
+void klio_clip_set_text(const char* utf8, size_t len) {
+    if (!klioSdlClipReady()) return;
+    const std::string text = utf8 ? std::string(utf8, len) : std::string();
+    SDL_SetClipboardText(text.c_str());
+    if (text != klioSdlClipSeen()) {
+        klioSdlClipSeen() = text;
+        ++klioSdlClipCount;
+    }
+}
+
+// The runtime reads the host's locale from its POSIX locale name.
+char* klio_host_locale(void) { return nullptr; }
 
 }  // extern "C"
 
@@ -1770,6 +2758,7 @@ void klio_win_close(KlioWindow* kw) {
 // each poll pumps the queue and returns the first translated event. Compile-checked
 // via a Windows cross target; not run-verified.
 #include <windows.h>
+#include <shellapi.h>
 
 struct KlioWindow {
     HWND hwnd;
@@ -1780,10 +2769,236 @@ struct KlioWindow {
     int evA;
     int evB;
     bool hasEv;
+    std::deque<KlioEv> events;  // klio_win_poll_event's queue
+    int buttons = 0;            // the mouse buttons held, one bit per KLIO_BTN_* - 1
+    bool pointerInside = false;
+    unsigned highSurrogate = 0;
+    KlioScriptState script;     // its progress through the scripted input
+    KlioFrameReport frameReport;
+    bool resizable = true;
+    bool decorated = true;
+    LONG_PTR savedStyle = 0;    // the style and frame fullscreen replaced
+    RECT savedRect = {0, 0, 0, 0};
+    HICON icon = nullptr;       // the icon klio_win_set_icon_png made
+    HMENU menu = nullptr;       // the menu bar klio_win_set_menu made
+    std::vector<KlioMenuEntry> menuEntries;
+    std::vector<HBITMAP> menuBitmaps;  // its items' icons
 };
+
+// A menu item's command: its entry's index past this base.
+static const int KLIO_MENU_COMMAND_BASE = 0x100;
+
+static void klioWinReportFrame(KlioWindow* kw) {
+    RECT r;
+    GetWindowRect(kw->hwnd, &r);
+    WINDOWPLACEMENT wp = {};
+    wp.length = sizeof(wp);
+    GetWindowPlacement(kw->hwnd, &wp);
+    int placement = KLIO_PLACEMENT_FLOATING;
+    if (kw->savedStyle != 0) placement = KLIO_PLACEMENT_FULLSCREEN;
+    else if (wp.showCmd == SW_SHOWMAXIMIZED) placement = KLIO_PLACEMENT_MAXIMIZED;
+    klioReportFrame(kw->frameReport, kw->events, r.left, r.top, placement, IsIconic(kw->hwnd) != 0);
+}
+
+// The modifiers the desktop reports, from the keyboard's state.
+static int klioWinMods() {
+    int m = 0;
+    if (GetKeyState(VK_SHIFT) & 0x8000) m |= KLIO_MOD_SHIFT;
+    if (GetKeyState(VK_CONTROL) & 0x8000) m |= KLIO_MOD_CTRL;
+    if (GetKeyState(VK_MENU) & 0x8000) m |= KLIO_MOD_ALT;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) m |= KLIO_MOD_META;
+    if (GetKeyState(VK_CAPITAL) & 1) m |= KLIO_MOD_CAPS_LOCK;
+    if (GetKeyState(VK_NUMLOCK) & 1) m |= KLIO_MOD_NUM_LOCK;
+    if (GetKeyState(VK_SCROLL) & 1) m |= KLIO_MOD_SCROLL_LOCK;
+    return m;
+}
+
+// A Windows virtual key as AWT's key code and location, as the desktop's
+// Windows toolkit numbers it. Letters, digits, the function keys and the
+// keypad share AWT's codes.
+static void klioWinKey(WPARAM vkIn, LPARAM lParam, int* vk, int* loc) {
+    const int k = static_cast<int>(vkIn);
+    const bool extended = (lParam & (1 << 24)) != 0;
+    const UINT scan = (lParam >> 16) & 0xFF;
+    *loc = KLIO_LOC_STANDARD;
+    if ((k >= 'A' && k <= 'Z') || (k >= '0' && k <= '9')) {
+        *vk = k;
+        return;
+    }
+    if (k >= VK_F1 && k <= VK_F24) {
+        *vk = klioVkFunction(1 + (k - VK_F1));
+        return;
+    }
+    if (k >= VK_NUMPAD0 && k <= VK_DIVIDE) {
+        *vk = VKK_NUMPAD0 + (k - VK_NUMPAD0);
+        *loc = KLIO_LOC_NUMPAD;
+        return;
+    }
+    switch (k) {
+        case VK_BACK: *vk = VKK_BACK_SPACE; return;
+        case VK_TAB: *vk = VKK_TAB; return;
+        case VK_RETURN: *vk = VKK_ENTER; if (extended) *loc = KLIO_LOC_NUMPAD; return;
+        case VK_SHIFT: *vk = VKK_SHIFT; *loc = scan == 0x36 ? KLIO_LOC_RIGHT : KLIO_LOC_LEFT; return;
+        case VK_CONTROL: *vk = VKK_CONTROL; *loc = extended ? KLIO_LOC_RIGHT : KLIO_LOC_LEFT; return;
+        case VK_MENU: *vk = VKK_ALT; *loc = extended ? KLIO_LOC_RIGHT : KLIO_LOC_LEFT; return;
+        case VK_PAUSE: *vk = VKK_PAUSE; return;
+        case VK_CAPITAL: *vk = VKK_CAPS_LOCK; return;
+        case VK_ESCAPE: *vk = VKK_ESCAPE; return;
+        case VK_SPACE: *vk = VKK_SPACE; return;
+        case VK_PRIOR: *vk = VKK_PAGE_UP; return;
+        case VK_NEXT: *vk = VKK_PAGE_DOWN; return;
+        case VK_END: *vk = VKK_END; return;
+        case VK_HOME: *vk = VKK_HOME; return;
+        case VK_LEFT: *vk = VKK_LEFT; return;
+        case VK_UP: *vk = VKK_UP; return;
+        case VK_RIGHT: *vk = VKK_RIGHT; return;
+        case VK_DOWN: *vk = VKK_DOWN; return;
+        case VK_SNAPSHOT: *vk = VKK_PRINTSCREEN; return;
+        case VK_INSERT: *vk = VKK_INSERT; return;
+        case VK_DELETE: *vk = VKK_DELETE; return;
+        case VK_HELP: *vk = VKK_HELP; return;
+        case VK_LWIN: *vk = VKK_WINDOWS; *loc = KLIO_LOC_LEFT; return;
+        case VK_RWIN: *vk = VKK_WINDOWS; *loc = KLIO_LOC_RIGHT; return;
+        case VK_APPS: *vk = VKK_CONTEXT_MENU; return;
+        case VK_NUMLOCK: *vk = VKK_NUM_LOCK; *loc = KLIO_LOC_NUMPAD; return;
+        case VK_SCROLL: *vk = VKK_SCROLL_LOCK; return;
+        case VK_OEM_1: *vk = VKK_SEMICOLON; return;
+        case VK_OEM_PLUS: *vk = VKK_EQUALS; return;
+        case VK_OEM_COMMA: *vk = VKK_COMMA; return;
+        case VK_OEM_MINUS: *vk = VKK_MINUS; return;
+        case VK_OEM_PERIOD: *vk = VKK_PERIOD; return;
+        case VK_OEM_2: *vk = VKK_SLASH; return;
+        case VK_OEM_3: *vk = VKK_BACK_QUOTE; return;
+        case VK_OEM_4: *vk = VKK_OPEN_BRACKET; return;
+        case VK_OEM_5: *vk = VKK_BACK_SLASH; return;
+        case VK_OEM_6: *vk = VKK_CLOSE_BRACKET; return;
+        case VK_OEM_7: *vk = VKK_QUOTE; return;
+        default: *vk = VKK_UNDEFINED; return;
+    }
+}
+
+// The window's input as klio_win_poll_event's events.
+static void klioWinTranslate(KlioWindow* kw, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const double x = static_cast<short>(LOWORD(lParam));
+    const double y = static_cast<short>(HIWORD(lParam));
+    int button = KLIO_BTN_NONE;
+    bool down = false;
+    switch (msg) {
+        case WM_LBUTTONDOWN: button = KLIO_BTN_PRIMARY; down = true; break;
+        case WM_LBUTTONUP: button = KLIO_BTN_PRIMARY; break;
+        case WM_RBUTTONDOWN: button = KLIO_BTN_SECONDARY; down = true; break;
+        case WM_RBUTTONUP: button = KLIO_BTN_SECONDARY; break;
+        case WM_MBUTTONDOWN: button = KLIO_BTN_TERTIARY; down = true; break;
+        case WM_MBUTTONUP: button = KLIO_BTN_TERTIARY; break;
+        case WM_XBUTTONDOWN:
+        case WM_XBUTTONUP:
+            button = HIWORD(wParam) == XBUTTON1 ? KLIO_BTN_BACK : KLIO_BTN_FORWARD;
+            down = msg == WM_XBUTTONDOWN;
+            break;
+        case WM_MOUSEMOVE: {
+            if (!kw->pointerInside) {
+                // Moves into the window enter it; its leaving is reported once asked for.
+                kw->pointerInside = true;
+                TRACKMOUSEEVENT tme = {};
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = kw->hwnd;
+                TrackMouseEvent(&tme);
+                kw->events.push_back(klioPointerEv(KLIO_PTR_ENTER, x, y, KLIO_BTN_NONE, kw->buttons, klioWinMods()));
+            }
+            kw->events.push_back(klioPointerEv(KLIO_PTR_MOVE, x, y, KLIO_BTN_NONE, kw->buttons, klioWinMods()));
+            return;
+        }
+        case WM_MOUSELEAVE: {
+            kw->pointerInside = false;
+            POINT p;
+            GetCursorPos(&p);
+            ScreenToClient(kw->hwnd, &p);
+            kw->events.push_back(klioPointerEv(KLIO_PTR_EXIT, p.x, p.y, KLIO_BTN_NONE, kw->buttons, klioWinMods()));
+            return;
+        }
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL: {
+            // The wheel's position is on the screen; its rotation, in notches of
+            // 120, is positive away from the user, the opposite of AWT's.
+            POINT p = {static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+            ScreenToClient(kw->hwnd, &p);
+            const double notches = GET_WHEEL_DELTA_WPARAM(wParam) / 120.0;
+            const bool horizontal = msg == WM_MOUSEHWHEEL;
+            kw->events.push_back(klioPointerEv(KLIO_PTR_SCROLL, p.x, p.y, KLIO_BTN_NONE, kw->buttons,
+                                               klioWinMods(), horizontal ? notches : 0,
+                                               horizontal ? 0 : -notches));
+            return;
+        }
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+        case WM_KEYUP:
+        case WM_SYSKEYUP: {
+            int vk = 0;
+            int loc = KLIO_LOC_STANDARD;
+            klioWinKey(wParam, lParam, &vk, &loc);
+            const unsigned c = MapVirtualKeyW(static_cast<UINT>(wParam), MAPVK_VK_TO_CHAR) & 0x7FFF;
+            const bool pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+            kw->events.push_back(klioKeyEv(pressed, vk, loc, klioAwtKeyChar(vk, c), klioWinMods()));
+            return;
+        }
+        case WM_CHAR: {
+            // UTF-16 units: a high surrogate waits for its low one.
+            const unsigned unit = static_cast<unsigned>(wParam);
+            if (unit >= 0xD800 && unit <= 0xDBFF) {
+                kw->highSurrogate = unit;
+                return;
+            }
+            unsigned cp = unit;
+            if (unit >= 0xDC00 && unit <= 0xDFFF && kw->highSurrogate) {
+                cp = 0x10000 + ((kw->highSurrogate - 0xD800) << 10) + (unit - 0xDC00);
+            }
+            kw->highSurrogate = 0;
+            if (!klioIsPrintable(cp)) return;
+            KlioEv e;
+            e.type = KLIO_EV_TEXT;
+            e.v[0] = 1;
+            e.v[1] = cp;
+            kw->events.push_back(e);
+            return;
+        }
+        case WM_COMMAND: {
+            // A menu item chosen (not an accelerator's or a control's command).
+            if (lParam != 0 || HIWORD(wParam) != 0) return;
+            const int index = static_cast<int>(LOWORD(wParam)) - KLIO_MENU_COMMAND_BASE;
+            if (index < 0 || static_cast<size_t>(index) >= kw->menuEntries.size()) return;
+            kw->events.push_back(klioSimpleEv(KLIO_EV_MENU, kw->menuEntries[static_cast<size_t>(index)].id));
+            return;
+        }
+        case WM_MOVE:
+            klioWinReportFrame(kw);
+            return;
+        case WM_SETFOCUS:
+            kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
+            return;
+        case WM_KILLFOCUS:
+            kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
+            return;
+        default:
+            return;
+    }
+    // A button press or release; the window keeps the mouse while one is held.
+    const int bit = 1 << (button - 1);
+    if (down) {
+        kw->buttons |= bit;
+        SetCapture(kw->hwnd);
+    } else {
+        if (!(kw->buttons & bit)) return;
+        kw->buttons &= ~bit;
+        if (kw->buttons == 0) ReleaseCapture();
+    }
+    kw->events.push_back(klioPointerEv(down ? KLIO_PTR_PRESS : KLIO_PTR_RELEASE, x, y, button,
+                                       kw->buttons, klioWinMods()));
+}
 
 static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* kw = reinterpret_cast<KlioWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+    if (kw) klioWinTranslate(kw, msg, wParam, lParam);
     if (kw) {
         switch (msg) {
             case WM_LBUTTONDOWN:
@@ -1795,6 +3010,7 @@ static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             case WM_CLOSE:
                 kw->evType = 2;
                 kw->hasEv = true;
+                kw->events.push_back(klioSimpleEv(KLIO_EV_CLOSE));
                 return 0;
             case WM_CHAR:
                 kw->evType = 3;
@@ -1809,6 +3025,7 @@ static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 kw->hasEv = true;
                 return 0;
             case WM_SIZE: {
+                klioWinReportFrame(kw);
                 const int nw = LOWORD(lParam);
                 const int nh = HIWORD(lParam);
                 if ((nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
@@ -1820,6 +3037,7 @@ static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     kw->evA = nw;
                     kw->evB = nh;
                     kw->hasEv = true;
+                    kw->events.push_back(klioSimpleEv(KLIO_EV_RESIZE, nw, nh));
                 }
                 return 0;
             }
@@ -1850,7 +3068,7 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
                               CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                               r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     if (!hwnd) return nullptr;
-    auto* kw = new KlioWindow{hwnd, w, h, nullptr, 0, 0, 0, false};
+    auto* kw = new KlioWindow{hwnd, w, h, nullptr, 0, 0, 0, false, {}, 0, false, 0};
     kw->surface = klio_skia_new(w, h);
     if (!kw->surface) {
         DestroyWindow(hwnd);
@@ -1901,17 +3119,579 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
     return 0;
 }
 
+// Waits up to timeoutMs for the window's next input event and writes its
+// values to out (KLIO_EV_VALUES doubles); returns its type (window_events.h),
+// or KLIO_EV_NONE when none came. The window proc translates each message.
+static int klioWinPop(KlioWindow* kw, double* out);
+
+int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
+    if (!kw) return KLIO_EV_CLOSE;
+    klioScriptTick(kw->script, kw->events);
+    if (!kw->frameReport.reported) klioWinReportFrame(kw);
+    if (!kw->events.empty()) return klioWinPop(kw, out);
+    MSG msg;
+    if (!PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(timeoutMs), QS_ALLINPUT);
+    }
+    while (kw->events.empty() && PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return klioWinPop(kw, out);
+}
+
+// The window's next event, a scripted menu choice performed on the way.
+static int klioWinPop(KlioWindow* kw, double* out) {
+    for (;;) {
+        const int type = klioPopEv(kw->events, out);
+        if (type != KLIO_EV_MENU_PATH) return type;
+        const size_t at = static_cast<size_t>(out[0]);
+        if (at >= klioScriptTexts().size()) continue;
+        // Chosen as a click chooses it: its command through the window.
+        const int index = klioMenuFindPath(kw->menuEntries, klioScriptTexts()[at]);
+        if (index < 0 || klioMenuEnabledItem(kw->menuEntries, klioScriptTexts()[at]) < 0) continue;
+        SendMessageW(kw->hwnd, WM_COMMAND, MAKEWPARAM(KLIO_MENU_COMMAND_BASE + index, 0), 0);
+    }
+}
+
+static std::wstring klioWiden(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return w;
+}
+
+// A shortcut as the desktop's Windows menus show it: "Ctrl+Shift+S".
+static std::string klioWinShortcutText(int vk, int mods) {
+    std::string t;
+    if (mods & KLIO_MOD_META) t += "Meta+";
+    if (mods & KLIO_MOD_CTRL) t += "Ctrl+";
+    if (mods & KLIO_MOD_ALT) t += "Alt+";
+    if (mods & KLIO_MOD_SHIFT) t += "Shift+";
+    char buf[16];
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        t += static_cast<char>(vk);
+        return t;
+    }
+    if (vk >= 112 && vk <= 123) {
+        std::snprintf(buf, sizeof buf, "F%d", vk - 111);
+        return t + buf;
+    }
+    switch (vk) {
+        case 10: return t + "Enter";
+        case 8: return t + "Backspace";
+        case 9: return t + "Tab";
+        case 27: return t + "Escape";
+        case 32: return t + "Space";
+        case 127: return t + "Delete";
+        case 37: return t + "Left";
+        case 38: return t + "Up";
+        case 39: return t + "Right";
+        case 40: return t + "Down";
+        case 36: return t + "Home";
+        case 35: return t + "End";
+        case 33: return t + "Page Up";
+        case 34: return t + "Page Down";
+        case 44: return t + "Comma";
+        case 45: return t + "Minus";
+        case 46: return t + "Period";
+        case 47: return t + "Slash";
+        case 59: return t + "Semicolon";
+        case 61: return t + "Equals";
+        default:
+            std::snprintf(buf, sizeof buf, "0x%x", vk);
+            return t + buf;
+    }
+}
+
+// An item's text for a Win32 menu: '&' doubled, the mnemonic's first
+// occurrence marked, and the shortcut after a tab.
+static std::wstring klioWinMenuText(const KlioMenuEntry& e) {
+    std::string t;
+    bool marked = false;
+    for (const char ch : e.text) {
+        if (!marked && e.mnemonic > 0 && e.mnemonic < 128 &&
+            std::tolower(static_cast<unsigned char>(ch)) == std::tolower(e.mnemonic)) {
+            t += '&';
+            marked = true;
+        }
+        if (ch == '&') t += '&';
+        t += ch;
+    }
+    if (e.keycode != 0) {
+        t += '\t';
+        t += klioWinShortcutText(e.keycode, e.mods);
+    }
+    return klioWiden(t);
+}
+
+// Sets the window's menu bar from its entries (window_events.h), or removes
+// it for an empty spec. The bar takes its height from the client area, as the
+// desktop's JMenuBar takes it from the content.
+void klio_win_set_menu(KlioWindow* kw, const char* spec, size_t len) {
+    if (!kw) return;
+    kw->menuEntries = klioParseMenu(spec, len);
+    HMENU bar = nullptr;
+    if (!kw->menuEntries.empty()) {
+        bar = CreateMenu();
+        std::vector<HMENU> stack = {bar};
+        for (size_t i = 0; i < kw->menuEntries.size(); i++) {
+            const KlioMenuEntry& e = kw->menuEntries[i];
+            if (e.depth < 0 || static_cast<size_t>(e.depth) >= stack.size()) continue;
+            stack.resize(static_cast<size_t>(e.depth) + 1);
+            HMENU parent = stack.back();
+            if (e.kind == 's') {
+                AppendMenuW(parent, MF_SEPARATOR, 0, nullptr);
+                continue;
+            }
+            const std::wstring text = klioWinMenuText(e);
+            UINT flags = MF_STRING | (e.enabled ? MF_ENABLED : MF_GRAYED);
+            if (e.kind == 'm') {
+                HMENU sub = CreatePopupMenu();
+                AppendMenuW(parent, flags | MF_POPUP, reinterpret_cast<UINT_PTR>(sub), text.c_str());
+                stack.push_back(sub);
+                continue;
+            }
+            if (e.state) flags |= MF_CHECKED;
+            const UINT command = static_cast<UINT>(KLIO_MENU_COMMAND_BASE + static_cast<int>(i));
+            AppendMenuW(parent, flags, command, text.c_str());
+            if (e.kind == 'r') {
+                MENUITEMINFOW mii = {};
+                mii.cbSize = sizeof(mii);
+                mii.fMask = MIIM_FTYPE;
+                mii.fType = MFT_STRING | MFT_RADIOCHECK;
+                SetMenuItemInfoW(parent, command, FALSE, &mii);
+            }
+        }
+    }
+    HMENU old = kw->menu;
+    SetMenu(kw->hwnd, bar);
+    kw->menu = bar;
+    if (old) DestroyMenu(old);
+    for (HBITMAP b : kw->menuBitmaps) DeleteObject(b);
+    kw->menuBitmaps.clear();
+    DrawMenuBar(kw->hwnd);
+    klioDumpMenuEntries(kw->menuEntries);
+}
+
+// A tray icon: a notification area icon whose messages come to a message-only
+// window, its popup menu, and the events of its action and menu.
+struct KlioTray {
+    HWND hwnd = nullptr;
+    NOTIFYICONDATAW nid = {};
+    HMENU menu = nullptr;
+    HICON icon = nullptr;
+    std::vector<KlioMenuEntry> menuEntries;
+    std::deque<KlioEv> events;
+    KlioScriptState script;
+};
+
+static const UINT KLIO_TRAY_CALLBACK = WM_APP + 1;
+
+static LRESULT CALLBACK klioTrayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* tray = reinterpret_cast<KlioTray*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (tray && msg == KLIO_TRAY_CALLBACK) {
+        switch (LOWORD(lParam)) {
+            case WM_LBUTTONDBLCLK:
+                // The desktop's action: a double click.
+                tray->events.push_back(klioSimpleEv(KLIO_EV_TRAY_ACTION));
+                return 0;
+            case WM_RBUTTONUP:
+            case WM_CONTEXTMENU:
+                if (tray->menu) {
+                    POINT p;
+                    GetCursorPos(&p);
+                    SetForegroundWindow(hwnd);
+                    TrackPopupMenu(tray->menu, TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, nullptr);
+                    PostMessageW(hwnd, WM_NULL, 0, 0);
+                }
+                return 0;
+        }
+    }
+    if (tray && msg == WM_COMMAND && lParam == 0 && HIWORD(wParam) == 0) {
+        const int index = static_cast<int>(LOWORD(wParam)) - KLIO_MENU_COMMAND_BASE;
+        if (index >= 0 && static_cast<size_t>(index) < tray->menuEntries.size()) {
+            tray->events.push_back(klioSimpleEv(KLIO_EV_MENU, tray->menuEntries[static_cast<size_t>(index)].id));
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+int klio_tray_supported(void) { return 1; }
+
+void* klio_tray_open(void) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = klioTrayProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"KlioTray";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    auto* tray = new KlioTray();
+    tray->hwnd = CreateWindowExW(0, L"KlioTray", L"klio tray", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                                 GetModuleHandleW(nullptr), nullptr);
+    if (!tray->hwnd) {
+        delete tray;
+        return nullptr;
+    }
+    SetWindowLongPtrW(tray->hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(tray));
+    tray->nid.cbSize = sizeof(tray->nid);
+    tray->nid.hWnd = tray->hwnd;
+    tray->nid.uID = 1;
+    tray->nid.uFlags = NIF_MESSAGE;
+    tray->nid.uCallbackMessage = KLIO_TRAY_CALLBACK;
+    Shell_NotifyIconW(NIM_ADD, &tray->nid);
+    return tray;
+}
+
+void klio_tray_close(void* t) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return;
+    Shell_NotifyIconW(NIM_DELETE, &tray->nid);
+    if (tray->menu) DestroyMenu(tray->menu);
+    if (tray->icon) DestroyIcon(tray->icon);
+    DestroyWindow(tray->hwnd);
+    delete tray;
+}
+
+static HICON klioWinIconFromPng(const unsigned char* png, size_t len);
+
+void klio_tray_set_icon(void* t, KlioSurface* s) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray || !s) return;
+    size_t len = 0;
+    uint8_t* png = klio_skia_encode_png(s, &len);
+    if (!png) return;
+    HICON icon = klioWinIconFromPng(png, len);
+    klio_skia_free_buffer(png);
+    if (!icon) return;
+    tray->nid.uFlags = NIF_ICON;
+    tray->nid.hIcon = icon;
+    Shell_NotifyIconW(NIM_MODIFY, &tray->nid);
+    if (tray->icon) DestroyIcon(tray->icon);
+    tray->icon = icon;
+}
+
+void klio_tray_set_tooltip(void* t, const char* utf8, size_t len) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return;
+    const std::wstring tip = utf8 ? klioWiden(std::string(utf8, len)) : std::wstring();
+    wcsncpy(tray->nid.szTip, tip.c_str(), sizeof(tray->nid.szTip) / sizeof(wchar_t) - 1);
+    tray->nid.szTip[sizeof(tray->nid.szTip) / sizeof(wchar_t) - 1] = 0;
+    tray->nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+    Shell_NotifyIconW(NIM_MODIFY, &tray->nid);
+}
+
+void klio_tray_set_menu(void* t, const char* spec, size_t len) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return;
+    tray->menuEntries = klioParseMenu(spec, len);
+    if (tray->menu) DestroyMenu(tray->menu);
+    tray->menu = nullptr;
+    if (tray->menuEntries.empty()) return;
+    tray->menu = CreatePopupMenu();
+    std::vector<HMENU> stack = {tray->menu};
+    for (size_t i = 0; i < tray->menuEntries.size(); i++) {
+        const KlioMenuEntry& e = tray->menuEntries[i];
+        if (e.depth < 0 || static_cast<size_t>(e.depth) >= stack.size()) continue;
+        stack.resize(static_cast<size_t>(e.depth) + 1);
+        HMENU parent = stack.back();
+        if (e.kind == 's') {
+            AppendMenuW(parent, MF_SEPARATOR, 0, nullptr);
+            continue;
+        }
+        const std::wstring text = klioWinMenuText(e);
+        UINT flags = MF_STRING | (e.enabled ? MF_ENABLED : MF_GRAYED);
+        if (e.kind == 'm') {
+            HMENU sub = CreatePopupMenu();
+            AppendMenuW(parent, flags | MF_POPUP, reinterpret_cast<UINT_PTR>(sub), text.c_str());
+            stack.push_back(sub);
+            continue;
+        }
+        if (e.state) flags |= MF_CHECKED;
+        AppendMenuW(parent, flags, static_cast<UINT>(KLIO_MENU_COMMAND_BASE + static_cast<int>(i)), text.c_str());
+    }
+    klioDumpMenuEntries(tray->menuEntries);
+}
+
+// A notification from the tray: the icon's balloon, as the desktop's
+// TrayIcon.displayMessage shows it.
+void klio_tray_notify(void* t, const char* title, size_t tlen, const char* message, size_t mlen, int type) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return;
+    const std::wstring ts = title ? klioWiden(std::string(title, tlen)) : std::wstring();
+    const std::wstring ms = message ? klioWiden(std::string(message, mlen)) : std::wstring();
+    wcsncpy(tray->nid.szInfoTitle, ts.c_str(), sizeof(tray->nid.szInfoTitle) / sizeof(wchar_t) - 1);
+    tray->nid.szInfoTitle[sizeof(tray->nid.szInfoTitle) / sizeof(wchar_t) - 1] = 0;
+    wcsncpy(tray->nid.szInfo, ms.c_str(), sizeof(tray->nid.szInfo) / sizeof(wchar_t) - 1);
+    tray->nid.szInfo[sizeof(tray->nid.szInfo) / sizeof(wchar_t) - 1] = 0;
+    switch (type) {
+        case 1: tray->nid.dwInfoFlags = NIIF_INFO; break;
+        case 2: tray->nid.dwInfoFlags = NIIF_WARNING; break;
+        case 3: tray->nid.dwInfoFlags = NIIF_ERROR; break;
+        default: tray->nid.dwInfoFlags = NIIF_NONE; break;
+    }
+    tray->nid.uFlags = NIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &tray->nid);
+}
+
+int klio_tray_poll_event(void* t, double* out) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return KLIO_EV_NONE;
+    klioScriptTick(tray->script, tray->events, true);
+    for (;;) {
+        const int type = klioPopEv(tray->events, out);
+        if (type != KLIO_EV_MENU_PATH) return type;
+        const size_t at = static_cast<size_t>(out[0]);
+        if (at >= klioScriptTexts().size()) continue;
+        const int index = klioMenuFindPath(tray->menuEntries, klioScriptTexts()[at]);
+        if (index < 0 || klioMenuEnabledItem(tray->menuEntries, klioScriptTexts()[at]) < 0) continue;
+        SendMessageW(tray->hwnd, WM_COMMAND, MAKEWPARAM(KLIO_MENU_COMMAND_BASE + index, 0), 0);
+    }
+}
+
+// Runs the thread's messages for up to the timeout, while no window's poll
+// runs them (an application with only a tray).
+void klio_app_wait(int timeoutMs) {
+    MSG msg;
+    if (!PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(timeoutMs), QS_ALLINPUT);
+    }
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+// Sets the icon of the menu item with the id from a drawn surface: its
+// premultiplied pixels as a 32-bit bitmap, which menus draw with their alpha.
+void klio_win_set_menu_icon(KlioWindow* kw, int id, KlioSurface* s) {
+    if (!kw || !kw->menu || !s || !s->surface) return;
+    int index = -1;
+    for (size_t i = 0; i < kw->menuEntries.size(); i++) {
+        if (kw->menuEntries[i].id == id && kw->menuEntries[i].kind != 'm') index = static_cast<int>(i);
+    }
+    if (index < 0) return;
+    const int w = s->surface->width();
+    const int h = s->surface->height();
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = GetDC(nullptr);
+    HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (!bitmap || !bits) return;
+    const SkImageInfo info = SkImageInfo::Make(w, h, kBGRA_8888_SkColorType, kPremul_SkAlphaType);
+    if (!s->surface->readPixels(info, bits, static_cast<size_t>(w) * 4, 0, 0)) {
+        DeleteObject(bitmap);
+        return;
+    }
+    MENUITEMINFOW mii = {};
+    mii.cbSize = sizeof(mii);
+    mii.fMask = MIIM_BITMAP;
+    mii.hbmpItem = bitmap;
+    SetMenuItemInfoW(kw->menu, static_cast<UINT>(KLIO_MENU_COMMAND_BASE + index), FALSE, &mii);
+    kw->menuBitmaps.push_back(bitmap);
+    DrawMenuBar(kw->hwnd);
+}
+
+// Queues an event on the window as if its platform had sent it (the values as
+// klio_win_poll_event reports them), for programs that drive a window's input.
+void klio_win_post_event(KlioWindow* kw, int type, const double* values) {
+    if (!kw || !values) return;
+    KlioEv e;
+    e.type = type;
+    for (int i = 0; i < KLIO_EV_VALUES; i++) e.v[i] = values[i];
+    kw->events.push_back(e);
+}
+
+// The window style its KLIO_WIN_* properties give.
+static LONG_PTR klioWinStyle(KlioWindow* kw, LONG_PTR style) {
+    style &= ~(WS_OVERLAPPEDWINDOW | WS_POPUP);
+    if (kw->decorated) {
+        style |= WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        if (kw->resizable) style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
+    } else {
+        style |= WS_POPUP;
+        if (kw->resizable) style |= WS_THICKFRAME;
+    }
+    return style;
+}
+
+// Sets one of a window's KLIO_WIN_* properties.
+void klio_win_set_flag(KlioWindow* kw, int which, int value) {
+    if (!kw) return;
+    HWND h = kw->hwnd;
+    switch (which) {
+        case KLIO_WIN_RESIZABLE:
+        case KLIO_WIN_DECORATED: {
+            if (which == KLIO_WIN_RESIZABLE) kw->resizable = value != 0;
+            else kw->decorated = value != 0;
+            // A new style keeps the client area's size.
+            RECT client;
+            GetClientRect(h, &client);
+            const LONG_PTR style = klioWinStyle(kw, GetWindowLongPtr(h, GWL_STYLE));
+            SetWindowLongPtr(h, GWL_STYLE, style);
+            RECT r = client;
+            AdjustWindowRect(&r, static_cast<DWORD>(style), FALSE);
+            SetWindowPos(h, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+            break;
+        }
+        case KLIO_WIN_ALWAYS_ON_TOP:
+            SetWindowPos(h, value ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            break;
+        case KLIO_WIN_VISIBLE:
+            ShowWindow(h, value ? SW_SHOW : SW_HIDE);
+            break;
+        case KLIO_WIN_MINIMIZED:
+            ShowWindow(h, value ? SW_MINIMIZE : SW_RESTORE);
+            break;
+        case KLIO_WIN_PLACEMENT:
+            if (value == KLIO_PLACEMENT_FULLSCREEN) {
+                if (kw->savedStyle != 0) break;
+                // Fullscreen: no frame, over the whole monitor.
+                kw->savedStyle = GetWindowLongPtr(h, GWL_STYLE);
+                GetWindowRect(h, &kw->savedRect);
+                MONITORINFO mi = {};
+                mi.cbSize = sizeof(mi);
+                GetMonitorInfo(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
+                SetWindowLongPtr(h, GWL_STYLE, (kw->savedStyle & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+                SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                             mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                             SWP_FRAMECHANGED);
+            } else {
+                if (kw->savedStyle != 0) {
+                    SetWindowLongPtr(h, GWL_STYLE, kw->savedStyle);
+                    const RECT r = kw->savedRect;
+                    SetWindowPos(h, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                                 SWP_NOZORDER | SWP_FRAMECHANGED);
+                    kw->savedStyle = 0;
+                }
+                ShowWindow(h, value == KLIO_PLACEMENT_MAXIMIZED ? SW_MAXIMIZE : SW_RESTORE);
+            }
+            klioWinReportFrame(kw);
+            break;
+        default:
+            break;
+    }
+}
+
+// Moves the window frame's top-left to (x, y) on the screen.
+void klio_win_set_position(KlioWindow* kw, int x, int y) {
+    if (!kw) return;
+    SetWindowPos(kw->hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+}
+
+void klio_win_get_position(KlioWindow* kw, int* x, int* y) {
+    if (!kw || !x || !y) return;
+    RECT r;
+    GetWindowRect(kw->hwnd, &r);
+    *x = r.left;
+    *y = r.top;
+}
+
+// Resizes the window's frame, its title bar and border included.
+void klio_win_set_frame_size(KlioWindow* kw, int w, int h) {
+    if (!kw || w <= 0 || h <= 0) return;
+    SetWindowPos(kw->hwnd, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+}
+
+void klio_win_get_frame_size(KlioWindow* kw, int* w, int* h) {
+    if (!kw || !w || !h) return;
+    RECT r;
+    GetWindowRect(kw->hwnd, &r);
+    *w = r.right - r.left;
+    *h = r.bottom - r.top;
+}
+
+// The primary monitor's area for windows (without the taskbar).
+void klio_win_screen_bounds(int* x, int* y, int* w, int* h) {
+    if (!x || !y || !w || !h) return;
+    RECT r = {0, 0, 0, 0};
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &r, 0);
+    *x = r.left;
+    *y = r.top;
+    *w = r.right - r.left;
+    *h = r.bottom - r.top;
+}
+
 void klio_win_set_title(KlioWindow* kw, const char* title) {
     if (!kw || !title) return;
     SetWindowTextA(kw->hwnd, title);
 }
 
-// Window icon from PNG bytes: decode + HICON via WM_SETICON belongs to the
-// Windows bring-up alongside the PE icon-resource patcher; no-op until then.
+// PNG bytes as a 32-bit icon with its alpha, or null.
+static HICON klioWinIconFromPng(const unsigned char* png, size_t len) {
+    if (!png || len == 0) return nullptr;
+    sk_sp<SkData> data = SkData::MakeWithoutCopy(png, len);
+    std::unique_ptr<SkCodec> codec = SkPngDecoder::Decode(data, nullptr);
+    if (!codec) return nullptr;
+    const SkImageInfo info = codec->getInfo()
+                                 .makeColorType(kBGRA_8888_SkColorType)
+                                 .makeAlphaType(kUnpremul_SkAlphaType);
+    const int w = info.width();
+    const int h = info.height();
+    if (w <= 0 || h <= 0) return nullptr;
+    BITMAPV5HEADER bi = {};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = w;
+    bi.bV5Height = -h;  // top-down
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC dc = GetDC(nullptr);
+    HBITMAP color = CreateDIBSection(dc, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (!color || !bits) return nullptr;
+    if (codec->getPixels(info, bits, static_cast<size_t>(w) * 4) != SkCodec::kSuccess) {
+        DeleteObject(color);
+        return nullptr;
+    }
+    HBITMAP mask = CreateBitmap(w, h, 1, 1, nullptr);
+    ICONINFO ii = {};
+    ii.fIcon = TRUE;
+    ii.hbmColor = color;
+    ii.hbmMask = mask;
+    HICON icon = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return icon;
+}
+
+// The window's icon (the title bar's and the taskbar's) from PNG bytes.
 void klio_win_set_icon_png(KlioWindow* kw, const unsigned char* png, size_t len) {
-    (void)kw;
-    (void)png;
-    (void)len;
+    if (!kw) return;
+    HICON icon = klioWinIconFromPng(png, len);
+    if (!icon) return;
+    SendMessageW(kw->hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));
+    SendMessageW(kw->hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
+    if (kw->icon) DestroyIcon(kw->icon);
+    kw->icon = icon;
+}
+
+// A window's icon (Compose's Window(icon)) from a drawn surface.
+void klio_win_set_icon_surface(KlioWindow* kw, KlioSurface* s) {
+    if (!kw || !s) return;
+    size_t len = 0;
+    uint8_t* png = klio_skia_encode_png(s, &len);
+    if (!png) return;
+    klio_win_set_icon_png(kw, png, len);
+    klio_skia_free_buffer(png);
 }
 
 void klio_win_set_size(KlioWindow* kw, int w, int h) {
@@ -1926,7 +3706,109 @@ void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
     if (kw->surface) klio_skia_free(kw->surface);
     DestroyWindow(kw->hwnd);
+    if (kw->icon) DestroyIcon(kw->icon);
+    if (kw->menu) DestroyMenu(kw->menu);
+    for (HBITMAP b : kw->menuBitmaps) DeleteObject(b);
     delete kw;
+}
+
+// The host clipboard, as text: a count that moves whenever any application
+// changes it (-1 when the host has none), its text as malloc'd UTF-8 that
+// klio_skia_free_cstr frees (null when it holds no text), and replacing its
+// contents with a text (null empties it).
+// The text is CF_UNICODETEXT, whose lines end in CR LF where the program's
+// end in LF, as the desktop translates them. Setting it needs a window to own
+// the clipboard: a message-only one.
+static HWND klioWinClipOwner() {
+    static HWND owner = nullptr;
+    if (!owner) {
+        owner = CreateWindowExW(0, L"STATIC", L"klio clipboard", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                                nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    return owner;
+}
+
+// Another process may hold the clipboard open for a moment.
+static bool klioWinOpenClip() {
+    for (int i = 0; i < 20; i++) {
+        if (OpenClipboard(klioWinClipOwner())) return true;
+        Sleep(5);
+    }
+    return false;
+}
+
+long long klio_clip_change_count(void) {
+    return static_cast<long long>(GetClipboardSequenceNumber());
+}
+
+char* klio_clip_get_text(size_t* len) {
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !klioWinOpenClip()) return nullptr;
+    std::string text;
+    bool got = false;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const wchar_t* w = static_cast<const wchar_t*>(GlobalLock(h));
+        if (w) {
+            const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+            if (n > 0) {
+                std::string raw(static_cast<size_t>(n), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, w, -1, &raw[0], n, nullptr, nullptr);
+                raw.resize(static_cast<size_t>(n - 1));
+                text.reserve(raw.size());
+                for (size_t i = 0; i < raw.size(); i++) {
+                    if (raw[i] == '\r' && i + 1 < raw.size() && raw[i + 1] == '\n') continue;
+                    text.push_back(raw[i]);
+                }
+                got = true;
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    if (!got) return nullptr;
+    char* out = static_cast<char*>(std::malloc(text.size() + 1));
+    if (!out) return nullptr;
+    std::memcpy(out, text.data(), text.size());
+    out[text.size()] = 0;
+    if (len) *len = text.size();
+    return out;
+}
+
+void klio_clip_set_text(const char* utf8, size_t len) {
+    if (!klioWinOpenClip()) return;
+    EmptyClipboard();
+    if (utf8) {
+        std::string text;
+        text.reserve(len);
+        for (size_t i = 0; i < len; i++) {
+            if (utf8[i] == '\n' && (i == 0 || utf8[i - 1] != '\r')) text.push_back('\r');
+            text.push_back(utf8[i]);
+        }
+        const int n = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (static_cast<size_t>(n) + 1) * sizeof(wchar_t));
+        if (g) {
+            wchar_t* w = static_cast<wchar_t*>(GlobalLock(g));
+            if (n > 0) MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), w, n);
+            w[n] = 0;
+            GlobalUnlock(g);
+            if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
+        }
+    }
+    CloseClipboard();
+}
+
+// The host's default locale as a language tag, malloc'd (klio_skia_free_cstr
+// frees it), as the JVM takes it on Windows: the user's UI language.
+char* klio_host_locale(void) {
+    wchar_t name[LOCALE_NAME_MAX_LENGTH];
+    const LCID lcid = MAKELCID(GetUserDefaultUILanguage(), SORT_DEFAULT);
+    if (LCIDToLocaleName(lcid, name, LOCALE_NAME_MAX_LENGTH, 0) == 0) return nullptr;
+    const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return nullptr;
+    char* out = static_cast<char*>(std::malloc(static_cast<size_t>(n)));
+    if (!out) return nullptr;
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, out, n, nullptr, nullptr);
+    return out;
 }
 
 }  // extern "C"
@@ -1970,6 +3852,20 @@ struct KlioWindow {
     void (*resizeCb)(void*, int, int);
     void* resizeCtx;
     id resizeObserver;
+    // klio_win_poll_event's queue and the input state it is translated with.
+    std::deque<KlioEv> events;
+    id focusObservers[2];
+    NSTrackingArea* tracking;
+    int buttons;        // the mouse buttons held, one bit per KLIO_BTN_* - 1
+    bool closeRequested;  // the close button was pressed (the legacy poll's close)
+    KlioScriptState script;  // its progress through the scripted input
+    KlioFrameReport frameReport;
+    id delegate;        // KlioWindowDelegate: the close button asks, it does not close
+    bool resizable;
+    // The window's menu bar: the application's main menu while it is key.
+    NSMenu* mainMenu;
+    id menuTarget;      // KlioMenuTarget: its items' action
+    std::vector<KlioMenuEntry> menuEntries;
 #if defined(KLIO_METAL)
     CAMetalLayer* metalLayer;  // nil when the raster path is in use
     id<MTLDevice> device;
@@ -2038,25 +3934,42 @@ static bool klioMetalInit(KlioWindow* kw, int w, int h) {
 }
 #endif  // KLIO_METAL
 
+// The application's name, for its menu.
+static NSString*& klioAppName() {
+    static NSString* name = nil;
+    return name;
+}
+
+// The main menu while no window with a menu bar is key.
+static NSMenu*& klioDefaultMainMenu() {
+    static NSMenu* menu = nil;
+    return menu;
+}
+
+// A main menu's first item: the application menu with Quit (Cmd-Q).
+static void klioAddAppMenu(NSMenu* menuBar) {
+    NSMenuItem* appItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:appItem];
+    NSMenu* appMenu = [[NSMenu alloc] init];
+    [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", klioAppName() ?: @"klio"]
+                       action:@selector(terminate:)
+                keyEquivalent:@"q"];
+    [appItem setSubmenu:appMenu];
+    [appMenu release];
+    [appItem release];
+}
+
 // Minimal main menu so the window behaves like a real app: Quit (Cmd-Q). Window
 // close is left to the app to wire if it wants it. Once per process.
 static void klioSetupMenu(const char* title) {
     static bool done = false;
     if (done) return;
     done = true;
-    NSString* name = title ? [NSString stringWithUTF8String:title] : @"klio";
+    klioAppName() = [(title ? [NSString stringWithUTF8String:title] : @"klio") retain];
     NSMenu* menuBar = [[NSMenu alloc] init];
-    NSMenuItem* appItem = [[NSMenuItem alloc] init];
-    [menuBar addItem:appItem];
+    klioAddAppMenu(menuBar);
     [NSApp setMainMenu:menuBar];
-    NSMenu* appMenu = [[NSMenu alloc] init];
-    [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", name]
-                       action:@selector(terminate:)
-                keyEquivalent:@"q"];
-    [appItem setSubmenu:appMenu];
-    [appMenu release];
-    [appItem release];
-    [menuBar release];
+    klioDefaultMainMenu() = menuBar;  // kept
 }
 
 // Resize the Metal drawable to a new point size at the current backing scale.
@@ -2090,7 +4003,488 @@ static void klioWinResized(KlioWindow* kw) {
     kw->resizeCb(kw->resizeCtx, nw, nh);
 }
 
+extern "C" void klio_win_close(KlioWindow* kw);  // used by the open error path
+
+// A window that takes the keyboard undecorated too (a borderless NSWindow
+// would not become key).
+@interface KlioNSWindow : NSWindow
+@end
+
+@implementation KlioNSWindow
+- (BOOL)canBecomeKeyWindow {
+    return YES;
+}
+- (BOOL)canBecomeMainWindow {
+    return YES;
+}
+@end
+
+// The close button asks the program, as a desktop window's does: the window
+// stays open until the program closes it.
+@interface KlioWindowDelegate : NSObject <NSWindowDelegate>
+@property(nonatomic, assign) KlioWindow* kw;
+@end
+
+@implementation KlioWindowDelegate
+- (BOOL)windowShouldClose:(NSWindow*)sender {
+    (void)sender;
+    if (_kw) {
+        _kw->closeRequested = true;
+        _kw->events.push_back(klioSimpleEv(KLIO_EV_CLOSE));
+    }
+    return NO;
+}
+@end
+
+// A menu item's action: the item's id queued on its window, as
+// KLIO_EV_MENU.
+@interface KlioMenuTarget : NSObject
+@property(nonatomic, assign) KlioWindow* kw;
+- (void)klioMenuAction:(id)sender;
+@end
+
+@implementation KlioMenuTarget
+- (void)klioMenuAction:(id)sender {
+    if (!_kw) return;
+    _kw->events.push_back(klioSimpleEv(KLIO_EV_MENU, static_cast<double>([(NSMenuItem*)sender tag])));
+}
+@end
+
+// An AWT key code as a menu item's key equivalent, or "" for none.
+static NSString* klioKeyEquivalent(int vk) {
+    unichar c = 0;
+    if (vk >= 'A' && vk <= 'Z') c = static_cast<unichar>(vk - 'A' + 'a');
+    else if (vk >= '0' && vk <= '9') c = static_cast<unichar>(vk);
+    else if (vk >= 112 && vk <= 123) c = static_cast<unichar>(NSF1FunctionKey + (vk - 112));
+    else {
+        switch (vk) {
+            case 10: c = '\r'; break;
+            case 8: c = 0x08; break;
+            case 9: c = '\t'; break;
+            case 27: c = 0x1B; break;
+            case 32: c = ' '; break;
+            case 127: c = NSDeleteFunctionKey; break;
+            case 44: c = ','; break;
+            case 45: c = '-'; break;
+            case 46: c = '.'; break;
+            case 47: c = '/'; break;
+            case 59: c = ';'; break;
+            case 61: c = '='; break;
+            case 91: c = '['; break;
+            case 92: c = '\\'; break;
+            case 93: c = ']'; break;
+            case 192: c = '`'; break;
+            case 222: c = '\''; break;
+            case 37: c = NSLeftArrowFunctionKey; break;
+            case 38: c = NSUpArrowFunctionKey; break;
+            case 39: c = NSRightArrowFunctionKey; break;
+            case 40: c = NSDownArrowFunctionKey; break;
+            case 36: c = NSHomeFunctionKey; break;
+            case 35: c = NSEndFunctionKey; break;
+            case 33: c = NSPageUpFunctionKey; break;
+            case 34: c = NSPageDownFunctionKey; break;
+            default: return @"";
+        }
+    }
+    return [NSString stringWithCharacters:&c length:1];
+}
+
+static NSEventModifierFlags klioMenuModifierMask(int mods) {
+    NSEventModifierFlags mask = 0;
+    if (mods & KLIO_MOD_SHIFT) mask |= NSEventModifierFlagShift;
+    if (mods & KLIO_MOD_CTRL) mask |= NSEventModifierFlagControl;
+    if (mods & KLIO_MOD_ALT) mask |= NSEventModifierFlagOption;
+    if (mods & KLIO_MOD_META) mask |= NSEventModifierFlagCommand;
+    return mask;
+}
+
+static NSString* klioNSString(const std::string& s) {
+    NSString* str = [[[NSString alloc] initWithBytes:s.data() length:s.size() encoding:NSUTF8StringEncoding] autorelease];
+    return str ?: @"";
+}
+
+// The window's main menu from its entries: the application menu, then its
+// menus, as AWT's screen menu bar shows a frame's JMenuBar. Mnemonics have
+// no place in macOS menus.
+static void klioFillCocoaMenu(NSMenu* root, const std::vector<KlioMenuEntry>& entries, id target);
+
+static NSMenu* klioBuildCocoaMenu(KlioWindow* kw) {
+    NSMenu* bar = [[NSMenu alloc] init];
+    [bar setAutoenablesItems:NO];
+    klioAddAppMenu(bar);
+    klioFillCocoaMenu(bar, kw->menuEntries, kw->menuTarget);
+    return bar;
+}
+
+// Adds the entries' menus and items to a menu, their actions to the target.
+static void klioFillCocoaMenu(NSMenu* root, const std::vector<KlioMenuEntry>& entries, id target) {
+    std::vector<NSMenu*> stack = {root};
+    for (const KlioMenuEntry& e : entries) {
+        if (e.depth < 0 || static_cast<size_t>(e.depth) >= stack.size()) continue;
+        stack.resize(static_cast<size_t>(e.depth) + 1);
+        NSMenu* parent = stack.back();
+        if (e.kind == 's') {
+            [parent addItem:[NSMenuItem separatorItem]];
+            continue;
+        }
+        NSMenuItem* item = [[[NSMenuItem alloc] initWithTitle:klioNSString(e.text)
+                                                       action:nil
+                                                keyEquivalent:@""] autorelease];
+        [item setTag:e.id];
+        [item setEnabled:e.enabled];
+        if (e.kind == 'm') {
+            NSMenu* sub = [[[NSMenu alloc] initWithTitle:klioNSString(e.text)] autorelease];
+            [sub setAutoenablesItems:NO];
+            [item setSubmenu:sub];
+            [parent addItem:item];
+            stack.push_back(sub);
+            continue;
+        }
+        [item setTarget:target];
+        [item setAction:@selector(klioMenuAction:)];
+        if (e.kind == 'c' || e.kind == 'r') {
+            [item setState:e.state ? NSControlStateValueOn : NSControlStateValueOff];
+        }
+        if (e.keycode != 0) {
+            NSString* key = klioKeyEquivalent(e.keycode);
+            if ([key length] > 0) {
+                [item setKeyEquivalent:key];
+                [item setKeyEquivalentModifierMask:klioMenuModifierMask(e.mods)];
+            }
+        }
+        [parent addItem:item];
+    }
+}
+
+// Debug: $KLIO_MENU_DUMP prints a window's native menu bar on stderr each
+// time it is set, as the platform holds it.
+static void klioDumpCocoaMenu(NSMenu* menu, int depth) {
+    for (NSMenuItem* item in [menu itemArray]) {
+        std::string line(static_cast<size_t>(depth) * 2, ' ');
+        if ([item isSeparatorItem]) {
+            fprintf(stderr, "[menu] %s---\n", line.c_str());
+            continue;
+        }
+        line += [[item title] UTF8String];
+        if (![item isEnabled]) line += " [disabled]";
+        if ([item state] == NSControlStateValueOn) line += " [on]";
+        if ([[item keyEquivalent] length] > 0) {
+            const NSEventModifierFlags m = [item keyEquivalentModifierMask];
+            line += " [key ";
+            if (m & NSEventModifierFlagControl) line += "ctrl+";
+            if (m & NSEventModifierFlagOption) line += "alt+";
+            if (m & NSEventModifierFlagShift) line += "shift+";
+            if (m & NSEventModifierFlagCommand) line += "cmd+";
+            const unichar k = [[item keyEquivalent] characterAtIndex:0];
+            char buf[16];
+            if (k >= 0x20 && k < 0x7F) snprintf(buf, sizeof buf, "%c", static_cast<char>(k));
+            else snprintf(buf, sizeof buf, "U+%04X", k);
+            line += buf;
+            line += "]";
+        }
+        fprintf(stderr, "[menu] %s\n", line.c_str());
+        if ([item submenu]) klioDumpCocoaMenu([item submenu], depth + 1);
+    }
+}
+
+// The menu item with the id, anywhere under the menu.
+static NSMenuItem* klioCocoaMenuItem(NSMenu* menu, int id) {
+    for (NSMenuItem* item in [menu itemArray]) {
+        if ([item isSeparatorItem]) continue;
+        if ([item submenu]) {
+            if (NSMenuItem* found = klioCocoaMenuItem([item submenu], id)) return found;
+        } else if ([item tag] == id && [item action] == @selector(klioMenuAction:)) {
+            return item;
+        }
+    }
+    return nil;
+}
+
+// Chooses the item at a path of titles as a click on it does: through its
+// menu's action, when it and the menus it is in are enabled.
+static void klioCocoaPerformPath(NSMenu* root, const std::vector<KlioMenuEntry>& entries, const std::string& path) {
+    if (!root) return;
+    const int index = klioMenuFindPath(entries, path);
+    if (index < 0) return;
+    NSMenuItem* item = klioCocoaMenuItem(root, entries[static_cast<size_t>(index)].id);
+    if (!item) return;
+    for (NSMenu* menu = [item menu]; menu && [menu supermenu]; menu = [menu supermenu]) {
+        NSMenu* super = [menu supermenu];
+        const NSInteger at = [super indexOfItemWithSubmenu:menu];
+        if (at >= 0 && ![[super itemAtIndex:at] isEnabled]) return;
+    }
+    if (![item isEnabled]) return;
+    NSMenu* menu = [item menu];
+    [menu performActionForItemAtIndex:[menu indexOfItem:item]];
+}
+
+static void klioCocoaPerformMenuPath(KlioWindow* kw, const std::string& path) {
+    klioCocoaPerformPath(kw->mainMenu, kw->menuEntries, path);
+}
+
+// The main screen's height, for AppKit's bottom-left screen coordinates to
+// become the desktop's top-left ones.
+static CGFloat klioMainScreenHeight() {
+    NSScreen* main = [[NSScreen screens] firstObject];
+    return main ? [main frame].size.height : 0;
+}
+
+// The window frame's top-left, in points from the main screen's top-left.
+static void klioCocoaTopLeft(KlioWindow* kw, int* x, int* y) {
+    const NSRect f = [kw->window frame];
+    *x = static_cast<int>(f.origin.x);
+    *y = static_cast<int>(klioMainScreenHeight() - (f.origin.y + f.size.height));
+}
+
+static int klioCocoaPlacement(KlioWindow* kw) {
+    if ([kw->window styleMask] & NSWindowStyleMaskFullScreen) return KLIO_PLACEMENT_FULLSCREEN;
+    if ([kw->window isZoomed]) return KLIO_PLACEMENT_MAXIMIZED;
+    return KLIO_PLACEMENT_FLOATING;
+}
+
+// Debug: $KLIO_SKIA_DUMP writes a presented frame to that PNG path, the first
+// one or the $KLIO_SKIA_DUMP_AT-th, so a window's render (a GPU one included)
+// can be inspected without on-screen capture.
+static void klioPresentDump(KlioSurface* surface) {
+    const char* dump = std::getenv("KLIO_SKIA_DUMP");
+    if (!dump || !surface) return;
+    static int presents = 0;
+    const char* at = std::getenv("KLIO_SKIA_DUMP_AT");
+    const int target = at ? std::atoi(at) : 1;
+    if (++presents != target) return;
+    const int rc = klio_skia_save_png(surface, dump);
+    if (std::getenv("KLIO_SKIA_VERBOSE"))
+        fprintf(stderr, "[klio-skia] present %d dump rc=%d -> %s\n", presents, rc, dump);
+}
+
+// The open windows by their NSWindow: AppKit's event queue is the process's, so
+// an event is translated for the window it happened in.
+static std::vector<KlioWindow*>& klioCocoaWindows() {
+    static std::vector<KlioWindow*> windows;
+    return windows;
+}
+
+static KlioWindow* klioCocoaWindowOf(NSWindow* window) {
+    if (!window) return nullptr;
+    for (KlioWindow* kw : klioCocoaWindows()) {
+        if (kw->window == window) return kw;
+    }
+    return nullptr;
+}
+
+// The modifiers the desktop reports, from AppKit's flags: Fn is not one.
+static int klioCocoaMods(NSEventModifierFlags f) {
+    int m = 0;
+    if (f & NSEventModifierFlagShift) m |= KLIO_MOD_SHIFT;
+    if (f & NSEventModifierFlagControl) m |= KLIO_MOD_CTRL;
+    if (f & NSEventModifierFlagOption) m |= KLIO_MOD_ALT;
+    if (f & NSEventModifierFlagCommand) m |= KLIO_MOD_META;
+    if (f & NSEventModifierFlagCapsLock) m |= KLIO_MOD_CAPS_LOCK;
+    return m;
+}
+
+// A mouse event's button: AppKit numbers them left 0, right 1, middle 2, then
+// back 3 and forward 4.
+static int klioCocoaButton(NSEvent* ev) {
+    switch ([ev buttonNumber]) {
+        case 0: return KLIO_BTN_PRIMARY;
+        case 1: return KLIO_BTN_SECONDARY;
+        case 2: return KLIO_BTN_TERTIARY;
+        case 3: return KLIO_BTN_BACK;
+        case 4: return KLIO_BTN_FORWARD;
+        default: return KLIO_BTN_NONE;
+    }
+}
+
+// Which device-dependent flag a modifier key's own state is in: the left and
+// right keys of a pair are told apart (NX_DEVICE*KEYMASK).
+static NSEventModifierFlags klioCocoaKeyFlag(unsigned short code) {
+    switch (code) {
+        case 0x38: return 0x02;      // left shift
+        case 0x3C: return 0x04;      // right shift
+        case 0x3B: return 0x01;      // left control
+        case 0x3E: return 0x2000;    // right control
+        case 0x3A: return 0x20;      // left option
+        case 0x3D: return 0x40;      // right option
+        case 0x37: return 0x08;      // left command
+        case 0x36: return 0x10;      // right command
+        case 0x39: return NSEventModifierFlagCapsLock;
+        default: return 0;
+    }
+}
+
+// Translates one AppKit event into the events of the window it happened in.
+// Clears *forward for the events AppKit must not also handle (keys, which it
+// would answer with a beep; a Command shortcut goes to the menu first).
+static void klioCocoaTranslate(NSEvent* ev, bool* forward) {
+    const NSEventType type = [ev type];
+    KlioWindow* kw = klioCocoaWindowOf([ev window]);
+    if (!kw) return;
+    const int mods = klioCocoaMods([ev modifierFlags]);
+    switch (type) {
+        case NSEventTypeLeftMouseDown:
+        case NSEventTypeRightMouseDown:
+        case NSEventTypeOtherMouseDown:
+        case NSEventTypeLeftMouseUp:
+        case NSEventTypeRightMouseUp:
+        case NSEventTypeOtherMouseUp:
+        case NSEventTypeMouseMoved:
+        case NSEventTypeLeftMouseDragged:
+        case NSEventTypeRightMouseDragged:
+        case NSEventTypeOtherMouseDragged:
+        case NSEventTypeMouseEntered:
+        case NSEventTypeMouseExited:
+        case NSEventTypeScrollWheel: {
+            // Content-view coordinates, top-left origin, whole points as AWT's.
+            const NSPoint p = [kw->view convertPoint:[ev locationInWindow] fromView:nil];
+            const double x = static_cast<int>(p.x);
+            const double y = static_cast<int>(kw->h - p.y);
+            const bool inside = x >= 0 && y >= 0 && x < kw->w && y < kw->h;
+            if (type == NSEventTypeLeftMouseDown || type == NSEventTypeRightMouseDown ||
+                type == NSEventTypeOtherMouseDown) {
+                const int button = klioCocoaButton(ev);
+                if (!inside || button == KLIO_BTN_NONE) return;  // the title bar's
+                kw->buttons |= 1 << (button - 1);
+                kw->events.push_back(klioPointerEv(KLIO_PTR_PRESS, x, y, button, kw->buttons, mods));
+            } else if (type == NSEventTypeLeftMouseUp || type == NSEventTypeRightMouseUp ||
+                       type == NSEventTypeOtherMouseUp) {
+                const int button = klioCocoaButton(ev);
+                if (button == KLIO_BTN_NONE || !(kw->buttons & (1 << (button - 1)))) return;
+                kw->buttons &= ~(1 << (button - 1));
+                kw->events.push_back(klioPointerEv(KLIO_PTR_RELEASE, x, y, button, kw->buttons, mods));
+            } else if (type == NSEventTypeMouseEntered) {
+                kw->events.push_back(klioPointerEv(KLIO_PTR_ENTER, x, y, KLIO_BTN_NONE, kw->buttons, mods));
+            } else if (type == NSEventTypeMouseExited) {
+                kw->events.push_back(klioPointerEv(KLIO_PTR_EXIT, x, y, KLIO_BTN_NONE, kw->buttons, mods));
+            } else if (type == NSEventTypeScrollWheel) {
+                if (!inside) return;
+                // AWT's wheel rotation runs opposite to AppKit's deltas.
+                kw->events.push_back(klioPointerEv(KLIO_PTR_SCROLL, x, y, KLIO_BTN_NONE, kw->buttons,
+                                                   mods, -[ev deltaX], -[ev deltaY]));
+            } else {
+                // A drag goes on outside the window; a hover stops at its edge.
+                if (!inside && kw->buttons == 0) return;
+                kw->events.push_back(klioPointerEv(KLIO_PTR_MOVE, x, y, KLIO_BTN_NONE, kw->buttons, mods));
+            }
+            return;
+        }
+        case NSEventTypeKeyDown:
+        case NSEventTypeKeyUp: {
+            *forward = false;
+            const bool down = type == NSEventTypeKeyDown;
+            // The application menu's shortcuts (Quit) go through AppKit; a
+            // window menu bar's reach the program with the key, which matches
+            // them as the desktop does.
+            if (down && ([ev modifierFlags] & NSEventModifierFlagCommand)) {
+                NSMenu* app = [[NSApp mainMenu] numberOfItems] > 0 ? [[[NSApp mainMenu] itemAtIndex:0] submenu] : nil;
+                if (app && [app performKeyEquivalent:ev]) return;
+            }
+            int vk = 0;
+            int loc = KLIO_LOC_STANDARD;
+            klioMacKey([ev keyCode], &vk, &loc);
+            NSString* chars = [ev characters];
+            const unsigned c = [chars length] > 0 ? [chars characterAtIndex:0] : 0;
+            kw->events.push_back(klioKeyEv(down, vk, loc, klioAwtKeyChar(vk, c), mods));
+            // The characters a press types, unless Command makes it a shortcut;
+            // a function key's character (AppKit's private-use range) types nothing.
+            if (down && !([ev modifierFlags] & NSEventModifierFlagCommand) && [chars length] > 0 &&
+                !(c >= 0xF700 && c <= 0xF8FF)) {
+                klioPushText(kw->events, [chars UTF8String]);
+            }
+            return;
+        }
+        case NSEventTypeFlagsChanged: {
+            *forward = false;
+            const unsigned short code = [ev keyCode];
+            const NSEventModifierFlags flag = klioCocoaKeyFlag(code);
+            if (flag == 0) return;
+            int vk = 0;
+            int loc = KLIO_LOC_STANDARD;
+            klioMacKey(code, &vk, &loc);
+            const bool down = ([ev modifierFlags] & flag) != 0;
+            kw->events.push_back(klioKeyEv(down, vk, loc, KLIO_CHAR_UNDEFINED, mods));
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+// Reports a moved window, a changed placement, and a content size changed
+// without a live resize callback, as a resize with the drawable or surface
+// resized to it.
+static void klioCocoaCheckWindow(KlioWindow* kw) {
+    int x = 0;
+    int y = 0;
+    klioCocoaTopLeft(kw, &x, &y);
+    klioReportFrame(kw->frameReport, kw->events, x, y, klioCocoaPlacement(kw), [kw->window isMiniaturized]);
+    if ([kw->window isMiniaturized]) return;
+    const int nw = static_cast<int>([kw->view bounds].size.width);
+    const int nh = static_cast<int>([kw->view bounds].size.height);
+    if ((nw == kw->w && nh == kw->h) || nw <= 0 || nh <= 0) return;
+#if defined(KLIO_METAL)
+    if (kw->grContext && kw->metalLayer) {
+        klioApplyMetalResize(kw, nw, nh);
+        kw->metalLayer.frame = NSMakeRect(0, 0, nw, nh);
+    } else
+#endif
+    {
+        if (kw->surface) klio_skia_free(kw->surface);
+        kw->surface = klio_skia_new(nw, nh);
+    }
+    kw->w = nw;
+    kw->h = nh;
+    kw->events.push_back(klioSimpleEv(KLIO_EV_RESIZE, nw, nh));
+}
+
 extern "C" {
+
+// Waits up to timeoutMs for the window's next input event and writes its
+// values to out (KLIO_EV_VALUES doubles); returns its type (window_events.h),
+// or KLIO_EV_NONE when none came. Every event AppKit has ready is translated
+// for the window it belongs to before the first is returned.
+// The window's next event, a scripted menu choice performed on the way.
+static int klioCocoaPop(KlioWindow* kw, double* out) {
+    for (;;) {
+        const int type = klioPopEv(kw->events, out);
+        if (type != KLIO_EV_MENU_PATH) return type;
+        const size_t at = static_cast<size_t>(out[0]);
+        if (at < klioScriptTexts().size()) klioCocoaPerformMenuPath(kw, klioScriptTexts()[at]);
+    }
+}
+
+int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
+    if (!kw) return KLIO_EV_CLOSE;
+    klioScriptTick(kw->script, kw->events);
+    if (!kw->events.empty()) return klioCocoaPop(kw, out);
+    @autoreleasepool {
+        NSDate* until = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
+        while (kw->events.empty()) {
+            NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                             untilDate:until
+                                                inMode:NSDefaultRunLoopMode
+                                               dequeue:YES];
+            if (!ev) break;
+            until = [NSDate distantPast];
+            bool forward = true;
+            klioCocoaTranslate(ev, &forward);
+            if (forward) [NSApp sendEvent:ev];
+            for (KlioWindow* w : klioCocoaWindows()) klioCocoaCheckWindow(w);
+        }
+        klioCocoaCheckWindow(kw);
+    }
+    return klioCocoaPop(kw, out);
+}
+
+// Queues an event on the window as if its platform had sent it (the values as
+// klio_win_poll_event reports them), for programs that drive a window's input.
+void klio_win_post_event(KlioWindow* kw, int type, const double* values) {
+    if (!kw || !values) return;
+    KlioEv e;
+    e.type = type;
+    for (int i = 0; i < KLIO_EV_VALUES; i++) e.v[i] = values[i];
+    kw->events.push_back(e);
+}
 
 // Set (or clear, with null) the live-resize render callback. The app sets it around
 // a poll so the callback value stays live for the call's duration.
@@ -2109,6 +4503,10 @@ void klio_win_set_title(KlioWindow* kw, const char* title) {
 
 // The app icon (Dock + Cmd-Tab) from encoded PNG bytes; NSImage decodes PNG
 // natively. Written alongside the rest of the Cocoa backend, unverified here.
+// A macOS window has no icon of its own (the Dock's is the application's),
+// so a window's icon changes nothing, as on the desktop.
+void klio_win_set_icon_surface(KlioWindow*, KlioSurface*) {}
+
 void klio_win_set_icon_png(KlioWindow* kw, const unsigned char* png, size_t len) {
     (void)kw;
     if (!png || len == 0) return;
@@ -2133,10 +4531,10 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         klioSetupMenu(title);
         NSRect frame = NSMakeRect(0, 0, w, h);
-        NSWindow* window = [[NSWindow alloc]
+        NSWindow* window = [[KlioNSWindow alloc]
             initWithContentRect:frame
                       styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                                 NSWindowStyleMaskResizable)
+                                 NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
                         backing:NSBackingStoreBuffered
                           defer:NO];
         if (!window) return nullptr;
@@ -2153,6 +4551,51 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         kw->surface = nullptr;
         kw->resizeCb = nullptr;
         kw->resizeCtx = nullptr;
+        kw->buttons = 0;
+        kw->closeRequested = false;
+        kw->resizable = true;
+        klioCocoaWindows().push_back(kw);
+        KlioWindowDelegate* delegate = [[KlioWindowDelegate alloc] init];
+        delegate.kw = kw;
+        [window setDelegate:delegate];
+        kw->delegate = delegate;
+        // The platform's default place: cascaded from the top-left, as AWT's
+        // location by platform puts a frame.
+        static NSPoint cascade = NSZeroPoint;
+        if (NSEqualPoints(cascade, NSZeroPoint)) {
+            NSScreen* screen = [NSScreen mainScreen];
+            const NSRect visible = screen ? [screen visibleFrame] : NSMakeRect(0, 0, 0, 0);
+            cascade = NSMakePoint(visible.origin.x, visible.origin.y + visible.size.height);
+        }
+        cascade = [window cascadeTopLeftFromPoint:cascade];
+        // Moves over the window, and its enters and exits, reach the event queue.
+        [window setAcceptsMouseMovedEvents:YES];
+        kw->tracking = [[NSTrackingArea alloc]
+            initWithRect:NSZeroRect
+                 options:(NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                          NSTrackingInVisibleRect)
+                   owner:view
+                userInfo:nil];
+        [view addTrackingArea:kw->tracking];
+        // The window gaining and losing the keyboard focus.
+        kw->focusObservers[0] = [[[NSNotificationCenter defaultCenter]
+            addObserverForName:NSWindowDidBecomeKeyNotification
+                        object:window
+                         queue:nil
+                    usingBlock:^(NSNotification* note) {
+                        (void)note;
+                        kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
+                        NSMenu* menu = kw->mainMenu ?: klioDefaultMainMenu();
+                        if (menu) [NSApp setMainMenu:menu];
+                    }] retain];
+        kw->focusObservers[1] = [[[NSNotificationCenter defaultCenter]
+            addObserverForName:NSWindowDidResignKeyNotification
+                        object:window
+                         queue:nil
+                    usingBlock:^(NSNotification* note) {
+                        (void)note;
+                        kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
+                    }] retain];
         // Fires during a live resize (the modal drag) — reflows the UI in realtime
         // when a render callback is registered for the current poll.
         kw->resizeObserver = [[[NSNotificationCenter defaultCenter]
@@ -2171,8 +4614,7 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         [view setWantsLayer:YES];
         kw->surface = klio_skia_new(w, h);
         if (!kw->surface) {
-            [window close];
-            delete kw;
+            klio_win_close(kw);
             return nullptr;
         }
         if (std::getenv("KLIO_SKIA_VERBOSE"))
@@ -2229,17 +4671,7 @@ void klio_win_present(KlioWindow* kw) {
     if (kw->grContext && kw->metalLayer) {
         if (!kw->surface || !kw->drawable) return;
         kw->grContext->flushAndSubmit(kw->surface->surface.get(), GrSyncCpu::kNo);
-        // Debug: $KLIO_SKIA_DUMP reads back the first rendered GPU frame to a PNG so
-        // the on-GPU render can be inspected without on-screen capture.
-        if (const char* dump = std::getenv("KLIO_SKIA_DUMP")) {
-            static bool dumped = false;
-            if (!dumped) {
-                dumped = true;
-                const int rc = klio_skia_save_png(kw->surface, dump);
-                if (std::getenv("KLIO_SKIA_VERBOSE"))
-                    fprintf(stderr, "[klio-skia] present dump rc=%d -> %s\n", rc, dump);
-            }
-        }
+        klioPresentDump(kw->surface);
         @autoreleasepool {
             id<CAMetalDrawable> d = (id<CAMetalDrawable>)kw->drawable;
             id<MTLCommandBuffer> cmd = [kw->queue commandBuffer];
@@ -2254,6 +4686,7 @@ void klio_win_present(KlioWindow* kw) {
     }
 #endif
     if (!kw->surface) return;
+    klioPresentDump(kw->surface);
     SkPixmap pm;
     if (!kw->surface->surface->peekPixels(&pm)) return;
     @autoreleasepool {
@@ -2311,7 +4744,7 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
         }
         [NSApp sendEvent:ev];
         // A closed window is no longer visible.
-        if (![kw->window isVisible]) return 2;
+        if (kw->closeRequested) return 2;
         // A resized content view: resize the drawable (Metal) or the raster surface.
         const int nw = static_cast<int>([kw->view bounds].size.width);
         const int nh = static_cast<int>([kw->view bounds].size.height);
@@ -2340,12 +4773,146 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
     }
 }
 
+// Sets one of a window's KLIO_WIN_* properties: whether the user can resize
+// it, whether it has a title bar and border, whether it floats above other
+// windows, whether it shows, whether it is minimized, its placement.
+void klio_win_set_flag(KlioWindow* kw, int which, int value) {
+    if (!kw || !kw->window) return;
+    @autoreleasepool {
+        NSWindow* w = kw->window;
+        switch (which) {
+            case KLIO_WIN_RESIZABLE:
+                kw->resizable = value != 0;
+                if (value) [w setStyleMask:[w styleMask] | NSWindowStyleMaskResizable];
+                else [w setStyleMask:[w styleMask] & ~NSWindowStyleMaskResizable];
+                break;
+            case KLIO_WIN_DECORATED: {
+                NSWindowStyleMask mask = value
+                    ? (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable)
+                    : NSWindowStyleMaskBorderless;
+                if (kw->resizable) mask |= NSWindowStyleMaskResizable;
+                // A new style mask keeps the window's frame, not its content size.
+                const NSRect content = [w contentRectForFrameRect:[w frame]];
+                [w setStyleMask:mask];
+                [w setFrame:[w frameRectForContentRect:content] display:YES];
+                break;
+            }
+            case KLIO_WIN_ALWAYS_ON_TOP:
+                [w setLevel:value ? NSFloatingWindowLevel : NSNormalWindowLevel];
+                break;
+            case KLIO_WIN_VISIBLE:
+                if (value) [w makeKeyAndOrderFront:nil];
+                else [w orderOut:nil];
+                break;
+            case KLIO_WIN_MINIMIZED:
+                if (value) [w miniaturize:nil];
+                else [w deminiaturize:nil];
+                break;
+            case KLIO_WIN_PLACEMENT: {
+                const int now = klioCocoaPlacement(kw);
+                if (now == value) break;
+                if (now == KLIO_PLACEMENT_FULLSCREEN || value == KLIO_PLACEMENT_FULLSCREEN) {
+                    [w toggleFullScreen:nil];
+                }
+                if (value == KLIO_PLACEMENT_MAXIMIZED && ![w isZoomed]) [w zoom:nil];
+                if (value == KLIO_PLACEMENT_FLOATING && [w isZoomed]) [w zoom:nil];
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+// Moves the window frame's top-left to (x, y), in points from the main
+// screen's top-left.
+void klio_win_set_position(KlioWindow* kw, int x, int y) {
+    if (!kw || !kw->window) return;
+    @autoreleasepool {
+        [kw->window setFrameTopLeftPoint:NSMakePoint(x, klioMainScreenHeight() - y)];
+    }
+}
+
+void klio_win_get_position(KlioWindow* kw, int* x, int* y) {
+    if (!kw || !kw->window || !x || !y) return;
+    klioCocoaTopLeft(kw, x, y);
+}
+
+// Resizes the window's frame, title bar and border included, keeping its
+// top-left where it is.
+void klio_win_set_frame_size(KlioWindow* kw, int w, int h) {
+    if (!kw || !kw->window || w <= 0 || h <= 0) return;
+    @autoreleasepool {
+        const NSRect f = [kw->window frame];
+        const CGFloat top = f.origin.y + f.size.height;
+        [kw->window setFrame:NSMakeRect(f.origin.x, top - h, w, h) display:YES];
+    }
+}
+
+void klio_win_get_frame_size(KlioWindow* kw, int* w, int* h) {
+    if (!kw || !kw->window || !w || !h) return;
+    const NSRect f = [kw->window frame];
+    *w = static_cast<int>(f.size.width);
+    *h = static_cast<int>(f.size.height);
+}
+
+// The main screen's area for windows (without the menu bar and the Dock), in
+// points from its top-left.
+void klio_win_screen_bounds(int* x, int* y, int* w, int* h) {
+    if (!x || !y || !w || !h) return;
+    @autoreleasepool {
+        NSScreen* screen = [NSScreen mainScreen];
+        if (!screen) {
+            *x = *y = *w = *h = 0;
+            return;
+        }
+        const NSRect v = [screen visibleFrame];
+        *x = static_cast<int>(v.origin.x);
+        *y = static_cast<int>(klioMainScreenHeight() - (v.origin.y + v.size.height));
+        *w = static_cast<int>(v.size.width);
+        *h = static_cast<int>(v.size.height);
+    }
+}
+
 void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
+    if (kw->delegate) {
+        [kw->window setDelegate:nil];
+        [kw->delegate release];
+        kw->delegate = nil;
+    }
+    auto& windows = klioCocoaWindows();
+    for (size_t i = 0; i < windows.size(); i++) {
+        if (windows[i] == kw) {
+            windows.erase(windows.begin() + static_cast<long>(i));
+            break;
+        }
+    }
     if (kw->resizeObserver) {
         [[NSNotificationCenter defaultCenter] removeObserver:kw->resizeObserver];
         [kw->resizeObserver release];
         kw->resizeObserver = nil;
+    }
+    for (id& observer : kw->focusObservers) {
+        if (observer) {
+            [[NSNotificationCenter defaultCenter] removeObserver:observer];
+            [observer release];
+            observer = nil;
+        }
+    }
+    if (kw->tracking) {
+        [kw->view removeTrackingArea:kw->tracking];
+        [kw->tracking release];
+        kw->tracking = nil;
+    }
+    if (kw->mainMenu) {
+        if ([NSApp mainMenu] == kw->mainMenu && klioDefaultMainMenu()) [NSApp setMainMenu:klioDefaultMainMenu()];
+        [kw->mainMenu release];
+        kw->mainMenu = nil;
+    }
+    if (kw->menuTarget) {
+        [kw->menuTarget release];
+        kw->menuTarget = nil;
     }
     if (kw->surface) klio_skia_free(kw->surface);
 #if defined(KLIO_METAL)
@@ -2371,6 +4938,291 @@ void klio_win_close(KlioWindow* kw) {
         [kw->window close];
     }
     delete kw;
+}
+
+// A tray icon: a status item in the menu bar, its menu, and the events of its
+// action and menu, which the program polls.
+struct KlioTray {
+    NSStatusItem* item = nil;
+    NSMenu* menu = nil;  // nil while the menu has no items
+    id target = nil;     // KlioTrayTarget
+    std::deque<KlioEv> events;
+    std::vector<KlioMenuEntry> menuEntries;
+    KlioScriptState script;
+};
+
+// A tray's clicks and menu choices: a left click shows its menu, a right one
+// is its action, as the desktop's macOS tray icon has them.
+@interface KlioTrayTarget : NSObject
+@property(nonatomic, assign) KlioTray* tray;
+- (void)klioMenuAction:(id)sender;
+- (void)klioTrayClicked:(id)sender;
+@end
+
+@implementation KlioTrayTarget
+- (void)klioMenuAction:(id)sender {
+    if (!_tray) return;
+    _tray->events.push_back(klioSimpleEv(KLIO_EV_MENU, static_cast<double>([(NSMenuItem*)sender tag])));
+}
+- (void)klioTrayClicked:(id)sender {
+    (void)sender;
+    if (!_tray) return;
+    NSEvent* ev = [NSApp currentEvent];
+    const bool right = [ev type] == NSEventTypeRightMouseUp ||
+                       ([ev modifierFlags] & NSEventModifierFlagControl);
+    if (right) {
+        _tray->events.push_back(klioSimpleEv(KLIO_EV_TRAY_ACTION));
+        return;
+    }
+    if (_tray->menu) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [_tray->item popUpStatusItemMenu:_tray->menu];
+#pragma clang diagnostic pop
+    }
+}
+@end
+
+int klio_tray_supported(void) { return 1; }
+
+void* klio_tray_open(void) {
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        klioSetupMenu(nullptr);
+        auto* tray = new KlioTray();
+        tray->item = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength] retain];
+        KlioTrayTarget* target = [[KlioTrayTarget alloc] init];
+        target.tray = tray;
+        tray->target = target;
+        NSStatusBarButton* button = [tray->item button];
+        [button setTarget:target];
+        [button setAction:@selector(klioTrayClicked:)];
+        [button sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
+        return tray;
+    }
+}
+
+void klio_tray_close(void* t) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return;
+    @autoreleasepool {
+        [[NSStatusBar systemStatusBar] removeStatusItem:tray->item];
+        [tray->item release];
+        if (tray->menu) [tray->menu release];
+        ((KlioTrayTarget*)tray->target).tray = nullptr;
+        [tray->target release];
+    }
+    delete tray;
+}
+
+// The tray's icon from a drawn surface, at the menu bar's 22 points.
+void klio_tray_set_icon(void* t, KlioSurface* s) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray || !s) return;
+    @autoreleasepool {
+        size_t len = 0;
+        uint8_t* png = klio_skia_encode_png(s, &len);
+        if (!png) return;
+        NSImage* image = [[[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]] autorelease];
+        klio_skia_free_buffer(png);
+        if (!image) return;
+        [image setSize:NSMakeSize(22, 22)];
+        [[tray->item button] setImage:image];
+    }
+}
+
+void klio_tray_set_tooltip(void* t, const char* utf8, size_t len) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return;
+    @autoreleasepool {
+        [[tray->item button] setToolTip:utf8 ? klioNSString(std::string(utf8, len)) : nil];
+    }
+}
+
+void klio_tray_set_menu(void* t, const char* spec, size_t len) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return;
+    @autoreleasepool {
+        tray->menuEntries = klioParseMenu(spec, len);
+        if (tray->menu) [tray->menu release];
+        tray->menu = nil;
+        if (!tray->menuEntries.empty()) {
+            tray->menu = [[NSMenu alloc] init];
+            [tray->menu setAutoenablesItems:NO];
+            klioFillCocoaMenu(tray->menu, tray->menuEntries, tray->target);
+            if (std::getenv("KLIO_MENU_DUMP")) {
+                fprintf(stderr, "[menu] tray menu\n");
+                klioDumpCocoaMenu(tray->menu, 0);
+            }
+        }
+    }
+}
+
+// A notification from the tray, as the desktop's shows one through the user
+// notification center; a process without an application bundle has no
+// center, and shows none, as the desktop's does.
+void klio_tray_notify(void* t, const char* title, size_t tlen, const char* message, size_t mlen, int type) {
+    if (!t) return;
+    const std::string ts = title ? std::string(title, tlen) : std::string();
+    const std::string ms = message ? std::string(message, mlen) : std::string();
+    if (std::getenv("KLIO_MENU_DUMP")) {
+        fprintf(stderr, "[menu] tray notification %d: %s / %s\n", type, ts.c_str(), ms.c_str());
+    }
+    @autoreleasepool {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if (![[NSBundle mainBundle] bundleIdentifier]) return;
+        NSUserNotificationCenter* center = [NSUserNotificationCenter defaultUserNotificationCenter];
+        if (!center) return;
+        NSUserNotification* note = [[[NSUserNotification alloc] init] autorelease];
+        [note setTitle:klioNSString(ts)];
+        [note setInformativeText:klioNSString(ms)];
+        [center deliverNotification:note];
+#pragma clang diagnostic pop
+    }
+}
+
+int klio_tray_poll_event(void* t, double* out) {
+    auto* tray = static_cast<KlioTray*>(t);
+    if (!tray) return KLIO_EV_NONE;
+    klioScriptTick(tray->script, tray->events, true);
+    for (;;) {
+        const int type = klioPopEv(tray->events, out);
+        if (type != KLIO_EV_MENU_PATH) return type;
+        const size_t at = static_cast<size_t>(out[0]);
+        if (at < klioScriptTexts().size()) klioCocoaPerformPath(tray->menu, tray->menuEntries, klioScriptTexts()[at]);
+    }
+}
+
+// Runs the application's events for up to the timeout, while no window's
+// poll runs them (an application with only a tray).
+void klio_app_wait(int timeoutMs) {
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        NSDate* until = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
+        for (;;) {
+            NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                             untilDate:until
+                                                inMode:NSDefaultRunLoopMode
+                                               dequeue:YES];
+            if (!ev) break;
+            [NSApp sendEvent:ev];
+            until = [NSDate distantPast];
+        }
+    }
+}
+
+// Sets the window's menu bar from its entries (window_events.h), or removes
+// it for an empty spec: the application's main menu while the window is key,
+// as the desktop's screen menu bar is.
+void klio_win_set_menu(KlioWindow* kw, const char* spec, size_t len) {
+    if (!kw) return;
+    @autoreleasepool {
+        kw->menuEntries = klioParseMenu(spec, len);
+        if (!kw->menuTarget) {
+            KlioMenuTarget* target = [[KlioMenuTarget alloc] init];
+            target.kw = kw;
+            kw->menuTarget = target;
+        }
+        NSMenu* old = kw->mainMenu;
+        kw->mainMenu = kw->menuEntries.empty() ? nil : klioBuildCocoaMenu(kw);
+        if ([kw->window isKeyWindow]) {
+            NSMenu* menu = kw->mainMenu ?: klioDefaultMainMenu();
+            if (menu) [NSApp setMainMenu:menu];
+        }
+        if (old) [old release];
+        if (std::getenv("KLIO_MENU_DUMP") && kw->mainMenu) {
+            fprintf(stderr, "[menu] menu bar\n");
+            NSArray* items = [kw->mainMenu itemArray];
+            for (NSUInteger i = 1; i < [items count]; i++) {
+                NSMenuItem* item = items[i];
+                std::string line = [[item title] UTF8String];
+                if (![item isEnabled]) line += " [disabled]";
+                fprintf(stderr, "[menu] %s\n", line.c_str());
+                if ([item submenu]) klioDumpCocoaMenu([item submenu], 1);
+            }
+        }
+    }
+}
+
+// Sets the icon of the menu item with the id from a drawn surface.
+void klio_win_set_menu_icon(KlioWindow* kw, int id, KlioSurface* s) {
+    if (!kw || !kw->mainMenu || !s) return;
+    @autoreleasepool {
+        NSMenuItem* item = klioCocoaMenuItem(kw->mainMenu, id);
+        if (!item) return;
+        size_t len = 0;
+        uint8_t* png = klio_skia_encode_png(s, &len);
+        if (!png) return;
+        NSImage* image = [[[NSImage alloc] initWithData:[NSData dataWithBytes:png length:len]] autorelease];
+        klio_skia_free_buffer(png);
+        if (!image) return;
+        [image setSize:NSMakeSize(16, 16)];
+        [item setImage:image];
+        if (std::getenv("KLIO_MENU_DUMP")) {
+            fprintf(stderr, "[menu] icon of %s: %dx%d pixels\n", [[item title] UTF8String],
+                    klio_skia_surf_size(s, 0), klio_skia_surf_size(s, 1));
+        }
+    }
+}
+
+// The host clipboard, as text: a count that moves whenever any application
+// changes it (-1 when the host has none), its text as malloc'd UTF-8 that
+// klio_skia_free_cstr frees (null when it holds no text), and replacing its
+// contents with a text (null empties it).
+// An NSString as malloc'd UTF-8, with its length.
+static char* klioCopyUtf8(NSString* s, size_t* len) {
+    if (!s) return nullptr;
+    NSData* d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d) return nullptr;
+    const size_t n = [d length];
+    char* out = static_cast<char*>(std::malloc(n + 1));
+    if (!out) return nullptr;
+    std::memcpy(out, [d bytes], n);
+    out[n] = 0;
+    if (len) *len = n;
+    return out;
+}
+
+long long klio_clip_change_count(void) {
+    @autoreleasepool {
+        return static_cast<long long>([[NSPasteboard generalPasteboard] changeCount]);
+    }
+}
+
+char* klio_clip_get_text(size_t* len) {
+    @autoreleasepool {
+        NSString* s = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+        return klioCopyUtf8(s, len);
+    }
+}
+
+void klio_clip_set_text(const char* utf8, size_t len) {
+    @autoreleasepool {
+        NSPasteboard* pb = [NSPasteboard generalPasteboard];
+        [pb clearContents];
+        if (!utf8) return;
+        NSString* s = [[[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding] autorelease];
+        if (s) [pb setString:s forType:NSPasteboardTypeString];
+    }
+}
+
+// The host's default locale as a language tag, malloc'd (klio_skia_free_cstr
+// frees it), as the JVM takes it on Apple platforms: the first of the user's
+// preferred languages, with the current locale's region when it has none.
+char* klio_host_locale(void) {
+    @autoreleasepool {
+        NSArray<NSString*>* languages = [NSLocale preferredLanguages];
+        NSString* tag = languages.count > 0 ? languages[0] : @"en";
+        NSArray<NSString*>* parts = [tag componentsSeparatedByString:@"-"];
+        const bool noRegion = parts.count == 1 || (parts.count == 2 && [parts[1] length] == 4);
+        if (noRegion) {
+            NSString* region = [[NSLocale currentLocale] objectForKey:NSLocaleCountryCode];
+            if (region.length > 0) tag = [NSString stringWithFormat:@"%@-%@", tag, region];
+        }
+        return klioCopyUtf8(tag, nullptr);
+    }
 }
 
 }  // extern "C"
@@ -2516,10 +5368,90 @@ void klio_win_close(KlioWindow* kw) {
 // UITouch handling, not a poll.
 KlioWindow* klio_win_open(int, int, const char*) { return nullptr; }
 int klio_win_poll(void*, int, int*, int*) { return 0; }
+int klio_win_poll_event(void*, int, double*) { return KLIO_EV_NONE; }
+void klio_win_post_event(void*, int, const double*) {}
+void klio_win_set_flag(void*, int, int) {}
+void klio_win_set_position(void*, int, int) {}
+void klio_win_get_position(void*, int* x, int* y) { if (x) *x = 0; if (y) *y = 0; }
+void klio_win_set_frame_size(void*, int, int) {}
+void klio_win_get_frame_size(void*, int* w, int* h) { if (w) *w = 0; if (h) *h = 0; }
+void klio_win_screen_bounds(int* x, int* y, int* w, int* h) { if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; }
 void klio_win_set_title(KlioWindow*, const char*) {}
 void klio_win_set_size(KlioWindow* kw, int w, int h) { if (kw) { kw->w = w; kw->h = h; } }
 void klio_win_set_icon_png(KlioWindow*, const unsigned char*, size_t) {}
+void klio_win_set_icon_surface(KlioWindow*, KlioSurface*) {}
+void klio_win_set_menu(KlioWindow*, const char*, size_t) {}
+void klio_win_set_menu_icon(KlioWindow*, int, KlioSurface*) {}
+
+// No tray icons: the desktop's Tray says so on standard error.
+int klio_tray_supported(void) { return 0; }
+void* klio_tray_open(void) { return nullptr; }
+void klio_tray_close(void*) {}
+void klio_tray_set_icon(void*, void*) {}
+void klio_tray_set_tooltip(void*, const char*, size_t) {}
+void klio_tray_set_menu(void*, const char*, size_t) {}
+void klio_tray_notify(void*, const char*, size_t, const char*, size_t, int) {}
+int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
+void klio_app_wait(int timeoutMs) {
+    if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+}
 void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
+
+// The host clipboard, as text: a count that moves whenever any application
+// changes it (-1 when the host has none), its text as malloc'd UTF-8 that
+// klio_skia_free_cstr frees (null when it holds no text), and replacing its
+// contents with a text (null empties it).
+// An NSString as malloc'd UTF-8, with its length.
+static char* klioCopyUtf8(NSString* s, size_t* len) {
+    if (!s) return nullptr;
+    NSData* d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d) return nullptr;
+    const size_t n = [d length];
+    char* out = static_cast<char*>(std::malloc(n + 1));
+    if (!out) return nullptr;
+    std::memcpy(out, [d bytes], n);
+    out[n] = 0;
+    if (len) *len = n;
+    return out;
+}
+
+long long klio_clip_change_count(void) {
+    @autoreleasepool {
+        return static_cast<long long>([UIPasteboard generalPasteboard].changeCount);
+    }
+}
+
+char* klio_clip_get_text(size_t* len) {
+    @autoreleasepool {
+        return klioCopyUtf8([UIPasteboard generalPasteboard].string, len);
+    }
+}
+
+void klio_clip_set_text(const char* utf8, size_t len) {
+    @autoreleasepool {
+        UIPasteboard* pb = [UIPasteboard generalPasteboard];
+        NSString* s = utf8 ? [[[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding] autorelease] : nil;
+        if (s) pb.string = s;
+        else pb.items = @[];
+    }
+}
+
+// The host's default locale as a language tag, malloc'd (klio_skia_free_cstr
+// frees it), as the JVM takes it on Apple platforms: the first of the user's
+// preferred languages, with the current locale's region when it has none.
+char* klio_host_locale(void) {
+    @autoreleasepool {
+        NSArray<NSString*>* languages = [NSLocale preferredLanguages];
+        NSString* tag = languages.count > 0 ? languages[0] : @"en";
+        NSArray<NSString*>* parts = [tag componentsSeparatedByString:@"-"];
+        const bool noRegion = parts.count == 1 || (parts.count == 2 && [parts[1] length] == 4);
+        if (noRegion) {
+            NSString* region = [[NSLocale currentLocale] objectForKey:NSLocaleCountryCode];
+            if (region.length > 0) tag = [NSString stringWithFormat:@"%@-%@", tag, region];
+        }
+        return klioCopyUtf8(tag, nullptr);
+    }
+}
 
 }  // extern "C"
 
@@ -2676,10 +5608,39 @@ void klio_win_close(KlioWindow* kw) {
 // The OS owns the run loop on Android: no shim-side window creation or poll.
 KlioWindow* klio_win_open(int, int, const char*) { return nullptr; }
 int klio_win_poll(void*, int, int*, int*) { return 0; }
+int klio_win_poll_event(void*, int, double*) { return KLIO_EV_NONE; }
+void klio_win_post_event(void*, int, const double*) {}
+void klio_win_set_flag(void*, int, int) {}
+void klio_win_set_position(void*, int, int) {}
+void klio_win_get_position(void*, int* x, int* y) { if (x) *x = 0; if (y) *y = 0; }
+void klio_win_set_frame_size(void*, int, int) {}
+void klio_win_get_frame_size(void*, int* w, int* h) { if (w) *w = 0; if (h) *h = 0; }
+void klio_win_screen_bounds(int* x, int* y, int* w, int* h) { if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; }
 void klio_win_set_title(KlioWindow*, const char*) {}
 void klio_win_set_size(KlioWindow* kw, int w, int h) { if (kw) { kw->w = w; kw->h = h; } }
 void klio_win_set_icon_png(KlioWindow*, const unsigned char*, size_t) {}
+void klio_win_set_icon_surface(KlioWindow*, KlioSurface*) {}
+void klio_win_set_menu(KlioWindow*, const char*, size_t) {}
+void klio_win_set_menu_icon(KlioWindow*, int, KlioSurface*) {}
+
+// No tray icons: the desktop's Tray says so on standard error.
+int klio_tray_supported(void) { return 0; }
+void* klio_tray_open(void) { return nullptr; }
+void klio_tray_close(void*) {}
+void klio_tray_set_icon(void*, void*) {}
+void klio_tray_set_tooltip(void*, const char*, size_t) {}
+void klio_tray_set_menu(void*, const char*, size_t) {}
+void klio_tray_notify(void*, const char*, size_t, const char*, size_t, int) {}
+int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
+void klio_app_wait(int timeoutMs) {
+    if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+}
 void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
+// No clipboard reaches the shim on Android.
+long long klio_clip_change_count(void) { return -1; }
+char* klio_clip_get_text(size_t*) { return nullptr; }
+void klio_clip_set_text(const char*, size_t) {}
+char* klio_host_locale(void) { return nullptr; }
 
 }  // extern "C"
 
@@ -2691,11 +5652,39 @@ void* klio_win_attach(void*, int, int, double) { return nullptr; }
 void* klio_win_surface(void*) { return nullptr; }
 void klio_win_present(void*) {}
 int klio_win_poll(void*, int, int*, int*) { return 2; }
+int klio_win_poll_event(void*, int, double*) { return KLIO_EV_CLOSE; }
+void klio_win_post_event(void*, int, const double*) {}
+void klio_win_set_flag(void*, int, int) {}
+void klio_win_set_position(void*, int, int) {}
+void klio_win_get_position(void*, int* x, int* y) { if (x) *x = 0; if (y) *y = 0; }
+void klio_win_set_frame_size(void*, int, int) {}
+void klio_win_get_frame_size(void*, int* w, int* h) { if (w) *w = 0; if (h) *h = 0; }
+void klio_win_screen_bounds(int* x, int* y, int* w, int* h) { if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; }
 void klio_win_close(void*) {}
 void klio_win_set_title(void*, const char*) {}
 void klio_win_set_size(void*, int, int) {}
 void klio_win_set_icon_png(void*, const unsigned char*, size_t) {}
+void klio_win_set_icon_surface(void*, void*) {}
+void klio_win_set_menu(void*, const char*, size_t) {}
+void klio_win_set_menu_icon(void*, int, void*) {}
+
+// No tray icons: the desktop's Tray says so on standard error.
+int klio_tray_supported(void) { return 0; }
+void* klio_tray_open(void) { return nullptr; }
+void klio_tray_close(void*) {}
+void klio_tray_set_icon(void*, void*) {}
+void klio_tray_set_tooltip(void*, const char*, size_t) {}
+void klio_tray_set_menu(void*, const char*, size_t) {}
+void klio_tray_notify(void*, const char*, size_t, const char*, size_t, int) {}
+int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
+void klio_app_wait(int timeoutMs) {
+    if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+}
 void klio_win_set_resize_cb(void*, void (*)(void*, int, int), void*) {}
+long long klio_clip_change_count(void) { return -1; }
+char* klio_clip_get_text(size_t*) { return nullptr; }
+void klio_clip_set_text(const char*, size_t) {}
+char* klio_host_locale(void) { return nullptr; }
 }  // extern "C"
 
 #endif

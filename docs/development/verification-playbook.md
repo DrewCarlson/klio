@@ -48,6 +48,7 @@ Two ways an audit sweep reads clean while finding nothing:
 | One library census | `KLIO_ITEST_BIN=zig-out/bin/klio-harness zig-out/bin/klio-census <coroutines|datetime|serialization|serialization_json|io|atomicfu|ktor|compose_ui|box>` | minutes |
 | One compose plugin class | `zig build klio-test-home`, then `HOME=$PWD/zig-out/klio-test-home KLIO_COMPOSE_PLUGIN=1 zig-out/bin/klio-harness test <the plugin file list> --filter=<Class[.test]>` (never the whole list in one process) | seconds |
 | The example corpus on the CLI route | `KLIO_BIN=zig-out/bin/klio-harness scripts/refresh-local-packs.sh` then `KLIO_HOME=$PWD/.klio-local python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180 --list-fail --jobs 4` | minutes |
+| Does a Compose example match Compose Desktop? | `KLIO_HOME=$PWD/.klio-local python3 scripts/compose-oracle.py <example>...` (`--jvm-only` prints the expected output) | ~30 s per example |
 | The threaded litmus set | `python3 scripts/litmus-sweep.py [harness] [--filter substr]` | ~40 s |
 | The e2e corpus (both JIT modes) | `zig build itest-e2e` | ~5 min |
 | The parity suites | `zig build itest-group_parity_core itest-group_parity_types itest-group_parity_shapes` (the pinned parity corpus is in `core`) | ~2 min |
@@ -105,7 +106,9 @@ of downloading. `scripts/gate.sh` runs both before anything else. Only when
 the libraries can be neither found nor fetched does it skip the marked
 examples, naming each one (`corpus_check.py --no-skia`,
 `KLIO_GATE_NO_SKIA=1` for the compose-ui gate); a shim that fails to build is
-a red gate.
+a red gate. An example marked `// corpus: tray` also needs the platform's tray
+icon, which macOS and Windows have and SDL hosts do not; `corpus_check.py`
+skips it there, naming it.
 
 ## The measured row
 

@@ -1,0 +1,28 @@
+-- secondary button
+Press PointerButton(index=1) primary=false secondary=true tertiary=false
+Release PointerButton(index=1) primary=false secondary=false tertiary=false
+-- tertiary button
+Press PointerButton(index=2) primary=false secondary=false tertiary=true
+Release PointerButton(index=2) primary=false secondary=false tertiary=false
+-- primary button
+Press PointerButton(index=0) primary=true secondary=false tertiary=false
+Release PointerButton(index=0) primary=false secondary=false tertiary=false
+-- drag
+drag start at Offset(10.0, 10.0)
+drag by Offset(19.9, 9.9)
+drag by Offset(30.0, 30.0)
+drag end
+-- scroll
+scroll Offset(0.0, 3.0)
+scroll Offset(-1.0, 0.0)
+-- tab, tab, a, shift+tab
+first focused
+first hears Tab KeyUp shift=false
+first hears Tab KeyDown shift=false
+second focused
+second hears Tab KeyUp shift=false
+second hears A KeyDown shift=false
+second hears A KeyUp shift=false
+second hears Tab KeyDown shift=true
+first focused
+first hears Tab KeyUp shift=true

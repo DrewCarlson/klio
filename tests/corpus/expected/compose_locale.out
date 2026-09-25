@@ -1,0 +1,28 @@
+"en-US" -> en-US (language "en", script "", region "US")
+"EN-us" -> en-US (language "en", script "", region "US")
+"zh-hant-tw" -> zh-Hant-TW (language "zh", script "Hant", region "TW")
+"es-419" -> es-419 (language "es", script "", region "419")
+"sr-Latn-RS" -> sr-Latn-RS (language "sr", script "Latn", region "RS")
+"en-US-POSIX" -> en-US-POSIX (language "en", script "", region "US")
+"iw" -> he (language "he", script "", region "")
+"in-ID" -> id-ID (language "id", script "", region "ID")
+"zh-yue-HK" -> yue-HK (language "yue", script "", region "HK")
+"i-klingon" -> tlh (language "tlh", script "", region "")
+"zh-min-nan" -> nan (language "nan", script "", region "")
+"de-DE-u-nu-thai-co-phonebk" -> de-DE-u-co-phonebk-nu-thai (language "de", script "", region "DE")
+"en-b-bbb-a-aaa" -> en-a-aaa-b-bbb (language "en", script "", region "")
+"x-private" -> x-private (language "", script "", region "")
+"" -> und (language "", script "", region "")
+"und" -> und (language "", script "", region "")
+"en_US" -> und (language "", script "", region "")
+"en-US-!!" -> en-US (language "en", script "", region "US")
+"toolongtag" -> und (language "", script "", region "")
+equal ignoring case: true
+list: [en-US, fr-FR, tr]
+current is the list's first: true
+upper: ISTANBUL ILIK / İSTANBUL ILIK
+lower: istanbul i̇zmi̇r / ıstanbul izmir
+capitalize: Istanbul / İstanbul
+decapitalize: istanbul / ıstanbul
+lithuanian: 3 chars, IX
+final sigma: οδος οδος.

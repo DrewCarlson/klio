@@ -683,7 +683,7 @@ private const val KEY_LOCATION_LEFT = 2
 private const val KEY_LOCATION_RIGHT = 3
 private const val KEY_LOCATION_NUMPAD = 4
 
-/** Each key code's text, as the desktop names the key. */
+/** Each key code's text, as the desktop names the key on Linux and Windows. */
 private val keyTexts: Map<Int, String> = mapOf(
     0 to "Unknown keyCode: 0x0",
     3 to "Cancel",
@@ -875,6 +875,101 @@ private val keyTexts: Map<Int, String> = mapOf(
     65489 to "Cut",
 )
 
+/**
+ * The texts macOS names keys by where they differ from the others': glyphs
+ * for the modifier, editing and arrow keys, and the symbol keys by their
+ * symbols, as the JDK's macOS toolkit resources name them.
+ */
+private val macKeyTexts: Map<Int, String> = mapOf(
+    3 to "\u238b",
+    8 to "\u232b",
+    9 to "\u21e5",
+    10 to "\u23ce",
+    12 to "\u2327",
+    16 to "\u21e7",
+    17 to "\u2303",
+    18 to "\u2325",
+    20 to "\u21ea",
+    27 to "\u238b",
+    32 to "\u2423",
+    33 to "\u21de",
+    34 to "\u21df",
+    35 to "\u2198",
+    36 to "\u2196",
+    37 to "\u2190",
+    38 to "\u2191",
+    39 to "\u2192",
+    40 to "\u2193",
+    44 to ",",
+    45 to "-",
+    46 to ".",
+    47 to "/",
+    59 to ";",
+    61 to "=",
+    91 to "[",
+    92 to "\\",
+    93 to "]",
+    96 to "\u2328-0",
+    97 to "\u2328-1",
+    98 to "\u2328-2",
+    99 to "\u2328-3",
+    100 to "\u2328-4",
+    101 to "\u2328-5",
+    102 to "\u2328-6",
+    103 to "\u2328-7",
+    104 to "\u2328-8",
+    105 to "\u2328-9",
+    106 to "\u2328 *",
+    107 to "\u2328 +",
+    108 to "\u2328 ,",
+    109 to "\u2328 -",
+    110 to "\u2328 .",
+    111 to "\u2328 /",
+    127 to "\u2326",
+    150 to "&",
+    151 to "*",
+    152 to "\"",
+    153 to "<",
+    154 to "\u2399",
+    157 to "\u2318",
+    160 to ">",
+    161 to "[",
+    162 to "]",
+    192 to "`",
+    222 to "'",
+    224 to "\u2191",
+    225 to "\u2193",
+    226 to "\u2190",
+    227 to "\u2192",
+    512 to "@",
+    513 to ":",
+    514 to "^",
+    515 to "\$",
+    516 to "\u20ac",
+    517 to "!",
+    518 to "\u00a1",
+    519 to "(",
+    520 to "#",
+    521 to "+",
+    522 to ")",
+    523 to "_",
+    65406 to "\u2325",
+)
+
+internal fun __composeui_hostOs(): String = "unknown"
+
+internal val isMacOs: Boolean by lazy { __composeui_hostOs() == "macos" }
+
+/**
+ * Whether the platform's key texts are in use. The desktop reads a key's text
+ * from the AWT toolkit's resources, whose platform half loads with the
+ * toolkit, which Compose Desktop starts with its first scene; before that a
+ * key has the shared names. klio's scenes set this when the first one opens.
+ */
+internal var platformKeyTextsLoaded: Boolean = false
+
 /** A key code's text: its name, or its code in hex for a key with none. */
 private fun keyText(code: Int): String =
-    keyTexts[code] ?: ("Unknown keyCode: 0x" + code.toString(16))
+    (if (isMacOs && platformKeyTextsLoaded) macKeyTexts[code] else null)
+        ?: keyTexts[code]
+        ?: ("Unknown keyCode: 0x" + code.toString(16))

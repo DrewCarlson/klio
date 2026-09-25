@@ -1,0 +1,22 @@
+# Scripted input for compose_window_clipboard.kt's window (KLIO_WIN_INPUT): an
+# event as the platform would report it, at the given milliseconds after the
+# window's first event poll. Key codes are AWT's (A 65, C 67, V 86, X 88);
+# "menu" is the platform's menu shortcut modifier.
+# Click into the first field, Select All, Copy.
+200ms move 50 20
+200ms press 50 20
+200ms release 50 20
+300ms key 65 97 menu
+400ms key 67 99 menu
+# Click into the second field, Paste twice.
+500ms move 50 60
+500ms press 50 60
+500ms release 50 60
+600ms key 86 118 menu
+700ms key 86 118 menu
+# Back in the first field, Select All and Cut.
+800ms move 50 20
+800ms press 50 20
+800ms release 50 20
+900ms key 65 97 menu
+1000ms key 88 120 menu

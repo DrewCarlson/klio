@@ -1,0 +1,15 @@
+system clipboard: true
+the same transferable: true
+text: a note
+flavors: 1
+has text: true
+read back: a selection
+manager text: a selection
+after a plain entry: null
+has text: false
+manager has text: false
+no text flavor: Unicode String
+manager text: from the manager
+entry text: from the manager
+after a null entry: null
+the note lost the clipboard: 1

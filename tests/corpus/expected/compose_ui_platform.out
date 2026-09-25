@@ -2,6 +2,8 @@ Key: A
 Key: Enter
 Key: Shift
 Key: NumPad-5
+[LongPress, TextHandleMove, Confirm, ToggleOn]
 true KeyDown 97 true false
 systemBars top=0 left=0
+text toolbar Hidden
 padded size 100 x 50

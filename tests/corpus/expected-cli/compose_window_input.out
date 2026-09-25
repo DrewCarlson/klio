@@ -1,0 +1,10 @@
+field focused
+button focused
+button clicked (1)
+button clicked (2)
+button clicked (3)
+window takes Escape
+window hears F1
+window opened=true
+text=hell! klio
+clicks=3

@@ -1624,6 +1624,21 @@ fn skiaLibName(os: std.Target.Os.Tag) []const u8 {
     };
 }
 
+/// skiko's RenderNode (src/compose_ui/skiko, from skiko v0.150.1), which draws
+/// the graphics layers. Its sources include Skia headers by bare name.
+const skiko_node_sources = [_][]const u8{
+    "src/compose_ui/skiko/common/node/RenderNode.cpp",
+    "src/compose_ui/skiko/common/node/RenderNodeContext.cpp",
+};
+
+fn skikoNodeIncludes(b: *std.Build, base: []const u8) [3][]const u8 {
+    return .{
+        "-Isrc/compose_ui/skiko/common/include",
+        b.fmt("-I{s}/include/core", .{base}),
+        b.fmt("-I{s}/include/utils", .{base}),
+    };
+}
+
 /// Build the iOS Compose-UI Skia shim as a STATIC archive (libklio_skia.a) of the
 /// shim's own objects, compiled with the platform clang++ against the iOS SDK.
 /// iOS bans dlopen of a runtime-written dylib, so the shim links into the app
@@ -1642,14 +1657,18 @@ fn buildSkiaShimIos(
     else
         "-miphoneos-version-min=15.0";
     const inc = b.fmt("-I{s}", .{base});
+    const skiko_inc = skikoNodeIncludes(b, base);
 
     // KLIO_UIKIT enables the iOS on-screen backend (attach to an app CAMetalLayer,
     // Ganesh-Metal). Offscreen raster + PNG still work alongside it; the app links
     // Metal/QuartzCore/UIKit. The shim is still compiled Objective-C++ for the
     // Metal/UIKit glue.
     const c1 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-arch", "arm64", "-DKLIO_UIKIT", "-DKLIO_METAL" });
-    c1.addArgs(&.{ min_flag, "-isysroot", sdk, "-x", "objective-c++", inc, "-c" });
+    c1.addArgs(&.{ min_flag, "-isysroot", sdk, "-x", "objective-c++", inc });
+    c1.addArgs(&skiko_inc);
+    c1.addArg("-c");
     c1.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
+    c1.addFileInput(b.path("src/compose_ui/window_events.h"));
     c1.addArg("-o");
     const shim_o = c1.addOutputFileArg("skia_shim.o");
 
@@ -1665,11 +1684,23 @@ fn buildSkiaShimIos(
     c3.addArg("-o");
     const icu_o = c3.addOutputFileArg("icu_shim.o");
 
+    var node_o: [skiko_node_sources.len]std.Build.LazyPath = undefined;
+    for (skiko_node_sources, 0..) |src, i| {
+        const c = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-arch", "arm64" });
+        c.addArgs(&.{ min_flag, "-isysroot", sdk, inc });
+        c.addArgs(&skiko_inc);
+        c.addArg("-c");
+        c.addFileArg(b.path(src));
+        c.addArg("-o");
+        node_o[i] = c.addOutputFileArg(b.fmt("{s}.o", .{std.fs.path.stem(src)}));
+    }
+
     const ar = b.addSystemCommand(&.{ "libtool", "-static", "-o" });
     const out = ar.addOutputFileArg("libklio_skia.a");
     ar.addFileArg(shim_o);
     ar.addFileArg(font_o);
     ar.addFileArg(icu_o);
+    for (node_o) |o| ar.addFileArg(o);
     return out;
 }
 
@@ -1722,6 +1753,7 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
     // compiled (its u16string symbols mangle pre-cxx11): std::basic_string
     // values cross the skparagraph API by reference, so the layouts must agree.
     run.addArgs(&.{ "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
+    run.addArgs(&skikoNodeIncludes(b, base));
     if (os == .linux) run.addArg("-D_GLIBCXX_USE_CXX11_ABI=0");
     // The Cocoa backend needs the shim compiled as Objective-C++; -x applies to the
     // source that follows, so it must precede the source file.
@@ -1733,10 +1765,14 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
         if (want_gpu) run.addArg("-DKLIO_METAL");
     }
     run.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
+    // The window input events the shim's backends report.
+    run.addFileInput(b.path("src/compose_ui/window_events.h"));
     // The bundled fallback font, baked into a byte array (scripts/gen-font-data.py).
     run.addFileArg(b.path("src/compose_ui/font_data.cpp"));
     // Date formatting over the ICU the Skia libraries bundle.
     run.addFileArg(b.path("src/compose_ui/icu_shim.cpp"));
+    // Graphics layers: skiko's RenderNode.
+    for (skiko_node_sources) |src| run.addFileArg(b.path(src));
     // Reset the input language so the .a archives that follow are linked, not
     // compiled as Objective-C++ source (the -x above applies to everything after).
     if (os == .macos and want_cocoa) run.addArgs(&.{ "-x", "none" });
@@ -1812,7 +1848,7 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
             "-framework", "IOKit",
         }),
         .windows => run.addArgs(&.{
-            "-luser32", "-lgdi32", "-lopengl32", "-lole32", "-loleaut32",
+            "-luser32", "-lgdi32", "-lopengl32", "-lole32", "-loleaut32", "-lshell32",
         }),
         else => return null,
     }

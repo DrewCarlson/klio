@@ -45,6 +45,16 @@ def needs_skia(path):
     return has_marker(path, "skia")
 
 
+def needs_tray(path):
+    """An example marked `// corpus: tray` uses the platform's tray icon, which
+    macOS and Windows have and the SDL windows of other hosts do not."""
+    return has_marker(path, "tray")
+
+
+def host_has_tray():
+    return sys.platform == "darwin" or sys.platform.startswith("win")
+
+
 def extra_args(path):
     """An example may document required flags in a header comment:
     `// Run with: klio run --feature X/Y examples/foo.kt`. Honor them."""
@@ -73,11 +83,24 @@ TIMED_OUT = "timeout"
 GREP_STDERR = None
 
 
+def run_env(path):
+    """An example runs with a clipboard of its own (KLIO_CLIPBOARD=private), so
+    the corpus neither reads nor replaces the user's, and in the en-US locale
+    (KLIO_LOCALE) whatever the host's. One with a
+    `<name>.input` beside it runs with that file as its window's scripted
+    input (KLIO_WIN_INPUT)."""
+    env = dict(os.environ, KLIO_CLIPBOARD="private", KLIO_LOCALE="en-US")
+    script = path[: -len(".kt")] + ".input"
+    if os.path.exists(script):
+        env["KLIO_WIN_INPUT"] = os.path.abspath(script)
+    return env
+
+
 def run(binary, path, timeout):
     try:
         p = subprocess.run(
             [binary, "run", path] + extra_args(path),
-            cwd=ROOT, capture_output=True, timeout=timeout,
+            cwd=ROOT, capture_output=True, timeout=timeout, env=run_env(path),
         )
         if GREP_STDERR:
             err = p.stderr.decode("utf-8", "replace")
@@ -133,6 +156,12 @@ def main():
         files = [f for f in files if f not in set(skipped)]
         print(f"skipping {len(skipped)} interactive example(s): "
               + " ".join(os.path.relpath(f, ROOT) for f in skipped))
+    if not host_has_tray():
+        no_tray = [f for f in files if needs_tray(f)]
+        files = [f for f in files if f not in set(no_tray)]
+        if no_tray:
+            print(f"skipping {len(no_tray)} example(s) that need a tray icon, which this host has none of: "
+                  + " ".join(os.path.relpath(f, ROOT) for f in no_tray))
     if args.no_skia:
         no_shim = [f for f in files if needs_skia(f)]
         files = [f for f in files if f not in set(no_shim)]

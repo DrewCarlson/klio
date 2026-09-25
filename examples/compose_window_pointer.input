@@ -1,0 +1,24 @@
+# Scripted input for compose_window_pointer.kt's window (KLIO_WIN_INPUT): an
+# event as the platform would report it, at the given milliseconds after the
+# window's first event poll.
+# The secondary, tertiary and primary buttons on the first box.
+100ms move 20 20
+100ms press 20 20 2
+100ms release 20 20 2
+150ms press 20 20 3
+150ms release 20 20 3
+200ms press 20 20 1
+200ms release 20 20 1
+# A double click on the second box: its two presses more than the 40 ms a
+# double click's presses must be apart, and well within its 300 ms.
+250ms move 20 120
+250ms press 20 120
+250ms release 20 120
+350ms press 20 120
+350ms release 20 120
+# A drag from the third box.
+500ms move 10 210
+500ms press 10 210
+550ms move 30 220
+600ms move 60 250
+650ms release 60 250

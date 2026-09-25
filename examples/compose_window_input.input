@@ -1,0 +1,22 @@
+# Scripted input for compose_window_input.kt's window (KLIO_WIN_INPUT): at
+# the window's n-th event poll, an event as the platform would report it.
+# Click into the text field.
+3 move 50 20
+3 press 50 20
+3 release 50 20
+# Type, erase one character, type more.
+6 text hello
+8 key 8
+10 text ! klio
+# Tab to the box, then Enter and Space on it (key codes are AWT's).
+12 key 9
+14 key 10 10
+16 key 32 32
+# Click the box.
+18 move 50 60
+18 press 50 60
+18 release 50 60
+# Escape (27): the window's onPreviewKeyEvent takes it. F1 (112): nothing in
+# the content takes it, so the window's onKeyEvent hears it.
+20 key 27 27
+22 key 112

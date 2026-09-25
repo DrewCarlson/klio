@@ -1,12 +1,29 @@
 /*
- * Copyright 2024 The klio Authors
+ * Copyright 2024 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
+// skiko's GraphicsLayer (SkiaGraphicsLayer.skiko.kt) over klio's RenderNode
+// binding (KlioRenderNode): the same properties, outline, recording and child
+// tracking, with the Skia paint and canvas reached through the Skia shim. A
+// layer records its content into its node and draws the node by reference, so
+// a parent's recording shows a child's later recordings. Headless the node's
+// handle is 0: the block still runs, so what it does besides drawing happens,
+// and nothing is drawn.
 package androidx.compose.ui.graphics.layer
 
+import androidx.annotation.IntRange
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -14,242 +31,467 @@ import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.isUnspecified
 import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.KlioCanvas
-import androidx.compose.ui.graphics.Matrix
 import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.RenderEffect
-import androidx.compose.ui.graphics.__skia_c_draw_picture
+import androidx.compose.ui.graphics.__skia_c_restore
 import androidx.compose.ui.graphics.__skia_c_save_layer
 import androidx.compose.ui.graphics.__skia_c_set_color_filter
-import androidx.compose.ui.graphics.__skia_picture_free
-import androidx.compose.ui.graphics.__skia_rec_begin
-import androidx.compose.ui.graphics.__skia_rec_end
 import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.draw
+import androidx.compose.ui.graphics.requirePrecondition
 import androidx.compose.ui.graphics.skiaCode
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.toSize
 
-/**
- * The klio [GraphicsLayer] actual, after skiko's SkiaGraphicsLayer. [record]
- * draws the block into a Skia picture and [draw] replays it: at [topLeft],
- * under the layer's pivoted transform, clipped to its outline when [clip] is
- * set, and through an offscreen layer when its alpha, blend mode, color filter,
- * render effect or compositing strategy asks for one. A layer is drawn again
- * without re-recording, so a transform or alpha change costs no draw pass.
- *
- * Headless (no Skia backend) the block still runs, so what it does besides
- * drawing happens, and there is no picture to draw.
- */
-actual class GraphicsLayer internal constructor() {
+actual class GraphicsLayer internal constructor(
+    renderNode: KlioRenderNode,
+) {
+    private var renderNode: KlioRenderNode? = renderNode
     private val pictureDrawScope = CanvasDrawScope()
 
-    /** What [record] last drew, as a shim picture handle; 0 before it or headless. */
-    private var picture = 0L
-
-    private var outsetLeft = 0
-    private var outsetTop = 0
-    private var outsetRight = 0
-    private var outsetBottom = 0
-
-    actual var compositingStrategy: CompositingStrategy = CompositingStrategy.Auto
-    actual var topLeft: IntOffset = IntOffset.Zero
-    actual var size: IntSize = IntSize.Zero
-        private set
-    actual var pivotOffset: Offset = Offset.Unspecified
-    actual var alpha: Float = 1f
-    actual var scaleX: Float = 1f
-    actual var scaleY: Float = 1f
-    actual var translationX: Float = 0f
-    actual var translationY: Float = 0f
-    actual var shadowElevation: Float = 0f
-    actual var ambientShadowColor: Color = Color.Black
-    actual var spotShadowColor: Color = Color.Black
-    actual var blendMode: BlendMode = BlendMode.SrcOver
-    actual var colorFilter: ColorFilter? = null
-    actual var rotationX: Float = 0f
-    actual var rotationY: Float = 0f
-    actual var rotationZ: Float = 0f
-    actual var cameraDistance: Float = DefaultCameraDistance
-    actual var clip: Boolean = false
-    actual var renderEffect: RenderEffect? = null
-    actual var isReleased: Boolean = false
-        private set
-
-    private var outlinePath: Path? = null
+    private var outlineDirty = true
     private var roundRectOutlineTopLeft: Offset = Offset.Zero
     private var roundRectOutlineSize: Size = Size.Unspecified
     private var roundRectCornerRadius: Float = 0f
 
-    actual val outline: Outline
-        get() {
-            outlinePath?.let { return Outline.Generic(it) }
-            val outlineSize = if (roundRectOutlineSize.isUnspecified) size.toSize() else roundRectOutlineSize
-            val left = roundRectOutlineTopLeft.x
-            val top = roundRectOutlineTopLeft.y
-            val right = left + outlineSize.width
-            val bottom = top + outlineSize.height
-            return if (roundRectCornerRadius > 0f) {
-                Outline.Rounded(RoundRect(left, top, right, bottom, CornerRadius(roundRectCornerRadius)))
-            } else {
-                Outline.Rectangle(Rect(left, top, right, bottom))
+    private var internalOutline: Outline? = null
+    private var outlinePath: Path? = null
+
+    private var outsetLeft: Int = 0
+    private var outsetTop: Int = 0
+    private var outsetRight: Int = 0
+    private var outsetBottom: Int = 0
+
+    /** skiko's cached layer paint: whether the content composites through one. */
+    private var hasLayerPaint = false
+
+    private var parentLayerUsages = 0
+    private val childDependenciesTracker = ChildLayerDependenciesTracker()
+
+    actual var compositingStrategy: CompositingStrategy = CompositingStrategy.Auto
+        set(value) {
+            if (field != value) {
+                field = value
+                updateLayerProperties()
             }
         }
 
-    actual fun setOutsets(left: Int, top: Int, right: Int, bottom: Int) {
-        require(left >= 0 && top >= 0 && right >= 0 && bottom >= 0) {
-            "Outsets cannot be negative! Left: $left, Top: $top, Right: $right, Bottom: $bottom"
+    actual var topLeft: IntOffset = IntOffset.Zero
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.setBounds(
+                    value.x.toFloat(),
+                    value.y.toFloat(),
+                    (value.x + size.width).toFloat(),
+                    (value.y + size.height).toFloat(),
+                )
+            }
         }
-        outsetLeft = left
-        outsetTop = top
-        outsetRight = right
-        outsetBottom = bottom
-    }
 
-    actual fun setPathOutline(path: Path) {
-        outlinePath = path
+    actual var size: IntSize = IntSize.Zero
+        private set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.setBounds(
+                    topLeft.x.toFloat(),
+                    topLeft.y.toFloat(),
+                    (topLeft.x + value.width).toFloat(),
+                    (topLeft.y + value.height).toFloat(),
+                )
+                if (roundRectOutlineSize.isUnspecified) {
+                    outlineDirty = true
+                    configureOutlineAndClip()
+                }
+            }
+        }
+
+    actual var pivotOffset: Offset = Offset.Unspecified
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.setPivot(value)
+            }
+        }
+
+    actual var alpha: Float = 1f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.alpha = value
+                updateLayerProperties()
+            }
+        }
+
+    actual var scaleX: Float = 1f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.scaleX = value
+            }
+        }
+
+    actual var scaleY: Float = 1f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.scaleY = value
+            }
+        }
+
+    actual var translationX: Float = 0f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.translationX = value
+            }
+        }
+
+    actual var translationY: Float = 0f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.translationY = value
+            }
+        }
+
+    actual var shadowElevation: Float = 0f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.shadowElevation = value
+                outlineDirty = true
+                configureOutlineAndClip()
+            }
+        }
+
+    actual var ambientShadowColor: Color = Color.Black
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.ambientShadowColor = value.toArgb()
+            }
+        }
+
+    actual var spotShadowColor: Color = Color.Black
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.spotShadowColor = value.toArgb()
+            }
+        }
+
+    actual var blendMode: BlendMode = BlendMode.SrcOver
+        set(value) {
+            if (field != value) {
+                field = value
+                updateLayerProperties()
+            }
+        }
+
+    actual var colorFilter: ColorFilter? = null
+        set(value) {
+            if (field != value) {
+                field = value
+                updateLayerProperties()
+            }
+        }
+
+    actual val outline: Outline
+        get() {
+            val tmpOutline = internalOutline
+            val tmpPath = outlinePath
+            return if (tmpOutline != null) {
+                tmpOutline
+            } else if (tmpPath != null) {
+                Outline.Generic(tmpPath).also { internalOutline = it }
+            } else {
+                resolveOutlinePosition { outlineTopLeft, outlineSize ->
+                    val left = outlineTopLeft.x
+                    val top = outlineTopLeft.y
+                    val right = left + outlineSize.width
+                    val bottom = top + outlineSize.height
+                    val cornerRadius = this.roundRectCornerRadius
+                    if (cornerRadius > 0f) {
+                        Outline.Rounded(
+                            RoundRect(left, top, right, bottom, CornerRadius(cornerRadius))
+                        )
+                    } else {
+                        Outline.Rectangle(Rect(left, top, right, bottom))
+                    }
+                }.also { internalOutline = it }
+            }
+        }
+
+    private fun resetOutlineParams() {
+        internalOutline = null
+        outlinePath = null
         roundRectOutlineSize = Size.Unspecified
         roundRectOutlineTopLeft = Offset.Zero
         roundRectCornerRadius = 0f
+        outlineDirty = true
+    }
+
+    actual fun setPathOutline(path: Path) {
+        resetOutlineParams()
+        this.outlinePath = path
+        configureOutlineAndClip()
     }
 
     actual fun setRoundRectOutline(topLeft: Offset, size: Size, cornerRadius: Float) {
-        outlinePath = null
-        roundRectOutlineTopLeft = topLeft
-        roundRectOutlineSize = size
-        roundRectCornerRadius = cornerRadius
+        if (this.roundRectOutlineTopLeft != topLeft ||
+            this.roundRectOutlineSize != size ||
+            this.roundRectCornerRadius != cornerRadius ||
+            this.outlinePath != null
+        ) {
+            resetOutlineParams()
+            this.roundRectOutlineTopLeft = topLeft
+            this.roundRectOutlineSize = size
+            this.roundRectCornerRadius = cornerRadius
+            configureOutlineAndClip()
+        }
     }
 
     actual fun setRectOutline(topLeft: Offset, size: Size) {
         setRoundRectOutline(topLeft, size, 0f)
     }
 
+    actual var rotationX: Float = 0f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.rotationX = value
+            }
+        }
+
+    actual var rotationY: Float = 0f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.rotationY = value
+            }
+        }
+
+    actual var rotationZ: Float = 0f
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.rotationZ = value
+            }
+        }
+
+    actual var cameraDistance: Float = DefaultCameraDistance
+        set(value) {
+            if (field != value) {
+                field = value
+                renderNode?.cameraDistance = value
+            }
+        }
+
+    actual var clip: Boolean = false
+        set(value) {
+            if (field != value) {
+                field = value
+                outlineDirty = true
+                configureOutlineAndClip()
+            }
+        }
+
+    actual var renderEffect: RenderEffect? = null
+        set(value) {
+            if (field != value) {
+                field = value
+                updateLayerProperties()
+            }
+        }
+
+    actual var isReleased: Boolean = false
+        private set
+
     actual fun record(
         density: Density,
         layoutDirection: LayoutDirection,
         size: IntSize,
-        block: DrawScope.() -> Unit,
+        block: DrawScope.() -> Unit
     ) {
         this.size = size
-        val recording = __skia_rec_begin(size.width.toFloat(), size.height.toFloat())
-        pictureDrawScope.draw(
-            density = density,
-            layoutDirection = layoutDirection,
-            canvas = KlioCanvas(recording),
-            size = size.toSize(),
-            graphicsLayer = this,
-            block = block,
+        recordWithTracking { canvas ->
+            canvas.alphaMultiplier = if (compositingStrategy == CompositingStrategy.ModulateAlpha) {
+                this@GraphicsLayer.alpha
+            } else {
+                1.0f
+            }
+            pictureDrawScope.draw(
+                density = density,
+                layoutDirection = layoutDirection,
+                canvas = canvas,
+                size = size.toSize(),
+                graphicsLayer = this,
+                block = block
+            )
+        }
+    }
+
+    private fun recordWithTracking(block: (KlioCanvas) -> Unit) {
+        val renderNode = renderNode ?: return
+        val recording = renderNode.beginRecording()
+        try {
+            val composeCanvas = KlioCanvas(recording)
+            childDependenciesTracker.withTracking(
+                onDependencyRemoved = { it.onRemovedFromParentLayer() },
+            ) { block(composeCanvas) }
+        } finally {
+            renderNode.endRecording(recording)
+        }
+    }
+
+    private fun addSubLayer(graphicsLayer: GraphicsLayer) {
+        if (childDependenciesTracker.onDependencyAdded(graphicsLayer)) {
+            graphicsLayer.onAddedToParentLayer()
+        }
+    }
+
+    internal actual fun draw(canvas: Canvas, parentLayer: GraphicsLayer?) {
+        if (isReleased) return
+        configureOutlineAndClip()
+        parentLayer?.addSubLayer(this)
+        val handle = (canvas as? KlioCanvas)?.nativeHandle ?: return
+        if (hasOutsets() && hasLayerPaint) {
+            // The offscreen layer is opened here, over the layer's bounds grown by
+            // its outsets, instead of by the node.
+            saveLayer(
+                handle,
+                left = topLeft.x - outsetLeft.toFloat(),
+                top = topLeft.y - outsetTop.toFloat(),
+                right = topLeft.x + size.width + outsetRight.toFloat(),
+                bottom = topLeft.y + size.height + outsetBottom.toFloat(),
+            )
+            renderNode?.drawInto(handle)
+            __skia_c_restore(handle)
+        } else {
+            renderNode?.drawInto(handle)
+        }
+    }
+
+    /** An offscreen layer composited back through the layer's paint. */
+    private fun saveLayer(handle: Long, left: Float, top: Float, right: Float, bottom: Float) {
+        val filter = colorFilter?.nativeColorFilter
+        if (filter != null) __skia_c_set_color_filter(handle, filter.spec)
+        __skia_c_save_layer(
+            handle, left, top, right, bottom, 1,
+            alpha,
+            blendMode.skiaCode(),
+            renderEffect?.klioImageFilter ?: "",
         )
-        val recorded = if (recording != 0L) __skia_rec_end(recording) else 0L
-        if (picture != 0L) __skia_picture_free(picture)
-        picture = recorded
+        if (filter != null) __skia_c_set_color_filter(handle, "")
+    }
+
+    private fun onAddedToParentLayer() {
+        parentLayerUsages++
+    }
+
+    private fun onRemovedFromParentLayer() {
+        parentLayerUsages--
+        discardContentIfReleasedAndHaveNoParentLayerUsages()
+    }
+
+    private fun configureOutlineAndClip() {
+        if (!outlineDirty) return
+        val renderNode = renderNode ?: return
+        val outlineIsNeeded = clip || shadowElevation > 0f
+        if (!outlineIsNeeded) {
+            renderNode.clip = false
+            renderNode.setOutline(null)
+        } else {
+            renderNode.clip = clip
+            renderNode.setOutline(outline)
+        }
+        outlineDirty = false
+    }
+
+    private inline fun <T> resolveOutlinePosition(block: (Offset, Size) -> T): T {
+        val layerSize = this.size.toSize()
+        val rRectTopLeft = roundRectOutlineTopLeft
+        val rRectSize = roundRectOutlineSize
+
+        val outlineSize =
+            if (rRectSize.isUnspecified) {
+                layerSize
+            } else {
+                rRectSize
+            }
+        return block(rRectTopLeft, outlineSize)
+    }
+
+    internal fun release() {
+        if (!isReleased) {
+            isReleased = true
+            discardContentIfReleasedAndHaveNoParentLayerUsages()
+        }
+    }
+
+    private fun discardContentIfReleasedAndHaveNoParentLayerUsages() {
+        if (isReleased && parentLayerUsages == 0) {
+            // discarding means we don't draw children layer anymore and need to remove dependencies:
+            childDependenciesTracker.removeDependencies { it.onRemovedFromParentLayer() }
+
+            renderNode?.close()
+            renderNode = null
+        }
     }
 
     actual suspend fun toImageBitmap(): ImageBitmap =
         ImageBitmap(size.width, size.height).apply { draw(Canvas(this), null) }
 
-    internal actual fun draw(canvas: Canvas, parentLayer: GraphicsLayer?) {
-        if (isReleased) return
-        val handle = (canvas as? KlioCanvas)?.nativeHandle ?: return
-        if (picture == 0L || handle == 0L) return
-        val layer = requiresLayer()
-        val outsets = outsetLeft > 0 || outsetTop > 0 || outsetRight > 0 || outsetBottom > 0
-        // With outsets the offscreen layer is opened here, around the transformed
-        // content, over the layer's bounds grown by them.
-        if (layer && outsets) {
-            saveLayer(
-                handle,
-                (topLeft.x - outsetLeft).toFloat(),
-                (topLeft.y - outsetTop).toFloat(),
-                (topLeft.x + size.width + outsetRight).toFloat(),
-                (topLeft.y + size.height + outsetBottom).toFloat(),
-            )
-        }
-        canvas.save()
-        canvas.translate(topLeft.x.toFloat(), topLeft.y.toFloat())
-        if (hasTransform()) canvas.concat(transform())
-        if (clip) clipToOutline(canvas)
-        if (layer && !outsets) saveLayer(handle, 0f, 0f, size.width.toFloat(), size.height.toFloat())
-        __skia_c_draw_picture(handle, picture)
-        if (layer && !outsets) canvas.restore()
-        canvas.restore()
-        if (layer && outsets) canvas.restore()
-    }
-
-    internal fun release() {
-        if (isReleased) return
-        isReleased = true
-        if (picture != 0L) __skia_picture_free(picture)
-        picture = 0L
-    }
-
-    /**
-     * Whether drawing needs an offscreen layer, as skiko decides: alpha under a
-     * strategy other than ModulateAlpha, a color filter, a blend mode other than
-     * SrcOver, a render effect, or the Offscreen strategy. Under ModulateAlpha
-     * skiko multiplies each recorded draw's alpha instead; klio's canvas has no
-     * alpha multiplier, so there the alpha takes the layer too, which differs
-     * only where the content's own draws overlap.
-     */
-    private fun requiresLayer(): Boolean =
-        alpha < 1f ||
-            colorFilter != null ||
-            blendMode != BlendMode.SrcOver ||
-            renderEffect != null ||
-            compositingStrategy == CompositingStrategy.Offscreen
-
-    private fun saveLayer(handle: Long, l: Float, t: Float, r: Float, b: Float) {
-        val filter = colorFilter?.nativeColorFilter
-        if (filter != null) __skia_c_set_color_filter(handle, filter.argb, filter.mode)
-        val blur = renderEffect as? BlurEffect
-        __skia_c_save_layer(
-            handle, l, t, r, b, 1,
-            alpha,
-            blendMode.skiaCode(),
-            blur?.klioBlurSigmaX ?: 0f,
-            blur?.klioBlurSigmaY ?: 0f,
-            blur?.klioBlurTileCode ?: 0,
-        )
-        if (filter != null) __skia_c_set_color_filter(handle, 0, -1)
-    }
-
-    private fun hasTransform(): Boolean =
-        translationX != 0f || translationY != 0f || scaleX != 1f || scaleY != 1f ||
-            rotationX != 0f || rotationY != 0f || rotationZ != 0f
-
-    /** The layer's transform about its pivot, the size's center when unspecified. */
-    private fun transform(): Matrix {
-        val pivot = if (pivotOffset.isUnspecified) Offset(size.width / 2f, size.height / 2f) else pivotOffset
-        return Matrix().apply {
-            resetToPivotedTransform(
-                pivotX = pivot.x,
-                pivotY = pivot.y,
-                translationX = translationX,
-                translationY = translationY,
-                rotationX = rotationX,
-                rotationY = rotationY,
-                rotationZ = rotationZ,
-                scaleX = scaleX,
-                scaleY = scaleY,
-            )
+    private fun updateLayerProperties() {
+        hasLayerPaint = requiresLayer()
+        // When outsets are present, we manage the offscreen layer manually in draw() using an
+        // expanded saveLayer bounds, so the renderNode must not create its own inner layer.
+        if (hasLayerPaint && !hasOutsets()) {
+            renderNode?.setLayerPaint(true, alpha, blendMode, colorFilter, renderEffect)
+        } else {
+            renderNode?.setLayerPaint(false)
         }
     }
 
-    private fun clipToOutline(canvas: Canvas) {
-        when (val o = outline) {
-            is Outline.Rectangle -> canvas.clipRect(o.rect)
-            is Outline.Rounded -> canvas.clipPath(Path().apply { addRoundRect(o.roundRect) })
-            is Outline.Generic -> canvas.clipPath(o.path)
+    private fun hasOutsets() = outsetLeft > 0 || outsetTop > 0 || outsetRight > 0 || outsetBottom > 0
+
+    private fun requiresLayer(): Boolean {
+        val alphaNeedsLayer = alpha < 1f && compositingStrategy != CompositingStrategy.ModulateAlpha
+        val hasColorFilter = colorFilter != null
+        val hasBlendMode = blendMode != BlendMode.SrcOver
+        val hasRenderEffect = renderEffect != null
+        val offscreenBufferRequested = compositingStrategy == CompositingStrategy.Offscreen
+        return alphaNeedsLayer || hasColorFilter || hasBlendMode || hasRenderEffect ||
+            offscreenBufferRequested
+    }
+
+    actual fun setOutsets(
+        @IntRange(from = 0) left: Int,
+        @IntRange(from = 0) top: Int,
+        @IntRange(from = 0) right: Int,
+        @IntRange(from = 0) bottom: Int
+    ) {
+        requirePrecondition(left >= 0 && top >= 0 && right >= 0 && bottom >= 0) {
+            "Outsets cannot be negative! Left: $left, Top: $top, Right: $right, Bottom: $bottom"
+        }
+        if (left != outsetLeft || top != outsetTop || right != outsetRight || bottom != outsetBottom) {
+            outsetLeft = left
+            outsetTop = top
+            outsetRight = right
+            outsetBottom = bottom
+            updateLayerProperties()
         }
     }
 }

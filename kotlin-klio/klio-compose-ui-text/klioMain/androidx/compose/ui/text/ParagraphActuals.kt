@@ -22,6 +22,7 @@ package androidx.compose.ui.text
 
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.createFontFamilyResolver
 import androidx.compose.ui.text.platform.KlioParagraph
 import androidx.compose.ui.text.platform.KlioParagraphIntrinsics
 import androidx.compose.ui.text.style.TextOverflow
@@ -44,6 +45,7 @@ private fun paragraph(
     constraints: Constraints,
     annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>>,
     placeholders: List<AnnotatedString.Range<Placeholder>>,
+    fontFamilyResolver: FontFamily.Resolver?,
 ): Paragraph =
     KlioParagraph(
         text,
@@ -54,6 +56,7 @@ private fun paragraph(
         width = constraints.maxWidth.toFloat(),
         annotations = annotations,
         placeholders = placeholders,
+        fontFamilyResolver = fontFamilyResolver,
     )
 
 @Suppress("DEPRECATION", "KmpDeprecationMismatch")
@@ -78,6 +81,7 @@ actual fun Paragraph(
         widthConstraints(width),
         spanStyles,
         placeholders,
+        createFontFamilyResolver(resourceLoader),
     )
 
 @Suppress("DEPRECATION", "KmpDeprecationMismatch")
@@ -104,6 +108,7 @@ actual fun Paragraph(
         widthConstraints(width),
         spanStyles,
         placeholders,
+        fontFamilyResolver,
     )
 
 @Suppress("DEPRECATION", "KmpDeprecationMismatch")
@@ -131,6 +136,7 @@ actual fun Paragraph(
         constraints,
         spanStyles,
         placeholders,
+        fontFamilyResolver,
     )
 
 actual fun Paragraph(
@@ -153,6 +159,7 @@ actual fun Paragraph(
         constraints,
         spanStyles,
         placeholders,
+        fontFamilyResolver,
     )
 
 @Suppress("DEPRECATION", "KmpDeprecationMismatch")
@@ -175,6 +182,7 @@ actual fun Paragraph(
         widthConstraints(width),
         i.annotations,
         i.placeholders,
+        i.fontFamilyResolver,
     )
 }
 
@@ -199,6 +207,7 @@ actual fun Paragraph(
         constraints,
         i.annotations,
         i.placeholders,
+        i.fontFamilyResolver,
     )
 }
 
@@ -218,6 +227,7 @@ actual fun Paragraph(
         constraints,
         i.annotations,
         i.placeholders,
+        i.fontFamilyResolver,
     )
 }
 
@@ -231,7 +241,7 @@ actual fun ParagraphIntrinsics(
     density: Density,
     resourceLoader: Font.ResourceLoader,
 ): ParagraphIntrinsics =
-    KlioParagraphIntrinsics(text, style, density, spanStyles, placeholders)
+    KlioParagraphIntrinsics(text, style, density, spanStyles, placeholders, createFontFamilyResolver(resourceLoader))
 
 @Deprecated("Use an overload that takes `annotations` instead")
 actual fun ParagraphIntrinsics(
@@ -242,7 +252,7 @@ actual fun ParagraphIntrinsics(
     density: Density,
     fontFamilyResolver: FontFamily.Resolver,
 ): ParagraphIntrinsics =
-    KlioParagraphIntrinsics(text, style, density, spanStyles, placeholders)
+    KlioParagraphIntrinsics(text, style, density, spanStyles, placeholders, fontFamilyResolver)
 
 actual fun ParagraphIntrinsics(
     text: String,
@@ -252,7 +262,7 @@ actual fun ParagraphIntrinsics(
     fontFamilyResolver: FontFamily.Resolver,
     placeholders: List<AnnotatedString.Range<Placeholder>>,
 ): ParagraphIntrinsics =
-    KlioParagraphIntrinsics(text, style, density, annotations, placeholders)
+    KlioParagraphIntrinsics(text, style, density, annotations, placeholders, fontFamilyResolver)
 
 actual fun ParagraphIntrinsics(
     text: String,
@@ -263,4 +273,4 @@ actual fun ParagraphIntrinsics(
     placeholders: List<AnnotatedString.Range<Placeholder>>,
     softWrap: Boolean,
 ): ParagraphIntrinsics =
-    KlioParagraphIntrinsics(text, style, density, annotations, placeholders)
+    KlioParagraphIntrinsics(text, style, density, annotations, placeholders, fontFamilyResolver)

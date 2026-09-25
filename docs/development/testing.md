@@ -54,6 +54,15 @@ binary started by hand without it installs the packs into
 - `differential` runs every example and coroutine smoke program over the
   cached base image and over a base analyzed afresh (`KLIO_SEMA_IMAGE=0`);
   the outcomes must be identical, and independent of program order.
+- The Compose examples have their own oracle: Compose Desktop 1.12.0 on the
+  JVM. `scripts/compose-oracle.py <example>...` compiles an example that
+  uses klio's headless `KlioComposeScene` with kotlinc 2.4.20 and the
+  Compose compiler plugin, beside a class of the same name and API over
+  ImageComposeScene, runs it headless, runs it on klio, and diffs the two
+  outputs (pixels read back, text metrics, event sequences). `--jvm-only`
+  prints the JVM output, which is the expected output for a new example.
+  The classpath is resolved from Maven by `scripts/compose-oracle-fetch.py`
+  into `target/parity-cache/compose-desktop-1.12.0` on first use.
 - The `e2e` module runs every `examples/*.kt` against the checked-in
   expected output under `tests/corpus/expected/`, byte for byte, with JIT on
   and off.

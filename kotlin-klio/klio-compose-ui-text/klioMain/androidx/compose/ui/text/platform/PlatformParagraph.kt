@@ -46,9 +46,14 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.DefaultFontFamily
 import androidx.compose.ui.text.font.FontListFontFamily
+import androidx.compose.ui.text.font.FontSynthesis
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.KlioFontLoadResult
 import androidx.compose.ui.text.font.GenericFontFamily
 import androidx.compose.ui.text.font.KlioFileFont
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.ResolvedTextDirection
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
@@ -149,7 +154,11 @@ private fun PlaceholderVerticalAlign.skPhAlign(): Int = when (this) {
     else -> 0
 }
 
+// The family a run shapes with: a generic family by name, which the Skia shim
+// maps to the platform's fonts as skiko's GenericFontFamiliesMapping does, and
+// the default family as sans-serif, as skiko's FontCache resolves it.
 private fun FontFamily?.klioName(): String = when (this) {
+    null, is DefaultFontFamily -> FontFamily.SansSerif.name
     is GenericFontFamily -> name
     // A file-backed font list: register the first file font (once) and
     // shape with its path-derived family alias.
@@ -189,6 +198,8 @@ internal class KlioParagraph(
     override val width: Float,
     val annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>> = emptyList(),
     val placeholders: List<AnnotatedString.Range<Placeholder>> = emptyList(),
+    /** Resolves a run's font family to the families it shapes with, as skiko's does. */
+    val fontFamilyResolver: FontFamily.Resolver? = null,
 ) : Paragraph {
 
     // The SpanStyle ranges, in application order (a later span overrides the
@@ -217,7 +228,7 @@ internal class KlioParagraph(
         if (spanRanges.isEmpty()) {
             val d = overrideDeco ?: baseDeco
             if (d == 0 && baseWeight < 600 && baseItalic == 0) return emptyList()
-            return listOf(KlioRun(0, text.length, fontSizePx, baseWeight, baseItalic, d, baseColor, style.fontFamily.klioName(), baseLetterSpacingPx))
+            return listOf(KlioRun(0, text.length, fontSizePx, baseWeight, baseItalic, d, baseColor, familySpec(style.fontFamily, baseWeight, baseItalic), baseLetterSpacingPx))
         }
         val out = ArrayList<KlioRun>()
         var seg = 0
@@ -232,7 +243,7 @@ internal class KlioParagraph(
             var italic = baseItalic
             var deco = overrideDeco ?: baseDeco
             var argb = baseColor
-            var family = style.fontFamily.klioName()
+            var family: FontFamily? = style.fontFamily
             var letterSp = baseLetterSpacingPx
             for (r in spanRanges) {
                 if (seg >= r.start && seg < r.end) {
@@ -244,16 +255,49 @@ internal class KlioParagraph(
                     st.fontWeight?.let { weight = it.weight }
                     st.fontStyle?.let { italic = if (it == FontStyle.Italic) 1 else 0 }
                     st.textDecoration?.let { deco = it.skBits() }
-                    st.fontFamily?.let { family = it.klioName() }
+                    st.fontFamily?.let { family = it }
                     if (st.letterSpacing != TextUnit.Unspecified) {
                         letterSp = st.letterSpacing.klioPx(density, size)
                     }
                 }
             }
-            out.add(KlioRun(seg, end, size, weight, italic, deco, argb, family, letterSp))
+            out.add(KlioRun(seg, end, size, weight, italic, deco, argb, familySpec(family, weight, italic), letterSp))
             seg = end
         }
         return out
+    }
+
+    /**
+     * The families a run of [family] at [weight] and [italic] shapes with, as
+     * skiko's paragraph builder asks its font family resolver: names separated
+     * by `|`, each with `%`, spaces and `|` percent-encoded; `-` for none.
+     */
+    private fun familySpec(family: FontFamily?, weight: Int, italic: Int): String {
+        val resolved = fontFamilyResolver?.resolve(
+            family,
+            FontWeight(weight),
+            if (italic != 0) FontStyle.Italic else FontStyle.Normal,
+            FontSynthesis.All,
+        )?.value as? KlioFontLoadResult
+        val names = resolved?.aliases ?: listOf(family.klioName())
+        if (names.isEmpty()) return "-"
+        return names.joinToString("|") { it.replace("%", "%25").replace(" ", "%20").replace("|", "%7C") }
+    }
+
+    /**
+     * skparagraph's TextHeightBehavior (0 all, 1 no first ascent, 2 no last
+     * descent, 3 neither) as skiko picks its height mode: from the line height
+     * style's trim when the line height exceeds the font size, else neither.
+     */
+    private fun heightBehavior(): Int {
+        if (!(paraLineHeightPx > fontSizePx)) return 3
+        val trim = (style.lineHeightStyle ?: LineHeightStyle.Default).trim
+        return when {
+            trim.isTrimFirstLineTop() && trim.isTrimLastLineBottom() -> 3
+            trim.isTrimFirstLineTop() -> 1
+            trim.isTrimLastLineBottom() -> 2
+            else -> 0
+        }
     }
 
     private fun buildSpec(baseColor: Int, decoOverride: TextDecoration?): String {
@@ -265,7 +309,8 @@ internal class KlioParagraph(
             .append(baseWeight).append(' ').append(baseItalic).append(' ')
             .append(decoOverride?.skBits() ?: baseDeco).append(' ')
             .append(baseColor.toLong() and 0xFFFFFFFFL).append(' ')
-            .append(baseLetterSpacingPx).append(' ').append(paraLineHeightPx).append('\n')
+            .append(baseLetterSpacingPx).append(' ').append(paraLineHeightPx).append(' ')
+            .append(familySpec(style.fontFamily, baseWeight, baseItalic)).append(' ').append(heightBehavior()).append('\n')
         for (r in resolvedRuns(baseColor, decoOverride)) {
             sb.append("r ").append(r.start).append(' ').append(r.end).append(' ')
                 .append(r.sizePx).append(' ').append(r.weight).append(' ').append(r.italic).append(' ')
@@ -741,8 +786,9 @@ internal class KlioParagraphIntrinsics(
     val density: Density,
     val annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>> = emptyList(),
     val placeholders: List<AnnotatedString.Range<Placeholder>> = emptyList(),
+    val fontFamilyResolver: FontFamily.Resolver? = null,
 ) : ParagraphIntrinsics {
-    private val measured = KlioParagraph(text, style, density, maxLines = 0, ellipsis = false, width = 0f, annotations = annotations, placeholders = placeholders)
+    private val measured = KlioParagraph(text, style, density, maxLines = 0, ellipsis = false, width = 0f, annotations = annotations, placeholders = placeholders, fontFamilyResolver = fontFamilyResolver)
     override val minIntrinsicWidth: Float = measured.minIntrinsicWidth
     override val maxIntrinsicWidth: Float = measured.maxIntrinsicWidth
     override val hasStaleResolvedFonts: Boolean = false

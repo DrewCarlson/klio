@@ -1,7 +1,8 @@
-// The real androidx.compose.ui.graphics.Paint — the drawing-parameter object the
+// The real androidx.compose.ui.graphics.Paint, the drawing-parameter object the
 // DrawScope configures before rasterizing a shape: fill vs stroke, colour, stroke
-// width/cap/join, blend mode, alpha, anti-aliasing. Backed by klio's plain value
-// object; the shader / colour-filter / path-effect slots default to null.
+// width/cap/join, blend mode, alpha, anti-aliasing. It reads back as skiko's
+// does: the alpha shares the colour's 8 bits, and the join and miter limit
+// report Compose's defaults (Round, 0) until they are set.
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Paint
@@ -11,7 +12,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 
 fun main() {
     val p = Paint()
-    // Defaults mirror upstream: opaque black fill, hairline stroke, AA on.
+    // Opaque black fill, hairline stroke, AA on.
     println("default fill=${p.style == PaintingStyle.Fill} aa=${p.isAntiAlias} alpha=${p.alpha}")
     println("default cap=${p.strokeCap} join=${p.strokeJoin} miter=${p.strokeMiterLimit}")
     println("default blend=${p.blendMode} shader=${p.shader == null}")

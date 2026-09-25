@@ -1,0 +1,8 @@
+tray supported: true
+action 1
+mute -> true
+mute -> false
+send info
+action 2
+quit
+application done

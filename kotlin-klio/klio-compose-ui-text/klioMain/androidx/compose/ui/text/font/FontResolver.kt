@@ -1,57 +1,93 @@
-/*
- * Copyright 2021 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
+// skiko's font resolution (SkiaFontLoader.skiko.kt, FontFamilyResolver.skiko.kt,
+// PlatformFontFamilyTypefaceAdapter.skiko.kt) over the Skia shim: resolving a
+// font family answers the family names a run shapes with, as skiko's
+// FontLoadResult's aliases. A generic or the default family answers its
+// generic name, which the shim maps to the platform's fonts; a SystemFont its
+// family name; a LoadedFont or a file font the name its bytes are registered
+// under.
 package androidx.compose.ui.text.font
 
-// klio's Skia shim renders every run with one bundled font (it ignores per-family
-// / per-weight typeface requests), so font resolution here is uniform: any
-// FontFamily resolves to the single [KlioTypeface] marker. The real layout +
-// glyph work happens in KlioParagraph, keyed only by pixel size. This is the
-// desktop actual for the ui-text font-resolution `expect`s.
+import androidx.compose.ui.text.ExperimentalTextApi
+import androidx.compose.ui.text.font.FontLoadingStrategy.Companion.Async
+import androidx.compose.ui.text.font.FontLoadingStrategy.Companion.Blocking
+import androidx.compose.ui.text.font.FontLoadingStrategy.Companion.OptionalLocal
+import androidx.compose.ui.text.platform.LoadedFont
+import androidx.compose.ui.text.platform.PlatformFont
+import androidx.compose.ui.text.platform.SystemFont
+import androidx.compose.ui.text.platform.__skia_font_register_data
+import kotlin.coroutines.CoroutineContext
 
-/** The one typeface klio's shim draws with; a marker (the shim needs no handle). */
-internal object KlioTypeface
+/** What a font resolves to: the family names a run lists, in order. */
+internal class KlioFontLoadResult(val aliases: List<String>)
 
-/**
- * A [PlatformFontLoader] that resolves every [Font] to [KlioTypeface]. `cacheKey`
- * is null: results never differ from the platform default, so no per-loader
- * cache partitioning is needed.
- */
+/** The families a program's loaded fonts are registered under, once each. */
+private val registeredFonts = HashSet<String>()
+
+@OptIn(ExperimentalTextApi::class)
 internal class KlioFontLoader : PlatformFontLoader {
-    override fun loadBlocking(font: Font): Any = KlioTypeface
+    override fun loadBlocking(font: Font): KlioFontLoadResult? {
+        if (font is KlioFileFont) return KlioFontLoadResult(listOf(KlioFileFont.aliasFor(font)))
+        if (font !is PlatformFont) {
+            if (font.loadingStrategy != OptionalLocal) {
+                throw IllegalArgumentException("Unsupported font type: $font")
+            }
+            return null
+        }
+        return when (font.loadingStrategy) {
+            Blocking -> load(font)
+            OptionalLocal -> kotlin.runCatching { load(font) }.getOrNull()
+            Async -> throw UnsupportedOperationException("Unsupported Async font load path")
+            else -> throw IllegalArgumentException(
+                "Unknown loading type ${font.loadingStrategy}"
+            )
+        }
+    }
 
-    override suspend fun awaitLoad(font: Font): Any = KlioTypeface
+    internal fun load(font: PlatformFont): KlioFontLoadResult = when (font) {
+        is SystemFont -> KlioFontLoadResult(listOf(font.identity))
+        is LoadedFont -> {
+            val key = font.cacheKey
+            if (registeredFonts.add(key)) __skia_font_register_data(font.data, key)
+            KlioFontLoadResult(listOf(key))
+        }
+    }
+
+    fun loadPlatformTypes(fontFamily: FontFamily): KlioFontLoadResult = when (fontFamily) {
+        is GenericFontFamily -> KlioFontLoadResult(listOf(fontFamily.name))
+        is FontListFontFamily -> KlioFontLoadResult(
+            fontFamily.fonts.mapNotNull { (it as? SystemFont)?.identity }
+        )
+        else -> KlioFontLoadResult(listOf(FontFamily.SansSerif.name))
+    }
+
+    override suspend fun awaitLoad(font: Font): KlioFontLoadResult? = loadBlocking(font)
 
     override val cacheKey: Any? = null
 }
 
-/**
- * Create a font resolver for use outside a composition (background layout,
- * preloading). Reuses the real [FontFamilyResolverImpl] dispatch; only the
- * platform loader + the non-list typeface adapter are klio's.
- */
 fun createFontFamilyResolver(): FontFamily.Resolver = FontFamilyResolverImpl(KlioFontLoader())
+
+@ExperimentalTextApi
+fun createFontFamilyResolver(
+    coroutineContext: CoroutineContext
+): FontFamily.Resolver {
+    return FontFamilyResolverImpl(
+        KlioFontLoader(),
+        PlatformResolveInterceptor.Default,
+        GlobalTypefaceRequestCache,
+        FontListFontFamilyTypefaceAdapter(
+            GlobalAsyncTypefaceCache,
+            coroutineContext
+        )
+    )
+}
 
 @Suppress("DEPRECATION", "KmpDeprecationMismatch")
 internal actual fun createFontFamilyResolver(
     fontResourceLoader: Font.ResourceLoader
 ): FontFamily.Resolver = createFontFamilyResolver()
 
-// klio uses the bundled font as-is; synthetic bold/italic transforms are not
-// applied, so synthesis returns the resolved typeface unchanged.
+// Skia synthesizes no bold or italic here; the resolved family is used as is.
 internal actual fun FontSynthesis.synthesizeTypeface(
     typeface: Any,
     font: Font,
@@ -59,9 +95,6 @@ internal actual fun FontSynthesis.synthesizeTypeface(
     requestedStyle: FontStyle,
 ): Any = typeface
 
-// Resolves every non-FontListFontFamily request (Default, Generic, loaded) to the
-// bundled typeface. FontListFontFamily is handled upstream by
-// FontListFontFamilyTypefaceAdapter before this adapter is consulted.
 internal actual class PlatformFontFamilyTypefaceAdapter actual constructor() :
     FontFamilyTypefaceAdapter {
 
@@ -70,5 +103,11 @@ internal actual class PlatformFontFamilyTypefaceAdapter actual constructor() :
         platformFontLoader: PlatformFontLoader,
         onAsyncCompletion: (TypefaceResult.Immutable) -> Unit,
         createDefaultTypeface: (TypefaceRequest) -> Any,
-    ): TypefaceResult = TypefaceResult.Immutable(KlioTypeface)
+    ): TypefaceResult? {
+        if (typefaceRequest.fontFamily is FontListFontFamily) return null
+        val loader = platformFontLoader as KlioFontLoader
+        return TypefaceResult.Immutable(
+            loader.loadPlatformTypes(typefaceRequest.fontFamily ?: FontFamily.Default)
+        )
+    }
 }
