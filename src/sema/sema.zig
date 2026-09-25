@@ -153,6 +153,8 @@ pub const Sema = struct {
     /// The smart-cast subject standing for each stable member path
     /// (`a.b`), keyed by base subject and property.
     path_subjects: std.AutoHashMapUnmanaged(u64, Sym) = .empty,
+    /// The property each of those subjects reads.
+    path_property: std.AutoHashMapUnmanaged(Sym, Sym) = .empty,
     /// What a local `val` being not null says about the values its
     /// initializer read: `val a = b?.f()` makes `b` not null with `a`.
     nonnull_implies: std.AutoHashMapUnmanaged(Sym, []const @import("body.zig").Narrow) = .empty,

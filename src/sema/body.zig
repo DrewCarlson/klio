@@ -2905,7 +2905,10 @@ pub fn stableSubject(ctx: *Ctx, e: *const Expr) Sym {
 }
 
 /// A bare name that is a stable value: a local, a parameter, or a
-/// read-only property of an implicit receiver.
+/// read-only property of an implicit receiver. The property is the path
+/// through its receiver, as `this.name` is, typed as that receiver sees it:
+/// `actual` read on a `StringSubject : Subject<String>` receiver is a
+/// `String?`, not `Subject`'s `T?`.
 fn stableName(ctx: *Ctx, id: ast.Ident) Sym {
     const s = ctx.s;
     const n = s.names.lookup(id.name) orelse return .none;
@@ -2915,9 +2918,10 @@ fn stableName(ctx: *Ctx, id: ast.Ident) Sym {
         return .none;
     }
     const r = findImplicitProperty(ctx, n) catch return .none;
-    if (r) |sym| {
-        if (stableProperty(s, sym)) return sym;
-        return .none;
+    if (r) |hit| {
+        if (!stableProperty(s, hit.sym)) return .none;
+        const base_t = narrowedReceiver(ctx, hit.recv) catch return .none;
+        return pathSubjectOn(ctx, hit.recv.owner, base_t, id.name) catch .none;
     }
     // A top-level `val` of the reading code's own module: nothing else
     // can change it between two reads (`val minus: Any = -0.0` smart
@@ -2954,9 +2958,13 @@ fn stableProperty(s: *Sema, p: Sym) bool {
 /// of `base`'s type, one per pair, typed with the property's type as seen
 /// through `base`.
 fn pathSubject(ctx: *Ctx, base: Sym, name_str: []const u8) Allocator.Error!Sym {
+    return pathSubjectOn(ctx, base, try narrowedType(ctx, base, try subjectBaseType(ctx, base)), name_str);
+}
+
+/// `pathSubject` of `base`, whose type as the smart casts see it is `base_t`.
+fn pathSubjectOn(ctx: *Ctx, base: Sym, base_t: TypeId, name_str: []const u8) Allocator.Error!Sym {
     const s = ctx.s;
     const n = s.names.lookup(name_str) orelse return .none;
-    const base_t = try narrowedType(ctx, base, try subjectBaseType(ctx, base));
     if (s.types.isErr(base_t)) return .none;
     const ms = try members.lookup(s, base_t, n, .property);
     if (ms.len == 0 or !stableProperty(s, ms[0].sym)) return .none;
@@ -2972,6 +2980,7 @@ fn pathSubject(ctx: *Ctx, base: Sym, name_str: []const u8) Allocator.Error!Sym {
         .detail = 0,
     }, .{ .ty = try members.memberType(s, ms[0]) });
     try s.path_subjects.put(s.arena, key, sym);
+    try s.path_property.put(s.arena, sym, ms[0].sym);
     return sym;
 }
 
@@ -2999,13 +3008,15 @@ fn narrowRead(ctx: *Ctx, e: *const Expr, t: TypeId) Allocator.Error!TypeId {
     return narrowedType(ctx, subj, t);
 }
 
-fn findImplicitProperty(ctx: *Ctx, n: Name) Allocator.Error!?Sym {
-    var sc: ?*Scope = ctx.scope;
-    while (sc) |c| : (sc = c.parent) {
-        for (c.receivers.items) |r| {
-            const ms = try members.lookup(ctx.s, try narrowedReceiver(ctx, r), n, .property);
-            if (ms.len != 0) return ms[0].sym;
-        }
+/// The property named `n` of the innermost implicit receiver that has
+/// one, and that receiver, as `nameAccess` reads it.
+fn findImplicitProperty(ctx: *Ctx, n: Name) Allocator.Error!?struct { sym: Sym, recv: Recv } {
+    const s = ctx.s;
+    for (try implicitReceivers(ctx)) |r| {
+        const rt = try narrowedReceiver(ctx, r);
+        if (try subtyping.admitsNull(s, rt)) continue;
+        const ms = try members.withoutExtensionProperties(s, try members.lookup(s, rt, n, .property));
+        if (ms.len != 0) return .{ .sym = ms[0].sym, .recv = r };
     }
     return null;
 }
@@ -3330,9 +3341,11 @@ pub fn narrowedType(ctx: *Ctx, sym: Sym, declared: TypeId) Allocator.Error!TypeI
 }
 
 /// A property with an explicit backing field reads as the field's type
-/// inside the class that declares it, where the field is visible.
-fn fieldCast(ctx: *Ctx, sym: Sym) Allocator.Error!?TypeId {
+/// inside the class that declares it, where the field is visible; so does
+/// a path through a receiver to it.
+fn fieldCast(ctx: *Ctx, subject: Sym) Allocator.Error!?TypeId {
     const s = ctx.s;
+    const sym = s.path_property.get(subject) orelse subject;
     if (s.syms.kind(sym) != .property) return null;
     const pd = switch (s.syms.get(sym).decl) {
         .property => |pd| pd,
@@ -3598,7 +3611,11 @@ pub fn nameAccess(ctx: *Ctx, id: ast.Ident, access: Access) Allocator.Error!Type
             const cx = (try calls.propertyContexts(ctx, m.sym, m.subst)) orelse &.{};
             try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = if (is_entry) .object else kind, .target = m.sym, .dispatch = recv, .contexts = cx });
             const t = try members.memberType(s, m);
-            return if (access == .read and s.syms.kind(m.sym) == .property) narrowedType(ctx, m.sym, t) else t;
+            if (access != .read or s.syms.kind(m.sym) != .property) return t;
+            // The smart casts on a stable one are on the path through its
+            // receiver; an explicit backing field casts any.
+            const subj: Sym = if (stableProperty(s, m.sym)) try pathSubjectOn(ctx, r.owner, rt, id.name) else .none;
+            return narrowedType(ctx, if (subj == .none) m.sym else subj, t);
         }
         if (try calls.extensionProperty(ctx, rt, n)) |ext| {
             try ext.take();

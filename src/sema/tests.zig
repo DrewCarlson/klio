@@ -940,12 +940,22 @@ test "an explicit backing field smart-casts reads inside its class" {
         \\val history: List<String>
         \\    field = ArrayList<String>()
         \\fun note(): Boolean = history.add("x")
+        \\interface Base {
+        \\    val a: Any
+        \\        get() = "not OK"
+        \\}
+        \\class Derived : Base {
+        \\    final override val a: Any
+        \\        field: MutableList<String> = ArrayList<String>()
+        \\    fun usage(): Boolean = a.add("x")
+        \\}
     });
     defer fx.deinit();
     try fx.resolve();
     try fx.expectClean();
     try fx.expectTarget("items.^add(item)", "kotlin/collections/ArrayList.add");
     try fx.expectTarget("history.^add(", "kotlin/collections/ArrayList.add");
+    try fx.expectTarget("a.^add(\"x\")", "kotlin/collections/MutableList.add");
 }
 
 test "type parameters with different bounds overload" {
@@ -6639,6 +6649,54 @@ test "a member with a supertype member's signature needs `override`" {
         "`q` hides member of supertype `I` and needs an `override` modifier",
         "`toString` hides member of supertype `Any` and needs an `override` modifier",
     });
+}
+
+test "a smart cast on an inherited property sees it as its receiver does" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\open class Subject<out T>(val actual: T?)
+        \\class StringSubject(a: String?) : Subject<String>(a)
+        \\fun StringSubject.len(): Int = if (actual == null) -1 else actual.length
+        \\fun StringSubject.lenThis(): Int = if (this.actual == null) -1 else actual.length
+        \\class Inside(a: String?) : Subject<String>(a) {
+        \\    fun len(): Int = if (actual != null) actual.length else -1
+        \\}
+    ,
+        \\package demo
+        \\class String { val length: Int get() = 0 }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("else actual.^length", "demo/String.length");
+}
+
+test "a smart cast on an inherited property keeps its type parameter's bound" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\open class Subject<out T>(val actual: T?)
+        \\class ComparableSubject<T : Comparable<T>>(a: T?) : Subject<T>(a)
+        \\fun <T : Comparable<T>> ComparableSubject<T>.greaterThan(other: T?): Boolean {
+        \\    requireNotNull(actual)
+        \\    requireNotNull(other)
+        \\    return actual > other
+        \\}
+        \\fun <T : Comparable<T>> ComparableSubject<T>.compareWith(other: T): Int {
+        \\    if (actual == null) return -2
+        \\    return actual.compareTo(other)
+        \\}
+    ,
+        \\package demo
+        \\interface Comparable<in T> { operator fun compareTo(other: T): Int }
+        \\fun <T : Any> requireNotNull(value: T?): T {
+        \\    contract { returns() implies (value != null) }
+        \\    return value!!
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("actual.^compareTo(other)", "demo/Comparable.compareTo");
 }
 
 test "a type alias of an inner class is found in scope, not among the receiver's members" {
