@@ -53,3 +53,12 @@
 	url = https://github.com/JakeWharton/mosaic
 	update = none
 	branch = 0.3.0
+# Upstream skiko: the org.jetbrains.skia binding layer takes its common Kotlin
+# API and its C glue. Treeless/sparse/shallow, update=none; see
+# scripts/init-skiko-submodule.sh.
+[submodule "kotlin-klio/klio-skiko/upstream"]
+	path = kotlin-klio/klio-skiko/upstream
+	url = https://github.com/JetBrains/skiko
+	update = none
+	shallow = true
+	branch = v0.150.1

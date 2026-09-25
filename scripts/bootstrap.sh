@@ -86,17 +86,19 @@ fi
 
 # --- 2. vendored submodules (kotlinx + ktor) -------------------------------
 # Regular submodules; the `update = none` sparse trees (kotlin, compose,
-# androidx-collection, mosaic) are cleanly skipped here and populated in phase 3.
+# androidx-collection, mosaic, skiko) are cleanly skipped here and populated in
+# phase 3.
 step "vendored submodules (kotlinx + ktor)"
 git submodule update --init --recursive
 note "done"
 
 # --- 3. sparse upstream checkouts ------------------------------------------
-step "sparse upstream sources (kotlin stdlib, compose, androidx.collection, mosaic)"
+step "sparse upstream sources (kotlin stdlib, compose, androidx.collection, mosaic, skiko)"
 ./scripts/init-kotlin-submodule.sh
 ./scripts/init-compose-submodule.sh
 ./scripts/init-androidx-collection-submodule.sh
 ./scripts/init-mosaic-submodule.sh
+./scripts/init-skiko-submodule.sh
 
 # --- 4. skia prebuilt (Compose-UI backend) ---------------------------------
 if [ "$DO_SKIA" -eq 1 ]; then

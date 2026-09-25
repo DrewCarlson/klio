@@ -30,13 +30,9 @@ where the upstream one needs the JVM, AWT or a native platform API.
 | `compose_ui` | ui-util, ui-geometry, ui-unit, ui-graphics, ui-text, ui commonTest | 452 | 0 | 452 / 0 |
 | compose runtime fleet | runtime commonTest + nonEmulatorCommonTest | 1138 | 0 | `scripts/compose-fleet.py` |
 | `compose_plugin_commontest` | the same sets, one child per class | 1404 | 0 | 1385 / 5 |
-| `compose_animation` | animation-core commonTest | 103 | 4 | 103 / 4 |
+| `compose_animation` | animation-core commonTest | 107 | 0 | 107 / 0 |
 | `compose_shapes` | graphics-shapes commonTest | 148 | 0 | 148 / 0 |
 
-The four animation-core failures are sema gaps in upstream Kruth's bodies
-(an inherited generic property keeps its supertype's `T` after a smart cast;
-a bound's members are not found on `T & Any`), routed to sema. The ratchet
-drops to 0 failures when that lands.
 
 Not run yet, and what each needs:
 

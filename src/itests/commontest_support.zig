@@ -707,8 +707,8 @@ pub const suites = [_]Config{
         .extra_args = &.{ "--feature", "kotlinx.coroutines/test" },
         .batch_dirs = true,
         .timeout_ms = 300_000,
-        .baseline = 103,
-        .max_failed = 4,
+        .baseline = 107,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
     .{
