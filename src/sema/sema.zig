@@ -174,6 +174,11 @@ pub const Sema = struct {
     /// with the enclosing body's locals visible, for a member's type asked
     /// for before the class body reaches it.
     local_class_scopes: std.AutoHashMapUnmanaged(Sym, *body.Scope) = .empty,
+    /// Properties whose setter a pass typing another declaration deferred.
+    /// That declaration's own pass resumes its own setter, but not those of
+    /// the properties of a class declared in its initializer, which it does
+    /// not revisit: `resolveAll` resumes whatever is still pending.
+    pending_setters: std.ArrayList(Sym) = .empty,
     /// Every reference resolved, in resolution order.
     refs: std.ArrayList(records.Ref) = .empty,
     /// The variables calls are inferring from the lambdas passed to them

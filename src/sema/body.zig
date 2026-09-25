@@ -320,6 +320,39 @@ pub fn resolveAll(s: *Sema, origins: []const sema_mod.Origin) Allocator.Error!vo
         if (!wanted) continue;
         try resolveFile(s, i);
     }
+    try resumePendingSetters(s);
+}
+
+/// Resolves every setter a typing pass deferred that no ordinary pass took
+/// up: a property of a class declared in the initializer of a property
+/// typed early (`val drawContext = object : DrawContext { override var
+/// density ... set(value) { ... } }`, typed for a use before its class
+/// body reached it) was resolved inside that typing, and the enclosing
+/// property's ordinary pass does not resolve its initializer again. Its
+/// setter resolves in the scope its class was resolved in.
+fn resumePendingSetters(s: *Sema) Allocator.Error!void {
+    var i: usize = 0;
+    // A setter resumed here may type another property and defer more.
+    while (i < s.pending_setters.items.len) : (i += 1) {
+        const p = s.pending_setters.items[i];
+        const info = s.syms.propertyInfo(p);
+        if (!info.setter_pending) continue;
+        info.setter_pending = false;
+        const sym = s.syms.get(p);
+        const pd = switch (sym.decl) {
+            .property => |pd| pd,
+            else => continue,
+        };
+        const st = pd.setter orelse continue;
+        var ctx = Ctx{ .s = s, .file = sym.file, .scope = try fileScope(s) };
+        try openMemberScope(&ctx, sym.owner);
+        const saved_node = ctx.enterNode(pd.id);
+        const sc = try pushPropertyScope(&ctx, p);
+        try resolveSetter(&ctx, p, st);
+        ctx.pop(sc);
+        ctx.leaveNode(saved_node);
+    }
+    s.pending_setters.clearRetainingCapacity();
 }
 
 /// The SAM constructor of every fun interface declared from `first` on,
@@ -733,6 +766,7 @@ fn resolvePropertyIn(ctx: *Ctx, p: Sym) Allocator.Error!void {
     if (pd.setter) |st| {
         if (ctx.typing_only) {
             s.syms.propertyInfo(p).setter_pending = true;
+            try s.pending_setters.append(s.arena, p);
         } else try resolveSetter(ctx, p, st);
     }
 }

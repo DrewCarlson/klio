@@ -2762,6 +2762,36 @@ test "members imported from an object are called and read on the object" {
     try std.testing.expect(s.syms.get(d.target).decl == .local_prop);
 }
 
+test "a setter in an object literal of a property typed early is resolved" {
+    // `read`'s getter needs `ctx`'s type before the class body reaches
+    // `ctx`, so `ctx`'s initializer, and the object's `density`, resolve
+    // while typing it; the setter waits for a pass that `ctx`'s own
+    // ordinary pass does not make.
+    var fx = try fixture(&.{
+        \\package demo
+        \\interface Ctx { var density: Int }
+        \\class Params { var density = 1 }
+        \\class Scope {
+        \\    val read: Int get() = ctx.density
+        \\    val params = Params()
+        \\    val ctx = object : Ctx {
+        \\        override var density: Int
+        \\            get() = params.density
+        \\            set(value) { params.density = value }
+        \\    }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const v = try fx.refAt("set(^value)", .decl);
+    try std.testing.expectEqualStrings("value", fx.s.str(fx.s.syms.name(v.target)));
+    // The body's references are recorded too.
+    const r = try fx.refAt("{ ^params.density = value }", .read);
+    try std.testing.expectEqualStrings("params", fx.s.str(fx.s.syms.name(r.target)));
+    try std.testing.expectEqual(@as(usize, 0), fx.s.pending_setters.items.len);
+}
+
 test "a plain function value passed for a suspend function type is converted" {
     var fx = try fixture(&.{
         \\package demo

@@ -1156,6 +1156,32 @@ test "locals, reassignment and parameters" {
     , "1\n5\n10\n1\n");
 }
 
+test "an object literal's setter runs when the property holding it was typed early" {
+    // `read`'s getter types `ctx` before the class body reaches it, which
+    // resolves the object's members while typing; the setter's body must
+    // still be resolved and lowered. Called directly, not through
+    // `expectRun`, so a missing record fails the test instead of skipping it.
+    try driver.expectOutput(&.{
+        \\interface Ctx { var density: Float }
+        \\class Params { var density = 1f }
+        \\class Scope {
+        \\    val read: Float get() = ctx.density
+        \\    val params = Params()
+        \\    val ctx = object : Ctx {
+        \\        override var density: Float
+        \\            get() = params.density
+        \\            set(value) { params.density = value }
+        \\    }
+        \\}
+        \\fun main() {
+        \\    val s = Scope()
+        \\    s.ctx.density = 3f
+        \\    println(s.params.density)
+        \\    println(s.read)
+        \\}
+    }, "3.0\n3.0\n");
+}
+
 test "a top-level property read before its initializer runs holds its seed" {
     try expectRun(
         \\val a: Int = b + 1
