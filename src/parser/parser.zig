@@ -1161,6 +1161,26 @@ test "a soft keyword followed by `:` names a parameter" {
     try testing.expect(f.params[3].is_vararg);
 }
 
+test "an extension receiver may end its line before the `.`" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\private inline fun <reified V : Any> Spec<V>
+        \\    .valueAt(t: Float): V = get(t)
+        \\val Spec<Int>
+        \\    .size: Int get() = 1
+        \\fun plain() = 2
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const f = out.file.decls[0].Function;
+    try testing.expectEqualStrings("valueAt", f.name.name);
+    try testing.expectEqualStrings("Spec", f.receiver_type.?.name.name);
+    const v = out.file.decls[1].Property;
+    try testing.expectEqualStrings("size", v.name.name);
+    try testing.expectEqualStrings("Spec", v.receiver_type.?.name.name);
+    try testing.expectEqualStrings("plain", out.file.decls[2].Function.name.name);
+}
+
 test "infix_call_no_newline_break" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

@@ -189,6 +189,7 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
                 break;
             }
         }
+        skipNl(p);
         // `T?.foo` lexes `?.` as one `QuestionDot`, which marks the receiver
         // nullable and serves as the dot before the function name.
         if (is(peekKind(p), .QuestionDot)) {
@@ -321,6 +322,11 @@ pub fn looksLikeExtensionReceiver(p: *const Parser) bool {
     }
     if (kindAt(p, j)) |k| {
         if (k.isQuestion()) j += 1;
+    }
+    // The `.` may start the next line (`Spec<V>\n    .valueAt(...)`).
+    while (kindAt(p, j)) |k| {
+        if (!is(&k, .Newline)) break;
+        j += 1;
     }
     // `T?.foo` lexes `?.` as one `QuestionDot`: nullable receiver plus separator.
     const at_j = kindAt(p, j);
@@ -786,6 +792,7 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
         var path: std.ArrayList(u8) = .empty;
         defer path.deinit(p.allocator);
         if (ty) |t| path.appendSlice(p.allocator, t.name.name) catch @panic("OOM");
+        skipNl(p);
         if (is(peekKind(p), .QuestionDot)) {
             if (ty) |*t| {
                 t.nullable = true;
