@@ -1,0 +1,11 @@
+[ws] welcome over http
+[ws] echo: hello
+[ws] echo: klio
+[ws] binary: 70000 bytes, checksum 8746781
+[ws] closed by the server: NORMAL goodbye
+[wss] welcome over https
+[wss] echo: hello
+[wss] echo: klio
+[wss] binary: 70000 bytes, checksum 8746781
+[wss] closed by the server: NORMAL goodbye
+server errors: 0

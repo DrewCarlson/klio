@@ -50,7 +50,12 @@ const mod_list = [_]Mod{
     .{ .name = "kotlinx_serialization", .deps = &.{ "runtime", "stdlib" }, .tested = true },
     .{ .name = "compose_runtime", .deps = &.{ "runtime", "stdlib" }, .tested = true },
     .{ .name = "compose_ui", .deps = &.{ "runtime", "stdlib" }, .tested = true },
-    .{ .name = "ktor_client", .deps = &.{ "runtime", "stdlib" }, .tested = true },
+    // The TLS test certificates under tests/fixtures/tls, embedded for the
+    // TLS engine's unit tests.
+    .{ .name = "tls_fixtures", .src = "tests/fixtures/tls/fixtures.zig" },
+    // The TLS 1.3 engine behind ktor-network-tls: pure std.crypto.
+    .{ .name = "ktor_tls", .deps = &.{"tls_fixtures"}, .tested = true },
+    .{ .name = "ktor_client", .deps = &.{ "runtime", "stdlib", "ktor_tls", "tls_fixtures" }, .tested = true },
     .{ .name = "typeck", .deps = &.{ "span", "ast", "diagnostics", "resolver", "types", "cfa" }, .tested = true },
     // Semantic analysis: resolves every reference to a declaration identity.
     .{ .name = "sema", .deps = &.{ "span", "ast", "lexer", "parser" }, .tested = true },
@@ -269,6 +274,16 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-ktor",
     }, .weight = 3 },
+    // End-to-end HTTPS gate: a background child `klio` serves an
+    // `sslConnector` on the `Klio` engine and std.crypto.tls.Client, in the
+    // test, verifies it against the test CA and talks HTTP/1.1 over it.
+    .{ .name = "ktor_https", .rss_cap_kb = null, .needs_exe = true, .home = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-io",
+        "kotlin-klio/klio-ktor",
+        "tests/fixtures/tls",
+    }, .weight = 2 },
     // Threaded stress gate for the pack concurrency primitives
     // (ConcurrentMap/Attributes computeIfAbsent once-only, the ktor locks
     // actuals, ByteChannel written from a Default worker) through child
@@ -440,7 +455,7 @@ const interp_env_keys = [_][]const u8{
     "KLIO_TRACE_RESOLVE",
     "KLIO_TRACE_INVARIANTS",
     "KLIO_TRACE_PATH",
-    "KLIO_TRACE_HTTP",
+    "KLIO_NET_TRACE",
     "KLIO_LINK_AUDIT",
     "KLIO_STDLIB_PACK",
     "KLIO_PACK_DIAG",

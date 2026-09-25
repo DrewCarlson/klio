@@ -84,22 +84,22 @@ pub fn register(b: *HostBindings) Allocator.Error!void {
 
 // ---- argument and result helpers ------------------------------------------
 
-fn argInt(ctx: *const CallCtx, i: usize) i64 {
+pub fn argInt(ctx: *const CallCtx, i: usize) i64 {
     if (i >= ctx.args.len) return 0;
     return ctx.args[i].asI64() orelse 0;
 }
 
-fn int(v: i64) EvalResult {
+pub fn int(v: i64) EvalResult {
     return .{ .ok = Value.newInt(v) };
 }
 
-fn typeErr(msg: []const u8) EvalResult {
+pub fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
 
 /// Runs `f` over the bytes of the ByteArray argument `i` (`mutable` for a
 /// write into it). A boxed array is copied through a scratch buffer.
-fn withBytes(
+pub fn withBytes(
     ctx: *CallCtx,
     i: usize,
     comptime mutable: bool,
@@ -159,7 +159,7 @@ fn byteArrayCopy(ctx: *const CallCtx, i: usize, out: []u8) ?[]u8 {
     }
 }
 
-fn newByteArray(a: Allocator, bytes: []const u8) Allocator.Error!Value {
+pub fn newByteArray(a: Allocator, bytes: []const u8) Allocator.Error!Value {
     var pb = runtime.PrimBuf{ .kind = .Byte };
     try pb.bytes.appendSlice(a, bytes);
     return .{ .Array = runtime.ArrayData.scalars(try runtime.ObjRef(runtime.PrimBuf).initOwned(a, pb), .Byte) };
@@ -687,6 +687,22 @@ pub fn pollFds(pfds: []c.pollfd, timeout_ms: i64) i32 {
     }
 }
 
+/// Polls in flight across threads, for `KLIO_NET_TRACE`.
+var polls_in_flight = std.atomic.Value(i64).init(0);
+
+/// `KLIO_NET_TRACE`: one line as a selector poll starts (`rc` null) and one as
+/// it returns, with the thread, the polls then in flight and the descriptors.
+fn tracePoll(fds: []const i32, timeout_ms: i64, rc: ?i32) void {
+    const tid = std.Thread.getCurrentId();
+    if (rc) |r| {
+        const n = polls_in_flight.fetchSub(1, .monotonic) - 1;
+        std.debug.print("[kknet] poll exit tid={d} in_flight={d} rc={d}\n", .{ tid, n, r });
+        return;
+    }
+    const n = polls_in_flight.fetchAdd(1, .monotonic) + 1;
+    std.debug.print("[kknet] poll enter tid={d} in_flight={d} timeout={d} fds={any}\n", .{ tid, n, timeout_ms, fds });
+}
+
 /// `poll(fds, events, revents, count, timeoutMs)`: `events` holds `poll_in` /
 /// `poll_out` bits per descriptor, `revents` receives the ready bits plus
 /// `poll_err`, `poll_hup`, `poll_nval`. A negative timeout waits until an
@@ -708,7 +724,10 @@ fn nPoll(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (ev & poll_out != 0) events |= posix.POLL.OUT;
         p.* = .{ .fd = fd, .events = events, .revents = 0 };
     }
+    const trace = runtime.envOnce("KLIO_NET_TRACE") != null;
+    if (trace) tracePoll(fds, argInt(ctx, 4), null);
     const rc = pollFds(pfds, argInt(ctx, 4));
+    if (trace) tracePoll(fds, argInt(ctx, 4), rc);
     if (rc > 0 and ctx.args.len > 2 and ctx.args[2] == .Array) {
         const out = ctx.args[2].Array;
         const n = @min(count, out.len());

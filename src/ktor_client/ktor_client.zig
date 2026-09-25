@@ -17,6 +17,8 @@ const HostBindings = stdlib.HostBindings;
 const Allocator = std.mem.Allocator;
 
 pub const net = @import("net.zig");
+pub const tls = @import("tls.zig");
+pub const zlib = @import("zlib.zig");
 
 pub fn hostBindings(allocator: Allocator) Allocator.Error!HostBindings {
     var b = HostBindings.init(allocator);
@@ -36,6 +38,8 @@ pub fn hostBindings(allocator: Allocator) Allocator.Error!HostBindings {
     try b.register("io.ktor.utils.io.locks.ReentrantLock.unlock", stdlib.implementations.concurrent_lock_exit);
     try b.register("io.ktor.utils.io.locks.synchronized", stdlib.implementations.concurrent_synchronized);
     try net.register(&b);
+    try tls.register(&b);
+    try zlib.register(&b);
     return b;
 }
 
@@ -360,6 +364,8 @@ const testing = std.testing;
 
 test {
     _ = net;
+    _ = tls;
+    _ = zlib;
 }
 
 fn makeCtx(allocator: Allocator, host: runtime.IntrinsicHost, out: Output, args: []const Value) CallCtx {

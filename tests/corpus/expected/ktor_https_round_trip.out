@@ -1,0 +1,6 @@
+hello over HTTP/1.1 and TLS
+hello over HTTP/1.1 and TLS
+echoed 100006 characters
+untrusted: TlsPeerUnverifiedException: the server certificate is not issued by a trusted authority (sent alert unknown_ca)
+wrong host: TlsPeerUnverifiedException: the server certificate is not valid for this host (sent alert bad_certificate)
+server responded at https: true

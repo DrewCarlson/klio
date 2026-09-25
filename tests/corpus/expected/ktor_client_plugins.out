@@ -1,0 +1,16 @@
+client says klio
+ok after 3 calls
+slow: timed out
+logged in
+session s-42
+secret for user-of-fresh-token
+logged requests:
+  REQUEST: /agent
+  REQUEST: /flaky
+  REQUEST: /flaky
+  REQUEST: /flaky
+  REQUEST: /slow
+  REQUEST: /login
+  REQUEST: /whoami
+  REQUEST: /secret
+  REQUEST: /secret

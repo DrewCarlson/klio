@@ -1,0 +1,10 @@
+/hello/klio -> 200 Hello, klio!
+/health -> 200 ok
+/old -> 302 /hello/klio
+/missing -> 404 
+server log:
+  INFO greeting klio {call-id=call-1, path=/hello/klio}
+  INFO still in the call on another dispatcher {call-id=call-1, path=/hello/klio}
+  INFO 200 OK: GET - /hello/klio in 0ms {call-id=call-1, path=/hello/klio}
+  INFO 302 Found: GET - /old in 0ms -> /hello/klio {call-id=call-3, path=/old}
+  INFO 404 Not Found: GET - /missing in 0ms {call-id=call-4, path=/missing}

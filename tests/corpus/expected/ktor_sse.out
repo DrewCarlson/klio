@@ -1,0 +1,6 @@
+content type: text/event-stream
+id=1 event=release data=klio 1.0 released
+id=2 event=note data=line one\nline two
+id=3 event=null data=bye
+news stream ended
+countdown: [4, 3, 2, 1, liftoff]

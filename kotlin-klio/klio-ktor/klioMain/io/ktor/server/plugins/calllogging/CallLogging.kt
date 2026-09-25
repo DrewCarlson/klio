@@ -1,0 +1,101 @@
+/*
+* Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+*/
+
+// klio's CallLogging: upstream's JVM plugin with its org.slf4j types replaced
+// by ktor's own. The level is an io.ktor.util.logging.LogLevel, and the MDC
+// entries go to klio.logging.MDC. There is no console to install for ANSI
+// colors: the colors are escape sequences in the message, as on the JVM.
+
+package io.ktor.server.plugins.calllogging
+
+import io.ktor.server.application.*
+import io.ktor.server.application.hooks.*
+import io.ktor.server.http.content.*
+import io.ktor.util.*
+import io.ktor.util.date.*
+import io.ktor.util.logging.*
+
+internal val CALL_START_TIME = AttributeKey<Long>("CallStartTime")
+
+/**
+ * Returns time in millis from the moment the call was received until now
+ *
+ * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.server.plugins.calllogging.processingTimeMillis)
+ */
+public fun ApplicationCall.processingTimeMillis(clock: () -> Long = { getTimeMillis() }): Long {
+    val startTime = attributes[CALL_START_TIME]
+    return clock() - startTime
+}
+
+/**
+ * A plugin that allows you to log incoming client requests.
+ * You can configure [CallLogging] in multiple ways: specify a logging level,
+ * filter requests based on a specified condition, customize log messages, and so on.
+ *
+ * You can learn more from [Call logging](https://ktor.io/docs/call-logging.html).
+ *
+ * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.server.plugins.calllogging.CallLogging)
+ */
+public val CallLogging: ApplicationPlugin<CallLoggingConfig> = createApplicationPlugin(
+    "CallLogging",
+    ::CallLoggingConfig
+) {
+    val log = pluginConfig.logger ?: application.log
+    val filters = pluginConfig.filters
+    val formatCall = pluginConfig.formatCall
+    val clock = pluginConfig.clock
+    val ignoreStaticContent = pluginConfig.ignoreStaticContent
+
+    fun log(message: String) = when (pluginConfig.level) {
+        LogLevel.ERROR -> log.error(message)
+        LogLevel.WARN -> log.warn(message)
+        LogLevel.INFO -> log.info(message)
+        LogLevel.DEBUG -> log.debug(message)
+        LogLevel.TRACE -> log.trace(message)
+    }
+
+    fun logSuccess(call: ApplicationCall) {
+        if ((ignoreStaticContent && call.isStaticContent()) || (filters.isNotEmpty() && filters.none { it(call) })) {
+            return
+        }
+        log(formatCall(call))
+    }
+
+    setupMDCProvider()
+
+    on(CallSetup) { call ->
+        call.attributes.put(CALL_START_TIME, clock())
+    }
+
+    if (pluginConfig.mdcEntries.isEmpty()) {
+        logCompletedCalls(::logSuccess)
+        return@createApplicationPlugin
+    }
+
+    logCallsWithMDC(::logSuccess)
+}
+
+private fun PluginBuilder<CallLoggingConfig>.logCompletedCalls(logSuccess: (ApplicationCall) -> Unit) {
+    on(ResponseSent) { call ->
+        logSuccess(call)
+    }
+}
+
+private fun PluginBuilder<CallLoggingConfig>.logCallsWithMDC(logSuccess: (ApplicationCall) -> Unit) {
+    val entries = pluginConfig.mdcEntries
+
+    on(MDCHook(ApplicationCallPipeline.Monitoring)) { call, proceed ->
+        withMDC(entries, call, proceed)
+    }
+
+    on(MDCHook(ApplicationCallPipeline.Call)) { call, proceed ->
+        withMDC(entries, call, proceed)
+    }
+
+    on(ResponseSent) { call ->
+        withMDC(entries, call) {
+            logSuccess(call)
+        }
+    }
+}

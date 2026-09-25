@@ -4,7 +4,8 @@
 
 // `Klio`, the name klio's server engine has always had:
 // `embeddedServer(Klio, port) { ... }`. It is the CIO engine, HTTP/1.1 over
-// ktor-network with keep-alive, streaming bodies and WebSocket upgrade.
+// ktor-network with keep-alive, streaming bodies and WebSocket upgrade, plus
+// HTTPS connectors (`sslConnector`) over klio's TLS engine.
 
 package io.ktor.server.engine.klio
 
@@ -18,7 +19,7 @@ import io.ktor.server.engine.ApplicationEngineFactory
 /**
  * Engine factory: `embeddedServer(Klio, port) { … }`.
  */
-public object Klio : ApplicationEngineFactory<CIOApplicationEngine, CIOApplicationEngine.Configuration> {
+public object Klio : ApplicationEngineFactory<KlioApplicationEngine, CIOApplicationEngine.Configuration> {
     override fun configuration(
         configure: CIOApplicationEngine.Configuration.() -> Unit
     ): CIOApplicationEngine.Configuration = CIO.configuration(configure)
@@ -29,7 +30,7 @@ public object Klio : ApplicationEngineFactory<CIOApplicationEngine, CIOApplicati
         developmentMode: Boolean,
         configuration: CIOApplicationEngine.Configuration,
         applicationProvider: () -> Application
-    ): CIOApplicationEngine = CIO.create(environment, monitor, developmentMode, configuration, applicationProvider)
+    ): KlioApplicationEngine = KlioApplicationEngine(environment, monitor, developmentMode, configuration, applicationProvider)
 
     override fun toString(): String = "Klio"
 }

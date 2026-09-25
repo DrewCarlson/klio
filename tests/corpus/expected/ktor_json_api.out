@@ -1,0 +1,7 @@
+201 Book(id=2, title=Programming Kotlin, tags=[kotlin, coroutines]) api 1
+all: [Kotlin in Action, Programming Kotlin]
+json: {"id":2,"title":"Programming Kotlin","tags":["kotlin","coroutines"]}
+404 ApiError(status=404, message=no book 9)
+400 ApiError(status=400, message=id must be a number)
+400 ApiError(status=400, message=title is empty)
+delete: 204, then 404

@@ -53,7 +53,9 @@ GRAPH = {
     "kotlinx_serialization": ["runtime", "stdlib"],
     "compose_runtime": ["runtime", "stdlib"],
     "compose_ui": ["runtime", "stdlib"],
-    "ktor_client": ["runtime", "stdlib"],
+    "tls_fixtures": [],
+    "ktor_tls": ["tls_fixtures"],
+    "ktor_client": ["runtime", "stdlib", "ktor_tls", "tls_fixtures"],
     "typeck": ["span", "ast", "diagnostics", "resolver", "types", "cfa"],
     "sema": ["span", "ast", "lexer", "parser"],
     "lower_driver": ["span", "ast", "lexer", "parser", "sema", "ir", "runtime", "stdlib", "interp_ir"],
@@ -74,6 +76,7 @@ PATH_OVERRIDES = {
     "sema_actuals_embedded": "src/cli/sema_actuals_stub.zig",
     "klio_child": "src/itests/klio_child.zig",
     "kotlinc_support": "src/itests/kotlinc_support.zig",
+    "tls_fixtures": "tests/fixtures/tls/fixtures.zig",
 }
 
 

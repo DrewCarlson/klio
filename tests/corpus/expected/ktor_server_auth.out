@@ -1,0 +1,10 @@
+basic, no credentials: 401 Basic realm=klio, charset=UTF-8
+basic, ada: 200 hello ada
+basic, wrong password: 401
+form login, wrong password: 401 bad login
+form login: 200 welcome alan, cookie user_session
+profile: alan, visit 1
+profile: alan, visit 2
+profile, no cookie: no session
+preflight from app.example.com: 200 allow-origin=https://app.example.com allow-headers=Authorization
+preflight from evil.example.com: 403

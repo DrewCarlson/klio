@@ -340,8 +340,7 @@ overrides and traces.
 
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
-| `KLIO_TRACE_HTTP` | set | Logs each outbound ktor HTTP request (method + URL) before the transport runs | `[HTTP]` |
-| `KLIO_SERVE_MAX` | number (`0`/unset unlimited) | Caps the embedded ktor server to N requests so a leak-checking run reaches its exit report | none |
+| `KLIO_NET_TRACE` | set | One line as each ktor-network selector `poll` starts and one as it returns: the thread, how many polls are in flight across threads, the timeout and the descriptors. A poll that never returns names a selector that was never closed | `[kknet]` |
 | `KLIO_DOLLAR_TRACE` | set | Lexer trace for multi-dollar string-template arming (file, position, source window) | `[dollar-arm]` |
 | `KLIO_REPEAT_DBG` | set | The `String.repeat` intrinsic's argument tags per call | `[srep]` |
 | `KLIO_SEQ_DIAG` | set | A sequence drain whose iterator lacks `hasNext`, with the iterator's kind and FQN | `[seq-diag]` |

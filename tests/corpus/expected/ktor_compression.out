@@ -1,0 +1,8 @@
+report: decoded by [gzip], intact true
+report as deflate: decoded by [deflate], intact true
+short body under deflate's minimum size: tiny, decoded by []
+received 11052 characters, decoded by [gzip]
+on the wire: gzip, under a fifth of the text: true
+gzip magic: 31 139
+GZipEncoder decodes the wire bytes: true
+server errors: 0

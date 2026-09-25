@@ -494,11 +494,12 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-io/common/test",
             "kotlin-klio/klio-ktor/upstream/ktor-utils/common/test",
             "kotlin-klio/klio-ktor/upstream/ktor-http/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-http/ktor-http-cio/common/test",
         },
-        // Pinning http (which pulls utils and io) keeps the load from
-        // activating serialization.
-        .extra_args = &.{ "--feature", "io.ktor/http", "--feature", "io.ktor/test-base" },
-        .baseline = 464,
+        // Pinning http-cio (which pulls http, utils and io) keeps the load
+        // from activating serialization.
+        .extra_args = &.{ "--feature", "io.ktor/http-cio", "--feature", "io.ktor/test-base" },
+        .baseline = 496,
         .max_failed = 0,
         .max_incomplete = 2,
     },
@@ -546,10 +547,134 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-test-base/common/test",
         },
         .extra_args = &.{ "--feature", "io.ktor/server-test-base,serialization-kotlinx-json" },
-        .baseline = 138,
-        // RegexRoutingTest x9: the stdlib Regex has no `\p{Alpha}` class, which
-        // the regex route selector finds group names with.
-        .max_failed = 9,
+        .baseline = 147,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        // ktor-server-cio's commonTest: the CIO engine through the shared
+        // engine suites (HTTP, WebSockets) over real loopback sockets.
+        .name = "ktor_server_cio",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-cio/common/test",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/server-cio,server-test-suites" },
+        .timeout_ms = 300_000,
+        // CIOEngineTest.kt does not finish: a cancelled delay or withTimeout
+        // timer holds its pool worker until it would have fired, so each
+        // test's server stop waits seconds for a free IO worker.
+        .baseline = 4,
+    },
+    .{
+        // ktor-server-tests' commonTest (routing, sessions, cookies, the
+        // plugins of the `ktor-server` umbrella), with upstream's JVM
+        // CompressionTest and CompressionAcceptEncodingTest ported to klio.
+        .name = "ktor_server_tests",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-tests/common/test",
+            "kotlin-klio/klio-ktor/klioTest/io/ktor/server/plugins/compression",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/server-test-host,test-base,server-rate-limit,server-auto-head-response,server-caching-headers,server-call-id,server-compression,server-conditional-headers,server-content-negotiation,server-cors,server-data-conversion,server-double-receive,server-forwarded-header,server-hsts,server-http-redirect,server-method-override,server-partial-content,server-sessions,server-sse,server-status-pages,serialization-kotlinx-json" },
+        // HSTSTest x8: a lambda whose parameter type comes from the other
+        // side of `?:` loses the receiver of a nested `run`, so the default
+        // filter's body is empty (sema). SessionTest x3: a reified type
+        // argument inferred from a sibling argument of `assertEquals` is
+        // `Any` (sema).
+        .timeout_ms = 90_000,
+        .baseline = 444,
+        .max_failed = 11,
+        .max_incomplete = 0,
+    },
+    .{
+        // The server plugin modules' commonTest suites, each over
+        // `testApplication`.
+        .name = "ktor_server_plugins",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-auth/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-auth-api-key/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-body-limit/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-caching-headers/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-content-negotiation/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-csrf/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-default-headers/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-double-receive/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-rate-limit/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-request-validation/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-resources/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-sessions/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-sse/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-status-pages/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-websockets/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-plugins/ktor-server-di/common/test",
+            // Upstream's JVM CallLoggingTest on klio's CallLogging port.
+            "kotlin-klio/klio-ktor/klioTest/io/ktor/server/plugins/calllogging",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/server-test-host,server-auth,server-auth-api-key,server-body-limit,server-caching-headers,server-call-logging,server-content-negotiation,server-csrf,server-default-headers,server-di,server-double-receive,server-rate-limit,server-request-validation,server-resources,server-sessions,server-sse,server-status-pages,server-websockets,server-call-id,client-content-negotiation,client-websockets,serialization-kotlinx-json,test-base" },
+        // OAuth2Test's hung case fails on runTest's own 60 s timeout; the
+        // child needs the time to report it.
+        .timeout_ms = 90_000,
+        // RateLimitTest x12: a cancelled `delay` holds its pool worker until it
+        // would have fired, so requests stall behind the refill timers.
+        // ServerSentEventsTest heartbeat x3: `withTimeout` on a
+        // limitedParallelism(1) dispatcher. AuthorizeHeaderParserTest x3: an
+        // `assertIs` contract is not substituted at the call. OAuth2Test x1: a
+        // generated serializer's `Encoder` resolves to `io.ktor.util.Encoder`.
+        // DependencyInjectionTest x4: a constructor reference picks the
+        // `provide(KClass)` member over the function-type overloads (x2), a
+        // reified `provideDelegate` is not inferred from the property type,
+        // and the `assertIs` contract again (sema).
+        .baseline = 274,
+        .max_failed = 23,
+        .max_incomplete = 0,
+    },
+    .{
+        // The client plugin modules' commonTest suites, over `MockEngine` and
+        // `testApplication`.
+        .name = "ktor_client_plugins",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-auth/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-call-id/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-content-negotiation/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-encoding/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-resources/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-websockets/common/test",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/client-mock,client-test-base,client-auth,client-call-id,client-content-negotiation,client-encoding,client-resources,client-websockets,client-logging,server-test-host,server-call-id,serialization-kotlinx-json" },
+        .baseline = 122,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        // ktor-serialization-kotlinx-json's commonTest over the shared
+        // serialization test base.
+        .name = "ktor_serialization",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/ktor-serialization-kotlinx-json/common/test",
+        },
+        .extra_support = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/ktor-serialization-kotlinx-tests/common/src/AbstractSerializationTest.kt",
+            "kotlin-klio/klio-ktor/upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/ktor-serialization-kotlinx-tests/common/src/AbstractContextualSerializationTest.kt",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/serialization-kotlinx-json,client-mock,client-content-negotiation,test-base" },
+        // testRegisterCustomFlow: the JSON extension that streams a Flow is
+        // registered by an `@EagerInitialization` property, which klio does
+        // not run, so the Flow falls to the polymorphic serializer.
+        .baseline = 13,
+        .max_failed = 1,
+        .max_incomplete = 0,
+    },
+    .{
+        // The shared modules' commonTest suites: the WebSocket frame and
+        // session model, type-safe resources and the test base.
+        .name = "ktor_shared",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-shared/ktor-websockets/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-shared/ktor-resources/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-shared/ktor-test-base/common/test",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/websockets,resources,test-base" },
+        .baseline = 50,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
     .{

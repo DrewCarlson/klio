@@ -47,13 +47,16 @@ root = "upstream/ktor-io/jvmAndPosix/src"
 # under klioMain/io/ktor/util, the posix files that reach the platform
 # through cinterop: the nonce source and `Digest` (CryptoNative), the GMTDate
 # clock (DateNative), `KtorSimpleLogger` (its `getenv`), `DISABLE_SFG`
-# (PipelineContext.posix) and the signal-based `ThreadInfo`.
+# (PipelineContext.posix) and the signal-based `ThreadInfo`. The gzip and
+# deflate encoders, identity encoders on posix, compress for real over host
+# natives (ContentEncodersKlio).
 [[source]]
 root = "upstream/ktor-utils/common/src"
 
 [[source]]
 root = "upstream/ktor-utils/posix/src"
 exclude = [
+    "io/ktor/util/ContentEncodersNative.kt",
     "io/ktor/util/CryptoNative.kt",
     "io/ktor/util/ThreadInfo.kt",
     "io/ktor/util/date/DateNative.kt",
@@ -178,13 +181,16 @@ root = "upstream/ktor-client/ktor-client-core/common/src"
 # through cinterop: the environment and `getenv` bridges
 # (EnvironmentUtilsNix, EnvironmentUtils.nix), the signal shutdown hook
 # (ShutdownHookNative), the processor count and stderr writer
-# (ApplicationUtilsNix) and the hostname escape (EngineUtilsNix).
+# (ApplicationUtilsNix) and the hostname escape (EngineUtilsNix). It also
+# replaces the native receive transformation, which refuses multipart, with
+# the JVM's multipart parsing over ktor-http-cio (DefaultTransformNix).
 [[source]]
 root = "upstream/ktor-server/ktor-server-core/common/src"
 
 [[source]]
 root = "upstream/ktor-server/ktor-server-core/posix/src"
 exclude = [
+    "io/ktor/server/engine/DefaultTransformNix.kt",
     "io/ktor/server/engine/EnvironmentUtilsNix.kt",
     "io/ktor/server/engine/ShutdownHookNative.kt",
     "io/ktor/server/engine/internal/ApplicationUtilsNix.kt",
@@ -228,12 +234,19 @@ include = [
 ]
 
 # ktor-network-tls: the TLS configuration, cipher-suite and extension model
-# and the `Socket.tls()` entry points.
+# and the `Socket.tls()` entry points. Upstream's non-JVM targets have no TLS
+# session; klio's actuals under klioMain/io/ktor/network/tls replace the
+# session and configuration stubs with sessions over klio's TLS 1.3 engine.
 [[source]]
 root = "upstream/ktor-network/ktor-network-tls/common/src"
 
 [[source]]
 root = "upstream/ktor-network/ktor-network-tls/nonJvm/src"
+exclude = [
+    "io/ktor/network/tls/TLSClientSession.nonJvm.kt",
+    "io/ktor/network/tls/TLSConfig.nonJvm.kt",
+    "io/ktor/network/tls/TLSConfigBuilder.nonJvm.kt",
+]
 
 # ktor-client-cio: the coroutine-based HTTP/1.1 client engine over
 # ktor-network, verbatim. Its posix `Loader.posix.kt` registers the engine
@@ -279,6 +292,177 @@ root = "upstream/ktor-server/ktor-server-test-base/nonJvm/src"
 
 [[source]]
 root = "upstream/ktor-server/ktor-server-test-base/posix/src"
+
+# ktor-server-test-suites: the engine test suites (HTTP, WebSockets) the
+# server engines' commonTests extend.
+[[source]]
+root = "upstream/ktor-server/ktor-server-test-suites/common/src"
+
+# ktor-client-test-base: the client test helpers (`testWithEngine`,
+# `clientTests`) the client modules' commonTests use.
+[[source]]
+root = "upstream/ktor-client/ktor-client-test-base/common/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-test-base/nonJvm/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-test-base/posix/src"
+
+# The plugin modules and their shared models, verbatim. Each is its own
+# feature (see [features]); a posix file that reaches the platform through
+# cinterop has a klio actual under klioMain instead.
+[[source]]
+root = "upstream/ktor-shared/ktor-call-id/common/src"
+
+[[source]]
+root = "upstream/ktor-shared/ktor-resources/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-auth/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-auth/posix/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-auth-api-key/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-auto-head-response/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-body-limit/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-caching-headers/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-call-id/common/src"
+
+# `callIdMdc()`, the CallLogging entry for the call id.
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-call-id/jvm/src"
+
+# CallLogging is JVM-only upstream and typed on org.slf4j. Its hooks and MDC
+# provider run verbatim; the plugin, its config and the MDC helpers are klio
+# ports under klioMain/io/ktor/server/plugins/calllogging.
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-call-logging/jvm/src"
+exclude = [
+    "io/ktor/server/plugins/calllogging/CallLogging.kt",
+    "io/ktor/server/plugins/calllogging/CallLoggingConfig.kt",
+    "io/ktor/server/plugins/calllogging/MDCEntryUtils.kt",
+]
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-conditional-headers/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-compression/jvm/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-cors/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-csrf/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-data-conversion/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-default-headers/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-di/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-di/nonJvm/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-double-receive/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-double-receive/posix/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-forwarded-header/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-hsts/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-http-redirect/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-method-override/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-partial-content/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-partial-content/posix/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-rate-limit/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-request-validation/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-resources/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-sessions/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-sessions/jvmAndPosix/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-sessions/posix/src"
+exclude = [
+    "io/ktor/server/sessions/SessionDeferral.posix.kt",
+]
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-sse/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-status-pages/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-status-pages/posix/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-websockets/common/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-auth/common/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-bom-remover/common/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-call-id/common/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-encoding/common/src"
+
+# klio's engines hand the plugin the body as sent, like the posix engines
+# other than Darwin's.
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-encoding/nonDarwinPosix/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-logging/common/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-logging/posix/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-resources/common/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-websockets/common/src"
 
 # klio-authored actuals for every module, placed in their module by package
 # path: `io/ktor/utils/io` (ktor-io: locks, the terminal codecs, the
@@ -333,6 +517,7 @@ sources = [
 sources = [
     "upstream/ktor-utils/",
     "klioMain/io/ktor/util/",
+    "klioMain/klio/logging/",
 ]
 requires = ["io"]
 
@@ -426,7 +611,10 @@ requires = ["utils"]
 # ktor-network-tls (`io.ktor.network.tls.*`): TLS over a connected socket.
 # Depends on ktor-network.
 [features.network-tls]
-sources = ["upstream/ktor-network/ktor-network-tls/"]
+sources = [
+    "upstream/ktor-network/ktor-network-tls/",
+    "klioMain/io/ktor/network/tls/",
+]
 requires = ["network"]
 
 # ktor-client-core (`io.ktor.client.*`): the real upstream client (the engine
@@ -460,7 +648,7 @@ sources = [
     "upstream/ktor-server/ktor-server-cio/",
     "klioMain/io/ktor/server/engine/klio/",
 ]
-requires = ["server-core", "network", "http-cio"]
+requires = ["server-core", "network", "network-tls", "http-cio"]
 
 # ktor-client-mock (`io.ktor.client.engine.mock.*`): `MockEngine`.
 [features.client-mock]
@@ -487,7 +675,7 @@ sources = [
     "upstream/ktor-server/ktor-server-core/",
     "klioMain/io/ktor/server/",
 ]
-requires = ["http", "events", "serialization", "websockets"]
+requires = ["http", "http-cio", "events", "serialization", "websockets"]
 
 # ktor-client-content-negotiation
 # (`io.ktor.client.plugins.contentnegotiation.*`): `ContentNegotiation`
@@ -502,3 +690,220 @@ requires = ["client-core", "serialization"]
 [features.server-content-negotiation]
 sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-content-negotiation/"]
 requires = ["server-core"]
+
+# ktor-server-test-suites (`io.ktor.server.testing.suites.*`): the shared
+# engine test suites.
+[features.server-test-suites]
+sources = ["upstream/ktor-server/ktor-server-test-suites/"]
+requires = [
+    "server-test-base",
+    "server-forwarded-header",
+    "server-auto-head-response",
+    "server-status-pages",
+    "server-hsts",
+    "server-websockets",
+    "server-sse",
+]
+
+# ktor-client-test-base (`io.ktor.client.test.base.*`): the client test
+# helpers.
+[features.client-test-base]
+sources = ["upstream/ktor-client/ktor-client-test-base/"]
+requires = ["client-core", "test-base"]
+
+# `callid.*` (ktor-call-id): the call id coroutine context element.
+[features.call-id]
+sources = ["upstream/ktor-shared/ktor-call-id/"]
+requires = ["utils"]
+
+# `resources.*` (ktor-resources): type-safe resource classes and their URLs.
+[features.resources]
+sources = ["upstream/ktor-shared/ktor-resources/"]
+requires = ["http"]
+deps = ["kotlinx.serialization"]
+
+# `server.auth.*` (ktor-server-auth): Authentication with basic, bearer, digest, form, session and OAuth providers.
+[features.server-auth]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-auth/"]
+requires = ["server-core", "client-core", "server-sessions"]
+deps = ["kotlinx.serialization/json"]
+
+# `server.auth.apikey.*` (ktor-server-auth-api-key): API key authentication.
+[features.server-auth-api-key]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-auth-api-key/"]
+requires = ["server-auth"]
+
+# `server.plugins.autohead.*` (ktor-server-auto-head-response): AutoHeadResponse.
+[features.server-auto-head-response]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-auto-head-response/"]
+requires = ["server-core"]
+
+# `server.plugins.bodylimit.*` (ktor-server-body-limit): RequestBodyLimit.
+[features.server-body-limit]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-body-limit/"]
+requires = ["server-core"]
+
+# `server.plugins.cachingheaders.*` (ktor-server-caching-headers): CachingHeaders.
+[features.server-caching-headers]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-caching-headers/"]
+requires = ["server-core"]
+
+# `server.plugins.callid.*` (ktor-server-call-id): CallId.
+[features.server-call-id]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-call-id/"]
+requires = ["server-core", "call-id", "server-call-logging"]
+
+# `server.plugins.calllogging.*` (ktor-server-call-logging): CallLogging,
+# with LogLevel for the level and klio.logging.MDC for the MDC entries.
+[features.server-call-logging]
+sources = [
+    "upstream/ktor-server/ktor-server-plugins/ktor-server-call-logging/",
+    "klioMain/io/ktor/server/plugins/calllogging/",
+]
+requires = ["server-core"]
+
+# `server.plugins.conditionalheaders.*` (ktor-server-conditional-headers): ConditionalHeaders.
+[features.server-conditional-headers]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-conditional-headers/"]
+requires = ["server-core"]
+
+# `server.plugins.compression.*` (ktor-server-compression): Compression and
+# RequestDecompression. Upstream ships it for the JVM only; its source uses
+# no JVM API, and the gzip and deflate encoders are klio's.
+[features.server-compression]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-compression/"]
+requires = ["server-core"]
+
+# `server.plugins.cors.*` (ktor-server-cors): CORS.
+[features.server-cors]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-cors/"]
+requires = ["server-core"]
+
+# `server.plugins.csrf.*` (ktor-server-csrf): CSRF.
+[features.server-csrf]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-csrf/"]
+requires = ["server-core"]
+
+# `server.plugins.dataconversion.*` (ktor-server-data-conversion): DataConversion.
+[features.server-data-conversion]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-data-conversion/"]
+requires = ["server-core"]
+
+# `server.plugins.defaultheaders.*` (ktor-server-default-headers): DefaultHeaders.
+[features.server-default-headers]
+sources = [
+    "upstream/ktor-server/ktor-server-plugins/ktor-server-default-headers/",
+    "klioMain/io/ktor/server/plugins/defaultheaders/",
+]
+requires = ["server-core"]
+
+# `server.plugins.di.*` (ktor-server-di): DependencyInjection.
+[features.server-di]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-di/"]
+requires = ["server-core"]
+
+# `server.plugins.doublereceive.*` (ktor-server-double-receive): DoubleReceive.
+[features.server-double-receive]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-double-receive/"]
+requires = ["server-core"]
+
+# `server.plugins.forwardedheaders.*` (ktor-server-forwarded-header): ForwardedHeaders, XForwardedHeaders.
+[features.server-forwarded-header]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-forwarded-header/"]
+requires = ["server-core"]
+
+# `server.plugins.hsts.*` (ktor-server-hsts): HSTS.
+[features.server-hsts]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-hsts/"]
+requires = ["server-core"]
+
+# `server.plugins.httpsredirect.*` (ktor-server-http-redirect): HttpsRedirect.
+[features.server-http-redirect]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-http-redirect/"]
+requires = ["server-core"]
+
+# `server.plugins.methodoverride.*` (ktor-server-method-override): XHttpMethodOverride.
+[features.server-method-override]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-method-override/"]
+requires = ["server-core"]
+
+# `server.plugins.partialcontent.*` (ktor-server-partial-content): PartialContent.
+[features.server-partial-content]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-partial-content/"]
+requires = ["server-conditional-headers"]
+
+# `server.plugins.ratelimit.*` (ktor-server-rate-limit): RateLimit.
+[features.server-rate-limit]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-rate-limit/"]
+requires = ["server-core"]
+
+# `server.plugins.requestvalidation.*` (ktor-server-request-validation): RequestValidation.
+[features.server-request-validation]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-request-validation/"]
+requires = ["server-core"]
+
+# `server.resources.*` (ktor-server-resources): type-safe routing.
+[features.server-resources]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-resources/"]
+requires = ["server-core", "resources"]
+deps = ["kotlinx.serialization"]
+
+# `server.sessions.*` (ktor-server-sessions): Sessions over cookies or headers.
+[features.server-sessions]
+sources = [
+    "upstream/ktor-server/ktor-server-plugins/ktor-server-sessions/",
+    "klioMain/io/ktor/server/sessions/",
+]
+requires = ["server-core"]
+deps = ["kotlinx.serialization/json"]
+
+# `server.sse.*` (ktor-server-sse): server-sent events.
+[features.server-sse]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-sse/"]
+requires = ["server-core", "sse"]
+
+# `server.plugins.statuspages.*` (ktor-server-status-pages): StatusPages.
+[features.server-status-pages]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-status-pages/"]
+requires = ["server-core"]
+
+# `server.websocket.*` (ktor-server-websockets): WebSockets.
+[features.server-websockets]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-websockets/"]
+requires = ["server-core", "websocket-serialization"]
+
+# `client.plugins.auth.*` (ktor-client-auth): Auth with basic, bearer and digest providers.
+[features.client-auth]
+sources = ["upstream/ktor-client/ktor-client-plugins/ktor-client-auth/"]
+requires = ["client-core"]
+
+# `client.plugins.callid.*` (ktor-client-call-id): CallId.
+[features.client-call-id]
+sources = ["upstream/ktor-client/ktor-client-plugins/ktor-client-call-id/"]
+requires = ["client-core", "call-id"]
+
+# `client.plugins.bomremover.*` (ktor-client-bom-remover): BOMRemover.
+[features.client-bom-remover]
+sources = ["upstream/ktor-client/ktor-client-plugins/ktor-client-bom-remover/"]
+requires = ["client-core"]
+
+# `client.plugins.compression.*` (ktor-client-encoding): ContentEncoding.
+[features.client-encoding]
+sources = ["upstream/ktor-client/ktor-client-plugins/ktor-client-encoding/"]
+requires = ["client-core"]
+
+# `client.plugins.logging.*` (ktor-client-logging): Logging.
+[features.client-logging]
+sources = ["upstream/ktor-client/ktor-client-plugins/ktor-client-logging/"]
+requires = ["client-core"]
+
+# `client.plugins.resources.*` (ktor-client-resources): type-safe requests.
+[features.client-resources]
+sources = ["upstream/ktor-client/ktor-client-plugins/ktor-client-resources/"]
+requires = ["client-core", "resources"]
+deps = ["kotlinx.serialization"]
+
+# `client.plugins.websocket.*` (ktor-client-websockets): the WebSockets client module.
+[features.client-websockets]
+sources = ["upstream/ktor-client/ktor-client-plugins/ktor-client-websockets/"]
+requires = ["client-core"]
