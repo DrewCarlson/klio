@@ -96,6 +96,31 @@ sparse=(
   "navigationevent/navigationevent/src/nativeMain"
   "navigationevent/navigationevent-compose/src/commonMain"
   "navigationevent/navigationevent-compose/src/nonAndroidMain"
+  # The back handler material3's skiko actuals call, and the remaining
+  # non-JVM actuals the packs take from upstream.
+  "compose/ui/ui-backhandler/src/commonMain"
+  "compose/ui/ui-backhandler/src/jbMain"
+  "compose/ui/ui-text/src/nonJvmMain"
+  "compose/ui/ui-unit/src/nonJvmMain"
+  "compose/ui/ui-unit/src/nonAndroidMain"
+  "compose/ui/ui-util/src/nonJvmMain"
+  "compose/foundation/foundation/src/nonJvmMain"
+  "compose/animation/animation/src/nonAndroidMain"
+  "compose/animation/animation/src/nonJvmMain"
+  "compose/animation/animation-core/src/nonJvmMain"
+  # The ui-test skiko harness the skikoTest suites compose against, and the
+  # upstream suites of foundation, animation, material3 and graphics-shapes.
+  "compose/ui/ui-test/src/skikoMain"
+  "compose/ui/ui/src/skikoTest"
+  "compose/ui/ui-graphics/src/skikoTest"
+  "compose/ui/ui-text/src/skikoTest"
+  "compose/foundation/foundation/src/commonTest"
+  "compose/foundation/foundation/src/skikoTest"
+  "compose/foundation/foundation/src/desktopTest"
+  "compose/animation/animation-core/src/commonTest"
+  "compose/material3/material3/src/skikoTest"
+  "compose/material3/material3/src/desktopTest"
+  "graphics/graphics-shapes/src/commonTest"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)
