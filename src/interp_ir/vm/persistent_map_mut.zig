@@ -35,15 +35,21 @@ var builder_class_hit = std.atomic.Value(usize).init(0);
 var map_class_hit = std.atomic.Value(usize).init(0);
 var node_class_hit = std.atomic.Value(usize).init(0);
 
-var fn_map = std.atomic.Value(?[*]const u8).init(null);
-var fn_ownership = std.atomic.Value(?[*]const u8).init(null);
-var fn_node = std.atomic.Value(?[*]const u8).init(null);
-var fn_modcount = std.atomic.Value(?[*]const u8).init(null);
-var fn_size = std.atomic.Value(?[*]const u8).init(null);
-var fn_datamap = std.atomic.Value(?[*]const u8).init(null);
-var fn_nodemap = std.atomic.Value(?[*]const u8).init(null);
-var fn_buffer = std.atomic.Value(?[*]const u8).init(null);
-var fn_ownedby = std.atomic.Value(?[*]const u8).init(null);
+var fn_map = InstanceData.SlotCache.init(0);
+var fn_ownership = InstanceData.SlotCache.init(0);
+var fn_node = InstanceData.SlotCache.init(0);
+var fn_modcount = InstanceData.SlotCache.init(0);
+var fn_size = InstanceData.SlotCache.init(0);
+var fn_datamap = InstanceData.SlotCache.init(0);
+var fn_nodemap = InstanceData.SlotCache.init(0);
+var fn_buffer = InstanceData.SlotCache.init(0);
+var fn_ownedby = InstanceData.SlotCache.init(0);
+
+/// The name the class's layout gives slot `i` of `d`.
+fn slotName(d: *const InstanceData, i: usize) []const u8 {
+    const layout = d.class.asPtrConst().layout_slots;
+    return if (i < layout.len) layout[i].name else "";
+}
 
 fn classMatches(inst: ObjRef(InstanceData), hit: *std.atomic.Value(usize), fqn: []const u8) bool {
     const g = inst.borrow();
@@ -92,11 +98,10 @@ fn valueIdentical(a: *const Value, b: *const Value) bool {
     };
 }
 
-/// TrieNode minting template: class cell plus the four interned field names in order.
+/// TrieNode minting template: the class and the role of each of its four slots.
 const NodeTmpl = struct {
     gen: u32 = 0,
     class: ?ObjRef(ClassDef) = null,
-    names: [4][]const u8 = .{ "", "", "", "" },
     order: [4]u8 = .{ 0, 0, 0, 0 },
 };
 threadlocal var node_tmpl: NodeTmpl = .{};
@@ -113,17 +118,17 @@ fn nodeTemplate(node: ObjRef(InstanceData)) ?*const NodeTmpl {
     const g = node.borrow();
     defer g.deinit();
     const d = g.get();
-    if (d.fields.items.len != 4) return null;
+    if (d.slots.len != 4) return null;
     var tmpl: NodeTmpl = .{ .gen = gen, .class = d.class.clone() };
-    for (d.fields.items, 0..) |f, i| {
-        tmpl.names[i] = f.name;
-        if (std.mem.eql(u8, f.name, "dataMap")) {
+    for (0..4) |i| {
+        const name = slotName(d, i);
+        if (std.mem.eql(u8, name, "dataMap")) {
             tmpl.order[i] = 0;
-        } else if (std.mem.eql(u8, f.name, "nodeMap")) {
+        } else if (std.mem.eql(u8, name, "nodeMap")) {
             tmpl.order[i] = 1;
-        } else if (std.mem.eql(u8, f.name, "buffer")) {
+        } else if (std.mem.eql(u8, name, "buffer")) {
             tmpl.order[i] = 2;
-        } else if (std.mem.eql(u8, f.name, "ownedBy")) {
+        } else if (std.mem.eql(u8, name, "ownedBy")) {
             tmpl.order[i] = 3;
         } else {
             tmpl.class.?.deinit();
@@ -185,29 +190,24 @@ fn mintNode(ctx: *PutCtx, data_map: i32, node_map: i32, items: []const Value, ow
     for (items) |v| list.appendAssumeCapacity(v);
     const buf_v = ArrayData.fromBoxedList(try runtime.ValueList.init(ctx.a, list));
     if (runtime.reclaimEnabled() and owned_by == .Instance) owned_by.retain();
-    var fields: std.ArrayList(InstanceData.Field) = .empty;
-    try fields.ensureTotalCapacity(ctx.a, 4);
-    const t = ctx.tmpl;
-    for (t.names, t.order) |name, which| {
-        const v: Value = switch (which) {
-            0 => Value.newInt(data_map),
-            1 => Value.newInt(node_map),
-            2 => buf_v,
-            else => owned_by,
-        };
-        fields.appendAssumeCapacity(.{ .name = name, .value = v });
-    }
-    const inst = try ObjRef(InstanceData).init(ctx.a, .{
-        .class = t.class.?.clone(),
-        .fields = fields,
-        .outer = null,
-        .identity = host_resolved.mintInstanceId(ctx.self),
-        .native_state = null,
-    });
+    const inst = try newNode(ctx, data_map, node_map, buf_v, owned_by);
     const v: Value = .{ .Instance = inst };
     // Collect-at-alloc: a fresh node reachable only from native locals is unrooted.
     runtime.keepalivePush(v);
     return v;
+}
+
+/// A trie node of the template's class with its slots filled by role.
+fn newNode(ctx: *PutCtx, data_map: i32, node_map: i32, buf_v: Value, owned_by: Value) Allocator.Error!ObjRef(InstanceData) {
+    const t = ctx.tmpl;
+    var vals: [4]Value = undefined;
+    for (t.order, &vals) |which, *slot| slot.* = switch (which) {
+        0 => Value.newInt(data_map),
+        1 => Value.newInt(node_map),
+        2 => buf_v,
+        else => owned_by,
+    };
+    return InstanceData.new(ctx.a, t.class.?.clone(), &vals, host_resolved.mintInstanceId(ctx.self));
 }
 
 /// In-place store of the node's mutable fields; the caller proved ownership.
@@ -215,9 +215,9 @@ fn storeNode(ctx: *PutCtx, view: *const NodeView, data_map: i32, node_map: i32, 
     const g = view.inst.borrowMut();
     defer g.deinit();
     const d = g.get();
-    if (view.data_map != data_map) try d.define(ctx.a, "dataMap", Value.newInt(data_map));
-    if (view.node_map != node_map) try d.define(ctx.a, "nodeMap", Value.newInt(node_map));
-    if (buffer) |b| try d.define(ctx.a, "buffer", b);
+    if (view.data_map != data_map) _ = d.store(ctx.a, "dataMap", Value.newInt(data_map));
+    if (view.node_map != node_map) _ = d.store(ctx.a, "nodeMap", Value.newInt(node_map));
+    if (buffer) |b| _ = d.store(ctx.a, "buffer", b);
 }
 
 // Bitmap arithmetic runs in the u32 domain: `mask - 1` on the i32 spelling overflows
@@ -394,25 +394,7 @@ fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key:
 /// Mint over an already-built buffer whose elements the caller retained.
 fn mintNodeFromBuf(ctx: *PutCtx, data_map: i32, node_map: i32, buf_v: Value) Allocator.Error!Value {
     if (runtime.reclaimEnabled() and ctx.owner == .Instance) ctx.owner.retain();
-    var fields: std.ArrayList(InstanceData.Field) = .empty;
-    try fields.ensureTotalCapacity(ctx.a, 4);
-    const t = ctx.tmpl;
-    for (t.names, t.order) |name, which| {
-        const v: Value = switch (which) {
-            0 => Value.newInt(data_map),
-            1 => Value.newInt(node_map),
-            2 => buf_v,
-            else => ctx.owner,
-        };
-        fields.appendAssumeCapacity(.{ .name = name, .value = v });
-    }
-    const inst = try ObjRef(InstanceData).init(ctx.a, .{
-        .class = t.class.?.clone(),
-        .fields = fields,
-        .outer = null,
-        .identity = host_resolved.mintInstanceId(ctx.self),
-        .native_state = null,
-    });
+    const inst = try newNode(ctx, data_map, node_map, buf_v, ctx.owner);
     const v: Value = .{ .Instance = inst };
     runtime.keepalivePush(v);
     return v;
@@ -446,7 +428,6 @@ const BuilderTmpl = struct {
     class: ?ObjRef(ClassDef) = null,
     owner_class: ?ObjRef(ClassDef) = null,
     count: u8 = 0,
-    names: [12][]const u8 = @splat(""),
     /// Slot roles: 0 map, 1 ownership, 2 node, 3 operationResult, 4 modCount,
     /// 5 size, 6 a null-initialized lazy view cache (`_keys`/`_values` and twins).
     order: [12]u8 = @splat(0),
@@ -469,33 +450,33 @@ fn captureBuilderTemplate(inst: ObjRef(InstanceData), ownership: *const Value) v
     defer g.deinit();
     const d = g.get();
     if (trace) {
-        std.debug.print("[mapmut] builder fields ({d}):", .{d.fields.items.len});
-        for (d.fields.items) |f| std.debug.print(" {s}", .{f.name});
+        std.debug.print("[mapmut] builder slots ({d}):", .{d.slots.len});
+        for (0..d.slots.len) |i| std.debug.print(" {s}", .{slotName(d, i)});
         std.debug.print("\n", .{});
     }
-    if (d.fields.items.len > 12) return;
-    var tmpl: BuilderTmpl = .{ .gen = gen, .count = @intCast(d.fields.items.len) };
+    if (d.slots.len > 12) return;
+    var tmpl: BuilderTmpl = .{ .gen = gen, .count = @intCast(d.slots.len) };
     var seen: u8 = 0;
-    for (d.fields.items, 0..) |f, i| {
-        tmpl.names[i] = f.name;
-        if (std.mem.eql(u8, f.name, "map")) {
+    for (0..d.slots.len) |i| {
+        const name = slotName(d, i);
+        if (std.mem.eql(u8, name, "map")) {
             tmpl.order[i] = 0;
-        } else if (std.mem.eql(u8, f.name, "ownership")) {
+        } else if (std.mem.eql(u8, name, "ownership")) {
             tmpl.order[i] = 1;
-        } else if (std.mem.eql(u8, f.name, "node")) {
+        } else if (std.mem.eql(u8, name, "node")) {
             tmpl.order[i] = 2;
-        } else if (std.mem.eql(u8, f.name, "operationResult")) {
+        } else if (std.mem.eql(u8, name, "operationResult")) {
             tmpl.order[i] = 3;
-        } else if (std.mem.eql(u8, f.name, "modCount")) {
+        } else if (std.mem.eql(u8, name, "modCount")) {
             tmpl.order[i] = 4;
-        } else if (std.mem.eql(u8, f.name, "size")) {
+        } else if (std.mem.eql(u8, name, "size")) {
             tmpl.order[i] = 5;
-        } else if (isViewCacheName(f.name)) {
+        } else if (isViewCacheName(name)) {
             // Lazy view caches, owner-qualified twins included (0x1f separator).
             tmpl.order[i] = 6;
             continue;
         } else {
-            if (trace) std.debug.print("[mapmut] capture bail unknown field {s} hex={x}\n", .{ f.name, f.name });
+            if (trace) std.debug.print("[mapmut] capture bail unknown slot {s} hex={x}\n", .{ name, name });
             return;
         }
         seen |= @as(u8, 1) << @intCast(tmpl.order[i]);
@@ -511,8 +492,8 @@ fn captureBuilderTemplate(inst: ObjRef(InstanceData), ownership: *const Value) v
     }
     const og = ownership.Instance.borrow();
     defer og.deinit();
-    if (og.get().fields.items.len != 0) {
-        if (trace) std.debug.print("[mapmut] capture bail owner fields={d}\n", .{og.get().fields.items.len});
+    if (og.get().slots.len != 0) {
+        if (trace) std.debug.print("[mapmut] capture bail owner slots={d}\n", .{og.get().slots.len});
         return;
     }
     tmpl.class = d.class.clone();
@@ -548,19 +529,12 @@ pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) A
         if (node != .Instance or size != .Int) return null;
         break :blk .{ node, size };
     };
-    const owner_inst = try ObjRef(InstanceData).init(a, .{
-        .class = t.owner_class.?.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = host_resolved.mintInstanceId(self),
-        .native_state = null,
-    });
+    const owner_inst = try InstanceData.new(a, t.owner_class.?.clone(), &.{}, host_resolved.mintInstanceId(self));
     self.ka.push(.{ .Instance = owner_inst });
     const map_v: Value = .{ .Instance = map_inst };
-    var fields: std.ArrayList(InstanceData.Field) = .empty;
-    try fields.ensureTotalCapacity(a, t.count);
-    for (t.names[0..t.count], t.order[0..t.count]) |name, which| {
-        const v: Value = switch (which) {
+    var vals: [12]Value = undefined;
+    for (t.order[0..t.count], vals[0..t.count]) |which, *slot| {
+        slot.* = switch (which) {
             0 => blk: {
                 if (runtime.reclaimEnabled()) map_v.retain();
                 break :blk map_v;
@@ -574,15 +548,8 @@ pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) A
             4 => Value.newInt(0),
             else => map_size,
         };
-        fields.appendAssumeCapacity(.{ .name = name, .value = v });
     }
-    const inst = try ObjRef(InstanceData).init(a, .{
-        .class = t.class.?.clone(),
-        .fields = fields,
-        .outer = null,
-        .identity = host_resolved.mintInstanceId(self),
-        .native_state = null,
-    });
+    const inst = try InstanceData.new(a, t.class.?.clone(), vals[0..t.count], host_resolved.mintInstanceId(self));
     return .{ .Instance = inst };
 }
 
@@ -624,19 +591,19 @@ pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *con
         defer g.deinit();
         const d = g.get();
         if (!(new_node == .Instance and ObjRef(InstanceData).ptrEq(new_node.Instance, st.node.Instance))) {
-            // A non-identical result is freshly minted; `define` consumes it and releases
+            // A non-identical result is freshly minted; `store` consumes it and releases
             // the old node.
-            try d.define(a, "node", new_node);
+            _ = d.store(a, "node", new_node);
         }
         if (ctx.size_delta != 0) {
-            try d.define(a, "size", Value.newInt(st.size + ctx.size_delta));
+            _ = d.store(a, "size", Value.newInt(st.size + ctx.size_delta));
             ctx.modcount_delta += ctx.size_delta;
         }
         if (ctx.modcount_delta != 0) {
-            try d.define(a, "modCount", Value.newInt(st.modcount + ctx.modcount_delta));
+            _ = d.store(a, "modCount", Value.newInt(st.modcount + ctx.modcount_delta));
         }
         if (runtime.reclaimEnabled()) ctx.op_result.retain();
-        try d.define(a, "operationResult", ctx.op_result);
+        _ = d.store(a, "operationResult", ctx.op_result);
     }
     if (runtime.reclaimEnabled()) ctx.op_result.retain();
     return ctx.op_result;
@@ -649,10 +616,10 @@ pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *con
 
 const SSM_FQN = "androidx.compose.runtime.snapshots.SnapshotStateMap";
 var ssm_class_hit = std.atomic.Value(usize).init(0);
-var fn_first_rec = std.atomic.Value(?[*]const u8).init(null);
-var fn_rec_map = std.atomic.Value(?[*]const u8).init(null);
-var fn_rec_mod = std.atomic.Value(?[*]const u8).init(null);
-var fn_rec_sid = std.atomic.Value(?[*]const u8).init(null);
+var fn_first_rec = InstanceData.SlotCache.init(0);
+var fn_rec_map = InstanceData.SlotCache.init(0);
+var fn_rec_mod = InstanceData.SlotCache.init(0);
+var fn_rec_sid = InstanceData.SlotCache.init(0);
 
 pub fn isSnapshotMapClass(inst: ObjRef(InstanceData)) bool {
     return classMatches(inst, &ssm_class_hit, SSM_FQN);
@@ -723,10 +690,10 @@ fn validateTrie(node: ObjRef(InstanceData), depth: u32) bool {
             std.debug.print("[ssm-rot] node cell UNMAPPED {x} depth={d}\n", .{ cp, depth });
             return false;
         }
-        const fslice = node.cell.data.fields.items;
+        const fslice = node.cell.data.slots;
         const fp = @intFromPtr(fslice.ptr);
         if (fslice.len > 64 or (fp >> 47) != 0 or (fslice.len != 0 and !pageMapped(fp))) {
-            std.debug.print("[ssm-rot] node {x} fields ptr={x} len={d} depth={d}\n", .{ cp, fp, fslice.len, depth });
+            std.debug.print("[ssm-rot] node {x} slots ptr={x} len={d} depth={d}\n", .{ cp, fp, fslice.len, depth });
             return false;
         }
     }
@@ -867,9 +834,9 @@ fn postWalk(node: ObjRef(InstanceData), depth: u32, epoch: usize, parent: usize)
         std.debug.print("[post-sweep] SWEPT node {x} depth={d} parent={x} epoch={d}\n", .{ cp, depth, parent, epoch });
         return;
     }
-    const fp = @intFromPtr(node.cell.data.fields.items.ptr);
-    if ((fp >> 47) != 0 or node.cell.data.fields.items.len > 64) {
-        std.debug.print("[post-sweep] POISONED node {x} fields={x}/{d} depth={d} parent={x} epoch={d}\n", .{ cp, fp, node.cell.data.fields.items.len, depth, parent, epoch });
+    const fp = @intFromPtr(node.cell.data.slots.ptr);
+    if ((fp >> 47) != 0 or node.cell.data.slots.len > 64) {
+        std.debug.print("[post-sweep] POISONED node {x} slots={x}/{d} depth={d} parent={x} epoch={d}\n", .{ cp, fp, node.cell.data.slots.len, depth, parent, epoch });
         return;
     }
     const null_owner: Value = .Null;
@@ -1115,8 +1082,9 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
             const g = r2.rec.borrowMut();
             defer g.deinit();
             const d = g.get();
-            // Storage names must be the plain spellings: `define` creates a missing field.
-            if (d.get("map") == null or d.get("modification") == null) {
+            // The record must hold both slots under their plain names, so no
+            // partial write is made.
+            if (d.slotIndex("map") == null or d.slotIndex("modification") == null) {
                 _ = try concurrent.monitorExit(sync_key);
                 if (runtime.reclaimEnabled()) {
                     new_map.release(a);
@@ -1126,8 +1094,8 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
                 return null;
             }
             const mode = runtime.envOnce("KLIO_SSMPUT") orelse "1";
-            if (!std.mem.eql(u8, mode, "6")) try d.define(a, "map", new_map);
-            if (!std.mem.eql(u8, mode, "7")) try d.define(a, "modification", Value.newInt(expected_mod + 1));
+            if (!std.mem.eql(u8, mode, "6")) _ = d.store(a, "map", new_map);
+            if (!std.mem.eql(u8, mode, "7")) _ = d.store(a, "modification", Value.newInt(expected_mod + 1));
             committed = true;
         }
         _ = try concurrent.monitorExit(sync_key);
@@ -1147,9 +1115,9 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
                     S8.once = true;
                     const g8 = r2.rec.borrow();
                     defer g8.deinit();
-                    std.debug.print("[ssm-fields] record fields:", .{});
-                    for (g8.get().fields.items) |f| {
-                        std.debug.print(" <{f}>", .{std.zig.fmtString(f.name)});
+                    std.debug.print("[ssm-fields] record slots:", .{});
+                    for (0..g8.get().slots.len) |i| {
+                        std.debug.print(" <{f}>", .{std.zig.fmtString(slotName(g8.get(), i))});
                     }
                     std.debug.print("\n", .{});
                 }
@@ -1199,57 +1167,33 @@ pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocat
         if (runtime.reclaimEnabled()) map_v.retain();
         return map_v;
     }
-    var fields: std.ArrayList(InstanceData.Field) = .empty;
-    {
+    var vals: [8]Value = undefined;
+    const n_slots = blk: {
         const g = map_v.Instance.borrow();
         defer g.deinit();
         const d = g.get();
-        try fields.ensureTotalCapacity(a, d.fields.items.len);
-        for (d.fields.items) |f| {
-            const v: Value = if (std.mem.eql(u8, f.name, "node")) blk: {
+        if (d.slots.len > vals.len) return null;
+        for (vals[0..d.slots.len], 0..) |*slot, i| {
+            const name = slotName(d, i);
+            slot.* = if (std.mem.eql(u8, name, "node")) node: {
                 if (runtime.reclaimEnabled()) st.node.retain();
-                break :blk st.node;
-            } else if (std.mem.eql(u8, f.name, "size"))
+                break :node st.node;
+            } else if (std.mem.eql(u8, name, "size"))
                 Value.newInt(st.size)
-            else if (std.mem.eql(u8, f.name, "_keys") or std.mem.eql(u8, f.name, "_values"))
+            else if (std.mem.eql(u8, name, "_keys") or std.mem.eql(u8, name, "_values"))
                 Value.Null
-            else {
-                fields.deinit(a);
+            else
                 return null;
-            };
-            fields.appendAssumeCapacity(.{ .name = f.name, .value = v });
         }
-    }
-    const map_class = blk: {
-        const g = map_v.Instance.borrow();
-        defer g.deinit();
-        break :blk g.get().class.clone();
+        break :blk d.slots.len;
     };
-    const new_map = try ObjRef(InstanceData).init(a, .{
-        .class = map_class,
-        .fields = fields,
-        .outer = null,
-        .identity = host_resolved.mintInstanceId(self),
-        .native_state = null,
-    });
+    const new_map = try InstanceData.new(a, map_v.Instance.asPtrConst().class.clone(), vals[0..n_slots], host_resolved.mintInstanceId(self));
     self.ka.push(.{ .Instance = new_map });
     const new_owner: Value = blk: {
         if (st.ownership != .Instance) return null;
-        const og = st.ownership.Instance.borrow();
-        const n_fields = og.get().fields.items.len;
-        const ocls = og.get().class.clone();
-        og.deinit();
-        if (n_fields != 0) {
-            ocls.deinit();
-            return null;
-        }
-        const oinst = try ObjRef(InstanceData).init(a, .{
-            .class = ocls,
-            .fields = .empty,
-            .outer = null,
-            .identity = host_resolved.mintInstanceId(self),
-            .native_state = null,
-        });
+        const owner = st.ownership.Instance.asPtrConst();
+        if (owner.slots.len != 0) return null;
+        const oinst = try InstanceData.new(a, owner.class.clone(), &.{}, host_resolved.mintInstanceId(self));
         break :blk .{ .Instance = oinst };
     };
     const new_map_v: Value = .{ .Instance = new_map };
@@ -1257,8 +1201,8 @@ pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocat
         const g = inst.borrowMut();
         defer g.deinit();
         const d = g.get();
-        try d.define(a, "map", new_map_v);
-        try d.define(a, "ownership", new_owner);
+        _ = d.store(a, "map", new_map_v);
+        _ = d.store(a, "ownership", new_owner);
     }
     if (runtime.reclaimEnabled()) new_map_v.retain();
     return new_map_v;

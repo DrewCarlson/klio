@@ -2,8 +2,7 @@
 //! `Value`, trapping an `Inst` the lowering pass never emits as `EvalError.Unsupported`.
 //!
 //! This root re-exports the `eval/` submodules (state, frame, activation, enter,
-//! exec, flow, inst, fused, leaf, loop, native, snapshot, chain, diag, values,
-//! host) and holds the process-wide counters and the hooks the host installs.
+//! exec, flow, inst, snapshot, diag, values, resolved, hand, host) and holds the process-wide counters and the hooks the host installs.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -18,17 +17,11 @@ pub const fastIndexSet = @import("eval/values.zig").fastIndexSet;
 const ev_state = @import("eval/state.zig");
 
 pub const EvalError = ev_state.EvalError;
-pub const RefSiteOverride = ev_state.RefSiteOverride;
 pub const currentFrameFunc = ev_state.currentFrameFunc;
 pub const fillCensusBump = ev_state.fillCensusBump;
-pub const acquireArgsCap = ev_state.acquireArgsCap;
-pub const releaseArgs = ev_state.releaseArgs;
-pub const releaseArgsIn = ev_state.releaseArgsIn;
 pub const gcInstallFrameRoot = ev_state.gcInstallFrameRoot;
 pub const gcUninstallFrameRoot = ev_state.gcUninstallFrameRoot;
 
-pub var regs_pool_hit: u64 = 0;
-pub var regs_pool_miss: u64 = 0;
 pub var regs_fill_slots: u64 = 0;
 
 const ev_diag = @import("eval/diag.zig");
@@ -81,6 +74,12 @@ pub var frame_count_total: u64 = 0;
 pub var frame_alloc_total: u64 = 0;
 pub var frame_count_on: bool = false;
 
+/// Whether any diagnostic hook on the call path is on (the frame counts, KLIO_FN_PROF, the trace
+/// and audit knobs a frame entry and teardown answer, KLIO_DUMP_FN, KLIO_CALL_STATS, fault
+/// injection, KLIO_FLAT=0). The run's hooks settle it before the program; until then every
+/// check runs.
+pub var call_hooks_on: bool = true;
+
 pub var frame_watch_want: []const u8 = "";
 
 /// Executed-instruction total: the denominator that turns a sampled opcode profile into a per-instruction cost.
@@ -125,7 +124,6 @@ const ev_enter = @import("eval/enter.zig");
 
 pub const eval = ev_enter.eval;
 pub const evalWith = ev_enter.evalWith;
-pub const fuseGateDump = ev_enter.fuseGateDump;
 pub const boolThisTrap = ev_enter.boolThisTrap;
 pub const dumpFnIfRequested = ev_enter.dumpFnIfRequested;
 pub const evalWithCaptures = ev_enter.evalWithCaptures;
@@ -181,17 +179,14 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
     testing.refAllDecls(@import("eval/activation.zig"));
-    testing.refAllDecls(@import("eval/chain.zig"));
     testing.refAllDecls(@import("eval/diag.zig"));
     testing.refAllDecls(@import("eval/enter.zig"));
     testing.refAllDecls(@import("eval/exec.zig"));
     testing.refAllDecls(@import("eval/flow.zig"));
     testing.refAllDecls(@import("eval/frame.zig"));
-    testing.refAllDecls(@import("eval/fused.zig"));
     testing.refAllDecls(@import("eval/hand.zig"));
     testing.refAllDecls(@import("eval/host.zig"));
     testing.refAllDecls(@import("eval/inst.zig"));
-    testing.refAllDecls(@import("eval/loop.zig"));
     testing.refAllDecls(@import("eval/resolved.zig"));
     testing.refAllDecls(@import("eval/snapshot.zig"));
     testing.refAllDecls(@import("eval/state.zig"));
@@ -199,10 +194,4 @@ test {
     testing.refAllDecls(@import("eval/values.zig"));
 }
 
-const ev_fused = @import("eval/fused.zig");
 
-pub const FUSED_MAX_REGS = ev_fused.FUSED_MAX_REGS;
-pub const fusedEnabled = ev_fused.fusedEnabled;
-pub const fused = ev_fused;
-pub const fusedExec = ev_fused.fusedExec;
-pub const fusedExecOpt = ev_fused.fusedExecOpt;

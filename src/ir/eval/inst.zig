@@ -83,7 +83,7 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
                 else => {
                     if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
                         std.debug.print("[not-miss] in={s} kind={s} span={?any}\n", .{
-                            frame.func.name, @tagName(std.meta.activeTag(v)), frame.cur_span,
+                            frame.func.name, @tagName(std.meta.activeTag(v)), frame.span(),
                         });
                         dumpCurrentFrameParamsForDiag();
                         dumpFrameChainForDiagAlways();
@@ -95,9 +95,10 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         },
         .UnOp => |u| return execArmUnOp(allocator, frame, u),
         .BinOp => |bo| return execArmBinOp(H, allocator, frame, bo, host),
-        .Trace => |t| frame.cur_span = t.span,
+        // A stream runs no Trace: `Frame.span` reads the block's Traces before the instruction.
+        .Trace => {},
         .LoadParam => |lp| {
-            const v = if (lp.idx < frame.params.items.len) frame.params.items[lp.idx] else Value.Unit;
+            const v = if (lp.idx < frame.params.len) frame.params[lp.idx] else Value.Unit;
             v.retain();
             try frame.write(lp.dst, v);
         },
@@ -149,7 +150,7 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         .ArraySet => |x| return ev_resolved.execArraySet(H, allocator, frame, x, host),
         .NewArray => |x| return ev_resolved.execNewArray(H, allocator, frame, x, host),
         .LoadCapture => |lc| {
-            const v = if (lc.idx < frame.captures.items.len) frame.captures.items[lc.idx] else Value.Unit;
+            const v = if (lc.idx < frame.captures.len) frame.captures[lc.idx] else Value.Unit;
             v.retain();
             try frame.write(lc.dst, v);
         },
@@ -157,7 +158,7 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
     return .cont;
 }
 
-noinline fn execArmCellSet(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
+pub noinline fn execArmCellSet(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
     _ = host;
     const v = frame.read(cs.value);
     v.retain();
@@ -204,7 +205,7 @@ pub noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Fra
     return .cont;
 }
 
-/// Binary-operator semantics with no frame coupling: the framed arm, the fused
+/// Binary-operator semantics with no frame coupling: the framed arm and the
 /// tier and the host's operator natives share it. Sema emits a `BinOp` over
 /// primitives and strings, `===` over anything, and a primitive's `equals`
 /// against any value; an operator a class or an extension declares is a call.

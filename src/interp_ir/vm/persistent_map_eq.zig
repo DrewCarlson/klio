@@ -22,11 +22,11 @@ const MAX_SHIFT = 30;
 var map_class_hit = std.atomic.Value(usize).init(0);
 var node_class_hit = std.atomic.Value(usize).init(0);
 
-var fn_datamap = std.atomic.Value(?[*]const u8).init(null);
-var fn_nodemap = std.atomic.Value(?[*]const u8).init(null);
-var fn_buffer = std.atomic.Value(?[*]const u8).init(null);
-var fn_size = std.atomic.Value(?[*]const u8).init(null);
-var fn_node = std.atomic.Value(?[*]const u8).init(null);
+var fn_datamap = runtime.InstanceData.SlotCache.init(0);
+var fn_nodemap = runtime.InstanceData.SlotCache.init(0);
+var fn_buffer = runtime.InstanceData.SlotCache.init(0);
+var fn_size = runtime.InstanceData.SlotCache.init(0);
+var fn_node = runtime.InstanceData.SlotCache.init(0);
 
 fn classMatches(inst: ObjRef(InstanceData), hit: *std.atomic.Value(usize), fqn: []const u8) bool {
     const g = inst.borrow();

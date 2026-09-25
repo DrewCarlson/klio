@@ -499,7 +499,7 @@ fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
     var entries: std.ArrayList(MapPair) = .empty;
     for (ctx.args) |v| {
         if (v != .Pair) return typeErr(try fmt(a, "{s} expects Pair arguments (use `key to value` or `Pair(k, v)`)", .{who}));
-        try entries.append(a, .{ .key = v.Pair.first.asPtr().*, .value = v.Pair.second.asPtr().* });
+        try entries.append(a, .{ .key = v.Pair.first.asPtrConst().*, .value = v.Pair.second.asPtrConst().* });
     }
     // Dedupe over the borrowed entries first; makeMapBorrowed then retains the
     // survivors.
@@ -630,7 +630,7 @@ pub fn coll_sorted_map_of(ctx: *CallCtx) Error!EvalResult {
     var entries: std.ArrayList(MapPair) = .empty;
     for (ctx.args) |v| {
         if (v != .Pair) return typeErr("sortedMapOf expects Pair arguments");
-        try entries.append(a, .{ .key = v.Pair.first.asPtr().*, .value = v.Pair.second.asPtr().* });
+        try entries.append(a, .{ .key = v.Pair.first.asPtrConst().*, .value = v.Pair.second.asPtrConst().* });
     }
     if (try sortMapByKey(a, entries.items, false)) |e| return e;
     return ok(try makeMapH(ctx.host, ctx.out, a, entries.items, true));

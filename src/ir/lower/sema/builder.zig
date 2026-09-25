@@ -14,6 +14,7 @@ const compose = @import("compose.zig");
 const env_mod = @import("env.zig");
 const operator = @import("operator.zig");
 const inline_mod = @import("inline.zig");
+const locals_mod = @import("locals.zig");
 
 const Allocator = std.mem.Allocator;
 const Sym = sema.Sym;
@@ -119,6 +120,15 @@ pub const Builder = struct {
     cur: BlockId = BlockId.from(0),
     next_reg: u32 = 0,
     locals: std.AutoHashMapUnmanaged(Sym, Home) = .empty,
+    /// The registers that are homes of `var` locals, which a `val` bound to
+    /// their value copies (`env.bindLocal`).
+    var_homes: std.AutoHashMapUnmanaged(Reg, void) = .empty,
+    /// What the statement or condition being lowered writes while the
+    /// values it reads are in flight (`locals.Hazard`).
+    hazard: ?*locals_mod.Hazard = null,
+    /// The index in the entry block of the instruction `emitEntry` last
+    /// appended, which is a register the body keeps.
+    entry_last: usize = std.math.maxInt(usize),
     env: env_mod.Env = .{},
     /// This body's captures (`br.captures_of[func]`), read-only.
     captures: []const bridge.CaptureKey = &.{},
@@ -230,7 +240,9 @@ pub const Builder = struct {
     /// Appends to the entry block, which dominates every use: a load with
     /// no effect the body reads anywhere (a parameter, a capture, `this`).
     pub fn emitEntry(b: *Builder, inst: Inst) Error!void {
-        try b.blocks.items[0].insts.append(b.p.a, inst);
+        const entry = &b.blocks.items[0].insts;
+        try entry.append(b.p.a, inst);
+        b.entry_last = entry.items.len - 1;
     }
 
     pub fn emitConst(b: *Builder, c: ir.Const) Error!Reg {

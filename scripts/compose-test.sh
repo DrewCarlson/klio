@@ -22,7 +22,6 @@ SRCS=$(find \
 exec env \
   HOME=/tmp/klio_itest_compose_plugin_home \
   KLIO_RSS_CAP_KB="${KLIO_RSS_CAP_KB:-8388608}" \
-  kotlinx_coroutines_test_default_timeout="${kotlinx_coroutines_test_default_timeout:-10s}" \
   KLIO_TEST_WALL_CAP="${KLIO_TEST_WALL_CAP:-90}" \
   KLIO_MAX_WORKERS="${KLIO_MAX_WORKERS:-3}" \
   nice -n 10 zig-out/bin/klio-harness test --feature kotlinx.coroutines/test $SRCS "--filter=$FILTER" "$@"

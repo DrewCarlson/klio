@@ -66,10 +66,6 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_SUBTYPE_TRACE` | `<substr>` | Instance-supertype search during overload scoring, for target types containing the substring | `[sub]` |
 | `KLIO_SHADOW_TRACE` | set | Whether an imported pack extension shadows a member call (probe plus each candidate) | `[shadow]` |
 | `KLIO_EXT_AUDIT` | `1` | Dual-compute audit for extension dispatch: the declaration a commit at lowering would name (`would`) beside the one the runtime's by-name walk serves (`ran`). Join them with `scripts/ext_audit_sweep.py` | `[KLIO_EXT_AUDIT]` |
-| `KLIO_FUSE_HEAVY` | set | What makes a body heavy, which is what the fused entry declines when it may not materialize. Dispatch cases are split by whether the site names its target | `[fuse-heavy]` |
-| `KLIO_FUSE_CLASSIFY` | set | Why `fusedClassify` refused a body, split by condition. `classify` dominates the decline census and is memoized per function, so the decline count and the rejection count are different questions | `[fuse-classify]` |
-| `KLIO_FUSE_GATE` | set | Which conjunct of the fused tier's entry gate turns a call away — receiver, closure, captures, native — against how many are offered | `[fuse-gate]` |
-| `KLIO_FUSE_MAX_BLOCKS` | count | Overrides the fused walker's block cap, so it can be priced rather than assumed. Raising it 64 to 4096 changed 5 406 frames to 5 407 | |
 | `KLIO_THIS_EXT` | `0` | Leaves bare `this` in an extension function body without a recorded class identity, so a wrong answer can be told from a wrong reading of one | |
 | `KLIO_DISPATCH_TRACE` | set | Runtime: a member-extension frame that had to derive its own dispatch receiver from the enclosing chain because no caller handed one over (`[dispatch-fallback] fn= found=`), and a contextual frame that had to derive a context parameter the same way (`[context-fallback] fn= idx= ty= found=`); a producer is missing at whichever call site reached it. Static: how a context argument resolved at a call site, the scope, the subjects and the receiver tower it saw (`[context-arg] want= ...` then `-> <reg>` or `-> null`), a `contextOf<T>()` with nothing of that type in scope (`[context-none] ty= fn=`), and the context types a lambda literal was given from its expected type (`[lambda-ctx]`) | `[dispatch-fallback]`, `[context-fallback]`, `[context-arg]`, `[context-none]`, `[lambda-ctx]` |
 | `KLIO_SLOT_TRACE` | set | Why a field read on the enclosing `this` did or did not claim a declared slot of its class's published layout: no owner, no class id, no layout (with the state), not a slot, or a capture | `[slot]` |
@@ -170,7 +166,7 @@ alone and reports its census.
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
 | `KLIO_ERR_TRACE` | set | On otherwise-traceless Vm failures: the live frame chain plus a site-specific miss line (unresolved field get, uninvokable call value, unmatched `this@label`). In `klio test` it also renders the full throwable (type, message, frames, causes) instead of the terse summary | `[errtrace]`, `[getfield-miss]`, `[callvalue-miss]`, `[labeled-this]` |
-| `KLIO_THROW_TRACE` | set | One line per exception as it is thrown (including failed casts that raise without a `Throw`, which name the class of the value and, off the fused tier, the receiver in `r0` with its address) | `[throw-trace]` |
+| `KLIO_THROW_TRACE` | set | One line per exception as it is thrown (including failed casts that raise without a `Throw`, which name the class of the value and the receiver in `r0` with its address) | `[throw-trace]` |
 | `KLIO_THROW_STACK` | set (needs `KLIO_THROW_TRACE`) | Adds the full frame chain at each throw site | `[errtrace]` |
 | `KLIO_LR_TRACE` | set | Labeled-return propagation through interpreter frames (raise, pass, exit) | `[lr-raise]`, `[lr]`, `[lr-exit]` |
 | `KLIO_AMP_TRACE` | `<substr>` | A resolution-class error about to be re-tagged as `CalleeFailed` whose message contains the substring; dumps the frames before they are torn down | `[amp]` |
@@ -275,11 +271,15 @@ backend (the default for `fast`/`safe`).
 
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
-| `KLIO_GC_DEBUG` | set; `0`/empty off | One summary line per collection: epoch, kind (minor/major), marked, live bytes, freed | `[kgc]` |
+| `KLIO_GC_DEBUG` | set; `0`/empty off | One line per collection: epoch, kind (`minor`, `major`, and for a spanning major `initial`, `slice`, `remark`), cells marked, live, freed, and the phase times (`mark_us`, `sweep_us`, `stop_us` for the rendezvous, `pause_us` from the raise to the release), the other mutators stopped, where the sweep ran (`sweep=pause` or `sweeper`), and a minor mark's split: `roots_us`, `rem_us` for retracing the remembered set, and what it retraced (`rem_whole` cells whole, `rem_spans` index ranges over `rem_span_len` elements), then for a spanning major the cells it traced in this stop (`slice`, `slice_us`) and the stops it has spanned (`major_stops`). A sweep the sweeper thread ran reports its freed cells and time on its own line | `[kgc]`, `[kgc-sweep]` |
+| `KLIO_GC_SWEEP` | `pause` | Keeps every sweep inside its collection's stop instead of handing it to the sweeper thread, to compare pause times or to rule the sweeper out. `KLIO_GC_NOFREE`, `KLIO_GC_HIST`, and a post-sweep audit sweep in the stop too | none |
+| `KLIO_GC_MAJOR` | `concurrent` (default), `slices`, `stop` | How a major marks: `concurrent` spans it across stops, beginning in a minor's stop, with the marking thread tracing it while the mutators run and running the remark itself; `slices` spans it the same way but traces a slice at each minor's stop; `stop` marks it whole in one stop. Spanning needs generational collection | none |
+| `KLIO_GC_SLICE` | number (default 10000) | Cells a spanning major traces per stop beyond what the stop's minor handed it | none |
+| `KLIO_GC_MAJOR_EVERY` | number (`0` off) | Makes every Nth collection a major, to exercise majors in a short run | none |
 | `KLIO_GC_GEN` | `1` on (default), `0` off | Generational collection: minor (nursery-only) sweeps between Appel-scheduled majors; `0` forces every collection major | none |
 | `KLIO_GC_GROWTH` | integer, min 2 (default 2) | The Appel growth multiplier: the next collection fires after `live * factor` bytes | none |
 | `KLIO_GC_MINOR_STOP` | `1` on (default), `0` off | Whether a minor mark stops at tenured cells; `0` full-traces minors to bisect a missed-barrier suspicion | none |
-| `KLIO_GC_VERIFY` | set | After each minor mark, traces every tenured cell and reports a child that is an unmarked nursery cell: a store that skipped the write barrier. Names the class and field for an instance, and dumps the frame chain on the first report; pair with `KLIO_GC_STRESS=1` so the report lands right after the store. A tenured cell that is already unreachable can also report, so confirm the holder is live |  `[gc-verify]` |
+| `KLIO_GC_VERIFY` | set | After each minor mark, traces every tenured cell and reports a child that is an unmarked nursery cell: a store that skipped the write barrier. After a major's mark it traces every marked cell and reports an unmarked child, and after each slice of a spanning major it does the same for every marked cell not due a retrace (not grey, not remembered since): a store into a traced cell that no barrier recorded, or a child a tracer skipped (`major:` in the line). Names the class and field for an instance, and dumps the frame chain on the first report; pair with `KLIO_GC_STRESS=1` so the report lands right after the store. A tenured cell that is already unreachable can also report, so confirm the holder is live |  `[gc-verify]` |
 | `KLIO_GC_REMEMBER_TRACE` | set | Logs, with a native stack, any remembered-set cell as it is swept | `[gc-freed-remembered]` |
 | `KLIO_GC_HIST` | set; `0`/empty off | Top-16 live-cell payload types per collection | `[kgc-hist]` |
 | `KLIO_ENUM_INIT_TRACE` | set | VM-start enum entry construction: which entries are rebuilt through the class path and the header thunk chain per class | `[enum-init]`, `[chain]` |
@@ -432,7 +432,7 @@ function — so in an interpreter the cost lands on every hot helper. It measure
 25% of samples on a member-call loop.
 
 `src/runtime/tls_fast.zig` answers it: the thread that calls `claimOwner()` at
-process entry reads the hot per-thread structures (the fused walker's banks,
+process entry reads the hot per-thread structures (the evaluator's state,
 the keepalive stack) from ordinary globals, and every
 other thread keeps its threadlocal. The owner never changes, so no state
 migrates between the two storages — a thread reads the same object for the

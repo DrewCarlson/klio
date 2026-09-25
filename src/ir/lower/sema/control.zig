@@ -25,6 +25,7 @@ const operator = @import("operator.zig");
 const types = @import("types.zig");
 const inline_mod = @import("inline.zig");
 const tailrec = @import("tailrec.zig");
+const locals = @import("locals.zig");
 
 const Builder = builder.Builder;
 const Error = records.Error;
@@ -35,13 +36,23 @@ const TypeId = sema.TypeId;
 
 /// `if`: a value when it has an `else`, `Unit` otherwise.
 pub fn lowerIf(b: *Builder, e: *const ast.Expr) Error!Reg {
+    return (try ifExpr(b, e, true)) orelse b.unit();
+}
+
+/// An `if` whose value nothing reads: its branches run for their effects.
+pub fn lowerIfDiscarding(b: *Builder, e: *const ast.Expr) Error!void {
+    _ = try ifExpr(b, e, false);
+}
+
+fn ifExpr(b: *Builder, e: *const ast.Expr, want: bool) Error!?Reg {
     const x = e.If;
-    const cond = try body.lowerExpr(b, x.cond);
+    const cond = try body.lowerAlone(b, x.cond);
     // Branches that compose each run in a replace group of their own, and
     // a missing `else` in an empty one, so a flip replaces what the other
     // branch composed.
     const grouped = compose.composes(b, x.then_branch) or (if (x.else_branch) |eb| compose.composes(b, eb) else false);
-    const result = b.newReg();
+    // Only an `if` with an `else` has a value of its own.
+    const result: ?Reg = if (want and x.else_branch != null) b.newReg() else null;
     const then_blk = try b.newBlock();
     const else_blk = try b.newBlock();
     const join = try b.newBlock();
@@ -53,28 +64,32 @@ pub fn lowerIf(b: *Builder, e: *const ast.Expr) Error!Reg {
         try arm(b, eb, result, join, grouped);
     } else {
         if (grouped) try compose.emptyGroup(b, e.span());
-        try b.emit(.{ .Move = .{ .dst = result, .src = try b.emitConst(.Unit) } });
         b.terminate(.{ .Goto = join });
     }
     b.switchTo(join);
-    if (x.else_branch == null) return b.emitConst(.Unit);
     return result;
 }
 
-/// One branch: its value into `result`, then on to `join`, unless it
-/// jumped away; in a replace group when `grouped`.
-fn arm(b: *Builder, e: *const ast.Expr, result: Reg, join: BlockId, grouped: bool) Error!void {
+/// One branch: its value into `result`, or run for its effects when there
+/// is none, then on to `join`, unless it jumped away; in a replace group
+/// when `grouped`. The instruction computing the value writes `result`
+/// itself when it can.
+fn arm(b: *Builder, e: *const ast.Expr, result: ?Reg, join: BlockId, grouped: bool) Error!void {
     if (grouped) try compose.startReplaceGroup(b, e.span());
     const saved_block = b.compose_block;
     b.compose_block = .{ .end = e.span().end };
-    const v = try body.lowerExpr(b, e);
+    const from = locals.mark(b);
+    const v: ?Reg = if (result != null) try body.lowerExpr(b, e) else blk: {
+        try body.lowerDiscarding(b, e);
+        break :blk null;
+    };
     b.compose_block = saved_block;
     if (grouped) {
         b.compose_open -= 1;
         if (!b.terminated()) try compose.endReplaceGroupCall(b);
     }
     if (b.terminated()) return;
-    try b.emit(.{ .Move = .{ .dst = result, .src = v } });
+    if (result) |r| if (!locals.retarget(b, from, v.?, r)) try b.emit(.{ .Move = .{ .dst = r, .src = v.? } });
     b.terminate(.{ .Goto = join });
 }
 
@@ -83,14 +98,28 @@ fn arm(b: *Builder, e: *const ast.Expr, result: Reg, join: BlockId, grouped: boo
 /// Without `else`, a `when` over an enum, sealed or `Boolean` subject that
 /// matches nothing throws `NoWhenBranchMatchedException`.
 pub fn lowerWhen(b: *Builder, e: *const ast.Expr) Error!Reg {
+    return (try whenExpr(b, e, true)).?;
+}
+
+/// A `when` whose value nothing reads: its branches run for their effects.
+pub fn lowerWhenDiscarding(b: *Builder, e: *const ast.Expr) Error!void {
+    _ = try whenExpr(b, e, false);
+}
+
+fn whenExpr(b: *Builder, e: *const ast.Expr, want: bool) Error!?Reg {
     const w = e.When;
     const s = b.p.s;
     var subject: ?Reg = null;
     var subject_t: TypeId = .none;
     if (w.subject) |subj| {
-        // Its value when the `when` starts, whatever a pattern assigns.
-        const v = b.newReg();
-        try b.emit(.{ .Move = .{ .dst = v, .src = try body.lowerExpr(b, subj) } });
+        // Its value when the `when` starts, whatever a pattern assigns: a
+        // `var`'s register is copied, any other value is held as it is.
+        const sv = try body.lowerExpr(b, subj);
+        const v = if (b.var_homes.contains(sv)) copy: {
+            const v = b.newReg();
+            try b.emit(.{ .Move = .{ .dst = v, .src = sv } });
+            break :copy v;
+        } else sv;
         subject = v;
         subject_t = b.exprType(subj.id());
         if (w.subject_binding != null) {
@@ -99,7 +128,7 @@ pub fn lowerWhen(b: *Builder, e: *const ast.Expr) Error!Reg {
             subject_t = s.syms.localInfo(sym).ty;
         }
     }
-    const result = b.newReg();
+    const result: ?Reg = if (want) b.newReg() else null;
     const join = try b.newBlock();
     var has_else = false;
     var has_null = false;
@@ -130,7 +159,7 @@ pub fn lowerWhen(b: *Builder, e: *const ast.Expr) Error!Reg {
         }
         if (br.guard) |g| {
             b.switchTo(matched);
-            const holds = try body.lowerExpr(b, &g.expr);
+            const holds = try body.lowerAlone(b, &g.expr);
             b.terminate(.{ .Branch = .{ .cond = holds, .t = body_blk, .f = next } });
         }
         // `fail_to` of the last pattern is `next`, where the next branch tests.
@@ -143,7 +172,7 @@ pub fn lowerWhen(b: *Builder, e: *const ast.Expr) Error!Reg {
         try throwNoBranch(b, e.span());
     } else {
         if (grouped and !has_else) try compose.emptyGroup(b, e.span());
-        try b.emit(.{ .Move = .{ .dst = result, .src = try b.emitConst(.Unit) } });
+        if (result) |r| try b.emit(.{ .Move = .{ .dst = r, .src = try b.unit() } });
         b.terminate(.{ .Goto = join });
     }
     b.switchTo(join);
@@ -197,8 +226,8 @@ fn noArgCtor(s: *sema.Sema, cls: Sym) ?Sym {
 fn pattern(b: *Builder, when_id: ast.NodeId, pat: *const ast.WhenPattern, subject: ?Reg, subject_t: TypeId) Error!Reg {
     switch (pat.kind) {
         .Value => |*v| {
-            const sv = subject orelse return body.lowerExpr(b, v);
-            const pv = try body.lowerExpr(b, v);
+            const sv = subject orelse return body.lowerAlone(b, v);
+            const pv = try body.lowerAlone(b, v);
             if (v.* == .NullLit) {
                 const dst = b.newReg();
                 try b.emit(.{ .BinOp = .{ .dst = dst, .op = .IdentEq, .lhs = sv, .rhs = pv } });
@@ -255,15 +284,15 @@ fn loopWhile(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     if (!b.terminated()) b.terminate(.{ .Goto = cond_blk });
     b.switchTo(exit);
     try groups.end(b);
-    return b.emitConst(.Unit);
+    return b.unit();
 }
 
 /// A loop's condition, in a replace group of its own when each iteration
 /// has one.
 fn loopCondition(b: *Builder, cond: *const ast.Expr, groups: compose.LoopGroups) Error!Reg {
-    if (!groups.per_iteration) return body.lowerExpr(b, cond);
+    if (!groups.per_iteration) return body.lowerAlone(b, cond);
     try compose.startReplaceGroup(b, cond.span());
-    const c = try body.lowerExpr(b, cond);
+    const c = try body.lowerAlone(b, cond);
     b.compose_open -= 1;
     if (!b.terminated()) try compose.endReplaceGroupCall(b);
     return c;
@@ -290,7 +319,7 @@ fn loopDoWhile(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     if (!b.terminated()) b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
     b.switchTo(exit);
     try groups.end(b);
-    return b.emitConst(.Unit);
+    return b.unit();
 }
 
 /// A loop's body with the loop on the stack for `break` and `continue`,
@@ -304,7 +333,8 @@ fn loopBody(b: *Builder, e: *const ast.Expr, label: ?[]const u8, break_to: Block
     b.compose_block = .{ .end = e.span().end, .loop_body = true };
     defer b.compose_block = saved_block;
     if (groups.per_iteration) try compose.startReplaceGroup(b, e.span());
-    _ = try body.lowerExpr(b, e);
+    // A loop's body is run for its effects.
+    try body.lowerDiscarding(b, e);
     if (groups.per_iteration) {
         b.compose_open -= 1;
         if (!b.terminated()) try compose.endReplaceGroupCall(b);
@@ -347,7 +377,7 @@ fn loopFor(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     if (!b.terminated()) b.terminate(.{ .Goto = head });
     b.switchTo(exit);
     try groups.end(b);
-    return b.emitConst(.Unit);
+    return b.unit();
 }
 
 /// A `Labeled` expression: a labeled loop takes the label onto the loop
@@ -445,7 +475,7 @@ pub fn lowerTry(b: *Builder, e: *const ast.Expr) Error!Reg {
     }
     if (fin) |f| {
         b.switchTo(f);
-        _ = try body.lowerBlock(b, fin_block.?);
+        try body.lowerStmtsDiscarding(b, fin_block.?.stmts);
         if (!b.terminated()) b.terminate(.{ .Goto = done.? });
         b.switchTo(done.?);
         b.terminate(.{ .Goto = exit });
@@ -578,7 +608,7 @@ pub fn jumpOut(b: *Builder, finally_depth: usize, to: BlockId) Error!void {
         // enclosing ones.
         const saved = try a.dupe(builder.Finally, b.finallys.items[i..]);
         b.finallys.items.len = i;
-        _ = try body.lowerBlock(b, fb);
+        try body.lowerStmtsDiscarding(b, fb.stmts);
         b.finallys.items.len = i;
         try b.finallys.appendSlice(a, saved);
         if (b.terminated()) return;

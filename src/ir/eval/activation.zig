@@ -16,12 +16,10 @@ const Module = ir.Module;
 const Reg = ir.Reg;
 
 const parent = @import("../eval.zig");
-const ev_chain = @import("chain.zig");
 const ev_diag = @import("diag.zig");
 const ev_enter = @import("enter.zig");
 const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
-const ev_loop = @import("loop.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 const ev_resolved = @import("resolved.zig");
@@ -33,6 +31,7 @@ const EvalTls = ev_state.EvalTls;
 const FlatCallReq = ev_flow.FlatCallReq;
 const Frame = ev_frame.Frame;
 const FrameSnapshot = ev_snapshot.FrameSnapshot;
+const ArgArea = ev_frame.ArgArea;
 const ResumeFrames = ev_state.ResumeFrames;
 const SuspendState = ev_snapshot.SuspendState;
 const TailSeg = ev_snapshot.TailSeg;
@@ -47,13 +46,11 @@ const funcFirstLoc = ev_diag.funcFirstLoc;
 const gcInstallFrameRoot = ev_state.gcInstallFrameRoot;
 const gcPopFrame = ev_state.gcPopFrame;
 const gcPushFrame = ev_state.gcPushFrame;
-const maxEvalDepth = ev_chain.maxEvalDepth;
 const noteSuspendSnapshot = ev_snapshot.noteSuspendSnapshot;
 const ok = ev_flow.ok;
-const regsAlloc = ev_state.regsAlloc;
 const resumeTraceOn = ev_flow.resumeTraceOn;
 const retainSnapshotValues = ev_snapshot.retainSnapshotValues;
-const runFlatLoop = ev_loop.runFlatLoop;
+const runFlatLoop = @import("exec.zig").runFlatLoop;
 const snapshotRegisters = ev_snapshot.snapshotRegisters;
 
 pub fn takeInFlightSuspend(allocator: Allocator) ?*SuspendState {
@@ -138,7 +135,7 @@ pub fn resumeContinuation(
                 resume_unwind = e;
             } else if (first) {
                 if (carry == .Result and !carry.Result.ok) {
-                    resume_throw = carry.Result.payload.asPtr().*;
+                    resume_throw = carry.Result.payload.asPtrConst().*;
                 }
             }
             first = false;
@@ -181,13 +178,18 @@ pub fn resumeContinuation(
                 snap.regs.ptrIdentity(),
             });
         }
-        var params: std.ArrayList(Value) = .empty;
-        try params.appendSlice(allocator, snap.params);
-        var caps: std.ArrayList(Value) = .empty;
-        try caps.appendSlice(allocator, snap.captures);
-        var frame = try Frame.newWithCaptures(ev_state.evtlsPtr(), allocator, m, func, params, caps);
+        const ev = ev_state.evtlsPtr();
+        const area = try ArgArea.push(ev, snap.params, snap.captures);
+        var frame: Frame = undefined;
+        frame.enter(ev, allocator, m, func, area.vals[0..snap.params.len], area.vals[snap.params.len..], area.mark) catch |e| {
+            ev.vstack.restore(area.mark);
+            return e;
+        };
         frame.closure_id = snap.closure_id;
-        frame.pending_finally = snap.pending_finally;
+        frame.pfSet(snap.pending_finally) catch |e| {
+            frame.deinitIn(ev);
+            return e;
+        };
         defer frame.deinit();
         gcPushFrame(&frame);
         defer gcPopFrame(&frame);
@@ -199,13 +201,14 @@ pub fn resumeContinuation(
                 // The sparse snapshot recorded only live registers over a Unit base, which a no-fill frame must materialize first.
                 frame.materializeRegs();
                 for (entries) |entry| {
-                    if (entry.id < frame.regs.items.len) frame.regs.items[entry.id] = entry.value;
+                    if (entry.id < frame.regs.len) frame.regs[entry.id] = entry.value;
                 }
             },
             .dense => |values| {
-                frame.regs.clearRetainingCapacity();
-                try frame.regs.appendSlice(regsAlloc(allocator), values);
-                frame.wmask.setAll();
+                frame.materializeRegs();
+                if (values.len > frame.regs.len) try frame.write(Reg.from(@intCast(values.len - 1)), .Unit);
+                @memcpy(frame.regs[0..values.len], values);
+                @memset(frame.regs[values.len..], .Unit);
             },
         }
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means resume by throwing `e` at the
@@ -220,7 +223,7 @@ pub fn resumeContinuation(
             resume_unwind = e;
         } else if (first) {
             if (carry == .Result and !carry.Result.ok) {
-                resume_throw = carry.Result.payload.asPtr().*;
+                resume_throw = carry.Result.payload.asPtrConst().*;
             }
         }
         first = false;
@@ -359,15 +362,15 @@ pub fn snapshotSuspendedFrame(
         block,
         inst_idx,
         resume_reg,
-        frame.regs.items,
+        frame.regs,
         try_stack.items.len == 0,
     );
     noteSuspendSnapshot(
         saved_regs.isDense(),
-        frame.regs.items.len,
+        frame.regs.len,
         saved_regs.savedLen(),
-        frame.params.items.len,
-        frame.captures.items.len,
+        frame.params.len,
+        frame.captures.len,
     );
     const snap: FrameSnapshot = .{
         .func = frame.func.id,
@@ -376,12 +379,12 @@ pub fn snapshotSuspendedFrame(
         .inst_idx = inst_idx,
         .regs = saved_regs,
         .params = blk: {
-            if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes((frame.params.items.len + frame.captures.items.len) * @sizeOf(Value));
-            break :blk try allocator.dupe(Value, frame.params.items);
+            if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes((frame.params.len + frame.captures.len) * @sizeOf(Value));
+            break :blk try allocator.dupe(Value, frame.params);
         },
-        .captures = try allocator.dupe(Value, frame.captures.items),
+        .captures = try allocator.dupe(Value, frame.captures),
         .try_stack = try allocator.dupe(TryFrame, try_stack.items),
-        .pending_finally = frame.pending_finally,
+        .pending_finally = frame.pf(),
         .is_lambda = frame.func.is_lambda,
         .resume_reg = resume_reg,
         .closure_id = frame.closure_id,
@@ -392,17 +395,17 @@ pub fn snapshotSuspendedFrame(
             frame.func.id.int(),
             block.int(),
             inst_idx,
-            frame.pending_finally.rethrow != null,
-            frame.pending_finally.return_value != null,
-            frame.pending_finally.unwind != null,
-            frame.captures.items.len,
+            frame.pf().rethrow != null,
+            frame.pf().return_value != null,
+            frame.pf().unwind != null,
+            frame.captures.len,
         });
     }
     // The snapshot now holds the only references surviving this frame's teardown and the unwind above it.
     retainSnapshotValues(snap);
     try state.frames.append(allocator, snap);
     // Ownership of the pending control-flow payload moved into `snap`; teardown must not release it.
-    frame.pending_finally = .{};
+    frame.pfForget();
 }
 
 /// Per-thread activation freelist, pooled only under the tracing GC. Entries are inert storage holding no Values.
@@ -436,98 +439,119 @@ pub fn actFree(ev: *EvalTls, allocator: Allocator, act: *Activation) void {
     allocator.destroy(act);
 }
 
+/// `openActivation` for a call the stream loop runs in a module lowered from sema, with the run's
+/// reclaim flag known where it is compiled. Under the tracing collector the activation comes off
+/// this thread's pool and nothing checks the flag.
+pub inline fn openStreamActivation(
+    ev: *EvalTls,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const ir.Func,
+    params: []const Value,
+    captures: []const Value,
+    area: ?ev_state.VsMark,
+    closure_id: ?u64,
+    owning: ?*const Module,
+    dst: Reg,
+    no_fill: bool,
+    comptime reclaim: bool,
+) Allocator.Error!*Activation {
+    if (reclaim or parent.call_hooks_on or !runtime.gc.gc_enabled) return openActivation(ev, allocator, module, .{
+        .func = func,
+        .run_module = module,
+        .owning = owning,
+        .params = params,
+        .captures = captures,
+        .area = area,
+        .closure_id = closure_id,
+        .dst = dst,
+    });
+    const act: *Activation = if (ev.act_pool_len > 0) blk: {
+        ev.act_pool_len -= 1;
+        break :blk ev.act_pool[ev.act_pool_len];
+    } else blk: {
+        const fresh = try std.heap.c_allocator.create(Activation);
+        fresh.frame.wmask.clear();
+        break :blk fresh;
+    };
+    errdefer actFree(ev, allocator, act);
+    try act.frame.enterStream(ev, allocator, module, func, params, captures, area, no_fill, false);
+    act.frame.closure_id = closure_id;
+    act.frame.module_arc = owning;
+    act.try_stack = .empty;
+    act.ret_dst = dst;
+    gcPushFrame(&act.frame);
+    return act;
+}
+
+/// `teardownActivation` for an activation the stream loop closes on a return.
+pub inline fn closeStreamActivation(ev: *EvalTls, allocator: Allocator, act: *Activation, comptime reclaim: bool) void {
+    if (reclaim or parent.call_hooks_on or !runtime.gc.gc_enabled) {
+        teardownActivation(allocator, act);
+        actFree(ev, allocator, act);
+        return;
+    }
+    gcPopFrame(&act.frame);
+    act.frame.deinitStream(ev, false);
+    if (act.try_stack.capacity != 0) act.try_stack.deinit(allocator);
+    if (ev.act_pool_len < ACT_POOL_MAX) {
+        ev.act_pool[ev.act_pool_len] = act;
+        ev.act_pool_len += 1;
+    } else std.heap.c_allocator.destroy(act);
+}
+
 /// Open a flat activation for a direct interpreted call: the entry sequence `evalClosure` performs recursively.
-pub fn openActivation(allocator: Allocator, caller_module: *const Module, req: FlatCallReq) Allocator.Error!*Activation {
-    const ev: *EvalTls = ev_state.evtlsPtr();
+pub fn openActivation(ev: *EvalTls, allocator: Allocator, caller_module: *const Module, req: FlatCallReq) Allocator.Error!*Activation {
     const module = req.run_module orelse caller_module;
     // A module lowered from sema passes arguments as sema typed and
     // converted them.
     if (module.resolved == null) {
-        boolThisTrap(req.func, req.args.items);
+        boolThisTrap(req.func, req.params);
         dumpFnIfRequested(req.func);
     }
-    callStatsBumpId(req.func.fqn, req.func.id.int(), module);
+    if (parent.call_hooks_on) callStatsBumpId(req.func.fqn, req.func.id.int(), module);
     const act = try actAlloc(ev, allocator);
     errdefer actFree(ev, allocator, act);
-    act.* = .{
-        .frame = try Frame.newWithCaptures(ev, allocator, module, req.func, req.args, req.captures),
-        .try_stack = .empty,
-        .composer_pushed = req.composer_pushed,
-        .keepalive = req.keepalive,
-        .suspend_barrier = req.suspend_barrier,
-        .barrier_scope_base = req.barrier_scope_base,
-        .scope_guard_ident = req.scope_guard_ident,
-        .root_pump = req.root_pump,
-        .typed_saved = req.typed_saved,
-        .type_args = req.type_args,
-        .ret_block = undefined,
-        .ret_idx = 0,
-        .ret_dst = req.dst,
-    };
+    try act.frame.enter(ev, allocator, module, req.func, req.params, req.captures, req.area);
     act.frame.closure_id = req.closure_id;
-    gcPushFrame(&act.frame);
     act.frame.module_arc = req.owning;
+    act.try_stack = .empty;
+    act.ret_idx = 0;
+    act.ret_dst = req.dst;
+    act.ret_streams = null;
+    act.ret_pc = 0;
+    gcPushFrame(&act.frame);
     return act;
 }
 
-/// Tear down a flat activation: `evalClosure`'s exit defers in LIFO order, then the host's post-call unwinds.
-pub fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, host: *H) void {
+/// Tear down a flat activation: `evalClosure`'s exit defers in LIFO order.
+pub fn teardownActivation(allocator: Allocator, act: *Activation) void {
     gcPopFrame(&act.frame);
-    act.frame.deinit();
+    // The activation just ran on this thread, so its frame's state is the running thread's.
+    act.frame.deinitIn(act.frame.tls);
     act.try_stack.deinit(allocator);
-    if (act.composer_pushed) {
-        if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
-        act.composer_pushed = false;
-    }
-    if (act.keepalive) |ka| {
-        if (runtime.reclaimEnabled()) ka.release(allocator);
-        act.keepalive = null;
-    }
-    if (act.scope_guard_ident != 0) {
-        if (comptime @hasDecl(H, "undispatchedScopeLeave")) host.undispatchedScopeLeave(act.scope_guard_ident);
-        act.scope_guard_ident = 0;
-    }
-    if (act.typed_saved) |ts| {
-        if (comptime @hasDecl(H, "typedBindingsRestore")) host.typedBindingsRestore(allocator, ts);
-        act.typed_saved = null;
-    }
-    if (act.type_args.len > 0) {
-        allocator.free(act.type_args);
-        act.type_args = &.{};
-    }
 }
 
-/// Park a flat activation live: unwind its host-entry effects and thread links, then hand the
-/// intact activation to the suspend state, which owns it until resume or drop.
+/// Park a flat activation live: take it off the frame chain and the value stack, then hand the
+/// activation to the suspend state, which owns it until resume or drop.
 pub fn liveParkActivation(
-    comptime H: type,
     allocator: Allocator,
     act: *Activation,
     block: BlockId,
     inst_idx: usize,
     resume_reg: ?Reg,
     state: *SuspendState,
-    host: *H,
 ) Allocator.Error!void {
-    if (act.composer_pushed) {
-        if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
-        act.composer_pushed = false;
-    }
     gcPopFrame(&act.frame);
-    // The park's scope-delta capture owns the guard entry from here on.
-    act.scope_guard_ident = 0;
-    // Reified bindings restore across a suspension; the resumed body's reified reads were lowering-bound.
-    if (act.typed_saved) |ts| {
-        if (comptime @hasDecl(H, "typedBindingsRestore")) host.typedBindingsRestore(allocator, ts);
-        act.typed_saved = null;
-    }
+    // The thread goes on using the stack slots the frame held, so what it keeps moves with it.
+    try act.frame.leaveStack(act.frame.tls);
     if (resumeTraceOn()) {
         std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} LIVE caps={d}\n", .{
             act.frame.func.name,
             act.frame.func.id.int(),
             block.int(),
             inst_idx,
-            act.frame.captures.items.len,
+            act.frame.captures.len,
         });
     }
     try state.frames.append(allocator, .{
@@ -551,10 +575,6 @@ pub fn liveParkActivation(
 pub fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
     act.frame.deinit();
     act.try_stack.deinit(allocator);
-    if (act.keepalive) |ka| {
-        if (runtime.reclaimEnabled()) ka.release(allocator);
-    }
-    if (act.type_args.len > 0) allocator.free(act.type_args);
     actFree(ev_state.evtlsPtr(), allocator, act);
 }
 
@@ -581,30 +601,14 @@ fn resumeLiveActivation(
     const res = try runFlatLoop(H, allocator, &act.frame, &act.try_stack, block, inst_idx, resume_throw, resume_unwind, act, host);
     if (res == .err and res.err == .Suspended) return res;
     const out = frameBoundary(act.frame.func, res);
-    teardownActivation(H, allocator, act, host);
+    teardownActivation(allocator, act);
     actFree(ev_state.evtlsPtr(), allocator, act);
     return out;
 }
 
-/// Discard a flat call request unrun: free the transferred buffers (values are borrows) and unwind the prepare step's host effects.
-pub fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, host: *H) void {
-    var args = req.args;
-    args.deinit(allocator);
-    var caps = req.captures;
-    caps.deinit(allocator);
-    if (req.composer_pushed) {
-        if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
-    }
-    if (req.keepalive) |ka| {
-        if (runtime.reclaimEnabled()) ka.release(allocator);
-    }
-    if (req.scope_guard_ident != 0) {
-        if (comptime @hasDecl(H, "undispatchedScopeLeave")) host.undispatchedScopeLeave(req.scope_guard_ident);
-    }
-    if (req.typed_saved) |ts| {
-        if (comptime @hasDecl(H, "typedBindingsRestore")) host.typedBindingsRestore(allocator, ts);
-    }
-    if (req.type_args.len > 0) allocator.free(req.type_args);
+/// Discard a flat call request unrun: pop the argument area it pushed (its values are borrows).
+pub fn discardFlatReq(ev: *EvalTls, req: FlatCallReq) void {
+    if (req.area) |m| ev.vstack.restore(m);
 }
 
 /// The flat call driver: a direct interpreted call the executor surfaces becomes a new heap

@@ -123,6 +123,12 @@ pub fn analyzeWith(a: Allocator, sources: []const []const u8, opts: AnalyzeOptio
 /// Parses the executable base (one layer) and `sources` (the next layer),
 /// resolves, bridges, lowers every body with an id and runs `main`.
 pub fn run(a: Allocator, sources: []const []const u8) anyerror!Outcome {
+    return runWith(a, sources, null);
+}
+
+/// `run`, calling `before_main` once the program is compiled, just before
+/// `main` starts: what a test arms against the run rather than the compile.
+pub fn runWith(a: Allocator, sources: []const []const u8, before_main: ?*const fn () void) anyerror!Outcome {
     var an = try analyze(a, sources);
     const census = try an.census(a, .program);
     if (census.len != 0) return failed(census);
@@ -152,7 +158,7 @@ pub fn run(a: Allocator, sources: []const []const u8) anyerror!Outcome {
     }
     const main_sym = (try an.mainSym()) orelse return failed("no main function\n");
     const main = an.br.funcOfOpt(main_sym) orelse return failed("main has no id\n");
-    return runMain(a, &an, main);
+    return runMain(a, &an, main, before_main);
 }
 
 /// The miniature base baked alone, as a base image holds it: bridged and
@@ -230,7 +236,7 @@ pub fn runOver(a: Allocator, sources: []const []const u8) anyerror!Outcome {
     }
     const main_sym = (try an.mainSym()) orelse return failed("no main function\n");
     const main = an.br.funcOfOpt(main_sym) orelse return failed("main has no id\n");
-    return runMain(a, &an, main);
+    return runMain(a, &an, main, null);
 }
 
 /// `runOver` with the baked base serialized and read back, as a run over
@@ -273,7 +279,7 @@ pub fn runOverImage(a: Allocator, sources: []const []const u8) anyerror!Outcome 
     }
     const main_sym = (try an.mainSym()) orelse return failed("no main function\n");
     const main = br.funcOfOpt(main_sym) orelse return failed("main has no id\n");
-    return runMain(a, &an, main);
+    return runMain(a, &an, main, null);
 }
 
 /// Runs `sources` over a base read back from its image and expects it to
@@ -325,13 +331,14 @@ fn spanWhere(a: Allocator, an: *const Analysis, sp: span.Span) Allocator.Error![
     return std.fmt.allocPrint(a, "{s}:{d}:{d}", .{ src.path, lc.line, lc.col });
 }
 
-const MainCtx = struct { main: ir.FuncId, outcome: *?interp_ir.CallOutcome };
+const MainCtx = struct { main: ir.FuncId, outcome: *?interp_ir.CallOutcome, before_main: ?*const fn () void };
 
 fn callMain(ctx: MainCtx, vm: *interp_ir.Vm) Allocator.Error!void {
+    if (ctx.before_main) |f| f();
     ctx.outcome.* = try vm.callMain(ctx.main);
 }
 
-fn runMain(a: Allocator, an: *Analysis, main: ir.FuncId) !Outcome {
+fn runMain(a: Allocator, an: *Analysis, main: ir.FuncId, before_main: ?*const fn () void) !Outcome {
     // Each program is its own run: the process-global caches keyed by the
     // addresses of a finished run's IR must not answer for this one's.
     interp_ir.resetRunGlobalCaches();
@@ -346,7 +353,7 @@ fn runMain(a: Allocator, an: *Analysis, main: ir.FuncId) !Outcome {
     defer vm.deinit();
     var cap = runtime.CaptureOutput.init(a);
     var outcome: ?interp_ir.CallOutcome = null;
-    const prep = try vm.runCalls(cap.output(), MainCtx, .{ .main = main, .outcome = &outcome }, callMain);
+    const prep = try vm.runCalls(cap.output(), MainCtx, .{ .main = main, .outcome = &outcome, .before_main = before_main }, callMain);
     var text: std.ArrayList(u8) = .empty;
     for (cap.lines.items) |line| {
         try text.appendSlice(a, line);
@@ -383,9 +390,14 @@ fn throwableClass(a: Allocator, an: *const Analysis, v: runtime.Value) Allocator
 
 /// `run`, then expects `result == .ok`, no census site, and `want` exactly.
 pub fn expectOutput(sources: []const []const u8, want: []const u8) !void {
+    return expectOutputWith(sources, want, null);
+}
+
+/// `expectOutput` over `runWith`.
+pub fn expectOutputWith(sources: []const []const u8, want: []const u8, before_main: ?*const fn () void) !void {
     var mem = ir.eval.hand.TestMemory.init();
     defer mem.deinit();
-    const o = try run(mem.allocator(), sources);
+    const o = try runWith(mem.allocator(), sources, before_main);
     if (o.result != .ok) {
         std.debug.print("program {s}:\n{s}output so far:\n{s}\n", .{ @tagName(o.result), o.diag, o.output });
         return error.TestUnexpectedResult;
@@ -588,4 +600,5 @@ test {
     _ = @import("tests/over.zig");
     _ = @import("tests/compose.zig");
     _ = @import("tests/image.zig");
+    _ = @import("tests/locals.zig");
 }

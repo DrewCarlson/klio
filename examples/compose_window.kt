@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // Desktop-style compose entrypoint: `application { Window(...) { ... } }`
 // drives the REAL androidx.compose.ui engine in a native window when a
 // windowing backend is available, and reports headless cleanly otherwise —

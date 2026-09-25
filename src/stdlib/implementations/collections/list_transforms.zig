@@ -334,8 +334,8 @@ pub fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Erro
     var entries: std.ArrayList(MapPair) = .empty;
     for (items) |v| {
         if (v != .Pair) return .{ .err = typeErr(try fmt(a, "{s} requires a collection of Pair<K, V>", .{who})) };
-        const key = v.Pair.first.asPtr().*;
-        const val = v.Pair.second.asPtr().*;
+        const key = v.Pair.first.asPtrConst().*;
+        const val = v.Pair.second.asPtrConst().*;
         if (findKeyIndexBoxed(entries.items, &key)) |i| {
             entries.items[i].value = val;
         } else {
@@ -374,12 +374,12 @@ pub fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enu
         var val: Value = undefined;
         switch (entry) {
             .MapEntry => |me| {
-                key = me.key.asPtr().*;
-                val = me.value.asPtr().*;
+                key = me.key.asPtrConst().*;
+                val = me.value.asPtrConst().*;
             },
             .Pair => |p| {
-                key = p.first.asPtr().*;
-                val = p.second.asPtr().*;
+                key = p.first.asPtrConst().*;
+                val = p.second.asPtrConst().*;
             },
             else => {
                 const kr = (try ctx.host.callWellKnown(&entry, .entry_key, &.{}, ctx.out)) orelse

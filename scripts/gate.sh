@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The full local verification gate, one entry point. Order: fast unit
+# The full local verification gate, one entry point. Order: the Skia shim
+# (found, linked from the main checkout in a worktree, or fetched), fast unit
 # tests, then the program-running litmus suites (the parity groups, the
 # threaded litmus, e2e, the examples and the ktor/concurrency gates)
 # through the build system (it wires KLIO_ITEST_BIN and the shared test
@@ -52,6 +53,19 @@ phase() {
   return 0
 }
 
+echo "== Skia shim"
+# The window and drawing examples expect the output they print when the Skia
+# shim renders, which the binaries load from zig-out/lib. fetch-skia.sh finds
+# the prebuilt Skia libraries (in a linked worktree, the main checkout's) or
+# downloads them; only when neither works are those examples skipped, by name.
+NO_SKIA=0
+if scripts/fetch-skia.sh; then
+  phase "skia-lib" zig build skia-lib
+else
+  NO_SKIA=1
+  echo "skia: SKIPPING the examples marked '// corpus: skia': no Skia libraries for this host and the download failed (scripts/fetch-skia.sh)"
+fi
+
 echo "== unit"
 phase "unit" zig build test
 
@@ -79,11 +93,17 @@ echo "== every shipped pack reinstalled from this tree"
 phase "packs" env KLIO_BIN=zig-out/bin/klio-harness scripts/refresh-local-packs.sh
 
 echo "== compose-ui example family (fresh packs, cleared bake cache)"
-phase "compose-ui-gate" scripts/compose-ui-gate.sh
+if [ "$NO_SKIA" = 1 ]; then
+  phase "compose-ui-gate" env KLIO_GATE_NO_SKIA=1 scripts/compose-ui-gate.sh
+else
+  phase "compose-ui-gate" scripts/compose-ui-gate.sh
+fi
 
 echo "== full example corpus"
 # 180 s per example: a cold compose bake is ~70 s even locally (warm ~2 s).
-phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180
+CORPUS_SKIA=""
+[ "$NO_SKIA" = 1 ] && CORPUS_SKIA="--no-skia"
+phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180 $CORPUS_SKIA
 
 # The sema census over the base, every installed pack with all of its
 # features, and the example corpus, against the packs just installed.

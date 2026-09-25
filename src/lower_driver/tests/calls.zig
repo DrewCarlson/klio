@@ -378,7 +378,8 @@ test "a constructor call names its class; an invoke of a function value is a val
 // ------------------------------------------------------ emitted IR shape --
 
 /// What `emitCall` wrote: the call instruction last, and per position of
-/// its argument run the register moved there.
+/// its argument run the register moved there, or the slot itself when a
+/// constant the call made is loaded straight into it.
 const Emitted = struct {
     insts: []const ir.Inst,
     call: ir.Inst,
@@ -393,6 +394,10 @@ const Emitted = struct {
             for (insts) |inst| switch (inst) {
                 .Move => |m| if (m.dst == want) {
                     o.* = m.src;
+                    found = true;
+                },
+                .Const => |c| if (c.dst == want) {
+                    o.* = want;
                     found = true;
                 },
                 else => {},

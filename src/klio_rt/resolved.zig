@@ -237,7 +237,6 @@ fn buildDef(a: std.mem.Allocator, d: *const ClassDesc) !ObjRef(runtime.ClassDef)
     }
     def.ir_class = d.id;
     def.layout_slots = lslots;
-    def.layout_state = 2;
     return ObjRef(runtime.ClassDef).init(a, def);
 }
 
@@ -810,13 +809,7 @@ export fn klio_r_class_value(cv: CValue) CValue {
 export fn klio_r_get(ocv: CValue, slot: u32) CValue {
     const obj = fromC(ocv);
     switch (obj) {
-        .Instance => |inst| {
-            const g = inst.borrow();
-            const fields = g.get().fields.items;
-            const v = if (slot < fields.len) fields[slot].value else null;
-            g.deinit();
-            return toC(v orelse fatal("a field slot past the instance's fields"));
-        },
+        .Instance => |inst| return toC(runtime.InstanceData.slotGet(inst, slot) orelse fatal("a field slot past the instance's fields")),
         .Null => raise(.npe, null),
         .UByte => |u| if (slot == 0) return toC(.{ .Byte = @bitCast(u) }),
         .UShort => |u| if (slot == 0) return toC(.{ .Short = @bitCast(u) }),
@@ -844,13 +837,7 @@ export fn klio_r_set(ocv: CValue, slot: u32, vcv: CValue) void {
     const obj = fromC(ocv);
     switch (obj) {
         .Instance => |inst| {
-            const g = inst.borrowMut();
-            const fields = g.get().fields.items;
-            const ok = slot < fields.len;
-            if (ok) fields[slot].value = fromC(vcv);
-            g.deinit();
-            if (!ok) fatal("a field slot past the instance's fields");
-            runtime.gc.writeBarrier(&inst.cell.hdr);
+            _ = runtime.InstanceData.slotSet(inst, slot, fromC(vcv)) orelse fatal("a field slot past the instance's fields");
         },
         .Null => raise(.npe, null),
         else => fatal("a field write of a value with no fields"),

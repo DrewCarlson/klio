@@ -26,6 +26,7 @@ pub fn configureGcFromEnv() void {
     if (envOn("KLIO_GC_POISON")) |v| gc.gc_poison = v;
     if (envOn("KLIO_GC_MINOR_STOP")) |v| gc.minor_stops_at_tenured = v;
     if (envOn("KLIO_GC_GEN")) |v| gc.generational = v;
+    if (objcell.envOnce("KLIO_GC_SWEEP")) |v| gc.sweep_in_pause = std.mem.eql(u8, v, "pause");
     if (objcell.envOnce("KLIO_GC_THRESHOLD_KB")) |v| {
         if (std.fmt.parseInt(usize, v, 10) catch null) |kb| {
             if (kb != 0) gc.setThresholdFloor(kb * 1024);
@@ -33,6 +34,17 @@ pub fn configureGcFromEnv() void {
     }
     if (objcell.envOnce("KLIO_GC_STRESS_EVERY")) |v| {
         gc.gc_stress_every = std.fmt.parseInt(usize, v, 10) catch 0;
+    }
+    if (objcell.envOnce("KLIO_GC_MAJOR")) |v| {
+        if (std.mem.eql(u8, v, "slices")) gc.major_mode = .slices;
+        if (std.mem.eql(u8, v, "concurrent")) gc.major_mode = .concurrent;
+        if (std.mem.eql(u8, v, "stop")) gc.major_mode = .stop;
+    }
+    if (objcell.envOnce("KLIO_GC_SLICE")) |v| {
+        if (std.fmt.parseInt(usize, v, 10) catch null) |n| gc.slice_budget = @max(n, 1);
+    }
+    if (objcell.envOnce("KLIO_GC_MAJOR_EVERY")) |v| {
+        gc.major_every = std.fmt.parseInt(usize, v, 10) catch 0;
     }
     objcell.setReclaim(false);
     // Another backend overrides this page-returning trim.

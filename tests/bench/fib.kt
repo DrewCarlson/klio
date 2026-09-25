@@ -1,0 +1,4 @@
+// fib: recursive calls and Int arithmetic, the cheapest-activation workload at
+// program scale. Measured for user CPU by scripts/measure-row.py.
+fun fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)
+fun main() { println(fib(32)) }

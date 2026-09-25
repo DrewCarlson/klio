@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // The real androidx.compose.ui.graphics.Path boolean operations (Path.op) —
 // union / intersect / difference / xor of two paths, computed by the Skia
 // shim's SkPathOps. Two overlapping squares are combined every way; the result

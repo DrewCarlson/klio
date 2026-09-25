@@ -17,21 +17,32 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def is_interactive(path):
-    """An example marked `// corpus: interactive` is a live windowed app
-    that loops until the user closes its window (maxFrames = -1); it has
-    no exit code to assert and is excluded from the corpus run."""
+def has_marker(path, marker):
+    """Whether one of the example's first 12 lines is `// corpus: <marker>`."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for _ in range(12):
                 line = f.readline()
                 if not line:
                     break
-                if re.search(r"//\s*corpus:\s*interactive", line):
+                if re.search(r"//\s*corpus:\s*" + re.escape(marker) + r"\b", line):
                     return True
     except OSError:
         pass
     return False
+
+
+def is_interactive(path):
+    """An example marked `// corpus: interactive` is a live windowed app
+    that loops until the user closes its window (maxFrames = -1); it has
+    no exit code to assert and is excluded from the corpus run."""
+    return has_marker(path, "interactive")
+
+
+def needs_skia(path):
+    """An example marked `// corpus: skia` expects the output it prints when
+    the Skia shim renders; without the shim it prints its headless output."""
+    return has_marker(path, "skia")
 
 
 def extra_args(path):
@@ -95,6 +106,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--jobs", type=int, default=min(12, os.cpu_count() or 1))
     ap.add_argument("--list-fail", action="store_true")
+    ap.add_argument("--no-skia", action="store_true",
+                    help="skip the examples marked `// corpus: skia`, for a host with no Skia shim")
     ap.add_argument("--allow-shared-home", action="store_true",
                     help="run against the shared ~/.klio data home (its installed packs shadow the tree)")
     ap.add_argument("pattern", nargs="?", default="examples/*.kt")
@@ -120,6 +133,11 @@ def main():
         files = [f for f in files if f not in set(skipped)]
         print(f"skipping {len(skipped)} interactive example(s): "
               + " ".join(os.path.relpath(f, ROOT) for f in skipped))
+    if args.no_skia:
+        no_shim = [f for f in files if needs_skia(f)]
+        files = [f for f in files if f not in set(no_shim)]
+        print(f"skipping {len(no_shim)} example(s) that render through the Skia shim (--no-skia): "
+              + " ".join(os.path.relpath(f, ROOT) for f in no_shim))
 
     def check(f):
         rel = os.path.relpath(f, ROOT)

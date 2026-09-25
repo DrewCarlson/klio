@@ -186,6 +186,19 @@ pub const DriverWakeup = struct {
         try self.owned_slot_set.append(self.allocator, slot);
     }
 
+    /// Drops `slot` once its registration is gone, so the set holds only the
+    /// slots still armed or parked here.
+    pub fn removeOwnedSlot(self: *DriverWakeup, slot: i64) void {
+        self.owned_slots.lock();
+        defer self.owned_slots.unlock();
+        for (self.owned_slot_set.items, 0..) |s, i| {
+            if (s == slot) {
+                _ = self.owned_slot_set.swapRemove(i);
+                return;
+            }
+        }
+    }
+
     pub fn releaseOwnedSlots(self: *DriverWakeup) void {
         self.owned_slots.lock();
         const slots = self.owned_slot_set;
@@ -235,6 +248,7 @@ const SlotOwners = struct {
     /// The owner check and the stash are one atomic section against
     /// `registerSlotOwner`; false means the caller must retry the owner route.
     fn stashPendingIfUnowned(slot: i64, value: Value) Allocator.Error!bool {
+        ensureCoroGlobalRoot();
         mutex.lock();
         defer mutex.unlock();
         if (map) |*m| {
@@ -308,6 +322,7 @@ const PersistedParked = struct {
             }
             std.debug.print("\n", .{});
         }
+        ensureCoroGlobalRoot();
         mutex.lock();
         defer mutex.unlock();
         if (map == null) {
@@ -586,12 +601,17 @@ pub fn lookupSlotOwner(slot: i64) ?ObjRef(DriverWakeup) {
 }
 
 pub fn unregisterSlot(slot: i64) void {
-    SlotOwners.mutex.lock();
-    defer SlotOwners.mutex.unlock();
-    if (SlotOwners.map) |*m| {
-        if (m.fetchRemove(slot)) |kv| {
-            kv.value.deinit();
-        }
+    const owner: ?ObjRef(DriverWakeup) = blk: {
+        SlotOwners.mutex.lock();
+        defer SlotOwners.mutex.unlock();
+        const m = if (SlotOwners.map) |*m| m else break :blk null;
+        break :blk if (m.fetchRemove(slot)) |kv| kv.value else null;
+    };
+    // After the registry lock: `releaseOwnedSlots` takes the set's lock and
+    // then the registry's, so neither is held across the other.
+    if (owner) |w| {
+        w.asPtr().removeOwnedSlot(slot);
+        w.deinit();
     }
 }
 
@@ -640,6 +660,9 @@ pub const CooperativeInterceptor = struct {
     token_resume_value: std.AutoHashMap(u64, Value),
     /// This pump's root while parked; an inline resume never steals it.
     root_tok: ?u64 = null,
+    /// The root's result once it completed, held here while the pump runs on
+    /// for the root's children: the driver's own copy is a native local.
+    root_value: Value = .Unit,
     /// Set once a native channel delivery routed through an external dispatcher's
     /// queue: such a pump orders its dispatched resumes there, not on `drv.ready`.
     scheduler_backed: bool = false,
@@ -688,6 +711,14 @@ pub const CooperativeInterceptor = struct {
         for (self.timeout_launched.items) |v| v.gcMark(m);
         var rit = self.token_resume_value.valueIterator();
         while (rit.next()) |v| v.gcMark(m);
+        self.root_value.gcMark(m);
+        // A failure held for the loop head, across turns that run user code.
+        if (self.pending_err) |pe| switch (pe) {
+            .Throw, .NonLocalReturn => |v| v.gcMark(m),
+            .LabeledReturn => |lr| lr.value.gcMark(m),
+            .Suspended => |st| ir.eval.gcMarkSuspendState(st, m),
+            else => {},
+        };
     }
 
     pub fn deinit(self: *CooperativeInterceptor) void {
@@ -793,8 +824,12 @@ pub const CooperativeInterceptor = struct {
         try registerSlotOwner(slot, &self.wakeup);
     }
 
+    /// The armed slot's suspension completed without parking, so nothing
+    /// will wait on it: its registration goes.
     pub fn clearPendingSlot(self: *CooperativeInterceptor) void {
+        const slot = self.pending_slot orelse return;
         self.pending_slot = null;
+        unregisterSlot(slot);
     }
 
     pub fn resumeSlot(self: *CooperativeInterceptor, slot: i64) Allocator.Error!bool {
@@ -1160,6 +1195,11 @@ fn gcMarkCoroGlobal(m: *runtime.gc.Marker) void {
         var it = sm.valueIterator();
         while (it.next()) |w| m.shade(&w.cell.hdr);
     }
+    // A resume that arrived before its slot's owner is held only here.
+    if (SlotOwners.pending) |*pm| {
+        var it = pm.valueIterator();
+        while (it.next()) |v| v.gcMark(m);
+    }
     SlotOwners.mutex.unlock();
 
     if (runtime.gc.gc_debug) {
@@ -1187,11 +1227,23 @@ fn gcMarkCoroLocalCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
 }
 
 var coro_global_registered = std.atomic.Value(bool).init(false);
+var coro_global_lock: SpinMutex = .{};
+
+/// Registered before anything reaches the process-global registries, and seen
+/// registered by every thread that then fills them.
+fn ensureCoroGlobalRoot() void {
+    if (!runtime.gc.gc_enabled) return;
+    if (coro_global_registered.load(.acquire)) return;
+    coro_global_lock.lock();
+    defer coro_global_lock.unlock();
+    if (coro_global_registered.load(.acquire)) return;
+    runtime.gc.registerRoot(gcMarkCoroGlobal);
+    coro_global_registered.store(true, .release);
+}
 
 fn ensureCoroRoot() void {
     if (!runtime.gc.gc_enabled) return;
-    if (!coro_global_registered.swap(true, .monotonic))
-        runtime.gc.registerRoot(gcMarkCoroGlobal);
+    ensureCoroGlobalRoot();
     if (!coro_troot_inited) {
         coro_troot_inited = true;
         coro_anchor = .{ .coro = &coro_stack, .scope = &active_scope_stack };
@@ -1423,7 +1475,7 @@ pub fn builderStep(self: anytype, state: runtime.BuilderStateRef, out: Output) A
         const g = state.borrow();
         done = g.get().done;
         failed = g.get().failed;
-        scope = g.get().scope.asPtr().*;
+        scope = g.get().scope.asPtrConst().*;
         g.deinit();
     }
     // A failed iterator rejects every later pull, matching
@@ -1460,20 +1512,20 @@ pub fn builderStep(self: anytype, state: runtime.BuilderStateRef, out: Output) A
         var cont: ?*SuspendState = undefined;
         var block: Value = undefined;
         {
-            const g = state.borrow();
+            // Read and claim under one exclusive borrow: two pullers on one
+            // builder must not both start it, or both take and resume its
+            // continuation and free it twice.
+            const g = state.borrowMut();
+            defer g.deinit();
             started = g.get().started;
+            g.get().started = true;
             cont = if (g.get().cont) |c| @ptrCast(@alignCast(c)) else null;
-            block = g.get().block.asPtr().*;
-            g.deinit();
+            g.get().cont = null;
+            block = g.get().block.asPtrConst().*;
         }
 
         var r: ir.eval.EvalResult = undefined;
         if (!started) {
-            {
-                const g = state.borrowMut();
-                g.get().started = true;
-                g.deinit();
-            }
             r = try self.evalClosureRaw(&block, &.{}, &scope, out);
         } else {
             const old = cont orelse {
@@ -1482,11 +1534,6 @@ pub fn builderStep(self: anytype, state: runtime.BuilderStateRef, out: Output) A
                 g.deinit();
                 return .done;
             };
-            {
-                const g = state.borrowMut();
-                g.get().cont = null;
-                g.deinit();
-            }
             ir.eval.resume_route = "yield-rotate";
             r = try self.resumeRaw(old, .Unit, out);
             // `resumeContinuation` freed `old.frames`; free the box itself.
@@ -1648,6 +1695,11 @@ pub fn driveRoot(self: anytype, block: *const Value, scope: *const Value, out: O
     if (try pumpLoop(self, scope, out, persist, !persist, &root_token, &root_value)) |err_result| {
         return err_result;
     }
+    // Popped with the pump, the root's value is held only here, and the exit
+    // can run the resumes left in the mailbox.
+    const ka_root = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka_root);
+    if (root_value) |v| runtime.keepalivePush(v);
     try pumpExit(self, out, persist);
     return .{ .ok = root_value orelse Value.Unit };
 }
@@ -1680,6 +1732,11 @@ pub fn driveSuspendMain(self: anytype, main_id: ir.FuncId, out: Output) Allocato
     if (try pumpLoop(self, &unit, out, false, true, &root_token, &root_value)) |err_result| {
         return err_result;
     }
+    // Popped with the pump, the root's value is held only here, and the exit
+    // can run the resumes left in the mailbox.
+    const ka_root = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka_root);
+    if (root_value) |v| runtime.keepalivePush(v);
     try pumpExit(self, out, false);
     return .{ .ok = root_value orelse Value.Unit };
 }
@@ -1757,6 +1814,7 @@ fn pumpLoop(
     const a = self.allocator;
     var idle_rounds: usize = 0;
     var diag_loops: usize = 0;
+    if (root_value.*) |v| (coroTop().?).root_value = v;
     while (true) {
         diag_loops += 1;
         // A deadlocked pump idles in this loop's sleep arms, never the eval loop,
@@ -1887,6 +1945,11 @@ fn pumpLoop(
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
                 const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
+                // Off the pump, the value is held only here until the activation
+                // has it; handing it over can run Kotlin.
+                const ka_resume = runtime.keepaliveMark();
+                defer runtime.keepaliveRestore(ka_resume);
+                runtime.keepalivePush(resume_with);
                 // The activation's own scope must be live for its own
                 // `coroutineContext` reads; a re-suspension re-captures the delta.
                 const scope_base = activeScopeDepth();
@@ -1897,6 +1960,7 @@ fn pumpLoop(
                     .ok => |v| {
                         if (root_token.* != null and root_token.*.? == tok) {
                             root_value.* = v;
+                            (coroTop().?).root_value = v;
                             root_token.* = null;
                         }
                     },
@@ -2080,6 +2144,10 @@ fn pumpExit(self: anytype, out: Output, persist: bool) Allocator.Error!void {
         }
     }
     defer if (leftovers.len != 0) a.free(leftovers);
+    // Drained, each resume value is held only here while the ones before it run.
+    const ka_left = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka_left);
+    for (leftovers) |entry| runtime.keepalivePush(entry.value);
     for (leftovers) |entry| {
         if (PersistedParked.take(entry.slot)) |pe| {
             _ = try driveResumed(self, pe.state, entry.value, pe.scope_delta, out);
@@ -2207,46 +2275,6 @@ pub fn coroutineHasDriver() bool {
     return coroTop() != null;
 }
 
-/// Undo `undispatchedFlatEnter`'s push by identity, never a blind top pop. No-op
-/// once the entry was captured into a parked scope delta.
-pub fn undispatchedFlatLeaveIdent(ident: usize) void {
-    if (ident == 0) return;
-    (ActiveScopeGuard{ .pushed = true, .ident = ident }).leave();
-}
-
-/// `res_ok` null with `aborted` true only exits the pump.
-pub fn rootPumpFlatFinish(self: anytype, out: Output, scope: *const Value, res_ok: ?Value, base: usize, aborted: bool) Allocator.Error!RuntimeEvalResult {
-    defer active_scope_stack.shrinkRetainingCapacity(@min(base, active_scope_stack.items.len));
-    if (aborted) {
-        try pumpExit(self, out, true);
-        return .{ .ok = Value.Unit };
-    }
-    var root_value: ?Value = res_ok;
-    var root_token: ?u64 = null;
-    if (try pumpLoop(self, scope, out, true, true, &root_token, &root_value)) |err_result| return err_result;
-    try pumpExit(self, out, true);
-    return .{ .ok = root_value orelse Value.Unit };
-}
-
-/// Reports the resumed value, or `CoroutineSuspended` when the root stays parked.
-pub fn rootPumpFlatPark(self: anytype, allocator: Allocator, out: Output, st: *SuspendState, scope: *const Value, base: usize) Allocator.Error!RuntimeEvalResult {
-    defer active_scope_stack.shrinkRetainingCapacity(@min(base, active_scope_stack.items.len));
-    var root_token: ?u64 = try park(allocator, st, base);
-    var root_value: ?Value = null;
-    if (try pumpLoop(self, scope, out, true, true, &root_token, &root_value)) |err_result| return err_result;
-    try pumpExit(self, out, true);
-    if (root_token != null) return .{ .ok = Value.CoroutineSuspended };
-    return .{ .ok = root_value orelse Value.Unit };
-}
-
-/// Hand the parked segment, with its scope delta above `scope_base`, to the
-/// enclosing pump. Ownership of `st` moves to the pump.
-pub fn undispatchedFlatPark(allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!Value {
-    if (pumpDiagEnabled()) std.debug.print("[tok] barrier-park frames={d}\n", .{st.frames.items.len});
-    _ = try park(allocator, st, scope_base);
-    return Value.CoroutineSuspended;
-}
-
 /// Run `block` as a fresh root with no enclosing driver. A genuine suspension
 /// parks the root, pumps to quiescence, persists it under its armed slot and
 /// returns `CoroutineSuspended`; the completion arrives later through the captured
@@ -2309,6 +2337,11 @@ pub fn coroutineStartRootOrSuspended(self: anytype, scope: ?*const Value, block:
     if (try pumpLoop(self, scope_v, out, true, true, &root_token, &root_value)) |err_result| {
         return err_result;
     }
+    // Popped with the pump, the root's value is held only here, and the exit
+    // can run the resumes left in the mailbox.
+    const ka_root = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka_root);
+    if (root_value) |v| runtime.keepalivePush(v);
     try pumpExit(self, out, true);
     // Still parked after quiescence: persisted awaiting an external resume.
     if (root_token != null) return .{ .ok = Value.CoroutineSuspended };
@@ -2676,6 +2709,12 @@ pub fn coroutineResumeExternal(self: anytype, slot: i64, value: Value, out: Outp
         if (lookupSlotOwner(slot)) |w| {
             var ww = w;
             defer ww.deinit();
+            // The owner can exit and drop its registration while this thread
+            // waits for its turns in a blocking bracket, leaving the wakeup
+            // held only here.
+            const ka_owner = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(ka_owner);
+            runtime.keepalivePushCell(&ww.cell.hdr);
             const turns0 = ww.cell.data.turns.load(.acquire);
             const posted = blk: {
                 const g = ww.borrowMut();
@@ -2748,6 +2787,10 @@ pub fn coroutineDrainToIdle(self: anytype, out: Output) Allocator.Error!?Runtime
         const top = coroTop() orelse break;
         const launched = try top.drainLaunched(a);
         defer a.free(launched);
+        // Out of the queue, each block is held only here until it has run.
+        const ka_launched = runtime.keepaliveMark();
+        defer runtime.keepaliveRestore(ka_launched);
+        runtime.keepalivePushSlice(launched);
         const scope = activeCoroScope() orelse Value.Unit;
         for (launched) |child| {
             const child_scope_base = activeScopeDepth();
@@ -2771,6 +2814,9 @@ pub fn coroutineDrainToIdle(self: anytype, out: Output) Allocator.Error!?Runtime
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
                 const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
+                const ka_resume = runtime.keepaliveMark();
+                defer runtime.keepaliveRestore(ka_resume);
+                runtime.keepalivePush(resume_with);
                 const scope_base = activeScopeDepth();
                 restoreScopeDelta(entry.scope_delta);
                 coroStackAllocator().free(entry.scope_delta);
@@ -2847,7 +2893,7 @@ test "pump-root scope base sits below the guard so a persisted root carries its 
     const cls_ref = try runtime.ObjRef(runtime.ClassDef).init(a, cls);
     const inst = try runtime.ObjRef(runtime.InstanceData).init(a, .{
         .class = cls_ref,
-        .fields = .empty,
+        .slots = &.{},
         .outer = null,
         .identity = 1,
         .native_state = null,
@@ -2958,6 +3004,38 @@ test "resume_slot_value queues the waiter and records its resume value" {
     try testing.expectEqual(@as(i32, 42), v.?.Int);
     // A second resume on the same slot finds no waiter.
     try testing.expect(!try ci.resumeSlot(3));
+}
+
+test "a pump's owned slots stay bounded across parks, resumes and synchronous completions" {
+    var ci = try CooperativeInterceptor.new(testing.allocator);
+    defer ci.deinit();
+    ci.mode = .Virtual;
+    var slot: i64 = 10_000;
+    var round: usize = 0;
+    while (round < 2_000) : (round += 1) {
+        // A suspension that parks and is resumed.
+        try ci.setPendingSlot(slot);
+        const tok = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = -1 }, &.{});
+        try testing.expect(try ci.resumeSlot(slot));
+        try testing.expectEqual(@as(?u64, tok), ci.nextReady());
+        slot += 1;
+        // One armed and then completed synchronously.
+        try ci.setPendingSlot(slot);
+        ci.clearPendingSlot();
+        try testing.expect(lookupSlotOwner(slot) == null);
+        slot += 1;
+    }
+    // One still armed is the only slot the pump owns.
+    try ci.setPendingSlot(slot);
+    {
+        const g = ci.wakeup.borrow();
+        defer g.deinit();
+        try testing.expectEqual(@as(usize, 1), g.get().owned_slot_set.items.len);
+    }
+    ci.clearPendingSlot();
+    const g = ci.wakeup.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 0), g.get().owned_slot_set.items.len);
 }
 
 test "launch queue drains FIFO" {
@@ -3119,4 +3197,30 @@ test "DriverWakeup survives concurrent cross-thread borrows" {
         defer w.deinit();
         w.get().releaseOwnedSlots();
     }
+}
+
+test "a resume stashed before its slot has an owner stays rooted" {
+    const gc = runtime.gc;
+    const prev_enabled = gc.gc_enabled;
+    gc.gc_enabled = true;
+    defer gc.gc_enabled = prev_enabled;
+    const prev_perm = gc.alloc_perm;
+    gc.alloc_perm = false;
+    defer gc.alloc_perm = prev_perm;
+    // A cell the collector finalizes stays readable: the arena outlives the test.
+    const S = struct {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    };
+    const a = S.arena.allocator();
+    const stashed = try runtime.strInit(a, "resumed with this");
+    const slot: i64 = 0x5eed_0001;
+    try testing.expect(try SlotOwners.stashPendingIfUnowned(slot, .{ .String = stashed }));
+    defer {
+        SlotOwners.mutex.lock();
+        if (SlotOwners.pending) |*p| _ = p.remove(slot);
+        SlotOwners.mutex.unlock();
+    }
+    gc.collect();
+    // A mark tenures what it reaches; a swept cell's header is gone.
+    try testing.expectEqual(@as(u8, 1), stashed.cell.hdr.gc_gen);
 }

@@ -56,12 +56,11 @@ pub fn transpileDump(gpa: Allocator, paths: []const []const u8, feature_specs: [
     const w = &aw.writer;
     const from = @min(programStart(p.built.br), m.funcs.items.len);
     for (m.funcs.items[from..]) |*f| {
-        const fs = ir.bc.funcStreams(f, false, m.consts.items) orelse continue;
+        const fs = ir.bc.funcStreams(f, m.consts.items) orelse continue;
         w.print("fn {s} (fid {d}, {d} blocks)\n", .{ f.name, f.id.int(), f.blocks.len }) catch return 2;
-        for (fs.streams, 0..) |sopt, bi| {
-            const st = sopt orelse continue;
+        for (0..fs.blocks.len) |bi| {
             w.print(" block b{d}:\n", .{bi}) catch return 2;
-            ir.bc.dumpStream(w, st) catch return 2;
+            ir.bc.dumpBlock(w, fs, bi) catch return 2;
         }
     }
     io.writeStdout(aw.written());

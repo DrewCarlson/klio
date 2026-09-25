@@ -199,8 +199,8 @@ sizes, about +9k and -112k in all.
 | `lower/sema` | The new lowering in `src/ir/lower` (`records`, `env`, `call`, `dispatch`, `name`, `operator`, `refs`, `types`, `classes`, `lambda`, `inline`) and `core/bridge` (every `ClassId`, `FuncId`, static, field and method slot allocated serially from symbols). The resolved `Inst` variants of design section 4 land beside the old ones with eval arms. Inline functions lower once and are instantiated from IR at each call site, lambda literals in place, so `return`, `break` and suspend calls in inline lambdas are the caller's. Local classes and object expressions lower at build time. Not wired in; an executing unit test per construct and per acceptance fact, driven over the miniature base. Work packages and file ownership: `docs/design/LOWER-SEMA-PACKAGES.md`. | +13k | done |
 | `cut/switch` | Sema runs at bake and at run and lowering reads only its records. Deleted: the old lowering's derivers, ladders, pickers and link passes (design section 5), the typeck bridge (`computeEagerCalls`, `pending_eager_*`, `ExternDecls`, `KLIO_EAGER_*`), the pre-sema syntax passes, the compose AST pass, the by-name `Inst` variants with their eval and cgen arms, the AST splice, `site_census`, the resolution ratchet and the by-name audit sweeps. The comptime guard refusing names, `TypeRef`s and memo words in `Inst` lands; `FORMAT_VERSION` bumps. | +1k / -76k | done; nothing emits a by-name `Inst` variant, their deletion is `cut/runtime`'s |
 | `cut/compose` | Compose as lowering: hidden `$composer`/`$changed` parameters and arguments, restart, replace and movable groups, `$dirty` and the skip gate, stability from class symbols. Group keys keep their function of the source range. | +3k | done |
-| `cut/objects` | Instances hold a fixed slot array sized from the class layout, and the instance header carries the `ClassId`; a value tag maps to a `ClassId` for host values; dense per-class vtables and interface tables whose entries are `FuncId` or `NativeId`; host-backed classes get tables like any other class; native code calls back into Kotlin through well-known slots (`toString`, `equals`, `hashCode`, `iterator`, `hasNext`, `next`, `compareTo`, `compare`). Deleted: the `{name, value}` field lists, the FQN to `ClassId` lookup copied into six places, `method_dispatch`'s hash map, `irMethodWalk`, the `"type.name"` intrinsic probe ahead of the vtable, the `IntrinsicHost` by-name callbacks. | +3k / -2k | doing |
-| `cut/runtime` | Every runtime path that resolves by name. Deleted: the member ladder (`callMemberInnerStatic`), the getter ladder (`getFieldInner`), `setFieldInner`, `execCallMemberOrGlobal`, `execArmLoadFromThisOrGlobal`, the extension fallback walk and extension-property resolution, `qualifiedThis`, the enclosing-this chain and its closure and coroutine snapshots, `callNamedOverload`, `pickMethodOverload`, `resolveInstanceMethod`, `overload_match`, constructor scoring and `newInstanceNamed`, by-name `lookupGlobal`/`storeGlobal`, by-name `instanceOf`, per-call named-argument binding, the run-time memo fields in `Inst` and the code that serves them, the argument-signature folds, the name-keyed registry maps and `ProgramImage` caches the VM reads, run-time `lowerMethod`. About 3.4k lines of native bodies move to `NativeId` keys rather than dying. | +1k / -32k | doing |
+| `cut/objects` | Instances hold a fixed slot array sized from the class layout, and the instance header carries the `ClassId`; a value tag maps to a `ClassId` for host values; dense per-class vtables and interface tables whose entries are `FuncId` or `NativeId`; host-backed classes get tables like any other class; native code calls back into Kotlin through well-known slots (`toString`, `equals`, `hashCode`, `iterator`, `hasNext`, `next`, `compareTo`, `compare`). Deleted: the `{name, value}` field lists, the FQN to `ClassId` lookup copied into six places, `method_dispatch`'s hash map, `irMethodWalk`, the `"type.name"` intrinsic probe ahead of the vtable, the `IntrinsicHost` by-name callbacks. | +3k / -2k | done |
+| `cut/runtime` | Every runtime path that resolves by name. Deleted: the member ladder (`callMemberInnerStatic`), the getter ladder (`getFieldInner`), `setFieldInner`, `execCallMemberOrGlobal`, `execArmLoadFromThisOrGlobal`, the extension fallback walk and extension-property resolution, `qualifiedThis`, the enclosing-this chain and its closure and coroutine snapshots, `callNamedOverload`, `pickMethodOverload`, `resolveInstanceMethod`, `overload_match`, constructor scoring and `newInstanceNamed`, by-name `lookupGlobal`/`storeGlobal`, by-name `instanceOf`, per-call named-argument binding, the run-time memo fields in `Inst` and the code that serves them, the argument-signature folds, the name-keyed registry maps and `ProgramImage` caches the VM reads, run-time `lowerMethod`. About 3.4k lines of native bodies move to `NativeId` keys rather than dying. | +1k / -32k | done |
 | `cut/backends` | cgen and the JIT read the resolved variants; a shape they do not handle declines to the interpreter. | +1k / -1.5k | cgen done (native C gate 41/41, `native_coroutines` refused); no sema body reached the JIT, which leaves the build for `archive/jit/` as reference; the leaf tier goes with `engine/one` |
 
 **Exit:** everything builds with the name guard in place, and every
@@ -240,26 +240,46 @@ receiver or global path.
 
 ### Speed
 
-After `cut/runtime`, and part of done. The acceptance is measured gain:
+After `cut/runtime`, and part of done. The acceptance is measured gain,
 before and after numbers for the trivial instruction, the cheapest
 activation, fib, bench_oo, bench_fn, `benchRecompose` and the compose
-runtime's three throughput-bound tests, with `resumeOnBackgroundThread`
-under the fleet's 10 s runTest cap and `derivedStateOfLeak` and
-`validatePotentialDeadlock` passing under a cap sized to what the two items
-reach (projected 45-50 s and 80-90 s). The interpreter is about 85% of a
-compose frame, so these two items bound the gain near 3x; the 10 s cap for
-the other two would take compiled code (the compose runtime through the C
-backend, with native coroutines), which is after done.
+runtime's three throughput-bound tests, and the compose runtime suite
+passing on the timing its tests set: `runTest`'s own 60 s default budget,
+with klio's 90 s per-test wall cap as the net under it for a real hang.
+Lowering emits one op for `a = a + i`. The native C backend is a separate
+way to build and run a program, not a route to interpreter speed. Further
+interpreter speed (blocks laid out to fall through, superinstructions for
+the commonest op pairs, a calling convention whose caller writes arguments
+where the callee's parameters live) follows done.
 
 | Id | Item | Size | Status |
 |----|------|-----:|--------|
-| `engine/one` | One interpreter loop over one representation. The leaf, fused, bytecode and framed tiers merge; the per-`Func` verdict bytes and their classification go. | -5k | todo |
-| `stack/value-stack` | One contiguous per-thread value stack; frames are windows into it; arguments stay where the caller computed them; the collector scans the stack; `Frame` becomes a header. No allocation on the call path. | todo | todo |
+| `lower/copies` | Sema's lowering reads a local in its register and writes an expression's result into the assigned local, so a statement costs one op, not four. | small | done |
+| `stack/value-stack` | One contiguous per-thread value stack; frames are windows into it; arguments stay where the caller computed them; the collector scans the stack; `Frame` becomes a header. No allocation on the call path. | todo | done |
+| `engine/one` | One interpreter loop over one representation. The fused and framed/bytecode tiers merge; calls, returns, field slots and allocation stay in the stream instead of escaping to the instruction executor; the per-`Func` verdict bytes and their classification go. | -5k | done |
+| `runtime/gc-threads` | The collector's marking and pauses, contended monitors' spin and yield, reference counting on cell borrows and allocation cost, measured on `validatePotentialDeadlock` and the fleet: no lock or wait that is not needed, no CPU spent spinning where a thread can park. Every object stays shareable across threads with the JVM memory model's visibility and ordering; nothing assumes an object is confined to one thread unless the runtime proves it. In order: a large array remembers the index range its stores dirty, so a minor retraces that range and not the whole array; sweep leaves the pause; stop and blocking-safe waiters park through the OS instead of yield loops; then mostly-concurrent major marking (a short stop to scan roots, marking on the collector thread with the existing object-granular barrier recording every mutable borrow while it runs, cells allocated during marking born marked, a short remark) with concurrent sweep. Minor collections stay stop-the-world. Done when validatePotentialDeadlock spends under 1% of its run stopped (about 4.1 s, 8.2%, before concurrent marking), no major pause exceeds 10 ms, and minor pauses keep their sub-millisecond median, measured with `KLIO_GC_DEBUG` on the plain (non-verify) run and on the fleet. | +2-3k | doing |
 
 ### After done
 
 The long tail: the box failures left under the ratchet and any suite item
-outside the floors, then `retire/typeck`. Pack completeness waits here too:
+outside the floors, then `retire/typeck`. After those, a JIT over the
+resolved IR, starting from `archive/jit/`, and the material3 APIs.
+
+Ktor support runs alongside, at the user's request, in its own plan
+(`plans/ktor-support.md`): the client and server core, HTTPS/TLS on both
+sides, pack features for WebSockets and the main plugins, and each module's
+upstream commonTest suite. Compose parity runs alongside the same way, in
+`plans/compose-parity.md`: every missing runtime, ui, foundation,
+animation and material3 API, the owned-layer adoption, and those modules'
+upstream commonTest suites.
+
+The front end's memory and time for large projects, after
+`runtime/gc-threads` and measured on a large build (the compose packs)
+first: an array-based AST (nodes in flat arrays addressed by 32-bit
+indices rather than pointers to separately allocated structs), each file's
+AST freed once it is lowered, and per-file results cached by content hash
+so an unchanged file skips parse, sema and lowering.
+ Pack completeness waits here too:
 the compose and material3 platform natives still unbound, and the host's
 owned layers over upstream's `GraphicsLayerOwnerLayer` (layer alpha, color
 filter, blend, render effect, shadows, and hit testing through layer
@@ -281,6 +301,16 @@ declaration of the base or a pack, where kotlinc reports it invisible
 (honouring `@file:Suppress("INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")`).
 `examples/channel_undelivered_element.kt` imports kotlinx.coroutines'
 internal `UndeliveredElementException` and becomes valid Kotlin with it.
+
+Four slow tests with no timeout of their own keep a raised klio wall cap
+for now: datetime's `LocalDateTest.fromEpochDays` (900 s) and
+`toEpochDays` (600 s), and json's `JsonUnicodeTest.testRandomEscapeSequences`
+and `JsonHugeDataSerializationTest.test` (900 s each). Whether they fit the
+90 s net is measured later.
+
+A lambda whose declared parameter type contradicts the call's expected
+function type is reported as "none of the candidates accept" at the call,
+where kotlinc reports a parameter type mismatch at the lambda's parameter.
 
 | Id | Item | Size | Status |
 |----|------|-----:|--------|
@@ -460,8 +490,8 @@ construction, and each gets a test.
    is pack completeness, tracked after done.
 4. `scripts/gate.sh` is green, run with nothing else touching `.zig-cache`.
 5. Every suite count in `plans/pack-suites-to-green.md` is at or above its
-   floor, and the compose runtime suite is at 100%, its throughput-bound
-   tests included under the caps the Speed section sets.
+   floor, and the compose runtime suite is at 100% under its tests' own
+   `runTest` timeout, with klio's 90 s wall cap as the net.
 6. The log carries measured before and after numbers for the trivial
    instruction, the cheapest activation, `benchRecompose` with its
    activations and instructions per frame (the executed dispatch census
@@ -957,3 +987,173 @@ measurement.
   at about 85% of a compose frame (dispatch loop 57-73%, activation 12%);
   the Speed items target a counted compose instruction at 70 to about
   25 ns and an activation at 66 to about 20 ns.
+- 2026-09-25: the old pipeline against the resolved one, same programs, JIT
+  off in both (`KLIO_OPT=safe`: the old `klio run` defaulted to the `fast`
+  profile, which turned the loop and function JITs on, and the 2.10 ns
+  first-campaign row was JIT code). Trivial instruction 10.75 to 14.5 ns,
+  cheapest activation 81 to 63 ns, fib 0.73 to 0.79 s, bench_oo 1.44 to
+  1.14 s, bench_fn 2.64 to 2.71 s. The old pipeline cannot run
+  `tests/bench/recompose.kt` (a by-name `applyChanges` on `Unit`). The
+  simple-statement gap is lowering: sema lowers `a = a + i` as four ops
+  (two reads copied into temps, the op, a copy back) where the old
+  lowering wrote one; each op is faster than the old walker's.
+- 2026-09-25: frames are windows on a per-thread value stack; a call's
+  arguments stay in the caller's registers, and natives read them in place.
+  The register and carrier pools are gone. Against 9d6cad7e: fib 0.80 to
+  0.75 s, bench_oo 1.10 to 0.95 s, bench_fn 2.73 to 2.48 s, benchRecompose
+  1 039 to 919 us a frame, a framed activation 140 to 105 ns. A compose
+  frame runs 56 947 bytecode ops: 28% moves, 10 189 escapes out of the
+  stream (field slots and calls), 7 824 traces; the fused walker runs no
+  compose code. engine/one takes the escapes into the stream, the traces
+  into a span table, and deletes the fused walker.
+- 2026-09-25: the throughput tests on the value stack, against 9d6cad7e
+  (runTest cap lifted, min of two): resumeOnBackgroundThread 10.0 to
+  8.9 s, under the fleet's cap; derivedStateOfLeak 112.8 to 103.2 s;
+  validatePotentialDeadlock 145.2 to 138.3 s, the runtime's share
+  (collection, monitors, allocation) moving least.
+- 2026-09-25: `cut/runtime` and `cut/objects` are done. An instance holds a
+  fixed slot array its class lays out, read without a lock and written
+  under a per-instance seqlock (a threaded litmus shows 2 902 torn reads
+  without it, 0 with it); the layout prediction and the class's by-name
+  walks are gone (-1 447 lines). A pump's owned-slot set drops a slot once
+  unregistered, which took `ivCoroutineArmSlot` from 5% of
+  derivedStateOfLeak to 0. bench_oo 0.89 s, benchRecompose about 849 us a
+  frame. Fleet 1 136/2: resumeOnBackgroundThread passes in 8.9 s;
+  derivedStateOfLeak 61.5 s and validatePotentialDeadlock 79.5 s in the
+  fleet's own runs.
+- 2026-09-25: stop-the-world pauses, from `KLIO_GC_DEBUG`'s phase times:
+  validatePotentialDeadlock 893 pauses, 17.25 s, 13.5% of its wall time,
+  majors up to 219 ms; the fleet 6.5%; derivedStateOfLeak 1.4%;
+  benchRecompose 0.6%. A minor's cost is retracing remembered tenured
+  arrays whole (compose's slot tables); sweep is half the pause time. The
+  rendezvous itself is 2 ms, but the waiters yield-loop on other cores.
+  Concurrent major marking joins `runtime/gc-threads` and the done line.
+- 2026-09-25: a statement lowers to one op: `a = a + i` is `BinOp a = a + i`
+  (plus its Trace), a local is read in its register unless the statement
+  writes it first, and an assigned value, an argument and an inline copy's
+  result are computed where they land. Trivial instruction 14.96 to 7.19 ns
+  (4.84 ns on the bytecode tier alone, so the fused walker is the slower
+  tier here too), fib 0.79 to 0.75 s, benchRecompose 988 to 942 us a
+  frame, a compose frame's bytecode ops 56 947 to 46 325 (moves 15 793 to
+  7 181).
+- 2026-09-25: engine/one's first stack: one loop; static calls, returns,
+  constructors, lambda invokes, field slots and virtual and interface calls
+  on instances run in the stream; Trace runs nothing and a frame records its
+  position where it stops; call sites cache their callee's stream; the fused
+  walker is deleted. Against e0a10bf6 (lowering copies in): fib 0.72 to
+  0.38 s, bench_oo 0.89 to 0.50 s, bench_fn 2.41 to 2.23 s, trivial
+  instruction 7.16 to 4.09 ns, cheapest activation 65.9 to 33.4 ns,
+  benchRecompose 784 to 510 us a frame. Throughput tests (cap lifted):
+  resumeOnBackgroundThread 7.68 to 4.62 s, derivedStateOfLeak 81.0 to
+  54.5 s, validatePotentialDeadlock 117.1 to 73.4 s. Left of engine/one:
+  the activation (33 ns against 20-25), the remaining escapes (CallNative,
+  array access, static and object loads, closures), and a stream for every
+  block.
+- 2026-09-25: one representation: every block has a stream and the
+  instruction walker is gone; host calls, array elements and built objects
+  run in the stream, and a frame boxes its paused finally flow only when a
+  finally is entered with one. Timings flat against the stack before, as a
+  structural change should be; throughput tests resumeOnBackgroundThread
+  4.47 s, derivedStateOfLeak 55.4 s, validatePotentialDeadlock 71.9 s. An
+  activation is 577 instructions and 106 cycles, a simple op 60
+  instructions and 12.7 cycles; the op's result round-trips a stack
+  temporary and switches on the operator kind, which typed integer ops
+  take next.
+- 2026-09-25: the collector: a collection with no other mutator still
+  raises the stop, and a new thread's block stays rooted until the thread
+  pins it (two premature frees, each with a litmus). A large tenured array
+  remembers the index range its stores touch, and the sweep runs on a
+  sweeper thread after the world restarts (`KLIO_GC_SWEEP=pause` restores
+  the old sweep). Share of run time paused: validatePotentialDeadlock
+  14.9% to 3.3%, derivedStateOfLeak 2.0% to 0.2%, the fleet 6.2% to
+  1.15%; minor pause medians 0.2-0.3 ms; longest pause 261 to 105 ms.
+  Microbenchmarks unchanged. Next: OS wait/wake for stop waiters, once an
+  older crash under GC stress in tl_yield_cross_thread_teardown is root
+  caused; then concurrent major marking.
+- 2026-09-25: typed Int and Long ops, one code array per function with
+  edges as pcs, branches on their own paths, statics and init-guarded
+  calls in the stream, terminator ops for every block, host calls from the
+  op, constants in the code table, one-byte write marks: fib 0.37 to
+  0.24 s, bench_fn 2.19 to 2.05 s, trivial instruction 4.11 to 1.90 ns,
+  cheapest activation 33.7 to 24.2 ns, benchRecompose 497 to 348 us a
+  frame. A resume stashed before its slot has an owner is rooted, and
+  tl_cancel_root_not_independent orders its steps with latches. The three
+  throughput tests on 34cdf2d0 (ReleaseFast harness, cap lifted, three
+  workers, minimum of two, 0.3 s of it the harness's own startup):
+  resumeOnBackgroundThread 3.1 s, derivedStateOfLeak 37.1 s,
+  validatePotentialDeadlock 41.1 s, against 13.4 s, 130.2 s and 169.5 s
+  at the before row.
+- 2026-09-25: engine/one is done: is/as on classified values, a try
+  region's normal flow, capture cells, static stores, closures and arrays
+  run in the stream, and the no-fill verdict lives in the function's code
+  table (images no longer carry a function's memo; FORMAT_VERSION 96).
+  Throughput tests on bc5e7738 (cap lifted, minimum of two):
+  resumeOnBackgroundThread 3.22 s, derivedStateOfLeak 34.8 s,
+  validatePotentialDeadlock 41.0 s. A compose frame is 81% loop, 9.5% host
+  natives, 6% collector. The full gate is red in the litmus phase on four
+  failures older than the Speed work (callable_class_literal_is_a_kclass,
+  reified_from_lambda_annotation, thread_declared_handle, the ktor lock
+  stress), which done item 4 needs green.
+- 2026-09-25: the gate's litmus phase is green (868/868). The ktor lock's
+  actual had empty Kotlin bodies that by-name host dispatch used to shadow;
+  they are `actual external` now and bind to the monitor natives (eight
+  threads at 2400 of 2400). A lambda's class literal names its Kotlin
+  function type (`kotlin.Function0`), a fixture that kotlinc rejects was
+  made valid, and a thread-name fixture follows `Thread-N`.
+- 2026-09-25: the compose runtime's tests keep `runTest`'s own 60 s
+  timeout. The 10 s the fleet and single-test scripts imposed, and the
+  itest's 900 s with per-test wall-cap overrides, were klio's choices;
+  only the 90 s wall cap stays, as the net. The fleet passes 1138 of 1138:
+  resumeOnBackgroundThread 4.3 s, derivedStateOfLeak 38.1 s,
+  validatePotentialDeadlock 42.4 s. Further interpreter speed follows done.
+- 2026-09-25: the collector's rendezvous read the blocking-bracket count
+  before the stop's own count, so a thread leaving a bracket mid-stop
+  could be counted twice and the collector marked with a mutator still
+  running: the cells freed live, torn slot reads and freed coroutine state
+  behind every stress crash. The stop's count is read first now, and the
+  stop's generation, raised bit and count share one word. A pump's
+  in-flight values (a root's result, a drained mailbox, launches, a resume
+  value, pending errors, the owner's wakeup) are rooted. The fleet passes
+  1138/0; tl_yield_cross_thread_teardown under GC stress 0 crashes in 40.
+- 2026-09-25: the concurrent-marking audits. Every tracer reads safely
+  while mutators run, every reference store into a cell records its
+  barrier where it stores, no cell lock is held across a safe point and a
+  trace takes its cell's shared lock (with a debug check), compose_ui's
+  resident callbacks and values a host op holds only in native memory are
+  rooted. Stress litmus 66/66 under GC stress and verify with no reports;
+  microbenchmarks unchanged. Stop waiters and the collector sleep through
+  the OS after a short spin (f195f94d). Left of `runtime/gc-threads`: the
+  spanning major in slices with its verifier, then the marking thread.
+- 2026-09-25: the gate runs green in any checkout: it fetches or links the
+  Skia libraries itself and skips the nine Skia examples by name only when
+  they can be neither found nor fetched. The after row is one command,
+  `python3 scripts/measure-row.py`. Its dry run on 463cd580, against the
+  before row: fib 0.87 to 0.25 s, bench_oo 1.26 to 0.48 s, bench_fn 2.92
+  to 2.09 s, trivial instruction 15.24 to 1.89 ns, cheapest activation
+  69.49 to 24.29 ns, benchRecompose 1 174 to 353 us a frame,
+  resumeOnBackgroundThread 13.4 to 2.85 s, derivedStateOfLeak 130.2 to
+  38.98 s, validatePotentialDeadlock 169.5 to 41.60 s, all three within
+  runTest's 60 s. Stopped time: validatePotentialDeadlock 7.39% with 58
+  majors over 10 ms, the fleet 3.06%; minor medians 0.27-0.40 ms. The
+  per-frame instruction count is now machine instructions and cycles, since
+  KLIO_FRAME_COUNT's insts counts only ops that leave the stream. Left of
+  done: the marking thread (the 1% and 10 ms lines), then the final row.
+- 2026-09-25: concurrent major marking, behind `KLIO_GC_MAJOR=concurrent`
+  (and a sliced variant, `slices`): a marking thread that is not a mutator
+  traces the tenured heap in 256-cell batches while the mutators run; each
+  minor during a major harvests the remembered cells the major has marked
+  and shades its promoted survivors; the remark re-shades roots, retraces
+  harvested cells and marks the nursery. The invariant is in
+  docs/design/GC.md and KLIO_GC_VERIFY checks it. validatePotentialDeadlock
+  concurrent against stop-the-world: stopped 0.75% against 8.1%, longest
+  pause 1.7 ms against 110-125 ms, test time 44.5 s against 47-50 s. The
+  fleet 0.62% stopped, one remark at 14.2 ms, bounded by the closure table
+  pass the release-on-sweep change removes. Default next.
+- 2026-09-25: concurrent major marking is the default (`KLIO_GC_MAJOR=stop`
+  keeps the whole-major stop), and a raised stop takes the major from the
+  marking thread at its next cell, so a descheduled marker cannot hold a
+  minor for its time slice. On the default, on a loaded machine:
+  validatePotentialDeadlock 0.88-0.97% stopped, longest pause 2.3 ms;
+  derivedStateOfLeak 0.44%; the fleet 0.65%, longest 16.4 ms, the remarks
+  over 10 ms all the closure-table pass. The done-line pause table is taken
+  once the closure release-on-sweep lands.

@@ -61,9 +61,13 @@ pub fn materialiseSequenceBounded(a: Allocator, host: IntrinsicHost, out: Output
         return .{ .err = .{ .Type = "materialise_sequence: not a Sequence" } };
     }
     if (try oneShotConsumeCheck(a, seq_val)) |e| return .{ .err = e };
-    const seq_g = seq_val.Sequence.borrow();
-    defer seq_g.deinit();
-    const seq = seq_g.get().*;
+    // A sequence's source and ops are fixed when it is made: copied out of its
+    // borrow, since the ops run lambdas and no cell lock is held across them.
+    const seq = blk: {
+        const seq_g = seq_val.Sequence.borrow();
+        defer seq_g.deinit();
+        break :blk seq_g.get().*;
+    };
 
     var all_streaming = true;
     for (seq.ops) |op| {
@@ -215,7 +219,7 @@ pub fn mergedPullOne(
     if (iter_left.*) |v| runtime.keepalivePush(v);
     if (iter_right.*) |v| runtime.keepalivePush(v);
     if (iter_left.* == null) {
-        const li = (try host.callWellKnown(&mz.left.asPtr().*, .sequence_iterator, &.{}, out)) orelse
+        const li = (try host.callWellKnown(&mz.left.asPtrConst().*, .sequence_iterator, &.{}, out)) orelse
             return .{ .err = .{ .Type = "zip: receiver lacks iterator()" } };
         switch (li) {
             .ok => |v| {
@@ -224,7 +228,7 @@ pub fn mergedPullOne(
             },
             .err => |e| return .{ .err = e },
         }
-        const ri = (try host.callWellKnown(&mz.right.asPtr().*, .sequence_iterator, &.{}, out)) orelse
+        const ri = (try host.callWellKnown(&mz.right.asPtrConst().*, .sequence_iterator, &.{}, out)) orelse
             return .{ .err = .{ .Type = "zip: argument lacks iterator()" } };
         switch (ri) {
             .ok => |v| {
@@ -263,7 +267,7 @@ pub fn mergedPullOne(
     };
     runtime.keepalivePush(bv);
     if (mz.transform) |t| {
-        return switch (try seqCall(host, t.asPtr(), &.{ av, bv }, out)) {
+        return switch (try seqCall(host, t.asPtrConst(), &.{ av, bv }, out)) {
             .value => |v| .{ .value = v },
             .err => |e| .{ .err = e },
         };
@@ -291,10 +295,14 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
     defer runtime.keepaliveRestore(ka_src);
     switch (seq.source) {
         .Items => |v| {
-            const g = v.borrow();
-            defer g.deinit();
-            runtime.keepalivePushSlice(g.get().*);
-            for (g.get().*) |item| {
+            // The items are fixed with the sequence; read out of the borrow.
+            const items = blk: {
+                const g = v.borrow();
+                defer g.deinit();
+                break :blk g.get().*;
+            };
+            runtime.keepalivePushSlice(items);
+            for (items) |item| {
                 if (takeCapReached(seq.ops, st.taken)) break;
                 const res = try pumpItem(a, host, out, item, seq.ops, &st, &output);
                 switch (res) {
@@ -337,7 +345,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
         },
         .Generate => |gen| {
             var cur: ?Value = if (gen.seed) |s| blk: {
-                const sv = s.asPtr().*;
+                const sv = s.asPtrConst().*;
                 if (gen.seed_is_fn) {
                     const r = switch (try seqCall(host, &sv, &.{}, out)) {
                         .value => |v| v,
@@ -357,7 +365,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                     if (gen.seed != null) break;
                     const output_keepalive = runtime.keepaliveMark();
                     runtime.keepalivePushSlice(output.items);
-                    const called = seqCall(host, gen.next.asPtr(), &.{}, out);
+                    const called = seqCall(host, gen.next.asPtrConst(), &.{}, out);
                     runtime.keepaliveRestore(output_keepalive);
                     const r = switch (try called) {
                         .value => |v| v,
@@ -380,7 +388,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 }
                 const output_keepalive = runtime.keepaliveMark();
                 runtime.keepalivePushSlice(output.items);
-                const called = seqCall(host, gen.next.asPtr(), if (gen.seed == null) &.{} else &.{candidate}, out);
+                const called = seqCall(host, gen.next.asPtrConst(), if (gen.seed == null) &.{} else &.{candidate}, out);
                 runtime.keepaliveRestore(output_keepalive);
                 const nxt = switch (try called) {
                     .value => |v| v,
@@ -391,7 +399,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             }
         },
         .IteratorFn => |fnbox| {
-            const iter = switch (try seqCall(host, fnbox.asPtr(), &.{}, out)) {
+            const iter = switch (try seqCall(host, fnbox.asPtrConst(), &.{}, out)) {
                 .value => |v| v,
                 .err => |e| return .{ .err = e },
             };
@@ -482,7 +490,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
         .Generate => |gen| {
             const limit: usize = 1024;
             var cur: ?Value = if (gen.seed) |s| blk: {
-                const sv = s.asPtr().*;
+                const sv = s.asPtrConst().*;
                 if (gen.seed_is_fn) {
                     const r = switch (try seqCall(host, &sv, &.{}, out)) {
                         .value => |v| v,
@@ -499,7 +507,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                     if (gen.seed != null) break;
                     const items_keepalive = runtime.keepaliveMark();
                     runtime.keepalivePushSlice(items.items);
-                    const called = seqCall(host, gen.next.asPtr(), &.{}, out);
+                    const called = seqCall(host, gen.next.asPtrConst(), &.{}, out);
                     runtime.keepaliveRestore(items_keepalive);
                     const r = switch (try called) {
                         .value => |v| v,
@@ -511,7 +519,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 try items.append(a, candidate);
                 const items_keepalive = runtime.keepaliveMark();
                 runtime.keepalivePushSlice(items.items);
-                const called = seqCall(host, gen.next.asPtr(), if (gen.seed == null) &.{} else &.{candidate}, out);
+                const called = seqCall(host, gen.next.asPtrConst(), if (gen.seed == null) &.{} else &.{candidate}, out);
                 runtime.keepaliveRestore(items_keepalive);
                 const nxt = switch (try called) {
                     .value => |v| v,
@@ -522,7 +530,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             }
         },
         .IteratorFn => |fnbox| {
-            const iter = switch (try seqCall(host, fnbox.asPtr(), &.{}, out)) {
+            const iter = switch (try seqCall(host, fnbox.asPtrConst(), &.{}, out)) {
                 .value => |v| v,
                 .err => |e| return .{ .err = e },
             };
@@ -569,7 +577,12 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
         },
     }
     var cur_items = try items.toOwnedSlice(a);
+    // Each op's input is held only here while its lambdas run.
+    const ops_keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ops_keepalive);
     for (seq.ops) |op| {
+        runtime.keepaliveRestore(ops_keepalive);
+        runtime.keepalivePushSlice(cur_items);
         cur_items = switch (try applySeqOp(a, host, out, op, cur_items)) {
             .items => |xs| xs,
             .err => |e| return .{ .err = e },
@@ -842,7 +855,7 @@ pub fn freshBuilderState(host: IntrinsicHost, a: Allocator, template: runtime.Bu
     const block: Value = blk: {
         const tg = template.borrow();
         defer tg.deinit();
-        break :blk tg.get().block.asPtr().*;
+        break :blk tg.get().block.asPtrConst().*;
     };
     const id = host.allocInstanceId();
     const fields = [_]InstanceData.Field{

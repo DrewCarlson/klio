@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // Gradient brushes — Brush.linearGradient / radialGradient build real Skia
 // gradient shaders (the brush serializes its colour stops + geometry, the shim
 // reconstructs an SkShader). Painted through the real DrawScope brush path

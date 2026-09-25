@@ -12,12 +12,12 @@ const RuntimeError = runtime.RuntimeError;
 const StringRef = runtime.StringRef;
 
 
-const Recv = struct { ok: bool, payload: *Value };
+const Recv = struct { ok: bool, payload: *const Value };
 
 fn recvResult(args: []const Value) ?Recv {
     if (args.len > 0) {
         switch (args[0]) {
-            .Result => |r| return .{ .ok = r.ok, .payload = r.payload.asPtr() },
+            .Result => |r| return .{ .ok = r.ok, .payload = r.payload.asPtrConst() },
             else => {},
         }
     }
@@ -472,13 +472,13 @@ test "result_success and result_failure box the payload" {
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .Result);
     try testing.expect(r.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 7), r.ok.Result.payload.asPtr().Int);
+    try testing.expectEqual(@as(i32, 7), r.ok.Result.payload.asPtrConst().Int);
 
     var ctx2 = ctxWith(&ok_args, noop.host(), cap.output(), a);
     const r2 = try result_failure(&ctx2);
     try testing.expect(r2.ok == .Result);
     try testing.expect(!r2.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.asPtr().Int);
+    try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.asPtrConst().Int);
 }
 
 test "result_success defaults to Unit when no arg" {
@@ -492,7 +492,7 @@ test "result_success defaults to Unit when no arg" {
     var ctx = ctxWith(&.{}, noop.host(), cap.output(), arena.allocator());
     const r = try result_success(&ctx);
     try testing.expect(r.ok.Result.ok);
-    try testing.expect(r.ok.Result.payload.asPtr().* == .Unit);
+    try testing.expect(r.ok.Result.payload.asPtrConst().* == .Unit);
 }
 
 test "isSuccess / isFailure read the ok flag" {
@@ -646,13 +646,13 @@ test "runCatching wraps a returned value and a thrown one" {
     var c1 = ctxWith(&args, stub.host(), cap.output(), a);
     const r1 = try result_run_catching(&c1);
     try testing.expect(r1.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 11), r1.ok.Result.payload.asPtr().Int);
+    try testing.expectEqual(@as(i32, 11), r1.ok.Result.payload.asPtrConst().Int);
 
     stub.reply = .{ .err = .{ .Thrown = .{ .Int = 13 } } };
     var c2 = ctxWith(&args, stub.host(), cap.output(), a);
     const r2 = try result_run_catching(&c2);
     try testing.expect(!r2.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 13), r2.ok.Result.payload.asPtr().Int);
+    try testing.expectEqual(@as(i32, 13), r2.ok.Result.payload.asPtrConst().Int);
 
     stub.reply = .{ .err = .{ .Type = "boom" } };
     var c3 = ctxWith(&args, stub.host(), cap.output(), a);
@@ -695,21 +695,21 @@ test "result_map maps success, passes failure through, mapCatching catches throw
     var c1 = ctxWith(&success, stub.host(), cap.output(), a);
     const r1 = try result_map(&c1);
     try testing.expect(r1.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 100), r1.ok.Result.payload.asPtr().Int);
+    try testing.expectEqual(@as(i32, 100), r1.ok.Result.payload.asPtrConst().Int);
     try testing.expectEqual(@as(i32, 2), stub.last_arg.?.Int);
 
     stub.invoked = 0;
     var c2 = ctxWith(&failure, stub.host(), cap.output(), a);
     const r2 = try result_map(&c2);
     try testing.expect(!r2.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.asPtr().Int);
+    try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.asPtrConst().Int);
     try testing.expectEqual(@as(usize, 0), stub.invoked);
 
     stub.reply = .{ .err = .{ .Thrown = .{ .Int = 55 } } };
     var c3 = ctxWith(&success, stub.host(), cap.output(), a);
     const r3 = try result_map_catching(&c3);
     try testing.expect(!r3.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 55), r3.ok.Result.payload.asPtr().Int);
+    try testing.expectEqual(@as(i32, 55), r3.ok.Result.payload.asPtrConst().Int);
 }
 
 test "result_fold dispatches to onSuccess or onFailure" {

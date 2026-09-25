@@ -30,6 +30,7 @@ const lambda_mod = @import("lambda.zig");
 const inline_mod = @import("inline.zig");
 const tailrec = @import("tailrec.zig");
 const compose = @import("compose.zig");
+const locals = @import("locals.zig");
 
 const Allocator = std.mem.Allocator;
 const Builder = builder.Builder;
@@ -65,6 +66,10 @@ pub const Operands = struct {
     /// The call as written, when there is one: a composable call reads
     /// its receiver and invoked value from it.
     call: ?*const ast.Expr = null,
+    /// Where lowering stood before the caller lowered operands the call
+    /// alone consumes (a written call's receiver), which its argument run
+    /// may then compute in place (`locals.runFrom`).
+    from: ?locals.Mark = null,
 
     pub fn count(ops: Operands) usize {
         return @max(ops.exprs.len, ops.regs.len);
@@ -274,6 +279,8 @@ pub fn lowerCall(b: *Builder, e: *const ast.Expr) Error!Reg {
     const written: []const ast.Expr = if (c.is_infix and c.args.len != 0) c.args[1..] else c.args;
     var ops = try operandsOf(b, written);
     ops.sp = c.span;
+    // The receiver is this call's alone.
+    ops.from = locals.mark(b);
     var recv: ?Reg = null;
     var safe = false;
     if (c.is_infix and c.args.len != 0) {
@@ -419,6 +426,8 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
     }
     const in_place = if (how == .inline_) try inPlaceLambdas(b, rec, ops, params) else &.{};
     const groups = if (how == .inline_) try inlineGroups(b, rec, ops, in_place, params) else compose.InlineGroups{};
+    // The values lowered from here on are the run's own.
+    const from = ops.from orelse locals.mark(b);
     const vals = try evalOperands(b, ops, in_place, try unmemoizedOperands(b, rec, ops, params));
 
     var run: Run = .{};
@@ -468,11 +477,11 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
     // its keys, so the block's state follows them.
     if (compose.isKeyCall(s, rec.callee)) {
         try compose.startMovableGroup(b, ops.sp, try keyValues(b, rec, vals));
-        const result = try finish(b, rec, how, &run);
+        const result = try finish(b, rec, how, &run, from);
         try compose.endMovableGroup(b);
         return result;
     }
-    const result = try finish(b, rec, how, &run);
+    const result = try finish(b, rec, how, &run, from);
     try groups.end(b);
     return result;
 }
@@ -524,7 +533,7 @@ const Run = struct {
     }
 };
 
-fn finish(b: *Builder, rec: *const CallRec, how: How, run: *const Run) Error!Reg {
+fn finish(b: *Builder, rec: *const CallRec, how: How, run: *const Run, from: locals.Mark) Error!Reg {
     switch (how) {
         .inline_ => |f| {
             if (try enumIntrinsic(b, rec, f, run)) |r| return r;
@@ -533,7 +542,7 @@ fn finish(b: *Builder, rec: *const CallRec, how: How, run: *const Run) Error!Reg
         },
         else => {},
     }
-    const first = try b.run(run.regs.items);
+    const first = try locals.runFrom(b, from, run.regs.items);
     const dst = b.newReg();
     try dispatch.emitHow(b, how, dst, first, @intCast(run.regs.items.len));
     return dst;
@@ -1023,13 +1032,14 @@ pub fn ctorArgs(b: *Builder, rec: *const CallRec, ops_in: Operands, head: []cons
     const masks = try defaultMasks(a, rec.args, try hasDefaults(a, s, params));
     if (masks.len != 0) func = b.p.br.defaultsOf(rec.callee) orelse
         return b.fail(ops.sp, "constructor `{s}` has no defaults bridge", .{calleeName(s, rec.callee)});
+    const from = locals.mark(b);
     const vals = try evalOperands(b, ops, &.{}, &.{});
     var run: Run = .{};
     for (head) |r| try run.push(a, r);
     for (rec.contexts) |cx| try run.push(a, try receiverFor(b, cx, null, ops.sp));
     try pushValues(b, &run, rec, ops, vals, params);
     for (masks) |w| try run.push(a, try b.emitConst(.{ .Int = @bitCast(w) }));
-    return .{ .func = func, .run = try b.run(run.regs.items), .n = @intCast(run.regs.items.len) };
+    return .{ .func = func, .run = try locals.runFrom(b, from, run.regs.items), .n = @intCast(run.regs.items.len) };
 }
 
 // -------------------------------------------------------- defaults bridge --
@@ -1102,6 +1112,7 @@ pub fn lowerDefaultsBridge(b: *Builder, target: Sym) Error!void {
         try env.bindLocal(b, p, home);
         if (i < expect_params.len) try env.bindLocal(b, expect_params[i], home);
     }
+    const from = locals.mark(b);
     var run: Run = .{};
     var i: u16 = 0;
     while (i < lay.valueStart()) : (i += 1) {
@@ -1124,7 +1135,7 @@ pub fn lowerDefaultsBridge(b: *Builder, target: Sym) Error!void {
         .{ .static = dispatch.funcIdOf(b.p.br, target) orelse return b.fail(sp, "constructor `{s}` has no identity", .{calleeName(s, target)}) }
     else
         dispatch.choose(b.p, &rec) catch |err| return noHow(b, &rec, sp, err);
-    const result = try finish(b, &rec, how, &run);
+    const result = try finish(b, &rec, how, &run, from);
     if (!b.terminated()) b.terminate(.{ .Return = result });
 }
 

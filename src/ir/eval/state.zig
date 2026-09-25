@@ -18,7 +18,6 @@ const ev_activation = @import("activation.zig");
 const ev_diag = @import("diag.zig");
 const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
-const ev_fused = @import("fused.zig");
 const ev_snapshot = @import("snapshot.zig");
 
 const ACT_POOL_MAX = ev_activation.ACT_POOL_MAX;
@@ -30,7 +29,6 @@ const FrameSnapshot = ev_snapshot.FrameSnapshot;
 const SuspendState = ev_snapshot.SuspendState;
 const TailSeg = ev_snapshot.TailSeg;
 const cmgTraceWant = ev_flow.cmgTraceWant;
-const fusedTls = ev_fused.fusedTls;
 const gcMarkSnapshot = ev_snapshot.gcMarkSnapshot;
 
 pub fn strVal(allocator: Allocator, s: []const u8) Allocator.Error!Value {
@@ -123,6 +121,11 @@ pub const EvalTls = struct {
     eval_depth: usize = 0,
     /// Resolved depth cap; `0` = not yet read from the env.
     eval_depth_cap: usize = 0,
+    /// Net external bytes of carriers and register buffers taken and returned
+    /// on this thread, handed to the collector `EXT_BATCH` at a time.
+    ext_delta: isize = 0,
+    /// Whether this thread's frame chain is registered as a collector root.
+    frame_root_installed: bool = false,
     /// The suspension a COMPILED body builds as it unwinds: compiled code cannot
     /// return an error union, so it answers `CoroutineSuspended` and leaves it here.
     in_flight_suspend: ?*SuspendState = null,
@@ -131,15 +134,12 @@ pub const EvalTls = struct {
     /// Innermost in-flight resume node chain (GC root seed).
     resuming: ?*ResumeFrames = null,
 
-    regs_pool: std.ArrayList([]Value) = .empty,
-    args_pool: std.ArrayList([]Value) = .empty,
-    /// Size-classed arg/capture carriers, one bucket per `ARGS_CLASS_CAPS` entry.
-    args_class_pool: [ARGS_CLASS_CAPS.len]ArgsBucket = @splat(.{}),
-    /// Lexical-origin override for file-private visibility (see `RefSiteOverride`).
-    ref_site_override: ?RefSiteOverride = null,
-    /// A direct call the host prepared for the flat driver to pick up.
-    host_flat_armed: bool = false,
-    host_flat_req: ?FlatCallReq = null,
+    /// The argument areas and register windows of this thread's frames.
+    vstack: ValueStack = .{},
+    /// The error an instruction raised with `Step.raised`, read by the dispatch loop.
+    step_err: ?EvalError = null,
+    /// The call an instruction left with `Step.flat_call`, read by the dispatch loop.
+    flat_call: ?FlatCallReq = null,
     act_pool_len: usize = 0,
     act_pool: [ACT_POOL_MAX]*Activation = undefined,
     /// `KLIO_SPIN_TRACE` bookkeeping.
@@ -170,25 +170,14 @@ fn evalDepthCapInit(ev: *EvalTls) usize {
     return cap;
 }
 
-/// A callable reference resolves file-private visibility at its WRITE site, not
-/// the caller's. Scoped to the frame innermost at push, so deeper bodies opt out.
-pub const RefSiteOverride = struct { file: ir.FileId, frame: *const Frame };
-
-/// The innermost EXECUTING function: the fused walker's body while no frame
-/// sits above the chain head it recorded, else the innermost frame's.
+/// The innermost executing function: the innermost frame's.
 pub fn currentFrameFunc() ?*const ir.Func {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain)
-        return fusedTls().marks[fusedTls().depth - 1].func;
     return if (evtlsPtr().frame_chain) |fr| fr.func else null;
 }
 
-pub const FusedMark = struct { func: *const ir.Func, mod: *const Module, head: ?*Frame, recv: ?Value, span: ?ir.Span = null };
-
-/// Bound on the per-thread register-buffer free list.
-const REGS_POOL_MAX: usize = 128;
-
-/// Allocator for frame REGISTER BUFFERS. Under the tracing GC they live outside
-/// the GC heap (libc): values are traced via the frame chain, storage never swept.
+/// Allocator for the heap block of a frame off the value stack. Under the
+/// tracing GC it lives outside the GC heap (libc): the frame's values are traced
+/// through the frame, the storage never swept.
 pub inline fn regsAlloc(fallback: Allocator) Allocator {
     if (!runtime.reclaimEnabled() and runtime.gc.gc_enabled) return std.heap.c_allocator;
     return fallback;
@@ -201,179 +190,97 @@ pub fn fillCensusBump(fid: u32, n: u32) void {
     fill_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= n;
 }
 
-/// Take a register buffer of length `n`, `.Unit`-filled unless `no_fill`,
-/// reusing a pooled buffer that fits; pooled ones share the run's allocator.
-pub fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool, fid: u32) Allocator.Error!std.ArrayList(Value) {
-    if (parent.frame_count_on) parent.frame_alloc_total += 1;
-    const ra = regsAlloc(allocator);
-    if (ev.regs_pool.items.len > 0) {
-        const buf = ev.regs_pool.items[ev.regs_pool.items.len - 1];
-        if (buf.len >= n) {
-            ev.regs_pool.items.len -= 1;
-            const list: std.ArrayList(Value) = .{ .items = buf[0..n], .capacity = buf.len };
-            // No-fill keeps the buffer's stale slots; the written mask gates readers.
-            if (!no_fill) @memset(list.items, .Unit);
-            if (parent.frame_count_on) {
-                parent.regs_pool_hit += 1;
-                if (!no_fill) {
-                    parent.regs_fill_slots += n;
-                    fillCensusBump(fid, n);
-                }
-            }
-            // Re-enters the traced set (see releaseRegs).
-            if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(buf.len * @sizeOf(Value));
-            return list;
-        }
-    }
-    if (parent.frame_count_on) {
-        parent.regs_pool_miss += 1;
-        if (!no_fill) {
-            parent.regs_fill_slots += n;
-            fillCensusBump(fid, n);
-        }
-    }
-    var regs: std.ArrayList(Value) = .empty;
-    if (no_fill) {
-        try regs.ensureTotalCapacityPrecise(ra, n);
-        regs.items.len = n;
-    } else {
-        try regs.appendNTimes(ra, .Unit, n);
-    }
-    // Fresh buffer: traced through the frame chain but outside the sweep
-    // registry, so the collector's Appel trigger must count these bytes.
-    if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(regs.capacity * @sizeOf(Value));
-    return regs;
-}
+const EXT_BATCH: isize = 256 * 1024;
 
-/// Recycle a frame's register buffer into this thread's pool. The outermost
-/// teardown (`eval_depth == 0`) frees and drains instead: nothing outlives its run.
-pub fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) void {
-    const ra = regsAlloc(allocator);
-    // Size-classed arg carriers come from the RUN allocator, so draining at depth
-    // 0 bounds them to one evaluation. Must precede the pooled-register return.
-    if (ev.eval_depth == 0 and argsClassPooled(ev)) drainArgsClassPool(ev, allocator);
-    const gc_pool = !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
-    const pool_ok = (gc_pool or (runtime.reclaimEnabled() and ev.eval_depth > 0)) and
-        regs.capacity > 0 and ev.regs_pool.items.len < REGS_POOL_MAX;
-    if (pool_ok) {
-        const buf = regs.allocatedSlice();
-        regs.* = .empty;
-        // Leaves the traced set; shrink the external-live estimate to match.
-        if (gc_pool and runtime.gc.external_accounting) runtime.gc.noteExternalFreed(buf.len * @sizeOf(Value));
-        // The list outlives the run whose allocator made its buffers, so it
-        // lives on the process allocator; the buffers drain at depth 0.
-        ev.regs_pool.append(std.heap.c_allocator, buf) catch {
-            ra.free(buf);
-        };
-        return;
-    }
-    regs.deinit(ra);
-    if (!gc_pool and ev.eval_depth == 0 and
-        (ev.regs_pool.items.len > 0 or ev.args_pool.items.len > 0 or argsClassPooled(ev))) drainRegsPool(ev, allocator);
-}
-
-/// Free every pooled register buffer when the outermost frame unwinds.
-fn drainRegsPool(ev: *EvalTls, allocator: Allocator) void {
-    const ra = regsAlloc(allocator);
-    for (ev.regs_pool.items) |buf| ra.free(buf);
-    ev.regs_pool.clearRetainingCapacity();
-    for (ev.args_pool.items) |buf| allocator.free(buf);
-    ev.args_pool.deinit(allocator);
-    ev.args_pool = .empty;
-    drainArgsClassPool(ev, allocator);
-}
-
-/// Free every pooled size-classed arg carrier.
-fn drainArgsClassPool(ev: *EvalTls, allocator: Allocator) void {
-    for (&ev.args_class_pool) |*bucket| {
-        for (bucket.bufs[0..bucket.len]) |buf| allocator.free(buf);
-        bucket.len = 0;
+/// Batches external bytes on the thread's evaluator state.
+pub inline fn noteExt(ev: *EvalTls, delta: isize) void {
+    ev.ext_delta += delta;
+    if (ev.ext_delta >= EXT_BATCH or ev.ext_delta <= -EXT_BATCH) {
+        runtime.gc.noteExternalNet(ev.ext_delta);
+        ev.ext_delta = 0;
     }
 }
 
-/// Whether any size-classed carrier is pooled; the run's allocator owns them.
-fn argsClassPooled(ev: *const EvalTls) bool {
-    for (ev.args_class_pool) |bucket| {
-        if (bucket.len != 0) return true;
-    }
-    return false;
-}
+/// Values in one segment of a thread's value stack.
+const VS_SEGMENT_VALUES: usize = 16 * 1024;
 
-/// One size class's buffers; a fixed array, since recycling must never allocate.
-const ArgsBucket = struct {
-    bufs: [ARGS_CLASS_MAX][]Value = undefined,
-    len: usize = 0,
+const VsSegment = struct {
+    prev: ?*VsSegment,
+    next: ?*VsSegment,
+    buf: []Value,
 };
 
-/// Exact capacities for arg/capture carriers: every acquire is an exact-size
-/// pop or a fresh allocation, so no fit check thrashes on mixed sizes.
-const ARGS_CLASS_CAPS = [_]usize{ 4, 8, 16, 32 };
+/// A position on a value stack: taken before a push, restored to pop everything
+/// pushed after it.
+pub const VsMark = struct {
+    seg: ?*VsSegment,
+    top: usize,
+};
 
-const ARGS_CLASS_MAX: usize = 32;
+/// A thread's value stack: every frame's argument area and register window,
+/// pushed at the call and popped at the return. Segments stay chained once
+/// allocated, so a call pays two stores. The collector reaches the values
+/// through the frames owning the windows, whose written masks say which slots
+/// hold values: a window's other slots keep what an earlier frame left.
+pub const ValueStack = struct {
+    seg: ?*VsSegment = null,
+    top: usize = 0,
+    first: ?*VsSegment = null,
 
-fn argsClassOf(cap: usize) ?usize {
-    for (ARGS_CLASS_CAPS, 0..) |c, i| {
-        if (cap <= c) return i;
+    pub inline fn mark(self: *const ValueStack) VsMark {
+        return .{ .seg = self.seg, .top = self.top };
     }
-    return null;
-}
 
-fn argsClassOfExact(len: usize) ?usize {
-    for (ARGS_CLASS_CAPS, 0..) |c, i| {
-        if (len == c) return i;
+    pub inline fn restore(self: *ValueStack, m: VsMark) void {
+        self.seg = m.seg;
+        self.top = m.top;
     }
-    return null;
-}
 
-pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.ArrayList(Value) {
-    const ev = evtlsPtr();
-    if (argsClassOf(cap)) |ci| {
-        const bucket = &ev.args_class_pool[ci];
-        if (bucket.len > 0) {
-            bucket.len -= 1;
-            const buf = bucket.bufs[bucket.len];
-            // Re-enters the traced set (see releaseArgs).
-            if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
-                runtime.gc.noteExternalBytes(buf.len * @sizeOf(Value));
-            return .{ .items = buf[0..0], .capacity = buf.len };
-        }
-        var list: std.ArrayList(Value) = .empty;
-        try list.ensureTotalCapacityPrecise(allocator, ARGS_CLASS_CAPS[ci]);
-        // A fresh carrier enters the traced set here, as a pooled one does above.
-        if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
-            runtime.gc.noteExternalBytes(list.capacity * @sizeOf(Value));
-        return list;
-    }
-    var list: std.ArrayList(Value) = .empty;
-    try list.ensureTotalCapacityPrecise(allocator, @max(cap, 4));
-    return list;
-}
-
-/// Recycle or free an arg/capture carrier; the values inside stay the caller's.
-pub fn releaseArgs(allocator: Allocator, list: *std.ArrayList(Value)) void {
-    releaseArgsIn(evtlsPtr(), allocator, list);
-}
-
-/// `releaseArgs` with the running thread's `evtlsPtr()` resolved once; it must be
-/// read fresh at the call, since a resumed coroutine can land on any thread.
-pub fn releaseArgsIn(ev: *EvalTls, allocator: Allocator, list: *std.ArrayList(Value)) void {
-    if (list.capacity != 0) {
-        if (argsClassOfExact(list.capacity)) |ci| {
-            const bucket = &ev.args_class_pool[ci];
-            if (bucket.len < ARGS_CLASS_MAX) {
-                const buf = list.allocatedSlice();
-                list.* = .empty;
-                // Leaves the traced set; shrink the external-live estimate to match.
-                if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
-                    runtime.gc.noteExternalFreed(buf.len * @sizeOf(Value));
-                bucket.bufs[bucket.len] = buf;
-                bucket.len += 1;
-                return;
+    /// `n` slots on top of the stack, holding whatever they last held.
+    pub inline fn push(self: *ValueStack, ev: *EvalTls, n: usize) Allocator.Error![]Value {
+        if (self.seg) |s| {
+            if (s.buf.len - self.top >= n) {
+                const w = s.buf[self.top..][0..n];
+                self.top += n;
+                return w;
             }
         }
+        return self.pushSegment(ev, n);
     }
-    list.deinit(allocator);
-}
+
+    /// A push that starts the next segment, allocating it the first time the
+    /// stack reaches it or when the one cached there is too small for `n`.
+    fn pushSegment(self: *ValueStack, ev: *EvalTls, n: usize) Allocator.Error![]Value {
+        const cached: ?*VsSegment = if (self.seg) |s| s.next else self.first;
+        const seg: *VsSegment = if (cached != null and cached.?.buf.len >= n) cached.? else blk: {
+            const a = std.heap.c_allocator;
+            const fresh = try a.create(VsSegment);
+            errdefer a.destroy(fresh);
+            const buf = try a.alloc(Value, @max(VS_SEGMENT_VALUES, n));
+            @memset(buf, .Unit);
+            fresh.* = .{ .prev = self.seg, .next = cached, .buf = buf };
+            if (cached) |c| c.prev = fresh;
+            if (self.seg) |p| p.next = fresh else self.first = fresh;
+            if (runtime.gc.gc_enabled and runtime.gc.external_accounting) noteExt(ev, @intCast(buf.len * @sizeOf(Value)));
+            break :blk fresh;
+        };
+        self.seg = seg;
+        self.top = n;
+        return seg.buf[0..n];
+    }
+
+    /// Free every segment of an empty stack, when its thread stops running Kotlin.
+    pub fn deinit(self: *ValueStack) void {
+        if (self.seg != null and self.top != 0) return;
+        var cur = self.first;
+        while (cur) |seg| {
+            cur = seg.next;
+            std.heap.c_allocator.free(seg.buf);
+            std.heap.c_allocator.destroy(seg);
+        }
+        self.* = .{};
+    }
+};
 
 /// Snapshots of an in-flight `resumeContinuation`: off the park registry and
 /// not yet on `frame_chain`, so the GC marks `frames.items[head..]` through here.
@@ -402,14 +309,22 @@ threadlocal var frame_troot: runtime.gc.ThreadRoot = undefined;
 
 threadlocal var frame_troot_inited: bool = false;
 
+/// Links `f` onto its thread's frame chain; `f.tls` is the running thread's state.
 pub inline fn gcPushFrame(f: *Frame) void {
     // The chain is maintained in every allocator mode (it backs stack-trace
     // capture too); only the root registration is gated on the collector.
-    if (runtime.gc.gc_enabled) gcInstallFrameRoot();
+    if (runtime.gc.gc_enabled and !f.tls.frame_root_installed) gcInstallFrameRoot();
+    if (parent.call_hooks_on) framePushTrace(f);
+    f.gc_link = f.tls.frame_chain;
+    f.tls.frame_chain = f;
+}
+
+/// KLIO_CMG_TRACE: a frame push of the named function, with its first parameters.
+fn framePushTrace(f: *const Frame) void {
     if (cmgTraceWant()) |w| {
         if (std.mem.eql(u8, w, f.func.name)) {
             std.debug.print("[frame-push] {s}#{d}", .{ f.func.name, f.func.id.int() });
-            for (f.params.items, 0..) |*v, i| {
+            for (f.params, 0..) |*v, i| {
                 if (i >= 4) break;
                 switch (v.*) {
                     .Int => |x| std.debug.print(" p{d}=i{d}", .{ i, x }),
@@ -421,27 +336,25 @@ pub inline fn gcPushFrame(f: *Frame) void {
             std.debug.print("\n", .{});
         }
     }
-    f.gc_link = evtlsPtr().frame_chain;
-    evtlsPtr().frame_chain = f;
 }
 
 pub inline fn gcPopFrame(f: *Frame) void {
-    evtlsPtr().frame_chain = f.gc_link;
+    f.tls.frame_chain = f.gc_link;
 }
 
 /// Mark a frame's register file, skipping slots the written mask says were
 /// never written: an unfilled slot holds whatever the pooled buffer last carried.
 pub fn gcMarkFrameRegs(f: *const Frame, m: *runtime.gc.Marker) void {
     runtime.gc.poison_ctx_name = f.func.name;
-    const mask = f.wmask;
+    const mask = &f.wmask;
     if (mask.isAll()) {
-        for (f.regs.items, 0..) |v, i| {
+        for (f.regs, 0..) |v, i| {
             runtime.gc.poison_ctx_idx = i;
             v.gcMark(m);
         }
         return;
     }
-    for (f.regs.items, 0..) |v, i| {
+    for (f.regs, 0..) |v, i| {
         runtime.gc.poison_ctx_idx = i;
         if (mask.has(i)) v.gcMark(m);
     }
@@ -449,10 +362,13 @@ pub fn gcMarkFrameRegs(f: *const Frame, m: *runtime.gc.Marker) void {
 
 var stw_audit_state: u8 = 0;
 
-pub fn stwAuditOn() bool {
-    if (stw_audit_state == 0)
-        stw_audit_state = if (runtime.envOnce("KLIO_GC_STW_AUDIT") != null) 2 else 1;
+pub inline fn stwAuditOn() bool {
+    if (stw_audit_state == 0) stwAuditInit();
     return stw_audit_state == 2;
+}
+
+fn stwAuditInit() void {
+    stw_audit_state = if (runtime.envOnce("KLIO_GC_STW_AUDIT") != null) 2 else 1;
 }
 
 /// Mark every Value reachable from the `ctx` thread's frames and resumes.
@@ -468,17 +384,17 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         if (audit) {
             const me = runtime.gc.currentTid();
             const bad = @intFromPtr(f) < 0x1000 or (@intFromPtr(f) >> 47) != 0 or
-                f.captures.items.len > 4096 or f.params.items.len > 4096 or
-                f.regs.items.len > 65536;
+                f.captures.len > 4096 or f.params.len > 4096 or
+                f.regs.len > 65536;
             if (bad) {
-                std.debug.print("[gc-frame] TORN anchor_tid={d} marker_tid={d} idx={d} f={x} caps={d} params={d} regs={d}\n", .{ anchor.tid, me, fi, @intFromPtr(f), f.captures.items.len, f.params.items.len, f.regs.items.len });
+                std.debug.print("[gc-frame] TORN anchor_tid={d} marker_tid={d} idx={d} f={x} caps={d} params={d} regs={d}\n", .{ anchor.tid, me, fi, @intFromPtr(f), f.captures.len, f.params.len, f.regs.len });
                 return;
             }
         }
         gcMarkFrameRegs(f, m);
-        for (f.params.items) |v| v.gcMark(m);
-        for (f.captures.items) |v| v.gcMark(m);
-        f.pending_finally.gcMark(m);
+        for (f.params) |v| v.gcMark(m);
+        for (f.captures) |v| v.gcMark(m);
+        if (f.pending) |p| p.gcMark(m);
         markFrameClosure(f.closure_id, m);
     }
     // Not-yet-rebuilt snapshots of every in-flight resume on this thread.
@@ -488,7 +404,7 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         while (seg) |t| : (seg = t.next) {
             if (m.minor and t.gc_quiesced) continue;
             for (t.frames.items[t.head..]) |snap| gcMarkSnapshot(snap, m);
-            t.gc_quiesced = true;
+            if (m.marksWhole()) t.gc_quiesced = true;
         }
         const head = node.head.*;
         const items = node.frames.items;
@@ -510,6 +426,7 @@ pub inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 
 /// Link this thread's frame-chain root node (idempotent per thread).
 pub fn gcInstallFrameRoot() void {
+    evtlsPtr().frame_root_installed = true;
     if (frame_troot_inited) return;
     frame_troot_inited = true;
     frame_anchor = .{ .chain = &evtlsPtr().frame_chain, .resuming = &evtlsPtr().resuming, .tid = runtime.gc.currentTid() };
@@ -517,20 +434,15 @@ pub fn gcInstallFrameRoot() void {
     runtime.gc.registerThreadRoot(&frame_troot);
 }
 
-/// Unlink this thread's frame-chain root and free its libc-backed register
-/// buffers; short-lived workers would otherwise leak one cache each.
+/// Unlink this thread's frame-chain root and free its value stack; short-lived
+/// workers would otherwise leak one each.
 pub fn gcUninstallFrameRoot() void {
+    evtlsPtr().frame_root_installed = false;
     if (frame_troot_inited) {
         runtime.gc.unregisterThreadRoot(&frame_troot);
         frame_troot_inited = false;
     }
-    if (runtime.gc.gc_enabled and evtlsPtr().regs_pool.items.len > 0) {
-        drainRegsPool(evtlsPtr(), std.heap.c_allocator);
-        evtlsPtr().regs_pool.deinit(std.heap.c_allocator);
-        // `deinit` leaves the list undefined, and the interpreter runs on the main
-        // thread, whose threadlocals outlive this seam and would read a garbage length.
-        evtlsPtr().regs_pool = .empty;
-    }
+    evtlsPtr().vstack.deinit();
 }
 
 /// The most frames a captured stack keeps, the innermost ones, as the JVM
@@ -541,41 +453,23 @@ pub const MAX_STACK_TRACE_DEPTH: usize = 1024;
 /// `MAX_STACK_TRACE_DEPTH` frames of it. Labels borrow program-lifetime
 /// module memory; only the frame slice is owned by the returned cell.
 pub fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
-    // The live stack is the frame chain with fused activations layered on: a
-    // fused body opens no Frame, and each mark records the chain head it sits on.
-    var frame_n: usize = 0;
+    var total: usize = 0;
     {
         var cur = evtlsPtr().frame_chain;
         while (cur) |f| : (cur = f.gc_link) {
-            frame_n += 1;
-            if (frame_n >= MAX_STACK_TRACE_DEPTH) break;
+            total += 1;
+            if (total >= MAX_STACK_TRACE_DEPTH) break;
         }
     }
-    const total = @min(fusedTls().depth + frame_n, MAX_STACK_TRACE_DEPTH);
     if (total == 0) return null;
     const frames = try allocator.alloc(runtime.StackFrame, total);
     errdefer allocator.free(frames);
     var i: usize = 0;
-    var fi: usize = fusedTls().depth;
     var fr = evtlsPtr().frame_chain;
-    while (i < total) {
-        while (fi > 0 and i < total and fusedTls().marks[fi - 1].head == fr) {
-            const mk = &fusedTls().marks[fi - 1];
-            frames[i] = stackFrame(mk.mod, mk.func, mk.span);
-            i += 1;
-            fi -= 1;
-        }
-        if (i == total) break;
-        const f = fr orelse break;
-        frames[i] = stackFrame(f.module, f.func, f.cur_span);
-        i += 1;
+    while (i < total) : (i += 1) {
+        const f = fr.?;
+        frames[i] = stackFrame(f.module, f.func, f.span());
         fr = f.gc_link;
-    }
-    // Every fused mark's head is a live frame or null, so `i == total` here
-    // unless the frames ran out first.
-    if (i != total) {
-        const shrunk = try allocator.realloc(frames, i);
-        return try runtime.StackRef.init(allocator, .{ .frames = shrunk });
     }
     return try runtime.StackRef.init(allocator, .{ .frames = frames });
 }

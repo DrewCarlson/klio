@@ -464,7 +464,7 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     };
     const user = ctx.args.len - 1;
     if (user == 1) {
-        const g = it.borrowMut();
+        const g = it.borrowMutAppend(1);
         defer g.deinit();
         if (runtime.reclaimEnabled()) ctx.args[1].retain();
         try g.get().append(a, ctx.args[1]);
@@ -631,8 +631,8 @@ pub fn coll_list_unzip(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
         if (v != .Pair) return typeErr("unzip requires List<Pair<A, B>>");
-        try firsts.append(a, v.Pair.first.asPtr().*);
-        try seconds.append(a, v.Pair.second.asPtr().*);
+        try firsts.append(a, v.Pair.first.asPtrConst().*);
+        try seconds.append(a, v.Pair.second.asPtrConst().*);
     }
     return ok(try makePair(a, try makeListBorrowed(a, firsts, false), try makeListBorrowed(a, seconds, false)));
 }
@@ -759,7 +759,8 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     }
     defer if (runtime.freeScratch()) a.free(to_add);
     const changed = to_add.len != 0;
-    const g = it.borrowMut();
+    // An insert moves what follows it; an append stores only past the end.
+    const g = if (indexed) it.borrowMut() else it.borrowMutAppend(to_add.len);
     defer g.deinit();
     if (runtime.reclaimEnabled()) for (to_add) |v| v.retain();
     if (indexed) {

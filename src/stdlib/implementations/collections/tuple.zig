@@ -28,7 +28,7 @@ pub fn pair_first(ctx: *CallCtx) Error!EvalResult {
         .pair => |v| v,
         .err => |e| return e,
     };
-    const out = p.Pair.first.asPtr().*;
+    const out = p.Pair.first.asPtrConst().*;
     out.retain();
     return ok(out);
 }
@@ -37,7 +37,7 @@ pub fn pair_second(ctx: *CallCtx) Error!EvalResult {
         .pair => |v| v,
         .err => |e| return e,
     };
-    const out = p.Pair.second.asPtr().*;
+    const out = p.Pair.second.asPtrConst().*;
     out.retain();
     return ok(out);
 }
@@ -65,12 +65,12 @@ pub fn pair_to_string(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     // Kotlin renders `($first, $second)`, each through its own `toString()`.
-    const first = switch (try displayElemH(ctx, p.Pair.first.asPtr().*)) {
+    const first = switch (try displayElemH(ctx, p.Pair.first.asPtrConst().*)) {
         .ok => |x| x,
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(first);
-    const second = switch (try displayElemH(ctx, p.Pair.second.asPtr().*)) {
+    const second = switch (try displayElemH(ctx, p.Pair.second.asPtrConst().*)) {
         .ok => |x| x,
         .err => |e| return e,
     };
@@ -86,7 +86,7 @@ pub fn pair_to_list(ctx: *CallCtx) Error!EvalResult {
         .pair => |v| v,
         .err => |e| return e,
     };
-    return ok(try makeList(a, &.{ p.Pair.first.asPtr().*, p.Pair.second.asPtr().* }, false));
+    return ok(try makeList(a, &.{ p.Pair.first.asPtrConst().*, p.Pair.second.asPtrConst().* }, false));
 }
 
 fn recvTriple(a: Allocator, args: []const Value, what: []const u8) Error!union(enum) { triple: Value, err: EvalResult } {
@@ -106,7 +106,7 @@ pub fn triple_first(ctx: *CallCtx) Error!EvalResult {
         .triple => |v| v,
         .err => |e| return e,
     };
-    const out = t.Triple.first.asPtr().*;
+    const out = t.Triple.first.asPtrConst().*;
     out.retain();
     return ok(out);
 }
@@ -115,7 +115,7 @@ pub fn triple_second(ctx: *CallCtx) Error!EvalResult {
         .triple => |v| v,
         .err => |e| return e,
     };
-    const out = t.Triple.second.asPtr().*;
+    const out = t.Triple.second.asPtrConst().*;
     out.retain();
     return ok(out);
 }
@@ -124,7 +124,7 @@ pub fn triple_third(ctx: *CallCtx) Error!EvalResult {
         .triple => |v| v,
         .err => |e| return e,
     };
-    const out = t.Triple.third.asPtr().*;
+    const out = t.Triple.third.asPtrConst().*;
     out.retain();
     return ok(out);
 }
@@ -145,5 +145,5 @@ pub fn triple_to_list(ctx: *CallCtx) Error!EvalResult {
         .triple => |v| v,
         .err => |e| return e,
     };
-    return ok(try makeList(a, &.{ t.Triple.first.asPtr().*, t.Triple.second.asPtr().*, t.Triple.third.asPtr().* }, false));
+    return ok(try makeList(a, &.{ t.Triple.first.asPtrConst().*, t.Triple.second.asPtrConst().*, t.Triple.third.asPtrConst().* }, false));
 }

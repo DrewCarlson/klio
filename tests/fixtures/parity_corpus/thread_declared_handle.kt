@@ -10,7 +10,7 @@ fun main() {
     t.join()
     println(seen.joinToString())
     println(t.isAlive)
-    println(t.name.startsWith("klio-thread-"))
+    println(t.name.startsWith("Thread-"))
 
     val many = (1..4).map { n -> thread { seen.add("w$n") } }
     many.forEach { it.join() }

@@ -160,12 +160,18 @@ var active_closures: ?SharedClosures = null;
 
 fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
     const sc = active_closures orelse return;
-    // Mark the slot live for this epoch, then shade its capture store and
-    // chain. Stop-the-world, so no push can realloc the spine underneath.
-    if (sc.getPtr(id)) |info| {
-        info.mark_epoch = m.epoch;
-        m.shade(&info.captures.cell.hdr);
-    }
+    // Mark the slot live for this epoch, then shade its capture store. The
+    // spine's shared borrow is held throughout: a mark may run beside a `push`
+    // that reallocates the spine, which takes the exclusive borrow.
+    const g = sc.obj.borrow();
+    defer g.deinit();
+    const list = g.get();
+    if (id >= list.items.len) return;
+    const info = &list.items[id];
+    // Only a mark writes the epoch, and only `reclaimDead` reads it, with the
+    // world stopped.
+    @atomicStore(usize, @constCast(&info.mark_epoch), m.epoch, .monotonic);
+    m.shade(&info.captures.cell.hdr);
 }
 
 /// Free the owned metadata of every closure slot unreferenced in the finished
@@ -272,18 +278,6 @@ pub const SharedClosures = struct {
         return list.items[id];
     }
 
-    /// In-place slot pointer, for the stop-the-world GC mark and sweep only:
-    /// `push` cannot run during a collection, so the pointer stays stable.
-    pub fn getPtr(self: SharedClosures, id: usize) ?*ClosureInfo {
-        // A shared borrow: the mark phase must not run the mutable borrow's
-        // write barrier, which locks the remembered set the collector holds.
-        const g = self.obj.borrow();
-        defer g.deinit();
-        const list = g.get();
-        if (id >= list.items.len) return null;
-        return @constCast(&list.items[id]);
-    }
-
     /// Free the owned metadata of every slot not marked in `epoch` and free its
     /// id. The capture-store cell is swept separately. Stop-the-world only.
     pub fn reclaimDead(self: SharedClosures, epoch: usize) void {
@@ -328,6 +322,14 @@ pub const ThreadEntry = struct {
     name: []const u8 = "",
     result: ?ThreadResult = null,
     finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// An error result can carry values only this entry holds.
+    pub fn gcTrace(self: *const ThreadEntry, m: *runtime.gc.Marker) void {
+        if (self.result) |r| switch (r) {
+            .err => |e| e.gcMark(m),
+            .ok => {},
+        };
+    }
 };
 
 pub const ThreadResult = union(enum) {
@@ -336,10 +338,6 @@ pub const ThreadResult = union(enum) {
 };
 
 pub const ThreadTable = ObjRef(std.AutoHashMap(u64, ThreadEntry));
-
-/// `ClassId.int()` → published singleton, authoritative for id-committed reads;
-/// name reads go through `globals`. Published to the id table first.
-pub const class_layout = @import("class_layout.zig");
 
 /// Vm-level errors, carried as data.
 pub const VmError = union(enum) {
@@ -537,7 +535,6 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
-    testing.refAllDecls(class_layout);
     _ = codec;
     _ = vmhost;
     _ = run_mod;
@@ -582,6 +579,59 @@ test "shared closures push is append-stable" {
     try testing.expectEqual(@as(u64, 1), id1);
     try testing.expect(sc.get(0) != null);
     try testing.expect(sc.get(2) == null);
+}
+
+test "a mark of a closure's slot runs beside pushes that reallocate the spine" {
+    const a = std.heap.smp_allocator;
+    const sc = try SharedClosures.new(a);
+    defer sc.deinit();
+    active_closures = sc;
+    defer active_closures = null;
+    const caps = try ObjRef(std.ArrayList(Value)).init(a, .empty);
+    defer caps.deinit();
+    _ = try sc.push(.{ .body_func = .from(0), .n_params = 0, .capture_names = &.{}, .captures = caps });
+
+    const Pusher = struct {
+        fn run(s: SharedClosures, c: ObjRef(std.ArrayList(Value)), stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.monotonic)) {
+                _ = s.push(.{ .body_func = .from(1), .n_params = 0, .capture_names = &.{}, .captures = c }) catch return;
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Pusher.run, .{ sc, caps, &stop });
+    // Each mark writes slot 0's epoch and shades its capture store while the
+    // spine grows under it; a mark that let go of the spine first would write
+    // into a buffer the push has freed.
+    var epoch: usize = 1;
+    while (epoch < 20_000) : (epoch += 1) {
+        var m: runtime.gc.Marker = .{ .epoch = epoch, .arena = a };
+        defer m.grey.deinit(a);
+        markClosureThunk(0, &m);
+        try testing.expectEqual(@as(usize, 1), m.grey.items.len);
+        try testing.expectEqual(&caps.cell.hdr, m.grey.items[0]);
+    }
+    stop.store(true, .monotonic);
+    t.join();
+    try testing.expectEqual(@as(usize, epoch - 1), sc.get(0).?.mark_epoch);
+}
+
+test "a thread's error result keeps the values it carries reachable" {
+    const a = testing.allocator;
+    const table = try ThreadTable.init(a, std.AutoHashMap(u64, ThreadEntry).init(a));
+    defer table.deinit();
+    const thrown = try runtime.strInit(a, "boom");
+    defer thrown.deinit();
+    {
+        const g = table.borrowMut();
+        defer g.deinit();
+        try g.get().put(1, .{ .handle = null, .result = .{ .err = .{ .Thrown = .{ .String = thrown } } } });
+        try g.get().put(2, .{ .handle = null, .result = .{ .ok = {} } });
+    }
+    var m: runtime.gc.Marker = .{ .epoch = 91, .arena = a };
+    defer m.grey.deinit(a);
+    table.cell.hdr.gc_trace(&table.cell.hdr, &m);
+    try testing.expectEqual(@as(usize, 91), thrown.cell.hdr.gc_mark);
 }
 
 test "closure singleton identity excludes lexical receiver chains" {

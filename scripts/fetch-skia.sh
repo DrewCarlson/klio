@@ -13,6 +13,8 @@
 #
 # Each target extracts to its own dir so several can coexist (cross-compilation):
 #   third_party/skia/<os>-<arch>/{include,modules,out/Release-<os>-<arch>}
+# In a linked git worktree the directory is a link to the main checkout's copy
+# when that one is complete, so a worktree needs no download of its own.
 #
 # C++ ABI per OS (the shim must be built with a matching compiler — build.zig
 # handles this): linux = GNU libstdc++ (.a), macos = LLVM libc++ (.a),
@@ -66,6 +68,20 @@ SENTINEL="${DEST}/src/base/SkUTF.h"
 
 if [ -f "${MAIN}" ] && [ -f "${SENTINEL}" ]; then
     echo "skia already present for ${OS}-${ARCH} at ${DEST}; nothing to do"
+    exit 0
+fi
+
+# A linked git worktree uses the main checkout's copy when that one is
+# complete, instead of downloading its own.
+MAIN_CHECKOUT="$(git -C "$(dirname "$0")/.." worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p' || true)"
+SHARED="${MAIN_CHECKOUT}/third_party/skia/${DIR_OS}-${ARCH}"
+if [ -n "${MAIN_CHECKOUT}" ] && [ "${SHARED}" != "${DEST}" ] \
+    && [ -f "${SHARED}/out/Release-${ASSET_OS}-${ARCH}/libskia.${EXT}" ] \
+    && [ -f "${SHARED}/src/base/SkUTF.h" ]; then
+    mkdir -p "${ROOT}"
+    rm -rf "${DEST}"
+    ln -s "${SHARED}" "${DEST}"
+    echo "skia for ${OS}-${ARCH} linked from the main checkout at ${SHARED}"
     exit 0
 fi
 

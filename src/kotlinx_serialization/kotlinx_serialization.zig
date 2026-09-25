@@ -58,7 +58,7 @@ fn isInterfaceClass(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(.{ .Bool = false });
     const cls_ref = classOf(&ctx.args[0]) orelse return ok(.{ .Bool = false });
     defer cls_ref.deinit();
-    return ok(.{ .Bool = cls_ref.asPtr().is_interface });
+    return ok(.{ .Bool = cls_ref.asPtrConst().is_interface });
 }
 
 test "hostBindings registers the two lookup intrinsics" {

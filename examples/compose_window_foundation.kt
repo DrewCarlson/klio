@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // The same desktop entrypoint as compose_window.kt with NO material3 in the
 // program at all: `application { Window(...) }` over foundation only —
 // Column/Box, `Modifier.background`/`padding`/`clickable`, and BasicText —

@@ -15,11 +15,10 @@ const Env = env_mod.Env;
 const Value = value_mod.Value;
 
 pub const ClassDef = struct {
-    /// Immutable after two-phase linking backpatches `parent`, `interfaces` and
-    /// `enum_entries` at single-threaded startup. The one later write, an enum
-    /// installing its constructed entries, runs under the enum's initialization
-    /// claim, and nothing else takes an exclusive borrow, so the reader lock is
-    /// elided.
+    /// Written only while it is made, before any other thread or the collector
+    /// can reach it, so the reader lock is elided and a concurrent mark reads
+    /// it freely. The cells it holds (`companion`, `object_singleton`, ...) are
+    /// cells of their own, each behind its own lock.
     pub const objref_immutable = true;
 
     name: []const u8,
@@ -71,16 +70,9 @@ pub const ClassDef = struct {
     /// bridge assigns; `maxInt(u32)` for a class that code never makes.
     ir_class: u32 = std.math.maxInt(u32),
 
-    /// Memo for the field layout construction reserves: 0 = uncomputed,
-    /// 1 = a writer is computing it, 2 = `layout_slots` holds it,
-    /// 3 = the class has none and `layout_no` says why. The layout is a
-    /// function of the declaration chain, so one walk per class serves every
-    /// construction.
-    layout_state: u8 = 0,
-    layout_no: u8 = 0,
-    layout_base_count: u32 = 0,
-    /// Program-lifetime, base classes first. Seeds are scalars or null, so
-    /// they hold no cell the collector must trace.
+    /// The slots an instance holds, base classes first; program-lifetime.
+    /// Seeds are scalars or null, so they hold no cell the collector must
+    /// trace.
     layout_slots: []const LayoutSlot = &.{},
 
     pub const EnumEntry = struct {
@@ -146,45 +138,6 @@ pub const ClassDef = struct {
         m.shade(&self.object_singleton.cell.hdr);
     }
 
-    /// Walks self, then parent. The handles are clones the caller owns.
-    pub fn findMethod(self: ObjRef(ClassDef), allocator: std.mem.Allocator, name: []const u8) ?MethodHit {
-        var seen: std.ArrayList(*const ClassDef) = .empty;
-        defer seen.deinit(allocator);
-        return findMethodWalk(allocator, self, name, &seen);
-    }
-
-    pub fn findMethodForArg(
-        self: ObjRef(ClassDef),
-        allocator: std.mem.Allocator,
-        name: []const u8,
-        arg_type_name: ?[]const u8,
-    ) ?MethodHit {
-        if (arg_type_name) |arg| {
-            var seen: std.ArrayList(*const ClassDef) = .empty;
-            defer seen.deinit(allocator);
-            if (findMethodForArgWalk(allocator, self, name, arg, &seen)) |found| {
-                return found;
-            }
-        }
-        return findMethod(self, allocator, name);
-    }
-
-    pub fn findBodyProperty(self: ObjRef(ClassDef), allocator: std.mem.Allocator, name: []const u8) ?PropertyHit {
-        var seen: std.ArrayList(*const ClassDef) = .empty;
-        defer seen.deinit(allocator);
-        return findBodyPropertyWalk(allocator, self, name, &seen);
-    }
-
-    /// The caller owns the slice.
-    pub fn allCompanions(self: ObjRef(ClassDef), allocator: std.mem.Allocator) ![]ObjRef(InstanceData) {
-        var out: std.ArrayList(ObjRef(InstanceData)) = .empty;
-        errdefer out.deinit(allocator);
-        var seen: std.ArrayList(*const ClassDef) = .empty;
-        defer seen.deinit(allocator);
-        try collectCompanionsWalk(allocator, self, &out, &seen);
-        return out.toOwnedSlice(allocator);
-    }
-
     /// Matches the class or any named supertype.
     pub fn isSubtypeOf(self: *const ClassDef, allocator: std.mem.Allocator, name: []const u8) bool {
         if (std.mem.eql(u8, self.name, name) or std.mem.eql(u8, self.fqn, name)) {
@@ -221,32 +174,12 @@ pub const ClassDef = struct {
     }
 };
 
-pub const MethodHit = struct { method: MethodDef, class: ObjRef(ClassDef) };
-pub const PropertyHit = struct { property: PropertyDef, class: ObjRef(ClassDef) };
-
-/// One slot of a class's predicted field layout: the key construction stores
-/// under, and the value the slot holds until an initializer replaces it — the
-/// JVM zero of a declared primitive, null otherwise.
+/// One slot of a class's layout: its name, and the value it holds until an
+/// initializer replaces it — the JVM zero of a declared primitive, null
+/// otherwise.
 pub const LayoutSlot = struct {
     name: []const u8,
     seed: Value = .Null,
-    /// A plain stored property: no accessor, no delegate. A read of one is the
-    /// slot's value, where a read of a property with a getter must run the
-    /// getter even though the backing slot exists.
-    plain: bool = false,
-    /// A primary-constructor property. Its slot is written before any user
-    /// code runs, so a read of it can never land before its value does — where
-    /// a body property's read can, and the discovery ladder answers that one
-    /// by running the initializer while the slot still holds its seed.
-    ctor: bool = false,
-    /// A plain stored WRITE: no custom setter, so storing the value is the
-    /// whole operation. Separate from `plain`, which is about reads — a
-    /// property can read straight from its slot while its setter runs code.
-    plain_write: bool = false,
-    /// Declared type head of the property this slot holds, empty where the
-    /// declaration left the type to inference. Only the head, so `Int?` and
-    /// `Int` both read as `Int`; a consumer that cares about null re-proves.
-    type_head: []const u8 = "",
 };
 
 pub const SupertypeDelegate = struct {
@@ -390,80 +323,6 @@ pub const PropertyDef = struct {
 /// `name` is at index i" without reading a name. Ids are addresses in a
 /// program-lifetime arena bounded by `shape_cap`, past which layouts degrade to
 /// the unshaped sentinel.
-pub const SHAPE_UNSET: usize = 0;
-pub const SHAPE_NONE: usize = 1;
-
-const ShapeRec = struct {
-    /// Hashed on both, compared on the pointers: an identical pointer vector is
-    /// an identical layout.
-    ptrs: [][*]const u8,
-    lens: []u32,
-};
-
-/// Held only for the intern-table probe on a shape miss.
-const ShapeLock = struct {
-    state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    fn lock(self: *ShapeLock) void {
-        while (self.state.swap(true, .acquire)) std.atomic.spinLoopHint();
-    }
-    fn unlock(self: *ShapeLock) void {
-        self.state.store(false, .release);
-    }
-};
-var shape_lock: ShapeLock = .{};
-var shape_table: std.HashMapUnmanaged(u64, std.ArrayList(*ShapeRec), std.hash_map.AutoContext(u64), 80) = .empty;
-var shape_count: usize = 0;
-const shape_cap: usize = 1 << 16;
-var shape_arena_state: ?std.heap.ArenaAllocator = null;
-
-fn shapeHash(fields: []const InstanceData.Field) u64 {
-    var h = std.hash.Wyhash.init(0x5a5a);
-    for (fields) |f| {
-        h.update(std.mem.asBytes(&f.name.ptr));
-        h.update(std.mem.asBytes(&f.name.len));
-    }
-    return h.final();
-}
-
-fn shapeMatches(rec: *const ShapeRec, fields: []const InstanceData.Field) bool {
-    if (rec.ptrs.len != fields.len) return false;
-    for (rec.ptrs, fields) |p, f| {
-        if (p != f.name.ptr) return false;
-    }
-    return true;
-}
-
-/// Never SHAPE_UNSET; SHAPE_NONE once the table is at capacity.
-fn internShape(fields: []const InstanceData.Field) usize {
-    const h = shapeHash(fields);
-    shape_lock.lock();
-    defer shape_lock.unlock();
-    const arena = blk: {
-        if (shape_arena_state == null)
-            shape_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        break :blk shape_arena_state.?.allocator();
-    };
-    const gop = shape_table.getOrPut(std.heap.smp_allocator, h) catch return SHAPE_NONE;
-    if (!gop.found_existing) gop.value_ptr.* = .empty;
-    for (gop.value_ptr.items) |rec| {
-        if (shapeMatches(rec, fields)) return @intFromPtr(rec);
-    }
-    if (shape_count >= shape_cap) return SHAPE_NONE;
-    const rec = arena.create(ShapeRec) catch return SHAPE_NONE;
-    const ptrs = arena.alloc([*]const u8, fields.len) catch return SHAPE_NONE;
-    const lens = arena.alloc(u32, fields.len) catch return SHAPE_NONE;
-    for (fields, 0..) |f, i| {
-        ptrs[i] = f.name.ptr;
-        lens[i] = @intCast(f.name.len);
-    }
-    rec.* = .{ .ptrs = ptrs, .lens = lens };
-    // A bucket list on the page allocator costs a mapping and an mmap for its first
-    // element, and a layout miss is per instance, not per class.
-    gop.value_ptr.append(std.heap.smp_allocator, rec) catch return SHAPE_NONE;
-    shape_count += 1;
-    return @intFromPtr(rec);
-}
-
 /// `KLIO_GC_VERIFY`: for an instance holding an edge no write barrier
 /// recorded, its class and the field that holds the target.
 pub fn describeGcEdge(from: *gc_mod.GcHeader, to: *gc_mod.GcHeader) void {
@@ -471,167 +330,285 @@ pub fn describeGcEdge(from: *gc_mod.GcHeader, to: *gc_mod.GcHeader) void {
     if (!std.mem.eql(u8, std.mem.span(from.gc_type), @typeName(InstanceData))) return;
     const cb: *Ref.Cell = @fieldParentPtr("hdr", @as(*align(16) gc_mod.GcHeader, @alignCast(from)));
     const d = &cb.data;
-    const cls = d.class.asPtrConst().name;
-    for (d.fields.items) |f| {
-        if (f.value != .Instance) continue;
-        if (&f.value.Instance.cell.hdr != @as(*align(16) gc_mod.GcHeader, @alignCast(to))) continue;
-        const tcls = f.value.Instance.asPtrConst().class.asPtrConst().name;
-        std.debug.print("[gc-verify]   {s}.{s} holds a {s}\n", .{ cls, f.name, tcls });
+    const cls = d.class.asPtrConst();
+    for (d.slots, 0..) |v, i| {
+        if (v != .Instance) continue;
+        if (&v.Instance.cell.hdr != @as(*align(16) gc_mod.GcHeader, @alignCast(to))) continue;
+        const name = if (i < cls.layout_slots.len) cls.layout_slots[i].name else "?";
+        const tcls = v.Instance.asPtrConst().class.asPtrConst().name;
+        std.debug.print("[gc-verify]   {s}.{s} holds a {s}\n", .{ cls.name, name, tcls });
         return;
     }
-    std.debug.print("[gc-verify]   {s}: the edge is outside its fields (outer, captures or native state)\n", .{cls});
+    std.debug.print("[gc-verify]   {s}: the edge is outside its slots (outer or native state)\n", .{cls.name});
 }
 
 pub const InstanceData = struct {
     class: ObjRef(ClassDef),
-    fields: std.ArrayList(Field),
-    /// `SHAPE_UNSET` until computed, reset by any field append. Racing fillers
-    /// compute the same id.
-    shape: std.atomic.Value(usize) = std.atomic.Value(usize).init(SHAPE_UNSET),
-    outer: ?Value,
-    identity: u64,
-    native_state: ?NativeState,
-    /// `fields` points into a baked image's arena, so growing or freeing it
-    /// with the runtime allocator would cross allocators. The first growth
-    /// re-buffers and clears this, and teardown skips the arena-owned spine.
-    fields_foreign: bool = false,
-    /// How many leading `fields` entries construction reserved from the
-    /// class's predicted layout. Their index is the class's, so a store under
-    /// one of those names overwrites it where it is instead of moving it to
-    /// the tail; zero means the whole list is in append order.
-    reserved: u32 = 0,
+    /// One value per slot of the class's layout, fixed at construction. The
+    /// class's `layout_slots` names them; nothing adds a slot later.
+    slots: []Value,
+    /// Odd while a slot store is in flight. A read copies a slot between two
+    /// equal even readings, so it never sees half of a store; stores to one
+    /// instance take turns. A `Value` is two words, so an unsynchronized read
+    /// could pair one store's tag with another's payload.
+    slot_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// The class's id in the tables of code lowered from sema, written once
     /// at construction; `maxInt` for an instance they do not cover.
     class_id: u32 = std.math.maxInt(u32),
+    outer: ?Value,
+    identity: u64,
+    native_state: ?NativeState,
     /// For a user `Throwable` subclass, the stack captured at the first throw.
     stack: ?value_mod.StackRef = null,
 
+    /// A named value a host instance is made from: the name becomes its
+    /// class's slot name.
     pub const Field = struct { name: []const u8, value: Value };
-    pub const Capture = struct { name: []const u8, value: Value };
 
-    pub fn get(self: *const InstanceData, name: []const u8) ?Value {
-        for (self.fields.items) |f| {
-            // Field names are canonicalized program-lifetime strings, so an
-            // identical pointer is an identical name; `eql` covers a name that
-            // bypassed canonicalization.
-            if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) return f.value;
-        }
-        return null;
+    /// A call site's memo of the slot a name has in the class it last met:
+    /// the class's identity above the low `cache_index_bits`, the index in
+    /// them. One word, so a racing fill can never pair a class with another
+    /// class's index.
+    pub const SlotCache = std.atomic.Value(u64);
+    const cache_index_bits = 12;
+    const cache_index_mask: u64 = (1 << cache_index_bits) - 1;
+
+    /// A new instance of `class`, whose handle it adopts, with slots holding
+    /// `values`, adopting one reference to each. The caller owns the one
+    /// reference returned.
+    pub fn new(a: std.mem.Allocator, class: ObjRef(ClassDef), values: []const Value, identity: u64) std.mem.Allocator.Error!ObjRef(InstanceData) {
+        const slots: []Value = if (values.len == 0) &.{} else try a.dupe(Value, values);
+        errdefer if (slots.len != 0) a.free(slots);
+        return ObjRef(InstanceData).init(a, .{
+            .class = class,
+            .slots = slots,
+            .class_id = class.asPtrConst().ir_class,
+            .outer = null,
+            .identity = identity,
+            .native_state = null,
+        });
     }
 
-    /// For a non-interned literal name, where the pointer fast path can never
-    /// hit. The caller passes a per-name cache slot the first hit fills.
-    pub fn getCached(self: *const InstanceData, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?Value {
-        if (slot.load(.monotonic)) |p| {
-            for (self.fields.items) |f| {
-                if (f.name.ptr == p) return f.value;
-            }
-        }
-        for (self.fields.items) |f| {
-            if (std.mem.eql(u8, f.name, name)) {
-                slot.store(f.name.ptr, .monotonic);
-                return f.value;
-            }
-        }
-        return null;
+    /// Slot `i` of `inst`, or null past its slots. Takes no lock.
+    pub inline fn slotGet(inst: ObjRef(InstanceData), i: usize) ?Value {
+        return inst.cell.data.loadSlot(i);
     }
 
-    pub fn set(self: *InstanceData, name: []const u8, v: Value) bool {
-        for (self.fields.items) |*f| {
-            if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) {
-                f.value = v;
-                return true;
-            }
-        }
-        return false;
+    /// Stores `v` in slot `i` of `inst` and answers the value it replaced,
+    /// taking no reference; null, storing nothing, past its slots.
+    pub inline fn slotSet(inst: ObjRef(InstanceData), i: usize, v: Value) ?Value {
+        return inst.cell.data.storeSlot(i, v);
     }
 
-    /// Stores `v` into slot `idx` of `inst` under its exclusive borrow, whose
-    /// write barrier records a tenured instance before it can hold a nursery
-    /// value. Retains `v` and hands back the replaced value for the caller to
-    /// release; null for an index past the last field.
-    pub fn storeSlot(inst: ObjRef(InstanceData), idx: usize, v: Value) ?Value {
-        const g = inst.borrowMut();
-        defer g.deinit();
-        const fields = g.get().fields.items;
-        if (idx >= fields.len) return null;
-        v.retain();
-        const old = fields[idx].value;
-        fields[idx].value = v;
+    /// The header of the cell this payload lives in: every instance is a cell.
+    inline fn cellHdr(self: *InstanceData) *gc_mod.GcHeader {
+        const cb: *ObjRef(InstanceData).Cell = @alignCast(@fieldParentPtr("data", self));
+        return &cb.hdr;
+    }
+
+    /// Slot `i`, copied whole, or null past the slots. The collector never
+    /// runs inside `storeSlot`, which holds no safe point.
+    pub inline fn loadSlot(self: *const InstanceData, i: usize) ?Value {
+        if (i >= self.slots.len) return null;
+        const words: *const [2]u64 = @ptrCast(&self.slots[i]);
+        while (true) {
+            const before = self.slot_seq.load(.acquire);
+            if (before & 1 == 0) {
+                // Acquire loads keep the second reading after both words, and
+                // one that saw a word of a later store sees that store's odd
+                // sequence.
+                const w0 = @atomicLoad(u64, &words[0], .acquire);
+                const w1 = @atomicLoad(u64, &words[1], .acquire);
+                if (self.slot_seq.load(.monotonic) == before) {
+                    var out: Value = undefined;
+                    const dst: *[2]u64 = @ptrCast(&out);
+                    dst[0] = w0;
+                    dst[1] = w1;
+                    return out;
+                }
+            }
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Stores `v` in slot `i` and answers the value it replaced, taking no
+    /// reference; null past the slots. Slot stores take no cell lock, so each
+    /// records the write barrier itself. With every collection stopping the
+    /// world, no mark runs between the barrier and the store, so the barrier
+    /// comes first and costs the store nothing more. A mark running beside
+    /// mutators needs the barrier inside the odd sequence, after a
+    /// sequentially consistent turn: then a trace either reads the sequence
+    /// odd and waits for the store, or has marked the instance by the time
+    /// the barrier reads it.
+    pub fn storeSlot(self: *InstanceData, i: usize, v: Value) ?Value {
+        if (i >= self.slots.len) return null;
+        gc_mod.writeBarrier(self.cellHdr());
+        const seq = self.holdStores();
+        const old = self.slots[i];
+        writeWhole(&self.slots[i], v);
+        self.slot_seq.store(seq + 2, .release);
         return old;
     }
 
-    /// Adopts one owned reference to `v`; a caller passing an alias retains
-    /// first. A replaced value is released, so the instance owns exactly one
-    /// reference per field.
-    pub fn define(self: *InstanceData, allocator: std.mem.Allocator, name: []const u8, v: Value) !void {
-        for (self.fields.items) |*f| {
-            if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) {
-                if (objcell.reclaimEnabled()) f.value.release(allocator);
-                f.value = v;
-                return;
+    /// Takes the store turn: the even sequence it made odd.
+    fn holdStores(self: *InstanceData) u32 {
+        var seq = self.slot_seq.load(.monotonic);
+        while (true) {
+            if (seq & 1 == 0) {
+                seq = self.slot_seq.cmpxchgWeak(seq, seq + 1, .acquire, .monotonic) orelse return seq;
+            } else {
+                std.atomic.spinLoopHint();
+                seq = self.slot_seq.load(.monotonic);
             }
         }
-        try self.ensureFieldsOwned(allocator, 1);
-        try self.fields.append(allocator, .{ .name = name, .value = v });
-        // The layout changed, so the memoized shape id no longer describes it.
-        self.shape.store(SHAPE_UNSET, .release);
     }
 
-    /// The caller must hold a borrow: the field list must not grow mid-read.
-    pub fn shapeOf(self: *const InstanceData) usize {
-        const cached = self.shape.load(.acquire);
-        if (cached != SHAPE_UNSET) return cached;
-        const id = internShape(self.fields.items);
-        @constCast(self).shape.store(id, .release);
-        return id;
+    /// Release stores, so a read that sees either word of this store also
+    /// sees the odd sequence that precedes it.
+    inline fn writeWhole(slot: *Value, v: Value) void {
+        const src: *const [2]u64 = @ptrCast(&v);
+        const words: *[2]u64 = @ptrCast(slot);
+        @atomicStore(u64, &words[0], src[0], .release);
+        @atomicStore(u64, &words[1], src[1], .release);
     }
 
-    /// The arena keeps the original buffer.
-    pub fn ensureFieldsOwned(self: *InstanceData, allocator: std.mem.Allocator, extra: usize) !void {
-        if (!self.fields_foreign) return;
-        var fresh: std.ArrayList(Field) = .empty;
-        try fresh.ensureTotalCapacity(allocator, self.fields.items.len + extra);
-        fresh.appendSliceAssumeCapacity(self.fields.items);
-        self.fields = fresh;
-        self.fields_foreign = false;
+    /// Holds off every other store to the instance's slots until `end`, for
+    /// a read-modify-write no store may split. Reads on other threads wait
+    /// for the end; the holder must not read the instance through
+    /// `loadSlot` meanwhile, and must reach no safe point. The write barrier
+    /// is recorded here, for every store the update makes.
+    pub fn beginUpdate(self: *InstanceData) SlotUpdate {
+        gc_mod.writeBarrier(self.cellHdr());
+        return .{ .data = self, .seq = self.holdStores() };
+    }
+
+    pub const SlotUpdate = struct {
+        data: *InstanceData,
+        seq: u32,
+
+        pub fn get(self: SlotUpdate, name: []const u8) ?Value {
+            return self.data.slots[self.data.slotIndex(name) orelse return null];
+        }
+
+        /// As `InstanceData.set`.
+        pub fn set(self: SlotUpdate, name: []const u8, v: Value) bool {
+            writeWhole(&self.data.slots[self.data.slotIndex(name) orelse return false], v);
+            return true;
+        }
+
+        /// As `InstanceData.store`.
+        pub fn store(self: SlotUpdate, allocator: std.mem.Allocator, name: []const u8, v: Value) bool {
+            const slot = &self.data.slots[self.data.slotIndex(name) orelse return false];
+            const old = slot.*;
+            writeWhole(slot, v);
+            if (objcell.reclaimEnabled()) old.release(allocator);
+            return true;
+        }
+
+        pub fn end(self: SlotUpdate) void {
+            self.data.slot_seq.store(self.seq + 2, .release);
+        }
+    };
+
+    /// The slot the class's layout names `name`, or null.
+    pub fn slotIndex(self: *const InstanceData, name: []const u8) ?usize {
+        const layout = self.class.asPtrConst().layout_slots;
+        const names = layout[0..@min(layout.len, self.slots.len)];
+        // Slot names are program-lifetime strings, so the same pointer is the
+        // same name; `eql` covers a name spelled elsewhere.
+        for (names, 0..) |sl, i| {
+            if (sl.name.ptr == name.ptr and sl.name.len == name.len) return i;
+        }
+        for (names, 0..) |sl, i| {
+            if (std.mem.eql(u8, sl.name, name)) return i;
+        }
+        return null;
+    }
+
+    /// `slotIndex` through the call site's memo of the last class it met.
+    pub fn slotIndexCached(self: *const InstanceData, cache: *SlotCache, name: []const u8) ?usize {
+        const class_key: u64 = self.class.identity();
+        const memo = cache.load(.monotonic);
+        if (memo != 0 and memo >> cache_index_bits == class_key) return @intCast(memo & cache_index_mask);
+        const i = self.slotIndex(name) orelse return null;
+        if (i <= cache_index_mask and class_key >> (64 - cache_index_bits) == 0) {
+            cache.store(class_key << cache_index_bits | i, .monotonic);
+        }
+        return i;
+    }
+
+    /// The value of the slot named `name`, or null when the class has none.
+    pub fn get(self: *const InstanceData, name: []const u8) ?Value {
+        return self.loadSlot(self.slotIndex(name) orelse return null);
+    }
+
+    /// `get` through the call site's slot memo.
+    pub fn getCached(self: *const InstanceData, cache: *SlotCache, name: []const u8) ?Value {
+        return self.loadSlot(self.slotIndexCached(cache, name) orelse return null);
+    }
+
+    /// Stores `v` in the slot named `name`, taking no reference and keeping
+    /// none to the replaced value; false when the class has no such slot.
+    pub fn set(self: *InstanceData, name: []const u8, v: Value) bool {
+        const i = self.slotIndex(name) orelse return false;
+        _ = self.storeSlot(i, v);
+        return true;
+    }
+
+    /// Adopts one owned reference to `v` into the slot named `name` and
+    /// releases the value it replaces, so the instance owns exactly one
+    /// reference per slot; false, adopting nothing, when the class has no
+    /// such slot.
+    pub fn store(self: *InstanceData, allocator: std.mem.Allocator, name: []const u8, v: Value) bool {
+        const i = self.slotIndex(name) orelse return false;
+        const old = self.storeSlot(i, v).?;
+        if (objcell.reclaimEnabled()) old.release(allocator);
+        return true;
     }
 
     /// The module keeps the class alive, so this drops only the instance's own
     /// clone; `native_state` belongs to its host binding.
     pub fn deinit(self: *InstanceData, allocator: std.mem.Allocator) void {
-        for (self.fields.items) |f| f.value.release(allocator);
+        for (self.slots) |v| v.release(allocator);
+        if (self.slots.len != 0) allocator.free(self.slots);
         if (self.outer) |o| o.release(allocator);
         if (self.stack) |*s| s.deinit();
-        if (!self.fields_foreign) self.fields.deinit(allocator);
         self.class.deinit();
     }
 
-    /// The class cell, one reference per field, and an inner class's outer.
+    /// The class cell, one reference per slot, an inner class's outer, the
+    /// throwable stack and the native-state box. Slot stores take no cell lock,
+    /// so a mark running beside them reads each slot as `loadSlot` does, whole;
+    /// every other field is written only while the instance is made or under
+    /// its exclusive borrow.
     pub fn gcTrace(self: *const InstanceData, m: *objcell.gc.Marker) void {
         m.shade(&self.class.cell.hdr);
-        for (self.fields.items) |f| f.value.gcMark(m);
+        for (0..self.slots.len) |i| self.loadSlot(i).?.gcMark(m);
         if (self.outer) |o| o.gcMark(m);
         if (self.stack) |s| m.shade(&s.cell.hdr);
-        // `native_state` is host-owned; a value-bearing binding installs its
-        // own tracer.
+        // The box is a cell; the state it points at is the binding's own.
+        if (self.native_state) |ns| m.shade(&ns.data.cell.hdr);
     }
 
-    /// Shallow: the field values, the outer and the class are independent cells
+    /// Shallow: the slot values, the outer and the class are independent cells
     /// swept on their own reachability.
     pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
-        if (!self.fields_foreign) self.fields.deinit(allocator);
+        if (self.slots.len != 0) allocator.free(self.slots);
     }
 
-    /// Created through `init` on first access. `kind` is the binding's
-    /// discriminator; panics when the instance already carries another kind.
+    /// Created through `init` on first access, under the instance's exclusive
+    /// borrow. `kind` is the binding's discriminator; panics when the instance
+    /// already carries another kind.
     pub fn ensureNativeState(
-        self: *InstanceData,
+        inst: ObjRef(InstanceData),
         allocator: std.mem.Allocator,
         comptime T: type,
         kind: []const u8,
         init: *const fn () T,
     ) std.mem.Allocator.Error!ObjRef(NativeBox) {
+        const g = inst.borrowMut();
+        defer g.deinit();
+        const self = g.get();
         if (self.native_state) |ns| {
             if (!std.mem.eql(u8, ns.kind, kind)) {
                 @panic("native_state kind mismatch: instance carries one binding's state, another binding asked for a different kind");
@@ -693,134 +670,6 @@ fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, s, needle)) return true;
     }
     return false;
-}
-
-fn containsPtr(haystack: []const *const ClassDef, needle: *const ClassDef) bool {
-    for (haystack) |p| {
-        if (p == needle) return true;
-    }
-    return false;
-}
-
-fn collectCompanionsWalk(
-    allocator: std.mem.Allocator,
-    cls: ObjRef(ClassDef),
-    out: *std.ArrayList(ObjRef(InstanceData)),
-    seen: *std.ArrayList(*const ClassDef),
-) !void {
-    const ptr: *const ClassDef = cls.asPtr();
-    if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return;
-    try seen.append(allocator, ptr);
-    {
-        const g = ptr.companion.borrow();
-        defer g.deinit();
-        if (g.get().*) |c| try out.append(allocator, c.clone());
-    }
-    if (parentClone(ptr)) |parent| {
-        defer parent.deinit();
-        try collectCompanionsWalk(allocator, parent, out, seen);
-    }
-    for (ptr.interfaces) |iface| {
-        try collectCompanionsWalk(allocator, iface, out, seen);
-    }
-    if (enclosingClone(ptr)) |encl| {
-        defer encl.deinit();
-        try collectCompanionsWalk(allocator, encl, out, seen);
-    }
-}
-
-fn findMethodWalk(
-    allocator: std.mem.Allocator,
-    cls: ObjRef(ClassDef),
-    name: []const u8,
-    seen: *std.ArrayList(*const ClassDef),
-) ?MethodHit {
-    const ptr: *const ClassDef = cls.asPtr();
-    if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return null;
-    seen.append(allocator, ptr) catch return null;
-    for (ptr.methods) |m| {
-        if (std.mem.eql(u8, m.name, name) and
-            (m.decl.get().body != null or m.sam_lambda != null or m.delegate_field != null))
-        {
-            return .{ .method = m, .class = cls.clone() };
-        }
-    }
-    for (ptr.delegate_forwarders) |m| {
-        if (std.mem.eql(u8, m.name, name)) return .{ .method = m, .class = cls.clone() };
-    }
-    if (parentClone(ptr)) |parent| {
-        defer parent.deinit();
-        if (findMethodWalk(allocator, parent, name, seen)) |found| return found;
-    }
-    for (ptr.interfaces) |iface| {
-        if (findMethodWalk(allocator, iface, name, seen)) |found| return found;
-    }
-    for (ptr.methods) |m| {
-        if (std.mem.eql(u8, m.name, name)) return .{ .method = m, .class = cls.clone() };
-    }
-    return null;
-}
-
-fn findMethodForArgWalk(
-    allocator: std.mem.Allocator,
-    cls: ObjRef(ClassDef),
-    name: []const u8,
-    arg_type_name: []const u8,
-    seen: *std.ArrayList(*const ClassDef),
-) ?MethodHit {
-    const ptr: *const ClassDef = cls.asPtr();
-    if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return null;
-    seen.append(allocator, ptr) catch return null;
-    for (ptr.methods) |m| {
-        if (std.mem.eql(u8, m.name, name) and m.decl.get().body != null and firstParamTypeMatches(m, arg_type_name)) {
-            return .{ .method = m, .class = cls.clone() };
-        }
-    }
-    if (parentClone(ptr)) |parent| {
-        defer parent.deinit();
-        if (findMethodForArgWalk(allocator, parent, name, arg_type_name, seen)) |found| return found;
-    }
-    for (ptr.interfaces) |iface| {
-        if (findMethodForArgWalk(allocator, iface, name, arg_type_name, seen)) |found| return found;
-    }
-    return null;
-}
-
-fn firstParamTypeMatches(m: MethodDef, arg_type_name: []const u8) bool {
-    if (m.decl.get().params.len == 0) return false;
-    return std.mem.eql(u8, m.decl.get().params[0].ty.name.name, arg_type_name);
-}
-
-fn findBodyPropertyWalk(
-    allocator: std.mem.Allocator,
-    cls: ObjRef(ClassDef),
-    name: []const u8,
-    seen: *std.ArrayList(*const ClassDef),
-) ?PropertyHit {
-    const ptr: *const ClassDef = cls.asPtr();
-    if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return null;
-    seen.append(allocator, ptr) catch return null;
-    for (ptr.body_properties) |p| {
-        if (std.mem.eql(u8, p.name, name)) return .{ .property = p, .class = cls.clone() };
-    }
-    if (parentClone(ptr)) |parent| {
-        defer parent.deinit();
-        if (findBodyPropertyWalk(allocator, parent, name, seen)) |found| return found;
-    }
-    for (ptr.interfaces) |iface| {
-        if (findBodyPropertyWalk(allocator, iface, name, seen)) |found| return found;
-    }
-    return null;
-}
-
-fn parentClone(cls: *const ClassDef) ?ObjRef(ClassDef) {
-    return if (cls.parent) |p| p.clone() else null;
-}
-
-fn enclosingClone(cls: *const ClassDef) ?ObjRef(ClassDef) {
-    const g = cls.enclosing_class.borrow();
-    defer g.deinit();
-    return if (g.get().*) |e| e.clone() else null;
 }
 
 const testing = std.testing;
@@ -930,115 +779,47 @@ fn typeRef(name: []const u8, nullable: bool, args: []ast.TypeArg) ast.TypeRef {
     };
 }
 
-/// With a body, so `findMethod` treats a `MethodDef` over it as concrete.
-fn fnWithBody(name: []const u8, params: []ast.Param, body: *ast.Block) ast.Function {
-    return .{
-        .name = ident(name),
-        .receiver_type = null,
-        .type_params = &.{},
-        .where_bounds = &.{},
-        .params = params,
-        .return_type = null,
-        .body = .{ .Block = body.* },
-        .is_open = false,
-        .is_override = false,
-        .is_abstract = false,
-        .is_operator = false,
-        .is_inline = false,
-        .is_infix = false,
-        .is_tailrec = false,
-        .is_suspend = false,
-        .is_expect = false,
-        .is_actual = false,
-        .visibility = .Public,
-        .annotations = &.{},
-        .span = dummySpan(),
-    };
-}
-
-fn methodDef(name: []const u8, decl: *const ast.Function) MethodDef {
-    return .{
-        .name = name,
-        .decl = .{ .ptr = decl },
-        .is_operator = false,
-        .is_open = false,
-        .is_override = false,
-        .is_abstract = false,
-        .sam_lambda = null,
-        .delegate_field = null,
-        .ir_fn_id = null,
-    };
-}
-
-fn propertyDef(name: []const u8) PropertyDef {
-    return .{
-        .name = name,
-        .mutable = false,
-        .init = null,
-        .getter = null,
-        .setter = null,
-        .delegate = null,
-        .is_abstract = false,
-        .is_lateinit = false,
-        .primitive_zero = null,
-    };
-}
-
-test "InstanceData get/set/define round-trip" {
+test "InstanceData reads and writes a slot by the name its class's layout gives it" {
     const allocator = testing.allocator;
     var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
     defer fx.deinit(allocator);
+    const layout = [_]LayoutSlot{ .{ .name = "x" }, .{ .name = "y" } };
+    fx.ptr().layout_slots = &layout;
 
-    var inst: InstanceData = .{
-        .class = fx.handle.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = 0,
-        .native_state = null,
-    };
-    defer {
-        inst.fields.deinit(allocator);
-        inst.class.deinit();
-    }
+    const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{ .Null, .{ .Int = 1 } }, 0);
+    defer inst.deinit();
+    const d = inst.asPtr();
 
-    try testing.expect(inst.get("x") == null);
-    try testing.expect(!inst.set("x", .{ .Int = 1 }));
+    try testing.expect(d.get("z") == null);
+    try testing.expect(!d.set("z", .{ .Int = 1 }));
+    try testing.expect(!d.store(allocator, "z", .{ .Int = 1 }));
+    try testing.expectEqual(@as(usize, 2), d.slots.len);
 
-    try inst.define(allocator, "x", .{ .Int = 7 });
-    try testing.expectEqual(@as(i32, 7), inst.get("x").?.Int);
+    try testing.expect(d.store(allocator, "x", .{ .Int = 7 }));
+    try testing.expectEqual(@as(i32, 7), d.get("x").?.Int);
+    try testing.expect(d.set("x", .{ .Int = 9 }));
+    try testing.expectEqual(@as(i32, 9), InstanceData.slotGet(inst, 0).?.Int);
+    try testing.expectEqual(@as(i32, 1), d.get("y").?.Int);
 
-    try inst.define(allocator, "x", .{ .Int = 8 });
-    try testing.expectEqual(@as(usize, 1), inst.fields.items.len);
-    try testing.expectEqual(@as(i32, 8), inst.get("x").?.Int);
-
-    try testing.expect(inst.set("x", .{ .Int = 9 }));
-    try testing.expectEqual(@as(i32, 9), inst.get("x").?.Int);
+    // The memo answers the class it saw, and a spelling at another address.
+    var cache: InstanceData.SlotCache = .init(0);
+    const y: []const u8 = "yy"[0..1];
+    try testing.expectEqual(@as(?usize, 1), d.slotIndexCached(&cache, y));
+    try testing.expect(cache.load(.monotonic) != 0);
+    try testing.expectEqual(@as(i32, 1), d.getCached(&cache, "y").?.Int);
 }
 
 test "instance release recursively frees a retained instance field" {
     const allocator = testing.allocator;
     var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
     defer fx.deinit(allocator);
+    const layout = [_]LayoutSlot{.{ .name = "b" }};
 
-    const b = try objcell.ObjRef(InstanceData).init(allocator, .{
-        .class = fx.handle.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = 1,
-        .native_state = null,
-    });
+    const b = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 1);
     const b_val = Value{ .Instance = b };
-
-    var a_data: InstanceData = .{
-        .class = fx.handle.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = 2,
-        .native_state = null,
-    };
     b_val.retain();
-    try a_data.define(allocator, "b", b_val);
-    const a = try objcell.ObjRef(InstanceData).init(allocator, a_data);
+    fx.ptr().layout_slots = &layout;
+    const a = try InstanceData.new(allocator, fx.handle.clone(), &.{b_val}, 2);
     const a_val = Value{ .Instance = a };
 
     // `testing.allocator` asserts the whole graph is reclaimed.
@@ -1053,7 +834,7 @@ test "list release recursively frees retained instance elements" {
 
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = fx.handle.clone(),
-        .fields = .empty,
+        .slots = &.{},
         .outer = null,
         .identity = 1,
         .native_state = null,
@@ -1068,101 +849,6 @@ test "list release recursively frees retained instance elements" {
 
     list_val.release(allocator);
     inst_val.release(allocator);
-}
-
-test "findMethod walks the parent chain and prefers concrete bodies" {
-    const allocator = testing.allocator;
-
-    var blk: ast.Block = .{ .stmts = &.{}, .span = dummySpan() };
-    var parent_fn = fnWithBody("greet", &.{}, &blk);
-    var child_fn = fnWithBody("speak", &.{}, &blk);
-
-    var parent_methods = [_]MethodDef{methodDef("greet", &parent_fn)};
-    var parent_fx = try ClassFixture.build(allocator, "Base", &.{}, &parent_methods, &.{});
-    defer parent_fx.deinit(allocator);
-
-    var child_methods = [_]MethodDef{methodDef("speak", &child_fn)};
-    var child_fx = try ClassFixture.build(allocator, "Derived", &.{"Base"}, &child_methods, &.{});
-    defer child_fx.deinit(allocator);
-    child_fx.setParent(parent_fx.handle);
-
-    const own = ClassDef.findMethod(child_fx.handle, allocator, "speak").?;
-    var own_hit = own;
-    defer own_hit.class.deinit();
-    try testing.expectEqualStrings("speak", own_hit.method.name);
-    {
-        const g = own_hit.class.borrow();
-        defer g.deinit();
-        try testing.expectEqualStrings("Derived", g.get().name);
-    }
-
-    const inherited = ClassDef.findMethod(child_fx.handle, allocator, "greet").?;
-    var inh_hit = inherited;
-    defer inh_hit.class.deinit();
-    try testing.expectEqualStrings("greet", inh_hit.method.name);
-    {
-        const g = inh_hit.class.borrow();
-        defer g.deinit();
-        try testing.expectEqualStrings("Base", g.get().name);
-    }
-
-    try testing.expect(ClassDef.findMethod(child_fx.handle, allocator, "missing") == null);
-}
-
-test "findMethodForArg prefers the matching first-param overload" {
-    const allocator = testing.allocator;
-
-    var blk: ast.Block = .{ .stmts = &.{}, .span = dummySpan() };
-
-    const int_arg_ty = typeRef("Int", false, &.{});
-    const bag_arg_ty = typeRef("Bag", false, &.{});
-    var int_params = [_]ast.Param{.{ .name = ident("o"), .ty = int_arg_ty, .default = null, .is_vararg = false, .is_crossinline = false, .is_noinline = false, .annotations = &.{}, .span = dummySpan() }};
-    var bag_params = [_]ast.Param{.{ .name = ident("o"), .ty = bag_arg_ty, .default = null, .is_vararg = false, .is_crossinline = false, .is_noinline = false, .annotations = &.{}, .span = dummySpan() }};
-
-    var plus_int = fnWithBody("plus", &int_params, &blk);
-    var plus_bag = fnWithBody("plus", &bag_params, &blk);
-
-    var methods = [_]MethodDef{ methodDef("plus", &plus_int), methodDef("plus", &plus_bag) };
-    var fx = try ClassFixture.build(allocator, "Bag", &.{}, &methods, &.{});
-    defer fx.deinit(allocator);
-
-    const hit = ClassDef.findMethodForArg(fx.handle, allocator, "plus", "Bag").?;
-    var h = hit;
-    defer h.class.deinit();
-    try testing.expectEqualStrings("Bag", h.method.decl.get().params[0].ty.name.name);
-
-    const fallback = ClassDef.findMethodForArg(fx.handle, allocator, "plus", "Other").?;
-    var fb = fallback;
-    defer fb.class.deinit();
-    try testing.expectEqualStrings("plus", fb.method.name);
-}
-
-test "findBodyProperty walks self then parent" {
-    const allocator = testing.allocator;
-
-    var parent_props = [_]PropertyDef{propertyDef("base")};
-    var parent_fx = try ClassFixture.build(allocator, "Base", &.{}, &.{}, &parent_props);
-    defer parent_fx.deinit(allocator);
-
-    var child_props = [_]PropertyDef{propertyDef("own")};
-    var child_fx = try ClassFixture.build(allocator, "Derived", &.{"Base"}, &.{}, &child_props);
-    defer child_fx.deinit(allocator);
-    child_fx.setParent(parent_fx.handle);
-
-    const own = ClassDef.findBodyProperty(child_fx.handle, allocator, "own").?;
-    own.class.deinit();
-    try testing.expectEqualStrings("own", own.property.name);
-
-    const inherited = ClassDef.findBodyProperty(child_fx.handle, allocator, "base").?;
-    var inh = inherited;
-    defer inh.class.deinit();
-    {
-        const g = inh.class.borrow();
-        defer g.deinit();
-        try testing.expectEqualStrings("Base", g.get().name);
-    }
-
-    try testing.expect(ClassDef.findBodyProperty(child_fx.handle, allocator, "nope") == null);
 }
 
 test "isSubtypeOf matches self, fqn, and named supertypes via captured env" {
@@ -1189,52 +875,6 @@ test "isSubtypeOf matches self, fqn, and named supertypes via captured env" {
     try testing.expect(derived_fx.ptr().isSubtypeOf(allocator, "Derived"));
     try testing.expect(derived_fx.ptr().isSubtypeOf(allocator, "Base"));
     try testing.expect(!derived_fx.ptr().isSubtypeOf(allocator, "Unrelated"));
-}
-
-test "allCompanions collects self and parent companions" {
-    const allocator = testing.allocator;
-
-    var parent_fx = try ClassFixture.build(allocator, "Base", &.{}, &.{}, &.{});
-    defer parent_fx.deinit(allocator);
-    var child_fx = try ClassFixture.build(allocator, "Derived", &.{"Base"}, &.{}, &.{});
-    defer child_fx.deinit(allocator);
-    child_fx.setParent(parent_fx.handle);
-
-    const parent_comp = try ObjRef(InstanceData).init(allocator, .{
-        .class = parent_fx.handle.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = 1,
-        .native_state = null,
-    });
-    defer parent_comp.deinit();
-    const child_comp = try ObjRef(InstanceData).init(allocator, .{
-        .class = child_fx.handle.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = 2,
-        .native_state = null,
-    });
-    defer child_comp.deinit();
-    {
-        const g = parent_fx.ptr().companion.borrowMut();
-        defer g.deinit();
-        g.get().* = parent_comp.clone();
-    }
-    {
-        const g = child_fx.ptr().companion.borrowMut();
-        defer g.deinit();
-        g.get().* = child_comp.clone();
-    }
-
-    const comps = try ClassDef.allCompanions(child_fx.handle, allocator);
-    defer {
-        for (comps) |c| c.deinit();
-        allocator.free(comps);
-    }
-    try testing.expectEqual(@as(usize, 2), comps.len);
-    try testing.expect(ObjRef(InstanceData).ptrEq(comps[0], child_comp));
-    try testing.expect(ObjRef(InstanceData).ptrEq(comps[1], parent_comp));
 }
 
 test "TypeShape from a generic, nullable type ref" {
@@ -1265,42 +905,6 @@ test "TypeShape from a generic, nullable type ref" {
     try testing.expect(shape.args[1].nullable);
 }
 
-test "shape ids: intern by layout, reset on append, distinct layouts differ" {
-    const allocator = testing.allocator;
-    var fx = try ClassFixture.build(allocator, "S", &.{}, &.{}, &.{});
-    defer fx.deinit(allocator);
-
-    var a: InstanceData = .{ .class = fx.handle.clone(), .fields = .empty, .outer = null, .identity = 0, .native_state = null };
-    defer {
-        a.fields.deinit(allocator);
-        a.class.deinit();
-    }
-    var b: InstanceData = .{ .class = fx.handle.clone(), .fields = .empty, .outer = null, .identity = 1, .native_state = null };
-    defer {
-        b.fields.deinit(allocator);
-        b.class.deinit();
-    }
-    const n1: []const u8 = "alpha";
-    const n2: []const u8 = "beta";
-    try a.fields.append(allocator, .{ .name = n1, .value = .Unit });
-    try b.fields.append(allocator, .{ .name = n1, .value = .{ .Int = 7 } });
-
-    const sa = a.shapeOf();
-    try testing.expect(sa != SHAPE_UNSET and sa != SHAPE_NONE);
-    // Same name pointers in the same order is the same id.
-    try testing.expectEqual(sa, b.shapeOf());
-    try testing.expectEqual(sa, a.shapeOf());
-
-    // Append changes the layout: the id resets and re-interns differently.
-    try b.fields.append(allocator, .{ .name = n2, .value = .Unit });
-    b.shape.store(SHAPE_UNSET, .release);
-    const sb2 = b.shapeOf();
-    try testing.expect(sb2 != sa and sb2 != SHAPE_UNSET and sb2 != SHAPE_NONE);
-    try a.fields.append(allocator, .{ .name = n2, .value = .Unit });
-    a.shape.store(SHAPE_UNSET, .release);
-    try testing.expectEqual(sb2, a.shapeOf());
-}
-
 test "ensureNativeState creates once and returns the same payload" {
     const allocator = testing.allocator;
     var fx = try ClassFixture.build(allocator, "Buf", &.{}, &.{}, &.{});
@@ -1313,54 +917,189 @@ test "ensureNativeState creates once and returns the same payload" {
         }
     };
 
-    var inst: InstanceData = .{
-        .class = fx.handle.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = 0,
-        .native_state = null,
-    };
+    const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 0);
     defer {
-        if (inst.native_state) |ns| ns.data.deinit();
-        inst.fields.deinit(allocator);
-        inst.class.deinit();
+        if (inst.asPtrConst().native_state) |ns| ns.data.deinit();
+        inst.deinit();
     }
 
-    const first = try inst.ensureNativeState(allocator, Payload, "kotlinx.io.Buffer", mk.make);
+    const first = try InstanceData.ensureNativeState(inst, allocator, Payload, "kotlinx.io.Buffer", mk.make);
     defer first.deinit();
     try testing.expectEqual(@as(u32, 42), InstanceData.nativeStatePtr(Payload, first).n);
 
     InstanceData.nativeStatePtr(Payload, first).n = 99;
-    const second = try inst.ensureNativeState(allocator, Payload, "kotlinx.io.Buffer", mk.make);
+    const second = try InstanceData.ensureNativeState(inst, allocator, Payload, "kotlinx.io.Buffer", mk.make);
     defer second.deinit();
     try testing.expect(ObjRef(NativeBox).ptrEq(first, second));
     try testing.expectEqual(@as(u32, 99), InstanceData.nativeStatePtr(Payload, second).n);
+}
+
+test "every slot store path records the barrier on a tenured instance" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Holder", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+    const layout = [_]LayoutSlot{.{ .name = "x" }};
+    fx.ptr().layout_slots = &layout;
+    const Case = enum { set, store, update_set, update_store };
+    for ([_]Case{ .set, .store, .update_set, .update_store }) |case| {
+        const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{.Null}, 0);
+        defer inst.deinit();
+        const hdr = &inst.cell.hdr;
+        defer gc_mod.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(gc_mod.GcHeader) }});
+        hdr.gc_gen = 1;
+        hdr.gc_remembered = false;
+        // The payload pointer, as a host op holding no borrow has it.
+        const d = &inst.cell.data;
+        const name = "x";
+        switch (case) {
+            .set => try testing.expect(d.set(name, .{ .Int = 1 })),
+            .store => try testing.expect(d.store(allocator, name, .{ .Int = 2 })),
+            .update_set => {
+                const u = d.beginUpdate();
+                defer u.end();
+                try testing.expect(u.set(name, .{ .Int = 3 }));
+            },
+            .update_store => {
+                const u = d.beginUpdate();
+                defer u.end();
+                try testing.expect(u.store(allocator, name, .{ .Int = 4 }));
+            },
+        }
+        try testing.expect(hdr.gc_remembered);
+    }
 }
 
 test "a slot store into a tenured instance joins the remembered set" {
     const allocator = testing.allocator;
     var fx = try ClassFixture.build(allocator, "Holder", &.{}, &.{}, &.{});
     defer fx.deinit(allocator);
-    var fields: std.ArrayList(InstanceData.Field) = .empty;
-    try fields.append(allocator, .{ .name = "head", .value = .Null });
-    const inst = try ObjRef(InstanceData).init(allocator, .{
-        .class = fx.handle.clone(),
-        .fields = fields,
-        .outer = null,
-        .identity = 0,
-        .native_state = null,
-    });
+    const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{.Null}, 0);
     defer inst.deinit();
     const hdr = &inst.cell.hdr;
     defer gc_mod.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(gc_mod.GcHeader) }});
     hdr.gc_gen = 1;
     hdr.gc_remembered = false;
 
-    const old = InstanceData.storeSlot(inst, 0, .{ .Int = 7 }) orelse return error.TestUnexpectedResult;
+    // Past the slots nothing is stored and nothing is remembered.
+    try testing.expect(InstanceData.slotSet(inst, 1, .Unit) == null);
+    try testing.expect(!hdr.gc_remembered);
+    const old = InstanceData.slotSet(inst, 0, .{ .Int = 7 }) orelse return error.TestUnexpectedResult;
     try testing.expect(old == .Null);
     try testing.expect(hdr.gc_remembered);
-    try testing.expect(InstanceData.storeSlot(inst, 1, .Unit) == null);
-    const g = inst.borrow();
-    defer g.deinit();
-    try testing.expectEqual(@as(i32, 7), g.get().fields.items[0].value.Int);
+    try testing.expectEqual(@as(i32, 7), InstanceData.slotGet(inst, 0).?.Int);
+    try testing.expect(InstanceData.slotGet(inst, 1) == null);
+}
+
+test "a mark tracing an instance while its slots are stored shades only whole values" {
+    const allocator = std.heap.smp_allocator;
+    var fx = try ClassFixture.build(allocator, "Traced", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+    const other = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 7);
+    defer other.deinit();
+    const text = try value_mod.strInit(allocator, "whole");
+    defer text.deinit();
+    const kinds = [_]Value{ .{ .Int = 0x5a5a5a5a }, .{ .String = text }, .{ .Instance = other }, .Null };
+    const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{ kinds[0], kinds[1] }, 1);
+    defer {
+        inst.asPtr().slots[0] = .Null;
+        inst.asPtr().slots[1] = .Null;
+        inst.deinit();
+    }
+
+    const Race = struct {
+        inst: ObjRef(InstanceData),
+        kinds: []const Value,
+        stop: std.atomic.Value(bool) = .init(false),
+
+        fn write(self: *@This(), which: usize) void {
+            var n: usize = 0;
+            while (!self.stop.load(.monotonic)) : (n += 1) {
+                _ = InstanceData.slotSet(self.inst, (which + n) % 2, self.kinds[(which + n) % self.kinds.len]);
+            }
+        }
+    };
+    var race: Race = .{ .inst = inst, .kinds = &kinds };
+    var threads: [3]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Race.write, .{ &race, i });
+    // A trace that paired one store's tag with another's payload would shade a
+    // header that is none of these.
+    const known = [_]*objcell.gc.GcHeader{ &fx.handle.cell.hdr, &text.cell.hdr, &other.cell.hdr };
+    var epoch: usize = 1;
+    while (epoch < 200_000) : (epoch += 1) {
+        var m: objcell.gc.Marker = .{ .epoch = epoch, .arena = allocator };
+        defer m.grey.deinit(allocator);
+        inst.cell.hdr.gc_trace(&inst.cell.hdr, &m);
+        for (m.grey.items) |h| {
+            const ok = for (known) |k| {
+                if (h == k) break true;
+            } else false;
+            try testing.expect(ok);
+        }
+    }
+    race.stop.store(true, .monotonic);
+    for (threads) |t| t.join();
+}
+
+test "a slot read racing stores of every kind sees one whole stored value" {
+    const allocator = std.heap.smp_allocator;
+    var fx = try ClassFixture.build(allocator, "Racy", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+    const other = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 7);
+    defer other.deinit();
+    const text = try value_mod.strInit(allocator, "whole");
+    defer text.deinit();
+    // Each writer stores values of one kind whose payload names the kind, so
+    // a read pairing one store's tag with another's payload is caught.
+    const kinds = [_]Value{ .{ .Int = 0x5a5a5a5a }, .{ .String = text }, .{ .Instance = other }, .Null, .{ .Long = -1 } };
+    const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{kinds[0]}, 1);
+    defer {
+        inst.asPtr().slots[0] = .Null;
+        inst.deinit();
+    }
+
+    const Race = struct {
+        inst: ObjRef(InstanceData),
+        kinds: []const Value,
+        stop: std.atomic.Value(bool) = .init(false),
+        torn: std.atomic.Value(usize) = .init(0),
+        reads: std.atomic.Value(usize) = .init(0),
+
+        fn whole(self: *@This(), v: Value) bool {
+            for (self.kinds) |k| {
+                if (std.meta.activeTag(k) != std.meta.activeTag(v)) continue;
+                return switch (v) {
+                    .Int => |x| x == k.Int,
+                    .Long => |x| x == k.Long,
+                    .String => |x| x.cell == k.String.cell,
+                    .Instance => |x| x.cell == k.Instance.cell,
+                    .Null => true,
+                    else => false,
+                };
+            }
+            return false;
+        }
+
+        fn write(self: *@This(), which: usize) void {
+            var n: usize = 0;
+            while (!self.stop.load(.monotonic)) : (n += 1) {
+                _ = InstanceData.slotSet(self.inst, 0, self.kinds[(which + n) % self.kinds.len]);
+            }
+        }
+
+        fn read(self: *@This()) void {
+            while (!self.stop.load(.monotonic)) {
+                const v = InstanceData.slotGet(self.inst, 0).?;
+                if (!self.whole(v)) _ = self.torn.fetchAdd(1, .monotonic);
+                _ = self.reads.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var race: Race = .{ .inst = inst, .kinds = &kinds };
+    var threads: [6]std.Thread = undefined;
+    for (threads[0..3], 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Race.write, .{ &race, i });
+    for (threads[3..]) |*t| t.* = try std.Thread.spawn(.{}, Race.read, .{&race});
+    while (race.reads.load(.monotonic) < 2_000_000) std.atomic.spinLoopHint();
+    race.stop.store(true, .monotonic);
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(usize, 0), race.torn.load(.monotonic));
 }

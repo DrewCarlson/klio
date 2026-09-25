@@ -21,6 +21,7 @@ const classes = @import("classes.zig");
 const lambda = @import("lambda.zig");
 const tailrec = @import("tailrec.zig");
 const refs = @import("refs.zig");
+const locals = @import("locals.zig");
 
 const Builder = builder.Builder;
 const Program = builder.Program;
@@ -252,9 +253,7 @@ fn lowerExprInner(b: *Builder, e: *const ast.Expr) Error!Reg {
 
 pub fn lowerStmt(b: *Builder, st: *const ast.Stmt) Error!void {
     switch (st.*) {
-        .Expr => |*e| {
-            _ = try lowerExpr(b, e);
-        },
+        .Expr => |*e| try lowerDiscarding(b, e),
         .Decl => |d| switch (d.*) {
             .Property => |prop| try lowerLocalProperty(b, prop),
             .Function => try lambda.lowerLocalFun(b, d),
@@ -270,6 +269,31 @@ pub fn lowerStmt(b: *Builder, st: *const ast.Stmt) Error!void {
     }
 }
 
+/// Lowers `e` for its effects: an `if` or `when` moves no value into a
+/// result, a block's statements are all statements, and an increment
+/// writes its variable in place. Named by a failure as `lowerExpr` names
+/// an expression.
+pub fn lowerDiscarding(b: *Builder, e: *const ast.Expr) Error!void {
+    const saved = b.cur_span;
+    const saved_kind = b.cur_kind;
+    b.cur_span = e.span();
+    b.cur_kind = @tagName(e.*);
+    switch (e.*) {
+        .If => try control.lowerIfDiscarding(b, e),
+        .When => try control.lowerWhenDiscarding(b, e),
+        .Block => |*blk| try lowerStmtsDiscarding(b, blk.stmts),
+        .Unary => |u| if (u.op == .PreInc or u.op == .PreDec) try operator.lowerIncDecStmt(b, e) else {
+            _ = try lowerExprInner(b, e);
+        },
+        .Postfix => |pf| if (pf.op == .Inc or pf.op == .Dec) try operator.lowerIncDecStmt(b, e) else {
+            _ = try lowerExprInner(b, e);
+        },
+        else => _ = try lowerExprInner(b, e),
+    }
+    b.cur_span = saved;
+    b.cur_kind = saved_kind;
+}
+
 /// The block's statements in order; its value is the last statement's
 /// when that is an expression, else `Unit`. Statements after a `return`,
 /// `throw`, `break` or `continue` never run and are not lowered.
@@ -280,13 +304,44 @@ pub fn lowerBlock(b: *Builder, blk: *const ast.Block) Error!Reg {
 /// `stmts` in order, as `lowerBlock` lowers them; the last one's value
 /// when it is an expression, else null.
 pub fn lowerStmts(b: *Builder, stmts: []const ast.Stmt) Error!?Reg {
+    return statements(b, stmts, true);
+}
+
+/// `stmts` in order, for their effects: a loop's body, a `finally`.
+pub fn lowerStmtsDiscarding(b: *Builder, stmts: []const ast.Stmt) Error!void {
+    _ = try statements(b, stmts, false);
+}
+
+/// Each statement answers for the locals it writes while the values it
+/// reads are in flight (`locals.Hazard`); the last one, when its value is
+/// the block's, for the enclosing construct's too.
+fn statements(b: *Builder, stmts: []const ast.Stmt, want_value: bool) Error!?Reg {
+    const saved = b.hazard;
+    defer b.hazard = saved;
     for (stmts, 0..) |*st, i| {
         if (b.terminated()) break;
         try traceStmt(b, st);
-        if (i + 1 == stmts.len and st.* == .Expr) return try lowerExpr(b, &st.Expr);
+        if (want_value and i + 1 == stmts.len and st.* == .Expr) {
+            var h: locals.Hazard = .{ .what = .{ .stmt = st }, .parent = saved };
+            b.hazard = &h;
+            return try lowerExpr(b, &st.Expr);
+        }
+        var h: locals.Hazard = .{ .what = .{ .stmt = st } };
+        b.hazard = &h;
         try lowerStmt(b, st);
     }
     return null;
+}
+
+/// Lowers `e`, whose value is used as soon as it is computed (a branch's
+/// condition, an expression body's result): it answers for its own writes
+/// only.
+pub fn lowerAlone(b: *Builder, e: *const ast.Expr) Error!Reg {
+    const saved = b.hazard;
+    defer b.hazard = saved;
+    var h: locals.Hazard = .{ .what = .{ .expr = e } };
+    b.hazard = &h;
+    return lowerExpr(b, e);
 }
 
 /// Marks where the frame is in its source, the position a stack trace
@@ -311,13 +366,13 @@ pub fn lowerFunctionBody(b: *Builder, fb: *const ast.FunctionBody) Error!void {
     switch (fb.*) {
         .Block => |*blk| {
             try tailrec.markUnitBody(b, blk.stmts);
-            _ = try lowerStmts(b, blk.stmts);
+            try lowerStmtsDiscarding(b, blk.stmts);
             b.terminate(.{ .Return = null });
         },
         .Expr => |*e| {
             try tailrec.markExpr(b, e);
             try b.emit(.{ .Trace = .{ .span = e.span() } });
-            const v = try lowerExpr(b, e);
+            const v = try lowerAlone(b, e);
             b.terminate(.{ .Return = v });
         },
     }
@@ -335,8 +390,9 @@ pub fn lowerLocalProperty(b: *Builder, prop: *const ast.Property) Error!void {
         return env.bindLocal(b, sym, delegate);
     }
     const init = prop.init orelse return env.declareLocal(b, sym);
+    const from = locals.mark(b);
     const v = try lowerExpr(b, init);
-    try env.bindLocal(b, sym, v);
+    try env.bindLocalFrom(b, sym, v, from);
 }
 
 /// `target = value`: a name's write, or an index target's `set` through
@@ -350,7 +406,9 @@ pub fn lowerAssign(b: *Builder, a: *const ast.AssignStmt) Error!void {
             const last = segs[segs.len - 1];
             const rec = b.nameAt(a.id, last.span.start) orelse return b.nameMissed(a.id);
             const prefix = if (segs.len > 1) try name.pathValue(b, a.id, segs[0 .. segs.len - 1]) else null;
+            const from = locals.mark(b);
             const v = try lowerExpr(b, &a.value);
+            if (rec.kind == .local) return env.writeLocalFrom(b, rec.target, v, from);
             return name.write(b, &rec, prefix, v);
         },
         .Member => |m| {

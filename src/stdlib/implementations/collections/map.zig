@@ -165,20 +165,20 @@ pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("plus requires an argument");
     const arg = ctx.args[1];
     switch (arg) {
-        .Pair => try out.append(a, .{ .key = arg.Pair.first.asPtr().*, .value = arg.Pair.second.asPtr().* }),
+        .Pair => try out.append(a, .{ .key = arg.Pair.first.asPtrConst().*, .value = arg.Pair.second.asPtrConst().* }),
         .Map => |e| try out.appendSlice(a, try snapshotEntries(a, e.entries)),
         .List => |l| {
             const g = l.items.borrow();
             defer g.deinit();
             for (g.get().items) |p| {
-                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtrConst().*, .value = p.Pair.second.asPtrConst().* });
             }
         },
         .Set => |s| {
             const g = s.items.borrow();
             defer g.deinit();
             for (g.get().items) |p| {
-                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtrConst().*, .value = p.Pair.second.asPtrConst().* });
             }
         },
         .Array, .Sequence, .Range => {
@@ -188,7 +188,7 @@ pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
             };
             defer if (runtime.freeScratch()) a.free(items);
             for (items) |p| {
-                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtrConst().*, .value = p.Pair.second.asPtrConst().* });
             }
         },
         else => return typeErr("Map.plus expects a Pair, Map, or Iterable<Pair>"),
@@ -762,7 +762,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     switch (arg) {
         .Pair => |p| {
             const one = try a.alloc(MapPair, 1);
-            one[0] = .{ .key = p.first.asPtr().*, .value = p.second.asPtr().* };
+            one[0] = .{ .key = p.first.asPtrConst().*, .value = p.second.asPtrConst().* };
             to_add = one;
         },
         .Map => |m| to_add = try snapshotEntries(a, m.entries),

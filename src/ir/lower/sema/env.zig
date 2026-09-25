@@ -19,6 +19,7 @@ const bridge = @import("../../core/bridge.zig");
 const builder = @import("builder.zig");
 const records = @import("records.zig");
 const call = @import("call.zig");
+const locals = @import("locals.zig");
 
 const Builder = builder.Builder;
 const Error = records.Error;
@@ -492,18 +493,33 @@ pub fn homeOf(b: *Builder, s: Sym) Error!?builder.Home {
 
 /// Gives local `s` its home, holding `value`: a cell when a nested body
 /// shares it, a register of its own when it is a `var`, and `value`'s
-/// register itself for a `val`, which nothing writes again.
+/// register itself for a `val`, which nothing writes again. A `val` bound
+/// to a `var`'s register, which the `var`'s writes change, copies it.
 pub fn bindLocal(b: *Builder, s: Sym, value: Reg) Error!void {
+    return bindLocalFrom(b, s, value, null);
+}
+
+/// `bindLocal` of a value lowered since `from`: a `var` takes the value's
+/// register as its home when nothing else holds it (`locals.adoptable`).
+pub fn bindLocalFrom(b: *Builder, s: Sym, value: Reg, from: ?locals.Mark) Error!void {
     const home: builder.Home = if (b.p.br.isCell(s)) blk: {
         const dst = b.newReg();
         try b.emit(.{ .MakeCell = .{ .dst = dst, .src = value } });
         break :blk .{ .cell = dst };
     } else if (b.p.s.syms.flags(s).mutable) blk: {
-        const dst = b.newReg();
-        try b.emit(.{ .Move = .{ .dst = dst, .src = value } });
+        const adopt = if (from) |m| locals.adoptable(b, m, value) else false;
+        const dst = if (adopt) value else try moved(b, value);
+        try b.var_homes.put(b.p.a, dst, {});
         break :blk .{ .reg = dst };
-    } else .{ .reg = value };
+    } else if (b.var_homes.contains(value)) .{ .reg = try moved(b, value) } else .{ .reg = value };
     try b.locals.put(b.p.a, s, home);
+}
+
+/// `value` in a register of its own.
+fn moved(b: *Builder, value: Reg) Error!Reg {
+    const dst = b.newReg();
+    try b.emit(.{ .Move = .{ .dst = dst, .src = value } });
+    return dst;
 }
 
 /// Gives local `s` a home of its own before its first assignment
@@ -518,22 +534,20 @@ pub fn declareLocal(b: *Builder, s: Sym) Error!void {
     } else {
         try b.emit(.{ .Move = .{ .dst = dst, .src = nul } });
         try b.locals.put(b.p.a, s, .{ .reg = dst });
+        if (b.p.s.syms.flags(s).mutable) try b.var_homes.put(b.p.a, dst, {});
     }
 }
 
-/// The value of local or parameter `s`. A `var` in a register is copied,
-/// so a later write cannot change a value already read; a delegated local
-/// asks its delegate; a `lateinit` local is checked.
+/// The value of local or parameter `s`. A `var` in a register is read
+/// where it stands, unless the construct being lowered writes it before
+/// the value is used (`locals.mustCopy`), when it is copied; a delegated
+/// local asks its delegate; a `lateinit` local is checked.
 pub fn readLocal(b: *Builder, s: Sym) Error!Reg {
     if (delegatedLocal(b, s)) |prop| return readDelegated(b, s, prop);
     const home = (try homeOf(b, s)) orelse return unreachable_(b, s);
     const v = switch (home) {
         .cell => |c| try cellGet(b, c),
-        .reg => |r| if (b.locals.contains(s) and b.p.s.syms.flags(s).mutable) blk: {
-            const dst = b.newReg();
-            try b.emit(.{ .Move = .{ .dst = dst, .src = r } });
-            break :blk dst;
-        } else r,
+        .reg => |r| if (b.var_homes.contains(r) and try locals.mustCopy(b, b.p.s.str(b.p.s.syms.name(s)))) try moved(b, r) else r,
     };
     if (lateinitLocal(b.p.s, s)) |prop| {
         const dst = b.newReg();
@@ -547,6 +561,13 @@ pub fn readLocal(b: *Builder, s: Sym) Error!Reg {
 /// Stores `value` into local `s`: its register or its cell, or through
 /// its delegate.
 pub fn writeLocal(b: *Builder, s: Sym, value: Reg) Error!void {
+    return writeLocalFrom(b, s, value, null);
+}
+
+/// `writeLocal` of a value lowered since `from`: the instruction that
+/// computed it writes the local's register itself when it can
+/// (`locals.retarget`).
+pub fn writeLocalFrom(b: *Builder, s: Sym, value: Reg, from: ?locals.Mark) Error!void {
     if (delegatedLocal(b, s)) |prop| return writeDelegated(b, s, prop, value);
     const home = (try homeOf(b, s)) orelse return unreachable_(b, s);
     switch (home) {
@@ -556,9 +577,21 @@ pub fn writeLocal(b: *Builder, s: Sym, value: Reg) Error!void {
                 const st = b.p.s;
                 return b.fail(b.cur_span, "`{s}` is written by a body that captured it by value", .{st.str(st.syms.name(s))});
             }
+            if (from) |m| if (locals.retarget(b, m, value, r)) return;
             try b.emit(.{ .Move = .{ .dst = r, .src = value } });
         },
     }
+}
+
+/// The register `s` lives in when it is a `var` of this body kept in a
+/// register, which a write replaces with a `Move`.
+pub fn varRegister(b: *Builder, s: Sym) ?Reg {
+    if (delegatedLocal(b, s) != null) return null;
+    const h = b.locals.get(s) orelse return null;
+    return switch (h) {
+        .reg => |r| if (b.var_homes.contains(r)) r else null,
+        .cell => null,
+    };
 }
 
 fn cellGet(b: *Builder, c: Reg) Error!Reg {

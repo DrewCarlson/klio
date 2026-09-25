@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // The real `androidx.compose.foundation` draw modifiers through the real UI
 // engine: `Modifier.background` (colour + shape), `Modifier.border`, and
 // `Image` over an `ImageBitmap` painted with the real graphics stack.

@@ -21,7 +21,6 @@ const ev_activation = @import("activation.zig");
 const ev_diag = @import("diag.zig");
 const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
-const ev_fused = @import("fused.zig");
 const ev_host = @import("host.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
@@ -30,13 +29,14 @@ const EvalError = ev_state.EvalError;
 const EvalResult = ev_flow.EvalResult;
 const EvalTls = ev_state.EvalTls;
 const Frame = ev_frame.Frame;
+const ArgArea = ev_frame.ArgArea;
+const VsMark = ev_state.VsMark;
 const NullHost = ev_host.NullHost;
 const TryFrame = ev_snapshot.TryFrame;
 const callStatsBumpId = ev_diag.callStatsBumpId;
 const currentFrameFunc = ev_state.currentFrameFunc;
 const dumpFrameChainForDiagAlways = ev_diag.dumpFrameChainForDiagAlways;
 const errResult = ev_flow.errResult;
-const fusedExecOpt = ev_fused.fusedExecOpt;
 const gcPopFrame = ev_state.gcPopFrame;
 const gcPushFrame = ev_state.gcPushFrame;
 const lrTraceOn = ev_flow.lrTraceOn;
@@ -66,40 +66,6 @@ pub fn funcOwnedBy(module: *const Module, func: *const Func) bool {
 }
 
 /// Like `eval`, but routes non-trivial dispatch through `H`, a comptime-duck-typed concrete host.
-/// The frameless tier reached straight from a static call site, whose arguments
-/// are still a contiguous register run in the caller.
-///
-/// The activation seam asks the same question, but only after the call has been
-/// turned into a carrier list and handed back through the flat loop. A body that
-/// runs frameless needs none of that: it borrows the caller's values exactly as
-/// the fused tier's own call arm does, and the caller's registers keep them
-/// reachable for the collector. Null means nothing ran and the call takes the
-/// ordinary path.
-///
-/// The preconditions are the seam's, minus the ones a plain positional static
-/// call satisfies by construction: it carries no owning receiver, no closure, no
-/// chain seed and no captures.
-/// `KLIO_FUSE_GATE=1`: which conjunct of the fused tier's entry gate turns a
-/// call away. The gate excludes any call with a receiver, which is what
-/// `engine/member-calls-frameless` exists to change, and this says what that
-/// is worth before the work starts.
-pub var fuse_gate_counts: [5]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0));
-var fuse_gate_state: u8 = 0;
-
-pub fn fuseGateProbeOn() bool {
-    if (fuse_gate_state == 0)
-        fuse_gate_state = if (runtime.envOnce("KLIO_FUSE_GATE") != null) 2 else 1;
-    return fuse_gate_state == 2;
-}
-
-pub fn fuseGateDump() void {
-    if (!fuseGateProbeOn()) return;
-    const names = [_][]const u8{ "has_receiver", "is_closure", "has_captures", "native_backed", "offered" };
-    for (names, 0..) |n, i| {
-        const v = fuse_gate_counts[i].load(.monotonic);
-        if (v != 0) std.debug.print("[fuse-gate] {d:>8}  {s}\n", .{ v, n });
-    }
-}
 
 pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), host: *H) Allocator.Error!EvalResult {
     dumpFnIfRequested(func);
@@ -255,7 +221,8 @@ fn frameMatchesLabel(func: *const Func, label: []const u8) bool {
 
 /// Runs `func` over `args` and `captures` as closure `closure_id` (null for a
 /// plain call), reading its ids against `module`; `owning` is the sub-module
-/// a suspension resumes in.
+/// a suspension resumes in. The lists' values are borrowed: they move into an
+/// argument area and the lists are freed.
 pub fn evalClosure(
     comptime H: type,
     allocator: Allocator,
@@ -267,40 +234,42 @@ pub fn evalClosure(
     closure_id: ?u64,
     host: *H,
 ) Allocator.Error!EvalResult {
-    dumpFnIfRequested(func);
-    boolThisTrap(func, args.items);
-    // The recursive call seam, the one point every interpreted call passes through.
-    // The fused tier at the same seam: no Frame at all, raising real errors rather than abandoning.
-    // `allow_materialize` is false: a body the walker cannot finish pays the tier's entry AND the
-    // frame it then opens, and measured against a recomposer frame that trade is a loss of 2.9%.
-    // Only a body the walker runs to completion takes this path.
-    if (fuseGateProbeOn()) {
-        const slot: usize = if (owning != null)
-            0
-        else if (closure_id != null)
-            1
-        else if (captures.items.len != 0)
-            2
-        else
-            4;
-        _ = fuse_gate_counts[slot].fetchAdd(1, .monotonic);
-    }
-    if (owning == null and closure_id == null and captures.items.len == 0) {
-        if (try fusedExecOpt(H, allocator, module, func, args.items, host, false)) |fr| {
-            var a = args;
-            a.deinit(allocator);
-            var c = captures;
-            c.deinit(allocator);
-            return fr;
-        }
-    }
-    callStatsBumpId(func.fqn, func.id.int(), module);
+    var a = args;
+    var c = captures;
+    defer a.deinit(allocator);
+    defer c.deinit(allocator);
+    const ar = try ArgArea.push(ev_state.evtlsPtr(), a.items, c.items);
+    const np = a.items.len;
+    return evalView(H, allocator, module, owning, func, ar.vals[0..np], ar.vals[np..], ar.mark, closure_id, host);
+}
+
+/// `evalClosure` over parameter and capture views: a run of the caller's
+/// registers, or the argument area pushed at `at`, which the frame takes over.
+pub fn evalView(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    owning: ?*const Module,
+    func: *const Func,
+    params: []const Value,
+    captures: []const Value,
+    at: ?VsMark,
+    closure_id: ?u64,
+    host: *H,
+) Allocator.Error!EvalResult {
     const ev: *EvalTls = ev_state.evtlsPtr();
+    dumpFnIfRequested(func);
+    boolThisTrap(func, params);
+    callStatsBumpId(func.fqn, func.id.int(), module);
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
-    var frame = try Frame.newWithCaptures(ev, allocator, module, func, args, captures);
+    var frame: Frame = undefined;
+    frame.enter(ev, allocator, module, func, params, captures, at) catch |e| {
+        if (at) |m| ev.vstack.restore(m);
+        return e;
+    };
     frame.closure_id = closure_id;
-    defer frame.deinit();
+    defer frame.deinitIn(ev);
     gcPushFrame(&frame);
     defer gcPopFrame(&frame);
     frame.module_arc = owning;

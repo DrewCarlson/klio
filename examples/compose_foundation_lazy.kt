@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // The real androidx.compose.foundation LazyColumn through the real UI engine:
 // SubcomposeLayout drives per-item subcomposition (only visible indices
 // compose), items measure through the real text stack, and LazyListState

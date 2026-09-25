@@ -212,11 +212,6 @@ pub const VmHost = struct {
     pub const makeResolvedClosure = host_resolved.makeResolvedClosure;
     pub const resolvedClosure = host_resolved.resolvedClosure;
     pub const resumeValue = host_resolved.resumeValue;
-    pub const undispatchedBarrierPark = host_call_value.undispatchedBarrierPark;
-    pub const undispatchedScopeLeave = host_call_value.undispatchedScopeLeave;
-    pub const rootPumpBarrierPark = host_call_value.rootPumpBarrierPark;
-    pub const rootPumpFlatComplete = host_call_value.rootPumpFlatComplete;
-    pub const flatCallClosed = host_call_value.flatCallClosed;
     pub const deepValueEquals = builtin_members.deepValueEquals;
     pub const funcRunsItsBody = host_resolved.funcRunsItsBody;
     pub const ownerModuleForFunc = host_resolved.ownerModuleForFunc;
@@ -411,7 +406,7 @@ fn ivPersist(ctx: *anyopaque) IntrinsicHost {
 fn ivCallableReturnTy(ctx: *anyopaque, callable: *const Value) ?[]const u8 {
     const self = ip(ctx);
     if (callable.* != .IrClosure) return null;
-    const info = self.closures.get(@intCast(callable.IrClosure.asPtr().id)) orelse return null;
+    const info = self.closures.get(@intCast(callable.IrClosure.asPtrConst().id)) orelse return null;
     const module_ref = self.module.clone();
     defer module_ref.deinit();
     const module = info.module orelse module_ref.asPtr();

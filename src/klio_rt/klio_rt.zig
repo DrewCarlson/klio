@@ -180,6 +180,7 @@ export fn klio_nat_begin() void {
 /// The safe point, polled at function entry and loop back edges; no borrow is
 /// held across it.
 export fn klio_nat_safepoint() void {
+    runtime.assertNoCellLock();
     if (!runtime.gc.pending()) return;
     runtime.gc.collect();
 }
@@ -367,7 +368,6 @@ export fn klio_nat_cell_set(c: CValue, v: CValue) void {
     const g = cv.Cell.borrowMut();
     defer g.deinit();
     g.get().* = fromC(v);
-    runtime.gc.writeBarrier(&cv.Cell.cell.hdr);
 }
 
 /// The runtime of programs compiled from sema's lowering.

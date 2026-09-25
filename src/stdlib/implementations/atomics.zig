@@ -60,14 +60,15 @@ fn withValueMut(
     }
     const g = ctx.args[0].Instance.borrowMut();
     defer g.deinit();
-    const cur = g.get().get("value") orelse return typeErr("atomic receiver missing `value`");
+    const guard = g.get().beginUpdate();
+    defer guard.end();
+    const cur = guard.get("value") orelse return typeErr("atomic receiver missing `value`");
     const step = f(fctx, cur);
     if (runtime.reclaimEnabled()) {
         step.out.retain();
         step.next.retain();
-        cur.release(ctx.allocator);
     }
-    g.get().define(ctx.allocator, "value", step.next) catch return typeErr("atomic store failed");
+    _ = guard.store(ctx.allocator, "value", step.next);
     return ok(step.out);
 }
 

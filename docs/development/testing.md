@@ -185,8 +185,9 @@ Match the check to the size of the change
   `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest`
 - **One suite**: `zig build itest-<name>`. Never build `itest-bin`
   (all standalone itest binaries) during iteration.
-- **Full gate before a commit**: `scripts/gate.sh` — unit tests, the
-  parity groups, the threaded litmus, e2e and the ktor/concurrency suites,
+- **Full gate before a commit**: `scripts/gate.sh` — the Skia shim
+  (`scripts/fetch-skia.sh`, then `zig build skia-lib`; see the verification
+  playbook), unit tests, the parity groups, the threaded litmus, e2e and the ktor/concurrency suites,
   a tree-keyed reinstall of every shipped pack into `.klio-local`
   (`scripts/refresh-local-packs.sh`), the compose-ui gate, the full example
   corpus through the CLI, the sema census (`scripts/sema-census.py`: no

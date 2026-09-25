@@ -22,12 +22,12 @@ const MUTABLE_BUFFER_SIZE = 33;
 
 var builder_class_hit = std.atomic.Value(usize).init(0);
 
-var fn_root = std.atomic.Value(?[*]const u8).init(null);
-var fn_tail = std.atomic.Value(?[*]const u8).init(null);
-var fn_size = std.atomic.Value(?[*]const u8).init(null);
-var fn_shift = std.atomic.Value(?[*]const u8).init(null);
-var fn_owner = std.atomic.Value(?[*]const u8).init(null);
-var fn_modc = std.atomic.Value(?[*]const u8).init(null);
+var fn_root = runtime.InstanceData.SlotCache.init(0);
+var fn_tail = runtime.InstanceData.SlotCache.init(0);
+var fn_size = runtime.InstanceData.SlotCache.init(0);
+var fn_shift = runtime.InstanceData.SlotCache.init(0);
+var fn_owner = runtime.InstanceData.SlotCache.init(0);
+var fn_modc = runtime.InstanceData.SlotCache.init(0);
 
 pub fn isBuilderClass(inst: ObjRef(InstanceData)) bool {
     const g = inst.borrow();
@@ -176,11 +176,11 @@ fn writeState(a: Allocator, inst: ObjRef(InstanceData), items: []const Value, ow
     const g = inst.borrowMut();
     defer g.deinit();
     const d = g.get();
-    try d.define(a, "root", new_root);
-    try d.define(a, "tail", new_tail);
-    try d.define(a, "size", Value.newInt(@intCast(new_size)));
-    try d.define(a, "rootShift", Value.newInt(new_shift));
-    try d.define(a, "modCount", Value.newInt(new_modc));
+    _ = d.store(a, "root", new_root);
+    _ = d.store(a, "tail", new_tail);
+    _ = d.store(a, "size", Value.newInt(@intCast(new_size)));
+    _ = d.store(a, "rootShift", Value.newInt(new_shift));
+    _ = d.store(a, "modCount", Value.newInt(new_modc));
 }
 
 /// Serve `builder.removeRange(from, to)`: Unit on success, null bails to the body.
@@ -257,9 +257,9 @@ pub fn tryAddAll(a: Allocator, inst: ObjRef(InstanceData), elements: *const Valu
         const g = inst.borrowMut();
         defer g.deinit();
         const d = g.get();
-        try d.define(a, "tail", new_tail);
-        try d.define(a, "size", Value.newInt(@intCast(st.total + k)));
-        try d.define(a, "modCount", Value.newInt(st.modc + 1));
+        _ = d.store(a, "tail", new_tail);
+        _ = d.store(a, "size", Value.newInt(@intCast(st.total + k)));
+        _ = d.store(a, "modCount", Value.newInt(st.modc + 1));
         return .{ .Bool = true };
     }
 

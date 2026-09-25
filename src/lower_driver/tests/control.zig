@@ -676,6 +676,125 @@ fn expectRun(src: []const u8, want: []const u8) !void {
     };
 }
 
+test "adds, subtracts and compares give Kotlin's answers for every operand pairing" {
+    // Two Ints or two Longs take the ops' own paths; mixed widths, Doubles, Chars, Strings
+    // and nullable operands run the general operator.
+    try expectRun(
+        \\fun cmp(a: Int, b: Int): String = "${a < b}${a <= b}${a == b}${a != b}${a > b}${a >= b}"
+        \\fun cmpL(a: Long, b: Long): String = "${a < b}${a <= b}${a == b}${a != b}${a > b}${a >= b}"
+        \\fun main() {
+        \\    println(Int.MAX_VALUE + 1)
+        \\    println(Int.MIN_VALUE - 1)
+        \\    println(Long.MAX_VALUE + 1L)
+        \\    println(3 - 5L)
+        \\    println(2 + 0.5)
+        \\    println('a' + 2)
+        \\    println('c' - 'a')
+        \\    println("s" + 1)
+        \\    println(cmp(1, 2) + " " + cmp(2, 2) + " " + cmp(3, 2))
+        \\    println(cmpL(-1L, 0L) + " " + cmpL(7L, 7L) + " " + cmpL(Long.MAX_VALUE, Long.MIN_VALUE))
+        \\    println(1.5 < 2 && 2L > 1 && 'a' < 'b' && "a" < "b")
+        \\    val n: Int? = if (cmp(1, 1).length > 3) 4 else null
+        \\    println(n == 4)
+        \\    var hits = 0
+        \\    for (i in 0 until 10) if (i >= 3 && i != 7) hits = hits + 1
+        \\    println(hits)
+        \\}
+    ,
+        "-2147483648\n2147483647\n-9223372036854775808\n-2\n2.5\nc\n2\ns1\n" ++
+            "truetruefalsetruefalsefalse falsetruetruefalsefalsetrue falsefalsefalsetruetruetrue\n" ++
+            "truetruefalsetruefalsefalse falsetruetruefalsefalsetrue falsefalsefalsetruetruetrue\n" ++
+            "true\ntrue\n6\n",
+    );
+}
+
+test "statics, init-guarded calls, captures and class tests read in place give Kotlin's answers" {
+    // The first call into another file runs that file's initializer; later reads, a write
+    // and a lambda's captures read in place; `is` and `as` settle nulls and instances in
+    // place and leave primitives, closures and a failing `as` to the full test.
+    driver.expectOutput(&.{
+        \\val registry = mutableListOf<String>().also { println("init registry") }
+        \\var counter = 10
+        \\fun bump(): Int { counter = counter + 1; return counter }
+        ,
+        \\open class Animal(val name: String)
+        \\class Dog(name: String) : Animal(name)
+        \\class Cat(name: String) : Animal(name)
+        \\fun describe(x: Any?): String = when {
+        \\    x is Dog -> "dog ${x.name}"
+        \\    x is Animal -> "animal ${x.name}"
+        \\    x is Int -> "int $x"
+        \\    x == null -> "null"
+        \\    else -> "other"
+        \\}
+        \\fun main() {
+        \\    println("start")
+        \\    println(bump() + bump())
+        \\    registry.add("a")
+        \\    println(registry)
+        \\    println(counter)
+        \\    val step = 3
+        \\    val add = { n: Int -> n + step + counter }
+        \\    println(add(1))
+        \\    val xs: List<Any?> = listOf(Dog("rex"), Cat("tom"), 5, null, "s", { 1 })
+        \\    for (x in xs) println(describe(x))
+        \\    val a: Any? = Cat("kit")
+        \\    println((a as? Dog)?.name)
+        \\    println((a as Animal).name)
+        \\    println((null as? Animal) == null)
+        \\    try {
+        \\        println((a as Dog).name)
+        \\    } catch (e: ClassCastException) {
+        \\        println("cast failed")
+        \\    }
+        \\}
+    }, "start\ninit registry\n23\n[a]\n12\n16\n" ++
+        "dog rex\nanimal tom\nint 5\nnull\nother\nother\n" ++
+        "null\nkit\ntrue\ncast failed\n") catch |err| {
+        if (err == error.Unsupported) return error.SkipZigTest;
+        return err;
+    };
+}
+
+test "functions with try regions run from calls in a loop, their finallys and catches in order" {
+    // Each callee enters a try region at its first block, returns from inside it through its
+    // finally, and a catch-only try's join pops its frame on normal flow.
+    try expectRun(
+        \\var log = ""
+        \\fun guarded(i: Int): Int {
+        \\    try {
+        \\        if (i % 3 == 0) return i * 10
+        \\        if (i % 3 == 1) throw IllegalStateException("odd $i")
+        \\        log = log + " b$i"
+        \\    } catch (e: IllegalStateException) {
+        \\        log = log + " c$i"
+        \\        return -i
+        \\    } finally {
+        \\        log = log + " f$i"
+        \\    }
+        \\    return i
+        \\}
+        \\fun caught(i: Int): Int {
+        \\    var r = 0
+        \\    try {
+        \\        if (i == 2) throw RuntimeException("x")
+        \\        r = i
+        \\    } catch (e: RuntimeException) {
+        \\        r = 100
+        \\    }
+        \\    return r + 1
+        \\}
+        \\fun main() {
+        \\    var sum = 0
+        \\    for (i in 0 until 6) sum = sum + guarded(i) + caught(i)
+        \\    println(sum)
+        \\    println(log)
+        \\}
+    ,
+        "151\n f0 c1 f1 b2 f2 f3 c4 f4 b5 f5\n",
+    );
+}
+
 test "a when guard runs once its pattern matches, and a failed guard falls through" {
     try expectRun(
         \\sealed interface S
@@ -1418,13 +1537,20 @@ test "String.compareTo answers the difference at the first unequal character" {
     , "-2\n1\ntrue\n-1\n");
 }
 
+/// Arms a 50 ms wall cap as `main` starts. Armed any earlier, the compile
+/// spends it: under a loaded build the deadline has passed before `main`
+/// runs, and the first check fires wherever the block counter's phase puts
+/// it, outside the program's `try` included.
+fn armWallCapAtMain() void {
+    ir.eval.wall_cap_fires.store(0, .monotonic);
+    ir.eval.test_wall_deadline_ms.store(ir.eval.nowMonotonicMs() + 50, .monotonic);
+}
+
 test "a wall-capped program that catches its timeout gets another, so its finallys run" {
     // A caught timeout is not the end of the program: the next expiry throws
     // again rather than aborting past the `finally` that restores `inside`.
     const saved_unwind = ir.eval.wall_cap_unwind_ms.load(.monotonic);
     ir.eval.wall_cap_unwind_ms.store(50, .monotonic);
-    ir.eval.wall_cap_fires.store(0, .monotonic);
-    ir.eval.test_wall_deadline_ms.store(ir.eval.nowMonotonicMs() + 50, .monotonic);
     defer {
         ir.eval.test_wall_deadline_ms.store(0, .monotonic);
         ir.eval.wall_cap_fires.store(0, .monotonic);
@@ -1433,7 +1559,7 @@ test "a wall-capped program that catches its timeout gets another, so its finall
         @import("runtime").setRunBoundaryAbandon(false);
         @import("runtime").clearAbandon();
     }
-    try expectRun(
+    driver.expectOutputWith(&.{
         \\var inside = false
         \\fun spin(): Int {
         \\    var n = 0
@@ -1451,5 +1577,41 @@ test "a wall-capped program that catches its timeout gets another, so its finall
         \\    }
         \\    println("caught $caught, inside $inside")
         \\}
-    , "caught 2, inside false\n");
+    }, "caught 2, inside false\n", armWallCapAtMain) catch |err| {
+        if (err == error.Unsupported) return error.SkipZigTest;
+        return err;
+    };
+}
+
+test "a loop closed by its condition's branch, with forward edges inside, still reaches the wall cap" {
+    // Only an edge back to its own or an earlier block polls; this loop's back edge is the
+    // do-while's compare-and-branch, and its body only jumps forward.
+    const saved_unwind = ir.eval.wall_cap_unwind_ms.load(.monotonic);
+    ir.eval.wall_cap_unwind_ms.store(50, .monotonic);
+    defer {
+        ir.eval.test_wall_deadline_ms.store(0, .monotonic);
+        ir.eval.wall_cap_fires.store(0, .monotonic);
+        ir.eval.wall_cap_unwind_ms.store(saved_unwind, .monotonic);
+        @import("runtime").setRunBoundaryAbandon(false);
+        @import("runtime").clearAbandon();
+    }
+    driver.expectOutputWith(&.{
+        \\fun spin(): Int {
+        \\    var n = 0
+        \\    do {
+        \\        if (n % 4 == 0) n = n + 2 else n = n + 6
+        \\    } while (n >= 0)
+        \\    return n
+        \\}
+        \\fun main() {
+        \\    try {
+        \\        println(spin())
+        \\    } catch (e: RuntimeException) {
+        \\        println("stopped")
+        \\    }
+        \\}
+    }, "stopped\n", armWallCapAtMain) catch |err| {
+        if (err == error.Unsupported) return error.SkipZigTest;
+        return err;
+    };
 }

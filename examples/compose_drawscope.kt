@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // The real androidx.compose.ui.graphics.drawscope.DrawScope — the upstream
 // drawing DSL a desktop Compose `Canvas { … }` composable ultimately runs. The
 // vendored CanvasDrawScope drives klio's Canvas actual over the Skia shim;

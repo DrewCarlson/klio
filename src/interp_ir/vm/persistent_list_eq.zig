@@ -22,11 +22,11 @@ const LOG_BRANCH = 5;
 var small_class_hit = std.atomic.Value(usize).init(0);
 var vec_class_hit = std.atomic.Value(usize).init(0);
 
-var fn_buffer = std.atomic.Value(?[*]const u8).init(null);
-var fn_size = std.atomic.Value(?[*]const u8).init(null);
-var fn_shift = std.atomic.Value(?[*]const u8).init(null);
-var fn_tail = std.atomic.Value(?[*]const u8).init(null);
-var fn_root = std.atomic.Value(?[*]const u8).init(null);
+var fn_buffer = runtime.InstanceData.SlotCache.init(0);
+var fn_size = runtime.InstanceData.SlotCache.init(0);
+var fn_shift = runtime.InstanceData.SlotCache.init(0);
+var fn_tail = runtime.InstanceData.SlotCache.init(0);
+var fn_root = runtime.InstanceData.SlotCache.init(0);
 
 fn classMatches(inst: ObjRef(InstanceData), hit: *std.atomic.Value(usize), fqn: []const u8) bool {
     const g = inst.borrow();

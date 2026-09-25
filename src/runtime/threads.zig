@@ -128,8 +128,13 @@ pub fn runBoundaryAbandonActive() bool {
 /// two are not: `thread_abandonable` is threadlocal, and on Darwin every read
 /// of it is a `_tlv_get_addr` call. This guard runs on every branch and back
 /// edge the evaluator takes, and abandonment is off for all but the last
-/// instants of a run, so the ordinary answer now costs one acquire load.
-pub fn shouldAbandon() bool {
+/// instants of a run, so the ordinary answer is one load, inline.
+pub inline fn shouldAbandon() bool {
+    if (!abandon_requested.load(.monotonic)) return false;
+    return shouldAbandonRequested();
+}
+
+fn shouldAbandonRequested() bool {
     if (!abandon_requested.load(.acquire)) return false;
     return thread_abandonable or run_boundary_abandon.load(.acquire);
 }

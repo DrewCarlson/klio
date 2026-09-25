@@ -2,15 +2,13 @@
 // real worker threads (a `ByteChannel` can be written from a
 // `Dispatchers.Default` worker while another coroutine's driver
 // reads), so these are real locks. `synchronized` delegates to
-// `kotlin.synchronized` — the host's per-object reentrant monitor,
-// keyed on the lock's identity — and `ReentrantLock`'s methods are
-// host-bound (see the pack's native bindings) to the same monitor:
-// `lock()` blocks until owned (reentrant), `tryLock()` is a
-// non-blocking acquire, `unlock()` releases one level. `withLock`
-// runs the action with the monitor held and releases it through
-// try/finally so an exception leaves the lock released. The
-// `ReentrantLock` Kotlin bodies are placeholders the installed host
-// bindings shadow at dispatch time.
+// `kotlin.synchronized`, the host's per-object reentrant monitor keyed
+// on the lock's identity. `ReentrantLock`'s methods are external, bound
+// (see the pack's native bindings) to the same monitor: `lock()` blocks
+// until owned (reentrant), `tryLock()` is a non-blocking acquire,
+// `unlock()` releases one level. `withLock` runs the action with the
+// monitor held and releases it through try/finally, so an exception
+// leaves the lock released.
 
 package io.ktor.utils.io.locks
 
@@ -21,9 +19,9 @@ public actual open class SynchronizedObject actual constructor()
 
 @InternalAPI
 public actual class ReentrantLock {
-    public actual fun lock() {}
-    public actual fun tryLock(): Boolean = true
-    public actual fun unlock() {}
+    public actual external fun lock()
+    public actual external fun tryLock(): Boolean
+    public actual external fun unlock()
 }
 
 @InternalAPI

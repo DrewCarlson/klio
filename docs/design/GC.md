@@ -20,7 +20,7 @@ multi-thread / coroutine / closure / host-temporary close-out):
   registry, `collect`, the epoch mark, and the KLIO_GC_STRESS / KLIO_GC_NOFREE /
   KLIO_GC_POISON oracles). The default arena path is unchanged (the collector is
   inert unless `gc_enabled`).
-- Multi-thread STW with thread roots: `stop_flag` / `parked_count` / `parkForStop`
+- Multi-thread STW with thread roots: the stop word / `parked_count` / `parkForStop`
   rendezvous and `registerThreadRoot` / `markThreadRoots` bring real-threaded
   programs (Dispatchers.Default, withContext(IO), cross-dispatcher channels) under
   the collector byte-identically to the arena baseline.
@@ -35,6 +35,73 @@ multi-thread / coroutine / closure / host-temporary close-out):
 - Slab page-return with idle hysteresis (`src/runtime/slab.zig`): same-size cells
   grouped into slabs, `munmap` on last-free, and MAP_FIXED decommit of stably-idle
   slab pages so RSS tracks the live set.
+- Generational collection: minors sweep the nursery and stop marking at tenured
+  cells; a store into a tenured cell puts it in the remembered set. A tenured
+  array of at least 64 elements whose stores name their index (`borrowMutAt`)
+  remembers only the index range they touched, so a minor retraces that range
+  instead of the whole array; an append remembers the indices it lands at.
+- The sweep runs off the pause. A mark tenures every nursery cell it reaches
+  as it reaches it, so the world restarts right after marking: the collector
+  detaches the nursery (and, for a major, the tenured list) and hands them to
+  a sweeper thread, which frees the white cells and relinks the survivors
+  while the mutators run. The next collection, and anything that walks the
+  lists, waits for that sweep first. `KLIO_GC_SWEEP=pause` keeps the sweep in
+  the stop.
+- A major can span stops (`KLIO_GC_MAJOR=slices`). It begins in a minor's
+  stop: with the minor done every live cell is tenured, and the roots
+  shaded then are the major's snapshot. Between stops the major traces
+  tenured cells only and passes over nursery cells. Every minor while it
+  runs hands the major the cells the write barrier remembered in that
+  minor's window (whole cells and index ranges) that the major has marked,
+  since one it has not reached yet is traced whole when it is, and shades
+  the survivors it promoted into the major; a slice then traces
+  `KLIO_GC_SLICE` cells beyond what the minor handed it, grey ones first
+  and then the remembered ones. When
+  none is left, the next collection is the remark: it shades the roots
+  again, retraces the marked cells remembered since the last minor and any
+  still waiting, marks the nursery with the major's epoch, and drains. A
+  nursery sweep keeps a cell by its generation, since the major re-stamps
+  a promoted survivor's mark before the sweeper reads it.
+
+  Why the remark finds every live cell: a store into a cell the major has
+  traced goes through the write barrier, which puts a tenured cell on the
+  remembered set once per minor window, and every window's set reaches the
+  major, so each such cell is retraced with what it holds by the end. A
+  cell born during the major stays a nursery cell until a minor promotes
+  it, which shades it into the major, or the remark reaches it. Whatever
+  holds a newborn cell is a root, another nursery cell, or a tenured cell
+  stored into after the newborn existed, and that store was remembered. So
+  the remark, tracing from the roots and the remembered cells through the
+  nursery, reaches every newborn cell still live and, through it, any
+  tenured cell only it holds that the major has not traced yet.
+
+  `KLIO_GC_VERIFY` checks exactly this. After each slice it traces every
+  cell the major marked that is not due a retrace (not grey, not
+  remembered since) and reports an unmarked child: a store into a traced
+  cell no barrier recorded, or a child a tracer skipped. After the remark
+  it checks that the marked set is closed, so the sweep frees nothing a
+  kept cell holds. A tracer that records a frozen structure as fully traced
+  (`gc_quiesced`) does so only for a mark that `marksWhole`, never between
+  a spanning major's stops.
+- The marking thread (`KLIO_GC_MAJOR=concurrent`, the default) traces a spanning major
+  between its stops while the mutators run, 256 cells a batch. It is not a
+  mutator: it holds `major_lock` while it traces a batch, and a collection
+  takes that lock once the mutators have stopped, so the major's lists and
+  marks change hands only between batches and a stop waits at most one
+  batch for it. It reads each cell under the cell's shared lock, which no
+  stopped thread holds (`assertNoCellLock` at every safe point and blocking
+  bracket). With nothing left to trace it runs the remark as a collection of
+  its own; raising a stop sets the pending flag the mutators poll, so they
+  park at their next poll rather than at the next collection an allocation
+  asks for. Minors while it runs stay stop-the-world and report as minors.
+  Releasing a heap's memory (`forgetRanges`) ends a major in progress, which
+  frees nothing: it would go on tracing cells live when it began, and one of
+  those may hold a cell in the released memory.
+- Waiting goes through the OS. A thread waiting out a stop, and the collector
+  waiting for the mutators to park, spin briefly, yield a few times and then
+  sleep on a gate (a pthread mutex and condition with a sleeper count). The
+  thread that ends a stop, parks, or enters a blocking bracket while a stop is
+  raised wakes the gate's sleepers; waking costs one load when nobody sleeps.
 
 Open next tier: Stage 2 (generational nursery) and Stage 3 (incremental/concurrent
 marking), both below. External-byte accounting is now part of the shipped
@@ -45,8 +112,9 @@ collector; its remaining stress hardening is described directly below.
 
 The Appel trigger (`threshold = max(floor, live*2)`) only counts bytes on the
 sweep registry — refcounted cells. But two large allocation classes live in libc
-storage OUTSIDE the registry: frame register buffers (`acquireRegs`) and
-suspension snapshots (the `dupe`d regs/params/captures a park captures). They are
+storage OUTSIDE the registry: the value stack's segments, which hold every
+frame's registers and argument areas, and suspension snapshots (the `dupe`d
+regs/params/captures a park captures). They are
 traced through the frame chain (never swept directly), so they are sound, but
 their growth never advances the trigger. Consequence: a program that builds a
 deep suspended chain (DeepRecursive, a long generator) keeps the trigger pinned
@@ -56,8 +124,9 @@ observed quadratic in `runFrameInner` self-time.
 The fix is enabled by default (`external_accounting` in `gc.zig`, with
 `KLIO_GC_EXT=0` retained as a diagnostic override): `noteExternalBytes` /
 `noteExternalFreed` add/subtract these buffers
-at their acquire/release/pool-transition sites (`acquireRegs`, `releaseRegs`
-pool return, the snapshot `dupe`, `freeSnapshotBuffers`), and `external_live`
+where they are allocated and freed (a value-stack segment's first allocation,
+the heap block of a frame taken off the stack, the snapshot `dupe`,
+`freeSnapshotBuffers`), and `external_live`
 feeds the threshold as `max(floor, (live + external_live)*2)`. With it on,
 DeepRecursive at 150k levels dropped 33s → 17s in the original measurement.
 On the current 100k-depth upstream test, the same change reduces the JIT-off

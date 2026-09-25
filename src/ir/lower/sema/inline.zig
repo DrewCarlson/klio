@@ -5,7 +5,10 @@
 //!
 //! The callee is lowered once, as an ordinary function. Copying it:
 //!
-//! - `LoadParam i` becomes a `Move` from the run's register `i`.
+//! - A parameter's register, and each single-assignment copy of it, is
+//!   the run's register `i` itself: its `LoadParam` and the copies are
+//!   dropped (`aliases`). A register of an argument run the body makes
+//!   keeps its own number, and its `LoadParam` becomes a `Move`.
 //! - A parameter the call passes a lambda literal for, and which the body
 //!   only calls (through its `LoadParam` register or single-assignment
 //!   copies of it), has each `RCallValue` on it replaced by the literal
@@ -15,8 +18,9 @@
 //!   (stores it, captures it in a closure) takes the literal as a closure.
 //! - A dynamic type test on a reified type value the caller gave as a
 //!   class literal becomes a static one.
-//! - `Return v` becomes a move into the call's result and a jump to its
-//!   join. The body's `try` frames armed there are left on the way, each
+//! - `Return v` becomes a move into the call's result, or the instruction
+//!   computing `v` writes the result when nothing else reads `v`, and a
+//!   jump to its join. The body's `try` frames armed there are left on the way, each
 //!   popped and its `finally` replayed from the copied IR, innermost
 //!   first, as the VM does for a real return. A jump out of a literal
 //!   lowered in place leaves them the same way (`FinallyReplay`).
@@ -84,6 +88,12 @@ pub const Instance = struct {
     lambdas: []const ?*const ast.Expr,
     /// By callee register: the parameter it holds unchanged, if any.
     param_of: []const ?u16,
+    /// By callee register: the parameter whose caller register the copy
+    /// reads in its place, with no move (`aliases`).
+    alias: []const ?u16,
+    /// By callee register: defined once and read only by a `return`, so
+    /// the instruction defining it can write the call's result instead.
+    returned: []const bool,
     result: Reg,
     join: BlockId,
 };
@@ -137,6 +147,8 @@ pub fn instantiate(b: *Builder, rec: *const CallRec, callee: FuncId, run: []cons
         .uses = uses,
         .lambdas = lambdas,
         .param_of = param_of,
+        .alias = try aliases(a, f, param_of, uses),
+        .returned = try returnedOnly(a, f),
         .result = result,
         .join = join,
     };
@@ -184,6 +196,62 @@ fn ensureLowered(b: *Builder, callee: FuncId) Error!void {
 
 /// By callee register: the parameter whose value it holds unchanged, from
 /// its only definition: `LoadParam`, or a `Move` from such a register.
+/// The callee registers the copy reads from the caller's argument
+/// registers directly: a parameter's value, or a copy of it, that nothing
+/// writes again. A parameter never changes and the caller does not write
+/// an argument's register while the call runs (`locals.Hazard`), so the
+/// value is the same. A slot of an argument run stays the callee's own,
+/// since a run's registers are contiguous; so does an in-place literal's
+/// parameter, which the copy calls rather than reads.
+fn aliases(a: Allocator, f: *const ir.Func, param_of: []const ?u16, uses: []const ParamUse) Error![]const ?u16 {
+    const out = try a.dupe(?u16, param_of);
+    for (out) |*o| if (o.*) |i| {
+        if (i >= uses.len or uses[i] != .value) o.* = null;
+    };
+    for (f.blocks) |blk| for (blk.insts) |inst| switch (inst) {
+        inline else => |x| if (@hasField(@TypeOf(x), "args") and @hasField(@TypeOf(x), "n_args")) {
+            var k: u32 = 0;
+            while (k < x.n_args) : (k += 1) {
+                const r = x.args.int() + k;
+                if (r < out.len) out[r] = null;
+            }
+        },
+    };
+    return out;
+}
+
+/// The callee registers defined once and read by nothing but one `return`.
+fn returnedOnly(a: Allocator, f: *const ir.Func) Error![]const bool {
+    const n = f.n_locals;
+    const Count = struct {
+        defs: []u32,
+        uses: []u32,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (r.int() >= c.defs.len) return;
+            if (is_def) c.defs[r.int()] += 1 else c.uses[r.int()] += 1;
+        }
+    };
+    const c: Count = .{ .defs = try a.alloc(u32, n), .uses = try a.alloc(u32, n) };
+    @memset(c.defs, 0);
+    @memset(c.uses, 0);
+    const returns = try a.alloc(u32, n);
+    @memset(returns, 0);
+    for (f.blocks) |blk| {
+        for (blk.insts) |*inst| ir.visitInstRegs(inst, c, Count.cb);
+        ir.visitTerminatorRegs(&blk.terminator, c, Count.cb);
+        for (blk.h().catches) |h| Count.cb(c, h.exception_reg, true);
+        switch (blk.terminator) {
+            .Return => |v| if (v) |r| if (r.int() < n) {
+                returns[r.int()] += 1;
+            },
+            else => {},
+        }
+    }
+    const out = try a.alloc(bool, n);
+    for (out, 0..) |*o, i| o.* = c.defs[i] == 1 and c.uses[i] == 1 and returns[i] == 1;
+    return out;
+}
+
 fn paramRegisters(a: Allocator, f: *const ir.Func) Error![]const ?u16 {
     const n = f.n_locals;
     const defs = try a.alloc(u32, n);
@@ -400,7 +468,7 @@ fn copyBlock(b: *Builder, inst: *const Instance, k: u32, tg: Target) Error!void 
         }
     }
     switch (blk.terminator) {
-        .Return => |v| try returnExit(b, inst, k, tg, if (v) |r| mapReg(inst, r) else null),
+        .Return => |v| try returnExit(b, inst, k, tg, v),
         else => |t| b.terminate(try mapTerminator(b, inst, tg, t)),
     }
 }
@@ -408,9 +476,12 @@ fn copyBlock(b: *Builder, inst: *const Instance, k: u32, tg: Target) Error!void 
 fn copyInst(b: *Builder, inst: *const Instance, k: u32, tg: Target, x: *const Inst) Error!void {
     switch (x.*) {
         .LoadParam => |lp| {
+            if (aliasOf(inst, lp.dst) != null) return;
             const src = if (lp.idx < inst.run.len) inst.run[lp.idx] else try b.unit();
             return b.emit(.{ .Move = .{ .dst = mapReg(inst, lp.dst), .src = src } });
         },
+        // A copy of a parameter the copy reads from the caller's register.
+        .Move => |m| if (aliasOf(inst, m.dst) != null) return,
         .LoadCapture => return b.fail(b.cur_span, "an inline function's body reads a capture", .{}),
         .RCallValue => |cv| if (paramOf(inst, cv.callee)) |i| {
             if (inst.uses[i] == .in_place) return inPlace(b, inst, k, tg, i, cv);
@@ -550,8 +621,13 @@ fn inPlace(b: *Builder, inst: *const Instance, k: u32, tg: Target, i: u16, cv: a
 
 /// A `return` of the callee: its value into the result, then out of each
 /// armed frame, innermost first, running its finally, then to the join.
-fn returnExit(b: *Builder, inst: *const Instance, k: u32, tg: Target, v: ?Reg) Error!void {
-    try b.emit(.{ .Move = .{ .dst = inst.result, .src = v orelse try b.unit() } });
+/// A copied `return v`: `v` into the call's result, written by the
+/// instruction that computed it when `v` is read by nothing else.
+fn returnExit(b: *Builder, inst: *const Instance, k: u32, tg: Target, callee_v: ?Reg) Error!void {
+    const v: ?Reg = if (callee_v) |r| mapReg(inst, r) else null;
+    if (!(callee_v != null and inst.returned[callee_v.?.int()] and computedLast(b, v.?, inst.result))) {
+        try b.emit(.{ .Move = .{ .dst = inst.result, .src = v orelse try b.unit() } });
+    }
     const frames = inst.at[k];
     var j = frames.len;
     while (j > 0) {
@@ -567,6 +643,24 @@ fn returnExit(b: *Builder, inst: *const Instance, k: u32, tg: Target, v: ?Reg) E
         }
     }
     b.terminate(.{ .Goto = inst.join });
+}
+
+/// When the last instruction of the current block defines `v`, makes it
+/// define `dst` instead.
+fn computedLast(b: *Builder, v: Reg, dst: Reg) bool {
+    if (b.terminated()) return false;
+    const insts = b.blocks.items[b.cur.int()].insts.items;
+    if (insts.len == 0 or b.cur.int() == 0) return false;
+    const last = &insts[insts.len - 1];
+    switch (last.*) {
+        .LoadParam, .LoadCapture, .MakeCell => return false,
+        inline else => |*x| {
+            if (!@hasField(@TypeOf(x.*), "dst")) return false;
+            if (x.dst != v) return false;
+            x.dst = dst;
+            return true;
+        },
+    }
 }
 
 fn popOnExit(b: *Builder, entry: BlockId) Error!void {
@@ -620,7 +714,12 @@ fn replayRegion(b: *Builder, inst: *const Instance, fr: Frame) Error!void {
 }
 
 fn mapReg(inst: *const Instance, r: Reg) Reg {
+    if (aliasOf(inst, r)) |i| if (i < inst.run.len) return inst.run[i];
     return Reg.from(r.int() + inst.base);
+}
+
+fn aliasOf(inst: *const Instance, r: Reg) ?u16 {
+    return if (r.int() < inst.alias.len) inst.alias[r.int()] else null;
 }
 
 fn mapInst(b: *Builder, inst: *const Instance, tg: Target, x: Inst) Error!Inst {

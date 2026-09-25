@@ -20,5 +20,5 @@ fun main() {
     println(describe("hi") { s: String -> s.uppercase() }) // T=String -> is:HI
     println(describe(7) { n: String -> n })        // T=String, 7 is String -> no
     // Explicit type argument still wins over inference.
-    println(classify<Int>(7) { s: String -> s })   // T = Int, 7 is Int -> is
+    println(classify<Int>(7) { n -> n.toString() }) // T = Int, 7 is Int -> is
 }

@@ -137,6 +137,11 @@ const RUNNABLE = [_][]const u8{
     "tl_default_parallel_wall",
     "tl_dispatch_thread_names",
     "tl_spin_handoff",
+    "tl_gc_array_publish",
+    "tl_gc_thread_start",
+    "tl_gc_sweep_promote",
+    "tl_gc_major_slices",
+    "tl_gc_major_concurrent",
     "tl_io_elastic",
     "tl_limited_one",
     "tl_withcontext_io_from_default",
@@ -235,6 +240,21 @@ test "tl_dispatch_thread_names" {
 }
 test "tl_spin_handoff" {
     try check("tl_spin_handoff");
+}
+test "tl_gc_array_publish" {
+    try check("tl_gc_array_publish");
+}
+test "tl_gc_thread_start" {
+    try check("tl_gc_thread_start");
+}
+test "tl_gc_sweep_promote" {
+    try check("tl_gc_sweep_promote");
+}
+test "tl_gc_major_slices" {
+    try check("tl_gc_major_slices");
+}
+test "tl_gc_major_concurrent" {
+    try check("tl_gc_major_concurrent");
 }
 test "tl_io_elastic" {
     try check("tl_io_elastic");

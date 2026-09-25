@@ -178,7 +178,7 @@ pub fn seq_scope_yield(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const inst = g.get();
     const v = if (ctx.args.len > 1) ctx.args[1] else Value.Unit;
     if (runtime.reclaimEnabled()) v.retain();
-    try inst.define(ctx.allocator, seq_value_field, v);
+    _ = inst.store(ctx.allocator, seq_value_field, v);
     _ = inst.set(seq_has_value_field, .{ .Bool = true });
     g.deinit();
     return err(.{ .Suspend = -1 });
@@ -216,7 +216,7 @@ pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const g = ctx.args[0].Instance.borrowMut();
         defer g.deinit();
         if (runtime.reclaimEnabled()) iter.retain();
-        try g.get().define(ctx.allocator, seq_yield_iter_field, iter);
+        _ = g.get().store(ctx.allocator, seq_yield_iter_field, iter);
     }
     return err(.{ .Suspend = -1 });
 }
@@ -559,7 +559,7 @@ pub fn map_entry_key(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return err(.{ .Type = "Map.Entry.key requires a Map.Entry receiver" });
     }
     if (try collections.mapEntryViewGuard(ctx.allocator, &ctx.args[0])) |e| return e;
-    const out = ctx.args[0].MapEntry.key.asPtr().*;
+    const out = ctx.args[0].MapEntry.key.asPtrConst().*;
     out.retain();
     return ok(out);
 }
@@ -569,7 +569,7 @@ pub fn map_entry_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return err(.{ .Type = "Map.Entry.value requires a Map.Entry receiver" });
     }
     if (try collections.mapEntryViewGuard(ctx.allocator, &ctx.args[0])) |e| return e;
-    const out = ctx.args[0].MapEntry.value.asPtr().*;
+    const out = ctx.args[0].MapEntry.value.asPtrConst().*;
     out.retain();
     return ok(out);
 }
@@ -608,9 +608,13 @@ fn materialiseSequenceBounded(
         return .{ .err = .{ .Type = "materialise_sequence: not a Sequence" } };
     }
     if (try collections.oneShotConsumeCheck(allocator, seq_val.*)) |e| return .{ .err = e };
-    const sg = seq_val.Sequence.borrow();
-    defer sg.deinit();
-    const seq = sg.get();
+    // A sequence's source and ops are fixed when it is made: read out of its
+    // borrow, since the ops run lambdas and no cell lock is held across them.
+    const seq = blk: {
+        const sg = seq_val.Sequence.borrow();
+        defer sg.deinit();
+        break :blk sg.get();
+    };
 
     const all_streaming = blk: {
         for (seq.ops) |op| {
@@ -674,7 +678,7 @@ fn materialiseSequenceBounded(
             },
             .Generate => |gen| {
                 var cur: ?Value = if (gen.seed) |s| blk: {
-                    const sv = s.asPtr().*;
+                    const sv = s.asPtrConst().*;
                     if (gen.seed_is_fn) {
                         const r = try invokeCallable(host, &sv, &.{}, out);
                         switch (r) {
@@ -701,7 +705,7 @@ fn materialiseSequenceBounded(
                     } else {
                         // Only the nullary form starts from `next()`.
                         if (gen.seed != null) break;
-                        const r = try invokeCallable(host, gen.next.asPtr(), &.{}, out);
+                        const r = try invokeCallable(host, gen.next.asPtrConst(), &.{}, out);
                         switch (r) {
                             .ok => |rv| {
                                 if (rv == .Null) break;
@@ -728,9 +732,9 @@ fn materialiseSequenceBounded(
                     }
                     if (max) |m| if (output.items.len >= m) break;
                     const nr = if (gen.seed == null)
-                        try invokeCallable(host, gen.next.asPtr(), &.{}, out)
+                        try invokeCallable(host, gen.next.asPtrConst(), &.{}, out)
                     else
-                        try invokeCallable(host, gen.next.asPtr(), &.{candidate}, out);
+                        try invokeCallable(host, gen.next.asPtrConst(), &.{candidate}, out);
                     switch (nr) {
                         .ok => |nv| {
                             if (nv == .Null) break;
@@ -744,7 +748,7 @@ fn materialiseSequenceBounded(
                 }
             },
             .IteratorFn => |fnbox| {
-                const ir = try invokeCallable(host, fnbox.asPtr(), &.{}, out);
+                const ir = try invokeCallable(host, fnbox.asPtrConst(), &.{}, out);
                 const iter = switch (ir) {
                     .ok => |v| v,
                     .err => |e| {
@@ -841,7 +845,7 @@ fn materialiseSequenceBounded(
         .Generate => |gen| {
             const limit: usize = 1024;
             var cur: ?Value = if (gen.seed) |s| blk: {
-                const sv = s.asPtr().*;
+                const sv = s.asPtrConst().*;
                 if (gen.seed_is_fn) {
                     const r = try invokeCallable(host, &sv, &.{}, out);
                     switch (r) {
@@ -864,7 +868,7 @@ fn materialiseSequenceBounded(
                     candidate = v;
                 } else {
                     if (gen.seed != null) break;
-                    const r = try invokeCallable(host, gen.next.asPtr(), &.{}, out);
+                    const r = try invokeCallable(host, gen.next.asPtrConst(), &.{}, out);
                     switch (r) {
                         .ok => |rv| {
                             if (rv == .Null) break;
@@ -878,9 +882,9 @@ fn materialiseSequenceBounded(
                 }
                 try items.append(allocator, candidate);
                 const nr = if (gen.seed == null)
-                    try invokeCallable(host, gen.next.asPtr(), &.{}, out)
+                    try invokeCallable(host, gen.next.asPtrConst(), &.{}, out)
                 else
-                    try invokeCallable(host, gen.next.asPtr(), &.{candidate}, out);
+                    try invokeCallable(host, gen.next.asPtrConst(), &.{candidate}, out);
                 switch (nr) {
                     .ok => |nv| {
                         if (nv == .Null) break;
@@ -894,7 +898,7 @@ fn materialiseSequenceBounded(
             }
         },
         .IteratorFn => |fnbox| {
-            const ir = try invokeCallable(host, fnbox.asPtr(), &.{}, out);
+            const ir = try invokeCallable(host, fnbox.asPtrConst(), &.{}, out);
             const iter = switch (ir) {
                 .ok => |v| v,
                 .err => |e| {

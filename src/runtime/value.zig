@@ -332,10 +332,11 @@ pub const StackRef = ObjRef(StackTraceData);
 pub const ValueList = ObjRef(std.ArrayList(Value));
 pub const ValueSlice = ObjRef([]Value);
 /// A closure's identity and captured values in one cell, so the `Value` payload
-/// is one pointer and closure identity is cell identity. `id` is immutable and
-/// reads through `asPtr()` without a lock; `captures` is rebindable, since a
-/// closure's `this` can be re-bound, so it keeps the cell's borrow.
+/// is one pointer and closure identity is cell identity. Both are set when the
+/// closure is made and never written after, so the cell takes no lock.
 pub const IrClosureData = struct {
+    pub const objref_immutable = true;
+
     id: u64,
     captures: []Value,
 
@@ -811,6 +812,17 @@ pub const ExceptionData = struct {
         if (self.suppressed) |sl| (ValueList{ .cell = sl }).deinit();
     }
 
+    /// Attach `s` as the stack captured at the first throw, under the cell's
+    /// exclusive borrow, which records the write barrier; false, attaching
+    /// nothing, when a stack is already attached.
+    pub fn attachStackOnce(self: *ExceptionData, s: StackRef) bool {
+        const g = exceptionRefOf(self).borrowMut();
+        defer g.deinit();
+        if (g.get().stack != null) return false;
+        g.get().stack = s.cell;
+        return true;
+    }
+
     pub fn gcTrace(self: *const ExceptionData, m: *objcell.gc.Marker) void {
         m.shade(&self.fqn.cell.hdr);
         if (self.message.get()) |msg| m.shade(&msg.cell.hdr);
@@ -1245,7 +1257,7 @@ pub const ArrayData = struct {
     pub fn set(self: ArrayData, allocator: std.mem.Allocator, i: usize, v: Value) void {
         switch (self.storage()) {
             .boxed => |vl| {
-                const g = vl.borrowMut();
+                const g = vl.borrowMutAt(i);
                 defer g.deinit();
                 const items = g.get().items;
                 if (objcell.reclaimEnabled()) {
@@ -1366,49 +1378,6 @@ pub const DelegateKind = union(enum) {
     }
 };
 
-pub const SuspendBody = struct {
-    states: []SuspendState,
-};
-
-pub const SuspendState = struct {
-    resume_target: ?[]const u8,
-    stmts: []ast.Stmt,
-    transition: SuspendTransition,
-};
-
-pub const SuspendTransition = union(enum) {
-    Goto: usize,
-    Return,
-    Branch: struct { then_state: usize, else_state: usize },
-};
-
-pub const PausedResume = union(enum) {
-    Resumed: Value,
-    Failed: Value,
-};
-
-pub const SuspendCallerCont = union(enum) {
-    Frame: ObjRef(SuspendFrame),
-    HostSlot: ObjRef(?HostSlotResult),
-};
-
-pub const HostSlotResult = union(enum) {
-    ok: Value,
-    err: Value,
-};
-
-pub const SuspendFrame = struct {
-    decl: *const ast.Function,
-    body: ObjRef(SuspendBody),
-    env: ObjRef(Env),
-    locals: std.ArrayList(Local),
-    state: usize,
-    caller: ?SuspendCallerCont,
-    paused_resume: ?PausedResume,
-
-    pub const Local = struct { name: []const u8, value: Value };
-};
-
 /// The lazy coroutine state of a `sequence {}` or `iterator {}` builder. Each
 /// `yield(x)` suspends the block, parking the continuation in `cont`, opaque
 /// because `runtime` cannot import `ir`. `builderStep` drives one step per pull
@@ -1456,8 +1425,15 @@ pub const BuilderState = struct {
 pub const BuilderStateRef = ObjRef(BuilderState);
 
 /// Pulls one element at a time through the source and op pipeline, so an
-/// infinite source never materialises.
+/// infinite source never materialises. A pull runs user code (the source's
+/// iterator, each op's lambda), so it holds no lock across the pull: the
+/// thread that set `pulling` owns the counters and flags, and each store of a
+/// value field takes the cell's exclusive borrow for that store (`setValue`).
 pub const SeqIterState = struct {
+    /// Set for the length of one `hasNext` or `next`. A second pull that finds
+    /// it set, from another thread or from the pull's own user code, fails
+    /// rather than interleaving with it.
+    pulling: std.atomic.Value(bool) = .init(false),
     seq: Value,
     /// Produced by `hasNext()`, consumed by `next()`.
     buffered: ?Value = null,
@@ -1477,6 +1453,14 @@ pub const SeqIterState = struct {
     take_while_live: []bool = &.{},
     drop_while_live: []bool = &.{},
     indices: []usize = &.{},
+
+    /// Store `v` in the value field `field`, under the cell's exclusive borrow.
+    pub fn setValue(self: *SeqIterState, comptime field: []const u8, v: @FieldType(SeqIterState, field)) void {
+        const ref: SeqIterStateRef = .{ .cell = @alignCast(@fieldParentPtr("data", self)) };
+        const g = ref.borrowMut();
+        defer g.deinit();
+        @field(g.get(), field) = v;
+    }
 
     pub fn gcTrace(self: *const SeqIterState, m: *objcell.gc.Marker) void {
         self.seq.gcMark(m);
@@ -2189,10 +2173,14 @@ pub const Value = union(enum) {
         return .{ .Exception = &ref.cell.data };
     }
 
-    /// Dual of `release`.
-    pub fn retain(self: Value) void {
-        // Gated to match `release`: under reclaim-off both are skipped.
+    /// Dual of `release`. Gated to match it: under reclaim-off both are
+    /// skipped, and the check is all a caller pays then.
+    pub inline fn retain(self: Value) void {
         if (!objcell.reclaimEnabled()) return;
+        self.retainSlow();
+    }
+
+    fn retainSlow(self: Value) void {
         if (self.isPrimitive()) return;
         self.forEachChildCell(RetainVisitor{});
     }
@@ -2217,7 +2205,7 @@ pub const Value = union(enum) {
             .Class => |c| m.shade(&c.cell.hdr),
             // Keep the side-table's capture store and receiver chain alive. A
             // closure no live value marks never reaches here.
-            .IrClosure => |c| if (objcell.gc.markClosureHook) |f| f(c.asPtr().id, m),
+            .IrClosure => |c| if (objcell.gc.markClosureHook) |f| f(c.asPtrConst().id, m),
             else => {},
         }
     }
@@ -2286,10 +2274,14 @@ pub const Value = union(enum) {
     }
 
     /// At strong count zero the payload `deinit` releases what it owns.
-    pub fn release(self: Value, allocator: std.mem.Allocator) void {
-        // Gated identically to `retain`: the arena frees en masse and the GC
-        // reclaims by reachability, while refcount teardown here is O(n).
+    /// Gated identically to `retain`: the arena frees en masse and the GC
+    /// reclaims by reachability, while refcount teardown here is O(n).
+    pub inline fn release(self: Value, allocator: std.mem.Allocator) void {
         if (!objcell.reclaimEnabled()) return;
+        self.releaseSlow(allocator);
+    }
+
+    fn releaseSlow(self: Value, allocator: std.mem.Allocator) void {
         if (self.isPrimitive()) return;
         switch (self) {
             .String => |s| s.deinit(),
@@ -2831,7 +2823,7 @@ pub const Value = union(enum) {
     /// stay owned by the source value; the caller keeps that alive.
     fn mapEntryParts(v: *const Value) ?struct { key: Value, value: Value } {
         switch (v.*) {
-            .MapEntry => |e| return .{ .key = e.key.asPtr().*, .value = e.value.asPtr().* },
+            .MapEntry => |e| return .{ .key = e.key.asPtrConst().*, .value = e.value.asPtrConst().* },
             .Instance => |inst| {
                 if (!instanceImplementsMapEntry(inst)) return null;
                 const g = inst.borrow();
@@ -2883,13 +2875,13 @@ pub const Value = union(enum) {
             .Set => |x| if (b.* == .Set) return setEqBoxed(x.items, b.Set.items),
             .Map => |x| if (b.* == .Map) return mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| if (b.* == .Pair)
-                return structuralEqBoxed(x.first.asPtr(), b.Pair.first.asPtr()) and structuralEqBoxed(x.second.asPtr(), b.Pair.second.asPtr()),
+                return structuralEqBoxed(x.first.asPtrConst(), b.Pair.first.asPtrConst()) and structuralEqBoxed(x.second.asPtrConst(), b.Pair.second.asPtrConst()),
             .Triple => |x| if (b.* == .Triple)
-                return structuralEqBoxed(x.first.asPtr(), b.Triple.first.asPtr()) and
-                    structuralEqBoxed(x.second.asPtr(), b.Triple.second.asPtr()) and
-                    structuralEqBoxed(x.third.asPtr(), b.Triple.third.asPtr()),
+                return structuralEqBoxed(x.first.asPtrConst(), b.Triple.first.asPtrConst()) and
+                    structuralEqBoxed(x.second.asPtrConst(), b.Triple.second.asPtrConst()) and
+                    structuralEqBoxed(x.third.asPtrConst(), b.Triple.third.asPtrConst()),
             .MapEntry => |x| if (b.* == .MapEntry)
-                return structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
+                return structuralEqBoxed(x.key.asPtrConst(), b.MapEntry.key.asPtrConst()) and structuralEqBoxed(x.value.asPtrConst(), b.MapEntry.value.asPtrConst()),
             // Kotlin does not override `Throwable.equals`.
             .Exception => if (b.* == .Exception) return referenceEq(a, b),
             else => {},
@@ -2952,29 +2944,29 @@ pub const Value = union(enum) {
             .Set => |x| b.* == .Set and setEqBoxed(x.items, b.Set.items),
             .Map => |x| b.* == .Map and mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| b.* == .Pair and
-                structuralEqBoxed(x.first.asPtr(), b.Pair.first.asPtr()) and structuralEqBoxed(x.second.asPtr(), b.Pair.second.asPtr()),
+                structuralEqBoxed(x.first.asPtrConst(), b.Pair.first.asPtrConst()) and structuralEqBoxed(x.second.asPtrConst(), b.Pair.second.asPtrConst()),
             .Triple => |x| b.* == .Triple and
-                structuralEqBoxed(x.first.asPtr(), b.Triple.first.asPtr()) and
-                structuralEqBoxed(x.second.asPtr(), b.Triple.second.asPtr()) and
-                structuralEqBoxed(x.third.asPtr(), b.Triple.third.asPtr()),
+                structuralEqBoxed(x.first.asPtrConst(), b.Triple.first.asPtrConst()) and
+                structuralEqBoxed(x.second.asPtrConst(), b.Triple.second.asPtrConst()) and
+                structuralEqBoxed(x.third.asPtrConst(), b.Triple.third.asPtrConst()),
             .MapEntry => |x| b.* == .MapEntry and
-                structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
-            .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload.asPtr(), b.Result.payload.asPtr()),
+                structuralEqBoxed(x.key.asPtrConst(), b.MapEntry.key.asPtrConst()) and structuralEqBoxed(x.value.asPtrConst(), b.MapEntry.value.asPtrConst()),
+            .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload.asPtrConst(), b.Result.payload.asPtrConst()),
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
             .IrClosure => |x| b.* == .IrClosure and blk: {
                 if (IrClosureRef.ptrEq(x, b.IrClosure)) break :blk true;
                 // A non-capturing lambda literal is a singleton in Kotlin, but
                 // klio gives each evaluation its own closure id.
                 if (objcell.gc.closureSingletonHook) |h| {
-                    const sa = h(x.asPtr().id);
-                    if (sa != 0 and sa == h(b.IrClosure.asPtr().id)) break :blk true;
+                    const sa = h(x.asPtrConst().id);
+                    if (sa != 0 and sa == h(b.IrClosure.asPtrConst().id)) break :blk true;
                 }
                 break :blk false;
             },
             .Comparator => |x| b.* == .Comparator and
                 ObjRef([]ComparatorStep).ptrEq(x.steps, b.Comparator.steps) and
                 x.descending == b.Comparator.descending,
-            .BoundMethod => |x| b.* == .BoundMethod and std.mem.eql(u8, x.fqn, b.BoundMethod.fqn) and structuralEq(x.receiver.asPtr(), b.BoundMethod.receiver.asPtr()),
+            .BoundMethod => |x| b.* == .BoundMethod and std.mem.eql(u8, x.fqn, b.BoundMethod.fqn) and structuralEq(x.receiver.asPtrConst(), b.BoundMethod.receiver.asPtrConst()),
             .Instance => |x| b.* == .Instance and instanceEq(x, b.Instance),
             // StringBuilder declares no equals override, so identity.
             .StringBuilder => |x| b.* == .StringBuilder and x.identity() == b.StringBuilder.identity(),
@@ -3075,8 +3067,8 @@ pub const Value = union(enum) {
                 }
             },
             .IrClosure => |c| {
-                if (objcell.gc.closureTextHook) |h| if (try h(c.asPtr().id, writer)) return;
-                try writer.print("{{ir-closure#{d}}}", .{c.asPtr().id});
+                if (objcell.gc.closureTextHook) |h| if (try h(c.asPtrConst().id, writer)) return;
+                try writer.print("{{ir-closure#{d}}}", .{c.asPtrConst().id});
             },
             .Intrinsic => |i| try writer.print("fun {s}(...)", .{i.fqn}),
             .BoundMethod => |m| try writer.print("fun {s}(...)", .{m.fqn}),
@@ -3123,28 +3115,28 @@ pub const Value = union(enum) {
             },
             .Pair => |p| {
                 try writer.writeByte('(');
-                try p.first.asPtr().writeTo(writer);
+                try p.first.asPtrConst().writeTo(writer);
                 try writer.writeAll(", ");
-                try p.second.asPtr().writeTo(writer);
+                try p.second.asPtrConst().writeTo(writer);
                 try writer.writeByte(')');
             },
             .Triple => |t| {
                 try writer.writeByte('(');
-                try t.first.asPtr().writeTo(writer);
+                try t.first.asPtrConst().writeTo(writer);
                 try writer.writeAll(", ");
-                try t.second.asPtr().writeTo(writer);
+                try t.second.asPtrConst().writeTo(writer);
                 try writer.writeAll(", ");
-                try t.third.asPtr().writeTo(writer);
+                try t.third.asPtrConst().writeTo(writer);
                 try writer.writeByte(')');
             },
             .MapEntry => |e| {
-                try e.key.asPtr().writeTo(writer);
+                try e.key.asPtrConst().writeTo(writer);
                 try writer.writeByte('=');
-                try e.value.asPtr().writeTo(writer);
+                try e.value.asPtrConst().writeTo(writer);
             },
             .Result => |r| {
                 try writer.writeAll(if (r.ok) "Success(" else "Failure(");
-                try r.payload.asPtr().writeTo(writer);
+                try r.payload.asPtrConst().writeTo(writer);
                 try writer.writeByte(')');
             },
             .Comparator => try writer.writeAll("Comparator"),
@@ -3577,6 +3569,20 @@ pub const RuntimeError = union(enum) {
     TailJump: struct { callee: Value, args: []Value, names: []?[]const u8 },
     /// Wakes after that many virtual ms.
     Suspend: i64,
+
+    /// Shade the cells of every value the error carries.
+    pub fn gcMark(self: RuntimeError, m: *objcell.gc.Marker) void {
+        switch (self) {
+            .Return, .Thrown => |v| v.gcMark(m),
+            .LabeledReturn => |r| r.value.gcMark(m),
+            .TailContinue => |t| for (t.args) |v| v.gcMark(m),
+            .TailJump => |t| {
+                t.callee.gcMark(m);
+                for (t.args) |v| v.gcMark(m);
+            },
+            else => {},
+        }
+    }
 };
 
 /// OOM stays a Zig `error`; this carries the `RuntimeError` path.
@@ -3683,6 +3689,28 @@ pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v
 
 
 const testing = std.testing;
+
+test "a stack attached to a tenured exception records the barrier, once" {
+    const a = std.testing.allocator;
+    const ev = try Value.newException(a, .{
+        .fqn = try strInit(a, "kotlin.IllegalStateException"),
+        .cause = null,
+    });
+    const ref = exceptionRefOf(ev.Exception);
+    defer ref.deinit();
+    const hdr = &ref.cell.hdr;
+    defer objcell.gc.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(objcell.gc.GcHeader) }});
+    hdr.gc_gen = 1;
+    hdr.gc_remembered = false;
+    const first = try StackRef.init(a, .{ .frames = try a.alloc(StackFrame, 0) });
+    try std.testing.expect(ev.Exception.attachStackOnce(first));
+    try std.testing.expect(hdr.gc_remembered);
+    try std.testing.expectEqual(first.cell, ev.Exception.stack.?);
+    const second = try StackRef.init(a, .{ .frames = try a.alloc(StackFrame, 0) });
+    defer second.deinit();
+    try std.testing.expect(!ev.Exception.attachStackOnce(second));
+    try std.testing.expectEqual(first.cell, ev.Exception.stack.?);
+}
 
 test "classifier receiver ABI separates host values from source classes" {
     try testing.expectEqual(ReceiverAbi.specialized, classifierReceiverAbi("kotlin.collections.Collection"));

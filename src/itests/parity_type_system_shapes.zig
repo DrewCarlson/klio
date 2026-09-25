@@ -123,16 +123,21 @@ test "kclass_simple_name" {
     try assertKlio("kclass_name", src, "Box,Box\n");
 }
 
+// A function value's class is named by its Kotlin function type,
+// `kotlin.Function0` for `() -> Int`. The JVM names the synthetic class
+// it generates for the lambda instead (`MainKt$$Lambda/0x...`, with no
+// qualified name), which is JVM naming, not Kotlin's.
 test "callable_class_literal_is_a_kclass" {
     const src =
         \\
         \\fun main() {
         \\    val block = { 1 }
         \\    println(block::class.simpleName)
+        \\    println(block::class.qualifiedName)
         \\}
         \\
     ;
-    try assertKlio("callable_kclass_name", src, "Function\n");
+    try assertKlio("callable_kclass_name", src, "Function0\nkotlin.Function0\n");
 }
 
 test "type_parameter_method_resolution" {

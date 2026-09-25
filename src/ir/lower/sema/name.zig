@@ -21,6 +21,7 @@ const env = @import("env.zig");
 const body = @import("body.zig");
 const inline_mod = @import("inline.zig");
 const compose = @import("compose.zig");
+const locals = @import("locals.zig");
 
 const Builder = builder.Builder;
 const Error = records.Error;
@@ -46,8 +47,10 @@ pub fn lowerName(b: *Builder, e: *const ast.Expr) Error!Reg {
             // A constant read through an object qualifier initializes
             // nothing; one read on an expression still evaluates it.
             if (isConstRead(b.p.s, &rec) and objectQualifier(b, m.id, m.receiver)) return read(b, &rec, null);
+            // The receiver is this read's alone.
+            const from = locals.mark(b);
             const recv = try memberReceiver(b, m.id, m.receiver);
-            if (!m.safe) return read(b, &rec, recv);
+            if (!m.safe) return readFrom(b, &rec, recv, from);
             // `a?.x`: null when `a` is.
             const split = try b.branchOnNull(recv);
             const result = b.newReg();
@@ -116,6 +119,9 @@ pub fn takesExpr(rec: *const NameRec) bool {
 /// before it. Null when every segment is a qualifier.
 pub fn pathValue(b: *Builder, id: ast.NodeId, segs: []const ast.Ident) Error!?Reg {
     var cur: ?Reg = null;
+    // Where lowering stood before `cur` was read, which the next read alone
+    // consumes.
+    var from: ?locals.Mark = null;
     for (segs, 0..) |seg, i| {
         const rec = b.nameAt(id, seg.span.start) orelse {
             // A qualifier cannot follow a value.
@@ -127,7 +133,9 @@ pub fn pathValue(b: *Builder, id: ast.NodeId, segs: []const ast.Ident) Error!?Re
         if (rec.kind == .object and i + 1 < segs.len) {
             if (b.nameAt(id, segs[i + 1].span.start)) |next| if (isConstRead(b.p.s, &next)) continue;
         }
-        cur = try read(b, &rec, cur);
+        const here = locals.mark(b);
+        cur = try readFrom(b, &rec, cur, from);
+        from = here;
     }
     return cur;
 }
@@ -179,12 +187,18 @@ pub fn lowerTemplateName(b: *Builder, ident: *const ast.Ident) Error!Reg {
 /// The value `rec` names, on `recv` for a record whose receiver is the
 /// site's expression.
 pub fn read(b: *Builder, rec: *const NameRec, recv: ?Reg) Error!Reg {
+    return readFrom(b, rec, recv, null);
+}
+
+/// `read` on a receiver lowered since `from` that the read alone consumes:
+/// an accessor call computes it in place in its argument run.
+pub fn readFrom(b: *Builder, rec: *const NameRec, recv: ?Reg, from: ?locals.Mark) Error!Reg {
     return switch (rec.kind) {
         .local, .param => env.readLocal(b, rec.target),
         .object => env.loadObject(b, rec.target),
         .enum_entry => entryValue(b, rec.target),
         .backing_field => readField(b, rec.target),
-        .property => readProperty(b, rec, recv),
+        .property => readProperty(b, rec, recv, from),
     };
 }
 
@@ -269,7 +283,7 @@ fn isSuper(r: sema.records.Receiver) bool {
     };
 }
 
-fn readProperty(b: *Builder, rec: *const NameRec, recv: ?Reg) Error!Reg {
+fn readProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, from: ?locals.Mark) Error!Reg {
     const s = b.p.s;
     const br = b.p.br;
     const p = rec.target;
@@ -324,7 +338,7 @@ fn readProperty(b: *Builder, rec: *const NameRec, recv: ?Reg) Error!Reg {
         try args.append(b.p.a, try compose.composer(b));
         try args.appendSlice(b.p.a, try compose.getterChanged(b, rec, p));
     }
-    return accessorCall(b, p, getterOf(br, p) orelse return noAccessor(b, p, "getter"), false, args.items, member and !via_super, via_super);
+    return accessorCall(b, p, getterOf(br, p) orelse return noAccessor(b, p, "getter"), false, args.items, member and !via_super, via_super, from);
 }
 
 fn writeProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, value: Reg) Error!void {
@@ -358,7 +372,7 @@ fn writeProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, value: Reg) Error
     if (ext) |x| try args.append(b.p.a, x);
     try args.append(b.p.a, value);
     const setter = br.setterOf(p) orelse return noAccessor(b, p, "setter");
-    _ = try accessorCall(b, p, setter, true, args.items, member and !via_super, via_super);
+    _ = try accessorCall(b, p, setter, true, args.items, member and !via_super, via_super, null);
 }
 
 /// `field` in an accessor: the property's own storage.
@@ -411,7 +425,7 @@ fn getterOf(br: *const bridge.Bridge, p: Sym) ?FuncId {
 /// Calls accessor `f` of property `p` over `args`: through its slot when
 /// `virtual` and an override may answer, else directly. `via_super` runs a
 /// native accessor as it is, which no receiver's override redirects.
-fn accessorCall(b: *Builder, p: Sym, f: FuncId, setter: bool, args: []const Reg, virtual: bool, via_super: bool) Error!Reg {
+fn accessorCall(b: *Builder, p: Sym, f: FuncId, setter: bool, args: []const Reg, virtual: bool, via_super: bool, from: ?locals.Mark) Error!Reg {
     const s = b.p.s;
     const br = b.p.br;
     // An inline accessor is instantiated like an inline function, unless a
@@ -422,7 +436,7 @@ fn accessorCall(b: *Builder, p: Sym, f: FuncId, setter: bool, args: []const Reg,
         @memset(lambdas, null);
         return inline_mod.instantiate(b, &rec, f, args, lambdas);
     }
-    const run = try b.run(args);
+    const run = if (from) |m| try locals.runFrom(b, m, args) else try b.run(args);
     const n: u32 = @intCast(args.len);
     const dst = b.newReg();
     if (!virtual or finalMember(s, p)) {

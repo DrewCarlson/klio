@@ -19,7 +19,6 @@ const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
-const Env = runtime.Env;
 const ClassDef = runtime.ClassDef;
 const Output = runtime.Output;
 const RuntimeError = runtime.RuntimeError;
@@ -120,7 +119,7 @@ pub fn evalClosureRaw(
         );
         return .{ .err = .{ .Type = msg } };
     }
-    const id = callable.IrClosure.asPtr().id;
+    const id = callable.IrClosure.asPtrConst().id;
     const live_captures = callable.IrClosure;
 
     const info = self.closures.get(@intCast(id)) orelse {
@@ -406,52 +405,27 @@ pub fn constructWellKnown(self: *VmIntrinsicHost, class: runtime.WellKnownClass,
 
 /// A host value presenting as `kind`: an instance of a class the tables do
 /// not hold, so a call on it reaches the host's implementation of the
-/// member, holding `fields`. `kind` only names it.
+/// member. Its slots are the kind's layout; each of `fields` fills the slot
+/// of its name, and the rest hold null.
 pub fn newHostInstance(self: *VmIntrinsicHost, kind: runtime.HostInstance, identity: u64, fields: []const InstanceData.Field) Allocator.Error!Value {
     const class_fqn = kind.fqn();
     const simple = if (std.mem.findScalarLast(u8, class_fqn, '.')) |i| class_fqn[i + 1 ..] else class_fqn;
-    const supertypes: []const []const u8 = &.{};
-    const class_def = try ObjRef(ClassDef).init(self.allocator, .{
-        .name = simple,
-        .fqn = class_fqn,
-        .annotation_names = &.{},
-        .primary_params = &.{},
-        .methods = &.{},
-        .body_properties = &.{},
-        .init_blocks = &.{},
-        .init_block_property_positions = &.{},
-        .is_data = false,
-        .is_value = false,
-        .is_object = false,
-        .is_enum = false,
-        .is_sealed = false,
-        .supertype_names = supertypes,
-        .parent = null,
-        .interfaces = &.{},
-        .is_interface = false,
-        .is_fun_interface = false,
-        .parent_ctor_args = &.{},
-        .is_open = false,
-        .is_abstract = false,
-        .is_inner = false,
-        .is_anonymous = true,
-        .secondary_ctors = &.{},
-        .enum_entries = &.{},
-        .companion = try ObjRef(?ObjRef(InstanceData)).init(self.allocator, null),
-        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(self.allocator, null),
-        .nested_classes = &.{},
-        .captured_env = try ObjRef(Env).init(self.allocator, Env.init(self.allocator)),
-        .supertype_delegates = &.{},
-        .delegate_forwarders = &.{},
-        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(self.allocator, null),
-    });
-
-    var field_list: std.ArrayList(InstanceData.Field) = .empty;
-    try field_list.appendSlice(self.allocator, fields);
-
+    const class_def = try ClassDef.minimal(self.allocator, simple, class_fqn, std.math.maxInt(u32));
+    const def = class_def.asPtr();
+    def.is_anonymous = true;
+    def.layout_slots = kind.layout();
+    const slots = try self.allocator.alloc(Value, def.layout_slots.len);
+    errdefer self.allocator.free(slots);
+    @memset(slots, .Null);
+    for (fields) |f| {
+        const i = for (def.layout_slots, 0..) |sl, i| {
+            if (std.mem.eql(u8, sl.name, f.name)) break i;
+        } else std.debug.panic("a {s} has no slot `{s}`", .{ class_fqn, f.name });
+        slots[i] = f.value;
+    }
     const inst = try ObjRef(InstanceData).init(self.allocator, .{
         .class = class_def,
-        .fields = field_list,
+        .slots = slots,
         .outer = null,
         .identity = identity,
         .native_state = null,
@@ -469,7 +443,47 @@ const WorkerArgs = struct {
     threads: root.ThreadTable,
     id: u64,
     name: []const u8,
+    handoff: u64,
 };
+
+// A spawned thread's block from `startWorker` until its worker has pinned it.
+// The worker joins the mutator set only once it runs, so a collection in that
+// window reaches the block through this set alone. Keyed by a process-wide
+// token: thread ids are per program, and programs share the heap.
+var handoff_lock: runtime.SpinMutex = .{};
+var handoff_blocks: std.AutoArrayHashMapUnmanaged(u64, Value) = .empty;
+var handoff_seq = std.atomic.Value(u64).init(0);
+var handoff_root = std.atomic.Value(bool).init(false);
+var handoff_root_lock: runtime.SpinMutex = .{};
+
+fn handoffPut(block: Value) Allocator.Error!u64 {
+    const token = handoff_seq.fetchAdd(1, .monotonic);
+    if (!runtime.gc.gc_enabled) return token;
+    if (!handoff_root.load(.acquire)) {
+        handoff_root_lock.lock();
+        defer handoff_root_lock.unlock();
+        if (!handoff_root.load(.acquire)) {
+            runtime.gc.registerRoot(gcMarkHandoff);
+            handoff_root.store(true, .release);
+        }
+    }
+    handoff_lock.lock();
+    defer handoff_lock.unlock();
+    try handoff_blocks.put(std.heap.page_allocator, token, block);
+    return token;
+}
+
+fn handoffTake(token: u64) void {
+    handoff_lock.lock();
+    defer handoff_lock.unlock();
+    _ = handoff_blocks.swapRemove(token);
+}
+
+fn gcMarkHandoff(m: *runtime.gc.Marker) void {
+    handoff_lock.lock();
+    defer handoff_lock.unlock();
+    for (handoff_blocks.values()) |v| v.gcMark(m);
+}
 
 fn publishThreadResult(threads: root.ThreadTable, id: u64, result: ThreadResult) void {
     const g = threads.borrowMut();
@@ -497,6 +511,7 @@ fn workerEntry(wargs: WorkerArgs) void {
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePush(args.block);
+    handoffTake(args.handoff);
     // Balance the spawn-time retain. Registered before `vm.deinit` so it runs
     // after the child Vm tears down (LIFO), keeping the block alive throughout.
     defer if (runtime.reclaimEnabled()) args.block.release(args.seed.allocator);
@@ -529,6 +544,10 @@ fn workerEntry(wargs: WorkerArgs) void {
 /// `Exception in thread "<name>" ` and the throwable's stack trace on
 /// stderr, as the JVM's default uncaught handler prints them.
 fn reportUncaught(vm: *root.Vm, v: Value, name: []const u8) void {
+    // Rendering runs the throwable's `toString`; the value is held only here.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePush(v);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const text = vm.threadUncaughtText(arena.allocator(), &v, name) catch return;
@@ -555,6 +574,13 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, name_in: []const u8)
     // The block and the graph its captures reach cross to a worker that may outlive
     // this frame's hold; retain, and `workerEntry` releases when the task finishes.
     block.retain();
+    const handoff = handoffPut(block.*) catch |e| {
+        block.release(self.allocator);
+        const g = self.threads.borrowMut();
+        defer g.deinit();
+        _ = g.get().remove(id);
+        return e;
+    };
     const wargs = WorkerArgs{
         .seed = spawnSeed(self),
         .block = block.*,
@@ -563,9 +589,11 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, name_in: []const u8)
         .threads = self.threads.clone(),
         .id = id,
         .name = name,
+        .handoff = handoff,
     };
 
     const handle = std.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, workerEntry, .{wargs}) catch {
+        handoffTake(handoff);
         block.release(self.allocator);
         const g = self.threads.borrowMut();
         defer g.deinit();

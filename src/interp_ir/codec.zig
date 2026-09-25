@@ -25,7 +25,7 @@ const FuncId = ir.FuncId;
 
 /// Bump on any change to the encoded layout or to the types it reaches. A
 /// mismatch refuses the load and the caller rebakes.
-pub const FORMAT_VERSION: u32 = 94;
+pub const FORMAT_VERSION: u32 = 96;
 
 // Watched AST node types: pointed at from the IR.
 
@@ -231,6 +231,7 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
                 try encodeInt(s.backing_integer.?, e, @bitCast(value.*));
             } else {
                 inline for (s.fields) |f| {
+                    if (comptime imageCache(T, f.name)) continue;
                     try encodeValue(f.type, e, &@field(value.*, f.name));
                 }
             }
@@ -252,6 +253,16 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
         .array => |arr| for (value) |*elem| try encodeValue(arr.child, e, elem),
         else => @compileError("unsupported type in image encode: " ++ @typeName(T)),
     }
+}
+
+/// Whether field `name` of `T` is a run memo its `image_cache` names: written as nothing and
+/// read back as its default.
+fn imageCache(comptime T: type, comptime name: []const u8) bool {
+    if (!@hasDecl(T, "image_cache")) return false;
+    inline for (T.image_cache) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
 }
 
 const DecodeError = error{ OutOfMemory, Malformed };
@@ -427,7 +438,11 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
                 out.* = @bitCast(raw);
             } else {
                 inline for (s.fields) |f| {
-                    try decodeInto(f.type, d, &@field(out.*, f.name));
+                    if (comptime imageCache(T, f.name)) {
+                        @field(out.*, f.name) = comptime f.defaultValue().?;
+                    } else {
+                        try decodeInto(f.type, d, &@field(out.*, f.name));
+                    }
                 }
             }
         },
@@ -597,6 +612,32 @@ test "codec preserves explicit receiver-lambda shape" {
     try testing.expect(got.lambda_receiver_shape_known);
     try testing.expect(got.lambda_has_receiver);
     try testing.expectEqualStrings("String", got.x().lambda_receiver_ty.?);
+}
+
+test "an image carries no run memo: a function decodes with its code-table memo unset" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var func = ir.Func{
+        .id = FuncId.from(3),
+        .name = "f",
+        .fqn = "f",
+        .params = &.{},
+        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
+        .n_locals = 2,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    };
+    func.bc_memo.store(0xdead0, .monotonic);
+    func.bc_memo_gen = 7;
+    const bytes = try encodeOne(ir.Func, a, &func);
+    const got = try decodeOne(ir.Func, a, bytes);
+    try testing.expectEqual(@as(usize, 0), got.bc_memo.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), got.bc_memo_gen);
+    try testing.expectEqual(@as(u32, 2), got.n_locals);
+    try testing.expectEqualStrings("f", got.name);
 }
 
 test "codec resolves watched AST pointers to the decoded tree" {

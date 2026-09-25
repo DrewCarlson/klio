@@ -462,10 +462,10 @@ test "Comparator SAM wraps one step" {
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .Comparator);
     defer runtime.comparatorRefOf(r.ok.Comparator).deinit();
-    defer testing.allocator.free(r.ok.Comparator.steps.asPtr().*);
-    try testing.expectEqual(@as(usize, 1), r.ok.Comparator.steps.asPtr().*.len);
+    defer testing.allocator.free(r.ok.Comparator.steps.asPtrConst().*);
+    try testing.expectEqual(@as(usize, 1), r.ok.Comparator.steps.asPtrConst().*.len);
     try testing.expect(!r.ok.Comparator.descending);
-    try testing.expect(!r.ok.Comparator.steps.asPtr().*[0].descending);
+    try testing.expect(!r.ok.Comparator.steps.asPtrConst().*[0].descending);
 }
 
 test "Comparator SAM rejects wrong arity and non-lambda" {
@@ -497,8 +497,8 @@ test "compareBy tags steps ascending" {
     const r = try cmp_compare_by(&ctx);
     try testing.expect(r.ok == .Comparator);
     defer runtime.comparatorRefOf(r.ok.Comparator).deinit();
-    defer testing.allocator.free(r.ok.Comparator.steps.asPtr().*);
-    const steps = r.ok.Comparator.steps.asPtr().*;
+    defer testing.allocator.free(r.ok.Comparator.steps.asPtrConst().*);
+    const steps = r.ok.Comparator.steps.asPtrConst().*;
     try testing.expectEqual(@as(usize, 2), steps.len);
     try testing.expect(!r.ok.Comparator.descending);
     try testing.expect(!steps[0].descending);
@@ -516,8 +516,8 @@ test "compareByDescending tags steps descending" {
     const r = try cmp_compare_by_descending(&ctx);
     try testing.expect(r.ok == .Comparator);
     defer runtime.comparatorRefOf(r.ok.Comparator).deinit();
-    defer testing.allocator.free(r.ok.Comparator.steps.asPtr().*);
-    const steps = r.ok.Comparator.steps.asPtr().*;
+    defer testing.allocator.free(r.ok.Comparator.steps.asPtrConst().*);
+    const steps = r.ok.Comparator.steps.asPtrConst().*;
     try testing.expectEqual(@as(usize, 1), steps.len);
     try testing.expect(!r.ok.Comparator.descending);
     try testing.expect(steps[0].descending);
@@ -534,15 +534,15 @@ test "naturalOrder and reverseOrder build empty-step comparators" {
     defer runtime.comparatorRefOf(nat.ok.Comparator).deinit();
     try testing.expect(nat.ok == .Comparator);
     defer nat.ok.Comparator.steps.deinit();
-    defer testing.allocator.free(nat.ok.Comparator.steps.asPtr().*);
-    try testing.expectEqual(@as(usize, 0), nat.ok.Comparator.steps.asPtr().*.len);
+    defer testing.allocator.free(nat.ok.Comparator.steps.asPtrConst().*);
+    try testing.expectEqual(@as(usize, 0), nat.ok.Comparator.steps.asPtrConst().*.len);
     try testing.expect(!nat.ok.Comparator.descending);
 
     const rev = try comparator_reverse_order(&ctx);
     defer runtime.comparatorRefOf(rev.ok.Comparator).deinit();
     try testing.expect(rev.ok == .Comparator);
     defer rev.ok.Comparator.steps.deinit();
-    defer testing.allocator.free(rev.ok.Comparator.steps.asPtr().*);
-    try testing.expectEqual(@as(usize, 0), rev.ok.Comparator.steps.asPtr().*.len);
+    defer testing.allocator.free(rev.ok.Comparator.steps.asPtrConst().*);
+    try testing.expectEqual(@as(usize, 0), rev.ok.Comparator.steps.asPtrConst().*.len);
     try testing.expect(rev.ok.Comparator.descending);
 }

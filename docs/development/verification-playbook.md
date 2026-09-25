@@ -53,6 +53,8 @@ Two ways an audit sweep reads clean while finding nothing:
 | The parity suites | `zig build itest-group_parity_core itest-group_parity_types itest-group_parity_shapes` (the pinned parity corpus is in `core`) | ~2 min |
 | The sema census | `python3 scripts/sema-census.py --home $PWD/.klio-local` | ~30 s |
 | The whole local gate | `scripts/stack.sh` | ~23 min warm |
+| The done-line gate | `scripts/gate.sh [--no-sweep]`, with nothing else touching `.zig-cache` | about an hour |
+| The measured row | `python3 scripts/measure-row.py [--only micro,headline,frames,throughput,gc] [--json out.json]` on a quiet machine | ~25 min |
 | The CI shape | `taskset -c 0-3 zig build itest -Ditest-shard=K/8 -Dharness-optimize=ReleaseSafe` | 12-21 min per shard |
 
 `zig build itest-<suite>` recompiles the whole itest binary every time
@@ -91,6 +93,31 @@ image format bump invalidates the installed packs.
 `corpus_check.py` refuses an unset or shared `KLIO_HOME` unless
 `--allow-shared-home`; the shared `~/.klio` reports fake failures from
 stale packs.
+
+## The Skia shim
+
+The window and drawing examples, marked `// corpus: skia`, expect the output
+they print when the Skia shim renders. The binaries load the shim from
+`zig-out/lib` (`zig build skia-lib`), which builds only when the prebuilt Skia
+libraries sit in `third_party/skia/<os>-<arch>`. `scripts/fetch-skia.sh` puts
+them there; in a linked git worktree it links the main checkout's copy instead
+of downloading. `scripts/gate.sh` runs both before anything else. Only when
+the libraries can be neither found nor fetched does it skip the marked
+examples, naming each one (`corpus_check.py --no-skia`,
+`KLIO_GATE_NO_SKIA=1` for the compose-ui gate); a shim that fails to build is
+a red gate.
+
+## The measured row
+
+`scripts/measure-row.py` takes every number the done line of
+`plans/resolved-interpreter.md` asks for, the way its before row was taken:
+fib, bench_oo, bench_fn and benchRecompose (`tests/bench`) for user CPU, the
+headline costs, benchRecompose's activations and machine instructions per
+frame, the compose runtime's three throughput-bound tests on `runTest`'s own
+timeout, and `KLIO_GC_DEBUG`'s pause table on validatePotentialDeadlock and on
+the fleet. It builds both harnesses, refreshes `.klio-local`, and runs copies
+of the binaries, so a rebuild during the run cannot swap one. It prints the
+load average first; a busy machine reads high.
 
 ## Standing rules and traps
 

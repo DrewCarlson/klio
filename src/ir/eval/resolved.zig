@@ -5,8 +5,11 @@
 //! error naming the ids, never a fallback.
 //!
 //! Calls run as flat activations: the arm leaves a `FlatCallReq` on the
-//! frame and the driver pushes it, so a callee that suspends parks at its
-//! call-return point with the call's `dst` as its resume register. An init
+//! thread's state and the driver pushes it, so a callee that suspends parks at
+//! its call-return point with the call's `dst` as its resume register. A
+//! callee's parameters are the call's argument run, read in place in the
+//! caller's registers; a call that adds a receiver or a bound value first
+//! copies them into an argument area on the value stack. An init
 //! unit, an object's constructor and an exception's constructor run
 //! recursively through `host.runResolved`, because the instruction needs
 //! their result before it continues.
@@ -19,7 +22,6 @@ const ev_enter = @import("enter.zig");
 const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
 const ev_state = @import("state.zig");
-const ev_chain = @import("chain.zig");
 const ev_diag = @import("diag.zig");
 
 const ev_values = @import("values.zig");
@@ -74,15 +76,15 @@ fn regAt(base: Reg, i: usize) Reg {
     return Reg.from(base.int() + @as(u32, @intCast(i)));
 }
 
-/// A carrier holding `prefix` and then the run `args[from..n]`, the shape a
-/// frame takes as its parameters. The values are borrowed from the caller.
-fn carrier(a: Allocator, frame: *const Frame, prefix: []const Value, args: Reg, from: u32, n: u32) Allocator.Error!std.ArrayList(Value) {
-    const count = prefix.len + (n - from);
-    var list = try ev_state.acquireArgsCap(a, count);
-    list.appendSliceAssumeCapacity(prefix);
-    var i = from;
-    while (i < n) : (i += 1) list.appendAssumeCapacity(frame.read(regAt(args, i)));
-    return list;
+/// The run `args[from..n]` of the caller's registers, in place.
+inline fn runOf(frame: *const Frame, args: Reg, from: u32, n: u32) []const Value {
+    return ev_frame.argRun(frame, regAt(args, from), n - from);
+}
+
+/// An argument area holding `prefix` and then the run `args[from..n]`: the
+/// parameters of a callee that takes a value before the call's arguments.
+fn area(frame: *Frame, prefix: []const Value, args: Reg, from: u32, n: u32) Allocator.Error!ev_frame.ArgArea {
+    return ev_frame.ArgArea.push(frame.tls, prefix, runOf(frame, args, from, n));
 }
 
 fn valueTag(v: *const Value) []const u8 {
@@ -109,16 +111,18 @@ fn valueClass(comptime H: type, host: *H, r: *const Resolved, v: *const Value) ?
 }
 
 /// The next instance's identity from the run state.
-fn nextIdentity(st: StateRef) u64 {
+pub fn nextIdentity(st: StateRef) u64 {
     const g = st.borrowMut();
     defer g.deinit();
     g.get().next_identity += 1;
     return g.get().next_identity;
 }
 
-/// Runs `func` over the argument carrier: its native when the tables bind
-/// one, else its body as a flat activation (recursively when the flat
-/// driver is off). Takes ownership of `list`.
+/// Runs `func` over `params`: its native when the tables bind one, else its
+/// body as a flat activation (recursively when the flat driver is off).
+/// `params` is the call's argument run or the argument area pushed at `at`,
+/// which the callee's frame takes over, or which is popped here when the
+/// call ends before one opens.
 fn runFunc(
     comptime H: type,
     a: Allocator,
@@ -126,46 +130,48 @@ fn runFunc(
     host: *H,
     r: *const Resolved,
     func: FuncId,
-    list_in: std.ArrayList(Value),
+    params: []const Value,
+    at: ?ev_state.VsMark,
     dst: Reg,
 ) Allocator.Error!Step {
-    var list = list_in;
+    const ev = frame.tls;
     if (runtime.envOnce("KLIO_FAULT_INJECT")) |spec| if (frame.module.funcById(func)) |f| if (injectedFault(spec, f.fqn)) {
-        ev_state.releaseArgs(a, &list);
+        if (at) |m| ev.vstack.restore(m);
         return internal(a, frame, "injected internal error in `{s}`", .{f.fqn});
     };
     // A fast path the host fronts the body with answers first, or declines.
     if (func.int() < r.func_try.len and r.func_try[func.int()] != .none) {
-        if (try host.tryNative(a, r.func_try[func.int()], list.items)) |res| {
-            defer ev_state.releaseArgs(a, &list);
+        if (try host.tryNative(a, r.func_try[func.int()], params)) |res| {
+            if (at) |m| ev.vstack.restore(m);
             return land(frame, res, dst);
         }
     }
     if (func.int() < r.func_native.len) {
         const nid = r.func_native[func.int()];
         if (nid != .none) {
-            defer ev_state.releaseArgs(a, &list);
             // A Kotlin receiver's own override of the member answers
             // (`NativeRt.slot`); `super` calls the native directly.
-            if (comptime @hasDecl(H, "callNativeSite")) {
-                if (list.items.len != 0 and list.items[0] == .Instance) return land(frame, try host.callNativeSite(a, nid, list.items), dst);
-            }
-            return land(frame, try host.callNative(a, nid, list.items), dst);
+            const res = if (comptime @hasDecl(H, "callNativeSite"))
+                (if (params.len != 0 and params[0] == .Instance) try host.callNativeSite(a, nid, params) else try host.callNative(a, nid, params))
+            else
+                try host.callNative(a, nid, params);
+            if (at) |m| ev.vstack.restore(m);
+            return land(frame, res, dst);
         }
     }
     const f = frame.module.funcById(func) orelse {
-        ev_state.releaseArgs(a, &list);
+        if (at) |m| ev.vstack.restore(m);
         return internal(a, frame, "call: function #{d} is not in the module", .{func.int()});
     };
     if (!f.hasBody()) {
-        ev_state.releaseArgs(a, &list);
+        if (at) |m| ev.vstack.restore(m);
         return internal(a, frame, "call: function #{d} ({s}) has no body and no native", .{ func.int(), f.fqn });
     }
     if (ev_flow.flatEnabled()) {
-        frame.flat_call = .{ .func = f, .args = list, .dst = dst };
+        ev.flat_call = .{ .func = f, .params = params, .area = at, .dst = dst };
         return .flat_call;
     }
-    const res = try ev_enter.evalClosure(H, a, frame.module, null, f, list, .empty, null, host);
+    const res = try ev_enter.evalView(H, a, frame.module, null, f, params, &.{}, at, null, host);
     return land(frame, res, dst);
 }
 
@@ -309,8 +315,7 @@ pub fn execCallStatic(comptime H: type, a: Allocator, frame: *Frame, x: anytype,
         const st = host.resolvedState() orelse return noState(frame, "CallStatic");
         if (try ensureUnit(H, a, frame, host, r, st, x.init)) |e| return raiseStep(frame, e);
     }
-    const list = try carrier(a, frame, &.{}, x.args, 0, x.n_args);
-    return runFunc(H, a, frame, host, r, x.func, list, x.dst);
+    return runFunc(H, a, frame, host, r, x.func, runOf(frame, x.args, 0, x.n_args), null, x.dst);
 }
 
 /// Whether init unit `unit` has yet to finish, for a tier that cannot run
@@ -377,16 +382,13 @@ fn dispatchRun(comptime H: type, a: Allocator, frame: *Frame, host: *H, r: *cons
         // class leaves the slot to the kind of value it is: the VM's
         // implementation of the slot's root.
         if ((recv != .Instance or cls_opt == null) and slot.int() < r.host_slot.len and r.host_slot[slot.int()] != .none) {
-            var list = try carrier(a, frame, &.{}, args, 0, n);
-            defer ev_state.releaseArgs(a, &list);
-            return land(frame, try host.callNative(a, r.host_slot[slot.int()], list.items), dst);
+            return land(frame, try host.callNative(a, r.host_slot[slot.int()], runOf(frame, args, 0, n)), dst);
         }
         const cls = cls_opt orelse
             return internal(a, frame, "virtual call of slot #{d}: a {s} receiver has no class in the tables", .{ slot.int(), valueTag(&recv) });
         return internal(a, frame, "virtual call: class #{d} ({s}) has no implementation of slot #{d}", .{ cls.int(), className(r, cls), slot.int() });
     };
-    const list = try carrier(a, frame, &.{}, args, 0, n);
-    return runFunc(H, a, frame, host, r, target, list, dst);
+    return runFunc(H, a, frame, host, r, target, runOf(frame, args, 0, n), null, dst);
 }
 
 /// A closure answers `equals` and `hashCode` by what it is: a reference by
@@ -614,10 +616,9 @@ fn propertyMember(
     if (!is_get and !is_set) return null;
     const accessor: u32 = if (is_get) body.func.id.int() else p.setter;
     if (accessor == ir.NO_FUNC) return try internal(a, frame, "property reference: slot #{d} set on a read-only property", .{slot.int()});
-    const bound = try boundOf(a, recv, p.bound);
-    defer if (bound.len != 0) a.free(bound);
-    const list = try carrier(a, frame, bound, args, 1, n);
-    return try runFunc(H, a, frame, host, r, accessorOf(frame.module, r, FuncId.from(accessor), list.items), list, dst);
+    const bound = boundOf(recv, p.bound);
+    const ar = try area(frame, if (bound) |*b| b[0..1] else &.{}, args, 1, n);
+    return try runFunc(H, a, frame, host, r, accessorOf(frame.module, r, FuncId.from(accessor), ar.vals), ar.vals, ar.mark, dst);
 }
 
 /// The implementation of member accessor `accessor` for the receiver that
@@ -641,15 +642,14 @@ fn hostAccessor(comptime H: type, host: *H, r: *const Resolved, accessor: FuncId
     return if (native == .none) null else native;
 }
 
-/// A bound property reference's receiver, its capture 0; empty otherwise.
-/// The caller frees a non-empty result.
-fn boundOf(a: Allocator, closure: *const Value, bound: bool) Allocator.Error![]Value {
-    if (!bound) return &.{};
+/// A bound property reference's receiver, its capture 0; null otherwise.
+fn boundOf(closure: *const Value, bound: bool) ?Value {
+    if (!bound) return null;
     const g = closure.IrClosure.borrow();
     defer g.deinit();
     const caps = g.get().captures;
-    if (caps.len == 0) return &.{};
-    return a.dupe(Value, caps[0..1]);
+    if (caps.len == 0) return null;
+    return caps[0];
 }
 
 fn constString(m: *const ir.Module, id: ir.ConstId) ?[]const u8 {
@@ -661,8 +661,7 @@ fn constString(m: *const ir.Module, id: ir.ConstId) ?[]const u8 {
 }
 
 pub fn execCallNative(comptime H: type, a: Allocator, frame: *Frame, x: anytype, host: *H) Allocator.Error!Step {
-    const run = try ev_frame.readArgRun(a, frame, x.args, x.n_args);
-    defer a.free(run);
+    const run = runOf(frame, x.args, 0, x.n_args);
     if (comptime @hasDecl(H, "callNativeSite")) {
         if (!x.direct and run.len != 0 and run[0] == .Instance) return land(frame, try host.callNativeSite(a, x.native, run), x.dst);
     }
@@ -675,49 +674,48 @@ pub fn execRCallValue(comptime H: type, a: Allocator, frame: *Frame, x: anytype,
     switch (callee) {
         .IrClosure => |c| {
             const body = host.resolvedClosure(&callee) orelse
-                return internal(a, frame, "RCallValue: closure #{d} was not made from sema's code", .{c.asPtr().id});
+                return internal(a, frame, "RCallValue: closure #{d} was not made from sema's code", .{c.asPtrConst().id});
             if (x.n_args != body.arity())
                 return internal(a, frame, "RCallValue: closure of #{d} ({s}) takes {d} arguments, called with {d}", .{ body.func.id.int(), body.func.fqn, body.arity(), x.n_args });
-            var params: std.ArrayList(Value) = undefined;
-            var captures: std.ArrayList(Value) = .empty;
             switch (body.kind) {
                 .property_ref => |p| {
-                    const bound = try boundOf(a, &callee, p.bound);
-                    defer if (bound.len != 0) a.free(bound);
-                    params = try carrier(a, frame, bound, x.args, 0, x.n_args);
-                    const impl = accessorOf(frame.module, r, body.func.id, params.items);
+                    const bound = boundOf(&callee, p.bound);
+                    const ar = try area(frame, if (bound) |*b| b[0..1] else &.{}, x.args, 0, x.n_args);
+                    const impl = accessorOf(frame.module, r, body.func.id, ar.vals);
                     // A host value's accessor the VM implements for that kind
                     // of value, as a virtual call through its slot reaches it.
-                    if (impl == body.func.id) if (hostAccessor(H, host, r, body.func.id, params.items)) |native| {
-                        defer ev_state.releaseArgs(a, &params);
-                        return land(frame, try host.callNative(a, native, params.items), x.dst);
+                    if (impl == body.func.id) if (hostAccessor(H, host, r, body.func.id, ar.vals)) |native| {
+                        const res = try host.callNative(a, native, ar.vals);
+                        frame.tls.vstack.restore(ar.mark);
+                        return land(frame, res, x.dst);
                     };
                     // An accessor bound to a native (`String::length`) runs
                     // it, as a direct call would.
-                    return runFunc(H, a, frame, host, r, impl, params, x.dst);
+                    return runFunc(H, a, frame, host, r, impl, ar.vals, ar.mark, x.dst);
                 },
-                else => {
-                    params = try carrier(a, frame, &.{}, x.args, 0, x.n_args);
-                    const g = c.borrow();
-                    defer g.deinit();
-                    const caps = g.get().captures;
-                    captures = try ev_state.acquireArgsCap(a, caps.len);
-                    captures.appendSliceAssumeCapacity(caps);
-                },
+                else => {},
             }
+            // The body reads a copy of the closure's captures, in an area of their own.
+            const caps = blk: {
+                const g = c.borrow();
+                defer g.deinit();
+                break :blk try ev_frame.ArgArea.push(frame.tls, &.{}, g.get().captures);
+            };
+            const params = runOf(frame, x.args, 0, x.n_args);
             if (ev_flow.flatEnabled()) {
-                frame.flat_call = .{
+                frame.tls.flat_call = .{
                     .func = body.func,
                     .run_module = body.module,
                     .owning = body.owning,
-                    .args = params,
-                    .captures = captures,
+                    .params = params,
+                    .captures = caps.vals,
+                    .area = caps.mark,
                     .closure_id = body.id,
                     .dst = x.dst,
                 };
                 return .flat_call;
             }
-            const res = try ev_enter.evalClosure(H, a, body.module, body.owning, body.func, params, captures, body.id, host);
+            const res = try ev_enter.evalView(H, a, body.module, body.owning, body.func, params, caps.vals, caps.mark, body.id, host);
             return land(frame, res, x.dst);
         },
         .Instance => {
@@ -733,8 +731,8 @@ pub fn execRCallValue(comptime H: type, a: Allocator, frame: *Frame, x: anytype,
             const target = ir.resolved.slotTarget(r, cls, slot) orelse
                 (if (suspend_slot) |ss| ir.resolved.slotTarget(r, cls, ss) else null) orelse
                 return internal(a, frame, "RCallValue: class #{d} ({s}) has no implementation of invoke slot #{d}", .{ cls.int(), className(r, cls), slot.int() });
-            const list = try carrier(a, frame, &.{callee}, x.args, 0, x.n_args);
-            return runFunc(H, a, frame, host, r, target, list, x.dst);
+            const ar = try area(frame, &.{callee}, x.args, 0, x.n_args);
+            return runFunc(H, a, frame, host, r, target, ar.vals, ar.mark, x.dst);
         },
         .Null => return throwNpe(H, a, frame, host, r, null),
         else => return internal(a, frame, "RCallValue: a {s} value is not a function", .{valueTag(&callee)}),
@@ -747,9 +745,7 @@ pub fn execRNewInstance(comptime H: type, a: Allocator, frame: *Frame, x: anytyp
     // A host-backed class's constructor is a native that makes the host
     // value itself.
     if (x.ctor.int() < r.func_native.len and r.func_native[x.ctor.int()] != .none) {
-        var args = try carrier(a, frame, &.{}, x.args, 0, x.n_args);
-        defer ev_state.releaseArgs(a, &args);
-        return land(frame, try host.callNative(a, r.func_native[x.ctor.int()], args.items), x.dst);
+        return land(frame, try host.callNative(a, r.func_native[x.ctor.int()], runOf(frame, x.args, 0, x.n_args)), x.dst);
     }
     const st = host.resolvedState() orelse return noState(frame, "RNewInstance");
     var inst = try ir.resolved.instantiate(a, r, x.class, nextIdentity(st));
@@ -758,8 +754,8 @@ pub fn execRNewInstance(comptime H: type, a: Allocator, frame: *Frame, x: anytyp
     // The register holds the instance while the constructor runs; the
     // constructor's result, `this`, then replaces it.
     try frame.write(x.dst, inst);
-    const list = try carrier(a, frame, &.{inst}, x.args, 0, x.n_args);
-    return runFunc(H, a, frame, host, r, x.ctor, list, x.dst);
+    const ar = try area(frame, &.{inst}, x.args, 0, x.n_args);
+    return runFunc(H, a, frame, host, r, x.ctor, ar.vals, ar.mark, x.dst);
 }
 
 // ---------------------------------------------------------------------------
@@ -807,13 +803,8 @@ pub fn execGetFieldSlot(comptime H: type, a: Allocator, frame: *Frame, x: anytyp
         },
         else => return internal(a, frame, "GetFieldSlot: slot {d} of a {s} value", .{ x.slot, valueTag(&obj) }),
     };
-    const v = blk: {
-        const g = inst.borrow();
-        defer g.deinit();
-        const fields = g.get().fields.items;
-        if (x.slot >= fields.len) break :blk null;
-        break :blk fields[x.slot].value;
-    } orelse return internal(a, frame, "GetFieldSlot: slot {d} is past the instance's fields", .{x.slot});
+    const v = runtime.InstanceData.slotGet(inst, x.slot) orelse
+        return internal(a, frame, "GetFieldSlot: slot {d} is past the instance's fields", .{x.slot});
     v.retain();
     try frame.write(x.dst, v);
     return .cont;
@@ -830,16 +821,11 @@ pub fn execSetFieldSlot(comptime H: type, a: Allocator, frame: *Frame, x: anytyp
         else => return internal(a, frame, "SetFieldSlot: slot {d} of a {s} value", .{ x.slot, valueTag(&obj) }),
     };
     const v = frame.read(x.value);
-    const old = blk: {
-        const g = inst.borrowMut();
-        defer g.deinit();
-        const fields = g.get().fields.items;
-        if (x.slot >= fields.len) break :blk null;
-        v.retain();
-        const prev = fields[x.slot].value;
-        fields[x.slot].value = v;
-        break :blk prev;
-    } orelse return internal(a, frame, "SetFieldSlot: slot {d} is past the instance's fields", .{x.slot});
+    v.retain();
+    const old = runtime.InstanceData.slotSet(inst, x.slot, v) orelse {
+        v.release(a);
+        return internal(a, frame, "SetFieldSlot: slot {d} is past the instance's fields", .{x.slot});
+    };
     old.release(a);
     return .cont;
 }
@@ -1010,14 +996,68 @@ pub fn execLoadStatic(comptime H: type, a: Allocator, frame: *Frame, x: anytype,
     const i = x.static.int();
     if (i >= r.statics.len) return internal(a, frame, "LoadStatic: static #{d} is not in the tables", .{i});
     if (try ensureUnit(H, a, frame, host, r, st, r.statics[i].unit)) |e| return raiseStep(frame, e);
-    const v = blk: {
-        const g = st.borrow();
-        defer g.deinit();
-        break :blk g.get().statics[i];
-    };
+    const v = st.cell.data.loadStatic(i);
     v.retain();
     try frame.write(x.dst, v);
     return .cont;
+}
+
+/// Static `static`, borrowed, once the unit that writes it has run; null when its arm must run
+/// the unit first or report.
+pub inline fn readyStatic(comptime H: type, frame: *const Frame, host: *H, static: u32) ?Value {
+    const r = frame.module.resolved orelse return null;
+    if (static >= r.statics.len) return null;
+    const st = host.resolvedState() orelse return null;
+    const unit = r.statics[static].unit;
+    if (unit != ir.resolved.NONE and !unitDone(st, unit)) return null;
+    return st.cell.data.loadStatic(static);
+}
+
+/// Store `v` in static `static` once the unit that writes it has run, taking one reference and
+/// releasing the value it replaced; false, storing nothing, when its arm must run the unit first
+/// or report.
+pub inline fn storeReadyStatic(comptime H: type, a: Allocator, frame: *const Frame, host: *H, static: u32, v: Value) bool {
+    const r = frame.module.resolved orelse return false;
+    if (static >= r.statics.len) return false;
+    const st = host.resolvedState() orelse return false;
+    const unit = r.statics[static].unit;
+    if (unit != ir.resolved.NONE and !unitDone(st, unit)) return false;
+    v.retain();
+    const old = blk: {
+        const g = st.borrowMut();
+        defer g.deinit();
+        break :blk g.get().storeStatic(static, v);
+    };
+    old.release(a);
+    return true;
+}
+
+/// Whether init unit `unit` has run, so a call it guards goes ahead; `NONE` guards nothing.
+pub inline fn unitReady(comptime H: type, host: *H, unit: u32) bool {
+    if (unit == ir.resolved.NONE) return true;
+    const st = host.resolvedState() orelse return false;
+    if (unit >= st.cell.data.unit_state.len) return false;
+    return unitDone(st, unit);
+}
+
+/// A class test's answer for a value the tables classify by themselves, which a stream op
+/// settles in place; null for a function value, whose class the host knows, and for a value
+/// with no class in the tables, which its arm reports.
+pub inline fn quickIsA(frame: *const Frame, v: *const Value, class: u32, nullable: bool) ?bool {
+    switch (v.*) {
+        .Null => return nullable,
+        .Instance => |inst| {
+            const id = inst.asPtrConst().class_id;
+            if (id == std.math.maxInt(u32)) return null;
+            return ir.resolved.isA(frame.module, ClassId.from(id), ClassId.from(class));
+        },
+        .IrClosure => return null,
+        else => {
+            const r = frame.module.resolved orelse return null;
+            const c = ir.resolved.classOf(r, v) orelse return null;
+            return ir.resolved.isA(frame.module, c, ClassId.from(class));
+        },
+    }
 }
 
 /// Static `id`'s value, its init unit run first, for the host outside a
@@ -1028,11 +1068,7 @@ pub fn staticValue(comptime H: type, a: Allocator, module: *const ir.Module, hos
     const i = id.int();
     if (i >= r.statics.len) return .{ .err = .{ .Unsupported = "LoadStatic: the static is not in the tables" } };
     if (try ensureUnitIn(H, a, module, host, r, st, r.statics[i].unit)) |e| return .{ .err = e };
-    const v = blk: {
-        const g = st.borrow();
-        defer g.deinit();
-        break :blk g.get().statics[i];
-    };
+    const v = st.cell.data.loadStatic(i);
     v.retain();
     return .{ .ok = v };
 }
@@ -1048,9 +1084,7 @@ pub fn execStoreStatic(comptime H: type, a: Allocator, frame: *Frame, x: anytype
     const old = blk: {
         const g = st.borrowMut();
         defer g.deinit();
-        const prev = g.get().statics[i];
-        g.get().statics[i] = v;
-        break :blk prev;
+        break :blk g.get().storeStatic(i, v);
     };
     old.release(a);
     return .cont;
@@ -1076,6 +1110,17 @@ pub fn execLoadObject(comptime H: type, a: Allocator, frame: *Frame, x: anytype,
     }
     if (r.classes[c].object_ctor == ir.NO_FUNC) return internal(a, frame, "LoadObject: class #{d} ({s}) is not an object", .{ c, className(r, x.class) });
     return land(frame, try objectInstance(H, a, frame.module, host, r, st, x.class), x.dst);
+}
+
+/// The singleton of object `class` when it is built (the host's Unit for
+/// Unit), borrowed; null when the object's arm must build it or report.
+pub inline fn builtObject(comptime H: type, frame: *const Frame, host: *H, class: u32) ?Value {
+    const r = frame.module.resolved orelse return null;
+    if (r.host_class.unit) |u| if (u.int() == class) return .Unit;
+    if (class >= r.classes.len) return null;
+    const st = host.resolvedState() orelse return null;
+    if (!objectDone(st, class)) return null;
+    return st.cell.data.singletons[class];
 }
 
 /// Whether object `c` is built. `done` is stored after its singleton, so
@@ -1321,13 +1366,11 @@ fn typeValueClass(a: Allocator, frame: *Frame, r: *const Resolved, ty: Reg) Allo
     const tv = frame.read(ty);
     if (ir.resolved.classOfKClass(&tv)) |c| return .{ .class = c, .nullable = false };
     if (r.base.ktype) |kt| if (tv == .Instance and ir.resolved.classOf(r, &tv) == kt.class) {
-        const g = tv.Instance.borrow();
-        defer g.deinit();
-        const fields = g.get().fields.items;
-        if (kt.classifier < fields.len and kt.nullable < fields.len) {
-            const nullable = fields[kt.nullable].value;
-            if (ir.resolved.classOfKClass(&fields[kt.classifier].value)) |c| {
-                return .{ .class = c, .nullable = nullable == .Bool and nullable.Bool };
+        const classifier = runtime.InstanceData.slotGet(tv.Instance, kt.classifier);
+        const nullable = runtime.InstanceData.slotGet(tv.Instance, kt.nullable);
+        if (classifier != null and nullable != null) {
+            if (ir.resolved.classOfKClass(&classifier.?)) |c| {
+                return .{ .class = c, .nullable = nullable.? == .Bool and nullable.?.Bool };
             }
         }
     };
@@ -1412,8 +1455,7 @@ pub fn execNewArray(comptime H: type, a: Allocator, frame: *Frame, x: anytype, h
     _ = host;
     const r = frame.module.resolved orelse return noTables(frame, "NewArray");
     const h = &r.host_class;
-    const run = try ev_frame.readArgRun(a, frame, x.args, x.n_args);
-    defer a.free(run);
+    const run = runOf(frame, x.args, 0, x.n_args);
     if (h.array != null and h.array.? == x.class) {
         var list: std.ArrayList(Value) = .empty;
         try list.appendSlice(a, run);

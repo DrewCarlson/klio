@@ -29,6 +29,10 @@ const Run = struct {
 
 /// Runs `main` of the hand-built module through `Vm.new` and `vm.run`.
 fn runVm(a: Allocator, h: *Hand, main: FuncId) !Run {
+    // Each program is its own run: the caches keyed by the addresses of an
+    // earlier test's IR must not answer for this one's. They are left filled
+    // after it, for a test that reads them.
+    interp_ir.resetRunGlobalCaches();
     const module_ref = try runtime.ObjRef(ir.Module).init(a, h.m.*);
     var vm = try interp_ir.Vm.new(a, module_ref);
     defer vm.deinit();
@@ -619,10 +623,8 @@ test "a host map entry equals an entry instance by the key and value its getters
     const make = struct {
         fn of(al: Allocator, tables: *const ir.Resolved, c: ir.ClassId, k: Value, v: Value) !Value {
             const inst = try ir.resolved.instantiate(al, tables, c, 1);
-            const g = inst.Instance.borrowMut();
-            defer g.deinit();
-            g.get().fields.items[0].value = k;
-            g.get().fields.items[1].value = v;
+            _ = runtime.InstanceData.slotSet(inst.Instance, 0, k);
+            _ = runtime.InstanceData.slotSet(inst.Instance, 1, v);
             return inst;
         }
     }.of;
@@ -866,7 +868,7 @@ test "a call that suspends resumes into its call's register" {
     try testing.expectEqual(@as(i32, 52), third.ok.Int);
 }
 
-test "a body lowered from sema runs fused or framed, off the leaf tier" {
+test "a chain of static calls runs in the stream, each call site keeping its callee" {
     var mem = hand.TestMemory.init();
     defer mem.deinit();
     const a = mem.allocator();
@@ -874,9 +876,11 @@ test "a body lowered from sema runs fused or framed, off the leaf tier" {
     const main = try hand.staticChain(&h);
     const run = try runVm(a, &h, main);
     try testing.expect(run.res == .ok);
+    try testing.expectEqual(@as(i32, 42), run.res.ok.Int);
+    // Every call ran from a stream, which kept the callee's streams at its site.
     for (h.m.funcs.items) |*f| {
-        // A chain of static calls fuses.
-        try testing.expectEqual(@as(u8, 1), f.fuse_state);
+        const fs = ir.bc.funcStreams(f, h.m.consts.items) orelse return error.TestUnexpectedResult;
+        for (fs.callees) |*c| try testing.expect(c.load(.acquire) != null);
     }
 }
 
@@ -1029,9 +1033,8 @@ test "a native builds a well-known class through its primary constructor" {
     const got = (try rig.natives().constructWellKnown(.indexed_value, &.{ .{ .Int = 3 }, .{ .Int = 9 } }, rig.cap.output())).?;
     try testing.expect(got == .ok and got.ok == .Instance);
     try testing.expectEqual(iv, ir.resolved.classOf(h.r, &got.ok).?);
-    const fields = got.ok.Instance.asPtrConst().fields.items;
-    try testing.expectEqual(@as(i32, 3), fields[0].value.Int);
-    try testing.expectEqual(@as(i32, 9), fields[1].value.Int);
+    try testing.expectEqual(@as(i32, 3), runtime.InstanceData.slotGet(got.ok.Instance, 0).?.Int);
+    try testing.expectEqual(@as(i32, 9), runtime.InstanceData.slotGet(got.ok.Instance, 1).?.Int);
 }
 
 test "a host instance holds the native's state and has no class in the tables" {

@@ -3502,7 +3502,6 @@ pub fn classDefOf(a: Allocator, m: *const ir.Module, c: usize, layout: []const S
     }
     def.ir_class = @intCast(ic.id.int());
     def.layout_slots = lslots;
-    def.layout_state = 2;
     return ObjRef(runtime.ClassDef).init(a, def);
 }
 

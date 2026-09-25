@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // The real androidx.compose.ui.graphics.Canvas — drawing rectangles, circles,
 // rounded rectangles, a path, and a line with real Paint objects onto an
 // offscreen Skia surface, saved as a PNG. `klioDrawToPng` wraps a KlioCanvas

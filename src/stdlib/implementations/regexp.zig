@@ -80,8 +80,8 @@ fn makeSequence(allocator: std.mem.Allocator, items: []const Value) !Value {
 
 fn stringBytes(v: Value) ?[]const u8 {
     return switch (v) {
-        .String => |s| s.asPtr().bytes,
-        .StringBuilder => |sb| sb.asPtr().items,
+        .String => |s| s.asPtrConst().bytes,
+        .StringBuilder => |sb| sb.asPtrConst().items,
         else => null,
     };
 }
@@ -92,7 +92,7 @@ fn stringBytes(v: Value) ?[]const u8 {
 fn inputRef(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error!?StringRef {
     return switch (v) {
         .String => |s| s.clone(),
-        .StringBuilder => |sb| try runtime.strInitOwned(allocator, try allocator.dupe(u8, sb.asPtr().items)),
+        .StringBuilder => |sb| try runtime.strInitOwned(allocator, try allocator.dupe(u8, sb.asPtrConst().items)),
         else => null,
     };
 }
@@ -987,7 +987,7 @@ fn programIsMatch(allocator: std.mem.Allocator, prog: *const Program, input: []c
 }
 
 fn progFromRegex(r: ObjRef(RegexData)) ?*Program {
-    const eng = r.asPtr().engine orelse return null;
+    const eng = r.asPtrConst().engine orelse return null;
     return @ptrCast(@alignCast(eng));
 }
 
@@ -1158,7 +1158,7 @@ fn buildMatch(
     input: StringRef,
     caps: []const Capture,
 ) !MatchData {
-    const s = input.asPtr().bytes;
+    const s = input.asPtrConst().bytes;
     var groups = try allocator.alloc(?MatchGroupData, caps.len);
     for (caps, 0..) |c, i| {
         if (c.start) |start_b| {
@@ -1216,7 +1216,7 @@ fn expandKotlinReplacement(
     const groupText = struct {
         fn get(gs: []const ?MatchGroupData, idx: usize) []const u8 {
             if (idx < gs.len) {
-                if (gs[idx]) |g| return g.value.asPtr().bytes;
+                if (gs[idx]) |g| return g.value.asPtrConst().bytes;
             }
             return "";
         }
@@ -1303,8 +1303,8 @@ fn groupIndexByName(prog: *const Program, name: []const u8) ?usize {
 fn applyRegexOption(opt: Value, flags: *Flags) void {
     switch (opt) {
         .Instance => |inst| {
-            const data = inst.asPtr();
-            const cls = data.class.asPtr();
+            const data = inst.asPtrConst();
+            const cls = data.class.asPtrConst();
             const is_regex_option =
                 std.mem.eql(u8, cls.name, "RegexOption") or
                 std.mem.endsWith(u8, cls.fqn, ".RegexOption");
@@ -1397,7 +1397,7 @@ pub fn regex_options(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .err => |e| return e,
     };
     var items: std.ArrayList(Value) = .empty;
-    if (r.asPtr().options) |ol| {
+    if (r.asPtrConst().options) |ol| {
         const g = ol.borrow();
         defer g.deinit();
         for (g.get().items) |v| {
@@ -1413,7 +1413,7 @@ pub fn regex_pattern(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
-    return ok(.{ .String = r.asPtr().pattern.clone() });
+    return ok(.{ .String = r.asPtrConst().pattern.clone() });
 }
 
 pub fn regex_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1421,7 +1421,7 @@ pub fn regex_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
-    return ok(.{ .String = r.asPtr().pattern.clone() });
+    return ok(.{ .String = r.asPtrConst().pattern.clone() });
 }
 
 pub fn regex_matches(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1460,7 +1460,7 @@ pub fn regex_find(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.find requires a String");
     }
     const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
-    const s = sr.asPtr().bytes;
+    const s = sr.asPtrConst().bytes;
     var start: usize = 0;
     if (ctx.args.len > 2) {
         const v = ctx.args[2];
@@ -1495,7 +1495,7 @@ pub fn regex_find_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.findAll requires a String");
     }
     const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
-    const s = sr.asPtr().bytes;
+    const s = sr.asPtrConst().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.findAll requires a Regex receiver");
 
     // An optional `startIndex` char index starts the scan; outside `[0, length]`
@@ -1538,7 +1538,7 @@ pub fn regex_match_entire(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.matchEntire requires a String");
     }
     const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
-    const s = sr.asPtr().bytes;
+    const s = sr.asPtrConst().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.matchEntire requires a Regex receiver");
     if (try runMatchFull(ctx.allocator, prog, s)) |caps| {
         defer ctx.allocator.free(caps);
@@ -1557,7 +1557,7 @@ pub fn regex_match_at(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.matchAt requires a String");
     }
     const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
-    const s = sr.asPtr().bytes;
+    const s = sr.asPtrConst().bytes;
     const idx = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
     if (idx == null) return typeErr("Regex.matchAt requires Int index");
     {
@@ -1660,7 +1660,7 @@ fn performRegexReplace(
     repl: ?Value,
     cfg: RegexReplace,
 ) std.mem.Allocator.Error!EvalResult {
-    const s = sr.asPtr().bytes;
+    const s = sr.asPtrConst().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.replace requires a Regex receiver");
     const allocator = ctx.allocator;
 
@@ -1669,7 +1669,7 @@ fn performRegexReplace(
     }
 
     if (repl.? == .String) {
-        const template = repl.?.String.asPtr().bytes;
+        const template = repl.?.String.asPtrConst().bytes;
         if (replacementError(template, prog)) |fqn| {
             const msg = try std.fmt.allocPrint(allocator, "Invalid replacement string: '{s}'", .{template});
             defer allocator.free(msg);
@@ -1735,7 +1735,7 @@ fn performRegexReplace(
         switch (rv) {
             .err => return rv,
             .ok => |val| switch (val) {
-                .String => |rs| try out.appendSlice(allocator, rs.asPtr().bytes),
+                .String => |rs| try out.appendSlice(allocator, rs.asPtrConst().bytes),
                 .Char => |c| {
                     const cs = try charUnitToString(allocator, c);
                     defer allocator.free(cs);
@@ -1784,7 +1784,7 @@ pub fn regex_split(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.split requires a String");
     }
     const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
-    const s = sr.asPtr().bytes;
+    const s = sr.asPtrConst().bytes;
     var limit: i64 = 0;
     if (ctx.args.len > 2) {
         const v = ctx.args[2];
@@ -1808,7 +1808,7 @@ pub fn regex_split_to_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
         return typeErr("Regex.splitToSequence requires a String");
     }
     const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
-    const s = sr.asPtr().bytes;
+    const s = sr.asPtrConst().bytes;
     var limit: i64 = 0;
     if (ctx.args.len > 2) {
         const v = ctx.args[2];
@@ -1856,7 +1856,7 @@ pub fn stringRegexSplitItems(
     limit: i64,
 ) std.mem.Allocator.Error!union(enum) { ok: []Value, err: RuntimeError } {
     const prog = progFromRegex(r) orelse return .{ .err = .{ .Type = "split requires a Regex" } };
-    const parts = try splitItems(ctx.allocator, prog, sr.asPtr().bytes, limit);
+    const parts = try splitItems(ctx.allocator, prog, sr.asPtrConst().bytes, limit);
     return .{ .ok = parts };
 }
 
@@ -1903,7 +1903,7 @@ pub fn match_result_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
-    const groups = m.asPtr().groups;
+    const groups = m.asPtrConst().groups;
     if (groups.len == 0 or groups[0] == null) {
         return typeErr("MatchResult has no whole-match group");
     }
@@ -1915,7 +1915,7 @@ pub fn match_result_range(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
-    const groups = m.asPtr().groups;
+    const groups = m.asPtrConst().groups;
     if (groups.len == 0 or groups[0] == null) {
         return typeErr("MatchResult has no whole-match group");
     }
@@ -1928,7 +1928,7 @@ pub fn match_result_group_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
         .ok => |v| v,
         .err => |e| return e,
     };
-    const groups = m.asPtr().groups;
+    const groups = m.asPtrConst().groups;
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
     for (groups) |g| {
@@ -1946,7 +1946,7 @@ pub fn match_result_destructured(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
         .ok => |v| v,
         .err => |e| return e,
     };
-    const groups = m.asPtr().groups;
+    const groups = m.asPtrConst().groups;
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
     // `MatchResult.Destructured` exposes the capture groups through
@@ -1990,7 +1990,7 @@ pub fn match_named_group_get(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     defer g.deinit();
     const mv = g.get().get("__mgc") orelse return typeErr("not a MatchNamedGroupCollection");
     if (mv != .Match) return typeErr("not a MatchNamedGroupCollection");
-    return matchGroupOf(ctx.allocator, mv.Match.asPtr(), key);
+    return matchGroupOf(ctx.allocator, mv.Match.asPtrConst(), key);
 }
 
 /// Group `key` of match `md`: by index, or by the name a named group
@@ -2002,7 +2002,7 @@ pub fn matchGroupOf(a: std.mem.Allocator, md: *const MatchData, key: Value) std.
         const n = key.asI64() orelse return typeErr("bad group index");
         if (n >= 0 and n < md.groups.len) idx = @intCast(n);
     } else if (key == .String) {
-        const name = key.String.asPtr().bytes;
+        const name = key.String.asPtrConst().bytes;
         var found = false;
         if (progFromRegex(md.regex)) |prog| {
             for (prog.names, 0..) |gn, i| {
@@ -2033,7 +2033,7 @@ pub fn match_named_group_size(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult 
     defer g.deinit();
     const mv = g.get().get("__mgc") orelse return ok(.{ .Int = 0 });
     if (mv != .Match) return ok(.{ .Int = 0 });
-    return ok(.{ .Int = @intCast(mv.Match.asPtr().groups.len) });
+    return ok(.{ .Int = @intCast(mv.Match.asPtrConst().groups.len) });
 }
 
 pub fn match_named_group_iterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -2045,7 +2045,7 @@ pub fn match_named_group_iterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalRes
         defer g.deinit();
         const mv = g.get().get("__mgc") orelse return typeErr("not a MatchNamedGroupCollection");
         if (mv != .Match) return typeErr("not a MatchNamedGroupCollection");
-        for (mv.Match.asPtr().groups) |gd| {
+        for (mv.Match.asPtrConst().groups) |gd| {
             try items.append(ctx.allocator, try matchGroupValue(ctx.allocator, gd));
         }
     }
@@ -2058,8 +2058,8 @@ pub fn match_result_next(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
-    const md = m.asPtr();
-    const input = md.input.asPtr().bytes;
+    const md = m.asPtrConst();
+    const input = md.input.asPtrConst().bytes;
     var start = md.end_byte;
     if (md.groups.len > 0) {
         if (md.groups[0]) |g| {
@@ -2090,7 +2090,7 @@ pub fn match_result_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult 
         .ok => |v| v,
         .err => |e| return e,
     };
-    const groups = m.asPtr().groups;
+    const groups = m.asPtrConst().groups;
     if (groups.len > 0) {
         if (groups[0]) |g| {
             return ok(.{ .String = g.value.clone() });

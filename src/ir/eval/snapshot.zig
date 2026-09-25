@@ -461,19 +461,18 @@ pub fn gcMarkSuspendState(state: *SuspendState, m: *runtime.gc.Marker) void {
     while (seg) |t| : (seg = t.next) {
         if (m.minor and t.gc_quiesced) continue;
         for (t.frames.items[t.head..]) |snap| gcMarkSnapshot(snap, m);
-        t.gc_quiesced = true;
+        if (m.marksWhole()) t.gc_quiesced = true;
     }
-    state.gc_quiesced = true;
+    if (m.marksWhole()) state.gc_quiesced = true;
 }
 
 pub fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
     if (snap.live) |act| {
         gcMarkFrameRegs(&act.frame, m);
-        for (act.frame.params.items) |v| v.gcMark(m);
-        for (act.frame.captures.items) |v| v.gcMark(m);
-        act.frame.pending_finally.gcMark(m);
+        for (act.frame.params) |v| v.gcMark(m);
+        for (act.frame.captures) |v| v.gcMark(m);
+        if (act.frame.pending) |p| p.gcMark(m);
         markFrameClosure(act.frame.closure_id, m);
-        if (act.keepalive) |ka| ka.gcMark(m);
         return;
     }
     switch (snap.regs) {

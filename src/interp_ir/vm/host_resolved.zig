@@ -16,6 +16,7 @@ const VmHost = vmhost.VmHost;
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
+const InstanceData = runtime.InstanceData;
 const IrClosureRef = runtime.IrClosureRef;
 const Module = ir.Module;
 const FuncId = ir.FuncId;
@@ -135,11 +136,7 @@ fn hostBase(r: *const ir.Resolved, v: *const Value) ?Value {
     if (cls.int() >= r.classes.len) return null;
     const slot = r.classes[cls.int()].host_slot;
     if (slot == ir.resolved.NONE) return null;
-    const g = inst.borrow();
-    defer g.deinit();
-    const fields = g.get().fields.items;
-    if (slot >= fields.len) return null;
-    return fields[slot].value;
+    return InstanceData.slotGet(inst, slot);
 }
 
 /// `coroutineContext`: the context of the coroutine the pump made active,
@@ -258,7 +255,7 @@ pub fn kotlinValue(self: *VmHost, allocator: Allocator, v: Value) Allocator.Erro
         return ir.eval.resolved_ops.staticValue(VmHost, allocator, module, self, st);
     }
     const rc = r.base.result orelse return .{ .ok = v };
-    const payload = v.Result.payload.asPtr().*;
+    const payload = v.Result.payload.asPtrConst().*;
     var inner = payload;
     if (!v.Result.ok) {
         const fc = r.base.result_failure orelse return .{ .ok = v };
@@ -518,7 +515,6 @@ pub fn makeResolvedClosure(
     return .{ .ok = .{ .IrClosure = ref } };
 }
 
-/// The body of a closure lowered from sema, or null for any other value.
 /// Runs a closure made from sema's code over `args`, with `this_value` as
 /// its first argument when given; null for any other callee.
 pub fn callResolvedClosure(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: ?*const Value, args: []const Value) Allocator.Error!?EvalResult {
@@ -541,9 +537,13 @@ pub fn callResolvedClosure(self: *VmHost, allocator: Allocator, callee: *const V
     return try ir.eval.evalClosure(VmHost, allocator, body.module, body.owning, body.func, params, caps, body.id, self);
 }
 
-pub fn resolvedClosure(self: *VmHost, v: *const Value) ?ir.resolved.ClosureBody {
+/// The body of a closure lowered from sema, or null for any other value.
+/// Kept out of line: inlined into the dispatch loop and the host's call
+/// paths, it displaces other inlining in the resolved dispatch helpers, and
+/// every lambda call runs about 35 more instructions.
+pub noinline fn resolvedClosure(self: *VmHost, v: *const Value) ?ir.resolved.ClosureBody {
     if (v.* != .IrClosure) return null;
-    const id = v.IrClosure.asPtr().id;
+    const id = v.IrClosure.asPtrConst().id;
     const info = self.closures.get(@intCast(id)) orelse return null;
     const kind = info.resolved orelse return null;
     const module = info.module orelse self.module.asPtrConst();

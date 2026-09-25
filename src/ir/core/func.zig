@@ -144,32 +144,9 @@ pub const Func = struct {
     /// Func classification for the extension scorer; `plain` unless the member-extension lowering sets it.
     kind: FuncKind = .plain,
     is_tailrec: bool = false,
-    /// Monomorphic call fast-path plan, cached on first call: 0 = not computed, 1 =
-    /// ineligible, else the low 14 bits are the eligible parameter count + 2, plus the flags.
-    fast_call: u16 = 0,
-    /// Index of `"this"` in `capture_order`: -2 = not yet computed, -1 = no `this` capture.
-    this_cap_idx: i32 = -2,
-    /// Accessor-shape memo: 0 = unknown, 1 = not an accessor, 2 = the body is exactly
-    /// `LoadParam #0; GetField; return`, with `acc_field` holding the GetField name.
-    acc_state: u8 = 0,
-    acc_field: u32 = 0,
-    /// Single-fill (CAS from 0) claimed receiver-class identity and its packed stored-slot
-    /// route for the frameless accessor read; only the winner writes `acc_route`.
-    acc_cls: u64 = 0,
-    acc_route: u64 = 0,
-    /// Fused-tier verdict: 0 = unasked, 1 = eligible (this body and every statically-resolved
-    /// callee), 2 = ineligible, 3 = in progress, which reads eligible until the root settles.
-    fuse_state: u8 = 0,
-    /// Trivial property-initializer memo: 0 = unasked, 1 = not trivial, 2 = returns one
-    /// constant (`triv_init_val` = ConstId), 3 = echoes one parameter (`triv_init_val` = index).
-    triv_init_state: u8 = 0,
-    triv_init_val: u32 = 0,
-    /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill, 2 = may start unfilled.
-    frame_fill_state: u8 = 0,
     /// Bytecode-stream table memo (`bc.funcStreams`): 0 unresolved, 1 none, else a
-    /// `*const bc.FuncStreams`. `bc_memo_fuse` says which allow_fuse variant it holds.
+    /// `*const bc.FuncStreams`.
     bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    bc_memo_fuse: u8 = 0,
     /// `bc.streamGen()` at fill time; a stale generation must fall to the shared path.
     bc_memo_gen: u32 = 0,
     /// True when `params[0]` is a synthesized `this` receiver (a dispatch receiver, an instance
@@ -209,6 +186,10 @@ pub const Func = struct {
 
     /// Null when every rare header field is at its default; read through `x()`.
     extra: ?*const FuncExtra = null,
+
+    /// Run memos an image must not carry: an image built in a process that ran code would
+    /// otherwise hand its pointers to the next process.
+    pub const image_cache = .{ "bc_memo", "bc_memo_gen" };
 
     pub inline fn x(self: *const Func) *const FuncExtra {
         return self.extra orelse &no_func_extra;
@@ -265,21 +246,9 @@ pub const Func = struct {
     /// Whether a fresh frame may leave its register file unfilled: every register read is
     /// preceded by a write on ALL paths from entry, proved by a must-written dataflow over the
     /// CFG. Catch/finally/absorption bodies keep the eager fill, since an exception edge can
-    /// enter a handler mid-block.
-    pub fn frameNoFill(self: *const Func) bool {
-        switch (self.frame_fill_state) {
-            1 => return false,
-            2 => return true,
-            else => {},
-        }
-        // A deferred body has no blocks to analyze yet; decide and cache once it decodes.
-        if (self.blocks.len == 0) return false;
-        const verdict = self.frameDefBeforeUse();
-        @constCast(self).frame_fill_state = if (verdict) 2 else 1;
-        return verdict;
-    }
-
-    fn frameDefBeforeUse(self: *const Func) bool {
+    /// enter a handler mid-block. The function's code table (`bc.FuncStreams.no_fill`) keeps
+    /// the answer.
+    pub fn frameDefBeforeUse(self: *const Func) bool {
         if (self.n_locals > FRAME_FILL_MAX_REGS) return false;
         const nb = self.blocks.len;
         if (nb == 0 or nb > FRAME_FILL_MAX_BLOCKS) return false;
@@ -360,7 +329,7 @@ pub const Func = struct {
 
 };
 
-/// CFG size bound for `frameNoFill`'s dataflow; a larger body keeps the eager fill.
+/// CFG size bound for `frameDefBeforeUse`'s dataflow; a larger body keeps the eager fill.
 pub const FRAME_FILL_MAX_BLOCKS: usize = 256;
 
 /// Register-set width for `frameDefBeforeUse`, in 64-bit words. Compose composables and

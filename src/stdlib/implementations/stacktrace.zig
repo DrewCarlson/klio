@@ -38,7 +38,7 @@ fn frameOf(args: []const Value, comptime what: []const u8) union(enum) { frame: 
     if (args.len == 0 or args[0] != .String) {
         return .{ .err = .{ .err = .{ .Type = "StackTraceElement." ++ what ++ " requires a stack trace element" } } };
     }
-    return .{ .frame = parse(args[0].String.asPtr().bytes) };
+    return .{ .frame = parse(args[0].String.asPtrConst().bytes) };
 }
 
 fn string(a: Allocator, s: []const u8) Allocator.Error!EvalResult {
@@ -121,16 +121,16 @@ test "the members read the parts of the element" {
     defer arena.deinit();
     const a = arena.allocator();
     const args = [_]Value{.{ .String = try runtime.strInit(a, "demo.Outer.Box.run(Box.kt:42)") }};
-    try std.testing.expectEqualStrings("demo.Outer.Box", (try classNameOf(a, &args)).ok.String.asPtr().bytes);
-    try std.testing.expectEqualStrings("run", (try methodNameOf(a, &args)).ok.String.asPtr().bytes);
-    try std.testing.expectEqualStrings("Box.kt", (try fileNameOf(a, &args)).ok.String.asPtr().bytes);
+    try std.testing.expectEqualStrings("demo.Outer.Box", (try classNameOf(a, &args)).ok.String.asPtrConst().bytes);
+    try std.testing.expectEqualStrings("run", (try methodNameOf(a, &args)).ok.String.asPtrConst().bytes);
+    try std.testing.expectEqualStrings("Box.kt", (try fileNameOf(a, &args)).ok.String.asPtrConst().bytes);
     try std.testing.expectEqual(@as(i32, 42), (try lineNumberOf(a, &args)).ok.Int);
     // A top-level function's qualifier is its package; the root package's
     // functions have none.
     const top = [_]Value{.{ .String = try runtime.strInit(a, "demo.main(main.kt:3)") }};
-    try std.testing.expectEqualStrings("demo", (try classNameOf(a, &top)).ok.String.asPtr().bytes);
-    try std.testing.expectEqualStrings("main", (try methodNameOf(a, &top)).ok.String.asPtr().bytes);
+    try std.testing.expectEqualStrings("demo", (try classNameOf(a, &top)).ok.String.asPtrConst().bytes);
+    try std.testing.expectEqualStrings("main", (try methodNameOf(a, &top)).ok.String.asPtrConst().bytes);
     const root = [_]Value{.{ .String = try runtime.strInit(a, "main(main.kt:3)") }};
-    try std.testing.expectEqualStrings("", (try classNameOf(a, &root)).ok.String.asPtr().bytes);
-    try std.testing.expectEqualStrings("main", (try methodNameOf(a, &root)).ok.String.asPtr().bytes);
+    try std.testing.expectEqualStrings("", (try classNameOf(a, &root)).ok.String.asPtrConst().bytes);
+    try std.testing.expectEqualStrings("main", (try methodNameOf(a, &root)).ok.String.asPtrConst().bytes);
 }

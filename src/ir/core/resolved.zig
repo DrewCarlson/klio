@@ -223,7 +223,7 @@ pub const Exceptions = struct {
 pub const ClassRt = struct {
     /// Its `ir_class` is this class's id.
     def: ObjRef(runtime.ClassDef),
-    /// One per field slot. The def's `layout_slots` names them, for display.
+    /// One per field slot. The def's `layout_slots` names them.
     seeds: []const SlotSeed = &.{},
     /// Objects and companions: the constructor `LoadObject` runs.
     object_ctor: u32 = NO_FUNC,
@@ -424,8 +424,13 @@ pub const UnitState = enum(u8) { idle, running, done, failed };
 /// Per VM run: owned by the host, reached by `host.resolvedState()` behind
 /// a shared handle, so every thread of the run sees one set of statics.
 pub const ResolvedState = struct {
-    /// By StaticId.
+    /// By StaticId. Read with `loadStatic`, which takes no lock; written with
+    /// `storeStatic` under the state's exclusive borrow.
     statics: []Value,
+    /// Odd while a static store is in flight. A read copies a static between
+    /// two equal even readings, so it never pairs one store's tag with
+    /// another's payload; stores take turns under the exclusive borrow.
+    static_seq: std.atomic.Value(u32) = .init(0),
     /// By init unit.
     unit_state: []UnitState,
     /// By init unit: what a failed unit's initializer threw, which every
@@ -450,6 +455,44 @@ pub const ResolvedState = struct {
     failed_objects: std.AutoHashMapUnmanaged(u32, Value) = .empty,
     /// The identity the next instance takes.
     next_identity: u64 = 0,
+
+    /// Static `i`, copied whole. The collector never runs inside
+    /// `storeStatic`, which holds no safe point.
+    pub fn loadStatic(self: *const ResolvedState, i: usize) Value {
+        const words: *const [2]u64 = @ptrCast(&self.statics[i]);
+        while (true) {
+            const before = self.static_seq.load(.acquire);
+            if (before & 1 == 0) {
+                // Acquire loads keep the second reading after both words, and
+                // one that saw a word of a later store sees its odd sequence.
+                const w0 = @atomicLoad(u64, &words[0], .acquire);
+                const w1 = @atomicLoad(u64, &words[1], .acquire);
+                if (self.static_seq.load(.monotonic) == before) {
+                    var out: Value = undefined;
+                    const dst: *[2]u64 = @ptrCast(&out);
+                    dst[0] = w0;
+                    dst[1] = w1;
+                    return out;
+                }
+            }
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Stores `v` in static `i` and answers the value it replaced, taking no
+    /// reference. The caller holds the state's exclusive borrow.
+    pub fn storeStatic(self: *ResolvedState, i: usize, v: Value) Value {
+        const seq = self.static_seq.load(.monotonic);
+        self.static_seq.store(seq + 1, .monotonic);
+        const old = self.statics[i];
+        // Release stores: a read that sees either word also sees the odd sequence.
+        const src: *const [2]u64 = @ptrCast(&v);
+        const words: *[2]u64 = @ptrCast(&self.statics[i]);
+        @atomicStore(u64, &words[0], src[0], .release);
+        @atomicStore(u64, &words[1], src[1], .release);
+        self.static_seq.store(seq + 2, .release);
+        return old;
+    }
 
     pub fn gcTrace(self: *const ResolvedState, m: *runtime.gc.Marker) void {
         for (self.statics) |v| v.gcMark(m);
@@ -505,17 +548,11 @@ pub const StateRef = ObjRef(ResolvedState);
 pub fn classOf(r: *const Resolved, v: *const Value) ?ClassId {
     const h = &r.host_class;
     return switch (v.*) {
-        // Written once when the tables make the instance, so read without
-        // a borrow; an instance made otherwise has its def's.
+        // Written once when the instance is made, from its def's id, so
+        // read without a borrow.
         .Instance => |inst| blk: {
             const id = inst.asPtrConst().class_id;
-            if (id != std.math.maxInt(u32)) break :blk ClassId.from(id);
-            const g = inst.borrow();
-            defer g.deinit();
-            const cg = g.get().class.borrow();
-            defer cg.deinit();
-            const raw = cg.get().ir_class;
-            break :blk if (raw == std.math.maxInt(u32)) null else ClassId.from(raw);
+            break :blk if (id == std.math.maxInt(u32)) null else ClassId.from(id);
         },
         .Unit => h.unit,
         .Bool => h.boolean,
@@ -651,21 +688,16 @@ pub fn seedValue(seed: SlotSeed) Value {
 /// constructor runs. The caller owns the one reference.
 pub fn instantiate(a: Allocator, r: *const Resolved, class: ClassId, identity: u64) Allocator.Error!Value {
     const rt = &r.classes[class.int()];
-    const names = rt.def.asPtrConst().layout_slots;
-    var fields: std.ArrayList(InstanceData.Field) = .empty;
-    try fields.ensureTotalCapacityPrecise(a, rt.seeds.len);
-    for (rt.seeds, 0..) |seed, i| {
-        const name: []const u8 = if (i < names.len) names[i].name else "";
-        fields.appendAssumeCapacity(.{ .name = name, .value = seedValue(seed) });
-    }
+    const slots: []Value = if (rt.seeds.len == 0) &.{} else try a.alloc(Value, rt.seeds.len);
+    errdefer if (slots.len != 0) a.free(slots);
+    for (rt.seeds, slots) |seed, *v| v.* = seedValue(seed);
     const inst = try ObjRef(InstanceData).init(a, .{
         .class = rt.def.clone(),
-        .fields = fields,
+        .slots = slots,
+        .class_id = class.int(),
         .outer = null,
         .identity = identity,
         .native_state = null,
-        .reserved = @intCast(rt.seeds.len),
-        .class_id = class.int(),
     });
     return .{ .Instance = inst };
 }
@@ -686,6 +718,20 @@ test "a fresh state seeds its statics and starts every unit idle" {
     try std.testing.expect(g.get().statics[1] == .Null);
     try std.testing.expectEqual(UnitState.idle, g.get().unit_state[0]);
     try std.testing.expectEqual(@as(usize, 0), g.get().singletons.len);
+}
+
+test "a static store is read back whole, and the sequence is even between stores" {
+    const a = std.testing.allocator;
+    var statics = [_]StaticRt{.{ .unit = NONE, .seed = .int, .name = "a" }};
+    const r: Resolved = .{ .statics = &statics };
+    const st = try stateNew(a, &r);
+    defer st.deinit();
+    const s = &st.cell.data;
+    try std.testing.expectEqual(Value{ .Int = 0 }, s.loadStatic(0));
+    const old = s.storeStatic(0, .{ .Long = -5 });
+    try std.testing.expectEqual(Value{ .Int = 0 }, old);
+    try std.testing.expectEqual(Value{ .Long = -5 }, s.loadStatic(0));
+    try std.testing.expectEqual(@as(u32, 2), s.static_seq.load(.monotonic));
 }
 
 test "a primitive value's class comes from the host table" {

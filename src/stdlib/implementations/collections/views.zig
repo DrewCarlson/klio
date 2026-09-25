@@ -58,7 +58,7 @@ pub fn syncMapView(a: Allocator, receiver: Value) void {
         if (j < items.len) {
             const it = items[j];
             const target = switch (kind) {
-                .Entries => if (it == .MapEntry) it.MapEntry.key.asPtr().* else it,
+                .Entries => if (it == .MapEntry) it.MapEntry.key.asPtrConst().* else it,
                 else => it,
             };
             matched = eqBoxed(&proj, &target);
@@ -145,6 +145,7 @@ pub fn mapEntryViewGuard(a: Allocator, v: *const Value) Error!?EvalResult {
     const me = v.MapEntry;
     const entries = me.backing.get() orelse return null;
     var stale = false;
+    var live: ?Value = null;
     {
         const g = entries.borrow();
         defer g.deinit();
@@ -155,20 +156,25 @@ pub fn mapEntryViewGuard(a: Allocator, v: *const Value) Error!?EvalResult {
         }
         if (!stale) {
             for (g.get().pairs.items) |*slot| {
-                if (Value.structuralEq(&slot.key, me.key.asPtr())) {
-                    const live = slot.value;
-                    if (!Value.structuralEq(me.value.asPtr(), &live)) {
-                        if (runtime.reclaimEnabled()) {
-                            live.retain();
-                            me.value.asPtr().release(a);
-                        }
-                        me.value.asPtr().* = live;
-                    }
+                if (Value.structuralEq(&slot.key, me.key.asPtrConst())) {
+                    live = slot.value;
                     break;
                 }
             }
         }
     }
     if (stale) return try thrown(a, "kotlin.ConcurrentModificationException", null);
+    // The box is a cell of its own: the refreshed value is stored under its lock.
+    if (live) |lv| {
+        const vg = me.value.borrowMut();
+        defer vg.deinit();
+        if (!Value.structuralEq(vg.get(), &lv)) {
+            if (runtime.reclaimEnabled()) {
+                lv.retain();
+                vg.get().release(a);
+            }
+            vg.get().* = lv;
+        }
+    }
     return null;
 }

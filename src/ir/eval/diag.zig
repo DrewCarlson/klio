@@ -79,8 +79,8 @@ var call_stats_mutex: runtime.SpinMutex = .{};
 
 var call_stats: ?runtime.NameHashMap(u64) = null;
 
-/// Counts one activation of `fid`, whichever tier runs it: the framed entry,
-/// a flat activation and a fused run each call this once. Keyed by FuncId,
+/// Counts one activation of `fid`: the framed entry and a flat activation
+/// each call this once. Keyed by FuncId,
 /// so `KLIO_CALL_STATS_LAMBDA` splits `<lambda>`.
 pub inline fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     if (call_stats_state == 1) return;
@@ -107,7 +107,7 @@ fn callStatsBumpSlow(fqn: []const u8, fid: u32, module: ?*const Module) void {
             var site_buf: [64]u8 = undefined;
             var site: []const u8 = "";
             if (ev_state.evtlsPtr().frame_chain) |fr| {
-                if (fr.cur_span) |sp| {
+                if (fr.span()) |sp| {
                     if (span.active_map) |am| {
                         if (am.getChecked(sp.file)) |sf| {
                             const lc = sf.lineCol(sp.start);
@@ -268,14 +268,21 @@ pub var frame_census_on: bool = false;
 
 pub fn frameCountInit() void {
     parent.frame_count_on = runtime.envOnce("KLIO_FRAME_COUNT") != null;
-    fuse_census_on = runtime.envOnce("KLIO_FUSE_CENSUS") != null;
-    if (fuse_census_on) parent.frame_count_on = true;
     if (runtime.envOnce("KLIO_FRAME_WATCH")) |w| {
         parent.frame_watch_want = w;
         parent.frame_count_on = true;
     }
     frame_census_on = runtime.envOnce("KLIO_FRAME_CENSUS") != null;
     if (frame_census_on) parent.frame_count_on = true;
+    parent.call_hooks_on = parent.frame_count_on or runtime.prof.fn_prof_active or
+        runtime.envOnce("KLIO_MISS_TRACE") != null or
+        runtime.envOnce("KLIO_CALLVALUE_TRACE") != null or
+        runtime.envOnce("KLIO_CMG_TRACE") != null or
+        runtime.envOnce("KLIO_GC_STW_AUDIT") != null or
+        runtime.envOnce("KLIO_DUMP_FN") != null or
+        runtime.envOnce("KLIO_CALL_STATS") != null or
+        runtime.envOnce("KLIO_FAULT_INJECT") != null or
+        !ev_flow.flatEnabled();
 }
 
 pub inline fn frameCensusBump(fid: u32) void {
@@ -283,65 +290,12 @@ pub inline fn frameCensusBump(fid: u32) void {
     frame_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= 1;
 }
 
-/// `KLIO_FUSE_CENSUS`: classify every activated body once and tally by verdict.
-var fuse_census_on: bool = false;
-
-var fuse_ok_acts: u64 = 0;
-
-var fuse_blocked_acts: u64 = 0;
-
-var fuse_structural_acts: u64 = 0;
-
-var fuse_block_by_tag: [64]u64 = @splat(0);
-
-const FUSE_VERDICT_SLOTS: usize = 1 << 21;
-
-/// 0 = unclassified, 1 = ok, 2 + tag = blocked by that instruction tag,
-/// 255 = structural (suspend / catches / too big).
-var fuse_verdict: [FUSE_VERDICT_SLOTS]u8 = @splat(0);
-
-fn fuseClassify(func: *const Func) u8 {
-    if (func.is_suspend) return 255;
-    if (func.blocks.len == 0 or func.blocks.len > 64) return 255;
-    if (func.n_locals > 128) return 255;
-    var total: usize = 0;
-    for (func.blocks) |*b| {
-        if (b.h().catches.len != 0 or b.h().finally != null) return 255;
-        total += b.insts.len;
-        if (total > 256) return 255;
-        switch (b.terminator) {
-            .Return, .Goto, .Branch, .Throw, .Unreachable => {},
-        }
-        for (b.insts) |*inst| {
-            switch (inst.*) {
-                .Const, .Move, .LoadParam, .LoadCapture, .BinOp, .UnOp, .Not, .Trace, .NotNullAssert, .LateinitCheck, .MakeCell, .CellGet, .CellSet => {},
-                else => return 2 + @as(u8, @intFromEnum(std.meta.activeTag(inst.*))),
-            }
-        }
-    }
-    return 1;
-}
-
-pub inline fn fuseCensusBump(func: *const Func) void {
-    if (!fuse_census_on) return;
-    const slot = func.id.int() & (FUSE_VERDICT_SLOTS - 1);
-    if (fuse_verdict[slot] == 0) fuse_verdict[slot] = fuseClassify(func);
-    switch (fuse_verdict[slot]) {
-        1 => fuse_ok_acts += 1,
-        255 => fuse_structural_acts += 1,
-        else => |v| {
-            fuse_blocked_acts += 1;
-            if (v >= 2 and v - 2 < fuse_block_by_tag.len) fuse_block_by_tag[v - 2] += 1;
-        },
-    }
-}
-
 pub fn frameCountDump(module: *const Module) void {
     if (!parent.frame_count_on) return;
     std.debug.print("[frames] entries={d} activations={d} insts={d}\n", .{ parent.frame_count_total, parent.frame_alloc_total, parent.inst_count_all.load(.monotonic) + parent.inst_count });
     std.debug.print("[call] pre_ms={d} args_ms={d} replay_ms={d} prep_ms={d} probe_ms={d}\n", .{ parent.cm_pre_ns / 1_000_000, parent.cm_args_ns / 1_000_000, parent.cm_replay_ns / 1_000_000, parent.cm_prep_ns / 1_000_000, parent.cm_probe_ns / 1_000_000 });
     std.debug.print("[call] member_arms={d}\n", .{parent.cm_calls});
-    std.debug.print("[regs] pool_hit={d} pool_miss={d} filled_slots={d}\n", .{ parent.regs_pool_hit, parent.regs_pool_miss, parent.regs_fill_slots });
+    std.debug.print("[regs] filled_slots={d}\n", .{parent.regs_fill_slots});
     if (frame_census_on) {
         const FE = struct { name: []const u8, n: u32 };
         var fl: std.ArrayList(FE) = .empty;
@@ -361,15 +315,6 @@ pub fn frameCountDump(module: *const Module) void {
         }.gt);
         for (fl.items[0..@min(fl.items.len, 12)]) |e| {
             std.debug.print("[fill] {d:>10} {s}\n", .{ e.n, e.name });
-        }
-    }
-    if (fuse_census_on) {
-        std.debug.print("[fuse] ok={d} blocked={d} structural={d}\n", .{ fuse_ok_acts, fuse_blocked_acts, fuse_structural_acts });
-        const tag_fields = @typeInfo(@typeInfo(Inst).@"union".tag_type.?).@"enum".fields;
-        inline for (tag_fields) |f| {
-            if (f.value < fuse_block_by_tag.len and fuse_block_by_tag[f.value] != 0) {
-                std.debug.print("[fuse-block] {d:>10} {s}\n", .{ fuse_block_by_tag[f.value], f.name });
-            }
         }
     }
     std.debug.print("[getfield] mono={d} getter={d} poly={d} total={d} getter_ms={d} slow_ms={d}\n", .{ parent.gf_mono, parent.gf_getter, parent.gf_poly, parent.gf_slow, parent.gf_getter_ns / 1_000_000, parent.gf_slow_ns / 1_000_000 });
@@ -521,7 +466,7 @@ pub fn dumpFrameChainForDiagAlways() void {
     var depth: usize = 0;
     while (cur) |f| : (cur = f.gc_link) {
         const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
-        if (f.cur_span) |sp| {
+        if (f.span()) |sp| {
             var printed = false;
             if (span.active_map) |m| {
                 if (m.getChecked(sp.file)) |sf| {
@@ -548,17 +493,17 @@ pub fn dumpCurrentFrameParamsForDiag() void {
         depth += 1;
         const label = if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name;
         std.debug.print("[frame-params] {s}#{d} ({d} params, {d} bound):\n", .{
-            label, fr.func.id.int(), fr.func.params.len, fr.params.items.len,
+            label, fr.func.id.int(), fr.func.params.len, fr.params.len,
         });
         for (fr.func.params, 0..) |p, i| {
-            if (i >= fr.params.items.len) break;
-            const v = &fr.params.items[i];
+            if (i >= fr.params.len) break;
+            const v = &fr.params[i];
             std.debug.print("  [{d}] {s} = {s} {s}{s}\n", .{
                 i, p.name, @tagName(std.meta.activeTag(v.*)), diagValueClassName(v), diagIdentity(v),
             });
         }
         // A mis-captured callee slot is only visible in the closure environment.
-        for (fr.captures.items, 0..) |*cv, i| {
+        for (fr.captures, 0..) |*cv, i| {
             std.debug.print("  [cap {d}] {s} {s}{s}\n", .{
                 i, @tagName(std.meta.activeTag(cv.*)), diagValueClassName(cv), diagIdentity(cv),
             });
@@ -572,7 +517,7 @@ fn diagIdentity(v: *const Value) []const u8 {
     const S = struct {
         threadlocal var buf: [24]u8 = undefined;
     };
-    return std.fmt.bufPrint(&S.buf, " @{x}", .{@intFromPtr(v.Instance.asPtr())}) catch "";
+    return std.fmt.bufPrint(&S.buf, " @{x}", .{@intFromPtr(v.Instance.asPtrConst())}) catch "";
 }
 
 /// Concrete runtime class for diagnostics; `typeFqn` alone prints `<instance>`.
@@ -609,9 +554,9 @@ pub fn spinDumpMaybe() void {
         var fi: usize = 0;
         while (rf) |f0| : (rf = f0.gc_link) {
             if (fi >= 3) break;
-            const n = @min(f0.regs.items.len, 60);
+            const n = @min(f0.regs.len, 60);
             std.debug.print("  [regs#{d} {s}]", .{ fi, f0.func.name });
-            for (f0.regs.items[0..n], 0..) |*v, i| {
+            for (f0.regs[0..n], 0..) |*v, i| {
                 if (!f0.wmask.has(i)) continue;
                 switch (v.*) {
                     .Int => |x| std.debug.print(" r{d}=i{d}", .{ i, x }),
@@ -628,7 +573,7 @@ pub fn spinDumpMaybe() void {
     var depth: usize = 0;
     while (cur) |f| : (cur = f.gc_link) {
         const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
-        if (f.cur_span) |sp| {
+        if (f.span()) |sp| {
             var printed = false;
             if (span.active_map) |m| {
                 if (m.getChecked(sp.file)) |sf| {
@@ -905,7 +850,8 @@ pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
     switch (v.*) {
         .Exception => |e| {
             if (e.stack != null) return;
-            if (try captureStack(allocator)) |s| e.stack = s.cell;
+            const s = try captureStack(allocator) orelse return;
+            _ = e.attachStackOnce(s);
         },
         .Instance => |inst| {
             const g = inst.borrowMut();

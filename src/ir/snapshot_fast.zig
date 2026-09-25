@@ -17,20 +17,20 @@ fn asI64(v: *const Value) ?i64 {
 
 const IdSet = struct { upper: i64, lower: i64, bound: i64 };
 
-var fn_map = std.atomic.Value(?[*]const u8).init(null);
-var fn_ref = std.atomic.Value(?[*]const u8).init(null);
-var fn_value = std.atomic.Value(?[*]const u8).init(null);
-var fn_size = std.atomic.Value(?[*]const u8).init(null);
-var fn_keys = std.atomic.Value(?[*]const u8).init(null);
-var fn_values = std.atomic.Value(?[*]const u8).init(null);
-var fn_below = std.atomic.Value(?[*]const u8).init(null);
-var fn_upper = std.atomic.Value(?[*]const u8).init(null);
-var fn_lower = std.atomic.Value(?[*]const u8).init(null);
-var fn_bound = std.atomic.Value(?[*]const u8).init(null);
-var fn_sid = std.atomic.Value(?[*]const u8).init(null);
-var fn_next = std.atomic.Value(?[*]const u8).init(null);
-var fn_invalid = std.atomic.Value(?[*]const u8).init(null);
-var fn_readobs = std.atomic.Value(?[*]const u8).init(null);
+var fn_map = runtime.InstanceData.SlotCache.init(0);
+var fn_ref = runtime.InstanceData.SlotCache.init(0);
+var fn_value = runtime.InstanceData.SlotCache.init(0);
+var fn_size = runtime.InstanceData.SlotCache.init(0);
+var fn_keys = runtime.InstanceData.SlotCache.init(0);
+var fn_values = runtime.InstanceData.SlotCache.init(0);
+var fn_below = runtime.InstanceData.SlotCache.init(0);
+var fn_upper = runtime.InstanceData.SlotCache.init(0);
+var fn_lower = runtime.InstanceData.SlotCache.init(0);
+var fn_bound = runtime.InstanceData.SlotCache.init(0);
+var fn_sid = runtime.InstanceData.SlotCache.init(0);
+var fn_next = runtime.InstanceData.SlotCache.init(0);
+var fn_invalid = runtime.InstanceData.SlotCache.init(0);
+var fn_readobs = runtime.InstanceData.SlotCache.init(0);
 
 /// `GlobalSnapshot` alone keeps `snapshotId`/`invalid`/`readObserver` as plain
 /// stored fields; subclasses override them as computed accessors while the base

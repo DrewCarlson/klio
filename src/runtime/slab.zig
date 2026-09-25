@@ -157,6 +157,10 @@ pub fn buildHeap() *Heap {
 /// container the phase left behind may still `deinit`; an allocation is a bug.
 pub fn releaseAll(h: *Heap) void {
     std.debug.assert(h.track_regions);
+    // The sweeper may be freeing cells minted on this heap. Later sweeps stay
+    // inside their collection's stop until the regions are gone.
+    gc.holdSweeper();
+    defer gc.releaseSweeper();
     @atomicStore(bool, &h.released, true, .release);
     // This thread's cached cells of the heap are about to vanish with it.
     magazines()[h.id] = @splat(.{});

@@ -439,7 +439,7 @@ fn matchGroups(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error
 
 fn matchOf(a: Allocator, v: *const Value) Allocator.Error!union(enum) { match: *const runtime.MatchData, err: EvalResult } {
     return switch (v.*) {
-        .Match => |m| .{ .match = m.asPtr() },
+        .Match => |m| .{ .match = m.asPtrConst() },
         else => .{ .err = try internal(a, "a match group read on a {s} value", .{tagOf(v)}) },
     };
 }
@@ -516,7 +516,7 @@ fn threadId(v: *const Value) ?u64 {
     if (v.* != .BoundMethod) return null;
     const bm = v.BoundMethod;
     if (!std.mem.eql(u8, bm.fqn, "klio.Thread")) return null;
-    return switch (bm.receiver.asPtr().*) {
+    return switch (bm.receiver.asPtrConst().*) {
         .Long => |x| @bitCast(x),
         else => 0,
     };

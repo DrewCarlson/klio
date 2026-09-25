@@ -153,9 +153,15 @@ pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    const g = it.borrowMut();
-    defer g.deinit();
-    if (try shuffleInPlace(ctx, g.get().items)) |e| return .{ .err = e };
+    // The random source is user code, which no cell lock may be held across:
+    // shuffle a copy, then store it back.
+    const copy = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(copy);
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(copy);
+    if (try shuffleInPlace(ctx, copy)) |e| return .{ .err = e };
+    writeBackItems(it, a, copy) catch return error.OutOfMemory;
     return ok(.Unit);
 }
 
@@ -460,7 +466,14 @@ fn groupingItemsViaProtocol(ctx: *CallCtx, recv: Value) Error!?[]Value {
     };
     var items: std.ArrayList(Value) = .empty;
     errdefer items.deinit(ctx.allocator);
+    // The iterator and the items drained so far are held only here across its calls.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePush(it);
+    const loop_ka = runtime.keepaliveMark();
     while (true) {
+        runtime.keepaliveRestore(loop_ka);
+        runtime.keepalivePushSlice(items.items);
         const more = switch ((try ctx.host.callWellKnown(&it, .has_next, &.{}, ctx.out)) orelse return null) {
             .ok => |v| v,
             .err => return null,
@@ -523,11 +536,16 @@ pub fn coll_grouping_each_count(ctx: *CallCtx) Error!EvalResult {
     };
     const Count = struct { key: Value, n: i64 };
     var counts: std.ArrayList(Count) = .empty;
+    // The items and every key are held only here across `keyOf` and `equals`.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(gp.items);
     for (gp.items) |v| {
         const k = switch (try groupingKeyOf(ctx, gp.key, gp.receiver, v)) {
             .value => |val| val,
             .err => |e| return e,
         };
+        runtime.keepalivePush(k);
         var found = false;
         for (counts.items) |*c| {
             if (try eqBoxedH(ctx.host, ctx.out, &c.key, &k)) {
@@ -555,11 +573,19 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len <= 2) return arityErr("fold expects (initial, operation)");
     const op = ctx.args[2];
     var acc: std.ArrayList(MapPair) = .empty;
+    // The items, the keys and the accumulators are held only here across user code.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(gp.items);
+    const loop_ka = runtime.keepaliveMark();
     for (gp.items) |v| {
+        runtime.keepaliveRestore(loop_ka);
+        runtime.keepalivePushPairs(acc.items);
         const k = switch (try groupingKeyOf(ctx, gp.key, gp.receiver, v)) {
             .value => |val| val,
             .err => |e| return e,
         };
+        runtime.keepalivePush(k);
         const pos = try findKeyIndexBoxedH(ctx.host, ctx.out, acc.items, &k);
         const cur = if (pos) |p| acc.items[p].value else blk: {
             if (isCallable(initial)) {
@@ -569,6 +595,7 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
                 };
             } else break :blk initial;
         };
+        runtime.keepalivePush(cur);
         // The computed-initial overload keys its operation:
         // `fold(initialValueSelector: (K, T) -> R, operation: (K, R, T) -> R)`.
         const next = switch (if (isCallable(initial))
@@ -596,11 +623,18 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len <= 1) return arityErr("reduce expects (operation)");
     const op = ctx.args[1];
     var acc: std.ArrayList(MapPair) = .empty;
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(gp.items);
+    const loop_ka = runtime.keepaliveMark();
     for (gp.items) |v| {
+        runtime.keepaliveRestore(loop_ka);
+        runtime.keepalivePushPairs(acc.items);
         const k = switch (try groupingKeyOf(ctx, gp.key, gp.receiver, v)) {
             .value => |val| val,
             .err => |e| return e,
         };
+        runtime.keepalivePush(k);
         if (try findKeyIndexBoxedH(ctx.host, ctx.out, acc.items, &k)) |p| {
             const cur = acc.items[p].value;
             const next = switch (try invoke(ctx, &op, &.{ k, cur, v })) {
@@ -627,17 +661,25 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var entries: std.ArrayList(MapPair) = .empty;
+    // The items and the pairs made so far are held only here across user code.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(items);
+    const loop_ka = runtime.keepaliveMark();
     for (items) |v| {
+        runtime.keepaliveRestore(loop_ka);
+        runtime.keepalivePushPairs(entries.items);
         const r = switch (try invoke(ctx, &block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
         };
+        runtime.keepalivePush(r);
         if (r != .Pair) {
             if (runtime.reclaimEnabled()) r.release(a);
             return typeErr("associate selector must return Pair");
         }
-        const key = r.Pair.first.asPtr().*;
-        const val = r.Pair.second.asPtr().*;
+        const key = r.Pair.first.asPtrConst().*;
+        const val = r.Pair.second.asPtrConst().*;
         // key and val are borrowed reads of the owned Pair, so retain before
         // storing, then release `r`.
         if (runtime.reclaimEnabled()) {
@@ -717,11 +759,18 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var entries: std.ArrayList(MapPair) = .empty;
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(items);
+    const loop_ka = runtime.keepaliveMark();
     for (items) |v| {
+        runtime.keepaliveRestore(loop_ka);
+        runtime.keepalivePushPairs(entries.items);
         const val = switch (try invoke(ctx, &block, &.{v})) {
             .value => |x| x,
             .err => |e| return e,
         };
+        runtime.keepalivePush(val);
         if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &v)) |i| {
             if (runtime.reclaimEnabled()) entries.items[i].value.release(a);
             entries.items[i].value = val;
@@ -861,6 +910,9 @@ pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
     };
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(copy);
     // Host-aware so user `Comparable` instances sort through their `compareTo`.
     if (try sortListHostAware(ctx, copy)) |e| return e;
     writeBackItems(it, a, copy) catch return error.OutOfMemory;
@@ -926,6 +978,10 @@ pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
     const cmp = ctx.args[1];
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
+    // The comparator is user code; the copy may become the elements' only holder.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(copy);
     if (try mergeSortComparator(ctx, cmp, copy)) |e| return e;
     writeBackItems(it, a, copy) catch return error.OutOfMemory;
     return ok(Value.Unit);

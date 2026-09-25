@@ -1180,6 +1180,19 @@ Statements: local `val`/`var` (bind), assignment through `name.write` or
 C3's index `set`, destructuring through its group, local functions and
 classes routed to C4.
 
+A `var` kept in a register (`locals.zig`) is read where it stands: an
+expression names its register with no copy, unless the statement being
+lowered writes the local before the value is used (`f(a, run { a = 5; 0 })`,
+`a + a++`), when the read is copied. Each statement answers for the locals it
+writes, less its own top-level assignment or increment; a branch condition
+answers for its own writes only, and a block's last statement, whose value
+leaves it, for the enclosing statement's too. A `val` bound to a `var`'s
+register copies it. The instruction that computes an assigned value writes
+the local's register itself (`a = a + i` is one `BinOp`), an initializer's
+value becomes the local's register, and a call's argument lowered for that
+call alone is computed straight into its slot of the argument run, when
+nothing else holds or reads the value.
+
 Consumes: S, B's arrays, the records. `body.zig`'s switch calls C2, C3, C4,
 D entry points declared in S.
 

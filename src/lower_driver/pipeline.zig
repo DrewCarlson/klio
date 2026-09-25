@@ -289,7 +289,7 @@ fn executeOn(a: Allocator, vm: *interp_ir.Vm, br: *bridge.Bridge, main: ir.FuncI
 
 /// The profiling and diagnostic switches a run honors, around the program:
 /// `KLIO_PROF`, `KLIO_OP_PROF`, `KLIO_FN_PROF`, the frame counts, the call
-/// stats, the fused tier's probes, `KLIO_RUN_STATS`, `KLIO_TRACE_RUN`,
+/// stats, `KLIO_RUN_STATS`, `KLIO_TRACE_RUN`,
 /// `KLIO_SLAB_STAT` and `KLIO_PUMP_DIAG`.
 pub const hooks = struct {
     /// Before anything of the run: the samplers that cover the whole
@@ -333,9 +333,6 @@ pub const hooks = struct {
         ir.eval.fnProfDump(m);
         ir.eval.frameCountDump(m);
         ir.eval.callStatsDump();
-        ir.eval.fused.classifyRejectDump();
-        ir.eval.fused.heavyReasonDump();
-        ir.eval.fuseGateDump();
         ir.eval.opProfDump();
     }
 

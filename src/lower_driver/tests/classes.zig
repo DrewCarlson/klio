@@ -963,10 +963,9 @@ test "an enum class's init unit makes each entry with its name and ordinal" {
     try testing.expectEqualStrings(
         \\  r0 = "A"
         \\  r1 = 0
-        \\  r3 = 1
+        \\  r6 = 1
         \\  r4 = r0
         \\  r5 = r1
-        \\  r6 = r3
         \\  r2 = new E <init>(r4..3)
         \\  static 0 = r2
         \\  r7 = "B"

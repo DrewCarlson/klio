@@ -9,6 +9,8 @@
 # catch. Output compares byte-strict on stdout; rc must be zero.
 #
 # Usage: compose-ui-gate.sh   (COMPOSE_UI_GATE_BIN overrides the binary)
+# With KLIO_GATE_NO_SKIA=1 (gate.sh sets it when no Skia shim can be built for
+# this host) the examples marked `// corpus: skia` are skipped and named.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="${COMPOSE_UI_GATE_BIN:-zig-out/bin/klio-harness}"
@@ -50,7 +52,13 @@ fi
 
 pass=0
 rc=0
+skipped=0
 for name in "${EXAMPLES[@]}"; do
+  if [ -n "${KLIO_GATE_NO_SKIA:-}" ] && head -12 "examples/$name.kt" | grep -q '//[[:space:]]*corpus:[[:space:]]*skia'; then
+    echo "compose-ui-gate: SKIP $name (renders through the Skia shim, which this host cannot build)"
+    skipped=$((skipped + 1))
+    continue
+  fi
   out=$(timeout 400 "$BIN" run "examples/$name.kt" 2>/tmp/compose-ui-gate-$name.err)
   erc=$?
   if [ $erc -ne 0 ]; then
@@ -67,6 +75,6 @@ for name in "${EXAMPLES[@]}"; do
   pass=$((pass + 1))
 done
 e=$(date +%s)
-if [ $rc -eq 0 ] && [ -n "$tree_key" ]; then printf '%s' "$tree_key" >"$cache_file"; fi
-echo "compose-ui-gate: $pass/${#EXAMPLES[@]} passed wall=$((e-s))s rc=$rc"
+if [ $rc -eq 0 ] && [ $skipped -eq 0 ] && [ -n "$tree_key" ]; then printf '%s' "$tree_key" >"$cache_file"; fi
+echo "compose-ui-gate: $pass/${#EXAMPLES[@]} passed, $skipped skipped, wall=$((e-s))s rc=$rc"
 exit $rc

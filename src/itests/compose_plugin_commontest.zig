@@ -46,20 +46,11 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
     try map.put("KLIO_HOME", home);
-    // runTest's own per-test budget. It must never fire before klio's wall cap
-    // below, the suite's hang guard: if it does, a slow but progressing test
-    // reports `UncompletedCoroutinesError` instead of passing or hitting the cap.
-    try map.put("kotlinx_coroutines_test_default_timeout", "900s");
-    // Per-test wall cap in seconds: a deadlocked test fails in place instead of
+    // runTest keeps its own per-test budget (the library's 60 s default), so a
+    // test passes or fails on the timing its authors set. Per-test wall cap in
+    // seconds, the net under it: a deadlocked test fails in place instead of
     // eating its class's whole budget, so its classmates' passes stay counted.
     try map.put("KLIO_TEST_WALL_CAP", "90");
-    // Per-test overrides in seconds for three tests that are slow, not stuck,
-    // and would otherwise cross the hang window while still passing. A budget
-    // is a ratchet: it only shrinks, and exceeding it still fails.
-    try map.put(
-        "KLIO_TEST_WALL_CAP_FOR",
-        "validatePotentialDeadlock=900,resumeOnBackgroundThread=300,pausingTheFrameClockStopShouldBlockWithFrameNanos=300",
-    );
     // Each child otherwise takes a half-the-cores compute pool, oversubscribing
     // the box. Cap each so the children together match the core count.
     try map.put("KLIO_MAX_WORKERS", "5");

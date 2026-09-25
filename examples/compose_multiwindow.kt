@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // Multi-window compose application with recomposition-driven window
 // parameters: two Windows compose side by side, the first window's TITLE
 // follows counter state, the second window is GATED on state (leaving the

@@ -140,7 +140,8 @@ fn withIntFieldMut(
 ) std.mem.Allocator.Error!StepResult {
     const g = inst.borrowMut();
     defer g.deinit();
-    const guard = g.get();
+    const guard = g.get().beginUpdate();
+    defer guard.end();
     var cur: i64 = undefined;
     if (guard.get("value")) |v| {
         switch (v) {
@@ -152,7 +153,7 @@ fn withIntFieldMut(
         return .{ .err = .{ .Type = "AtomicInt: receiver missing `value: Int`" } };
     }
     const step = f(fctx, cur);
-    try guard.define(allocator, "value", Value.newInt(step.next));
+    _ = guard.store(allocator, "value", Value.newInt(step.next));
     return .{ .val = step.out };
 }
 
@@ -350,7 +351,8 @@ fn withLongFieldMut(
 ) std.mem.Allocator.Error!StepResult {
     const g = inst.borrowMut();
     defer g.deinit();
-    const guard = g.get();
+    const guard = g.get().beginUpdate();
+    defer guard.end();
     var cur: i64 = undefined;
     if (guard.get("value")) |v| {
         switch (v) {
@@ -362,7 +364,7 @@ fn withLongFieldMut(
         return .{ .err = .{ .Type = "AtomicLong: receiver missing `value: Long`" } };
     }
     const step = f(fctx, cur);
-    try guard.define(allocator, "value", .{ .Long = step.next });
+    _ = guard.store(allocator, "value", .{ .Long = step.next });
     return .{ .val = step.out };
 }
 
@@ -566,13 +568,14 @@ fn atomicBoolCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const g = inst.borrowMut();
     defer g.deinit();
-    const guard = g.get();
+    const guard = g.get().beginUpdate();
+    defer guard.end();
     const cur: bool = if (guard.get("value")) |v| switch (v) {
         .Bool => |b| b,
         else => return typeErr("AtomicBoolean: receiver missing `value: Boolean`"),
     } else return typeErr("AtomicBoolean: receiver missing `value: Boolean`");
     if (cur == expected) {
-        try guard.define(ctx.allocator, "value", .{ .Bool = update });
+        _ = guard.store(ctx.allocator, "value", .{ .Bool = update });
         return ok(.{ .Bool = true });
     }
     return ok(.{ .Bool = false });
@@ -589,12 +592,13 @@ fn atomicBoolGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const g = inst.borrowMut();
     defer g.deinit();
-    const guard = g.get();
+    const guard = g.get().beginUpdate();
+    defer guard.end();
     const prev: bool = if (guard.get("value")) |v| switch (v) {
         .Bool => |b| b,
         else => return typeErr("AtomicBoolean: receiver missing `value: Boolean`"),
     } else return typeErr("AtomicBoolean: receiver missing `value: Boolean`");
-    try guard.define(ctx.allocator, "value", .{ .Bool = next });
+    _ = guard.store(ctx.allocator, "value", .{ .Bool = next });
     return ok(.{ .Bool = prev });
 }
 
@@ -611,23 +615,24 @@ fn atomicRefCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // structural equality would mis-CAS.
     const g = inst.borrowMut();
     defer g.deinit();
-    const guard = g.get();
+    const guard = g.get().beginUpdate();
+    defer guard.end();
     const cur = guard.get("value") orelse Value.Null;
     const swapped = Value.referenceEq(&cur, &expected);
     if (runtime.envOnce("KLIO_CAS_TRACE") != null) {
         std.debug.print("[cas] ref @{x} cur={s}@{x} expected={s}@{x} update={s} swapped={}\n", .{
-            @intFromPtr(inst.asPtr()),
+            @intFromPtr(inst.asPtrConst()),
             @tagName(cur),
-            if (cur == .Instance) @intFromPtr(cur.Instance.asPtr()) else 0,
+            if (cur == .Instance) @intFromPtr(cur.Instance.asPtrConst()) else 0,
             @tagName(expected),
-            if (expected == .Instance) @intFromPtr(expected.Instance.asPtr()) else 0,
+            if (expected == .Instance) @intFromPtr(expected.Instance.asPtrConst()) else 0,
             @tagName(update),
             swapped,
         });
     }
     if (swapped) {
         if (runtime.reclaimEnabled()) update.retain();
-        try guard.define(ctx.allocator, "value", update);
+        _ = guard.store(ctx.allocator, "value", update);
         return ok(.{ .Bool = true });
     }
     return ok(.{ .Bool = false });
@@ -641,7 +646,8 @@ fn atomicRefGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const next = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
     const g = inst.borrowMut();
     defer g.deinit();
-    const guard = g.get();
+    const guard = g.get().beginUpdate();
+    defer guard.end();
     const prev = guard.get("value") orelse Value.Null;
     // getAndSet transfers the previous value's ownership to the caller, so
     // overwrite with a plain `set` and retain `next` for the atomic.
@@ -693,15 +699,8 @@ fn makeClass(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.E
 
 fn makeInstance(allocator: std.mem.Allocator, name: []const u8, value: Value) std.mem.Allocator.Error!InstanceRef {
     const cls = try makeClass(allocator, name);
-    var fields: std.ArrayList(InstanceData.Field) = .empty;
-    try fields.append(allocator, .{ .name = "value", .value = value });
-    return ObjRef(InstanceData).init(allocator, .{
-        .class = cls,
-        .fields = fields,
-        .outer = null,
-        .identity = 1,
-        .native_state = null,
-    });
+    cls.asPtr().layout_slots = &.{.{ .name = "value" }};
+    return InstanceData.new(allocator, cls, &.{value}, 1);
 }
 
 const testing = std.testing;

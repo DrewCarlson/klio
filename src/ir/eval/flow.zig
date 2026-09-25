@@ -4,6 +4,7 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("../ir.zig");
+const bc = @import("../bc.zig");
 const span = @import("span");
 
 const Allocator = std.mem.Allocator;
@@ -21,6 +22,7 @@ const ev_state = @import("state.zig");
 
 const EvalError = ev_state.EvalError;
 const Frame = ev_frame.Frame;
+const VsMark = ev_state.VsMark;
 const TryFrame = ev_snapshot.TryFrame;
 
 /// `Result<Value, EvalError>` as data; OOM stays a Zig `error`.
@@ -30,38 +32,23 @@ pub const EvalResult = union(enum) {
 };
 
 /// Per-instruction control signal from `execInst`: `cont` completed, `raised` left an `EvalError` in
-/// `frame.step_err`, `flat_call` left a request in `frame.flat_call` for the driver to push.
+/// the thread's `step_err`, `flat_call` left a request in its `flat_call` for the driver to push.
 pub const Step = enum { cont, raised, flat_call };
 
-/// A direct interpreted call the flat driver runs by pushing an activation instead of recursing. Arg-buffer
-/// ownership passes to the new frame's params; a closure also carries its captures, chain, module and id.
+/// A direct interpreted call the flat driver runs by pushing an activation instead of recursing. The
+/// parameters are a run of the caller's registers or an argument area on the value stack at `area`,
+/// which the callee's frame then owns and pops.
 pub const FlatCallReq = struct {
     func: *const Func,
     /// The module the body resolves against (a closure body's creation module); null = the caller's module.
     run_module: ?*const Module = null,
     /// Owning sub-module for a body lowered into one, kept as the frame's `module_arc` so a suspension resumes there.
     owning: ?*const Module = null,
-    args: std.ArrayList(Value),
-    captures: std.ArrayList(Value) = .empty,
+    params: []const Value,
+    captures: []const Value = &.{},
+    /// Where the value stack stood before the call pushed an argument area; null when it pushed none.
+    area: ?VsMark = null,
     closure_id: ?u64 = null,
-    /// The host pushed an ambient composer for this call; the activation's teardown must pop it.
-    composer_pushed: bool = false,
-    /// A value the activation must keep alive for its whole life (the receiver-bound closure whose capture
-    /// vector the frame's captures borrow). Released at teardown or parked-drop, GC-marked while live-parked.
-    keepalive: ?Value = null,
-    /// Undispatched-start boundary: a suspension crossing this activation parks the segment into the pump
-    /// through the host hook, and the CALLER continues with the hook's value instead of unwinding.
-    suspend_barrier: bool = false,
-    /// Active-scope depth captured BEFORE the prepare's scope push; the barrier park hands it to the pump.
-    barrier_scope_base: usize = 0,
-    /// Identity of the active-scope entry the prepare pushed (0 = none); teardown removes it, a park hands it on.
-    scope_guard_ident: usize = 0,
-    /// This barrier activation owns a fresh pump; its completion or suspension runs the pump loop.
-    root_pump: bool = false,
-    /// Reified type-name globals bound for the call's duration; the host hook restores them at teardown or park.
-    typed_saved: ?*anyopaque = null,
-    /// The call site's type arguments (module-owned strings) for `attachDeclaredElemTypes` at the frame boundary.
-    type_args: []const []const u8 = &.{},
     dst: Reg,
 };
 
@@ -79,29 +66,31 @@ pub const ParkPoint = struct {
     resume_reg: ?Reg,
 };
 
-/// One interpreted activation on the flat driver's call stack, heap-allocated so the Frame's address stays
-/// stable on the GC frame chain while the stack list grows. `ret_*` is the resume point in the CALLER frame.
+/// One interpreted activation on the flat driver's call stack, held by pointer so the Frame's address
+/// stays stable on the GC frame chain. `ret_*` is the resume point in the CALLER frame.
 pub const Activation = struct {
     frame: Frame,
     try_stack: std.ArrayList(TryFrame),
-    composer_pushed: bool,
-    keepalive: ?Value,
-    suspend_barrier: bool,
-    barrier_scope_base: usize,
-    scope_guard_ident: usize,
-    root_pump: bool,
-    typed_saved: ?*anyopaque,
-    type_args: []const []const u8,
+    /// The activation below this one in the driver that opened it; null for the driver's first.
+    caller: ?*Activation,
     ret_block: BlockId,
     ret_idx: usize,
     ret_dst: Reg,
+    /// The caller's streams when it called from a stream it can go on in at `ret_pc`: a return
+    /// then lands in the caller's stream directly. Null sends it through the frame loop.
+    ret_streams: ?*const bc.FuncStreams,
+    ret_pc: u32,
 };
 
 /// `KLIO_FLAT=0` falls back to native recursion for every call.
 var flat_enabled_cached: ?bool = null;
 
-pub fn flatEnabled() bool {
+pub inline fn flatEnabled() bool {
     if (flat_enabled_cached) |b| return b;
+    return flatEnabledInit();
+}
+
+fn flatEnabledInit() bool {
     const raw = runtime.envOnce("KLIO_FLAT");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     flat_enabled_cached = b;
@@ -111,8 +100,12 @@ pub fn flatEnabled() bool {
 /// Trace gates cached once: `getenvSlice` locks and probes a hashmap per consult, and the env never changes mid-run.
 var cv_trace_cached: ?bool = null;
 
-pub fn cvTraceOn() bool {
+pub inline fn cvTraceOn() bool {
     if (cv_trace_cached) |b| return b;
+    return cvTraceInit();
+}
+
+fn cvTraceInit() bool {
     const b = runtime.envOnce("KLIO_CALLVALUE_TRACE") != null;
     cv_trace_cached = b;
     return b;
@@ -144,43 +137,37 @@ var miss_trace_init: bool = false;
 
 var miss_trace_val: ?[]const u8 = null;
 
-pub fn missTraceWant() ?[]const u8 {
-    if (!miss_trace_init) {
-        miss_trace_val = runtime.envOnce("KLIO_MISS_TRACE");
-        miss_trace_init = true;
-    }
+pub inline fn missTraceWant() ?[]const u8 {
+    if (!miss_trace_init) missTraceInit();
     return miss_trace_val;
+}
+
+fn missTraceInit() void {
+    miss_trace_val = runtime.envOnce("KLIO_MISS_TRACE");
+    miss_trace_init = true;
 }
 
 var cmg_trace_init: bool = false;
 
 var cmg_trace_val: ?[]const u8 = null;
 
-pub fn cmgTraceWant() ?[]const u8 {
-    if (!cmg_trace_init) {
-        cmg_trace_val = runtime.envOnce("KLIO_CMG_TRACE");
-        cmg_trace_init = true;
-    }
+pub inline fn cmgTraceWant() ?[]const u8 {
+    if (!cmg_trace_init) cmgTraceInit();
     return cmg_trace_val;
+}
+
+fn cmgTraceInit() void {
+    cmg_trace_val = runtime.envOnce("KLIO_CMG_TRACE");
+    cmg_trace_init = true;
 }
 
 var nu_trace_init: bool = false;
 
 var nu_trace_val: ?[]const u8 = null;
 
-pub fn takeHostFlatArm() bool {
-    const a = ev_state.evtlsPtr().host_flat_armed;
-    ev_state.evtlsPtr().host_flat_armed = false;
-    return a;
-}
-
-pub fn stashHostFlatReq(req: FlatCallReq) void {
-    ev_state.evtlsPtr().host_flat_req = req;
-}
-
-/// Stash a control-flow `EvalError` on the frame and signal `Step.raised`.
+/// Stash a control-flow `EvalError` on the thread's state and signal `Step.raised`.
 pub inline fn raiseStep(frame: *Frame, e: EvalError) Step {
-    frame.step_err = e;
+    frame.tls.step_err = e;
     return .raised;
 }
 

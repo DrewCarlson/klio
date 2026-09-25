@@ -822,6 +822,22 @@ var frame_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = unde
 
 var input_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
 
+/// The resident callbacks are held only here once `main` returns, so they are
+/// a collection root of their own.
+var callbacks_rooted = std.atomic.Value(bool).init(false);
+
+fn markCallbacks(m: *runtime.gc.Marker) void {
+    for ([_]*const FrameCb{ &frame_cb, &input_cb, &text_cb }) |cb| {
+        if (cb.set) cb.callback.gcMark(m);
+    }
+}
+
+/// Store `cb` in the resident slot `slot`, rooting the slots first.
+fn keepCallback(slot: *FrameCb, cb: FrameCb) void {
+    if (!callbacks_rooted.swap(true, .monotonic)) runtime.gc.registerRoot(markCallbacks);
+    slot.* = cb;
+}
+
 fn isHosted(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     return ok(Value{ .Bool = surface_layer != null });
@@ -844,13 +860,13 @@ fn surfaceHeight(ctx: *CallCtx) Error!EvalResult {
 /// run's process-lifetime arena.
 fn setFrameCallback(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
-    frame_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
+    keepCallback(&frame_cb, .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true });
     return ok(Value.newLong(1));
 }
 
 fn setInputCallback(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
-    input_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
+    keepCallback(&input_cb, .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true });
     return ok(Value.newLong(1));
 }
 
@@ -1004,7 +1020,7 @@ var staged_text_len: usize = 0;
 
 fn setTextCallback(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
-    text_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
+    keepCallback(&text_cb, .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true });
     return ok(Value.newLong(1));
 }
 
@@ -1608,6 +1624,19 @@ fn canvasConcat(ctx: *CallCtx) Error!EvalResult {
 }
 
 const testing = std.testing;
+
+test "a resident callback is marked by the callbacks' root" {
+    const a = std.testing.allocator;
+    const saved = text_cb;
+    defer text_cb = saved;
+    const callback = try runtime.strInit(a, "callback");
+    defer callback.deinit();
+    text_cb = .{ .host = undefined, .callback = .{ .String = callback }, .out = undefined, .set = true };
+    var m: runtime.gc.Marker = .{ .epoch = 93, .arena = a };
+    defer m.grey.deinit(a);
+    markCallbacks(&m);
+    try std.testing.expectEqual(@as(usize, 93), callback.cell.hdr.gc_mark);
+}
 
 test "hostBindings registers the skia render + windowing sinks" {
     var b = try hostBindings(testing.allocator);

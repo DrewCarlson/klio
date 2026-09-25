@@ -6,6 +6,7 @@
 //! - `builder.zig` (C1): `Program`, `Builder`, blocks and registers.
 //! - `records.zig` (C1): the record lookups, as `Builder` methods.
 //! - `env.zig` (C1): receivers, locals, cells and captures.
+//! - `locals.zig`: reading and writing a `var`'s register in place.
 //! - `body.zig` (C1): body entry, statements, the expression switch.
 //! - `name.zig` (C1): reads and writes of locals, parameters, properties.
 //! - `call.zig`, `dispatch.zig` (C2): argument runs and the call's `How`.
@@ -18,6 +19,7 @@
 pub const builder = @import("builder.zig");
 pub const records = @import("records.zig");
 pub const env = @import("env.zig");
+pub const locals = @import("locals.zig");
 pub const body = @import("body.zig");
 pub const name = @import("name.zig");
 pub const call = @import("call.zig");
@@ -43,6 +45,7 @@ test {
     testing.refAllDecls(builder);
     testing.refAllDecls(records);
     testing.refAllDecls(env);
+    testing.refAllDecls(locals);
     testing.refAllDecls(body);
     testing.refAllDecls(name);
     testing.refAllDecls(call);

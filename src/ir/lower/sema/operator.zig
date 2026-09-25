@@ -13,6 +13,8 @@ const records = @import("records.zig");
 const body = @import("body.zig");
 const call = @import("call.zig");
 const name = @import("name.zig");
+const env = @import("env.zig");
+const locals = @import("locals.zig");
 
 const Allocator = std.mem.Allocator;
 const Builder = builder.Builder;
@@ -266,7 +268,7 @@ pub fn emitPrimRegs(b: *Builder, op: PrimOp, dst: Reg, regs: []const Reg) Error!
         .array_get => try b.emit(.{ .ArrayGet = .{ .dst = dst, .array = regs[0], .index = regs[1] } }),
         .array_set => {
             try b.emit(.{ .ArraySet = .{ .array = regs[0], .index = regs[1], .value = regs[2] } });
-            try b.emit(.{ .Move = .{ .dst = dst, .src = try b.emitConst(.Unit) } });
+            try b.emit(.{ .Move = .{ .dst = dst, .src = try b.unit() } });
         },
     }
 }
@@ -392,6 +394,12 @@ pub fn lowerPrimBody(b: *Builder, callee: Sym) Error!void {
 /// Emits the call `rec` with receiver `recv` over already lowered operands:
 /// one instruction when the table binds the callee, else through `emitCall`.
 pub fn callOn(b: *Builder, rec: *const CallRec, recv: Reg, operands: []const Reg) Error!Reg {
+    return callOnFrom(b, rec, recv, operands, null);
+}
+
+/// `callOn` over operands lowered since `from` that the call alone
+/// consumes, which its argument run may compute in place.
+fn callOnFrom(b: *Builder, rec: *const CallRec, recv: Reg, operands: []const Reg, from: ?locals.Mark) Error!Reg {
     if (b.p.prims.get(rec.callee)) |op| {
         var regs: [3]Reg = undefined;
         if (operands.len + 1 > regs.len) return error.Unsupported;
@@ -405,7 +413,7 @@ pub fn callOn(b: *Builder, rec: *const CallRec, recv: Reg, operands: []const Reg
     @memset(exprs, null);
     const regs = try b.p.a.alloc(?Reg, operands.len);
     for (operands, regs) |o, *r| r.* = o;
-    return call.emitCall(b, rec, .{ .exprs = exprs, .regs = regs, .receiver = recv });
+    return call.emitCall(b, rec, .{ .exprs = exprs, .regs = regs, .receiver = recv, .from = from });
 }
 
 /// Arithmetic, comparisons, `==`, `in`, ranges, `&&`, `||`, `?:`, `===`.
@@ -433,13 +441,15 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
         .In, .NotIn => {
             // `x in c` is `c.contains(x)`: the container is evaluated
             // first, as kotlinc does.
+            const from = locals.mark(b);
             const container = try body.lowerExpr(b, x.rhs);
             const elem = try body.lowerExpr(b, x.lhs);
             const rec = try b.call(e.id());
-            const r = try callOn(b, &rec, container, &.{elem});
+            const r = try callOnFrom(b, &rec, container, &.{elem}, from);
             return if (x.op == .NotIn) negate(b, r) else r;
         },
         .Lt, .Le, .Gt, .Ge => {
+            const from = locals.mark(b);
             const l = try body.lowerExpr(b, x.lhs);
             const r = try body.lowerExpr(b, x.rhs);
             const rec = try b.call(e.id());
@@ -455,7 +465,7 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
                 return dst;
             };
             // `compareTo`'s result against zero.
-            const order = try callOn(b, &rec, l, &.{r});
+            const order = try callOnFrom(b, &rec, l, &.{r}, from);
             const zero = try b.emitConst(.{ .Int = 0 });
             try b.emit(.{ .BinOp = .{ .dst = dst, .op = cmp, .lhs = order, .rhs = zero } });
             return dst;
@@ -464,10 +474,11 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
             // Arithmetic over integer literals: a constant of the type sema
             // gave it.
             if (sema.body.intConstValue(e) != null) return foldedArithmetic(b, e);
+            const from = locals.mark(b);
             const l = try body.lowerExpr(b, x.lhs);
             const r = try body.lowerExpr(b, x.rhs);
             const rec = try b.call(e.id());
-            return callOn(b, &rec, l, &.{r});
+            return callOnFrom(b, &rec, l, &.{r}, from);
         },
         // A statement, never an expression the parser leaves here.
         .Assign => return b.fail(e.span(), "an assignment used as a value", .{}),
@@ -771,6 +782,12 @@ fn takesExpr(rec: *const NameRec) bool {
 }
 
 fn writeTarget(b: *Builder, t: Target, c: *const records.Compound, value: Reg, sp: @import("span").Span) Error!void {
+    return writeTargetFrom(b, t, c, value, sp, null);
+}
+
+/// `writeTarget` of a value lowered since `from`: a local's register is
+/// written by the instruction that computed it when it can be.
+fn writeTargetFrom(b: *Builder, t: Target, c: *const records.Compound, value: Reg, sp: @import("span").Span, from: ?locals.Mark) Error!void {
     switch (t) {
         .index => |ix| {
             const set = c.set orelse return error.Unrecorded;
@@ -781,6 +798,7 @@ fn writeTarget(b: *Builder, t: Target, c: *const records.Compound, value: Reg, s
         },
         .name => |n| {
             const w = n.write orelse return b.fail(sp, "a compound assignment with no recorded write", .{});
+            if (w.kind == .local) return env.writeLocalFrom(b, w.target, value, from);
             try name.write(b, &w, if (takesExpr(&w)) n.recv else null, value);
         },
     }
@@ -819,12 +837,46 @@ pub fn lowerCompound(b: *Builder, a: *const ast.AssignStmt) Error!void {
     } else null;
     const tgt = try readTarget(b, &a.target, &c, pre);
     const v = try body.lowerExpr(b, &a.value);
+    const from = locals.mark(b);
     const res = try callOn(b, &c.op, tgt.value, &.{v});
-    if (!c.assign_form) try writeTarget(b, tgt.t, &c, res, a.span);
+    if (!c.assign_form) try writeTargetFrom(b, tgt.t, &c, res, a.span, from);
     if (join) |j| {
         b.terminate(.{ .Goto = j });
         b.switchTo(j);
     }
+}
+
+/// An increment or decrement whose value nothing reads: on a `var` in a
+/// register the operation writes the register itself.
+pub fn lowerIncDecStmt(b: *Builder, e: *const ast.Expr) Error!void {
+    const operand = switch (e.*) {
+        .Unary => |u| u.expr,
+        .Postfix => |p| p.expr,
+        else => unreachable,
+    };
+    const c = try b.compound(e.id());
+    const r = (try varOperand(b, operand, &c)) orelse {
+        _ = try lowerIncDec(b, e);
+        return;
+    };
+    const from = locals.mark(b);
+    const res = try callOn(b, &c.op, r, &.{});
+    if (!locals.retarget(b, from, res, r)) try b.emit(.{ .Move = .{ .dst = r, .src = res } });
+}
+
+/// The register of a `var` local an increment's operand names, when it is
+/// one this body keeps in a register.
+fn varOperand(b: *Builder, operand: *const ast.Expr, c: *const records.Compound) Error!?Reg {
+    if (operand.* != .Path or operand.Path.segments.len != 1) return null;
+    const w = c.write orelse return null;
+    if (w.kind != .local) return null;
+    return env.varRegister(b, w.target);
+}
+
+fn copyOf(b: *Builder, r: Reg) Error!Reg {
+    const dst = b.newReg();
+    try b.emit(.{ .Move = .{ .dst = dst, .src = r } });
+    return dst;
 }
 
 /// `++` and `--`, prefix and postfix: `inc` or `dec` on the target's value,
@@ -840,6 +892,20 @@ pub fn lowerIncDec(b: *Builder, e: *const ast.Expr) Error!Reg {
         else => unreachable,
     };
     const c = try b.compound(e.id());
+    if (try varOperand(b, operand, &c)) |r| {
+        // A postfix gives the old value, copied before the write; a prefix
+        // the new one, which the local's own register holds only until the
+        // next write.
+        const old: ?Reg = if (prefix) null else try copyOf(b, r);
+        const from = locals.mark(b);
+        const res = try callOn(b, &c.op, r, &.{});
+        if (old) |o| {
+            if (!locals.retarget(b, from, res, r)) try b.emit(.{ .Move = .{ .dst = r, .src = res } });
+            return o;
+        }
+        try b.emit(.{ .Move = .{ .dst = r, .src = res } });
+        return res;
+    }
     const pre = try safeReceiver(b, operand, &c);
     const result = if (pre != null) b.newReg() else undefined;
     const join = if (pre) |r| blk: {
@@ -852,9 +918,9 @@ pub fn lowerIncDec(b: *Builder, e: *const ast.Expr) Error!Reg {
         break :blk join;
     } else null;
     const tgt = try readTarget(b, operand, &c, pre);
-    // The read may be the local's own register, which the write replaces.
-    const old = b.newReg();
-    try b.emit(.{ .Move = .{ .dst = old, .src = tgt.value } });
+    // The value read is the old one unless it is a `var`'s register, which
+    // the write replaces.
+    const old = if (b.var_homes.contains(tgt.value)) try copyOf(b, tgt.value) else tgt.value;
     const res = try callOn(b, &c.op, old, &.{});
     try writeTarget(b, tgt.t, &c, res, e.span());
     const value = if (prefix) try rereadTarget(b, operand, tgt.t, &c, res) else old;

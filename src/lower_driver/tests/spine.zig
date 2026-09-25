@@ -958,8 +958,7 @@ test "a local declared without a value holds null until assigned, and a lateinit
         \\  r3 = r0
         \\  r4 = param 1
         \\  r3 = r4
-        \\  r5 = r3
-        \\  r6 = lateinit r5
+        \\  r5 = lateinit r3
         \\  return
         \\
     , try fx.lower_(f));

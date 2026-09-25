@@ -210,6 +210,16 @@ pub const HostInstance = enum(u8) {
             .ktype_projection => "kotlin.reflect.KTypeProjection",
         };
     }
+
+    /// The slots an instance of the kind holds, in order.
+    pub fn layout(k: HostInstance) []const class_mod.LayoutSlot {
+        return switch (k) {
+            .sequence_scope => &.{ .{ .name = "__seq_has_value" }, .{ .name = "__seq_value" }, .{ .name = "__seq_yield_iter" } },
+            .grouping => &.{ .{ .name = "__grouping_src" }, .{ .name = "__grouping_key" } },
+            .match_group_collection => &.{.{ .name = "__mgc" }},
+            .ktype, .ktype_projection => &.{},
+        };
+    }
 };
 
 /// Optional slots fall back to the wrapper methods below.
@@ -500,7 +510,8 @@ pub const NoopHost = struct {
     }
 };
 
-const InstanceData = @import("class.zig").InstanceData;
+const class_mod = @import("class.zig");
+const InstanceData = class_mod.InstanceData;
 
 const testing = std.testing;
 

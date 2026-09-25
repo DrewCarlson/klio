@@ -82,6 +82,8 @@ fn gcMarkAllVms(m: *runtime.gc.Marker) void {
         // The lambda side-table spine traces nothing and its per-closure captures
         // stay alive through `markClosureHook`, so shading it would pin every closure.
         if (vm.resolved_state) |st| m.shade(&st.cell.hdr);
+        // A finished thread's error result can hold values nothing else does.
+        m.shade(&vm.threads.cell.hdr);
     }
 }
 
@@ -197,7 +199,11 @@ fn programArgsValue(a: Allocator, argv: []const []const u8) Allocator.Error!Valu
 pub fn vmPrepareResolved(self: *Vm) Allocator.Error!void {
     if (self.resolved_state != null) return;
     const r = self.module.asPtrConst().resolved orelse return;
-    self.resolved_state = try ir.resolved.stateNew(self.allocator, r);
+    const st = try ir.resolved.stateNew(self.allocator, r);
+    // The Vm may already be a root: the collector reads the field under this lock.
+    gcVmsLock();
+    defer gcVmsUnlock();
+    self.resolved_state = st;
 }
 
 /// Call outcome: `threw` is an uncaught Throwable, `failed` an interpreter error.

@@ -191,8 +191,9 @@ pub fn throwable_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
-/// Append to the receiver's shared suppressed list, built at construction; a
-/// throwable created outside the constructor path has no list, so this no-ops.
+/// Append to a host throwable's shared suppressed list, built at
+/// construction; a throwable created outside the constructor path has no
+/// list, so this no-ops. A Kotlin throwable's `addSuppressed` is its own.
 pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len >= 2 and ctx.args[0] == .Exception) {
         if (ctx.args[0].Exception.suppressed) |sl_cell| {
@@ -203,32 +204,6 @@ pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
             try g.get().append(ctx.allocator, ctx.args[1]);
         }
     }
-    // A user throwable is an interpreted Instance whose suppressed set is the
-    // hidden `__suppressed__` list the member arms maintain, and the statically
-    // bound header call lands here directly.
-    if (ctx.args.len >= 2 and ctx.args[0] == .Instance) {
-        const inst = ctx.args[0].Instance;
-        const existing: ?Value = blk: {
-            const g = inst.borrow();
-            defer g.deinit();
-            break :blk g.get().get("__suppressed__");
-        };
-        const list: Value = blk: {
-            if (existing) |l| {
-                if (l == .List) break :blk l;
-            }
-            const items = try ValueList.init(ctx.allocator, .empty);
-            const fresh = try Value.newList(ctx.allocator, .{ .items = items, .mutable = true, .enum_entries = false, .backing = null });
-            const g = inst.borrowMut();
-            defer g.deinit();
-            try g.get().define(ctx.allocator, "__suppressed__", fresh);
-            break :blk fresh;
-        };
-        const g = list.List.items.borrowMut();
-        defer g.deinit();
-        if (runtime.reclaimEnabled()) ctx.args[1].retain();
-        try g.get().append(ctx.allocator, ctx.args[1]);
-    }
     return ok(.Unit);
 }
 
@@ -236,14 +211,6 @@ pub fn throwable_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len >= 1 and ctx.args[0] == .Exception) {
         if (ctx.args[0].Exception.suppressed) |sl_cell| {
             return ok(try makeList((ValueList{ .cell = sl_cell }).clone(), false));
-        }
-    }
-    if (ctx.args.len >= 1 and ctx.args[0] == .Instance) {
-        const inst = ctx.args[0].Instance;
-        const g = inst.borrow();
-        defer g.deinit();
-        if (g.get().get("__suppressed__")) |l| {
-            if (l == .List) return ok(try makeList(l.List.items.clone(), false));
         }
     }
     const items = try ValueList.init(ctx.allocator, .empty);
@@ -256,7 +223,7 @@ pub fn throwable_cause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     const cause = ctx.args[0].Exception.cause;
     if (cause) |c| {
-        const out = (ValueBox{ .cell = c }).asPtr().*;
+        const out = (ValueBox{ .cell = c }).asPtrConst().*;
         out.retain();
         return ok(out);
     }
@@ -360,8 +327,8 @@ test "single throwable argument is treated as the cause" {
     try testing.expect(exc.message.isSome());
     try testing.expect(exc.cause != null);
     const cause_box = ValueBox{ .cell = exc.cause.? };
-    try testing.expect(cause_box.asPtr().* == .Exception);
-    const ig = cause_box.asPtr().Exception.fqn.borrow();
+    try testing.expect(cause_box.asPtrConst().* == .Exception);
+    const ig = cause_box.asPtrConst().Exception.fqn.borrow();
     defer ig.deinit();
     try testing.expectEqualStrings("kotlin.IllegalStateException", ig.get().bytes);
 }

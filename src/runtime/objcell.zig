@@ -343,6 +343,10 @@ fn isContainer(comptime U: type) bool {
 fn hasDeclSafe(comptime U: type, comptime name: []const u8) bool {
     return isContainer(U) and @hasDecl(U, name);
 }
+/// The shortest array whose element stores remember a range: a shorter one
+/// is cheaper to trace whole than to keep an entry for.
+pub const range_min_len = 64;
+
 fn isArrayListLike(comptime U: type) bool {
     return @typeInfo(U) == .@"struct" and @hasField(U, "items") and @hasField(U, "capacity");
 }
@@ -384,6 +388,48 @@ fn mayHoldRefs(comptime U: type) bool {
     return false;
 }
 
+/// Whether a `U` holds a cell reference that a tracer must reach: a type with
+/// a tracer of its own (a `Value` among them), a handle, a raw cell pointer,
+/// or any of these inside its fields, elements or hash-map values, looked at
+/// `depth` levels deep. A pointer to anything else is not followed.
+fn holdsRefs(comptime U: type, comptime depth: u8) bool {
+    if (depth == 0) return false;
+    if (hasDeclSafe(U, "gc_pointer_free")) return false;
+    if (hasDeclSafe(U, "gcMark") or hasDeclSafe(U, "gcTrace")) return true;
+    if (isObjRef(U) or isCellType(U)) return true;
+    if (isHashMapLike(U) and @hasDecl(U, "KV")) return holdsRefs(@FieldType(U.KV, "value"), depth - 1);
+    return switch (@typeInfo(U)) {
+        .@"struct" => |s| inline for (s.fields) |f| {
+            if (holdsRefs(f.type, depth - 1)) break true;
+        } else false,
+        .@"union" => |u| inline for (u.fields) |f| {
+            if (holdsRefs(f.type, depth - 1)) break true;
+        } else false,
+        .optional => |o| holdsRefs(o.child, depth - 1),
+        .array => |a| holdsRefs(a.child, depth - 1),
+        .pointer => |p| switch (p.size) {
+            .slice => holdsRefs(p.child, depth - 1),
+            .one => isCellType(p.child),
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// A `ControlBlock`: what a raw `*X.Cell` field points at.
+fn isCellType(comptime U: type) bool {
+    return @typeInfo(U) == .@"struct" and @hasField(U, "hdr") and @FieldType(U, "hdr") == gc.GcHeader;
+}
+
+/// A payload or element the generic tracer walks as a leaf must hold no
+/// reference, or the collector would sweep what it reaches.
+fn assertLeaf(comptime U: type) void {
+    @setEvalBranchQuota(200_000);
+    if (comptime holdsRefs(U, 6)) {
+        @compileError(@typeName(U) ++ " holds cell references but has no gcTrace or gcMark, so a mark would miss them");
+    }
+}
+
 /// Shading a cell is how the graph advances; its own `gc_trace` does the next
 /// level.
 fn gcTraceElem(comptime E: type, e: *const E, m: *gc.Marker) void {
@@ -395,10 +441,14 @@ fn gcTraceElem(comptime E: type, e: *const E, m: *gc.Marker) void {
         m.shade(&e.cell.hdr);
     } else if (comptime @typeInfo(E) == .optional) {
         if (e.*) |inner| gcTraceElem(@TypeOf(inner), &inner, m);
+    } else {
+        comptime assertLeaf(E);
     }
 }
 
 fn gcTraceData(comptime U: type, data: *const U, m: *gc.Marker) void {
+    comptime if (!hasDeclSafe(U, "gcTrace") and !hasDeclSafe(U, "gcMark") and !isObjRef(U) and
+        @typeInfo(U) != .optional and !isArrayListLike(U) and !isSlice(U) and !isHashMapLike(U)) assertLeaf(U);
     if (comptime hasDeclSafe(U, "gcTrace")) {
         data.gcTrace(m);
     } else if (comptime hasDeclSafe(U, "gcMark")) {
@@ -432,6 +482,35 @@ fn gcFinalizeData(comptime U: type, data: *U, a: std.mem.Allocator) void {
 }
 
 pub const BorrowMutError = error{AlreadyBorrowed};
+
+/// The cell locks this thread holds, counted where runtime safety is on. No
+/// cell lock, shared or exclusive, may be held across a safe point: a
+/// collection's marker takes each cell's shared lock, so a thread stopped for
+/// the collection while it holds an exclusive one stalls the mark; and a
+/// writer spinning for a lock a stopped thread holds, shared or exclusive,
+/// never reaches the safe point the stop waits for. A host op that runs user
+/// code (a lambda, a user `equals` or `compareTo`, a user iterator) copies
+/// out of its borrow first. A payload that declares itself immutable takes
+/// no lock and is not counted.
+threadlocal var locks_held: u32 = 0;
+
+inline fn noteLock(comptime T: type, comptime delta: i2) void {
+    if (!std.debug.runtime_safety or LockFor(T) != SpinRwLock) return;
+    if (delta > 0) locks_held += 1 else locks_held -= 1;
+}
+
+/// Panics when this thread holds a cell lock; called where the interpreter
+/// reaches a safe point. A no-op without runtime safety.
+pub inline fn assertNoCellLock() void {
+    if (!std.debug.runtime_safety) return;
+    if (locks_held != 0) cellLockAtSafePoint();
+}
+
+noinline fn cellLockAtSafePoint() noreturn {
+    std.debug.print("\n[cell-lock] a safe point was reached holding {d} cell lock(s)\n", .{locks_held});
+    trace.dumpCurrent(.{});
+    @panic("a cell lock is held across a safe point");
+}
 
 /// A nullable `ObjRef(T)` the size of a pointer. `?ObjRef(T)` is not: Zig's
 /// null-pointer optimization applies to a bare `?*T`, not to an optional of a
@@ -484,11 +563,30 @@ pub fn ObjRef(comptime T: type) type {
             return initOwned(allocator, data);
         }
 
+        /// A trace holds the cell's shared lock, so it reads the payload as a
+        /// reader does: every store into a payload is made under the cell's
+        /// exclusive lock or, for an instance's slots, the store sequence its
+        /// tracer reads through. Only this thunk knows the lock's type.
         fn gcTraceThunk(h: *gc.GcHeader, m: *gc.Marker) void {
             // Every cell is 16-byte aligned, so recovering the block from its
             // header re-establishes that alignment.
             const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
+            cb.lock.lockShared();
+            defer cb.lock.unlockShared();
             gcTraceData(T, &cb.data, m);
+        }
+
+        /// Elements `lo` through `hi` of an array-like payload, clamped to
+        /// its length now.
+        fn gcTraceRangeThunk(h: *gc.GcHeader, m: *gc.Marker, lo: u32, hi: u32) void {
+            if (comptime !isArrayListLike(T)) unreachable;
+            const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
+            cb.lock.lockShared();
+            defer cb.lock.unlockShared();
+            const items = cb.data.items;
+            if (lo >= items.len) return;
+            const end = @min(items.len, @as(usize, hi) + 1);
+            for (items[lo..end]) |*e| gcTraceElem(@TypeOf(e.*), e, m);
         }
         /// Shallow: child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
@@ -614,6 +712,52 @@ pub fn ObjRef(comptime T: type) type {
             return self.tryBorrowMut() catch unreachable;
         }
 
+        /// A mutable borrow of an array-like payload for a store into element
+        /// `index` and nowhere else. A tenured array at least `range_min_len`
+        /// long remembers only the range such stores touch, so the next minor
+        /// mark traces that range rather than the whole array; a store that
+        /// moves other elements takes `borrowMut`.
+        pub fn borrowMutAt(self: Self, index: usize) ObjGuardMut(T) {
+            comptime std.debug.assert(isArrayListLike(T));
+            const cell = self.cell;
+            raceJitter();
+            cell.lock.lockExclusive();
+            noteLock(T, 1);
+            if (comptime mayHoldRefs(T)) {
+                if (cell.data.items.len >= range_min_len) {
+                    gc.writeBarrierAt(&cell.hdr, index, gcTraceRangeThunk);
+                } else {
+                    gc.writeBarrier(&cell.hdr);
+                }
+            }
+            return .{ .cell = cell };
+        }
+
+        /// A mutable borrow of an array-like payload for appending `count`
+        /// elements and nothing else. The indices they land at are read under
+        /// the lock, so a concurrent append cannot land outside the range
+        /// remembered; a list that ends at least `range_min_len` long
+        /// remembers only that range.
+        pub fn borrowMutAppend(self: Self, count: usize) ObjGuardMut(T) {
+            comptime std.debug.assert(isArrayListLike(T));
+            const cell = self.cell;
+            raceJitter();
+            cell.lock.lockExclusive();
+            noteLock(T, 1);
+            if (comptime mayHoldRefs(T)) {
+                if (count != 0) {
+                    const at = cell.data.items.len;
+                    if (at + count >= range_min_len) {
+                        gc.writeBarrierAt(&cell.hdr, at, gcTraceRangeThunk);
+                        gc.writeBarrierAt(&cell.hdr, at + count - 1, gcTraceRangeThunk);
+                    } else {
+                        gc.writeBarrier(&cell.hdr);
+                    }
+                }
+            }
+            return .{ .cell = cell };
+        }
+
         /// Concurrent shared borrows proceed together and an exclusive borrow
         /// blocks until they drain. Never returns null; the optional is kept
         /// for source compatibility.
@@ -621,6 +765,7 @@ pub fn ObjRef(comptime T: type) type {
             const cell = self.cell;
             raceJitter();
             cell.lock.lockShared();
+            noteLock(T, 1);
             return .{ .cell = cell };
         }
 
@@ -630,6 +775,7 @@ pub fn ObjRef(comptime T: type) type {
             const cell = self.cell;
             raceJitter();
             cell.lock.lockExclusive();
+            noteLock(T, 1);
             // Generational write barrier: a mutable borrow of a tenured cell
             // may store a nursery reference into it, so the cell joins the
             // remembered set. This one point covers every guarded mutation.
@@ -675,6 +821,7 @@ pub fn ObjGuard(comptime T: type) type {
         }
 
         pub fn deinit(self: Self) void {
+            noteLock(T, -1);
             self.cell.lock.unlockShared();
         }
     };
@@ -690,6 +837,7 @@ pub fn ObjGuardMut(comptime T: type) type {
         }
 
         pub fn deinit(self: Self) void {
+            noteLock(T, -1);
             self.cell.lock.unlockExclusive();
         }
     };
@@ -964,4 +1112,174 @@ test "handoff orders the write across threads" {
 
         slot.?.deinit();
     }
+}
+
+test "a payload that holds a reference is told apart from a leaf for the compile-time tracer check" {
+    const Box = ObjRef(u64);
+    const Traced = struct {
+        pub fn gcMark(_: @This(), _: *gc.Marker) void {}
+    };
+    comptime {
+        std.debug.assert(holdsRefs(struct { n: u32, items: std.ArrayList(Box) }, 6));
+        std.debug.assert(holdsRefs(struct { raw: ?*Box.Cell }, 6));
+        std.debug.assert(holdsRefs(std.AutoHashMap(u64, struct { v: Traced }), 6));
+        std.debug.assert(holdsRefs(union(enum) { ok: void, err: struct { v: [2]Traced } }, 6));
+        std.debug.assert(!holdsRefs(struct { n: u32, bytes: []const u8, p: *anyopaque }, 6));
+        std.debug.assert(!holdsRefs(std.AutoHashMap(u64, u32), 6));
+        std.debug.assert(!holdsRefs(struct {
+            pub const gc_pointer_free = true;
+            b: Box,
+        }, 6));
+    }
+}
+
+test "a cell lock is counted until its guard lets go" {
+    if (!std.debug.runtime_safety) return error.SkipZigTest;
+    const a = try ObjRef(i32).init(testing.allocator, 0);
+    defer a.deinit();
+    const b = try ObjRef(std.ArrayList(i32)).init(testing.allocator, .empty);
+    defer b.deinit();
+    const Frozen = struct {
+        pub const objref_immutable = true;
+        n: u32,
+    };
+    const f = try ObjRef(Frozen).init(testing.allocator, .{ .n = 1 });
+    defer f.deinit();
+    const before = locks_held;
+    {
+        const g = a.borrowMut();
+        defer g.deinit();
+        try testing.expectEqual(before + 1, locks_held);
+        const h = b.borrowMutAt(0);
+        defer h.deinit();
+        try testing.expectEqual(before + 2, locks_held);
+    }
+    try testing.expectEqual(before, locks_held);
+    {
+        const r = a.borrow();
+        defer r.deinit();
+        try testing.expectEqual(before + 1, locks_held);
+        // An immutable payload takes no lock.
+        const fr = f.borrow();
+        defer fr.deinit();
+        try testing.expectEqual(before + 1, locks_held);
+    }
+    try testing.expectEqual(before, locks_held);
+    assertNoCellLock();
+}
+
+test "appends to a tenured list from many threads leave every appended cell reachable to a minor mark" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Box = ObjRef(u64);
+    const List = std.ArrayList(Box);
+    const old = try Box.init(a, 0);
+    old.cell.hdr.gc_gen = 1;
+    var items: List = .empty;
+    try items.appendNTimes(std.heap.smp_allocator, old, 100);
+    const list = try ObjRef(List).init(a, items);
+    list.cell.hdr.gc_gen = 1;
+    defer gc.drainRemembered();
+
+    const Appender = struct {
+        fn run(target: ObjRef(List), alloc: std.mem.Allocator, seed: u64) void {
+            var n: usize = 0;
+            while (n < 2000) : (n += 1) {
+                const young = [_]Box{
+                    Box.init(alloc, seed * 10_000 + n) catch unreachable,
+                    Box.init(alloc, seed * 10_000 + n + 1) catch unreachable,
+                };
+                // One element at a time, and two at once, as add and addAll do.
+                const k: usize = if (n % 3 == 0) 2 else 1;
+                const g = target.borrowMutAppend(k);
+                defer g.deinit();
+                g.get().appendSlice(std.heap.smp_allocator, young[0..k]) catch unreachable;
+            }
+        }
+    };
+    var arenas: [4]std.heap.ArenaAllocator = undefined;
+    for (&arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer for (&arenas) |*ar| ar.deinit();
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, k| t.* = try std.Thread.spawn(.{}, Appender.run, .{ list, arenas[k].allocator(), k + 1 });
+    for (threads) |t| t.join();
+    defer list.cell.data.deinit(std.heap.smp_allocator);
+
+    // A mark tenures what it reaches, so the young cells are counted first.
+    const was_young = try a.alloc(bool, list.cell.data.items.len);
+    var young: usize = 0;
+    for (list.cell.data.items, was_young) |e, *y| {
+        y.* = e.cell.hdr.gc_gen == 0;
+        young += @intFromBool(y.*);
+    }
+    try testing.expect(young > 8000);
+    var m: gc.Marker = .{ .epoch = 78, .arena = std.heap.page_allocator, .minor = true };
+    defer m.grey.deinit(std.heap.page_allocator);
+    _ = gc.traceRemembered(&m);
+    m.drain();
+    for (list.cell.data.items, was_young) |e, y| {
+        if (!y) continue;
+        try testing.expectEqual(@as(usize, 78), e.cell.hdr.gc_mark);
+    }
+    // Only the appended range was remembered; the list was not retraced whole.
+    try testing.expect(!list.cell.hdr.gc_remembered);
+    try testing.expect(list.cell.hdr.gc_range != 0);
+}
+
+test "stores into a tenured array from many threads leave every stored cell reachable to a minor mark" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Box = ObjRef(u64);
+    const List = std.ArrayList(Box);
+    const old = try Box.init(a, 0);
+    old.cell.hdr.gc_gen = 1;
+    var items: List = .empty;
+    try items.appendNTimes(a, old, 4096);
+    const arr = try ObjRef(List).init(a, items);
+    arr.cell.hdr.gc_gen = 1;
+    defer gc.drainRemembered();
+
+    const Writer = struct {
+        fn run(target: ObjRef(List), alloc: std.mem.Allocator, seed: u64) void {
+            var x = seed;
+            var n: usize = 0;
+            while (n < 3000) : (n += 1) {
+                x = x *% 6364136223846793005 +% 1442695040888963407;
+                const i: usize = @intCast((x >> 33) % 4096);
+                const young = Box.init(alloc, x) catch unreachable;
+                const g = target.borrowMutAt(i);
+                defer g.deinit();
+                g.get().items[i] = young;
+            }
+        }
+    };
+    // The arena is not thread-safe; each writer gets its own.
+    var arenas: [4]std.heap.ArenaAllocator = undefined;
+    for (&arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer for (&arenas) |*ar| ar.deinit();
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, k| t.* = try std.Thread.spawn(.{}, Writer.run, .{ arr, arenas[k].allocator(), k + 1 });
+    for (threads) |t| t.join();
+
+    // A mark tenures what it reaches, so the young cells are counted first.
+    var was_young: [4096]bool = undefined;
+    var young: usize = 0;
+    for (arr.cell.data.items, &was_young) |e, *y| {
+        y.* = e.cell.hdr.gc_gen == 0;
+        young += @intFromBool(y.*);
+    }
+    try testing.expect(young > 1000);
+    var m: gc.Marker = .{ .epoch = 77, .arena = std.heap.page_allocator, .minor = true };
+    defer m.grey.deinit(std.heap.page_allocator);
+    _ = gc.traceRemembered(&m);
+    m.drain();
+    for (arr.cell.data.items, was_young) |e, y| {
+        if (!y) continue;
+        try testing.expectEqual(@as(usize, 77), e.cell.hdr.gc_mark);
+    }
+    // Only the array joined the range table; nothing was remembered whole.
+    try testing.expect(!arr.cell.hdr.gc_remembered);
+    try testing.expect(arr.cell.hdr.gc_range != 0);
 }
