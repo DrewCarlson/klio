@@ -1095,6 +1095,9 @@ const Serial = struct {
     packs: []const sema.SourceFile,
     /// How many generated files the packs alone produce.
     n_pack_generated: usize,
+    /// The packs' `@MetaSerializable` annotation classes: a program class
+    /// carrying one is serializable without spelling `@Serializable`.
+    pack_meta: std.StringHashMap(void),
 
     fn init(a: Allocator, map: *span.SourceMap, pack_files: []const sema.SourceFile) !Serial {
         const originals = try a.alloc(ast.KotlinFile, pack_files.len);
@@ -1107,7 +1110,12 @@ const Serial = struct {
             else
                 .{ .ast = f, .path = map.get(f.span.file).path, .origin = .pack, .generated = true };
         }
-        return .{ .pack_originals = originals, .packs = packs, .n_pack_generated = out.len - pack_files.len };
+        return .{
+            .pack_originals = originals,
+            .packs = packs,
+            .n_pack_generated = out.len - pack_files.len,
+            .pack_meta = try serialization_pass.metaSerializableNames(a, originals),
+        };
     }
 
     /// The programs as sema should see them: transformed, followed by the
@@ -1115,7 +1123,10 @@ const Serial = struct {
     /// come back as they are.
     fn programFiles(self: *const Serial, a: Allocator, map: *span.SourceMap, programs: []const sema.SourceFile) ![]const sema.SourceFile {
         var any = false;
-        for (programs) |p| any = any or serialization_pass.fileMentionsSerializable(p.ast);
+        for (programs) |p| {
+            any = any or serialization_pass.fileMentionsSerializable(p.ast) or
+                serialization_pass.fileUsesMetaSerializable(p.ast, &self.pack_meta);
+        }
         if (!any) return programs;
         const n_p = self.pack_originals.len;
         const input = try a.alloc(ast.KotlinFile, n_p + programs.len);

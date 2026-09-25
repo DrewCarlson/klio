@@ -262,6 +262,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "klio/ClassInit.kt",
     "klio/Exceptions.kt",
     "klio/security/Exceptions.kt",
+    "klio/util/regex/Exceptions.kt",
     "kotlin-collections/MapActuals.kt",
     "kotlin-uuid/UuidActuals.kt",
     "kotlin-reflect/ReflectActuals.kt",

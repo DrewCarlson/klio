@@ -1,0 +1,60 @@
+[user, login]
+\p{Alpha}+ ~ "abcXYZ": true
+\p{Alpha} ~ "é": false
+\p{Lower}\p{Upper}\p{Digit}\p{XDigit} ~ "aZ7f": true
+\p{Punct}\p{Graph}\p{Print}\p{Blank}\p{Space} ~ "!~  
+": true
+\p{Cntrl}\p{ASCII} ~ "": true
+(i) \p{Lower} ~ "A": true
+\p{L}+ ~ "héllo": true
+\pL\pN ~ "ж٣": true
+\p{Lu}\p{Ll}\p{Lt} ~ "Éaǅ": true
+\p{IsLu}\p{gc=Nd}\p{general_category=Sc} ~ "Ω7€": true
+\PL\P{Lu} ~ "1a": true
+\PL ~ "a": false
+\p{Zs}\p{Pd}\p{Sm}\p{Cc} ~ "　-+": true
+\p{LC}\p{LD}\p{L1} ~ "aZÿ": true
+\p{Lu} ~ "a": false
+(i) \p{Lu} ~ "a": true
+\p{IsGreek}+ ~ "αβγ": true
+\p{IsGreek} ~ "a": false
+\p{sc=Latin}\p{script=cyrillic}\p{IsLatn}\p{IsHan} ~ "aжz字": true
+\p{InGreek}\p{InBasicLatin} ~ "αa": true
+\p{blk=Greek and Coptic}\p{block=GREEK}\p{InGreekandCoptic} ~ "ωΩϢ": true
+\p{InBasicLatin} ~ "é": false
+\p{InLatin-1 Supplement} ~ "é": true
+\p{javaLowerCase}\p{javaUpperCase}\p{javaDigit} ~ "ªÉ٣": true
+\p{javaWhitespace}\p{javaSpaceChar} ~ " ": true
+\p{javaWhitespace} ~ " ": false
+\p{javaJavaIdentifierStart}\p{javaJavaIdentifierPart}\p{javaMirrored} ~ "$1(": true
+\p{javaLetterOrDigit}\p{javaDefined}\p{javaAlphabetic} ~ "x é": true
+\p{IsAlpha}\p{IsAlphabetic}\p{IsLetter} ~ "éΩж": true
+\p{IsWhite_Space}\p{IsWhiteSpace}\p{IsPunctuation} ~ " ¿": true
+\p{IsHex_Digit}\p{IsIdeographic}\p{IsJoin_Control} ~ "Ｆ字‍": true
+\p{IsUppercase}\p{IsTitlecase}\p{IsAssigned} ~ "Aǅa": true
+\p{IsAssigned} ~ "͸": false
+\p{IsWord}\p{IsAlnum}\p{IsDigit}\p{IsBlank}\p{IsGraph}\p{IsPrint} ~ "_٣٣	!é": true
+\p{IsEmoji} ~ "😀": true
+[\p{L}\d_]+ ~ "héllo_42": true
+[^\p{L}] ~ "é": false
+[\P{L}] ~ "5": true
+[a-z&&[^aeiou]]+ ~ "xyz": true
+[a-z&&[^aeiou]] ~ "e": false
+[\p{L}&&[^\p{Lu}]] ~ "é": true
+[\p{L}&&[^\p{Lu}]] ~ "É": false
+[ab&&bc] ~ "b": true
+[ab&&bc] ~ "a": false
+[a[bc]]{3} ~ "abc": true
+[^a[bc]] ~ "c": false
+[]a]+ ~ "]a": true
+[a-]+ ~ "a-": true
+[a&b]+ ~ "a&b": true
+(i) [a-c] ~ "B": true
+(i) [^a-c] ~ "B": false
+\p{Foo}: Unknown character property name {Foo} near index 6
+a\pQ: Unknown character property name {Q} near index 3
+\p{sc=Klingon}: Unknown Unicode property {name=<sc>, value=<Klingon>} near index 13
+\p{InNowhere}: Unknown character property name {InNowhere} near index 12
+\p{lu}: Unknown character property name {lu} near index 5
+\p{}: Empty character family near index 3
+[z-a]: Illegal character range near index 3

@@ -288,6 +288,7 @@ Run any program with:
 | `numeric_fidelity.kt`      | Integer/float width and rounding fidelity.                     |
 | `numeric_literal_coercion.kt` | Unsuffixed integer literals taking a `Long` binding or parameter-default type, including recursive local `tailrec` accumulators. |
 | `regex.kt`                 | `Regex` basics.                                                |
+| `regex_unicode_properties.kt` | `\p{...}` / `\P{...}` as java.util.regex resolves them: ASCII POSIX classes, general categories (`\pL`, `Is`, `gc=`), scripts (`Is`, `sc=`, ISO 15924 aliases), blocks (`In`, `blk=`), `java*` classes and Unicode binary properties, inside and outside brackets with nested classes, `&&` intersection, whole-class `^` and IGNORE_CASE; an unknown property is a PatternSyntaxException, an `IllegalArgumentException`, with the JVM's message. |
 | `native_callbacks.kt`      | Natively written library functions calling back into user classes through the member they override: `toTypedArray` through an `AbstractCollection`'s `toArray`, sorting through `compareTo`, a `HashMap` copy through a user map's `entries`; a regex match's `groups` indexed by number and by name. |
 | `host_class_overrides.kt`  | Subclasses of `ArrayList` and `HashMap` overriding `get`, `size` and `put`: a call through the base type runs the override, and the override's `super` call runs the host's implementation. |
 | `for_user_iterator.kt`     | `for` over a user-defined `iterator()`.                        |

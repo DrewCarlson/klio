@@ -7,6 +7,7 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const char_impl = @import("char.zig");
+const uni = @import("regex_unicode.zig");
 
 const Value = runtime.Value;
 const CallCtx = runtime.CallCtx;
@@ -124,18 +125,90 @@ const Quant = struct {
 
 const ClassRange = struct { lo: u21, hi: u21 };
 
-const ClassItem = union(enum) {
+const BuiltinClass = enum { digit, not_digit, word, not_word, space, not_space };
+
+/// A character class as java.util.regex builds one: members, ranges and
+/// properties joined by union, `&&` intersection, and a class-wide `^`.
+const CharSet = union(enum) {
+    single: u21,
     range: ClassRange,
     builtin: BuiltinClass,
+    prop: struct { prop: Prop, negated: bool },
+    any_of: []*CharSet,
+    both: struct { a: *CharSet, b: *CharSet },
+    not: *CharSet,
 };
 
-const BuiltinClass = enum { digit, not_digit, word, not_word, space, not_space };
+/// A `\p{...}` property, resolved the way java.util.regex's `CharPredicates`
+/// resolves it.
+const Prop = union(enum) {
+    /// A mask over `Character.getType` codes. `case_wide` widens a lone Lu, Ll
+    /// or Lt to all three under IGNORE_CASE.
+    categories: struct { mask: u32, case_wide: bool = false },
+    script: u8,
+    block: u16,
+    range: ClassRange,
+    ascii: AsciiClass,
+    char_fn: CharFn,
+    all,
+};
+
+/// The POSIX classes, ASCII-only as java.util.regex defines them.
+const AsciiClass = enum { alnum, alpha, blank, cntrl, graph, punct, space, xdigit, lower, upper };
+
+/// The `java*` classes (java.lang.Character predicates) and the Unicode binary
+/// properties the `Is` prefix names.
+const CharFn = enum {
+    java_lower,
+    java_upper,
+    java_title,
+    java_alphabetic,
+    java_ideographic,
+    java_digit,
+    java_defined,
+    java_letter,
+    java_letter_or_digit,
+    java_id_start,
+    java_id_part,
+    unicode_id_start,
+    unicode_id_part,
+    id_ignorable,
+    java_space_char,
+    java_whitespace,
+    java_iso_control,
+    java_mirrored,
+    alphabetic,
+    assigned,
+    control,
+    emoji,
+    emoji_presentation,
+    emoji_modifier,
+    emoji_modifier_base,
+    emoji_component,
+    extended_pictographic,
+    hex_digit,
+    ideographic,
+    join_control,
+    letter,
+    lowercase,
+    noncharacter,
+    titlecase,
+    punctuation,
+    uppercase,
+    white_space,
+    word,
+    alnum,
+    blank,
+    graph,
+    print,
+    digit,
+};
 
 const Node = union(enum) {
     literal: u21,
     /// `.`: any codepoint except newline. `(?s)` dotall is not modeled.
     any,
-    class: struct { items: []ClassItem, negated: bool },
+    set: *CharSet,
     builtin: BuiltinClass,
     anchor_start,
     anchor_end,
@@ -153,16 +226,63 @@ const Node = union(enum) {
 
 const ParseError = error{ OutOfMemory, InvalidPattern };
 
+/// Why a pattern failed, in java.util.regex's words, and the pattern index the
+/// JVM reports it at.
+const Diag = struct {
+    desc: ?[]const u8 = null,
+    index: usize = 0,
+};
+
 const Parser = struct {
     src: []const u21,
     pos: usize,
     allocator: std.mem.Allocator,
     next_group: usize,
     names: std.ArrayList(?[]const u8),
+    diag: Diag = .{},
 
     fn peek(self: *Parser) ?u21 {
         if (self.pos < self.src.len) return self.src[self.pos];
         return null;
+    }
+
+    /// java.util.regex's cursor reads: the pattern as if followed by NULs.
+    fn at(self: *Parser, i: usize) u21 {
+        return if (i < self.src.len) self.src[i] else 0;
+    }
+
+    fn cur(self: *Parser) u21 {
+        return self.at(self.pos);
+    }
+
+    fn advance(self: *Parser) u21 {
+        self.pos += 1;
+        return self.cur();
+    }
+
+    fn fail(self: *Parser, comptime fmt: []const u8, args: anytype, index: usize) ParseError {
+        const desc = std.fmt.allocPrint(self.allocator, fmt, args) catch return ParseError.OutOfMemory;
+        self.diag = .{ .desc = desc, .index = index };
+        return ParseError.InvalidPattern;
+    }
+
+    fn set(self: *Parser, s: CharSet) ParseError!*CharSet {
+        const p = try self.allocator.create(CharSet);
+        p.* = s;
+        return p;
+    }
+
+    fn setUnion(self: *Parser, a: *CharSet, b: *CharSet) ParseError!*CharSet {
+        const parts = try self.allocator.alloc(*CharSet, 2);
+        parts[0] = a;
+        parts[1] = b;
+        return self.set(.{ .any_of = parts });
+    }
+
+    fn singlesSet(self: *Parser, singles: []const u21) ParseError!*CharSet {
+        const parts = try self.allocator.alloc(*CharSet, singles.len);
+        for (singles, parts) |c, *p| p.* = try self.set(.{ .single = c });
+        return self.set(.{ .any_of = parts });
     }
 
     fn bump(self: *Parser) ?u21 {
@@ -399,54 +519,195 @@ const Parser = struct {
     }
 
     fn parseClass(self: *Parser) ParseError!*Node {
-        _ = self.bump(); // '['
-        var negated = false;
-        if (self.peek() == '^') {
-            _ = self.bump();
-            negated = true;
-        }
-        var items: std.ArrayList(ClassItem) = .empty;
-        var first = true;
-        while (self.peek()) |c| {
-            if (c == ']' and !first) {
-                _ = self.bump();
-                return self.node(.{ .class = .{ .items = try items.toOwnedSlice(self.allocator), .negated = negated } });
-            }
-            first = false;
-            if (c == '\\') {
-                _ = self.bump();
-                const e = self.bump() orelse return ParseError.InvalidPattern;
-                if (classBuiltin(e)) |b| {
-                    try items.append(self.allocator, .{ .builtin = b });
-                    continue;
-                }
-                const lo = escapeChar(e);
-                try self.appendClassMember(&items, lo);
-                continue;
-            }
-            _ = self.bump();
-            try self.appendClassMember(&items, c);
-        }
-        return ParseError.InvalidPattern;
+        return self.node(.{ .set = try self.parseClassSet(true) });
     }
 
-    fn appendClassMember(self: *Parser, items: *std.ArrayList(ClassItem), lo: u21) ParseError!void {
-        if (self.peek() == '-' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']') {
-            _ = self.bump(); // '-'
-            var hi = self.bump().?;
-            if (hi == '\\') {
-                hi = escapeChar(self.bump() orelse return ParseError.InvalidPattern);
-            }
-            try items.append(self.allocator, .{ .range = .{ .lo = lo, .hi = hi } });
-        } else {
-            try items.append(self.allocator, .{ .range = .{ .lo = lo, .hi = lo } });
+    /// A `[...]` class, java.util.regex's `Pattern.clazz`: entered with `pos`
+    /// one before the first member (on the `[`, or on the character before an
+    /// intersection's unbracketed right side). Single characters collect into a
+    /// union joined to the rest at `]` or `&&`; a nested class is a union
+    /// member; `&&` intersects everything so far with the rest up to `]`; a
+    /// leading `^` negates the whole class. `consume` takes the closing `]`.
+    fn parseClassSet(self: *Parser, consume: bool) ParseError!*CharSet {
+        var prev: ?*CharSet = null;
+        var curr: ?*CharSet = null;
+        var singles: std.ArrayList(u21) = .empty;
+        defer singles.deinit(self.allocator);
+        var negated = false;
+        var ch = self.advance();
+        if (ch == '^' and self.src[self.pos - 1] == '[') {
+            ch = self.advance();
+            negated = true;
         }
+        while (true) {
+            switch (ch) {
+                '[' => {
+                    curr = try self.parseClassSet(true);
+                    prev = if (prev) |p| try self.setUnion(p, curr.?) else curr;
+                    ch = self.cur();
+                    continue;
+                },
+                '&' => {
+                    ch = self.advance();
+                    if (ch == '&') {
+                        ch = self.advance();
+                        var right: ?*CharSet = null;
+                        while (ch != ']' and ch != '&') {
+                            if (ch == 0 and self.pos >= self.src.len) {
+                                return self.fail("Unclosed character class", .{}, self.src.len -| 1);
+                            }
+                            const part = if (ch == '[') try self.parseClassSet(true) else blk: {
+                                self.pos -= 1;
+                                break :blk try self.parseClassSet(false);
+                            };
+                            right = if (right) |r| try self.setUnion(r, part) else part;
+                            ch = self.cur();
+                        }
+                        if (singles.items.len > 0) {
+                            const s = try self.singlesSet(singles.items);
+                            if (prev == null) {
+                                prev = s;
+                                curr = s;
+                            } else {
+                                prev = try self.setUnion(prev.?, s);
+                            }
+                            singles.clearRetainingCapacity();
+                        }
+                        if (right != null) curr = right;
+                        if (prev == null) {
+                            if (right == null) return self.fail("Bad class syntax", .{}, self.pos -| 1);
+                            prev = right;
+                        } else {
+                            prev = try self.set(.{ .both = .{ .a = prev.?, .b = curr.? } });
+                        }
+                        continue;
+                    }
+                    // A lone `&` is a literal.
+                    self.pos -= 1;
+                },
+                0 => if (self.pos >= self.src.len) {
+                    return self.fail("Unclosed character class", .{}, self.src.len -| 1);
+                },
+                ']' => if (prev != null or singles.items.len > 0) {
+                    if (consume) _ = self.advance();
+                    var result = prev orelse try self.singlesSet(singles.items);
+                    if (prev != null and singles.items.len > 0) {
+                        result = try self.setUnion(result, try self.singlesSet(singles.items));
+                    }
+                    return if (negated) self.set(.{ .not = result }) else result;
+                },
+                else => {},
+            }
+            if (try self.parseClassMember(&singles)) |member| {
+                prev = if (prev) |p| try self.setUnion(p, member) else member;
+            }
+            ch = self.cur();
+        }
+    }
+
+    /// One class member, java.util.regex's `Pattern.range`: a character (added
+    /// to `singles`, null returned), a range, an escape class or a property.
+    fn parseClassMember(self: *Parser, singles: *std.ArrayList(u21)) ParseError!?*CharSet {
+        var ch = self.cur();
+        if (ch == '\\') {
+            const e = self.advance();
+            if (e == 'p' or e == 'P') {
+                const one_letter = self.advance() != '{';
+                return try self.parseFamily(one_letter, e == 'P');
+            }
+            _ = self.advance();
+            if (classBuiltin(e)) |b| return try self.set(.{ .builtin = b });
+            ch = escapeChar(e);
+        } else {
+            _ = self.advance();
+        }
+        if (self.cur() == '-') {
+            const end_range = self.at(self.pos + 1);
+            if (end_range != '[' and end_range != ']') {
+                _ = self.advance();
+                var hi = self.cur();
+                if (hi == '\\') {
+                    _ = self.advance();
+                    hi = escapeChar(self.cur());
+                }
+                _ = self.advance();
+                if (hi < ch) return self.fail("Illegal character range", .{}, self.pos -| 1);
+                return try self.set(.{ .range = .{ .lo = ch, .hi = hi } });
+            }
+        }
+        try singles.append(self.allocator, ch);
+        return null;
+    }
+
+    /// The name after `\p` or `\P`, java.util.regex's `Pattern.family`: one
+    /// letter, or a braced name, `In` block, `Is` property / category / script,
+    /// or `key=value` (`sc`/`script`, `blk`/`block`, `gc`/`general_category`).
+    /// Entered with `pos` on the letter or the `{`.
+    fn parseFamily(self: *Parser, one_letter: bool, complement: bool) ParseError!*CharSet {
+        var name_cps: []const u21 = undefined;
+        if (one_letter) {
+            name_cps = self.src[@min(self.pos, self.src.len)..@min(self.pos + 1, self.src.len)];
+            self.pos += 1;
+        } else {
+            const open = self.pos;
+            var i = open + 1;
+            while (i < self.src.len and self.src[i] != '}') : (i += 1) {}
+            if (i >= self.src.len) {
+                self.pos = self.src.len;
+                return self.fail("Unclosed character family", .{}, self.src.len);
+            }
+            if (i == open + 1) {
+                self.pos = i + 1;
+                return self.fail("Empty character family", .{}, i);
+            }
+            name_cps = self.src[open + 1 .. i];
+            self.pos = i + 1;
+        }
+        var name_buf: std.ArrayList(u8) = .empty;
+        defer name_buf.deinit(self.allocator);
+        for (name_cps) |c| {
+            var enc: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(@intCast(c), &enc) catch return ParseError.InvalidPattern;
+            try name_buf.appendSlice(self.allocator, enc[0..n]);
+        }
+        const name = name_buf.items;
+        const err_at = self.pos -| 1;
+        var prop: ?Prop = null;
+        if (std.mem.indexOfScalar(u8, name, '=')) |eq| {
+            const key = name[0..eq];
+            const value = name[eq + 1 ..];
+            if (asciiEqlLower(key, "sc") or asciiEqlLower(key, "script")) {
+                prop = scriptProp(value);
+            } else if (asciiEqlLower(key, "blk") or asciiEqlLower(key, "block")) {
+                prop = blockProp(value);
+            } else if (asciiEqlLower(key, "gc") or asciiEqlLower(key, "general_category")) {
+                prop = namedProp(value);
+            }
+            if (prop == null) {
+                const lower_key = try std.ascii.allocLowerString(self.allocator, key);
+                defer self.allocator.free(lower_key);
+                return self.fail("Unknown Unicode property {{name=<{s}>, value=<{s}>}}", .{ lower_key, value }, err_at);
+            }
+        } else if (std.mem.startsWith(u8, name, "In")) {
+            prop = blockProp(name[2..]);
+        } else if (std.mem.startsWith(u8, name, "Is")) {
+            const short = name[2..];
+            prop = unicodeProp(short) orelse namedProp(short) orelse scriptProp(short);
+        } else {
+            prop = namedProp(name);
+        }
+        const p = prop orelse return self.fail("Unknown character property name {{{s}}}", .{name}, err_at);
+        return self.set(.{ .prop = .{ .prop = p, .negated = complement } });
     }
 
     fn parseEscape(self: *Parser) ParseError!*Node {
         _ = self.bump(); // '\\'
         const e = self.bump() orelse return ParseError.InvalidPattern;
         if (classBuiltin(e)) |b| return self.node(.{ .builtin = b });
+        if (e == 'p' or e == 'P') {
+            const one_letter = self.cur() != '{';
+            return self.node(.{ .set = try self.parseFamily(one_letter, e == 'P') });
+        }
         switch (e) {
             'b' => return self.node(.{ .word_boundary = true }),
             'B' => return self.node(.{ .word_boundary = false }),
@@ -556,24 +817,401 @@ fn matchBuiltin(b: BuiltinClass, c: u21) bool {
     };
 }
 
-fn matchClass(items: []const ClassItem, negated: bool, c: u21) bool {
-    var hit = false;
-    for (items) |it| {
-        switch (it) {
-            .range => |r| if (c >= r.lo and c <= r.hi) {
-                hit = true;
-                break;
-            },
-            .builtin => |b| if (matchBuiltin(b, c)) {
-                hit = true;
-                break;
-            },
+fn asciiEqlLower(s: []const u8, lower: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(s, lower);
+}
+
+/// `Character.getType` codes.
+const Cat = struct {
+    const unassigned = 0;
+    const upper = 1;
+    const lower = 2;
+    const title = 3;
+    const modifier_letter = 4;
+    const other_letter = 5;
+    const non_spacing_mark = 6;
+    const enclosing_mark = 7;
+    const spacing_mark = 8;
+    const decimal_digit = 9;
+    const letter_number = 10;
+    const other_number = 11;
+    const space_separator = 12;
+    const line_separator = 13;
+    const paragraph_separator = 14;
+    const control = 15;
+    const format = 16;
+    const private_use = 18;
+    const surrogate = 19;
+    const dash_punct = 20;
+    const start_punct = 21;
+    const end_punct = 22;
+    const connector_punct = 23;
+    const other_punct = 24;
+    const math_symbol = 25;
+    const currency_symbol = 26;
+    const modifier_symbol = 27;
+    const other_symbol = 28;
+    const initial_punct = 29;
+    const final_punct = 30;
+};
+
+fn bit(comptime codes: anytype) u32 {
+    var m: u32 = 0;
+    inline for (codes) |c| m |= @as(u32, 1) << c;
+    return m;
+}
+
+const mask_letter = bit(.{ Cat.upper, Cat.lower, Cat.title, Cat.modifier_letter, Cat.other_letter });
+const mask_cased = bit(.{ Cat.upper, Cat.lower, Cat.title });
+const mask_mark = bit(.{ Cat.non_spacing_mark, Cat.enclosing_mark, Cat.spacing_mark });
+const mask_number = bit(.{ Cat.decimal_digit, Cat.letter_number, Cat.other_number });
+const mask_separator = bit(.{ Cat.space_separator, Cat.line_separator, Cat.paragraph_separator });
+const mask_other = bit(.{ Cat.control, Cat.format, Cat.private_use, Cat.surrogate, Cat.unassigned });
+const mask_punct = bit(.{ Cat.dash_punct, Cat.start_punct, Cat.end_punct, Cat.connector_punct, Cat.other_punct, Cat.initial_punct, Cat.final_punct });
+const mask_symbol = bit(.{ Cat.math_symbol, Cat.currency_symbol, Cat.modifier_symbol, Cat.other_symbol });
+
+/// The category names java.util.regex's `CharPredicates.forProperty` knows,
+/// matched exactly.
+const category_names = [_]struct { name: []const u8, mask: u32 }{
+    .{ .name = "Cn", .mask = bit(.{Cat.unassigned}) },
+    .{ .name = "Lu", .mask = bit(.{Cat.upper}) },
+    .{ .name = "Ll", .mask = bit(.{Cat.lower}) },
+    .{ .name = "Lt", .mask = bit(.{Cat.title}) },
+    .{ .name = "Lm", .mask = bit(.{Cat.modifier_letter}) },
+    .{ .name = "Lo", .mask = bit(.{Cat.other_letter}) },
+    .{ .name = "Mn", .mask = bit(.{Cat.non_spacing_mark}) },
+    .{ .name = "Me", .mask = bit(.{Cat.enclosing_mark}) },
+    .{ .name = "Mc", .mask = bit(.{Cat.spacing_mark}) },
+    .{ .name = "Nd", .mask = bit(.{Cat.decimal_digit}) },
+    .{ .name = "Nl", .mask = bit(.{Cat.letter_number}) },
+    .{ .name = "No", .mask = bit(.{Cat.other_number}) },
+    .{ .name = "Zs", .mask = bit(.{Cat.space_separator}) },
+    .{ .name = "Zl", .mask = bit(.{Cat.line_separator}) },
+    .{ .name = "Zp", .mask = bit(.{Cat.paragraph_separator}) },
+    .{ .name = "Cc", .mask = bit(.{Cat.control}) },
+    .{ .name = "Cf", .mask = bit(.{Cat.format}) },
+    .{ .name = "Co", .mask = bit(.{Cat.private_use}) },
+    .{ .name = "Cs", .mask = bit(.{Cat.surrogate}) },
+    .{ .name = "Pd", .mask = bit(.{Cat.dash_punct}) },
+    .{ .name = "Ps", .mask = bit(.{Cat.start_punct}) },
+    .{ .name = "Pe", .mask = bit(.{Cat.end_punct}) },
+    .{ .name = "Pc", .mask = bit(.{Cat.connector_punct}) },
+    .{ .name = "Po", .mask = bit(.{Cat.other_punct}) },
+    .{ .name = "Sm", .mask = bit(.{Cat.math_symbol}) },
+    .{ .name = "Sc", .mask = bit(.{Cat.currency_symbol}) },
+    .{ .name = "Sk", .mask = bit(.{Cat.modifier_symbol}) },
+    .{ .name = "So", .mask = bit(.{Cat.other_symbol}) },
+    .{ .name = "Pi", .mask = bit(.{Cat.initial_punct}) },
+    .{ .name = "Pf", .mask = bit(.{Cat.final_punct}) },
+    .{ .name = "L", .mask = mask_letter },
+    .{ .name = "M", .mask = mask_mark },
+    .{ .name = "N", .mask = mask_number },
+    .{ .name = "Z", .mask = mask_separator },
+    .{ .name = "C", .mask = mask_other },
+    .{ .name = "P", .mask = mask_punct },
+    .{ .name = "S", .mask = mask_symbol },
+    .{ .name = "LC", .mask = mask_cased },
+    .{ .name = "LD", .mask = mask_letter | bit(.{Cat.decimal_digit}) },
+};
+
+const posix_names = [_]struct { name: []const u8, class: AsciiClass }{
+    .{ .name = "Alnum", .class = .alnum },
+    .{ .name = "Alpha", .class = .alpha },
+    .{ .name = "Blank", .class = .blank },
+    .{ .name = "Cntrl", .class = .cntrl },
+    .{ .name = "Graph", .class = .graph },
+    .{ .name = "Lower", .class = .lower },
+    .{ .name = "Punct", .class = .punct },
+    .{ .name = "Space", .class = .space },
+    .{ .name = "Upper", .class = .upper },
+    .{ .name = "XDigit", .class = .xdigit },
+};
+
+const java_names = [_]struct { name: []const u8, f: CharFn }{
+    .{ .name = "javaLowerCase", .f = .java_lower },
+    .{ .name = "javaUpperCase", .f = .java_upper },
+    .{ .name = "javaAlphabetic", .f = .java_alphabetic },
+    .{ .name = "javaIdeographic", .f = .java_ideographic },
+    .{ .name = "javaTitleCase", .f = .java_title },
+    .{ .name = "javaDigit", .f = .java_digit },
+    .{ .name = "javaDefined", .f = .java_defined },
+    .{ .name = "javaLetter", .f = .java_letter },
+    .{ .name = "javaLetterOrDigit", .f = .java_letter_or_digit },
+    .{ .name = "javaJavaIdentifierStart", .f = .java_id_start },
+    .{ .name = "javaJavaIdentifierPart", .f = .java_id_part },
+    .{ .name = "javaUnicodeIdentifierStart", .f = .unicode_id_start },
+    .{ .name = "javaUnicodeIdentifierPart", .f = .unicode_id_part },
+    .{ .name = "javaIdentifierIgnorable", .f = .id_ignorable },
+    .{ .name = "javaSpaceChar", .f = .java_space_char },
+    .{ .name = "javaWhitespace", .f = .java_whitespace },
+    .{ .name = "javaISOControl", .f = .java_iso_control },
+    .{ .name = "javaMirrored", .f = .java_mirrored },
+};
+
+/// `CharPredicates.forProperty`: category names, `L1`, `all`, the ASCII POSIX
+/// classes and the `java*` classes, all case-sensitive.
+fn namedProp(name: []const u8) ?Prop {
+    for (category_names) |e| {
+        if (std.mem.eql(u8, e.name, name)) {
+            const wide = std.mem.eql(u8, name, "Lu") or std.mem.eql(u8, name, "Ll") or std.mem.eql(u8, name, "Lt");
+            return .{ .categories = .{ .mask = e.mask, .case_wide = wide } };
         }
     }
-    return hit != negated;
+    if (std.mem.eql(u8, name, "L1")) return .{ .range = .{ .lo = 0, .hi = 0xFF } };
+    if (std.mem.eql(u8, name, "all")) return .all;
+    if (std.mem.eql(u8, name, "ASCII")) return .{ .range = .{ .lo = 0, .hi = 0x7F } };
+    if (std.mem.eql(u8, name, "Digit")) return .{ .range = .{ .lo = '0', .hi = '9' } };
+    if (std.mem.eql(u8, name, "Print")) return .{ .range = .{ .lo = 0x20, .hi = 0x7E } };
+    for (posix_names) |e| if (std.mem.eql(u8, e.name, name)) return .{ .ascii = e.class };
+    for (java_names) |e| if (std.mem.eql(u8, e.name, name)) return .{ .char_fn = e.f };
+    return null;
+}
+
+/// `CharPredicates.forUnicodeProperty`: the Unicode binary properties and the
+/// Unicode forms of the POSIX classes, compared upper-cased.
+fn unicodeProp(name: []const u8) ?Prop {
+    var buf: [64]u8 = undefined;
+    if (name.len > buf.len) return null;
+    const up = std.ascii.upperString(buf[0..name.len], name);
+    const table = [_]struct { name: []const u8, f: CharFn }{
+        .{ .name = "ALPHABETIC", .f = .alphabetic },
+        .{ .name = "ASSIGNED", .f = .assigned },
+        .{ .name = "CONTROL", .f = .control },
+        .{ .name = "EMOJI", .f = .emoji },
+        .{ .name = "EMOJI_PRESENTATION", .f = .emoji_presentation },
+        .{ .name = "EMOJI_MODIFIER", .f = .emoji_modifier },
+        .{ .name = "EMOJI_MODIFIER_BASE", .f = .emoji_modifier_base },
+        .{ .name = "EMOJI_COMPONENT", .f = .emoji_component },
+        .{ .name = "EXTENDED_PICTOGRAPHIC", .f = .extended_pictographic },
+        .{ .name = "HEXDIGIT", .f = .hex_digit },
+        .{ .name = "HEX_DIGIT", .f = .hex_digit },
+        .{ .name = "IDEOGRAPHIC", .f = .ideographic },
+        .{ .name = "JOINCONTROL", .f = .join_control },
+        .{ .name = "JOIN_CONTROL", .f = .join_control },
+        .{ .name = "LETTER", .f = .letter },
+        .{ .name = "LOWERCASE", .f = .lowercase },
+        .{ .name = "NONCHARACTERCODEPOINT", .f = .noncharacter },
+        .{ .name = "NONCHARACTER_CODE_POINT", .f = .noncharacter },
+        .{ .name = "TITLECASE", .f = .titlecase },
+        .{ .name = "PUNCTUATION", .f = .punctuation },
+        .{ .name = "UPPERCASE", .f = .uppercase },
+        .{ .name = "WHITESPACE", .f = .white_space },
+        .{ .name = "WHITE_SPACE", .f = .white_space },
+        .{ .name = "WORD", .f = .word },
+        .{ .name = "ALPHA", .f = .alphabetic },
+        .{ .name = "LOWER", .f = .lowercase },
+        .{ .name = "UPPER", .f = .uppercase },
+        .{ .name = "SPACE", .f = .white_space },
+        .{ .name = "PUNCT", .f = .punctuation },
+        .{ .name = "XDIGIT", .f = .hex_digit },
+        .{ .name = "ALNUM", .f = .alnum },
+        .{ .name = "CNTRL", .f = .control },
+        .{ .name = "DIGIT", .f = .digit },
+        .{ .name = "BLANK", .f = .blank },
+        .{ .name = "GRAPH", .f = .graph },
+        .{ .name = "PRINT", .f = .print },
+    };
+    for (table) |e| if (std.mem.eql(u8, e.name, up)) return .{ .char_fn = e.f };
+    return null;
+}
+
+/// `UnicodeScript.forName`: an ISO 15924 alias or a script name, upper-cased.
+fn scriptProp(name: []const u8) ?Prop {
+    var buf: [64]u8 = undefined;
+    if (name.len > buf.len) return null;
+    const up = std.ascii.upperString(buf[0..name.len], name);
+    for (uni.script_aliases) |e| if (std.mem.eql(u8, e.key, up)) return .{ .script = e.index };
+    for (uni.script_names, 0..) |n, i| if (std.mem.eql(u8, n, up)) return .{ .script = @intCast(i) };
+    return null;
+}
+
+/// `UnicodeBlock.forName`: any of a block's keys, upper-cased.
+fn blockProp(name: []const u8) ?Prop {
+    var buf: [128]u8 = undefined;
+    if (name.len > buf.len) return null;
+    const up = std.ascii.upperString(buf[0..name.len], name);
+    for (uni.block_keys) |e| if (std.mem.eql(u8, e.key, up)) return .{ .block = e.index };
+    return null;
+}
+
+/// The value of the run containing `c` in a `starts`/`values` run table.
+fn runValue(comptime T: type, starts: []const u32, values: []const T, c: u21) T {
+    var lo: usize = 0;
+    var hi: usize = starts.len;
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (starts[mid] <= c) lo = mid else hi = mid;
+    }
+    return values[lo];
+}
+
+/// Membership in a flat `[lo, hi, lo, hi, ...]` set.
+fn inSet(set: []const u32, c: u21) bool {
+    var lo: usize = 0;
+    var hi: usize = set.len / 2;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (c < set[2 * mid]) {
+            hi = mid;
+        } else if (c > set[2 * mid + 1]) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
+}
+
+fn category(c: u21) u5 {
+    return @intCast(runValue(u8, &uni.category_starts, &uni.category_values, c));
+}
+
+fn inCategories(c: u21, mask: u32) bool {
+    return (mask >> category(c)) & 1 != 0;
+}
+
+fn matchAscii(class: AsciiClass, c: u21) bool {
+    if (c > 0x7F) return false;
+    const b: u8 = @intCast(c);
+    return switch (class) {
+        .alnum => std.ascii.isAlphanumeric(b),
+        .alpha => std.ascii.isAlphabetic(b),
+        .blank => b == ' ' or b == '\t',
+        .cntrl => b < 0x20 or b == 0x7F,
+        .graph => b >= 0x21 and b <= 0x7E,
+        .punct => b >= 0x21 and b <= 0x7E and !std.ascii.isAlphanumeric(b),
+        .space => b == ' ' or (b >= 0x09 and b <= 0x0D),
+        .xdigit => std.ascii.isHex(b),
+        .lower => b >= 'a' and b <= 'z',
+        .upper => b >= 'A' and b <= 'Z',
+    };
+}
+
+fn isJavaLower(c: u21) bool {
+    return inSet(&uni.lowercase, c);
+}
+
+fn isJavaUpper(c: u21) bool {
+    return inSet(&uni.uppercase, c);
+}
+
+fn isJavaTitle(c: u21) bool {
+    return category(c) == Cat.title;
+}
+
+fn isJavaDigit(c: u21) bool {
+    return category(c) == Cat.decimal_digit;
+}
+
+fn isAlphabetic(c: u21) bool {
+    return inSet(&uni.alphabetic, c);
+}
+
+fn isJoinControl(c: u21) bool {
+    return c == 0x200C or c == 0x200D;
+}
+
+fn isUnicodeControl(c: u21) bool {
+    return category(c) == Cat.control;
+}
+
+fn isUnicodeWhiteSpace(c: u21) bool {
+    return inCategories(c, mask_separator) or (c >= 0x09 and c <= 0x0D) or c == 0x85;
+}
+
+fn isUnicodeBlank(c: u21) bool {
+    return category(c) == Cat.space_separator or c == 0x09;
+}
+
+fn isUnicodeGraph(c: u21) bool {
+    return !inCategories(c, mask_separator | bit(.{ Cat.control, Cat.surrogate, Cat.unassigned }));
+}
+
+fn matchCharFn(f: CharFn, c: u21, fold: bool) bool {
+    return switch (f) {
+        .java_lower => isJavaLower(c) or (fold and (isJavaUpper(c) or isJavaTitle(c))),
+        .java_upper => isJavaUpper(c) or (fold and (isJavaLower(c) or isJavaTitle(c))),
+        .java_title => isJavaTitle(c) or (fold and (isJavaLower(c) or isJavaUpper(c))),
+        .java_alphabetic, .alphabetic => isAlphabetic(c),
+        .java_ideographic, .ideographic => inSet(&uni.ideographic, c),
+        .java_digit, .digit => isJavaDigit(c),
+        .java_defined, .assigned => category(c) != Cat.unassigned,
+        .java_letter, .letter => inCategories(c, mask_letter),
+        .java_letter_or_digit => inCategories(c, mask_letter | bit(.{Cat.decimal_digit})),
+        .java_id_start => inSet(&uni.java_identifier_start, c),
+        .java_id_part => inSet(&uni.java_identifier_part, c),
+        .unicode_id_start => inSet(&uni.unicode_identifier_start, c),
+        .unicode_id_part => inSet(&uni.unicode_identifier_part, c),
+        .id_ignorable => inSet(&uni.identifier_ignorable, c),
+        .java_space_char => inCategories(c, mask_separator),
+        .java_whitespace => (inCategories(c, mask_separator) and c != 0x00A0 and c != 0x2007 and c != 0x202F) or
+            (c >= 0x09 and c <= 0x0D) or (c >= 0x1C and c <= 0x1F),
+        .java_iso_control => c <= 0x9F and (c >= 0x7F or c < 0x20),
+        .java_mirrored => inSet(&uni.mirrored, c),
+        .control => isUnicodeControl(c),
+        .emoji => inSet(&uni.emoji, c),
+        .emoji_presentation => inSet(&uni.emoji_presentation, c),
+        .emoji_modifier => inSet(&uni.emoji_modifier, c),
+        .emoji_modifier_base => inSet(&uni.emoji_modifier_base, c),
+        .emoji_component => inSet(&uni.emoji_component, c),
+        .extended_pictographic => inSet(&uni.extended_pictographic, c),
+        .hex_digit => isJavaDigit(c) or (c >= '0' and c <= '9') or (c >= 'A' and c <= 'F') or (c >= 'a' and c <= 'f') or
+            (c >= 0xFF10 and c <= 0xFF19) or (c >= 0xFF21 and c <= 0xFF26) or (c >= 0xFF41 and c <= 0xFF46),
+        .join_control => isJoinControl(c),
+        .lowercase => isJavaLower(c) or (fold and (isJavaUpper(c) or isJavaTitle(c))),
+        .uppercase => isJavaUpper(c) or (fold and (isJavaLower(c) or isJavaTitle(c))),
+        .titlecase => isJavaTitle(c) or (fold and (isJavaLower(c) or isJavaUpper(c))),
+        .noncharacter => (c & 0xFFFE) == 0xFFFE or (c >= 0xFDD0 and c <= 0xFDEF),
+        .punctuation => inCategories(c, mask_punct),
+        .white_space => isUnicodeWhiteSpace(c),
+        .word => isAlphabetic(c) or inCategories(c, mask_mark | bit(.{ Cat.decimal_digit, Cat.connector_punct })) or isJoinControl(c),
+        .alnum => isAlphabetic(c) or isJavaDigit(c),
+        .blank => isUnicodeBlank(c),
+        .graph => isUnicodeGraph(c),
+        .print => (isUnicodeGraph(c) or isUnicodeBlank(c)) and !isUnicodeControl(c),
+    };
+}
+
+fn matchProp(p: Prop, c: u21, fold: bool) bool {
+    return switch (p) {
+        .categories => |cat| inCategories(c, if (fold and cat.case_wide) mask_cased else cat.mask),
+        .script => |s| runValue(u8, &uni.script_starts, &uni.script_values, c) == s,
+        .block => |b| runValue(u16, &uni.block_starts, &uni.block_values, c) == b,
+        .range => |r| c >= r.lo and c <= r.hi,
+        .ascii => |a| switch (a) {
+            .lower, .upper => matchAscii(if (fold) .alpha else a, c),
+            else => matchAscii(a, c),
+        },
+        .char_fn => |f| matchCharFn(f, c, fold),
+        .all => true,
+    };
+}
+
+fn inRange(r: ClassRange, c: u21) bool {
+    return c >= r.lo and c <= r.hi;
+}
+
+/// Class membership. Under IGNORE_CASE a character or range also matches the
+/// input's upper case and its lower-of-upper case (`SingleU`, `CIRangeU`),
+/// while properties and escape classes answer as java.util.regex builds them.
+fn matchSet(s: *const CharSet, c: u21, fold: bool) bool {
+    return switch (s.*) {
+        .single => |x| c == x or (fold and foldCp(c) == foldCp(x)),
+        .range => |r| inRange(r, c) or (fold and (inRange(r, upperCp(c)) or inRange(r, foldCp(c)))),
+        .builtin => |b| matchBuiltin(b, c),
+        .prop => |p| matchProp(p.prop, c, fold) != p.negated,
+        .any_of => |parts| for (parts) |part| {
+            if (matchSet(part, c, fold)) break true;
+        } else false,
+        .both => |ab| matchSet(ab.a, c, fold) and matchSet(ab.b, c, fold),
+        .not => |inner| !matchSet(inner, c, fold),
+    };
 }
 
 fn compileProgram(allocator: std.mem.Allocator, pattern: []const u8) !?*Program {
+    return compileProgramDiag(allocator, pattern, null);
+}
+
+/// As `compileProgram`, reporting a failure's JVM description into `diag`.
+fn compileProgramDiag(allocator: std.mem.Allocator, pattern: []const u8, diag: ?*Diag) !?*Program {
     var cps: std.ArrayList(u21) = .empty;
     defer cps.deinit(allocator);
     {
@@ -594,7 +1232,10 @@ fn compileProgram(allocator: std.mem.Allocator, pattern: []const u8) !?*Program 
     try parser.names.append(allocator, null); // group 0 is the whole match
 
     const root = parser.parseAlternation() catch |e| switch (e) {
-        ParseError.InvalidPattern => return null,
+        ParseError.InvalidPattern => {
+            if (diag) |d| d.* = parser.diag;
+            return null;
+        },
         else => |oom| return oom,
     };
     if (parser.pos != parser.src.len) return null; // trailing `)` etc.
@@ -626,20 +1267,6 @@ fn upperCp(c: u21) u21 {
 fn cpEq(a: u21, b: u21, fold: bool) bool {
     if (a == b) return true;
     return fold and foldCp(a) == foldCp(b);
-}
-
-/// Class membership honoring case-insensitivity. Membership is tested against
-/// the input codepoint and, under `fold`, its case variants; negation applies
-/// once over that membership, so `[^a-z]` rejects `A` under IGNORE_CASE.
-fn matchClassFold(items: []const ClassItem, negated: bool, c: u21, fold: bool) bool {
-    var member = matchClass(items, false, c);
-    if (fold and !member) {
-        const lo = foldCp(c);
-        const up = upperCp(c);
-        if (lo != c and matchClass(items, false, lo)) member = true;
-        if (!member and up != c and matchClass(items, false, up)) member = true;
-    }
-    return member != negated;
 }
 
 fn isLineTerminator(c: u21) bool {
@@ -729,9 +1356,9 @@ const Matcher = struct {
                 if (!matchBuiltin(b, d.cp)) return null;
                 return k.run(self, at + d.len);
             },
-            .class => |cl| {
+            .set => |s| {
                 const d = self.decode(at) orelse return null;
-                if (!matchClassFold(cl.items, cl.negated, d.cp, self.flags.case_insensitive)) return null;
+                if (!matchSet(s, d.cp, self.flags.case_insensitive)) return null;
                 return k.run(self, at + d.len);
             },
             .anchor_start => {
@@ -1046,6 +1673,21 @@ fn preprocessPattern(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+/// `PatternSyntaxException.getMessage()`: the description, `near index N`,
+/// the pattern, and a caret under index N when it falls inside the pattern.
+fn patternSyntaxMessage(allocator: std.mem.Allocator, desc: []const u8, index: usize, pattern: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "{s} near index {d}\n{s}", .{ desc, index, pattern });
+    const len = std.unicode.utf8CountCodepoints(pattern) catch pattern.len;
+    if (index < len) {
+        try out.append(allocator, '\n');
+        try out.appendNTimes(allocator, ' ', index);
+        try out.append(allocator, '^');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn compileRegex(allocator: std.mem.Allocator, pattern: []const u8) !EvalResult {
     return compileRegexFlags(allocator, pattern, .{});
 }
@@ -1053,9 +1695,14 @@ fn compileRegex(allocator: std.mem.Allocator, pattern: []const u8) !EvalResult {
 fn compileRegexFlags(allocator: std.mem.Allocator, pattern: []const u8, flags: Flags) !EvalResult {
     const prepared = try preprocessPattern(allocator, pattern);
     defer allocator.free(prepared);
-    const prog = (try compileProgram(allocator, prepared)) orelse {
-        const msg = try std.fmt.allocPrint(allocator, "invalid regex: {s}", .{pattern});
-        const ex = try makeException(allocator, "kotlin.text.PatternSyntaxException", msg);
+    var diag: Diag = .{};
+    defer if (diag.desc) |d| allocator.free(d);
+    const prog = (try compileProgramDiag(allocator, prepared, &diag)) orelse {
+        const msg = if (diag.desc) |desc|
+            try patternSyntaxMessage(allocator, desc, diag.index, pattern)
+        else
+            try std.fmt.allocPrint(allocator, "invalid regex: {s}", .{pattern});
+        const ex = try makeException(allocator, "klio.util.regex.PatternSyntaxException", msg);
         return .{ .err = .{ .Thrown = ex } };
     };
     prog.flags = flags;
@@ -2383,4 +3030,168 @@ test "MULTILINE anchors match at line boundaries" {
     const eol = try compileForTestFlags(a, "b$", .{ .multiline = true });
     const ecaps = (try runMatch(a, eol, "ab\ncb", 0)).?;
     try testing.expectEqual(@as(?usize, 1), ecaps[0].start);
+}
+
+/// Whether `pattern` matches the whole of `input`, for the `\p` tests.
+fn fullMatch(a: std.mem.Allocator, pattern: []const u8, input: []const u8, flags: Flags) !bool {
+    const prog = try compileForTestFlags(a, pattern, flags);
+    return (try runMatchFull(a, prog, input)) != null;
+}
+
+/// The JVM description and index a pattern fails with.
+fn diagFor(a: std.mem.Allocator, pattern: []const u8) !Diag {
+    const prepared = try preprocessPattern(a, pattern);
+    var diag: Diag = .{};
+    try testing.expect((try compileProgramDiag(a, prepared, &diag)) == null);
+    return diag;
+}
+
+test "\\p POSIX classes are ASCII, and find ktor's regex route group names" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(try fullMatch(a, "\\p{Alpha}\\p{Alnum}*", "number1", .{}));
+    try testing.expect(!try fullMatch(a, "\\p{Alpha}", "é", .{}));
+    try testing.expect(try fullMatch(a, "\\p{Lower}\\p{Upper}\\p{Digit}\\p{XDigit}", "aZ7f", .{}));
+    try testing.expect(try fullMatch(a, "\\p{Punct}\\p{Graph}\\p{Print}\\p{Blank}\\p{Space}\\p{Cntrl}\\p{ASCII}", "!~ \t\n\x01\x7f", .{}));
+    try testing.expect(!try fullMatch(a, "\\p{Punct}", "a", .{}));
+    // Under IGNORE_CASE, Lower and Upper are both letter classes.
+    try testing.expect(try fullMatch(a, "\\p{Lower}", "A", .{ .case_insensitive = true }));
+    // The group-name finder ktor's PathSegmentRegexRouteSelector uses.
+    const finder = try compileForTest(a, "(^|[^\\\\])\\(\\?<(\\p{Alpha}\\p{Alnum}*)>(.*?[^\\\\])?\\)");
+    const caps = (try runMatch(a, finder, "/(?<number>\\d+)", 0)).?;
+    try testing.expectEqualStrings("number", "/(?<number>\\d+)"[caps[2].start.?..caps[2].end.?]);
+}
+
+test "\\p general categories: letters, their one-letter and Is and gc= forms, and complements" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(try fullMatch(a, "\\p{L}+", "héllo", .{}));
+    try testing.expect(try fullMatch(a, "\\pL\\pN", "ж٣", .{}));
+    try testing.expect(try fullMatch(a, "\\p{Lu}\\p{Ll}", "Éa", .{}));
+    try testing.expect(try fullMatch(a, "\\p{IsLu}", "Ω", .{}));
+    try testing.expect(try fullMatch(a, "\\p{gc=Nd}\\p{general_category=Sc}", "7€", .{}));
+    try testing.expect(try fullMatch(a, "\\PL\\P{Lu}", "1a", .{}));
+    try testing.expect(!try fullMatch(a, "\\PL", "a", .{}));
+    try testing.expect(try fullMatch(a, "\\p{Zs}\\p{Pd}\\p{Sm}\\p{Cc}", "\u{3000}-+\x07", .{}));
+    try testing.expect(try fullMatch(a, "\\p{LC}\\p{LD}\\p{L1}\\p{all}", "aZÿ\u{10FFFF}", .{}));
+    // A lone Lu widens to every cased letter under IGNORE_CASE.
+    try testing.expect(!try fullMatch(a, "\\p{Lu}", "a", .{}));
+    try testing.expect(try fullMatch(a, "\\p{Lu}", "a", .{ .case_insensitive = true }));
+}
+
+test "\\p scripts by name, Is prefix, sc= and ISO 15924 alias" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(try fullMatch(a, "\\p{IsGreek}+", "αβγ", .{}));
+    try testing.expect(!try fullMatch(a, "\\p{IsGreek}", "a", .{}));
+    try testing.expect(try fullMatch(a, "\\p{sc=Latin}\\p{script=cyrillic}\\p{IsLatn}", "aжz", .{}));
+    try testing.expect(try fullMatch(a, "\\p{IsHan}", "字", .{}));
+}
+
+test "\\p blocks by In prefix and blk=, with spaced, joined and constant names" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(try fullMatch(a, "\\p{InGreek}\\p{InBasicLatin}", "αa", .{}));
+    try testing.expect(try fullMatch(a, "\\p{blk=Greek and Coptic}\\p{block=GREEK}\\p{InGreekandCoptic}", "ωΩϢ", .{}));
+    try testing.expect(!try fullMatch(a, "\\p{InBasicLatin}", "é", .{}));
+    try testing.expect(try fullMatch(a, "\\p{InLatin-1 Supplement}", "é", .{}));
+}
+
+test "\\p java classes follow java.lang.Character" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(try fullMatch(a, "\\p{javaLowerCase}\\p{javaUpperCase}\\p{javaDigit}", "ªÉ٣", .{}));
+    try testing.expect(try fullMatch(a, "\\p{javaWhitespace}\\p{javaSpaceChar}", "\x1f\u{00A0}", .{}));
+    try testing.expect(!try fullMatch(a, "\\p{javaWhitespace}", "\u{00A0}", .{}));
+    try testing.expect(try fullMatch(a, "\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}\\p{javaMirrored}\\p{javaISOControl}", "$1(\u{0085}", .{}));
+    try testing.expect(try fullMatch(a, "\\p{javaLetterOrDigit}\\p{javaDefined}\\p{javaIdentifierIgnorable}", "x \u{0000}", .{}));
+}
+
+test "\\p Unicode binary properties and the Unicode POSIX forms after Is" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Is + a POSIX name is the Unicode property, not the ASCII class.
+    try testing.expect(try fullMatch(a, "\\p{IsAlpha}\\p{IsAlphabetic}\\p{IsLetter}", "éΩж", .{}));
+    try testing.expect(try fullMatch(a, "\\p{IsWhite_Space}\\p{IsWhiteSpace}\\p{IsPunctuation}", "\u{2028}\u{0085}¿", .{}));
+    try testing.expect(try fullMatch(a, "\\p{IsHex_Digit}\\p{IsIdeographic}\\p{IsJoin_Control}\\p{IsEmoji}", "Ｆ字\u{200D}😀", .{}));
+    try testing.expect(try fullMatch(a, "\\p{IsUppercase}\\p{IsTitlecase}\\p{IsNoncharacter_Code_Point}\\p{IsAssigned}", "Aǅ\u{FFFF}a", .{}));
+    try testing.expect(!try fullMatch(a, "\\p{IsAssigned}", "\u{0378}", .{}));
+    try testing.expect(try fullMatch(a, "\\p{IsWord}\\p{IsAlnum}\\p{IsDigit}\\p{IsBlank}\\p{IsGraph}\\p{IsPrint}\\p{IsControl}", "_٣٣\t!é\x00", .{}));
+}
+
+test "classes: properties inside brackets, nesting, intersection and whole-class negation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(try fullMatch(a, "[\\p{L}\\d_]+", "héllo_42", .{}));
+    try testing.expect(!try fullMatch(a, "[^\\p{L}]", "é", .{}));
+    try testing.expect(try fullMatch(a, "[\\P{L}]", "5", .{}));
+    try testing.expect(try fullMatch(a, "[a-z&&[^aeiou]]+", "xyz", .{}));
+    try testing.expect(!try fullMatch(a, "[a-z&&[^aeiou]]", "e", .{}));
+    try testing.expect(try fullMatch(a, "[\\p{L}&&[^\\p{Lu}]]", "é", .{}));
+    try testing.expect(!try fullMatch(a, "[\\p{L}&&[^\\p{Lu}]]", "É", .{}));
+    try testing.expect(try fullMatch(a, "[ab&&bc]", "b", .{}));
+    try testing.expect(!try fullMatch(a, "[ab&&bc]", "a", .{}));
+    try testing.expect(try fullMatch(a, "[a[bc]]{3}", "abc", .{}));
+    try testing.expect(!try fullMatch(a, "[^a[bc]]", "c", .{}));
+    try testing.expect(try fullMatch(a, "[]a]+", "]a", .{}));
+    try testing.expect(try fullMatch(a, "[a-]+", "a-", .{}));
+    try testing.expect(try fullMatch(a, "[a&b]+", "a&b", .{}));
+    // A range folds case under IGNORE_CASE; negation applies after.
+    try testing.expect(try fullMatch(a, "[a-c]", "B", .{ .case_insensitive = true }));
+    try testing.expect(!try fullMatch(a, "[^a-c]", "B", .{ .case_insensitive = true }));
+}
+
+test "unknown or malformed properties fail with the JVM's descriptions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d = try diagFor(a, "\\p{Foo}");
+    try testing.expectEqualStrings("Unknown character property name {Foo}", d.desc.?);
+    try testing.expectEqual(@as(usize, 6), d.index);
+    d = try diagFor(a, "a\\pQ");
+    try testing.expectEqualStrings("Unknown character property name {Q}", d.desc.?);
+    try testing.expectEqual(@as(usize, 3), d.index);
+    d = try diagFor(a, "\\p{sc=Klingon}");
+    try testing.expectEqualStrings("Unknown Unicode property {name=<sc>, value=<Klingon>}", d.desc.?);
+    d = try diagFor(a, "\\p{InNowhere}");
+    try testing.expectEqualStrings("Unknown character property name {InNowhere}", d.desc.?);
+    d = try diagFor(a, "\\p{lu}");
+    try testing.expectEqualStrings("Unknown character property name {lu}", d.desc.?);
+    d = try diagFor(a, "\\p{}");
+    try testing.expectEqualStrings("Empty character family", d.desc.?);
+    d = try diagFor(a, "\\p{L");
+    try testing.expectEqualStrings("Unclosed character family", d.desc.?);
+    d = try diagFor(a, "[a-z");
+    try testing.expectEqualStrings("Unclosed character class", d.desc.?);
+    d = try diagFor(a, "[z-a]");
+    try testing.expectEqualStrings("Illegal character range", d.desc.?);
+    try testing.expectEqual(@as(usize, 3), d.index);
+    const msg = try patternSyntaxMessage(a, "Unknown character property name {Foo}", 6, "\\p{Foo}");
+    try testing.expectEqualStrings("Unknown character property name {Foo} near index 6\n\\p{Foo}\n      ^", msg);
+}
+
+test "the property tables cover every code point in order" {
+    try testing.expectEqual(@as(u32, 0), uni.category_starts[0]);
+    try testing.expectEqual(@as(u32, 0), uni.script_starts[0]);
+    try testing.expectEqual(@as(u32, 0), uni.block_starts[0]);
+    for (uni.category_starts[1..], uni.category_starts[0 .. uni.category_starts.len - 1]) |next, prev| try testing.expect(next > prev);
+    for ([_][]const u32{ &uni.alphabetic, &uni.lowercase, &uni.emoji, &uni.java_identifier_part }) |s| {
+        try testing.expect(s.len % 2 == 0);
+        var i: usize = 0;
+        while (i < s.len) : (i += 2) {
+            try testing.expect(s[i] <= s[i + 1]);
+            if (i > 0) try testing.expect(s[i] > s[i - 1] + 1);
+        }
+    }
+    try testing.expectEqual(@as(u5, Cat.upper), category('A'));
+    try testing.expectEqual(@as(u5, Cat.unassigned), category(0x10FFFF));
+    try testing.expect(inSet(&uni.alphabetic, 'z'));
+    try testing.expect(!inSet(&uni.alphabetic, '1'));
 }

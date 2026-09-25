@@ -48,6 +48,10 @@ const Info = struct {
     /// Suffix of the generated top-level artifact; a
     /// `@KeepGeneratedSerializer` twin uses `$generatedSerializer`.
     gen_suffix: []const u8 = "$serializer",
+    /// A local class's descriptor annotations. The index holds only the
+    /// file's top-level and nested classes, so a local class's own come
+    /// from its declaration.
+    local_annotations: ?[]const []const u8 = null,
 };
 
 const SealedSub = struct { path: []const u8 };
@@ -1234,7 +1238,8 @@ fn writeDescriptor(b: *const BodyGen, serial: []const u8) Allocator.Error!void {
         try wp(w, a, "        `$dd`.addElement(\"{s}\", {s})\n", .{ try kq(a, e.serial_name), if (elemOptional(e)) "true" else "false" });
         try writeElementAnnotations(b, e);
     }
-    for (try classAnnotationCalls(a, b.g.idx, b.info.path)) |call| {
+    const calls = b.info.local_annotations orelse try classAnnotationCalls(a, b.g.idx, b.info.path);
+    for (calls) |call| {
         try wp(w, a, "        `$dd`.pushClassAnnotation({s})\n", .{call});
     }
     try w.appendSlice(a, "    }\n");
@@ -1537,6 +1542,31 @@ fn classAnnotationCalls(a: Allocator, idx: *const Index, path: []const u8) Alloc
                 }
             }
             try queue.append(a, spath);
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// A local class's descriptor annotations: its own `@SerialInfo` ones, then
+/// the inheritable ones of its indexed supertypes.
+fn localClassAnnotationCalls(a: Allocator, idx: *const Index, c: *const ast.Class) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (c.annotations) |*an| {
+        if (isFrameworkAnnotation(annotationSimpleName(an))) continue;
+        if (!isSerialInfoAnnotation(idx, annotationSimpleName(an))) continue;
+        if (annotationCallText(a, an)) |t| try out.append(a, t);
+    }
+    for (c.supertypes) |*st| {
+        const sup = st.x().qualified_path orelse st.name.name;
+        if (!idx.supers.contains(sup)) continue;
+        for (try classAnnotationCalls(a, idx, sup)) |call| {
+            const head = if (std.mem.findScalar(u8, call, '(')) |lp| call[0..lp] else call;
+            if (!idx.inheritable.contains(simpleHead(head))) continue;
+            var dup = false;
+            for (out.items) |x| {
+                if (std.mem.eql(u8, x, call)) dup = true;
+            }
+            if (!dup) try out.append(a, call);
         }
     }
     return out.toOwnedSlice(a);
@@ -2208,7 +2238,8 @@ fn processLocalStmts(ctx: *Ctx, f: *ast.Function, stmts: []ast.Stmt, outer: []co
                 if (dbg) std.debug.print("[serial-pass] local class {s} serializable={}\n", .{ c.name.name, isSerializableIn(ctx.idx, c.annotations) });
                 if (!isSerializableIn(ctx.idx, c.annotations)) continue;
                 if (companionIsSerializer(c.members)) continue;
-                const info = classInfo(ctx.idx, c, c.name.name, ctx.pkg);
+                var info = classInfo(ctx.idx, c, c.name.name, ctx.pkg);
+                info.local_annotations = try localClassAnnotationCalls(ctx.a, ctx.idx, c);
                 var tps: std.ArrayList([]const u8) = .empty;
                 for (c.type_params) |*tp| try tps.append(ctx.a, tp.name.name);
                 const g = Gen{ .a = ctx.a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = tps.items, .scope_path = try localScopePath(ctx.a, outer, c.name.name), .file = &ctx.settings };
@@ -2615,26 +2646,10 @@ const gen_imports = [_][]const []const u8{
     &.{ "kotlin", "time" },
 };
 
-/// Returns the originals followed by one generated sibling file per original
-/// that declared serializable classes. Copies are shallow: decl arrays are
-/// replaced, never mutated, so the caller's originals stay valid. Spliced
-/// nodes take ids after the file's own.
-pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.Error![]ast.KotlinFile {
-    var any = false;
-    for (files_in) |*f| {
-        if (fileMentionsSerializable(f)) {
-            any = true;
-            break;
-        }
-    }
-    if (!any) {
-        const out = try a.alloc(ast.KotlinFile, files_in.len);
-        @memcpy(out, files_in);
-        return out;
-    }
-    var idx = Index.init(a);
-    active_index = &idx;
-    defer active_index = null;
+/// The index over every input file: annotation classes, classifier paths,
+/// class annotations qualified in their declaring scope, and each sealed
+/// parent's subclasses.
+fn buildIndex(idx: *Index, a: Allocator, files_in: []const ast.KotlinFile) Allocator.Error!void {
     // Top-level string constants first: an annotation argument in one file may
     // reference a `const val` declared in another.
     for (files_in) |*f| {
@@ -2646,9 +2661,9 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
             if (exprStringLiteral(ini)) |txt| try idx.const_strings.put(p.name.name, txt);
         }
     }
-    for (files_in) |*f| try indexAnnotationClasses(&idx, f.decls);
+    for (files_in) |*f| try indexAnnotationClasses(idx, f.decls);
     for (files_in) |*f| {
-        try indexDecls(&idx, f.decls, "", packageText(a, f));
+        try indexDecls(idx, f.decls, "", packageText(a, f));
     }
     // A class's annotations are spelled in the scope around it; qualify them
     // there once every path is known, so a subclass that inherits one keeps
@@ -2657,7 +2672,7 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
         var it = idx.class_annotations.iterator();
         while (it.next()) |entry| {
             const calls = try a.dupe([]const u8, entry.value_ptr.*);
-            for (calls) |*call| call.* = try qualifySourceText(a, &idx, call.*, parentPath(entry.key_ptr.*));
+            for (calls) |*call| call.* = try qualifySourceText(a, idx, call.*, parentPath(entry.key_ptr.*));
             entry.value_ptr.* = calls;
         }
     }
@@ -2680,12 +2695,38 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(a, .{ .path = rec.sub_path });
     }
+}
+
+/// Returns the originals followed by one generated sibling file per original
+/// that declared serializable classes. Copies are shallow: decl arrays are
+/// replaced, never mutated, so the caller's originals stay valid. Spliced
+/// nodes take ids after the file's own.
+pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.Error![]ast.KotlinFile {
+    var any = false;
+    for (files_in) |*f| {
+        if (fileMentionsSerializable(f)) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        const out = try a.alloc(ast.KotlinFile, files_in.len);
+        @memcpy(out, files_in);
+        return out;
+    }
+    var idx = Index.init(a);
+    // Set before indexing: an annotation's string template may name a
+    // `const val` indexed first.
+    active_index = &idx;
+    defer active_index = null;
+    try buildIndex(&idx, a, files_in);
     var out: std.ArrayList(ast.KotlinFile) = .empty;
     try out.appendSlice(a, files_in);
     const dump = std.c.getenv("KLIO_SERIAL_DUMP") != null;
     for (out.items[0..files_in.len]) |*f| {
-        if (dump) std.debug.print("[serial-pass] file {} mentions={}\n", .{ f.span.file, fileMentionsSerializable(f) });
-        if (!fileMentionsSerializable(f)) continue;
+        const needs_pass = fileMentionsSerializable(f) or fileUsesMetaSerializable(f, &idx.meta_serializable);
+        if (dump) std.debug.print("[serial-pass] file {} mentions={}\n", .{ f.span.file, needs_pass });
+        if (!needs_pass) continue;
         const decls_copy = try a.alloc(ast.Decl, f.decls.len);
         @memcpy(decls_copy, f.decls);
         f.decls = decls_copy;
@@ -2727,6 +2768,54 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
         }
     }
     return out.toOwnedSlice(a);
+}
+
+/// The annotation classes among `files` marked `@MetaSerializable`, by simple
+/// name. A class carrying one is serializable though its file never spells
+/// `@Serializable` (ktor's `@Resource`).
+pub fn metaSerializableNames(a: Allocator, files: []const ast.KotlinFile) Allocator.Error!std.StringHashMap(void) {
+    var out = std.StringHashMap(void).init(a);
+    for (files) |*f| try collectMetaSerializable(f.decls, &out);
+    return out;
+}
+
+fn collectMetaSerializable(decls: []const ast.Decl, out: *std.StringHashMap(void)) Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Class => |*c| {
+            if (c.is_annotation and hasAnnotation(c.annotations, "MetaSerializable")) try out.put(c.name.name, {});
+            try collectMetaSerializable(c.members, out);
+        },
+        .Object => |*o| try collectMetaSerializable(o.members, out),
+        else => {},
+    };
+}
+
+/// Whether a class or object in `f` carries one of the `meta` annotations.
+pub fn fileUsesMetaSerializable(f: *const ast.KotlinFile, meta: *const std.StringHashMap(void)) bool {
+    return meta.count() != 0 and declsUseMeta(f.decls, meta);
+}
+
+fn declsUseMeta(decls: []const ast.Decl, meta: *const std.StringHashMap(void)) bool {
+    for (decls) |*d| switch (d.*) {
+        .Class => |*c| {
+            for (c.annotations) |*an| if (meta.contains(annotationSimpleName(an))) return true;
+            if (declsUseMeta(c.members, meta)) return true;
+        },
+        .Object => |*o| {
+            for (o.annotations) |*an| if (meta.contains(annotationSimpleName(an))) return true;
+            if (declsUseMeta(o.members, meta)) return true;
+        },
+        .Function => |*fun| {
+            const body = fun.body orelse continue;
+            if (body != .Block) continue;
+            for (body.Block.stmts) |*st| {
+                if (st.* != .Decl) continue;
+                if (declsUseMeta(@as([*]const ast.Decl, @ptrCast(st.Decl))[0..1], meta)) return true;
+            }
+        },
+        else => {},
+    };
+    return false;
 }
 
 pub fn fileMentionsSerializable(f: *const ast.KotlinFile) bool {
@@ -3111,4 +3200,90 @@ test "an annotation nested in an enclosing class is spelled by its path in the g
     try std.testing.expect(std.mem.indexOf(u8, gen, "pushAnnotation(Outer.Order(Outer.Kind.B))") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "pushAnnotation(Outer.Tag(\"s \\\"Kind\\\"\"))") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "pushClassAnnotation(Outer.Tag(\"data\"))") != null);
+}
+
+test "a class carrying another file's meta-serializable annotation gets a serializer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lib =
+        \\package lib
+        \\import kotlinx.serialization.*
+        \\
+        \\@MetaSerializable
+        \\@Target(AnnotationTarget.CLASS)
+        \\annotation class Route(val path: String)
+    ;
+    const program =
+        \\package app
+        \\import lib.*
+        \\
+        \\@Route("/users/{id}")
+        \\data class User(val id: Int)
+    ;
+    var map = span_mod.SourceMap.init(a);
+    const lib_id = try map.add("lib.kt", lib);
+    const program_id = try map.add("app.kt", program);
+    const prev_map = span_mod.active_map;
+    span_mod.active_map = &map;
+    defer span_mod.active_map = prev_map;
+    const originals = [_]ast.KotlinFile{
+        parseSnippetFrom(a, lib_id, lib, 1).?,
+        parseSnippetFrom(a, program_id, program, 1).?,
+    };
+    // The program never spells `@Serializable`; the library's annotation is
+    // what marks its class.
+    try std.testing.expect(!fileMentionsSerializable(&originals[1]));
+    const meta = try metaSerializableNames(a, originals[0..1]);
+    try std.testing.expect(meta.contains("Route"));
+    try std.testing.expect(fileUsesMetaSerializable(&originals[1], &meta));
+    const out = try transformFiles(a, &originals);
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    var serializers: usize = 0;
+    for (out[2].decls) |*d| switch (d.*) {
+        .Object => |*o| {
+            if (std.mem.eql(u8, o.name.name, "User$serializer")) serializers += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), serializers);
+}
+
+test "a local class's descriptor carries its own serial-info annotations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\import kotlinx.serialization.*
+        \\
+        \\@MetaSerializable
+        \\annotation class Route(val path: String)
+        \\@SerialInfo
+        \\annotation class Tag(val text: String)
+        \\@Route("/top")
+        \\class Local(val id: Int)
+        \\
+        \\fun handler() {
+        \\    @Route("/local")
+        \\    @Tag("t")
+        \\    class Local(val id: Int)
+        \\}
+    ;
+    var map = span_mod.SourceMap.init(a);
+    const id = try map.add("test.kt", src);
+    const prev_map = span_mod.active_map;
+    span_mod.active_map = &map;
+    defer span_mod.active_map = prev_map;
+    const file = parseSnippetFrom(a, id, src, 1).?;
+    var idx = Index.init(a);
+    try buildIndex(&idx, a, &.{file});
+    const local = for (file.decls) |*d| {
+        if (d.* == .Function) break &d.Function.body.?.Block.stmts[0].Decl.Class;
+    } else return error.TestUnexpectedResult;
+    const calls = try localClassAnnotationCalls(a, &idx, local);
+    // The local class's own annotations, not those of the top-level class
+    // that shares its name.
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+    try std.testing.expectEqualStrings("Route(\"/local\")", calls[0]);
+    try std.testing.expectEqualStrings("Tag(\"t\")", calls[1]);
 }
