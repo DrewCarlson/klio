@@ -40,6 +40,12 @@ sparse=(
   "compose/ui/ui-test/src/commonMain"
   "compose/ui/ui-test-junit4/src/commonMain"
   "compose/runtime/runtime-saveable/src/commonMain"
+  # The runtime's stability annotations and the retained-values store the
+  # ui owners expose, with retain's suite.
+  "compose/runtime/runtime-annotation/src/commonMain"
+  "compose/runtime/runtime-retain/src/commonMain"
+  "compose/runtime/runtime-retain/src/nonJvmMain"
+  "compose/runtime/runtime-retain/src/commonTest"
   "compose/ui/ui/src/commonMain"
   "compose/ui/ui/src/skikoMain"
   "compose/ui/ui/src/desktopMain"
@@ -121,6 +127,37 @@ sparse=(
   "compose/material3/material3/src/skikoTest"
   "compose/material3/material3/src/desktopTest"
   "graphics/graphics-shapes/src/commonTest"
+  # Kruth, the assertion library those suites are written against.
+  "kruth/kruth/src/commonMain"
+  "kruth/kruth/src/nonJvmMain"
+  "kruth/kruth/src/nativeMain"
+  # The lifecycle and savedstate libraries the ui's skiko platform owners
+  # (lifecycle, view model store, saved state registry) are built on, with
+  # their suites.
+  "lifecycle/lifecycle-common/src/commonMain"
+  "lifecycle/lifecycle-common/src/nonJvmMain"
+  "lifecycle/lifecycle-runtime/src/commonMain"
+  "lifecycle/lifecycle-runtime/src/nativeMain"
+  "lifecycle/lifecycle-runtime/src/desktopMain"
+  "lifecycle/lifecycle-runtime/src/commonTest"
+  "lifecycle/lifecycle-viewmodel/src/commonMain"
+  "lifecycle/lifecycle-viewmodel/src/nonJvmMain"
+  "lifecycle/lifecycle-viewmodel/src/nativeMain"
+  "lifecycle/lifecycle-viewmodel/src/commonTest"
+  "lifecycle/lifecycle-viewmodel-savedstate/src/commonMain"
+  "lifecycle/lifecycle-viewmodel-savedstate/src/nonAndroidMain"
+  "lifecycle/lifecycle-viewmodel-savedstate/src/nativeMain"
+  "lifecycle/lifecycle-viewmodel-savedstate/src/commonTest"
+  "lifecycle/lifecycle-runtime-compose/src/commonMain"
+  "lifecycle/lifecycle-viewmodel-compose/src/commonMain"
+  "lifecycle/lifecycle-viewmodel-compose/src/nonJvmMain"
+  "savedstate/savedstate/src/commonMain"
+  "savedstate/savedstate/src/nonAndroidMain"
+  "savedstate/savedstate/src/nativeMain"
+  "savedstate/savedstate/src/commonTest"
+  "savedstate/savedstate/src/nonAndroidTest"
+  "savedstate/savedstate-compose/src/commonMain"
+  "savedstate/savedstate-compose/src/nonAndroidMain"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)
