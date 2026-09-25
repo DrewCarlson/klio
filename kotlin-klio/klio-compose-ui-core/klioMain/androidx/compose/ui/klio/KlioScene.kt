@@ -111,6 +111,7 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
 
     fun dispose() {
         for (layer in layers.toList()) layer.close()
+        main.dispose()
     }
 
     override fun createLayer(
@@ -277,7 +278,8 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
         focusable: Boolean,
         override var consumePointerInputOutside: Boolean,
     ) : ComposeSceneLayer {
-        val owner = KlioComposeOwner(density, layoutDirection, main.windowInfo).also { it.scene = this@KlioScene }
+        val owner = KlioComposeOwner(density, layoutDirection, main.windowInfo, main.coroutineContext)
+            .also { it.scene = this@KlioScene }
         val processor = PointerInputEventProcessor(owner.root)
         private var composition: Composition? = null
         private var closed = false
@@ -334,6 +336,7 @@ internal class KlioScene(val main: KlioComposeOwner, width: Int, height: Int) : 
             onOwnerRemoved(owner)
             composition?.dispose()
             composition = null
+            owner.dispose()
         }
 
         override fun setContent(parentCompositionContext: CompositionContext, content: @Composable () -> Unit) {

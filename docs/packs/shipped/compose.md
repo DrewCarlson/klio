@@ -21,12 +21,13 @@ each upstream module is its own pack.
 | `androidx.navigationevent`           | navigationevent/navigationevent | runtime, annotation, collection, coroutines, atomicfu   |
 | `androidx.navigationevent.compose`   | navigationevent/navigationevent-compose | runtime, navigationevent, coroutines            |
 | `androidx.compose.ui`                | ui/ui                          | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, ui.text, navigationevent, navigationevent.compose, coroutines |
+| `androidx.compose.ui.backhandler`    | ui/ui-backhandler              | runtime, ui.util, annotation, navigationevent, navigationevent.compose, coroutines |
 | `androidx.compose.animation.core`    | animation/animation-core       | runtime, ui, ui.unit, ui.util, ui.geometry, ui.graphics, collection, coroutines |
 | `androidx.compose.animation`         | animation/animation            | runtime, animation.core, ui, ui.*, foundation.layout, collection, coroutines |
 | `androidx.compose.foundation.layout` | foundation/foundation-layout   | runtime, ui, ui.unit, ui.geometry, ui.graphics, ui.util  |
 | `androidx.compose.foundation`        | foundation/foundation          | runtime, runtime.saveable, ui, ui.*, foundation.layout, animation.core, animation, coroutines |
 | `androidx.compose.material.ripple`   | material/material-ripple       | runtime, animation.core, foundation, ui, ui.*, coroutines |
-| `androidx.compose.material3`         | material3/material3            | runtime, runtime.saveable, ui, ui.*, foundation, foundation.layout, animation.core, animation, material.ripple, shapes, coroutines |
+| `androidx.compose.material3`         | material3/material3            | runtime, runtime.saveable, ui, ui.*, ui.backhandler, foundation, foundation.layout, animation.core, animation, material.ripple, shapes, coroutines, datetime, atomicfu |
 
 Two libraries from the same checkout ship beside them: `androidx.collection`
 (`kotlin-klio/klio-androidx-collection`, the collections the runtime is built
@@ -61,10 +62,26 @@ signature:
 - platform code: a `GraphicsLayer` that records into a Skia picture through
   klio's shim and replays it under its transform, clip and offscreen layer
   (skiko's does the same through a skiko RenderNode), a Kotlin `PathMeasure`, code-point stand-ins
-  for the two skia ICU calls foundation's text helpers make, and adapted
-  copies of the desktop files that are java-free once their AWT and skiko
-  calls are replaced. A body klio cannot serve throws
-  `UnsupportedOperationException` naming what is missing.
+  for the two skia ICU calls foundation's text helpers make, adapted copies
+  of the foundation desktop files that are java-free once their AWT calls
+  are replaced (the scroll configuration answers the per-OS defaults, the
+  text field selection reads klio's clipboard entry; typed-key detection
+  and the character palette throw until the scene delivers native key
+  events), and the
+  runtime's thread ids, identity hash, locks and frame clock. A body klio cannot serve throws `UnsupportedOperationException`
+  naming what is missing.
+- everything else a skiko desktop target compiles comes from upstream: each
+  module's nonJvmMain and nonAndroidMain sets, foundation's java-free
+  desktopMain files, and the runtime's jvmAndAndroidMain actuals that are
+  plain Kotlin over kotlinx.coroutines (the tracing context and snapshot
+  context element are `ThreadContextElement`s, as on the desktop).
+- material3's platform half is upstream's skikoMain and nonJvmMain (dialogs,
+  menus, the bottom sheet, tooltips, strings with their translations, the
+  kotlinx-datetime calendar model). Its `CalendarLocale` is the ui text
+  `Locale`, and its `PlatformDateFormat` asks the ICU the Skia shim bundles
+  (with its CLDR data compiled in) for skeleton patterns, weekday names, the
+  first day of the week and the hour cycle, as the darwin actual asks
+  `NSDateFormatter`.
 
 ## Install
 

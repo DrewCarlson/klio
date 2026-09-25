@@ -158,14 +158,14 @@ fn currentThreadId(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@bitCast(@as(u64, std.Thread.getCurrentId()))));
 }
 
-/// Compose's internal error sink, writing to stderr so it never pollutes program
-/// stdout.
+/// The runtime's error logger's message line on stderr, as the desktop's
+/// `System.err.println(message)`; the caller prints the stack trace after it.
 fn logError(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len >= 1) {
         if (ctx.args[0] == .String) {
             const g = ctx.args[0].String.borrow();
             defer g.deinit();
-            std.debug.print("compose: {s}\n", .{g.get().bytes});
+            std.debug.print("{s}\n", .{g.get().bytes});
         }
     }
     return ok(unit);

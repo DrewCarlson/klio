@@ -1,11 +1,7 @@
-# androidx.compose.ui:ui-graphics — the compose UI graphics module, vendored
-# verbatim. One klio pack per upstream Gradle module: the
-# `androidx.compose.ui.graphics` package. This first cut is the pure,
-# non-Skia surface — the Color inline value class, the color-science colorspace
-# package (Rgb / ColorSpaces / the XYZ transforms), and the drawing-parameter
-# value classes (BlendMode / StrokeCap / PathFillType / …). The Skia-backed
-# Canvas / Paint / Path / DrawScope layer is vendored on top of the native shim
-# separately.
+# androidx.compose.ui:ui-graphics — the compose UI graphics module: its whole
+# commonMain vendored verbatim (colors and color spaces, Path with its
+# iterator, geometry, hit tester and SVG conversion, brushes, the drawing
+# scope, GraphicsLayer's surface), over klioMain's platform actuals.
 [library]
 id = "androidx.compose.ui.graphics"
 version = "1.12.0"
@@ -15,100 +11,10 @@ auto_bindings = true
 
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui-graphics/src/commonMain/kotlin"
-include = [
-    "androidx/compose/ui/graphics/Color.kt",
-    "androidx/compose/ui/graphics/LayerOutsets.kt",
-    "androidx/compose/ui/graphics/Float16.kt",
-    "androidx/compose/ui/graphics/InlineClassHelper.kt",
-    # The pure-Kotlin Path surface (klioMain supplies the actual command buffer).
-    "androidx/compose/ui/graphics/internal/JvmDefaultWithCompatibility.kt",
-    "androidx/compose/ui/graphics/Path.kt",
-    "androidx/compose/ui/graphics/PathIterator.kt",
-    "androidx/compose/ui/graphics/Bezier.kt",
-    "androidx/compose/ui/graphics/PathSegment.kt",
-    "androidx/compose/ui/graphics/Matrix.kt",
-    # The Paint surface (klioMain supplies the actual value object) + the value
-    # types its properties reference (Shader / ColorFilter / PathEffect / etc.).
-    "androidx/compose/ui/graphics/Paint.kt",
-    "androidx/compose/ui/graphics/Shader.kt",
-    "androidx/compose/ui/graphics/ColorFilter.kt",
-    "androidx/compose/ui/graphics/ColorMatrix.kt",
-    "androidx/compose/ui/graphics/PathEffect.kt",
-    "androidx/compose/ui/graphics/ImageBitmap.kt",
-    "androidx/compose/ui/graphics/PixelMap.kt",
-    # Painter abstraction + the concrete painters foundation's Image uses.
-    "androidx/compose/ui/graphics/painter/Painter.kt",
-    "androidx/compose/ui/graphics/painter/BitmapPainter.kt",
-    "androidx/compose/ui/graphics/painter/BrushPainter.kt",
-    "androidx/compose/ui/graphics/painter/ColorPainter.kt",
-    # The Canvas surface (klioMain supplies the actual over the Skia shim).
-    "androidx/compose/ui/graphics/Canvas.kt",
-    "androidx/compose/ui/graphics/Vertices.kt",
-    # The DrawScope layer — pure Kotlin over Canvas.
-    "androidx/compose/ui/graphics/drawscope/DrawScopeMarker.kt",
-    "androidx/compose/ui/graphics/drawscope/DrawTransform.kt",
-    "androidx/compose/ui/graphics/drawscope/DrawContext.kt",
-    "androidx/compose/ui/graphics/drawscope/DrawScope.kt",
-    "androidx/compose/ui/graphics/drawscope/CanvasDrawScope.kt",
-    "androidx/compose/ui/graphics/drawscope/ContentDrawScope.kt",
-    "androidx/compose/ui/graphics/drawscope/EmptyCanvas.kt",
-    # Shape + Outline — pure Kotlin over Path / geometry.
-    "androidx/compose/ui/graphics/Shape.kt",
-    "androidx/compose/ui/graphics/Outline.kt",
-    "androidx/compose/ui/graphics/RectangleShape.kt",
-    # Brush — SolidColor is a plain Paint colour; gradient brushes build but need
-    # the (deferred) shader actuals to paint.
-    "androidx/compose/ui/graphics/Brush.kt",
-    # Shadow — a plain data holder (color/offset/blur) TextStyle references.
-    "androidx/compose/ui/graphics/Shadow.kt",
-    "androidx/compose/ui/graphics/Interpolatable.kt",
-    "androidx/compose/ui/graphics/RenderEffect.kt",
-    "androidx/compose/ui/graphics/PathMeasure.kt",
-    "androidx/compose/ui/graphics/Degrees.kt",
-    "androidx/compose/ui/graphics/IntervalTree.kt",
-    # The layer surface the ui engine and animation reference: klioMain's
-    # GraphicsLayer actual records into a Skia picture and replays it, and
-    # its KlioGraphicsContext is the one the ui host creates layers with.
-    "androidx/compose/ui/graphics/GraphicsContext.kt",
-    "androidx/compose/ui/graphics/layer/GraphicsLayer.kt",
-    "androidx/compose/ui/graphics/layer/CompositingStrategy.kt",
-    "androidx/compose/ui/graphics/vector/PathNode.kt",
-    "androidx/compose/ui/graphics/vector/PathBuilder.kt",
-    "androidx/compose/ui/graphics/vector/FastFloatParser.kt",
-    "androidx/compose/ui/graphics/vector/PathParser.kt",
-    "androidx/compose/ui/graphics/shadow/Blur.kt",
-    "androidx/compose/ui/graphics/shadow/Shadow.kt",
-    "androidx/compose/ui/graphics/shadow/ShadowContext.kt",
-    "androidx/compose/ui/graphics/shadow/ShadowRenderer.kt",
-    "androidx/compose/ui/graphics/shadow/DropShadowPainter.kt",
-    "androidx/compose/ui/graphics/shadow/InnerShadowPainter.kt",
-    # Pure drawing-parameter value classes (inline over Int; Immutable only).
-    "androidx/compose/ui/graphics/BlendMode.kt",
-    "androidx/compose/ui/graphics/ClipOp.kt",
-    "androidx/compose/ui/graphics/FilterQuality.kt",
-    "androidx/compose/ui/graphics/PaintingStyle.kt",
-    "androidx/compose/ui/graphics/PathFillType.kt",
-    "androidx/compose/ui/graphics/PathOperation.kt",
-    "androidx/compose/ui/graphics/PointMode.kt",
-    "androidx/compose/ui/graphics/StrokeCap.kt",
-    "androidx/compose/ui/graphics/StrokeJoin.kt",
-    "androidx/compose/ui/graphics/TileMode.kt",
-    "androidx/compose/ui/graphics/VertexMode.kt",
-    # colorspace: the Color inline value class's color-science backing.
-    "androidx/compose/ui/graphics/colorspace/Adaptation.kt",
-    "androidx/compose/ui/graphics/colorspace/ColorModel.kt",
-    "androidx/compose/ui/graphics/colorspace/ColorSpace.kt",
-    "androidx/compose/ui/graphics/colorspace/ColorSpaces.kt",
-    "androidx/compose/ui/graphics/colorspace/Connector.kt",
-    "androidx/compose/ui/graphics/colorspace/Illuminant.kt",
-    "androidx/compose/ui/graphics/colorspace/Lab.kt",
-    "androidx/compose/ui/graphics/colorspace/Oklab.kt",
-    "androidx/compose/ui/graphics/colorspace/RenderIntent.kt",
-    "androidx/compose/ui/graphics/colorspace/Rgb.kt",
-    "androidx/compose/ui/graphics/colorspace/TransferParameters.kt",
-    "androidx/compose/ui/graphics/colorspace/WhitePoint.kt",
-    "androidx/compose/ui/graphics/colorspace/Xyz.kt",
-]
+
+# nonJvmMain: the JVM-default marker.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-graphics/src/nonJvmMain/kotlin"
 
 # klioMain: the platform actuals (Path command buffer and measure, Paint, Canvas
 # over the Skia shim, ImageBitmap, RenderEffect, GraphicsLayer) and the

@@ -1,7 +1,7 @@
 # androidx.compose.animation.core — the pure-Kotlin animation engine (Easing,
 # AnimationSpec/VectorConverter, Animatable, TargetBasedAnimation, ArcSpline,
-# vector value types), vendored verbatim. klioMain supplies the platform-primitive
-# actuals (atomics, current-thread token, binary search, cancellation base).
+# vector value types), vendored verbatim with the non-JVM actuals. klioMain
+# supplies the current-thread token.
 # The `animation` module above it (fling decay, Color animation) is its own
 # pack, klio-compose-animation. A dependency of compose.foundation.
 [library]
@@ -52,6 +52,11 @@ include = [
     "androidx/compose/animation/core/VectorizedMonoSplineKeyframesSpec.kt",
     "androidx/compose/animation/core/VisibilityThresholds.kt",
 ]
+
+# nonJvmMain: the atomic reference, the arc spline's binary search and the
+# cancellation exception every non-JVM target shares.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/animation/animation-core/src/nonJvmMain/kotlin"
 
 [[source]]
 root = "klioMain"

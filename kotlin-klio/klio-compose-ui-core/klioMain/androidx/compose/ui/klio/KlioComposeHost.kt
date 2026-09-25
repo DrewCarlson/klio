@@ -348,6 +348,11 @@ internal class KlioComposeOwner(
     layoutDirection: LayoutDirection,
     /** The window this owner is in; a scene's layers share their content's. */
     override val windowInfo: WindowInfoImpl = WindowInfoImpl(),
+    /**
+     * Where the nodes' coroutines run: the scene's effect context, whose frame
+     * clock their animations await.
+     */
+    override val coroutineContext: kotlin.coroutines.CoroutineContext = Dispatchers.Unconfined,
 ) : Owner {
 
     private val platformFocusOwner = object : PlatformFocusOwner {
@@ -440,11 +445,15 @@ internal class KlioComposeOwner(
     }
     override val dragAndDropManager: androidx.compose.ui.draganddrop.DragAndDropManager get() = dragAndDropManagerImpl
 
-    override val coroutineContext: kotlin.coroutines.CoroutineContext =
-        Dispatchers.Unconfined
-
     init {
+        // The state a layout or draw reads invalidates it once changed, as
+        // RootNodeOwner's observer does.
+        _snapshotObserver.startObserving()
         root.attach(this)
+    }
+
+    fun dispose() {
+        _snapshotObserver.stopObserving()
     }
 
     fun setRootConstraints(constraints: Constraints) {
@@ -596,6 +605,9 @@ internal class KlioRecomposerDriver {
     private val effectScope = CoroutineScope(frameClock + Dispatchers.Unconfined)
     val recomposer = Recomposer(effectScope.coroutineContext)
     private val runner = effectScope.launch { recomposer.runRecomposeAndApplyChanges() }
+
+    /** The context effects and the nodes' coroutines run in, with the frame clock. */
+    val effectContext: kotlin.coroutines.CoroutineContext get() = effectScope.coroutineContext
     private var frameNanos = 0L
 
     fun frame(): Boolean {
@@ -608,7 +620,7 @@ internal class KlioRecomposerDriver {
         // sendFrame only wakes the recomposer's coroutine to find no work — an
         // expensive resume/suspend under the interpreter for zero benefit. Skip it
         // so a static scene between changes costs nothing.
-        if (!recomposer.hasPendingWork) return false
+        if (!recomposer.hasPendingWork && !frameClock.hasAwaiters) return false
         val before = recomposer.changeCount
         frameClock.sendFrame(frameNanos)
         frameNanos += 16_666_666L
@@ -641,7 +653,11 @@ class KlioComposeScene(
 ) {
     private val recomposerDriver = KlioRecomposerDriver()
     private val recomposer = recomposerDriver.recomposer
-    internal val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+    internal val owner = KlioComposeOwner(
+        Density(density),
+        LayoutDirection.Ltr,
+        coroutineContext = recomposerDriver.effectContext,
+    )
     private val scene = KlioScene(owner, width, height)
     private val composition = Composition(KlioUiApplier(owner.root), recomposer)
     private var uptime = 0L
@@ -709,6 +725,17 @@ class KlioComposeScene(
         frame()
     }
 
+    /**
+     * Renders the current frame into an [ImageBitmap] whose pixels can be read
+     * back ([ImageBitmap.toPixelMap]); transparent without a Skia backend.
+     */
+    fun render(): androidx.compose.ui.graphics.ImageBitmap {
+        frame()
+        val bitmap = androidx.compose.ui.graphics.ImageBitmap(width, height)
+        scene.draw(androidx.compose.ui.graphics.Canvas(bitmap))
+        return bitmap
+    }
+
     /** Rasterize the current frame to a PNG. False without a Skia backend. */
     fun renderToPng(path: String): Boolean {
         frame()
@@ -731,7 +758,7 @@ fun renderComposeToPng(
 ): Boolean {
     val recomposerDriver = KlioRecomposerDriver()
     val recomposer = recomposerDriver.recomposer
-    val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+    val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr, coroutineContext = recomposerDriver.effectContext)
     val scene = KlioScene(owner, width, height)
     val composition = Composition(KlioUiApplier(owner.root), recomposer)
     composition.setContent {

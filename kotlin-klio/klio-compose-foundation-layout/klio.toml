@@ -10,40 +10,10 @@ auto_bindings = true
 
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/foundation/foundation-layout/src/commonMain/kotlin"
-include = [
-    "androidx/compose/foundation/layout/AlignmentLine.kt",
-    "androidx/compose/foundation/layout/Arrangement.kt",
-    "androidx/compose/foundation/layout/AspectRatio.kt",
-    "androidx/compose/foundation/layout/Box.kt",
-    "androidx/compose/foundation/layout/BoxWithConstraints.kt",
-    "androidx/compose/foundation/layout/Column.kt",
-    "androidx/compose/foundation/layout/ComposeFoundationLayoutFlags.kt",
-    "androidx/compose/foundation/layout/ContextualFlowLayout.kt",
-    "androidx/compose/foundation/layout/ExperimentalFlexBoxApi.kt",
-    "androidx/compose/foundation/layout/ExperimentalGridApi.kt",
-    "androidx/compose/foundation/layout/ExperimentalLayoutApi.kt",
-    "androidx/compose/foundation/layout/FlexBox.kt",
-    "androidx/compose/foundation/layout/FlowLayout.kt",
-    "androidx/compose/foundation/layout/FlowLayoutBuildingBlocks.kt",
-    "androidx/compose/foundation/layout/FlowLayoutOverflow.kt",
-    "androidx/compose/foundation/layout/Grid.kt",
-    "androidx/compose/foundation/layout/Intrinsic.kt",
-    "androidx/compose/foundation/layout/LayoutScopeMarker.kt",
-    "androidx/compose/foundation/layout/Offset.kt",
-    "androidx/compose/foundation/layout/Padding.kt",
-    "androidx/compose/foundation/layout/Row.kt",
-    "androidx/compose/foundation/layout/RowColumnImpl.kt",
-    "androidx/compose/foundation/layout/RowColumnMeasurePolicy.kt",
-    "androidx/compose/foundation/layout/RulerAlignment.kt",
-    "androidx/compose/foundation/layout/Size.kt",
-    "androidx/compose/foundation/layout/Spacer.kt",
-    "androidx/compose/foundation/layout/Visible.kt",
-    "androidx/compose/foundation/layout/WindowInsets.kt",
-    "androidx/compose/foundation/layout/WindowInsetsPadding.kt",
-    "androidx/compose/foundation/layout/WindowInsetsSize.kt",
-    "androidx/compose/foundation/layout/internal/InlineClassHelper.kt",
-    "androidx/compose/foundation/layout/internal/JvmDefaultWithCompatibility.kt",
-]
+
+# nonJvmMain: the JVM-default marker.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/foundation/foundation-layout/src/nonJvmMain/kotlin"
 
 # skikoMain: the window insets actuals, read from the scene's platform insets
 # (none on a desktop window).

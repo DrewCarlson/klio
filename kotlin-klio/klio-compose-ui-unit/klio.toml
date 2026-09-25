@@ -3,12 +3,8 @@
 # (Dp / IntOffset / IntSize / IntRect / Constraints / Velocity / TextUnit / Density /
 # LayoutDirection) — the density-independent units and pixel<->dp<->sp conversions
 # the layout system runs on. Pure Kotlin over inline value classes, no Skia.
-#
-# The klioMain layer supplies the platform actuals: `FontScaling` (upstream is an
-# `expect interface`; klio is a desktop runtime, so the actual is the linear
-# Sp<->Dp conversion — the non-Android default) and the no-op
-# `internal.JvmDefaultWithCompatibility` marker (an `@OptionalExpectation`
-# annotation upstream).
+# The non-Android and non-JVM actuals come from upstream too: FontScaling is
+# the linear Sp<->Dp conversion.
 [library]
 id = "androidx.compose.ui.unit"
 version = "1.12.0"
@@ -18,24 +14,14 @@ auto_bindings = true
 
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui-unit/src/commonMain/kotlin"
-include = [
-    "androidx/compose/ui/unit/ComposeUiUnitFlags.kt",
-    "androidx/compose/ui/unit/InlineClassHelper.kt",
-    "androidx/compose/ui/unit/LayoutDirection.kt",
-    "androidx/compose/ui/unit/Dp.kt",
-    "androidx/compose/ui/unit/IntOffset.kt",
-    "androidx/compose/ui/unit/IntSize.kt",
-    "androidx/compose/ui/unit/IntRect.kt",
-    "androidx/compose/ui/unit/Constraints.kt",
-    "androidx/compose/ui/unit/Velocity.kt",
-    "androidx/compose/ui/unit/ExperimentalUnitApi.kt",
-    "androidx/compose/ui/unit/TextUnit.kt",
-    "androidx/compose/ui/unit/Density.kt",
-]
 
-# klioMain: the platform actuals (FontScaling linear conversion, JvmDefault marker).
+# nonAndroidMain: FontScaling is FontScalingLinear, and the insets in dp;
+# nonJvmMain: the JVM-default marker.
 [[source]]
-root = "klioMain"
+root = "../klio-compose-runtime/upstream/compose/ui/ui-unit/src/nonAndroidMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-unit/src/nonJvmMain/kotlin"
 
 [deps]
 stdlib = "*"

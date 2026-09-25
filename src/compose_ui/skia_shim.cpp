@@ -240,6 +240,20 @@ inline SkColor toColor(uint32_t argb) { return static_cast<SkColor>(argb); }
 // before a draw and clears them after.
 thread_local sk_sp<SkMaskFilter> g_pendingBlur;
 thread_local sk_sp<SkColorFilter> g_pendingColorFilter;
+// The paint's blend mode for the next draw, and the alpha an image draw
+// composites with (a shape's alpha is folded into its color). SrcOver and
+// opaque when nothing is armed.
+thread_local SkBlendMode g_pendingBlend = SkBlendMode::kSrcOver;
+thread_local float g_pendingImageAlpha = 1.0f;
+
+// The paint an image draw composites through: the armed tint, blend and alpha.
+inline SkPaint imagePaint() {
+    SkPaint paint;
+    if (g_pendingColorFilter) paint.setColorFilter(g_pendingColorFilter);
+    paint.setBlendMode(g_pendingBlend);
+    paint.setAlphaf(g_pendingImageAlpha);
+    return paint;
+}
 
 inline void fillPaint(SkPaint& p, uint32_t argb) {
     p.setAntiAlias(true);
@@ -534,11 +548,9 @@ void klio_skia_c_draw_surface(KlioSurface* dst, KlioSurface* src, float x, float
     if (!dst || !src || !src->surface || !canvasOf(dst)) return;
     sk_sp<SkImage> img = src->surface->makeImageSnapshot();
     if (!img) return;
-    // A tinted image draw (a shadow's) filters the image's colors.
-    SkPaint paint;
-    if (g_pendingColorFilter) paint.setColorFilter(g_pendingColorFilter);
-    canvasOf(dst)->drawImage(img, x, y, SkSamplingOptions(SkFilterMode::kLinear),
-                                         g_pendingColorFilter ? &paint : nullptr);
+    // A tinted image draw (a shadow's, an icon's) filters the image's colors.
+    const SkPaint paint = imagePaint();
+    canvasOf(dst)->drawImage(img, x, y, SkSamplingOptions(SkFilterMode::kLinear), &paint);
 }
 
 void klio_skia_c_draw_surface_rect(
@@ -548,14 +560,13 @@ void klio_skia_c_draw_surface_rect(
     if (!dst || !src || !src->surface || !canvasOf(dst)) return;
     sk_sp<SkImage> img = src->surface->makeImageSnapshot();
     if (!img) return;
-    SkPaint paint;
-    if (g_pendingColorFilter) paint.setColorFilter(g_pendingColorFilter);
+    const SkPaint paint = imagePaint();
     canvasOf(dst)->drawImageRect(
         img,
         SkRect::MakeLTRB(sl, st, sr, sb),
         SkRect::MakeLTRB(dl, dt, dr, db),
         SkSamplingOptions(SkFilterMode::kLinear),
-        g_pendingColorFilter ? &paint : nullptr,
+        &paint,
         SkCanvas::kStrict_SrcRectConstraint);
 }
 
@@ -1169,10 +1180,19 @@ extern "C" void klio_skia_c_set_color_filter(KlioSurface* /*s*/, uint32_t argb, 
     g_pendingColorFilter = mode >= 0 ? SkColorFilters::Blend(toColor(argb), static_cast<SkBlendMode>(mode)) : nullptr;
 }
 
+// `mode` is Compose's BlendMode (SkBlendMode's order) for the next draws, and
+// `imageAlpha` the alpha an image draw composites with; a negative mode resets
+// both to SrcOver and opaque.
+extern "C" void klio_skia_c_set_paint_state(KlioSurface* /*s*/, int mode, float imageAlpha) {
+    g_pendingBlend = mode >= 0 ? static_cast<SkBlendMode>(mode) : SkBlendMode::kSrcOver;
+    g_pendingImageAlpha = mode >= 0 ? imageAlpha : 1.0f;
+}
+
 SkPaint klioCanvasPaint(uint32_t argb, int style, float strokeWidth, int cap, int join, int aa) {
     SkPaint p;
     p.setAntiAlias(aa != 0);
     p.setColor(toColor(argb));
+    p.setBlendMode(g_pendingBlend);
     if (g_pendingShader) p.setShader(g_pendingShader);
     if (g_pendingBlur) p.setMaskFilter(g_pendingBlur);
     if (g_pendingColorFilter) p.setColorFilter(g_pendingColorFilter);

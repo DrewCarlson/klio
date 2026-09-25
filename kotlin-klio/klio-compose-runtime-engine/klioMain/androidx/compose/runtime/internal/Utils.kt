@@ -1,10 +1,11 @@
-// klio actual for the runtime's internal error logger. Upstream routes this to
-// the platform log (android.util.Log / stderr); klio writes the message and the
-// throwable to standard error so a swallowed compositional error stays visible.
+// klio actual for the runtime's error logger, as the desktop's: the message and
+// then the throwable's stack trace, both on standard error.
 
 package androidx.compose.runtime.internal
 
+import androidx.compose.runtime.__compose_logError
+
 internal actual fun logError(message: String, e: Throwable) {
-    println(message)
+    __compose_logError(message, e)
     e.printStackTrace()
 }

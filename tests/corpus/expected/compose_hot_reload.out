@@ -1,0 +1,19 @@
+Greeting klio
+-- hot reload
+Greeting klio
+errors: []
+-- a recomposition throws
+Greeting boom
+errors: [IllegalStateException: cannot greet boom (recoverable=true)]
+recomposer state: Inactive
+-- hot reload after the fix
+Greeting fixed
+errors: []
+-- a recorded error is cleared
+Greeting boom
+errors: true
+errors: []
+-- live literals
+size 12
+size 16
+same state: true

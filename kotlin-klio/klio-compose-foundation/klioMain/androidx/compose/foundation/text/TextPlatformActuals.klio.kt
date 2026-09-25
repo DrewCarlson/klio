@@ -5,51 +5,21 @@
  * you may not use this file except in compliance with the License.
  */
 
+// The text field actuals the non-JVM native targets give, which klio's
+// platform answers the same way: the undo manager's clock is the monotonic
+// one, and there are no platform clipboard events to handle.
 package androidx.compose.foundation.text
 
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.text.AnnotatedString
+import kotlin.time.TimeSource
 
-/**
- * klio actuals for the foundation.text expects whose desktop implementations live
- * in JVM-coupled files (java.awt clipboard / Swing context menus), which the pack
- * cannot carry.
- */
+private val markNow = TimeSource.Monotonic.markNow()
 
-/**
- * The undo manager coalesces edits by the GAP between them, so it needs a
- * monotonically increasing millisecond clock, not a wall clock — and klio exposes
- * no wall clock (`androidx.compose.ui.currentTimeMillis` takes the same approach).
- * A counter advancing one frame per read gives positive, ordered deltas and is
- * deterministic, which the headless render tier needs.
- */
-private var undoClockMillis: Long = 0L
+internal actual fun timeNowMillis(): Long =
+    markNow.elapsedNow().inWholeMilliseconds
 
-internal actual fun timeNowMillis(): Long {
-    undoClockMillis += 16L
-    return undoClockMillis
-}
-
-/**
- * Append a Unicode code point. Kotlin's `StringBuilder` takes `Char`s, so a
- * supplementary code point (above the BMP) must be appended as its surrogate
- * pair — the same thing Java's `appendCodePoint` does.
- */
-internal actual fun StringBuilder.appendCodePointX(codePoint: Int): StringBuilder {
-    if (codePoint < 0x10000) {
-        append(codePoint.toChar())
-    } else {
-        val v = codePoint - 0x10000
-        append((0xD800 + (v shr 10)).toChar())
-        append((0xDC00 + (v and 0x3FF)).toChar())
-    }
-    return this
-}
-
-/**
- * klio has no system clipboard binding yet, so nothing intercepts the paste/copy/cut
- * key events and the field keeps its own handling. Returns false: "not handled here".
- */
+@Suppress("ComposableNaming")
 @Composable
 internal actual inline fun rememberClipboardEventsHandler(
     crossinline onPaste: (AnnotatedString) -> Unit,

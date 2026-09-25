@@ -83,6 +83,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_c_set_shader", canvasSetShader);
     try b.register("androidx.compose.ui.graphics.__skia_c_set_blur", canvasSetBlur);
     try b.register("androidx.compose.ui.graphics.__skia_c_set_color_filter", canvasSetColorFilter);
+    try b.register("androidx.compose.ui.graphics.__skia_c_set_paint_state", canvasSetPaintState);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_rect", canvasDrawRect);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_rrect", canvasDrawRRect);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_oval", canvasDrawOval);
@@ -117,6 +118,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.text.platform.__skia_font_register", fontRegister);
     try b.register("androidx.compose.ui.text.platform.__skia_para_ph_count", paraPhCount);
     try b.register("androidx.compose.ui.text.platform.__skia_para_ph_rect", paraPhRect);
+    try b.register("androidx.compose.material3.internal.__klio_icu_date", icuDate);
     return b;
 }
 
@@ -173,6 +175,7 @@ const Skia = struct {
     cSetShader: ?CSetShaderFn,
     cSetBlur: ?CRotateFn,
     cSetColorFilter: ?CSetColorFilterFn,
+    cSetPaintState: ?CSetPaintStateFn,
     cDrawRect: ?CDrawRectFn,
     cDrawRRect: ?CDrawRRectFn,
     cDrawOval: ?CDrawRectFn,
@@ -206,6 +209,7 @@ const Skia = struct {
     fontRegister: ?FontRegisterFn,
     paraPhCount: ?ParaPhCountFn,
     paraPhRect: ?ParaPhRectFn,
+    icuDate: ?IcuDateFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
     /// Optional: mobile backends attach to an OS-provided surface layer; null on
     /// desktop, where `winOpen` creates the window.
@@ -225,6 +229,7 @@ const WinAttachFn = *const fn (?*anyopaque, c_int, c_int, f64) callconv(.c) ?*Sk
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
 const PathOpFn = *const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) ?[*:0]u8;
 const FreeCstrFn = *const fn ([*:0]u8) callconv(.c) void;
+const IcuDateFn = *const fn (c_int, [*:0]const u8, [*:0]const u8, [*:0]const u8, f64) callconv(.c) ?[*:0]u8;
 
 // Canvas entry points, optional so a stale shared library degrades to no-op
 // drawing instead of failing the whole Skia load.
@@ -235,6 +240,7 @@ const CClipRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int) callconv(
 const CClipPathFn = *const fn (?*SkSurface, [*:0]const u8, c_int) callconv(.c) void;
 const CSetShaderFn = *const fn (?*SkSurface, [*:0]const u8) callconv(.c) void;
 const CSetColorFilterFn = *const fn (?*SkSurface, u32, c_int) callconv(.c) void;
+const CSetPaintStateFn = *const fn (?*SkSurface, c_int, f32) callconv(.c) void;
 // The trailing (argb, style, strokeWidth, cap, join, aa) is the packed paint.
 const CDrawRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
 const CDrawRRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
@@ -337,6 +343,7 @@ fn loadSkia() ?*Skia {
         .cSetShader = lib.lookup(CSetShaderFn, "klio_skia_c_set_shader"),
         .cSetBlur = lib.lookup(CRotateFn, "klio_skia_c_set_blur"),
         .cSetColorFilter = lib.lookup(CSetColorFilterFn, "klio_skia_c_set_color_filter"),
+        .cSetPaintState = lib.lookup(CSetPaintStateFn, "klio_skia_c_set_paint_state"),
         .cDrawRect = lib.lookup(CDrawRectFn, "klio_skia_c_draw_rect"),
         .cDrawRRect = lib.lookup(CDrawRRectFn, "klio_skia_c_draw_rrect"),
         .cDrawOval = lib.lookup(CDrawRectFn, "klio_skia_c_draw_oval"),
@@ -370,6 +377,7 @@ fn loadSkia() ?*Skia {
         .fontRegister = lib.lookup(FontRegisterFn, "klio_skia_font_register"),
         .paraPhCount = lib.lookup(ParaPhCountFn, "klio_skia_para_ph_count"),
         .paraPhRect = lib.lookup(ParaPhRectFn, "klio_skia_para_ph_rect"),
+        .icuDate = lib.lookup(IcuDateFn, "klio_icu_date"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
         .winAttach = lib.lookup(WinAttachFn, "klio_win_attach"),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
@@ -426,6 +434,7 @@ fn loadSkiaStatic() ?*Skia {
         .cSetShader = externSym(CSetShaderFn, "klio_skia_c_set_shader"),
         .cSetBlur = externSym(CRotateFn, "klio_skia_c_set_blur"),
         .cSetColorFilter = externSym(CSetColorFilterFn, "klio_skia_c_set_color_filter"),
+        .cSetPaintState = externSym(CSetPaintStateFn, "klio_skia_c_set_paint_state"),
         .cDrawRect = externSym(CDrawRectFn, "klio_skia_c_draw_rect"),
         .cDrawRRect = externSym(CDrawRRectFn, "klio_skia_c_draw_rrect"),
         .cDrawOval = externSym(CDrawRectFn, "klio_skia_c_draw_oval"),
@@ -459,6 +468,7 @@ fn loadSkiaStatic() ?*Skia {
         .fontRegister = externSym(FontRegisterFn, "klio_skia_font_register"),
         .paraPhCount = externSym(ParaPhCountFn, "klio_skia_para_ph_count"),
         .paraPhRect = externSym(ParaPhRectFn, "klio_skia_para_ph_rect"),
+        .icuDate = externSym(IcuDateFn, "klio_icu_date"),
         .winOpen = externSym(@FieldType(Skia, "winOpen"), "klio_win_open"),
         .winAttach = externSym(WinAttachFn, "klio_win_attach"),
         .winSurface = externSym(@FieldType(Skia, "winSurface"), "klio_win_surface"),
@@ -1125,6 +1135,30 @@ fn pathOp(ctx: *CallCtx) Error!EvalResult {
     return ok(Value{ .String = try runtime.strInitOwned(a, owned) });
 }
 
+/// A date question for the host's ICU (`klio_icu_date` in icu_shim.cpp):
+/// (op, languageTag, a, b, millis). Null when ICU cannot answer or no Skia
+/// backend is present.
+fn icuDate(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 5) return ok(Value.Null);
+    for (ctx.args[1..4]) |arg| if (arg != .String) return ok(Value.Null);
+    const skia = loadSkia() orelse return ok(Value.Null);
+    const date_fn = skia.icuDate orelse return ok(Value.Null);
+    const free_fn = skia.freeCstr orelse return ok(Value.Null);
+    const a = ctx.allocator;
+    var z: [3][:0]u8 = undefined;
+    for (0..3) |i| {
+        const g = ctx.args[1 + i].String.borrow();
+        defer g.deinit();
+        z[i] = try a.dupeZ(u8, g.get().bytes);
+    }
+    defer for (z) |s| a.free(s);
+    const millis: f64 = @floatFromInt(argInt(ctx.args[4]));
+    const res = date_fn(@intCast(argInt(ctx.args[0])), z[0].ptr, z[1].ptr, z[2].ptr, millis) orelse return ok(Value.Null);
+    defer free_fn(res);
+    const owned = try a.dupe(u8, std.mem.span(res));
+    return ok(Value{ .String = try runtime.strInitOwned(a, owned) });
+}
+
 // Canvas intrinsics: a Canvas actual draws through these onto an offscreen
 // surface, the handle being a KlioSurface pointer as a Long.
 
@@ -1498,6 +1532,15 @@ fn canvasSetColorFilter(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+/// Arm the next draws' blend mode and an image draw's alpha, (mode, alpha); a
+/// negative mode resets them.
+fn canvasSetPaintState(ctx: *CallCtx) Error!EvalResult {
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (ctx.args.len >= 3) if (surfArg(ctx.args[0])) |s| if (skia.cSetPaintState) |f|
+        f(s, @intCast(argInt(ctx.args[1])), argFloat(ctx.args[2]));
+    return ok(Value.newLong(0));
+}
+
 /// The trailing paint args are (argb, style, strokeWidth, cap, join, aa).
 fn canvasDrawRect(ctx: *CallCtx) Error!EvalResult {
     if (runtime.envOnce("KLIO_DRAW_TRACE") != null and ctx.args.len >= 11) {
@@ -1662,7 +1705,21 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_rec_end") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_picture_free") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_picture") != null);
-    try testing.expectEqual(@as(usize, 84), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_paint_state") != null);
+    try testing.expect(b.resolve("androidx.compose.material3.internal.__klio_icu_date") != null);
+    try testing.expectEqual(@as(usize, 86), b.len());
+}
+
+test "the ICU date and paint state bindings answer null or 0 for short args" {
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c0 = host.ctx(&none);
+    try testing.expect((try icuDate(&c0)).ok == .Null);
+    try testing.expectEqual(@as(i64, 0), (try canvasSetPaintState(&c0)).ok.Long);
+    // A non-string locale, pattern or text answers null before any ICU call.
+    const wrong = [_]Value{ Value.newInt(0), Value.newInt(1), Value.newInt(2), Value.newInt(3), Value.newLong(0) };
+    var c1 = host.ctx(&wrong);
+    try testing.expect((try icuDate(&c1)).ok == .Null);
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

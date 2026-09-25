@@ -45,18 +45,14 @@ internal class KlioPath : Path {
     private var maxY = Float.NEGATIVE_INFINITY
     private var pointCount = 0
 
-    // True while the path is exactly one convex primitive (a single rect / oval /
-    // rounded rect) and nothing else — the only shapes we report as convex.
-    private var singlePrimitive = false
-    private var mutatedAfterPrimitive = false
-
     override var fillType: PathFillType = PathFillType.NonZero
 
     override val isEmpty: Boolean
         get() = verbs.isEmpty()
 
+    // Decided from the path's points as Skia decides it (SkPathPriv::ComputeConvexity).
     override val isConvex: Boolean
-        get() = singlePrimitive && !mutatedAfterPrimitive
+        get() = isConvexPath(verbs, pts)
 
     private fun include(x: Float, y: Float) {
         if (x < minX) minX = x
@@ -100,33 +96,28 @@ internal class KlioPath : Path {
         curX = startX; curY = startY
     }
 
-    private fun markMutated() {
-        if (verbs.isNotEmpty()) mutatedAfterPrimitive = true
-    }
-
-    override fun moveTo(x: Float, y: Float) { markMutated(); emitMove(x, y) }
+    override fun moveTo(x: Float, y: Float) { emitMove(x, y) }
 
     override fun relativeMoveTo(dx: Float, dy: Float) = moveTo(curX + dx, curY + dy)
 
-    override fun lineTo(x: Float, y: Float) { markMutated(); emitLine(x, y) }
+    override fun lineTo(x: Float, y: Float) { emitLine(x, y) }
 
     override fun relativeLineTo(dx: Float, dy: Float) = lineTo(curX + dx, curY + dy)
 
     @Deprecated("Use quadraticTo() for consistency with cubicTo()")
     override fun quadraticBezierTo(x1: Float, y1: Float, x2: Float, y2: Float) {
-        markMutated(); emitQuad(x1, y1, x2, y2)
+        emitQuad(x1, y1, x2, y2)
     }
 
     override fun relativeQuadraticBezierTo(dx1: Float, dy1: Float, dx2: Float, dy2: Float) {
-        markMutated(); emitQuad(curX + dx1, curY + dy1, curX + dx2, curY + dy2)
+        emitQuad(curX + dx1, curY + dy1, curX + dx2, curY + dy2)
     }
 
     override fun cubicTo(x1: Float, y1: Float, x2: Float, y2: Float, x3: Float, y3: Float) {
-        markMutated(); emitCubic(x1, y1, x2, y2, x3, y3)
+        emitCubic(x1, y1, x2, y2, x3, y3)
     }
 
     override fun relativeCubicTo(dx1: Float, dy1: Float, dx2: Float, dy2: Float, dx3: Float, dy3: Float) {
-        markMutated()
         emitCubic(curX + dx1, curY + dy1, curX + dx2, curY + dy2, curX + dx3, curY + dy3)
     }
 
@@ -136,7 +127,6 @@ internal class KlioPath : Path {
         sweepAngleRadians: Float,
         forceMoveTo: Boolean,
     ) {
-        markMutated()
         arcTo(rect, startAngleRadians, sweepAngleRadians, forceMoveTo, degrees = false)
     }
 
@@ -146,7 +136,6 @@ internal class KlioPath : Path {
         sweepAngleDegrees: Float,
         forceMoveTo: Boolean,
     ) {
-        markMutated()
         arcTo(
             rect,
             startAngleDegrees * DEG_TO_RAD,
@@ -189,14 +178,15 @@ internal class KlioPath : Path {
     ) {
         if (sweepRad == 0f) return
         val segments = max(1, ceil(abs(sweepRad) / (PI.toFloat() / 2f)).toInt())
-        val delta = sweepRad / segments
-        val kappa = (4.0 / 3.0 * kotlin.math.tan(delta.toDouble() / 4.0)).toFloat()
-        var angle = startRad
+        val delta = sweepRad.toDouble() / segments
+        val kappa = (4.0 / 3.0 * kotlin.math.tan(delta / 4.0)).toFloat()
         for (i in 0 until segments) {
-            val a0 = angle
-            val a1 = angle + delta
-            val cosA0 = cos(a0); val sinA0 = sin(a0)
-            val cosA1 = cos(a1); val sinA1 = sin(a1)
+            // In double precision, and exact at the quarter turns, so an oval
+            // or a rounded corner meets its neighbours at the exact point.
+            val a0 = startRad.toDouble() + i * delta
+            val a1 = startRad.toDouble() + (i + 1) * delta
+            val cosA0 = exactCos(a0); val sinA0 = exactCos(a0 - PI / 2)
+            val cosA1 = exactCos(a1); val sinA1 = exactCos(a1 - PI / 2)
             val p1x = cx + rx * cosA0
             val p1y = cy + ry * sinA0
             val p2x = cx + rx * cosA1
@@ -206,14 +196,27 @@ internal class KlioPath : Path {
             val c2x = p2x + kappa * rx * sinA1
             val c2y = p2y - kappa * ry * cosA1
             emitCubic(c1x, c1y, c2x, c2y, p2x, p2y)
-            angle = a1
+        }
+    }
+
+    /**
+     * The cosine of [angle] as a Float, exact at the quarter turns: an angle
+     * built from Float multiples of pi lands within a rounding error of one.
+     */
+    private fun exactCos(angle: Double): Float {
+        val quarters = kotlin.math.round(angle / (PI / 2))
+        if (abs(angle - quarters * (PI / 2)) > 1e-5) return kotlin.math.cos(angle).toFloat()
+        return when (((quarters.toLong() % 4) + 4) % 4) {
+            0L -> 1f
+            1L -> 0f
+            2L -> -1f
+            else -> 0f
         }
     }
 
     override fun addRect(rect: Rect) = addRect(rect, Path.Direction.CounterClockwise)
 
     override fun addRect(rect: Rect, direction: Path.Direction) {
-        val wasEmpty = verbs.isEmpty()
         emitMove(rect.left, rect.top)
         if (direction == Path.Direction.Clockwise) {
             emitLine(rect.right, rect.top)
@@ -225,13 +228,11 @@ internal class KlioPath : Path {
             emitLine(rect.right, rect.top)
         }
         emitClose()
-        setPrimitive(wasEmpty)
     }
 
     override fun addOval(oval: Rect) = addOval(oval, Path.Direction.CounterClockwise)
 
     override fun addOval(oval: Rect, direction: Path.Direction) {
-        val wasEmpty = verbs.isEmpty()
         val cx = oval.center.x
         val cy = oval.center.y
         val rx = oval.width / 2f
@@ -240,14 +241,12 @@ internal class KlioPath : Path {
         emitMove(cx + rx, cy)
         appendArcCubics(cx, cy, rx, ry, 0f, sweep)
         emitClose()
-        setPrimitive(wasEmpty)
     }
 
     override fun addRoundRect(roundRect: RoundRect) =
         addRoundRect(roundRect, Path.Direction.CounterClockwise)
 
     override fun addRoundRect(roundRect: RoundRect, direction: Path.Direction) {
-        val wasEmpty = verbs.isEmpty()
         val l = roundRect.left
         val t = roundRect.top
         val r = roundRect.right
@@ -282,16 +281,13 @@ internal class KlioPath : Path {
             appendArcCubics(r - trx, t + tryy, trx, tryy, 0f, -half)
         }
         emitClose()
-        setPrimitive(wasEmpty)
     }
 
     override fun addArcRad(oval: Rect, startAngleRadians: Float, sweepAngleRadians: Float) {
-        markMutated()
         arcTo(oval, startAngleRadians, sweepAngleRadians, forceMoveTo = true, degrees = false)
     }
 
     override fun addArc(oval: Rect, startAngleDegrees: Float, sweepAngleDegrees: Float) {
-        markMutated()
         arcTo(
             oval,
             startAngleDegrees * DEG_TO_RAD,
@@ -302,7 +298,6 @@ internal class KlioPath : Path {
     }
 
     override fun addPath(path: Path, offset: Offset) {
-        markMutated()
         val other = path as? KlioPath ?: return
         var i = 0
         var p = 0
@@ -330,7 +325,7 @@ internal class KlioPath : Path {
         }
     }
 
-    override fun close() { markMutated(); emitClose() }
+    override fun close() { emitClose() }
 
     override fun reset() {
         verbs.clear()
@@ -339,8 +334,6 @@ internal class KlioPath : Path {
         minX = Float.POSITIVE_INFINITY; minY = Float.POSITIVE_INFINITY
         maxX = Float.NEGATIVE_INFINITY; maxY = Float.NEGATIVE_INFINITY
         pointCount = 0
-        singlePrimitive = false
-        mutatedAfterPrimitive = false
         fillType = PathFillType.NonZero
     }
 
@@ -416,15 +409,6 @@ internal class KlioPath : Path {
                 "c" -> cubicTo(f[1].toFloat(), f[2].toFloat(), f[3].toFloat(), f[4].toFloat(), f[5].toFloat(), f[6].toFloat())
                 "z" -> close()
             }
-        }
-    }
-
-    private fun setPrimitive(wasEmpty: Boolean) {
-        if (wasEmpty) {
-            singlePrimitive = true
-            mutatedAfterPrimitive = false
-        } else {
-            mutatedAfterPrimitive = true
         }
     }
 

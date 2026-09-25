@@ -67,7 +67,16 @@ internal class KlioPathIterator(
                 PathSegment.Type.Cubic
             }
             else -> { // VERB_CLOSE
-                curX = startX; curY = startY
+                // Skia's SkPath::Iter, which skiko's iterator walks, first
+                // returns the line that closes the contour when its last point
+                // is not its start, and the close after it.
+                if (curX != startX || curY != startY) {
+                    vi--
+                    outPoints[offset] = curX; outPoints[offset + 1] = curY
+                    outPoints[offset + 2] = startX; outPoints[offset + 3] = startY
+                    curX = startX; curY = startY
+                    return PathSegment.Type.Line
+                }
                 PathSegment.Type.Close
             }
         }

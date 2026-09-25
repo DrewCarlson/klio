@@ -366,66 +366,57 @@ include = [
     "androidx/compose/foundation/text/selection/TextSelectionDelegate.kt",
 ]
 
+# skikoMain: upstream's actuals for every skiko target, whole: key mapping,
+# cursor and selection drawing, the context menu, clipboard, dead-key
+# combining, Modifier.onClick with PointerMatcher, Modifier.onDrag, the
+# scrollbars. The drag-and-drop source draws its shadow through a skia
+# canvas, so it waits for the skia binding layer.
 [[source]]
-# Upstream's DESKTOP (skiko) source set: the real `actual`s for foundation's
-# platform expects — key mapping, cursor/selection drawing, code-point helpers,
-# context menu, clipboard, dead-key combining. klio IS a desktop Compose target,
-# so these are vendored rather than reinvented. Curated like commonMain: only the
-# files klio can lex + parse and whose dependencies the pack carries.
 root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/skikoMain/kotlin"
-include = [
-    "androidx/compose/foundation/BasicTooltip.skiko.kt",
-    "androidx/compose/foundation/ComposeFoundationFlags.skiko.kt",
-    "androidx/compose/foundation/DarkTheme.skiko.kt",
-    "androidx/compose/foundation/content/TransferableContent.skiko.kt",
-    "androidx/compose/foundation/content/internal/DragAndDropRequestPermission.skiko.kt",
-    "androidx/compose/foundation/content/internal/ReceiveContentDragAndDropNode.skiko.kt",
-    "androidx/compose/foundation/contextmenu/ContextMenuUi.skiko.kt",
-    "androidx/compose/foundation/internal/PlatformUtils.kt",
-    "androidx/compose/foundation/platform/Synchronization.skiko.kt",
-    "androidx/compose/foundation/text/BasicTextField.skiko.kt",
-    "androidx/compose/foundation/text/CoreTextField.skiko.kt",
-    "androidx/compose/foundation/lazy/layout/PrefetchScheduler.skiko.kt",
-    "androidx/compose/foundation/text/AutofillHighlight.skiko.kt",
-    "androidx/compose/foundation/text/BasicSecureTextField.skiko.kt",
-    "androidx/compose/foundation/text/BasicText.skiko.kt",
-    "androidx/compose/foundation/text/ContextMenuIcons.skiko.kt",
-    "androidx/compose/foundation/text/ContextMenuStrings.skiko.kt",
-    "androidx/compose/foundation/text/CupertinoTextFieldPointerModifier.skiko.kt",
-    "androidx/compose/foundation/text/DeadKeyCombiner.skiko.kt",
-    "androidx/compose/foundation/text/KeyMapping.skiko.kt",
-    "androidx/compose/foundation/text/StringHelpers.skiko.kt",
-    "androidx/compose/foundation/text/TextFieldDelegate.skiko.kt",
-    "androidx/compose/foundation/text/TextFieldFocusModifier.skiko.kt",
-    "androidx/compose/foundation/text/TextFieldScrollState.skiko.kt",
-    "androidx/compose/foundation/text/TextPointerIcon.skiko.kt",
-    "androidx/compose/foundation/text/contextmenu/builder/TextContextMenuBuilderScope.skiko.kt",
-    "androidx/compose/foundation/text/contextmenu/data/TextContextMenuData.skiko.kt",
-    "androidx/compose/foundation/text/contextmenu/internal/DefaultTextContextMenuDropdownProvider.skiko.kt",
-    # The context-menu string translations ContextMenuStrings.skiko.kt reads.
-    "androidx/compose/foundation/text/l10n/",
-    "androidx/compose/foundation/text/handwriting/StylusHandwriting.skiko.kt",
-    "androidx/compose/foundation/text/input/internal/LegacyPlatformTextInputServiceAdapter.skiko.kt",
-    "androidx/compose/foundation/text/input/internal/TextFieldDragAndDropNode.skiko.kt",
-    "androidx/compose/foundation/text/input/internal/TextFieldKeyEventHandler.skiko.kt",
-    "androidx/compose/foundation/text/input/internal/TextFieldLayoutStateCache.skiko.kt",
-    "androidx/compose/foundation/text/input/internal/TextInputSession.skiko.kt",
-    "androidx/compose/foundation/text/input/internal/ToCharArray.skiko.kt",
-    "androidx/compose/foundation/text/selection/PlatformSelectionBehaviors.skiko.kt",
-    "androidx/compose/foundation/text/selection/SelectionGestures.skiko.kt",
-    "androidx/compose/foundation/text/selection/SelectionHandles.skiko.kt",
+exclude = [
+    "androidx/compose/foundation/draganddrop/DragAndDropSource.skiko.kt",
 ]
 
-# desktopMain: the desktop actuals that are already java-free.
+# nonJvmMain: the actuals every non-JVM target shares.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/nonJvmMain/kotlin"
+
+# desktopMain: the desktop actuals that are java-free, taken as they are.
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/desktopMain/kotlin"
 include = [
     "androidx/compose/foundation/Overscroll.desktop.kt",
+    "androidx/compose/foundation/Clickable.desktop.kt",
+    "androidx/compose/foundation/RequestFocusOnClick.desktop.kt",
+    "androidx/compose/foundation/gestures/Scrollable.desktop.kt",
+    "androidx/compose/foundation/lazy/LazyList.desktop.kt",
+    "androidx/compose/foundation/lazy/layout/Lazy.desktop.kt",
+    "androidx/compose/foundation/v2/Actuals.desktop.kt",
+    "androidx/compose/foundation/text/BasicTextField.desktop.kt",
+    "androidx/compose/foundation/text/CoreTextField.desktop.kt",
+    "androidx/compose/foundation/text/DesktopCursorHandle.desktop.kt",
+    "androidx/compose/foundation/text/KeyMapping.desktop.kt",
+    "androidx/compose/foundation/text/TextFieldCursor.desktop.kt",
+    "androidx/compose/foundation/text/TextFieldPointerModifier.desktop.kt",
+    "androidx/compose/foundation/text/TextFieldScroll.desktop.kt",
+    "androidx/compose/foundation/text/TouchMode.desktop.kt",
+    "androidx/compose/foundation/text/contextmenu/internal/PlatformDefaultTextContextMenuProviders.desktop.kt",
+    "androidx/compose/foundation/text/contextmenu/modifier/TextContextMenuModifier.desktop.kt",
+    "androidx/compose/foundation/text/input/internal/TextFieldCoreModifier.desktop.kt",
+    "androidx/compose/foundation/text/input/internal/TextFieldKeyEventHandler.desktop.kt",
+    "androidx/compose/foundation/text/input/internal/selection/TextFieldMagnifierNode.desktop.kt",
+    "androidx/compose/foundation/text/modifiers/SelectionController.desktop.kt",
+    "androidx/compose/foundation/text/selection/DefaultTextSelectionColors.desktop.kt",
+    "androidx/compose/foundation/text/selection/SelectionGestures.desktop.kt",
+    "androidx/compose/foundation/text/selection/SelectionHandles.desktop.kt",
+    "androidx/compose/foundation/text/selection/SelectionManager.desktop.kt",
+    "androidx/compose/foundation/text/selection/TextFieldSelectionManager.desktop.kt",
 ]
 
-# klioMain: the platform actuals, the java-free desktopMain files adapted to
-# klio's platform, and internal stand-ins for the two skia ICU calls
-# StringHelpers.skiko.kt makes (org.jetbrains.skia).
+# klioMain: the platform actuals where the desktop ones reach AWT or skiko
+# (the clipboard, typed key events, the character palette), and internal
+# stand-ins for the two skia ICU calls StringHelpers.skiko.kt makes
+# (org.jetbrains.skia).
 [[source]]
 root = "klioMain"
 

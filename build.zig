@@ -1659,10 +1659,17 @@ fn buildSkiaShimIos(
     c2.addArg("-o");
     const font_o = c2.addOutputFileArg("font_data.o");
 
+    const c3 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-arch", "arm64" });
+    c3.addArgs(&.{ min_flag, "-isysroot", sdk, inc, "-c" });
+    c3.addFileArg(b.path("src/compose_ui/icu_shim.cpp"));
+    c3.addArg("-o");
+    const icu_o = c3.addOutputFileArg("icu_shim.o");
+
     const ar = b.addSystemCommand(&.{ "libtool", "-static", "-o" });
     const out = ar.addOutputFileArg("libklio_skia.a");
     ar.addFileArg(shim_o);
     ar.addFileArg(font_o);
+    ar.addFileArg(icu_o);
     return out;
 }
 
@@ -1728,6 +1735,8 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
     run.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
     // The bundled fallback font, baked into a byte array (scripts/gen-font-data.py).
     run.addFileArg(b.path("src/compose_ui/font_data.cpp"));
+    // Date formatting over the ICU the Skia libraries bundle.
+    run.addFileArg(b.path("src/compose_ui/icu_shim.cpp"));
     // Reset the input language so the .a archives that follow are linked, not
     // compiled as Objective-C++ source (the -x above applies to everything after).
     if (os == .macos and want_cocoa) run.addArgs(&.{ "-x", "none" });

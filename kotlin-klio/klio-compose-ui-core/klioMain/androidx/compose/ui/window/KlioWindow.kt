@@ -58,7 +58,7 @@ fun runComposeWindow(
 
     val recomposerDriver = KlioRecomposerDriver()
     val recomposer = recomposerDriver.recomposer
-    val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+    val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr, coroutineContext = recomposerDriver.effectContext)
     val scene = KlioScene(owner, width, height)
     val composition = Composition(KlioUiApplier(owner.root), recomposer)
     composition.setContent {
@@ -195,6 +195,7 @@ internal class KlioWindowHolder(
 internal class KlioApplicationScope(
     private val recomposer: Recomposer,
     private val density: Float,
+    private val effectContext: kotlin.coroutines.CoroutineContext,
 ) : ApplicationScope {
     val windows = mutableListOf<KlioWindowHolder>()
     var exited = false
@@ -206,7 +207,7 @@ internal class KlioApplicationScope(
     fun open(title: String, width: Int, height: Int, content: @Composable () -> Unit): KlioWindowHolder? {
         val handle = __composeui_winOpen(width, height, title)
         if (handle == 0L) return null
-        val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+        val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr, coroutineContext = effectContext)
         val scene = KlioScene(owner, width, height)
         val composition = Composition(KlioUiApplier(owner.root), recomposer)
         composition.setContent {
@@ -456,7 +457,7 @@ fun application(
 ): Boolean {
     val recomposerDriver = KlioRecomposerDriver()
     val recomposer = recomposerDriver.recomposer
-    val scope = KlioApplicationScope(recomposer, density)
+    val scope = KlioApplicationScope(recomposer, density, recomposerDriver.effectContext)
     val appComposition = Composition(KlioNoopApplier(), recomposer)
     appComposition.setContent {
         scope.content()

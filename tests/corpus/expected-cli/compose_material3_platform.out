@@ -1,0 +1,20 @@
+--- menu ---
+menu open: false, items laid out: false
+menu open: true
+items below the button: true
+item drawn on the menu surface: true
+picked Delete
+menu open: false
+menu dismissed
+menu open: false
+--- dialog ---
+title above the confirm button: true
+scrim over the corner: true
+confirmed
+dialog open: false
+--- dates ---
+en-US: Mar 15, 2024 | March 2024
+en-GB: 15 Mar 2024 | March 2024
+de-DE: 15. März 2024 | März 2024
+fr-FR: 15 mars 2024 | mars 2024
+ja-JP: 2024年3月15日 | 2024年3月

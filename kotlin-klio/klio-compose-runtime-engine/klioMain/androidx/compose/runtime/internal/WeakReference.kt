@@ -9,9 +9,11 @@ package androidx.compose.runtime.internal
 
 import androidx.compose.runtime.__compose_identityHashCode
 
-internal class WeakReference<T : Any>(private val referent: T) {
-    fun get(): T? = referent
+internal actual class WeakReference<T : Any> actual constructor(reference: T) {
+    private val referent: T = reference
+
+    actual fun get(): T? = referent
 }
 
-internal fun identityHashCode(instance: Any?): Int =
+internal actual fun identityHashCode(instance: Any?): Int =
     if (instance == null) 0 else __compose_identityHashCode(instance)

@@ -103,6 +103,19 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         if (active) __skia_c_set_color_filter(handle, 0, -1)
     }
 
+    // A paint's blend mode (BlendMode.Clear, a SrcIn tint mask, ...) and, for an
+    // image, the alpha it composites with (a shape's is folded into its color).
+    private fun beginPaintState(paint: Paint, image: Boolean): Boolean {
+        val alpha = if (image) paint.alpha else 1f
+        if (paint.blendMode == BlendMode.SrcOver && alpha == 1f) return false
+        __skia_c_set_paint_state(handle, paint.blendMode.skiaCode(), alpha)
+        return true
+    }
+
+    private fun endPaintState(active: Boolean) {
+        if (active) __skia_c_set_paint_state(handle, -1, 1f)
+    }
+
     override fun save() { __skia_c_save(handle) }
 
     override fun restore() { __skia_c_restore(handle) }
@@ -147,14 +160,18 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
     }
 
     override fun drawLine(p1: Offset, p2: Offset, paint: Paint) {
+        val ps = beginPaintState(paint, image = false)
         __skia_c_draw_line(handle, p1.x, p1.y, p2.x, p2.y, paint.argb(), paint.strokeWidth, paint.capCode(), paint.aaCode())
+        endPaintState(ps)
     }
 
     override fun drawRect(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) {
         val sh = beginShader(paint)
         val bl = beginBlur(paint)
         val cf = beginColorFilter(paint)
+        val ps = beginPaintState(paint, image = false)
         __skia_c_draw_rect(handle, left, top, right, bottom, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endPaintState(ps)
         endColorFilter(cf)
         endBlur(bl)
         endShader(sh)
@@ -164,7 +181,9 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         val sh = beginShader(paint)
         val bl = beginBlur(paint)
         val cf = beginColorFilter(paint)
+        val ps = beginPaintState(paint, image = false)
         __skia_c_draw_rrect(handle, left, top, right, bottom, radiusX, radiusY, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endPaintState(ps)
         endColorFilter(cf)
         endBlur(bl)
         endShader(sh)
@@ -174,7 +193,9 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         val sh = beginShader(paint)
         val bl = beginBlur(paint)
         val cf = beginColorFilter(paint)
+        val ps = beginPaintState(paint, image = false)
         __skia_c_draw_oval(handle, left, top, right, bottom, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endPaintState(ps)
         endColorFilter(cf)
         endBlur(bl)
         endShader(sh)
@@ -184,7 +205,9 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         val sh = beginShader(paint)
         val bl = beginBlur(paint)
         val cf = beginColorFilter(paint)
+        val ps = beginPaintState(paint, image = false)
         __skia_c_draw_circle(handle, center.x, center.y, radius, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endPaintState(ps)
         endColorFilter(cf)
         endBlur(bl)
         endShader(sh)
@@ -208,7 +231,9 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         val sh = beginShader(paint)
         val bl = beginBlur(paint)
         val cf = beginColorFilter(paint)
+        val ps = beginPaintState(paint, image = false)
         __skia_c_draw_path(handle, t, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endPaintState(ps)
         endColorFilter(cf)
         endBlur(bl)
         endShader(sh)
@@ -218,7 +243,9 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         val src = image.klioSurfaceHandle()
         if (src == 0L) return
         val cf = beginColorFilter(paint)
+        val ps = beginPaintState(paint, image = true)
         __skia_c_draw_surface(handle, src, topLeftOffset.x, topLeftOffset.y)
+        endPaintState(ps)
         endColorFilter(cf)
     }
 
@@ -233,6 +260,7 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         val src = image.klioSurfaceHandle()
         if (src == 0L) return
         val cf = beginColorFilter(paint)
+        val ps = beginPaintState(paint, image = true)
         __skia_c_draw_surface_rect(
             handle,
             src,
@@ -245,6 +273,7 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
             (dstOffset.x + dstSize.width).toFloat(),
             (dstOffset.y + dstSize.height).toFloat(),
         )
+        endPaintState(ps)
         endColorFilter(cf)
     }
 

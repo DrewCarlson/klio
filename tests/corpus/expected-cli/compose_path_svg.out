@@ -1,0 +1,14 @@
+M0.0 0.0L10.0 0.0 10.0 10.0 0.0 10.0 0.0 0.0ZM20.0 20.0L50.0 20.0 50.0 50.0 20.0 50.0 20.0 20.0Z
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0.0 0.0 50.0 50.0">
+  <path d="M0.0 0.0L10.0 0.0 10.0 10.0 0.0 10.0 0.0 0.0ZM20.0 20.0L50.0 20.0 50.0 50.0 20.0 50.0 20.0 20.0Z"/>
+</svg>
+M10.0 10.0C20.0 20.0 30.0 30.0 40.0 40.0Q50.0 50.0 60.0 60.0
+M10.0 10.0L30.0 10.0 30.0 30.0 10.0 30.0 10.0 10.0ZM50.0 10.0L60.0 20.0
+ring contains Offset(10.0, 10.0): true
+ring contains Offset(30.0, 30.0): false
+ring contains Offset(70.0, 70.0): true
+ring contains Offset(90.0, 10.0): false
+clockwise square: Clockwise
+counter-clockwise square: CounterClockwise
+contours: 2: M0.0 0.0L10.0 0.0 10.0 10.0 0.0 10.0 0.0 0.0Z | M20.0 20.0L50.0 20.0 50.0 50.0 20.0 50.0 20.0 20.0Z
+reversed: M60.0 60.0Q50.0 50.0 40.0 40.0C30.0 30.0 20.0 20.0 10.0 10.0

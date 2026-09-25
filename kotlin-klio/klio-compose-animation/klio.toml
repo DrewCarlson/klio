@@ -4,9 +4,8 @@
 # transition and visibility surface (AnimatedVisibility, EnterTransition /
 # ExitTransition, Crossfade, AnimatedContent, the shared-element transitions).
 # Vendored verbatim from compose-multiplatform-core (the sparse submodule hosted
-# by ../klio-compose-runtime). klioMain supplies the platform actuals: the fling
-# friction constant and the density-aware spline decay. A dependency of
-# compose.foundation and material3.
+# by ../klio-compose-runtime), with the non-Android and non-JVM actuals. A
+# dependency of compose.foundation and material3.
 [library]
 id = "androidx.compose.animation"
 version = "1.12.0"
@@ -18,8 +17,13 @@ auto_bindings = true
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/animation/animation/src/commonMain/kotlin"
 
+# nonAndroidMain: the default decay and the spline-based fling decay;
+# nonJvmMain: the JVM-default marker.
 [[source]]
-root = "klioMain"
+root = "../klio-compose-runtime/upstream/compose/animation/animation/src/nonAndroidMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/animation/animation/src/nonJvmMain/kotlin"
 
 [deps]
 stdlib = "*"

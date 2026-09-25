@@ -99,7 +99,17 @@ include = [
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui-text/src/skikoMain/kotlin"
 include = [
+    "androidx/compose/ui/text/TextDecorationLineStyle.kt",
     "androidx/compose/ui/text/input/PlatformTextInputService2.kt",
+]
+
+# nonJvmMain: the atomic reference, the annotated string transform, the gap
+# buffer's char copy and the JVM-default marker. Its code-point direction
+# helpers ask skia's ICU and wait for the skia binding layer.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-text/src/nonJvmMain/kotlin"
+exclude = [
+    "androidx/compose/ui/text/CharHelpers.nonJvm.kt",
 ]
 
 [[source]]

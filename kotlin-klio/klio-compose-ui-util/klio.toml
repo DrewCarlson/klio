@@ -2,9 +2,8 @@
 # vendored verbatim from the compose-multiplatform-core submodule. One klio pack
 # per upstream Gradle module: this is the leaf `androidx.compose.ui.util` package
 # the geometry / unit / graphics modules build on (packFloats/lerp/fastCoerceIn,
-# the fast list helpers, the inline-class bit helpers). The klioMain layer
-# supplies the platform `expect` actuals (float-bit helpers, fastRoundToInt,
-# no-op tracing).
+# the fast list helpers, the inline-class bit helpers), with the non-JVM
+# actuals. klioMain supplies the no-op tracing the desktop target has.
 [library]
 id = "androidx.compose.ui.util"
 version = "1.12.0"
@@ -26,7 +25,11 @@ include = [
     "androidx/compose/ui/InternalComposeUiApi.kt",
 ]
 
-# klioMain: the platform `expect` actuals (float bits, fastRoundToInt, tracing).
+# nonJvmMain: the float/double bit helpers every non-JVM target shares.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-util/src/nonJvmMain/kotlin"
+
+# klioMain: tracing, a no-op as on the desktop target.
 [[source]]
 root = "klioMain"
 
