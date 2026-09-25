@@ -424,12 +424,12 @@ pub const UnitState = enum(u8) { idle, running, done, failed };
 /// Per VM run: owned by the host, reached by `host.resolvedState()` behind
 /// a shared handle, so every thread of the run sees one set of statics.
 pub const ResolvedState = struct {
-    /// By StaticId. Read with `loadStatic`, which takes no lock; written with
-    /// `storeStatic` under the state's exclusive borrow.
+    /// By StaticId. Read with `loadStatic` and written with `storeStatic`,
+    /// neither of which takes the state's lock.
     statics: []Value,
     /// Odd while a static store is in flight. A read copies a static between
     /// two equal even readings, so it never pairs one store's tag with
-    /// another's payload; stores take turns under the exclusive borrow.
+    /// another's payload; stores take turns on it.
     static_seq: std.atomic.Value(u32) = .init(0),
     /// By init unit.
     unit_state: []UnitState,
@@ -453,8 +453,16 @@ pub const ResolvedState = struct {
     /// By ClassId: the objects whose initialization threw, with what it
     /// threw, which every later use throws for.
     failed_objects: std.AutoHashMapUnmanaged(u32, Value) = .empty,
-    /// The identity the next instance takes.
-    next_identity: u64 = 0,
+    /// The identity the last instance took; `takeIdentity` advances it.
+    next_identity: std.atomic.Value(u64) = .init(0),
+
+    /// The next instance's identity. A counter no tracer reads, so it takes
+    /// neither the state's lock nor its write barrier: under the barrier,
+    /// every instance made would have the next collection retrace the whole
+    /// state, statics and singletons and all.
+    pub fn takeIdentity(self: *ResolvedState) u64 {
+        return self.next_identity.fetchAdd(1, .monotonic) + 1;
+    }
 
     /// Static `i`, copied whole. The collector never runs inside
     /// `storeStatic`, which holds no safe point.
@@ -480,10 +488,24 @@ pub const ResolvedState = struct {
     }
 
     /// Stores `v` in static `i` and answers the value it replaced, taking no
-    /// reference. The caller holds the state's exclusive borrow.
+    /// reference and no lock: stores take turns on the sequence. A value
+    /// that holds a cell records the barrier for this static alone, so the
+    /// next collection retraces the statics stored since the last one and
+    /// not the whole state; a scalar makes no edge and records nothing. The
+    /// remembered set is read only inside a stop, and no stop falls between
+    /// the barrier and the store.
     pub fn storeStatic(self: *ResolvedState, i: usize, v: Value) Value {
-        const seq = self.static_seq.load(.monotonic);
-        self.static_seq.store(seq + 1, .monotonic);
+        const h = self.cellHdr();
+        if (h.gc_gen != 0 and !v.isPrimitive()) runtime.gc.writeBarrierAt(h, i, traceStaticsRange);
+        var seq = self.static_seq.load(.monotonic);
+        while (true) {
+            if (seq & 1 == 0) {
+                seq = self.static_seq.cmpxchgWeak(seq, seq + 1, .acquire, .monotonic) orelse break;
+            } else {
+                std.atomic.spinLoopHint();
+                seq = self.static_seq.load(.monotonic);
+            }
+        }
         const old = self.statics[i];
         // Release stores: a read that sees either word also sees the odd sequence.
         const src: *const [2]u64 = @ptrCast(&v);
@@ -494,8 +516,23 @@ pub const ResolvedState = struct {
         return old;
     }
 
+    fn cellHdr(self: *ResolvedState) *runtime.gc.GcHeader {
+        const cb: *StateRef.Cell = @alignCast(@fieldParentPtr("data", self));
+        return &cb.hdr;
+    }
+
+    /// Statics `lo` through `hi` of the state whose cell is `h`, read as
+    /// `loadStatic` reads them: a mark may run beside a store.
+    fn traceStaticsRange(h: *runtime.gc.GcHeader, m: *runtime.gc.Marker, lo: u32, hi: u32) void {
+        const cb: *StateRef.Cell = @fieldParentPtr("hdr", @as(*align(16) runtime.gc.GcHeader, @alignCast(h)));
+        const self = &cb.data;
+        if (lo >= self.statics.len) return;
+        const end = @min(self.statics.len, @as(usize, hi) + 1);
+        for (lo..end) |i| self.loadStatic(i).gcMark(m);
+    }
+
     pub fn gcTrace(self: *const ResolvedState, m: *runtime.gc.Marker) void {
-        for (self.statics) |v| v.gcMark(m);
+        for (0..self.statics.len) |i| self.loadStatic(i).gcMark(m);
         for (self.singletons) |s| if (s) |v| v.gcMark(m);
         for (self.unit_failure) |f| if (f) |v| v.gcMark(m);
         var it = self.lambdas.valueIterator();
@@ -732,6 +769,51 @@ test "a static store is read back whole, and the sequence is even between stores
     try std.testing.expectEqual(Value{ .Int = 0 }, old);
     try std.testing.expectEqual(Value{ .Long = -5 }, s.loadStatic(0));
     try std.testing.expectEqual(@as(u32, 2), s.static_seq.load(.monotonic));
+}
+
+test "a static store records a barrier over that static alone, and a scalar none" {
+    const a = std.testing.allocator;
+    var statics = [_]StaticRt{
+        .{ .unit = NONE, .seed = .int, .name = "a" },
+        .{ .unit = NONE, .seed = .null_ref, .name = "b" },
+        .{ .unit = NONE, .seed = .null_ref, .name = "c" },
+    };
+    const r: Resolved = .{ .statics = &statics };
+    const st = try stateNew(a, &r);
+    defer st.deinit();
+    const hdr = &st.cell.hdr;
+    defer runtime.gc.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(runtime.gc.GcHeader) }});
+    hdr.gc_gen = 1;
+    hdr.gc_remembered = false;
+    const s = &st.cell.data;
+    _ = s.storeStatic(0, .{ .Int = 9 });
+    try std.testing.expect(!hdr.gc_remembered);
+    try std.testing.expectEqual(@as(u16, 0), hdr.gc_range);
+    const text = try runtime.strInit(a, "kept");
+    defer text.deinit();
+    _ = s.storeStatic(2, .{ .String = text });
+    // Remembered by range, not whole: a minor retraces static 2 alone.
+    try std.testing.expect(!hdr.gc_remembered);
+    try std.testing.expect(hdr.gc_range != 0);
+    var m: runtime.gc.Marker = .{ .epoch = 77, .arena = a };
+    defer m.grey.deinit(a);
+    ResolvedState.traceStaticsRange(hdr, &m, 2, 2);
+    try std.testing.expectEqual(@as(usize, 77), text.cell.hdr.gc_mark);
+    _ = s.storeStatic(2, .Null);
+}
+
+test "an identity is taken without the state's lock or barrier" {
+    const a = std.testing.allocator;
+    const r: Resolved = .{};
+    const st = try stateNew(a, &r);
+    defer st.deinit();
+    const hdr = &st.cell.hdr;
+    defer runtime.gc.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(runtime.gc.GcHeader) }});
+    hdr.gc_gen = 1;
+    hdr.gc_remembered = false;
+    try std.testing.expectEqual(@as(u64, 1), st.cell.data.takeIdentity());
+    try std.testing.expectEqual(@as(u64, 2), st.cell.data.takeIdentity());
+    try std.testing.expect(!hdr.gc_remembered);
 }
 
 test "a primitive value's class comes from the host table" {

@@ -412,6 +412,7 @@ pub const Vm = struct {
     pub const new = run_mod.vmNew;
     pub const makeHost = run_mod.vmMakeHost;
     pub const runThreadBlock = run_mod.vmRunThreadBlock;
+    pub const runTimerService = run_mod.vmRunTimerService;
     pub const run = run_mod.vmRun;
     pub const deinit = run_mod.vmDeinit;
     // Embedder entry points: prepare startup, then invoke functions or methods.

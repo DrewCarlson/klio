@@ -112,10 +112,7 @@ fn valueClass(comptime H: type, host: *H, r: *const Resolved, v: *const Value) ?
 
 /// The next instance's identity from the run state.
 pub fn nextIdentity(st: StateRef) u64 {
-    const g = st.borrowMut();
-    defer g.deinit();
-    g.get().next_identity += 1;
-    return g.get().next_identity;
+    return st.cell.data.takeIdentity();
 }
 
 /// Runs `func` over `params`: its native when the tables bind one, else its
@@ -837,13 +834,17 @@ fn initThread() u64 {
 }
 
 /// One round of waiting for another thread's initializer, as a contended
-/// monitor waits: spin, then yield, then sleep. A sleep is a region the
-/// collector does not wait for.
+/// monitor waits: spin, then yield, then sleep. A yield or a sleep is a
+/// region the collector does not wait for: the initializer's thread may be
+/// the one collecting, and a waiter yielding outside the bracket would hold
+/// its rendezvous open.
 fn initWait(rounds: *u32) void {
     rounds.* +|= 1;
     if (rounds.* <= 256) {
         std.atomic.spinLoopHint();
     } else if (rounds.* <= 2048) {
+        runtime.gc.enterBlockingSafe();
+        defer runtime.gc.exitBlockingSafe();
         std.Thread.yield() catch {};
     } else if (rounds.* <= 4096) {
         runtime.clockSleepMicros(100);
@@ -1023,12 +1024,7 @@ pub inline fn storeReadyStatic(comptime H: type, a: Allocator, frame: *const Fra
     const unit = r.statics[static].unit;
     if (unit != ir.resolved.NONE and !unitDone(st, unit)) return false;
     v.retain();
-    const old = blk: {
-        const g = st.borrowMut();
-        defer g.deinit();
-        break :blk g.get().storeStatic(static, v);
-    };
-    old.release(a);
+    st.cell.data.storeStatic(static, v).release(a);
     return true;
 }
 
@@ -1081,12 +1077,7 @@ pub fn execStoreStatic(comptime H: type, a: Allocator, frame: *Frame, x: anytype
     if (try ensureUnit(H, a, frame, host, r, st, r.statics[i].unit)) |e| return raiseStep(frame, e);
     const v = frame.read(x.value);
     v.retain();
-    const old = blk: {
-        const g = st.borrowMut();
-        defer g.deinit();
-        break :blk g.get().storeStatic(i, v);
-    };
-    old.release(a);
+    st.cell.data.storeStatic(i, v).release(a);
     return .cont;
 }
 

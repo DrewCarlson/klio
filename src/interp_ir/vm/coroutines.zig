@@ -559,6 +559,249 @@ pub fn drainVirtualClock() void {
     VirtualClock.drainAll();
 }
 
+// The timer thread, klio's `DefaultExecutor`. The pool dispatchers' delays and
+// timeouts wait here, on one long-lived pump, instead of on the pump of the
+// dispatched task that scheduled them: a task waiting out its own timer holds
+// its worker until the timer ends, and a `limitedParallelism` view whose only
+// worker is held that way cannot run the resume the timer dispatches to it.
+// Posts arrive from any thread; the pump takes them each turn and parks each
+// block on its own timer. The thread starts on the first post of a run and is
+// stopped at the run boundary, dropping any timer still pending, as the JVM's
+// daemon executor is.
+const TimerService = struct {
+    const State = enum { idle, starting, running, closed };
+
+    var mutex: SpinMutex = .{};
+    /// Blocks posted and not yet taken by the pump. Each carries its post's
+    /// reference, and under `Virtual` counts as unsettled until taken.
+    var pending: std.ArrayList(Value) = .empty;
+    /// The live pump's wakeup, rung on every post; null while none runs.
+    var wakeup: ?ObjRef(DriverWakeup) = null;
+    var state: State = .idle;
+    var thread: ?std.Thread = null;
+    var fork_handler_installed = std.atomic.Value(bool).init(false);
+
+    fn allocator() Allocator {
+        return std.heap.smp_allocator;
+    }
+
+    fn hasPending() bool {
+        mutex.lock();
+        defer mutex.unlock();
+        return pending.items.len != 0;
+    }
+
+    fn stopping() bool {
+        mutex.lock();
+        defer mutex.unlock();
+        return state == .closed;
+    }
+
+    /// Moves every posted block onto `top`'s launch queue. Under `Virtual` the
+    /// pump then holds the barrier at its current instant, which orders the
+    /// blocks, so they stop counting as unsettled.
+    fn drainInto(top: *CooperativeInterceptor) Allocator.Error!void {
+        var n: usize = 0;
+        {
+            mutex.lock();
+            defer mutex.unlock();
+            n = pending.items.len;
+            if (n == 0) return;
+            try top.launched.appendSlice(top.allocator, pending.items);
+            pending.clearRetainingCapacity();
+        }
+        if (pumpDiagEnabled()) std.debug.print("[timer] take n={d}\n", .{n});
+        if (top.mode == .Virtual) {
+            top.claimNow();
+            for (0..n) |_| VirtualClock.settle();
+        }
+    }
+
+    fn attach(w: *const ObjRef(DriverWakeup)) void {
+        mutex.lock();
+        defer mutex.unlock();
+        if (wakeup) |old| {
+            var o = old;
+            o.deinit();
+        }
+        wakeup = w.clone();
+    }
+
+    fn detach() void {
+        mutex.lock();
+        const old = wakeup;
+        wakeup = null;
+        mutex.unlock();
+        if (old) |o| {
+            var ow = o;
+            ow.deinit();
+        }
+    }
+
+    fn ringPump() void {
+        const w: ObjRef(DriverWakeup) = blk: {
+            mutex.lock();
+            defer mutex.unlock();
+            break :blk (wakeup orelse return).clone();
+        };
+        defer {
+            var ww = w;
+            ww.deinit();
+        }
+        w.asPtr().gate.ring();
+    }
+
+    /// A forked child has no timer thread and starts its own on its first post.
+    /// Blocks pending at the fork stay with the parent.
+    fn goneInChild() callconv(.c) void {
+        mutex = .{};
+        pending = .empty;
+        wakeup = null;
+        state = .idle;
+        thread = null;
+    }
+};
+
+/// What a post asks of the poster.
+pub const TimerPost = enum {
+    /// Queued for the running pump, or for one already starting.
+    posted,
+    /// Queued, and the caller must start the thread (`timerThreadStarted`).
+    start,
+    /// Dropped: the run is at its boundary.
+    dropped,
+};
+
+/// Queues `block` for the timer thread.
+pub fn timerPost(block: Value) Allocator.Error!TimerPost {
+    ensureCoroGlobalRoot();
+    const outcome: TimerPost = blk: {
+        TimerService.mutex.lock();
+        defer TimerService.mutex.unlock();
+        if (TimerService.state == .closed) break :blk .dropped;
+        try TimerService.pending.append(TimerService.allocator(), block);
+        if (runtime.reclaimEnabled()) block.retain();
+        if (root.coroutineTimeMode() == .Virtual) VirtualClock.enterUnsettled();
+        if (TimerService.state == .idle) {
+            TimerService.state = .starting;
+            break :blk .start;
+        }
+        break :blk .posted;
+    };
+    if (pumpDiagEnabled()) std.debug.print("[timer] post {s}\n", .{@tagName(outcome)});
+    if (outcome == .posted) TimerService.ringPump();
+    return outcome;
+}
+
+/// Records the thread a `.start` post spawned; `null` when the spawn failed,
+/// which drops what the thread would have run.
+pub fn timerThreadStarted(handle: ?std.Thread) void {
+    if (handle != null and !TimerService.fork_handler_installed.swap(true, .acq_rel)) {
+        _ = std.c.pthread_atfork(null, null, TimerService.goneInChild);
+    }
+    TimerService.mutex.lock();
+    defer TimerService.mutex.unlock();
+    if (handle) |h| {
+        TimerService.thread = h;
+        TimerService.state = .running;
+        return;
+    }
+    TimerService.state = .idle;
+    dropPendingLocked();
+}
+
+fn dropPendingLocked() void {
+    for (TimerService.pending.items) |b| {
+        if (root.coroutineTimeMode() == .Virtual) VirtualClock.settle();
+        if (runtime.reclaimEnabled()) b.release(TimerService.allocator());
+    }
+    TimerService.pending.clearRetainingCapacity();
+}
+
+/// Run boundary: stop the timer thread, dropping every timer it still holds,
+/// and refuse posts until `timerServiceReopen`. Waits out a start in flight.
+pub fn timerServiceStop() void {
+    const handle: ?std.Thread = blk: {
+        while (true) {
+            TimerService.mutex.lock();
+            if (TimerService.state != .starting) break;
+            TimerService.mutex.unlock();
+            std.Thread.yield() catch {};
+        }
+        defer TimerService.mutex.unlock();
+        TimerService.state = .closed;
+        const h = TimerService.thread;
+        TimerService.thread = null;
+        break :blk h;
+    };
+    TimerService.ringPump();
+    if (handle) |h| {
+        // Blocked, the joining thread counts as parked for a collection the
+        // timer thread starts before it sees the stop.
+        runtime.gc.enterBlockingSafe();
+        h.join();
+        runtime.gc.exitBlockingSafe();
+    }
+    TimerService.mutex.lock();
+    defer TimerService.mutex.unlock();
+    dropPendingLocked();
+}
+
+/// Accept posts again; the next one starts a fresh thread.
+pub fn timerServiceReopen() void {
+    TimerService.mutex.lock();
+    defer TimerService.mutex.unlock();
+    if (TimerService.state == .closed) TimerService.state = .idle;
+}
+
+/// The timer thread's body: one pump that takes posted blocks and waits for
+/// more when it has nothing to run or time. A failure inside the pump is the
+/// run's first error, as a failed pool task's is, and a fresh pump takes over.
+pub fn driveTimerService(self: anytype, out: Output) Allocator.Error!void {
+    const a = self.allocator;
+    const unit: Value = .Unit;
+    while (!TimerService.stopping()) {
+        try coroPush(a);
+        coroTop().?.timer_service = true;
+        TimerService.attach(&coroTop().?.wakeup);
+        var root_token: ?u64 = null;
+        var root_value: ?Value = null;
+        const outcome: ?RuntimeEvalResult = while (true) {
+            if (try pumpLoop(self, &unit, out, true, false, &root_token, &root_value)) |r| break r;
+            if (TimerService.stopping()) break null;
+            // Idle: wait for a post, a resume or the stop, each of which rings
+            // the gate. The epoch is read before the checks, so none is missed.
+            const gp: *runtime.EventGate = blk: {
+                const w = coroTop().?.wakeup.borrowMut();
+                defer w.deinit();
+                break :blk &w.get().gate;
+            };
+            const seen = gp.epochNow();
+            if (TimerService.hasPending() or TimerService.stopping()) continue;
+            const has_resume = blk: {
+                const w = coroTop().?.wakeup.borrowMut();
+                defer w.deinit();
+                break :blk w.get().mailboxNonEmpty();
+            };
+            if (has_resume) continue;
+            gp.waitFrom(seen, 100_000);
+        };
+        TimerService.detach();
+        if (outcome) |r| {
+            // The pump has exited already.
+            if (!TimerService.stopping()) switch (r) {
+                .err => |e| {
+                    if (pumpDiagEnabled()) std.debug.print("[timer] pump failed: {any}\n", .{e});
+                    vmhost.scheduler.noteTaskError(e);
+                },
+                .ok => {},
+            };
+            continue;
+        }
+        try pumpExit(self, out, true);
+    }
+}
+
 pub fn registerSlotOwner(slot: i64, wakeup: *const ObjRef(DriverWakeup)) Allocator.Error!void {
     // The insert publishes this cell to worker threads, which `borrowMut` it to post
     // resumes concurrently with this driver's pump under the cell's reader/writer
@@ -669,6 +912,8 @@ pub const CooperativeInterceptor = struct {
     /// A failure from an activation that ran inline, outside the drive loop. The
     /// loop cannot see it there, so it is raised on the next turn.
     pending_err: ?EvalError = null,
+    /// The timer thread's pump, which takes posted timer blocks each turn.
+    timer_service: bool = false,
     allocator: Allocator,
 
     /// Under `Virtual`, seeds `virtual_now` from the shared clock so a coroutine
@@ -955,9 +1200,11 @@ pub const CooperativeInterceptor = struct {
     /// Publish only on change: idle pumps otherwise republish the same floor every
     /// round and serialise on the barrier lock. A pump joins on its first finite one.
     fn publishFloor(self: *CooperativeInterceptor, floor: i64) void {
-        // A publish point means the body has parked, so a dispatched pool task is
-        // no longer unsettled: its floor now orders it.
-        if (pool_task_unsettled) {
+        // A finite floor means the body has parked on a timer, so a dispatched
+        // pool task is no longer unsettled: the floor now orders it. An
+        // indefinite one orders nothing: an idle pump about to exit hands
+        // control back to its task, which runs on.
+        if (pool_task_unsettled and floor != INDEFINITE) {
             pool_task_unsettled = false;
             VirtualClock.settle();
         }
@@ -1067,7 +1314,8 @@ pub const CooperativeInterceptor = struct {
                             const nonempty = blk: {
                                 const w = self.wakeup.borrowMut();
                                 defer w.deinit();
-                                break :blk w.get().mailboxNonEmpty();
+                                break :blk w.get().mailboxNonEmpty() or
+                                    (self.timer_service and TimerService.hasPending());
                             };
                             if (!nonempty) {
                                 const cap_us: u64 = @min(@as(u64, @intCast(wait)) * 1_000, 2_000);
@@ -1201,6 +1449,12 @@ fn gcMarkCoroGlobal(m: *runtime.gc.Marker) void {
         while (it.next()) |v| v.gcMark(m);
     }
     SlotOwners.mutex.unlock();
+
+    // Timer blocks posted and not yet taken, and the timer pump's wakeup.
+    TimerService.mutex.lock();
+    for (TimerService.pending.items) |v| v.gcMark(m);
+    if (TimerService.wakeup) |w| m.shade(&w.cell.hdr);
+    TimerService.mutex.unlock();
 
     if (runtime.gc.gc_debug) {
         const so = if (SlotOwners.map) |sm| sm.count() else 0;
@@ -1819,7 +2073,8 @@ fn pumpLoop(
         diag_loops += 1;
         // A deadlocked pump idles in this loop's sleep arms, never the eval loop,
         // so the test runner's watchdog must fire here.
-        if (diag_loops % 64 == 0) {
+        // The timer thread serves every test in turn and answers to none's cap.
+        if (diag_loops % 64 == 0 and !(coroTop().?).timer_service) {
             const wall_dl = ir.eval.test_wall_deadline_ms.load(.monotonic);
             if (wall_dl != 0 and ir.eval.nowMonotonicMs() > wall_dl) {
                 std.debug.print("[wall-cap] pump wall-clock deadline exceeded — stalled pump state follows:\n", .{});
@@ -1871,11 +2126,13 @@ fn pumpLoop(
             }
         }
         // 0. A pool task's pump still running at the run boundary exits through
-        //    the protocol.
-        if (runtime.shouldAbandon()) {
+        //    the protocol, and so does the timer thread's once it is stopped.
+        if (runtime.shouldAbandon() or ((coroTop().?).timer_service and TimerService.stopping())) {
             try pumpExit(self, out, persist);
             return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
         }
+        // 0a. The timer thread's posted blocks join its launch queue.
+        if ((coroTop().?).timer_service) try TimerService.drainInto(coroTop().?);
 
         // 0b. Anything still queued or parked when the root coroutine completes is
         //     outside its job tree and dies with the pump.
@@ -2031,7 +2288,12 @@ fn pumpLoop(
         //     can post its cancellation. Never break, the timer is real work.
         if (barrier_blocked) {
             countSleep(.barrier_yield);
+            // Counted parked while it yields: this loop evaluates nothing, so
+            // it reaches no safe point, and the pump holding the barrier may
+            // itself be parked for a collection waiting on this thread.
+            runtime.gc.enterBlockingSafe();
             std.Thread.yield() catch sleepMillis(1);
+            runtime.gc.exitBlockingSafe();
             continue;
         }
 
@@ -2075,6 +2337,11 @@ fn pumpLoop(
                         return .{ .err = mapDriverErr(a, pe) };
                     }
                 }
+            }
+            // Waiting only on another thread, a pool task orders nothing.
+            if (pool_task_unsettled) {
+                pool_task_unsettled = false;
+                VirtualClock.settle();
             }
             countSleep(.root_parked);
             gateWaitBrief(&wakeup, 1_000);
@@ -2130,6 +2397,16 @@ fn pumpExit(self: anytype, out: Output, persist: bool) Allocator.Error!void {
             g.deinit();
         }
         ww.deinit();
+    }
+    // A pool task that runs on past its last pump holds the virtual clock
+    // again until it parks on another or ends: it may start more work, as a
+    // `limitedParallelism` worker does with the next runnable in its queue,
+    // and that work's first timer must register before any pump jumps past it.
+    if (coro_stack.items.len == 0 and vmhost.scheduler.onPoolWorker() and
+        !pool_task_unsettled and root.coroutineTimeMode() == .Virtual)
+    {
+        pool_task_unsettled = true;
+        VirtualClock.enterUnsettled();
     }
     if (orphan_launched.len != 0) {
         if (coroTop()) |below| {
@@ -3096,6 +3373,27 @@ test "slot owner registry routes lookups and clears on release" {
 // `setPendingSlot` registers an arena-backed clone in the process-global
 // registry, and an error-path exit pops without `releaseOwnedSlots`, so
 // `drainSlotOwners` must empty it before the arena reset frees the cell.
+test "the first timer post of a run starts the timer thread, and the run boundary drops what is pending" {
+    timerServiceStop();
+    timerServiceReopen();
+    try testing.expectEqual(TimerPost.start, try timerPost(.Unit));
+    // A start in flight: a later post only queues behind it.
+    try testing.expectEqual(TimerPost.posted, try timerPost(.Unit));
+    try testing.expect(TimerService.hasPending());
+    // The spawn failed: its blocks are dropped and the next post starts again.
+    timerThreadStarted(null);
+    try testing.expect(!TimerService.hasPending());
+    try testing.expectEqual(TimerPost.start, try timerPost(.Unit));
+    timerThreadStarted(null);
+    // Closed at the boundary, a post is dropped until the service reopens.
+    timerServiceStop();
+    try testing.expectEqual(TimerPost.dropped, try timerPost(.Unit));
+    try testing.expect(!TimerService.hasPending());
+    timerServiceReopen();
+    try testing.expectEqual(TimerPost.start, try timerPost(.Unit));
+    timerThreadStarted(null);
+}
+
 test "drainSlotOwners clears registry entries an error path left behind" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

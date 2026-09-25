@@ -44,6 +44,33 @@ Two invariants underneath the table, both learned from failures:
 The failure-vs-cancellation pair is one `throw` apart and the two fixtures
 exist so that a change collapsing them is caught.
 
+### Pool timers wait on the timer thread
+
+`Dispatchers.Default` and `Dispatchers.IO`, and every `limitedParallelism`
+view of them (whose `Delay` delegates to the dispatcher it views), schedule
+their delays and `withTimeout` gates on one timer thread
+(`kotlinx.coroutines.DefaultExecutor`, `TimerService` in
+`src/interp_ir/vm/coroutines.zig`), as the JVM schedules them on
+`DefaultExecutor`. The thread runs one long-lived pump; `__kxco_spawnTimer`
+posts a timer block to it from any thread, the pump takes posted blocks each
+turn and parks each on its own timer, and a fired block resumes its
+continuation, which dispatches to the pool as any resume does. A cancelled
+delay disposes its gate and the block ends at once.
+
+The invariant: **a dispatched task never waits out a timer it scheduled.**
+Its pump runs until nothing is ready, launched or timed, so a timer on it
+kept the task, and the task's worker, until the timer fired. A
+`limitedParallelism(1)` view has one worker, and the resume a timer or a
+completer dispatches to the view waits for that worker, so a
+`withTimeout { delay() }` or `withTimeout { join() }` on it resumed only
+after its own timeout fired. Pinned by `tl_limited_timeout`, which fails
+every case without the timer thread.
+
+The thread starts on a run's first post and stops at the run boundary,
+before the pool, dropping any timer still pending: a stopped pool never
+receives a resume a timer fires. `runBlocking`'s own dispatcher keeps its
+timers on its pump, which is the event loop they belong to.
+
 ---
 
 ## STATUS 2026-06-27 — verified current state and remaining work

@@ -273,19 +273,34 @@ fn markingThreadMain() void {
     }
 }
 
+/// Starts the marking thread if it has not started; false when it cannot.
+/// A collection calls this before it raises its stop, so the spawn, which
+/// takes milliseconds on a loaded machine, is never part of a pause.
+fn startMarkingThread() bool {
+    if (comptime !has_marking_thread) return false;
+    const mt = &marking_thread;
+    mt.sync.lock();
+    defer mt.sync.unlock();
+    return startMarkingThreadLocked(mt);
+}
+
+fn startMarkingThreadLocked(mt: *MarkingThread) bool {
+    if (mt.started) return true;
+    const t = std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, markingThreadMain, .{}) catch return false;
+    t.detach();
+    mt.started = true;
+    installForkHandler();
+    return true;
+}
+
 /// Hands the major just begun to the marking thread, starting the thread
-/// first if need be. False when it could not start. World stopped.
+/// first if it has not started. False when it could not start. World stopped.
 fn wakeMarkingThread() bool {
     if (comptime !has_marking_thread) return false;
     const mt = &marking_thread;
     mt.sync.lock();
     defer mt.sync.unlock();
-    if (!mt.started) {
-        const t = std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, markingThreadMain, .{}) catch return false;
-        t.detach();
-        mt.started = true;
-        installForkHandler();
-    }
+    if (!startMarkingThreadLocked(mt)) return false;
     mt.wanted = true;
     mt.sync.broadcast();
     return true;
@@ -568,7 +583,12 @@ fn retrace(marker: *Marker, whole: []const *GcHeader, spans: []const Span, only_
     var counts: RememberedCounts = .{};
     for (whole) |h| {
         if (only_marked and h.gc_mark != marker.epoch) continue;
-        h.gc_trace(h, marker);
+        if (rem_top) {
+            const t = clock_mod.monotonicNanos();
+            const g = marker.grey.items.len;
+            h.gc_trace(h, marker);
+            remTopNote(h, clock_mod.monotonicNanos() - t, marker.grey.items.len -| g);
+        } else h.gc_trace(h, marker);
         counts.whole += 1;
     }
     for (spans) |sp| {
@@ -578,6 +598,73 @@ fn retrace(marker: *Marker, whole: []const *GcHeader, spans: []const Span, only_
         counts.span_len += sp.hi - sp.lo + 1;
     }
     return counts;
+}
+
+/// `KLIO_GC_REM_TOP`: a collection whose retrace of whole remembered cells
+/// takes over a millisecond prints the payload types that took it
+/// (`[kgc-rem]`): cells, time, and the children they shaded.
+pub var rem_top: bool = false;
+const RemTop = struct { ty: ?[*:0]const u8 = null, n: usize = 0, ns: u64 = 0, shaded: usize = 0, largest_ns: u64 = 0, largest: ?*GcHeader = null };
+var rem_top_rows: [32]RemTop = @splat(.{});
+
+/// Cells whose whole retrace took over 200 us: the next barrier that
+/// remembers one prints the stack that stored into it (`[kgc-rem-store]`).
+var rem_watch: [8]?*GcHeader = @splat(null);
+
+fn remWatch(h: *GcHeader) void {
+    for (&rem_watch) |*w| {
+        if (w.* == h) return;
+    }
+    for (&rem_watch) |*w| {
+        if (w.* == null) {
+            w.* = h;
+            return;
+        }
+    }
+}
+
+fn remWatchHit(h: *GcHeader) void {
+    for (&rem_watch) |*w| {
+        if (w.* != h) continue;
+        w.* = null;
+        std.debug.print("[kgc-rem-store] a whole-cell barrier on {s} {*}, which a retrace found large:\n", .{ h.gc_type, h });
+        trace.dumpCurrent(.{});
+        return;
+    }
+}
+
+fn remTopNote(h: *GcHeader, ns: u64, shaded: usize) void {
+    if (ns > 200 * std.time.ns_per_us) remWatch(h);
+    for (&rem_top_rows) |*r| {
+        if (r.n == 0) r.ty = h.gc_type;
+        if (r.ty != h.gc_type) continue;
+        r.n += 1;
+        r.ns += ns;
+        r.shaded += shaded;
+        if (ns > r.largest_ns) {
+            r.largest_ns = ns;
+            r.largest = h;
+        }
+        return;
+    }
+}
+
+fn remTopReport(epoch: usize, kind: []const u8) void {
+    std.mem.sort(RemTop, &rem_top_rows, {}, struct {
+        fn gt(_: void, a: RemTop, b: RemTop) bool {
+            return a.ns > b.ns;
+        }
+    }.gt);
+    for (rem_top_rows[0..@min(6, rem_top_rows.len)]) |r| {
+        if (r.n == 0) break;
+        std.debug.print("[kgc-rem] epoch={d} kind={s} type={s} cells={d} us={d} shaded={d} largest_us={d} largest={*}\n", .{
+            epoch, kind, r.ty.?, r.n, r.ns / 1000, r.shaded, r.largest_ns / 1000, r.largest,
+        });
+    }
+}
+
+fn remTopClear() void {
+    rem_top_rows = @splat(.{});
 }
 
 pub const RememberedCounts = struct {
@@ -597,6 +684,7 @@ fn writeBarrierSlow(h: *GcHeader) void {
     defer remembered_lock.unlock();
     if (h.gc_remembered) return;
     h.gc_remembered = true;
+    if (rem_top) remWatchHit(h);
     if (rememberTraceOn()) {
         std.debug.print("[gc-remember] h={*} gen={d} type={s} program_started={}\n", .{ h, h.gc_gen, h.gc_type, program_started });
     }
@@ -1135,6 +1223,11 @@ fn endStop() void {
 
 var parked_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
+/// Mutators counted parked by a blocking-safe bracket now.
+pub fn parkedCount() usize {
+    return parked_count.load(.seq_cst);
+}
+
 /// Whether fewer than `others` mutators are parked for the stop now raised.
 /// A thread leaving a blocking bracket moves from the bracket count to the
 /// stop's, so the stop's count is read first: read the other way round, a
@@ -1179,6 +1272,7 @@ pub fn enterMutator() void {
         if (!stopRaised()) {
             is_mutator = true;
             _ = mutators.fetchAdd(1, .acq_rel);
+            lateRegister();
             mutator_lock.unlock();
             return;
         }
@@ -1199,6 +1293,7 @@ pub fn exitMutator() void {
         if (!stopRaised()) {
             is_mutator = false;
             _ = mutators.fetchSub(1, .acq_rel);
+            lateUnregister();
             mutator_lock.unlock();
             return;
         }
@@ -1319,7 +1414,92 @@ fn waitStopEnd(gen: ?u32) void {
 
 /// The collector's side of the rendezvous.
 fn awaitRendezvous(others: usize) void {
+    if (has_late_dump and late_ms != 0) return awaitRendezvousLate(others);
     waitOut(&rendezvous_gate, rendezvousShort, others);
+}
+
+// `KLIO_GC_LATE=<ms>`: a rendezvous still short after this long has every
+// other mutator print its native stack (`[gc-late]`). A parked thread shows the
+// park; a late one shows what it runs without reaching a safe point.
+
+const has_late_dump = builtin.link_libc and !builtin.single_threaded and
+    (builtin.os.tag == .macos or builtin.os.tag == .linux);
+
+pub var late_ms: u64 = 0;
+const late_cap = 128;
+/// The mutators' threads, kept only while `late_ms` is set. Written under
+/// `mutator_lock`.
+var late_threads: [late_cap]?std.c.pthread_t = @splat(null);
+var late_print_lock: SpinLock = .{};
+var late_handler_installed: bool = false;
+
+fn lateRegister() void {
+    if (comptime !has_late_dump) return;
+    if (late_ms == 0) return;
+    const me = std.c.pthread_self();
+    for (&late_threads) |*slot| {
+        if (slot.* == null) {
+            slot.* = me;
+            return;
+        }
+    }
+}
+
+fn lateUnregister() void {
+    if (comptime !has_late_dump) return;
+    if (late_ms == 0) return;
+    const me = std.c.pthread_self();
+    for (&late_threads) |*slot| {
+        if (slot.*) |t| if (t == me) {
+            slot.* = null;
+            return;
+        };
+    }
+}
+
+fn lateHandler(_: std.c.SIG) callconv(.c) void {
+    late_print_lock.lock();
+    defer late_print_lock.unlock();
+    std.debug.print("[gc-late] thread {d} park_depth={d} blocking_safe={d}\n", .{ currentTid(), park_depth, blocking_safe_depth });
+    trace.dumpCurrent(.{});
+}
+
+/// The rendezvous with the late report: spins and yields while short, and once
+/// `late_ms` has passed signals every other registered mutator to print.
+fn awaitRendezvousLate(others: usize) void {
+    if (comptime !has_late_dump) return;
+    if (!late_handler_installed) {
+        late_handler_installed = true;
+        var act = std.posix.Sigaction{
+            .handler = .{ .handler = lateHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        std.posix.sigaction(.USR2, &act, null);
+    }
+    const t0 = clock_mod.monotonicNanos();
+    var reported = false;
+    var rounds: u32 = 0;
+    while (rendezvousShort(others)) : (rounds +%= 1) {
+        if (rounds < spin_rounds) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+        if (reported or clock_mod.monotonicNanos() - t0 < late_ms * std.time.ns_per_ms) continue;
+        reported = true;
+        std.debug.print("[gc-late] rendezvous short after {d} ms: {d} of {d} counted ({d} stopped, {d} in brackets)\n", .{
+            late_ms, stoppedCount() + parked_count.load(.seq_cst), others, stoppedCount(), parked_count.load(.seq_cst),
+        });
+        const me = std.c.pthread_self();
+        mutator_lock.lock();
+        for (late_threads) |slot| {
+            const t = slot orelse continue;
+            if (t == me) continue;
+            _ = std.c.pthread_kill(t, .USR2);
+        }
+        mutator_lock.unlock();
+    }
 }
 
 fn parkPublish() void {
@@ -1433,6 +1613,10 @@ fn collectImpl(force_major: bool) void {
     // threshold math reads them.
     flushExternalDelta();
 
+    // A major this collection may begin runs on the marking thread, started
+    // here while the mutators still run.
+    if (major_mode == .concurrent and spanningMajors()) _ = startMarkingThread();
+
     // Timed only under `KLIO_GC_DEBUG`, which reports each phase.
     const t_raise: u64 = if (gc_debug) clock_mod.monotonicNanos() else 0;
 
@@ -1503,6 +1687,10 @@ fn collectImpl(force_major: bool) void {
     if (kind != .major) rem = traceRememberedIf(marker, kind == .remark);
     if (kind == .remark) rem.add(retrace(marker, mm.dirty.items, mm.dirty_spans.items, true));
     const t_rem: u64 = if (gc_debug) clock_mod.monotonicNanos() else 0;
+    if (rem_top) {
+        if (gc_debug and t_rem - t_roots > std.time.ns_per_ms) remTopReport(marker.epoch, kindName(kind));
+        remTopClear();
+    }
     const marked = marker.drainCounted();
     const t_marked: u64 = if (gc_debug) clock_mod.monotonicNanos() else 0;
     if (verifyOn()) {

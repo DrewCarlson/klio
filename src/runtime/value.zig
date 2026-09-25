@@ -2090,6 +2090,19 @@ pub const Value = union(enum) {
         }
     };
 
+    /// A number or a boolean: the tags up to `Bool`, one compare. Every one of
+    /// them is primitive; `Char` and `Null` are too but answer false here.
+    pub inline fn isNumberOrBool(self: Value) bool {
+        comptime {
+            for (std.meta.fields(std.meta.Tag(Value))) |f| {
+                if (f.value <= @intFromEnum(std.meta.Tag(Value).Bool) and
+                    !(Value.isPrimitive(@unionInit(Value, f.name, undefined))))
+                    @compileError("a tag up to Bool is not primitive: " ++ f.name);
+            }
+        }
+        return @intFromEnum(std.meta.activeTag(self)) <= @intFromEnum(std.meta.Tag(Value).Bool);
+    }
+
     /// Listed conservatively, so a heap variant omitted here still takes the
     /// full path rather than leaking.
     pub inline fn isPrimitive(self: Value) bool {

@@ -334,6 +334,9 @@ fn ivCoroutineLaunch(ctx: *anyopaque, block: *const Value, scope: *const Value, 
 fn ivCoroutineSpawnTimeout(ctx: *anyopaque, block: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineSpawnTimeout(ip(ctx), block, out);
 }
+fn ivCoroutineSpawnTimer(ctx: *anyopaque, block: *const Value, out: Output) Allocator.Error!?RuntimeError {
+    return intrinsic_host.coroutineSpawnTimer(ip(ctx), block, out);
+}
 fn ivCoroutineArmSlot(ctx: *anyopaque, slot: i64) void {
     intrinsic_host.coroutineArmSlot(ip(ctx), slot);
 }
@@ -430,6 +433,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .coroutine_has_driver = ivCoroutineHasDriver,
     .coroutine_launch = ivCoroutineLaunch,
     .coroutine_spawn_timeout = ivCoroutineSpawnTimeout,
+    .coroutine_spawn_timer = ivCoroutineSpawnTimer,
     .coroutine_arm_slot = ivCoroutineArmSlot,
     .coroutine_disarm_slot = ivCoroutineDisarmSlot,
     .coroutine_last_root_parked_once = ivCoroutineLastRootParkedOnce,

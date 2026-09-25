@@ -94,6 +94,18 @@ fn monitorEnterMon(mon: *Monitor) bool {
         mon.depth += 1;
         return true;
     }
+    if (mon.owner.cmpxchgWeak(0, me, .acquire, .monotonic) == null) {
+        mon.depth = 1;
+        return true;
+    }
+    // Contended. The wait touches only the monitor, never the heap, so the
+    // thread counts as parked for a collection throughout: the owner may be
+    // collecting inside its critical section, and a waiter that spun or
+    // yielded outside the bracket held that collection's rendezvous open
+    // until the owner came back, which a stopped owner never does. Leaving
+    // the bracket waits out a collection in progress.
+    runtime.gc.enterBlockingSafe();
+    defer runtime.gc.exitBlockingSafe();
     var rounds: u32 = 0;
     while (true) {
         if (mon.owner.cmpxchgWeak(0, me, .acquire, .monotonic) == null) {
@@ -102,8 +114,7 @@ fn monitorEnterMon(mon: *Monitor) bool {
         }
         // The owner runs an arbitrary interpreted body, so the wait is
         // unbounded: spin briefly, then yield, then park at a millisecond
-        // cadence. A pure spin loop saturates every core under contention,
-        // and the sleep brackets the GC blocking-safe region.
+        // cadence. A pure spin loop saturates every core under contention.
         if (runtime.shouldAbandon()) return false;
         rounds +|= 1;
         if (rounds <= 512) {
@@ -405,6 +416,45 @@ test "tryEnter fails while another thread holds the monitor" {
     holder.join();
     try testing.expect(try monitorTryEnter(key));
     try testing.expect(try monitorExit(key));
+}
+
+test "a thread waiting on a contended monitor counts as parked throughout the wait" {
+    const gc = runtime.gc;
+    const was_enabled = gc.gc_enabled;
+    gc.gc_enabled = true;
+    defer gc.gc_enabled = was_enabled;
+    const key: usize = 0xBEEF03;
+    try testing.expect(try monitorEnter(key));
+    const base = gc.parkedCount();
+
+    const Waiter = struct {
+        fn run(k: usize, waiting: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            gc.enterMutator();
+            defer gc.exitMutator();
+            waiting.store(true, .release);
+            if (monitorEnter(k) catch false) _ = monitorExit(k) catch {};
+            done.store(true, .release);
+        }
+    };
+    var waiting = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ key, &waiting, &done });
+    while (!waiting.load(.acquire)) std.Thread.yield() catch {};
+    // Counted once the waiter finds the monitor held, and then without a
+    // gap: a waiter spinning or yielding outside the bracket would hold a
+    // collection's rendezvous open while the owner collects.
+    var spins: usize = 0;
+    while (gc.parkedCount() == base) : (spins += 1) {
+        try testing.expect(spins < 10_000_000);
+        std.atomic.spinLoopHint();
+    }
+    var i: usize = 0;
+    while (i < 200_000) : (i += 1) try testing.expectEqual(base + 1, gc.parkedCount());
+    try testing.expect(!done.load(.acquire));
+    try testing.expect(try monitorExit(key));
+    t.join();
+    try testing.expect(done.load(.acquire));
+    try testing.expectEqual(base, gc.parkedCount());
 }
 
 test "lock bindings acquire and release through the receiver identity" {

@@ -240,6 +240,57 @@ pub fn coroutineSpawnTimeout(self: *VmIntrinsicHost, block: *const Value, out: O
     return coroutines.coroutineSpawnTimeout(self, block, out);
 }
 
+/// Post a pool dispatcher's timer block to the timer thread, starting the
+/// thread on the run's first post.
+pub fn coroutineSpawnTimer(self: *VmIntrinsicHost, block: *const Value, out: Output) Allocator.Error!?RuntimeError {
+    _ = out;
+    switch (try coroutines.timerPost(block.*)) {
+        .posted, .dropped => return null,
+        .start => {},
+    }
+    const args: TimerThreadArgs = .{
+        .seed = spawnSeed(self),
+        .time_mode = root.coroutineTimeMode(),
+        .reclaim = runtime.reclaimEnabled(),
+    };
+    const handle = std.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, timerThreadEntry, .{args}) catch null;
+    coroutines.timerThreadStarted(handle);
+    if (handle == null) {
+        // The seed's handles release through a child Vm's teardown.
+        if (args.seed.materialize()) |vm_in| {
+            var vm = vm_in;
+            vm.deinit();
+        } else |_| {}
+        return .{ .Type = "failed to start the coroutine timer thread" };
+    }
+    return null;
+}
+
+const TimerThreadArgs = struct {
+    seed: SendableVmSeed,
+    time_mode: root.TimeMode,
+    reclaim: bool,
+};
+
+fn timerThreadEntry(args: TimerThreadArgs) void {
+    runtime.enterThreadStack(runtime.WORKER_STACK_SIZE);
+    const tid = std.Thread.getCurrentId();
+    runtime.setThreadName(tid, "kotlinx.coroutines.DefaultExecutor");
+    defer runtime.clearThreadName(tid);
+    defer runtime.slab.flushMagazines();
+    root.setCoroutineTimeMode(args.time_mode);
+    runtime.setReclaim(args.reclaim);
+    coroutines.gcThreadEnter();
+    defer coroutines.gcThreadExit();
+    // A resume the thread runs inline is user code, which the run boundary
+    // must be able to stop.
+    runtime.setThreadAbandonable(true);
+    defer runtime.setThreadAbandonable(false);
+    var vm = args.seed.materialize() catch return;
+    defer vm.deinit();
+    vm.runTimerService() catch {};
+}
+
 pub fn coroutineArmSlot(self: *VmIntrinsicHost, slot: i64) void {
     coroutines.coroutineArmSlot(self, slot);
 }

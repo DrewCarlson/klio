@@ -254,6 +254,9 @@ pub const IntrinsicHost = struct {
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         /// Null runs it eagerly, like a launch with no pump.
         coroutine_spawn_timeout: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
+        /// Schedules a pool dispatcher's timer block on the host's timer thread.
+        /// Null means the host has none.
+        coroutine_spawn_timer: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_arm_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_disarm_slot: ?*const fn (ctx: *anyopaque) void = null,
         coroutine_last_root_parked_once: ?*const fn (ctx: *anyopaque) bool = null,
@@ -370,6 +373,15 @@ pub const IntrinsicHost = struct {
             .ok => null,
             .err => |e| e,
         };
+    }
+
+    pub fn hasTimerThread(self: IntrinsicHost) bool {
+        return self.vtable.coroutine_spawn_timer != null;
+    }
+
+    /// Only for a host with a timer thread (`hasTimerThread`).
+    pub fn coroutineSpawnTimer(self: IntrinsicHost, block: *const Value, out: Output) !?RuntimeError {
+        return self.vtable.coroutine_spawn_timer.?(self.ctx, block, out);
     }
 
     pub fn coroutineArmSlot(self: IntrinsicHost, slot: i64) void {

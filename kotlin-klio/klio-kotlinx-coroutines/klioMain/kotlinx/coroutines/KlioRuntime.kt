@@ -1,14 +1,16 @@
 // klio dispatchers for the upstream kotlinx-coroutines runtime.
 // Each `runBlocking` owns a cooperative pump on its calling OS
 // thread. `KlioDispatcher` posts work back onto that pump via
-// `__kxco_spawn` (`Unconfined`, `Main`, internal delay continuations).
+// `__kxco_spawn` (`Unconfined`, `Main`, internal delay continuations),
+// and its delays and timeouts wait on that pump.
 // `KlioDefaultDispatcher` posts each Runnable onto a real worker
 // thread via `__kxco_dispatch`, so `async(Dispatchers.Default)` /
 // `launch(Dispatchers.Default)` execute bodies in parallel; the
 // worker's completion `resumeWith` routes back to the awaiter's
-// pump through a cross-thread mailbox in the runtime. Delay
-// scheduling stays on the cooperative virtual clock through
-// `__kxco_spawn`.
+// pump through a cross-thread mailbox in the runtime. The Default
+// and IO dispatchers' delays and timeouts wait on the timer thread
+// (`__kxco_spawnTimer`), as the JVM's wait on `DefaultExecutor`, so a
+// worker never waits out a timer it scheduled.
 
 package kotlinx.coroutines
 
@@ -19,6 +21,9 @@ internal fun __kxco_spawn(block: () -> Unit) {}
 // so the host re-homes the gate onto the pump of the undispatched block it
 // cancels (they share one timer queue), letting the earliest deadline fire.
 internal fun __kxco_spawnTimeout(block: () -> Unit) {}
+// Schedule `block` on the timer thread. A host without one schedules it as
+// `__kxco_spawnTimeout` (`timeout`) or `__kxco_spawn` would.
+internal fun __kxco_spawnTimer(timeout: Boolean, block: () -> Unit) {}
 internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
 // `__kxco_dispatch` onto the elastic blocking-work view of the pool.
@@ -142,8 +147,8 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
 // the shared worker pool's Default view (parallelism `max(2, nproc)`)
 // via `__kxco_dispatch`; multiple bodies under
 // `async(Dispatchers.Default) { … }` execute in parallel through
-// the loom-verified value model. Delay scheduling stays on the
-// cooperative virtual clock by routing through `__kxco_spawn`.
+// the loom-verified value model. Its delays and timeouts wait on the
+// timer thread.
 internal object KlioDefaultDispatcher : CoroutineDispatcher(), Delay {
     override fun dispatch(context: CoroutineContext, block: Runnable) {
         __kxco_dispatch { block.run() }
@@ -152,30 +157,13 @@ internal object KlioDefaultDispatcher : CoroutineDispatcher(), Delay {
     override fun scheduleResumeAfterDelay(
         timeMillis: Long,
         continuation: CancellableContinuation<Unit>
-    ) {
-        __kxco_spawn {
-            __kxco_delayMillis(timeMillis)
-            continuation.resumeWith(Result.success(Unit))
-        }
-    }
+    ) = scheduleTimerResume(timeMillis, continuation)
 
     override fun invokeOnTimeout(
         timeMillis: Long,
         block: Runnable,
         context: CoroutineContext
-    ): DisposableHandle {
-        val gate = TimeoutGate(block)
-        __kxco_spawnTimeout {
-            if (!gate.isDisposed()) {
-                val slot = __kxco_newSlot()
-                gate.bindSlot(slot)
-                __kxco_armSlot(slot)
-                __kxco_delayMillis(timeMillis)
-                gate.fire()
-            }
-        }
-        return gate
-    }
+    ): DisposableHandle = scheduleTimerGate(timeMillis, block)
 }
 
 // Blocking-work dispatcher: the elastic view over the same worker pool
@@ -191,29 +179,52 @@ internal object KlioIoDispatcher : CoroutineDispatcher(), Delay {
     override fun scheduleResumeAfterDelay(
         timeMillis: Long,
         continuation: CancellableContinuation<Unit>
-    ) {
-        __kxco_spawn {
-            __kxco_delayMillis(timeMillis)
-            continuation.resumeWith(Result.success(Unit))
-        }
-    }
+    ) = scheduleTimerResume(timeMillis, continuation)
 
     override fun invokeOnTimeout(
         timeMillis: Long,
         block: Runnable,
         context: CoroutineContext
-    ): DisposableHandle {
-        val gate = TimeoutGate(block)
-        __kxco_spawnTimeout {
-            if (!gate.isDisposed()) {
-                val slot = __kxco_newSlot()
-                gate.bindSlot(slot)
-                __kxco_armSlot(slot)
-                __kxco_delayMillis(timeMillis)
-                gate.fire()
-            }
+    ): DisposableHandle = scheduleTimerGate(timeMillis, block)
+}
+
+// The pool dispatchers' `Delay`, which `limitedParallelism` views share:
+// the wait runs on the timer thread, not on the worker that scheduled it.
+// A dispatched task waiting out its own timer would hold its worker, and a
+// `limitedParallelism(1)` view has only that worker to run the resume the
+// timer dispatches, so the resume would wait for the timer's own end. A
+// cancelled delay disposes its gate, which ends the wait at once.
+private fun scheduleTimerResume(timeMillis: Long, continuation: CancellableContinuation<Unit>) {
+    val gate = TimeoutGate(ResumeAfterDelay(continuation))
+    __kxco_spawnTimer(false) {
+        if (!gate.isDisposed()) {
+            val slot = __kxco_newSlot()
+            gate.bindSlot(slot)
+            __kxco_armSlot(slot)
+            __kxco_delayMillis(timeMillis)
+            gate.fire()
         }
-        return gate
+    }
+    continuation.disposeOnCancellation(gate)
+}
+
+private fun scheduleTimerGate(timeMillis: Long, block: Runnable): DisposableHandle {
+    val gate = TimeoutGate(block)
+    __kxco_spawnTimer(true) {
+        if (!gate.isDisposed()) {
+            val slot = __kxco_newSlot()
+            gate.bindSlot(slot)
+            __kxco_armSlot(slot)
+            __kxco_delayMillis(timeMillis)
+            gate.fire()
+        }
+    }
+    return gate
+}
+
+private class ResumeAfterDelay(private val continuation: CancellableContinuation<Unit>) : Runnable {
+    override fun run() {
+        continuation.resumeWith(Result.success(Unit))
     }
 }
 

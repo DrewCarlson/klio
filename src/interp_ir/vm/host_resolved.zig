@@ -189,10 +189,7 @@ pub fn mintInstanceId(self: *VmHost) u64 {
 }
 
 fn nextIdentity(st: ir.resolved.StateRef) u64 {
-    const g = st.borrowMut();
-    defer g.deinit();
-    g.get().next_identity += 1;
-    return g.get().next_identity;
+    return st.cell.data.takeIdentity();
 }
 
 /// Object `class`'s instance, made and constructed on first use, as

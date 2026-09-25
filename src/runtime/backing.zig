@@ -43,6 +43,10 @@ pub fn configureGcFromEnv() void {
     if (objcell.envOnce("KLIO_GC_SLICE")) |v| {
         if (std.fmt.parseInt(usize, v, 10) catch null) |n| gc.slice_budget = @max(n, 1);
     }
+    if (envOn("KLIO_GC_REM_TOP")) |v| gc.rem_top = v;
+    if (objcell.envOnce("KLIO_GC_LATE")) |v| {
+        gc.late_ms = std.fmt.parseInt(u64, v, 10) catch 0;
+    }
     if (objcell.envOnce("KLIO_GC_MAJOR_EVERY")) |v| {
         gc.major_every = std.fmt.parseInt(usize, v, 10) catch 0;
     }

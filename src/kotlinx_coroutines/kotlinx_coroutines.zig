@@ -328,6 +328,31 @@ fn spawnTimeoutBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .Unit };
 }
 
+/// Schedules a pool dispatcher's delay or timeout wait on the timer thread. A
+/// host without one schedules it as `__kxco_spawnTimeout` (a timeout) or
+/// `__kxco_spawn` (a delay) would.
+fn spawnTimerBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) {
+        return .{ .err = .{ .Type = "__kxco_spawnTimer: expected the timeout flag and the timer block" } };
+    }
+    const timeout = switch (ctx.args[0]) {
+        .Bool => |b| b,
+        else => return .{ .err = .{ .Type = "__kxco_spawnTimer: the first argument must be Boolean" } },
+    };
+    const lam = ctx.args[1];
+    if (ctx.host.hasTimerThread()) {
+        if (try ctx.host.coroutineSpawnTimer(&lam, ctx.out)) |e| return .{ .err = e };
+        return .{ .ok = .Unit };
+    }
+    if (timeout) {
+        if (try ctx.host.coroutineSpawnTimeout(&lam, ctx.out)) |e| return .{ .err = e };
+        return .{ .ok = .Unit };
+    }
+    const scope = (try ctx.host.wellKnownObject(.global_scope)) orelse Value.Null;
+    if (try ctx.host.coroutineLaunch(&lam, &scope, ctx.out)) |e| return .{ .err = e };
+    return .{ .ok = .Unit };
+}
+
 /// Post a `Dispatchers.Default` runnable onto the shared worker pool. The body,
 /// its captures and its result cross threads, each shared cell mediating access
 /// through its own reader/writer lock.
@@ -453,6 +478,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_schedulerDrainCount", .f = schedulerDrainCount },
     .{ .fqn = "kotlinx.coroutines.__kxco_spawn", .f = spawnLaunchBlock },
     .{ .fqn = "kotlinx.coroutines.__kxco_spawnTimeout", .f = spawnTimeoutBlock },
+    .{ .fqn = "kotlinx.coroutines.__kxco_spawnTimer", .f = spawnTimerBlock },
     .{ .fqn = "kotlinx.coroutines.__kxco_dispatch", .f = dispatchCoroutine },
     .{ .fqn = "kotlinx.coroutines.internal.synchronizedImpl", .f = synchronizedImpl },
     .{ .fqn = "kotlinx.coroutines.internal.__kxco_systemProp", .f = kxcoSystemProp },

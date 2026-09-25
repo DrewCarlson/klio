@@ -55,6 +55,12 @@ pub fn vmMakeHost(self: *Vm, out: Output) VmHost {
     return VmHost.borrowed(sharedHandles(self), out);
 }
 
+/// The timer thread's body over this Vm's handles.
+pub fn vmRunTimerService(self: *Vm) Allocator.Error!void {
+    var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
+    try vmhost.coroutines.driveTimerService(&intrinsic, self.out_sink.output());
+}
+
 pub fn vmRunThreadBlock(self: *Vm, block: *const Value) Allocator.Error!runtime.EvalResult {
     // The intrinsic host borrows the child Vm's handles by value for this one call.
     var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
@@ -305,12 +311,7 @@ pub fn vmNewResolved(self: *Vm, class: ir.ClassId, ctor: FuncId) Allocator.Error
         return outcomeFromEval(self, try host.callNative(self.allocator, r.func_native[ctor.int()], &.{}));
     }
     const st = self.resolved_state orelse return .{ .failed = "no resolved state" };
-    const identity = blk: {
-        const g = st.borrowMut();
-        defer g.deinit();
-        g.get().next_identity += 1;
-        break :blk g.get().next_identity;
-    };
+    const identity = st.cell.data.takeIdentity();
     const inst = try ir.resolved.instantiate(self.allocator, r, class, identity);
     return vmCallArgs(self, ctor, &.{inst});
 }
@@ -407,9 +408,13 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     defer if (outermost) vmhost.coroutines.drainSlotOwners();
     // The two populations drain in turn: explicit threads (which may post tasks)
     // then the dispatcher pool (whose tasks may spawn threads), until both empty.
+    // The next run's first timer post starts a fresh timer thread.
+    defer if (outermost) vmhost.coroutines.timerServiceReopen();
     while (true) {
         var joined_any = false;
         if (outermost) runtime.requestAbandon();
+        // An explicit thread joined below may still wait on a pool timer.
+        if (outermost) vmhost.coroutines.timerServiceReopen();
         while (true) {
             // Take one handle under the lock and join it without holding the lock,
             // so the worker's own result publication cannot deadlock against it.
@@ -458,6 +463,10 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
             if (!joined_any) break;
             continue;
         }
+        // The timer thread stops before the pool, so no timer it fires can post
+        // to a pool that has shut down; a pool task stopping meanwhile finds
+        // its timer posts dropped.
+        vmhost.coroutines.timerServiceStop();
         const pool_had_work = vmhost.scheduler.outstandingOther() != 0;
         vmhost.scheduler.shutdownAndJoin();
         if (out == .ok) {

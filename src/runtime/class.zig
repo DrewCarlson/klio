@@ -433,21 +433,27 @@ pub const InstanceData = struct {
 
     /// Stores `v` in slot `i` and answers the value it replaced, taking no
     /// reference; null past the slots. Slot stores take no cell lock, so each
-    /// records the write barrier itself. With every collection stopping the
-    /// world, no mark runs between the barrier and the store, so the barrier
-    /// comes first and costs the store nothing more. A mark running beside
-    /// mutators needs the barrier inside the odd sequence, after a
-    /// sequentially consistent turn: then a trace either reads the sequence
-    /// odd and waits for the store, or has marked the instance by the time
-    /// the barrier reads it.
+    /// records the write barrier itself, and only for a value that holds a
+    /// cell: a scalar makes no edge for a minor to find or a major to retrace.
+    /// The barrier may come before the store because the remembered set is
+    /// read only inside a stop, and no stop falls between the two.
     pub fn storeSlot(self: *InstanceData, i: usize, v: Value) ?Value {
         if (i >= self.slots.len) return null;
-        gc_mod.writeBarrier(self.cellHdr());
+        recordStore(self.cellHdr(), v);
         const seq = self.holdStores();
         const old = self.slots[i];
         writeWhole(&self.slots[i], v);
         self.slot_seq.store(seq + 2, .release);
         return old;
+    }
+
+    /// The write barrier for storing `v` into the instance whose cell is `h`:
+    /// a nursery instance needs none, and a number or a boolean makes no
+    /// edge. That test is one compare; a char or null, which make no edge
+    /// either, record the barrier as a reference does.
+    inline fn recordStore(h: *gc_mod.GcHeader, v: Value) void {
+        if (h.gc_gen == 0 or v.isNumberOrBool()) return;
+        gc_mod.writeBarrier(h);
     }
 
     /// Takes the store turn: the even sequence it made odd.
@@ -475,10 +481,9 @@ pub const InstanceData = struct {
     /// Holds off every other store to the instance's slots until `end`, for
     /// a read-modify-write no store may split. Reads on other threads wait
     /// for the end; the holder must not read the instance through
-    /// `loadSlot` meanwhile, and must reach no safe point. The write barrier
-    /// is recorded here, for every store the update makes.
+    /// `loadSlot` meanwhile, and must reach no safe point. Each store the
+    /// update makes records its own barrier, as `storeSlot` does.
     pub fn beginUpdate(self: *InstanceData) SlotUpdate {
-        gc_mod.writeBarrier(self.cellHdr());
         return .{ .data = self, .seq = self.holdStores() };
     }
 
@@ -492,7 +497,9 @@ pub const InstanceData = struct {
 
         /// As `InstanceData.set`.
         pub fn set(self: SlotUpdate, name: []const u8, v: Value) bool {
-            writeWhole(&self.data.slots[self.data.slotIndex(name) orelse return false], v);
+            const slot = &self.data.slots[self.data.slotIndex(name) orelse return false];
+            recordStore(self.data.cellHdr(), v);
+            writeWhole(slot, v);
             return true;
         }
 
@@ -500,6 +507,7 @@ pub const InstanceData = struct {
         pub fn store(self: SlotUpdate, allocator: std.mem.Allocator, name: []const u8, v: Value) bool {
             const slot = &self.data.slots[self.data.slotIndex(name) orelse return false];
             const old = slot.*;
+            recordStore(self.data.cellHdr(), v);
             writeWhole(slot, v);
             if (objcell.reclaimEnabled()) old.release(allocator);
             return true;
@@ -934,38 +942,49 @@ test "ensureNativeState creates once and returns the same payload" {
     try testing.expectEqual(@as(u32, 99), InstanceData.nativeStatePtr(Payload, second).n);
 }
 
-test "every slot store path records the barrier on a tenured instance" {
+test "every slot store path records the barrier for a reference and none for a scalar" {
     const allocator = testing.allocator;
     var fx = try ClassFixture.build(allocator, "Holder", &.{}, &.{}, &.{});
     defer fx.deinit(allocator);
     const layout = [_]LayoutSlot{.{ .name = "x" }};
     fx.ptr().layout_slots = &layout;
+    const text = try value_mod.strInit(allocator, "held");
+    defer text.deinit();
     const Case = enum { set, store, update_set, update_store };
-    for ([_]Case{ .set, .store, .update_set, .update_store }) |case| {
-        const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{.Null}, 0);
-        defer inst.deinit();
-        const hdr = &inst.cell.hdr;
-        defer gc_mod.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(gc_mod.GcHeader) }});
-        hdr.gc_gen = 1;
-        hdr.gc_remembered = false;
-        // The payload pointer, as a host op holding no borrow has it.
-        const d = &inst.cell.data;
-        const name = "x";
-        switch (case) {
-            .set => try testing.expect(d.set(name, .{ .Int = 1 })),
-            .store => try testing.expect(d.store(allocator, name, .{ .Int = 2 })),
-            .update_set => {
-                const u = d.beginUpdate();
-                defer u.end();
-                try testing.expect(u.set(name, .{ .Int = 3 }));
-            },
-            .update_store => {
-                const u = d.beginUpdate();
-                defer u.end();
-                try testing.expect(u.store(allocator, name, .{ .Int = 4 }));
-            },
+    for ([_]bool{ true, false }) |reference| {
+        for ([_]Case{ .set, .store, .update_set, .update_store }) |case| {
+            const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{.Null}, 0);
+            defer inst.deinit();
+            const hdr = &inst.cell.hdr;
+            defer gc_mod.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(gc_mod.GcHeader) }});
+            hdr.gc_gen = 1;
+            hdr.gc_remembered = false;
+            // The payload pointer, as a host op holding no borrow has it.
+            const d = &inst.cell.data;
+            const name = "x";
+            const v: Value = if (reference) .{ .String = text } else .{ .Int = 1 };
+            switch (case) {
+                .set => try testing.expect(d.set(name, v)),
+                // A store releases what it replaced, so the slot starts null
+                // and ends without the reference it borrowed.
+                .store => {
+                    try testing.expect(d.store(allocator, name, v));
+                    d.slots[0] = .Null;
+                },
+                .update_set => {
+                    const u = d.beginUpdate();
+                    defer u.end();
+                    try testing.expect(u.set(name, v));
+                },
+                .update_store => {
+                    const u = d.beginUpdate();
+                    defer u.end();
+                    try testing.expect(u.store(allocator, name, v));
+                    d.slots[0] = .Null;
+                },
+            }
+            try testing.expectEqual(reference, hdr.gc_remembered);
         }
-        try testing.expect(hdr.gc_remembered);
     }
 }
 
@@ -983,10 +1002,16 @@ test "a slot store into a tenured instance joins the remembered set" {
     // Past the slots nothing is stored and nothing is remembered.
     try testing.expect(InstanceData.slotSet(inst, 1, .Unit) == null);
     try testing.expect(!hdr.gc_remembered);
+    // A scalar makes no edge, so it is not remembered; a reference is.
     const old = InstanceData.slotSet(inst, 0, .{ .Int = 7 }) orelse return error.TestUnexpectedResult;
     try testing.expect(old == .Null);
-    try testing.expect(hdr.gc_remembered);
+    try testing.expect(!hdr.gc_remembered);
     try testing.expectEqual(@as(i32, 7), InstanceData.slotGet(inst, 0).?.Int);
+    const other = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 1);
+    defer other.deinit();
+    _ = InstanceData.slotSet(inst, 0, .{ .Instance = other }) orelse return error.TestUnexpectedResult;
+    try testing.expect(hdr.gc_remembered);
+    _ = InstanceData.slotSet(inst, 0, .Null);
     try testing.expect(InstanceData.slotGet(inst, 1) == null);
 }
 

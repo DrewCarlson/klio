@@ -600,10 +600,7 @@ fn land(r: ir.eval.EvalResult, what: []const u8) CValue {
 
 fn nextIdentity() u64 {
     const st = vm.resolved_state orelse return 0;
-    const g = st.borrowMut();
-    defer g.deinit();
-    g.get().next_identity += 1;
-    return g.get().next_identity;
+    return st.cell.data.takeIdentity();
 }
 
 /// Builds exception `which` with `message` through the class the program

@@ -406,6 +406,14 @@ pub fn shutdownAndJoin() void {
     global_pool.shutdownAndJoin();
 }
 
+/// Records a failure of the run's own machinery outside any pool task (the
+/// timer thread's), surfaced at the run boundary as a task's would be.
+pub fn noteTaskError(e: RuntimeError) void {
+    global_pool.mutex.lock();
+    defer global_pool.mutex.unlock();
+    if (global_pool.first_error == null) global_pool.first_error = e;
+}
+
 pub fn takeFirstError() ?RuntimeError {
     return global_pool.takeFirstError();
 }
