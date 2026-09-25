@@ -2255,7 +2255,7 @@ fn processLocalStmts(ctx: *Ctx, f: *ast.Function, stmts: []ast.Stmt, outer: []co
                 }
                 ctx.generated_any = true;
                 if (local_gen.items.len != 0) {
-                    const artifacts = try snippetPadded(ctx, local_gen.items);
+                    const artifacts = try snippetPadded(ctx, try qualifyFrameworkNames(ctx.a, local_gen.items));
                     if (dbg) std.debug.print("[serial-pass] local artifacts for {s}:\n{s}\n", .{ c.name.name, local_gen.items });
                     if (parseSplice(ctx, artifacts)) |snip_val| {
                         if (dbg) std.debug.print("[serial-pass] local artifacts parsed: {d} decls\n", .{snip_val.decls.len});
@@ -2646,6 +2646,105 @@ const gen_imports = [_][]const []const u8{
     &.{ "kotlin", "time" },
 };
 
+/// The kotlinx.serialization classifiers and functions generated code names
+/// without qualification.
+const framework_names = [_]struct { name: []const u8, fqn: []const u8 }{
+    .{ .name = "KSerializer", .fqn = "kotlinx.serialization.KSerializer" },
+    .{ .name = "SerializationException", .fqn = "kotlinx.serialization.SerializationException" },
+    .{ .name = "UnknownFieldException", .fqn = "kotlinx.serialization.UnknownFieldException" },
+    .{ .name = "MissingFieldException", .fqn = "kotlinx.serialization.MissingFieldException" },
+    .{ .name = "PolymorphicSerializer", .fqn = "kotlinx.serialization.PolymorphicSerializer" },
+    .{ .name = "SealedClassSerializer", .fqn = "kotlinx.serialization.SealedClassSerializer" },
+    .{ .name = "ContextualSerializer", .fqn = "kotlinx.serialization.ContextualSerializer" },
+    .{ .name = "GeneratedSerializer", .fqn = "kotlinx.serialization.internal.GeneratedSerializer" },
+    .{ .name = "PluginGeneratedSerialDescriptor", .fqn = "kotlinx.serialization.internal.PluginGeneratedSerialDescriptor" },
+    .{ .name = "InlineClassDescriptor", .fqn = "kotlinx.serialization.internal.InlineClassDescriptor" },
+    .{ .name = "ObjectSerializer", .fqn = "kotlinx.serialization.internal.ObjectSerializer" },
+    .{ .name = "throwMissingFieldException", .fqn = "kotlinx.serialization.internal.throwMissingFieldException" },
+    .{ .name = "createSimpleEnumSerializer", .fqn = "kotlinx.serialization.internal.createSimpleEnumSerializer" },
+    .{ .name = "createAnnotatedEnumSerializer", .fqn = "kotlinx.serialization.internal.createAnnotatedEnumSerializer" },
+    .{ .name = "SerialDescriptor", .fqn = "kotlinx.serialization.descriptors.SerialDescriptor" },
+    .{ .name = "Encoder", .fqn = "kotlinx.serialization.encoding.Encoder" },
+    .{ .name = "Decoder", .fqn = "kotlinx.serialization.encoding.Decoder" },
+    .{ .name = "CompositeEncoder", .fqn = "kotlinx.serialization.encoding.CompositeEncoder" },
+    .{ .name = "CompositeDecoder", .fqn = "kotlinx.serialization.encoding.CompositeDecoder" },
+};
+
+/// Explicitly imports each framework name the generated text uses. The
+/// sibling file carries the source file's imports so that the class's own
+/// types resolve, and a user type or a star-imported one named like a
+/// framework type (ktor's `io.ktor.util.Encoder`, say) would otherwise win
+/// over the framework's star imports; an explicit import outranks both. A
+/// name the source file imports explicitly itself is left to that import,
+/// since two explicit imports of one name conflict.
+fn writeFrameworkImports(src: *std.ArrayList(u8), a: Allocator, f: *const ast.KotlinFile, gen: []const u8) Allocator.Error!void {
+    for (framework_names) |entry| {
+        if (!usesIdentifier(gen, entry.name)) continue;
+        const taken = for (f.imports) |imp| {
+            if (imp.wildcard) continue;
+            const simple = if (imp.alias) |al| al.name else if (imp.path.len > 0) imp.path[imp.path.len - 1].name else continue;
+            if (std.mem.eql(u8, simple, entry.name)) break true;
+        } else false;
+        if (taken) continue;
+        try wp(src, a, "import {s}\n", .{entry.fqn});
+    }
+}
+
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// Spells each framework name in generated text by its full name, for code
+/// spliced into the user's own file, where an import would change what the
+/// user's code resolves to. String and character literals and backquoted
+/// names are copied as they are.
+fn qualifyFrameworkNames(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '"' or c == '\'' or c == '`') {
+            // A literal or a backquoted name runs to its closing quote.
+            var j = i + 1;
+            while (j < text.len and text[j] != c) : (j += 1) {
+                if (text[j] == '\\' and c != '`') j += 1;
+            }
+            const end = @min(j + 1, text.len);
+            try out.appendSlice(a, text[i..end]);
+            i = end;
+            continue;
+        }
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            var j = i;
+            while (j < text.len and isIdentByte(text[j])) j += 1;
+            const word = text[i..j];
+            const qualified = i == 0 or text[i - 1] != '.';
+            const fqn = if (qualified) for (framework_names) |entry| {
+                if (std.mem.eql(u8, entry.name, word)) break entry.fqn;
+            } else null else null;
+            try out.appendSlice(a, fqn orelse word);
+            i = j;
+            continue;
+        }
+        try out.append(a, c);
+        i += 1;
+    }
+    return out.items;
+}
+
+/// Whether `name` occurs in `text` as a whole identifier, not after a `.`
+/// (a qualified use needs no import).
+fn usesIdentifier(text: []const u8, name: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, name)) |at| {
+        from = at + name.len;
+        if (at > 0 and (isIdentByte(text[at - 1]) or text[at - 1] == '.' or text[at - 1] == '`')) continue;
+        if (at + name.len < text.len and isIdentByte(text[at + name.len])) continue;
+        return true;
+    }
+    return false;
+}
+
 /// The index over every input file: annotation classes, classifier paths,
 /// class annotations qualified in their declaring scope, and each sealed
 /// parent's subclasses.
@@ -2752,6 +2851,7 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
             }
             try src.appendSlice(a, ".*\n");
         }
+        try writeFrameworkImports(&src, a, f, ctx.gen.items);
         try src.appendSlice(a, "\n");
         try src.appendSlice(a, ctx.gen.items);
         if (dump) std.debug.print("[serial-pass] generated for file {d}:\n{s}\n", .{ f.span.file.int(), src.items });
@@ -3286,4 +3386,46 @@ test "a local class's descriptor carries its own serial-info annotations" {
     try std.testing.expectEqual(@as(usize, 2), calls.len);
     try std.testing.expectEqualStrings("Route(\"/local\")", calls[0]);
     try std.testing.expectEqualStrings("Tag(\"t\")", calls[1]);
+}
+
+test "the generated file imports the framework names it uses explicitly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // The file's own `Encoder` and a star import that could bring another
+    // must not capture the generated serializer's framework types; an
+    // explicit import of `Decoder` in the source is kept as the only one.
+    const gen = try generatedFor(arena.allocator(),
+        \\package demo
+        \\import io.ktor.util.*
+        \\import kotlinx.serialization.*
+        \\import my.codec.Decoder
+        \\interface Encoder
+        \\@Serializable
+        \\data class Point(val x: Int, val y: Int)
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "\nimport kotlinx.serialization.encoding.Encoder\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "\nimport kotlinx.serialization.KSerializer\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "\nimport kotlinx.serialization.internal.GeneratedSerializer\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "\nimport kotlinx.serialization.encoding.Decoder\n") == null);
+    // Names the generated code does not use are not imported.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "import kotlinx.serialization.SealedClassSerializer") == null);
+}
+
+test "qualifyFrameworkNames spells framework names in full outside literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const got = try qualifyFrameworkNames(arena.allocator(),
+        \\override fun serialize(encoder: Encoder, value: P) { addElement("Encoder", false); `Decoder`; x.Encoder; 'E'; throwMissingFieldException(s, 1, d) }
+    );
+    try std.testing.expectEqualStrings(
+        \\override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: P) { addElement("Encoder", false); `Decoder`; x.Encoder; 'E'; kotlinx.serialization.internal.throwMissingFieldException(s, 1, d) }
+    , got);
+}
+
+test "usesIdentifier matches whole unqualified identifiers" {
+    try std.testing.expect(usesIdentifier("fun f(e: Encoder)", "Encoder"));
+    try std.testing.expect(!usesIdentifier("fun f(e: CompositeEncoder)", "Encoder"));
+    try std.testing.expect(!usesIdentifier("fun f(e: kotlinx.serialization.encoding.Encoder)", "Encoder"));
+    try std.testing.expect(!usesIdentifier("val EncoderX = 1", "Encoder"));
+    try std.testing.expect(!usesIdentifier("val `Encoder` = 1", "Encoder"));
 }
