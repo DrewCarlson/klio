@@ -10,259 +10,61 @@ abi = 1
 implicit_packages = []
 auto_bindings = true
 
-# Real upstream ktor-http value types consumed verbatim from the
-# submodule (the start of the upstream-consumption migration).
-# Gated under the `io` feature.
-# Real upstream `io.ktor.utils.io` annotations (`InternalAPI`, `KtorDsl`,
-# `ExperimentalKtorApi`, …) consumed verbatim — pure declarations the rest
-# of ktor's commonMain imports. Gated under the `io` feature.
+# ktor-io: the byte channels, the packet and pool layer, charsets and locks.
+# Common, nonJvm and jvmAndPosix run verbatim. klio replaces, under
+# klioMain/io/ktor/utils/io: `ByteChannel.kt` (a copy with the close-cause
+# rethrow in `awaitContent`), the lock, IO-dispatcher, byte-order and
+# `PosixException` actuals, and the charset codec terminals, which upstream
+# binds to iconv through cinterop. The posix operations over native pointers
+# (`CPointer` reads and writes) have no klio counterpart.
 [[source]]
 root = "upstream/ktor-io/common/src"
-include = [
-    "io/ktor/utils/io/Annotations.kt",
-    "io/ktor/utils/io/Deprecation.kt",
-    "io/ktor/utils/io/core/Input.kt",
-    "io/ktor/utils/io/core/Buffer.kt",
-    "io/ktor/utils/io/core/Strings.kt",
-    "io/ktor/utils/io/core/ByteReadPacket.kt",
-    "io/ktor/utils/io/core/BytePacketBuilder.kt",
-    "io/ktor/utils/io/core/Builder.kt",
-    # Channel layer: the read side (the fully-buffered, non-suspending
-    # `SourceByteReadChannel`, the `ByteReadChannel(bytes/text/source)`
-    # factories, the read operations — the shape a response body is drained
-    # with) and the async write side (the `ByteChannel` Slot state machine +
-    # the write operations). klio supplies the `locks` actuals under
-    # `klioMain`; `DEVELOPMENT_MODE` comes from the posix set below.
-    "io/ktor/utils/io/ByteReadChannel.kt",
-    "io/ktor/utils/io/ByteWriteChannel.kt",
-    "io/ktor/utils/io/BufferedByteWriteChannel.kt",
-    "io/ktor/utils/io/Exceptions.kt",
-    "io/ktor/utils/io/CloseToken.kt",
-    "io/ktor/utils/io/SourceByteReadChannel.kt",
-    "io/ktor/utils/io/ByteChannelCtor.kt",
-    "io/ktor/utils/io/ByteReadChannelOperations.kt",
-    "io/ktor/utils/io/ByteWriteChannelOperations.kt",
-    "io/ktor/utils/io/LineEndingMode.kt",
-    "io/ktor/utils/io/LineEnding.kt",
-    "io/ktor/utils/io/SinkByteWriteChannel.kt",
-    "io/ktor/utils/io/ByteChannelScanner.kt",
-    "io/ktor/utils/io/ByteChannelUtils.kt",
-    "io/ktor/utils/io/CountedByteReadChannel.kt",
-    "io/ktor/utils/io/CountedByteWriteChannel.kt",
-    "io/ktor/utils/io/CloseHookByteWriteChannel.kt",
-    "io/ktor/utils/io/locks/Synchronized.kt",
-    # Engine I/O dispatcher expect (the engine base's default dispatcher).
-    # klio supplies the `Unconfined` actual under `klioMain`.
-    "io/ktor/utils/io/IODispatcher.kt",
-    # Charsets: the expect surface + the encode/decode extension layer.
-    # The class actuals come from the posix set below; klio supplies only
-    # the terminal UTF-8/ISO-8859-1 codec actuals under `klioMain`.
-    "io/ktor/utils/io/charsets/Encoding.kt",
-    "io/ktor/utils/io/core/internal/CharArraySequence.kt",
-    # `ByteOrder`, which the posix charset layer reads for the platform's
-    # UTF-16 byte order.
-    "io/ktor/utils/io/core/ByteOrder.kt",
-    # The object pools `Sink(pool)` and ktor-utils' `ByteArrayPool` users name.
-    "io/ktor/utils/io/pool/Pool.kt",
-    "io/ktor/utils/io/pool/ByteArrayPool.kt",
-    # `JvmSerializable`, the marker ktor-http's `Url`, `Cookie` and
-    # `URLProtocol` implement.
-    "io/ktor/utils/io/JvmSerializable.kt",
-    # `Closeable` (the client engine and plugin instances) and the
-    # `io.ktor.utils.io.errors` aliases the client and server import.
-    "io/ktor/utils/io/core/Closeable.kt",
-    "io/ktor/utils/io/errors/Exceptions.kt",
+exclude = [
+    "io/ktor/utils/io/ByteChannel.kt",
 ]
 
-# ktor-io posix actuals that are pure Kotlin (`DEVELOPMENT_MODE`, the
-# Charset/CharsetEncoder/CharsetDecoder class layer, `DefaultPool`,
-# `JvmSerializable`). The cinterop-bound ones (locks, the iconv codec
-# terminals, `ioDispatcher`) and the ones that read `kotlin.native.Platform`
-# (`ByteOrder`) stay klio-side actuals under `klioMain`.
 [[source]]
 root = "upstream/ktor-io/posix/src"
-include = [
-    "io/ktor/utils/io/ByteChannel.posix.kt",
-    "io/ktor/utils/io/charsets/CharsetNative.kt",
-    "io/ktor/utils/io/pool/DefaultPool.posix.kt",
-    "io/ktor/utils/io/JvmSerializable.posix.kt",
-    "io/ktor/utils/io/core/Closeable.posix.kt",
+exclude = [
+    "io/ktor/utils/io/ByteReadChannelOperations.posix.kt",
+    "io/ktor/utils/io/ByteWriteChannelOperations.posix.kt",
+    "io/ktor/utils/io/IODispatcher.posix.kt",
+    "io/ktor/utils/io/Input.posix.kt",
+    "io/ktor/utils/io/locks/Synchronized.kt",
+    "io/ktor/utils/io/core/ByteOrderNative.kt",
+    "io/ktor/utils/io/core/BytePacketBuilderOperations.posix.kt",
+    "io/ktor/utils/io/errors/PosixErrors.kt",
 ]
 
-# `Source.readText` became an `expect` in 3.5.2; its non-JVM `actual` is the
-# body that used to sit in commonMain.
 [[source]]
 root = "upstream/ktor-io/nonJvm/src"
-include = [
-    "io/ktor/utils/io/core/Strings.nonJvm.kt",
-]
 
-# Upstream `io.ktor.util` string helpers (escapeHTML / quote /
-# toLowerCasePreservingASCIIRules / caseInsensitive …) — self-contained,
-# foundational for the http header/value parsing layer. Gated under `utils`.
+[[source]]
+root = "upstream/ktor-io/jvmAndPosix/src"
+
+# ktor-utils: text and collection helpers, Attributes, the pipeline runtime,
+# dates, crypto, logging and encoders. Common runs verbatim. klio replaces,
+# under klioMain/io/ktor/util, the posix files that reach the platform
+# through cinterop: the nonce source and `Digest` (CryptoNative), the GMTDate
+# clock (DateNative), `KtorSimpleLogger` (its `getenv`), `DISABLE_SFG`
+# (PipelineContext.posix) and the signal-based `ThreadInfo`.
 [[source]]
 root = "upstream/ktor-utils/common/src"
-include = [
-    "io/ktor/util/Text.kt",
-    "io/ktor/util/Charset.kt",
-    "io/ktor/util/Base64.kt",
-    "io/ktor/util/Crypto.kt",
-    "io/ktor/util/Hash.kt",
-    "io/ktor/util/HashFunction.kt",
-    "io/ktor/util/NonceManager.kt",
-    "io/ktor/util/converters/ConversionService.kt",
-    "io/ktor/util/converters/DataConversion.kt",
-    "io/ktor/util/date/Date.kt",
-    "io/ktor/util/date/GMTDateParser.kt",
-    "io/ktor/util/Ranges.kt",
-    "io/ktor/util/ByteChannels.kt",
-    "io/ktor/util/Collections.kt",
-    "io/ktor/util/DelegatingMutableSet.kt",
-    "io/ktor/util/CaseInsensitiveMap.kt",
-    "io/ktor/util/StringValues.kt",
-    "io/ktor/util/reflect/Type.kt",
-    "io/ktor/util/Attributes.kt",
-    # `SilentSupervisor` etc. — the engine base's coroutine context builder.
-    "io/ktor/util/CoroutinesUtils.kt",
-    # PlatformUtils (platform detection / development-mode flag the client
-    # core reads). The posix actuals are consumed below.
-    "io/ktor/util/PlatformUtils.kt",
-    "io/ktor/util/collections/CollectionUtils.kt",
-    "io/ktor/util/collections/ConcurrentMap.kt",
-    "io/ktor/util/collections/ConcurrentSet.kt",
-    "io/ktor/util/collections/CopyOnWriteHashMap.kt",
-    "io/ktor/util/collections/MapDelegates.kt",
-    # GMTDate (request/response timestamps in the cores). klio supplies the
-    # UTC calendar-math actuals + the `getTimeMillis` clock intrinsic.
-    "io/ktor/util/date/Date.kt",
-    # Pipeline runtime (spine of both cores). Engine = DebugPipelineContext
-    # (klio `DISABLE_SFG = true`); SuspendFunctionGun consumed but unused.
-    "io/ktor/util/debug/plugins/PluginName.kt",
-    "io/ktor/util/debug/plugins/PluginsTrace.kt",
-    "io/ktor/util/debug/IntellijIdeaDebugDetector.kt",
-    "io/ktor/util/debug/ContextUtils.kt",
-    "io/ktor/util/pipeline/PipelinePhase.kt",
-    "io/ktor/util/pipeline/PipelinePhaseRelation.kt",
-    "io/ktor/util/pipeline/PhaseContent.kt",
-    "io/ktor/util/pipeline/StackWalkingFailedFrame.kt",
-    "io/ktor/util/pipeline/StackWalkingFailed.kt",
-    "io/ktor/util/pipeline/StackTraceRecover.kt",
-    "io/ktor/util/pipeline/PipelineContext.kt",
-    "io/ktor/util/pipeline/DebugPipelineContext.kt",
-    "io/ktor/util/pipeline/SuspendFunctionGun.kt",
-    "io/ktor/util/pipeline/Pipeline.kt",
-    # The coroutine stack-frame shapes `SuspendFunctionGun` and
-    # `StackWalkingFailedFrame` implement.
-    "io/ktor/util/StackFrames.kt",
-    # `io.ktor.util.internal` (the event bus's handler list, the server's
-    # `initCauseBridge`), `io.ktor.util.cio` (the server's channel
-    # exceptions), `TreeLike` (the routing tree) and `NetworkAddress` (the
-    # client's proxy address).
-    "io/ktor/util/internal/LockFreeLinkedList.kt",
-    "io/ktor/util/internal/ExceptionUtils.kt",
-    "io/ktor/util/cio/Channels.kt",
-    "io/ktor/util/cio/Readers.kt",
-    "io/ktor/util/collections/TreeLike.kt",
-    "io/ktor/util/network/NetworkAddress.kt",
-    # `Throwable.rootCause`, which the client's SSE session reports errors by.
-    "io/ktor/util/Throwable.kt",
-    # Logging (LOGGER in HttpRedirect/HttpSend etc.). `Logger` is an expect
-    # interface; klio supplies the `KtorSimpleLogger` actual (posix uses cinterop).
-    "io/ktor/util/logging/Logger.kt",
-    "io/ktor/util/logging/KtorSimpleLogger.kt",
-]
 
-# Platform `actual`s for the ktor-util `expect`s that are pure common Kotlin
-# on posix: reflect, pipeline, platform detection, `Set.unmodifiable`,
-# `ConcurrentMap` (over the klio locks actuals), and `Attributes` (over
-# `ConcurrentMap`). The cinterop-bound ones (`DISABLE_SFG`, GMTDate,
-# `KtorSimpleLogger`) stay klio-side actuals under `klioMain`.
 [[source]]
 root = "upstream/ktor-utils/posix/src"
-include = [
-    "io/ktor/util/reflect/TypeInfoNative.kt",
-    "io/ktor/util/debug/IntellijIdeaDebugDetectorNative.kt",
-    "io/ktor/util/pipeline/PipelineNative.kt",
-    "io/ktor/util/pipeline/StackTraceRecoverNative.kt",
-    "io/ktor/util/AttributesNative.kt",
-    "io/ktor/util/CollectionsNative.kt",
-    "io/ktor/util/PlatformUtilsNative.kt",
-    "io/ktor/util/collections/ConcurrentMapNative.kt",
-    # Default conversion terminals: pure-null on every non-JVM platform.
-    "io/ktor/util/converters/ConversionServiceNative.kt",
-    # `Logger` actual interface + `LogLevel` enum (pure Kotlin; the cinterop-using
-    # `KtorSimpleLoggerNative` is replaced by `klioMain/.../KtorSimpleLoggerKlio`).
-    "io/ktor/util/logging/LoggerNative.kt",
-    "io/ktor/util/logging/LogLevelNative.kt",
-    # `CoroutineStackFrame` / `StackTraceElement`: no platform stack frames.
-    "io/ktor/util/StackFramesNative.kt",
-    "io/ktor/util/internal/ExceptionUtilsPosix.kt",
-    "io/ktor/util/network/NetworkAddressNative.kt",
+exclude = [
+    "io/ktor/util/CryptoNative.kt",
+    "io/ktor/util/ThreadInfo.kt",
+    "io/ktor/util/date/DateNative.kt",
+    "io/ktor/util/logging/KtorSimpleLoggerNative.kt",
+    "io/ktor/util/pipeline/PipelineContext.posix.kt",
 ]
 
+# ktor-http: URLs, headers, content types, cookies, the body content model,
+# the header grammar and the auth header model, verbatim.
 [[source]]
 root = "upstream/ktor-http/common/src"
-include = [
-    "io/ktor/http/HttpStatusCode.kt",
-    "io/ktor/http/Cookie.kt",
-    "io/ktor/http/CookieUtils.kt",
-    "io/ktor/http/DateUtils.kt",
-    "io/ktor/http/FileContentType.kt",
-    "io/ktor/http/Mimes.kt",
-    "io/ktor/http/HttpUrlEncoded.kt",
-    "io/ktor/http/header/AcceptEncoding.kt",
-    "io/ktor/http/HttpMethod.kt",
-    "io/ktor/http/HttpProtocolVersion.kt",
-    "io/ktor/http/HttpHeaders.kt",
-    "io/ktor/http/HttpHeaderValueParser.kt",
-    "io/ktor/http/HeaderValueWithParameters.kt",
-    "io/ktor/http/ContentTypes.kt",
-    "io/ktor/http/Headers.kt",
-    "io/ktor/http/Parameters.kt",
-    "io/ktor/http/CacheControl.kt",
-    "io/ktor/http/ContentDisposition.kt",
-    "io/ktor/http/ContentTypeMatcher.kt",
-    "io/ktor/http/HttpMessage.kt",
-    "io/ktor/http/HttpMessageProperties.kt",
-    "io/ktor/http/LinkHeader.kt",
-    "io/ktor/http/RequestConnectionPoint.kt",
-    "io/ktor/http/Ranges.kt",
-    "io/ktor/http/ContentRange.kt",
-    "io/ktor/http/RangesSpecifier.kt",
-    "io/ktor/http/Codecs.kt",
-    "io/ktor/http/Query.kt",
-    "io/ktor/http/UrlDecodedParametersBuilder.kt",
-    "io/ktor/http/URLUtils.kt",
-    "io/ktor/http/URLProtocol.kt",
-    "io/ktor/http/URLBuilder.kt",
-    "io/ktor/http/URLParser.kt",
-    "io/ktor/http/Url.kt",
-    # Body content layer (the request/response payload representation both
-    # cores build on): the sealed `OutgoingContent` + the concrete
-    # `TextContent` / `ByteArrayContent`.
-    "io/ktor/http/content/OutgoingContent.kt",
-    "io/ktor/http/content/TextContent.kt",
-    "io/ktor/http/content/ByteArrayContent.kt",
-    "io/ktor/http/content/Multipart.kt",
-    # `ChannelWriterContent` (the server's `respondBytesWriter` and the json
-    # converters' streaming bodies) and `Version` (the server's push builder).
-    "io/ktor/http/content/ChannelWriterContent.kt",
-    "io/ktor/http/content/Versions.kt",
-    # `HeadersBuilder.etag`, which `EntityTagVersion` writes its header with.
-    "io/ktor/http/ApplicationResponseProperties.kt",
-    # Authorization header model (`parseAuthorizationHeader`,
-    # `HttpAuthHeader`) with its enum/constant siblings and the
-    # `ParseException` it throws.
-    "io/ktor/http/auth/AuthScheme.kt",
-    "io/ktor/http/auth/DigestAlgorithm.kt",
-    "io/ktor/http/auth/HeaderValueEncoding.kt",
-    "io/ktor/http/auth/HttpAuthHeader.kt",
-    "io/ktor/http/parsing/ParseException.kt",
-    # `splitHeaderValues`, called by the included `Headers.getSplitValues`.
-    "io/ktor/http/header/utils.kt",
-    # `formUrlEncode`/`formUrlEncodeTo` over parameter entries.
-    "io/ktor/http/HttpUrlEncoded.kt",
-]
 
 # ktor-http-cio: the CIO message parser and multipart reader the client's
 # default response transform reads multipart bodies with. Pure Kotlin on
@@ -276,100 +78,57 @@ root = "upstream/ktor-http/ktor-http-cio/jvmAndPosix/src"
 [[source]]
 root = "upstream/ktor-http/ktor-http-cio/posix/src"
 
-# nonJvm engine loader: the `engines` registry (`append` + iteration) the
-# posix `HttpClient()` actual discovers a default engine through. Gated
-# under the `client-core` feature (see [features]); klio's engine-less actual
-# binds `KlioClient` directly, so the registry is consumed and usable but
-# not the default-engine mechanism.
+# ktor-client-core nonJvm: the `engines` registry the default engine is found
+# through, the timeout exceptions, the engine-dispatcher switch,
+# `unwrapCancellationException` and the static platform config.
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/nonJvm/src"
-include = [
-    "io/ktor/client/engine/Loader.kt",
-    # The timeout exceptions, the engine-dispatcher switch and
-    # `unwrapCancellationException`, pure Kotlin off the JVM.
-    "io/ktor/client/network/sockets/TimeoutExceptions.nonJvm.kt",
-    "io/ktor/client/statement/DispatcherSwitching.nonJvm.kt",
-    "io/ktor/client/utils/ExceptionUtils.nonJvm.kt",
-]
 
-# ktor-client-core posix: the `ProxyConfig` actual over a proxy `Url`, and
-# the default-transform actuals: no platform body types beyond common's, so
-# the request transform declines and the response hook installs nothing.
+# ktor-client-core posix: the `ProxyConfig` actual, the default-transform
+# actuals, the response observer's context and the posix coroutine utils.
+# The engine-less `HttpClient()` is a klio actual (klioMain): upstream's
+# reads the `engines` list that `@EagerInitialization` hooks fill, which klio
+# does not run.
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/posix/src"
-include = [
-    "io/ktor/client/engine/ProxyConfigNative.kt",
-    "io/ktor/client/plugins/DefaultTransformIos.kt",
+exclude = [
+    "io/ktor/client/HttpClient.kt",
 ]
 
-# ktor-client-core jvmAndPosix actuals that are pure Kotlin:
-# `checkContentLength`, the body-size guard the save-body transform reaches.
+# ktor-client-core jvmAndPosix: `checkContentLength` and the Unix-socket
+# request builders.
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/jvmAndPosix/src"
-include = [
-    "io/ktor/client/call/utils.kt",
-]
 
-# Server-sent event model (`ServerSentEvent`) the client SSE session types
-# above are declared against.
+# ktor-sse: the server-sent event model both SSE plugins are built on.
 [[source]]
 root = "upstream/ktor-shared/ktor-sse/common/src"
-include = [
-    "io/ktor/sse/ServerSentEvent.kt",
-]
 
-# WebSocket frame model: `ContentConvertException.kt` declares
-# `WebsocketDeserializeException(frame: Frame)`, so the frame classes ride
-# along (the websocket sessions themselves stay out of the pack).
+# ktor-websockets: the frame model, the raw and default sessions, ping/pong
+# and extensions. Common and posix are plain Kotlin.
 [[source]]
 root = "upstream/ktor-shared/ktor-websockets/common/src"
-include = [
-    "io/ktor/websocket/FrameCommon.kt",
-    "io/ktor/websocket/FrameType.kt",
-    "io/ktor/websocket/CloseReason.kt",
-    # The RFC 6455 control-frame size limits CloseReason and FrameNative check.
-    "io/ktor/websocket/ControlFrames.kt",
-]
 [[source]]
 root = "upstream/ktor-shared/ktor-websockets/posix/src"
-include = [
-    "io/ktor/websocket/FrameNative.kt",
-]
 
-# ktor-serialization (the ContentConverter contract) + the kotlinx and
-# kotlinx-json converters, vendored unchanged. The WebSocket converter
-# pair is excluded with record: it needs the websocket session surface,
-# which the pack does not carry. Gated under the `serialization*` features.
+# ktor-websocket-serialization: typed `sendSerialized`/`receiveDeserialized`
+# over a session's converter.
+[[source]]
+root = "upstream/ktor-shared/ktor-websocket-serialization/common/src"
+
+# ktor-serialization (the ContentConverter contract and the WebSocket
+# converter) + the kotlinx and kotlinx-json converters, vendored unchanged.
+# Gated under the `serialization*` features.
 [[source]]
 root = "upstream/ktor-shared/ktor-serialization/common/src"
-include = [
-    "ContentConverter.kt",
-    "ContentConvertException.kt",
-]
 [[source]]
 root = "upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/common/src"
-include = [
-    "io/ktor/serialization/kotlinx/KotlinxSerializationConverter.kt",
-    "io/ktor/serialization/kotlinx/Extensions.kt",
-    "io/ktor/serialization/kotlinx/SerializerLookup.kt",
-]
 [[source]]
 root = "upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/posix/src"
-include = [
-    "io/ktor/serialization/kotlinx/ExtensionsNative.kt",
-]
 [[source]]
 root = "upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/ktor-serialization-kotlinx-json/common/src"
-include = [
-    "io/ktor/serialization/kotlinx/json/JsonSupport.kt",
-    "io/ktor/serialization/kotlinx/json/KotlinxSerializationJsonExtensions.kt",
-    "io/ktor/serialization/kotlinx/json/ExperimentalJsonConverter.kt",
-]
 [[source]]
 root = "upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/ktor-serialization-kotlinx-json/posix/src"
-include = [
-    "io/ktor/serialization/kotlinx/json/JsonExtensionsNative.kt",
-]
 [[source]]
 root = "upstream/ktor-client/ktor-client-plugins/ktor-client-content-negotiation/common/src"
 [[source]]
@@ -379,20 +138,14 @@ root = "upstream/ktor-server/ktor-server-plugins/ktor-server-content-negotiation
 [[source]]
 root = "upstream/ktor-server/ktor-server-plugins/ktor-server-content-negotiation/posix/src"
 
-# Event bus (`io.ktor.events.Events`) — `HttpClient.monitor`. Gated under `events`.
+# ktor-events: the event bus behind `HttpClient.monitor` and the server's
+# monitor. Gated under `events`.
 [[source]]
 root = "upstream/ktor-shared/ktor-events/common/src"
-include = [
-    "io/ktor/events/Events.kt",
-]
 
-# Platform `actual`s for the ktor-http `expect`s. The posix variant is pure
-# common Kotlin (no JVM/JS imports): `URLBuilder.Companion.origin`.
+# ktor-http posix: `URLBuilder.Companion.origin`.
 [[source]]
 root = "upstream/ktor-http/posix/src"
-include = [
-    "io/ktor/http/URLBuilderPosix.kt",
-]
 
 # ktor-test-base + ktor-test-dispatcher (`io.ktor.test.*`,
 # `io.ktor.test.dispatcher.*`): the `runTest` wrapper over
@@ -412,134 +165,120 @@ root = "upstream/ktor-test-dispatcher/common/src"
 [[source]]
 root = "upstream/ktor-test-dispatcher/posix/src"
 
-# Upstream ktor-client-core commonMain. The whole module — the engine layer
-# (`EmptyContent`, the engine config base, the capability interface; note
-# `HttpClientEngineCapability`'s eager `DEFAULT_CAPABILITIES` references the
-# timeout plugin, so klio defers a missing-symbol top-level-val init to
-# on-access) plus the client itself (request/statement/call layers, default
-# plugins, `HttpClient`) — is gated under the `client-core` feature.
+# Upstream ktor-client-core commonMain, the whole module: the engine layer,
+# the request, statement and call layers, the default and optional plugins
+# (timeout, retry, redirect, cookies, cache, default request, user agent,
+# websockets, SSE) and HttpClient itself. Gated under the client-core feature.
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/common/src"
-include = [
-    "io/ktor/client/utils/Content.kt",
-    "io/ktor/client/engine/HttpClientEngineConfig.kt",
-    "io/ktor/client/engine/HttpClientEngineCapability.kt",
-    "io/ktor/client/engine/HttpClientEngine.kt",
-    "io/ktor/client/engine/HttpClientEngineBase.kt",
-    "io/ktor/client/engine/HttpClientEngineFactory.kt",
-    "io/ktor/client/engine/Utils.kt",
-    # Upstream client core (request/statement/call layers + the default
-    # plugins + HttpClient itself), gated under the `client-core` feature.
-    "io/ktor/client/content/ObservableContent.kt",
-    "io/ktor/client/request/RequestBody.kt",
-    "io/ktor/client/request/HttpRequest.kt",
-    "io/ktor/client/request/DefaultHttpRequest.kt",
-    "io/ktor/client/request/HttpRequestPipeline.kt",
-    "io/ktor/client/statement/HttpResponse.kt",
-    "io/ktor/client/statement/DefaultHttpResponse.kt",
-    "io/ktor/client/statement/HttpResponsePipeline.kt",
-    "io/ktor/client/call/HttpClientCall.kt",
-    "io/ktor/client/call/SavedCall.kt",
-    "io/ktor/client/call/DelegatedCall.kt",
-    "io/ktor/client/call/utils.kt",
-    "io/ktor/client/HttpClientConfig.kt",
-    "io/ktor/client/HttpClient.kt",
-    "io/ktor/client/plugins/HttpClientPlugin.kt",
-    "io/ktor/client/plugins/api/ClientHook.kt",
-    "io/ktor/client/plugins/api/ClientPluginBuilder.kt",
-    "io/ktor/client/plugins/api/ClientPluginInstance.kt",
-    "io/ktor/client/plugins/api/CommonHooks.kt",
-    "io/ktor/client/plugins/api/CreatePluginUtils.kt",
-    "io/ktor/client/plugins/api/KtorCallContexts.kt",
-    "io/ktor/client/plugins/HttpRequestLifecycle.kt",
-    "io/ktor/client/plugins/BodyProgress.kt",
-    "io/ktor/client/plugins/SaveBody.kt",
-    "io/ktor/client/plugins/DefaultTransform.kt",
-    "io/ktor/client/plugins/HttpSend.kt",
-    # `ClientSSESession` / `ClientSSESessionWithDeserialization`: the
-    # content-negotiation plugin lists them among the body types it never
-    # converts; the session types themselves ride on ktor-sse's event model.
-    "io/ktor/client/plugins/sse/ClientSSESession.kt",
-    # `HttpSend` reads `MaxRetriesPerRequestAttributeKey`, declared here.
-    "io/ktor/client/plugins/HttpRequestRetry.kt",
-    "io/ktor/client/plugins/HttpCallValidator.kt",
-    "io/ktor/client/plugins/HttpRedirect.kt",
-    "io/ktor/client/plugins/HttpPlainText.kt",
-    "io/ktor/client/plugins/DefaultResponseValidation.kt",
-    "io/ktor/client/plugins/HttpTimeout.kt",
-    "io/ktor/client/utils/ClientEvents.kt",
-    "io/ktor/client/request/builders.kt",
-    "io/ktor/client/request/buildersWithUrl.kt",
-    "io/ktor/client/request/utils.kt",
-    "io/ktor/client/statement/HttpStatement.kt",
-    "io/ktor/client/statement/Readers.kt",
-    # What the included client layers name besides: the proxy config the
-    # engine config holds, the timeout exceptions, the upgrade content, the
-    # server-sent-events plugin the request and timeout layers check for,
-    # the engine-dispatcher switch, the body-progress channel, the
-    # cancellation unwrap and `buildHeaders`.
-    "io/ktor/client/engine/ProxyConfig.kt",
-    "io/ktor/client/network/sockets/TimeoutExceptions.common.kt",
-    "io/ktor/client/request/ClientUpgradeContent.kt",
-    "io/ktor/client/plugins/sse/builders.kt",
-    "io/ktor/client/plugins/sse/DefaultClientSSESession.kt",
-    "io/ktor/client/plugins/sse/SSE.kt",
-    "io/ktor/client/plugins/sse/SSEBufferPolicy.kt",
-    "io/ktor/client/plugins/sse/SSEClientContent.kt",
-    "io/ktor/client/plugins/sse/SSEConfig.kt",
-    "io/ktor/client/statement/DispatcherSwitching.kt",
-    "io/ktor/client/utils/ByteChannelUtils.kt",
-    "io/ktor/client/utils/ExceptionUtils.kt",
-    "io/ktor/client/utils/headers.kt",
-]
 
-# Real upstream ktor-server-core commonMain: the Application / engine /
-# routing / request / response pipeline, consumed verbatim and gated under
-# the `server-core` feature. klio supplies a server-engine actual over the native
-# `__kktor_serve` transport under `klioMain` (the one new piece),
-# plus actuals for the cinterop/reflect `expect`s the posix/nonJvm sets back.
+# ktor-server-core: the application, the engine base, routing, the request
+# and response pipelines, config and plugins API, verbatim. klio replaces,
+# under klioMain/io/ktor/server, the posix files that reach the platform
+# through cinterop: the environment and `getenv` bridges
+# (EnvironmentUtilsNix, EnvironmentUtils.nix), the signal shutdown hook
+# (ShutdownHookNative), the processor count and stderr writer
+# (ApplicationUtilsNix) and the hostname escape (EngineUtilsNix).
 [[source]]
 root = "upstream/ktor-server/ktor-server-core/common/src"
-include = [
-    "io/ktor/server/application/",
-    "io/ktor/server/engine/",
-    "io/ktor/server/request/",
-    "io/ktor/server/response/",
-    "io/ktor/server/routing/",
-    "io/ktor/server/http/",
-    "io/ktor/server/config/",
-    "io/ktor/server/util/",
-    "io/ktor/server/logging/",
-    "io/ktor/server/plugins/OriginConnectionPoint.kt",
-    "io/ktor/server/plugins/Errors.kt",
-]
 
-# ktor-server-core posix actuals that are pure Kotlin (the cinterop ones —
-# ApplicationUtilsNix / ShutdownHookNative / EnvironmentUtils* — and
-# EngineUtilsNix, which reads `kotlin.native.Platform`, are replaced by klio
-# actuals under klioMain).
 [[source]]
 root = "upstream/ktor-server/ktor-server-core/posix/src"
-include = [
-    "io/ktor/server/engine/EmbeddedServerNix.kt",
-    "io/ktor/server/engine/DefaultTransformNix.kt",
-    "io/ktor/server/request/ApplicationReceiveFunctions.posix.kt",
+exclude = [
+    "io/ktor/server/engine/EnvironmentUtilsNix.kt",
+    "io/ktor/server/engine/ShutdownHookNative.kt",
+    "io/ktor/server/engine/internal/ApplicationUtilsNix.kt",
+    "io/ktor/server/engine/internal/EngineUtilsNix.kt",
 ]
 
-# ktor-server-core nonJvm actuals that are pure Kotlin (TypeUtils.nonJvm uses
-# kotlin.reflect and is replaced by a klio actual).
 [[source]]
 root = "upstream/ktor-server/ktor-server-core/nonJvm/src"
+
+# ktor-network: TCP, UDP and Unix sockets and the selector. The common and
+# nonJvm sets run verbatim, as do the posix files that are plain Kotlin (the
+# selector manager and its event records, the socket base, the address and
+# builder glue). The posix and nix files that reach the platform through
+# cinterop (socket calls, `sockaddr`, pselect, the wakeup pipe) are klio
+# copies under klioMain/io/ktor/network over the host socket natives.
+[[source]]
+root = "upstream/ktor-network/common/src"
+
+[[source]]
+root = "upstream/ktor-network/nonJvm/src"
+
+[[source]]
+root = "upstream/ktor-network/posix/src"
 include = [
-    "io/ktor/server/config/ConfigLoaders.nonJvm.kt",
-    "io/ktor/server/application/ApplicationEnvironment.nonJvm.kt",
-    "io/ktor/server/application/Application.nonJvm.kt",
-    "io/ktor/server/engine/EngineConnectorConfing.nonJvm.kt",
-    "io/ktor/server/engine/ApplicationEngineEnvironment.nonJvm.kt",
-    "io/ktor/server/http/content/DefaultTransform.nonJvm.kt",
-    "io/ktor/server/engine/internal/ExceptionUtils.nonJvm.kt",
-    "io/ktor/server/application/internal/TypeUtils.nonJvm.kt",
+    "io/ktor/network/selector/SelectorManager.kt",
+    "io/ktor/network/selector/WorkerSelectorManager.kt",
+    "io/ktor/network/selector/SelectUtils.kt",
+    "io/ktor/network/selector/EventInfo.kt",
+    "io/ktor/network/selector/SelectableNative.kt",
+    "io/ktor/network/sockets/NativeSocketImpl.kt",
+    "io/ktor/network/sockets/TCPSocketBuilderNative.kt",
+    "io/ktor/network/sockets/SocketAddress.nonJvm.posix.kt",
+    "io/ktor/network/util/NativeUtils.kt",
+    "io/ktor/network/util/Pools.kt",
 ]
+
+[[source]]
+root = "upstream/ktor-network/nix/src"
+include = [
+    "io/ktor/network/sockets/SocketAddress.nonJvm.nix.kt",
+]
+
+# ktor-network-tls: the TLS configuration, cipher-suite and extension model
+# and the `Socket.tls()` entry points.
+[[source]]
+root = "upstream/ktor-network/ktor-network-tls/common/src"
+
+[[source]]
+root = "upstream/ktor-network/ktor-network-tls/nonJvm/src"
+
+# ktor-client-cio: the coroutine-based HTTP/1.1 client engine over
+# ktor-network, verbatim. Its posix `Loader.posix.kt` registers the engine
+# through `@EagerInitialization`, which klio does not run; the klio default
+# engine actual binds CIO instead.
+[[source]]
+root = "upstream/ktor-client/ktor-client-cio/common/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-cio/nonJvm/src"
+
+# ktor-server-cio: the coroutine-based HTTP/1.1 server engine over
+# ktor-network, verbatim, with its posix dispatcher bridge.
+[[source]]
+root = "upstream/ktor-server/ktor-server-cio/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-cio/nonJvm/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-cio/posix/src"
+
+# ktor-client-mock: `MockEngine`, the in-memory client engine tests answer
+# requests with.
+[[source]]
+root = "upstream/ktor-client/ktor-client-mock/common/src"
+
+# ktor-server-test-host: `testApplication`, the in-process server engine and
+# its client, with the posix bridges.
+[[source]]
+root = "upstream/ktor-server/ktor-server-test-host/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-test-host/posix/src"
+
+# ktor-server-test-base: the engine test base the server modules' commonTest
+# suites extend.
+[[source]]
+root = "upstream/ktor-server/ktor-server-test-base/common/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-test-base/nonJvm/src"
+
+[[source]]
+root = "upstream/ktor-server/ktor-server-test-base/posix/src"
 
 # klio-authored actuals for every module, placed in their module by package
 # path: `io/ktor/utils/io` (ktor-io: locks, the terminal codecs, the
@@ -622,18 +361,24 @@ requires = ["utils"]
 sources = ["upstream/ktor-shared/ktor-sse/"]
 requires = ["utils"]
 
-# ktor-websockets (`io.ktor.websocket.*`): the frame model (the sessions
-# themselves stay out of the pack). Depends on ktor-http.
+# ktor-websockets (`io.ktor.websocket.*`): the frame model, the raw and
+# default sessions, ping/pong and extensions. Depends on ktor-http.
 [features.websockets]
 sources = ["upstream/ktor-shared/ktor-websockets/"]
 requires = ["http"]
 
 # ktor-serialization (`io.ktor.serialization.*`): the ContentConverter
-# contract both content-negotiation plugins program against. Depends on
-# ktor-websockets (`WebsocketDeserializeException(frame: Frame)`).
+# contract both content-negotiation plugins program against, and the
+# WebSocket converter. Depends on ktor-websockets.
 [features.serialization]
 sources = ["upstream/ktor-shared/ktor-serialization/common/"]
 requires = ["websockets"]
+
+# ktor-websocket-serialization (`io.ktor.websocket.serialization.*`): typed
+# frames over a session's converter. Depends on ktor-serialization.
+[features.websocket-serialization]
+sources = ["upstream/ktor-shared/ktor-websocket-serialization/"]
+requires = ["serialization"]
 
 # ktor-serialization-kotlinx (`io.ktor.serialization.kotlinx.*`): the
 # kotlinx.serialization-backed converter and the serializer lookup. Built
@@ -668,6 +413,22 @@ deps = ["kotlinx.coroutines/test"]
 sources = ["upstream/ktor-shared/ktor-test-base/"]
 requires = ["test-dispatcher"]
 
+# ktor-network (`io.ktor.network.*`): TCP, UDP and Unix sockets over a
+# poll-based selector, the upstream common layer over klio's host socket
+# natives. Upstream depends on ktor-utils (and ktor-io through it).
+[features.network]
+sources = [
+    "upstream/ktor-network/",
+    "klioMain/io/ktor/network/",
+]
+requires = ["utils"]
+
+# ktor-network-tls (`io.ktor.network.tls.*`): TLS over a connected socket.
+# Depends on ktor-network.
+[features.network-tls]
+sources = ["upstream/ktor-network/ktor-network-tls/"]
+requires = ["network"]
+
 # ktor-client-core (`io.ktor.client.*`): the real upstream client (the engine
 # layer + request/statement/call layers + default plugins + `HttpClient`),
 # consumed verbatim, plus klio's engine actual over the host `__kktor_request`
@@ -679,7 +440,43 @@ sources = [
     "upstream/ktor-client/ktor-client-core/",
     "klioMain/io/ktor/client/",
 ]
-requires = ["http", "http-cio", "events", "sse", "serialization"]
+requires = ["http", "http-cio", "events", "sse", "websocket-serialization"]
+
+# ktor-client-cio (`io.ktor.client.engine.cio.*`): the CIO engine, HTTP/1.1
+# over ktor-network with keep-alive, streaming bodies and WebSocket upgrade;
+# the default engine of `HttpClient()`.
+[features.client-cio]
+sources = [
+    "upstream/ktor-client/ktor-client-cio/",
+    "klioMain/io/ktor/client/engine/cio/",
+    "klioMain/io/ktor/client/engine/klio/",
+]
+requires = ["client-core", "network-tls"]
+
+# ktor-server-cio (`io.ktor.server.cio.*`): the CIO engine,
+# `embeddedServer(CIO)`, and klio's `Klio` engine name over it.
+[features.server-cio]
+sources = [
+    "upstream/ktor-server/ktor-server-cio/",
+    "klioMain/io/ktor/server/engine/klio/",
+]
+requires = ["server-core", "network", "http-cio"]
+
+# ktor-client-mock (`io.ktor.client.engine.mock.*`): `MockEngine`.
+[features.client-mock]
+sources = ["upstream/ktor-client/ktor-client-mock/"]
+requires = ["client-core"]
+
+# ktor-server-test-host (`io.ktor.server.testing.*`): `testApplication` over
+# the in-process test engine, with a client wired to it.
+[features.server-test-host]
+sources = ["upstream/ktor-server/ktor-server-test-host/"]
+requires = ["client-cio", "server-core", "test-dispatcher"]
+
+# ktor-server-test-base (`io.ktor.server.test.base.*`): the engine test base.
+[features.server-test-base]
+sources = ["upstream/ktor-server/ktor-server-test-base/"]
+requires = ["server-test-host", "test-base"]
 
 # ktor-server-core (`io.ktor.server.*`): `embeddedServer` + routing + the
 # request/response pipeline over klio's engine actual on the native

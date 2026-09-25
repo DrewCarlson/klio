@@ -1,0 +1,11 @@
+200 Hello, klio!
+200 desserts
+202 Accepted queued
+streamed with chunked encoding:
+chunk 0
+chunk 1
+chunk 2
+binary body: 256 bytes, last -1
+missing route: 404 Not Found
+connections for 6 requests: 6
+server logged its start: true

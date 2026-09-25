@@ -1,7 +1,8 @@
-//! End-to-end ktor server gate: a real `klio` child runs `embeddedServer`
-//! while this test acts as the HTTP client. The server blocks in the native
-//! `__kktor_serve` accept loop, so it is spawned as a background process,
-//! driven over real sockets, and killed at the end.
+//! End-to-end ktor server gate: a real `klio` child runs `embeddedServer` on
+//! the `Klio` engine (the CIO server over klio's socket layer) while this test
+//! acts as the HTTP client. `start(wait = true)` blocks, so the server is
+//! spawned as a background process, driven over real sockets, and killed at
+//! the end.
 
 const std = @import("std");
 const census_support = @import("commontest_support.zig");
@@ -235,7 +236,7 @@ test "server: routing, params, headers, status codes, and typed JSON" {
     try cwd.writeFile(io, .{ .sub_path = path, .data = prog });
 
     var child = std.process.spawn(io, .{
-        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server-content-negotiation,serialization-kotlinx-json", path },
+        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server-cio,server-content-negotiation,serialization-kotlinx-json", path },
         .environ_map = &env,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -325,7 +326,7 @@ test "server: start(wait = false) is non-blocking and the daemon serve abandons 
     // The program must exit on its own once the daemon serve loop sees the
     // run-boundary abandon; the timeout turns a hang into a failure.
     const r = std.process.run(a, io, .{
-        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server-core", path },
+        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server-cio", path },
         .environ_map = &env,
         .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
     }) catch |e| {

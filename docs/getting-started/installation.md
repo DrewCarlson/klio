@@ -49,5 +49,5 @@ and install the ones your programs need:
 A multi-module pack exposes each upstream module as a feature. The
 ktor pack loads nothing by default: install it the same way
 (`kotlin-klio/klio-ktor`), then enable the modules a program uses per
-run, e.g. `klio run --feature io.ktor/client-core program.kt`. See
+run, e.g. `klio run --feature io.ktor/client-cio program.kt`. See
 [Using packs](../packs/using.md).

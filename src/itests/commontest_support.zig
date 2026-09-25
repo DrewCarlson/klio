@@ -503,6 +503,56 @@ pub const suites = [_]Config{
         .max_incomplete = 2,
     },
     .{
+        // ktor-network's common, jvmAndPosix and posix suites over klio's
+        // socket layer. The nix-only suites test upstream's pselect selector
+        // and read descriptors through cinterop, neither of which klio runs;
+        // their nix TestUtils actual is the one file taken from that set.
+        .name = "ktor_network",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-network/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-network/jvmAndPosix/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-network/posix/test",
+        },
+        .extra_support = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-network/nix/test/io/ktor/network/sockets/tests/TestUtils.nix.kt",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/network", "--feature", "io.ktor/test-base" },
+        .baseline = 24,
+        // TCPSocketTest.testAwaitClosedDoesNotDeadLock: `withTimeout` under
+        // `limitedParallelism(1)` never resumes its body (coroutine runtime).
+        .max_failed = 1,
+        .max_incomplete = 0,
+    },
+    .{
+        // ktor-client-core's commonTest, with ktor-client-mock's own suite:
+        // the client, its plugins and `MockEngine`.
+        .name = "ktor_client_core",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-core/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-mock/common/test",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/client-mock,server-test-host,client-content-negotiation,serialization-kotlinx-json,test-base" },
+        .baseline = 93,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        // ktor-server-core's commonTest with the test host's and test base's
+        // own suites: routing, plugins, hooks, config and `testApplication`.
+        .name = "ktor_server_core",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-core/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-test-host/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-server/ktor-server-test-base/common/test",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/server-test-base,serialization-kotlinx-json" },
+        .baseline = 138,
+        // RegexRoutingTest x9: the stdlib Regex has no `\p{Alpha}` class, which
+        // the regex route selector finds group names with.
+        .max_failed = 9,
+        .max_incomplete = 0,
+    },
+    .{
         // Kruth's assertion surface is a klio-authored stand-in under
         // tests/compose_ui_commontest_actuals.
         .name = "compose_ui",

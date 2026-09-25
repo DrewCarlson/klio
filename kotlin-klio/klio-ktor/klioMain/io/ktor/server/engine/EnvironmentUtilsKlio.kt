@@ -1,18 +1,35 @@
-// klio `actual`s for the engine's environment/property bridges (the native
-// versions read the process environment and SSL config through cinterop /
-// platform.posix; klio neither serves TLS nor needs the env at startup).
+// klio `actual`s for ktor-server-core's environment bridges: upstream's
+// posix `EnvironmentUtilsNix.kt` and nix `EnvironmentUtils.nix.kt`, with
+// `getenv`/`setenv`/`unsetenv`/`environ` going through the host instead of
+// cinterop.
 
 package io.ktor.server.engine
 
+import io.ktor.util.__kktor_environ
+import io.ktor.util.__kktor_getenv
+import io.ktor.util.__kktor_setenv
+import io.ktor.util.__kktor_unsetenv
+
 internal actual fun ApplicationEnvironmentBuilder.configurePlatformProperties(args: Array<String>) {}
 
-internal actual fun getKtorEnvironmentProperties(): List<Pair<String, String>> = emptyList()
+internal actual fun getKtorEnvironmentProperties(): List<Pair<String, String>> = buildList {
+    for (keyValue in __kktor_environ()) {
+        if (keyValue.startsWith("ktor.")) {
+            val (key, value) = keyValue.splitPair('=') ?: continue
+            add(key to value)
+        }
+    }
+}
 
-internal actual fun getEnvironmentProperty(key: String): String? = null
+internal actual fun getEnvironmentProperty(key: String): String? = __kktor_getenv(key)
 
-internal actual fun setEnvironmentProperty(key: String, value: String) {}
+internal actual fun setEnvironmentProperty(key: String, value: String) {
+    __kktor_setenv(key, value)
+}
 
-internal actual fun clearEnvironmentProperty(key: String) {}
+internal actual fun clearEnvironmentProperty(key: String) {
+    __kktor_unsetenv(key)
+}
 
 internal actual fun ApplicationEngine.Configuration.configureSSLConnectors(
     host: String,
@@ -25,5 +42,5 @@ internal actual fun ApplicationEngine.Configuration.configureSSLConnectors(
     sslTrustStorePassword: String?,
     sslEnabledProtocols: List<String>?
 ) {
-    error("TLS is not supported by the klio server engine")
+    error("SSL is not supported in native")
 }

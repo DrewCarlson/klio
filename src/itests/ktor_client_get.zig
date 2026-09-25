@@ -1,6 +1,7 @@
 //! End-to-end ktor-client gate: a child `klio` process requests an HTTP server
 //! this test runs in-process, so nothing depends on the network. Covers
-//! feature gating, the host `__kktor_request` transport, and the
+//! feature gating, the CIO engine over klio's socket layer (the default
+//! `HttpClient()` engine and the `KlioClient` name), and the
 //! kotlinx-serialization typed `body<T>()` path.
 
 const std = @import("std");
@@ -190,7 +191,7 @@ test "client GET single-sends with status and body (default engine)" {
         \\    client.close()
         \\}
         \\
-    , "io.ktor/client-core",
+    , "io.ktor/client-cio",
         \\status=200 OK
         \\body={"name":"Ada","age":36,"roles":["ADMIN","USER"]}
         \\
@@ -214,7 +215,7 @@ test "client GET with explicit engine and followRedirects off" {
         \\    client.close()
         \\}
         \\
-    , "io.ktor/client-core",
+    , "io.ktor/client-cio",
         \\status=200 OK
         \\body={"name":"Ada","age":36,"roles":["ADMIN","USER"]}
         \\
@@ -244,7 +245,7 @@ test "typed body deserializes through client-serialization" {
         \\    client.close()
         \\}
         \\
-    , "io.ktor/client-content-negotiation,serialization-kotlinx-json",
+    , "io.ktor/client-cio,client-content-negotiation,serialization-kotlinx-json",
         \\user=User(name=Ada, age=36, roles=[ADMIN, USER])
         \\first=ADMIN
         \\
@@ -277,7 +278,7 @@ test "POST setBody serializes through ContentNegotiation onto the wire" {
         \\    client.close()
         \\}
         \\
-    , "io.ktor/client-content-negotiation,serialization-kotlinx-json",
+    , "io.ktor/client-cio,client-content-negotiation,serialization-kotlinx-json",
         \\status=200 OK
         \\echo={"name":"Bo","age":7,"roles":["USER"]}
         \\

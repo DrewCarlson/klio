@@ -1,166 +1,140 @@
 # io.ktor
 
-The `io.ktor` pack ships the ktor surface klio supports — the common
-modules (`io.ktor.utils.io`, `io.ktor.util`, `io.ktor.http`,
-`io.ktor.events`), the HTTP **client**, and an embedded **server** — built
-from the real upstream ktor sources plus klio-authored platform actuals. It
-is **opt-in**: installing the pack registers it, but nothing loads until a
-program enables a feature, because not every program needs the network.
+The `io.ktor` pack ships Ktor 3.5.2: the common modules (`io.ktor.utils.io`,
+`io.ktor.util`, `io.ktor.http`, `io.ktor.events`), sockets
+(`io.ktor.network`), the HTTP **client** and **server** cores, the CIO
+engines for both, and the test hosts. It is built from the real upstream Ktor
+sources plus klio-authored platform actuals, and it is **opt-in**: installing
+the pack registers it, but nothing loads until a program enables a feature.
+
+## How it is built
+
+Upstream sources run verbatim wherever klio can run them. klio writes its own
+actual only where upstream's non-JVM actual reaches the platform through
+cinterop. In practice that means:
+
+- **Sockets.** ktor-network's common code and its plain-Kotlin posix files
+  (the selector manager, event records, socket base) are upstream's. The
+  socket calls, `sockaddr` handling and the selector's wait go through host
+  natives (`src/ktor_client/net.zig`). The selector keeps upstream's design: a
+  selection coroutine on `Dispatchers.IO`, a wakeup pipe, and interest and
+  close queues. It waits in `poll` rather than `pselect`, so there is no
+  `FD_SETSIZE` limit.
+- **Engines.** ktor-client-cio and ktor-server-cio run verbatim over those
+  sockets: HTTP/1.1 with chunked and streamed bodies, keep-alive on the server
+  and WebSocket upgrade.
+- **Platform bridges.** `getenv` (the `KTOR_LOG_LEVEL` logger level and the
+  server's `ktor.*` environment properties), message digests (`Digest(name)`
+  covers every JVM `MessageDigest` algorithm), the clock, locks and
+  `PosixException`'s errno table are host natives too.
 
 ## Features
 
-Features mirror ktor's Gradle modules one for one, named after the
-artifact with `ktor-` stripped, all opt-in via `--feature io.ktor/<name>`.
-Nothing loads by default; a feature's `requires` carries its module's
-upstream dependencies inside ktor, so enabling a module enables everything
-it is built on.
+Features mirror Ktor's Gradle modules one for one, named after the artifact
+with `ktor-` stripped, all opt-in via `--feature io.ktor/<name>`. Nothing
+loads by default. A feature's `requires` carries its module's upstream
+dependencies inside Ktor, so enabling a module enables everything it is built
+on.
 
-| Feature                       | Surface (`io.ktor.…`)                                  | Requires                                  | Other packs                        |
-|-------------------------------|--------------------------------------------------------|-------------------------------------------|------------------------------------|
-| `io`                          | `utils.io.*`: `ByteChannel`, locks, charsets           |                                           |                                    |
-| `utils`                       | `util.*`: collections, pipeline, date, log             | `io`                                      |                                    |
-| `http`                        | `http.*`: URLs, headers, status, content               | `utils`                                   |                                    |
-| `http-cio`                    | `http.cio.*`: the CIO message parser, multipart reader | `http`                                    |                                    |
-| `events`                      | `events.*`: the event bus                              | `utils`                                   |                                    |
-| `sse`                         | `sse.*`: the `ServerSentEvent` model                   | `utils`                                   |                                    |
-| `websockets`                  | `websocket.*`: the frame model                         | `http`                                    |                                    |
-| `serialization`               | `serialization.*`: the `ContentConverter` contract     | `websockets`                              |                                    |
-| `serialization-kotlinx`       | `serialization.kotlinx.*`: the kotlinx converter       | `serialization`                           | `kotlinx.serialization`            |
-| `serialization-kotlinx-json`  | `serialization.kotlinx.json.*`: `json()`               | `serialization-kotlinx`                   | `kotlinx.serialization/json-io`    |
-| `test-dispatcher`             | `test.dispatcher.*`: `testSuspend` runners             | `utils`                                   | `kotlinx.coroutines/test`          |
-| `test-base`                   | `test.*`: `runTest`, `runTestWithData`                 | `test-dispatcher`                         |                                    |
-| `client-core`                 | `client.*`: `HttpClient` + default plugins             | `http`, `http-cio`, `events`, `sse`, `serialization` |                         |
-| `server-core`                 | `server.*`: `embeddedServer`, routing, pipeline        | `http`, `events`, `serialization`, `websockets` |                              |
-| `client-content-negotiation`  | `client.plugins.contentnegotiation.*`                  | `client-core`, `serialization`            |                                    |
-| `server-content-negotiation`  | `server.plugins.contentnegotiation.*`: typed `receive`/`respond` | `server-core`                   |                                    |
+| Feature                       | Surface (`io.ktor.…`)                                   | Requires                                   | Other packs                     |
+|-------------------------------|---------------------------------------------------------|--------------------------------------------|---------------------------------|
+| `io`                          | `utils.io.*`: byte channels, packets, pools, charsets   |                                            |                                 |
+| `utils`                       | `util.*`: collections, pipeline, date, crypto, logging  | `io`                                       |                                 |
+| `http`                        | `http.*`: URLs, headers, status, content, cookies       | `utils`                                    |                                 |
+| `http-cio`                    | `http.cio.*`: the CIO message parser, multipart reader  | `http`                                     |                                 |
+| `events`                      | `events.*`: the event bus                               | `utils`                                    |                                 |
+| `sse`                         | `sse.*`: the `ServerSentEvent` model                    | `utils`                                    |                                 |
+| `websockets`                  | `websocket.*`: frames, sessions, ping/pong, extensions  | `http`                                     |                                 |
+| `serialization`               | `serialization.*`: the `ContentConverter` contract      | `websockets`                               |                                 |
+| `websocket-serialization`     | `websocket.serialization.*`: typed frames               | `serialization`                            |                                 |
+| `serialization-kotlinx`       | `serialization.kotlinx.*`: the kotlinx converter        | `serialization`                            | `kotlinx.serialization`         |
+| `serialization-kotlinx-json`  | `serialization.kotlinx.json.*`: `json()`                | `serialization-kotlinx`                    | `kotlinx.serialization/json-io` |
+| `network`                     | `network.*`: TCP, UDP and Unix sockets, the selector    | `utils`                                    |                                 |
+| `network-tls`                 | `network.tls.*`: the TLS configuration model            | `network`                                  |                                 |
+| `client-core`                 | `client.*`: `HttpClient`, requests, the core plugins    | `http`, `http-cio`, `events`, `sse`, `websocket-serialization` |             |
+| `client-cio`                  | `client.engine.cio.*`: the CIO engine, `KlioClient`     | `client-core`, `network-tls`               |                                 |
+| `client-mock`                 | `client.engine.mock.*`: `MockEngine`                    | `client-core`                              |                                 |
+| `client-content-negotiation`  | `client.plugins.contentnegotiation.*`                   | `client-core`, `serialization`             |                                 |
+| `server-core`                 | `server.*`: applications, routing, the pipelines        | `http`, `events`, `serialization`, `websockets` |                            |
+| `server-cio`                  | `server.cio.*`: the CIO engine, `Klio`                  | `server-core`, `network`, `http-cio`       |                                 |
+| `server-content-negotiation`  | `server.plugins.contentnegotiation.*`                   | `server-core`                              |                                 |
+| `server-test-host`            | `server.testing.*`: `testApplication`                   | `client-cio`, `server-core`, `test-dispatcher` |                             |
+| `server-test-base`            | `server.test.base.*`: the engine test base              | `server-test-host`, `test-base`            |                                 |
+| `test-dispatcher`             | `test.dispatcher.*`: `testSuspend` runners              | `utils`                                    | `kotlinx.coroutines/test`       |
+| `test-base`                   | `test.*`: `runTest`, `runTestWithData`                  | `test-dispatcher`                          |                                 |
 
-So a bare channel program enables `--feature io.ktor/io`; a client program
-enables `--feature io.ktor/client-core`; typed JSON on either side pairs the
-content-negotiation plugin with the JSON converter, exactly as the two
-Gradle dependencies would:
-`--feature io.ktor/client-content-negotiation,serialization-kotlinx-json`.
+A bare channel program enables `--feature io.ktor/io`. A client enables
+`--feature io.ktor/client-cio`, and a server enables
+`--feature io.ktor/server-cio`, exactly as a Gradle build adds the engine
+artifact. Typed JSON pairs the content-negotiation plugin with the JSON
+converter: `--feature io.ktor/client-cio,client-content-negotiation,serialization-kotlinx-json`.
 
 ## Client
 
 ```kotlin
 import io.ktor.client.HttpClient
-import io.ktor.http.HttpMethod
-import kotlinx.coroutines.runBlocking
+import io.ktor.client.request.get
+import io.ktor.client.statement.bodyAsText
 
-fun main() {
+suspend fun main() {
     val client = HttpClient()
-    val resp = runBlocking {
-        client.get("https://httpbin.org/get")
-    }
-    println("status=${resp.status}")
-    println("body=${resp.bodyAsText()}")
+    val response = client.get("http://127.0.0.1:8080/hello")
+    println("${response.status} ${response.bodyAsText()}")
     client.close()
 }
 ```
 
-Run it with `klio run --feature io.ktor/client-core program.kt`.
+Run it with `klio run --feature io.ktor/client-cio fetch.kt`.
 
-### Engine
+`HttpClient()` uses the CIO engine, which is the default engine the
+`client-cio` feature supplies. Upstream's posix build finds its default
+engine through an `@EagerInitialization` hook in the engine module; klio
+initializes top-level properties on first use, as the JVM does, so the engine
+module supplies the `HttpClient()` actual instead. With only `client-core`
+enabled, `HttpClient()` has no engine, just as an upstream build with no
+engine dependency has none. `HttpClient(CIO)` and `HttpClient(KlioClient)`
+name the same engine. `KlioClient` is the name klio's engine has always had,
+and it configures a `CIOEngineConfig`.
 
-The host binding (`src/ktor_client/ktor_client.zig`) wires the shim into a
-small blocking HTTP/1.1 transport built on the platform sockets: blocking,
-single-thread, modest dependency footprint. A request returns a flat
-`Array<String>` shaped `[status, body, contentType, k1, v1, k2, v2, …]`
-that the shim rebuilds into `HttpResponse`. Returning primitives from native
-bindings avoids the cost (and bugs) of constructing Kotlin class instances
-directly from Zig.
-
-Any module that calls `HostBindings.register(
-"io.ktor.client.engine.__kktor_request", myFn)` shadows the default engine.
-To wire it in, add the module to the CLI's `mergedHostBindings()` *after*
-`ktor_client.hostBindings()` — later registrations win (swap the transport,
-route through an in-memory mock during tests, intercept for tracing). The
-engine contract is the `StdlibFn` shape every host binding shares
-(`*const fn (ctx: *CallCtx) Allocator.Error!EvalResult`); arguments are
-`[method, url, body, headers]` and the return is the flat string array.
+Like upstream CIO on every non-JVM platform, the client gives each request
+its own connection (request pipelining is JVM-only).
 
 ## Server
 
-`embeddedServer(CIO, port) { … }` runs a blocking HTTP/1.1 server on a
-single accept loop (the native `__kktor_serve` binding). The module lambda
-installs plugins and a `routing { … }` table; each handler runs against an
-`ApplicationCall` exposing the request and collecting the response.
-
 ```kotlin
-import io.ktor.server.engine.embeddedServer
 import io.ktor.server.cio.CIO
-import io.ktor.server.routing.routing
-import io.ktor.server.routing.route
+import io.ktor.server.engine.embeddedServer
 import io.ktor.server.response.respondText
-import io.ktor.server.response.respond
-import io.ktor.server.request.receiveText
-import io.ktor.server.request.receive
-import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.server.plugins.contentnegotiation.install
-import io.ktor.serialization.kotlinx.json.json
-import io.ktor.http.HttpStatusCode
-import io.ktor.http.ContentType
-import kotlinx.serialization.Serializable
-
-@Serializable
-data class User(val id: Int, val name: String)
+import io.ktor.server.routing.get
+import io.ktor.server.routing.routing
 
 fun main() {
     embeddedServer(CIO, port = 8080) {
-        install(ContentNegotiation) { json() }
         routing {
-            get("/users/{id}") {
-                val id = call.parameters["id"]
-                val q = call.request.queryParameters["q"]
-                val tag = call.request.headers["X-Tag"]
-                call.respondText("id=$id q=$q tag=$tag", status = HttpStatusCode.OK)
-            }
-            post("/items") {
-                val body = call.receiveText()
-                call.response.headers.append("X-Made", "yes")
-                call.respondText("created:$body", contentType = ContentType.Text.Plain, status = HttpStatusCode.Created)
-            }
-            post("/users") {
-                val u = call.receive<User>()                 // typed JSON in
-                call.respond(HttpStatusCode.Created, User(u.id, u.name + "!"))  // typed JSON out
-            }
-            route("/api/v1") {                                // nested prefix
-                get("/ping") { call.respondText("pong") }     // -> /api/v1/ping
-            }
-            get("/files/{path...}") {                         // tailcard
-                call.respondText("file=${call.parameters["path"]}")
-            }
+            get("/hello/{name}") { call.respondText("Hello, ${call.parameters["name"]}!") }
         }
     }.start(wait = true)
 }
 ```
 
-Run it with
-`klio run --feature io.ktor/server-content-negotiation,serialization-kotlinx-json server.kt`
-(`--feature io.ktor/server-core` alone if you do not need typed JSON), then
-drive it:
+Run it with `klio run --feature io.ktor/server-cio server.kt`
+(`--feature io.ktor/server-cio,server-content-negotiation,serialization-kotlinx-json`
+for typed JSON). `embeddedServer(Klio, …)` names the same engine; `Klio` is
+the name klio's server engine has always had.
 
-```sh
-curl -i 'http://127.0.0.1:8080/users/42?q=hi' -H 'X-Tag: abc'
-curl -i -X POST --data 'widget' http://127.0.0.1:8080/items
-curl -i -X POST --data '{"id":7,"name":"Ada"}' http://127.0.0.1:8080/users
-```
+The whole server core is upstream's: routing (path, wildcard, tailcard,
+optional and regex segments, method, header, host and port selectors),
+application and route-scoped plugins, hooks, the receive and send pipelines,
+status pages for unhandled errors, config, and `start(wait = false)` with
+`stop(gracePeriod, timeout)`. Engine coroutines run on `Dispatchers.IO`, so a
+program can start a server and exit: the run boundary abandons its daemon
+tasks.
 
-The handler surface: `call.parameters` (path `{name}` captures),
-`call.request.queryParameters`, `call.request.headers` (case-insensitive),
-`call.receiveText()` / `call.receive<T>()`, `call.respondText(text,
-contentType, status)`, `call.respond(status, value)` (typed JSON),
-`call.response.headers.append(name, value)`, and `call.response.status(code)`.
+## Testing
 
-Route patterns support `{name}` (one captured segment), `{name...}` (a
-tailcard capturing the rest of the path), and `*` (any one segment, not
-captured); `route(prefix) { … }` nests, prepending its prefix to the routes
-inside it. The first registered route whose method and pattern match wins.
-
-`start(wait = true)` blocks the calling thread; `start(wait = false)`
-dispatches the accept loop onto the coroutine worker pool and returns, so a
-program can start the server, do other work, and exit (the daemon serve loop
-is abandoned cleanly at the run boundary).
+`testApplication { … }` (`server-test-host`) runs an application in process
+with a client wired to it, and `MockEngine` (`client-mock`) answers client
+requests from a handler, as upstream's own test suites use them.
 
 ## Install
 
@@ -169,11 +143,11 @@ is abandoned cleanly at the run boundary).
 ./zig-out/bin/klio pack install target/packs/io.ktor.klio-pack
 ```
 
-## What is not included
+## Not included yet
 
-- Streaming / SSE bodies.
-- WebSocket support.
-- Regex route segments and per-route plugins / interceptors.
-- Pluggable client engines beyond the built-in transport. The slot is there
-  if you want to swap in another one — wire a new module into
-  `mergedHostBindings()` and adjust the binding manifest.
+- HTTPS and TLS on either side (in progress: a TLS 1.3 engine over Zig's
+  std.crypto for the client and the `Klio` server engine).
+- The plugin modules beyond content negotiation (WebSockets, Auth, Logging,
+  StatusPages, CORS, Compression, CallLogging and the rest).
+- WebSockets inside `testApplication`: upstream's native test engine does not
+  support them.

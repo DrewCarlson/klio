@@ -1,0 +1,10 @@
+bound to 127.0.0.1, port assigned: true
+remote of the accepted socket is the client: true
+echoed ALPHA
+echoed BETA
+echoed GAMMA
+binary payload of 65536 bytes intact: true
+both ends closed: true
+unix: over a unix socket
+udp: ping from the first socket: true
+udp: pong

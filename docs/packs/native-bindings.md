@@ -151,6 +151,7 @@ remediation.
   `std.ArrayList(u8)` via `native_state`.
 - `src/kotlinx_datetime/kotlinx_datetime.zig` — clock, tz
   conversions, RFC-3339 parsing.
-- `src/ktor_client/ktor_client.zig` — blocking HTTP on the platform
-  sockets, returning flat string arrays that the shim rebuilds into
-  `HttpResponse`.
+- `src/ktor_client/net.zig` — the socket calls behind the ktor pack's
+  ktor-network actuals: each native mirrors a POSIX call, records
+  `errno` for the Kotlin side to read back, and reads or fills a
+  `ByteArray` window in place.

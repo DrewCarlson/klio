@@ -1,14 +1,20 @@
-// klio `actual` for the `io.ktor.util.logging.KtorSimpleLogger` expect. The
-// posix actual reads `KTOR_LOG_LEVEL` via cinterop/getenv; klio has no cinterop,
-// so this variant defaults to INFO and prints through `println`. Sub-INFO
-// levels (DEBUG/TRACE) are suppressed by the level check, matching upstream.
+// klio `actual` for the `io.ktor.util.logging.KtorSimpleLogger` expect,
+// upstream's posix actual with the `KTOR_LOG_LEVEL` lookup going through the
+// host instead of cinterop `getenv`: the level defaults to INFO and messages
+// print through `println`.
 
 package io.ktor.util.logging
+
+import io.ktor.util.__kktor_getenv
+
+private const val KTOR_LOG_LEVEL_KEY = "KTOR_LOG_LEVEL"
 
 @Suppress("FunctionName")
 public actual fun KtorSimpleLogger(name: String): Logger = object : Logger {
 
-    override val level: LogLevel = LogLevel.INFO
+    override val level: LogLevel = __kktor_getenv(KTOR_LOG_LEVEL_KEY)?.let { level ->
+        LogLevel.entries.firstOrNull { it.name == level }
+    } ?: LogLevel.INFO
 
     private fun log(level: LogLevel, message: String) {
         if (level < this.level) return

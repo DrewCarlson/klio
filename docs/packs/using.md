@@ -57,14 +57,14 @@ into the [bundled executable](../BUNDLE.md)):
 ```sh
 klio run --feature kotlinx.serialization/json app.kt
 klio run --feature kotlinx.coroutines/test scheduler_test.kt
-klio run --feature io.ktor/client-core fetch.kt
+klio run --feature io.ktor/client-cio fetch.kt
 klio run --feature io.ktor/server-content-negotiation,serialization-kotlinx-json api.kt
 ```
 
 A feature carries its module's upstream dependencies: `requires` pulls
 the pack's own modules it is built on (`io.ktor/client-core` activates
-`http`, `utils`, `io`, `events`, `sse`, `serialization`, and
-`websockets`), and `deps` pulls features of other packs
+`http`, `http-cio`, `utils`, `io`, `events`, `sse`,
+`websocket-serialization`, `serialization`, and `websockets`), and `deps` pulls features of other packs
 (`io.ktor/serialization-kotlinx-json` enables
 `kotlinx.serialization/json-io`, which enables `json` and loads the
 `kotlinx.io` pack). A program's `klio.toml` asks for the same thing
