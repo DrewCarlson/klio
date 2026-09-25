@@ -1,0 +1,4 @@
+client offered: permessage-deflate
+asked for 3 rows: 3 rows, intact true
+asked for 200 rows: 200 rows, intact true
+asked for 1000 rows: 1000 rows, intact true

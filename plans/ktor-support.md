@@ -47,8 +47,9 @@ where upstream reaches the platform through cinterop.
 | ktor-client-cio | `client-cio` | verbatim; default `HttpClient()` engine, `KlioClient`; HTTPS |
 | ktor-server-cio | `server-cio` | verbatim; census `ktor_server_cio` 4 (the engine suite waits on the pool timer fix) |
 | server HTTPS | `server-cio` | `Klio` = the CIO engine plus `sslConnector(chainPem, keyPem)`; calls report `https`; `wss` |
-| server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 274 passed, 23 failing |
+| server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 275 passed, 22 failing |
 | compression | `utils`, `server-compression`, `client-encoding` | gzip and deflate over `src/ktor_client/zlib.zig`; example `ktor_compression` |
+| WebSocket compression | `websockets` | klio port of the JVM permessage-deflate extension; example `ktor_websocket_deflate` |
 | call logging | `server-call-logging` | klio port on `LogLevel` and `klio.logging.MDC`; upstream's JVM CallLoggingTest ported, 20/20 in `ktor_server_plugins` |
 | client plugins | `client-*` | 7 modules verbatim; census `ktor_client_plugins` 122/122 |
 | kotlinx JSON converter | `serialization-kotlinx-json` | census `ktor_serialization` 13 passed, 1 failing |
@@ -62,14 +63,12 @@ Open failures, each with its owner:
   would have fired, so after a few tests the IO pool is out of workers and
   each server stop waits about 10 s (coroutine runtime; repro
   `pooldelay.kt`, JVM prompt, klio 10 to 20 s).
-- `ktor_server_plugins`, 19 cases: RateLimitTest x12 (the same pool timers:
+- `ktor_server_plugins`, 22 cases: RateLimitTest x12 (the same pool timers:
   each request's cancelled refill `delay` holds a worker);
   ServerSentEventsTest heartbeat x3 (`client.sse` inside `withTimeout` never
   enters its block); AuthorizeHeaderParserTest x3 (sema: an `assertIs`
   contract's `T` is not substituted at the call, so the smart cast is
-  `HttpAuthHeader & T`); OAuth2Test.testApplicationState x1 (the
-  serialization pass names framework types by simple name, and the test
-  file's `io.ktor.util.*` brings its own `Encoder`); DependencyInjectionTest
+  `HttpAuthHeader & T`); DependencyInjectionTest
   x4 (sema: a constructor reference resolves to the `provide(KClass)`
   member x2, a reified `provideDelegate` is not inferred from the
   property's type, and the `assertIs` contract).
@@ -124,6 +123,17 @@ klio runs.
   Compression module is jvm-only upstream but imports nothing from java.*,
   so it is consumed verbatim. ktor-client-encoding's `shouldDecode` comes
   from its nonDarwinPosix set: klio's engines pass bodies through as sent.
+- WebSocketDeflateExtension is jvm-only upstream (java.util.zip). klio's
+  port keeps the negotiation and RFC 7692 framing and uses two stateless
+  natives (`__kkz_deflate_message`, `__kkz_inflate_message`): an outgoing
+  message is compressed by a fresh compressor, which the RFC allows whatever
+  context takeover says, and an incoming one is inflated after the stream's
+  last 32 KB of output, which the extension keeps unless the peer dropped
+  its context. Nothing native outlives a call, because an extension has no
+  close hook to free it. Zig tests decode RFC 7692's examples (including the
+  shared-window "Hello"); manually, a Python client over raw sockets and
+  zlib, keeping its compressor's context across messages, talked to the
+  klio server in both directions (2026-09-26).
 - CallLogging is jvm-only upstream and built on org.slf4j. klio ports
   CallLogging.kt, CallLoggingConfig.kt and MDCEntryUtils.kt under klioMain
   with the same DSL and messages; the hooks and the MDC provider run
@@ -198,12 +208,41 @@ Manual interop, 2026-09-26, macOS:
 - klio's client with the operating system roots (157 on macOS) refuses the
   test CA's server with unknown_ca.
 
-First-cut limits: TLS 1.3 only on both sides; ECDSA-P256 and Ed25519 server
-keys; no client certificates; no 0-RTT or session tickets.
+TLS 1.2 client (`tls12.zig`, the 1.2 states in `session.zig`): one
+ClientHello offers 1.3 and 1.2 (supported_versions, the 1.2 ECDHE suites,
+ec_point_formats, extended_master_secret, an empty renegotiation_info); a
+ServerHello without supported_versions takes the 1.2 path, refusing RFC
+8446's downgrade sentinels. Suites: ECDHE_{ECDSA,RSA} with AES-128/256-GCM
+and ChaCha20-Poly1305; the PRF is std's P_hash (`hmacExpandLabel`); records
+use RFC 5288's explicit GCM nonce (the sequence number) and RFC 7905's
+ChaCha20 nonce. ServerKeyExchange signatures: ECDSA with SHA-256/384/512 on
+P-256 or P-384 keys, Ed25519, RSA PKCS#1 v1.5 and PSS, all std.crypto. The
+extended master secret is used when the server echoes it. A HelloRequest is
+answered with a no_renegotiation warning; TLS 1.2 warnings other than
+close_notify are ignored. Tests: the PRF against the published SHA-256 and
+SHA-384 vectors; the master secret, extended master secret, key block and
+Finished values against OpenSSL 3.6's TLS1-PRF KDF; record layout, nonce
+and additional data against std's AEADs directly; a scripted TLS 1.2
+server (tls12_test.zig) with full handshakes for all six suites, ECDSA,
+Ed25519 and RSA keys (RSA signatures pinned from OpenSSL with
+tls12-signatures.sh), with and without the extended master secret and with
+a certificate request; one test per reachable 1.2 alert; seeded fuzzing of
+single corrupted deliveries and random records in the 1.2 states.
 
-Follow-ups: a TLS 1.2 client; RSA-PSS server keys (RSA signing over
-std.crypto.ff); the Kotlin side could drop its handle table for a NativeBox
-on the socket wrapper.
+TLS 1.2 manual interop, 2026-09-26, macOS: klio's CIO client against
+OpenSSL 3.6.3 `s_server -tls1_2` for all six suites (P-256 and RSA-2048
+certificates), X25519, P-256 and P-384 key exchange, RSA PKCS#1 and PSS
+signatures, extended master secret off, and an Ed25519 certificate; and
+against JDK 21.0.11 HttpsServer forced to TLSv1.2 with RSA-2048 and P-256
+identities (TLS_ECDHE_{RSA,ECDSA}_WITH_AES_256_GCM_SHA384 as the JDK chose),
+GET and a 100 KB POST.
+
+Limits: the server is TLS 1.3 only; ECDSA-P256 and Ed25519 server keys; no
+client certificates; no 0-RTT, session tickets or resumption; no TLS 1.2
+renegotiation, CBC or RSA key-transport suites.
+
+Follow-ups: RSA-PSS server keys (RSA signing over std.crypto.ff); the Kotlin
+side could drop its handle table for a NativeBox on the socket wrapper.
 
 ## Out of scope for now
 

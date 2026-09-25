@@ -1,12 +1,14 @@
-//! klio's TLS 1.3 engine for Ktor's network-tls actuals: a sans-IO session
-//! for either side of a connection, the certificate checks around
-//! std.crypto.Certificate, and PEM loading for server identities and trust
-//! anchors. Every cryptographic primitive is std.crypto's.
+//! klio's TLS engine for Ktor's network-tls actuals: a sans-IO session for
+//! either side of a connection (TLS 1.3, and TLS 1.2 for a client), the
+//! certificate checks around std.crypto.Certificate, and PEM loading for
+//! server identities and trust anchors. Every cryptographic primitive is
+//! std.crypto's.
 
 const std = @import("std");
 
 pub const wire = @import("wire.zig");
 pub const suites = @import("suites.zig");
+pub const tls12 = @import("tls12.zig");
 pub const x509 = @import("x509.zig");
 pub const pem = @import("pem.zig");
 pub const session = @import("session.zig");
@@ -26,4 +28,5 @@ test {
     _ = @import("alerts_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("interop_test.zig");
+    _ = @import("tls12_test.zig");
 }

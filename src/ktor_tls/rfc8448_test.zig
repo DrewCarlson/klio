@@ -89,6 +89,8 @@ test "RFC 8448 section 3, client side" {
         // The trace's certificate is self-signed and expired in 2026.
         .verification = .insecure_accept_any,
         .cipher_suites = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256, .aes_256_gcm_sha384 },
+        // The traces offer TLS 1.3 only.
+        .tls12_suites = &.{},
         .compat_mode = false,
         .hooks = .{
             .random = ch.random,
@@ -167,6 +169,8 @@ test "RFC 8448 section 5, client side" {
         .server_name = "server",
         .verification = .insecure_accept_any,
         .cipher_suites = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256, .aes_256_gcm_sha384 },
+        // The traces offer TLS 1.3 only.
+        .tls12_suites = &.{},
         .compat_mode = false,
         .hooks = .{
             .random = ch1.random,

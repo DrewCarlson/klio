@@ -56,3 +56,10 @@ rm -f server-p521ca.csr p521-ca.srl
     -not_before 20000101000000Z -not_after 20010101000000Z \
     -extfile <(printf '%s\n' "$SAN") -out expired.pem
 rm -f expired.csr ca.srl
+
+# An RSA-2048 server key the CA certifies, for the TLS 1.2 ECDHE_RSA suites.
+# The TLS 1.2 tests pin ServerKeyExchange signatures made with it; after
+# regenerating, rerun tls12-signatures.sh and update tls12_test.zig.
+"$OPENSSL" genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out server-rsa-key.pem
+issue server-rsa server-rsa-key.pem
+rm -f ca.srl

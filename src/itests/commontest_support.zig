@@ -610,21 +610,20 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/klioTest/io/ktor/server/plugins/calllogging",
         },
         .extra_args = &.{ "--feature", "io.ktor/server-test-host,server-auth,server-auth-api-key,server-body-limit,server-caching-headers,server-call-logging,server-content-negotiation,server-csrf,server-default-headers,server-di,server-double-receive,server-rate-limit,server-request-validation,server-resources,server-sessions,server-sse,server-status-pages,server-websockets,server-call-id,client-content-negotiation,client-websockets,serialization-kotlinx-json,test-base" },
-        // OAuth2Test's hung case fails on runTest's own 60 s timeout; the
-        // child needs the time to report it.
+        // A hung case fails on runTest's own 60 s timeout; the child needs
+        // the time to report it.
         .timeout_ms = 90_000,
         // RateLimitTest x12: a cancelled `delay` holds its pool worker until it
         // would have fired, so requests stall behind the refill timers.
         // ServerSentEventsTest heartbeat x3: `withTimeout` on a
         // limitedParallelism(1) dispatcher. AuthorizeHeaderParserTest x3: an
-        // `assertIs` contract is not substituted at the call. OAuth2Test x1: a
-        // generated serializer's `Encoder` resolves to `io.ktor.util.Encoder`.
+        // `assertIs` contract is not substituted at the call.
         // DependencyInjectionTest x4: a constructor reference picks the
         // `provide(KClass)` member over the function-type overloads (x2), a
         // reified `provideDelegate` is not inferred from the property type,
         // and the `assertIs` contract again (sema).
-        .baseline = 274,
-        .max_failed = 23,
+        .baseline = 275,
+        .max_failed = 22,
         .max_incomplete = 0,
     },
     .{

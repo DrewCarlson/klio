@@ -13,3 +13,6 @@ pub const expired_key = @embedFile("expired-key.pem");
 pub const p521_ca = @embedFile("p521-ca.pem");
 /// server-p256-key.pem's key, certified by the P-521 CA.
 pub const server_p521ca = @embedFile("server-p521ca.pem");
+/// An RSA-2048 server certificate the CA issued; its key signs the pinned
+/// TLS 1.2 ServerKeyExchange values (tls12-signatures.sh).
+pub const server_rsa = @embedFile("server-rsa.pem");

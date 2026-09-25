@@ -35,6 +35,8 @@ pub fn register(b: *HostBindings) Allocator.Error!void {
     try b.register(P ++ "__kkz_inflate_error", nInflateError);
     try b.register(P ++ "__kkz_free", nFree);
     try b.register(P ++ "__kkz_crc32", nCrc32);
+    try b.register(P ++ "__kkz_deflate_message", nDeflateMessage);
+    try b.register(P ++ "__kkz_inflate_message", nInflateMessage);
 }
 
 // ---- streams ------------------------------------------------------------------
@@ -69,6 +71,12 @@ pub const Deflater = struct {
 
     pub fn write(d: *Deflater, bytes: []const u8) Allocator.Error!void {
         d.compress.writer.writeAll(bytes) catch return error.OutOfMemory;
+    }
+
+    /// Emits everything written so far, ending at a byte boundary with the
+    /// stream still open.
+    pub fn flush(d: *Deflater) Allocator.Error!void {
+        d.compress.writer.flush() catch return error.OutOfMemory;
     }
 
     pub fn finish(d: *Deflater) Allocator.Error!void {
@@ -502,6 +510,124 @@ fn nCrc32(ctx: *CallCtx) Allocator.Error!EvalResult {
     return net.int(@as(i32, @bitCast(crc32Update(start, bytes))));
 }
 
+// ---- per-message deflate (WebSocket permessage-deflate) -----------------------
+
+/// Compresses one message with a fresh compressor and flushes it to a byte
+/// boundary without ending the stream, the shape RFC 7692 sends. Level -1 is
+/// the default (6), 0 stores, 1 to 9 are zlib's levels. The caller owns the
+/// result.
+pub fn deflateMessage(data: []const u8, level: i64) error{ OutOfMemory, InvalidLevel }![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try out.ensureUnusedCapacity(64);
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    if (level == 0) {
+        var raw = flate.Compress.Raw.init(&out.writer, window, .raw) catch return error.OutOfMemory;
+        raw.writer.writeAll(data) catch return error.OutOfMemory;
+        raw.writer.flush() catch return error.OutOfMemory;
+    } else {
+        const opts: flate.Compress.Options = switch (level) {
+            -1, 6 => .level_6,
+            1 => .level_1,
+            2 => .level_2,
+            3 => .level_3,
+            4 => .level_4,
+            5 => .level_5,
+            7 => .level_7,
+            8 => .level_8,
+            9 => .level_9,
+            else => return error.InvalidLevel,
+        };
+        const c = try gpa.create(flate.Compress);
+        defer gpa.destroy(c);
+        c.* = flate.Compress.init(&out.writer, window, .raw, opts) catch return error.OutOfMemory;
+        c.writer.writeAll(data) catch return error.OutOfMemory;
+        c.writer.flush() catch return error.OutOfMemory;
+    }
+    return gpa.dupe(u8, out.written());
+}
+
+pub const MessageInflate = union(enum) {
+    /// The message's output, owned by the caller.
+    ok: []u8,
+    failure: []const u8,
+    too_large: usize,
+};
+
+/// Inflates one message of a permessage-deflate stream: `data` followed by
+/// the empty stored block the sender removed, decoded after `history`, the
+/// stream's earlier output (at most a window of it). The message must end
+/// at a block boundary. Output past `max` bytes fails as too large.
+pub fn inflateMessage(history: []const u8, data: []const u8, max: usize) Allocator.Error!MessageInflate {
+    const input = try std.mem.concat(gpa, u8, &.{ data, &.{ 0x00, 0x00, 0xff, 0xff } });
+    defer gpa.free(input);
+    var reader: std.Io.Reader = .fixed(input);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    // Direct mode: matches copy from the history in the output buffer.
+    const kept = history[history.len - @min(history.len, flate.history_len) ..];
+    out.writer.writeAll(kept) catch return error.OutOfMemory;
+    var decompress: flate.Decompress = .init(&reader, .raw, &.{});
+    while (true) {
+        _ = decompress.reader.stream(&out.writer, .limited(1 << 16)) catch |e| switch (e) {
+            // A final block ends the stream.
+            error.EndOfStream => break,
+            error.WriteFailed => return error.OutOfMemory,
+            error.ReadFailed => {
+                const derr = decompress.err orelse return .{ .failure = Inflater.invalid_input };
+                // The input ran out at a block boundary: the message is whole.
+                if (derr == error.EndOfStream and decompress.state == .block_header and reader.seek == input.len) break;
+                return .{ .failure = Inflater.describe(derr) };
+            },
+        };
+        const produced = out.written().len - kept.len;
+        if (produced > max) return .{ .too_large = produced };
+    }
+    const produced = out.written()[kept.len..];
+    if (produced.len > max) return .{ .too_large = produced.len };
+    return .{ .ok = try gpa.dupe(u8, produced) };
+}
+
+/// `__kkz_deflate_message(bytes, off, len, level): ByteArray?`: null for a
+/// level outside -1..9.
+fn nDeflateMessage(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const bytes = (try argRange(ctx, 0, net.argInt(ctx, 1), net.argInt(ctx, 2))) orelse
+        return net.typeErr("__kkz_deflate_message: the byte range does not fit the array");
+    defer gpa.free(bytes);
+    const out = deflateMessage(bytes, net.argInt(ctx, 3)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLevel => return .{ .ok = .Null },
+    };
+    return bytesResult(ctx.allocator, out);
+}
+
+/// `__kkz_inflate_message(history, bytes, off, len, max): Any`: the output as
+/// a ByteArray, or the failure as a String.
+fn nInflateMessage(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const history = (try argRange(ctx, 0, 0, arrayLen(ctx, 0))) orelse
+        return net.typeErr("__kkz_inflate_message: history is not a byte array");
+    defer gpa.free(history);
+    const bytes = (try argRange(ctx, 1, net.argInt(ctx, 2), net.argInt(ctx, 3))) orelse
+        return net.typeErr("__kkz_inflate_message: the byte range does not fit the array");
+    defer gpa.free(bytes);
+    const max: usize = @intCast(@max(net.argInt(ctx, 4), 0));
+    return switch (try inflateMessage(history, bytes, max)) {
+        .ok => |out| bytesResult(ctx.allocator, out),
+        .failure => |msg| .{ .ok = .{ .String = try runtime.strInit(ctx.allocator, msg) } },
+        .too_large => |n| blk: {
+            const msg = try std.fmt.allocPrint(gpa, "Inflated data exceeds limit: {d} > {d}", .{ n, max });
+            defer gpa.free(msg);
+            break :blk .{ .ok = .{ .String = try runtime.strInit(ctx.allocator, msg) } };
+        },
+    };
+}
+
+fn arrayLen(ctx: *const CallCtx, i: usize) i64 {
+    if (i >= ctx.args.len or ctx.args[i] != .Array) return -1;
+    return @intCast(ctx.args[i].Array.len());
+}
+
 pub fn crc32Update(crc: u32, bytes: []const u8) u32 {
     // std's Crc32 keeps the complemented register; resuming from a finished
     // value complements it back first.
@@ -677,6 +803,80 @@ test "inflate reports invalid input as it arrives, and stops when freed early" {
     // Freed before any input.
     const idle = try Inflater.create();
     idle.destroy();
+}
+
+/// RFC 7692's sending rule, as ktor applies it: a message that ends in an
+/// empty stored block drops its last four bytes; otherwise a zero byte
+/// starts the block the receiver completes.
+fn frameMessage(compressed: []const u8) ![]u8 {
+    const padded = [_]u8{ 0, 0, 0, 0xff, 0xff };
+    if (std.mem.endsWith(u8, compressed, &padded)) return gpa.dupe(u8, compressed[0 .. compressed.len - 4]);
+    return std.mem.concat(gpa, u8, &.{ compressed, &.{0} });
+}
+
+test "inflateMessage decodes RFC 7692's examples, with and without a shared window" {
+    const first = [_]u8{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 };
+    const r1 = try inflateMessage("", &first, 1 << 20);
+    defer gpa.free(r1.ok);
+    try testing.expectEqualStrings("Hello", r1.ok);
+    // The second "Hello" is a match into the first message's output.
+    const second = [_]u8{ 0xf2, 0x00, 0x11, 0x00, 0x00 };
+    const r2 = try inflateMessage("Hello", &second, 1 << 20);
+    defer gpa.free(r2.ok);
+    try testing.expectEqualStrings("Hello", r2.ok);
+    // Without the window the match reaches before the stream.
+    try testing.expect(try inflateMessage("", &second, 1 << 20) == .failure);
+    // A stored block.
+    const stored = [_]u8{ 0x00, 0x05, 0x00, 0xfa, 0xff, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x00 };
+    const r3 = try inflateMessage("", &stored, 1 << 20);
+    defer gpa.free(r3.ok);
+    try testing.expectEqualStrings("Hello", r3.ok);
+}
+
+test "deflateMessage output inflates at every level, and limits and bad input fail" {
+    const text = "per-message deflate, per-message deflate, per-message deflate " ** 20;
+    for ([_]i64{ -1, 0, 1, 6, 9 }) |level| {
+        const compressed = try deflateMessage(text, level);
+        defer gpa.free(compressed);
+        const framed = try frameMessage(compressed);
+        defer gpa.free(framed);
+        const r = try inflateMessage("", framed, 1 << 20);
+        defer gpa.free(r.ok);
+        try testing.expectEqualStrings(text, r.ok);
+        if (level != 0) try testing.expect(framed.len < text.len / 4);
+    }
+    try testing.expectError(error.InvalidLevel, deflateMessage("x", 10));
+
+    const compressed = try deflateMessage(text, -1);
+    defer gpa.free(compressed);
+    const framed = try frameMessage(compressed);
+    defer gpa.free(framed);
+    try testing.expect(try inflateMessage("", framed, 100) == .too_large);
+    try testing.expectEqualStrings("invalid block type", (try inflateMessage("", &.{ 0xff, 0xff }, 100)).failure);
+}
+
+test "inflateMessage follows a sender that keeps its window across messages" {
+    // A peer with context takeover: one compressor, flushed per message, the
+    // later messages matching into the earlier ones.
+    const d = try Deflater.create();
+    defer d.destroy();
+    const messages = [_][]const u8{ "the quick brown fox jumps", "the quick brown fox jumps over the lazy dog", "the lazy dog" };
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(gpa);
+    for (messages) |msg| {
+        try d.write(msg);
+        try d.flush();
+        const produced = (try d.take()).?;
+        defer gpa.free(produced);
+        const framed = try frameMessage(produced);
+        defer gpa.free(framed);
+        // The framing's extra byte starts the stored block the receiver ends;
+        // the sender's stream goes on as if it had written that block.
+        const r = try inflateMessage(history.items, framed, 1 << 20);
+        defer gpa.free(r.ok);
+        try testing.expectEqualStrings(msg, r.ok);
+        try history.appendSlice(gpa, r.ok);
+    }
 }
 
 test "crc32 matches java.util.zip.CRC32 and resumes across chunks" {

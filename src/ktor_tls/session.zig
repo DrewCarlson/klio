@@ -1,4 +1,5 @@
-//! A sans-IO TLS 1.3 session (RFC 8446), client or server.
+//! A sans-IO TLS session: TLS 1.3 (RFC 8446) for a client or a server, and
+//! TLS 1.2 (RFC 5246) for a client whose server does not speak 1.3.
 //!
 //! The session never touches a socket. The caller feeds it the bytes read from
 //! the peer (`feed`), sends whatever it queues (`output`/`consumeOutput`),
@@ -7,12 +8,13 @@
 //! matching alert, moves the session to `.failed` and returns
 //! `error.TlsFailure`; `failure` then says which alert and why.
 //!
-//! Scope: TLS 1.3 only; X25519, P-256 and P-384 key exchange; the three
-//! standard AEAD suites; server keys P-256 ECDSA or Ed25519; peer certificates
-//! verified against a trust bundle with ECDSA, Ed25519 or RSA (PSS for
-//! CertificateVerify) signatures. No client certificates (a server's
-//! CertificateRequest is answered with an empty Certificate), no session
-//! resumption, no 0-RTT.
+//! Scope: X25519, P-256 and P-384 key exchange; the three TLS 1.3 AEAD
+//! suites, and for TLS 1.2 the ECDHE suites with AES-GCM or
+//! ChaCha20-Poly1305 (tls12.zig); server keys P-256 ECDSA or Ed25519; peer
+//! certificates verified against a trust bundle with ECDSA, Ed25519 or RSA
+//! signatures. No client certificates (a server's certificate request is
+//! answered with an empty Certificate), no session resumption, no 0-RTT, no
+//! TLS 1.2 renegotiation.
 
 const std = @import("std");
 const crypto = std.crypto;
@@ -21,11 +23,14 @@ const Certificate = crypto.Certificate;
 
 const wire = @import("wire.zig");
 const suites = @import("suites.zig");
+const tls12 = @import("tls12.zig");
 const x509 = @import("x509.zig");
 const pem = @import("pem.zig");
 
 pub const Suite = suites.Suite;
+pub const Suite12 = tls12.Suite12;
 const Cipher = suites.Cipher;
+const Cipher12 = tls12.Cipher12;
 const Secret = suites.Secret;
 
 pub const Role = enum { client, server };
@@ -39,14 +44,18 @@ pub const ContentType = enum(u8) {
 };
 
 pub const HandshakeType = enum(u8) {
+    hello_request = 0,
     client_hello = 1,
     server_hello = 2,
     new_session_ticket = 4,
     end_of_early_data = 5,
     encrypted_extensions = 8,
     certificate = 11,
+    server_key_exchange = 12,
     certificate_request = 13,
+    server_hello_done = 14,
     certificate_verify = 15,
+    client_key_exchange = 16,
     finished = 20,
     key_update = 24,
     message_hash = 254,
@@ -58,6 +67,7 @@ pub const ExtensionType = struct {
     pub const max_fragment_length: u16 = 1;
     pub const status_request: u16 = 5;
     pub const supported_groups: u16 = 10;
+    pub const ec_point_formats: u16 = 11;
     pub const signature_algorithms: u16 = 13;
     pub const use_srtp: u16 = 14;
     pub const heartbeat: u16 = 15;
@@ -66,7 +76,9 @@ pub const ExtensionType = struct {
     pub const client_certificate_type: u16 = 19;
     pub const server_certificate_type: u16 = 20;
     pub const padding: u16 = 21;
+    pub const extended_master_secret: u16 = 23;
     pub const record_size_limit: u16 = 28;
+    pub const session_ticket: u16 = 35;
     pub const pre_shared_key: u16 = 41;
     pub const early_data: u16 = 42;
     pub const supported_versions: u16 = 43;
@@ -77,6 +89,7 @@ pub const ExtensionType = struct {
     pub const post_handshake_auth: u16 = 49;
     pub const signature_algorithms_cert: u16 = 50;
     pub const key_share: u16 = 51;
+    pub const renegotiation_info: u16 = 0xff01;
 };
 
 pub const AlertDescription = enum(u8) {
@@ -100,6 +113,7 @@ pub const AlertDescription = enum(u8) {
     internal_error = 80,
     inappropriate_fallback = 86,
     user_canceled = 90,
+    no_renegotiation = 100,
     missing_extension = 109,
     unsupported_extension = 110,
     unrecognized_name = 112,
@@ -133,8 +147,16 @@ pub const SignatureScheme = struct {
 };
 
 pub const tls13: u16 = 0x0304;
+pub const tls12_version: u16 = 0x0303;
 pub const max_plaintext = 1 << 14;
 const max_ciphertext = max_plaintext + 256;
+const max_ciphertext12 = max_plaintext + 2048;
+
+/// The last eight bytes of a TLS 1.2 or earlier ServerHello random from a
+/// server that also speaks TLS 1.3 (RFC 8446 §4.1.3): a 1.3 client seeing
+/// one has been downgraded.
+const downgrade_tls12 = "DOWNGRD\x01";
+const downgrade_tls11 = "DOWNGRD\x00";
 const max_handshake_message = 1 << 17;
 const record_header_len = 5;
 
@@ -206,6 +228,9 @@ pub const ClientConfig = struct {
     server_name: ?[]const u8 = null,
     verification: Verification,
     cipher_suites: []const Suite = &default_suites,
+    /// The TLS 1.2 suites offered beside the TLS 1.3 ones, for a server
+    /// that does not speak 1.3. Empty offers TLS 1.3 only.
+    tls12_suites: []const Suite12 = &tls12.default_suites,
     groups: []const Group = &default_groups,
     key_share_groups: []const Group = &default_key_share_groups,
     signature_schemes: []const u16 = &default_signature_schemes,
@@ -248,6 +273,12 @@ const State = enum {
     wait_certificate,
     wait_certificate_verify,
     wait_server_finished,
+    // client, TLS 1.2
+    wait_certificate12,
+    wait_server_key_exchange12,
+    wait_server_hello_done12,
+    wait_server_ccs12,
+    wait_server_finished12,
     // server
     wait_client_hello,
     wait_retry_client_hello,
@@ -375,9 +406,25 @@ pub const Session = struct {
     /// handshake completes.
     transcript: std.ArrayList(u8) = .empty,
 
+    /// The negotiated protocol version, once the ServerHello chose one.
+    version: u16 = 0,
     suite: ?Suite = null,
     read: ?Cipher = null,
     write: ?Cipher = null,
+    /// TLS 1.2: the suite, the record protection in each direction, and the
+    /// server's keys, installed at its ChangeCipherSpec.
+    suite12: ?Suite12 = null,
+    read12: ?Cipher12 = null,
+    write12: ?Cipher12 = null,
+    pending_read12: ?Cipher12 = null,
+    server_random: [32]u8 = @splat(0),
+    /// Both sides agreed to the extended master secret (RFC 7627).
+    ems: bool = false,
+    /// The ECDHE shared secret, from ServerKeyExchange to the master secret.
+    pre_master12: [48]u8 = @splat(0),
+    pre_master12_len: u8 = 0,
+    master12: [tls12.master_secret_len]u8 = @splat(0),
+    expected_server_verify: [tls12.verify_data_len]u8 = @splat(0),
     handshake_secret: Secret = .{},
     master_secret: Secret = .{},
     client_hs: Secret = .{},
@@ -463,12 +510,19 @@ pub const Session = struct {
         s.wipeSecrets();
         if (s.read) |*c| c.wipe();
         if (s.write) |*c| c.wipe();
+        if (s.read12) |*c| c.wipe();
+        if (s.write12) |*c| c.wipe();
         s.* = undefined;
     }
 
     fn wipeSecrets(s: *Session) void {
         s.handshake_secret.wipe();
         s.master_secret.wipe();
+        crypto.secureZero(u8, &s.pre_master12);
+        crypto.secureZero(u8, &s.master12);
+        crypto.secureZero(u8, &s.expected_server_verify);
+        if (s.pending_read12) |*c| c.wipe();
+        s.pending_read12 = null;
         s.client_hs.wipe();
         s.server_hs.wipe();
         s.client_ap.wipe();
@@ -526,6 +580,16 @@ pub const Session = struct {
         return s.suite;
     }
 
+    /// The TLS 1.2 suite, when the handshake negotiated TLS 1.2.
+    pub fn negotiatedSuite12(s: *const Session) ?Suite12 {
+        return s.suite12;
+    }
+
+    /// 0x0304 or 0x0303 once the ServerHello chose; 0 before.
+    pub fn negotiatedVersion(s: *const Session) u16 {
+        return s.version;
+    }
+
     /// Takes bytes received from the peer and processes every complete record.
     pub fn feed(s: *Session, bytes: []const u8) Error!void {
         if (s.state == .failed) return error.TlsFailure;
@@ -559,7 +623,8 @@ pub const Session = struct {
     /// Moves this side's sending keys forward and asks the peer to do the
     /// same (KeyUpdate with update_requested).
     pub fn requestKeyUpdate(s: *Session) Error!void {
-        if (s.state != .connected or s.close_sent) return error.TlsFailure;
+        // TLS 1.2 has no KeyUpdate.
+        if (s.state != .connected or s.close_sent or s.version != tls13) return error.TlsFailure;
         s.sendRecord(.handshake, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 1 }) catch |e| switch (e) {
             error.Alert => return s.abort(),
             error.OutOfMemory => return error.OutOfMemory,
@@ -621,7 +686,17 @@ pub const Session = struct {
         // In compatibility mode a client's first protected record follows a
         // dummy ChangeCipherSpec.
         if (s.write != null and s.role == .client and s.client_config.?.compat_mode) try s.sendChangeCipherSpec();
-        if (s.write) |*c| {
+        if (s.write12) |*c| {
+            // TLS 1.2: the record keeps its type; the payload is the
+            // explicit nonce, the ciphertext and the tag.
+            const total = frag.len + c.overhead();
+            try q.ensureUnusedCapacity(s.a, record_header_len + total);
+            var header: [5]u8 = .{ @intFromEnum(ct), 0x03, 0x03, 0, 0 };
+            std.mem.writeInt(u16, header[3..5], @intCast(total), .big);
+            try s.out.append(s.a, &header);
+            const dst = q.addManyAsSliceAssumeCapacity(total);
+            c.seal(dst, @intFromEnum(ct), frag) catch return s.fail(.internal_error, "record sequence exhausted");
+        } else if (s.write) |*c| {
             const inner_len = frag.len + 1;
             const total = inner_len + suites.tag_len;
             try q.ensureUnusedCapacity(s.a, record_header_len + total);
@@ -641,7 +716,7 @@ pub const Session = struct {
         } else {
             // The first ClientHello goes out as record version 1.0 for
             // compatibility; everything else says 1.2.
-            const legacy: u8 = if (s.role == .client and ct == .handshake and s.suite == null) 0x01 else 0x03;
+            const legacy: u8 = if (s.role == .client and ct == .handshake and s.suite == null and s.version == 0) 0x01 else 0x03;
             var header: [5]u8 = .{ @intFromEnum(ct), 0x03, legacy, 0, 0 };
             std.mem.writeInt(u16, header[3..5], @intCast(frag.len), .big);
             try s.out.append(s.a, &header);
@@ -664,7 +739,7 @@ pub const Session = struct {
             const ct: ContentType = @enumFromInt(buf[0]);
             if (buf[1] != 0x03) return s.fail(.protocol_version, "record version is not TLS");
             const len = std.mem.readInt(u16, buf[3..5], .big);
-            const limit: usize = if (s.read != null) max_ciphertext else max_plaintext;
+            const limit: usize = if (s.read12 != null) max_ciphertext12 else if (s.read != null) max_ciphertext else max_plaintext;
             if (len > limit) return s.fail(.record_overflow, "record longer than the limit");
             if (buf.len < record_header_len + len) return;
             const header = buf[0..record_header_len].*;
@@ -679,6 +754,7 @@ pub const Session = struct {
     }
 
     fn processRecord(s: *Session, ct: ContentType, header: [5]u8, payload: []u8) (Fail || Allocator.Error)!void {
+        if (s.version == tls12_version) return s.processRecord12(ct, header, payload);
         if (ct == .change_cipher_spec) {
             // A middlebox-compatibility CCS: one byte 0x01, only while the
             // handshake runs; dropped.
@@ -718,6 +794,36 @@ pub const Session = struct {
         return s.dispatch(ct, payload, false);
     }
 
+    /// A TLS 1.2 record: ChangeCipherSpec is the server's switch to its
+    /// keys; after it, every record is protected under its own type.
+    fn processRecord12(s: *Session, ct: ContentType, header: [5]u8, payload: []u8) (Fail || Allocator.Error)!void {
+        _ = header;
+        if (ct == .change_cipher_spec) {
+            if (payload.len != 1 or payload[0] != 1) return s.fail(.unexpected_message, "malformed change_cipher_spec");
+            if (s.state != .wait_server_ccs12) return s.fail(.unexpected_message, "unexpected change_cipher_spec");
+            try s.requireKeyBoundary();
+            s.read12 = s.pending_read12;
+            s.pending_read12 = null;
+            s.state = .wait_server_finished12;
+            return;
+        }
+        if (s.read12) |*c| {
+            if (payload.len < c.overhead()) return s.fail(.bad_record_mac, "protected record too short");
+            const plain = try s.a.alloc(u8, payload.len - c.overhead());
+            defer {
+                crypto.secureZero(u8, plain);
+                s.a.free(plain);
+            }
+            c.open(plain, @intFromEnum(ct), payload) catch |e| return switch (e) {
+                error.BadRecordMac => s.fail(.bad_record_mac, "record authentication failed"),
+                error.SequenceExhausted => s.fail(.internal_error, "record sequence exhausted"),
+            };
+            if (plain.len > max_plaintext) return s.fail(.record_overflow, "record plaintext longer than the limit");
+            return s.dispatch(ct, plain, true);
+        }
+        return s.dispatch(ct, payload, false);
+    }
+
     fn dispatch(s: *Session, ct: ContentType, content: []const u8, protected: bool) (Fail || Allocator.Error)!void {
         switch (ct) {
             .alert => return s.receiveAlert(content),
@@ -741,6 +847,8 @@ pub const Session = struct {
         if (content.len != 2) return s.fail(.decode_error, "malformed alert");
         if (s.hs_buf.items().len != 0) return s.fail(.unexpected_message, "alert inside a handshake message");
         const desc: AlertDescription = @enumFromInt(content[1]);
+        // TLS 1.2 warnings other than close_notify leave the connection up.
+        if (s.version == tls12_version and content[0] == 1 and desc != .close_notify) return;
         switch (desc) {
             .close_notify => s.peer_closed = true,
             .user_canceled => {},
@@ -960,8 +1068,11 @@ pub const Session = struct {
         try w.int(u16, 0x0303);
         try w.bytes(&s.random);
         try s.wvec(&w, u8, s.session_id[0..s.session_id_len]);
+        const offer12 = cfg.tls12_suites.len != 0;
         const suites_mark = try w.begin(u16);
         for (cfg.cipher_suites) |cs| try w.int(u16, @intFromEnum(cs));
+        // The TLS 1.2 suites follow; a TLS 1.3 server ignores them.
+        for (cfg.tls12_suites) |cs| try w.int(u16, @intFromEnum(cs));
         try s.wend(&w, u16, suites_mark);
         try w.bytes(&.{ 1, 0 });
         const exts_start = w.list.items.len + 2;
@@ -1002,7 +1113,17 @@ pub const Session = struct {
                 try s.wend(&w, u16, ext);
             }
             try w.int(u16, ExtensionType.supported_versions);
-            try w.bytes(&.{ 0, 3, 2, 0x03, 0x04 });
+            if (offer12) {
+                try w.bytes(&.{ 0, 5, 4, 0x03, 0x04, 0x03, 0x03 });
+                // For TLS 1.2: uncompressed points, the extended master
+                // secret, and the empty renegotiation_info of a first
+                // handshake (RFC 8422, RFC 7627, RFC 5746).
+                try w.bytes(&.{ 0, ExtensionType.ec_point_formats, 0, 2, 1, 0 });
+                try w.bytes(&.{ 0, ExtensionType.extended_master_secret, 0, 0 });
+                try w.bytes(&.{ 0xff, 0x01, 0, 1, 0 });
+            } else {
+                try w.bytes(&.{ 0, 3, 2, 0x03, 0x04 });
+            }
             try w.int(u16, ExtensionType.signature_algorithms);
             {
                 const ext = try w.begin(u16);
@@ -1026,6 +1147,12 @@ pub const Session = struct {
 
     fn clientMessage(s: *Session, ht: HandshakeType, raw: []const u8) (Fail || Allocator.Error)!void {
         const body = raw[4..];
+        // A TLS 1.2 HelloRequest while a handshake runs is ignored (RFC 5246
+        // §7.4.1.1); it is not part of the transcript.
+        if (ht == .hello_request and s.version == tls12_version and s.state != .connected) {
+            if (body.len != 0) return s.decodeFail("HelloRequest has a body");
+            return;
+        }
         switch (s.state) {
             .wait_server_hello => {
                 if (ht != .server_hello) return s.fail(.unexpected_message, "expected ServerHello");
@@ -1066,7 +1193,41 @@ pub const Session = struct {
                 if (ht != .finished) return s.fail(.unexpected_message, "expected Finished");
                 return s.clientServerFinished(raw, body);
             },
-            .connected => return s.postHandshake(ht, body),
+            .wait_certificate12 => {
+                if (ht != .certificate) return s.fail(.unexpected_message, "expected Certificate");
+                try s.clientCertificate12(body);
+                try s.appendTranscript(raw);
+                s.state = .wait_server_key_exchange12;
+            },
+            .wait_server_key_exchange12 => {
+                if (ht != .server_key_exchange) return s.fail(.unexpected_message, "expected ServerKeyExchange");
+                try s.clientServerKeyExchange12(body);
+                try s.appendTranscript(raw);
+                s.state = .wait_server_hello_done12;
+            },
+            .wait_server_hello_done12 => switch (ht) {
+                .certificate_request => {
+                    if (s.client_auth_requested) return s.fail(.unexpected_message, "a second CertificateRequest");
+                    try s.clientCertificateRequest12(body);
+                    try s.appendTranscript(raw);
+                },
+                .server_hello_done => {
+                    if (body.len != 0) return s.decodeFail("ServerHelloDone has a body");
+                    try s.appendTranscript(raw);
+                    try s.clientFinishHandshake12();
+                },
+                else => return s.fail(.unexpected_message, "expected ServerHelloDone"),
+            },
+            .wait_server_ccs12 => return s.fail(.unexpected_message, "expected ChangeCipherSpec"),
+            .wait_server_finished12 => {
+                if (ht != .finished) return s.fail(.unexpected_message, "expected Finished");
+                if (!tls12.verifyDataMatches(&s.expected_server_verify, body)) {
+                    if (body.len != tls12.verify_data_len) return s.decodeFail("Finished has the wrong length");
+                    return s.fail(.decrypt_error, "server Finished does not verify");
+                }
+                s.finishHandshake();
+            },
+            .connected => if (s.version == tls12_version) return s.postHandshake12(ht, body) else return s.postHandshake(ht, body),
             // The server states never occur on a client.
             else => unreachable,
         }
@@ -1084,8 +1245,13 @@ pub const Session = struct {
         r.expectEnd() catch return s.decodeFail("trailing bytes in ServerHello");
 
         const exts = try s.parseExtensions(ext_block);
-        const version = exts.get(ExtensionType.supported_versions) orelse
-            return s.fail(.protocol_version, "the server does not speak TLS 1.3");
+        const version = exts.get(ExtensionType.supported_versions) orelse {
+            // No supported_versions: the server chose TLS 1.2 or earlier.
+            if (cfg.tls12_suites.len == 0) return s.fail(.protocol_version, "the server does not speak TLS 1.3");
+            if (legacy_version != tls12_version) return s.fail(.protocol_version, "the server does not speak TLS 1.2 or 1.3");
+            if (s.retried) return s.fail(.illegal_parameter, "a TLS 1.2 ServerHello after a HelloRetryRequest");
+            return s.clientServerHello12(raw, random, suite_wire, compression, &exts);
+        };
         if (version.len != 2 or std.mem.readInt(u16, version[0..2], .big) != tls13)
             return s.fail(.illegal_parameter, "the server selected a version that was not offered");
         if (legacy_version != 0x0303) return s.fail(.illegal_parameter, "ServerHello legacy_version is not 1.2");
@@ -1159,6 +1325,7 @@ pub const Session = struct {
         defer crypto.secureZero(u8, &shared_buf);
 
         s.suite = suite;
+        s.version = tls13;
         try s.appendTranscript(raw);
         try s.installHandshakeKeys(shared);
         try s.requireKeyBoundary();
@@ -1167,6 +1334,185 @@ pub const Session = struct {
         // protected with the client handshake keys.
         s.setWrite(s.client_hs);
         s.state = .wait_encrypted_extensions;
+    }
+
+    // ---- client, TLS 1.2 --------------------------------------------------
+
+    /// A ServerHello that chose TLS 1.2 (the caller checked there is no
+    /// supported_versions and that 1.2 was offered).
+    fn clientServerHello12(s: *Session, raw: []const u8, random: *const [32]u8, suite_wire: u16, compression: u8, exts: *const Extensions) (Fail || Allocator.Error)!void {
+        const cfg = s.client_config.?;
+        if (std.mem.eql(u8, random[24..], downgrade_tls12) or std.mem.eql(u8, random[24..], downgrade_tls11))
+            return s.fail(.illegal_parameter, "the server downgraded a TLS 1.3 connection");
+        if (compression != 0) return s.fail(.illegal_parameter, "ServerHello selected compression");
+        const suite = Suite12.fromWire(suite_wire) orelse return s.fail(.illegal_parameter, "the server selected an unknown cipher suite");
+        if (std.mem.findScalar(Suite12, cfg.tls12_suites, suite) == null)
+            return s.fail(.illegal_parameter, "the server selected a cipher suite that was not offered");
+        var ems = false;
+        for (exts.types[0..exts.n], exts.data[0..exts.n]) |t, d| {
+            switch (t) {
+                ExtensionType.server_name => if (d.len != 0) return s.decodeFail("non-empty server_name acknowledgement"),
+                ExtensionType.ec_point_formats => {
+                    var r: wire.Reader = .init(d);
+                    const formats = r.vec(u8) catch return s.decodeFail("malformed ec_point_formats");
+                    r.expectEnd() catch return s.decodeFail("malformed ec_point_formats");
+                    if (std.mem.findScalar(u8, formats, 0) == null)
+                        return s.fail(.illegal_parameter, "the server does not accept uncompressed points");
+                },
+                ExtensionType.extended_master_secret => {
+                    if (d.len != 0) return s.decodeFail("non-empty extended_master_secret");
+                    ems = true;
+                },
+                ExtensionType.renegotiation_info => {
+                    // A first handshake's renegotiated_connection is empty.
+                    if (d.len != 1 or d[0] != 0) return s.fail(.handshake_failure, "renegotiation_info is not empty");
+                },
+                else => return s.fail(.unsupported_extension, "ServerHello carries an extension that was not offered"),
+            }
+            if (!s.offered(t)) return s.fail(.unsupported_extension, "ServerHello carries an extension that was not offered");
+        }
+        s.version = tls12_version;
+        s.suite12 = suite;
+        s.ems = ems;
+        s.server_random = random.*;
+        // The TLS 1.3 key shares go unused; the ECDHE key comes after the
+        // ServerKeyExchange names a group.
+        for (&s.shares) |*k| {
+            if (k.*) |*ks| crypto.secureZero(u8, std.mem.asBytes(ks));
+            k.* = null;
+        }
+        try s.appendTranscript(raw);
+        s.state = .wait_certificate12;
+    }
+
+    /// Certificate (RFC 5246 §7.4.2): the chain, checked as in TLS 1.3, and a
+    /// leaf key of the kind the suite authenticates with.
+    fn clientCertificate12(s: *Session, body: []const u8) (Fail || Allocator.Error)!void {
+        var r: wire.Reader = .init(body);
+        var list = r.sub(u24) catch return s.decodeFail("truncated Certificate");
+        r.expectEnd() catch return s.decodeFail("trailing bytes in Certificate");
+        var chain: [x509.max_chain_len][]const u8 = undefined;
+        var n: usize = 0;
+        while (!list.done()) {
+            const der = list.vec(u24) catch return s.decodeFail("truncated certificate entry");
+            if (der.len == 0) return s.decodeFail("empty certificate entry");
+            if (n == chain.len) return s.fail(.bad_certificate, "certificate chain too long");
+            chain[n] = der;
+            n += 1;
+        }
+        if (n == 0) return s.decodeFail("the server sent no certificate");
+        try s.acceptServerChain(chain[0..n]);
+        const algo = s.peer_key.?.algo;
+        const rsa_key = algo == .rsaEncryption or algo == .rsassa_pss;
+        if (s.suite12.?.rsa() != rsa_key)
+            return s.fail(.unsupported_certificate, "the server certificate's key does not match the cipher suite");
+    }
+
+    /// ServerKeyExchange for ECDHE (RFC 8422 §5.4): the server's point on a
+    /// named group, signed over both randoms with the certificate's key.
+    fn clientServerKeyExchange12(s: *Session, body: []const u8) (Fail || Allocator.Error)!void {
+        const cfg = s.client_config.?;
+        var r: wire.Reader = .init(body);
+        const curve_type = r.int(u8) catch return s.decodeFail("truncated ServerKeyExchange");
+        if (curve_type != 3) return s.fail(.illegal_parameter, "ServerKeyExchange does not name a curve");
+        const group: Group = @enumFromInt(r.int(u16) catch return s.decodeFail("truncated ServerKeyExchange"));
+        const point = r.vec(u8) catch return s.decodeFail("truncated ServerKeyExchange");
+        const params = body[0 .. body.len - r.remaining()];
+        const scheme = r.int(u16) catch return s.decodeFail("truncated ServerKeyExchange");
+        const sig = r.vec(u16) catch return s.decodeFail("truncated ServerKeyExchange");
+        r.expectEnd() catch return s.decodeFail("trailing bytes in ServerKeyExchange");
+
+        if (std.mem.findScalar(Group, cfg.groups, group) == null or !groupSupported(group))
+            return s.fail(.illegal_parameter, "ServerKeyExchange uses a group that was not offered");
+        if (std.mem.findScalar(u16, cfg.signature_schemes, scheme) == null)
+            return s.fail(.illegal_parameter, "ServerKeyExchange uses a signature scheme that was not offered");
+        const key = &s.peer_key.?;
+        const msg = try std.mem.concat(s.a, u8, &.{ &s.random, &s.server_random, params });
+        defer s.a.free(msg);
+        verifySignature12(scheme, key.algo, key.bytes.items, sig, msg) catch |e| return switch (e) {
+            error.SchemeMismatch => s.fail(.illegal_parameter, "ServerKeyExchange scheme does not match the certificate key"),
+            error.BadSignature => s.fail(.decrypt_error, "ServerKeyExchange signature is invalid"),
+        };
+
+        // Our ECDHE key for that group; the shared secret is the premaster.
+        s.shares[0] = try s.newShare(group);
+        var shared_buf: [48]u8 = undefined;
+        defer crypto.secureZero(u8, &shared_buf);
+        const shared = s.shares[0].?.exchange(point, &shared_buf) orelse return s.fail(.illegal_parameter, "invalid ECDHE point");
+        @memcpy(s.pre_master12[0..shared.len], shared);
+        s.pre_master12_len = @intCast(shared.len);
+    }
+
+    /// CertificateRequest (RFC 5246 §7.4.4): noted, and answered with an
+    /// empty Certificate.
+    fn clientCertificateRequest12(s: *Session, body: []const u8) Fail!void {
+        var r: wire.Reader = .init(body);
+        const types = r.vec(u8) catch return s.decodeFail("truncated CertificateRequest");
+        _ = r.vec(u16) catch return s.decodeFail("truncated CertificateRequest");
+        _ = r.vec(u16) catch return s.decodeFail("truncated CertificateRequest");
+        r.expectEnd() catch return s.decodeFail("trailing bytes in CertificateRequest");
+        if (types.len == 0) return s.decodeFail("CertificateRequest lists no certificate types");
+        s.client_auth_requested = true;
+    }
+
+    /// After ServerHelloDone: an empty Certificate if one was requested,
+    /// ClientKeyExchange, ChangeCipherSpec and Finished, and the keys.
+    fn clientFinishHandshake12(s: *Session) (Fail || Allocator.Error)!void {
+        try s.requireKeyBoundary();
+        const suite = s.suite12.?;
+        if (s.client_auth_requested) {
+            try s.sendHandshake(&.{ @intFromEnum(HandshakeType.certificate), 0, 0, 3, 0, 0, 0 });
+        }
+        {
+            var pub_buf: [97]u8 = undefined;
+            const pub_key = s.shares[0].?.publicBytes(&pub_buf);
+            var w: wire.Writer = .init(s.a);
+            defer w.deinit();
+            try w.int(u8, @intFromEnum(HandshakeType.client_key_exchange));
+            const b = try w.begin(u24);
+            try s.wvec(&w, u8, pub_key);
+            try s.wend(&w, u24, b);
+            try s.sendHandshake(w.list.items);
+        }
+        const pre = s.pre_master12[0..s.pre_master12_len];
+        if (s.ems) {
+            const session_hash = tls12.hash(suite, s.transcript.items);
+            s.master12 = tls12.masterSecret(suite, pre, &s.random, &s.server_random, &session_hash);
+        } else {
+            s.master12 = tls12.masterSecret(suite, pre, &s.random, &s.server_random, null);
+        }
+        crypto.secureZero(u8, &s.pre_master12);
+        s.pre_master12_len = 0;
+        for (&s.shares) |*k| {
+            if (k.*) |*ks| crypto.secureZero(u8, std.mem.asBytes(ks));
+            k.* = null;
+        }
+        var keys = tls12.keys(suite, &s.master12, &s.random, &s.server_random);
+        const client_verify = tls12.verifyData(suite, &s.master12, .client, &tls12.hash(suite, s.transcript.items));
+        try s.out.append(s.a, &.{ @intFromEnum(ContentType.change_cipher_spec), 0x03, 0x03, 0x00, 0x01, 0x01 });
+        s.write12 = keys.client;
+        s.pending_read12 = keys.server;
+        crypto.secureZero(u8, std.mem.asBytes(&keys));
+        var fin: [4 + tls12.verify_data_len]u8 = undefined;
+        fin[0] = @intFromEnum(HandshakeType.finished);
+        std.mem.writeInt(u24, fin[1..4], tls12.verify_data_len, .big);
+        @memcpy(fin[4..], &client_verify);
+        try s.sendHandshake(&fin);
+        s.expected_server_verify = tls12.verifyData(suite, &s.master12, .server, &tls12.hash(suite, s.transcript.items));
+        crypto.secureZero(u8, &s.master12);
+        s.state = .wait_server_ccs12;
+    }
+
+    /// After a TLS 1.2 handshake: a HelloRequest is refused with a
+    /// no_renegotiation warning; nothing else may arrive.
+    fn postHandshake12(s: *Session, ht: HandshakeType, body: []const u8) (Fail || Allocator.Error)!void {
+        switch (ht) {
+            .hello_request => {
+                if (body.len != 0) return s.decodeFail("HelloRequest has a body");
+                if (!s.close_sent) try s.sendRecord(.alert, &.{ 1, @intFromEnum(AlertDescription.no_renegotiation) });
+            },
+            else => return s.fail(.unexpected_message, "unexpected handshake message after the handshake"),
+        }
     }
 
     fn clientEncryptedExtensions(s: *Session, body: []const u8) Fail!void {
@@ -1194,6 +1540,10 @@ pub const Session = struct {
                 ExtensionType.signature_algorithms,
                 ExtensionType.psk_key_exchange_modes,
                 => return s.fail(.illegal_parameter, "EncryptedExtensions carries a hello-only extension"),
+                ExtensionType.ec_point_formats,
+                ExtensionType.extended_master_secret,
+                ExtensionType.renegotiation_info,
+                => return s.fail(.illegal_parameter, "EncryptedExtensions carries a TLS 1.2 extension"),
                 else => {},
             }
             if (t != ExtensionType.supported_groups and !s.offered(t))
@@ -1215,7 +1565,6 @@ pub const Session = struct {
     }
 
     fn clientCertificate(s: *Session, body: []const u8) (Fail || Allocator.Error)!void {
-        const cfg = s.client_config.?;
         var r: wire.Reader = .init(body);
         const context = r.vec(u8) catch return s.decodeFail("truncated Certificate");
         if (context.len != 0) return s.fail(.illegal_parameter, "server Certificate has a request context");
@@ -1233,6 +1582,13 @@ pub const Session = struct {
             n += 1;
         }
         if (n == 0) return s.decodeFail("the server sent no certificate");
+        try s.acceptServerChain(chain[0..n]);
+    }
+
+    /// Verifies the server's chain as the configuration asks and keeps the
+    /// leaf's key for the handshake signature.
+    fn acceptServerChain(s: *Session, chain: []const []const u8) (Fail || Allocator.Error)!void {
+        const cfg = s.client_config.?;
         switch (cfg.verification) {
             .trust => |t| {
                 var bundles: [2]*const Certificate.Bundle = undefined;
@@ -1243,7 +1599,7 @@ pub const Session = struct {
                         nb += 1;
                     }
                 }
-                try s.verifyServerChain(chain[0..n], bundles[0..nb], cfg.server_name.?, t.now_sec);
+                try s.verifyServerChain(chain, bundles[0..nb], cfg.server_name.?, t.now_sec);
             },
             .insecure_accept_any => {},
         }
@@ -1508,6 +1864,7 @@ pub const Session = struct {
         if (exts.get(ExtensionType.server_name)) |sn| try s.readServerName(sn);
         if (exts.get(ExtensionType.early_data) != null) s.skip_early_data = 1 << 16;
         s.suite = suite;
+        s.version = tls13;
         s.selected_group = group;
         @memcpy(s.session_id[0..ch.session_id.len], ch.session_id);
         s.session_id_len = @intCast(ch.session_id.len);
@@ -1766,6 +2123,61 @@ fn verifySignature(scheme: u16, algo: Certificate.Parsed.PubKeyAlgo, key: []cons
             try verifyPss(scheme, key, sig, msg);
         },
         // PKCS#1 v1.5 signatures are for certificates only in TLS 1.3.
+        else => return error.SchemeMismatch,
+    }
+}
+
+/// Checks a TLS 1.2 ServerKeyExchange signature. TLS 1.2 names a hash and
+/// a signature algorithm, not a curve, so an ECDSA scheme applies to a P-256
+/// or P-384 key alike, and PKCS#1 v1.5 RSA signatures are allowed.
+fn verifySignature12(scheme: u16, algo: Certificate.Parsed.PubKeyAlgo, key: []const u8, sig: []const u8, msg: []const u8) SignatureError!void {
+    const sha2 = crypto.hash.sha2;
+    switch (scheme) {
+        SignatureScheme.ecdsa_secp256r1_sha256, SignatureScheme.ecdsa_secp384r1_sha384, 0x0603 => {
+            if (algo != .X9_62_id_ecPublicKey) return error.SchemeMismatch;
+            switch (algo.X9_62_id_ecPublicKey) {
+                .X9_62_prime256v1 => try verifyEcdsa12(crypto.ecc.P256, scheme, key, sig, msg),
+                .secp384r1 => try verifyEcdsa12(crypto.ecc.P384, scheme, key, sig, msg),
+                else => return error.SchemeMismatch,
+            }
+        },
+        SignatureScheme.rsa_pkcs1_sha256, SignatureScheme.rsa_pkcs1_sha384, SignatureScheme.rsa_pkcs1_sha512 => {
+            if (algo != .rsaEncryption) return error.SchemeMismatch;
+            const rsa = Certificate.rsa;
+            if (!rsaKeyShape(key)) return error.BadSignature;
+            const parts = rsa.PublicKey.parseDer(key) catch return error.BadSignature;
+            switch (parts.modulus.len) {
+                inline 128, 256, 384, 512 => |n| {
+                    if (sig.len != n) return error.BadSignature;
+                    const pk = rsa.PublicKey.fromBytes(parts.exponent, parts.modulus) catch return error.BadSignature;
+                    const s = rsa.PKCS1v1_5Signature.fromBytes(n, sig);
+                    switch (scheme) {
+                        SignatureScheme.rsa_pkcs1_sha256 => rsa.PKCS1v1_5Signature.verify(n, s, msg, pk, sha2.Sha256) catch return error.BadSignature,
+                        SignatureScheme.rsa_pkcs1_sha384 => rsa.PKCS1v1_5Signature.verify(n, s, msg, pk, sha2.Sha384) catch return error.BadSignature,
+                        else => rsa.PKCS1v1_5Signature.verify(n, s, msg, pk, sha2.Sha512) catch return error.BadSignature,
+                    }
+                },
+                else => return error.BadSignature,
+            }
+        },
+        else => return verifySignature(scheme, algo, key, sig, msg),
+    }
+}
+
+fn verifyEcdsa12(comptime Curve: type, scheme: u16, key: []const u8, sig: []const u8, msg: []const u8) SignatureError!void {
+    const sha2 = crypto.hash.sha2;
+    switch (scheme) {
+        inline SignatureScheme.ecdsa_secp256r1_sha256, SignatureScheme.ecdsa_secp384r1_sha384, 0x0603 => |sch| {
+            const Hash = switch (sch) {
+                SignatureScheme.ecdsa_secp256r1_sha256 => sha2.Sha256,
+                SignatureScheme.ecdsa_secp384r1_sha384 => sha2.Sha384,
+                else => sha2.Sha512,
+            };
+            const E = crypto.sign.ecdsa.Ecdsa(Curve, Hash);
+            const s = E.Signature.fromDer(sig) catch return error.BadSignature;
+            const pk = E.PublicKey.fromSec1(key) catch return error.BadSignature;
+            s.verify(msg, pk) catch return error.BadSignature;
+        },
         else => return error.SchemeMismatch,
     }
 }

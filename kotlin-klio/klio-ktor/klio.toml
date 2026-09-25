@@ -108,7 +108,9 @@ root = "upstream/ktor-client/ktor-client-core/jvmAndPosix/src"
 root = "upstream/ktor-shared/ktor-sse/common/src"
 
 # ktor-websockets: the frame model, the raw and default sessions, ping/pong
-# and extensions. Common and posix are plain Kotlin.
+# and extensions. Common and posix are plain Kotlin. The permessage-deflate
+# extension is JVM-only upstream (java.util.zip); klio's port is under
+# klioMain/io/ktor/websocket, over the DEFLATE natives.
 [[source]]
 root = "upstream/ktor-shared/ktor-websockets/common/src"
 [[source]]
@@ -549,7 +551,10 @@ requires = ["utils"]
 # ktor-websockets (`io.ktor.websocket.*`): the frame model, the raw and
 # default sessions, ping/pong and extensions. Depends on ktor-http.
 [features.websockets]
-sources = ["upstream/ktor-shared/ktor-websockets/"]
+sources = [
+    "upstream/ktor-shared/ktor-websockets/",
+    "klioMain/io/ktor/websocket/",
+]
 requires = ["http"]
 
 # ktor-serialization (`io.ktor.serialization.*`): the ContentConverter

@@ -350,6 +350,8 @@ const ClientCase = struct {
         errdefer k.env.deinit();
         k.cfg = if (verify_host) k.env.trust("localhost") else .{ .server_name = "localhost", .verification = .insecure_accept_any };
         k.cfg.cipher_suites = &.{.aes_128_gcm_sha256};
+        // A TLS 1.3 peer; the TLS 1.2 cases have their own.
+        k.cfg.tls12_suites = &.{};
         k.cfg.compat_mode = false;
         k.cfg.hooks = .{ .random = client_random, .x25519_secret = client_secret };
         k.c = try Session.initClient(a, &k.cfg, @splat(5));

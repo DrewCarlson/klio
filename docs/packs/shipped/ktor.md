@@ -221,10 +221,15 @@ throw `TlsException`. Both carry the reason and the alert sent or received.
 (server, with a `TlsServerIdentity` from PEM) give the same sessions to raw
 ktor-network sockets.
 
-Limits: TLS 1.3 only on both sides (the TLS 1.2 client is planned); server keys
-are P-256 ECDSA or Ed25519 (the client verifies RSA servers too); no client
-certificates (a server's certificate request is answered with none); no
-session resumption or 0-RTT.
+The client speaks TLS 1.3 and, to a server that does not, TLS 1.2 with the
+ECDHE suites (AES-GCM or ChaCha20-Poly1305, over X25519, P-256 or P-384),
+using the extended master secret whenever the server offers it and refusing
+renegotiation. The server speaks TLS 1.3.
+
+Limits: server keys are P-256 ECDSA or Ed25519 (the client verifies RSA
+servers too); no client certificates (a server's certificate request is
+answered with none); no session resumption or 0-RTT; no TLS 1.2 CBC or RSA
+key-transport suites.
 
 ## Compression
 
@@ -244,6 +249,16 @@ decoder writes what each piece of input decodes to as it arrives. A truncated
 stream throws `EOFException("Compressed input is incomplete.")`, and a corrupt
 one an `IOException` with zlib's message (`invalid block type`, ...), where
 the JVM throws `DataFormatException` with the same message.
+
+WebSockets can compress their frames with `WebSocketDeflateExtension`
+(permessage-deflate, RFC 7692), installed in the `extensions { }` block of
+either side's WebSockets plugin with upstream's options (context takeover,
+`compressionLevel`, `compressIf`, `compressIfBiggerThan`,
+`maxInflatedFrameSize`). Upstream ships it for the JVM only; klio's port
+keeps its negotiation and framing. Each outgoing message is compressed on
+its own, which the RFC allows whatever context takeover was negotiated, so
+messages that repeat earlier ones compress a little less than on the JVM;
+incoming messages are inflated with the peer's window either way.
 
 ## Call logging
 
@@ -288,7 +303,7 @@ cases that still fail and why.
 
 ## Not included yet
 
-- A TLS 1.2 client, and RSA server keys.
+- RSA server keys.
 - Static file and resource routes (`staticFiles`, `staticResources`), which
   upstream builds on java.io.File and the class path.
 - WebSockets inside `testApplication`: upstream's native test engine does not

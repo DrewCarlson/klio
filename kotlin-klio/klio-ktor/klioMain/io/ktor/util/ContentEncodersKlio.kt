@@ -34,6 +34,12 @@ internal fun __kkz_inflate_error(handle: Long): String? = null
 internal fun __kkz_free(handle: Long) {}
 internal fun __kkz_crc32(crc: Int, bytes: ByteArray, offset: Int, length: Int): Int = 0
 
+// One message of a permessage-deflate stream (the WebSocket extension): a
+// fresh compressor flushed to a byte boundary, and an inflate after the
+// stream's earlier output that answers the output or a failure message.
+internal fun __kkz_deflate_message(bytes: ByteArray, offset: Int, length: Int, level: Int): ByteArray? = null
+internal fun __kkz_inflate_message(history: ByteArray, bytes: ByteArray, offset: Int, length: Int, max: Int): Any? = null
+
 /**
  * Implementation of [ContentEncoder] using gzip algorithm
  *
