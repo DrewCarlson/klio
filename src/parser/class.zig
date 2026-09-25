@@ -795,7 +795,7 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
         var is_override = false;
         var is_open = false;
         var is_final = false;
-        while (std.meta.activeTag(support.peekKind(p).*) == .Ident) {
+        while (std.meta.activeTag(support.peekKind(p).*) == .Ident and !support.softKeywordIsParamName(p)) {
             const t = support.text(p, support.currentSpan(p));
             if (std.mem.eql(u8, t, "public")) {
                 visibility = .Public;
@@ -842,7 +842,8 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
         }
         var is_vararg = false;
         if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
-            std.mem.eql(u8, support.text(p, support.currentSpan(p)), "vararg"))
+            std.mem.eql(u8, support.text(p, support.currentSpan(p)), "vararg") and
+            !support.softKeywordIsParamName(p))
         {
             _ = support.bump(p);
             support.skipNl(p);

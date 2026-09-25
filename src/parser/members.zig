@@ -407,6 +407,7 @@ pub fn parseParamListWith(p: *Parser, allow_no_type: bool) []Param {
         var is_noinline = false;
         while (true) {
             const t = peekIdentText(p) orelse break;
+            if (support.softKeywordIsParamName(p)) break;
             if (std.mem.eql(u8, t, "vararg")) {
                 _ = bump(p);
                 skipNl(p);

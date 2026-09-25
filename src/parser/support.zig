@@ -228,6 +228,20 @@ pub fn peekIdentText(p: *const Parser) ?[]const u8 {
     return null;
 }
 
+/// Whether the soft keyword at the cursor names a value parameter rather
+/// than modifying it: a name is what `,`, `:`, `=` or `)` follows, so
+/// `actual: Double?` and `vararg: Int` are parameters named `actual` and
+/// `vararg`.
+pub fn softKeywordIsParamName(p: *const Parser) bool {
+    var i = p.pos + 1;
+    while (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Newline) i += 1;
+    if (i >= p.tokens.len) return true;
+    return switch (p.tokens[i].kind) {
+        .Comma, .Colon, .Eq, .RParen => true,
+        else => false,
+    };
+}
+
 pub fn peekKeywordIdent(p: *const Parser, name: []const u8) bool {
     return std.meta.activeTag(peekKind(p).*) == .Ident and
         std.mem.eql(u8, text(p, currentSpan(p)), name);

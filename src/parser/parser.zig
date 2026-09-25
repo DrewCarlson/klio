@@ -1121,6 +1121,46 @@ test "a primary constructor keeps the annotations written before `constructor`" 
     try testing.expectEqual(@as(usize, 1), out.file.decls[1].Class.annotations.len);
 }
 
+test "a soft keyword followed by `:` names a parameter" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class Subject
+        \\internal constructor(
+        \\    actual: Double?,
+        \\    open: Int = 1,
+        \\    private val internal: Int,
+        \\    vararg final: String,
+        \\) {
+        \\    fun isZero() = actual == 0.0
+        \\}
+        \\fun f(vararg: Int, noinline: Boolean, crossinline: String, vararg open: Int) {}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const c = out.file.decls[0].Class;
+    try testing.expectEqual(@as(usize, 4), c.primary_params.len);
+    try testing.expectEqualStrings("actual", c.primary_params[0].name.name);
+    try testing.expectEqual(@as(?bool, null), c.primary_params[0].property);
+    try testing.expectEqualStrings("open", c.primary_params[1].name.name);
+    try testing.expect(!c.primary_params[1].is_open);
+    try testing.expectEqualStrings("internal", c.primary_params[2].name.name);
+    try testing.expectEqual(ast.Visibility.Private, c.primary_params[2].visibility);
+    try testing.expectEqualStrings("final", c.primary_params[3].name.name);
+    try testing.expect(c.primary_params[3].is_vararg);
+    // The body is the class's, not declarations of the file.
+    try testing.expectEqual(@as(usize, 2), out.file.decls.len);
+    const f = out.file.decls[1].Function;
+    try testing.expectEqual(@as(usize, 4), f.params.len);
+    try testing.expectEqualStrings("vararg", f.params[0].name.name);
+    try testing.expect(!f.params[0].is_vararg);
+    try testing.expectEqualStrings("noinline", f.params[1].name.name);
+    try testing.expect(!f.params[1].is_noinline);
+    try testing.expectEqualStrings("crossinline", f.params[2].name.name);
+    try testing.expect(!f.params[2].is_crossinline);
+    try testing.expectEqualStrings("open", f.params[3].name.name);
+    try testing.expect(f.params[3].is_vararg);
+}
+
 test "infix_call_no_newline_break" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
