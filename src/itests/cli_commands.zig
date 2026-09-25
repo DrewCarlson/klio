@@ -197,6 +197,117 @@ test "a library runs its own sources beside its installed pack" {
     try std.testing.expectEqualStrings("hello, user\n", u.stdout);
 }
 
+/// Builds and installs the pack of the project at `dir` (under TMP_ROOT) from
+/// its klio.toml and one source file.
+fn installPack(c: *Ctx, dir: []const u8, id: []const u8, manifest_tail: []const u8, src_rel: []const u8, src: []const u8) !void {
+    _ = try write(c, try std.fmt.allocPrint(c.a, "{s}/klio.toml", .{dir}), try std.fmt.allocPrint(c.a,
+        \\[library]
+        \\id = "{s}"
+        \\version = "0.1.0"
+        \\abi = 1
+        \\
+        \\[[source]]
+        \\root = "src"
+        \\
+        \\{s}
+    , .{ id, manifest_tail }));
+    _ = try write(c, try std.fmt.allocPrint(c.a, "{s}/src/{s}", .{ dir, src_rel }), src);
+    const abs = try std.fmt.allocPrint(c.a, "{s}/{s}", .{ TMP_ROOT, dir });
+    try expectCode(try klio(c, abs, &.{ "pack", "build", "." }), 0);
+    const built = try std.fmt.allocPrint(c.a, "target/packs/{s}.klio-pack", .{id});
+    try expectCode(try klio(c, abs, &.{ "pack", "install", built }), 0);
+}
+
+test "a pack's declared dependency loads with it, reached by a qualified name" {
+    const c = try ctx();
+    try installPack(c, "depbase", "demo.depbase", "[deps]\nstdlib = \"*\"\n", "demo/depbase/Base.kt",
+        \\package demo.depbase
+        \\
+        \\class Event(val x: Float) { override fun toString() = "Event($x)" }
+        \\
+    );
+    // The top pack names the dependency only by qualified name, with no import.
+    try installPack(c, "deptop", "demo.deptop", "[deps]\nstdlib = \"*\"\n\"demo.depbase\" = \"*\"\n", "demo/deptop/Top.kt",
+        \\package demo.deptop
+        \\
+        \\fun top(): String = demo.depbase.Event(1f).toString()
+        \\
+    );
+    // The program imports the top pack alone and never names the dependency.
+    const path = try write(c, "use_deptop.kt",
+        \\import demo.deptop.top
+        \\
+        \\fun main() {
+        \\    println(top())
+        \\}
+        \\
+    );
+    const r = try klio(c, null, &.{ "run", path });
+    try expectCode(r, 0);
+    try std.testing.expectEqualStrings("Event(1.0)\n", r.stdout);
+}
+
+test "a dependency of an unrequested feature does not load" {
+    const c = try ctx();
+    try installPack(c, "featdep", "demo.featdep", "[deps]\nstdlib = \"*\"\n", "demo/featdep/Dep.kt",
+        \\package demo.featdep
+        \\
+        \\fun dep(): String = "dep"
+        \\
+    );
+    _ = try write(c, "feathost/src/demo/feathost/Extra.kt",
+        \\package demo.feathost
+        \\
+        \\fun extra(): String = demo.featdep.dep()
+        \\
+    );
+    try installPack(c, "feathost", "demo.feathost",
+        \\[features]
+        \\default = ["core"]
+        \\core = { sources = ["src/demo/feathost/Core.kt"] }
+        \\extra = { sources = ["src/demo/feathost/Extra.kt"], requires = ["core"], deps = ["demo.featdep"] }
+        \\
+        \\[deps]
+        \\stdlib = "*"
+        \\
+    , "demo/feathost/Core.kt",
+        \\package demo.feathost
+        \\
+        \\fun core(): String = "core"
+        \\
+    );
+    var env = try c.env.clone(c.a);
+    try env.put("KLIO_PACK_TRACE", "1");
+    // Without the feature its dependency stays out.
+    const core_only = try write(c, "use_feathost_core.kt",
+        \\import demo.feathost.core
+        \\
+        \\fun main() { println(core()) }
+        \\
+    );
+    const off = try klioEnv(c, &env, null, &.{ "run", core_only });
+    try expectCode(off, 0);
+    try std.testing.expectEqualStrings("core\n", off.stdout);
+    try expectContains(off.stderr, "[pack-load] demo.feathost ");
+    if (std.mem.find(u8, off.stderr, "[pack-load] demo.featdep ") != null) {
+        std.debug.print("demo.featdep loaded without its feature:\n{s}\n", .{off.stderr});
+        return error.TestUnexpectedResult;
+    }
+    // With it, the dependency loads and the feature's qualified name into it
+    // resolves.
+    const with_extra = try write(c, "use_feathost_extra.kt",
+        \\import demo.feathost.core
+        \\import demo.feathost.extra
+        \\
+        \\fun main() { println(core() + " " + extra()) }
+        \\
+    );
+    const on = try klioEnv(c, &env, null, &.{ "run", "--feature", "demo.feathost/extra", with_extra });
+    try expectCode(on, 0);
+    try std.testing.expectEqualStrings("core dep\n", on.stdout);
+    try expectContains(on.stderr, "[pack-load] demo.featdep ");
+}
+
 test "an installed pack that does not decode is reported" {
     const c = try ctx();
     const pack = HOME ++ "/.klio/packs/demo.broken-0.1.0.klio-pack";

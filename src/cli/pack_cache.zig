@@ -969,6 +969,12 @@ fn loadEmbeddedStdlibSources(
     }
 }
 
+/// Whether a `[deps]` entry names an installed pack rather than the embedded
+/// standard library.
+fn isPackDependency(library_id: []const u8) bool {
+    return !std.mem.eql(u8, library_id, "stdlib");
+}
+
 /// Bidirectional dotted-prefix match: `imp == pkg`, or either starts with the other plus a dot.
 pub fn importPrefixMatches(
     allocator: Allocator,
@@ -1568,6 +1574,8 @@ fn loadInstalledPacksImpl(
     };
     defer gpa.free(cache);
 
+    // KLIO_PACK_TRACE: one line per pack the program loads.
+    const pack_trace = envVarPresent(gpa, "KLIO_PACK_TRACE");
     var merged = mergedHostBindings(gpa);
     defer merged.deinit();
 
@@ -1598,6 +1606,10 @@ fn loadInstalledPacksImpl(
 
     var loaded_lib_ids = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&loaded_lib_ids);
+    // The library ids loaded packs declare in `[deps]`: each loads by its own
+    // id, where an import prefix also reaches the packs nested under it.
+    var dep_ids = std.StringHashMap(void).init(gpa);
+    defer freeStringSet(&dep_ids);
 
     var declared = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&declared);
@@ -1644,6 +1656,8 @@ fn loadInstalledPacksImpl(
         defer freeStringSet(&pre_wanted);
         var pre_prefixes = std.StringHashMap(void).init(gpa);
         defer freeStringSet(&pre_prefixes);
+        var pre_deps = std.StringHashMap(void).init(gpa);
+        defer freeStringSet(&pre_deps);
         {
             var it = known_prefixes.keyIterator();
             while (it.next()) |k| {
@@ -1658,7 +1672,7 @@ fn loadInstalledPacksImpl(
             for (candidates) |*c| {
                 const lib_id = c.manifest.library_id;
                 if (restrict and !declared.contains(lib_id)) continue;
-                if (!importPrefixMatches(gpa, &pre_prefixes, lib_id)) continue;
+                if (!pre_deps.contains(lib_id) and !importPrefixMatches(gpa, &pre_prefixes, lib_id)) continue;
                 // The contribution loop below is idempotent, so re-visiting is safe.
                 if (!pre_wanted.contains(lib_id)) {
                     const dup = try gpa.dupe(u8, lib_id);
@@ -1694,6 +1708,11 @@ fn loadInstalledPacksImpl(
                         const dep_gop = declared.getOrPut(dep_dup) catch continue;
                         if (dep_gop.found_existing) gpa.free(dep_dup) else dep_gop.value_ptr.* = {};
                     }
+                    // A declared dependency loads with the pack that declares it.
+                    if (isPackDependency(dep.library_id) and !pre_deps.contains(dep.library_id)) {
+                        try pre_deps.put(try gpa.dupe(u8, dep.library_id), {});
+                        changed = true;
+                    }
                     if (dep.features.len != 0) {
                         if (try addFeatureSliceChanged(gpa, &feature_reqs, dep.library_id, dep.features)) changed = true;
                     }
@@ -1714,17 +1733,23 @@ fn loadInstalledPacksImpl(
             for (new_prefixes.items) |s| gpa.free(s);
             new_prefixes.deinit(gpa);
         }
+        var new_deps: std.ArrayList([]u8) = .empty;
+        defer {
+            for (new_deps.items) |s| gpa.free(s);
+            new_deps.deinit(gpa);
+        }
 
         for (candidates) |*c| {
             const lib_id = c.manifest.library_id;
             if (loaded_lib_ids.contains(lib_id)) continue;
             if (restrict and !declared.contains(lib_id)) continue;
-            const wanted = importPrefixMatches(gpa, &known_prefixes, lib_id);
+            const wanted = dep_ids.contains(lib_id) or importPrefixMatches(gpa, &known_prefixes, lib_id);
             if (!wanted) continue;
             const lib_dup = try gpa.dupe(u8, lib_id);
             const gop = try loaded_lib_ids.getOrPut(lib_dup);
             if (gop.found_existing) gpa.free(lib_dup) else gop.value_ptr.* = {};
             progressed = true;
+            if (pack_trace) io.printStderr(gpa, "[pack-load] {s} {s}\n", .{ lib_id, c.path });
 
             var active = try resolveActiveFeatures(gpa, &c.manifest, feature_reqs.getPtr(lib_id));
             defer active.deinit();
@@ -1762,7 +1787,13 @@ fn loadInstalledPacksImpl(
                     }
                 }
             }
+            // A declared dependency loads with the pack that declares it, as
+            // its classpath would carry it: a qualified reference into it
+            // needs no import.
             for (c.manifest.dependencies) |dep| {
+                if (isPackDependency(dep.library_id)) {
+                    try new_deps.append(gpa, try gpa.dupe(u8, dep.library_id));
+                }
                 if (dep.features.len != 0) {
                     try addFeatureSlice(gpa, &feature_reqs, dep.library_id, dep.features);
                 }
@@ -1804,6 +1835,10 @@ fn loadInstalledPacksImpl(
             const pp = try known_prefixes.getOrPut(dup);
             if (pp.found_existing) gpa.free(dup) else pp.value_ptr.* = {};
         }
+        for (new_deps.items) |d| {
+            if (dep_ids.contains(d)) continue;
+            try dep_ids.put(try gpa.dupe(u8, d), {});
+        }
     }
 
     // A wanted pack that failed to decode is a broken environment, not a missing
@@ -1813,7 +1848,7 @@ fn loadInstalledPacksImpl(
         const base = std.fs.path.basename(f.path);
         const lib_id = packLibIdFromBasename(base) orelse continue;
         if (loaded_lib_ids.contains(lib_id)) continue;
-        if (!importPrefixMatches(gpa, &known_prefixes, lib_id)) continue;
+        if (!dep_ids.contains(lib_id) and !importPrefixMatches(gpa, &known_prefixes, lib_id)) continue;
         io.printStderr(
             gpa,
             "warning: skipping installed pack {s}: {s}\n" ++

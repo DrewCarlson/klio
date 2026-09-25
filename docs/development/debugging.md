@@ -331,6 +331,7 @@ overrides and traces.
 | `KLIO_HOME` | path | The klio data home (packs, cache, registry, stubs); overrides the `~/.klio` default | none |
 | `KLIO_STDLIB_PACK` | path | On-disk stdlib pack override, first in the resolution order (also folded into the image cache key) | none |
 | `KLIO_PACK_DIAG` | set | Per-source lex/parse error dumps while the stdlib and pack sources load | `[embed lex err]` |
+| `KLIO_PACK_TRACE` | set | One line per installed pack a run or `klio sema` loads, with its path | `[pack-load]` |
 | `KLIO_AST_REBASE_TRACE` | set | Old-to-new FileId mapping when a cached AST bundle's spans are rebased | `[ast-rebase]` |
 | `KLIO_BUNDLE_INSPECT` | `1` (`0` off) | A bundled executable prints its manifest and payload table, then exits without running | manifest listing |
 | `KLIO_STUB_DIR` | directory | Local source for cross-target runtime stubs and Skia shims (`<dir>/<target>/<name>`), checked before the download cache | none |

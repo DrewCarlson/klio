@@ -79,7 +79,10 @@ A program's dependencies belong in its `klio.toml`: `[deps]` names the
 packs and the features of each, and that is the whole load set. A file
 run without a manifest still selects packs by matching its imports
 against installed pack ids; that path exists for one-off scripts and is
-being retired in favour of declared dependencies. The shipped feature
+being retired in favour of declared dependencies. Either way, a loaded
+pack brings the packs its own `[deps]` name, as a classpath would, so
+its code may reach them by qualified name with no import;
+`KLIO_PACK_TRACE=1` prints each pack a run loads. The shipped feature
 tables are on each pack's page: [kotlinx.coroutines](shipped/coroutines.md),
 [kotlinx.serialization](shipped/serialization.md),
 [kotlinx.io](shipped/io.md), and [io.ktor](shipped/ktor.md).
