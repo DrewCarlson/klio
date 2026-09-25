@@ -699,6 +699,38 @@ pub const suites = [_]Config{
         .max_failed = 0,
         .max_incomplete = 0,
     },
+    .{
+        // animation-core's commonTest, asserted through upstream Kruth.
+        .name = "compose_animation",
+        .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/compose/animation/animation-core/src/commonTest/kotlin"},
+        .extra_support = &kruth_support,
+        .extra_args = &.{ "--feature", "kotlinx.coroutines/test" },
+        .batch_dirs = true,
+        .timeout_ms = 300_000,
+        .baseline = 103,
+        .max_failed = 4,
+        .max_incomplete = 0,
+    },
+    .{
+        // graphics-shapes' commonTest (the rounded polygons and morphs
+        // material3 draws), asserted through upstream Kruth.
+        .name = "compose_shapes",
+        .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/graphics/graphics-shapes/src/commonTest/kotlin"},
+        .extra_support = &kruth_support,
+        .batch_dirs = true,
+        .timeout_ms = 300_000,
+        .baseline = 148,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+};
+
+/// androidx.kruth, the assertion library the compose suites are written
+/// against, from the upstream checkout.
+const kruth_support = [_][]const u8{
+    "kotlin-klio/klio-compose-runtime/upstream/kruth/kruth/src/commonMain/kotlin",
+    "kotlin-klio/klio-compose-runtime/upstream/kruth/kruth/src/nonJvmMain/kotlin",
+    "kotlin-klio/klio-compose-runtime/upstream/kruth/kruth/src/nativeMain/kotlin",
 };
 
 pub fn runSuiteNamed(name: []const u8) !void {

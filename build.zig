@@ -422,6 +422,30 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlin-test",
         "tests/compose_ui_commontest_actuals",
     }, .weight = 12 },
+    .{ .name = "compose_animation_commontest", .needs_exe = true, .home = true, .dirs = &.{
+        "kotlin-klio/klio-androidx-annotation",
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-compose-runtime-engine",
+        "kotlin-klio/klio-compose-ui-util",
+        "kotlin-klio/klio-compose-ui-geometry",
+        "kotlin-klio/klio-compose-ui-unit",
+        "kotlin-klio/klio-compose-ui-graphics",
+        "kotlin-klio/klio-compose-ui-text",
+        "kotlin-klio/klio-compose-ui-core",
+        "kotlin-klio/klio-compose-animation-core",
+        "kotlin-klio/klio-navigationevent",
+        "kotlin-klio/klio-navigationevent-compose",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 2 },
+    .{ .name = "compose_shapes_commontest", .needs_exe = true, .home = true, .dirs = &.{
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-graphics-shapes",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 1 },
 };
 
 /// Read by the stdlib pack's tests: the stdlib pack is built at runtime from
