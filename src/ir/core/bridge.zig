@@ -2303,7 +2303,7 @@ const Build = struct {
             }
             var params: std.ArrayList(ir.Param) = .empty;
             try b.paramsOf(origin, caps[idx], &params);
-            var f: ir.Func = .{
+            const f: ir.Func = .{
                 .id = id,
                 .name = try b.funcName(origin),
                 .fqn = try b.funcFqn(origin),
@@ -2314,7 +2314,6 @@ const Build = struct {
                 .entry = ir.BlockId.from(0),
                 .is_suspend = b.isSuspend(origin),
             };
-            resolved.declineTiers(&f);
             b.br.m.funcs.appendAssumeCapacity(f);
         }
         b.br.captures_of = caps;
@@ -2622,6 +2621,7 @@ const Build = struct {
         for (std.enums.values(runtime.WellKnownObject)) |o| {
             r.well_known_objects.set(o, b.br.classOfOpt(s.classByFqn(o.fqn())));
         }
+        for (std.enums.values(runtime.WellKnownClass)) |c| r.well_known_classes.set(c, b.primaryOf(c.fqn()));
         for (std.enums.values(runtime.WellKnownStatic)) |w| r.well_known_statics.set(w, b.wellKnownStatic(w));
         r.host_class = try b.hostClasses();
         r.exceptions = try b.exceptions(base.exceptions);
@@ -2939,6 +2939,9 @@ const Build = struct {
                 if (b.br.funcOfOpt(m)) |f| h.to_string_slot = b.br.slotOf(f);
             }
         }
+        h.list = b.classByFqn("kotlin.collections.List");
+        h.set = b.classByFqn("kotlin.collections.Set");
+        h.map = b.classByFqn("kotlin.collections.Map");
         const entry = s.classByFqn("kotlin.collections.Map.Entry");
         if (entry != .none) {
             h.map_entry = b.br.classOfOpt(entry);
@@ -3015,6 +3018,8 @@ const Build = struct {
         const s = b.s;
         var out: resolved.WellKnownSlots = .initFill(null);
         for (std.enums.values(runtime.WellKnown)) |member| {
+            // One slot per arity: `HostClasses.invoke_slot`.
+            if (member == .invoke) continue;
             const w = wellKnownDeclaration(member);
             const cls = s.classByFqn(w.class);
             if (cls == .none) continue;
@@ -3414,11 +3419,6 @@ fn sameParamTypes(s: *sema.Sema, a: Sym, a_subst: *const sema.types.Subst, b: Sy
     return true;
 }
 
-/// The value arguments well-known function `member` takes.
-pub fn wellKnownArity(member: runtime.WellKnown) usize {
-    return wellKnownDeclaration(member).arity;
-}
-
 /// The class declaring well-known `member`, and the value arguments a
 /// function member takes.
 fn wellKnownDeclaration(member: runtime.WellKnown) struct { class: []const u8, arity: u8 = 0 } {
@@ -3446,6 +3446,8 @@ fn wellKnownDeclaration(member: runtime.WellKnown) struct { class: []const u8, a
         .next_int => .{ .class = "kotlin.random.Random", .arity = 1 },
         .context_get => .{ .class = "kotlin.coroutines.CoroutineContext", .arity = 1 },
         .handle_exception => .{ .class = "kotlinx.coroutines.CoroutineExceptionHandler", .arity = 2 },
+        // Declared once per arity, by `kotlin.jvm.functions.FunctionN`.
+        .invoke => .{ .class = "" },
     };
 }
 

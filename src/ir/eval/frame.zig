@@ -13,10 +13,7 @@ const Func = ir.Func;
 const Module = ir.Module;
 const Reg = ir.Reg;
 
-const exec_call = @import("../exec_call.zig");
 
-const ownReceiverEntry = exec_call.ownReceiverEntry;
-const sameReceiver = exec_call.sameReceiver;
 
 const parent = @import("../eval.zig");
 const ev_chain = @import("chain.zig");
@@ -26,21 +23,12 @@ const ev_flow = @import("flow.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 
-const EnclosingEntry = ev_state.EnclosingEntry;
 const EvalError = ev_state.EvalError;
 const EvalTls = ev_state.EvalTls;
 const FlatCallReq = ev_flow.FlatCallReq;
 const PendingFinallyState = ev_snapshot.PendingFinallyState;
 const acquireRegs = ev_state.acquireRegs;
-const chainAcquire = ev_chain.chainAcquire;
-const chainAllocator = ev_chain.chainAllocator;
-const chainRelease = ev_chain.chainRelease;
-const chainTraceOn = ev_flow.chainTraceOn;
-const coerceGenericIntPeersToLong = ev_enter.coerceGenericIntPeersToLong;
-const coerceIntArgsToLong = ev_enter.coerceIntArgsToLong;
-const coercePlanFor = ev_enter.coercePlanFor;
 const cvTraceOn = ev_flow.cvTraceOn;
-const dispatchBump = ev_diag.dispatchBump;
 const frameCensusBump = ev_diag.frameCensusBump;
 const fuseCensusBump = ev_diag.fuseCensusBump;
 const missTraceWant = ev_flow.missTraceWant;
@@ -93,13 +81,6 @@ pub const Frame = struct {
     wmask: RegMask,
     params: std.ArrayList(Value),
     captures: std.ArrayList(Value),
-    /// The enclosing-`this` chain this frame runs with, innermost last: the frame's lexical receivers plus
-    /// what dispatch pushed for this call. Snapshotted on suspend and restored verbatim on resume.
-    enclosing_this: std.ArrayList(EnclosingEntry),
-    /// The `evtlsPtr().active_chain` to restore on exit, returning receiver resolution to the caller's chain.
-    prev_chain: ?*std.ArrayList(EnclosingEntry),
-    /// The caller's `evtlsPtr().active_chain_base`, restored on exit alongside `prev_chain`.
-    prev_chain_base: usize,
     /// The per-method sub-module this frame runs in (anonymous object, local or nested class), null in the
     /// main module. Carried into the snapshot so a suspended method resolves `FuncId` against that module.
     module_arc: ?*const Module,
@@ -117,12 +98,6 @@ pub const Frame = struct {
     step_err: ?EvalError = null,
     /// Out-of-band payload for `Step.flat_call`, set and consumed within one dispatch step.
     flat_call: ?FlatCallReq = null,
-    /// The dispatch receiver a caller handed this member-extension frame, borrowed from the chain entry it
-    /// pushed; `Null` until one arrives, or when the caller pushed none.
-    dispatch_this: Value = .Null,
-    /// The context arguments a caller handed this contextual frame, in declaration order, borrowed from
-    /// the `context` chain entries it pushed; empty when the caller pushed none.
-    ctx_values: std.ArrayList(Value) = .empty,
     pending_finally: PendingFinallyState = .{},
     /// The per-thread evaluator state, resolved once when the frame is built: macOS reaches a thread-local
     /// through a call the compiler cannot hoist, so every access site would otherwise pay its own.
@@ -159,11 +134,6 @@ pub const Frame = struct {
                 if (func.fqn.len != 0) func.fqn else func.name, params.items.len, func.params.len, caller,
             });
         }
-        // The coercion walks trigger only on specific declared param shapes; compute once per func which can apply.
-        const plan = coercePlanFor(module, func);
-        if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
-        if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
-        dispatchBump(.frame_push);
         if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
             for (params.items, 0..) |*pv, pi| {
                 const payload: i64 = switch (pv.*) {
@@ -198,81 +168,10 @@ pub const Frame = struct {
             .wmask = if (no_fill) RegMask.none else RegMask.all,
             .params = params,
             .captures = captures,
-            .enclosing_this = chainAcquire(ev),
-            .prev_chain = null,
-            .prev_chain_base = 0,
             .module_arc = null,
             .allocator = allocator,
             .tls = ev,
         };
-    }
-
-    /// Seed this frame's enclosing-`this` chain and make it active for the frame's lifetime. Kotlin receiver
-    /// scope is lexical, so the seed is `seed` plus the pushes dispatch made for this call, not the caller's chain.
-    pub fn activateChain(self: *Frame, seed: []const EnclosingEntry) Allocator.Error!void {
-        if (chainTraceOn()) {
-            std.debug.print("[chain] enter tid={d} tls={*} frame={*} caller={*} base={d} fn={s}\n", .{
-                std.Thread.getCurrentId(), self.tls, self, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
-            });
-        }
-        for (seed) |e| {
-            if (e.kind == .access) continue;
-            try self.enclosing_this.append(chainAllocator(), e);
-        }
-        if (self.tls.active_chain) |caller| {
-            const base = @min(self.tls.active_chain_base, caller.items.len);
-            // The caller's own context values stay visible to a callee that
-            // derives one from its chain: the by-name paths' fallback.
-            for (caller.items[0..base]) |e| {
-                if (e.kind == .context or e.kind == .access_context) try self.enclosing_this.append(chainAllocator(), .{ .v = e.v, .kind = .access_context });
-            }
-            for (caller.items[base..]) |e| {
-                if (e.kind == .access) continue;
-                if (e.kind == .dispatch) self.dispatch_this = e.v;
-                if (e.kind == .context) try self.ctx_values.append(self.allocator, e.v);
-                try self.enclosing_this.append(chainAllocator(), e);
-            }
-        }
-        // A method or extension body's own receiver is the innermost lexical receiver of everything written
-        // inside it, so it joins the seeded base rather than the in-flight pushes and never leaks into callees.
-        if (ownReceiverEntry(self.func, self.params.items)) |own| {
-            const items = self.enclosing_this.items;
-            const dup = items.len > 0 and sameReceiver(items[items.len - 1].v, own.v);
-            if (!dup) try self.enclosing_this.append(chainAllocator(), own);
-        }
-        self.activateAs();
-    }
-
-    /// Seed this frame's chain from a saved snapshot slice (resume path) and make it active.
-    pub fn activateChainFrom(self: *Frame, saved: []const EnclosingEntry) Allocator.Error!void {
-        try self.enclosing_this.appendSlice(chainAllocator(), saved);
-        for (saved) |e| {
-            if (e.kind == .dispatch) self.dispatch_this = e.v;
-            if (e.kind == .context) try self.ctx_values.append(self.allocator, e.v);
-        }
-        self.activateAs();
-    }
-
-    pub fn activateAs(self: *Frame) void {
-        if (chainTraceOn()) {
-            std.debug.print("[chain] act tid={d} tls={*} frame={*} list={*} prev={*} base={d} fn={s}\n", .{
-                std.Thread.getCurrentId(), self.tls, self, &self.enclosing_this, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
-            });
-        }
-        self.prev_chain = self.tls.active_chain;
-        self.prev_chain_base = self.tls.active_chain_base;
-        self.tls.active_chain = &self.enclosing_this;
-        self.tls.active_chain_base = self.enclosing_this.items.len;
-    }
-
-    pub fn deactivateChain(self: *Frame) void {
-        if (chainTraceOn()) {
-            std.debug.print("[chain] deact tid={d} tls={*} frame={*} restore={*} fn={s}\n", .{
-                std.Thread.getCurrentId(), self.tls, self, self.prev_chain, self.func.name,
-            });
-        }
-        self.tls.active_chain = self.prev_chain;
-        self.tls.active_chain_base = self.prev_chain_base;
     }
 
     pub fn deinit(self: *Frame) void {
@@ -297,14 +196,12 @@ pub const Frame = struct {
             }
             self.pending_finally.release(self.allocator);
         }
-        self.ctx_values.deinit(self.allocator);
         // Args before regs: `releaseRegs` runs the depth-0 pool drain, so the outermost frame's own carriers must
         // already be pooled. The pools belong to the thread tearing the frame down, not the one that built it.
         const ev: *EvalTls = ev_state.evtlsPtr();
         releaseArgsIn(ev, self.allocator, &self.params);
         releaseArgsIn(ev, self.allocator, &self.captures);
         releaseRegs(ev, self.allocator, &self.regs);
-        chainRelease(ev, &self.enclosing_this);
     }
 
     pub fn read(self: *const Frame, r: Reg) Value {
@@ -344,3 +241,13 @@ pub const Frame = struct {
         self.wmask.setAll();
     }
 };
+
+/// Pull `n` register values from `args_start` into a fresh slice. Caller frees.
+pub fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32) Allocator.Error![]Value {
+    const out = try allocator.alloc(Value, n);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        out[i] = frame.read(Reg.from(args_start.int() + i));
+    }
+    return out;
+}

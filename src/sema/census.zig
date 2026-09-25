@@ -60,6 +60,9 @@ pub const Reason = enum(u8) {
     /// A `when` guard where none may stand: in a `when` without a subject,
     /// or after several conditions.
     when_guard,
+    /// A member function or property declared without `override` that has
+    /// the signature of a supertype's member.
+    member_hidden,
 };
 
 /// What one tentative resolution recorded. `refs` holds the analysis's

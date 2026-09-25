@@ -89,12 +89,6 @@ fn nodeEq(a: ArrayData, b: ArrayData, shift: u32, remaining: usize) ?bool {
     return true;
 }
 
-/// The gate a flat-call preparer uses to stand aside.
-pub fn isVectorClass(inst: ObjRef(InstanceData)) bool {
-    if (classMatches(inst, &small_class_hit, SMALL_FQN)) return true;
-    return classMatches(inst, &vec_class_hit, VEC_FQN);
-}
-
 /// Ordered host scan for `element`: its first index, -1 when absent, null when an
 /// element needs dispatched equality.
 pub fn tryIndexOf(a: ObjRef(InstanceData), element: *const Value) ?i64 {

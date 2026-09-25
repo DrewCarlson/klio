@@ -83,17 +83,6 @@ pub fn currentComposer() ?Value {
     return composer_stack.items[composer_stack.items.len - 1];
 }
 
-/// The threaded `$composer`, or null when the call is not a threaded composable. The
-/// plugin ABI ends the parameter list with `$composer, $changed` and right-aligns `args`
-/// with `params`: 1:1 for a free call, one shorter when `params` carry a leading `this`.
-pub fn threadedComposerArgFor(fqn: []const u8, params: []const ir.Param, args: []const Value) ?Value {
-    const got = threadedComposerArg(params, args);
-    if (got != null and runtime.envOnce("KLIO_COMPOSER_BIND_TRACE") != null) {
-        std.debug.print("[composer-bind-fn] {s}\n", .{fqn});
-    }
-    return got;
-}
-
 pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value {
     if (params.len < 2 or args.len < 2) return null;
     if (args.len != params.len and args.len != params.len - 1) return null;

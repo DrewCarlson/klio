@@ -419,8 +419,8 @@ fn resolvedFailure(st: *RunState, vm: *Vm, oc: interp_ir.CallOutcome) ?[]const u
         .ok => null,
         .threw => |v| blk: {
             if (v == .Instance) {
-                const r = vm.callMethod(&v, "toString") catch break :blk describeThrow(st.gpa, v);
-                if (r == .ok and r.ok == .String) break :blk r.ok.display(st.gpa) catch "exception";
+                const text = vm.throwableText(st.gpa, &v) catch break :blk describeThrow(st.gpa, v);
+                if (text) |t| break :blk t;
             }
             break :blk describeThrow(st.gpa, v);
         },

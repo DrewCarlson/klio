@@ -416,7 +416,7 @@ pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
         .{ .name = "__grouping_src", .value = src },
         .{ .name = "__grouping_key", .value = block },
     };
-    return ok(try ctx.host.newSynthInstance("kotlin.collections.Grouping", id, &fields));
+    return ok(try ctx.host.newHostInstance(.grouping, id, &fields));
 }
 
 pub fn coll_grouping_source_iterator(ctx: *CallCtx) Error!EvalResult {

@@ -134,7 +134,7 @@ fn makeBuilderSequence(ctx: *CallCtx) std.mem.Allocator.Error!union(enum) { seq:
         .{ .name = seq_value_field, .value = .Unit },
         .{ .name = seq_yield_iter_field, .value = .Null },
     };
-    const scope = try ctx.host.newSynthInstance("kotlin.sequences.SequenceScope", id, &fields);
+    const scope = try ctx.host.newHostInstance(.sequence_scope, id, &fields);
     if (runtime.reclaimEnabled()) block.retain();
     const block_box = try Value.boxRef(ctx.allocator, block);
     if (runtime.reclaimEnabled()) scope.retain();

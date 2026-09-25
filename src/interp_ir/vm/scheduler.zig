@@ -366,10 +366,6 @@ fn dropVmTask(task: *Task) void {
 /// The process-global pool serving `Dispatchers.Default` / `IO`.
 var global_pool: Pool = .{};
 
-pub fn globalPool() *Pool {
-    return &global_pool;
-}
-
 // GC root: a queued task's block is reachable only through the pool FIFO until a worker
 // dequeues it; a running block is pinned by its worker's keepalive stack. Marking runs
 // stop-the-world with every worker parked, so the pool mutex is uncontended here.
@@ -398,15 +394,9 @@ pub fn post(task: Task) Allocator.Error!void {
     return global_pool.post(task);
 }
 
-pub fn tasksBegun() u64 {
-    return tasks_begun.load(.acquire);
-}
-
 pub fn outstandingOtherCount() usize {
     return global_pool.outstandingOther();
 }
-
-
 
 pub fn outstandingOther() usize {
     return global_pool.outstandingOther();
@@ -419,7 +409,6 @@ pub fn shutdownAndJoin() void {
 pub fn takeFirstError() ?RuntimeError {
     return global_pool.takeFirstError();
 }
-
 
 const testing = std.testing;
 

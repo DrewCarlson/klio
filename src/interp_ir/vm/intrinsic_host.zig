@@ -4,7 +4,6 @@
 //! into the vtable by `vmhost.zig`; each transient `VmHost` shares live program state.
 
 const std = @import("std");
-const host_classes = @import("host_classes.zig");
 const stdlib = @import("stdlib");
 
 const ir = @import("ir");
@@ -13,10 +12,6 @@ const runtime = @import("runtime");
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const scheduler = @import("scheduler.zig");
-const host_call_member = @import("host_call_member.zig");
-const host_instances = @import("host_instances.zig");
-const host_fields = @import("host_fields.zig");
-const host_call_value = @import("host_call_value.zig");
 const trace = @import("trace.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -32,14 +27,11 @@ const HostResultU64 = runtime.HostResultU64;
 const InstanceData = runtime.InstanceData;
 const RuntimeEvalResult = runtime.EvalResult;
 
-const Module = ir.Module;
-const ClassId = ir.ClassId;
 const EvalError = ir.eval.EvalError;
 const EvalResult = ir.eval.EvalResult;
 const SuspendState = ir.eval.SuspendState;
 
 const SendableVmSeed = root.SendableVmSeed;
-const ThreadEntry = root.ThreadEntry;
 const ThreadResult = root.ThreadResult;
 
 /// `Result<Value, EvalError>` for the raw coroutine-facing helpers.
@@ -49,7 +41,7 @@ pub const RawResult = EvalResult;
 /// evaluation. Handles are copied by value: the view owns nothing, needs no deinit.
 pub fn vmHost(self: *VmIntrinsicHost, out: Output) VmHost {
     const state = vmhost.SharedHandles.fromIntrinsic(self);
-    return VmHost.borrowed(state, state.globals, out);
+    return VmHost.borrowed(state, out);
 }
 
 /// Sibling `VmIntrinsicHost` over the same shared state; borrows by value, owns nothing.
@@ -73,17 +65,10 @@ fn spawnSeed(self: *VmIntrinsicHost) SendableVmSeed {
     assertSpawnAllocatorInvariant(self.allocator, "spawnSeed");
     return .{
         .module = self.module.clone(),
-        .globals = self.globals.clone(),
         .instance_id_counter = self.instance_id_counter.clone(),
-        .classes = self.classes.clone(),
-        .prog = self.prog.clone(),
-        .anon_methods = self.anon_methods.clone(),
-        .class_default_outer = self.class_default_outer.clone(),
         .closures = self.closures.clone(),
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
-        .object_states = self.object_states.clone(),
-        .singletons_by_id = self.singletons_by_id.clone(),
         .resolved_state = if (self.resolved_state) |rs| rs.clone() else null,
         .allocator = self.allocator,
     };
@@ -117,17 +102,6 @@ fn flattenEval(r: EvalResult) RuntimeEvalResult {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = runtimeErrorFromEval(e) },
     };
-}
-
-fn classDefIsInner(def: ObjRef(ClassDef)) bool {
-    const dg = def.borrow();
-    defer dg.deinit();
-    return dg.get().is_inner;
-}
-
-pub fn construct(self: *VmIntrinsicHost, class_id: ClassId, args: []const Value, out: Output) Allocator.Error!RawResult {
-    var host = vmHost(self, out);
-    return host.newInstance(self.allocator, class_id, args, null);
 }
 
 /// Evaluate an `IrClosure` with the raw `EvalError` out, so the driver sees `Suspended`.
@@ -217,9 +191,9 @@ pub fn evalClosureRaw(
     try caps_owned.appendSlice(self.allocator, capture_values.items);
 
     const state = vmhost.SharedHandles.fromIntrinsic(self);
-    var host = VmHost.borrowed(state, state.globals, out);
+    var host = VmHost.borrowed(state, out);
     vmhost.emitPath(self.allocator, "coroutine_closure", func.fqn, info.body_func, this_value, args);
-    return ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, info.module, func, args_owned, caps_owned, info.chain, @intCast(id), &host);
+    return ir.eval.evalClosure(VmHost, self.allocator, module, info.module, func, args_owned, caps_owned, @intCast(id), &host);
 }
 
 /// Evaluate a top-level no-arg function as a coroutine driver root, raw `EvalError` out.
@@ -231,7 +205,7 @@ pub fn evalFuncRaw(self: *VmIntrinsicHost, func_id: ir.FuncId, out: Output) Allo
         return .{ .err = .{ .Type = "invalid main FuncId" } };
     };
     const state = vmhost.SharedHandles.fromIntrinsic(self);
-    var host = VmHost.borrowed(state, state.globals, out);
+    var host = VmHost.borrowed(state, out);
     const empty: std.ArrayList(Value) = .empty;
     return ir.eval.evalWith(VmHost, self.allocator, module, func, empty, &host);
 }
@@ -320,162 +294,11 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
 
 /// Whether `v` is a companion-object singleton, recognized by a `$Companion$`
 /// lift name or a `.Companion` FQN tail.
-fn isCompanionInstanceValue(v: Value) bool {
-    if (v != .Instance) return false;
-    const g = v.Instance.borrow();
-    defer g.deinit();
-    const cg = g.get().class.borrow();
-    defer cg.deinit();
-    return std.mem.find(u8, cg.get().name, "$Companion$") != null or
-        std.mem.endsWith(u8, cg.get().fqn, ".Companion");
-}
-
+/// Calls `callable` over `args` for a native: a closure made from sema's
+/// code, a native value, an instance of a class implementing the function
+/// type of the call's arity, or a host comparator.
 pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []const Value, out: Output) Allocator.Error!RuntimeEvalResult {
-    // A bound method/property reference (`recv::method`, `Cls::method`) is a
-    // synthetic Instance carrying `__bound_receiver__` and `__bound_name__`.
-    if (callable.* == .Instance) {
-        const inst = callable.Instance;
-        var recv: ?Value = null;
-        var name: ?[]const u8 = null;
-        {
-            const snap = inst.borrow();
-            defer snap.deinit();
-            recv = snap.get().get("__bound_receiver__");
-            if (snap.get().get("__bound_name__")) |nv| {
-                if (nv == .String) {
-                    const sg = nv.String.borrow();
-                    defer sg.deinit();
-                    name = sg.get().bytes;
-                }
-            }
-        }
-        if (recv != null and name != null) {
-            const r = recv.?;
-            const nm = name.?;
-            // An unbound class-method reference's captured receiver is the type
-            // itself, a `.Class` or its companion; its first argument is the receiver.
-            var host0 = vmHost(self, out);
-            const type_like = (r == .Class) or
-                (isCompanionInstanceValue(r) and !host0.hostHasMember(&r, nm));
-            const unbound = type_like and args.len != 0;
-            var target: Value = undefined;
-            var member_args: []const Value = undefined;
-            if (unbound) {
-                target = args[0];
-                member_args = args[1..];
-            } else {
-                target = r;
-                member_args = args;
-            }
-            var host = vmHost(self, out);
-            // A property reference reads the property: a member property, or an
-            // extension property when no extension function owns the name.
-            const as_property = member_args.len == 0 and
-                (root.memberIsProperty(self.allocator, &self.classes, &target, nm) or
-                    (!host_call_value.extensionFnNamed(&host, nm) and host_fields.hostHasExtProp(&host, self.allocator, &target, nm)));
-            // Dispatch under the reference's creation site, where visibility is decided.
-            var ref_pushed = false;
-            var ref_prev: ?ir.eval.RefSiteOverride = null;
-            if (host_call_member.boundRefFile(callable)) |bf| {
-                ref_prev = ir.eval.pushRefSiteFile(bf);
-                ref_pushed = true;
-            }
-            defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
-            const result = if (as_property)
-                try host.getField(self.allocator, &target, nm)
-            else
-                try host.callMember(self.allocator, &target, nm, member_args);
-            return flattenEval(result);
-        }
-    }
-
-    if (callable.* == .IrClosure) {
-        const id = callable.IrClosure.asPtr().id;
-        const info = self.closures.get(@intCast(id)) orelse {
-            const msg = try std.fmt.allocPrint(self.allocator, "unknown IrClosure id {d}", .{id});
-            return .{ .err = .{ .Type = msg } };
-        };
-        if (info.resolved != null) return invokeResolvedClosure(self, callable, null, args, out);
-        // A receiver lambda invoked as a plain value with one extra leading arg is
-        // the ABI's flattened form: bind arg 0 as the receiver, never as a positional.
-        if (info.receiver_shape_known and info.has_receiver and args.len == info.n_params + 1) {
-            return invokeCallableWithThis(self, callable, args[1..], &args[0], out);
-        }
-        const module_g = self.module.borrow();
-        defer module_g.deinit();
-        const module = info.module orelse module_g.get();
-        const func = module.funcById(info.body_func) orelse {
-            const msg = try std.fmt.allocPrint(
-                self.allocator,
-                "closure body FuncId {d} out of range",
-                .{info.body_func.int()},
-            );
-            return .{ .err = .{ .Type = msg } };
-        };
-
-        var caps_owned: std.ArrayList(Value) = .empty;
-        {
-            const cap_g = info.captures.borrow();
-            defer cap_g.deinit();
-            try caps_owned.appendSlice(self.allocator, cap_g.get().items);
-        }
-
-        var call_args: std.ArrayList(Value) = .empty;
-        {
-            var i: usize = 0;
-            while (i < info.n_params) : (i += 1) {
-                try call_args.append(self.allocator, if (i < args.len) args[i] else .Null);
-            }
-            var j: usize = info.n_params;
-            while (j < args.len) : (j += 1) {
-                try call_args.append(self.allocator, args[j]);
-            }
-        }
-
-        const state = vmhost.SharedHandles.fromIntrinsic(self);
-        var host = VmHost.borrowed(state, state.globals, out);
-        vmhost.emitPath(self.allocator, "hof_invoke", func.fqn, info.body_func, null, args);
-        const result = try ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, info.module, func, call_args, caps_owned, info.chain, @intCast(id), &host);
-        return flattenEval(result);
-    }
-
-    // A class value used as a function is a constructor reference (`::Box`,
-    // `Outer::Nested`).
-    if (callable.* == .Class) {
-        const def = callable.Class;
-        var name: []const u8 = undefined;
-        var fqn: []const u8 = undefined;
-        {
-            const dg = def.borrow();
-            defer dg.deinit();
-            name = dg.get().name;
-            fqn = dg.get().fqn;
-        }
-        // The bound ClassDef carries the FQN; resolve by it so `::Ctor` of a
-        // same-simple-name class in another package constructs the right class.
-        const module_g = self.module.borrow();
-        const class_id_opt = module_g.get().classIdByFqn(fqn) orelse module_g.get().classId(name);
-        module_g.deinit();
-        if (class_id_opt) |class_id| {
-            // An inner class's constructor reference takes the enclosing instance first.
-            const inner_outer: ?*const Value = blk: {
-                if (args.len == 0 or args[0] != .Instance) break :blk null;
-                if (!classDefIsInner(def)) break :blk null;
-                const mg = self.module.borrow();
-                defer mg.deinit();
-                if (class_id.int() >= mg.get().classes.items.len) break :blk null;
-                if (args.len != mg.get().classes.items[class_id.int()].primary_params.len + 1) break :blk null;
-                break :blk &args[0];
-            };
-            if (inner_outer) |oh| {
-                var host = vmHost(self, out);
-                const r = try host.newInstance(self.allocator, class_id, args[1..], oh);
-                return flattenEval(r);
-            }
-            const r = try construct(self, class_id, args, out);
-            return flattenEval(r);
-        }
-    }
+    if (callable.* == .IrClosure) return invokeResolvedClosure(self, callable, null, args, out);
 
     if (callable.* == .Intrinsic) {
         var child = childHost(self);
@@ -490,18 +313,15 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         return callable.Intrinsic.func(&ctx);
     }
 
-    // A user class declaring `operator fun invoke` dispatches through it.
+    // An instance of a class implementing a function type is called through
+    // its `invoke` of the call's arity.
     if (callable.* == .Instance) {
-        var host = vmHost(self, out);
-        const r = try host.callMember(self.allocator, callable, "invoke", args);
-        return flattenEval(r);
+        if (try callWellKnown(self, callable, .invoke, args, out)) |r| return r;
     }
 
     // `Comparator` is a `fun interface`: invoking it as a value calls `compare`.
     if (callable.* == .Comparator and args.len == 2) {
-        var host = vmHost(self, out);
-        const r = try host.callMember(self.allocator, callable, "compare", args);
-        return flattenEval(r);
+        if (try callWellKnown(self, callable, .compare, args, out)) |r| return r;
     }
 
     const msg = try std.fmt.allocPrint(self.allocator, "Vm::invoke_callable on `{s}`", .{callable.typeFqn()});
@@ -532,141 +352,14 @@ fn invokeResolvedClosure(self: *VmIntrinsicHost, callable: *const Value, this_va
     }
     if (this_value) |t| try params.append(self.allocator, t.*);
     try params.appendSlice(self.allocator, args);
-    const result = try ir.eval.evalWithCapturesChained(VmHost, self.allocator, body.module, body.owning, body.func, params, caps, &.{}, body.id, &host);
+    const result = try ir.eval.evalClosure(VmHost, self.allocator, body.module, body.owning, body.func, params, caps, body.id, &host);
     return flattenEval(result);
 }
 
+/// `callable` called with `this_value` as its receiver: a receiver lambda
+/// or a reference takes it as its first argument.
 pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, args: []const Value, this_value: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
-    // Receiver-typed lambda dispatch: bind the receiver as the lambda's implicit
-    // `this` and as the injected `it` by overriding the captures cell for the call.
-    if (callable.* == .IrClosure) {
-        const id = callable.IrClosure.asPtr().id;
-        const info = self.closures.get(@intCast(id));
-        if (info) |inf| if (inf.resolved != null) return invokeResolvedClosure(self, callable, this_value, args, out);
-        if (info) |inf| {
-            var this_idx: ?usize = null;
-            var prior_this: ?Value = null;
-            for (inf.capture_names, 0..) |n, idx| {
-                if (std.mem.eql(u8, n, "this")) {
-                    this_idx = idx;
-                    break;
-                }
-            }
-            if (this_idx) |idx| {
-                const cap_g = inf.captures.borrowMut();
-                defer cap_g.deinit();
-                if (idx < cap_g.get().items.len) {
-                    prior_this = cap_g.get().items[idx];
-                    cap_g.get().items[idx] = this_value.*;
-                } else {
-                    try cap_g.get().appendNTimes(self.allocator, .Null, idx + 1 - cap_g.get().items.len);
-                    cap_g.get().items[idx] = this_value.*;
-                }
-            }
-
-            // The receiver fills the leading declared positional only when the
-            // caller left one unfilled, never displacing a real parameter. The
-            // pass-threaded `$composer`/`$changed` pair are not user positionals.
-            var fill_params = inf.n_params;
-            {
-                const mg2 = self.module.borrow();
-                defer mg2.deinit();
-                const m2 = inf.module orelse mg2.get();
-                if (m2.funcById(inf.body_func)) |bf| {
-                    const p2 = bf.params;
-                    if (p2.len >= 2 and std.mem.eql(u8, p2[p2.len - 1].name, "$changed") and
-                        std.mem.eql(u8, p2[p2.len - 2].name, "$composer"))
-                    {
-                        fill_params -|= 2;
-                    }
-                }
-            }
-            var all: std.ArrayList(Value) = .empty;
-            defer all.deinit(self.allocator);
-            if (fill_params >= 1 and args.len < fill_params) {
-                try all.append(self.allocator, this_value.*);
-                for (args) |a| try all.append(self.allocator, a);
-            } else {
-                try all.appendSlice(self.allocator, args);
-            }
-
-            // The receiver just displaced an enclosing `this` (`with(sb) { … }`
-            // inside a member); keep the prior one as an outer implicit receiver so
-            // bare members and `this@Outer` still resolve, matching Kotlin's nested
-            // receiver rule. Any distinct prior `this` counts, not only an Instance.
-            const pushed_outer = po: {
-                const pt = prior_this orelse break :po false;
-                if (pt == .Null or pt == .Unit) break :po false;
-                if (pt == .Instance and this_value.* == .Instance) {
-                    break :po !ObjRef(InstanceData).ptrEq(pt.Instance, this_value.Instance);
-                }
-                break :po true;
-            };
-            if (pushed_outer) {
-                if (prior_this) |p| host_call_member.pushOuterThis(self.allocator, &p);
-            }
-            // The member-extension visibility filter reads the runtime enclosing-this
-            // stack, not closure captures, so push the receiver for the call. A null
-            // subject is a real candidate for nullable-receiver extensions.
-            const pushed_receiver = this_value.* == .Instance or this_value.* == .Null;
-            if (pushed_receiver) {
-                host_call_member.pushOuterSubject(self.allocator, this_value);
-            }
-
-            const result = try invokeCallable(self, callable, all.items, out);
-
-            if (pushed_receiver) host_call_member.popOuterThis();
-            if (pushed_outer) host_call_member.popOuterThis();
-
-            // Restore the prior `this` so a reused closure keeps its captured value.
-            if (this_idx) |idx| {
-                if (prior_this) |prior| {
-                    const cap_g = inf.captures.borrowMut();
-                    defer cap_g.deinit();
-                    if (idx < cap_g.get().items.len) {
-                        cap_g.get().items[idx] = prior;
-                    }
-                }
-            }
-            return result;
-        }
-        return invokeCallable(self, callable, args, out);
-    }
-
-    // An inner class's constructor reference called with receiver syntax
-    // (`val a: Foo.() -> Foo.Bar = Foo::Bar`): the receiver is the outer instance.
-    if (callable.* == .Class and this_value.* == .Instance and classDefIsInner(callable.Class)) {
-        const class_id_opt = blk: {
-            const dg = callable.Class.borrow();
-            defer dg.deinit();
-            const mg = self.module.borrow();
-            defer mg.deinit();
-            break :blk mg.get().classIdByFqn(dg.get().fqn) orelse mg.get().classId(dg.get().name);
-        };
-        if (class_id_opt) |class_id| {
-            var host = vmHost(self, out);
-            const r = try host.newInstance(self.allocator, class_id, args, this_value);
-            return flattenEval(r);
-        }
-    }
-
-    // Any other class value called with receiver syntax is its constructor
-    // with the receiver as the leading argument: `65.f()` with `f = ::Char`
-    // is `Char(65)`, exactly as the member-or-value fallback serves it.
-    if (callable.* == .Class) {
-        const adapted = try self.allocator.alloc(Value, args.len + 1);
-        defer self.allocator.free(adapted);
-        adapted[0] = this_value.*;
-        @memcpy(adapted[1..], args);
-        const names = try self.allocator.alloc(?[]const u8, args.len + 1);
-        defer self.allocator.free(names);
-        @memset(names, null);
-        var host = vmHost(self, out);
-        const r = try host.callValueNamed(self.allocator, callable, adapted, names);
-        return flattenEval(r);
-    }
-
-    // With receiver syntax (`recv.refValue()`) the receiver is the reference's leading arg.
+    if (callable.* == .IrClosure) return invokeResolvedClosure(self, callable, this_value, args, out);
     if (callable.* == .Instance) {
         var with_recv: std.ArrayList(Value) = .empty;
         defer with_recv.deinit(self.allocator);
@@ -674,13 +367,7 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
         try with_recv.appendSlice(self.allocator, args);
         return invokeCallable(self, callable, with_recv.items, out);
     }
-
     const msg = try std.fmt.allocPrint(self.allocator, "Vm::invoke_callable_with_this on `{s}`", .{callable.typeFqn()});
-    if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
-        std.debug.print("[icwt] callable={s} this={s} nargs={d}\n", .{ callable.typeFqn(), this_value.typeFqn(), args.len });
-        ir.eval.dumpCurrentFrameParamsForDiag();
-        ir.eval.dumpFrameChainForDiagAlways();
-    }
     return .{ .err = .{ .Unimplemented = msg } };
 }
 
@@ -709,34 +396,20 @@ pub fn allocInstanceId(self: *VmIntrinsicHost) u64 {
     return g.get().fetchAdd(1, .monotonic) + 1;
 }
 
-pub fn newSynthInstance(self: *VmIntrinsicHost, class_fqn: []const u8, identity: u64, fields: []const InstanceData.Field) Allocator.Error!Value {
-    const simple = blk: {
-        if (std.mem.findScalarLast(u8, class_fqn, '.')) |i| break :blk class_fqn[i + 1 ..];
-        break :blk class_fqn;
-    };
-    // A concrete data class has a registered ClassDef, so reuse it and the synth instance
-    // behaves like a constructed one; klio-internal synth types keep the stub.
-    {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(simple)) |real_def| {
-            const rg = real_def.borrow();
-            const is_data = rg.get().is_data;
-            rg.deinit();
-            if (is_data) {
-                var field_list: std.ArrayList(InstanceData.Field) = .empty;
-                try field_list.appendSlice(self.allocator, fields);
-                const inst = try ObjRef(InstanceData).init(self.allocator, .{
-                    .class = real_def.clone(),
-                    .fields = field_list,
-                    .outer = null,
-                    .identity = identity,
-                    .native_state = null,
-                });
-                return .{ .Instance = inst };
-            }
-        }
-    }
+/// A new `class` through its primary constructor over `args`; null when
+/// the tables do not declare it (`host_resolved.constructWellKnown`).
+pub fn constructWellKnown(self: *VmIntrinsicHost, class: runtime.WellKnownClass, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
+    var host = vmHost(self, out);
+    const r = (try vmhost.host_resolved.constructWellKnown(&host, self.allocator, class, args)) orelse return null;
+    return flattenEval(r);
+}
+
+/// A host value presenting as `kind`: an instance of a class the tables do
+/// not hold, so a call on it reaches the host's implementation of the
+/// member, holding `fields`. `kind` only names it.
+pub fn newHostInstance(self: *VmIntrinsicHost, kind: runtime.HostInstance, identity: u64, fields: []const InstanceData.Field) Allocator.Error!Value {
+    const class_fqn = kind.fqn();
+    const simple = if (std.mem.findScalarLast(u8, class_fqn, '.')) |i| class_fqn[i + 1 ..] else class_fqn;
     const supertypes: []const []const u8 = &.{};
     const class_def = try ObjRef(ClassDef).init(self.allocator, .{
         .name = simple,

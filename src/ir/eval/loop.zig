@@ -18,7 +18,6 @@ const Module = ir.Module;
 const Reg = ir.Reg;
 const TypeRef = ir.TypeRef;
 
-const exec_call = @import("../exec_call.zig");
 
 const ev_activation = @import("activation.zig");
 const ev_chain = @import("chain.zig");
@@ -29,7 +28,6 @@ const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
 const ev_fused = @import("fused.zig");
 const ev_inst = @import("inst.zig");
-const ev_leaf = @import("leaf.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 const ev_resolved = @import("resolved.zig");
@@ -49,14 +47,10 @@ const execInst = ev_inst.execInst;
 const frameBoundary = ev_enter.frameBoundary;
 const funcOwnedBy = ev_enter.funcOwnedBy;
 const fusedExecOpt = ev_fused.fusedExecOpt;
-const leafExprServe = ev_enter.leafExprServe;
-const leafReqServable = ev_leaf.leafReqServable;
 const liveParkActivation = ev_activation.liveParkActivation;
 const maxEvalDepth = ev_chain.maxEvalDepth;
 const ok = ev_flow.ok;
 const openActivation = ev_activation.openActivation;
-const popEnclosing = ev_chain.popEnclosing;
-const pushEnclosingAccess = ev_chain.pushEnclosingAccess;
 const runFrameExec = ev_exec.runFrameExec;
 const snapshotSuspendedFrame = ev_activation.snapshotSuspendedFrame;
 const teardownActivation = ev_activation.teardownActivation;
@@ -105,52 +99,8 @@ pub fn runFlatLoop(
                 }
                 break :blk_cm f.module;
             };
-            // A module lowered from sema calls by its tables alone: the seam,
-            // the host routes and the leaf tier serve the name-resolving
-            // lowering only.
-            const resolved_mod = f.module.resolved != null;
-            // A host-served compose helper answers before any activation opens; `discardFlatReq` undoes the request.
-            if (!resolved_mod and site.req.captures.items.len == 0 and site.req.closure_id == null and
-                site.req.type_args.len == 0 and !site.req.composer_pushed)
-            {
-                if (exec_call.hostRouteServe(H, allocator, site.req.func, site.req.args.items, host)) |served| {
-                    const dst = site.req.dst;
-                    discardFlatReq(H, allocator, site.req, host);
-                    try f.write(dst, served);
-                    cur = site.ret_block;
-                    ridx = site.ret_idx;
-                    continue;
-                }
-                if (try exec_call.hostRouteServeThrowing(H, allocator, callee_mod, site.req.func, site.req.args.items, host)) |r| {
-                    const dst = site.req.dst;
-                    discardFlatReq(H, allocator, site.req, host);
-                    switch (r) {
-                        .ok => |v| {
-                            try f.write(dst, v);
-                            cur = site.ret_block;
-                            ridx = site.ret_idx;
-                            continue;
-                        },
-                        .err => |e| switch (e) {
-                            .Throw => |v| {
-                                rthrow = v;
-                                cur = site.ret_block;
-                                ridx = site.ret_idx;
-                                continue;
-                            },
-                            else => {
-                                runwind = e;
-                                cur = site.ret_block;
-                                ridx = site.ret_idx;
-                                continue;
-                            },
-                        },
-                    }
-                }
-            }
             if (site.req.captures.items.len == 0 and site.req.closure_id == null and
-                site.req.type_args.len == 0 and !site.req.composer_pushed and
-                site.req.chain.len == 0)
+                site.req.type_args.len == 0 and !site.req.composer_pushed)
             fused: {
                 const callee_mod2 = blk_cm2: {
                     if (funcOwnedBy(f.module, site.req.func)) break :blk_cm2 f.module;
@@ -188,19 +138,8 @@ pub fn runFlatLoop(
                     },
                 }
             }
-            if (!resolved_mod and leafReqServable(site.req)) {
-                // A leaf-expression callee needs no activation: serve it straight into the caller's register.
-                if (try leafExprServe(H, allocator, callee_mod, site.req.func, site.req.args.items)) |lr| {
-                    const dst = site.req.dst;
-                    discardFlatReq(H, allocator, site.req, host);
-                    try f.write(dst, lr.ok);
-                    cur = site.ret_block;
-                    ridx = site.ret_idx;
-                    continue;
-                }
-            }
             // Same depth bound as the recursive path: unbounded recursion becomes a catchable StackOverflowError.
-            if (ev.eval_depth >= maxEvalDepth()) {
+            if (ev.eval_depth >= ev_state.evalDepthCap(ev)) {
                 dumpFrameChainForDiag();
                 discardFlatReq(H, allocator, site.req, host);
                 // Kotlin code catches it as `java.lang.StackOverflowError`.
@@ -214,7 +153,7 @@ pub fn runFlatLoop(
                 continue;
             }
             ev.eval_depth += 1;
-            const act = openActivation(H, allocator, callee_mod, site.req, host) catch |e| {
+            const act = openActivation(allocator, callee_mod, site.req) catch |e| {
                 ev.eval_depth -= 1;
                 return e;
             };

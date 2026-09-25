@@ -4,7 +4,6 @@ const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("../ir.zig");
 
-const Allocator = std.mem.Allocator;
 
 const Value = runtime.Value;
 
@@ -13,11 +12,9 @@ const Const = ir.Const;
 const Func = ir.Func;
 const Inst = ir.Inst;
 const Module = ir.Module;
-const Reg = ir.Reg;
 const testing = std.testing;
 
 const ev_activation = @import("activation.zig");
-const ev_chain = @import("chain.zig");
 const ev_enter = @import("enter.zig");
 const ev_flow = @import("flow.zig");
 const ev_host = @import("host.zig");
@@ -26,20 +23,12 @@ const ev_state = @import("state.zig");
 const ev_values = @import("values.zig");
 const ev_exec = @import("exec.zig");
 
-const EnclosingEntry = ev_state.EnclosingEntry;
 const NullHost = ev_host.NullHost;
 const SuspendState = ev_snapshot.SuspendState;
 const TryFrame = ev_snapshot.TryFrame;
-const chainAllocator = ev_chain.chainAllocator;
-const enclosingEntriesAlloc = ev_chain.enclosingEntriesAlloc;
-const enclosingThisChainAlloc = ev_chain.enclosingThisChainAlloc;
-const enclosingThisLast = ev_chain.enclosingThisLast;
 const eval = ev_enter.eval;
 const nullHost = ev_host.nullHost;
 const ok = ev_flow.ok;
-const popEnclosing = ev_chain.popEnclosing;
-const pushEnclosing = ev_chain.pushEnclosing;
-const pushEnclosingSubject = ev_chain.pushEnclosingSubject;
 const resetSuspendLivenessCache = ev_snapshot.resetSuspendLivenessCache;
 const resumeContinuation = ev_activation.resumeContinuation;
 const suspendLiveRegs = ev_snapshot.suspendLiveRegs;
@@ -192,7 +181,6 @@ test "a resume value is made while the parked frames are rooted" {
         .regs = .{ .dense = try testing.allocator.dupe(Value, &.{Value.Unit}) },
         .params = try testing.allocator.alloc(Value, 0),
         .captures = try testing.allocator.alloc(Value, 0),
-        .enclosing_this = try testing.allocator.alloc(EnclosingEntry, 0),
         .try_stack = try testing.allocator.alloc(TryFrame, 0),
         .is_lambda = false,
         .resume_reg = .from(0),
@@ -243,53 +231,4 @@ test "a Double equals a Float as a number, and boxed equality keeps the kind" {
         // The scalar path every tier tries first answers the same.
         if (ev_exec.scalarBin(c.op, c.l, c.r)) |v| try testing.expectEqual(c.want, v.Bool);
     }
-}
-
-test "enclosing chain tags subjects and projects innermost-first" {
-    var chain: std.ArrayList(EnclosingEntry) = .empty;
-    defer chain.deinit(chainAllocator());
-    const prev = ev_state.evtlsPtr().active_chain;
-    ev_state.evtlsPtr().active_chain = &chain;
-    defer ev_state.evtlsPtr().active_chain = prev;
-
-    const receiver = Value{ .Int = 1 };
-    const subject = Value{ .Int = 2 };
-    pushEnclosing(&receiver);
-    pushEnclosingSubject(&subject);
-
-    const vals = try enclosingThisChainAlloc(testing.allocator);
-    defer testing.allocator.free(vals);
-    try testing.expectEqual(@as(usize, 2), vals.len);
-    try testing.expect(vals[0] == .Int and vals[0].Int == 2);
-    try testing.expect(vals[1] == .Int and vals[1].Int == 1);
-    try testing.expect(enclosingThisLast().? == .Int and enclosingThisLast().?.Int == 2);
-
-    const entries = try enclosingEntriesAlloc(testing.allocator);
-    defer testing.allocator.free(entries);
-    try testing.expectEqual(@as(usize, 2), entries.len);
-    try testing.expect(entries[0].isSubject() and entries[0].v.Int == 2);
-    try testing.expect(!entries[1].isSubject() and entries[1].v.Int == 1);
-
-    popEnclosing();
-    const rest = try enclosingEntriesAlloc(testing.allocator);
-    defer testing.allocator.free(rest);
-    try testing.expectEqual(@as(usize, 1), rest.len);
-    try testing.expect(!rest[0].isSubject() and rest[0].v.Int == 1);
-    popEnclosing();
-    try testing.expectEqual(@as(usize, 0), chain.items.len);
-}
-
-test "enclosing chain pushes are dropped with no active frame" {
-    const prev = ev_state.evtlsPtr().active_chain;
-    ev_state.evtlsPtr().active_chain = null;
-    defer ev_state.evtlsPtr().active_chain = prev;
-
-    const v = Value{ .Int = 7 };
-    pushEnclosing(&v);
-    pushEnclosingSubject(&v);
-    popEnclosing();
-    try testing.expect(enclosingThisLast() == null);
-    const entries = try enclosingEntriesAlloc(testing.allocator);
-    defer testing.allocator.free(entries);
-    try testing.expectEqual(@as(usize, 0), entries.len);
 }

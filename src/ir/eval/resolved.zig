@@ -15,7 +15,6 @@ const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("../ir.zig");
 
-const exec_call = @import("../exec_call.zig");
 const ev_enter = @import("enter.zig");
 const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
@@ -23,6 +22,7 @@ const ev_state = @import("state.zig");
 const ev_chain = @import("chain.zig");
 const ev_diag = @import("diag.zig");
 
+const ev_values = @import("values.zig");
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ClassId = ir.ClassId;
@@ -165,7 +165,7 @@ fn runFunc(
         frame.flat_call = .{ .func = f, .args = list, .dst = dst };
         return .flat_call;
     }
-    const res = try ev_enter.evalWithCapturesChained(H, a, frame.module, null, f, list, .empty, &.{}, null, host);
+    const res = try ev_enter.evalClosure(H, a, frame.module, null, f, list, .empty, null, host);
     return land(frame, res, dst);
 }
 
@@ -229,7 +229,7 @@ pub fn stackOverflowError(comptime H: type, a: Allocator, module: *const ir.Modu
     if (raised.class.int() >= r.classes.len) return null;
     const st = host.resolvedState() orelse return null;
     const tls = ev_state.evtlsPtr();
-    const cap = ev_chain.maxEvalDepth();
+    const cap = ev_state.evalDepthCap(tls);
     tls.eval_depth_cap = cap + overflow_headroom;
     defer tls.eval_depth_cap = cap;
     const floor = runtime.openStackReserve();
@@ -661,7 +661,7 @@ fn constString(m: *const ir.Module, id: ir.ConstId) ?[]const u8 {
 }
 
 pub fn execCallNative(comptime H: type, a: Allocator, frame: *Frame, x: anytype, host: *H) Allocator.Error!Step {
-    const run = try exec_call.readArgRun(a, frame, x.args, x.n_args);
+    const run = try ev_frame.readArgRun(a, frame, x.args, x.n_args);
     defer a.free(run);
     if (comptime @hasDecl(H, "callNativeSite")) {
         if (!x.direct and run.len != 0 and run[0] == .Instance) return land(frame, try host.callNativeSite(a, x.native, run), x.dst);
@@ -717,7 +717,7 @@ pub fn execRCallValue(comptime H: type, a: Allocator, frame: *Frame, x: anytype,
                 };
                 return .flat_call;
             }
-            const res = try ev_enter.evalWithCapturesChained(H, a, body.module, body.owning, body.func, params, captures, &.{}, body.id, host);
+            const res = try ev_enter.evalClosure(H, a, body.module, body.owning, body.func, params, captures, body.id, host);
             return land(frame, res, x.dst);
         },
         .Instance => {
@@ -1389,7 +1389,7 @@ pub fn execArrayGet(comptime H: type, a: Allocator, frame: *Frame, x: anytype, h
     }
     const index = (try indexOf(a, frame, x.index)) orelse return .raised;
     const idx_v: Value = .{ .Int = index };
-    const v = exec_call.fastIndexGet(&arr, &idx_v) orelse return throwIndex(H, a, frame, host, r, &arr, index);
+    const v = ev_values.fastIndexGet(&arr, &idx_v) orelse return throwIndex(H, a, frame, host, r, &arr, index);
     try frame.write(x.dst, v);
     return .cont;
 }
@@ -1404,7 +1404,7 @@ pub fn execArraySet(comptime H: type, a: Allocator, frame: *Frame, x: anytype, h
     }
     const index = (try indexOf(a, frame, x.index)) orelse return .raised;
     const idx_v: Value = .{ .Int = index };
-    _ = exec_call.fastIndexSet(a, &arr, &idx_v, frame.read(x.value)) orelse return throwIndex(H, a, frame, host, r, &arr, index);
+    _ = ev_values.fastIndexSet(a, &arr, &idx_v, frame.read(x.value)) orelse return throwIndex(H, a, frame, host, r, &arr, index);
     return .cont;
 }
 
@@ -1412,7 +1412,7 @@ pub fn execNewArray(comptime H: type, a: Allocator, frame: *Frame, x: anytype, h
     _ = host;
     const r = frame.module.resolved orelse return noTables(frame, "NewArray");
     const h = &r.host_class;
-    const run = try exec_call.readArgRun(a, frame, x.args, x.n_args);
+    const run = try ev_frame.readArgRun(a, frame, x.args, x.n_args);
     defer a.free(run);
     if (h.array != null and h.array.? == x.class) {
         var list: std.ArrayList(Value) = .empty;

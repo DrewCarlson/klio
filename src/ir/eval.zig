@@ -7,62 +7,18 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
-const ir = @import("ir.zig");
-const span = @import("span");
-const bc = @import("bc.zig");
 
-const Allocator = std.mem.Allocator;
 
 const Value = runtime.Value;
-const StringRef = runtime.StringRef;
-const ValueList = runtime.ValueList;
-const ObjRef = runtime.ObjRef;
-const RangeKind = runtime.RangeKind;
-const InstanceData = runtime.InstanceData;
 
-const BinOp = ir.BinOp;
-const BlockId = ir.BlockId;
-const Const = ir.Const;
-const Func = ir.Func;
-const FuncId = ir.FuncId;
-const ClassId = ir.ClassId;
-const ConstId = ir.ConstId;
-const Inst = ir.Inst;
-const Module = ir.Module;
-const Reg = ir.Reg;
-const Terminator = ir.Terminator;
-const TypeRef = ir.TypeRef;
-const UnOp = ir.UnOp;
 
-const exec_call = @import("exec_call.zig");
-
-const callerThisValue = exec_call.callerThisValue;
-const constStr = exec_call.constStr;
-const declaringClassName = exec_call.declaringClassName;
-const envVarSet = exec_call.envVarSet;
-const fastIndexGet = exec_call.fastIndexGet;
-const freeDispatchMissMsg = exec_call.freeDispatchMissMsg;
-const ownReceiverEntry = exec_call.ownReceiverEntry;
-const readArgRun = exec_call.readArgRun;
-const sameReceiver = exec_call.sameReceiver;
+pub const fastIndexGet = @import("eval/values.zig").fastIndexGet;
+pub const fastIndexSet = @import("eval/values.zig").fastIndexSet;
 
 const ev_state = @import("eval/state.zig");
 
 pub const EvalError = ev_state.EvalError;
-pub const EnclosingEntry = ev_state.EnclosingEntry;
-pub const currentCallSiteSpan = ev_state.currentCallSiteSpan;
-pub const currentFramePackage = ev_state.currentFramePackage;
-pub const ThisChainIter = ev_state.ThisChainIter;
-pub const frameThisChainIter = ev_state.frameThisChainIter;
-pub const frameThisChainAlloc = ev_state.frameThisChainAlloc;
-pub const nearestFramePackage = ev_state.nearestFramePackage;
 pub const RefSiteOverride = ev_state.RefSiteOverride;
-pub const refSiteFile = ev_state.refSiteFile;
-pub const pushRefSiteFile = ev_state.pushRefSiteFile;
-pub const popRefSiteFile = ev_state.popRefSiteFile;
-pub const currentFuncName = ev_state.currentFuncName;
-pub const currentFrameParam = ev_state.currentFrameParam;
-pub const currentFrameModule = ev_state.currentFrameModule;
 pub const currentFrameFunc = ev_state.currentFrameFunc;
 pub const fillCensusBump = ev_state.fillCensusBump;
 pub const acquireArgsCap = ev_state.acquireArgsCap;
@@ -70,7 +26,6 @@ pub const releaseArgs = ev_state.releaseArgs;
 pub const releaseArgsIn = ev_state.releaseArgsIn;
 pub const gcInstallFrameRoot = ev_state.gcInstallFrameRoot;
 pub const gcUninstallFrameRoot = ev_state.gcUninstallFrameRoot;
-pub const debugPrintFrames = ev_state.debugPrintFrames;
 
 pub var regs_pool_hit: u64 = 0;
 pub var regs_pool_miss: u64 = 0;
@@ -79,21 +34,11 @@ pub var regs_fill_slots: u64 = 0;
 const ev_diag = @import("eval/diag.zig");
 
 pub const wallCapAbandon = ev_diag.wallCapAbandon;
-pub const dispatchCacheStable = ev_diag.dispatchCacheStable;
 pub const nowMonotonicMs = ev_diag.nowMonotonicMs;
 pub const op_route_names = ev_diag.op_route_names;
 pub const opProfDump = ev_diag.opProfDump;
-pub const callStatsProbe = ev_diag.callStatsProbe;
-pub const DispatchKind = ev_diag.DispatchKind;
-pub const dispatchBump = ev_diag.dispatchBump;
-pub const extAuditArmed = ev_diag.extAuditArmed;
 pub const extAuditRow = ev_diag.extAuditRow;
-pub const extAuditServed = ev_diag.extAuditServed;
 pub const extAuditTake = ev_diag.extAuditTake;
-pub const requireResolvedRaises = ev_diag.requireResolvedRaises;
-pub const unresolvedNoteSlow = ev_diag.unresolvedNoteSlow;
-pub const unresolvedCount = ev_diag.unresolvedCount;
-pub const dispatchNote = ev_diag.dispatchNote;
 pub const callStatsDump = ev_diag.callStatsDump;
 pub const frameCountInit = ev_diag.frameCountInit;
 pub const frameCountDump = ev_diag.frameCountDump;
@@ -145,20 +90,6 @@ pub var inst_count_all: std.atomic.Value(u64) = .init(0);
 /// Delivery-route tag for `KLIO_RESUME_TRACE`: which host path drove the current resume (park slot, persisted take, adopt, inline claim).
 pub threadlocal var resume_route: []const u8 = "?";
 
-const ev_chain = @import("eval/chain.zig");
-
-pub const EnclosingChainIter = ev_chain.EnclosingChainIter;
-pub const enclosingChainIter = ev_chain.enclosingChainIter;
-pub const pushEnclosing = ev_chain.pushEnclosing;
-pub const pushEnclosingSubject = ev_chain.pushEnclosingSubject;
-pub const pushDispatch = ev_chain.pushDispatch;
-pub const pushEnclosingAccess = ev_chain.pushEnclosingAccess;
-pub const popEnclosing = ev_chain.popEnclosing;
-pub const enclosingThisLast = ev_chain.enclosingThisLast;
-pub const enclosingThisChainAlloc = ev_chain.enclosingThisChainAlloc;
-pub const enclosingChainClassHash = ev_chain.enclosingChainClassHash;
-pub const enclosingEntriesAlloc = ev_chain.enclosingEntriesAlloc;
-pub const captureChainAlloc = ev_chain.captureChainAlloc;
 
 const ev_flow = @import("eval/flow.zig");
 
@@ -168,8 +99,6 @@ pub const FlatCallReq = ev_flow.FlatCallReq;
 pub const flatEnabled = ev_flow.flatEnabled;
 pub const missTraceWant = ev_flow.missTraceWant;
 pub const cmgTraceWant = ev_flow.cmgTraceWant;
-pub const takeHostFlatArm = ev_flow.takeHostFlatArm;
-pub const stashHostFlatReq = ev_flow.stashHostFlatReq;
 pub const raiseStep = ev_flow.raiseStep;
 pub const ok = ev_flow.ok;
 pub const errResult = ev_flow.errResult;
@@ -195,25 +124,20 @@ pub const Frame = ev_frame.Frame;
 const ev_enter = @import("eval/enter.zig");
 
 pub const eval = ev_enter.eval;
-pub const leafExprServe = ev_enter.leafExprServe;
 pub const evalWith = ev_enter.evalWith;
 pub const fuseGateDump = ev_enter.fuseGateDump;
 pub const boolThisTrap = ev_enter.boolThisTrap;
 pub const dumpFnIfRequested = ev_enter.dumpFnIfRequested;
 pub const evalWithCaptures = ev_enter.evalWithCaptures;
 pub const evalWithCapturesIn = ev_enter.evalWithCapturesIn;
-pub const evalWithCapturesChained = ev_enter.evalWithCapturesChained;
-
-const ev_leaf = @import("eval/leaf.zig");
+pub const evalClosure = ev_enter.evalClosure;
 
 const ev_activation = @import("eval/activation.zig");
 
 pub const takeInFlightSuspend = ev_activation.takeInFlightSuspend;
 pub const resumeContinuation = ev_activation.resumeContinuation;
 
-const ev_loop = @import("eval/loop.zig");
 
-const ev_exec = @import("eval/exec.zig");
 
 const ev_inst = @import("eval/inst.zig");
 
@@ -242,9 +166,6 @@ pub const rangeValue = ev_values.rangeValue;
 
 const ev_host = @import("eval/host.zig");
 
-pub const MaybeValueResult = ev_host.MaybeValueResult;
-pub const UnitResult = ev_host.UnitResult;
-pub const ReceiverShape = ev_host.ReceiverShape;
 pub const NullHost = ev_host.NullHost;
 pub const nullHost = ev_host.nullHost;
 
@@ -270,7 +191,6 @@ test {
     testing.refAllDecls(@import("eval/hand.zig"));
     testing.refAllDecls(@import("eval/host.zig"));
     testing.refAllDecls(@import("eval/inst.zig"));
-    testing.refAllDecls(@import("eval/leaf.zig"));
     testing.refAllDecls(@import("eval/loop.zig"));
     testing.refAllDecls(@import("eval/resolved.zig"));
     testing.refAllDecls(@import("eval/snapshot.zig"));

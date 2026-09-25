@@ -1,7 +1,7 @@
-//! The member surface the host serves for builtin value shapes: the routes
-//! `host_call_member.zig` walks that never consult a user declaration. Kotlin
-//! structural equality, hashing and ordering; comparator, collection, array and
-//! `componentN` ops; the data-class conventions; and the iteration protocol.
+//! The member surface the host serves for builtin value shapes, behind the
+//! natives in `host_members.zig`: Kotlin structural equality, hashing and
+//! ordering; comparator, collection, array and `componentN` ops; and the
+//! iteration protocol.
 
 const std = @import("std");
 
@@ -11,43 +11,30 @@ const stdlib = @import("stdlib");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
-const host_call_member = @import("host_call_member.zig");
+const host_util = @import("host_util.zig");
 const host_resolved = @import("host_resolved.zig");
+const host_call_value = @import("host_call_value.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const InstanceData = runtime.InstanceData;
-const ClassDef = runtime.ClassDef;
-const MapPair = runtime.MapPair;
 const RangeKind = runtime.RangeKind;
-const SeqOp = runtime.SeqOp;
 const SequenceData = runtime.SequenceData;
 const ComparatorStep = runtime.ComparatorStep;
 
 const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
 const VmHost = vmhost.VmHost;
+const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-const boolVal = host_call_member.boolVal;
-const callMember = host_call_member.callMember;
-const callMemberRec = host_call_member.callMemberRec;
-const callValueRec = host_call_member.callValueRec;
-const classDisplayName = host_call_member.classDisplayName;
-const cloneItemsList = host_call_member.cloneItemsList;
-const deinitIntrinsicHost = host_call_member.deinitIntrinsicHost;
-const funcAt = host_call_member.funcAt;
-const getFieldRec = host_call_member.getFieldRec;
-const isIteratorNext = host_call_member.isIteratorNext;
-const listOf = host_call_member.listOf;
-const makeIntrinsicHost = host_call_member.makeIntrinsicHost;
-const mapRuntimeError = host_call_member.mapRuntimeError;
-const receiverImplementsHead = host_call_member.receiverImplementsHead;
-const receiverImplementsType = host_call_member.receiverImplementsType;
-const reconstructDataClass = host_call_member.reconstructDataClass;
-const strVal = host_call_member.strVal;
-const throwExc = host_call_member.throwExc;
-const typeErr = host_call_member.typeErr;
+const boolVal = host_util.boolVal;
+const cloneItemsList = host_util.cloneItemsList;
+const isIteratorNext = host_util.isIteratorNext;
+const listOf = host_util.listOf;
+const mapRuntimeError = host_util.mapRuntimeError;
+const throwExc = host_util.throwExc;
+const typeErr = host_util.typeErr;
 
 /// Recursive value equality: dispatches a user `equals` for Instance operands and
 /// compares List/Set/Map element-wise under a live borrow the GC keeps rooted.
@@ -63,7 +50,7 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
     // A native collection on the left compares to a user Instance by size and elements.
     if (a.* != .Instance and b.* == .Instance) {
         switch (a.*) {
-            .Set => if (receiverImplementsHead(self, b, "Set")) {
+            .Set => if (host_resolved.instanceImplements(self, b, hostClasses(self).set)) {
                 // What the host holds across the Kotlin calls below is rooted
                 // for the collector: the drained elements have no other owner.
                 const mark = runtime.keepaliveMark();
@@ -94,7 +81,7 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                 }
                 return true;
             },
-            .List => if (receiverImplementsHead(self, b, "List")) {
+            .List => if (host_resolved.instanceImplements(self, b, hostClasses(self).list)) {
                 const mark = runtime.keepaliveMark();
                 defer runtime.keepaliveRestore(mark);
                 const dr = try drainIterableToList(self, allocator, b);
@@ -118,12 +105,12 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                 }
                 return true;
             },
-            .Map => if (receiverImplementsHead(self, b, "Map")) {
+            .Map => if (host_resolved.instanceImplements(self, b, hostClasses(self).map)) {
                 // `entries` is a property: read as one, a class lowered from
                 // sema answers it through its slot.
                 const mark = runtime.keepaliveMark();
                 defer runtime.keepaliveRestore(mark);
-                const er = try getFieldRec(self, allocator, b, "entries");
+                const er = try host_resolved.wellKnownMember(self, allocator, b, .entries, &.{});
                 const entries_val = switch (er) {
                     .ok => |v| v,
                     .err => return false,
@@ -149,7 +136,7 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                     for (xb) |*eb| {
                         const entry_mark = runtime.keepaliveMark();
                         defer runtime.keepaliveRestore(entry_mark);
-                        const kr = try self.getField(allocator, eb, "key");
+                        const kr = try host_resolved.wellKnownMember(self, allocator, eb, .entry_key, &.{});
                         const key = switch (kr) {
                             .ok => |v| v,
                             .err => continue,
@@ -157,7 +144,7 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                         runtime.keepalivePush(key);
                         defer if (runtime.reclaimEnabled()) key.release(allocator);
                         if (!try deepValueEquals(self, allocator, &ka.key, &key)) continue;
-                        const vr = try self.getField(allocator, eb, "value");
+                        const vr = try host_resolved.wellKnownMember(self, allocator, eb, .entry_value, &.{});
                         const val = switch (vr) {
                             .ok => |v| v,
                             .err => continue,
@@ -176,15 +163,16 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
             else => {},
         }
     }
-    if (a.* == .Instance or b.* == .Instance) {
-        if (a.* == .Instance and b.* == .Instance) {
-            switch (try callMemberRec(self, allocator, a, "equals", &.{b.*})) {
-                .ok => |v| return v == .Bool and v.Bool,
-                .err => {},
-            }
+    // An instance on the left answers with its own `equals`, whatever the
+    // right side is: a ring buffer compares with a host list as a list.
+    if (a.* == .Instance) {
+        switch (try host_resolved.wellKnownMember(self, allocator, a, .equals, &.{b.*})) {
+            .ok => |v| return v == .Bool and v.Bool,
+            .err => {},
         }
         return Value.structuralEqBoxed(a, b);
     }
+    if (b.* == .Instance) return Value.structuralEqBoxed(a, b);
     switch (a.*) {
         .List => {
             if (b.* != .List) return Value.structuralEqBoxed(a, b);
@@ -275,7 +263,7 @@ pub fn hashWithDispatch(self: *VmHost, allocator: Allocator, v: *const Value) Al
             return javaStringHash(g.get().bytes);
         },
         .Instance, .Exception => {
-            const r = try callMember(self, allocator, v, "hashCode", &.{});
+            const r = try host_resolved.wellKnownMember(self, allocator, v, .hash_code, &.{});
             switch (r) {
                 .ok => |hv| {
                     if (hv == .Int) return @truncate(hv.Int);
@@ -490,22 +478,6 @@ pub fn valueStructuralHash(v: *const Value) i32 {
     return @truncate(@as(i64, @bitCast(h.final())));
 }
 
-pub fn materialiseRangeItems(allocator: Allocator, start: i64, end: i64, step: i64, kind: RangeKind) Allocator.Error!std.ArrayList(Value) {
-    var out: std.ArrayList(Value) = .empty;
-    if (step == 0) return out;
-    var cur = start;
-    // `inBounds` compares unsigned for ULong, so `MaxUL..MinUL` is empty. `end`
-    // is the exact final element: advancing past it would overflow or wrap.
-    while (kind.inBounds(cur, end, step)) {
-        try out.append(allocator, rangeElem(cur, kind));
-        if (cur == end) break;
-        const adv = cur +| step;
-        if (adv == cur) break;
-        cur = adv;
-    }
-    return out;
-}
-
 fn rangeElem(cur: i64, kind: RangeKind) Value {
     return switch (kind) {
         .Int => Value.newInt(cur),
@@ -516,126 +488,6 @@ fn rangeElem(cur: i64, kind: RangeKind) Value {
     };
 }
 
-/// `map.containsKey(needle)` honoring a key instance's custom `equals`.
-pub fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: runtime.MapEntries, needle: *const Value) Allocator.Error!union(enum) { ok: bool, err: EvalError } {
-    if (needle.* != .Instance) {
-        const g = entries.borrow();
-        defer g.deinit();
-        for (g.get().pairs.items) |kv| {
-            if (Value.structuralEqBoxed(&kv.key, needle)) return .{ .ok = true };
-        }
-        return .{ .ok = false };
-    }
-    // Snapshot keys so the `equals` call can't conflict with the borrow.
-    var keys: std.ArrayList(Value) = .empty;
-    defer keys.deinit(allocator);
-    {
-        const g = entries.borrow();
-        defer g.deinit();
-        for (g.get().pairs.items) |kv| try keys.append(allocator, kv.key);
-    }
-    for (keys.items) |k| {
-        const r = try callMemberRec(self, allocator, &k, "equals", &.{needle.*});
-        switch (r) {
-            .ok => |rv| switch (rv) {
-                .Bool => |b| if (b) return .{ .ok = true },
-                else => if (Value.structuralEqBoxed(&k, needle)) return .{ .ok = true },
-            },
-            .err => if (Value.structuralEqBoxed(&k, needle)) return .{ .ok = true },
-        }
-    }
-    return .{ .ok = false };
-}
-
-pub fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) Allocator.Error!EvalResult {
-    const entries_r = try getFieldRec(self, allocator, recv, "entries");
-    const entries_val = switch (entries_r) {
-        .ok => |v| v,
-        .err => |e| return .{ .err = e },
-    };
-    // `entries_val` is owned: release at exit; the pairs loop retains its keeps.
-    defer if (runtime.reclaimEnabled()) entries_val.release(allocator);
-    // The drained list stays alive until after the pairs loop, then releases.
-    var drained: ?Value = null;
-    defer if (runtime.reclaimEnabled()) if (drained) |d| d.release(allocator);
-    var entry_items: std.ArrayList(Value) = .empty;
-    defer entry_items.deinit(allocator);
-    switch (entries_val) {
-        .Set => |s| {
-            const g = s.items.borrow();
-            defer g.deinit();
-            try entry_items.appendSlice(allocator, g.get().items);
-        },
-        .List => |l| {
-            const g = l.items.borrow();
-            defer g.deinit();
-            try entry_items.appendSlice(allocator, g.get().items);
-        },
-        .Instance => {
-            const dr = try drainIterableToList(self, allocator, &entries_val);
-            switch (dr) {
-                .ok => |dv| {
-                    drained = dv; // released after the pairs loop (see defer)
-                    switch (dv) {
-                        .List => |l| {
-                            const g = l.items.borrow();
-                            defer g.deinit();
-                            try entry_items.appendSlice(allocator, g.get().items);
-                        },
-                        else => {},
-                    }
-                },
-                .err => |e| return .{ .err = e },
-            }
-        },
-        else => {},
-    }
-    var pairs: std.ArrayList(MapPair) = .empty;
-    for (entry_items.items) |e| {
-        const kv = try mapEntryKv(self, allocator, &e);
-        switch (kv) {
-            .ok => |pair| try pairs.append(allocator, pair),
-            .err => |err| {
-                pairs.deinit(allocator);
-                return .{ .err = err };
-            },
-        }
-    }
-    return .{ .ok = try Value.newMap(allocator, .{ .entries = try runtime.MapEntries.init(allocator, .{ .pairs = pairs }), .mutable = false }) };
-}
-
-fn mapEntryKv(self: *VmHost, allocator: Allocator, e: *const Value) Allocator.Error!union(enum) { ok: MapPair, err: EvalError } {
-    switch (e.*) {
-        .MapEntry => |me| {
-            const k = me.key.asPtr().*;
-            const v = me.value.asPtr().*;
-            k.retain();
-            v.retain();
-            return .{ .ok = .{ .key = k, .value = v } };
-        },
-        .Pair => |p| {
-            const k = p.first.asPtr().*;
-            const v = p.second.asPtr().*;
-            k.retain();
-            v.retain();
-            return .{ .ok = .{ .key = k, .value = v } };
-        },
-        else => {
-            const kr = try callMemberRec(self, allocator, e, "key", &.{});
-            const k = switch (kr) {
-                .ok => |v| v,
-                .err => |err| return .{ .err = err },
-            };
-            const vr = try callMemberRec(self, allocator, e, "value", &.{});
-            const v = switch (vr) {
-                .ok => |v| v,
-                .err => |err| return .{ .err = err },
-            };
-            return .{ .ok = .{ .key = k, .value = v } };
-        },
-    }
-}
-
 /// Read a boxed component slot: the box keeps its `Value`, the caller gets a ref.
 fn extractOwned(box: runtime.ObjRef(Value)) EvalResult {
     const out = box.asPtr().*;
@@ -644,7 +496,7 @@ fn extractOwned(box: runtime.ObjRef(Value)) EvalResult {
 }
 
 pub fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const Value) Allocator.Error!EvalResult {
-    const iter_r = try callMemberRec(self, allocator, receiver, "iterator", &.{});
+    const iter_r = try host_resolved.wellKnownMember(self, allocator, receiver, .iterator, &.{});
     const iter = switch (iter_r) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
@@ -659,7 +511,7 @@ pub fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const
     var items: std.ArrayList(Value) = .empty;
     var guard: usize = 0;
     while (guard < 1_000_000) : (guard += 1) {
-        const hn_r = try callMemberRec(self, allocator, &iter, "hasNext", &.{});
+        const hn_r = try host_resolved.wellKnownMember(self, allocator, &iter, .has_next, &.{});
         const has = switch (hn_r) {
             .ok => |v| switch (v) {
                 .Bool => |b| b,
@@ -671,7 +523,7 @@ pub fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const
             },
         };
         if (!has) break;
-        const nx_r = try callMemberRec(self, allocator, &iter, "next", &.{});
+        const nx_r = try host_resolved.wellKnownMember(self, allocator, &iter, .next, &.{});
         switch (nx_r) {
             .ok => |v| {
                 runtime.keepalivePush(v);
@@ -693,8 +545,8 @@ pub fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const
 
 fn materialiseSequence(self: *VmHost, allocator: Allocator, seq_val: *const Value) Allocator.Error!union(enum) { ok: std.ArrayList(Value), err: EvalError } {
     var sink = self.out_sink;
-    var intrinsic = makeIntrinsicHost(self);
-    defer deinitIntrinsicHost(&intrinsic);
+    var intrinsic = VmIntrinsicHost.owning(self);
+    defer intrinsic.release();
     const ihost = intrinsic.intrinsicHost();
     const outcome = try stdlib.materialise_sequence(allocator, ihost, sink.output(), seq_val.*);
     switch (outcome) {
@@ -800,166 +652,23 @@ pub fn builtinIterator(allocator: Allocator, receiver: *const Value) Allocator.E
     }
 }
 
-pub fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    const seq = receiver.Sequence;
-    if (std.mem.eql(u8, name, "iterator") and args.len == 0) {
-        // A builder Sequence is re-iterable: a fresh coroutine cursor per call.
-        {
-            var intrinsic = makeIntrinsicHost(self);
-            defer deinitIntrinsicHost(&intrinsic);
-            const ihost = intrinsic.intrinsicHost();
-            if (try stdlib.freshBuilderSeq(ihost, allocator, receiver.*)) |fresh| {
-                return .{ .ok = try stdlib.makeSeqIter(allocator, fresh) };
-            }
-        }
-        if (stdlib.oneShotConsumeCheck(allocator, receiver.*) catch null) |re| {
-            return .{ .err = try mapRuntimeError(allocator, re) };
-        }
-        var sv = receiver.*;
-        if (runtime.reclaimEnabled()) sv.retain();
-        return .{ .ok = try stdlib.makeSeqIter(allocator, sv) };
-    }
-    // `zip` over a Sequence is lazy: `Merged` pulls its children alternately.
-    if (std.mem.eql(u8, name, "zip") and (args.len == 1 or args.len == 2) and args[0] == .Sequence) {
-        var left = receiver.*;
-        var right = args[0];
-        if (runtime.reclaimEnabled()) {
-            left.retain();
-            right.retain();
-        }
-        const transform: ?runtime.ValueBox = if (args.len == 2) blk: {
-            var t = args[1];
-            if (runtime.reclaimEnabled()) t.retain();
-            break :blk try Value.boxRef(allocator, t);
-        } else null;
-        return .{ .ok = .{ .Sequence = try ObjRef(SequenceData).init(allocator, .{
-            .source = .{ .Merged = .{
-                .left = try Value.boxRef(allocator, left),
-                .right = try Value.boxRef(allocator, right),
-                .transform = transform,
-            } },
-            .ops = &.{},
-        }) } };
-    }
-    const terminal = isSequenceTerminal(name);
-    if (terminal) {
-        const m = try materialiseSequence(self, allocator, receiver);
-        const items = switch (m) {
-            .ok => |v| v,
-            .err => |e| return .{ .err = e },
-        };
-        const as_list = try listOf(allocator, items, false);
-        var margs = try allocator.alloc(Value, args.len);
-        for (args, 0..) |a, i| {
-            if (a == .Sequence) {
-                const ms = try materialiseSequence(self, allocator, &a);
-                switch (ms) {
-                    .ok => |it| margs[i] = try listOf(allocator, it, false),
-                    .err => |e| return .{ .err = e },
-                }
-            } else margs[i] = a;
-        }
-        return try callMemberRec(self, allocator, &as_list, name, margs);
-    }
-    const new_op: ?SeqOp = blk: {
-        if (std.mem.eql(u8, name, "map") and args.len == 1) break :blk .{ .Map = args[0] };
-        if (std.mem.eql(u8, name, "onEach") and args.len == 1) break :blk .{ .OnEach = args[0] };
-        if (std.mem.eql(u8, name, "mapIndexed") and args.len == 1) break :blk .{ .MapIndexed = args[0] };
-        if (std.mem.eql(u8, name, "filterIndexed") and args.len == 1) break :blk .{ .FilterIndexed = args[0] };
-        if (std.mem.eql(u8, name, "filter") and args.len == 1) break :blk .{ .Filter = args[0] };
-        if (std.mem.eql(u8, name, "filterNot") and args.len == 1) break :blk .{ .FilterNot = args[0] };
-        if (std.mem.eql(u8, name, "take") and args.len == 1) {
-            if (args[0].asI64()) |n| {
-                if (n < 0) {
-                    const msg = try std.fmt.allocPrint(allocator, "Requested element count {d} is less than zero.", .{n});
-                    return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
-                }
-                break :blk .{ .Take = n };
-            }
-        }
-        if (std.mem.eql(u8, name, "drop") and args.len == 1) {
-            if (args[0].asI64()) |n| {
-                if (n < 0) {
-                    const msg = try std.fmt.allocPrint(allocator, "Requested element count {d} is less than zero.", .{n});
-                    return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
-                }
-                break :blk .{ .Drop = n };
-            }
-        }
-        if (std.mem.eql(u8, name, "takeWhile") and args.len == 1) break :blk .{ .TakeWhile = args[0] };
-        if (std.mem.eql(u8, name, "dropWhile") and args.len == 1) break :blk .{ .DropWhile = args[0] };
-        if (std.mem.eql(u8, name, "flatMap") and args.len == 1) break :blk .{ .FlatMap = args[0] };
-        if (std.mem.eql(u8, name, "distinct") and args.len == 0) break :blk .Distinct;
-        if (std.mem.eql(u8, name, "distinctBy") and args.len == 1) break :blk .{ .DistinctBy = args[0] };
-        if (std.mem.eql(u8, name, "sorted") and args.len == 0) break :blk .{ .Sorted = false };
-        if (std.mem.eql(u8, name, "sortedDescending") and args.len == 0) break :blk .{ .Sorted = true };
-        if (std.mem.eql(u8, name, "sortedBy") and args.len == 1) break :blk .{ .SortedBy = .{ .selector = args[0], .descending = false } };
-        if (std.mem.eql(u8, name, "sortedByDescending") and args.len == 1) break :blk .{ .SortedBy = .{ .selector = args[0], .descending = true } };
-        if (std.mem.eql(u8, name, "sortedWith") and args.len == 1) break :blk .{ .SortedWith = args[0] };
-        break :blk null;
-    };
-    if (new_op) |op| {
-        const g = seq.borrow();
-        const src = g.get().source;
-        const old_ops = g.get().ops;
-        var ops = try allocator.alloc(SeqOp, old_ops.len + 1);
-        @memcpy(ops[0..old_ops.len], old_ops);
-        ops[old_ops.len] = op;
-        g.deinit();
-        return .{ .ok = .{ .Sequence = try ObjRef(SequenceData).init(allocator, .{ .source = src, .ops = ops }) } };
-    }
-    return null;
-}
-
-pub fn isSequenceTerminal(name: []const u8) bool {
-    const terms = [_][]const u8{
-        "toList",    "toMutableList", "toSet",        "count",        "sum",         "average",
-        "sumOf",     "last",          "lastOrNull",   "forEach",      "fold",        "reduce",
-        "iterator",  "max",           "maxOrNull",    "min",          "minOrNull",   "maxBy",
-        "minBy",     "maxByOrNull",   "minByOrNull",  "maxOf",        "minOf",       "joinToString",
-        "all",       "contains",      "groupBy",      "associate",    "associateBy", "associateWith",
-        "partition", "indexOf",       "indexOfFirst", "toMap",        "toHashSet",   "toMutableSet",
-        "zip",       "unzip",         "plus",         "reduceOrNull", "foldRight",   "reduceRight",
-    };
-    for (terms) |t| {
-        if (std.mem.eql(u8, t, name)) return true;
-    }
-    return false;
-}
-
-pub fn sortedInstances(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
-    var snap = try cloneItemsList(allocator, receiver.List.items);
-    defer snap.deinit(allocator);
-    var has_inst = false;
-    for (snap.items) |v| {
-        if (v == .Instance) has_inst = true;
-    }
-    if (!has_inst) return null;
-    var sorted: std.ArrayList(Value) = .empty;
-    try sorted.appendSlice(allocator, snap.items);
-    const descending = std.mem.eql(u8, name, "sortedDescending");
-    var i: usize = 1;
-    while (i < sorted.items.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const a = sorted.items[j - 1];
-            const b = sorted.items[j];
-            const cmp_r = try callMemberRec(self, allocator, &a, "compareTo", &.{b});
-            const ncmp: i64 = switch (cmp_r) {
-                .ok => |v| v.asI64() orelse 0,
-                .err => |e| {
-                    sorted.deinit(allocator);
-                    return .{ .err = e };
-                },
-            };
-            const greater = if (descending) ncmp < 0 else ncmp > 0;
-            if (greater) {
-                std.mem.swap(Value, &sorted.items[j - 1], &sorted.items[j]);
-                j -= 1;
-            } else break;
+/// `Sequence.iterator()`: a builder sequence gets a fresh coroutine cursor
+/// per call; any other sequence is iterated once.
+pub fn sequenceIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) Allocator.Error!EvalResult {
+    {
+        var intrinsic = VmIntrinsicHost.owning(self);
+        defer intrinsic.release();
+        const ihost = intrinsic.intrinsicHost();
+        if (try stdlib.freshBuilderSeq(ihost, allocator, receiver.*)) |fresh| {
+            return .{ .ok = try stdlib.makeSeqIter(allocator, fresh) };
         }
     }
-    return .{ .ok = try listOf(allocator, sorted, false) };
+    if (stdlib.oneShotConsumeCheck(allocator, receiver.*) catch null) |re| {
+        return .{ .err = try mapRuntimeError(allocator, re) };
+    }
+    var sv = receiver.*;
+    if (runtime.reclaimEnabled()) sv.retain();
+    return .{ .ok = try stdlib.makeSeqIter(allocator, sv) };
 }
 
 pub const Ordering = enum { lt, eq, gt };
@@ -983,7 +692,7 @@ fn ordToInt(o: Ordering) i64 {
 /// Natural-order compare, falling back to a user `compareTo` for non-builtins.
 fn compareValuesHostAware(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!union(enum) { ord: Ordering, err: EvalError } {
     if (compareValuesBuiltin(a, b)) |o| return .{ .ord = o };
-    const r = try callMemberRec(self, allocator, a, "compareTo", &.{b.*});
+    const r = try host_resolved.wellKnownMember(self, allocator, a, .compare_to, &.{b.*});
     switch (r) {
         .ok => |v| {
             const i = v.asI64() orelse return .{ .err = try typeErr(allocator, "incomparable values", .{}) };
@@ -1084,25 +793,25 @@ pub fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Va
                     else => 1,
                 };
                 const o: Ordering = if (n_params >= 2) blk: {
-                    const r = try callValueRec(self, allocator, &sel, &.{ a, b });
+                    const r = try host_call_value.callValue(self, allocator, &sel, &.{ a, b });
                     const nval: i64 = switch (r) {
                         .ok => |v| v.asI64() orelse 0,
                         .err => |e| return .{ .err = e },
                     };
                     break :blk if (nval < 0) .lt else if (nval > 0) .gt else .eq;
                 } else blk: {
-                    const ka_r = try callValueRec(self, allocator, &sel, &.{a});
+                    const ka_r = try host_call_value.callValue(self, allocator, &sel, &.{a});
                     const ka = switch (ka_r) {
                         .ok => |v| v,
                         .err => |e| return .{ .err = e },
                     };
-                    const kb_r = try callValueRec(self, allocator, &sel, &.{b});
+                    const kb_r = try host_call_value.callValue(self, allocator, &sel, &.{b});
                     const kb = switch (kb_r) {
                         .ok => |v| v,
                         .err => |e| return .{ .err = e },
                     };
                     if (step.key_comparator) |kc| {
-                        const r = try callMemberRec(self, allocator, &kc, "compare", &.{ ka, kb });
+                        const r = try host_resolved.wellKnownMember(self, allocator, &kc, .compare, &.{ ka, kb });
                         const nval: i64 = switch (r) {
                             .ok => |v| v.asI64() orelse 0,
                             .err => |e| return .{ .err = e },
@@ -1223,199 +932,6 @@ pub fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value
     return null;
 }
 
-pub fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    // `+=`/`-=` over a multi-element collection flattens to addAll / removeAll;
-    // a single element adds or removes just that one. Delegate the former.
-    const arg_is_multi = args.len == 1 and switch (args[0]) {
-        .List, .Set, .Range, .Sequence, .Array => true,
-        else => false,
-    };
-    switch (receiver.*) {
-        .List => |l| {
-            if (!l.mutable) return null;
-            if (std.mem.eql(u8, name, "plusAssign") and args.len == 1) {
-                if (arg_is_multi) return try self.callMember(allocator, receiver, "addAll", args);
-                const g = l.items.borrowMut();
-                defer g.deinit();
-                try g.get().append(allocator, args[0]);
-                return .{ .ok = .Unit };
-            }
-            if (std.mem.eql(u8, name, "minusAssign") and args.len == 1) {
-                if (arg_is_multi) return try self.callMember(allocator, receiver, "removeAll", args);
-                const g = l.items.borrowMut();
-                defer g.deinit();
-                for (g.get().items, 0..) |x, idx| {
-                    if (Value.structuralEq(&x, &args[0])) {
-                        _ = g.get().orderedRemove(idx);
-                        break;
-                    }
-                }
-                return .{ .ok = .Unit };
-            }
-        },
-        .Set => |s| {
-            if (!s.mutable) return null;
-            if (std.mem.eql(u8, name, "plusAssign") and args.len == 1) {
-                if (arg_is_multi) return try self.callMember(allocator, receiver, "addAll", args);
-                const g = s.items.borrowMut();
-                defer g.deinit();
-                var present = false;
-                for (g.get().items) |x| {
-                    if (Value.structuralEq(&x, &args[0])) present = true;
-                }
-                if (!present) try g.get().append(allocator, args[0]);
-                return .{ .ok = .Unit };
-            }
-            if (std.mem.eql(u8, name, "minusAssign") and args.len == 1) {
-                if (arg_is_multi) return try self.callMember(allocator, receiver, "removeAll", args);
-                const g = s.items.borrowMut();
-                defer g.deinit();
-                for (g.get().items, 0..) |x, idx| {
-                    if (Value.structuralEq(&x, &args[0])) {
-                        _ = g.get().orderedRemove(idx);
-                        break;
-                    }
-                }
-                return .{ .ok = .Unit };
-            }
-        },
-        .Map => |m| {
-            if (!m.mutable) return null;
-            if (std.mem.eql(u8, name, "plusAssign") and args.len == 1) {
-                var to_put: std.ArrayList(MapPair) = .empty;
-                defer to_put.deinit(allocator);
-                const a2 = args[0];
-                switch (a2) {
-                    .Pair => |p| {
-                        const k = p.first.asPtr().*;
-                        const v = p.second.asPtr().*;
-                        k.retain();
-                        v.retain();
-                        try to_put.append(allocator, .{ .key = k, .value = v });
-                    },
-                    .Map => |other| {
-                        const og = other.entries.borrow();
-                        defer og.deinit();
-                        // Entries are borrowed from `other`: retain each.
-                        for (og.get().pairs.items) |kv| {
-                            if (runtime.reclaimEnabled()) {
-                                kv.key.retain();
-                                kv.value.retain();
-                            }
-                            try to_put.append(allocator, kv);
-                        }
-                    },
-                    .List => |lst| try collectPairs(allocator, &to_put, lst.items),
-                    .Set => |st| try collectPairs(allocator, &to_put, st.items),
-                    .Array => |arr| if (arr.boxedList()) |bl| try collectPairs(allocator, &to_put, bl),
-                    .Sequence => {
-                        const ms = try materialiseSequence(self, allocator, &a2);
-                        var items = switch (ms) {
-                            .ok => |it| it,
-                            .err => |e| return .{ .err = e },
-                        };
-                        defer items.deinit(allocator);
-                        for (items.items) |v| {
-                            if (v == .Pair) {
-                                const k = v.Pair.first.asPtr().*;
-                                const val = v.Pair.second.asPtr().*;
-                                k.retain();
-                                val.retain();
-                                try to_put.append(allocator, .{ .key = k, .value = val });
-                            }
-                        }
-                    },
-                    else => {},
-                }
-                const g = m.entries.borrowMut();
-                defer g.deinit();
-                for (to_put.items) |kv| {
-                    var found = false;
-                    for (g.get().pairs.items) |*slot| {
-                        if (Value.structuralEq(&slot.key, &kv.key)) {
-                            // Overwrite: release the old value and staged key.
-                            if (runtime.reclaimEnabled()) {
-                                slot.value.release(allocator);
-                                kv.key.release(allocator);
-                            }
-                            slot.value = kv.value;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        try g.get().pairs.append(allocator, kv);
-                        try g.get().noteAppended(allocator, g.get().pairs.items.len - 1);
-                    }
-                }
-                return .{ .ok = .Unit };
-            }
-        },
-        else => {},
-    }
-    return null;
-}
-
-fn collectPairs(allocator: Allocator, out: *std.ArrayList(MapPair), items: runtime.ValueList) Allocator.Error!void {
-    const g = items.borrow();
-    defer g.deinit();
-    for (g.get().items) |v| {
-        if (v == .Pair) {
-            const k = v.Pair.first.asPtr().*;
-            const val = v.Pair.second.asPtr().*;
-            k.retain();
-            val.retain();
-            try out.append(allocator, .{ .key = k, .value = val });
-        }
-    }
-}
-
-/// Element-wise equality for builtin Lists holding user INSTANCES, whose `equals`
-/// structural equality cannot dispatch. Null when neither operand needs it.
-pub fn collectionsEqualHostAware(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) ?bool {
-    if (a.* != .List or b.* != .List) return null;
-    const needs_host = blk: {
-        inline for ([_]*const Value{ a, b }) |v| {
-            const g = v.List.items.borrow();
-            defer g.deinit();
-            for (g.get().items) |e| {
-                if (e == .Instance) break :blk true;
-            }
-        }
-        break :blk false;
-    };
-    if (!needs_host) return null;
-    const ga = a.List.items.borrow();
-    defer ga.deinit();
-    const gb = b.List.items.borrow();
-    defer gb.deinit();
-    const ia = ga.get().items;
-    const ib = gb.get().items;
-    if (ia.len != ib.len) return false;
-    for (ia, ib) |ea, eb| {
-        if (ea == .Instance or eb == .Instance) {
-            const recv = if (ea == .Instance) &ea else &eb;
-            const arg = if (ea == .Instance) eb else ea;
-            const r = callMemberRec(self, allocator, recv, "equals", &.{arg}) catch return false;
-            switch (r) {
-                .ok => |v| {
-                    if (!(v == .Bool and v.Bool)) return false;
-                },
-                .err => return false,
-            }
-            continue;
-        }
-        if (ea == .List or eb == .List) {
-            if (collectionsEqualHostAware(self, allocator, &ea, &eb)) |eq| {
-                if (!eq) return false;
-                continue;
-            }
-        }
-        if (!Value.structuralEqBoxed(&ea, &eb)) return false;
-    }
-    return true;
-}
-
 pub fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     switch (receiver.*) {
         .Pair => |p| {
@@ -1498,17 +1014,17 @@ pub fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
         },
         .Instance => {
             if (std.mem.eql(u8, name, "component1") and
-                (receiverImplementsType(self, receiver, "Entry") or receiverImplementsType(self, receiver, "MutableEntry")))
+                host_resolved.instanceImplements(self, receiver, hostClasses(self).map_entry))
             {
                 // getFieldRec borrows; this escapes, so retain.
-                var r = try getFieldRec(self, allocator, receiver, "key");
+                var r = try host_resolved.wellKnownMember(self, allocator, receiver, .entry_key, &.{});
                 if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
                 return r;
             }
             if (std.mem.eql(u8, name, "component2") and
-                (receiverImplementsType(self, receiver, "Entry") or receiverImplementsType(self, receiver, "MutableEntry")))
+                host_resolved.instanceImplements(self, receiver, hostClasses(self).map_entry))
             {
-                var r = try getFieldRec(self, allocator, receiver, "value");
+                var r = try host_resolved.wellKnownMember(self, allocator, receiver, .entry_value, &.{});
                 if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
                 return r;
             }
@@ -1846,8 +1362,8 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
             return .{ .value = e };
         },
         .Builder => |bstate| {
-            var intrinsic = makeIntrinsicHost(self);
-            defer deinitIntrinsicHost(&intrinsic);
+            var intrinsic = VmIntrinsicHost.owning(self);
+            defer intrinsic.release();
             const ihost = intrinsic.intrinsicHost();
             const step = try ihost.builderStep(bstate, out);
             return switch (step) {
@@ -1858,8 +1374,8 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
         },
         .IteratorFn => |fnbox| {
             if (st.done) return .done;
-            var intrinsic = makeIntrinsicHost(self);
-            defer deinitIntrinsicHost(&intrinsic);
+            var intrinsic = VmIntrinsicHost.owning(self);
+            defer intrinsic.release();
             const ihost = intrinsic.intrinsicHost();
             if (st.iter_obj == null) {
                 const r = try ihost.invokeCallable(&fnbox.asPtr().*, &.{}, out);
@@ -1869,7 +1385,7 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 }
             }
             const iter = st.iter_obj.?;
-            const hn = try callMemberRec(self, allocator, &iter, "hasNext", &.{});
+            const hn = try host_resolved.wellKnownMember(self, allocator, &iter, .has_next, &.{});
             const has = switch (hn) {
                 .ok => |x| x == .Bool and x.Bool,
                 .err => |e| return .{ .err = e },
@@ -1878,7 +1394,7 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 st.done = true;
                 return .done;
             }
-            const nx = try callMemberRec(self, allocator, &iter, "next", &.{});
+            const nx = try host_resolved.wellKnownMember(self, allocator, &iter, .next, &.{});
             return switch (nx) {
                 .ok => |v| .{ .value = v },
                 .err => |e| .{ .err = e },
@@ -1887,11 +1403,11 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
         .Merged => |mz| {
             if (st.done) return .done;
             if (st.iter_left == null) {
-                switch (try callMemberRec(self, allocator, &mz.left.asPtr().*, "iterator", &.{})) {
+                switch (try host_resolved.wellKnownMember(self, allocator, &mz.left.asPtr().*, .iterator, &.{})) {
                     .ok => |v| st.iter_left = v,
                     .err => |e| return .{ .err = e },
                 }
-                switch (try callMemberRec(self, allocator, &mz.right.asPtr().*, "iterator", &.{})) {
+                switch (try host_resolved.wellKnownMember(self, allocator, &mz.right.asPtr().*, .iterator, &.{})) {
                     .ok => |v| st.iter_right = v,
                     .err => |e| return .{ .err = e },
                 }
@@ -1899,7 +1415,7 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
             const lit = st.iter_left.?;
             const rit = st.iter_right.?;
             // Strict interleave, in `MergingSequence`'s pull order.
-            const lh = switch (try callMemberRec(self, allocator, &lit, "hasNext", &.{})) {
+            const lh = switch (try host_resolved.wellKnownMember(self, allocator, &lit, .has_next, &.{})) {
                 .ok => |x| x == .Bool and x.Bool,
                 .err => |e| return .{ .err = e },
             };
@@ -1907,7 +1423,7 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 st.done = true;
                 return .done;
             }
-            const rh = switch (try callMemberRec(self, allocator, &rit, "hasNext", &.{})) {
+            const rh = switch (try host_resolved.wellKnownMember(self, allocator, &rit, .has_next, &.{})) {
                 .ok => |x| x == .Bool and x.Bool,
                 .err => |e| return .{ .err = e },
             };
@@ -1915,17 +1431,17 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 st.done = true;
                 return .done;
             }
-            const av = switch (try callMemberRec(self, allocator, &lit, "next", &.{})) {
+            const av = switch (try host_resolved.wellKnownMember(self, allocator, &lit, .next, &.{})) {
                 .ok => |v| v,
                 .err => |e| return .{ .err = e },
             };
-            const bv = switch (try callMemberRec(self, allocator, &rit, "next", &.{})) {
+            const bv = switch (try host_resolved.wellKnownMember(self, allocator, &rit, .next, &.{})) {
                 .ok => |v| v,
                 .err => |e| return .{ .err = e },
             };
             if (mz.transform) |t| {
-                var intrinsic = makeIntrinsicHost(self);
-                defer deinitIntrinsicHost(&intrinsic);
+                var intrinsic = VmIntrinsicHost.owning(self);
+                defer intrinsic.release();
                 const ihost = intrinsic.intrinsicHost();
                 const r = try ihost.invokeCallable(&t.asPtr().*, &.{ av, bv }, out);
                 return switch (r) {
@@ -1945,8 +1461,8 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 if (gen.seed) |s| {
                     var sv = s.asPtr().*;
                     if (gen.seed_is_fn) {
-                        var intr = makeIntrinsicHost(self);
-                        defer deinitIntrinsicHost(&intr);
+                        var intr = VmIntrinsicHost.owning(self);
+                        defer intr.release();
                         const ih = intr.intrinsicHost();
                         const r = try ih.invokeCallable(&sv, &.{}, out);
                         switch (r) {
@@ -1969,8 +1485,8 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 }
                 // Nullary form: first element comes from next().
             }
-            var intrinsic = makeIntrinsicHost(self);
-            defer deinitIntrinsicHost(&intrinsic);
+            var intrinsic = VmIntrinsicHost.owning(self);
+            defer intrinsic.release();
             const ihost = intrinsic.intrinsicHost();
             // The nullary form's `next` takes nothing; the seeded forms' the
             // previous element.
@@ -2002,8 +1518,8 @@ fn seqIterPull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out: runt
     };
     try seqIterEnsureState(allocator, st, n_ops);
 
-    var intrinsic = makeIntrinsicHost(self);
-    defer deinitIntrinsicHost(&intrinsic);
+    var intrinsic = VmIntrinsicHost.owning(self);
+    defer intrinsic.release();
     const ihost = intrinsic.intrinsicHost();
 
     outer: while (true) {
@@ -2223,38 +1739,6 @@ pub fn seqIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value
     return null;
 }
 
-/// True when the module's member index records a user-declared `mname` on
-/// `owner_fqn`: a `@JvmInline value class` has an empty ClassDef.methods list.
-fn moduleMemberDeclares(self: *VmHost, owner_fqn: []const u8, mname: []const u8) bool {
-    if (owner_fqn.len == 0) return false;
-    const mg = self.module.borrow();
-    defer mg.deinit();
-    return mg.get().memberDecls(owner_fqn, mname).len != 0;
-}
-
-fn instanceClassDeclaresMethod(inst: ObjRef(InstanceData), mname: []const u8) bool {
-    const g = inst.borrow();
-    const cd = g.get().class.clone();
-    g.deinit();
-    defer cd.deinit();
-    const dg = cd.borrow();
-    defer dg.deinit();
-    return classDefDeclaresMethod(dg.get(), mname, 0);
-}
-
-fn classDefDeclaresMethod(d: *const ClassDef, mname: []const u8, depth: u32) bool {
-    if (depth > 24) return false;
-    for (d.methods) |m| {
-        if (std.mem.eql(u8, m.name, mname)) return true;
-    }
-    for (d.interfaces) |iface| {
-        const fg = iface.borrow();
-        defer fg.deinit();
-        if (classDefDeclaresMethod(fg.get(), mname, depth + 1)) return true;
-    }
-    return false;
-}
-
 /// Memo for `classHasUserMethod`: one hierarchy walk per (class, method) per gen.
 const UserMethodMemoEntry = struct { has: bool, gen: u32 };
 const UserMethodMemoLock = struct {
@@ -2301,219 +1785,6 @@ test "user-method memo answers per dispatch generation" {
     try std.testing.expectEqual(@as(?bool, null), userMethodMemoGet("pkg.C\x1fhashCode", 8));
 }
 
-fn classHasUserMethod(self: *VmHost, allocator: Allocator, start_in: []const u8, mname: []const u8) bool {
-    const start = if (std.mem.findScalarLast(u8, start_in, '.')) |d| start_in[d + 1 ..] else start_in;
-    {
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        if (mg.get().registry.hierarchy_methods.get(start_in)) |set| {
-            return set.contains(mname);
-        }
-        if (mg.get().registry.hierarchy_methods.get(start)) |set| {
-            return set.contains(mname);
-        }
-    }
-    const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
-    var key_buf: [512]u8 = undefined;
-    const key: ?[]const u8 = std.fmt.bufPrint(&key_buf, "{s}\x1f{s}", .{ start_in, mname }) catch null;
-    if (key) |k| {
-        if (userMethodMemoGet(k, gen)) |has| return has;
-    }
-    const has = classHasUserMethodWalk(self, allocator, start, mname);
-    if (key) |k| userMethodMemoPut(k, gen, has);
-    return has;
-}
-
-/// Uncached: breadth-first over supertype names via the module's class index.
-fn classHasUserMethodWalk(self: *VmHost, allocator: Allocator, start: []const u8, mname: []const u8) bool {
-    var queue: std.ArrayList([]const u8) = .empty;
-    defer queue.deinit(allocator);
-    var seen: runtime.NameHashMap(void) = .init(allocator);
-    defer seen.deinit();
-    queue.append(allocator, start) catch return false;
-    var head: usize = 0;
-    while (head < queue.items.len) : (head += 1) {
-        const cur_raw = queue.items[head];
-        const cur = if (std.mem.findScalarLast(u8, cur_raw, '.')) |d| cur_raw[d + 1 ..] else cur_raw;
-        if (seen.contains(cur)) continue;
-        seen.put(cur, {}) catch {};
-        {
-            const mg = self.module.borrow();
-            defer mg.deinit();
-            const mod = mg.get();
-            if (mod.registry.hierarchy_methods.get(cur)) |set| {
-                if (set.contains(mname)) return true;
-            } else if (mod.classId(cur)) |cid| {
-                if (cid.int() < mod.classes.items.len) {
-                    for (mod.classes.items[cid.int()].methods) |fid| {
-                        if (funcAt(mod, fid)) |f| {
-                            if (std.mem.eql(u8, f.name, mname)) return true;
-                        }
-                    }
-                }
-            }
-        }
-        const cg = self.classes.borrow();
-        if (cg.get().get(cur)) |def| {
-            const dg = def.borrow();
-            for (dg.get().supertype_names) |sup| queue.append(allocator, sup) catch {};
-            dg.deinit();
-        }
-        cg.deinit();
-    }
-    return false;
-}
-
-pub fn dataValueInstanceEquals(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), other: *const Value) Allocator.Error!bool {
-    if (other.* != .Instance) return false;
-    const rhs = other.Instance;
-    const lg = inst.borrow();
-    const lcg = lg.get().class.borrow();
-    const rg = rhs.borrow();
-    const rcg = rg.get().class.borrow();
-    defer {
-        rcg.deinit();
-        rg.deinit();
-        lcg.deinit();
-        lg.deinit();
-    }
-    if (!std.mem.eql(u8, lcg.get().fqn, rcg.get().fqn)) return false;
-    for (lcg.get().primary_params) |p| {
-        const left = lg.get().get(p.name) orelse Value.Null;
-        const right = rg.get().get(p.name) orelse Value.Null;
-        if (!try deepValueEquals(self, allocator, &left, &right)) return false;
-    }
-    return true;
-}
-
-pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    const inst = receiver.Instance;
-    var is_data = false;
-    var is_value = false;
-    var is_object = false;
-    var is_annotation = false;
-    var class_name: []const u8 = undefined;
-    var class_fqn: []const u8 = undefined;
-    {
-        const g = inst.borrow();
-        const cg = g.get().class.borrow();
-        is_data = cg.get().is_data;
-        is_value = cg.get().is_value;
-        is_object = cg.get().is_object;
-        is_annotation = cg.get().is_annotation;
-        class_name = cg.get().name;
-        class_fqn = cg.get().fqn;
-        cg.deinit();
-        g.deinit();
-    }
-    // Only data/value/object/annotation classes have auto members; skip the walk.
-    if (!is_data and !is_value and !is_object and !is_annotation) return null;
-    // A colliding simple name misleads the registry; the ClassDef is authoritative.
-    const has_user_override = classHasUserMethod(self, allocator, if (class_fqn.len != 0) class_fqn else class_name, name) or
-        instanceClassDeclaresMethod(inst, name) or
-        moduleMemberDeclares(self, class_fqn, name);
-
-    if (is_data and is_object and !has_user_override and std.mem.eql(u8, name, "toString")) {
-        return .{ .ok = try strVal(allocator, classDisplayName(class_name)) };
-    }
-    if (is_annotation and !has_user_override) {
-        if (args.len == 0 and std.mem.eql(u8, name, "toString")) {
-            return .{ .ok = try renderAnnotation(self, allocator, inst) };
-        }
-        if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
-            return .{ .ok = Value.newInt(@as(i64, try annotationHash(self, allocator, inst))) };
-        }
-        if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
-            return .{ .ok = boolVal(try annotationInstanceEquals(self, allocator, inst, &args[0])) };
-        }
-        return null;
-    }
-    if ((is_data or is_value) and !has_user_override and args.len == 0) {
-        if (is_data and std.mem.startsWith(u8, name, "component")) {
-            const rest = name["component".len..];
-            if (std.fmt.parseInt(usize, rest, 10) catch null) |n| {
-                if (n >= 1) {
-                    const g = inst.borrow();
-                    const cg = g.get().class.borrow();
-                    if (n - 1 < cg.get().primary_params.len) {
-                        const pname = cg.get().primary_params[n - 1].name;
-                        if (g.get().get(pname)) |v| {
-                            cg.deinit();
-                            g.deinit();
-                            // Borrowed instance field: retain, host-returns-owned.
-                            if (runtime.reclaimEnabled()) v.retain();
-                            return .{ .ok = v };
-                        }
-                    }
-                    cg.deinit();
-                    g.deinit();
-                }
-            }
-        }
-        if (std.mem.eql(u8, name, "toString")) {
-            return .{ .ok = try renderStructural(self, allocator, inst) };
-        }
-        if (std.mem.eql(u8, name, "hashCode")) {
-            // Kotlin folds each property's OWN `hashCode()`. The fold dispatches
-            // back in, so nothing may stay borrowed across it.
-            var fields: std.ArrayList(Value) = .empty;
-            defer {
-                if (runtime.reclaimEnabled()) {
-                    for (fields.items) |v| v.release(allocator);
-                }
-                fields.deinit(allocator);
-            }
-            {
-                const g = inst.borrow();
-                const cg = g.get().class.borrow();
-                defer {
-                    cg.deinit();
-                    g.deinit();
-                }
-                try fields.ensureTotalCapacity(allocator, cg.get().primary_params.len);
-                for (cg.get().primary_params) |p| {
-                    const v = g.get().get(p.name) orelse Value.Null;
-                    if (runtime.reclaimEnabled()) v.retain();
-                    fields.appendAssumeCapacity(v);
-                }
-            }
-            var h: i32 = 0;
-            for (fields.items) |*v| h = h *% 31 +% try hashWithDispatch(self, allocator, v);
-            return .{ .ok = Value.newInt(@as(i64, h)) };
-        }
-    }
-    if (is_data and !has_user_override and std.mem.eql(u8, name, "copy")) {
-        var n_params: usize = undefined;
-        {
-            const g = inst.borrow();
-            const cg = g.get().class.borrow();
-            n_params = cg.get().primary_params.len;
-            cg.deinit();
-            g.deinit();
-        }
-        if (args.len <= n_params) {
-            var new_args: std.ArrayList(Value) = .empty;
-            defer new_args.deinit(allocator);
-            const g = inst.borrow();
-            const cg = g.get().class.borrow();
-            for (cg.get().primary_params, 0..) |p, idx| {
-                if (idx < args.len) {
-                    try new_args.append(allocator, args[idx]);
-                } else {
-                    try new_args.append(allocator, g.get().get(p.name) orelse Value.Null);
-                }
-            }
-            cg.deinit();
-            g.deinit();
-            return try reconstructDataClass(self, allocator, inst, new_args.items);
-        }
-    }
-    if ((is_data or is_value) and !has_user_override and args.len == 1 and std.mem.eql(u8, name, "equals")) {
-        return .{ .ok = boolVal(try dataValueInstanceEquals(self, allocator, inst, &args[0])) };
-    }
-    return null;
-}
-
 /// An annotation instance's parameter names and values; values are retained for the caller.
 const AnnotationFields = struct {
     names: std.ArrayList([]const u8) = .empty,
@@ -2548,62 +1819,6 @@ const AnnotationFields = struct {
         self.values.deinit(allocator);
     }
 };
-
-/// Kotlin's rules for an instantiated annotation: `equals` compares every
-/// parameter, arrays by content and floats by bit pattern (NaN equals NaN,
-/// -0.0 differs from 0.0); `hashCode` sums `(127 * name.hashCode()) xor
-/// value.hashCode()`; `toString` renders `@fqn(name=value, ...)`.
-pub fn annotationInstanceEquals(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), other: *const Value) Allocator.Error!bool {
-    if (other.* != .Instance) return false;
-    const rhs = other.Instance;
-    var lhs_fields = try AnnotationFields.collect(allocator, inst);
-    defer lhs_fields.release(allocator);
-    var rhs_fields = try AnnotationFields.collect(allocator, rhs);
-    defer rhs_fields.release(allocator);
-    if (!std.mem.eql(u8, lhs_fields.fqn, rhs_fields.fqn)) return false;
-    if (lhs_fields.values.items.len != rhs_fields.values.items.len) return false;
-    for (lhs_fields.values.items, rhs_fields.values.items) |*l, *r| {
-        if (!try annotationValueEquals(self, allocator, l, r)) return false;
-    }
-    return true;
-}
-
-fn annotationValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
-    switch (a.*) {
-        .Float => |x| {
-            if (b.* == .Float) return @as(u32, @bitCast(x)) == @as(u32, @bitCast(b.Float));
-        },
-        .Double => |x| {
-            if (b.* == .Double) return @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.Double));
-        },
-        .Array => |xa| {
-            if (b.* == .Array) {
-                const ya = b.Array;
-                const n = xa.len();
-                if (n != ya.len()) return false;
-                var i: usize = 0;
-                while (i < n) : (i += 1) {
-                    var ex = xa.get(i);
-                    var ey = ya.get(i);
-                    if (!try annotationValueEquals(self, allocator, &ex, &ey)) return false;
-                }
-                return true;
-            }
-        },
-        else => {},
-    }
-    return deepValueEquals(self, allocator, a, b);
-}
-
-fn annotationHash(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!i32 {
-    var fields = try AnnotationFields.collect(allocator, inst);
-    defer fields.release(allocator);
-    var h: i32 = 0;
-    for (fields.names.items, fields.values.items) |n, *v| {
-        h +%= (javaStringHash(n) *% 127) ^ (try hashWithDispatch(self, allocator, v));
-    }
-    return h;
-}
 
 /// Callable references compare by target, captures and adaptation: two loads of
 /// `::f` are the same function, as are two wrappers of the same adaptation.
@@ -2724,13 +1939,6 @@ pub fn javaStringHash(s: []const u8) i32 {
     return h;
 }
 
-fn renderAnnotation(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!Value {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try renderAnnotationInto(self, allocator, inst, &buf);
-    return .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) };
-}
-
 fn renderAnnotationInto(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), buf: *std.ArrayList(u8)) Allocator.Error!void {
     var fields = try AnnotationFields.collect(allocator, inst);
     defer fields.release(allocator);
@@ -2768,7 +1976,7 @@ fn renderAnnotationValue(self: *VmHost, allocator: Allocator, v: *const Value, b
                 break :blk cg.get().is_annotation;
             };
             if (nested) return renderAnnotationInto(self, allocator, ii, buf);
-            switch (try callMember(self, allocator, v, "toString", &.{})) {
+            switch (try host_resolved.wellKnownMember(self, allocator, v, .to_string, &.{})) {
                 .ok => |sv| try buf.appendSlice(allocator, try sv.display(allocator)),
                 .err => try buf.appendSlice(allocator, try v.display(allocator)),
             }
@@ -2777,61 +1985,11 @@ fn renderAnnotationValue(self: *VmHost, allocator: Allocator, v: *const Value, b
     }
 }
 
-/// `Name(p1=v1, p2=v2)` structural rendering of a data class.
-fn renderStructural(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!Value {
-    const g = inst.borrow();
-    const cg = g.get().class.borrow();
-    defer {
-        cg.deinit();
-        g.deinit();
-    }
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, classDisplayName(cg.get().name));
-    try buf.append(allocator, '(');
-    // Fields are collected first: rendering dispatches back into the interpreter.
-    var fields: std.ArrayList(Value) = .empty;
-    defer {
-        if (runtime.reclaimEnabled()) {
-            for (fields.items) |v| v.release(allocator);
-        }
-        fields.deinit(allocator);
-    }
-    try fields.ensureTotalCapacity(allocator, cg.get().primary_params.len);
-    for (cg.get().primary_params) |p| {
-        const v = g.get().get(p.name) orelse Value.Null;
-        if (runtime.reclaimEnabled()) v.retain();
-        fields.appendAssumeCapacity(v);
-    }
-    for (cg.get().primary_params, fields.items) |p, *v| {
-        if (buf.items[buf.items.len - 1] != '(') try buf.appendSlice(allocator, ", ");
-        try buf.appendSlice(allocator, p.name);
-        try buf.append(allocator, '=');
-        const s = try displayWithDispatch(self, allocator, v);
-        try buf.appendSlice(allocator, s);
-    }
-    try buf.append(allocator, ')');
-    return .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) };
-}
-
-/// `Value.display` with member dispatch: data/value classes and container
-/// elements render through the value's OWN `toString()`; arrays keep identity.
-pub fn displayWithDispatch(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error![]const u8 {
-    switch (v.*) {
-        .Instance, .Exception, .Result, .List, .Set, .Map, .Pair, .Triple, .MapEntry => {
-            const r = try callMember(self, allocator, v, "toString", &.{});
-            switch (r) {
-                .ok => |sv| {
-                    if (sv == .String) {
-                        const sg = sv.String.borrow();
-                        defer sg.deinit();
-                        return try allocator.dupe(u8, sg.get().bytes);
-                    }
-                    return try v.display(allocator);
-                },
-                .err => return try v.display(allocator),
-            }
-        },
-        else => return try v.display(allocator),
-    }
+/// The host class table of the program's tables.
+fn hostClasses(self: *VmHost) *const ir.resolved.HostClasses {
+    const empty = struct {
+        const table: ir.resolved.HostClasses = .{};
+    };
+    const r = self.module.asPtrConst().resolved orelse return &empty.table;
+    return &r.host_class;
 }

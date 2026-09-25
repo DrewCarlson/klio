@@ -14,7 +14,6 @@
 const std = @import("std");
 
 const ir = @import("ir");
-const runtime = @import("runtime");
 const ast = @import("ast");
 
 const span = @import("span");
@@ -26,7 +25,7 @@ const FuncId = ir.FuncId;
 
 /// Bump on any change to the encoded layout or to the types it reaches. A
 /// mismatch refuses the load and the caller rebakes.
-pub const FORMAT_VERSION: u32 = 92;
+pub const FORMAT_VERSION: u32 = 94;
 
 // Watched AST node types: pointed at from the IR.
 
@@ -324,24 +323,6 @@ fn decStat(comptime T: type, n: usize) void {
     if (!gop.found_existing) gop.value_ptr.* = .{ .bytes = 0, .count = 0 };
     gop.value_ptr.bytes += @as(u64, @sizeOf(T)) * n;
     gop.value_ptr.count += n;
-}
-pub fn dumpDecodeStats() void {
-    if (!decode_stats_on) return;
-    const E = struct { name: []const u8, bytes: u64, count: u64 };
-    var list: std.ArrayList(E) = .empty;
-    var it = decode_stats.iterator();
-    while (it.next()) |kv| list.append(std.heap.page_allocator, .{ .name = kv.key_ptr.*, .bytes = kv.value_ptr.bytes, .count = kv.value_ptr.count }) catch {};
-    std.mem.sort(E, list.items, {}, struct {
-        fn lt(_: void, a: E, b: E) bool {
-            return a.bytes > b.bytes;
-        }
-    }.lt);
-    var n: usize = 0;
-    for (list.items) |e| {
-        if (n >= 25) break;
-        n += 1;
-        std.debug.print("[decode-stats] {d: >9} B  {d: >7} x  {s}\n", .{ e.bytes, e.count, e.name });
-    }
 }
 
 /// Decode one value in place through `out`, so every watched node and defined

@@ -59,7 +59,7 @@ pub const Hand = struct {
         const id = FuncId.from(@intCast(self.m.funcs.items.len));
         const params = try self.a.alloc(ir.Param, n_params);
         for (params) |*p| p.* = .{ .name = "p", .ty = .{ .name = "", .nullable = true, .args = &.{} }, .default = null };
-        var f: ir.Func = .{
+        const f: ir.Func = .{
             .id = id,
             .name = name,
             .fqn = name,
@@ -70,7 +70,6 @@ pub const Hand = struct {
             .entry = BlockId.from(0),
             .is_suspend = false,
         };
-        resolved.declineTiers(&f);
         try self.m.funcs.append(self.a, f);
         try self.func_native.append(self.a, .none);
         return id;
@@ -302,7 +301,7 @@ pub fn jump(b: u32) ir.Terminator {
     return .{ .Goto = BlockId.from(b) };
 }
 pub fn catchClass(c: ClassId, handler: u32, exception_reg: u32) ir.CatchHandler {
-    return .{ .type_name = "", .handler = BlockId.from(handler), .exception_reg = reg(exception_reg), .class_raw = c.int() };
+    return .{ .class = c, .handler = BlockId.from(handler), .exception_reg = reg(exception_reg) };
 }
 
 /// `this`, returned: the constructor of a class with nothing to initialize.

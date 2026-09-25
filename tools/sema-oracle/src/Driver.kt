@@ -17,6 +17,8 @@ private const val USAGE = """usage: sema-oracle [options] <file.kt | dir>...
   -o <file>        write the TSV to <file> instead of stdout
   -cp <paths>      extra classpath entries (path-separator separated) for every compilation
   -j <n>           compile n files concurrently (default: half the cores, at most 4)
+  --together       compile all the given files as one program (a multi-file
+                   example); each file's sites are printed under its own path
   -X<flag>, -language-version <v>
                    passed through to every compilation (e.g. -Xname-based-destructuring=complete)
   --keep-failed    also emit the sites of files that failed to compile
@@ -62,6 +64,9 @@ private class FirstError : MessageCollector {
 
 private class Job(val display: String, val file: File)
 
+/** One compilation: a file on its own, or every file of a program given with `--together`. */
+private class Compilation(val jobs: List<Job>)
+
 private class Result(val job: Job, val sites: List<Site>, val ok: Boolean, val error: String?, val unresolved: Int, val debug: List<String>)
 
 fun main(argv: Array<String>) {
@@ -69,6 +74,7 @@ fun main(argv: Array<String>) {
     var classpath: String? = null
     var jobs = (Runtime.getRuntime().availableProcessors() / 2).coerceIn(1, 4)
     var keepFailed = false
+    var together = false
     var debug = false
     var quiet = false
     val passthrough = ArrayList<String>()
@@ -80,6 +86,7 @@ fun main(argv: Array<String>) {
             "-cp", "-classpath" -> classpath = argv.getOrNull(++i)
             "-j" -> jobs = argv.getOrNull(++i)?.toIntOrNull() ?: 1
             "--keep-failed" -> keepFailed = true
+            "--together" -> together = true
             "--jvm-names" -> Options.commonNames = false
             "--debug" -> debug = true
             "--quiet" -> quiet = true
@@ -116,11 +123,12 @@ fun main(argv: Array<String>) {
     System.setProperty("idea.io.use.nio2", "true")
 
     val started = System.nanoTime()
+    val units = if (together) listOf(Compilation(work.toList())) else work.map { Compilation(listOf(it)) }
     val pool = Executors.newFixedThreadPool(jobs.coerceAtLeast(1))
-    val futures: List<Future<Result>> = work.mapIndexed { n, job ->
-        pool.submit<Result> { compileOne(job, home, pluginJar, File(scratch, "o$n"), classpath, passthrough, debug) }
+    val futures: List<Future<List<Result>>> = units.mapIndexed { n, unit ->
+        pool.submit<List<Result>> { compile(unit, home, pluginJar, File(scratch, "o$n"), classpath, passthrough, debug) }
     }
-    val results = futures.map { it.get() }
+    val results = futures.flatMap { it.get() }
     pool.shutdown()
     val elapsed = (System.nanoTime() - started) / 1e9
 
@@ -155,21 +163,25 @@ fun main(argv: Array<String>) {
     }
 }
 
-private fun compileOne(
-    job: Job, home: File, pluginJar: String, outDir: File, classpath: String?, passthrough: List<String>, debug: Boolean,
-): Result {
-    val bytes = try { job.file.readBytes() } catch (e: Exception) {
-        return Result(job, emptyList(), false, "cannot read: ${e.message}", 0, emptyList())
+private fun compile(
+    unit: Compilation, home: File, pluginJar: String, outDir: File, classpath: String?, passthrough: List<String>, debug: Boolean,
+): List<Result> {
+    val collectors = ArrayList<FileCollector>()
+    for (job in unit.jobs) {
+        val bytes = try { job.file.readBytes() } catch (e: Exception) {
+            return unit.jobs.map { Result(it, emptyList(), false, "cannot read ${job.display}: ${e.message}", 0, emptyList()) }
+        }
+        collectors.add(FileCollector(job.display, bytes, debug))
     }
-    val collector = FileCollector(job.display, bytes, debug)
-    val key = OracleSink.canonical(job.file.path)
-    OracleSink.collectors[key] = collector
+    val keys = unit.jobs.map { OracleSink.canonical(it.file.path) }
+    for ((key, collector) in keys.zip(collectors)) OracleSink.collectors[key] = collector
     val messages = FirstError()
     val code = try {
         val compiler = K2JVMCompiler()
         val args = compiler.createArguments()
-        val argv = arrayListOf(
-            job.file.path,
+        val argv = ArrayList<String>()
+        unit.jobs.forEach { argv.add(it.file.path) }
+        argv.addAll(listOf(
             "-d", outDir.path,
             "-kotlin-home", home.path,
             "-Xplugin=$pluginJar",
@@ -179,7 +191,7 @@ private fun compileOne(
             "-nowarn",
             "-Xsuppress-version-warnings",
             "-Xrender-internal-diagnostic-names",
-        )
+        ))
         if (classpath != null) { argv.add("-classpath"); argv.add(classpath) }
         argv.addAll(passthrough)
         compiler.parseArguments(argv.toTypedArray(), args)
@@ -188,17 +200,19 @@ private fun compileOne(
         messages.first = messages.first ?: "compiler crashed: $e"
         ExitCode.INTERNAL_ERROR
     } finally {
-        OracleSink.collectors.remove(key)
+        keys.forEach { OracleSink.collectors.remove(it) }
         outDir.deleteRecursively()
     }
     val compiled = messages.errors == 0 && (code == ExitCode.OK || messages.frontendDone || messages.jvmOnly > 0)
-    val ok = compiled && collector.visited
-    val error = when {
-        !compiled -> messages.first ?: code.name
-        !collector.visited -> "plugin did not run"
-        else -> null
+    return unit.jobs.zip(collectors).map { (job, collector) ->
+        val ok = compiled && collector.visited
+        val error = when {
+            !compiled -> messages.first ?: code.name
+            !collector.visited -> "plugin did not run"
+            else -> null
+        }
+        Result(job, collector.sites, ok, error, collector.unresolved, collector.debugLines)
     }
-    return Result(job, collector.sites, ok, error, collector.unresolved, collector.debugLines)
 }
 
 private fun kotlinHome(): File {

@@ -1,23 +1,17 @@
 //! The `Vm` run loop and constructors: establishes a `Vm` around a lowered IR
 //! module, runs the startup pipeline, and drives `main` through the IR evaluator.
-//! `object` and companion singletons initialize lazily at first access through
-//! `host_globals.ensureObjectSingleton`, not at startup.
 
 const std = @import("std");
-const host_globals = @import("host_globals.zig");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
-const stdlib = @import("stdlib");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
-const trace = @import("trace.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
-const Env = runtime.Env;
 const Output = runtime.Output;
 const SharedOutput = root.SharedOutput;
 const RuntimeError = runtime.RuntimeError;
@@ -28,40 +22,17 @@ const EvalError = ir.eval.EvalError;
 const Vm = root.Vm;
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
-const ProgramImage = root.ProgramImage;
-const SendableVmSeed = root.SendableVmSeed;
 const VmError = root.VmError;
 const VmResult = root.VmResult;
-const ClassTable = root.ClassTable;
-const OuterTable = root.OuterTable;
-const AnonMethodEntry = root.AnonMethodEntry;
 const SharedClosures = root.SharedClosures;
 
-/// Stdlib aliases go into globals up front, so Kotlin's default imports need no `import`.
 pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
-    var env = Env.init(allocator);
-    for (stdlib.IMPLICIT_ALIASES) |alias| {
-        if (stdlib.implementation(alias.fqn)) |func| {
-            try env.define(alias.name, Value.internIntrinsic(alias.fqn, func));
-        }
-    }
-    const globals = try ObjRef(Env).init(allocator, env);
-
     return .{
         .module = module,
-        .globals = globals,
         .instance_id_counter = try ObjRef(std.atomic.Value(u64)).init(allocator, std.atomic.Value(u64).init(0)),
-        .classes = try ObjRef(ClassTable).init(allocator, ClassTable.init(allocator)),
-        .top_level_props = .empty,
-        .enum_entry_arg_inits = .empty,
-        .class_default_outer = try ObjRef(OuterTable).init(allocator, OuterTable.init(allocator)),
-        .anon_methods = try root.AnonMethods.init(allocator, runtime.NameHashMap(AnonMethodEntry).init(allocator)),
         .closures = try SharedClosures.new(allocator),
-        .prog = try ObjRef(ProgramImage).init(allocator, try ProgramImage.init(allocator)),
         .out_sink = try SharedOutput.new(allocator),
         .threads = try root.ThreadTable.init(allocator, std.AutoHashMap(u64, root.ThreadEntry).init(allocator)),
-        .object_states = try root.ObjectStates.init(allocator, runtime.NameHashMap(root.ObjectInitState).init(allocator)),
-        .singletons_by_id = try root.SingletonsById.init(allocator, std.AutoHashMap(u32, runtime.Value).init(allocator)),
         .allocator = allocator,
     };
 }
@@ -69,18 +40,11 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
 /// Borrowed view of this Vm's shared handles; copies bump no refcount and own nothing.
 fn sharedHandles(self: *Vm) vmhost.SharedHandles {
     return .{
-        .globals = self.globals,
         .module = self.module,
         .instance_id_counter = self.instance_id_counter,
-        .classes = self.classes,
-        .prog = self.prog,
-        .anon_methods = self.anon_methods,
-        .class_default_outer = self.class_default_outer,
         .closures = self.closures,
         .out_sink = self.out_sink,
         .threads = self.threads,
-        .object_states = self.object_states,
-        .singletons_by_id = self.singletons_by_id,
         .resolved_state = self.resolved_state,
         .allocator = self.allocator,
     };
@@ -88,33 +52,7 @@ fn sharedHandles(self: *Vm) vmhost.SharedHandles {
 
 /// `VmHost` borrowing this Vm's state for one evaluation; it owns nothing, no deinit.
 pub fn vmMakeHost(self: *Vm, out: Output) VmHost {
-    return VmHost.borrowed(sharedHandles(self), self.globals, out);
-}
-
-/// Snapshot of every handle a spawned OS thread needs for its own child `Vm`; the seed
-/// carries `self.allocator` verbatim, sound under `assertSpawnAllocatorInvariant`.
-pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
-    const ok = @intFromPtr(self.allocator.vtable) != 0;
-    if (!ok and trace.invariantsEnabled()) {
-        trace.invariant("kind=spawn_allocator site=vmSpawnChild detail=degenerate_allocator", .{});
-    }
-    std.debug.assert(ok);
-    return .{
-        .module = self.module.clone(),
-        .globals = self.globals.clone(),
-        .instance_id_counter = self.instance_id_counter.clone(),
-        .classes = self.classes.clone(),
-        .prog = self.prog.clone(),
-        .anon_methods = self.anon_methods.clone(),
-        .class_default_outer = self.class_default_outer.clone(),
-        .closures = self.closures.clone(),
-        .out_sink = self.out_sink.clone(),
-        .threads = self.threads.clone(),
-        .object_states = self.object_states.clone(),
-        .singletons_by_id = self.singletons_by_id.clone(),
-        .resolved_state = if (self.resolved_state) |rs| rs.clone() else null,
-        .allocator = self.allocator,
-    };
+    return VmHost.borrowed(sharedHandles(self), out);
 }
 
 pub fn vmRunThreadBlock(self: *Vm, block: *const Value) Allocator.Error!runtime.EvalResult {
@@ -141,21 +79,13 @@ fn gcMarkAllVms(m: *runtime.gc.Marker) void {
     gcVmsLock();
     defer gcVmsUnlock();
     for (gc_vms.items) |vm| {
-        m.shade(&vm.globals.cell.hdr);
-        m.shade(&vm.classes.cell.hdr);
-        m.shade(&vm.class_default_outer.cell.hdr);
         // The lambda side-table spine traces nothing and its per-closure captures
         // stay alive through `markClosureHook`, so shading it would pin every closure.
-        // Mid-construction singletons, anon-object receivers, image default Values.
-        m.shade(&vm.object_states.cell.hdr);
-        m.shade(&vm.singletons_by_id.cell.hdr);
-        m.shade(&vm.anon_methods.cell.hdr);
-        m.shade(&vm.prog.cell.hdr);
         if (vm.resolved_state) |st| m.shade(&st.cell.hdr);
     }
 }
 
-/// Register a live Vm as a GC root (globals and class graph). Idempotent.
+/// Register a live Vm as a GC root (its run state). Idempotent.
 pub fn gcRegisterVm(vm: *const Vm) void {
     // The lazy-`sequence {}` continuation hooks are needed in every memory mode.
     runtime.gc.markSuspendHook = ir.eval.gcMarkSuspendStateOpaque;
@@ -309,18 +239,6 @@ pub fn vmPrepare(self: *Vm) Allocator.Error!?VmError {
     return null;
 }
 
-pub fn vmCallNoArg(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
-    const module_ref = self.module.clone();
-    defer module_ref.deinit();
-    const mg = module_ref.borrow();
-    defer mg.deinit();
-    const module = mg.get();
-    const func = module.funcById(func_id) orelse return .{ .failed = "test function not found" };
-    var host = vmMakeHost(self, self.out_sink.output());
-    const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, .empty, &host);
-    return outcomeFromEval(self, r);
-}
-
 /// Runs a program's `main` as `vmRunBody` does: a `suspend fun main` on the
 /// cooperative pump, so a suspension parks instead of escaping, and
 /// `main(args)` with the program's arguments.
@@ -388,23 +306,6 @@ pub fn vmNewResolved(self: *Vm, class: ir.ClassId, ctor: FuncId) Allocator.Error
     };
     const inst = try ir.resolved.instantiate(self.allocator, r, class, identity);
     return vmCallArgs(self, ctor, &.{inst});
-}
-
-pub fn vmConstruct(self: *Vm, class_id: ir.ClassId) Allocator.Error!CallOutcome {
-    var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
-    const r = try vmhost.intrinsic_host.construct(&intrinsic, class_id, &.{}, self.out_sink.output());
-    return outcomeFromEval(self, r);
-}
-
-pub fn vmCallMethod(self: *Vm, receiver: *const Value, name: []const u8) Allocator.Error!CallOutcome {
-    // Route through `callMember`, not `invokeMethod` (which flattens every
-    // non-throw error to null), and pin `receiver` until the callee roots its params.
-    const ka = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(ka);
-    runtime.keepalivePush(receiver.*);
-    var host = vmMakeHost(self, self.out_sink.output());
-    const r = try host.callMember(self.allocator, receiver, name, &.{});
-    return outcomeFromEval(self, r);
 }
 
 /// A throwable's `toString()`, which heads its stack trace: its class's own
@@ -610,19 +511,10 @@ pub fn vmDeinit(self: *Vm) void {
     gcUnregisterVm(self);
     if (runtime.freeScratch()) {
         self.module.deinit();
-        self.globals.deinit();
         self.instance_id_counter.deinit();
-        self.classes.deinit();
-        self.top_level_props.deinit(self.allocator);
-        self.enum_entry_arg_inits.deinit(self.allocator);
-        self.class_default_outer.deinit();
-        self.anon_methods.deinit();
         self.closures.deinit();
-        self.prog.deinit();
         self.out_sink.deinit();
         self.threads.deinit();
-        self.object_states.deinit();
-        self.singletons_by_id.deinit();
         if (self.resolved_state) |st| st.deinit();
     }
     vmhost.resetReceiverThreadLocals();

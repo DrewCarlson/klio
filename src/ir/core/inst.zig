@@ -1,5 +1,4 @@
 const std = @import("std");
-const runtime = @import("runtime");
 const root_ir = @import("../ir.zig");
 const core_ids = @import("ids.zig");
 
@@ -13,10 +12,6 @@ const StaticId = core_ids.StaticId;
 const NO_FUNC = core_ids.NO_FUNC;
 const Reg = core_ids.Reg;
 const Span = root_ir.Span;
-const TypeRef = core_ids.TypeRef;
-
-/// `CatchHandler.class_raw` when the handler names no class.
-pub const NO_CLASS: u32 = std.math.maxInt(u32);
 
 /// `CallStatic.init` when the call runs no init unit first.
 pub const NO_UNIT: u32 = std.math.maxInt(u32);
@@ -204,16 +199,60 @@ pub const Terminator = union(enum) {
     Unreachable,
 };
 
-/// Catch handler on a try-body block: on a Throw the evaluator pops handlers in stack
-/// order and jumps to the first whose `type_name` matches; `exception_reg` gets the value.
+/// Catch handler on a try-body block: on a throw the evaluator takes the
+/// handlers in order and jumps to the first whose `class` the thrown value
+/// is; `exception_reg` gets the value.
 pub const CatchHandler = struct {
-    type_name: []const u8,
+    class: ClassId,
     handler: BlockId,
     exception_reg: Reg,
-    /// The caught class, for a handler lowered from sema: it matches by
-    /// `Module.classIsA` and `type_name` is not read. `NO_CLASS` otherwise.
-    class_raw: u32 = NO_CLASS,
 };
+
+// The name guard. An instruction, a terminator and a catch handler carry
+// ids, registers, constants, flags and counts: never a name, a type written
+// out, or a word the runtime fills in as it runs. A field of any other type,
+// or one named like a memo, fails the build.
+comptime {
+    @setEvalBranchQuota(100_000);
+    for (@typeInfo(Inst).@"union".fields) |f| checkResolved(f.type, "Inst." ++ f.name);
+    for (@typeInfo(Terminator).@"union".fields) |f| checkResolved(f.type, "Terminator." ++ f.name);
+    checkResolved(CatchHandler, "CatchHandler");
+}
+
+fn checkResolved(comptime T: type, comptime where: []const u8) void {
+    if (resolvedPayloadError(T)) |why| @compileError(where ++ ": " ++ why);
+}
+
+/// Why `T` cannot sit in an instruction, or null when it can.
+fn resolvedPayloadError(comptime T: type) ?[]const u8 {
+    if (@typeInfo(T) != .@"struct") return resolvedFieldError(T, "");
+    for (@typeInfo(T).@"struct".fields) |f| {
+        if (resolvedFieldError(f.type, f.name)) |why| return "`" ++ f.name ++ "` " ++ why;
+    }
+    return null;
+}
+
+fn resolvedFieldError(comptime T: type, comptime name: []const u8) ?[]const u8 {
+    const memo_words = [_][]const u8{ "site", "memo", "cache", "route", "hint", "name_ptr", "name_len" };
+    for (memo_words) |w| {
+        if (std.mem.find(u8, name, w) != null) return "is named like a memo the runtime fills in";
+    }
+    const allowed = [_]type{ void, bool, u16, u32, Reg, ?Reg, []const Reg, BlockId, ConstId, FuncId, ClassId, MethodSlotId, NativeId, StaticId, BinOp, UnOp, Span };
+    for (allowed) |A| {
+        if (T == A) return null;
+    }
+    return "is a " ++ @typeName(T) ++ ", not an id, a register, a constant, a flag or a count";
+}
+
+test "the name guard refuses a name, a type and a memo word" {
+    @setEvalBranchQuota(10_000);
+    try std.testing.expect(comptime resolvedPayloadError(struct { dst: Reg, func: FuncId, n_args: u32 }) == null);
+    try std.testing.expect(comptime resolvedPayloadError(struct { dst: Reg, name: []const u8 }) != null);
+    try std.testing.expect(comptime resolvedPayloadError(struct { dst: Reg, ty: core_ids.TypeRef }) != null);
+    try std.testing.expect(comptime resolvedPayloadError(struct { dst: Reg, site_cls: u32 }) != null);
+    try std.testing.expect(comptime resolvedPayloadError(struct { dst: Reg, cache: u64 }) != null);
+    try std.testing.expect(comptime resolvedPayloadError(BlockId) == null);
+}
 
 test "the instruction union stays within half a cache line" {
     // The evaluator's dispatch loop reads instructions linearly, so a union

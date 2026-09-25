@@ -20,7 +20,6 @@ const ev_flow = @import("flow.zig");
 const ev_state = @import("state.zig");
 
 const Activation = ev_flow.Activation;
-const EnclosingEntry = ev_state.EnclosingEntry;
 const EvalError = ev_state.EvalError;
 const destroyParkedActivation = ev_activation.destroyParkedActivation;
 const gcMarkFrameRegs = ev_state.gcMarkFrameRegs;
@@ -29,9 +28,6 @@ const markFrameClosure = ev_state.markFrameClosure;
 pub const TryFrame = struct {
     /// Try body entry block; matches pop and pending return/rethrow against `Block.finally_done_for`.
     body: BlockId,
-    /// The frame's enclosing-receiver chain length at try entry. An exception unwinding out of a spliced
-    /// receiver-lambda region skips its `EnclosingPop`, so catch restores the chain to this length.
-    chain_len: usize = 0,
     catches: []ir.CatchHandler,
     /// Where to jump to start the finally or first catch; null for a try with only catches.
     finally_entry: ?BlockId,
@@ -94,9 +90,6 @@ pub const FrameSnapshot = struct {
     regs: SnapshotRegisters,
     params: []Value,
     captures: []Value,
-    /// The frame's enclosing-`this` chain (innermost last) at the suspension point, restored verbatim so a
-    /// bare member or `this@Outer` inside the body resolves to the same receivers after the park.
-    enclosing_this: []EnclosingEntry,
     try_stack: []TryFrame,
     pending_finally: PendingFinallyState = .{},
     is_lambda: bool,
@@ -171,9 +164,8 @@ threadlocal var suspend_stats_params: usize = 0;
 
 threadlocal var suspend_stats_captures: usize = 0;
 
-threadlocal var suspend_stats_receivers: usize = 0;
 
-pub fn noteSuspendSnapshot(dense: bool, total: usize, saved: usize, params: usize, captures: usize, receivers: usize) void {
+pub fn noteSuspendSnapshot(dense: bool, total: usize, saved: usize, params: usize, captures: usize) void {
     const enabled = suspend_stats_enabled orelse blk: {
         const on = runtime.envOnce("KLIO_SUSPEND_STATS") != null;
         suspend_stats_enabled = on;
@@ -186,16 +178,14 @@ pub fn noteSuspendSnapshot(dense: bool, total: usize, saved: usize, params: usiz
     suspend_stats_saved += saved;
     suspend_stats_params += params;
     suspend_stats_captures += captures;
-    suspend_stats_receivers += receivers;
     if (suspend_stats_total % 50_000 == 0) {
-        std.debug.print("[suspend-stats] snapshots={d} dense={d} slots={d} saved={d} params={d} captures={d} receivers={d}\n", .{
+        std.debug.print("[suspend-stats] snapshots={d} dense={d} slots={d} saved={d} params={d} captures={d}\n", .{
             suspend_stats_total,
             suspend_stats_dense,
             suspend_stats_slots,
             suspend_stats_saved,
             suspend_stats_params,
             suspend_stats_captures,
-            suspend_stats_receivers,
         });
     }
 }
@@ -213,7 +203,6 @@ pub fn resetSuspendLivenessCache() void {
     suspend_stats_saved = 0;
     suspend_stats_params = 0;
     suspend_stats_captures = 0;
-    suspend_stats_receivers = 0;
 }
 
 const RegUseDef = struct {
@@ -482,7 +471,6 @@ pub fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
         gcMarkFrameRegs(&act.frame, m);
         for (act.frame.params.items) |v| v.gcMark(m);
         for (act.frame.captures.items) |v| v.gcMark(m);
-        for (act.frame.enclosing_this.items) |e| e.v.gcMark(m);
         act.frame.pending_finally.gcMark(m);
         markFrameClosure(act.frame.closure_id, m);
         if (act.keepalive) |ka| ka.gcMark(m);
@@ -494,7 +482,6 @@ pub fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
     }
     for (snap.params) |v| v.gcMark(m);
     for (snap.captures) |v| v.gcMark(m);
-    for (snap.enclosing_this) |e| e.v.gcMark(m);
     snap.pending_finally.gcMark(m);
     markFrameClosure(snap.closure_id, m);
 }
@@ -536,6 +523,5 @@ pub fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
     }
     allocator.free(snap.params);
     allocator.free(snap.captures);
-    allocator.free(snap.enclosing_this);
     allocator.free(snap.try_stack);
 }

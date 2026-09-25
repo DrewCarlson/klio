@@ -6513,6 +6513,20 @@ test "a when guard sees its pattern's smart cast and gives the body its own" {
     });
 }
 
+test "a when's later branches see the subject as the earlier failed type tests leave it" {
+    var fx = try fixture(&.{
+        \\package app
+        \\fun f(x: Any): Int = when (x) {
+        \\    !is String -> 0
+        \\    else -> x.length
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("x.^length", "kotlin/String.length");
+}
+
 test "a vararg parameter's default is typed as its array" {
     var fx = try fixture(&.{
         \\package app
@@ -6565,5 +6579,91 @@ test "a call no candidate accepts lists them, and an ambiguous one names both" {
         "none of the candidates for `f` accept (Boolean):\n    fun f(a: String): Int\n    fun f(a: Int, b: Int): Int",
         "`g` is ambiguous: `fun g(a: Int, b: Long): Int`, `fun g(a: Int, c: Int): Int`",
         "cannot infer the type argument `T` of `make`; write it explicitly",
+    });
+}
+
+test "a member with a supertype member's signature needs `override`" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class Base {
+        \\    open val x: Int = 1
+        \\    open fun f(a: Int) {}
+        \\    fun g() {}
+        \\    private fun p() {}
+        \\    open fun <T> gen(t: T) {}
+        \\    open fun h(a: List<String>) {}
+        \\}
+        \\interface I {
+        \\    fun i(): Int
+        \\    val q: String get() = ""
+        \\}
+        \\class D(val x: Int) : Base(), I {
+        \\    fun f(a: Int) {}
+        \\    fun f(a: String) {}
+        \\    fun g() {}
+        \\    fun p() {}
+        \\    fun <T> gen(t: T) {}
+        \\    fun h(a: List<Int>) {}
+        \\    fun i(): Int = 0
+        \\    private val q: String = "q"
+        \\    fun toString(): String = ""
+        \\    companion object {
+        \\        fun f(a: Int) {}
+        \\    }
+        \\}
+        \\class E : Base() {
+        \\    override val x: Int = 2
+        \\    override fun f(a: Int) {}
+        \\    fun p() {}
+        \\    override fun toString(): String = ""
+        \\}
+        \\interface P {
+        \\    @kotlin.internal.PlatformDependent
+        \\    fun f(): String = "FAIL"
+        \\}
+        \\class F : P {
+        \\    fun f() = "OK"
+        \\}
+    ,
+        \\package kotlin.internal
+        \\internal annotation class PlatformDependent
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectMessages(&fx, &.{
+        "`x` hides member of supertype `Base` and needs an `override` modifier",
+        "`f` hides member of supertype `Base` and needs an `override` modifier",
+        "`g` hides member of supertype `Base` and needs an `override` modifier",
+        "`gen` hides member of supertype `Base` and needs an `override` modifier",
+        "`i` hides member of supertype `I` and needs an `override` modifier",
+        "`q` hides member of supertype `I` and needs an `override` modifier",
+        "`toString` hides member of supertype `Any` and needs an `override` modifier",
+    });
+}
+
+test "a type alias of an inner class is found in scope, not among the receiver's members" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Outer<T>(val id: String) {
+        \\    inner class Inner(val p: T)
+        \\    typealias TAtoInner = Outer<String>.Inner
+        \\    fun inside(): String {
+        \\        val unbound = Outer<String>::TAtoInner
+        \\        val bound = Outer<String>("b")::TAtoInner
+        \\        return unbound(Outer("u"), "x").p + bound("y").p + Outer<String>("c").TAtoInner("z").p
+        \\    }
+        \\}
+        \\fun outside(o: Outer<String>) {
+        \\    o.TAtoInner("x")
+        \\    val bound = o::TAtoInner
+        \\    val unbound = Outer<String>::TAtoInner
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectMessages(&fx, &.{
+        "unresolved reference `TAtoInner` on `Outer<String>`",
+        "unresolved reference `TAtoInner`",
+        "unresolved reference `TAtoInner`",
     });
 }

@@ -53,12 +53,6 @@ pub const Reg = enum(u32) {
     }
 };
 
-/// One implicit-receiver tower entry: the receiver's type head plus the `this@<label>` that addresses its value, null when unbound.
-pub const ReceiverTowerEntry = struct {
-    head: []const u8,
-    label: ?[]const u8 = null,
-};
-
 pub const BlockId = enum(u32) {
     _,
     pub fn from(v: u32) BlockId {
@@ -77,15 +71,6 @@ pub const FuncId = enum(u32) {
     pub fn int(self: FuncId) u32 {
         return @intFromEnum(self);
     }
-};
-
-/// Out-pointers into a `CallVirtual` site memo: virtual dispatch stamps the resolved class
-/// and native here. Null when the call carries argument names or a parameter map.
-pub const VirtNativeSite = struct {
-    cls: *u64,
-    native: *u64,
-    name_ptr: *u64,
-    name_len: *u32,
 };
 
 pub const MethodSlotId = enum(u32) {
@@ -110,46 +95,6 @@ pub const ClassId = enum(u32) {
         return @intFromEnum(self);
     }
 };
-
-/// Identity key for a class type parameter: `$class$`, NUL, owner id, NUL, name
-/// length, `:`, name. The parse side also strips an `out#`/`in#` variance prefix.
-pub fn classTypeParamIdentity(
-    allocator: Allocator,
-    owner: ClassId,
-    param: []const u8,
-) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "$class$\x00{d}\x00{d}:{s}",
-        .{ owner.int(), param.len, param },
-    );
-}
-
-pub const ClassTypeParamIdentity = struct {
-    owner: ClassId,
-    param: []const u8,
-};
-
-pub fn parseClassTypeParamIdentity(raw_name: []const u8) ?ClassTypeParamIdentity {
-    var name = raw_name;
-    if (std.mem.startsWith(u8, name, "out#")) {
-        name = name["out#".len..];
-    } else if (std.mem.startsWith(u8, name, "in#")) {
-        name = name["in#".len..];
-    }
-    const prefix = "$class$\x00";
-    if (!std.mem.startsWith(u8, name, prefix)) return null;
-    const owner_end = std.mem.findScalar(u8, name[prefix.len..], 0) orelse return null;
-    const owner_text = name[prefix.len .. prefix.len + owner_end];
-    const owner_int = std.fmt.parseInt(u32, owner_text, 10) catch return null;
-    const length_start = prefix.len + owner_end + 1;
-    const colon = std.mem.findScalar(u8, name[length_start..], ':') orelse return null;
-    const length_text = name[length_start .. length_start + colon];
-    const param_len = std.fmt.parseInt(usize, length_text, 10) catch return null;
-    const param = name[length_start + colon + 1 ..];
-    if (param.len != param_len) return null;
-    return .{ .owner = ClassId.from(owner_int), .param = param };
-}
 
 /// A host function a bodyless declaration is bound to: an index into
 /// `Resolved.natives`.

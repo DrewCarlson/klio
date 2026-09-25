@@ -10,7 +10,6 @@ const runtime = @import("runtime");
 
 const vmhost = @import("vmhost.zig");
 const host_call_func = @import("host_call_func.zig");
-const host_call_member = @import("host_call_member.zig");
 
 const VmHost = vmhost.VmHost;
 
@@ -29,6 +28,20 @@ fn fail(allocator: Allocator, comptime fmt: []const u8, args: anytype) Allocator
 
 pub fn resolvedState(self: *VmHost) ?ir.resolved.StateRef {
     return self.resolved_state;
+}
+
+/// Whether `fid`'s body runs wherever it is called: a body the host fronts
+/// with a fast path runs only where the call asks the fast path first, which
+/// the fused tier does not.
+pub fn funcRunsItsBody(self: *VmHost, fid: FuncId) bool {
+    const r = self.module.asPtrConst().resolved orelse return true;
+    return fid.int() >= r.func_try.len or r.func_try[fid.int()] == .none;
+}
+
+/// The module `func`'s body indexes against when that is the program's own.
+pub fn ownerModuleForFunc(self: *VmHost, func: *const ir.Func) ?*const Module {
+    const m = self.module.asPtrConst();
+    return if (m.funcById(func.id) == func) m else null;
 }
 
 /// Runs native `id` of the main module's tables over `args`.
@@ -170,6 +183,14 @@ fn generatedSerializer(self: *VmHost, allocator: Allocator, args: []const Value)
     return runResolved(self, allocator, module, entry.func, call.items);
 }
 
+/// The next identity from the host's instance counter, counting from 1, for
+/// an instance a host member makes itself.
+pub fn mintInstanceId(self: *VmHost) u64 {
+    const g = self.instance_id_counter.borrowMut();
+    defer g.deinit();
+    return g.get().fetchAdd(1, .monotonic) + 1;
+}
+
 fn nextIdentity(st: ir.resolved.StateRef) u64 {
     const g = st.borrowMut();
     defer g.deinit();
@@ -187,10 +208,19 @@ fn objectValue(self: *VmHost, allocator: Allocator, module: *const Module, class
 
 /// A new instance of `cc.class` built by its constructor over `arg`.
 pub fn construct(self: *VmHost, allocator: Allocator, module: *const Module, cc: ir.resolved.ClassCtor, arg: Value) Allocator.Error!EvalResult {
+    return constructWith(self, allocator, module, cc, &.{arg});
+}
+
+/// A new instance of `cc.class` built by its constructor over `args`.
+pub fn constructWith(self: *VmHost, allocator: Allocator, module: *const Module, cc: ir.resolved.ClassCtor, args: []const Value) Allocator.Error!EvalResult {
     const r = module.resolved.?;
     const st = self.resolved_state orelse return fail(allocator, "a construction without a run state", .{});
     const inst = try ir.resolved.instantiate(allocator, r, cc.class, nextIdentity(st));
-    const built = try runResolved(self, allocator, module, cc.ctor, &.{ inst, arg });
+    const call = try allocator.alloc(Value, args.len + 1);
+    defer allocator.free(call);
+    call[0] = inst;
+    @memcpy(call[1..], args);
+    const built = try runResolved(self, allocator, module, cc.ctor, call);
     switch (built) {
         .ok => |v| v.release(allocator),
         .err => {
@@ -315,8 +345,35 @@ pub fn callWellKnown(self: *VmHost, allocator: Allocator, recv: *const Value, me
     }
     const module = self.module.asPtrConst();
     const r = module.resolved orelse return null;
+    if (member == .invoke) return callInvoke(self, allocator, module, r, recv, args);
     const slot = r.well_known.get(member) orelse return null;
     return callSlot(self, allocator, module, recv, slot, args);
+}
+
+/// `invoke` of the function type of `args`' arity that `recv`'s class
+/// implements, a plain or a suspend one; null when it implements neither.
+fn callInvoke(self: *VmHost, allocator: Allocator, module: *const Module, r: *const ir.Resolved, recv: *const Value, args: []const Value) Allocator.Error!?EvalResult {
+    const h = &r.host_class;
+    if (args.len < h.invoke_slot.len) if (try callSlot(self, allocator, module, recv, h.invoke_slot[args.len], args)) |res| return res;
+    if (args.len < h.suspend_invoke_slot.len) return callSlot(self, allocator, module, recv, h.suspend_invoke_slot[args.len], args);
+    return null;
+}
+
+/// A new `class` over `args` through its primary constructor; null when
+/// the tables do not declare it.
+pub fn constructWellKnown(self: *VmHost, allocator: Allocator, class: runtime.WellKnownClass, args: []const Value) Allocator.Error!?EvalResult {
+    const module = self.module.asPtrConst();
+    const r = module.resolved orelse return null;
+    const cc = r.well_known_classes.get(class) orelse return null;
+    return try constructWith(self, allocator, module, cc, args);
+}
+
+/// `member` of `recv` through its class's slot, as a call in Kotlin
+/// dispatches it; an error for a value whose class the tables give no such
+/// member.
+pub fn wellKnownMember(self: *VmHost, allocator: Allocator, recv: *const Value, member: runtime.WellKnown, args: []const Value) Allocator.Error!EvalResult {
+    if (try callWellKnown(self, allocator, recv, member, args)) |r| return r;
+    return fail(allocator, "no `{s}` for a {s}", .{ member.memberName(), recv.typeFqn() });
 }
 
 /// `object` from the tables, made on first use as `LoadObject` makes it;
@@ -365,31 +422,6 @@ fn callSlot(self: *VmHost, allocator: Allocator, module: *const Module, recv: *c
     return try runResolved(self, allocator, module, target.?, list.items);
 }
 
-/// The by-name member ladder asking an instance lowered from sema for a
-/// member: the base member it names answers through its slot, as
-/// `callWellKnown` does, and a function type's `invoke` through the slot of
-/// its arity. Null for any other receiver or name.
-pub fn wellKnownCall(self: *VmHost, allocator: Allocator, recv: *const Value, name: []const u8, args: []const Value, kind: ir.resolved.MemberKind) Allocator.Error!?EvalResult {
-    if (recv.* != .Instance) return null;
-    const module = self.module.asPtrConst();
-    const r = module.resolved orelse return null;
-    if (kind == .function and std.mem.eql(u8, name, "invoke")) {
-        const h = &r.host_class;
-        if (args.len < h.invoke_slot.len) return callSlot(self, allocator, module, recv, h.invoke_slot[args.len], args);
-        return null;
-    }
-    // A name can be several members (`get` of a list, a map and a char
-    // sequence): the one the instance's class implements answers.
-    for (std.enums.values(runtime.WellKnown)) |member| {
-        if (member.isProperty() != (kind == .getter) or kind == .setter) continue;
-        if (!std.mem.eql(u8, member.memberName(), name)) continue;
-        if (!member.isProperty() and ir.bridge.wellKnownArity(member) != args.len) continue;
-        const slot = r.well_known.get(member) orelse continue;
-        if (try callSlot(self, allocator, module, recv, slot, args)) |res| return res;
-    }
-    return null;
-}
-
 /// A host entry's `equals` against an instance lowered from sema whose class
 /// implements `Map.Entry`: the instance's key and value come from its own
 /// getters, as `other.key` and `other.value` read them in Kotlin. Null for
@@ -429,16 +461,15 @@ fn getterValue(self: *VmHost, allocator: Allocator, module: *const Module, cls: 
 /// Whether an instance lowered from sema is of a class whose simple name
 /// is `head` (`Set` for a class implementing `kotlin.collections.Set`),
 /// answered from the resolved tables; null for any other value.
-pub fn implementsHead(self: *VmHost, recv: *const Value, head: []const u8) ?bool {
-    if (recv.* != .Instance) return null;
+/// Whether `recv` is an instance of a class implementing `iface`, one of
+/// the host class table's interfaces; false for any other value.
+pub fn instanceImplements(self: *VmHost, recv: *const Value, iface: ?ir.ClassId) bool {
+    if (recv.* != .Instance) return false;
+    const want = iface orelse return false;
     const module = self.module.asPtrConst();
-    const r = module.resolved orelse return null;
-    const cls = ir.resolved.classOf(r, recv) orelse return null;
-    for (r.classes, 0..) |c, i| {
-        if (!std.mem.eql(u8, c.def.asPtr().name, head)) continue;
-        if (ir.resolved.isA(module, cls, ir.ClassId.from(@intCast(i)))) return true;
-    }
-    return false;
+    const r = module.resolved orelse return false;
+    const cls = ir.resolved.classOf(r, recv) orelse return false;
+    return ir.resolved.isA(module, cls, want);
 }
 
 /// Runs `f` of `module` recursively, for an instruction that needs the
@@ -488,6 +519,28 @@ pub fn makeResolvedClosure(
 }
 
 /// The body of a closure lowered from sema, or null for any other value.
+/// Runs a closure made from sema's code over `args`, with `this_value` as
+/// its first argument when given; null for any other callee.
+pub fn callResolvedClosure(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: ?*const Value, args: []const Value) Allocator.Error!?EvalResult {
+    const body = resolvedClosure(self, callee) orelse return null;
+    const given = args.len + @intFromBool(this_value != null);
+    if (given != body.arity()) return try fail(allocator, "closure of {s} takes {d} arguments, called with {d}", .{ body.func.fqn, body.arity(), given });
+    var params: std.ArrayList(Value) = .empty;
+    var caps: std.ArrayList(Value) = .empty;
+    {
+        const g = callee.IrClosure.borrow();
+        defer g.deinit();
+        const closure_caps = g.get().captures;
+        switch (body.kind) {
+            .property_ref => |p| if (p.bound and closure_caps.len != 0) try params.append(allocator, closure_caps[0]),
+            else => try caps.appendSlice(allocator, closure_caps),
+        }
+    }
+    if (this_value) |t| try params.append(allocator, t.*);
+    try params.appendSlice(allocator, args);
+    return try ir.eval.evalClosure(VmHost, allocator, body.module, body.owning, body.func, params, caps, body.id, self);
+}
+
 pub fn resolvedClosure(self: *VmHost, v: *const Value) ?ir.resolved.ClosureBody {
     if (v.* != .IrClosure) return null;
     const id = v.IrClosure.asPtr().id;

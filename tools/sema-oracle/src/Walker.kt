@@ -174,7 +174,14 @@ class SiteWalker(val session: FirSession, val scopeSession: ScopeSession, val ou
     }
 
     private fun objectOf(q: FirResolvedQualifier): FirRegularClassSymbol? {
-        val sym = q.qualifierSymbol as? FirRegularClassSymbol ?: return null
+        // A type alias names the class it expands to (`typealias HC = Holder.Companion`).
+        val sym = when (val qs = q.qualifierSymbol) {
+            is FirTypeAliasSymbol -> {
+                val t = qs.resolvedExpandedTypeRef.coneType.fullyExpandedType(session)
+                (t as? ConeClassLikeType)?.lookupTag?.toClassSymbol(session) as? FirRegularClassSymbol
+            }
+            else -> qs as? FirRegularClassSymbol
+        } ?: return null
         if (q.resolvedToCompanionObject) return sym.resolvedCompanionObjectSymbol
         return if (sym.classKind == ClassKind.OBJECT) sym else null
     }
@@ -197,8 +204,9 @@ class SiteWalker(val session: FirSession, val scopeSession: ScopeSession, val ou
         }
         return when (e) {
             is FirCallableReferenceAccess -> if (calleeKind is KtFakeSourceElementKind) null else "ref"
-            // `val (_, b) = p`: the language does not call component1 for `_`.
-            is FirComponentCall -> if ((psi(e.source) as? KtDestructuringDeclarationEntry)?.name == "_") null else "component${e.componentIndex}"
+            // `val (_, b) = p`: the language does not call component1 for `_`. A
+            // backtick-escaped `` `_` `` is a name like any other and is read.
+            is FirComponentCall -> if ((psi(e.source) as? KtDestructuringDeclarationEntry)?.nameIdentifier?.text == "_") null else "component${e.componentIndex}"
             is FirImplicitInvokeCall -> "invoke"
             is FirFunctionCall -> when {
                 // `a !in b` is `!b.contains(a)`; the `not` is not written.

@@ -117,27 +117,6 @@ pub fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Erro
     return errResult(.{ .Type = msg });
 }
 
-/// Kotlin `toString` for a value, dispatching user overrides through the host. Caller owns the returned string.
-pub fn stringify(comptime H: type, allocator: Allocator, host: *H, v: *const Value) Allocator.Error!union(enum) { ok: []const u8, err: EvalError } {
-    // Instances, collections, tuples and `Result` dispatch so element overrides fire; arrays keep Kotlin's identity `toString`.
-    if (v.* == .Instance or v.* == .List or v.* == .Set or v.* == .Map or v.* == .Result or
-        v.* == .Pair or v.* == .Triple)
-    {
-        switch (try host.callMember(allocator, v, "toString", &.{})) {
-            .ok => |result| {
-                if (result == .String) {
-                    const g = result.String.borrow();
-                    defer g.deinit();
-                    return .{ .ok = try allocator.dupe(u8, g.get().bytes) };
-                }
-                return .{ .ok = try renderValue(allocator, &result) };
-            },
-            .err => |e| return .{ .err = e },
-        }
-    }
-    return .{ .ok = try renderValue(allocator, v) };
-}
-
 pub fn valueToI64(v: *const Value) ?i64 {
     return switch (v.*) {
         .Int => |i| @as(i64, i),
@@ -180,7 +159,7 @@ pub fn compoundAssignMethod(op: BinOp) ?[]const u8 {
 }
 
 /// Render a value the way Kotlin's `toString` and string templates do. Caller owns the string.
-fn renderValue(allocator: Allocator, v: *const Value) Allocator.Error![]const u8 {
+pub fn renderValue(allocator: Allocator, v: *const Value) Allocator.Error![]const u8 {
     return switch (v.*) {
         .Unit => allocator.dupe(u8, "kotlin.Unit"),
         .Int => |i| std.fmt.allocPrint(allocator, "{d}", .{i}),
@@ -727,3 +706,126 @@ pub fn remTruncI32(a: i32, b: i32) i32 {
     return @rem(a, b);
 }
 
+pub fn envVarSet(name: []const u8) bool {
+    return runtime.procEnvIsSet(std.heap.page_allocator, name);
+}
+
+pub fn constStr(module: *const Module, id: ConstId) ?[]const u8 {
+    return switch (module.consts.items[id.int()]) {
+        .String => |s| s,
+        else => null,
+    };
+}
+
+pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
+    if (idx_v.* != .Int) return null;
+    const idx = idx_v.Int;
+    if (idx < 0) return null;
+    const ui: usize = @intCast(idx);
+    switch (recv.*) {
+        .Array => |arr| switch (arr.storage()) {
+            .scalars => |pb| {
+                const g = pb.borrow();
+                defer g.deinit();
+                if (ui >= g.get().len()) return null;
+                // An unsigned array over signed backing (`UIntArray(intArray)`)
+                // tags elements by `arr.prim`, not the buffer's storage kind.
+                return g.get().getAs(ui, arr.primKind() orelse g.get().kind); // fresh scalar
+            },
+            .boxed => |vl| {
+                const g = vl.borrow();
+                defer g.deinit();
+                const items = g.get().items;
+                if (ui >= items.len) return null;
+                const elem = items[ui];
+                elem.retain();
+                return elem;
+            },
+        },
+        .List => |l| {
+            // A stale subList view must fail fast: the slow path's read guard
+            // throws ConcurrentModificationException.
+            if (recv.sublistViewStale()) return null;
+            // An array `.asList()` view re-reads its scalar source so a later
+            // array write shows through on this indexed load.
+            recv.refreshArrayView();
+            recv.refreshSublistView();
+            const g = l.items.borrow();
+            defer g.deinit();
+            const items = g.get().items;
+            if (ui >= items.len) return null;
+            const elem = items[ui];
+            elem.retain();
+            return elem;
+        },
+        .String => |s| {
+            const g = s.borrow();
+            defer g.deinit();
+            const sd = g.get();
+            // The UTF-16 unit at `ui` is byte `ui` when every byte is ASCII;
+            // otherwise the cursor-resumed walk answers, so an in-bounds index
+            // is served here whatever the string holds. Out of bounds is the
+            // one case left, and the caller raises it.
+            if (sd.ascii) return if (ui < sd.bytes.len) .{ .Char = sd.bytes[ui] } else null;
+            return if (sd.utf16UnitAt(ui)) |u| .{ .Char = u } else null;
+        },
+        // A builder carries no immutable header, so its ASCII-ness, length and
+        // cursor live in the reader memo every mutating builtin invalidates.
+        .StringBuilder => |sb| {
+            const g = sb.borrow();
+            defer g.deinit();
+            const items = g.get().items;
+            const m = runtime.sbMemoFor(@intFromPtr(sb.cell), items);
+            if (m.ascii) return if (ui < items.len) .{ .Char = items[ui] } else null;
+            return if (runtime.sbUnitAt(m, items, ui)) |u| .{ .Char = u } else null;
+        },
+        else => return null,
+    }
+}
+
+/// Indexed-store fast path for `a[i] = v` on an `Array` or a plain mutable
+/// `List`, with the `coll_array_set` ownership: release the overwritten element,
+/// retain the incoming one. Returns the set-EXPRESSION's value, `Unit` for an
+/// array and the PREVIOUS element for a list per Kotlin's `MutableList.set`.
+/// Out-of-bounds, an immutable receiver and a live view return null.
+pub inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) ?Value {
+    if (idx_v.* != .Int) return null;
+    const idx = idx_v.Int;
+    if (idx < 0) return null;
+    const ui: usize = @intCast(idx);
+    switch (recv.*) {
+        .Array => |arr| switch (arr.storage()) {
+            .scalars => |pb| {
+                const g = pb.borrowMut();
+                defer g.deinit();
+                if (ui >= g.get().len()) return null;
+                g.get().setAs(ui, new_val, arr.primKind() orelse g.get().kind);
+                return Value.Unit;
+            },
+            .boxed => |vl| {
+                const g = vl.borrowMut();
+                defer g.deinit();
+                const items = g.get().items;
+                if (ui >= items.len) return null;
+                if (runtime.reclaimEnabled()) {
+                    items[ui].release(allocator);
+                    new_val.retain();
+                }
+                items[ui] = new_val;
+                return Value.Unit;
+            },
+        },
+        .List => |l| {
+            if (!l.mutable or l.backing != null) return null;
+            const g = l.items.borrowMut();
+            defer g.deinit();
+            const items = g.get().items;
+            if (ui >= items.len) return null;
+            if (runtime.reclaimEnabled()) new_val.retain();
+            const prev = items[ui];
+            items[ui] = new_val;
+            return prev;
+        },
+        else => return null,
+    }
+}

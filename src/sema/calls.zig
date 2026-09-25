@@ -635,18 +635,18 @@ fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, ar
         if (nested != .none and s.syms.kind(nested) == .class and s.syms.flags(nested).inner) {
             try appendCtorsVia(ctx, &member_level, nested, .{ .dispatch = recv_src }, rt);
         }
-        // An alias of an inner class nested in the receiver's class.
-        if (nested != .none and s.syms.kind(nested) == .type_alias) {
-            const target = s.types.classSym(try headers.aliasTarget(s, nested));
-            if (target != .none and s.syms.flags(target).inner) try appendAliasCtorsOn(ctx, &member_level, nested, recv_src, rt);
+        // An alias is found by its name in scope, not among the receiver's
+        // members: a nested alias of an enclosing class, then a top-level
+        // one. Outside `Outer`, `outer.A()` for its nested alias `A` names
+        // nothing.
+        if (member_level.items.len == 0) {
+            const alias = try scope_mod.classifierInContext(s, body.typeCtx(ctx).decl, ctx.file, n);
+            if (try innerAliasOn(s, alias, rt)) try appendAliasCtorsOn(ctx, &member_level, alias, recv_src, rt);
         }
         if (member_level.items.len == 0) {
             for (try topLevelTiers(ctx, n)) |tier| {
                 for (tier) |m| {
-                    if (s.syms.kind(m) != .type_alias) continue;
-                    const target = s.types.classSym(try headers.aliasTarget(s, m));
-                    if (target == .none or !s.syms.flags(target).inner) continue;
-                    if (try subtyping.supertypeWithClass(s, rt, s.syms.owner(target)) == null) continue;
+                    if (!try innerAliasOn(s, m, rt)) continue;
                     try appendAliasCtorsOn(ctx, &member_level, m, recv_src, rt);
                 }
                 if (member_level.items.len != 0) break;
@@ -3581,7 +3581,7 @@ pub fn equalsRef(ctx: *Ctx, anchor: Span, lhs_t: TypeId) Allocator.Error!void {
         // The other side (the right operand, or the `when` subject's
         // pattern value) is operand 0.
         const rec = try s.arena.create(records.CallRec);
-        rec.* = .{ .callee = m.sym, .form = .plain, .dispatch = .expr, .args = try s.arena.dupe(records.ArgSource, &.{.{ .arg = 0 }}), .conv = try s.arena.dupe(records.Conv, &.{.none}) };
+        rec.* = .{ .callee = m.sym, .form = .plain, .dispatch = .expr, .args = try s.arena.dupe(records.ArgSource, &.{.{ .arg = 0 }}), .conv = try s.arena.dupe(records.Conv, &.{.none}), .subject_ty = lhs_t };
         try ctx.addRef(.{ .file = ctx.file, .anchor = anchor, .kind = .equals, .target = m.sym, .dispatch = .expr, .detail = .{ .call = rec } });
         return;
     }
@@ -4263,7 +4263,7 @@ fn boundRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), rt: TypeId, src: 
         if (nested != .none and s.syms.kind(nested) == .class and s.syms.flags(nested).inner) {
             try ctorRefCands(ctx, &level, nested, .{ .dispatch = src, .subst = try innerSubst(ctx, nested, rt) });
         }
-        if (level.items.len == 0) try innerAliasRefCands(ctx, &level, rt, src, n);
+        if (level.items.len == 0) try innerAliasRefCands(ctx, &level, rt, .{ .dispatch = src }, n);
     }
     if (level.items.len != 0) try levels.append(s.arena, level);
     var ext: RefLevel = .empty;
@@ -4330,15 +4330,9 @@ fn unboundRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), cls: Sym, self_
         const inner = s.syms.flags(nested).inner;
         try ctorRefCands(ctx, &level, nested, .{ .lead = if (inner) self_t else .none, .subst = if (inner) try innerSubst(ctx, nested, self_t) else &empty_subst });
     }
-    if (level.items.len == 0) {
-        var aliased: RefLevel = .empty;
-        try innerAliasRefCands(ctx, &aliased, self_t, .none, n);
-        for (aliased.items) |*c| {
-            c.dispatch = .none;
-            c.lead = self_t;
-        }
-        try level.appendSlice(s.arena, aliased.items);
-    }
+    // The outer instance an alias of an inner class takes is the first
+    // argument, not an implicit receiver.
+    if (level.items.len == 0) try innerAliasRefCands(ctx, &level, self_t, .{ .lead = self_t }, n);
     if (level.items.len != 0) try levels.append(s.arena, level);
     var ext: RefLevel = .empty;
     for (try extensionFunctions(ctx, n)) |x| {
@@ -4475,33 +4469,32 @@ fn innerSubst(ctx: *Ctx, inner: Sym, outer_t: TypeId) Allocator.Error!*const typ
     return sub;
 }
 
+/// Whether `alias` is a type alias of an inner class whose outer class a
+/// receiver of type `rt` has.
+fn innerAliasOn(s: *Sema, alias: Sym, rt: TypeId) Allocator.Error!bool {
+    if (alias == .none or s.syms.kind(alias) != .type_alias) return false;
+    const target = s.types.classSym(try headers.aliasTarget(s, alias));
+    if (target == .none or s.syms.kind(target) != .class or !s.syms.flags(target).inner) return false;
+    return (try subtyping.supertypeWithClass(s, rt, s.syms.owner(target))) != null;
+}
+
 /// The constructors of an inner class of `outer_t`'s class reached
-/// through a type alias in scope named `n`.
-fn innerAliasRefCands(ctx: *Ctx, level: *RefLevel, outer_t: TypeId, src: Receiver, n: Name) Allocator.Error!void {
+/// through a type alias in scope named `n`, the outer instance given by
+/// `via`: bound (`outer::A`, its dispatch) or unbound (`Outer<X>::A`, its
+/// lead). The alias is found by its name in scope, a nested alias of an
+/// enclosing class (`typealias A = Outer<X>.Inner` inside `Outer`) and
+/// then top-level ones, not among the receiver's members.
+fn innerAliasRefCands(ctx: *Ctx, level: *RefLevel, outer_t: TypeId, via: RefCand, n: Name) Allocator.Error!void {
     const s = ctx.s;
-    // An alias nested in the outer class (`typealias A = Outer<X>.Inner`
-    // inside `Outer`), then top-level ones.
-    const oc = s.types.classSym(outer_t);
-    if (oc != .none) {
-        const nested = try scope_mod.nestedClassifier(s, oc, n);
-        if (nested != .none and s.syms.kind(nested) == .type_alias) {
-            const target = s.types.classSym(try headers.aliasTarget(s, nested));
-            if (target != .none and s.syms.flags(target).inner) {
-                try ctorRefCands(ctx, level, target, .{ .dispatch = src, .subst = try innerSubst(ctx, target, outer_t), .alias = nested });
-                return;
-            }
-        }
-    }
-    for (try topLevelTiers(ctx, n)) |tier| {
-        for (tier) |m| {
-            if (s.syms.kind(m) != .type_alias) continue;
-            const target = s.types.classSym(try headers.aliasTarget(s, m));
-            if (target == .none or !s.syms.flags(target).inner) continue;
-            if (try subtyping.supertypeWithClass(s, outer_t, s.syms.owner(target)) == null) continue;
-            try ctorRefCands(ctx, level, target, .{ .dispatch = src, .subst = try innerSubst(ctx, target, outer_t), .alias = m });
-            return;
-        }
-    }
+    const found = try scope_mod.classifierInContext(s, body.typeCtx(ctx).decl, ctx.file, n);
+    const alias = if (try innerAliasOn(s, found, outer_t)) found else top: for (try topLevelTiers(ctx, n)) |tier| {
+        for (tier) |m| if (try innerAliasOn(s, m, outer_t)) break :top m;
+    } else return;
+    const target = s.types.classSym(try headers.aliasTarget(s, alias));
+    var c = via;
+    c.subst = try innerSubst(ctx, target, outer_t);
+    c.alias = alias;
+    try ctorRefCands(ctx, level, target, c);
 }
 
 /// Whether an extension's declared receiver accepts a value of type `rt`.

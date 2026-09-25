@@ -2368,12 +2368,15 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
         // guard fail. What it would cover is kept apart.
         const covers_before = covers.items.len;
         const prior_before = prior_false.items.len;
+        // The subject as the earlier branches' failing patterns see it:
+        // past `!is Float ->`, a `0.0F ->` compares a `Float`.
+        const cur_t = if (subject_sym != .none) try narrowedType(ctx, subject_sym, subject_t) else subject_t;
         for (br.patterns) |*pat| {
             switch (pat.kind) {
                 .Value => |*v| {
                     if (w.subject != null) {
                         const refs_before = ctx.refCount();
-                        _ = try expr(ctx, v, subject_t);
+                        _ = try expr(ctx, v, cur_t);
                         try covers.append(s.arena, switch (v.*) {
                             .NullLit => .null_,
                             .BoolLit => |b| .{ .bool_ = b.value },
@@ -2383,7 +2386,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                             },
                         });
                         // `null ->` is an identity test, not a call.
-                        if (v.* != .NullLit) try calls.equalsRef(ctx, v.span(), subject_t);
+                        if (v.* != .NullLit) try calls.equalsRef(ctx, v.span(), cur_t);
                         // `null -> ...` (alone or among other patterns):
                         // every later branch sees the subject not null.
                         if (v.* == .NullLit and subject_sym != .none) {
@@ -2406,11 +2409,15 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                     try typeTestRef(ctx, .is_, t, pat.span, .none);
                     try covers.append(s.arena, .{ .is_type = t });
                     if (br.patterns.len == 1) narrowed = t;
+                    // A later branch runs only when the subject is not a `t`.
+                    if (subject_sym != .none and !s.types.isErr(t)) try prior_false.append(s.arena, .{ .sym = subject_sym, .ty = cur_t, .excluded = .{ .type = t } });
                 },
                 .NotIsType => |*tr| {
                     const t = try resolveTypeInBody(ctx, tr);
                     try typeTestRef(ctx, .not_is, t, pat.span, .none);
                     try covers.append(s.arena, .{ .not_is = t });
+                    // A later branch runs only when the subject is a `t`.
+                    if (subject_sym != .none and !s.types.isErr(t)) try prior_false.append(s.arena, .{ .sym = subject_sym, .ty = try intersectNarrow(ctx, cur_t, t) });
                 },
                 .Else => if (br.guard == null) {
                     has_else = true;
@@ -2418,7 +2425,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
             }
         }
         if (narrowed != .none and subject_sym != .none) {
-            try ctx.scope.narrow.append(s.arena, .{ .sym = subject_sym, .ty = try intersectNarrow(ctx, subject_t, narrowed) });
+            try ctx.scope.narrow.append(s.arena, .{ .sym = subject_sym, .ty = try intersectNarrow(ctx, cur_t, narrowed) });
         }
         if (br.guard) |g| {
             covers.shrinkRetainingCapacity(covers_before);

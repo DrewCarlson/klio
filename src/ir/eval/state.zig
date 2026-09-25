@@ -8,22 +8,13 @@ const span = @import("span");
 const Allocator = std.mem.Allocator;
 
 const Value = runtime.Value;
-const ObjRef = runtime.ObjRef;
-const InstanceData = runtime.InstanceData;
 
-const BinOp = ir.BinOp;
-const Const = ir.Const;
 const Func = ir.Func;
 const Module = ir.Module;
-const UnOp = ir.UnOp;
 
-const exec_call = @import("../exec_call.zig");
-
-const callerThisValue = exec_call.callerThisValue;
 
 const parent = @import("../eval.zig");
 const ev_activation = @import("activation.zig");
-const ev_chain = @import("chain.zig");
 const ev_diag = @import("diag.zig");
 const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
@@ -32,9 +23,7 @@ const ev_snapshot = @import("snapshot.zig");
 
 const ACT_POOL_MAX = ev_activation.ACT_POOL_MAX;
 const Activation = ev_flow.Activation;
-const CHAIN_POOL_MAX = ev_chain.CHAIN_POOL_MAX;
 const FRAME_CENSUS_SLOTS = ev_diag.FRAME_CENSUS_SLOTS;
-const FUSED_BANK_DEPTH = ev_fused.FUSED_BANK_DEPTH;
 const FlatCallReq = ev_flow.FlatCallReq;
 const Frame = ev_frame.Frame;
 const FrameSnapshot = ev_snapshot.FrameSnapshot;
@@ -134,12 +123,6 @@ pub const EvalTls = struct {
     eval_depth: usize = 0,
     /// Resolved depth cap; `0` = not yet read from the env.
     eval_depth_cap: usize = 0,
-    /// The executing frame's chain: always a live Frame's `enclosing_this`,
-    /// repointed on entry and restored on exit, so it parks and resumes with it.
-    active_chain: ?*std.ArrayList(EnclosingEntry) = null,
-    /// Length of the seeded (frame-entry) prefix. Entries at or past it are the
-    /// dispatch's in-flight pushes, the only ones transferred into the next frame.
-    active_chain_base: usize = 0,
     /// The suspension a COMPILED body builds as it unwinds: compiled code cannot
     /// return an error union, so it answers `CoroutineSuspended` and leaves it here.
     in_flight_suspend: ?*SuspendState = null,
@@ -162,150 +145,34 @@ pub const EvalTls = struct {
     /// `KLIO_SPIN_TRACE` bookkeeping.
     spin_last_dump: i64 = 0,
     spin_check_counter: u64 = 0,
-    /// Current leaf-serve nesting level, indexing `leaf_bank`.
-    leaf_depth: usize = 0,
-    chain_pool: [CHAIN_POOL_MAX][]EnclosingEntry = undefined,
-    chain_pool_len: usize = 0,
 };
 
-/// One implicit receiver on the enclosing-`this` chain. A `receiver` carries
-/// its whole class-nesting tower, a `subject` only itself, an `access` one dispatch.
-pub const EnclosingEntry = runtime.ImplicitReceiver;
-
-/// Source span of the statement the innermost active frame is executing, set
-/// per statement by `.Trace`; compose keys its positional group on it.
-pub fn currentCallSiteSpan() ?ir.Span {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain) {
-        // The walker records each Trace span on its mark just as a frame tracks
-        // cur_span, null included: gates read the innermost site, never the caller's.
-        return fusedTls().marks[fusedTls().depth - 1].span;
-    }
-    return if (evtlsPtr().frame_chain) |fr| fr.cur_span else null;
+/// The evaluation depth cap of the thread whose state `ev` is. The first
+/// read on a thread takes `KLIO_MAX_EVAL_DEPTH`.
+pub inline fn evalDepthCap(ev: *EvalTls) usize {
+    if (ev.eval_depth_cap != 0) return ev.eval_depth_cap;
+    return evalDepthCapInit(ev);
 }
 
-/// Declaring package of the innermost executing frame. Null-receiver extension
-/// property dispatch keys on it, so same-name extensions resolve per visibility.
-pub fn currentFramePackage() ?[]const u8 {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain) {
-        const pkg = fusedTls().marks[fusedTls().depth - 1].func.package;
-        if (pkg.len != 0) return pkg;
-    }
-    const fr = evtlsPtr().frame_chain orelse return null;
-    const pkg = fr.func.package;
-    return if (pkg.len == 0) null else pkg;
-}
-
-/// Every executing frame's bound `this`, innermost first with adjacent
-/// duplicates suppressed: the tower the member-extension owner walk falls back to.
-pub const ThisChainIter = struct {
-    cur: ?*Frame,
-    steps: usize = 0,
-    prev: ?Value = null,
-    /// Active fused walkers' receivers, yielded before the frames: a fused body
-    /// binds its receiver in the walker's args, never in a frame.
-    fused_i: usize = 0,
-
-    pub fn next(self: *ThisChainIter) ?Value {
-        while (self.fused_i > 0) {
-            self.fused_i -= 1;
-            const v = fusedTls().marks[self.fused_i].recv orelse continue;
-            if (self.prev) |p| {
-                if (p == .Instance and v == .Instance and
-                    ObjRef(InstanceData).ptrEq(p.Instance, v.Instance)) continue;
-            }
-            self.prev = v;
-            return v;
-        }
-        while (self.cur) |f| {
-            self.cur = f.gc_link;
-            if (self.steps > 256) return null;
-            self.steps += 1;
-            const v = callerThisValue(f) orelse continue;
-            if (self.prev) |p| {
-                if (p == .Instance and v == .Instance and
-                    ObjRef(InstanceData).ptrEq(p.Instance, v.Instance)) continue;
-            }
-            self.prev = v;
-            return v;
-        }
-        return null;
-    }
-};
-
-pub fn frameThisChainIter() ThisChainIter {
-    return .{ .cur = evtlsPtr().frame_chain, .fused_i = fusedTls().depth };
-}
-
-pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
-    var out: std.ArrayList(Value) = .empty;
-    var cur = evtlsPtr().frame_chain;
-    var steps: usize = 0;
-    while (cur) |f| : (cur = f.gc_link) {
-        if (steps > 256) break;
-        steps += 1;
-        if (callerThisValue(f)) |v| {
-            const dup = out.items.len > 0 and out.items[out.items.len - 1] == .Instance and
-                v == .Instance and ObjRef(InstanceData).ptrEq(out.items[out.items.len - 1].Instance, v.Instance);
-            if (!dup) try out.append(allocator, v);
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-/// Nearest enclosing frame's package, walking past accessors and init thunks.
-pub fn nearestFramePackage() ?[]const u8 {
-    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtlsPtr().frame_chain) {
-        const pkg = fusedTls().marks[fusedTls().depth - 1].func.package;
-        if (pkg.len != 0) return pkg;
-    }
-    var cur = evtlsPtr().frame_chain;
-    while (cur) |f| : (cur = f.gc_link) {
-        if (f.func.package.len != 0) return f.func.package;
-    }
-    return null;
+fn evalDepthCapInit(ev: *EvalTls) usize {
+    // `procEnvGetVar` reads the whole environment block into the scratch allocator, so a fixed buffer would fail.
+    const a = std.heap.page_allocator;
+    const cap = blk: {
+        const raw = runtime.procEnvGetVar(a, "KLIO_MAX_EVAL_DEPTH") catch break :blk DEFAULT_MAX_EVAL_DEPTH;
+        const v = raw orelse break :blk DEFAULT_MAX_EVAL_DEPTH;
+        defer a.free(v);
+        const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        const parsed = std.fmt.parseInt(usize, trimmed, 10) catch break :blk DEFAULT_MAX_EVAL_DEPTH;
+        if (parsed == 0) break :blk DEFAULT_MAX_EVAL_DEPTH;
+        break :blk parsed;
+    };
+    ev.eval_depth_cap = cap;
+    return cap;
 }
 
 /// A callable reference resolves file-private visibility at its WRITE site, not
 /// the caller's. Scoped to the frame innermost at push, so deeper bodies opt out.
 pub const RefSiteOverride = struct { file: ir.FileId, frame: *const Frame };
-
-/// The reference-site file, while the frame it was pushed under is innermost.
-pub fn refSiteFile() ?ir.FileId {
-    const o = evtlsPtr().ref_site_override orelse return null;
-    const fr = evtlsPtr().frame_chain orelse return null;
-    return if (fr == o.frame) o.file else null;
-}
-
-/// Install a reference-site override on the innermost frame, returning the
-/// previous one for `popRefSiteFile` to restore when the dispatch completes.
-pub fn pushRefSiteFile(file: ir.FileId) ?RefSiteOverride {
-    const prev = evtlsPtr().ref_site_override;
-    if (evtlsPtr().frame_chain) |fr| evtlsPtr().ref_site_override = .{ .file = file, .frame = fr };
-    return prev;
-}
-
-pub fn popRefSiteFile(prev: ?RefSiteOverride) void {
-    evtlsPtr().ref_site_override = prev;
-}
-
-pub fn currentFuncName() ?[]const u8 {
-    return if (evtlsPtr().frame_chain) |fr| fr.func.name else null;
-}
-
-/// The innermost frame's i-th bound parameter, borrowed. Reified type-variable
-/// reads resolve through it: a type param naming a value param binds that class.
-pub fn currentFrameParam(i: usize) ?Value {
-    const fr = evtlsPtr().frame_chain orelse return null;
-    if (i >= fr.params.items.len) return null;
-    return fr.params.items[i];
-}
-
-/// The module the innermost frame's body is read against: a side module for an
-/// anonymous-object or local-class member, else the main module.
-pub fn currentFrameModule() ?*const Module {
-    const fr = evtlsPtr().frame_chain orelse return null;
-    return fr.module;
-}
 
 /// The innermost EXECUTING function: the fused walker's body while no frame
 /// sits above the chain head it recorded, else the innermost frame's.
@@ -522,10 +389,6 @@ pub const ResumeFrames = struct {
 const FrameAnchor = struct {
     chain: *const ?*Frame,
     resuming: *const ?*ResumeFrames,
-    /// The fused walker's chain windows: an entry can be an object's only
-    /// reference once its register is overwritten, so mark it like `enclosing_this`.
-    fused_chains: *const [FUSED_BANK_DEPTH]std.ArrayList(EnclosingEntry),
-    fused_depth: *const usize,
     /// Owning thread, for `KLIO_GC_FRAME_AUDIT`: a collector marking another
     /// thread's chain must find it parked, so a torn frame names an unparked mutator.
     tid: runtime.gc.Tid = 0,
@@ -615,12 +478,8 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         gcMarkFrameRegs(f, m);
         for (f.params.items) |v| v.gcMark(m);
         for (f.captures.items) |v| v.gcMark(m);
-        for (f.enclosing_this.items) |e| e.v.gcMark(m);
         f.pending_finally.gcMark(m);
         markFrameClosure(f.closure_id, m);
-    }
-    for (anchor.fused_chains[0..@min(anchor.fused_depth.*, FUSED_BANK_DEPTH)]) |*w| {
-        for (w.items) |e| e.v.gcMark(m);
     }
     // Not-yet-rebuilt snapshots of every in-flight resume on this thread.
     var r = anchor.resuming.*;
@@ -653,7 +512,7 @@ pub inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &evtlsPtr().frame_chain, .resuming = &evtlsPtr().resuming, .fused_chains = &fusedTls().chain, .fused_depth = &fusedTls().depth, .tid = runtime.gc.currentTid() };
+    frame_anchor = .{ .chain = &evtlsPtr().frame_chain, .resuming = &evtlsPtr().resuming, .tid = runtime.gc.currentTid() };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -743,20 +602,3 @@ fn firstSpan(func: *const ir.Func) ?ir.Span {
     return null;
 }
 
-/// Print the active frame chain to stderr; env-gated call sites only.
-pub fn debugPrintFrames() void {
-    var cur = evtlsPtr().frame_chain;
-    while (cur) |f| : (cur = f.gc_link) {
-        var path: []const u8 = "?";
-        var line: u32 = 0;
-        if (f.cur_span) |sp| {
-            if (span.active_map) |m| {
-                if (m.getChecked(sp.file)) |sf| {
-                    path = sf.path;
-                    line = sf.lineCol(sp.start).line;
-                }
-            }
-        }
-        std.debug.print("  at {s} ({s}:{d}) span={any}\n", .{ if (f.func.fqn.len != 0) f.func.fqn else f.func.name, path, line, f.cur_span });
-    }
-}

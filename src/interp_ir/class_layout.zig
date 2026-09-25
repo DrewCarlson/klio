@@ -63,24 +63,11 @@ pub const NoLayout = enum {
     interface,
     /// Built by `build_object.zig` in a different order entirely.
     anonymous,
-    /// Registered at execution from a declaration inside a function body, so
-    /// its layout cannot be baked.
-    local_runtime,
     /// A supertype that does not resolve, so the base layout is unknown.
     unresolved_super,
     /// The chain is deeper than the walk allows, which means a cycle.
     chain_too_deep,
 };
-
-/// The no-layout reason a published state names, or null when it names one.
-pub fn noLayoutOf(state: ir.FieldLayoutState) ?NoLayout {
-    return switch (state) {
-        .interface => .interface,
-        .anonymous => .anonymous,
-        .local_runtime => .local_runtime,
-        .ok, .unpublished, .unavailable => null,
-    };
-}
 
 /// The value a published seed kind stands for.
 pub fn seedValue(kind: ir.SlotSeed) Value {
@@ -94,23 +81,6 @@ pub fn seedValue(kind: ir.SlotSeed) Value {
         .double => .{ .Double = 0.0 },
         .boolean => .{ .Bool = false },
         .char => .{ .Char = 0 },
-    };
-}
-
-/// The seed kind that stands for `v`, or null for a value the table cannot
-/// describe — which refuses to publish that class rather than publish it wrong.
-pub fn seedKind(v: Value) ?ir.SlotSeed {
-    return switch (v) {
-        .Null => .null_ref,
-        .Int => |x| if (x == 0) .int else null,
-        .Long => |x| if (x == 0) .long else null,
-        .Short => |x| if (x == 0) .short else null,
-        .Byte => |x| if (x == 0) .byte else null,
-        .Float => |x| if (x == 0.0) .float else null,
-        .Double => |x| if (x == 0.0) .double else null,
-        .Bool => |x| if (!x) .boolean else null,
-        .Char => |x| if (x == 0) .char else null,
-        else => null,
     };
 }
 
@@ -377,8 +347,6 @@ fn computeLayout(ctx: *const Ctx, def_ref: ObjRef(ClassDef)) Allocator.Error!Res
             .interface
         else if (d.is_anonymous)
             .anonymous
-        else if (d.is_local_runtime)
-            .local_runtime
         else
             null;
         const next = if (d.parent) |p| p.clone() else null;
@@ -605,17 +573,6 @@ pub fn audit(ctx_in: *const Ctx, inst: ObjRef(InstanceData)) void {
             }
         },
     }
-}
-
-pub fn auditDump() void {
-    if (!auditOn()) return;
-    std.debug.print("[layout-audit] classes_agreed={d} classes_divergent={d} published_agreed={d} published_divergent={d} published_absent={d}\n", .{
-        audit_agreed.load(.monotonic),
-        audit_divergent.load(.monotonic),
-        pub_agreed.load(.monotonic),
-        pub_divergent.load(.monotonic),
-        pub_absent.load(.monotonic),
-    });
 }
 
 const testing = std.testing;

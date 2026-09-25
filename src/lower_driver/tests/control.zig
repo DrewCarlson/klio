@@ -724,6 +724,26 @@ test "a when guard runs once its pattern matches, and a failed guard falls throu
     , "eval a>0\nA+1\neval a>0\nA-1\nB empty\neval else guard\nlong B\neval else guard\nother\nC\nstr:abc\nelse\nbig\nelse\nnull\n10\n");
 }
 
+test "a when pattern compares the subject as the earlier failed type tests narrow it" {
+    try expectRun(
+        \\fun testF(x: Any) = when (x) {
+        \\    !is Float -> "!Float"
+        \\    0.0F -> "0.0"
+        \\    else -> "other"
+        \\}
+        \\fun testD(x: Any) = when (x) {
+        \\    !is Double -> "!Double"
+        \\    0.0 -> "0.0"
+        \\    else -> "other"
+        \\}
+        \\fun main() {
+        \\    println(testF(-0.0F))
+        \\    println(testD(-0.0))
+        \\    println(testF("x"))
+        \\}
+    , "0.0\n0.0\n!Float\n");
+}
+
 test "when with a subject tests values, ranges and types, null narrowing later branches" {
     try expectRun(
         \\sealed class Shape

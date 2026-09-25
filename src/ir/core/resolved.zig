@@ -9,8 +9,6 @@ const root_ir = @import("../ir.zig");
 const ids = @import("ids.zig");
 const class_mod = @import("class.zig");
 const func_mod = @import("func.zig");
-const snapshot_fast = @import("../snapshot_fast.zig");
-const compose_fast = @import("../compose_fast.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -66,6 +64,8 @@ pub const Resolved = struct {
     well_known: WellKnownSlots = .initFill(null),
     /// The objects natives need a reference to.
     well_known_objects: WellKnownObjects = .initFill(null),
+    /// The classes natives build instances of.
+    well_known_classes: WellKnownClasses = .initFill(null),
     /// The top-level properties host fast paths read.
     well_known_statics: WellKnownStatics = .initFill(null),
     host_class: HostClasses = .{},
@@ -179,6 +179,11 @@ pub const HostClasses = struct {
     map_entry: ?ClassId = null,
     entry_key_slot: ?MethodSlotId = null,
     entry_value_slot: ?MethodSlotId = null,
+    /// `kotlin.collections.List`, `Set` and `Map`: a host collection compares
+    /// with an instance implementing the same one element by element.
+    list: ?ClassId = null,
+    set: ?ClassId = null,
+    map: ?ClassId = null,
     /// By value tag, the class a host value of that kind is an instance of
     /// (a list is an `ArrayList`, a string builder a `StringBuilder`), for
     /// its type tests; the host serves its members.
@@ -364,6 +369,10 @@ pub const WellKnownSlots = std.enums.EnumArray(runtime.WellKnown, ?MethodSlotId)
 /// By `runtime.WellKnownObject`: the object's class, null where no source
 /// declares it.
 pub const WellKnownObjects = std.enums.EnumArray(runtime.WellKnownObject, ?ClassId);
+
+/// By `runtime.WellKnownClass`: the class and its primary constructor,
+/// null where no source declares it.
+pub const WellKnownClasses = std.enums.EnumArray(runtime.WellKnownClass, ?ClassCtor);
 
 /// By `runtime.WellKnownStatic`: the property's static, null where no
 /// source declares it.
@@ -586,22 +595,6 @@ pub fn isContinuationForm(r: *const Resolved, sub: ClassId, sup: ClassId) bool {
     return false;
 }
 
-/// Keeps the leaf and fused tiers and the name-classified
-/// host serves off a body lowered from sema, so the frame interpreter runs it.
-pub fn declineTiers(f: *func_mod.Func) void {
-    f.leaf_hopeless = 1;
-    f.leaf_state = 1;
-    // The fused tier runs the static calls lowered from sema and classifies
-    // the body on its first call.
-    f.fuse_state = 0;
-    f.host_route = @intFromEnum(snapshot_fast.Route.none);
-    f.compose_route = @intFromEnum(compose_fast.Route.none);
-    f.throw_route = 1;
-    // Computed, and no argument coercion applies: the arguments arrive as
-    // sema typed them.
-    f.coerce_plan = 1;
-}
-
 /// A fresh run's state: every static holds its seed, every unit is idle and
 /// no singleton exists.
 pub fn stateInit(a: Allocator, r: *const Resolved) Allocator.Error!ResolvedState {
@@ -709,14 +702,3 @@ test "a primitive value's class comes from the host table" {
     try std.testing.expectEqual(ClassId.from(9), classOf(&r, &longs).?);
 }
 
-test "declined tiers stay declined and no name classifies the body" {
-    var f: func_mod.Func = .{ .id = FuncId.from(0), .name = "f", .fqn = "f", .params = &.{}, .return_ty = .{ .name = "", .nullable = true, .args = &.{} }, .blocks = &.{}, .entry = ids.BlockId.from(0), .n_locals = 0, .is_suspend = false };
-    declineTiers(&f);
-    try std.testing.expectEqual(@as(u8, 1), f.leaf_hopeless);
-    // The fused tier classifies the body on its first call.
-    try std.testing.expectEqual(@as(u8, 0), f.fuse_state);
-    try std.testing.expectEqual(@intFromEnum(snapshot_fast.Route.none), f.host_route);
-    try std.testing.expectEqual(@intFromEnum(compose_fast.Route.none), f.compose_route);
-    try std.testing.expectEqual(@as(u8, 1), f.throw_route);
-    try std.testing.expect(!f.leafExprBody());
-}

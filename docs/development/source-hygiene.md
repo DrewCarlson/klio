@@ -45,19 +45,16 @@ labeled `switch` with `continue :label` for interpreter dispatch loops,
 
 ## Splits landed
 
-Eleven files over 5000 lines were split along real seams. Each parent keeps
-its public surface and re-exports it, so no call site outside the file
-changed.
+Files over 5000 lines were split along real seams. Each parent keeps its
+public surface and re-exports it, so no call site outside the file changed.
+The ones still in the tree:
 
 | was | lines | now | files | largest child |
 |---|---|---|---|---|
 | `ir/ir.zig` | 17236 | `ir/core/` | 18 | 2365 |
-| `interp_ir/vm/host_call_member.zig` | 16968 | `.../host_call_member/` | 16 | 2112 |
 | `ir/eval.zig` | 13546 | `ir/eval/` | 17 | 1706 |
 | `stdlib/implementations/collections.zig` | 8222 | `.../collections/` | 13 | 1118 |
 | `cli/cgen.zig` | 8016 | `cli/cgen/` | 8 | 1848 |
-| `interp_ir/vm/host_instances.zig` | 6150 | `.../host_instances/` | 8 | 1399 |
-| `interp_ir/vm/host_fields.zig` | 5826 | `.../host_fields/` | 10 | 1572 |
 
 ### What a split has to get right
 

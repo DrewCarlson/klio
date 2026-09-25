@@ -4,13 +4,18 @@
     scripts/sema-oracle-triage.py [-n N] [--json] oracle.tsv sema.tsv [sema.unresolved.tsv]
 
 Pairs the two dumps the way scripts/sema-oracle-diff.py does, then assigns every
-difference to a cause by rule, under one of three owners:
+difference to a cause by rule, under one of five owners:
 
-    sema     the analysis resolved differently (or not at all)
-    dump     representation: the two sides agree on the declaration but print it
-             differently; tools/sema-oracle/README.md ("The sema side") lists the
-             ones the dump already corrects
-    oracle   kotlinc answered for the JVM, not the common stdlib KLIO implements
+    normalized  a representation rule of the diff tool accounts for it
+    jvm         a Kotlin-vs-JVM naming rule of the diff tool accounts for it
+    sema        the analysis resolved differently (or not at all)
+    dump        representation: the two sides agree on the declaration but print it
+                differently; tools/sema-oracle/README.md ("The sema side") lists the
+                ones the dump already corrects
+    oracle      kotlinc answered for the JVM, not the common stdlib KLIO implements
+
+The first two are the diff tool's rules (--raw there, and here, turns them off);
+the other three are this script's guesses at the causes of what is left.
 
 A target difference no narrower rule matches is `different declaration`. The
 optional third input is `klio sema --unresolved` output; with it, a site kotlinc
@@ -184,6 +189,7 @@ def main():
     ap.add_argument("-n", "--examples", type=int, default=3, help="examples per cause (default 3)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--root", default=".", help="directory the dump paths are relative to")
+    ap.add_argument("--raw", action="store_true", help="apply none of the diff tool's normalization rules")
     args = ap.parse_args()
 
     oracle = diff.load(args.oracle)
@@ -193,6 +199,7 @@ def main():
     loc = diff.Locator(args.root)
     oracle_paths = {k[0] for k in oracle}
     sema = {k: v for k, v in sema.items() if k[0] in oracle_paths}
+    norm = diff.Normalizer(args.root, oracle, off=args.raw)
 
     causes = collections.defaultdict(list)  # (owner, cause) -> [example]
     matched = 0
@@ -200,6 +207,10 @@ def main():
 
     def note(owner, cause, key, o=None, s=None):
         causes[(owner, cause)].append({"where": loc.where(key[0], key[1]), "kind": key[3], "oracle": o, "sema": s})
+
+    def note_rule(r, key, o=None, s=None):
+        name, cls = diff.RULES[r]
+        note(cls, name, key, o, s)
 
     for key in sorted(set(oracle) | set(sema)):
         ovals = list(oracle.get(key, []))
@@ -215,11 +226,39 @@ def main():
         exact, targets, receivers, o_left, s_left = diff.pair_up(ovals, svals, False)
         matched += exact
         for o, s in targets:
-            note(*classify_target(o, s), key, o, s)
+            r = norm.pair(key, o, s)
+            if r:
+                note_rule(r, key, o, s)
+            else:
+                note(*classify_target(o, s), key, o, s)
         for o, s in receivers:
-            note(*classify_receivers(o, s, key, src), key, o, s)
+            r = norm.pair(key, o, s)
+            if r:
+                note_rule(r, key, o, s)
+            else:
+                note(*classify_receivers(o, s, key, src), key, o, s)
         only_o += [(key, o) for o in o_left]
         only_s += [(key, s) for s in s_left]
+
+    moved, only_o, only_s = norm.pair_leftovers(only_o, only_s)
+    for r, okey, o, (skey, s) in moved:
+        note_rule(r, okey, o, (f"{skey[1]}-{skey[2]}",) + tuple(s))
+    rest = []
+    for key, o in only_o:
+        r = norm.oracle_only(key, o)
+        if r:
+            note_rule(r, key, o, None)
+        else:
+            rest.append((key, o))
+    only_o = rest
+    rest = []
+    for key, s in only_s:
+        r = norm.sema_only(key, s)
+        if r:
+            note_rule(r, key, None, s)
+        else:
+            rest.append((key, s))
+    only_s = rest
 
     # Pair leftovers that differ only in anchor or kind.
     by_path = collections.defaultdict(list)
@@ -294,9 +333,14 @@ def main():
         print()
         return 0
 
+    ruled = {k: total.pop(k, 0) for k in ("normalized", "jvm")}
     differ = sum(total.values())
-    print(f"{matched} sites match, {differ} differ: " + ", ".join(f"{k} {v}" for k, v in total.most_common()))
-    for owner in ("sema", "dump", "oracle"):
+    print(
+        f"{matched} sites match, {ruled['normalized']} normalized, {ruled['jvm']} Kotlin-vs-JVM naming, "
+        f"{differ} differ" + "".join(f", {k} {v}" for k, v in total.most_common())
+    )
+    total.update(ruled)
+    for owner in ("sema", "dump", "oracle", "normalized", "jvm"):
         rows = [(cause, items) for (ow, cause), items in causes.items() if ow == owner]
         if not rows:
             continue

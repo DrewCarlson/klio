@@ -509,7 +509,7 @@ pub const NO_FUNC: u32 = std.math.maxInt(u32);
 Unchanged: `FuncId`, `ClassId`, `MethodSlotId` (ids.zig:79, 127, 114). A
 method slot is the root declaration's `FuncId` (`MethodSlotId.fromFunc`,
 ids.zig:119), and `Module.method_dispatch` (ir.zig:450, key
-`(class << 32) | slot`, `methodSlotTarget` at module_methods.zig:29) maps a
+`(class << 32) | slot`, `methodSlotTarget` in module_props.zig) maps a
 class and slot to the implementation. A field slot is a `u32` index into an
 instance's `fields`.
 

@@ -957,7 +957,8 @@ export fn klio_r_hash_code(vcv: CValue) i32 {
     const v = fromC(vcv);
     if (v == .Null) return 0;
     if (slotCall(&v, tables.host_class.hash_code_slot, &.{v})) |res| return if (res == .Int) res.Int else 0;
-    const r = theHost().callMember(alloc(), &v, "hashCode", &.{}) catch @panic("klio_r_hash_code: out of memory");
+    const any_hash = interp_ir.hostMemberFn("kotlin.Any.hashCode") orelse fatal("the host has no `Any.hashCode`");
+    const r = any_hash(theHost(), alloc(), &.{v}) catch @panic("klio_r_hash_code: out of memory");
     const h = fromC(land(r, "hashCode"));
     return if (h == .Int) h.Int else 0;
 }
@@ -1019,7 +1020,7 @@ export fn klio_r_array_get(acv: CValue, index: i32) CValue {
         else => fatal("an element read of a value that is not an array"),
     }
     const idx: Value = .{ .Int = index };
-    const v = ir.exec_call.fastIndexGet(&arr, &idx) orelse raiseIndex(&arr, index);
+    const v = ir.eval.fastIndexGet(&arr, &idx) orelse raiseIndex(&arr, index);
     return toC(v);
 }
 
@@ -1031,7 +1032,7 @@ export fn klio_r_array_set(acv: CValue, index: i32, vcv: CValue) void {
         else => fatal("an element write of a value that is not an array"),
     }
     const idx: Value = .{ .Int = index };
-    _ = ir.exec_call.fastIndexSet(alloc(), &arr, &idx, fromC(vcv)) orelse raiseIndex(&arr, index);
+    _ = ir.eval.fastIndexSet(alloc(), &arr, &idx, fromC(vcv)) orelse raiseIndex(&arr, index);
 }
 
 /// An array of class `cls` (`Array` or a primitive array) over `argv`.

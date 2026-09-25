@@ -378,10 +378,9 @@ fn copyBlock(b: *Builder, inst: *const Instance, k: u32, tg: Target) Error!void 
         if (h.catches.len != 0) {
             const cs = try a.alloc(ir.CatchHandler, h.catches.len);
             for (h.catches, cs) |c, *o| o.* = .{
-                .type_name = c.type_name,
+                .class = c.class,
                 .handler = tg.block(c.handler),
                 .exception_reg = mapReg(inst, c.exception_reg),
-                .class_raw = c.class_raw,
             };
             fh.catches = cs;
         }

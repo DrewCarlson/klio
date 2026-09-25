@@ -1,6 +1,6 @@
 //! The per-evaluation `VmHost` the IR evaluator dispatches non-trivial operations
 //! through, plus the `VmIntrinsicHost` adapter the stdlib reaches back through to
-//! invoke lambdas. `ir.eval` is generic over its host type, so `host.callValue(...)`
+//! invoke lambdas. `ir.eval` is generic over its host type, so `host.callNative(...)`
 //! resolves as a direct comptime call with no vtable indirection: the per-operation
 //! methods are free functions over `*VmHost` in the sibling `host_*.zig` files,
 //! aliased here as decls. `VmIntrinsicHost` keeps the `{ctx, vtable}` pair instead.
@@ -9,8 +9,6 @@ const std = @import("std");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
-const ast = @import("ast");
-const span = @import("span");
 const stdlib = @import("stdlib");
 
 const root = @import("../interp_ir.zig");
@@ -18,8 +16,6 @@ const root = @import("../interp_ir.zig");
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
-const Env = runtime.Env;
-const ClassDef = runtime.ClassDef;
 const Output = runtime.Output;
 const SharedOutput = root.SharedOutput;
 const RuntimeError = runtime.RuntimeError;
@@ -29,33 +25,17 @@ const InstanceData = runtime.InstanceData;
 
 const Module = ir.Module;
 const FuncId = ir.FuncId;
-const ClassId = ir.ClassId;
-const TypeRef = ir.TypeRef;
 const EvalResult = ir.eval.EvalResult;
 /// The stdlib callbacks carry `runtime.EvalResult`, not the evaluator's.
 const RuntimeEvalResult = runtime.EvalResult;
-const EvalError = ir.eval.EvalError;
-const UnitResult = ir.eval.UnitResult;
-const MaybeValueResult = ir.eval.MaybeValueResult;
-const ReceiverShape = ir.eval.ReceiverShape;
 
-const ProgramImage = root.ProgramImage;
-const AnonMethods = root.AnonMethods;
-const ClassTable = root.ClassTable;
-const OuterTable = root.OuterTable;
 const SharedClosures = root.SharedClosures;
 const ThreadTable = root.ThreadTable;
-const ObjectStates = root.ObjectStates;
 
 pub const host_call_func = @import("host_call_func.zig");
-pub const host_call_member = @import("host_call_member.zig");
 pub const host_call_value = @import("host_call_value.zig");
-pub const host_classes = @import("host_classes.zig");
-pub const host_context = @import("host_context.zig");
-pub const host_fields = @import("host_fields.zig");
 const builtin_members = @import("builtin_members.zig");
-pub const host_globals = @import("host_globals.zig");
-pub const host_instances = @import("host_instances.zig");
+const host_util = @import("host_util.zig");
 pub const host_impl = @import("host_impl.zig");
 pub const host_resolved = @import("host_resolved.zig");
 pub const intrinsic_host = @import("intrinsic_host.zig");
@@ -129,10 +109,6 @@ fn pathSimpleName(fqn: []const u8) []const u8 {
 
 /// Assert (Debug) the receiver/coroutine thread-locals are empty at a run boundary.
 pub fn resetReceiverThreadLocals() void {
-    host_instances.resetReceiverTls();
-    host_call_member.resetReceiverTls();
-    host_fields.resetReceiverTls();
-    host_impl.resetReceiverTls();
     coroutines.resetReceiverTls();
     compose.resetAtRunBoundary();
 }
@@ -140,12 +116,11 @@ pub fn resetReceiverThreadLocals() void {
 /// Drop the process-global caches that belong to the finished run. PROGRAM boundary
 /// only, never a Vm deinit.
 pub fn resetRunGlobalCaches() void {
-    host_call_member.resetStaticApplicabilityCache();
     // Invalidate every pointer-keyed dispatch cache in one stroke: entries carry a
     // generation stamp, so stale ones never hit, including on parked pool workers a
     // per-thread clear cannot reach, and a reused cell address cannot replay a
     // resolution into freed IR.
-    host_call_member.bumpDispatchCacheGen();
+    host_util.bumpDispatchCacheGen();
     // The bytecode stream cache keys on blocks-pointer identity, so a reused address
     // must not replay it.
     ir.bc.resetCacheForTest();
@@ -158,18 +133,11 @@ pub fn resetRunGlobalCaches() void {
 /// value copies that bump no refcount, so a `SharedHandles` owns nothing and must never
 /// be `deinit`'d; the owner keeps every cell alive for the view's lifetime.
 pub const SharedHandles = struct {
-    globals: ObjRef(Env),
     module: ObjRef(Module),
     instance_id_counter: ObjRef(std.atomic.Value(u64)),
-    classes: ObjRef(ClassTable),
-    prog: ObjRef(ProgramImage),
-    anon_methods: AnonMethods,
-    class_default_outer: ObjRef(OuterTable),
     closures: SharedClosures,
     out_sink: SharedOutput,
     threads: ThreadTable,
-    object_states: ObjectStates,
-    singletons_by_id: root.SingletonsById,
     /// The run state of code lowered from sema, null for a module lowered
     /// the other way.
     resolved_state: ?ir.resolved.StateRef,
@@ -177,18 +145,11 @@ pub const SharedHandles = struct {
 
     pub fn fromHost(host: *const VmHost) SharedHandles {
         return .{
-            .globals = host.globals,
             .module = host.module,
             .instance_id_counter = host.instance_id_counter,
-            .classes = host.classes,
-            .prog = host.prog,
-            .anon_methods = host.anon_methods,
-            .class_default_outer = host.class_default_outer,
             .closures = host.closures,
             .out_sink = host.out_sink,
             .threads = host.threads,
-            .object_states = host.object_states,
-            .singletons_by_id = host.singletons_by_id,
             .resolved_state = host.resolved_state,
             .allocator = host.allocator,
         };
@@ -196,18 +157,11 @@ pub const SharedHandles = struct {
 
     pub fn fromIntrinsic(host: *const VmIntrinsicHost) SharedHandles {
         return .{
-            .globals = host.globals,
             .module = host.module,
             .instance_id_counter = host.instance_id_counter,
-            .classes = host.classes,
-            .prog = host.prog,
-            .anon_methods = host.anon_methods,
-            .class_default_outer = host.class_default_outer,
             .closures = host.closures,
             .out_sink = host.out_sink,
             .threads = host.threads,
-            .object_states = host.object_states,
-            .singletons_by_id = host.singletons_by_id,
             .resolved_state = host.resolved_state,
             .allocator = host.allocator,
         };
@@ -216,49 +170,31 @@ pub const SharedHandles = struct {
 
 /// The shared state the sibling free functions read and write for one evaluation.
 pub const VmHost = struct {
-    globals: ObjRef(Env),
     module: ObjRef(Module),
     out: Output,
     instance_id_counter: ObjRef(std.atomic.Value(u64)),
-    classes: ObjRef(ClassTable),
-    prog: ObjRef(ProgramImage),
-    anon_methods: AnonMethods,
-    class_default_outer: ObjRef(OuterTable),
     closures: SharedClosures,
     out_sink: SharedOutput,
     threads: ThreadTable,
-    object_states: ObjectStates,
-    singletons_by_id: root.SingletonsById,
     /// The run state of code lowered from sema, null for a module lowered
     /// the other way.
     resolved_state: ?ir.resolved.StateRef,
     allocator: Allocator,
-    /// This thread's field caches: a view is stack-local to its building thread.
-    tls: *host_fields.FieldsTls,
     /// This thread's keepalive handle; every member call pins across a host re-entry.
     ka: runtime.KeepaliveHandle,
 
     /// Transient `VmHost` BORROWING another host's handles by value, with no refcount
     /// bump: it never outlives the owner and must not `deinit` a borrowed handle.
-    /// `globals` and `out` are explicit: a delegated closure body layers its own env.
-    pub fn borrowed(state: SharedHandles, globals: ObjRef(Env), out: Output) VmHost {
+    pub fn borrowed(state: SharedHandles, out: Output) VmHost {
         return .{
-            .globals = globals,
             .module = state.module,
             .out = out,
             .instance_id_counter = state.instance_id_counter,
-            .classes = state.classes,
-            .prog = state.prog,
-            .anon_methods = state.anon_methods,
-            .class_default_outer = state.class_default_outer,
             .closures = state.closures,
             .out_sink = state.out_sink,
             .threads = state.threads,
-            .object_states = state.object_states,
-            .singletons_by_id = state.singletons_by_id,
             .resolved_state = state.resolved_state,
             .allocator = state.allocator,
-            .tls = host_fields.currentTls(),
             .ka = runtime.keepaliveHandle(),
         };
     }
@@ -269,154 +205,23 @@ pub const VmHost = struct {
     pub const tryNative = host_resolved.tryNative;
     pub const callWellKnown = host_resolved.callWellKnown;
     pub const wellKnownObject = host_resolved.wellKnownObject;
+    pub const constructWellKnown = host_resolved.constructWellKnown;
     pub const wellKnownStatic = host_resolved.wellKnownStatic;
     pub const caughtValue = host_resolved.caughtValue;
     pub const runResolved = host_resolved.runResolved;
     pub const makeResolvedClosure = host_resolved.makeResolvedClosure;
     pub const resolvedClosure = host_resolved.resolvedClosure;
     pub const resumeValue = host_resolved.resumeValue;
-    pub const callValue = host_call_value.callValue;
-    pub const callableDeclaredArity = host_call_func.callableDeclaredArity;
-    pub const prepareClosureFlatCall = host_call_value.prepareClosureFlatCall;
-    pub const callClosureFast = host_call_value.callClosureFast;
-    pub const prepareClosureWithThisFlatCall = host_call_value.prepareClosureWithThisFlatCall;
-    pub const prepareValueRecvCtxFlatCall = host_call_value.prepareValueRecvCtxFlatCall;
-    pub const prepareUndispatchedStartFlatCall = host_call_value.prepareUndispatchedStartFlatCall;
     pub const undispatchedBarrierPark = host_call_value.undispatchedBarrierPark;
     pub const undispatchedScopeLeave = host_call_value.undispatchedScopeLeave;
     pub const rootPumpBarrierPark = host_call_value.rootPumpBarrierPark;
     pub const rootPumpFlatComplete = host_call_value.rootPumpFlatComplete;
-    pub const prepareTypedFlatCall = host_call_func.prepareTypedFlatCall;
-    pub const typedBindingsRestore = host_call_func.typedBindingsRestore;
-    pub const typedCallBoundary = host_call_func.typedCallBoundary;
     pub const flatCallClosed = host_call_value.flatCallClosed;
-    pub const callValueNamed = host_call_value.callValueNamed;
-    pub const callValueNamedRecvCtx = host_call_value.callValueNamedRecvCtx;
-    pub const closureParamsDisproven = host_call_value.closureParamsDisproven;
-    pub const callValueNamedTyped = host_call_value.callValueNamedTyped;
-    pub const collectionsEqualHostAware = host_call_member.collectionsEqualHostAware;
-    pub const deepValueEquals = host_call_member.deepValueEquals;
-    pub const callValueWithThis = host_call_value.callValueWithThis;
-    pub const callValueWithThisHead = host_call_value.callValueWithThisHead;
-    pub const callValueWithThisExact = host_call_value.callValueWithThisExact;
-    pub const callableFieldArity = host_call_member.callableFieldArity;
-    pub const valueCouldServeName = host_call_member.valueCouldServeName;
-    pub const debugClassNameOf = host_call_member.debugClassNameOf;
-    pub const bindTypeParamGlobal = host_globals.bindTypeParamGlobal;
-    pub const bindTypeParamSpelling = host_globals.bindTypeParamSpelling;
-    pub const restoreGlobalBinding = host_globals.restoreGlobalBinding;
-    pub const callMember = host_call_member.callMember;
-    pub const prepareMemberFlatCall = host_call_member.prepareMemberFlatCall;
-    pub const prepareMemberFlatCallNamed = host_call_member.prepareMemberFlatCallNamed;
-    pub const callMemberNamed = host_call_member.callMemberNamed;
-    pub const callMemberNamedStatic = host_call_member.callMemberNamedStatic;
-    pub const callMemberNamedDeclared = host_call_member.callMemberNamedDeclared;
-    pub const invokeResolvedMember = host_call_member.invokeResolvedMember;
-    pub const invokeVirtualMember = host_call_member.invokeVirtualMember;
-    pub const prepareVirtualFlatCall = host_call_member.prepareVirtualFlatCall;
-    pub const prepareResolvedFlatCall = host_call_member.prepareResolvedFlatCall;
-    pub const memberSiteSig = host_call_member.memberSiteSig;
-    pub const hostMemberServeProbe = host_call_member.hostMemberServeProbe;
-    pub const hostMemberServeKind = host_call_member.hostMemberServeKind;
-    pub const prepareMemberFlatFromFid = host_call_member.prepareMemberFlatFromFid;
-    pub const callMemberStrictExt = host_call_member.callMemberStrictExt;
-    pub const receiverImplementsType = host_call_member.receiverImplementsType;
-    pub const memberExtOverridesFor = host_call_member.memberExtOverridesFor;
-    pub const callMemberMembersOnly = host_call_member.callMemberMembersOnly;
-    pub const callMemberMembersOnlyLenient = host_call_member.callMemberMembersOnlyLenient;
-    pub const committedExtReceiverDisproven = host_call_member.committedExtReceiverDisproven;
-    pub const committedExtReceiverProven = host_call_member.committedExtReceiverProven;
-    pub const resolveMemberFuncId = host_call_member.resolveMemberFuncId;
-    pub const resolveVirtualFuncId = host_call_member.resolveVirtualFuncId;
-    pub const hostHasMember = host_call_member.hostHasMember;
-    pub const cmgGlobalSkip = host_call_member.cmgGlobalSkip;
-    pub const cmgGlobalRecord = host_call_member.cmgGlobalRecord;
-    pub const hostHasProperty = host_call_member.hostHasProperty;
-    pub const hostHasExtPropSetter = host_fields.hostHasExtPropSetter;
-    pub const companionWithMember = host_call_member.companionWithMember;
-    pub const declaringClassSimpleName = host_call_member.declaringClassSimpleName;
-    pub const memberRef = host_call_member.memberRef;
-    pub const memberRefExact = host_call_member.memberRefExact;
-    pub const invokeMethodFuncId = host_call_member.invokeMethodFuncId;
-    pub const qualifiedThis = host_call_member.qualifiedThis;
-    pub const memberExtOwnerInstanceFor = host_call_member.memberExtOwnerInstanceFor;
-    pub const setCtorArgStaticHeads = host_instances.setCtorArgStaticHeads;
-    pub const setCtorSitePick = host_instances.setCtorSitePick;
-    pub const newInstance = host_instances.newInstance;
-    pub const newInstanceNamed = host_instances.newInstanceNamed;
-    pub const classSecondaryCtorCanBind = host_instances.classSecondaryCtorCanBind;
-    pub const getField = host_fields.getField;
-    /// `EnumClass.Entry` served by index: the entries are built on first use,
-    /// so the read has to run that before it can index them.
-    pub fn enumEntryAt(self: *VmHost, cls: runtime.ObjRef(runtime.ClassDef), index: u32, name: []const u8) ir.eval.EvalResult {
-        if (host_globals.ensureEnumInit(self, cls) catch return .{ .err = .{ .Type = "enum init failed" } }) |e|
-            return .{ .err = e };
-        const g = cls.borrow();
-        defer g.deinit();
-        const entries = g.get().enum_entries;
-        if (index >= entries.len) return .{ .err = .{ .Type = "enum entry index out of range" } };
-        const e = entries[index];
-        if (!std.mem.eql(u8, e.name, name)) return .{ .err = .{ .Type = "enum entry name mismatch" } };
-        return .{ .ok = e.value };
-    }
-    pub const getMemberField = host_fields.getMemberField;
-    pub const getMemberFieldNoExt = host_fields.getMemberFieldNoExt;
-    pub const enclosingEnumEntry = host_fields.enclosingEnumEntry;
-    pub const enclosingEnumEntryByOwner = host_fields.enclosingEnumEntryByOwner;
-    pub const enclosingCompanionMember = host_fields.enclosingCompanionMember;
-    pub const extensionFnFallback = host_call_member.extensionFnFallback;
-    pub const instanceHasInvokeSurface = host_call_member.instanceHasInvokeSurface;
-    pub const instanceExtendsFunctionType = host_call_member.instanceExtendsFunctionType;
-    pub const stampRefAdaptation = host_fields.stampRefAdaptation;
-    pub const closureRefEquals = builtin_members.closureRefEquals;
-    pub const fieldSiteRoute = host_fields.fieldSiteRoute;
-    pub const fieldWriteSiteRoute = host_fields.fieldWriteSiteRoute;
-    pub const sgetterNameMatches = host_fields.sgetterNameMatches;
-    pub const storedNullServable = host_fields.storedNullServable;
-    pub const builtinIndexPropsServable = host_fields.builtinIndexPropsServable;
-    pub const runFieldGetter = host_fields.runFieldGetter;
-    pub const fieldGetterIsLeaf = host_fields.fieldGetterIsLeaf;
-    pub const funcRunsItsBody = host_fields.funcRunsItsBody;
-    pub const ownerModuleForFunc = host_fields.ownerModuleForFunc;
-    pub const replayHits = host_call_member.replayHits;
-    pub const extFbCounts = host_call_member.extFbCounts;
-    pub const dispatchCacheGen = host_call_member.dispatchCacheGen;
-    pub const leafGlobalGet = host_globals.leafGlobalGet;
-    pub const fastCallPlan = host_call_func.fastCallPlan;
-    pub const fuseSiteBinds = host_call_func.fuseSiteBinds;
-    pub const callFuncFast = host_call_func.callFuncFast;
-    pub const flatPlainCallOpen = host_call_func.flatPlainCallOpen;
-    pub const plainStoredFieldIndex = host_fields.plainStoredFieldIndex;
-    pub const plainStoredScalarFieldNN = host_fields.plainStoredScalarFieldNN;
-    pub const setField = host_fields.setField;
-    pub const instanceOf = host_classes.instanceOf;
-    pub const contextValueOfType = host_context.contextValueOfType;
-    pub const isConcreteCastTarget = host_classes.isConcreteCastTarget;
-    pub const isDeclaredClassNameFrom = host_classes.isDeclaredClassNameFrom;
-    pub const lookupGlobal = host_globals.lookupGlobal;
-    pub const composeSnapshotGlobals = host_globals.composeSnapshotGlobals;
-    pub const lookupGlobalById = host_globals.lookupGlobalById;
-    pub const mainFuncNameMatches = host_globals.mainFuncNameMatches;
-    pub const lookupGlobalThrowing = host_globals.lookupGlobalThrowing;
-    pub const storeGlobal = host_globals.storeGlobal;
-    pub const isShadowingCapture = host_globals.isShadowingCapture;
-    pub const scopedLocalBinds = host_globals.scopedLocalBinds;
-    pub const buildClosure = host_call_value.buildClosure;
-    pub const callableReceiverShape = host_call_value.callableReceiverShape;
-    pub const callableAcceptsArgs = host_call_value.callableAcceptsArgs;
-    pub const callableAcceptsCall = host_call_value.callableAcceptsCall;
-    pub const closureNeedsThisCapture = host_call_value.closureNeedsThisCapture;
-    pub const overrideClosureThis = host_call_value.overrideClosureThis;
-    pub const callFunc = host_call_func.callFunc;
-    pub const samConvertActivationArgs = host_call_func.samConvertActivationArgs;
-    pub const callFuncNamed = host_call_func.callFuncNamed;
-    pub const callFuncTyped = host_call_func.callFuncTyped;
-    pub const setTrailingLambdaCall = host_call_func.setTrailingLambdaCall;
-    pub const setTrailingMemberCall = host_call_member.setTrailingMemberCall;
-    pub const callNamedOverload = host_call_func.callNamedOverload;
-    pub const pickNamedOverloadId = host_call_func.pickNamedOverloadId;
-    pub const pickNamedOverloadIdRecv = host_call_func.pickNamedOverloadIdRecv;
-    pub const bareUnsettledHeaderNoOp = host_call_func.bareUnsettledHeaderNoOp;
+    pub const deepValueEquals = builtin_members.deepValueEquals;
+    pub const funcRunsItsBody = host_resolved.funcRunsItsBody;
+    pub const ownerModuleForFunc = host_resolved.ownerModuleForFunc;
+    /// The fused tier runs a body for a host that declares this.
+    pub const fieldSiteRoute = {};
 };
 
 /// Stdlib `CallCtx` host adapter: HOF bindings reach through it to invoke a lambda.
@@ -436,16 +241,9 @@ pub const VmIntrinsicHost = struct {
 
     module: ObjRef(Module),
     closures: SharedClosures,
-    globals: ObjRef(Env),
-    classes: ObjRef(ClassTable),
-    prog: ObjRef(ProgramImage),
-    anon_methods: AnonMethods,
-    class_default_outer: ObjRef(OuterTable),
     instance_id_counter: ObjRef(std.atomic.Value(u64)),
     out_sink: SharedOutput,
     threads: ThreadTable,
-    object_states: ObjectStates,
-    singletons_by_id: root.SingletonsById,
     /// The run state of code lowered from sema, null for a module lowered
     /// the other way.
     resolved_state: ?ir.resolved.StateRef,
@@ -456,19 +254,40 @@ pub const VmIntrinsicHost = struct {
         return .{
             .module = state.module,
             .closures = state.closures,
-            .globals = state.globals,
-            .classes = state.classes,
-            .prog = state.prog,
-            .anon_methods = state.anon_methods,
-            .class_default_outer = state.class_default_outer,
             .instance_id_counter = state.instance_id_counter,
             .out_sink = state.out_sink,
             .threads = state.threads,
-            .object_states = state.object_states,
-            .singletons_by_id = state.singletons_by_id,
             .resolved_state = state.resolved_state,
             .allocator = state.allocator,
         };
+    }
+
+    /// A view of `host`'s handles, under `borrowed`'s contract.
+    pub fn borrowedFrom(host: *const VmHost) VmIntrinsicHost {
+        return borrowed(SharedHandles.fromHost(host));
+    }
+
+    /// A host over `host`'s handles holding a reference to each, for a
+    /// caller that keeps it past the call (a coroutine pump, a sequence
+    /// builder's cursor). `release` gives them back.
+    pub fn owning(host: *const VmHost) VmIntrinsicHost {
+        return .{
+            .module = host.module.clone(),
+            .closures = host.closures.clone(),
+            .instance_id_counter = host.instance_id_counter.clone(),
+            .out_sink = host.out_sink.clone(),
+            .threads = host.threads.clone(),
+            .resolved_state = host.resolved_state,
+            .allocator = host.allocator,
+        };
+    }
+
+    pub fn release(self: *VmIntrinsicHost) void {
+        self.module.deinit();
+        self.closures.deinit();
+        self.instance_id_counter.deinit();
+        self.out_sink.deinit();
+        self.threads.deinit();
     }
 
     pub fn intrinsicHost(self: *VmIntrinsicHost) IntrinsicHost {
@@ -495,8 +314,11 @@ fn ivCallWellKnown(ctx: *anyopaque, receiver: *const Value, member: runtime.Well
 fn ivAllocInstanceId(ctx: *anyopaque) u64 {
     return intrinsic_host.allocInstanceId(ip(ctx));
 }
-fn ivNewSynthInstance(ctx: *anyopaque, class_fqn: []const u8, identity: u64, fields: []const InstanceData.Field) Allocator.Error!Value {
-    return intrinsic_host.newSynthInstance(ip(ctx), class_fqn, identity, fields);
+fn ivNewHostInstance(ctx: *anyopaque, kind: runtime.HostInstance, identity: u64, fields: []const InstanceData.Field) Allocator.Error!Value {
+    return intrinsic_host.newHostInstance(ip(ctx), kind, identity, fields);
+}
+fn ivConstructWellKnown(ctx: *anyopaque, class: runtime.WellKnownClass, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
+    return intrinsic_host.constructWellKnown(ip(ctx), class, args, out);
 }
 fn ivRunBlocking(ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     return intrinsic_host.runBlocking(ip(ctx), block, scope, out);
@@ -578,16 +400,9 @@ fn ivPersist(ctx: *anyopaque) IntrinsicHost {
     p.* = .{
         .module = src.module.clone(),
         .closures = src.closures.clone(),
-        .globals = src.globals.clone(),
-        .classes = src.classes.clone(),
-        .prog = src.prog.clone(),
-        .anon_methods = src.anon_methods.clone(),
-        .class_default_outer = src.class_default_outer.clone(),
         .instance_id_counter = src.instance_id_counter.clone(),
         .out_sink = src.out_sink.clone(),
         .threads = src.threads.clone(),
-        .object_states = src.object_states.clone(),
-        .singletons_by_id = src.singletons_by_id.clone(),
         .resolved_state = if (src.resolved_state) |rs| rs.clone() else null,
         .allocator = src.allocator,
     };
@@ -612,7 +427,8 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .call_well_known = ivCallWellKnown,
     .well_known_object = ivWellKnownObject,
     .alloc_instance_id = ivAllocInstanceId,
-    .new_synth_instance = ivNewSynthInstance,
+    .new_host_instance = ivNewHostInstance,
+    .construct_well_known = ivConstructWellKnown,
     .run_blocking = ivRunBlocking,
     .coroutine_run_root = ivCoroutineRunRoot,
     .coroutine_start_root_or_suspended = ivCoroutineStartRootOrSuspended,
@@ -645,12 +461,7 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
     _ = host_call_func;
-    _ = host_call_member;
     _ = host_call_value;
-    _ = host_classes;
-    _ = host_fields;
-    _ = host_globals;
-    _ = host_instances;
     _ = host_impl;
     _ = host_resolved;
     _ = intrinsic_host;

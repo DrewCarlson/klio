@@ -148,7 +148,7 @@ pub fn solve(a: Allocator, ctx: Ctx) Allocator.Error!Typing {
         changed = false;
         for (f.blocks) |*blk| {
             for (blk.h().catches) |h| {
-                if (try define(kinds, cls, h.exception_reg, .{ .ty = .object }, if (h.class_raw != ir.NO_CLASS) .{ .known = ClassId.from(h.class_raw) } else .many)) changed = true;
+                if (try define(kinds, cls, h.exception_reg, .{ .ty = .object }, .{ .known = h.class })) changed = true;
             }
             for (blk.insts) |*inst| {
                 if (try step(ctx, kinds, cls, inst)) changed = true;

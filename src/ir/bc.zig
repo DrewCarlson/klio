@@ -120,18 +120,22 @@ pub fn resetCacheForTest() void {
 
 /// `allow_fuse` is process-constant, so the first call decides what the cache
 /// holds. `consts` is the owning module's table, for embedded Int payloads.
-pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Const) ?*const FuncStreams {
+/// The streams of `func`'s blocks. The memo on the `Func` answers inline;
+/// the shared cache behind it takes a global mutex and a hash probe. The memo
+/// holds one fuse variant; the other keeps that path.
+pub inline fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Const) ?*const FuncStreams {
+    const want_fuse: u8 = if (allow_fuse) 2 else 1;
+    const m = func.bc_memo.load(.acquire);
+    if (m != 0 and func.bc_memo_fuse == want_fuse and func.bc_memo_gen == stream_gen.load(.monotonic)) {
+        return if (m == 1) null else @ptrFromInt(m);
+    }
+    return funcStreamsSlow(func, allow_fuse, consts);
+}
+
+fn funcStreamsSlow(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Const) ?*const FuncStreams {
     if (func.blocks.len == 0) return null;
-    // The shared cache below takes a global mutex and a hash probe on every
-    // activation. The memo holds one fuse variant; the other keeps that path.
     const want_fuse: u8 = if (allow_fuse) 2 else 1;
     const gen = stream_gen.load(.monotonic);
-    {
-        const m = func.bc_memo.load(.acquire);
-        if (m != 0 and func.bc_memo_fuse == want_fuse and func.bc_memo_gen == gen) {
-            return if (m == 1) null else @ptrFromInt(m);
-        }
-    }
     const key: CacheKey = .{ .blocks = @intFromPtr(func.blocks.ptr), .sig = blocksSignature(func.blocks), .fuse = allow_fuse };
     cache_mutex.lock();
     defer cache_mutex.unlock();

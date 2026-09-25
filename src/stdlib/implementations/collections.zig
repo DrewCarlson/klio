@@ -203,7 +203,6 @@ pub const pinBuilderState = sequence_mod.pinBuilderState;
 pub const freshBuilderState = sequence_mod.freshBuilderState;
 pub const freshBuilderSeq = sequence_mod.freshBuilderSeq;
 pub const materialise_sequence = sequence_mod.materialise_sequence;
-pub const materialise_sequence_bounded = sequence_mod.materialise_sequence_bounded;
 
 const list_transforms_mod = @import("collections/list_transforms.zig");
 pub const coll_list_sorted = list_transforms_mod.coll_list_sorted;

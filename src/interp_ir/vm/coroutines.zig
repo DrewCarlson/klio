@@ -1111,7 +1111,6 @@ pub const CooperativeInterceptor = struct {
 
 const vmhost = @import("vmhost.zig");
 const intrinsic_host = @import("intrinsic_host.zig");
-const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const Output = runtime.Output;
 const RuntimeError = runtime.RuntimeError;
 const RuntimeEvalResult = runtime.EvalResult;
@@ -1650,43 +1649,6 @@ pub fn driveRoot(self: anytype, block: *const Value, scope: *const Value, out: O
         return err_result;
     }
     try pumpExit(self, out, persist);
-    return .{ .ok = root_value orelse Value.Unit };
-}
-
-/// A compiled root block on the same pump, entered by calling a native
-/// continuation, so compiled and interpreted programs schedule alike.
-pub fn driveRootNative(
-    self: anytype,
-    call: *const fn (?*anyopaque, runtime.CValue) callconv(.c) runtime.CValue,
-    frame: ?*anyopaque,
-    out: Output,
-) Allocator.Error!RuntimeEvalResult {
-    const a = self.allocator;
-    try coroPush(a);
-    if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
-    const scope_depth = active_scope_stack.items.len;
-    defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
-    const unit: Value = .Unit;
-    const guard = ActiveScopeGuard.enter(&unit);
-    defer guard.leave();
-
-    var root_value: ?Value = null;
-    var root_token: ?u64 = null;
-    const produced = runtime.fromC(call(frame, runtime.toC(.Unit)));
-    if (produced == .CoroutineSuspended) {
-        const st = ir.eval.takeInFlightSuspend(a) orelse {
-            try pumpExit(self, out, false);
-            return .{ .err = .{ .Type = "compiled body suspended without a continuation" } };
-        };
-        root_token = try park(a, st, scope_depth);
-    } else {
-        root_value = produced;
-    }
-
-    if (try pumpLoop(self, &unit, out, false, true, &root_token, &root_value)) |err_result| {
-        return err_result;
-    }
-    try pumpExit(self, out, false);
     return .{ .ok = root_value orelse Value.Unit };
 }
 
@@ -2245,31 +2207,11 @@ pub fn coroutineHasDriver() bool {
     return coroTop() != null;
 }
 
-/// `ident` is 0 when nothing was pushed.
-pub const UndispatchedEnter = struct { base: usize, ident: usize };
-pub fn undispatchedFlatEnter(scope: *const Value) UndispatchedEnter {
-    root_suspension_hit = false;
-    const base = activeScopeDepth();
-    const g = ActiveScopeGuard.enter(scope);
-    return .{ .base = base, .ident = if (g.pushed) g.ident else 0 };
-}
-
 /// Undo `undispatchedFlatEnter`'s push by identity, never a blind top pop. No-op
 /// once the entry was captured into a parked scope delta.
 pub fn undispatchedFlatLeaveIdent(ident: usize) void {
     if (ident == 0) return;
     (ActiveScopeGuard{ .pushed = true, .ident = ident }).leave();
-}
-
-/// Null when a driver already encloses this thread.
-pub fn rootPumpFlatEnter(allocator: Allocator, scope: *const Value) Allocator.Error!?UndispatchedEnter {
-    if (coroTop() != null) return null;
-    root_suspension_hit = false;
-    try coroPush(allocator);
-    if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
-    const base = activeScopeDepth();
-    const g = ActiveScopeGuard.enter(scope);
-    return .{ .base = base, .ident = if (g.pushed) g.ident else 0 };
 }
 
 /// `res_ok` null with `aborted` true only exits the pump.
@@ -2426,9 +2368,6 @@ pub fn coroutineDisarmSlot(self: anytype) void {
     if (coroTop()) |top| top.clearPendingSlot();
 }
 
-/// Whether the most recent undispatched start saw its root body park.
-threadlocal var last_root_parked_once: bool = false;
-
 /// Set whenever a suspension boundary is crossed; reset when an undispatched start
 /// begins its body, so a start that suspended is distinguishable.
 threadlocal var root_suspension_hit: bool = false;
@@ -2436,10 +2375,6 @@ threadlocal var root_suspension_hit: bool = false;
 pub fn coroutineNoteSuspensionHit(self: anytype) void {
     _ = self;
     root_suspension_hit = true;
-}
-
-pub fn coroutineResetSuspensionHit() void {
-    root_suspension_hit = false;
 }
 
 pub fn coroutineLastRootParkedOnce(self: anytype) bool {
@@ -2454,10 +2389,6 @@ pub fn coroutinePushScope(scope: *const Value) void {
     if (scopeDiagOn())
         std.debug.print("[scope] push depth={d} id={x}\n", .{ active_scope_stack.items.len, scopeIdent(scope) });
     active_scope_stack.append(coroStackAllocator(), scope.*) catch {};
-}
-
-pub fn coroutineScopeIdent(v: *const Value) usize {
-    return scopeIdent(v);
 }
 
 pub fn coroutinePopScope() void {

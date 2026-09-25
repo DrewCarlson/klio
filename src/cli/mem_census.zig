@@ -75,5 +75,4 @@ pub fn printTypeSizes() void {
     row("ir.Class", ir.Class);
     row("ir.Const", ir.Const);
     row("typeck.Type", typeck.check.Type);
-    row("interp_ir.ProgramImage", interp_ir.ProgramImage);
 }

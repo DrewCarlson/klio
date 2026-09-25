@@ -78,10 +78,11 @@ Install packs once into a shared, tree-keyed test home as a build step the
 child suites depend on, rather than per suite.
 
 Gate scripts: `scripts/gate.sh`'s litmus phase moves with the suites; its
-ratchet phase (`site-census-sweep.py`, `plans/resolution-ceiling.json`) is
-replaced by the name guard and a `klio sema --each` census-zero step; drop
-`--eager both`. `scripts/quick-gate.sh`'s census phase becomes the sema census.
-The by-name audit scripts go with the by-name variants.
+ratchet phase is replaced by the name guard and a `klio sema --each`
+census-zero step; drop `--eager both`. `scripts/quick-gate.sh`'s census phase
+becomes the sema census. The by-name audit scripts (the site and dispatch
+censuses, the Or-arm and emit audits) and the resolution ceiling have gone
+with the by-name variants.
 
 ## Order of the deletion
 

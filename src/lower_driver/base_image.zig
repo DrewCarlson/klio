@@ -26,7 +26,7 @@ const ClassId = ir.ClassId;
 const magic = "KLIOSEMB";
 
 /// Bumped with any change to the layout below.
-pub const version: u32 = 23;
+pub const version: u32 = 27;
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };
@@ -170,6 +170,7 @@ const ResolvedImage = struct {
     slot_iface: []const u32,
     well_known: resolved.WellKnownSlots,
     well_known_objects: resolved.WellKnownObjects,
+    well_known_classes: resolved.WellKnownClasses,
     well_known_statics: resolved.WellKnownStatics,
     host_class: resolved.HostClasses,
     exceptions: ExceptionsImage,
@@ -314,6 +315,7 @@ fn resolvedImage(a: Allocator, m: *const ir.Module) !ResolvedImage {
         .slot_iface = r.slot_iface,
         .well_known = r.well_known,
         .well_known_objects = r.well_known_objects,
+        .well_known_classes = r.well_known_classes,
         .well_known_statics = r.well_known_statics,
         .host_class = r.host_class,
         .exceptions = .{ .fixed = fixed, .by_fqn = by_fqn.items },
@@ -437,6 +439,7 @@ fn loadResolved(a: Allocator, img: *const ResolvedImage, m: *const ir.Module, br
     r.slot_iface = img.slot_iface;
     r.well_known = img.well_known;
     r.well_known_objects = img.well_known_objects;
+    r.well_known_classes = img.well_known_classes;
     r.well_known_statics = img.well_known_statics;
     r.host_class = img.host_class;
     r.base = img.base;

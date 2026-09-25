@@ -11,14 +11,11 @@ const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 
 const BinOp = ir.BinOp;
-const BlockId = ir.BlockId;
 const Func = ir.Func;
 const Module = ir.Module;
 const TypeRef = ir.TypeRef;
 
-const exec_call = @import("../exec_call.zig");
 
-const constStr = exec_call.constStr;
 
 const ev_activation = @import("activation.zig");
 const ev_diag = @import("diag.zig");
@@ -26,12 +23,9 @@ const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
 const ev_fused = @import("fused.zig");
 const ev_host = @import("host.zig");
-const ev_leaf = @import("leaf.zig");
-const ev_loop = @import("loop.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 
-const EnclosingEntry = ev_state.EnclosingEntry;
 const EvalError = ev_state.EvalError;
 const EvalResult = ev_flow.EvalResult;
 const EvalTls = ev_state.EvalTls;
@@ -45,7 +39,6 @@ const errResult = ev_flow.errResult;
 const fusedExecOpt = ev_fused.fusedExecOpt;
 const gcPopFrame = ev_state.gcPopFrame;
 const gcPushFrame = ev_state.gcPushFrame;
-const leafExprServeAt = ev_leaf.leafExprServeAt;
 const lrTraceOn = ev_flow.lrTraceOn;
 const nullHost = ev_host.nullHost;
 const ok = ev_flow.ok;
@@ -60,79 +53,6 @@ fn coerceIntToLongTy(ty: TypeRef, v: *Value) void {
     }
 }
 
-/// Apply `coerceIntToLongTy` per declared parameter type. A `vararg` slot binds the packed array, not an element, so it is skipped.
-pub fn coerceIntArgsToLong(func: *const Func, params: []Value) void {
-    var i: usize = 0;
-    while (i < params.len and i < func.params.len) : (i += 1) {
-        if (!func.params[i].is_vararg) {
-            coerceIntToLongTy(func.params[i].ty, &params[i]);
-        }
-    }
-}
-
-/// Whether `name` is one of the function's declared type-parameter names (`T` of `fun <T> f(...)`).
-fn isFuncTypeParam(module: *const Module, func: *const Func, name: []const u8) bool {
-    if (module.registry.func_type_params.get(func.id)) |tps| {
-        for (tps.items) |t| if (std.mem.eql(u8, t, name)) return true;
-    }
-    return false;
-}
-
-/// Cached literal-coercion plan for `func`: bit 1 = computed, bit 2 = a declared non-nullable
-/// `Long` param (coerceIntArgsToLong), bit 4 = a type-variable param beside a peer
-/// (coerceGenericIntPeersToLong).
-pub fn coercePlanFor(module: *const Module, func: *const Func) u8 {
-    var plan = func.coerce_plan;
-    if (plan != 0) return plan;
-    plan = 1;
-    for (func.params) |*p| {
-        if (!p.is_vararg and !p.ty.nullable and std.mem.eql(u8, p.ty.name, "Long")) {
-            plan |= 2;
-            break;
-        }
-    }
-    if (func.params.len >= 2) {
-        for (func.params) |*p| {
-            if (!p.ty.nullable and isFuncTypeParam(module, func, p.ty.name)) {
-                plan |= 4;
-                break;
-            }
-        }
-    }
-    @constCast(func).coerce_plan = plan;
-    return plan;
-}
-
-/// A literal `Int` bound to a type-variable param keeps its `Int` tag, while Kotlin typed it
-/// by inference: widen it when a peer param bound to the same `T` carries `Long` content.
-pub fn coerceGenericIntPeersToLong(module: *const Module, func: *const Func, params: []Value) void {
-    const n = @min(params.len, func.params.len);
-    if (n < 2) return;
-    var has_tparam = false;
-    for (func.params[0..n]) |*p| {
-        if (!p.ty.nullable and isFuncTypeParam(module, func, p.ty.name)) {
-            has_tparam = true;
-            break;
-        }
-    }
-    if (!has_tparam) return;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const iv = params[i];
-        const ti = func.params[i].ty;
-        if (ti.nullable or !isFuncTypeParam(module, func, ti.name)) continue;
-        if (iv != .Int) continue;
-        var j: usize = 0;
-        while (j < n) : (j += 1) {
-            if (j == i or params[j] != .Long) continue;
-            if (std.mem.eql(u8, func.params[j].ty.name, ti.name)) {
-                params[i] = .{ .Long = @as(i64, iv.Int) };
-                break;
-            }
-        }
-    }
-}
-
 /// Run a function body positionally, returning the terminating `Return`'s value or `Unit` on a
 /// fall-off, against `nullHost`. `args` ownership transfers in as the frame's params backing.
 pub fn eval(allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value)) Allocator.Error!EvalResult {
@@ -140,29 +60,9 @@ pub fn eval(allocator: Allocator, module: *const Module, func: *const Func, args
     return evalWith(NullHost, allocator, module, func, args, &host);
 }
 
-/// Whether `v` is a primitive the leaf evaluator may hand to `applyBinop`; anything else declines the serve.
-pub fn leafPrimitive(v: *const Value) bool {
-    return switch (v.*) {
-        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char => true,
-        else => false,
-    };
-}
-
 /// Whether `module` is the one `func`'s body indexes against: its ids must name this very `Func`.
 pub fn funcOwnedBy(module: *const Module, func: *const Func) bool {
     return module.funcById(func.id) == func;
-}
-
-/// Serve a `leafExprBody` with no frame. Speculative: an instruction whose semantics need the
-/// frame path abandons and returns null, before anything is mutated, and the caller runs the body.
-pub fn leafExprServe(
-    comptime H: type,
-    allocator: Allocator,
-    module: *const Module,
-    func: *const Func,
-    args: []const Value,
-) Allocator.Error!?EvalResult {
-    return leafExprServeAt(H, allocator, module, func, args);
 }
 
 /// Like `eval`, but routes non-trivial dispatch through `H`, a comptime-duck-typed concrete host.
@@ -183,7 +83,7 @@ pub fn leafExprServe(
 /// call away. The gate excludes any call with a receiver, which is what
 /// `engine/member-calls-frameless` exists to change, and this says what that
 /// is worth before the work starts.
-pub var fuse_gate_counts: [6]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0));
+pub var fuse_gate_counts: [5]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0));
 var fuse_gate_state: u8 = 0;
 
 pub fn fuseGateProbeOn() bool {
@@ -194,7 +94,7 @@ pub fn fuseGateProbeOn() bool {
 
 pub fn fuseGateDump() void {
     if (!fuseGateProbeOn()) return;
-    const names = [_][]const u8{ "has_receiver", "is_closure", "chain_seed", "has_captures", "native_backed", "offered" };
+    const names = [_][]const u8{ "has_receiver", "is_closure", "has_captures", "native_backed", "offered" };
     for (names, 0..) |n, i| {
         const v = fuse_gate_counts[i].load(.monotonic);
         if (v != 0) std.debug.print("[fuse-gate] {d:>8}  {s}\n", .{ v, n });
@@ -210,7 +110,12 @@ pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, f
 /// `KLIO_THIS_TRAP=1`: print every frame entry binding a Bool into a `this` param, the ext-receiver misbind signature.
 var bool_this_trap_state: u8 = 0;
 
-pub fn boolThisTrap(func: *const Func, args: []const Value) void {
+pub inline fn boolThisTrap(func: *const Func, args: []const Value) void {
+    if (bool_this_trap_state == 1) return;
+    boolThisTrapSlow(func, args);
+}
+
+fn boolThisTrapSlow(func: *const Func, args: []const Value) void {
     if (bool_this_trap_state == 0)
         bool_this_trap_state = if (runtime.envOnce("KLIO_THIS_TRAP") != null) 2 else 1;
     if (bool_this_trap_state != 2) return;
@@ -236,14 +141,22 @@ var dump_fn_done: bool = false;
 /// Cached `KLIO_DUMP_FN` value; an empty slice means unset.
 var dump_fn_want: ?[]const u8 = null;
 
-pub fn dumpFnIfRequested(func: *const Func) void {
+pub inline fn dumpFnIfRequested(func: *const Func) void {
+    if (dump_fn_done) return;
+    dumpFnSlow(func);
+}
+
+fn dumpFnSlow(func: *const Func) void {
     const want = dump_fn_want orelse blk: {
         const w = runtime.envOnce("KLIO_DUMP_FN") orelse "";
         dump_fn_want = w;
         break :blk w;
     };
-    if (want.len == 0) return;
-    if (dump_fn_done) return;
+    // Unset: stop asking.
+    if (want.len == 0) {
+        dump_fn_done = true;
+        return;
+    }
     // `#<id>` selects by FuncId, the only handle for the synthetic names (`<lambda>`) many functions share.
     if (want.len > 1 and want[0] == '#') {
         const id = std.fmt.parseInt(u32, want[1..], 10) catch return;
@@ -303,7 +216,7 @@ pub fn evalWithCapturesIn(
     captures: std.ArrayList(Value),
     host: *H,
 ) Allocator.Error!EvalResult {
-    return evalWithCapturesChained(H, allocator, module, owning, func, args, captures, &.{}, null, host);
+    return evalClosure(H, allocator, module, owning, func, args, captures, null, host);
 }
 
 /// Where a non-local return goes once this frame's finallys have run: a labeled return to the
@@ -340,9 +253,10 @@ fn frameMatchesLabel(func: *const Func, label: []const u8) bool {
     return false;
 }
 
-/// Like `evalWithCapturesIn` but seeds the enclosing-`this` chain with `chain_seed` (storage
-/// order, innermost last): the closure's creation-time receivers, not the dynamic caller's.
-pub fn evalWithCapturesChained(
+/// Runs `func` over `args` and `captures` as closure `closure_id` (null for a
+/// plain call), reading its ids against `module`; `owning` is the sub-module
+/// a suspension resumes in.
+pub fn evalClosure(
     comptime H: type,
     allocator: Allocator,
     module: *const Module,
@@ -350,25 +264,12 @@ pub fn evalWithCapturesChained(
     func: *const Func,
     args: std.ArrayList(Value),
     captures: std.ArrayList(Value),
-    chain_seed: []const EnclosingEntry,
     closure_id: ?u64,
     host: *H,
 ) Allocator.Error!EvalResult {
     dumpFnIfRequested(func);
     boolThisTrap(func, args.items);
-    // The recursive call seam, the one point every interpreted call passes through. A leaf callee
-    // needs no frame.
-    if (owning == null and closure_id == null and chain_seed.len == 0 and
-        captures.items.len == 0 and func.leafExprBody())
-    {
-        if (try leafExprServe(H, allocator, module, func, args.items)) |lr| {
-            var a = args;
-            a.deinit(allocator);
-            var c = captures;
-            c.deinit(allocator);
-            return lr;
-        }
-    }
+    // The recursive call seam, the one point every interpreted call passes through.
     // The fused tier at the same seam: no Frame at all, raising real errors rather than abandoning.
     // `allow_materialize` is false: a body the walker cannot finish pays the tier's entry AND the
     // frame it then opens, and measured against a recomposer frame that trade is a loss of 2.9%.
@@ -378,15 +279,13 @@ pub fn evalWithCapturesChained(
             0
         else if (closure_id != null)
             1
-        else if (chain_seed.len != 0)
-            2
         else if (captures.items.len != 0)
-            3
+            2
         else
-            5;
+            4;
         _ = fuse_gate_counts[slot].fetchAdd(1, .monotonic);
     }
-    if (owning == null and closure_id == null and chain_seed.len == 0 and captures.items.len == 0) {
+    if (owning == null and closure_id == null and captures.items.len == 0) {
         if (try fusedExecOpt(H, allocator, module, func, args.items, host, false)) |fr| {
             var a = args;
             a.deinit(allocator);
@@ -395,41 +294,16 @@ pub fn evalWithCapturesChained(
             return fr;
         }
     }
-    // Host-route serve at the same seam, reached through any dispatch path. A served target is a
-    // pure function of (receiver, args), so a chain seed does not disqualify it.
-    if (owning == null and closure_id == null and captures.items.len == 0) {
-        if (exec_call.hostRouteServe(H, allocator, func, args.items, host)) |served| {
-            var a = args;
-            a.deinit(allocator);
-            var c = captures;
-            c.deinit(allocator);
-            return ok(served);
-        }
-        if (try exec_call.hostRouteServeThrowing(H, allocator, module, func, args.items, host)) |r| {
-            var a = args;
-            a.deinit(allocator);
-            var c = captures;
-            c.deinit(allocator);
-            return r;
-        }
-    }
     callStatsBumpId(func.fqn, func.id.int(), module);
     const ev: *EvalTls = ev_state.evtlsPtr();
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
-    // Kotlin's SAM conversion happens at the CALL boundary: a lambda bound to a `fun interface`
-    // parameter arrives as an instance of that interface, and every call shape passes through here.
-    if (comptime @hasDecl(H, "samConvertActivationArgs")) {
-        try host.samConvertActivationArgs(allocator, func, args.items);
-    }
     var frame = try Frame.newWithCaptures(ev, allocator, module, func, args, captures);
     frame.closure_id = closure_id;
     defer frame.deinit();
     gcPushFrame(&frame);
     defer gcPopFrame(&frame);
     frame.module_arc = owning;
-    try frame.activateChain(chain_seed);
-    defer frame.deactivateChain();
     const cur = func.entry;
     const result = try runFrame(H, allocator, module, &frame, &try_stack, cur, 0, host);
     return frameBoundary(func, result);

@@ -221,8 +221,6 @@ test "every declaration gets an id, and the ids are dense" {
     try std.testing.expect(br.staticOf(try fx.programSym(.property, "topVal")) != null);
     _ = br.funcOf(try fx.programSym(.function, "local"));
     try std.testing.expectEqual(@as(usize, 1), (try fx.lambdas()).len);
-    // Every shell is kept off the tiers that cannot run the new instructions.
-    for (m.funcs.items) |f| try std.testing.expectEqual(@as(u8, 1), f.leaf_hopeless);
 }
 
 test "the same sources give the same ids, and the base keeps its ids under another program" {

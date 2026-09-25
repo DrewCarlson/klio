@@ -5,6 +5,7 @@
 //! declaration answers first.
 
 const std = @import("std");
+const ast = @import("ast");
 
 const sema_mod = @import("sema.zig");
 const symbols = @import("symbols.zig");
@@ -263,6 +264,17 @@ fn declaresDefaults(s: *Sema, f: Sym) bool {
 /// substitution. Type parameters of the functions themselves compare by
 /// position.
 pub fn sameSignature(s: *Sema, a: Sym, a_subst: *const types.Subst, b: Sym, b_subst: *const types.Subst) Allocator.Error!bool {
+    return signaturesMatch(s, a, a_subst, b, b_subst, false);
+}
+
+/// `sameSignature`, with the value-parameter types equal as written, type
+/// arguments included: `f(a: List<Int>)` does not have the signature of
+/// `f(a: List<String>)`.
+pub fn sameSignatureExactly(s: *Sema, a: Sym, a_subst: *const types.Subst, b: Sym, b_subst: *const types.Subst) Allocator.Error!bool {
+    return signaturesMatch(s, a, a_subst, b, b_subst, true);
+}
+
+fn signaturesMatch(s: *Sema, a: Sym, a_subst: *const types.Subst, b: Sym, b_subst: *const types.Subst, exact: bool) Allocator.Error!bool {
     try headers.functionHeader(s, a);
     try headers.functionHeader(s, b);
     const ai = s.syms.functionInfo(a);
@@ -309,6 +321,7 @@ pub fn sameSignature(s: *Sema, a: Sym, a_subst: *const types.Subst, b: Sym, b_su
         const at = try s.types.substitute(try headers.paramType(s, ap), a_subst);
         const bt = try s.types.substitute(try headers.paramType(s, bp), &bs);
         if (!try sameErasure(s, at, bt)) return false;
+        if (exact and !try subtyping.equivalent(s, at, bt)) return false;
     }
     return true;
 }
@@ -373,6 +386,45 @@ pub fn overridden(s: *Sema, m: Sym) Allocator.Error![]const Sym {
     }
     if (k == .function) s.syms.functionInfo(m).overrides = out.items else s.syms.propertyInfo(m).overrides = out.items;
     return out.items;
+}
+
+/// The member of a supertype that `m`, a member function or property
+/// declared without `override`, has the signature of: a function with the
+/// same parameter types, a property with the same receiver. kotlinc
+/// requires `override` on `m`. A supertype's private member is not
+/// inherited, so `m` does not hide it, and neither does it hide one only
+/// some platforms declare (`@PlatformDependent`).
+pub fn hiddenSupertypeMember(s: *Sema, m: Sym) Allocator.Error!Sym {
+    const k = s.syms.kind(m);
+    const cls = s.syms.owner(m);
+    if (k != .function and k != .property) return .none;
+    if (cls == .none or s.syms.kind(cls) != .class) return .none;
+    const want: Want = if (k == .function) .function else .property;
+    const none_subst = try s.arena.create(types.Subst);
+    none_subst.* = .empty;
+    const self_subst = try subtyping.classSubst(s, try headers.selfType(s, cls));
+    for (try headers.supertypes(s, cls)) |st_decl| {
+        const st = try s.types.substitute(st_decl, &self_subst);
+        for (try lookupEvery(s, st, s.syms.name(m), want)) |cand| {
+            if (s.syms.kind(cand.sym) != k) continue;
+            const cf = s.syms.flags(cand.sym);
+            if (cf.static or cf.visibility == .private) continue;
+            if (k == .function and !try sameSignatureExactly(s, m, none_subst, cand.sym, cand.subst)) continue;
+            if (k == .property and !try sameExtensionReceiver(s, m, cand.sym, cand.subst)) continue;
+            if (try platformDependent(s, cand.sym)) continue;
+            return cand.sym;
+        }
+    }
+    return .none;
+}
+
+fn platformDependent(s: *Sema, m: Sym) Allocator.Error!bool {
+    const anns: []const ast.Annotation = switch (s.syms.get(m).decl) {
+        .function => |f| f.annotations,
+        .property => |p| p.annotations,
+        else => return false,
+    };
+    return headers.annotatedWith(s, .{ .decl = m, .file = s.syms.get(m).file }, anns, s.builtins.platform_dependent);
 }
 
 /// Two member properties with the same name override when both or neither

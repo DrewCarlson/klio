@@ -161,7 +161,6 @@ pub const SetRef = value_mod.SetRef;
 pub const setRefOf = value_mod.setRefOf;
 
 pub const ClassDef = class_mod.ClassDef;
-pub const ImplicitReceiver = class_mod.ImplicitReceiver;
 pub const SupertypeDelegate = class_mod.SupertypeDelegate;
 pub const LayoutSlot = class_mod.LayoutSlot;
 pub const ClassParamDef = class_mod.ClassParamDef;
@@ -184,6 +183,8 @@ pub const CallCtx = host_mod.CallCtx;
 pub const IntrinsicHost = host_mod.IntrinsicHost;
 pub const WellKnown = host_mod.WellKnown;
 pub const WellKnownObject = host_mod.WellKnownObject;
+pub const WellKnownClass = host_mod.WellKnownClass;
+pub const HostInstance = host_mod.HostInstance;
 pub const WellKnownStatic = host_mod.WellKnownStatic;
 pub const NoopHost = host_mod.NoopHost;
 pub const HostResultU64 = host_mod.HostResultU64;
@@ -291,7 +292,6 @@ test {
 
 const testing = std.testing;
 
-const InstanceField = class_mod.InstanceData.Field;
 
 fn makeClass(
     allocator: std.mem.Allocator,

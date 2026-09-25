@@ -6,6 +6,7 @@ const runtime = @import("runtime");
 const ir = @import("../ir.zig");
 const span = @import("span");
 
+const callStatsBumpId = @import("diag.zig").callStatsBumpId;
 const Allocator = std.mem.Allocator;
 
 const Value = runtime.Value;
@@ -20,12 +21,9 @@ const Inst = ir.Inst;
 const Module = ir.Module;
 const Reg = ir.Reg;
 
-const exec_call = @import("../exec_call.zig");
 
-const constStr = exec_call.constStr;
-const fastIndexGet = exec_call.fastIndexGet;
-const ownReceiverEntry = exec_call.ownReceiverEntry;
-const sameReceiver = exec_call.sameReceiver;
+const constStr = ev_values.constStr;
+const fastIndexGet = ev_values.fastIndexGet;
 
 const parent = @import("../eval.zig");
 const ev_activation = @import("activation.zig");
@@ -36,37 +34,27 @@ const ev_diag = @import("diag.zig");
 const ev_flow = @import("flow.zig");
 const ev_frame = @import("frame.zig");
 const ev_inst = @import("inst.zig");
-const ev_leaf = @import("leaf.zig");
 const ev_loop = @import("loop.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 const ev_values = @import("values.zig");
 const ev_resolved = @import("resolved.zig");
 
-const EnclosingEntry = ev_state.EnclosingEntry;
 const EvalError = ev_state.EvalError;
 const EvalResult = ev_flow.EvalResult;
 const EvalTls = ev_state.EvalTls;
 const Frame = ev_frame.Frame;
 const FusedMark = ev_state.FusedMark;
-const LEAF_BANK_DEPTH = ev_leaf.LEAF_BANK_DEPTH;
 const TryFrame = ev_snapshot.TryFrame;
 const binopValue = ev_inst.binopValue;
-const chainAllocator = ev_chain.chainAllocator;
-const coerceGenericIntPeersToLong = ev_enter.coerceGenericIntPeersToLong;
-const coerceIntArgsToLong = ev_enter.coerceIntArgsToLong;
-const coercePlanFor = ev_enter.coercePlanFor;
 const constToValue = ev_values.constToValue;
-const evalWithCapturesChained = ev_enter.evalWithCapturesChained;
+const evalClosure = ev_enter.evalClosure;
 const frameBoundary = ev_enter.frameBoundary;
 const gcInstallFrameRoot = ev_state.gcInstallFrameRoot;
 const gcPopFrame = ev_state.gcPopFrame;
 const gcPushFrame = ev_state.gcPushFrame;
 const lateinitThrow = ev_flow.lateinitThrow;
 const ok = ev_flow.ok;
-const popEnclosing = ev_chain.popEnclosing;
-const pushEnclosingAccess = ev_chain.pushEnclosingAccess;
-const pushEnclosingSubject = ev_chain.pushEnclosingSubject;
 const runFrame = ev_activation.runFrame;
 const scalarBin = ev_exec.scalarBin;
 const valueTruthy = ev_values.valueTruthy;
@@ -95,7 +83,6 @@ const FUSED_MAX_INSTS: usize = 256;
 /// All per-thread walker state in one threadlocal, so the base resolves once per activation.
 const FusedTls = struct {
     bank: [FUSED_BANK_DEPTH][FUSED_MAX_REGS]Value = undefined,
-    chain: [FUSED_BANK_DEPTH]std.ArrayList(EnclosingEntry) = @splat(.empty),
     marks: [FUSED_BANK_DEPTH]FusedMark = undefined,
     depth: usize = 0,
 };
@@ -433,17 +420,8 @@ fn fusedRun(
     const ev: *EvalTls = ev_state.evtlsPtr();
     const ka = runtime.keepaliveHandle();
     const reclaim = runtime.reclaimEnabled();
-    var eff_args = args_in;
-    {
-        const plan = coercePlanFor(module, func);
-        if (plan & 6 != 0 and args_in.len <= ir.LEAF_MAX_REGS) {
-            const coerce_buf: []Value = ev_leaf.leafBanks().coerce[ft.depth % LEAF_BANK_DEPTH][0..args_in.len];
-            @memcpy(coerce_buf, args_in);
-            if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf);
-            if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf);
-            eff_args = coerce_buf;
-        }
-    }
+    const eff_args = args_in;
+    callStatsBumpId(func.fqn, func.id.int(), module);
     const nlive: usize = @min(@as(usize, func.n_locals), FUSED_MAX_REGS);
     const regs: []Value = ft.bank[ft.depth][0..nlive];
     ft.depth += 1;
@@ -468,29 +446,6 @@ fn fusedRun(
     defer if (reclaim) {
         for (regs) |*v| v.release(allocator);
     };
-    // The fused body owns an enclosing chain exactly as a frame does, seeded from the caller's
-    // in-flight pushes plus its own receiver, then activated.
-    const chain = &ft.chain[ft.depth - 1];
-    chain.clearRetainingCapacity();
-    if (ev.active_chain) |caller| {
-        const base = @min(ev.active_chain_base, caller.items.len);
-        for (caller.items[base..]) |e| {
-            if (e.kind == .access) continue;
-            try chain.append(chainAllocator(), e);
-        }
-    }
-    if (exec_call.ownReceiverEntry(func, eff_args)) |own| {
-        const dup = chain.items.len > 0 and sameReceiver(chain.items[chain.items.len - 1].v, own.v);
-        if (!dup) try chain.append(chainAllocator(), own);
-    }
-    const prev_chain = ev.active_chain;
-    const prev_chain_base = ev.active_chain_base;
-    ev.active_chain = chain;
-    ev.active_chain_base = chain.items.len;
-    defer {
-        ev.active_chain = prev_chain;
-        ev.active_chain_base = prev_chain_base;
-    }
     // KLIO_FN_PROF: the fused body is the executing function, not its last framed caller.
     const fn_prof_prev = runtime.prof.current_fn;
     if (runtime.prof.fn_prof_active) runtime.prof.current_fn = func.id.int();
@@ -577,17 +532,6 @@ fn fusedMaterializeAndRun(
     defer frame.deinit();
     gcPushFrame(&frame);
     defer gcPopFrame(&frame);
-    // The frame inherits the walker's chain window WHOLE: the window IS what activateChain would
-    // build here, and re-deriving drops the seeded portion that sits below the window's base.
-    const wbase = ev.active_chain_base;
-    if (ev.active_chain) |wchain| {
-        try frame.enclosing_this.appendSlice(chainAllocator(), wchain.items);
-        // The frame owns the entries now; the window is a thread root and would keep rooting them.
-        wchain.clearRetainingCapacity();
-    }
-    frame.activateAs();
-    ev.active_chain_base = @min(wbase, frame.enclosing_this.items.len);
-    defer frame.deactivateChain();
     // Bank slots MOVE into the frame with no retain: the walker never resumes after a
     // materialization, and the pinned bank is zeroed behind it so it stops rooting them.
     const n = @min(regs.len, frame.regs.items.len);
@@ -650,13 +594,6 @@ fn fusedInst(
         .Move => |mv| fusedWrite(allocator, regs, mv.dst, fusedRead(regs, mv.src), reclaim, true),
         .Not => |n| {
             const v = fusedRead(regs, n.src);
-            if (v == .Instance) {
-                switch (try host.callMember(allocator, &v, "not", &.{})) {
-                    .ok => |rv| fusedWrite(allocator, regs, n.dst, rv, reclaim, false),
-                    .err => |e| return fusedRaise(e),
-                }
-                return;
-            }
             const b = switch (v) {
                 .Bool => |bv| !bv,
                 else => return fusedRaise(.{ .Type = "Not on non-bool" }),
@@ -751,7 +688,7 @@ fn fusedInst(
                 var arg_list: std.ArrayList(Value) = .empty;
                 try arg_list.appendSlice(allocator, argv[0..cs.n_args]);
                 if (runtime.reclaimEnabled()) for (arg_list.items) |v| v.retain();
-                break :blk try evalWithCapturesChained(H, allocator, module, null, callee, arg_list, .empty, &.{}, null, host);
+                break :blk try evalClosure(H, allocator, module, null, callee, arg_list, .empty, null, host);
             };
             switch (r) {
                 .ok => |v| fusedWrite(allocator, regs, cs.dst, v, reclaim, false),

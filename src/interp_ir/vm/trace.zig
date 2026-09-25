@@ -2,7 +2,6 @@
 //!
 //! `KLIO_TRACE_RESOLVE=<comma list of simple fn names, or *>`: a `[RESOLVE]` line per
 //! dispatch decision.
-//! `KLIO_TRACE_CHAIN=1`: the enclosing-`this` chain after a traced member dispatch.
 //! `KLIO_TRACE_INVARIANTS=1`: an `[INVARIANT]` line per violation; the checks report,
 //! never repair.
 //! `KLIO_TRACE_PATH=1`: a `[PATH]` record per terminal dispatch, read by
@@ -73,35 +72,6 @@ pub fn enabled(name: []const u8) bool {
 /// Emit one trace line (callers gate with `enabled`).
 pub fn emit(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("[RESOLVE] " ++ fmt ++ "\n", args);
-}
-
-var chain_inited = std.atomic.Value(bool).init(false);
-var chain_done = std.atomic.Value(bool).init(false);
-var chain_on: bool = false;
-
-fn ensureChain() void {
-    if (chain_done.load(.acquire)) return;
-    if (chain_inited.swap(true, .acquire)) {
-        while (!chain_done.load(.acquire)) std.atomic.spinLoopHint();
-        return;
-    }
-    var cbuf: [64]u8 = undefined;
-    chain_on = readEnv("KLIO_TRACE_CHAIN", &cbuf) != null;
-    chain_done.store(true, .release);
-}
-
-/// With `KLIO_TRACE_CHAIN=1`, print the enclosing-`this` chain, closest receiver first.
-pub fn maybeDumpChain(allocator: std.mem.Allocator, chain: []const Value) void {
-    ensureChain();
-    if (!chain_on) return;
-    std.debug.print("[RESOLVE]   chain=[", .{});
-    for (chain, 0..) |v, i| {
-        if (i != 0) std.debug.print(", ", .{});
-        const label = recvLabel(allocator, v) catch "?";
-        defer if (labelOwned(v)) allocator.free(label);
-        std.debug.print("{s}", .{label});
-    }
-    std.debug.print("]\n", .{});
 }
 
 /// Short receiver-kind label: an instance's class name, the variant tag for callable kinds,

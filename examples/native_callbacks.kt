@@ -25,9 +25,9 @@ class Version(val major: Int, val minor: Int) : Comparable<Version> {
     override fun toString(): String = "v$major.$minor"
 }
 
-class Pairs(private val keys: List<String>) : AbstractMap<String, Int>() {
+class Pairs(private val names: List<String>) : AbstractMap<String, Int>() {
     override val entries: Set<Map.Entry<String, Int>>
-        get() = keys.mapIndexed { i, k -> entry(k, i) }.toSet()
+        get() = names.mapIndexed { i, k -> entry(k, i) }.toSet()
 
     private fun entry(k: String, v: Int): Map.Entry<String, Int> = object : Map.Entry<String, Int> {
         override val key: String = k

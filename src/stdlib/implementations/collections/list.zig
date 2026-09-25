@@ -692,19 +692,21 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeSetH(ctx.host, ctx.out, a, items, true));
 }
 
-pub fn withIndexImpl(ctx: *CallCtx, items: []const Value) Error!Value {
+/// Each of `items` with its index, as the `IndexedValue`s `withIndex` yields,
+/// built by the class's constructor.
+pub fn withIndexImpl(ctx: *CallCtx, items: []const Value) Error!EvalResult {
     const a = ctx.allocator;
     var indexed: std.ArrayList(Value) = .empty;
     for (items, 0..) |v, i| {
-        v.retain();
-        const id = ctx.host.allocInstanceId();
-        const fields = [_]InstanceData.Field{
-            .{ .name = "index", .value = Value.newInt(@intCast(i)) },
-            .{ .name = "value", .value = v },
-        };
-        try indexed.append(a, try ctx.host.newSynthInstance("kotlin.collections.IndexedValue", id, &fields));
+        const args = [_]Value{ Value.newInt(@intCast(i)), v };
+        const r = (try ctx.host.constructWellKnown(.indexed_value, &args, ctx.out)) orelse
+            return typeErr("withIndex: the tables declare no kotlin.collections.IndexedValue");
+        switch (r) {
+            .ok => |iv| try indexed.append(a, iv),
+            .err => return r,
+        }
     }
-    return makeListFromArrayList(a, indexed, false);
+    return ok(try makeListFromArrayList(a, indexed, false));
 }
 
 pub fn coll_list_with_index(ctx: *CallCtx) Error!EvalResult {
@@ -713,7 +715,7 @@ pub fn coll_list_with_index(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try withIndexImpl(ctx, try snapshotItems(a, it)));
+    return withIndexImpl(ctx, try snapshotItems(a, it));
 }
 pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -723,7 +725,7 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    return ok(try withIndexImpl(ctx, items));
+    return withIndexImpl(ctx, items);
 }
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {

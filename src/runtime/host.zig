@@ -81,6 +81,9 @@ pub const WellKnown = enum(u8) {
     handle_exception,
     /// `Sequence.iterator()`.
     sequence_iterator,
+    /// `FunctionN.invoke(...)`, of the arity the call passes: a class
+    /// implementing a function type, called as the function.
+    invoke,
 
     /// The member's name, for a host that answers by name.
     pub fn memberName(m: WellKnown) []const u8 {
@@ -112,6 +115,7 @@ pub const WellKnown = enum(u8) {
             .next_int => "nextInt",
             .context_get => "get",
             .handle_exception => "handleException",
+            .invoke => "invoke",
         };
     }
 
@@ -167,6 +171,47 @@ pub const WellKnownObject = enum(u8) {
     }
 };
 
+/// A class of the base a native builds an instance of through its primary
+/// constructor, named by its declaration.
+pub const WellKnownClass = enum(u8) {
+    /// `IndexedValue(index, value)`, the elements `withIndex` yields.
+    indexed_value,
+
+    /// The class's FQN, as sema spells a nested class's.
+    pub fn fqn(c: WellKnownClass) []const u8 {
+        return switch (c) {
+            .indexed_value => "kotlin.collections.IndexedValue",
+        };
+    }
+};
+
+/// A value the host keeps its own state in and presents as an instance of
+/// an abstract base type, whose members the host implements. Its class is
+/// not in the tables, so a call on it reaches the host's implementation of
+/// the member; the declaration it stands for only names it for display.
+pub const HostInstance = enum(u8) {
+    /// The receiver of a `sequence { }` or `iterator { }` block.
+    sequence_scope,
+    /// What `groupingBy` returns.
+    grouping,
+    /// A match's `groups`.
+    match_group_collection,
+    /// A reified type and one of its arguments.
+    ktype,
+    ktype_projection,
+
+    /// The declaration the value stands for.
+    pub fn fqn(k: HostInstance) []const u8 {
+        return switch (k) {
+            .sequence_scope => "kotlin.sequences.SequenceScope",
+            .grouping => "kotlin.collections.Grouping",
+            .match_group_collection => "kotlin.text.MatchNamedGroupCollection",
+            .ktype => "kotlin.reflect.KType",
+            .ktype_projection => "kotlin.reflect.KTypeProjection",
+        };
+    }
+};
+
 /// Optional slots fall back to the wrapper methods below.
 pub const IntrinsicHost = struct {
     ctx: *anyopaque,
@@ -184,7 +229,11 @@ pub const IntrinsicHost = struct {
         /// declare it.
         well_known_object: ?*const fn (ctx: *anyopaque, object: WellKnownObject) std.mem.Allocator.Error!?Value = null,
         alloc_instance_id: ?*const fn (ctx: *anyopaque) u64 = null,
-        new_synth_instance: ?*const fn (ctx: *anyopaque, class_fqn: []const u8, identity: u64, fields: []const InstanceData.Field) std.mem.Allocator.Error!Value = null,
+        /// A host value presenting as `kind`, holding `fields`.
+        new_host_instance: ?*const fn (ctx: *anyopaque, kind: HostInstance, identity: u64, fields: []const InstanceData.Field) std.mem.Allocator.Error!Value = null,
+        /// A new `class` built by its primary constructor over `args`; null
+        /// when the host's tables do not declare it.
+        construct_well_known: ?*const fn (ctx: *anyopaque, class: WellKnownClass, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
         run_blocking: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
         coroutine_run_root: ?*const fn (ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
         /// Answers the block's value, or `Value.CoroutineSuspended` when the
@@ -263,9 +312,16 @@ pub const IntrinsicHost = struct {
         return 0;
     }
 
-    pub fn newSynthInstance(self: IntrinsicHost, class_fqn: []const u8, identity: u64, fields: []const InstanceData.Field) !Value {
-        if (self.vtable.new_synth_instance) |f| return f(self.ctx, class_fqn, identity, fields);
+    pub fn newHostInstance(self: IntrinsicHost, kind: HostInstance, identity: u64, fields: []const InstanceData.Field) !Value {
+        if (self.vtable.new_host_instance) |f| return f(self.ctx, kind, identity, fields);
         return .Unit;
+    }
+
+    /// A new `class` over `args` through its primary constructor; null
+    /// when the host's tables do not declare it.
+    pub fn constructWellKnown(self: IntrinsicHost, class: WellKnownClass, args: []const Value, out: Output) !?EvalResult {
+        if (self.vtable.construct_well_known) |f| return f(self.ctx, class, args, out);
+        return null;
     }
 
     pub fn runBlocking(self: IntrinsicHost, block: *const Value, scope: *const Value, out: Output) !EvalResult {

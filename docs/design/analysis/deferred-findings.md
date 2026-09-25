@@ -104,26 +104,21 @@ carrier on the run path, deferred under the latency gate.
 ### 7. Lenient extension-dispatch residue
 
 The lenient pass after the strict receiver-proven walk remains the designed
-residue of the strict-then-lenient call policy, now pinned by an on-demand
-detector: `python3 scripts/or_audit_sweep.py` runs examples +
-coroutine_smoke + parity_corpus (583 programs) under `KLIO_OR_AUDIT=1`,
-dedups identical runtime `arm=member_lenient` lines per program, and fails
-if any lenient name falls outside the documented residue set (`{dispatch}`).
-Current baseline: 10 deduped lenient lines across 10 programs (38 raw
-occurrences), all `name=dispatch` — the kotlinx coroutine-internal
-`dispatch` member-extensions whose erased receiver the strict prover cannot
-model. The sweep is deliberately not wired into `zig build test`; a new
-name in the lenient arm trips it and should be triaged as a prover gap,
-not widened into the residue set. The readout in
-`execution-architecture.md` records the same baseline and counting method.
+residue of the strict-then-lenient call policy. Its last measured baseline
+was 10 lenient dispatches across 10 programs, all `name=dispatch`: the
+kotlinx coroutine-internal `dispatch` member-extensions whose erased
+receiver the strict prover cannot model. The detector that measured it read
+`KLIO_OR_AUDIT` lines, which the interpreter stopped emitting when the
+by-name instructions left the IR, so it was removed and the residue is no
+longer swept.
 
 The lenient arm is load-bearing and must not be deleted. Two attempts to
 delete it (after teaching the strict prover to prove the corpus-visible
 `dispatch` receivers) both regressed the ktor client: the arm also serves
 `async`/`proceed` (and, on the response exception path,
 `unwrapCancellationException`) whose receivers the strict prover does not
-fully model, and the `or_audit_sweep` corpus does not exercise the
-live-server ktor path, so a sweep reading of an empty residue is not proof
+fully model, and the audit corpus did not exercise the
+live-server ktor path, so a sweep reading of an empty residue was not proof
 the arm is unused. Deleting it caused spurious dispatch misses that
 cascaded into the exception branch. Closing this properly means completing
 the strict prover to cover those receiver classes AND enumerating consumers

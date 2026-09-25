@@ -96,7 +96,8 @@ the three loop calls on `xs`.
 
 Not reported: `this`/`super` expressions; unresolved references (counted on
 stderr); annotations and their arguments; implicit supertype and `this()`
-delegation with no syntax; the `componentN` call of a `_` entry; the `not` that
+delegation with no syntax; the `componentN` call of a `_` entry (a
+backtick-escaped `` `_` `` is a name and is reported); the `not` that
 `!in` adds; `x == null` and `===`; compiler temporaries (`<iterator>`,
 `<destruct>`, `x$delegate`); the `thisRef`/`::p` arguments of delegate calls;
 implicit context arguments; bodies the compiler generates (data class members,
@@ -133,8 +134,9 @@ declaration they come from, so an inherited member names the class that declares
   (`local:<anonymous>@<offset>` for `object :`), so their members are
   `local:Loc@120.twice||`.
 - Objects and companions used as values, including as an explicit receiver
-  (`Obj.f()`, `Outer.g()` through the companion): `object:<ClassId>`, kind `read`,
-  on the qualifier's name.
+  (`Obj.f()`, `Outer.g()` through the companion, `Alias.f()` through a typealias
+  of either): `object:<ClassId>` of the object, kind `read`, on the qualifier's
+  name.
 - Enum entries: `enum:<ClassId>.<ENTRY>`. Backing fields: `field:<property>`.
   SAM constructors (`Runnable { }`): `sam:<interface ClassId>`.
 - `==`: FIR does not bind `==` to a member, so the oracle reports the `equals(Any?)`
@@ -151,8 +153,9 @@ JDK class with no Kotlin name is printed under the receiver's class
 
 The oracle reflects the JVM stdlib, which is not the common one KLIO implements:
 `println(1)` resolves to the JVM-only overload `kotlin/io/println||kotlin/Int`,
-and Java members keep Java signatures (`StringBuilder.append(String!)`).
-`--exclude-target` on the diff tool drops such known differences.
+and Java members keep Java signatures (`StringBuilder.append(String!)`). The diff
+tool's `jvm` rules account for these (see "Normalizations" below);
+`--exclude-target` drops other known differences.
 
 ### Receivers
 
@@ -184,6 +187,25 @@ scripts/sema-oracle-compare.sh -o out examples            # oracle + klio sema -
 scripts/sema-oracle-compare.sh --oracle out/oracle.tsv -o out examples   # reuse the oracle run
 scripts/sema-oracle-triage.py out/oracle.tsv out/sema.tsv out/sema.unresolved.tsv
 ```
+
+The corpus check is the first line with the local packs, run from the checkout
+root (about a minute):
+
+```sh
+KLIO_HOME=$PWD/.klio-local scripts/sema-oracle-compare.sh -o out -j 4 --dir-programs examples
+```
+
+`--dir-programs` compiles each example directory as one program on both sides
+(`sema-oracle.sh --together`). A program whose imports outside `kotlin.*` are
+all `kotlinx.coroutines` compiles against the kotlinx-coroutines-core jar the
+pinned kotlinc ships in its `lib` directory (version 1.8.0 in kotlinc 2.4.20;
+the klio pack is 1.11.0). No other library is on the oracle's classpath.
+
+It ends with `compared N files: M sites match, A normalized, B Kotlin-vs-JVM
+naming, D differ`; the corpus agrees with kotlinc when `D` is 0, and the diff
+tool exits 0 exactly then. The files kotlinc cannot compile are listed in
+`out/oracle.tsv.fail` and left out: those that import any other pack or
+`kotlinx.coroutines.test`, and programs kotlinc rejects.
 
 The compare script gives both tools the same sorted file list, leaves out the
 files kotlinc could not compile and the programs sema did not finish, and keeps
@@ -242,6 +264,34 @@ kotlinc's form needs: the anchor of an `invoke` whose callee is a call or a
 parenthesized expression (`g()(x)`, `(f)(x)`: kotlinc anchors the callee
 expression, sema its name), and nested prefix operators (`!!p`), which the parser
 spans alike.
+
+### Normalizations
+
+`scripts/sema-oracle-diff.py` (and the triage script) count a difference one of
+its rules accounts for under the rule, not as a difference. Each rule is a
+function with a comment saying what the two sides do; `--raw` turns them off.
+Two classes:
+
+- `normalized`: sema and kotlinc agree on what runs and model or anchor it
+  differently. Arithmetic on integer literals, which sema folds to a constant
+  (`1 + 2`); an annotation class's value `equals`/`hashCode`/`toString`, which
+  klio declares on the class and FIR names on `Any`; the object qualifier of a
+  nested classifier (`Obj` in `Obj.Nested`), which sema does not record; a type
+  alias of an inner class, whose outer instance FIR passes as the alias
+  constructor's extension receiver and sema as the inner constructor's
+  dispatch receiver; the parentheses around an `invoke` callee (`(f)(x)`); a
+  `companion { }` block, which klio models as a companion object; `suspend { }`,
+  which sema resolves to the stdlib's `suspend(block)`; and a collection
+  literal in an annotation, which sema resolves to its array factory.
+- `jvm`: Kotlin-vs-JVM naming. The JVM-only `print`/`println` overloads; Java
+  classes and signatures (`java/lang/Thread.join`, which klio provides as
+  `klio/Thread.join`, a Java static that klio declares on the companion, Java
+  parameter and platform types); members a JVM class declares where the common
+  stdlib does not (`StringBuilder.toString`, `StringBuilder.setCharAt` and
+  `Throwable.stackTrace`, which klio provides as extensions, and
+  `AbstractMutableList`'s members, which FIR names by the Kotlin interface
+  `java.util.AbstractList` maps to); and the companion qualifier of a
+  `klio.*` class's static.
 
 ## Layout
 

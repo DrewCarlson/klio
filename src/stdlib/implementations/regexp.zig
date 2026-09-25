@@ -1975,7 +1975,7 @@ pub fn match_result_groups(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const fields = [_]InstanceData.Field{
         .{ .name = "__mgc", .value = .{ .Match = m.clone() } },
     };
-    return ok(try ctx.host.newSynthInstance("kotlin.text.MatchNamedGroupCollection", id, &fields));
+    return ok(try ctx.host.newHostInstance(.match_group_collection, id, &fields));
 }
 
 fn matchGroupValue(a: std.mem.Allocator, gd: ?MatchGroupData) std.mem.Allocator.Error!Value {

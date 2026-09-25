@@ -571,11 +571,11 @@ test "two references to one target are equal, a capturing lambda equals only its
     try testing.expect(res == .ok);
     const items = try res.ok.Array.snapshot(a);
     var host = vm.makeHost(cap.output());
-    try testing.expect(try host.closureRefEquals(a, &items[0], &items[1]));
-    try testing.expect(!try host.closureRefEquals(a, &items[0], &items[2]));
-    try testing.expect(!try host.closureRefEquals(a, &items[3], &items[4]));
-    try testing.expect(try host.closureRefEquals(a, &items[3], &items[3]));
-    try testing.expect(try host.closureRefEquals(a, &items[5], &items[6]));
+    try testing.expect(try host.deepValueEquals(a, &items[0], &items[1]));
+    try testing.expect(!try host.deepValueEquals(a, &items[0], &items[2]));
+    try testing.expect(!try host.deepValueEquals(a, &items[3], &items[4]));
+    try testing.expect(try host.deepValueEquals(a, &items[3], &items[3]));
+    try testing.expect(try host.deepValueEquals(a, &items[5], &items[6]));
 }
 
 test "a host map entry equals an entry instance by the key and value its getters answer" {
@@ -635,14 +635,15 @@ test "a host map entry equals an entry instance by the key and value its getters
         .{ .v = other_value, .want = false },
         .{ .v = not_entry, .want = false },
     };
+    const any_equals = interp_ir.hostMemberFn("kotlin.Any.equals").?;
     for (answers) |c| {
-        const res = try host.callMember(a, &host_entry, "equals", &.{c.v});
+        const res = try any_equals(&host, a, &.{ host_entry, c.v });
         try testing.expect(res == .ok and res.ok == .Bool);
         try testing.expectEqual(c.want, res.ok.Bool);
     }
 }
 
-test "a well-known member runs the instance's own implementation, and names a member the class has" {
+test "a well-known member runs the instance's own implementation, and none the class lacks" {
     var mem = hand.TestMemory.init();
     defer mem.deinit();
     const a = mem.allocator();
@@ -678,10 +679,11 @@ test "a well-known member runs the instance's own implementation, and names a me
     // A host value is the native's to serve.
     const n: Value = .{ .Int = 3 };
     try testing.expect((try host.callWellKnown(a, &n, .to_string, &.{})) == null);
-    // `get` by name is whichever `get` the class implements.
-    const g = try host.callMember(a, &inst, "get", &.{.{ .Int = 0 }});
+    // `Map.get` is the class's own; it implements no `List.get`.
+    const g = (try host.callWellKnown(a, &inst, .map_get, &.{.{ .Int = 0 }})).?;
     try testing.expect(g == .ok);
     try testing.expectEqual(@as(i32, 7), g.ok.Int);
+    try testing.expect((try host.callWellKnown(a, &inst, .list_get, &.{.{ .Int = 0 }})) == null);
 }
 
 test "a host value whose class declares a well-known member with a Kotlin body runs the VM's member of the root" {
@@ -875,8 +877,6 @@ test "a body lowered from sema runs fused or framed, off the leaf tier" {
     for (h.m.funcs.items) |*f| {
         // A chain of static calls fuses.
         try testing.expectEqual(@as(u8, 1), f.fuse_state);
-        try testing.expectEqual(@as(u8, 1), f.leaf_hopeless);
-        try testing.expectEqual(@as(u8, 1), f.host_route);
     }
 }
 
@@ -896,4 +896,165 @@ test "an uncaught throw fails the run with the throwable's class" {
     try testing.expect(std.mem.find(u8, run.res.err.Eval, "IllegalStateException") != null);
     // The slot's display name labels the field the message is in.
     try testing.expect(std.mem.find(u8, run.res.err.Eval, "bad state") != null);
+}
+
+/// A VM over `h`'s tables, for a test that calls the host directly.
+const HostRig = struct {
+    vm: interp_ir.Vm,
+    host: interp_ir.VmHost,
+    view: interp_ir.VmIntrinsicHost,
+    cap: runtime.CaptureOutput,
+
+    fn init(self: *HostRig, a: Allocator, h: *Hand) !void {
+        const module_ref = try runtime.ObjRef(ir.Module).init(a, h.m.*);
+        self.vm = try interp_ir.Vm.new(a, module_ref);
+        try self.vm.prepareResolved();
+        self.cap = runtime.CaptureOutput.init(a);
+        self.host = self.vm.makeHost(self.cap.output());
+        self.view = interp_ir.VmIntrinsicHost.borrowedFrom(&self.host);
+    }
+
+    fn deinit(self: *HostRig) void {
+        self.vm.deinit();
+    }
+
+    fn natives(self: *HostRig) runtime.IntrinsicHost {
+        return self.view.intrinsicHost();
+    }
+
+    fn module(self: *HostRig) *const ir.Module {
+        return self.host.module.asPtrConst();
+    }
+};
+
+test "a native invokes an instance of a class implementing a function type through its invoke, never a member named invoke" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const c100 = try h.constant(.{ .Int = 100 });
+    const invoke0 = try h.func("Function0.invoke", 1);
+    const invoke1 = try h.func("Function1.invoke", 2);
+    const adder_invoke = try h.func("Adder.invoke", 2);
+    try h.body(adder_invoke, &.{.{ .insts = &.{ param(0, 1), konst(1, c100), bin(2, .Add, 0, 1) }, .term = ret(2) }});
+    const function1 = try h.class("Function1", .{});
+    const adder = try h.class("Adder", .{ .supers = &.{function1} });
+    try h.dispatch(adder, invoke1, adder_invoke);
+    // A class declaring a function called `invoke` but no function type.
+    const plain = try h.class("Plain", .{});
+    const plain_invoke = try h.func("Plain.invoke", 2);
+    try h.body(plain_invoke, &.{.{ .insts = &.{param(0, 1)}, .term = ret(0) }});
+    h.r.host_class.invoke_slot = &.{ slot(invoke0), slot(invoke1) };
+    try h.finish();
+
+    var rig: HostRig = undefined;
+    try rig.init(a, &h);
+    defer rig.deinit();
+    const r = rig.module().resolved.?;
+    const fn_inst = try ir.resolved.instantiate(a, r, adder, 1);
+    const got = try rig.natives().invokeCallable(&fn_inst, &.{.{ .Int = 5 }}, rig.cap.output());
+    try testing.expect(got == .ok);
+    try testing.expectEqual(@as(i32, 105), got.ok.Int);
+    const plain_inst = try ir.resolved.instantiate(a, r, plain, 2);
+    const refused = try rig.natives().invokeCallable(&plain_inst, &.{.{ .Int = 5 }}, rig.cap.output());
+    try expectNotCallable(refused, "Vm::invoke_callable on");
+}
+
+/// A callable the host refused as not callable, rather than a call it tried.
+fn expectNotCallable(r: runtime.EvalResult, what: []const u8) !void {
+    try testing.expect(r == .err and r.err == .Unimplemented);
+    try testing.expect(std.mem.startsWith(u8, r.err.Unimplemented, what));
+}
+
+test "a native invoking a host comparator runs Comparator.compare through its slot" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const compare = try h.func("Comparator.compare", 3);
+    const comparator = try h.class("Comparator", .{});
+    h.r.host_class.by_tag[@intFromEnum(std.meta.Tag(Value).Comparator)] = comparator;
+    const slots = try a.alloc(ir.NativeId, 16);
+    @memset(slots, .none);
+    slots[compare.int()] = try hostMember(&h, "kotlin.Comparator.compare");
+    h.r.host_slot = slots;
+    h.r.well_known.set(.compare, slot(compare));
+    try h.finish();
+
+    var rig: HostRig = undefined;
+    try rig.init(a, &h);
+    defer rig.deinit();
+    const steps = try a.alloc(runtime.ComparatorStep, 0);
+    const reverse = try Value.newComparator(a, .{ .steps = try runtime.ObjRef([]runtime.ComparatorStep).init(a, steps), .descending = true });
+    const got = try rig.natives().invokeCallable(&reverse, &.{ .{ .Int = 1 }, .{ .Int = 2 } }, rig.cap.output());
+    try testing.expect(got == .ok);
+    try testing.expect(got.ok.asI64().? > 0);
+}
+
+test "a class value is constructed by the class its def names by id, never by its name" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    _ = try h.class("Box", .{});
+    try h.finish();
+
+    var rig: HostRig = undefined;
+    try rig.init(a, &h);
+    defer rig.deinit();
+    // A def naming `Box` but no class in the tables.
+    const stray = try runtime.ClassDef.minimal(a, "Box", "Box", std.math.maxInt(u32));
+    const class_value: Value = .{ .Class = stray };
+    try expectNotCallable(try rig.natives().invokeCallable(&class_value, &.{}, rig.cap.output()), "Vm::invoke_callable on");
+    const recv: Value = .{ .Int = 65 };
+    try expectNotCallable(try rig.natives().invokeCallableWithThis(&class_value, &.{}, &recv, rig.cap.output()), "Vm::invoke_callable_with_this on");
+}
+
+test "a native builds a well-known class through its primary constructor" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const iv = try h.class("IndexedValue", .{ .seeds = &.{ .int, .null_ref }, .slot_names = &.{ "index", "value" } });
+    const ctor = try h.func("IndexedValue.<init>", 3);
+    try h.body(ctor, &.{.{ .insts = &.{ param(0, 0), param(1, 1), param(2, 2), hand.setField(0, 0, 1), hand.setField(0, 1, 2) }, .term = ret(0) }});
+    try h.finish();
+
+    var rig: HostRig = undefined;
+    try rig.init(a, &h);
+    defer rig.deinit();
+    // Before the tables name the class, a native has nothing to build.
+    try testing.expect((try rig.natives().constructWellKnown(.indexed_value, &.{ .{ .Int = 3 }, .{ .Int = 9 } }, rig.cap.output())) == null);
+    h.r.well_known_classes.set(.indexed_value, .{ .class = iv, .ctor = ctor });
+    const got = (try rig.natives().constructWellKnown(.indexed_value, &.{ .{ .Int = 3 }, .{ .Int = 9 } }, rig.cap.output())).?;
+    try testing.expect(got == .ok and got.ok == .Instance);
+    try testing.expectEqual(iv, ir.resolved.classOf(h.r, &got.ok).?);
+    const fields = got.ok.Instance.asPtrConst().fields.items;
+    try testing.expectEqual(@as(i32, 3), fields[0].value.Int);
+    try testing.expectEqual(@as(i32, 9), fields[1].value.Int);
+}
+
+test "a host instance holds the native's state and has no class in the tables" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    // A class of the name the host instance stands for, which it must not become.
+    _ = try h.class("SequenceScope", .{});
+    try h.finish();
+
+    var rig: HostRig = undefined;
+    try rig.init(a, &h);
+    defer rig.deinit();
+    const fields = [_]runtime.InstanceData.Field{.{ .name = "__seq_has_value", .value = .{ .Bool = false } }};
+    const scope = try rig.natives().newHostInstance(.sequence_scope, 7, &fields);
+    try testing.expect(scope == .Instance);
+    try testing.expect(ir.resolved.classOf(h.r, &scope) == null);
+    const g = scope.Instance.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(u64, 7), g.get().identity);
+    try testing.expect(g.get().get("__seq_has_value").?.Bool == false);
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    try testing.expectEqualStrings("kotlin.sequences.SequenceScope", cg.get().fqn);
 }

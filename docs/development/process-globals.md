@@ -29,7 +29,7 @@ interchangeable — pick by what the state is keyed on.
 
 2. **Generation stamping.** Entries carry a generation counter; a bump
    invalidates every entry at once, including on parked worker threads a
-   per-thread clear could never reach. `host_call_member.dispatch_cache_gen`
+   per-thread clear could never reach. `host_util.dispatch_cache_gen`
    with `bumpDispatchCacheGen()` is the reference implementation.
    Use when: the cache is thread-local or too hot to walk, and a stale hit
    would be silently wrong rather than merely stale.
@@ -69,8 +69,6 @@ Notable classifications:
 
 | state | defense |
 |---|---|
-| `host_instances.shared_anon_module` / `shared_anon_arena` | boundary reset (and the clone is dropped at every boundary — its identity gate compares run-module CELL ADDRESSES, which an arena-reusing driver reissues) |
-| `host_instances.anon_site_names` / `anon_site_thunks` | boundary reset |
 | `ir.bc.cache` | boundary reset (entries freed, not just cleared) |
 | `inline_state.expr_body_members` | reset in the build-start cluster (AST pointers into one build's arena) |
 | the thread-local dispatch caches, name-identity slots, perm slots | generation stamping |
@@ -81,13 +79,6 @@ Notable classifications:
 | `value.intrinsic_intern` | immortal, keys duped into permanent storage |
 | `stdlib.known_packages`, `threads.hooks` / `names` | immortal registries |
 | `image.decode_stats`, `eval.call_stats` / `probe_stats` | diagnostics; cumulative across programs by design |
-
-Open, minor: `host_call_member.lenient_warned` is a warn-once set keyed by
-id and is not reset per program, so the second program in a process can
-lose a leniency warning the first already emitted. Cosmetic — it suppresses
-a diagnostic, never changes a result — but it is the one piece of
-per-program state deliberately left shared, and it is recorded here rather
-than left to be rediscovered.
 
 ## The contract for new state
 

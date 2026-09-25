@@ -154,6 +154,9 @@ pub const CallRec = struct {
     /// The call passes the composer: its callee is `@Composable`, or it is
     /// `invoke` on a value of a composable function type.
     composable: bool = false,
+    /// A `when` pattern's `equals`: the subject's type where the pattern
+    /// tests it, the earlier branches' smart casts applied.
+    subject_ty: TypeId = .none,
 };
 
 /// Where one parameter's value comes from.

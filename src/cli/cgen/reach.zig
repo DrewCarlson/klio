@@ -236,8 +236,7 @@ pub const Reach = struct {
         const f = self.m.funcById(id) orelse return;
         for (f.blocks) |*b| {
             for (b.h().catches) |h| {
-                if (h.class_raw == ir.NO_CLASS) continue;
-                const c = ClassId.from(h.class_raw);
+                const c = h.class;
                 try self.addTested(c);
                 for (self.caught.items) |x| {
                     if (x == c) break;

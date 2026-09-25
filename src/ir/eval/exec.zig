@@ -18,9 +18,8 @@ const Module = ir.Module;
 const Reg = ir.Reg;
 const Terminator = ir.Terminator;
 
-const exec_call = @import("../exec_call.zig");
 
-const envVarSet = exec_call.envVarSet;
+const envVarSet = ev_values.envVarSet;
 
 const parent = @import("../eval.zig");
 const ev_diag = @import("diag.zig");
@@ -45,7 +44,6 @@ const Step = ev_flow.Step;
 const TryFrame = ev_snapshot.TryFrame;
 const attachStackTrace = ev_diag.attachStackTrace;
 const cmgTraceWant = ev_flow.cmgTraceWant;
-const coerceIntArgsToLong = ev_enter.coerceIntArgsToLong;
 const constToValue = ev_values.constToValue;
 const currentFrameFunc = ev_state.currentFrameFunc;
 const displayThrow = ev_state.displayThrow;
@@ -63,7 +61,6 @@ const regsAlloc = ev_state.regsAlloc;
 const remTruncI32 = ev_values.remTruncI32;
 const remTruncI64 = ev_values.remTruncI64;
 const spinDumpMaybe = ev_diag.spinDumpMaybe;
-const truncChainTo = ev_flow.truncChainTo;
 const typeRefName = ev_loop.typeRefName;
 const unwindTerminal = ev_enter.unwindTerminal;
 const valueTruthy = ev_values.valueTruthy;
@@ -96,16 +93,9 @@ pub fn runFrameExec(
     };
     // Resolved once, and re-bound to the RUNNING thread: a frame captures `tls` when built,
     // but a suspended coroutine resumes on whatever thread the dispatcher hands it, and the
-    // free-list, receiver chain and frame chain behind it are per-thread and unsynchronized.
-    // The chain activation re-homes with it, so deactivate restores this thread's chain.
+    // free-list and frame chain behind it are per-thread and unsynchronized.
     const here = ev_state.evtlsPtr();
-    if (frame.tls != here) {
-        frame.tls = here;
-        frame.prev_chain = here.active_chain;
-        frame.prev_chain_base = here.active_chain_base;
-        here.active_chain = &frame.enclosing_this;
-        here.active_chain_base = frame.enclosing_this.items.len;
-    }
+    if (frame.tls != here) frame.tls = here;
     const ftls: *EvalTls = frame.tls;
     var cur = cur_in;
     var resume_idx = resume_idx_in;
@@ -173,7 +163,6 @@ pub fn runFrameExec(
         if (resume_idx == 0 and (has_catches or finally != null)) {
             try try_stack.append(allocator, .{
                 .body = cur,
-                .chain_len = frame.enclosing_this.items.len,
                 .catches = block.h().catches,
                 .finally_entry = finally,
                 .finally_done = finally_done,
@@ -459,14 +448,13 @@ pub fn runFrameExec(
                 if (tf.finally_entry) |fin0| {
                     if (std.meta.eql(fin0, cur)) continue;
                 }
-                if (findCatch(H, host, frame.module, &exc, tf.catches)) |h| {
+                if (findCatch(frame.module, &exc, tf.catches)) |h| {
                     // A catch belonging to a try nested inside the active finally handles the new throw
                     // without replacing the exception or return that caused the finally. Once the scan
                     // crosses the saved depth the throw is escaping, and Kotlin replaces the prior flow.
                     if (pending_depth) |depth| {
                         if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
                     }
-                    truncChainTo(frame, tf.chain_len);
                     try frame.write(h.exception_reg, try caughtValue(H, host, allocator, exc));
                     cur = h.handler;
                     routed = true;
@@ -475,7 +463,6 @@ pub fn runFrameExec(
                     // An uncaught throw entering a nested finally supersedes the pending control flow.
                     frame.pending_finally.release(allocator);
                     const key = tf.finally_done orelse fin;
-                    truncChainTo(frame, tf.chain_len);
                     frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                     cur = fin;
                     routed = true;
@@ -545,15 +532,13 @@ pub fn runFrameExec(
                 if (try_stack.items.len > pr.depth) try_stack.shrinkRetainingCapacity(pr.depth);
                 var routed = false;
                 while (try_stack.pop()) |tf| {
-                    if (findCatch(H, host, frame.module, &exc, tf.catches)) |h| {
-                        truncChainTo(frame, tf.chain_len);
+                    if (findCatch(frame.module, &exc, tf.catches)) |h| {
                     try frame.write(h.exception_reg, try caughtValue(H, host, allocator, exc));
                         cur = h.handler;
                         routed = true;
                         break;
                     } else if (tf.finally_entry) |fin2| {
                         const key = tf.finally_done orelse fin2;
-                        truncChainTo(frame, tf.chain_len);
                     frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin2;
                         routed = true;
@@ -649,11 +634,10 @@ pub fn runFrameExec(
                     if (tf.finally_entry) |fin0| {
                         if (std.meta.eql(fin0, cur)) continue;
                     }
-                    if (findCatch(H, host, frame.module, &exc, tf.catches)) |h| {
+                    if (findCatch(frame.module, &exc, tf.catches)) |h| {
                         if (pending_depth) |depth| {
                             if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
                         }
-                        truncChainTo(frame, tf.chain_len);
                     try frame.write(h.exception_reg, try caughtValue(H, host, allocator, exc));
                         cur = h.handler;
                         routed = true;
@@ -661,7 +645,6 @@ pub fn runFrameExec(
                     } else if (tf.finally_entry) |fin| {
                         frame.pending_finally.release(allocator);
                         const key = tf.finally_done orelse fin;
-                        truncChainTo(frame, tf.chain_len);
                     frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin;
                         routed = true;
@@ -721,15 +704,11 @@ fn caughtValue(comptime H: type, host: *H, allocator: Allocator, exc: Value) All
     return exc;
 }
 
-fn findCatch(comptime H: type, host: *H, module: *const Module, exc: *const Value, catches: []const ir.CatchHandler) ?ir.CatchHandler {
+fn findCatch(module: *const Module, exc: *const Value, catches: []const ir.CatchHandler) ?ir.CatchHandler {
+    const r = module.resolved orelse return null;
+    const have = ir.resolved.classOf(r, exc) orelse return null;
     for (catches) |h| {
-        if (h.class_raw != ir.NO_CLASS) {
-            const r = module.resolved orelse continue;
-            const have = ir.resolved.classOf(r, exc) orelse continue;
-            if (ir.resolved.isA(module, have, ClassId.from(h.class_raw))) return h;
-            continue;
-        }
-        if (host.instanceOf(exc, typeRefName(h.type_name))) return h;
+        if (ir.resolved.isA(module, have, h.class)) return h;
     }
     return null;
 }
@@ -826,12 +805,8 @@ pub inline fn binFast(frame: *Frame, op: BinOp, dst: Reg, lhs: Reg, rhs: Reg, al
     return true;
 }
 
-/// The scalar UnOp core, mirroring `binFast`. Declines whenever an enclosing
-/// instance is in scope: there a member-extension operator can shadow a
-/// scalar's builtin `inc`/`dec`/`unaryMinus`, which only the arm resolves.
+/// The scalar UnOp core, mirroring `binFast`.
 pub inline fn unopFast(frame: *Frame, op: ir.UnOp, dst: Reg, src: Reg, allocator: Allocator) bool {
-    if (frame.enclosing_this.items.len != 0) return false;
-    if (frame.params.items.len > 0 and frame.params.items.ptr[0] == .Instance) return false;
     const regs = frame.regs.items.ptr;
     const out: Value = scalarUn(op, regs[src.int()]) orelse return false;
     const old = regs[dst.int()];

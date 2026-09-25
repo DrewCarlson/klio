@@ -64,3 +64,17 @@ sample.kt	731	737	read	kotlin/text/StringBuilder.length||	lambda@693	-
 sample.kt	747	755	call	kotlin/text/StringBuilder.toString||	lambda@693	-
 sample.kt	768	775	call	kotlin/io/println||kotlin/Any?	-	-
 sample.kt	776	780	read	local:text@660	-	-
+sample.kt	945	952	call	kotlin/io/println||kotlin/Any?	-	-
+sample.kt	953	968	read	object:Holder.Companion	-	-
+sample.kt	969	975	read	Holder.Companion.result||	expr	-
+sample.kt	989	990	component2	Point.component2||	expr	-
+sample.kt	994	999	ctor	Point.<init>||kotlin/Int,kotlin/Int	-	-
+sample.kt	1015	1018	component1	Point.component1||	expr	-
+sample.kt	1020	1021	component2	Point.component2||	expr	-
+sample.kt	1025	1030	ctor	Point.<init>||kotlin/Int,kotlin/Int	-	-
+sample.kt	1041	1048	call	kotlin/io/println||kotlin/Int	-	-
+sample.kt	1049	1050	read	local:y@989	-	-
+sample.kt	1049	1054	plus	kotlin/Int.plus||kotlin/Int	expr	-
+sample.kt	1049	1060	plus	kotlin/Int.plus||kotlin/Int	expr	-
+sample.kt	1053	1054	read	local:z@1020	-	-
+sample.kt	1057	1060	read	local:_@1015	-	-

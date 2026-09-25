@@ -15,12 +15,9 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 
 const vmhost = @import("vmhost.zig");
+const host_util = @import("host_util.zig");
 const host_call_func = @import("host_call_func.zig");
-const host_call_member = @import("host_call_member.zig");
-const host_fields = @import("host_fields.zig");
 const builtin_members = @import("builtin_members.zig");
-const stdlib_tail = @import("host_call_member/stdlib_tail.zig");
-const class_access = @import("host_fields/class_access.zig");
 const host_resolved = @import("host_resolved.zig");
 const persistent_list_mut = @import("persistent_list_mut.zig");
 const persistent_map_mut = @import("persistent_map_mut.zig");
@@ -37,8 +34,8 @@ const VmHost = vmhost.VmHost;
 const coll = stdlib.implementations.collections;
 const impl = stdlib.implementations;
 
-const boolVal = host_call_member.boolVal;
-const throwExc = host_call_member.throwExc;
+const boolVal = host_util.boolVal;
+const throwExc = host_util.throwExc;
 
 /// The member the VM implements under `key` (`resolved.hostKey`), or null.
 pub fn resolve(key: []const u8) ?HostFn {
@@ -114,8 +111,7 @@ fn iterableIterator(h: *anyopaque, a: Allocator, args: []const Value) Allocator.
             recv.retain();
             return .{ .ok = recv.* };
         },
-        .Sequence => return (try builtin_members.sequenceMember(vm(h), a, recv, "iterator", &.{})) orelse
-            internal(a, "`Sequence.iterator` declined", .{}),
+        .Sequence => return builtin_members.sequenceIterator(vm(h), a, recv),
         else => {},
     }
     return (try builtin_members.builtinIterator(a, recv)) orelse internal(a, "`iterator` on a {s} value", .{tagOf(recv)});
@@ -180,7 +176,7 @@ fn arrayGet(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!Ev
         .err => |e| return e,
     };
     if (args.len < 2 or args[1] != .Int) return internal(a, "`Array.get` without an Int index", .{});
-    if (ir.exec_call.fastIndexGet(&args[0], &args[1])) |v| return .{ .ok = v };
+    if (ir.eval.fastIndexGet(&args[0], &args[1])) |v| return .{ .ok = v };
     return arrayIndexError(a, args[1].Int, arr.len());
 }
 
@@ -191,7 +187,7 @@ fn arraySet(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!Ev
         .err => |e| return e,
     };
     if (args.len < 3 or args[1] != .Int) return internal(a, "`Array.set` without an Int index and a value", .{});
-    if (ir.exec_call.fastIndexSet(a, &args[0], &args[1], args[2]) == null) return arrayIndexError(a, args[1].Int, arr.len());
+    if (ir.eval.fastIndexSet(a, &args[0], &args[1], args[2]) == null) return arrayIndexError(a, args[1].Int, arr.len());
     return .{ .ok = .Unit };
 }
 
@@ -211,9 +207,22 @@ fn rangeProperty(comptime name: []const u8) HostFn {
     return struct {
         fn call(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!EvalResult {
             _ = h;
-            const v = host_fields.hostFreeProperty(&args[0], name) orelse
+            const view = impl.ranges.asRangeView(&args[0]) orelse
                 return internal(a, "`" ++ name ++ "` on a {s} value", .{tagOf(&args[0])});
-            return .{ .ok = v };
+            // `step` keeps its sign and is Int for Int, Char and UInt, Long for
+            // Long and ULong.
+            if (comptime std.mem.eql(u8, name, "step")) return .{ .ok = switch (view.kind) {
+                .Long, .ULong => .{ .Long = view.step },
+                .Int, .Char, .UInt => .{ .Int = @truncate(view.step) },
+            } };
+            const v: i64 = if (comptime std.mem.eql(u8, name, "first")) view.start else view.end;
+            return .{ .ok = switch (view.kind) {
+                .Int => .{ .Int = @truncate(v) },
+                .Long => .{ .Long = v },
+                .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
+                .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
+                .ULong => .{ .ULong = @bitCast(v) },
+            } };
         }
     }.call;
 }
@@ -302,7 +311,14 @@ fn anyToString(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error
     const self = vm(h);
     const recv = &args[0];
     const f: ?struct { []const u8, StdlibFn } = switch (recv.*) {
-        .Instance => |inst| return .{ .ok = try stdlib_tail.inheritedInstanceToString(a, inst, false) },
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            const text = try std.fmt.allocPrint(a, "{s}@{x}", .{ cg.get().fqn, g.get().identity });
+            return .{ .ok = .{ .String = try runtime.strInitOwned(a, text) } };
+        },
         .Class => |c| {
             const g = c.borrow();
             defer g.deinit();
@@ -457,13 +473,20 @@ fn matchGroup(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!
 
 // ----------------------------------------------------------- class values --
 
-/// A `KClass` property the class tables answer (`simpleName`,
-/// `qualifiedName`).
+/// `KClass.simpleName` or `qualifiedName` of a class value, from its def:
+/// the simple name the last `.` or a lifted class's last `$` starts, and
+/// null for both of an anonymous class.
 fn classProperty(comptime name: []const u8) HostFn {
     return struct {
         fn call(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!EvalResult {
-            return (try class_access.classReflective(vm(h), a, &args[0], name)) orelse
-                internal(a, "`KClass." ++ name ++ "` on a {s} value", .{tagOf(&args[0])});
+            _ = h;
+            if (args[0] != .Class) return internal(a, "`KClass." ++ name ++ "` on a {s} value", .{tagOf(&args[0])});
+            const g = args[0].Class.borrow();
+            defer g.deinit();
+            const cd = g.get();
+            if (cd.is_anonymous) return .{ .ok = .Null };
+            const text = if (comptime std.mem.eql(u8, name, "simpleName")) host_util.classSimpleName(cd.name) else cd.fqn;
+            return .{ .ok = .{ .String = try runtime.strInit(a, text) } };
         }
     }.call;
 }
@@ -503,7 +526,7 @@ fn threadJoin(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!
     const id = threadId(&args[0]) orelse return internal(a, "`Thread.join` on a {s} value", .{tagOf(&args[0])});
     return switch (vmhost.host_impl.joinSpawned(vm(h), id)) {
         .ok => .{ .ok = .Unit },
-        .err => |e| .{ .err = try host_call_member.mapRuntimeError(a, e) },
+        .err => |e| .{ .err = try host_util.mapRuntimeError(a, e) },
     };
 }
 

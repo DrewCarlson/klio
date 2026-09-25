@@ -36,17 +36,11 @@ const mod_list = [_]Mod{
     // generated serializer declarations for every `@Serializable` class as
     // ordinary Kotlin (parsed from generated source) before lowering.
     .{ .name = "serialization_pass", .deps = &.{ "ast", "span", "lexer", "parser", "diagnostics" }, .src = "src/serialization_pass/serialization_pass.zig", .tested = true },
-    .{ .name = "ir", .deps = &.{ "span", "ast", "runtime", "diagnostics", "applicability", "sema" }, .tested = true },
-    // Shared overload-resolution applicability engine. Lives inside the ir
-    // module's directory but is its own module (it depends on ir for TypeRef /
-    // Param / FuncId) so the runtime scorers can import it. `ir` in turn
-    // imports it for the lowering-time `resolveCall` scorer; Zig permits the
-    // module cycle since neither side forms a comptime dependency loop.
-    .{ .name = "applicability", .deps = &.{ "ir", "span" }, .src = "src/ir/applicability.zig", .tested = true },
+    .{ .name = "ir", .deps = &.{ "span", "ast", "runtime", "diagnostics", "sema" }, .tested = true },
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },
     .{ .name = "resolver", .deps = &.{ "span", "ast", "diagnostics", "types", "stdlib" }, .tested = true },
-    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability" }, .tested = true },
+    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics" }, .tested = true },
     .{ .name = "stdlib_pack", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "stdlib_gen", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "kotlinx_atomicfu", .deps = &.{ "runtime", "stdlib" }, .tested = true },
@@ -444,7 +438,6 @@ const interp_env_keys = [_][]const u8{
     "KLIO_MAX_EVAL_DEPTH",
     "KLIO_THROW_TRACE",
     "KLIO_TRACE_RESOLVE",
-    "KLIO_TRACE_CHAIN",
     "KLIO_TRACE_INVARIANTS",
     "KLIO_TRACE_PATH",
     "KLIO_TRACE_HTTP",

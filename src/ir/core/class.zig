@@ -272,33 +272,3 @@ pub const FieldLayout = struct {
     state: FieldLayoutState = .unpublished,
 };
 
-pub const ClassIndexEntry = struct { name: []const u8, id: ClassId };
-
-pub const FuncIndexEntry = struct { name: []const u8, id: FuncId };
-
-pub const StrPair = struct {
-    a: []const u8,
-    b: []const u8,
-};
-
-pub const StrPairContext = struct {
-    pub fn hash(_: StrPairContext, key: StrPair) u64 {
-        return runtime.mixHash(runtime.hashName(key.a), runtime.hashName(key.b));
-    }
-    pub fn eql(_: StrPairContext, x: StrPair, y: StrPair) bool {
-        return runtime.eqlName(x.a, y.a) and runtime.eqlName(x.b, y.b);
-    }
-};
-
-pub fn StrPairMap(comptime V: type) type {
-    return std.HashMap(StrPair, V, StrPairContext, runtime.nameMaxLoadPercentage);
-}
-
-pub const StrPairSet = StrPairMap(void);
-
-pub fn headAllUpper(s_: []const u8) bool {
-    for (s_) |c| {
-        if (!std.ascii.isUpper(c)) return false;
-    }
-    return true;
-}

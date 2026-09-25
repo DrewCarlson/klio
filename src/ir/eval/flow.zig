@@ -19,7 +19,6 @@ const ev_frame = @import("frame.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 
-const EnclosingEntry = ev_state.EnclosingEntry;
 const EvalError = ev_state.EvalError;
 const Frame = ev_frame.Frame;
 const TryFrame = ev_snapshot.TryFrame;
@@ -44,13 +43,9 @@ pub const FlatCallReq = struct {
     owning: ?*const Module = null,
     args: std.ArrayList(Value),
     captures: std.ArrayList(Value) = .empty,
-    /// Creation-time receiver-chain seed, borrowed; copied into the frame's chain at activation open.
-    chain: []const EnclosingEntry = &.{},
     closure_id: ?u64 = null,
     /// The host pushed an ambient composer for this call; the activation's teardown must pop it.
     composer_pushed: bool = false,
-    /// Access-enclosing entries the dispatch pushed; teardown pops them LIFO once the caller's chain is active again.
-    pop_enclosing_n: u8 = 0,
     /// A value the activation must keep alive for its whole life (the receiver-bound closure whose capture
     /// vector the frame's captures borrow). Released at teardown or parked-drop, GC-marked while live-parked.
     keepalive: ?Value = null,
@@ -90,7 +85,6 @@ pub const Activation = struct {
     frame: Frame,
     try_stack: std.ArrayList(TryFrame),
     composer_pushed: bool,
-    pop_enclosing_n: u8,
     keepalive: ?Value,
     suspend_barrier: bool,
     barrier_scope_base: usize,
@@ -129,14 +123,6 @@ var lr_trace_cached: ?bool = null;
 var chain_trace_init: bool = false;
 
 var chain_trace_on: bool = false;
-
-pub fn chainTraceOn() bool {
-    if (!chain_trace_init) {
-        chain_trace_on = runtime.envOnce("KLIO_CHAIN_TRACE") != null;
-        chain_trace_init = true;
-    }
-    return chain_trace_on;
-}
 
 pub fn lrTraceOn() bool {
     if (lr_trace_cached) |b| return b;
@@ -216,10 +202,9 @@ pub fn lateinitThrow(allocator: Allocator, name: []const u8) Allocator.Error!Eva
     }) };
 }
 
-/// Restore the frame's enclosing-receiver chain to its try-entry length: an unwind into a catch or finally
-/// skipped every `EnclosingPop` inside the try body, and the stale subject would shadow later reads.
-pub fn truncChainTo(frame: *Frame, chain_len: usize) void {
-    if (frame.enclosing_this.items.len > chain_len) {
-        frame.enclosing_this.shrinkRetainingCapacity(chain_len);
-    }
+/// Free a discarded member-dispatch-miss message. The host allocPrints a
+/// `Vm::`-prefixed string on a miss; a static literal never carries that prefix.
+pub fn freeDispatchMissMsg(allocator: Allocator, msg: []const u8) void {
+    if (!runtime.freeScratch()) return;
+    if (std.mem.startsWith(u8, msg, "Vm::")) allocator.free(msg);
 }

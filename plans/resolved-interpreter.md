@@ -235,16 +235,21 @@ receiver or global path.
 |----|------|--------|
 | `green/corpus` | `itest-e2e`, the example corpus and the stdlib commontest sweep at their floors. | done: corpus 551/551 |
 | `green/packs` | Every pack suite in `plans/pack-suites-to-green.md` at or above its floor, compose runtime at 100%. | doing |
-| `green/box` | The kotlinc box corpus at or above its ratchet. | doing: 6266/86 ratchet, the old path 6019 |
+| `green/box` | The kotlinc box corpus at or above its ratchet. | doing: 6268/84 ratchet, the old path 6019 |
 | `green/measure` | Re-take the headline costs, the executed dispatch census and `benchRecompose`, before and after, in the log below. | todo |
 
 ### Speed
 
-After `cut/runtime`, and part of done. The acceptance is the compose
-runtime's throughput-bound tests: `derivedStateOfLeak`,
-`validatePotentialDeadlock` and `resumeOnBackgroundThread` pass under the
-fleet's 10 s runTest cap, with before and after numbers for them, fib,
-bench_oo, bench_fn and `benchRecompose` in the log.
+After `cut/runtime`, and part of done. The acceptance is measured gain:
+before and after numbers for the trivial instruction, the cheapest
+activation, fib, bench_oo, bench_fn, `benchRecompose` and the compose
+runtime's three throughput-bound tests, with `resumeOnBackgroundThread`
+under the fleet's 10 s runTest cap and `derivedStateOfLeak` and
+`validatePotentialDeadlock` passing under a cap sized to what the two items
+reach (projected 45-50 s and 80-90 s). The interpreter is about 85% of a
+compose frame, so these two items bound the gain near 3x; the 10 s cap for
+the other two would take compiled code (the compose runtime through the C
+backend, with native coroutines), which is after done.
 
 | Id | Item | Size | Status |
 |----|------|-----:|--------|
@@ -260,6 +265,23 @@ owned layers over upstream's `GraphicsLayerOwnerLayer` (layer alpha, color
 filter, blend, render effect, shadows, and hit testing through layer
 transforms).
 
+The stdlib natives' move off the generic intrinsic path waits here as
+well. 744 bindings (478 distinct keys) still bind through the `natives`
+table and run through `dispatchIntrinsic` rather than as host members.
+Both are bound by declaration at build time and called by id at run time,
+so the move is representation, not resolution. It needs the bridge's host
+keys to carry the receiver first: 264 of the bindings are extensions whose
+declaration names collide (`kotlin.collections.plus` over nine array
+receivers). Proposed order: numeric and char, math and ranges, strings,
+collections, the small families, the coroutine intrinsics, then
+`dispatchIntrinsic` itself. The 133 pack natives keep the generic path.
+
+Sema has no cross-module `internal` check: a program may name an internal
+declaration of the base or a pack, where kotlinc reports it invisible
+(honouring `@file:Suppress("INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")`).
+`examples/channel_undelivered_element.kt` imports kotlinx.coroutines'
+internal `UndeliveredElementException` and becomes valid Kotlin with it.
+
 | Id | Item | Size | Status |
 |----|------|-----:|--------|
 | `retire/typeck` | The checker's diagnostics run over sema's records; `src/typeck`'s resolution core, `src/types`' string `Type` and `src/resolver` go. | +5k / -15k | todo |
@@ -273,14 +295,14 @@ transforms).
   as a sema test.
 - **The name guard**: the comptime test on `Inst` is the permanent proof that
   the IR resolves.
-- **Execution cost**: `scripts/headline-costs.sh`, the executed dispatch
-  census, `benchRecompose`, with the interleaved CPU-time A/B in
+- **Execution cost**: `scripts/headline-costs.sh`, `benchRecompose`
+  (`tests/bench/recompose.kt`) and the activations and instructions per frame
+  (`KLIO_FRAME_COUNT`), with the interleaved CPU-time A/B in
   `plans/pack-suites-to-green.md`. These are the numbers the goal is measured
-  by.
+  by. The executed dispatch census, the site census sweep and its resolution
+  ceiling read output the by-name instructions took with them, and are gone.
 - **The gate**: `scripts/gate.sh`, run with nothing else touching
-  `.zig-cache`, at the end of the cutover and of every item after it. Its
-  resolution ratchet step and `plans/resolution-ceiling.json` go with the
-  by-name variants, since there is nothing left for them to count.
+  `.zig-cache`, at the end of the cutover and of every item after it.
 
 The first campaign's lessons about measurement stand: a counter must be proved
 to fire before its zero is trusted, a threadlocal counter under the worker pool
@@ -439,10 +461,12 @@ construction, and each gets a test.
 4. `scripts/gate.sh` is green, run with nothing else touching `.zig-cache`.
 5. Every suite count in `plans/pack-suites-to-green.md` is at or above its
    floor, and the compose runtime suite is at 100%, its throughput-bound
-   tests included.
+   tests included under the caps the Speed section sets.
 6. The log carries measured before and after numbers for the trivial
-   instruction, the cheapest activation, the executed dispatch census and
-   `benchRecompose`.
+   instruction, the cheapest activation, `benchRecompose` with its
+   activations and instructions per frame (the executed dispatch census
+   counted by-name dispatch, which no longer exists), fib, bench_oo,
+   bench_fn and the three compose throughput tests.
 
 ## Log
 
@@ -868,3 +892,68 @@ measurement.
   Klio names its exceptions the Kotlin way: kotlin.* where Kotlin has the
   class, klio.* for the JVM-only ones, and frames name Kotlin
   declarations.
+- 2026-09-24: `green/measure`'s before row, taken on d190cce9's
+  interpreter with the ReleaseFast harness. The micro-benchmarks and
+  benchRecompose read user CPU, minimum of five warmed rounds that cycle
+  through the benches. fib 0.87 s, bench_oo 1.26 s, bench_fn 2.92 s.
+  `scripts/headline-costs.sh` (minimum of five): a trivial instruction
+  15.24 ns, the cheapest activation 69.49 ns. benchRecompose is now
+  `tests/bench/recompose.kt`, written to the description above because the
+  scratch program was lost. It starts a new series that cannot be
+  compared with the old 2 811 µs. It runs 2 000 frames (2 001
+  recompositions) at 1 174 µs a recomposer frame, the frame loop's wall
+  time, 2.43 s user for the whole run. `KLIO_FRAME_COUNT` gives 2 360
+  activations and 10 477 instructions per frame, net of a one-frame run.
+  The throughput tests ran once each, with the runTest cap lifted.
+  `derivedStateOfLeak` took 130.2 s over 62 400 frames (100 advances of 312
+  frames under each of the two composers), 2.09 ms a frame.
+  `validatePotentialDeadlock` took 169.5 s over 6 240 frames of 200 Texts
+  (10 advances of 312 under each composer), 27.2 ms a frame, and 183 s of
+  user time with its Default-dispatcher writer. `resumeOnBackgroundThread`
+  took 13.4 s; its frames race a background mutator and have no fixed
+  count. The executed dispatch census has no printer since c78e779f took
+  `[dispatch-stats]` out with the by-name instructions (its counters are
+  left at four call sites), so the activations and instructions per frame
+  stand in for it here.
+- 2026-09-24: the name guard is in (done item 2): a comptime check in
+  `ir/core/inst.zig` over every `Inst`, `Terminator` and `CatchHandler`
+  payload admits only id, register, constant, flag and count fields, on
+  every build. A catch handler names its `ClassId`. The leaf tier and the
+  fqn-classified host routes left (-7k lines); nothing sema lowers reached
+  them. `exec_call.zig` is gone. Timings neutral, box 6268/84. Left of
+  `cut/runtime`: cutting the live entries into the by-name VM layer, then
+  deleting that layer and the module's by-name resolvers, and the
+  fixed slot array.
+- 2026-09-24: done item 3 holds over what kotlinc compiles alone: the sema
+  census reads zero sema sites and zero lowering failures over the base,
+  every pack and the corpus, and the oracle over the corpus reads 19 472
+  sites matching, 54 normalized by explicit rules (folded literal
+  arithmetic, synthesized annotation members, qualifier and anchor
+  placement), 1 010 Kotlin-vs-JVM naming, 0 differing, over 485 of 626
+  examples. The rest import packs the oracle has no jars for. Rerun with
+  `scripts/sema-oracle-compare.sh` (tools/sema-oracle/README.md). The
+  comparison found klio accepting a member that hides a supertype's
+  without `override`, and inner-class aliases resolved on a receiver
+  outside their class; both are errors now, as in kotlinc. After done:
+  numeric promotion in `x == y` over a Double? and an Int? smart cast
+  (IEEE -0.0 == 0), and `kotlin.suspend { }` accepted.
+- 2026-09-25: nothing reaches a member by name at run time. The evaluator's
+  by-name tails, builtin members' calls, the bound-reference arms and the
+  receiver chain are gone; well-known slots, class ids and sema's closures
+  answer instead. Counters on the VM's 17 by-name entry points read zero
+  over the sweep, the corpus and the fleet (they read 73.4M, 5.28M and
+  258k before the unary operators ran on the primitive). fib 0.82 s,
+  bench_oo 1.17 s, bench_fn 2.74 s, trivial instruction 14.91 ns, cheapest
+  activation 65.88 ns, benchRecompose 1 006 µs a frame, derivedStateOfLeak
+  110 s. Left of `cut/runtime`: deleting the orphaned by-name layer (the
+  VM ladders, the module's resolvers, registry, applicability,
+  overload_match, ProgramImage's link caches) and the fixed slot array.
+- 2026-09-25: the by-name layer is deleted: the VM's member, field,
+  instance and global ladders (-33k lines), the module's resolver layer
+  with registry, applicability and their tests (-16k), and the handles,
+  program image and receiver records only it read (-1.5k). Corpus
+  567/567, sweep 0 failures, native C 41 with `native_coroutines` refused.
+  Left of `cut/runtime`: the fixed slot array. Profiles put the interpreter
+  at about 85% of a compose frame (dispatch loop 57-73%, activation 12%);
+  the Speed items target a counted compose instruction at 70 to about
+  25 ns and an activation at 66 to about 20 ns.

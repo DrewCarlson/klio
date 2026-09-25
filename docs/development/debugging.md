@@ -31,7 +31,7 @@ Two cross-cutting caveats:
 - `zig build` run steps forward only a fixed passthrough list to
   their child processes (`interp_env_keys` in `build.zig`):
   `KLIO_RACE_JITTER`, `KLIO_MAX_EVAL_DEPTH`, `KLIO_THROW_TRACE`,
-  `KLIO_TRACE_RESOLVE`, `KLIO_TRACE_CHAIN`, `KLIO_TRACE_INVARIANTS`,
+  `KLIO_TRACE_RESOLVE`, `KLIO_TRACE_INVARIANTS`,
   `KLIO_TRACE_PATH`, `KLIO_TRACE_HTTP`, `KLIO_LINK_AUDIT`,
   `KLIO_STDLIB_PACK`, `KLIO_PACK_DIAG`
   (plus, for fuzz suites, `KLIO_FUZZ_SEED`, `KLIO_FUZZ_SEEDS`,
@@ -63,23 +63,20 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_ADM_TRACE` | set | Callable-vs-class adjudication detail inside `argDefinitelyNotParamType` | `[adm]` |
 | `KLIO_EF_TRACE` | `<name>` | Emit-form / member-shadowability decision for a named call (inline target chosen, shadowable routing, receiver-context flags) | `[ef]`, `[tbie]`, `[efset]` |
 | `KLIO_EXTKEY_TRACE` | `<fid>[,<fid>]` | The eight-element extension ranking key for the named candidates, plus their parameter type heads. Ranking is lexicographic, so the first differing component is the one that decided | `[extkey]` |
-| `KLIO_LEAF_TRACE` | `<substring of a function name>` | Why the frameless leaf-expression serve declined for a matching function (unsupported opcode, non-instance field receiver, unclaimed field route, callee that is not a leaf) | `[leaf]` |
 | `KLIO_SUBTYPE_TRACE` | `<substr>` | Instance-supertype search during overload scoring, for target types containing the substring | `[sub]` |
 | `KLIO_SHADOW_TRACE` | set | Whether an imported pack extension shadows a member call (probe plus each candidate) | `[shadow]` |
 | `KLIO_EXT_AUDIT` | `1` | Dual-compute audit for extension dispatch: the declaration a commit at lowering would name (`would`) beside the one the runtime's by-name walk serves (`ran`). Join them with `scripts/ext_audit_sweep.py` | `[KLIO_EXT_AUDIT]` |
 | `KLIO_FUSE_HEAVY` | set | What makes a body heavy, which is what the fused entry declines when it may not materialize. Dispatch cases are split by whether the site names its target | `[fuse-heavy]` |
 | `KLIO_FUSE_CLASSIFY` | set | Why `fusedClassify` refused a body, split by condition. `classify` dominates the decline census and is memoized per function, so the decline count and the rejection count are different questions | `[fuse-classify]` |
-| `KLIO_FUSE_GATE` | set | Which conjunct of the fused tier's entry gate turns a call away — receiver, closure, chain seed, captures, native — against how many are offered | `[fuse-gate]` |
+| `KLIO_FUSE_GATE` | set | Which conjunct of the fused tier's entry gate turns a call away — receiver, closure, captures, native — against how many are offered | `[fuse-gate]` |
 | `KLIO_FUSE_MAX_BLOCKS` | count | Overrides the fused walker's block cap, so it can be priced rather than assumed. Raising it 64 to 4096 changed 5 406 frames to 5 407 | |
 | `KLIO_THIS_EXT` | `0` | Leaves bare `this` in an extension function body without a recorded class identity, so a wrong answer can be told from a wrong reading of one | |
 | `KLIO_DISPATCH_TRACE` | set | Runtime: a member-extension frame that had to derive its own dispatch receiver from the enclosing chain because no caller handed one over (`[dispatch-fallback] fn= found=`), and a contextual frame that had to derive a context parameter the same way (`[context-fallback] fn= idx= ty= found=`); a producer is missing at whichever call site reached it. Static: how a context argument resolved at a call site, the scope, the subjects and the receiver tower it saw (`[context-arg] want= ...` then `-> <reg>` or `-> null`), a `contextOf<T>()` with nothing of that type in scope (`[context-none] ty= fn=`), and the context types a lambda literal was given from its expected type (`[lambda-ctx]`) | `[dispatch-fallback]`, `[context-fallback]`, `[context-arg]`, `[context-none]`, `[lambda-ctx]` |
 | `KLIO_SLOT_TRACE` | set | Why a field read on the enclosing `this` did or did not claim a declared slot of its class's published layout: no owner, no class id, no layout (with the state), not a slot, or a capture | `[slot]` |
 | `KLIO_CGEN_REACH` | set | What `klio transpile --native <file.kt>` reaches from `main`: every function (program or base) with its instruction count, every native with its binding, the classes it constructs, the slots it dispatches, its statics and closures, and a count of each instruction kind. The backlog for widening the native backend | `[reach]` |
 | `KLIO_CGEN_DUMP` | `<substring>` | The resolved instructions of every function whose name or FQN contains the substring, as `klio transpile --native` sees them | (none) |
-| `KLIO_NOINST_WHY` | `1` | Why a statically bound slot on a host-backed receiver declined to a member-name walk: `no-slot-entry` (no `(class, slot)` mapping) or `target-not-executable` (the target is bodyless and no native is registered under its FQN) | `[noinst-why]` |
 | `KLIO_ICRT` | `1` | Each return-type instantiation's pre-solve state and terminal (`OK`, `bindings incomplete`, `star head`), plus which parameter refused the bind and both sides' argument counts — a `param=x(Array nargs=1) actual=Array nargs=0` row means the ARGUMENT's recorded type dropped its arguments, not a real mismatch | `[icrt]` |
 | `KLIO_MAX_WORKERS` | `<n>` | Caps BOTH the dispatcher pool's compute width (default: half the cores) and its elastic IO ceiling (default: max(16, cores)). Raise it when a single instance owns the machine; the commontest sweep sets `2` for its children so a full sweep stays near half the cores | — |
-| `KLIO_SLOT_BYNAME` | set | Every statically bound virtual slot call that degraded to a by-name member walk, with the slot root. The host boundary made visible | `[slot-byname]` |
 | — | — | NOTE: any captured log carrying `$class$` identity-mangle rows embeds NUL bytes and is BINARY to grep — filter with `grep -a`, or matching rows silently vanish and a dump looks nondeterministic | — |
 | `KLIO_BIND_LUB` | `0` to disable | Off, a generic call's type-parameter constraints must be EQUAL across the receiver and every argument — a subsumed constraint (`getOrDefault(k, Derived())` on a Map of Base, `listOf(Derived(), base)`) rejects the instantiation again | — |
 | `KLIO_TP_DISPROOF` | `0` to disable | Off, a receiver type argument that is a declared TYPE PARAMETER stops disproving concrete-element extension candidates (`Array<T>` no longer rules out `Array<out Double>.minOrNull`) | — |
@@ -117,30 +114,21 @@ comparison into a three-hour one.
 | `KLIO_CAS_TRACE` | set | Every atomicfu `AtomicRef.compareAndSet`: the atomic, the current and expected values with their addresses, and whether it swapped | `[cas]` |
 | `KLIO_OUTER_TRACE` | `<substr>` | Inner-class enclosing `this@Outer` selection for IR names containing the substring | `[outer]` |
 | `KLIO_REBIND_AUDIT` | set | Arity-guess `this` rebinds during closure invocation | `[REBIND]` |
-| `KLIO_CVNRC` | set | A this-less closure invoked on an instance receiver being rebound to `callValueWithThis` | `[cvnrc]` |
 | `KLIO_TRACE_RESOLVE` | `name1,name2` or `*` | Per-dispatch decision log for the named function(s) | `[RESOLVE]` |
-| `KLIO_TRACE_CHAIN` | set | Adds the enclosing-`this` chain to each traced dispatch (with `KLIO_TRACE_RESOLVE`) | `[RESOLVE]   chain=` |
 | `KLIO_TRACE_PATH` | set; `0`/empty off | One structured record per terminal dispatch site (proves single-path dispatch; see `scripts/assert_single_path.py`) | `[PATH]` |
 | `KLIO_TRACE_INVARIANTS` | set; `0`/empty off | Detect-only dispatch invariant checks, one machine-readable line per violation | `[INVARIANT]` |
 | `KLIO_INIT_DEBUG` | set | `object`/companion initializer first-failure and the cause take/swallow/restash steps | `[init-debug]` |
-| `KLIO_BARRIER_TRACE` | set | The type-safe collection bridge (erased-bound check on generic members called through an erased signature): each refusal reason | `[barrier]` |
 | `KLIO_CFN_TRACE` | `<substr of a fn name>` | Named-argument call binding: the declared parameter list vs the supplied names, on both the named and the typed entry | `[cfn]`, `[cft]` |
-| `KLIO_CHAIN_TRACE` | set | Enclosing-`this` chain activation per frame: enter/activate with thread id, frame pointers, and chain base (high volume) | `[chain]` |
-| `KLIO_DCS_TRACE` | set | The declaring-class scan for a FuncId — the per-class method walk feeding the owner cache (very high volume) | `[dcs]` |
 | `KLIO_DRAIN_TRACE` | set | Each Iterable receiver drained to a list by the collection fallback, with the caller and call-site span | `[drain]` |
 | `KLIO_FASTPLAN_TRACE` | `<substr of a fn name>` | Why a function is ineligible for the monomorphic fast call plan (no body, inline, extension, defaults, sibling overloads, ...) | `[fastplan]` |
 | `KLIO_ITER_TRACE` | set | The builtin iterator's `next()` element kind per call | `[iter-next]` |
 | `KLIO_KTYPE_TRACE` | set | Each synthetic `KType` materialized for a reified type name, with the enclosing function | `[ktype]` |
 | `KLIO_MEOI_TRACE` | `<owner class>` | Member-extension dispatch-receiver selection: the enclosing entries walked and each owner-identity verdict | `[meoi]` |
-| `KLIO_NOINST_TRACE` | set | Each virtual slot resolved by member name against the runtime class of a host-backed (non-`Instance`) receiver | `[noinst]` |
 | `KLIO_PICK_TRACE` | `<name>` | The runtime overload re-pick: the base candidate's applicability score and every sibling's | `[pick]` |
-| `KLIO_QT_TRACE` | `<substr of a qualifier>` | The qualified `this@Qualifier` receiver walk: each candidate class and the match | `[qt]` |
 | `KLIO_REDIR_TRACE` | set | Value-shaped redirect-target resolution among same-arity expect/actual siblings | `[redir]` |
 | `KLIO_RFP_DUMP` | set | Dumps every registered receiver-fn-property `(receiver, name)` pair when the gate masks build | `[rfp]` |
 | `KLIO_ROUTE` | `<name>` | Which runtime arm bound each `*OrGlobal` execution of that name (member@depth, overload, global-id, global, the fallback variants), plus dispatch-ladder route markers | `[route]` |
-| `KLIO_SLOT_RECV` | set (needs `KLIO_SLOT_BYNAME`) | The slot-byname note prints the receiver's runtime type instead of the slot root | `[slot-recv]` |
 | `KLIO_THIS_TRAP` | set | Every frame entry that binds a Bool or Int into a `this` parameter — the ext-receiver misbind signature — with the caller | `[this-trap]` |
-| `KLIO_VFLAT_TRACE` | set | One line per declined virtual flat prepare, with the reason a slot population stays recursive | `[vflat]` |
 | `KLIO_WALK_TRACE` | set | Each by-name IR method walk and extension-fallback walk entry, with the receiver and cache-key state | `[ir-walk]`, `[extfb-walk]` |
 
 ```sh
@@ -445,7 +433,7 @@ function — so in an interpreter the cost lands on every hot helper. It measure
 
 `src/runtime/tls_fast.zig` answers it: the thread that calls `claimOwner()` at
 process entry reads the hot per-thread structures (the fused walker's banks,
-`host_fields`' caches, the keepalive stack) from ordinary globals, and every
+the keepalive stack) from ordinary globals, and every
 other thread keeps its threadlocal. The owner never changes, so no state
 migrates between the two storages — a thread reads the same object for the
 process's life. A binary that never claims an owner (the test harnesses) behaves

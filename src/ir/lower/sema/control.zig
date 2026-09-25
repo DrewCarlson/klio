@@ -208,7 +208,10 @@ fn pattern(b: *Builder, when_id: ast.NodeId, pat: *const ast.WhenPattern, subjec
                 .equals => |c| c,
                 else => return error.Unrecorded,
             };
-            return operator.equality(b, sv, subject_t, pv, b.exprType(v.id()), rec);
+            // The subject as the pattern compares it: a `Float` past `!is
+            // Float ->`, which `0.0F` meets with IEEE 754 equality.
+            const lt = if (rec.subject_ty != .none) rec.subject_ty else subject_t;
+            return operator.equality(b, sv, lt, pv, b.exprType(v.id()), rec);
         },
         .InRange, .NotInRange => |*v| {
             const sv = subject orelse return b.fail(pat.span, "an `in` pattern without a subject", .{});
@@ -387,7 +390,7 @@ pub fn lowerTry(b: *Builder, e: *const ast.Expr) Error!Reg {
     for (handlers, catches, 0..) |*h, *ch, i| {
         h.* = .{ .blk = try b.newBlock(), .exc = b.newReg() };
         const class = if (dynamic) try types.throwableClass(b, t.catches[0].ty.span) else try types.catchClass(b, &t.catches[i]);
-        ch.* = .{ .type_name = "", .handler = h.blk, .exception_reg = h.exc, .class_raw = class.int() };
+        ch.* = .{ .class = class, .handler = h.blk, .exception_reg = h.exc };
     }
     const entry = try b.newBlock();
     b.terminate(.{ .Goto = entry });

@@ -850,7 +850,7 @@ pub fn freshBuilderState(host: IntrinsicHost, a: Allocator, template: runtime.Bu
         .{ .name = seq_value_field, .value = .Unit },
         .{ .name = seq_yield_iter_field, .value = .Null },
     };
-    const scope = try host.newSynthInstance("kotlin.sequences.SequenceScope", id, &fields);
+    const scope = try host.newHostInstance(.sequence_scope, id, &fields);
     var blk_val = block;
     if (runtime.reclaimEnabled()) blk_val.retain();
     const block_box = try Value.boxRef(a, blk_val);

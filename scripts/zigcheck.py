@@ -34,13 +34,12 @@ GRAPH = {
     "lexer": ["diagnostics", "span"],
     "pack": ["ast", "span", "types"],
     "parser": ["ast", "diagnostics", "lexer", "span"],
-    "ir": ["span", "ast", "runtime", "diagnostics", "applicability", "sema"],
-    "applicability": ["ir", "span"],
+    "ir": ["span", "ast", "runtime", "diagnostics", "sema"],
     "stdlib": ["runtime", "pack"],
     "cfa": ["ast", "diagnostics", "lexer", "parser", "span", "types"],
     "resolver": ["span", "ast", "diagnostics", "types", "stdlib"],
     "serialization_pass": ["ast", "span", "lexer", "parser", "diagnostics"],
-    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability"],
+    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics"],
     "stdlib_pack": ["pack", "stdlib", "stdlib_embedded"],
     # build.zig generates the real embedded pack; isolated checks use the
     # no-bytes stub so the cwd source checkout stays the pack source.
@@ -73,7 +72,6 @@ GRAPH = {
 PATH_OVERRIDES = {
     "stdlib_embedded": "src/stdlib_pack/embedded_stub.zig",
     "sema_actuals_embedded": "src/cli/sema_actuals_stub.zig",
-    "applicability": "src/ir/applicability.zig",
     "klio_child": "src/itests/klio_child.zig",
     "kotlinc_support": "src/itests/kotlinc_support.zig",
 }
@@ -123,8 +121,8 @@ def build_cmd(root, root_override, build_only, mods):
             continue
         for d in GRAPH[m]:
             # The root module is named "root"; a module that depends on it
-            # (e.g. applicability -> ir when `ir` is the root) must alias the
-            # import name to that module so the cycle resolves.
+            # (one in a cycle with the root) must alias the import name to
+            # that module so the cycle resolves.
             cmd += ["--dep", f"{d}=root" if d == root else d]
         cmd += [f"-M{m}={path(m)}"]
     if build_only:

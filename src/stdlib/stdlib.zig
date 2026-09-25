@@ -32,7 +32,6 @@ pub const build_stdlib_pack = pack_builder.buildStdlibPack;
 
 pub const compare_values = implementations.compare_values;
 pub const materialise_sequence = implementations.materialise_sequence;
-pub const materialise_sequence_bounded = implementations.materialise_sequence_bounded;
 pub const makeSeqIter = implementations.sequence.makeSeqIter;
 pub const oneShotConsumeCheck = implementations.collections.oneShotConsumeCheck;
 pub const resetEmptyCollectionSingletons = implementations.collections.resetEmptyCollectionSingletons;
@@ -534,10 +533,6 @@ pub fn declarationHostSymbol(
     name: []const u8,
 ) ?[]const u8 {
     return implementations.declarationHostSymbol(source_fqn, receiver_name, name);
-}
-
-pub fn implementationApplicable(fqn: []const u8, args: []const runtime.Value) ?bool {
-    return implementations.applicable(fqn, args);
 }
 
 /// Registry of native bindings, `host_symbol` -> `StdlibFn`. A pack carries the

@@ -1007,14 +1007,16 @@ pub fn declSpan(s: *Sema, sym: Sym) @import("span").Span {
         .class => |c| c.name.span,
         .object => |o| o.name.span,
         .type_alias => |ta| ta.name.span,
+        .class_param => |cp| cp.name.span,
         else => @import("span").Span.init(@import("span").FileId.from(0), 0, 0),
     };
 }
 
 /// Reports what is wrong with the program's declarations from `first` on,
 /// before any body is resolved: two declarations of one scope that clash
-/// (functions of one signature, properties or classifiers of one name), and
-/// an `expect` no `actual` implements. The base's declarations are the
+/// (functions of one signature, properties or classifiers of one name), a
+/// member with a supertype member's signature and no `override`, and an
+/// `expect` no `actual` implements. The base's declarations are the
 /// libraries', not the program's to answer for.
 pub fn checkDeclarations(s: *Sema, first: Sym) Allocator.Error!void {
     var i: u32 = first.int();
@@ -1036,8 +1038,23 @@ pub fn checkDeclarations(s: *Sema, first: Sym) Allocator.Error!void {
             else => continue,
         }
         try checkConflicts(s, sym, owner);
+        if (!fc.generated) try checkHidesMember(s, sym);
         try checkExpectHasActual(s, sym);
     }
+}
+
+/// A member declared without `override` that has the signature of a
+/// supertype's member: kotlinc requires the modifier.
+fn checkHidesMember(s: *Sema, sym: Sym) Allocator.Error!void {
+    const fl = s.syms.flags(sym);
+    if (fl.override or fl.static) return;
+    const hidden = try @import("members.zig").hiddenSupertypeMember(s, sym);
+    if (hidden == .none) return;
+    const msg = try std.fmt.allocPrint(s.arena, "`{s}` hides member of supertype `{s}` and needs an `override` modifier", .{
+        s.str(s.syms.name(sym)),
+        s.str(s.syms.name(s.syms.owner(hidden))),
+    });
+    try s.census.reportFacts(.member_hidden, s.syms.get(sym).file, declSpan(s, sym), .{ .message = msg }, "{s}", .{msg});
 }
 
 fn checkConflicts(s: *Sema, sym: Sym, owner: Sym) Allocator.Error!void {

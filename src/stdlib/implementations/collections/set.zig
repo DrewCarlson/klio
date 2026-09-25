@@ -463,7 +463,7 @@ pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try withIndexImpl(ctx, try snapshotItems(a, it)));
+    return withIndexImpl(ctx, try snapshotItems(a, it));
 }
 pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;

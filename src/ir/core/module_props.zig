@@ -1,18 +1,11 @@
-//! Subtype tests over the class table, and the shape of a property answer.
+//! Subtype tests and virtual dispatch over the class table.
 
 const core_ids = @import("ids.zig");
 
 const ClassId = core_ids.ClassId;
 const FuncId = core_ids.FuncId;
+const MethodSlotId = core_ids.MethodSlotId;
 const Module = @import("../ir.zig").Module;
-
-/// How one class answers a read of one property.
-pub const PropTarget = union(enum) {
-    /// Run this accessor with the receiver as its only argument.
-    getter: FuncId,
-    /// Read this index of the receiver's field layout.
-    field: u32,
-};
 
 /// Whether an instance of `sub` is also a `sup`, by identity. Callers that
 /// must not mistake "no closure" for "not a subtype" use `classIsAKnown`.
@@ -28,4 +21,14 @@ pub fn classIsA(self: *const Module, sub: ClassId, sup: ClassId) bool {
         if (v < sup.int()) lo = mid + 1 else hi = mid;
     }
     return false;
+}
+
+/// The `method_dispatch` key of `slot` on `class`.
+pub fn methodDispatchKey(class: ClassId, slot: MethodSlotId) u64 {
+    return (@as(u64, class.int()) << 32) | slot.int();
+}
+
+/// Concrete implementation selected for `slot` on `runtime_class`.
+pub fn methodSlotTarget(self: *const Module, runtime_class: ClassId, slot: MethodSlotId) ?FuncId {
+    return self.method_dispatch.get(methodDispatchKey(runtime_class, slot));
 }

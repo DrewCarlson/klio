@@ -79,28 +79,23 @@ var call_stats_mutex: runtime.SpinMutex = .{};
 
 var call_stats: ?runtime.NameHashMap(u64) = null;
 
-/// Census bump keyed by FuncId, so `KLIO_CALL_STATS_LAMBDA` splits `<lambda>`.
-pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
+/// Counts one activation of `fid`, whichever tier runs it: the framed entry,
+/// a flat activation and a fused run each call this once. Keyed by FuncId,
+/// so `KLIO_CALL_STATS_LAMBDA` splits `<lambda>`.
+pub inline fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
+    if (call_stats_state == 1) return;
+    callStatsBumpSlow(fqn, fid, module);
+}
+
+fn callStatsBumpSlow(fqn: []const u8, fid: u32, module: ?*const Module) void {
     if (call_stats_state == 0)
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     var key: []const u8 = fqn;
     var buf: [160]u8 = undefined;
+    _ = module;
     if (fid != 0 and std.mem.eql(u8, fqn, "<lambda>") and lambdaStatsOn()) {
-        key = blk: {
-            if (module) |m| {
-                if (@constCast(m).decl_span.get(fid)) |sp| {
-                    if (span.active_map) |am| {
-                        if (am.getChecked(sp.file)) |sf| {
-                            const lc = sf.lineCol(sp.start);
-                            const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
-                            break :blk std.fmt.bufPrint(&buf, "<lambda>#{d}[{s}:{d}]", .{ fid, base, lc.line }) catch fqn;
-                        }
-                    }
-                }
-            }
-            break :blk std.fmt.bufPrint(&buf, "<lambda>#{d}", .{fid}) catch fqn;
-        };
+        key = std.fmt.bufPrint(&buf, "<lambda>#{d}", .{fid}) catch fqn;
     }
     // `KLIO_CALL_STATS_CALLER=<substr>`: a matching fqn also bumps
     // `<fqn>@<caller-fqn>`, attributing the frame to the live interpreted caller.
@@ -239,128 +234,6 @@ pub fn callStatsProbe(name: []const u8) void {
     const gop = probe_stats.?.getOrPut(name) catch return;
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* += 1;
-}
-
-/// `KLIO_DISPATCH_STATS=1`: executed-instruction census over the call forms.
-pub const DispatchKind = enum(u8) {
-    call_static,
-    call_member_resolved,
-    call_member_virtual,
-    call_virtual_slot,
-    call_member_or_global,
-    call_value,
-    call_member_or_value,
-    call_value_or_member,
-    call_spread,
-    /// Where a name-based member dispatch ended up.
-    served_intrinsic,
-    served_user_body,
-    served_extension,
-    /// Sub-tails of the name-based member arm, in the order it tries them.
-    member_fast_subscript,
-    member_prim_op,
-    member_range_iter,
-    member_flat_prepare,
-    member_ladder,
-    /// Slot-bound / lowering-resolved calls served as pushed flat activations.
-    virtual_flat_prepare,
-    resolved_flat_prepare,
-    /// Exact static calls fused by the cached fast plan, split by admission.
-    static_flat_fuse,
-    static_flat_fuse_ext,
-    /// Why an exact static call did NOT reach the fused plan.
-    static_decline_named,
-    static_decline_plan,
-    static_decline_ambig,
-    static_decline_arity,
-    /// By-name member calls replayed from their instruction-site memo.
-    member_site_flat,
-    /// Name reads and writes that search the implicit receivers before the global.
-    load_this_or_global,
-    store_this_or_global,
-    /// A field read served from the slot lowering claimed, on its first
-    /// execution, without the discovery ladder.
-    field_read_claimed_slot,
-    /// A read served through the accessor lowering named.
-    field_read_getter_named,
-    field_read_prop_slot,
-    type_instanceof_class,
-    type_cast_class,
-    /// `EnumClass.Entry` served by the index lowering named.
-    field_read_enum_entry,
-    /// A write served from the declared slot lowering named, the mirror of
-    /// `field_read_claimed_slot`: a plain slot has no setter, so the store is it.
-    field_write_claimed_slot,
-    /// A field read that reached the host by name, past the site memo.
-    field_read_host_by_name,
-    /// A builtin property the site named, served from the receiver's tag.
-    field_read_builtin,
-    /// A member-or-global site whose global leg the link pass proved is the
-    /// only one that can win, taken directly.
-    call_member_or_global_static,
-    /// Every interpreter frame constructed: the denominator for the rest.
-    frame_push,
-};
-
-const DISPATCH_KINDS = @typeInfo(DispatchKind).@"enum".fields.len;
-
-/// What each executed dispatch says about resolution. This is the runtime half
-/// of the static verdict in `ir/site_census.zig`: the static census says how
-/// many SITES re-derive their target, this says how many TIMES one did.
-///
-/// `bookkeeping` covers counters that are not themselves a dispatch decision —
-/// the tails downstream of one, the fusion admissions and declines, and the
-/// frame denominators. Counting them in the split would count the same call
-/// twice.
-pub const DispatchVerdict = enum(u8) { resolved, unresolved, dynamic_by_design, bookkeeping };
-
-const dispatch_verdicts: [DISPATCH_KINDS]DispatchVerdict = blk: {
-    var t: [DISPATCH_KINDS]DispatchVerdict = @splat(.bookkeeping);
-    const K = DispatchKind;
-    t[@intFromEnum(K.call_static)] = .resolved;
-    t[@intFromEnum(K.call_member_resolved)] = .resolved;
-    t[@intFromEnum(K.call_virtual_slot)] = .resolved;
-    t[@intFromEnum(K.call_member_virtual)] = .unresolved;
-    t[@intFromEnum(K.call_member_or_global)] = .unresolved;
-    t[@intFromEnum(K.call_member_or_value)] = .unresolved;
-    t[@intFromEnum(K.call_value_or_member)] = .unresolved;
-    // Every `CallSpread` form but the slot-bound one dispatches by name, and the
-    // counter does not separate them; the static census does.
-    t[@intFromEnum(K.call_spread)] = .unresolved;
-    t[@intFromEnum(K.load_this_or_global)] = .unresolved;
-    t[@intFromEnum(K.store_this_or_global)] = .unresolved;
-    t[@intFromEnum(K.field_read_host_by_name)] = .unresolved;
-    t[@intFromEnum(K.field_read_claimed_slot)] = .resolved;
-    t[@intFromEnum(K.field_read_getter_named)] = .resolved;
-    t[@intFromEnum(K.field_read_prop_slot)] = .resolved;
-    t[@intFromEnum(K.type_instanceof_class)] = .resolved;
-    t[@intFromEnum(K.type_cast_class)] = .resolved;
-    t[@intFromEnum(K.field_read_enum_entry)] = .resolved;
-    t[@intFromEnum(K.field_read_builtin)] = .resolved;
-    t[@intFromEnum(K.call_member_or_global_static)] = .resolved;
-    t[@intFromEnum(K.field_write_claimed_slot)] = .resolved;
-    t[@intFromEnum(K.call_value)] = .dynamic_by_design;
-    break :blk t;
-};
-
-pub fn dispatchVerdictOf(k: DispatchKind) DispatchVerdict {
-    return dispatch_verdicts[@intFromEnum(k)];
-}
-
-var dispatch_counts: [DISPATCH_KINDS]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
-
-pub var dispatch_stats_state: u8 = 0;
-
-pub inline fn dispatchBump(comptime k: DispatchKind) void {
-    if (dispatch_stats_state == 0) {
-        dispatch_stats_state = if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) 2 else 1;
-    }
-    if (dispatch_stats_state != 2) return;
-    _ = dispatch_counts[@intFromEnum(k)].fetchAdd(1, .monotonic);
-}
-
-pub fn dispatchNote(comptime k: DispatchKind) void {
-    dispatchBump(k);
 }
 
 pub fn callStatsDump() void {
@@ -1042,135 +915,6 @@ pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
         },
         else => {},
     }
-}
-
-// ---------------------------------------------------------------------------
-// The resolution ratchet.
-//
-// A dispatch that re-derives its target from a name is a site lowering did not
-// bind. `KLIO_REQUIRE_RESOLVED` turns that from a cost into a failure, so a
-// construct that has been resolved once stays resolved.
-//
-//   KLIO_REQUIRE_RESOLVED=1      count every name-based resolution, name the
-//                                responsible sites, and exit non-zero
-//   KLIO_REQUIRE_RESOLVED=raise  raise at the first one instead of serving it
-//
-// Under `KLIO_DISPATCH_STATS` (or `KLIO_UNRESOLVED_SITES`) the site table is
-// collected without failing the run, which is the executed half of the census:
-// which name, in which function, re-derived its target and how often.
-// ---------------------------------------------------------------------------
-
-/// 0 unread, 1 off, 2 record only, 3 record and fail at exit, 4 raise.
-pub var require_resolved_state: u8 = 0;
-
-fn requireResolvedInit() void {
-    if (runtime.envOnce("KLIO_REQUIRE_RESOLVED")) |v| {
-        if (std.mem.eql(u8, v, "raise")) {
-            require_resolved_state = 4;
-            return;
-        }
-        if (v.len != 0 and !std.mem.eql(u8, v, "0")) {
-            require_resolved_state = 3;
-            return;
-        }
-    }
-    const recording = runtime.envOnce("KLIO_UNRESOLVED_SITES") != null or
-        runtime.envOnce("KLIO_DISPATCH_STATS") != null;
-    require_resolved_state = if (recording) 2 else 1;
-}
-
-/// Whether an unresolved dispatch must raise rather than serve the call.
-pub fn requireResolvedRaises() bool {
-    if (require_resolved_state == 0) requireResolvedInit();
-    return require_resolved_state == 4;
-}
-
-var unresolved_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-var unresolved_sites: ?runtime.NameHashMap(u64) = null;
-var unresolved_mutex: runtime.SpinMutex = .{};
-
-/// Count one execution of an unresolved site, and record the site that caused
-/// it. `kind` names the site class (a `site_census.SiteKind` tag), `name` the
-/// identifier being resolved, `in_fn` the function whose body holds the site,
-/// `recv` the receiver's runtime type where there is one.
-pub fn unresolvedNoteSlow(kind: []const u8, name: []const u8, in_fn: []const u8, recv: []const u8) void {
-    if (require_resolved_state == 0) requireResolvedInit();
-    if (require_resolved_state == 1) return;
-    _ = unresolved_total.fetchAdd(1, .monotonic);
-    var buf: [320]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{s} {s}.{s} @{s}", .{ kind, recv, name, in_fn }) catch return;
-    unresolved_mutex.lock();
-    defer unresolved_mutex.unlock();
-    if (unresolved_sites == null) unresolved_sites = runtime.NameHashMap(u64).init(std.heap.page_allocator);
-    const gop = unresolved_sites.?.getOrPut(key) catch return;
-    if (!gop.found_existing) {
-        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
-        gop.value_ptr.* = 0;
-    }
-    gop.value_ptr.* += 1;
-}
-
-pub fn unresolvedCount() u64 {
-    return unresolved_total.load(.monotonic);
-}
-
-/// Test hook: force the ratchet's state, bypassing the environment read.
-pub fn setRequireResolvedForTest(state: u8) void {
-    require_resolved_state = state;
-}
-
-test "the ratchet is inert when off" {
-    setRequireResolvedForTest(1);
-    defer setRequireResolvedForTest(0);
-    const before = unresolvedCount();
-    unresolvedNoteSlow("call_member_by_name", "size", "kotlin.collections.foo", "List");
-    try std.testing.expectEqual(before, unresolvedCount());
-    try std.testing.expect(!requireResolvedRaises());
-}
-
-test "recording names the site that re-derived a target" {
-    setRequireResolvedForTest(2);
-    defer {
-        setRequireResolvedForTest(0);
-        unresolved_total.store(0, .monotonic);
-        if (unresolved_sites) |*m| m.clearRetainingCapacity();
-    }
-    unresolved_total.store(0, .monotonic);
-    if (unresolved_sites) |*m| m.clearRetainingCapacity();
-    unresolvedNoteSlow("call_member_by_name", "size", "pkg.caller", "List");
-    unresolvedNoteSlow("call_member_by_name", "size", "pkg.caller", "List");
-    unresolvedNoteSlow("call_member_or_global", "helper", "pkg.caller", "-");
-    try std.testing.expectEqual(@as(u64, 3), unresolvedCount());
-    unresolved_mutex.lock();
-    defer unresolved_mutex.unlock();
-    try std.testing.expectEqual(@as(usize, 2), unresolved_sites.?.count());
-    try std.testing.expectEqual(@as(u64, 2), unresolved_sites.?.get("call_member_by_name List.size @pkg.caller").?);
-}
-
-test "raise mode is distinguishable from counting" {
-    setRequireResolvedForTest(4);
-    defer setRequireResolvedForTest(0);
-    try std.testing.expect(requireResolvedRaises());
-    setRequireResolvedForTest(3);
-    try std.testing.expect(!requireResolvedRaises());
-}
-
-test "every dispatch kind that the ratchet hooks is an unresolved verdict" {
-    // The hooks and the verdict table must agree: a kind the by-name paths
-    // report must not be counted as resolved work.
-    const hooked = [_]DispatchKind{
-        .call_member_virtual, .call_member_or_global, .call_member_or_value,
-        .call_value_or_member, .load_this_or_global,
-        .store_this_or_global, .field_read_host_by_name,
-    };
-    for (hooked) |k| try std.testing.expectEqual(DispatchVerdict.unresolved, dispatchVerdictOf(k));
-    try std.testing.expectEqual(DispatchVerdict.resolved, dispatchVerdictOf(.call_member_resolved));
-    try std.testing.expectEqual(DispatchVerdict.resolved, dispatchVerdictOf(.call_virtual_slot));
-    try std.testing.expectEqual(DispatchVerdict.resolved, dispatchVerdictOf(.call_static));
-    // The tails downstream of a by-name member call are bookkeeping, or the
-    // split would count one call as several.
-    for ([_]DispatchKind{ .member_ladder, .member_site_flat, .member_fast_subscript, .frame_push }) |k|
-        try std.testing.expectEqual(DispatchVerdict.bookkeeping, dispatchVerdictOf(k));
 }
 
 // ---------------------------------------------------------------------------

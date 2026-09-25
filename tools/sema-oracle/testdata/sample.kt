@@ -31,3 +31,17 @@ fun main() {
     }
     println(text)
 }
+
+class Holder {
+    companion object {
+        val result = "companion"
+    }
+}
+typealias HolderCompanion = Holder.Companion
+
+fun aliasesAndPlaceholders() {
+    println(HolderCompanion.result)
+    val (_, y) = Point(1, 2)
+    val (`_`, z) = Point(3, 4)
+    println(y + z + `_`)
+}

@@ -206,11 +206,7 @@ fn writeBlockEntry(fx: *Fn, blk: *const ir.Block, bi: usize) Error!void {
     try w.print("    klio_nat_frame_restore(KM{d});\n    klio_try_top = KT{d}.prev;\n", .{ bi, bi });
     for (h.catches) |c| {
         const target = try fx.reg(c.exception_reg);
-        if (c.class_raw == ir.NO_CLASS) {
-            try w.print("    {s} = klio_in_flight; goto B{d};\n", .{ target, c.handler.int() });
-            continue;
-        }
-        try w.print("    if (klio_r_is_a(klio_in_flight, {d}u, 0)) {{ {s} = klio_in_flight; goto B{d}; }} /* {s} */\n", .{ c.class_raw, target, c.handler.int(), fx.p.className(c.class_raw) });
+        try w.print("    if (klio_r_is_a(klio_in_flight, {d}u, 0)) {{ {s} = klio_in_flight; goto B{d}; }} /* {s} */\n", .{ c.class.int(), target, c.handler.int(), fx.p.className(c.class.int()) });
     }
     try w.writeAll("    kthrow(klio_in_flight);\n  }\n");
 }

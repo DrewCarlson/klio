@@ -14,25 +14,6 @@ const ObjRef = objcell.ObjRef;
 const Env = env_mod.Env;
 const Value = value_mod.Value;
 
-/// Storage order is outermost first, innermost last.
-pub const ImplicitReceiver = struct {
-    v: Value,
-    kind: Kind = .receiver,
-
-    /// `dispatch`: the owner instance a caller hands a member extension for
-    /// this call, a receiver to every walk and the frame's `this@Owner`.
-    /// `context`: a context argument the caller hands the contextual callee,
-    /// in declaration order; never an implicit receiver.
-    /// `access_context`: a context value inherited from a caller's frame, for a
-    /// callee deriving one it was not handed; never a receiver, never handed on
-    /// as the callee's own.
-    pub const Kind = enum { receiver, subject, access, dispatch, context, access_context };
-
-    pub fn isSubject(self: ImplicitReceiver) bool {
-        return self.kind == .subject;
-    }
-};
-
 pub const ClassDef = struct {
     /// Immutable after two-phase linking backpatches `parent`, `interfaces` and
     /// `enum_entries` at single-threaded startup. The one later write, an enum
@@ -64,10 +45,6 @@ pub const ClassDef = struct {
     is_annotation: bool = false,
     is_sealed: bool,
     supertype_names: []const []const u8,
-    /// Parallel to `supertype_names`: the dotted source qualifier when one was
-    /// written qualified. Parent resolution uses it to tell a nested base from a
-    /// same-simple-name class in scope.
-    supertype_paths: []const ?[]const u8 = &.{},
     /// Backpatched once during linking, then immutable and read lock-free.
     parent: ?ObjRef(ClassDef),
     interfaces: []const ObjRef(ClassDef),
@@ -82,8 +59,6 @@ pub const ClassDef = struct {
     /// Linking fills the table with one shell per entry; the enum's first use
     /// constructs them in place.
     enum_entries: []const EnumEntry,
-    /// 0 = not started, 1 = in progress, 2 = entries and companion ready.
-    enum_init_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     companion: ObjRef(?ObjRef(InstanceData)),
     enclosing_class: ObjRef(?ObjRef(ClassDef)),
     nested_classes: []const NestedClass,
@@ -91,59 +66,10 @@ pub const ClassDef = struct {
     supertype_delegates: []const SupertypeDelegate,
     delegate_forwarders: []const MethodDef,
     object_singleton: ObjRef(?ObjRef(InstanceData)),
-    /// Synthesized at runtime from a class declaration inside a function body.
-    /// Such a def is the class itself: a constructor call on its `.Class` value
-    /// must never be redirected through the module class index, where an
-    /// unrelated same-simple-name class can shadow it.
-    is_local_runtime: bool = false,
-    /// The scope a runtime-local declaration captured. One registration is one
-    /// scope, so an instance keeps the scope it was declared in.
-    local_captures: []const InstanceData.Capture = &.{},
-    /// The implicit receivers where a runtime-local declaration ran; its member
-    /// bodies resolve bare names against them.
-    local_enclosing: []const ImplicitReceiver = &.{},
-
-    /// Memo for the constructor chain's first non-interface supertype.
-    /// 0 = uncomputed, 1 = none, 2 = filled with `first_super_index` and
-    /// `first_super_fqn`, null for a builtin parent.
-    first_super_state: u8 = 0,
-    first_super_index: u8 = 0,
-    first_super_fqn: ?[]const u8 = null,
 
     /// The `ClassId` of this class in code lowered from sema, which the
     /// bridge assigns; `maxInt(u32)` for a class that code never makes.
     ir_class: u32 = std.math.maxInt(u32),
-
-    /// Memo for the ir-module `ClassId` this class resolves to, so virtual
-    /// dispatch skips the string-keyed probe. `resolve_mod` is claimed by the
-    /// first resolving module's pointer identity, and `resolve_cid`, the id plus
-    /// 1, is the validity gate; another module keeps the slow path.
-    resolve_mod: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    resolve_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-
-    /// The same, for this class's first non-interface supertype. The ctor
-    /// chain walks parents once per construction and reached each by name;
-    /// the parent a class has cannot change, so the id is memoized beside
-    /// the strings `first_super_*` already keep. Same validity gate:
-    /// `super_cid_mod` claims the resolving module and `super_cid` is the id
-    /// plus 1, zero meaning "not resolved here".
-    super_cid_mod: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    super_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-
-    /// Which primary-constructor parameters declare a `fun interface`, one
-    /// bit each, single-fill. Construction converts a lambda argument to the
-    /// interface, and deciding which parameters need it resolved every
-    /// parameter's declared type BY NAME on every construction — including
-    /// the ones whose type is not a class at all, whose lookup could only
-    /// ever fail. 0 = uncomputed, 1 = filled.
-    ctor_sam_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    ctor_sam_mask: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-
-    /// Memo for the `<class-companion-or-self>` read: 0 = unresolved, 1 = the
-    /// class value itself, 2 = `companion_read_value`, a borrowed copy of a
-    /// process-stable singleton the shared registry keeps alive.
-    companion_read_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    companion_read_value: Value = .Null,
 
     /// Memo for the field layout construction reserves: 0 = uncomputed,
     /// 1 = a writer is computing it, 2 = `layout_slots` holds it,
@@ -218,8 +144,6 @@ pub const ClassDef = struct {
         m.shade(&self.enclosing_class.cell.hdr);
         m.shade(&self.captured_env.cell.hdr);
         m.shade(&self.object_singleton.cell.hdr);
-        for (self.local_captures) |c| c.value.gcMark(m);
-        for (self.local_enclosing) |e| e.v.gcMark(m);
     }
 
     /// Walks self, then parent. The handles are clones the caller owns.
@@ -249,11 +173,6 @@ pub const ClassDef = struct {
         var seen: std.ArrayList(*const ClassDef) = .empty;
         defer seen.deinit(allocator);
         return findBodyPropertyWalk(allocator, self, name, &seen);
-    }
-
-    /// The caller owns the slice.
-    pub fn interfaceRefs(self: *const ClassDef, allocator: std.mem.Allocator) ![]ObjRef(ClassDef) {
-        return allocator.dupe(ObjRef(ClassDef), self.interfaces);
     }
 
     /// The caller owns the slice.
@@ -584,13 +503,6 @@ pub const InstanceData = struct {
     /// The class's id in the tables of code lowered from sema, written once
     /// at construction; `maxInt` for an instance they do not cover.
     class_id: u32 = std.math.maxInt(u32),
-    /// For an anonymous-object instance, the values it captured, seeding the
-    /// method-body env at dispatch. Held per instance, so they are reclaimed
-    /// with it; names are borrowed, the slice and values owned.
-    anon_captures: []Capture = &.{},
-    /// Lexical implicit receivers where the anonymous-object expression was
-    /// created, so nested receiver lambdas do not hide an outer receiver.
-    anon_enclosing: []ImplicitReceiver = &.{},
     /// For a user `Throwable` subclass, the stack captured at the first throw.
     stack: ?value_mod.StackRef = null,
 
@@ -605,12 +517,6 @@ pub const InstanceData = struct {
             if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) return f.value;
         }
         return null;
-    }
-
-    /// An instance's class is written once at construction, so a dispatch key
-    /// needing only that pointer pays no atomics.
-    pub fn classIdentityUnlocked(inst: objcell.ObjRef(InstanceData)) usize {
-        return inst.asPtrConst().class.identity();
     }
 
     /// For a non-interned literal name, where the pointer fast path can never
@@ -672,21 +578,6 @@ pub const InstanceData = struct {
         self.shape.store(SHAPE_UNSET, .release);
     }
 
-    /// The index of `name` among the reserved slots, which a store must keep
-    /// in place. Null for a name the layout did not reserve.
-    pub fn reservedSlot(self: *const InstanceData, name: []const u8) ?usize {
-        const n = @min(@as(usize, self.reserved), self.fields.items.len);
-        for (self.fields.items[0..n], 0..) |f, i| {
-            if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) return i;
-        }
-        return null;
-    }
-
-    /// Any out-of-band field-list mutation must drop the memoized layout id.
-    pub fn invalidateShape(self: *InstanceData) void {
-        self.shape.store(SHAPE_UNSET, .release);
-    }
-
     /// The caller must hold a borrow: the field list must not grow mid-read.
     pub fn shapeOf(self: *const InstanceData) usize {
         const cached = self.shape.load(.acquire);
@@ -711,10 +602,6 @@ pub const InstanceData = struct {
     pub fn deinit(self: *InstanceData, allocator: std.mem.Allocator) void {
         for (self.fields.items) |f| f.value.release(allocator);
         if (self.outer) |o| o.release(allocator);
-        for (self.anon_captures) |c| c.value.release(allocator);
-        if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
-        for (self.anon_enclosing) |e| e.v.release(allocator);
-        if (self.anon_enclosing.len != 0) allocator.free(self.anon_enclosing);
         if (self.stack) |*s| s.deinit();
         if (!self.fields_foreign) self.fields.deinit(allocator);
         self.class.deinit();
@@ -725,8 +612,6 @@ pub const InstanceData = struct {
         m.shade(&self.class.cell.hdr);
         for (self.fields.items) |f| f.value.gcMark(m);
         if (self.outer) |o| o.gcMark(m);
-        for (self.anon_captures) |c| c.value.gcMark(m);
-        for (self.anon_enclosing) |e| e.v.gcMark(m);
         if (self.stack) |s| m.shade(&s.cell.hdr);
         // `native_state` is host-owned; a value-bearing binding installs its
         // own tracer.
@@ -735,8 +620,6 @@ pub const InstanceData = struct {
     /// Shallow: the field values, the outer and the class are independent cells
     /// swept on their own reachability.
     pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
-        if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
-        if (self.anon_enclosing.len != 0) allocator.free(self.anon_enclosing);
         if (!self.fields_foreign) self.fields.deinit(allocator);
     }
 
@@ -1161,36 +1044,6 @@ test "instance release recursively frees a retained instance field" {
     // `testing.allocator` asserts the whole graph is reclaimed.
     a_val.release(allocator);
     b_val.release(allocator);
-}
-
-test "instance release frees its anonymous lexical receiver snapshot" {
-    const allocator = testing.allocator;
-    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
-    defer fx.deinit(allocator);
-
-    const outer = try objcell.ObjRef(InstanceData).init(allocator, .{
-        .class = fx.handle.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = 1,
-        .native_state = null,
-    });
-    const outer_value = Value{ .Instance = outer };
-    const chain = try allocator.alloc(ImplicitReceiver, 1);
-    outer_value.retain();
-    chain[0] = .{ .v = outer_value, .kind = .receiver };
-
-    const anon = try objcell.ObjRef(InstanceData).init(allocator, .{
-        .class = fx.handle.clone(),
-        .fields = .empty,
-        .outer = null,
-        .identity = 2,
-        .native_state = null,
-        .anon_enclosing = chain,
-    });
-    const anon_value = Value{ .Instance = anon };
-    anon_value.release(allocator);
-    outer_value.release(allocator);
 }
 
 test "list release recursively frees retained instance elements" {

@@ -11,7 +11,6 @@ const runtime = @import("runtime");
 const ir = @import("ir");
 
 const vmhost = @import("vmhost.zig");
-const host_instances = @import("host_instances.zig");
 const host_resolved = @import("host_resolved.zig");
 const concurrent = @import("stdlib").implementations.concurrent;
 
@@ -39,7 +38,6 @@ var node_class_hit = std.atomic.Value(usize).init(0);
 var fn_map = std.atomic.Value(?[*]const u8).init(null);
 var fn_ownership = std.atomic.Value(?[*]const u8).init(null);
 var fn_node = std.atomic.Value(?[*]const u8).init(null);
-var fn_opresult = std.atomic.Value(?[*]const u8).init(null);
 var fn_modcount = std.atomic.Value(?[*]const u8).init(null);
 var fn_size = std.atomic.Value(?[*]const u8).init(null);
 var fn_datamap = std.atomic.Value(?[*]const u8).init(null);
@@ -104,7 +102,7 @@ const NodeTmpl = struct {
 threadlocal var node_tmpl: NodeTmpl = .{};
 
 fn cacheGen() u32 {
-    return @import("host_call_member.zig").dispatch_cache_gen.load(.monotonic);
+    return @import("host_util.zig").dispatchCacheGen();
 }
 
 fn nodeTemplate(node: ObjRef(InstanceData)) ?*const NodeTmpl {
@@ -203,7 +201,7 @@ fn mintNode(ctx: *PutCtx, data_map: i32, node_map: i32, items: []const Value, ow
         .class = t.class.?.clone(),
         .fields = fields,
         .outer = null,
-        .identity = host_instances.mintInstanceId(ctx.self),
+        .identity = host_resolved.mintInstanceId(ctx.self),
         .native_state = null,
     });
     const v: Value = .{ .Instance = inst };
@@ -412,7 +410,7 @@ fn mintNodeFromBuf(ctx: *PutCtx, data_map: i32, node_map: i32, buf_v: Value) All
         .class = t.class.?.clone(),
         .fields = fields,
         .outer = null,
-        .identity = host_instances.mintInstanceId(ctx.self),
+        .identity = host_resolved.mintInstanceId(ctx.self),
         .native_state = null,
     });
     const v: Value = .{ .Instance = inst };
@@ -554,7 +552,7 @@ pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) A
         .class = t.owner_class.?.clone(),
         .fields = .empty,
         .outer = null,
-        .identity = host_instances.mintInstanceId(self),
+        .identity = host_resolved.mintInstanceId(self),
         .native_state = null,
     });
     self.ka.push(.{ .Instance = owner_inst });
@@ -582,7 +580,7 @@ pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) A
         .class = t.class.?.clone(),
         .fields = fields,
         .outer = null,
-        .identity = host_instances.mintInstanceId(self),
+        .identity = host_resolved.mintInstanceId(self),
         .native_state = null,
     });
     return .{ .Instance = inst };
@@ -709,45 +707,6 @@ fn globalWriteObserversEmpty(self: *VmHost, a: Allocator) Allocator.Error!bool {
         },
     }
 }
-
-/// Mint a PersistentHashMap over (node, size) from a live map's field surface.
-/// Consumes `node`'s reference on success; the caller releases it on a null bail.
-fn mintMapFrom(self: *VmHost, a: Allocator, proto: ObjRef(InstanceData), node: Value, size: i32) Allocator.Error!?Value {
-    var fields: std.ArrayList(InstanceData.Field) = .empty;
-    {
-        const g = proto.borrow();
-        defer g.deinit();
-        const d = g.get();
-        try fields.ensureTotalCapacity(a, d.fields.items.len);
-        for (d.fields.items) |f| {
-            const v: Value = if (std.mem.eql(u8, f.name, "node"))
-                node
-            else if (std.mem.eql(u8, f.name, "size"))
-                Value.newInt(size)
-            else if (std.mem.eql(u8, f.name, "_keys") or std.mem.eql(u8, f.name, "_values"))
-                Value.Null
-            else {
-                fields.deinit(a);
-                return null;
-            };
-            fields.appendAssumeCapacity(.{ .name = f.name, .value = v });
-        }
-    }
-    const cls = blk: {
-        const g = proto.borrow();
-        defer g.deinit();
-        break :blk g.get().class.clone();
-    };
-    const inst = try ObjRef(InstanceData).init(a, .{
-        .class = cls,
-        .fields = fields,
-        .outer = null,
-        .identity = host_instances.mintInstanceId(self),
-        .native_state = null,
-    });
-    return .{ .Instance = inst };
-}
-
 
 /// Whether the page holding `addr` is mapped (`KLIO_SSMPUT=5` trie shape audit).
 fn pageMapped(addr: usize) bool {
@@ -1270,7 +1229,7 @@ pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocat
         .class = map_class,
         .fields = fields,
         .outer = null,
-        .identity = host_instances.mintInstanceId(self),
+        .identity = host_resolved.mintInstanceId(self),
         .native_state = null,
     });
     self.ka.push(.{ .Instance = new_map });
@@ -1288,7 +1247,7 @@ pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocat
             .class = ocls,
             .fields = .empty,
             .outer = null,
-            .identity = host_instances.mintInstanceId(self),
+            .identity = host_resolved.mintInstanceId(self),
             .native_state = null,
         });
         break :blk .{ .Instance = oinst };

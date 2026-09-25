@@ -1,16 +1,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const runtime = @import("runtime");
-const root_ir = @import("../ir.zig");
 const core_ids = @import("ids.zig");
 const core_inst = @import("inst.zig");
 
 const BlockId = core_ids.BlockId;
 const CatchHandler = core_inst.CatchHandler;
-const ConstId = core_ids.ConstId;
 const FuncId = core_ids.FuncId;
 const Inst = core_inst.Inst;
-const Module = root_ir.Module;
 const Reg = core_ids.Reg;
 const Terminator = core_inst.Terminator;
 const TypeRef = core_ids.TypeRef;
@@ -85,22 +82,6 @@ pub const FuncKind = enum {
     member_extension,
 };
 
-/// `Func.fast_call` flag: the body carries its receiver as the leading `"this"` param, so fast dispatch seeds the caller's `this`.
-pub const FAST_CALL_EXT_FLAG: u16 = 0x4000;
-
-/// `Func.fast_call` flag: the callee's simple name has same-arity peers, so only the call
-/// site can say whether the baked target is what scope resolution picks; it caches that.
-pub const FAST_CALL_AMBIG_FLAG: u16 = 0x2000;
-
-/// Whether the declaration currently lowering carries `@Suppress("DEPRECATION_ERROR")`,
-/// under which kotlinc restores `@Deprecated(level = ERROR)` candidates to ordinary rank.
-pub threadlocal var suppress_deprecation_error: bool = false;
-
-/// Effective low-priority rank at the site: a deprecation-ERROR overload ranks ordinary under the suppression.
-pub fn rankLowPriority(f: *const Func) bool {
-    return f.low_priority and !(f.deprecated_error and suppress_deprecation_error);
-}
-
 /// The header fields most functions leave at their defaults, out of line:
 /// the adapted-reference key, a receiver lambda's receiver head, the capture
 /// order, the implicit label and the annotation names. A function header is
@@ -166,9 +147,6 @@ pub const Func = struct {
     /// Monomorphic call fast-path plan, cached on first call: 0 = not computed, 1 =
     /// ineligible, else the low 14 bits are the eligible parameter count + 2, plus the flags.
     fast_call: u16 = 0,
-    /// Argument-coercion walks that can apply to the declared params, computed on first frame
-    /// entry: bit0 = computed, bit1 = a non-vararg `Long` param, bit2 = 2+ params with a type variable.
-    coerce_plan: u8 = 0,
     /// Index of `"this"` in `capture_order`: -2 = not yet computed, -1 = no `this` capture.
     this_cap_idx: i32 = -2,
     /// Accessor-shape memo: 0 = unknown, 1 = not an accessor, 2 = the body is exactly
@@ -179,8 +157,6 @@ pub const Func = struct {
     /// route for the frameless accessor read; only the winner writes `acc_route`.
     acc_cls: u64 = 0,
     acc_route: u64 = 0,
-    /// Cached `leafExprBody` verdict: 0 = unasked, 1 = no, 2 = yes.
-    leaf_state: u8 = 0,
     /// Fused-tier verdict: 0 = unasked, 1 = eligible (this body and every statically-resolved
     /// callee), 2 = ineligible, 3 = in progress, which reads eligible until the root settles.
     fuse_state: u8 = 0,
@@ -188,30 +164,14 @@ pub const Func = struct {
     /// constant (`triv_init_val` = ConstId), 3 = echoes one parameter (`triv_init_val` = index).
     triv_init_state: u8 = 0,
     triv_init_val: u32 = 0,
-    /// Host-served static routing memo: 0 = unasked, else a `snapshot_fast.Route`.
-    host_route: u8 = 0,
-    /// Compose fast-path verdict (`compose_fast.Route`), classified on first execution.
-    compose_route: u8 = 0,
-    /// Throw-capable host-serve route (`hostRouteServeThrowing`): 0 unasked, 1 none,
-    /// 2 the gap-buffer changelist wrapper, 3 the link-buffer one.
-    throw_route: u8 = 0,
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill, 2 = may start unfilled.
     frame_fill_state: u8 = 0,
-    /// Scalar-replay (`kl_`) route memo: 0 unresolved, 1 none, else the registered
-    /// NativeLeafFn as an address. The table is write-once before the program runs.
-    leaf_route: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    /// Leaf bail damper: bit 31 = the leaf served at least once (sticky), low bits count
-    /// bails while never-served. Past the threshold the route flips to `none`.
-    leaf_bail_probe: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Bytecode-stream table memo (`bc.funcStreams`): 0 unresolved, 1 none, else a
     /// `*const bc.FuncStreams`. `bc_memo_fuse` says which allow_fuse variant it holds.
     bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     bc_memo_fuse: u8 = 0,
     /// `bc.streamGen()` at fill time; a stale generation must fall to the shared path.
     bc_memo_gen: u32 = 0,
-    /// The frameless leaf serve hit a structurally unsupported instruction here, so every
-    /// future serve would abandon at the same place and the attempt is skipped outright.
-    leaf_hopeless: u8 = 0,
     /// True when `params[0]` is a synthesized `this` receiver (a dispatch receiver, an instance
     /// under construction, any injected leading `this`), not a parameter merely spelled `this`.
     has_receiver_param: bool = false,
@@ -300,69 +260,6 @@ pub const Func = struct {
         // read after a cleared offset are the published ones.
         if (@atomicLoad(u32, &self.deferred_offset, .acquire) != 0) return true;
         return self.blocks.len != 0 or self.lazy_deferred;
-    }
-
-    /// Whether this body is a leaf expression: one block, no handlers, a `Return` of a register,
-    /// and only parameter loads, constants, stored-field reads, moves and primitive operators,
-    /// so it evaluates without building a frame.
-    pub fn leafExprBody(self: *const Func) bool {
-        switch (self.leaf_state) {
-            1 => return false,
-            2, 3 => return true,
-            else => {},
-        }
-        // A DEFERRED body carries no blocks until the image section decodes it; classifying
-        // one here would cache "not a leaf" for a function that becomes one on load.
-        if (self.blocks.len == 0) return false;
-        const verdict = self.classifyLeafExprBody();
-        @constCast(self).leaf_state = if (!verdict)
-            1
-        else if (self.leafDefBeforeUse())
-            3
-        else
-            2;
-        return verdict;
-    }
-
-    /// Whether every register read is dominated by a write, by the same block or by the entry
-    /// block. Then the leaf serve can skip zero-filling its register bank.
-    pub fn leafNoFill(self: *const Func) bool {
-        return self.leaf_state == 3;
-    }
-
-    fn leafDefBeforeUse(self: *const Func) bool {
-        const Ctx = struct {
-            uses: u64 = 0,
-            defs: u64 = 0,
-            oob: bool = false,
-            fn visit(c: *@This(), reg: Reg, is_def: bool) void {
-                const r = reg.int();
-                if (r >= 64) {
-                    c.oob = true;
-                    return;
-                }
-                const bit = @as(u64, 1) << @intCast(r);
-                if (is_def) c.defs |= bit else c.uses |= bit;
-            }
-        };
-        var entry_written: u64 = 0;
-        for (self.blocks, 0..) |*b, bi| {
-            var written: u64 = entry_written;
-            for (b.insts) |*inst| {
-                var c: Ctx = .{};
-                visitInstRegs(inst, &c, Ctx.visit);
-                if (c.oob) return false;
-                if (c.uses & ~written != 0) return false;
-                written |= c.defs;
-            }
-            var c: Ctx = .{};
-            visitTerminatorRegs(&b.terminator, &c, Ctx.visit);
-            if (c.oob) return false;
-            if (c.uses & ~written != 0) return false;
-            written |= c.defs;
-            if (bi == 0) entry_written = written;
-        }
-        return true;
     }
 
     /// Whether a fresh frame may leave its register file unfilled: every register read is
@@ -461,35 +358,7 @@ pub const Func = struct {
         return true;
     }
 
-    /// Structural admission only. Which instructions a leaf serve can execute is decided as it
-    /// runs, since a value-returning path of pure leaf work can sit beside a branch that is not.
-    fn classifyLeafExprBody(self: *const Func) bool {
-        if (self.is_suspend or self.is_lambda) return false;
-        if (self.blocks.len == 0 or self.blocks.len > LEAF_MAX_BLOCKS) return false;
-        if (self.n_locals > LEAF_MAX_REGS) return false;
-        var total: usize = 0;
-        for (self.blocks) |*b| {
-            // A finally-carrying body needs the try-stack machinery the frameless walk skips.
-            if (b.h().catches.len != 0 or b.h().finally != null) return false;
-            total += b.insts.len;
-            if (total > LEAF_MAX_INSTS) return false;
-            switch (b.terminator) {
-                // A `Return` with no register is a `Unit` return, the shape of every guard helper.
-                .Return, .Goto, .Branch => {},
-                // A guard's failing arm never runs on the path this serves; let the walk abandon there.
-                .Throw, .Unreachable => {},
-            }
-        }
-        for (self.params) |*p| {
-            if (p.is_vararg or p.default != null) return false;
-        }
-        return true;
-    }
 };
-
-/// Bounds for `leafExprBody`: a leaf serve keeps its registers in a fixed stack array, so
-/// register count and body length are capped, and the block bound admits guard shapes only.
-pub const LEAF_MAX_REGS: u32 = 64;
 
 /// CFG size bound for `frameNoFill`'s dataflow; a larger body keeps the eager fill.
 pub const FRAME_FILL_MAX_BLOCKS: usize = 256;
@@ -539,12 +408,6 @@ inline fn regSetAnyOutside(a: RegSet, b: RegSet) bool {
 /// analysis skips the safe builds' stack poisoning and concurrent first-asks stay apart.
 const FrameFillScratch = struct { sets: [3][FRAME_FILL_MAX_BLOCKS]RegSet = undefined };
 const frame_fill_scratch = runtime.tls_fast.PerThread(FrameFillScratch);
-
-pub const LEAF_MAX_INSTS: usize = 96;
-
-pub const LEAF_MAX_BLOCKS: usize = 32;
-
-pub const LEAF_MAX_STEPS: usize = 160;
 
 pub const Param = struct {
     name: []const u8,

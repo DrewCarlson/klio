@@ -20,6 +20,8 @@ const Lexer = lexer.Lexer;
 const parser = @import("parser");
 const Parser = parser.Parser;
 
+const interp_ir = @import("interp_ir");
+
 const io = @import("io.zig");
 
 const pack_cache = @import("pack_cache.zig");
@@ -145,49 +147,28 @@ const Scan = struct {
     }
 };
 
-/// Names the interpreter resolves in hardcoded `callMember` arms, not the binding table,
-/// so an `expect` for one is served. Mirrors `host_call_member.zig`, not otherwise enumerable.
-const INTERP_BUILTIN_MEMBERS = [_][]const u8{
-    // Reified enum reflection, resolved in `call_func_typed` (not a binding).
+/// Calls the lowering answers itself, never reaching a declaration.
+const LOWERED_INTRINSICS = [_][]const u8{
+    // Reified enum reflection, lowered to the enum class's own members
+    // (`src/ir/lower/sema/call.zig`).
     "enumValues",
     "enumValueOf",
-    "asList",
-    "constrainOnce",
-    "containsValue",
-    "distinct",
-    "distinctBy",
-    "drop",
-    "dropWhile",
-    "equals",
-    "filter",
-    "filterIndexed",
-    "filterNot",
-    "flatMap",
-    "hashCode",
-    "map",
-    "mapIndexed",
-    "notNull",
-    "observable",
-    "onEach",
-    "sorted",
-    "sortedBy",
-    "sortedByDescending",
-    "sortedDescending",
-    "sortedWith",
-    "take",
-    "takeWhile",
-    "toList",
-    "toMutableList",
-    "toSet",
-    "toString",
-    "toTypedArray",
 };
 
-fn isInterpBuiltinMember(name: []const u8) bool {
-    for (INTERP_BUILTIN_MEMBERS) |m| {
+fn isLoweredIntrinsic(name: []const u8) bool {
+    for (LOWERED_INTRINSICS) |m| {
         if (std.mem.eql(u8, m, name)) return true;
     }
     return false;
+}
+
+/// Whether the VM's own member table serves `fqn`, as a function or as a
+/// property's getter.
+fn hostServes(fqn: []const u8) bool {
+    if (interp_ir.hostMemberFn(fqn) != null) return true;
+    var buf: [512]u8 = undefined;
+    const getter = std.fmt.bufPrint(&buf, "get {s}", .{fqn}) catch return false;
+    return interp_ir.hostMemberFn(getter) != null;
 }
 
 const CANDIDATE_PREFIXES = [_][]const u8{
@@ -346,7 +327,7 @@ pub fn runCheckUnimplemented(
         const candidates = candidateFqns(arena, e.pkg, e.owner, e.name) catch return 2;
         var served = false;
         for (candidates) |fqn| {
-            if (bindings.resolve(fqn) != null) {
+            if (bindings.resolve(fqn) != null or hostServes(fqn)) {
                 served = true;
                 break;
             }
@@ -358,7 +339,7 @@ pub fn runCheckUnimplemented(
             if (intrinsic_owner_name.contains(.{ .owner = o, .name = e.name })) continue;
         }
         if (intrinsic_top_name.contains(e.name)) continue;
-        if (isInterpBuiltinMember(e.name)) continue;
+        if (isLoweredIntrinsic(e.name)) continue;
 
         const display = displayName(arena, e.pkg, e.owner, e.name);
         const gop = seen.getOrPut(display) catch return 2;
@@ -524,10 +505,12 @@ test "lastSegment and secondToLastSegment" {
     try std.testing.expect(secondToLastSegment("name") == null);
 }
 
-test "isInterpBuiltinMember matches known members" {
-    try std.testing.expect(isInterpBuiltinMember("map"));
-    try std.testing.expect(isInterpBuiltinMember("enumValues"));
-    try std.testing.expect(!isInterpBuiltinMember("notAMember"));
+test "a member the VM's own table serves counts as implemented, a function or a getter" {
+    try std.testing.expect(hostServes("kotlin.Any.equals"));
+    try std.testing.expect(hostServes("kotlin.Pair.first"));
+    try std.testing.expect(!hostServes("kotlin.Pair.notAMember"));
+    try std.testing.expect(isLoweredIntrinsic("enumValues"));
+    try std.testing.expect(!isLoweredIntrinsic("map"));
 }
 
 test "unimplemented usage check" {
