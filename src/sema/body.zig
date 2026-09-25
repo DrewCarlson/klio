@@ -2918,11 +2918,14 @@ fn stableName(ctx: *Ctx, id: ast.Ident) Sym {
         return .none;
     }
     const r = findImplicitProperty(ctx, n) catch return .none;
-    if (r) |hit| {
-        if (!stableProperty(s, hit.sym)) return .none;
-        const base_t = narrowedReceiver(ctx, hit.recv) catch return .none;
-        return pathSubjectOn(ctx, hit.recv.owner, base_t, id.name) catch .none;
-    }
+    if (r) |found| switch (found) {
+        .extension => return .none,
+        .member => |hit| {
+            if (!stableProperty(s, hit.sym)) return .none;
+            const base_t = narrowedReceiver(ctx, hit.recv) catch return .none;
+            return pathSubjectOn(ctx, hit.recv.owner, base_t, id.name) catch .none;
+        },
+    };
     // A top-level `val` of the reading code's own module: nothing else
     // can change it between two reads (`val minus: Any = -0.0` smart
     // casts after `minus is Double`).
@@ -3008,15 +3011,20 @@ fn narrowRead(ctx: *Ctx, e: *const Expr, t: TypeId) Allocator.Error!TypeId {
     return narrowedType(ctx, subj, t);
 }
 
-/// The property named `n` of the innermost implicit receiver that has
-/// one, and that receiver, as `nameAccess` reads it.
-fn findImplicitProperty(ctx: *Ctx, n: Name) Allocator.Error!?struct { sym: Sym, recv: Recv } {
-    const s = ctx.s;
+/// What a bare name reads through the implicit receivers.
+const ImplicitProperty = union(enum) {
+    member: struct { sym: Sym, recv: Recv },
+    extension,
+};
+
+/// The member property a bare `n` reads through an implicit receiver, and
+/// that receiver, or an extension property, as `nameAccess` finds them;
+/// null when neither answers, or only a member the code cannot see does.
+fn findImplicitProperty(ctx: *Ctx, n: Name) Allocator.Error!?ImplicitProperty {
     for (try implicitReceivers(ctx)) |r| {
         const rt = try narrowedReceiver(ctx, r);
-        if (try subtyping.admitsNull(s, rt)) continue;
-        const ms = try members.withoutExtensionProperties(s, try members.lookup(s, rt, n, .property));
-        if (ms.len != 0) return .{ .sym = ms[0].sym, .recv = r };
+        if (try calls.firstVisible(ctx, try receiverProperties(ctx, rt, n))) |m| return .{ .member = .{ .sym = m.sym, .recv = r } };
+        if ((try calls.extensionProperty(ctx, rt, n)) != null) return .extension;
     }
     return null;
 }
@@ -3597,26 +3605,15 @@ pub fn nameAccess(ctx: *Ctx, id: ast.Ident, access: Access) Allocator.Error!Type
             else => {},
         }
     }
-    const recvs = try implicitReceivers(ctx);
-    for (recvs) |r| {
+    // A member the code cannot see answers only when nothing else does: a
+    // private member of a receiver's class hides no extension, no outer
+    // receiver's property and no top-level one.
+    var hidden: ?ImplicitMember = null;
+    for (try implicitReceivers(ctx)) |r| {
         const rt = try narrowedReceiver(ctx, r);
-        // A receiver that may be null has no members to read bare; the
-        // extensions on its nullable type apply.
-        const ms: []const members.Member = if (try subtyping.admitsNull(s, rt)) &.{} else try members.withoutExtensionProperties(s, try members.lookup(s, rt, n, .property));
-        if (ms.len != 0) {
-            const m = ms[0];
-            const is_entry = s.syms.kind(m.sym) == .enum_entry;
-            // An enum entry is a static value: no receiver dispatches to it.
-            const recv: Receiver = if (is_entry or s.syms.flags(m.sym).static) .none else .{ .implicit = .{ .kind = r.kind, .owner = r.owner } };
-            const cx = (try calls.propertyContexts(ctx, m.sym, m.subst)) orelse &.{};
-            try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = if (is_entry) .object else kind, .target = m.sym, .dispatch = recv, .contexts = cx });
-            const t = try members.memberType(s, m);
-            if (access != .read or s.syms.kind(m.sym) != .property) return t;
-            // The smart casts on a stable one are on the path through its
-            // receiver; an explicit backing field casts any.
-            const subj: Sym = if (stableProperty(s, m.sym)) try pathSubjectOn(ctx, r.owner, rt, id.name) else .none;
-            return narrowedType(ctx, if (subj == .none) m.sym else subj, t);
-        }
+        const ms = try receiverProperties(ctx, rt, n);
+        if (try calls.firstVisible(ctx, ms)) |m| return implicitMemberRead(ctx, id, access, .{ .m = m, .r = r, .rt = rt });
+        if (ms.len != 0 and hidden == null) hidden = .{ .m = ms[0], .r = r, .rt = rt };
         if (try calls.extensionProperty(ctx, rt, n)) |ext| {
             try ext.take();
             try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = kind, .target = ext.sym, .extension = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, .dispatch = ext.dispatch, .contexts = ext.contexts });
@@ -3651,9 +3648,44 @@ pub fn nameAccess(ctx: *Ctx, id: ast.Ident, access: Access) Allocator.Error!Type
         const v = try scope_mod.classifierInFileWhere(s, ctx.file, n, &isValueClassifier);
         if (v != .none) cls = if (s.syms.kind(v) == .type_alias) s.types.classSym(try s.types.makeNotNull(try headers.aliasTarget(s, v))) else v;
     }
-    if (cls != .none and s.syms.kind(cls) == .class) return classifierAsValue(ctx, cls, id.span);
+    if (cls != .none and s.syms.kind(cls) == .class and (hidden == null or isValueClass(s, cls))) return classifierAsValue(ctx, cls, id.span);
+    // Only a member the code cannot see is named: it is read, and invisible.
+    if (hidden) |h| {
+        if (!calls.generatedFile(ctx)) try ctx.reportFacts(.invisible, id.span, .{ .name = id.name, .syms = try ctx.arena().dupe(Sym, &.{h.m.sym}) }, "{s}", .{id.name});
+        return implicitMemberRead(ctx, id, access, h);
+    }
     try ctx.report(.unresolved_name, id.span, "{s}", .{id.name});
     return s.types.errType();
+}
+
+/// A member property of an implicit receiver, of that receiver's type.
+const ImplicitMember = struct { m: members.Member, r: Recv, rt: TypeId };
+
+/// The member properties named `n` an implicit receiver of type `rt` gives
+/// a bare name: none when it may be null, as the extensions on its nullable
+/// type apply.
+fn receiverProperties(ctx: *Ctx, rt: TypeId, n: Name) Allocator.Error![]const members.Member {
+    const s = ctx.s;
+    if (try subtyping.admitsNull(s, rt)) return &.{};
+    return members.withoutExtensionProperties(s, try members.lookup(s, rt, n, .property));
+}
+
+/// A bare name read or written as implicit receiver member `im`.
+fn implicitMemberRead(ctx: *Ctx, id: ast.Ident, access: Access, im: ImplicitMember) Allocator.Error!TypeId {
+    const s = ctx.s;
+    const m = im.m;
+    const kind: records.RefKind = if (access == .write) .write else .read;
+    const is_entry = s.syms.kind(m.sym) == .enum_entry;
+    // An enum entry is a static value: no receiver dispatches to it.
+    const recv: Receiver = if (is_entry or s.syms.flags(m.sym).static) .none else .{ .implicit = .{ .kind = im.r.kind, .owner = im.r.owner } };
+    const cx = (try calls.propertyContexts(ctx, m.sym, m.subst)) orelse &.{};
+    try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = if (is_entry) .object else kind, .target = m.sym, .dispatch = recv, .contexts = cx });
+    const t = try members.memberType(s, m);
+    if (access != .read or s.syms.kind(m.sym) != .property) return t;
+    // The smart casts on a stable one are on the path through its
+    // receiver; an explicit backing field casts any.
+    const subj: Sym = if (stableProperty(s, m.sym)) try pathSubjectOn(ctx, im.r.owner, im.rt, id.name) else .none;
+    return narrowedType(ctx, if (subj == .none) m.sym else subj, t);
 }
 
 /// An object, or a class with a companion: a class that is a value.

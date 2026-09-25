@@ -1358,7 +1358,7 @@ fn resolveLevels(ctx: *Ctx, levels: []const Level, id: ast.Ident, args: []Arg, t
     // Only candidates the call cannot see apply: it names one of them, and
     // cannot access it.
     if (hidden_level) |apps| {
-        const m = apps[0].cand.sym;
+        const m = try invisibleTarget(ctx, apps[0].cand);
         try ctx.reportFacts(.invisible, id.span, .{ .name = id.name, .syms = try ctx.arena().dupe(Sym, &.{m}) }, "{s}", .{id.name});
         return chooseAndComplete(ctx, apps, args, trailing, id, expected);
     }
@@ -1981,17 +1981,39 @@ fn onlyLowPriority(ctx: *Ctx, apps: []const Applied) Allocator.Error!bool {
 fn dropInvisible(ctx: *Ctx, apps: *std.ArrayList(Applied)) Allocator.Error!bool {
     var visible_n: usize = 0;
     for (apps.items) |a| {
-        if (try memberVisible(ctx, a.cand.sym)) visible_n += 1;
+        if (try candVisible(ctx, a.cand)) visible_n += 1;
     }
     if (visible_n == apps.items.len) return false;
     if (visible_n == 0) return true;
     var i: usize = 0;
     while (i < apps.items.len) {
-        if (!try memberVisible(ctx, apps.items[i].cand.sym)) {
+        if (!try candVisible(ctx, apps.items[i].cand)) {
             _ = apps.orderedRemove(i);
         } else i += 1;
     }
     return false;
+}
+
+/// Whether the code being resolved can see a candidate: its function and,
+/// for `invoke` on a property's value, the property.
+fn candVisible(ctx: *Ctx, c: Cand) Allocator.Error!bool {
+    if (!try memberVisible(ctx, c.sym)) return false;
+    return c.via == .none or try memberVisible(ctx, c.via);
+}
+
+/// The declaration a candidate the code cannot see names: the property
+/// whose value it invokes, or the function.
+fn invisibleTarget(ctx: *Ctx, c: Cand) Allocator.Error!Sym {
+    if (c.via != .none and !try memberVisible(ctx, c.via)) return c.via;
+    return c.sym;
+}
+
+/// The first of the members `ms` the code being resolved can see.
+pub fn firstVisible(ctx: *Ctx, ms: []const members.Member) Allocator.Error!?members.Member {
+    for (ms) |m| {
+        if (try memberVisible(ctx, m.sym)) return m;
+    }
+    return null;
 }
 
 /// Whether the code being resolved can see class member `sym`: a private
@@ -3256,21 +3278,22 @@ pub fn propertyAccess(ctx: *Ctx, t_in: TypeId, n: Name, sp: Span, access: body.A
         return ext.ty;
     };
     const ms = try members.withoutExtensionProperties(s, try members.lookup(s, t, n, .property));
-    if (ms.len != 0) {
-        const m = ms[0];
+    if (try firstVisible(ctx, ms)) |m| {
         const cx = (try propertyContexts(ctx, m.sym, m.subst)) orelse &.{};
         try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = if (s.syms.kind(m.sym) == .enum_entry) .object else kind, .target = m.sym, .dispatch = recv, .contexts = cx });
         return members.memberType(s, m);
     }
+    // A member the code cannot see does not hide an extension.
     if (try extensionProperty(ctx, t, n)) |ext| {
         try ext.take();
         try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = kind, .target = ext.sym, .extension = recv, .dispatch = ext.dispatch, .contexts = ext.contexts });
         return ext.ty;
     }
-    // Nothing else answers: a supertype's private property, which the
-    // receiver does not inherit, is the one named, and it is invisible
-    // but to a compiler plugin's generated code.
-    const hidden = try members.withoutExtensionProperties(s, try members.lookupWithPrivate(s, t, n, .property));
+    // Nothing else answers: a member the code cannot see, or a
+    // supertype's private property, which the receiver does not inherit,
+    // is the one named, and it is invisible but to a compiler plugin's
+    // generated code.
+    const hidden = if (ms.len != 0) ms else try members.withoutExtensionProperties(s, try members.lookupWithPrivate(s, t, n, .property));
     if (hidden.len != 0) {
         const m = hidden[0];
         if (!generatedFile(ctx)) try ctx.reportFacts(.invisible, sp, .{ .name = s.str(n), .syms = try ctx.arena().dupe(Sym, &.{m.sym}) }, "{s}", .{s.str(n)});
@@ -3283,7 +3306,7 @@ pub fn propertyAccess(ctx: *Ctx, t_in: TypeId, n: Name, sp: Span, access: body.A
 }
 
 /// Whether the code being resolved is a compiler plugin's.
-fn generatedFile(ctx: *const Ctx) bool {
+pub fn generatedFile(ctx: *const Ctx) bool {
     const fc = ctx.s.fileOf(ctx.file) orelse return false;
     return fc.generated;
 }

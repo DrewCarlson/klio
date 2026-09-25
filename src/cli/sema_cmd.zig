@@ -143,11 +143,18 @@ pub fn run(gpa: Allocator, args: []const []const u8) u8 {
     // The lowering census measures the base the sema pipeline runs on.
     if (lower) addSemaActuals(arena, &map, &files) catch return 2;
     const n_stdlib = files.items.len;
+    var syntax: Syntax = .{};
     for (inputs.items) |path| {
-        addPath(arena, &map, &files, path, .program) catch |e| {
+        addPath(arena, &map, &files, path, &syntax) catch |e| {
             io.printStderr(gpa, "error: cannot read {s}: {s}\n", .{ path, @errorName(e) });
             return 2;
         };
+    }
+    // A program that does not parse is analyzed as far as it parsed; its
+    // errors say why its census reads as it does.
+    if (syntax.files != 0) {
+        io.writeStderr(syntax.text.items);
+        io.printStdout(gpa, "[sema] program files with syntax errors: {d}\n", .{syntax.files});
     }
 
     // The installed packs the programs import, the way `klio run` selects
@@ -1169,25 +1176,33 @@ fn runWithFeatures(a: Allocator, source: []const u8, specs: *std.ArrayList([]con
     }
 }
 
-fn addPath(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, origin: sema.Origin) !void {
+/// The lex and parse errors of the program files a run analyzes, rendered,
+/// and how many files have them.
+const Syntax = struct {
+    text: std.ArrayList(u8) = .empty,
+    files: usize = 0,
+};
+
+/// A program file, or every `.kt` file below a program directory.
+fn addPath(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, syntax: *Syntax) !void {
     var threaded: std.Io.Threaded = .init(arena, .{});
     defer threaded.deinit();
     const fio = threaded.io();
     const st = try std.Io.Dir.cwd().statFile(fio, path, .{});
-    if (st.kind == .directory) return addDir(arena, map, files, path, origin);
+    if (st.kind == .directory) return addDir(arena, map, files, path, syntax);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(fio, path, arena, .unlimited);
-    try addSource(arena, map, files, path, bytes, origin);
+    try addSourceReporting(arena, map, files, path, bytes, .program, syntax);
 }
 
 /// Every `.kt` file below `dir_path`, recursively, sorted by path the way
 /// the oracle orders them.
-fn addDir(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), dir_path: []const u8, origin: sema.Origin) !void {
+fn addDir(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), dir_path: []const u8, syntax: *Syntax) !void {
     var threaded: std.Io.Threaded = .init(arena, .{});
     defer threaded.deinit();
     const fio = threaded.io();
     for (try ktFilesBelow(arena, dir_path)) |full| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(fio, full, arena, .unlimited);
-        try addSource(arena, map, files, full, bytes, origin);
+        try addSourceReporting(arena, map, files, full, bytes, .program, syntax);
     }
 }
 
@@ -1217,6 +1232,12 @@ fn ktFilesBelow(arena: Allocator, dir_path_in: []const u8) ![]const []const u8 {
 }
 
 fn addSource(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8, origin: sema.Origin) !void {
+    return addSourceReporting(arena, map, files, path, bytes, origin, null);
+}
+
+/// `addSource`, rendering the file's diagnostics into `syntax` when it has
+/// a lex or parse error.
+fn addSourceReporting(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8, origin: sema.Origin, syntax: ?*Syntax) !void {
     const id = try map.add(path, bytes);
     const src = map.get(id).source;
     var lx = try lexer.Lexer.init(arena, id, src);
@@ -1229,6 +1250,13 @@ fn addSource(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.
     defer parser.language = saved_language;
     if (origin == .program) runWithLanguage(src);
     file_ast.* = p.parseFile();
+    if (syntax) |out| {
+        if (lexed.diagnostics.hasErrors() or p.diagnostics.hasErrors()) {
+            try lexed.diagnostics.render(arena, map, &out.text);
+            try p.diagnostics.render(arena, map, &out.text);
+            out.files += 1;
+        }
+    }
     try files.append(arena, .{ .ast = file_ast, .path = path, .origin = origin });
 }
 

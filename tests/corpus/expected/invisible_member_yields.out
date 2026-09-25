@@ -1,0 +1,16 @@
+draw alpha=0.5 colorFilter=tint
+draw alpha=0.5 colorFilter=tint
+draw alpha=0.5 colorFilter=tint
+draw alpha=0.5 colorFilter=tint
+draw alpha=0.5 colorFilter=tint
+nested alpha=0.5 tag=other
+draw alpha=0.5 colorFilter=tint
+after write alpha=0.25 colorFilter=written
+own alpha=0.5 colorFilter=tint note=null
+5
+2
+2
+inside x=1 f=member f
+outer f
+level=1 depth=2
+holder sees level=7 depth=2

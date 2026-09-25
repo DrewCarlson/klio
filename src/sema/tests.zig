@@ -6334,6 +6334,89 @@ test "a supertype's private member is found and refused as invisible" {
     });
 }
 
+test "a member the code cannot see does not hide an outer receiver's property" {
+    var fx = try fixture(&.{
+        \\package app
+        \\abstract class Painter {
+        \\    private var colorFilter: String? = null
+        \\    private var alpha: Int = 1
+        \\    private val note: String? = null
+        \\    private val f: () -> Int = { 1 }
+        \\    fun draw(alpha: Int, colorFilter: String?) {}
+        \\}
+        \\class Other { private val alpha: Int = 9 }
+        \\class PainterNode(val painter: Painter, var alpha: Int, var colorFilter: String?, val note: String?) {
+        \\    val f: () -> Int = { 2 }
+        \\    fun named() { with(painter) { draw(alpha = alpha, colorFilter = colorFilter) } }
+        \\    fun Painter.ext() { draw(alpha, colorFilter /*ext*/) }
+        \\    fun applied() { painter.apply { draw(alpha, colorFilter /*apply*/) } }
+        \\    fun nested(o: Other) { with(painter) { with(o) { draw(alpha /*nested*/, colorFilter) } } }
+        \\    fun write() { with(painter) { alpha = 25 } }
+        \\    fun cast(): Int = with(painter) { if (note != null) note.length else -1 }
+        \\    fun invoked(): Int = with(painter) { f() }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("draw(alpha = ^alpha", "app/PainterNode.alpha");
+    try fx.expectTarget("colorFilter = ^colorFilter) } }", "app/PainterNode.colorFilter");
+    try fx.expectTarget("^colorFilter /*ext*/", "app/PainterNode.colorFilter");
+    try fx.expectTarget("^colorFilter /*apply*/", "app/PainterNode.colorFilter");
+    try fx.expectTarget("^alpha /*nested*/", "app/PainterNode.alpha");
+    try fx.expectRef("^alpha = 25", .write, "app/PainterNode.alpha");
+    try fx.expectTarget("note.^length", "kotlin/String.length");
+    try fx.expectRef("{ ^f() }", .read, "app/PainterNode.f");
+}
+
+test "a protected member is seen from a subclass only, an internal one everywhere" {
+    var fx = try fixture(&.{
+        \\package app
+        \\abstract class Base {
+        \\    protected var level: Int = 1
+        \\    internal var depth: Int = 2
+        \\}
+        \\class Sub : Base() {
+        \\    fun read(s: Sub) = with(s) { level /*sub*/ }
+        \\}
+        \\class Holder(var level: Int, var depth: Int) {
+        \\    fun read(s: Sub) = with(s) { level + depth /*holder*/ }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("^level /*sub*/", "app/Base.level");
+    try fx.expectRef("^level + depth /*holder*/", .read, "app/Holder.level");
+    try fx.expectTarget("^depth /*holder*/", "app/Base.depth");
+}
+
+test "a member the code cannot see does not hide an extension, and alone is invisible" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class P {
+        \\    private val x = 1
+        \\    private val y = 1
+        \\    fun inside() = x
+        \\}
+        \\val P.x: Int get() = 2
+        \\fun explicit(p: P) = p.x
+        \\fun implicit(p: P) = with(p) { x /*implicit*/ }
+        \\fun alone(p: P) = p.y + with(p) { y /*alone*/ }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectTarget("p.^x", "app/x");
+    try fx.expectTarget("^x /*implicit*/", "app/x");
+    try fx.expectTarget("fun inside() = ^x", "app/P.x");
+    try fx.expectTarget("p.^y", "app/P.y");
+    try fx.expectTarget("^y /*alone*/", "app/P.y");
+    try expectMessages(&fx, &.{
+        "cannot access 'val y: Int': it is private in 'P'.",
+        "cannot access 'val y: Int': it is private in 'P'.",
+    });
+}
+
 test "a compiler plugin's generated code reads a supertype's private property" {
     var fx = try fixtureGenerated(&.{
         \\package app
