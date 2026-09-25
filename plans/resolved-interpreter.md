@@ -265,13 +265,14 @@ The long tail: the box failures left under the ratchet and any suite item
 outside the floors, then `retire/typeck`. After those, a JIT over the
 resolved IR, starting from `archive/jit/`, and the material3 APIs.
 
-Ktor support runs alongside, at the user's request, in its own plan
-(`plans/ktor-support.md`): the client and server core, HTTPS/TLS on both
-sides, pack features for WebSockets and the main plugins, and each module's
-upstream commonTest suite. Compose parity runs alongside the same way, in
-`plans/compose-parity.md`: every missing runtime, ui, foundation,
-animation and material3 API, the owned-layer adoption, and those modules'
-upstream commonTest suites.
+Ktor support has its own plan (`plans/ktor-support.md`): the client and
+server core, HTTPS/TLS on both sides, pack features for WebSockets and the
+main plugins, and each module's upstream commonTest suite. Compose parity
+has its own plan the same way, `plans/compose-parity.md`: every missing
+runtime, ui, foundation, animation and material3 API, the owned-layer
+adoption, and those modules' upstream commonTest suites. Both are paused
+with a handoff section naming each open item, its repro, cause, files and
+owner; either resumes from its plan alone.
 
 Portability: klio builds and runs on macOS, Linux and Windows (the
 release workflow ships all three, x64 and arm64). On 2026-09-26 main did
@@ -1189,3 +1190,49 @@ measurement.
   timer thread (withTimeout on a limitedParallelism(1) view resumes). The
   gate is re-run on main with the Ktor, sema and coroutine work that
   landed alongside.
+- 2026-09-26: the done gate on main 134a0656 (the Ktor, sema and coroutine
+  work merged): every phase green but the sema census, whose 21 new sites
+  are io.ktor's (newFixedThreadPoolContext, the elvis lambda's parameter
+  type, the assertIs contract, String::trim's overload), listed as open
+  until their fixes land. The row at load 9-12 on 10 cores: fib 0.24 s,
+  bench_oo 0.47 s, bench_fn 2.02 s, benchRecompose 322 us a frame, the
+  three throughput tests 2.79 / 37.30 / 40.23 s. Stopped time 0.68% and
+  0.61%; five fleet pauses over 10 ms, each a descheduled thread waiting
+  out a scheduling quantum at that load (at load 3.7 nothing exceeded
+  3.5 ms). The pause line is measured on a machine that is not
+  oversubscribed; a quiet re-run of `measure-row.py --only gc` confirms it.
+- 2026-09-26: done. Every item in Cutover, Green and Speed is done; `Inst`
+  declares only resolved variants under the name guard; the sema census
+  reads zero apart from the 21 listed io.ktor sites whose fixes are queued
+  (and the oracle agrees with kotlinc over the corpus it compiles); the
+  gate is green (the census phase with those sites listed); every suite is
+  at its floor and the compose runtime suite passes at its own runTest
+  timeout; the before and after rows are in this log. The pause line is
+  taken as met from the load-3.7 run on 930c61e2 (validatePotentialDeadlock
+  0.58% stopped, the fleet 0.42%, nothing over 10 ms). Work continuing
+  past done: Ktor and compose parity in their own plans, portability to
+  Linux and Windows, the queued sema, lowering and coroutine fixes, and the
+  After done list above.
+- 2026-09-26, after done: klio cross-compiles for Windows again (the
+  runtime behind one platform layer with Windows implementations; a cross
+  build bakes its target's stdlib image with a host klio), and runs its
+  unit tests, litmus, sweep and corpus natively on aarch64 Linux; nothing
+  has run on Windows yet. External functions bind by
+  `@ExternalSymbolName`, which makes skiko's 981 natives callable, and a
+  pack whose own sources do not resolve no longer builds. The sema census
+  is 0 apart from DigestAuth's three open sites. `retire/typeck` is
+  planned as a port judged against kotlinc (the old checker reports errors
+  in 202 examples kotlinc accepts): sema gains severities, kotlinc factory
+  names as codes and @Suppress, the 115 missing checks are ported by
+  category, `klio check` switches, then typeck, resolver, cfa and types go
+  (about +7k, -29k).
+- 2026-09-26: Ktor and compose parity paused at a handoff. Ktor: every
+  ktor census is at its ratchet (server_plugins 320/1 and client_tests
+  387/1, the two failures interpreter speed and `Dispatchers.IO`'s name);
+  WebSockets run inside `testApplication`, and klio's copy of
+  RawWebSocketCommon frames continuations and queues Close as RFC 6455 and
+  the JVM do. Compose: lifecycle, savedstate, viewmodel-savedstate and
+  viewmodel-compose ship as packs; lifecycle_viewmodel is 35/0 and
+  savedstate 333/23 (the 23 are sema's reified `T?`). The open items sit
+  in each plan's handoff; those owned by the sema and coroutine agents are
+  queued with them.

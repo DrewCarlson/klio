@@ -1,3 +1,28 @@
 # Known unresolved, unrecorded or unlowered sites of scripts/sema-census.py:
 # <reason> <path:line:col>, then the first scope and the detail after tabs.
 # The gate fails on any other site and on a listed one that is gone.
+# io.ktor: kotlinx.coroutines does not provide newFixedThreadPoolContext yet.
+lower_lowering upstream/ktor-client/ktor-client-core/posix/src/io/ktor/client/utils/CoroutineUtilsPosix.kt:23:26	pack:io.ktor	no call record
+lower_lowering upstream/ktor-utils/posix/src/io/ktor/util/CoroutineUtils.kt:21:5	pack:io.ktor	no call record
+unresolved_call upstream/ktor-client/ktor-client-core/posix/src/io/ktor/client/utils/CoroutineUtilsPosix.kt:23:26	pack:io.ktor	newFixedThreadPoolContext
+unresolved_call upstream/ktor-utils/posix/src/io/ktor/util/CoroutineUtils.kt:21:5	pack:io.ktor	newFixedThreadPoolContext
+unresolved_import upstream/ktor-client/ktor-client-core/posix/src/io/ktor/client/utils/CoroutineUtilsPosix.kt:11:1	pack:io.ktor	kotlinx.coroutines.newFixedThreadPoolContext
+unresolved_import upstream/ktor-utils/posix/src/io/ktor/util/CoroutineUtils.kt:11:1	pack:io.ktor	kotlinx.coroutines.newFixedThreadPoolContext
+# io.ktor: a lambda on the right of `?:` does not take its parameter type from the left side's function type, so `call.request` is unresolved.
+lower_lowering upstream/ktor-server/ktor-server-plugins/ktor-server-hsts/common/src/io/ktor/server/plugins/hsts/HSTS.kt:135:9	pack:io.ktor	no call record
+receiver_unresolved upstream/ktor-server/ktor-server-plugins/ktor-server-hsts/common/src/io/ktor/server/plugins/hsts/HSTS.kt:135:14	pack:io.ktor	request
+receiver_unresolved upstream/ktor-server/ktor-server-plugins/ktor-server-hsts/common/src/io/ktor/server/plugins/hsts/HSTS.kt:135:22	pack:io.ktor	origin
+receiver_unresolved upstream/ktor-server/ktor-server-plugins/ktor-server-hsts/common/src/io/ktor/server/plugins/hsts/HSTS.kt:135:29	pack:io.ktor	run
+unresolved_name upstream/ktor-server/ktor-server-plugins/ktor-server-hsts/common/src/io/ktor/server/plugins/hsts/HSTS.kt:135:35	pack:io.ktor	scheme
+unresolved_name upstream/ktor-server/ktor-server-plugins/ktor-server-hsts/common/src/io/ktor/server/plugins/hsts/HSTS.kt:135:56	pack:io.ktor	serverPort
+# io.ktor: `map(String::trim)` binds CharSequence.trim instead of the more specific String.trim.
+lower_lowering upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:815:13	pack:io.ktor	no call record
+no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:815:21	pack:io.ktor	append(kotlin.CharSequence, kotlin.CharSequence)
+# io.ktor: assertIs<Frame.Text>(frame) smart casts frame to `Frame & T`; the contract's T is not substituted with the call's type argument.
+lower_lowering upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:269:36	pack:io.ktor	no call record
+lower_lowering upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:623:17	pack:io.ktor	no call record
+lower_lowering upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:651:42	pack:io.ktor	no call record
+no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:269:42	pack:io.ktor	readText()
+no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:623:23	pack:io.ktor	complete(io.ktor.websocket.Frame & T)
+no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:627:24	pack:io.ktor	complete(io.ktor.websocket.Frame & T)
+no_applicable upstream/ktor-server/ktor-server-test-suites/common/src/io/ktor/server/testing/suites/WebSocketEngineSuite.kt:651:48	pack:io.ktor	readText()
