@@ -48,6 +48,7 @@ import androidx.compose.ui.window.__composeui_hideKeyboard
 import androidx.compose.ui.window.__composeui_setTextCallback
 import androidx.compose.ui.window.__composeui_showKeyboard
 import androidx.compose.ui.window.__composeui_textInput
+import androidx.compose.ui.window.KlioWindowTextInput
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
@@ -140,21 +141,23 @@ internal object KlioPlatformTextInputService : androidx.compose.ui.text.input.Pl
 /**
  * What a klio window's or the mobile surface's scene knows of its platform:
  * the window's focus and size, its lifecycle, view model store and saved
- * state, the input mode, and the platform's text input.
+ * state, the input mode, and the text input: a desktop window's input method
+ * ([windowTextInput]), or the mobile platform's keyboard.
  */
 @OptIn(InternalComposeUiApi::class)
-internal open class KlioPlatformContext(
+internal class KlioPlatformContext(
     override val windowInfo: WindowInfoImpl,
     override val architectureComponentsOwner: DefaultArchitectureComponentsOwner,
+    val windowTextInput: KlioWindowTextInput? = null,
 ) : PlatformContext {
     override val inputModeManager: InputModeManager = DefaultInputModeManager()
 
     @Suppress("DEPRECATION")
     override val textInputService: androidx.compose.ui.text.input.PlatformTextInputService
-        get() = KlioPlatformTextInputService
+        get() = windowTextInput ?: KlioPlatformTextInputService
 
     override suspend fun startInputMethod(request: PlatformTextInputMethodRequest): Nothing =
-        KlioPlatformTextInputService.startInputMethod(request)
+        windowTextInput?.startInputMethod(request) ?: KlioPlatformTextInputService.startInputMethod(request)
 }
 
 /**

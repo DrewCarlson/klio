@@ -43,6 +43,7 @@ import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.InternalComposeUiApi
+import androidx.compose.ui.ProvideSystemTheme
 import androidx.compose.ui.klio.KlioPlatformContext
 import androidx.compose.ui.klio.KlioRecomposerDriver
 import androidx.compose.ui.platform.DefaultArchitectureComponentsOwner
@@ -133,7 +134,11 @@ internal class KlioApplication(
         // The window is focused and sized before its content first composes,
         // as a desktop window's is: Popup and Dialog place by its size.
         val components = DefaultArchitectureComponentsOwner().apply { enableSavedStateHandles() }
-        val platformContext = KlioPlatformContext(WindowInfoImpl().apply { isWindowFocused = true }, components)
+        val platformContext = KlioPlatformContext(
+            WindowInfoImpl().apply { isWindowFocused = true },
+            components,
+            windowTextInput = if (hosted) null else KlioWindowTextInput(handle),
+        )
         var holder: KlioWindowHolder? = null
         val invalidate = { holder?.dirty = true }
         val frameRecomposer = FrameRecomposer(driver.dispatcherContext, invalidate)
@@ -150,7 +155,9 @@ internal class KlioApplication(
         created.resize(w, h)
         created.updateLifecycleState()
         holder = created
-        scene.setContent(parent) { content() }
+        // A desktop window's content has the system's theme, as the desktop's
+        // scene gives it.
+        scene.setContent(parent) { if (hosted) content() else ProvideSystemTheme(content) }
         windows.add(created)
         return created
     }
@@ -415,7 +422,7 @@ internal class KlioWindowHolder(
 
     /** Whether the window's unpainted pixels are see-through. */
     var transparent: Boolean = false
-    val input = KlioWindowInput(scene, platformContext.windowInfo).also { input ->
+    val input = KlioWindowInput(scene, platformContext.windowInfo, handle, platformContext.windowTextInput).also { input ->
         input.menuShortcut = { event -> menuBar?.shortcut(event) ?: false }
         input.onFocusChanged = { updateLifecycleState() }
     }
@@ -986,6 +993,8 @@ private fun renderWindowFrame(holder: KlioWindowHolder) {
     __composeui_winClear(holder.handle, if (holder.transparent) 0 else WINDOW_BACKGROUND)
     klioDrawToSurface(surface) { holder.scene.draw(this) }
     __composeui_winPresent(holder.handle)
+    // The candidate window follows the focused field's cursor as it moves.
+    holder.platformContext.windowTextInput?.updateRect()
 }
 
 /** The values of the event a window's poll last reported. */
@@ -1032,7 +1041,7 @@ private fun dropsBlocked(blocker: KlioWindowHolder, type: Int, v: DoubleArray): 
     val forward = when (type) {
         WINDOW_EVENT_POINTER -> v[0].toInt() == 1
         WINDOW_EVENT_FOCUS -> v[0] != 0.0
-        WINDOW_EVENT_KEY, WINDOW_EVENT_TEXT, WINDOW_EVENT_MENU -> false
+        WINDOW_EVENT_KEY, WINDOW_EVENT_TEXT, WINDOW_EVENT_IME, WINDOW_EVENT_MENU -> false
         else -> return false
     }
     if (forward) __composeui_winSetFlag(blocker.handle, WIN_FRONT, 1)

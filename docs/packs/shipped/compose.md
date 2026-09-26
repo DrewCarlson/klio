@@ -80,8 +80,7 @@ signature:
   adapted copies of the foundation desktop files that are java-free once their AWT calls
   are replaced (the scroll configuration answers the per-OS defaults, the
   text field selection reads klio's clipboard entry; typed-key detection
-  and the character palette throw until the scene delivers native key
-  events), and the
+  reads klio's native key event), and the
   runtime's thread ids, identity hash, locks and frame clock. A body klio cannot serve throws `UnsupportedOperationException`
   naming what is missing.
 - everything else a skiko desktop target compiles comes from upstream: each

@@ -90,10 +90,10 @@ GREP_STDERR = None
 def run_env(path):
     """An example runs with a clipboard of its own (KLIO_CLIPBOARD=private), so
     the corpus neither reads nor replaces the user's, and in the en-US locale
-    (KLIO_LOCALE) whatever the host's. One with a
-    `<name>.input` beside it runs with that file as its window's scripted
-    input (KLIO_WIN_INPUT)."""
-    env = dict(os.environ, KLIO_CLIPBOARD="private", KLIO_LOCALE="en-US")
+    (KLIO_LOCALE) and a light system theme (KLIO_SYSTEM_THEME) whatever the
+    host's. One with a `<name>.input` beside it runs with that file as its
+    window's scripted input (KLIO_WIN_INPUT)."""
+    env = dict(os.environ, KLIO_CLIPBOARD="private", KLIO_LOCALE="en-US", KLIO_SYSTEM_THEME="light")
     script = path[: -len(".kt")] + ".input"
     if os.path.exists(script):
         env["KLIO_WIN_INPUT"] = os.path.abspath(script)

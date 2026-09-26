@@ -325,24 +325,50 @@ void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
 // null for none. The surface owns it.
 SkCanvas* klio_skia_surf_canvas(KlioSurface* s) { return canvasOf(s); }
 
-// One pixel as ARGB (unpremultiplied), or 0 when out of range / unreadable.
-// Backs ImageBitmap.readPixels; per-pixel readback keeps the ABI scalar-only.
 // A surface's width (which 0) or height (which 1); 0 for none.
 int klio_skia_surf_size(KlioSurface* s, int which) {
     if (!s || !s->surface) return 0;
     return which == 0 ? s->surface->width() : s->surface->height();
 }
 
-
-
-
-
 }  // extern "C"
+
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <TargetConditionals.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
 
 extern "C" {
 
 // Frees a C string the shim returned (the clipboard's text, a locale name).
 void klio_skia_free_cstr(char* s) { std::free(s); }
+
+// The system's appearance, as skiko reads it: 0 light, 1 dark, 2 unknown.
+// macOS answers by its interface style and Windows by whether apps use the
+// light theme; elsewhere it is unknown.
+int klio_system_theme(void) {
+#if defined(__APPLE__) && TARGET_OS_OSX
+    CFPropertyListRef style =
+        CFPreferencesCopyAppValue(CFSTR("AppleInterfaceStyle"), kCFPreferencesAnyApplication);
+    if (!style) return 0;
+    const bool dark = CFGetTypeID(style) == CFStringGetTypeID() &&
+                      CFStringCompare(static_cast<CFStringRef>(style), CFSTR("Dark"), 0) == kCFCompareEqualTo;
+    CFRelease(style);
+    return dark ? 1 : 0;
+#elif defined(_WIN32)
+    DWORD light = 1;
+    DWORD size = sizeof(light);
+    const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER,
+                                        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                                        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+    if (status != ERROR_SUCCESS) return 2;
+    return light == 0 ? 1 : 0;
+#else
+    return 2;
+#endif
+}
 
 }  // extern "C"
 
@@ -449,6 +475,10 @@ struct KlioWindow {
     unsigned menuShown = 0;            // the menu state the window last showed
     struct KlioMenuUi* menu = nullptr;  // its menu bar, which the window draws
     KlioFrameReport frameReport;       // the frame and placement last reported
+    bool textInput = false;            // a text field has the keyboard (klio_win_set_text_input)
+    bool composing = false;            // the input method is composing
+    SDL_Rect imeRect = {0, 0, 0, 0};   // the text cursor, in the content
+    std::string eventText;             // the text of the event last polled
 #if defined(KLIO_GPU)
     SDL_GLContext gl = nullptr;
     sk_sp<GrDirectContext> grContext;  // per-window GL context for the on-screen GPU
@@ -628,6 +658,10 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return nullptr;
     SDL_SetMainReady();
     if (!klioSdlWindowsHoldVideo) {
+#if SDL_VERSION_ATLEAST(2, 0, 22)
+        // A composition longer than SDL_TEXTEDITING's 32 bytes arrives whole.
+        SDL_SetHint(SDL_HINT_IME_SUPPORT_EXTENDED_TEXT, "1");
+#endif
         if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
             klioWinFailed(std::string("SDL could not start its video subsystem: ") + SDL_GetError());
             return nullptr;
@@ -1446,6 +1480,32 @@ static void klioSdlPaintFrame(KlioWindow* kw) {
 }
 
 // Translates one SDL event into the events of its window.
+// The input method's composing text, while a text field has the keyboard; an
+// empty one ends the composition.
+static void klioSdlCompose(KlioWindow* kw, const char* text) {
+    if (!kw->textInput || (kw->menu && !kw->menu->panels.empty())) return;
+    if (!text[0] && !kw->composing) return;
+    kw->composing = text[0] != 0;
+    kw->events.push_back(klioImeEv("", text));
+}
+
+// Drops the input method's composition without committing it.
+static void klioSdlClearComposition() {
+#if SDL_VERSION_ATLEAST(2, 0, 22)
+    SDL_ClearComposition();
+#else
+    SDL_StopTextInput();
+    SDL_StartTextInput();
+#endif
+}
+
+// Places the input method's candidate window at the window's text cursor.
+static void klioSdlPlaceIme(KlioWindow* kw) {
+    if (!kw->textInput || SDL_GetKeyboardFocus() != kw->win) return;
+    SDL_Rect r = kw->imeRect;
+    SDL_SetTextInputRect(&r);
+}
+
 static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
     switch (ev.type) {
         case SDL_WINDOWEVENT: {
@@ -1481,6 +1541,7 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
                     return;
                 case SDL_WINDOWEVENT_FOCUS_GAINED:
                     if (!klioScriptDrivesFocus()) kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
+                    klioSdlPlaceIme(kw);
                     return;
                 case SDL_WINDOWEVENT_FOCUS_LOST:
                     if (!klioScriptDrivesFocus()) kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
@@ -1546,8 +1607,24 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
         }
         case SDL_TEXTINPUT:
             if (kw->menu && !kw->menu->panels.empty()) return;
+            // The end of a composition is the input method's commit; other
+            // text is what the keys typed.
+            if (kw->composing) {
+                kw->composing = false;
+                kw->events.push_back(klioImeEv(ev.text.text, ""));
+                return;
+            }
             klioPushText(kw->events, ev.text.text);
             return;
+        case SDL_TEXTEDITING:
+            klioSdlCompose(kw, ev.edit.text);
+            return;
+#if SDL_VERSION_ATLEAST(2, 0, 22)
+        case SDL_TEXTEDITING_EXT:
+            klioSdlCompose(kw, ev.editExt.text);
+            SDL_free(ev.editExt.text);
+            return;
+#endif
         default:
             return;
     }
@@ -1579,6 +1656,10 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
             case SDL_MOUSEMOTION: wid = ev.motion.windowID; break;
             case SDL_MOUSEWHEEL: wid = ev.wheel.windowID; break;
             case SDL_TEXTINPUT: wid = ev.text.windowID; break;
+            case SDL_TEXTEDITING: wid = ev.edit.windowID; break;
+#if SDL_VERSION_ATLEAST(2, 0, 22)
+            case SDL_TEXTEDITING_EXT: wid = ev.editExt.windowID; break;
+#endif
             case SDL_KEYDOWN:
             case SDL_KEYUP: wid = ev.key.windowID; break;
             default: wid = kw->id; break;
@@ -1588,7 +1669,7 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
         klioSdlTranslate(it->second, ev);
     }
     for (;;) {
-        const int type = klioPopEv(kw->events, out);
+        const int type = klioPopEv(kw->events, out, &kw->eventText);
         if (type != KLIO_EV_MENU_PATH) {
             klioSdlShowMenus();
             return type;
@@ -1598,6 +1679,43 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
         if (kw->menu) klioMenuPath(*kw->menu, klioScriptTexts()[at], out[1] != 0);
     }
 }
+
+// A text field has the keyboard, or none has: while one has it the input
+// method composes into it. SDL's text input, which delivers the characters
+// keys type, stays on either way.
+void klio_win_set_text_input(KlioWindow* kw, int enabled) {
+    if (!kw) return;
+    kw->textInput = enabled != 0;
+    if (kw->textInput) {
+        klioSdlPlaceIme(kw);
+    } else if (kw->composing) {
+        kw->composing = false;
+        klioSdlClearComposition();
+    }
+}
+
+// The text field's cursor, in the window's content, where the input method
+// places its candidate window.
+void klio_win_set_text_input_rect(KlioWindow* kw, int x, int y, int w, int h) {
+    if (!kw) return;
+    kw->imeRect = {x, y + kw->barH, w, h};
+    klioSdlPlaceIme(kw);
+}
+
+// The text field ended the composition itself: the input method drops it.
+void klio_win_end_composition(KlioWindow* kw) {
+    if (!kw || !kw->composing) return;
+    kw->composing = false;
+    klioSdlClearComposition();
+}
+
+// The text of the event klio_win_poll_event last returned.
+size_t klio_win_event_text(KlioWindow* kw, char* buf, size_t cap) {
+    return kw ? klioCopyEventText(kw->eventText, buf, cap) : 0;
+}
+
+// Only macOS has an emoji and symbols palette to open.
+void klio_order_emoji_palette(void) {}
 
 // A window's menu bar: SDL has no native menus, so the window draws the bar
 // and its menus itself, and the bar's height comes out of the content, whose
@@ -2500,6 +2618,7 @@ char* klio_host_locale(void) { return nullptr; }
 // each poll pumps the queue and returns the first translated event. Compile-checked
 // via a Windows cross target; not run-verified.
 #include <windows.h>
+#include <imm.h>
 #include <shellapi.h>
 
 struct KlioWindow {
@@ -2526,6 +2645,10 @@ struct KlioWindow {
     std::vector<KlioMenuEntry> menuEntries;
     std::vector<HBITMAP> menuBitmaps;  // its items' icons
     bool layered = false;       // transparent: presented with its alpha
+    bool textInput = false;     // a text field has the keyboard (klio_win_set_text_input)
+    bool composing = false;     // the input method is composing
+    RECT imeRect = {0, 0, 0, 0};  // the text cursor, in the client area
+    std::string eventText;      // the text of the event last polled
 };
 
 // A menu item's command: its entry's index past this base.
@@ -2677,6 +2800,8 @@ static void klioWinTranslate(KlioWindow* kw, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_SYSKEYDOWN:
         case WM_KEYUP:
         case WM_SYSKEYUP: {
+            // A key the input method takes is its, as AWT drops it.
+            if (wParam == VK_PROCESSKEY) return;
             int vk = 0;
             int loc = KLIO_LOC_STANDARD;
             klioWinKey(wParam, lParam, &vk, &loc);
@@ -2739,9 +2864,80 @@ static void klioWinTranslate(KlioWindow* kw, UINT msg, WPARAM wParam, LPARAM lPa
                                        kw->buttons, klioWinMods()));
 }
 
+// The input method's composition string of the kind asked for (GCS_RESULTSTR,
+// GCS_COMPSTR), as UTF-8.
+static std::string klioWinImeString(HIMC himc, DWORD kind) {
+    const LONG bytes = ImmGetCompositionStringW(himc, kind, nullptr, 0);
+    if (bytes <= 0) return std::string();
+    std::wstring w(static_cast<size_t>(bytes) / sizeof(wchar_t), L'\0');
+    ImmGetCompositionStringW(himc, kind, &w[0], static_cast<DWORD>(bytes));
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &out[0], n, nullptr, nullptr);
+    return out;
+}
+
+// Places the input method's composition and candidate windows at the text cursor.
+static void klioWinPlaceIme(KlioWindow* kw) {
+    HIMC himc = ImmGetContext(kw->hwnd);
+    if (!himc) return;
+    const RECT& r = kw->imeRect;
+    COMPOSITIONFORM comp = {};
+    comp.dwStyle = CFS_POINT;
+    comp.ptCurrentPos.x = r.left;
+    comp.ptCurrentPos.y = r.top;
+    ImmSetCompositionWindow(himc, &comp);
+    CANDIDATEFORM cand = {};
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_EXCLUDE;
+    cand.ptCurrentPos.x = r.left;
+    cand.ptCurrentPos.y = r.bottom;
+    cand.rcArea = r;
+    ImmSetCandidateWindow(himc, &cand);
+    ImmReleaseContext(kw->hwnd, himc);
+}
+
+// The input method's messages while a text field has the keyboard: the field
+// shows the composition itself, so the input method's own composition window
+// stays hidden, and what it composes and commits is queued as KLIO_EV_IME.
+// True when the message was handled.
+static bool klioWinIme(KlioWindow* kw, UINT msg, LPARAM lParam) {
+    if (!kw->textInput) return false;
+    switch (msg) {
+        case WM_IME_STARTCOMPOSITION:
+            klioWinPlaceIme(kw);
+            return true;
+        case WM_IME_COMPOSITION: {
+            HIMC himc = ImmGetContext(kw->hwnd);
+            if (!himc) return true;
+            const std::string committed =
+                (lParam & GCS_RESULTSTR) ? klioWinImeString(himc, GCS_RESULTSTR) : std::string();
+            const std::string composing =
+                (lParam & GCS_COMPSTR) ? klioWinImeString(himc, GCS_COMPSTR) : std::string();
+            ImmReleaseContext(kw->hwnd, himc);
+            if (committed.empty() && composing.empty() && !kw->composing) return true;
+            kw->composing = !composing.empty();
+            kw->events.push_back(klioImeEv(committed.c_str(), composing.c_str()));
+            return true;
+        }
+        case WM_IME_ENDCOMPOSITION:
+            if (kw->composing) {
+                kw->composing = false;
+                kw->events.push_back(klioImeEv("", ""));
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
 static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* kw = reinterpret_cast<KlioWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
     if (kw) klioWinTranslate(kw, msg, wParam, lParam);
+    if (kw && klioWinIme(kw, msg, lParam)) return 0;
+    if (kw && msg == WM_IME_SETCONTEXT && kw->textInput) {
+        return DefWindowProc(hwnd, msg, wParam, lParam & ~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW));
+    }
     if (kw) {
         switch (msg) {
             case WM_LBUTTONDOWN:
@@ -2911,7 +3107,7 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
 // The window's next event, a scripted menu choice performed on the way.
 static int klioWinPop(KlioWindow* kw, double* out) {
     for (;;) {
-        const int type = klioPopEv(kw->events, out);
+        const int type = klioPopEv(kw->events, out, &kw->eventText);
         if (type != KLIO_EV_MENU_PATH) return type;
         const size_t at = static_cast<size_t>(out[0]);
         // A native menu is not left open: menushow is the drawn menus'.
@@ -3282,6 +3478,44 @@ void klio_win_post_event(KlioWindow* kw, int type, const double* values) {
     for (int i = 0; i < KLIO_EV_VALUES; i++) e.v[i] = values[i];
     kw->events.push_back(e);
 }
+
+// The text field ended the composition itself: the input method drops it.
+void klio_win_end_composition(KlioWindow* kw) {
+    if (!kw || !kw->composing) return;
+    kw->composing = false;
+    HIMC himc = ImmGetContext(kw->hwnd);
+    if (!himc) return;
+    ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+    ImmReleaseContext(kw->hwnd, himc);
+}
+
+// A text field has the keyboard, or none has: the window has the input method
+// only while one has it, as AWT enables input methods for a text component.
+void klio_win_set_text_input(KlioWindow* kw, int enabled) {
+    if (!kw) return;
+    const bool on = enabled != 0;
+    if (!on && kw->composing) klio_win_end_composition(kw);
+    kw->textInput = on;
+    ImmAssociateContextEx(kw->hwnd, nullptr, on ? IACE_DEFAULT : 0);
+    if (on) klioWinPlaceIme(kw);
+}
+
+// The text field's cursor, in the window's client area, where the input
+// method places its candidate window.
+void klio_win_set_text_input_rect(KlioWindow* kw, int x, int y, int w, int h) {
+    if (!kw) return;
+    kw->imeRect = {x, y, x + w, y + h};
+    if (kw->textInput) klioWinPlaceIme(kw);
+}
+
+// The text of the event klio_win_poll_event last returned.
+size_t klio_win_event_text(KlioWindow* kw, char* buf, size_t cap) {
+    return kw ? klioCopyEventText(kw->eventText, buf, cap) : 0;
+}
+
+// Only macOS has an emoji and symbols palette to open; Windows' emoji panel
+// is the user's (Win+.) and types through the input method.
+void klio_order_emoji_palette(void) {}
 
 // The window style its KLIO_WIN_* properties give.
 static LONG_PTR klioWinStyle(KlioWindow* kw, LONG_PTR style) {
@@ -3654,6 +3888,14 @@ struct KlioWindow {
     NSMenu* mainMenu;
     id menuTarget;      // KlioMenuTarget: its items' action
     std::vector<KlioMenuEntry> menuEntries;
+    // The input method, while a text field has the keyboard (klio_win_set_text_input).
+    bool textInput;
+    NSString* marked;   // the text it is composing (retained), or nil
+    NSRect imeRect;     // the text cursor, in the content (top-left origin)
+    bool inKey;         // a key press is with the input method
+    bool keyTaken;      // the input method took the press
+    std::string typed;  // what the press typed, when the input method passed it on
+    std::string eventText;  // the text of the event last polled
 #if defined(KLIO_METAL)
     CAMetalLayer* metalLayer;  // nil when the raster path is in use
     id<MTLDevice> device;
@@ -3804,6 +4046,98 @@ extern "C" void klio_win_close(KlioWindow* kw);  // used by the open error path
 }
 - (BOOL)canBecomeMainWindow {
     return YES;
+}
+@end
+
+static NSString* klioPlainString(id s) {
+    return [s isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString*)s string] : (NSString*)s;
+}
+
+static void klioCocoaSetMarked(KlioWindow* kw, NSString* text) {
+    [kw->marked release];
+    kw->marked = [text length] > 0 ? [text copy] : nil;
+}
+
+// The window's content view, the input method's client as AWT's view is.
+// While a text field has the keyboard a key press goes to the input method
+// first: what it composes and commits is queued as KLIO_EV_IME, and a press
+// it passes on reaches the program as the key and the character it typed.
+@interface KlioContentView : NSView <NSTextInputClient>
+@property(nonatomic, assign) KlioWindow* kw;
+@end
+
+@implementation KlioContentView
+- (BOOL)acceptsFirstResponder {
+    return YES;
+}
+- (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
+    (void)replacementRange;
+    KlioWindow* kw = _kw;
+    if (!kw || !kw->textInput) return;
+    NSString* text = klioPlainString(string);
+    // One character a key typed with nothing composing is the key's own, as
+    // AWT delivers it (the press then reaches the program, even after the
+    // input method committed something before it); anything else is the
+    // input method's commit.
+    if (kw->inKey && !kw->marked && [text length] == 1) {
+        kw->typed = [text UTF8String];
+        kw->keyTaken = false;
+        return;
+    }
+    klioCocoaSetMarked(kw, nil);
+    kw->events.push_back(klioImeEv([text UTF8String], ""));
+    kw->keyTaken = true;
+}
+- (void)doCommandBySelector:(SEL)selector {
+    (void)selector;
+}
+- (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange replacementRange:(NSRange)replacementRange {
+    (void)selectedRange;
+    (void)replacementRange;
+    KlioWindow* kw = _kw;
+    if (!kw || !kw->textInput) return;
+    NSString* text = klioPlainString(string);
+    const bool was = kw->marked != nil;
+    klioCocoaSetMarked(kw, text);
+    if (was || kw->marked) kw->events.push_back(klioImeEv("", [text UTF8String]));
+    kw->keyTaken = true;
+}
+- (void)unmarkText {
+    KlioWindow* kw = _kw;
+    if (!kw || !kw->marked) return;
+    NSString* text = [[kw->marked retain] autorelease];
+    klioCocoaSetMarked(kw, nil);
+    kw->events.push_back(klioImeEv([text UTF8String], ""));
+}
+- (NSRange)selectedRange {
+    return NSMakeRange(_kw && _kw->marked ? [_kw->marked length] : 0, 0);
+}
+- (NSRange)markedRange {
+    return _kw && _kw->marked ? NSMakeRange(0, [_kw->marked length]) : NSMakeRange(NSNotFound, 0);
+}
+- (BOOL)hasMarkedText {
+    return _kw && _kw->marked != nil;
+}
+- (NSAttributedString*)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    (void)range;
+    (void)actualRange;
+    return nil;
+}
+- (NSArray<NSAttributedStringKey>*)validAttributesForMarkedText {
+    return @[];
+}
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    (void)range;
+    (void)actualRange;
+    KlioWindow* kw = _kw;
+    if (!kw) return NSZeroRect;
+    const NSRect r = kw->imeRect;
+    const NSRect inView = NSMakeRect(r.origin.x, kw->h - r.origin.y - r.size.height, r.size.width, r.size.height);
+    return [[self window] convertRectToScreen:[self convertRect:inView toView:nil]];
+}
+- (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    (void)point;
+    return NSNotFound;
 }
 @end
 
@@ -4157,6 +4491,20 @@ static void klioCocoaTranslate(NSEvent* ev, bool* forward) {
             klioMacKey([ev keyCode], &vk, &loc);
             NSString* chars = [ev characters];
             const unsigned c = [chars length] > 0 ? [chars characterAtIndex:0] : 0;
+            // While a text field has the keyboard the input method sees a press
+            // first; one it composes or commits with is its, as AWT's view
+            // passes on only a press that leaves nothing composing.
+            if (down && kw->textInput && !([ev modifierFlags] & NSEventModifierFlagCommand)) {
+                kw->inKey = true;
+                kw->keyTaken = false;
+                kw->typed.clear();
+                [[kw->view inputContext] handleEvent:ev];
+                kw->inKey = false;
+                if (kw->marked || kw->keyTaken) return;
+                kw->events.push_back(klioKeyEv(down, vk, loc, klioAwtKeyChar(vk, c), mods));
+                if (!kw->typed.empty()) klioPushText(kw->events, kw->typed.c_str());
+                return;
+            }
             kw->events.push_back(klioKeyEv(down, vk, loc, klioAwtKeyChar(vk, c), mods));
             // The characters a press types, unless Command makes it a shortcut;
             // a function key's character (AppKit's private-use range) types nothing.
@@ -4219,7 +4567,7 @@ extern "C" {
 // The window's next event, a scripted menu choice performed on the way.
 static int klioCocoaPop(KlioWindow* kw, double* out) {
     for (;;) {
-        const int type = klioPopEv(kw->events, out);
+        const int type = klioPopEv(kw->events, out, &kw->eventText);
         if (type != KLIO_EV_MENU_PATH) return type;
         const size_t at = static_cast<size_t>(out[0]);
         // A native menu is not left open: menushow is the drawn menus'.
@@ -4258,6 +4606,54 @@ void klio_win_post_event(KlioWindow* kw, int type, const double* values) {
     e.type = type;
     for (int i = 0; i < KLIO_EV_VALUES; i++) e.v[i] = values[i];
     kw->events.push_back(e);
+}
+
+// Drops the input method's composition without committing it.
+static void klioCocoaDropComposition(KlioWindow* kw) {
+    if (!kw->marked) return;
+    klioCocoaSetMarked(kw, nil);
+    [[kw->view inputContext] discardMarkedText];
+}
+
+// A text field has the keyboard, or none has: while one has it key presses go
+// through the input method.
+void klio_win_set_text_input(KlioWindow* kw, int enabled) {
+    if (!kw) return;
+    @autoreleasepool {
+        kw->textInput = enabled != 0;
+        if (!kw->textInput) klioCocoaDropComposition(kw);
+    }
+}
+
+// The text field's cursor, in the window's content, where the input method
+// places its candidate window.
+void klio_win_set_text_input_rect(KlioWindow* kw, int x, int y, int w, int h) {
+    if (!kw) return;
+    kw->imeRect = NSMakeRect(x, y, w, h);
+    @autoreleasepool {
+        [[kw->view inputContext] invalidateCharacterCoordinates];
+    }
+}
+
+// The text field ended the composition itself: the input method drops it.
+void klio_win_end_composition(KlioWindow* kw) {
+    if (!kw) return;
+    @autoreleasepool {
+        klioCocoaDropComposition(kw);
+    }
+}
+
+// The system's emoji and symbols palette, as skiko opens it on macOS; what it
+// picks reaches the focused field through the key window's input method.
+void klio_order_emoji_palette(void) {
+    @autoreleasepool {
+        [NSApp orderFrontCharacterPalette:nil];
+    }
+}
+
+// The text of the event klio_win_poll_event last returned.
+size_t klio_win_event_text(KlioWindow* kw, char* buf, size_t cap) {
+    return kw ? klioCopyEventText(kw->eventText, buf, cap) : 0;
 }
 
 // Set (or clear, with null) the live-resize render callback. The app sets it around
@@ -4317,12 +4713,16 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         }
         [window setReleasedWhenClosed:NO];  // we own its lifetime (non-ARC)
         if (title) [window setTitle:[NSString stringWithUTF8String:title]];
-        NSView* view = [window contentView];
+        KlioContentView* view = [[KlioContentView alloc] initWithFrame:frame];
+        [window setContentView:view];
+        [view release];  // the window holds it
+        [window makeFirstResponder:view];
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
         auto* kw = new KlioWindow();
         kw->window = window;
         kw->view = view;
+        view.kw = kw;
         kw->w = w;
         kw->h = h;
         kw->surface = nullptr;
@@ -4608,6 +5008,8 @@ void klio_win_close(KlioWindow* kw) {
         [kw->delegate release];
         kw->delegate = nil;
     }
+    if ([kw->view isKindOfClass:[KlioContentView class]]) ((KlioContentView*)kw->view).kw = nullptr;
+    klioCocoaSetMarked(kw, nil);
     auto& windows = klioCocoaWindows();
     for (size_t i = 0; i < windows.size(); i++) {
         if (windows[i] == kw) {
@@ -5099,6 +5501,14 @@ KlioWindow* klio_win_open(int, int, const char*) {
 }
 int klio_win_poll_event(void*, int, double*) { return KLIO_EV_NONE; }
 void klio_win_post_event(void*, int, const double*) {}
+void klio_win_set_text_input(void*, int) {}
+void klio_win_set_text_input_rect(void*, int, int, int, int) {}
+void klio_win_end_composition(void*) {}
+void klio_order_emoji_palette(void) {}
+size_t klio_win_event_text(void*, char* buf, size_t cap) {
+    if (buf && cap > 0) buf[0] = 0;
+    return 0;
+}
 void klio_win_set_flag(void*, int, int) {}
 void klio_win_set_position(void*, int, int) {}
 void klio_win_get_position(void*, int* x, int* y) { if (x) *x = 0; if (y) *y = 0; }
@@ -5341,6 +5751,14 @@ KlioWindow* klio_win_open(int, int, const char*) {
 }
 int klio_win_poll_event(void*, int, double*) { return KLIO_EV_NONE; }
 void klio_win_post_event(void*, int, const double*) {}
+void klio_win_set_text_input(void*, int) {}
+void klio_win_set_text_input_rect(void*, int, int, int, int) {}
+void klio_win_end_composition(void*) {}
+void klio_order_emoji_palette(void) {}
+size_t klio_win_event_text(void*, char* buf, size_t cap) {
+    if (buf && cap > 0) buf[0] = 0;
+    return 0;
+}
 void klio_win_set_flag(void*, int, int) {}
 void klio_win_set_position(void*, int, int) {}
 void klio_win_get_position(void*, int* x, int* y) { if (x) *x = 0; if (y) *y = 0; }
@@ -5387,6 +5805,14 @@ void* klio_win_surface(void*) { return nullptr; }
 void klio_win_present(void*) {}
 int klio_win_poll_event(void*, int, double*) { return KLIO_EV_CLOSE; }
 void klio_win_post_event(void*, int, const double*) {}
+void klio_win_set_text_input(void*, int) {}
+void klio_win_set_text_input_rect(void*, int, int, int, int) {}
+void klio_win_end_composition(void*) {}
+void klio_order_emoji_palette(void) {}
+size_t klio_win_event_text(void*, char* buf, size_t cap) {
+    if (buf && cap > 0) buf[0] = 0;
+    return 0;
+}
 void klio_win_set_flag(void*, int, int) {}
 void klio_win_set_position(void*, int, int) {}
 void klio_win_get_position(void*, int* x, int* y) { if (x) *x = 0; if (y) *y = 0; }

@@ -391,6 +391,7 @@ include = [
     "androidx/compose/foundation/text/BasicTextField.desktop.kt",
     "androidx/compose/foundation/text/CoreTextField.desktop.kt",
     "androidx/compose/foundation/text/DesktopCursorHandle.desktop.kt",
+    "androidx/compose/foundation/text/KeyEventHelpers.desktop.kt",
     "androidx/compose/foundation/text/KeyMapping.desktop.kt",
     "androidx/compose/foundation/text/TextFieldCursor.desktop.kt",
     "androidx/compose/foundation/text/TextFieldPointerModifier.desktop.kt",

@@ -2075,6 +2075,8 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
         }),
         .windows => run.addArgs(&.{
             "-luser32", "-lgdi32", "-lopengl32", "-lole32", "-loleaut32", "-lshell32",
+            // The input method (imm32) and the system theme's registry value (advapi32).
+            "-limm32", "-ladvapi32",
         }),
         else => return null,
     }

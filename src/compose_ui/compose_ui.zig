@@ -41,6 +41,10 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winSetIconSurface", winSetIconSurface);
     try b.register("androidx.compose.ui.window.__composeui_winSetMenu", winSetMenu);
     try b.register("androidx.compose.ui.window.__composeui_winSetMenuIcon", winSetMenuIcon);
+    try b.register("androidx.compose.ui.window.__composeui_winSetTextInput", winSetTextInput);
+    try b.register("androidx.compose.ui.window.__composeui_winSetTextInputRect", winSetTextInputRect);
+    try b.register("androidx.compose.ui.window.__composeui_winEndComposition", winEndComposition);
+    try b.register("androidx.compose.ui.window.__composeui_winEventText", winEventText);
     try b.register("androidx.compose.ui.window.__composeui_traySupported", traySupported);
     try b.register("androidx.compose.ui.window.__composeui_trayOpen", trayOpen);
     try b.register("androidx.compose.ui.window.__composeui_trayClose", trayClose);
@@ -175,6 +179,12 @@ const Skia = struct {
     winSetIconSurface: ?*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void,
     winSetMenu: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
     winSetMenuIcon: ?*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void,
+    winSetTextInput: ?*const fn (?*SkWindow, c_int) callconv(.c) void,
+    winSetTextInputRect: ?*const fn (?*SkWindow, c_int, c_int, c_int, c_int) callconv(.c) void,
+    winEndComposition: ?*const fn (?*SkWindow) callconv(.c) void,
+    winEventText: ?WinEventTextFn,
+    systemTheme: ?*const fn () callconv(.c) c_int,
+    orderEmojiPalette: ?*const fn () callconv(.c) void,
     winLastError: ?*const fn () callconv(.c) [*:0]const u8,
     tray: TrayFns,
     clipChangeCount: ?ClipChangeCountFn,
@@ -241,6 +251,7 @@ const ClipSetTextFn = *const fn (?[*]const u8, usize) callconv(.c) void;
 const WinAttachFn = *const fn (?*anyopaque, c_int, c_int, f64) callconv(.c) ?*SkWindow;
 const WinPollEventFn = *const fn (?*SkWindow, c_int, [*]f64) callconv(.c) c_int;
 const WinPostEventFn = *const fn (?*SkWindow, c_int, [*]const f64) callconv(.c) void;
+const WinEventTextFn = *const fn (?*SkWindow, ?[*]u8, usize) callconv(.c) usize;
 /// The values of one window event (src/compose_ui/window_events.h).
 const win_event_values = 12;
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
@@ -317,6 +328,12 @@ fn loadSkia() ?*Skia {
         .winSetIconSurface = lib.lookup(*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void, "klio_win_set_icon_surface"),
         .winSetMenu = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_menu"),
         .winSetMenuIcon = lib.lookup(*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void, "klio_win_set_menu_icon"),
+        .winSetTextInput = lib.lookup(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_set_text_input"),
+        .winSetTextInputRect = lib.lookup(*const fn (?*SkWindow, c_int, c_int, c_int, c_int) callconv(.c) void, "klio_win_set_text_input_rect"),
+        .winEndComposition = lib.lookup(*const fn (?*SkWindow) callconv(.c) void, "klio_win_end_composition"),
+        .winEventText = lib.lookup(WinEventTextFn, "klio_win_event_text"),
+        .systemTheme = lib.lookup(*const fn () callconv(.c) c_int, "klio_system_theme"),
+        .orderEmojiPalette = lib.lookup(*const fn () callconv(.c) void, "klio_order_emoji_palette"),
         .winLastError = lib.lookup(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
         .tray = TrayFns.fromLib(&lib),
         .clipChangeCount = lib.lookup(ClipChangeCountFn, "klio_clip_change_count"),
@@ -368,6 +385,12 @@ fn loadSkiaStatic() ?*Skia {
         .winSetIconSurface = externSym(*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void, "klio_win_set_icon_surface"),
         .winSetMenu = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_menu"),
         .winSetMenuIcon = externSym(*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void, "klio_win_set_menu_icon"),
+        .winSetTextInput = externSym(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_set_text_input"),
+        .winSetTextInputRect = externSym(*const fn (?*SkWindow, c_int, c_int, c_int, c_int) callconv(.c) void, "klio_win_set_text_input_rect"),
+        .winEndComposition = externSym(*const fn (?*SkWindow) callconv(.c) void, "klio_win_end_composition"),
+        .winEventText = externSym(WinEventTextFn, "klio_win_event_text"),
+        .systemTheme = externSym(*const fn () callconv(.c) c_int, "klio_system_theme"),
+        .orderEmojiPalette = externSym(*const fn () callconv(.c) void, "klio_order_emoji_palette"),
         .winLastError = externSym(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
         .tray = TrayFns.fromExtern(),
         .clipChangeCount = externSym(ClipChangeCountFn, "klio_clip_change_count"),
@@ -749,6 +772,89 @@ fn winSetFlag(ctx: *CallCtx) Error!EvalResult {
     const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
     f(win, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])));
     return ok(Value.newLong(1));
+}
+
+/// `__composeui_winSetTextInput(handle, enabled)`: a text field has the
+/// window's keyboard, or none has; the window's input method is on only while
+/// one has it.
+fn winSetTextInput(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(.{ .Unit = {} });
+    const skia = loadSkia() orelse return ok(.{ .Unit = {} });
+    const f = skia.winSetTextInput orelse return ok(.{ .Unit = {} });
+    const win = winHandle(ctx.args[0]) orelse return ok(.{ .Unit = {} });
+    f(win, @intFromBool(ctx.args[1] == .Bool and ctx.args[1].Bool));
+    return ok(.{ .Unit = {} });
+}
+
+/// `__composeui_winSetTextInputRect(handle, x, y, w, h)`: the focused text
+/// field's cursor in the window's content, where the input method's candidate
+/// window goes.
+fn winSetTextInputRect(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 5) return ok(.{ .Unit = {} });
+    const skia = loadSkia() orelse return ok(.{ .Unit = {} });
+    const f = skia.winSetTextInputRect orelse return ok(.{ .Unit = {} });
+    const win = winHandle(ctx.args[0]) orelse return ok(.{ .Unit = {} });
+    f(win, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])), @intCast(argInt(ctx.args[3])), @intCast(argInt(ctx.args[4])));
+    return ok(.{ .Unit = {} });
+}
+
+/// `__composeui_winEndComposition(handle)`: the text field ended the
+/// composition itself, so the input method drops its own.
+fn winEndComposition(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(.{ .Unit = {} });
+    const skia = loadSkia() orelse return ok(.{ .Unit = {} });
+    const f = skia.winEndComposition orelse return ok(.{ .Unit = {} });
+    const win = winHandle(ctx.args[0]) orelse return ok(.{ .Unit = {} });
+    f(win);
+    return ok(.{ .Unit = {} });
+}
+
+/// `__composeui_winEventText(handle): String`: the text of the event the
+/// window's last poll returned (an input method's), "" for none.
+fn winEventText(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const empty = Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, "")) };
+    if (ctx.args.len < 1) return ok(empty);
+    const skia = loadSkia() orelse return ok(empty);
+    const f = skia.winEventText orelse return ok(empty);
+    const win = winHandle(ctx.args[0]) orelse return ok(empty);
+    const n = f(win, null, 0);
+    if (n == 0) return ok(empty);
+    empty.String.deinit();
+    const buf = try a.alloc(u8, n + 1);
+    defer a.free(buf);
+    _ = f(win, buf.ptr, buf.len);
+    return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, buf[0..n])) });
+}
+
+/// `__skiko_systemTheme(): Int`: the system's appearance, 0 light, 1 dark, 2
+/// unknown. `KLIO_SYSTEM_THEME` (light, dark or unknown) answers in its place,
+/// so a run's output does not depend on the host's setting; without the Skia
+/// shim it is unknown.
+pub fn systemTheme(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    if (runtime.envOnce("KLIO_SYSTEM_THEME")) |forced| {
+        const theme: i32 = if (std.ascii.eqlIgnoreCase(forced, "light"))
+            0
+        else if (std.ascii.eqlIgnoreCase(forced, "dark"))
+            1
+        else
+            2;
+        return ok(Value.newInt(theme));
+    }
+    const skia = loadSkia() orelse return ok(Value.newInt(2));
+    const f = skia.systemTheme orelse return ok(Value.newInt(2));
+    return ok(Value.newInt(f()));
+}
+
+/// `orderEmojiAndSymbolsPopup()`: opens the system's emoji and symbols
+/// palette, as skiko does on macOS; elsewhere, and without the Skia shim,
+/// nothing opens.
+pub fn orderEmojiPalette(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    const skia = loadSkia() orelse return ok(.{ .Unit = {} });
+    if (skia.orderEmojiPalette) |f| f();
+    return ok(.{ .Unit = {} });
 }
 
 /// `__composeui_winSetPosition(handle, x, y)`: move the window frame's
@@ -1359,7 +1465,9 @@ test "hostBindings registers the surface and windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_trayPollEvent") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_appWait") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winOpenError") != null);
-    try testing.expectEqual(@as(usize, 60), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetTextInput") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winEventText") != null);
+    try testing.expectEqual(@as(usize, 64), b.len());
 }
 
 test "a window that cannot open says why" {
@@ -1444,6 +1552,33 @@ test "openUri runs the opener with the URI and reports whether it opened" {
     runtime.envSetForTest("KLIO_URI_OPENER", "/nonexistent/klio-uri-opener");
     var c3 = host.ctx(&args);
     try testing.expect(!(try openUri(&c3)).ok.Bool);
+}
+
+test "systemTheme answers KLIO_SYSTEM_THEME in the host's place" {
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c = host.ctx(&none);
+    defer runtime.envResetForTest("KLIO_SYSTEM_THEME");
+    runtime.envSetForTest("KLIO_SYSTEM_THEME", "light");
+    try testing.expectEqual(@as(i32, 0), (try systemTheme(&c)).ok.Int);
+    runtime.envSetForTest("KLIO_SYSTEM_THEME", "Dark");
+    try testing.expectEqual(@as(i32, 1), (try systemTheme(&c)).ok.Int);
+    runtime.envSetForTest("KLIO_SYSTEM_THEME", "unknown");
+    try testing.expectEqual(@as(i32, 2), (try systemTheme(&c)).ok.Int);
+}
+
+test "the text input bindings do nothing for short args, and event text is empty" {
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c = host.ctx(&none);
+    try testing.expect((try winSetTextInput(&c)).ok == .Unit);
+    try testing.expect((try winSetTextInputRect(&c)).ok == .Unit);
+    try testing.expect((try winEndComposition(&c)).ok == .Unit);
+    const text = (try winEventText(&c)).ok;
+    defer text.String.deinit();
+    const g = text.String.borrow();
+    defer g.deinit();
+    try testing.expectEqualStrings("", g.get().bytes);
 }
 
 test "a window position packs x high and y low, negatives kept" {

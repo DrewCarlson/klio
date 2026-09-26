@@ -1,0 +1,9 @@
+text='a' composition=null selection=TextRange(1, 1)
+text='ab' composition=null selection=TextRange(2, 2)
+text='abに' composition=TextRange(2, 3) selection=TextRange(3, 3)
+text='abにほん' composition=TextRange(2, 5) selection=TextRange(5, 5)
+text='ab日本' composition=null selection=TextRange(4, 4)
+text='ab日本ご' composition=TextRange(4, 5) selection=TextRange(5, 5)
+text='ab日本' composition=null selection=TextRange(4, 4)
+text='ab日本語' composition=null selection=TextRange(5, 5)
+application ended

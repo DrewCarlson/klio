@@ -18,6 +18,10 @@
 //                    in points from the main screen's top-left
 //   KLIO_EV_PLACEMENT [0] KLIO_PLACEMENT_*, [1] 1 when minimized
 //   KLIO_EV_MENU     [0] the id of the menu item chosen (klio_win_set_menu)
+//   KLIO_EV_IME      [0] the committed text's length in UTF-16 units; the
+//                    event's text (klio_win_event_text) is the text the input
+//                    method commits followed by the text it is composing, as
+//                    an AWT InputMethodEvent carries them
 //   KLIO_EV_TRAY_ACTION  a tray icon's action (klio_tray_poll_event): a double
 //                    click on Windows, a right click on macOS
 //
@@ -49,6 +53,7 @@ enum {
     // holds at [0], as a click on it would. The backend's poll performs it.
     KLIO_EV_MENU_PATH = 17,
     KLIO_EV_TRAY_ACTION = 18,
+    KLIO_EV_IME = 19,
 };
 
 // A window's menu bar as klio_win_set_menu takes it: one entry per line,
@@ -240,6 +245,7 @@ constexpr int KLIO_CHAR_UNDEFINED = 0xFFFF;
 struct KlioEv {
     int type = KLIO_EV_NONE;
     double v[KLIO_EV_VALUES] = {};
+    std::string text;  // a KLIO_EV_IME's text
 };
 
 // AWT's key locations.
@@ -430,16 +436,48 @@ inline void klioPushText(std::deque<KlioEv>& q, const char* utf8) {
     }
 }
 
-// Pops the next queued event into out (type, then the values); the type, or
-// KLIO_EV_NONE when the queue is empty.
-inline int klioPopEv(std::deque<KlioEv>& q, double* out) {
+// The number of UTF-16 units of UTF-8 text.
+inline int klioUtf16Length(const char* utf8) {
+    int n = 0;
+    for (const unsigned char* s = reinterpret_cast<const unsigned char*>(utf8); *s; s++) {
+        if ((*s & 0xC0) == 0x80) continue;
+        n += (*s & 0xF8) == 0xF0 ? 2 : 1;
+    }
+    return n;
+}
+
+// An input method's event: the text it commits, then the text it is composing
+// (empty when it composes nothing).
+inline KlioEv klioImeEv(const char* committed, const char* composing) {
+    KlioEv e;
+    e.type = KLIO_EV_IME;
+    e.v[0] = klioUtf16Length(committed);
+    e.text = std::string(committed) + composing;
+    return e;
+}
+
+// Pops the next queued event into out (type, then the values) and its text
+// into text; the type, or KLIO_EV_NONE when the queue is empty.
+inline int klioPopEv(std::deque<KlioEv>& q, double* out, std::string* text = nullptr) {
     if (q.empty()) return KLIO_EV_NONE;
     const KlioEv e = q.front();
     q.pop_front();
     if (out) {
         for (int i = 0; i < KLIO_EV_VALUES; i++) out[i] = e.v[i];
     }
+    if (text) *text = e.text;
     return e.type;
+}
+
+// Copies a window's last event text into buf (cap bytes, NUL-terminated when
+// it fits); the text's length in bytes.
+inline size_t klioCopyEventText(const std::string& text, char* buf, size_t cap) {
+    if (buf && cap > 0) {
+        const size_t n = text.size() < cap - 1 ? text.size() : cap - 1;
+        std::memcpy(buf, text.data(), n);
+        buf[n] = 0;
+    }
+    return text.size();
 }
 
 // A macOS virtual key code (the kVK_* of HIToolbox, by position on an ANSI
@@ -550,6 +588,10 @@ inline int klioAwtKeyChar(int vk, unsigned platformChar) {
 //                                        shortcut modifier (Command on macOS,
 //                                        Control elsewhere, as AWT's Toolkit has it)
 //   <when> text <characters>             typed text, the rest of the line
+//   <when> compose <characters>          the input method's composing text, the
+//                                        rest of the line (none ends the composition)
+//   <when> commit <characters>           the input method commits text, the rest
+//                                        of the line, ending its composition
 //   <when> focus <0|1>                   the window gains or loses the focus; a script
 //                                        with a focus event is the windows' only source
 //                                        of focus, the platform's own changes dropped
@@ -636,6 +678,10 @@ inline std::vector<KlioScriptEntry>& klioScript() {
             std::deque<KlioEv> typed;
             klioPushText(typed, rest);
             for (const KlioEv& e : typed) add(e);
+        } else if (std::strcmp(cmd, "compose") == 0) {
+            add(klioImeEv("", rest));
+        } else if (std::strcmp(cmd, "commit") == 0) {
+            add(klioImeEv(rest, ""));
         } else if (std::strcmp(cmd, "focus") == 0) {
             add(klioSimpleEv(KLIO_EV_FOCUS, a));
         } else if (std::strcmp(cmd, "close") == 0) {

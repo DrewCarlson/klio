@@ -46,6 +46,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("org.jetbrains.skiko.__skiko_hostOs", compose_ui.hostOs);
     try b.register("org.jetbrains.skiko.__skiko_hostArch", hostArch);
     try b.register("org.jetbrains.skiko.__skiko_readFile", readFile);
+    try b.register("org.jetbrains.skiko.__skiko_systemTheme", compose_ui.systemTheme);
+    try b.register("org.jetbrains.skiko.__skiko_orderEmojiAndSymbolsPopup", compose_ui.orderEmojiPalette);
     return b;
 }
 
@@ -387,7 +389,8 @@ fn arity(ctx: *CallCtx, symbol: []const u8, want: usize) Error!EvalResult {
 test "every native has a host function under its symbol" {
     var b = try hostBindings(std.testing.allocator);
     defer b.deinit();
-    try std.testing.expectEqual(natives.all.len + 10, b.table.count());
+    try std.testing.expectEqual(natives.all.len + 12, b.table.count());
+    try std.testing.expect(b.table.get("org.jetbrains.skiko.__skiko_systemTheme") != null);
     try std.testing.expect(b.table.get("org_jetbrains_skia_Paint__1nMake") != null);
 }
 

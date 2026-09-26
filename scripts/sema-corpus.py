@@ -74,7 +74,7 @@ def run_one(klio, path, timeout, home):
     # A clipboard of its own and a pinned locale, as corpus_check runs them:
     # an example never touches the user's clipboard, and prints the same
     # dates whatever the host's locale.
-    env = dict(os.environ, KLIO_CLIPBOARD="private", KLIO_LOCALE="en-US")
+    env = dict(os.environ, KLIO_CLIPBOARD="private", KLIO_LOCALE="en-US", KLIO_SYSTEM_THEME="light")
     if home:
         env["KLIO_HOME"] = home
     try:

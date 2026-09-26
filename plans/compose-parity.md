@@ -149,6 +149,30 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
     supertypes are all interfaces resolves to Any's, and every object
     expression and local class is a KClass of its own, so Compose's node
     kind cache no longer shares one entry across anonymous nodes.
+11. The skiko UI's desktop half, in this order: (a) done: the input method
+    and the system theme (below); (b) the resource loaders (ui desktopMain
+    res/: painterResource, loadSvgPainter over skia's SVGDOM,
+    loadXmlImageVector, loadImageBitmap, which need an InputStream, a
+    resource lookup and an XML DOM), foundation's TooltipArea and
+    ContextMenuProvider (java-free, take them as they are),
+    BasicContextMenuRepresentation and text/ContextMenu without Swing, and
+    WindowDraggableArea over klio's window move; (c) the accessibility
+    bridge (the semantics tree to NSAccessibility, UI Automation and
+    AT-SPI); (d) pointer icons (`PlatformContext.setPointerIcon`), drag and
+    drop between applications; (e) a Windows run (item 8).
+    The input method: a klio window's text field turns the window's input
+    method on (klio_win_set_text_input), and the shim reports what it
+    composes and commits as KLIO_EV_IME, which KlioWindowTextInput applies
+    as DesktopTextInputService2 applies AWT's InputMethodEvent. Cocoa's
+    content view is an NSTextInputClient and a key press goes through its
+    input context first (checked with key events posted through AppKit:
+    typing, Backspace and a dead key compose and commit as AWT's view
+    would); SDL reports SDL_TEXTEDITING and places the candidate window;
+    Win32 takes WM_IME_COMPOSITION and places IMM32's windows (compiled
+    only). The system theme is skiko's currentSystemTheme over the shim's
+    klio_system_theme, and a window's content gets ProvideSystemTheme as the
+    desktop's does. skiko's orderEmojiAndSymbolsPopup opens macOS's
+    palette, so foundation's KeyEventHelpers is upstream's.
 
 **Sparse checkout widenings a future item needs** (for the coordinator to
 run; scripts/init-compose-submodule.sh lists the current set):
@@ -231,11 +255,11 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 |--------|-----------:|----------:|-----------:|------------------------:|
 | runtime | 188 / 188 | n/a | 6 / 9, nonAndroid 10 / 10 | jvmAndAndroid 3 java-free; klio actuals |
 | runtime-saveable | 9 / 9 | n/a | n/a | n/a |
-| ui | 244 / 244 | 92 / 92 | 8 / 8 | 86 / 175 |
+| ui | 244 / 244 | 92 / 92 | 8 / 8 | 88 / 175 |
 | ui-graphics | 82 / 82 | 19 / 19, skikoExcludingWeb 1 / 1 | 1 / 1 | 0 / 7 |
 | ui-text | 79 / 79 | 28 / 28 | 5 / 5, native 6 / 6 | 0 / 15 |
 | ui-unit, ui-util, ui-geometry | complete | n/a | complete, ui-unit nonAndroid 2 / 2 | n/a |
-| foundation | 354 / 354 | 127 / 127 | 8 / 8 | 27 / 37 |
+| foundation | 354 / 354 | 127 / 127 | 8 / 8 | 28 / 37 |
 | foundation-layout | 32 / 32 | 2 / 2 | 1 / 1 | n/a |
 | animation, animation-core | complete | n/a | complete, animation nonAndroid 2 / 2 | n/a |
 | material3 | 251 / 251 | 97 / 97 | 4 / 4 | 0 / 2 (java.text) |
@@ -254,8 +278,8 @@ runtime-retain (klio carries only the store interface the ui owner exposes;
 the `retain` composables are missing). foundation's desktopMain files left:
 TooltipArea, ContextMenuProvider, BasicContextMenuRepresentation and
 text/ContextMenu (with the upstream scene and a Swing-free popup menu);
-DesktopScrollable, KeyEventHelpers and TextFieldKeyInput, adapted in
-klioMain with their AWT calls replaced; ClipboardUtils, adapted over
+DesktopScrollable and TextFieldKeyInput, adapted in klioMain with their
+AWT calls replaced; ClipboardUtils, adapted over
 klio.datatransfer; WindowDraggableArea (AWT window dragging).
 
 Public API still missing: foundation's `TooltipArea`, `ContextMenuArea`;
@@ -272,10 +296,10 @@ tray runs on the X display; a MenuBar in a GPU SDL window). skiko's C glue
 
 | Platform | Verified by running | Verified by compiling only |
 |----------|---------------------|----------------------------|
-| macOS arm64 | every compose example (71 of 71 with the tray), the compose-ui gate, the upstream suites, the JVM oracle, skiko's natives through the shim's glue (the skiko module's test) | |
-| Linux aarch64 (Debian 12 container, Xvfb) | the compose examples (69 of 70 with skiko's glue in the shim: compose_text_fonts prints FreeType's baselines, 17.312 where CoreText gives 17.312012, and Compose Desktop 1.12.0 prints the same 17.312 in that container), the JVM oracle run in the same container (identical on the 11 font- and pixel-dependent examples it can compile), the drawn menu bar by frame dumps, the XEmbed tray under trayer (icon, menu, action, balloon) and without a tray, skiko's natives through the shim's glue (the skiko module's test), and all 31 packs, org.jetbrains.skiko included, building | the harness is cross-compiled from macOS; the shim is built in the container with g++ |
+| macOS arm64 | every compose example (71 of 71 with the tray), the compose-ui gate, the upstream suites, the JVM oracle, skiko's natives through the shim's glue (the skiko module's test), the input method with key events posted through AppKit's input context | |
+| Linux aarch64 (Debian 12 container, Xvfb) | the compose examples (69 of 70 with skiko's glue in the shim: compose_text_fonts prints FreeType's baselines, 17.312 where CoreText gives 17.312012, and Compose Desktop 1.12.0 prints the same 17.312 in that container), the JVM oracle run in the same container (identical on the 11 font- and pixel-dependent examples it can compile), the drawn menu bar by frame dumps, the XEmbed tray under trayer (icon, menu, action, balloon) and without a tray, skiko's natives through the shim's glue (the skiko module's test), the compose-ui gate from a fresh home (the scripted input method and the system theme among it), and all 31 packs, org.jetbrains.skiko included, building | the harness is cross-compiled from macOS; the shim is built in the container with g++ |
 | Linux x86_64 | | compose_ui and the stdlib (`zigcheck.py --target x86_64-linux-gnu`) |
-| Windows x86_64 | | klio.exe with compose_ui and the skiko bindings, compiled and linked by the cross build (`zig build -Dtarget=x86_64-windows-gnu`, over the runtime's platform layer); the shim's own sources and all 86 of skiko's glue sources to objects (`zig c++ -target x86_64-windows-gnu`, C++20). Linking the shim needs the MSVC toolchain the Windows Skia prebuilt is built with |
+| Windows x86_64 | | klio.exe with compose_ui and the skiko bindings, compiled and linked by the cross build (`zig build -Dtarget=x86_64-windows-gnu`, over the runtime's platform layer); the shim's own sources (its IMM32 input method and registry theme read among them) and all 86 of skiko's glue sources to objects (`zig c++ -target x86_64-windows-gnu`, C++20). Linking the shim needs the MSVC toolchain the Windows Skia prebuilt is built with |
 
 Not verified anywhere yet: a Wayland session (SDL picks Wayland or X11 at
 runtime; the tray is X11's, so under Wayland without XWayland
@@ -575,3 +599,12 @@ isTraySupported is false), and running on Windows.
   and local classes compared equal as KClasses (all shared `<anonymous>` or
   `<local>.Name`), so a class-keyed cache answered for the wrong class; they
   now compare and hash by their IR class.
+- 2026-09-26: a klio window has the platform's input method and the
+  system's theme. A focused text field composes and commits through the
+  input method on macOS (an NSTextInputClient content view), Linux (SDL's
+  text editing) and Windows (IMM32), as Compose Desktop's does over AWT;
+  scripted input gains `compose` and `commit`. isSystemInDarkTheme reads
+  macOS's appearance and Windows' app theme, KLIO_SYSTEM_THEME fixes it for
+  test runs, and macOS's emoji and symbols palette opens from a text field.
+  The compose-ui gate's pack filter now names every pack the compose
+  closure needs; a fresh home failed its install.

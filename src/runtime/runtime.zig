@@ -34,6 +34,7 @@ pub const reclaimRequested = objcell.reclaimRequested;
 pub const getenvSlice = objcell.getenvSlice;
 pub const envOnce = objcell.envOnce;
 pub const envSetForTest = objcell.envSetForTest;
+pub const envResetForTest = objcell.envResetForTest;
 pub const envSetOnce = objcell.envSetOnce;
 
 /// `--opt` / `KLIO_OPT`: the JIT tiers and the memory backend, resolved once.

@@ -37,6 +37,8 @@ EXAMPLES=(
   compose_window_clipboard
   compose_window_lifetime
   compose_window_lifecycle
+  compose_window_ime
+  compose_system_theme
   compose_window_menu
   compose_window_modal
   compose_window_modal_app
@@ -53,7 +55,7 @@ rm -rf .klio-local/cache
 # ReleaseSafe pack builds (the script's default KLIO_BIN is the Debug
 # CLI — 8x slower), trimmed to the compose closure the family needs.
 export KLIO_BIN="$BIN"
-export PACK_FILTER="klio-compose-,klio-kotlin-test,klio-kotlinx-coroutines,klio-kotlinx-atomicfu,klio-androidx-collection,klio-androidx-annotation,klio-navigationevent"
+export PACK_FILTER="klio-compose-,klio-kotlin-test,klio-kotlinx-coroutines,klio-kotlinx-atomicfu,klio-androidx-collection,klio-androidx-annotation,klio-navigationevent,klio-skiko,klio-lifecycle,klio-savedstate,klio-kotlinx-serialization,klio-kotlinx-io,klio-kotlinx-datetime,klio-graphics-shapes"
 if ! scripts/install-local-packs.sh >/tmp/compose-ui-gate-packs.log 2>&1; then
   echo "compose-ui-gate: pack install FAILED (see /tmp/compose-ui-gate-packs.log)"
   exit 1
@@ -64,6 +66,7 @@ pass=0
 # en-US locale whatever the host's.
 export KLIO_CLIPBOARD=private
 export KLIO_LOCALE=en-US
+export KLIO_SYSTEM_THEME=light
 rc=0
 skipped=0
 for name in "${EXAMPLES[@]}"; do

@@ -8,8 +8,9 @@
 // A native window's input, as the Skia shim's window backends report it
 // (src/compose_ui/window_events.h), sent into its scene the way Compose
 // Desktop's ComposeSceneMediator sends AWT's: mouse events with the buttons
-// and modifiers they carry, key presses and releases, and each typed
-// character as a key event of its own, with the platform event behind it.
+// and modifiers they carry, key presses and releases, each typed character as
+// a key event of its own with the platform event behind it, and the input
+// method's composing and committed text to the focused field.
 
 package androidx.compose.ui.window
 
@@ -39,6 +40,7 @@ internal const val WINDOW_EVENT_FOCUS = 13
 internal const val WINDOW_EVENT_MOVE = 14
 internal const val WINDOW_EVENT_PLACEMENT = 15
 internal const val WINDOW_EVENT_MENU = 16
+internal const val WINDOW_EVENT_IME = 19
 
 /** How many values a window event carries. */
 internal const val WINDOW_EVENT_VALUES = 12
@@ -85,6 +87,8 @@ private fun pointerButtons(held: Int) = PointerButtons(
 internal class KlioWindowInput(
     private val scene: ComposeScene,
     private val windowInfo: WindowInfoImpl,
+    private val handle: Long,
+    private val textInput: KlioWindowTextInput?,
 ) {
     private var keyModifiers = PointerKeyboardModifiers()
 
@@ -97,12 +101,13 @@ internal class KlioWindowInput(
     /** The window gained or lost the focus. */
     var onFocusChanged: () -> Unit = {}
 
-    /** Sends a pointer, key, text or focus event; the others are the window loop's. */
+    /** Sends a pointer, key, text, input method or focus event; the others are the window loop's. */
     fun send(type: Int, v: DoubleArray) {
         when (type) {
             WINDOW_EVENT_POINTER -> if (enabled) sendPointer(v)
             WINDOW_EVENT_KEY -> if (enabled && focusable) sendKey(v)
             WINDOW_EVENT_TEXT -> if (enabled && focusable) sendText(v)
+            WINDOW_EVENT_IME -> if (enabled && focusable) sendInputMethod(v)
             WINDOW_EVENT_FOCUS -> {
                 windowInfo.isWindowFocused = v[0] != 0.0
                 onFocusChanged()
@@ -156,6 +161,14 @@ internal class KlioWindowInput(
         val consumed = sendKeyEvent(event)
         // A menu bar's accelerators see the press the content leaves.
         if (pressed && (!consumed || menuShortcutsAfterConsumedKeys)) menuShortcut(event)
+    }
+
+    // The input method's event: the text it commits, then the text it composes.
+    private fun sendInputMethod(v: DoubleArray) {
+        val input = textInput ?: return
+        val text = __composeui_winEventText(handle)
+        val committed = v[0].toInt().coerceIn(0, text.length)
+        input.onInputMethodEvent(text.substring(0, committed), text.substring(committed))
     }
 
     // Each typed character is a key event of its own, as AWT types them: of no

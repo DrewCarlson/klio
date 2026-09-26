@@ -33,10 +33,21 @@ actual val hostId: String = "${hostOs.id}-${hostArch.id}"
 
 actual val kotlinBackend: KotlinBackend = KotlinBackend.Native
 
-/** klio has no reading of the system's appearance; Compose then uses its light theme. */
-actual val currentSystemTheme: SystemTheme = SystemTheme.UNKNOWN
+/** The system's appearance as the host reports it, read again at each ask as skiko's is. */
+actual val currentSystemTheme: SystemTheme
+    get() = when (__skiko_systemTheme()) {
+        0 -> SystemTheme.LIGHT
+        1 -> SystemTheme.DARK
+        else -> SystemTheme.UNKNOWN
+    }
 
 actual suspend fun loadBytesFromPath(path: String): ByteArray = __skiko_readFile(path)
+
+/**
+ * Opens the system's emoji and symbols palette, as skiko's desktop and macOS
+ * targets do; only macOS has one, and elsewhere nothing opens.
+ */
+fun orderEmojiAndSymbolsPopup() = __skiko_orderEmojiAndSymbolsPopup()
 
 internal actual fun loadAngleLibrary() {
     throw RenderException("ANGLE is not available on klio")
@@ -78,5 +89,11 @@ actual open class SkiaLayer {
 }
 
 internal fun __skiko_hostOs(): String = error("intrinsic org.jetbrains.skiko.__skiko_hostOs is not installed")
+
+internal fun __skiko_orderEmojiAndSymbolsPopup(): Unit =
+    error("intrinsic org.jetbrains.skiko.__skiko_orderEmojiAndSymbolsPopup is not installed")
+
+/** 0 light, 1 dark, 2 unknown. */
+internal fun __skiko_systemTheme(): Int = error("intrinsic org.jetbrains.skiko.__skiko_systemTheme is not installed")
 internal fun __skiko_hostArch(): String = error("intrinsic org.jetbrains.skiko.__skiko_hostArch is not installed")
 internal fun __skiko_readFile(path: String): ByteArray = error("intrinsic org.jetbrains.skiko.__skiko_readFile is not installed")

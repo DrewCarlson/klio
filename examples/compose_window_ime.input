@@ -1,0 +1,11 @@
+# Scripted input for compose_window_ime.kt's window (KLIO_WIN_INPUT): typed
+# text, then an input method composing two readings and committing one, a
+# second composition it abandons, and one more commit.
+6 text ab
+8 compose に
+10 compose にほん
+12 commit 日本
+14 compose ご
+16 compose
+18 commit 語
+22 close
