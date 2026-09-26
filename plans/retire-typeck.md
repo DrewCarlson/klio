@@ -43,7 +43,23 @@ B. Port the missing checks into sema by category, each category's errors
 before its warnings, with sema unit tests; `typeck_negative` is the
 acceptance list.
 
-- B1. Declarations, modifiers and overrides (58).
+- B1. Declarations, modifiers and overrides (58). Done:
+  `src/sema/declcheck.zig` checks the program's declarations once their
+  bodies are resolved. Modifiers that exclude each other or do not apply;
+  data, value and enum classes; supertypes (final, an object, a sealed
+  class from a local class, `by` to a class, an uninitialized superclass,
+  a generic `Throwable`); `lateinit`, `const`, extension, inline and
+  explicit-backing-field properties; reified, `crossinline`, `noinline`
+  and vararg parameters; overrides (nothing overridden, final, visibility,
+  return and property types, `var` by `val`, `suspend`); abstract members
+  left unimplemented and members several supertypes implement; operator
+  and infix shapes; constructor delegation cycles; an escaping object
+  expression's type. A convention call of a function without `operator` or
+  `infix` asks for the modifier. Warnings: `NOTHING_TO_INLINE`,
+  `PARAMETER_NAME_CHANGED_ON_OVERRIDE`, `REDUNDANT_EXPLICIT_BACKING_FIELD`.
+  kotlinc prints no warning of a compilation with an error, and neither
+  does `klio check`. `FullValueClasses` is a language feature
+  (`--language=+FullValueClasses`) each file records.
 - B2. Annotations, targets, opt-in and deprecation (14).
 - B3. Visibility and names, context parameters (17).
 - B4. Types: initializers, assignments, defaults, returns, accessors,
@@ -79,6 +95,15 @@ library the pinned kotlinc does not ship and are taken as valid):
 kotlinc also reports 90 diagnostics in the examples that neither engine
 does, nearly all warnings (`USELESS_IS_CHECK` 36, `NOTHING_TO_INLINE` 12),
 and 125 in typeck_negative. The old engine aborts on 5 inputs, sema on none.
+
+After B1: rule 1 keeps 69 of the old engine's typeck_negative diagnostics
+kotlinc confirms (50 to go, and the 11 warnings in the examples); sema
+matches kotlinc 77 times in typeck_negative and 16 times in the examples
+(all warnings), and misses 6, all in typeck_negative: 5 `NONE_APPLICABLE`
+where kotlinc names the one candidate's problem (B4), and a
+`NOTHING_TO_INLINE` kotlinc leaves out beside a
+`NON_PUBLIC_CALL_FROM_PUBLIC_INLINE` sema does not report yet. Rule 4
+holds.
 
 Measured 2026-09-26 with `klio check --format=json` over 807 inputs, the old
 engine against `--engine sema`:

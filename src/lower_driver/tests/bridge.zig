@@ -438,7 +438,7 @@ test "a class's run-time def names its ancestors, so the host's by-name subtype 
 test "a data class's run-time def lists its constructor properties, so host equality compares them" {
     var fx = try Fx.init(&.{
         \\package demo
-        \\data class P(val a: Int, var b: String, c: Int = 0)
+        \\data class P(val a: Int, var b: String)
         \\class Q(val a: Int)
         \\fun main() {}
     });

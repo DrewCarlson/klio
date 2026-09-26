@@ -48,7 +48,7 @@ pub fn message(s: *Sema, a: Allocator, site: Site) Allocator.Error![]const u8 {
         .expect_no_actual => std.fmt.allocPrint(a, "`{s}` is an `expect` with no `actual`", .{n}),
         .invisible => invisible(s, a, n, site.syms),
         .reified_param => std.fmt.allocPrint(a, "cannot use `{s}` as a reified type argument of `{s}`; use a class instead", .{ if (site.syms.len != 0) s.str(s.syms.name(site.syms[0])) else "?", n }),
-        .type_mismatch, .non_exhaustive_when, .when_guard, .member_hidden => site.detail,
+        .type_mismatch, .non_exhaustive_when, .when_guard, .member_hidden, .declaration, .modifier_required => site.detail,
     };
 }
 
@@ -141,7 +141,7 @@ fn invisible(s: *Sema, a: Allocator, n: []const u8, syms: []const Sym) Allocator
 
 /// `val x: String`, `var n: Int`, `fun f(x: Int): String`,
 /// `constructor(x: Int)`: a declaration as kotlinc's diagnostics show it.
-fn writeDeclaration(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), m: Sym) Allocator.Error!void {
+pub fn writeDeclaration(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), m: Sym) Allocator.Error!void {
     switch (s.syms.kind(m)) {
         .property => {
             try headers.propertyHeader(s, m);
@@ -161,6 +161,7 @@ fn writeDeclaration(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), m: Sym) All
             if (s.syms.kind(m) == .constructor) {
                 try buf.appendSlice(a, "constructor");
             } else {
+                if (s.syms.flags(m).suspend_) try buf.appendSlice(a, "suspend ");
                 try buf.appendSlice(a, "fun ");
                 if (info.receiver != .none) {
                     try writeType(s, a, buf, info.receiver);
@@ -183,6 +184,13 @@ fn writeDeclaration(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), m: Sym) All
         },
         else => try buf.appendSlice(a, s.str(s.syms.name(m))),
     }
+}
+
+/// `writeDeclaration` as a string.
+pub fn declarationText(s: *Sema, a: Allocator, m: Sym) Allocator.Error![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try writeDeclaration(s, a, &buf, m);
+    return buf.items;
 }
 
 fn uninferred(s: *Sema, a: Allocator, n: []const u8, tps: []const Sym) Allocator.Error![]const u8 {

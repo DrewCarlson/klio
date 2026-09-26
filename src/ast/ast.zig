@@ -147,12 +147,27 @@ pub fn exprUsesField(e: *const Expr) bool {
     };
 }
 
+/// Source-affecting language features, as kotlinc's `-XXLanguage:+Feature`.
+pub const LanguageFeatures = struct {
+    /// The full form `(val a, val b = prop)` and positional `[a, b]`, which
+    /// klio parses unconditionally.
+    name_based_destructuring: bool = false,
+    /// The parenthesized short form `(a, b = prop)` binds by property name;
+    /// off, `(a, b)` stays positional.
+    name_based_short_form: bool = false,
+    /// Value classes of several properties, and ones that extend an
+    /// abstract or sealed value class.
+    full_value_classes: bool = false,
+};
+
 pub const KotlinFile = struct {
     package: ?PackageHeader,
     imports: []ImportDecl,
     decls: []Decl,
     span: Span,
     file_annotations: []Annotation = &.{},
+    /// The language features the file was parsed with.
+    language: LanguageFeatures = .{},
     /// The parser saw a `@Composable` annotation somewhere in the file, so the
     /// compose pass has something to do.
     has_composable: bool = false,
@@ -344,6 +359,8 @@ pub const Property = struct {
     is_abstract: bool,
     is_open: bool,
     is_override: bool,
+    /// `final override`: the override closes the member.
+    is_final: bool = false,
     is_lateinit: bool,
     is_const: bool,
     is_inline: bool,

@@ -41,15 +41,9 @@ const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 
 /// Source-affecting language features, as kotlinc's `-XXLanguage:+Feature`.
-/// Set once per process from `klio run --language=+Feature` or `KLIO_LANGUAGE`.
-pub const LanguageFeatures = struct {
-    /// The full form `(val a, val b = prop)` and positional `[a, b]`, which
-    /// klio parses unconditionally.
-    name_based_destructuring: bool = false,
-    /// The parenthesized short form `(a, b = prop)` binds by property name;
-    /// off, `(a, b)` stays positional.
-    name_based_short_form: bool = false,
-};
+/// Set once per process from `klio run --language=+Feature` or `KLIO_LANGUAGE`;
+/// each parsed file keeps the features it was parsed with.
+pub const LanguageFeatures = ast.LanguageFeatures;
 pub var language: LanguageFeatures = .{};
 
 /// An unknown feature is accepted and ignored; the return says whether the name
@@ -65,6 +59,10 @@ pub fn setLanguageFeature(spec: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "EnableNameBasedDestructuringShortForm")) {
         language.name_based_short_form = on;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "FullValueClasses")) {
+        language.full_value_classes = on;
         return true;
     }
     return false;

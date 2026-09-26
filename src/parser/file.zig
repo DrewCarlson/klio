@@ -108,6 +108,7 @@ pub fn parseFile(p: *Parser) KotlinFile {
         .imports = imports,
         .decls = decls.toOwnedSlice(p.allocator) catch @panic("OOM in parseFile"),
         .has_composable = p.saw_composable,
+        .language = root.language,
         .span = start.join(end),
         .node_count = p.first_node_id,
     };

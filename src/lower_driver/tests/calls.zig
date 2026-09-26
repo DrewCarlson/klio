@@ -1711,6 +1711,10 @@ test "a data object hashes as its qualified name" {
 }
 
 test "a value class sets its properties before its supertype initializes" {
+    // A value class extending another is `FullValueClasses`.
+    const saved = parser.language;
+    defer parser.language = saved;
+    parser.language.full_value_classes = true;
     try driver.expectOutput(&.{
         \\var log = ""
         \\abstract value class Base(a: Int) {

@@ -24,6 +24,7 @@ const scope_mod = @import("scope.zig");
 const subtyping = @import("subtyping.zig");
 const members = @import("members.zig");
 const records = @import("records.zig");
+const census_mod = @import("census.zig");
 const infer = @import("infer.zig");
 const body = @import("body.zig");
 
@@ -660,16 +661,32 @@ fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, ar
     if (rinv.items.len != 0) try levels.append(s.arena, rinv);
     try appendExtensionLevels(ctx, &levels, n, recv_src, rt, false);
     try appendExtPropInvokeLevel(ctx, &levels, n, rt, recv_src);
+    // The functions an infix call names that are not `infix`: when no
+    // other candidate is left, the call is theirs, and kotlinc asks for the
+    // modifier.
+    var not_infix = newLevel();
     if (infix_only) {
         for (levels.items) |*level| {
             var kept: usize = 0;
             for (level.items) |c| {
                 if (c.via != .none or c.on_value or s.syms.kind(c.sym) != .function) continue;
-                if (!try members.isInfix(s, c.sym)) continue;
+                if (!try members.isInfix(s, c.sym)) {
+                    try not_infix.append(s.arena, c);
+                    continue;
+                }
                 level.items[kept] = c;
                 kept += 1;
             }
             level.shrinkRetainingCapacity(kept);
+        }
+        const left = for (levels.items) |level| {
+            if (level.items.len != 0) break true;
+        } else false;
+        if (!left and not_infix.items.len != 0) {
+            const f = not_infix.items[0].sym;
+            const msg = try std.fmt.allocPrint(s.arena, "'infix' modifier is required on '{s}'.", .{try sema_mod.diagnose.declarationText(s, s.arena, f)});
+            try ctx.reportFacts(.modifier_required, id.span, .{ .name = id.name, .message = msg, .factory = .INFIX_MODIFIER_REQUIRED }, "{s}", .{id.name});
+            return resolveLevels(ctx, &.{not_infix}, id, args, trailing, type_args, expected);
         }
     }
     // No candidate at all: a supertype's private function, which the
@@ -3401,8 +3418,36 @@ pub fn operatorCallExpecting(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pr
     for (args) |a| if (a.postponed) {
         _ = try body.expr(ctx, a.expr, .none);
     };
-    try ctx.reportFacts(.unresolved_operator, anchor, .{ .name = s.str(n), .on = try sema_mod.diagnose.typeText(s, s.arena, rt), .arg_types = try argTypes(ctx, args) }, "{s}.{s}({s})", .{ try sema_mod.render.typeStr(s, s.arena, rt), s.str(n), try argTypesText(ctx, args) });
+    // A member of the convention's name declared without `operator`:
+    // kotlinc asks for the modifier, and for a delegate reports that none
+    // of the functions applies.
+    const plain = if (members_apply) try plainMember(s, rt, n, args.len) else Sym.none;
+    const delegate = n == wk.getValue or n == wk.setValue or n == wk.provideDelegate;
+    if (plain != .none and !delegate) {
+        const msg = try std.fmt.allocPrint(s.arena, "'operator' modifier is required on '{s}' defined in '{s}'.", .{ try sema_mod.diagnose.declarationText(s, s.arena, plain), s.str(s.syms.name(s.syms.owner(plain))) });
+        try ctx.reportFacts(.modifier_required, anchor, .{ .name = s.str(n), .message = msg, .factory = .OPERATOR_MODIFIER_REQUIRED }, "{s}", .{s.str(n)});
+        return s.types.errType();
+    }
+    try ctx.reportFacts(.unresolved_operator, anchor, .{
+        .name = s.str(n),
+        .on = try sema_mod.diagnose.typeText(s, s.arena, rt),
+        .arg_types = try argTypes(ctx, args),
+        .factory = if (plain != .none) .DELEGATE_SPECIAL_FUNCTION_NONE_APPLICABLE else .none,
+    }, "{s}.{s}({s})", .{ try sema_mod.render.typeStr(s, s.arena, rt), s.str(n), try argTypesText(ctx, args) });
     return s.types.errType();
+}
+
+/// A member function of `rt` named `n`, taking `arity` arguments, that is
+/// not an `operator`.
+fn plainMember(s: *Sema, rt: TypeId, n: Name, arity: usize) Allocator.Error!Sym {
+    for (try members.lookup(s, rt, n, .function)) |m| {
+        if (try members.isOperator(s, m.sym)) continue;
+        try headers.functionHeader(s, m.sym);
+        const info = s.syms.functionInfo(m.sym);
+        if (info.receiver != .none or info.params.len != arity) continue;
+        return m.sym;
+    }
+    return .none;
 }
 
 /// A binary operator's right operand as its argument when it is a call
@@ -3865,8 +3910,8 @@ fn inHeader(c: *const body.Scope) bool {
 
 /// kotlinc's diagnostic for a `super` with no target: a label that names
 /// no enclosing class, or no class to have a supertype.
-fn superFactory(sp: *const ast.SuperExpr) []const u8 {
-    return if (sp.label != null) "UNRESOLVED_LABEL" else "SUPER_NOT_AVAILABLE";
+fn superFactory(sp: *const ast.SuperExpr) census_mod.Factory {
+    return if (sp.label != null) .UNRESOLVED_LABEL else .SUPER_NOT_AVAILABLE;
 }
 
 fn superTarget(ctx: *Ctx, sp: *const ast.SuperExpr) Allocator.Error!?struct { ty: TypeId, owner: Sym } {

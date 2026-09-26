@@ -63,6 +63,12 @@ pub const Reason = enum(u8) {
     /// A member function or property declared without `override` that has
     /// the signature of a supertype's member.
     member_hidden,
+    /// A declaration kotlinc refuses for its shape: its modifiers, its
+    /// kind's rules, its supertypes. The site names kotlinc's diagnostic.
+    declaration,
+    /// A call through a convention (`a + b`, `a[i]`, `a f b`) of a function
+    /// declared without the `operator` or `infix` it needs.
+    modifier_required,
 };
 
 /// What one tentative resolution recorded. `refs` holds the analysis's
@@ -82,6 +88,110 @@ pub const Buffer = BufferOf(@import("records.zig").Ref, @import("records.zig").E
 /// How a diagnostic weighs, as kotlinc ranks its factories: an error fails
 /// the compilation, a warning does not.
 pub const Severity = enum(u1) { err, warning };
+
+/// kotlinc's diagnostics the analysis reports, by their factory names
+/// (klio's own are `KLIO_*`). `none` leaves a site to its reason's.
+pub const Factory = enum {
+    none,
+    ABSTRACT_CLASS_MEMBER_NOT_IMPLEMENTED,
+    ABSTRACT_MEMBER_NOT_IMPLEMENTED,
+    ABSTRACT_MEMBER_NOT_IMPLEMENTED_BY_ENUM_ENTRY,
+    ACTUAL_MISSING,
+    AMBIGUOUS_ANONYMOUS_TYPE_INFERRED,
+    BACKING_FIELD_FOR_DELEGATED_PROPERTY,
+    CANNOT_CHANGE_ACCESS_PRIVILEGE,
+    CANNOT_INFER_PARAMETER_TYPE,
+    CANNOT_WEAKEN_ACCESS_PRIVILEGE,
+    CLASSIFIER_REDECLARATION,
+    COMMA_IN_WHEN_CONDITION_WITH_WHEN_GUARD,
+    COMPONENT_FUNCTION_MISSING,
+    CONFLICTING_OVERLOADS,
+    CONST_VAL_NOT_TOP_LEVEL_OR_OBJECT,
+    CYCLIC_CONSTRUCTOR_DELEGATION_CALL,
+    CONST_VAL_WITHOUT_INITIALIZER,
+    CONST_VAL_WITH_DELEGATE,
+    CONST_VAL_WITH_GETTER,
+    CONST_VAL_WITH_NON_CONST_INITIALIZER,
+    DATA_CLASS_NOT_PROPERTY_PARAMETER,
+    DATA_CLASS_VARARG_PARAMETER,
+    DATA_CLASS_WITHOUT_PARAMETERS,
+    DATA_OBJECT_CUSTOM_EQUALS_OR_HASH_CODE,
+    DELEGATE_SPECIAL_FUNCTION_MISSING,
+    DELEGATE_SPECIAL_FUNCTION_NONE_APPLICABLE,
+    DELEGATE_SPECIAL_FUNCTION_RETURN_TYPE_MISMATCH,
+    DELEGATION_NOT_TO_INTERFACE,
+    EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT,
+    EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET,
+    EXPLICIT_BACKING_FIELD_IN_INTERFACE,
+    EXPLICIT_FIELD_MUST_BE_INITIALIZED,
+    EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE,
+    EXTENSION_PROPERTY_MUST_HAVE_ACCESSORS_OR_BE_ABSTRACT,
+    EXTENSION_PROPERTY_WITH_BACKING_FIELD,
+    FINAL_SUPERTYPE,
+    GENERIC_THROWABLE_SUBCLASS,
+    HAS_NEXT_MISSING,
+    ILLEGAL_INLINE_PARAMETER_MODIFIER,
+    INAPPLICABLE_INFIX_MODIFIER,
+    INAPPLICABLE_LATEINIT_MODIFIER,
+    INAPPLICABLE_OPERATOR_MODIFIER,
+    INCOMPATIBLE_MODIFIERS,
+    INCONSISTENT_BACKING_FIELD_TYPE,
+    INLINE_PROPERTY_WITH_BACKING_FIELD,
+    INFIX_MODIFIER_REQUIRED,
+    INVISIBLE_REFERENCE,
+    MANY_IMPL_MEMBER_NOT_IMPLEMENTED,
+    MANY_INTERFACES_MEMBER_NOT_IMPLEMENTED,
+    ITERATOR_MISSING,
+    KLIO_MISSING_BUILTIN,
+    KLIO_UNRECORDED,
+    KLIO_UNSUPPORTED,
+    MULTIPLE_VARARG_PARAMETERS,
+    NEXT_MISSING,
+    NONE_APPLICABLE,
+    NON_SUSPEND_OVERRIDDEN_BY_SUSPEND,
+    NON_FINAL_PROPERTY_WITH_EXPLICIT_BACKING_FIELD,
+    NOTHING_TO_INLINE,
+    NOTHING_TO_OVERRIDE,
+    OPERATOR_MODIFIER_REQUIRED,
+    PARAMETER_NAME_CHANGED_ON_OVERRIDE,
+    NO_ACTUAL_FOR_EXPECT,
+    NO_ELSE_IN_WHEN,
+    NO_GET_METHOD,
+    NO_SET_METHOD,
+    NO_THIS,
+    OVERLOAD_RESOLUTION_AMBIGUITY,
+    OVERRIDING_FINAL_MEMBER,
+    PROPERTY_INITIALIZER_NO_BACKING_FIELD,
+    PROPERTY_WITH_EXPLICIT_FIELD_AND_ACCESSORS,
+    PROPERTY_TYPE_MISMATCH_ON_OVERRIDE,
+    REDECLARATION,
+    REDUNDANT_EXPLICIT_BACKING_FIELD,
+    REIFIED_TYPE_PARAMETER_NO_INLINE,
+    RETURN_TYPE_MISMATCH_ON_OVERRIDE,
+    SEALED_SUPERTYPE_IN_LOCAL_CLASS,
+    SINGLETON_IN_SUPERTYPE,
+    SUPERTYPE_NOT_INITIALIZED,
+    SUPER_NOT_AVAILABLE,
+    SUSPEND_OVERRIDDEN_BY_NON_SUSPEND,
+    TYPE_CANT_BE_USED_FOR_CONST_VAL,
+    TYPE_MISMATCH,
+    TYPE_PARAMETER_AS_REIFIED,
+    UNCHECKED_CAST,
+    UNRESOLVED_IMPORT,
+    UNRESOLVED_LABEL,
+    UNRESOLVED_REFERENCE,
+    UNSUPPORTED_FEATURE,
+    VALUE_CLASS_CANNOT_EXTEND_CLASSES,
+    VALUE_CLASS_CONSTRUCTOR_NOT_FINAL_READ_ONLY_PARAMETER,
+    VALUE_CLASS_EMPTY_CONSTRUCTOR,
+    VALUE_CLASS_NOT_FINAL,
+    VAR_OVERRIDDEN_BY_VAL,
+    VAR_PROPERTY_WITH_EXPLICIT_BACKING_FIELD,
+    VAR_TYPE_MISMATCH_ON_OVERRIDE,
+    VIRTUAL_MEMBER_HIDDEN,
+    WHEN_GUARD_WITHOUT_SUBJECT,
+    WRONG_MODIFIER_TARGET,
+};
 
 /// A place a diagnostic points to besides its own: the other declaration of
 /// a clash, the declaration an override hides.
@@ -113,7 +223,7 @@ pub const Site = struct {
     message: []const u8 = "",
     /// kotlinc's name for the diagnostic, where it is not the reason's
     /// (`factoryOf`).
-    factory: []const u8 = "",
+    factory: Factory = .none,
     severity: Severity = .err,
     related: []const Related = &.{},
     notes: []const []const u8 = &.{},
@@ -126,7 +236,7 @@ pub const Facts = struct {
     arg_types: []const TypeId = &.{},
     syms: []const Sym = &.{},
     message: []const u8 = "",
-    factory: []const u8 = "",
+    factory: Factory = .none,
     severity: Severity = .err,
     related: []const Related = &.{},
     notes: []const []const u8 = &.{},
@@ -136,41 +246,48 @@ pub const Facts = struct {
 /// its reason's. A reason kotlinc has no diagnostic for (what klio does not
 /// model, its own internal failures) is named `KLIO_*`.
 pub fn factoryOf(site: Site) []const u8 {
-    if (site.factory.len != 0) return site.factory;
+    return @tagName(factoryEnum(site));
+}
+
+fn factoryEnum(site: Site) Factory {
+    if (site.factory != .none) return site.factory;
     return switch (site.reason) {
-        .unresolved_type, .unresolved_name, .unresolved_call, .unresolved_member, .receiver_unresolved => "UNRESOLVED_REFERENCE",
-        .no_applicable => "NONE_APPLICABLE",
-        .ambiguous => "OVERLOAD_RESOLUTION_AMBIGUITY",
-        .unresolved_receiver => "UNRESOLVED_LABEL",
+        .unresolved_type, .unresolved_name, .unresolved_call, .unresolved_member, .receiver_unresolved => .UNRESOLVED_REFERENCE,
+        .no_applicable => .NONE_APPLICABLE,
+        .ambiguous => .OVERLOAD_RESOLUTION_AMBIGUITY,
+        .unresolved_receiver => .UNRESOLVED_LABEL,
         .unresolved_operator => operatorFactory(site.name),
-        .uninferred => "CANNOT_INFER_PARAMETER_TYPE",
-        .unresolved_import => "UNRESOLVED_IMPORT",
-        .unsupported => "KLIO_UNSUPPORTED",
-        .missing_builtin => "KLIO_MISSING_BUILTIN",
-        .unrecorded => "KLIO_UNRECORDED",
-        .expect_actual_mismatch => "ACTUAL_MISSING",
-        .conflicting_overloads => "CONFLICTING_OVERLOADS",
-        .expect_no_actual => "NO_ACTUAL_FOR_EXPECT",
-        .invisible => "INVISIBLE_REFERENCE",
-        .reified_param => "TYPE_PARAMETER_AS_REIFIED",
-        .type_mismatch => "TYPE_MISMATCH",
-        .non_exhaustive_when => "NO_ELSE_IN_WHEN",
-        .when_guard => "WHEN_GUARD_WITHOUT_SUBJECT",
-        .member_hidden => "VIRTUAL_MEMBER_HIDDEN",
+        .uninferred => .CANNOT_INFER_PARAMETER_TYPE,
+        .unresolved_import => .UNRESOLVED_IMPORT,
+        .unsupported => .KLIO_UNSUPPORTED,
+        .missing_builtin => .KLIO_MISSING_BUILTIN,
+        .unrecorded => .KLIO_UNRECORDED,
+        .expect_actual_mismatch => .ACTUAL_MISSING,
+        .conflicting_overloads => .CONFLICTING_OVERLOADS,
+        .expect_no_actual => .NO_ACTUAL_FOR_EXPECT,
+        .invisible => .INVISIBLE_REFERENCE,
+        .reified_param => .TYPE_PARAMETER_AS_REIFIED,
+        .type_mismatch => .TYPE_MISMATCH,
+        .non_exhaustive_when => .NO_ELSE_IN_WHEN,
+        .when_guard => .WHEN_GUARD_WITHOUT_SUBJECT,
+        .member_hidden => .VIRTUAL_MEMBER_HIDDEN,
+        // Always named by the site.
+        .declaration => .KLIO_UNSUPPORTED,
+        .modifier_required => .OPERATOR_MODIFIER_REQUIRED,
     };
 }
 
 /// kotlinc's diagnostic for an operator convention no function answers.
-fn operatorFactory(name: []const u8) []const u8 {
+fn operatorFactory(name: []const u8) Factory {
     const eql = std.mem.eql;
-    if (eql(u8, name, "get")) return "NO_GET_METHOD";
-    if (eql(u8, name, "set")) return "NO_SET_METHOD";
-    if (eql(u8, name, "iterator")) return "ITERATOR_MISSING";
-    if (eql(u8, name, "next")) return "NEXT_MISSING";
-    if (eql(u8, name, "hasNext")) return "HAS_NEXT_MISSING";
-    if (std.mem.startsWith(u8, name, "component")) return "COMPONENT_FUNCTION_MISSING";
-    if (eql(u8, name, "getValue") or eql(u8, name, "setValue") or eql(u8, name, "provideDelegate")) return "DELEGATE_SPECIAL_FUNCTION_MISSING";
-    return "UNRESOLVED_REFERENCE";
+    if (eql(u8, name, "get")) return .NO_GET_METHOD;
+    if (eql(u8, name, "set")) return .NO_SET_METHOD;
+    if (eql(u8, name, "iterator")) return .ITERATOR_MISSING;
+    if (eql(u8, name, "next")) return .NEXT_MISSING;
+    if (eql(u8, name, "hasNext")) return .HAS_NEXT_MISSING;
+    if (std.mem.startsWith(u8, name, "component")) return .COMPONENT_FUNCTION_MISSING;
+    if (eql(u8, name, "getValue") or eql(u8, name, "setValue") or eql(u8, name, "provideDelegate")) return .DELEGATE_SPECIAL_FUNCTION_MISSING;
+    return .UNRESOLVED_REFERENCE;
 }
 
 pub const Census = struct {
@@ -283,7 +400,7 @@ test "a warning is kept apart from the counted sites" {
     var c = Census.init(arena.allocator());
     const sp = span.Span.init(span.FileId.from(0), 1, 2);
     const m = c.mark();
-    try c.reportFacts(.type_mismatch, 0, sp, .{ .factory = "UNCHECKED_CAST", .severity = .warning }, "cast", .{});
+    try c.reportFacts(.type_mismatch, 0, sp, .{ .factory = .UNCHECKED_CAST, .severity = .warning }, "cast", .{});
     try c.report(.unresolved_name, 0, sp, "x");
     try std.testing.expectEqual(@as(u64, 1), c.total());
     try std.testing.expectEqual(@as(usize, 1), c.warnings.items.len);
@@ -299,5 +416,5 @@ test "a site is named by its reason unless it names itself" {
     try std.testing.expectEqualStrings("NO_GET_METHOD", factoryOf(.{ .reason = .unresolved_operator, .file = 0, .sp = sp, .detail = "", .name = "get" }));
     try std.testing.expectEqualStrings("COMPONENT_FUNCTION_MISSING", factoryOf(.{ .reason = .unresolved_operator, .file = 0, .sp = sp, .detail = "", .name = "component2" }));
     try std.testing.expectEqualStrings("UNRESOLVED_REFERENCE", factoryOf(.{ .reason = .unresolved_operator, .file = 0, .sp = sp, .detail = "", .name = "plus" }));
-    try std.testing.expectEqualStrings("NO_THIS", factoryOf(.{ .reason = .unresolved_receiver, .file = 0, .sp = sp, .detail = "", .factory = "NO_THIS" }));
+    try std.testing.expectEqualStrings("NO_THIS", factoryOf(.{ .reason = .unresolved_receiver, .file = 0, .sp = sp, .detail = "", .factory = .NO_THIS }));
 }

@@ -7221,3 +7221,499 @@ test "a type alias of an inner class is found in scope, not among the receiver's
         "unresolved reference `TAtoInner`",
     });
 }
+
+/// The factories of the program's census sites, sorted, each as
+/// `line FACTORY` of the file it is in.
+fn siteFactories(fx: *Fixture) ![]const []const u8 {
+    const a = fx.arena.allocator();
+    var out: std.ArrayList([]const u8) = .empty;
+    for (fx.s.census.sites.items) |site| {
+        const fc = fx.s.fileOf(site.file) orelse continue;
+        if (fc.origin != .program) continue;
+        const lc = fx.map.get(site.sp.file).lineCol(site.sp.start);
+        try out.append(a, try std.fmt.allocPrint(a, "{d} {s}", .{ lc.line, sema_mod.census.factoryOf(site) }));
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            const xn = std.fmt.parseInt(u32, x[0..std.mem.indexOfScalar(u8, x, ' ').?], 10) catch 0;
+            const yn = std.fmt.parseInt(u32, y[0..std.mem.indexOfScalar(u8, y, ' ').?], 10) catch 0;
+            if (xn != yn) return xn < yn;
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return out.items;
+}
+
+fn expectFactories(fx: *Fixture, want: []const []const u8) !void {
+    const got = try siteFactories(fx);
+    errdefer for (got) |g| std.debug.print("site: {s}\n", .{g});
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+test "a class's modifiers and kind's rules are kotlinc's" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open data class P(val x: Int)
+        \\data class Empty()
+        \\data class Bag(vararg val items: Int)
+        \\data class Plain(x: Int)
+        \\value class Two(val a: Int, val b: Int)
+        \\open value class Opened(val x: Int)
+        \\value class Mut(var x: Int)
+        \\open annotation class Marker
+        \\abstract enum class E { A }
+        \\data value class DV(val x: Int)
+        \\data class Fine(val x: Int, var y: Int)
+        \\value class Wrapped(val x: Int)
+        \\data object D {
+        \\    override fun equals(other: Any?): Boolean = true
+        \\    override fun hashCode(): Int = 0
+        \\}
+        \\data class C(val a: Int) {
+        \\    operator fun component1(): Int = a
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "2 INCOMPATIBLE_MODIFIERS",
+        "2 INCOMPATIBLE_MODIFIERS",
+        "3 DATA_CLASS_WITHOUT_PARAMETERS",
+        "4 DATA_CLASS_VARARG_PARAMETER",
+        "5 DATA_CLASS_NOT_PROPERTY_PARAMETER",
+        "6 UNSUPPORTED_FEATURE",
+        "7 VALUE_CLASS_NOT_FINAL",
+        "8 VALUE_CLASS_CONSTRUCTOR_NOT_FINAL_READ_ONLY_PARAMETER",
+        "9 WRONG_MODIFIER_TARGET",
+        "10 WRONG_MODIFIER_TARGET",
+        "11 INCOMPATIBLE_MODIFIERS",
+        "11 INCOMPATIBLE_MODIFIERS",
+        "15 DATA_OBJECT_CUSTOM_EQUALS_OR_HASH_CODE",
+        "16 DATA_OBJECT_CUSTOM_EQUALS_OR_HASH_CODE",
+        "18 CONFLICTING_OVERLOADS",
+        "19 CONFLICTING_OVERLOADS",
+    });
+}
+
+test "a supertype a class cannot have is refused as kotlinc refuses it" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Final
+        \\class Derived : Final()
+        \\object O
+        \\class FromObject : O
+        \\sealed class S
+        \\fun local(): Any {
+        \\    class L : S()
+        \\    return object : S() {}
+        \\}
+        \\open class Base(val n: Int)
+        \\class NotInit : Base
+        \\interface I
+        \\class ByClass(d: Base) : Base(1), I
+        \\class Deleg(d: Base) : Base by d
+        \\class GenericEx<T> : Throwable()
+        \\class Plain : Throwable()
+        \\open class Open
+        \\class Fine : Open(), I
+        \\abstract class Abs : Open()
+        \\class Later : Open {
+        \\    constructor() : super()
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "3 FINAL_SUPERTYPE",
+        "5 SINGLETON_IN_SUPERTYPE",
+        "8 SEALED_SUPERTYPE_IN_LOCAL_CLASS",
+        "9 SEALED_SUPERTYPE_IN_LOCAL_CLASS",
+        "12 SUPERTYPE_NOT_INITIALIZED",
+        "15 DELEGATION_NOT_TO_INTERFACE",
+        "15 SUPERTYPE_NOT_INITIALIZED",
+        "16 GENERIC_THROWABLE_SUBCLASS",
+    });
+}
+
+test "a property's and a parameter's modifiers are kotlinc's" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Holder {
+        \\    const val NAME = "x"
+        \\    private open fun f() {}
+        \\    lateinit val v: String
+        \\    lateinit var n: Int
+        \\    lateinit var q: String?
+        \\    lateinit var i: String = ""
+        \\    lateinit var ok: String
+        \\}
+        \\fun answer(): Int = 42
+        \\const val X: Int = answer()
+        \\const val ONE: Int = 1
+        \\const val SUM: Int = ONE + 2
+        \\const val TEXT: String = "a${ONE}"
+        \\const val ARR: Array<Int> = arrayOf(1)
+        \\val Int.bad: Int = 5
+        \\val Int.bare: Int
+        \\val Int.good: Int get() = this
+        \\inline val inl: Int = 42
+        \\val noField: Int = 7
+        \\    get() = 42
+        \\val withField: Int = 7
+        \\    get() = field + 1
+        \\fun <reified T> notInline(): String = "x"
+        \\inline fun <reified T> inlined(): String = "x"
+        \\fun runIt(crossinline block: () -> Unit) { block() }
+        \\fun twoVarargs(vararg a: Int, vararg b: Int) {}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "3 CONST_VAL_NOT_TOP_LEVEL_OR_OBJECT",
+        "4 INCOMPATIBLE_MODIFIERS",
+        "4 INCOMPATIBLE_MODIFIERS",
+        "5 INAPPLICABLE_LATEINIT_MODIFIER",
+        "6 INAPPLICABLE_LATEINIT_MODIFIER",
+        "7 INAPPLICABLE_LATEINIT_MODIFIER",
+        "8 INAPPLICABLE_LATEINIT_MODIFIER",
+        "12 CONST_VAL_WITH_NON_CONST_INITIALIZER",
+        "16 TYPE_CANT_BE_USED_FOR_CONST_VAL",
+        "17 EXTENSION_PROPERTY_WITH_BACKING_FIELD",
+        "18 EXTENSION_PROPERTY_MUST_HAVE_ACCESSORS_OR_BE_ABSTRACT",
+        "20 INLINE_PROPERTY_WITH_BACKING_FIELD",
+        "21 PROPERTY_INITIALIZER_NO_BACKING_FIELD",
+        "25 REIFIED_TYPE_PARAMETER_NO_INLINE",
+        "27 ILLEGAL_INLINE_PARAMETER_MODIFIER",
+        "28 MULTIPLE_VARARG_PARAMETERS",
+        "28 MULTIPLE_VARARG_PARAMETERS",
+    });
+}
+
+test "an override keeps what the member it overrides requires" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class B {
+        \\    fun closed(): Int = 1
+        \\    open fun f(): Int = 1
+        \\    open var v: Any = 1
+        \\    open var w: Int = 1
+        \\    open val r: Any = 1
+        \\    open fun s() {}
+        \\    open suspend fun t() {}
+        \\    protected open fun p() {}
+        \\    open fun g() {}
+        \\}
+        \\class D : B() {
+        \\    override fun none(): Int = 0
+        \\    override fun closed(): Int = 2
+        \\    override fun f(): Any = 2
+        \\    override var v: Int = 1
+        \\    override val w: Int = 2
+        \\    override val r: String = ""
+        \\    override suspend fun s() {}
+        \\    override fun t() {}
+        \\    public override fun p() {}
+        \\    private override fun g() {}
+        \\}
+        \\interface Box<T> { fun get(): T; val item: T }
+        \\class IntBox(override val item: Int) : Box<Int> {
+        \\    override fun get(): Int = item
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "14 NOTHING_TO_OVERRIDE",
+        "15 OVERRIDING_FINAL_MEMBER",
+        "16 RETURN_TYPE_MISMATCH_ON_OVERRIDE",
+        "17 VAR_TYPE_MISMATCH_ON_OVERRIDE",
+        "18 VAR_OVERRIDDEN_BY_VAL",
+        "20 NON_SUSPEND_OVERRIDDEN_BY_SUSPEND",
+        "21 SUSPEND_OVERRIDDEN_BY_NON_SUSPEND",
+        "23 CANNOT_WEAKEN_ACCESS_PRIVILEGE",
+        "23 INCOMPATIBLE_MODIFIERS",
+        "23 INCOMPATIBLE_MODIFIERS",
+    });
+}
+
+test "a class implements what it inherits abstract, and overrides what several supertypes implement" {
+    var fx = try fixture(&.{
+        \\package app
+        \\interface I { fun f() }
+        \\interface D1 { fun g() {} }
+        \\interface D2 { fun g() {} }
+        \\abstract class A { abstract fun h(): Int }
+        \\open class K { open fun g() {} }
+        \\class Missing : I
+        \\class MissingBase : A()
+        \\abstract class StillAbstract : A(), I
+        \\class Through : StillAbstract()
+        \\class Two : D1, D2
+        \\abstract class TwoAbstract : D1, D2
+        \\class ClassAndDefault : K(), D1
+        \\class Done : A(), I, D1, D2 {
+        \\    override fun f() {}
+        \\    override fun g() {}
+        \\    override fun h(): Int = 1
+        \\}
+        \\open class Impl { fun f() {} }
+        \\class ByClass : Impl(), I
+        \\class Delegated(d: I) : I by d
+        \\object O : I
+        \\fun anon(): Any = object : I {}
+        \\interface Str { override fun toString(): String }
+        \\class NoStr : Str
+        \\enum class E { X; abstract fun f() }
+        \\enum class F { Y { override fun f() {} }; abstract fun f() }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "7 ABSTRACT_MEMBER_NOT_IMPLEMENTED",
+        "8 ABSTRACT_CLASS_MEMBER_NOT_IMPLEMENTED",
+        "10 ABSTRACT_CLASS_MEMBER_NOT_IMPLEMENTED",
+        "10 ABSTRACT_MEMBER_NOT_IMPLEMENTED",
+        "11 MANY_INTERFACES_MEMBER_NOT_IMPLEMENTED",
+        "12 MANY_INTERFACES_MEMBER_NOT_IMPLEMENTED",
+        "13 MANY_IMPL_MEMBER_NOT_IMPLEMENTED",
+        "22 ABSTRACT_MEMBER_NOT_IMPLEMENTED",
+        "23 ABSTRACT_MEMBER_NOT_IMPLEMENTED",
+        "25 ABSTRACT_MEMBER_NOT_IMPLEMENTED",
+        "26 ABSTRACT_MEMBER_NOT_IMPLEMENTED_BY_ENUM_ENTRY",
+    });
+}
+
+test "a convention call of a function without the modifier asks for it" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class V(val x: Int) {
+        \\    fun plus(o: V): V = V(x + o.x)
+        \\    fun get(i: Int): Int = i
+        \\    infix fun times(o: V): V = o
+        \\}
+        \\fun f(a: V, b: V): Int {
+        \\    val r = a plus b
+        \\    val s = a + b
+        \\    val u = a times b
+        \\    return a[0]
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "8 INFIX_MODIFIER_REQUIRED",
+        "9 OPERATOR_MODIFIER_REQUIRED",
+        "11 OPERATOR_MODIFIER_REQUIRED",
+    });
+    try expectMessages(&fx, &.{
+        "'infix' modifier is required on 'fun plus(o: V): V'.",
+        "'operator' modifier is required on 'fun plus(o: V): V' defined in 'V'.",
+        "'operator' modifier is required on 'fun get(i: Int): Int' defined in 'V'.",
+    });
+}
+
+test "an operator function has its convention's shape" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Card(val rank: Int) {
+        \\    operator fun compareTo(other: Card): Boolean = true
+        \\    operator fun plus(a: Card, b: Card): Card = a
+        \\    operator fun get(): Int = 0
+        \\    suspend operator fun getValue(thisRef: Any?, prop: Any?): Int = 1
+        \\    operator fun frobnicate(): Int = 0
+        \\    operator fun component1(): Int = rank
+        \\    operator fun contains(x: Int): Boolean = true
+        \\    infix fun pair(a: Int, b: Int): Int = a
+        \\}
+        \\operator fun unaryMinus(): Int = 0
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "3 INAPPLICABLE_OPERATOR_MODIFIER",
+        "4 INAPPLICABLE_OPERATOR_MODIFIER",
+        "5 INAPPLICABLE_OPERATOR_MODIFIER",
+        "6 INAPPLICABLE_OPERATOR_MODIFIER",
+        "7 INAPPLICABLE_OPERATOR_MODIFIER",
+        "10 INAPPLICABLE_INFIX_MODIFIER",
+        "12 INAPPLICABLE_OPERATOR_MODIFIER",
+    });
+}
+
+test "secondary constructors that delegate in a circle are refused" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Loopy {
+        \\    constructor(a: Int) : this(a, 0)
+        \\    constructor(a: Int, b: Int) : this(a)
+        \\}
+        \\class Fine(val x: Int) {
+        \\    constructor() : this(1)
+        \\    constructor(a: Int, b: Int) : this()
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "3 CYCLIC_CONSTRUCTOR_DELEGATION_CALL",
+        "4 CYCLIC_CONSTRUCTOR_DELEGATION_CALL",
+    });
+}
+
+test "an explicit backing field keeps kotlinc's rules" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class C {
+        \\    var mutable: Number
+        \\        field: Int = 1
+        \\    val accessor: Number
+        \\        field: Int = 1
+        \\        get() = 5
+        \\    val wrong: Int
+        \\        field: String = "x"
+        \\    val same: Int
+        \\        field: Int = 1
+        \\    private val hidden: Number
+        \\        field: Int = 1
+        \\    val never: Number
+        \\        field: Int
+        \\    val later: Number
+        \\        field: Int
+        \\    val fine: Number
+        \\        field: Int = 1
+        \\    init { later = 2 }
+        \\}
+        \\open class O {
+        \\    open val n: Number
+        \\        field: Int = 1
+        \\}
+        \\interface I {
+        \\    val n: Number
+        \\        field: Int = 1
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "4 VAR_PROPERTY_WITH_EXPLICIT_BACKING_FIELD",
+        "6 PROPERTY_WITH_EXPLICIT_FIELD_AND_ACCESSORS",
+        "9 INCONSISTENT_BACKING_FIELD_TYPE",
+        "13 EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE",
+        "15 EXPLICIT_FIELD_MUST_BE_INITIALIZED",
+        "24 NON_FINAL_PROPERTY_WITH_EXPLICIT_BACKING_FIELD",
+        "28 EXPLICIT_BACKING_FIELD_IN_INTERFACE",
+    });
+    var warned: usize = 0;
+    for (fx.s.census.warnings.items) |w| {
+        if (std.mem.eql(u8, sema_mod.census.factoryOf(w), "REDUNDANT_EXPLICIT_BACKING_FIELD")) warned += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), warned);
+}
+
+test "a declaration seen outside cannot take an object expression's type of several supertypes" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class Base
+        \\interface I
+        \\fun leak() = object : Base(), I {}
+        \\private fun keep() = object : Base(), I {}
+        \\fun single() = object : I {}
+        \\val prop = object : Base(), I {}
+        \\fun local(): Any {
+        \\    val x = object : Base(), I {}
+        \\    return x
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "4 AMBIGUOUS_ANONYMOUS_TYPE_INFERRED",
+        "7 AMBIGUOUS_ANONYMOUS_TYPE_INFERRED",
+    });
+}
+
+/// The factories of the program's warning sites, as `siteFactories`
+/// lists the errors.
+fn warningFactories(fx: *Fixture) ![]const []const u8 {
+    const a = fx.arena.allocator();
+    var out: std.ArrayList([]const u8) = .empty;
+    for (fx.s.census.warnings.items) |site| {
+        const fc = fx.s.fileOf(site.file) orelse continue;
+        if (fc.origin != .program) continue;
+        const lc = fx.map.get(site.sp.file).lineCol(site.sp.start);
+        try out.append(a, try std.fmt.allocPrint(a, "{d} {s}", .{ lc.line, sema_mod.census.factoryOf(site) }));
+    }
+    return out.items;
+}
+
+fn expectWarnings(fx: *Fixture, want: []const []const u8) !void {
+    const got = try warningFactories(fx);
+    errdefer for (got) |g| std.debug.print("warning: {s}\n", .{g});
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+test "an inline function with nothing to inline and a renamed override parameter are warned of" {
+    var fx = try fixture(&.{
+        \\package app
+        \\inline fun plain(x: Int): Int = x
+        \\inline fun lambda(block: () -> Int): Int = block()
+        \\inline fun <reified T> reified(x: Any): Boolean = x is T
+        \\inline fun nullable(block: (() -> Int)?): Int = 0
+        \\inline fun Int.ext(): Int = this
+        \\open class B { open fun f(x: Int, y: Int) {} }
+        \\class D : B() { override fun f(x: Int, z: Int) {} }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{});
+    try expectWarnings(&fx, &.{
+        "2 NOTHING_TO_INLINE",
+        "5 NOTHING_TO_INLINE",
+        "6 NOTHING_TO_INLINE",
+        "8 PARAMETER_NAME_CHANGED_ON_OVERRIDE",
+    });
+}
+
+test "a value class hierarchy needs FullValueClasses" {
+    const program =
+        \\package app
+        \\abstract value class Base(a: Int) {
+        \\    abstract val i: Int
+        \\}
+        \\value class Derived(override val i: Int) : Base(i + 1)
+        \\value class Two(val a: Int, val b: Int)
+    ;
+    {
+        var fx = try fixture(&.{program});
+        defer fx.deinit();
+        try fx.resolve();
+        try expectFactories(&fx, &.{
+            "2 VALUE_CLASS_NOT_FINAL",
+            "5 VALUE_CLASS_CANNOT_EXTEND_CLASSES",
+            "6 UNSUPPORTED_FEATURE",
+        });
+    }
+    const saved = parser.language;
+    defer parser.language = saved;
+    parser.language.full_value_classes = true;
+    var fx = try fixture(&.{program});
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{});
+}
+
+test "kotlinc holds inc and dec to no parameter count, and names an operator before placing it" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class C(val n: Int) {
+        \\    operator fun inc(by: Int): C = C(n + by)
+        \\}
+        \\operator fun top(): Int = 0
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{"5 INAPPLICABLE_OPERATOR_MODIFIER"});
+    try expectMessages(&fx, &.{"'operator' modifier is not applicable to function: illegal function name."});
+}

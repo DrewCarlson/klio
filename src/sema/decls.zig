@@ -228,7 +228,7 @@ fn collectProperty(ctx: Ctx, p: *const ast.Property, owner: Sym, place: Place) A
         .file = ctx.file,
         .flags = .{
             .visibility = visibility(p.visibility),
-            .modality = if (place == .top_level) .final else memberModality(place, p.is_abstract, p.is_open, p.is_override, false, has_body),
+            .modality = if (place == .top_level) .final else memberModality(place, p.is_abstract, p.is_open, p.is_override, p.is_final, has_body),
             .expect = p.is_expect,
             .actual = p.is_actual,
             .inline_ = p.is_inline,
@@ -993,12 +993,12 @@ fn checkActualModifiers(s: *Sema, e: Sym, a: Sym) Allocator.Error!void {
     const file = s.syms.get(a).file;
     const sp = declSpan(s, a);
     const name = s.str(s.syms.name(a));
-    if (!af.actual) try mismatch(s, file, sp, name, "ACTUAL_MISSING", "matches an expect but is not marked actual", "`{s}` implements an `expect` and must be marked `actual`");
+    if (!af.actual) try mismatch(s, file, sp, name, .ACTUAL_MISSING, "matches an expect but is not marked actual", "`{s}` implements an `expect` and must be marked `actual`");
     // The actual carries every `inline`, `operator` and `infix` its expect
     // has, and may add `inline`; `suspend` matches.
-    const not_subset = "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET";
+    const not_subset: census_mod.Factory = .EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET;
     if (ef.inline_ and !af.inline_) try mismatch(s, file, sp, name, not_subset, "its expect is inline", "`{s}` must be `inline`, as its `expect` is");
-    if (ef.suspend_ != af.suspend_) try mismatch(s, file, sp, name, "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT", "suspend differs from its expect", "`{s}` must be `suspend` exactly when its `expect` is");
+    if (ef.suspend_ != af.suspend_) try mismatch(s, file, sp, name, .EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT, "suspend differs from its expect", "`{s}` must be `suspend` exactly when its `expect` is");
     if (ef.operator and !af.operator) try mismatch(s, file, sp, name, not_subset, "its expect is an operator", "`{s}` must be an `operator`, as its `expect` is");
     if (ef.infix and !af.infix) try mismatch(s, file, sp, name, not_subset, "its expect is infix", "`{s}` must be `infix`, as its `expect` is");
     const m = s.syms.getMut(a);
@@ -1006,7 +1006,7 @@ fn checkActualModifiers(s: *Sema, e: Sym, a: Sym) Allocator.Error!void {
     m.flags.infix = m.flags.infix or ef.infix;
 }
 
-fn mismatch(s: *Sema, file: u32, sp: @import("span").Span, name: []const u8, factory: []const u8, comptime detail: []const u8, comptime msg: []const u8) Allocator.Error!void {
+fn mismatch(s: *Sema, file: u32, sp: @import("span").Span, name: []const u8, factory: census_mod.Factory, comptime detail: []const u8, comptime msg: []const u8) Allocator.Error!void {
     try s.census.reportFacts(.expect_actual_mismatch, file, sp, .{ .message = try std.fmt.allocPrint(s.arena, msg, .{name}), .factory = factory }, "{s}: " ++ detail, .{name});
 }
 
@@ -1019,7 +1019,18 @@ pub fn declSpan(s: *Sema, sym: Sym) @import("span").Span {
         .object => |o| o.name.span,
         .type_alias => |ta| ta.name.span,
         .class_param => |cp| cp.name.span,
+        // A data class's `componentN` and `copy` are declared by the class.
+        .none => if (dataMember(s, sym)) declSpan(s, s.syms.owner(sym)) else @import("span").Span.init(@import("span").FileId.from(0), 0, 0),
         else => @import("span").Span.init(@import("span").FileId.from(0), 0, 0),
+    };
+}
+
+/// A `componentN` or `copy` the language declares for a data class.
+fn dataMember(s: *Sema, sym: Sym) bool {
+    if (s.syms.kind(sym) != .function or !s.syms.flags(sym).synthetic) return false;
+    return switch (s.syms.functionInfo(sym).synth) {
+        .data_component, .data_copy => true,
+        else => false,
     };
 }
 
@@ -1083,12 +1094,20 @@ fn checkConflicts(s: *Sema, sym: Sym, owner: Sym) Allocator.Error!void {
     for (clashes.items[1..]) |other| try related.append(s.arena, .{ .file = s.syms.get(other).file, .sp = declSpan(s, other), .message = "also declared here" });
     // kotlinc names a clash of functions an overload conflict and one of
     // properties or classifiers a redeclaration.
-    const factory = switch (s.syms.kind(sym)) {
-        .function => "CONFLICTING_OVERLOADS",
-        .property => "REDECLARATION",
-        else => "CLASSIFIER_REDECLARATION",
+    const factory: census_mod.Factory = switch (s.syms.kind(sym)) {
+        .function => .CONFLICTING_OVERLOADS,
+        .property => .REDECLARATION,
+        else => .CLASSIFIER_REDECLARATION,
     };
     try s.census.reportFacts(.conflicting_overloads, s.syms.get(sym).file, declSpan(s, sym), .{ .name = name, .syms = clashes.items, .factory = factory, .related = related.items }, "{s}: {d} declarations", .{ name, clashes.items.len });
+    // A `componentN` or `copy` the class declares clashes with the one the
+    // language declares for it too, which kotlinc reports at the class.
+    for (clashes.items[1..]) |other| {
+        if (!dataMember(s, other)) continue;
+        const pair = try s.arena.dupe(Sym, &.{ other, sym });
+        const back = try s.arena.dupe(census_mod.Related, &.{.{ .file = s.syms.get(sym).file, .sp = declSpan(s, sym), .message = "also declared here" }});
+        try s.census.reportFacts(.conflicting_overloads, s.syms.get(other).file, declSpan(s, other), .{ .name = name, .syms = pair, .factory = factory, .related = back }, "{s}: {d} declarations", .{ name, 2 });
+    }
 }
 
 /// Whether two declarations of one scope under one name clash: two
@@ -1110,7 +1129,7 @@ fn clash(s: *Sema, a: Sym, b: Sym) Allocator.Error!bool {
     }
     const fa = s.syms.flags(a);
     const fb = s.syms.flags(b);
-    if (fb.synthetic) return false;
+    if (fb.synthetic and !dataMember(s, b)) return false;
     if (fa.expect != fb.expect) return false;
     if (fa.visibility == .private and fb.visibility == .private and s.syms.get(a).file != s.syms.get(b).file) return false;
     return switch (ka) {

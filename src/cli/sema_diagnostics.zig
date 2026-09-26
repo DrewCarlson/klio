@@ -15,7 +15,7 @@ pub const Options = struct {
     /// What an error site is shown as. An import that names nothing is an
     /// error whatever this says: it fails the file whatever runs it.
     error_severity: diagnostics.Severity = .Error,
-    /// The warning sites too.
+    /// The warning sites too, when there is no error.
     warnings: bool = true,
 };
 
@@ -49,7 +49,8 @@ pub fn collect(arena: Allocator, s: *sema.Sema, opts: Options) Allocator.Error!C
         const severity: diagnostics.Severity = if (site.reason == .unresolved_import) .Error else opts.error_severity;
         try out.append(arena, try fromSite(arena, s, site, severity));
     }
-    if (opts.warnings) {
+    // kotlinc prints no warning of a compilation that has an error.
+    if (opts.warnings and kept.items.len == 0) {
         for (s.census.warnings.items) |site| {
             if (!inProgram(s, site) or try sup.suppressed(s, site)) continue;
             try out.append(arena, try fromSite(arena, s, site, .Warning));
@@ -94,31 +95,17 @@ pub fn sortByPlace(list: []Diagnostic) void {
     }.lt);
 }
 
-test "every reason's diagnostic is a factory kotlinc or klio declares" {
+test "every diagnostic sema names is a factory kotlinc or klio declares" {
+    inline for (std.meta.fields(sema.census.Factory)) |f| {
+        if (comptime std.mem.eql(u8, f.name, "none")) continue;
+        if (diagnostics.factoryByName(f.name) == null) {
+            std.debug.print("no factory {s}\n", .{f.name});
+            return error.TestUnexpectedResult;
+        }
+    }
     const sp = span.Span.init(span.FileId.from(0), 0, 0);
     inline for (std.meta.fields(sema.census.Reason)) |f| {
         const site: Site = .{ .reason = @enumFromInt(f.value), .file = 0, .sp = sp, .detail = "" };
-        const name = sema.census.factoryOf(site);
-        if (diagnostics.factoryByName(name) == null) {
-            std.debug.print("{s}: no factory {s}\n", .{ f.name, name });
-            return error.TestUnexpectedResult;
-        }
-    }
-    for ([_][]const u8{ "get", "set", "iterator", "next", "hasNext", "component1", "getValue", "plus" }) |op| {
-        const site: Site = .{ .reason = .unresolved_operator, .file = 0, .sp = sp, .detail = "", .name = op };
         try std.testing.expect(diagnostics.factoryByName(sema.census.factoryOf(site)) != null);
-    }
-    // The names sites give themselves.
-    for ([_][]const u8{
-        "NO_THIS",                                                "UNRESOLVED_LABEL",
-        "SUPER_NOT_AVAILABLE",                                    "COMMA_IN_WHEN_CONDITION_WITH_WHEN_GUARD",
-        "DELEGATE_SPECIAL_FUNCTION_RETURN_TYPE_MISMATCH",         "ACTUAL_MISSING",
-        "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT", "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET",
-        "REDECLARATION",                                          "CLASSIFIER_REDECLARATION",
-    }) |name| {
-        if (diagnostics.factoryByName(name) == null) {
-            std.debug.print("no factory {s}\n", .{name});
-            return error.TestUnexpectedResult;
-        }
     }
 }
