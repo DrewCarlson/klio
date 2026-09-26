@@ -78,9 +78,10 @@ oracle when they landed and expect the JVM's output; compose_window_input and
 compose_window_pointer expect the event sequences Compose Desktop prints for
 the same events through ImageComposeScene. The other window examples
 (lifetime, modal, transparent, menus, tray) open native windows the headless
-oracle cannot, and are checked by frame dumps and scripted input. A fresh
-full oracle sweep (`scripts/compose-oracle.py` over every compose example)
-has not been run since the 44. The sema census
+oracle cannot, and are checked by frame dumps and scripted input. The last
+full oracle sweep (`scripts/compose-oracle.py` over every headless compose
+example) finds 56 of 57 identical; compose_material3_platform does not
+compile for the JVM. The sema census
 over the compose, lifecycle, savedstate and skiko packs has no unresolved
 site, no unlowered site and no unbound native: material3's natives are all
 bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
@@ -108,19 +109,16 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
    `org.jetbrains.skiko` import beside them, and `androidx.lifecycle.
    SavedStateHandle` alone selects no pack. Cause, fix and tests are in
    plans/resolved-interpreter.md, open correctness bugs.
-4. The upstream scene (item 3). Every library it needs is a pack now:
-   androidx.lifecycle (runtime-compose), androidx.savedstate (compose),
-   androidx.lifecycle.viewmodel.savedstate, androidx.lifecycle.viewmodel.
-   compose. Next: ui's skikoMain PlatformContext with desktopMain's
-   DefaultArchitectureComponentsOwner (lifecycle, view model store,
-   saved-state registry, enableSavedStateHandles),
-   ProvidePlatformCompositionLocals (LocalLifecycleOwner,
-   LocalSavedStateRegistryOwner, LocalSaveableStateRegistry,
-   HostDefaultProviderImpl), then RootNodeOwner, BaseComposeScene and
-   CanvasLayersComposeScene in place of KlioComposeHost and KlioScene
-   (kotlin-klio/klio-compose-ui-core/klioMain). ui-core's klio.toml takes the
-   two viewmodel packs as deps then; ComposeSceneInputHandler.klio.kt goes
-   back to upstream's file once RootNodeOwner is in.
+4. Done: the upstream scene. ui's skikoMain is taken whole: RootNodeOwner,
+   BaseComposeScene, CanvasLayersComposeScene, PlatformLayersComposeScene,
+   ImageComposeScene and renderComposeScene, PlatformContext and the
+   platform composition locals. A klio window is a CanvasLayersComposeScene
+   with a FrameRecomposer of its own and a KlioPlatformContext
+   (klioMain/androidx/compose/ui/klio/KlioComposeHost.kt), and its content
+   has a DefaultArchitectureComponentsOwner whose lifecycle follows the
+   window as a desktop window's does (compose_window_lifecycle).
+   KlioComposeScene is the oracle's own helper over ImageComposeScene, and
+   compose_popup now prints what Compose Desktop prints.
 5. Done: the skia binding layer's second half (item 6). ui-graphics and
    ui-text run their skikoMain whole over org.jetbrains.skia (with ui-text's
    nativeMain, and klio actuals only for the locale, the string casing and
@@ -143,8 +141,8 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
 8. Not verified anywhere: running on Windows (the shim's link needs the MSVC
    toolchain the Windows Skia prebuilt is built with), a Wayland session.
 9. The long tail in Inventory: foundation's TooltipArea, ContextMenuProvider,
-   BasicContextMenuRepresentation, text/ContextMenu; ui's ImageComposeScene,
-   renderComposeScene and the skia interop; runtime-retain's `retain`.
+   BasicContextMenuRepresentation, text/ContextMenu; the skia interop;
+   runtime-retain's `retain`.
 
 **Sparse checkout widenings a future item needs** (for the coordinator to
 run; scripts/init-compose-submodule.sh lists the current set):
@@ -164,7 +162,7 @@ run; scripts/init-compose-submodule.sh lists the current set):
 2. **material3's platform half.** skikoMain and nonJvmMain verbatim, a
    ui-backhandler pack, `CalendarLocale` and `PlatformDateFormat` over the
    ICU the Skia shim bundles. Done: the 35 unbound natives are gone.
-3. **The upstream scene.** RootNodeOwner, OwnedLayerManager,
+3. **The upstream scene.** Done. RootNodeOwner, OwnedLayerManager,
    GraphicsLayerOwnerLayer, BaseComposeScene, CanvasLayersComposeScene and
    the input and focus handlers from ui's skikoMain, in place of
    KlioComposeHost and KlioScene. The layers are done: GraphicsLayerOwnerLayer
@@ -227,7 +225,7 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 |--------|-----------:|----------:|-----------:|------------------------:|
 | runtime | 188 / 188 | n/a | 6 / 9, nonAndroid 10 / 10 | jvmAndAndroid 3 java-free; klio actuals |
 | runtime-saveable | 9 / 9 | n/a | n/a | n/a |
-| ui | 244 / 244 | 45 / 92 | 8 / 8 | 86 / 175 |
+| ui | 244 / 244 | 92 / 92 | 8 / 8 | 86 / 175 |
 | ui-graphics | 82 / 82 | 19 / 19, skikoExcludingWeb 1 / 1 | 1 / 1 | 0 / 7 |
 | ui-text | 79 / 79 | 28 / 28 | 5 / 5, native 6 / 6 | 0 / 15 |
 | ui-unit, ui-util, ui-geometry | complete | n/a | complete, ui-unit nonAndroid 2 / 2 | n/a |
@@ -254,9 +252,7 @@ DesktopScrollable, KeyEventHelpers and TextFieldKeyInput, adapted in
 klioMain with their AWT calls replaced; ClipboardUtils, adapted over
 klio.datatransfer; WindowDraggableArea (AWT window dragging).
 
-Public API still missing (beyond the scene internals): ui's
-`ImageComposeScene`, `renderComposeScene`; foundation's
-`TooltipArea`, `ContextMenuArea`;
+Public API still missing: foundation's `TooltipArea`, `ContextMenuArea`;
 runtime-retain's `retain`, `RetainedEffect` and the stores.
 
 ## Platforms
@@ -544,8 +540,9 @@ isTraySupported is false), and running on Windows.
 - Resolved: PathMeasure measured klio's own path (arcs as cubics) with a
   Kotlin contour measure; it is skiko's SkContourMeasure over the SkPath now,
   and compose_pathmeasure prints what Compose Desktop prints.
-- Open, pre-existing: compose_popup prints its placement lines twice on
-  Compose Desktop's ImageComposeScene and once on klio's scene.
+- Resolved: compose_popup printed its placement lines once where Compose
+  Desktop's ImageComposeScene prints them twice; klio's own scene placed the
+  popup in one pass, upstream's scene takes two, as the JVM does.
 - 2026-09-26: klio.compose.ui, klio's own display-list UI over the shim, is
   gone with its nine examples. The mobile hosts' offscreen scene and the
   bundle_ui gate render upstream Compose through `renderComposeToPng`, and
@@ -553,3 +550,8 @@ isTraySupported is false), and running on Windows.
   program by Compose's `application`, `awaitApplication` and
   `singleWindowApplication`. The shim drops the display-list draw calls,
   `klio_win_poll` and the offscreen EGL surface.
+- 2026-09-26: klio's hosts run upstream's scene. ui's skikoMain is taken
+  whole, and KlioScene, klio's owner and its composition locals are gone. A
+  window is a CanvasLayersComposeScene with its own FrameRecomposer, and its
+  lifecycle follows its focus and close as a desktop window's does. The JVM
+  oracle finds 56 of the 57 headless compose examples identical.

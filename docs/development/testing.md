@@ -56,9 +56,10 @@ binary started by hand without it installs the packs into
   the outcomes must be identical, and independent of program order.
 - The Compose examples have their own oracle: Compose Desktop 1.12.0 on the
   JVM. `scripts/compose-oracle.py <example>...` compiles an example that
-  uses klio's headless `KlioComposeScene` with kotlinc 2.4.20 and the
-  Compose compiler plugin, beside a class of the same name and API over
-  ImageComposeScene, runs it headless, runs it on klio, and diffs the two
+  uses `KlioComposeScene`, the headless helper klio's ui pack defines over
+  upstream's ImageComposeScene, with kotlinc 2.4.20 and the Compose compiler
+  plugin, beside the same helper over Compose Desktop's ImageComposeScene,
+  runs it headless, runs it on klio, and diffs the two
   outputs (pixels read back, text metrics, event sequences). `--jvm-only`
   prints the JVM output, which is the expected output for a new example.
   The classpath is resolved from Maven by `scripts/compose-oracle-fetch.py`

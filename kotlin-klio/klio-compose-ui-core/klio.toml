@@ -13,82 +13,14 @@ auto_bindings = true
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui/src/commonMain/kotlin"
 
-# skikoMain: the upstream non-JVM actuals that are already java-free. Autofill has
-# no platform behind it off Android, so upstream's own skiko actuals answer null,
-# which is exactly what klio can serve. A text field reaches these on every
-# semantics pass (`FillableData.createFromText`). TranslationsCache is the
-# locale lookup the desktop platform strings below go through.
-# CompositionLocals.skiko.kt is not vendored: beside the LocalLifecycleOwner
-# actual and LocalPlatformPrefetchScheduler it provides the locals of a skiko
-# ComposeScene's PlatformContext, which klio's host does not have; klioMain's
-# CompositionLocals.klio.kt keeps the first two.
+# skikoMain whole: the scene (ComposeScene, CanvasLayersComposeScene,
+# PlatformLayersComposeScene, ImageComposeScene), RootNodeOwner and the
+# PlatformContext a host implements, the platform composition locals with the
+# lifecycle, view model and saved-state owners, the frame recomposer, the input
+# handling, drag and drop, popups and dialogs, and interop. klioMain has the
+# hosts over it (KlioWindow, KlioComposeScene) and the actuals skikoMain expects.
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui/src/skikoMain/kotlin"
-include = [
-    "androidx/compose/ui/platform/PlatformPrefetchScheduler.skiko.kt",
-    # The clipboard's platform factories; klioMain's PlatformClipboard.klio.kt
-    # is the desktop's over klio.datatransfer.
-    "androidx/compose/ui/platform/PlatformClipboard.skiko.kt",
-    "androidx/compose/ui/autofill/ContentDataType.skiko.kt",
-    "androidx/compose/ui/autofill/ContentType.skiko.kt",
-    "androidx/compose/ui/autofill/FillableData.skiko.kt",
-    "androidx/compose/ui/platform/TranslationsCache.skiko.kt",
-    "androidx/compose/ui/input/pointer/PointerButton.skiko.kt",
-    "androidx/compose/ui/input/pointer/PointerEvent.skiko.kt",
-    "androidx/compose/ui/input/pointer/InternalPointerEvent.skiko.kt",
-    "androidx/compose/ui/input/pointer/PointerInputEvent.skiko.kt",
-    "androidx/compose/ui/input/rotary/RotaryScrollEvent.skiko.kt",
-    # Modifier.onPointerEvent, the pointer data tests send, and the window
-    # exception handler interface.
-    "androidx/compose/ui/input/pointer/SuspendingPointerInputFilter.skiko.kt",
-    "androidx/compose/ui/input/pointer/TestPointerInputEventData.skiko.kt",
-    "androidx/compose/ui/window/WindowExceptionHandler.kt",
-    "androidx/compose/ui/hapticfeedback/HapticFeedbackType.skiko.kt",
-    "androidx/compose/ui/platform/DefaultHapticFeedback.skiko.kt",
-    "androidx/compose/ui/platform/DefaultAccessibilityManager.skiko.kt",
-    "androidx/compose/ui/platform/DefaultTextToolbar.skiko.kt",
-    "androidx/compose/ui/platform/PlatformTextInputMethodRequest.skiko.kt",
-    "androidx/compose/ui/platform/PlatformTextInputSession.skiko.kt",
-    "androidx/compose/ui/SystemTheme.kt",
-    "androidx/compose/ui/platform/PlatformWindowInsets.skiko.kt",
-    "androidx/compose/ui/platform/PlatformWindowInsetsProviderNode.skiko.kt",
-    "androidx/compose/ui/layout/WindowInsetsRulers.skiko.kt",
-    "androidx/compose/ui/viewinterop/InteropViewFactoryHolder.skiko.kt",
-    "androidx/compose/ui/input/key/KeyEvent.skiko.kt",
-    # The layers Popup draws in, above the content in the same window, with
-    # the back handler a focusable one registers (navigationevent).
-    "androidx/compose/ui/scene/ComposeSceneLayer.skiko.kt",
-    "androidx/compose/ui/window/ComposeSceneLayerMeasurePolicy.kt",
-    "androidx/compose/ui/window/OnBackClickEventHandler.kt",
-    "androidx/compose/ui/window/Popup.skiko.kt",
-    "androidx/compose/ui/layout/EmptyLayout.skiko.kt",
-    # Dialog: a focusable layer with a scrim, faded and scaled in and out
-    # through a GraphicsLayer over the frame clock, unless the skiko flag
-    # turns the animation off.
-    "androidx/compose/ui/window/Dialog.skiko.kt",
-    "androidx/compose/ui/animation/Animation.skiko.kt",
-    "androidx/compose/ui/ComposeUiFlags.skiko.kt",
-    # The layers a node with a graphicsLayer draws through: a GraphicsLayer of
-    # the owner's SkiaGraphicsContext, and the manager that redraws them.
-    "androidx/compose/ui/node/GraphicsLayerOwnerLayer.skiko.kt",
-    "androidx/compose/ui/node/OwnedLayerManager.skiko.kt",
-    # Delayed work on the main dispatcher, the locks, and the applier that
-    # builds a composition's LayoutNode tree.
-    "androidx/compose/ui/Actuals.skiko.kt",
-    "androidx/compose/ui/platform/Synchronization.skiko.kt",
-    "androidx/compose/ui/platform/Subcomposition.skiko.kt",
-    "androidx/compose/ui/platform/DefaultUiApplier.skiko.kt",
-    # The scene's input handling: the pointer and button state a scene tracks,
-    # the synthetic moves, presses and releases it fills gaps with, and the
-    # results it reports. ComposeSceneInputHandler is klioMain's until
-    # RootNodeOwner, which its KDoc imports, comes with the upstream scene.
-    "androidx/compose/ui/scene/ComposeScenePointer.skiko.kt",
-    "androidx/compose/ui/input/pointer/SyntheticEventSender.skiko.kt",
-    # The mesh gradient painter's renderers, drawing through drawVertices.
-    "androidx/compose/ui/graphics/BaseMeshGradientRenderer.skiko.kt",
-    "androidx/compose/ui/graphics/DefaultMeshGradientRenderer.skiko.kt",
-    "androidx/compose/ui/graphics/MeshGradientRenderer.skiko.kt",
-]
 
 # desktopMain: the java-free desktop actuals: the velocity tracker, focusability,
 # and the localization of the platform strings (copy, cut,
@@ -148,8 +80,11 @@ stdlib = "*"
 "androidx.compose.ui.text" = "*"
 # skiko's SystemTheme and currentSystemTheme, which ui's SystemTheme.kt reads.
 "org.jetbrains.skiko" = "*"
-# The lifecycle a composition's owner has, and LocalLifecycleOwner.
-"androidx.lifecycle" = { version = "*", features = ["runtime-compose"] }
+# The owners a scene's content has: lifecycle, view model store, saved state.
+"androidx.lifecycle" = { version = "*", features = ["runtime-compose", "viewmodel"] }
+"androidx.lifecycle.viewmodel.compose" = "*"
+"androidx.lifecycle.viewmodel.savedstate" = "*"
+"androidx.savedstate" = { version = "*", features = ["compose"] }
 "kotlinx.coroutines" = "*"
 "androidx.navigationevent" = "*"
 "androidx.navigationevent.compose" = "*"

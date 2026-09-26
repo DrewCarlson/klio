@@ -25,7 +25,8 @@ import androidx.compose.ui.input.pointer.PointerButtons
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
 import androidx.compose.ui.input.pointer.PointerType
-import androidx.compose.ui.klio.KlioScene
+import androidx.compose.ui.platform.WindowInfoImpl
+import androidx.compose.ui.scene.ComposeScene
 
 /** The event types a window's poll reports. */
 internal const val WINDOW_EVENT_NONE = 0
@@ -81,7 +82,10 @@ private fun pointerButtons(held: Int) = PointerButtons(
  * input and one that is not focusable no keys.
  */
 @OptIn(InternalComposeUiApi::class)
-internal class KlioWindowInput(private val scene: KlioScene) {
+internal class KlioWindowInput(
+    private val scene: ComposeScene,
+    private val windowInfo: WindowInfoImpl,
+) {
     private var keyModifiers = PointerKeyboardModifiers()
 
     var enabled: Boolean = true
@@ -90,6 +94,8 @@ internal class KlioWindowInput(private val scene: KlioScene) {
     var onKeyEvent: (KeyEvent) -> Boolean = { false }
     /** The window's menu bar's shortcuts: runs the one a key press is. */
     var menuShortcut: (KeyEvent) -> Boolean = { false }
+    /** The window gained or lost the focus. */
+    var onFocusChanged: () -> Unit = {}
 
     /** Sends a pointer, key, text or focus event; the others are the window loop's. */
     fun send(type: Int, v: DoubleArray) {
@@ -97,7 +103,10 @@ internal class KlioWindowInput(private val scene: KlioScene) {
             WINDOW_EVENT_POINTER -> if (enabled) sendPointer(v)
             WINDOW_EVENT_KEY -> if (enabled && focusable) sendKey(v)
             WINDOW_EVENT_TEXT -> if (enabled && focusable) sendText(v)
-            WINDOW_EVENT_FOCUS -> scene.main.windowInfo.isWindowFocused = v[0] != 0.0
+            WINDOW_EVENT_FOCUS -> {
+                windowInfo.isWindowFocused = v[0] != 0.0
+                onFocusChanged()
+            }
         }
     }
 

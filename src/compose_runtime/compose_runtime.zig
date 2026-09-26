@@ -36,6 +36,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.runtime.__compose_logError", logError);
     try b.register("androidx.compose.runtime.internal.__compose_currentThreadId", currentThreadId);
     try b.register("androidx.compose.ui.internal.__composeui_identityHashCode", identityHashCode);
+    try b.register("androidx.compose.ui.internal.__composeui_currentThreadId", currentThreadId);
     // Gap-buffer group-field accessors. Layout mirrors SlotTable.kt: 5 ints per
     // group (key, groupInfo, parentAnchor, size, dataAnchor).
     try b.register("androidx.compose.runtime.composer.gapbuffer.parentAnchor", gapParentAnchor);
@@ -181,11 +182,12 @@ test "hostBindings registers every compose symbol" {
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_monotonicNanos") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_logError") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.internal.__compose_currentThreadId") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.internal.__composeui_currentThreadId") != null);
     try testing.expect(b.resolve("androidx.compose.ui.internal.__composeui_identityHashCode") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.composer.gapbuffer.parentAnchor") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.composer.gapbuffer.updateDataAnchor") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.composer.gapbuffer.countOneBits") != null);
-    try testing.expectEqual(@as(usize, 13), b.len());
+    try testing.expectEqual(@as(usize, 14), b.len());
 }
 
 test "gap-buffer field accessors read and write the 5-int group layout" {

@@ -1,0 +1,4 @@
+rendered 40x20: inside ffff0000, outside 0
+frame 0: ff0000ff
+clicks=1, frame 1: ff00e500
+content size 30 x 30, pending false

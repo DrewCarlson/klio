@@ -3,6 +3,10 @@ top-start + (10, 70) at Offset(50.0, 110.0) size 50 x 50
 bottom-end at Offset(70.0, 70.0) size 30 x 30
 clipped at Offset(150.0, 40.0) size 50 x 50
 unclipped at Offset(190.0, 40.0) size 50 x 50
+top-start + (10, 70) at Offset(50.0, 110.0) size 50 x 50
+bottom-end at Offset(70.0, 70.0) size 30 x 30
+clipped at Offset(150.0, 40.0) size 50 x 50
+unclipped at Offset(190.0, 40.0) size 50 x 50
 --- plain popup ---
 click inside
 popup clicked

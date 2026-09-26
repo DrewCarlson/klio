@@ -203,14 +203,10 @@ kotlinc also reports warnings in the examples neither engine does
 (`USELESS_IS_CHECK` 36, `NOTHING_TO_INLINE` now matched, and a few more),
 which parity will want after the categories.
 
-Open from the pack-source check (`KLIO_CHECK_PACKS=1`): klio-authored
-`klio-compose-ui-core/klioMain/androidx/compose/ui/klio/KlioComposeHost.kt`
-reports `ABSTRACT_MEMBER_NOT_IMPLEMENTED` for `KlioPointerIconService` (the
-stylus hover icon) and `KlioComposeOwner` (`onInteropViewLayoutChange`,
-`localToScreen`, `screenToLocal`, ...), and `NOTHING_TO_OVERRIDE` for
-`onAttach` at line 518: either kotlinc would refuse klio's glue (fix the
-glue) or it is a false positive (fix the check). Every upstream pack source
-is otherwise clean of declaration and annotation findings.
+The pack-source check (`KLIO_CHECK_PACKS=1`) finds no declaration or
+annotation site in any pack. The klio glue it once flagged
+(`KlioComposeOwner`, `KlioPointerIconService`) is gone: ui's host is
+upstream's RootNodeOwner and scene now.
 
 ## What kotlinc 2.4.20 does
 

@@ -513,7 +513,7 @@ internal class WindowMenuSink(private val window: KlioWindowHolder) : KlioMenuSi
         if (surface == 0L) return
         val size = Size(px.toFloat(), px.toFloat())
         klioDrawToSurface(surface) {
-            CanvasDrawScope().draw(window.owner.density, LayoutDirection.Ltr, this, size) {
+            CanvasDrawScope().draw(window.scene.density, LayoutDirection.Ltr, this, size) {
                 with(icon) { draw(size) }
             }
         }

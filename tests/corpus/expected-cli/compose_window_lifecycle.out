@@ -1,0 +1,10 @@
+lifecycle ON_CREATE
+lifecycle ON_START
+lifecycle ON_RESUME
+lifecycle ON_PAUSE
+lifecycle ON_RESUME
+lifecycle ON_PAUSE
+lifecycle ON_STOP
+lifecycle ON_DESTROY
+content disposed
+application ended

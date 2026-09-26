@@ -1,0 +1,6 @@
+# Scripted input for compose_window_lifecycle.kt's window (KLIO_WIN_INPUT): at
+# the window's n-th event poll, the window loses the focus, gets it back, and
+# its close button is pressed.
+4 focus 0
+8 focus 1
+12 close

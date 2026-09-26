@@ -81,7 +81,53 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_surf_free", surfFree);
     try b.register("androidx.compose.ui.graphics.__skia_surf_canvas", surfCanvas);
     try b.register("androidx.compose.material3.internal.__klio_icu_date", icuDate);
+    try b.register("androidx.compose.ui.platform.__composeui_openUri", openUri);
     return b;
+}
+
+/// `__composeui_openUri(uri): Boolean`: opens [uri] with the platform's
+/// handler for it (`open` on macOS, the URL protocol handler on Windows,
+/// `xdg-open` elsewhere); `$KLIO_URI_OPENER` names a program to run with the
+/// URI instead. False when the opener could not run or reported a failure.
+fn openUri(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1 or ctx.args[0] != .String) return ok(Value{ .Bool = false });
+    const ug = ctx.args[0].String.borrow();
+    defer ug.deinit();
+    const uri = ug.get().bytes;
+    var argv_buf: [3][]const u8 = undefined;
+    const argv: []const []const u8 = if (runtime.envOnce("KLIO_URI_OPENER")) |opener| blk: {
+        argv_buf[0] = opener;
+        argv_buf[1] = uri;
+        break :blk argv_buf[0..2];
+    } else switch (@import("builtin").os.tag) {
+        .macos => blk: {
+            argv_buf[0] = "open";
+            argv_buf[1] = uri;
+            break :blk argv_buf[0..2];
+        },
+        .windows => blk: {
+            argv_buf[0] = "rundll32";
+            argv_buf[1] = "url.dll,FileProtocolHandler";
+            argv_buf[2] = uri;
+            break :blk argv_buf[0..3];
+        },
+        else => blk: {
+            argv_buf[0] = "xdg-open";
+            argv_buf[1] = uri;
+            break :blk argv_buf[0..2];
+        },
+    };
+    const a = ctx.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const r = std.process.run(a, threaded.io(), .{ .argv = argv }) catch return ok(Value{ .Bool = false });
+    defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    const opened = switch (r.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    return ok(Value{ .Bool = opened });
 }
 
 fn argInt(v: Value) i64 {
@@ -1293,6 +1339,7 @@ test "hostBindings registers the surface and windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSurface") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winPresent") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winClose") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.platform.__composeui_openUri") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_new") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_canvas") != null);
     try testing.expect(b.resolve("androidx.compose.material3.internal.__klio_icu_date") != null);
@@ -1312,7 +1359,7 @@ test "hostBindings registers the surface and windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_trayPollEvent") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_appWait") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winOpenError") != null);
-    try testing.expectEqual(@as(usize, 59), b.len());
+    try testing.expectEqual(@as(usize, 60), b.len());
 }
 
 test "a window that cannot open says why" {
@@ -1376,6 +1423,27 @@ test "the ICU date bindings answer null for short args" {
     const wrong = [_]Value{ Value.newInt(0), Value.newInt(1), Value.newInt(2), Value.newInt(3), Value.newLong(0) };
     var c1 = host.ctx(&wrong);
     try testing.expect((try icuDate(&c1)).ok == .Null);
+}
+
+test "openUri runs the opener with the URI and reports whether it opened" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c0 = host.ctx(&none);
+    try testing.expect(!(try openUri(&c0)).ok.Bool);
+    var uri = Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, "https://example.com/a")) };
+    defer uri.String.deinit();
+    const args = [_]Value{uri};
+    runtime.envSetForTest("KLIO_URI_OPENER", "true");
+    var c1 = host.ctx(&args);
+    try testing.expect((try openUri(&c1)).ok.Bool);
+    runtime.envSetForTest("KLIO_URI_OPENER", "false");
+    var c2 = host.ctx(&args);
+    try testing.expect(!(try openUri(&c2)).ok.Bool);
+    runtime.envSetForTest("KLIO_URI_OPENER", "/nonexistent/klio-uri-opener");
+    var c3 = host.ctx(&args);
+    try testing.expect(!(try openUri(&c3)).ok.Bool);
 }
 
 test "a window position packs x high and y low, negatives kept" {
