@@ -104,18 +104,13 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
    in src/itests/commontest_support.zig from 333 / 23 and check whether
    encodeDefaults_false and the MutableStateFlow `Any` serializer lookups
    were the same cause.
-2. The Main dispatcher (coroutines; with P1). Repros:
-   plans/compose-parity-pending/main_immediate_launch.kt (Main.immediate
-   dispatches work already on Main) and main_from_worker.kt
-   (runBlocking(Dispatchers.Main.immediate) on a worker runs there). After
-   both: register lifecycle-runtime's commonTest as a suite (test roots
+2. lifecycle-runtime's commonTest as a suite (test roots
    lifecycle/lifecycle-runtime/src/commonTest, extra support Kruth,
    testutils/testutils-lifecycle/src/commonMain and
-   tests/lifecycle_commontest_actuals/runtime), and move
-   plans/compose-parity-pending/lifecycle_registry.kt to examples/ with
-   lifecycle_registry.out as tests/corpus/expected/lifecycle_registry.out
-   (its two differences today: the off-main call does not throw, and
-   viewModelScope's cancellation prints after onCleared).
+   tests/lifecycle_commontest_actuals/runtime), now that Dispatchers.Main
+   runs on the main thread and Main.immediate knows it
+   (tl_main_immediate; examples/lifecycle_registry.kt prints what Compose
+   Desktop prints).
 3. A program's `[deps]` does not load a pack no import names by id prefix
    (src/cli/pack_cache.zig; with Sema). `org.jetbrains.skia` imports need an
    `org.jetbrains.skiko` import beside them, and `androidx.lifecycle.

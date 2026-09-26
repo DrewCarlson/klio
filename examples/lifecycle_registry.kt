@@ -5,10 +5,8 @@
 // dispatcher's thread: a call from a Dispatchers.Default thread throws. A
 // ViewModel closes its closeables and cancels its viewModelScope when its
 // store is cleared.
+// The output is Compose Desktop 1.12.0's.
 // Run with: klio run --feature androidx.lifecycle/viewmodel examples/lifecycle_registry.kt
-// Pending: moves to examples/, with lifecycle_registry.out (Compose Desktop
-// 1.12.0's output, from compose-oracle) as its expected output, once both
-// Main dispatcher fixes land (main_immediate_launch.kt, main_from_worker.kt).
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
