@@ -151,7 +151,7 @@ pub fn typeValue(b: *Builder, t: TypeId) Error!Reg {
         return b.fail(b.cur_span, "no run-time type value for a type of kind `{s}`", .{@tagName(std.meta.activeTag(s.types.get(t)))});
     // A local of the function, or a capture of a nested body.
     const home = (try env.homeOf(b, tp)) orelse return error.Unrecorded;
-    return switch (home) {
+    const v = switch (home) {
         .reg => |r| r,
         .cell => |cell| blk: {
             const dst = b.newReg();
@@ -159,6 +159,11 @@ pub fn typeValue(b: *Builder, t: TypeId) Error!Reg {
             break :blk dst;
         },
     };
+    // `T?` is the type `T` stands for, marked nullable: `impl<T?>()` in a
+    // body where `T` is a `Byte` passes `Byte?`.
+    if (!s.types.isNullable(t)) return v;
+    const nullable = helper(b, "__klio_typeNullable") orelse return v;
+    return callStatic(b, nullable, &.{v});
 }
 
 /// The `KClass` a class literal names: of class type `t`, or of the type a

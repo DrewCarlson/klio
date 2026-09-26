@@ -240,6 +240,40 @@ test "a delegate's call solves a reified argument it left open, the property's t
     , "0\n1\n");
 }
 
+test "a reified type parameter written nullable passes its type marked nullable" {
+    try driver.expectOutput(&.{
+        \\package kotlin.reflect
+        \\interface KType { val isMarkedNullable: Boolean }
+        \\class TestType(val name: String?, override val isMarkedNullable: Boolean, val args: Array<out Any?>) : KType {
+        \\    override fun toString(): String {
+        \\        var s = name ?: "?"
+        \\        if (args.size != 0) s = s + "<" + args[0] + ">"
+        \\        return if (isMarkedNullable) s + "?" else s
+        \\    }
+        \\}
+        \\fun __klio_type(classifier: KClass<*>, nullable: Boolean, vararg arguments: Any?): KType = TestType(classifier.simpleName, nullable, arguments)
+        \\fun __klio_projection(variance: Int, type: KType?): Any? = type
+        \\fun __klio_typeNullable(type: KType): KType = if (type.isMarkedNullable) type else TestType((type as TestType).name, true, type.args)
+        \\inline fun <reified T> typeOf(): KType = throw IllegalStateException()
+        ,
+        \\import kotlin.reflect.typeOf
+        \\class Box<T>
+        \\inline fun <reified T : Any> T.outer() {
+        \\    impl<T>("T")
+        \\    impl<T?>("T?")
+        \\    impl<Box<T?>>("Box<T?>")
+        \\    nullable<T?>()
+        \\}
+        \\inline fun <reified T> impl(label: String) { println(label + ": " + typeOf<T>()) }
+        \\inline fun <reified T> nullable() { impl<T?>("T? of T?") }
+        \\fun main() {
+        \\    "s".outer()
+        \\    1.outer()
+        \\}
+    }, "T: String\nT?: String?\nBox<T?>: Box<String?>\nT? of T?: String?\n" ++
+        "T: Int\nT?: Int?\nBox<T?>: Box<Int?>\nT? of T?: Int?\n");
+}
+
 test "a reified type parameter tests, casts, names its class and passes on" {
     try expectRun(
         \\inline fun <reified T> isA(x: Any?): Boolean = x is T

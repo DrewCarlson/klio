@@ -957,7 +957,8 @@ fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Erro
             var e = e0;
             e.inherited = true;
             e.in_ctor = false;
-            e.default_text = null;
+            // Its default stays: an inherited property with an initializer is
+            // optional, and not written out while it holds that value.
             e.is_lateinit = false;
             for (sup.type_params, 0..) |*tp, ti| {
                 if (!std.mem.eql(u8, e.ty.name.name, tp.name.name)) continue;
@@ -1280,12 +1281,14 @@ fn writeChildSerializers(b: *const BodyGen) Allocator.Error!void {
 }
 
 /// `serialize`: one encode call per element, guarded where a default need not
-/// be written out.
+/// be written out. Its parameters are named apart from the properties: a
+/// default compared in the instance's scope (`run { ... }` on it) reads a
+/// property named `value` or `encoder`, not the parameter.
 fn writeSerialize(b: *const BodyGen) Allocator.Error!void {
     const w = b.w;
     const a = b.a;
-    try wp(w, a, "    override fun serialize(encoder: Encoder, value: {s}) {{\n", .{b.self_ty});
-    try w.appendSlice(a, "        val `$d` = descriptor\n        val `$out` = encoder.beginStructure(`$d`)\n");
+    try wp(w, a, "    override fun serialize(`$encoder`: Encoder, `$value`: {s}) {{\n", .{b.self_ty});
+    try w.appendSlice(a, "        val `$d` = descriptor\n        val `$out` = `$encoder`.beginStructure(`$d`)\n");
     for (b.elems, 0..) |*e, i| {
         const enc = try encodeElementCall(b, e, i);
         if (elemOptional(e) and e.encode_default != .always) {
@@ -1294,9 +1297,9 @@ fn writeSerialize(b: *const BodyGen) Allocator.Error!void {
             const dflt = e.default_text.?;
             const tt = try b.g.typeText(e.ty);
             if (e.encode_default == .never) {
-                try wp(w, a, "        if (value.run {{ val `$default`: {s} = ({s}); {s} != `$default` }}) {s}\n", .{ tt, dflt, e.name, enc });
+                try wp(w, a, "        if (`$value`.run {{ val `$default`: {s} = ({s}); this.{s} != `$default` }}) {s}\n", .{ tt, dflt, e.name, enc });
             } else {
-                try wp(w, a, "        if (`$out`.shouldEncodeElementDefault(`$d`, {d}) || value.run {{ val `$default`: {s} = ({s}); {s} != `$default` }}) {s}\n", .{ i, tt, dflt, e.name, enc });
+                try wp(w, a, "        if (`$out`.shouldEncodeElementDefault(`$d`, {d}) || `$value`.run {{ val `$default`: {s} = ({s}); this.{s} != `$default` }}) {s}\n", .{ i, tt, dflt, e.name, enc });
             }
         } else {
             try wp(w, a, "        {s}\n", .{enc});
@@ -1313,13 +1316,13 @@ fn encodeElementCall(b: *const BodyGen, e: *const Elem, i: usize) Allocator.Erro
     const g = b.g;
     const p = elemPrim(g, e);
     if (p != .none)
-        return std.fmt.allocPrint(a, "`$out`.encode{s}Element(`$d`, {d}, value.{s})", .{ primSuffix(p), i, e.name });
+        return std.fmt.allocPrint(a, "`$out`.encode{s}Element(`$d`, {d}, `$value`.{s})", .{ primSuffix(p), i, e.name });
     if (e.ty.nullable) {
         if (try g.nullableTargetRef(e.ty, e.annotations)) |ref|
-            return std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, ref, e.name });
-        return std.fmt.allocPrint(a, "`$out`.encodeNullableSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExprNonNull(e.ty, e.annotations), e.name });
+            return std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, `$value`.{s})", .{ i, ref, e.name });
+        return std.fmt.allocPrint(a, "`$out`.encodeNullableSerializableElement(`$d`, {d}, {s}, `$value`.{s})", .{ i, try g.serializerExprNonNull(e.ty, e.annotations), e.name });
     }
-    return std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExpr(e.ty, e.annotations), e.name });
+    return std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, `$value`.{s})", .{ i, try g.serializerExpr(e.ty, e.annotations), e.name });
 }
 
 /// `deserialize`: the slots and seen masks, the sequential and index-driven
@@ -1480,7 +1483,7 @@ fn writeAfterConstructionWrites(b: *const BodyGen) Allocator.Error!void {
     const w = b.w;
     const a = b.a;
     for (b.elems, 0..) |*e, i| {
-        if (e.in_ctor) continue;
+        if (e.in_ctor or e.inherited) continue;
         // An init block runs after field assignment, so decode the element but
         // leave the construction alone.
         if (e.default_text == null and !e.is_lateinit) continue;
@@ -3206,7 +3209,37 @@ test "an optional element is compared with its default typed as it is declared" 
         \\@Serializable
         \\data class Media(val name: String, val extensions: Map<String, String?> = emptyMap())
     );
-    try std.testing.expect(std.mem.indexOf(u8, gen, "val `$default`: Map<String, String?> = (emptyMap()); extensions != `$default`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "val `$default`: Map<String, String?> = (emptyMap()); this.extensions != `$default`") != null);
+}
+
+test "an inherited property with an initializer is optional and not written at its default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\@Serializable
+        \\sealed class F {
+        \\    val s: String? = null
+        \\}
+        \\@Serializable
+        \\data class G(val i: Int) : F()
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "addElement(\"s\", true)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "val `$default`: String? = (null); this.s != `$default`") != null);
+}
+
+test "an element named value or encoder is compared as the property, not serialize's parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gen = try generatedFor(arena.allocator(),
+        \\import kotlinx.serialization.*
+        \\@Serializable
+        \\data class Data(val value: Int = 7, val encoder: String = "e", val next: Int = value + 1)
+    );
+    try std.testing.expect(std.mem.indexOf(u8, gen, "override fun serialize(`$encoder`: Encoder, `$value`: Data)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "`$value`.run { val `$default`: Int = (7); this.value != `$default` }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "`$value`.run { val `$default`: Int = (value + 1); this.next != `$default` }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "`$out`.encodeIntElement(`$d`, 0, `$value`.value)") != null);
 }
 
 test "a default value naming a nested class is spelled by its path in the generated file" {
@@ -3237,7 +3270,7 @@ test "a collection serializer is cast to a declared type it does not name" {
         \\data class Wrapper(val c: Collection<String>, val l: List<Int>, val m: HashMap<String, Int>?, val s: MutableSet<Long>)
     );
     try std.testing.expect(std.mem.indexOf(u8, gen, "(ArrayListSerializer(String.serializer()) as KSerializer<Collection<String>>)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "ArrayListSerializer(Int.serializer()), value.l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "ArrayListSerializer(Int.serializer()), `$value`.l") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "(HashMapSerializer(String.serializer(), Int.serializer()) as KSerializer<HashMap<String, Int>>)") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "(LinkedHashSetSerializer(Long.serializer()) as KSerializer<MutableSet<Long>>)") != null);
 }

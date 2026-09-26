@@ -41,3 +41,8 @@ internal fun __klio_projection(variance: Int, type: KType?): KTypeProjection = w
 // The class a reified type parameter's run-time type names (`T::class`).
 @PublishedApi
 internal fun __klio_typeClass(type: KType): KClass<*> = type.classifier as KClass<*>
+
+// `type` marked nullable: what `T?` stands for when `T` is `type`.
+@PublishedApi
+internal fun __klio_typeNullable(type: KType): KType =
+    if (type.isMarkedNullable) type else KlioType(type.classifier, type.arguments, true)

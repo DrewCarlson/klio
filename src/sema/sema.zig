@@ -148,6 +148,9 @@ pub const Sema = struct {
     /// The bounds of a variable a call left open, its type parameter's
     /// declared ones included, for the system that adopts it.
     open_var_bounds: std.AutoHashMapUnmanaged(u32, struct { lower: []const TypeId, upper: []const TypeId, declared: []const TypeId = &.{} }) = .empty,
+    /// The inference variables that stand for a reified type parameter,
+    /// wherever a call adopts them.
+    reified_vars: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// Whether an overriding function inherits `operator`.
     operator_memo: std.AutoHashMapUnmanaged(Sym, bool) = .empty,
     /// The synthetic SAM constructor of each fun interface asked for.

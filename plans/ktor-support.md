@@ -154,8 +154,9 @@ files and the owner:
   recurs, capture stdout and stderr before rerunning.
 - Pack loading: `--feature io.ktor/test-server` alone does not make a
   package outside the `io.ktor` prefix (`test.server`) importable, because
-  packs are selected by the prefix of a program's imports. The coordinator
-  tracks it as pack-loader design; ktor works around it with
+  packs are selected by the prefix of a program's imports. It is recorded,
+  with its cause, fix and tests, in plans/resolved-interpreter.md's open
+  correctness bugs; ktor works around it with
   `io.ktor.testserver.runTestServer()`.
 
 Not run from upstream: the suites

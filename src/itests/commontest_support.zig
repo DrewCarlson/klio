@@ -885,9 +885,8 @@ pub const suites = [_]Config{
     .{
         // savedstate's commonTest (SavedState, its registry, and the
         // kotlinx.serialization codec), asserted through upstream Kruth, with
-        // the nonAndroidTest actuals and klio's IgnoreWebTarget. The codec
-        // failures are a reified `T?` losing its `?` inside another inline
-        // function's reified `T`, so the non-null serializer is picked.
+        // the nonAndroidTest actuals and klio's IgnoreWebTarget. It passes
+        // whole.
         .name = "savedstate",
         .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/savedstate/savedstate/src/commonTest/kotlin"},
         .extra_support = &(kruth_support ++ [_][]const u8{
@@ -897,8 +896,8 @@ pub const suites = [_]Config{
         .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
         .batch_dirs = true,
         .timeout_ms = 600_000,
-        .baseline = 333,
-        .max_failed = 23,
+        .baseline = 356,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
 };

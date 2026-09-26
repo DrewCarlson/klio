@@ -1,0 +1,15 @@
+{}
+{"value":8}
+{"value":7}
+{}
+{"value":1}
+{"value":1}
+Named(value=3, encoder=e, next=4)
+{"i":3}
+{"s":"bar","i":3}
+{"s":null,"i":3}
+{}
+{"i":5,"s":"foo"}
+{"type":"G","i":3}
+{"i":3}
+G(i=4)

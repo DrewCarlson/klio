@@ -488,6 +488,34 @@ sema or lowering test, so the rewrite cannot re-learn them the same way.
   above (a bare call made by-name on the implicit receiver), not bisected.
   The new pipeline calls it by record and prints the string.
 
+- A program's `[deps]` and `--feature` packs load only when an import
+  prefix-matches the pack's id. `docs/packs/using.md` says `[deps]` is the
+  whole load set, and deps are declared, never inferred from imports.
+  Repros: a project whose klio.toml has `"org.jetbrains.skiko" = "*"` and
+  imports `org.jetbrains.skia.Paint` leaves every skia import unresolved
+  (the package does not start with the pack's id); `--feature
+  io.ktor/test-server` does not make `test.server` importable;
+  `androidx.lifecycle.SavedStateHandle` selects no pack (viewmodel-savedstate).
+  Cause: `loadInstalledPacksImpl` in src/cli/pack_cache.zig wants a pack only
+  when `importPrefixMatches` or a loaded pack's `[deps]` (`dep_ids`) names
+  it; `declared_lib_ids` only restricts. The fix: seed `dep_ids` (and the
+  manifest fixed point's `pre_deps`) with the manifest's own `[deps]` and the
+  `--feature` packs by exact library id, as `LoadOptions.dep_lib_ids` already
+  does for `klio pack build`'s check; keep import-driven selection only for a
+  program with no manifest, never widened. Tests to add in
+  src/itests/cli_commands.zig: a project declaring a pack whose package is
+  outside its id prefix imports it, and `--feature` alone makes such a
+  package importable; then run itest-cli_commands, itest-e2e and the corpus,
+  since load sets change. Cross-referenced from plans/compose-parity.md
+  (open item 3) and plans/ktor-support.md (pack loading).
+- A lone `null` lower bound fixes a variable at `Nothing?` where kotlinc,
+  with an upper bound, takes the upper bound (its
+  `checkSingleLowerNullabilityConstraint`): `fun <T> id(x: T): T` with
+  `val s: String? = id(null)` is a `T` of `String?` there, `Nothing?` in
+  klio. Only a reified variable's `Nothing` takes its upper bound now
+  (src/sema/infer.zig, `solve`). Unconfirmed what a program can observe;
+  check with kotlinc before changing it.
+
 Sema subsumes the first four: each is a resolution answer it gives by
 construction, and each gets a test.
 

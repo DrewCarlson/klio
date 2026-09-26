@@ -1,0 +1,12 @@
+T: Byte, marked nullable false
+T?: Byte, marked nullable true
+null as T?: Byte, marked nullable true
+List<T?>: List[Byte?]
+Map<String, T?>: Map[String, Byte?]
+T: String, marked nullable false
+T?: String, marked nullable true
+null as T?: String, marked nullable true
+List<T?>: List[String?]
+Map<String, T?>: Map[String, String?]
+Int? as T?: Int, marked nullable true
+Int as T?: Int, marked nullable true

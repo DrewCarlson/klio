@@ -47,6 +47,9 @@ pub const Var = struct {
     /// it (builder inference): the call's other lambdas are too, whatever
     /// that body said of it.
     postponed: bool = false,
+    /// It stands for a reified type parameter, here or in the call that
+    /// left it open.
+    reified: bool = false,
 };
 
 pub const System = struct {
@@ -112,7 +115,9 @@ pub const System = struct {
         for (tps) |tp| {
             const v = try freshVar(s);
             try self.index.put(s.arena, v.id, @intCast(self.vars.items.len));
-            try self.vars.append(s.arena, .{ .tp = tp, .id = v.id, .ty = v.ty });
+            const reified = s.syms.flags(tp).reified;
+            if (reified) try s.reified_vars.put(s.arena, v.id, {});
+            try self.vars.append(s.arena, .{ .tp = tp, .id = v.id, .ty = v.ty, .reified = reified });
             try self.open_subst.put(s.arena, tp, v.ty);
         }
     }
@@ -125,7 +130,7 @@ pub const System = struct {
                 if (self.index.contains(v.id)) return;
                 if (s.var_solution.contains(v.id)) return;
                 try self.index.put(s.arena, v.id, @intCast(self.vars.items.len));
-                var nv: Var = .{ .tp = .none, .id = v.id, .ty = try s.types.intern(.{ .variable = .{ .id = v.id } }), .foreign = s.builder_owners.contains(v.id) };
+                var nv: Var = .{ .tp = .none, .id = v.id, .ty = try s.types.intern(.{ .variable = .{ .id = v.id } }), .foreign = s.builder_owners.contains(v.id), .reified = s.reified_vars.contains(v.id) };
                 // What the call that left it open knew about it, and the
                 // open variables that knowledge mentions.
                 const bounds = s.open_var_bounds.get(v.id);
@@ -855,10 +860,24 @@ pub const System = struct {
                     const lub = try subtyping.commonSupertype(s, lowers.items);
                     const lit = try s.types.intern(.{ .int_lit = lits });
                     if (!try subtyping.isSubtype(s, lit, lub)) try lowers.append(s.arena, try intLitDefault(s, lits));
-                } else if (any_lit) try lowers.append(s.arena, try intLitDefault(s, lits));
+                } else if (any_lit) {
+                    // Beside a variable still open, the integral type an
+                    // upper bound names, else the default: `Holder(4)` for a
+                    // `Holder<T>` with `T : Long` holds a `Long`.
+                    try lowers.append(s.arena, (try self.literalTarget(v, lits)) orelse try intLitDefault(s, lits));
+                }
                 if (lowers.items.len != 0) {
                     v.fixed = try subtyping.commonSupertype(s, lowers.items);
                     if (pending_null) v.fixed = try s.types.makeNullable(v.fixed);
+                    // A reified variable is not fixed at `Nothing` while an
+                    // upper bound gives it a type, as kotlinc has it: `val p:
+                    // String? by saved { error("none") }` makes `saved`'s
+                    // reified `T` a `String?`, which it serializes.
+                    if (isNothing(s, v.fixed) and v.reified) {
+                        if (try self.closedUpperMeet(v)) |meet| {
+                            if (!isNothing(s, meet) and try subtyping.isSubtype(s, v.fixed, meet)) v.fixed = meet;
+                        }
+                    }
                     // The join can be coarser than an upper bound every
                     // lower bound fits: `In<Int>` and `In<String>` join to
                     // `In<*>`, which is not below `In<Int & String>`; the
@@ -893,8 +912,16 @@ pub const System = struct {
                     // `T3` of `passThrough(none())`) do: an upper bound
                     // every one of them names is the type, unless an
                     // enclosing call decides it.
+                    // Those variables must know of nothing below them either:
+                    // one with a literal or a type below it is fixed first,
+                    // and says what `v` is (`Holder(123)` for a `Holder<T>`
+                    // with `T : Any` is a `Holder<Int>`, not a `Holder<Any>`).
+                    var nothing_seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                    try nothing_seen.put(s.arena, v.id, {});
                     const only_vars = for (v.lower.items) |lb| {
-                        if (self.varIndex(try zonk(s, lb)) == null) break false;
+                        const z = try zonk(s, lb);
+                        if (self.varIndex(z) == null) break false;
+                        if (!try self.knowsNothingBelow(z, &nothing_seen)) break false;
                     } else true;
                     if (only_vars and (!leave_open or !reaches(reach, v.id))) if (try self.closedUpperMeet(v)) |meet| {
                         v.fixed = meet;
@@ -1199,6 +1226,24 @@ pub const System = struct {
             const c = try self.close(z);
             try lowers.append(s.arena, try withVarNullability(&s.types, v, c));
         }
+    }
+
+    /// Whether `t`, a variable of this system, has nothing below it but
+    /// open variables that have nothing below them.
+    fn knowsNothingBelow(self: *System, t: TypeId, seen: *std.AutoHashMapUnmanaged(u32, void)) Allocator.Error!bool {
+        const s = self.s;
+        const v = switch (s.types.get(t)) {
+            .variable => |v| v,
+            else => return false,
+        };
+        const i = self.index.get(v.id) orelse return true;
+        if ((try seen.getOrPut(s.arena, v.id)).found_existing) return true;
+        for (self.vars.items[i].lower.items) |lb| {
+            const z = try zonk(s, lb);
+            if (self.varIndex(z) == null or !self.waitsOnOwn(z)) return false;
+            if (!try self.knowsNothingBelow(z, seen)) return false;
+        }
+        return true;
     }
 
     /// Whether `t` mentions a variable of this system still to be fixed.

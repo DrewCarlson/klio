@@ -1,0 +1,11 @@
+bounded: Int 123
+long: Long 4
+comparable: Int 5
+number: Int 6
+bounded: Long 3000000000
+elements: List<Int> [1, 3]
+elements: Map<String> {a=1}
+delegate of String, nullable true
+delegate of List, nullable false
+delegate of String, nullable false
+text

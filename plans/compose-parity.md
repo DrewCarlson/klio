@@ -45,12 +45,7 @@ where the upstream one needs the JVM, AWT or a native platform API.
 | `compose_animation` | animation-core commonTest | 107 | 0 | 107 / 0 |
 | `compose_shapes` | graphics-shapes commonTest | 148 | 0 | 148 / 0 |
 | `lifecycle_viewmodel` | lifecycle-viewmodel commonTest | 35 | 0 | 35 / 0 |
-| `savedstate` | savedstate commonTest (with nonAndroidTest's actuals) | 333 | 23 | 333 / 23 |
-
-The savedstate failures are the codec tests: a reified
-`T?` inside an inline function whose own `T` is reified loses its `?`, so
-`encodeDecodeImpl<T?>` encodes through the non-null serializer; routed to
-sema.
+| `savedstate` | savedstate commonTest (with nonAndroidTest's actuals) | 356 | 0 | 356 / 0 |
 
 
 Not run yet, and what each needs:
@@ -93,17 +88,14 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
 
 **Open, each with what to run and where it lives.**
 
-1. Reified `T?` loses its `?` (sema/lowering; with Sema). Repro:
-   plans/compose-parity-pending/reified_nullable_type_argument.kt (expected
-   output in its header). Cause: substituting a reified argument written
-   `T?`, where `T` is the enclosing inline function's reified parameter,
-   drops the nullability (typeOf, serializer<T>()). Effect: the 23 savedstate
-   failures (SavedStateCodecTest, SavedStateCodecEncodeDefaultsTest,
-   MutableStateFlowSerializerTest, SavedStateRegistryOwnerDelegateTest.
-   saved_nullable_restoreNull). After the fix, raise the `savedstate` ratchet
-   in src/itests/commontest_support.zig from 333 / 23 and check whether
-   encodeDefaults_false and the MutableStateFlow `Any` serializer lookups
-   were the same cause.
+1. Done: savedstate's commonTest passes whole (356 / 0). Its 23 failures had
+   four causes: a reified `T?` lost its `?`
+   (examples/reified_nullable_argument.kt), a type argument took its bound
+   before a nested call's literal or list typed it, a reified argument only
+   `Nothing` flowed into stayed `Nothing`
+   (examples/literal_through_nested_call.kt), and generated serializers
+   compared a default against serialize's own `value` parameter and wrote an
+   inherited property at its default (examples/serial_encode_defaults.kt).
 2. lifecycle-runtime's commonTest as a suite (test roots
    lifecycle/lifecycle-runtime/src/commonTest, extra support Kruth,
    testutils/testutils-lifecycle/src/commonMain and
@@ -114,7 +106,8 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
 3. A program's `[deps]` does not load a pack no import names by id prefix
    (src/cli/pack_cache.zig; with Sema). `org.jetbrains.skia` imports need an
    `org.jetbrains.skiko` import beside them, and `androidx.lifecycle.
-   SavedStateHandle` alone selects no pack.
+   SavedStateHandle` alone selects no pack. Cause, fix and tests are in
+   plans/resolved-interpreter.md, open correctness bugs.
 4. The upstream scene (item 3). Every library it needs is a pack now:
    androidx.lifecycle (runtime-compose), androidx.savedstate (compose),
    androidx.lifecycle.viewmodel.savedstate, androidx.lifecycle.viewmodel.

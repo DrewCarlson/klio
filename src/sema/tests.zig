@@ -3149,6 +3149,60 @@ test "a val initialized from a safe chain being not null makes the chain's recei
     try fx.expectClean();
 }
 
+test "a literal below a nested call's variable is typed before a bound it does not take" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\class Holder<T>(val v: T)
+        \\fun <T : Any> bounded(value: Holder<T>): T = value.v
+        \\fun <T : Long> long(value: Holder<T>): T = value.v
+        \\fun <T : Comparable<T>> comparable(value: Holder<T>): T = value.v
+        \\fun <E> listOf(vararg elements: E): List<E> = TODO()
+        \\fun use() {
+        \\    bounded(Holder(123))
+        \\    long(Holder(4))
+        \\    comparable(Holder(5))
+        \\    bounded(Holder(listOf(1, 3)))
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const cases = [_]struct { needle: []const u8, want: []const u8 }{
+        .{ .needle = "^bounded(Holder(123))", .want = "kotlin.Int" },
+        .{ .needle = "^long(Holder(4))", .want = "kotlin.Long" },
+        .{ .needle = "^comparable(Holder(5))", .want = "kotlin.Int" },
+        .{ .needle = "^bounded(Holder(listOf(1, 3)))", .want = "kotlin.collections.List<kotlin.Int>" },
+    };
+    for (cases) |c| {
+        const call = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt(c.needle, .call)).node);
+        try std.testing.expectEqualStrings(c.want, fx.typeText(call.type_args[0]));
+    }
+}
+
+test "a reified type argument only Nothing flows into takes the type its upper bound gives" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\import kotlin.reflect.KProperty
+        \\class Prop<T>(val v: () -> T) { operator fun getValue(thisRef: Any?, p: KProperty<*>): T = v() }
+        \\inline fun <reified T> delegate(noinline init: () -> T): Prop<T> = Prop(init)
+        \\fun fail(): Nothing = TODO()
+        \\class Host {
+        \\    val p: String? by delegate { fail() }
+        \\}
+        ,
+        \\package kotlin.reflect
+        \\interface KProperty<out V>
+        \\interface KProperty0<out V> : KProperty<V>
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const reified = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt("by ^delegate { fail() }", .call)).node);
+    try std.testing.expectEqualStrings("kotlin.String?", fx.typeText(reified.type_args[0]));
+}
+
 test "a star projection passed through a nested call captures the type argument" {
     var fx = try fixture(&.{
         \\package demo
