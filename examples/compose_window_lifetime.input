@@ -1,0 +1,5 @@
+# Scripted input for compose_window_lifetime.kt's window (KLIO_WIN_INPUT):
+# the window's close button, pressed twice, some time after its first event
+# poll.
+300ms close
+600ms close

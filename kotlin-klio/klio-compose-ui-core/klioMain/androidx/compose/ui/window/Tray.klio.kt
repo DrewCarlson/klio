@@ -16,12 +16,14 @@
 
 // ui's desktopMain Tray.desktop.kt (v1.12.0) over the platform's own tray
 // icon in place of AWT's SystemTray and TrayIcon: a status item in the macOS
-// menu bar, a Windows notification area icon. Its menu is the desktop's AWT
-// popup menu (no icons, mnemonics, shortcuts or radio button items), its
-// action and menu choices run on the application loop, and a notification
-// shows as the platform's, as TrayIcon.displayMessage shows it. Where the
-// platform has no tray (SDL), Tray says so on standard error, as the
-// desktop's does.
+// menu bar, a Windows notification area icon, and on X11 an icon docked in
+// the desktop's system tray (the XEmbed tray protocol AWT's X11 SystemTray
+// speaks). Its menu is the desktop's AWT popup menu (no icons, mnemonics,
+// shortcuts or radio button items), its action and menu choices run on the
+// application loop, and a notification shows as the platform's, as
+// TrayIcon.displayMessage shows it. Where there is no tray (no tray on the X
+// display, no X display), Tray says so on standard error, as the desktop's
+// does.
 package androidx.compose.ui.window
 
 import androidx.compose.runtime.Composable
@@ -38,7 +40,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
 import androidx.compose.ui.graphics.klioDrawToSurface
 import androidx.compose.ui.graphics.painter.Painter
-import androidx.compose.ui.input.key.isMacOs
+import androidx.compose.ui.input.key.__composeui_hostOs
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 import kotlinx.coroutines.channels.Channel
@@ -191,12 +193,15 @@ internal class KlioTray(private val onAction: () -> Unit) : KlioMenuSink {
         handle = 0L
     }
 
-    /** The icon drawn at the size the platform shows it: 22 points on macOS, 16 pixels elsewhere, at twice their pixels. */
+    /**
+     * The icon drawn at the size the desktop draws it (Tray.desktop.kt's
+     * iconSize): 16 points on Windows, 22 elsewhere, at twice their pixels.
+     */
     fun setIcon(painter: Painter) {
         if (!isOpen || (iconSet && icon === painter)) return
         icon = painter
         iconSet = true
-        val px = if (isMacOs) 44 else 32
+        val px = if (__composeui_hostOs() == "windows") 32 else 44
         val surface = __composeui_iconSurface(px, px)
         if (surface == 0L) return
         val size = Size(px.toFloat(), px.toFloat())

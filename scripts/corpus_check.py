@@ -47,12 +47,16 @@ def needs_skia(path):
 
 def needs_tray(path):
     """An example marked `// corpus: tray` uses the platform's tray icon, which
-    macOS and Windows have and the SDL windows of other hosts do not."""
+    macOS and Windows have, and an X display only while a system tray (a
+    panel's notification area, trayer, stalonetray) runs on it."""
     return has_marker(path, "tray")
 
 
 def host_has_tray():
-    return sys.platform == "darwin" or sys.platform.startswith("win")
+    """macOS and Windows always; elsewhere KLIO_TRAY_HOST=1 says the display
+    has a system tray."""
+    return (sys.platform == "darwin" or sys.platform.startswith("win")
+            or os.environ.get("KLIO_TRAY_HOST") == "1")
 
 
 def extra_args(path):

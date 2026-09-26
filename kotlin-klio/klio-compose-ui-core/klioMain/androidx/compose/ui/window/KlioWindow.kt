@@ -22,7 +22,6 @@ import androidx.compose.runtime.Composition
 import androidx.compose.runtime.CompositionContext
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -38,6 +37,7 @@ import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
 import androidx.compose.ui.graphics.klioDrawToSurface
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.util.UpdateEffect
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerType
@@ -643,8 +643,9 @@ fun singleWindowApplication(
  * state's size and position, kept to its properties and state as they change,
  * and reporting the user's resizes, moves and placement changes to the state.
  * As desktop's AwtWindow does, the window is created and its content set when
- * the composition applies, not while it composes, and updated after each
- * composition.
+ * the composition applies, not while it composes, and its properties are
+ * applied through [UpdateEffect], again whenever what they read changes; the
+ * effect's coroutine keeps the application running while the window is open.
  */
 @Composable
 private fun <S : WindowScope> KlioPlatformWindow(
@@ -693,13 +694,8 @@ private fun <S : WindowScope> KlioPlatformWindow(
             windowRef.holder = null
         }
     }
-    // Reading the state here recomposes the window when it changes.
-    val size = access.size
-    val position = access.position
-    val placement = access.placement
-    val minimized = access.isMinimized
-    SideEffect {
-        val holder = windowRef.holder ?: return@SideEffect
+    UpdateEffect {
+        val holder = windowRef.holder ?: return@UpdateEffect
         holder.onCloseRequest = onCloseRequest
         holder.state = access
         holder.input.enabled = enabled
@@ -708,7 +704,7 @@ private fun <S : WindowScope> KlioPlatformWindow(
         holder.input.onKeyEvent = onKeyEvent
         applyWindowProperties(holder, title, visible, resizable, decoration, alwaysOnTop)
         applyWindowIcon(holder, icon)
-        applyWindowState(holder, size, position, placement, minimized)
+        applyWindowState(holder, access.size, access.position, access.placement, access.isMinimized)
     }
 }
 

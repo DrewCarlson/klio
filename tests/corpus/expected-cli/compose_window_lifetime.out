@@ -1,0 +1,3 @@
+close request 1: the window stays open (drawn=true)
+close request 2: the application exits
+application ended after 2 close requests

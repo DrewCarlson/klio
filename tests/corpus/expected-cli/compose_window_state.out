@@ -1,0 +1,11 @@
+shown: size=320.0.dp x 240.0.dp position=Absolute(100.0.dp, 120.0.dp) placement=Floating
+moved: position=Absolute(140.0.dp, 160.0.dp)
+dialog opened, size=200.0.dp x 120.0.dp
+preview B KeyDown
+preview B KeyUp
+preview A KeyDown
+window hears A KeyDown
+preview A KeyUp
+window hears A KeyUp
+window opened=true
+final position=Absolute(140.0.dp, 160.0.dp) placement=Floating

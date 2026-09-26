@@ -1,0 +1,7 @@
+# Scripted input for compose_window_state.kt's window (KLIO_WIN_INPUT): at
+# the window's n-th event poll, an event as the platform would report it.
+# A (key code 65) reaches the content and then the window's onKeyEvent; the
+# window's onPreviewKeyEvent consumes B (66). They come once the window has
+# moved and the dialog has come and gone.
+60 key 66 98
+60 key 65 97

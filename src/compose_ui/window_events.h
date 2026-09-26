@@ -361,6 +361,20 @@ inline void klioReportFrame(KlioFrameReport& r, std::deque<KlioEv>& q, int x, in
     r.minimized = minimized;
 }
 
+// A move the program made: the window's frame now, recorded as reported so
+// the move is not reported back later, when the program may have moved it
+// again (the desktop reports its own moves before the program's next frame).
+// Where the platform put the window elsewhere than asked, that is reported.
+inline void klioBaselineMove(KlioFrameReport& r, std::deque<KlioEv>& q, int askedX, int askedY, int x, int y,
+                             int placement, bool minimized) {
+    if (x != askedX || y != askedY) q.push_back(klioSimpleEv(KLIO_EV_MOVE, x, y));
+    r.reported = true;
+    r.x = x;
+    r.y = y;
+    r.placement = placement;
+    r.minimized = minimized;
+}
+
 // Whether a typed code point is text a field inserts: not a control character,
 // the undefined character or one of the Specials, as the desktop's check is.
 inline bool klioIsPrintable(unsigned cp) {
@@ -531,8 +545,13 @@ inline int klioAwtKeyChar(int vk, unsigned platformChar) {
 //                                        Control elsewhere, as AWT's Toolkit has it)
 //   <when> text <characters>             typed text, the rest of the line
 //   <when> focus <0|1>
+//   <when> close                         the window's close button: a close request
 //   <when> menu <path>                   choose the menu bar item at the path of
 //                                        titles ("File/Open"), as a click would
+//   <when> menushow <path>               open the drawn menus down to the item at
+//                                        the path and leave them open (an SDL
+//                                        window's menu bar, for frame dumps;
+//                                        native menu bars ignore it)
 //   <when> tray action                   a tray icon's action
 //   <when> tray menu <path>              choose the tray menu's item at the path
 // A tray's events count its own polls and time, apart from the windows'.
@@ -606,9 +625,12 @@ inline std::vector<KlioScriptEntry>& klioScript() {
             for (const KlioEv& e : typed) add(e);
         } else if (std::strcmp(cmd, "focus") == 0) {
             add(klioSimpleEv(KLIO_EV_FOCUS, a));
-        } else if (std::strcmp(cmd, "menu") == 0) {
+        } else if (std::strcmp(cmd, "close") == 0) {
+            add(klioSimpleEv(KLIO_EV_CLOSE));
+        } else if (std::strcmp(cmd, "menu") == 0 || std::strcmp(cmd, "menushow") == 0) {
             klioScriptTexts().push_back(rest);
-            add(klioSimpleEv(KLIO_EV_MENU_PATH, static_cast<double>(klioScriptTexts().size() - 1)));
+            add(klioSimpleEv(KLIO_EV_MENU_PATH, static_cast<double>(klioScriptTexts().size() - 1),
+                             cmd[4] == 's' ? 1 : 0));
         } else if (std::strcmp(cmd, "tray") == 0) {
             if (std::strncmp(rest, "action", 6) == 0) {
                 addTray(klioSimpleEv(KLIO_EV_TRAY_ACTION));

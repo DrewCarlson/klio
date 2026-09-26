@@ -304,8 +304,11 @@ runtime-retain's `retain`, `RetainedEffect` and the stores.
   declaration was typed (the draw context's setters, 231b2e70), the
   graphics layer examples, LazyColumn, material3 text and the windows run
   again; compose_foundation_lazy's expected output is Compose Desktop's
-  (eight rows fit). Open: a WindowState position the program sets is
-  reported back as the old one (compose_window_state).
+  (eight rows fit). A move the program makes is recorded as reported, so
+  the window's first report (or a late one of an earlier move) no longer
+  sets a WindowState position the program has since changed back to the
+  old one; compose_window_state checks the state both ways, a DialogWindow
+  and the window key callbacks.
 - Open, routed to coroutines: a delay of `Long.MAX_VALUE / 2` under
   Dispatchers.Unconfined overflows the scheduler's clock. `Modifier.onClick`
   (whose tap detector waits that long when there is no long click) crashes

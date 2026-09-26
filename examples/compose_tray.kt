@@ -1,12 +1,16 @@
 // corpus: skia (the expected output is the one printed when the Skia shim renders)
-// corpus: tray (runs where the platform has tray icons: macOS and Windows)
+// corpus: tray (runs where the platform has tray icons: macOS, Windows, and an X display with a system tray)
 // An application with only a tray icon, as Compose Desktop's Tray adds one:
 // its icon and tooltip, a menu with a check box item, a submenu and a
 // disabled item, its action, and a notification. On macOS it is a status
 // item in the menu bar (a left click shows the menu, a right click is the
 // action); on Windows a notification area icon (a right click shows the menu,
-// a double click is the action). compose_tray.input ($KLIO_WIN_INPUT) clicks
-// it and chooses its items by their titles' path through the native menu.
+// a double click is the action); on X11 an icon docked in the desktop's
+// system tray (a left click is the action, a right click shows the menu, as
+// AWT's X11 tray icon has them). Where there is no tray, isTraySupported is
+// false and Tray says so on standard error. compose_tray.input
+// ($KLIO_WIN_INPUT) clicks it and chooses its items by their titles' path
+// through its menu.
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember

@@ -113,6 +113,9 @@ include = [
     "androidx/compose/ui/window/DialogState.desktop.kt",
     "androidx/compose/ui/window/WindowDecoration.desktop.kt",
     "androidx/compose/ui/window/MenuComposable.desktop.kt",
+    # The effect AwtWindow applies a window's properties with, which also keeps
+    # the application running while the window is open.
+    "androidx/compose/ui/util/UpdateEffect.desktop.kt",
 ]
 
 # nonJvmMain whole: the atomics, the remeasure queue's sorted set, the pointer

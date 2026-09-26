@@ -511,7 +511,9 @@ fn loadSkia() ?*Skia {
     var lib = openSkiaLib() orelse return null;
     const F = struct {
         fn get(l: *std.DynLib, comptime name: []const u8, comptime sym: [:0]const u8) ?@FieldType(Skia, name) {
-            return l.lookup(@FieldType(Skia, name), sym);
+            const f = l.lookup(@FieldType(Skia, name), sym);
+            if (f == null) std.debug.print("klio: the Skia shim is missing {s}; rendering is headless\n", .{sym});
+            return f;
         }
     };
     const s = Skia{
@@ -753,10 +755,10 @@ pub fn setDefaultWindowTitle(title: [:0]const u8) void {
 
 fn openSkiaLib() ?std.DynLib {
     if (skia_lib_override) |p| {
-        if (std.DynLib.open(p)) |l| return l else |_| {}
+        if (openSkiaAt(p)) |l| return l;
     }
     if (runtime.envOnce("KLIO_SKIA_LIB")) |p| {
-        if (std.DynLib.open(p)) |l| return l else |_| {}
+        if (openSkiaAt(p)) |l| return l;
     }
     if (std.DynLib.open(skia_lib_name)) |l| return l else |_| {}
     // The install layout puts the shim in `lib/` next to the binary's `bin/`, so
@@ -765,8 +767,29 @@ fn openSkiaLib() ?std.DynLib {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ "../lib", "." }) |rel| {
         const p = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}", .{ exe_dir, rel, skia_lib_name }) catch continue;
-        if (std.DynLib.open(p)) |l| return l else |_| {}
+        if (openSkiaAt(p)) |l| return l;
     }
+    return null;
+}
+
+/// Opens the shim at `path`. A shim that is there but does not load (a
+/// symbol the loader cannot bind, a library it needs) says why on standard
+/// error; with no shim at all rendering stays headless without a word.
+fn openSkiaAt(path: []const u8) ?std.DynLib {
+    if (std.DynLib.open(path)) |l| return l else |_| {}
+    const os = @import("builtin").os.tag;
+    if (comptime os != .linux and os != .macos) return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return null;
+    if (std.c.access(z, 0) != 0) return null;
+    // DynLib.open keeps only an error code; opening again recovers the
+    // loader's reason.
+    if (std.c.dlopen(z, .{ .LAZY = true })) |h| {
+        _ = std.c.dlclose(h);
+        return null;
+    }
+    const why: []const u8 = if (std.c.dlerror()) |e| std.mem.span(e) else "unknown loader error";
+    std.debug.print("klio: the Skia shim at {s} did not load ({s}); rendering is headless\n", .{ path, why });
     return null;
 }
 

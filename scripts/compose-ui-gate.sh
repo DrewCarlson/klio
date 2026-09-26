@@ -35,7 +35,9 @@ EXAMPLES=(
   compose_window
   compose_window_input
   compose_window_clipboard
+  compose_window_lifetime
   compose_window_menu
+  compose_window_state
   compose_multiwindow
   compose_material3_text
   compose_foundation_draw
