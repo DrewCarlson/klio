@@ -452,6 +452,9 @@ pub const LoadReport = struct {
     /// rendered plain: file by file, each file's lexer diagnostics before
     /// its parser's, up to the first file with an error.
     syntax: std.ArrayList(u8) = .empty,
+    /// The program files' lex and parse diagnostics as values, spanned in
+    /// the run's map: filled once the program has loaded.
+    syntax_diags: std.ArrayList(diagnostics.Diagnostic) = .empty,
     /// The program path that could not be read, and why.
     unreadable: ?struct { path: []const u8, err: anyerror } = null,
 };
@@ -554,7 +557,7 @@ pub fn loadSources(arena: Allocator, map: *span.SourceMap, inputs: []const []con
     var programs: std.ArrayList(sema.SourceFile) = .empty;
     for (scanned.items) |p| {
         const src = scan_map.get(p.ast.span.file);
-        try addSource(arena, map, &programs, p.path, src.source, .program);
+        try addSourceReporting(arena, map, &programs, p.path, src.source, .program, null, &report.syntax_diags);
     }
     return .{ .base = files.items, .program = try serial.programFiles(arena, map, programs.items) };
 }
@@ -1315,7 +1318,7 @@ fn addPath(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.So
     const st = try std.Io.Dir.cwd().statFile(fio, path, .{});
     if (st.kind == .directory) return addDir(arena, map, files, path, syntax);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(fio, path, arena, .unlimited);
-    try addSourceReporting(arena, map, files, path, bytes, .program, syntax);
+    try addSourceReporting(arena, map, files, path, bytes, .program, syntax, null);
 }
 
 /// Every `.kt` file below `dir_path`, recursively, sorted by path the way
@@ -1326,7 +1329,7 @@ fn addDir(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.Sou
     const fio = threaded.io();
     for (try ktFilesBelow(arena, dir_path)) |full| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(fio, full, arena, .unlimited);
-        try addSourceReporting(arena, map, files, full, bytes, .program, syntax);
+        try addSourceReporting(arena, map, files, full, bytes, .program, syntax, null);
     }
 }
 
@@ -1356,12 +1359,12 @@ fn ktFilesBelow(arena: Allocator, dir_path_in: []const u8) ![]const []const u8 {
 }
 
 fn addSource(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8, origin: sema.Origin) !void {
-    return addSourceReporting(arena, map, files, path, bytes, origin, null);
+    return addSourceReporting(arena, map, files, path, bytes, origin, null, null);
 }
 
 /// `addSource`, rendering the file's diagnostics into `syntax` when it has
-/// a lex or parse error.
-fn addSourceReporting(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8, origin: sema.Origin, syntax: ?*Syntax) !void {
+/// a lex or parse error, and adding every one of them to `diags`.
+fn addSourceReporting(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8, origin: sema.Origin, syntax: ?*Syntax, diags: ?*std.ArrayList(diagnostics.Diagnostic)) !void {
     const id = try map.add(path, bytes);
     const src = map.get(id).source;
     var lx = try lexer.Lexer.init(arena, id, src);
@@ -1380,6 +1383,10 @@ fn addSourceReporting(arena: Allocator, map: *span.SourceMap, files: *std.ArrayL
             try p.diagnostics.render(arena, map, &out.text);
             out.files += 1;
         }
+    }
+    if (diags) |out| {
+        try out.appendSlice(arena, lexed.diagnostics.diags());
+        try out.appendSlice(arena, p.diagnostics.diags());
     }
     try files.append(arena, .{ .ast = file_ast, .path = path, .origin = origin });
 }

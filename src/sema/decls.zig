@@ -9,6 +9,7 @@ const sema_mod = @import("sema.zig");
 const symbols = @import("symbols.zig");
 const types = @import("types.zig");
 const names_mod = @import("names.zig");
+const census_mod = @import("census.zig");
 
 const Allocator = std.mem.Allocator;
 const Sema = sema_mod.Sema;
@@ -992,20 +993,21 @@ fn checkActualModifiers(s: *Sema, e: Sym, a: Sym) Allocator.Error!void {
     const file = s.syms.get(a).file;
     const sp = declSpan(s, a);
     const name = s.str(s.syms.name(a));
-    if (!af.actual) try mismatch(s, file, sp, name, "matches an expect but is not marked actual", "`{s}` implements an `expect` and must be marked `actual`");
+    if (!af.actual) try mismatch(s, file, sp, name, "ACTUAL_MISSING", "matches an expect but is not marked actual", "`{s}` implements an `expect` and must be marked `actual`");
     // The actual carries every `inline`, `operator` and `infix` its expect
     // has, and may add `inline`; `suspend` matches.
-    if (ef.inline_ and !af.inline_) try mismatch(s, file, sp, name, "its expect is inline", "`{s}` must be `inline`, as its `expect` is");
-    if (ef.suspend_ != af.suspend_) try mismatch(s, file, sp, name, "suspend differs from its expect", "`{s}` must be `suspend` exactly when its `expect` is");
-    if (ef.operator and !af.operator) try mismatch(s, file, sp, name, "its expect is an operator", "`{s}` must be an `operator`, as its `expect` is");
-    if (ef.infix and !af.infix) try mismatch(s, file, sp, name, "its expect is infix", "`{s}` must be `infix`, as its `expect` is");
+    const not_subset = "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET";
+    if (ef.inline_ and !af.inline_) try mismatch(s, file, sp, name, not_subset, "its expect is inline", "`{s}` must be `inline`, as its `expect` is");
+    if (ef.suspend_ != af.suspend_) try mismatch(s, file, sp, name, "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT", "suspend differs from its expect", "`{s}` must be `suspend` exactly when its `expect` is");
+    if (ef.operator and !af.operator) try mismatch(s, file, sp, name, not_subset, "its expect is an operator", "`{s}` must be an `operator`, as its `expect` is");
+    if (ef.infix and !af.infix) try mismatch(s, file, sp, name, not_subset, "its expect is infix", "`{s}` must be `infix`, as its `expect` is");
     const m = s.syms.getMut(a);
     m.flags.operator = m.flags.operator or ef.operator;
     m.flags.infix = m.flags.infix or ef.infix;
 }
 
-fn mismatch(s: *Sema, file: u32, sp: @import("span").Span, name: []const u8, comptime detail: []const u8, comptime msg: []const u8) Allocator.Error!void {
-    try s.census.reportFacts(.expect_actual_mismatch, file, sp, .{ .message = try std.fmt.allocPrint(s.arena, msg, .{name}) }, "{s}: " ++ detail, .{name});
+fn mismatch(s: *Sema, file: u32, sp: @import("span").Span, name: []const u8, factory: []const u8, comptime detail: []const u8, comptime msg: []const u8) Allocator.Error!void {
+    try s.census.reportFacts(.expect_actual_mismatch, file, sp, .{ .message = try std.fmt.allocPrint(s.arena, msg, .{name}), .factory = factory }, "{s}: " ++ detail, .{name});
 }
 
 /// The span of a declaration's name.
@@ -1077,7 +1079,16 @@ fn checkConflicts(s: *Sema, sym: Sym, owner: Sym) Allocator.Error!void {
     }
     if (clashes.items.len == 0) return;
     const name = s.str(s.syms.name(sym));
-    try s.census.reportFacts(.conflicting_overloads, s.syms.get(sym).file, declSpan(s, sym), .{ .name = name, .syms = clashes.items }, "{s}: {d} declarations", .{ name, clashes.items.len });
+    var related: std.ArrayList(census_mod.Related) = .empty;
+    for (clashes.items[1..]) |other| try related.append(s.arena, .{ .file = s.syms.get(other).file, .sp = declSpan(s, other), .message = "also declared here" });
+    // kotlinc names a clash of functions an overload conflict and one of
+    // properties or classifiers a redeclaration.
+    const factory = switch (s.syms.kind(sym)) {
+        .function => "CONFLICTING_OVERLOADS",
+        .property => "REDECLARATION",
+        else => "CLASSIFIER_REDECLARATION",
+    };
+    try s.census.reportFacts(.conflicting_overloads, s.syms.get(sym).file, declSpan(s, sym), .{ .name = name, .syms = clashes.items, .factory = factory, .related = related.items }, "{s}: {d} declarations", .{ name, clashes.items.len });
 }
 
 /// Whether two declarations of one scope under one name clash: two

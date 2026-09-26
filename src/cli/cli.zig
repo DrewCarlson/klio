@@ -117,6 +117,8 @@ const USAGE =
     \\  --format <plain|json|sarif>  Output format for diagnostics.
     \\  --feature <pack>/<feature>   Enable a pack feature (repeatable).
     \\  --unimplemented              Report unimplemented `expect` declarations.
+    \\  --engine <old|sema>          Analyze with the type checker (default) or with sema,
+    \\                               as `klio run` does; sema names kotlinc's diagnostics.
     \\
 ;
 
@@ -756,6 +758,7 @@ fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
     var format: DiagFormat = .Plain;
+    var engine: check_cmd.Engine = .old;
     var want_unimplemented = false;
 
     var i: usize = 0;
@@ -776,6 +779,19 @@ fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (optionValue(a, "--format=")) |v| {
             format = parseFormat(v) orelse {
                 printErr(gpa, "error: unknown --format `{s}` (use plain|json|sarif)\n", .{v});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "--engine") or optionValue(a, "--engine=") != null) {
+            const v = optionValue(a, "--engine=") orelse blk: {
+                i += 1;
+                if (i >= args.len) {
+                    printErr(gpa, "error: --engine requires a value (old|sema)\n", .{});
+                    return 2;
+                }
+                break :blk args[i];
+            };
+            engine = check_cmd.Engine.fromStr(v) orelse {
+                printErr(gpa, "error: unknown --engine `{s}` (use old|sema)\n", .{v});
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "--feature")) {
@@ -801,6 +817,8 @@ fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             files.append(gpa, a) catch return 2;
         }
     }
+
+    if (engine == .sema and !want_unimplemented) return check_cmd.runCheckSema(gpa, files.items, format, feature_specs.items);
 
     var requested = parseRequestedFeatures(gpa, feature_specs.items);
     defer deinitRequestedFeatures(&requested);
@@ -985,6 +1003,7 @@ test {
     std.testing.refAllDecls(pack_build);
     std.testing.refAllDecls(unimplemented);
     std.testing.refAllDecls(check_cmd);
+    std.testing.refAllDecls(@import("sema_diagnostics.zig"));
     std.testing.refAllDecls(repl);
     std.testing.refAllDecls(test_report);
     std.testing.refAllDecls(io);

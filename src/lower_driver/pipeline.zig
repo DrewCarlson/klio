@@ -118,6 +118,32 @@ pub fn buildOnBase(a: Allocator, src: Sources, binding: Binding, image: []const 
     return .{ .s = s, .br = br, .prog = prog };
 }
 
+/// Sema over every file of `src`, with nothing lowered: what a check of the
+/// program reports from.
+pub fn analyze(a: Allocator, src: Sources) !*sema.Sema {
+    const s = try sema.Sema.init(a);
+    try s.addFiles(src.base);
+    try s.addFiles(src.program);
+    try sema.headers.resolveAllHeaders(s);
+    try s.resolveBodies(&.{ .base, .pack, .program });
+    return s;
+}
+
+/// `analyze` over the base image `image`: the base is decoded from it and
+/// only the program's bodies are analyzed. `error.Stale` when the image is
+/// not of this base. `image` must outlive the result.
+pub fn analyzeOnBase(a: Allocator, src: Sources, binding: Binding, image: []const u8) !*sema.Sema {
+    const s = try sema.Sema.init(a);
+    try s.addFiles(src.base);
+    const saved_perm = runtime.gc.alloc_perm;
+    runtime.gc.alloc_perm = true;
+    defer runtime.gc.alloc_perm = saved_perm;
+    _ = try base_image.decode(a, image, s, .{ .natives = binding.natives, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries });
+    try s.addFiles(src.program);
+    try s.resolveBodies(&.{.program});
+    return s;
+}
+
 /// `KLIO_SEMA_TIMING`: the milliseconds each step of `build` took.
 pub const Timing = struct {
     last: u64,

@@ -22,6 +22,8 @@ private const val USAGE = """usage: sema-oracle [options] <file.kt | dir>...
   -X<flag>, -language-version <v>
                    passed through to every compilation (e.g. -Xname-based-destructuring=complete)
   --keep-failed    also emit the sites of files that failed to compile
+  --diagnostics    print every diagnostic kotlinc reports instead of the sites:
+                   path, line, column, severity, factory and message
   --jvm-names      keep JVM class names (java/util/ArrayList) instead of the Kotlin alias
   --debug          print raw FIR detail for every site to stderr
   --quiet          no progress/summary on stderr"""
@@ -29,26 +31,48 @@ private const val USAGE = """usage: sema-oracle [options] <file.kt | dir>...
 /**
  * JVM-platform restrictions that leave resolution complete. A file whose only errors
  * are these still counts as compiled: the program is valid Kotlin outside the JVM.
+ * The JVM backend's signature clashes are among them (`--diagnostics` runs it).
  */
 private val JVM_ONLY_ERRORS = setOf(
     "VALUE_CLASS_WITHOUT_JVM_INLINE_ANNOTATION",
+    "CONFLICTING_JVM_DECLARATIONS",
+    "CONFLICTING_INHERITED_JVM_DECLARATIONS",
+    "ACCIDENTAL_OVERRIDE",
 )
 
 private val DIAGNOSTIC_NAME = Regex("""^\[([A-Z][A-Z0-9_]+)]""")
+
+/** One diagnostic of a source file, as `--diagnostics` prints it. */
+private class Diag(val path: String, val line: Int, val column: Int, val severity: String, val factory: String, val message: String)
 
 private class FirstError : MessageCollector {
     var first: String? = null
     var errors = 0
     var frontendDone = false
     var jvmOnly = 0
+
+    /** Every diagnostic with a place in a source file, errors and warnings. */
+    val all = ArrayList<Diag>()
     override fun clear() {}
     override fun hasErrors() = errors > 0
     override fun report(severity: CompilerMessageSeverity, message: String, location: CompilerMessageSourceLocation?) {
-        if (!severity.isError) return
         if (message.contains(FrontendDone.MARKER)) {
             frontendDone = true
             return
         }
+        val label = when {
+            severity.isError -> "error"
+            severity.isWarning -> "warning"
+            else -> null
+        }
+        val head = message.lineSequence().first()
+        val factory = DIAGNOSTIC_NAME.find(head)?.groupValues?.get(1) ?: ""
+        // A JVM restriction is not a diagnostic of the program's Kotlin.
+        if (label != null && location != null && factory !in JVM_ONLY_ERRORS) {
+            val text = head.removePrefix("[$factory]").trim().replace('\t', ' ')
+            all.add(Diag(location.path, location.line, location.column, label, factory, text))
+        }
+        if (!severity.isError) return
         val name = DIAGNOSTIC_NAME.find(message.lineSequence().first())?.groupValues?.get(1)
         if (name in JVM_ONLY_ERRORS) {
             jvmOnly++
@@ -67,7 +91,10 @@ private class Job(val display: String, val file: File)
 /** One compilation: a file on its own, or every file of a program given with `--together`. */
 private class Compilation(val jobs: List<Job>)
 
-private class Result(val job: Job, val sites: List<Site>, val ok: Boolean, val error: String?, val unresolved: Int, val debug: List<String>)
+private class Result(
+    val job: Job, val sites: List<Site>, val ok: Boolean, val error: String?, val unresolved: Int, val debug: List<String>,
+    val diags: List<Diag> = emptyList(),
+)
 
 fun main(argv: Array<String>) {
     var outFile: String? = null
@@ -77,6 +104,7 @@ fun main(argv: Array<String>) {
     var together = false
     var debug = false
     var quiet = false
+    var diagnostics = false
     val passthrough = ArrayList<String>()
     val inputs = ArrayList<String>()
     var i = 0
@@ -86,6 +114,7 @@ fun main(argv: Array<String>) {
             "-cp", "-classpath" -> classpath = argv.getOrNull(++i)
             "-j" -> jobs = argv.getOrNull(++i)?.toIntOrNull() ?: 1
             "--keep-failed" -> keepFailed = true
+            "--diagnostics" -> { diagnostics = true; Options.stopAfterFrontend = false }
             "--together" -> together = true
             "--jvm-names" -> Options.commonNames = false
             "--debug" -> debug = true
@@ -126,11 +155,21 @@ fun main(argv: Array<String>) {
     val units = if (together) listOf(Compilation(work.toList())) else work.map { Compilation(listOf(it)) }
     val pool = Executors.newFixedThreadPool(jobs.coerceAtLeast(1))
     val futures: List<Future<List<Result>>> = units.mapIndexed { n, unit ->
-        pool.submit<List<Result>> { compile(unit, home, pluginJar, File(scratch, "o$n"), classpath, passthrough, debug) }
+        pool.submit<List<Result>> { compile(unit, home, pluginJar, File(scratch, "o$n"), classpath, passthrough, debug, diagnostics) }
     }
     val results = futures.flatMap { it.get() }
     pool.shutdown()
     val elapsed = (System.nanoTime() - started) / 1e9
+
+    if (diagnostics) {
+        printDiagnostics(results, outFile)
+        scratch.deleteRecursively()
+        if (!quiet) {
+            val n = results.sumOf { it.diags.size }
+            System.err.println("[oracle] ${work.size} files, $n diagnostics, %.1fs (%.1f files/s)".format(elapsed, work.size / elapsed))
+        }
+        return
+    }
 
     val rows = ArrayList<Pair<String, Site>>()
     var failed = 0
@@ -163,8 +202,27 @@ fun main(argv: Array<String>) {
     }
 }
 
+/**
+ * `--diagnostics`: one line per diagnostic, `path line column severity factory
+ * message`, tab-separated and sorted by path, line and column. A file that did
+ * not compile is `[oracle-fail]` on stderr as in the sites mode.
+ */
+private fun printDiagnostics(results: List<Result>, outFile: String?) {
+    val rows = results.flatMap { r -> r.diags.map { r.job.display to it } }
+        .sortedWith(compareBy({ it.first }, { it.second.line }, { it.second.column }, { it.second.factory }))
+    val sink: PrintStream = outFile?.let { PrintStream(File(it).outputStream().buffered(), false, "UTF-8") } ?: PrintStream(System.out, false, "UTF-8")
+    for ((path, d) in rows) {
+        sink.print(path); sink.print('\t'); sink.print(d.line); sink.print('\t'); sink.print(d.column); sink.print('\t')
+        sink.print(d.severity); sink.print('\t'); sink.print(d.factory); sink.print('\t'); sink.print(d.message); sink.print('\n')
+    }
+    sink.flush()
+    if (outFile != null) sink.close()
+    for (r in results) if (!r.ok) System.err.println("[oracle-fail] ${r.job.display}: ${r.error}")
+}
+
 private fun compile(
     unit: Compilation, home: File, pluginJar: String, outDir: File, classpath: String?, passthrough: List<String>, debug: Boolean,
+    diagnostics: Boolean = false,
 ): List<Result> {
     val collectors = ArrayList<FileCollector>()
     for (job in unit.jobs) {
@@ -174,7 +232,8 @@ private fun compile(
         collectors.add(FileCollector(job.display, bytes, debug))
     }
     val keys = unit.jobs.map { OracleSink.canonical(it.file.path) }
-    for ((key, collector) in keys.zip(collectors)) OracleSink.collectors[key] = collector
+    // The diagnostics mode needs no sites: the walker stays off.
+    if (!diagnostics) for ((key, collector) in keys.zip(collectors)) OracleSink.collectors[key] = collector
     val messages = FirstError()
     val code = try {
         val compiler = K2JVMCompiler()
@@ -188,10 +247,10 @@ private fun compile(
             "-Xuse-fir-lt=false",
             "-Xdisable-default-scripting-plugin",
             "-no-reflect",
-            "-nowarn",
             "-Xsuppress-version-warnings",
             "-Xrender-internal-diagnostic-names",
         ))
+        if (!diagnostics) argv.add("-nowarn")
         if (classpath != null) { argv.add("-classpath"); argv.add(classpath) }
         argv.addAll(passthrough)
         compiler.parseArguments(argv.toTypedArray(), args)
@@ -204,6 +263,12 @@ private fun compile(
         outDir.deleteRecursively()
     }
     val compiled = messages.errors == 0 && (code == ExitCode.OK || messages.frontendDone || messages.jvmOnly > 0)
+    if (diagnostics) {
+        val byKey = messages.all.groupBy { OracleSink.canonical(it.path) }
+        return unit.jobs.zip(keys).map { (job, key) ->
+            Result(job, emptyList(), compiled, if (compiled) null else messages.first ?: code.name, 0, emptyList(), byKey[key] ?: emptyList())
+        }
+    }
     return unit.jobs.zip(collectors).map { (job, collector) ->
         val ok = compiled && collector.visited
         val error = when {

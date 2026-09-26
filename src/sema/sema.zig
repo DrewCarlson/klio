@@ -29,6 +29,7 @@ pub const members = @import("members.zig");
 pub const infer = @import("infer.zig");
 pub const diagnose = @import("diagnose.zig");
 pub const exhaustive = @import("exhaustive.zig");
+pub const suppress = @import("suppress.zig");
 
 const Allocator = std.mem.Allocator;
 pub const Name = names.Name;

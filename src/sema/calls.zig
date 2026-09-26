@@ -3863,6 +3863,12 @@ fn inHeader(c: *const body.Scope) bool {
     return true;
 }
 
+/// kotlinc's diagnostic for a `super` with no target: a label that names
+/// no enclosing class, or no class to have a supertype.
+fn superFactory(sp: *const ast.SuperExpr) []const u8 {
+    return if (sp.label != null) "UNRESOLVED_LABEL" else "SUPER_NOT_AVAILABLE";
+}
+
 fn superTarget(ctx: *Ctx, sp: *const ast.SuperExpr) Allocator.Error!?struct { ty: TypeId, owner: Sym } {
     const s = ctx.s;
     // `super@Outer`: the named class's supertypes; else the innermost
@@ -3902,7 +3908,7 @@ fn superTarget(ctx: *Ctx, sp: *const ast.SuperExpr) Allocator.Error!?struct { ty
 pub fn superMember(ctx: *Ctx, sp: *const ast.SuperExpr, name: ast.Ident, access: body.Access) Allocator.Error!TypeId {
     const s = ctx.s;
     const tgt = (try superTarget(ctx, sp)) orelse {
-        try ctx.report(.unresolved_receiver, sp.span, "super", .{});
+        try ctx.reportFacts(.unresolved_receiver, sp.span, .{ .factory = superFactory(sp) }, "super", .{});
         return s.types.errType();
     };
     const n = try ctx.intern(name.name);
@@ -3930,7 +3936,7 @@ fn superCall(ctx: *Ctx, sp: *const ast.SuperExpr, name: ast.Ident, args: []Arg, 
     const s = ctx.s;
     const tgt = (try superTarget(ctx, sp)) orelse {
         try finishArgsBlind(ctx, args);
-        try ctx.report(.unresolved_receiver, sp.span, "super", .{});
+        try ctx.reportFacts(.unresolved_receiver, sp.span, .{ .factory = superFactory(sp) }, "super", .{});
         return s.types.errType();
     };
     // Every supertype when unqualified: an interface may be the declarer.

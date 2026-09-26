@@ -31,6 +31,7 @@ Directories are searched recursively for `*.kt`.
 | `-cp <paths>` | extra classpath for every compilation, e.g. `lib/kotlinx-coroutines-core-jvm.jar` of the kotlinc dist |
 | `-X...`, `-language-version <v>` | passed to every compilation (e.g. `-Xname-based-destructuring=complete`) |
 | `--keep-failed` | also print the sites of files that did not compile |
+| `--diagnostics` | print kotlinc's diagnostics instead of the sites (see Diagnostics) |
 | `--jvm-names` | keep JVM class names instead of mapping them to their Kotlin alias (see Targets) |
 | `--debug` | print the raw FIR detail behind every site to stderr |
 | `--quiet` | no summary line on stderr |
@@ -45,6 +46,23 @@ Throughput on a 10-core development machine: about 21 files/s with `-j 1` and ab
 50 files/s with `-j 4` (the 591 files of `examples/` in 11.5 s, including JVM start;
 more jobs do not help). Most of the per-file cost is kotlinc deserializing stdlib
 metadata again for each new session.
+
+## Diagnostics
+
+`--diagnostics` prints every diagnostic kotlinc reports for each file, errors
+and warnings, one tab-separated line each, sorted by path, line and column:
+
+```
+path  line  column  severity  factory  message
+```
+
+`factory` is the FIR diagnostic's name (`UNRESOLVED_REFERENCE`,
+`USELESS_CAST`, ...), `severity` is `error` or `warning`, and `message` is the
+first line of kotlinc's text. `line` and `column` are kotlinc's, 1-based. The
+compilation runs to its end in this mode, because kotlinc reports the
+frontend's warnings only then, so it is slower than the sites mode.
+`VALUE_CLASS_WITHOUT_JVM_INLINE_ANNOTATION` is left out, a JVM restriction as
+above. `scripts/check-diff.py` compares these with `klio check`'s engines.
 
 ## Format
 

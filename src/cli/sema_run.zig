@@ -15,6 +15,7 @@ const compose_ui = @import("compose_ui");
 const io = @import("io.zig");
 const sema_cmd = @import("sema_cmd.zig");
 const sema_base_cache = @import("sema_base_cache.zig");
+const sema_diagnostics = @import("sema_diagnostics.zig");
 
 const Allocator = std.mem.Allocator;
 const pipeline = lower_driver.pipeline;
@@ -42,6 +43,24 @@ pub fn buildRun(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, sr
     const bytes = try bakeBase(gpa, arena, src.base, binding, path);
     return pipeline.buildOnBase(arena, src, binding, bytes) catch |e| switch (e) {
         error.Stale, error.Malformed => pipeline.build(arena, src, binding),
+        else => e,
+    };
+}
+
+/// Sema over `src` as `buildRun` analyzes it, with nothing lowered: over
+/// the cached base image, baked first when there is none.
+pub fn analyzeRun(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, src: pipeline.Sources, binding: pipeline.Binding) !*sema.Sema {
+    if (sema_base_cache.disabled()) return pipeline.analyze(arena, src);
+    const path = sema_base_cache.pathFor(arena, map, src.base) orelse return pipeline.analyze(arena, src);
+    if (sema_base_cache.read(arena, path)) |bytes| {
+        if (pipeline.analyzeOnBase(arena, src, binding, bytes)) |s| return s else |e| switch (e) {
+            error.Stale, error.Malformed => {},
+            else => return e,
+        }
+    }
+    const bytes = try bakeBase(gpa, arena, src.base, binding, path);
+    return pipeline.analyzeOnBase(arena, src, binding, bytes) catch |e| switch (e) {
+        error.Stale, error.Malformed => pipeline.analyze(arena, src),
         else => e,
     };
 }
@@ -267,11 +286,10 @@ pub fn reportProgramErrors(gpa: Allocator, arena: Allocator, map: *const span.So
     return n;
 }
 
-/// Whether a program site sema reported lies within `sp` or holds it.
-fn reportedAt(s: *sema.Sema, sp: span.Span) bool {
-    for (s.census.sites.items) |site| {
-        const fc = s.fileOf(site.file) orelse continue;
-        if (fc.origin != .program) continue;
+/// Whether a site of the program's that is shown lies within `sp` or
+/// holds it.
+fn reportedAt(sites: []const sema.census.Site, sp: span.Span) bool {
+    for (sites) |site| {
         if (site.sp.file.int() != sp.file.int()) continue;
         if (site.sp.start <= sp.end and sp.start <= site.sp.end) return true;
     }
@@ -286,11 +304,6 @@ fn inProgram(map: *const span.SourceMap, program: []const sema.SourceFile, sp: s
     return false;
 }
 
-/// Renders into `out`, with `severity`, what sema found wrong in
-/// `program`'s files and, when it found nothing, what did not lower there,
-/// in the form the lexer's and parser's diagnostics take; answers how many
-/// there are. A member of a receiver that did not resolve is counted but
-/// not shown when anything else is: the receiver's own diagnostic says it.
 /// How many of the program's imports name nothing: each fails the program
 /// as kotlinc fails its compilation, whatever `programDiagnostics`'
 /// severity for the rest.
@@ -304,35 +317,22 @@ pub fn programImportErrors(built: *const pipeline.Built) usize {
     return n;
 }
 
+/// Renders into `out`, with `severity`, what sema found wrong in
+/// `program`'s files (`sema_diagnostics.collect`, warnings aside) and what
+/// did not lower there, in the form the lexer's and parser's diagnostics
+/// take; answers how many there are.
 pub fn programDiagnostics(arena: Allocator, map: *const span.SourceMap, program: []const sema.SourceFile, built: *const pipeline.Built, severity: diagnostics.Severity, out: *std.ArrayList(u8)) !usize {
     const s = built.s;
-    var n: usize = 0;
-    var shown: usize = 0;
-    for (s.census.sites.items) |site| {
-        const fc = s.fileOf(site.file) orelse continue;
-        if (fc.origin != .program) continue;
-        n += 1;
-        if (site.reason != .receiver_unresolved) shown += 1;
-    }
-    for (s.census.sites.items) |site| {
-        const fc = s.fileOf(site.file) orelse continue;
-        if (fc.origin != .program) continue;
-        if (site.reason == .receiver_unresolved and shown != 0) continue;
-        var d = diagnostics.Diagnostic.err(try sema.diagnose.message(s, arena, site), site.sp);
-        // An import that names nothing fails the file whatever runs it.
-        d.severity = if (site.reason == .unresolved_import) .Error else severity;
-        if (site.reason == .conflicting_overloads and site.syms.len > 1) {
-            for (site.syms[1..]) |other| try d.secondary.append(arena, .{ .span = sema.decls.declSpan(s, other), .message = "also declared here" });
-        }
-        try diagnostics.render.plain.render(arena, &.{d}, map, out);
-    }
+    const found = try sema_diagnostics.collect(arena, s, .{ .error_severity = severity, .warnings = false });
+    try diagnostics.render.plain.renderWith(arena, found.list, map, out, .{ .codes = false });
+    var n: usize = found.sites.len;
     // What did not lower follows from what did not resolve where sema
     // reported something at its place; anywhere else, it is klio's to fix,
     // and shown whatever sema found elsewhere.
     for (built.prog.errors.items) |le| {
         if (!inProgram(map, program, le.span)) continue;
         n += 1;
-        if (shown != 0 and reportedAt(s, le.span)) continue;
+        if (found.primary != 0 and reportedAt(found.sites, le.span)) continue;
         const f = built.br.m.funcs.items[le.func.int()];
         var d = diagnostics.Diagnostic.err(try std.fmt.allocPrint(arena, "klio cannot run `{s}`: {s}", .{ f.fqn, le.msg }), le.span);
         d.severity = severity;

@@ -5095,11 +5095,54 @@ test "two declarations of one signature conflict at each declaration" {
         "redeclaration: `D` is declared twice",
         "redeclaration: `D` is declared twice",
     });
+    var factories: std.ArrayList([]const u8) = .empty;
     for (fx.s.census.sites.items) |site| {
         const fc = fx.s.fileOf(site.file) orelse continue;
         if (fc.origin != .program) continue;
         try std.testing.expectEqual(@as(usize, 2), site.syms.len);
+        try std.testing.expectEqual(@as(usize, 1), site.related.len);
+        try std.testing.expectEqualStrings("also declared here", site.related[0].message);
+        try factories.append(fx.arena.allocator(), sema_mod.census.factoryOf(site));
     }
+    const want = [_][]const u8{ "CONFLICTING_OVERLOADS", "CONFLICTING_OVERLOADS", "REDECLARATION", "REDECLARATION", "CONFLICTING_OVERLOADS", "CONFLICTING_OVERLOADS", "CLASSIFIER_REDECLARATION", "CLASSIFIER_REDECLARATION" };
+    try std.testing.expectEqual(want.len, factories.items.len);
+    for (want, factories.items) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+test "@Suppress silences the diagnostics it names over what it annotates" {
+    var fx = try fixture(&.{
+        \\@file:Suppress("NO_THIS")
+        \\package app
+        \\fun self() = this
+    ,
+        \\package app
+        \\annotation class Suppress(vararg val names: String)
+        \\@Suppress("UNRESOLVED_REFERENCE")
+        \\fun quiet(): Int = missing1
+        \\fun loud(): Int = missing2
+        \\class C {
+        \\    @Suppress("warnings", "unresolved_reference") val p: Int = missing3
+        \\    fun m(): Int = missing4
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    var sup = sema_mod.suppress.Suppressions.init(fx.arena.allocator());
+    var shown: std.ArrayList([]const u8) = .empty;
+    var hidden: usize = 0;
+    for (fx.s.census.sites.items) |site| {
+        const fc = fx.s.fileOf(site.file) orelse continue;
+        if (fc.origin != .program) continue;
+        if (try sup.suppressed(fx.s, site)) {
+            hidden += 1;
+            continue;
+        }
+        try shown.append(fx.arena.allocator(), site.detail);
+    }
+    try std.testing.expectEqual(@as(usize, 3), hidden);
+    try std.testing.expectEqual(@as(usize, 2), shown.items.len);
+    try std.testing.expectEqualStrings("missing2", shown.items[0]);
+    try std.testing.expectEqualStrings("missing4", shown.items[1]);
 }
 
 test "an expect of the program no actual implements reports itself" {

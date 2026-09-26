@@ -175,3 +175,17 @@ closes a site, delete its line in the same commit; `--update-open` rewrites
 the file from a run.
 
     python3 scripts/sema-census.py --klio zig-out/bin/klio-harness --home $PWD/.klio-local
+
+## Diagnostics against kotlinc
+
+`scripts/check-diff.py` runs `klio check` with the old engine and with
+`--engine sema`, and kotlinc 2.4.20 through `scripts/sema-oracle.sh
+--diagnostics`, over the examples and the fixtures, and checks what
+`plans/retire-typeck.md` requires line by line: an old diagnostic kotlinc
+also reports keeps a sema diagnostic of kotlinc's factory, every sema
+diagnostic is one kotlinc reports, with kotlinc's severity. `--save DIR`
+keeps each side's results and `--old`, `--sema`, `--kotlinc` reuse them. In
+a worktree without `target/parity-cache`, point `SEMA_ORACLE_KOTLINC` at the
+checkout's kotlinc.
+
+    SEMA_ORACLE_KOTLINC=../../../target/parity-cache/kotlinc-2.4.20 python3 scripts/check-diff.py --save out

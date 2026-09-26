@@ -48,7 +48,7 @@ class OracleRegistrar : CompilerPluginRegistrar() {
  */
 object StopAfterFrontend : IrGenerationExtension {
     override fun generate(moduleFragment: IrModuleFragment, pluginContext: IrPluginContext) {
-        throw FrontendDone()
+        if (Options.stopAfterFrontend) throw FrontendDone()
     }
 }
 

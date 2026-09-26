@@ -13,14 +13,30 @@ const diag = @import("../diagnostics.zig");
 const Diagnostic = diag.Diagnostic;
 const Severity = diag.Severity;
 
+/// What the plain form shows beyond kotlinc's.
+pub const Options = struct {
+    /// Each diagnostic's code after its message, `[NAME]`.
+    codes: bool = true,
+};
+
 pub fn render(
     allocator: std.mem.Allocator,
     diagnostics: []const Diagnostic,
     sources: *const SourceMap,
     out: *std.ArrayList(u8),
 ) !void {
+    return renderWith(allocator, diagnostics, sources, out, .{});
+}
+
+pub fn renderWith(
+    allocator: std.mem.Allocator,
+    diagnostics: []const Diagnostic,
+    sources: *const SourceMap,
+    out: *std.ArrayList(u8),
+    opts: Options,
+) !void {
     for (diagnostics) |*d| {
-        try renderOne(allocator, d, sources, out);
+        try renderOne(allocator, d, sources, out, opts);
     }
 }
 
@@ -40,11 +56,12 @@ fn renderOne(
     d: *const Diagnostic,
     sources: *const SourceMap,
     out: *std.ArrayList(u8),
+    opts: Options,
 ) !void {
     const file = sources.get(d.primary.span.file);
     const lc = file.lineCol(d.primary.span.start);
     const sev_label = severityWord(d.severity);
-    if (d.code()) |c| {
+    if (if (opts.codes) d.code() else null) |c| {
         try printLine(allocator, out, "{s}:{d}:{d}: {s}: {s} [{s}]", .{
             file.path, lc.line, lc.col, sev_label, d.message, c,
         });
@@ -167,4 +184,17 @@ test "plain render warning level" {
     defer a.free(s);
     const expected = "x.kt:1:1: warning: careful\nval a = 1\n^^^\n";
     try std.testing.expectEqualStrings(expected, s);
+}
+
+test "plain render can leave the code out" {
+    const a = std.testing.allocator;
+    var sm = SourceMap.init(a);
+    defer sm.deinit();
+    const id = try sm.add("x.kt", "val a = 1\n");
+    var d = Diagnostic.fromFactory(&diag.generated.ABSTRACT_DELEGATED_PROPERTY, Span.init(id, 0, 3));
+    defer d.deinit(a);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try renderWith(a, &.{d}, &sm, &buf, .{ .codes = false });
+    try std.testing.expectEqualStrings("x.kt:1:1: error: Delegated property cannot be abstract.\nval a = 1\n^^^\n", buf.items);
 }

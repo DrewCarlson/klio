@@ -16,6 +16,21 @@ which renders to plain text, JSON, or SARIF.
 The full catalog (with the source spans that emit each code) lives
 at `docs/design/DIAGNOSTICS.md` in the repository.
 
+## Sema's diagnostics
+
+`klio run` and `klio check --engine sema` report what sema finds. Each
+diagnostic carries kotlinc's factory name as its code (`UNRESOLVED_REFERENCE`,
+`CONFLICTING_OVERLOADS`, ...) and kotlinc's severity for it; what kotlinc has
+no diagnostic for, klio names `KLIO_*` (`KLIO_UNSUPPORTED` for a construct
+klio does not model yet). `@Suppress("NAME")` on a file, a declaration or a
+lambda silences that diagnostic over what it annotates, and
+`@Suppress("warnings")` every warning there.
+
+A census site (`src/sema/census.zig`) is one diagnostic: its reason names
+the factory unless the site names its own, an error counts toward the
+census and a warning does not. `src/cli/sema_diagnostics.zig` turns the
+program's sites into `Diagnostic`s for the renderers.
+
 ## Wording rules
 
 User-facing messages must not cite the Kotlin Language Specification.

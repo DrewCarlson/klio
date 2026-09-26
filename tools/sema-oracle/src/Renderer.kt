@@ -172,4 +172,9 @@ class Renderer(private val session: FirSession, private val out: FileCollector) 
 
 object Options {
     @Volatile var commonNames: Boolean = true
+
+    /** Whether the compilation ends once the frontend is done. `--diagnostics`
+     *  lets it run on: kotlinc reports the frontend's warnings only when the
+     *  compilation finishes. */
+    @Volatile var stopAfterFrontend: Boolean = true
 }

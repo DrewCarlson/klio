@@ -79,6 +79,18 @@ pub fn BufferOf(comptime Ref: type, comptime ExprType: type) type {
 
 pub const Buffer = BufferOf(@import("records.zig").Ref, @import("records.zig").ExprType);
 
+/// How a diagnostic weighs, as kotlinc ranks its factories: an error fails
+/// the compilation, a warning does not.
+pub const Severity = enum(u1) { err, warning };
+
+/// A place a diagnostic points to besides its own: the other declaration of
+/// a clash, the declaration an override hides.
+pub const Related = struct {
+    file: u32,
+    sp: span.Span,
+    message: []const u8,
+};
+
 pub const Site = struct {
     reason: Reason,
     file: u32,
@@ -99,6 +111,12 @@ pub const Site = struct {
     syms: []const Sym = &.{},
     /// The diagnostic's message, where the site composes its own.
     message: []const u8 = "",
+    /// kotlinc's name for the diagnostic, where it is not the reason's
+    /// (`factoryOf`).
+    factory: []const u8 = "",
+    severity: Severity = .err,
+    related: []const Related = &.{},
+    notes: []const []const u8 = &.{},
 };
 
 /// The facts of a site a diagnostic draws on; see `Site`.
@@ -108,14 +126,62 @@ pub const Facts = struct {
     arg_types: []const TypeId = &.{},
     syms: []const Sym = &.{},
     message: []const u8 = "",
+    factory: []const u8 = "",
+    severity: Severity = .err,
+    related: []const Related = &.{},
+    notes: []const []const u8 = &.{},
 };
+
+/// The name kotlinc gives the diagnostic of `site`: the site's own, else
+/// its reason's. A reason kotlinc has no diagnostic for (what klio does not
+/// model, its own internal failures) is named `KLIO_*`.
+pub fn factoryOf(site: Site) []const u8 {
+    if (site.factory.len != 0) return site.factory;
+    return switch (site.reason) {
+        .unresolved_type, .unresolved_name, .unresolved_call, .unresolved_member, .receiver_unresolved => "UNRESOLVED_REFERENCE",
+        .no_applicable => "NONE_APPLICABLE",
+        .ambiguous => "OVERLOAD_RESOLUTION_AMBIGUITY",
+        .unresolved_receiver => "UNRESOLVED_LABEL",
+        .unresolved_operator => operatorFactory(site.name),
+        .uninferred => "CANNOT_INFER_PARAMETER_TYPE",
+        .unresolved_import => "UNRESOLVED_IMPORT",
+        .unsupported => "KLIO_UNSUPPORTED",
+        .missing_builtin => "KLIO_MISSING_BUILTIN",
+        .unrecorded => "KLIO_UNRECORDED",
+        .expect_actual_mismatch => "ACTUAL_MISSING",
+        .conflicting_overloads => "CONFLICTING_OVERLOADS",
+        .expect_no_actual => "NO_ACTUAL_FOR_EXPECT",
+        .invisible => "INVISIBLE_REFERENCE",
+        .reified_param => "TYPE_PARAMETER_AS_REIFIED",
+        .type_mismatch => "TYPE_MISMATCH",
+        .non_exhaustive_when => "NO_ELSE_IN_WHEN",
+        .when_guard => "WHEN_GUARD_WITHOUT_SUBJECT",
+        .member_hidden => "VIRTUAL_MEMBER_HIDDEN",
+    };
+}
+
+/// kotlinc's diagnostic for an operator convention no function answers.
+fn operatorFactory(name: []const u8) []const u8 {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "get")) return "NO_GET_METHOD";
+    if (eql(u8, name, "set")) return "NO_SET_METHOD";
+    if (eql(u8, name, "iterator")) return "ITERATOR_MISSING";
+    if (eql(u8, name, "next")) return "NEXT_MISSING";
+    if (eql(u8, name, "hasNext")) return "HAS_NEXT_MISSING";
+    if (std.mem.startsWith(u8, name, "component")) return "COMPONENT_FUNCTION_MISSING";
+    if (eql(u8, name, "getValue") or eql(u8, name, "setValue") or eql(u8, name, "provideDelegate")) return "DELEGATE_SPECIAL_FUNCTION_MISSING";
+    return "UNRESOLVED_REFERENCE";
+}
 
 pub const Census = struct {
     arena: Allocator,
     counts: [std.meta.fields(Reason).len]u64 = @splat(0),
-    /// Every site, in the order reported. The dump and the per-file totals
-    /// read this; the counts above are its histogram.
+    /// Every error site, in the order reported. The dump and the per-file
+    /// totals read this; the counts above are its histogram.
     sites: std.ArrayList(Site) = .empty,
+    /// The warning sites, in the order reported: diagnostics only, never
+    /// counted.
+    warnings: std.ArrayList(Site) = .empty,
     /// Sites resolved, for the ratio the census prints.
     resolved: u64 = 0,
     /// Non-zero while an expression is analyzed only to learn its type:
@@ -139,6 +205,7 @@ pub const Census = struct {
             try b.sites.append(self.arena, site);
             return;
         }
+        if (site.severity == .warning) return self.warnings.append(self.arena, site);
         self.counts[@intFromEnum(site.reason)] += 1;
         try self.sites.append(self.arena, site);
     }
@@ -152,13 +219,35 @@ pub const Census = struct {
     pub fn reportFacts(self: *Census, reason: Reason, file: u32, sp: span.Span, facts: Facts, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
         if (self.muted != 0) return;
         const detail = try std.fmt.allocPrint(self.arena, fmt, args);
-        return self.reportSite(.{ .reason = reason, .file = file, .sp = sp, .detail = detail, .name = facts.name, .on = facts.on, .arg_types = facts.arg_types, .syms = facts.syms, .message = facts.message });
+        return self.reportSite(.{
+            .reason = reason,
+            .file = file,
+            .sp = sp,
+            .detail = detail,
+            .name = facts.name,
+            .on = facts.on,
+            .arg_types = facts.arg_types,
+            .syms = facts.syms,
+            .message = facts.message,
+            .factory = facts.factory,
+            .severity = facts.severity,
+            .related = facts.related,
+            .notes = facts.notes,
+        });
     }
 
-    /// Drops every site reported after the first `n`.
-    pub fn truncate(self: *Census, n: usize) void {
-        for (self.sites.items[n..]) |site| self.counts[@intFromEnum(site.reason)] -= 1;
-        self.sites.shrinkRetainingCapacity(n);
+    /// How many sites of each severity are reported so far, for `truncate`.
+    pub const Mark = struct { sites: usize, warnings: usize };
+
+    pub fn mark(self: *const Census) Mark {
+        return .{ .sites = self.sites.items.len, .warnings = self.warnings.items.len };
+    }
+
+    /// Drops every site reported after `m`.
+    pub fn truncate(self: *Census, m: Mark) void {
+        for (self.sites.items[m.sites..]) |site| self.counts[@intFromEnum(site.reason)] -= 1;
+        self.sites.shrinkRetainingCapacity(m.sites);
+        self.warnings.shrinkRetainingCapacity(m.warnings);
     }
 
     pub fn missingBuiltin(self: *Census, fqn: []const u8) Allocator.Error!void {
@@ -186,4 +275,29 @@ test "the census counts by reason" {
     try std.testing.expectEqual(@as(u64, 2), c.total());
     try std.testing.expectEqual(@as(u64, 1), c.count(.unsupported));
     try std.testing.expectEqualStrings("construct when", c.sites.items[1].detail);
+}
+
+test "a warning is kept apart from the counted sites" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var c = Census.init(arena.allocator());
+    const sp = span.Span.init(span.FileId.from(0), 1, 2);
+    const m = c.mark();
+    try c.reportFacts(.type_mismatch, 0, sp, .{ .factory = "UNCHECKED_CAST", .severity = .warning }, "cast", .{});
+    try c.report(.unresolved_name, 0, sp, "x");
+    try std.testing.expectEqual(@as(u64, 1), c.total());
+    try std.testing.expectEqual(@as(usize, 1), c.warnings.items.len);
+    try std.testing.expectEqualStrings("UNCHECKED_CAST", factoryOf(c.warnings.items[0]));
+    c.truncate(m);
+    try std.testing.expectEqual(@as(u64, 0), c.total());
+    try std.testing.expectEqual(@as(usize, 0), c.warnings.items.len);
+}
+
+test "a site is named by its reason unless it names itself" {
+    const sp = span.Span.init(span.FileId.from(0), 1, 2);
+    try std.testing.expectEqualStrings("UNRESOLVED_REFERENCE", factoryOf(.{ .reason = .unresolved_type, .file = 0, .sp = sp, .detail = "" }));
+    try std.testing.expectEqualStrings("NO_GET_METHOD", factoryOf(.{ .reason = .unresolved_operator, .file = 0, .sp = sp, .detail = "", .name = "get" }));
+    try std.testing.expectEqualStrings("COMPONENT_FUNCTION_MISSING", factoryOf(.{ .reason = .unresolved_operator, .file = 0, .sp = sp, .detail = "", .name = "component2" }));
+    try std.testing.expectEqualStrings("UNRESOLVED_REFERENCE", factoryOf(.{ .reason = .unresolved_operator, .file = 0, .sp = sp, .detail = "", .name = "plus" }));
+    try std.testing.expectEqualStrings("NO_THIS", factoryOf(.{ .reason = .unresolved_receiver, .file = 0, .sp = sp, .detail = "", .factory = "NO_THIS" }));
 }

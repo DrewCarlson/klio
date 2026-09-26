@@ -652,7 +652,7 @@ fn checkDelegateValue(ctx: *Ctx, d: *const Expr, got: TypeId, declared: TypeId) 
     const g = try infer.zonk(s, got);
     if (infer.hasOpenVar(s, g) or try subtyping.isSubtype(s, g, declared)) return;
     const msg = try std.fmt.allocPrint(s.arena, "the delegate's `getValue` returns `{s}`, but the property is a `{s}`", .{ try sema_mod.diagnose.typeText(s, s.arena, g), try sema_mod.diagnose.typeText(s, s.arena, declared) });
-    try ctx.reportFacts(.type_mismatch, d.span(), .{ .message = msg }, "{s}", .{msg});
+    try ctx.reportFacts(.type_mismatch, d.span(), .{ .message = msg, .factory = "DELEGATE_SPECIAL_FUNCTION_RETURN_TYPE_MISMATCH" }, "{s}", .{msg});
 }
 
 /// The type an expression body gives a function that does not write one.
@@ -2473,7 +2473,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
             if (w.subject == null) {
                 try ctx.reportFacts(.when_guard, g.span, .{ .message = "guard statements are only allowed in 'when' with subject." }, "guard", .{});
             } else if (br.patterns.len > 1) {
-                try ctx.reportFacts(.when_guard, g.span, .{ .message = "use of comma in 'when' condition with guard statement is not allowed." }, "guard", .{});
+                try ctx.reportFacts(.when_guard, g.span, .{ .message = "use of comma in 'when' condition with guard statement is not allowed.", .factory = "COMMA_IN_WHEN_CONDITION_WITH_WHEN_GUARD" }, "guard", .{});
             }
             // The guard sees what the patterns establish; the body sees
             // what the guard does too.
@@ -2588,7 +2588,7 @@ fn objectExpr(ctx: *Ctx, o: *const ast.ObjectLiteral) Allocator.Error!TypeId {
 fn thisExpr(ctx: *Ctx, qualifier: ?ast.Ident, sp: Span) Allocator.Error!TypeId {
     const s = ctx.s;
     const r = (try thisReceiver(ctx, qualifier)) orelse {
-        try ctx.report(.unresolved_receiver, sp, "this{s}{s}", .{ if (qualifier != null) "@" else "", if (qualifier) |q| q.name else "" });
+        try ctx.reportFacts(.unresolved_receiver, sp, .{ .factory = if (qualifier != null) "UNRESOLVED_LABEL" else "NO_THIS" }, "this{s}{s}", .{ if (qualifier != null) "@" else "", if (qualifier) |q| q.name else "" });
         return s.types.errType();
     };
     try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = .this_, .target = r.owner, .dispatch = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } } });
@@ -3602,7 +3602,7 @@ fn isCheckType(ctx: *Ctx, tr: *const ast.TypeRef, quiet: bool) Allocator.Error!T
 
 pub fn resolveTypeInBodyQuiet(ctx: *Ctx, tr: *const ast.TypeRef) Allocator.Error!TypeId {
     // Already reported when the condition resolved.
-    const before = ctx.s.census.sites.items.len;
+    const before = ctx.s.census.mark();
     const t = try resolveTypeInBody(ctx, tr);
     ctx.s.census.truncate(before);
     return t;

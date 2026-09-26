@@ -208,7 +208,7 @@ const itests_files = [_]Itest{
         "parity_operator_edge_cases", "parity_properties_accessors", "parity_sealed_when_patterns", "parity_strings_numbers",
         "parity_stdlib_isolation",    "parity_suspend_shapes",       "parity_type_system_shapes",   "parity_visibility_modifiers",
     } },
-    .{ .name = "group_lang_features", .needs_exe = true, .home = true, .weight = 3, .fuzz_env = true, .dirs = &.{"examples"}, .members = &.{
+    .{ .name = "group_lang_features", .needs_exe = true, .home = true, .weight = 3, .fuzz_env = true, .dirs = &.{ "examples", "tests/fixtures/check_sema" }, .members = &.{
         "explicit_backing_fields", "annotation_targets", "context_parameters",
         "resolve_ambiguity",       "check_examples",     "fuzz_closures_suspend",
     } },
@@ -247,7 +247,7 @@ const itests_files = [_]Itest{
     .{ .name = "parser_corpus", .rss_cap_kb = null, .interprets = false },
     .{ .name = "runtime_objref_threads", .rss_cap_kb = null, .interprets = false },
     .{ .name = "typeck_negative", .rss_cap_kb = null, .interprets = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
-    .{ .name = "check_examples", .needs_exe = true, .home = true, .dirs = &.{"examples"}, .weight = 2 },
+    .{ .name = "check_examples", .needs_exe = true, .home = true, .dirs = &.{ "examples", "tests/fixtures/check_sema" }, .weight = 2 },
     .{ .name = "differential", .needs_exe = true, .home = true, .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" }, .weight = 24 },
     .{ .name = "fuzz_closures_suspend", .needs_exe = true, .home = true, .fuzz_env = true, .weight = 2 },
     // End-to-end ktor gate: child `klio` + in-test HTTP server + installed packs.

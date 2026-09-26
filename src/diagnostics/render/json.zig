@@ -32,6 +32,20 @@ pub fn render(
         try s.appendSlice(allocator, "},\"end\":{");
         try appendFmt(allocator, &s, "\"line\":{d},\"col\":{d}", .{ end.line, end.col });
         try s.appendSlice(allocator, "}}");
+        if (d.secondary.items.len != 0) {
+            try s.appendSlice(allocator, ",\"related\":[");
+            for (d.secondary.items, 0..) |sec, i| {
+                if (i > 0) try s.append(allocator, ',');
+                const sfile = sources.getChecked(sec.span.file) orelse file;
+                const slc = sfile.lineCol(sec.span.start);
+                const path = try jsonString(allocator, sfile.path);
+                defer allocator.free(path);
+                const msg = try jsonString(allocator, sec.message);
+                defer allocator.free(msg);
+                try appendFmt(allocator, &s, "{{\"file\":{s},\"line\":{d},\"col\":{d},\"message\":{s}}}", .{ path, slc.line, slc.col, msg });
+            }
+            try s.append(allocator, ']');
+        }
         if (d.notes.items.len != 0) {
             try s.appendSlice(allocator, ",\"notes\":[");
             for (d.notes.items, 0..) |n, i| {
@@ -156,4 +170,20 @@ test "json string escapes control chars" {
     const s = try jsonString(a, "a\"b\\c\nd\te\x01f");
     defer a.free(s);
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\nd\\te\\u0001f\"", s);
+}
+
+test "json render lists the related places" {
+    const a = std.testing.allocator;
+    var sm = SourceMap.init(a);
+    defer sm.deinit();
+    const id = try sm.add("x.kt", "fun f() {}\nfun f() {}\n");
+    var d = Diagnostic.fromFactory(&diag.generated.CONFLICTING_OVERLOADS, span.Span.init(id, 4, 5));
+    defer d.deinit(a);
+    _ = try d.withLabel(a, span.Span.init(id, 15, 16), "also declared here");
+    d.message = "conflicting overloads";
+    const s = try toString(a, &.{d}, &sm);
+    defer a.free(s);
+    const expected =
+        "{\"factory\":\"CONFLICTING_OVERLOADS\",\"legacy_code\":\"\",\"severity\":\"error\",\"file\":\"x.kt\",\"message\":\"conflicting overloads\",\"range\":{\"start\":{\"line\":1,\"col\":5},\"end\":{\"line\":1,\"col\":6}},\"related\":[{\"file\":\"x.kt\",\"line\":2,\"col\":5,\"message\":\"also declared here\"}]}\n";
+    try std.testing.expectEqualStrings(expected, s);
 }

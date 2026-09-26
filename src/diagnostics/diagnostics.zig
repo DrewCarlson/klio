@@ -36,6 +36,51 @@ pub const DiagnosticFactory = struct {
     message_template: []const u8,
 };
 
+/// Factories outside the frontend's `FirErrors`: what kotlinc reports from
+/// its later phases, and what klio reports of itself (`KLIO_*`).
+pub const extra = struct {
+    pub const NO_ACTUAL_FOR_EXPECT = DiagnosticFactory{
+        .name = "NO_ACTUAL_FOR_EXPECT",
+        .default_severity = .Error,
+        .message_template = "Expected {0} has no actual declaration in module {1}.",
+    };
+    pub const KLIO_UNSUPPORTED = DiagnosticFactory{
+        .name = "KLIO_UNSUPPORTED",
+        .default_severity = .Error,
+        .message_template = "klio does not support {0} yet.",
+    };
+    pub const KLIO_MISSING_BUILTIN = DiagnosticFactory{
+        .name = "KLIO_MISSING_BUILTIN",
+        .default_severity = .Error,
+        .message_template = "The base declares no ''{0}''.",
+    };
+    pub const KLIO_UNRECORDED = DiagnosticFactory{
+        .name = "KLIO_UNRECORDED",
+        .default_severity = .Error,
+        .message_template = "Internal error: {0} was resolved without a record.",
+    };
+    pub const KLIO_CANNOT_RUN = DiagnosticFactory{
+        .name = "KLIO_CANNOT_RUN",
+        .default_severity = .Error,
+        .message_template = "klio cannot run ''{0}'': {1}",
+    };
+};
+
+const all_factories = generated.FACTORIES ++ blk: {
+    const e = @typeInfo(extra).@"struct".decls;
+    var list: [e.len]*const DiagnosticFactory = undefined;
+    for (e, 0..) |d, i| list[i] = &@field(extra, d.name);
+    break :blk list;
+};
+
+/// The factory named `name`: kotlinc's, or klio's own.
+pub fn factoryByName(name: []const u8) ?*const DiagnosticFactory {
+    for (all_factories) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f;
+    }
+    return null;
+}
+
 pub const Label = struct {
     span: Span,
     message: []const u8,
@@ -274,6 +319,13 @@ test "sink collects and reports errors" {
 
 test "factories module wired" {
     try std.testing.expect(generated.FACTORIES.len > 0);
+}
+
+test "a factory is found by its name, kotlinc's or klio's" {
+    try std.testing.expectEqual(&generated.UNRESOLVED_REFERENCE, factoryByName("UNRESOLVED_REFERENCE").?);
+    try std.testing.expectEqual(&extra.NO_ACTUAL_FOR_EXPECT, factoryByName("NO_ACTUAL_FOR_EXPECT").?);
+    try std.testing.expectEqual(Severity.Error, factoryByName("KLIO_UNSUPPORTED").?.default_severity);
+    try std.testing.expect(factoryByName("NOT_A_FACTORY") == null);
 }
 
 test {

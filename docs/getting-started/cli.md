@@ -9,7 +9,7 @@ the live list.
 |-------------------------|------------------------------------------------------------------------------------------|
 | `klio run <files...>`   | Execute one or more Kotlin files as a single module.                                     |
 | `klio test <file\|dir...>` | Run `kotlin.test` `@Test` functions; see [Testing](../testing.md).                    |
-| `klio check <files...>` | Resolve + type-check, emit diagnostics. Exits non-zero on error. `--format plain\|json\|sarif`. |
+| `klio check <files...>` | Resolve + type-check, emit diagnostics. Exits non-zero on error. `--format plain\|json\|sarif`; `--engine sema` analyzes as `klio run` does and names kotlinc's diagnostics. |
 | `klio lex <file>`       | Print the lexer's token stream.                                                          |
 | `klio parse <file>`     | Print the parser's AST.                                                                  |
 | `klio dump-ir <file>`   | Lower a program and print its functions' IR without executing (`--func N` for one function, `--all` for the base's too); tallies DIRECT vs DYNAMIC call sites. |
