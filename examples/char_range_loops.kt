@@ -1,6 +1,7 @@
 // Char ranges iterate as counted register loops: literal `'a'..'z'`,
 // `downTo`, `until`, and a hoisted CharRange all avoid the iterator
-// protocol; a stepped char progression keeps it and must agree.
+// protocol; a stepped char progression counts from its first, last and
+// step, and must agree.
 fun main() {
     var sum = 0
     for (c in 'a'..'z') sum += c.code

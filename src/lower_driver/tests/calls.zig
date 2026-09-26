@@ -536,6 +536,50 @@ test "a callee the bridge gave no identity fails the choice" {
     try testing.expectError(error.Unrecorded, fx.choose(.none, .plain));
 }
 
+test "a for over a standard progression counts, calling no iterator" {
+    // The fixture's base has no ranges: the progression the loops would walk
+    // is declared where the standard library's is.
+    const fx = try Fixture.init(
+        \\package kotlin.ranges
+        \\abstract class IntIterator {
+        \\    abstract operator fun hasNext(): Boolean
+        \\    abstract operator fun next(): Int
+        \\}
+        \\abstract class IntProgression(val first: Int, val last: Int, val step: Int) {
+        \\    abstract operator fun iterator(): IntIterator
+        \\}
+        \\infix fun Int.until(to: Int): IntProgression = until(this, to)
+        \\infix fun Int.downTo(to: Int): IntProgression = downTo(this, to)
+        \\fun until(from: Int, to: Int): IntProgression = until(from, to)
+        \\fun downTo(from: Int, to: Int): IntProgression = downTo(from, to)
+        \\fun consume(x: Int) {}
+        \\fun loops(n: Int) {
+        \\    for (i in 0 until n) consume(i)
+        \\    for (i in n downTo 0) consume(i)
+        \\}
+    );
+    defer fx.deinit();
+    const pkg = fx.s.syms.package_by_fqn.get(fx.name("kotlin.ranges")).?;
+    const inRanges = struct {
+        fn f(x: *Fixture, p: Sym, n: []const u8) !Sym {
+            const found = sema.scope.membersOf(x.s, p, x.name(n));
+            try testing.expect(found.len != 0);
+            try sema.headers.functionHeader(x.s, found[0]);
+            return found[0];
+        }
+    }.f;
+    const l = try Lowered.ofSym(fx, try inRanges(fx, pkg, "loops"));
+    // The iterator protocol is virtual: `iterator()` on the progression,
+    // `hasNext()` and `next()` on its iterator.
+    try testing.expectEqual(@as(usize, 0), (try l.all(.RCallVirtual)).len);
+    try testing.expectEqual(@as(usize, 0), (try l.all(.CallInterface)).len);
+    // `until` and `downTo` make no progression: the loops call only `consume`.
+    const calls = try l.all(.CallStatic);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    const consume = ir.FuncId.from((try inRanges(fx, pkg, "consume")).int());
+    for (calls) |c| try testing.expectEqual(consume, c.CallStatic.func);
+}
+
 // ------------------------------------------- written calls through the spine --
 
 /// A top-level function of `demo` lowered through the spine over sema's

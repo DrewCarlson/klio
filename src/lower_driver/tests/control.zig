@@ -708,6 +708,34 @@ test "adds, subtracts and compares give Kotlin's answers for every operand pairi
     );
 }
 
+test "a counted for loop keeps Kotlin's bounds, captures and evaluation order" {
+    try expectRun(
+        \\fun bound(x: Int): Int { println("bound " + x); return x }
+        \\fun main() {
+        \\    var seen = ""
+        \\    for (i in Int.MAX_VALUE - 1..Int.MAX_VALUE) seen = seen + (i - Int.MAX_VALUE) + " "
+        \\    for (i in Int.MIN_VALUE + 1 downTo Int.MIN_VALUE) seen = seen + (i - Int.MIN_VALUE) + " "
+        \\    for (i in 0 until Int.MIN_VALUE) seen = seen + "never"
+        \\    for (i in 3..1) seen = seen + "never"
+        \\    for (i in 1..<3) seen = seen + i
+        \\    for (i in 10 downTo 0 step 4) seen = seen + i
+        \\    println(seen)
+        \\    var first: () -> Int = { -1 }
+        \\    var last: () -> Int = { -1 }
+        \\    for (i in 0 until 3) {
+        \\        if (i == 0) first = { i * 10 }
+        \\        if (i == 2) last = { i * 10 }
+        \\    }
+        \\    println("" + first() + " " + last())
+        \\    var walked = ""
+        \\    for (i in bound(1)..bound(2)) walked = walked + i
+        \\    println(walked)
+        \\}
+    ,
+        "-1 0 1 0 121062\n0 20\nbound 1\nbound 2\n12\n",
+    );
+}
+
 test "statics, init-guarded calls, captures and class tests read in place give Kotlin's answers" {
     // The first call into another file runs that file's initializer; later reads, a write
     // and a lambda's captures read in place; `is` and `as` settle nulls and instances in

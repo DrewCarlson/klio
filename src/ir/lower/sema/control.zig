@@ -351,6 +351,7 @@ pub fn lowerFor(b: *Builder, e: *const ast.Expr) Error!Reg {
 fn loopFor(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     const f = e.For;
     const g = try b.forGroup(f.id);
+    if (try countedFor(b, e, &g)) |c| return loopCounted(b, e, label, c);
     const groups = try compose.LoopGroups.begin(b, e, f.body, label);
     const src = try body.lowerExpr(b, f.iter);
     const iter = try operator.callOn(b, &g.iterator, src, &.{});
@@ -375,6 +376,191 @@ fn loopFor(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     }
     try loopBody(b, f.body, label, exit, head, groups);
     if (!b.terminated()) b.terminate(.{ .Goto = head });
+    b.switchTo(exit);
+    try groups.end(b);
+    return b.unit();
+}
+
+/// A `for` over an integer or character progression of the standard
+/// library's, which counts, as kotlinc compiles it: `a..b`, `a..<b`,
+/// `a until b` and `a downTo b` make no progression at all, and another
+/// progression (`step`, `indices`, a range held in a variable) has its
+/// `first`, `last` and `step` read once, where its iterator would read them.
+const Counted = struct {
+    kind: enum { up_until, up_to, down_to, progression },
+    /// The start of a direct form, or the progression.
+    from: *const ast.Expr,
+    /// The bound of a direct form.
+    to: ?*const ast.Expr = null,
+    prim: operator.Prim,
+    /// The progression's class (`IntProgression`, ...), for `progression`.
+    cls: Sym = .none,
+};
+
+fn countedFor(b: *Builder, e: *const ast.Expr, g: *const records.ForGroup) Error!?Counted {
+    const f = e.For;
+    if (f.vars.len != 1 or f.destructured) return null;
+    const s = b.p.s;
+    // The iterator is a standard progression's (their classes cannot be
+    // extended outside the standard library).
+    const cls = s.syms.owner(g.iterator.callee);
+    if (cls == .none or s.syms.kind(cls) != .class) return null;
+    const fqn = s.str(s.syms.classInfo(cls).fqn);
+    const prim: operator.Prim = if (std.mem.eql(u8, fqn, "kotlin.ranges.IntProgression"))
+        .int
+    else if (std.mem.eql(u8, fqn, "kotlin.ranges.LongProgression"))
+        .long
+    else if (std.mem.eql(u8, fqn, "kotlin.ranges.CharProgression"))
+        .char
+    else
+        return null;
+    switch (f.iter.*) {
+        .Binary => |x| if (x.op == .Range or x.op == .RangeUntil) {
+            const rec = try b.call(f.iter.id());
+            const want = if (x.op == .Range) "rangeTo" else "rangeUntil";
+            if (primRangeMember(s, rec.callee, prim, want)) {
+                return .{ .kind = if (x.op == .Range) .up_to else .up_until, .from = x.lhs, .to = x.rhs, .prim = prim };
+            }
+        },
+        .Call => |c| if (c.is_infix and c.args.len == 2) {
+            const rec = try b.call(f.iter.id());
+            const n = s.str(s.syms.name(rec.callee));
+            const until = std.mem.eql(u8, n, "until");
+            if ((until or std.mem.eql(u8, n, "downTo")) and rangesExtension(s, rec.callee, prim)) {
+                return .{ .kind = if (until) .up_until else .down_to, .from = &c.args[0], .to = &c.args[1], .prim = prim };
+            }
+        },
+        else => {},
+    }
+    return .{ .kind = .progression, .from = f.iter, .prim = prim, .cls = cls };
+}
+
+/// `rangeTo`/`rangeUntil` of the primitive class, on an operand of its own type.
+fn primRangeMember(s: *sema.Sema, callee: Sym, prim: operator.Prim, want: []const u8) bool {
+    if (s.syms.kind(callee) != .function or !std.mem.eql(u8, s.str(s.syms.name(callee)), want)) return false;
+    const owner = s.syms.owner(callee);
+    if (owner == .none or s.syms.kind(owner) != .class or operator.primOfClass(s, owner) != prim) return false;
+    return onePrimParam(s, callee, prim);
+}
+
+/// `until`/`downTo` of `kotlin.ranges` on the primitive, with a bound of its type.
+fn rangesExtension(s: *sema.Sema, callee: Sym, prim: operator.Prim) bool {
+    if (s.syms.kind(callee) != .function) return false;
+    const owner = s.syms.owner(callee);
+    if (owner == .none or s.syms.kind(owner) != .package) return false;
+    if (!std.mem.eql(u8, s.str(s.syms.packageInfo(owner).fqn), "kotlin.ranges")) return false;
+    const info = s.syms.functionInfo(callee);
+    if (info.receiver == .none or s.types.isNullable(info.receiver) or operator.primOf(s, info.receiver) != prim) return false;
+    return onePrimParam(s, callee, prim);
+}
+
+fn onePrimParam(s: *sema.Sema, callee: Sym, prim: operator.Prim) bool {
+    const info = s.syms.functionInfo(callee);
+    if (info.params.len != 1 or info.type_params.len != 0) return false;
+    const pt = sema.headers.paramType(s, info.params[0]) catch return false;
+    return !s.types.isNullable(pt) and operator.primOf(s, pt) == prim;
+}
+
+/// A property of the progression class, by name.
+fn progressionProperty(b: *Builder, cls: Sym, n: []const u8) Error!Sym {
+    const s = b.p.s;
+    const key = try s.names.intern(n);
+    if (s.syms.classInfo(cls).members.get(key)) |list| {
+        for (list.items) |m| if (s.syms.kind(m) == .property) return m;
+    }
+    return b.fail(b.cur_span, "no `{s}` on the progression class", .{n});
+}
+
+/// The counting loop: whether an element is left and the element are kept
+/// in registers; the flag is tested where `hasNext()` would be called (in
+/// the same replace group, when each iteration has one), and a step clears
+/// it at the bound before it moves the count, so the count never passes
+/// the type's range.
+fn loopCounted(b: *Builder, e: *const ast.Expr, label: ?[]const u8, c: Counted) Error!Reg {
+    const f = e.For;
+    const groups = try compose.LoopGroups.begin(b, e, f.body, label);
+    const i = b.newReg();
+    const bound = b.newReg();
+    const step = b.newReg();
+    const more = b.newReg();
+    switch (c.kind) {
+        .up_until, .up_to, .down_to => {
+            const lo = try body.lowerExpr(b, c.from);
+            const hi = try body.lowerExpr(b, c.to.?);
+            try b.emit(.{ .Move = .{ .dst = i, .src = lo } });
+            try b.emit(.{ .Move = .{ .dst = bound, .src = hi } });
+            const op: ir.BinOp = switch (c.kind) {
+                .up_until => .Less,
+                .up_to => .LessEq,
+                else => .GreaterEq,
+            };
+            try b.emit(.{ .BinOp = .{ .dst = more, .op = op, .lhs = i, .rhs = bound } });
+        },
+        .progression => {
+            const p = try body.lowerExpr(b, c.from);
+            const read = struct {
+                fn prop(bb: *Builder, cls: Sym, n: []const u8, recv: Reg) Error!Reg {
+                    const nr: records.NameRec = .{ .kind = .property, .target = try progressionProperty(bb, cls, n), .dispatch = .expr };
+                    return name.read(bb, &nr, recv);
+                }
+            };
+            try b.emit(.{ .Move = .{ .dst = i, .src = try read.prop(b, c.cls, "first", p) } });
+            try b.emit(.{ .Move = .{ .dst = bound, .src = try read.prop(b, c.cls, "last", p) } });
+            try b.emit(.{ .Move = .{ .dst = step, .src = try read.prop(b, c.cls, "step", p) } });
+            // Empty when the first element is already past the last one in
+            // the step's direction.
+            const zero = try b.emitConst(if (c.prim == .long) .{ .Long = 0 } else .{ .Int = 0 });
+            const up = b.newReg();
+            try b.emit(.{ .BinOp = .{ .dst = up, .op = .Greater, .lhs = step, .rhs = zero } });
+            const on_up = try b.newBlock();
+            const on_down = try b.newBlock();
+            const join = try b.newBlock();
+            b.terminate(.{ .Branch = .{ .cond = up, .t = on_up, .f = on_down } });
+            b.switchTo(on_up);
+            try b.emit(.{ .BinOp = .{ .dst = more, .op = .LessEq, .lhs = i, .rhs = bound } });
+            b.terminate(.{ .Goto = join });
+            b.switchTo(on_down);
+            try b.emit(.{ .BinOp = .{ .dst = more, .op = .GreaterEq, .lhs = i, .rhs = bound } });
+            b.terminate(.{ .Goto = join });
+            b.switchTo(join);
+        },
+    }
+    const head = try b.newBlock();
+    const body_blk = try b.newBlock();
+    const next = try b.newBlock();
+    const exit = try b.newBlock();
+    b.terminate(.{ .Goto = head });
+    b.switchTo(head);
+    if (groups.per_iteration) try compose.startReplaceGroup(b, f.iter.span());
+    const test_more = b.newReg();
+    try b.emit(.{ .Move = .{ .dst = test_more, .src = more } });
+    if (groups.per_iteration) {
+        b.compose_open -= 1;
+        try compose.endReplaceGroupCall(b);
+    }
+    b.terminate(.{ .Branch = .{ .cond = test_more, .t = body_blk, .f = exit } });
+    b.switchTo(body_blk);
+    const elem = b.newReg();
+    try b.emit(.{ .Move = .{ .dst = elem, .src = i } });
+    try env.bindLocal(b, try b.decl(f.id), elem);
+    try loopBody(b, f.body, label, exit, next, groups);
+    if (!b.terminated()) b.terminate(.{ .Goto = next });
+    b.switchTo(next);
+    switch (c.kind) {
+        .up_until => {
+            try b.emit(.{ .UnOp = .{ .dst = i, .op = .Inc, .operand = i } });
+            try b.emit(.{ .BinOp = .{ .dst = more, .op = .Less, .lhs = i, .rhs = bound } });
+        },
+        .up_to, .down_to => {
+            try b.emit(.{ .BinOp = .{ .dst = more, .op = .NotEq, .lhs = i, .rhs = bound } });
+            try b.emit(.{ .UnOp = .{ .dst = i, .op = if (c.kind == .up_to) .Inc else .Dec, .operand = i } });
+        },
+        .progression => {
+            try b.emit(.{ .BinOp = .{ .dst = more, .op = .NotEq, .lhs = i, .rhs = bound } });
+            try b.emit(.{ .BinOp = .{ .dst = i, .op = .Add, .lhs = i, .rhs = step } });
+        },
+    }
+    b.terminate(.{ .Goto = head });
     b.switchTo(exit);
     try groups.end(b);
     return b.unit();
