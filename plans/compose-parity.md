@@ -140,9 +140,7 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
    timeout-driven gestures.
 8. Not verified anywhere: running on Windows (the shim's link needs the MSVC
    toolchain the Windows Skia prebuilt is built with), a Wayland session.
-9. The long tail in Inventory: foundation's TooltipArea, ContextMenuProvider,
-   BasicContextMenuRepresentation, text/ContextMenu; the skia interop;
-   runtime-retain's `retain`.
+9. The long tail in Inventory: the skia interop; runtime-retain's `retain`.
 10. Done: compose_foundation's four failures. The selection handle tests
     needed desktopTest's SelectionHandleShape actual. The focus-indication
     tests needed two interpreter fixes: `super.equals` in a class whose
@@ -153,10 +151,11 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
     and the system theme (below); (b) the resource loaders (ui desktopMain
     res/: painterResource, loadSvgPainter over skia's SVGDOM,
     loadXmlImageVector, loadImageBitmap, which need an InputStream, a
-    resource lookup and an XML DOM), foundation's TooltipArea and
-    ContextMenuProvider (java-free, take them as they are),
-    BasicContextMenuRepresentation and text/ContextMenu without Swing, and
-    WindowDraggableArea over klio's window move; (c) the accessibility
+    resource lookup and an XML DOM); done: foundation's TooltipArea and
+    ContextMenuProvider as they are, BasicContextMenuRepresentation and
+    text/ContextMenu without their Swing menus (a text field's context menu
+    is upstream's), and WindowDraggableArea over a klio window's move with
+    the mouse; (c) the accessibility
     bridge (the semantics tree to NSAccessibility, UI Automation and
     AT-SPI); (d) pointer icons (`PlatformContext.setPointerIcon`), drag and
     drop between applications; (e) a Windows run (item 8).
@@ -255,11 +254,11 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 |--------|-----------:|----------:|-----------:|------------------------:|
 | runtime | 188 / 188 | n/a | 6 / 9, nonAndroid 10 / 10 | jvmAndAndroid 3 java-free; klio actuals |
 | runtime-saveable | 9 / 9 | n/a | n/a | n/a |
-| ui | 244 / 244 | 92 / 92 | 8 / 8 | 88 / 175 |
+| ui | 244 / 244 | 92 / 92 | 8 / 8 | 89 / 175 |
 | ui-graphics | 82 / 82 | 19 / 19, skikoExcludingWeb 1 / 1 | 1 / 1 | 0 / 7 |
 | ui-text | 79 / 79 | 28 / 28 | 5 / 5, native 6 / 6 | 0 / 15 |
 | ui-unit, ui-util, ui-geometry | complete | n/a | complete, ui-unit nonAndroid 2 / 2 | n/a |
-| foundation | 354 / 354 | 127 / 127 | 8 / 8 | 28 / 37 |
+| foundation | 354 / 354 | 127 / 127 | 8 / 8 | 33 / 37 |
 | foundation-layout | 32 / 32 | 2 / 2 | 1 / 1 | n/a |
 | animation, animation-core | complete | n/a | complete, animation nonAndroid 2 / 2 | n/a |
 | material3 | 251 / 251 | 97 / 97 | 4 / 4 | 0 / 2 (java.text) |
@@ -275,15 +274,15 @@ over atomicfu, the desktop frame clock and the error logger;
 animation-core's current-thread token; ui-util's tracing. Not in the checkout yet:
 runtime-annotation (klio's `Stable`/`Immutable`/lint markers stand in) and
 runtime-retain (klio carries only the store interface the ui owner exposes;
-the `retain` composables are missing). foundation's desktopMain files left:
-TooltipArea, ContextMenuProvider, BasicContextMenuRepresentation and
-text/ContextMenu (with the upstream scene and a Swing-free popup menu);
-DesktopScrollable and TextFieldKeyInput, adapted in klioMain with their
-AWT calls replaced; ClipboardUtils, adapted over
-klio.datatransfer; WindowDraggableArea (AWT window dragging).
+the `retain` composables are missing). foundation's desktopMain files adapted in klioMain:
+DesktopScrollable and TextFieldKeyInput with their AWT calls replaced;
+ClipboardUtils over klio.datatransfer; BasicContextMenuRepresentation and
+text/ContextMenu without JPopupContextMenuRepresentation and JPopupTextMenu;
+WindowDraggableArea over a klio window.
 
-Public API still missing: foundation's `TooltipArea`, `ContextMenuArea`;
-runtime-retain's `retain`, `RetainedEffect` and the stores.
+Public API still missing: runtime-retain's `retain`, `RetainedEffect` and
+the stores; ui's resource loaders; foundation's Swing-only
+`JPopupContextMenuRepresentation` and `JPopupTextMenu`.
 
 ## Platforms
 
@@ -608,3 +607,7 @@ isTraySupported is false), and running on Windows.
   test runs, and macOS's emoji and symbols palette opens from a text field.
   The compose-ui gate's pack filter now names every pack the compose
   closure needs; a fresh home failed its install.
+- 2026-09-26: TooltipArea, ContextMenuArea and a text field's context menu
+  are upstream's, their popups placed by ui's DesktopPopup position
+  providers (Compose Desktop prints the same for both examples), and
+  WindowDraggableArea moves a klio window with the mouse.

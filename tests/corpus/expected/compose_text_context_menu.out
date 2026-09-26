@@ -1,0 +1,3 @@
+selection TextRange(0, 10)
+text hello menu, selection TextRange(0, 10)
+selection TextRange(10, 10)

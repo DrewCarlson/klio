@@ -176,6 +176,15 @@ internal class KlioApplication(
 /** The application a window composes in. */
 internal val LocalKlioApplication = staticCompositionLocalOf<KlioApplication?> { null }
 
+/**
+ * Starts moving the window whose content reads it together with the mouse,
+ * until the press is released: what foundation's WindowDraggableArea asks of
+ * a window on a press, as it asks an AWT window on Compose Desktop. Null
+ * outside a window.
+ */
+@InternalComposeUiApi
+val LocalWindowMoveWithMouse = staticCompositionLocalOf<(() -> Unit)?> { null }
+
 /** The application composition emits no UI nodes of its own. */
 private class KlioNoopApplier : AbstractApplier<Unit>(Unit) {
     override fun insertTopDown(index: Int, instance: Unit) {}
@@ -425,6 +434,7 @@ internal class KlioWindowHolder(
     val input = KlioWindowInput(scene, platformContext.windowInfo, handle, platformContext.windowTextInput).also { input ->
         input.menuShortcut = { event -> menuBar?.shortcut(event) ?: false }
         input.onFocusChanged = { updateLifecycleState() }
+        input.onMoved = { x, y -> reportFrame(this, WINDOW_EVENT_MOVE, doubleArrayOf(x.toDouble(), y.toDouble())) }
     }
 
     /** The window state this window follows and reports to. */
@@ -779,7 +789,10 @@ private fun <S : WindowScope> KlioPlatformWindow(
             if (size.height.isSpecified) size.height.value.toInt() else DEFAULT_HEIGHT,
             currentTitle,
         ) {
-            CompositionLocalProvider(LocalKlioWindowRef provides windowRef) {
+            CompositionLocalProvider(
+                LocalKlioWindowRef provides windowRef,
+                LocalWindowMoveWithMouse provides { windowRef.holder?.input?.startMovingTogetherWithMouse() },
+            ) {
                 scope.currentContent()
             }
         }
@@ -945,7 +958,7 @@ private fun applyWindowState(
  * window's own values, as desktop's component and window state listeners
  * give them.
  */
-private fun reportFrame(holder: KlioWindowHolder, type: Int, v: DoubleArray) {
+internal fun reportFrame(holder: KlioWindowHolder, type: Int, v: DoubleArray) {
     if (type == WINDOW_EVENT_PLACEMENT) {
         holder.isMinimized = v[1] != 0.0
         holder.updateLifecycleState()

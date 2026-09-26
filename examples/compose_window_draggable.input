@@ -1,0 +1,10 @@
+# Scripted input for compose_window_draggable.kt's window (KLIO_WIN_INPUT): a
+# drag on the draggable area, then a drag below it that moves nothing.
+6 press 50 20
+8 move 60 25
+10 move 80 35
+12 release 80 35
+14 press 50 80
+16 move 90 120
+18 release 90 120
+22 close

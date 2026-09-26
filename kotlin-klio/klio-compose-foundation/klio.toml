@@ -382,6 +382,8 @@ root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/nonJv
 root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/desktopMain/kotlin"
 include = [
     "androidx/compose/foundation/Overscroll.desktop.kt",
+    "androidx/compose/foundation/TooltipArea.desktop.kt",
+    "androidx/compose/foundation/ContextMenuProvider.desktop.kt",
     "androidx/compose/foundation/Clickable.desktop.kt",
     "androidx/compose/foundation/RequestFocusOnClick.desktop.kt",
     "androidx/compose/foundation/gestures/Scrollable.desktop.kt",
@@ -412,7 +414,8 @@ include = [
 ]
 
 # klioMain: the platform actuals where the desktop ones reach AWT (the
-# clipboard, typed key events, the character palette).
+# clipboard, typed key events), the context menu files without their Swing
+# popup menus, and WindowDraggableArea over a klio window.
 [[source]]
 root = "klioMain"
 

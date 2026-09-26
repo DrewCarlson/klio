@@ -100,6 +100,47 @@ internal class KlioWindowInput(
     var menuShortcut: (KeyEvent) -> Boolean = { false }
     /** The window gained or lost the focus. */
     var onFocusChanged: () -> Unit = {}
+    /** The window moved with the mouse: its frame's new top-left on the screen. */
+    var onMoved: (x: Int, y: Int) -> Unit = { _, _ -> }
+
+    /** Where the pointer last was in the window's content. */
+    private var pointerX = 0
+    private var pointerY = 0
+
+    /**
+     * A move of the window with the mouse: the window frame's top-left and the
+     * pointer on the screen (the frame's position plus the pointer's in the
+     * content) when it started. Null while the window is not moving.
+     */
+    private var move: IntArray? = null
+
+    /**
+     * Moves the window together with the mouse until the press is released, as
+     * Compose Desktop moves a window by hand: each drag moves it by as much as
+     * the pointer moved on the screen since the move started.
+     */
+    fun startMovingTogetherWithMouse() {
+        val frame = __composeui_winPosition(handle)
+        val x = (frame shr 32).toInt()
+        val y = frame.toInt()
+        move = intArrayOf(x, y, x + pointerX, y + pointerY)
+    }
+
+    private fun moveWithMouse(eventType: PointerEventType, held: Int) {
+        val m = move ?: return
+        if (eventType == PointerEventType.Release || held and 1 == 0) {
+            move = null
+            return
+        }
+        if (eventType != PointerEventType.Move) return
+        val frame = __composeui_winPosition(handle)
+        val screenX = (frame shr 32).toInt() + pointerX
+        val screenY = frame.toInt() + pointerY
+        val x = m[0] + screenX - m[2]
+        val y = m[1] + screenY - m[3]
+        __composeui_winSetPosition(handle, x, y)
+        onMoved(x, y)
+    }
 
     /** Sends a pointer, key, text, input method or focus event; the others are the window loop's. */
     fun send(type: Int, v: DoubleArray) {
@@ -129,6 +170,9 @@ internal class KlioWindowInput(
             else -> return
         }
         val button = v[5].toInt()
+        pointerX = v[1].toInt()
+        pointerY = v[2].toInt()
+        moveWithMouse(eventType, v[6].toInt())
         scene.sendPointerEvent(
             eventType = eventType,
             position = Offset(v[1].toFloat(), v[2].toFloat()),
