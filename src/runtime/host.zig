@@ -253,6 +253,14 @@ pub const IntrinsicHost = struct {
         /// Whether the calling thread's innermost pump is a blocking event loop.
         /// Null answers false.
         coroutine_on_event_loop: ?*const fn (ctx: *anyopaque) bool = null,
+        /// Marks (or clears) the block the pump dispatcher is about to run:
+        /// its `resumeWith` goes to the pump the coroutine parked on. Null
+        /// ignores it.
+        coroutine_owner_route: ?*const fn (ctx: *anyopaque, on: bool) void = null,
+        /// Posts a `Dispatchers.Main` block to the event loop on the
+        /// program's main thread; false when none runs there. Null answers
+        /// false.
+        coroutine_post_main: ?*const fn (ctx: *anyopaque, block: *const Value) std.mem.Allocator.Error!bool = null,
         /// Null runs it eagerly.
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         /// Null runs it eagerly, like a launch with no pump.
@@ -386,6 +394,15 @@ pub const IntrinsicHost = struct {
 
     pub fn coroutineOnEventLoop(self: IntrinsicHost) bool {
         if (self.vtable.coroutine_on_event_loop) |f| return f(self.ctx);
+        return false;
+    }
+
+    pub fn coroutineOwnerRoute(self: IntrinsicHost, on: bool) void {
+        if (self.vtable.coroutine_owner_route) |f| f(self.ctx, on);
+    }
+
+    pub fn coroutinePostMain(self: IntrinsicHost, block: *const Value) std.mem.Allocator.Error!bool {
+        if (self.vtable.coroutine_post_main) |f| return f(self.ctx, block);
         return false;
     }
 

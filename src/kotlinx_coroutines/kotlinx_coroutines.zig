@@ -399,6 +399,34 @@ fn onEventLoop(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .{ .Bool = ctx.host.coroutineOnEventLoop() } };
 }
 
+/// Whether the calling thread runs the program's `main`, which
+/// `Dispatchers.Main` confines its coroutines to: `Main.immediate` dispatches
+/// from any other thread only.
+fn onMainThread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    _ = ctx;
+    return .{ .ok = .{ .Bool = runtime.onProgramThread() } };
+}
+
+/// `__kxco_postMain(block)`: `Dispatchers.Main` from another thread queues
+/// `block` for the event loop on the program's main thread; false when none
+/// runs there.
+fn postMain(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 1) return .{ .err = .{ .Type = "__kxco_postMain: expected the block" } };
+    const block = ctx.args[0];
+    return .{ .ok = .{ .Bool = try ctx.host.coroutinePostMain(&block) } };
+}
+
+/// `__kxco_ownerRoute(on)`: the pump dispatcher marks the block it runs, whose
+/// `resumeWith` goes to the pump the coroutine parked on.
+fn ownerRoute(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const on = switch (ctx.args[0]) {
+        .Bool => |b| b,
+        else => return .{ .err = .{ .Type = "__kxco_ownerRoute: argument must be Boolean" } },
+    };
+    ctx.host.coroutineOwnerRoute(on);
+    return .{ .ok = .Unit };
+}
+
 /// Post a `Dispatchers.Default` runnable onto the shared worker pool. The body,
 /// its captures and its result cross threads, each shared cell mediating access
 /// through its own reader/writer lock.
@@ -526,6 +554,9 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_spawnTimeout", .f = spawnTimeoutBlock },
     .{ .fqn = "kotlinx.coroutines.__kxco_spawnTimer", .f = spawnTimerBlock },
     .{ .fqn = "kotlinx.coroutines.__kxco_onEventLoop", .f = onEventLoop },
+    .{ .fqn = "kotlinx.coroutines.__kxco_ownerRoute", .f = ownerRoute },
+    .{ .fqn = "kotlinx.coroutines.__kxco_onMainThread", .f = onMainThread },
+    .{ .fqn = "kotlinx.coroutines.__kxco_postMain", .f = postMain },
     .{ .fqn = "kotlinx.coroutines.__kxco_poolNew", .f = poolNew },
     .{ .fqn = "kotlinx.coroutines.__kxco_poolDispatch", .f = poolDispatch },
     .{ .fqn = "kotlinx.coroutines.__kxco_poolClose", .f = poolClose },

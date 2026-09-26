@@ -27,6 +27,14 @@ internal fun __kxco_spawnTimer(timeout: Boolean, block: () -> Unit) {}
 // Whether this thread runs a blocking event loop (`runBlocking`, `suspend fun
 // main`) that a delay scheduled here can wait on.
 internal fun __kxco_onEventLoop(): Boolean = false
+// Marks the block the pump dispatcher runs: the coroutine it resumes is confined
+// to the pump it parked on. Any other `resumeWith` runs on the resuming thread.
+internal fun __kxco_ownerRoute(on: Boolean) {}
+// Whether the calling thread runs the program's `main`, the thread
+// `Dispatchers.Main` confines its coroutines to.
+internal fun __kxco_onMainThread(): Boolean = false
+// Queues `block` for the event loop on the main thread; false when none runs there.
+internal fun __kxco_postMain(block: () -> Unit): Boolean = false
 internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
 // `__kxco_dispatch` onto the elastic blocking-work view of the pool.
@@ -111,9 +119,11 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
         val job = context[Job]
         __kxco_spawn {
             if (job != null) __kxco_pushScope(job)
+            __kxco_ownerRoute(true)
             try {
                 block.run()
             } finally {
+                __kxco_ownerRoute(false)
                 if (job != null) __kxco_popScope()
             }
         }
@@ -166,6 +176,8 @@ internal object KlioDefaultDispatcher : CoroutineDispatcher(), Delay {
         __kxco_dispatch { block.run() }
     }
 
+    override fun toString(): String = "Dispatchers.Default"
+
     override fun scheduleResumeAfterDelay(
         timeMillis: Long,
         continuation: CancellableContinuation<Unit>
@@ -187,6 +199,8 @@ internal object KlioIoDispatcher : CoroutineDispatcher(), Delay {
     override fun dispatch(context: CoroutineContext, block: Runnable) {
         __kxco_dispatchIo { block.run() }
     }
+
+    override fun toString(): String = "Dispatchers.IO"
 
     override fun scheduleResumeAfterDelay(
         timeMillis: Long,
@@ -240,11 +254,37 @@ private class ResumeAfterDelay(private val continuation: CancellableContinuation
     }
 }
 
+// `Dispatchers.Main` runs its blocks on the program's main thread. From another
+// thread a block goes to the event loop running there, as the JVM's main
+// dispatcher runs its posts on its own thread; with no loop on the main
+// thread it runs on the pump where it was dispatched.
 internal object KlioMainDispatcher : MainCoroutineDispatcher() {
-    override val immediate: MainCoroutineDispatcher get() = this
+    override val immediate: MainCoroutineDispatcher get() = KlioMainImmediateDispatcher
 
     override fun dispatch(context: CoroutineContext, block: Runnable) {
-        __kxco_spawn { block.run() }
+        if (!__kxco_onMainThread() && __kxco_postMain { runRouted(block) }) return
+        __kxco_spawn { runRouted(block) }
+    }
+
+    private fun runRouted(block: Runnable) {
+        __kxco_ownerRoute(true)
+        try {
+            block.run()
+        } finally {
+            __kxco_ownerRoute(false)
+        }
+    }
+}
+
+// `Dispatchers.Main.immediate`: on the main thread a coroutine runs on the
+// caller's stack; from any other thread it is dispatched to Main.
+private object KlioMainImmediateDispatcher : MainCoroutineDispatcher() {
+    override val immediate: MainCoroutineDispatcher get() = this
+
+    override fun isDispatchNeeded(context: CoroutineContext): Boolean = !__kxco_onMainThread()
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        KlioMainDispatcher.dispatch(context, block)
     }
 }
 

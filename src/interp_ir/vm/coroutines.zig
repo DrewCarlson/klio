@@ -105,6 +105,9 @@ pub const DriverWakeup = struct {
     pub const MailboxEntry = struct {
         slot: i64,
         value: Value,
+        /// Set on a hand-over request (`SurrenderRequest`), which asks for the
+        /// activation parked on `slot` rather than resuming it.
+        surrender: ?*SurrenderRequest = null,
     };
 
     pub fn new(allocator: Allocator) Allocator.Error!ObjRef(DriverWakeup) {
@@ -112,6 +115,7 @@ pub const DriverWakeup = struct {
     }
 
     pub fn deinit(self: *DriverWakeup) void {
+        answerUnservedSurrenders(self.mailbox_entries.items);
         self.mailbox_entries.deinit(self.allocator);
         self.owned_slot_set.deinit(self.allocator);
     }
@@ -123,6 +127,7 @@ pub const DriverWakeup = struct {
     /// Shallow: the spines only, since entry Values are independent cells.
     pub fn gcFinalize(self: *DriverWakeup, gc_alloc: std.mem.Allocator) void {
         _ = gc_alloc;
+        answerUnservedSurrenders(self.mailbox_entries.items);
         self.mailbox_entries.deinit(self.allocator);
         self.owned_slot_set.deinit(self.allocator);
     }
@@ -135,6 +140,19 @@ pub const DriverWakeup = struct {
             defer self.mailbox.unlock();
             if (self.mailbox_closed) return false;
             try self.mailbox_entries.append(self.allocator, .{ .slot = slot, .value = value });
+        }
+        self.gate.ring();
+        return true;
+    }
+
+    /// Queues a hand-over request for `slot` behind the resumes already
+    /// posted. False means the mailbox is closed; the request is untouched.
+    pub fn postSurrender(self: *DriverWakeup, slot: i64, req: *SurrenderRequest) Allocator.Error!bool {
+        {
+            self.mailbox.lock();
+            defer self.mailbox.unlock();
+            if (self.mailbox_closed) return false;
+            try self.mailbox_entries.append(self.allocator, .{ .slot = slot, .value = .Unit, .surrender = req });
         }
         self.gate.ring();
         return true;
@@ -219,6 +237,140 @@ pub const DriverWakeup = struct {
         }
     }
 };
+
+/// A resumer's request that the pump holding `slot` hand the parked activation
+/// over through the persisted registry, so a `resumeWith` that needs no
+/// dispatch runs the coroutine on the resumer's own thread, as an `Unconfined`
+/// resume does on the JVM. Held twice, by the resumer and by the mailbox
+/// entry; the second release frees it.
+pub const SurrenderRequest = struct {
+    state: std.atomic.Value(u8) = .init(pending),
+    refs: std.atomic.Value(u8) = .init(2),
+    gate: runtime.EventGate = .{},
+
+    const pending: u8 = 0;
+    /// The owner took the request and is answering it.
+    const claimed: u8 = 1;
+    /// The activation is in the persisted registry under its slot.
+    const moved: u8 = 2;
+    /// The owner held nothing parked on the slot.
+    const absent: u8 = 3;
+    /// The resumer stopped waiting before the owner took the request.
+    const cancelled: u8 = 4;
+
+    fn create() ?*SurrenderRequest {
+        const r = std.heap.smp_allocator.create(SurrenderRequest) catch return null;
+        r.* = .{};
+        return r;
+    }
+
+    fn release(self: *SurrenderRequest) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) std.heap.smp_allocator.destroy(self);
+    }
+
+    /// The owner's side; false when the resumer already gave up.
+    fn claim(self: *SurrenderRequest) bool {
+        return self.state.cmpxchgStrong(pending, claimed, .acq_rel, .acquire) == null;
+    }
+
+    fn answer(self: *SurrenderRequest, outcome: u8) void {
+        self.state.store(outcome, .release);
+        self.gate.ring();
+    }
+};
+
+/// Requests still in a mailbox nobody will drain: each resumer hears that its
+/// slot was not handed over, and the entry's hold goes.
+fn answerUnservedSurrenders(entries: []const DriverWakeup.MailboxEntry) void {
+    for (entries) |e| {
+        const req = e.surrender orelse continue;
+        if (req.claim()) req.answer(SurrenderRequest.absent);
+        req.release();
+    }
+}
+
+/// How long a resumer waits for the owning pump to hand a coroutine over
+/// before it posts the resume to that pump instead. A pump drains its mailbox
+/// every turn and when idle wakes on the post; one running a long step keeps
+/// its coroutines.
+const surrender_wait_ns: u64 = 250 * std.time.ns_per_ms;
+
+const SurrenderOutcome = enum { moved, not_moved, closed };
+
+/// Asks the pump behind `owner` for the activation parked on `slot` and waits
+/// (bounded) for its answer.
+fn requestSurrender(owner: *const ObjRef(DriverWakeup), slot: i64) Allocator.Error!SurrenderOutcome {
+    const req = SurrenderRequest.create() orelse return .not_moved;
+    const posted = blk: {
+        const g = owner.borrowMut();
+        defer g.deinit();
+        break :blk g.get().postSurrender(slot, req) catch |e| {
+            req.release();
+            req.release();
+            return e;
+        };
+    };
+    if (!posted) {
+        req.release();
+        req.release();
+        return .closed;
+    }
+    defer req.release();
+    const deadline = runtime.clockMonotonicNanos() + surrender_wait_ns;
+    var spins: u32 = 0;
+    while (true) {
+        const st = req.state.load(.acquire);
+        if (st == SurrenderRequest.moved) return .moved;
+        if (st == SurrenderRequest.absent) return .not_moved;
+        if (st == SurrenderRequest.pending and runtime.clockMonotonicNanos() >= deadline) {
+            if (req.state.cmpxchgStrong(SurrenderRequest.pending, SurrenderRequest.cancelled, .acq_rel, .acquire) == null)
+                return .not_moved;
+            continue;
+        }
+        if (spins < 200) {
+            spins += 1;
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        // The owner may be waiting on this thread's pumps the same way.
+        try serveOwnSurrenders();
+        const seen = req.gate.epochNow();
+        const again = req.state.load(.acquire);
+        if (again == SurrenderRequest.moved or again == SurrenderRequest.absent) continue;
+        req.gate.waitFrom(seen, 1_000);
+    }
+}
+
+/// Answers the hand-over requests queued on this thread's own pumps, leaving
+/// their resumes queued. A resume queued ahead of a request finds its slot
+/// moved and adopts it back from the registry.
+fn serveOwnSurrenders() Allocator.Error!void {
+    for (coro_stack.items) |*pump| {
+        var taken: std.ArrayList(DriverWakeup.MailboxEntry) = .empty;
+        defer taken.deinit(coroStackAllocator());
+        {
+            const g = pump.wakeup.borrowMut();
+            defer g.deinit();
+            const w = g.get();
+            w.mailbox.lock();
+            defer w.mailbox.unlock();
+            var i: usize = 0;
+            while (i < w.mailbox_entries.items.len) {
+                if (w.mailbox_entries.items[i].surrender != null) {
+                    try taken.append(coroStackAllocator(), w.mailbox_entries.orderedRemove(i));
+                } else i += 1;
+            }
+        }
+        for (taken.items, 0..) |entry, i| {
+            errdefer answerUnservedSurrenders(taken.items[i + 1 ..]);
+            const req = entry.surrender.?;
+            defer req.release();
+            if (!req.claim()) continue;
+            const moved = try surrenderSlot(pump, entry.slot);
+            req.answer(if (moved) SurrenderRequest.moved else SurrenderRequest.absent);
+        }
+    }
+}
 
 /// Process-global slot to owning `DriverWakeup`: a worker routes its completion
 /// resume through the driver owning the slot it parked on. Its clones reach into
@@ -717,6 +869,109 @@ const TimerService = struct {
     }
 };
 
+/// Blocks `Dispatchers.Main` posts from another thread for the program's main
+/// thread, taken by the event loop (`runBlocking`, `suspend fun main`) running
+/// there, as the JVM's main dispatcher runs its posts on its own thread. With
+/// no event loop on the main thread a post is refused and the dispatcher runs
+/// the block where it is.
+const MainQueue = struct {
+    var mutex: SpinMutex = .{};
+    /// Blocks posted and not yet taken, each holding its post's reference;
+    /// under `Virtual` each counts as unsettled until taken.
+    var pending: std.ArrayList(Value) = .empty;
+    /// The wakeup of the innermost event loop on the main thread.
+    var wakeup: ?ObjRef(DriverWakeup) = null;
+
+    fn allocator() Allocator {
+        return std.heap.smp_allocator;
+    }
+
+    /// Makes `w` the loop posts go to; answers the one it replaces, whose
+    /// reference passes to the caller.
+    fn attach(w: *const ObjRef(DriverWakeup)) ?ObjRef(DriverWakeup) {
+        mutex.lock();
+        defer mutex.unlock();
+        const prev = wakeup;
+        wakeup = w.clone();
+        return prev;
+    }
+
+    /// Hands posts back to `prev`, the loop the exiting one replaced. With
+    /// none, what is still pending goes to `top`'s launch queue, which its exit
+    /// hands to the pump below or drops.
+    fn detach(prev: ?ObjRef(DriverWakeup), top: *CooperativeInterceptor) Allocator.Error!void {
+        mutex.lock();
+        const cur = wakeup;
+        wakeup = prev;
+        var orphans: []Value = &.{};
+        if (prev == null and pending.items.len != 0) {
+            orphans = pending.toOwnedSlice(allocator()) catch &.{};
+        }
+        mutex.unlock();
+        if (cur) |c| {
+            var cc = c;
+            cc.deinit();
+        }
+        defer if (orphans.len != 0) allocator().free(orphans);
+        for (orphans) |b| {
+            if (top.mode == .Virtual) VirtualClock.settle();
+            try top.launched.append(top.allocator, b);
+        }
+    }
+
+    fn drainInto(top: *CooperativeInterceptor) Allocator.Error!void {
+        var n: usize = 0;
+        {
+            mutex.lock();
+            defer mutex.unlock();
+            n = pending.items.len;
+            if (n == 0) return;
+            try top.launched.appendSlice(top.allocator, pending.items);
+            pending.clearRetainingCapacity();
+        }
+        if (top.mode == .Virtual) {
+            top.claimNow();
+            for (0..n) |_| VirtualClock.settle();
+        }
+    }
+
+    fn dropAll() void {
+        mutex.lock();
+        defer mutex.unlock();
+        for (pending.items) |b| {
+            if (root.coroutineTimeMode() == .Virtual) VirtualClock.settle();
+            if (runtime.reclaimEnabled()) b.release(allocator());
+        }
+        pending.clearRetainingCapacity();
+    }
+};
+
+/// Queues `block` for the event loop on the program's main thread; false when
+/// none runs there.
+pub fn mainPost(block: Value) Allocator.Error!bool {
+    ensureCoroGlobalRoot();
+    const w: ObjRef(DriverWakeup) = blk: {
+        MainQueue.mutex.lock();
+        defer MainQueue.mutex.unlock();
+        const cur = MainQueue.wakeup orelse return false;
+        try MainQueue.pending.append(MainQueue.allocator(), block);
+        if (runtime.reclaimEnabled()) block.retain();
+        if (root.coroutineTimeMode() == .Virtual) VirtualClock.enterUnsettled();
+        break :blk cur.clone();
+    };
+    defer {
+        var ww = w;
+        ww.deinit();
+    }
+    w.asPtr().gate.ring();
+    return true;
+}
+
+/// Run boundary: blocks posted to a main loop that never took them go.
+pub fn drainMainQueue() void {
+    MainQueue.dropAll();
+}
+
 /// What a post asks of the poster.
 pub const TimerPost = enum {
     /// Queued for the running pump, or for one already starting.
@@ -974,6 +1229,10 @@ pub const CooperativeInterceptor = struct {
     pending_err: ?EvalError = null,
     /// The timer thread's pump, which takes posted timer blocks each turn.
     timer_service: bool = false,
+    /// An event loop on the main thread takes `Dispatchers.Main` posts while it
+    /// runs; `main_outer` is the loop it took them over from.
+    main_attached: bool = false,
+    main_outer: ?ObjRef(DriverWakeup) = null,
     /// A `runBlocking` or `suspend fun main` pump: it holds its thread until its
     /// root completes, so it is that thread's event loop, and a delay scheduled
     /// on the thread through the default `Delay` waits on it. Any other pump
@@ -1011,6 +1270,7 @@ pub const CooperativeInterceptor = struct {
     /// queued blocks, and undelivered resume values.
     pub fn gcMark(self: *CooperativeInterceptor, m: *runtime.gc.Marker) void {
         m.shade(&self.wakeup.cell.hdr);
+        if (self.main_outer) |w| m.shade(&w.cell.hdr);
         var pit = self.parked.valueIterator();
         while (pit.next()) |e| {
             // Quiescent skip on minor marks: a fully-traced parked entry is frozen.
@@ -1524,6 +1784,12 @@ fn gcMarkCoroGlobal(m: *runtime.gc.Marker) void {
     for (TimerService.pending.items) |v| v.gcMark(m);
     if (TimerService.wakeup) |w| m.shade(&w.cell.hdr);
     TimerService.mutex.unlock();
+
+    // Blocks posted to the main thread's loop and not yet taken.
+    MainQueue.mutex.lock();
+    for (MainQueue.pending.items) |v| v.gcMark(m);
+    if (MainQueue.wakeup) |w| m.shade(&w.cell.hdr);
+    MainQueue.mutex.unlock();
 
     if (runtime.gc.gc_debug) {
         const so = if (SlotOwners.map) |sm| sm.count() else 0;
@@ -2140,7 +2406,15 @@ fn pumpLoop(
     var idle_rounds: usize = 0;
     var diag_loops: usize = 0;
     if (root_value.*) |v| (coroTop().?).root_value = v;
+    // The main thread's event loop takes what `Dispatchers.Main` posts there
+    // from other threads, until its exit hands them back (`pumpExit`).
+    const main_loop = coroTop().?.event_loop and runtime.onProgramThread();
+    if (main_loop and !coroTop().?.main_attached) {
+        coroTop().?.main_outer = MainQueue.attach(&coroTop().?.wakeup);
+        coroTop().?.main_attached = true;
+    }
     while (true) {
+        if (main_loop) try MainQueue.drainInto(coroTop().?);
         diag_loops += 1;
         // A deadlocked pump idles in this loop's sleep arms, never the eval loop,
         // so the test runner's watchdog must fire here.
@@ -2429,6 +2703,16 @@ fn pumpLoop(
 /// entries through the persisted registry.
 fn pumpExit(self: anytype, out: Output, persist: bool) Allocator.Error!void {
     const a = self.allocator;
+    // Posts to the main thread go back to the loop this one took them from;
+    // with none, those still pending join this pump's launches below.
+    if (coroTop()) |top| {
+        if (top.main_attached) {
+            top.main_attached = false;
+            const outer = top.main_outer;
+            top.main_outer = null;
+            try MainQueue.detach(outer, top);
+        }
+    }
     if (persist) {
         const saved = try (coroTop().?).drainIndefiniteParked(a);
         defer a.free(saved);
@@ -2489,6 +2773,13 @@ fn pumpExit(self: anytype, out: Output, persist: bool) Allocator.Error!void {
     defer runtime.keepaliveRestore(ka_left);
     for (leftovers) |entry| runtime.keepalivePush(entry.value);
     for (leftovers) |entry| {
+        // The exit persisted what it held parked, so a hand-over request is
+        // answered by the registry.
+        if (entry.surrender) |req| {
+            if (req.claim()) req.answer(SurrenderRequest.moved);
+            req.release();
+            continue;
+        }
         if (PersistedParked.take(entry.slot)) |pe| {
             _ = try driveResumed(self, pe.state, entry.value, pe.scope_delta, out);
             coroStackAllocator().free(pe.scope_delta);
@@ -2568,12 +2859,50 @@ fn drainWakeupInto(allocator: Allocator, wakeup: *const ObjRef(DriverWakeup), to
         break :blk try g.get().drainMailbox(allocator);
     };
     defer allocator.free(drained);
-    for (drained) |entry| {
-        const routed = try top.resumeSlotValue(entry.slot, entry.value);
+    for (drained, 0..) |entry, i| {
+        if (entry.surrender) |req| {
+            // Answer the rest on an error, so none of their resumers waits out
+            // its bound for a pump that stopped reading.
+            errdefer answerUnservedSurrenders(drained[i + 1 ..]);
+            defer req.release();
+            if (!req.claim()) continue;
+            const moved = try surrenderSlot(top, entry.slot);
+            req.answer(if (moved) SurrenderRequest.moved else SurrenderRequest.absent);
+            if (pumpDiagEnabled())
+                std.debug.print("[PUMP] surrender slot={d} moved={}\n", .{ entry.slot, moved });
+            continue;
+        }
+        var routed = try top.resumeSlotValue(entry.slot, entry.value);
+        // Handed over to another thread's resumer and persisted again since:
+        // the resume adopts it here.
+        if (!routed) {
+            if (PersistedParked.take(entry.slot)) |pe| {
+                try top.adoptPersisted(pe.state, pe.scope_delta, entry.value);
+                routed = true;
+            }
+        }
         if (pumpDiagEnabled())
             std.debug.print("[PUMP] drain slot={d} routed={}\n", .{ entry.slot, routed });
     }
     return drained.len != 0;
+}
+
+/// Moves the activation `top` holds parked on `slot` into the persisted
+/// registry for a resumer on another thread. The registry has it before the
+/// slot's owner registration goes, so a resume racing the move finds one or
+/// the other. False when `top` holds nothing parked there, or holds its own
+/// root there.
+fn surrenderSlot(top: *CooperativeInterceptor, slot: i64) Allocator.Error!bool {
+    const tok = top.slot_to_token.get(slot) orelse return false;
+    if (top.root_tok != null and top.root_tok.? == tok) return false;
+    const entry = top.parked.fetchRemove(tok) orelse return false;
+    _ = top.slot_to_token.remove(slot);
+    // A resume value already delivered to the token travels with no one; the
+    // resumer brings its own.
+    _ = top.token_resume_value.remove(tok);
+    try PersistedParked.put(slot, entry.value.state, entry.value.scope_delta);
+    unregisterSlot(slot);
+    return true;
 }
 
 pub fn runBlocking(self: anytype, block: *const Value, scope: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
@@ -2947,6 +3276,22 @@ fn resumeInlineOnce(self: anytype, slot: i64, value: Value, out: Output) Allocat
 /// the coroutine still queued.
 threadlocal var kotlin_resume_delivery: bool = false;
 
+/// Set by the pump dispatcher (`KlioDispatcher`, `Dispatchers.Main`) around a
+/// dispatched block, and taken by the first `resumeWith` inside it: that
+/// coroutine is confined to the pump it parked on, which the dispatch reaches
+/// through the owner's mailbox. Any other `resumeWith` already runs where its
+/// interceptor chose, so a coroutine another thread's pump holds is handed
+/// over and runs here.
+threadlocal var owner_route: bool = false;
+
+/// Whether this `resumeWith` may take its coroutine from the pump on another
+/// thread that holds it parked.
+threadlocal var resume_may_move: bool = false;
+
+pub fn coroutineOwnerRoute(on: bool) void {
+    owner_route = on;
+}
+
 /// Whether a cross-thread `resumeWith` post waits (bounded) for the owner pump to
 /// run the routed step; the wait serializes the pool against the owner.
 var sync_resume_checked: bool = false;
@@ -2977,6 +3322,10 @@ pub fn coroutineResumeContinuation(self: anytype, slot: i64, value: Value, out: 
     const prev = kotlin_resume_delivery;
     kotlin_resume_delivery = true;
     defer kotlin_resume_delivery = prev;
+    const prev_move = resume_may_move;
+    resume_may_move = !owner_route;
+    owner_route = false;
+    defer resume_may_move = prev_move;
     if (try coroutineResumeInline(self, slot, value, out)) return null;
     return coroutineResumeExternal(self, slot, value, out);
 }
@@ -3062,6 +3411,33 @@ pub fn coroutineResumeExternal(self: anytype, slot: i64, value: Value, out: Outp
             const ka_owner = runtime.keepaliveMark();
             defer runtime.keepaliveRestore(ka_owner);
             runtime.keepalivePushCell(&ww.cell.hdr);
+            // A resume its interceptor did not dispatch runs here: the owner
+            // hands the coroutine over rather than running it itself.
+            if (resume_may_move and kotlin_resume_delivery) {
+                resume_may_move = false;
+                // The wait parks this thread for collections; the value is
+                // held only here until the coroutine runs.
+                runtime.keepalivePush(value);
+                switch (try requestSurrender(&ww, slot)) {
+                    .moved => {
+                        // Another resumer that claimed it first is running it.
+                        const pe = PersistedParked.take(slot) orelse return null;
+                        if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} routed=handed-over\n", .{slot});
+                        if (try resumePersistedOnTop(self, pe, value, out)) return null;
+                        if (coroTop()) |top| {
+                            try top.adoptPersisted(pe.state, pe.scope_delta, value);
+                            return null;
+                        }
+                        const thrown = try driveResumed(self, pe.state, value, pe.scope_delta, out);
+                        coroStackAllocator().free(pe.scope_delta);
+                        return thrown;
+                    },
+                    // The exit that closed the mailbox persisted the coroutine:
+                    // the registry arm below takes it.
+                    .closed => {},
+                    .not_moved => {},
+                }
+            }
             const turns0 = ww.cell.data.turns.load(.acquire);
             const posted = blk: {
                 const g = ww.borrowMut();

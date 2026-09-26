@@ -73,9 +73,6 @@ against the code.
 ### Runtime and interpreter
 
 - Coroutines: `runBlocking`'s job `toString` leaks `KlioBlockingCoroutine`.
-  A continuation of an `Unconfined` coroutine resumed from another thread
-  runs on the thread whose pump parked it, after the resumer continues;
-  on the JVM it runs inline in the resumer first.
   Unverified: `SupervisorJob` with several throwing children, cancel while
   parked on a channel `send`/`receive`, `DeepRecursiveFunction` under
   `klio run`, `subscriptionCount` on a shared flow.

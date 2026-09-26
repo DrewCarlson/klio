@@ -46,6 +46,21 @@ fn resetThreadNumber() void {
     thread_number.store(0, .monotonic);
 }
 
+/// The OS thread running the program's `main`, the JVM's "main" thread; 0
+/// outside a run.
+var program_thread = std.atomic.Value(u64).init(0);
+
+pub fn setProgramThread(id: u64) void {
+    program_thread.store(id, .release);
+}
+
+/// Whether the calling thread runs the program's `main`: the thread
+/// `Dispatchers.Main` confines its coroutines to.
+pub fn onProgramThread() bool {
+    const t = program_thread.load(.acquire);
+    return t != 0 and t == @as(u64, std.Thread.getCurrentId());
+}
+
 pub fn clearThreadName(id: u64) void {
     names_mutex.lock();
     defer names_mutex.unlock();

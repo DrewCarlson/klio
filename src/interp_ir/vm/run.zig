@@ -400,6 +400,8 @@ pub fn vmRunCalls(
     const tid = std.Thread.getCurrentId();
     runtime.setThreadName(tid, "main");
     defer runtime.clearThreadName(tid);
+    runtime.setProgramThread(tid);
+    defer runtime.setProgramThread(0);
     const prep = try vmPrepare(self);
     if (prep == null) {
         const clock_held = vmhost.coroutines.threadClockBegin();
@@ -434,6 +436,7 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     defer if (outermost) runtime.runBoundarySweep();
     defer if (outermost) vmhost.coroutines.drainVirtualClock();
     defer if (outermost) vmhost.coroutines.drainPersistedParked();
+    defer if (outermost) vmhost.coroutines.drainMainQueue();
     defer if (outermost) vmhost.coroutines.drainSlotOwners();
     // The two populations drain in turn: explicit threads (which may post tasks)
     // then the dispatcher pool (whose tasks may spawn threads), until both empty.

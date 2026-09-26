@@ -332,6 +332,14 @@ fn ivCoroutineOnEventLoop(ctx: *anyopaque) bool {
     _ = ctx;
     return coroutines.coroutineOnEventLoop();
 }
+fn ivCoroutineOwnerRoute(ctx: *anyopaque, on: bool) void {
+    _ = ctx;
+    coroutines.coroutineOwnerRoute(on);
+}
+fn ivCoroutinePostMain(ctx: *anyopaque, block: *const Value) Allocator.Error!bool {
+    _ = ctx;
+    return coroutines.mainPost(block.*);
+}
 fn ivCoroutineLaunch(ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineLaunch(ip(ctx), block, scope, out);
 }
@@ -447,6 +455,8 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .coroutine_start_root_or_suspended = ivCoroutineStartRootOrSuspended,
     .coroutine_has_driver = ivCoroutineHasDriver,
     .coroutine_on_event_loop = ivCoroutineOnEventLoop,
+    .coroutine_owner_route = ivCoroutineOwnerRoute,
+    .coroutine_post_main = ivCoroutinePostMain,
     .coroutine_launch = ivCoroutineLaunch,
     .coroutine_spawn_timeout = ivCoroutineSpawnTimeout,
     .coroutine_spawn_timer = ivCoroutineSpawnTimer,
