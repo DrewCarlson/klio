@@ -15,9 +15,11 @@ where the upstream one needs the JVM, AWT or a native platform API.
    files the pack includes. The inventory script walks the upstream tree at
    the pinned commit and each pack's `klio.toml`.
 2. **Sema census.** `scripts/sema-census.py` over every installed pack: no
-   compose site unresolved, unlowered or unbound. `tests/sema-census-open.txt`
-   carries one: ComposeSceneInputHandler's import of RootNodeOwner (named
-   only in its KDoc), which resolves when the upstream scene lands.
+   compose site unresolved, unlowered or unbound, and none in
+   `tests/sema-census-open.txt`. ComposeSceneInputHandler is klioMain's copy
+   of the skikoMain file without its import of RootNodeOwner, which only its
+   KDoc names and which `klio pack build` rejects as unresolved, until
+   RootNodeOwner comes with the upstream scene.
 3. **Upstream suites.** Each module's upstream test sets as a ratcheted
    census in `src/itests/commontest_support.zig`.
 4. **Examples and pixels.** A deterministic example per feature area under
@@ -82,8 +84,7 @@ Not run yet, and what each needs:
    review before it is built.
 7. **The long tail.** The remaining nonJvm actuals taken verbatim, the
    desktop window API's AWT-bound rest (dialog modality, window
-   transparency, a menu bar drawn in SDL windows and a tray on their hosts,
-   which have no native ones). `Window(icon)` draws its painter at 192 pixels, as
+   transparency). `Window(icon)` draws its painter at 192 pixels, as
    the desktop does, and sets it on SDL and Win32 windows; a macOS window
    has no icon of its own. The `window` of a WindowScope is AWT's own window
    and has no klio counterpart.
@@ -96,7 +97,7 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 |--------|-----------:|----------:|-----------:|------------------------:|
 | runtime | 188 / 188 | n/a | 6 / 9, nonAndroid 10 / 10 | jvmAndAndroid 3 java-free; klio actuals |
 | runtime-saveable | 7 / 9 | n/a | n/a | n/a |
-| ui | 244 / 244 | 46 / 92 | 8 / 8 | 86 / 175 |
+| ui | 244 / 244 | 45 / 92 | 8 / 8 | 86 / 175 |
 | ui-graphics | 82 / 82 | 0 / 19 | 1 / 1 | 0 / 7 |
 | ui-text | 79 / 79 | 2 / 28 | 4 / 5 | 0 / 15 |
 | ui-unit, ui-util, ui-geometry | complete | n/a | complete, ui-unit nonAndroid 2 / 2 | n/a |
@@ -130,6 +131,26 @@ Typeface-based `FontLoader`, which come with the binding layer; foundation's
 `Modifier.onClick`, `PointerMatcher`, `Modifier.onDrag`, `TooltipArea`,
 `ContextMenuArea`; runtime-saveable's `rememberSerializable`;
 runtime-retain's `retain`, `RetainedEffect` and the stores.
+
+## Platforms
+
+Everything the compose packs and the Skia shim do runs on macOS, Linux and
+Windows: each window, input, clipboard, menu, tray and dialog feature has a
+Cocoa, an SDL (with X11 for the tray) and a Win32 backend, and a feature a
+platform cannot give says so, as the desktop does (Tray where no system
+tray runs on the X display; a MenuBar in a GPU SDL window). skiko's C glue
+(RenderNode, the default font manager) builds for all three.
+
+| Platform | Verified by running | Verified by compiling only |
+|----------|---------------------|----------------------------|
+| macOS arm64 | every compose example (70 of 70 with the tray), the compose-ui gate, the upstream suites, the JVM oracle | |
+| Linux aarch64 (Debian 12 container, Xvfb) | the compose examples (69 of 70: compose_text_fonts prints FreeType's baselines, 17.312 where CoreText gives 17.312012, and Compose Desktop 1.12.0 prints the same 17.312 in that container), the JVM oracle run in the same container (identical on the 11 font- and pixel-dependent examples it can compile), the drawn menu bar by frame dumps, the XEmbed tray under trayer (icon, menu, action, balloon) and without a tray | the harness is cross-compiled from macOS; the shim is built in the container with g++ |
+| Linux x86_64 | | compose_ui and the stdlib (`zigcheck.py --target x86_64-linux-gnu`) |
+| Windows x86_64 | | compose_ui and the stdlib (`zigcheck.py compose_ui --build-only --target x86_64-windows-gnu`, with runtime's `safety.zig` stack mmap stubbed until the runtime builds for Windows); the shim's six sources to objects (`zig c++ -target x86_64-windows-gnu`). Linking the shim needs the MSVC toolchain the Windows Skia prebuilt is built with |
+
+Not verified anywhere yet: a Wayland session (SDL picks Wayland or X11 at
+runtime; the tray is X11's, so under Wayland without XWayland
+isTraySupported is false), and running on Windows.
 
 ## Log
 
@@ -309,6 +330,29 @@ runtime-retain's `retain`, `RetainedEffect` and the stores.
   sets a WindowState position the program has since changed back to the
   old one; compose_window_state checks the state both ways, a DialogWindow
   and the window key callbacks.
+- 2026-09-26: Linux. An SDL window draws its MenuBar as Swing draws the
+  desktop's there: a bar above the content (which gives up its height), a
+  panel per open menu with check marks, radio dots, icons, shortcuts and
+  submenus (flipped left of their parent where the right has no room), the
+  mouse and the keys (F10, Alt with a mnemonic, the arrows) while one is
+  open; `menushow` in a script leaves them open for frame dumps. On X11 a
+  Tray docks in the system tray over the XEmbed tray protocol, as AWT's X11
+  SystemTray does: a 24-pixel icon window with size hints, a popup menu, a
+  tooltip and balloon notifications drawn with Skia; with no tray on the
+  display isTraySupported is false. The Linux shim did not load at all: it
+  is built without RTTI now, as Skia and skiko's glue are, and links
+  libstdc++ before the Skia archives so a weak copy of a libstdc++ function
+  no longer pulls in the GL backend. A shim that is there but does not load
+  says why. The default font manager is skiko's own FontMgrDefaultFactory
+  (CoreText, DirectWrite, fontconfig), so Linux and Windows lay out default
+  text in the platform's sans-serif as the desktop does, where they had
+  used the bundled monospace face. A Window applies its properties through
+  desktop's UpdateEffect, whose effect keeps the application running while
+  the window is open: a window with no effects of its own no longer ended
+  the application after its first frame (compose_window_lifetime). The
+  oracle takes skiko's runtime for its host, so it runs in the Linux
+  container too; `zigcheck.py --target` compiles a module for another
+  target. The Platforms section records what runs where.
 - Open, routed to coroutines: a delay of `Long.MAX_VALUE / 2` under
   Dispatchers.Unconfined overflows the scheduler's clock. `Modifier.onClick`
   (whose tap detector waits that long when there is no long click) crashes

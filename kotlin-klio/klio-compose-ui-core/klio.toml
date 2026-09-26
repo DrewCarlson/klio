@@ -80,9 +80,9 @@ include = [
     "androidx/compose/ui/platform/DefaultUiApplier.skiko.kt",
     # The scene's input handling: the pointer and button state a scene tracks,
     # the synthetic moves, presses and releases it fills gaps with, and the
-    # results it reports.
+    # results it reports. ComposeSceneInputHandler is klioMain's until
+    # RootNodeOwner, which its KDoc imports, comes with the upstream scene.
     "androidx/compose/ui/scene/ComposeScenePointer.skiko.kt",
-    "androidx/compose/ui/scene/ComposeSceneInputHandler.skiko.kt",
     "androidx/compose/ui/input/pointer/SyntheticEventSender.skiko.kt",
     # The mesh gradient painter's renderers, drawing through drawVertices.
     "androidx/compose/ui/graphics/BaseMeshGradientRenderer.skiko.kt",

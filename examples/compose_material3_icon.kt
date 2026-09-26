@@ -1,3 +1,4 @@
+// corpus: skia (the expected output is the one printed when the Skia shim renders)
 // Material 3's Icon over a vector: its tint (the content color by default,
 // or one given), and an Image whose paint modifier takes an alpha and a
 // color filter, read back from the rendered frame's pixels. The values are

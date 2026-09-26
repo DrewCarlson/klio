@@ -1,5 +1,3 @@
 # Known unresolved, unrecorded or unlowered sites of scripts/sema-census.py:
 # <reason> <path:line:col>, then the first scope and the detail after tabs.
 # The gate fails on any other site and on a listed one that is gone.
-# androidx.compose.ui: ComposeSceneInputHandler imports RootNodeOwner for its KDoc; RootNodeOwner comes with the upstream scene.
-unresolved_import ../klio-compose-runtime/upstream/compose/ui/ui/src/skikoMain/kotlin/androidx/compose/ui/scene/ComposeSceneInputHandler.skiko.kt:38:1	pack:androidx.compose.animation.core	androidx.compose.ui.node.RootNodeOwner
