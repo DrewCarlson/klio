@@ -299,6 +299,23 @@ root = "upstream/ktor-server/ktor-server-test-base/posix/src"
 [[source]]
 root = "upstream/ktor-server/ktor-server-test-suites/common/src"
 
+# ktor-test-server: ktor's own test server, which Gradle starts for
+# upstream's client test runs (the CIO application at 127.0.0.1:8080 and the
+# HTTP and SOCKS proxy test servers). The files that reach java.* and the
+# JVM-only engines have klio copies under klioMain/test/server.
+[[source]]
+root = "upstream/ktor-test-server/src/main/kotlin"
+exclude = [
+    "test/server/TestServer.kt",
+    "test/server/TestServerService.kt",
+    "test/server/TestTcpServer.kt",
+    "test/server/tests/Auth.kt",
+    "test/server/tests/Cache.kt",
+    "test/server/tests/Content.kt",
+    "test/server/tests/Download.kt",
+    "test/server/tests/ServerSentEvents.kt",
+]
+
 # ktor-client-test-base: the client test helpers (`testWithEngine`,
 # `clientTests`) the client modules' commonTests use.
 [[source]]
@@ -518,6 +535,7 @@ sources = [
     "upstream/ktor-utils/",
     "klioMain/io/ktor/util/",
     "klioMain/klio/logging/",
+    "klioMain/klio/security/",
 ]
 requires = ["io"]
 
@@ -525,7 +543,7 @@ requires = ["io"]
 # types, URLs, and the `OutgoingContent` body layer. Depends on
 # ktor-utils (and ktor-io through it).
 [features.http]
-sources = ["upstream/ktor-http/"]
+sources = ["upstream/ktor-http/", "klioMain/io/ktor/http/"]
 requires = ["utils"]
 
 # ktor-http-cio (`io.ktor.http.cio.*`): the CIO HTTP message parser and the
@@ -707,6 +725,25 @@ requires = [
 ]
 deps = ["kotlin.test"]
 
+# ktor's test server (`test.server.*`): `io.ktor.testserver.runTestServer()`
+# serves what the client suites call, as upstream's Gradle build does before
+# their runs.
+[features.test-server]
+sources = ["upstream/ktor-test-server/", "klioMain/test/server/", "klioMain/io/ktor/testserver/"]
+requires = [
+    "server-cio",
+    "server-auth",
+    "server-caching-headers",
+    "server-compression",
+    "server-conditional-headers",
+    "server-default-headers",
+    "server-status-pages",
+    "server-sse",
+    "server-websockets",
+    "client-core",
+    "serialization-kotlinx-json",
+]
+
 # ktor-client-test-base (`io.ktor.client.test.base.*`): the client test
 # helpers.
 [features.client-test-base]
@@ -726,7 +763,7 @@ deps = ["kotlinx.serialization"]
 
 # `server.auth.*` (ktor-server-auth): Authentication with basic, bearer, digest, form, session and OAuth providers.
 [features.server-auth]
-sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-auth/"]
+sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-auth/", "klioMain/io/ktor/server/auth/"]
 requires = ["server-core", "client-core", "server-sessions"]
 deps = ["kotlinx.serialization/json"]
 

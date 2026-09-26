@@ -40,7 +40,119 @@ pub const Config = struct {
     extra_env: []const [2][]const u8 = &.{},
     /// Extra `klio test` arguments for every child (`--feature …`).
     extra_args: []const []const u8 = &.{},
+    /// A program the suite's tests reach over the network, run beside them.
+    service: ?Service = null,
 };
+
+/// A program a suite's tests call over the network (a test server), run for
+/// the suite's duration: `klio <args>` starts in the background, the suite
+/// runs once `port` accepts connections on 127.0.0.1, and the service is
+/// stopped when the suite ends. Its output goes to a log in the temporary
+/// directory whose tail the census prints when the service never answers or
+/// the suite fails.
+pub const Service = struct {
+    /// `klio` arguments, e.g. `run --feature io.ktor/test-server server.kt`.
+    args: []const []const u8,
+    /// The port the service listens on. Zero picks a free port, which the
+    /// service and every test child read from `KLIO_SERVICE_PORT`. A fixed
+    /// port serves tests that name one; suites sharing a fixed port take
+    /// turns on a lock file, across worktrees too.
+    port: u16 = 0,
+    /// How long the port may take to accept, in ms on a ReleaseSafe harness.
+    ready_ms: i64 = 180_000,
+};
+
+const RunningService = struct {
+    child: std.process.Child,
+    lock: ?std.Io.File,
+    log_path: []const u8,
+
+    fn stop(rs: *RunningService, io: std.Io) void {
+        rs.child.kill(io);
+        if (rs.lock) |f| {
+            f.unlock(io);
+            f.close(io);
+        }
+    }
+};
+
+fn tempDir(env: *const std.process.Environ.Map) []const u8 {
+    return env.get("TMPDIR") orelse env.get("TEMP") orelse env.get("TMP") orelse "/tmp";
+}
+
+fn freeLoopbackPort(io: std.Io) !u16 {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .reuse_address = true });
+    defer srv.deinit(io);
+    return srv.socket.address.getPort();
+}
+
+fn portAccepts(io: std.Io, port: u16) bool {
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return false;
+    const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
+    return true;
+}
+
+/// The last `n` bytes of the service log, for a failure report.
+fn serviceLogTail(a: std.mem.Allocator, io: std.Io, path: []const u8, n: usize) []const u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch |e| return @errorName(e);
+    return bytes[if (bytes.len > n) bytes.len - n else 0..];
+}
+
+fn startService(
+    a: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    cfg: Config,
+    svc: Service,
+    slowdown: i64,
+) !RunningService {
+    const port = if (svc.port != 0) svc.port else try freeLoopbackPort(io);
+    try env.put("KLIO_SERVICE_PORT", try std.fmt.allocPrint(a, "{d}", .{port}));
+    const tmp = tempDir(env);
+    var lock: ?std.Io.File = null;
+    errdefer if (lock) |f| {
+        f.unlock(io);
+        f.close(io);
+    };
+    if (svc.port != 0) {
+        const lock_path = try std.fs.path.join(a, &.{ tmp, try std.fmt.allocPrint(a, "klio-census-service-{d}.lock", .{port}) });
+        const f = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+        f.lock(io, .exclusive) catch |e| {
+            f.close(io);
+            return e;
+        };
+        lock = f;
+    }
+    if (portAccepts(io, port)) {
+        std.debug.print("{s}_commontest: port {d} is already taken; the service cannot start\n", .{ cfg.name, port });
+        return error.ServicePortTaken;
+    }
+    const log_path = try std.fs.path.join(a, &.{ tmp, try std.fmt.allocPrint(a, "klio-census-{s}-service.log", .{cfg.name}) });
+    const log = try std.Io.Dir.cwd().createFile(io, log_path, .{});
+    defer log.close(io);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(a, klioBin(env));
+    try argv.appendSlice(a, svc.args);
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .environ_map = env,
+        .stdin = .ignore,
+        .stdout = .{ .file = log },
+        .stderr = .{ .file = log },
+    });
+    const deadline = runtime.clockMonotonicNanos() + @as(u64, @intCast(svc.ready_ms * slowdown)) * std.time.ns_per_ms;
+    while (runtime.clockMonotonicNanos() < deadline) {
+        if (portAccepts(io, port)) return .{ .child = child, .lock = lock, .log_path = log_path };
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+    }
+    child.kill(io);
+    std.debug.print("{s}_commontest: the service did not accept on port {d}; its log ({s}) ends:\n{s}\n", .{
+        cfg.name, port, log_path, serviceLogTail(a, io, log_path, 2000),
+    });
+    return error.ServiceNotReady;
+}
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
@@ -398,6 +510,14 @@ fn failedCount(stdout: []const u8) usize {
 
 var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
+/// ktor's own test server (tests/fixtures/ktor/test_server.kt over the pack's
+/// `test-server` feature), which the ktor client suites call at
+/// 127.0.0.1:8080 as upstream's do. The tests name the port, so it is fixed.
+const ktor_test_server: Service = .{
+    .args = &.{ "run", "--feature", "io.ktor/test-server", "tests/fixtures/ktor/test_server.kt" },
+    .port = 8080,
+};
+
 /// The suite registry, shared by the itest gates and the `klio-census` driver.
 /// Floors and ceilings are ratchets: tighten only.
 pub const suites = [_]Config{
@@ -558,10 +678,9 @@ pub const suites = [_]Config{
         },
         .extra_args = &.{ "--feature", "io.ktor/server-cio,server-test-suites" },
         .timeout_ms = 300_000,
-        // CIOEngineTest.kt does not finish: a cancelled delay or withTimeout
-        // timer holds its pool worker until it would have fired, so each
-        // test's server stop waits seconds for a free IO worker.
-        .baseline = 4,
+        .baseline = 98,
+        .max_failed = 0,
+        .max_incomplete = 0,
     },
     .{
         // ktor-server-tests' commonTest (routing, sessions, cookies, the
@@ -573,14 +692,9 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/klioTest/io/ktor/server/plugins/compression",
         },
         .extra_args = &.{ "--feature", "io.ktor/server-test-host,test-base,server-rate-limit,server-auto-head-response,server-caching-headers,server-call-id,server-compression,server-conditional-headers,server-content-negotiation,server-cors,server-data-conversion,server-double-receive,server-forwarded-header,server-hsts,server-http-redirect,server-method-override,server-partial-content,server-sessions,server-sse,server-status-pages,serialization-kotlinx-json" },
-        // HSTSTest x8: a lambda whose parameter type comes from the other
-        // side of `?:` loses the receiver of a nested `run`, so the default
-        // filter's body is empty (sema). SessionTest x3: a reified type
-        // argument inferred from a sibling argument of `assertEquals` is
-        // `Any` (sema).
         .timeout_ms = 90_000,
-        .baseline = 444,
-        .max_failed = 11,
+        .baseline = 455,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
     .{
@@ -611,13 +725,8 @@ pub const suites = [_]Config{
         // A hung case fails on runTest's own 60 s timeout; the child needs
         // the time to report it.
         .timeout_ms = 90_000,
-        // AuthorizeHeaderParserTest x3: an `assertIs` contract is not
-        // substituted at the call. DependencyInjectionTest x4: a constructor
-        // reference picks the `provide(KClass)` member over the function-type
-        // overloads (x2), a reified `provideDelegate` is not inferred from the
-        // property type, and the `assertIs` contract again (sema).
-        .baseline = 290,
-        .max_failed = 7,
+        .baseline = 297,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
     .{
@@ -633,14 +742,38 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-websockets/common/test",
         },
         .extra_args = &.{ "--feature", "io.ktor/client-mock,client-test-base,client-auth,client-call-id,client-content-negotiation,client-encoding,client-resources,client-websockets,client-logging,server-test-host,server-call-id,serialization-kotlinx-json" },
-        // AuthTest x29, ContentEncodingTest x5 and WebSocketRemoteTest x7 run
-        // `clientTests` against every registered engine, and those requests
-        // go to ktor's test server at 127.0.0.1:8080, which Gradle starts
-        // for upstream's runs and nothing starts here yet. Before CIO
-        // registered itself through `@EagerInitialization` they ran against
-        // no engine at all.
-        .baseline = 81,
-        .max_failed = 41,
+        // AuthTest, ContentEncodingTest and WebSocketRemoteTest call ktor's
+        // test server through every registered engine.
+        .service = ktor_test_server,
+        // ContentEncodingTest testGzipByteArray and testDisableDecompression:
+        // the server's `/gzip-precompressed` declares the 294 bytes the JVM's
+        // zlib makes of its body, and klio's deflate (std.compress.flate)
+        // makes 293.
+        .baseline = 120,
+        .max_failed = 2,
+        .max_incomplete = 0,
+    },
+    .{
+        // ktor-client-tests' commonTest: the client end to end over CIO
+        // against ktor's test server.
+        .name = "ktor_client_tests",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-tests/common/test",
+        },
+        // The module's commonMain, which its tests build on.
+        .extra_support = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-tests/common/src/io/ktor/client/tests/utils/Generators.kt",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/client-cio,client-test-base,client-mock,client-logging,client-auth,client-encoding,client-content-negotiation,client-websockets,serialization-kotlinx-json,test-base" },
+        .service = ktor_test_server,
+        .timeout_ms = 300_000,
+        // CacheLegacyStorageTest x7: `plugin::findAndRefresh` in
+        // HttpCacheLegacy.kt binds HttpCache's private member, which is not
+        // visible there, instead of the file's extension, so the legacy
+        // storage is never consulted. DispatcherTest x1: Dispatchers.IO's
+        // toString is not "Dispatchers.IO".
+        .baseline = 380,
+        .max_failed = 8,
         .max_incomplete = 0,
     },
     .{
@@ -961,6 +1094,9 @@ pub fn runSuite(cfg: Config) !void {
             }
         }
     };
+    var service: ?RunningService = if (cfg.service) |svc| try startService(a, io, &env, cfg, svc, slowdown) else null;
+    defer if (service) |*rs| rs.stop(io);
+
     var threads: std.ArrayList(std.Thread) = .empty;
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
@@ -971,6 +1107,11 @@ pub fn runSuite(cfg: Config) !void {
 
     const passed = total_passed.load(.monotonic);
     const failed = total_failed.load(.monotonic);
+    if (service) |rs| {
+        if (failed != 0 or passed < cfg.baseline) std.debug.print("{s}_commontest: the service's log ({s}) ends:\n{s}\n", .{
+            cfg.name, rs.log_path, serviceLogTail(a, io, rs.log_path, 2000),
+        });
+    }
     std.debug.print(
         "{s}_commontest: {d} passed, {d} failed across {d} files, {d} did not complete (baseline {d})\n",
         .{ cfg.name, passed, failed, targets.items.len, hung.load(.monotonic), cfg.baseline },

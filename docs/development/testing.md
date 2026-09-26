@@ -138,6 +138,19 @@ ratchet the pass count. The migration from the per-file driver + the
 Python sweep to a single `klio test <project> --format=json` is
 tracked in `plans/open-campaigns.md`.
 
+A suite whose tests call a server over the network declares it as a
+`service` in its `commontest_support.suites` entry: the `klio` arguments
+that start it and the port it listens on. The census starts the
+service before the suite's children, waits until the port accepts on
+127.0.0.1 (`ready_ms`), and kills it when the suite ends. Its output
+goes to `klio-census-<suite>-service.log` in the temporary directory,
+and the census prints the log's tail when the service never answers or
+the suite fails. Port zero picks a free port, which the service and
+every child read from `KLIO_SERVICE_PORT`; a fixed port is for tests
+that name one (ktor's client suites call its test server at
+127.0.0.1:8080), and suites sharing a fixed port take turns on a lock
+file in the temporary directory, across worktrees too.
+
 ## 5. Pack smoke tests
 
 Every pack ships a smoke flow:

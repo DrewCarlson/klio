@@ -39,6 +39,12 @@ cinterop. In practice that means:
   server's `ktor.*` environment properties), message digests (`Digest(name)`
   covers every JVM `MessageDigest` algorithm), the clock, locks and
   `PosixException`'s errno table are host natives too.
+- **JVM-only modules.** A few upstream files exist only for the JVM because
+  they reach `java.*`. klio carries them verbatim under `klioMain`, with a
+  `klio.*` class in place of the JVM one: server digest authentication
+  (`digest(…)` in `server-auth`, and ktor-http's `DigestAlgorithm.toDigester`)
+  hashes through `klio.security.MessageDigest`, the JVM's `MessageDigest`
+  surface over the same host digests.
 
 ## Features
 
@@ -76,6 +82,7 @@ on.
 | `test-base`                   | `test.*`: `runTest`, `runTestWithData`                  | `test-dispatcher`                          |                                 |
 | `server-test-suites`          | `server.testing.suites.*`: the shared engine suites     | `server-test-base` and the plugins they use |                                |
 | `client-test-base`            | `client.test.base.*`: the client test helpers           | `client-core`, `test-base`                 |                                 |
+| `test-server`                 | `testserver.runTestServer()`: ktor's own test server    | `server-cio` and the plugins it serves     |                                 |
 
 The plugin modules are features too, each requiring the core it plugs into:
 
@@ -293,10 +300,22 @@ with a client wired to it, and `MockEngine` (`client-mock`) answers client
 requests from a handler, as upstream's own test suites use them.
 
 klio runs upstream's commonTest suites for the pack's modules
-(`klio-census ktor,ktor_network,ktor_client_core,ktor_server_core,ktor_server_tests,ktor_server_plugins,ktor_client_plugins,ktor_shared,ktor_serialization`),
+(`klio-census ktor,ktor_network,ktor_client_core,ktor_server_core,ktor_server_cio,ktor_server_tests,ktor_server_plugins,ktor_client_plugins,ktor_client_tests,ktor_shared,ktor_serialization`),
 plus klio ports of the JVM tests for the modules that are JVM-only upstream
 (CallLogging, Compression). The plan (`plans/ktor-support.md`) lists the
 cases that still fail and why.
+
+The client suites call ktor's own test server (ktor-test-server) at
+127.0.0.1:8080, which upstream's Gradle build starts before their runs.
+The `test-server` feature carries it, and
+`klio run --feature io.ktor/test-server tests/fixtures/ktor/test_server.kt`
+starts it: the CIO application at 8080, the HTTP and SOCKS proxy test
+servers at 8082 and 8083, and the TLS server at 8089, which runs on the
+`Klio` engine with the klio test CA's localhost certificate
+(`tests/fixtures/tls/server-p256.pem`) where upstream uses Jetty. Upstream's
+Netty HTTP/2 server at 8084 is not started, since klio has no HTTP/2 engine.
+The census runs the server as the client suites' service (see
+`docs/development/testing.md`).
 
 ## Platforms
 

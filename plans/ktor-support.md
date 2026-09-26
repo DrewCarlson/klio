@@ -44,46 +44,43 @@ where upstream reaches the platform through cinterop.
 | ktor-network-tls | `network-tls` | TLS 1.3 sessions over `src/ktor_tls`, client and server |
 | ktor-client-core + mock | `client-core`, `client-mock` | whole module; census `ktor_client_core` 93/93 |
 | ktor-server-core + test host/base | `server-core`, `server-test-host`, `server-test-base` | whole module, multipart receive; census `ktor_server_core` 147/147 |
-| ktor-server-tests | (the plugins it covers) | census `ktor_server_tests` 444 passed, 11 failing, with the JVM compression tests ported |
+| ktor-server-tests | (the plugins it covers) | census `ktor_server_tests` 455/455, with the JVM compression tests ported |
 | ktor-client-cio | `client-cio` | verbatim, with its posix loader registering the default `HttpClient()` engine; `KlioClient`; HTTPS |
-| ktor-server-cio | `server-cio` | verbatim; census `ktor_server_cio` floor 4, currently 0 (CIOWebSocketTest's client hits the String::trim sema bug and hangs) |
+| ktor-server-cio | `server-cio` | verbatim; census `ktor_server_cio` 98/98 |
 | server HTTPS | `server-cio` | `Klio` = the CIO engine plus `sslConnector(chainPem, keyPem)`; calls report `https`; `wss` |
-| server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 290 passed, 7 failing |
+| server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 297/297 |
 | compression | `utils`, `server-compression`, `client-encoding` | gzip and deflate over `src/ktor_client/zlib.zig`; example `ktor_compression` |
 | WebSocket compression | `websockets` | klio port of the JVM permessage-deflate extension; example `ktor_websocket_deflate` |
 | call logging | `server-call-logging` | klio port on `LogLevel` and `klio.logging.MDC`; upstream's JVM CallLoggingTest ported, 20/20 in `ktor_server_plugins` |
-| client plugins | `client-*` | 7 modules verbatim; census `ktor_client_plugins` 81 passed, 41 waiting on the test server |
+| client plugins | `client-*` | 7 modules verbatim; census `ktor_client_plugins` 120 passed, 2 failing, against ktor's test server |
+| ktor-client-tests | (the client end to end) | census `ktor_client_tests` 380 passed, 8 failing, over CIO against ktor's test server |
+| ktor-test-server | `test-server` | verbatim with klio copies of its JVM files; TLS on `Klio`; the census service for the client suites |
+| digest authentication | `server-auth`, `http` | the JVM-only DigestAuth, DigestCredential and `toDigester` verbatim over `klio.security.MessageDigest` |
 | kotlinx JSON converter | `serialization-kotlinx-json` | census `ktor_serialization` 14/14 |
 | shared modules | `call-id`, `resources`, `websockets`, `test-base` | census `ktor_shared` 50/50 |
 
 Open failures, each with its owner:
-- `ktor_server_cio`: CIOWebSocketTest's client never finishes the upgrade
-  handshake: the suite's `parseHeaders` does
-  `line.split(":").map(String::trim)` and `builder.append(name, value)`,
-  the sema census site WebSocketEngineSuite.kt:815 (`String::trim` binds
-  CharSequence.trim, so `append` has no call record and lowers broken). The
-  client never closes its socket, the server rightly waits, and the test
-  hangs after its timeout. The census compiles CIOWebSocketTest.kt into
-  every job, so all three files hang. Fixed on the sema branch, not yet
-  merged.
-- `ktor_server_plugins`, 7 cases: AuthorizeHeaderParserTest x3 (sema: an
-  `assertIs` contract's `T` is not substituted at the call, so the smart
-  cast is `HttpAuthHeader & T`); DependencyInjectionTest x4 (sema: a
-  constructor reference resolves to the `provide(KClass)` member x2, a
-  reified `provideDelegate` is not inferred from the property's type, and
-  the `assertIs` contract). Fixed on the sema branch, not yet merged.
-- `ktor_client_plugins`, 41 cases: AuthTest x29, ContentEncodingTest x5 and
-  WebSocketRemoteTest x7 send requests through every registered engine to
-  ktor's test server at 127.0.0.1:8080, which nothing starts yet. They ran
-  against no engine at all until `@EagerInitialization` registered CIO.
-- `ktor_server_tests`, 11 cases: HSTSTest x8 (sema: a lambda typed from the
-  other side of `?:` loses a nested `run` receiver, so HSTS's default
-  filter has no body and every call hangs to runTest's timeout);
-  SessionTest x3 (sema: a reified type argument inferred from a sibling
-  argument is `Any`). Both fixed on the sema branch, not yet merged.
+- `ktor_client_plugins`, 2 cases: ContentEncodingTest testGzipByteArray
+  and testDisableDecompression. The test server's `/gzip-precompressed`
+  declares the 294 bytes the JVM's zlib makes of its body, and klio's
+  deflate (std.compress.flate, level 6) makes 293, so the server rightly
+  fails the response. Needs a deflate that matches zlib's output byte for
+  byte (ktor).
+- `ktor_client_tests`, 8 cases: CacheLegacyStorageTest x7 (sema: the
+  callable reference `plugin::findAndRefresh` in HttpCacheLegacy.kt binds
+  HttpCache's private member, which is not visible there, instead of the
+  file's private extension, so the legacy storage is never consulted);
+  DispatcherTest x1 (coroutines: `Dispatchers.IO.toString()` is not
+  "Dispatchers.IO", which upstream native's DefaultIoScheduler returns).
+- Digest authentication on the server:
+  DigestAuthenticationProvider.onAuthenticate reads `credentials.qop` in the
+  branch where `principal`, a safe call on `credentials`, is not null. K2
+  smart casts `credentials` there and klio does not yet, so the body fails
+  to lower and the call has none (sema). No upstream suite covers it: the
+  client AuthTest digest cases exclude native engines.
 
-Not run from upstream: the suites that need ktor's JVM test server
-(ktor-client-cio, ktor-client-bom-remover, ktor-client-tests); the ones
+Not run from upstream: ktor-client-cio's and ktor-client-bom-remover's
+own suites, which the test server now makes runnable; the ones
 for kotlinx.html and the other formats (html-builder, htmx, cbor, protobuf,
 xml), which the pack does not ship; and ktor-network's nix suites
 (`SelectNixTest`, `TcpSocketTestNix`, `UdpSocketTestNix`), which test the
@@ -102,12 +99,12 @@ klio runs.
    reporting the `https` scheme.
 2. ktor-server-tests' commonTest (405), and klio ports of its JVM
    CompressionTest and CompressionAcceptEncodingTest.
-3. Run ktor's test server (`ktor-test-server`, a Ktor application) under
-   klio for the client suites: the 41 client plugin cases above, then
-   ktor-client-tests and ktor-client-cio's own suite.
-4. When the sema fixes land: set the `ktor_server_cio` ratchet from
-   CIOWebSocketTest.kt and CIOEngineTest.kt, and recount the HSTS, Session,
-   AuthorizeHeaderParser and DI cases.
+3. Done: ktor's test server under klio (`test-server`), run by the census
+   as the client suites' service; ktor-client-tests' suite; the
+   `ktor_server_cio`, `ktor_server_tests` and `ktor_server_plugins`
+   ratchets at zero failures once the sema fixes landed.
+4. ktor-client-cio's and ktor-client-bom-remover's own suites against the
+   test server, and a zlib-exact deflate for the precompressed gzip body.
 5. Static content (`staticFiles`, `staticResources`, pre-compressed files)
    over kotlinx-io files instead of java.io.File.
 
@@ -156,6 +153,20 @@ klio runs.
   upstream's `import kotlinx.coroutines.IO` in ktor-io's posix
   `IODispatcher.posix.kt` does not resolve; klio's actual returns
   `Dispatchers.IO` directly.
+
+- ktor's test server (ktor-test-server) is build infrastructure upstream:
+  Gradle starts it before the client test runs. The `test-server` feature
+  loads its sources verbatim; the eight files that reach the JVM have klio
+  copies under klioMain/test/server with only those uses swapped
+  (klio.security.MessageDigest, atomicfu, ktor's writer and charset API, the
+  platform SelectorManager), and the TLS server at 8089 runs on the Klio
+  engine with the klio test CA's certificate instead of Jetty with a
+  generated keystore. `io.ktor.testserver.runTestServer()` is the entry
+  point, under the pack's id prefix so a program can import it. The census
+  runs `tests/fixtures/ktor/test_server.kt` as the client suites' service
+  (commontest_support.zig): the tests name 127.0.0.1:8080, so the port is
+  fixed and suites take turns on a lock file; every server binds with
+  address reuse so the next suite can start it at once.
 
 ## TLS design and limits
 
@@ -377,4 +388,5 @@ ReleaseSafe harness build beside other containers, runs out of memory.
 
 ## Out of scope for now
 
-- ktor-client-tests (395) needs ktor's JVM test server.
+- HTTP/2: upstream's test server runs a Netty HTTP/2 server at 8084, which
+  klio's test server does not start, since klio has no HTTP/2 engine.

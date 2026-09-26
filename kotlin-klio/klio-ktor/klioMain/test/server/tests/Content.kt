@@ -1,0 +1,140 @@
+/*
+ * Copyright 2014-2024 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+ */
+
+// klio's copy of ktor-test-server's Content.kt: `/content/chunked-data`
+// writes its chunks through `respondBytesWriter` with the content type the
+// JVM's `respondTextWriter` (a java.io.Writer) sends. Everything else is
+// upstream's.
+
+package test.server.tests
+
+import io.ktor.http.*
+import io.ktor.http.content.*
+import io.ktor.server.application.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import io.ktor.utils.io.*
+import io.ktor.utils.io.charsets.*
+import kotlinx.coroutines.delay
+import test.server.fail
+import test.server.makeString
+
+internal fun Application.contentTestServer() {
+    routing {
+        route("/content") {
+            get("/uri") {
+                call.respondText { call.request.local.uri }
+            }
+
+            get("/empty") {
+                call.respond("")
+            }
+            get("/chunked-data") {
+                call.respondBytesWriter(contentType = ContentType.Text.Plain.withCharset(Charsets.UTF_8)) {
+                    val text = "x".repeat(call.parameters["size"]?.toInt() ?: 1000)
+                    text.chunked(255).forEach { writeStringUtf8(it) }
+                }
+            }
+            head("/emptyHead") {
+                call.respond(
+                    object : OutgoingContent.NoContent() {
+                        override val contentLength: Long = 150
+                    }
+                )
+            }
+            get("/hello") {
+                call.respond("hello")
+            }
+            get("/xxx") {
+                call.respond(
+                    buildString {
+                        append("x".repeat(100))
+                    }
+                )
+            }
+
+            post("/pseudo-auth") {
+                if (call.request.headers.contains("respond")) {
+                    val content = call.request.receiveChannel().toByteArray()
+                    call.respond(content.size.toString())
+                } else {
+                    call.respond(HttpStatusCode.Forbidden)
+                }
+            }
+            post("/echo") {
+                val content = call.request.receiveChannel().toByteArray()
+                call.respond(content)
+            }
+            get("/news") {
+                val form = call.request.queryParameters
+
+                check("myuser" == form["user"]!!)
+                check("10" == form["page"]!!)
+
+                call.respond("100")
+            }
+            get("/big-plain-text") {
+                call.respondText {
+                    buildString {
+                        for (i in 1..10_000)
+                            appendLine("I will not introduce deadlocks.")
+                    }
+                }
+            }
+            post("/sign") {
+                val form = call.receiveParameters()
+
+                check("myuser" == form["user"]!!)
+                check("abcdefg" == form["token"]!!)
+
+                call.respond("success")
+            }
+            post("/upload") {
+                val response = StringBuilder()
+                call.receiveMultipart().forEachPart { part ->
+                    check(part.contentDisposition?.disposition == "form-data")
+                    response.append(part.makeString())
+                    part.dispose()
+                }
+
+                call.respondText(response.toString())
+            }
+            put("/file-upload") {
+                if (call.request.headers[HttpHeaders.ContentLength] == null) error("Content length is missing")
+
+                val file = call.receiveMultipart().readPart() as? PartData.FileItem ?: call.fail("Invalid item")
+                if (4 != file.headers[HttpHeaders.ContentLength]?.toInt()) call.fail("Size is missing")
+
+                val value = file.provider().readInt()
+                if (value != 42) call.fail("Invalid content")
+
+                call.respond(HttpStatusCode.OK)
+            }
+            get("/stream") {
+                val delay = call.parameters["delay"]?.toLong() ?: 0L
+                call.respond(
+                    object : OutgoingContent.WriteChannelContent() {
+                        override val contentType: ContentType
+                            get() = ContentType.Application.OctetStream
+
+                        override suspend fun writeTo(channel: ByteWriteChannel) {
+                            while (true) {
+                                channel.writeInt(42)
+                                channel.flush()
+                                delay(delay)
+                            }
+                        }
+                    }
+                )
+            }
+
+            get("/binary") {
+                call.respondBytes(contentType = ContentType.Image.PNG) {
+                    byteArrayOf((0x89).toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+                }
+            }
+        }
+    }
+}
