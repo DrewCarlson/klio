@@ -238,6 +238,68 @@ fn expectThrow(src: []const u8, fqn: []const u8) !void {
     };
 }
 
+test "a call to an empty function still initializes its object and evaluates its arguments" {
+    try expectRun(
+        \\object O {
+        \\    init { println("init O") }
+        \\    fun f(x: Int) {}
+        \\}
+        \\fun arg(): Int { println("arg"); return 1 }
+        \\fun main() {
+        \\    println("before")
+        \\    O.f(arg())
+        \\    O.f(arg())
+        \\    println("after")
+        \\}
+    , "before\ninit O\narg\narg\nafter\n");
+}
+
+test "data class hashes, strings and enum comparisons give Kotlin's answers" {
+    try expectRun(
+        \\enum class E { A, B }
+        \\data class P(val a: Int, val b: String?, val e: E?)
+        \\fun main() {
+        \\    val p = P(1, null, E.A)
+        \\    println(p)
+        \\    println(p.hashCode() == P(1, null, E.A).hashCode())
+        \\    println(P(2, "x", null).hashCode() - P(2, "x", null).hashCode())
+        \\    val n: E? = null
+        \\    println("" + (p.e == E.A) + " " + (p.e != E.B) + " " + (n == E.A) + " " + (n == null))
+        \\}
+    , "P(a=1, b=null, e=A)\ntrue\n0\ntrue true false true\n");
+}
+
+test "a data class's hashCode and toString read each property's own, without the Any? extensions" {
+    var fx = try Fx.init(
+        \\data class P(val a: Int, val b: String?)
+        \\fun main() { println(P(1, null)) }
+    );
+    defer fx.deinit();
+    try fx.expectNoErrors();
+    const p = try fx.class("P");
+    // `Any?.hashCode()` and `Any?.toString()` inlined: a null test and the
+    // member through `Any`'s slot for each property.
+    const hash = fx.an.br.funcOf(try fx.member(p, "hashCode"));
+    try testing.expectEqual(@as(usize, 0), fx.count(hash, .CallStatic));
+    try testing.expectEqual(@as(usize, 2), fx.count(hash, .RCallVirtual));
+    const str = fx.an.br.funcOf(try fx.member(p, "toString"));
+    try testing.expectEqual(@as(usize, 0), fx.count(str, .CallStatic));
+    try testing.expectEqual(@as(usize, 2), fx.count(str, .RCallVirtual));
+}
+
+test "an enum's == is identity, calling no equals" {
+    var fx = try Fx.init(
+        \\enum class E { A, B }
+        \\fun same(x: E, y: E?): Boolean = x == y
+        \\fun main() { println(same(E.A, null)) }
+    );
+    defer fx.deinit();
+    try fx.expectNoErrors();
+    const same = fx.an.br.funcOf(try fx.topLevel("same"));
+    try testing.expectEqual(@as(usize, 0), fx.count(same, .CallStatic));
+    try testing.expectEqual(@as(usize, 0), fx.count(same, .RCallVirtual));
+}
+
 test "an open base's body property holds its seed while an override reads it during the base constructor" {
     try expectRun(
         \\open class Base {

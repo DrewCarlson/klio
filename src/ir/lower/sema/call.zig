@@ -540,12 +540,37 @@ fn finish(b: *Builder, rec: *const CallRec, how: How, run: *const Run, from: loc
             if (isTypeOf(b.p.s, rec.callee) and rec.type_args.len == 1) return types_mod.typeValue(b, rec.type_args[0]);
             return inline_mod.instantiate(b, rec, f, run.regs.items, run.lambdas.items);
         },
+        // A function with an empty body does nothing once its receiver and
+        // arguments are evaluated (a platform's no-op actual).
+        .static => |f| if (b.p.br.funcOfOpt(rec.callee) == f and emptyBody(b.p.s, rec.callee)) return b.unit(),
         else => {},
     }
     const first = try locals.runFrom(b, from, run.regs.items);
     const dst = b.newReg();
     try dispatch.emitHow(b, how, dst, first, @intCast(run.regs.items.len));
     return dst;
+}
+
+/// Whether `f` is a written function of the base (the standard library, a
+/// pack: a platform's no-op actual) whose body is an empty block: not
+/// inline, suspending, tail-recursive, external or composable (a composable
+/// one still opens its groups). A program's own functions keep their calls,
+/// which klio's tools name them by (fault injection, frame watches).
+fn emptyBody(s: *sema.Sema, f: Sym) bool {
+    if (s.syms.kind(f) != .function) return false;
+    const file = s.syms.get(f).file;
+    if (file >= s.files.items.len or s.files.items[file].origin == .program) return false;
+    const fd = switch (s.syms.get(f).decl) {
+        .function => |d| d,
+        else => return false,
+    };
+    if (fd.is_inline or fd.is_suspend or fd.is_tailrec or fd.is_external or fd.is_expect) return false;
+    const written = fd.body orelse return false;
+    const empty = switch (written) {
+        .Block => |blk| blk.stmts.len == 0,
+        .Expr => false,
+    };
+    return empty and !compose.composableFunction(s, f);
 }
 
 /// `kotlin.reflect.typeOf<T>()`: the run-time type of its type argument,

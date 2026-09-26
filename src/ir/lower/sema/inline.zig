@@ -487,10 +487,10 @@ fn copyInst(b: *Builder, inst: *const Instance, k: u32, tg: Target, x: *const In
             if (inst.uses[i] == .in_place) return inPlace(b, inst, k, tg, i, cv);
         },
         .InstanceOfDyn => |t| if (paramOf(inst, t.ty)) |i| {
-            if (concreteClass(b, inst, i)) |cls| return b.emit(.{ .RInstanceOf = .{ .dst = mapReg(inst, t.dst), .src = mapReg(inst, t.src), .class = cls, .nullable = t.nullable } });
+            if (concreteType(b, inst, i)) |ct| return b.emit(.{ .RInstanceOf = .{ .dst = mapReg(inst, t.dst), .src = mapReg(inst, t.src), .class = ct.class, .nullable = t.nullable or ct.nullable } });
         },
         .CastDyn => |t| if (paramOf(inst, t.ty)) |i| {
-            if (concreteClass(b, inst, i)) |cls| return b.emit(.{ .RCast = .{ .dst = mapReg(inst, t.dst), .src = mapReg(inst, t.src), .class = cls, .nullable = t.nullable, .safe = t.safe } });
+            if (concreteType(b, inst, i)) |ct| return b.emit(.{ .RCast = .{ .dst = mapReg(inst, t.dst), .src = mapReg(inst, t.src), .class = ct.class, .nullable = t.nullable or ct.nullable, .safe = t.safe } });
         },
         .CallStatic => |cs| if (try enumIntrinsic(b, inst, cs)) return,
         else => {},
@@ -502,24 +502,58 @@ fn paramOf(inst: *const Instance, r: Reg) ?u16 {
     return if (r.int() < inst.param_of.len) inst.param_of[r.int()] else null;
 }
 
-/// The class a reified type value the caller passed names, when the caller
-/// made it with a class literal just before the call.
-fn concreteClass(b: *Builder, inst: *const Instance, i: u16) ?ClassId {
+/// The class a reified type value the caller passed names, and whether the
+/// type is nullable, when the caller made it here: a class literal, or the
+/// `KType` the base builds over one with a constant nullability. A test or
+/// cast against it is then static: a reified type argument is erased to its
+/// class, as the JVM's `instanceof` erases it.
+fn concreteType(b: *Builder, inst: *const Instance, i: u16) ?struct { class: ClassId, nullable: bool } {
     if (i >= inst.run.len) return null;
-    const r = inst.run[i];
-    // The literal is in the block the call started in; the copy may have
-    // moved on, so search every block of the caller written so far.
-    var bi = b.blocks.items.len;
-    while (bi > 0) {
-        bi -= 1;
-        const list = b.blocks.items[bi].insts.items;
-        var j = list.len;
-        while (j > 0) {
-            j -= 1;
-            switch (list[j]) {
-                .ClassLiteral => |cl| if (cl.dst == r) return cl.class,
-                else => {},
-            }
+    const make = types.typeBuilder(b);
+    var cur = inst.run[i];
+    var hops: u8 = 0;
+    while (hops < 8) : (hops += 1) {
+        switch (lastDef(b, cur) orelse return null) {
+            .ClassLiteral => |cl| return .{ .class = cl.class, .nullable = false },
+            .Move => |m| cur = m.src,
+            .CallStatic => |c| {
+                if (make == null or c.func != make.? or c.n_args < 2) return null;
+                const cls = classOfReg(b, c.args) orelse return null;
+                const nullable = boolConstOf(b, Reg.from(c.args.int() + 1)) orelse return null;
+                return .{ .class = cls, .nullable = nullable };
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// The class literal `r` holds, through copies.
+fn classOfReg(b: *Builder, r: Reg) ?ClassId {
+    var cur = r;
+    var hops: u8 = 0;
+    while (hops < 8) : (hops += 1) {
+        switch (lastDef(b, cur) orelse return null) {
+            .ClassLiteral => |cl| return cl.class,
+            .Move => |m| cur = m.src,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// The Boolean constant `r` holds, through copies.
+fn boolConstOf(b: *Builder, r: Reg) ?bool {
+    var cur = r;
+    var hops: u8 = 0;
+    while (hops < 8) : (hops += 1) {
+        switch (lastDef(b, cur) orelse return null) {
+            .Const => |c| return switch (b.p.m.consts.items[c.value.int()]) {
+                .Bool => |v| v,
+                else => null,
+            },
+            .Move => |m| cur = m.src,
+            else => return null,
         }
     }
     return null;

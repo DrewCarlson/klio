@@ -134,6 +134,11 @@ const Fixture = struct {
     ;
 
     fn init(src: []const u8) !*Fixture {
+        return initWithBase("", src);
+    }
+
+    /// `init` with `extra` declared in the base, after its own declarations.
+    fn initWithBase(extra: []const u8, src: []const u8) !*Fixture {
         const fx = try testing.allocator.create(Fixture);
         errdefer testing.allocator.destroy(fx);
         fx.arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -142,6 +147,7 @@ const Fixture = struct {
         var map = span.SourceMap.init(a);
         const s = try sema.Sema.init(a);
         try s.addFiles(&.{try parse(a, &map, "kotlin.kt", base_src, .base)});
+        if (extra.len != 0) try s.addFiles(&.{try parse(a, &map, "extra.kt", extra, .base)});
         try s.addFiles(&.{try parse(a, &map, "main.kt", src, .program)});
         try s.resolveBodies(&.{.program});
         fx.s = s;
@@ -536,6 +542,34 @@ test "a callee the bridge gave no identity fails the choice" {
     try testing.expectError(error.Unrecorded, fx.choose(.none, .plain));
 }
 
+test "a call to a base function with an empty body is only its receiver and arguments" {
+    const fx = try Fixture.initWithBase(
+        \\package platform
+        \\object Stats { fun onCall() {} }
+        \\fun noop(x: Any?) {}
+    ,
+        \\package demo
+        \\import platform.Stats
+        \\import platform.noop
+        \\fun own() {}
+        \\fun use(v: Int): Int {
+        \\    Stats.onCall()
+        \\    noop(v)
+        \\    own()
+        \\    return v
+        \\}
+    );
+    defer fx.deinit();
+    const l = try Lowered.of(fx, "use");
+    // The base's no-ops are gone; the program's own function keeps its
+    // call, which klio's tools name it by.
+    const calls = try l.all(.CallStatic);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqual(ir.FuncId.from((try fx.top("own")).int()), calls[0].CallStatic.func);
+    // The object is still loaded, so a first use initializes it.
+    try testing.expectEqual(@as(usize, 1), (try l.all(.LoadObject)).len);
+}
+
 test "a for over a standard progression counts, calling no iterator" {
     // The fixture's base has no ranges: the progression the loops would walk
     // is declared where the standard library's is.
@@ -552,7 +586,7 @@ test "a for over a standard progression counts, calling no iterator" {
         \\infix fun Int.downTo(to: Int): IntProgression = downTo(this, to)
         \\fun until(from: Int, to: Int): IntProgression = until(from, to)
         \\fun downTo(from: Int, to: Int): IntProgression = downTo(from, to)
-        \\fun consume(x: Int) {}
+        \\fun consume(x: Int): Int = x
         \\fun loops(n: Int) {
         \\    for (i in 0 until n) consume(i)
         \\    for (i in n downTo 0) consume(i)

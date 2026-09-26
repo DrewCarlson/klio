@@ -274,6 +274,60 @@ test "a reified type parameter written nullable passes its type marked nullable"
         "T: Int\nT?: Int?\nBox<T?>: Box<Int?>\nT? of T?: Int?\n");
 }
 
+test "a reified argument an inline body only tests builds no type value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const an = try driver.analyze(a, &.{
+        \\package kotlin.reflect
+        \\interface KType
+        \\class TestType(val name: String?, val nullable: Boolean, val args: Array<out Any?>) : KType
+        \\fun __klio_type(classifier: KClass<*>, nullable: Boolean, vararg arguments: Any?): KType = TestType(classifier.simpleName, nullable, arguments)
+        \\fun __klio_projection(variance: Int, type: KType?): Any? = type
+        \\fun __klio_typeNullable(type: KType): KType = type
+        ,
+        \\inline fun <reified T> isA(x: Any?): Boolean = x is T
+        \\fun main() {
+        \\    val x: Any? = "s"
+        \\    println(isA<String>(x))
+        \\    println(isA<List<Int>>(x))
+        \\}
+    });
+    const prog = try ir.lower_sema.lowerProgram(a, an.s, an.br);
+    try std.testing.expectEqual(@as(usize, 0), prog.errors.items.len);
+    const main = an.br.funcOfOpt((try an.mainSym()).?).?;
+    var literals: u32 = 0;
+    var arrays: u32 = 0;
+    for (an.br.m.funcs.items[main.int()].blocks) |blk| for (blk.insts) |inst| switch (inst) {
+        .ClassLiteral => literals += 1,
+        .NewArray => arrays += 1,
+        else => {},
+    };
+    // `is T` became a static test: nothing is left that reads the `KType`
+    // the call built for `T`, so nothing builds it.
+    try std.testing.expectEqual(@as(u32, 0), literals);
+    try std.testing.expectEqual(@as(u32, 0), arrays);
+}
+
+test "a static test against a reified type keeps the type argument's nullability" {
+    try driver.expectOutput(&.{
+        \\package kotlin.reflect
+        \\interface KType
+        \\class TestType(val name: String?, val nullable: Boolean, val args: Array<out Any?>) : KType
+        \\fun __klio_type(classifier: KClass<*>, nullable: Boolean, vararg arguments: Any?): KType = TestType(classifier.simpleName, nullable, arguments)
+        \\fun __klio_projection(variance: Int, type: KType?): Any? = type
+        \\fun __klio_typeNullable(type: KType): KType = type
+        ,
+        \\inline fun <reified T> isA(x: Any?): Boolean = x is T
+        \\inline fun <reified T> asT(x: Any?): T = x as T
+        \\fun main() {
+        \\    println("" + isA<String>(null) + " " + isA<String?>(null) + " " + isA<String?>("s") + " " + isA<Int?>("s"))
+        \\    println(asT<String?>(null))
+        \\    println(asT<String>("ok"))
+        \\}
+    }, "false true true false\nnull\nok\n");
+}
+
 test "a reified type parameter tests, casts, names its class and passes on" {
     try expectRun(
         \\inline fun <reified T> isA(x: Any?): Boolean = x is T

@@ -884,7 +884,7 @@ fn samHashCode(b: *Builder) Error!void {
     const this = try loadParam(b, 0);
     const fv = b.newReg();
     try b.emit(.{ .GetFieldSlot = .{ .dst = fv, .obj = this, .slot = 0 } });
-    b.terminate(.{ .Return = try callStatic(b, try baseExtension(b, "hashCode"), &.{fv}) });
+    b.terminate(.{ .Return = try valueHash(b, try anyMember(b, sema.wk.hashCode), fv) });
 }
 
 /// A data or value class's constructor properties, in parameter order.
@@ -947,7 +947,7 @@ fn dataToString(b: *Builder, cls: Sym) Error!void {
 fn propertiesToString(b: *Builder, cls: Sym, head: []const u8) Error!void {
     const s = b.p.s;
     const this = try env.thisOf(b, cls);
-    const to_string = try baseExtension(b, "toString");
+    const any_string = try anyMember(b, sema.wk.toString);
     const props = try dataProperties(b, cls);
     var acc = try b.emitConst(.{ .String = try std.fmt.allocPrint(b.p.a, "{s}(", .{head}) });
     for (props, 0..) |p, i| {
@@ -956,8 +956,8 @@ fn propertiesToString(b: *Builder, cls: Sym, head: []const u8) Error!void {
         const v = try readProp(b, p, this);
         // An array renders by its elements, as the JVM's `Arrays.toString`
         // does: `[1, 2]`.
-        const f = (try arrayContent(b, p, "contentToString", 0)) orelse to_string;
-        acc = try concat(b, acc, try callStatic(b, f, &.{v}));
+        const text = if (try arrayContent(b, p, "contentToString", 0)) |f| try callStatic(b, f, &.{v}) else try valueString(b, any_string, v);
+        acc = try concat(b, acc, text);
     }
     acc = try concat(b, acc, try b.emitConst(.{ .String = ")" }));
     b.terminate(.{ .Return = acc });
@@ -974,12 +974,12 @@ fn dataHashCode(b: *Builder, cls: Sym) Error!void {
         return;
     }
     const this = try env.thisOf(b, cls);
-    const hash = try baseExtension(b, "hashCode");
+    const any_hash = try anyMember(b, sema.wk.hashCode);
     const props = try dataProperties(b, cls);
     var acc: ?Reg = null;
     const k31 = try b.emitConst(.{ .Int = 31 });
     for (props) |p| {
-        const h = try callStatic(b, hash, &.{try readProp(b, p, this)});
+        const h = try valueHash(b, any_hash, try readProp(b, p, this));
         if (acc) |x| {
             const m = b.newReg();
             try b.emit(.{ .BinOp = .{ .dst = m, .op = .Mul, .lhs = x, .rhs = k31 } });
@@ -997,14 +997,14 @@ fn dataHashCode(b: *Builder, cls: Sym) Error!void {
 fn annotationHashCode(b: *Builder, cls: Sym) Error!void {
     const s = b.p.s;
     const this = try env.thisOf(b, cls);
-    const hash = try baseExtension(b, "hashCode");
+    const any_hash = try anyMember(b, sema.wk.hashCode);
     const props = try dataProperties(b, cls);
     var acc = try b.emitConst(.{ .Int = 0 });
     for (props) |p| {
         const key = try b.emitConst(.{ .Int = 127 *% stringHash(s.str(s.syms.name(p))) });
         const v = try readProp(b, p, this);
         // An array member hashes by content.
-        const h = if (try arrayContent(b, p, "contentHashCode", 0)) |f| try callStatic(b, f, &.{v}) else try callStatic(b, hash, &.{v});
+        const h = if (try arrayContent(b, p, "contentHashCode", 0)) |f| try callStatic(b, f, &.{v}) else try valueHash(b, any_hash, v);
         const x = b.newReg();
         try b.emit(.{ .BinOp = .{ .dst = x, .op = .Xor, .lhs = key, .rhs = h } });
         const sum = b.newReg();
@@ -1136,14 +1136,47 @@ fn valuesEqual(b: *Builder, any_equals: FuncId, x: Reg, y: Reg) Error!Reg {
 }
 
 fn anyEquals(b: *Builder) Error!FuncId {
+    return anyMember(b, sema.wk.equals);
+}
+
+/// `kotlin.Any`'s member `name` (`equals`, `hashCode`, `toString`).
+fn anyMember(b: *Builder, name: sema.Name) Error!FuncId {
     const s = b.p.s;
     const any = s.builtins.any;
     if (any != .none) {
-        for (sema.symbols.Symbols.members(&s.syms.classInfo(any).members, sema.wk.equals)) |m| {
+        for (sema.symbols.Symbols.members(&s.syms.classInfo(any).members, name)) |m| {
             if (b.p.br.funcOfOpt(m)) |f| return f;
         }
     }
-    return b.fail(b.cur_span, "the base declares no `Any.equals`", .{});
+    return b.fail(b.cur_span, "the base declares no `Any.{s}`", .{s.str(name)});
+}
+
+/// `v?.hashCode() ?: 0` through `Any.hashCode`'s slot: the extension
+/// `Any?.hashCode()`'s body, without the call to it.
+fn valueHash(b: *Builder, any_hash: FuncId, v: Reg) Error!Reg {
+    return nullOrVirtual(b, any_hash, v, try b.emitConst(.{ .Int = 0 }));
+}
+
+/// `v?.toString() ?: "null"` through `Any.toString`'s slot, as the
+/// extension `Any?.toString()` has it.
+fn valueString(b: *Builder, any_string: FuncId, v: Reg) Error!Reg {
+    return nullOrVirtual(b, any_string, v, try b.emitConst(.{ .String = "null" }));
+}
+
+/// `if_null` for a null `v`, else `Any`'s member `member` of `v`.
+fn nullOrVirtual(b: *Builder, member: FuncId, v: Reg, if_null: Reg) Error!Reg {
+    const slot = b.p.br.slotOf(member) orelse return b.fail(b.cur_span, "`Any`'s member has no slot", .{});
+    const result = b.newReg();
+    const split = try b.branchOnNull(v);
+    const join = try b.newBlock();
+    b.switchTo(split.is_null);
+    try b.emit(.{ .Move = .{ .dst = result, .src = if_null } });
+    b.terminate(.{ .Goto = join });
+    b.switchTo(split.not_null);
+    try b.emit(.{ .RCallVirtual = .{ .dst = result, .slot = slot, .args = try b.run(&.{v}), .n_args = 1 } });
+    b.terminate(.{ .Goto = join });
+    b.switchTo(join);
+    return result;
 }
 
 /// `values()`: a new array of the entries in order.
@@ -1224,22 +1257,6 @@ fn callStatic(b: *Builder, f: FuncId, args: []const Reg) Error!Reg {
 
 /// The base's `Any?.name()` extension in package `kotlin`: `toString` and
 /// `hashCode` of a value that may be null.
-fn baseExtension(b: *Builder, name: []const u8) Error!FuncId {
-    const s = b.p.s;
-    const fail_msg = "the base declares no `Any?.{s}()` in package kotlin";
-    const pkg_name = s.names.lookup("kotlin") orelse return b.fail(b.cur_span, fail_msg, .{name});
-    const pkg = s.syms.package_by_fqn.get(pkg_name) orelse return b.fail(b.cur_span, fail_msg, .{name});
-    const n = s.names.lookup(name) orelse return b.fail(b.cur_span, fail_msg, .{name});
-    for (sema.scope.membersOf(s, pkg, n)) |m| {
-        if (s.syms.kind(m) != .function) continue;
-        try sema.headers.functionHeader(s, m);
-        const info = s.syms.functionInfo(m);
-        if (info.receiver != s.t.any_q or info.params.len != 0) continue;
-        if (b.p.br.funcOfOpt(m)) |f| return f;
-    }
-    return b.fail(b.cur_span, fail_msg, .{name});
-}
-
 // ------------------------------------------- object expressions, locals --
 
 /// `object : ... { }`: a new instance of its class, given the values the

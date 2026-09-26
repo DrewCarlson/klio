@@ -213,6 +213,12 @@ pub fn typeBuilder(b: *Builder) ?ir.FuncId {
     return helper(b, "__klio_type");
 }
 
+/// The base's functions a run-time type value is built with: they only
+/// allocate the value.
+pub fn typeBuilders(b: *Builder) [3]?ir.FuncId {
+    return .{ helper(b, "__klio_type"), helper(b, "__klio_projection"), helper(b, "__klio_typeNullable") };
+}
+
 /// Whether `t` is a type parameter that is not reified.
 fn erased(s: *sema.Sema, t: TypeId) bool {
     return switch (s.types.get(t)) {

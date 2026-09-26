@@ -15,6 +15,7 @@ const env_mod = @import("env.zig");
 const operator = @import("operator.zig");
 const inline_mod = @import("inline.zig");
 const locals_mod = @import("locals.zig");
+const types_mod = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 const Sym = sema.Sym;
@@ -318,6 +319,7 @@ pub const Builder = struct {
     /// nothing terminated is dead code and ends in `Unreachable`.
     pub fn finish(b: *Builder) Error!void {
         const a = b.p.a;
+        try b.pruneDeadTypeValues();
         const f = &b.p.m.funcs.items[b.func.int()];
         const blocks = try a.alloc(ir.Block, b.blocks.items.len);
         for (b.blocks.items, blocks, 0..) |*buf, *out, i| {
@@ -337,6 +339,40 @@ pub const Builder = struct {
         const lw = &b.p.lowered;
         if (b.func.int() >= lw.bit_length) try lw.resize(a, @max(b.func.int() + 1, b.p.m.funcs.items.len), false);
         lw.set(b.func.int());
+    }
+
+    /// Drops what builds a run-time type value nothing reads: a reified
+    /// argument an inline body only tests statically leaves the value its
+    /// call built behind. Class literals, arrays and the base's type builders
+    /// only allocate, and constants and copies only set registers.
+    fn pruneDeadTypeValues(b: *Builder) Error!void {
+        const builders = types_mod.typeBuilders(b);
+        if (builders[0] == null) return;
+        const reads = try b.p.a.alloc(u32, b.next_reg);
+        const Count = struct {
+            reads: []u32,
+            fn cb(c: @This(), r: Reg, is_def: bool) void {
+                if (!is_def and r.int() < c.reads.len) c.reads[r.int()] += 1;
+            }
+        };
+        while (true) {
+            @memset(reads, 0);
+            for (b.blocks.items) |*blk| {
+                for (blk.insts.items) |*inst| ir.visitInstRegs(inst, Count{ .reads = reads }, Count.cb);
+                if (blk.terminator) |*t| ir.visitTerminatorRegs(t, Count{ .reads = reads }, Count.cb);
+            }
+            var removed = false;
+            for (b.blocks.items) |*blk| {
+                var i: usize = 0;
+                while (i < blk.insts.items.len) {
+                    if (deadTypePart(&blk.insts.items[i], builders, reads)) {
+                        _ = blk.insts.orderedRemove(i);
+                        removed = true;
+                    } else i += 1;
+                }
+            }
+            if (!removed) return;
+        }
     }
 
     pub const call = records.call;
@@ -360,6 +396,23 @@ pub const Builder = struct {
     pub const delegate = records.delegate;
     pub const supers = records.supers;
 };
+
+/// Whether `inst` builds part of a run-time type value that nothing reads
+/// (with the constants and copies that fed it).
+fn deadTypePart(inst: *const ir.Inst, builders: [3]?ir.FuncId, reads: []const u32) bool {
+    const dst: Reg = switch (inst.*) {
+        .ClassLiteral => |x| x.dst,
+        .NewArray => |x| x.dst,
+        .Const => |x| x.dst,
+        .Move => |x| x.dst,
+        .CallStatic => |x| blk: {
+            for (builders) |f| if (f != null and x.func == f.?) break :blk x.dst;
+            return false;
+        },
+        else => return false,
+    };
+    return dst.int() < reads.len and reads[dst.int()] == 0;
+}
 
 /// Where `Builder.branchOnNull` goes.
 pub const NullSplit = struct { is_null: BlockId, not_null: BlockId };

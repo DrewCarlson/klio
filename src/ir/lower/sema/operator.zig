@@ -490,6 +490,11 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
 /// as `a?.equals(b) ?: (b === null)` when `a` may be null.
 pub fn equality(b: *Builder, l: Reg, lt: TypeId, r: Reg, rt: TypeId, rec: CallRec) Error!Reg {
     const s = b.p.s;
+    // An enum's `equals` is `kotlin.Enum`'s, which is final and is identity:
+    // `a == b` is `a === b`, nulls included.
+    if (rec.callee != .none and s.builtins.enum_ != .none and s.syms.owner(rec.callee) == s.builtins.enum_) {
+        return identity(b, l, r);
+    }
     const lp = primOf(s, lt);
     const rp = primOf(s, rt);
     if (lp != null and rp != null and lp.? != .string and rp.? != .string) {
