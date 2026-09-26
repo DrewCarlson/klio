@@ -144,7 +144,8 @@ pub fn analyzeOnBase(a: Allocator, src: Sources, binding: Binding, image: []cons
     return s;
 }
 
-/// `KLIO_SEMA_TIMING`: the milliseconds each step of `build` took.
+/// `KLIO_SEMA_TIMING`: the milliseconds each step of `build` took, and the
+/// resident memory after it.
 pub const Timing = struct {
     last: u64,
     on: bool,
@@ -156,7 +157,7 @@ pub const Timing = struct {
     pub fn mark(self: *Timing, what: []const u8) void {
         if (!self.on) return;
         const now = runtime.clockMonotonicNanos();
-        std.debug.print("[sema-timing] {s} {d}ms\n", .{ what, (now - self.last) / 1_000_000 });
+        std.debug.print("[sema-timing] {s} {d}ms (rss {d}mb)\n", .{ what, (now - self.last) / 1_000_000, (runtime.currentRssKb() orelse 0) / 1024 });
         self.last = now;
     }
 };

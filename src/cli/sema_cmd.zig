@@ -140,12 +140,14 @@ pub fn run(gpa: Allocator, args: []const []const u8) u8 {
         return 2;
     };
     defer stdlib_src.deinit();
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
     for (stdlib_src.files) |sf| {
-        addSource(arena, &map, &files, sf.rel_path, sf.bytes, .base) catch return 2;
+        addBaseSource(arena, &scratch, &map, &files, sf.rel_path, sf.bytes) catch return 2;
     }
     // The base a program runs on: klio's actuals beside the stdlib, as a run
     // and a pack build load them.
-    addSemaActuals(arena, &map, &files) catch return 2;
+    addSemaActuals(arena, &scratch, &map, &files) catch return 2;
     const n_stdlib = files.items.len;
     var syntax: Syntax = .{};
     for (inputs.items) |path| {
@@ -350,7 +352,7 @@ pub fn hostBinding(gpa: Allocator) lower_driver.pipeline.Binding {
     return .{ .natives = hostNative, .host_symbol = stdlib.declarationHostSymbol, .host_members = true, .spread_varargs = true, .constructors = stdlib.constructorNative, .host_fns = interp_ir.hostMemberFn, .host_tries = interp_ir.hostMemberTry };
 }
 
-fn addSemaActuals(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile)) !void {
+fn addSemaActuals(arena: Allocator, scratch: *std.heap.ArenaAllocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile)) !void {
     var threaded: std.Io.Threaded = .init(arena, .{});
     defer threaded.deinit();
     const fio = threaded.io();
@@ -360,7 +362,7 @@ fn addSemaActuals(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(
             error.FileNotFound => embeddedActual(name) orelse continue,
             else => return e,
         };
-        try addSource(arena, map, files, path, bytes, .base);
+        try addBaseSource(arena, scratch, map, files, path, bytes);
     }
 }
 
@@ -517,8 +519,10 @@ pub fn loadSources(arena: Allocator, map: *span.SourceMap, inputs: []const []con
         var perr: pack.PackError = undefined;
         var stdlib_src = (try stdlib_pack.stdlibSources(arena, null, &perr)) orelse return error.StdlibSourcesMissing;
         defer stdlib_src.deinit();
-        for (stdlib_src.files) |sf| try addSource(arena, map, &files, sf.rel_path, sf.bytes, .base);
-        try addSemaActuals(arena, map, &files);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        for (stdlib_src.files) |sf| try addBaseSource(arena, &scratch, map, &files, sf.rel_path, sf.bytes);
+        try addSemaActuals(arena, &scratch, map, &files);
         n_stdlib = files.items.len;
         map_stdlib = map.files.items.len;
     }
@@ -570,9 +574,11 @@ pub fn loadSources(arena: Allocator, map: *span.SourceMap, inputs: []const []con
 /// base's file ids, are the ones the image was baked against.
 fn addImageBase(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), base: []const BaseFile) !void {
     var pack_ids: std.ArrayList(span.FileId) = .empty;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
     for (base) |f| {
         if (f.origin != .pack) {
-            try addSource(arena, map, files, f.path, f.text, .base);
+            try addBaseSource(arena, &scratch, map, files, f.path, f.text);
             continue;
         }
         try pack_ids.append(arena, try map.add(f.path, f.text));
@@ -1131,8 +1137,10 @@ pub fn checkLibrarySources(gpa: Allocator, arena: Allocator, lib: Library, out: 
     var perr: pack.PackError = undefined;
     var stdlib_src = (try stdlib_pack.stdlibSources(arena, null, &perr)) orelse return error.StdlibSourcesMissing;
     defer stdlib_src.deinit();
-    for (stdlib_src.files) |sf| try addSource(arena, &map, &files, sf.rel_path, sf.bytes, .base);
-    try addSemaActuals(arena, &map, &files);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    for (stdlib_src.files) |sf| try addBaseSource(arena, &scratch, &map, &files, sf.rel_path, sf.bytes);
+    try addSemaActuals(arena, &scratch, &map, &files);
 
     var own: std.ArrayList(sema.SourceFile) = .empty;
     for (lib.files) |f| try addSource(arena, &map, &own, f.path, f.bytes, .pack);
@@ -1363,10 +1371,27 @@ fn addSource(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.
     return addSourceReporting(arena, map, files, path, bytes, origin, null, null);
 }
 
+/// `addSource` for a base file: parsed in `scratch`, so the run keeps only
+/// its tree (`parser.parseMoved`); one that does not parse is added as
+/// `addSource` adds it.
+fn addBaseSource(arena: Allocator, scratch: *std.heap.ArenaAllocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8) !void {
+    const id = try map.add(path, bytes);
+    const src = map.get(id).source;
+    const tree = try parser.parseMoved(arena, scratch, id, src) orelse
+        return parseAdded(arena, map, files, id, path, .base, null, null);
+    const file_ast = try arena.create(ast.KotlinFile);
+    file_ast.* = tree;
+    try files.append(arena, .{ .ast = file_ast, .path = path, .origin = .base });
+}
+
 /// `addSource`, rendering the file's diagnostics into `syntax` when it has
 /// a lex or parse error, and adding every one of them to `diags`.
 fn addSourceReporting(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8, origin: sema.Origin, syntax: ?*Syntax, diags: ?*std.ArrayList(diagnostics.Diagnostic)) !void {
-    const id = try map.add(path, bytes);
+    return parseAdded(arena, map, files, try map.add(path, bytes), path, origin, syntax, diags);
+}
+
+/// `addSourceReporting` for the file `id` already in `map`.
+fn parseAdded(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), id: span.FileId, path: []const u8, origin: sema.Origin, syntax: ?*Syntax, diags: ?*std.ArrayList(diagnostics.Diagnostic)) !void {
     const src = map.get(id).source;
     var lx = try lexer.Lexer.init(arena, id, src);
     const lexed = try lx.tokenize();

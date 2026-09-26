@@ -388,7 +388,26 @@ fn pieceTokens(allocator: Allocator, tokens: []const Token, from: usize, to: usi
 /// Lex, parse and alias-expand one registered file. Per file the only shared
 /// state is the allocator, so jobs may run on any thread.
 fn runParseJob(allocator: Allocator, pool: ?*ParsePool, index: usize, job: *ParseJob) void {
+    runParseJobIn(allocator, null, pool, index, job);
+}
+
+/// `runParseJob`, parsing a whole file in `scratch` when there is one and
+/// keeping only its tree (`parser.parseMoved`).
+fn runParseJobIn(allocator: Allocator, scratch: ?*std.heap.ArenaAllocator, pool: ?*ParsePool, index: usize, job: *ParseJob) void {
     const t0 = runtime.clockMonotonicNanos();
+    if (scratch) |sa| {
+        if (job.piece == null) {
+            const moved = parser.parseMoved(allocator, sa, job.fid, job.src) catch return;
+            if (moved) |tree| {
+                var file_ast = tree;
+                ast.expandFileClassAliases(allocator, &file_ast);
+                job.parse_ns = runtime.clockMonotonicNanos() - t0;
+                if (std.c.getenv("KLIO_PARSE_CHECK") != null) checkNamesInSource(job, &file_ast);
+                job.result = .{ .ok = file_ast };
+                return;
+            }
+        }
+    }
     if (job.piece) |piece| {
         const p = parser.Parser.new(allocator, job.fid, job.src, piece.tokens, piece.strings);
         const file_ast = p.parseFile();
@@ -598,7 +617,9 @@ fn pieceCapacity(jobs: []const ParseJob) usize {
 fn runParseJobsOn(allocator: Allocator, jobs: *std.ArrayList(ParseJob), want: usize) usize {
     const files = jobs.items.len;
     if (want <= 1) {
-        for (jobs.items, 0..) |*job, i| runParseJob(allocator, null, i, job);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        for (jobs.items, 0..) |*job, i| runParseJobIn(allocator, &scratch, null, i, job);
         return 1;
     }
     const order = allocator.alloc(usize, files) catch {
@@ -1326,12 +1347,16 @@ fn loadPackCandidate(
     }
     // Re-parse through the shared SourceMap rather than decoding the frozen
     // `ast` section: fresh FileIds never collide, and it survives schema drift.
-    // The frozen bundle serves only when `sources` is absent.
-    if (reader.readSection(section_names.SOURCES, &err) catch null) |payload| {
-        defer payload.deinit(allocator);
-        if (schema.decode(schema.SourceBundle, allocator, payload.slice(), &err) catch null) |bundle_val| {
+    // The frozen bundle serves only when `sources` is absent. The section and
+    // its bundle are read into a heap of their own and freed here, whatever
+    // `allocator` is: the map keeps its own copy of each file's text.
+    var transient = reader.*;
+    transient.allocator = std.heap.smp_allocator;
+    if (transient.readSection(section_names.SOURCES, &err) catch null) |payload| {
+        defer payload.deinit(transient.allocator);
+        if (schema.decode(schema.SourceBundle, transient.allocator, payload.slice(), &err) catch null) |bundle_val| {
             var bundle = bundle_val;
-            defer bundle.deinit(allocator);
+            defer bundle.deinit(transient.allocator);
             var jobs: std.ArrayList(ParseJob) = .empty;
             defer jobs.deinit(allocator);
             for (bundle.files) |sf| {

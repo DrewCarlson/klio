@@ -24,6 +24,7 @@ pub const node_ids = @import("node_ids.zig");
 pub const assignIds = node_ids.assign;
 pub const checkIds = node_ids.check;
 pub const clone = @import("clone.zig").clone;
+pub const moveOut = @import("clone.zig").moveOut;
 
 pub const Ident = struct {
     name: []const u8,

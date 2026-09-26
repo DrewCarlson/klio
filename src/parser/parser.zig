@@ -162,6 +162,26 @@ pub const Parser = struct {
     }
 };
 
+/// How much of a scratch arena `parseMoved` keeps between files.
+const scratch_retain: usize = 16 * 1024 * 1024;
+
+/// Lexes and parses `src` in `scratch`, then moves the tree into `out`
+/// (`ast.moveOut`) and resets `scratch`: `out` keeps the tree at its own
+/// size, and the tokens and every list the parse grew are dropped with the
+/// scratch. Null when the file has a lex or parse error, for the caller to
+/// parse it into `out`, where its diagnostics outlive the parse.
+pub fn parseMoved(out: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, file_id: FileId, src: []const u8) std.mem.Allocator.Error!?KotlinFile {
+    defer _ = scratch.reset(.{ .retain_with_limit = scratch_retain });
+    const a = scratch.allocator();
+    var lx = lexer.Lexer.init(a, file_id, src) catch return error.OutOfMemory;
+    const lexed = lx.tokenize() catch return error.OutOfMemory;
+    if (lexed.diagnostics.hasErrors()) return null;
+    const p = Parser.new(a, file_id, src, lexed.tokens, lexed.strings);
+    const tree = p.parseFile();
+    if (p.diagnostics.hasErrors()) return null;
+    return try ast.moveOut(out, KotlinFile, &tree, src);
+}
+
 pub const ClassModifiers = struct {
     is_data: bool = false,
     is_companion: bool = false,
@@ -292,6 +312,43 @@ test "foundation: nl_soft precomputes bracket softness" {
         }
     }
     try testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "a moved parse is the parse, and outlives its scratch" {
+    const src =
+        \\package a.b
+        \\import kotlin.math.max
+        \\@Target(AnnotationTarget.CLASS) annotation class Tag(val name: String)
+        \\@Tag("x") data class P<T : Comparable<T>>(val v: T, var n: Int = 1) : Comparable<P<T>> {
+        \\    override fun compareTo(other: P<T>): Int = v.compareTo(other.v)
+        \\    val label: String get() = "p=${v} n=$n \\u0041"
+        \\    companion object { const val K = 3 }
+        \\}
+        \\fun <R> List<Int>.sumOf(f: (Int) -> R): List<R> = map { x -> f(x) }.filterNotNull()
+        \\fun main() {
+        \\    val s = """raw $K ${listOf(1, 2).sumOf { it * 2 }}"""
+        \\    when (val v = s.length) { in 0..3 -> println(v) else -> println(max(v, 2)) }
+        \\    val o = object : Runnable { override fun run() = Unit }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const in_place = try parse(a, src);
+    try testing.expect(!in_place.parser.diagnostics.hasErrors());
+
+    var out = std.heap.ArenaAllocator.init(testing.allocator);
+    defer out.deinit();
+    // The scratch lives in a buffer overwritten once the parse is done, so
+    // anything the moved tree still points into reads as garbage.
+    const buf = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer testing.allocator.free(buf);
+    var fixed = std.heap.FixedBufferAllocator.init(buf);
+    var scratch = std.heap.ArenaAllocator.init(fixed.allocator());
+    const moved = (try parseMoved(out.allocator(), &scratch, span.FileId.from(0), src)).?;
+    scratch.deinit();
+    @memset(buf, 0xaa);
+    try testing.expectEqualDeep(in_place.file, moved);
 }
 
 test "foundation: is_valid_infix_name rejects soft modifiers" {
