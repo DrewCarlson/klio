@@ -1343,3 +1343,22 @@ measurement.
   savedstate 333/23 (the 23 are sema's reified `T?`). The open items sit
   in each plan's handoff; those owned by the sema and coroutine agents are
   queued with them.
+- 2026-09-26, after done: the collector has weak references and
+  finalization. Kotlin/Native's kotlin.native.ref.WeakReference,
+  createCleaner and kotlin.native.runtime.GC.collect() run over it: a weak
+  cell's referent is cleared after the mark that finds it garbage, a dead
+  cleaner's job is marked again and run on a cleaner thread, and
+  klio.ref's native finalizers free a native peer's object on the sweeper
+  thread with nothing allocated per peer (docs/design/GC.md). The compose
+  runtime, ui and lifecycle take their native WeakReference actuals, and
+  skiko's managed peers free their Skia objects when nobody closes them.
+  ui-graphics and ui-text then moved onto their skikoMain over skiko, and
+  klio's own canvas, path, paragraph and graphics layer were deleted with
+  the shim code only they used (plans/compose-parity.md). `klio sema`
+  now loads klio's actuals as a run does, with or without `--lower`, so
+  the census and the oracle compare the base programs run on: 0 census
+  sites, and over 531 of 684 examples 21 580 sites match, 56 normalized,
+  1 068 Kotlin-vs-JVM naming, 0 differing. Two naming rules are new: a
+  JVM factory where Native has the constructor (`CancellationException`
+  with a cause), and a member the JVM's `LinkedHashMap` overrides and
+  klio's inherits from `HashMap`.

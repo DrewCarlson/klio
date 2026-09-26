@@ -341,6 +341,11 @@ JVM_MAPPED = {
     "kotlin/collections/ArrayList", "kotlin/collections/HashMap", "kotlin/collections/HashSet",
     "kotlin/collections/LinkedHashMap", "kotlin/collections/LinkedHashSet",
 }
+# JVM classes that override members their klio superclass declares.
+JVM_OVERRIDES_SUPER = {
+    "kotlin/collections/LinkedHashMap": "kotlin/collections/HashMap",
+    "kotlin/collections/LinkedHashSet": "kotlin/collections/HashSet",
+}
 COLLECTION_INTERFACE = re.compile(r"kotlin/collections/(Mutable)?(List|Collection|Set|Map|Iterable)$")
 
 
@@ -353,11 +358,14 @@ def jvm_class_member(src, key, o, s):
     `Throwable.stackTrace`), and the members of `AbstractMutableList` and its
     kin, which on the JVM is `java.util.AbstractList` and FIR names by the
     Kotlin interface it maps to (`Any` for `equals`) where the common class
-    declares them itself."""
+    declares them itself. `LinkedHashMap.entries` is also one: the JVM class
+    overrides it, klio's inherits `HashMap`'s."""
     op, sp = split_target(o[0]), split_target(s[0])
     if not op or not sp or op[1] != sp[1]:
         return False
     (oo, on, orc, opa), (so, sn, src_, spa) = op, sp
+    if JVM_OVERRIDES_SUPER.get(oo) == so and orc == src_ and opa == spa and o[1:] == s[1:]:
+        return True
     if oo in JVM_MAPPED and orc == "":
         if so == "kotlin/Any" and src_ == "" and opa == spa:
             return True
@@ -376,10 +384,26 @@ def klio_companion_qualifier(src, key, s):
     return key[3] == "read" and re.match(r"object:klio/[\w/.]+\.Companion$", s[0]) is not None
 
 
+@rule("JVM factory for a Native constructor", JVM)
+def jvm_factory_constructor(src, okey, o, skey, s):
+    """`CancellationException(message, cause)`: the JVM class has no such
+    constructor, so kotlinc calls the factory function named after the class;
+    on Native, as in klio, the class declares the constructor, and it outranks
+    the factory, which is `@LowPriorityInOverloadResolution`."""
+    if okey[:3] != skey[:3] or okey[3] != "call" or skey[3] != "ctor" or o[1:] != s[1:]:
+        return False
+    fn, _, orest = o[0].partition("|")
+    ctor, _, srest = s[0].partition("|")
+    if not ctor.endswith(".<init>") or orest != srest or not orest.startswith("|"):
+        return False
+    return simple_name(ctor[: -len(".<init>")]) == simple_name(fn)
+
+
 PAIR_RULES = (annotation_members, alias_inner_constructor, companion_block_member,
               jvm_print_overload, java_signature, jvm_class_member)
 ORACLE_ONLY_RULES = (folded_literal_arithmetic,)
 SEMA_ONLY_RULES = (companion_block_qualifier, suspend_lambda, annotation_array_literal, klio_companion_qualifier)
+MOVED_RULES = (parenthesized_invoke, jvm_factory_constructor)
 
 
 class Normalizer:
@@ -415,7 +439,7 @@ class Normalizer:
     def moved(self, okey, o, skey, s):
         if self.off:
             return None
-        return parenthesized_invoke.rule if parenthesized_invoke(self.src, okey, o, skey, s) else None
+        return next((r.rule for r in MOVED_RULES if r(self.src, okey, o, skey, s)), None)
 
     def pair_leftovers(self, only_o, only_s):
         """Pairs an oracle-only site with a sema-only one a rule says is the same

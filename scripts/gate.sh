@@ -114,7 +114,7 @@ echo "== full example corpus"
 # 180 s per example: a cold compose bake is ~70 s even locally (warm ~2 s).
 CORPUS_SKIA=""
 [ "$NO_SKIA" = 1 ] && CORPUS_SKIA="--no-skia"
-phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180 $CORPUS_SKIA
+phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180 --list-fail $CORPUS_SKIA
 
 # The sema census over the base, every installed pack with all of its
 # features, and the example corpus, against the packs just installed.

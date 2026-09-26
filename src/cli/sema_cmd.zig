@@ -143,8 +143,9 @@ pub fn run(gpa: Allocator, args: []const []const u8) u8 {
     for (stdlib_src.files) |sf| {
         addSource(arena, &map, &files, sf.rel_path, sf.bytes, .base) catch return 2;
     }
-    // The lowering census measures the base the sema pipeline runs on.
-    if (lower) addSemaActuals(arena, &map, &files) catch return 2;
+    // The base a program runs on: klio's actuals beside the stdlib, as a run
+    // and a pack build load them.
+    addSemaActuals(arena, &map, &files) catch return 2;
     const n_stdlib = files.items.len;
     var syntax: Syntax = .{};
     for (inputs.items) |path| {

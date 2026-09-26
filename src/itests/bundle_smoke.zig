@@ -92,25 +92,26 @@ fn ctx() !*Ctx {
     run_env.* = try baseEnv(a, run_home);
     const bin = try klioBin(a, io, build_env);
 
+    // In dependency order, each installed before the next builds: a pack
+    // whose sources do not resolve does not build, and serialization's
+    // json-io feature is built on kotlinx.io.
     const pack_dirs = [_][]const u8{
+        "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-bundle",
     };
     // Built into this suite's own directory: the shared target/packs is
     // rewritten by every other suite that builds a pack.
-    var pack_files: [pack_dirs.len][]const u8 = undefined;
-    for (pack_dirs, &pack_files) |d, *f| {
-        f.* = try std.fmt.allocPrint(a, "{s}/{s}.klio-pack", .{ TMP_ROOT, std.fs.path.basename(d) });
-        const r = try runChild(a, io, build_env, null, &.{ bin, "pack", "build", d, "--out", f.* });
+    for (pack_dirs) |d| {
+        const f = try std.fmt.allocPrint(a, "{s}/{s}.klio-pack", .{ TMP_ROOT, std.fs.path.basename(d) });
+        const r = try runChild(a, io, build_env, null, &.{ bin, "pack", "build", d, "--out", f });
         if (r.code != 0) {
             std.debug.print("bundle_smoke: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
             return error.TestUnexpectedResult;
         }
-    }
-    for (pack_files) |f| {
-        const r = try runChild(a, io, build_env, null, &.{ bin, "pack", "install", f });
-        if (r.code != 0) {
-            std.debug.print("bundle_smoke: pack install {s} failed:\n{s}\n", .{ f, r.stderr });
+        const ri = try runChild(a, io, build_env, null, &.{ bin, "pack", "install", f });
+        if (ri.code != 0) {
+            std.debug.print("bundle_smoke: pack install {s} failed:\n{s}\n", .{ f, ri.stderr });
             return error.TestUnexpectedResult;
         }
     }
