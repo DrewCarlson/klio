@@ -106,22 +106,19 @@ actual class InteropScope actual constructor() {
     actual fun toInteropForArraysOfPointers(interopPointers: Array<InteropPointer>): InteropPointer =
         toInterop(interopPointers.toLongArray())
 
-    actual fun callback(callback: (() -> Unit)?): InteropPointer = noCallback(callback)
-    actual fun intCallback(callback: (() -> Int)?): InteropPointer = noCallback(callback)
-    actual fun nativePointerCallback(callback: (() -> NativePointer)?): InteropPointer = noCallback(callback)
-    actual fun interopPointerCallback(callback: (() -> InteropPointer)?): InteropPointer = noCallback(callback)
-    actual fun booleanCallback(callback: (() -> Boolean)?): InteropPointer = noCallback(callback)
+    // A callback's handle stays good until the glue disposes of it, as each
+    // of its KCallbacks does when it is destroyed.
+    actual fun callback(callback: (() -> Unit)?): InteropPointer = SkikoCallbacks.register(callback)
+    actual fun intCallback(callback: (() -> Int)?): InteropPointer = SkikoCallbacks.register(callback)
+    actual fun nativePointerCallback(callback: (() -> NativePointer)?): InteropPointer = SkikoCallbacks.register(callback)
+    actual fun interopPointerCallback(callback: (() -> InteropPointer)?): InteropPointer = SkikoCallbacks.register(callback)
+    actual fun booleanCallback(callback: (() -> Boolean)?): InteropPointer = SkikoCallbacks.register(callback)
 
-    actual fun virtual(method: () -> Unit): InteropPointer = noCallback(method)
-    actual fun virtualInt(method: () -> Int): InteropPointer = noCallback(method)
-    actual fun virtualNativePointer(method: () -> NativePointer): InteropPointer = noCallback(method)
-    actual fun virtualInteropPointer(method: () -> InteropPointer): InteropPointer = noCallback(method)
-    actual fun virtualBoolean(method: () -> Boolean): InteropPointer = noCallback(method)
-
-    private fun noCallback(callback: Any?): InteropPointer {
-        if (callback == null) return 0L
-        throw UnsupportedOperationException(NO_CALLBACKS)
-    }
+    actual fun virtual(method: () -> Unit): InteropPointer = SkikoCallbacks.register(method)
+    actual fun virtualInt(method: () -> Int): InteropPointer = SkikoCallbacks.register(method)
+    actual fun virtualNativePointer(method: () -> NativePointer): InteropPointer = SkikoCallbacks.register(method)
+    actual fun virtualInteropPointer(method: () -> InteropPointer): InteropPointer = SkikoCallbacks.register(method)
+    actual fun virtualBoolean(method: () -> Boolean): InteropPointer = SkikoCallbacks.register(method)
 
     actual fun release() {
         for (ptr in allocations) __skiko_free(ptr)
@@ -130,6 +127,44 @@ actual class InteropScope actual constructor() {
 }
 
 internal const val NO_CALLBACKS = "Skia calling back into Kotlin is not supported on klio"
+
+/**
+ * The Kotlin callbacks the glue holds, by the handle it calls them with. The
+ * glue's callback functions (src/skiko) run one through [dispatch] while the
+ * native call that invokes it runs, and dispose of it when the native object
+ * holding it goes.
+ */
+internal object SkikoCallbacks {
+    private const val DISPOSE = 4
+
+    private val callbacks = HashMap<Long, () -> Any?>()
+    private var next = 1L
+    private val dispatcher: (Int, Long) -> Long = { kind, handle -> dispatch(kind, handle) }
+
+    init {
+        __skiko_setCallbackDispatcher(dispatcher)
+    }
+
+    fun register(callback: (() -> Any?)?): InteropPointer {
+        if (callback == null) return 0L
+        val handle = next++
+        callbacks[handle] = callback
+        return handle
+    }
+
+    private fun dispatch(kind: Int, handle: Long): Long {
+        if (kind == DISPOSE) {
+            callbacks.remove(handle)
+            return 0L
+        }
+        return when (val result = callbacks[handle]?.invoke()) {
+            is Boolean -> if (result) 1L else 0L
+            is Int -> result.toLong()
+            is Long -> result
+            else -> 0L
+        }
+    }
+}
 
 internal actual inline fun <T> interopScope(block: InteropScope.() -> T): T {
     val scope = InteropScope()
@@ -145,3 +180,5 @@ internal fun __skiko_free(ptr: Long): Unit = error("intrinsic org.jetbrains.skia
 internal fun __skiko_copyIn(ptr: Long, array: Any): Unit = error("intrinsic org.jetbrains.skia.impl.__skiko_copyIn is not installed")
 internal fun __skiko_copyOut(ptr: Long, array: Any): Unit = error("intrinsic org.jetbrains.skia.impl.__skiko_copyOut is not installed")
 internal fun __skiko_cstring(s: String): Long = error("intrinsic org.jetbrains.skia.impl.__skiko_cstring is not installed")
+internal fun __skiko_setCallbackDispatcher(dispatch: (Int, Long) -> Long): Unit =
+    error("intrinsic org.jetbrains.skia.impl.__skiko_setCallbackDispatcher is not installed")

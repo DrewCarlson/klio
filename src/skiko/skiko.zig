@@ -8,6 +8,14 @@
 //! result back. A pointer (NativePointer, InteropPointer) is a Long on the
 //! Kotlin side. A native the shim does not carry throws
 //! UnsupportedOperationException naming it.
+//!
+//! Skia calls back into Kotlin (a Drawable's onDraw, a PaintFilterCanvas's
+//! onFilter) through the five functions skiko_initCallbacks installs in the
+//! glue, with the handle Kotlin gave for the callback. They run inside a
+//! native call and reach Kotlin through its host: the Kotlin dispatcher
+//! (org.jetbrains.skia.impl's callback registry) runs the callback by its
+//! handle. An exception a callback throws is rethrown when the native call
+//! returns.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -32,6 +40,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("org.jetbrains.skia.impl.__skiko_copyIn", copyIn);
     try b.register("org.jetbrains.skia.impl.__skiko_copyOut", copyOut);
     try b.register("org.jetbrains.skia.impl.__skiko_cstring", cString);
+    try b.register("org.jetbrains.skia.impl.__skiko_setCallbackDispatcher", setCallbackDispatcher);
     // The platform queries of org.jetbrains.skia and org.jetbrains.skiko.
     try b.register("org.jetbrains.skia.__skiko_defaultLanguageTag", compose_ui.hostLocale);
     try b.register("org.jetbrains.skiko.__skiko_hostOs", compose_ui.hostOs);
@@ -260,13 +269,105 @@ fn hostFn(comptime i: usize) stdlib.StdlibFn {
             const f: *const CFn(n.sig) = @ptrCast(@alignCast(raw));
             var args: std.meta.ArgsTuple(CFn(n.sig)) = undefined;
             inline for (params, 0..) |c, k| args[k] = toC(c, ctx.args[k]);
+            // The glue may call back into Kotlin while it runs.
+            const outer = active;
+            active = .{ .host = ctx.host, .out = ctx.out };
+            defer active = outer;
             if (n.sig[0] == 'V') {
                 @call(.auto, f, args);
+                if (active.?.failure) |e| return .{ .err = e };
                 return .{ .ok = .{ .Unit = {} } };
             }
-            return .{ .ok = fromC(n.sig[0], @call(.auto, f, args)) };
+            const r = @call(.auto, f, args);
+            if (active.?.failure) |e| return .{ .err = e };
+            return .{ .ok = fromC(n.sig[0], r) };
         }
     }.call;
+}
+
+// --- callbacks from Skia into Kotlin -------------------------------------------
+
+/// The native call running on this thread: the host its callbacks run through,
+/// and the first error one of them raised.
+const Active = struct {
+    host: runtime.IntrinsicHost,
+    out: runtime.Output,
+    failure: ?runtime.RuntimeError = null,
+};
+
+threadlocal var active: ?Active = null;
+
+/// The Kotlin dispatcher, `(kind: Int, handle: Long) -> Long`: runs the
+/// callback under the handle and answers its result (a Boolean as 1 or 0), or
+/// forgets the handle for DISPOSE.
+var dispatcher: ?Value = null;
+var dispatcher_rooted = false;
+
+const CALL_BOOLEAN: i32 = 0;
+const CALL_INT: i32 = 1;
+const CALL_POINTER: i32 = 2;
+const CALL_VOID: i32 = 3;
+const DISPOSE: i32 = 4;
+
+fn markDispatcher(m: *runtime.gc.Marker) void {
+    if (dispatcher) |*d| d.gcMark(m);
+}
+
+/// `__skiko_setCallbackDispatcher(dispatch)`: keeps the dispatcher and
+/// installs the callback functions in the glue.
+fn setCallbackDispatcher(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return unit();
+    dispatcher = ctx.args[0];
+    if (!dispatcher_rooted) {
+        runtime.gc.registerRoot(markDispatcher);
+        dispatcher_rooted = true;
+    }
+    if (compose_ui.skiaSymbol("skiko_initCallbacks")) |raw| {
+        const Init = *const fn (?*const anyopaque, ?*const anyopaque, ?*const anyopaque, ?*const anyopaque, ?*const anyopaque) callconv(.c) void;
+        const init: Init = @ptrCast(@alignCast(raw));
+        init(&callBoolean, &callInt, &callPointer, &callVoid, &dispose);
+    }
+    return unit();
+}
+
+/// Runs the Kotlin callback under `handle` through the running native call's
+/// host; 0 when there is none, or once a callback has failed in this call.
+fn dispatch(kind: i32, handle: ?*anyopaque) i64 {
+    const a = if (active) |*a| a else return 0;
+    if (a.failure != null) return 0;
+    const d = dispatcher orelse return 0;
+    const args = [_]Value{ .{ .Int = kind }, Value.newLong(@bitCast(@as(u64, @intFromPtr(handle)))) };
+    const r = a.host.invokeCallable(&d, &args, a.out) catch {
+        a.failure = .{ .Unimplemented = "out of memory in a Skia callback" };
+        return 0;
+    };
+    switch (r) {
+        .ok => |v| return integer(v),
+        .err => |e| {
+            a.failure = e;
+            return 0;
+        },
+    }
+}
+
+fn callBoolean(handle: ?*anyopaque) callconv(.c) i8 {
+    return @intFromBool(dispatch(CALL_BOOLEAN, handle) != 0);
+}
+
+fn callInt(handle: ?*anyopaque) callconv(.c) i32 {
+    return @truncate(dispatch(CALL_INT, handle));
+}
+
+fn callPointer(handle: ?*anyopaque) callconv(.c) ?*anyopaque {
+    return @ptrFromInt(@as(usize, @bitCast(@as(isize, @truncate(dispatch(CALL_POINTER, handle))))));
+}
+
+fn callVoid(handle: ?*anyopaque) callconv(.c) void {
+    _ = dispatch(CALL_VOID, handle);
+}
+
+fn dispose(handle: ?*anyopaque) callconv(.c) void {
+    _ = dispatch(DISPOSE, handle);
 }
 
 fn missing(ctx: *CallCtx, symbol: []const u8) Error!EvalResult {
@@ -286,7 +387,7 @@ fn arity(ctx: *CallCtx, symbol: []const u8, want: usize) Error!EvalResult {
 test "every native has a host function under its symbol" {
     var b = try hostBindings(std.testing.allocator);
     defer b.deinit();
-    try std.testing.expectEqual(natives.all.len + 9, b.table.count());
+    try std.testing.expectEqual(natives.all.len + 10, b.table.count());
     try std.testing.expect(b.table.get("org_jetbrains_skia_Paint__1nMake") != null);
 }
 
@@ -386,6 +487,80 @@ test "Paint's natives run through the shim's glue" {
 
     const finalizer = try callNative("org_jetbrains_skia_Paint__1nGetFinalizer", &ctx, &.{});
     _ = try callNative("org_jetbrains_skia_impl_Managed__invokeFinalizer", &ctx, &.{ finalizer, paint });
+}
+
+/// A host that records the callbacks the glue makes: each (kind, handle).
+const RecordingHost = struct {
+    allocator: std.mem.Allocator,
+    calls: std.ArrayList([2]i64) = .empty,
+
+    fn invoke(c: *anyopaque, callable: *const Value, args: []const Value, out: runtime.Output) Error!EvalResult {
+        _ = callable;
+        _ = out;
+        const self: *RecordingHost = @ptrCast(@alignCast(c));
+        try self.calls.append(self.allocator, .{ args[0].Int, args[1].Long });
+        return .{ .ok = Value.newLong(0) };
+    }
+
+    fn invokeWithThis(c: *anyopaque, callable: *const Value, args: []const Value, this_value: *const Value, out: runtime.Output) Error!EvalResult {
+        _ = this_value;
+        return invoke(c, callable, args, out);
+    }
+
+    const vtable: runtime.IntrinsicHost.VTable = .{
+        .invoke_callable = invoke,
+        .invoke_callable_with_this = invokeWithThis,
+    };
+
+    fn saw(self: *const RecordingHost, kind: i32, handle: i64) bool {
+        for (self.calls.items) |c| {
+            if (c[0] == kind and c[1] == handle) return true;
+        }
+        return false;
+    }
+};
+
+test "Skia calls back into Kotlin through the running native call's host" {
+    const lib = if (@import("builtin").os.tag == .macos) "zig-out/lib/libklio_skia.dylib" else "zig-out/lib/libklio_skia.so";
+    compose_ui.setSkiaLibPath(lib);
+    if (compose_ui.skiaSymbol("skiko_initCallbacks") == null) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var rec = RecordingHost{ .allocator = std.testing.allocator };
+    defer rec.calls.deinit(std.testing.allocator);
+    var cap = runtime.CaptureOutput.init(std.testing.allocator);
+    defer cap.deinit();
+    var ctx: CallCtx = undefined;
+    ctx.allocator = arena.allocator();
+    ctx.host = .{ .ctx = &rec, .vtable = &RecordingHost.vtable };
+    ctx.out = cap.output();
+
+    var dispatch_args = [_]Value{.Null};
+    ctx.args = &dispatch_args;
+    _ = try setCallbackDispatcher(&ctx);
+
+    // A drawable whose onGetBounds is handle 7 and onDraw handle 8.
+    const drawable = try callNative("org_jetbrains_skia_Drawable__1nMake", &ctx, &.{});
+    _ = try callNative("org_jetbrains_skia_Drawable__1nInit", &ctx, &.{ drawable, Value.newLong(7), Value.newLong(8) });
+    // Skia asks for its bounds through onGetBounds.
+    var alloc_args = [_]Value{Value.newLong(16)};
+    ctx.args = &alloc_args;
+    const rect = (try memAlloc(&ctx)).ok;
+    _ = try callNative("org_jetbrains_skia_Drawable__1nGetBounds", &ctx, &.{ drawable, rect });
+    try std.testing.expect(rec.saw(CALL_VOID, 7));
+    try std.testing.expect(!rec.saw(CALL_VOID, 8));
+    // Deleting it disposes of both callbacks.
+    const finalizer = try callNative("org_jetbrains_skia_Drawable__1nGetFinalizer", &ctx, &.{});
+    _ = try callNative("org_jetbrains_skia_impl_Managed__invokeFinalizer", &ctx, &.{ finalizer, drawable });
+    try std.testing.expect(rec.saw(DISPOSE, 7));
+    try std.testing.expect(rec.saw(DISPOSE, 8));
+    var free_args = [_]Value{rect};
+    ctx.args = &free_args;
+    _ = try memFree(&ctx);
+    // Outside a native call no callback runs.
+    try std.testing.expect(active == null);
+    dispatcher = null;
 }
 
 test "a native the shim does not carry throws, naming it" {

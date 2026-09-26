@@ -89,11 +89,13 @@ Not run yet, and what each needs:
    scripts/gen-skiko-natives.py), converting pointers as Longs and arrays
    and strings through native memory. Waiting: lowering binds an `external
    fun` to the host function its @ExternalSymbolName names (requested; the
-   979 natives are the census's only unbound sites). Then callbacks from Skia
-   into Kotlin (Drawable, PaintFilterCanvas, the shaper, skottie's logger,
-   which throw until then), and ui-graphics and ui-text move onto the
-   verbatim skikoMain. Managed peers free their native objects on close();
-   the collector runs no finalizers.
+   981 natives are the census's only unbound sites). Skia calls back into
+   Kotlin (a Drawable's onDraw and onGetBounds, a PaintFilterCanvas's
+   onFilter, skottie's logger) through the callbacks skiko_initCallbacks
+   installs, run through the host of the native call that invokes them;
+   the shaper's run handlers still throw. Then ui-graphics and ui-text move
+   onto the verbatim skikoMain. Managed peers free their native objects on
+   close(); the collector runs no finalizers.
 7. **The long tail.** The remaining nonJvm actuals taken verbatim, the
    desktop window API's AWT-bound rest. Dialog modality and window
    transparency are done. `Window(icon)` draws its painter at 192 pixels, as
@@ -140,8 +142,7 @@ Public API still missing (beyond the scene internals): ui's
 `ImageComposeScene`, `renderComposeScene`; the skia interop
 (`asComposeCanvas`, `toComposeImageBitmap`, ...) and ui-text's deprecated
 Typeface-based `FontLoader`, which come with the binding layer; foundation's
-`Modifier.onClick`, `PointerMatcher`, `Modifier.onDrag`, `TooltipArea`,
-`ContextMenuArea`; runtime-saveable's `rememberSerializable`;
+`TooltipArea`, `ContextMenuArea`; runtime-saveable's `rememberSerializable`;
 runtime-retain's `retain`, `RetainedEffect` and the stores.
 
 ## Platforms
@@ -382,14 +383,15 @@ isTraySupported is false), and running on Windows.
   per-pixel transparency, and the shim says so. Checked by frame dump (the
   frame's corners alpha 0 around an opaque disc, compose_window_transparent);
   the see-through compositing itself is the platforms', not screen-captured.
-- Open, routed to coroutines: a delay of `Long.MAX_VALUE / 2` under
-  Dispatchers.Unconfined overflows the scheduler's clock. `Modifier.onClick`
-  (whose tap detector waits that long when there is no long click) crashes
-  on its first press, so its PointerMatcher example waits for the fix.
-- Open, routed to coroutines: a launch on Dispatchers.Unconfined does not
-  return across a delay, so in a headless scene (Unconfined, as
-  ImageComposeScene's default) a focused text field's cursor blink never
-  gives the frame back. Windows are clear of it: they run on their loop.
+- 2026-09-26: with the coroutine runtime's Unconfined fixes, foundation's
+  desktop `Modifier.onClick` and PointerMatcher run: compose_onclick (the
+  buttons a matcher names, the keyboard modifiers it asks for) is identical
+  to Compose Desktop. A focused text field's headless frames return.
+- Open, routed to coroutines: a gesture's timeouts are real-time delays on
+  a headless scene's Unconfined dispatcher; after two taps too quick for a
+  double click, onClick takes the next tap as a long click where Compose
+  Desktop takes a single click (repro sent; plain detectTapGestures and a
+  lone tap are identical).
 - Open, needs the skia binding layer: klio's paragraph layer differs from
   skiko's SkiaParagraph in line tops, line height trims, text indent,
   baseline shift and ellipsis flags; the layout example that shows it waits

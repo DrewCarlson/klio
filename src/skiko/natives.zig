@@ -313,6 +313,8 @@ pub const all = [_]Native{
     .{ .symbol = "org_jetbrains_skia_MaskFilter__1nMakeGamma", .sig = "P:F" },
     .{ .symbol = "org_jetbrains_skia_MaskFilter__1nMakeShader", .sig = "P:P" },
     .{ .symbol = "org_jetbrains_skia_MaskFilter__1nMakeTable", .sig = "P:P" },
+    .{ .symbol = "org_jetbrains_skia_PaintFilterCanvas__1nGetOnFilterPaint", .sig = "P:P" },
+    .{ .symbol = "org_jetbrains_skia_PaintFilterCanvas__1nInit", .sig = "V:PP" },
     .{ .symbol = "org_jetbrains_skia_PaintFilterCanvas__1nMake", .sig = "P:PZ" },
     .{ .symbol = "org_jetbrains_skia_Paint__1nEquals", .sig = "Z:PP" },
     .{ .symbol = "org_jetbrains_skia_Paint__1nGetBlendMode", .sig = "I:P" },
