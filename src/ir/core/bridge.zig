@@ -3448,6 +3448,9 @@ const host_kinds = [_]HostKind{
     .{ .tag = .Match, .fqn = "kotlin.text.MatchResult" },
     .{ .tag = .MatchGroup, .fqn = "kotlin.text.MatchGroup" },
     .{ .tag = .StringBuilder, .fqn = "kotlin.text.StringBuilder" },
+    // The host's thread handles (`thread`, `klio.Thread.currentThread`) are
+    // its only bound methods.
+    .{ .tag = .BoundMethod, .fqn = "klio.Thread" },
 };
 
 const MemberKind = resolved.MemberKind;

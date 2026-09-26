@@ -104,6 +104,13 @@ pub fn available_processors(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .Int = @intCast(@min(n, std.math.maxInt(i32))) } };
 }
 
+/// `Any?.identityHashCode()`: the object's identity hash, stable for its
+/// life and independent of its `hashCode`.
+pub fn identity_hash_code(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v: Value = if (ctx.args.len > 0) ctx.args[0] else .Null;
+    return .{ .ok = .{ .Int = v.identityHashCode() } };
+}
+
 /// `GC.collect()`: a full collection, finished before it returns.
 pub fn gc_collect(ctx: *CallCtx) Allocator.Error!EvalResult {
     _ = ctx;

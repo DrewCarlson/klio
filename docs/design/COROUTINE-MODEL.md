@@ -302,6 +302,14 @@ fresh child `Vm` and runs the block via `runVmTask`/`runThreadBlock`
 the owning driver's mailbox, or `PersistedParked` after the driver exited
 (`coroutineResumeExternal`, coroutines.zig:1693-1747).
 
+A `resumeWith` its interceptor did not dispatch (an unconfined resume) runs
+where it is called, as on the JVM: the resumer asks the owning pump to hand
+the parked coroutine over (`requestSurrender`) and runs it on its own thread.
+A pump answers those requests when it drains its mailbox. A thread blocked in
+an inner pump (a `runBlocking` on another dispatcher) answers them for every
+pump under it before each idle wait (`serveOwnSurrenders`), so a resumer on
+the thread it waits on is not left to time out.
+
 **The divergence.** `coroutineLaunch` (coroutines.zig:1642-1654): with an active
 pump it enqueues the child onto the pump; with **no** pump it runs the child
 **eagerly inline** via `invokeCallable`, so `delay` is a no-op and `await`

@@ -1974,6 +1974,27 @@ test "super names a supertype's inner class constructor" {
     try fx.expectRef("super.^B(", .ctor, "demo/A.B.<init>");
 }
 
+test "super beside an interface's abstract equals and hashCode reaches Any's" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\interface Factory {
+        \\    fun make(): Int
+        \\    override fun equals(other: Any?): Boolean
+        \\    override fun hashCode(): Int
+        \\}
+        \\class Impl : Factory {
+        \\    override fun make() = 1
+        \\    override fun hashCode() = super.hashCode()
+        \\    override fun equals(other: Any?) = super.equals(other)
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectRef("super.^hashCode(", .call, "kotlin/Any.hashCode");
+    try fx.expectRef("super.^equals(", .call, "kotlin/Any.equals");
+}
+
 test "an expression of extension-function type invoked takes an implicit receiver" {
     var fx = try fixture(&.{
         \\package demo

@@ -3977,6 +3977,24 @@ pub fn superMember(ctx: *Ctx, sp: *const ast.SuperExpr, name: ast.Ident, access:
     return propertyAccess(ctx, ty, n, name.span, access, .{ .implicit = .{ .kind = .super_, .owner = tgt.owner } });
 }
 
+/// The supertypes an unqualified `super` reaches: those `cls` names, and
+/// `Any` when it names no superclass, since a class that extends only
+/// interfaces extends `Any`: `super.equals(other)` beside an interface that
+/// redeclares `equals` abstractly calls `Any`'s.
+fn superSources(s: *Sema, cls: Sym) Allocator.Error![]const TypeId {
+    const declared = try headers.supertypes(s, cls);
+    if (s.t.any == .none) return declared;
+    for (declared) |st| {
+        if (st == s.t.any) return declared;
+        const c = s.types.classSym(st);
+        if (c != .none and s.syms.classInfo(c).kind != .interface) return declared;
+    }
+    const out = try s.arena.alloc(TypeId, declared.len + 1);
+    @memcpy(out[0..declared.len], declared);
+    out[declared.len] = s.t.any;
+    return out;
+}
+
 fn superCall(ctx: *Ctx, sp: *const ast.SuperExpr, name: ast.Ident, args: []Arg, trailing: bool, type_args: []const TypeId, expected: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
     const tgt = (try superTarget(ctx, sp)) orelse {
@@ -3989,7 +4007,7 @@ fn superCall(ctx: *Ctx, sp: *const ast.SuperExpr, name: ast.Ident, args: []Arg, 
     const n = try ctx.intern(name.name);
     const recv: Receiver = .{ .implicit = .{ .kind = .super_, .owner = tgt.owner } };
     var level = newLevel();
-    const sts: []const TypeId = if (sp.qualifier != null) &.{tgt.ty} else try headers.supertypes(s, tgt.owner);
+    const sts: []const TypeId = if (sp.qualifier != null) &.{tgt.ty} else try superSources(s, tgt.owner);
     for (sts) |st| {
         for (try members.lookup(s, st, n, .function)) |m| {
             try headers.functionHeader(s, m.sym);

@@ -21,6 +21,7 @@ each upstream module is its own pack.
 | `androidx.navigationevent`           | navigationevent/navigationevent | runtime, annotation, collection, coroutines, atomicfu   |
 | `androidx.navigationevent.compose`   | navigationevent/navigationevent-compose | runtime, navigationevent, coroutines            |
 | `androidx.compose.ui`                | ui/ui                          | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, ui.text, navigationevent, navigationevent.compose, lifecycle (runtime-compose, viewmodel), lifecycle.viewmodel.compose, lifecycle.viewmodel.savedstate, savedstate (compose), skiko, coroutines |
+| `androidx.compose.ui.test`           | ui/ui-test                     | runtime, runtime.saveable, ui, ui.*, skiko, coroutines (test), atomicfu |
 | `androidx.compose.ui.backhandler`    | ui/ui-backhandler              | runtime, ui.util, annotation, navigationevent, navigationevent.compose, coroutines |
 | `androidx.compose.animation.core`    | animation/animation-core       | runtime, ui, ui.unit, ui.util, ui.geometry, ui.graphics, collection, coroutines |
 | `androidx.compose.animation`         | animation/animation            | runtime, animation.core, ui, ui.*, foundation.layout, collection, coroutines |

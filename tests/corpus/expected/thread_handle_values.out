@@ -1,0 +1,5 @@
+is Thread: true
+same thread ===: true, ==: true
+through a Result: true, null
+another thread ===: false
+list holds it: true

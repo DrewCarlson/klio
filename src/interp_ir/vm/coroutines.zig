@@ -1647,6 +1647,9 @@ pub const CooperativeInterceptor = struct {
                                     (self.timer_service and TimerService.hasPending());
                             };
                             if (!nonempty) {
+                                // Hand over what another thread asks for from
+                                // the pumps under this one before sleeping.
+                                try serveOwnSurrenders();
                                 // At most 2 ms a slice, clamped before it is
                                 // scaled: a wait can be most of the clock's range.
                                 const cap_us: u64 = @as(u64, @intCast(@min(wait, 2))) * 1_000;
@@ -2626,6 +2629,10 @@ fn pumpLoop(
         }
         if (pending > 0) {
             countSleep(.wakeup_pending);
+            // Another thread may be waiting to take a coroutine an outer pump
+            // on this thread holds parked; that pump cannot answer while this
+            // one runs above it.
+            try serveOwnSurrenders();
             gateWaitBrief(&wakeup, 1_000);
             _ = try drainWakeupInto(a, &wakeup, coroTop().?);
             continue;
@@ -2688,6 +2695,10 @@ fn pumpLoop(
             // An event loop waiting only on another thread orders nothing.
             releaseClock();
             countSleep(.root_parked);
+            // The thread it waits on may be waiting to take a coroutine an
+            // outer pump on this thread holds parked, as an unconfined
+            // dispatcher's resume from there runs there.
+            try serveOwnSurrenders();
             gateWaitBrief(&wakeup, 1_000);
             continue;
         }

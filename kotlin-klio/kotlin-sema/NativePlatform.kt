@@ -1,5 +1,5 @@
 // Kotlin/Native's kotlin.native.Platform: what the program runs on, over the
-// host klio runs on.
+// host klio runs on. Also the identity hash Kotlin/Native gives every object.
 
 package kotlin.native
 
@@ -86,3 +86,13 @@ public fun isExperimentalMM(): Boolean = true
 internal external fun __klio_osFamily(): Int
 internal external fun __klio_cpuArchitecture(): Int
 internal external fun __klio_availableProcessors(): Int
+
+/**
+ * Computes a hash code of an object's identity: the same for the object's
+ * whole life, and independent of its [Any.hashCode].
+ */
+@ExperimentalNativeApi
+public fun Any?.identityHashCode(): Int = __klio_identityHashCode(this)
+
+internal fun __klio_identityHashCode(value: Any?): Int =
+    error("intrinsic kotlin.native.__klio_identityHashCode is not installed")

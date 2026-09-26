@@ -40,6 +40,9 @@ pub const Config = struct {
     extra_env: []const [2][]const u8 = &.{},
     /// Extra `klio test` arguments for every child (`--feature …`).
     extra_args: []const []const u8 = &.{},
+    /// Test files, matched by path suffix, left out of the suite: each needs a
+    /// module klio does not ship, which the suite names beside the list.
+    exclude: []const []const u8 = &.{},
     /// A program the suite's tests reach over the network, run beside them.
     service: ?Service = null,
 };
@@ -863,6 +866,48 @@ pub const suites = [_]Config{
         .max_incomplete = 0,
     },
     .{
+        // ui's skikoTest: the scene and its layers, popups and dialogs, focus,
+        // pointer and key input, semantics, graphics layers and window insets,
+        // driven through the ui-test harness (runComposeUiTest).
+        .name = "compose_ui_scene",
+        .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui/src/skikoTest/kotlin"},
+        .extra_support = &(kruth_support ++ [_][]const u8{
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-text/src/commonTest/kotlin/kotlinx/test/IgnoreTargets.kt",
+        }),
+        .extra_args = &.{ "--feature", "kotlinx.coroutines/test" },
+        // These compose Material (1) widgets, a module klio does not ship.
+        .exclude = &.{
+            "androidx/compose/ui/layout/WindowInsetsTest.kt",
+            "androidx/compose/ui/platform/GraphicLayerBugTest.kt",
+            "androidx/compose/ui/window/DialogTest.kt",
+            "androidx/compose/ui/window/PopupTest.kt",
+        },
+        .timeout_ms = 600_000,
+        .baseline = 179,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        // foundation's skikoTest and commonTest: gestures, scrolling, lazy
+        // layouts, text fields and selection, and the desktop's scrollbars,
+        // driven through the ui-test harness.
+        .name = "compose_foundation",
+        .test_roots = &.{
+            "kotlin-klio/klio-compose-runtime/upstream/compose/foundation/foundation/src/skikoTest/kotlin",
+            "kotlin-klio/klio-compose-runtime/upstream/compose/foundation/foundation/src/commonTest/kotlin",
+        },
+        .extra_support = &(kruth_support ++ [_][]const u8{
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-text/src/commonTest/kotlin/kotlinx/test/IgnoreTargets.kt",
+            // The desktop's selection handle shape, which skikoTest expects.
+            "kotlin-klio/klio-compose-runtime/upstream/compose/foundation/foundation/src/desktopTest/kotlin/androidx/compose/foundation/text/selection/SelectionHandleShape.desktop.kt",
+        }),
+        .extra_args = &.{ "--feature", "kotlinx.coroutines/test" },
+        .timeout_ms = 600_000,
+        .baseline = 590,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
         // animation-core's commonTest, asserted through upstream Kruth.
         .name = "compose_animation",
         .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/compose/animation/animation-core/src/commonTest/kotlin"},
@@ -968,7 +1013,10 @@ pub fn runSuite(cfg: Config) !void {
     var support: std.ArrayList([]const u8) = .empty;
     for (cfg.extra_support) |s| try support.append(a, s);
     var targets: std.ArrayList([]const u8) = .empty;
-    for (all.items) |p| {
+    outer: for (all.items) |p| {
+        for (cfg.exclude) |suffix| {
+            if (std.mem.endsWith(u8, p, suffix)) continue :outer;
+        }
         if (fileHasTest(a, io, p)) try targets.append(a, p) else try support.append(a, p);
     }
 

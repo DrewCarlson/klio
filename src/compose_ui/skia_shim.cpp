@@ -1480,10 +1480,10 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
                                                        klioSdlMods(SDL_GetModState())));
                     return;
                 case SDL_WINDOWEVENT_FOCUS_GAINED:
-                    kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
+                    if (!klioScriptDrivesFocus()) kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
                     return;
                 case SDL_WINDOWEVENT_FOCUS_LOST:
-                    kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
+                    if (!klioScriptDrivesFocus()) kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
                     return;
                 case SDL_WINDOWEVENT_MOVED:
                 case SDL_WINDOWEVENT_MINIMIZED:
@@ -2717,10 +2717,10 @@ static void klioWinTranslate(KlioWindow* kw, UINT msg, WPARAM wParam, LPARAM lPa
             klioWinReportFrame(kw);
             return;
         case WM_SETFOCUS:
-            kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
+            if (!klioScriptDrivesFocus()) kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
             return;
         case WM_KILLFOCUS:
-            kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
+            if (!klioScriptDrivesFocus()) kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
             return;
         default:
             return;
@@ -4361,7 +4361,7 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
                          queue:nil
                     usingBlock:^(NSNotification* note) {
                         (void)note;
-                        kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
+                        if (!klioScriptDrivesFocus()) kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 1));
                         NSMenu* menu = kw->mainMenu ?: klioDefaultMainMenu();
                         if (menu) [NSApp setMainMenu:menu];
                     }] retain];
@@ -4371,7 +4371,7 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
                          queue:nil
                     usingBlock:^(NSNotification* note) {
                         (void)note;
-                        kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
+                        if (!klioScriptDrivesFocus()) kw->events.push_back(klioSimpleEv(KLIO_EV_FOCUS, 0));
                     }] retain];
         // Fires during a live resize (the modal drag) — reflows the UI in realtime
         // when a render callback is registered for the current poll.

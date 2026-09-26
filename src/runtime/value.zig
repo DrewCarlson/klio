@@ -3038,6 +3038,27 @@ pub const Value = union(enum) {
         return structuralEq(a, b);
     }
 
+    /// A stable per-object hash, as the JVM's `System.identityHashCode` and
+    /// Kotlin/Native's `identityHashCode()` answer: a boxed scalar hashes by
+    /// its value, null to 0, an object by its identity.
+    pub fn identityHashCode(self: Value) i32 {
+        return switch (self) {
+            .Null, .Unit => 0,
+            .Int => |i| @truncate(i),
+            .Long => |i| @truncate(i),
+            .Short => |i| i,
+            .Byte => |i| i,
+            .UInt => |i| @bitCast(i),
+            .Char => |c| @intCast(c),
+            .Bool => |b| if (b) 1231 else 1237,
+            else => {
+                const id = self.lockIdentity() orelse return 0;
+                const h: i32 = @truncate(@as(i64, @bitCast(@as(u64, id) *% 0x9E3779B97F4A7C15)));
+                return h & 0x7FFFFFFF;
+            },
+        };
+    }
+
     /// Address-stable identity, for use as a `synchronized` monitor key.
     pub fn lockIdentity(self: Value) ?usize {
         return switch (self) {
@@ -3481,7 +3502,30 @@ fn classFqnEq(a: ObjRef(ClassDef), b: ObjRef(ClassDef)) bool {
     defer ga.deinit();
     const gb = b.borrow();
     defer gb.deinit();
-    return classFqnSpellingEq(ga.get().fqn, gb.get().fqn);
+    const x = ga.get();
+    const y = gb.get();
+    if (!classFqnSpellingEq(x.fqn, y.fqn)) return false;
+    // Every object expression and every local class is a class of its own,
+    // though sema names them all `<anonymous>` or `<local>.Name`.
+    return classFqnIsUnique(x.fqn) or x.ir_class == y.ir_class;
+}
+
+/// Whether a class's fqn names only it: a local class's and an object
+/// expression's are shared by every such class in the program.
+pub fn classFqnIsUnique(fqn: []const u8) bool {
+    return std.mem.indexOf(u8, fqn, "<local>") == null and std.mem.indexOf(u8, fqn, "<anonymous>") == null;
+}
+
+/// A hash consistent with `KClass` equality: the fqn with both nesting
+/// spellings folded together, and the IR class of one whose fqn is shared.
+pub fn classHash(c: ObjRef(ClassDef)) u64 {
+    const g = c.borrow();
+    defer g.deinit();
+    const d = g.get();
+    var h = std.hash.Wyhash.init(0x6b636c);
+    for (d.fqn) |ch| h.update(&.{if (ch == '$') '.' else ch});
+    if (!classFqnIsUnique(d.fqn)) h.update(std.mem.asBytes(&d.ir_class));
+    return h.final();
 }
 
 /// One class can sit in the class table under two spellings of its fqn, the
@@ -3752,6 +3796,14 @@ test "classifier receiver ABI separates host values from source classes" {
     try testing.expectEqual(ReceiverAbi.instance, classifierReceiverAbi("sample.Collection"));
 }
 
+test "identity hash of a scalar is its value, of null zero" {
+    try testing.expectEqual(@as(i32, 0), (Value{ .Null = {} }).identityHashCode());
+    try testing.expectEqual(@as(i32, 42), Value.newInt(42).identityHashCode());
+    try testing.expectEqual(@as(i32, -1), (Value{ .Long = -1 }).identityHashCode());
+    try testing.expectEqual(@as(i32, 1231), (Value{ .Bool = true }).identityHashCode());
+    try testing.expectEqual(@as(i32, 1237), (Value{ .Bool = false }).identityHashCode());
+}
+
 test "numeric type fqn and rank" {
     try testing.expectEqualStrings("kotlin.Int", (Value{ .Int = 1 }).typeFqn());
     try testing.expectEqualStrings("kotlin.Long", (Value{ .Long = 1 }).typeFqn());
@@ -3771,6 +3823,26 @@ test "structural eq is type-strict across numerics" {
     try testing.expect(!Value.structuralEq(&a, &b));
     const c = Value{ .Int = 1 };
     try testing.expect(Value.structuralEq(&a, &c));
+}
+
+test "each object expression and local class is a KClass of its own" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const anon1 = Value{ .Class = try ClassDef.minimal(a, "<anonymous>", "<anonymous>", 3) };
+    const anon1_again = Value{ .Class = try ClassDef.minimal(a, "<anonymous>", "<anonymous>", 3) };
+    const anon2 = Value{ .Class = try ClassDef.minimal(a, "<anonymous>", "<anonymous>", 4) };
+    const local1 = Value{ .Class = try ClassDef.minimal(a, "L", "<local>.L", 5) };
+    const local2 = Value{ .Class = try ClassDef.minimal(a, "L", "<local>.L", 6) };
+    const nested = Value{ .Class = try ClassDef.minimal(a, "B", "Outer.B", 7) };
+    const lifted = Value{ .Class = try ClassDef.minimal(a, "B", "Outer$B", 8) };
+    try testing.expect(Value.structuralEq(&anon1, &anon1_again));
+    try testing.expect(!Value.structuralEq(&anon1, &anon2));
+    try testing.expect(!Value.structuralEq(&local1, &local2));
+    try testing.expect(Value.structuralEq(&nested, &lifted));
+    try testing.expectEqual(classHash(anon1.Class), classHash(anon1_again.Class));
+    try testing.expect(classHash(anon1.Class) != classHash(anon2.Class));
+    try testing.expectEqual(classHash(nested.Class), classHash(lifted.Class));
 }
 
 test "is_runtime_type basic primitives" {

@@ -56,6 +56,7 @@ Run any program with:
 | `forward_member_extension.kt` | A member extension declared after its caller resolves statically inside a receiver lambda. |
 | `parenthesized_callable_result.kt` | A trailing lambda after a parenthesized call invokes the callable returned by that call. |
 | `anonymous_object_classifier_identity.kt` | An anonymous-object initializer retains the exact lexical classifier and companion identity. |
+| `anonymous_class_identity.kt` | Each object expression and each local class is a `KClass` of its own: two never compare equal, one expression's instances share one, and a class-keyed map keeps an entry for each. |
 | `anonymous_object_supertypes.kt` | An object literal is an instance of its supertype's supertypes too: `is` and a safe cast walk the whole declared chain, for a literal with a body, a delegating one, and a class subtype alike. |
 | `anonymous_object_receiver_shapes.kt` | One anonymous-object site instantiated under different receivers: a property initializer reading the receiver's member works for a stored field and a backing-field-less getter alike — the shared site lowering must not bake in the first receiver's storage layout. |
 | `receiver_extension_shadow.kt` | A receiver-lambda extension shadows an applicable same-named top-level function. |
@@ -385,6 +386,10 @@ Run any program with:
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 | `jvm_string_bytes_format.kt` | The JVM `String` surface the common stdlib does not declare: `toByteArray()` and `String(bytes)` / `String(bytes, offset, length)` in UTF-8 (a cut sequence decodes to U+FFFD), `"x=%d".format(7)` and `String.format(...)`, and `toSortedMap()` with natural order or a comparator (keys the comparator finds equal are one entry: the first key, the last value). |
 | `weak_references.kt` | Kotlin/Native's `kotlin.native.ref`: a `WeakReference` answers its referent while something else holds it and null once `GC.collect()` frees it, so a weak cache keeps only the images still in use; `clear()` and `value`; `createCleaner` runs each action on the cleaner thread after its owner is collected. The JVM has no `kotlin.native.ref`, so kotlinc cannot run it: the expected output is Kotlin/Native's documented behaviour. |
+| `super_any_through_interface.kt` | A class that extends only interfaces extends `Any`, so an unqualified `super` call reaches `Any`'s members: beside an interface that redeclares `equals` and `hashCode` abstractly, `super.equals(other)` and `super.hashCode()` call `Any`'s identity versions. |
+| `native_identity_hash.kt` | Kotlin/Native's `identityHashCode()`: an object's identity hash holds for its whole life and does not follow equality, so two equal data objects hash apart by identity while their `hashCode` agrees; null's is 0. |
+| `thread_handle_values.kt` | A `klio.Thread` handle is a value like any other: a type test sees a `klio.Thread`, it passes through a `Result` and a list, and two handles of one thread are the same thread (`===`) while another thread's is not. |
+| `coroutines_test_cross_thread_advance.kt` | A coroutine on an unconfined test dispatcher resumes on the thread that advances its scheduler, even when another thread's `runTest` started it: each frame of the loop runs during the advance, before the test body goes on, as Compose's UI test harness drives frames from its UI thread (`--feature kotlinx.coroutines/test`). |
 
 ## Integration showcases
 

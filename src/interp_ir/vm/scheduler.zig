@@ -390,13 +390,12 @@ fn runVmTask(task: *Task) ?RuntimeError {
     };
 }
 
-/// Drop a task that never ran; the seed's handles release through child-Vm teardown.
+/// Drop a task that never ran, on whichever thread drops it: a post into a
+/// stopping pool drops it on the poster's thread, mid-coroutine. As a refused
+/// task, no child Vm is materialized and torn down, which would reset that
+/// thread's own coroutine and composer state.
 fn dropVmTask(task: *Task) void {
-    // Release the dispatch-time unsettled count so no virtual-clock gate is held.
-    coroutines.poolTaskSettleDropped();
-    if (runtime.reclaimEnabled()) task.block.release(task.seed.allocator);
-    var vm = task.seed.materialize() catch return;
-    vm.deinit();
+    dropRefusedTask(task.*);
 }
 
 /// The process-global pool serving `Dispatchers.Default` / `IO`.

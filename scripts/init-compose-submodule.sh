@@ -123,6 +123,10 @@ sparse=(
   # The ui-test skiko harness the skikoTest suites compose against, and the
   # upstream suites of foundation, animation, material3 and graphics-shapes.
   "compose/ui/ui-test/src/skikoMain"
+  "compose/ui/ui-test/src/nonJvmMain"
+  "compose/ui/ui-test/src/nativeMain"
+  "compose/ui/ui-test/src/desktopMain"
+  "compose/ui/ui/src/desktopTest"
   "compose/ui/ui/src/skikoTest"
   "compose/ui/ui-graphics/src/skikoTest"
   "compose/ui/ui-text/src/skikoTest"

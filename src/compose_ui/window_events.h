@@ -550,7 +550,9 @@ inline int klioAwtKeyChar(int vk, unsigned platformChar) {
 //                                        shortcut modifier (Command on macOS,
 //                                        Control elsewhere, as AWT's Toolkit has it)
 //   <when> text <characters>             typed text, the rest of the line
-//   <when> focus <0|1>
+//   <when> focus <0|1>                   the window gains or loses the focus; a script
+//                                        with a focus event is the windows' only source
+//                                        of focus, the platform's own changes dropped
 //   <when> close                         the window's close button: a close request
 //   <when> menu <path>                   choose the menu bar item at the path of
 //                                        titles ("File/Open"), as a click would
@@ -569,6 +571,11 @@ inline int klioMenuShortcutMod() {
     return KLIO_MOD_CTRL;
 #endif
 }
+
+// Whether the script gives the windows their focus: a script with a focus
+// event is the only source of focus changes, so a window driven by it sees
+// the same ones whichever other windows open beside it.
+inline bool klioScriptDrivesFocus();
 
 struct KlioScriptEntry {
     int poll;       // the poll it comes at, or -1 for a timed one
@@ -648,6 +655,16 @@ inline std::vector<KlioScriptEntry>& klioScript() {
     }
     std::fclose(f);
     return script;
+}
+
+inline bool klioScriptDrivesFocus() {
+    static const bool drives = [] {
+        for (const KlioScriptEntry& e : klioScript()) {
+            if (!e.tray && e.ev.type == KLIO_EV_FOCUS) return true;
+        }
+        return false;
+    }();
+    return drives;
 }
 
 // A window's progress through the script: its polls, when the first came,

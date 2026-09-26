@@ -85,7 +85,8 @@ wave1_steps=(
 wave2_steps=(
   itest-datetime_commontest itest-serialization_commontest
   itest-serialization_json_commontest itest-compose_ui_commontest
-  itest-compose_ui_skiko_commontest
+  itest-compose_ui_skiko_commontest itest-compose_ui_scene_commontest
+  itest-compose_foundation_commontest
   itest-compose_animation_commontest itest-compose_shapes_commontest
   itest-lifecycle_viewmodel_commontest itest-savedstate_commontest
   itest-atomicfu_commontest itest-check_examples itest-box_conformance

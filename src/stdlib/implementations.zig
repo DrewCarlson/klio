@@ -127,6 +127,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.native.__klio_osFamily", .f = native_ref.os_family },
     .{ .fqn = "kotlin.native.__klio_cpuArchitecture", .f = native_ref.cpu_architecture },
     .{ .fqn = "kotlin.native.__klio_availableProcessors", .f = native_ref.available_processors },
+    .{ .fqn = "kotlin.native.__klio_identityHashCode", .f = native_ref.identity_hash_code },
     .{ .fqn = "klio.ref.registerNativeFinalizer", .f = native_ref.native_finalizer_register },
     .{ .fqn = "klio.ref.runNativeFinalizer", .f = native_ref.native_finalizer_run },
     .{ .fqn = "klio.Thread.sleep", .f = concurrent.concurrent_thread_sleep },

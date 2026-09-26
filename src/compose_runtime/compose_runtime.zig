@@ -119,24 +119,7 @@ fn gapCountOneBits(ctx: *CallCtx) Error!EvalResult {
 /// falls back to a value-derived hash, identity hashing needing spread only.
 fn identityHashCode(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(Value.newInt(0));
-    const v = ctx.args[0];
-    switch (v) {
-        .Null, .Unit => return ok(Value.newInt(0)),
-        .Int => |i| return ok(Value.newInt(@as(i64, @as(i32, @truncate(i))))),
-        .Long => |i| return ok(Value.newInt(@as(i64, @as(i32, @truncate(i))))),
-        .Short => |i| return ok(Value.newInt(@intCast(i))),
-        .Byte => |i| return ok(Value.newInt(@intCast(i))),
-        .UInt => |i| return ok(Value.newInt(@as(i64, @as(i32, @bitCast(i))))),
-        .Char => |c| return ok(Value.newInt(@intCast(c))),
-        .Bool => |bb| return ok(Value.newInt(if (bb) 1231 else 1237)),
-        else => {
-            if (v.lockIdentity()) |id| {
-                const h: i32 = @truncate(@as(i64, @bitCast(@as(u64, id) *% 0x9E3779B97F4A7C15)));
-                return ok(Value.newInt(@as(i64, h & 0x7FFFFFFF)));
-            }
-            return ok(Value.newInt(0));
-        },
-    }
+    return ok(Value.newInt(ctx.args[0].identityHashCode()));
 }
 
 fn nextStateId(ctx: *CallCtx) Error!EvalResult {

@@ -494,6 +494,11 @@ pub fn valueStructuralHash(v: *const Value) i32 {
             defer g.deinit();
             h.update(g.get().bytes);
         },
+        .Class => |c| {
+            h.update(std.mem.asBytes(&@as(i32, 8)));
+            const ch = runtime.classHash(c);
+            h.update(std.mem.asBytes(&ch));
+        },
         else => h.update(std.mem.asBytes(&@as(i32, 7))),
     }
     return @truncate(@as(i64, @bitCast(h.final())));

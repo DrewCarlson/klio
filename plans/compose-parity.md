@@ -44,6 +44,8 @@ where the upstream one needs the JVM, AWT or a native platform API.
 | `compose_plugin_commontest` | the same sets, one child per class | 1404 | 0 | 1385 / 5 |
 | `compose_animation` | animation-core commonTest | 107 | 0 | 107 / 0 |
 | `compose_ui_skiko` | ui-graphics and ui-text skikoTest | 110 | 0 | 110 / 0 |
+| `compose_ui_scene` | ui skikoTest (4 Material files left out) | 179 | 0 | 179 / 0 |
+| `compose_foundation` | foundation skikoTest and commonTest | 590 | 0 | 590 / 0 |
 | `compose_shapes` | graphics-shapes commonTest | 148 | 0 | 148 / 0 |
 | `lifecycle_viewmodel` | lifecycle-viewmodel commonTest | 35 | 0 | 35 / 0 |
 | `savedstate` | savedstate commonTest (with nonAndroidTest's actuals) | 356 | 0 | 356 / 0 |
@@ -53,12 +55,10 @@ Not run yet, and what each needs:
 
 | Upstream set | Files | Needs |
 |--------------|------:|-------|
-| foundation commonTest | 1 | nothing; lands with the skikoTest suite |
-| foundation skikoTest | 84 | the ui-test skiko harness (`runComposeUiTest` over `CanvasLayersComposeScene`) |
-| foundation desktopTest | 13 | the harness, then the desktop APIs they test (TooltipArea, context menus, scrollbars) |
-| material3 skikoTest | 8 | the harness; test actuals for `calendarLocale`, `getTimeZone`/`setTimeZone` |
-| material3 desktopTest | 4 | the harness |
-| ui skikoTest | 37 | the harness |
+| foundation desktopTest | 13 | the desktop APIs they test (TooltipArea, context menus, scrollbars) |
+| material3 skikoTest | 8 | test actuals for `calendarLocale`, `getTimeZone`/`setTimeZone` |
+| material3 desktopTest | 4 | a suite of its own |
+| ui skikoTest's Material files | 4 | the Material (1) library, which klio does not ship |
 | lifecycle-runtime commonTest | 5 | the Main dispatcher fixes (below): under the desktop's `runLifecycleTest` (runBlocking on Main, the actual in tests/lifecycle_commontest_actuals/runtime) WithLifecycleStateTest.testBlockCancelledWhenInitiallyDestroyed waits forever; with a runTest form 39 of 65 passed |
 | lifecycle-viewmodel-savedstate commonTest | 1 | lifecycle-runtime-testing's TestLifecycleOwner (not in the checkout) |
 
@@ -143,6 +143,12 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
 9. The long tail in Inventory: foundation's TooltipArea, ContextMenuProvider,
    BasicContextMenuRepresentation, text/ContextMenu; the skia interop;
    runtime-retain's `retain`.
+10. Done: compose_foundation's four failures. The selection handle tests
+    needed desktopTest's SelectionHandleShape actual. The focus-indication
+    tests needed two interpreter fixes: `super.equals` in a class whose
+    supertypes are all interfaces resolves to Any's, and every object
+    expression and local class is a KClass of its own, so Compose's node
+    kind cache no longer shares one entry across anonymous nodes.
 
 **Sparse checkout widenings a future item needs** (for the coordinator to
 run; scripts/init-compose-submodule.sh lists the current set):
@@ -555,3 +561,17 @@ isTraySupported is false), and running on Windows.
   window is a CanvasLayersComposeScene with its own FrameRecomposer, and its
   lifecycle follows its focus and close as a desktop window's does. The JVM
   oracle finds 56 of the 57 headless compose examples identical.
+- 2026-09-26: ui-test is a pack (androidx.compose.ui.test: commonMain,
+  skikoMain, nonJvmMain and nativeMain whole, desktopMain's runner), and ui's
+  and foundation's skikoTest run as suites: 179 / 0 and 586 / 4. The UI
+  thread a test's scene runs on is a thread of its own, as the desktop's
+  event dispatch thread is. Getting there fixed three interpreter bugs: a
+  klio.Thread handle failed every type test; an inner pump never handed a
+  coroutine its thread's outer pump held parked to the thread that resumed
+  it, so an unconfined resume from another thread waited forever; and a
+  task posted to a stopping pool was torn down as a Vm on the posting
+  thread, resetting that thread's coroutine state mid-run.
+- 2026-09-26: foundation's suite passes whole (590 / 0). Anonymous objects
+  and local classes compared equal as KClasses (all shared `<anonymous>` or
+  `<local>.Name`), so a class-keyed cache answered for the wrong class; they
+  now compare and hash by their IR class.

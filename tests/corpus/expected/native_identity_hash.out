@@ -1,0 +1,5 @@
+equal: true, same hashCode: true
+stable: true
+apart: true
+non-negative: true
+null: 0
