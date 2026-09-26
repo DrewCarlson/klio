@@ -1,7 +1,8 @@
-# androidx.compose.ui:ui-graphics — the compose UI graphics module: its whole
-# commonMain vendored verbatim (colors and color spaces, Path with its
-# iterator, geometry, hit tester and SVG conversion, brushes, the drawing
-# scope, GraphicsLayer's surface), over klioMain's platform actuals.
+# androidx.compose.ui:ui-graphics — the compose UI graphics module as a skiko
+# target has it: commonMain (colors and color spaces, Path with its iterator,
+# geometry, hit tester and SVG conversion, brushes, the drawing scope), and
+# skikoMain's Canvas, Paint, Path, PathMeasure, shaders, filters, images and
+# GraphicsLayer over org.jetbrains.skia.
 [library]
 id = "androidx.compose.ui.graphics"
 version = "1.12.0"
@@ -16,9 +17,16 @@ root = "../klio-compose-runtime/upstream/compose/ui/ui-graphics/src/commonMain/k
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui-graphics/src/nonJvmMain/kotlin"
 
-# klioMain: the platform actuals (Path command buffer and measure, Paint, Canvas
-# over the Skia shim, ImageBitmap, RenderEffect, GraphicsLayer) and the
-# GraphicsContext that creates the layers.
+# skikoMain: everything over org.jetbrains.skia and skiko's RenderNode.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-graphics/src/skikoMain/kotlin"
+
+# skikoExcludingWebMain: an Image's Bitmap drawn through a Canvas.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-graphics/src/skikoExcludingWebMain/kotlin"
+
+# klioMain: the host's surfaces (a window's frame, icons, offscreen PNGs) drawn
+# through a skiko Canvas, and the native target's byte copy.
 [[source]]
 root = "klioMain"
 
@@ -32,4 +40,5 @@ stdlib = "*"
 # Connector.kt uses androidx.collection.mutableIntObjectMapOf for its
 # colorspace-connection cache.
 "androidx.collection" = "*"
+"org.jetbrains.skiko" = "*"
 

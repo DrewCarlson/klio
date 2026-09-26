@@ -100,6 +100,8 @@ sparse=(
   "compose/runtime/runtime/src/nativeMain"
   "compose/ui/ui/src/nativeMain"
   "compose/ui/ui-text/src/nativeMain"
+  # skikoExcludingWebMain: ui-graphics' Image-to-Bitmap conversion.
+  "compose/ui/ui-graphics/src/skikoExcludingWebMain"
   # The back-event dispatch the ui's Popup and Dialog register with.
   "navigationevent/navigationevent/src/commonMain"
   "navigationevent/navigationevent/src/jvmAndAndroidMain"

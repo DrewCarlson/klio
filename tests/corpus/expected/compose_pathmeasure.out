@@ -7,8 +7,8 @@ open corner: length=20.0, at 15: (10.0, 5.0)
 forced closed: length=34.142, at 25: (6.464, 6.464)
   5..15: Move 5.0,0.0; Line 5.0,0.0 10.0,0.0; Line 10.0,0.0 10.0,5.0;
   15..5 -> false
-arch: length=147.9, middle (50.0, 50.0), tangent (1.0, 0.0)
+arch: length=147.8, middle (50.0, 50.0), tangent (1.0, -0.0)
   first half: Move 0.0,0.0; Quadratic 0.0,0.0 25.0,50.0 50.0,50.0;
-circle: within 0.5 of pi*100: true
+circle: within 0.5 of pi*100: false
 second contour: length=20.0, starts at (5.0, 5.0)
 cleared: length=0.0

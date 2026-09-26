@@ -283,6 +283,7 @@ pub const SEMA_ACTUAL_FILES = [_][]const u8{
     "KlioType.kt",
     "Library.kt",
     "Native.kt",
+    "NativePlatform.kt",
     "NativeRef.kt",
     "NativeRuntime.kt",
     "Regex.kt",

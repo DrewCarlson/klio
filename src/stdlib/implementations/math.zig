@@ -577,15 +577,29 @@ pub fn math_ceil(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 /// Round half to even (IEEE rint), as `kotlin.math.round` does. Zig has no
 /// ties-to-even builtin, so this floors and adjusts on the .5 boundary.
+/// `Math.rint`: the nearest integer, ties to even. A result of zero keeps the
+/// argument's sign, so a value in [-0.5, 0) rounds to -0.0.
 fn roundTiesEven(x: f64) f64 {
     if (std.math.isNan(x) or std.math.isInf(x) or x == 0.0) return x;
     const fl = @floor(x);
     const diff = x - fl;
-    if (diff < 0.5) return fl;
-    if (diff > 0.5) return fl + 1.0;
-    const half = fl * 0.5;
-    if (@floor(half) == half) return fl; // fl is even
-    return fl + 1.0;
+    const r = if (diff < 0.5)
+        fl
+    else if (diff > 0.5)
+        fl + 1.0
+    else if (@floor(fl * 0.5) == fl * 0.5) fl else fl + 1.0;
+    return if (r == 0.0) std.math.copysign(@as(f64, 0.0), x) else r;
+}
+
+test "round keeps the sign of a zero result, as Math.rint does" {
+    try std.testing.expect(std.math.signbit(roundTiesEven(-0.3)));
+    try std.testing.expect(std.math.signbit(roundTiesEven(-0.5)));
+    try std.testing.expect(!std.math.signbit(roundTiesEven(0.3)));
+    try std.testing.expect(!std.math.signbit(roundTiesEven(0.5)));
+    try std.testing.expectEqual(@as(f64, -2.0), roundTiesEven(-1.5));
+    try std.testing.expectEqual(@as(f64, -2.0), roundTiesEven(-2.5));
+    try std.testing.expectEqual(@as(f64, 2.0), roundTiesEven(1.5));
+    try std.testing.expectEqual(@as(f64, -1.0), roundTiesEven(-0.7));
 }
 
 pub fn math_round(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

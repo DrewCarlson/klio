@@ -64,6 +64,46 @@ pub fn native_finalizer_run(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .Bool = runtime.weak.runNative(h) } };
 }
 
+/// `Platform.osFamily`'s ordinal: OsFamily's order.
+pub fn os_family(ctx: *CallCtx) Allocator.Error!EvalResult {
+    _ = ctx;
+    const b = @import("builtin");
+    const n: i32 = switch (b.os.tag) {
+        .macos => 1,
+        .ios => 2,
+        .linux => if (b.abi == .android or b.abi == .androideabi) 5 else 3,
+        .windows => 4,
+        .wasi, .emscripten => 6,
+        .tvos => 7,
+        .watchos => 8,
+        else => 0,
+    };
+    return .{ .ok = .{ .Int = n } };
+}
+
+/// `Platform.cpuArchitecture`'s ordinal: CpuArchitecture's order.
+pub fn cpu_architecture(ctx: *CallCtx) Allocator.Error!EvalResult {
+    _ = ctx;
+    const n: i32 = switch (@import("builtin").cpu.arch) {
+        .arm, .thumb => 1,
+        .aarch64 => 2,
+        .x86 => 3,
+        .x86_64 => 4,
+        .mips => 5,
+        .mipsel => 6,
+        .wasm32 => 7,
+        else => 0,
+    };
+    return .{ .ok = .{ .Int = n } };
+}
+
+/// `Platform.getAvailableProcessors()`: the processors this process may use.
+pub fn available_processors(ctx: *CallCtx) Allocator.Error!EvalResult {
+    _ = ctx;
+    const n = std.Thread.getCpuCount() catch 1;
+    return .{ .ok = .{ .Int = @intCast(@min(n, std.math.maxInt(i32))) } };
+}
+
 /// `GC.collect()`: a full collection, finished before it returns.
 pub fn gc_collect(ctx: *CallCtx) Allocator.Error!EvalResult {
     _ = ctx;

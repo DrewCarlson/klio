@@ -37,6 +37,7 @@ differed or failed.
 import argparse
 import difflib
 import os
+import re
 import subprocess
 import sys
 
@@ -274,10 +275,25 @@ def run_jvm(src, name, kc, cp):
     return p.stdout, None
 
 
+def run_flags(src):
+    """The flags an example's `Run with: klio run ...` header names, as the
+    corpus runs it (a pack feature it needs, say)."""
+    try:
+        with open(src, "r", encoding="utf-8", errors="replace") as f:
+            head = [f.readline() for _ in range(12)]
+    except OSError:
+        return []
+    for line in head:
+        m = re.search(r"Run with:\s*klio run\s+(.*)", line)
+        if m:
+            return [a for a in m.group(1).split() if not a.endswith(".kt")]
+    return []
+
+
 def run_klio(src, name, klio):
     work = os.path.join(ORACLE_HOME, "work", name)
     env = dict(os.environ, KLIO_CLIPBOARD="none")
-    p = subprocess.run([klio, "run", src], capture_output=True, text=True, cwd=ROOT, env=env)
+    p = subprocess.run([klio, "run", src] + run_flags(src), capture_output=True, text=True, cwd=ROOT, env=env)
     with open(os.path.join(work, "klio.txt"), "w") as f:
         f.write(p.stdout)
     with open(os.path.join(work, "klio.err"), "w") as f:

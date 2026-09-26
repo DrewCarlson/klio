@@ -16,8 +16,8 @@ each upstream module is its own pack.
 | `androidx.compose.ui.util`           | ui/ui-util                     |                                                          |
 | `androidx.compose.ui.geometry`       | ui/ui-geometry                 | runtime, ui.util                                         |
 | `androidx.compose.ui.unit`           | ui/ui-unit                     | runtime, ui.util, ui.geometry                            |
-| `androidx.compose.ui.graphics`       | ui/ui-graphics                 | runtime, ui.util, ui.geometry, ui.unit                   |
-| `androidx.compose.ui.text`           | ui/ui-text                     | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, coroutines |
+| `androidx.compose.ui.graphics`       | ui/ui-graphics                 | runtime, ui.util, ui.geometry, ui.unit, skiko            |
+| `androidx.compose.ui.text`           | ui/ui-text                     | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, skiko, coroutines |
 | `androidx.navigationevent`           | navigationevent/navigationevent | runtime, annotation, collection, coroutines, atomicfu   |
 | `androidx.navigationevent.compose`   | navigationevent/navigationevent-compose | runtime, navigationevent, coroutines            |
 | `androidx.compose.ui`                | ui/ui                          | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, ui.text, navigationevent, navigationevent.compose, lifecycle (runtime-compose), skiko, coroutines |
@@ -25,7 +25,7 @@ each upstream module is its own pack.
 | `androidx.compose.animation.core`    | animation/animation-core       | runtime, ui, ui.unit, ui.util, ui.geometry, ui.graphics, collection, coroutines |
 | `androidx.compose.animation`         | animation/animation            | runtime, animation.core, ui, ui.*, foundation.layout, collection, coroutines |
 | `androidx.compose.foundation.layout` | foundation/foundation-layout   | runtime, ui, ui.unit, ui.geometry, ui.graphics, ui.util  |
-| `androidx.compose.foundation`        | foundation/foundation          | runtime, runtime.saveable, ui, ui.*, foundation.layout, animation.core, animation, coroutines |
+| `androidx.compose.foundation`        | foundation/foundation          | runtime, runtime.saveable, ui, ui.*, foundation.layout, animation.core, animation, skiko, coroutines |
 | `androidx.compose.material.ripple`   | material/material-ripple       | runtime, animation.core, foundation, ui, ui.*, coroutines |
 | `androidx.compose.material3`         | material3/material3            | runtime, runtime.saveable, ui, ui.*, ui.backhandler, foundation, foundation.layout, animation.core, animation, material.ripple, shapes, coroutines, datetime, atomicfu |
 
@@ -52,7 +52,8 @@ lifecycle-common and they on savedstate, so as features of
 `androidx.lifecycle` they would make the two packs depend on each other.
 `org.jetbrains.skiko` (`kotlin-klio/klio-skiko`) is skiko's
 commonMain, the `org.jetbrains.skia` API, over the native functions skiko's
-C glue exports from the Skia shim. `klio.compose.ui`
+C glue exports from the Skia shim. ui-graphics and ui-text draw through it
+as on Compose Desktop: their skikoMain sets are upstream's, whole. `klio.compose.ui`
 (`kotlin-klio/klio-compose-ui`) is klio's own windowing and rendering layer
 (`runApp`, the Skia backend) over the runtime, not an upstream module.
 
@@ -73,11 +74,11 @@ signature:
 - libraries outside the checkout: the androidx annotation markers (the
   `androidx.annotation` pack), compose's runtime-annotation markers and
   runtime-retain's store (runtime pack);
-- platform code: a `GraphicsLayer` that records into a Skia picture through
-  klio's shim and replays it under its transform, clip and offscreen layer
-  (skiko's does the same through a skiko RenderNode), a Kotlin `PathMeasure`, code-point stand-ins
-  for the two skia ICU calls foundation's text helpers make, adapted copies
-  of the foundation desktop files that are java-free once their AWT calls
+- platform code: ui-text's locale, right-to-left test, string casing and
+  font resolve interceptor (the native target's are darwinMain's, over
+  Foundation), ui-graphics' byte copy, the host's surfaces drawn through a
+  skiko Canvas (`klioDrawToSurface`, `klioDrawToPng`, `klioRenderToPng`),
+  adapted copies of the foundation desktop files that are java-free once their AWT calls
   are replaced (the scroll configuration answers the per-OS defaults, the
   text field selection reads klio's clipboard entry; typed-key detection
   and the character palette throw until the scene delivers native key
@@ -85,7 +86,8 @@ signature:
   runtime's thread ids, identity hash, locks and frame clock. A body klio cannot serve throws `UnsupportedOperationException`
   naming what is missing.
 - everything else a skiko desktop target compiles comes from upstream: each
-  module's nonJvmMain and nonAndroidMain sets, foundation's java-free
+  module's skikoMain, nonJvmMain and nonAndroidMain sets (with ui-text's
+  and the weak references' nativeMain), foundation's java-free
   desktopMain files, and the runtime's jvmAndAndroidMain actuals that are
   plain Kotlin over kotlinx.coroutines (the tracing context and snapshot
   context element are `ThreadContextElement`s, as on the desktop).

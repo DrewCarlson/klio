@@ -369,13 +369,9 @@ include = [
 # skikoMain: upstream's actuals for every skiko target, whole: key mapping,
 # cursor and selection drawing, the context menu, clipboard, dead-key
 # combining, Modifier.onClick with PointerMatcher, Modifier.onDrag, the
-# scrollbars. The drag-and-drop source draws its shadow through a skia
-# canvas, so it waits for the skia binding layer.
+# scrollbars, and the drag-and-drop source's shadow picture.
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/foundation/foundation/src/skikoMain/kotlin"
-exclude = [
-    "androidx/compose/foundation/draganddrop/DragAndDropSource.skiko.kt",
-]
 
 # nonJvmMain: the actuals every non-JVM target shares.
 [[source]]
@@ -414,10 +410,8 @@ include = [
     "androidx/compose/foundation/text/selection/TextFieldSelectionManager.desktop.kt",
 ]
 
-# klioMain: the platform actuals where the desktop ones reach AWT or skiko
-# (the clipboard, typed key events, the character palette), and internal
-# stand-ins for the two skia ICU calls StringHelpers.skiko.kt makes
-# (org.jetbrains.skia).
+# klioMain: the platform actuals where the desktop ones reach AWT (the
+# clipboard, typed key events, the character palette).
 [[source]]
 root = "klioMain"
 
@@ -438,4 +432,6 @@ stdlib = "*"
 "androidx.collection" = "*"
 "kotlinx.coroutines" = "*"
 "kotlinx.atomicfu" = "*"
+# StringHelpers.skiko.kt's grapheme and code point breaks are skia's ICU.
+"org.jetbrains.skiko" = "*"
 

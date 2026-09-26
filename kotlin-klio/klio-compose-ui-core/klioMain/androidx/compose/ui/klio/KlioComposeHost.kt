@@ -9,13 +9,14 @@
 // analogue of Compose Multiplatform's RootNodeOwner + ImageComposeScene: it hosts
 // the root LayoutNode, provides the platform CompositionLocals, runs the
 // measure/layout passes through the vendored MeasureAndLayoutDelegate, and draws
-// the node tree onto a klio Skia canvas (KlioCanvas) — the same Canvas actual the
-// engine already renders through. A headless render entry point rasterizes a
-// @Composable to a PNG.
+// the node tree through upstream's SkiaBackedCanvas over skiko, as Compose
+// Desktop does. A headless render entry point rasterizes a @Composable to a PNG.
 
 package androidx.compose.ui.klio
 
 import androidx.collection.MutableIntObjectMap
+import androidx.compose.ui.graphics.asComposeCanvas
+import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.collection.mutableIntObjectMapOf
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.runtime.BroadcastFrameClock
@@ -891,14 +892,17 @@ class KlioComposeScene(
     }
 
     /**
-     * Renders the current frame into an [ImageBitmap] whose pixels can be read
-     * back ([ImageBitmap.toPixelMap]); transparent without a Skia backend.
+     * Renders the current frame and returns it as an [ImageBitmap] whose pixels
+     * can be read back ([ImageBitmap.toPixelMap]). As Compose Desktop's
+     * ImageComposeScene does, it draws on a raster N32 premultiplied surface
+     * and takes a snapshot of it.
      */
     fun render(): androidx.compose.ui.graphics.ImageBitmap {
         frame()
-        val bitmap = androidx.compose.ui.graphics.ImageBitmap(width, height)
-        scene.draw(androidx.compose.ui.graphics.Canvas(bitmap))
-        return bitmap
+        val surface = org.jetbrains.skia.Surface.makeRasterN32Premul(width, height)
+        surface.canvas.clear(0)
+        scene.draw(surface.canvas.asComposeCanvas())
+        return surface.makeImageSnapshot().toComposeImageBitmap()
     }
 
     /** Rasterize the current frame to a PNG. False without a Skia backend. */

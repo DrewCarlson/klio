@@ -316,3 +316,9 @@ internal class LocaleTag private constructor(
         }
     }
 }
+
+// Compose Desktop asks AWT's ComponentOrientation, which reads right to left
+// for these languages; web targets list the same ones.
+private val rtlLanguages = setOf("ar", "fa", "he", "iw", "ji", "ur", "yi")
+
+internal actual fun Locale.isRtl(): Boolean = language in rtlLanguages

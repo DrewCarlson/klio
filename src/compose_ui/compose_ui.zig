@@ -46,7 +46,6 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("klio.compose.ui.__composeui_winClear", winClear);
     try b.register("androidx.compose.ui.window.__composeui_winOpen", winOpen);
     try b.register("androidx.compose.ui.window.__composeui_winOpenError", winOpenError);
-    try b.register("androidx.compose.ui.window.__composeui_winProbe", winProbe);
     try b.register("androidx.compose.ui.window.__composeui_winSetTitle", winSetTitle);
     try b.register("androidx.compose.ui.window.__composeui_winSetSize", winSetSize);
     try b.register("androidx.compose.ui.window.__composeui_winPoll", winPoll);
@@ -98,77 +97,10 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("klio.datatransfer.__klio_clipChangeCount", clipChangeCount);
     try b.register("klio.datatransfer.__klio_clipText", clipText);
     try b.register("klio.datatransfer.__klio_clipSetText", clipSetText);
-    try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
     try b.register("androidx.compose.ui.graphics.__skia_surf_free", surfFree);
-    try b.register("androidx.compose.ui.graphics.__skia_c_save", canvasSave);
-    try b.register("androidx.compose.ui.graphics.__skia_c_restore", canvasRestore);
-    try b.register("androidx.compose.ui.graphics.__skia_c_translate", canvasTranslate);
-    try b.register("androidx.compose.ui.graphics.__skia_c_scale", canvasScale);
-    try b.register("androidx.compose.ui.graphics.__skia_c_rotate", canvasRotate);
-    try b.register("androidx.compose.ui.graphics.__skia_c_skew", canvasSkew);
-    try b.register("androidx.compose.ui.graphics.__skia_c_clip_rect", canvasClipRect);
-    try b.register("androidx.compose.ui.graphics.__skia_c_clip_path", canvasClipPath);
-    try b.register("androidx.compose.ui.graphics.__skia_c_set_shader", canvasSetShader);
-    try b.register("androidx.compose.ui.graphics.__skia_c_set_blur", canvasSetBlur);
-    try b.register("androidx.compose.ui.graphics.__skia_c_set_color_filter", canvasSetColorFilter);
-    try b.register("androidx.compose.ui.graphics.__skia_c_set_paint_state", canvasSetPaintState);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_rect", canvasDrawRect);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_rrect", canvasDrawRRect);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_oval", canvasDrawOval);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_circle", canvasDrawCircle);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_line", canvasDrawLine);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_path", canvasDrawPath);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_text", canvasDrawText);
-    try b.register("androidx.compose.ui.graphics.__composeui_text_width", textWidth);
-    try b.register("androidx.compose.ui.graphics.__composeui_font_metric", fontMetric);
-    try b.register("androidx.compose.ui.graphics.__skia_surf_pixel", surfPixel);
-    try b.register("androidx.compose.ui.graphics.__skia_surf_size", surfSize);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_text2", canvasDrawText2);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface", canvasDrawSurface);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface_rect", canvasDrawSurfaceRect);
-    try b.register("androidx.compose.ui.graphics.__skia_c_save_layer", canvasSaveLayer);
-    try b.register("androidx.compose.ui.graphics.__skia_rec_begin", recBegin);
-    try b.register("androidx.compose.ui.graphics.__skia_rec_end", recEnd);
-    try b.register("androidx.compose.ui.graphics.__skia_picture_free", pictureFree);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_picture", canvasDrawPicture);
-    try b.register("androidx.compose.ui.graphics.__skia_c_concat44", canvasConcat44);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_context_new", rnContextNew);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_context_free", rnContextFree);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_context_set_lighting", rnContextSetLighting);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_new", rnNew);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_free", rnFree);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_float", rnSetFloat);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_color", rnSetColor);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_bounds", rnSetBounds);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_pivot", rnSetPivot);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_clip", rnSetClip);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_outline", rnSetOutline);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_set_layer_paint", rnSetLayerPaint);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_begin_recording", rnBeginRecording);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_end_recording", rnEndRecording);
-    try b.register("androidx.compose.ui.graphics.layer.__skia_rn_draw_into", rnDrawInto);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_point", canvasDrawPoint);
-    try b.register("androidx.compose.ui.graphics.__skia_c_set_path_effect", canvasSetPathEffect);
-    try b.register("androidx.compose.ui.graphics.__skia_c_draw_vertices", canvasDrawVertices);
-    try b.register("androidx.compose.ui.graphics.__skia_image_decode", imageDecode);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_new", paraNew);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_layout", paraLayout);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_metric", paraMetric);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_line_metric", paraLineMetric);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_offset_at", paraOffsetAt);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_box", paraBox);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_range_rect", paraRangeRect);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_range_rect_count", paraRangeRectCount);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_word", paraWord);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_line_for", paraLineFor);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_paint", paraPaint);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_free", paraFree);
-    try b.register("androidx.compose.ui.text.platform.__skia_font_register", fontRegister);
-    try b.register("androidx.compose.ui.text.platform.__skia_font_register_data", fontRegisterData);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_ph_count", paraPhCount);
-    try b.register("androidx.compose.ui.text.platform.__skia_para_ph_rect", paraPhRect);
+    try b.register("androidx.compose.ui.graphics.__skia_surf_canvas", surfCanvas);
     try b.register("androidx.compose.material3.internal.__klio_icu_date", icuDate);
     return b;
 }
@@ -183,15 +115,6 @@ fn argInt(v: Value) i64 {
     };
 }
 
-fn argFloat(v: Value) f32 {
-    return switch (v) {
-        .Float => |x| x,
-        .Double => |x| @floatCast(x),
-        .Int => |i| @floatFromInt(i),
-        .Long => |i| @floatFromInt(i),
-        else => 0,
-    };
-}
 
 const SkSurface = anyopaque;
 const SkWindow = anyopaque;
@@ -213,60 +136,8 @@ const Skia = struct {
     savePng: *const fn (?*SkSurface, [*:0]const u8) callconv(.c) c_int,
     encodePng: *const fn (?*SkSurface, *usize) callconv(.c) ?[*]u8,
     freeBuffer: *const fn ([*]u8) callconv(.c) void,
-    pathOp: ?PathOpFn,
     freeCstr: ?FreeCstrFn,
-    cSave: ?CVoidFn,
-    cRestore: ?CVoidFn,
-    cTranslate: ?CXYFn,
-    cScale: ?CXYFn,
-    cRotate: ?CRotateFn,
-    cSkew: ?CXYFn,
-    cClipRect: ?CClipRectFn,
-    cClipPath: ?CClipPathFn,
-    cSetShader: ?CSetShaderFn,
-    cSetBlur: ?CRotateFn,
-    cSetColorFilter: ?CSetColorFilterFn,
-    cSetPaintState: ?CSetPaintStateFn,
-    cDrawRect: ?CDrawRectFn,
-    cDrawRRect: ?CDrawRRectFn,
-    cDrawOval: ?CDrawRectFn,
-    cDrawCircle: ?CDrawCircleFn,
-    cDrawLine: ?CDrawLineFn,
-    cDrawPath: ?CDrawPathFn,
-    cMeasureTextWidth: ?CMeasureTextWidthFn,
-    cFontMetric: ?CFontMetricFn,
-    surfPixel: ?SurfPixelFn,
-    surfSize: ?SurfSizeFn,
-    cDrawText2: ?CDrawText2Fn,
-    cDrawSurface: ?CDrawSurfaceFn,
-    cDrawSurfaceRect: ?CDrawSurfaceRectFn,
-    cSaveLayer: ?CSaveLayerFn,
-    recBegin: ?RecBeginFn,
-    recEnd: ?RecEndFn,
-    pictureFree: ?PictureFreeFn,
-    cDrawPicture: ?CDrawPictureFn,
-    cConcat44: ?CConcat44Fn,
-    rn: RenderNodeFns,
-    cDrawPoint: ?CDrawPointFn,
-    cSetPathEffect: ?CSetShaderFn,
-    cDrawVertices: ?CDrawVerticesFn,
-    imageDecode: ?ImageDecodeFn,
-    paraNew: ?ParaNewFn,
-    paraLayout: ?ParaLayoutFn,
-    paraMetric: ?ParaMetricFn,
-    paraLineMetric: ?ParaLineMetricFn,
-    paraOffsetAt: ?ParaOffsetAtFn,
-    paraBox: ?ParaBoxFn,
-    paraRangeRect: ?ParaRangeRectFn,
-    paraRangeRectCount: ?ParaRangeRectCountFn,
-    paraWord: ?ParaWordFn,
-    paraLineFor: ?ParaLineForFn,
-    paraPaint: ?ParaPaintFn,
-    paraFree: ?ParaFreeFn,
-    fontRegister: ?FontRegisterFn,
-    fontRegisterData: ?FontRegisterDataFn,
-    paraPhCount: ?ParaPhCountFn,
-    paraPhRect: ?ParaPhRectFn,
+    surfCanvas: ?SurfCanvasFn,
     icuDate: ?IcuDateFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
     /// Optional: mobile backends attach to an OS-provided surface layer; null on
@@ -361,125 +232,16 @@ const WinPostEventFn = *const fn (?*SkWindow, c_int, [*]const f64) callconv(.c) 
 /// The values of one window event (src/compose_ui/window_events.h).
 const win_event_values = 12;
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
-const PathOpFn = *const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) ?[*:0]u8;
 const FreeCstrFn = *const fn ([*:0]u8) callconv(.c) void;
 const IcuDateFn = *const fn (c_int, [*:0]const u8, [*:0]const u8, [*:0]const u8, f64) callconv(.c) ?[*:0]u8;
 
-// Canvas entry points, optional so a stale shared library degrades to no-op
-// drawing instead of failing the whole Skia load.
-const CVoidFn = *const fn (?*SkSurface) callconv(.c) void;
-const CXYFn = *const fn (?*SkSurface, f32, f32) callconv(.c) void;
-const CRotateFn = *const fn (?*SkSurface, f32) callconv(.c) void;
-const CClipRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int) callconv(.c) void;
-const CClipPathFn = *const fn (?*SkSurface, [*:0]const u8, c_int) callconv(.c) void;
-const CSetShaderFn = *const fn (?*SkSurface, [*:0]const u8) callconv(.c) void;
-// A color filter spec (see skia_shim.cpp's Spec).
-const CSetColorFilterFn = *const fn (?*SkSurface, [*:0]const u8) callconv(.c) void;
-// (blendMode, imageAlpha, strokeMiter)
-const CSetPaintStateFn = *const fn (?*SkSurface, c_int, f32, f32) callconv(.c) void;
-// The trailing (argb, style, strokeWidth, cap, join, aa) is the packed paint.
-const CDrawRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
-const CDrawRRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
-const CDrawCircleFn = *const fn (?*SkSurface, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
-const CDrawLineFn = *const fn (?*SkSurface, f32, f32, f32, f32, u32, f32, c_int, c_int) callconv(.c) void;
-const CDrawPathFn = *const fn (?*SkSurface, [*:0]const u8, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
-const CMeasureTextWidthFn = *const fn ([*:0]const u8, f32) callconv(.c) f32;
-const CFontMetricFn = *const fn (f32, c_int) callconv(.c) f32;
-const SurfPixelFn = *const fn (?*SkSurface, c_int, c_int) callconv(.c) u32;
-const SurfSizeFn = *const fn (?*SkSurface, c_int) callconv(.c) c_int;
-const CDrawText2Fn = *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, u32, c_int) callconv(.c) void;
-const CDrawSurfaceFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32, c_int) callconv(.c) void;
-const CDrawSurfaceRectFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32, f32, f32, f32, f32, f32, f32, c_int) callconv(.c) void;
-// (l, t, r, b, hasBounds, alpha, blendMode, imageFilterSpec)
-const CSaveLayerFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int, f32, c_int, [*:0]const u8) callconv(.c) void;
-const SkPicture = anyopaque;
-// (left, top, right, bottom) of the recording's bounds.
-const RecBeginFn = *const fn (f32, f32, f32, f32) callconv(.c) ?*SkSurface;
-const RecEndFn = *const fn (?*SkSurface) callconv(.c) ?*SkPicture;
-const PictureFreeFn = *const fn (?*SkPicture) callconv(.c) void;
-const CDrawPictureFn = *const fn (?*SkSurface, ?*SkPicture) callconv(.c) void;
-// A Compose Matrix's 16 values, column-major.
-const CConcat44Fn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) callconv(.c) void;
+// The SkCanvas* a surface draws through, for a skiko Canvas to wrap; optional
+// so a stale shared library degrades to no drawing instead of failing the load.
+const SurfCanvasFn = *const fn (?*SkSurface) callconv(.c) ?*anyopaque;
 
-/// Graphics layer nodes (skiko's RenderNode, `klio_rn_*` in skia_shim.cpp).
-/// Each is optional so a shim without them draws layers as nothing.
-const RenderNodeFns = struct {
-    contextNew: ?*const fn (c_int) callconv(.c) ?*anyopaque = null,
-    contextFree: ?*const fn (?*anyopaque) callconv(.c) void = null,
-    contextSetLighting: ?*const fn (?*anyopaque, f32, f32, f32, f32, f32, f32) callconv(.c) void = null,
-    new: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque = null,
-    free: ?*const fn (?*anyopaque) callconv(.c) void = null,
-    setFloat: ?*const fn (?*anyopaque, c_int, f32) callconv(.c) void = null,
-    setColor: ?*const fn (?*anyopaque, c_int, u32) callconv(.c) void = null,
-    setBounds: ?*const fn (?*anyopaque, f32, f32, f32, f32) callconv(.c) void = null,
-    setPivot: ?*const fn (?*anyopaque, f32, f32) callconv(.c) void = null,
-    setClip: ?*const fn (?*anyopaque, c_int) callconv(.c) void = null,
-    // (kind, l, t, r, b, the 8 corner radii, path)
-    setOutline: ?*const fn (?*anyopaque, c_int, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, ?[*:0]const u8) callconv(.c) void = null,
-    // (has, alpha, blendMode, colorFilterSpec, imageFilterSpec)
-    setLayerPaint: ?*const fn (?*anyopaque, c_int, f32, c_int, [*:0]const u8, [*:0]const u8) callconv(.c) void = null,
-    beginRecording: ?*const fn (?*anyopaque) callconv(.c) ?*SkSurface = null,
-    endRecording: ?*const fn (?*anyopaque, ?*SkSurface) callconv(.c) void = null,
-    drawInto: ?*const fn (?*anyopaque, ?*SkSurface) callconv(.c) void = null,
-
-    const names = .{
-        .{ "contextNew", "klio_rn_context_new" },
-        .{ "contextFree", "klio_rn_context_free" },
-        .{ "contextSetLighting", "klio_rn_context_set_lighting" },
-        .{ "new", "klio_rn_new" },
-        .{ "free", "klio_rn_free" },
-        .{ "setFloat", "klio_rn_set_float" },
-        .{ "setColor", "klio_rn_set_color" },
-        .{ "setBounds", "klio_rn_set_bounds" },
-        .{ "setPivot", "klio_rn_set_pivot" },
-        .{ "setClip", "klio_rn_set_clip" },
-        .{ "setOutline", "klio_rn_set_outline" },
-        .{ "setLayerPaint", "klio_rn_set_layer_paint" },
-        .{ "beginRecording", "klio_rn_begin_recording" },
-        .{ "endRecording", "klio_rn_end_recording" },
-        .{ "drawInto", "klio_rn_draw_into" },
-    };
-
-    fn fromLib(lib: anytype) RenderNodeFns {
-        var r: RenderNodeFns = .{};
-        inline for (names) |n| {
-            const T = @typeInfo(@FieldType(RenderNodeFns, n[0])).optional.child;
-            @field(r, n[0]) = lib.lookup(T, n[1]);
-        }
-        return r;
-    }
-
-    fn fromExtern() RenderNodeFns {
-        var r: RenderNodeFns = .{};
-        inline for (names) |n| {
-            const T = @typeInfo(@FieldType(RenderNodeFns, n[0])).optional.child;
-            @field(r, n[0]) = externSym(T, n[1]);
-        }
-        return r;
-    }
-};
 // (x, y, argb, strokeWidth, cap, aa)
-const CDrawPointFn = *const fn (?*SkSurface, f32, f32, u32, f32, c_int, c_int) callconv(.c) void;
 // (mode, positions, texCoords, colors, indices, blendMode, argb): the arrays as number text.
-const CDrawVerticesFn = *const fn (?*SkSurface, c_int, [*:0]const u8, [*:0]const u8, [*:0]const u8, [*:0]const u8, c_int, u32) callconv(.c) void;
-const ImageDecodeFn = *const fn ([*]const u8, usize) callconv(.c) ?*SkSurface;
 const KlioPara = anyopaque;
-const ParaNewFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) ?*KlioPara;
-const ParaLayoutFn = *const fn (?*KlioPara, f32) callconv(.c) void;
-const ParaMetricFn = *const fn (?*KlioPara, c_int) callconv(.c) f32;
-const ParaLineMetricFn = *const fn (?*KlioPara, c_int, c_int) callconv(.c) f32;
-const ParaOffsetAtFn = *const fn (?*KlioPara, f32, f32) callconv(.c) c_int;
-const ParaBoxFn = *const fn (?*KlioPara, c_int, c_int, c_int) callconv(.c) f32;
-const ParaRangeRectFn = *const fn (?*KlioPara, c_int, c_int, c_int, c_int) callconv(.c) f32;
-const ParaRangeRectCountFn = *const fn (?*KlioPara, c_int, c_int) callconv(.c) c_int;
-const ParaWordFn = *const fn (?*KlioPara, c_int) callconv(.c) i64;
-const ParaLineForFn = *const fn (?*KlioPara, c_int) callconv(.c) c_int;
-const ParaPaintFn = *const fn (?*KlioPara, ?*SkSurface, f32, f32) callconv(.c) void;
-const ParaFreeFn = *const fn (?*KlioPara) callconv(.c) void;
-const FontRegisterFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) i32;
-const FontRegisterDataFn = *const fn ([*]const u8, usize, [*:0]const u8) callconv(.c) i32;
-const ParaPhCountFn = *const fn (?*KlioPara) callconv(.c) i32;
-const ParaPhRectFn = *const fn (?*KlioPara, i32, i32) callconv(.c) f32;
 
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
@@ -535,60 +297,8 @@ fn loadSkia() ?*Skia {
         .savePng = F.get(&lib, "savePng", "klio_skia_save_png") orelse return skiaLoadFail(&lib),
         .encodePng = F.get(&lib, "encodePng", "klio_skia_encode_png") orelse return skiaLoadFail(&lib),
         .freeBuffer = F.get(&lib, "freeBuffer", "klio_skia_free_buffer") orelse return skiaLoadFail(&lib),
-        .pathOp = lib.lookup(PathOpFn, "klio_skia_path_op"),
         .freeCstr = lib.lookup(FreeCstrFn, "klio_skia_free_cstr"),
-        .cSave = lib.lookup(CVoidFn, "klio_skia_c_save"),
-        .cRestore = lib.lookup(CVoidFn, "klio_skia_c_restore"),
-        .cTranslate = lib.lookup(CXYFn, "klio_skia_c_translate"),
-        .cScale = lib.lookup(CXYFn, "klio_skia_c_scale"),
-        .cRotate = lib.lookup(CRotateFn, "klio_skia_c_rotate"),
-        .cSkew = lib.lookup(CXYFn, "klio_skia_c_skew"),
-        .cClipRect = lib.lookup(CClipRectFn, "klio_skia_c_clip_rect"),
-        .cClipPath = lib.lookup(CClipPathFn, "klio_skia_c_clip_path"),
-        .cSetShader = lib.lookup(CSetShaderFn, "klio_skia_c_set_shader"),
-        .cSetBlur = lib.lookup(CRotateFn, "klio_skia_c_set_blur"),
-        .cSetColorFilter = lib.lookup(CSetColorFilterFn, "klio_skia_c_set_color_filter"),
-        .cSetPaintState = lib.lookup(CSetPaintStateFn, "klio_skia_c_set_paint_state"),
-        .cDrawRect = lib.lookup(CDrawRectFn, "klio_skia_c_draw_rect"),
-        .cDrawRRect = lib.lookup(CDrawRRectFn, "klio_skia_c_draw_rrect"),
-        .cDrawOval = lib.lookup(CDrawRectFn, "klio_skia_c_draw_oval"),
-        .cDrawCircle = lib.lookup(CDrawCircleFn, "klio_skia_c_draw_circle"),
-        .cDrawLine = lib.lookup(CDrawLineFn, "klio_skia_c_draw_line"),
-        .cDrawPath = lib.lookup(CDrawPathFn, "klio_skia_c_draw_path"),
-        .cMeasureTextWidth = lib.lookup(CMeasureTextWidthFn, "klio_skia_measure_text_width"),
-        .cFontMetric = lib.lookup(CFontMetricFn, "klio_skia_font_metric"),
-        .surfPixel = lib.lookup(SurfPixelFn, "klio_skia_surf_pixel"),
-        .surfSize = lib.lookup(SurfSizeFn, "klio_skia_surf_size"),
-        .cDrawText2 = lib.lookup(CDrawText2Fn, "klio_skia_c_draw_text2"),
-        .cDrawSurface = lib.lookup(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
-        .cDrawSurfaceRect = lib.lookup(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
-        .cSaveLayer = lib.lookup(CSaveLayerFn, "klio_skia_c_save_layer"),
-        .recBegin = lib.lookup(RecBeginFn, "klio_skia_rec_begin_bounds"),
-        .recEnd = lib.lookup(RecEndFn, "klio_skia_rec_end"),
-        .pictureFree = lib.lookup(PictureFreeFn, "klio_skia_picture_free"),
-        .cDrawPicture = lib.lookup(CDrawPictureFn, "klio_skia_c_draw_picture"),
-        .cConcat44 = lib.lookup(CConcat44Fn, "klio_skia_c_concat44"),
-        .rn = RenderNodeFns.fromLib(&lib),
-        .cDrawPoint = lib.lookup(CDrawPointFn, "klio_skia_c_draw_point"),
-        .cSetPathEffect = lib.lookup(CSetShaderFn, "klio_skia_c_set_path_effect"),
-        .cDrawVertices = lib.lookup(CDrawVerticesFn, "klio_skia_c_draw_vertices"),
-        .imageDecode = lib.lookup(ImageDecodeFn, "klio_skia_image_decode"),
-        .paraNew = lib.lookup(ParaNewFn, "klio_skia_para_new"),
-        .paraLayout = lib.lookup(ParaLayoutFn, "klio_skia_para_layout"),
-        .paraMetric = lib.lookup(ParaMetricFn, "klio_skia_para_metric"),
-        .paraLineMetric = lib.lookup(ParaLineMetricFn, "klio_skia_para_line_metric"),
-        .paraOffsetAt = lib.lookup(ParaOffsetAtFn, "klio_skia_para_offset_at"),
-        .paraBox = lib.lookup(ParaBoxFn, "klio_skia_para_box"),
-        .paraRangeRect = lib.lookup(ParaRangeRectFn, "klio_skia_para_range_rect"),
-        .paraRangeRectCount = lib.lookup(ParaRangeRectCountFn, "klio_skia_para_range_rect_count"),
-        .paraWord = lib.lookup(ParaWordFn, "klio_skia_para_word"),
-        .paraLineFor = lib.lookup(ParaLineForFn, "klio_skia_para_line_for"),
-        .paraPaint = lib.lookup(ParaPaintFn, "klio_skia_para_paint"),
-        .paraFree = lib.lookup(ParaFreeFn, "klio_skia_para_free"),
-        .fontRegister = lib.lookup(FontRegisterFn, "klio_skia_font_register"),
-        .fontRegisterData = lib.lookup(FontRegisterDataFn, "klio_skia_font_register_data"),
-        .paraPhCount = lib.lookup(ParaPhCountFn, "klio_skia_para_ph_count"),
-        .paraPhRect = lib.lookup(ParaPhRectFn, "klio_skia_para_ph_rect"),
+        .surfCanvas = lib.lookup(SurfCanvasFn, "klio_skia_surf_canvas"),
         .icuDate = lib.lookup(IcuDateFn, "klio_icu_date"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
         .winAttach = lib.lookup(WinAttachFn, "klio_win_attach"),
@@ -650,60 +360,8 @@ fn loadSkiaStatic() ?*Skia {
         .savePng = externSym(@FieldType(Skia, "savePng"), "klio_skia_save_png"),
         .encodePng = externSym(@FieldType(Skia, "encodePng"), "klio_skia_encode_png"),
         .freeBuffer = externSym(@FieldType(Skia, "freeBuffer"), "klio_skia_free_buffer"),
-        .pathOp = externSym(PathOpFn, "klio_skia_path_op"),
         .freeCstr = externSym(FreeCstrFn, "klio_skia_free_cstr"),
-        .cSave = externSym(CVoidFn, "klio_skia_c_save"),
-        .cRestore = externSym(CVoidFn, "klio_skia_c_restore"),
-        .cTranslate = externSym(CXYFn, "klio_skia_c_translate"),
-        .cScale = externSym(CXYFn, "klio_skia_c_scale"),
-        .cRotate = externSym(CRotateFn, "klio_skia_c_rotate"),
-        .cSkew = externSym(CXYFn, "klio_skia_c_skew"),
-        .cClipRect = externSym(CClipRectFn, "klio_skia_c_clip_rect"),
-        .cClipPath = externSym(CClipPathFn, "klio_skia_c_clip_path"),
-        .cSetShader = externSym(CSetShaderFn, "klio_skia_c_set_shader"),
-        .cSetBlur = externSym(CRotateFn, "klio_skia_c_set_blur"),
-        .cSetColorFilter = externSym(CSetColorFilterFn, "klio_skia_c_set_color_filter"),
-        .cSetPaintState = externSym(CSetPaintStateFn, "klio_skia_c_set_paint_state"),
-        .cDrawRect = externSym(CDrawRectFn, "klio_skia_c_draw_rect"),
-        .cDrawRRect = externSym(CDrawRRectFn, "klio_skia_c_draw_rrect"),
-        .cDrawOval = externSym(CDrawRectFn, "klio_skia_c_draw_oval"),
-        .cDrawCircle = externSym(CDrawCircleFn, "klio_skia_c_draw_circle"),
-        .cDrawLine = externSym(CDrawLineFn, "klio_skia_c_draw_line"),
-        .cDrawPath = externSym(CDrawPathFn, "klio_skia_c_draw_path"),
-        .cMeasureTextWidth = externSym(CMeasureTextWidthFn, "klio_skia_measure_text_width"),
-        .cFontMetric = externSym(CFontMetricFn, "klio_skia_font_metric"),
-        .surfPixel = externSym(SurfPixelFn, "klio_skia_surf_pixel"),
-        .surfSize = externSym(SurfSizeFn, "klio_skia_surf_size"),
-        .cDrawText2 = externSym(CDrawText2Fn, "klio_skia_c_draw_text2"),
-        .cDrawSurface = externSym(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
-        .cDrawSurfaceRect = externSym(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
-        .cSaveLayer = externSym(CSaveLayerFn, "klio_skia_c_save_layer"),
-        .recBegin = externSym(RecBeginFn, "klio_skia_rec_begin_bounds"),
-        .recEnd = externSym(RecEndFn, "klio_skia_rec_end"),
-        .pictureFree = externSym(PictureFreeFn, "klio_skia_picture_free"),
-        .cDrawPicture = externSym(CDrawPictureFn, "klio_skia_c_draw_picture"),
-        .cConcat44 = externSym(CConcat44Fn, "klio_skia_c_concat44"),
-        .rn = RenderNodeFns.fromExtern(),
-        .cDrawPoint = externSym(CDrawPointFn, "klio_skia_c_draw_point"),
-        .cSetPathEffect = externSym(CSetShaderFn, "klio_skia_c_set_path_effect"),
-        .cDrawVertices = externSym(CDrawVerticesFn, "klio_skia_c_draw_vertices"),
-        .imageDecode = externSym(ImageDecodeFn, "klio_skia_image_decode"),
-        .paraNew = externSym(ParaNewFn, "klio_skia_para_new"),
-        .paraLayout = externSym(ParaLayoutFn, "klio_skia_para_layout"),
-        .paraMetric = externSym(ParaMetricFn, "klio_skia_para_metric"),
-        .paraLineMetric = externSym(ParaLineMetricFn, "klio_skia_para_line_metric"),
-        .paraOffsetAt = externSym(ParaOffsetAtFn, "klio_skia_para_offset_at"),
-        .paraBox = externSym(ParaBoxFn, "klio_skia_para_box"),
-        .paraRangeRect = externSym(ParaRangeRectFn, "klio_skia_para_range_rect"),
-        .paraRangeRectCount = externSym(ParaRangeRectCountFn, "klio_skia_para_range_rect_count"),
-        .paraWord = externSym(ParaWordFn, "klio_skia_para_word"),
-        .paraLineFor = externSym(ParaLineForFn, "klio_skia_para_line_for"),
-        .paraPaint = externSym(ParaPaintFn, "klio_skia_para_paint"),
-        .paraFree = externSym(ParaFreeFn, "klio_skia_para_free"),
-        .fontRegister = externSym(FontRegisterFn, "klio_skia_font_register"),
-        .fontRegisterData = externSym(FontRegisterDataFn, "klio_skia_font_register_data"),
-        .paraPhCount = externSym(ParaPhCountFn, "klio_skia_para_ph_count"),
-        .paraPhRect = externSym(ParaPhRectFn, "klio_skia_para_ph_rect"),
+        .surfCanvas = externSym(SurfCanvasFn, "klio_skia_surf_canvas"),
         .icuDate = externSym(IcuDateFn, "klio_icu_date"),
         .winOpen = externSym(@FieldType(Skia, "winOpen"), "klio_win_open"),
         .winAttach = externSym(WinAttachFn, "klio_win_attach"),
@@ -1139,12 +797,6 @@ fn winSetSize(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
-fn winProbe(ctx: *CallCtx) Error!EvalResult {
-    _ = ctx;
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    _ = skia;
-    return ok(Value.newLong(1));
-}
 
 /// Why the last window open failed, for the program's error.
 var win_open_error: []const u8 = "";
@@ -1776,28 +1428,6 @@ fn winHandle(v: Value) ?*SkWindow {
     return @ptrFromInt(@as(usize, @intCast(h)));
 }
 
-/// Combine two serialized path command buffers with a boolean op. Null when the
-/// op fails or no Skia backend is available, leaving the caller's path unchanged.
-fn pathOp(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 3 or ctx.args[0] != .String or ctx.args[1] != .String) return ok(Value.Null);
-    const skia = loadSkia() orelse return ok(Value.Null);
-    const op_fn = skia.pathOp orelse return ok(Value.Null);
-    const free_fn = skia.freeCstr orelse return ok(Value.Null);
-    const a = ctx.allocator;
-    const ag = ctx.args[0].String.borrow();
-    defer ag.deinit();
-    const bg = ctx.args[1].String.borrow();
-    defer bg.deinit();
-    const az = std.fmt.allocPrintSentinel(a, "{s}", .{ag.get().bytes}, 0) catch return ok(Value.Null);
-    defer a.free(az);
-    const bz = std.fmt.allocPrintSentinel(a, "{s}", .{bg.get().bytes}, 0) catch return ok(Value.Null);
-    defer a.free(bz);
-    const op: c_int = @intCast(argInt(ctx.args[2]));
-    const res = op_fn(az.ptr, bz.ptr, op) orelse return ok(Value.Null);
-    defer free_fn(res);
-    const owned = try a.dupe(u8, std.mem.span(res));
-    return ok(Value{ .String = try runtime.strInitOwned(a, owned) });
-}
 
 /// A date question for the host's ICU (`klio_icu_date` in icu_shim.cpp):
 /// (op, languageTag, a, b, millis). Null when ICU cannot answer or no Skia
@@ -1832,9 +1462,6 @@ fn surfArg(v: Value) ?*SkSurface {
     return @ptrFromInt(@as(usize, @intCast(h)));
 }
 
-fn argU32(v: Value) u32 {
-    return @bitCast(@as(i32, @truncate(argInt(v))));
-}
 
 fn surfNew(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return ok(Value.newLong(0));
@@ -1864,712 +1491,91 @@ fn surfFree(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-fn surfPixel(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 3) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.surfPixel orelse return ok(Value.newLong(0));
-    const x: c_int = @intCast(argInt(ctx.args[1]));
-    const y: c_int = @intCast(argInt(ctx.args[2]));
-    return ok(Value.newLong(@intCast(f(surf, x, y))));
-}
 
-/// Register a font's bytes (a ByteArray) under a family name: true when they
-/// load as a typeface.
-fn fontRegisterData(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2 or ctx.args[0] != .Array) return ok(Value{ .Bool = false });
-    const skia = loadSkia() orelse return ok(Value{ .Bool = false });
-    const f = skia.fontRegisterData orelse return ok(Value{ .Bool = false });
-    const family = (try specArg(ctx.allocator, ctx.args[1])) orelse return ok(Value{ .Bool = false });
-    defer ctx.allocator.free(family);
-    const arr = ctx.args[0].Array;
-    const bytes = try ctx.allocator.alloc(u8, arr.len());
-    defer ctx.allocator.free(bytes);
-    for (bytes, 0..) |*b, i| b.* = switch (arr.get(i)) {
-        .Byte => |x| @bitCast(x),
-        else => 0,
-    };
-    return ok(Value{ .Bool = f(bytes.ptr, bytes.len, family.ptr) != 0 });
-}
 
 /// A surface's width (which 0) or height (which 1).
-fn surfSize(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2) return ok(Value.newInt(0));
-    const skia = loadSkia() orelse return ok(Value.newInt(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newInt(0));
-    const f = skia.surfSize orelse return ok(Value.newInt(0));
-    return ok(Value.newInt(f(surf, @intCast(argInt(ctx.args[1])))));
-}
-
-/// Canvas.drawImage: (dst, src, x, y, sampling), sampling as the paint's
-/// filter quality maps (0 nearest, 1 linear, 2 linear + nearest mipmap, 3 cubic).
-fn canvasDrawSurface(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 5) return ok(Value.newLong(0));
+/// `__skia_surf_canvas(handle)`: the SkCanvas* the surface's draws go to, for
+/// a skiko Canvas to wrap; 0 without a Skia backend.
+fn surfCanvas(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const dst = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const src = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
-    if (skia.cDrawSurface) |f| f(dst, src, argFloat(ctx.args[2]), argFloat(ctx.args[3]), @intCast(argInt(ctx.args[4])));
-    return ok(Value.newLong(0));
-}
-
-/// A string argument as a sentinel-terminated copy; null when it is not a
-/// string. The caller frees it.
-fn specArg(allocator: std.mem.Allocator, v: Value) !?[:0]u8 {
-    if (v != .String) return null;
-    const g = v.String.borrow();
-    defer g.deinit();
-    return try allocator.dupeZ(u8, g.get().bytes);
-}
-
-/// Canvas.saveLayer: (handle, l, t, r, b, hasBounds, alpha, blendMode,
-/// imageFilterSpec); the pending color filter joins the layer's paint.
-fn canvasSaveLayer(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 9) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.surfCanvas orelse return ok(Value.newLong(0));
     const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    const filter = (try specArg(ctx.allocator, a[8])) orelse return ok(Value.newLong(0));
-    defer ctx.allocator.free(filter);
-    if (skia.cSaveLayer) |f| f(
-        surf,
-        argFloat(a[1]),
-        argFloat(a[2]),
-        argFloat(a[3]),
-        argFloat(a[4]),
-        @intCast(argInt(a[5])),
-        argFloat(a[6]),
-        @intCast(argInt(a[7])),
-        filter.ptr,
-    );
-    return ok(Value.newLong(0));
+    const canvas = f(surf) orelse return ok(Value.newLong(0));
+    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(canvas)))));
 }
 
-/// Arm the next draws' path effect spec; an empty spec clears it.
-fn canvasSetPathEffect(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 2) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cSetPathEffect orelse return ok(Value.newLong(0));
-    const spec = (try specArg(ctx.allocator, ctx.args[1])) orelse return ok(Value.newLong(0));
-    defer ctx.allocator.free(spec);
-    f(surf, spec.ptr);
-    return ok(Value.newLong(0));
-}
 
-/// Canvas.drawVertices: (handle, mode, positions, texCoords, colors, indices,
-/// blendMode, argb), the arrays as whitespace-separated number text.
-fn canvasDrawVertices(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 8) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cDrawVertices orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    var texts: [4][:0]u8 = undefined;
-    var n: usize = 0;
-    defer for (texts[0..n]) |t| ctx.allocator.free(t);
-    for (a[2..6]) |v| {
-        texts[n] = (try specArg(ctx.allocator, v)) orelse return ok(Value.newLong(0));
-        n += 1;
-    }
-    f(surf, @intCast(argInt(a[1])), texts[0].ptr, texts[1].ptr, texts[2].ptr, texts[3].ptr, @intCast(argInt(a[6])), argU32(a[7]));
-    return ok(Value.newLong(0));
-}
 
-/// Decode an encoded image (a ByteArray) into a new surface of its size: the
-/// surface's handle, or 0 when the bytes do not decode or there is no Skia.
-fn imageDecode(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 1 or ctx.args[0] != .Array) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const f = skia.imageDecode orelse return ok(Value.newLong(0));
-    const arr = ctx.args[0].Array;
-    const bytes = try ctx.allocator.alloc(u8, arr.len());
-    defer ctx.allocator.free(bytes);
-    for (bytes, 0..) |*b, i| b.* = switch (arr.get(i)) {
-        .Byte => |x| @bitCast(x),
-        else => 0,
-    };
-    return ok(handleOf(f(bytes.ptr, bytes.len)));
-}
 
-/// Begin recording a picture over (left, top, right, bottom): returns a handle
-/// that draws like a surface's, or 0 without the Skia backend.
-fn recBegin(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 4) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const f = skia.recBegin orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    const h = f(argFloat(a[0]), argFloat(a[1]), argFloat(a[2]), argFloat(a[3])) orelse return ok(Value.newLong(0));
-    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(h)))));
-}
 
-/// Concat a Compose Matrix (its 16 values) onto the canvas, perspective included.
-fn canvasConcat44(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 17) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cConcat44 orelse return ok(Value.newLong(0));
-    var m: [16]f32 = undefined;
-    for (&m, ctx.args[1..17]) |*d, v| d.* = argFloat(v);
-    f(surf, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
-    return ok(Value.newLong(0));
-}
+
+
+
+
 
 // Graphics layer nodes. A node or context handle is its pointer as a Long; 0
 // without the Skia backend, which every entry point then answers with 0.
 
-fn handleOf(p: ?*anyopaque) Value {
-    return Value.newLong(if (p) |q| @bitCast(@as(u64, @intFromPtr(q))) else 0);
-}
 
-fn rnFns(ctx: *CallCtx, min_args: usize) ?*RenderNodeFns {
-    if (ctx.args.len < min_args) return null;
-    const skia = loadSkia() orelse return null;
-    return &skia.rn;
-}
 
-fn rnContextNew(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
-    const f = rn.contextNew orelse return ok(Value.newLong(0));
-    return ok(handleOf(f(@intCast(argInt(ctx.args[0])))));
-}
 
-fn rnContextFree(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
-    if (rn.contextFree) |f| if (surfArg(ctx.args[0])) |p| f(p);
-    return ok(Value.newLong(0));
-}
 
-fn rnContextSetLighting(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 7) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    if (rn.contextSetLighting) |f| f(p, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argFloat(a[5]), argFloat(a[6]));
-    return ok(Value.newLong(0));
-}
 
-fn rnNew(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
-    const context = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = rn.new orelse return ok(Value.newLong(0));
-    return ok(handleOf(f(context)));
-}
 
-fn rnFree(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
-    if (rn.free) |f| if (surfArg(ctx.args[0])) |p| f(p);
-    return ok(Value.newLong(0));
-}
 
-fn rnSetFloat(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 3) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    if (rn.setFloat) |f| f(p, @intCast(argInt(ctx.args[1])), argFloat(ctx.args[2]));
-    return ok(Value.newLong(0));
-}
 
-fn rnSetColor(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 3) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    if (rn.setColor) |f| f(p, @intCast(argInt(ctx.args[1])), argU32(ctx.args[2]));
-    return ok(Value.newLong(0));
-}
 
-fn rnSetBounds(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 5) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    if (rn.setBounds) |f| f(p, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]));
-    return ok(Value.newLong(0));
-}
 
-fn rnSetPivot(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 3) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    if (rn.setPivot) |f| f(p, argFloat(ctx.args[1]), argFloat(ctx.args[2]));
-    return ok(Value.newLong(0));
-}
 
-fn rnSetClip(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 2) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    if (rn.setClip) |f| f(p, @intCast(argInt(ctx.args[1])));
-    return ok(Value.newLong(0));
-}
 
-/// (node, kind, l, t, r, b, 8 corner radii, path): the outline a node clips to
-/// and casts its shadow from.
-fn rnSetOutline(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 15) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = rn.setOutline orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    var path: ?[:0]u8 = null;
-    defer if (path) |t| ctx.allocator.free(t);
-    if (a[14] == .String) {
-        const g = a[14].String.borrow();
-        defer g.deinit();
-        path = try ctx.allocator.dupeZ(u8, g.get().bytes);
-    }
-    var v: [12]f32 = undefined;
-    for (&v, a[2..14]) |*d, x| d.* = argFloat(x);
-    f(p, @intCast(argInt(a[1])), v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], if (path) |t| t.ptr else null);
-    return ok(Value.newLong(0));
-}
 
-fn rnSetLayerPaint(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 6) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = rn.setLayerPaint orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    const color_filter = (try specArg(ctx.allocator, a[4])) orelse return ok(Value.newLong(0));
-    defer ctx.allocator.free(color_filter);
-    const image_filter = (try specArg(ctx.allocator, a[5])) orelse return ok(Value.newLong(0));
-    defer ctx.allocator.free(image_filter);
-    f(p, @intCast(argInt(a[1])), argFloat(a[2]), @intCast(argInt(a[3])), color_filter.ptr, image_filter.ptr);
-    return ok(Value.newLong(0));
-}
 
-fn rnBeginRecording(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 1) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = rn.beginRecording orelse return ok(Value.newLong(0));
-    return ok(handleOf(f(p)));
-}
 
-fn rnEndRecording(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 2) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    if (rn.endRecording) |f| f(p, surfArg(ctx.args[1]));
-    return ok(Value.newLong(0));
-}
 
-fn rnDrawInto(ctx: *CallCtx) Error!EvalResult {
-    const rn = rnFns(ctx, 2) orelse return ok(Value.newLong(0));
-    const p = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
-    if (rn.drawInto) |f| f(p, surf);
-    return ok(Value.newLong(0));
-}
 
-/// Draw a point the stroke width across, round or square by the cap.
-fn canvasDrawPoint(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 7) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cDrawPoint orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    f(surf, argFloat(a[1]), argFloat(a[2]), argU32(a[3]), argFloat(a[4]), @intCast(argInt(a[5])), @intCast(argInt(a[6])));
-    return ok(Value.newLong(0));
-}
 
-/// End a recording, freeing its handle: returns the picture's handle.
-fn recEnd(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 1) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const rec = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.recEnd orelse return ok(Value.newLong(0));
-    const p = f(rec) orelse return ok(Value.newLong(0));
-    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(p)))));
-}
 
-fn pictureFree(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 1) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (surfArg(ctx.args[0])) |p| if (skia.pictureFree) |f| f(p);
-    return ok(Value.newLong(0));
-}
 
-fn canvasDrawPicture(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const pic = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
-    if (skia.cDrawPicture) |f| f(surf, pic);
-    return ok(Value.newLong(0));
-}
 
-fn canvasDrawSurfaceRect(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 11) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const dst = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const src = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
-    if (skia.cDrawSurfaceRect) |f| f(
-        dst,
-        src,
-        argFloat(ctx.args[2]),
-        argFloat(ctx.args[3]),
-        argFloat(ctx.args[4]),
-        argFloat(ctx.args[5]),
-        argFloat(ctx.args[6]),
-        argFloat(ctx.args[7]),
-        argFloat(ctx.args[8]),
-        argFloat(ctx.args[9]),
-        @intCast(argInt(ctx.args[10])),
-    );
-    return ok(Value.newLong(0));
-}
 
-/// Build a styled paragraph, or 0 when no Skia backend or font is available, so
-/// callers fall back to stub metrics.
-fn paraNew(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2 or ctx.args[0] != .String or ctx.args[1] != .String) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const f = skia.paraNew orelse return ok(Value.newLong(0));
-    const tg = ctx.args[0].String.borrow();
-    defer tg.deinit();
-    const sg = ctx.args[1].String.borrow();
-    defer sg.deinit();
-    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer ctx.allocator.free(txt);
-    const spec = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{sg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer ctx.allocator.free(spec);
-    const para = f(txt.ptr, spec.ptr) orelse return ok(Value.newLong(0));
-    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(para)))));
-}
 
-fn paraArg(v: Value) ?*KlioPara {
-    const h = argInt(v);
-    if (h == 0) return null;
-    return @ptrFromInt(@as(usize, @intCast(@as(u64, @bitCast(h)))));
-}
 
-fn paraLayout(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (skia.paraLayout) |f| if (paraArg(ctx.args[0])) |p| f(p, argFloat(ctx.args[1]));
-    return ok(Value.newLong(0));
-}
 
-fn paraMetric(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2) return ok(.{ .Float = 0 });
-    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
-    const f = skia.paraMetric orelse return ok(.{ .Float = 0 });
-    const p = paraArg(ctx.args[0]) orelse return ok(.{ .Float = 0 });
-    return ok(.{ .Float = f(p, @intCast(argInt(ctx.args[1]))) });
-}
 
-fn paraLineMetric(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 3) return ok(.{ .Float = 0 });
-    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
-    const f = skia.paraLineMetric orelse return ok(.{ .Float = 0 });
-    const p = paraArg(ctx.args[0]) orelse return ok(.{ .Float = 0 });
-    return ok(.{ .Float = f(p, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2]))) });
-}
 
-fn paraOffsetAt(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 3) return ok(Value.newInt(0));
-    const skia = loadSkia() orelse return ok(Value.newInt(0));
-    const f = skia.paraOffsetAt orelse return ok(Value.newInt(0));
-    const p = paraArg(ctx.args[0]) orelse return ok(Value.newInt(0));
-    return ok(Value.newInt(f(p, argFloat(ctx.args[1]), argFloat(ctx.args[2]))));
-}
 
-fn paraBox(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 4) return ok(.{ .Float = 0 });
-    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
-    const f = skia.paraBox orelse return ok(.{ .Float = 0 });
-    const p = paraArg(ctx.args[0]) orelse return ok(.{ .Float = 0 });
-    return ok(.{ .Float = f(p, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])), @intCast(argInt(ctx.args[3]))) });
-}
 
-fn paraRangeRect(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 5) return ok(.{ .Float = 0 });
-    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
-    const f = skia.paraRangeRect orelse return ok(.{ .Float = 0 });
-    const p = paraArg(ctx.args[0]) orelse return ok(.{ .Float = 0 });
-    return ok(.{ .Float = f(p, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])), @intCast(argInt(ctx.args[3])), @intCast(argInt(ctx.args[4]))) });
-}
 
-fn paraRangeRectCount(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 3) return ok(Value.newInt(0));
-    const skia = loadSkia() orelse return ok(Value.newInt(0));
-    const f = skia.paraRangeRectCount orelse return ok(Value.newInt(0));
-    const p = paraArg(ctx.args[0]) orelse return ok(Value.newInt(0));
-    return ok(Value.newInt(f(p, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])))));
-}
 
-fn paraWord(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const f = skia.paraWord orelse return ok(Value.newLong(0));
-    const p = paraArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    return ok(Value.newLong(f(p, @intCast(argInt(ctx.args[1])))));
-}
 
-fn paraLineFor(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2) return ok(Value.newInt(0));
-    const skia = loadSkia() orelse return ok(Value.newInt(0));
-    const f = skia.paraLineFor orelse return ok(Value.newInt(0));
-    const p = paraArg(ctx.args[0]) orelse return ok(Value.newInt(0));
-    return ok(Value.newInt(f(p, @intCast(argInt(ctx.args[1])))));
-}
 
-fn paraPaint(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 4) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const f = skia.paraPaint orelse return ok(Value.newLong(0));
-    const p = paraArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
-    f(p, surf, argFloat(ctx.args[2]), argFloat(ctx.args[3]));
-    return ok(Value.newLong(0));
-}
 
-fn paraFree(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 1) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (skia.paraFree) |f| if (paraArg(ctx.args[0])) |p| f(p);
-    return ok(Value.newLong(0));
-}
 
-fn fontRegister(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2 or ctx.args[0] != .String or ctx.args[1] != .String) return ok(Value{ .Bool = false });
-    const skia = loadSkia() orelse return ok(Value{ .Bool = false });
-    const f = skia.fontRegister orelse return ok(Value{ .Bool = false });
-    const pg = ctx.args[0].String.borrow();
-    defer pg.deinit();
-    const fg = ctx.args[1].String.borrow();
-    defer fg.deinit();
-    const path = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{pg.get().bytes}, 0) catch return ok(Value{ .Bool = false });
-    defer ctx.allocator.free(path);
-    const fam = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{fg.get().bytes}, 0) catch return ok(Value{ .Bool = false });
-    defer ctx.allocator.free(fam);
-    return ok(Value{ .Bool = f(path.ptr, fam.ptr) != 0 });
-}
 
-fn paraPhCount(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 1) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const f = skia.paraPhCount orelse return ok(Value.newLong(0));
-    const p = paraArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    return ok(Value.newLong(f(p)));
-}
 
-fn paraPhRect(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 3) return ok(Value{ .Float = 0 });
-    const skia = loadSkia() orelse return ok(Value{ .Float = 0 });
-    const f = skia.paraPhRect orelse return ok(Value{ .Float = 0 });
-    const p = paraArg(ctx.args[0]) orelse return ok(Value{ .Float = 0 });
-    const i = ctx.args[1].asI64() orelse 0;
-    const w = ctx.args[2].asI64() orelse 0;
-    return ok(Value{ .Float = f(p, @intCast(i), @intCast(w)) });
-}
 
-fn canvasSave(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 1) if (surfArg(ctx.args[0])) |s| if (skia.cSave) |f| f(s);
-    return ok(Value.newLong(0));
-}
 
-fn canvasRestore(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 1) if (surfArg(ctx.args[0])) |s| if (skia.cRestore) |f| f(s);
-    return ok(Value.newLong(0));
-}
 
-fn canvasTranslate(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 3) if (surfArg(ctx.args[0])) |s| if (skia.cTranslate) |f|
-        f(s, argFloat(ctx.args[1]), argFloat(ctx.args[2]));
-    return ok(Value.newLong(0));
-}
 
-fn canvasScale(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 3) if (surfArg(ctx.args[0])) |s| if (skia.cScale) |f|
-        f(s, argFloat(ctx.args[1]), argFloat(ctx.args[2]));
-    return ok(Value.newLong(0));
-}
 
-fn canvasRotate(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 2) if (surfArg(ctx.args[0])) |s| if (skia.cRotate) |f|
-        f(s, argFloat(ctx.args[1]));
-    return ok(Value.newLong(0));
-}
 
-fn canvasSkew(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 3) if (surfArg(ctx.args[0])) |s| if (skia.cSkew) |f|
-        f(s, argFloat(ctx.args[1]), argFloat(ctx.args[2]));
-    return ok(Value.newLong(0));
-}
 
-fn canvasClipRect(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 6) if (surfArg(ctx.args[0])) |s| if (skia.cClipRect) |f|
-        f(s, argFloat(ctx.args[1]), argFloat(ctx.args[2]), argFloat(ctx.args[3]), argFloat(ctx.args[4]), @intCast(argInt(ctx.args[5])));
-    return ok(Value.newLong(0));
-}
 
-fn canvasClipPath(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 3 or ctx.args[1] != .String) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cClipPath orelse return ok(Value.newLong(0));
-    const pg = ctx.args[1].String.borrow();
-    defer pg.deinit();
-    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{pg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer ctx.allocator.free(txt);
-    f(surf, txt.ptr, @intCast(argInt(ctx.args[2])));
-    return ok(Value.newLong(0));
-}
 
-/// Arm the next draw's gradient shader; empty text clears it.
-fn canvasSetShader(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cSetShader orelse return ok(Value.newLong(0));
-    const pg = ctx.args[1].String.borrow();
-    defer pg.deinit();
-    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{pg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer ctx.allocator.free(txt);
-    f(surf, txt.ptr);
-    return ok(Value.newLong(0));
-}
 
-/// Arm the next draw's blur by its sigma; zero clears it.
-fn canvasSetBlur(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 2) if (surfArg(ctx.args[0])) |s| if (skia.cSetBlur) |f| f(s, argFloat(ctx.args[1]));
-    return ok(Value.newLong(0));
-}
 
-/// Arm the next draws' color filter spec; an empty spec clears it.
-fn canvasSetColorFilter(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 2) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cSetColorFilter orelse return ok(Value.newLong(0));
-    const spec = (try specArg(ctx.allocator, ctx.args[1])) orelse return ok(Value.newLong(0));
-    defer ctx.allocator.free(spec);
-    f(surf, spec.ptr);
-    return ok(Value.newLong(0));
-}
 
-/// Arm the next draws' blend mode, an image draw's alpha and the stroke miter
-/// limit, (mode, alpha, miter); a negative mode resets them.
-fn canvasSetPaintState(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len >= 4) if (surfArg(ctx.args[0])) |s| if (skia.cSetPaintState) |f|
-        f(s, @intCast(argInt(ctx.args[1])), argFloat(ctx.args[2]), argFloat(ctx.args[3]));
-    return ok(Value.newLong(0));
-}
 
-/// The trailing paint args are (argb, style, strokeWidth, cap, join, aa).
-fn canvasDrawRect(ctx: *CallCtx) Error!EvalResult {
-    if (runtime.envOnce("KLIO_DRAW_TRACE") != null and ctx.args.len >= 11) {
-        std.debug.print("[draw] rect surf={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} color={x:0>8}\n", .{
-            argInt(ctx.args[0]), argFloat(ctx.args[1]), argFloat(ctx.args[2]),
-            argFloat(ctx.args[3]), argFloat(ctx.args[4]), argU32(ctx.args[5]),
-        });
-    }
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 11) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    if (skia.cDrawRect) |f| f(surf, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argU32(a[5]), @intCast(argInt(a[6])), argFloat(a[7]), @intCast(argInt(a[8])), @intCast(argInt(a[9])), @intCast(argInt(a[10])));
-    return ok(Value.newLong(0));
-}
 
-fn canvasDrawOval(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 11) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    if (skia.cDrawOval) |f| f(surf, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argU32(a[5]), @intCast(argInt(a[6])), argFloat(a[7]), @intCast(argInt(a[8])), @intCast(argInt(a[9])), @intCast(argInt(a[10])));
-    return ok(Value.newLong(0));
-}
 
-fn canvasDrawRRect(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 13) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    if (skia.cDrawRRect) |f| f(surf, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argFloat(a[5]), argFloat(a[6]), argU32(a[7]), @intCast(argInt(a[8])), argFloat(a[9]), @intCast(argInt(a[10])), @intCast(argInt(a[11])), @intCast(argInt(a[12])));
-    return ok(Value.newLong(0));
-}
 
-fn canvasDrawCircle(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 10) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    if (skia.cDrawCircle) |f| f(surf, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argU32(a[4]), @intCast(argInt(a[5])), argFloat(a[6]), @intCast(argInt(a[7])), @intCast(argInt(a[8])), @intCast(argInt(a[9])));
-    return ok(Value.newLong(0));
-}
 
-fn canvasDrawLine(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 9) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const a = ctx.args;
-    if (skia.cDrawLine) |f| f(surf, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argU32(a[5]), argFloat(a[6]), @intCast(argInt(a[7])), @intCast(argInt(a[8])));
-    return ok(Value.newLong(0));
-}
 
-fn canvasDrawPath(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 8 or ctx.args[1] != .String) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cDrawPath orelse return ok(Value.newLong(0));
-    const pg = ctx.args[1].String.borrow();
-    defer pg.deinit();
-    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{pg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer ctx.allocator.free(txt);
-    const a = ctx.args;
-    f(surf, txt.ptr, argU32(a[2]), @intCast(argInt(a[3])), argFloat(a[4]), @intCast(argInt(a[5])), @intCast(argInt(a[6])), @intCast(argInt(a[7])));
-    return ok(Value.newLong(0));
-}
 
-fn canvasDrawText(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 6 or ctx.args[1] != .String) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const tg = ctx.args[1].String.borrow();
-    defer tg.deinit();
-    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer ctx.allocator.free(txt);
-    const a = ctx.args;
-    skia.drawText(surf, txt.ptr, argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argU32(a[5]));
-    return ok(Value.newLong(0));
-}
 
-/// A styled run at a baseline origin; flags are bit0 bold, bit1 italic, bit2
-/// underline, bit3 strikethrough.
-fn canvasDrawText2(ctx: *CallCtx) Error!EvalResult {
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    if (ctx.args.len < 7 or ctx.args[1] != .String) return ok(Value.newLong(0));
-    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const f = skia.cDrawText2 orelse return ok(Value.newLong(0));
-    const tg = ctx.args[1].String.borrow();
-    defer tg.deinit();
-    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer ctx.allocator.free(txt);
-    const a = ctx.args;
-    f(surf, txt.ptr, argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argU32(a[5]), @intCast(argInt(a[6])));
-    return ok(Value.newLong(0));
-}
 
-fn textWidth(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2 or ctx.args[0] != .String) return ok(.{ .Float = 0 });
-    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
-    const f = skia.cMeasureTextWidth orelse return ok(.{ .Float = 0 });
-    const tg = ctx.args[0].String.borrow();
-    defer tg.deinit();
-    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(.{ .Float = 0 });
-    defer ctx.allocator.free(txt);
-    return ok(.{ .Float = f(txt.ptr, argFloat(ctx.args[1])) });
-}
 
-/// A font vertical metric: which=0 ascent (negative), 1 descent (positive),
-/// 2 leading.
-fn fontMetric(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2) return ok(.{ .Float = 0 });
-    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
-    const f = skia.cFontMetric orelse return ok(.{ .Float = 0 });
-    return ok(.{ .Float = f(argFloat(ctx.args[0]), @intCast(argInt(ctx.args[1]))) });
-}
 
 const testing = std.testing;
 
@@ -2595,32 +1601,9 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winRender") != null);
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winPoll") != null);
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winClose") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_path_op") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_new") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_path") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_shader") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_blur") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_color_filter") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_text") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_save_layer") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_rec_begin") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_rec_end") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_picture_free") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_picture") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat44") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.layer.__skia_rn_new") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.layer.__skia_rn_set_outline") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.layer.__skia_rn_draw_into") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_point") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_paint_state") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_canvas") != null);
     try testing.expect(b.resolve("androidx.compose.material3.internal.__klio_icu_date") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_path_effect") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_vertices") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_image_decode") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_size") != null);
-    try testing.expect(b.resolve("androidx.compose.ui.text.platform.__skia_font_register_data") != null);
     try testing.expect(b.resolve("androidx.compose.ui.input.key.__composeui_hostOs") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winPollEvent") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winPostEvent") != null);
@@ -2637,7 +1620,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_trayPollEvent") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_appWait") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winOpenError") != null);
-    try testing.expectEqual(@as(usize, 137), b.len());
+    try testing.expectEqual(@as(usize, 69), b.len());
 }
 
 test "a window that cannot open says why" {
@@ -2692,12 +1675,11 @@ test "the clipboard bindings answer no clipboard without the library" {
     }
 }
 
-test "the ICU date and paint state bindings answer null or 0 for short args" {
+test "the ICU date bindings answer null for short args" {
     var host: TestHost = .{};
     const none = [_]Value{};
     var c0 = host.ctx(&none);
     try testing.expect((try icuDate(&c0)).ok == .Null);
-    try testing.expectEqual(@as(i64, 0), (try canvasSetPaintState(&c0)).ok.Long);
     // A non-string locale, pattern or text answers null before any ICU call.
     const wrong = [_]Value{ Value.newInt(0), Value.newInt(1), Value.newInt(2), Value.newInt(3), Value.newLong(0) };
     var c1 = host.ctx(&wrong);
@@ -2750,44 +1732,6 @@ test "window event bindings report a closed window for short args or no event ar
     const no_array = [_]Value{ Value.newLong(0), Value.newInt(0), .Null, Value.newInt(3) };
     var c1 = host.ctx(&no_array);
     try testing.expectEqual(@as(i32, 2), (try winPollEvent(&c1)).ok.Int);
-}
-
-test "picture recording and layer bindings answer 0 for short args or a null handle" {
-    var host: TestHost = .{};
-    const none = [_]Value{};
-    var c0 = host.ctx(&none);
-    try testing.expectEqual(@as(i64, 0), (try recBegin(&c0)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try recEnd(&c0)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try canvasSaveLayer(&c0)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try canvasDrawPicture(&c0)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try pictureFree(&c0)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try canvasConcat44(&c0)).ok.Long);
-    inline for (.{ rnContextNew, rnContextFree, rnContextSetLighting, rnNew, rnFree, rnSetFloat, rnSetColor, rnSetBounds, rnSetPivot, rnSetClip, rnSetOutline, rnSetLayerPaint, rnBeginRecording, rnEndRecording, rnDrawInto }) |f| {
-        try testing.expectEqual(@as(i64, 0), (try f(&c0)).ok.Long);
-    }
-    try testing.expectEqual(@as(i64, 0), (try canvasDrawPoint(&c0)).ok.Long);
-    // Two floats were a recording's size; the bounds take four.
-    const size_only = [_]Value{ .{ .Float = 10 }, .{ .Float = 10 } };
-    var c2 = host.ctx(&size_only);
-    try testing.expectEqual(@as(i64, 0), (try recBegin(&c2)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try canvasSetPathEffect(&c0)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try canvasDrawVertices(&c0)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try imageDecode(&c0)).ok.Long);
-    // Bytes that are not a ByteArray decode to nothing.
-    const not_bytes = [_]Value{Value.newInt(7)};
-    var c4 = host.ctx(&not_bytes);
-    try testing.expectEqual(@as(i64, 0), (try imageDecode(&c4)).ok.Long);
-    try testing.expect(!(try fontRegisterData(&c4)).ok.Bool);
-    // A null node answers 0 without reaching the library.
-    var zeros: [15]Value = undefined;
-    for (&zeros) |*v| v.* = Value.newLong(0);
-    var c3 = host.ctx(&zeros);
-    try testing.expectEqual(@as(i64, 0), (try rnSetOutline(&c3)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try rnBeginRecording(&c3)).ok.Long);
-    const null_handle = [_]Value{Value.newLong(0)};
-    var c1 = host.ctx(&null_handle);
-    try testing.expectEqual(@as(i64, 0), (try recEnd(&c1)).ok.Long);
-    try testing.expectEqual(@as(i64, 0), (try pictureFree(&c1)).ok.Long);
 }
 
 const TestHost = struct {

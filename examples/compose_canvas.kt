@@ -1,10 +1,9 @@
 // corpus: skia (the expected output is the one printed when the Skia shim renders)
 // The real androidx.compose.ui.graphics.Canvas — drawing rectangles, circles,
 // rounded rectangles, a path, and a line with real Paint objects onto an
-// offscreen Skia surface, saved as a PNG. `klioDrawToPng` wraps a KlioCanvas
-// (the Canvas actual) over the shim; the coming graphics.drawscope.DrawScope
-// render path drives the same Canvas. Requires the Skia library + a display-less
-// backend; headless-safe (returns false with no backend).
+// offscreen Skia surface, saved as a PNG. `klioDrawToPng` draws through upstream's
+// SkiaBackedCanvas over skiko's Canvas, as Compose Desktop does. Requires the Skia
+// library; headless-safe (returns false with no backend).
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Paint

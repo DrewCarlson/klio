@@ -43,6 +43,7 @@ where the upstream one needs the JVM, AWT or a native platform API.
 | compose runtime fleet | runtime commonTest + nonEmulatorCommonTest | 1138 | 0 | `scripts/compose-fleet.py` |
 | `compose_plugin_commontest` | the same sets, one child per class | 1404 | 0 | 1385 / 5 |
 | `compose_animation` | animation-core commonTest | 107 | 0 | 107 / 0 |
+| `compose_ui_skiko` | ui-graphics and ui-text skikoTest | 110 | 0 | 110 / 0 |
 | `compose_shapes` | graphics-shapes commonTest | 148 | 0 | 148 / 0 |
 | `lifecycle_viewmodel` | lifecycle-viewmodel commonTest | 35 | 0 | 35 / 0 |
 | `savedstate` | savedstate commonTest (with nonAndroidTest's actuals) | 356 | 0 | 356 / 0 |
@@ -58,7 +59,6 @@ Not run yet, and what each needs:
 | material3 skikoTest | 8 | the harness; test actuals for `calendarLocale`, `getTimeZone`/`setTimeZone` |
 | material3 desktopTest | 4 | the harness |
 | ui skikoTest | 37 | the harness |
-| ui-graphics skikoTest, ui-text skikoTest | 7 + 7 | the org.jetbrains.skia binding layer |
 | lifecycle-runtime commonTest | 5 | the Main dispatcher fixes (below): under the desktop's `runLifecycleTest` (runBlocking on Main, the actual in tests/lifecycle_commontest_actuals/runtime) WithLifecycleStateTest.testBlockCancelledWhenInitiallyDestroyed waits forever; with a runTest form 39 of 65 passed |
 | lifecycle-viewmodel-savedstate commonTest | 1 | lifecycle-runtime-testing's TestLifecycleOwner (not in the checkout) |
 
@@ -121,26 +121,25 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
    (kotlin-klio/klio-compose-ui-core/klioMain). ui-core's klio.toml takes the
    two viewmodel packs as deps then; ComposeSceneInputHandler.klio.kt goes
    back to upstream's file once RootNodeOwner is in.
-5. The skia binding layer's second half (item 6). foundation drops its
-   stand-ins kotlin-klio/klio-compose-foundation/klioMain/org/jetbrains/
-   skia/{BreakIterator,icu/CharProperties}.klio.kt for skiko's (add
-   "org.jetbrains.skiko" to its deps; ICU grapheme breaks change cursor
-   movement over combining marks and emoji sequences, check against the
-   oracle) and takes DragAndDropSource.skiko.kt once ui-graphics' canvas is
-   skia's. ui-graphics and ui-text move onto their skikoMain (SkiaBackedCanvas,
-   SkiaBackedPath, SkiaParagraph) in place of KlioCanvas, KlioPath and
-   PlatformParagraph; that closes the paragraph and PathMeasure divergences
-   below and unblocks the ui-graphics and ui-text skikoTest suites. The
-   shaper's run handlers (kotlin-klio/klio-skiko/klioMain/org/jetbrains/
-   skia/shaper/Shaper.klio.kt) still throw; they need callbacks through
-   src/skiko like the Drawable's.
+5. Done: the skia binding layer's second half (item 6). ui-graphics and
+   ui-text run their skikoMain whole over org.jetbrains.skia (with ui-text's
+   nativeMain, and klio actuals only for the locale, the string casing and
+   the font resolve interceptor); foundation takes skiko's BreakIterator and
+   CharProperties and upstream's DragAndDropSource. klio's own canvas, path,
+   path measure, paragraph and graphics layer are gone, with the shim's
+   entry points only they used. The ui-graphics and ui-text skikoTest suites
+   pass (compose_ui_skiko, 110 / 0). Open: the shaper's run handlers
+   (kotlin-klio/klio-skiko/klioMain/org/jetbrains/skia/shaper/
+   Shaper.klio.kt) still throw; they need callbacks through src/skiko like
+   the Drawable's.
 6. lifecycle-viewmodel-savedstate's commonTest needs
    androidx.lifecycle.testing.TestLifecycleOwner (lifecycle-runtime-testing):
    add it as a `runtime-testing` feature of androidx.lifecycle once the
    checkout carries it, then register the suite.
-7. The gesture timing divergence (with P1): after two taps too quick for a
-   double click, onClick takes the next tap as a long click (the repro sent
-   to P1; compose_onclick keeps timeout-driven gestures out until then).
+7. Done: the gesture timing divergence. A resume that needs no dispatch now
+   runs on the resuming thread, so after two quick taps the next one is a
+   single click, as on Compose Desktop; compose_onclick can take
+   timeout-driven gestures.
 8. Not verified anywhere: running on Windows (the shim's link needs the MSVC
    toolchain the Windows Skia prebuilt is built with), a Wayland session.
 9. The long tail in Inventory: foundation's TooltipArea, ContextMenuProvider,
@@ -191,8 +190,7 @@ run; scripts/init-compose-submodule.sh lists the current set):
    PathSvg / PathHitTester / PathGeometry, MeshGradient. `rememberSerializable`
    is in.
 6. **The org.jetbrains.skia binding layer**, so ui-graphics' and ui-text's
-   skikoMain run verbatim in place of KlioCanvas, KlioPath and
-   PlatformParagraph. In place: skiko's C glue (all 86 sources of
+   skikoMain run verbatim. Done. In place: skiko's C glue (all 86 sources of
    nativeJsMain and commonMain's common) builds into the Skia shim from the
    skiko checkout on macOS, Linux and (compiled) Windows; the
    org.jetbrains.skiko pack carries skiko's commonMain verbatim (it resolves
@@ -207,9 +205,13 @@ run; scripts/init-compose-submodule.sh lists the current set):
    Kotlin (a Drawable's onDraw and onGetBounds, a PaintFilterCanvas's
    onFilter, skottie's logger) through the callbacks skiko_initCallbacks
    installs, run through the host of the native call that invokes them;
-   the shaper's run handlers still throw. Then ui-graphics and ui-text move
-   onto the verbatim skikoMain. Managed peers free their native objects on
-   close(), or the runtime's native finalizer after a collection frees them.
+   the shaper's run handlers still throw. ui-graphics and ui-text run their
+   skikoMain verbatim over it; a host surface (a window's frame, an icon, a
+   menu, an offscreen PNG) is drawn through a skiko Canvas over the
+   surface's SkCanvas (klio.skia.wrapCanvas), and a scene's frame renders on
+   a raster N32 surface, as ImageComposeScene's does. Managed peers free
+   their native objects on close(), or the runtime's native finalizer after
+   a collection frees them.
 7. **The long tail.** The remaining nonJvm actuals taken verbatim, the
    desktop window API's AWT-bound rest. Dialog modality and window
    transparency are done. `Window(icon)` draws its painter at 192 pixels, as
@@ -226,22 +228,23 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 | runtime | 188 / 188 | n/a | 6 / 9, nonAndroid 10 / 10 | jvmAndAndroid 3 java-free; klio actuals |
 | runtime-saveable | 9 / 9 | n/a | n/a | n/a |
 | ui | 244 / 244 | 45 / 92 | 8 / 8 | 86 / 175 |
-| ui-graphics | 82 / 82 | 0 / 19 | 1 / 1 | 0 / 7 |
-| ui-text | 79 / 79 | 2 / 28 | 4 / 5 | 0 / 15 |
+| ui-graphics | 82 / 82 | 19 / 19, skikoExcludingWeb 1 / 1 | 1 / 1 | 0 / 7 |
+| ui-text | 79 / 79 | 28 / 28 | 5 / 5, native 6 / 6 | 0 / 15 |
 | ui-unit, ui-util, ui-geometry | complete | n/a | complete, ui-unit nonAndroid 2 / 2 | n/a |
-| foundation | 354 / 354 | 126 / 127 | 8 / 8 | 27 / 37 |
+| foundation | 354 / 354 | 127 / 127 | 8 / 8 | 27 / 37 |
 | foundation-layout | 32 / 32 | 2 / 2 | 1 / 1 | n/a |
 | animation, animation-core | complete | n/a | complete, animation nonAndroid 2 / 2 | n/a |
 | material3 | 251 / 251 | 97 / 97 | 4 / 4 | 0 / 2 (java.text) |
 | material-ripple | 4 / 4 | nonAndroid 1 / 1 | n/a | n/a |
 | graphics-shapes | 16 / 16 | n/a | 0 / 1 | jvmMain 1 / 1 |
 
-klio actuals that stay: ui-text's Locale and string delegate (the
-desktop's wrap java.util.Locale and the JVM's casing; klio reads tags and
-cases as those do); runtime's thread id, identity hash, locks over atomicfu, the
-desktop frame clock and the error logger; animation-core's current-thread
-token; ui-util's tracing; ui-text's code-point direction helpers (they ask
-skia's ICU through the binding layer). Not in the checkout yet:
+klio actuals that stay: ui-text's Locale, its right-to-left test and the
+string delegate (the native target's are darwinMain's, over Foundation;
+klio reads tags and cases as the desktop does, and takes AWT's
+right-to-left languages), and the font resolve interceptor; ui-graphics'
+byte copy (native's is memcpy); runtime's thread id, identity hash, locks
+over atomicfu, the desktop frame clock and the error logger;
+animation-core's current-thread token; ui-util's tracing. Not in the checkout yet:
 runtime-annotation (klio's `Stable`/`Immutable`/lint markers stand in) and
 runtime-retain (klio carries only the store interface the ui owner exposes;
 the `retain` composables are missing). foundation's desktopMain files left:
@@ -252,9 +255,7 @@ klioMain with their AWT calls replaced; ClipboardUtils, adapted over
 klio.datatransfer; WindowDraggableArea (AWT window dragging).
 
 Public API still missing (beyond the scene internals): ui's
-`ImageComposeScene`, `renderComposeScene`; the skia interop
-(`asComposeCanvas`, `toComposeImageBitmap`, ...) and ui-text's deprecated
-Typeface-based `FontLoader`, which come with the binding layer; foundation's
+`ImageComposeScene`, `renderComposeScene`; foundation's
 `TooltipArea`, `ContextMenuArea`;
 runtime-retain's `retain`, `RetainedEffect` and the stores.
 
@@ -519,23 +520,29 @@ isTraySupported is false), and running on Windows.
   commonTest is the savedstate suite. A local class's `KClass.qualifiedName`
   is null, as Kotlin's is (lifecycle refuses a local class as a ViewModel by
   it), and lifecycle-viewmodel's suite passes whole.
-- Open, routed to coroutines: `Dispatchers.Main.immediate` dispatches work
-  already running on Main, and `runBlocking(Dispatchers.Main)` from a worker
-  runs its block on the worker. Each shows in lifecycle: the first leaves
-  withStarted on a destroyed lifecycle waiting and runs viewModelScope's
-  cancellation after onCleared, the second lets a LifecycleRegistry take
-  calls from any thread. An example of the lifecycle library, identical to
-  Compose Desktop but for these, lands with the fixes.
-- Open, routed to coroutines: a gesture's timeouts are real-time delays on
-  a headless scene's Unconfined dispatcher; after two taps too quick for a
-  double click, onClick takes the next tap as a long click where Compose
-  Desktop takes a single click (repro sent; plain detectTapGestures and a
-  lone tap are identical).
-- Open, needs the skia binding layer: klio's paragraph layer differs from
-  skiko's SkiaParagraph in line tops, line height trims, text indent,
-  baseline shift and ellipsis flags; the layout example that shows it waits
-  for the verbatim ui-text skikoMain.
-- Open, needs the skia binding layer: PathMeasure measures klio's own path
-  (arcs as cubics) with a Kotlin contour measure, where skiko measures the
-  SkPath (arcs as conics) with SkContourMeasure; lengths differ in the first
-  decimal (compose_pathmeasure). The path moves onto SkPath with the layer.
+- Resolved by the coroutine runtime: `Dispatchers.Main.immediate` dispatched
+  work already running on Main, and `runBlocking(Dispatchers.Main)` from a
+  worker ran its block on the worker. examples/lifecycle_registry.kt prints
+  what Compose Desktop prints.
+- 2026-09-26: ui-graphics and ui-text run their skikoMain whole over
+  org.jetbrains.skia, and foundation takes skiko's ICU breaks and upstream's
+  drag-and-drop source; klio's canvas, path, path measure, paragraph and
+  graphics layer are deleted, with the 69 host functions and the shim entry
+  points only they used. The weak references the runtime, ui and lifecycle
+  use are upstream's over kotlin.native.ref, and skiko's managed peers free
+  their Skia objects through the runtime's native finalizers. The JVM oracle
+  finds 53 of the 56 headless compose examples identical (compose_popup's
+  placement is printed twice on the JVM, as before; two do not compile for
+  the JVM), compose_pathmeasure now prints Compose Desktop's output, and the
+  ui-graphics and ui-text skikoTest suites pass (110 / 0).
+- Resolved: after two taps too quick for a double click, onClick took the
+  next tap as a long click; a resume that needs no dispatch now runs on the
+  resuming thread, as on the JVM.
+- Resolved: klio's paragraph layer differed from skiko's SkiaParagraph in
+  line tops, line height trims, text indent, baseline shift and ellipsis
+  flags; ui-text now runs SkiaParagraph itself.
+- Resolved: PathMeasure measured klio's own path (arcs as cubics) with a
+  Kotlin contour measure; it is skiko's SkContourMeasure over the SkPath now,
+  and compose_pathmeasure prints what Compose Desktop prints.
+- Open, pre-existing: compose_popup prints its placement lines twice on
+  Compose Desktop's ImageComposeScene and once on klio's scene.

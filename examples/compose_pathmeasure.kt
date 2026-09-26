@@ -1,8 +1,8 @@
 // The real androidx.compose.ui.graphics.PathMeasure: the length of a path's
 // first contour, the position and unit tangent at a distance along it, and the
-// sub-path between two distances. klio measures in plain Kotlin over the path's
-// segments, following Skia's contour measure (distances pin to 0..length, an
-// empty contour is skipped, forceClosed adds the closing line).
+// sub-path between two distances. It measures through Skia's contour measure,
+// as Compose Desktop does: distances pin to 0..length, an empty contour is
+// skipped, forceClosed adds the closing line. The output is Compose Desktop's.
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Path

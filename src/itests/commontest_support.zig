@@ -845,6 +845,24 @@ pub const suites = [_]Config{
         .max_incomplete = 0,
     },
     .{
+        // ui-graphics' and ui-text's skikoTest: the canvas, path, path measure,
+        // matrix, shadows and graphics layers over skiko, and paragraphs over
+        // skia's paragraph module.
+        .name = "compose_ui_skiko",
+        .test_roots = &.{
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-graphics/src/skikoTest/kotlin",
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-text/src/skikoTest/kotlin",
+        },
+        .extra_support = &(kruth_support ++ [_][]const u8{
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-text/src/commonTest/kotlin/kotlinx/test/IgnoreTargets.kt",
+        }),
+        .batch_dirs = true,
+        .timeout_ms = 600_000,
+        .baseline = 110,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
         // animation-core's commonTest, asserted through upstream Kruth.
         .name = "compose_animation",
         .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/compose/animation/animation-core/src/commonTest/kotlin"},
