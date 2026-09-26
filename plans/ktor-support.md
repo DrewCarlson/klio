@@ -55,7 +55,7 @@ where upstream reaches the platform through cinterop.
 | client plugins | `client-*` | 8 modules verbatim; census `ktor_client_plugins` 123 passed, 2 failing, against ktor's test server |
 | ktor-client-tests | (the client end to end) | census `ktor_client_tests` 380 passed, 8 failing, over CIO against ktor's test server |
 | ktor-test-server | `test-server` | verbatim with klio copies of its JVM files; TLS on `Klio`; the census service for the client suites |
-| digest authentication | `server-auth`, `http` | the JVM-only DigestAuth, DigestCredential and `toDigester` verbatim over `klio.security.MessageDigest` |
+| digest authentication | `server-auth`, `http` | the JVM-only DigestAuth, DigestCredential and `toDigester` verbatim over `klio.security.MessageDigest`; example `ktor_digest_auth` (MD5, SHA-256, qop=auth with Authentication-Info) |
 | kotlinx JSON converter | `serialization-kotlinx-json` | census `ktor_serialization` 14/14 |
 | shared modules | `call-id`, `resources`, `websockets`, `test-base` | census `ktor_shared` 50/50 |
 
@@ -72,12 +72,11 @@ Open failures, each with its owner:
   file's private extension, so the legacy storage is never consulted);
   DispatcherTest x1 (coroutines: `Dispatchers.IO.toString()` is not
   "Dispatchers.IO", which upstream native's DefaultIoScheduler returns).
-- Digest authentication on the server:
-  DigestAuthenticationProvider.onAuthenticate reads `credentials.qop` in the
-  branch where `principal`, a safe call on `credentials`, is not null. K2
-  smart casts `credentials` there and klio does not yet, so the body fails
-  to lower and the call has none (sema). No upstream suite covers it: the
-  client AuthTest digest cases exclude native engines.
+  On the Linux VM PluginsTest.testIgnoreBody fails too, and on macOS it
+  passes with little to spare: the server's `"x".repeat(16 MiB)` takes
+  11.4 s (`CharArray(n) { c }` at about 0.7 µs a char) and
+  `encodeToByteArray` 1.27 s, against the engine's 15 s request timeout
+  (interpreter speed, on its after-done list).
 
 Not run from upstream: the suites
 for kotlinx.html and the other formats (html-builder, htmx, cbor, protobuf,
@@ -161,7 +160,11 @@ klio runs.
   platform SelectorManager), and the TLS server at 8089 runs on the Klio
   engine with the klio test CA's certificate instead of Jetty with a
   generated keystore. `io.ktor.testserver.runTestServer()` is the entry
-  point, under the pack's id prefix so a program can import it. The census
+  point, under the pack's id prefix so a program can import it: a program
+  selects packs by the prefix of its imports, and `--feature
+  io.ktor/test-server` alone does not make a package outside `io.ktor`
+  (here `test.server`) importable. That is the pack loader's design, not a
+  ktor question, and is tracked outside this plan. The census
   runs `tests/fixtures/ktor/test_server.kt` as the client suites' service
   (commontest_support.zig): the tests name 127.0.0.1:8080, so the port is
   fixed and suites take turns on a lock file; every server binds with

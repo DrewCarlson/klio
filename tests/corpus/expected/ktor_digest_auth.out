@@ -1,0 +1,5 @@
+MD5(alice:klio@example:wonderland) = a9650c509843f5ea4b5be7c36a4b5960
+md5 area for alice
+authentication-info: qop=auth nc=00000001 rspauth 32 hex digits
+sha-256 area for bob
+wrong password: 401 Unauthorized
