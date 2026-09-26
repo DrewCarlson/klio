@@ -3,6 +3,8 @@
 //! reason. Nothing executes, so a whole-corpus census takes seconds.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const runtime = @import("runtime");
 const span = @import("span");
 const ast = @import("ast");
 const lexer = @import("lexer");
@@ -697,6 +699,7 @@ const EachShared = struct {
     /// base set, writes its encoded result to a pipe and exits; its stderr
     /// is kept for the failure reason.
     fn runIsolated(self: *EachShared, i: usize) !ProgramResult {
+        if (comptime builtin.os.tag == .windows) return error.NoForkOnWindows;
         var out_fds: [2]std.c.fd_t = undefined;
         var err_fds: [2]std.c.fd_t = undefined;
         if (std.c.pipe(&out_fds) != 0) return error.PipeFailed;
@@ -919,6 +922,11 @@ fn panicLine(err: []const u8) ?[]const u8 {
 /// `Sema`, in a forked child unless `--in-process`, several at a time.
 fn runEach(gpa: Allocator, arena: Allocator, map: *span.SourceMap, serial: *const Serial, base: []const sema.SourceFile, programs: []const sema.SourceFile, opts: EachOptions) u8 {
     const t0 = nowNs();
+    var in_process = opts.in_process;
+    if (builtin.os.tag == .windows and !in_process) {
+        io.writeStderr("note: --each analyzes every program in this process on Windows, which has no fork; a panic in one ends the whole run\n");
+        in_process = true;
+    }
     const results = arena.alloc(ProgramResult, programs.len) catch return 2;
     @memset(results, .{});
     var shared: EachShared = .{
@@ -930,13 +938,13 @@ fn runEach(gpa: Allocator, arena: Allocator, map: *span.SourceMap, serial: *cons
         .out_arena = arena,
         .dump = opts.dump_path != null,
         .headers_only = opts.headers_only,
-        .in_process = opts.in_process,
+        .in_process = in_process,
     };
     const cores = std.Thread.getCpuCount() catch 1;
     var jobs = if (opts.jobs != 0) opts.jobs else @min(cores, 8);
     jobs = @max(1, @min(jobs, programs.len));
-    const threads = arena.alloc(?std.Thread, jobs) catch return 2;
-    for (threads) |*th| th.* = std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, EachShared.worker, .{&shared}) catch null;
+    const threads = arena.alloc(?runtime.platform.Thread, jobs) catch return 2;
+    for (threads) |*th| th.* = runtime.platform.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, EachShared.worker, .{&shared}) catch null;
     // A worker that failed to start leaves its share to the others; with
     // none started, the calling thread does the work.
     var started: usize = 0;
@@ -1081,9 +1089,7 @@ fn location(arena: Allocator, map: *span.SourceMap, sp: span.Span) []const u8 {
 }
 
 fn nowNs() u64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    return runtime.platform.monotonicNs() orelse 0;
 }
 
 /// The serialization pass over the analysis's inputs. The packs are

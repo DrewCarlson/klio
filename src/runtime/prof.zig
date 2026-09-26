@@ -15,6 +15,11 @@ const MAX_SAMPLES = 1 << 22; // 4M slots; overflow simply stops recording.
 /// ITIMER_PROF interval timer.
 const sampler_os = builtin.os.tag == .linux or builtin.os.tag.isDarwin();
 
+/// A profile asked for where there is no SIGPROF timer to sample on.
+fn noteNoSampler(var_name: []const u8) void {
+    std.debug.print("[prof] {s} is not available on {s}: the sampler runs on a SIGPROF interval timer\n", .{ var_name, @tagName(builtin.os.tag) });
+}
+
 /// Arms (or with 0 disarms) the profiling interval timer at `usec`.
 fn armTimer(usec: i64) void {
     if (builtin.os.tag == .linux) {
@@ -170,7 +175,10 @@ fn callerPcsFromContext(ctx: ?*anyopaque) [2]usize {
 
 /// Interval defaults to 1ms; `KLIO_PROF=<usec>` overrides.
 pub fn maybeStart() void {
-    if (!sampler_os) return;
+    if (comptime !sampler_os) {
+        if (builtin.link_libc and std.c.getenv("KLIO_PROF") != null) noteNoSampler("KLIO_PROF");
+        return;
+    }
     // Started once for the process: a later call from the run command must
     // not remap the sample buffer under a running timer.
     if (active) return;
@@ -228,6 +236,7 @@ fn opHandler(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) cal
 pub fn opProfMaybeStart() void {
     if (comptime !builtin.link_libc) return;
     const env = std.c.getenv("KLIO_OP_PROF") orelse return;
+    if (comptime !sampler_os) return noteNoSampler("KLIO_OP_PROF");
     const env_s = std.mem.span(env);
     var usec: i64 = 1000;
     if (env_s.len > 0 and env_s[0] >= '0' and env_s[0] <= '9') {
@@ -271,6 +280,7 @@ fn fnHandler(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) cal
 pub fn fnProfMaybeStart() void {
     if (comptime !builtin.link_libc) return;
     const env = std.c.getenv("KLIO_FN_PROF") orelse return;
+    if (comptime !sampler_os) return noteNoSampler("KLIO_FN_PROF");
     const env_s = std.mem.span(env);
     var usec: i64 = 1000;
     if (env_s.len > 0 and env_s[0] >= '0' and env_s[0] <= '9') {

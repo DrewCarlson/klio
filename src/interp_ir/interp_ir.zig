@@ -340,7 +340,7 @@ pub const SharedClosures = struct {
 
 /// One spawned OS thread; an error result carries a thrown Kotlin Throwable.
 pub const ThreadEntry = struct {
-    handle: ?std.Thread,
+    handle: ?runtime.platform.Thread,
     /// The thread's name, as `Thread.name` answers it.
     name: []const u8 = "",
     result: ?ThreadResult = null,

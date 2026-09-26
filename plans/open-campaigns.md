@@ -73,6 +73,9 @@ against the code.
 ### Runtime and interpreter
 
 - Coroutines: `runBlocking`'s job `toString` leaks `KlioBlockingCoroutine`.
+  A continuation of an `Unconfined` coroutine resumed from another thread
+  runs on the thread whose pump parked it, after the resumer continues;
+  on the JVM it runs inline in the resumer first.
   Unverified: `SupervisorJob` with several throwing children, cancel while
   parked on a channel `send`/`receive`, `DeepRecursiveFunction` under
   `klio run`, `subscriptionCount` on a shared flow.
@@ -118,6 +121,12 @@ against the code.
   litmus flake.
 
 ### Packs, project model, distribution
+
+- Hosts (`docs/development/platforms.md`): Windows compiles and links but
+  runs nothing yet: the platform layer's tests and a program run on a
+  Windows host come first (Wine in the amd64 and arm64 containers here does
+  not start). ktor's sockets, TLS and zlib need Winsock and a Windows
+  environment API; the PE bundle overlay placement is not wired.
 
 - Workspace members and one-command multi-artifact builds; path
   dependency auto-build; dependency sources (git, registry), `klio.lock`,

@@ -43,8 +43,12 @@ pub fn bake(gpa: Allocator, paths: []const []const u8, feature_specs: []const []
 /// `klio bake-image --stdlib-cache <dir>`: the base image of a program
 /// without packs, into `dir` under the name a run of this binary looks
 /// for it by. The build installs `dir` as `share/klio/cache`, where a run
-/// whose own cache misses finds it.
-pub fn bakeStdlibCache(gpa: Allocator, dir: []const u8) u8 {
+/// whose own cache misses finds it. `--for <exe>` names the image for
+/// another klio built from the same sources: a cross build bakes its
+/// target's image with a host binary, as it cannot run the target's.
+pub fn bakeStdlibCache(gpa: Allocator, dir: []const u8, for_exe: ?[]const u8) u8 {
+    sema_base_cache.stamp_exe = for_exe;
+    defer sema_base_cache.stamp_exe = null;
     const mem = sema_run.RunMemory.init() catch return 2;
     defer mem.deinit();
     const a = mem.arena();

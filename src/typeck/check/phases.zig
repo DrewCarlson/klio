@@ -3491,7 +3491,7 @@ const Worker = struct {
     checker: Checker,
     ranges: std.ArrayList(DiagRange) = .empty,
     applied: usize = 0,
-    thread: ?std.Thread = null,
+    thread: ?@import("runtime").platform.Thread = null,
 };
 
 /// Body checks are independent once the declarations are seeded: each reads
@@ -3499,12 +3499,9 @@ const Worker = struct {
 /// between them is a top-level property's inferred type reaching the
 /// declarations after it, so the properties are checked first, in order, and
 /// their bindings replayed into each worker as it passes them.
-/// Monotonic nanoseconds for the phase timers; only differences matter, 0 without libc.
+/// Monotonic nanoseconds for the phase timers; only differences matter, 0 without a clock.
 fn nowNs() u64 {
-    if (comptime !@import("builtin").link_libc) return 0;
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return @import("runtime").platform.monotonicNs() orelse 0;
 }
 
 /// A top-level `val x = Foo()` has the type of its initializer everywhere it
@@ -3605,7 +3602,7 @@ fn checkBodies(self: *Checker, decls: []const Decl) Allocator.Error!void {
     }
     var spawned: usize = 0;
     for (workers) |*w| {
-        w.thread = std.Thread.spawn(.{}, workerMain, .{ &work, w }) catch break;
+        w.thread = @import("runtime").platform.Thread.spawn(.{}, workerMain, .{ &work, w }) catch break;
         spawned += 1;
     }
     // Whatever failed to start leaves its share to the rest.

@@ -87,5 +87,6 @@ nav:
     - Workspace Layout: development/workspace.md
     - Testing: development/testing.md
     - Debugging: development/debugging.md
+    - Platforms: development/platforms.md
     - Cold start: development/cold-start.md
     - Contributing: development/contributing.md

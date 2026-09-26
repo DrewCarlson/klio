@@ -197,7 +197,7 @@ const SkSurface = anyopaque;
 const SkWindow = anyopaque;
 
 const Skia = struct {
-    lib: std.DynLib,
+    lib: runtime.platform.DynLib,
     new: *const fn (c_int, c_int) callconv(.c) ?*SkSurface,
     newGpu: *const fn (c_int, c_int) callconv(.c) ?*SkSurface,
     free: *const fn (?*SkSurface) callconv(.c) void,
@@ -314,7 +314,7 @@ const TrayFns = struct {
     pollEvent: ?*const fn (?*anyopaque, [*]f64) callconv(.c) c_int = null,
     appWait: ?*const fn (c_int) callconv(.c) void = null,
 
-    fn fromLib(lib: *std.DynLib) TrayFns {
+    fn fromLib(lib: *runtime.platform.DynLib) TrayFns {
         var t: TrayFns = .{};
         inline for (.{
             .{ "supported", "klio_tray_supported" },
@@ -512,7 +512,7 @@ fn loadSkia() ?*Skia {
 
     var lib = openSkiaLib() orelse return null;
     const F = struct {
-        fn get(l: *std.DynLib, comptime name: []const u8, comptime sym: [:0]const u8) ?@FieldType(Skia, name) {
+        fn get(l: *runtime.platform.DynLib, comptime name: []const u8, comptime sym: [:0]const u8) ?@FieldType(Skia, name) {
             const f = l.lookup(@FieldType(Skia, name), sym);
             if (f == null) std.debug.print("klio: the Skia shim is missing {s}; rendering is headless\n", .{sym});
             return f;
@@ -622,7 +622,7 @@ fn loadSkia() ?*Skia {
     return &skia_state.?;
 }
 
-fn skiaLoadFail(lib: *std.DynLib) ?*Skia {
+fn skiaLoadFail(lib: *runtime.platform.DynLib) ?*Skia {
     lib.close();
     return null;
 }
@@ -757,20 +757,22 @@ pub fn setDefaultWindowTitle(title: [:0]const u8) void {
     default_window_title = title;
 }
 
-fn openSkiaLib() ?std.DynLib {
+fn openSkiaLib() ?runtime.platform.DynLib {
     if (skia_lib_override) |p| {
         if (openSkiaAt(p)) |l| return l;
     }
     if (runtime.envOnce("KLIO_SKIA_LIB")) |p| {
         if (openSkiaAt(p)) |l| return l;
     }
-    if (std.DynLib.open(skia_lib_name)) |l| return l else |_| {}
+    if (runtime.platform.DynLib.open(skia_lib_name)) |l| return l else |_| {}
     // The install layout puts the shim in `lib/` next to the binary's `bin/`, so
     // resolving relative to the executable needs no loader-path setup.
     const exe_dir = selfExeDir() orelse return null;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    for ([_][]const u8{ "../lib", "." }) |rel| {
-        const p = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}", .{ exe_dir, rel, skia_lib_name }) catch continue;
+    var fba = std.heap.FixedBufferAllocator.init(&path_buf);
+    for ([_][]const []const u8{ &.{ exe_dir, "..", "lib", skia_lib_name }, &.{ exe_dir, skia_lib_name } }) |parts| {
+        fba.reset();
+        const p = std.fs.path.join(fba.allocator(), parts) catch continue;
         if (openSkiaAt(p)) |l| return l;
     }
     return null;
@@ -787,8 +789,8 @@ pub fn skiaSymbol(name: [:0]const u8) ?*anyopaque {
 /// Opens the shim at `path`. A shim that is there but does not load (a
 /// symbol the loader cannot bind, a library it needs) says why on standard
 /// error; with no shim at all rendering stays headless without a word.
-fn openSkiaAt(path: []const u8) ?std.DynLib {
-    if (std.DynLib.open(path)) |l| return l else |_| {}
+fn openSkiaAt(path: []const u8) ?runtime.platform.DynLib {
+    if (runtime.platform.DynLib.open(path)) |l| return l else |_| {}
     const os = @import("builtin").os.tag;
     if (comptime os != .linux and os != .macos) return null;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -808,24 +810,8 @@ fn openSkiaAt(path: []const u8) ?std.DynLib {
 var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
 
 fn selfExeDir() ?[]const u8 {
-    const os = @import("builtin").os.tag;
-    var len: usize = 0;
-    switch (os) {
-        .linux => {
-            const n = std.os.linux.readlink("/proc/self/exe", &self_exe_buf, self_exe_buf.len - 1);
-            if (@as(isize, @bitCast(n)) <= 0) return null;
-            len = n;
-        },
-        .macos => {
-            var l: u32 = self_exe_buf.len;
-            if (std.c._NSGetExecutablePath(&self_exe_buf, &l) != 0) return null;
-            len = std.mem.len(@as([*:0]const u8, @ptrCast(&self_exe_buf)));
-        },
-        else => return null,
-    }
-    const path = self_exe_buf[0..len];
-    const slash = std.mem.findScalarLast(u8, path, '/') orelse return null;
-    return path[0..slash];
+    const path = runtime.platform.selfExePath(&self_exe_buf) orelse return null;
+    return std.fs.path.dirname(path);
 }
 
 fn parseU32Hex(s: []const u8) u32 {

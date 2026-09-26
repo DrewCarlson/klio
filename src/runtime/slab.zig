@@ -24,6 +24,7 @@ const tls_fast = @import("tls_fast.zig");
 const builtin = @import("builtin");
 const trace = @import("trace.zig");
 const gc = @import("gc.zig");
+const platform = @import("platform.zig");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
@@ -175,7 +176,7 @@ pub fn releaseAll(h: *Heap) void {
     // program starts; the regions stay mapped and harmless until then.
     const deferred = std.heap.page_allocator.dupe(Region, h.regions.items) catch null;
     if (deferred) |list| {
-        if (std.Thread.spawn(.{ .stack_size = 64 * 1024 }, unmapRegionsThread, .{list})) |t| {
+        if (std.Thread.spawn(.{ .stack_size = platform.small_thread_stack }, unmapRegionsThread, .{list})) |t| {
             t.detach();
         } else |_| {
             unmapRegions(list);
@@ -195,8 +196,7 @@ pub fn releaseAll(h: *Heap) void {
 
 fn unmapRegions(regions: []const Region) void {
     for (regions) |r| {
-        const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(r.start);
-        std.posix.munmap(p[0..r.len]);
+        platform.unmap(@ptrFromInt(r.start), r.len);
         _ = unmap_calls.fetchAdd(1, .monotonic);
     }
 }
@@ -335,19 +335,9 @@ pub fn traceReport() void {
     std.debug.print("\n[slabtrace] total live sites: {d}\n", .{sites.items.len});
 }
 
-fn onTraceSignal(_: std.c.SIG) callconv(.c) void {
-    traceReport();
-    std.c._exit(0);
-}
-
+/// The live-mapping report when the run is stopped, then exit.
 pub fn installTraceSignalDump() void {
-    var act: std.posix.Sigaction = .{
-        .handler = .{ .handler = onTraceSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    platform.onTerminate(traceReport);
 }
 
 // `page_allocator` allocations bypass the slab, so the tracer never sees them,
@@ -385,22 +375,20 @@ inline fn isSmall(len: usize, alignment: Alignment) bool {
 
 
 fn mapRaw(h: *Heap, size: usize) ?[]align(std.heap.page_size_min) u8 {
-    const m = std.posix.mmap(
-        null,
-        size,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    ) catch return null;
+    const m = (platform.map(size) orelse return null)[0..size];
+    noteMapped(h, m.ptr, size);
+    return m;
+}
+
+/// The accounting and tracing of a fresh mapping of `size` bytes at `ptr`.
+inline fn noteMapped(h: *Heap, ptr: [*]u8, size: usize) void {
     _ = mapped_bytes.fetchAdd(size, .monotonic);
     _ = h.mapped.fetchAdd(size, .monotonic);
     _ = map_calls.fetchAdd(1, .monotonic);
-    if (h.track_regions) regionsAdd(h, @intFromPtr(m.ptr), size);
+    if (h.track_regions) regionsAdd(h, @intFromPtr(ptr), size);
     // Track only post-startup mmaps; `KLIO_SLAB_TRACE_ALL` drops the gate.
-    if (trace_enabled and (gc.program_started or trace_all)) traceNote(@intFromPtr(m.ptr), size);
+    if (trace_enabled and (gc.program_started or trace_all)) traceNote(@intFromPtr(ptr), size);
     if (map_sites_enabled) noteMapSite(size);
-    return m;
 }
 
 // `KLIO_SLAB_MAPS`: every map call by the site that made it, whether or not
@@ -548,10 +536,9 @@ pub fn censusReport() void {
 }
 
 fn unmapRaw(h: *Heap, ptr: [*]u8, size: usize) void {
-    const aligned: [*]align(std.heap.page_size_min) u8 = @alignCast(ptr);
     if (trace_enabled) traceForget(@intFromPtr(ptr));
     if (h.track_regions) regionsRemove(h, @intFromPtr(ptr), size);
-    std.posix.munmap(aligned[0..size]);
+    platform.unmap(ptr, size);
     _ = mapped_bytes.fetchSub(size, .monotonic);
     _ = h.mapped.fetchSub(size, .monotonic);
     _ = unmap_calls.fetchAdd(1, .monotonic);
@@ -668,15 +655,10 @@ fn largeParked(h: *Heap) usize {
     return total;
 }
 
-/// Over-maps `len` bytes and trims the unaligned head and tail.
+/// `len` bytes mapped at a `SLAB` boundary.
 fn mapAligned(h: *Heap, len: usize) ?usize {
-    const over = mapRaw(h, len + SLAB) orelse return null;
-    const base = @intFromPtr(over.ptr);
-    const aligned = std.mem.alignForward(usize, base, SLAB);
-    const head = aligned - base;
-    if (head != 0) unmapRaw(h, over.ptr, head);
-    const tail = (base + over.len) - (aligned + len);
-    if (tail != 0) unmapRaw(h, @ptrFromInt(aligned + len), tail);
+    const aligned = platform.mapAligned(len, SLAB) orelse return null;
+    noteMapped(h, @ptrFromInt(aligned), len);
     return aligned;
 }
 
@@ -1043,19 +1025,9 @@ fn freeSmall(h: *Heap, ptr: [*]u8) void {
 // dormant, re-committed on demand by `allocSmall`.
 
 /// Returns the resident pages to the OS while keeping the range mapped,
-/// zero-filled on the next touch. Overlaying a fresh anonymous `MAP_FIXED`
-/// mapping is the portable way to actually drop RSS: on macOS `madvise` leaves
-/// the pages resident until reclaimed under pressure.
+/// zero-filled on the next touch (`platform.discard`).
 inline fn decommit(addr: usize, len: usize) void {
-    const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(addr);
-    _ = std.posix.mmap(
-        p,
-        len,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true },
-        -1,
-        0,
-    ) catch {};
+    platform.discard(addr, len);
 }
 
 /// The decommitted page stayed mapped, zero-filled, so re-threading its cells

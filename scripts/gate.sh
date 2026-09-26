@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The full local verification gate, one entry point. Order: the Skia shim
 # (found, linked from the main checkout in a worktree, or fetched), fast unit
-# tests, then the program-running litmus suites (the parity groups, the
+# tests, the Linux and Windows cross builds (compiled, not run), then the
+# program-running litmus suites (the parity groups, the
 # threaded litmus, e2e, the examples and the ktor/concurrency gates)
 # through the build system (it wires KLIO_ITEST_BIN and the shared test
 # home itself), the packs, the compose-ui gate, the CLI corpus, the sema
@@ -68,6 +69,15 @@ fi
 
 echo "== unit"
 phase "unit" zig build test
+
+echo "== cross builds (compile only)"
+# The install step for the other desktop hosts: the klio binary and its
+# stdlib image. A cross build runs none of the binaries it builds; a host
+# klio built from the same sources bakes the target's image. Each target
+# installs under its own prefix, so zig-out stays this host's.
+for triple in x86_64-linux-gnu x86_64-windows-gnu; do
+  phase "cross-$triple" zig build -Dtarget="$triple" --prefix "$ROOT/zig-out/cross/$triple"
+done
 
 echo "== litmus + ktor + e2e (build-system run steps)"
 # The parity groups and the language-feature group run every migrated

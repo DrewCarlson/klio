@@ -42,7 +42,7 @@ pub const Pool = struct {
     queue_default: Fifo = .{},
     queue_io: Fifo = .{},
     /// Worker join handles, owned by the pool.
-    workers: std.ArrayList(std.Thread) = .empty,
+    workers: std.ArrayList(runtime.platform.Thread) = .empty,
     running: usize = 0,
     running_default: usize = 0,
     worker_seq: usize = 0,
@@ -182,7 +182,7 @@ pub const Pool = struct {
                 // Spawn under the lock so a concurrent shutdown never sees a
                 // reserved-but-unstarted handle.
                 self.worker_seq += 1;
-                const handle = std.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, workerMain, .{ self, self.worker_seq }) catch null;
+                const handle = runtime.platform.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, workerMain, .{ self, self.worker_seq }) catch null;
                 if (handle) |h| {
                     self.workers.append(a, h) catch {
                         // Untracked worker: runs detached and exits on the stopping flag.
@@ -231,7 +231,7 @@ pub const Pool = struct {
     /// reset. `first_error` survives for `takeFirstError`, read strictly after this join.
     pub fn shutdownAndJoin(self: *Pool) void {
         const a = self.allocator();
-        var handles: std.ArrayList(std.Thread) = .empty;
+        var handles: std.ArrayList(runtime.platform.Thread) = .empty;
         defer handles.deinit(a);
         {
             self.mutex.lock();

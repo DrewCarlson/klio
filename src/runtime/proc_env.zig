@@ -24,13 +24,14 @@ pub fn getVar(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.
 }
 
 /// The base directory holding klio's `.klio` data tree. `KLIO_HOME` overrides
-/// `HOME`, so a project can point its data at a repo-local folder. Caller
-/// frees.
+/// the user's home (`HOME`, or `USERPROFILE` on Windows), so a project can
+/// point its data at a repo-local folder. Caller frees.
 pub fn klioHome(allocator: std.mem.Allocator) std.mem.Allocator.Error!?[]u8 {
     if (try getVar(allocator, "KLIO_HOME")) |v| {
         if (v.len != 0) return v;
         allocator.free(v);
     }
+    if (builtin.os.tag == .windows) return getVar(allocator, "USERPROFILE");
     return getVar(allocator, "HOME");
 }
 

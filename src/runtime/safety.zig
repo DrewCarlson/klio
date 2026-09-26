@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 
 const proc_env = @import("proc_env.zig");
 const tls_fast = @import("tls_fast.zig");
+const platform = @import("platform.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -34,7 +35,7 @@ pub fn startMemoryWatchdog() void {
     }
 
     const cap_kb = readCapKb();
-    const t = std.Thread.spawn(.{}, memoryWatchdogLoop, .{cap_kb}) catch return;
+    const t = platform.Thread.spawn(.{}, memoryWatchdogLoop, .{cap_kb}) catch return;
     t.detach();
 }
 
@@ -66,14 +67,7 @@ fn sleepNs(ns: u64) void {
         _ = std.os.linux.nanosleep(&ts, null);
         return;
     }
-    if (builtin.os.tag.isDarwin()) {
-        const ts = std.c.timespec{
-            .sec = @intCast(ns / std.time.ns_per_s),
-            .nsec = @intCast(ns % std.time.ns_per_s),
-        };
-        _ = std.c.nanosleep(&ts, null);
-        return;
-    }
+    if (platform.sleepNs(ns)) return;
     const ms: i64 = @intCast(ns / std.time.ns_per_ms);
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
@@ -98,8 +92,9 @@ fn memoryWatchdogLoop(cap_kb: u64) void {
     }
 }
 
-/// From `/proc/self/statm` field 2 on Linux and mach task basic info on macOS.
-/// Null on any other platform or on a read error.
+/// From `/proc/self/statm` field 2 on Linux, mach task basic info on macOS
+/// and the working set on Windows. Null on any other platform or on a read
+/// error.
 pub fn currentRssKb() ?u64 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
@@ -135,6 +130,10 @@ pub fn currentRssKb() ?u64 {
         if (kr != 0) return null;
         return @as(u64, @intCast(info.resident_size)) / 1024;
     }
+    if (builtin.os.tag == .windows) {
+        const bytes = platform.residentBytes() orelse return null;
+        return bytes / 1024;
+    }
     return null;
 }
 
@@ -148,7 +147,7 @@ pub fn startRunDeadline() void {
     const secs = readEnvU64(std.heap.page_allocator, "KLIO_RUN_TIMEOUT_S") orelse 0;
     if (secs == 0) return;
     if (run_deadline_started.swap(true, .seq_cst)) return;
-    const t = std.Thread.spawn(.{}, runDeadlineLoop, .{secs}) catch return;
+    const t = platform.Thread.spawn(.{}, runDeadlineLoop, .{secs}) catch return;
     t.detach();
 }
 
@@ -285,7 +284,7 @@ pub fn runOnBigStack(
         }
     };
     var runner = Runner{ .ctx = ctx };
-    const t = std.Thread.spawn(
+    const t = platform.Thread.spawn(
         .{ .stack_size = INTERPRET_STACK_SIZE },
         Runner.entry,
         .{&runner},
@@ -353,19 +352,18 @@ pub fn runOnBigStackMainThread(
         }
     };
     var runner = Runner{ .ctx = ctx };
-    const stack = std.posix.mmap(
-        null,
-        INTERPRET_STACK_SIZE,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    ) catch return func(ctx);
-    defer std.posix.munmap(stack);
-    const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack.ptr) + stack.len, 16);
+    if (comptime platform.is_windows) {
+        on_big_stack = true;
+        defer on_big_stack = false;
+        if (!fiber.run(Runner.entry, &runner)) return func(ctx);
+        return runner.result;
+    }
+    const stack = platform.map(INTERPRET_STACK_SIZE) orelse return func(ctx);
+    defer platform.unmap(stack, INTERPRET_STACK_SIZE);
+    const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack) + INTERPRET_STACK_SIZE, 16);
     on_big_stack = true;
     defer on_big_stack = false;
-    const prev = setStack(@intFromPtr(stack.ptr), stack.len);
+    const prev = setStack(@intFromPtr(stack), INTERPRET_STACK_SIZE);
     defer restoreStack(prev);
     callOnStack(sp_top, Runner.entry, &runner);
     return runner.result;
@@ -376,7 +374,7 @@ threadlocal var on_big_stack: bool = false;
 /// A process-lifetime interpreter stack for an OS-driven frame loop, which
 /// re-enters the VM on its own small UI-thread stack each vsync. Mapped on
 /// first use and never unmapped; only the hosted-UI frame callback maps it.
-var persistent_stack: ?[]align(std.heap.page_size_min) u8 = null;
+var persistent_stack: ?[*]align(std.heap.page_size_min) u8 = null;
 
 /// Each call starts at the top of the shared stack, so this is valid only for a
 /// body that fully returns: nothing may survive across the switch back, which
@@ -390,18 +388,6 @@ pub fn runOnPersistentBigStack(
     if (comptime builtin.cpu.arch != .aarch64 and builtin.cpu.arch != .x86_64) {
         return func(ctx);
     }
-    const stack = persistent_stack orelse blk: {
-        const s = std.posix.mmap(
-            null,
-            INTERPRET_STACK_SIZE,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-            -1,
-            0,
-        ) catch return func(ctx);
-        persistent_stack = s;
-        break :blk s;
-    };
     const Runner = struct {
         ctx: Ctx,
         result: Ret = undefined,
@@ -411,12 +397,113 @@ pub fn runOnPersistentBigStack(
         }
     };
     var runner = Runner{ .ctx = ctx };
-    const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack.ptr) + stack.len, 16);
-    const prev = setStack(@intFromPtr(stack.ptr), stack.len);
+    if (comptime platform.is_windows) {
+        if (!fiber.runPersistent(Runner.entry, &runner)) return func(ctx);
+        return runner.result;
+    }
+    const stack = persistent_stack orelse blk: {
+        const s = platform.map(INTERPRET_STACK_SIZE) orelse return func(ctx);
+        persistent_stack = s;
+        break :blk s;
+    };
+    const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack) + INTERPRET_STACK_SIZE, 16);
+    const prev = setStack(@intFromPtr(stack), INTERPRET_STACK_SIZE);
     defer restoreStack(prev);
     callOnStack(sp_top, Runner.entry, &runner);
     return runner.result;
 }
+
+/// Windows runs the interpreter's big stack as a fiber on the calling thread.
+/// A stack pointer moved by hand would leave the thread's recorded stack
+/// bounds describing its own small stack, which Windows consults to grow the
+/// stack and to unwind; a fiber switch moves them along with the stack. The
+/// fiber's stack is a reservation, committed as it grows.
+const fiber = struct {
+    const win = platform.win;
+
+    const Job = struct {
+        func: *const fn (*anyopaque) callconv(.c) void,
+        arg: *anyopaque,
+        caller: *anyopaque,
+    };
+
+    /// Runs the job with this thread's stack bounds set to the fiber's.
+    fn runJob(job: *const Job) void {
+        var low: usize = 0;
+        var high: usize = 0;
+        win.GetCurrentThreadStackLimits(&low, &high);
+        const prev = setStack(low, high - low);
+        defer restoreStack(prev);
+        job.func(job.arg);
+    }
+
+    fn onceEntry(param: ?*anyopaque) callconv(.winapi) void {
+        const job: *const Job = @ptrCast(@alignCast(param.?));
+        runJob(job);
+        win.SwitchToFiber(job.caller);
+        unreachable;
+    }
+
+    /// The fiber this thread runs as: converts the thread on first use, else
+    /// answers the fiber it already is. `converted` says whether this call
+    /// converted it.
+    fn callerFiber(converted: *bool) ?*anyopaque {
+        if (win.ConvertThreadToFiber(null)) |f| {
+            converted.* = true;
+            return f;
+        }
+        converted.* = false;
+        if (win.GetLastError() != win.ERROR_ALREADY_FIBER) return null;
+        return win.currentFiber();
+    }
+
+    /// False when no fiber could be made; the caller then runs on its own
+    /// stack.
+    fn run(func: *const fn (*anyopaque) callconv(.c) void, arg: *anyopaque) bool {
+        var converted = false;
+        const caller = callerFiber(&converted) orelse return false;
+        defer if (converted) {
+            _ = win.ConvertFiberToThread();
+        };
+        var job: Job = .{ .func = func, .arg = arg, .caller = caller };
+        const f = win.CreateFiberEx(64 * 1024, INTERPRET_STACK_SIZE, win.FIBER_FLAG_FLOAT_SWITCH, onceEntry, &job) orelse return false;
+        win.SwitchToFiber(f);
+        win.DeleteFiber(f);
+        return true;
+    }
+
+    /// The frame loop's fiber, made on first use and kept. Its entry loops:
+    /// each switch to it runs the job it was handed and switches back, so
+    /// every call starts at the fiber's base, as a fresh stack would.
+    var persistent: ?*anyopaque = null;
+    var persistent_job: Job = undefined;
+
+    fn persistentEntry(_: ?*anyopaque) callconv(.winapi) void {
+        while (true) {
+            runJob(&persistent_job);
+            win.SwitchToFiber(persistent_job.caller);
+        }
+    }
+
+    fn runPersistent(func: *const fn (*anyopaque) callconv(.c) void, arg: *anyopaque) bool {
+        // The frame loop's thread stays a fiber for the process's life.
+        var converted = false;
+        const caller = callerFiber(&converted) orelse return false;
+        const f = persistent orelse blk: {
+            const made = win.CreateFiberEx(64 * 1024, INTERPRET_STACK_SIZE, win.FIBER_FLAG_FLOAT_SWITCH, persistentEntry, null) orelse return false;
+            persistent = made;
+            break :blk made;
+        };
+        // Already on it: a nested call runs where it is.
+        if (caller == f) {
+            func(arg);
+            return true;
+        }
+        persistent_job = .{ .func = func, .arg = arg, .caller = caller };
+        win.SwitchToFiber(f);
+        return true;
+    }
+};
 
 /// Used on the abort path, so it must not allocate.
 pub fn writeStderr(msg: []const u8) void {

@@ -13,6 +13,7 @@ const tls_fast = @import("tls_fast.zig");
 const trace = @import("trace.zig");
 const clock_mod = @import("clock.zig");
 const slab = @import("slab.zig");
+const platform = @import("platform.zig");
 const assertNoCellLock = @import("objcell.zig").assertNoCellLock;
 const Allocator = std.mem.Allocator;
 
@@ -245,7 +246,7 @@ fn spanningMajors() bool {
 // cells as every spanning major does. With nothing left to trace it runs the
 // remark itself.
 
-const has_marking_thread = builtin.link_libc and !builtin.single_threaded;
+const has_marking_thread = platform.has_os_sync;
 
 /// Cells the marking thread traces before it looks for a stop again.
 var marker_batch: usize = 256;
@@ -1344,11 +1345,11 @@ pub threadlocal var park_depth: u32 = 0;
 // written before the other is read, all sequentially consistent, so either
 // the waiter sees the change or the waker sees the sleeper.
 
-const has_os_wait = builtin.link_libc and !builtin.single_threaded;
+const has_os_wait = platform.has_os_sync;
 
 const Gate = struct {
-    mutex: if (has_os_wait) std.c.pthread_mutex_t else void = if (has_os_wait) .{} else {},
-    cond: if (has_os_wait) std.c.pthread_cond_t else void = if (has_os_wait) .{} else {},
+    mutex: platform.Mutex = .{},
+    cond: platform.Cond = .{},
     sleepers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Sleeps until `still(arg)` is false.
@@ -1357,20 +1358,20 @@ const Gate = struct {
             while (still(arg)) std.Thread.yield() catch std.atomic.spinLoopHint();
             return;
         }
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        self.mutex.lock();
         _ = self.sleepers.fetchAdd(1, .seq_cst);
-        while (still(arg)) _ = std.c.pthread_cond_wait(&self.cond, &self.mutex);
+        while (still(arg)) self.cond.wait(&self.mutex);
         _ = self.sleepers.fetchSub(1, .seq_cst);
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.unlock();
     }
 
     /// One load when nobody sleeps.
     fn wake(self: *Gate) void {
         if (comptime !has_os_wait) return;
         if (self.sleepers.load(.seq_cst) == 0) return;
-        _ = std.c.pthread_mutex_lock(&self.mutex);
-        _ = std.c.pthread_cond_broadcast(&self.cond);
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.lock();
+        self.cond.broadcast();
+        self.mutex.unlock();
     }
 };
 
@@ -1422,14 +1423,17 @@ fn awaitRendezvous(others: usize) void {
 // other mutator print its native stack (`[gc-late]`). A parked thread shows the
 // park; a late one shows what it runs without reaching a safe point.
 
-const has_late_dump = builtin.link_libc and !builtin.single_threaded and
+/// The report signals each late thread to print its own stack, so it needs
+/// `pthread_kill`.
+pub const has_late_dump = builtin.link_libc and !builtin.single_threaded and
     (builtin.os.tag == .macos or builtin.os.tag == .linux);
 
 pub var late_ms: u64 = 0;
 const late_cap = 128;
+const LateThread = if (has_late_dump) std.c.pthread_t else void;
 /// The mutators' threads, kept only while `late_ms` is set. Written under
 /// `mutator_lock`.
-var late_threads: [late_cap]?std.c.pthread_t = @splat(null);
+var late_threads: [late_cap]?LateThread = @splat(null);
 var late_print_lock: SpinLock = .{};
 var late_handler_installed: bool = false;
 
@@ -1849,7 +1853,7 @@ fn noteFreed(freed: usize) void {
 // only cells the mark left white, which nothing live points to, and relinks
 // survivors through `gc_next`, which no mutator reads.
 
-const has_sweeper = builtin.link_libc and !builtin.single_threaded;
+const has_sweeper = platform.has_os_sync;
 
 /// `KLIO_GC_SWEEP=pause` keeps every sweep inside its collection's stop.
 pub var sweep_in_pause: bool = false;
@@ -1917,20 +1921,20 @@ fn sweepChain(head: ?*GcHeader, epoch: ?usize, kept: *Chain) usize {
 }
 
 const SweepSync = if (has_sweeper) struct {
-    mutex: std.c.pthread_mutex_t = .{},
-    cond: std.c.pthread_cond_t = .{},
+    mutex: platform.Mutex = .{},
+    cond: platform.Cond = .{},
 
     fn lock(self: *@This()) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        self.mutex.lock();
     }
     fn unlock(self: *@This()) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.unlock();
     }
     fn wait(self: *@This()) void {
-        _ = std.c.pthread_cond_wait(&self.cond, &self.mutex);
+        self.cond.wait(&self.mutex);
     }
     fn broadcast(self: *@This()) void {
-        _ = std.c.pthread_cond_broadcast(&self.cond);
+        self.cond.broadcast();
     }
 } else struct {
     fn lock(_: *@This()) void {}
@@ -1994,6 +1998,8 @@ fn postSweep(job: SweepJob) bool {
 var fork_handler_installed = std.atomic.Value(bool).init(false);
 
 fn installForkHandler() void {
+    // Windows has no fork.
+    if (comptime platform.is_windows) return;
     if (fork_handler_installed.swap(true, .acq_rel)) return;
     _ = std.c.pthread_atfork(null, null, threadsGoneInChild);
 }
@@ -2233,8 +2239,7 @@ fn testRaiseStop() void {
 }
 
 fn testSleepMs(ms: u32) void {
-    const ts = std.c.timespec{ .sec = 0, .nsec = @as(c_long, ms) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&ts, null);
+    _ = platform.sleepNs(@as(u64, ms) * std.time.ns_per_ms);
 }
 
 /// Waits up to two seconds for `pred`.
@@ -3105,6 +3110,5 @@ test "a collector waiting on a mutator that parks late sleeps until it parks" {
 }
 
 fn testCpuMicros() i64 {
-    const ru = std.posix.getrusage(0);
-    return (@as(i64, ru.utime.sec) + ru.stime.sec) * 1_000_000 + ru.utime.usec + ru.stime.usec;
+    return platform.processCpuMicros() orelse 0;
 }

@@ -8,7 +8,6 @@
 //! ignores the installed copy.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const span = @import("span");
 const sema = @import("sema");
 const runtime = @import("runtime");
@@ -77,13 +76,10 @@ fn shippedPath(a: Allocator, name: []const u8) ?[]const u8 {
     if (runtime.envOnce("KLIO_STDLIB_IMAGE_SHIPPED")) |v| {
         if (std.mem.eql(u8, v, "0")) return null;
     }
+    // The shipped cache sits beside the real file, not beside a link to it,
+    // and `selfExePath` resolves links.
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = exePath(&buf) orelse return null;
-    // The shipped cache sits beside the real file, not beside a link to it.
-    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_z = a.dupeZ(u8, exe) catch return null;
-    const real_z = std.c.realpath(exe_z, &real_buf) orelse return null;
-    const real = std.mem.sliceTo(real_z, 0);
+    const real = runtime.platform.selfExePath(&buf) orelse return null;
     const bin_dir = std.fs.path.dirname(real) orelse return null;
     return std.fs.path.join(a, &.{ bin_dir, "..", "share", "klio", "cache", name }) catch null;
 }
@@ -100,10 +96,7 @@ pub fn writeOrFail(a: Allocator, path: []const u8, bytes: []const u8) !void {
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
     const fio = threaded.io();
-    const pid: u64 = switch (builtin.os.tag) {
-        .linux => @intCast(std.os.linux.getpid()),
-        else => @intCast(std.c.getpid()),
-    };
+    const pid = runtime.platform.processId();
     const tmp = try std.fmt.allocPrint(a, "{s}.tmp-{x}", .{ path, runtime.clockMonotonicNanos() ^ (pid << 32) });
     const cwd = std.Io.Dir.cwd();
     try cwd.writeFile(fio, .{ .sub_path = tmp, .data = bytes });
@@ -122,18 +115,10 @@ fn cacheDir(a: Allocator) ?[]const u8 {
     return dir;
 }
 
-/// The running executable's path, into `buf`.
-fn exePath(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
-    return switch (builtin.os.tag) {
-        .linux => "/proc/self/exe",
-        .macos, .ios, .tvos, .watchos, .visionos => blk: {
-            var n: u32 = buf.len;
-            if (std.c._NSGetExecutablePath(buf, &n) != 0) return null;
-            break :blk std.mem.sliceTo(buf, 0);
-        },
-        else => null,
-    };
-}
+/// The executable whose images this process names: the running one, or
+/// the target binary a cross build bakes the shipped image for
+/// (`bake-image --stdlib-cache <dir> --for <exe>`).
+pub var stamp_exe: ?[]const u8 = null;
 
 /// Size and modification time of the running executable: a rebuilt klio
 /// binds natives differently, so its images are its own. The build installs
@@ -141,10 +126,12 @@ fn exePath(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
 /// the one that baked the shipped image.
 fn exeStamp() ?[2]u64 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = exePath(&buf) orelse return null;
+    const path = stamp_exe orelse runtime.platform.selfExePath(&buf) orelse return null;
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const st = std.Io.Dir.cwd().statFile(threaded.io(), path, .{}) catch return null;
     const mtime_ns: u64 = @truncate(@as(u128, @bitCast(@as(i128, st.mtime.nanoseconds))));
-    return .{ st.size, mtime_ns };
+    // Whole 100 ns ticks, the finest time NTFS keeps: a binary cross-built
+    // elsewhere and copied to Windows keys as the one that baked its image.
+    return .{ st.size, mtime_ns - mtime_ns % 100 };
 }

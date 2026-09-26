@@ -398,8 +398,7 @@ fn drainWallCapAbandon() void {
     runtime.gc.enterBlockingSafe();
     var waited_ms: u64 = 0;
     while (ir.eval.threads_in_eval.load(.monotonic) != 0 and waited_ms < 10_000) {
-        const ts = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&ts, null);
+        _ = runtime.platform.sleepNs(10 * std.time.ns_per_ms);
         waited_ms += 10;
     }
     runtime.gc.exitBlockingSafe();

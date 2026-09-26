@@ -46,6 +46,8 @@ pub fn configureGcFromEnv() void {
     if (envOn("KLIO_GC_REM_TOP")) |v| gc.rem_top = v;
     if (objcell.envOnce("KLIO_GC_LATE")) |v| {
         gc.late_ms = std.fmt.parseInt(u64, v, 10) catch 0;
+        if (!gc.has_late_dump and gc.late_ms != 0)
+            std.debug.print("[gc-late] KLIO_GC_LATE is not available on {s}: the report signals each late thread to print its stack\n", .{@tagName(@import("builtin").os.tag)});
     }
     if (objcell.envOnce("KLIO_GC_MAJOR_EVERY")) |v| {
         gc.major_every = std.fmt.parseInt(usize, v, 10) catch 0;

@@ -7,6 +7,7 @@ const std = @import("std");
 const tls_fast = @import("tls_fast.zig");
 const trace = @import("trace.zig");
 const gc = @import("gc.zig");
+const platform = @import("platform.zig");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
@@ -117,19 +118,9 @@ pub fn wrap(child: Allocator) Allocator {
     return .{ .ptr = undefined, .vtable = &vtable };
 }
 
-fn onSignal(_: std.c.SIG) callconv(.c) void {
-    report();
-    std.c._exit(0);
-}
-
+/// The leak report when the run is stopped, then exit.
 pub fn installSignalDump() void {
-    var act: std.posix.Sigaction = .{
-        .handler = .{ .handler = onSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    platform.onTerminate(report);
 }
 
 /// After a final collect, what remains under an fqn is that intrinsic's leaked

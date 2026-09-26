@@ -60,7 +60,7 @@ GRAPH = {
     "tls_fixtures": [],
     "ktor_tls": ["tls_fixtures"],
     "ktor_client": ["runtime", "stdlib", "ktor_tls", "tls_fixtures"],
-    "typeck": ["span", "ast", "diagnostics", "resolver", "types", "cfa"],
+    "typeck": ["span", "ast", "diagnostics", "resolver", "types", "cfa", "runtime"],
     "sema": ["span", "ast", "lexer", "parser"],
     "lower_driver": ["span", "ast", "lexer", "parser", "sema", "ir", "runtime", "stdlib", "interp_ir"],
     "diagnostics_gen": [],

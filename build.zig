@@ -58,7 +58,7 @@ const mod_list = [_]Mod{
     // The TLS 1.3 engine behind ktor-network-tls: pure std.crypto.
     .{ .name = "ktor_tls", .deps = &.{"tls_fixtures"}, .tested = true },
     .{ .name = "ktor_client", .deps = &.{ "runtime", "stdlib", "ktor_tls", "tls_fixtures" }, .tested = true },
-    .{ .name = "typeck", .deps = &.{ "span", "ast", "diagnostics", "resolver", "types", "cfa" }, .tested = true },
+    .{ .name = "typeck", .deps = &.{ "span", "ast", "diagnostics", "resolver", "types", "cfa", "runtime" }, .tested = true },
     // Semantic analysis: resolves every reference to a declaration identity.
     .{ .name = "sema", .deps = &.{ "span", "ast", "lexer", "parser" }, .tested = true },
     // Runs small programs through sema, the bridge, lowering from sema and
@@ -641,9 +641,9 @@ pub fn build(b: *std.Build) void {
     // target universe only when it coincides with the host, and otherwise
     // gets its own host-target instances of embed_gen's module closure.
     const host_resolved = b.resolveTargetQuery(.{});
-    const embed_gen_mods = blk: {
-        const cross_build = target.result.os.tag != host_resolved.result.os.tag or
-            target.result.cpu.arch != host_resolved.result.cpu.arch;
+    const cross_build = target.result.os.tag != host_resolved.result.os.tag or
+        target.result.cpu.arch != host_resolved.result.cpu.arch;
+    var embed_gen_mods = blk: {
         if (!cross_build) break :blk mods;
         var host_mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
         for (mod_list) |m| {
@@ -688,6 +688,12 @@ pub fn build(b: *std.Build) void {
         embed_run.addFileInput(b.path(b.fmt("{s}/{s}", .{ stdlib_sources.KLIO_STDLIB_DIR, rel })));
     wireEmbeddedPack(b, &mods, target, optimize, embedded_pack);
     wireSemaActuals(b, &mods, target, optimize);
+    // A cross build bakes the target's stdlib image with a host klio built
+    // from the same sources (below), which carries the same embedded data.
+    if (cross_build) {
+        wireEmbeddedPack(b, &embed_gen_mods, host_resolved, optimize, embedded_pack);
+        wireSemaActuals(b, &embed_gen_mods, host_resolved, optimize);
+    }
     if (harness_optimize != optimize) {
         wireEmbeddedPack(b, &harness_mods, target, harness_optimize, embedded_pack);
         wireSemaActuals(b, &harness_mods, target, harness_optimize);
@@ -727,11 +733,35 @@ pub fn build(b: *std.Build) void {
     // it under share/klio/cache, which the runtime reads when its own cache
     // misses. Re-runs when the binary, a stdlib source or a sema actual
     // changes.
-    const stdlib_cache = b.addRunArtifact(exe);
+    //
+    // A cross build cannot run the binary it builds, so a host klio built
+    // from the same sources bakes the image and names it for the target's
+    // binary (`--for`): the name keys on that binary's size and modification
+    // time, and the image binds natives by name when it loads.
+    const stdlib_cache = if (cross_build) blk: {
+        const baker = b.addExecutable(.{
+            .name = "klio-image-baker",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = host_resolved,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "cli", .module = embed_gen_mods.get("cli").? },
+                    .{ .name = "runtime", .module = embed_gen_mods.get("runtime").? },
+                },
+            }),
+        });
+        break :blk b.addRunArtifact(baker);
+    } else b.addRunArtifact(exe);
     stdlib_cache.setCwd(b.path("."));
     stdlib_cache.addArg("bake-image");
     stdlib_cache.addArg("--stdlib-cache");
     const stdlib_cache_dir = stdlib_cache.addOutputDirectoryArg("stdlib-cache");
+    if (cross_build) {
+        stdlib_cache.addArg("--for");
+        stdlib_cache.addArtifactArg(exe);
+    }
     for (stdlib_sources.CURATED_UPSTREAM_SOURCES) |rel|
         stdlib_cache.addFileInput(b.path(b.fmt("{s}/{s}", .{ stdlib_sources.UPSTREAM_STDLIB_ROOT, rel })));
     for (stdlib_sources.KLIO_STDLIB_ACTUAL_FILES) |rel|
@@ -1059,6 +1089,10 @@ pub fn build(b: *std.Build) void {
         // test stays on the default optimize mode for leak/UAF fidelity.
         const runs_programs = std.mem.eql(u8, m.name, "e2e") or std.mem.eql(u8, m.name, "bench");
         const test_mods = if (runs_programs) &harness_mods else &mods;
+        // A module's own test binary is its root artifact: the modules read
+        // the environment through libc (`std.c.getenv`), which only macOS
+        // links without being asked.
+        test_mods.get(m.name).?.link_libc = true;
         const t = b.addTest(.{ .root_module = test_mods.get(m.name).? });
         const run_t = b.addRunArtifact(t);
         keyOnEnv(b, run_t, &interp_env_keys);

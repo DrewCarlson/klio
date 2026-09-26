@@ -669,22 +669,9 @@ fn buildManifest(arena: Allocator, in: ManifestInputs) !bf.BundleManifest {
 }
 
 pub fn selfExePath(arena: Allocator) ?[]const u8 {
-    switch (builtin.os.tag) {
-        .linux => {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const n = std.os.linux.readlink("/proc/self/exe", &buf, buf.len);
-            if (@as(isize, @bitCast(n)) <= 0) return null;
-            return arena.dupe(u8, buf[0..n]) catch null;
-        },
-        .macos => {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            var len: u32 = buf.len;
-            if (std.c._NSGetExecutablePath(&buf, &len) != 0) return null;
-            const path = std.mem.sliceTo(&buf, 0);
-            return arena.dupe(u8, path) catch null;
-        },
-        else => return null,
-    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = runtime.platform.selfExePath(&buf) orelse return null;
+    return arena.dupe(u8, path) catch null;
 }
 
 fn markExecutable(path: []const u8) void {

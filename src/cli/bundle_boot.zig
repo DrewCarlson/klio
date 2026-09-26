@@ -56,86 +56,60 @@ fn probeSelf() ?bf.Trailer {
 /// trailer at `LC_CODE_SIGNATURE.dataoff - 72`; an unsigned stub falls back to
 /// the EOF probe.
 fn probeSelfInner() ?bf.Trailer {
-    const path = selfExePathZ() orelse return null;
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-    if (end <= bf.TRAILER_LEN) return null;
-    const file_len: u64 = @intCast(end);
+    const file = openSelf() orelse return null;
+    defer file.close();
+    const file_len = file.size() orelse return null;
+    if (file_len <= bf.TRAILER_LEN) return null;
 
     if (builtin.os.tag == .macos) {
-        if (machoTrailerPos(fd)) |pos| {
-            if (readTrailerAt(fd, pos, file_len)) |t| {
+        if (machoTrailerPos(file)) |pos| {
+            if (readTrailerAt(file, pos, file_len)) |t| {
                 probe_file_len = file_len;
                 return t;
             }
         }
     }
 
-    const t = readTrailerAt(fd, file_len - bf.TRAILER_LEN, file_len) orelse return null;
+    const t = readTrailerAt(file, file_len - bf.TRAILER_LEN, file_len) orelse return null;
     probe_file_len = file_len;
     return t;
 }
 
-fn readTrailerAt(fd: c_int, pos: u64, file_len: u64) ?bf.Trailer {
+fn readTrailerAt(file: runtime.platform.ReadOnlyFile, pos: u64, file_len: u64) ?bf.Trailer {
     if (pos + bf.TRAILER_LEN > file_len) return null;
     var tail: [bf.TRAILER_LEN]u8 = undefined;
-    const n = std.c.pread(fd, &tail, tail.len, @intCast(pos));
-    if (n != tail.len) return null;
+    if (file.readAt(&tail, pos) != tail.len) return null;
     const t = bf.Trailer.decode(&tail) orelse return null;
     if (!t.consistent(file_len)) return null;
     return t;
 }
 
 var macho_head_buf: [256 * 1024]u8 = undefined;
-fn machoTrailerPos(fd: c_int) ?u64 {
+fn machoTrailerPos(file: runtime.platform.ReadOnlyFile) ?u64 {
     var hdr: [32]u8 = undefined;
-    if (std.c.pread(fd, &hdr, hdr.len, 0) != hdr.len) return null;
+    if (file.readAt(&hdr, 0) != hdr.len) return null;
     if (std.mem.readInt(u32, hdr[0..4], .little) != 0xfeedfacf) return null;
     const sizeofcmds = std.mem.readInt(u32, hdr[20..24], .little);
     const need: usize = 32 + @as(usize, sizeofcmds);
     if (need > macho_head_buf.len) return null;
-    if (std.c.pread(fd, &macho_head_buf, need, 0) != @as(isize, @intCast(need))) return null;
+    if (file.readAt(macho_head_buf[0..need], 0) != need) return null;
     return macho_sign.trailerOffset(macho_head_buf[0..need]);
 }
 
 var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
 
-/// Resolve the own-executable path into a static buffer, never trusting argv[0].
-fn selfExePathZ() ?[*:0]const u8 {
-    switch (builtin.os.tag) {
-        .linux => {
-            const n = std.os.linux.readlink("/proc/self/exe", &self_path_buf, self_path_buf.len - 1);
-            if (@as(isize, @bitCast(n)) <= 0) return null;
-            self_path_buf[n] = 0;
-            return @ptrCast(&self_path_buf);
-        },
-        .macos => {
-            var len: u32 = self_path_buf.len;
-            if (std.c._NSGetExecutablePath(&self_path_buf, &len) != 0) return null;
-            return @ptrCast(&self_path_buf);
-        },
-        else => return null,
-    }
+/// The running executable, found through the OS, never through argv[0].
+fn openSelf() ?runtime.platform.ReadOnlyFile {
+    const path = runtime.platform.selfExePath(&self_path_buf) orelse return null;
+    return runtime.platform.ReadOnlyFile.open(path);
 }
 
-/// mmap the whole bundle file read-only. The mapping lives for the process: the
-/// loaded base and every borrowed string point into it.
+/// Maps the whole bundle file read-only. The mapping lives for the process:
+/// the loaded base and every borrowed string point into it.
 fn mmapSelf(len: u64) ?[]const u8 {
-    const path = selfExePathZ() orelse return null;
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-    const mapped = std.posix.mmap(
-        null,
-        @intCast(len),
-        .{ .READ = true },
-        .{ .TYPE = .PRIVATE },
-        fd,
-        0,
-    ) catch return null;
-    return mapped[0..@intCast(len)];
+    const file = openSelf() orelse return null;
+    defer file.close();
+    return file.mapAll(@intCast(len));
 }
 
 pub fn run(gpa: Allocator, argv: []const []const u8) u8 {

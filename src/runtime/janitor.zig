@@ -12,7 +12,7 @@ pub fn releaseArenas(list: []std.heap.ArenaAllocator) void {
         std.heap.page_allocator.free(list);
         return;
     }
-    if (std.Thread.spawn(.{ .stack_size = 64 * 1024 }, releaseThread, .{list})) |t| {
+    if (std.Thread.spawn(.{ .stack_size = @import("platform.zig").small_thread_stack }, releaseThread, .{list})) |t| {
         t.detach();
     } else |_| {
         releaseThread(list);

@@ -253,7 +253,7 @@ pub fn coroutineSpawnTimer(self: *VmIntrinsicHost, block: *const Value, out: Out
         .time_mode = root.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
     };
-    const handle = std.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, timerThreadEntry, .{args}) catch null;
+    const handle = runtime.platform.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, timerThreadEntry, .{args}) catch null;
     coroutines.timerThreadStarted(handle);
     if (handle == null) {
         // The seed's handles release through a child Vm's teardown.
@@ -648,7 +648,7 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, name_in: []const u8)
     // Under virtual time the new thread holds the clock from here, as a
     // dispatched task does.
     coroutines.poolTaskDispatched();
-    const handle = std.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, workerEntry, .{wargs}) catch {
+    const handle = runtime.platform.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, workerEntry, .{wargs}) catch {
         coroutines.poolTaskSettleDropped();
         handoffTake(handoff);
         block.release(self.allocator);

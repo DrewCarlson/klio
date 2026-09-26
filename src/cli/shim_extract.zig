@@ -45,6 +45,16 @@ fn cacheBase(gpa: Allocator) ?[]const u8 {
     }
 }
 
+/// The system temp dir, `gpa`-allocated: `%TEMP%` (else `%TMP%`) on Windows,
+/// `/tmp` elsewhere.
+fn tempDir(gpa: Allocator) ?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        if (runtime.procEnvGetVar(gpa, "TEMP") catch null) |t| return t;
+        return runtime.procEnvGetVar(gpa, "TMP") catch null;
+    }
+    return gpa.dupe(u8, "/tmp") catch null;
+}
+
 /// Path to `bytes` in the content-addressed cache, `gpa`-allocated; null when nothing is writable.
 pub fn ensureExtracted(gpa: Allocator, bytes: []const u8) ?[]const u8 {
     var digest: [32]u8 = undefined;
@@ -57,7 +67,9 @@ pub fn ensureExtracted(gpa: Allocator, bytes: []const u8) ?[]const u8 {
         defer gpa.free(dir);
         if (extractInto(gpa, dir, bytes)) |p| return p;
     }
-    const tmp = std.fs.path.join(gpa, &.{ "/tmp", "klio-shim", &hex }) catch return null;
+    const tmp_base = tempDir(gpa) orelse return null;
+    defer gpa.free(tmp_base);
+    const tmp = std.fs.path.join(gpa, &.{ tmp_base, "klio-shim", &hex }) catch return null;
     defer gpa.free(tmp);
     return extractInto(gpa, tmp, bytes);
 }
@@ -77,10 +89,7 @@ fn extractInto(gpa: Allocator, dir: []const u8, bytes: []const u8) ?[]const u8 {
         gpa.free(dest);
         return null;
     };
-    const pid: u64 = switch (builtin.os.tag) {
-        .linux => @intCast(std.os.linux.getpid()),
-        else => @intCast(std.c.getpid()),
-    };
+    const pid = runtime.platform.processId();
     const unique = runtime.clockMonotonicNanos() ^ (pid << 32);
     const tmp_path = std.fmt.allocPrint(gpa, "{s}/.tmp-{x}", .{ dir, unique }) catch {
         gpa.free(dest);

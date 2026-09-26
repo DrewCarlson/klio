@@ -45,6 +45,9 @@ pub const leaktrack = @import("leaktrack.zig");
 pub const trace = @import("trace.zig");
 pub const forest = @import("forest.zig");
 pub const prof = @import("prof.zig");
+/// The host operating system: clocks, OS locks, virtual memory, threads,
+/// the executable's path and shared libraries.
+pub const platform = @import("platform.zig");
 
 /// Debug-only frame-chain dump hook the evaluator installs at startup, so a
 /// stdlib intrinsic, which cannot import the ir layer, can name its calling
@@ -283,6 +286,7 @@ test {
     _ = safety_mod;
     _ = threads_mod;
     _ = alloc_track_mod;
+    _ = platform;
 }
 
 

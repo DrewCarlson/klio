@@ -1,32 +1,16 @@
 //! Portable clock and sleep helpers. Zig 0.16 routes wall-clock, monotonic time
-//! and sleeping through `Io`; these go straight to the libc syscalls when libc
-//! is linked, because every idle worker and pump poll sleeps at a ~1 ms cadence
-//! and a per-call `std.Io.Threaded` construction costs whole cores.
+//! and sleeping through `Io`; these go straight to the host (`platform`)
+//! because every idle worker and pump poll sleeps at a ~1 ms cadence and a
+//! per-call `std.Io.Threaded` construction costs whole cores.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const threads_mod = @import("threads.zig");
 const gc = @import("gc.zig");
-
-fn cNowNs(clk: std.c.clockid_t) ?i128 {
-    if (comptime !builtin.link_libc) return null;
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(clk, &ts) != 0) return null;
-    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-}
-
-fn cSleepNs(ns: u64) bool {
-    if (comptime !builtin.link_libc) return false;
-    const ts = std.c.timespec{
-        .sec = @intCast(ns / std.time.ns_per_s),
-        .nsec = @intCast(ns % std.time.ns_per_s),
-    };
-    _ = std.c.nanosleep(&ts, null);
-    return true;
-}
+const platform = @import("platform.zig");
 
 pub fn wallMillis() i64 {
-    if (cNowNs(.REALTIME)) |ns| return @intCast(@divFloor(ns, std.time.ns_per_ms));
+    if (platform.realtimeNs()) |ns| return @intCast(@divFloor(ns, std.time.ns_per_ms));
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -36,7 +20,7 @@ pub fn wallMillis() i64 {
 pub const WallTime = struct { secs: i64, nanos: u32 };
 
 pub fn wallTime() WallTime {
-    const ns: i128 = cNowNs(.REALTIME) orelse blk: {
+    const ns: i128 = platform.realtimeNs() orelse blk: {
         var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
         defer threaded.deinit();
         const io = threaded.io();
@@ -49,12 +33,10 @@ pub fn wallTime() WallTime {
 
 /// Only differences are meaningful. 0 on failure.
 pub fn monotonicNanos() u64 {
-    const ns: i128 = cNowNs(.MONOTONIC) orelse blk: {
-        var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-        defer threaded.deinit();
-        const io = threaded.io();
-        break :blk @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-    };
+    if (platform.monotonicNs()) |ns| return ns;
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const ns: i128 = @intCast(std.Io.Clock.awake.now(threaded.io()).nanoseconds);
     if (ns <= 0) return 0;
     return @intCast(@min(ns, @as(i128, std.math.maxInt(u64))));
 }
@@ -71,12 +53,12 @@ pub fn sleepMillis(ms: i64) void {
     // A non-abandonable thread uses coarse slices, so a leaked sleeper no
     // longer holds the run's final join open.
     const slice_ms: i64 = if (threads_mod.isThreadAbandonable()) 2 else 50;
-    if (comptime builtin.link_libc) {
+    if (comptime builtin.link_libc or platform.is_windows) {
         var remaining = ms;
         while (remaining > 0) {
             if (threads_mod.shouldAbandon()) return;
             const slice = @min(remaining, slice_ms);
-            _ = cSleepNs(@as(u64, @intCast(slice)) * std.time.ns_per_ms);
+            _ = platform.sleepNs(@as(u64, @intCast(slice)) * std.time.ns_per_ms);
             remaining -= slice;
         }
         return;
@@ -93,12 +75,13 @@ pub fn sleepMillis(ms: i64) void {
     }
 }
 
-/// Cross-thread event gate: an epoch counter with a libc condvar. `waitFrom`
-/// parks only while the epoch still equals the `seen` snapshot the caller took
-/// before its final emptiness check, which closes the post-then-wait race.
+/// Cross-thread event gate: an epoch counter with an OS condition variable.
+/// `waitFrom` parks only while the epoch still equals the `seen` snapshot the
+/// caller took before its final emptiness check, which closes the
+/// post-then-wait race.
 pub const EventGate = struct {
-    mutex: std.c.pthread_mutex_t = .{},
-    cond: std.c.pthread_cond_t = .{},
+    mutex: platform.Mutex = .{},
+    cond: platform.Cond = .{},
     epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn epochNow(self: *EventGate) u64 {
@@ -106,32 +89,27 @@ pub const EventGate = struct {
     }
 
     pub fn ring(self: *EventGate) void {
-        if (comptime !builtin.link_libc) {
+        if (comptime !platform.has_os_sync) {
             _ = self.epoch.fetchAdd(1, .release);
             return;
         }
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        self.mutex.lock();
         _ = self.epoch.fetchAdd(1, .release);
-        _ = std.c.pthread_cond_broadcast(&self.cond);
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        self.cond.broadcast();
+        self.mutex.unlock();
     }
 
     pub fn waitFrom(self: *EventGate, seen: u64, timeout_us: u64) void {
-        if (comptime !builtin.link_libc) {
+        if (comptime !platform.has_os_sync) {
             sleepMicros(@intCast(@min(timeout_us, 1_000)));
             return;
         }
         gc.enterBlockingSafe();
         defer gc.exitBlockingSafe();
-        _ = std.c.pthread_mutex_lock(&self.mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.epoch.load(.acquire) != seen) return;
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(.REALTIME, &ts);
-        const add_ns: i128 = @as(i128, ts.nsec) + @as(i128, timeout_us) * 1_000;
-        ts.sec += @intCast(@divFloor(add_ns, 1_000_000_000));
-        ts.nsec = @intCast(@mod(add_ns, 1_000_000_000));
-        _ = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts);
+        self.cond.timedWait(&self.mutex, timeout_us *| std.time.ns_per_us);
     }
 };
 
@@ -140,7 +118,7 @@ pub fn sleepMicros(us: i64) void {
     if (us <= 0) return;
     gc.enterBlockingSafe();
     defer gc.exitBlockingSafe();
-    if (cSleepNs(@as(u64, @intCast(us)) * 1_000)) return;
+    if (platform.sleepNs(@as(u64, @intCast(us)) * 1_000)) return;
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

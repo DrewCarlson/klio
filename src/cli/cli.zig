@@ -239,7 +239,7 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
 }
 
 fn usageBakeImage(gpa: std.mem.Allocator) u8 {
-    printErr(gpa, "usage: klio bake-image <program.kt...> -o <base.klio-image> [--feature <pack>/<feat>]\n       klio bake-image --stdlib-cache <dir>\n", .{});
+    printErr(gpa, "usage: klio bake-image <program.kt...> -o <base.klio-image> [--feature <pack>/<feat>]\n       klio bake-image --stdlib-cache <dir> [--for <klio executable>]\n", .{});
     return 2;
 }
 
@@ -248,6 +248,7 @@ fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var programs: std.ArrayList([]const u8) = .empty;
     defer programs.deinit(gpa);
     var stdlib_cache: ?[]const u8 = null;
+    var for_exe: ?[]const u8 = null;
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
     var i: usize = 0;
@@ -261,6 +262,10 @@ fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return usageBakeImage(gpa);
             stdlib_cache = args[i];
+        } else if (std.mem.eql(u8, a, "--for")) {
+            i += 1;
+            if (i >= args.len) return usageBakeImage(gpa);
+            for_exe = args[i];
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
             if (i >= args.len) return usageBakeImage(gpa);
@@ -277,8 +282,9 @@ fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     }
     if (stdlib_cache) |dir| {
         if (programs.items.len != 0 or out != null) return usageBakeImage(gpa);
-        return image_cmd.bakeStdlibCache(gpa, dir);
+        return image_cmd.bakeStdlibCache(gpa, dir, for_exe);
     }
+    if (for_exe != null) return usageBakeImage(gpa);
     if (programs.items.len == 0 or out == null) return usageBakeImage(gpa);
     return image_cmd.bakeImage(gpa, programs.items, feature_specs.items, out.?);
 }

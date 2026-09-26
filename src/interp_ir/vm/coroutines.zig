@@ -633,7 +633,7 @@ const TimerService = struct {
     /// The live pump's wakeup, rung on every post; null while none runs.
     var wakeup: ?ObjRef(DriverWakeup) = null;
     var state: State = .idle;
-    var thread: ?std.Thread = null;
+    var thread: ?runtime.platform.Thread = null;
     var fork_handler_installed = std.atomic.Value(bool).init(false);
 
     fn allocator() Allocator {
@@ -750,8 +750,9 @@ pub fn timerPost(block: Value) Allocator.Error!TimerPost {
 
 /// Records the thread a `.start` post spawned; `null` when the spawn failed,
 /// which drops what the thread would have run.
-pub fn timerThreadStarted(handle: ?std.Thread) void {
-    if (handle != null and !TimerService.fork_handler_installed.swap(true, .acq_rel)) {
+pub fn timerThreadStarted(handle: ?runtime.platform.Thread) void {
+    // Windows has no fork.
+    if (!runtime.platform.is_windows and handle != null and !TimerService.fork_handler_installed.swap(true, .acq_rel)) {
         _ = std.c.pthread_atfork(null, null, TimerService.goneInChild);
     }
     TimerService.mutex.lock();
@@ -776,7 +777,7 @@ fn dropPendingLocked() void {
 /// Run boundary: stop the timer thread, dropping every timer it still holds,
 /// and refuse posts until `timerServiceReopen`. Waits out a start in flight.
 pub fn timerServiceStop() void {
-    const handle: ?std.Thread = blk: {
+    const handle: ?runtime.platform.Thread = blk: {
         while (true) {
             TimerService.mutex.lock();
             if (TimerService.state != .starting) break;

@@ -613,10 +613,10 @@ fn runParseJobsOn(allocator: Allocator, jobs: *std.ArrayList(ParseJob), want: us
     for (order, 0..) |*slot, i| slot.* = i;
     std.mem.sort(usize, order, @as([]const ParseJob, jobs.items), ParsePool.largerFirst);
     var pool = ParsePool{ .allocator = allocator, .jobs = jobs, .files = files, .order = order };
-    var threads: [max_parse_workers]std.Thread = undefined;
+    var threads: [max_parse_workers]runtime.platform.Thread = undefined;
     var spawned: usize = 0;
     while (spawned + 1 < want) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(
+        threads[spawned] = runtime.platform.Thread.spawn(
             .{ .stack_size = parse_worker_stack },
             ParsePool.worker,
             .{&pool},
