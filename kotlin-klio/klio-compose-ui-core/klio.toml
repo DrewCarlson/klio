@@ -124,8 +124,13 @@ include = [
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/ui/ui/src/nonJvmMain/kotlin"
 
+# nativeMain: the weak reference, over kotlin.native.ref.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui/src/nativeMain/kotlin"
+include = ["androidx/compose/ui/node/WeakReference.native.kt"]
+
 # klioMain: the host (owner, scene, windows), the pointer and key event actuals,
-# and the platform-primitive actuals (atomics, sync, refs, identity hash).
+# and the platform-primitive actuals (atomics, sync, identity hash).
 [[source]]
 root = "klioMain"
 

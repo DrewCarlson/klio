@@ -1,0 +1,8 @@
+before: [banner, logo, splash]
+after: [logo]
+logo: logo
+splash: null
+value: logo
+cleared: null
+freed bytes: 192
+logo

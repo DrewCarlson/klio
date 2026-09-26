@@ -6,6 +6,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const objcell = @import("objcell.zig");
+const weak_mod = @import("weak.zig");
 const slab = @import("slab.zig");
 const tls_fast = @import("tls_fast.zig");
 const trace_mod = @import("trace.zig");
@@ -2029,6 +2030,9 @@ pub const Value = union(enum) {
     MatchGroup: *MatchGroupData,
     StringBuilder: ObjRef(std.ArrayList(u8)),
     Cell: ObjRef(Value),
+    /// A weak reference's cell: it holds its referent without keeping it
+    /// alive, and the collector clears it once the referent is garbage.
+    Weak: weak_mod.WeakRef,
 
     pub fn newCell(allocator: std.mem.Allocator, v: Value) !Value {
         return .{ .Cell = try ObjRef(Value).init(allocator, v) };
@@ -2058,6 +2062,7 @@ pub const Value = union(enum) {
             .Match => |m| visitor.visit(m),
             .StringBuilder => |s| visitor.visit(s),
             .Cell => |c| visitor.visit(c),
+            .Weak => |w| visitor.visit(w),
             .IrClosure => |c| visitor.visit(c),
             .Comparator => |c| visitor.visit(comparatorRefOf(c)),
             .List => |x| visitor.visit(listRefOf(x)),
@@ -2546,6 +2551,7 @@ pub const Value = union(enum) {
     pub fn typeFqn(self: Value) []const u8 {
         return switch (self) {
             .Cell => "kotlin.Any",
+            .Weak => "kotlin.Any",
             .Unit => "kotlin.Unit",
             .CoroutineSuspended => "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED",
             .Int => "kotlin.Int",
@@ -2675,6 +2681,7 @@ pub const Value = union(enum) {
                 defer g.deinit();
                 break :blk g.get().isRuntimeType(name);
             },
+            .Weak => std.mem.eql(u8, name, "Any"),
             .CoroutineSuspended => false,
             .Int => matchesAny(name, &.{ "Int", "Number", "Any", "Comparable" }),
             .Long => matchesAny(name, &.{ "Long", "Number", "Any", "Comparable" }),
@@ -3052,6 +3059,7 @@ pub const Value = union(enum) {
                 defer g.deinit();
                 try g.get().writeTo(writer);
             },
+            .Weak => |w| try writer.print("kotlin.native.ref.WeakCell@{x}", .{w.identity()}),
             .Unit => try writer.writeAll("kotlin.Unit"),
             .CoroutineSuspended => try writer.writeAll("COROUTINE_SUSPENDED"),
             .Int => |v| try writer.print("{d}", .{v}),

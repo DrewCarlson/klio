@@ -48,6 +48,8 @@ pub const prof = @import("prof.zig");
 /// The host operating system: clocks, OS locks, virtual memory, threads,
 /// the executable's path and shared libraries.
 pub const platform = @import("platform.zig");
+/// Weak references and cleaners over the collector.
+pub const weak = @import("weak.zig");
 
 /// Debug-only frame-chain dump hook the evaluator installs at startup, so a
 /// stdlib intrinsic, which cannot import the ir layer, can name its calling

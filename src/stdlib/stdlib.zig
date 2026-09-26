@@ -478,7 +478,9 @@ pub fn auditImplementationTable() TableAudit {
     var out: TableAudit = .{ .matched = 0, .unmatched = 0, .internal = 0, .receiver_form = 0 };
     var it = implementations.allFqns();
     while (it.next()) |fqn| {
-        if (std.mem.find(u8, fqn, "__klio") != null) {
+        // A `__klio` helper, or a declaration of klio's own `klio` package:
+        // neither has an upstream counterpart.
+        if (std.mem.find(u8, fqn, "__klio") != null or std.mem.startsWith(u8, fqn, "klio.")) {
             out.internal += 1;
             continue;
         }
@@ -796,10 +798,9 @@ test "every hand-written intrinsic is accounted for against the mined index" {
     //
     // The unknown bucket is a ratchet rather than zero, since the mined index is
     // built from whatever upstream sources are present. It grows only by a
-    // JVM-only declaration klio implements, recorded here: `klio`'s
-    // `StackTraceElement.className`, `methodName`, `fileName` and `lineNumber`
-    // took it from 141 to 145.
-    const UNKNOWN_CEILING: usize = 145;
+    // JVM-only declaration klio implements outside its own `klio` package,
+    // recorded here.
+    const UNKNOWN_CEILING: usize = 139;
     if (a.unmatched > UNKNOWN_CEILING) {
         std.debug.print(
             "\n[stdlib-table] {d} intrinsics name nothing the mined index knows (was {d})\n",

@@ -35,6 +35,7 @@ root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-runtime/src/commonM
 root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-runtime/src/nativeMain/kotlin"
 include = [
     "androidx/lifecycle/LifecycleRegistry.native.kt",
+    "androidx/lifecycle/WeakReference.native.kt",
 ]
 
 [[source]]

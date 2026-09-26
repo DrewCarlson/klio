@@ -103,6 +103,27 @@ multi-thread / coroutine / closure / host-temporary close-out):
   thread that ends a stop, parks, or enters a blocking bracket while a stop is
   raised wakes the gate's sleepers; waking costs one load when nobody sleeps.
 
+- Weak references and cleaners (`src/runtime/weak.zig`), behind Kotlin/Native's
+  `kotlin.native.ref.WeakReference`, `createCleaner` and `kotlin.native.runtime.GC`.
+  A weak cell is a `Value.Weak` whose tracer skips its referent; every weak cell
+  whose referent can be swept is on a registry the collector reads after each
+  mark, with the world still stopped (`gc.weak_hook`): a live weak cell whose
+  referent `gc.cellDead` says this collection frees is cleared before the sweep,
+  and a dead one leaves the registry. A cleaner's owner holds its job; when a
+  collection finds the owner dead the job is marked again with that
+  collection's marker, so it survives the sweep, and queued for a cleaner thread
+  (a Kotlin daemon started with the first cleaner) that runs it. Weak cells are
+  cleared after the jobs are marked, so what a queued job holds stays weakly
+  reachable until it has run. Entries registered since the last collection are
+  young and every minor checks only them; a minor's survivors are tenured, so
+  their entries become old and only a major looks at them again.
+- Native finalizers (`klio.ref.registerNativeFinalizer`): a C function and the
+  pointer it frees, registered against a Kotlin owner, which the sweeper thread
+  calls once a collection finds the owner dead, or the owner's `close()` calls
+  first (`runNativeFinalizer`); a one-shot flag runs it exactly once. No Kotlin
+  object or job is allocated per peer and nothing extra is marked. skiko's
+  `Managed` peers free their Skia objects this way.
+
 Open next tier: Stage 2 (generational nursery) and Stage 3 (incremental/concurrent
 marking), both below. External-byte accounting is now part of the shipped
 collector; its remaining stress hardening is described directly below.
@@ -198,7 +219,7 @@ MAP-VIEW BACKING (fatal fix — freed-while-live source map under a live view): 
 
 MARK & SWEEP
 - MARK: tri-color with an EXPLICIT work-list (ArrayList of *GcHeader), never native recursion. Seed greys from all roots via markValue(v) driving the GC-mark forEachChildCell variant: CAS-set each child's gc_mark to current_epoch (white→grey) and push. Pop a grey, call its gc_trace thunk, shade children grey, blacken self. A cell already at current_epoch is skipped, so cycles terminate.
-- SWEEP: single pass over gc_all_cells. If gc_mark != current_epoch: unlink, run gc_finalize (the SHALLOW teardown — own buffers/bytes/HashMap spine only, NEVER child Values), then allocator.destroy(cell). Payload deinits are split: InstanceData.gcFinalize keeps fields.deinit(allocator) but DROPS the `for fields |f| f.value.release()` loop (class.zig:324) and `outer.release` and `class.deinit`; Env.gcFinalize keeps vars.deinit() drops parent.deinit() (env.zig:27); releaseValueList/releaseSliceElems/the Map last-owner element release (value.zig:580-598) are gated off — only the buffer free remains. Each cell is freed exactly once; no resurrection (no Kotlin finalizers). The weak closure-table sweep pass (root 5) runs after the cell sweep. Epoch-wrap invariant documented: every reachable cell is re-marked every collection, so wrap can only DELAY (never prevent) reclamation of an unreachable cell — a bounded leak, not a UAF — and the usize width makes it unobservable.
+- SWEEP: single pass over gc_all_cells. If gc_mark != current_epoch: unlink, run gc_finalize (the SHALLOW teardown — own buffers/bytes/HashMap spine only, NEVER child Values), then allocator.destroy(cell). Payload deinits are split: InstanceData.gcFinalize keeps fields.deinit(allocator) but DROPS the `for fields |f| f.value.release()` loop (class.zig:324) and `outer.release` and `class.deinit`; Env.gcFinalize keeps vars.deinit() drops parent.deinit() (env.zig:27); releaseValueList/releaseSliceElems/the Map last-owner element release (value.zig:580-598) are gated off — only the buffer free remains. Each cell is freed exactly once; the only resurrection is a dead cleaner's job, which the weak registry's pass marks before the sweep (see Completed). The weak closure-table sweep pass (root 5) runs after the cell sweep. Epoch-wrap invariant documented: every reachable cell is re-marked every collection, so wrap can only DELAY (never prevent) reclamation of an unreachable cell — a bounded leak, not a UAF — and the usize width makes it unobservable.
 
 SAFE POINTS & CONCURRENCY
 - WHEN: only at opcode boundaries — top of the while(true) block loop / before each execInst (eval.zig:891/925), beside shouldAbandon() (eval.zig:896); plus the pump loop top and the worker idle loop (scheduler.zig:279). Check: `if (runtime.gcPending()) runtime.gcSafePoint();`.

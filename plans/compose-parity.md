@@ -209,7 +209,7 @@ run; scripts/init-compose-submodule.sh lists the current set):
    installs, run through the host of the native call that invokes them;
    the shaper's run handlers still throw. Then ui-graphics and ui-text move
    onto the verbatim skikoMain. Managed peers free their native objects on
-   close(); the collector runs no finalizers.
+   close(), or the runtime's native finalizer after a collection frees them.
 7. **The long tail.** The remaining nonJvm actuals taken verbatim, the
    desktop window API's AWT-bound rest. Dialog modality and window
    transparency are done. `Window(icon)` draws its painter at 192 pixels, as
@@ -238,8 +238,7 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 
 klio actuals that stay: ui-text's Locale and string delegate (the
 desktop's wrap java.util.Locale and the JVM's casing; klio reads tags and
-cases as those do); runtime's thread id, identity hash, weak reference
-(strong: the collector has no weak references), locks over atomicfu, the
+cases as those do); runtime's thread id, identity hash, locks over atomicfu, the
 desktop frame clock and the error logger; animation-core's current-thread
 token; ui-util's tracing; ui-text's code-point direction helpers (they ask
 skia's ICU through the binding layer). Not in the checkout yet:

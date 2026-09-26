@@ -696,7 +696,7 @@ fn writeBarrierSlow(h: *GcHeader) void {
 /// An address range about to be unmapped as a whole.
 pub const Range = struct { start: usize, len: usize };
 
-fn inRanges(ranges: []const Range, h: *GcHeader) bool {
+pub fn inRanges(ranges: []const Range, h: *GcHeader) bool {
     const addr = @intFromPtr(h);
     for (ranges) |r| {
         if (addr >= r.start and addr < r.start + r.len) return true;
@@ -713,6 +713,7 @@ fn inRanges(ranges: []const Range, h: *GcHeader) bool {
 pub fn forgetRanges(ranges: []const Range) void {
     waitSweep();
     abortMajor();
+    if (weak_forget_hook) |f| f(ranges);
     {
         remembered_lock.lock();
         defer remembered_lock.unlock();
@@ -861,6 +862,7 @@ var program_perm_lock: SpinLock = .{};
 /// Free every cell on the program-perm list. Run boundary only, strictly after
 /// the final collect and `drainRemembered`.
 pub fn freeProgramPerm() void {
+    if (weak_forget_hook) |f| f(null);
     program_perm_lock.lock();
     var cur = program_perm;
     program_perm = null;
@@ -1556,8 +1558,27 @@ pub var gc_nofree: bool = false;
 
 /// Called after marking, before the sweep, world still stopped.
 pub var audit_hook: ?*const fn (major: bool, epoch: usize) void = null;
+
+/// The weak-reference registry's pass, after marking and before the sweep,
+/// world stopped: it clears what `cellDead` says this collection frees, and
+/// may mark more with the collection's marker, which it drains.
+pub var weak_hook: ?*const fn (major: bool, m: *Marker) void = null;
+/// Runs the native finalizers the last collection queued; the sweeper calls
+/// it after its sweep, or the collector once its stop has ended.
+pub var native_finalize_hook: ?*const fn () void = null;
+/// Drops the weak registry's entries for cells freed outside a sweep: those
+/// inside the ranges, or every entry for null.
+pub var weak_forget_hook: ?*const fn (ranges: ?[]const Range) void = null;
 /// Diagnostics: called after the sweep, world still stopped.
 pub var post_sweep_hook: ?*const fn (major: bool, epoch: usize) void = null;
+
+/// Whether the collection in progress frees `h`: a white cell on the lists it
+/// sweeps. A permanent cell, which carries no bytes, is never freed by one.
+/// Valid from the end of its mark until its sweep.
+pub fn cellDead(h: *const GcHeader, major: bool) bool {
+    if (h.gc_bytes == 0) return false;
+    return cellSweepFate(h, major) == .white;
+}
 
 pub fn cellSweepFate(h: *const GcHeader, major: bool) enum { marked, tenured, white } {
     if (h.gc_mark == sweep_epoch) return .marked;
@@ -1744,6 +1765,7 @@ fn collectImpl(force_major: bool) void {
     const t_sliced: u64 = if (gc_debug) clock_mod.monotonicNanos() else 0;
 
     if (audit_hook) |f| f(major, marker.epoch);
+    if (weak_hook) |f| f(major, marker);
     // The counts come from the mark: every nursery cell it reached is tenured
     // already, and every cell it missed is garbage.
     if (major) {
@@ -1796,7 +1818,10 @@ fn collectImpl(force_major: bool) void {
     major_lock.unlock();
     endStop();
     const t_released: u64 = if (gc_debug) clock_mod.monotonicNanos() else 0;
-    if (swept_here) noteFreed(freed);
+    if (swept_here) {
+        noteFreed(freed);
+        if (native_finalize_hook) |f| f();
+    }
     // `stop_us` is the rendezvous; `pause_us` runs from the raise to the
     // release, the time every other mutator stood still. A sweep handed to
     // the sweeper reports on its own `[kgc-sweep]` line. `slice` counts the
@@ -1835,6 +1860,11 @@ fn kindName(kind: Kind) []const u8 {
 
 /// The epoch the collection in progress sweeps by.
 var sweep_epoch: usize = 0;
+
+/// The epoch the last collection swept by; a cell marked with it survived.
+pub fn sweepEpoch() usize {
+    return sweep_epoch;
+}
 
 /// Returns swept pages to the OS: the backing allocator holds freed memory in
 /// free-lists, so RSS otherwise tracks the allocation high-water.
@@ -1964,6 +1994,7 @@ fn sweeperMain() void {
         while (sweep_gate.load(.acquire)) std.Thread.yield() catch {};
         const t0: u64 = if (gc_debug) clock_mod.monotonicNanos() else 0;
         const freed = sweepJob(job);
+        if (native_finalize_hook) |f| f();
         // Cells freed here wait in this thread's magazines until flushed, and
         // the heap they came from may be released before the next job.
         slab.flushMagazines();

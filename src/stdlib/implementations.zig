@@ -20,6 +20,7 @@ pub const control = @import("implementations/control.zig");
 pub const exceptions = @import("implementations/exceptions.zig");
 pub const io = @import("implementations/io.zig");
 pub const math = @import("implementations/math.zig");
+pub const native_ref = @import("implementations/native_ref.zig");
 pub const numeric = @import("implementations/numeric.zig");
 pub const random = @import("implementations/random.zig");
 pub const ranges = @import("implementations/ranges.zig");
@@ -118,6 +119,13 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.__klioMonitorEnter", .f = concurrent.concurrent_monitor_enter },
     .{ .fqn = "kotlin.__klioMonitorExit", .f = concurrent.concurrent_monitor_exit },
     .{ .fqn = "kotlin.concurrent.thread", .f = concurrent.concurrent_thread },
+    .{ .fqn = "kotlin.native.ref.__klio_weakNew", .f = native_ref.weak_new },
+    .{ .fqn = "kotlin.native.ref.__klio_weakGet", .f = native_ref.weak_get },
+    .{ .fqn = "kotlin.native.ref.__klio_cleanerRegister", .f = native_ref.cleaner_register },
+    .{ .fqn = "kotlin.native.ref.__klio_cleanerTake", .f = native_ref.cleaner_take },
+    .{ .fqn = "kotlin.native.runtime.__klio_gcCollect", .f = native_ref.gc_collect },
+    .{ .fqn = "klio.ref.registerNativeFinalizer", .f = native_ref.native_finalizer_register },
+    .{ .fqn = "klio.ref.runNativeFinalizer", .f = native_ref.native_finalizer_run },
     .{ .fqn = "klio.Thread.sleep", .f = concurrent.concurrent_thread_sleep },
     .{ .fqn = "klio.Thread.currentThread", .f = concurrent.concurrent_thread_current },
     .{ .fqn = "kotlin.time.__klio_time_systemMillis", .f = time.time_system_millis },

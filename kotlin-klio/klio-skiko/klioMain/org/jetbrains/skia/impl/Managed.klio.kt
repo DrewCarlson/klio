@@ -1,9 +1,12 @@
 // skiko's managed and reference-counted peers on klio. The finalizer is the
-// C glue's delete for the peer's type; close() runs it, as the desktop's does.
-// The collector does not run finalizers, so a peer that is never closed keeps
-// its native object.
+// C glue's delete for the peer's type; it runs once, by close() or after a
+// collection frees the peer, as skiko's native target has it. Native skiko
+// frees through a cleaner; klio registers the finalizer with the runtime
+// directly, which frees the object on the sweeper thread with no Kotlin code.
 package org.jetbrains.skia.impl
 
+import klio.ref.registerNativeFinalizer
+import klio.ref.runNativeFinalizer
 import org.jetbrains.skia.ExternalSymbolName
 
 actual class NativePointerArray actual constructor(size: Int) {
@@ -20,21 +23,31 @@ actual class NativePointerArray actual constructor(size: Int) {
 
 actual abstract class Managed actual constructor(
     ptr: NativePointer,
-    private val finalizer: NativePointer,
-    private val managed: Boolean,
+    finalizer: NativePointer,
+    managed: Boolean,
 ) : Native(ptr) {
+    private val finalization: Long = if (managed) {
+        require(ptr != NullPointer) { "Managed ptr is nullptr" }
+        require(finalizer != NullPointer) { "Managed finalizer is nullptr" }
+        registerNativeFinalizer(this, finalizer, ptr)
+    } else 0L
+
     actual open fun close() {
-        if (_ptr == NullPointer) {
-            throw RuntimeException("Object already closed: ${this::class.simpleName}, _ptr=$_ptr")
+        require(_ptr != NullPointer) {
+            "Object already closed: ${this::class.simpleName}, _ptr=$_ptr"
         }
-        if (!managed) {
-            throw RuntimeException("Object is not managed, can't close(): ${this::class.simpleName}, _ptr=$_ptr")
+        require(finalization != 0L) {
+            "Object is not managed in K/N runtime, can't close(): ${this::class.simpleName}, _ptr=$_ptr"
         }
-        Managed_invokeFinalizer(finalizer, _ptr)
+        val ran = runNativeFinalizer(finalization)
+        require(ran) {
+            "Object is closed already, can't close(): ${this::class.simpleName}, _ptr=$_ptr"
+        }
         _ptr = NullPointer
     }
 
-    actual open val isClosed: Boolean get() = _ptr == NullPointer
+    actual open val isClosed: Boolean
+        get() = _ptr == NullPointer
 }
 
 actual abstract class RefCnt : Managed {

@@ -384,6 +384,7 @@ Run any program with:
 | `jit_recursion.kt` | Recursive scalar functions with no enclosing loop (`fib`, `fact`, Ackermann, mutual `isEven`/`isOdd`); a recursive function that eventually divides by zero raises a catchable `ArithmeticException`. |
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 | `jvm_string_bytes_format.kt` | The JVM `String` surface the common stdlib does not declare: `toByteArray()` and `String(bytes)` / `String(bytes, offset, length)` in UTF-8 (a cut sequence decodes to U+FFFD), `"x=%d".format(7)` and `String.format(...)`, and `toSortedMap()` with natural order or a comparator (keys the comparator finds equal are one entry: the first key, the last value). |
+| `weak_references.kt` | Kotlin/Native's `kotlin.native.ref`: a `WeakReference` answers its referent while something else holds it and null once `GC.collect()` frees it, so a weak cache keeps only the images still in use; `clear()` and `value`; `createCleaner` runs each action on the cleaner thread after its owner is collected. The JVM has no `kotlin.native.ref`, so kotlinc cannot run it: the expected output is Kotlin/Native's documented behaviour. |
 
 ## Integration showcases
 

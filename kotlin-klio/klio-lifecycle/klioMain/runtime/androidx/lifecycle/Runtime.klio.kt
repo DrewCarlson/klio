@@ -5,11 +5,10 @@
  * you may not use this file except in compliance with the License.
  */
 
-// lifecycle-runtime's MainDispatcherChecker and WeakReference on klio. The
-// checker is the desktop's, over klio.Thread in place of java.lang.Thread: the
-// main dispatcher's thread is found by running on Dispatchers.Main.immediate
-// and asked again when the calling thread differs. The collector has no weak
-// references, so the reference is strong, as the other klio packs' are.
+// lifecycle-runtime's MainDispatcherChecker on klio: the desktop's, over
+// klio.Thread in place of java.lang.Thread. The main dispatcher's thread is
+// found by running on Dispatchers.Main.immediate and asked again when the
+// calling thread differs.
 package androidx.lifecycle
 
 import kotlin.concurrent.Volatile
@@ -37,10 +36,4 @@ internal object MainDispatcherChecker {
         updateMainDispatcherThread()
         return !isMainDispatcherAvailable || currentThread === mainDispatcherThread
     }
-}
-
-internal actual class WeakReference<T : Any> actual constructor(reference: T) {
-    private val referent: T = reference
-
-    actual fun get(): T? = referent
 }

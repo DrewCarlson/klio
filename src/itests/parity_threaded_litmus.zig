@@ -143,6 +143,7 @@ const RUNNABLE = [_][]const u8{
     "tl_gc_sweep_promote",
     "tl_gc_major_slices",
     "tl_gc_major_concurrent",
+    "tl_gc_weak_cleaner",
     "tl_io_elastic",
     "tl_limited_one",
     "tl_limited_timeout",
@@ -288,6 +289,9 @@ test "tl_unconfined_delay" {
 }
 test "tl_unconfined_resume_inline" {
     try check("tl_unconfined_resume_inline");
+}
+test "tl_gc_weak_cleaner" {
+    try check("tl_gc_weak_cleaner");
 }
 test "tl_dispatcher_names" {
     try check("tl_dispatcher_names");

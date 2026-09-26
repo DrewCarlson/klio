@@ -96,6 +96,10 @@ sparse=(
   "compose/runtime/runtime/src/desktopMain"
   "compose/runtime/runtime/src/jvmAndAndroidMain"
   "compose/runtime/runtime/src/nonJvmMain"
+  # nativeMain: the WeakReference actuals over kotlin.native.ref.
+  "compose/runtime/runtime/src/nativeMain"
+  "compose/ui/ui/src/nativeMain"
+  "compose/ui/ui-text/src/nativeMain"
   # The back-event dispatch the ui's Popup and Dialog register with.
   "navigationevent/navigationevent/src/commonMain"
   "navigationevent/navigationevent/src/jvmAndAndroidMain"

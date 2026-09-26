@@ -44,8 +44,13 @@ include = [
     "androidx/compose/runtime/snapshots/SnapshotId.jvmAndAndroid.kt",
 ]
 
+# nativeMain: the weak reference, over kotlin.native.ref.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/runtime/runtime/src/nativeMain/kotlin"
+include = ["androidx/compose/runtime/internal/WeakReference.native.kt"]
+
 # klio's layer: the platform actuals no shipped upstream source set covers
-# here (thread ids, identity hash, weak reference, locks, the desktop frame
+# here (thread ids, identity hash, locks, the desktop frame
 # clock, error logging), the runtime-annotation and runtime-retain surfaces,
 # and the host-intrinsic entrypoints (backed by src/compose_runtime).
 [[source]]
