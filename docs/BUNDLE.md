@@ -169,11 +169,28 @@ under it); an explicit `:mount` overrides it. Resources are served
 straight from the executable's memory map (zstd-compressed entries
 decompress on read).
 
-Reading a path that was not bundled throws
-``IllegalArgumentException: no bundled resource at `path` ``;
-calling `readBytes`/`readText` outside a bundle (for example under
-`klio run`) throws
-`IllegalStateException: no resources are bundled with this program`.
+`klio run` takes the same `--include <path[:mount]>` flags, and a
+project's `[application] include`, and serves those files from disk at
+the same mount paths, so a program reads its resources the same way run
+or bundled, as a JVM program reads its classpath resources from a
+directory or from its jar:
+
+```sh
+$ klio run app/main.kt --include app/assets
+args: 
+hello from a bundled resource
+[assets/greeting.txt]
+false
+```
+
+Compose's resource loaders (`painterResource`, `useResource`) read
+through the same table.
+
+Reading a path no include names throws
+``IllegalArgumentException: no resource is included at `path` ``;
+calling `readBytes`/`readText` in a program with no includes throws
+`IllegalStateException: no resources are included with this program
+(`--include` or the manifest's [application] include)`.
 
 ## Project mode
 

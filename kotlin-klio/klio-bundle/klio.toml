@@ -1,10 +1,9 @@
-# klio.bundle — the embedded-resource surface of a bundled program.
-#
-# `klio bundle --include` embeds files into the executable's resource
-# table; a program reads them back through `klio.bundle.Resources`. The
-# object methods delegate to the interpreter's `__klio_bundle_*` host
-# intrinsics (auto-bound below), which serve the bytes straight from the
-# bundle's mmap. Outside a bundle, `readBytes`/`readText` throw
+# klio.bundle: a program's resources. `klio bundle --include` embeds files
+# into the executable's resource table, and `klio run --include` (or the
+# manifest's [application] include) serves the same files from disk; a
+# program reads them through `klio.bundle.Resources`. The object methods
+# delegate to the interpreter's `__klio_bundle_*` host intrinsics
+# (auto-bound below). With no includes, `readBytes`/`readText` throw
 # IllegalStateException, `list()` is empty, and `exists()` is false.
 [library]
 id = "klio.bundle"

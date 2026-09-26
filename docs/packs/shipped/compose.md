@@ -20,7 +20,7 @@ each upstream module is its own pack.
 | `androidx.compose.ui.text`           | ui/ui-text                     | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, skiko, coroutines |
 | `androidx.navigationevent`           | navigationevent/navigationevent | runtime, annotation, collection, coroutines, atomicfu   |
 | `androidx.navigationevent.compose`   | navigationevent/navigationevent-compose | runtime, navigationevent, coroutines            |
-| `androidx.compose.ui`                | ui/ui                          | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, ui.text, navigationevent, navigationevent.compose, lifecycle (runtime-compose, viewmodel), lifecycle.viewmodel.compose, lifecycle.viewmodel.savedstate, savedstate (compose), skiko, coroutines |
+| `androidx.compose.ui`                | ui/ui                          | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, ui.text, navigationevent, navigationevent.compose, lifecycle (runtime-compose, viewmodel), lifecycle.viewmodel.compose, lifecycle.viewmodel.savedstate, savedstate (compose), skiko, coroutines, klio.bundle, klio.xml |
 | `androidx.compose.ui.test`           | ui/ui-test                     | runtime, runtime.saveable, ui, ui.*, skiko, coroutines (test), atomicfu |
 | `androidx.compose.ui.backhandler`    | ui/ui-backhandler              | runtime, ui.util, annotation, navigationevent, navigationevent.compose, coroutines |
 | `androidx.compose.animation.core`    | animation/animation-core       | runtime, ui, ui.unit, ui.util, ui.geometry, ui.graphics, collection, coroutines |
@@ -89,6 +89,13 @@ signature:
   desktopMain files, and the runtime's jvmAndAndroidMain actuals that are
   plain Kotlin over kotlinx.coroutines (the tracing context and snapshot
   context element are `ThreadContextElement`s, as on the desktop).
+- ui's resource loaders (`painterResource`, `useResource`, `loadSvgPainter`,
+  `loadXmlImageVector`, `loadImageBitmap`) are upstream's desktop sources
+  with `klio.io.InputStream` and `klio.xml` in place of `java.io` and the
+  JVM's XML APIs; a resource is read from the program's includes
+  (`klio.bundle.Resources`: `--include` or the manifest's
+  `[application] include`, served from disk under `klio run` and from the
+  executable in a bundle) where the JVM reads its classpath.
 - material3's platform half is upstream's skikoMain and nonJvmMain (dialogs,
   menus, the bottom sheet, tooltips, strings with their translations, the
   kotlinx-datetime calendar model). Its `CalendarLocale` is the ui text

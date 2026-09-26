@@ -43,6 +43,7 @@ const PackCmd = pack_build.PackCmd;
 const unimplemented = @import("unimplemented.zig");
 
 pub const bundle = @import("bundle.zig");
+const includes = @import("includes.zig");
 pub const mem_census = @import("mem_census.zig");
 const bundle_boot = @import("bundle_boot.zig");
 
@@ -402,6 +403,8 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     defer files.deinit(gpa);
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
+    var resource_includes: std.ArrayList(includes.Include) = .empty;
+    defer resource_includes.deinit(gpa);
     var virtual_time = false;
 
     var i: usize = 0;
@@ -421,6 +424,15 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, args[i]) catch return 2;
         } else if (optionValue(a, "--feature=")) |v| {
             feature_specs.append(gpa, v) catch return 2;
+        } else if (std.mem.eql(u8, a, "--include")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, "error: --include requires a `<path[:mount]>` value\n", .{});
+                return 2;
+            }
+            resource_includes.append(gpa, includes.parse(args[i])) catch return 2;
+        } else if (optionValue(a, "--include=")) |v| {
+            resource_includes.append(gpa, includes.parse(v)) catch return 2;
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
         } else if (perfOptValue(a, args, &i)) |v| {
@@ -448,6 +460,19 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     // run of that project, not only when the command line repeats it.
     for (project.declaredFeatureSpecs(gpa, files.items)) |spec| {
         feature_specs.append(gpa, spec) catch return 2;
+    }
+    // The program's resources, as its bundle would carry them.
+    for (project.declaredIncludes(gpa, files.items)) |inc| {
+        resource_includes.append(gpa, includes.parse(inc)) catch return 2;
+    }
+    if (resource_includes.items.len != 0) {
+        var threaded: std.Io.Threaded = .init(gpa, .{});
+        defer threaded.deinit();
+        var failed: ?[]const u8 = null;
+        if (!includes.serveFromDisk(gpa, threaded.io(), resource_includes.items, files.items[0], &failed)) {
+            printErr(gpa, "error: cannot read --include `{s}`\n", .{failed orelse ""});
+            return 2;
+        }
     }
     return sema_run.run(gpa, files.items, feature_specs.items);
 }
@@ -1007,6 +1032,7 @@ test {
     std.testing.refAllDecls(repl);
     std.testing.refAllDecls(test_report);
     std.testing.refAllDecls(io);
+    std.testing.refAllDecls(@import("includes.zig"));
     std.testing.refAllDecls(bundle);
     std.testing.refAllDecls(bundle_boot);
     std.testing.refAllDecls(@import("stub_fetch.zig"));

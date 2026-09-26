@@ -1,0 +1,6 @@
+[run_resources/greeting.txt, run_resources/notes.txt]
+hello from an included file
+18
+true
+false
+missing: no resource is included at `run_resources/missing.txt`

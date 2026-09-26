@@ -292,7 +292,7 @@ test "resources round-trip: text, bytes, exists, list, missing throws" {
         \\config-line-1
         \\config-line-2
         \\4096 {d}
-        \\missing: no bundled resource at `missing.txt`
+        \\missing: no resource is included at `missing.txt`
         \\
     , .{sum});
     try std.testing.expectEqualStrings(expected, got.stdout);

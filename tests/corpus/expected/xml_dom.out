@@ -1,0 +1,15 @@
+vector (null, vector)
+  path (null, path)
+  aapt:attr (http://schemas.android.com/aapt, attr)
+    gradient (null, gradient)
+  label (null, label)
+    text "1 < 2 && A<raw>"
+24dp
+[]
+24dp
+android
+p:b
+not well-formed: </a> closes <b> (line 1, column 10)
+not well-formed: an attribute value must be quoted (line 1, column 6)
+not well-formed: the entity &nope; is not declared (line 1, column 10)
+not well-formed: the document has no root element (line 1, column 1)

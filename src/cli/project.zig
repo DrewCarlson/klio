@@ -317,6 +317,22 @@ pub fn declaredFeatureSpecs(a: Allocator, paths: []const []const u8) []const []c
     return out.items;
 }
 
+/// The `[application] include` entries of the manifest owning `paths`, each
+/// `path[:mount]` with its path joined to the project directory: the
+/// resources `klio run` serves the program, as its bundle would carry them.
+pub fn declaredIncludes(a: Allocator, paths: []const []const u8) []const []const u8 {
+    const owner = owningManifest(a, paths) orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (owner.cfg.application.include) |inc| {
+        const joined = if (std.mem.findScalarLast(u8, inc, ':')) |colon|
+            std.fmt.allocPrint(a, "{s}:{s}", .{ std.fs.path.join(a, &.{ owner.dir, inc[0..colon] }) catch continue, inc[colon + 1 ..] }) catch continue
+        else
+            std.fs.path.join(a, &.{ owner.dir, inc }) catch continue;
+        out.append(a, joined) catch continue;
+    }
+    return out.items;
+}
+
 /// Libraries the running command needs whatever the project declares. `klio
 /// test` runs `kotlin.test`: its `@Test` and assertions are the runner's own
 /// dependency, so a library's test sources resolve them without the manifest

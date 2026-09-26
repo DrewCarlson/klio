@@ -1,0 +1,15 @@
+# klio.xml: the part of the JVM's XML APIs (javax.xml.parsers, org.w3c.dom,
+# org.xml.sax) that a namespace-aware DOM parse needs, under klio's name:
+# a document builder, the document tree it builds, and its input. Compose's
+# XML vector loader parses through it.
+[library]
+id = "klio.xml"
+version = "0.1.0"
+abi = 1
+implicit_packages = []
+
+[[source]]
+root = "klioMain"
+
+[deps]
+stdlib = "*"

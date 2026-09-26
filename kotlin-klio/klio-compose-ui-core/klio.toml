@@ -95,4 +95,8 @@ stdlib = "*"
 "kotlinx.coroutines" = "*"
 "androidx.navigationevent" = "*"
 "androidx.navigationevent.compose" = "*"
+# The program's resources, which painterResource and useResource read, and
+# the XML parser the vector drawable loader parses with.
+"klio.bundle" = "*"
+"klio.xml" = "*"
 

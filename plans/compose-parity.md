@@ -148,10 +148,12 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
     expression and local class is a KClass of its own, so Compose's node
     kind cache no longer shares one entry across anonymous nodes.
 11. The skiko UI's desktop half, in this order: (a) done: the input method
-    and the system theme (below); (b) the resource loaders (ui desktopMain
-    res/: painterResource, loadSvgPainter over skia's SVGDOM,
-    loadXmlImageVector, loadImageBitmap, which need an InputStream, a
-    resource lookup and an XML DOM); done: foundation's TooltipArea and
+    and the system theme (below); (b) done: the resource loaders (ui
+    desktopMain res/ with klio.io.InputStream and the klio.xml pack for
+    java.io and the JVM's XML APIs, reading the program's includes, which
+    `klio run --include` now serves from disk as a bundle serves them from
+    the executable; compose_resources draws what Compose Desktop draws from
+    the same files on its classpath); done: foundation's TooltipArea and
     ContextMenuProvider as they are, BasicContextMenuRepresentation and
     text/ContextMenu without their Swing menus (a text field's context menu
     is upstream's), and WindowDraggableArea over a klio window's move with
@@ -254,7 +256,7 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 |--------|-----------:|----------:|-----------:|------------------------:|
 | runtime | 188 / 188 | n/a | 6 / 9, nonAndroid 10 / 10 | jvmAndAndroid 3 java-free; klio actuals |
 | runtime-saveable | 9 / 9 | n/a | n/a | n/a |
-| ui | 244 / 244 | 92 / 92 | 8 / 8 | 89 / 175 |
+| ui | 244 / 244 | 92 / 92 | 8 / 8 | 96 / 175 |
 | ui-graphics | 82 / 82 | 19 / 19, skikoExcludingWeb 1 / 1 | 1 / 1 | 0 / 7 |
 | ui-text | 79 / 79 | 28 / 28 | 5 / 5, native 6 / 6 | 0 / 15 |
 | ui-unit, ui-util, ui-geometry | complete | n/a | complete, ui-unit nonAndroid 2 / 2 | n/a |
@@ -281,8 +283,8 @@ text/ContextMenu without JPopupContextMenuRepresentation and JPopupTextMenu;
 WindowDraggableArea over a klio window.
 
 Public API still missing: runtime-retain's `retain`, `RetainedEffect` and
-the stores; ui's resource loaders; foundation's Swing-only
-`JPopupContextMenuRepresentation` and `JPopupTextMenu`.
+the stores; foundation's Swing-only `JPopupContextMenuRepresentation` and
+`JPopupTextMenu`.
 
 ## Platforms
 
@@ -611,3 +613,8 @@ isTraySupported is false), and running on Windows.
   are upstream's, their popups placed by ui's DesktopPopup position
   providers (Compose Desktop prints the same for both examples), and
   WindowDraggableArea moves a klio window with the mouse.
+- 2026-09-26: ui's resource loaders run. painterResource reads SVGs through
+  skia's SVG DOM, vector drawables through the new klio.xml pack, and
+  bitmaps, from the program's includes: `klio run --include` (or the
+  manifest's `[application] include`) serves them from disk at the mount
+  paths a bundle embeds them at. klio.io.InputStream is in the stdlib.

@@ -1,8 +1,10 @@
-// Embedded resources of a bundled program (`klio bundle --include`).
+// A program's resources: the files `--include` (or the manifest's
+// `[application] include`) names, embedded in its bundle or, under `klio
+// run`, read from disk.
 //
 // The `__klio_bundle_*` bodies below are inert stubs; the interpreter's
 // host bindings shadow them at dispatch and serve the real bytes from
-// the running bundle's resource table.
+// the program's resource table.
 package klio.bundle
 
 internal fun __klio_bundle_readBytes(path: String): ByteArray = ByteArray(0)
@@ -11,13 +13,14 @@ internal fun __klio_bundle_exists(path: String): Boolean = false
 internal fun __klio_bundle_list(): List<String> = emptyList()
 
 /**
- * Read access to the files embedded in this program's bundle.
+ * Read access to this program's resources: the files embedded in its
+ * bundle, or under `klio run` the same files read from disk.
  *
- * Mount paths are the ones recorded at bundle time (`--include
- * <path[:mount]>`, defaulting to the path relative to the main source's
- * directory). Reading a path that was not bundled throws
- * [IllegalArgumentException]; calling [readBytes]/[readText] outside a
- * bundle throws [IllegalStateException].
+ * Mount paths are the ones `--include <path[:mount]>` gives, defaulting to
+ * the path relative to the main source's directory. Reading a path no
+ * include names throws [IllegalArgumentException]; calling
+ * [readBytes]/[readText] when the program has no includes throws
+ * [IllegalStateException].
  */
 object Resources {
     /** The raw bytes of the resource mounted at [path]. */
@@ -29,6 +32,6 @@ object Resources {
     /** Whether a resource is mounted at [path]. */
     fun exists(path: String): Boolean = __klio_bundle_exists(path)
 
-    /** Every mount path in the bundle, sorted. */
+    /** Every mount path, sorted. */
     fun list(): List<String> = __klio_bundle_list()
 }

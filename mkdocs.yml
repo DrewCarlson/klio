@@ -83,6 +83,7 @@ nav:
       - io.ktor: packs/shipped/ktor.md
       - androidx.compose.runtime: packs/shipped/compose-runtime.md
       - Compose packs: packs/shipped/compose.md
+      - klio.xml: packs/shipped/xml.md
   - Development:
     - Workspace Layout: development/workspace.md
     - Testing: development/testing.md

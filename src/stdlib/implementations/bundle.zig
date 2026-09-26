@@ -1,6 +1,6 @@
-//! `klio.bundle.*` intrinsics: the embedded-resource surface a bundled
-//! program reads through `klio.bundle.Resources`, plus
-//! `kotlin.system.exitProcess`.
+//! `klio.bundle.*` intrinsics: the resources a program reads through
+//! `klio.bundle.Resources` (a bundle's embedded ones, or under `klio run` the
+//! files its includes name), plus `kotlin.system.exitProcess`.
 //! The Kotlin side lives in the `klio.bundle` pack, whose thin object methods
 //! delegate to these `__klio_bundle_*` functions.
 
@@ -41,14 +41,19 @@ fn pathArg(ctx: *CallCtx) ?[]const u8 {
 
 fn resourceBytes(ctx: *CallCtx, path: []const u8) Allocator.Error!union(enum) { bytes: []const u8, err: EvalResult } {
     if (!bundle_resources.isActive()) {
-        return .{ .err = try thrown(ctx.allocator, "kotlin.IllegalStateException", "no resources are bundled with this program") };
+        return .{ .err = try thrown(ctx.allocator, "kotlin.IllegalStateException", "no resources are included with this program (`--include` or the manifest's [application] include)") };
     }
     const entry = bundle_resources.find(path) orelse {
-        const msg = try std.fmt.allocPrint(ctx.allocator, "no bundled resource at `{s}`", .{path});
+        const msg = try std.fmt.allocPrint(ctx.allocator, "no resource is included at `{s}`", .{path});
         defer if (runtime.freeScratch()) ctx.allocator.free(msg);
         return .{ .err = try thrown(ctx.allocator, "kotlin.IllegalArgumentException", msg) };
     };
     const bytes = (try bundle_resources.read(ctx.allocator, entry)) orelse {
+        if (entry.path) |file| {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "cannot read `{s}`, included at `{s}`", .{ file, path });
+            defer if (runtime.freeScratch()) ctx.allocator.free(msg);
+            return .{ .err = try thrown(ctx.allocator, "kotlin.IllegalStateException", msg) };
+        }
         return .{ .err = try thrown(ctx.allocator, "kotlin.IllegalStateException", "bundled resource is corrupt; rebundle") };
     };
     return .{ .bytes = bytes };

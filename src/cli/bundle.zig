@@ -19,6 +19,7 @@ const stdlib = @import("stdlib");
 const io = @import("io.zig");
 const pack_cache = @import("pack_cache.zig");
 const project = @import("project.zig");
+const includes = @import("includes.zig");
 const macho_sign = @import("macho_sign.zig");
 const lower_driver = @import("lower_driver");
 const sema_cmd = @import("sema_cmd.zig");
@@ -43,10 +44,7 @@ pub const Options = struct {
     feature_specs: std.ArrayList([]const u8) = .empty,
 };
 
-pub const Include = struct {
-    path: []const u8,
-    mount: []const u8,
-};
+pub const Include = includes.Include;
 
 const USAGE =
     \\usage: klio bundle <main.kt | project-dir> [options]
@@ -135,12 +133,7 @@ fn flagValue(
     return null;
 }
 
-fn parseInclude(val: []const u8) Include {
-    if (std.mem.findScalarLast(u8, val, ':')) |colon| {
-        return .{ .path = val[0..colon], .mount = val[colon + 1 ..] };
-    }
-    return .{ .path = val, .mount = "" };
-}
+const parseInclude = includes.parse;
 
 fn usageErr(gpa: Allocator, msg: []const u8) u8 {
     io.printStderr(gpa, "error: {s}\n\n{s}", .{ msg, USAGE });
@@ -483,40 +476,11 @@ fn collectInclude(
     blob: *std.ArrayList(u8),
     entries: *std.ArrayList(bf.ResourceEntry),
 ) bool {
-    const cwd = std.Io.Dir.cwd();
-    const mount_root = if (inc.mount.len != 0) inc.mount else defaultMount(inc.path, main_path);
-    if (isDirectory(fio, inc.path)) {
-        var dir = cwd.openDir(fio, inc.path, .{ .iterate = true }) catch return false;
-        defer dir.close(fio);
-        var walker = dir.walk(arena) catch return false;
-        defer walker.deinit();
-        var rels: std.ArrayList([]const u8) = .empty;
-        while (walker.next(fio) catch return false) |entry| {
-            if (entry.kind != .file) continue;
-            rels.append(arena, arena.dupe(u8, entry.path) catch return false) catch return false;
-        }
-        // Sort for deterministic output (readdir order is not stable).
-        std.mem.sort([]const u8, rels.items, {}, struct {
-            fn lt(_: void, x: []const u8, y: []const u8) bool {
-                return std.mem.lessThan(u8, x, y);
-            }
-        }.lt);
-        for (rels.items) |rel| {
-            const full = std.fs.path.join(arena, &.{ inc.path, rel }) catch return false;
-            const mount = std.fmt.allocPrint(arena, "{s}/{s}", .{ mount_root, rel }) catch return false;
-            if (!appendResource(arena, fio, full, mount, blob, entries)) return false;
-        }
-        return true;
+    const list = includes.files(arena, fio, inc, main_path) orelse return false;
+    for (list) |f| {
+        if (!appendResource(arena, fio, f.path, f.mount, blob, entries)) return false;
     }
-    return appendResource(arena, fio, inc.path, mount_root, blob, entries);
-}
-
-fn defaultMount(path: []const u8, main_path: []const u8) []const u8 {
-    const dir = std.fs.path.dirname(main_path) orelse "";
-    if (dir.len != 0 and std.mem.startsWith(u8, path, dir) and path.len > dir.len and path[dir.len] == '/') {
-        return path[dir.len + 1 ..];
-    }
-    return std.fs.path.basename(path);
+    return true;
 }
 
 fn appendResource(
@@ -873,8 +837,8 @@ test "parseInclude splits path:mount" {
 }
 
 test "defaultMount is main-relative, else basename" {
-    try std.testing.expectEqualStrings("assets/a.txt", defaultMount("app/assets/a.txt", "app/main.kt"));
-    try std.testing.expectEqualStrings("a.txt", defaultMount("elsewhere/a.txt", "app/main.kt"));
+    try std.testing.expectEqualStrings("assets/a.txt", includes.defaultMount("app/assets/a.txt", "app/main.kt"));
+    try std.testing.expectEqualStrings("a.txt", includes.defaultMount("elsewhere/a.txt", "app/main.kt"));
 }
 
 test "programOpensWindow finds Compose's window entry points" {

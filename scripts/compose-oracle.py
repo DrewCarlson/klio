@@ -22,6 +22,10 @@ Options:
                     output for a new example)
   --klio BIN        the klio binary (default: zig-out/bin/klio-harness)
 
+An example's `--include` files (from its `Run with:` header) go on the JVM's
+classpath at the paths klio mounts them at, so painterResource and
+useResource read the same files on both.
+
 The klio run inherits the environment, so KLIO_HOME selects the installed
 packs (scripts/klio-local.sh's .klio-local for local pack work). It runs
 with KLIO_CLIPBOARD=none, as the headless JVM has no system clipboard, and an
@@ -38,6 +42,7 @@ import argparse
 import difflib
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -229,7 +234,34 @@ def main_class(src, name):
     return cls
 
 
+def stage_includes(src, work):
+    """The example's `--include <path[:mount]>` files copied under a directory
+    at their mount paths, as klio serves them, so the JVM reads them as
+    classpath resources at the same paths; None when it includes nothing."""
+    flags = run_flags(src)
+    includes = [flags[i + 1] for i, f in enumerate(flags[:-1]) if f == "--include"]
+    includes += [f[len("--include="):] for f in flags if f.startswith("--include=")]
+    if not includes:
+        return None
+    out = os.path.join(work, "resources")
+    shutil.rmtree(out, ignore_errors=True)
+    main_dir = os.path.dirname(src)
+    for inc in includes:
+        path, _, mount = inc.rpartition(":") if ":" in inc else (inc, "", "")
+        path = os.path.join(ROOT, path)
+        if not mount:
+            rel = os.path.relpath(path, os.path.join(ROOT, main_dir))
+            mount = rel if not rel.startswith("..") else os.path.basename(path)
+        if os.path.isdir(path):
+            shutil.copytree(path, os.path.join(out, mount), dirs_exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(os.path.join(out, mount)), exist_ok=True)
+            shutil.copyfile(path, os.path.join(out, mount))
+    return out
+
+
 def run_jvm(src, name, kc, cp):
+    src_path = src
     work = os.path.join(ORACLE_HOME, "work", name)
     classes = os.path.join(work, "classes")
     os.makedirs(work, exist_ok=True)
@@ -264,7 +296,9 @@ def run_jvm(src, name, kc, cp):
     cmd = [java, "-Djava.awt.headless=true",
            "-Dskiko.data.path=" + os.path.join(ORACLE_HOME, "skiko-data")]
     cmd += os.environ.get("JAVA_OPTS", "").split()
-    cmd += ["-cp", classes + ":" + cpath, main_class(src, name)]
+    resources = stage_includes(src_path, work)
+    run_cp = classes + ":" + (resources + ":" if resources else "") + cpath
+    cmd += ["-cp", run_cp, main_class(src, name)]
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     with open(os.path.join(work, "jvm.txt"), "w") as f:
         f.write(p.stdout)
