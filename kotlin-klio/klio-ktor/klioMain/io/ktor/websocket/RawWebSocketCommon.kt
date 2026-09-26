@@ -1,0 +1,323 @@
+/*
+ * Copyright 2014-2026 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+ */
+
+// klio's copy of ktor-websockets' RawWebSocketCommon.kt with two changes,
+// each marked where it is made, that make the session send what the JVM's
+// RawWebSocket sends and RFC 6455 requires. Everything else is upstream's.
+
+package io.ktor.websocket
+
+import io.ktor.util.cio.*
+import io.ktor.utils.io.*
+import io.ktor.utils.io.core.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.*
+import kotlinx.io.*
+import kotlin.coroutines.*
+import kotlin.random.*
+
+/**
+ * Creates a RAW web socket session from connection.
+ *
+ *
+ * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.websocket.RawWebSocket)
+ *
+ * @param input is a [ByteReadChannel] of connection
+ * @param output is a [ByteWriteChannel] of connection
+ * @param maxFrameSize is an initial [maxFrameSize] value for [WebSocketSession]
+ * @param masking is an initial [masking] value for [WebSocketSession]
+ * @param coroutineContext is a [CoroutineContext] to execute reading/writing from/to connection
+ * @param channelsConfig is a [WebSocketChannelsConfig] for the incoming and outgoing [Frame] queues
+ */
+@Suppress("FunctionName")
+public expect fun RawWebSocket(
+    input: ByteReadChannel,
+    output: ByteWriteChannel,
+    maxFrameSize: Long = Int.MAX_VALUE.toLong(),
+    masking: Boolean = false,
+    coroutineContext: CoroutineContext,
+    channelsConfig: WebSocketChannelsConfig = WebSocketChannelsConfig.UNLIMITED,
+): WebSocketSession
+
+@OptIn(InternalAPI::class)
+internal class RawWebSocketCommon(
+    private val input: ByteReadChannel,
+    private val output: ByteWriteChannel,
+    override var maxFrameSize: Long = Int.MAX_VALUE.toLong(),
+    override var masking: Boolean = false,
+    coroutineContext: CoroutineContext,
+    channelsConfig: WebSocketChannelsConfig,
+) : WebSocketSession {
+    private val socketJob: CompletableJob = Job(coroutineContext[Job])
+    override val coroutineContext: CoroutineContext = coroutineContext + socketJob + CoroutineName("raw-ws")
+
+    private val _incoming = Channel.from<Frame>(channelsConfig.incoming)
+    private val _outgoing = Channel.from<Any>(channelsConfig.outgoing)
+
+    private var lastOpcode = 0
+
+    // klio: the data frame type of the fragmented message being sent, as the
+    // JVM's Serializer tracks it. RFC 6455 sends every fragment after the
+    // first with the continuation opcode (0); upstream's native writer
+    // repeated the data opcode, which a conforming peer (and this session's
+    // own reader) rejects as a new message started inside the previous one.
+    private var lastOutgoingDataType: FrameType? = null
+    override val incoming: ReceiveChannel<Frame> get() = _incoming
+    override val outgoing: SendChannel<Frame> get() = _outgoing
+    override val extensions: List<WebSocketExtension<*>> get() = emptyList()
+
+    private val writerJob = launch(context = CoroutineName("ws-writer"), start = CoroutineStart.ATOMIC) {
+        try {
+            mainLoop@ while (true) {
+                when (val message = _outgoing.receive()) {
+                    is Frame -> {
+                        output.writeFrame(message, masking, outgoingOpcode(message))
+                        output.flush()
+                        if (message is Frame.Close) break@mainLoop
+                    }
+
+                    is FlushRequest -> {
+                        message.complete()
+                    }
+
+                    else -> throw IllegalArgumentException("unknown message $message")
+                }
+            }
+            _outgoing.close()
+        } catch (cause: ChannelWriteException) {
+            _outgoing.close(CancellationException("Failed to write to WebSocket.", cause))
+        } catch (t: Throwable) {
+            _outgoing.close(t)
+        } finally {
+            _outgoing.close(CancellationException("WebSocket closed.", null))
+
+            output.flushAndClose()
+        }
+
+        while (true) {
+            when (val message = _outgoing.tryReceive().getOrNull() ?: break) {
+                is FlushRequest -> message.complete()
+                else -> {}
+            }
+        }
+    }
+
+    init {
+        launch(CoroutineName("ws-reader"), start = CoroutineStart.ATOMIC) {
+            try {
+                while (true) {
+                    val frame = input.readFrame(maxFrameSize, lastOpcode)
+                    if (!frame.frameType.controlFrame) {
+                        lastOpcode = if (frame.fin) 0 else frame.frameType.opcode
+                    }
+                    _incoming.send(frame)
+                }
+            } catch (cause: FrameTooBigException) {
+                // klio: the Close frame is queued before `incoming` fails, as
+                // the JVM's RawWebSocket does. Failing `incoming` first lets
+                // the handler fail and cancel the session before the writer
+                // takes the Close, so the peer never learns why.
+                val reason = CloseReason.truncated(CloseReason.Codes.TOO_BIG, cause.message)
+                outgoing.trySend(Frame.Close(reason))
+                _incoming.close(cause)
+            } catch (cause: ProtocolViolationException) {
+                // same as above
+                val reason = CloseReason.truncated(CloseReason.Codes.PROTOCOL_ERROR, cause.message)
+                outgoing.trySend(Frame.Close(reason))
+                _incoming.close(cause)
+            } catch (_: CancellationException) {
+                _incoming.cancel()
+            } catch (_: EOFException) {
+                // no more bytes is possible to read
+            } catch (_: ClosedReceiveChannelException) {
+                // no more bytes is possible to read
+            } catch (cause: Throwable) {
+                _incoming.close(cause)
+                throw cause
+            } finally {
+                _incoming.close()
+            }
+        }
+    }
+
+    init {
+        socketJob.complete()
+    }
+
+    override suspend fun flush(): Unit = FlushRequest(coroutineContext[Job]).also {
+        try {
+            _outgoing.send(it)
+        } catch (_: ClosedSendChannelException) {
+            it.complete()
+            writerJob.join()
+        } catch (sendFailure: Throwable) {
+            it.complete()
+            throw sendFailure
+        }
+    }.await()
+
+    @Deprecated(
+        "Use cancel() instead.",
+        ReplaceWith("cancel()", "kotlinx.coroutines.cancel"),
+        level = DeprecationLevel.ERROR
+    )
+    override fun terminate() {
+        outgoing.close()
+        socketJob.complete()
+    }
+
+    // klio: the JVM Serializer's opcode choice (see lastOutgoingDataType).
+    private fun outgoingOpcode(frame: Frame): Int = when (lastOutgoingDataType) {
+        null -> {
+            if (!frame.fin) lastOutgoingDataType = frame.frameType
+            frame.frameType.opcode
+        }
+
+        frame.frameType -> {
+            if (frame.fin) lastOutgoingDataType = null
+            0
+        }
+
+        else -> {
+            if (!frame.frameType.controlFrame) {
+                throw IllegalStateException("Can't continue with different data frame opcode")
+            }
+            frame.frameType.opcode
+        }
+    }
+
+    private class FlushRequest(parent: Job?) {
+        private val done: CompletableJob = Job(parent)
+        fun complete(): Boolean = done.complete()
+        suspend fun await(): Unit = done.join()
+    }
+}
+
+private fun Source.mask(maskKey: Int): Source = withMemory(4) { maskMemory ->
+    maskMemory.storeIntAt(0, maskKey)
+    buildPacket {
+        repeat(remaining.toInt()) { i ->
+            writeByte((readByte().toInt() xor (maskMemory[i % 4].toInt())).toByte())
+        }
+    }
+}
+
+/**
+ * Serializes WebSocket [Frame] and writes the bits into the [ByteWriteChannel].
+ * If [masking] is true, then data will be masked with random mask
+ *
+ * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.websocket.writeFrame)
+ */
+@InternalAPI // used in tests
+public suspend fun ByteWriteChannel.writeFrame(frame: Frame, masking: Boolean) {
+    writeFrame(frame, masking, frame.frameType.opcode)
+}
+
+// klio: writeFrame with the opcode chosen by the caller, so a session can
+// send a fragment's continuation opcode.
+internal suspend fun ByteWriteChannel.writeFrame(frame: Frame, masking: Boolean, opcode: Int) {
+    val length = frame.data.size
+
+    val flagsAndOpcode = frame.fin.flagAt(7) or
+        frame.rsv1.flagAt(6) or
+        frame.rsv2.flagAt(5) or
+        frame.rsv3.flagAt(4) or
+        opcode
+
+    writeByte(flagsAndOpcode.toByte())
+
+    val formattedLength = when {
+        length < 126 -> length
+        length <= 0xffff -> 126
+        else -> 127
+    }
+
+    val maskAndLength = masking.flagAt(7) or formattedLength
+
+    writeByte(maskAndLength.toByte())
+
+    when (formattedLength) {
+        126 -> writeShort(length.toShort())
+        127 -> writeLong(length.toLong())
+    }
+
+    val data = ByteReadPacket(frame.data)
+
+    val maskedData = when (masking) {
+        true -> {
+            val maskKey = Random.nextInt()
+            writeInt(maskKey)
+            data.mask(maskKey)
+        }
+
+        false -> data
+    }
+    writePacket(maskedData)
+}
+
+/**
+ * Reads bits from [ByteReadChannel] and converts into a WebSocket [Frame].
+ *
+ *
+ * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.websocket.readFrame)
+ *
+ * @param maxFrameSize maximum frame size that could be read
+ * @param lastOpcode last read opcode
+ */
+
+@InternalAPI // used in tests
+public suspend fun ByteReadChannel.readFrame(maxFrameSize: Long, lastOpcode: Int): Frame {
+    val flagsAndOpcode = readByte().toInt()
+    val maskAndLength = readByte().toInt()
+
+    val rawOpcode = flagsAndOpcode and 0x0f
+    if (rawOpcode == 0 && lastOpcode == 0) {
+        throw ProtocolViolationException("Can't continue finished frames")
+    }
+    val opcode = if (rawOpcode == 0) lastOpcode else rawOpcode
+    val frameType = FrameType[opcode] ?: throw ProtocolViolationException("Unsupported opcode: $opcode")
+    if (rawOpcode != 0 && lastOpcode != 0 && !frameType.controlFrame) {
+        // trying to intermix data frames
+        throw ProtocolViolationException("Can't start new data frame before finishing previous one")
+    }
+
+    val fin = flagsAndOpcode and 0x80 != 0
+    if (frameType.controlFrame && !fin) {
+        throw ProtocolViolationException("control frames can't be fragmented")
+    }
+
+    val length = when (val length = maskAndLength and 0x7f) {
+        126 -> readShort().toLong() and 0xffff
+        127 -> readLong()
+        else -> length.toLong()
+    }
+    if (frameType.controlFrame && length > MAX_CONTROL_FRAME_PAYLOAD_SIZE) {
+        throw ProtocolViolationException("control frames can't be larger than $MAX_CONTROL_FRAME_PAYLOAD_SIZE bytes")
+    }
+
+    val maskKey = when (maskAndLength and 0x80 != 0) {
+        true -> readInt()
+        false -> -1
+    }
+
+    if (length > Int.MAX_VALUE || length > maxFrameSize) {
+        throw FrameTooBigException(length)
+    }
+
+    val data = readPacket(length.toInt())
+    val maskedData = when (maskKey) {
+        -1 -> data
+        else -> data.mask(maskKey)
+    }
+
+    return Frame.byType(
+        fin = fin,
+        frameType = frameType,
+        data = maskedData.readByteArray(),
+        rsv1 = flagsAndOpcode and 0x40 != 0,
+        rsv2 = flagsAndOpcode and 0x20 != 0,
+        rsv3 = flagsAndOpcode and 0x10 != 0
+    )
+}

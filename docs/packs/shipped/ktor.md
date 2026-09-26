@@ -275,6 +275,12 @@ message's bytes are the JVM's for a fresh deflater, and messages that repeat
 earlier ones compress a little less than on the JVM with context takeover;
 incoming messages are inflated with the peer's window either way.
 
+A session sends what the JVM's does where upstream's native session differs:
+the fragments of a message after the first carry the continuation opcode,
+as RFC 6455 requires, and a frame larger than `maxFrameSize` (or one that
+breaks the protocol) is answered with its Close frame (TOO_BIG or
+PROTOCOL_ERROR) before the handler sees the failure.
+
 ## Call logging
 
 `server-call-logging` is Ktor's CallLogging plugin with the same DSL
@@ -301,12 +307,17 @@ JVM, `server-call-id` depends on `server-call-logging` for it.
 
 `testApplication { … }` (`server-test-host`) runs an application in process
 with a client wired to it, and `MockEngine` (`client-mock`) answers client
-requests from a handler, as upstream's own test suites use them.
+requests from a handler, as upstream's own test suites use them. The test
+client speaks WebSockets to the application, as on the JVM; upstream's native
+test engine refuses them. ktor-client-cio's raw WebSocket builders
+(`webSocketRaw`, `wsRaw`, `wssRaw`), JVM-only upstream, come with
+`client-cio`.
 
 klio runs upstream's commonTest suites for the pack's modules
 (`klio-census ktor,ktor_network,ktor_client_core,ktor_server_core,ktor_server_cio,ktor_server_tests,ktor_server_plugins,ktor_client_plugins,ktor_client_tests,ktor_client_cio,ktor_shared,ktor_serialization`),
 plus klio ports of the JVM tests for the modules that are JVM-only upstream
-(CallLogging, Compression). The plan (`plans/ktor-support.md`) lists the
+(CallLogging, Compression) and of the server WebSockets plugin's JVM tests.
+The plan (`plans/ktor-support.md`) lists the
 cases that still fail and why.
 
 The client suites call ktor's own test server (ktor-test-server) at
@@ -369,5 +380,3 @@ gives every platform the POSIX meaning the actuals expect.
 
 - Static file and resource routes (`staticFiles`, `staticResources`), which
   upstream builds on java.io.File and the class path.
-- WebSockets inside `testApplication`: upstream's native test engine does not
-  support them.

@@ -48,7 +48,7 @@ where upstream reaches the platform through cinterop.
 | ktor-client-cio | `client-cio` | verbatim, with its posix loader registering the default `HttpClient()` engine; `KlioClient`; HTTPS; census `ktor_client_cio` 13/13 |
 | ktor-server-cio | `server-cio` | verbatim; census `ktor_server_cio` 98/98 |
 | server HTTPS | `server-cio` | `Klio` = the CIO engine plus `sslConnector(chainPem, keyPem)`; calls report `https`; `wss` |
-| server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 297/297 |
+| server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 320 passed, 1 failing (with the ported JVM WebSocket tests) |
 | compression | `utils`, `server-compression`, `client-encoding` | gzip and deflate over `src/ktor_client/zlib.zig`, compressing with a port of zlib's deflate (the JVM's bytes); example `ktor_compression` |
 | WebSocket compression | `websockets` | klio port of the JVM permessage-deflate extension; example `ktor_websocket_deflate` |
 | call logging | `server-call-logging` | klio port on `LogLevel` and `klio.logging.MDC`; upstream's JVM CallLoggingTest ported, 20/20 in `ktor_server_plugins` |
@@ -58,16 +58,105 @@ where upstream reaches the platform through cinterop.
 | digest authentication | `server-auth`, `http` | the JVM-only DigestAuth, DigestCredential and `toDigester` verbatim over `klio.security.MessageDigest`; example `ktor_digest_auth` (MD5, SHA-256, qop=auth with Authentication-Info) |
 | kotlinx JSON converter | `serialization-kotlinx-json` | census `ktor_serialization` 14/14 |
 | shared modules | `call-id`, `resources`, `websockets`, `test-base` | census `ktor_shared` 50/50 |
+| WebSockets in `testApplication` | `server-test-host` | klio's test-engine bridge (the JVM's conversation over a `RawWebSocket`); client-cio's JVM `webSocketRaw` builders verbatim; upstream's JVM WebSocket tests ported under `klioTest/io/ktor/tests/websocket` |
 
-Open failures, each with its owner:
-- `ktor_client_tests`, 1 case: DispatcherTest (coroutines:
-  `Dispatchers.IO.toString()` is not "Dispatchers.IO", which upstream
-  native's DefaultIoScheduler returns).
-  On the Linux VM PluginsTest.testIgnoreBody fails too, and on macOS it
-  passes with little to spare: the server's `"x".repeat(16 MiB)` takes
-  11.4 s (`CharArray(n) { c }` at about 0.7 µs a char) and
-  `encodeToByteArray` 1.27 s, against the engine's 15 s request timeout
-  (interpreter speed, on its after-done list).
+Every census suite and its ratchet lives in `src/itests/commontest_support.zig`
+(`suites`); run one with `KLIO_ITEST_BIN=zig-out/bin/klio-harness
+KLIO_ITEST_HOME=$PWD/.klio-local zig-out/bin/klio-census <suite>` after
+`zig build klio-harness klio-census` and a pack reinstall
+(`klio pack build kotlin-klio/klio-ktor` then `klio pack install`). The client
+suites start ktor's test server themselves (see Decisions).
+
+Census on macOS, 2026-09-26 (passed / failed):
+
+| Suite | Result |
+| --- | --- |
+| `ktor` | 496 / 0 |
+| `ktor_network` | 25 / 0 |
+| `ktor_client_core` | 93 / 0 |
+| `ktor_server_core` | 147 / 0 |
+| `ktor_server_cio` | 98 / 0 |
+| `ktor_server_tests` | 455 / 0 |
+| `ktor_server_plugins` | 320 / 1 |
+| `ktor_client_plugins` | 125 / 0 |
+| `ktor_client_tests` | 387 / 1 |
+| `ktor_client_cio` | 13 / 0 |
+| `ktor_serialization` | 14 / 0 |
+| `ktor_shared` | 50 / 0 |
+
+Open items, each with its failing tests, the cause as far as known, the
+files and the owner:
+- `ktor_client_tests` DispatcherTest "the default dispatcher is IO - except
+  web" (coroutines, P1). It asserts
+  `client.engine.dispatcher.toString() == "Dispatchers.IO"`. Upstream
+  native's `DefaultIoScheduler` returns that
+  (`kotlinx-coroutines-core/native/src/Dispatchers.kt:44`); klio's
+  `KlioIoDispatcher` (`kotlin-klio/klio-kotlinx-coroutines/klioMain/kotlinx/coroutines/KlioRuntime.kt`)
+  has no `toString`. Native's Default dispatcher has none either, so only IO
+  changes. Reported to P1.
+- `ktor_server_plugins` WebSocketTest.testBigFrame (interpreter speed, on
+  the after-done list; registered as the suite's one failure). The test
+  echoes a 20 MiB binary frame within `withTimeout(10.seconds)`. The client
+  masks it and the server unmasks it with `Source.mask` in
+  `klioMain/io/ktor/websocket/RawWebSocketCommon.kt`, a byte-at-a-time xor
+  loop over a packet: a masked `writeFrame` plus `readFrame` of 20 MiB takes
+  33 s (about 0.8 us a byte a pass), and `Random.nextBytes` of 20 MiB 2.9 s.
+  The JVM takes milliseconds.
+- `ktor_client_tests` PluginsTest.testIgnoreBody on the Linux VM
+  (interpreter speed, on the after-done list). The test server's
+  `/plugins/body?size=16777216` (`upstream/ktor-test-server/.../tests/Features.kt`)
+  builds `"x".repeat(16 MiB)`, which takes 11.4 s on macOS (`CharArray(n) { c }`
+  at about 0.7 us a char) plus 1.27 s for `encodeToByteArray`, against the
+  client engine's 15 s request timeout. It passes on macOS (14.5 s) and
+  times out on the slower aarch64 Docker VM (379/9 there before the fixes
+  below landed; 1 of those 9 is this).
+- Upstream native divergences in ktor-websockets, fixed in klio's copy
+  `klioMain/io/ktor/websocket/RawWebSocketCommon.kt` (each change carries a
+  `klio:` comment), to offer upstream later; nothing is filed:
+  - Fragmented messages: native `writeFrame` wrote every fragment with the
+    data opcode. RFC 6455 and the JVM's Serializer write 0 (continuation)
+    after the first, and native's own reader rejects the repeat ("Can't
+    start new data frame before finishing previous one"). Repro: a client
+    sending `Text(fin = false, "ABC")`, a Ping, `Text(false, "12")`,
+    `Text(true, "3")` to a CIO server; the server must receive "ABC123".
+    Covered by WebSocketTest.testFragmentation.
+  - A too-big or protocol-violating frame: native closed `incoming` before
+    queueing Close(TOO_BIG / PROTOCOL_ERROR), so the failing handler
+    cancelled the session before the writer sent the Close, and the peer saw
+    the connection end without one. The JVM queues the Close first. Repro: a
+    CIO server with `maxFrameSize = 1023` and a client sending 1024 bytes;
+    the client must receive Close(TOO_BIG, "Frame is too big: 1024").
+    Covered by WebSocketTest.testMaxSize, testFragmentationMaxSize and
+    testFragmentationMaxSizeBound.
+- No HTTP/2 engine: upstream's test server also runs a Netty HTTP/2 server
+  at 8084, which klio's test server (`klioMain/test/server/TestServerKlio.kt`)
+  does not start; the client tests that reach it are JVM-only upstream.
+- Windows: `klio-census` does not compile for Windows (P1, not ktor files):
+  `src/itests/box_support.zig:459` formats a `*anyopaque` pid with `{d}`,
+  `src/itests/census_main.zig:20` uses `init.args.iterate()` (Windows needs
+  an allocator), and `src/runtime/clock.zig:52` fails on `cNowNs`. The census
+  service code itself (TMPDIR/TEMP/TMP, std.Io file locks, a spawned
+  `klio run`) reports no errors. The klio binary does not build for Windows
+  until the runtime does, so the test server and the packs are verified on
+  Windows only through the socket layer's standalone tests (see
+  Portability).
+- Linux re-verification: the last full Linux census predates the test
+  server; since then the Docker VM ran the ktor unit tests (ktor_tls 76,
+  ktor_client 65 with the deflate port's JVM cases, all passing) and the
+  client suites against the test server (ktor_client_plugins 120/2 and
+  ktor_client_tests 379/9 before the deflate port and the sema fixes). A
+  full `inside.sh` run (see Portability) should be repeated.
+- `examples/ktor_client_plugins.kt` differed once from its expected output
+  (`tests/corpus/expected/ktor_client_plugins.out`) in a verification run
+  made right after the censuses, and matched in seven runs after it; the
+  failing run's output was not kept. It times out a 2 s route at 200 ms and
+  retries two 503s, so a timing-dependent line is the likely suspect. If it
+  recurs, capture stdout and stderr before rerunning.
+- Pack loading: `--feature io.ktor/test-server` alone does not make a
+  package outside the `io.ktor` prefix (`test.server`) importable, because
+  packs are selected by the prefix of a program's imports. The coordinator
+  tracks it as pack-loader design; ktor works around it with
+  `io.ktor.testserver.runTestServer()`.
 
 Not run from upstream: the suites
 for kotlinx.html and the other formats (html-builder, htmx, cbor, protobuf,
@@ -81,22 +170,36 @@ klio runs.
 1. Done: ktor-network over host sockets; ktor-client-cio and ktor-server-cio
    verbatim; the test hosts; whole source sets for io, utils, http,
    client-core and server-core; regex `\p{...}` classes; the server and client
-   plugin modules and their suites; TLS 1.3 on both sides with HTTPS on the
-   `Klio` engine; gzip and deflate over `std.compress.flate` with the
-   server Compression module and the client's ContentEncoding; CallLogging;
-   WebSockets over ws and wss (example `ktor_websockets`), with HTTPS calls
-   reporting the `https` scheme.
-2. ktor-server-tests' commonTest (405), and klio ports of its JVM
+   plugin modules and their suites; TLS 1.3 on both sides (and a TLS 1.2
+   client) with HTTPS on the `Klio` engine, RSA-PSS server keys; gzip and
+   deflate with the server Compression module and the client's
+   ContentEncoding; CallLogging; WebSockets over ws and wss (example
+   `ktor_websockets`), with HTTPS calls reporting the `https` scheme;
+   portability to Linux and Windows (Portability).
+2. Done: ktor-server-tests' commonTest, and klio ports of its JVM
    CompressionTest and CompressionAcceptEncodingTest.
 3. Done: ktor's test server under klio (`test-server`), run by the census
    as the client suites' service; the ktor-client-tests, ktor-client-cio
-   and ktor-client-bom-remover suites; the
-   `ktor_server_cio`, `ktor_server_tests` and `ktor_server_plugins`
-   ratchets at zero failures once the sema fixes landed.
+   and ktor-client-bom-remover suites; the `ktor_server_cio`,
+   `ktor_server_tests` and `ktor_server_plugins` ratchets at zero failures
+   once the sema fixes landed; server digest authentication.
 4. Done: zlib's deflate ported (`zdeflate.zig`), so compressed bodies are
    the JVM's bytes and the precompressed gzip cases pass.
-5. Static content (`staticFiles`, `staticResources`, pre-compressed files)
-   over kotlinx-io files instead of java.io.File.
+5. Done: WebSockets in `testApplication`, with the JVM WebSocket tests
+   ported and the two native session divergences fixed.
+6. Next: static content (`staticFiles`, `staticResources`, `staticZip`,
+   single-page applications, pre-compressed files). Upstream's
+   `ktor-server-core/jvm/src/io/ktor/server/http/content/` (StaticContent.kt,
+   StaticContentResolution.kt, PreCompressed.kt, LocalFileContent.kt,
+   SinglePageApplication.kt, ETagProvider.kt, LastModifiedJavaTime.kt) is
+   built on java.io.File, java.nio.file and the class path; a klio port over
+   kotlinx-io files (`kotlinx.io.files`) keeps the routes and headers, and
+   its JVM tests (`ktor-server-tests/jvm/test/io/ktor/server/plugins/StaticContentTest.kt`)
+   are the checks. Class-path resources have no klio counterpart yet.
+7. Then: the open items above that are ktor's (a full Linux census run),
+   and the TLS follow-up below (a NativeBox instead of the Kotlin handle
+   table). Not started: TLS client certificates, 0-RTT, session tickets and
+   resumption (see Limits), none of which is requested yet.
 
 ## Decisions
 
@@ -339,14 +442,16 @@ all three; the natives carry the differences:
 
 Verified, 2026-09-26:
 - macOS (arm64): the unit tests of `ktor_client` (with the socket layer's
-  own) and `ktor_tls`, every ktor census, the ktor itests and examples.
+  own) and `ktor_tls`, every ktor census (counts under Status), the ktor
+  itests and the sixteen ktor examples.
 - Linux, aarch64 Ubuntu 24.04 in Docker with Zig 0.16.0: `zig build`, the
   harness, the same unit tests, the packs, every ktor census with the same
   counts as macOS (ktor 496, ktor_network 25, ktor_client_core 93,
   ktor_server_core 147, ktor_server_tests 444/11, ktor_server_plugins
   290/7, ktor_client_plugins 81/41, ktor_serialization 14, ktor_shared 50;
-  ktor_server_cio hangs on both, as recorded above), the five ktor itests
-  and the fourteen ktor examples (how, below).
+  ktor_server_cio hung on both then), the five ktor itests and the fourteen
+  ktor examples of that day (how, below). Later runs are listed under
+  Status (Linux re-verification).
 - Windows: `zig build -Dtarget=x86_64-windows-gnu` reports no errors in the
   ktor files (the ones left are the runtime's and the cli's, owned
   elsewhere). The socket layer, locks, environment and Winsock mapping

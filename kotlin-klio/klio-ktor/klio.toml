@@ -106,9 +106,14 @@ root = "upstream/ktor-shared/ktor-sse/common/src"
 # ktor-websockets: the frame model, the raw and default sessions, ping/pong
 # and extensions. Common and posix are plain Kotlin. The permessage-deflate
 # extension is JVM-only upstream (java.util.zip); klio's port is under
-# klioMain/io/ktor/websocket, over the DEFLATE natives.
+# klioMain/io/ktor/websocket, over the DEFLATE natives. So is a copy of
+# RawWebSocketCommon.kt that sends continuation opcodes and a too-big
+# frame's Close as the JVM's session does.
 [[source]]
 root = "upstream/ktor-shared/ktor-websockets/common/src"
+exclude = [
+    "io/ktor/websocket/RawWebSocketCommon.kt",
+]
 [[source]]
 root = "upstream/ktor-shared/ktor-websockets/posix/src"
 
@@ -259,6 +264,19 @@ root = "upstream/ktor-client/ktor-client-cio/nonJvm/src"
 [[source]]
 root = "upstream/ktor-client/ktor-client-cio/posix/src"
 
+# The raw WebSocket builders (`webSocketRaw`, `wsRaw`, `wssRaw`) are plain
+# Kotlin over the client's WebSockets plugin; upstream ships them with the
+# JVM engine only. The JVM file runs verbatim; the JVM engine files beside it
+# do not load.
+[[source]]
+root = "upstream/ktor-client/ktor-client-cio/jvm/src"
+exclude = [
+    "io/ktor/client/engine/cio/CIOEngineContainer.kt",
+    "io/ktor/client/engine/cio/ConnectionPipeline.kt",
+    "io/ktor/client/engine/cio/Exceptions.kt",
+    "io/ktor/client/engine/cio/Proxy.jvm.kt",
+]
+
 # ktor-server-cio: the coroutine-based HTTP/1.1 server engine over
 # ktor-network, verbatim, with its posix dispatcher bridge.
 [[source]]
@@ -276,12 +294,17 @@ root = "upstream/ktor-server/ktor-server-cio/posix/src"
 root = "upstream/ktor-client/ktor-client-mock/common/src"
 
 # ktor-server-test-host: `testApplication`, the in-process server engine and
-# its client, with the posix bridges.
+# its client, with the posix bridges. The client's bridge to the engine is
+# klio's (klioMain/io/ktor/server/testing/client): upstream's native one
+# refuses WebSockets, and klio's runs them as the JVM's does.
 [[source]]
 root = "upstream/ktor-server/ktor-server-test-host/common/src"
 
 [[source]]
 root = "upstream/ktor-server/ktor-server-test-host/posix/src"
+exclude = [
+    "io/ktor/server/testing/client/TestHttpClientEngineBridgeNix.kt",
+]
 
 # ktor-server-test-base: the engine test base the server modules' commonTest
 # suites extend.
@@ -677,7 +700,10 @@ requires = ["client-core"]
 # ktor-server-test-host (`io.ktor.server.testing.*`): `testApplication` over
 # the in-process test engine, with a client wired to it.
 [features.server-test-host]
-sources = ["upstream/ktor-server/ktor-server-test-host/"]
+sources = [
+    "upstream/ktor-server/ktor-server-test-host/",
+    "klioMain/io/ktor/server/testing/",
+]
 requires = ["client-cio", "server-core", "test-dispatcher"]
 
 # ktor-server-test-base (`io.ktor.server.test.base.*`): the engine test base.
