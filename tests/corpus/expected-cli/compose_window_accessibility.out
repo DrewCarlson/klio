@@ -1,0 +1,17 @@
+group
+  text "Settings"
+  button "Add"
+  checkbox "Subscribe" unchecked
+  text field "Name" value=""
+  slider "Volume" value=0.5
+clicked 1
+subscribed true
+name Ada
+volume 6
+group
+  text "Settings"
+  button "Add"
+  checkbox "Subscribe" checked
+  text field "Name" value="Ada"
+  slider "Volume" value=0.6
+application ended

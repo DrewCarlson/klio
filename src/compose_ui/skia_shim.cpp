@@ -435,6 +435,14 @@ extern "C" const char* klio_win_last_error(void) {
 #include <type_traits>
 #define KLIO_X11_TRAY 1
 #endif
+#if defined(KLIO_ATK)
+// ATK's and GLib's declarations; the functions come from the libraries the
+// accessibility bridge loads at run time (klioAtkLoad), so no cast calls
+// into GObject's checks.
+#define G_DISABLE_CAST_CHECKS 1
+#include <atk/atk.h>
+#include <dlfcn.h>
+#endif
 
 // One routed event held for a window other than the one that polled: SDL's
 // event queue is process-global, so a poll on window A may pull window B's
@@ -479,12 +487,26 @@ struct KlioWindow {
     bool composing = false;            // the input method is composing
     SDL_Rect imeRect = {0, 0, 0, 0};   // the text cursor, in the content
     std::string eventText;             // the text of the event last polled
+    // The window's semantics for assistive technologies (klio_a11y_update),
+    // their ATK objects by node id (-1 for the window's frame), and whether a
+    // client reads them.
+    bool a11yActive = false;
+    KlioA11yTree a11y;
+    std::unordered_map<int, struct KlioAtkObject*> atk;
 #if defined(KLIO_GPU)
     SDL_GLContext gl = nullptr;
     sk_sp<GrDirectContext> grContext;  // per-window GL context for the on-screen GPU
     bool gpu = false;
 #endif
 };
+
+// The window joins, and leaves, the application assistive technologies
+// read (the ATK bridge further down, with C linkage as the functions
+// around it have).
+extern "C" {
+static void klioSdlA11yOpen(KlioWindow* kw);
+static void klioSdlA11yClose(KlioWindow* kw);
+}
 
 // Open windows by SDL id, for event routing. klio is single-threaded.
 static std::unordered_map<Uint32, KlioWindow*>& klioSdlWindows() {
@@ -675,6 +697,8 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         SDL_StartTextInput();
         gpuWin->id = SDL_GetWindowID(gpuWin->win);
         klioSdlWindows()[gpuWin->id] = gpuWin;
+        gpuWin->a11yActive = klioA11yForced();
+        klioSdlA11yOpen(gpuWin);
         ++klioSdlOpenCount;
         return gpuWin;
     }
@@ -706,6 +730,8 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     SDL_StartTextInput();  // deliver typed characters as SDL_TEXTINPUT events
     kw->id = SDL_GetWindowID(win);
     klioSdlWindows()[kw->id] = kw;
+    kw->a11yActive = klioA11yForced();
+    klioSdlA11yOpen(kw);
     ++klioSdlOpenCount;
     return kw;
 }
@@ -1480,6 +1506,831 @@ static void klioSdlPaintFrame(KlioWindow* kw) {
 }
 
 // Translates one SDL event into the events of its window.
+// ---------------------------------------------------------------------------
+// Accessibility: the windows' semantics through ATK, which atk-bridge serves
+// to AT-SPI clients (Orca) as GTK's are, as Compose Desktop's are served
+// through the Java ATK wrapper. An application object holds a frame per
+// window, whose children are the semantics nodes of the window's latest
+// snapshot. ATK and GLib are loaded when the first window opens, so a
+// desktop without them runs the program without the bridge.
+
+#if defined(KLIO_ATK)
+// The functions the bridge calls, from the libraries loaded at run time.
+struct KlioAtkApi {
+    bool loaded = false;
+    bool bridged = false;
+    decltype(&g_type_register_static) type_register_static;
+    decltype(&g_type_add_interface_static) type_add_interface_static;
+    decltype(&g_object_new) object_new;
+    decltype(&g_object_unref) object_unref;
+    decltype(&g_object_ref) object_ref;
+    decltype(&g_type_class_ref) type_class_ref;
+    decltype(&g_type_class_peek_parent) type_class_peek_parent;
+    decltype(&g_signal_emit_by_name) signal_emit_by_name;
+    decltype(&g_main_context_iteration) main_context_iteration;
+    decltype(&g_strdup) strdup_;
+    decltype(&g_value_init) value_init;
+    decltype(&g_value_set_double) value_set_double;
+    decltype(&g_value_get_double) value_get_double;
+    decltype(&g_value_unset) value_unset;
+    decltype(&atk_object_get_type) object_get_type;
+    decltype(&atk_util_get_type) util_get_type;
+    decltype(&atk_component_get_type) component_get_type;
+    decltype(&atk_action_get_type) action_get_type;
+    decltype(&atk_value_get_type) value_get_type;
+    decltype(&atk_editable_text_get_type) editable_text_get_type;
+    decltype(&atk_text_get_type) text_get_type;
+    decltype(&atk_state_set_new) state_set_new;
+    decltype(&atk_state_set_add_state) state_set_add_state;
+    decltype(&atk_state_set_contains_state) state_set_contains_state;
+    decltype(&atk_object_notify_state_change) notify_state_change;
+    decltype(&atk_object_get_n_accessible_children) get_n_children;
+    decltype(&atk_object_ref_accessible_child) ref_child;
+    decltype(&atk_object_get_role) get_role;
+    decltype(&atk_object_get_name) get_name;
+    decltype(&atk_object_ref_state_set) ref_state_set;
+    decltype(&atk_action_get_n_actions) action_get_n_actions;
+    decltype(&atk_action_get_name) action_get_name;
+    decltype(&atk_action_do_action) action_do_action;
+    decltype(&atk_editable_text_set_text_contents) set_text_contents;
+    decltype(&atk_text_get_text) text_get_text;
+    decltype(&atk_text_get_character_count) text_get_character_count;
+    decltype(&atk_value_get_current_value) value_get_current_value;
+    decltype(&atk_value_set_current_value) value_set_current_value;
+    decltype(&atk_component_grab_focus) component_grab_focus;
+    int (*bridge_init)(int*, char***);
+};
+
+static KlioAtkApi& klioAtk() {
+    static KlioAtkApi api;
+    return api;
+}
+
+#define klioAtkSym(lib, name, field) \
+    ((field = reinterpret_cast<decltype(field)>(dlsym(lib, name))) != nullptr)
+
+// Loads GLib, GObject, ATK and atk-bridge; false when a library or a
+// function is missing.
+static bool klioAtkLoad() {
+    KlioAtkApi& a = klioAtk();
+    static bool tried = false;
+    if (tried) return a.loaded;
+    tried = true;
+    void* glib = dlopen("libglib-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+    void* gobject = dlopen("libgobject-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+    void* atk = dlopen("libatk-1.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+    void* bridge = dlopen("libatk-bridge-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+    if (!glib || !gobject || !atk || !bridge) return false;
+    bool ok = true;
+    ok &= klioAtkSym(gobject, "g_type_register_static", a.type_register_static);
+    ok &= klioAtkSym(gobject, "g_type_add_interface_static", a.type_add_interface_static);
+    ok &= klioAtkSym(gobject, "g_object_new", a.object_new);
+    ok &= klioAtkSym(gobject, "g_object_unref", a.object_unref);
+    ok &= klioAtkSym(gobject, "g_object_ref", a.object_ref);
+    ok &= klioAtkSym(gobject, "g_type_class_ref", a.type_class_ref);
+    ok &= klioAtkSym(gobject, "g_type_class_peek_parent", a.type_class_peek_parent);
+    ok &= klioAtkSym(gobject, "g_signal_emit_by_name", a.signal_emit_by_name);
+    ok &= klioAtkSym(gobject, "g_value_init", a.value_init);
+    ok &= klioAtkSym(gobject, "g_value_set_double", a.value_set_double);
+    ok &= klioAtkSym(gobject, "g_value_get_double", a.value_get_double);
+    ok &= klioAtkSym(gobject, "g_value_unset", a.value_unset);
+    ok &= klioAtkSym(glib, "g_main_context_iteration", a.main_context_iteration);
+    ok &= klioAtkSym(glib, "g_strdup", a.strdup_);
+    ok &= klioAtkSym(atk, "atk_object_get_type", a.object_get_type);
+    ok &= klioAtkSym(atk, "atk_util_get_type", a.util_get_type);
+    ok &= klioAtkSym(atk, "atk_component_get_type", a.component_get_type);
+    ok &= klioAtkSym(atk, "atk_action_get_type", a.action_get_type);
+    ok &= klioAtkSym(atk, "atk_value_get_type", a.value_get_type);
+    ok &= klioAtkSym(atk, "atk_editable_text_get_type", a.editable_text_get_type);
+    ok &= klioAtkSym(atk, "atk_text_get_type", a.text_get_type);
+    ok &= klioAtkSym(atk, "atk_state_set_new", a.state_set_new);
+    ok &= klioAtkSym(atk, "atk_state_set_add_state", a.state_set_add_state);
+    ok &= klioAtkSym(atk, "atk_state_set_contains_state", a.state_set_contains_state);
+    ok &= klioAtkSym(atk, "atk_object_notify_state_change", a.notify_state_change);
+    ok &= klioAtkSym(atk, "atk_object_get_n_accessible_children", a.get_n_children);
+    ok &= klioAtkSym(atk, "atk_object_ref_accessible_child", a.ref_child);
+    ok &= klioAtkSym(atk, "atk_object_get_role", a.get_role);
+    ok &= klioAtkSym(atk, "atk_object_get_name", a.get_name);
+    ok &= klioAtkSym(atk, "atk_object_ref_state_set", a.ref_state_set);
+    ok &= klioAtkSym(atk, "atk_action_get_n_actions", a.action_get_n_actions);
+    ok &= klioAtkSym(atk, "atk_action_get_name", a.action_get_name);
+    ok &= klioAtkSym(atk, "atk_action_do_action", a.action_do_action);
+    ok &= klioAtkSym(atk, "atk_editable_text_set_text_contents", a.set_text_contents);
+    ok &= klioAtkSym(atk, "atk_text_get_text", a.text_get_text);
+    ok &= klioAtkSym(atk, "atk_text_get_character_count", a.text_get_character_count);
+    ok &= klioAtkSym(atk, "atk_value_get_current_value", a.value_get_current_value);
+    ok &= klioAtkSym(atk, "atk_value_set_current_value", a.value_set_current_value);
+    ok &= klioAtkSym(atk, "atk_component_grab_focus", a.component_grab_focus);
+    ok &= klioAtkSym(bridge, "atk_bridge_adaptor_init", a.bridge_init);
+    a.loaded = ok;
+    return ok;
+}
+
+// What an object of the bridge stands for: the application, a window, or
+// a semantics node of a window.
+enum KlioAtkKind { KLIO_ATK_APP, KLIO_ATK_FRAME, KLIO_ATK_NODE };
+
+struct KlioAtkObject {
+    AtkObject parent;
+    int kind;
+    KlioWindow* kw;       // null once the window closed or the node left the tree
+    int nodeId;
+    int ifaces;           // the interfaces its type offers (KLIO_ATK_TEXT, ...)
+    char* cache;          // the last name or text handed out (freed on the next)
+};
+
+struct KlioAtkObjectClass {
+    AtkObjectClass parent;
+};
+
+static GType klioAtkObjectType(int ifaces);
+static AtkObjectClass* klioAtkParentClass = nullptr;
+
+static std::vector<KlioWindow*>& klioAtkWindows() {
+    static std::vector<KlioWindow*> windows;
+    return windows;
+}
+
+static KlioAtkObject* klioAtkApp() {
+    static KlioAtkObject* app = nullptr;
+    if (!app) {
+        app = reinterpret_cast<KlioAtkObject*>(klioAtk().object_new(klioAtkObjectType(0), nullptr));
+        app->kind = KLIO_ATK_APP;
+        app->parent.role = ATK_ROLE_APPLICATION;
+    }
+    return app;
+}
+
+static const KlioA11yNode* klioAtkNode(KlioAtkObject* o) {
+    return o->kind == KLIO_ATK_NODE && o->kw ? o->kw->a11y.find(o->nodeId) : nullptr;
+}
+
+static const char* klioAtkCache(KlioAtkObject* o, const std::string& s) {
+    std::free(o->cache);
+    o->cache = strdup(s.c_str());
+    return o->cache;
+}
+
+// The object of a node (or the frame for id -1) of a window.
+static AtkObject* klioAtkFor(KlioWindow* kw, int nodeId);
+
+static const std::vector<int>* klioAtkChildIds(KlioAtkObject* o) {
+    if (o->kind == KLIO_ATK_FRAME) return o->kw ? &o->kw->a11y.roots : nullptr;
+    const KlioA11yNode* n = klioAtkNode(o);
+    return n ? &n->children : nullptr;
+}
+
+static void klioSdlA11yActivate(KlioWindow* kw);
+
+static const gchar* klioAtkGetName(AtkObject* obj) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(obj);
+    if (o->kind == KLIO_ATK_APP) return "klio";
+    if (o->kind == KLIO_ATK_FRAME) return o->kw && o->kw->win ? klioAtkCache(o, SDL_GetWindowTitle(o->kw->win)) : "";
+    const KlioA11yNode* n = klioAtkNode(o);
+    return n ? klioAtkCache(o, n->name) : "";
+}
+
+static const gchar* klioAtkGetDescription(AtkObject* obj) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(obj);
+    const KlioA11yNode* n = klioAtkNode(o);
+    return n && n->description != n->name ? klioAtkCache(o, n->description) : nullptr;
+}
+
+static AtkObject* klioAtkGetParent(AtkObject* obj) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(obj);
+    if (o->kind == KLIO_ATK_APP) return nullptr;
+    if (o->kind == KLIO_ATK_FRAME) return &klioAtkApp()->parent;
+    const KlioA11yNode* n = klioAtkNode(o);
+    if (!n) return nullptr;
+    AtkObject* p = klioAtkFor(o->kw, n->parent >= 0 ? n->parent : -1);
+    return p ? p : klioAtkFor(o->kw, -1);
+}
+
+static gint klioAtkGetNChildren(AtkObject* obj) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(obj);
+    if (o->kind == KLIO_ATK_APP) return static_cast<gint>(klioAtkWindows().size());
+    if (o->kind == KLIO_ATK_FRAME && o->kw) klioSdlA11yActivate(o->kw);
+    const std::vector<int>* ids = klioAtkChildIds(o);
+    return ids ? static_cast<gint>(ids->size()) : 0;
+}
+
+static AtkObject* klioAtkRefChild(AtkObject* obj, gint i) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(obj);
+    AtkObject* child = nullptr;
+    if (o->kind == KLIO_ATK_APP) {
+        if (i >= 0 && static_cast<size_t>(i) < klioAtkWindows().size()) child = klioAtkFor(klioAtkWindows()[i], -1);
+    } else {
+        const std::vector<int>* ids = klioAtkChildIds(o);
+        if (ids && i >= 0 && static_cast<size_t>(i) < ids->size()) child = klioAtkFor(o->kw, (*ids)[i]);
+    }
+    if (child) klioAtk().object_ref(child);
+    return child;
+}
+
+static gint klioAtkGetIndexInParent(AtkObject* obj) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(obj);
+    if (o->kind == KLIO_ATK_APP) return -1;
+    if (o->kind == KLIO_ATK_FRAME) {
+        const auto& ws = klioAtkWindows();
+        for (size_t i = 0; i < ws.size(); i++) {
+            if (ws[i] == o->kw) return static_cast<gint>(i);
+        }
+        return -1;
+    }
+    const KlioA11yNode* n = klioAtkNode(o);
+    if (!n) return -1;
+    const KlioA11yNode* p = n->parent >= 0 ? o->kw->a11y.find(n->parent) : nullptr;
+    const std::vector<int>& siblings = p ? p->children : o->kw->a11y.roots;
+    for (size_t i = 0; i < siblings.size(); i++) {
+        if (siblings[i] == o->nodeId) return static_cast<gint>(i);
+    }
+    return -1;
+}
+
+static AtkRole klioAtkRoleOf(int role) {
+    switch (role) {
+        case KLIO_A11Y_ROLE_BUTTON: return ATK_ROLE_PUSH_BUTTON;
+        case KLIO_A11Y_ROLE_CHECKBOX: return ATK_ROLE_CHECK_BOX;
+        case KLIO_A11Y_ROLE_SWITCH: return ATK_ROLE_TOGGLE_BUTTON;
+        case KLIO_A11Y_ROLE_RADIO_BUTTON: return ATK_ROLE_RADIO_BUTTON;
+        case KLIO_A11Y_ROLE_TAB: return ATK_ROLE_PAGE_TAB;
+        case KLIO_A11Y_ROLE_DROPDOWN: return ATK_ROLE_COMBO_BOX;
+        case KLIO_A11Y_ROLE_IMAGE: return ATK_ROLE_IMAGE;
+        case KLIO_A11Y_ROLE_TEXT_FIELD: return ATK_ROLE_ENTRY;
+        case KLIO_A11Y_ROLE_PASSWORD_FIELD: return ATK_ROLE_PASSWORD_TEXT;
+        case KLIO_A11Y_ROLE_TEXT: return ATK_ROLE_LABEL;
+        case KLIO_A11Y_ROLE_SLIDER: return ATK_ROLE_SLIDER;
+        case KLIO_A11Y_ROLE_PROGRESS: return ATK_ROLE_PROGRESS_BAR;
+        case KLIO_A11Y_ROLE_SCROLL_AREA: return ATK_ROLE_SCROLL_PANE;
+        default: return ATK_ROLE_PANEL;
+    }
+}
+
+static AtkRole klioAtkGetRole(AtkObject* obj) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(obj);
+    if (o->kind == KLIO_ATK_APP) return ATK_ROLE_APPLICATION;
+    if (o->kind == KLIO_ATK_FRAME) return ATK_ROLE_FRAME;
+    const KlioA11yNode* n = klioAtkNode(o);
+    return klioAtkRoleOf(n ? n->role : KLIO_A11Y_ROLE_UNKNOWN);
+}
+
+static AtkStateSet* klioAtkRefStateSet(AtkObject* obj) {
+    KlioAtkApi& a = klioAtk();
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(obj);
+    AtkStateSet* set = a.state_set_new();
+    if (o->kind != KLIO_ATK_NODE) {
+        a.state_set_add_state(set, ATK_STATE_VISIBLE);
+        a.state_set_add_state(set, ATK_STATE_SHOWING);
+        return set;
+    }
+    const KlioA11yNode* n = klioAtkNode(o);
+    if (!n) {
+        a.state_set_add_state(set, ATK_STATE_DEFUNCT);
+        return set;
+    }
+    a.state_set_add_state(set, ATK_STATE_VISIBLE);
+    a.state_set_add_state(set, ATK_STATE_SHOWING);
+    if (n->states & KLIO_A11Y_STATE_ENABLED) {
+        a.state_set_add_state(set, ATK_STATE_ENABLED);
+        a.state_set_add_state(set, ATK_STATE_SENSITIVE);
+    }
+    if (klioA11yOffers(n->actions, KLIO_A11Y_ACTION_FOCUS)) a.state_set_add_state(set, ATK_STATE_FOCUSABLE);
+    if (n->states & KLIO_A11Y_STATE_FOCUSED) a.state_set_add_state(set, ATK_STATE_FOCUSED);
+    if (n->states & KLIO_A11Y_STATE_SELECTED) a.state_set_add_state(set, ATK_STATE_SELECTED);
+    if (n->states & KLIO_A11Y_STATE_CHECKABLE) a.state_set_add_state(set, ATK_STATE_CHECKABLE);
+    if (n->states & KLIO_A11Y_STATE_CHECKED) {
+        a.state_set_add_state(set, n->role == KLIO_A11Y_ROLE_SWITCH ? ATK_STATE_PRESSED : ATK_STATE_CHECKED);
+    }
+    if (n->states & KLIO_A11Y_STATE_MIXED) a.state_set_add_state(set, ATK_STATE_INDETERMINATE);
+    if (n->states & KLIO_A11Y_STATE_EDITABLE) a.state_set_add_state(set, ATK_STATE_EDITABLE);
+    if (n->states & (KLIO_A11Y_STATE_EXPANDED | KLIO_A11Y_STATE_COLLAPSED)) a.state_set_add_state(set, ATK_STATE_EXPANDABLE);
+    if (n->states & KLIO_A11Y_STATE_EXPANDED) a.state_set_add_state(set, ATK_STATE_EXPANDED);
+    return set;
+}
+
+static void klioAtkFinalize(GObject* gobj) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(gobj);
+    std::free(o->cache);
+    o->cache = nullptr;
+    G_OBJECT_CLASS(klioAtkParentClass)->finalize(gobj);
+}
+
+static void klioAtkClassInit(gpointer klass, gpointer) {
+    klioAtkParentClass = reinterpret_cast<AtkObjectClass*>(klioAtk().type_class_peek_parent(klass));
+    AtkObjectClass* c = reinterpret_cast<AtkObjectClass*>(klass);
+    c->get_name = klioAtkGetName;
+    c->get_description = klioAtkGetDescription;
+    c->get_parent = klioAtkGetParent;
+    c->get_n_children = klioAtkGetNChildren;
+    c->ref_child = klioAtkRefChild;
+    c->get_index_in_parent = klioAtkGetIndexInParent;
+    c->get_role = klioAtkGetRole;
+    c->ref_state_set = klioAtkRefStateSet;
+    reinterpret_cast<GObjectClass*>(klass)->finalize = klioAtkFinalize;
+}
+
+// A node's action as a client asks it: queued for the program to run.
+static gboolean klioAtkPerform(KlioAtkObject* o, int action, const char* text = "") {
+    const KlioA11yNode* n = klioAtkNode(o);
+    if (!n || !klioA11yOffers(n->actions, action)) return FALSE;
+    o->kw->events.push_back(klioA11yEv(o->nodeId, action, text));
+    return TRUE;
+}
+
+// AtkComponent: where the object is, and focusing it.
+static void klioAtkGetExtents(AtkComponent* c, gint* x, gint* y, gint* w, gint* h, AtkCoordType coords) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(c);
+    *x = *y = *w = *h = 0;
+    if (!o->kw || !o->kw->win) return;
+    int wx = 0;
+    int wy = 0;
+    SDL_GetWindowPosition(o->kw->win, &wx, &wy);
+    if (coords != ATK_XY_SCREEN) wx = wy = 0;
+    if (o->kind == KLIO_ATK_FRAME) {
+        *x = wx;
+        *y = wy;
+        *w = o->kw->w;
+        *h = o->kw->h + o->kw->barH;
+        return;
+    }
+    const KlioA11yNode* n = klioAtkNode(o);
+    if (!n) return;
+    *x = wx + static_cast<gint>(n->x);
+    *y = wy + o->kw->barH + static_cast<gint>(n->y);
+    *w = static_cast<gint>(n->w);
+    *h = static_cast<gint>(n->h);
+}
+
+static gboolean klioAtkGrabFocus(AtkComponent* c) {
+    return klioAtkPerform(reinterpret_cast<KlioAtkObject*>(c), KLIO_A11Y_ACTION_FOCUS);
+}
+
+static void klioAtkComponentInit(gpointer iface, gpointer) {
+    AtkComponentIface* i = reinterpret_cast<AtkComponentIface*>(iface);
+    i->get_extents = klioAtkGetExtents;
+    i->grab_focus = klioAtkGrabFocus;
+}
+
+// AtkAction: the node's click, long click, expand and collapse, in that order.
+static const int klioAtkActionOrder[] = {KLIO_A11Y_ACTION_CLICK, KLIO_A11Y_ACTION_LONG_CLICK, KLIO_A11Y_ACTION_EXPAND,
+                                         KLIO_A11Y_ACTION_COLLAPSE, KLIO_A11Y_ACTION_DISMISS};
+
+static int klioAtkActionAt(KlioAtkObject* o, gint i) {
+    const KlioA11yNode* n = klioAtkNode(o);
+    if (!n) return 0;
+    gint k = 0;
+    for (int action : klioAtkActionOrder) {
+        if (!klioA11yOffers(n->actions, action)) continue;
+        if (k++ == i) return action;
+    }
+    return 0;
+}
+
+static gint klioAtkGetNActions(AtkAction* a) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(a);
+    gint k = 0;
+    while (klioAtkActionAt(o, k) != 0) k++;
+    return k;
+}
+
+static const gchar* klioAtkActionName(AtkAction* a, gint i) {
+    switch (klioAtkActionAt(reinterpret_cast<KlioAtkObject*>(a), i)) {
+        case KLIO_A11Y_ACTION_CLICK: return "click";
+        case KLIO_A11Y_ACTION_LONG_CLICK: return "long click";
+        case KLIO_A11Y_ACTION_EXPAND: return "expand";
+        case KLIO_A11Y_ACTION_COLLAPSE: return "collapse";
+        case KLIO_A11Y_ACTION_DISMISS: return "dismiss";
+        default: return nullptr;
+    }
+}
+
+static gboolean klioAtkDoAction(AtkAction* a, gint i) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(a);
+    const int action = klioAtkActionAt(o, i);
+    return action != 0 && klioAtkPerform(o, action);
+}
+
+static void klioAtkActionInit(gpointer iface, gpointer) {
+    AtkActionIface* i = reinterpret_cast<AtkActionIface*>(iface);
+    i->get_n_actions = klioAtkGetNActions;
+    i->get_name = klioAtkActionName;
+    i->do_action = klioAtkDoAction;
+}
+
+// AtkValue: a slider's or progress bar's value; a new one is reached a
+// step at a time, as the semantics offer.
+static void klioAtkValueField(AtkValue* v, GValue* out, int which) {
+    const KlioA11yNode* n = klioAtkNode(reinterpret_cast<KlioAtkObject*>(v));
+    klioAtk().value_init(out, G_TYPE_DOUBLE);
+    klioAtk().value_set_double(out, !n ? 0.0 : which == 0 ? n->current : which == 1 ? n->min : n->max);
+}
+
+static void klioAtkGetCurrentValue(AtkValue* v, GValue* out) { klioAtkValueField(v, out, 0); }
+static void klioAtkGetMinimumValue(AtkValue* v, GValue* out) { klioAtkValueField(v, out, 1); }
+static void klioAtkGetMaximumValue(AtkValue* v, GValue* out) { klioAtkValueField(v, out, 2); }
+
+static gboolean klioAtkSetCurrentValue(AtkValue* v, const GValue* value) {
+    KlioAtkObject* o = reinterpret_cast<KlioAtkObject*>(v);
+    const KlioA11yNode* n = klioAtkNode(o);
+    if (!n) return FALSE;
+    const double target = klioAtk().value_get_double(value);
+    if (target == n->current) return TRUE;
+    return klioAtkPerform(o, target > n->current ? KLIO_A11Y_ACTION_INCREMENT : KLIO_A11Y_ACTION_DECREMENT);
+}
+
+static void klioAtkValueInit(gpointer iface, gpointer) {
+    AtkValueIface* i = reinterpret_cast<AtkValueIface*>(iface);
+    i->get_current_value = klioAtkGetCurrentValue;
+    i->get_minimum_value = klioAtkGetMinimumValue;
+    i->get_maximum_value = klioAtkGetMaximumValue;
+    i->set_current_value = klioAtkSetCurrentValue;
+}
+
+// AtkEditableText: a text field's new text.
+static void klioAtkSetTextContents(AtkEditableText* t, const gchar* text) {
+    klioAtkPerform(reinterpret_cast<KlioAtkObject*>(t), KLIO_A11Y_ACTION_SET_TEXT, text ? text : "");
+}
+
+static void klioAtkEditableTextInit(gpointer iface, gpointer) {
+    reinterpret_cast<AtkEditableTextIface*>(iface)->set_text_contents = klioAtkSetTextContents;
+}
+
+// AtkText: the text of a text field or of static text, by character.
+static std::string klioAtkText(KlioAtkObject* o) {
+    const KlioA11yNode* n = klioAtkNode(o);
+    if (!n) return std::string();
+    return n->role == KLIO_A11Y_ROLE_TEXT_FIELD || n->role == KLIO_A11Y_ROLE_PASSWORD_FIELD ? n->value : n->name;
+}
+
+static size_t klioUtf8Offset(const std::string& s, gint chars) {
+    size_t i = 0;
+    for (gint k = 0; i < s.size() && k < chars; k++) {
+        i++;
+        while (i < s.size() && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80) i++;
+    }
+    return i;
+}
+
+static gint klioUtf8Length(const std::string& s) {
+    gint n = 0;
+    for (unsigned char c : s) {
+        if ((c & 0xC0) != 0x80) n++;
+    }
+    return n;
+}
+
+static gchar* klioAtkGetText(AtkText* t, gint start, gint end) {
+    const std::string s = klioAtkText(reinterpret_cast<KlioAtkObject*>(t));
+    const size_t from = klioUtf8Offset(s, start);
+    const size_t to = end < 0 ? s.size() : klioUtf8Offset(s, end);
+    return klioAtk().strdup_(s.substr(from, to > from ? to - from : 0).c_str());
+}
+
+static gint klioAtkGetCharacterCount(AtkText* t) {
+    return klioUtf8Length(klioAtkText(reinterpret_cast<KlioAtkObject*>(t)));
+}
+
+static gint klioAtkGetCaretOffset(AtkText* t) { return klioAtkGetCharacterCount(t); }
+
+static void klioAtkTextInit(gpointer iface, gpointer) {
+    AtkTextIface* i = reinterpret_cast<AtkTextIface*>(iface);
+    i->get_text = klioAtkGetText;
+    i->get_character_count = klioAtkGetCharacterCount;
+    i->get_caret_offset = klioAtkGetCaretOffset;
+}
+
+// The interfaces an object offers beyond the component and the actions, as
+// GTK's accessibles differ by widget: text for static text, text and
+// editable text for a field, a value for a slider or progress bar.
+enum { KLIO_ATK_TEXT = 1, KLIO_ATK_EDITABLE = 2, KLIO_ATK_VALUE = 4 };
+
+static int klioAtkInterfacesOf(int role) {
+    switch (role) {
+        case KLIO_A11Y_ROLE_TEXT: return KLIO_ATK_TEXT;
+        case KLIO_A11Y_ROLE_TEXT_FIELD:
+        case KLIO_A11Y_ROLE_PASSWORD_FIELD: return KLIO_ATK_TEXT | KLIO_ATK_EDITABLE;
+        case KLIO_A11Y_ROLE_SLIDER:
+        case KLIO_A11Y_ROLE_PROGRESS: return KLIO_ATK_VALUE;
+        default: return 0;
+    }
+}
+
+// The object type offering the interfaces `ifaces` names, one per set.
+static GType klioAtkObjectType(int ifaces) {
+    static GType types[8] = {};
+    if (types[ifaces]) return types[ifaces];
+    KlioAtkApi& a = klioAtk();
+    GTypeInfo info = {};
+    info.class_size = sizeof(KlioAtkObjectClass);
+    info.class_init = klioAtkClassInit;
+    info.instance_size = sizeof(KlioAtkObject);
+    char name[32];
+    std::snprintf(name, sizeof name, "KlioAtkObject%d", ifaces);
+    const GType type = a.type_register_static(a.object_get_type(), name, &info, static_cast<GTypeFlags>(0));
+    GInterfaceInfo component = {klioAtkComponentInit, nullptr, nullptr};
+    GInterfaceInfo action = {klioAtkActionInit, nullptr, nullptr};
+    GInterfaceInfo value = {klioAtkValueInit, nullptr, nullptr};
+    GInterfaceInfo editable = {klioAtkEditableTextInit, nullptr, nullptr};
+    GInterfaceInfo text = {klioAtkTextInit, nullptr, nullptr};
+    a.type_add_interface_static(type, a.component_get_type(), &component);
+    a.type_add_interface_static(type, a.action_get_type(), &action);
+    if (ifaces & KLIO_ATK_VALUE) a.type_add_interface_static(type, a.value_get_type(), &value);
+    if (ifaces & KLIO_ATK_EDITABLE) a.type_add_interface_static(type, a.editable_text_get_type(), &editable);
+    if (ifaces & KLIO_ATK_TEXT) a.type_add_interface_static(type, a.text_get_type(), &text);
+    types[ifaces] = type;
+    return type;
+}
+
+static AtkObject* klioAtkGetRoot() { return &klioAtkApp()->parent; }
+static const gchar* klioAtkToolkitName() { return "klio"; }
+static const gchar* klioAtkToolkitVersion() { return "1"; }
+
+// Loads ATK and starts atk-bridge once: the application object becomes
+// the root AT-SPI clients reach the windows by.
+static bool klioAtkStart() {
+    KlioAtkApi& a = klioAtk();
+    if (a.bridged) return true;
+    if (!klioAtkLoad()) return false;
+    AtkUtilClass* util = reinterpret_cast<AtkUtilClass*>(a.type_class_ref(a.util_get_type()));
+    util->get_root = klioAtkGetRoot;
+    util->get_toolkit_name = klioAtkToolkitName;
+    util->get_toolkit_version = klioAtkToolkitVersion;
+    klioAtkApp();
+    a.bridge_init(nullptr, nullptr);
+    a.bridged = true;
+    return true;
+}
+
+// Answers AT-SPI clients: atk-bridge's D-Bus traffic runs on GLib's main
+// context, which the window loop drives.
+static void klioAtkPump() {
+    if (!klioAtk().bridged) return;
+    for (int i = 0; i < 64 && klioAtk().main_context_iteration(nullptr, FALSE); i++) {
+    }
+}
+#endif  // KLIO_ATK
+
+static void klioSdlA11yActivate(KlioWindow* kw) {
+    if (kw->a11yActive) return;
+    kw->a11yActive = true;
+    kw->events.push_back(klioA11yEv(0, 0));
+}
+
+#if defined(KLIO_ATK)
+static AtkObject* klioAtkFor(KlioWindow* kw, int nodeId) {
+    const auto it = kw->atk.find(nodeId);
+    return it == kw->atk.end() ? nullptr : &it->second->parent;
+}
+
+static KlioAtkObject* klioAtkNew(KlioWindow* kw, int kind, int nodeId, int ifaces = 0) {
+    auto* o = reinterpret_cast<KlioAtkObject*>(klioAtk().object_new(klioAtkObjectType(ifaces), nullptr));
+    o->kind = kind;
+    o->kw = kw;
+    o->nodeId = nodeId;
+    o->ifaces = ifaces;
+    return o;
+}
+
+// The window joins the application AT-SPI clients read.
+static void klioSdlA11yOpen(KlioWindow* kw) {
+    if (!klioAtkStart()) return;
+    kw->atk[-1] = klioAtkNew(kw, KLIO_ATK_FRAME, -1);
+    klioAtkWindows().push_back(kw);
+    klioAtk().signal_emit_by_name(klioAtkApp(), "children-changed::add",
+                                  static_cast<gint>(klioAtkWindows().size() - 1), klioAtkFor(kw, -1));
+}
+
+static void klioSdlA11yClose(KlioWindow* kw) {
+    auto& ws = klioAtkWindows();
+    for (size_t i = 0; i < ws.size(); i++) {
+        if (ws[i] != kw) continue;
+        ws.erase(ws.begin() + static_cast<long>(i));
+        klioAtk().signal_emit_by_name(klioAtkApp(), "children-changed::remove", static_cast<gint>(i), klioAtkFor(kw, -1));
+        break;
+    }
+    for (auto& entry : kw->atk) {
+        entry.second->kw = nullptr;
+        klioAtk().object_unref(entry.second);
+    }
+    kw->atk.clear();
+}
+
+// The window's semantics as the program sends them: objects keep their
+// identity across snapshots, and clients hear what changed.
+static void klioSdlA11yUpdate(KlioWindow* kw, const char* text, size_t len) {
+    KlioA11yTree next = klioParseA11y(text, len);
+    if (kw->atk.empty()) {
+        kw->a11y = std::move(next);
+        return;
+    }
+    KlioAtkApi& a = klioAtk();
+    const KlioA11yTree before = std::move(kw->a11y);
+    std::unordered_map<int, KlioAtkObject*> objects;
+    objects[-1] = kw->atk[-1];
+    kw->atk.erase(-1);
+    std::vector<int> added;
+    for (const KlioA11yNode& n : next.nodes) {
+        const auto it = kw->atk.find(n.id);
+        // A node whose role now wants other interfaces is a new object.
+        if (it != kw->atk.end() && it->second->ifaces == klioAtkInterfacesOf(n.role)) {
+            objects[n.id] = it->second;
+            kw->atk.erase(it);
+        } else {
+            objects[n.id] = klioAtkNew(kw, KLIO_ATK_NODE, n.id, klioAtkInterfacesOf(n.role));
+            added.push_back(n.id);
+        }
+    }
+    std::vector<KlioAtkObject*> gone;
+    for (auto& entry : kw->atk) gone.push_back(entry.second);
+    kw->atk = std::move(objects);
+    kw->a11y = std::move(next);
+    for (KlioAtkObject* o : gone) {
+        const KlioA11yNode* was = before.find(o->nodeId);
+        AtkObject* parent = was ? klioAtkFor(kw, was->parent >= 0 ? was->parent : -1) : nullptr;
+        o->kw = nullptr;
+        if (parent) a.signal_emit_by_name(parent, "children-changed::remove", -1, &o->parent);
+        a.notify_state_change(&o->parent, ATK_STATE_DEFUNCT, TRUE);
+        a.object_unref(o);
+    }
+    for (int id : added) {
+        const KlioA11yNode* n = kw->a11y.find(id);
+        AtkObject* parent = klioAtkFor(kw, n->parent >= 0 ? n->parent : -1);
+        if (parent) {
+            a.signal_emit_by_name(parent, "children-changed::add", klioAtkGetIndexInParent(klioAtkFor(kw, id)),
+                                  klioAtkFor(kw, id));
+        }
+    }
+    for (const KlioA11yNode& n : kw->a11y.nodes) {
+        const KlioA11yNode* was = before.find(n.id);
+        if (!was) continue;
+        AtkObject* o = klioAtkFor(kw, n.id);
+        const int changed = was->states ^ n.states;
+        if (changed & KLIO_A11Y_STATE_CHECKED) {
+            a.notify_state_change(o, n.role == KLIO_A11Y_ROLE_SWITCH ? ATK_STATE_PRESSED : ATK_STATE_CHECKED,
+                                  (n.states & KLIO_A11Y_STATE_CHECKED) != 0);
+        }
+        if (changed & KLIO_A11Y_STATE_ENABLED) a.notify_state_change(o, ATK_STATE_ENABLED, (n.states & KLIO_A11Y_STATE_ENABLED) != 0);
+        if (changed & KLIO_A11Y_STATE_EXPANDED) a.notify_state_change(o, ATK_STATE_EXPANDED, (n.states & KLIO_A11Y_STATE_EXPANDED) != 0);
+        if (changed & KLIO_A11Y_STATE_FOCUSED) a.notify_state_change(o, ATK_STATE_FOCUSED, (n.states & KLIO_A11Y_STATE_FOCUSED) != 0);
+        if (was->value != n.value || was->name != n.name) a.signal_emit_by_name(o, "visible-data-changed");
+    }
+}
+
+// A node's name as a client reads it through ATK.
+static std::string klioSdlAtkName(AtkObject* o) {
+    const gchar* name = klioAtk().get_name(o);
+    return name ? name : "";
+}
+
+static int klioSdlAtkRole(AtkObject* o) {
+    switch (klioAtk().get_role(o)) {
+        case ATK_ROLE_PUSH_BUTTON: return KLIO_A11Y_ROLE_BUTTON;
+        case ATK_ROLE_CHECK_BOX: return KLIO_A11Y_ROLE_CHECKBOX;
+        case ATK_ROLE_TOGGLE_BUTTON: return KLIO_A11Y_ROLE_SWITCH;
+        case ATK_ROLE_RADIO_BUTTON: return KLIO_A11Y_ROLE_RADIO_BUTTON;
+        case ATK_ROLE_PAGE_TAB: return KLIO_A11Y_ROLE_TAB;
+        case ATK_ROLE_COMBO_BOX: return KLIO_A11Y_ROLE_DROPDOWN;
+        case ATK_ROLE_IMAGE: return KLIO_A11Y_ROLE_IMAGE;
+        case ATK_ROLE_ENTRY: return KLIO_A11Y_ROLE_TEXT_FIELD;
+        case ATK_ROLE_PASSWORD_TEXT: return KLIO_A11Y_ROLE_PASSWORD_FIELD;
+        case ATK_ROLE_LABEL: return KLIO_A11Y_ROLE_TEXT;
+        case ATK_ROLE_SLIDER: return KLIO_A11Y_ROLE_SLIDER;
+        case ATK_ROLE_PROGRESS_BAR: return KLIO_A11Y_ROLE_PROGRESS;
+        case ATK_ROLE_SCROLL_PANE: return KLIO_A11Y_ROLE_SCROLL_AREA;
+        default: return KLIO_A11Y_ROLE_GROUP;
+    }
+}
+
+static void klioSdlAtkDump(AtkObject* o, int depth) {
+    KlioAtkApi& a = klioAtk();
+    const int role = klioSdlAtkRole(o);
+    AtkStateSet* states = a.ref_state_set(o);
+    std::string detail;
+    switch (role) {
+        case KLIO_A11Y_ROLE_CHECKBOX:
+        case KLIO_A11Y_ROLE_SWITCH:
+        case KLIO_A11Y_ROLE_RADIO_BUTTON:
+        case KLIO_A11Y_ROLE_TAB:
+            detail = a.state_set_contains_state(states, ATK_STATE_INDETERMINATE) ? "mixed"
+                     : a.state_set_contains_state(states, role == KLIO_A11Y_ROLE_SWITCH ? ATK_STATE_PRESSED : ATK_STATE_CHECKED)
+                         ? "checked"
+                         : "unchecked";
+            break;
+        case KLIO_A11Y_ROLE_TEXT_FIELD:
+        case KLIO_A11Y_ROLE_PASSWORD_FIELD: {
+            gchar* text = a.text_get_text(reinterpret_cast<AtkText*>(o), 0, -1);
+            detail = std::string("value=\"") + (text ? text : "") + "\"";
+            std::free(text);
+            break;
+        }
+        case KLIO_A11Y_ROLE_SLIDER:
+        case KLIO_A11Y_ROLE_PROGRESS: {
+            GValue v = G_VALUE_INIT;
+            a.value_get_current_value(reinterpret_cast<AtkValue*>(o), &v);
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "value=%g", a.value_get_double(&v));
+            a.value_unset(&v);
+            detail = buf;
+            break;
+        }
+        default:
+            break;
+    }
+    if (a.state_set_contains_state(states, ATK_STATE_FOCUSED)) detail += detail.empty() ? "focused" : " focused";
+    if (!a.state_set_contains_state(states, ATK_STATE_ENABLED)) detail += detail.empty() ? "disabled" : " disabled";
+    a.object_unref(states);
+    std::string name = klioSdlAtkName(o);
+    if (role == KLIO_A11Y_ROLE_TEXT_FIELD || role == KLIO_A11Y_ROLE_PASSWORD_FIELD || role == KLIO_A11Y_ROLE_TEXT) {
+        // A label reads its text; a field its name.
+        if (role == KLIO_A11Y_ROLE_TEXT && name.empty()) {
+            gchar* text = a.text_get_text(reinterpret_cast<AtkText*>(o), 0, -1);
+            name = text ? text : "";
+            std::free(text);
+        }
+    }
+    klioA11yDumpLine(depth, role, name, detail);
+    const gint n = a.get_n_children(o);
+    for (gint i = 0; i < n; i++) {
+        AtkObject* child = a.ref_child(o, i);
+        if (!child) continue;
+        klioSdlAtkDump(child, depth + 1);
+        a.object_unref(child);
+    }
+}
+
+static AtkObject* klioSdlAtkFind(AtkObject* o, const std::string& name) {
+    KlioAtkApi& a = klioAtk();
+    const gint n = a.get_n_children(o);
+    for (gint i = 0; i < n; i++) {
+        AtkObject* child = a.ref_child(o, i);
+        if (!child) continue;
+        if (klioSdlAtkName(child) == name) return child;
+        AtkObject* found = klioSdlAtkFind(child, name);
+        a.object_unref(child);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+// Scripted input asking through ATK, as an AT-SPI client asks through
+// atk-bridge.
+static void klioSdlA11yScript(KlioWindow* kw, int kind, const std::string& name, const std::string& text) {
+    AtkObject* frame = klioAtkFor(kw, -1);
+    if (!frame) {
+        std::fprintf(stderr, "klio: assistive technologies cannot read the window: ATK and atk-bridge are not installed\n");
+        return;
+    }
+    KlioAtkApi& a = klioAtk();
+    if (kind == KLIO_A11Y_SCRIPT_DUMP) {
+        const gint n = a.get_n_children(frame);
+        for (gint i = 0; i < n; i++) {
+            AtkObject* child = a.ref_child(frame, i);
+            if (!child) continue;
+            klioSdlAtkDump(child, 0);
+            a.object_unref(child);
+        }
+        return;
+    }
+    AtkObject* o = klioSdlAtkFind(frame, name);
+    if (!o) {
+        std::fprintf(stderr, "klio: no accessible node is named `%s`\n", name.c_str());
+        return;
+    }
+    switch (kind) {
+        case KLIO_A11Y_SCRIPT_PRESS:
+            if (a.action_get_n_actions(reinterpret_cast<AtkAction*>(o)) > 0) a.action_do_action(reinterpret_cast<AtkAction*>(o), 0);
+            break;
+        case KLIO_A11Y_SCRIPT_FOCUS: a.component_grab_focus(reinterpret_cast<AtkComponent*>(o)); break;
+        case KLIO_A11Y_SCRIPT_VALUE: a.set_text_contents(reinterpret_cast<AtkEditableText*>(o), text.c_str()); break;
+        case KLIO_A11Y_SCRIPT_INCREMENT: {
+            GValue v = G_VALUE_INIT;
+            a.value_get_current_value(reinterpret_cast<AtkValue*>(o), &v);
+            const double next = a.value_get_double(&v) + 1e-6;
+            a.value_unset(&v);
+            GValue target = G_VALUE_INIT;
+            a.value_init(&target, G_TYPE_DOUBLE);
+            a.value_set_double(&target, next);
+            a.value_set_current_value(reinterpret_cast<AtkValue*>(o), &target);
+            a.value_unset(&target);
+            break;
+        }
+        default: break;
+    }
+    a.object_unref(o);
+}
+
+static bool klioSdlA11yBridged() { return klioAtk().bridged; }
+#else
+static void klioSdlA11yOpen(KlioWindow*) {}
+static void klioSdlA11yClose(KlioWindow*) {}
+static void klioSdlA11yUpdate(KlioWindow* kw, const char* text, size_t len) { kw->a11y = klioParseA11y(text, len); }
+static void klioSdlA11yScript(KlioWindow*, int, const std::string&, const std::string&) {
+    std::fprintf(stderr, "klio: assistive technologies cannot read the window: the shim was built without ATK's headers (libatk1.0-dev)\n");
+}
+static bool klioSdlA11yBridged() { return false; }
+static void klioAtkPump() {}
+#endif  // KLIO_ATK
+
 // The input method's composing text, while a text field has the keyboard; an
 // empty one ends the composition.
 static void klioSdlCompose(KlioWindow* kw, const char* text) {
@@ -1638,12 +2489,20 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     if (!kw) return KLIO_EV_CLOSE;
     klioScriptTick(kw->script, kw->events);
     if (!kw->frameReport.reported) klioSdlReportFrame(kw);
+    klioAtkPump();
     int wait = timeoutMs;
     while (kw->events.empty()) {
         SDL_Event ev;
-        const int got = wait > 0 ? SDL_WaitEventTimeout(&ev, wait) : SDL_PollEvent(&ev);
-        wait = 0;
-        if (!got) break;
+        // With the accessibility bridge up, the wait is cut into slices so
+        // AT-SPI clients are answered while the window idles.
+        const int slice = klioSdlA11yBridged() && wait > 20 ? 20 : wait;
+        const int got = slice > 0 ? SDL_WaitEventTimeout(&ev, slice) : SDL_PollEvent(&ev);
+        klioAtkPump();
+        wait = got ? 0 : wait - slice;
+        if (!got) {
+            if (wait > 0) continue;
+            break;
+        }
         if (ev.type == SDL_QUIT) {
             kw->events.push_back(klioSimpleEv(KLIO_EV_CLOSE));
             break;
@@ -1670,6 +2529,14 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     }
     for (;;) {
         const int type = klioPopEv(kw->events, out, &kw->eventText);
+        if (type == KLIO_EV_A11Y_SCRIPT) {
+            const size_t at = static_cast<size_t>(out[1]);
+            const size_t textAt = static_cast<size_t>(out[2]);
+            if (textAt < klioScriptTexts().size()) {
+                klioSdlA11yScript(kw, static_cast<int>(out[0]), klioScriptTexts()[at], klioScriptTexts()[textAt]);
+            }
+            continue;
+        }
         if (type != KLIO_EV_MENU_PATH) {
             klioSdlShowMenus();
             return type;
@@ -1716,6 +2583,13 @@ size_t klio_win_event_text(KlioWindow* kw, char* buf, size_t cap) {
 
 // Only macOS has an emoji and symbols palette to open.
 void klio_order_emoji_palette(void) {}
+
+int klio_a11y_active(KlioWindow* kw) { return kw && kw->a11yActive ? 1 : 0; }
+
+void klio_a11y_update(KlioWindow* kw, const char* text, size_t len) {
+    if (!kw || !text) return;
+    klioSdlA11yUpdate(kw, text, len);
+}
 
 // A window's menu bar: SDL has no native menus, so the window draws the bar
 // and its menus itself, and the bar's height comes out of the content, whose
@@ -2521,6 +3395,7 @@ void klio_win_screen_bounds(int* x, int* y, int* w, int* h) {
 void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
     klioSdlWindows().erase(kw->id);
+    klioSdlA11yClose(kw);
     // The VIDEO subsystem is shared by every open window: quit it only
     // when the last one closes.
     const bool last = (--klioSdlOpenCount) <= 0;
@@ -2619,7 +3494,9 @@ char* klio_host_locale(void) { return nullptr; }
 // via a Windows cross target; not run-verified.
 #include <windows.h>
 #include <imm.h>
+#include <ole2.h>
 #include <shellapi.h>
+#include <uiautomation.h>
 
 struct KlioWindow {
     HWND hwnd;
@@ -2649,6 +3526,12 @@ struct KlioWindow {
     bool composing = false;     // the input method is composing
     RECT imeRect = {0, 0, 0, 0};  // the text cursor, in the client area
     std::string eventText;      // the text of the event last polled
+    // The window's semantics for assistive technologies (klio_a11y_update),
+    // their UI Automation providers by node id, and whether a client reads them.
+    bool a11yActive = false;
+    KlioA11yTree a11y;
+    std::unordered_map<int, class KlioUiaNode*> uiaNodes;
+    class KlioUiaRoot* uiaRoot = nullptr;
 };
 
 // A menu item's command: its entry's index past this base.
@@ -2931,10 +3814,762 @@ static bool klioWinIme(KlioWindow* kw, UINT msg, LPARAM lParam) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Accessibility: the window's semantics as UI Automation providers, as
+// Compose Desktop's ComposeSceneAccessible offers them through AWT's (the
+// Java Access Bridge). The window answers WM_GETOBJECT with a fragment root
+// whose fragments are the semantics nodes of the latest snapshot; a client
+// reading it asks the program to send them. The providers live on the
+// window's thread and are called there (ProviderOptions_UseComThreading).
+
+class KlioUiaRoot;
+
+// UI Automation's HeadingLevel1, which mingw's headers do not declare.
+constexpr long kKlioUiaHeadingLevel1 = 80051;
+
+static std::wstring klioWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return w;
+}
+
+static std::string klioNarrow(const wchar_t* w) {
+    if (!w || !*w) return std::string();
+    const int len = static_cast<int>(wcslen(w));
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, len, &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static void klioWinA11yActivate(KlioWindow* kw);
+static IRawElementProviderFragment* klioWinUiaNode(KlioWindow* kw, int nodeId);
+static KlioUiaRoot* klioWinUiaRoot(KlioWindow* kw);
+
+// A node's rectangle in the client area, on the screen.
+static UiaRect klioWinA11yScreenRect(KlioWindow* kw, const KlioA11yNode& n) {
+    POINT origin = {0, 0};
+    ClientToScreen(kw->hwnd, &origin);
+    return UiaRect{origin.x + n.x, origin.y + n.y, n.w, n.h};
+}
+
+// One semantics node as UI Automation exposes it: its control type, name
+// and state read from the window's latest snapshot, and the patterns its
+// actions give it, each queued as KLIO_EV_A11Y for the program to run.
+class KlioUiaNode final : public IRawElementProviderSimple,
+                          public IRawElementProviderFragment,
+                          public IInvokeProvider,
+                          public IToggleProvider,
+                          public IValueProvider,
+                          public IRangeValueProvider,
+                          public IExpandCollapseProvider {
+  public:
+    KlioUiaNode(KlioWindow* kw, int nodeId) : kw_(kw), nodeId_(nodeId) {}
+
+    // The window closed or the node left the tree: the provider answers
+    // UIA_E_ELEMENTNOTAVAILABLE from then on.
+    void detach() { kw_ = nullptr; }
+    int nodeId() const { return nodeId_; }
+
+    const KlioA11yNode* node() const { return kw_ ? kw_->a11y.find(nodeId_) : nullptr; }
+
+    // IUnknown
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&refs_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IRawElementProviderSimple)) {
+            *out = static_cast<IRawElementProviderSimple*>(this);
+        } else if (riid == __uuidof(IRawElementProviderFragment)) {
+            *out = static_cast<IRawElementProviderFragment*>(this);
+        } else if (riid == __uuidof(IInvokeProvider)) {
+            *out = static_cast<IInvokeProvider*>(this);
+        } else if (riid == __uuidof(IToggleProvider)) {
+            *out = static_cast<IToggleProvider*>(this);
+        } else if (riid == __uuidof(IValueProvider)) {
+            *out = static_cast<IValueProvider*>(this);
+        } else if (riid == __uuidof(IRangeValueProvider)) {
+            *out = static_cast<IRangeValueProvider*>(this);
+        } else if (riid == __uuidof(IExpandCollapseProvider)) {
+            *out = static_cast<IExpandCollapseProvider*>(this);
+        } else {
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+
+    // IRawElementProviderSimple
+    HRESULT STDMETHODCALLTYPE get_ProviderOptions(ProviderOptions* out) override {
+        if (!out) return E_POINTER;
+        *out = static_cast<ProviderOptions>(ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID pattern, IUnknown** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        bool has = false;
+        switch (pattern) {
+            case UIA_InvokePatternId:
+                has = klioA11yOffers(n->actions, KLIO_A11Y_ACTION_CLICK) && !(n->states & KLIO_A11Y_STATE_CHECKABLE);
+                break;
+            case UIA_TogglePatternId: has = (n->states & KLIO_A11Y_STATE_CHECKABLE) != 0; break;
+            case UIA_ValuePatternId:
+                has = n->role == KLIO_A11Y_ROLE_TEXT_FIELD || n->role == KLIO_A11Y_ROLE_PASSWORD_FIELD;
+                break;
+            case UIA_RangeValuePatternId:
+                has = n->role == KLIO_A11Y_ROLE_SLIDER || n->role == KLIO_A11Y_ROLE_PROGRESS;
+                break;
+            case UIA_ExpandCollapsePatternId:
+                has = (n->states & (KLIO_A11Y_STATE_EXPANDED | KLIO_A11Y_STATE_COLLAPSED)) != 0;
+                break;
+            default: break;
+        }
+        if (!has) return S_OK;
+        return QueryInterface(pattern == UIA_InvokePatternId ? __uuidof(IInvokeProvider)
+                              : pattern == UIA_TogglePatternId ? __uuidof(IToggleProvider)
+                              : pattern == UIA_ValuePatternId ? __uuidof(IValueProvider)
+                              : pattern == UIA_RangeValuePatternId ? __uuidof(IRangeValueProvider)
+                                                                   : __uuidof(IExpandCollapseProvider),
+                              reinterpret_cast<void**>(out));
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property, VARIANT* out) override {
+        if (!out) return E_POINTER;
+        VariantInit(out);
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        switch (property) {
+            case UIA_ControlTypePropertyId:
+                out->vt = VT_I4;
+                out->lVal = controlType(*n);
+                break;
+            case UIA_NamePropertyId:
+                if (!n->name.empty()) {
+                    out->vt = VT_BSTR;
+                    out->bstrVal = SysAllocString(klioWide(n->name).c_str());
+                }
+                break;
+            case UIA_HelpTextPropertyId:
+                if (!n->description.empty() && n->description != n->name) {
+                    out->vt = VT_BSTR;
+                    out->bstrVal = SysAllocString(klioWide(n->description).c_str());
+                }
+                break;
+            case UIA_AutomationIdPropertyId:
+                out->vt = VT_BSTR;
+                out->bstrVal = SysAllocString(std::to_wstring(n->id).c_str());
+                break;
+            case UIA_IsEnabledPropertyId:
+                out->vt = VT_BOOL;
+                out->boolVal = (n->states & KLIO_A11Y_STATE_ENABLED) ? VARIANT_TRUE : VARIANT_FALSE;
+                break;
+            case UIA_HasKeyboardFocusPropertyId:
+                out->vt = VT_BOOL;
+                out->boolVal = (n->states & KLIO_A11Y_STATE_FOCUSED) ? VARIANT_TRUE : VARIANT_FALSE;
+                break;
+            case UIA_IsKeyboardFocusablePropertyId:
+                out->vt = VT_BOOL;
+                out->boolVal = klioA11yOffers(n->actions, KLIO_A11Y_ACTION_FOCUS) ? VARIANT_TRUE : VARIANT_FALSE;
+                break;
+            case UIA_IsPasswordPropertyId:
+                out->vt = VT_BOOL;
+                out->boolVal = n->role == KLIO_A11Y_ROLE_PASSWORD_FIELD ? VARIANT_TRUE : VARIANT_FALSE;
+                break;
+            case UIA_HeadingLevelPropertyId:
+                if (n->states & KLIO_A11Y_STATE_HEADING) {
+                    out->vt = VT_I4;
+                    out->lVal = kKlioUiaHeadingLevel1;
+                }
+                break;
+            default: break;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return S_OK;
+    }
+
+    // IRawElementProviderFragment
+    HRESULT STDMETHODCALLTYPE Navigate(NavigateDirection direction, IRawElementProviderFragment** out) override;
+    HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY** out) override {
+        if (!out) return E_POINTER;
+        int ids[2] = {UiaAppendRuntimeId, nodeId_};
+        *out = SafeArrayCreateVector(VT_I4, 0, 2);
+        if (!*out) return E_OUTOFMEMORY;
+        for (LONG i = 0; i < 2; i++) SafeArrayPutElement(*out, &i, &ids[i]);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_BoundingRectangle(UiaRect* out) override {
+        if (!out) return E_POINTER;
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        *out = klioWinA11yScreenRect(kw_, *n);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetEmbeddedFragmentRoots(SAFEARRAY** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetFocus() override { return perform(KLIO_A11Y_ACTION_FOCUS); }
+    HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot** out) override;
+
+    // IInvokeProvider
+    HRESULT STDMETHODCALLTYPE Invoke() override { return perform(KLIO_A11Y_ACTION_CLICK); }
+
+    // IToggleProvider
+    HRESULT STDMETHODCALLTYPE Toggle() override { return perform(KLIO_A11Y_ACTION_CLICK); }
+    HRESULT STDMETHODCALLTYPE get_ToggleState(ToggleState* out) override {
+        if (!out) return E_POINTER;
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        *out = (n->states & KLIO_A11Y_STATE_MIXED)     ? ToggleState_Indeterminate
+               : (n->states & KLIO_A11Y_STATE_CHECKED) ? ToggleState_On
+                                                       : ToggleState_Off;
+        return S_OK;
+    }
+
+    // IValueProvider
+    HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR value) override {
+        return perform(KLIO_A11Y_ACTION_SET_TEXT, klioNarrow(value));
+    }
+    HRESULT STDMETHODCALLTYPE get_Value(BSTR* out) override {
+        if (!out) return E_POINTER;
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        *out = SysAllocString(klioWide(n->value).c_str());
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL* out) override {
+        if (!out) return E_POINTER;
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        const bool range = n->role == KLIO_A11Y_ROLE_SLIDER || n->role == KLIO_A11Y_ROLE_PROGRESS;
+        *out = !klioA11yOffers(n->actions, range ? KLIO_A11Y_ACTION_INCREMENT : KLIO_A11Y_ACTION_SET_TEXT);
+        return S_OK;
+    }
+
+    // IRangeValueProvider: a value is reached a step at a time, as the
+    // semantics offer (the increment and decrement actions).
+    HRESULT STDMETHODCALLTYPE SetValue(double value) override {
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (value == n->current) return S_OK;
+        return perform(value > n->current ? KLIO_A11Y_ACTION_INCREMENT : KLIO_A11Y_ACTION_DECREMENT);
+    }
+    HRESULT STDMETHODCALLTYPE get_Value(double* out) override { return rangeField(out, 0); }
+    HRESULT STDMETHODCALLTYPE get_Maximum(double* out) override { return rangeField(out, 1); }
+    HRESULT STDMETHODCALLTYPE get_Minimum(double* out) override { return rangeField(out, 2); }
+    HRESULT STDMETHODCALLTYPE get_LargeChange(double* out) override { return rangeField(out, 3); }
+    HRESULT STDMETHODCALLTYPE get_SmallChange(double* out) override { return rangeField(out, 3); }
+
+    // IExpandCollapseProvider
+    HRESULT STDMETHODCALLTYPE Expand() override { return perform(KLIO_A11Y_ACTION_EXPAND); }
+    HRESULT STDMETHODCALLTYPE Collapse() override { return perform(KLIO_A11Y_ACTION_COLLAPSE); }
+    HRESULT STDMETHODCALLTYPE get_ExpandCollapseState(ExpandCollapseState* out) override {
+        if (!out) return E_POINTER;
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        *out = (n->states & KLIO_A11Y_STATE_EXPANDED) ? ExpandCollapseState_Expanded : ExpandCollapseState_Collapsed;
+        return S_OK;
+    }
+
+    static long controlType(const KlioA11yNode& n) {
+        switch (n.role) {
+            case KLIO_A11Y_ROLE_BUTTON: return UIA_ButtonControlTypeId;
+            case KLIO_A11Y_ROLE_CHECKBOX:
+            case KLIO_A11Y_ROLE_SWITCH: return UIA_CheckBoxControlTypeId;
+            case KLIO_A11Y_ROLE_RADIO_BUTTON: return UIA_RadioButtonControlTypeId;
+            case KLIO_A11Y_ROLE_TAB: return UIA_TabItemControlTypeId;
+            case KLIO_A11Y_ROLE_DROPDOWN: return UIA_ComboBoxControlTypeId;
+            case KLIO_A11Y_ROLE_IMAGE: return UIA_ImageControlTypeId;
+            case KLIO_A11Y_ROLE_TEXT_FIELD:
+            case KLIO_A11Y_ROLE_PASSWORD_FIELD: return UIA_EditControlTypeId;
+            case KLIO_A11Y_ROLE_TEXT: return UIA_TextControlTypeId;
+            case KLIO_A11Y_ROLE_SLIDER: return UIA_SliderControlTypeId;
+            case KLIO_A11Y_ROLE_PROGRESS: return UIA_ProgressBarControlTypeId;
+            case KLIO_A11Y_ROLE_SCROLL_AREA: return UIA_PaneControlTypeId;
+            default: return UIA_GroupControlTypeId;
+        }
+    }
+
+  private:
+    HRESULT perform(int action, const std::string& text = std::string()) {
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!klioA11yOffers(n->actions, action)) return UIA_E_INVALIDOPERATION;
+        kw_->events.push_back(klioA11yEv(nodeId_, action, text.c_str()));
+        return S_OK;
+    }
+
+    HRESULT rangeField(double* out, int which) {
+        if (!out) return E_POINTER;
+        const KlioA11yNode* n = node();
+        if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+        *out = which == 0 ? n->current : which == 1 ? n->max : which == 2 ? n->min : (n->max - n->min) / 10.0;
+        return S_OK;
+    }
+
+    LONG refs_ = 1;
+    KlioWindow* kw_;
+    int nodeId_;
+};
+
+// The window as UI Automation's fragment root: the host window's provider
+// underneath, the semantics roots as its children.
+class KlioUiaRoot final : public IRawElementProviderSimple,
+                          public IRawElementProviderFragment,
+                          public IRawElementProviderFragmentRoot {
+  public:
+    explicit KlioUiaRoot(KlioWindow* kw) : kw_(kw) {}
+    void detach() { kw_ = nullptr; }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&refs_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IRawElementProviderSimple)) {
+            *out = static_cast<IRawElementProviderSimple*>(this);
+        } else if (riid == __uuidof(IRawElementProviderFragment)) {
+            *out = static_cast<IRawElementProviderFragment*>(this);
+        } else if (riid == __uuidof(IRawElementProviderFragmentRoot)) {
+            *out = static_cast<IRawElementProviderFragmentRoot*>(this);
+        } else {
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_ProviderOptions(ProviderOptions* out) override {
+        if (!out) return E_POINTER;
+        *out = static_cast<ProviderOptions>(ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID, IUnknown** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID, VARIANT* out) override {
+        if (!out) return E_POINTER;
+        VariantInit(out);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!kw_) return UIA_E_ELEMENTNOTAVAILABLE;
+        return UiaHostProviderFromHwnd(kw_->hwnd, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE Navigate(NavigateDirection direction, IRawElementProviderFragment** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!kw_ || kw_->a11y.roots.empty()) return S_OK;
+        if (direction == NavigateDirection_FirstChild) *out = klioWinUiaNode(kw_, kw_->a11y.roots.front());
+        else if (direction == NavigateDirection_LastChild) *out = klioWinUiaNode(kw_, kw_->a11y.roots.back());
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_BoundingRectangle(UiaRect* out) override {
+        if (!out) return E_POINTER;
+        *out = UiaRect{0, 0, 0, 0};
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetEmbeddedFragmentRoots(SAFEARRAY** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetFocus() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot** out) override {
+        if (!out) return E_POINTER;
+        *out = this;
+        AddRef();
+        return S_OK;
+    }
+
+    // IRawElementProviderFragmentRoot
+    HRESULT STDMETHODCALLTYPE ElementProviderFromPoint(double x, double y, IRawElementProviderFragment** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!kw_) return S_OK;
+        // The last node in document order under the point is the innermost.
+        for (auto it = kw_->a11y.nodes.rbegin(); it != kw_->a11y.nodes.rend(); ++it) {
+            const UiaRect r = klioWinA11yScreenRect(kw_, *it);
+            if (x >= r.left && y >= r.top && x < r.left + r.width && y < r.top + r.height) {
+                *out = klioWinUiaNode(kw_, it->id);
+                return S_OK;
+            }
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetFocus(IRawElementProviderFragment** out) override {
+        if (!out) return E_POINTER;
+        *out = kw_ ? klioWinUiaNode(kw_, kw_->a11y.focused()) : nullptr;
+        return S_OK;
+    }
+
+  private:
+    LONG refs_ = 1;
+    KlioWindow* kw_;
+};
+
+// The provider of a node of the latest snapshot, with a reference for the
+// caller; null for none.
+static IRawElementProviderFragment* klioWinUiaNode(KlioWindow* kw, int nodeId) {
+    const auto it = kw->uiaNodes.find(nodeId);
+    if (it == kw->uiaNodes.end()) return nullptr;
+    it->second->AddRef();
+    return static_cast<IRawElementProviderFragment*>(it->second);
+}
+
+static KlioUiaRoot* klioWinUiaRoot(KlioWindow* kw) {
+    if (!kw->uiaRoot) kw->uiaRoot = new KlioUiaRoot(kw);
+    return kw->uiaRoot;
+}
+
+HRESULT KlioUiaNode::Navigate(NavigateDirection direction, IRawElementProviderFragment** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    const KlioA11yNode* n = node();
+    if (!n) return UIA_E_ELEMENTNOTAVAILABLE;
+    switch (direction) {
+        case NavigateDirection_Parent:
+            if (n->parent >= 0 && kw_->a11y.find(n->parent)) {
+                *out = klioWinUiaNode(kw_, n->parent);
+            } else {
+                KlioUiaRoot* root = klioWinUiaRoot(kw_);
+                root->AddRef();
+                *out = static_cast<IRawElementProviderFragment*>(root);
+            }
+            return S_OK;
+        case NavigateDirection_FirstChild:
+            if (!n->children.empty()) *out = klioWinUiaNode(kw_, n->children.front());
+            return S_OK;
+        case NavigateDirection_LastChild:
+            if (!n->children.empty()) *out = klioWinUiaNode(kw_, n->children.back());
+            return S_OK;
+        case NavigateDirection_NextSibling:
+        case NavigateDirection_PreviousSibling: {
+            const KlioA11yNode* parent = n->parent >= 0 ? kw_->a11y.find(n->parent) : nullptr;
+            const std::vector<int>& siblings = parent ? parent->children : kw_->a11y.roots;
+            for (size_t i = 0; i < siblings.size(); i++) {
+                if (siblings[i] != nodeId_) continue;
+                if (direction == NavigateDirection_NextSibling && i + 1 < siblings.size()) {
+                    *out = klioWinUiaNode(kw_, siblings[i + 1]);
+                } else if (direction == NavigateDirection_PreviousSibling && i > 0) {
+                    *out = klioWinUiaNode(kw_, siblings[i - 1]);
+                }
+                break;
+            }
+            return S_OK;
+        }
+        default:
+            return S_OK;
+    }
+}
+
+HRESULT KlioUiaNode::get_FragmentRoot(IRawElementProviderFragmentRoot** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!kw_) return UIA_E_ELEMENTNOTAVAILABLE;
+    KlioUiaRoot* root = klioWinUiaRoot(kw_);
+    root->AddRef();
+    *out = static_cast<IRawElementProviderFragmentRoot*>(root);
+    return S_OK;
+}
+
+static void klioWinA11yActivate(KlioWindow* kw) {
+    if (kw->a11yActive) return;
+    kw->a11yActive = true;
+    kw->events.push_back(klioA11yEv(0, 0));
+}
+
+// The window's providers let go: the window is closing.
+static void klioWinA11yRelease(KlioWindow* kw) {
+    for (auto& entry : kw->uiaNodes) {
+        entry.second->detach();
+        entry.second->Release();
+    }
+    kw->uiaNodes.clear();
+    if (kw->uiaRoot) {
+        kw->uiaRoot->detach();
+        UiaDisconnectProvider(static_cast<IRawElementProviderSimple*>(kw->uiaRoot));
+        kw->uiaRoot->Release();
+        kw->uiaRoot = nullptr;
+    }
+}
+
+// A node's name as a client reads it through the provider.
+static std::string klioWinUiaName(IRawElementProviderSimple* p) {
+    VARIANT v;
+    p->GetPropertyValue(UIA_NamePropertyId, &v);
+    std::string name = v.vt == VT_BSTR ? klioNarrow(v.bstrVal) : std::string();
+    VariantClear(&v);
+    return name;
+}
+
+static int klioWinUiaRole(IRawElementProviderSimple* p) {
+    VARIANT v;
+    p->GetPropertyValue(UIA_ControlTypePropertyId, &v);
+    const long type = v.vt == VT_I4 ? v.lVal : 0;
+    VariantClear(&v);
+    VARIANT pw;
+    p->GetPropertyValue(UIA_IsPasswordPropertyId, &pw);
+    const bool password = pw.vt == VT_BOOL && pw.boolVal == VARIANT_TRUE;
+    switch (type) {
+        case UIA_ButtonControlTypeId: return KLIO_A11Y_ROLE_BUTTON;
+        case UIA_CheckBoxControlTypeId: return KLIO_A11Y_ROLE_CHECKBOX;
+        case UIA_RadioButtonControlTypeId: return KLIO_A11Y_ROLE_RADIO_BUTTON;
+        case UIA_TabItemControlTypeId: return KLIO_A11Y_ROLE_TAB;
+        case UIA_ComboBoxControlTypeId: return KLIO_A11Y_ROLE_DROPDOWN;
+        case UIA_ImageControlTypeId: return KLIO_A11Y_ROLE_IMAGE;
+        case UIA_EditControlTypeId: return password ? KLIO_A11Y_ROLE_PASSWORD_FIELD : KLIO_A11Y_ROLE_TEXT_FIELD;
+        case UIA_TextControlTypeId: return KLIO_A11Y_ROLE_TEXT;
+        case UIA_SliderControlTypeId: return KLIO_A11Y_ROLE_SLIDER;
+        case UIA_ProgressBarControlTypeId: return KLIO_A11Y_ROLE_PROGRESS;
+        case UIA_PaneControlTypeId: return KLIO_A11Y_ROLE_SCROLL_AREA;
+        default: return KLIO_A11Y_ROLE_GROUP;
+    }
+}
+
+// The providers' children, through Navigate as UI Automation walks them.
+static std::vector<IRawElementProviderFragment*> klioWinUiaChildren(IRawElementProviderFragment* f) {
+    std::vector<IRawElementProviderFragment*> out;
+    IRawElementProviderFragment* child = nullptr;
+    f->Navigate(NavigateDirection_FirstChild, &child);
+    while (child) {
+        out.push_back(child);
+        IRawElementProviderFragment* next = nullptr;
+        child->Navigate(NavigateDirection_NextSibling, &next);
+        child = next;
+    }
+    return out;
+}
+
+static void klioWinUiaDump(IRawElementProviderFragment* f, int depth) {
+    IRawElementProviderSimple* p = nullptr;
+    f->QueryInterface(__uuidof(IRawElementProviderSimple), reinterpret_cast<void**>(&p));
+    const int role = klioWinUiaRole(p);
+    std::string detail;
+    IUnknown* pattern = nullptr;
+    if (p->GetPatternProvider(UIA_TogglePatternId, &pattern) == S_OK && pattern) {
+        ToggleState state = ToggleState_Off;
+        static_cast<IToggleProvider*>(pattern)->get_ToggleState(&state);
+        detail = state == ToggleState_Indeterminate ? "mixed" : state == ToggleState_On ? "checked" : "unchecked";
+        pattern->Release();
+    } else if (p->GetPatternProvider(UIA_ValuePatternId, &pattern) == S_OK && pattern) {
+        BSTR value = nullptr;
+        static_cast<IValueProvider*>(pattern)->get_Value(&value);
+        detail = "value=\"" + klioNarrow(value) + "\"";
+        SysFreeString(value);
+        pattern->Release();
+    } else if (p->GetPatternProvider(UIA_RangeValuePatternId, &pattern) == S_OK && pattern) {
+        double value = 0;
+        static_cast<IRangeValueProvider*>(pattern)->get_Value(&value);
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "value=%g", value);
+        detail = buf;
+        pattern->Release();
+    }
+    VARIANT v;
+    p->GetPropertyValue(UIA_HasKeyboardFocusPropertyId, &v);
+    if (v.vt == VT_BOOL && v.boolVal == VARIANT_TRUE) detail += detail.empty() ? "focused" : " focused";
+    p->GetPropertyValue(UIA_IsEnabledPropertyId, &v);
+    if (v.vt == VT_BOOL && v.boolVal != VARIANT_TRUE) detail += detail.empty() ? "disabled" : " disabled";
+    klioA11yDumpLine(depth, role, klioWinUiaName(p), detail);
+    p->Release();
+    for (IRawElementProviderFragment* child : klioWinUiaChildren(f)) {
+        klioWinUiaDump(child, depth + 1);
+        child->Release();
+    }
+}
+
+static IRawElementProviderFragment* klioWinUiaFind(IRawElementProviderFragment* f, const std::string& name) {
+    for (IRawElementProviderFragment* child : klioWinUiaChildren(f)) {
+        IRawElementProviderSimple* p = nullptr;
+        child->QueryInterface(__uuidof(IRawElementProviderSimple), reinterpret_cast<void**>(&p));
+        const bool match = klioWinUiaName(p) == name;
+        p->Release();
+        if (match) return child;
+        IRawElementProviderFragment* found = klioWinUiaFind(child, name);
+        child->Release();
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+// Scripted input asking through the window's UI Automation providers, as a
+// client asks.
+static void klioWinA11yScript(KlioWindow* kw, int kind, const std::string& name, const std::string& text) {
+    KlioUiaRoot* root = klioWinUiaRoot(kw);
+    if (kind == KLIO_A11Y_SCRIPT_DUMP) {
+        for (IRawElementProviderFragment* child : klioWinUiaChildren(root)) {
+            klioWinUiaDump(child, 0);
+            child->Release();
+        }
+        return;
+    }
+    IRawElementProviderFragment* f = klioWinUiaFind(root, name);
+    if (!f) {
+        std::fprintf(stderr, "klio: no accessible node is named `%s`\n", name.c_str());
+        return;
+    }
+    KlioUiaNode* node = static_cast<KlioUiaNode*>(f);
+    switch (kind) {
+        case KLIO_A11Y_SCRIPT_PRESS: {
+            ToggleState state;
+            if (node->get_ToggleState(&state) == S_OK && (node->node()->states & KLIO_A11Y_STATE_CHECKABLE)) {
+                node->Toggle();
+            } else {
+                node->Invoke();
+            }
+            break;
+        }
+        case KLIO_A11Y_SCRIPT_FOCUS: node->SetFocus(); break;
+        case KLIO_A11Y_SCRIPT_VALUE: node->SetValue(klioWide(text).c_str()); break;
+        case KLIO_A11Y_SCRIPT_INCREMENT: {
+            double value = 0;
+            node->get_Value(&value);
+            node->SetValue(value + 1e-6);
+            break;
+        }
+        default: break;
+    }
+    f->Release();
+}
+
+// Whether an assistive client reads the window.
+static int klioWinA11yIsActive(KlioWindow* kw) { return kw && kw->a11yActive ? 1 : 0; }
+
+static void klioWinUiaRaiseProperty(KlioUiaNode* node, PROPERTYID property, VARIANT before, VARIANT after) {
+    UiaRaiseAutomationPropertyChangedEvent(static_cast<IRawElementProviderSimple*>(node), property, before, after);
+    VariantClear(&before);
+    VariantClear(&after);
+}
+
+static VARIANT klioWinBstr(const std::string& s) {
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_BSTR;
+    v.bstrVal = SysAllocString(klioWide(s).c_str());
+    return v;
+}
+
+static VARIANT klioWinI4(long n) {
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_I4;
+    v.lVal = n;
+    return v;
+}
+
+static VARIANT klioWinR8(double d) {
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_R8;
+    v.dblVal = d;
+    return v;
+}
+
+static long klioWinToggle(int states) {
+    return (states & KLIO_A11Y_STATE_MIXED) ? ToggleState_Indeterminate
+           : (states & KLIO_A11Y_STATE_CHECKED) ? ToggleState_On
+                                                : ToggleState_Off;
+}
+
+// The window's semantics as the program sends them: providers keep their
+// identity across snapshots, and listening clients hear what changed.
+static void klioWinA11yUpdate(KlioWindow* kw, const char* text, size_t len) {
+    KlioA11yTree next = klioParseA11y(text, len);
+    const bool listening = UiaClientsAreListening() != FALSE;
+    bool structure = next.nodes.size() != kw->a11y.nodes.size();
+    std::vector<std::pair<KlioUiaNode*, KlioA11yNode>> changed;
+    std::unordered_map<int, KlioUiaNode*> nodes;
+    for (const KlioA11yNode& n : next.nodes) {
+        const auto it = kw->uiaNodes.find(n.id);
+        if (it != kw->uiaNodes.end()) {
+            nodes[n.id] = it->second;
+            kw->uiaNodes.erase(it);
+            const KlioA11yNode* before = kw->a11y.find(n.id);
+            if (before) {
+                changed.push_back({nodes[n.id], *before});
+                if (before->children != n.children) structure = true;
+            }
+        } else {
+            nodes[n.id] = new KlioUiaNode(kw, n.id);
+            structure = true;
+        }
+    }
+    for (auto& gone : kw->uiaNodes) {
+        gone.second->detach();
+        gone.second->Release();
+        structure = true;
+    }
+    kw->uiaNodes = std::move(nodes);
+    const int focusedBefore = kw->a11y.focused();
+    kw->a11y = std::move(next);
+    if (!listening) return;
+    for (auto& entry : changed) {
+        KlioUiaNode* node = entry.first;
+        const KlioA11yNode& before = entry.second;
+        const KlioA11yNode* now = node->node();
+        if (!now) continue;
+        if (before.name != now->name) klioWinUiaRaiseProperty(node, UIA_NamePropertyId, klioWinBstr(before.name), klioWinBstr(now->name));
+        if (before.value != now->value) klioWinUiaRaiseProperty(node, UIA_ValueValuePropertyId, klioWinBstr(before.value), klioWinBstr(now->value));
+        if (klioWinToggle(before.states) != klioWinToggle(now->states)) {
+            klioWinUiaRaiseProperty(node, UIA_ToggleToggleStatePropertyId, klioWinI4(klioWinToggle(before.states)),
+                                    klioWinI4(klioWinToggle(now->states)));
+        }
+        if (before.current != now->current) {
+            klioWinUiaRaiseProperty(node, UIA_RangeValueValuePropertyId, klioWinR8(before.current), klioWinR8(now->current));
+        }
+    }
+    if (structure) {
+        UiaRaiseStructureChangedEvent(static_cast<IRawElementProviderSimple*>(klioWinUiaRoot(kw)),
+                                      StructureChangeType_ChildrenInvalidated, nullptr, 0);
+    }
+    const int focused = kw->a11y.focused();
+    if (focused != focusedBefore && focused >= 0) {
+        const auto it = kw->uiaNodes.find(focused);
+        if (it != kw->uiaNodes.end()) {
+            UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(it->second), UIA_AutomationFocusChangedEventId);
+        }
+    }
+}
+
 static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* kw = reinterpret_cast<KlioWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
     if (kw) klioWinTranslate(kw, msg, wParam, lParam);
     if (kw && klioWinIme(kw, msg, lParam)) return 0;
+    // An assistive client asks for the window's UI Automation root.
+    if (kw && msg == WM_GETOBJECT && static_cast<long>(lParam) == static_cast<long>(UiaRootObjectId)) {
+        klioWinA11yActivate(kw);
+        return UiaReturnRawElementProvider(hwnd, wParam, lParam,
+                                           static_cast<IRawElementProviderSimple*>(klioWinUiaRoot(kw)));
+    }
     if (kw && msg == WM_IME_SETCONTEXT && kw->textInput) {
         return DefWindowProc(hwnd, msg, wParam, lParam & ~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW));
     }
@@ -2989,6 +4624,8 @@ extern "C" {
 
 KlioWindow* klio_win_open(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return nullptr;
+    // UI Automation calls the window's providers through its COM apartment.
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     HINSTANCE inst = GetModuleHandle(nullptr);
     static const char* kClass = "KlioWindowClass";
     static bool registered = false;
@@ -3011,6 +4648,7 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         return nullptr;
     }
     auto* kw = new KlioWindow{hwnd, w, h, nullptr, 0, 0, 0, false, {}, 0, false, 0};
+    kw->a11yActive = klioA11yForced();
     kw->surface = klio_skia_new(w, h);
     if (!kw->surface) {
         DestroyWindow(hwnd);
@@ -3108,6 +4746,14 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
 static int klioWinPop(KlioWindow* kw, double* out) {
     for (;;) {
         const int type = klioPopEv(kw->events, out, &kw->eventText);
+        if (type == KLIO_EV_A11Y_SCRIPT) {
+            const size_t at = static_cast<size_t>(out[1]);
+            const size_t textAt = static_cast<size_t>(out[2]);
+            if (textAt < klioScriptTexts().size()) {
+                klioWinA11yScript(kw, static_cast<int>(out[0]), klioScriptTexts()[at], klioScriptTexts()[textAt]);
+            }
+            continue;
+        }
         if (type != KLIO_EV_MENU_PATH) return type;
         const size_t at = static_cast<size_t>(out[0]);
         // A native menu is not left open: menushow is the drawn menus'.
@@ -3517,6 +5163,13 @@ size_t klio_win_event_text(KlioWindow* kw, char* buf, size_t cap) {
 // is the user's (Win+.) and types through the input method.
 void klio_order_emoji_palette(void) {}
 
+int klio_a11y_active(KlioWindow* kw) { return klioWinA11yIsActive(kw); }
+
+void klio_a11y_update(KlioWindow* kw, const char* text, size_t len) {
+    if (!kw || !text) return;
+    klioWinA11yUpdate(kw, text, len);
+}
+
 // The window style its KLIO_WIN_* properties give.
 static LONG_PTR klioWinStyle(KlioWindow* kw, LONG_PTR style) {
     style &= ~(WS_OVERLAPPEDWINDOW | WS_POPUP);
@@ -3727,6 +5380,8 @@ void klio_win_set_size(KlioWindow* kw, int w, int h) {
 void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
     if (kw->surface) klio_skia_free(kw->surface);
+    UiaReturnRawElementProvider(kw->hwnd, 0, 0, nullptr);
+    klioWinA11yRelease(kw);
     DestroyWindow(kw->hwnd);
     if (kw->icon) DestroyIcon(kw->icon);
     if (kw->menu) DestroyMenu(kw->menu);
@@ -3896,6 +5551,11 @@ struct KlioWindow {
     bool keyTaken;      // the input method took the press
     std::string typed;  // what the press typed, when the input method passed it on
     std::string eventText;  // the text of the event last polled
+    // The window's semantics for assistive technologies (klio_a11y_update),
+    // their elements by node id, and whether a client reads them.
+    bool a11yActive;
+    KlioA11yTree a11y;
+    NSMutableDictionary* a11yElements;
 #if defined(KLIO_METAL)
     CAMetalLayer* metalLayer;  // nil when the raster path is in use
     id<MTLDevice> device;
@@ -4058,6 +5718,197 @@ static void klioCocoaSetMarked(KlioWindow* kw, NSString* text) {
     kw->marked = [text length] > 0 ? [text copy] : nil;
 }
 
+// An assistive client started reading the window: the program sends its
+// semantics from the next frame on.
+static void klioCocoaA11yActivate(KlioWindow* kw) {
+    if (kw->a11yActive) return;
+    kw->a11yActive = true;
+    kw->events.push_back(klioA11yEv(0, 0));
+}
+
+static NSString* klioNSString(const std::string& s) {
+    NSString* str = [[[NSString alloc] initWithBytes:s.data() length:s.size() encoding:NSUTF8StringEncoding] autorelease];
+    return str ?: @"";
+}
+
+// A semantics node as NSAccessibility exposes it, as Compose Desktop's
+// ComposeAccessible exposes one through AWT: its role, name and value read
+// from the window's latest snapshot, and the actions a client performs
+// queued as KLIO_EV_A11Y for the program to run.
+@interface KlioA11yElement : NSAccessibilityElement
+@property(nonatomic, assign) KlioWindow* kw;
+@property(nonatomic, assign) int nodeId;
+@end
+
+static id klioCocoaA11yElementFor(KlioWindow* kw, int nodeId) {
+    return kw && kw->a11yElements ? [kw->a11yElements objectForKey:@(nodeId)] : nil;
+}
+
+static NSArray* klioCocoaA11yElements(KlioWindow* kw, const std::vector<int>& ids) {
+    NSMutableArray* out = [NSMutableArray arrayWithCapacity:ids.size()];
+    for (int nodeId : ids) {
+        id e = klioCocoaA11yElementFor(kw, nodeId);
+        if (e) [out addObject:e];
+    }
+    return out;
+}
+
+// A node's rectangle in the window's content, on the screen.
+static NSRect klioCocoaA11yScreenRect(KlioWindow* kw, const KlioA11yNode& n) {
+    const NSRect inView = NSMakeRect(n.x, kw->h - n.y - n.h, n.w, n.h);
+    return [kw->window convertRectToScreen:[kw->view convertRect:inView toView:nil]];
+}
+
+@implementation KlioA11yElement
+- (const KlioA11yNode*)node {
+    return _kw ? _kw->a11y.find(_nodeId) : nullptr;
+}
+- (void)perform:(int)action text:(const char*)text {
+    if (_kw) _kw->events.push_back(klioA11yEv(_nodeId, action, text));
+}
+- (BOOL)offers:(int)action {
+    const KlioA11yNode* n = [self node];
+    return n && klioA11yOffers(n->actions, action);
+}
+- (BOOL)isAccessibilityElement {
+    return YES;
+}
+- (NSAccessibilityRole)accessibilityRole {
+    const KlioA11yNode* n = [self node];
+    switch (n ? n->role : KLIO_A11Y_ROLE_UNKNOWN) {
+        case KLIO_A11Y_ROLE_BUTTON: return NSAccessibilityButtonRole;
+        case KLIO_A11Y_ROLE_CHECKBOX:
+        case KLIO_A11Y_ROLE_SWITCH: return NSAccessibilityCheckBoxRole;
+        case KLIO_A11Y_ROLE_RADIO_BUTTON:
+        case KLIO_A11Y_ROLE_TAB: return NSAccessibilityRadioButtonRole;
+        case KLIO_A11Y_ROLE_DROPDOWN: return NSAccessibilityPopUpButtonRole;
+        case KLIO_A11Y_ROLE_IMAGE: return NSAccessibilityImageRole;
+        case KLIO_A11Y_ROLE_TEXT_FIELD:
+        case KLIO_A11Y_ROLE_PASSWORD_FIELD: return NSAccessibilityTextFieldRole;
+        case KLIO_A11Y_ROLE_TEXT: return NSAccessibilityStaticTextRole;
+        case KLIO_A11Y_ROLE_SLIDER: return NSAccessibilitySliderRole;
+        case KLIO_A11Y_ROLE_PROGRESS: return NSAccessibilityProgressIndicatorRole;
+        case KLIO_A11Y_ROLE_SCROLL_AREA: return NSAccessibilityScrollAreaRole;
+        default: return NSAccessibilityGroupRole;
+    }
+}
+- (NSAccessibilitySubrole)accessibilitySubrole {
+    const KlioA11yNode* n = [self node];
+    switch (n ? n->role : KLIO_A11Y_ROLE_UNKNOWN) {
+        case KLIO_A11Y_ROLE_SWITCH: return NSAccessibilitySwitchSubrole;
+        case KLIO_A11Y_ROLE_TAB: return NSAccessibilityTabButtonSubrole;
+        case KLIO_A11Y_ROLE_PASSWORD_FIELD: return NSAccessibilitySecureTextFieldSubrole;
+        default: return nil;
+    }
+}
+- (NSString*)accessibilityLabel {
+    const KlioA11yNode* n = [self node];
+    // Static text is read by its value.
+    if (!n || n->role == KLIO_A11Y_ROLE_TEXT || n->name.empty()) return nil;
+    return klioNSString(n->name);
+}
+- (id)accessibilityValue {
+    const KlioA11yNode* n = [self node];
+    if (!n) return nil;
+    switch (n->role) {
+        case KLIO_A11Y_ROLE_TEXT: return klioNSString(n->name);
+        case KLIO_A11Y_ROLE_TEXT_FIELD:
+        case KLIO_A11Y_ROLE_PASSWORD_FIELD: return klioNSString(n->value);
+        case KLIO_A11Y_ROLE_SLIDER:
+        case KLIO_A11Y_ROLE_PROGRESS: return @(n->current);
+        default: break;
+    }
+    if (n->states & KLIO_A11Y_STATE_CHECKABLE) {
+        return @((n->states & KLIO_A11Y_STATE_MIXED) ? 2 : (n->states & KLIO_A11Y_STATE_CHECKED) ? 1 : 0);
+    }
+    return n->value.empty() ? nil : klioNSString(n->value);
+}
+- (id)accessibilityMinValue {
+    const KlioA11yNode* n = [self node];
+    return n ? @(n->min) : nil;
+}
+- (id)accessibilityMaxValue {
+    const KlioA11yNode* n = [self node];
+    return n ? @(n->max) : nil;
+}
+- (NSString*)accessibilityHelp {
+    const KlioA11yNode* n = [self node];
+    return n && !n->description.empty() && n->description != n->name ? klioNSString(n->description) : nil;
+}
+- (NSRect)accessibilityFrame {
+    const KlioA11yNode* n = [self node];
+    return n ? klioCocoaA11yScreenRect(_kw, *n) : NSZeroRect;
+}
+- (id)accessibilityParent {
+    const KlioA11yNode* n = [self node];
+    if (!n) return nil;
+    id parent = n->parent >= 0 ? klioCocoaA11yElementFor(_kw, n->parent) : nil;
+    return parent ? parent : _kw->view;
+}
+- (NSArray*)accessibilityChildren {
+    const KlioA11yNode* n = [self node];
+    return n ? klioCocoaA11yElements(_kw, n->children) : @[];
+}
+- (BOOL)isAccessibilityEnabled {
+    const KlioA11yNode* n = [self node];
+    return n && (n->states & KLIO_A11Y_STATE_ENABLED);
+}
+- (BOOL)isAccessibilityFocused {
+    const KlioA11yNode* n = [self node];
+    return n && (n->states & KLIO_A11Y_STATE_FOCUSED);
+}
+- (BOOL)isAccessibilitySelected {
+    const KlioA11yNode* n = [self node];
+    return n && (n->states & KLIO_A11Y_STATE_SELECTED);
+}
+- (BOOL)isAccessibilityExpanded {
+    const KlioA11yNode* n = [self node];
+    return n && (n->states & KLIO_A11Y_STATE_EXPANDED);
+}
+- (BOOL)accessibilityPerformPress {
+    if (![self offers:KLIO_A11Y_ACTION_CLICK]) return NO;
+    [self perform:KLIO_A11Y_ACTION_CLICK text:""];
+    return YES;
+}
+- (BOOL)accessibilityPerformIncrement {
+    if (![self offers:KLIO_A11Y_ACTION_INCREMENT]) return NO;
+    [self perform:KLIO_A11Y_ACTION_INCREMENT text:""];
+    return YES;
+}
+- (BOOL)accessibilityPerformDecrement {
+    if (![self offers:KLIO_A11Y_ACTION_DECREMENT]) return NO;
+    [self perform:KLIO_A11Y_ACTION_DECREMENT text:""];
+    return YES;
+}
+- (BOOL)accessibilityPerformCancel {
+    if (![self offers:KLIO_A11Y_ACTION_DISMISS]) return NO;
+    [self perform:KLIO_A11Y_ACTION_DISMISS text:""];
+    return YES;
+}
+- (BOOL)accessibilityPerformShowMenu {
+    if (![self offers:KLIO_A11Y_ACTION_LONG_CLICK]) return NO;
+    [self perform:KLIO_A11Y_ACTION_LONG_CLICK text:""];
+    return YES;
+}
+- (void)setAccessibilityFocused:(BOOL)focused {
+    if (focused && [self offers:KLIO_A11Y_ACTION_FOCUS]) [self perform:KLIO_A11Y_ACTION_FOCUS text:""];
+}
+- (void)setAccessibilityValue:(id)value {
+    if (![self offers:KLIO_A11Y_ACTION_SET_TEXT] || ![value isKindOfClass:[NSString class]]) return;
+    [self perform:KLIO_A11Y_ACTION_SET_TEXT text:[(NSString*)value UTF8String]];
+}
+- (BOOL)isAccessibilitySelectorAllowed:(SEL)selector {
+    if (selector == @selector(accessibilityPerformPress)) return [self offers:KLIO_A11Y_ACTION_CLICK];
+    if (selector == @selector(accessibilityPerformIncrement)) return [self offers:KLIO_A11Y_ACTION_INCREMENT];
+    if (selector == @selector(accessibilityPerformDecrement)) return [self offers:KLIO_A11Y_ACTION_DECREMENT];
+    if (selector == @selector(accessibilityPerformCancel)) return [self offers:KLIO_A11Y_ACTION_DISMISS];
+    if (selector == @selector(accessibilityPerformShowMenu)) return [self offers:KLIO_A11Y_ACTION_LONG_CLICK];
+    if (selector == @selector(setAccessibilityFocused:)) return [self offers:KLIO_A11Y_ACTION_FOCUS];
+    if (selector == @selector(setAccessibilityValue:)) return [self offers:KLIO_A11Y_ACTION_SET_TEXT];
+    return [super isAccessibilitySelectorAllowed:selector];
+}
+@end
+
 // The window's content view, the input method's client as AWT's view is.
 // While a text field has the keyboard a key press goes to the input method
 // first: what it composes and commits is queued as KLIO_EV_IME, and a press
@@ -4138,6 +5989,34 @@ static void klioCocoaSetMarked(KlioWindow* kw, NSString* text) {
 - (NSUInteger)characterIndexForPoint:(NSPoint)point {
     (void)point;
     return NSNotFound;
+}
+// The window's semantics, exposed to assistive clients: a client reading
+// them asks the program to send them.
+- (NSArray*)accessibilityChildren {
+    KlioWindow* kw = _kw;
+    if (!kw) return @[];
+    klioCocoaA11yActivate(kw);
+    return klioCocoaA11yElements(kw, kw->a11y.roots);
+}
+- (id)accessibilityHitTest:(NSPoint)point {
+    KlioWindow* kw = _kw;
+    if (!kw) return self;
+    klioCocoaA11yActivate(kw);
+    // The last node in document order under the point is the innermost.
+    for (auto it = kw->a11y.nodes.rbegin(); it != kw->a11y.nodes.rend(); ++it) {
+        if (NSPointInRect(point, klioCocoaA11yScreenRect(kw, *it))) {
+            id e = klioCocoaA11yElementFor(kw, it->id);
+            if (e) return e;
+        }
+    }
+    return self;
+}
+- (id)accessibilityFocusedUIElement {
+    KlioWindow* kw = _kw;
+    if (!kw) return self;
+    klioCocoaA11yActivate(kw);
+    id e = klioCocoaA11yElementFor(kw, kw->a11y.focused());
+    return e ? e : self;
 }
 @end
 
@@ -4220,10 +6099,6 @@ static NSEventModifierFlags klioMenuModifierMask(int mods) {
     return mask;
 }
 
-static NSString* klioNSString(const std::string& s) {
-    NSString* str = [[[NSString alloc] initWithBytes:s.data() length:s.size() encoding:NSUTF8StringEncoding] autorelease];
-    return str ?: @"";
-}
 
 // The window's main menu from its entries: the application menu, then its
 // menus, as AWT's screen menu bar shows a frame's JMenuBar. Mnemonics have
@@ -4565,9 +6440,19 @@ extern "C" {
 // or KLIO_EV_NONE when none came. Every event AppKit has ready is translated
 // for the window it belongs to before the first is returned.
 // The window's next event, a scripted menu choice performed on the way.
+static void klioCocoaA11yScript(KlioWindow* kw, int kind, const std::string& name, const std::string& text);
+
 static int klioCocoaPop(KlioWindow* kw, double* out) {
     for (;;) {
         const int type = klioPopEv(kw->events, out, &kw->eventText);
+        if (type == KLIO_EV_A11Y_SCRIPT) {
+            const size_t at = static_cast<size_t>(out[1]);
+            const size_t textAt = static_cast<size_t>(out[2]);
+            if (textAt < klioScriptTexts().size()) {
+                klioCocoaA11yScript(kw, static_cast<int>(out[0]), klioScriptTexts()[at], klioScriptTexts()[textAt]);
+            }
+            continue;
+        }
         if (type != KLIO_EV_MENU_PATH) return type;
         const size_t at = static_cast<size_t>(out[0]);
         // A native menu is not left open: menushow is the drawn menus'.
@@ -4640,6 +6525,165 @@ void klio_win_end_composition(KlioWindow* kw) {
     if (!kw) return;
     @autoreleasepool {
         klioCocoaDropComposition(kw);
+    }
+}
+
+// A node's role as NSAccessibility reports it, read back to klio's.
+static int klioCocoaA11yRoleOf(id el) {
+    NSString* role = [el accessibilityRole];
+    NSString* sub = [el accessibilitySubrole];
+    if ([role isEqualToString:NSAccessibilityButtonRole]) return KLIO_A11Y_ROLE_BUTTON;
+    if ([role isEqualToString:NSAccessibilityCheckBoxRole]) {
+        return [sub isEqualToString:NSAccessibilitySwitchSubrole] ? KLIO_A11Y_ROLE_SWITCH : KLIO_A11Y_ROLE_CHECKBOX;
+    }
+    if ([role isEqualToString:NSAccessibilityRadioButtonRole]) {
+        return [sub isEqualToString:NSAccessibilityTabButtonSubrole] ? KLIO_A11Y_ROLE_TAB : KLIO_A11Y_ROLE_RADIO_BUTTON;
+    }
+    if ([role isEqualToString:NSAccessibilityPopUpButtonRole]) return KLIO_A11Y_ROLE_DROPDOWN;
+    if ([role isEqualToString:NSAccessibilityImageRole]) return KLIO_A11Y_ROLE_IMAGE;
+    if ([role isEqualToString:NSAccessibilityTextFieldRole]) {
+        return [sub isEqualToString:NSAccessibilitySecureTextFieldSubrole] ? KLIO_A11Y_ROLE_PASSWORD_FIELD
+                                                                           : KLIO_A11Y_ROLE_TEXT_FIELD;
+    }
+    if ([role isEqualToString:NSAccessibilityStaticTextRole]) return KLIO_A11Y_ROLE_TEXT;
+    if ([role isEqualToString:NSAccessibilitySliderRole]) return KLIO_A11Y_ROLE_SLIDER;
+    if ([role isEqualToString:NSAccessibilityProgressIndicatorRole]) return KLIO_A11Y_ROLE_PROGRESS;
+    if ([role isEqualToString:NSAccessibilityScrollAreaRole]) return KLIO_A11Y_ROLE_SCROLL_AREA;
+    return KLIO_A11Y_ROLE_GROUP;
+}
+
+static std::string klioCocoaString(id v) {
+    return [v isKindOfClass:[NSString class]] ? std::string([(NSString*)v UTF8String]) : std::string();
+}
+
+// A node's name as a client reads it: static text's value, else its label.
+static std::string klioCocoaA11yName(id el) {
+    if (klioCocoaA11yRoleOf(el) == KLIO_A11Y_ROLE_TEXT) return klioCocoaString([el accessibilityValue]);
+    return klioCocoaString([el accessibilityLabel]);
+}
+
+static void klioCocoaA11yDump(id el, int depth) {
+    const int role = klioCocoaA11yRoleOf(el);
+    std::string detail;
+    id value = [el accessibilityValue];
+    switch (role) {
+        case KLIO_A11Y_ROLE_CHECKBOX:
+        case KLIO_A11Y_ROLE_SWITCH:
+        case KLIO_A11Y_ROLE_RADIO_BUTTON:
+        case KLIO_A11Y_ROLE_TAB: {
+            const int v = [value isKindOfClass:[NSNumber class]] ? [(NSNumber*)value intValue] : 0;
+            detail = v == 2 ? "mixed" : v == 1 ? "checked" : "unchecked";
+            break;
+        }
+        case KLIO_A11Y_ROLE_TEXT_FIELD:
+        case KLIO_A11Y_ROLE_PASSWORD_FIELD:
+            detail = "value=\"" + klioCocoaString(value) + "\"";
+            break;
+        case KLIO_A11Y_ROLE_SLIDER:
+        case KLIO_A11Y_ROLE_PROGRESS: {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "value=%g", [value isKindOfClass:[NSNumber class]] ? [(NSNumber*)value doubleValue] : 0.0);
+            detail = buf;
+            break;
+        }
+        default:
+            break;
+    }
+    if ([el isAccessibilityFocused]) detail += detail.empty() ? "focused" : " focused";
+    if (![el isAccessibilityEnabled]) detail += detail.empty() ? "disabled" : " disabled";
+    klioA11yDumpLine(depth, role, klioCocoaA11yName(el), detail);
+    for (id child in [el accessibilityChildren]) klioCocoaA11yDump(child, depth + 1);
+}
+
+static id klioCocoaA11yFind(NSArray* elements, const std::string& name) {
+    for (id el in elements) {
+        if (klioCocoaA11yName(el) == name) return el;
+        id found = klioCocoaA11yFind([el accessibilityChildren], name);
+        if (found) return found;
+    }
+    return nil;
+}
+
+// Scripted input asking through NSAccessibility, as an assistive client asks.
+static void klioCocoaA11yScript(KlioWindow* kw, int kind, const std::string& name, const std::string& text) {
+    @autoreleasepool {
+        NSArray* roots = [kw->view accessibilityChildren];
+        if (kind == KLIO_A11Y_SCRIPT_DUMP) {
+            for (id el in roots) klioCocoaA11yDump(el, 0);
+            return;
+        }
+        id el = klioCocoaA11yFind(roots, name);
+        if (!el) {
+            std::fprintf(stderr, "klio: no accessible node is named `%s`\n", name.c_str());
+            return;
+        }
+        switch (kind) {
+            case KLIO_A11Y_SCRIPT_PRESS: [el accessibilityPerformPress]; break;
+            case KLIO_A11Y_SCRIPT_FOCUS: [el setAccessibilityFocused:YES]; break;
+            case KLIO_A11Y_SCRIPT_VALUE: [el setAccessibilityValue:klioNSString(text)]; break;
+            case KLIO_A11Y_SCRIPT_INCREMENT: [el accessibilityPerformIncrement]; break;
+            default: break;
+        }
+    }
+}
+
+// Whether an assistive client reads the window.
+int klio_a11y_active(KlioWindow* kw) {
+    return kw && kw->a11yActive ? 1 : 0;
+}
+
+// The window's semantics as the program sends them: elements keep their
+// identity across snapshots, and clients hear what changed.
+void klio_a11y_update(KlioWindow* kw, const char* text, size_t len) {
+    if (!kw || !text) return;
+    @autoreleasepool {
+        KlioA11yTree next = klioParseA11y(text, len);
+        NSMutableDictionary* elements = [[NSMutableDictionary alloc] init];
+        std::vector<int> changedValues;
+        bool layout = next.nodes.size() != kw->a11y.nodes.size();
+        for (const KlioA11yNode& n : next.nodes) {
+            KlioA11yElement* e = klioCocoaA11yElementFor(kw, n.id);
+            if (e) {
+                [elements setObject:e forKey:@(n.id)];
+                const KlioA11yNode* before = kw->a11y.find(n.id);
+                if (before && (before->value != n.value || before->name != n.name || before->states != n.states ||
+                               before->current != n.current)) {
+                    changedValues.push_back(n.id);
+                }
+                if (before && (before->x != n.x || before->y != n.y || before->w != n.w || before->h != n.h ||
+                               before->children != n.children)) {
+                    layout = true;
+                }
+            } else {
+                e = [[KlioA11yElement alloc] init];
+                e.kw = kw;
+                e.nodeId = n.id;
+                [elements setObject:e forKey:@(n.id)];
+                [e release];
+                layout = true;
+            }
+        }
+        for (NSNumber* key in kw->a11yElements) {
+            if (![elements objectForKey:key]) {
+                KlioA11yElement* gone = [kw->a11yElements objectForKey:key];
+                gone.kw = nullptr;
+                NSAccessibilityPostNotification(gone, NSAccessibilityUIElementDestroyedNotification);
+            }
+        }
+        const int focusedBefore = kw->a11y.focused();
+        [kw->a11yElements release];
+        kw->a11yElements = elements;
+        kw->a11y = std::move(next);
+        for (int nodeId : changedValues) {
+            id e = klioCocoaA11yElementFor(kw, nodeId);
+            if (e) NSAccessibilityPostNotification(e, NSAccessibilityValueChangedNotification);
+        }
+        if (layout) NSAccessibilityPostNotification(kw->view, NSAccessibilityLayoutChangedNotification);
+        const int focused = kw->a11y.focused();
+        if (focused != focusedBefore && focused >= 0) {
+            id e = klioCocoaA11yElementFor(kw, focused);
+            if (e) NSAccessibilityPostNotification(e, NSAccessibilityFocusedUIElementChangedNotification);
+        }
     }
 }
 
@@ -4731,6 +6775,7 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         kw->buttons = 0;
         kw->closeRequested = false;
         kw->resizable = true;
+        kw->a11yActive = klioA11yForced();
         klioCocoaWindows().push_back(kw);
         KlioWindowDelegate* delegate = [[KlioWindowDelegate alloc] init];
         delegate.kw = kw;
@@ -5010,6 +7055,9 @@ void klio_win_close(KlioWindow* kw) {
     }
     if ([kw->view isKindOfClass:[KlioContentView class]]) ((KlioContentView*)kw->view).kw = nullptr;
     klioCocoaSetMarked(kw, nil);
+    for (NSNumber* key in kw->a11yElements) ((KlioA11yElement*)[kw->a11yElements objectForKey:key]).kw = nullptr;
+    [kw->a11yElements release];
+    kw->a11yElements = nil;
     auto& windows = klioCocoaWindows();
     for (size_t i = 0; i < windows.size(); i++) {
         if (windows[i] == kw) {
@@ -5505,6 +7553,8 @@ void klio_win_set_text_input(void*, int) {}
 void klio_win_set_text_input_rect(void*, int, int, int, int) {}
 void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
+int klio_a11y_active(void*) { return 0; }
+void klio_a11y_update(void*, const char*, size_t) {}
 size_t klio_win_event_text(void*, char* buf, size_t cap) {
     if (buf && cap > 0) buf[0] = 0;
     return 0;
@@ -5755,6 +7805,8 @@ void klio_win_set_text_input(void*, int) {}
 void klio_win_set_text_input_rect(void*, int, int, int, int) {}
 void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
+int klio_a11y_active(void*) { return 0; }
+void klio_a11y_update(void*, const char*, size_t) {}
 size_t klio_win_event_text(void*, char* buf, size_t cap) {
     if (buf && cap > 0) buf[0] = 0;
     return 0;
@@ -5809,6 +7861,8 @@ void klio_win_set_text_input(void*, int) {}
 void klio_win_set_text_input_rect(void*, int, int, int, int) {}
 void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
+int klio_a11y_active(void*) { return 0; }
+void klio_a11y_update(void*, const char*, size_t) {}
 size_t klio_win_event_text(void*, char* buf, size_t cap) {
     if (buf && cap > 0) buf[0] = 0;
     return 0;

@@ -40,6 +40,7 @@ EXAMPLES=(
   compose_window_ime
   compose_system_theme
   compose_window_draggable
+  compose_window_accessibility
   compose_window_menu
   compose_window_modal
   compose_window_modal_app

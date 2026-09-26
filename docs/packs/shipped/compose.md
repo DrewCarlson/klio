@@ -96,6 +96,13 @@ signature:
   (`klio.bundle.Resources`: `--include` or the manifest's
   `[application] include`, served from disk under `klio run` and from the
   executable in a bundle) where the JVM reads its classpath.
+- a klio window's content reaches assistive technologies as a Compose
+  Desktop window's does: its semantics tree is exposed through the
+  platform's accessibility API (NSAccessibility on macOS, UI Automation on
+  Windows, AT-SPI through ATK and atk-bridge on Linux, loaded at run time)
+  once a client reads the window, with each node's role, name, value and
+  states computed as upstream's ComposeAccessible computes them, and a
+  client's press, focus, new text or step running the semantics action.
 - material3's platform half is upstream's skikoMain and nonJvmMain (dialogs,
   menus, the bottom sheet, tooltips, strings with their translations, the
   kotlinx-datetime calendar model). Its `CalendarLocale` is the ui text

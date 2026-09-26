@@ -22,6 +22,10 @@
 //                    event's text (klio_win_event_text) is the text the input
 //                    method commits followed by the text it is composing, as
 //                    an AWT InputMethodEvent carries them
+//   KLIO_EV_A11Y     [0] a semantics node's id, [1] the action an assistive
+//                    client asks of it (KLIO_A11Y_ACTION_*; 0 when a client
+//                    starts reading the window), the event's text the new
+//                    text of a KLIO_A11Y_ACTION_SET_TEXT
 //   KLIO_EV_TRAY_ACTION  a tray icon's action (klio_tray_poll_event): a double
 //                    click on Windows, a right click on macOS
 //
@@ -35,6 +39,7 @@
 #include <deque>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -54,6 +59,12 @@ enum {
     KLIO_EV_MENU_PATH = 17,
     KLIO_EV_TRAY_ACTION = 18,
     KLIO_EV_IME = 19,
+    KLIO_EV_A11Y = 20,
+    // Scripted input only: an assistive client's request, through the
+    // platform's accessibility API, performed by the backend's poll:
+    // [0] KLIO_A11Y_SCRIPT_*, the node's name at klioScriptTexts()[[1]],
+    // new text at [[2]].
+    KLIO_EV_A11Y_SCRIPT = 21,
 };
 
 // A window's menu bar as klio_win_set_menu takes it: one entry per line,
@@ -436,6 +447,221 @@ inline void klioPushText(std::deque<KlioEv>& q, const char* utf8) {
     }
 }
 
+// A window's semantics for assistive technologies, as the program sends them
+// (klio_a11y_update; KlioWindowAccessibility.kt writes the snapshot).
+enum {
+    KLIO_A11Y_ROLE_UNKNOWN = 0,
+    KLIO_A11Y_ROLE_BUTTON = 1,
+    KLIO_A11Y_ROLE_CHECKBOX = 2,
+    KLIO_A11Y_ROLE_SWITCH = 3,
+    KLIO_A11Y_ROLE_RADIO_BUTTON = 4,
+    KLIO_A11Y_ROLE_TAB = 5,
+    KLIO_A11Y_ROLE_DROPDOWN = 6,
+    KLIO_A11Y_ROLE_IMAGE = 7,
+    KLIO_A11Y_ROLE_TEXT_FIELD = 8,
+    KLIO_A11Y_ROLE_PASSWORD_FIELD = 9,
+    KLIO_A11Y_ROLE_TEXT = 10,
+    KLIO_A11Y_ROLE_SLIDER = 11,
+    KLIO_A11Y_ROLE_PROGRESS = 12,
+    KLIO_A11Y_ROLE_SCROLL_AREA = 13,
+    KLIO_A11Y_ROLE_GROUP = 14,
+};
+
+enum {
+    KLIO_A11Y_STATE_ENABLED = 1,
+    KLIO_A11Y_STATE_FOCUSABLE = 2,
+    KLIO_A11Y_STATE_FOCUSED = 4,
+    KLIO_A11Y_STATE_SELECTED = 8,
+    KLIO_A11Y_STATE_CHECKED = 16,
+    KLIO_A11Y_STATE_MIXED = 32,
+    KLIO_A11Y_STATE_EDITABLE = 64,
+    KLIO_A11Y_STATE_EXPANDED = 128,
+    KLIO_A11Y_STATE_COLLAPSED = 256,
+    KLIO_A11Y_STATE_HEADING = 512,
+    KLIO_A11Y_STATE_CHECKABLE = 1024,
+};
+
+// An action's code; bit (code - 1) of a node's actions says it offers it.
+enum {
+    KLIO_A11Y_ACTION_CLICK = 1,
+    KLIO_A11Y_ACTION_LONG_CLICK = 2,
+    KLIO_A11Y_ACTION_FOCUS = 3,
+    KLIO_A11Y_ACTION_SET_TEXT = 4,
+    KLIO_A11Y_ACTION_INCREMENT = 5,
+    KLIO_A11Y_ACTION_DECREMENT = 6,
+    KLIO_A11Y_ACTION_EXPAND = 7,
+    KLIO_A11Y_ACTION_COLLAPSE = 8,
+    KLIO_A11Y_ACTION_DISMISS = 9,
+    KLIO_A11Y_ACTION_SCROLL_FORWARD = 10,
+    KLIO_A11Y_ACTION_SCROLL_BACKWARD = 11,
+};
+
+inline bool klioA11yOffers(int actions, int action) { return (actions >> (action - 1)) & 1; }
+
+struct KlioA11yNode {
+    int id = 0;
+    int parent = -1;
+    int role = KLIO_A11Y_ROLE_UNKNOWN;
+    int states = 0;
+    int actions = 0;
+    double x = 0, y = 0, w = 0, h = 0;  // in the window's content
+    double min = 0, max = 0, current = 0;
+    std::string name;
+    std::string value;
+    std::string description;
+    std::vector<int> children;  // the ids of its children, in order
+};
+
+// A window's semantics: the nodes in document order, and each id's index.
+struct KlioA11yTree {
+    std::vector<KlioA11yNode> nodes;
+    std::vector<int> roots;
+    std::unordered_map<int, size_t> index;  // a node's id to its place in nodes
+
+    const KlioA11yNode* find(int id) const {
+        const auto it = index.find(id);
+        return it == index.end() ? nullptr : &nodes[it->second];
+    }
+
+    // The focused node's id, or -1.
+    int focused() const {
+        for (const KlioA11yNode& n : nodes) {
+            if (n.states & KLIO_A11Y_STATE_FOCUSED) return n.id;
+        }
+        return -1;
+    }
+};
+
+inline std::string klioA11yUnescape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            const char c = s[++i];
+            out += c == 't' ? '\t' : c == 'n' ? '\n' : c;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+// Parses a snapshot: a node per line, the fields tab-separated (id, parent,
+// role, states, actions, x, y, w, h, min, max, current, name, value,
+// description).
+inline KlioA11yTree klioParseA11y(const char* text, size_t len) {
+    KlioA11yTree tree;
+    size_t start = 0;
+    while (start < len) {
+        size_t end = start;
+        while (end < len && text[end] != '\n') end++;
+        std::vector<std::string> f;
+        size_t p = start;
+        for (size_t i = start; i <= end; i++) {
+            if (i == end || text[i] == '\t') {
+                f.emplace_back(text + p, i - p);
+                p = i + 1;
+            }
+        }
+        start = end + 1;
+        if (f.size() < 15) continue;
+        KlioA11yNode n;
+        n.id = std::atoi(f[0].c_str());
+        n.parent = std::atoi(f[1].c_str());
+        n.role = std::atoi(f[2].c_str());
+        n.states = std::atoi(f[3].c_str());
+        n.actions = std::atoi(f[4].c_str());
+        n.x = std::atof(f[5].c_str());
+        n.y = std::atof(f[6].c_str());
+        n.w = std::atof(f[7].c_str());
+        n.h = std::atof(f[8].c_str());
+        n.min = std::atof(f[9].c_str());
+        n.max = std::atof(f[10].c_str());
+        n.current = std::atof(f[11].c_str());
+        n.name = klioA11yUnescape(f[12]);
+        n.value = klioA11yUnescape(f[13]);
+        n.description = klioA11yUnescape(f[14]);
+        tree.nodes.push_back(n);
+    }
+    for (size_t i = 0; i < tree.nodes.size(); i++) tree.index[tree.nodes[i].id] = i;
+    for (const KlioA11yNode& n : tree.nodes) {
+        const auto parent = n.parent < 0 ? tree.index.end() : tree.index.find(n.parent);
+        if (parent == tree.index.end()) {
+            tree.roots.push_back(n.id);
+        } else {
+            tree.nodes[parent->second].children.push_back(n.id);
+        }
+    }
+    return tree;
+}
+
+// The event asking the program to run an action of a node.
+inline KlioEv klioA11yEv(int nodeId, int action, const char* text = "") {
+    KlioEv e;
+    e.type = KLIO_EV_A11Y;
+    e.v[0] = nodeId;
+    e.v[1] = action;
+    e.text = text;
+    return e;
+}
+
+// What scripted input asks through the platform's accessibility API.
+enum {
+    KLIO_A11Y_SCRIPT_DUMP = 1,       // print the tree the platform exposes
+    KLIO_A11Y_SCRIPT_PRESS = 2,      // press the node of a name
+    KLIO_A11Y_SCRIPT_FOCUS = 3,      // focus it
+    KLIO_A11Y_SCRIPT_VALUE = 4,      // set its value (text)
+    KLIO_A11Y_SCRIPT_INCREMENT = 5,  // step its value up
+};
+
+// A role's name in a dump of the platform's tree, the same on every
+// platform: each backend reads its platform's role back to these names.
+inline const char* klioA11yRoleName(int role) {
+    switch (role) {
+        case KLIO_A11Y_ROLE_BUTTON: return "button";
+        case KLIO_A11Y_ROLE_CHECKBOX: return "checkbox";
+        case KLIO_A11Y_ROLE_SWITCH: return "switch";
+        case KLIO_A11Y_ROLE_RADIO_BUTTON: return "radio button";
+        case KLIO_A11Y_ROLE_TAB: return "tab";
+        case KLIO_A11Y_ROLE_DROPDOWN: return "dropdown";
+        case KLIO_A11Y_ROLE_IMAGE: return "image";
+        case KLIO_A11Y_ROLE_TEXT_FIELD: return "text field";
+        case KLIO_A11Y_ROLE_PASSWORD_FIELD: return "password field";
+        case KLIO_A11Y_ROLE_TEXT: return "text";
+        case KLIO_A11Y_ROLE_SLIDER: return "slider";
+        case KLIO_A11Y_ROLE_PROGRESS: return "progress";
+        case KLIO_A11Y_ROLE_SCROLL_AREA: return "scroll area";
+        default: return "group";
+    }
+}
+
+// One node of a dump of the platform's tree: its role, name and what the
+// platform reports of its state, indented by depth.
+inline void klioA11yDumpLine(int depth, int role, const std::string& name, const std::string& detail) {
+    std::string line(static_cast<size_t>(depth) * 2, ' ');
+    line += klioA11yRoleName(role);
+    if (!name.empty()) line += " \"" + name + "\"";
+    if (!detail.empty()) line += " " + detail;
+    line += "\n";
+    std::fputs(line.c_str(), stdout);
+    std::fflush(stdout);
+}
+
+struct KlioScriptEntry;
+inline std::vector<KlioScriptEntry>& klioScript();
+inline bool klioScriptAsksA11y();
+
+// Whether assistive-technology support is on from the start, as it is once
+// a screen reader reads a window: forced by $KLIO_A11Y=1, or by scripted
+// input that asks through the accessibility API.
+inline bool klioA11yForced() {
+    static const bool forced = [] {
+        const char* v = std::getenv("KLIO_A11Y");
+        return (v && v[0] == '1') || klioScriptAsksA11y();
+    }();
+    return forced;
+}
+
 // The number of UTF-16 units of UTF-8 text.
 inline int klioUtf16Length(const char* utf8) {
     int n = 0;
@@ -592,6 +818,13 @@ inline int klioAwtKeyChar(int vk, unsigned platformChar) {
 //                                        rest of the line (none ends the composition)
 //   <when> commit <characters>           the input method commits text, the rest
 //                                        of the line, ending its composition
+//   <when> a11y dump                     print the window's accessibility tree as
+//                                        the platform's accessibility API exposes it
+//   <when> a11y press <name>             press the accessible node of that name
+//                                        through the platform's accessibility API
+//   <when> a11y focus <name>             focus it the same way
+//   <when> a11y value <name>=<text>      set its value (a text field's text)
+//   <when> a11y increment <name>         step its value up (a slider's)
 //   <when> focus <0|1>                   the window gains or loses the focus; a script
 //                                        with a focus event is the windows' only source
 //                                        of focus, the platform's own changes dropped
@@ -682,6 +915,37 @@ inline std::vector<KlioScriptEntry>& klioScript() {
             add(klioImeEv("", rest));
         } else if (std::strcmp(cmd, "commit") == 0) {
             add(klioImeEv(rest, ""));
+        } else if (std::strcmp(cmd, "a11y") == 0) {
+            char verb[16] = {};
+            int vused = 0;
+            if (std::sscanf(rest, "%15s %n", verb, &vused) >= 1) {
+                const char* arg = rest + vused;
+                int kind = 0;
+                if (std::strcmp(verb, "dump") == 0) kind = KLIO_A11Y_SCRIPT_DUMP;
+                else if (std::strcmp(verb, "press") == 0) kind = KLIO_A11Y_SCRIPT_PRESS;
+                else if (std::strcmp(verb, "focus") == 0) kind = KLIO_A11Y_SCRIPT_FOCUS;
+                else if (std::strcmp(verb, "value") == 0) kind = KLIO_A11Y_SCRIPT_VALUE;
+                else if (std::strcmp(verb, "increment") == 0) kind = KLIO_A11Y_SCRIPT_INCREMENT;
+                if (kind != 0) {
+                    std::string target = arg;
+                    std::string text;
+                    if (kind == KLIO_A11Y_SCRIPT_VALUE) {
+                        const size_t eq = target.find('=');
+                        if (eq != std::string::npos) {
+                            text = target.substr(eq + 1);
+                            target = target.substr(0, eq);
+                        }
+                    }
+                    klioScriptTexts().push_back(target);
+                    klioScriptTexts().push_back(text);
+                    KlioEv e;
+                    e.type = KLIO_EV_A11Y_SCRIPT;
+                    e.v[0] = kind;
+                    e.v[1] = static_cast<double>(klioScriptTexts().size() - 2);
+                    e.v[2] = static_cast<double>(klioScriptTexts().size() - 1);
+                    add(e);
+                }
+            }
         } else if (std::strcmp(cmd, "focus") == 0) {
             add(klioSimpleEv(KLIO_EV_FOCUS, a));
         } else if (std::strcmp(cmd, "close") == 0) {
@@ -701,6 +965,13 @@ inline std::vector<KlioScriptEntry>& klioScript() {
     }
     std::fclose(f);
     return script;
+}
+
+inline bool klioScriptAsksA11y() {
+    for (const KlioScriptEntry& e : klioScript()) {
+        if (e.ev.type == KLIO_EV_A11Y_SCRIPT) return true;
+    }
+    return false;
 }
 
 inline bool klioScriptDrivesFocus() {

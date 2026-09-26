@@ -41,6 +41,7 @@ internal const val WINDOW_EVENT_MOVE = 14
 internal const val WINDOW_EVENT_PLACEMENT = 15
 internal const val WINDOW_EVENT_MENU = 16
 internal const val WINDOW_EVENT_IME = 19
+internal const val WINDOW_EVENT_A11Y = 20
 
 /** How many values a window event carries. */
 internal const val WINDOW_EVENT_VALUES = 12
@@ -89,6 +90,7 @@ internal class KlioWindowInput(
     private val windowInfo: WindowInfoImpl,
     private val handle: Long,
     private val textInput: KlioWindowTextInput?,
+    private val accessibility: KlioWindowAccessibility?,
 ) {
     private var keyModifiers = PointerKeyboardModifiers()
 
@@ -149,6 +151,7 @@ internal class KlioWindowInput(
             WINDOW_EVENT_KEY -> if (enabled && focusable) sendKey(v)
             WINDOW_EVENT_TEXT -> if (enabled && focusable) sendText(v)
             WINDOW_EVENT_IME -> if (enabled && focusable) sendInputMethod(v)
+            WINDOW_EVENT_A11Y -> if (enabled) sendAccessibility(v)
             WINDOW_EVENT_FOCUS -> {
                 windowInfo.isWindowFocused = v[0] != 0.0
                 onFocusChanged()
@@ -213,6 +216,19 @@ internal class KlioWindowInput(
         val text = __composeui_winEventText(handle)
         val committed = v[0].toInt().coerceIn(0, text.length)
         input.onInputMethodEvent(text.substring(0, committed), text.substring(committed))
+    }
+
+    // What an assistive client asks: to start reading the window (action 0),
+    // or an action of a node.
+    private fun sendAccessibility(v: DoubleArray) {
+        val a11y = accessibility ?: return
+        val action = v[1].toInt()
+        if (action == 0) {
+            a11y.onActivated()
+            return
+        }
+        val text = if (action == A11yAction.SET_TEXT) __composeui_winEventText(handle) else ""
+        a11y.perform(v[0].toInt(), action, text)
     }
 
     // Each typed character is a key event of its own, as AWT types them: of no

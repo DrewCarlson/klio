@@ -45,6 +45,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winSetTextInputRect", winSetTextInputRect);
     try b.register("androidx.compose.ui.window.__composeui_winEndComposition", winEndComposition);
     try b.register("androidx.compose.ui.window.__composeui_winEventText", winEventText);
+    try b.register("androidx.compose.ui.window.__composeui_a11yActive", a11yActive);
+    try b.register("androidx.compose.ui.window.__composeui_a11yUpdate", a11yUpdate);
     try b.register("androidx.compose.ui.window.__composeui_traySupported", traySupported);
     try b.register("androidx.compose.ui.window.__composeui_trayOpen", trayOpen);
     try b.register("androidx.compose.ui.window.__composeui_trayClose", trayClose);
@@ -185,6 +187,8 @@ const Skia = struct {
     winEventText: ?WinEventTextFn,
     systemTheme: ?*const fn () callconv(.c) c_int,
     orderEmojiPalette: ?*const fn () callconv(.c) void,
+    a11yActive: ?*const fn (?*SkWindow) callconv(.c) c_int,
+    a11yUpdate: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
     winLastError: ?*const fn () callconv(.c) [*:0]const u8,
     tray: TrayFns,
     clipChangeCount: ?ClipChangeCountFn,
@@ -334,6 +338,8 @@ fn loadSkia() ?*Skia {
         .winEventText = lib.lookup(WinEventTextFn, "klio_win_event_text"),
         .systemTheme = lib.lookup(*const fn () callconv(.c) c_int, "klio_system_theme"),
         .orderEmojiPalette = lib.lookup(*const fn () callconv(.c) void, "klio_order_emoji_palette"),
+        .a11yActive = lib.lookup(*const fn (?*SkWindow) callconv(.c) c_int, "klio_a11y_active"),
+        .a11yUpdate = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_a11y_update"),
         .winLastError = lib.lookup(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
         .tray = TrayFns.fromLib(&lib),
         .clipChangeCount = lib.lookup(ClipChangeCountFn, "klio_clip_change_count"),
@@ -391,6 +397,8 @@ fn loadSkiaStatic() ?*Skia {
         .winEventText = externSym(WinEventTextFn, "klio_win_event_text"),
         .systemTheme = externSym(*const fn () callconv(.c) c_int, "klio_system_theme"),
         .orderEmojiPalette = externSym(*const fn () callconv(.c) void, "klio_order_emoji_palette"),
+        .a11yActive = externSym(*const fn (?*SkWindow) callconv(.c) c_int, "klio_a11y_active"),
+        .a11yUpdate = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_a11y_update"),
         .winLastError = externSym(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
         .tray = TrayFns.fromExtern(),
         .clipChangeCount = externSym(ClipChangeCountFn, "klio_clip_change_count"),
@@ -854,6 +862,30 @@ pub fn orderEmojiPalette(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     const skia = loadSkia() orelse return ok(.{ .Unit = {} });
     if (skia.orderEmojiPalette) |f| f();
+    return ok(.{ .Unit = {} });
+}
+
+/// `__composeui_a11yActive(handle): Boolean`: whether an assistive client
+/// reads the window, so its semantics are worth sending.
+fn a11yActive(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value{ .Bool = false });
+    const skia = loadSkia() orelse return ok(Value{ .Bool = false });
+    const f = skia.a11yActive orelse return ok(Value{ .Bool = false });
+    const win = winHandle(ctx.args[0]) orelse return ok(Value{ .Bool = false });
+    return ok(Value{ .Bool = f(win) != 0 });
+}
+
+/// `__composeui_a11yUpdate(handle, snapshot)`: the window's semantics for
+/// assistive technologies (KlioWindowAccessibility.kt's snapshot).
+fn a11yUpdate(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(.{ .Unit = {} });
+    const skia = loadSkia() orelse return ok(.{ .Unit = {} });
+    const f = skia.a11yUpdate orelse return ok(.{ .Unit = {} });
+    const win = winHandle(ctx.args[0]) orelse return ok(.{ .Unit = {} });
+    const g = ctx.args[1].String.borrow();
+    defer g.deinit();
+    const bytes = g.get().bytes;
+    f(win, bytes.ptr, bytes.len);
     return ok(.{ .Unit = {} });
 }
 
@@ -1467,7 +1499,8 @@ test "hostBindings registers the surface and windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winOpenError") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetTextInput") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winEventText") != null);
-    try testing.expectEqual(@as(usize, 64), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_a11yUpdate") != null);
+    try testing.expectEqual(@as(usize, 66), b.len());
 }
 
 test "a window that cannot open says why" {
@@ -1579,6 +1612,14 @@ test "the text input bindings do nothing for short args, and event text is empty
     const g = text.String.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("", g.get().bytes);
+}
+
+test "the accessibility bindings are inactive and do nothing for short args" {
+    var host: TestHost = .{};
+    const none = [_]Value{};
+    var c = host.ctx(&none);
+    try testing.expect(!(try a11yActive(&c)).ok.Bool);
+    try testing.expect((try a11yUpdate(&c)).ok == .Unit);
 }
 
 test "a window position packs x high and y low, negatives kept" {

@@ -48,6 +48,7 @@ import androidx.compose.ui.window.__composeui_hideKeyboard
 import androidx.compose.ui.window.__composeui_setTextCallback
 import androidx.compose.ui.window.__composeui_showKeyboard
 import androidx.compose.ui.window.__composeui_textInput
+import androidx.compose.ui.window.KlioWindowAccessibility
 import androidx.compose.ui.window.KlioWindowTextInput
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -141,16 +142,22 @@ internal object KlioPlatformTextInputService : androidx.compose.ui.text.input.Pl
 /**
  * What a klio window's or the mobile surface's scene knows of its platform:
  * the window's focus and size, its lifecycle, view model store and saved
- * state, the input mode, and the text input: a desktop window's input method
- * ([windowTextInput]), or the mobile platform's keyboard.
+ * state, the input mode, the text input (a desktop window's input method,
+ * [windowTextInput], or the mobile platform's keyboard), and a desktop
+ * window's accessibility.
  */
 @OptIn(InternalComposeUiApi::class)
 internal class KlioPlatformContext(
     override val windowInfo: WindowInfoImpl,
     override val architectureComponentsOwner: DefaultArchitectureComponentsOwner,
     val windowTextInput: KlioWindowTextInput? = null,
+    /** A desktop window's accessibility, which its semantics owners report to. */
+    val windowAccessibility: KlioWindowAccessibility? = null,
 ) : PlatformContext {
     override val inputModeManager: InputModeManager = DefaultInputModeManager()
+
+    override val semanticsOwnerListener: PlatformContext.SemanticsOwnerListener?
+        get() = windowAccessibility
 
     @Suppress("DEPRECATION")
     override val textInputService: androidx.compose.ui.text.input.PlatformTextInputService

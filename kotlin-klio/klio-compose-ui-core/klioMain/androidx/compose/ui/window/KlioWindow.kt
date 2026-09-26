@@ -138,6 +138,7 @@ internal class KlioApplication(
             WindowInfoImpl().apply { isWindowFocused = true },
             components,
             windowTextInput = if (hosted) null else KlioWindowTextInput(handle),
+            windowAccessibility = if (hosted) null else KlioWindowAccessibility(handle),
         )
         var holder: KlioWindowHolder? = null
         val invalidate = { holder?.dirty = true }
@@ -431,7 +432,13 @@ internal class KlioWindowHolder(
 
     /** Whether the window's unpainted pixels are see-through. */
     var transparent: Boolean = false
-    val input = KlioWindowInput(scene, platformContext.windowInfo, handle, platformContext.windowTextInput).also { input ->
+    val input = KlioWindowInput(
+        scene,
+        platformContext.windowInfo,
+        handle,
+        platformContext.windowTextInput,
+        platformContext.windowAccessibility,
+    ).also { input ->
         input.menuShortcut = { event -> menuBar?.shortcut(event) ?: false }
         input.onFocusChanged = { updateLifecycleState() }
         input.onMoved = { x, y -> reportFrame(this, WINDOW_EVENT_MOVE, doubleArrayOf(x.toDouble(), y.toDouble())) }
@@ -1008,6 +1015,8 @@ private fun renderWindowFrame(holder: KlioWindowHolder) {
     __composeui_winPresent(holder.handle)
     // The candidate window follows the focused field's cursor as it moves.
     holder.platformContext.windowTextInput?.updateRect()
+    // Assistive technologies see what the frame changed.
+    holder.platformContext.windowAccessibility?.sync()
 }
 
 /** The values of the event a window's poll last reported. */
@@ -1054,7 +1063,7 @@ private fun dropsBlocked(blocker: KlioWindowHolder, type: Int, v: DoubleArray): 
     val forward = when (type) {
         WINDOW_EVENT_POINTER -> v[0].toInt() == 1
         WINDOW_EVENT_FOCUS -> v[0] != 0.0
-        WINDOW_EVENT_KEY, WINDOW_EVENT_TEXT, WINDOW_EVENT_IME, WINDOW_EVENT_MENU -> false
+        WINDOW_EVENT_KEY, WINDOW_EVENT_TEXT, WINDOW_EVENT_IME, WINDOW_EVENT_MENU, WINDOW_EVENT_A11Y -> false
         else -> return false
     }
     if (forward) __composeui_winSetFlag(blocker.handle, WIN_FRONT, 1)

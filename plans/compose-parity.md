@@ -157,9 +157,7 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
     ContextMenuProvider as they are, BasicContextMenuRepresentation and
     text/ContextMenu without their Swing menus (a text field's context menu
     is upstream's), and WindowDraggableArea over a klio window's move with
-    the mouse; (c) the accessibility
-    bridge (the semantics tree to NSAccessibility, UI Automation and
-    AT-SPI); (d) pointer icons (`PlatformContext.setPointerIcon`), drag and
+    the mouse; (c) done: the accessibility bridge (below); (d) pointer icons (`PlatformContext.setPointerIcon`), drag and
     drop between applications; (e) a Windows run (item 8).
     The input method: a klio window's text field turns the window's input
     method on (klio_win_set_text_input), and the shim reports what it
@@ -174,6 +172,18 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
     klio_system_theme, and a window's content gets ProvideSystemTheme as the
     desktop's does. skiko's orderEmojiAndSymbolsPopup opens macOS's
     palette, so foundation's KeyEventHelpers is upstream's.
+    The accessibility bridge: KlioWindowAccessibility listens to a window's
+    semantics owners and, once an assistive client reads the window, sends
+    the shim a snapshot of the merged tree after each frame that changed it
+    (roles, states and actions as upstream's ComposeAccessible computes
+    them); a client's request comes back as KLIO_EV_A11Y and runs the
+    node's semantics action. macOS exposes NSAccessibilityElements from
+    the content view; Windows UI Automation providers from WM_GETOBJECT
+    (compiled and linked only); Linux ATK objects that atk-bridge serves
+    over AT-SPI, with ATK loaded at run time. Scripted `a11y` verbs ask
+    through each platform's API, and compose_window_accessibility prints
+    the same tree on macOS and Linux; a pyatspi client over D-Bus read the
+    tree and pressed and toggled through atk-bridge.
 
 **Sparse checkout widenings a future item needs** (for the coordinator to
 run; scripts/init-compose-submodule.sh lists the current set):
@@ -297,10 +307,10 @@ tray runs on the X display; a MenuBar in a GPU SDL window). skiko's C glue
 
 | Platform | Verified by running | Verified by compiling only |
 |----------|---------------------|----------------------------|
-| macOS arm64 | every compose example (71 of 71 with the tray), the compose-ui gate, the upstream suites, the JVM oracle, skiko's natives through the shim's glue (the skiko module's test), the input method with key events posted through AppKit's input context | |
-| Linux aarch64 (Debian 12 container, Xvfb) | the compose examples (69 of 70 with skiko's glue in the shim: compose_text_fonts prints FreeType's baselines, 17.312 where CoreText gives 17.312012, and Compose Desktop 1.12.0 prints the same 17.312 in that container), the JVM oracle run in the same container (identical on the 11 font- and pixel-dependent examples it can compile), the drawn menu bar by frame dumps, the XEmbed tray under trayer (icon, menu, action, balloon) and without a tray, skiko's natives through the shim's glue (the skiko module's test), the compose-ui gate from a fresh home (the scripted input method and the system theme among it), and all 31 packs, org.jetbrains.skiko included, building | the harness is cross-compiled from macOS; the shim is built in the container with g++ |
+| macOS arm64 | every compose example (71 of 71 with the tray), the compose-ui gate, the upstream suites, the JVM oracle, skiko's natives through the shim's glue (the skiko module's test), the input method with key events posted through AppKit's input context, the accessibility tree through NSAccessibility | |
+| Linux aarch64 (Debian 12 container, Xvfb) | the compose examples (69 of 70 with skiko's glue in the shim: compose_text_fonts prints FreeType's baselines, 17.312 where CoreText gives 17.312012, and Compose Desktop 1.12.0 prints the same 17.312 in that container), the JVM oracle run in the same container (identical on the 11 font- and pixel-dependent examples it can compile), the drawn menu bar by frame dumps, the XEmbed tray under trayer (icon, menu, action, balloon) and without a tray, skiko's natives through the shim's glue (the skiko module's test), the compose-ui gate from a fresh home (the scripted input method, the system theme and the accessibility tree among it), an AT-SPI client (pyatspi) reading and acting through atk-bridge, and all 31 packs, org.jetbrains.skiko included, building | the harness is cross-compiled from macOS; the shim is built in the container with g++ |
 | Linux x86_64 | | compose_ui and the stdlib (`zigcheck.py --target x86_64-linux-gnu`) |
-| Windows x86_64 | | klio.exe with compose_ui and the skiko bindings, compiled and linked by the cross build (`zig build -Dtarget=x86_64-windows-gnu`, over the runtime's platform layer); the shim's own sources (its IMM32 input method and registry theme read among them) and all 86 of skiko's glue sources to objects (`zig c++ -target x86_64-windows-gnu`, C++20). Linking the shim needs the MSVC toolchain the Windows Skia prebuilt is built with |
+| Windows x86_64 | | klio.exe with compose_ui and the skiko bindings, compiled and linked by the cross build (`zig build -Dtarget=x86_64-windows-gnu`, over the runtime's platform layer); the shim's own sources (its IMM32 input method, registry theme read and UI Automation providers among them; the UIA imports link against uiautomationcore) and all 86 of skiko's glue sources to objects (`zig c++ -target x86_64-windows-gnu`, C++20). Linking the shim needs the MSVC toolchain the Windows Skia prebuilt is built with |
 
 Not verified anywhere yet: a Wayland session (SDL picks Wayland or X11 at
 runtime; the tray is X11's, so under Wayland without XWayland
@@ -618,3 +628,7 @@ isTraySupported is false), and running on Windows.
   bitmaps, from the program's includes: `klio run --include` (or the
   manifest's `[application] include`) serves them from disk at the mount
   paths a bundle embeds them at. klio.io.InputStream is in the stdlib.
+- 2026-09-26: klio windows reach assistive technologies. The semantics
+  tree goes to NSAccessibility, UI Automation and AT-SPI (ATK with
+  atk-bridge, loaded at run time), and a client's press, toggle, new text
+  or step runs the node's semantics action.

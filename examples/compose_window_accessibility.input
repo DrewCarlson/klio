@@ -1,0 +1,9 @@
+# Scripted input for compose_window_accessibility.kt's window (KLIO_WIN_INPUT):
+# requests through the platform's accessibility API, as a screen reader's.
+8 a11y dump
+10 a11y press Add
+12 a11y press Subscribe
+14 a11y value Name=Ada
+16 a11y increment Volume
+20 a11y dump
+24 close

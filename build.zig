@@ -1729,6 +1729,29 @@ fn detectSdl(b: *std.Build) ?struct { inc: []const u8, lib: []const u8 } {
     return null;
 }
 
+/// ATK's and GLib's headers, for the SDL backend's accessibility bridge
+/// (AT-SPI through ATK and atk-bridge). Headers only: the shim loads the
+/// libraries when a window opens, so a desktop without them still runs.
+fn detectAtk(b: *std.Build) ?[]const []const u8 {
+    const io = b.graph.io;
+    const atk = "/usr/include/atk-1.0";
+    const glib = "/usr/include/glib-2.0";
+    b.build_root.handle.access(io, atk ++ "/atk/atk.h", .{}) catch return null;
+    b.build_root.handle.access(io, glib ++ "/glib.h", .{}) catch return null;
+    const config_candidates = [_][]const u8{
+        "/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+        "/usr/lib/aarch64-linux-gnu/glib-2.0/include",
+        "/usr/lib64/glib-2.0/include",
+        "/usr/lib/glib-2.0/include",
+    };
+    for (config_candidates) |c| {
+        if (b.build_root.handle.access(io, b.fmt("{s}/glibconfig.h", .{c}), .{})) |_| {
+            return b.allocator.dupe([]const u8, &.{ "-DKLIO_ATK", "-I" ++ atk, "-I" ++ glib, b.fmt("-I{s}", .{c}) }) catch null;
+        } else |_| {}
+    }
+    return null;
+}
+
 /// A versioned system shared object (e.g. `libEGL.so.1`) for the optional GPU
 /// backend, by base name. No dev symlink (`libEGL.so`) is required — the `.so.1`
 /// is enough to link against directly by path.
@@ -2060,6 +2083,11 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
         } else {
             std.log.warn("SDL2 not found; the Compose-UI window backend is disabled (headless render only). Install libsdl2-dev.", .{});
         }
+        if (detectAtk(b)) |flags| {
+            run.addArgs(flags);
+        } else {
+            std.log.warn("ATK's headers not found; windows are not exposed to assistive technologies (AT-SPI). Install libatk1.0-dev.", .{});
+        }
         // Optional Ganesh+GL GPU surface. The ganesh archive is already in the link
         // group above; this enables the code path and links the GL and EGL
         // runtimes its GL interface references (Skia's native GL interface on
@@ -2083,8 +2111,9 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
         }),
         .windows => run.addArgs(&.{
             "-luser32", "-lgdi32", "-lopengl32", "-lole32", "-loleaut32", "-lshell32",
-            // The input method (imm32) and the system theme's registry value (advapi32).
-            "-limm32", "-ladvapi32",
+            // The input method (imm32), the system theme's registry value
+            // (advapi32) and UI Automation.
+            "-limm32", "-ladvapi32", "-luiautomationcore",
         }),
         else => return null,
     }

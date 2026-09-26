@@ -12,7 +12,8 @@ name: release
 #
 # Linux shims link SDL2 statically (scripts/fetch-sdl.sh) so bundles have
 # no libSDL2 install dependency; the builder image's glibc/libstdc++ set
-# the documented runtime floor.
+# the documented runtime floor. ATK and atk-bridge, for assistive
+# technologies, are loaded at run time where the desktop has them.
 
 on:
   push:
@@ -86,6 +87,10 @@ jobs:
           set -euo pipefail
           ./scripts/fetch-skia.sh linux x64
           ./scripts/fetch-sdl.sh
+      # ATK's headers, for the accessibility bridge (the shim loads ATK and
+      # atk-bridge at run time, so they are no install dependency).
+      - name: install ATK headers
+        run: sudo apt-get update && sudo apt-get install -y libatk1.0-dev
       - name: build shim (static SDL2)
         run: |
           set -euo pipefail
