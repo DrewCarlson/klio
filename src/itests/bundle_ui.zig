@@ -1,54 +1,60 @@
 //! End-to-end gate for UI bundles. A Compose program bundles with the Skia
 //! backend embedded, runs against an empty home with no `KLIO_SKIA_LIB` and no
-//! repo `LD_LIBRARY_PATH`, extracts the shim into the per-user cache on first
+//! repo library path, extracts the shim into the per-user cache on first
 //! launch only, and rasterizes a PNG byte-identical to a direct `klio run`
 //! against the dev shim. Skips without the built backend at `zig-out/lib/`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime = @import("runtime");
+const klio_child = @import("klio_child");
 
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 const TMP_ROOT = "/tmp/klio_itest_bundle_ui";
 
+const SHIM_NAME = switch (builtin.os.tag) {
+    .macos => "libklio_skia.dylib",
+    .windows => "klio_skia.dll",
+    else => "libklio_skia.so",
+};
+
 const SCENE =
-    \\import klio.compose.ui.Box
-    \\import klio.compose.ui.Color
-    \\import klio.compose.ui.Column
-    \\import klio.compose.ui.Modifier
-    \\import klio.compose.ui.Text
-    \\import klio.compose.ui.uiRenderer
+    \\import androidx.compose.foundation.background
+    \\import androidx.compose.foundation.border
+    \\import androidx.compose.foundation.layout.Box
+    \\import androidx.compose.foundation.layout.Column
+    \\import androidx.compose.foundation.layout.fillMaxSize
+    \\import androidx.compose.foundation.layout.padding
+    \\import androidx.compose.foundation.layout.size
+    \\import androidx.compose.foundation.shape.RoundedCornerShape
+    \\import androidx.compose.foundation.text.BasicText
+    \\import androidx.compose.ui.Modifier
+    \\import androidx.compose.ui.graphics.Color
+    \\import androidx.compose.ui.klio.renderComposeToPng
+    \\import androidx.compose.ui.text.TextStyle
+    \\import androidx.compose.ui.unit.dp
+    \\import androidx.compose.ui.unit.sp
     \\
     \\fun main() {
-    \\    val ui = uiRenderer(16, 10) {
-    \\        Column(Modifier.None.background(Color.Blue).border(Color.White).padding(1)) {
-    \\            Text("PNG", Color.White, Modifier.None)
-    \\            Box(Modifier.None.size(6, 3).background(Color.Red).border(Color.Yellow).cornerRadius(1))
+    \\    val ok = renderComposeToPng(128, 80, 8f, "/tmp/klio_itest_bundle_ui/scene.png") {
+    \\        Column(Modifier.fillMaxSize().background(Color.Blue).border(1.dp, Color.White).padding(1.dp)) {
+    \\            BasicText("PNG", style = TextStyle(color = Color.White, fontSize = 4.sp))
+    \\            val shape = RoundedCornerShape(1.dp)
+    \\            Box(Modifier.size(6.dp, 3.dp).background(Color.Red, shape).border(1.dp, Color.Yellow, shape))
     \\        }
     \\    }
-    \\    println("checksum=" + ui.savePng("/tmp/klio_itest_bundle_ui/scene.png", 8))
-    \\    ui.dispose()
+    \\    println("rendered=" + ok)
     \\}
     \\
 ;
 
-fn klioBin(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]const u8 {
-    const rel = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
-    return std.Io.Dir.cwd().realPathFileAlloc(io, rel, a) catch rel;
-}
-
-fn baseEnv(a: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
-    var map = std.process.Environ.Map.init(a);
-    errdefer map.deinit();
-    runtime.procEnvPutAllInto(a, &map);
-    try map.put("HOME", home);
-    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_TRACE_STDLIB_IMAGE"));
-    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_STDLIB_IMAGE"));
-    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_PACK_DIAG"));
-    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_SKIA_LIB"));
-    _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
-    _ = map.array_hash_map.swapRemove(@as([]const u8, "LD_LIBRARY_PATH"));
-    return map;
+/// Drops what would let a child find the dev shim, a baked image or the
+/// repository's libraries, so a bundle proves it carries its own.
+fn scrub(env: *std.process.Environ.Map) void {
+    inline for (.{ "KLIO_TRACE_STDLIB_IMAGE", "KLIO_STDLIB_IMAGE", "KLIO_PACK_DIAG", "KLIO_SKIA_LIB", "KLIO_BUNDLE_INSPECT", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH" }) |k| {
+        _ = env.swapRemove(k);
+    }
 }
 
 const RunResult = struct { code: u32, stdout: []u8, stderr: []u8 };
@@ -83,7 +89,7 @@ fn findShim(a: std.mem.Allocator, io: std.Io, root: []const u8) ?[]const u8 {
     var walker = dir.walk(a) catch return null;
     defer walker.deinit();
     while (walker.next(io) catch null) |entry| {
-        if (entry.kind == .file and std.mem.eql(u8, entry.basename, "libklio_skia.so")) {
+        if (entry.kind == .file and std.mem.eql(u8, entry.basename, SHIM_NAME)) {
             return std.fmt.allocPrint(a, "{s}/{s}", .{ root, entry.path }) catch null;
         }
     }
@@ -97,66 +103,43 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     const io = threaded.io();
     const cwd = std.Io.Dir.cwd();
 
-    _ = cwd.statFile(io, "zig-out/lib/libklio_skia.so", .{}) catch {
-        std.debug.print("bundle_ui: zig-out/lib/libklio_skia.so absent; skipping (run scripts/fetch-skia.sh + zig build)\n", .{});
+    const shim_rel = "zig-out/lib/" ++ SHIM_NAME;
+    _ = cwd.statFile(io, shim_rel, .{}) catch {
+        if (klio_child.verbose()) std.debug.print("bundle_ui: " ++ shim_rel ++ " absent; skipping (zig build skia-lib)\n", .{});
         return error.SkipZigTest;
     };
 
     cwd.deleteTree(io, TMP_ROOT) catch {};
     try cwd.createDirPath(io, TMP_ROOT);
-    const build_home = try freshDir(a, io, "home_build");
-    const run_home = try freshDir(a, io, "home_run");
-    var build_env = try baseEnv(a, build_home);
+    // The program builds against the shared test home, where every shipped
+    // pack is installed; the bundle runs in an empty one.
+    var build_env = try klio_child.baseEnv(a);
     defer build_env.deinit();
-    var run_env = try baseEnv(a, run_home);
+    scrub(&build_env);
+    const run_home = try freshDir(a, io, "home_run");
+    var run_env = try klio_child.envFor(a, run_home);
     defer run_env.deinit();
+    scrub(&run_env);
     const cache_dir = try std.fmt.allocPrint(a, "{s}/xdg-cache", .{TMP_ROOT});
     try run_env.put("XDG_CACHE_HOME", cache_dir);
-    const bin = try klioBin(a, io, &build_env);
-
-    const pack_dirs = [_][]const u8{
-        "kotlin-klio/klio-androidx-annotation",
-        "kotlin-klio/klio-kotlinx-atomicfu",
-        "kotlin-klio/klio-kotlinx-io",
-        "kotlin-klio/klio-kotlinx-coroutines",
-        "kotlin-klio/klio-androidx-collection",
-        "kotlin-klio/klio-compose-runtime-engine",
-        "kotlin-klio/klio-compose-ui",
-    };
-    // Built into this suite's own directory: the shared target/packs is
-    // rewritten by every other suite that builds a pack.
-    var pack_files: [pack_dirs.len][]const u8 = undefined;
-    for (pack_dirs, &pack_files) |d, *f| {
-        f.* = try std.fmt.allocPrint(a, "{s}/{s}.klio-pack", .{ TMP_ROOT, std.fs.path.basename(d) });
-        const r = try runChild(a, io, &build_env, &.{ bin, "pack", "build", d, "--out", f.* });
-        if (r.code != 0) {
-            std.debug.print("bundle_ui: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
-            return error.TestUnexpectedResult;
-        }
-    }
-    for (pack_files) |f| {
-        const r = try runChild(a, io, &build_env, &.{ bin, "pack", "install", f });
-        if (r.code != 0) {
-            std.debug.print("bundle_ui: pack install {s} failed:\n{s}\n", .{ f, r.stderr });
-            return error.TestUnexpectedResult;
-        }
-    }
+    const bin = cwd.realPathFileAlloc(io, klio_child.bin(), a) catch klio_child.bin();
 
     const program = try std.fmt.allocPrint(a, "{s}/scene.kt", .{TMP_ROOT});
     try cwd.writeFile(io, .{ .sub_path = program, .data = SCENE });
 
-    const shim_abs = try cwd.realPathFileAlloc(io, "zig-out/lib/libklio_skia.so", a);
+    const shim_abs = try cwd.realPathFileAlloc(io, shim_rel, a);
     try build_env.put("KLIO_SKIA_LIB", shim_abs);
     const expect = try runChild(a, io, &build_env, &.{ bin, "run", program });
-    _ = build_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_SKIA_LIB"));
+    _ = build_env.swapRemove("KLIO_SKIA_LIB");
+    if (expect.code != 0) std.debug.print("bundle_ui: klio run failed:\n{s}\n", .{expect.stderr});
     try std.testing.expectEqual(@as(u32, 0), expect.code);
-    try std.testing.expect(std.mem.startsWith(u8, expect.stdout, "checksum="));
-    // Checksum 0 is the headless fallback, which would make the gate vacuous.
-    try std.testing.expect(!std.mem.eql(u8, std.mem.trim(u8, expect.stdout, "\n"), "checksum=0"));
+    // `false` is the headless fallback, which would make the gate vacuous.
+    try std.testing.expectEqualStrings("rendered=true\n", expect.stdout);
     const expect_png = try cwd.readFileAlloc(io, TMP_ROOT ++ "/scene.png", a, .unlimited);
+    try std.testing.expect(std.mem.startsWith(u8, expect_png, "\x89PNG\r\n\x1a\n"));
     try cwd.deleteFile(io, TMP_ROOT ++ "/scene.png");
 
-    // The ui flavor must be auto-detected from the klio.compose.ui pack.
+    // The ui flavor must be auto-detected from the androidx.compose.ui packs.
     const out = try std.fmt.allocPrint(a, "{s}/uibin", .{TMP_ROOT});
     const bundled = try runChild(a, io, &build_env, &.{ bin, "bundle", program, "-o", out });
     if (bundled.code != 0) {
@@ -169,7 +152,7 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     const abs = try cwd.realPathFileAlloc(io, out, a);
     try run_env.put("KLIO_BUNDLE_INSPECT", "1");
     const inspect = try runChild(a, io, &run_env, &.{abs});
-    _ = run_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
+    _ = run_env.swapRemove("KLIO_BUNDLE_INSPECT");
     try std.testing.expectEqual(@as(u32, 0), inspect.code);
     try std.testing.expect(std.mem.find(u8, inspect.stdout, "flavor: ui\n") != null);
     try std.testing.expect(std.mem.find(u8, inspect.stdout, "  skia-shim ") != null);
@@ -181,7 +164,11 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     const got_png = try cwd.readFileAlloc(io, TMP_ROOT ++ "/scene.png", a, .unlimited);
     try std.testing.expect(std.mem.eql(u8, expect_png, got_png));
 
-    const shim_root = try std.fmt.allocPrint(a, "{s}/klio/shim", .{cache_dir});
+    const cache_base = if (builtin.os.tag == .macos)
+        try std.fmt.allocPrint(a, "{s}/Library/Caches", .{run_home})
+    else
+        cache_dir;
+    const shim_root = try std.fmt.allocPrint(a, "{s}/klio/shim", .{cache_base});
     const extracted = findShim(a, io, shim_root) orelse {
         std.debug.print("bundle_ui: no extracted shim under {s}\n", .{shim_root});
         return error.TestUnexpectedResult;

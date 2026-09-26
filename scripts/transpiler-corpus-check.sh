@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 pattern="${1:-examples/*.kt}"
 jobs="${JOBS:-8}"
-skip_re='compose_ui_dashboard|compose_ui_input|compose_ui_window|compose_window|compose_multiwindow|compose_foundation_lazy'
+skip_re='compose_window|compose_multiwindow|compose_foundation_lazy'
 
 # ReleaseFast on both sides: the gate compares the interpreter's output against
 # a compiled native binary under a wall-clock cap, and a debug interpreter runs

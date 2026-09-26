@@ -134,8 +134,7 @@ against the code.
   the cold `klio run hello.kt` under 50 ms acceptance (unverified).
 - Multiplatform axis: `target` on sources, `--target`/`KLIO_TARGET` for
   `run` and `pack build`, per-target bindings, an emitter for
-  `ACTUAL_ANNOTATIONS_NOT_MATCH_EXPECT`, retiring the interim
-  `klio-compose-ui` pack.
+  `ACTUAL_ANNOTATIONS_NOT_MATCH_EXPECT`.
 - Pack features follow upstream modules (one feature per Gradle module,
   `default` = the primary module; the rule and layout live in
   `docs/packs/authoring.md`). Modules present in the sparse checkouts but not

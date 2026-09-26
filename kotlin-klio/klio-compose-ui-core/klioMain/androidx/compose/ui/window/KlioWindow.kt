@@ -1115,7 +1115,7 @@ internal fun __composeui_screenBounds(which: Int): Int =
     error("intrinsic androidx.compose.ui.window.__composeui_screenBounds not installed")
 
 internal fun __composeui_winOpen(width: Int, height: Int, title: String): Long =
-    error("intrinsic klio.compose.ui.__composeui_winOpen not installed")
+    error("intrinsic androidx.compose.ui.window.__composeui_winOpen not installed")
 
 // Why the last __composeui_winOpen answered 0.
 internal fun __composeui_winOpenError(): String =
@@ -1135,16 +1135,16 @@ internal fun __composeui_winPostEvent(handle: Long, type: Int, values: DoubleArr
     error("intrinsic androidx.compose.ui.window.__composeui_winPostEvent not installed")
 
 internal fun __composeui_winClose(handle: Long): Long =
-    error("intrinsic klio.compose.ui.__composeui_winClose not installed")
+    error("intrinsic androidx.compose.ui.window.__composeui_winClose not installed")
 
 internal fun __composeui_winSurface(handle: Long): Long =
-    error("intrinsic klio.compose.ui.__composeui_winSurface not installed")
+    error("intrinsic androidx.compose.ui.window.__composeui_winSurface not installed")
 
 internal fun __composeui_winPresent(handle: Long): Long =
-    error("intrinsic klio.compose.ui.__composeui_winPresent not installed")
+    error("intrinsic androidx.compose.ui.window.__composeui_winPresent not installed")
 
 internal fun __composeui_winClear(handle: Long, argb: Int): Long =
-    error("intrinsic klio.compose.ui.__composeui_winClear not installed")
+    error("intrinsic androidx.compose.ui.window.__composeui_winClear not installed")
 
 internal fun __composeui_winSetTitle(handle: Long, title: String): Long =
     error("intrinsic androidx.compose.ui.window.__composeui_winSetTitle not installed")

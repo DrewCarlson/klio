@@ -53,9 +53,7 @@ lifecycle-common and they on savedstate, so as features of
 `org.jetbrains.skiko` (`kotlin-klio/klio-skiko`) is skiko's
 commonMain, the `org.jetbrains.skia` API, over the native functions skiko's
 C glue exports from the Skia shim. ui-graphics and ui-text draw through it
-as on Compose Desktop: their skikoMain sets are upstream's, whole. `klio.compose.ui`
-(`kotlin-klio/klio-compose-ui`) is klio's own windowing and rendering layer
-(`runApp`, the Skia backend) over the runtime, not an upstream module.
+as on Compose Desktop: their skikoMain sets are upstream's, whole.
 
 The runtime's page, [androidx.compose.runtime](compose-runtime.md), covers
 how `@Composable` code runs without the Compose compiler plugin.

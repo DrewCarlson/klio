@@ -3,8 +3,8 @@
 // Built with system g++/libstdc++ (Skia's prebuilt libs use the old GNU string
 // ABI; zig cc/libc++ will not link them). See plans/open-campaigns.md.
 //
-// The klio.compose.ui pack records a display list of draw ops during its draw
-// pass; this shim replays them onto a headless raster SkSurface and encodes PNG.
+// It owns the raster surfaces ui-graphics draws on and the platform windows,
+// trays and menus; skiko's own C glue, linked in beside it, draws the frame.
 // Colors are 0xAARRGGBB (Compose's packed ARGB). Coordinates are pixels.
 
 #include <cmath>
@@ -89,9 +89,9 @@ extern "C" const char klio_win_backend_tag[] = "klio-win-backend:cocoa";
 extern "C" const char klio_win_backend_tag[] = "klio-win-backend:stub";
 #endif
 
-// Optional GPU (Ganesh + EGL) backend — off by default. When built with -DKLIO_GPU
-// (and linked against libskia_ganesh_ext + libEGL), klio_skia_new_gpu returns a
-// GPU-backed surface; otherwise it returns null and callers fall back to raster.
+// Optional GPU (Ganesh) window surfaces, off by default: built with -DKLIO_GPU,
+// the SDL window draws through a GL context; otherwise it draws on a raster
+// surface.
 #if defined(KLIO_GPU)
 #include "include/gpu/GpuTypes.h"
 #include "include/gpu/ganesh/GrBackendSurface.h"
@@ -103,39 +103,6 @@ extern "C" const char klio_win_backend_tag[] = "klio-win-backend:stub";
 #include "include/gpu/ganesh/gl/GrGLDirectContext.h"
 #include "include/gpu/ganesh/gl/GrGLInterface.h"
 #include "include/gpu/ganesh/gl/GrGLTypes.h"
-
-// Minimal EGL surface-less context bring-up. Declared here (rather than via the
-// EGL headers, which are not reliably present) since only these entry points +
-// constants are needed; values are fixed by the EGL 1.5 spec.
-extern "C" {
-typedef void* EGLDisplay;
-typedef void* EGLConfig;
-typedef void* EGLContext;
-typedef void* EGLSurface;
-typedef int EGLint;
-typedef unsigned int EGLBoolean;
-typedef unsigned int EGLenum;
-EGLDisplay eglGetDisplay(void*);
-EGLBoolean eglInitialize(EGLDisplay, EGLint*, EGLint*);
-EGLBoolean eglChooseConfig(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*);
-EGLBoolean eglBindAPI(EGLenum);
-EGLContext eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint*);
-EGLSurface eglCreatePbufferSurface(EGLDisplay, EGLConfig, const EGLint*);
-EGLBoolean eglMakeCurrent(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
-void (*eglGetProcAddress(const char*))(void);
-EGLint eglGetError(void);
-}
-#define KLIO_EGL_DEFAULT_DISPLAY ((void*)0)
-#define KLIO_EGL_NO_CONTEXT ((void*)0)
-#define KLIO_EGL_NO_SURFACE ((void*)0)
-#define KLIO_EGL_NONE 0x3038
-#define KLIO_EGL_SURFACE_TYPE 0x3033
-#define KLIO_EGL_PBUFFER_BIT 0x0001
-#define KLIO_EGL_RENDERABLE_TYPE 0x3040
-#define KLIO_EGL_OPENGL_BIT 0x0008
-#define KLIO_EGL_OPENGL_API 0x30A2
-#define KLIO_EGL_WIDTH 0x3057
-#define KLIO_EGL_HEIGHT 0x3056
 #endif  // KLIO_GPU
 
 namespace {
@@ -157,8 +124,8 @@ SkCanvas* canvasOf(KlioSurface* s) {
 }
 
 // Common system font paths tried (in order) for text rendering, since the empty
-// SkFontMgr ships no faces. $KLIO_SKIA_FONT overrides. A miss leaves text unpainted
-// (the display list still carries the text op).
+// SkFontMgr ships no faces. $KLIO_SKIA_FONT overrides. A miss leaves text
+// unpainted.
 const char* const kFontCandidates[] = {
     "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
@@ -211,30 +178,6 @@ void ensureFonts() {
 // A wrapped paragraph's line spacing.
 constexpr float kLineSpacing = 1.3f;
 
-// Greedily word-wrap `utf8` into lines that fit `width` px at font `font`.
-std::vector<std::string> wrapLines(const char* utf8, float width, const SkFont& font) {
-    std::vector<std::string> lines;
-    const std::string text(utf8);
-    std::string cur;
-    size_t i = 0;
-    while (i <= text.size()) {
-        const size_t sp = text.find(' ', i);
-        const bool last = (sp == std::string::npos);
-        const std::string word = text.substr(i, last ? std::string::npos : sp - i);
-        const std::string candidate = cur.empty() ? word : cur + " " + word;
-        const float w = font.measureText(candidate.c_str(), candidate.size(), SkTextEncoding::kUTF8);
-        if (w > width && !cur.empty()) {
-            lines.push_back(cur);
-            cur = word;
-        } else {
-            cur = candidate;
-        }
-        if (last) break;
-        i = sp + 1;
-    }
-    if (!cur.empty()) lines.push_back(cur);
-    return lines;
-}
 
 // The fonts a generic family names on this platform, in skiko's order
 // (PlatformFont.skiko.kt's GenericFontFamiliesMapping); another name stands
@@ -299,18 +242,7 @@ inline SkColor toColor(uint32_t argb) { return static_cast<SkColor>(argb); }
 
 
 
-inline void fillPaint(SkPaint& p, uint32_t argb) {
-    p.setAntiAlias(true);
-    p.setStyle(SkPaint::kFill_Style);
-    p.setColor(toColor(argb));
-}
 
-inline void strokePaint(SkPaint& p, uint32_t argb, float width) {
-    p.setAntiAlias(true);
-    p.setStyle(SkPaint::kStroke_Style);
-    p.setStrokeWidth(width);
-    p.setColor(toColor(argb));
-}
 
 // Snapshot a surface's pixels: the fast peekPixels path for raster surfaces, or a
 // GPU→CPU readback for Ganesh surfaces. `backing` owns the pixels when read back.
@@ -323,71 +255,9 @@ bool surfaceToPixmap(KlioSurface* s, SkPixmap& pm, SkBitmap& backing) {
     return true;
 }
 
-#if defined(KLIO_GPU)
-sk_sp<GrDirectContext> g_grContext;
-bool g_gpu_tried = false;
-
-// Bring up a surface-less EGL desktop-GL context + a Skia GrDirectContext once.
-// Leaves g_grContext null (callers fall back to raster) if any step fails.
-void ensureGpu() {
-    if (g_gpu_tried) return;
-    g_gpu_tried = true;
-    EGLDisplay dpy = eglGetDisplay(KLIO_EGL_DEFAULT_DISPLAY);
-    if (!dpy) return;
-    EGLint major = 0, minor = 0;
-    if (!eglInitialize(dpy, &major, &minor)) return;
-    const EGLint cfgAttrs[] = {
-        KLIO_EGL_SURFACE_TYPE,    KLIO_EGL_PBUFFER_BIT,
-        KLIO_EGL_RENDERABLE_TYPE, KLIO_EGL_OPENGL_BIT,
-        KLIO_EGL_NONE};
-    EGLConfig cfg = nullptr;
-    EGLint n = 0;
-    if (!eglChooseConfig(dpy, cfgAttrs, &cfg, 1, &n) || n < 1) return;
-    if (!eglBindAPI(KLIO_EGL_OPENGL_API)) return;
-    EGLContext ctx = eglCreateContext(dpy, cfg, KLIO_EGL_NO_CONTEXT, nullptr);
-    if (ctx == KLIO_EGL_NO_CONTEXT) return;
-    const EGLint pbAttrs[] = {KLIO_EGL_WIDTH, 1, KLIO_EGL_HEIGHT, 1, KLIO_EGL_NONE};
-    EGLSurface surf = eglCreatePbufferSurface(dpy, cfg, pbAttrs);
-    if (!eglMakeCurrent(dpy, surf, surf, ctx)) return;
-    // Assemble the GL interface from eglGetProcAddress (the prebuilt ganesh's
-    // native interface is GLX-bound; this keeps us on EGL). Desktop GL context, so
-    // the GL — not GLES — assembler.
-    auto iface = GrGLMakeAssembledGLInterface(
-        nullptr, [](void*, const char name[]) -> GrGLFuncPtr {
-            return reinterpret_cast<GrGLFuncPtr>(eglGetProcAddress(name));
-        });
-    if (!iface) return;
-    g_grContext = GrDirectContexts::MakeGL(iface);
-}
-#endif  // KLIO_GPU
-
 }  // namespace
 
 extern "C" {
-
-// Create a GPU (Ganesh) surface, or null if the GPU backend is unavailable (not
-// built with -DKLIO_GPU, or EGL/GL bring-up failed) so the caller uses raster.
-KlioSurface* klio_skia_new_gpu(int width, int height) {
-#if defined(KLIO_GPU)
-    if (width <= 0 || height <= 0) return nullptr;
-    ensureGpu();
-    if (!g_grContext) return nullptr;
-    auto* s = new KlioSurface();
-    s->surface = SkSurfaces::RenderTarget(
-        g_grContext.get(), skgpu::Budgeted::kYes,
-        SkImageInfo::MakeN32Premul(width, height), 0, nullptr);
-    if (!s->surface) {
-        delete s;
-        return nullptr;
-    }
-    ensureFonts();
-    return s;
-#else
-    (void)width;
-    (void)height;
-    return nullptr;
-#endif
-}
 
 // Create a headless N32-premul raster surface, cleared transparent.
 KlioSurface* klio_skia_new(int width, int height) {
@@ -408,84 +278,14 @@ void klio_skia_clear(KlioSurface* s, uint32_t argb) {
     if (auto* c = canvasOf(s)) c->clear(toColor(argb));
 }
 
-void klio_skia_fill_rect(KlioSurface* s, float x, float y, float w, float h, uint32_t argb) {
-    if (!s) return;
-    SkPaint p;
-    fillPaint(p, argb);
-    if (auto* c = canvasOf(s)) c->drawRect(SkRect::MakeXYWH(x, y, w, h), p);
-}
-
-void klio_skia_stroke_rect(KlioSurface* s, float x, float y, float w, float h, float width, uint32_t argb) {
-    if (!s) return;
-    SkPaint p;
-    strokePaint(p, argb, width);
-    // Inset by half the stroke so the outline stays inside the rect bounds.
-    float half = width * 0.5f;
-    if (auto* c = canvasOf(s)) c->drawRect(SkRect::MakeXYWH(x + half, y + half, w - width, h - width), p);
-}
-
-void klio_skia_fill_rrect(KlioSurface* s, float x, float y, float w, float h, float rx, float ry, uint32_t argb) {
-    if (!s) return;
-    SkPaint p;
-    fillPaint(p, argb);
-    if (auto* c = canvasOf(s)) c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, w, h), rx, ry), p);
-}
-
-void klio_skia_fill_circle(KlioSurface* s, float cx, float cy, float r, uint32_t argb) {
-    if (!s) return;
-    SkPaint p;
-    fillPaint(p, argb);
-    if (auto* c = canvasOf(s)) c->drawCircle(cx, cy, r, p);
-}
-
-void klio_skia_draw_line(KlioSurface* s, float x0, float y0, float x1, float y1, float width, uint32_t argb) {
-    if (!s) return;
-    SkPaint p;
-    strokePaint(p, argb, width);
-    if (auto* c = canvasOf(s)) c->drawLine(x0, y0, x1, y1, p);
-}
-
-// Baseline-left text. `x`,`y` is the baseline origin. No-op if no typeface.
-void klio_skia_draw_text(KlioSurface* s, const char* utf8, float x, float y, float size, uint32_t argb) {
-    if (!s || !utf8 || !g_typeface) return;
-    SkFont font(g_typeface, size);
-    font.setEdging(SkFont::Edging::kAntiAlias);
-    SkPaint p;
-    fillPaint(p, argb);
-    if (auto* c = canvasOf(s)) c->drawSimpleText(
-        utf8, std::strlen(utf8), SkTextEncoding::kUTF8, x, y, font, p);
-}
 
 
-// Lay out UTF-8 text within `width` px (word-wrapped, aligned: 0 left, 1 center,
-// 2 right) and paint it with its top-left at (x, y). No-op without a font.
-void klio_skia_draw_paragraph(KlioSurface* s, const char* utf8, float x, float y, float width, float size, uint32_t argb, int align) {
-    if (!s || !utf8 || !g_typeface) return;
-    SkFont font(g_typeface, size);
-    font.setEdging(SkFont::Edging::kAntiAlias);
-    SkPaint p;
-    fillPaint(p, argb);
-    const auto lines = wrapLines(utf8, width, font);
-    float baseline = y + size;  // first line's baseline sits `size` below the top
-    for (const auto& line : lines) {
-        const float lw = font.measureText(line.c_str(), line.size(), SkTextEncoding::kUTF8);
-        float lx = x;
-        if (align == 1) lx = x + (width - lw) * 0.5f;
-        else if (align == 2) lx = x + (width - lw);
-        if (auto* c = canvasOf(s)) c->drawSimpleText(line.c_str(), line.size(), SkTextEncoding::kUTF8, lx, baseline, font, p);
-        baseline += size * kLineSpacing;
-    }
-}
 
-// The laid-out height (px) of `utf8` wrapped to `width` at `size`. 0 without a
-// font. No surface needed, so the layout pass can call it to size a paragraph.
-float klio_skia_measure_paragraph(const char* utf8, float width, float size) {
-    ensureFonts();
-    if (!utf8 || !g_typeface) return 0;
-    SkFont font(g_typeface, size);
-    const int n = static_cast<int>(wrapLines(utf8, width, font).size());
-    return n * size * kLineSpacing;
-}
+
+
+
+
+
 
 
 
@@ -926,7 +726,7 @@ void klio_win_set_size(KlioWindow* kw, int w, int h) {
 static void klioSdlPaintFrame(KlioWindow* kw);
 static unsigned klioMenuVersion(const KlioMenuUi& ui);
 
-// The surface the caller replays the display list onto before presenting.
+// The surface the caller draws the frame on before presenting.
 KlioSurface* klio_win_surface(KlioWindow* kw) { return kw ? kw->surface : nullptr; }
 
 // Shows the raster window: the content as last drawn, under the bar and the
@@ -972,70 +772,6 @@ static void klioSdlShowMenus() {
     }
 }
 
-// Wait up to timeoutMs for one event (poll when timeoutMs <= 0, so the caller can
-// drain a backlog non-blocking). Returns an event type and writes two type-
-// dependent values into *outA/*outB:
-//   0 none/redraw
-//   1 click     — outA=x, outB=y
-//   2 close
-//   3 key       — outA=char (ASCII, 0 if non-printable), outB=keysym (X11-style)
-//   4 move      — outA=x, outB=y (pointer position)
-//   5 resize    — outA=width, outB=height (the surface is recreated to match)
-// Classify one SDL event against its TARGET window (which may not be the
-// polling one): the poll contract's (type, a, b). Resize applies the
-// surface change to the target.
-static int klioSdlClassify(KlioWindow* kw, const SDL_Event& ev, int* outA, int* outB) {
-    switch (ev.type) {
-        case SDL_WINDOWEVENT:
-            if (ev.window.event == SDL_WINDOWEVENT_CLOSE) return 2;
-            if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                const int nw = ev.window.data1;
-                const int nh = ev.window.data2;
-                if (nw > 0 && nh > 0 && (nw != kw->w || nh != kw->h)) {
-                    klioSdlSizeTo(kw, nw, nh);
-                    if (outA) *outA = nw;
-                    if (outB) *outB = nh;
-                    return 5;
-                }
-            }
-            return 0;  // Exposed / focus / etc. — the caller re-presents each loop.
-        case SDL_MOUSEBUTTONDOWN:
-            if (ev.button.button != SDL_BUTTON_LEFT) return 0;
-            if (outA) *outA = ev.button.x;
-            if (outB) *outB = ev.button.y;
-            return 1;
-        case SDL_MOUSEMOTION:
-            if (outA) *outA = ev.motion.x;
-            if (outB) *outB = ev.motion.y;
-            return 4;
-        case SDL_TEXTINPUT: {
-            // A typed printable character (honours shift/layout). Non-ASCII bytes
-            // are ignored for now (the interim ui-core is ASCII-only).
-            const unsigned char c = static_cast<unsigned char>(ev.text.text[0]);
-            if (c < 32 || c > 126) return 0;
-            if (outA) *outA = c;
-            if (outB) *outB = 0;
-            return 3;
-        }
-        case SDL_KEYDOWN: {
-            // Only the editing keys the ui-core handles; printable characters
-            // arrive via SDL_TEXTINPUT, so ignore their key-down to avoid doubling.
-            // Report X11-style keysyms so the pack's key handling stays unchanged.
-            int ch = 0;
-            int keysym = 0;
-            switch (ev.key.keysym.sym) {
-                case SDLK_BACKSPACE: ch = 8; keysym = 0xff08; break;
-                case SDLK_DELETE:    ch = 0; keysym = 0xffff; break;
-                default: return 0;
-            }
-            if (outA) *outA = ch;
-            if (outB) *outB = keysym;
-            return 3;
-        }
-        default:
-            return 0;
-    }
-}
 
 // The modifiers the desktop reports, from SDL's.
 static int klioSdlMods(Uint16 mod) {
@@ -2663,54 +2399,6 @@ void klio_win_screen_bounds(int* x, int* y, int* w, int* h) {
     *h = r.h;
 }
 
-int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
-    if (!kw) return 2;
-    // Deliver events routed here by another window's earlier poll first.
-    if (kw->pendingHead < kw->pending.size()) {
-        const KlioPendingEv pe = kw->pending[kw->pendingHead++];
-        if (kw->pendingHead == kw->pending.size()) {
-            kw->pending.clear();
-            kw->pendingHead = 0;
-        }
-        if (outA) *outA = pe.a;
-        if (outB) *outB = pe.b;
-        return pe.type;
-    }
-    SDL_Event ev;
-    const int got = (timeoutMs > 0) ? SDL_WaitEventTimeout(&ev, timeoutMs)
-                                    : SDL_PollEvent(&ev);
-    if (!got) return 0;
-    if (ev.type == SDL_QUIT) return 2;  // app-level quit: the poller reports close
-    // SDL's queue is process-global: route by the event's window id, parking
-    // another window's event on that window for its own next poll.
-    Uint32 wid;
-    switch (ev.type) {
-        case SDL_WINDOWEVENT: wid = ev.window.windowID; break;
-        case SDL_MOUSEBUTTONDOWN:
-        case SDL_MOUSEBUTTONUP: wid = ev.button.windowID; break;
-        case SDL_MOUSEMOTION: wid = ev.motion.windowID; break;
-        case SDL_TEXTINPUT: wid = ev.text.windowID; break;
-        case SDL_KEYDOWN:
-        case SDL_KEYUP: wid = ev.key.windowID; break;
-        default: wid = kw->id; break;
-    }
-    KlioWindow* target = kw;
-    if (wid != kw->id) {
-        auto it = klioSdlWindows().find(wid);
-        if (it == klioSdlWindows().end()) return 0;  // a closed window's straggler
-        target = it->second;
-    }
-    int a = 0;
-    int b = 0;
-    const int type = klioSdlClassify(target, ev, &a, &b);
-    if (target == kw) {
-        if (outA) *outA = a;
-        if (outB) *outB = b;
-        return type;
-    }
-    if (type != 0) target->pending.push_back({type, a, b});
-    return 0;
-}
 
 void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
@@ -3198,24 +2886,6 @@ void klio_win_present(KlioWindow* kw) {
     ReleaseDC(kw->hwnd, hdc);
 }
 
-int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
-    if (!kw) return 2;
-    kw->hasEv = false;
-    MSG msg;
-    if (!PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(timeoutMs), QS_ALLINPUT);
-    }
-    while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-        if (kw->hasEv) {
-            if (outA) *outA = kw->evA;
-            if (outB) *outB = kw->evB;
-            return kw->evType;
-        }
-    }
-    return 0;
-}
 
 // Waits up to timeoutMs for the window's next input event and writes its
 // values to out (KLIO_EV_VALUES doubles); returns its type (window_events.h),
@@ -4760,7 +4430,7 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
         }
         if (!surf) return nullptr;
         // The drawable is sized in physical pixels; scale the canvas by the backing
-        // factor so the display list (in points) rasterizes at full resolution.
+        // factor so the frame (in points) rasterizes at full resolution.
         if (kw->backingScale != 1.0)
             surf->getCanvas()->scale(kw->backingScale, kw->backingScale);
         kw->drawable = (GrMTLHandle)CFRetain((CFTypeRef)d);  // hold until present
@@ -4812,73 +4482,6 @@ void klio_win_present(KlioWindow* kw) {
     }
 }
 
-int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
-    if (!kw) return 2;
-    @autoreleasepool {
-        NSDate* until = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
-        NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                         untilDate:until
-                                            inMode:NSDefaultRunLoopMode
-                                           dequeue:YES];
-        if (!ev) return 0;
-        // Content-view coordinates, top-left origin (flip y).
-        NSPoint p = [kw->view convertPoint:[ev locationInWindow] fromView:nil];
-        const int px = static_cast<int>(p.x);
-        const int py = static_cast<int>(kw->h - p.y);
-        int type = 0;
-        switch ([ev type]) {
-            case NSEventTypeLeftMouseDown:
-                if (outA) *outA = px;
-                if (outB) *outB = py;
-                type = 1;
-                break;
-            case NSEventTypeMouseMoved:
-            case NSEventTypeLeftMouseDragged:
-                if (outA) *outA = px;
-                if (outB) *outB = py;
-                type = 4;
-                break;
-            case NSEventTypeKeyDown: {
-                NSString* chars = [ev characters];
-                const int c = [chars length] > 0 ? [chars characterAtIndex:0] : 0;
-                if (outA) *outA = c;
-                if (outB) *outB = [ev keyCode];
-                type = 3;
-                break;
-            }
-            default:
-                break;
-        }
-        [NSApp sendEvent:ev];
-        // A closed window is no longer visible.
-        if (kw->closeRequested) return 2;
-        // A resized content view: resize the drawable (Metal) or the raster surface.
-        const int nw = static_cast<int>([kw->view bounds].size.width);
-        const int nh = static_cast<int>([kw->view bounds].size.height);
-        if (type == 0 && (nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
-#if defined(KLIO_METAL)
-            if (kw->grContext && kw->metalLayer) {
-                CGFloat scale = [kw->window backingScaleFactor];
-                if (scale < 1.0) scale = 1.0;
-                kw->backingScale = scale;
-                kw->metalLayer.contentsScale = scale;
-                kw->metalLayer.frame = NSMakeRect(0, 0, nw, nh);
-                kw->metalLayer.drawableSize = CGSizeMake(nw * scale, nh * scale);
-            } else
-#endif
-            {
-                if (kw->surface) klio_skia_free(kw->surface);
-                kw->surface = klio_skia_new(nw, nh);
-            }
-            kw->w = nw;
-            kw->h = nh;
-            if (outA) *outA = nw;
-            if (outB) *outB = nh;
-            return 5;
-        }
-        return type;
-    }
-}
 
 // Sets one of a window's KLIO_WIN_* properties: whether the user can resize
 // it, whether it has a title bar and border, whether it floats above other
@@ -5494,7 +5097,6 @@ KlioWindow* klio_win_open(int, int, const char*) {
     klioWinFailed("iOS gives an application its window; it cannot open another");
     return nullptr;
 }
-int klio_win_poll(void*, int, int*, int*) { return 0; }
 int klio_win_poll_event(void*, int, double*) { return KLIO_EV_NONE; }
 void klio_win_post_event(void*, int, const double*) {}
 void klio_win_set_flag(void*, int, int) {}
@@ -5701,7 +5303,7 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
         kw->grContext.get(), backendRT, kBottomLeft_GrSurfaceOrigin,
         kRGBA_8888_SkColorType, nullptr, nullptr);
     if (!surf) return nullptr;
-    // The framebuffer is sized in physical pixels; scale so the display list (in
+    // The framebuffer is sized in physical pixels; scale so the frame (in
     // points) rasterizes at full resolution.
     if (kw->scale != 1.0) surf->getCanvas()->scale(kw->scale, kw->scale);
     kw->surface = new KlioSurface();
@@ -5737,7 +5339,6 @@ KlioWindow* klio_win_open(int, int, const char*) {
     klioWinFailed("Android gives an application its window; it cannot open another");
     return nullptr;
 }
-int klio_win_poll(void*, int, int*, int*) { return 0; }
 int klio_win_poll_event(void*, int, double*) { return KLIO_EV_NONE; }
 void klio_win_post_event(void*, int, const double*) {}
 void klio_win_set_flag(void*, int, int) {}
@@ -5784,7 +5385,6 @@ void* klio_win_open(int, int, const char*) {
 void* klio_win_attach(void*, int, int, double) { return nullptr; }
 void* klio_win_surface(void*) { return nullptr; }
 void klio_win_present(void*) {}
-int klio_win_poll(void*, int, int*, int*) { return 2; }
 int klio_win_poll_event(void*, int, double*) { return KLIO_EV_CLOSE; }
 void klio_win_post_event(void*, int, const double*) {}
 void klio_win_set_flag(void*, int, int) {}

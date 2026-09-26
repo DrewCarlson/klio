@@ -245,7 +245,7 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
             switch (skiaWindowSupport(shim_bytes.?)) {
                 .ok => {},
                 .stub => {
-                    io.printStderr(gpa, "error: this Compose UI program opens a window (runApp), but the Skia backend for {s} has no windowing support (it renders offscreen only, so the app would open no window and exit silently).\n  {s}\n", .{ target, rebuildHint(target) });
+                    io.printStderr(gpa, "error: this Compose UI program opens a window, but the Skia backend for {s} has no windowing support (it renders offscreen only, so the app would open no window and exit silently).\n  {s}\n", .{ target, rebuildHint(target) });
                     return 1;
                 },
                 .unknown => {
@@ -459,11 +459,7 @@ fn defaultOutput(gpa: Allocator, main_path: []const u8, target: []const u8) Allo
 fn detectUiFlavor(selection: *const pack_cache.Selection) bool {
     for (selection.packs.items) |p| {
         const base = std.fs.path.basename(p.path);
-        if (std.mem.startsWith(u8, base, "androidx.compose.ui") or
-            std.mem.startsWith(u8, base, "klio.compose.ui"))
-        {
-            return true;
-        }
+        if (std.mem.startsWith(u8, base, "androidx.compose.ui")) return true;
     }
     return false;
 }
@@ -582,12 +578,33 @@ pub fn shimFileName(target: []const u8) []const u8 {
     return "libklio_skia.so";
 }
 
-/// `runApp` is the only windowing entrypoint in `klio.compose.ui`.
-fn programOpensWindow(texts: [][]const u8) bool {
+/// Whether the program calls one of Compose's window entry points
+/// (`application`, `awaitApplication`, `singleWindowApplication`).
+fn programOpensWindow(texts: []const []const u8) bool {
+    const entries = [_][]const u8{ "application", "awaitApplication", "singleWindowApplication" };
     for (texts) |t| {
-        if (std.mem.find(u8, t, "runApp") != null) return true;
+        for (entries) |name| {
+            if (callsName(t, name)) return true;
+        }
     }
     return false;
+}
+
+/// Whether `text` has `name` as a whole identifier followed by `(` or `{`.
+fn callsName(text: []const u8, name: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.findPos(u8, text, from, name)) |at| {
+        from = at + name.len;
+        if (at > 0 and isIdentChar(text[at - 1])) continue;
+        var i = from;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        if (i < text.len and (text[i] == '(' or text[i] == '{')) return true;
+    }
+    return false;
+}
+
+fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
 const ShimWindowSupport = enum { ok, stub, unknown };
@@ -860,19 +877,23 @@ test "defaultMount is main-relative, else basename" {
     try std.testing.expectEqualStrings("a.txt", defaultMount("elsewhere/a.txt", "app/main.kt"));
 }
 
+test "programOpensWindow finds Compose's window entry points" {
+    const windowed = [_][]const u8{"fun main() = application {\n    Window(onCloseRequest = ::exitApplication) {}\n}\n"};
+    try std.testing.expect(programOpensWindow(&windowed));
+    const single = [_][]const u8{"fun main() = singleWindowApplication (title = \"x\") { }\n"};
+    try std.testing.expect(programOpensWindow(&single));
+    const awaiting = [_][]const u8{"suspend fun main() = awaitApplication{ }\n"};
+    try std.testing.expect(programOpensWindow(&awaiting));
+    const offscreen = [_][]const u8{ "// no application here\nval myapplication = 1\n", "fun main() { renderComposeToPng(1, 1, 1f, \"a.png\") {} }\n" };
+    try std.testing.expect(!programOpensWindow(&offscreen));
+}
+
 test "skiaWindowSupport reads the backend marker" {
     try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("....klio-win-backend:cocoa\x00..."));
     try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("klio-win-backend:sdl"));
     try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("x klio-win-backend:win32 y"));
     try std.testing.expectEqual(ShimWindowSupport.stub, skiaWindowSupport("junk klio-win-backend:stub junk"));
     try std.testing.expectEqual(ShimWindowSupport.unknown, skiaWindowSupport("a plain dylib with no marker"));
-}
-
-test "programOpensWindow detects runApp, not offscreen uiRenderer" {
-    var windowed = [_][]const u8{"fun main() { runApp(80, 52, 8, \"t\", -1) { } }"};
-    try std.testing.expect(programOpensWindow(&windowed));
-    var offscreen = [_][]const u8{"fun main() { val ui = uiRenderer(16, 10) { }; ui.savePng(\"x\", 8) }"};
-    try std.testing.expect(!programOpensWindow(&offscreen));
 }
 
 test "defaultOutput strips .kt and appends .exe on windows" {

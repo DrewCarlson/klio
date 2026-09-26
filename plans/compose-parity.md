@@ -546,3 +546,10 @@ isTraySupported is false), and running on Windows.
   and compose_pathmeasure prints what Compose Desktop prints.
 - Open, pre-existing: compose_popup prints its placement lines twice on
   Compose Desktop's ImageComposeScene and once on klio's scene.
+- 2026-09-26: klio.compose.ui, klio's own display-list UI over the shim, is
+  gone with its nine examples. The mobile hosts' offscreen scene and the
+  bundle_ui gate render upstream Compose through `renderComposeToPng`, and
+  bundle_ui runs on macOS as well as Linux. The bundler finds a windowed
+  program by Compose's `application`, `awaitApplication` and
+  `singleWindowApplication`. The shim drops the display-list draw calls,
+  `klio_win_poll` and the offscreen EGL surface.

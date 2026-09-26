@@ -26,8 +26,8 @@ TIMEOUT=${TIMEOUT:-60}
 
 NEVER_TERMINATES="compose_foundation compose_foundation_draw \
 compose_foundation_lazy compose_layout compose_material3 \
-compose_material3_text compose_multiwindow compose_ui_dashboard \
-compose_ui_input compose_ui_window compose_window select_on_timeout_loses"
+compose_material3_text compose_multiwindow compose_window \
+select_on_timeout_loses"
 # One line, space separated: the membership test below matches on surrounding
 # SPACES, so a newline-separated list silently matches nothing.
 

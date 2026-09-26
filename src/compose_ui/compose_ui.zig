@@ -1,9 +1,8 @@
-//! Native Skia backend for the `klio.compose.ui` pack.
-//!
-//! The compose UI layer records a display list of draw ops in pure Kotlin; this
-//! module replays it onto a Skia raster surface through libklio_skia and encodes
-//! a PNG. The shared library is dlopened lazily so the interpreter never links
-//! libstdc++ or Skia; without it `skiaRender` returns 0.
+//! Host side of the Compose UI packs: windows, trays, menus, pointer, touch
+//! and text input, the clipboard, the raster surfaces ui-graphics draws on, and
+//! the host's locale and date formats. The Skia shim (libklio_skia) is
+//! dlopened lazily so the interpreter never links libstdc++ or Skia; without it
+//! rendering is headless.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -21,34 +20,14 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
-var rss_log_gate: enum { unknown, on, off } = .unknown;
-fn rssLog() void {
-    if (rss_log_gate == .unknown) {
-        rss_log_gate = if (runtime.envOnce("KLIO_RSS_LOG") != null) .on else .off;
-    }
-    if (rss_log_gate != .on) return;
-    const kb = runtime.currentRssKb() orelse return;
-    std.debug.print("[rss] {} MB\n", .{kb / 1024});
-}
-
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("androidx.compose.foundation.__composeui_hostOs", hostOs);
     try b.register("androidx.compose.ui.input.key.__composeui_hostOs", hostOs);
-    try b.register("klio.compose.ui.__composeui_skiaRender", skiaRender);
-    try b.register("klio.compose.ui.__composeui_measureText", measureText);
-    try b.register("klio.compose.ui.__composeui_winOpen", winOpen);
-    try b.register("klio.compose.ui.__composeui_winRender", winRender);
-    try b.register("klio.compose.ui.__composeui_winPoll", winPoll);
-    try b.register("klio.compose.ui.__composeui_winClose", winClose);
-    try b.register("klio.compose.ui.__composeui_winSurface", winSurfaceOf);
-    try b.register("klio.compose.ui.__composeui_winPresent", winPresent);
-    try b.register("klio.compose.ui.__composeui_winClear", winClear);
     try b.register("androidx.compose.ui.window.__composeui_winOpen", winOpen);
     try b.register("androidx.compose.ui.window.__composeui_winOpenError", winOpenError);
     try b.register("androidx.compose.ui.window.__composeui_winSetTitle", winSetTitle);
     try b.register("androidx.compose.ui.window.__composeui_winSetSize", winSetSize);
-    try b.register("androidx.compose.ui.window.__composeui_winPoll", winPoll);
     try b.register("androidx.compose.ui.window.__composeui_winPollEvent", winPollEvent);
     try b.register("androidx.compose.ui.window.__composeui_winPostEvent", winPostEvent);
     try b.register("androidx.compose.ui.window.__composeui_winSetFlag", winSetFlag);
@@ -115,27 +94,15 @@ fn argInt(v: Value) i64 {
     };
 }
 
-
 const SkSurface = anyopaque;
 const SkWindow = anyopaque;
 
 const Skia = struct {
     lib: runtime.platform.DynLib,
     new: *const fn (c_int, c_int) callconv(.c) ?*SkSurface,
-    newGpu: *const fn (c_int, c_int) callconv(.c) ?*SkSurface,
     free: *const fn (?*SkSurface) callconv(.c) void,
     clear: *const fn (?*SkSurface, u32) callconv(.c) void,
-    fillRect: *const fn (?*SkSurface, f32, f32, f32, f32, u32) callconv(.c) void,
-    strokeRect: *const fn (?*SkSurface, f32, f32, f32, f32, f32, u32) callconv(.c) void,
-    fillRRect: *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, u32) callconv(.c) void,
-    fillCircle: *const fn (?*SkSurface, f32, f32, f32, u32) callconv(.c) void,
-    drawLine: *const fn (?*SkSurface, f32, f32, f32, f32, f32, u32) callconv(.c) void,
-    drawText: *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, u32) callconv(.c) void,
-    drawParagraph: *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, f32, u32, c_int) callconv(.c) void,
-    measureParagraph: *const fn ([*:0]const u8, f32, f32) callconv(.c) f32,
     savePng: *const fn (?*SkSurface, [*:0]const u8) callconv(.c) c_int,
-    encodePng: *const fn (?*SkSurface, *usize) callconv(.c) ?[*]u8,
-    freeBuffer: *const fn ([*]u8) callconv(.c) void,
     freeCstr: ?FreeCstrFn,
     surfCanvas: ?SurfCanvasFn,
     icuDate: ?IcuDateFn,
@@ -145,7 +112,6 @@ const Skia = struct {
     winAttach: ?WinAttachFn,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
-    winPoll: *const fn (?*SkWindow, c_int, *c_int, *c_int) callconv(.c) c_int,
     winClose: *const fn (?*SkWindow) callconv(.c) void,
     /// Optional: only native live-resize backends export this.
     winSetResizeCb: ?ResizeCbFn,
@@ -239,10 +205,6 @@ const IcuDateFn = *const fn (c_int, [*:0]const u8, [*:0]const u8, [*:0]const u8,
 // so a stale shared library degrades to no drawing instead of failing the load.
 const SurfCanvasFn = *const fn (?*SkSurface) callconv(.c) ?*anyopaque;
 
-// (x, y, argb, strokeWidth, cap, aa)
-// (mode, positions, texCoords, colors, indices, blendMode, argb): the arrays as number text.
-const KlioPara = anyopaque;
-
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
 
@@ -283,20 +245,9 @@ fn loadSkia() ?*Skia {
     const s = Skia{
         .lib = lib,
         .new = F.get(&lib, "new", "klio_skia_new") orelse return skiaLoadFail(&lib),
-        .newGpu = F.get(&lib, "newGpu", "klio_skia_new_gpu") orelse return skiaLoadFail(&lib),
         .free = F.get(&lib, "free", "klio_skia_free") orelse return skiaLoadFail(&lib),
         .clear = F.get(&lib, "clear", "klio_skia_clear") orelse return skiaLoadFail(&lib),
-        .fillRect = F.get(&lib, "fillRect", "klio_skia_fill_rect") orelse return skiaLoadFail(&lib),
-        .strokeRect = F.get(&lib, "strokeRect", "klio_skia_stroke_rect") orelse return skiaLoadFail(&lib),
-        .fillRRect = F.get(&lib, "fillRRect", "klio_skia_fill_rrect") orelse return skiaLoadFail(&lib),
-        .fillCircle = F.get(&lib, "fillCircle", "klio_skia_fill_circle") orelse return skiaLoadFail(&lib),
-        .drawLine = F.get(&lib, "drawLine", "klio_skia_draw_line") orelse return skiaLoadFail(&lib),
-        .drawText = F.get(&lib, "drawText", "klio_skia_draw_text") orelse return skiaLoadFail(&lib),
-        .drawParagraph = F.get(&lib, "drawParagraph", "klio_skia_draw_paragraph") orelse return skiaLoadFail(&lib),
-        .measureParagraph = F.get(&lib, "measureParagraph", "klio_skia_measure_paragraph") orelse return skiaLoadFail(&lib),
         .savePng = F.get(&lib, "savePng", "klio_skia_save_png") orelse return skiaLoadFail(&lib),
-        .encodePng = F.get(&lib, "encodePng", "klio_skia_encode_png") orelse return skiaLoadFail(&lib),
-        .freeBuffer = F.get(&lib, "freeBuffer", "klio_skia_free_buffer") orelse return skiaLoadFail(&lib),
         .freeCstr = lib.lookup(FreeCstrFn, "klio_skia_free_cstr"),
         .surfCanvas = lib.lookup(SurfCanvasFn, "klio_skia_surf_canvas"),
         .icuDate = lib.lookup(IcuDateFn, "klio_icu_date"),
@@ -304,7 +255,6 @@ fn loadSkia() ?*Skia {
         .winAttach = lib.lookup(WinAttachFn, "klio_win_attach"),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
-        .winPoll = F.get(&lib, "winPoll", "klio_win_poll") orelse return skiaLoadFail(&lib),
         .winClose = F.get(&lib, "winClose", "klio_win_close") orelse return skiaLoadFail(&lib),
         .winSetResizeCb = lib.lookup(ResizeCbFn, "klio_win_set_resize_cb"),
         .winPollEvent = lib.lookup(WinPollEventFn, "klio_win_poll_event"),
@@ -346,20 +296,9 @@ fn loadSkiaStatic() ?*Skia {
     const s = Skia{
         .lib = undefined,
         .new = externSym(@FieldType(Skia, "new"), "klio_skia_new"),
-        .newGpu = externSym(@FieldType(Skia, "newGpu"), "klio_skia_new_gpu"),
         .free = externSym(@FieldType(Skia, "free"), "klio_skia_free"),
         .clear = externSym(@FieldType(Skia, "clear"), "klio_skia_clear"),
-        .fillRect = externSym(@FieldType(Skia, "fillRect"), "klio_skia_fill_rect"),
-        .strokeRect = externSym(@FieldType(Skia, "strokeRect"), "klio_skia_stroke_rect"),
-        .fillRRect = externSym(@FieldType(Skia, "fillRRect"), "klio_skia_fill_rrect"),
-        .fillCircle = externSym(@FieldType(Skia, "fillCircle"), "klio_skia_fill_circle"),
-        .drawLine = externSym(@FieldType(Skia, "drawLine"), "klio_skia_draw_line"),
-        .drawText = externSym(@FieldType(Skia, "drawText"), "klio_skia_draw_text"),
-        .drawParagraph = externSym(@FieldType(Skia, "drawParagraph"), "klio_skia_draw_paragraph"),
-        .measureParagraph = externSym(@FieldType(Skia, "measureParagraph"), "klio_skia_measure_paragraph"),
         .savePng = externSym(@FieldType(Skia, "savePng"), "klio_skia_save_png"),
-        .encodePng = externSym(@FieldType(Skia, "encodePng"), "klio_skia_encode_png"),
-        .freeBuffer = externSym(@FieldType(Skia, "freeBuffer"), "klio_skia_free_buffer"),
         .freeCstr = externSym(FreeCstrFn, "klio_skia_free_cstr"),
         .surfCanvas = externSym(SurfCanvasFn, "klio_skia_surf_canvas"),
         .icuDate = externSym(IcuDateFn, "klio_icu_date"),
@@ -367,7 +306,6 @@ fn loadSkiaStatic() ?*Skia {
         .winAttach = externSym(WinAttachFn, "klio_win_attach"),
         .winSurface = externSym(@FieldType(Skia, "winSurface"), "klio_win_surface"),
         .winPresent = externSym(@FieldType(Skia, "winPresent"), "klio_win_present"),
-        .winPoll = externSym(@FieldType(Skia, "winPoll"), "klio_win_poll"),
         .winClose = externSym(@FieldType(Skia, "winClose"), "klio_win_close"),
         .winSetResizeCb = externSym(ResizeCbFn, "klio_win_set_resize_cb"),
         .winPollEvent = externSym(WinPollEventFn, "klio_win_poll_event"),
@@ -472,148 +410,8 @@ fn selfExeDir() ?[]const u8 {
     return std.fs.path.dirname(path);
 }
 
-fn parseU32Hex(s: []const u8) u32 {
-    return std.fmt.parseInt(u32, s, 16) catch 0;
-}
-
-fn parseF32(s: []const u8) f32 {
-    return std.fmt.parseFloat(f32, s) catch 0;
-}
-
-/// `__composeui_skiaRender(path, width, height, displayList): Long`
-///
-/// `displayList` is newline-separated draw ops replayed onto a Skia raster
-/// surface; colors are 8-hex-digit ARGB. Ops:
-///   clear AARRGGBB
-///   rect   x y w h AARRGGBB
-///   srect  x y w h strokeWidth AARRGGBB
-///   rrect  x y w h rx ry AARRGGBB
-///   circle cx cy r AARRGGBB
-///   line   x0 y0 x1 y1 strokeWidth AARRGGBB
-///   text   x y size AARRGGBB <utf8 text to end of line>
-/// Writes a PNG to `path` and returns an FNV-1a checksum of the encoded bytes
-/// (0 if Skia is unavailable or the render failed).
-fn skiaRender(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 4) return ok(Value.newLong(0));
-    if (ctx.args[0] != .String or ctx.args[3] != .String) return ok(Value.newLong(0));
-
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-
-    const width: c_int = @intCast(@max(1, argInt(ctx.args[1])));
-    const height: c_int = @intCast(@max(1, argInt(ctx.args[2])));
-    // Opt-in GPU surface when KLIO_SKIA_GPU is set and the backend was built
-    // with it; on GPU init failure, fall back to raster.
-    const gpu = runtime.envOnce("KLIO_SKIA_GPU") != null;
-    const surface = (if (gpu) skia.newGpu(width, height) else null) orelse
-        skia.new(width, height) orelse return ok(Value.newLong(0));
-    defer skia.free(surface);
-
-    const dg = ctx.args[3].String.borrow();
-    defer dg.deinit();
-    replay(skia, surface, dg.get().bytes);
-
-    const a = ctx.allocator;
-    const pg = ctx.args[0].String.borrow();
-    defer pg.deinit();
-    const path_z = std.fmt.allocPrintSentinel(a, "{s}", .{pg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer a.free(path_z);
-    _ = skia.savePng(surface, path_z.ptr);
-
-    var len: usize = 0;
-    const buf = skia.encodePng(surface, &len) orelse return ok(Value.newLong(0));
-    defer skia.freeBuffer(buf);
-    var h: u64 = 1469598103934665603;
-    for (buf[0..len]) |byte| h = (h ^ byte) *% 1099511628211;
-    return ok(Value.newLong(@bitCast(h)));
-}
-
-/// `__composeui_measureText(text, width, size): Long`: the wrapped height in
-/// ceiled px, or 0 when Skia is unavailable so the caller can estimate.
-fn measureText(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 3 or ctx.args[0] != .String) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const tg = ctx.args[0].String.borrow();
-    defer tg.deinit();
-    const text_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
-    defer ctx.allocator.free(text_z);
-    const width: f32 = @floatFromInt(@max(1, argInt(ctx.args[1])));
-    const size: f32 = @floatFromInt(@max(1, argInt(ctx.args[2])));
-    const h = skia.measureParagraph(text_z.ptr, width, size);
-    return ok(Value.newLong(@intFromFloat(@ceil(h))));
-}
-
-fn replay(skia: *Skia, surface: *SkSurface, list: []const u8) void {
-    var lines = std.mem.splitScalar(u8, list, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0) continue;
-        var it = std.mem.tokenizeScalar(u8, trimmed, ' ');
-        const op = it.next() orelse continue;
-        if (std.mem.eql(u8, op, "clear")) {
-            skia.clear(surface, parseU32Hex(it.next() orelse continue));
-        } else if (std.mem.eql(u8, op, "rect")) {
-            const x = parseF32(it.next() orelse continue);
-            const y = parseF32(it.next() orelse continue);
-            const w = parseF32(it.next() orelse continue);
-            const hh = parseF32(it.next() orelse continue);
-            skia.fillRect(surface, x, y, w, hh, parseU32Hex(it.next() orelse continue));
-        } else if (std.mem.eql(u8, op, "srect")) {
-            const x = parseF32(it.next() orelse continue);
-            const y = parseF32(it.next() orelse continue);
-            const w = parseF32(it.next() orelse continue);
-            const hh = parseF32(it.next() orelse continue);
-            const sw = parseF32(it.next() orelse continue);
-            skia.strokeRect(surface, x, y, w, hh, sw, parseU32Hex(it.next() orelse continue));
-        } else if (std.mem.eql(u8, op, "rrect")) {
-            const x = parseF32(it.next() orelse continue);
-            const y = parseF32(it.next() orelse continue);
-            const w = parseF32(it.next() orelse continue);
-            const hh = parseF32(it.next() orelse continue);
-            const rx = parseF32(it.next() orelse continue);
-            const ry = parseF32(it.next() orelse continue);
-            skia.fillRRect(surface, x, y, w, hh, rx, ry, parseU32Hex(it.next() orelse continue));
-        } else if (std.mem.eql(u8, op, "circle")) {
-            const cx = parseF32(it.next() orelse continue);
-            const cy = parseF32(it.next() orelse continue);
-            const r = parseF32(it.next() orelse continue);
-            skia.fillCircle(surface, cx, cy, r, parseU32Hex(it.next() orelse continue));
-        } else if (std.mem.eql(u8, op, "line")) {
-            const x0 = parseF32(it.next() orelse continue);
-            const y0 = parseF32(it.next() orelse continue);
-            const x1 = parseF32(it.next() orelse continue);
-            const y1 = parseF32(it.next() orelse continue);
-            const sw = parseF32(it.next() orelse continue);
-            skia.drawLine(surface, x0, y0, x1, y1, sw, parseU32Hex(it.next() orelse continue));
-        } else if (std.mem.eql(u8, op, "text")) {
-            const x = parseF32(it.next() orelse continue);
-            const y = parseF32(it.next() orelse continue);
-            const size = parseF32(it.next() orelse continue);
-            const color = parseU32Hex(it.next() orelse continue);
-            const s = std.mem.trimStart(u8, it.rest(), " ");
-            var buf: [256]u8 = undefined;
-            const n = @min(s.len, buf.len - 1);
-            @memcpy(buf[0..n], s[0..n]);
-            buf[n] = 0;
-            skia.drawText(surface, @ptrCast(&buf), x, y, size, color);
-        } else if (std.mem.eql(u8, op, "para")) {
-            const x = parseF32(it.next() orelse continue);
-            const y = parseF32(it.next() orelse continue);
-            const w = parseF32(it.next() orelse continue);
-            const size = parseF32(it.next() orelse continue);
-            const alignment: c_int = std.fmt.parseInt(c_int, it.next() orelse continue, 10) catch 0;
-            const color = parseU32Hex(it.next() orelse continue);
-            const s = std.mem.trimStart(u8, it.rest(), " ");
-            var buf: [2048]u8 = undefined;
-            const n = @min(s.len, buf.len - 1);
-            @memcpy(buf[0..n], s[0..n]);
-            buf[n] = 0;
-            skia.drawParagraph(surface, @ptrCast(&buf), x, y, w, size, color, alignment);
-        }
-    }
-}
-
-// Windowing intrinsics: open an on-screen window, replay a display list into it
-// each frame, and pump input events. The window handle reaches Kotlin as a Long
+// Windowing intrinsics: open an on-screen window, hand its surface to the
+// frame's draw, and pump input events. The window handle reaches Kotlin as a Long
 // (the KlioWindow pointer). Each one no-ops or reports "closed" when Skia or a
 // windowing backend is unavailable, so a headless build still runs.
 
@@ -797,7 +595,6 @@ fn winSetSize(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
-
 /// Why the last window open failed, for the program's error.
 var win_open_error: []const u8 = "";
 var win_open_error_buf: [512]u8 = undefined;
@@ -841,26 +638,9 @@ fn winOpen(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(win)))));
 }
 
-fn winRender(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
-    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
-    const surface = skia.winSurface(win) orelse return ok(Value.newLong(0));
-    const dg = ctx.args[1].String.borrow();
-    defer dg.deinit();
-    // Clear to opaque black before replaying so frames do not accumulate on the
-    // persistent window surface; a double-buffered swapchain would otherwise show
-    // a stale back buffer.
-    skia.clear(surface, 0xFF000000);
-    replay(skia, surface, dg.get().bytes);
-    skia.winPresent(win);
-    rssLog();
-    return ok(Value.newLong(1));
-}
-
-/// Registered for the duration of a `winPoll` so the shim's live-resize observer
-/// can drive a frame while the modal drag blocks the VM's loop. The render
-/// callback is a live poll argument, so it needs no separate GC root.
+/// Registered for the duration of a `winPollEvent` so the shim's live-resize
+/// observer can drive a frame while the modal drag blocks the VM's loop. The
+/// render callback is a live poll argument, so it needs no separate GC root.
 const ResizeCb = struct {
     host: IntrinsicHost,
     callback: Value,
@@ -871,32 +651,6 @@ fn resizeTrampoline(user: ?*anyopaque, w: c_int, h: c_int) callconv(.c) void {
     const rc: *ResizeCb = @ptrCast(@alignCast(user orelse return));
     var args = [_]Value{ Value.newInt(@intCast(w)), Value.newInt(@intCast(h)) };
     _ = rc.host.invokeCallable(&rc.callback, &args, rc.out) catch {};
-}
-
-/// `__composeui_winPoll(handle, timeoutMs, onResize?): Long`: wait up to
-/// timeoutMs for an event and return `(type << 32) | (x << 16) | y`, where type
-/// is 0 none, 1 click, 2 close. A supplied `onResize` runs during a live resize.
-fn winPoll(ctx: *CallCtx) Error!EvalResult {
-    if (ctx.args.len < 2) return ok(Value.newLong(2 << 32));
-    const skia = loadSkia() orelse return ok(Value.newLong(2 << 32));
-    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(2 << 32));
-    const timeout: c_int = @intCast(@max(0, argInt(ctx.args[1])));
-    var rc: ResizeCb = undefined;
-    // The live-resize callback fires only on backends exporting the hook; SDL
-    // reports resizes through winPoll's event code instead.
-    const has_cb = ctx.args.len >= 3 and ctx.args[2] != .Null and skia.winSetResizeCb != null;
-    if (has_cb) {
-        rc = .{ .host = ctx.host, .callback = ctx.args[2], .out = ctx.out };
-        skia.winSetResizeCb.?(win, resizeTrampoline, &rc);
-    }
-    var x: c_int = 0;
-    var y: c_int = 0;
-    const t = skia.winPoll(win, timeout, &x, &y);
-    if (has_cb) skia.winSetResizeCb.?(win, null, null);
-    const packed_ev: i64 = (@as(i64, t) << 32) |
-        (@as(i64, @intCast(std.math.clamp(x, 0, 0xFFFF))) << 16) |
-        @as(i64, @intCast(std.math.clamp(y, 0, 0xFFFF)));
-    return ok(Value.newLong(packed_ev));
 }
 
 /// `__composeui_winPollEvent(handle, timeoutMs, onResize?, out: DoubleArray): Int`:
@@ -1403,7 +1157,20 @@ fn winPresent(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
     skia.winPresent(win);
+    rssLog();
     return ok(Value.newLong(1));
+}
+
+var rss_log_gate: enum { unknown, on, off } = .unknown;
+
+/// `KLIO_RSS_LOG`: the process's RSS after each presented frame.
+fn rssLog() void {
+    if (rss_log_gate == .unknown) {
+        rss_log_gate = if (runtime.envOnce("KLIO_RSS_LOG") != null) .on else .off;
+    }
+    if (rss_log_gate != .on) return;
+    const kb = runtime.currentRssKb() orelse return;
+    std.debug.print("[rss] {} MB\n", .{kb / 1024});
 }
 
 fn winClear(ctx: *CallCtx) Error!EvalResult {
@@ -1427,7 +1194,6 @@ fn winHandle(v: Value) ?*SkWindow {
     if (h == 0) return null;
     return @ptrFromInt(@as(usize, @intCast(h)));
 }
-
 
 /// A date question for the host's ICU (`klio_icu_date` in icu_shim.cpp):
 /// (op, languageTag, a, b, millis). Null when ICU cannot answer or no Skia
@@ -1462,7 +1228,6 @@ fn surfArg(v: Value) ?*SkSurface {
     return @ptrFromInt(@as(usize, @intCast(h)));
 }
 
-
 fn surfNew(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return ok(Value.newLong(0));
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -1491,8 +1256,6 @@ fn surfFree(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
-
-
 /// A surface's width (which 0) or height (which 1).
 /// `__skia_surf_canvas(handle)`: the SkCanvas* the surface's draws go to, for
 /// a skiko Canvas to wrap; 0 without a Skia backend.
@@ -1505,77 +1268,8 @@ fn surfCanvas(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(canvas)))));
 }
 
-
-
-
-
-
-
-
-
-
 // Graphics layer nodes. A node or context handle is its pointer as a Long; 0
 // without the Skia backend, which every entry point then answers with 0.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const testing = std.testing;
 
@@ -1592,15 +1286,13 @@ test "a resident callback is marked by the callbacks' root" {
     try std.testing.expectEqual(@as(usize, 93), callback.cell.hdr.gc_mark);
 }
 
-test "hostBindings registers the skia render + windowing sinks" {
+test "hostBindings registers the surface and windowing sinks" {
     var b = try hostBindings(testing.allocator);
     defer b.deinit();
-    try testing.expect(b.resolve("klio.compose.ui.__composeui_skiaRender") != null);
-    try testing.expect(b.resolve("klio.compose.ui.__composeui_measureText") != null);
-    try testing.expect(b.resolve("klio.compose.ui.__composeui_winOpen") != null);
-    try testing.expect(b.resolve("klio.compose.ui.__composeui_winRender") != null);
-    try testing.expect(b.resolve("klio.compose.ui.__composeui_winPoll") != null);
-    try testing.expect(b.resolve("klio.compose.ui.__composeui_winClose") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winOpen") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSurface") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winPresent") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winClose") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_new") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_canvas") != null);
     try testing.expect(b.resolve("androidx.compose.material3.internal.__klio_icu_date") != null);
@@ -1620,7 +1312,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_trayPollEvent") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_appWait") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winOpenError") != null);
-    try testing.expectEqual(@as(usize, 69), b.len());
+    try testing.expectEqual(@as(usize, 59), b.len());
 }
 
 test "a window that cannot open says why" {
@@ -1684,23 +1376,6 @@ test "the ICU date bindings answer null for short args" {
     const wrong = [_]Value{ Value.newInt(0), Value.newInt(1), Value.newInt(2), Value.newInt(3), Value.newLong(0) };
     var c1 = host.ctx(&wrong);
     try testing.expect((try icuDate(&c1)).ok == .Null);
-}
-
-test "skiaRender guards arg shapes and no-ops without the library" {
-    // The Skia shared library is absent in the unit-test environment, so this
-    // exercises the arg-shape guards without needing the .so.
-    const a = testing.allocator;
-    var host: TestHost = .{};
-    var path = Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, "/tmp/klio_skia_test.png")) };
-    defer path.String.deinit();
-    var list = Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, "clear FF000000\nrect 0 0 4 4 FFFFFFFF\n")) };
-    defer list.String.deinit();
-    const short = [_]Value{path};
-    var ctx0 = host.ctx(&short);
-    try testing.expectEqual(@as(i64, 0), (try skiaRender(&ctx0)).ok.Long);
-    const args = [_]Value{ path, Value.newInt(4), Value.newInt(4), list };
-    var ctx = host.ctx(&args);
-    _ = (try skiaRender(&ctx)).ok.Long;
 }
 
 test "a window position packs x high and y low, negatives kept" {

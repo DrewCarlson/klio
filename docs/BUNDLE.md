@@ -63,7 +63,7 @@ klio bundle <main.kt | project-dir> [options]
                              windows-x64, windows-arm64
   --ui | --headless          Force the flavor. Default: auto-detected — the
                              pack fixpoint selecting any androidx.compose.ui*
-                             pack (or klio.compose.ui) marks the bundle UI.
+                             pack marks the bundle UI.
   --include <path[:mount]>   Embed a file or directory into the bundle's
                              resource table (repeatable). Mount defaults to
                              the path relative to the source file's directory.
@@ -94,14 +94,14 @@ bundled serial_tool (23.4 MB): stdlib + kotlinx.serialization
 ## Sizes and startup
 
 Bundle size is dominated by the stub — a byte-for-byte copy of the
-`klio` binary doing the bundling. Measured on linux-x64 with a
-release build (`zig build -Doptimize=ReleaseFast`, stripped):
+`klio` binary doing the bundling (16.6 MB). Measured on linux-arm64
+with a release build (`zig build -Doptimize=ReleaseFast`, stripped):
 
-| Bundle                                   | Size    |
-|------------------------------------------|---------|
-| hello world                               | 22.3 MB |
-| kotlinx.serialization CLI tool            | 23.4 MB |
-| Compose UI app (klio.compose.ui + shim)   | 44.3 MB |
+| Bundle                                        | Size    |
+|-----------------------------------------------|---------|
+| hello world                                    | 16.8 MB |
+| kotlinx.serialization CLI tool                 | 17.1 MB |
+| Compose UI app (foundation, offscreen + shim)  | 38.2 MB |
 
 A bundle carries its base (the stdlib and the packs the program
 imports) as a sema image: the base image a run keeps in its cache,
@@ -250,14 +250,15 @@ resources:
 ## UI bundles
 
 A program whose pack fixpoint selects any `androidx.compose.ui*` pack
-(or `klio.compose.ui`) bundles as UI automatically; `--ui` and
+bundles as UI automatically; `--ui` and
 `--headless` force it. A UI bundle embeds the Skia rendering backend
 (zstd-compressed). Bundling one requires the backend library next to
 the bundling `klio` (`zig build skia-lib`) or at `KLIO_SKIA_LIB`. The
 library name is per-OS: `libklio_skia.so` (Linux), `libklio_skia.dylib`
 (macOS), `klio_skia.dll` (Windows).
 
-A program that opens a window (`runApp`) needs a backend built with a
+A program that opens a window (`application`, `awaitApplication` or
+`singleWindowApplication`) needs a backend built with a
 real windowing layer. A shim built without one — the *stub* backend,
 which still renders offscreen — cannot open a window, so such a bundle
 would launch and exit silently. Bundling catches this and fails fast:
@@ -265,13 +266,13 @@ the shim carries a backend marker (`cocoa`, `sdl`, `win32`, or `stub`)
 that the bundler reads and refuses to ship a windowed program against a
 stub. Build a windowing backend with `zig build skia-lib -Dskia -Dcocoa
 -Dgpu` (macOS) or `-Dskia` with `libsdl2-dev` (Linux). Offscreen-only
-bundles (`uiRenderer` → PNG, no `runApp`) are exempt — the stub renders
+bundles (`renderComposeToPng`, no window) are exempt — the stub renders
 them fine.
 
 ```sh
-$ klio bundle counter.kt -o counter
-bundled counter (42.3 MB, ui): stdlib + androidx.collection + androidx.compose.runtime + klio.compose.ui + kotlinx.atomicfu + kotlinx.coroutines + skia backend
-$ ./counter     # opens the window; no klio and no rendering install needed
+$ klio bundle compose_window.kt -o compose_window
+bundled compose_window (39.4 MB, ui): stdlib + androidx.annotation + androidx.collection + androidx.compose.animation + androidx.compose.animation.core + androidx.compose.foundation + androidx.compose.foundation.layout + androidx.compose.material.ripple + androidx.compose.material3 + androidx.compose.runtime + androidx.compose.runtime.saveable + androidx.compose.ui + androidx.compose.ui.backhandler + androidx.compose.ui.geometry + androidx.compose.ui.graphics + androidx.compose.ui.text + androidx.compose.ui.unit + androidx.compose.ui.util + androidx.graphics.shapes + androidx.lifecycle + androidx.navigationevent + androidx.navigationevent.compose + androidx.savedstate + kotlinx.atomicfu + kotlinx.coroutines + kotlinx.datetime + kotlinx.serialization + org.jetbrains.skiko + skia backend
+$ ./compose_window     # opens the window; no klio and no rendering install needed
 ```
 
 On first launch the shim is extracted to a content-addressed per-user
@@ -426,7 +427,7 @@ Bundle-time errors:
 - `error: this is a UI bundle but no Skia backend library was found for <target>; build it (zig build skia-lib) or set KLIO_SKIA_LIB`
   — a UI bundle needs the rendering backend to embed; build it or
   point `KLIO_SKIA_LIB` at one.
-- `error: this Compose UI program opens a window (runApp), but the Skia backend for <target> has no windowing support ...`
+- `error: this Compose UI program opens a window, but the Skia backend for <target> has no windowing support ...`
   — the shim was built without a windowing layer (the stub backend), so
   a windowed app would open no window and exit silently. Rebuild the
   backend with `zig build skia-lib -Dskia -Dcocoa -Dgpu` (macOS) or

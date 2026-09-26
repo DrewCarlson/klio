@@ -322,17 +322,9 @@ const itests_files = [_]Itest{
     // honor, and the commands built on the same pipeline.
     .{ .name = "cli_commands", .needs_exe = true, .rss_cap_kb = null, .weight = 3 },
     // UI bundle gate: the Skia shim embeds, extracts to the per-user
-    // cache on first launch, and renders the headless pixel gate
-    // byte-identically to a direct run (skips without the built shim).
-    .{ .name = "bundle_ui", .needs_exe = true, .dirs = &.{
-        "kotlin-klio/klio-androidx-annotation",
-        "kotlin-klio/klio-kotlinx-atomicfu",
-        "kotlin-klio/klio-kotlinx-io",
-        "kotlin-klio/klio-kotlinx-coroutines",
-        "kotlin-klio/klio-androidx-collection",
-        "kotlin-klio/klio-compose-runtime-engine",
-        "kotlin-klio/klio-compose-ui",
-    }, .weight = 1 },
+    // cache on first launch, and renders a Compose frame byte-identically
+    // to a direct run (skips without the built shim).
+    .{ .name = "bundle_ui", .needs_exe = true, .home = true, .weight = 2 },
     // Bootstrapping proof: Kotlin's own stdlib commonTest sources run through
     // a child `klio test` against the installed kotlin.test pack.
     // kotlinc's own box-test corpus (`fun box(): String` == "OK"), one
@@ -1893,9 +1885,9 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
     const default_cxx: []const u8 = if (os == .linux) "g++" else "clang++";
     const cxx = b.option([]const u8, "skia-cxx", "C++ compiler for the Skia shim (default: g++ on linux, clang++ elsewhere)") orelse default_cxx;
     // macOS builds the Cocoa window + Metal surface by default, so a plain
-    // `zig build` yields a UI-capable shim (no window backend => runApp opens
-    // nothing). Pass -Dcocoa=false / -Dgpu=false for a headless offscreen-only
-    // shim. Linux windowing is SDL (auto-linked when present); its GL surface
+    // `zig build` yields a UI-capable shim (with no window backend, a Compose
+    // `Window` opens nothing). Pass -Dcocoa=false / -Dgpu=false for a headless
+    // offscreen-only shim. Linux windowing is SDL (auto-linked when present); its GL surface
     // stays opt-in via -Dgpu. Metal falls back to raster at runtime if bring-up
     // fails, so defaulting it on is safe.
     const macos_backend_default = os == .macos;
@@ -2003,10 +1995,11 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
             std.log.warn("SDL2 not found; the Compose-UI window backend is disabled (headless render only). Install libsdl2-dev.", .{});
         }
         // Optional Ganesh+GL GPU surface. The ganesh archive is already in the link
-        // group above; this enables the code path + links the GL/EGL runtime (the
-        // ganesh objects also reference glX, so libGL is needed too). The on-screen
-        // GPU window renders through SDL's GL context; the offscreen path uses EGL.
-        // Skipped (raster fallback) if the GL/EGL libs are not found.
+        // group above; this enables the code path and links the GL and EGL
+        // runtimes its GL interface references (Skia's native GL interface on
+        // Linux is the EGL one, and ganesh also references glX). The GPU window
+        // renders through SDL's GL context. Skipped (raster fallback) if the
+        // GL/EGL libs are not found.
         if (linux_gl) |libs| run.addArgs(&.{ "-DKLIO_GPU", libs[0], libs[1] });
     }
 

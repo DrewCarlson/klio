@@ -229,7 +229,6 @@ engine runtime are the only compose path; the lowering always runs.
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
 | `KLIO_SKIA_LIB` | path | The Skia shim library to load at runtime (first in the search order) and to embed when bundling. A shim that is there but does not load says why on stderr (`klio: the Skia shim at ... did not load (<the loader's reason>)`, or the symbol it lacks) and rendering is headless | none |
-| `KLIO_SKIA_GPU` | set | Requests a GPU (Ganesh+EGL) surface for offscreen render; falls back to raster on failure | none |
 | `KLIO_SKIA_VERBOSE` | set | One-line backend notes: window backend chosen, dump writeback result | `[klio-skia]` |
 | `KLIO_SKIA_DUMP` | path | Writes a window's presented frame to the given PNG path (the first, or the `KLIO_SKIA_DUMP_AT`-th), GPU or raster, on every backend; an SDL window's frame includes its drawn menu bar and open menus. A path with `%d` writes every presented frame, numbered from 1 (`frame-%d.png`) | none |
 | `KLIO_CLIPBOARD` | `system`, `private`, `none` | The clipboard `klio.datatransfer.systemClipboard()` answers with, which Compose's `LocalClipboard` uses: the host's (the default; none where the host has none), one of the program's own that nothing outside it reads or changes (the test runners set this), or none, as a headless desktop has | `system` |

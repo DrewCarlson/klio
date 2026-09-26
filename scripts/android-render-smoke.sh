@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-SCENE="mobile/ios/AppHost/scene.kt"   # klio.compose.ui offscreen scene (shared with iOS)
+SCENE="mobile/ios/AppHost/scene.kt"   # offscreen Compose scene (shared with iOS)
 API="${ANDROID_API:-24}"
 
 skip() { echo "SKIP android-render-smoke: $1"; exit 0; }
