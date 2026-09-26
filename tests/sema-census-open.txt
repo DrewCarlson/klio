@@ -1,3 +1,7 @@
 # Known unresolved, unrecorded or unlowered sites of scripts/sema-census.py:
 # <reason> <path:line:col>, then the first scope and the detail after tabs.
 # The gate fails on any other site and on a listed one that is gone.
+# io.ktor: `credentials` is not smart cast to non-null where `principal`, a safe call on it, is known non-null, so DigestAuth's qop branch does not resolve.
+ambiguous klioMain/io/ktor/server/auth/DigestAuth.kt:143:35	pack:io.ktor	header: 3 candidates
+lower_lowering klioMain/io/ktor/server/auth/DigestAuth.kt:138:36	pack:io.ktor	no call record
+no_applicable klioMain/io/ktor/server/auth/DigestAuth.kt:138:48	pack:io.ktor	buildAuthenticationInfoHeader(kotlin.ByteArray, kotlin.String, kotlin.ByteArray?)
