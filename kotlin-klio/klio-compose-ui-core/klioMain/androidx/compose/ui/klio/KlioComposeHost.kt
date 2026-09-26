@@ -1,10 +1,3 @@
-/*
- * Copyright 2024 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // klio's hosts over upstream's scene. A klio window and the mobile surface
 // give their CanvasLayersComposeScene a KlioPlatformContext (the platform's
 // text input, the window's focus and size); the application's own

@@ -1,10 +1,3 @@
-/*
- * Copyright 2024 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // Compose Desktop's window API over klio's native windows (SDL2 / Cocoa /
 // Win32 via src/compose_ui): application, Window, DialogWindow and
 // singleWindowApplication with desktop's signatures. Each window is a

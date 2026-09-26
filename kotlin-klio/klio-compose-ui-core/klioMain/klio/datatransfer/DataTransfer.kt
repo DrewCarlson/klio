@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // The data transfer types of java.awt.datatransfer that Compose Desktop's
 // clipboard is written against, with the same names and behaviour: a
 // Transferable offers its data in DataFlavors, a Clipboard holds one with its

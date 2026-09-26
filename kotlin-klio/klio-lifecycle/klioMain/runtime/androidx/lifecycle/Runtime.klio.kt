@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // lifecycle-runtime's MainDispatcherChecker on klio: the desktop's, over
 // klio.Thread in place of java.lang.Thread. The main dispatcher's thread is
 // found by running on Dispatchers.Main.immediate and asked again when the

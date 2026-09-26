@@ -1,10 +1,3 @@
-/*
- * Copyright 2025 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // The text field actuals the non-JVM native targets give, which klio's
 // platform answers the same way: the undo manager's clock is the monotonic
 // one, and there are no platform clipboard events to handle.

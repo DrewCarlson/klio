@@ -1,10 +1,3 @@
-/*
- * Copyright 2025 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // klio's CalendarLocale is the ui text Locale, as on the other non-JVM skiko
 // targets: a BCP 47 tag the host's ICU formats dates for.
 package androidx.compose.material3

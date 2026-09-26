@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // A document builder in the shape of javax.xml.parsers': a factory makes a
 // builder, which parses a whole document into klio.xml.dom nodes. It reads
 // well-formed XML 1.0 in UTF-8: elements, attributes, namespace declarations

@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // The input a document builder reads and the error it throws, in the shape
 // of org.xml.sax's.
 

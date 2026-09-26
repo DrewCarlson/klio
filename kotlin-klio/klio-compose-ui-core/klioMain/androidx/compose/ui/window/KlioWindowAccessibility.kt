@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // A window's accessibility: its content's semantics as the platform's
 // assistive technologies read them (VoiceOver through NSAccessibility,
 // Narrator through UI Automation, Orca through AT-SPI), as Compose

@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // The UI thread a test's scene runs on, as the desktop's event dispatch
 // thread: a thread of its own, apart from the one the test body runs on, so
 // a test that sets content from its body waits for the content to settle.

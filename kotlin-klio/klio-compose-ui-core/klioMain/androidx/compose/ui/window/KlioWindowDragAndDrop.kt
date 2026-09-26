@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // A window's drag and drop, as Compose Desktop's AwtDragAndDropManager runs
 // it over AWT's: a drag from another application (or from the window itself)
 // over the window reaches the scene's root drag-and-drop node, which decides

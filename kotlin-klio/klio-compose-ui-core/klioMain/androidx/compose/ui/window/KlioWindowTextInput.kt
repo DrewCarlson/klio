@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // A window's input method sessions, as Compose Desktop's
 // DesktopTextInputService2 runs them over AWT's input method events. While a
 // text field has the keyboard the window's input method is on, its candidate

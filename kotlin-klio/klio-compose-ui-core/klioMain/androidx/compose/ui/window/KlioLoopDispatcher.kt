@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // The dispatcher a klio window's compositions run on: the window loop's own
 // thread, as a desktop window's run on the AWT event thread through skiko's
 // MainUIDispatcher (Swing's, a Delay over Swing timers). Work dispatched to

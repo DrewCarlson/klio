@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // A native window's input, as the Skia shim's window backends report it
 // (src/compose_ui/window_events.h), sent into its scene the way Compose
 // Desktop's ComposeSceneMediator sends AWT's: mouse events with the buttons

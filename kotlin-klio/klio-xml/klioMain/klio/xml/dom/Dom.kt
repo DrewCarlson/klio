@@ -1,10 +1,3 @@
-/*
- * Copyright 2026 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // The part of the W3C DOM (org.w3c.dom on the JVM) a namespace-aware parse
 // yields: elements with their attributes and children, text, and the
 // document. Nodes are built by klio.xml.parsers.DocumentBuilder and read

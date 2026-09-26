@@ -1,10 +1,3 @@
-/*
- * Copyright 2025 The klio Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- */
-
 // klio's PlatformDateFormat: the platform date formatter is the ICU the Skia
 // shim bundles (the same CLDR data Apple's NSDateFormatter reads), asked the
 // questions the darwin actual asks its formatter. Instants are formatted in
