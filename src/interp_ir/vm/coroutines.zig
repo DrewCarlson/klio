@@ -560,22 +560,10 @@ const VirtualClock = struct {
         if (pool_unsettled != 0) pool_unsettled -= 1;
     }
 
-    fn hasUnsettled() bool {
-        mutex.lock();
-        defer mutex.unlock();
-        return pool_unsettled != 0;
-    }
-
     fn currentNow() i64 {
         mutex.lock();
         defer mutex.unlock();
         return now;
-    }
-
-    fn advanceNow(t: i64) void {
-        mutex.lock();
-        defer mutex.unlock();
-        if (t > now) now = t;
     }
 
     fn registerWith(floor: i64) u64 {
@@ -622,9 +610,8 @@ const VirtualClock = struct {
         return false;
     }
 
-    fn minOtherFloor(id: u64) ?i64 {
-        mutex.lock();
-        defer mutex.unlock();
+    /// Caller holds `mutex`.
+    fn minOtherFloorLocked(id: u64) ?i64 {
         var m: ?i64 = null;
         for (slots.items) |s| {
             if (s.id == id) continue;
@@ -635,12 +622,25 @@ const VirtualClock = struct {
         return m;
     }
 
-    /// A pump idle with its soonest timer at `t` may fire it only if no other live
-    /// pump has a floor below `t`, since that pump runs first and may preempt it.
-    fn mayFire(id: u64, t: i64) bool {
-        const other = minOtherFloor(id) orelse return true;
-        return other >= t;
+    /// Moves the clock to the pump `id`'s soonest timer `t`, which it may only
+    /// do once no other live pump has a floor below `t`: that pump runs first
+    /// and may preempt it. A top-level driver (`wait_unsettled`) also waits
+    /// while anything unordered is in flight (a dispatched task or a timer post
+    /// not yet taken), unless it has starved. One critical section: a pump that
+    /// takes a post registers its floor before the post settles, so a driver
+    /// that sees it settled sees the floor too.
+    fn tryAdvance(id: u64, t: i64, wait_unsettled: bool, starving: bool) Advanced {
+        mutex.lock();
+        defer mutex.unlock();
+        if (minOtherFloorLocked(id)) |other| {
+            if (other < t) return .floor_below;
+        }
+        if (wait_unsettled and pool_unsettled != 0 and !starving) return .unsettled;
+        if (t > now) now = t;
+        return .advanced;
     }
+
+    const Advanced = enum { advanced, floor_below, unsettled };
 
     fn dumpState() void {
         mutex.lock();
@@ -1531,8 +1531,9 @@ pub const CooperativeInterceptor = struct {
         // nothing is ready and then hands control back to the code that
         // started it, which the thread's hold must go on covering: let go
         // while that pump went idle, the clock could jump before the code
-        // after it had run.
-        if (floor != INDEFINITE and self.event_loop) releaseClock();
+        // after it had run. The floor is published before the hold goes, so a
+        // pump that sees the thread settled also sees its floor.
+        defer if (floor != INDEFINITE and self.event_loop) releaseClock();
         if (self.published_floor == floor) return;
         self.published_floor = floor;
         if (self.clock_id == VirtualClock.UNREGISTERED) {
@@ -1603,18 +1604,19 @@ pub const CooperativeInterceptor = struct {
                 // another pump at the same instant, and its floor stays here.
                 if (t > self.virtual_now) {
                     self.publishFloor(t);
-                    if (!VirtualClock.mayFire(self.clock_id, t)) return .blocked;
                     // A top-level driver also waits while a dispatched pool task it
                     // launched has published no floor: that coroutine may park on a
                     // sooner timer, or cancel this driver's job, first. The floor `t`
                     // stands, so a sibling with a sooner timer still advances.
-                    if (!vmhost.scheduler.onPoolWorker() and VirtualClock.hasUnsettled() and
-                        !self.virtualStarvationDue())
-                    {
-                        return .blocked;
+                    const wait_unsettled = !vmhost.scheduler.onPoolWorker();
+                    switch (VirtualClock.tryAdvance(self.clock_id, t, wait_unsettled, false)) {
+                        .advanced => {},
+                        .floor_below => return .blocked,
+                        // Starved: the check runs again with the valve open.
+                        .unsettled => if (!self.virtualStarvationDue() or
+                            VirtualClock.tryAdvance(self.clock_id, t, wait_unsettled, true) != .advanced) return .blocked,
                     }
                     self.virtual_now = t;
-                    VirtualClock.advanceNow(t);
                 } else {
                     self.publishFloor(self.virtual_now);
                 }

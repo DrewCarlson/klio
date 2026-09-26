@@ -491,6 +491,85 @@ sema or lowering test, so the rewrite cannot re-learn them the same way.
 Sema subsumes the first four: each is a resolution answer it gives by
 construction, and each gets a test.
 
+### Coroutines, runtime and hosts
+
+- **An Unconfined hand-over waits at most 250 ms for the owner.** A Kotlin
+  `resumeWith` that needs no dispatch (Unconfined, or no interceptor) runs
+  its coroutine on the resuming thread (7d1859a9). When another thread's pump
+  holds the coroutine parked, the resumer posts a hand-over request to that
+  pump's mailbox and waits for the answer. A pump busy in a long step does not
+  answer within the bound, so the resume is posted and the coroutine runs
+  late, on the owner's thread: the divergence 7d1859a9 fixed, now depending
+  on load. Files: `src/interp_ir/vm/coroutines.zig` (`SurrenderRequest`,
+  `requestSurrender`, `serveOwnSurrenders`, `surrenderSlot`,
+  `drainWakeupInto`, `coroutineResumeExternal`).
+  Next step, claim without the owner:
+  - Park a non-root activation waiting indefinitely on a slot straight into
+    `PersistedParked`, whose `take` is single-winner. Decide it in `parkInto`
+    with a `pinned` flag for roots: `driveRoot`, `driveSuspendMain`,
+    `coroutineStartRootOrSuspended`, and `pumpLoop`'s re-park of the root
+    token. Timed parks and roots stay in the pump.
+  - Give each `SlotOwners` entry a state: armed, parking, claimable, pinned.
+    - `__klio_co_armSlot` sets armed.
+    - `__klio_co_park` and `__kxco_parkSlot` set parking, through a new host
+      call beside `coroutine_arm_slot`. From the park intrinsic to
+      `interceptSuspend` the owner only unwinds and runs no Kotlin.
+    - `parkInto` sets claimable after the registry `put`, or pinned for a
+      local park.
+  - The owner's own lookups fall back to the registry when `SlotOwners` names
+    its pump: `resumeSlot`/`resumeSlotValue` (adopt), `claimSlotForInline`
+    (take), `slotParkedHere`, `ownerReadyPending`,
+    `markSlotOwnerSchedulerBacked`.
+  - The resumer loops:
+    - a `take` that succeeds runs the coroutine inline;
+    - parking waits on a park gate, an `EventGate` plus a waiter count rung
+      on every state change. The wait is blocking-safe with the value kept
+      alive, and never spins outside it, since the owner's unwind can start
+      a collection;
+    - armed (a raw resume while the block still runs) or pinned is posted.
+    No time bound.
+  - Delete the hand-over machinery.
+  - Check one behaviour change in the differential: a child parked in a
+    `runBlocking` that exits stays resumable in the registry instead of being
+    dropped.
+  - Measure the two registry locks per park and resume on a coroutine-heavy
+    program before and after.
+  - Pin it with a litmus whose owner thread is busy (a `Thread.sleep` step) when
+    another thread resumes its Unconfined coroutine; kotlinc prints the
+    coroutine running on the resumer before `resume` returns.
+- **Unverified: `suspend fun main` resumed from a worker stays on main.** A
+  pinned root keeps a `suspend fun main` continuation on main's pump. On the
+  JVM its continuation has no interceptor, so after
+  `withContext(Dispatchers.Default)` it resumes on the worker thread. Compare
+  `Thread.currentThread().name` against kotlinc before changing it.
+- **A SIGABRT in `tl_wakeup_hammer` and a teardown assert in `runVmTask`,
+  one each, not reproduced.**
+  - The hammer abort came once in a wall-time litmus run on macOS; the
+    stack showed only `pthread_cond_wait`/`pthread_cond_broadcast` frames.
+    564 reruns at 8 to 16 at once had no failure.
+  - The teardown assert was in `runVmTask`'s `vm.deinit`
+    (`resetReceiverTls`), once in 48 runs under load, and not in about 800
+    runs with a TLS diagnostic build.
+  - Next: rerun inside the gate's interleaving (the litmus phase beside
+    e2e), with `KLIO_MAX_WORKERS=1` and `=2`, and under
+    `KLIO_GC_STRESS_EVERY=200 KLIO_GC_VERIFY=1`, saving the full stderr.
+    Then attach lldb to the Debug harness on a catch.
+- **lifecycle-runtime's commonTest is not a suite yet.** Dispatchers.Main
+  and Main.immediate now find the main thread (1e5cbcf5), which
+  `examples/lifecycle_registry.kt` shows. Register it in
+  `src/itests/commontest_support.zig` with the roots and support that
+  `plans/compose-parity.md` item 2 lists, then set its ratchet from a
+  census.
+- **The Linux runs are clean except for load.** 64415371 with 96418ab6 on
+  top, native in the aarch64 container:
+  - build, a run served by the shipped image, a cold bake;
+  - unit tests;
+  - threaded litmus 77/77 under virtual and wall time;
+  - stdlib sweep 149/149;
+  - sema corpus 597/602 at four jobs. compose_animation was killed and
+    compose_pointer_events, compose_popup, compose_scene_frames and
+    compose_shape timed out, all in the 8 GB VM; each passes alone.
+
 ## Done means
 
 1. Every item in Cutover, Green and Speed is `done`.

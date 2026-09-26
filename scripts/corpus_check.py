@@ -193,7 +193,8 @@ def main():
             stem = os.path.basename(f)[: -len(".kt")]
             exp = os.path.join(ROOT, "tests/corpus/expected-cli", stem + ".out")
             if ok and os.path.exists(exp):
-                with open(exp, "r", errors="replace") as fh:
+                # Byte for byte: no newline translation of a carriage return.
+                with open(exp, "r", encoding="utf-8", errors="replace", newline="") as fh:
                     want = fh.read()
                 if zout != want:
                     ok = False

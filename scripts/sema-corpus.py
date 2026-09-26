@@ -66,7 +66,10 @@ def run_one(klio, path, timeout, home):
     want_path = os.path.join(ROOT, "tests", "corpus", "expected", name + ".out")
     if not os.path.exists(want_path):
         return name, "no-expected", ""
-    with open(want_path, "r", encoding="utf-8", errors="replace") as f:
+    # No newline translation: an output line may carry a carriage return (an
+    # SSE event's data lines are joined with CRLF), which a universal-newline
+    # read turns into a line break.
+    with open(want_path, "r", encoding="utf-8", errors="replace", newline="") as f:
         want = f.read()
     # A clipboard of its own and a pinned locale, as corpus_check runs them:
     # an example never touches the user's clipboard, and prints the same
