@@ -1952,6 +1952,46 @@ test "an eager initializer that throws fails the program before main runs" {
     try std.testing.expectEqualStrings("", o.output);
 }
 
+test "an external function binds to the host symbol its @ExternalSymbolName names" {
+    // Two files declare private externals of the same name bound to
+    // different symbols: each binds its own, whatever its name.
+    try driver.expectOutput(&.{
+        \\import cfg.twice
+        \\annotation class ExternalSymbolName(val name: String)
+        \\@ExternalSymbolName("kotlin.math.sqrt") private external fun mySqrt(x: Double): Double
+        \\fun main() {
+        \\    println(mySqrt(4.0))
+        \\    println(twice(9.0))
+        \\}
+        ,
+        \\package cfg
+        \\annotation class ExternalSymbolName(val name: String)
+        \\@ExternalSymbolName("kotlin.math.abs") private external fun mySqrt(x: Double): Double
+        \\fun twice(x: Double): Double = mySqrt(-x) * 2.0
+    },
+        \\2.0
+        \\18.0
+        \\
+    );
+}
+
+test "an external function whose symbol is not registered fails at the call, naming both" {
+    var mem = ir.eval.hand.TestMemory.init();
+    defer mem.deinit();
+    const o = try driver.run(mem.allocator(), &.{
+        \\annotation class ExternalSymbolName(val name: String)
+        \\@ExternalSymbolName("klio_no_such_symbol") private external fun missing(x: Int): Int
+        \\fun main() {
+        \\    println("before")
+        \\    println(missing(1))
+        \\}
+    });
+    try std.testing.expect(o.result == .failed);
+    try std.testing.expectEqualStrings("before\n", o.output);
+    try std.testing.expect(std.mem.indexOf(u8, o.diag, "missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o.diag, "\"klio_no_such_symbol\"") != null);
+}
+
 test "a file's JvmName annotation does not rename the file" {
     try driver.expectOutput(&.{
         \\import cfg.limit

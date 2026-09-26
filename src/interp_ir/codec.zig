@@ -25,7 +25,7 @@ const FuncId = ir.FuncId;
 
 /// Bump on any change to the encoded layout or to the types it reaches. A
 /// mismatch refuses the load and the caller rebakes.
-pub const FORMAT_VERSION: u32 = 97;
+pub const FORMAT_VERSION: u32 = 98;
 
 // Watched AST node types: pointed at from the IR.
 

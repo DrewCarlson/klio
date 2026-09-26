@@ -355,7 +355,9 @@ pub const FrameNamer = struct {
 /// `stack_frames` is the frames a throwable's throw captured, each
 /// rendered `pkg.f(File.kt:line)`; `print_err` writes a line to standard
 /// error.
-pub const HostOp = enum { none, coroutine_context, generated_serializer, stack_frames, print_err };
+/// `missing_symbol`: an `external` function whose `@ExternalSymbolName`
+/// names a host symbol no binding registers; a call fails naming both.
+pub const HostOp = enum { none, coroutine_context, generated_serializer, stack_frames, print_err, missing_symbol };
 
 /// Where a class's generated `serializer(...)` lives: on its companion, or
 /// on an object itself.

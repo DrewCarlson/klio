@@ -706,7 +706,9 @@ fn writeProgram(p: *Program, w: *Writer, cbs: *const Callbacks) Error!void {
     try w.print("static const klio_r_native KNATIVES[{d}] = {{\n", .{@max(p.rc.natives.items.len, 1)});
     for (p.rc.natives.items) |nid| {
         const n = p.r.natives[nid.int()];
-        if (n.op != .none and n.op != .print_err) p.refuse("the compiler intrinsic `{s}`", .{n.name});
+        if (n.op == .missing_symbol) {
+            p.refuse("external function `{s}` is bound to the host symbol \"{s}\", which is not registered", .{ n.name, n.key });
+        } else if (n.op != .none and n.op != .print_err) p.refuse("the compiler intrinsic `{s}`", .{n.name});
         var flags: u32 = 0;
         if (n.static_) flags |= 1;
         if (n.receiver) flags |= 2;

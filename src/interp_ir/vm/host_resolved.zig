@@ -84,6 +84,7 @@ pub fn callNative(self: *VmHost, allocator: Allocator, id: NativeId, args: []con
             }
             return .{ .ok = .Unit };
         },
+        .missing_symbol => return fail(allocator, "external function `{s}` is bound to the host symbol \"{s}\", which is not registered", .{ n.name, n.key }),
     }
     if (n.host_fn) |f| return hostResult(self, allocator, try f(self, allocator, run));
     return kotlinThrow(self, allocator, try host_call_func.dispatchIntrinsic(self, allocator, n.name, n.func, run));

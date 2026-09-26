@@ -109,8 +109,12 @@ pub const Hand = struct {
         const layout = try self.a.alloc(runtime.LayoutSlot, opts.slot_names.len);
         for (layout, opts.slot_names) |*l, n| l.* = .{ .name = n };
         def.asPtr().layout_slots = layout;
-        try self.classes.append(self.a, .{ .def = def, .seeds = opts.seeds });
-        try self.supers.append(self.a, opts.supers);
+        // The options' slices may be the caller's temporaries (`.supers =
+        // &.{k}` over a runtime `k`), which die with its statement: `finish`
+        // reads copies.
+        try self.classes.append(self.a, .{ .def = def, .seeds = try self.a.dupe(ir.SlotSeed, opts.seeds) });
+        const supers = try self.a.dupe(ClassId, opts.supers);
+        try self.supers.append(self.a, supers);
         try self.m.classes.append(self.a, .{
             .id = id,
             .name = name,
@@ -119,7 +123,7 @@ pub const Hand = struct {
             .methods = &.{},
             .init_block = null,
             .companion = null,
-            .supertypes = try self.a.dupe(ClassId, opts.supers),
+            .supertypes = supers,
         });
         return id;
     }

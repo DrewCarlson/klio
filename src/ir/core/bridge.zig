@@ -153,6 +153,29 @@ pub const Unit = union(enum) {
     eager_file: u32,
 };
 
+/// The host symbol an `external` function's `@ExternalSymbolName("S")`
+/// names: an annotation of that simple name, as Kotlin/Native and the
+/// libraries declaring their own copy of it write it, with one constant
+/// string argument. Null for any other declaration.
+pub fn externalSymbolName(s: *sema.Sema, f: Sym) ?[]const u8 {
+    if (!s.syms.flags(f).external) return null;
+    const fd = switch (s.syms.get(f).decl) {
+        .function => |fd| fd,
+        else => return null,
+    };
+    for (fd.annotations) |ann| {
+        if (ann.path.len == 0 or !std.mem.eql(u8, ann.path[ann.path.len - 1].name, "ExternalSymbolName")) continue;
+        if (ann.args.len != 1) continue;
+        const parts = switch (ann.args[0]) {
+            .StringTemplate => |t| t.parts,
+            else => continue,
+        };
+        if (parts.len == 1 and parts[0] == .Text) return parts[0].Text;
+        if (parts.len == 0) return "";
+    }
+    return null;
+}
+
 /// Whether `p` is a top-level property Kotlin/Native initializes when the
 /// program starts: one annotated `@kotlin.native.EagerInitialization`.
 pub fn eagerProperty(s: *sema.Sema, p: Sym) Error!bool {
@@ -1204,6 +1227,9 @@ const Build = struct {
     fn bindNative(b: *Build, decl: Sym, id: FuncId, key: Sym, kind: MemberKind) Error!void {
         const s = b.s;
         const fqn = try b.qualName(decl);
+        if (kind == .function and s.syms.kind(decl) == .function) if (externalSymbolName(s, decl)) |symbol| {
+            return b.bindExternalSymbol(decl, id, key, fqn, symbol);
+        };
         // A setter never shares its getter's native under the property's
         // FQN, and a property its declaration stores (a constructor
         // property, one with an initializer) is read from the host value
@@ -1240,6 +1266,26 @@ const Build = struct {
         }
         if (kind == .function and s.syms.kind(decl) == .function) b.nativeShape(decl, &rt);
         rt.receiver = (isInstanceMember(s, decl) and !static_) or receiverFirst(s, decl);
+        const nid = NativeId.from(@intCast(b.natives.items.len));
+        try b.natives.append(b.a, rt);
+        if (b.br.native_of[key.int()] == .none) b.br.native_of[key.int()] = nid;
+        try b.func_native.put(b.a, id.int(), nid);
+    }
+
+    /// Binds `external` function `decl` to the host function registered
+    /// under `symbol`, its `@ExternalSymbolName`, as Kotlin/Native binds it,
+    /// whatever its own name: private names repeat across files. A symbol
+    /// no binding registers binds a native that fails the call naming the
+    /// function and the symbol.
+    fn bindExternalSymbol(b: *Build, decl: Sym, id: FuncId, key: Sym, fqn: []const u8, symbol: []const u8) Error!void {
+        const s = b.s;
+        var rt: resolved.NativeRt = if (b.opts.natives(symbol)) |func|
+            .{ .func = func, .name = fqn, .table = .natives, .key = symbol }
+        else
+            .{ .func = hostMemberUnbound, .name = fqn, .key = symbol, .op = .missing_symbol };
+        b.nativeShape(decl, &rt);
+        rt.static_ = companionStatic(s, decl) != null;
+        rt.receiver = (isInstanceMember(s, decl) and !rt.static_) or receiverFirst(s, decl);
         const nid = NativeId.from(@intCast(b.natives.items.len));
         try b.natives.append(b.a, rt);
         if (b.br.native_of[key.int()] == .none) b.br.native_of[key.int()] = nid;
