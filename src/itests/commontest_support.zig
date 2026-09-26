@@ -746,12 +746,8 @@ pub const suites = [_]Config{
         // AuthTest, BomRemoverTest, ContentEncodingTest and WebSocketRemoteTest
         // call ktor's test server through every registered engine.
         .service = ktor_test_server,
-        // ContentEncodingTest testGzipByteArray and testDisableDecompression:
-        // the server's `/gzip-precompressed` declares the 294 bytes the JVM's
-        // zlib makes of its body, and klio's deflate (std.compress.flate)
-        // makes 293.
-        .baseline = 123,
-        .max_failed = 2,
+        .baseline = 125,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
     .{
@@ -768,13 +764,9 @@ pub const suites = [_]Config{
         .extra_args = &.{ "--feature", "io.ktor/client-cio,client-test-base,client-mock,client-logging,client-auth,client-encoding,client-content-negotiation,client-websockets,serialization-kotlinx-json,test-base" },
         .service = ktor_test_server,
         .timeout_ms = 300_000,
-        // CacheLegacyStorageTest x7: `plugin::findAndRefresh` in
-        // HttpCacheLegacy.kt binds HttpCache's private member, which is not
-        // visible there, instead of the file's extension, so the legacy
-        // storage is never consulted. DispatcherTest x1: Dispatchers.IO's
-        // toString is not "Dispatchers.IO".
-        .baseline = 380,
-        .max_failed = 8,
+        // DispatcherTest x1: Dispatchers.IO's toString is not "Dispatchers.IO".
+        .baseline = 387,
+        .max_failed = 1,
         .max_incomplete = 0,
     },
     .{

@@ -32,9 +32,10 @@ cinterop. In practice that means:
 - **Compression.** Upstream's posix `GZipEncoder` and `DeflateEncoder` are
   the identity encoder. klio's actuals follow the JVM's: the gzip header,
   checksum and trailer are written and checked in Kotlin, and raw DEFLATE and
-  CRC-32 are host natives over Zig's `std.compress.flate`
-  (`src/ktor_client/zlib.zig`). The output is standard gzip and deflate that
-  any decoder reads.
+  CRC-32 are host natives (`src/ktor_client/zlib.zig`). Compression is a Zig
+  port of zlib's deflate (`src/ktor_client/zdeflate.zig`), the compressor
+  inside java.util.zip.Deflater, so klio writes the JVM's bytes exactly;
+  decompression is Zig's `std.compress.flate`.
 - **Platform bridges.** `getenv` (the `KTOR_LOG_LEVEL` logger level and the
   server's `ktor.*` environment properties), message digests (`Digest(name)`
   covers every JVM `MessageDigest` algorithm), the clock, locks and
@@ -255,7 +256,9 @@ val gzipped = GZipEncoder.encode(ByteReadChannel(bytes)).toByteArray()
 val plain = GZipEncoder.decode(ByteReadChannel(gzipped)).toByteArray()
 ```
 
-Compression uses level 6, the JVM's default. Both directions stream: a
+Compression uses level 6, the JVM's default, and produces the same bytes as
+the JVM (a body whose compressed length a server declares up front matches).
+Both directions stream: a
 decoder writes what each piece of input decodes to as it arrives. A truncated
 stream throws `EOFException("Compressed input is incomplete.")`, and a corrupt
 one an `IOException` with zlib's message (`invalid block type`, ...), where
@@ -267,8 +270,9 @@ either side's WebSockets plugin with upstream's options (context takeover,
 `compressionLevel`, `compressIf`, `compressIfBiggerThan`,
 `maxInflatedFrameSize`). Upstream ships it for the JVM only; klio's port
 keeps its negotiation and framing. Each outgoing message is compressed on
-its own, which the RFC allows whatever context takeover was negotiated, so
-messages that repeat earlier ones compress a little less than on the JVM;
+its own, which the RFC allows whatever context takeover was negotiated: a
+message's bytes are the JVM's for a fresh deflater, and messages that repeat
+earlier ones compress a little less than on the JVM with context takeover;
 incoming messages are inflated with the peer's window either way.
 
 ## Call logging

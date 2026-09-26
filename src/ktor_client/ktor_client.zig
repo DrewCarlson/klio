@@ -349,6 +349,7 @@ test {
     _ = zlib;
     _ = env;
     _ = @import("sync.zig");
+    _ = @import("zdeflate.zig");
 }
 
 fn makeCtx(allocator: Allocator, host: runtime.IntrinsicHost, out: Output, args: []const Value) CallCtx {

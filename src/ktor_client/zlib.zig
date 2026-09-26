@@ -1,7 +1,10 @@
-//! Raw DEFLATE and CRC-32 natives behind klio's ktor-utils content encoders,
-//! over std.compress.flate. They stand where the JVM actuals use
-//! java.util.zip's `Deflater(nowrap)`, `Inflater(nowrap)` and `CRC32`: the
-//! gzip container (header, checksum, trailer) stays in Kotlin, as on the JVM.
+//! Raw DEFLATE and CRC-32 natives behind klio's ktor-utils content encoders.
+//! They stand where the JVM actuals use java.util.zip's `Deflater(nowrap)`,
+//! `Inflater(nowrap)` and `CRC32`: the gzip container (header, checksum,
+//! trailer) stays in Kotlin, as on the JVM. Compression is zlib's own
+//! algorithm (zdeflate.zig), driven the way ktor's JVM code drives
+//! java.util.zip.Deflater, so the bytes are the JVM's; decompression is
+//! std.compress.flate.
 //!
 //! A deflater and an inflater both work as input arrives and hand back what
 //! they have produced.
@@ -11,6 +14,7 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 const net = @import("net.zig");
 const sync = @import("sync.zig");
+const zdeflate = @import("zdeflate.zig");
 
 const CallCtx = runtime.CallCtx;
 const EvalResult = runtime.EvalResult;
@@ -41,58 +45,67 @@ pub fn register(b: *HostBindings) Allocator.Error!void {
 
 // ---- streams ------------------------------------------------------------------
 
-/// A raw DEFLATE compressor. Pinned in memory: the compressor's writer
-/// points at `window` and at `out`.
+/// A raw DEFLATE compressor at java.util.zip's DEFAULT_COMPRESSION (6),
+/// driven as ktor's JVM encoder drives `Deflater`: each input is deflated
+/// into 4096-byte buffers until the deflater needs input.
 pub const Deflater = struct {
-    out: std.Io.Writer.Allocating,
-    window: []u8,
-    compress: flate.Compress,
-    finished: bool = false,
+    z: zdeflate.Deflater,
+    out: std.ArrayList(u8) = .empty,
 
     pub fn create() Allocator.Error!*Deflater {
+        return createLevel(-1) catch |e| switch (e) {
+            error.InvalidLevel => unreachable,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    pub fn createLevel(level: i32) error{ OutOfMemory, InvalidLevel }!*Deflater {
         const d = try gpa.create(Deflater);
         errdefer gpa.destroy(d);
-        d.out = .init(gpa);
-        errdefer d.out.deinit();
-        try d.out.ensureUnusedCapacity(64);
-        d.window = try gpa.alloc(u8, flate.max_window_len);
-        errdefer gpa.free(d.window);
-        // Level 6 is java.util.zip's DEFAULT_COMPRESSION.
-        d.compress = flate.Compress.init(&d.out.writer, d.window, .raw, .default) catch return error.OutOfMemory;
-        d.finished = false;
+        d.* = .{ .z = try zdeflate.Deflater.create(gpa, level) };
         return d;
     }
 
     pub fn destroy(d: *Deflater) void {
-        d.out.deinit();
-        gpa.free(d.window);
+        d.out.deinit(gpa);
+        d.z.destroy();
         gpa.destroy(d);
     }
 
     pub fn write(d: *Deflater, bytes: []const u8) Allocator.Error!void {
-        d.compress.writer.writeAll(bytes) catch return error.OutOfMemory;
+        try d.z.setInput(bytes);
+        var buf: [buffer_size]u8 = undefined;
+        while (!d.z.needsInput()) try d.out.appendSlice(gpa, buf[0..try d.z.deflate(&buf, .none)]);
     }
 
-    /// Emits everything written so far, ending at a byte boundary with the
-    /// stream still open.
+    /// Emits everything written so far with a sync flush (ending in an empty
+    /// stored block) and the stream still open, as ktor's WebSocket
+    /// extension flushes the JVM's Deflater: until a call writes nothing.
     pub fn flush(d: *Deflater) Allocator.Error!void {
-        d.compress.writer.flush() catch return error.OutOfMemory;
+        var buf: [buffer_size]u8 = undefined;
+        while (true) {
+            const w = try d.z.deflate(&buf, .sync);
+            try d.out.appendSlice(gpa, buf[0..w]);
+            if (w == 0) break;
+        }
     }
 
     pub fn finish(d: *Deflater) Allocator.Error!void {
-        if (d.finished) return;
-        d.finished = true;
-        d.compress.finish() catch return error.OutOfMemory;
+        d.z.finish();
+        var buf: [buffer_size]u8 = undefined;
+        while (!d.z.finished()) try d.out.appendSlice(gpa, buf[0..try d.z.deflate(&buf, .none)]);
     }
 
     /// The compressed bytes produced so far, owned by the caller.
     pub fn take(d: *Deflater) Allocator.Error!?[]u8 {
-        const produced = d.out.written();
-        if (produced.len == 0) return null;
-        const copy = try gpa.dupe(u8, produced);
+        if (d.out.items.len == 0) return null;
+        const copy = try gpa.dupe(u8, d.out.items);
         d.out.clearRetainingCapacity();
         return copy;
     }
+
+    /// ktor's JVM buffers come from KtorDefaultPool, 4096 bytes each.
+    const buffer_size = 4096;
 };
 
 /// A raw DEFLATE decompressor that inflates as input arrives, as the JVM's
@@ -513,39 +526,17 @@ fn nCrc32(ctx: *CallCtx) Allocator.Error!EvalResult {
 // ---- per-message deflate (WebSocket permessage-deflate) -----------------------
 
 /// Compresses one message with a fresh compressor and flushes it to a byte
-/// boundary without ending the stream, the shape RFC 7692 sends. Level -1 is
+/// boundary without ending the stream, the shape RFC 7692 sends, as ktor's
+/// JVM `deflateFully` does with a new `Deflater(level, true)`. Level -1 is
 /// the default (6), 0 stores, 1 to 9 are zlib's levels. The caller owns the
 /// result.
 pub fn deflateMessage(data: []const u8, level: i64) error{ OutOfMemory, InvalidLevel }![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try out.ensureUnusedCapacity(64);
-    const window = try gpa.alloc(u8, flate.max_window_len);
-    defer gpa.free(window);
-    if (level == 0) {
-        var raw = flate.Compress.Raw.init(&out.writer, window, .raw) catch return error.OutOfMemory;
-        raw.writer.writeAll(data) catch return error.OutOfMemory;
-        raw.writer.flush() catch return error.OutOfMemory;
-    } else {
-        const opts: flate.Compress.Options = switch (level) {
-            -1, 6 => .level_6,
-            1 => .level_1,
-            2 => .level_2,
-            3 => .level_3,
-            4 => .level_4,
-            5 => .level_5,
-            7 => .level_7,
-            8 => .level_8,
-            9 => .level_9,
-            else => return error.InvalidLevel,
-        };
-        const c = try gpa.create(flate.Compress);
-        defer gpa.destroy(c);
-        c.* = flate.Compress.init(&out.writer, window, .raw, opts) catch return error.OutOfMemory;
-        c.writer.writeAll(data) catch return error.OutOfMemory;
-        c.writer.flush() catch return error.OutOfMemory;
-    }
-    return gpa.dupe(u8, out.written());
+    if (level < -1 or level > 9) return error.InvalidLevel;
+    const d = try Deflater.createLevel(@intCast(level));
+    defer d.destroy();
+    try d.write(data);
+    try d.flush();
+    return gpa.dupe(u8, d.out.items);
 }
 
 pub const MessageInflate = union(enum) {
@@ -686,6 +677,22 @@ fn inflateSteps(compressed: []const u8, step: usize) !struct { data: []u8, rest:
 fn inflateAll(compressed: []const u8) !struct { data: []u8, rest: []u8 } {
     const r = try inflateSteps(compressed, @max(compressed.len, 1));
     return .{ .data = r.data, .rest = r.rest };
+}
+
+test "the encoder's bytes are the JVM's" {
+    // ktor's test server gzips these 500 bytes and declares the 294-byte
+    // body the JVM makes: 10 header bytes, 276 of DEFLATE and 8 of trailer.
+    var counting: [500]u8 = undefined;
+    for (&counting, 0..) |*b, i| b.* = @truncate(i);
+    const out = try deflateAll(&.{&counting});
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 276), out.len);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xfd, 0x67, 0x18, 0x81, 0xfe, 0x07, 0x00 }, out[out.len - 7 ..]);
+
+    // ktor's JVM deflateFully on "Hello": RFC 7692's example bytes.
+    const hello = try deflateMessage("Hello", -1);
+    defer gpa.free(hello);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x00, 0x00, 0xff, 0xff }, hello);
 }
 
 test "deflate then inflate round-trips text, binary and empty input" {
