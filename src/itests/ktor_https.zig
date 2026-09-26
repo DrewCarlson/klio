@@ -144,7 +144,9 @@ fn bodyOf(resp: []const u8) []const u8 {
     return resp[sep + 4 ..];
 }
 
-test "https: std.crypto.tls.Client verifies the Klio engine's certificate and talks HTTP/1.1 over it" {
+/// Serves SERVER_SRC with the fixture identity `name` (`<name>.pem`,
+/// `<name>-key.pem`) and checks three calls through std's client.
+fn serveAndCheck(name: []const u8) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -153,8 +155,8 @@ test "https: std.crypto.tls.Client verifies the Klio engine's certificate and ta
     var env = try envWithHome(a, try klio_child.home(a));
     const cwd = std.Io.Dir.cwd();
 
-    const chain = try cwd.readFileAlloc(io, FIXTURES ++ "/server-p256.pem", a, .limited(1 << 20));
-    const key = try cwd.readFileAlloc(io, FIXTURES ++ "/server-p256-key.pem", a, .limited(1 << 20));
+    const chain = try cwd.readFileAlloc(io, try std.fmt.allocPrint(a, FIXTURES ++ "/{s}.pem", .{name}), a, .limited(1 << 20));
+    const key = try cwd.readFileAlloc(io, try std.fmt.allocPrint(a, FIXTURES ++ "/{s}-key.pem", .{name}), a, .limited(1 << 20));
     var anchors: std.crypto.Certificate.Bundle = .empty;
     try anchors.addCertsFromFilePath(a, io, std.Io.Timestamp.now(io, .real), cwd, FIXTURES ++ "/ca.pem");
 
@@ -163,7 +165,7 @@ test "https: std.crypto.tls.Client verifies the Klio engine's certificate and ta
     var prog = try std.mem.replaceOwned(u8, a, SERVER_SRC, "CHAIN_PEM", chain);
     prog = try std.mem.replaceOwned(u8, a, prog, "KEY_PEM", key);
     prog = try std.mem.replaceOwned(u8, a, prog, "PORT", try std.fmt.allocPrint(a, "{d}", .{port}));
-    const path = TMP_DIR ++ "/https_server.kt";
+    const path = try std.fmt.allocPrint(a, TMP_DIR ++ "/https_server_{s}.kt", .{name});
     try cwd.writeFile(io, .{ .sub_path = path, .data = prog });
 
     var child = std.process.spawn(io, .{
@@ -203,4 +205,12 @@ test "https: std.crypto.tls.Client verifies the Klio engine's certificate and ta
         try std.testing.expectEqual(@as(?u16, 200), statusOf(resp));
         try std.testing.expectEqualStrings("https https 443", bodyOf(resp));
     }
+}
+
+test "https: std.crypto.tls.Client verifies the Klio engine's certificate and talks HTTP/1.1 over it" {
+    try serveAndCheck("server-p256");
+}
+
+test "https: an RSA identity serves, its RSA-PSS signature checked by std.crypto.tls.Client" {
+    try serveAndCheck("server-rsa");
 }

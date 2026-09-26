@@ -50,6 +50,7 @@ pub const Env = struct {
     anchors: Bundle = .empty,
     p256: OwnedIdentity,
     ed25519: OwnedIdentity,
+    rsa: OwnedIdentity,
     untrusted: OwnedIdentity,
     expired: OwnedIdentity,
 
@@ -58,6 +59,7 @@ pub const Env = struct {
             .a = a,
             .p256 = try .load(a, fixtures.server_p256, fixtures.server_p256_key),
             .ed25519 = try .load(a, fixtures.server_ed25519, fixtures.server_ed25519_key),
+            .rsa = try .load(a, fixtures.server_rsa, fixtures.server_rsa_key),
             .untrusted = try .load(a, fixtures.untrusted, fixtures.untrusted_key),
             .expired = try .load(a, fixtures.expired, fixtures.expired_key),
         };
@@ -69,6 +71,7 @@ pub const Env = struct {
         e.anchors.deinit(e.a);
         e.p256.deinit(e.a);
         e.ed25519.deinit(e.a);
+        e.rsa.deinit(e.a);
         e.untrusted.deinit(e.a);
         e.expired.deinit(e.a);
     }
@@ -130,7 +133,7 @@ fn handshake(ccfg: *const ClientConfig, scfg: *const ServerConfig) !struct { c: 
 test "a handshake over each server key completes and carries data both ways" {
     var env = try Env.init(testing.allocator);
     defer env.deinit();
-    for ([_]*const Identity{ &env.p256.identity, &env.ed25519.identity }) |id| {
+    for ([_]*const Identity{ &env.p256.identity, &env.ed25519.identity, &env.rsa.identity }) |id| {
         const ccfg = env.trust("localhost");
         const scfg: ServerConfig = .{ .identity = id };
         var pair = try handshake(&ccfg, &scfg);
@@ -333,4 +336,44 @@ test "large writes span records and byte-at-a-time delivery reassembles them" {
     try c.writeApp(big);
     try pump(&c, &s);
     try testing.expectEqualSlices(u8, big, s.appData());
+}
+
+test "an RSA server signs with the first RSA-PSS hash the client accepts" {
+    var env = try Env.init(testing.allocator);
+    defer env.deinit();
+    const S = session.SignatureScheme;
+    const cases = [_]struct { offered: []const u16, chosen: u16 }{
+        .{ .offered = &.{ S.ecdsa_secp256r1_sha256, S.rsa_pss_rsae_sha512, S.rsa_pss_rsae_sha256 }, .chosen = S.rsa_pss_rsae_sha256 },
+        .{ .offered = &.{ S.rsa_pss_rsae_sha384, S.rsa_pkcs1_sha256 }, .chosen = S.rsa_pss_rsae_sha384 },
+        .{ .offered = &.{ S.rsa_pkcs1_sha256, S.rsa_pss_rsae_sha512 }, .chosen = S.rsa_pss_rsae_sha512 },
+    };
+    for (cases) |cs| {
+        var ccfg = env.trust("localhost");
+        ccfg.signature_schemes = cs.offered;
+        const scfg: ServerConfig = .{ .identity = &env.rsa.identity };
+        var pair = try handshake(&ccfg, &scfg);
+        defer pair.c.deinit();
+        defer pair.s.deinit();
+        try testing.expect(pair.c.handshakeDone());
+        try testing.expectEqual(cs.chosen, pair.s.selected_scheme);
+        try exchange(&pair.c, &pair.s);
+    }
+}
+
+test "an RSA server refuses a client that takes no RSA-PSS scheme" {
+    var env = try Env.init(testing.allocator);
+    defer env.deinit();
+    const S = session.SignatureScheme;
+    var ccfg = env.trust("localhost");
+    // PKCS#1 v1.5 and RSASSA-PSS with a PSS-only key cannot sign a TLS 1.3
+    // CertificateVerify with an rsaEncryption key.
+    ccfg.signature_schemes = &.{ S.rsa_pkcs1_sha256, S.rsa_pss_pss_sha256, S.ecdsa_secp256r1_sha256 };
+    const scfg: ServerConfig = .{ .identity = &env.rsa.identity };
+    var pair = try handshake(&ccfg, &scfg);
+    defer pair.c.deinit();
+    defer pair.s.deinit();
+    const f = pair.s.failure().?;
+    try testing.expectEqual(AlertDescription.handshake_failure, f.alert);
+    try testing.expectEqualStrings("the client does not accept our certificate's signature scheme", f.reason);
+    try testing.expect(pair.c.failure() != null);
 }

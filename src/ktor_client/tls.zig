@@ -17,6 +17,7 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 const ktor_tls = @import("ktor_tls");
 const net = @import("net.zig");
+const sync = @import("sync.zig");
 
 const CallCtx = runtime.CallCtx;
 const EvalResult = runtime.EvalResult;
@@ -48,22 +49,7 @@ pub fn register(b: *HostBindings) Allocator.Error!void {
 
 // ---- handles ----------------------------------------------------------------
 
-/// A blocking mutex. Waiting for it counts as blocking for the collector, so
-/// a collection never waits on a thread parked here.
-pub const Mutex = struct {
-    m: std.c.pthread_mutex_t = .{},
-
-    pub fn lock(self: *Mutex) void {
-        if (std.c.pthread_mutex_trylock(&self.m) == .SUCCESS) return;
-        runtime.gc.enterBlockingSafe();
-        _ = std.c.pthread_mutex_lock(&self.m);
-        runtime.gc.exitBlockingSafe();
-    }
-
-    pub fn unlock(self: *Mutex) void {
-        _ = std.c.pthread_mutex_unlock(&self.m);
-    }
-};
+const Mutex = sync.Mutex;
 
 /// A server identity, shared by every connection of one connector.
 const Identity = struct {
@@ -143,13 +129,18 @@ fn setLastError(comptime fmt: []const u8, args: anytype) void {
 
 // ---- the platform ---------------------------------------------------------
 
-/// Fresh OS randomness for a session's generator.
-fn osSeed() [32]u8 {
+/// Fresh OS randomness for a session's generator. Null, with the reason
+/// recorded, when the system's secure source fails: a session never runs on
+/// a weaker one.
+fn osSeed() ?[32]u8 {
     var seed: [32]u8 = undefined;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    io.randomSecure(&seed) catch io.random(&seed);
+    io.randomSecure(&seed) catch {
+        setLastError("the system's secure random source is not available", .{});
+        return null;
+    };
     return seed;
 }
 
@@ -157,11 +148,14 @@ fn nowSec() i64 {
     return @divFloor(runtime.clockWallMillis(), 1000);
 }
 
-/// The operating system's trusted roots, loaded once.
+/// The operating system's trusted roots, loaded once: the keychains on
+/// macOS, the distribution's CA bundle on Linux, the ROOT system store on
+/// Windows (`Bundle.rescan`).
 const System = struct {
     var mutex: Mutex = .{};
     var loaded = false;
     var bundle: Bundle = .empty;
+    var failure: ?anyerror = null;
 
     fn anchors() *const Bundle {
         mutex.lock();
@@ -171,12 +165,25 @@ const System = struct {
             var threaded: std.Io.Threaded = .init(gpa, .{});
             defer threaded.deinit();
             const io = threaded.io();
-            bundle.rescan(gpa, io, std.Io.Timestamp.now(io, .real)) catch {
+            bundle.rescan(gpa, io, std.Io.Timestamp.now(io, .real)) catch |err| {
+                failure = err;
                 bundle.deinit(gpa);
                 bundle = .empty;
             };
         }
         return &bundle;
+    }
+
+    /// Records why the system store holds no trusted root. False when it
+    /// holds some.
+    fn explainEmpty(b: *const Bundle) bool {
+        if (b.map.count() > 0) return false;
+        if (failure) |err| {
+            setLastError("the system's trusted certificates could not be read ({s}); pass trusted certificates or install the system's CA certificates", .{@errorName(err)});
+        } else {
+            setLastError("the system has no trusted certificates; pass trusted certificates or install the system's CA certificates", .{});
+        }
+        return true;
     }
 };
 
@@ -275,15 +282,19 @@ fn nClient(ctx: *CallCtx) Allocator.Error!EvalResult {
             return net.int(0);
         }
     }
+    const system_anchors = if (system_trust and !insecure) System.anchors() else null;
+    // Trusting only an empty system store would refuse every server.
+    if (!insecure and e.anchors == null) if (system_anchors) |b| if (System.explainEmpty(b)) return net.int(0);
     e.client_config = .{
         .server_name = e.server_name,
         .verification = if (insecure) .insecure_accept_any else .{ .trust = .{
             .anchors = e.anchors,
-            .system_anchors = if (system_trust) System.anchors() else null,
+            .system_anchors = system_anchors,
             .now_sec = now,
         } },
     };
-    e.session = try Session.initClient(gpa, &e.client_config, osSeed());
+    const seed = osSeed() orelse return net.int(0);
+    e.session = try Session.initClient(gpa, &e.client_config, seed);
     if (e.session.failure()) |f| {
         setLastError("{s}", .{f.reason});
         e.session.deinit();
@@ -327,19 +338,31 @@ fn nIdentity(ctx: *CallCtx) Allocator.Error!EvalResult {
         setLastError("the first certificate of the chain cannot be parsed", .{});
         return net.int(0);
     };
-    const key = ktor_tls.pem.privateKey(gpa, key_pem) catch |err| {
+    var key = ktor_tls.pem.privateKey(gpa, key_pem) catch |err| {
         switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.EncryptedPrivateKey => setLastError("encrypted private keys are not supported; decrypt it first", .{}),
-            error.UnsupportedPrivateKey => setLastError("the private key must be a P-256 ECDSA or Ed25519 key", .{}),
+            error.UnsupportedPrivateKey => setLastError("the private key must be a P-256 ECDSA, Ed25519 or RSA key", .{}),
+            error.UnsupportedRsaKey => setLastError("the RSA key must have a 2048- to 4096-bit modulus, an odd public exponent from 3 to 2^32 - 1 and two primes", .{}),
             error.MissingPrivateKey => setLastError("no private key found in the key PEM", .{}),
             else => setLastError("the private key is not valid", .{}),
         }
         return net.int(0);
     };
+    // The identity keeps its own copy; this one is cleared on every path.
+    defer ktor_tls.pem.wipe(&key);
     if (!ktor_tls.pem.keyMatches(&key, &leaf)) {
         setLastError("the private key does not match the certificate", .{});
         return net.int(0);
+    }
+    if (key == .rsa) {
+        // The modulus and exponent match the certificate; one signature,
+        // checked with the public exponent, shows the private exponent does.
+        var sig: [ktor_tls.rsa.max_bytes]u8 = undefined;
+        _ = key.rsa.signPss(.sha256, "klio identity check", &([_]u8{0} ** 32), &sig) catch {
+            setLastError("the RSA private exponent does not belong to the certificate's key", .{});
+            return net.int(0);
+        };
     }
     const id = try gpa.create(Identity);
     id.* = .{ .chain = chain, .identity = .{ .chain = chain, .key = key } };
@@ -348,6 +371,7 @@ fn nIdentity(ctx: *CallCtx) Allocator.Error!EvalResult {
     const handle = table.next;
     table.next += 1;
     table.identities.put(gpa, handle, id) catch |err| {
+        std.crypto.secureZero(u8, std.mem.asBytes(&id.identity.key));
         gpa.destroy(id);
         return err;
     };
@@ -381,13 +405,17 @@ fn nServer(ctx: *CallCtx) Allocator.Error!EvalResult {
         _ = found.refs.fetchAdd(1, .acq_rel);
         break :blk found;
     };
+    const seed = osSeed() orelse {
+        id.release();
+        return net.int(0);
+    };
     const e = gpa.create(Entry) catch |err| {
         id.release();
         return err;
     };
     e.* = .{ .identity = id };
     e.server_config = .{ .identity = &id.identity };
-    e.session = Session.initServer(gpa, &e.server_config, osSeed());
+    e.session = Session.initServer(gpa, &e.server_config, seed);
     const sid = putSession(e) catch |err| {
         e.destroy();
         return err;
@@ -650,6 +678,45 @@ test "identities refuse a key that does not match or is unsupported" {
     try testing.expectEqual(@as(i64, 0), (try call(nIdentity, &.{ chain, rsa })).asI64().?);
 }
 
+test "an RSA identity serves a handshake, and RSA keys that cannot serve say why" {
+    const fixtures = @import("tls_fixtures");
+    const chain = try str(fixtures.server_rsa);
+    defer chain.release(testing.allocator);
+    for ([_][]const u8{ fixtures.server_rsa_key, fixtures.server_rsa_key_pkcs1 }) |key_pem| {
+        const key = try str(key_pem);
+        defer key.release(testing.allocator);
+        const ident = (try call(nIdentity, &.{ chain, key })).asI64().?;
+        try testing.expect(ident > 0);
+        defer _ = call(nIdentityFree, &.{Value.newInt(ident)}) catch {};
+        const host = try str("localhost");
+        defer host.release(testing.allocator);
+        const ca = try str(fixtures.ca);
+        defer ca.release(testing.allocator);
+        const c = (try call(nClient, &.{ host, ca, .{ .Bool = false }, .{ .Bool = false } })).asI64().?;
+        defer _ = call(nFree, &.{Value.newInt(c)}) catch {};
+        const s = (try call(nServer, &.{Value.newInt(ident)})).asI64().?;
+        defer _ = call(nFree, &.{Value.newInt(s)}) catch {};
+        while (try relay(c, s) or try relay(s, c)) {}
+        try testing.expect((try call(nState, &.{Value.newInt(c)})).asI64().? & state_handshake_done != 0);
+    }
+    const cases = [_]struct { key: []const u8, message: []const u8 }{
+        .{ .key = fixtures.rsa3072_key, .message = "the private key does not match the certificate" },
+        .{ .key = fixtures.rsa1024_key, .message = "the RSA key must have a 2048- to 4096-bit modulus, an odd public exponent from 3 to 2^32 - 1 and two primes" },
+        .{ .key = fixtures.rsa_even_e_key, .message = "the RSA key must have a 2048- to 4096-bit modulus, an odd public exponent from 3 to 2^32 - 1 and two primes" },
+        .{ .key = fixtures.rsa_wrong_d_key, .message = "the RSA private exponent does not belong to the certificate's key" },
+    };
+    for (cases) |cs| {
+        const key = try str(cs.key);
+        defer key.release(testing.allocator);
+        try testing.expectEqual(@as(i64, 0), (try call(nIdentity, &.{ chain, key })).asI64().?);
+        const msg = try call(nLastError, &.{});
+        defer msg.release(testing.allocator);
+        const g = msg.String.borrow();
+        defer g.deinit();
+        try testing.expectEqualStrings(cs.message, g.get().bytes);
+    }
+}
+
 test "a client without a server name cannot verify, and unknown handles are refused" {
     const ca = try str(@import("tls_fixtures").ca);
     defer ca.release(testing.allocator);
@@ -659,4 +726,27 @@ test "a client without a server name cannot verify, and unknown handles are refu
     try testing.expectEqual(@as(i64, -1), (try call(nFeed, &.{ Value.newInt(987654), empty, Value.newInt(0), Value.newInt(0) })).asI64().?);
     try testing.expect((try call(nTakeOutput, &.{Value.newInt(987654)})) == .Null);
     _ = try call(nFree, &.{Value.newInt(987654)});
+}
+
+test "the system's trusted roots load on this platform" {
+    // macOS reads the keychains, Linux the distribution's CA bundle, Windows
+    // the ROOT system store; each ships roots on a stock install.
+    const b = System.anchors();
+    try testing.expect(b.map.count() > 0);
+    try testing.expect(!System.explainEmpty(b));
+}
+
+test "trusting only an empty system store is refused with the reason" {
+    var empty: Bundle = .empty;
+    const saved = System.failure;
+    defer System.failure = saved;
+    System.failure = error.FileNotFound;
+    try testing.expect(System.explainEmpty(&empty));
+    try testing.expectEqualStrings(
+        "the system's trusted certificates could not be read (FileNotFound); pass trusted certificates or install the system's CA certificates",
+        last_error_buf[0..last_error_len],
+    );
+    System.failure = null;
+    try testing.expect(System.explainEmpty(&empty));
+    try testing.expect(std.mem.startsWith(u8, last_error_buf[0..last_error_len], "the system has no trusted certificates"));
 }

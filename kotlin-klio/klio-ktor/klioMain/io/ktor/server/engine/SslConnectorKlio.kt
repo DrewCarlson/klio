@@ -10,8 +10,8 @@ package io.ktor.server.engine
 
 /**
  * An HTTPS connector: the server's certificate chain (its own certificate
- * first) and its private key, both PEM. The key is a P-256 ECDSA or Ed25519
- * key, unencrypted.
+ * first) and its private key, both PEM. The key is a P-256 ECDSA, Ed25519
+ * or RSA (2048 to 4096 bits) key, unencrypted.
  */
 public interface EngineSSLConnectorConfig : EngineConnectorConfig {
     /** The PEM certificate chain, the server's certificate first. */

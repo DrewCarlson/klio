@@ -169,6 +169,13 @@ pub const default_suites = [_]Suite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha
 pub const default_groups = [_]Group{ .x25519, .secp256r1, .secp384r1 };
 pub const default_key_share_groups = [_]Group{.x25519};
 
+/// The schemes an RSA server key signs with, in the server's preference.
+const rsa_pss_schemes = [_]u16{
+    SignatureScheme.rsa_pss_rsae_sha256,
+    SignatureScheme.rsa_pss_rsae_sha384,
+    SignatureScheme.rsa_pss_rsae_sha512,
+};
+
 /// The signature schemes a client offers. The PKCS#1 ones cover certificate
 /// signatures only; a CertificateVerify signed with one is refused.
 pub const default_signature_schemes = [_]u16{
@@ -1834,6 +1841,10 @@ pub const Session = struct {
         const want: u16 = if (cfg.hooks.signature) |sig| sig.scheme else switch (cfg.identity.key) {
             .p256 => SignatureScheme.ecdsa_secp256r1_sha256,
             .ed25519 => SignatureScheme.ed25519,
+            // RSA-PSS over the first of SHA-256, -384, -512 the client takes.
+            .rsa => for (rsa_pss_schemes) |scheme| {
+                if (listHasU16(schemes.buf, scheme)) break scheme;
+            } else SignatureScheme.rsa_pss_rsae_sha256,
         };
         if (!listHasU16(schemes.buf, want)) return s.fail(.handshake_failure, "the client does not accept our certificate's signature scheme");
         s.selected_scheme = want;
@@ -2051,6 +2062,17 @@ pub const Session = struct {
                 @memcpy(buf[0..bytes.len], &bytes);
                 return buf[0..bytes.len];
             },
+            .rsa => |*kp| {
+                const hash: pem.rsa.Hash, const salt_len: usize = switch (s.selected_scheme) {
+                    SignatureScheme.rsa_pss_rsae_sha256 => .{ .sha256, 32 },
+                    SignatureScheme.rsa_pss_rsae_sha384 => .{ .sha384, 48 },
+                    SignatureScheme.rsa_pss_rsae_sha512 => .{ .sha512, 64 },
+                    else => return s.fail(.internal_error, "no RSA-PSS scheme selected"),
+                };
+                var salt: [64]u8 = undefined;
+                s.randomBytes(salt[0..salt_len]);
+                return kp.signPss(hash, content, salt[0..salt_len], buf) catch s.fail(.internal_error, "signing failed");
+            },
         }
     }
 };
@@ -2183,22 +2205,16 @@ fn verifyEcdsa12(comptime Curve: type, scheme: u16, key: []const u8, sig: []cons
 }
 
 fn verifyPss(scheme: u16, key: []const u8, sig: []const u8, msg: []const u8) SignatureError!void {
-    const rsa = Certificate.rsa;
     if (!rsaKeyShape(key)) return error.BadSignature;
-    const parts = rsa.PublicKey.parseDer(key) catch return error.BadSignature;
-    switch (parts.modulus.len) {
-        inline 128, 256, 384, 512 => |n| {
-            if (sig.len != n) return error.BadSignature;
-            const pk = rsa.PublicKey.fromBytes(parts.exponent, parts.modulus) catch return error.BadSignature;
-            const s = rsa.PSSSignature.fromBytes(n, sig);
-            switch (scheme) {
-                SignatureScheme.rsa_pss_rsae_sha256, SignatureScheme.rsa_pss_pss_sha256 => rsa.PSSSignature.verify(n, s, msg, pk, crypto.hash.sha2.Sha256) catch return error.BadSignature,
-                SignatureScheme.rsa_pss_rsae_sha384, SignatureScheme.rsa_pss_pss_sha384 => rsa.PSSSignature.verify(n, s, msg, pk, crypto.hash.sha2.Sha384) catch return error.BadSignature,
-                else => rsa.PSSSignature.verify(n, s, msg, pk, crypto.hash.sha2.Sha512) catch return error.BadSignature,
-            }
-        },
-        else => return error.BadSignature,
-    }
+    const parts = Certificate.rsa.PublicKey.parseDer(key) catch return error.BadSignature;
+    const hash: pem.rsa.Hash = switch (scheme) {
+        SignatureScheme.rsa_pss_rsae_sha256, SignatureScheme.rsa_pss_pss_sha256 => .sha256,
+        SignatureScheme.rsa_pss_rsae_sha384, SignatureScheme.rsa_pss_pss_sha384 => .sha384,
+        else => .sha512,
+    };
+    // klio's verifier takes every modulus length, including those whose
+    // encoded message is a byte shorter than the modulus.
+    pem.rsa.verifyPss(hash, parts.modulus, parts.exponent, sig, msg) catch return error.BadSignature;
 }
 
 /// An RSAPublicKey whose two integers lie inside `key`, the layout std's

@@ -17,7 +17,8 @@ where upstream reaches the platform through cinterop.
   `klioMain/io/ktor/network` that keep upstream's structure and call host
   natives (`src/ktor_client/net.zig`, `__kknet_*`). The selector is
   upstream's nix design (a selection coroutine on `Dispatchers.IO`, a wakeup
-  pipe, MPSC interest and close queues) over `poll` instead of `pselect`.
+  pipe, MPSC interest and close queues) over `poll` instead of `pselect`;
+  on Windows a loopback socket pair and `WSAPoll` (see Portability).
 - **Engines.** ktor-client-cio and ktor-server-cio run verbatim over the
   sockets. `HttpClient()` defaults to CIO. The `Klio` server engine and the
   `KlioClient` client engine stay as names; the server one is the CIO
@@ -39,48 +40,47 @@ where upstream reaches the platform through cinterop.
 | Area | Feature | State |
 | --- | --- | --- |
 | ktor-io, ktor-utils, ktor-http, ktor-http-cio | `io`, `utils`, `http`, `http-cio` | whole modules; census `ktor` 496/496 |
-| ktor-network | `network` | TCP/UDP/Unix over host natives; census `ktor_network` 24/25 |
+| ktor-network | `network` | TCP/UDP/Unix over host natives (BSD sockets or Winsock); census `ktor_network` 25/25 |
 | ktor-network-tls | `network-tls` | TLS 1.3 sessions over `src/ktor_tls`, client and server |
 | ktor-client-core + mock | `client-core`, `client-mock` | whole module; census `ktor_client_core` 93/93 |
 | ktor-server-core + test host/base | `server-core`, `server-test-host`, `server-test-base` | whole module, multipart receive; census `ktor_server_core` 147/147 |
 | ktor-server-tests | (the plugins it covers) | census `ktor_server_tests` 444 passed, 11 failing, with the JVM compression tests ported |
-| ktor-client-cio | `client-cio` | verbatim; default `HttpClient()` engine, `KlioClient`; HTTPS |
-| ktor-server-cio | `server-cio` | verbatim; census `ktor_server_cio` 4 (the engine suite waits on the pool timer fix) |
+| ktor-client-cio | `client-cio` | verbatim, with its posix loader registering the default `HttpClient()` engine; `KlioClient`; HTTPS |
+| ktor-server-cio | `server-cio` | verbatim; census `ktor_server_cio` floor 4, currently 0 (CIOWebSocketTest's client hits the String::trim sema bug and hangs) |
 | server HTTPS | `server-cio` | `Klio` = the CIO engine plus `sslConnector(chainPem, keyPem)`; calls report `https`; `wss` |
-| server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 275 passed, 22 failing |
+| server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 290 passed, 7 failing |
 | compression | `utils`, `server-compression`, `client-encoding` | gzip and deflate over `src/ktor_client/zlib.zig`; example `ktor_compression` |
 | WebSocket compression | `websockets` | klio port of the JVM permessage-deflate extension; example `ktor_websocket_deflate` |
 | call logging | `server-call-logging` | klio port on `LogLevel` and `klio.logging.MDC`; upstream's JVM CallLoggingTest ported, 20/20 in `ktor_server_plugins` |
-| client plugins | `client-*` | 7 modules verbatim; census `ktor_client_plugins` 122/122 |
-| kotlinx JSON converter | `serialization-kotlinx-json` | census `ktor_serialization` 13 passed, 1 failing |
+| client plugins | `client-*` | 7 modules verbatim; census `ktor_client_plugins` 81 passed, 41 waiting on the test server |
+| kotlinx JSON converter | `serialization-kotlinx-json` | census `ktor_serialization` 14/14 |
 | shared modules | `call-id`, `resources`, `websockets`, `test-base` | census `ktor_shared` 50/50 |
 
 Open failures, each with its owner:
-- `ktor_network`: `TCPSocketTest.testAwaitClosedDoesNotDeadLock`. `withTimeout`
-  under `limitedParallelism(1)` never resumes its body (coroutine runtime).
-- `ktor_server_cio`: CIOEngineTest.kt does not finish. A cancelled `delay` or
-  disposed `withTimeout` gate keeps its pool worker pumping until the timer
-  would have fired, so after a few tests the IO pool is out of workers and
-  each server stop waits about 10 s (coroutine runtime; repro
-  `pooldelay.kt`, JVM prompt, klio 10 to 20 s).
-- `ktor_server_plugins`, 22 cases: RateLimitTest x12 (the same pool timers:
-  each request's cancelled refill `delay` holds a worker);
-  ServerSentEventsTest heartbeat x3 (`client.sse` inside `withTimeout` never
-  enters its block); AuthorizeHeaderParserTest x3 (sema: an `assertIs`
-  contract's `T` is not substituted at the call, so the smart cast is
-  `HttpAuthHeader & T`); DependencyInjectionTest
-  x4 (sema: a constructor reference resolves to the `provide(KClass)`
-  member x2, a reified `provideDelegate` is not inferred from the
-  property's type, and the `assertIs` contract).
+- `ktor_server_cio`: CIOWebSocketTest's client never finishes the upgrade
+  handshake: the suite's `parseHeaders` does
+  `line.split(":").map(String::trim)` and `builder.append(name, value)`,
+  the sema census site WebSocketEngineSuite.kt:815 (`String::trim` binds
+  CharSequence.trim, so `append` has no call record and lowers broken). The
+  client never closes its socket, the server rightly waits, and the test
+  hangs after its timeout. The census compiles CIOWebSocketTest.kt into
+  every job, so all three files hang. Fixed on the sema branch, not yet
+  merged.
+- `ktor_server_plugins`, 7 cases: AuthorizeHeaderParserTest x3 (sema: an
+  `assertIs` contract's `T` is not substituted at the call, so the smart
+  cast is `HttpAuthHeader & T`); DependencyInjectionTest x4 (sema: a
+  constructor reference resolves to the `provide(KClass)` member x2, a
+  reified `provideDelegate` is not inferred from the property's type, and
+  the `assertIs` contract). Fixed on the sema branch, not yet merged.
+- `ktor_client_plugins`, 41 cases: AuthTest x29, ContentEncodingTest x5 and
+  WebSocketRemoteTest x7 send requests through every registered engine to
+  ktor's test server at 127.0.0.1:8080, which nothing starts yet. They ran
+  against no engine at all until `@EagerInitialization` registered CIO.
 - `ktor_server_tests`, 11 cases: HSTSTest x8 (sema: a lambda typed from the
   other side of `?:` loses a nested `run` receiver, so HSTS's default
   filter has no body and every call hangs to runTest's timeout);
   SessionTest x3 (sema: a reified type argument inferred from a sibling
-  argument is `Any`).
-- `ktor_serialization`: `testRegisterCustomFlow`. The JSON extension that
-  streams a `Flow` registers through an `@EagerInitialization` property,
-  which klio does not run (reported; the runtime fix would also retire the
-  engine-loader actual).
+  argument is `Any`). Both fixed on the sema branch, not yet merged.
 
 Not run from upstream: the suites that need ktor's JVM test server
 (ktor-client-cio, ktor-client-bom-remover, ktor-client-tests); the ones
@@ -102,10 +102,13 @@ klio runs.
    reporting the `https` scheme.
 2. ktor-server-tests' commonTest (405), and klio ports of its JVM
    CompressionTest and CompressionAcceptEncodingTest.
-3. When the coroutine runtime fixes land: raise `ktor_network` to 25/0, set
-   the `ktor_server_cio` ratchet from CIOEngineTest.kt, and recount the
-   RateLimit and SSE cases.
-4. Static content (`staticFiles`, `staticResources`, pre-compressed files)
+3. Run ktor's test server (`ktor-test-server`, a Ktor application) under
+   klio for the client suites: the 41 client plugin cases above, then
+   ktor-client-tests and ktor-client-cio's own suite.
+4. When the sema fixes land: set the `ktor_server_cio` ratchet from
+   CIOWebSocketTest.kt and CIOEngineTest.kt, and recount the HSTS, Session,
+   AuthorizeHeaderParser and DI cases.
+5. Static content (`staticFiles`, `staticResources`, pre-compressed files)
    over kotlinx-io files instead of java.io.File.
 
 ## Decisions
@@ -146,8 +149,9 @@ klio runs.
   because klio's kotlinx.coroutines has no `newSingleThreadContext`).
   `server-call-id` requires `server-call-logging`, mirroring the JVM
   module's dependency for `callIdMdc`.
-- `@EagerInitialization` is not supported, so the posix engine loader hook
-  (`engines.append(CIO)`) never runs; the default engine is a klio actual.
+- `HttpClient()` is upstream's posix actual: ktor-client-cio's
+  `Loader.posix.kt` adds CIO to the `engines` list through
+  `@EagerInitialization`, which klio runs before `main`.
 - `Dispatchers.IO` is a member of klio's `Dispatchers` (as on the JVM), so
   upstream's `import kotlinx.coroutines.IO` in ktor-io's posix
   `IODispatcher.posix.kt` does not resolve; klio's actual returns
@@ -237,12 +241,139 @@ against JDK 21.0.11 HttpsServer forced to TLSv1.2 with RSA-2048 and P-256
 identities (TLS_ECDHE_{RSA,ECDSA}_WITH_AES_256_GCM_SHA384 as the JDK chose),
 GET and a 100 KB POST.
 
-Limits: the server is TLS 1.3 only; ECDSA-P256 and Ed25519 server keys; no
-client certificates; no 0-RTT, session tickets or resumption; no TLS 1.2
-renegotiation, CBC or RSA key-transport suites.
+RSA server keys (`rsa.zig`), as approved: PKCS#8 rsaEncryption or PKCS#1
+keys, parsed as strict DER (minimal lengths and integers, version 0 only,
+nothing trailing), with a 2048- to 4096-bit modulus, any odd e with
+3 <= e < 2^32, and 0 < d < n. The TLS 1.3 server signs CertificateVerify
+with rsa_pss_rsae_sha256, or _sha384 or _sha512 when the client takes only
+those, and refuses a client that takes no RSA-PSS scheme with
+handshake_failure. The private operation is `m^d mod n` with std.crypto.ff's
+`powWithEncodedExponent` (constant time in d, which is padded to the modulus
+length), without the CRT; EMSA-PSS-ENCODE (the one construction written
+here) uses a salt of the hash's length from the session's generator; every
+signature is checked with `s^e mod n` before it is sent, and an identity is
+refused at load if its private exponent fails that check. The key is wiped
+with the identity, and the loading copy on every path; PEM buffers are
+cleared before they are freed. The client verifies RSA-PSS with `rsa.zig`'s
+own EMSA-PSS-VERIFY, which takes every modulus length: std's verifier
+asserts when the encoded message is a byte shorter than the modulus (a
+3065- or 4089-bit key crashed the client). An adversarial review found
+that, three untested constraints and the wiping gaps; all are fixed.
+Tests: signatures by 2048-, 2049-, 2050-, 3072- and 4096-bit fixtures for
+each hash, verified by this verifier and by std's where it applies; known
+answers with a pinned salt computed by `rsa-pss-kat.py` with Python
+integers and verified by OpenSSL 3.6, for 2048 bits, 2049 (the encoded
+message a byte shorter) and 2050 (seven cleared bits); a flipped bit of d
+caught before sending, and an identity with the wrong d refused; d's
+padding; each refusal (sizes, exponents, d, multi-prime, non-minimal DER,
+PKCS#8 parameters and trailing elements, encrypted traditional keys);
+handshakes with each hash choice and the refusal; std.crypto.tls.Client
+verifying an RSA server in process and in the `ktor_https` itest; RSA keys
+in the PEM corruption fuzzing, whose surviving signatures must verify.
 
-Follow-ups: RSA-PSS server keys (RSA signing over std.crypto.ff); the Kotlin
-side could drop its handle table for a NativeBox on the socket wrapper.
+RSA manual interop, 2026-09-26, macOS, `Klio` with RSA-2048 (PKCS#8 and
+PKCS#1 keys) and RSA-4096 connectors: OpenSSL 3.6.3 `s_client` verifies all
+three with each of rsa_pss_rsae_sha256, _sha384 and _sha512 (peer signature
+type rsa_pss_rsae_*) and gets handshake_failure offering only
+rsa_pkcs1_sha256; curl 8.7.1 (SecureTransport) and JDK 21.0.11 HttpClient
+(GET and a 200 KB POST) against the 2048- and 4096-bit connectors.
+
+Limits: the server is TLS 1.3 only; ECDSA-P256, Ed25519 and RSA (PSS)
+server keys; no client certificates; no 0-RTT, session tickets or
+resumption; no TLS 1.2 renegotiation, CBC or RSA key-transport suites.
+
+Follow-ups: the Kotlin side could drop its handle table for a NativeBox on
+the socket wrapper.
+
+## Portability
+
+The pack must run on macOS, Linux and Windows. Its Kotlin is the same on
+all three; the natives carry the differences:
+- `src/ktor_client/sock.zig`: the socket layer under `net.zig`, BSD
+  sockets and `poll` on POSIX systems and Winsock 2 on Windows, with POSIX
+  meaning everywhere. Windows specifics: WSAStartup on first use; the
+  descriptor is the SOCKET handle, made non-inheritable (handles fit in 32
+  bits; one that did not would be refused, not truncated);
+  `winsock.zig` maps each Winsock error to the C runtime's errno value
+  under its POSIX name, so `PosixException` subtypes match, and keeps a
+  code without a counterpart as itself (all of them are 10000 or more);
+  a started non-blocking connect reads as EINPROGRESS; the selector waits
+  in `WSAPoll` and wakes through a loopback socket pair whose accepted end
+  is checked to be the one connected; a closed socket in a wait is reported
+  on its own entry (NVAL), as `poll` does; datagram sockets turn off
+  SIO_UDP_CONNRESET and a datagram longer than the buffer is cut to it;
+  `reuseAddress` is not set (its POSIX meaning is Windows' default, and
+  Windows' SO_REUSEADDR allows taking over a port in use); `reusePort`
+  fails with ENOPROTOOPT; there is no SIGPIPE. AF_UNIX works where
+  Windows has it (10 1803 and later, stream only) and otherwise fails with
+  EAFNOSUPPORT.
+- `sync.zig`: pthread mutexes and conditions, or SRW locks and condition
+  variables. `env.zig`: the C environment, or the Win32 environment (per-drive
+  `=C:` entries are left out of `environ`) and a direct stderr handle.
+- Trusted roots: `Bundle.rescan` reads the System and System Roots
+  keychains on macOS, the first CA bundle found on Linux
+  (`/etc/ssl/certs/ca-certificates.crt`, the Fedora, OpenSUSE and Alpine
+  paths, then the certificate directories), and the ROOT system store on
+  Windows. A client trusting only the system roots is refused with a
+  message when the store could not be read or is empty. Not covered: macOS
+  trust settings (admin-distrusted roots, roots only in a login keychain)
+  and Windows roots the system has not downloaded yet.
+- A TLS session is refused if the system's secure random source fails,
+  rather than seeded from a weaker one.
+
+Verified, 2026-09-26:
+- macOS (arm64): the unit tests of `ktor_client` (with the socket layer's
+  own) and `ktor_tls`, every ktor census, the ktor itests and examples.
+- Linux, aarch64 Ubuntu 24.04 in Docker with Zig 0.16.0: `zig build`, the
+  harness, the same unit tests, the packs, every ktor census with the same
+  counts as macOS (ktor 496, ktor_network 25, ktor_client_core 93,
+  ktor_server_core 147, ktor_server_tests 444/11, ktor_server_plugins
+  290/7, ktor_client_plugins 81/41, ktor_serialization 14, ktor_shared 50;
+  ktor_server_cio hangs on both, as recorded above), the five ktor itests
+  and the fourteen ktor examples (how, below).
+- Windows: `zig build -Dtarget=x86_64-windows-gnu` reports no errors in the
+  ktor files (the ones left are the runtime's and the cli's, owned
+  elsewhere). The socket layer, locks, environment and Winsock mapping
+  build and link for x86_64 and aarch64 Windows as standalone test
+  binaries (with a stub for the runtime's collector hooks), and ktor_tls's
+  tests do too. Under Wine 9 (x86_64 Ubuntu 24.04, emulated in Docker;
+  wineboot does not finish under that emulation, so the prefix's system32
+  is filled with Wine's builtin DLLs, and the test binaries are built
+  without libc because the prefix lacks the UCRT API sets) the Winsock
+  mapping tests, the environment test and all six socket-layer tests pass
+  against Wine's Winsock: a loopback stream with EAGAIN, a refused
+  non-blocking connect (EINPROGRESS, then ECONNREFUSED from SO_ERROR after
+  WSAPoll), the wakeup pair with NVAL after close, a closed socket's error,
+  name resolution and the refusals. Not verified on Windows: anything that
+  starts a thread (Wine crashes creating one under that emulation), so the
+  locks, the TLS tests and the system store; and klio itself, which does
+  not build for Windows until the runtime does.
+
+Linux, how: an image from
+
+```
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl xz-utils python3 rsync git
+RUN curl -fsSL https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz \
+    && mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+ENV PATH=/opt/zig:$PATH
+```
+
+run with the checkout mounted read-only at its own path (so the source
+checkouts' absolute symlinks resolve) and volumes for the work tree and
+the Zig cache: `docker run --rm --platform linux/arm64 -v $REPO:$REPO:ro
+-v klio-ktor-work:/work -v klio-ktor-zigcache:/root/.cache/zig IMAGE bash
+inside.sh`. `inside.sh` rsyncs the worktree to `/work/klio` (without
+`.git`, `zig-out`, `.zig-cache`, `.klio-local`, `target`), runs `zig build`
+and `zig build klio-harness klio-census`, `scripts/zigcheck.py ktor_tls` and
+`ktor_client`, installs the packs with
+`PACK_FILTER=klio-kotlin-test,klio-kotlinx-,klio-ktor
+scripts/install-local-packs.sh`, then `klio-census` for each ktor suite,
+`scripts/zigcheck.py itests --root src/itests/ktor_*.zig`, and each
+`examples/ktor_*.kt` against its expected output. With Docker's 8 GB VM the
+censuses run two jobs at a time (KLIO_ITEST_JOBS=2); four at once, or a
+ReleaseSafe harness build beside other containers, runs out of memory.
 
 ## Out of scope for now
 

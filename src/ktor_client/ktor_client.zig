@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 pub const net = @import("net.zig");
 pub const tls = @import("tls.zig");
 pub const zlib = @import("zlib.zig");
+const env = @import("env.zig");
 
 pub fn hostBindings(allocator: Allocator) Allocator.Error!HostBindings {
     var b = HostBindings.init(allocator);
@@ -48,40 +49,28 @@ fn get_time_millis(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .Long = runtime.clockWallMillis() } };
 }
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
 /// The process environment is one table per process; these calls take turns.
 var env_lock: runtime.SpinMutex = .{};
-
-fn argStringZ(ctx: *const CallCtx, idx: usize) Allocator.Error!ArgResult([:0]u8) {
-    const s = switch (try arg_string(ctx.allocator, ctx, idx)) {
-        .ok => |v| v,
-        .err => |e| return .{ .err = e },
-    };
-    defer ctx.allocator.free(s);
-    return .{ .ok = try ctx.allocator.dupeZ(u8, s) };
-}
 
 /// `io.ktor.util.__kktor_getenv(name)`: the process environment variable, or
 /// null when unset: the posix `getenv` ktor's native logger and server
 /// environment read.
 fn getenv(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
-    const name = switch (try argStringZ(ctx, 0)) {
+    const name = switch (try arg_string(a, ctx, 0)) {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
     };
     defer a.free(name);
     // Copied out under the lock and turned into a String after it, so no
     // interpreter allocation runs while another thread may spin on it.
+    const ca = std.heap.c_allocator;
     const copy = blk: {
         env_lock.lock();
         defer env_lock.unlock();
-        const value = std.c.getenv(name.ptr) orelse return .{ .ok = .Null };
-        break :blk try std.heap.c_allocator.dupe(u8, std.mem.span(value));
+        break :blk try env.get(ca, name) orelse return .{ .ok = .Null };
     };
-    defer std.heap.c_allocator.free(copy);
+    defer ca.free(copy);
     return .{ .ok = .{ .String = try runtime.strInit(a, copy) } };
 }
 
@@ -89,33 +78,33 @@ fn getenv(ctx: *CallCtx) Allocator.Error!EvalResult {
 /// overwriting, as ktor's native `setEnvironmentProperty` calls it.
 fn setenvNative(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
-    const name = switch (try argStringZ(ctx, 0)) {
+    const name = switch (try arg_string(a, ctx, 0)) {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
     };
     defer a.free(name);
-    const value = switch (try argStringZ(ctx, 1)) {
+    const value = switch (try arg_string(a, ctx, 1)) {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
     };
     defer a.free(value);
     env_lock.lock();
     defer env_lock.unlock();
-    _ = setenv(name.ptr, value.ptr, 0);
+    try env.setIfAbsent(std.heap.c_allocator, name, value);
     return .{ .ok = .Unit };
 }
 
 /// `io.ktor.util.__kktor_unsetenv(name)`: posix `unsetenv`.
 fn unsetenvNative(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
-    const name = switch (try argStringZ(ctx, 0)) {
+    const name = switch (try arg_string(a, ctx, 0)) {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
     };
     defer a.free(name);
     env_lock.lock();
     defer env_lock.unlock();
-    _ = unsetenv(name.ptr);
+    try env.unset(std.heap.c_allocator, name);
     return .{ .ok = .Unit };
 }
 
@@ -132,10 +121,7 @@ fn environNative(ctx: *CallCtx) Allocator.Error!EvalResult {
     {
         env_lock.lock();
         defer env_lock.unlock();
-        var i: usize = 0;
-        while (std.c.environ[i]) |entry| : (i += 1) {
-            try entries.append(ca, try ca.dupe(u8, std.mem.span(entry)));
-        }
+        try env.entries(ca, &entries);
     }
     var items: std.ArrayList(Value) = .empty;
     for (entries.items) |e| try items.append(a, .{ .String = try runtime.strInit(a, e) });
@@ -157,12 +143,7 @@ fn printError(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer a.free(msg);
-    var off: usize = 0;
-    while (off < msg.len) {
-        const rc = std.c.write(2, msg.ptr + off, msg.len - off);
-        if (rc <= 0) break;
-        off += @intCast(rc);
-    }
+    env.writeStderr(msg);
     return .{ .ok = .Unit };
 }
 
@@ -366,6 +347,8 @@ test {
     _ = net;
     _ = tls;
     _ = zlib;
+    _ = env;
+    _ = @import("sync.zig");
 }
 
 fn makeCtx(allocator: Allocator, host: runtime.IntrinsicHost, out: Output, args: []const Value) CallCtx {

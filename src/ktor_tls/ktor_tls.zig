@@ -11,6 +11,7 @@ pub const suites = @import("suites.zig");
 pub const tls12 = @import("tls12.zig");
 pub const x509 = @import("x509.zig");
 pub const pem = @import("pem.zig");
+pub const rsa = pem.rsa;
 pub const session = @import("session.zig");
 
 pub const Session = session.Session;
@@ -23,6 +24,7 @@ pub const Failure = session.Failure;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("rsa.zig");
     _ = @import("tests.zig");
     _ = @import("rfc8448_test.zig");
     _ = @import("alerts_test.zig");

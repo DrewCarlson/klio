@@ -88,15 +88,11 @@ root = "upstream/ktor-http/ktor-http-cio/posix/src"
 root = "upstream/ktor-client/ktor-client-core/nonJvm/src"
 
 # ktor-client-core posix: the `ProxyConfig` actual, the default-transform
-# actuals, the response observer's context and the posix coroutine utils.
-# The engine-less `HttpClient()` is a klio actual (klioMain): upstream's
-# reads the `engines` list that `@EagerInitialization` hooks fill, which klio
-# does not run.
+# actuals, the response observer's context, the posix coroutine utils and the
+# engine-less `HttpClient()`, which takes the first engine in the `engines`
+# list that the engine modules' `@EagerInitialization` hooks fill.
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/posix/src"
-exclude = [
-    "io/ktor/client/HttpClient.kt",
-]
 
 # ktor-client-core jvmAndPosix: `checkContentLength` and the Unix-socket
 # request builders.
@@ -251,14 +247,17 @@ exclude = [
 ]
 
 # ktor-client-cio: the coroutine-based HTTP/1.1 client engine over
-# ktor-network, verbatim. Its posix `Loader.posix.kt` registers the engine
-# through `@EagerInitialization`, which klio does not run; the klio default
-# engine actual binds CIO instead.
+# ktor-network, verbatim. Its posix `Loader.posix.kt` registers CIO in the
+# `engines` list through `@EagerInitialization`, which makes it the engine of
+# `HttpClient()`.
 [[source]]
 root = "upstream/ktor-client/ktor-client-cio/common/src"
 
 [[source]]
 root = "upstream/ktor-client/ktor-client-cio/nonJvm/src"
+
+[[source]]
+root = "upstream/ktor-client/ktor-client-cio/posix/src"
 
 # ktor-server-cio: the coroutine-based HTTP/1.1 server engine over
 # ktor-network, verbatim, with its posix dispatcher bridge.
@@ -469,9 +468,8 @@ root = "upstream/ktor-client/ktor-client-plugins/ktor-client-websockets/common/s
 # klio-authored actuals for every module, placed in their module by package
 # path: `io/ktor/utils/io` (ktor-io: locks, the terminal codecs, the
 # IO dispatcher, the ByteChannel actual), `io/ktor/util` (ktor-utils: crypto,
-# GMTDate, the logger, the pipeline engine), `io/ktor/client` (ktor-client-core:
-# the KlioClientEngine over the host `__kktor_request` transport and the
-# engine-less `HttpClient()`), `io/ktor/server` (ktor-server-core: the engine
+# GMTDate, the logger, the pipeline engine), `io/ktor/client` (the
+# `KlioClient` name for the CIO engine), `io/ktor/server` (ktor-server-core: the engine
 # over `__kktor_serve`, environment / shutdown / application-utils and
 # hostname-escape actuals).
 [[source]]
@@ -624,8 +622,7 @@ requires = ["network"]
 
 # ktor-client-core (`io.ktor.client.*`): the real upstream client (the engine
 # layer + request/statement/call layers + default plugins + `HttpClient`),
-# consumed verbatim, plus klio's engine actual over the host `__kktor_request`
-# transport and the engine-less `HttpClient()` bound to it. Upstream depends
+# consumed verbatim. Upstream depends
 # on ktor-http, ktor-events, ktor-sse, and (through ktor-websocket-serialization)
 # ktor-serialization.
 [features.client-core]
@@ -641,7 +638,6 @@ requires = ["http", "http-cio", "events", "sse", "websocket-serialization"]
 [features.client-cio]
 sources = [
     "upstream/ktor-client/ktor-client-cio/",
-    "klioMain/io/ktor/client/engine/cio/",
     "klioMain/io/ktor/client/engine/klio/",
 ]
 requires = ["client-core", "network-tls"]

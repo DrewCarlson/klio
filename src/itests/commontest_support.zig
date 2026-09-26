@@ -518,10 +518,8 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-network/nix/test/io/ktor/network/sockets/tests/TestUtils.nix.kt",
         },
         .extra_args = &.{ "--feature", "io.ktor/network", "--feature", "io.ktor/test-base" },
-        .baseline = 24,
-        // TCPSocketTest.testAwaitClosedDoesNotDeadLock: `withTimeout` under
-        // `limitedParallelism(1)` never resumes its body (coroutine runtime).
-        .max_failed = 1,
+        .baseline = 25,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
     .{
@@ -613,17 +611,13 @@ pub const suites = [_]Config{
         // A hung case fails on runTest's own 60 s timeout; the child needs
         // the time to report it.
         .timeout_ms = 90_000,
-        // RateLimitTest x12: a cancelled `delay` holds its pool worker until it
-        // would have fired, so requests stall behind the refill timers.
-        // ServerSentEventsTest heartbeat x3: `withTimeout` on a
-        // limitedParallelism(1) dispatcher. AuthorizeHeaderParserTest x3: an
-        // `assertIs` contract is not substituted at the call.
-        // DependencyInjectionTest x4: a constructor reference picks the
-        // `provide(KClass)` member over the function-type overloads (x2), a
-        // reified `provideDelegate` is not inferred from the property type,
-        // and the `assertIs` contract again (sema).
-        .baseline = 275,
-        .max_failed = 22,
+        // AuthorizeHeaderParserTest x3: an `assertIs` contract is not
+        // substituted at the call. DependencyInjectionTest x4: a constructor
+        // reference picks the `provide(KClass)` member over the function-type
+        // overloads (x2), a reified `provideDelegate` is not inferred from the
+        // property type, and the `assertIs` contract again (sema).
+        .baseline = 290,
+        .max_failed = 7,
         .max_incomplete = 0,
     },
     .{
@@ -639,8 +633,14 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-websockets/common/test",
         },
         .extra_args = &.{ "--feature", "io.ktor/client-mock,client-test-base,client-auth,client-call-id,client-content-negotiation,client-encoding,client-resources,client-websockets,client-logging,server-test-host,server-call-id,serialization-kotlinx-json" },
-        .baseline = 122,
-        .max_failed = 0,
+        // AuthTest x29, ContentEncodingTest x5 and WebSocketRemoteTest x7 run
+        // `clientTests` against every registered engine, and those requests
+        // go to ktor's test server at 127.0.0.1:8080, which Gradle starts
+        // for upstream's runs and nothing starts here yet. Before CIO
+        // registered itself through `@EagerInitialization` they ran against
+        // no engine at all.
+        .baseline = 81,
+        .max_failed = 41,
         .max_incomplete = 0,
     },
     .{

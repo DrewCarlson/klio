@@ -100,10 +100,11 @@ test "std.crypto.tls.Client completes a verified handshake with this server" {
     const io = threaded.io();
     var env = try tests.Env.init(a);
     defer env.deinit();
-    // Only the P-256 identity: std's client offers ed25519 but maps no
+    // Not the Ed25519 identity: std's client offers ed25519 but maps no
     // certificate key type to it when checking CertificateVerify, so it
-    // refuses every Ed25519 server with TlsBadSignatureScheme.
-    for ([_]*const session.Identity{&env.p256.identity}) |id| {
+    // refuses every Ed25519 server with TlsBadSignatureScheme. The RSA
+    // identity signs with RSA-PSS, which std's client verifies itself.
+    for ([_]*const session.Identity{ &env.p256.identity, &env.rsa.identity }) |id| {
         const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
         var server = try addr.listen(io, .{ .reuse_address = true });
         defer server.deinit(io);

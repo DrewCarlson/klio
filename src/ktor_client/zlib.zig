@@ -10,7 +10,7 @@ const std = @import("std");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 const net = @import("net.zig");
-const tls = @import("tls.zig");
+const sync = @import("sync.zig");
 
 const CallCtx = runtime.CallCtx;
 const EvalResult = runtime.EvalResult;
@@ -103,8 +103,8 @@ pub const Deflater = struct {
 /// decompressor reads up to four bytes ahead of the symbol it decodes, so the
 /// last few symbols of an input wait for the next input or for `finish`.
 pub const Inflater = struct {
-    m: std.c.pthread_mutex_t = .{},
-    cv: std.c.pthread_cond_t = .{},
+    m: sync.Lock = .{},
+    cv: sync.Cond = .{},
     /// Input not yet read by the decompressor.
     pending: std.ArrayList(u8) = .empty,
     pending_pos: usize = 0,
@@ -148,7 +148,7 @@ pub const Inflater = struct {
     pub fn destroy(inf: *Inflater) void {
         inf.lock();
         inf.cancelled = true;
-        _ = std.c.pthread_cond_broadcast(&inf.cv);
+        inf.cv.broadcast();
         inf.unlock();
         if (inf.thread) |t| t.join();
         inf.pending.deinit(gpa);
@@ -159,18 +159,18 @@ pub const Inflater = struct {
     }
 
     fn lock(inf: *Inflater) void {
-        _ = std.c.pthread_mutex_lock(&inf.m);
+        inf.m.lock();
     }
 
     fn unlock(inf: *Inflater) void {
-        _ = std.c.pthread_mutex_unlock(&inf.m);
+        inf.m.unlock();
     }
 
     /// Waits on the condition from an interpreter thread, which counts as
     /// blocking for the collector.
     fn waitBlocking(inf: *Inflater) void {
         runtime.gc.enterBlockingSafe();
-        _ = std.c.pthread_cond_wait(&inf.cv, &inf.m);
+        inf.cv.wait(&inf.m);
         runtime.gc.exitBlockingSafe();
     }
 
@@ -182,7 +182,7 @@ pub const Inflater = struct {
         try inf.pending.appendSlice(gpa, bytes);
         if (inf.done) return inf.failure == null;
         inf.starved = false;
-        _ = std.c.pthread_cond_broadcast(&inf.cv);
+        inf.cv.broadcast();
         while (!inf.done and !(inf.starved and inf.pending_pos == inf.pending.items.len)) inf.waitBlocking();
         return inf.failure == null;
     }
@@ -193,7 +193,7 @@ pub const Inflater = struct {
         inf.lock();
         defer inf.unlock();
         inf.closed = true;
-        _ = std.c.pthread_cond_broadcast(&inf.cv);
+        inf.cv.broadcast();
         while (!inf.done) inf.waitBlocking();
         return inf.ended and inf.failure == null;
     }
@@ -252,8 +252,8 @@ pub const Inflater = struct {
             // before waiting, so the caller of `input` sees it.
             inf.publishLocked() catch return error.ReadFailed;
             inf.starved = true;
-            _ = std.c.pthread_cond_broadcast(&inf.cv);
-            _ = std.c.pthread_cond_wait(&inf.cv, &inf.m);
+            inf.cv.broadcast();
+            inf.cv.wait(&inf.m);
         }
         if (inf.cancelled) return error.ReadFailed;
         inf.starved = false;
@@ -303,7 +303,7 @@ pub const Inflater = struct {
         inf.ended = ended and failure == null;
         inf.failure = if (inf.cancelled) null else failure;
         inf.done = true;
-        _ = std.c.pthread_cond_broadcast(&inf.cv);
+        inf.cv.broadcast();
     }
 
     /// Keeps the last window of output, the history later matches read,
@@ -345,7 +345,7 @@ const Stream = union(enum) {
 };
 
 const Table = struct {
-    mutex: tls.Mutex = .{},
+    mutex: sync.Mutex = .{},
     streams: std.AutoHashMapUnmanaged(u64, Stream) = .empty,
     next: u64 = 1,
 };

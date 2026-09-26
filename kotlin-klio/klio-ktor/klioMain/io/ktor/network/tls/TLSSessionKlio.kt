@@ -36,9 +36,10 @@ internal actual suspend fun openTLSSession(
 
 /**
  * A server's certificate chain and private key, from PEM. The key is a P-256
- * ECDSA or Ed25519 key, unencrypted, as PKCS#8 (`BEGIN PRIVATE KEY`) or, for
- * P-256, SEC 1 (`BEGIN EC PRIVATE KEY`); the chain lists the server's
- * certificate first.
+ * ECDSA, Ed25519 or RSA (2048 to 4096 bits) key, unencrypted, as PKCS#8
+ * (`BEGIN PRIVATE KEY`), SEC 1 for P-256 (`BEGIN EC PRIVATE KEY`) or PKCS#1
+ * for RSA (`BEGIN RSA PRIVATE KEY`); the chain lists the server's
+ * certificate first. An RSA key signs the handshake with RSA-PSS.
  */
 public class TlsServerIdentity(certificateChainPem: String, privateKeyPem: String) : Closeable {
     internal val handle: Long = __kktls_identity(certificateChainPem, privateKeyPem).also {

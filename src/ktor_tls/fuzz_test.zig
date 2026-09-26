@@ -190,7 +190,10 @@ test "certificate parsing survives every truncation and random corruption" {
 test "private key and PEM parsing survives corruption" {
     var prng = std.Random.DefaultPrng.init(0x9e3);
     const r = prng.random();
-    const sources = [_][]const u8{ fixtures.server_p256_key, fixtures.server_ed25519_key, fixtures.untrusted_key, fixtures.server_p256 };
+    const sources = [_][]const u8{
+        fixtures.server_p256_key, fixtures.server_ed25519_key,   fixtures.untrusted_key, fixtures.server_p256,
+        fixtures.server_rsa_key,  fixtures.server_rsa_key_pkcs1, fixtures.rsa3072_key,
+    };
     const buf = try a.alloc(u8, 4096);
     defer a.free(buf);
     for (0..iterations(3000)) |i| {
@@ -204,7 +207,16 @@ test "private key and PEM parsing survives corruption" {
             const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             text[at] = if (r.uintLessThan(u8, 4) != 0) alphabet[r.uintLessThan(usize, alphabet.len)] else r.int(u8);
         }
-        if (pem.privateKey(a, text)) |_| {} else |_| {}
+        if (pem.privateKey(a, text)) |key| {
+            // A corrupted RSA key that still parses signs correctly or is
+            // caught by the check before sending.
+            if (key == .rsa) {
+                var sig: [pem.rsa.max_bytes]u8 = undefined;
+                if (key.rsa.signPss(.sha256, "fuzz", &([_]u8{7} ** 32), &sig)) |s| {
+                    try pem.rsa.verifyPss(.sha256, key.rsa.modulus(), key.rsa.exponent(), s, "fuzz");
+                } else |_| {}
+            }
+        } else |_| {}
         if (pem.certificates(a, text)) |list| {
             for (list) |c| a.free(c);
             a.free(list);

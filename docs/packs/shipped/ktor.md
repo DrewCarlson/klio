@@ -17,10 +17,11 @@ cinterop. In practice that means:
 - **Sockets.** ktor-network's common code and its plain-Kotlin posix files
   (the selector manager, event records, socket base) are upstream's. The
   socket calls, `sockaddr` handling and the selector's wait go through host
-  natives (`src/ktor_client/net.zig`). The selector keeps upstream's design: a
-  selection coroutine on `Dispatchers.IO`, a wakeup pipe, and interest and
-  close queues. It waits in `poll` rather than `pselect`, so there is no
-  `FD_SETSIZE` limit.
+  natives (`src/ktor_client/net.zig`, over the platform layer described under
+  Platforms). The selector keeps upstream's design: a selection coroutine on
+  `Dispatchers.IO`, a wakeup pipe (a loopback socket pair on Windows), and
+  interest and close queues. It waits in `poll` (`WSAPoll` on Windows) rather
+  than `pselect`, so there is no `FD_SETSIZE` limit.
 - **Engines.** ktor-client-cio and ktor-server-cio run verbatim over those
   sockets: HTTP/1.1 with chunked and streamed bodies, keep-alive on the server
   and WebSocket upgrade.
@@ -118,13 +119,13 @@ suspend fun main() {
 
 Run it with `klio run --feature io.ktor/client-cio fetch.kt`.
 
-`HttpClient()` uses the CIO engine, which is the default engine the
-`client-cio` feature supplies. Upstream's posix build finds its default
-engine through an `@EagerInitialization` hook in the engine module; klio
-initializes top-level properties on first use, as the JVM does, so the engine
-module supplies the `HttpClient()` actual instead. With only `client-core`
-enabled, `HttpClient()` has no engine, just as an upstream build with no
-engine dependency has none. `HttpClient(CIO)` and `HttpClient(KlioClient)`
+`HttpClient()` uses the CIO engine, which the `client-cio` feature
+registers. As in upstream's posix build, `HttpClient()` takes the first
+engine in ktor's `engines` list, and ktor-client-cio's `@EagerInitialization`
+hook adds CIO to it before `main` runs. With only `client-core` enabled,
+`HttpClient()` fails with upstream's "Failed to find HTTP client engine
+implementation", just as an upstream build with no engine dependency does.
+`HttpClient(CIO)` and `HttpClient(KlioClient)`
 name the same engine. `KlioClient` is the name klio's engine has always had,
 and it configures a `CIOEngineConfig`.
 
@@ -188,10 +189,13 @@ fun main() {
 `sslConnector(certificateChainPem, privateKeyPem)` takes the certificate chain
 (the server's certificate first) and its private key as PEM text. It replaces
 the JVM's `sslConnector(keyStore, keyAlias, ...)`, which is built on
-`java.security.KeyStore`. The key is a P-256 ECDSA or Ed25519 key, unencrypted,
-as PKCS#8 (`BEGIN PRIVATE KEY`) or, for P-256, SEC 1 (`BEGIN EC PRIVATE KEY`).
-A chain whose key does not match, or a key in another form, fails the server's
-start with a message that says which. Plain `connector { }` entries serve HTTP
+`java.security.KeyStore`. The key is a P-256 ECDSA, Ed25519 or RSA key,
+unencrypted, as PKCS#8 (`BEGIN PRIVATE KEY`), SEC 1 for P-256
+(`BEGIN EC PRIVATE KEY`) or PKCS#1 for RSA (`BEGIN RSA PRIVATE KEY`). An RSA
+key has a 2048- to 4096-bit modulus and an odd public exponent below 2^32,
+and signs the handshake with RSA-PSS (SHA-256, or SHA-384 or SHA-512 when
+the client takes only those). A chain whose key does not match, or a key in
+another form, fails the server's start with a message that says which. Plain `connector { }` entries serve HTTP
 beside the HTTPS ones. A call on an HTTPS connector reports the `https` scheme
 in `request.local` and `request.origin` (so `HttpsRedirect` and URLs built
 from the request see it), and WebSocket routes serve `wss://` there. The
@@ -226,8 +230,8 @@ ECDHE suites (AES-GCM or ChaCha20-Poly1305, over X25519, P-256 or P-384),
 using the extended master secret whenever the server offers it and refusing
 renegotiation. The server speaks TLS 1.3.
 
-Limits: server keys are P-256 ECDSA or Ed25519 (the client verifies RSA
-servers too); no client certificates (a server's certificate request is
+Limits: server keys are P-256 ECDSA, Ed25519 or RSA, and an RSA key signs
+only with RSA-PSS (TLS 1.3 allows nothing else); no client certificates (a server's certificate request is
 answered with none); no session resumption or 0-RTT; no TLS 1.2 CBC or RSA
 key-transport suites.
 
@@ -294,6 +298,43 @@ plus klio ports of the JVM tests for the modules that are JVM-only upstream
 (CallLogging, Compression). The plan (`plans/ktor-support.md`) lists the
 cases that still fail and why.
 
+## Platforms
+
+The pack runs on macOS, Linux and Windows from the same Kotlin sources. The
+socket natives sit on a platform layer (`src/ktor_client/sock.zig`) that
+gives every platform the POSIX meaning the actuals expect.
+
+- **macOS and Linux**: BSD sockets and `poll`. Descriptors are closed on
+  exec; SIGPIPE is suppressed per socket on macOS and per send on Linux.
+- **Windows**: Winsock 2, started on first use. A descriptor is the socket's
+  handle, not inherited by child processes. Failures are reported as the C
+  runtime's errno values under their POSIX names (`EAGAIN`,
+  `ECONNREFUSED`, ...; `src/ktor_client/winsock.zig` maps each Winsock
+  error), so `PosixException` and its subclasses are the same as elsewhere,
+  and a started non-blocking connect reads as EINPROGRESS. The selector
+  waits in `WSAPoll` and is woken through a connected loopback socket pair.
+  Where Windows means something else, the POSIX behavior is kept:
+  - `reuseAddress` is accepted and not set. Rebinding a port whose old
+    connections are still closing, which the option allows on POSIX, is
+    already Windows' default, and Windows' own `SO_REUSEADDR` would let
+    another socket take over a port in use.
+  - `reusePort = true` fails with ENOPROTOOPT: Windows has nothing like it.
+  - A datagram socket does not fail a receive with the ICMP unreachable an
+    earlier send provoked, and a datagram longer than the buffer is cut to
+    it, as on POSIX.
+  - Unix domain sockets need Windows 10 1803 or later and are stream only;
+    otherwise creating one fails with EAFNOSUPPORT.
+- **Trusted roots** for HTTPS clients come from the system: the System and
+  System Roots keychains on macOS, the distribution's CA bundle on Linux
+  (`/etc/ssl/certs/ca-certificates.crt` and the other usual places), and
+  the ROOT certificate store on Windows. A client that trusts only the
+  system roots fails to start with a message when the system has none it
+  can read (a container without `ca-certificates`, for example). macOS
+  trust settings (certificates an administrator marked untrusted, roots
+  added only to a login keychain) are not consulted. On Windows, a root the
+  system has not downloaded yet is not in the store; pass it with
+  `addTrustedCertificates`.
+
 ## Install
 
 ```sh
@@ -303,7 +344,6 @@ cases that still fail and why.
 
 ## Not included yet
 
-- RSA server keys.
 - Static file and resource routes (`staticFiles`, `staticResources`), which
   upstream builds on java.io.File and the class path.
 - WebSockets inside `testApplication`: upstream's native test engine does not
