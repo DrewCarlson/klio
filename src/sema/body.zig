@@ -2768,7 +2768,7 @@ fn contractFacts(ctx: *Ctx, e: *const Expr, refs_before: usize, use: ContractUse
     const c = &e.Call;
     const params = s.syms.functionInfo(rec.callee).params;
     const recv: ?*const Expr = if (c.callee.* == .Member) c.callee.Member.receiver else null;
-    const binding: ContractBinding = .{ .call = c, .params = params, .args = rec.args, .receiver = recv, .callee = rec.callee };
+    const binding: ContractBinding = .{ .call = c, .params = params, .args = rec.args, .receiver = recv, .callee = rec.callee, .type_args = rec.type_args };
     var out: Facts = .{};
     for (effects) |eff| {
         switch (use) {
@@ -2793,6 +2793,8 @@ const ContractBinding = struct {
     receiver: ?*const Expr,
     /// The function declaring the contract: its types are written there.
     callee: Sym,
+    /// The call's arguments for the callee's type parameters.
+    type_args: []const TypeId,
 };
 
 /// The argument expression a contract's name stands for: a parameter's
@@ -2845,14 +2847,24 @@ fn impliedFacts(ctx: *Ctx, cond: *const Expr, b: *const ContractBinding) Allocat
             return .{ .when_true = inner.when_false, .when_false = inner.when_true };
         } else return .{},
         // `implies (this@isError is NetRequestStatus.Error)`: the operand is
-        // the type, as written where the contract is declared.
+        // the type, as written where the contract is declared, with the
+        // call's type arguments for the callee's type parameters
+        // (`assertIs<Sub>(b)` makes `b` a `Sub`).
         .IsCheck => |c| {
+            const s = ctx.s;
             const arg = contractOperand(ctx, c.expr, b) orelse return .{};
-            ctx.s.census.muted += 1;
-            const t = headers.resolveTypeRef(ctx.s, headers.ctxOf(ctx.s, b.callee), &c.ty);
-            ctx.s.census.muted -= 1;
-            const ty = try t;
-            if (ctx.s.types.isErr(ty)) return .{};
+            s.census.muted += 1;
+            const t = headers.resolveTypeRef(s, headers.ctxOf(s, b.callee), &c.ty);
+            s.census.muted -= 1;
+            var ty = try t;
+            if (s.types.isErr(ty)) return .{};
+            const tps = s.syms.functionInfo(b.callee).type_params;
+            if (tps.len != 0 and tps.len == b.type_args.len) {
+                var subst: types.Subst = .empty;
+                for (tps, b.type_args) |tp, ta| try subst.put(s.arena, tp, ta);
+                ty = try s.types.substitute(ty, &subst);
+                if (s.types.isErr(ty)) return .{};
+            }
             return isFacts(ctx, arg, ty, c.negated);
         },
         else => return .{},
@@ -4075,7 +4087,12 @@ fn binary(ctx: *Ctx, e: *const Expr, op: ast.BinOp, lhs: *const Expr, rhs: *cons
             const l_expected = if (expected == .none or s.types.isErr(expected)) expected else try s.types.makeNullable(expected);
             const lt = try expr(ctx, lhs, l_expected);
             if (try openExpected(s, expected) and saved_arg == .none) ctx.in_arg = .branch else ctx.in_arg = saved_arg;
-            const rt = try expr(ctx, rhs, expected);
+            // `a ?: b` is `elvis(a: K?, b: K)`: with nothing expected, a
+            // function literal on the right is typed by what the left side
+            // fixes `K` to (`f ?: { call -> call.origin }` for an
+            // `f: ((Call) -> Boolean)?`).
+            const r_expected = if (expected == .none and functionLiteral(rhs) and !s.types.isErr(lt)) try s.types.definitelyNotNull(lt) else expected;
+            const rt = try expr(ctx, rhs, r_expected);
             ctx.in_arg = saved_arg;
             const lnn = try s.types.definitelyNotNull(lt);
             if (isNothingType(s, rt)) {
@@ -4146,6 +4163,17 @@ fn binary(ctx: *Ctx, e: *const Expr, op: ast.BinOp, lhs: *const Expr, rhs: *cons
             return calls.operatorCall(ctx, e.span(), lt, n, &.{.{ .expr = rhs, .ty = rt }}, kind);
         },
     }
+}
+
+/// A lambda, anonymous function or callable reference: an expression whose
+/// type comes from the function type expected of it.
+fn functionLiteral(e: *const Expr) bool {
+    return switch (e.*) {
+        .Lambda, .AnonFun, .PropertyRef => true,
+        .MemberRef => |r| !calls.isClassLiteral(r),
+        .Labeled => |l| functionLiteral(l.expr),
+        else => false,
+    };
 }
 
 pub fn isNothingType(s: *Sema, t: TypeId) bool {

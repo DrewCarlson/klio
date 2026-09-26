@@ -38,6 +38,10 @@ pub const Resolved = struct {
     /// which entering it runs first, as the JVM initializes a class before
     /// its static method runs. `NONE` for every other function.
     facade_unit: []const u32 = &.{},
+    /// The init units of the files' `@EagerInitialization` properties, in
+    /// file order: what the program's start runs before `main`, as
+    /// Kotlin/Native initializes such a property when the program starts.
+    eager_units: []const u32 = &.{},
     /// Names a function as a JVM stack frame does; null where no builder
     /// set one, and a frame then shows the function's FQN.
     frame_namer: ?FrameNamer = null,

@@ -1909,6 +1909,49 @@ test "a failed initializer throws ExceptionInInitializerError, then NoClassDefFo
     );
 }
 
+test "an @EagerInitialization property is initialized when the program starts, and only it" {
+    // `hook` runs before `main`; `later`, in the same file, waits for the
+    // first access to its file, as Kotlin/Native initializes them.
+    try driver.expectOutput(&.{
+        \\import cfg.later
+        \\object Registry {
+        \\    val names = mutableListOf<String>()
+        \\    fun add(name: String): Int { names.add(name); return names.size }
+        \\}
+        \\fun main() {
+        \\    println(Registry.names)
+        \\    println(later)
+        \\    println(Registry.names)
+        \\}
+        ,
+        \\package cfg
+        \\import Registry
+        \\@EagerInitialization
+        \\private val hook: Int = Registry.add("eager")
+        \\val later: Int = Registry.add("lazy")
+    },
+        \\[eager]
+        \\2
+        \\[eager, lazy]
+        \\
+    );
+}
+
+test "an eager initializer that throws fails the program before main runs" {
+    var mem = ir.eval.hand.TestMemory.init();
+    defer mem.deinit();
+    const o = try driver.run(mem.allocator(), &.{
+        \\fun main() { println("main ran") }
+        ,
+        \\package cfg
+        \\@kotlin.native.EagerInitialization
+        \\val hook: Int = check()
+        \\fun check(): Int { throw IllegalStateException("bad") }
+    });
+    try std.testing.expect(o.result == .threw);
+    try std.testing.expectEqualStrings("", o.output);
+}
+
 test "a file's JvmName annotation does not rename the file" {
     try driver.expectOutput(&.{
         \\import cfg.limit

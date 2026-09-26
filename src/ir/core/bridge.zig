@@ -143,11 +143,29 @@ pub const ClassOrigin = union(enum) {
 
 /// An init unit: what its body initializes.
 pub const Unit = union(enum) {
-    /// The file's top-level properties with storage, in source order.
+    /// The file's top-level properties with storage, in source order, but
+    /// for its eager ones: what the first access to the file runs.
     file: u32,
     /// The enum class's entries.
     enum_class: Sym,
+    /// The file's `@EagerInitialization` properties, in source order, which
+    /// the program's start runs (`Resolved.eager_units`).
+    eager_file: u32,
 };
+
+/// Whether `p` is a top-level property Kotlin/Native initializes when the
+/// program starts: one annotated `@kotlin.native.EagerInitialization`.
+pub fn eagerProperty(s: *sema.Sema, p: Sym) Error!bool {
+    const owner = s.syms.owner(p);
+    if (owner == .none or s.syms.kind(owner) != .package) return false;
+    const pd = switch (s.syms.get(p).decl) {
+        .property => |pd| pd,
+        else => return false,
+    };
+    if (pd.annotations.len == 0) return false;
+    const cls = s.classByFqn("kotlin.native.EagerInitialization");
+    return sema.headers.annotatedWith(s, .{ .decl = p, .file = s.syms.get(p).file }, pd.annotations, cls);
+}
 
 /// A value a nested body captures from an enclosing one. A read of `field`
 /// captures the enclosing class's `this`; `super` is captured as
@@ -489,7 +507,7 @@ const Over = struct {
     rt: ir.Resolved,
 };
 
-const StaticOwner = union(enum) { file: u32, enum_class: Sym };
+const StaticOwner = union(enum) { file: u32, enum_class: Sym, eager_file: u32 };
 
 const Scope = struct {
     sym: Sym,
@@ -1051,7 +1069,9 @@ const Build = struct {
         if (owner != .none and s.syms.kind(owner) == .package and b.br.native_of[p.int()] == .none) {
             if (s.syms.propertyInfo(p).has_delegate or try b.hasStorage(p)) {
                 const seed = if (s.syms.propertyInfo(p).has_delegate) SlotSeed.null_ref else try b.seedOf(p);
-                b.br.static_of[p.int()] = try b.newStatic(.{ .file = s.syms.get(p).file }, seed, s.str(s.syms.name(p)));
+                const file = s.syms.get(p).file;
+                const static_owner: StaticOwner = if (try eagerProperty(s, p)) .{ .eager_file = file } else .{ .file = file };
+                b.br.static_of[p.int()] = try b.newStatic(static_owner, seed, s.str(s.syms.name(p)));
             }
         }
         // An enum class's `entries` is made once, after the entries, by the
@@ -1082,21 +1102,33 @@ const Build = struct {
     }
 
     /// Gives the statics allocated since the last pass their init units:
-    /// one per file in file order, then one per enum class in symbol order.
+    /// one per file in file order, then one per file for its eager
+    /// properties, then one per enum class in symbol order.
     fn finishUnits(b: *Build) Error!void {
         const from = b.statics_united;
         var files: std.ArrayList(u32) = .empty;
+        var eager_files: std.ArrayList(u32) = .empty;
         // A static of no file (`.file = NONE`) has no unit: nothing
         // initializes it but its own stores.
         for (b.static_owner.items[from..]) |o| switch (o) {
             .file => |f| if (f != NONE and std.mem.indexOfScalar(u32, files.items, f) == null) try files.append(b.a, f),
+            .eager_file => |f| if (std.mem.indexOfScalar(u32, eager_files.items, f) == null) try eager_files.append(b.a, f),
             .enum_class => {},
         };
         std.mem.sort(u32, files.items, {}, std.sort.asc(u32));
+        std.mem.sort(u32, eager_files.items, {}, std.sort.asc(u32));
         for (files.items) |f| {
             const u = try b.newUnit(.{ .file = f });
             for (b.static_owner.items[from..], b.statics.items[from..]) |o, *st| {
                 if (o == .file and o.file == f) st.unit = u;
+            }
+        }
+        // An eager property read before the start ran its unit (by another
+        // file's eager initializer) runs it then, as its guard.
+        for (eager_files.items) |f| {
+            const u = try b.newUnit(.{ .eager_file = f });
+            for (b.static_owner.items[from..], b.statics.items[from..]) |o, *st| {
+                if (o == .eager_file and o.eager_file == f) st.unit = u;
             }
         }
         for (b.pending_enums.items) |e| {
@@ -2474,7 +2506,7 @@ const Build = struct {
             .setter => |p| std.fmt.allocPrint(b.a, "<set-{s}>", .{s.str(s.syms.name(p))}),
             .defaults => |d| std.fmt.allocPrint(b.a, "{s}$default", .{s.str(s.syms.name(d))}),
             .init_unit => |u| switch (b.units.items[u]) {
-                .file => "<init>",
+                .file, .eager_file => "<init>",
                 .enum_class => "<init-entries>",
             },
             .sam_ctor => "<init>",
@@ -2494,7 +2526,7 @@ const Build = struct {
             .setter => |p| std.fmt.allocPrint(b.a, "{s}.<set>", .{try b.qualName(p)}),
             .defaults => |d| std.fmt.allocPrint(b.a, "{s}$default", .{try b.qualName(d)}),
             .init_unit => |u| switch (b.units.items[u]) {
-                .file => |f| std.fmt.allocPrint(b.a, "{s}.<init>", .{try kotlinFileName(s, b.a, f)}),
+                .file, .eager_file => |f| std.fmt.allocPrint(b.a, "{s}.<init>", .{try kotlinFileName(s, b.a, f)}),
                 .enum_class => |e| std.fmt.allocPrint(b.a, "{s}.<init-entries>", .{try b.qualName(e)}),
             },
             .sam_ctor => |iface| std.fmt.allocPrint(b.a, "{s}$sam.<init>", .{try b.qualName(iface)}),
@@ -2598,6 +2630,9 @@ const Build = struct {
             u.* = .{ .func = f, .name = name };
         }
         r.init_units = units;
+        var eager: std.ArrayList(u32) = .empty;
+        for (b.units.items, 0..) |u, i| if (u == .eager_file) try eager.append(a, @intCast(i));
+        r.eager_units = eager.items;
         // Appends natives, so ahead of taking them.
         r.host_slot = try b.hostSlots(base.host_slot, nf);
         r.natives = b.natives.items;
@@ -2787,7 +2822,8 @@ const Build = struct {
         var by_file: std.AutoHashMapUnmanaged(u32, u32) = .empty;
         for (b.units.items, 0..) |u, i| switch (u) {
             .file => |f| try by_file.put(b.a, f, @intCast(i)),
-            .enum_class => {},
+            // Entering a file's function runs its lazy unit only.
+            .enum_class, .eager_file => {},
         };
         for (b.origins.items[first..], out[first..]) |o, *unit| {
             const sym: Sym = switch (o) {
@@ -2851,7 +2887,7 @@ const Build = struct {
     fn unitName(b: *Build, u: u32) Error![]const u8 {
         return switch (b.units.items[u]) {
             .enum_class => |e| std.fmt.allocPrint(b.a, "enum class {s}", .{try kotlinName(b.s, b.a, e)}),
-            .file => |f| std.fmt.allocPrint(b.a, "file {s}", .{try kotlinFileName(b.s, b.a, f)}),
+            .file, .eager_file => |f| std.fmt.allocPrint(b.a, "file {s}", .{try kotlinFileName(b.s, b.a, f)}),
         };
     }
 
@@ -3614,7 +3650,7 @@ fn frameNameOf(br: *Bridge, a: Allocator, f: FuncId) Allocator.Error!?[]const u8
         .init_unit => |u| {
             if (u >= br.units.len) return null;
             return switch (br.units[u]) {
-                .file => |file| try std.fmt.allocPrint(a, "{s}.<init>", .{try kotlinFileName(s, a, file)}),
+                .file, .eager_file => |file| try std.fmt.allocPrint(a, "{s}.<init>", .{try kotlinFileName(s, a, file)}),
                 .enum_class => |e| try std.fmt.allocPrint(a, "{s}.<init-entries>", .{try kotlinName(s, a, e)}),
             };
         },

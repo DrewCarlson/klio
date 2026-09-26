@@ -655,11 +655,8 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/ktor-serialization-kotlinx-tests/common/src/AbstractContextualSerializationTest.kt",
         },
         .extra_args = &.{ "--feature", "io.ktor/serialization-kotlinx-json,client-mock,client-content-negotiation,test-base" },
-        // testRegisterCustomFlow: the JSON extension that streams a Flow is
-        // registered by an `@EagerInitialization` property, which klio does
-        // not run, so the Flow falls to the polymorphic serializer.
-        .baseline = 13,
-        .max_failed = 1,
+        .baseline = 14,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
     .{

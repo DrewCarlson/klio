@@ -430,6 +430,12 @@ fn resolvedFailure(st: *RunState, vm: *Vm, oc: interp_ir.CallOutcome) ?[]const u
 
 fn runResolvedBody(st: *RunState, vm: *Vm) Allocator.Error!void {
     defer clearWallDeadline();
+    // The program starts before any test runs: its eager properties are
+    // initialized, and one that throws fails the start instead.
+    if (try vm.startProgram()) |oc| {
+        if (resolvedFailure(st, vm, oc)) |d| try record(st, "<startup>", .failed, d);
+        return;
+    }
     const plan = st.plan;
     for (plan.top) |t| {
         if (t.ignored) {

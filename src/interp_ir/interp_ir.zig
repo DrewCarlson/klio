@@ -420,6 +420,7 @@ pub const Vm = struct {
     pub const prepareResolved = run_mod.vmPrepareResolved;
     pub const runCalls = run_mod.vmRunCalls;
     pub const callMain = run_mod.vmCallMain;
+    pub const startProgram = run_mod.vmStartProgram;
     pub const callArgs = run_mod.vmCallArgs;
     pub const newResolved = run_mod.vmNewResolved;
     pub const throwableText = run_mod.vmThrowableText;

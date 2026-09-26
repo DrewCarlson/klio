@@ -326,7 +326,7 @@ fn isProgramFunc(br: *const ir.bridge.Bridge, f: ir.FuncId) bool {
     const sym: sema.Sym = switch (br.origin[f.int()]) {
         .decl, .getter, .setter, .defaults, .lambda, .sam_ctor, .sam_method, .sam_equals, .sam_hash_code, .abstract, .restart => |x| x,
         .init_unit => |u| switch (br.units[u]) {
-            .file => |file| return if (s.fileOf(file)) |fc| fc.origin == .program else false,
+            .file, .eager_file => |file| return if (s.fileOf(file)) |fc| fc.origin == .program else false,
             .enum_class => |e| e,
         },
         .adapter => |i| br.adapters[i].target,

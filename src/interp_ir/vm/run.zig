@@ -165,8 +165,12 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     const sink = self.out_sink.output();
 
     // The module initializes its statics and objects on first touch through
-    // its own tables.
+    // its own tables, but for its eager properties, which run now.
     try vmPrepareResolved(self);
+    if (module.resolved != null) {
+        var start_host = vmMakeHost(self, sink);
+        if (try ir.eval.resolved_ops.runEagerUnits(VmHost, self.allocator, module, &start_host)) |e| return .{ .err = vmErrorFromEval(self.allocator, e) };
+    }
 
     const func = module.funcById(main) orelse return .{ .err = .InvalidMain };
     // A `suspend fun main` runs on the cooperative pump, so `delay` parks, not escapes.
@@ -263,10 +267,12 @@ pub fn vmCallMain(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
     const module = mg.get();
     const func = module.funcById(func_id) orelse return .{ .failed = "main not found" };
     const sink = self.out_sink.output();
-    // The file declaring `main` is initialized before it runs, as the JVM
-    // initializes the class whose `main` it launches.
+    // The program's eager properties are initialized when it starts, then
+    // the file declaring `main` before it runs, as the JVM initializes the
+    // class whose `main` it launches.
     if (module.resolved != null) {
         var init_host = vmMakeHost(self, sink);
+        if (try ir.eval.resolved_ops.runEagerUnits(VmHost, self.allocator, module, &init_host)) |e| return outcomeFromEval(self, .{ .err = e });
         if (try ir.eval.resolved_ops.ensureFacade(VmHost, self.allocator, module, &init_host, func_id)) |e| return outcomeFromEval(self, .{ .err = e });
     }
     if (func.is_suspend) {
@@ -278,6 +284,21 @@ pub fn vmCallMain(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
     if (func.params.len >= 1) try args.append(self.allocator, try programArgsValue(self.allocator, self.program_args));
     const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, args, &host);
     return outcomeFromEval(self, r);
+}
+
+/// The program's start for a host that runs no `main` (the test runner):
+/// its eager properties initialized. Null when that went through.
+pub fn vmStartProgram(self: *Vm) Allocator.Error!?CallOutcome {
+    try vmPrepareResolved(self);
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const mg = module_ref.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    if (module.resolved == null) return null;
+    var host = vmMakeHost(self, self.out_sink.output());
+    if (try ir.eval.resolved_ops.runEagerUnits(VmHost, self.allocator, module, &host)) |e| return outcomeFromEval(self, .{ .err = e });
+    return null;
 }
 
 /// Calls `func_id` of a module lowered from sema with `args`.

@@ -332,6 +332,21 @@ pub fn ensureFacade(comptime H: type, a: Allocator, module: *const ir.Module, ho
     return ensureUnitIn(H, a, module, host, r, st, unit);
 }
 
+/// Runs the program's eager initializers, the `@EagerInitialization`
+/// properties of every file in file order, as Kotlin/Native runs them when
+/// the program starts. A unit already run (by an earlier start, or read
+/// early by another eager initializer) is not run again. What one throws
+/// fails the start, as an uncaught throwable before `main`.
+pub fn runEagerUnits(comptime H: type, a: Allocator, module: *const ir.Module, host: *H) Allocator.Error!?EvalError {
+    const r = module.resolved orelse return null;
+    if (r.eager_units.len == 0) return null;
+    const st = host.resolvedState() orelse return null;
+    for (r.eager_units) |unit| {
+        if (try ensureUnitIn(H, a, module, host, r, st, unit)) |e| return e;
+    }
+    return null;
+}
+
 /// Whether init unit `unit` has run to its end. A unit that finished stays
 /// finished, so the flag is read without the state's lock; `ensureUnitIn`
 /// publishes it with a release store.

@@ -812,12 +812,17 @@ pub const System = struct {
                 var lits: types.IntLit = .{};
                 var any_lit = false;
                 var pending = false;
+                // Below it a nullable type still open (`T2?` of
+                // `same("text", lookup())`): whatever that becomes, `v`
+                // holds its null.
+                var pending_null = false;
                 var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
                 try seen.put(s.arena, v.id, {});
                 for (v.lower.items) |lb| {
                     const z = try zonk(s, lb);
                     if (self.waitsOnOwn(z)) {
                         pending = true;
+                        if (s.types.isNullable(z)) pending_null = true;
                         // `v :> w` for an open `w`: what is below `w` is
                         // below `v` too.
                         try self.lowersThrough(z, &lowers, &seen);
@@ -853,6 +858,7 @@ pub const System = struct {
                 } else if (any_lit) try lowers.append(s.arena, try intLitDefault(s, lits));
                 if (lowers.items.len != 0) {
                     v.fixed = try subtyping.commonSupertype(s, lowers.items);
+                    if (pending_null) v.fixed = try s.types.makeNullable(v.fixed);
                     // The join can be coarser than an upper bound every
                     // lower bound fits: `In<Int>` and `In<String>` join to
                     // `In<*>`, which is not below `In<Int & String>`; the

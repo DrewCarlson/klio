@@ -381,7 +381,7 @@ fn prepareArgs(ctx: *Ctx, exprs: []const Expr, arg_names: []const ?[]const u8) A
 }
 
 /// `T::class` or `value::class`: a class literal, not a callable reference.
-fn isClassLiteral(r: anytype) bool {
+pub fn isClassLiteral(r: anytype) bool {
     return std.mem.eql(u8, r.name.name, "class");
 }
 
@@ -1812,17 +1812,23 @@ fn lambdaParamTypesFit(ctx: *Ctx, l: *const ast.LambdaExpr, fn_t: TypeId, shape:
 }
 
 /// Whether a callable reference could have type `pt`: a function type, a
-/// reflection type (`KProperty1`, `KFunction2`, ...), `Function`, a fun
-/// interface, `Any`, or a type still to be inferred.
-fn refFits(s: *Sema, pt: TypeId) bool {
-    const t = s.types.makeNotNull(pt) catch return true;
+/// callable's reflection type (`KProperty1`, `KFunction2`, `KCallable`,
+/// ...), `Function`, a fun interface, `Any`, or a type still to be
+/// inferred. A `KClass` is no callable's type: `provide(::Teller)` does
+/// not apply to a `provide(kClass: KClass<out T>)`.
+fn refFits(s: *Sema, pt: TypeId) Allocator.Error!bool {
+    const t = try s.types.makeNotNull(pt);
     switch (s.types.get(t)) {
         .class => |c| {
             if (functionShape(s, t) != null) return true;
             if (c.sym == s.builtins.any or c.sym == s.builtins.function) return true;
             if (s.syms.flags(c.sym).fun_iface) return true;
             const fqn = s.str(s.syms.classInfo(c.sym).fqn);
-            return std.mem.startsWith(u8, fqn, "kotlin.reflect.");
+            if (!std.mem.startsWith(u8, fqn, "kotlin.reflect.")) return false;
+            if (std.mem.eql(u8, fqn, "kotlin.reflect.KAnnotatedElement")) return true;
+            const callable = s.classByFqn("kotlin.reflect.KCallable");
+            if (callable == .none) return true;
+            return (try subtyping.supertypeWithClass(s, try headers.selfType(s, c.sym), callable)) != null;
         },
         else => return true,
     }
@@ -3643,14 +3649,15 @@ pub fn delegateAccess(ctx: *Ctx, del: *const Expr, del_t_in: TypeId, prop: Sym, 
     const kprop = if (s.builtins.kproperty0 != .none) try s.types.class(s.builtins.kproperty0, &.{.{ .variance = .star, .ty = .none }}, false) else s.types.errType();
     const pd_args = [_]Arg{ .{ .expr = dummy, .ty = this_ref }, .{ .expr = dummy, .ty = kprop } };
     const provide_args = [_]Arg{ .{ .expr = dummy, .ty = host }, .{ .expr = dummy, .ty = kprop } };
-    if (try hasOperator(ctx, del_t, wk.provideDelegate)) {
-        del_t = try operatorCall(ctx, anchor, del_t, wk.provideDelegate, &provide_args, .provide_delegate);
-    }
     const declared: TypeId = switch (s.syms.kind(prop)) {
         .property => s.syms.propertyInfo(prop).ty,
         .local => s.syms.localInfo(prop).ty,
         else => .none,
     };
+    if (try hasOperator(ctx, del_t, wk.provideDelegate)) {
+        const want = if (declared != .none and !s.types.isErr(declared)) try providedFor(ctx, del_t, this_ref, declared, mutable) else .none;
+        del_t = try operatorCallExpecting(ctx, anchor, del_t, wk.provideDelegate, &provide_args, .provide_delegate, want);
+    }
     const vt = try operatorCallExpecting(ctx, anchor, del_t, wk.getValue, &pd_args, .get_value, declared);
     if (mutable) {
         const value_t = if (s.syms.kind(prop) == .property) s.syms.propertyInfo(prop).ty else vt;
@@ -3658,6 +3665,27 @@ pub fn delegateAccess(ctx: *Ctx, del: *const Expr, del_t_in: TypeId, prop: Sym, 
         _ = try operatorCall(ctx, anchor, del_t, wk.setValue, &set_args, .set_value);
     }
     return vt;
+}
+
+/// What a delegate's `provideDelegate` is expected to return so the
+/// `getValue` of what it returns gives the property's written type:
+/// `val text: String by registry` for a `provideDelegate<T>` returning a
+/// `ReadOnlyProperty<Any?, T>` expects a `ReadOnlyProperty<Any?, String>`.
+/// `.none` when no such result is known.
+fn providedFor(ctx: *Ctx, del_t: TypeId, this_ref: TypeId, declared: TypeId, mutable: bool) Allocator.Error!TypeId {
+    const s = ctx.s;
+    var sys = infer.System.init(s);
+    sys.trial = true;
+    const provided = (try operatorResultIn(ctx, &sys, del_t, wk.provideDelegate, this_ref)) orelse return .none;
+    sys.trial = true;
+    const v = (try operatorResultIn(ctx, &sys, provided, wk.getValue, this_ref)) orelse return .none;
+    sys.trial = true;
+    if (!try sys.constrain(v, declared)) return .none;
+    if (mutable and !try sys.constrain(declared, v)) return .none;
+    if (!try sys.solve(false)) return .none;
+    const out = try sys.close(provided);
+    if (s.types.isErr(out) or infer.hasOpenVar(s, out)) return .none;
+    return out;
 }
 
 /// The type `getValue` gives on a delegate of type `del_t` whose type
@@ -4234,13 +4262,13 @@ fn refApplies(ctx: *Ctx, e: *const Expr, pt: TypeId) Allocator.Error!bool {
         else => return true,
     };
     if (c.sym == s.builtins.any or c.sym == s.builtins.function) return true;
-    const target: TypeId = if (functionShape(s, nn) != null) nn else if (try samType(ctx, nn)) |sam| sam.fn_type else return refFits(s, nn);
+    const target: TypeId = if (functionShape(s, nn) != null) nn else if (try samType(ctx, nn)) |sam| sam.fn_type else return try refFits(s, nn);
     const recv: ?*const Expr, const name: ast.Ident = switch (e.*) {
         .PropertyRef => |r| .{ null, r.name },
         .MemberRef => |r| .{ r.receiver, r.name },
         else => return true,
     };
-    if (recv != null and std.mem.eql(u8, name.name, "class")) return refFits(s, nn);
+    if (recv != null and std.mem.eql(u8, name.name, "class")) return try refFits(s, nn);
     s.census.muted += 1;
     defer s.census.muted -= 1;
     const nullable_lhs = e.* == .MemberRef and e.MemberRef.nullable_receiver;
@@ -4568,10 +4596,13 @@ const RefChoice = struct {
     /// The target's own type arguments the fit inferred, in declaration
     /// order; empty when no expected type inferred them.
     targs: []const TypeId = &.{},
+    /// It fits only adapted: defaults, an empty vararg or a `Unit` result.
+    adapted: bool = false,
 };
 
-/// A reference type that fits, and the target's type arguments it fixed.
-const RefFit = struct { ty: TypeId, targs: []const TypeId };
+/// A reference type that fits, the target's type arguments it fixed, and
+/// whether it fits only adapted.
+const RefFit = struct { ty: TypeId, targs: []const TypeId, adapted: bool = false };
 
 /// The candidate a reference names. With an expected type, the first level
 /// holding a candidate whose type fits it, the most specific of those,
@@ -4599,10 +4630,15 @@ fn chooseRef(ctx: *Ctx, levels: []const RefLevel, expected: TypeId) Allocator.Er
         for (levels) |level| {
             var fits: std.ArrayList(RefChoice) = .empty;
             for (level.items) |c| {
-                if (try refFit(ctx, c, target)) |f| try fits.append(s.arena, .{ .c = c, .ty = if (sam_iface != .none) sam_iface else f.ty, .fn_ty = if (sam_iface != .none) f.ty else .none, .targs = f.targs });
+                if (try refFit(ctx, c, target)) |f| try fits.append(s.arena, .{ .c = c, .ty = if (sam_iface != .none) sam_iface else f.ty, .fn_ty = if (sam_iface != .none) f.ty else .none, .targs = f.targs, .adapted = f.adapted });
             }
             if (fits.items.len == 0) continue;
-            return try mostSpecificRef(ctx, fits.items);
+            // A candidate that fits as declared wins over one that fits
+            // only adapted: `map(String::trim)` is `trim()`, not
+            // `trim(vararg chars)` with no chars.
+            var exact: std.ArrayList(RefChoice) = .empty;
+            for (fits.items) |f| if (!f.adapted) try exact.append(s.arena, f);
+            return try mostSpecificRef(ctx, if (exact.items.len != 0) exact.items else fits.items);
         }
     }
     const first = levels[0].items;
@@ -4632,7 +4668,9 @@ fn refFit(ctx: *Ctx, c: RefCand, expected: TypeId) Allocator.Error!?RefFit {
     if (s.types.isErr(t)) return null;
     if (try fitRefType(ctx, c, t, expected)) |r| return r;
     const adapted = (try adaptedRefType(ctx, c, t, expected)) orelse return null;
-    return fitRefType(ctx, c, adapted, expected);
+    var r = (try fitRefType(ctx, c, adapted, expected)) orelse return null;
+    r.adapted = true;
+    return r;
 }
 
 /// `t`, a type of the reference `c`, with `c`'s type parameters inferred
@@ -4734,19 +4772,36 @@ fn mostSpecificRef(ctx: *Ctx, fits: []const RefChoice) Allocator.Error!RefChoice
     const s = ctx.s;
     if (fits.len == 1) return fits[0];
     outer: for (fits, 0..) |a, i| {
-        const ap = s.types.argsOf(if (a.fn_ty != .none) a.fn_ty else a.ty);
+        const ap = try refParamTypes(ctx, a);
         for (fits, 0..) |b, j| {
             if (i == j) continue;
-            const bp = s.types.argsOf(if (b.fn_ty != .none) b.fn_ty else b.ty);
+            const bp = try refParamTypes(ctx, b);
             if (ap.len != bp.len) continue :outer;
             // Every parameter type of `a` fits `b`'s.
-            for (ap[0 .. ap.len -| 1], bp[0 .. bp.len -| 1]) |x, y| {
-                if (!try subtyping.isSubtype(s, x.ty, y.ty)) continue :outer;
+            for (ap, bp) |x, y| {
+                if (!try subtyping.isSubtype(s, x, y)) continue :outer;
             }
         }
         return a;
     }
     return fits[0];
+}
+
+/// The parameter types a reference's candidate is compared by: its
+/// reference type's, with an extension's unbound receiver as the
+/// extension declares it. The qualifier gives every candidate's receiver
+/// one type, and `String::trim` is `String.trim`, more specific than
+/// `CharSequence.trim`.
+fn refParamTypes(ctx: *Ctx, ch: RefChoice) Allocator.Error![]const TypeId {
+    const s = ctx.s;
+    const args = s.types.argsOf(if (ch.fn_ty != .none) ch.fn_ty else ch.ty);
+    const out = try s.arena.alloc(TypeId, args.len -| 1);
+    for (out, args[0..out.len]) |*o, a| o.* = a.ty;
+    if (ch.c.lead != .none and out.len != 0 and s.syms.kind(ch.c.sym) == .function) {
+        const recv = s.syms.functionInfo(ch.c.sym).receiver;
+        if (recv != .none) out[0] = try s.types.substitute(recv, ch.c.subst);
+    }
+    return out;
 }
 
 /// The type a reference to `c` has: a `KFunctionN` over its parameters

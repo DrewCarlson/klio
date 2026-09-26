@@ -26,7 +26,7 @@ const ClassId = ir.ClassId;
 const magic = "KLIOSEMB";
 
 /// Bumped with any change to the layout below.
-pub const version: u32 = 27;
+pub const version: u32 = 28;
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };
@@ -162,6 +162,7 @@ const ResolvedImage = struct {
     statics: []const resolved.StaticRt,
     init_units: []const resolved.InitUnitRt,
     facade_unit: []const u32,
+    eager_units: []const u32,
     natives: []const NativeRtImage,
     func_native: []const ir.NativeId,
     func_try: []const ir.NativeId,
@@ -307,6 +308,7 @@ fn resolvedImage(a: Allocator, m: *const ir.Module) !ResolvedImage {
         .statics = r.statics,
         .init_units = r.init_units,
         .facade_unit = r.facade_unit,
+        .eager_units = r.eager_units,
         .natives = natives,
         .func_native = r.func_native,
         .func_try = r.func_try,
@@ -432,6 +434,7 @@ fn loadResolved(a: Allocator, img: *const ResolvedImage, m: *const ir.Module, br
     r.statics = @constCast(img.statics);
     r.init_units = @constCast(img.init_units);
     r.facade_unit = img.facade_unit;
+    r.eager_units = img.eager_units;
     r.func_native = @constCast(img.func_native);
     r.func_try = img.func_try;
     r.host_slot = img.host_slot;

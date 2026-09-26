@@ -1,0 +1,6 @@
+provideDelegate for text: String
+provideDelegate for number: Int
+a string 42
+provideDelegate for title: String
+provideDelegate for count: Int
+a string 43

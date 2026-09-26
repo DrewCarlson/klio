@@ -77,7 +77,7 @@ fn bodySite(p: *Program, origin: bridge.FuncOrigin, plan: Plan) span.Span {
     return switch (origin) {
         .adapter => |i| refs.referenceSite(p, i),
         .init_unit => |u| switch (p.br.units[u]) {
-            .file => |file| if (file < s.files.items.len) s.files.items[file].ast.span else builder.zero_span,
+            .file, .eager_file => |file| if (file < s.files.items.len) s.files.items[file].ast.span else builder.zero_span,
             .enum_class => |cls| declSite(s, cls),
         },
         else => declSite(s, plan.owner),

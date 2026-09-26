@@ -77,7 +77,7 @@ fn lowersBody(s: *sema.Sema, br: *const bridge.Bridge, origin: bridge.FuncOrigin
     const sym: Sym = switch (origin) {
         .decl, .getter, .setter, .defaults, .lambda, .sam_ctor, .sam_method, .sam_equals, .sam_hash_code, .abstract, .restart => |x| x,
         .init_unit => |u| switch (br.units[u]) {
-            .file => |f| return br.lowersFile(f),
+            .file, .eager_file => |f| return br.lowersFile(f),
             .enum_class => |e| e,
         },
         .adapter => return true,

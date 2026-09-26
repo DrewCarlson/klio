@@ -820,6 +820,7 @@ fn entryIndex(cbs: *const Callbacks, cb: Callback) u32 {
 fn writeMain(p: *Program, w: *Writer) Error!void {
     try w.writeAll("static void kmain(void) {\n  klio_try t; klio_try_arm(&t);\n  if (setjmp(t.jb) != 0) { klio_try_top = 0; klio_r_uncaught(klio_in_flight); }\n");
     const mb = p.body(p.main).?;
+    for (p.r.eager_units) |u| if (p.unitIndex(u)) |ui| try w.print("  if (KU[{d}] != 2) ku_{d}();\n", .{ ui, ui });
     if (p.unitIndex(p.mainUnit())) |ui| try w.print("  if (KU[{d}] != 2) ku_{d}();\n", .{ ui, ui });
     if (mb.sig.params.len == 0) {
         try w.print("  (void)kf_{d}();\n", .{p.main.int()});

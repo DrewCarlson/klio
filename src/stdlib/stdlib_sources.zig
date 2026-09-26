@@ -281,6 +281,7 @@ pub const SEMA_ACTUAL_FILES = [_][]const u8{
     "FileInit.kt",
     "KlioType.kt",
     "Library.kt",
+    "Native.kt",
     "Regex.kt",
     "Spread.kt",
     "Unit.kt",

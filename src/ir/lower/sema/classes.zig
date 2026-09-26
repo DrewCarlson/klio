@@ -447,13 +447,16 @@ fn loadParam(b: *Builder, idx: u16) Error!Reg {
 pub fn lowerInitUnit(b: *Builder, unit: u32) Error!void {
     const br = b.p.br;
     switch (br.units[unit]) {
-        .file => |f| try fileStatics(b, f),
+        .file => |f| try fileStatics(b, f, false),
+        .eager_file => |f| try fileStatics(b, f, true),
         .enum_class => |e| try enumEntries(b, e),
     }
     if (!b.terminated()) b.terminate(.{ .Return = null });
 }
 
-fn fileStatics(b: *Builder, file: u32) Error!void {
+/// The initializers of `file`'s top-level properties, in source order: its
+/// eager ones for the unit the program's start runs, `eager`, else the rest.
+fn fileStatics(b: *Builder, file: u32, eager: bool) Error!void {
     const s = b.p.s;
     const br = b.p.br;
     b.setFile(file);
@@ -463,6 +466,7 @@ fn fileStatics(b: *Builder, file: u32) Error!void {
         if (st.int() == bridge.NONE) continue;
         const p = Sym.from(i);
         if (s.syms.kind(p) != .property or s.syms.get(p).file != file) continue;
+        if (try bridge.eagerProperty(s, p) != eager) continue;
         const pd = switch (s.syms.get(p).decl) {
             .property => |pd| pd,
             else => continue,

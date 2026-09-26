@@ -176,7 +176,11 @@ serial bridge pass walks the committed symbols in symbol order and allocates:
   binding, per committed lambda and local function, per defaults bridge, and
   per callable-reference adapter;
 - a static slot per top-level property with storage and per enum entry, owned
-  by an init unit (file or enum class) that runs on first access;
+  by an init unit (file or enum class) that runs on first access; a file's
+  `@kotlin.native.EagerInitialization` properties get a unit of their own,
+  which the program's start runs before `main` (`Resolved.eager_units`, in
+  file order), as Kotlin/Native does, while the file's other properties stay
+  lazy;
 - a field slot per backing field (superclass slots, own, an inner class's outer
   instance, a local class's captures);
 - a vtable slot per open member and an itable slot per interface member, from

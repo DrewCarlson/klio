@@ -181,7 +181,9 @@ pub fn build(gpa: Allocator, a: Allocator, br: *ir.bridge.Bridge, main: FuncId) 
     var hc: std.ArrayList(u32) = .empty;
     try p.hostClasses(&hc);
     for (hc.items) |c| try p.rc.addHostClass(ClassId.from(c));
-    // The file declaring `main` initializes before it runs.
+    // The eager properties initialize when the program starts, and the
+    // file declaring `main` before `main` runs.
+    for (p.r.eager_units) |u| try p.rc.addUnit(u);
     try p.rc.addUnit(p.mainUnit());
     try p.rc.walk(main);
     // The host builds a match's groups with the base's constructor.

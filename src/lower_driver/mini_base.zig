@@ -21,6 +21,7 @@ pub const files: []const File = &.{
     .{ .path = "mini/kotlin/io/Console.kt", .source = io },
     .{ .path = "mini/kotlin/reflect/Reflect.kt", .source = reflect },
     .{ .path = "mini/kotlin/coroutines/Continuation.kt", .source = coroutines },
+    .{ .path = "mini/kotlin/native/Native.kt", .source = native },
     .{ .path = "mini/klio/Throwables.kt", .source = klio_throwables },
     .{ .path = "mini/klio/test/HostBound.kt", .source = host_bound },
 };
@@ -365,6 +366,12 @@ pub const host_bound =
 
 /// The throwables klio raises that Kotlin has no common name for: a failed
 /// object's or file's initialization, an array or string index out of range.
+pub const native =
+    \\package kotlin.native
+    \\
+    \\public annotation class EagerInitialization
+;
+
 pub const klio_throwables =
     \\package klio
     \\

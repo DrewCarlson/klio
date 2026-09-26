@@ -22,9 +22,10 @@ const Span = @import("span").Span;
 
 /// Packages every file imports implicitly, in two levels: the common set,
 /// then below it klio's own `klio` (the throwables and types Kotlin has no
-/// common name for) and `kotlin.jvm`. A name the first level declares is
-/// never looked up in the second (`IllegalStateException` is
-/// `kotlin.IllegalStateException` even where `klio` declares one too).
+/// common name for), `kotlin.jvm` and `kotlin.native`, which the JVM's and
+/// the native targets' sources klio runs name unqualified. A name the first
+/// level declares is never looked up in the second (`IllegalStateException`
+/// is `kotlin.IllegalStateException` even where `klio` declares one too).
 pub const default_imports = [_][]const u8{
     "kotlin",
     "kotlin.annotation",
@@ -39,6 +40,7 @@ pub const default_imports = [_][]const u8{
 pub const default_low_imports = [_][]const u8{
     "klio",
     "kotlin.jvm",
+    "kotlin.native",
 };
 
 /// What `import a.b.C` binds `C` (or its alias) to: every declaration named

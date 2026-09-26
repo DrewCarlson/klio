@@ -1088,6 +1088,26 @@ test "a call's variable below a builder's variable is left to the builder" {
     try std.testing.expectEqualStrings("kotlin.Int", fx.typeText(n.type_args[0]));
 }
 
+test "a nested call's type argument is inferred from a sibling argument" {
+    var fx = try fixture(&.{
+        \\package app
+        \\inline fun <reified T : Any> lookup(): T? = null
+        \\fun <T> same(expected: T, actual: T): Boolean = expected == actual
+        \\fun use() {
+        \\    same("text", lookup())
+        \\    same(42, lookup())
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const a = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt("same(\"text\", ^lookup())", .call)).node);
+    try std.testing.expectEqualStrings("kotlin.String", fx.typeText(a.type_args[0]));
+    const b = try sema_mod.output.call(fx.s, &out.files[3], (try fx.refAt("same(42, ^lookup())", .call)).node);
+    try std.testing.expectEqualStrings("kotlin.Int", fx.typeText(b.type_args[0]));
+}
+
 test "a value known null in one branch and not null in the other stays nullable after both" {
     var fx = try fixture(&.{
         \\package app
@@ -4206,6 +4226,89 @@ test "a class literal argument is typed before candidates are chosen" {
     try fx.expectTarget("value.^id", "demo/Base.id");
 }
 
+test "a callable reference is not passed for a KClass parameter" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\import kotlin.reflect.KClass
+        \\class Teller(val name: String)
+        \\class Registry {
+        \\    inline fun <reified T : Any> provide(kClass: KClass<out T>): String = "kclass"
+        \\}
+        \\inline fun <reified E, reified I1> Registry.provide(crossinline f: (I1) -> E): String = "function"
+        \\fun byRef() = Registry().provide(::Teller)
+        \\fun byClass() = Registry().provide(Teller::class)
+        ,
+        \\package kotlin.reflect
+        \\interface KClass<T : Any>
+        \\interface KCallable<out R>
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("byRef() = Registry().^provide", "demo/provide");
+    try fx.expectTarget("byClass() = Registry().^provide", "demo/Registry.provide");
+}
+
+test "a generic provideDelegate takes its type argument from the property's type" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\import kotlin.reflect.KProperty
+        \\interface ReadOnlyProperty<in T, out V> {
+        \\    operator fun getValue(thisRef: T, property: KProperty<*>): V
+        \\}
+        \\class Registry {
+        \\    operator fun <T> provideDelegate(thisRef: Any?, prop: KProperty<*>): ReadOnlyProperty<Any?, T> = TODO()
+        \\}
+        \\class Holder(registry: Registry) {
+        \\    val text: String by registry
+        \\    val number: Int by registry
+        \\}
+        \\fun local(registry: Registry): Int {
+        \\    val n: Int by registry
+        \\    return n
+        \\}
+        ,
+        \\package kotlin.reflect
+        \\interface KProperty<out V>
+        \\interface KProperty0<out V> : KProperty<V>
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const out = try sema_mod.output.build(fx.s);
+    const text = try sema_mod.output.delegate(fx.s, &out.files[3], (try fx.refAt("val text: String by ^registry", .provide_delegate)).node);
+    try std.testing.expectEqualStrings("kotlin.String", fx.typeText(text.provide.?.type_args[0]));
+    const number = try sema_mod.output.delegate(fx.s, &out.files[3], (try fx.refAt("val number: Int by ^registry", .provide_delegate)).node);
+    try std.testing.expectEqualStrings("kotlin.Int", fx.typeText(number.provide.?.type_args[0]));
+}
+
+test "a callable reference on a type takes the most specific candidate while the result is open" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\interface CharSeq
+        \\class Str : CharSeq
+        \\fun CharSeq.trim(): CharSeq = this
+        \\fun Str.trim(vararg n: Int): Str = this
+        \\fun Str.trim(): Str = this
+        \\fun CharSeq.trim(vararg n: Int): CharSeq = this
+        \\fun <T, R> List<T>.mapTo(transform: (T) -> R): List<R> = TODO()
+        \\fun take(a: Str) {}
+        \\fun use(xs: List<Str>) {
+        \\    val out = xs.mapTo(Str::trim)
+        \\    take(out[0])
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("Str::^trim", "demo/trim");
+    const r = try fx.ref("Str::^trim");
+    const recv = fx.s.syms.functionInfo(r.target).receiver;
+    try std.testing.expectEqualStrings("demo.Str", fx.typeText(recv));
+    // The one taking no vararg: it fits without adapting.
+    try std.testing.expectEqual(@as(usize, 0), fx.s.syms.functionInfo(r.target).params.len);
+}
+
 test "a lambda typed against a type variable waits for the call it is an argument of" {
     var fx = try fixture(&.{
         \\package demo
@@ -5380,6 +5483,49 @@ test "a contract's implied is-check smart casts the call's receiver" {
     defer fx.deinit();
     try fx.resolve();
     try fx.expectRef("s.^error", .read, "app/Status.Error.error");
+}
+
+test "a contract's is-check on a type parameter takes the call's type argument" {
+    var fx = try fixture(&.{
+        \\package app
+        \\import kotlin.contracts.contract
+        \\open class Base
+        \\class Sub(val x: Int) : Base()
+        \\inline fun <reified T> assertIs(value: Any?): T {
+        \\    contract { returns() implies (value is T) }
+        \\    return value as T
+        \\}
+        \\fun direct(b: Base): Int { assertIs<Sub>(b); return b.x /*direct*/ }
+        \\fun nested(b: Base): Int {
+        \\    if (b is Base) { assertIs<Sub>(b); return b.x /*nested*/ }
+        \\    return 0
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectRef("b.^x /*direct*/", .read, "app/Sub.x");
+    try fx.expectRef("b.^x /*nested*/", .read, "app/Sub.x");
+}
+
+test "a lambda on the right of ?: is typed by the left side" {
+    var fx = try fixture(&.{
+        \\package app
+        \\inline fun <T, R> T.runOn(block: T.() -> R): R = block()
+        \\class Origin(val scheme: String)
+        \\class Call(val origin: Origin)
+        \\fun scheme(): String = "top"
+        \\fun use(nothing: ((Call) -> Boolean)?) {
+        \\    val viaElvis = nothing ?: { call -> call.origin.runOn { scheme /*elvis*/ == "https" } }
+        \\    val ref = nothing ?: ::check
+        \\}
+        \\fun check(c: Call): Boolean = true
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectRef("call.^origin", .read, "app/Call.origin");
+    try fx.expectRef("^scheme /*elvis*/", .read, "app/Origin.scheme");
+    try fx.expectTarget("::^check", "app/check");
 }
 
 test "a lambda with a return without a value returns Unit and coerces its last statement" {
