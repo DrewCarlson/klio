@@ -8446,24 +8446,30 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
         // Acquire this frame's drawable and wrap its texture as a Ganesh render
         // target. (Managing the drawable directly, rather than WrapCAMetalLayer,
         // because that helper does not hand back the drawable to present here.)
-        id<CAMetalDrawable> d = [kw->metalLayer nextDrawable];
-        const int pw = static_cast<int>(kw->metalLayer.drawableSize.width);
-        const int ph = static_cast<int>(kw->metalLayer.drawableSize.height);
+        // The frame is drawn outside any run loop pass, so the drawable
+        // nextDrawable autoreleases is released here: a drawable left in the
+        // thread's pool keeps its layer, and its textures, alive.
         sk_sp<SkSurface> surf;
-        if (d && d.texture) {
-            GrMtlTextureInfo texInfo;
-            texInfo.fTexture.retain((GrMTLHandle)d.texture);
-            GrBackendRenderTarget backendRT = GrBackendRenderTargets::MakeMtl(pw, ph, texInfo);
-            surf = SkSurfaces::WrapBackendRenderTarget(
-                kw->grContext.get(), backendRT, kTopLeft_GrSurfaceOrigin,
-                kBGRA_8888_SkColorType, nullptr, nullptr);
+        id<CAMetalDrawable> d = nil;
+        @autoreleasepool {
+            d = [kw->metalLayer nextDrawable];
+            const int pw = static_cast<int>(kw->metalLayer.drawableSize.width);
+            const int ph = static_cast<int>(kw->metalLayer.drawableSize.height);
+            if (d && d.texture) {
+                GrMtlTextureInfo texInfo;
+                texInfo.fTexture.retain((GrMTLHandle)d.texture);
+                GrBackendRenderTarget backendRT = GrBackendRenderTargets::MakeMtl(pw, ph, texInfo);
+                surf = SkSurfaces::WrapBackendRenderTarget(
+                    kw->grContext.get(), backendRT, kTopLeft_GrSurfaceOrigin,
+                    kBGRA_8888_SkColorType, nullptr, nullptr);
+            }
+            if (surf) kw->drawable = (GrMTLHandle)CFRetain((CFTypeRef)d);  // hold until present
         }
         if (!surf) return nullptr;
         // The drawable is sized in physical pixels; scale the canvas by the backing
         // factor so the frame (in points) rasterizes at full resolution.
         if (kw->backingScale != 1.0)
             surf->getCanvas()->scale(kw->backingScale, kw->backingScale);
-        kw->drawable = (GrMTLHandle)CFRetain((CFTypeRef)d);  // hold until present
         kw->surface = new KlioSurface();
         kw->surface->surface = surf;
         return kw->surface;
@@ -8477,9 +8483,12 @@ void klio_win_present(KlioWindow* kw) {
 #if defined(KLIO_METAL)
     if (kw->grContext && kw->metalLayer) {
         if (!kw->surface || !kw->drawable) return;
-        kw->grContext->flushAndSubmit(kw->surface->surface.get(), GrSyncCpu::kNo);
-        klioPresentDump(kw->surface);
+        // Skia's Metal backend makes its command buffers and encoders as it
+        // flushes; the frame is outside any run loop pass, so they are
+        // released here.
         @autoreleasepool {
+            kw->grContext->flushAndSubmit(kw->surface->surface.get(), GrSyncCpu::kNo);
+            klioPresentDump(kw->surface);
             id<CAMetalDrawable> d = (id<CAMetalDrawable>)kw->drawable;
             id<MTLCommandBuffer> cmd = [kw->queue commandBuffer];
             [cmd presentDrawable:d];
@@ -8686,8 +8695,12 @@ void klio_win_close(KlioWindow* kw) {
         CFRelease(kw->drawable);
         kw->drawable = nullptr;
     }
-    kw->grContext.reset();
+    @autoreleasepool {
+        kw->grContext.reset();
+    }
     if (kw->metalLayer) {
+        // The view's layer holds it as a sublayer, with its drawables.
+        [kw->metalLayer removeFromSuperlayer];
         [kw->metalLayer release];
         kw->metalLayer = nil;
     }
@@ -8700,9 +8713,14 @@ void klio_win_close(KlioWindow* kw) {
         kw->device = nil;
     }
 #endif
+    // The window is not released when it closes (setReleasedWhenClosed:NO):
+    // its view and layers go with the reference this window holds.
     @autoreleasepool {
         [kw->window close];
+        [kw->window release];
     }
+    kw->window = nil;
+    kw->view = nil;
     delete kw;
 }
 
