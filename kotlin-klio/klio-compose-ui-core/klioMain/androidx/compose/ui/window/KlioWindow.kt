@@ -258,16 +258,27 @@ private fun runApplication(content: @Composable ApplicationScope.() -> Unit): Bo
     }
     // The recomposer shuts down once the content is gone and its effects end.
     driver.recomposer.close()
+    val clock = loop!!
+    val pacer = KlioFramePacer()
     while (!driver.isShutDown) {
-        // State invalidated by effects or events marks every window for redraw.
-        if (driver.frame()) {
-            for (win in app.windows) win.dirty = true
-        }
+        // Queued work, due timers and snapshot writes run on every pass; a
+        // frame, at most once a refresh of the display, as Compose Desktop
+        // draws at the display's rate.
+        driver.runTasks()
         val live = app.windows.toList()
-        for (win in live) {
-            if (win.needsRender) renderWindowFrame(win)
+        pacer.interval = frameIntervalNanos(live)
+        val now = clock.nowNanos()
+        if (pacer.isDue(now) && (driver.wantsFrame || live.any { it.needsRender })) {
+            // State invalidated by effects or events marks every window for redraw.
+            if (driver.frame()) {
+                for (win in app.windows) win.dirty = true
+            }
+            for (win in live) {
+                if (win.needsRender) renderWindowFrame(win)
+            }
+            pacer.framed(now)
         }
-        val timeout = loopTimeout(loop, driver, FRAME_MILLIS.toInt())
+        val timeout = loopTimeout(clock, driver, live, pacer)
         if (live.isEmpty()) {
             // No window to wait on: wait for the loop's next timer, or a frame,
             // running the platform's events for the trays meanwhile.
@@ -276,9 +287,12 @@ private fun runApplication(content: @Composable ApplicationScope.() -> Unit): Bo
                 else __composeui_appWait(timeout)
             }
         } else {
+            // The first window waits for input; the others take what came.
+            var wait = timeout
             for (win in live) {
                 if (win.closed) continue
-                if (pumpWindow(win, timeout, app.blockerOf(win))) win.dirty = true
+                if (pumpWindow(win, wait, app.blockerOf(win))) win.dirty = true
+                wait = 0
             }
         }
         for (tray in app.trays.toList()) tray.poll()
@@ -290,18 +304,59 @@ private fun runApplication(content: @Composable ApplicationScope.() -> Unit): Bo
 }
 
 /**
- * How long a window loop waits for input: no longer than [cap], than the
- * loop's next timer, or than a frame while one is awaited.
+ * How long a window loop waits for input: not at all while work is queued,
+ * and no longer than the loop's next timer, than the next frame while one
+ * is wanted, or than [WAIT_CAP_MILLIS].
  */
-private fun loopTimeout(loop: KlioLoopDispatcher?, driver: KlioRecomposerDriver, cap: Int): Int {
-    var timeout = cap.toLong()
-    loop?.millisToNextTimer()?.let { timeout = minOf(timeout, it) }
-    if (driver.hasPendingWork) timeout = minOf(timeout, FRAME_MILLIS)
+private fun loopTimeout(
+    loop: KlioLoopDispatcher,
+    driver: KlioRecomposerDriver,
+    live: List<KlioWindowHolder>,
+    pacer: KlioFramePacer,
+): Int {
+    if (loop.hasTasks) return 0
+    var timeout = WAIT_CAP_MILLIS
+    loop.millisToNextTimer()?.let { timeout = minOf(timeout, it) }
+    if (driver.wantsFrame || live.any { it.needsRender }) {
+        timeout = minOf(timeout, pacer.nanosUntilDue(loop.nowNanos()) / 1_000_000L)
+    }
     return timeout.toInt()
 }
 
-/** A frame's length at 60 frames a second, in whole milliseconds. */
-private const val FRAME_MILLIS = 16L
+/** The longest a window loop waits for input at once, in milliseconds. */
+private const val WAIT_CAP_MILLIS = 16L
+
+/**
+ * The frames a window loop draws: the next is due an [interval] after the
+ * last one was, so frames keep to the display's refresh; one drawn late
+ * starts the count again from when it was drawn. A frame may come up to
+ * a millisecond early, the resolution of the loop's waits.
+ */
+private class KlioFramePacer {
+    var interval: Long = DEFAULT_FRAME_NANOS
+    private var next = 0L
+
+    fun isDue(now: Long): Boolean = now >= next - FRAME_SLACK_NANOS
+
+    fun framed(now: Long) {
+        next = if (now - next < interval) next + interval else now + interval
+    }
+
+    fun nanosUntilDue(now: Long): Long = (next - now).coerceAtLeast(0L)
+}
+
+private const val DEFAULT_FRAME_NANOS = 16_666_667L
+private const val FRAME_SLACK_NANOS = 1_000_000L
+
+/** A frame's length on the fastest display a window is on. */
+private fun frameIntervalNanos(live: List<KlioWindowHolder>): Long {
+    var hz = 0
+    for (win in live) {
+        if (win.closed || win.hosted) continue
+        hz = maxOf(hz, __composeui_winRefreshHz(win.handle))
+    }
+    return if (hz > 0) 1_000_000_000L / hz else DEFAULT_FRAME_NANOS
+}
 
 // --- windows -------------------------------------------------------------------
 
@@ -1222,6 +1277,10 @@ internal fun __composeui_winOpenError(): String =
 /** Shows the system cursor of [kind] (the shim's KLIO_CURSOR_*) over the window's content. */
 internal fun __composeui_winSetCursor(handle: Long, kind: Int): Unit =
     error("intrinsic androidx.compose.ui.window.__composeui_winSetCursor not installed")
+
+/** The refresh rate of the display the window is on, in frames a second; 0 when unknown. */
+internal fun __composeui_winRefreshHz(handle: Long): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_winRefreshHz not installed")
 
 // Waits up to timeoutMs for the window's next event, writes its values into
 // [out] (WINDOW_EVENT_VALUES of them) and returns its type (WINDOW_EVENT_*).

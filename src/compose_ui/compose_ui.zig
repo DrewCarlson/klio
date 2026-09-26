@@ -48,6 +48,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_a11yActive", a11yActive);
     try b.register("androidx.compose.ui.window.__composeui_a11yUpdate", a11yUpdate);
     try b.register("androidx.compose.ui.window.__composeui_winSetCursor", winSetCursor);
+    try b.register("androidx.compose.ui.window.__composeui_winRefreshHz", winRefreshHz);
     try b.register("androidx.compose.ui.window.__composeui_winDragStart", winDragStart);
     try b.register("androidx.compose.ui.window.__composeui_winDndAccept", winDndAccept);
     try b.register("androidx.compose.ui.window.__composeui_traySupported", traySupported);
@@ -193,6 +194,7 @@ const Skia = struct {
     a11yActive: ?*const fn (?*SkWindow) callconv(.c) c_int,
     a11yUpdate: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
     winSetCursor: ?*const fn (?*SkWindow, c_int) callconv(.c) void,
+    winRefreshHz: ?*const fn (?*SkWindow) callconv(.c) c_int,
     winDragStart: ?WinDragStartFn,
     winDndAccept: ?*const fn (?*SkWindow, c_int) callconv(.c) void,
     winLastError: ?*const fn () callconv(.c) [*:0]const u8,
@@ -348,6 +350,7 @@ fn loadSkia() ?*Skia {
         .a11yActive = lib.lookup(*const fn (?*SkWindow) callconv(.c) c_int, "klio_a11y_active"),
         .a11yUpdate = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_a11y_update"),
         .winSetCursor = lib.lookup(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_set_cursor"),
+        .winRefreshHz = lib.lookup(*const fn (?*SkWindow) callconv(.c) c_int, "klio_win_refresh_hz"),
         .winDragStart = lib.lookup(WinDragStartFn, "klio_win_drag_start"),
         .winDndAccept = lib.lookup(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_dnd_accept"),
         .winLastError = lib.lookup(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
@@ -410,6 +413,7 @@ fn loadSkiaStatic() ?*Skia {
         .a11yActive = externSym(*const fn (?*SkWindow) callconv(.c) c_int, "klio_a11y_active"),
         .a11yUpdate = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_a11y_update"),
         .winSetCursor = externSym(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_set_cursor"),
+        .winRefreshHz = externSym(*const fn (?*SkWindow) callconv(.c) c_int, "klio_win_refresh_hz"),
         .winDragStart = externSym(WinDragStartFn, "klio_win_drag_start"),
         .winDndAccept = externSym(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_dnd_accept"),
         .winLastError = externSym(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
@@ -911,6 +915,16 @@ fn winSetCursor(ctx: *CallCtx) Error!EvalResult {
     const win = winHandle(ctx.args[0]) orelse return ok(.{ .Unit = {} });
     f(win, @intCast(argInt(ctx.args[1])));
     return ok(.{ .Unit = {} });
+}
+
+/// `__composeui_winRefreshHz(handle): Int`: the refresh rate of the display
+/// the window is on, in frames a second; 0 where the platform does not say.
+fn winRefreshHz(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value{ .Int = 0 });
+    const skia = loadSkia() orelse return ok(Value{ .Int = 0 });
+    const f = skia.winRefreshHz orelse return ok(Value{ .Int = 0 });
+    const win = winHandle(ctx.args[0]) orelse return ok(Value{ .Int = 0 });
+    return ok(Value{ .Int = @intCast(f(win)) });
 }
 
 /// `__composeui_winDragStart(handle, payload, png, offsetX, offsetY, actions):
@@ -1560,8 +1574,9 @@ test "hostBindings registers the surface and windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winEventText") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_a11yUpdate") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetCursor") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winRefreshHz") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winDragStart") != null);
-    try testing.expectEqual(@as(usize, 69), b.len());
+    try testing.expectEqual(@as(usize, 70), b.len());
 }
 
 test "a window that cannot open says why" {
@@ -1682,6 +1697,7 @@ test "the accessibility bindings are inactive and do nothing for short args" {
     try testing.expect(!(try a11yActive(&c)).ok.Bool);
     try testing.expect((try a11yUpdate(&c)).ok == .Unit);
     try testing.expect((try winSetCursor(&c)).ok == .Unit);
+    try testing.expectEqual(@as(i32, 0), (try winRefreshHz(&c)).ok.Int);
     try testing.expect(!(try winDragStart(&c)).ok.Bool);
     try testing.expect((try winDndAccept(&c)).ok == .Unit);
 }

@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.onClick
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerButton
@@ -21,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalFoundationApi::class)
 fun main() {
@@ -57,10 +57,10 @@ fun main() {
                         ) { println("drag by $it") }
                 )
             }
-            // Sixty frames, a second, then the application ends.
+            // A second, the scripted input's span, then the application ends.
             LaunchedEffect(Unit) {
                 opened = true
-                repeat(60) { withFrameNanos { } }
+                delay(1_000)
                 exitApplication()
             }
         }

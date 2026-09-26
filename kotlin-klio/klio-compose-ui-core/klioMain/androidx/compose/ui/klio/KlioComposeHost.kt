@@ -204,13 +204,22 @@ internal class KlioRecomposerDriver(
     val hasPendingWork: Boolean
         get() = recomposer.hasPendingWork || frameClock.hasAwaiters || loop?.hasTasks == true
 
-    fun frame(): Boolean {
+    /** Whether the next frame has work: invalidations or frame awaiters. */
+    val wantsFrame: Boolean
+        get() = recomposer.hasPendingWork || frameClock.hasAwaiters
+
+    /** Runs the loop's queued work and due timers, and applies the snapshot writes made since. */
+    fun runTasks() {
         loop?.runPending()
         // Writes to the global snapshot since the last frame (a click handler's,
         // or the program's own between frames) invalidate what read them only
         // once they are applied.
         Snapshot.sendApplyNotifications()
         loop?.runPending()
+    }
+
+    fun frame(): Boolean {
+        runTasks()
         if (!recomposer.hasPendingWork && !frameClock.hasAwaiters) return false
         val before = recomposer.changeCount
         if (loop != null) frameNanos = loop.nowNanos()

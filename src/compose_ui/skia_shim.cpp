@@ -2735,6 +2735,16 @@ static SDL_Cursor* klioSdlCursor(int kind) {
 
 // The cursor over the window's content. SDL's cursor is the mouse's, so a
 // window sets it as the pointer's hover over it asks.
+// The refresh rate of the display the window is on, in frames a second (0
+// where SDL does not know it).
+int klio_win_refresh_hz(KlioWindow* kw) {
+    if (!kw) return 0;
+    const int display = SDL_GetWindowDisplayIndex(kw->win);
+    SDL_DisplayMode mode;
+    if (display < 0 || SDL_GetCurrentDisplayMode(display, &mode) != 0) return 0;
+    return mode.refresh_rate;
+}
+
 void klio_win_set_cursor(KlioWindow* kw, int kind) {
     if (!kw) return;
     if (SDL_Cursor* c = klioSdlCursor(kind)) SDL_SetCursor(c);
@@ -6546,6 +6556,19 @@ int klio_win_drag_start(KlioWindow* kw, const char* payload, size_t len, const u
 
 // The cursor over the window's client area: WM_SETCURSOR's from now on, and
 // at once while the pointer is over it.
+// The refresh rate of the monitor the window is on, in frames a second.
+int klio_win_refresh_hz(KlioWindow* kw) {
+    if (!kw || !kw->hwnd) return 0;
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(MonitorFromWindow(kw->hwnd, MONITOR_DEFAULTTONEAREST), &info)) return 0;
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) return 0;
+    // 0 and 1 mean the hardware's default rate.
+    return mode.dmDisplayFrequency > 1 ? static_cast<int>(mode.dmDisplayFrequency) : 0;
+}
+
 void klio_win_set_cursor(KlioWindow* kw, int kind) {
     if (!kw || kw->cursorKind == kind) return;
     kw->cursorKind = kind;
@@ -8149,6 +8172,18 @@ static NSCursor* klioCocoaCursor(int kind) {
 
 // The cursor over the window's content: its cursor rect's from now on, and
 // at once while the pointer is over the content.
+// The refresh rate of the display the window is on (a ProMotion display's
+// highest), in frames a second.
+int klio_win_refresh_hz(KlioWindow* kw) {
+    if (!kw) return 0;
+    @autoreleasepool {
+        NSScreen* screen = [kw->window screen] ?: [NSScreen mainScreen];
+        if (!screen) return 0;
+        if (@available(macOS 12.0, *)) return static_cast<int>([screen maximumFramesPerSecond]);
+        return 60;
+    }
+}
+
 void klio_win_set_cursor(KlioWindow* kw, int kind) {
     if (!kw) return;
     @autoreleasepool {
@@ -9163,6 +9198,7 @@ void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
+int klio_win_refresh_hz(void*) { return 0; }
 void klio_win_set_cursor(void*, int) {}
 void klio_win_dnd_accept(void*, int) {}
 int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
@@ -9418,6 +9454,7 @@ void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
+int klio_win_refresh_hz(void*) { return 0; }
 void klio_win_set_cursor(void*, int) {}
 void klio_win_dnd_accept(void*, int) {}
 int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
@@ -9477,6 +9514,7 @@ void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
+int klio_win_refresh_hz(void*) { return 0; }
 void klio_win_set_cursor(void*, int) {}
 void klio_win_dnd_accept(void*, int) {}
 int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
