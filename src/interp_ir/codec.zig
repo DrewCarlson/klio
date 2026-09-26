@@ -273,8 +273,16 @@ const Decoder = struct {
     a: Allocator,
     buf: []const u8,
     pos: usize = 0,
+    /// Holds the registries, which only the decode itself reads: they are
+    /// freed with the decoder, not left in `a` beside what was decoded.
+    scratch: Allocator = std.heap.smp_allocator,
     nodes: std.ArrayList(usize) = .empty,
     slices: std.ArrayList(SliceEntry) = .empty,
+
+    fn deinit(self: *Decoder) void {
+        self.nodes.deinit(self.scratch);
+        self.slices.deinit(self.scratch);
+    }
 
     fn take(self: *Decoder, n: usize) DecodeError![]const u8 {
         if (self.pos + n > self.buf.len) return error.Malformed;
@@ -344,7 +352,7 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
         return;
     }
     if (comptime isWatched(T)) {
-        try d.nodes.append(d.a, @intFromPtr(out));
+        try d.nodes.append(d.scratch, @intFromPtr(out));
     }
     const info = @typeInfo(T);
     switch (info) {
@@ -409,12 +417,12 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
                     const len: usize = @intCast(try d.varint());
                     if (p.child == u8 and p.is_const) {
                         const s = try d.take(len);
-                        try d.slices.append(d.a, .{ .addr = @intFromPtr(s.ptr), .len = len });
+                        try d.slices.append(d.scratch, .{ .addr = @intFromPtr(s.ptr), .len = len });
                         out.* = s;
                     } else {
                         decStat(p.child, len);
                         const arr = try d.a.alloc(p.child, len);
-                        try d.slices.append(d.a, .{ .addr = @intFromPtr(arr.ptr), .len = len });
+                        try d.slices.append(d.scratch, .{ .addr = @intFromPtr(arr.ptr), .len = len });
                         if (p.child == u8) {
                             @memcpy(arr, try d.take(len));
                         } else {
@@ -473,6 +481,7 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
 /// so every call decodes.
 pub fn decodeFuncBlocks(a: Allocator, section: []const u8, offset: u32) ?[]ir.Block {
     var d = Decoder{ .a = a, .buf = section, .pos = offset };
+    defer d.deinit();
     var blocks: []ir.Block = undefined;
     decodeInto([]ir.Block, &d, &blocks) catch return null;
     return blocks;
@@ -512,6 +521,7 @@ pub const CodecError = DecodeError;
 /// values point into `bytes`, which must outlive them.
 pub fn decodeBytes(comptime T: type, a: Allocator, bytes: []const u8) CodecError!T {
     var d = Decoder{ .a = a, .buf = bytes };
+    defer d.deinit();
     var out: T = undefined;
     try decodeInto(T, &d, &out);
     return out;
@@ -525,7 +535,8 @@ fn encodeOne(comptime T: type, gpa: Allocator, value: *const T) ![]u8 {
 }
 
 fn decodeOne(comptime T: type, a: Allocator, bytes: []const u8) !T {
-    var d = Decoder{ .a = a, .buf = bytes };
+    var d = Decoder{ .a = a, .buf = bytes, .scratch = testing.allocator };
+    defer d.deinit();
     var out: T = undefined;
     try decodeInto(T, &d, &out);
     try testing.expectEqual(bytes.len, d.pos);
@@ -799,7 +810,8 @@ test "codec floats are little-endian IEEE-754 bits on the wire" {
     const v: f64 = 1.5;
     const bytes = try encodeOne(f64, a, &v);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0xf8, 0x3f }, bytes);
-    var d = Decoder{ .a = a, .buf = bytes };
+    var d = Decoder{ .a = a, .buf = bytes, .scratch = testing.allocator };
+    defer d.deinit();
     var out: f64 = undefined;
     try decodeInto(f64, &d, &out);
     try testing.expectEqual(v, out);
@@ -811,7 +823,8 @@ test "codec rejects truncated input" {
     const a = arena.allocator();
     const v: []const u8 = "hello";
     const bytes = try encodeOne([]const u8, a, &v);
-    var d = Decoder{ .a = a, .buf = bytes[0 .. bytes.len - 2] };
+    var d = Decoder{ .a = a, .buf = bytes[0 .. bytes.len - 2], .scratch = testing.allocator };
+    defer d.deinit();
     var out: []const u8 = undefined;
     try testing.expectError(error.Malformed, decodeInto([]const u8, &d, &out));
 }

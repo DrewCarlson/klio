@@ -85,6 +85,10 @@ pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, bin
     defer runtime.gc.alloc_perm = saved_perm;
     const br = try bridge.build(a, s, .{ .natives = binding.natives, .host_symbol = binding.host_symbol, .host_members = binding.host_members, .spread_varargs = binding.spread_varargs, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries, .records = out.files, .layers = try a.dupe(bridge.Layer, &.{layer}) });
     const prog = try lower.lowerProgram(a, s, br);
+    if (Timing.start().on) {
+        const syms = &s.syms;
+        std.debug.print("[sema-timing] bake: {d} symbols ({d} declared; {d} functions, {d} properties, {d} params, {d} locals, {d} classes), {d} types, {d} names\n", .{ syms.count(), prefix, syms.functions.items.len, syms.properties.items.len, syms.params.items.len, syms.locals.items.len, syms.classes.items.len, s.types.items.items.len, s.names.strs.items.len });
+    }
     return base_image.encode(gpa, a, s, br, &prog.lowered, prefix);
 }
 
