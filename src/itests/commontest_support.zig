@@ -863,18 +863,34 @@ pub const suites = [_]Config{
     .{
         // lifecycle-viewmodel's commonTest (ViewModel, its store, the
         // provider and its factories), asserted through upstream Kruth, with
-        // klio's actual of the suite's IgnoreWebTarget. The nine
-        // ViewModelProvider tests fail on ViewModelProvider.create's
-        // defaults: the actual does not take its expect's defaults when a
-        // parameter's type is a class nested in the expect class.
+        // klio's actual of the suite's IgnoreWebTarget.
         .name = "lifecycle_viewmodel",
         .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel/src/commonTest/kotlin"},
         .extra_support = &(kruth_support ++ [_][]const u8{"tests/lifecycle_commontest_actuals/viewmodel"}),
         .extra_args = &.{ "--feature", "androidx.lifecycle/viewmodel" },
         .batch_dirs = true,
         .timeout_ms = 300_000,
-        .baseline = 26,
-        .max_failed = 9,
+        .baseline = 35,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        // savedstate's commonTest (SavedState, its registry, and the
+        // kotlinx.serialization codec), asserted through upstream Kruth, with
+        // the nonAndroidTest actuals and klio's IgnoreWebTarget. The codec
+        // failures are a reified `T?` losing its `?` inside another inline
+        // function's reified `T`, so the non-null serializer is picked.
+        .name = "savedstate",
+        .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/savedstate/savedstate/src/commonTest/kotlin"},
+        .extra_support = &(kruth_support ++ [_][]const u8{
+            "kotlin-klio/klio-compose-runtime/upstream/savedstate/savedstate/src/nonAndroidTest/kotlin",
+            "tests/savedstate_commontest_actuals",
+        }),
+        .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
+        .batch_dirs = true,
+        .timeout_ms = 600_000,
+        .baseline = 333,
+        .max_failed = 23,
         .max_incomplete = 0,
     },
 };

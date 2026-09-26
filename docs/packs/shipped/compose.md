@@ -12,7 +12,7 @@ each upstream module is its own pack.
 | Pack id                              | Upstream module                | Depends on                                               |
 |--------------------------------------|--------------------------------|----------------------------------------------------------|
 | `androidx.compose.runtime`           | runtime/runtime                |                                                          |
-| `androidx.compose.runtime.saveable`  | runtime/runtime-saveable       | runtime, collection                                      |
+| `androidx.compose.runtime.saveable`  | runtime/runtime-saveable       | runtime, collection, lifecycle, savedstate (compose), serialization |
 | `androidx.compose.ui.util`           | ui/ui-util                     |                                                          |
 | `androidx.compose.ui.geometry`       | ui/ui-geometry                 | runtime, ui.util                                         |
 | `androidx.compose.ui.unit`           | ui/ui-unit                     | runtime, ui.util, ui.geometry                            |
@@ -42,7 +42,15 @@ lifecycle library, one pack whose features are its modules, since they share
 the `androidx.lifecycle` package: `common`, `runtime` (the default),
 `viewmodel` and `runtime-compose`, which ui asks for
 (`--feature androidx.lifecycle/viewmodel` in a program without a
-manifest). `org.jetbrains.skiko` (`kotlin-klio/klio-skiko`) is skiko's
+manifest). `androidx.savedstate` (`kotlin-klio/klio-savedstate`) is the
+saved-state library, with features `savedstate` (the default) and
+`compose`; runtime-saveable is built on it. The lifecycle library's
+lifecycle-viewmodel-savedstate and lifecycle-viewmodel-compose modules ship
+as the `androidx.lifecycle.viewmodel.savedstate` and
+`androidx.lifecycle.viewmodel.compose` packs: savedstate is built on
+lifecycle-common and they on savedstate, so as features of
+`androidx.lifecycle` they would make the two packs depend on each other.
+`org.jetbrains.skiko` (`kotlin-klio/klio-skiko`) is skiko's
 commonMain, the `org.jetbrains.skia` API, over the native functions skiko's
 C glue exports from the Skia shim. `klio.compose.ui`
 (`kotlin-klio/klio-compose-ui`) is klio's own windowing and rendering layer
@@ -64,8 +72,7 @@ signature:
 
 - libraries outside the checkout: the androidx annotation markers (the
   `androidx.annotation` pack), compose's runtime-annotation markers and
-  runtime-retain's store (runtime pack), and the savedstate slice the
-  saveable pack carries;
+  runtime-retain's store (runtime pack);
 - platform code: a `GraphicsLayer` that records into a Skia picture through
   klio's shim and replays it under its transform, clip and offscreen layer
   (skiko's does the same through a skiko RenderNode), a Kotlin `PathMeasure`, code-point stand-ins

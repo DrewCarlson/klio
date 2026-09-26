@@ -1,0 +1,33 @@
+# androidx.lifecycle.viewmodel.savedstate: lifecycle-viewmodel-savedstate
+# (SavedStateHandle, SavedStateViewModelFactory, enableSavedStateHandles and
+# the saved-state delegates), vendored verbatim from the
+# compose-multiplatform-core submodule (commonMain with the non-Android and
+# native actuals). It is a module of the lifecycle library, but its own pack:
+# the savedstate library sits between it and the androidx.lifecycle pack
+# (savedstate is built on lifecycle-common, and this module on savedstate),
+# so as a feature of androidx.lifecycle it would make the two packs depend
+# on each other.
+[library]
+id = "androidx.lifecycle.viewmodel.savedstate"
+version = "2.11.0"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel-savedstate/src/commonMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel-savedstate/src/nonAndroidMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel-savedstate/src/nativeMain/kotlin"
+
+[deps]
+stdlib = "*"
+"androidx.annotation" = "*"
+"androidx.collection" = "*"
+"androidx.lifecycle" = { version = "*", features = ["viewmodel"] }
+"androidx.savedstate" = "*"
+"kotlinx.coroutines" = "*"
+"kotlinx.serialization" = "*"

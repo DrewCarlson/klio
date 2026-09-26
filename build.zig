@@ -462,6 +462,18 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlin-test",
         "tests/lifecycle_commontest_actuals",
     }, .weight = 1 },
+    .{ .name = "savedstate_commontest", .needs_exe = true, .home = true, .dirs = &.{
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-androidx-annotation",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-lifecycle",
+        "kotlin-klio/klio-savedstate",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-serialization",
+        "kotlin-klio/klio-kotlin-test",
+        "tests/savedstate_commontest_actuals",
+    }, .weight = 2 },
 };
 
 /// Read by the stdlib pack's tests: the stdlib pack is built at runtime from

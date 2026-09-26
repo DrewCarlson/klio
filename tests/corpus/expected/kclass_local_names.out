@@ -1,0 +1,6 @@
+top-level: simpleName=TopLevel qualifiedName=names.TopLevel
+nested: simpleName=Nested qualifiedName=names.TopLevel.Nested
+local: simpleName=Local qualifiedName=null
+inner of local: simpleName=Inner qualifiedName=null
+local in a lambda: simpleName=InLambda qualifiedName=null
+anonymous: simpleName=null qualifiedName=null

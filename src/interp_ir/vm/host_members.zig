@@ -475,7 +475,9 @@ fn matchGroup(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!
 
 /// `KClass.simpleName` or `qualifiedName` of a class value, from its def:
 /// the simple name the last `.` or a lifted class's last `$` starts, and
-/// null for both of an anonymous class.
+/// null for both of an anonymous class. A local class (and a class nested
+/// in one), whose name sema roots at `<local>`, has a simple name and no
+/// qualified one.
 fn classProperty(comptime name: []const u8) HostFn {
     return struct {
         fn call(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!EvalResult {
@@ -485,10 +487,26 @@ fn classProperty(comptime name: []const u8) HostFn {
             defer g.deinit();
             const cd = g.get();
             if (cd.is_anonymous) return .{ .ok = .Null };
-            const text = if (comptime std.mem.eql(u8, name, "simpleName")) host_util.classSimpleName(cd.name) else cd.fqn;
+            const qualified = comptime std.mem.eql(u8, name, "qualifiedName");
+            if (qualified and isLocalFqn(cd.fqn)) return .{ .ok = .Null };
+            const text = if (!qualified) host_util.classSimpleName(cd.name) else cd.fqn;
             return .{ .ok = .{ .String = try runtime.strInit(a, text) } };
         }
     }.call;
+}
+
+/// Whether a class's fqn is a local class's: sema names a class declared in
+/// a function body, and every class nested in it, under `<local>`.
+fn isLocalFqn(fqn: []const u8) bool {
+    return std.mem.eql(u8, fqn, "<local>") or std.mem.startsWith(u8, fqn, "<local>.");
+}
+
+test "a local class's fqn has no qualified name, a top-level or nested one does" {
+    try std.testing.expect(isLocalFqn("<local>.Local"));
+    try std.testing.expect(isLocalFqn("<local>.Local.Nested"));
+    try std.testing.expect(!isLocalFqn("TopLevel"));
+    try std.testing.expect(!isLocalFqn("pkg.Outer.Nested"));
+    try std.testing.expect(!isLocalFqn("pkg.localish.Name"));
 }
 
 /// `KClass.isInstance`: whether the value's class is the class or one of

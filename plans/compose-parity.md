@@ -44,12 +44,13 @@ where the upstream one needs the JVM, AWT or a native platform API.
 | `compose_plugin_commontest` | the same sets, one child per class | 1404 | 0 | 1385 / 5 |
 | `compose_animation` | animation-core commonTest | 107 | 0 | 107 / 0 |
 | `compose_shapes` | graphics-shapes commonTest | 148 | 0 | 148 / 0 |
-| `lifecycle_viewmodel` | lifecycle-viewmodel commonTest | 26 | 9 | 26 / 9 |
+| `lifecycle_viewmodel` | lifecycle-viewmodel commonTest | 35 | 0 | 35 / 0 |
+| `savedstate` | savedstate commonTest (with nonAndroidTest's actuals) | 333 | 23 | 333 / 23 |
 
-The nine lifecycle-viewmodel failures are the ViewModelProvider tests: an
-actual does not take its expect's defaults when a parameter's type is a
-class nested in the expect class (`ViewModelProvider.create`'s `extras`);
-routed to sema.
+The savedstate failures are the codec tests: a reified
+`T?` inside an inline function whose own `T` is reified loses its `?`, so
+`encodeDecodeImpl<T?>` encodes through the non-null serializer; routed to
+sema.
 
 
 Not run yet, and what each needs:
@@ -63,8 +64,112 @@ Not run yet, and what each needs:
 | material3 desktopTest | 4 | the harness |
 | ui skikoTest | 37 | the harness |
 | ui-graphics skikoTest, ui-text skikoTest | 7 + 7 | the org.jetbrains.skia binding layer |
-| lifecycle-runtime commonTest | 5 | `Dispatchers.Main.immediate` dispatches work already running on Main, so under the desktop's `runLifecycleTest` (runBlocking on Main) withStarted on a destroyed lifecycle waits forever instead of throwing; routed to coroutines |
-| savedstate commonTest | 8 | the savedstate pack, which waits on a sema fix (a `Ser<*>` reaching `Ser<T>` through a nested call's result) |
+| lifecycle-runtime commonTest | 5 | the Main dispatcher fixes (below): under the desktop's `runLifecycleTest` (runBlocking on Main, the actual in tests/lifecycle_commontest_actuals/runtime) WithLifecycleStateTest.testBlockCancelledWhenInitiallyDestroyed waits forever; with a runTest form 39 of 65 passed |
+| lifecycle-viewmodel-savedstate commonTest | 1 | lifecycle-runtime-testing's TestLifecycleOwner (not in the checkout) |
+
+## Handoff: state and open items
+
+State on 2026-09-26, for picking the work up cold.
+
+**Done and green.** The suites above hold their ratchets. Every compose
+example with an expected output matches it on macOS (75 of 75, compose_tray
+under `KLIO_TRAY_HOST=1`; three interactive or output-less examples are not
+compared), and `scripts/compose-ui-gate.sh`
+passes 13 of 13. The JVM oracle's last full sweep found 44 headless
+examples identical to Compose Desktop 1.12.0. The headless examples added
+since (compose_graphics_layer, compose_onclick, compose_locale,
+compose_clipboard, compose_foundation_lazy, ...) were checked against the
+oracle when they landed and expect the JVM's output; compose_window_input and
+compose_window_pointer expect the event sequences Compose Desktop prints for
+the same events through ImageComposeScene. The other window examples
+(lifetime, modal, transparent, menus, tray) open native windows the headless
+oracle cannot, and are checked by frame dumps and scripted input. A fresh
+full oracle sweep (`scripts/compose-oracle.py` over every compose example)
+has not been run since the 44. The sema census
+over the compose, lifecycle, savedstate and skiko packs has no unresolved
+site, no unlowered site and no unbound native: material3's natives are all
+bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
+(aarch64 container) and Windows (cross-linked klio.exe) are in Platforms.
+
+**Open, each with what to run and where it lives.**
+
+1. Reified `T?` loses its `?` (sema/lowering; with Sema). Repro:
+   plans/compose-parity-pending/reified_nullable_type_argument.kt (expected
+   output in its header). Cause: substituting a reified argument written
+   `T?`, where `T` is the enclosing inline function's reified parameter,
+   drops the nullability (typeOf, serializer<T>()). Effect: the 23 savedstate
+   failures (SavedStateCodecTest, SavedStateCodecEncodeDefaultsTest,
+   MutableStateFlowSerializerTest, SavedStateRegistryOwnerDelegateTest.
+   saved_nullable_restoreNull). After the fix, raise the `savedstate` ratchet
+   in src/itests/commontest_support.zig from 333 / 23 and check whether
+   encodeDefaults_false and the MutableStateFlow `Any` serializer lookups
+   were the same cause.
+2. The Main dispatcher (coroutines; with P1). Repros:
+   plans/compose-parity-pending/main_immediate_launch.kt (Main.immediate
+   dispatches work already on Main) and main_from_worker.kt
+   (runBlocking(Dispatchers.Main.immediate) on a worker runs there). After
+   both: register lifecycle-runtime's commonTest as a suite (test roots
+   lifecycle/lifecycle-runtime/src/commonTest, extra support Kruth,
+   testutils/testutils-lifecycle/src/commonMain and
+   tests/lifecycle_commontest_actuals/runtime), and move
+   plans/compose-parity-pending/lifecycle_registry.kt to examples/ with
+   lifecycle_registry.out as tests/corpus/expected/lifecycle_registry.out
+   (its two differences today: the off-main call does not throw, and
+   viewModelScope's cancellation prints after onCleared).
+3. A program's `[deps]` does not load a pack no import names by id prefix
+   (src/cli/pack_cache.zig; with Sema). `org.jetbrains.skia` imports need an
+   `org.jetbrains.skiko` import beside them, and `androidx.lifecycle.
+   SavedStateHandle` alone selects no pack.
+4. The upstream scene (item 3). Every library it needs is a pack now:
+   androidx.lifecycle (runtime-compose), androidx.savedstate (compose),
+   androidx.lifecycle.viewmodel.savedstate, androidx.lifecycle.viewmodel.
+   compose. Next: ui's skikoMain PlatformContext with desktopMain's
+   DefaultArchitectureComponentsOwner (lifecycle, view model store,
+   saved-state registry, enableSavedStateHandles),
+   ProvidePlatformCompositionLocals (LocalLifecycleOwner,
+   LocalSavedStateRegistryOwner, LocalSaveableStateRegistry,
+   HostDefaultProviderImpl), then RootNodeOwner, BaseComposeScene and
+   CanvasLayersComposeScene in place of KlioComposeHost and KlioScene
+   (kotlin-klio/klio-compose-ui-core/klioMain). ui-core's klio.toml takes the
+   two viewmodel packs as deps then; ComposeSceneInputHandler.klio.kt goes
+   back to upstream's file once RootNodeOwner is in.
+5. The skia binding layer's second half (item 6). foundation drops its
+   stand-ins kotlin-klio/klio-compose-foundation/klioMain/org/jetbrains/
+   skia/{BreakIterator,icu/CharProperties}.klio.kt for skiko's (add
+   "org.jetbrains.skiko" to its deps; ICU grapheme breaks change cursor
+   movement over combining marks and emoji sequences, check against the
+   oracle) and takes DragAndDropSource.skiko.kt once ui-graphics' canvas is
+   skia's. ui-graphics and ui-text move onto their skikoMain (SkiaBackedCanvas,
+   SkiaBackedPath, SkiaParagraph) in place of KlioCanvas, KlioPath and
+   PlatformParagraph; that closes the paragraph and PathMeasure divergences
+   below and unblocks the ui-graphics and ui-text skikoTest suites. The
+   shaper's run handlers (kotlin-klio/klio-skiko/klioMain/org/jetbrains/
+   skia/shaper/Shaper.klio.kt) still throw; they need callbacks through
+   src/skiko like the Drawable's.
+6. lifecycle-viewmodel-savedstate's commonTest needs
+   androidx.lifecycle.testing.TestLifecycleOwner (lifecycle-runtime-testing):
+   add it as a `runtime-testing` feature of androidx.lifecycle once the
+   checkout carries it, then register the suite.
+7. The gesture timing divergence (with P1): after two taps too quick for a
+   double click, onClick takes the next tap as a long click (the repro sent
+   to P1; compose_onclick keeps timeout-driven gestures out until then).
+8. Not verified anywhere: running on Windows (the shim's link needs the MSVC
+   toolchain the Windows Skia prebuilt is built with), a Wayland session.
+9. The long tail in Inventory: foundation's TooltipArea, ContextMenuProvider,
+   BasicContextMenuRepresentation, text/ContextMenu; ui's ImageComposeScene,
+   renderComposeScene and the skia interop; runtime-retain's `retain`.
+
+**Sparse checkout widenings a future item needs** (for the coordinator to
+run; scripts/init-compose-submodule.sh lists the current set):
+
+- `lifecycle/lifecycle-runtime-testing/src/commonMain` (and its nonJvmMain
+  or nativeMain actuals, if the module has them): TestLifecycleOwner, for
+  lifecycle-viewmodel-savedstate's commonTest (item 6).
+- `lifecycle/lifecycle-runtime-compose/src/commonTest` and
+  `savedstate/savedstate-compose/src/commonTest`, if upstream has them:
+  their suites.
+- `compose/ui/ui-test/src/desktopMain`, if the ui-test skiko harness
+  (item 4 of Order of work) reaches it.
 
 ## Order of work
 
@@ -82,15 +187,21 @@ Not run yet, and what each needs:
    in: one androidx.lifecycle pack, a feature per upstream module (common,
    runtime by default, viewmodel, runtime-compose), commonMain with the
    non-JVM and native actuals verbatim; the runtime's main-thread check is
-   the desktop's over klio.Thread. The rest waits for the savedstate pack
-   (savedstate, savedstate-compose, viewmodel-savedstate), then the
+   the desktop's over klio.Thread. The savedstate library is in too (one
+   androidx.savedstate pack: savedstate, the default, and compose), and
+   runtime-saveable takes its whole commonMain over it. The lifecycle
+   library's viewmodel-savedstate and viewmodel-compose modules are packs of
+   their own (savedstate is built on lifecycle-common and they are built on
+   savedstate). viewmodel-savedstate's commonTest needs lifecycle-runtime-
+   testing's TestLifecycleOwner, which the checkout does not carry. Then the
    PlatformContext's architecture components owner the scene provides.
 4. **The ui-test skiko harness**, then the foundation, material3 and ui
    skikoTest suites, each with its own ratchet.
 5. **Desktop and skiko public APIs.** Scrollbars, TooltipArea, ContextMenuArea,
    `Modifier.onClick` and PointerMatcher, `Modifier.onDrag`,
    `Modifier.onPointerEvent`, material3's `Modifier.scrollbar`, ui-graphics'
-   PathSvg / PathHitTester / PathGeometry, MeshGradient, `rememberSerializable`.
+   PathSvg / PathHitTester / PathGeometry, MeshGradient. `rememberSerializable`
+   is in.
 6. **The org.jetbrains.skia binding layer**, so ui-graphics' and ui-text's
    skikoMain run verbatim in place of KlioCanvas, KlioPath and
    PlatformParagraph. In place: skiko's C glue (all 86 sources of
@@ -125,7 +236,7 @@ Upstream v1.12.0 (f29d2f99) against the packs, desktop-equivalent sets.
 | Module | commonMain | skikoMain | nonJvmMain | desktopMain (java-free) |
 |--------|-----------:|----------:|-----------:|------------------------:|
 | runtime | 188 / 188 | n/a | 6 / 9, nonAndroid 10 / 10 | jvmAndAndroid 3 java-free; klio actuals |
-| runtime-saveable | 7 / 9 | n/a | n/a | n/a |
+| runtime-saveable | 9 / 9 | n/a | n/a | n/a |
 | ui | 244 / 244 | 45 / 92 | 8 / 8 | 86 / 175 |
 | ui-graphics | 82 / 82 | 0 / 19 | 1 / 1 | 0 / 7 |
 | ui-text | 79 / 79 | 2 / 28 | 4 / 5 | 0 / 15 |
@@ -157,7 +268,7 @@ Public API still missing (beyond the scene internals): ui's
 `ImageComposeScene`, `renderComposeScene`; the skia interop
 (`asComposeCanvas`, `toComposeImageBitmap`, ...) and ui-text's deprecated
 Typeface-based `FontLoader`, which come with the binding layer; foundation's
-`TooltipArea`, `ContextMenuArea`; runtime-saveable's `rememberSerializable`;
+`TooltipArea`, `ContextMenuArea`;
 runtime-retain's `retain`, `RetainedEffect` and the stores.
 
 ## Platforms
@@ -413,6 +524,14 @@ isTraySupported is false), and running on Windows.
   is the lifecycle_viewmodel suite. skiko's natives bind by name at
   lowering, and a program drawing with skia directly prints what it prints
   on the JVM.
+- 2026-09-26: the savedstate library is one androidx.savedstate pack
+  (savedstate, the default, and compose), and runtime-saveable takes its whole
+  commonMain over it (rememberSerializable, serializableSaver, the registry's
+  bridge to a SavedStateRegistryOwner). lifecycle-viewmodel-savedstate and
+  lifecycle-viewmodel-compose ship as packs of their own. savedstate's
+  commonTest is the savedstate suite. A local class's `KClass.qualifiedName`
+  is null, as Kotlin's is (lifecycle refuses a local class as a ViewModel by
+  it), and lifecycle-viewmodel's suite passes whole.
 - Open, routed to coroutines: `Dispatchers.Main.immediate` dispatches work
   already running on Main, and `runBlocking(Dispatchers.Main)` from a worker
   runs its block on the worker. Each shows in lifecycle: the first leaves

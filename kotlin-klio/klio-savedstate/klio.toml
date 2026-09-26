@@ -1,0 +1,46 @@
+# androidx.savedstate: the saved-state library, vendored verbatim from the
+# compose-multiplatform-core submodule, one feature per upstream module:
+#
+#   savedstate  SavedState, its reader and writer, SavedStateRegistry with
+#               its owner and controller, and the kotlinx.serialization
+#               encoding of saved state (the default)
+#   compose     LocalSavedStateRegistryOwner and the serializers of Compose's
+#               snapshot state
+#
+# Each module takes commonMain with the non-Android and native actuals the
+# desktop build's counterparts mirror.
+[library]
+id = "androidx.savedstate"
+version = "1.5.0-alpha01"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/savedstate/savedstate/src/commonMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/savedstate/savedstate/src/nonAndroidMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/savedstate/savedstate/src/nativeMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/savedstate/savedstate-compose/src/commonMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/savedstate/savedstate-compose/src/nonAndroidMain/kotlin"
+
+[deps]
+stdlib = "*"
+"androidx.annotation" = "*"
+"androidx.collection" = "*"
+"androidx.lifecycle" = { version = "*", default_features = false, features = ["common"] }
+"kotlinx.atomicfu" = "*"
+"kotlinx.coroutines" = "*"
+"kotlinx.serialization" = "*"
+
+[features]
+default = ["savedstate"]
+savedstate = { sources = ["../klio-compose-runtime/upstream/savedstate/savedstate/"] }
+compose = { sources = ["../klio-compose-runtime/upstream/savedstate/savedstate-compose/"], requires = ["savedstate"], deps = ["androidx.compose.runtime"] }

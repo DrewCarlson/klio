@@ -1,0 +1,29 @@
+# androidx.lifecycle.viewmodel.compose: lifecycle-viewmodel-compose
+# (LocalViewModelStoreOwner, viewModel(), rememberViewModelStoreOwner and the
+# SavedStateHandle savers), vendored verbatim from the
+# compose-multiplatform-core submodule (commonMain with the non-JVM
+# actuals). A module of the lifecycle library in its own pack, as
+# viewmodel-savedstate is: it is built on that module and on savedstate.
+[library]
+id = "androidx.lifecycle.viewmodel.compose"
+version = "2.11.0"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel-compose/src/commonMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel-compose/src/nonJvmMain/kotlin"
+
+[deps]
+stdlib = "*"
+"androidx.annotation" = "*"
+"androidx.compose.runtime" = "*"
+"androidx.compose.runtime.saveable" = "*"
+"androidx.lifecycle" = { version = "*", features = ["viewmodel", "runtime-compose"] }
+"androidx.lifecycle.viewmodel.savedstate" = "*"
+"androidx.savedstate" = { version = "*", features = ["compose"] }
+"kotlinx.coroutines" = "*"
+"kotlinx.serialization" = "*"

@@ -1,0 +1,23 @@
+state: INITIALIZED
+first: ON_CREATE
+first: ON_START
+first: ON_RESUME
+state: RESUMED
+late: ON_CREATE
+late: ON_START
+late: ON_RESUME
+late: ON_PAUSE
+first: ON_PAUSE
+at least STARTED: true
+from another thread: Method setCurrentState must be called on the main thread
+late: ON_STOP
+first: ON_STOP
+late: ON_DESTROY
+first: ON_DESTROY
+state: DESTROYED
+keys: [counter]
+clearing the store
+  closeable closed
+  viewModelScope cancelled
+  onCleared
+job cancelled: true

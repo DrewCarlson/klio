@@ -1,33 +1,24 @@
-# androidx.compose.runtime.saveable — the Saver abstraction (Saver interface +
-# Saver(save, restore) factory + SaverScope + autoSaver), vendored verbatim.
-# A dependency of compose.ui.ui-text (AnnotatedString/SpanStyle savers) and
-# compose.foundation. The @Composable-driven pieces (rememberSaveable,
-# SaveableStateRegistry) are not vendored — only the pure Saver surface.
+# androidx.compose.runtime.saveable: the Saver abstraction, rememberSaveable,
+# rememberSerializable, the SaveableStateRegistry and SaveableStateHolder, and
+# the bridge to a SavedStateRegistryOwner, vendored verbatim (commonMain,
+# whole) over the lifecycle and savedstate libraries.
 [library]
 id = "androidx.compose.runtime.saveable"
 version = "1.12.0"
 abi = 1
 implicit_packages = []
-source_roots = ["klioMain"]
 auto_bindings = true
 
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/runtime/runtime-saveable/src/commonMain/kotlin"
-include = [
-    "androidx/compose/runtime/saveable/ListSaver.kt",
-    "androidx/compose/runtime/saveable/MapSaver.kt",
-    "androidx/compose/runtime/saveable/RememberSaveable.kt",
-    "androidx/compose/runtime/saveable/SaveableStateHolder.kt",
-    "androidx/compose/runtime/saveable/SaveableStateRegistry.kt",
-    "androidx/compose/runtime/saveable/SaveableStateRegistryWrapper.kt",
-    "androidx/compose/runtime/saveable/Saver.kt",
-]
 
 [deps]
 stdlib = "*"
 "androidx.compose.runtime" = "*"
 "androidx.collection" = "*"
-# The saved-state owner klioMain stands in for is a LifecycleOwner, and
-# SaveableStateRegistryWrapper keeps a LifecycleRegistry.
+# SaveableStateRegistryWrapper keeps a LifecycleRegistry and bridges to
+# LocalSavedStateRegistryOwner; rememberSerializable encodes through the
+# saved-state codec.
 "androidx.lifecycle" = "*"
-
+"androidx.savedstate" = { version = "*", features = ["compose"] }
+"kotlinx.serialization" = "*"
