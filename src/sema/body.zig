@@ -58,6 +58,11 @@ pub const Narrow = struct {
     reset: bool = false,
 };
 
+/// A fact a local `val` being not null implies. For a local `var` it
+/// speaks of, `writes` is how many writes to the `var` came before the
+/// `val`: one after ends the fact.
+pub const Implied = struct { narrow: Narrow, writes: u32 = 0 };
+
 pub const Excluded = union(enum) {
     none,
     type: TypeId,
@@ -1370,15 +1375,7 @@ fn localDecl(ctx: *Ctx, d: *const ast.Decl) Allocator.Error!void {
             s.syms.getMut(sym).decl = .{ .local_prop = p };
             try ctx.addRef(.{ .file = ctx.file, .anchor = p.name.span, .kind = .decl, .target = sym });
             try ctx.declareLocal(s.syms.name(sym), sym);
-            if (!p.mutable) if (p.init) |i| {
-                // Only values that cannot change after the declaration.
-                var implied: std.ArrayList(Narrow) = .empty;
-                for (try nonNullFacts(ctx, i)) |f| {
-                    if (s.syms.kind(f.sym) == .local and s.syms.flags(f.sym).mutable) continue;
-                    try implied.append(s.arena, f);
-                }
-                if (implied.items.len != 0) try s.nonnull_implies.put(s.arena, sym, implied.items);
-            };
+            if (!p.mutable) if (p.init) |i| try recordNonNullImplies(ctx, sym, i);
         },
         .Function => |*f| {
             const saved_node = ctx.enterNode(f.id);
@@ -2380,6 +2377,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
             const sym = try newLocal(ctx, try ctx.intern(bind.name.name), bind.name, t, false);
             try ctx.declareLocal(s.syms.name(sym), sym);
             try ctx.addRef(.{ .file = ctx.file, .anchor = bind.name.span, .kind = .decl, .target = sym });
+            try recordNonNullImplies(ctx, sym, subj);
             subject_sym = sym;
             subject_t = t;
         } else {
@@ -2423,8 +2421,12 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                         if (v.* != .NullLit) try calls.equalsRef(ctx, v.span(), cur_t);
                         // `null -> ...` (alone or among other patterns):
                         // every later branch sees the subject not null.
-                        if (v.* == .NullLit and subject_sym != .none) {
-                            try prior_false.append(s.arena, .{ .sym = subject_sym, .ty = try s.types.definitelyNotNull(try narrowedType(ctx, subject_sym, subject_t)) });
+                        if (v.* == .NullLit) {
+                            try prior_false.appendSlice(s.arena, try subjectNonNullFacts(ctx, w, subject_sym, subject_t));
+                        } else if (br.patterns.len == 1 and try knownNonNull(ctx, v)) {
+                            // Equal to a value that is not null, it is not
+                            // null either.
+                            try applyFacts(ctx, try subjectNonNullFacts(ctx, w, subject_sym, subject_t));
                         }
                     } else {
                         const facts = try condition(ctx, v);
@@ -2443,6 +2445,10 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                     try typeTestRef(ctx, .is_, t, pat.span, .none);
                     try covers.append(s.arena, .{ .is_type = t });
                     if (br.patterns.len == 1) narrowed = t;
+                    // A subject that is a `t` not null is not null.
+                    if (br.patterns.len == 1 and !s.types.isErr(t) and !s.types.isNullable(t)) {
+                        try applyFacts(ctx, try subjectNonNullFacts(ctx, w, subject_sym, subject_t));
+                    }
                     // A later branch runs only when the subject is not a `t`.
                     if (subject_sym != .none and !s.types.isErr(t)) try prior_false.append(s.arena, .{ .sym = subject_sym, .ty = cur_t, .excluded = .{ .type = t } });
                 },
@@ -2505,6 +2511,50 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
     ctx.pop(outer);
     try applyFacts(ctx, merged);
     return r;
+}
+
+/// What knowing a `when`'s subject is not null says: the subject is not
+/// null, and so is what it implies when not null. `when (r?.m) { null -> }`
+/// leaves `r` not null in the later branches; a subject `val` initialized
+/// from a safe chain, or bound as `when (val v = r?.m)`, carries the
+/// chain's facts.
+fn subjectNonNullFacts(ctx: *Ctx, w: *const ast.WhenExpr, subject_sym: Sym, subject_t: TypeId) Allocator.Error![]const Narrow {
+    const s = ctx.s;
+    if (w.subject_binding == null) return nonNullFacts(ctx, w.subject.?);
+    if (subject_sym == .none) return &.{};
+    var out: std.ArrayList(Narrow) = .empty;
+    try out.append(s.arena, .{ .sym = subject_sym, .ty = try s.types.definitelyNotNull(try narrowedType(ctx, subject_sym, subject_t)) });
+    try appendImplied(s, &out, subject_sym);
+    return out.items;
+}
+
+/// A local `val` initialized from `init` implies, when not null, what
+/// `init` not null does: `val p = r?.let { ... }` not null has `r` not
+/// null. What it says of a local `var` holds until the `var` is written.
+fn recordNonNullImplies(ctx: *Ctx, sym: Sym, init: *const Expr) Allocator.Error!void {
+    const s = ctx.s;
+    var implied: std.ArrayList(Implied) = .empty;
+    for (try nonNullFacts(ctx, init)) |f| {
+        try implied.append(s.arena, .{ .narrow = f, .writes = s.local_writes.get(pathRoot(s, f.sym)) orelse 0 });
+    }
+    if (implied.items.len != 0) try s.nonnull_implies.put(s.arena, sym, implied.items);
+}
+
+/// What `sym` being not null implies that still holds: a fact on a local
+/// `var` written since `sym` was declared no longer does.
+fn appendImplied(s: *Sema, out: *std.ArrayList(Narrow), sym: Sym) Allocator.Error!void {
+    const implied = s.nonnull_implies.get(sym) orelse return;
+    for (implied) |i| {
+        if ((s.local_writes.get(pathRoot(s, i.narrow.sym)) orelse 0) != i.writes) continue;
+        try out.append(s.arena, i.narrow);
+    }
+}
+
+/// The subject a path `a.b.c` reads from, `a`; any other subject itself.
+fn pathRoot(s: *Sema, sym: Sym) Sym {
+    var cur = sym;
+    while (s.path_base.get(cur)) |b| cur = b;
+    return cur;
 }
 
 fn forLoop(ctx: *Ctx, f: *const ast.ForExpr) Allocator.Error!TypeId {
@@ -3030,6 +3080,7 @@ fn pathSubjectOn(ctx: *Ctx, base: Sym, base_t: TypeId, name_str: []const u8) All
     }, .{ .ty = try members.memberType(s, ms[0]) });
     try s.path_subjects.put(s.arena, key, sym);
     try s.path_property.put(s.arena, sym, ms[0].sym);
+    try s.path_base.put(s.arena, sym, base);
     return sym;
 }
 
@@ -3244,7 +3295,7 @@ pub fn nonNullFacts(ctx: *Ctx, e: *const Expr) Allocator.Error![]const Narrow {
         if (try subjectOf(ctx, cur)) |subj| {
             try out.append(s.arena, .{ .sym = subj.sym, .ty = try s.types.definitelyNotNull(subj.ty) });
             // A `val` initialized from a safe chain carries the chain's facts.
-            if (s.nonnull_implies.get(subj.sym)) |implied| try out.appendSlice(s.arena, implied);
+            try appendImplied(s, &out, subj.sym);
         }
         // `x as? T` is not null exactly when `x` is a `T`.
         if (cur.* == .As and cur.As.safe) {
@@ -3641,6 +3692,10 @@ pub fn nameAccess(ctx: *Ctx, id: ast.Ident, access: Access) Allocator.Error!Type
         switch (s.syms.kind(loc)) {
             .local, .value_param => {
                 try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = kind, .target = loc });
+                if (access == .write) {
+                    const gop = try s.local_writes.getOrPut(s.arena, loc);
+                    gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+                }
                 const declared = try symbolType(ctx, loc);
                 return if (access == .read) narrowedType(ctx, loc, declared) else declared;
             },

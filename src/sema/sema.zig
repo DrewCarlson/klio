@@ -155,9 +155,14 @@ pub const Sema = struct {
     path_subjects: std.AutoHashMapUnmanaged(u64, Sym) = .empty,
     /// The property each of those subjects reads.
     path_property: std.AutoHashMapUnmanaged(Sym, Sym) = .empty,
+    /// The subject each of those reads it on.
+    path_base: std.AutoHashMapUnmanaged(Sym, Sym) = .empty,
     /// What a local `val` being not null says about the values its
     /// initializer read: `val a = b?.f()` makes `b` not null with `a`.
-    nonnull_implies: std.AutoHashMapUnmanaged(Sym, []const @import("body.zig").Narrow) = .empty,
+    nonnull_implies: std.AutoHashMapUnmanaged(Sym, []const @import("body.zig").Implied) = .empty,
+    /// How many writes to each local `var` have been analyzed: a write
+    /// after a `val` read it ends what the `val` implied of it.
+    local_writes: std.AutoHashMapUnmanaged(Sym, u32) = .empty,
     /// Each sealed class's direct subtypes, found in its package once asked
     /// for.
     sealed_inheritors: std.AutoHashMapUnmanaged(Sym, []const Sym) = .empty,

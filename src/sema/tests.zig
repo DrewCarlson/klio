@@ -3120,6 +3120,141 @@ test "a val initialized from a safe chain being not null makes the chain's recei
     try fx.expectClean();
 }
 
+test "a star projection passed through a nested call captures the type argument" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\import kotlin.reflect.KClass
+        \\interface Ser<T>
+        \\class FlowSer<T>(val value: Ser<T>) : Ser<List<T>>
+        \\fun <T> List<T>.head(): T = this[0]
+        \\fun fromList(xs: List<Ser<*>>): Ser<*> = FlowSer(xs.head())
+        \\class Builder {
+        \\    fun <T : Any> contextual(kClass: KClass<T>, serializer: Ser<T>) {}
+        \\    fun <T : Any> contextual(kClass: KClass<T>, provider: (typeArgumentsSerializers: List<Ser<*>>) -> Ser<*>) {}
+        \\}
+        \\fun use() {
+        \\    Builder().contextual(List::class) { elementSerializers -> FlowSer(elementSerializers.head()) }
+        \\}
+        ,
+        \\package kotlin.reflect
+        \\interface KClass<T : Any>
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("-> ^FlowSer(elementSerializers", "demo/FlowSer.<init>");
+}
+
+test "a when subject known not null makes what it implies not null" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\class Credential(val qop: String?, val next: Credential?)
+        \\fun Credential.info(tag: String): String = tag
+        \\fun afterNull(credentials: Credential?): String {
+        \\    val principal = credentials?.let { "principal" }
+        \\    return when (principal) {
+        \\        null -> "none"
+        \\        else -> credentials.info("else")
+        \\    }
+        \\}
+        \\fun nullAmong(credentials: Credential?): String {
+        \\    val principal = credentials?.let { "principal" }
+        \\    return when (principal) {
+        \\        "other", null -> "other"
+        \\        else -> credentials.info("among")
+        \\    }
+        \\}
+        \\fun bound(credentials: Credential?): String {
+        \\    val principal = credentials?.next?.let { "principal" }
+        \\    return when (val p = principal) {
+        \\        null -> "none"
+        \\        else -> credentials.info(p) + credentials.next.info(principal)
+        \\    }
+        \\}
+        \\fun safeSubject(credentials: Credential?): String {
+        \\    return when (credentials?.qop) {
+        \\        null -> "none"
+        \\        else -> credentials.info("safe")
+        \\    }
+        \\}
+        \\fun isPattern(credentials: Credential?): String {
+        \\    val principal = credentials?.let { "principal" }
+        \\    return when (principal) {
+        \\        is String -> credentials.info(principal)
+        \\        else -> "none"
+        \\    }
+        \\}
+        \\fun valuePattern(credentials: Credential?): String {
+        \\    val principal = credentials?.let { "principal" }
+        \\    return when (principal) {
+        \\        "principal" -> credentials.info(principal)
+        \\        else -> "none"
+        \\    }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    try fx.expectTarget("credentials.^info(\"else\")", "demo/info");
+    try fx.expectTarget("credentials.next.^info(principal)", "demo/info");
+}
+
+test "a val not null implies a var it read is not null until the var is written" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\class Credential(val qop: String?)
+        \\fun Credential.info(tag: String): String = tag
+        \\fun lookup(): Credential? = null
+        \\fun unwritten(): String {
+        \\    var credentials = lookup()
+        \\    val principal = credentials?.let { "principal" }
+        \\    return when (principal) {
+        \\        null -> "none"
+        \\        else -> credentials.info("unwritten")
+        \\    }
+        \\}
+        \\fun writtenBefore(): String {
+        \\    var credentials = lookup()
+        \\    credentials = lookup()
+        \\    val principal = credentials?.let { "principal" }
+        \\    if (principal != null) return credentials.info("before")
+        \\    return "none"
+        \\}
+        \\fun String.shout(): String = this
+        \\fun pathUnwritten(): String {
+        \\    var credentials = lookup()
+        \\    val principal = credentials?.qop
+        \\    if (principal != null) return credentials.qop.shout()
+        \\    return "none"
+        \\}
+        \\fun writtenAfter(flag: Boolean): String {
+        \\    var credentials = lookup()
+        \\    val principal = credentials?.qop
+        \\    if (flag) credentials = lookup()
+        \\    if (principal != null) return credentials.info("after")
+        \\    return "none"
+        \\}
+        \\fun pathWrittenAfter(flag: Boolean): String {
+        \\    var credentials = lookup()
+        \\    val principal = credentials?.qop
+        \\    if (flag) credentials = lookup()
+        \\    if (principal != null) return credentials.qop.shout()
+        \\    return "none"
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    var n: usize = 0;
+    for (fx.s.census.sites.items) |site| {
+        if (site.file == 3) n += 1;
+    }
+    // Past the write, neither `credentials` nor `credentials.qop` is known.
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try fx.expectTarget("credentials.^info(\"unwritten\")", "demo/info");
+    try fx.expectTarget("credentials.^info(\"before\")", "demo/info");
+    try fx.expectTarget("return credentials.qop.^shout()\n    return \"none\"\n}\nfun writtenAfter", "demo/shout");
+}
+
 test "a val assigned after its declaration is narrowed by the assignment" {
     var fx = try fixture(&.{
         \\package demo

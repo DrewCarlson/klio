@@ -1,0 +1,10 @@
+info auth else
+no principal
+info auth among
+info auth principal / info inner next
+none
+info auth safe subject
+no qop
+info auth is principal
+info auth value
+info auth var AUTH

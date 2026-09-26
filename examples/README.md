@@ -703,3 +703,5 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `reified_inferred_from_sibling.kt` | A reified type argument of a call passed to a generic function is inferred from the other arguments: `same("text", lookup())` makes `lookup`'s `T` a `String` and `same`'s a `String?`. |
 | `provide_delegate_reified.kt` | A generic `provideDelegate` takes its type argument from the property's declared type, for local and member properties. |
 | `callable_reference_overloads.kt` | A callable reference picks among overloads by what it can be: never a `KClass` parameter's; `String::trim` is `String.trim()`, over `CharSequence.trim()` and over `trim(vararg chars)` with no chars. |
+| `safe_call_val_implies_non_null.kt` | A `val` holding a safe call's result being not null smart casts the receiver: in a `when` over it past `null ->`, in `is` and equality branches, through a subject binding, and for a `var` until it is written. |
+| `star_projection_capture.kt` | A star-projected value passed where a type argument is inferred captures it, also through a nested call: `FlowSer(xs.first())` for `xs: List<Ser<*>>`, in a lambda as in a plain call. |

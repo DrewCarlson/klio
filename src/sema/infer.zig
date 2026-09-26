@@ -1008,7 +1008,42 @@ pub const System = struct {
     /// passed for a `Target` makes `T` at most a `Target`).
     fn fits(self: *System, fixed: TypeId, bound: TypeId) Allocator.Error!bool {
         if (self.mentionsForeign(fixed) or self.mentionsForeign(bound)) return self.constrain(fixed, bound);
-        return subtyping.isSubtype(self.s, fixed, bound);
+        if (try subtyping.isSubtype(self.s, fixed, bound)) return true;
+        return capturedFits(self.s, fixed, bound);
+    }
+
+    /// Whether `fixed` fits `bound` once its star projections are captured.
+    /// A star passed where a type argument is inferred captures an unknown
+    /// type, which `constrain` takes at the parameter's bound: `Ser<*>` for
+    /// a `Ser<T>` puts `Any?` below `T`. A `Ser<*>` reaching the bound
+    /// through a variable (`FlowSer(xs.first())` for `xs: List<Ser<*>>`)
+    /// fits the `Ser<T>` that capture fixed.
+    fn capturedFits(s: *Sema, fixed: TypeId, bound: TypeId) Allocator.Error!bool {
+        const ts = &s.types;
+        if (ts.isNullable(fixed) and !try subtyping.admitsNull(s, bound)) return false;
+        const bound_nn = try ts.makeNotNull(bound);
+        const bc = switch (ts.get(bound_nn)) {
+            .class => |c| c,
+            else => return false,
+        };
+        const up = (try subtyping.supertypeWithClass(s, try ts.makeNotNull(fixed), bc.sym)) orelse return false;
+        const have = ts.argsOf(up);
+        if (have.len != bc.args.len) return false;
+        const tps = try headers.classTypeParams(s, bc.sym);
+        const args = try s.arena.dupe(types.Arg, have);
+        var captured = false;
+        for (args, bc.args, 0..) |*h, w, i| {
+            if (h.variance != .star or w.variance == .star) continue;
+            const cap: TypeId = if (i < tps.len) blk: {
+                const bs = try headers.typeParamBounds(s, tps[i]);
+                break :blk if (bs.len != 0) bs[0] else s.t.any_q;
+            } else s.t.any_q;
+            if (!try subtyping.isSubtype(s, cap, w.ty)) return false;
+            h.* = w;
+            captured = true;
+        }
+        if (!captured) return false;
+        return subtyping.isSubtype(s, try ts.class(bc.sym, args, false), bound_nn);
     }
 
     fn mentionsForeign(self: *const System, t: TypeId) bool {
