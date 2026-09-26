@@ -41,6 +41,8 @@ EXAMPLES=(
   compose_system_theme
   compose_window_draggable
   compose_window_accessibility
+  compose_window_cursor
+  compose_window_drag_and_drop
   compose_window_menu
   compose_window_modal
   compose_window_modal_app

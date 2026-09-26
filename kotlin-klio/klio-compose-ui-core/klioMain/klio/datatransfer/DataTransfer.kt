@@ -22,29 +22,33 @@ import androidx.compose.ui.platform.synchronized
 import kotlin.reflect.KClass
 
 /** A format a [Transferable] offers its data in. */
-public open class DataFlavor(
+public open class DataFlavor private constructor(
     public val representationClass: KClass<*>,
     humanPresentableName: String?,
+    primaryMimeType: String,
 ) {
+    public constructor(representationClass: KClass<*>, humanPresentableName: String?) :
+        this(representationClass, humanPresentableName, SERIALIZED_OBJECT_MIME_TYPE)
+
     /** The flavor's MIME type, with the representation class as its parameter. */
     public val mimeType: String =
-        "$SERIALIZED_OBJECT_MIME_TYPE; class=" + (representationClass.qualifiedName ?: "")
+        "$primaryMimeType; class=" + (representationClass.qualifiedName ?: "")
 
     public val humanPresentableName: String = humanPresentableName ?: mimeType
 
     /** Whether [mimeType], without its parameters, is this flavor's. */
     public fun isMimeTypeEqual(mimeType: String): Boolean =
-        mimeType.substringBefore(';').trim().equals(SERIALIZED_OBJECT_MIME_TYPE, ignoreCase = true)
+        mimeType.substringBefore(';').trim().equals(this.mimeType.substringBefore(';'), ignoreCase = true)
 
     /** Two flavors are equal when their MIME types and representation classes are. */
     override fun equals(other: Any?): Boolean =
         other is DataFlavor && representationClass == other.representationClass &&
-            isMimeTypeEqual(other.mimeType)
+            mimeType.substringBefore(';') == other.mimeType.substringBefore(';')
 
-    override fun hashCode(): Int = representationClass.hashCode() * 31 + SERIALIZED_OBJECT_MIME_TYPE.hashCode()
+    override fun hashCode(): Int = representationClass.hashCode() * 31 + mimeType.substringBefore(';').hashCode()
 
     override fun toString(): String =
-        "klio.datatransfer.DataFlavor[mimetype=$SERIALIZED_OBJECT_MIME_TYPE;representationclass=" +
+        "klio.datatransfer.DataFlavor[mimetype=" + mimeType.substringBefore(';') + ";representationclass=" +
             (representationClass.qualifiedName ?: "") + "]"
 
     public companion object {
@@ -53,6 +57,10 @@ public open class DataFlavor(
 
         /** Text, as a String. */
         public val stringFlavor: DataFlavor = DataFlavor(String::class, "Unicode String")
+
+        /** Files, as a List of their paths (the desktop's List of Files). */
+        public val javaFileListFlavor: DataFlavor =
+            DataFlavor(List::class, "Java File List", "application/x-java-file-list")
     }
 }
 

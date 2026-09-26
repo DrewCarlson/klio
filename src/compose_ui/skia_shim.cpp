@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -428,12 +429,14 @@ extern "C" const char* klio_win_last_error(void) {
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/cursorfont.h>
 #include <X11/keysym.h>
+#include <SDL_syswm.h>
 #include <dlfcn.h>
 #include <sys/select.h>
 #include <cmath>
 #include <type_traits>
-#define KLIO_X11_TRAY 1
+#define KLIO_X11 1
 #endif
 #if defined(KLIO_ATK)
 // ATK's and GLib's declarations; the functions come from the libraries the
@@ -493,6 +496,19 @@ struct KlioWindow {
     bool a11yActive = false;
     KlioA11yTree a11y;
     std::unordered_map<int, struct KlioAtkObject*> atk;
+    // Drag and drop: the window's X window (XDND's drags are the shim's,
+    // further down), the drag the window runs itself where it has none (a
+    // Wayland window, scripted input), the drag event the program answers,
+    // the files and text SDL reports dropped on a Wayland window, and a
+    // release SDL hears that the window drops (the drag took the button).
+    unsigned long xwin = 0;
+    unsigned long xproxy = 0;  // the shim's window its XdndProxy names
+    KlioDragSession drag;
+    KlioDndAsk dndAsk;
+    std::vector<std::string> dropFiles;
+    std::string dropText;
+    bool dropHasText = false;
+    bool swallowRelease = false;
 #if defined(KLIO_GPU)
     SDL_GLContext gl = nullptr;
     sk_sp<GrDirectContext> grContext;  // per-window GL context for the on-screen GPU
@@ -507,6 +523,20 @@ extern "C" {
 static void klioSdlA11yOpen(KlioWindow* kw);
 static void klioSdlA11yClose(KlioWindow* kw);
 }
+
+#if defined(KLIO_X11)
+// Drag and drop over XDND, on the shim's own X connection (further down).
+extern "C" {
+static void klioXdndAttach(KlioWindow* kw);
+static void klioXdndDetach(KlioWindow* kw);
+static bool klioXdndStart(KlioWindow* kw, const std::string& payload, int actions);
+static void klioXdndAnswer(KlioWindow* kw, int kind, int action);
+static bool klioXdndWatching();
+static void klioXdndWaitInput(int ms);
+static void klioX11Pump();
+static void klioXdndTrace(const char* fmt, ...);
+}
+#endif
 
 // Open windows by SDL id, for event routing. klio is single-threaded.
 static std::unordered_map<Uint32, KlioWindow*>& klioSdlWindows() {
@@ -688,6 +718,11 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
             klioWinFailed(std::string("SDL could not start its video subsystem: ") + SDL_GetError());
             return nullptr;
         }
+        // Files and text other applications drop on a window.
+        SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+        SDL_EventState(SDL_DROPTEXT, SDL_ENABLE);
+        SDL_EventState(SDL_DROPBEGIN, SDL_ENABLE);
+        SDL_EventState(SDL_DROPCOMPLETE, SDL_ENABLE);
         klioSdlWindowsHoldVideo = true;
     }
 #if defined(KLIO_GPU)
@@ -699,6 +734,9 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         klioSdlWindows()[gpuWin->id] = gpuWin;
         gpuWin->a11yActive = klioA11yForced();
         klioSdlA11yOpen(gpuWin);
+#if defined(KLIO_X11)
+        klioXdndAttach(gpuWin);
+#endif
         ++klioSdlOpenCount;
         return gpuWin;
     }
@@ -732,6 +770,9 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     klioSdlWindows()[kw->id] = kw;
     kw->a11yActive = klioA11yForced();
     klioSdlA11yOpen(kw);
+#if defined(KLIO_X11)
+    klioXdndAttach(kw);
+#endif
     ++klioSdlOpenCount;
     return kw;
 }
@@ -2070,6 +2111,8 @@ static void klioAtkPump() {
 }
 #endif  // KLIO_ATK
 
+static void klioSdlPrintCursor();
+
 static void klioSdlA11yActivate(KlioWindow* kw) {
     if (kw->a11yActive) return;
     kw->a11yActive = true;
@@ -2412,6 +2455,13 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
             const int button = klioSdlButton(ev.button.button);
             if (button == KLIO_BTN_NONE) return;
             const bool down = ev.type == SDL_MOUSEBUTTONDOWN;
+            if (kw->swallowRelease) {
+                kw->swallowRelease = false;
+#if defined(KLIO_X11)
+                klioXdndTrace("SDL button %s after a drag%s", down ? "down" : "up", down ? "" : ", dropped");
+#endif
+                if (!down) return;
+            }
             if (kw->buttons == 0 || !down) {
                 if (kw->menu && klioMenuPointer(*kw->menu, down ? KLIO_PTR_PRESS : KLIO_PTR_RELEASE, ev.button.x, ev.button.y)) return;
             }
@@ -2470,6 +2520,43 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
         case SDL_TEXTEDITING:
             klioSdlCompose(kw, ev.edit.text);
             return;
+        // A drop on a Wayland window, which SDL reports only once it lands:
+        // the drag enters, moves to the pointer and drops there (an X11
+        // window's drags are XDND's, further down).
+        case SDL_DROPBEGIN:
+            kw->dropFiles.clear();
+            kw->dropText.clear();
+            kw->dropHasText = false;
+            return;
+        case SDL_DROPFILE:
+            if (ev.drop.file) {
+                kw->dropFiles.push_back(ev.drop.file);
+                SDL_free(ev.drop.file);
+            }
+            return;
+        case SDL_DROPTEXT:
+            if (ev.drop.file) {
+                kw->dropText += ev.drop.file;
+                kw->dropHasText = true;
+                SDL_free(ev.drop.file);
+            }
+            return;
+        case SDL_DROPCOMPLETE: {
+            int gx = 0, gy = 0, wx = 0, wy = 0;
+            SDL_GetGlobalMouseState(&gx, &gy);
+            SDL_GetWindowPosition(kw->win, &wx, &wy);
+            const double x = gx - wx;
+            const double y = gy - wy - kw->barH;
+            const std::string payload = klioDndPayload(kw->dropFiles, kw->dropHasText ? &kw->dropText : nullptr);
+            const int offered = KLIO_DND_ACTION_COPY;
+            kw->events.push_back(klioDndEv(KLIO_DND_ENTER, x, y, offered, payload));
+            kw->events.push_back(klioDndEv(KLIO_DND_OVER, x, y, offered, payload));
+            kw->events.push_back(klioDndEv(KLIO_DND_DROP, x, y, offered, payload));
+            kw->dropFiles.clear();
+            kw->dropText.clear();
+            kw->dropHasText = false;
+            return;
+        }
 #if SDL_VERSION_ATLEAST(2, 0, 22)
         case SDL_TEXTEDITING_EXT:
             klioSdlCompose(kw, ev.editExt.text);
@@ -2481,12 +2568,41 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
     }
 }
 
+// The program's answer to the drag event it handled: the window's own drag
+// hears it, or the XDND source waiting for it.
+static void klioSdlDndAnswer(KlioWindow* kw, int action) {
+    const KlioDndAsk ask = kw->dndAsk;
+    kw->dndAsk = KlioDndAsk();
+    if (ask.ask == KLIO_DND_ASK_SESSION) kw->drag.answer(kw->events, ask.kind, action);
+#if defined(KLIO_X11)
+    else if (ask.ask == KLIO_DND_ASK_REPLY) klioXdndAnswer(kw, ask.kind, action);
+#endif
+}
+
+// Waits up to ms for SDL's next event. On X11 the shim's own connection,
+// which carries the drags, is served as the window waits.
+static int klioSdlWaitEvent(KlioWindow* kw, SDL_Event* ev, int ms) {
+#if defined(KLIO_X11)
+    if (klioXdndWatching()) {
+        klioX11Pump();
+        if (SDL_PollEvent(ev)) return 1;
+        if (ms <= 0 || !kw->events.empty()) return 0;
+        klioXdndWaitInput(ms);
+        klioX11Pump();
+        return SDL_PollEvent(ev);
+    }
+#endif
+    (void)kw;
+    return ms > 0 ? SDL_WaitEventTimeout(ev, ms) : SDL_PollEvent(ev);
+}
+
 // Waits up to timeoutMs for the window's next input event and writes its
 // values to out (KLIO_EV_VALUES doubles); returns its type (window_events.h),
 // or KLIO_EV_NONE when none came. SDL's queue is the process's: an event for
 // another window is translated onto that window's queue.
 int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     if (!kw) return KLIO_EV_CLOSE;
+    if (kw->dndAsk.kind) klioSdlDndAnswer(kw, 0);
     klioScriptTick(kw->script, kw->events);
     if (!kw->frameReport.reported) klioSdlReportFrame(kw);
     klioAtkPump();
@@ -2496,7 +2612,7 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
         // With the accessibility bridge up, the wait is cut into slices so
         // AT-SPI clients are answered while the window idles.
         const int slice = klioSdlA11yBridged() && wait > 20 ? 20 : wait;
-        const int got = slice > 0 ? SDL_WaitEventTimeout(&ev, slice) : SDL_PollEvent(&ev);
+        const int got = klioSdlWaitEvent(kw, &ev, slice);
         klioAtkPump();
         wait = got ? 0 : wait - slice;
         if (!got) {
@@ -2516,6 +2632,10 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
             case SDL_MOUSEWHEEL: wid = ev.wheel.windowID; break;
             case SDL_TEXTINPUT: wid = ev.text.windowID; break;
             case SDL_TEXTEDITING: wid = ev.edit.windowID; break;
+            case SDL_DROPBEGIN:
+            case SDL_DROPFILE:
+            case SDL_DROPTEXT:
+            case SDL_DROPCOMPLETE: wid = ev.drop.windowID; break;
 #if SDL_VERSION_ATLEAST(2, 0, 22)
             case SDL_TEXTEDITING_EXT: wid = ev.editExt.windowID; break;
 #endif
@@ -2529,6 +2649,16 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     }
     for (;;) {
         const int type = klioPopEv(kw->events, out, &kw->eventText);
+        if (type == KLIO_EV_POINTER && kw->drag.active) {
+            KlioEv e;
+            e.type = type;
+            for (int i = 0; i < KLIO_EV_VALUES; i++) e.v[i] = out[i];
+            if (kw->drag.pointer(kw->events, e)) continue;
+        }
+        if (type == KLIO_EV_CURSOR_SCRIPT) {
+            klioSdlPrintCursor();
+            continue;
+        }
         if (type == KLIO_EV_A11Y_SCRIPT) {
             const size_t at = static_cast<size_t>(out[1]);
             const size_t textAt = static_cast<size_t>(out[2]);
@@ -2539,6 +2669,7 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
         }
         if (type != KLIO_EV_MENU_PATH) {
             klioSdlShowMenus();
+            kw->dndAsk.reported(type, out);
             return type;
         }
         const size_t at = static_cast<size_t>(out[0]);
@@ -2591,6 +2722,57 @@ void klio_a11y_update(KlioWindow* kw, const char* text, size_t len) {
     klioSdlA11yUpdate(kw, text, len);
 }
 
+static SDL_Cursor* klioSdlCursor(int kind) {
+    static SDL_Cursor* cursors[4] = {};
+    if (kind < 0 || kind > 3) kind = KLIO_CURSOR_DEFAULT;
+    if (!cursors[kind]) {
+        const SDL_SystemCursor ids[] = {SDL_SYSTEM_CURSOR_ARROW, SDL_SYSTEM_CURSOR_CROSSHAIR, SDL_SYSTEM_CURSOR_IBEAM,
+                                        SDL_SYSTEM_CURSOR_HAND};
+        cursors[kind] = SDL_CreateSystemCursor(ids[kind]);
+    }
+    return cursors[kind];
+}
+
+// The cursor over the window's content. SDL's cursor is the mouse's, so a
+// window sets it as the pointer's hover over it asks.
+void klio_win_set_cursor(KlioWindow* kw, int kind) {
+    if (!kw) return;
+    if (SDL_Cursor* c = klioSdlCursor(kind)) SDL_SetCursor(c);
+}
+
+// The program's answer to the drag event it handled: the action it takes
+// (0 for none).
+void klio_win_dnd_accept(KlioWindow* kw, int action) {
+    if (kw) klioSdlDndAnswer(kw, action);
+}
+
+// Starts a drag of the payload from the window: XDND's on X11, as AWT's
+// XToolkit starts one (X11 drags show no image, as AWT's do not), or where
+// there is none (Wayland, a scripted press) a drag the window runs itself,
+// over the window and dropped in it.
+int klio_win_drag_start(KlioWindow* kw, const char* payload, size_t len, const unsigned char*, size_t, int, int,
+                        int actions) {
+    if (!kw || !payload) return 0;
+    const std::string data(payload, len);
+#if defined(KLIO_X11)
+    // Only a real press moves the pointer the drag follows.
+    const bool pressed = (kw->buttons & (1 << (KLIO_BTN_PRIMARY - 1))) != 0;
+    klioXdndTrace("drag asked from 0x%lx, buttons %d", kw->xwin, kw->buttons);
+    if (pressed && klioXdndStart(kw, data, actions)) return 1;
+#endif
+    kw->drag.start(actions, data);
+    return 1;
+}
+
+static void klioSdlPrintCursor() {
+    SDL_Cursor* shown = SDL_GetCursor();
+    int kind = KLIO_CURSOR_DEFAULT;
+    for (int k = KLIO_CURSOR_CROSSHAIR; k <= KLIO_CURSOR_HAND; k++) {
+        if (shown && shown == klioSdlCursor(k)) kind = k;
+    }
+    klioPrintCursor(kind);
+}
+
 // A window's menu bar: SDL has no native menus, so the window draws the bar
 // and its menus itself, and the bar's height comes out of the content, whose
 // new size is reported as a resize.
@@ -2636,14 +2818,14 @@ void klio_win_set_menu_icon(KlioWindow* kw, int id, KlioSurface* s) {
     kw->menu->icons[id] = s->surface->makeImageSnapshot();
 }
 
-#if defined(KLIO_X11_TRAY)
+#if defined(KLIO_X11)
 // The Linux tray icon, as the desktop's AWT puts one on X11: an XEmbed icon
 // window docked in the system tray (the _NET_SYSTEM_TRAY_S<screen> selection's
 // owner), a left click its action, a right press its popup menu, a tooltip
 // after a pause over it, and a notification as a balloon by it. There is a
 // tray only while some tray manager owns the selection, as AWT's
-// SystemTray.isSupported answers. libX11 is loaded when a tray is first
-// asked for, so a host without X11 runs without it.
+// SystemTray.isSupported answers. libX11 is loaded when a tray or a window
+// first asks for it, so a host without X11 runs without it.
 struct KlioX11 {
     void* lib = nullptr;
     Display* (*OpenDisplay)(const char*);
@@ -2686,6 +2868,14 @@ struct KlioX11 {
     int (*DisplayHeight_)(Display*, int);
     Bool (*TranslateCoordinates)(Display*, Window, Window, int, int, int*, int*, Window*);
     void (*SetWMNormalHints)(Display*, Window, XSizeHints*);
+    int (*SetSelectionOwner)(Display*, Atom, Window, Time);
+    int (*ConvertSelection)(Display*, Atom, Atom, Atom, Window, Time);
+    int (*Sync)(Display*, Bool);
+    int (*(*SetErrorHandler)(int (*)(Display*, XErrorEvent*)))(Display*, XErrorEvent*);
+    Cursor (*CreateFontCursor)(Display*, unsigned);
+    int (*FreeCursor)(Display*, Cursor);
+    int (*ChangeActivePointerGrab)(Display*, unsigned, Cursor, Time);
+    char* (*GetAtomName)(Display*, Atom);
 };
 
 static KlioX11* klioX11() {
@@ -2739,6 +2929,14 @@ static KlioX11* klioX11() {
     get(x.DisplayHeight_, "XDisplayHeight");
     get(x.TranslateCoordinates, "XTranslateCoordinates");
     get(x.SetWMNormalHints, "XSetWMNormalHints");
+    get(x.SetSelectionOwner, "XSetSelectionOwner");
+    get(x.ConvertSelection, "XConvertSelection");
+    get(x.Sync, "XSync");
+    get(x.SetErrorHandler, "XSetErrorHandler");
+    get(x.CreateFontCursor, "XCreateFontCursor");
+    get(x.FreeCursor, "XFreeCursor");
+    get(x.ChangeActivePointerGrab, "XChangeActivePointerGrab");
+    get(x.GetAtomName, "XGetAtomName");
     if (!ok) return nullptr;
     state = 1;
     return &x;
@@ -2760,6 +2958,831 @@ static Window klioX11TrayManager(Display* dpy) {
     char name[64];
     std::snprintf(name, sizeof name, "_NET_SYSTEM_TRAY_S%d", x->DefaultScreen_(dpy));
     return x->GetSelectionOwner(dpy, x->InternAtom(dpy, name, False));
+}
+
+// ---------------------------------------------------------------------------
+// Drag and drop over XDND, as AWT's XToolkit runs it. Each window's
+// XdndProxy names a window of the shim's own X connection, so the drags over
+// it come to the shim, which reports them to the program and answers each
+// position and the drop with the program's answer. A drag the program starts
+// owns XdndSelection and runs the source side of the protocol under a
+// pointer grab. The windows' poll serves both, so the program runs, and
+// answers the drags over its own windows, while a drag goes on. Under
+// Wayland SDL's drop events and the window's own drag stand in.
+
+struct KlioXdndAtoms {
+    Atom aware, proxy, enter, position, status, leave, drop, finished, selection, typeList, actionList;
+    Atom copy, move, link, targets, utf8, uriList, textPlain, textPlainUtf8, textPlainUTF8, data;
+};
+
+// The drag over one of the windows.
+struct KlioXdndIn {
+    KlioWindow* kw = nullptr;  // the window it is over; null when none
+    Window source = None;      // the dragging application's window
+    Window addressed = None;   // the window the source addresses: the window's, or its proxy
+    Atom want[2] = {None, None};  // the files' and the text's types still to read
+    bool reading = false;
+    std::chrono::steady_clock::time_point since;
+    std::vector<std::string> files;
+    std::string text;
+    bool hasText = false;
+    int x = 0;
+    int y = 0;
+    int offered = 0;
+    bool positioned = false;  // a position waits for the data
+    bool dropped = false;     // the drop waits for the data, then for the program
+    bool entered = false;     // the program heard the drag enter
+};
+
+// The drag a window started.
+struct KlioXdndOut {
+    KlioWindow* kw = nullptr;  // the window dragging; null when none
+    std::vector<std::string> files;
+    std::string text;
+    bool hasText = false;
+    std::vector<Atom> types;
+    int actions = 0;
+    Window target = None;  // the XdndAware window under the pointer
+    Window to = None;      // where its messages go: its proxy, or itself
+    int version = 0;
+    bool waiting = false;  // a position waits for its status
+    bool moved = false;    // the pointer moved while it waited
+    int rx = 0;
+    int ry = 0;
+    Time time = CurrentTime;
+    bool accepted = false;
+    Atom action = None;
+    bool grabbed = false;
+    bool dropped = false;
+    std::chrono::steady_clock::time_point droppedAt;
+    Cursor yes = None;
+    Cursor no = None;
+};
+
+struct KlioXdnd {
+    bool ready = false;
+    Window root = None;
+    Display* sdlDpy = nullptr;  // SDL's connection, which the windows' poll waits on with the shim's
+    KlioXdndAtoms a{};
+    KlioXdndIn in;
+    KlioXdndOut out;
+};
+
+static KlioXdnd& klioXdnd() {
+    static KlioXdnd d;
+    return d;
+}
+
+static int klioX11IgnoreError(Display*, XErrorEvent*) { return 0; }
+
+// X errors about a window that went away mid-drag are ignored, where Xlib's
+// default handler would end the process.
+struct KlioX11Trap {
+    Display* dpy;
+    int (*prev)(Display*, XErrorEvent*);
+    explicit KlioX11Trap(Display* d) : dpy(d) { prev = klioX11()->SetErrorHandler(klioX11IgnoreError); }
+    ~KlioX11Trap() {
+        klioX11()->Sync(dpy, False);
+        klioX11()->SetErrorHandler(prev);
+    }
+    KlioX11Trap(const KlioX11Trap&) = delete;
+    KlioX11Trap& operator=(const KlioX11Trap&) = delete;
+};
+
+static bool klioXdndReady() {
+    KlioXdnd& d = klioXdnd();
+    if (d.ready) return true;
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    if (!x || !dpy) return false;
+    auto atom = [&](const char* name) { return x->InternAtom(dpy, name, False); };
+    KlioXdndAtoms& a = d.a;
+    a.aware = atom("XdndAware");
+    a.proxy = atom("XdndProxy");
+    a.enter = atom("XdndEnter");
+    a.position = atom("XdndPosition");
+    a.status = atom("XdndStatus");
+    a.leave = atom("XdndLeave");
+    a.drop = atom("XdndDrop");
+    a.finished = atom("XdndFinished");
+    a.selection = atom("XdndSelection");
+    a.typeList = atom("XdndTypeList");
+    a.actionList = atom("XdndActionList");
+    a.copy = atom("XdndActionCopy");
+    a.move = atom("XdndActionMove");
+    a.link = atom("XdndActionLink");
+    a.targets = atom("TARGETS");
+    a.utf8 = atom("UTF8_STRING");
+    a.uriList = atom("text/uri-list");
+    a.textPlain = atom("text/plain");
+    a.textPlainUtf8 = atom("text/plain;charset=utf-8");
+    a.textPlainUTF8 = atom("text/plain;charset=UTF-8");
+    a.data = atom("KLIO_XDND_DATA");
+    d.root = x->RootWindow_(dpy, x->DefaultScreen_(dpy));
+    d.ready = true;
+    return true;
+}
+
+static bool klioXdndTracing() {
+    static const bool on = std::getenv("KLIO_XDND_TRACE") != nullptr;
+    return on;
+}
+
+// KLIO_XDND_TRACE: the windows' XDND messages, sent and heard, on stderr.
+static void klioXdndTrace(const char* fmt, ...) {
+    if (!klioXdndTracing()) return;
+    va_list args;
+    va_start(args, fmt);
+    std::fputs("[xdnd] ", stderr);
+    std::vfprintf(stderr, fmt, args);
+    std::fputc('\n', stderr);
+    va_end(args);
+}
+
+static std::string klioX11AtomName(Atom atom) {
+    if (atom == None) return "None";
+    char* name = klioX11()->GetAtomName(klioX11Display(), atom);
+    if (!name) return "?";
+    std::string out(name);
+    klioX11()->Free(name);
+    return out;
+}
+
+static int klioXdndActionBit(Atom action) {
+    const KlioXdndAtoms& a = klioXdnd().a;
+    if (action == a.move) return KLIO_DND_ACTION_MOVE;
+    if (action == a.link) return KLIO_DND_ACTION_LINK;
+    return KLIO_DND_ACTION_COPY;
+}
+
+static Atom klioXdndActionAtom(int bit) {
+    const KlioXdndAtoms& a = klioXdnd().a;
+    switch (bit) {
+        case KLIO_DND_ACTION_COPY: return a.copy;
+        case KLIO_DND_ACTION_MOVE: return a.move;
+        case KLIO_DND_ACTION_LINK: return a.link;
+        default: return None;
+    }
+}
+
+static void klioXdndSend(Window to, Window window, Atom type, long l0, long l1, long l2, long l3, long l4) {
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    if (klioXdndTracing()) {
+        klioXdndTrace("send %s to 0x%lx window 0x%lx [0x%lx %ld %ld %ld %s]", klioX11AtomName(type).c_str(), to, window,
+                      l0, l1, l2, l3, klioX11AtomName(static_cast<Atom>(l4)).c_str());
+    }
+    XEvent ev{};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.display = dpy;
+    ev.xclient.window = window;
+    ev.xclient.message_type = type;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = l0;
+    ev.xclient.data.l[1] = l1;
+    ev.xclient.data.l[2] = l2;
+    ev.xclient.data.l[3] = l3;
+    ev.xclient.data.l[4] = l4;
+    x->SendEvent(dpy, to, False, NoEventMask, &ev);
+}
+
+// A window property of 32-bit items (atoms, windows), or empty.
+static std::vector<unsigned long> klioX11Items(Window w, Atom prop, Atom type) {
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    std::vector<unsigned long> out;
+    Atom got = None;
+    int format = 0;
+    unsigned long n = 0, after = 0;
+    unsigned char* data = nullptr;
+    if (x->GetWindowProperty(dpy, w, prop, 0, 1024, False, type, &got, &format, &n, &after, &data) == Success && data) {
+        if (format == 32) {
+            const auto* items = reinterpret_cast<const unsigned long*>(data);
+            out.assign(items, items + n);
+        }
+        x->Free(data);
+    }
+    return out;
+}
+
+// A property of bytes, deleted as it is read.
+static std::string klioX11TakeBytes(Window w, Atom prop) {
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    std::string out;
+    Atom got = None;
+    int format = 0;
+    unsigned long n = 0, after = 0;
+    unsigned char* data = nullptr;
+    if (x->GetWindowProperty(dpy, w, prop, 0, 1L << 24, True, AnyPropertyType, &got, &format, &n, &after, &data) ==
+            Success &&
+        data) {
+        if (format == 8) out.assign(reinterpret_cast<const char*>(data), n);
+        x->Free(data);
+    }
+    return out;
+}
+
+// A path as a file URI's path, and back.
+static std::string klioUriEncode(const std::string& path) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out;
+    for (const unsigned char c : path) {
+        if (std::isalnum(c) || (c != 0 && std::strchr("-._~/!$&'()*+,;=:@", c))) {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+static std::string klioUriDecode(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i + 2 < s.size() && std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+            out += static_cast<char>(std::stoi(s.substr(i + 1, 2), nullptr, 16));
+            i += 2;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+// The files of a text/uri-list: its file URIs, as paths.
+static std::vector<std::string> klioXdndFiles(const std::string& list) {
+    std::vector<std::string> files;
+    size_t i = 0;
+    while (i < list.size()) {
+        const size_t end = std::min(list.find('\n', i), list.size());
+        std::string line = list.substr(i, end - i);
+        i = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#' || line.compare(0, 5, "file:") != 0) continue;
+        std::string path = line.substr(5);
+        if (path.compare(0, 2, "//") == 0) {
+            const size_t slash = path.find('/', 2);
+            if (slash == std::string::npos) continue;
+            path = path.substr(slash);
+        }
+        files.push_back(klioUriDecode(path));
+    }
+    return files;
+}
+
+// The window an X window is, or is the proxy of.
+static KlioWindow* klioXdndWindow(Window w) {
+    for (const auto& entry : klioSdlWindows()) {
+        if (entry.second->xwin == w || entry.second->xproxy == w) return entry.second;
+    }
+    return nullptr;
+}
+
+// --- The drag over a window ------------------------------------------------
+
+static void klioXdndInReport(int kind) {
+    KlioXdndIn& in = klioXdnd().in;
+    const std::string payload = klioDndPayload(in.files, in.hasText ? &in.text : nullptr);
+    in.kw->events.push_back(klioDndEv(kind, in.x, in.y, in.offered, payload, KLIO_DND_ASK_REPLY));
+}
+
+// The data is all here (or no more is coming): the position and the drop
+// waiting for it are reported.
+static void klioXdndInReady() {
+    KlioXdndIn& in = klioXdnd().in;
+    if (in.positioned || (in.dropped && !in.entered)) {
+        in.positioned = false;
+        klioXdndInReport(in.entered ? KLIO_DND_OVER : KLIO_DND_ENTER);
+        in.entered = true;
+    }
+    if (in.dropped) klioXdndInReport(KLIO_DND_DROP);
+}
+
+// Asks the source for the next type still to read, or reports the drag
+// once none is left.
+static void klioXdndInRead() {
+    KlioXdnd& d = klioXdnd();
+    KlioXdndIn& in = d.in;
+    for (const Atom type : in.want) {
+        if (type == None) continue;
+        klioX11()->ConvertSelection(klioX11Display(), d.a.selection, type, d.a.data, in.kw->xproxy, CurrentTime);
+        in.reading = true;
+        in.since = std::chrono::steady_clock::now();
+        return;
+    }
+    in.reading = false;
+    klioXdndInReady();
+}
+
+static void klioXdndInLeave() {
+    KlioXdndIn& in = klioXdnd().in;
+    if (in.kw && in.entered && !in.dropped) in.kw->events.push_back(klioDndEv(KLIO_DND_EXIT, 0, 0, 0));
+    in = KlioXdndIn();
+}
+
+static void klioXdndInEnter(const XClientMessageEvent& m) {
+    KlioXdnd& d = klioXdnd();
+    KlioWindow* kw = klioXdndWindow(m.window);
+    if (!kw) return;
+    klioXdndInLeave();
+    KlioXdndIn& in = d.in;
+    in.kw = kw;
+    in.source = static_cast<Window>(m.data.l[0]);
+    in.addressed = m.window;
+    std::vector<unsigned long> types;
+    if (m.data.l[1] & 1) {
+        types = klioX11Items(in.source, d.a.typeList, XA_ATOM);
+    } else {
+        for (int i = 2; i <= 4; i++) {
+            if (m.data.l[i]) types.push_back(static_cast<unsigned long>(m.data.l[i]));
+        }
+    }
+    // The text in the first of these types the source offers.
+    const Atom texts[] = {d.a.utf8, d.a.textPlainUtf8, d.a.textPlainUTF8, d.a.textPlain};
+    for (const Atom text : texts) {
+        if (in.want[1] == None && std::find(types.begin(), types.end(), text) != types.end()) in.want[1] = text;
+    }
+    if (std::find(types.begin(), types.end(), d.a.uriList) != types.end()) in.want[0] = d.a.uriList;
+    klioXdndInRead();
+}
+
+static void klioXdndInPosition(const XClientMessageEvent& m) {
+    KlioXdnd& d = klioXdnd();
+    KlioXdndIn& in = d.in;
+    if (!in.kw || static_cast<Window>(m.data.l[0]) != in.source || in.dropped) return;
+    const int rx = static_cast<int>((m.data.l[2] >> 16) & 0xFFFF);
+    const int ry = static_cast<int>(m.data.l[2] & 0xFFFF);
+    int wx = 0, wy = 0;
+    Window child = None;
+    klioX11()->TranslateCoordinates(klioX11Display(), d.root, in.kw->xwin, rx, ry, &wx, &wy, &child);
+    in.x = wx;
+    in.y = wy - in.kw->barH;
+    in.offered = klioXdndActionBit(static_cast<Atom>(m.data.l[4]));
+    in.positioned = true;
+    if (!in.reading) klioXdndInReady();
+}
+
+static void klioXdndInDrop(const XClientMessageEvent& m) {
+    KlioXdndIn& in = klioXdnd().in;
+    if (!in.kw || static_cast<Window>(m.data.l[0]) != in.source || in.dropped) return;
+    in.dropped = true;
+    in.positioned = false;
+    if (!in.reading) klioXdndInReady();
+}
+
+static void klioXdndInData(const XSelectionEvent& e) {
+    KlioXdnd& d = klioXdnd();
+    KlioXdndIn& in = d.in;
+    if (!in.kw || !in.reading) return;
+    const std::string bytes = e.property != None ? klioX11TakeBytes(in.kw->xproxy, e.property) : std::string();
+    klioXdndTrace("data %s: %zu bytes", klioX11AtomName(e.target).c_str(), bytes.size());
+    if (e.target == in.want[0]) {
+        in.files = klioXdndFiles(bytes);
+        in.want[0] = None;
+    } else if (e.target == in.want[1]) {
+        if (e.property != None) {
+            in.text = bytes;
+            in.hasText = true;
+        }
+        in.want[1] = None;
+    } else {
+        return;
+    }
+    klioXdndInRead();
+}
+
+// The program's answer to the drag over one of the windows: the source
+// hears it as the status of the position, or as the drop's end.
+static void klioXdndAnswer(KlioWindow* kw, int kind, int action) {
+    KlioXdnd& d = klioXdnd();
+    KlioXdndIn& in = d.in;
+    if (!d.ready || in.kw != kw) return;
+    Display* dpy = klioX11Display();
+    KlioX11Trap trap(dpy);
+    const Atom atom = action ? klioXdndActionAtom(action) : None;
+    if (kind == KLIO_DND_DROP) {
+        if (!in.dropped) return;
+        klioXdndSend(in.source, in.source, d.a.finished, static_cast<long>(in.addressed), action ? 1 : 0,
+                     static_cast<long>(atom), 0, 0);
+        in = KlioXdndIn();
+        return;
+    }
+    // Once it drops, the source waits only for the drop's end.
+    if (in.dropped) return;
+    klioXdndSend(in.source, in.source, d.a.status, static_cast<long>(in.addressed), action ? 3 : 2, 0, 0,
+                 static_cast<long>(atom));
+}
+
+// --- The drag a window started -----------------------------------------------
+
+// XdndAware's version on a window; 0 where it has none.
+static int klioXdndAware(Window w) {
+    const std::vector<unsigned long> v = klioX11Items(w, klioXdnd().a.aware, XA_ATOM);
+    return v.empty() ? 0 : static_cast<int>(v[0]);
+}
+
+// The window under the root point that takes XDND drags, where its messages
+// go, and its version; None where no window takes them.
+static Window klioXdndFindTarget(int rx, int ry, Window* to, int* version) {
+    KlioXdnd& d = klioXdnd();
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    Window w = d.root;
+    for (int depth = 0; depth < 32; depth++) {
+        Window child = None;
+        int cx = 0, cy = 0;
+        if (!x->TranslateCoordinates(dpy, d.root, w, rx, ry, &cx, &cy, &child) || child == None) return None;
+        w = child;
+        const int v = klioXdndAware(w);
+        if (v == 0) continue;
+        if (v < 3) return None;
+        const std::vector<unsigned long> proxy = klioX11Items(w, d.a.proxy, XA_WINDOW);
+        *to = proxy.empty() || proxy[0] == None ? w : static_cast<Window>(proxy[0]);
+        *version = std::min(v, 5);
+        return w;
+    }
+    return None;
+}
+
+static void klioXdndCursor(bool accepted) {
+    KlioXdndOut& out = klioXdnd().out;
+    if (!out.grabbed) return;
+    klioX11()->ChangeActivePointerGrab(klioX11Display(), ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                                       accepted ? out.yes : out.no, CurrentTime);
+}
+
+// The pointer at a root point: the drag leaves the window it was over for
+// the one there, and tells it where it is once it answered the last time.
+static void klioXdndMove(int rx, int ry) {
+    KlioXdnd& d = klioXdnd();
+    KlioXdndOut& out = d.out;
+    out.rx = rx;
+    out.ry = ry;
+    Window to = None;
+    int version = 0;
+    const Window target = klioXdndFindTarget(rx, ry, &to, &version);
+    if (target != out.target) {
+        if (out.target) klioXdndSend(out.to, out.target, d.a.leave, static_cast<long>(out.kw->xproxy), 0, 0, 0, 0);
+        out.target = target;
+        out.to = to;
+        out.version = version;
+        out.waiting = false;
+        out.accepted = false;
+        out.action = None;
+        klioXdndCursor(false);
+        if (target) {
+            long types[3] = {0, 0, 0};
+            for (size_t i = 0; i < out.types.size() && i < 3; i++) types[i] = static_cast<long>(out.types[i]);
+            const long flags = (static_cast<long>(version) << 24) | (out.types.size() > 3 ? 1 : 0);
+            klioXdndSend(to, target, d.a.enter, static_cast<long>(out.kw->xproxy), flags, types[0], types[1], types[2]);
+        }
+    }
+    if (!out.target) return;
+    if (out.waiting) {
+        out.moved = true;
+        return;
+    }
+    klioXdndSend(out.to, out.target, d.a.position, static_cast<long>(out.kw->xproxy), 0,
+                 (static_cast<long>(rx) << 16) | (ry & 0xFFFF), static_cast<long>(out.time),
+                 static_cast<long>(klioXdndActionAtom(klioDndDefaultAction(out.actions))));
+    out.waiting = true;
+    out.moved = false;
+}
+
+// The pointer is the window's again: the grab ends, and the button the drag
+// took is up. SDL, which saw the press, hears a release the window drops,
+// and, where the pointer left the window during the drag (the grab's
+// crossings are not SDL's to act on), that it left.
+static void klioXdndRelease() {
+    KlioXdnd& d = klioXdnd();
+    KlioXdndOut& out = d.out;
+    if (!out.grabbed) return;
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    x->UngrabPointer(dpy, CurrentTime);
+    x->UngrabKeyboard(dpy, CurrentTime);
+    out.grabbed = false;
+    KlioWindow* kw = out.kw;
+    kw->buttons &= ~(1 << (KLIO_BTN_PRIMARY - 1));
+    kw->swallowRelease = true;
+    int wx = 0, wy = 0;
+    Window child = None;
+    x->TranslateCoordinates(dpy, d.root, kw->xwin, out.rx, out.ry, &wx, &wy, &child);
+    XEvent up{};
+    up.xbutton.type = ButtonRelease;
+    up.xbutton.display = dpy;
+    up.xbutton.window = kw->xwin;
+    up.xbutton.root = d.root;
+    up.xbutton.time = out.time;
+    up.xbutton.x = wx;
+    up.xbutton.y = wy;
+    up.xbutton.x_root = out.rx;
+    up.xbutton.y_root = out.ry;
+    up.xbutton.state = Button1Mask;
+    up.xbutton.button = Button1;
+    up.xbutton.same_screen = True;
+    x->SendEvent(dpy, kw->xwin, False, ButtonReleaseMask, &up);
+    int w = 0, h = 0;
+    SDL_GetWindowSize(kw->win, &w, &h);
+    if (wx >= 0 && wy >= 0 && wx < w && wy < h) return;
+    XEvent left{};
+    left.xcrossing.type = LeaveNotify;
+    left.xcrossing.display = dpy;
+    left.xcrossing.window = kw->xwin;
+    left.xcrossing.root = d.root;
+    left.xcrossing.time = out.time;
+    left.xcrossing.x = wx;
+    left.xcrossing.y = wy;
+    left.xcrossing.x_root = out.rx;
+    left.xcrossing.y_root = out.ry;
+    left.xcrossing.mode = NotifyNormal;
+    left.xcrossing.detail = NotifyNonlinear;
+    left.xcrossing.same_screen = True;
+    x->SendEvent(dpy, kw->xwin, False, LeaveWindowMask, &left);
+}
+
+// The drag ends with the action the target took (0 for none), which the
+// window that started it hears.
+static void klioXdndEnd(int taken, bool report = true) {
+    KlioXdnd& d = klioXdnd();
+    KlioXdndOut& out = d.out;
+    if (!out.kw) return;
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    if (report) klioXdndRelease();
+    if (out.grabbed) {
+        x->UngrabPointer(dpy, CurrentTime);
+        x->UngrabKeyboard(dpy, CurrentTime);
+    }
+    if (out.yes) x->FreeCursor(dpy, out.yes);
+    if (out.no) x->FreeCursor(dpy, out.no);
+    if (x->GetSelectionOwner(dpy, d.a.selection) == out.kw->xproxy) {
+        x->SetSelectionOwner(dpy, d.a.selection, None, CurrentTime);
+    }
+    klioXdndTrace("drag ended, taken %d", taken);
+    if (report) out.kw->events.push_back(klioDndEv(KLIO_DND_SOURCE_ENDED, 0, 0, taken));
+    d.out = KlioXdndOut();
+}
+
+// The drop at the pointer's release, or the drag's end where nothing took it.
+static void klioXdndDrop(bool cancelled) {
+    KlioXdnd& d = klioXdnd();
+    KlioXdndOut& out = d.out;
+    klioXdndRelease();
+    if (!cancelled && out.target && out.accepted) {
+        klioXdndSend(out.to, out.target, d.a.drop, static_cast<long>(out.kw->xproxy), 0, static_cast<long>(out.time), 0, 0);
+        out.dropped = true;
+        out.droppedAt = std::chrono::steady_clock::now();
+        return;
+    }
+    if (out.target) klioXdndSend(out.to, out.target, d.a.leave, static_cast<long>(out.kw->xproxy), 0, 0, 0, 0);
+    klioXdndEnd(0);
+}
+
+static bool klioXdndStart(KlioWindow* kw, const std::string& payload, int actions) {
+    KlioXdnd& d = klioXdnd();
+    if (!d.ready || !kw->xwin || d.out.kw) return false;
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    KlioXdndOut out;
+    klioDndParse(payload, out.files, out.text, out.hasText);
+    if (out.files.empty() && !out.hasText) return false;
+    if (!out.files.empty()) out.types.push_back(d.a.uriList);
+    if (out.hasText) {
+        out.types.push_back(d.a.textPlain);
+        out.types.push_back(d.a.textPlainUtf8);
+        out.types.push_back(d.a.utf8);
+    }
+    out.actions = actions;
+    out.kw = kw;
+    KlioX11Trap trap(dpy);
+    // The press's grab is SDL's connection's: it lets go, so the drag's grab
+    // takes the pointer.
+    if (d.sdlDpy) {
+        x->UngrabPointer(d.sdlDpy, CurrentTime);
+        x->Sync(d.sdlDpy, False);
+    }
+    out.yes = x->CreateFontCursor(dpy, XC_hand2);
+    out.no = x->CreateFontCursor(dpy, XC_circle);
+    const int grab = x->GrabPointer(dpy, d.root, False, ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                                    GrabModeAsync, GrabModeAsync, None, out.no, CurrentTime);
+    if (grab != GrabSuccess) {
+        klioXdndTrace("drag from 0x%lx not started: the pointer grab failed (%d)", kw->xwin, grab);
+        x->FreeCursor(dpy, out.yes);
+        x->FreeCursor(dpy, out.no);
+        return false;
+    }
+    x->GrabKeyboard(dpy, d.root, False, GrabModeAsync, GrabModeAsync, CurrentTime);
+    out.grabbed = true;
+    x->ChangeProperty(dpy, kw->xproxy, d.a.typeList, XA_ATOM, 32, PropModeReplace,
+                      reinterpret_cast<const unsigned char*>(out.types.data()), static_cast<int>(out.types.size()));
+    std::vector<Atom> offered;
+    for (const int bit : {KLIO_DND_ACTION_COPY, KLIO_DND_ACTION_MOVE, KLIO_DND_ACTION_LINK}) {
+        if (actions & bit) offered.push_back(klioXdndActionAtom(bit));
+    }
+    x->ChangeProperty(dpy, kw->xproxy, d.a.actionList, XA_ATOM, 32, PropModeReplace,
+                      reinterpret_cast<const unsigned char*>(offered.data()), static_cast<int>(offered.size()));
+    x->SetSelectionOwner(dpy, d.a.selection, kw->xproxy, CurrentTime);
+    klioXdndTrace("drag started from 0x%lx, %zu types", kw->xwin, out.types.size());
+    d.out = std::move(out);
+    Window r = None, c = None;
+    int rx = 0, ry = 0, wx = 0, wy = 0;
+    unsigned mask = 0;
+    if (x->QueryPointer(dpy, d.root, &r, &c, &rx, &ry, &wx, &wy, &mask)) klioXdndMove(rx, ry);
+    return true;
+}
+
+// The data of the drag a window started, for a target that asks.
+static void klioXdndServe(const XSelectionRequestEvent& r) {
+    KlioXdnd& d = klioXdnd();
+    const KlioXdndOut& out = d.out;
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    const Atom prop = r.property != None ? r.property : r.target;
+    bool served = false;
+    if (out.kw && r.owner == out.kw->xproxy) {
+        const bool text = r.target == d.a.utf8 || r.target == d.a.textPlain || r.target == d.a.textPlainUtf8 ||
+                          r.target == d.a.textPlainUTF8;
+        if (r.target == d.a.targets) {
+            std::vector<Atom> list = out.types;
+            list.push_back(d.a.targets);
+            x->ChangeProperty(dpy, r.requestor, prop, XA_ATOM, 32, PropModeReplace,
+                              reinterpret_cast<const unsigned char*>(list.data()), static_cast<int>(list.size()));
+            served = true;
+        } else if (r.target == d.a.uriList && !out.files.empty()) {
+            std::string list;
+            for (const std::string& f : out.files) list += "file://" + klioUriEncode(f) + "\r\n";
+            x->ChangeProperty(dpy, r.requestor, prop, r.target, 8, PropModeReplace,
+                              reinterpret_cast<const unsigned char*>(list.data()), static_cast<int>(list.size()));
+            served = true;
+        } else if (text && out.hasText) {
+            x->ChangeProperty(dpy, r.requestor, prop, r.target, 8, PropModeReplace,
+                              reinterpret_cast<const unsigned char*>(out.text.data()), static_cast<int>(out.text.size()));
+            served = true;
+        }
+    }
+    XEvent n{};
+    n.xselection.type = SelectionNotify;
+    n.xselection.display = dpy;
+    n.xselection.requestor = r.requestor;
+    n.xselection.selection = r.selection;
+    n.xselection.target = r.target;
+    n.xselection.property = served ? prop : None;
+    n.xselection.time = r.time;
+    x->SendEvent(dpy, r.requestor, False, NoEventMask, &n);
+    klioXdndTrace("asked for %s by 0x%lx: %s", klioX11AtomName(r.target).c_str(), r.requestor, served ? "served" : "refused");
+}
+
+// --- The shim's X connection ---------------------------------------------------
+
+// An X event of the drags; false when it is not theirs.
+static bool klioXdndEvent(const XEvent& ev) {
+    KlioXdnd& d = klioXdnd();
+    if (!d.ready) return false;
+    KlioXdndOut& out = d.out;
+    switch (ev.type) {
+        case ClientMessage: {
+            const XClientMessageEvent& m = ev.xclient;
+            const Atom t = m.message_type;
+            if (klioXdndTracing()) {
+                klioXdndTrace("hear %s window 0x%lx [0x%lx %ld %ld %ld %s]", klioX11AtomName(t).c_str(), m.window,
+                              m.data.l[0], m.data.l[1], m.data.l[2], m.data.l[3],
+                              klioX11AtomName(static_cast<Atom>(m.data.l[4])).c_str());
+            }
+            if (t == d.a.enter) klioXdndInEnter(m);
+            else if (t == d.a.position) klioXdndInPosition(m);
+            else if (t == d.a.leave) {
+                if (d.in.kw && static_cast<Window>(m.data.l[0]) == d.in.source) klioXdndInLeave();
+            } else if (t == d.a.drop) klioXdndInDrop(m);
+            else if (t == d.a.status) {
+                if (!out.kw || static_cast<Window>(m.data.l[0]) != out.target) return true;
+                out.waiting = false;
+                out.accepted = (m.data.l[1] & 1) != 0;
+                out.action = out.accepted ? static_cast<Atom>(m.data.l[4]) : None;
+                klioXdndCursor(out.accepted);
+                if (!out.dropped && out.moved) klioXdndMove(out.rx, out.ry);
+            } else if (t == d.a.finished) {
+                if (!out.kw || !out.dropped || static_cast<Window>(m.data.l[0]) != out.target) return true;
+                int taken = out.action != None ? klioXdndActionBit(out.action) : 0;
+                if (out.version >= 5) taken = (m.data.l[1] & 1) ? klioXdndActionBit(static_cast<Atom>(m.data.l[2])) : 0;
+                klioXdndEnd(taken);
+            } else {
+                return false;
+            }
+            return true;
+        }
+        case SelectionRequest:
+            if (!klioXdndWindow(ev.xselectionrequest.owner) || ev.xselectionrequest.selection != d.a.selection) {
+                return false;
+            }
+            klioXdndServe(ev.xselectionrequest);
+            return true;
+        case SelectionNotify:
+            if (!klioXdndWindow(ev.xselection.requestor) || ev.xselection.selection != d.a.selection) return false;
+            klioXdndInData(ev.xselection);
+            return true;
+        case MotionNotify:
+            if (!out.grabbed || ev.xmotion.window != d.root) return false;
+            out.time = ev.xmotion.time;
+            klioXdndMove(ev.xmotion.x_root, ev.xmotion.y_root);
+            return true;
+        case ButtonRelease:
+            if (!out.grabbed || ev.xbutton.window != d.root) return false;
+            if (ev.xbutton.button != Button1) return true;
+            out.time = ev.xbutton.time;
+            out.rx = ev.xbutton.x_root;
+            out.ry = ev.xbutton.y_root;
+            klioXdndDrop(false);
+            return true;
+        case ButtonPress:
+            return out.grabbed && ev.xbutton.window == d.root;
+        case KeyPress:
+            if (!out.grabbed) return false;
+            if (klioX11()->LookupKeysym(const_cast<XKeyEvent*>(&ev.xkey), 0) == XK_Escape) klioXdndDrop(true);
+            return true;
+        case KeyRelease:
+            return out.grabbed;
+        default:
+            return false;
+    }
+}
+
+// What a drag waits for that does not come: data a source never sends is
+// taken as none, and a drop a target never ends ends as taken by none.
+static void klioXdndTick() {
+    KlioXdnd& d = klioXdnd();
+    const auto now = std::chrono::steady_clock::now();
+    if (d.in.kw && d.in.reading && now - d.in.since > std::chrono::seconds(2)) {
+        d.in.want[0] = None;
+        d.in.want[1] = None;
+        d.in.reading = false;
+        klioXdndInReady();
+    }
+    if (d.out.kw && d.out.dropped && now - d.out.droppedAt > std::chrono::seconds(10)) klioXdndEnd(0);
+}
+
+static void klioXdndAttach(KlioWindow* kw) {
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(kw->win, &info) || info.subsystem != SDL_SYSWM_X11) return;
+    if (!klioXdndReady()) return;
+    KlioXdnd& d = klioXdnd();
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    kw->xwin = info.info.x11.window;
+    d.sdlDpy = info.info.x11.display;
+    KlioX11Trap trap(dpy);
+    // The window's proxy: the drags over the window go to it, and it is the
+    // source window of the drags the window starts. It names itself, and is
+    // aware, as sources check.
+    XSetWindowAttributes attrs{};
+    attrs.override_redirect = True;
+    kw->xproxy = x->CreateWindow(dpy, d.root, -100, -100, 1, 1, 0, 0, InputOnly, nullptr, CWOverrideRedirect, &attrs);
+    const long version = 5;
+    for (const Window w : {static_cast<Window>(kw->xwin), static_cast<Window>(kw->xproxy)}) {
+        x->ChangeProperty(dpy, w, d.a.aware, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&version),
+                          1);
+        x->ChangeProperty(dpy, w, d.a.proxy, XA_WINDOW, 32, PropModeReplace,
+                          reinterpret_cast<const unsigned char*>(&kw->xproxy), 1);
+    }
+}
+
+static void klioXdndDetach(KlioWindow* kw) {
+    KlioXdnd& d = klioXdnd();
+    if (!d.ready) return;
+    KlioX11Trap trap(klioX11Display());
+    if (d.in.kw == kw) d.in = KlioXdndIn();
+    if (d.out.kw == kw) {
+        if (d.out.target && !d.out.dropped) {
+            klioXdndSend(d.out.to, d.out.target, d.a.leave, static_cast<long>(kw->xproxy), 0, 0, 0, 0);
+        }
+        klioXdndEnd(0, false);
+    }
+    if (kw->xproxy) klioX11()->DestroyWindow(klioX11Display(), kw->xproxy);
+    kw->xproxy = 0;
+}
+
+// Whether the windows' poll serves the shim's X connection as it waits.
+static bool klioXdndWatching() { return klioXdnd().ready; }
+
+// Waits up to ms for either connection, SDL's or the shim's, to have input.
+static void klioXdndWaitInput(int ms) {
+    KlioXdnd& d = klioXdnd();
+    KlioX11* x = klioX11();
+    const int ours = x->ConnectionNumber_(klioX11Display());
+    const int sdls = d.sdlDpy ? x->ConnectionNumber_(d.sdlDpy) : -1;
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(ours, &set);
+    if (sdls >= 0) FD_SET(sdls, &set);
+    timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    select(std::max(ours, sdls) + 1, &set, nullptr, nullptr, &tv);
 }
 
 // A window drawn from a Skia raster surface: the tray icon, its menu, its
@@ -2990,85 +4013,84 @@ static SDL_Keycode klioX11KeyToSdl(KeySym k) {
     }
 }
 
-// Runs the X events of the trays' windows.
-static void klioTrayPump() {
+// An X event of the trays' windows.
+static void klioTrayEvent(XEvent& ev) {
     KlioX11* x = klioX11();
-    Display* dpy = klioX11Display();
-    if (!x || !dpy) return;
-    while (x->Pending(dpy)) {
-        XEvent ev;
-        x->NextEvent(dpy, &ev);
-        for (KlioTray* t : klioTrays()) {
-            const Window w = ev.xany.window;
-            if (w == t->icon.win) {
-                switch (ev.type) {
-                    case Expose:
+    for (KlioTray* t : klioTrays()) {
+        const Window w = ev.xany.window;
+        if (w == t->icon.win) {
+            switch (ev.type) {
+                case Expose:
+                    klioTrayDrawIcon(t);
+                    break;
+                case ConfigureNotify:
+                    if (ev.xconfigure.width != t->icon.w || ev.xconfigure.height != t->icon.h) {
+                        t->icon.w = ev.xconfigure.width;
+                        t->icon.h = ev.xconfigure.height;
                         klioTrayDrawIcon(t);
-                        break;
-                    case ConfigureNotify:
-                        if (ev.xconfigure.width != t->icon.w || ev.xconfigure.height != t->icon.h) {
-                            t->icon.w = ev.xconfigure.width;
-                            t->icon.h = ev.xconfigure.height;
-                            klioTrayDrawIcon(t);
-                        }
-                        break;
-                    case EnterNotify:
-                        t->hovering = true;
-                        t->hoverSince = std::chrono::steady_clock::now();
-                        break;
-                    case LeaveNotify:
-                        t->hovering = false;
-                        if (t->tipShown) klioX11Hide(t->tipWin);
-                        t->tipShown = false;
-                        break;
-                    case ButtonPress:
-                        t->hovering = false;
-                        if (t->tipShown) klioX11Hide(t->tipWin);
-                        t->tipShown = false;
-                        if (ev.xbutton.button == Button3) {
-                            klioTrayOpenMenuAt(t, ev.xbutton.x_root, ev.xbutton.y_root);
-                            klioTrayShowMenu(t);
-                        }
-                        break;
-                    case ButtonRelease:
-                        // A click of the first button is the tray's action.
-                        if (ev.xbutton.button == Button1 && ev.xbutton.x >= 0 && ev.xbutton.y >= 0 &&
-                            ev.xbutton.x < t->icon.w && ev.xbutton.y < t->icon.h) {
-                            t->events.push_back(klioSimpleEv(KLIO_EV_TRAY_ACTION));
-                        }
-                        break;
-                }
-            } else if (w == t->menuWin.win) {
-                const float mx = static_cast<float>(ev.type == MotionNotify ? ev.xmotion.x_root : ev.xbutton.x_root);
-                const float my = static_cast<float>(ev.type == MotionNotify ? ev.xmotion.y_root : ev.xbutton.y_root);
-                switch (ev.type) {
-                    case MotionNotify:
-                        klioMenuPointer(t->menu, KLIO_PTR_MOVE, mx, my);
+                    }
+                    break;
+                case EnterNotify:
+                    t->hovering = true;
+                    t->hoverSince = std::chrono::steady_clock::now();
+                    break;
+                case LeaveNotify:
+                    t->hovering = false;
+                    if (t->tipShown) klioX11Hide(t->tipWin);
+                    t->tipShown = false;
+                    break;
+                case ButtonPress:
+                    t->hovering = false;
+                    if (t->tipShown) klioX11Hide(t->tipWin);
+                    t->tipShown = false;
+                    if (ev.xbutton.button == Button3) {
+                        klioTrayOpenMenuAt(t, ev.xbutton.x_root, ev.xbutton.y_root);
                         klioTrayShowMenu(t);
-                        break;
-                    case ButtonPress:
-                        klioMenuPointer(t->menu, KLIO_PTR_PRESS, mx, my);
-                        klioTrayShowMenu(t);
-                        break;
-                    case ButtonRelease:
-                        klioMenuPointer(t->menu, KLIO_PTR_RELEASE, mx, my);
-                        klioTrayShowMenu(t);
-                        break;
-                    case KeyPress:
-                        klioMenuKey(t->menu, klioX11KeyToSdl(x->LookupKeysym(&ev.xkey, 0)), 0, true);
-                        klioTrayShowMenu(t);
-                        break;
-                    case Expose:
-                        klioTrayShowMenu(t);
-                        break;
-                }
-            } else if (w == t->balloonWin.win && ev.type == ButtonPress) {
-                klioX11Hide(t->balloonWin);
-                t->balloonShown = false;
+                    }
+                    break;
+                case ButtonRelease:
+                    // A click of the first button is the tray's action.
+                    if (ev.xbutton.button == Button1 && ev.xbutton.x >= 0 && ev.xbutton.y >= 0 &&
+                        ev.xbutton.x < t->icon.w && ev.xbutton.y < t->icon.h) {
+                        t->events.push_back(klioSimpleEv(KLIO_EV_TRAY_ACTION));
+                    }
+                    break;
             }
+        } else if (w == t->menuWin.win) {
+            const float mx = static_cast<float>(ev.type == MotionNotify ? ev.xmotion.x_root : ev.xbutton.x_root);
+            const float my = static_cast<float>(ev.type == MotionNotify ? ev.xmotion.y_root : ev.xbutton.y_root);
+            switch (ev.type) {
+                case MotionNotify:
+                    klioMenuPointer(t->menu, KLIO_PTR_MOVE, mx, my);
+                    klioTrayShowMenu(t);
+                    break;
+                case ButtonPress:
+                    klioMenuPointer(t->menu, KLIO_PTR_PRESS, mx, my);
+                    klioTrayShowMenu(t);
+                    break;
+                case ButtonRelease:
+                    klioMenuPointer(t->menu, KLIO_PTR_RELEASE, mx, my);
+                    klioTrayShowMenu(t);
+                    break;
+                case KeyPress:
+                    klioMenuKey(t->menu, klioX11KeyToSdl(x->LookupKeysym(&ev.xkey, 0)), 0, true);
+                    klioTrayShowMenu(t);
+                    break;
+                case Expose:
+                    klioTrayShowMenu(t);
+                    break;
+            }
+        } else if (w == t->balloonWin.win && ev.type == ButtonPress) {
+            klioX11Hide(t->balloonWin);
+            t->balloonShown = false;
         }
     }
-    // A pause over an icon shows its tooltip; a balloon goes after its time.
+}
+
+// A pause over an icon shows its tooltip; a balloon goes after its time.
+static void klioTrayTick() {
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
     const auto now = std::chrono::steady_clock::now();
     for (KlioTray* t : klioTrays()) {
         if (t->hovering && !t->tipShown && !t->tooltip.empty() &&
@@ -3085,6 +4107,26 @@ static void klioTrayPump() {
             t->balloonShown = false;
         }
     }
+}
+
+// Runs the X events of the shim's connection: the drags' and the trays'.
+static void klioX11Pump() {
+    KlioX11* x = klioX11();
+    Display* dpy = klioX11Display();
+    if (!x || !dpy) return;
+    if (x->Pending(dpy)) {
+        KlioX11Trap trap(dpy);
+        while (x->Pending(dpy)) {
+            XEvent ev;
+            x->NextEvent(dpy, &ev);
+            if (!klioXdndEvent(ev)) klioTrayEvent(ev);
+        }
+    }
+    if (klioXdnd().in.kw || klioXdnd().out.kw) {
+        KlioX11Trap trap(dpy);
+        klioXdndTick();
+    }
+    klioTrayTick();
 }
 
 int klio_tray_supported(void) {
@@ -3234,7 +4276,7 @@ void klio_tray_notify(void* h, const char* title, size_t tlen, const char* messa
 int klio_tray_poll_event(void* h, double* out) {
     auto* t = static_cast<KlioTray*>(h);
     if (!t) return KLIO_EV_NONE;
-    klioTrayPump();
+    klioX11Pump();
     klioScriptTick(t->script, t->events, true);
     for (;;) {
         const int type = klioPopEv(t->events, out);
@@ -3288,7 +4330,7 @@ int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
 void klio_app_wait(int timeoutMs) {
     if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
 }
-#endif  // KLIO_X11_TRAY
+#endif  // KLIO_X11
 
 
 // Queues an event on the window as if its platform had sent it (the values as
@@ -3396,6 +4438,9 @@ void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
     klioSdlWindows().erase(kw->id);
     klioSdlA11yClose(kw);
+#if defined(KLIO_X11)
+    klioXdndDetach(kw);
+#endif
     // The VIDEO subsystem is shared by every open window: quit it only
     // when the last one closes.
     const bool last = (--klioSdlOpenCount) <= 0;
@@ -3496,6 +4541,7 @@ char* klio_host_locale(void) { return nullptr; }
 #include <imm.h>
 #include <ole2.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <uiautomation.h>
 
 struct KlioWindow {
@@ -3532,7 +4578,24 @@ struct KlioWindow {
     KlioA11yTree a11y;
     std::unordered_map<int, class KlioUiaNode*> uiaNodes;
     class KlioUiaRoot* uiaRoot = nullptr;
+    int cursorKind = 0;         // the cursor over the client area (KLIO_CURSOR_*)
+    // Drag and drop: the drag the window runs itself (scripted input), the
+    // action the program takes of the drag over it, and the window's OLE
+    // drop target.
+    KlioDragSession drag;
+    KlioDndAsk dndAsk;
+    int dndAccepted = 0;
+    class KlioDropTarget* dropTarget = nullptr;
 };
+
+static HCURSOR klioWinCursor(int kind) {
+    switch (kind) {
+        case KLIO_CURSOR_CROSSHAIR: return LoadCursor(nullptr, IDC_CROSS);
+        case KLIO_CURSOR_TEXT: return LoadCursor(nullptr, IDC_IBEAM);
+        case KLIO_CURSOR_HAND: return LoadCursor(nullptr, IDC_HAND);
+        default: return LoadCursor(nullptr, IDC_ARROW);
+    }
+}
 
 // A menu item's command: its entry's index past this base.
 static const int KLIO_MENU_COMMAND_BASE = 0x100;
@@ -4560,10 +5623,268 @@ static void klioWinA11yUpdate(KlioWindow* kw, const char* text, size_t len) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Drag and drop through OLE, as AWT's is on Windows: the window is a drop
+// target whose events carry the dragged files and text to the program, and
+// a drag the program starts runs DoDragDrop with them.
+
+static int klioWinDndActions(DWORD effects) {
+    int a = 0;
+    if (effects & DROPEFFECT_COPY) a |= KLIO_DND_ACTION_COPY;
+    if (effects & DROPEFFECT_MOVE) a |= KLIO_DND_ACTION_MOVE;
+    if (effects & DROPEFFECT_LINK) a |= KLIO_DND_ACTION_LINK;
+    return a;
+}
+
+static DWORD klioWinDropEffect(int action) {
+    switch (action) {
+        case KLIO_DND_ACTION_COPY: return DROPEFFECT_COPY;
+        case KLIO_DND_ACTION_MOVE: return DROPEFFECT_MOVE;
+        case KLIO_DND_ACTION_LINK: return DROPEFFECT_LINK;
+        default: return DROPEFFECT_NONE;
+    }
+}
+
+// The files and text a data object offers, as a drag payload.
+static std::string klioWinDndPayload(IDataObject* data) {
+    std::vector<std::string> files;
+    FORMATETC drop = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium = {};
+    if (data->GetData(&drop, &medium) == S_OK) {
+        HDROP hdrop = static_cast<HDROP>(GlobalLock(medium.hGlobal));
+        if (hdrop) {
+            const UINT n = DragQueryFileW(hdrop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < n; i++) {
+                const UINT len = DragQueryFileW(hdrop, i, nullptr, 0);
+                std::wstring path(len + 1, L'\0');
+                DragQueryFileW(hdrop, i, &path[0], len + 1);
+                path.resize(len);
+                files.push_back(klioNarrow(path.c_str()));
+            }
+            GlobalUnlock(medium.hGlobal);
+        }
+        ReleaseStgMedium(&medium);
+    }
+    std::string text;
+    bool hasText = false;
+    FORMATETC unicode = {CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    if (data->GetData(&unicode, &medium) == S_OK) {
+        const wchar_t* w = static_cast<const wchar_t*>(GlobalLock(medium.hGlobal));
+        if (w) {
+            text = klioNarrow(w);
+            hasText = true;
+            GlobalUnlock(medium.hGlobal);
+        }
+        ReleaseStgMedium(&medium);
+    }
+    return klioDndPayload(files, hasText ? &text : nullptr);
+}
+
+// Whether the program is running a drag of its own: OLE's DoDragDrop holds
+// the program's thread until it drops.
+static bool klioWinDragging = false;
+
+// The window as OLE's drop target: a drag over it is queued for the program,
+// and OLE hears the program's latest answer. While the program drags itself
+// it cannot answer until the drop, so its own windows take the drag's
+// default action and the program hears the drag once DoDragDrop returns.
+class KlioDropTarget final : public IDropTarget {
+  public:
+    explicit KlioDropTarget(KlioWindow* kw) : kw_(kw) {}
+    void detach() { kw_ = nullptr; }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&refs_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDropTarget)) {
+            *out = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL pt, DWORD* effect) override {
+        if (!kw_) return E_UNEXPECTED;
+        payload_ = klioWinDndPayload(data);
+        offered_ = klioWinDndActions(*effect);
+        kw_->dndAccepted = 0;
+        queue(KLIO_DND_ENTER, pt);
+        *effect = answer(*effect);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL pt, DWORD* effect) override {
+        if (!kw_) return E_UNEXPECTED;
+        if (pt.x != last_.x || pt.y != last_.y) queue(KLIO_DND_OVER, pt);
+        *effect = answer(*effect);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        if (kw_) kw_->events.push_back(klioDndEv(KLIO_DND_EXIT, 0, 0, 0));
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD, POINTL pt, DWORD* effect) override {
+        if (!kw_) return E_UNEXPECTED;
+        payload_ = klioWinDndPayload(data);
+        queue(KLIO_DND_DROP, pt);
+        *effect = answer(*effect);
+        return S_OK;
+    }
+
+  private:
+    DWORD answer(DWORD offered) const {
+        if (klioWinDragging) return klioWinDropEffect(klioDndDefaultAction(klioWinDndActions(offered)));
+        return klioWinDropEffect(kw_->dndAccepted);
+    }
+
+    void queue(int kind, POINTL pt) {
+        last_ = pt;
+        POINT client = {pt.x, pt.y};
+        ScreenToClient(kw_->hwnd, &client);
+        kw_->events.push_back(klioDndEv(kind, client.x, client.y, offered_, payload_));
+    }
+
+    LONG refs_ = 1;
+    KlioWindow* kw_;
+    std::string payload_;
+    int offered_ = 0;
+    POINTL last_ = {-1, -1};
+};
+
+// The data a drag the window starts offers: its files (CF_HDROP) and text
+// (CF_UNICODETEXT).
+class KlioDataObject final : public IDataObject {
+  public:
+    KlioDataObject(std::vector<std::string> files, bool hasText, std::string text)
+        : files_(std::move(files)), hasText_(hasText), text_(std::move(text)) {}
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&refs_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDataObject)) {
+            *out = static_cast<IDataObject*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetData(FORMATETC* format, STGMEDIUM* medium) override {
+        if (!format || !medium) return E_INVALIDARG;
+        if (QueryGetData(format) != S_OK) return DV_E_FORMATETC;
+        HGLOBAL global = nullptr;
+        if (format->cfFormat == CF_UNICODETEXT) {
+            const std::wstring w = klioWide(text_);
+            global = GlobalAlloc(GMEM_MOVEABLE, (w.size() + 1) * sizeof(wchar_t));
+            if (!global) return E_OUTOFMEMORY;
+            std::memcpy(GlobalLock(global), w.c_str(), (w.size() + 1) * sizeof(wchar_t));
+            GlobalUnlock(global);
+        } else {
+            // DROPFILES and the paths, each NUL-terminated, ending in an empty one.
+            std::wstring paths;
+            for (const std::string& f : files_) {
+                paths += klioWide(f);
+                paths += L'\0';
+            }
+            paths += L'\0';
+            global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DROPFILES) + paths.size() * sizeof(wchar_t));
+            if (!global) return E_OUTOFMEMORY;
+            auto* drop = static_cast<DROPFILES*>(GlobalLock(global));
+            drop->pFiles = sizeof(DROPFILES);
+            drop->fWide = TRUE;
+            std::memcpy(reinterpret_cast<char*>(drop) + sizeof(DROPFILES), paths.data(), paths.size() * sizeof(wchar_t));
+            GlobalUnlock(global);
+        }
+        medium->tymed = TYMED_HGLOBAL;
+        medium->hGlobal = global;
+        medium->pUnkForRelease = nullptr;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* format) override {
+        if (!format || !(format->tymed & TYMED_HGLOBAL) || format->dwAspect != DVASPECT_CONTENT) return DV_E_FORMATETC;
+        if (format->cfFormat == CF_UNICODETEXT && hasText_) return S_OK;
+        if (format->cfFormat == CF_HDROP && !files_.empty()) return S_OK;
+        return DV_E_FORMATETC;
+    }
+    HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override {
+        if (out) out->ptd = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD direction, IEnumFORMATETC** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (direction != DATADIR_GET) return E_NOTIMPL;
+        FORMATETC formats[2];
+        UINT n = 0;
+        if (!files_.empty()) formats[n++] = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        if (hasText_) formats[n++] = {CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        return SHCreateStdEnumFmtEtc(n, formats, out);
+    }
+    HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA**) override { return OLE_E_ADVISENOTSUPPORTED; }
+
+  private:
+    LONG refs_ = 1;
+    std::vector<std::string> files_;
+    bool hasText_;
+    std::string text_;
+};
+
+// The drag the window starts: it drops when the primary button is released
+// and is cancelled by Escape, with the platform's cursors.
+class KlioDropSource final : public IDropSource {
+  public:
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&refs_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDropSource)) {
+            *out = static_cast<IDropSource*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape, DWORD keys) override {
+        if (escape) return DRAGDROP_S_CANCEL;
+        if (!(keys & MK_LBUTTON)) return DRAGDROP_S_DROP;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
+
+  private:
+    LONG refs_ = 1;
+};
+
 static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* kw = reinterpret_cast<KlioWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
     if (kw) klioWinTranslate(kw, msg, wParam, lParam);
     if (kw && klioWinIme(kw, msg, lParam)) return 0;
+    // The client area shows the cursor its content asks for.
+    if (kw && msg == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT) {
+        SetCursor(klioWinCursor(kw->cursorKind));
+        return TRUE;
+    }
     // An assistive client asks for the window's UI Automation root.
     if (kw && msg == WM_GETOBJECT && static_cast<long>(lParam) == static_cast<long>(UiaRootObjectId)) {
         klioWinA11yActivate(kw);
@@ -4624,8 +5945,9 @@ extern "C" {
 
 KlioWindow* klio_win_open(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return nullptr;
-    // UI Automation calls the window's providers through its COM apartment.
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // UI Automation calls the window's providers through its COM apartment,
+    // and OLE's drag and drop needs the thread's OLE.
+    OleInitialize(nullptr);
     HINSTANCE inst = GetModuleHandle(nullptr);
     static const char* kClass = "KlioWindowClass";
     static bool registered = false;
@@ -4649,6 +5971,8 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     }
     auto* kw = new KlioWindow{hwnd, w, h, nullptr, 0, 0, 0, false, {}, 0, false, 0};
     kw->a11yActive = klioA11yForced();
+    kw->dropTarget = new KlioDropTarget(kw);
+    RegisterDragDrop(hwnd, kw->dropTarget);
     kw->surface = klio_skia_new(w, h);
     if (!kw->surface) {
         DestroyWindow(hwnd);
@@ -4728,6 +6052,7 @@ static int klioWinPop(KlioWindow* kw, double* out);
 
 int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     if (!kw) return KLIO_EV_CLOSE;
+    if (kw->dndAsk.kind) klioDndAnswer(kw, 0);
     klioScriptTick(kw->script, kw->events);
     if (!kw->frameReport.reported) klioWinReportFrame(kw);
     if (!kw->events.empty()) return klioWinPop(kw, out);
@@ -4746,6 +6071,16 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
 static int klioWinPop(KlioWindow* kw, double* out) {
     for (;;) {
         const int type = klioPopEv(kw->events, out, &kw->eventText);
+        if (type == KLIO_EV_POINTER && kw->drag.active) {
+            KlioEv e;
+            e.type = type;
+            for (int i = 0; i < KLIO_EV_VALUES; i++) e.v[i] = out[i];
+            if (kw->drag.pointer(kw->events, e)) continue;
+        }
+        if (type == KLIO_EV_CURSOR_SCRIPT) {
+            klioPrintCursor(kw->cursorKind);
+            continue;
+        }
         if (type == KLIO_EV_A11Y_SCRIPT) {
             const size_t at = static_cast<size_t>(out[1]);
             const size_t textAt = static_cast<size_t>(out[2]);
@@ -4754,7 +6089,10 @@ static int klioWinPop(KlioWindow* kw, double* out) {
             }
             continue;
         }
-        if (type != KLIO_EV_MENU_PATH) return type;
+        if (type != KLIO_EV_MENU_PATH) {
+            kw->dndAsk.reported(type, out);
+            return type;
+        }
         const size_t at = static_cast<size_t>(out[0]);
         // A native menu is not left open: menushow is the drawn menus'.
         if (at >= klioScriptTexts().size() || out[1] != 0) continue;
@@ -5165,6 +6503,55 @@ void klio_order_emoji_palette(void) {}
 
 int klio_a11y_active(KlioWindow* kw) { return klioWinA11yIsActive(kw); }
 
+// The program's answer to the drag event it handled: the action it takes
+// (0 for none). OLE asks for the latest answer itself.
+void klio_win_dnd_accept(KlioWindow* kw, int action) {
+    if (kw) klioDndAnswer(kw, action);
+}
+
+// Starts a drag of the payload from the window: OLE's DoDragDrop, which
+// returns when it drops or is cancelled, or, from a scripted press, a drag
+// the window runs itself. The decoration is not shown: OLE's cursors are.
+int klio_win_drag_start(KlioWindow* kw, const char* payload, size_t len, const unsigned char*, size_t, int, int,
+                        int actions) {
+    if (!kw || !payload) return 0;
+    const std::string data(payload, len);
+    if (!(kw->buttons & (1 << (KLIO_BTN_PRIMARY - 1)))) {
+        kw->drag.start(actions, data);
+        return 1;
+    }
+    std::vector<std::string> files;
+    std::string text;
+    bool hasText = false;
+    klioDndParse(data, files, text, hasText);
+    if (files.empty() && !hasText) return 0;
+    auto* object = new KlioDataObject(std::move(files), hasText, std::move(text));
+    auto* source = new KlioDropSource();
+    DWORD allowed = 0;
+    if (actions & KLIO_DND_ACTION_COPY) allowed |= DROPEFFECT_COPY;
+    if (actions & KLIO_DND_ACTION_MOVE) allowed |= DROPEFFECT_MOVE;
+    if (actions & KLIO_DND_ACTION_LINK) allowed |= DROPEFFECT_LINK;
+    DWORD effect = DROPEFFECT_NONE;
+    klioWinDragging = true;
+    const HRESULT hr = DoDragDrop(object, source, allowed, &effect);
+    klioWinDragging = false;
+    object->Release();
+    source->Release();
+    kw->events.push_back(klioDndEv(KLIO_DND_SOURCE_ENDED, 0, 0, hr == DRAGDROP_S_DROP ? klioWinDndActions(effect) : 0));
+    // The drag took the release, as it does from AWT's view: the content sees
+    // the button up from its next event.
+    kw->buttons &= ~(1 << (KLIO_BTN_PRIMARY - 1));
+    return 1;
+}
+
+// The cursor over the window's client area: WM_SETCURSOR's from now on, and
+// at once while the pointer is over it.
+void klio_win_set_cursor(KlioWindow* kw, int kind) {
+    if (!kw || kw->cursorKind == kind) return;
+    kw->cursorKind = kind;
+    if (kw->pointerInside) SetCursor(klioWinCursor(kind));
+}
+
 void klio_a11y_update(KlioWindow* kw, const char* text, size_t len) {
     if (!kw || !text) return;
     klioWinA11yUpdate(kw, text, len);
@@ -5382,6 +6769,12 @@ void klio_win_close(KlioWindow* kw) {
     if (kw->surface) klio_skia_free(kw->surface);
     UiaReturnRawElementProvider(kw->hwnd, 0, 0, nullptr);
     klioWinA11yRelease(kw);
+    if (kw->dropTarget) {
+        RevokeDragDrop(kw->hwnd);
+        kw->dropTarget->detach();
+        kw->dropTarget->Release();
+        kw->dropTarget = nullptr;
+    }
     DestroyWindow(kw->hwnd);
     if (kw->icon) DestroyIcon(kw->icon);
     if (kw->menu) DestroyMenu(kw->menu);
@@ -5499,6 +6892,7 @@ char* klio_host_locale(void) {
 //            wrapped as a Ganesh GPU surface; Skia renders on the GPU and the
 //            drawable is presented through the Metal command queue.
 #import <Cocoa/Cocoa.h>
+#include <cstdarg>
 #include <cstdio>
 
 #if defined(KLIO_METAL)
@@ -5556,6 +6950,17 @@ struct KlioWindow {
     bool a11yActive;
     KlioA11yTree a11y;
     NSMutableDictionary* a11yElements;
+    NSCursor* cursor;   // the cursor over the content (retained), nil for the arrow
+    // Drag and drop: the drag the window runs itself (scripted input), the
+    // action the program takes of the drag over it, where that drag last
+    // was, the actions the window's own platform drag offers, and the last
+    // mouse press or drag (retained), which a platform drag starts from.
+    KlioDragSession drag;
+    KlioDndAsk dndAsk;
+    int dndAccepted;
+    NSPoint dndAt;
+    int dragActions;
+    NSEvent* lastMouseEvent;
 #if defined(KLIO_METAL)
     CAMetalLayer* metalLayer;  // nil when the raster path is in use
     id<MTLDevice> device;
@@ -5913,7 +7318,16 @@ static NSRect klioCocoaA11yScreenRect(KlioWindow* kw, const KlioA11yNode& n) {
 // While a text field has the keyboard a key press goes to the input method
 // first: what it composes and commits is queued as KLIO_EV_IME, and a press
 // it passes on reaches the program as the key and the character it typed.
-@interface KlioContentView : NSView <NSTextInputClient>
+static NSDragOperation klioCocoaDragOperation(int action) {
+    switch (action) {
+        case KLIO_DND_ACTION_COPY: return NSDragOperationCopy;
+        case KLIO_DND_ACTION_MOVE: return NSDragOperationMove;
+        case KLIO_DND_ACTION_LINK: return NSDragOperationLink;
+        default: return NSDragOperationNone;
+    }
+}
+
+@interface KlioContentView : NSView <NSTextInputClient, NSDraggingSource>
 @property(nonatomic, assign) KlioWindow* kw;
 @end
 
@@ -5989,6 +7403,77 @@ static NSRect klioCocoaA11yScreenRect(KlioWindow* kw, const KlioA11yNode& n) {
 - (NSUInteger)characterIndexForPoint:(NSPoint)point {
     (void)point;
     return NSNotFound;
+}
+// A drag over the content: its position, the actions it offers and the
+// data it carries, queued for the program, which decides whether the window
+// takes it; AppKit hears the program's latest answer.
+- (NSDragOperation)klioDrag:(id<NSDraggingInfo>)info kind:(int)kind {
+    KlioWindow* kw = _kw;
+    if (!kw) return NSDragOperationNone;
+    const NSPoint p = [self convertPoint:[info draggingLocation] fromView:nil];
+    const NSPoint at = NSMakePoint(static_cast<int>(p.x), static_cast<int>(kw->h - p.y));
+    if (kind == KLIO_DND_OVER && NSEqualPoints(at, kw->dndAt)) return klioCocoaDragOperation(kw->dndAccepted);
+    kw->dndAt = at;
+    const NSDragOperation offered = [info draggingSourceOperationMask];
+    int actions = 0;
+    if (offered & NSDragOperationCopy) actions |= KLIO_DND_ACTION_COPY;
+    if (offered & NSDragOperationMove) actions |= KLIO_DND_ACTION_MOVE;
+    if (offered & NSDragOperationLink) actions |= KLIO_DND_ACTION_LINK;
+    NSPasteboard* pb = [info draggingPasteboard];
+    std::vector<std::string> files;
+    for (NSURL* url in [pb readObjectsForClasses:@[ [NSURL class] ]
+                                          options:@{NSPasteboardURLReadingFileURLsOnlyKey : @YES}]) {
+        if ([url path]) files.push_back([[url path] UTF8String]);
+    }
+    NSString* text = [pb stringForType:NSPasteboardTypeString];
+    const std::string str = text ? [text UTF8String] : "";
+    if (kind == KLIO_DND_ENTER) kw->dndAccepted = 0;
+    kw->events.push_back(klioDndEv(kind, at.x, at.y, actions, klioDndPayload(files, text ? &str : nullptr)));
+    return klioCocoaDragOperation(kw->dndAccepted);
+}
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info {
+    return [self klioDrag:info kind:KLIO_DND_ENTER];
+}
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)info {
+    return [self klioDrag:info kind:KLIO_DND_OVER];
+}
+- (void)draggingExited:(id<NSDraggingInfo>)info {
+    (void)info;
+    if (_kw) _kw->events.push_back(klioDndEv(KLIO_DND_EXIT, 0, 0, 0));
+}
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
+    if (!_kw || _kw->dndAccepted == 0) return NO;
+    [self klioDrag:info kind:KLIO_DND_DROP];
+    return YES;
+}
+// The window's own platform drag: the actions it offers, and its end.
+- (NSDragOperation)draggingSession:(NSDraggingSession*)session sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+    (void)session;
+    (void)context;
+    const int a = _kw ? _kw->dragActions : 0;
+    NSDragOperation mask = NSDragOperationNone;
+    if (a & KLIO_DND_ACTION_COPY) mask |= NSDragOperationCopy;
+    if (a & KLIO_DND_ACTION_MOVE) mask |= NSDragOperationMove;
+    if (a & KLIO_DND_ACTION_LINK) mask |= NSDragOperationLink;
+    return mask;
+}
+- (void)draggingSession:(NSDraggingSession*)session endedAtPoint:(NSPoint)point operation:(NSDragOperation)operation {
+    (void)session;
+    (void)point;
+    if (!_kw) return;
+    int taken = 0;
+    if (operation & NSDragOperationCopy) taken = KLIO_DND_ACTION_COPY;
+    else if (operation & NSDragOperationMove) taken = KLIO_DND_ACTION_MOVE;
+    else if (operation & NSDragOperationLink) taken = KLIO_DND_ACTION_LINK;
+    _kw->events.push_back(klioDndEv(KLIO_DND_SOURCE_ENDED, 0, 0, taken));
+    // The session took the release, as it does from AWT's view: the content
+    // sees the button up from its next event.
+    _kw->buttons &= ~(1 << (KLIO_BTN_PRIMARY - 1));
+}
+// The cursor the content asks for, over the whole content.
+- (void)resetCursorRects {
+    KlioWindow* kw = _kw;
+    [self addCursorRect:[self visibleRect] cursor:(kw && kw->cursor ? kw->cursor : [NSCursor arrowCursor])];
 }
 // The window's semantics, exposed to assistive clients: a client reading
 // them asks the program to send them.
@@ -6322,6 +7807,11 @@ static void klioCocoaTranslate(NSEvent* ev, bool* forward) {
             const double x = static_cast<int>(p.x);
             const double y = static_cast<int>(kw->h - p.y);
             const bool inside = x >= 0 && y >= 0 && x < kw->w && y < kw->h;
+            if (type == NSEventTypeLeftMouseDown || type == NSEventTypeLeftMouseDragged) {
+                // A platform drag the program starts starts from this press.
+                [kw->lastMouseEvent release];
+                kw->lastMouseEvent = [ev retain];
+            }
             if (type == NSEventTypeLeftMouseDown || type == NSEventTypeRightMouseDown ||
                 type == NSEventTypeOtherMouseDown) {
                 const int button = klioCocoaButton(ev);
@@ -6442,9 +7932,21 @@ extern "C" {
 // The window's next event, a scripted menu choice performed on the way.
 static void klioCocoaA11yScript(KlioWindow* kw, int kind, const std::string& name, const std::string& text);
 
+static void klioCocoaPrintCursor(KlioWindow* kw);
+
 static int klioCocoaPop(KlioWindow* kw, double* out) {
     for (;;) {
         const int type = klioPopEv(kw->events, out, &kw->eventText);
+        if (type == KLIO_EV_POINTER && kw->drag.active) {
+            KlioEv e;
+            e.type = type;
+            for (int i = 0; i < KLIO_EV_VALUES; i++) e.v[i] = out[i];
+            if (kw->drag.pointer(kw->events, e)) continue;
+        }
+        if (type == KLIO_EV_CURSOR_SCRIPT) {
+            klioCocoaPrintCursor(kw);
+            continue;
+        }
         if (type == KLIO_EV_A11Y_SCRIPT) {
             const size_t at = static_cast<size_t>(out[1]);
             const size_t textAt = static_cast<size_t>(out[2]);
@@ -6453,7 +7955,10 @@ static int klioCocoaPop(KlioWindow* kw, double* out) {
             }
             continue;
         }
-        if (type != KLIO_EV_MENU_PATH) return type;
+        if (type != KLIO_EV_MENU_PATH) {
+            kw->dndAsk.reported(type, out);
+            return type;
+        }
         const size_t at = static_cast<size_t>(out[0]);
         // A native menu is not left open: menushow is the drawn menus'.
         if (at < klioScriptTexts().size() && out[1] == 0) klioCocoaPerformMenuPath(kw, klioScriptTexts()[at]);
@@ -6462,6 +7967,7 @@ static int klioCocoaPop(KlioWindow* kw, double* out) {
 
 int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     if (!kw) return KLIO_EV_CLOSE;
+    if (kw->dndAsk.kind) klioDndAnswer(kw, 0);
     klioScriptTick(kw->script, kw->events);
     if (!kw->events.empty()) return klioCocoaPop(kw, out);
     @autoreleasepool {
@@ -6632,6 +8138,84 @@ int klio_a11y_active(KlioWindow* kw) {
     return kw && kw->a11yActive ? 1 : 0;
 }
 
+static NSCursor* klioCocoaCursor(int kind) {
+    switch (kind) {
+        case KLIO_CURSOR_CROSSHAIR: return [NSCursor crosshairCursor];
+        case KLIO_CURSOR_TEXT: return [NSCursor IBeamCursor];
+        case KLIO_CURSOR_HAND: return [NSCursor pointingHandCursor];
+        default: return [NSCursor arrowCursor];
+    }
+}
+
+// The cursor over the window's content: its cursor rect's from now on, and
+// at once while the pointer is over the content.
+void klio_win_set_cursor(KlioWindow* kw, int kind) {
+    if (!kw) return;
+    @autoreleasepool {
+        NSCursor* cursor = klioCocoaCursor(kind);
+        if (cursor == kw->cursor) return;
+        [kw->cursor release];
+        kw->cursor = [cursor retain];
+        [kw->window invalidateCursorRectsForView:kw->view];
+        const NSPoint p = [kw->view convertPoint:[kw->window mouseLocationOutsideOfEventStream] fromView:nil];
+        if ([kw->window isKeyWindow] && NSPointInRect(p, [kw->view bounds])) [cursor set];
+    }
+}
+
+// The program's answer to the drag event it handled: the action it takes
+// (0 for none). AppKit asks for the latest answer itself.
+void klio_win_dnd_accept(KlioWindow* kw, int action) {
+    if (kw) klioDndAnswer(kw, action);
+}
+
+// Starts a drag of the payload from the window: AppKit's dragging session
+// from the last press, with the decoration under the pointer, or, from a
+// scripted press, a drag the window runs itself.
+int klio_win_drag_start(KlioWindow* kw, const char* payload, size_t len, const unsigned char* png, size_t pngLen,
+                        int ox, int oy, int actions) {
+    if (!kw || !payload) return 0;
+    const std::string data(payload, len);
+    if (!(kw->buttons & (1 << (KLIO_BTN_PRIMARY - 1))) || !kw->lastMouseEvent) {
+        kw->drag.start(actions, data);
+        return 1;
+    }
+    @autoreleasepool {
+        std::vector<std::string> files;
+        std::string text;
+        bool hasText = false;
+        klioDndParse(data, files, text, hasText);
+        NSMutableArray* items = [NSMutableArray array];
+        NSImage* image = png && pngLen ? [[[NSImage alloc] initWithData:[NSData dataWithBytes:png length:pngLen]] autorelease] : nil;
+        const NSPoint p = [kw->view convertPoint:[kw->lastMouseEvent locationInWindow] fromView:nil];
+        const NSSize size = image ? [image size] : NSMakeSize(1, 1);
+        const NSRect frame = NSMakeRect(p.x - ox, p.y - (size.height - oy), size.width, size.height);
+        auto add = [&](id<NSPasteboardWriting> writer) {
+            NSDraggingItem* item = [[[NSDraggingItem alloc] initWithPasteboardWriter:writer] autorelease];
+            [item setDraggingFrame:frame contents:[items count] == 0 ? image : nil];
+            [items addObject:item];
+        };
+        for (const std::string& f : files) add([NSURL fileURLWithPath:klioNSString(f)]);
+        if (hasText) {
+            NSPasteboardItem* item = [[[NSPasteboardItem alloc] init] autorelease];
+            [item setString:klioNSString(text) forType:NSPasteboardTypeString];
+            add(item);
+        }
+        if ([items count] == 0) return 0;
+        kw->dragActions = actions;
+        [kw->view beginDraggingSessionWithItems:items event:kw->lastMouseEvent source:(id<NSDraggingSource>)kw->view];
+    }
+    return 1;
+}
+
+static void klioCocoaPrintCursor(KlioWindow* kw) {
+    NSCursor* shown = kw->cursor ? kw->cursor : [NSCursor arrowCursor];
+    int kind = KLIO_CURSOR_DEFAULT;
+    for (int k = KLIO_CURSOR_CROSSHAIR; k <= KLIO_CURSOR_HAND; k++) {
+        if (shown == klioCocoaCursor(k)) kind = k;
+    }
+    klioPrintCursor(kind);
+}
+
 // The window's semantics as the program sends them: elements keep their
 // identity across snapshots, and clients hear what changed.
 void klio_a11y_update(KlioWindow* kw, const char* text, size_t len) {
@@ -6758,6 +8342,7 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         [window setReleasedWhenClosed:NO];  // we own its lifetime (non-ARC)
         if (title) [window setTitle:[NSString stringWithUTF8String:title]];
         KlioContentView* view = [[KlioContentView alloc] initWithFrame:frame];
+        [view registerForDraggedTypes:@[ NSPasteboardTypeFileURL, NSPasteboardTypeString ]];
         [window setContentView:view];
         [view release];  // the window holds it
         [window makeFirstResponder:view];
@@ -7058,6 +8643,10 @@ void klio_win_close(KlioWindow* kw) {
     for (NSNumber* key in kw->a11yElements) ((KlioA11yElement*)[kw->a11yElements objectForKey:key]).kw = nullptr;
     [kw->a11yElements release];
     kw->a11yElements = nil;
+    [kw->cursor release];
+    kw->cursor = nil;
+    [kw->lastMouseEvent release];
+    kw->lastMouseEvent = nil;
     auto& windows = klioCocoaWindows();
     for (size_t i = 0; i < windows.size(); i++) {
         if (windows[i] == kw) {
@@ -7414,6 +9003,7 @@ char* klio_host_locale(void) {
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <cstdarg>
 #include <cstdio>
 #include "include/core/SkColorSpace.h"
 #include "include/gpu/GpuTypes.h"
@@ -7555,6 +9145,9 @@ void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
+void klio_win_set_cursor(void*, int) {}
+void klio_win_dnd_accept(void*, int) {}
+int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
 size_t klio_win_event_text(void*, char* buf, size_t cap) {
     if (buf && cap > 0) buf[0] = 0;
     return 0;
@@ -7807,6 +9400,9 @@ void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
+void klio_win_set_cursor(void*, int) {}
+void klio_win_dnd_accept(void*, int) {}
+int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
 size_t klio_win_event_text(void*, char* buf, size_t cap) {
     if (buf && cap > 0) buf[0] = 0;
     return 0;
@@ -7863,6 +9459,9 @@ void klio_win_end_composition(void*) {}
 void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
+void klio_win_set_cursor(void*, int) {}
+void klio_win_dnd_accept(void*, int) {}
+int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
 size_t klio_win_event_text(void*, char* buf, size_t cap) {
     if (buf && cap > 0) buf[0] = 0;
     return 0;

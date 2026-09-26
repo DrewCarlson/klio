@@ -65,7 +65,65 @@ enum {
     // [0] KLIO_A11Y_SCRIPT_*, the node's name at klioScriptTexts()[[1]],
     // new text at [[2]].
     KLIO_EV_A11Y_SCRIPT = 21,
+    // Scripted input only: print the cursor the window shows (KLIO_CURSOR_*).
+    KLIO_EV_CURSOR_SCRIPT = 22,
+    KLIO_EV_DND = 23,
 };
+
+// A drag and drop over a window, as KLIO_EV_DND reports it: [0] the kind,
+// [1] x, [2] y (in the content), [3] the actions the drag offers
+// (KLIO_DND_ACTION_* bits; the action taken, or 0, for SOURCE_ENDED), [4]
+// who hears the program's answer (KLIO_DND_ASK_*); the event's text is the
+// data dragged (klioDndPayload).
+enum {
+    KLIO_DND_ENTER = 1,
+    KLIO_DND_OVER = 2,
+    KLIO_DND_EXIT = 3,
+    KLIO_DND_DROP = 4,
+    // The drag the window started ended: [3] the action the target took.
+    KLIO_DND_SOURCE_ENDED = 5,
+};
+
+enum {
+    KLIO_DND_ACTION_COPY = 1,
+    KLIO_DND_ACTION_MOVE = 2,
+    KLIO_DND_ACTION_LINK = 4,
+};
+
+// The program answers each enter, over and drop as it handles it
+// (klio_win_dnd_accept, before the window's next poll) with the action it
+// takes. Who hears the answer: the platform, which asks for the latest one
+// itself; the drag the window runs itself; or a platform target that waits
+// for the answer to each (XDND's).
+enum {
+    KLIO_DND_ASK_LATEST = 0,
+    KLIO_DND_ASK_SESSION = 1,
+    KLIO_DND_ASK_REPLY = 2,
+};
+
+// The system cursors a window shows over its content, as a pointer icon
+// asks (klio_win_set_cursor).
+enum {
+    KLIO_CURSOR_DEFAULT = 0,
+    KLIO_CURSOR_CROSSHAIR = 1,
+    KLIO_CURSOR_TEXT = 2,
+    KLIO_CURSOR_HAND = 3,
+};
+
+inline const char* klioCursorName(int kind) {
+    switch (kind) {
+        case KLIO_CURSOR_CROSSHAIR: return "crosshair";
+        case KLIO_CURSOR_TEXT: return "text";
+        case KLIO_CURSOR_HAND: return "hand";
+        default: return "default";
+    }
+}
+
+// Scripted input's report of the cursor the platform shows over a window.
+inline void klioPrintCursor(int kind) {
+    std::printf("cursor %s\n", klioCursorName(kind));
+    std::fflush(stdout);
+}
 
 // A window's menu bar as klio_win_set_menu takes it: one entry per line,
 // depth first, its fields separated by tabs:
@@ -682,6 +740,144 @@ inline KlioEv klioImeEv(const char* committed, const char* composing) {
     return e;
 }
 
+// Dragged data as one text: a line `F<path>` per file, then `T` and the
+// text, if any, to the end.
+inline std::string klioDndPayload(const std::vector<std::string>& files, const std::string* text) {
+    std::string out;
+    for (const std::string& f : files) out += "F" + f + "\n";
+    if (text) out += "T" + *text;
+    return out;
+}
+
+inline void klioDndParse(const std::string& payload, std::vector<std::string>& files, std::string& text, bool& hasText) {
+    size_t i = 0;
+    hasText = false;
+    while (i < payload.size()) {
+        if (payload[i] == 'T') {
+            text = payload.substr(i + 1);
+            hasText = true;
+            return;
+        }
+        const size_t end = payload.find('\n', i);
+        const size_t stop = end == std::string::npos ? payload.size() : end;
+        if (payload[i] == 'F') files.push_back(payload.substr(i + 1, stop - i - 1));
+        i = stop + 1;
+    }
+}
+
+inline KlioEv klioDndEv(int kind, double x, double y, int actions, const std::string& payload = std::string(),
+                        int ask = KLIO_DND_ASK_LATEST) {
+    KlioEv e;
+    e.type = KLIO_EV_DND;
+    e.v[0] = kind;
+    e.v[1] = x;
+    e.v[2] = y;
+    e.v[3] = actions;
+    e.v[4] = ask;
+    e.text = payload;
+    return e;
+}
+
+// The action a drag takes of those it offers, as a desktop drag takes its
+// default one: a copy where it offers one.
+inline int klioDndDefaultAction(int actions) {
+    if (actions & KLIO_DND_ACTION_COPY) return KLIO_DND_ACTION_COPY;
+    if (actions & KLIO_DND_ACTION_MOVE) return KLIO_DND_ACTION_MOVE;
+    if (actions & KLIO_DND_ACTION_LINK) return KLIO_DND_ACTION_LINK;
+    return 0;
+}
+
+// The drag event the program is answering: the enter, over or drop the
+// window last reported, until klio_win_dnd_accept answers it. One still
+// unanswered at the next poll is refused.
+struct KlioDndAsk {
+    int kind = 0;
+    int ask = KLIO_DND_ASK_LATEST;
+
+    // The event the window's poll just reported.
+    void reported(int type, const double* v) {
+        if (type != KLIO_EV_DND) return;
+        const int k = static_cast<int>(v[0]);
+        if (k != KLIO_DND_ENTER && k != KLIO_DND_OVER && k != KLIO_DND_DROP) return;
+        kind = k;
+        ask = static_cast<int>(v[4]);
+    }
+};
+
+// A drag the window runs itself, where the platform has no drag session of
+// its own to start (a Wayland window) or no real pointer drives it (scripted
+// input): from the drag's start, pointer moves over the window are the drag
+// moving over it and the release its drop, all reported as KLIO_EV_DND to
+// the program, and the drag ends with the action the program takes at the
+// drop. The release is the drag's, as a platform drag takes it.
+struct KlioDragSession {
+    bool active = false;
+    bool entered = false;
+    bool dropping = false;  // dropped, the program's answer to come
+    int actions = 0;
+    std::string payload;
+
+    void start(int offered, const std::string& data) {
+        active = true;
+        entered = false;
+        dropping = false;
+        actions = offered;
+        payload = data;
+    }
+
+    // A pointer event of the window while the drag runs: queued as the
+    // drag's events instead; true when the drag took it.
+    bool pointer(std::deque<KlioEv>& q, const KlioEv& e) {
+        if (!active || dropping || e.type != KLIO_EV_POINTER) return false;
+        const int kind = static_cast<int>(e.v[0]);
+        const double x = e.v[1];
+        const double y = e.v[2];
+        if (kind == KLIO_PTR_MOVE || kind == KLIO_PTR_ENTER) {
+            if (!entered) {
+                entered = true;
+                q.push_back(klioDndEv(KLIO_DND_ENTER, x, y, actions, payload, KLIO_DND_ASK_SESSION));
+            }
+            q.push_back(klioDndEv(KLIO_DND_OVER, x, y, actions, payload, KLIO_DND_ASK_SESSION));
+            return true;
+        }
+        if (kind == KLIO_PTR_EXIT) {
+            if (entered) q.push_back(klioDndEv(KLIO_DND_EXIT, x, y, actions));
+            entered = false;
+            return true;
+        }
+        if (kind == KLIO_PTR_RELEASE) {
+            if (!entered) {
+                entered = true;
+                q.push_back(klioDndEv(KLIO_DND_ENTER, x, y, actions, payload, KLIO_DND_ASK_SESSION));
+            }
+            q.push_back(klioDndEv(KLIO_DND_DROP, x, y, actions, payload, KLIO_DND_ASK_SESSION));
+            dropping = true;
+            return true;
+        }
+        return false;
+    }
+
+    // The program's answer to one of the drag's events; its answer to the
+    // drop ends the drag with the action it took.
+    void answer(std::deque<KlioEv>& q, int kind, int action) {
+        if (kind != KLIO_DND_DROP || !dropping) return;
+        active = false;
+        dropping = false;
+        q.push_back(klioDndEv(KLIO_DND_SOURCE_ENDED, 0, 0, action));
+    }
+};
+
+// The program's answer to the drag event it handled, where the platform asks
+// for the latest answer itself: the window's own drag hears it, or it is the
+// latest.
+template <typename W>
+inline void klioDndAnswer(W* kw, int action) {
+    const KlioDndAsk ask = kw->dndAsk;
+    kw->dndAsk = KlioDndAsk();
+    if (ask.ask == KLIO_DND_ASK_SESSION) kw->drag.answer(kw->events, ask.kind, action);
+    else kw->dndAccepted = action;
+}
+
 // Pops the next queued event into out (type, then the values) and its text
 // into text; the type, or KLIO_EV_NONE when the queue is empty.
 inline int klioPopEv(std::deque<KlioEv>& q, double* out, std::string* text = nullptr) {
@@ -825,6 +1021,11 @@ inline int klioAwtKeyChar(int vk, unsigned platformChar) {
 //   <when> a11y focus <name>             focus it the same way
 //   <when> a11y value <name>=<text>      set its value (a text field's text)
 //   <when> a11y increment <name>         step its value up (a slider's)
+//   <when> cursor                        print the cursor the window shows (a
+//                                        pointer icon's), as the platform reports it
+//   <when> drop <x> <y> text <text>      another application drops text at (x, y):
+//                                        the drag enters, moves there and drops
+//   <when> drop <x> <y> files <p>|<p>    it drops files (paths, '|'-separated)
 //   <when> focus <0|1>                   the window gains or loses the focus; a script
 //                                        with a focus event is the windows' only source
 //                                        of focus, the platform's own changes dropped
@@ -915,6 +1116,34 @@ inline std::vector<KlioScriptEntry>& klioScript() {
             add(klioImeEv("", rest));
         } else if (std::strcmp(cmd, "commit") == 0) {
             add(klioImeEv(rest, ""));
+        } else if (std::strcmp(cmd, "cursor") == 0) {
+            add(klioSimpleEv(KLIO_EV_CURSOR_SCRIPT));
+        } else if (std::strcmp(cmd, "drop") == 0) {
+            double x = 0, y = 0;
+            char what[8] = {};
+            int dused = 0;
+            if (std::sscanf(rest, "%lf %lf %7s %n", &x, &y, what, &dused) >= 3) {
+                const std::string data = rest + dused;
+                std::string payload;
+                if (std::strcmp(what, "text") == 0) {
+                    payload = klioDndPayload({}, &data);
+                } else {
+                    std::vector<std::string> files;
+                    size_t p = 0;
+                    while (p <= data.size()) {
+                        const size_t bar = data.find('|', p);
+                        const std::string path = data.substr(p, bar == std::string::npos ? std::string::npos : bar - p);
+                        if (!path.empty()) files.push_back(path);
+                        if (bar == std::string::npos) break;
+                        p = bar + 1;
+                    }
+                    payload = klioDndPayload(files, nullptr);
+                }
+                const int offered = KLIO_DND_ACTION_COPY | KLIO_DND_ACTION_MOVE;
+                add(klioDndEv(KLIO_DND_ENTER, x, y, offered, payload));
+                add(klioDndEv(KLIO_DND_OVER, x, y, offered, payload));
+                add(klioDndEv(KLIO_DND_DROP, x, y, offered, payload));
+            }
         } else if (std::strcmp(cmd, "a11y") == 0) {
             char verb[16] = {};
             int vused = 0;

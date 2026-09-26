@@ -1,0 +1,14 @@
+# Scripted input for compose_window_drag_and_drop.kt's window (KLIO_WIN_INPUT):
+# another application drops text, then two files, on the target (the lower
+# box); then a drag from the source (the upper box) down to the target. The
+# pointer hovers over the source before it presses, as a mouse does: a
+# gesture starts listening on the first event that reaches it.
+6 drop 100 90 text hello from elsewhere
+10 drop 100 90 files /tmp/notes.txt|/tmp/photo.png
+13 move 100 30
+14 press 100 30
+16 move 105 40
+18 move 110 60
+20 move 110 90
+22 release 110 90
+28 close

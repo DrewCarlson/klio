@@ -1,0 +1,11 @@
+# Scripted input for compose_window_cursor.kt's window (KLIO_WIN_INPUT): the
+# pointer over each row in turn, and the cursor the window then shows.
+6 move 50 15
+8 cursor
+10 move 50 45
+12 cursor
+14 move 50 75
+16 cursor
+18 move 50 105
+20 cursor
+22 close

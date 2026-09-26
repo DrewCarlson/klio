@@ -47,6 +47,9 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winEventText", winEventText);
     try b.register("androidx.compose.ui.window.__composeui_a11yActive", a11yActive);
     try b.register("androidx.compose.ui.window.__composeui_a11yUpdate", a11yUpdate);
+    try b.register("androidx.compose.ui.window.__composeui_winSetCursor", winSetCursor);
+    try b.register("androidx.compose.ui.window.__composeui_winDragStart", winDragStart);
+    try b.register("androidx.compose.ui.window.__composeui_winDndAccept", winDndAccept);
     try b.register("androidx.compose.ui.window.__composeui_traySupported", traySupported);
     try b.register("androidx.compose.ui.window.__composeui_trayOpen", trayOpen);
     try b.register("androidx.compose.ui.window.__composeui_trayClose", trayClose);
@@ -189,6 +192,9 @@ const Skia = struct {
     orderEmojiPalette: ?*const fn () callconv(.c) void,
     a11yActive: ?*const fn (?*SkWindow) callconv(.c) c_int,
     a11yUpdate: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
+    winSetCursor: ?*const fn (?*SkWindow, c_int) callconv(.c) void,
+    winDragStart: ?WinDragStartFn,
+    winDndAccept: ?*const fn (?*SkWindow, c_int) callconv(.c) void,
     winLastError: ?*const fn () callconv(.c) [*:0]const u8,
     tray: TrayFns,
     clipChangeCount: ?ClipChangeCountFn,
@@ -256,6 +262,7 @@ const WinAttachFn = *const fn (?*anyopaque, c_int, c_int, f64) callconv(.c) ?*Sk
 const WinPollEventFn = *const fn (?*SkWindow, c_int, [*]f64) callconv(.c) c_int;
 const WinPostEventFn = *const fn (?*SkWindow, c_int, [*]const f64) callconv(.c) void;
 const WinEventTextFn = *const fn (?*SkWindow, ?[*]u8, usize) callconv(.c) usize;
+const WinDragStartFn = *const fn (?*SkWindow, [*]const u8, usize, [*]const u8, usize, c_int, c_int, c_int) callconv(.c) c_int;
 /// The values of one window event (src/compose_ui/window_events.h).
 const win_event_values = 12;
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
@@ -340,6 +347,9 @@ fn loadSkia() ?*Skia {
         .orderEmojiPalette = lib.lookup(*const fn () callconv(.c) void, "klio_order_emoji_palette"),
         .a11yActive = lib.lookup(*const fn (?*SkWindow) callconv(.c) c_int, "klio_a11y_active"),
         .a11yUpdate = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_a11y_update"),
+        .winSetCursor = lib.lookup(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_set_cursor"),
+        .winDragStart = lib.lookup(WinDragStartFn, "klio_win_drag_start"),
+        .winDndAccept = lib.lookup(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_dnd_accept"),
         .winLastError = lib.lookup(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
         .tray = TrayFns.fromLib(&lib),
         .clipChangeCount = lib.lookup(ClipChangeCountFn, "klio_clip_change_count"),
@@ -399,6 +409,9 @@ fn loadSkiaStatic() ?*Skia {
         .orderEmojiPalette = externSym(*const fn () callconv(.c) void, "klio_order_emoji_palette"),
         .a11yActive = externSym(*const fn (?*SkWindow) callconv(.c) c_int, "klio_a11y_active"),
         .a11yUpdate = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_a11y_update"),
+        .winSetCursor = externSym(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_set_cursor"),
+        .winDragStart = externSym(WinDragStartFn, "klio_win_drag_start"),
+        .winDndAccept = externSym(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_dnd_accept"),
         .winLastError = externSym(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
         .tray = TrayFns.fromExtern(),
         .clipChangeCount = externSym(ClipChangeCountFn, "klio_clip_change_count"),
@@ -886,6 +899,52 @@ fn a11yUpdate(ctx: *CallCtx) Error!EvalResult {
     defer g.deinit();
     const bytes = g.get().bytes;
     f(win, bytes.ptr, bytes.len);
+    return ok(.{ .Unit = {} });
+}
+
+/// `__composeui_winSetCursor(handle, kind)`: the system cursor (the shim's
+/// KLIO_CURSOR_*) the window shows over its content, as a pointer icon asks.
+fn winSetCursor(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(.{ .Unit = {} });
+    const skia = loadSkia() orelse return ok(.{ .Unit = {} });
+    const f = skia.winSetCursor orelse return ok(.{ .Unit = {} });
+    const win = winHandle(ctx.args[0]) orelse return ok(.{ .Unit = {} });
+    f(win, @intCast(argInt(ctx.args[1])));
+    return ok(.{ .Unit = {} });
+}
+
+/// `__composeui_winDragStart(handle, payload, png, offsetX, offsetY, actions):
+/// Boolean`: starts a platform drag from the window (KlioWindowDragAndDrop.kt).
+fn winDragStart(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 6 or ctx.args[1] != .String) return ok(Value{ .Bool = false });
+    const skia = loadSkia() orelse return ok(Value{ .Bool = false });
+    const f = skia.winDragStart orelse return ok(Value{ .Bool = false });
+    const win = winHandle(ctx.args[0]) orelse return ok(Value{ .Bool = false });
+    const g = ctx.args[1].String.borrow();
+    defer g.deinit();
+    const payload = g.get().bytes;
+    var png: []const u8 = &.{};
+    var png_guard: ?@TypeOf(ctx.args[2].Array.storage().scalars.borrow()) = null;
+    defer if (png_guard) |pg| pg.deinit();
+    if (ctx.args[2] == .Array) switch (ctx.args[2].Array.storage()) {
+        .scalars => |pb| {
+            png_guard = pb.borrow();
+            png = png_guard.?.get().bytes.items;
+        },
+        .boxed => {},
+    };
+    const started = f(win, payload.ptr, payload.len, png.ptr, png.len, @intCast(argInt(ctx.args[3])), @intCast(argInt(ctx.args[4])), @intCast(argInt(ctx.args[5])));
+    return ok(Value{ .Bool = started != 0 });
+}
+
+/// `__composeui_winDndAccept(handle, action)`: the action the program now
+/// takes of the drag over the window (0 for none).
+fn winDndAccept(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(.{ .Unit = {} });
+    const skia = loadSkia() orelse return ok(.{ .Unit = {} });
+    const f = skia.winDndAccept orelse return ok(.{ .Unit = {} });
+    const win = winHandle(ctx.args[0]) orelse return ok(.{ .Unit = {} });
+    f(win, @intCast(argInt(ctx.args[1])));
     return ok(.{ .Unit = {} });
 }
 
@@ -1500,7 +1559,9 @@ test "hostBindings registers the surface and windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetTextInput") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winEventText") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_a11yUpdate") != null);
-    try testing.expectEqual(@as(usize, 66), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetCursor") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winDragStart") != null);
+    try testing.expectEqual(@as(usize, 69), b.len());
 }
 
 test "a window that cannot open says why" {
@@ -1620,6 +1681,9 @@ test "the accessibility bindings are inactive and do nothing for short args" {
     var c = host.ctx(&none);
     try testing.expect(!(try a11yActive(&c)).ok.Bool);
     try testing.expect((try a11yUpdate(&c)).ok == .Unit);
+    try testing.expect((try winSetCursor(&c)).ok == .Unit);
+    try testing.expect(!(try winDragStart(&c)).ok.Bool);
+    try testing.expect((try winDndAccept(&c)).ok == .Unit);
 }
 
 test "a window position packs x high and y low, negatives kept" {

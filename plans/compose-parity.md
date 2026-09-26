@@ -157,8 +157,9 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
     ContextMenuProvider as they are, BasicContextMenuRepresentation and
     text/ContextMenu without their Swing menus (a text field's context menu
     is upstream's), and WindowDraggableArea over a klio window's move with
-    the mouse; (c) done: the accessibility bridge (below); (d) pointer icons (`PlatformContext.setPointerIcon`), drag and
-    drop between applications; (e) a Windows run (item 8).
+    the mouse; (c) done: the accessibility bridge (below); (d) done: pointer
+    icons and drag and drop between applications (below); (e) a Windows run
+    (item 8).
     The input method: a klio window's text field turns the window's input
     method on (klio_win_set_text_input), and the shim reports what it
     composes and commits as KLIO_EV_IME, which KlioWindowTextInput applies
@@ -184,6 +185,28 @@ bound (none remain), and skiko's 981 bind by @ExternalSymbolName. Linux
     through each platform's API, and compose_window_accessibility prints
     the same tree on macOS and Linux; a pyatspi client over D-Bus read the
     tree and pressed and toggled through atk-bridge.
+    Pointer icons: KlioPlatformContext.setPointerIcon sets the window's
+    system cursor (klio_win_set_cursor: NSCursor over the content, SDL's
+    system cursors, WM_SETCURSOR), and a scripted `cursor` prints it.
+    Drag and drop: KlioWindowDragAndDrop is AwtDragAndDropManager's
+    counterpart. A drag over a window reaches the scene's root
+    drag-and-drop node, and the program answers each enter, move and drop
+    with the action it takes (the drop's answer is AWT's dropComplete); a
+    dragAndDropSource starts the platform's drag with its decoration drawn
+    to a PNG. macOS: the content view is an NSDraggingDestination and
+    source (the destination checked in-process with AppKit's calls on a
+    stand-in NSDraggingInfo). Windows: IDropTarget and DoDragDrop (compiled
+    only; DoDragDrop holds the program's thread, so the program's own
+    windows take its drag with the default action and hear it after).
+    X11: XDND on the shim's own connection, each window's XdndProxy naming
+    a window of it, the source side under a pointer grab, served from the
+    windows' poll so the program answers drags over its own windows; drags
+    between klio windows and GTK's, both ways, with text and files, ran
+    under xdotool. A scripted press, or a Wayland window, drags within the
+    window. A drag taking the mouse release, the content sees the button up
+    from its next event, as over AWT; upstream's skiko drag detector then
+    starts listening again from the event after, so scripted input hovers
+    twice before pressing again.
 
 **Sparse checkout widenings a future item needs** (for the coordinator to
 run; scripts/init-compose-submodule.sh lists the current set):
@@ -307,10 +330,10 @@ tray runs on the X display; a MenuBar in a GPU SDL window). skiko's C glue
 
 | Platform | Verified by running | Verified by compiling only |
 |----------|---------------------|----------------------------|
-| macOS arm64 | every compose example (71 of 71 with the tray), the compose-ui gate, the upstream suites, the JVM oracle, skiko's natives through the shim's glue (the skiko module's test), the input method with key events posted through AppKit's input context, the accessibility tree through NSAccessibility | |
-| Linux aarch64 (Debian 12 container, Xvfb) | the compose examples (69 of 70 with skiko's glue in the shim: compose_text_fonts prints FreeType's baselines, 17.312 where CoreText gives 17.312012, and Compose Desktop 1.12.0 prints the same 17.312 in that container), the JVM oracle run in the same container (identical on the 11 font- and pixel-dependent examples it can compile), the drawn menu bar by frame dumps, the XEmbed tray under trayer (icon, menu, action, balloon) and without a tray, skiko's natives through the shim's glue (the skiko module's test), the compose-ui gate from a fresh home (the scripted input method, the system theme and the accessibility tree among it), an AT-SPI client (pyatspi) reading and acting through atk-bridge, and all 31 packs, org.jetbrains.skiko included, building | the harness is cross-compiled from macOS; the shim is built in the container with g++ |
+| macOS arm64 | every compose example (the tray's included), the compose-ui gate, the upstream suites, the JVM oracle, skiko's natives through the shim's glue (the skiko module's test), the input method with key events posted through AppKit's input context, the accessibility tree through NSAccessibility, a drop through the content view's NSDraggingDestination calls | a drag with a real pointer through AppKit's dragging session |
+| Linux aarch64 (Debian 12 container, Xvfb) | the compose examples (69 of 70 with skiko's glue in the shim: compose_text_fonts prints FreeType's baselines, 17.312 where CoreText gives 17.312012, and Compose Desktop 1.12.0 prints the same 17.312 in that container), the JVM oracle run in the same container (identical on the 11 font- and pixel-dependent examples it can compile), the drawn menu bar by frame dumps, the XEmbed tray under trayer (icon, menu, action, balloon) and without a tray, skiko's natives through the shim's glue (the skiko module's test), the compose-ui gate from a fresh home (the scripted input method, the system theme and the accessibility tree among it), an AT-SPI client (pyatspi) reading and acting through atk-bridge, XDND drags driven by xdotool within a klio window and between it and a GTK window both ways (text and files), and all 31 packs, org.jetbrains.skiko included, building | the harness is cross-compiled from macOS; the shim is built in the container with g++ |
 | Linux x86_64 | | compose_ui and the stdlib (`zigcheck.py --target x86_64-linux-gnu`) |
-| Windows x86_64 | | klio.exe with compose_ui and the skiko bindings, compiled and linked by the cross build (`zig build -Dtarget=x86_64-windows-gnu`, over the runtime's platform layer); the shim's own sources (its IMM32 input method, registry theme read and UI Automation providers among them; the UIA imports link against uiautomationcore) and all 86 of skiko's glue sources to objects (`zig c++ -target x86_64-windows-gnu`, C++20). Linking the shim needs the MSVC toolchain the Windows Skia prebuilt is built with |
+| Windows x86_64 | | klio.exe with compose_ui and the skiko bindings, compiled and linked by the cross build (`zig build -Dtarget=x86_64-windows-gnu`, over the runtime's platform layer); the shim's own sources (its IMM32 input method, registry theme read, UI Automation providers and OLE drag and drop among them; the UIA imports link against uiautomationcore) and all 86 of skiko's glue sources to objects (`zig c++ -target x86_64-windows-gnu`, C++20). Linking the shim needs the MSVC toolchain the Windows Skia prebuilt is built with |
 
 Not verified anywhere yet: a Wayland session (SDL picks Wayland or X11 at
 runtime; the tray is X11's, so under Wayland without XWayland
@@ -632,3 +655,9 @@ isTraySupported is false), and running on Windows.
   tree goes to NSAccessibility, UI Automation and AT-SPI (ATK with
   atk-bridge, loaded at run time), and a client's press, toggle, new text
   or step runs the node's semantics action.
+- 2026-09-26: a klio window shows the cursor its pointer icon asks for, and
+  drag and drop runs through the platform's: AppKit's dragging session and
+  destination, OLE's, and XDND on X11, which the shim serves on its own
+  connection. The program answers each drag event as it handles it, so an
+  X11 source hears the drop's result. A drag that ends outside the window
+  leaves it for SDL too, which never saw the grab's crossing.

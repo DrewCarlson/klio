@@ -27,6 +27,8 @@ import androidx.compose.ui.graphics.Paint
 import androidx.compose.ui.graphics.klioDrawToPng
 import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.input.InputModeManager
+import androidx.compose.ui.input.pointer.KlioPointerIcon
+import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerButtons
@@ -36,6 +38,7 @@ import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.platform.DefaultArchitectureComponentsOwner
 import androidx.compose.ui.platform.DefaultInputModeManager
 import androidx.compose.ui.platform.PlatformContext
+import androidx.compose.ui.platform.PlatformDragAndDropManager
 import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.platform.WindowInfoImpl
 import androidx.compose.ui.scene.ComposeScenePointer
@@ -48,7 +51,9 @@ import androidx.compose.ui.window.__composeui_hideKeyboard
 import androidx.compose.ui.window.__composeui_setTextCallback
 import androidx.compose.ui.window.__composeui_showKeyboard
 import androidx.compose.ui.window.__composeui_textInput
+import androidx.compose.ui.window.__composeui_winSetCursor
 import androidx.compose.ui.window.KlioWindowAccessibility
+import androidx.compose.ui.window.KlioWindowDragAndDrop
 import androidx.compose.ui.window.KlioWindowTextInput
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -153,7 +158,20 @@ internal class KlioPlatformContext(
     val windowTextInput: KlioWindowTextInput? = null,
     /** A desktop window's accessibility, which its semantics owners report to. */
     val windowAccessibility: KlioWindowAccessibility? = null,
+    /** A desktop window's handle, whose cursor follows the pointer icon; 0 for a hosted surface. */
+    private val windowHandle: Long = 0L,
+    /** A desktop window's drag and drop. */
+    val windowDragAndDrop: KlioWindowDragAndDrop? = null,
 ) : PlatformContext {
+    override val dragAndDropManager: PlatformDragAndDropManager
+        get() = windowDragAndDrop ?: super.dragAndDropManager
+
+    // The window shows the icon's system cursor, as the desktop sets its
+    // component's AWT cursor.
+    override fun setPointerIcon(pointerIcon: PointerIcon) {
+        if (windowHandle != 0L) __composeui_winSetCursor(windowHandle, (pointerIcon as? KlioPointerIcon)?.kind ?: 0)
+    }
+
     override val inputModeManager: InputModeManager = DefaultInputModeManager()
 
     override val semanticsOwnerListener: PlatformContext.SemanticsOwnerListener?

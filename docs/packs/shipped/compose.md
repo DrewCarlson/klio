@@ -103,6 +103,18 @@ signature:
   once a client reads the window, with each node's role, name, value and
   states computed as upstream's ComposeAccessible computes them, and a
   client's press, focus, new text or step running the semantics action.
+- a klio window shows the system cursor its content's pointer icon asks for
+  (the arrow, the text cursor, the hand, the crosshair), and drag and drop
+  runs through the platform's, as Compose Desktop's runs through AWT's:
+  files and text another application drops on a window reach its
+  `dragAndDropTarget`, answered with what the target takes, and a
+  `dragAndDropSource` starts a platform drag that other applications (and
+  the program's own windows) take, hearing the action the drop took.
+  macOS uses AppKit's dragging session and destination, Windows OLE's
+  DoDragDrop and IDropTarget, and X11 XDND, which the Skia shim serves on its
+  own X connection as AWT's XToolkit does (X11 drags show no image, as AWT's
+  do not). A Wayland window takes SDL's drops, reported as they land, and
+  drags within itself.
 - material3's platform half is upstream's skikoMain and nonJvmMain (dialogs,
   menus, the bottom sheet, tooltips, strings with their translations, the
   kotlinx-datetime calendar model). Its `CalendarLocale` is the ui text

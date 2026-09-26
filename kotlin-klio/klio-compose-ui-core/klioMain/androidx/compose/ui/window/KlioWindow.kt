@@ -139,6 +139,8 @@ internal class KlioApplication(
             components,
             windowTextInput = if (hosted) null else KlioWindowTextInput(handle),
             windowAccessibility = if (hosted) null else KlioWindowAccessibility(handle),
+            windowHandle = if (hosted) 0L else handle,
+            windowDragAndDrop = if (hosted) null else KlioWindowDragAndDrop(handle),
         )
         var holder: KlioWindowHolder? = null
         val invalidate = { holder?.dirty = true }
@@ -152,6 +154,7 @@ internal class KlioApplication(
             invalidateLayout = invalidate,
             invalidateDraw = invalidate,
         )
+        platformContext.windowDragAndDrop?.scene = scene
         val created = KlioWindowHolder(handle, scene, frameRecomposer, platformContext, w, h, hosted)
         created.resize(w, h)
         created.updateLifecycleState()
@@ -167,9 +170,12 @@ internal class KlioApplication(
         if (holder.closed) return
         holder.closed = true
         holder.updateLifecycleState()
-        __composeui_winClose(holder.handle)
+        // The scene goes first, as a ComposeWindow disposes its content before
+        // the AWT window: disposing it resets the pointer icon and ends text
+        // input, on the window.
         holder.scene.close()
         holder.frameRecomposer.close()
+        __composeui_winClose(holder.handle)
         windows.remove(holder)
     }
 }
@@ -438,6 +444,7 @@ internal class KlioWindowHolder(
         handle,
         platformContext.windowTextInput,
         platformContext.windowAccessibility,
+        platformContext.windowDragAndDrop,
     ).also { input ->
         input.menuShortcut = { event -> menuBar?.shortcut(event) ?: false }
         input.onFocusChanged = { updateLifecycleState() }
@@ -1063,7 +1070,7 @@ private fun dropsBlocked(blocker: KlioWindowHolder, type: Int, v: DoubleArray): 
     val forward = when (type) {
         WINDOW_EVENT_POINTER -> v[0].toInt() == 1
         WINDOW_EVENT_FOCUS -> v[0] != 0.0
-        WINDOW_EVENT_KEY, WINDOW_EVENT_TEXT, WINDOW_EVENT_IME, WINDOW_EVENT_MENU, WINDOW_EVENT_A11Y -> false
+        WINDOW_EVENT_KEY, WINDOW_EVENT_TEXT, WINDOW_EVENT_IME, WINDOW_EVENT_MENU, WINDOW_EVENT_A11Y, WINDOW_EVENT_DND -> false
         else -> return false
     }
     if (forward) __composeui_winSetFlag(blocker.handle, WIN_FRONT, 1)
@@ -1218,6 +1225,10 @@ internal fun __composeui_winOpen(width: Int, height: Int, title: String): Long =
 // Why the last __composeui_winOpen answered 0.
 internal fun __composeui_winOpenError(): String =
     error("intrinsic androidx.compose.ui.window.__composeui_winOpenError not installed")
+
+/** Shows the system cursor of [kind] (the shim's KLIO_CURSOR_*) over the window's content. */
+internal fun __composeui_winSetCursor(handle: Long, kind: Int): Unit =
+    error("intrinsic androidx.compose.ui.window.__composeui_winSetCursor not installed")
 
 // Waits up to timeoutMs for the window's next event, writes its values into
 // [out] (WINDOW_EVENT_VALUES of them) and returns its type (WINDOW_EVENT_*).

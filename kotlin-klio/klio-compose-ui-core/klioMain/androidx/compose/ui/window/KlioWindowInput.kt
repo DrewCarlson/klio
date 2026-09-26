@@ -42,6 +42,7 @@ internal const val WINDOW_EVENT_PLACEMENT = 15
 internal const val WINDOW_EVENT_MENU = 16
 internal const val WINDOW_EVENT_IME = 19
 internal const val WINDOW_EVENT_A11Y = 20
+internal const val WINDOW_EVENT_DND = 23
 
 /** How many values a window event carries. */
 internal const val WINDOW_EVENT_VALUES = 12
@@ -91,6 +92,7 @@ internal class KlioWindowInput(
     private val handle: Long,
     private val textInput: KlioWindowTextInput?,
     private val accessibility: KlioWindowAccessibility?,
+    private val dragAndDrop: KlioWindowDragAndDrop?,
 ) {
     private var keyModifiers = PointerKeyboardModifiers()
 
@@ -152,6 +154,12 @@ internal class KlioWindowInput(
             WINDOW_EVENT_TEXT -> if (enabled && focusable) sendText(v)
             WINDOW_EVENT_IME -> if (enabled && focusable) sendInputMethod(v)
             WINDOW_EVENT_A11Y -> if (enabled) sendAccessibility(v)
+            WINDOW_EVENT_DND -> if (enabled) {
+                val kind = v[0].toInt()
+                // Only a drag's enter, move and drop carry its data.
+                val payload = if (kind == 1 || kind == 2 || kind == 4) __composeui_winEventText(handle) else ""
+                dragAndDrop?.onEvent(kind, v[1].toFloat(), v[2].toFloat(), v[3].toInt(), payload)
+            }
             WINDOW_EVENT_FOCUS -> {
                 windowInfo.isWindowFocused = v[0] != 0.0
                 onFocusChanged()
