@@ -85,17 +85,23 @@ pub fn isThreadAbandonable() bool {
     return thread_abandonable;
 }
 
-/// Hook the coroutine layer installs to hear that this thread is about to block
-/// in a real wall sleep. A pool task doing wall work does not advance the
-/// cooperative virtual clock, so the hook settles its unsettled count.
+/// Hooks the coroutine layer installs to hear that this thread enters and
+/// leaves a real `Thread.sleep`. A sleeping thread advances no cooperative
+/// virtual clock, so it releases its hold on it for the length of the sleep.
 var wall_block_hook: ?*const fn () void = null;
+var wall_unblock_hook: ?*const fn () void = null;
 
-pub fn setWallBlockHook(hook: *const fn () void) void {
-    wall_block_hook = hook;
+pub fn setWallBlockHooks(block: *const fn () void, unblock: *const fn () void) void {
+    wall_unblock_hook = unblock;
+    wall_block_hook = block;
 }
 
 pub fn notifyWallBlock() void {
     if (wall_block_hook) |h| h();
+}
+
+pub fn notifyWallUnblock() void {
+    if (wall_unblock_hook) |h| h();
 }
 
 pub fn requestAbandon() void {

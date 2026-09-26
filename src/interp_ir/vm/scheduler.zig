@@ -57,6 +57,13 @@ pub const Pool = struct {
     default_cap_override: usize = 0,
     /// Pool worker ceiling (the IO view's parallelism); 0 = derive.
     max_workers_override: usize = 0,
+    /// A dispatcher's own pool names its threads after it, as the JVM's
+    /// thread-pool contexts do: `name` alone for one thread, `name-N` for more.
+    /// Null names them as `Dispatchers.Default`'s workers. Page-allocator owned.
+    thread_name: ?[]const u8 = null,
+    /// Closed by its dispatcher: posts are refused, and the workers exit once
+    /// the queue drains.
+    closing: bool = false,
 
     const Fifo = struct {
         items: std.ArrayList(Task) = .empty,
@@ -142,6 +149,17 @@ pub const Pool = struct {
     /// Post a task, spawning a worker when none is idle and the pool is below its
     /// ceiling. A post into a stopping pool is dropped.
     pub fn post(self: *Pool, task: Task) Allocator.Error!void {
+        _ = try self.postImpl(task, false);
+    }
+
+    /// Refuses the post when the pool is closed, answering false; the task is
+    /// then the caller's to drop. The check and the enqueue are one step, so a
+    /// post racing the close never lands behind workers that have left.
+    pub fn postUnlessClosed(self: *Pool, task: Task) Allocator.Error!bool {
+        return self.postImpl(task, true);
+    }
+
+    fn postImpl(self: *Pool, task: Task, refuse_closed: bool) Allocator.Error!bool {
         gcInstallPoolRoot();
         const a = self.allocator();
         {
@@ -150,8 +168,9 @@ pub const Pool = struct {
             if (self.stopping) {
                 var t = task;
                 self.drop_fn(&t);
-                return;
+                return true;
             }
+            if (refuse_closed and self.closing) return false;
             switch (task.kind) {
                 .default => try self.queue_default.push(a, task),
                 .io => try self.queue_io.push(a, task),
@@ -173,6 +192,18 @@ pub const Pool = struct {
                     self.worker_seq -= 1;
                 }
             }
+        }
+        self.gate.ring();
+        return true;
+    }
+
+    /// Refuses further posts; queued tasks still run, and each worker ends once
+    /// the queue drains. Does not wait.
+    pub fn close(self: *Pool) void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.closing = true;
         }
         self.gate.ring();
     }
@@ -266,8 +297,11 @@ pub const Pool = struct {
     fn workerMain(self: *Pool, seq: usize) void {
         runtime.enterThreadStack(runtime.WORKER_STACK_SIZE);
         const tid = std.Thread.getCurrentId();
-        var name_buf: [64]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "DefaultDispatcher-worker-{d}", .{seq}) catch "DefaultDispatcher-worker";
+        var name_buf: [256]u8 = undefined;
+        const name = if (self.thread_name) |base| blk: {
+            if (self.max_workers_override == 1) break :blk base;
+            break :blk std.fmt.bufPrint(&name_buf, "{s}-{d}", .{ base, seq }) catch base;
+        } else std.fmt.bufPrint(&name_buf, "DefaultDispatcher-worker-{d}", .{seq}) catch "DefaultDispatcher-worker";
         runtime.setThreadName(tid, name);
         defer runtime.clearThreadName(tid);
         coroutines.gcThreadEnter();
@@ -289,6 +323,8 @@ pub const Pool = struct {
                             _ = tasks_begun.fetchAdd(1, .release);
                             break :blk t;
                         }
+                        // Closed and drained: the thread ends.
+                        if (self.closing and self.queue_default.len() == 0 and self.queue_io.len() == 0) return;
                     }
                     // Idle park; the 1ms cap paces the abandon poll and the wait is
                     // GC-safe.
@@ -378,12 +414,106 @@ fn gcInstallPoolRoot() void {
 }
 
 fn gcMarkPool(m: *runtime.gc.Marker) void {
-    global_pool.mutex.lock();
-    defer global_pool.mutex.unlock();
-    const qd = &global_pool.queue_default;
+    gcMarkPoolQueues(&global_pool, m);
+    DispatcherPools.mutex.lock();
+    defer DispatcherPools.mutex.unlock();
+    for (DispatcherPools.pools.items) |p| gcMarkPoolQueues(p, m);
+}
+
+fn gcMarkPoolQueues(pool: *Pool, m: *runtime.gc.Marker) void {
+    pool.mutex.lock();
+    defer pool.mutex.unlock();
+    const qd = &pool.queue_default;
     for (qd.items.items[qd.head..]) |*t| t.block.gcMark(m);
-    const qi = &global_pool.queue_io;
+    const qi = &pool.queue_io;
     for (qi.items.items[qi.head..]) |*t| t.block.gcMark(m);
+}
+
+// The pools of `newFixedThreadPoolContext` dispatchers, each with threads of
+// its own. A dispatcher names its pool by a handle, its index plus one. The
+// run boundary closes every pool and shuts it down as a daemon, as the JVM's
+// pool threads are, whether or not the program closed it. A pool stays
+// registered, closed, for the rest of the process: a thread still holding its
+// handle, one the boundary has yet to join, finds it refusing work rather
+// than freed.
+const DispatcherPools = struct {
+    var mutex: runtime.SpinMutex = .{};
+    var pools: std.ArrayList(*Pool) = .empty;
+
+    fn get(handle: i64) ?*Pool {
+        mutex.lock();
+        defer mutex.unlock();
+        if (handle < 1 or handle > pools.items.len) return null;
+        return pools.items[@intCast(handle - 1)];
+    }
+};
+
+/// A pool of `n_threads` threads named after `name` (copied), for a
+/// dispatcher of its own. Returns its handle.
+pub fn newDispatcherPool(n_threads: usize, name: []const u8) Allocator.Error!i64 {
+    gcInstallPoolRoot();
+    const a = std.heap.page_allocator;
+    const pool = try a.create(Pool);
+    errdefer a.destroy(pool);
+    const owned = try a.dupe(u8, name);
+    errdefer a.free(owned);
+    pool.* = .{
+        .default_cap_override = n_threads,
+        .max_workers_override = n_threads,
+        .thread_name = owned,
+    };
+    DispatcherPools.mutex.lock();
+    defer DispatcherPools.mutex.unlock();
+    try DispatcherPools.pools.append(a, pool);
+    return @intCast(DispatcherPools.pools.items.len);
+}
+
+/// Posts `task` onto the dispatcher pool `handle`. False when that pool is
+/// closed or gone, having dropped the task.
+pub fn postToDispatcherPool(handle: i64, task: Task) Allocator.Error!bool {
+    if (DispatcherPools.get(handle)) |pool| {
+        if (try pool.postUnlessClosed(task)) return true;
+    }
+    dropRefusedTask(task);
+    return false;
+}
+
+/// Releases a task its pool refused, on the poster's own thread: no child Vm
+/// is materialized and torn down, which would reset the poster's own state.
+fn dropRefusedTask(task: Task) void {
+    coroutines.poolTaskSettleDropped();
+    if (runtime.reclaimEnabled()) task.block.release(task.seed.allocator);
+    task.seed.release();
+}
+
+pub fn closeDispatcherPool(handle: i64) void {
+    const pool = DispatcherPools.get(handle) orelse return;
+    pool.close();
+}
+
+/// Run boundary: close every dispatcher pool, drop what is queued and join its
+/// threads. Its first task failure becomes the run's.
+fn shutdownDispatcherPools() void {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const pool = blk: {
+            DispatcherPools.mutex.lock();
+            defer DispatcherPools.mutex.unlock();
+            if (i >= DispatcherPools.pools.items.len) return;
+            break :blk DispatcherPools.pools.items[i];
+        };
+        pool.close();
+        pool.shutdownAndJoin();
+        if (pool.takeFirstError()) |e| noteTaskError(e);
+    }
+}
+
+fn dispatcherPoolsOutstanding() usize {
+    DispatcherPools.mutex.lock();
+    defer DispatcherPools.mutex.unlock();
+    var n: usize = 0;
+    for (DispatcherPools.pools.items) |p| n += p.outstandingOther();
+    return n;
 }
 
 /// Tasks a worker has picked up. Monotonic; a caller compares against the
@@ -398,11 +528,13 @@ pub fn outstandingOtherCount() usize {
     return global_pool.outstandingOther();
 }
 
+/// Work outstanding on the shared pool and every dispatcher pool.
 pub fn outstandingOther() usize {
-    return global_pool.outstandingOther();
+    return global_pool.outstandingOther() + dispatcherPoolsOutstanding();
 }
 
 pub fn shutdownAndJoin() void {
+    shutdownDispatcherPools();
     global_pool.shutdownAndJoin();
 }
 
@@ -582,6 +714,62 @@ test "shutdown drops queued tasks and resets for reuse" {
     }
     try testing.expectEqual(@as(usize, 1), test_counter.load(.acquire));
     pool.shutdownAndJoin();
+}
+
+var test_names_mutex: runtime.SpinMutex = .{};
+var test_names: std.ArrayList([]const u8) = .empty;
+
+fn namingRunner(task: *Task) ?RuntimeError {
+    _ = task;
+    const name = runtime.threadName(std.heap.page_allocator, std.Thread.getCurrentId()) orelse "?";
+    test_names_mutex.lock();
+    defer test_names_mutex.unlock();
+    test_names.append(std.heap.page_allocator, name) catch {};
+    runtime.clockSleepMillis(2);
+    _ = test_counter.fetchAdd(1, .monotonic);
+    return null;
+}
+
+test "a closed dispatcher pool runs what it queued, refuses more, and its threads end" {
+    var pool: Pool = .{ .run_fn = namingRunner, .drop_fn = noopDrop, .default_cap_override = 2, .max_workers_override = 2, .thread_name = "crew" };
+    test_counter.store(0, .release);
+    test_names.clearRetainingCapacity();
+    var i: usize = 0;
+    while (i < 8) : (i += 1) try testing.expect(try pool.postUnlessClosed(stubTask(.default)));
+    pool.close();
+    try testing.expect(!try pool.postUnlessClosed(stubTask(.default)));
+    var spins: usize = 0;
+    while (test_counter.load(.acquire) < 8 and spins < 10_000) : (spins += 1) runtime.clockSleepMillis(1);
+    try testing.expectEqual(@as(usize, 8), test_counter.load(.acquire));
+    // Drained and closed, every worker has left its loop.
+    spins = 0;
+    while (spins < 10_000) : (spins += 1) {
+        pool.mutex.lock();
+        const running = pool.running;
+        pool.mutex.unlock();
+        if (running == 0) break;
+        runtime.clockSleepMillis(1);
+    }
+    pool.shutdownAndJoin();
+    test_names_mutex.lock();
+    defer test_names_mutex.unlock();
+    for (test_names.items) |n| {
+        try testing.expect(std.mem.eql(u8, n, "crew-1") or std.mem.eql(u8, n, "crew-2"));
+    }
+}
+
+test "a one-thread dispatcher pool names its thread after the dispatcher alone" {
+    var pool: Pool = .{ .run_fn = namingRunner, .drop_fn = noopDrop, .default_cap_override = 1, .max_workers_override = 1, .thread_name = "solo" };
+    test_counter.store(0, .release);
+    test_names.clearRetainingCapacity();
+    try testing.expect(try pool.postUnlessClosed(stubTask(.default)));
+    var spins: usize = 0;
+    while (test_counter.load(.acquire) < 1 and spins < 10_000) : (spins += 1) runtime.clockSleepMillis(1);
+    pool.shutdownAndJoin();
+    test_names_mutex.lock();
+    defer test_names_mutex.unlock();
+    try testing.expectEqual(@as(usize, 1), test_names.items.len);
+    try testing.expectEqualStrings("solo", test_names.items[0]);
 }
 
 test {

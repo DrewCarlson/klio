@@ -353,6 +353,52 @@ fn spawnTimerBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .Unit };
 }
 
+/// A pool of threads of its own for `newFixedThreadPoolContext`: its handle.
+fn poolNew(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Type = "__kxco_poolNew: expected the thread count and the name" } };
+    const n: i64 = switch (ctx.args[0]) {
+        .Int => |i| i,
+        .Long => |l| l,
+        else => return .{ .err = .{ .Type = "__kxco_poolNew: the thread count must be Int" } },
+    };
+    const name: []const u8 = switch (ctx.args[1]) {
+        .String => |s| s.asPtrConst().bytes,
+        else => return .{ .err = .{ .Type = "__kxco_poolNew: the name must be String" } },
+    };
+    if (n < 1) return .{ .err = .{ .Type = "__kxco_poolNew: expected at least one thread" } };
+    return .{ .ok = .{ .Long = try ctx.host.coroutinePoolNew(@intCast(n), name) } };
+}
+
+/// Posts a runnable to a thread-pool dispatcher's pool; false once it is closed.
+fn poolDispatch(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Type = "__kxco_poolDispatch: expected the pool and the block" } };
+    const pool: i64 = switch (ctx.args[0]) {
+        .Long => |l| l,
+        .Int => |i| i,
+        else => return .{ .err = .{ .Type = "__kxco_poolDispatch: the pool must be Long" } },
+    };
+    return switch (try ctx.host.coroutinePoolDispatch(pool, &ctx.args[1], ctx.out)) {
+        .posted => |b| .{ .ok = .{ .Bool = b } },
+        .err => |e| .{ .err = e },
+    };
+}
+
+fn poolClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const pool: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| i,
+        else => return .{ .err = .{ .Type = "__kxco_poolClose: the pool must be Long" } },
+    };
+    ctx.host.coroutinePoolClose(pool);
+    return .{ .ok = .Unit };
+}
+
+/// Whether a delay scheduled on this thread through the default `Delay` has a
+/// blocking event loop to wait on.
+fn onEventLoop(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return .{ .ok = .{ .Bool = ctx.host.coroutineOnEventLoop() } };
+}
+
 /// Post a `Dispatchers.Default` runnable onto the shared worker pool. The body,
 /// its captures and its result cross threads, each shared cell mediating access
 /// through its own reader/writer lock.
@@ -479,6 +525,10 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_spawn", .f = spawnLaunchBlock },
     .{ .fqn = "kotlinx.coroutines.__kxco_spawnTimeout", .f = spawnTimeoutBlock },
     .{ .fqn = "kotlinx.coroutines.__kxco_spawnTimer", .f = spawnTimerBlock },
+    .{ .fqn = "kotlinx.coroutines.__kxco_onEventLoop", .f = onEventLoop },
+    .{ .fqn = "kotlinx.coroutines.__kxco_poolNew", .f = poolNew },
+    .{ .fqn = "kotlinx.coroutines.__kxco_poolDispatch", .f = poolDispatch },
+    .{ .fqn = "kotlinx.coroutines.__kxco_poolClose", .f = poolClose },
     .{ .fqn = "kotlinx.coroutines.__kxco_dispatch", .f = dispatchCoroutine },
     .{ .fqn = "kotlinx.coroutines.internal.synchronizedImpl", .f = synchronizedImpl },
     .{ .fqn = "kotlinx.coroutines.internal.__kxco_systemProp", .f = kxcoSystemProp },

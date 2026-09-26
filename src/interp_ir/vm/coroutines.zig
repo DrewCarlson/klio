@@ -513,29 +513,68 @@ const VirtualClock = struct {
     }
 };
 
-/// Whether this thread's pool task still counts as unsettled; the first
-/// `publishFloor` or `poolTaskRunEnd` settles the global count, once per task.
-threadlocal var pool_task_unsettled: bool = false;
+// Under `Virtual`, a thread that runs code outside any pump holds the shared
+// clock: nothing orders what it may start (a launch, a dispatch, a timer post),
+// so no pump jumps to a later timer until the thread parks on a timer of its
+// own, or ends. The program's main thread, an explicit thread and a
+// dispatched pool task hold it; an event loop (`runBlocking`) represents its
+// thread by its floor instead. A thread holds while it runs from its start,
+// or its dispatch, to the first finite floor one of its event loops
+// publishes, and again from the exit of its last pump. `Thread.sleep` and `Thread.join` let it go for the wait,
+// since what they wait for runs on its own clock. Any other wait holds it: a
+// thread blocked on real I/O keeps virtual time from jumping past the
+// timeouts guarding that I/O. A thread that holds the clock without ending
+// the hold, a spin loop or a long I/O wait, holds a pump's timer back only
+// for as long in real time as the timer's own delay (`virtualStarvationDue`),
+// so virtual time never runs slower than real time.
 
-/// The runtime wall-block hook: a task entering a real `Thread.sleep` releases
-/// its virtual-clock claim for the length of the sleep.
-fn wallBlockSettle() void {
-    if (pool_task_unsettled) {
-        pool_task_unsettled = false;
-        VirtualClock.settle();
-    }
+/// This thread holds one count of the clock's unsettled threads.
+threadlocal var holds_clock: bool = false;
+/// This thread takes the clock whenever it runs outside a pump.
+threadlocal var clock_holder: bool = false;
+/// Whether the wait in progress let the clock go.
+threadlocal var released_for_wait: bool = false;
+
+fn holdClock() void {
+    if (holds_clock or root.coroutineTimeMode() != .Virtual) return;
+    installClockHooks();
+    holds_clock = true;
+    VirtualClock.enterUnsettled();
 }
 
-var wall_hook_installed = std.atomic.Value(bool).init(false);
+fn releaseClock() void {
+    if (!holds_clock) return;
+    holds_clock = false;
+    VirtualClock.settle();
+}
 
-/// A top-level driver must not advance virtual time across the window between
-/// dispatch and the task establishing its barrier floor. Paired with
-/// `poolTaskSettleDropped` or the task's first `publishFloor`.
+/// Lets the clock go for a `Thread.sleep` or `Thread.join`.
+pub fn clockWaitBegin() void {
+    if (!holds_clock) return;
+    releaseClock();
+    released_for_wait = true;
+}
+
+/// Takes the clock back after the wait, unless a pump speaks for the thread.
+pub fn clockWaitEnd() void {
+    if (!released_for_wait) return;
+    released_for_wait = false;
+    if (clock_holder and coro_stack.items.len == 0) holdClock();
+}
+
+var clock_hooks_installed = std.atomic.Value(bool).init(false);
+
+fn installClockHooks() void {
+    if (clock_hooks_installed.swap(true, .monotonic)) return;
+    runtime.setWallBlockHooks(clockWaitBegin, clockWaitEnd);
+}
+
+/// A pool task, or an explicit thread, counts as unsettled from its dispatch:
+/// the poster holds the clock for it until it runs. Paired with
+/// `poolTaskSettleDropped`, or taken over by the thread that runs it.
 pub fn poolTaskDispatched() void {
     if (root.coroutineTimeMode() != .Virtual) return;
-    if (!wall_hook_installed.swap(true, .monotonic)) {
-        runtime.setWallBlockHook(wallBlockSettle);
-    }
+    installClockHooks();
     VirtualClock.enterUnsettled();
 }
 
@@ -544,15 +583,31 @@ pub fn poolTaskSettleDropped() void {
     VirtualClock.settle();
 }
 
+/// The thread now running a dispatched task, or a spawned thread's body, takes
+/// over the count its poster took.
 pub fn poolTaskRunBegin() void {
-    pool_task_unsettled = root.coroutineTimeMode() == .Virtual;
+    clock_holder = true;
+    holds_clock = root.coroutineTimeMode() == .Virtual;
 }
 
 pub fn poolTaskRunEnd() void {
-    if (pool_task_unsettled) {
-        pool_task_unsettled = false;
-        VirtualClock.settle();
-    }
+    releaseClock();
+    clock_holder = false;
+}
+
+/// The run's main thread holds the clock while it runs its body. False when it
+/// already did (a nested run), so the caller leaves `threadClockEnd` to the
+/// outer one.
+pub fn threadClockBegin() bool {
+    if (clock_holder) return false;
+    clock_holder = true;
+    holdClock();
+    return true;
+}
+
+pub fn threadClockEnd() void {
+    releaseClock();
+    clock_holder = false;
 }
 
 pub fn drainVirtualClock() void {
@@ -761,6 +816,10 @@ pub fn driveTimerService(self: anytype, out: Output) Allocator.Error!void {
     const a = self.allocator;
     const unit: Value = .Unit;
     while (!TimerService.stopping()) {
+        // A continuation resumed here and abandoned with the pump never runs
+        // its scope pop, so each pump truncates the stack on exit, as a root does.
+        const scope_depth = active_scope_stack.items.len;
+        defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
         try coroPush(a);
         coroTop().?.timer_service = true;
         TimerService.attach(&coroTop().?.wakeup);
@@ -914,6 +973,12 @@ pub const CooperativeInterceptor = struct {
     pending_err: ?EvalError = null,
     /// The timer thread's pump, which takes posted timer blocks each turn.
     timer_service: bool = false,
+    /// A `runBlocking` or `suspend fun main` pump: it holds its thread until its
+    /// root completes, so it is that thread's event loop, and a delay scheduled
+    /// on the thread through the default `Delay` waits on it. Any other pump
+    /// runs until nothing is ready, and a timer on it would hold whoever
+    /// started it.
+    event_loop: bool = false,
     allocator: Allocator,
 
     /// Under `Virtual`, seeds `virtual_now` from the shared clock so a coroutine
@@ -1200,14 +1265,13 @@ pub const CooperativeInterceptor = struct {
     /// Publish only on change: idle pumps otherwise republish the same floor every
     /// round and serialise on the barrier lock. A pump joins on its first finite one.
     fn publishFloor(self: *CooperativeInterceptor, floor: i64) void {
-        // A finite floor means the body has parked on a timer, so a dispatched
-        // pool task is no longer unsettled: the floor now orders it. An
-        // indefinite one orders nothing: an idle pump about to exit hands
-        // control back to its task, which runs on.
-        if (pool_task_unsettled and floor != INDEFINITE) {
-            pool_task_unsettled = false;
-            VirtualClock.settle();
-        }
+        // An event loop's finite floor orders its thread from now on, so the
+        // thread stops holding the clock. Any other pump runs only until
+        // nothing is ready and then hands control back to the code that
+        // started it, which the thread's hold must go on covering: let go
+        // while that pump went idle, the clock could jump before the code
+        // after it had run.
+        if (floor != INDEFINITE and self.event_loop) releaseClock();
         if (self.published_floor == floor) return;
         self.published_floor = floor;
         if (self.clock_id == VirtualClock.UNREGISTERED) {
@@ -1283,7 +1347,9 @@ pub const CooperativeInterceptor = struct {
                     // launched has published no floor: that coroutine may park on a
                     // sooner timer, or cancel this driver's job, first. The floor `t`
                     // stands, so a sibling with a sooner timer still advances.
-                    if (!vmhost.scheduler.onPoolWorker() and VirtualClock.hasUnsettled()) {
+                    if (!vmhost.scheduler.onPoolWorker() and VirtualClock.hasUnsettled() and
+                        !self.virtualStarvationDue())
+                    {
                         return .blocked;
                     }
                     self.virtual_now = t;
@@ -1318,7 +1384,9 @@ pub const CooperativeInterceptor = struct {
                                     (self.timer_service and TimerService.hasPending());
                             };
                             if (!nonempty) {
-                                const cap_us: u64 = @min(@as(u64, @intCast(wait)) * 1_000, 2_000);
+                                // At most 2 ms a slice, clamped before it is
+                                // scaled: a wait can be most of the clock's range.
+                                const cap_us: u64 = @as(u64, @intCast(@min(wait, 2))) * 1_000;
                                 gp.waitFrom(seen, cap_us);
                             }
                         }
@@ -1914,6 +1982,7 @@ pub fn driveRunBlocking(self: anytype, block: *const Value, scope: *const Value,
 pub fn driveRoot(self: anytype, block: *const Value, scope: *const Value, out: Output, persist: bool) Allocator.Error!RuntimeEvalResult {
     const a = self.allocator;
     try coroPush(a);
+    coroTop().?.event_loop = !persist;
     // A top-level driver holds the shared virtual clock at the current instant
     // while its body runs synchronously: a coroutine dispatched onto a pool worker
     // must not advance virtual time past `now` before the body reaches the
@@ -1963,6 +2032,7 @@ pub fn driveRoot(self: anytype, block: *const Value, scope: *const Value, out: O
 pub fn driveSuspendMain(self: anytype, main_id: ir.FuncId, out: Output) Allocator.Error!RuntimeEvalResult {
     const a = self.allocator;
     try coroPush(a);
+    coroTop().?.event_loop = true;
     if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     const scope_depth = active_scope_stack.items.len;
     defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
@@ -2338,11 +2408,8 @@ fn pumpLoop(
                     }
                 }
             }
-            // Waiting only on another thread, a pool task orders nothing.
-            if (pool_task_unsettled) {
-                pool_task_unsettled = false;
-                VirtualClock.settle();
-            }
+            // An event loop waiting only on another thread orders nothing.
+            releaseClock();
             countSleep(.root_parked);
             gateWaitBrief(&wakeup, 1_000);
             continue;
@@ -2398,16 +2465,11 @@ fn pumpExit(self: anytype, out: Output, persist: bool) Allocator.Error!void {
         }
         ww.deinit();
     }
-    // A pool task that runs on past its last pump holds the virtual clock
-    // again until it parks on another or ends: it may start more work, as a
-    // `limitedParallelism` worker does with the next runnable in its queue,
-    // and that work's first timer must register before any pump jumps past it.
-    if (coro_stack.items.len == 0 and vmhost.scheduler.onPoolWorker() and
-        !pool_task_unsettled and root.coroutineTimeMode() == .Virtual)
-    {
-        pool_task_unsettled = true;
-        VirtualClock.enterUnsettled();
-    }
+    // A thread that runs on past its last pump holds the virtual clock again:
+    // it may start more work, as a `limitedParallelism` worker does with the
+    // next runnable in its queue, and that work's first timer must register
+    // before any pump jumps past it.
+    if (coro_stack.items.len == 0 and clock_holder) holdClock();
     if (orphan_launched.len != 0) {
         if (coroTop()) |below| {
             // The drained blocks carry the retain their enqueue took.
@@ -2550,6 +2612,13 @@ pub fn coroutineRunRoot(self: anytype, scope: ?*const Value, block: *const Value
 
 pub fn coroutineHasDriver() bool {
     return coroTop() != null;
+}
+
+/// Whether this thread's innermost pump is a blocking event loop
+/// (`CooperativeInterceptor.event_loop`).
+pub fn coroutineOnEventLoop() bool {
+    const top = coroTop() orelse return false;
+    return top.event_loop;
 }
 
 /// Run `block` as a fresh root with no enclosing driver. A genuine suspension

@@ -328,11 +328,26 @@ fn ivCoroutineHasDriver(ctx: *anyopaque) bool {
     _ = ctx;
     return coroutines.coroutineHasDriver();
 }
+fn ivCoroutineOnEventLoop(ctx: *anyopaque) bool {
+    _ = ctx;
+    return coroutines.coroutineOnEventLoop();
+}
 fn ivCoroutineLaunch(ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineLaunch(ip(ctx), block, scope, out);
 }
 fn ivCoroutineSpawnTimeout(ctx: *anyopaque, block: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineSpawnTimeout(ip(ctx), block, out);
+}
+fn ivCoroutinePoolNew(ctx: *anyopaque, n_threads: usize, name: []const u8) Allocator.Error!i64 {
+    _ = ctx;
+    return scheduler.newDispatcherPool(n_threads, name);
+}
+fn ivCoroutinePoolDispatch(ctx: *anyopaque, pool: i64, block: *const Value) Allocator.Error!bool {
+    return intrinsic_host.coroutineDispatchToPool(ip(ctx), pool, block);
+}
+fn ivCoroutinePoolClose(ctx: *anyopaque, pool: i64) void {
+    _ = ctx;
+    scheduler.closeDispatcherPool(pool);
 }
 fn ivCoroutineSpawnTimer(ctx: *anyopaque, block: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineSpawnTimer(ip(ctx), block, out);
@@ -431,6 +446,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .coroutine_run_root = ivCoroutineRunRoot,
     .coroutine_start_root_or_suspended = ivCoroutineStartRootOrSuspended,
     .coroutine_has_driver = ivCoroutineHasDriver,
+    .coroutine_on_event_loop = ivCoroutineOnEventLoop,
     .coroutine_launch = ivCoroutineLaunch,
     .coroutine_spawn_timeout = ivCoroutineSpawnTimeout,
     .coroutine_spawn_timer = ivCoroutineSpawnTimer,
@@ -445,6 +461,9 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .active_coro_scope = ivActiveCoroScope,
     .coroutine_resume_external = ivCoroutineResumeExternal,
     .coroutine_dispatch_pooled = ivCoroutineDispatchPooled,
+    .coroutine_pool_new = ivCoroutinePoolNew,
+    .coroutine_pool_dispatch = ivCoroutinePoolDispatch,
+    .coroutine_pool_close = ivCoroutinePoolClose,
     .coroutine_resume_continuation = ivCoroutineResumeContinuation,
     .coroutine_drain_to_idle = ivCoroutineDrainToIdle,
     .spawn_os_thread = ivSpawnOsThread,

@@ -445,6 +445,17 @@ pub const SendableVmSeed = struct {
     resolved_state: ?ir.resolved.StateRef = null,
     allocator: Allocator,
 
+    /// Drops the seed's handles without a Vm, for a task that never runs.
+    pub fn release(self: SendableVmSeed) void {
+        if (!runtime.freeScratch()) return;
+        self.module.deinit();
+        self.instance_id_counter.deinit();
+        self.closures.deinit();
+        self.out_sink.deinit();
+        self.threads.deinit();
+        if (self.resolved_state) |st| st.deinit();
+    }
+
     pub fn materialize(self: SendableVmSeed) Allocator.Error!Vm {
         return .{
             .module = self.module,

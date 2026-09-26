@@ -147,6 +147,9 @@ const RUNNABLE = [_][]const u8{
     "tl_limited_one",
     "tl_limited_timeout",
     "tl_gc_virtual_barrier",
+    "tl_pool_timer_release",
+    "tl_unconfined_delay",
+    "tl_thread_pool_context",
     "tl_withcontext_io_from_default",
     "tl_delay_on_worker",
     "tl_runblocking_undispatched",
@@ -273,6 +276,15 @@ test "tl_limited_timeout" {
 }
 test "tl_gc_virtual_barrier" {
     try check("tl_gc_virtual_barrier");
+}
+test "tl_pool_timer_release" {
+    try check("tl_pool_timer_release");
+}
+test "tl_unconfined_delay" {
+    try check("tl_unconfined_delay");
+}
+test "tl_thread_pool_context" {
+    try check("tl_thread_pool_context");
 }
 test "tl_withcontext_io_from_default" {
     try check("tl_withcontext_io_from_default");

@@ -250,6 +250,9 @@ pub const IntrinsicHost = struct {
         /// root parked and was persisted for a later external resume.
         coroutine_start_root_or_suspended: ?*const fn (ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
         coroutine_has_driver: ?*const fn (ctx: *anyopaque) bool = null,
+        /// Whether the calling thread's innermost pump is a blocking event loop.
+        /// Null answers false.
+        coroutine_on_event_loop: ?*const fn (ctx: *anyopaque) bool = null,
         /// Null runs it eagerly.
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         /// Null runs it eagerly, like a launch with no pump.
@@ -278,6 +281,12 @@ pub const IntrinsicHost = struct {
         coroutine_resume_continuation: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) ?Value = null,
         /// Null runs the block inline on the calling thread.
         coroutine_dispatch_pooled: ?*const fn (ctx: *anyopaque, block: *const Value, io: bool, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
+        /// A pool of threads of its own for a thread-pool dispatcher; its
+        /// handle. Null has none, and its dispatcher posts to the shared pool.
+        coroutine_pool_new: ?*const fn (ctx: *anyopaque, n_threads: usize, name: []const u8) std.mem.Allocator.Error!i64 = null,
+        /// False when that pool is closed.
+        coroutine_pool_dispatch: ?*const fn (ctx: *anyopaque, pool: i64, block: *const Value) std.mem.Allocator.Error!bool = null,
+        coroutine_pool_close: ?*const fn (ctx: *anyopaque, pool: i64) void = null,
         /// `name` is the thread's, as `Thread.name` answers it.
         spawn_os_thread: ?*const fn (ctx: *anyopaque, block: *const Value, name: []const u8, out: Output) std.mem.Allocator.Error!HostResultU64 = null,
         join_os_thread: ?*const fn (ctx: *anyopaque, id: u64) std.mem.Allocator.Error!?RuntimeError = null,
@@ -375,6 +384,11 @@ pub const IntrinsicHost = struct {
         };
     }
 
+    pub fn coroutineOnEventLoop(self: IntrinsicHost) bool {
+        if (self.vtable.coroutine_on_event_loop) |f| return f(self.ctx);
+        return false;
+    }
+
     pub fn hasTimerThread(self: IntrinsicHost) bool {
         return self.vtable.coroutine_spawn_timer != null;
     }
@@ -439,6 +453,28 @@ pub const IntrinsicHost = struct {
         if (self.vtable.coroutine_resume_continuation) |f| return f(self.ctx, slot, value, out);
         self.coroutineResumeExternal(slot, value, out);
         return null;
+    }
+
+    /// A handle to a new pool of `n_threads` threads named after `name`, or 0 when
+    /// the host has none.
+    pub fn coroutinePoolNew(self: IntrinsicHost, n_threads: usize, name: []const u8) !i64 {
+        if (self.vtable.coroutine_pool_new) |f| return f(self.ctx, n_threads, name);
+        return 0;
+    }
+
+    /// Posts `block` to pool `pool`; false when the pool is closed. With no
+    /// pool of its own (handle 0) the block goes to the shared pool.
+    pub fn coroutinePoolDispatch(self: IntrinsicHost, pool: i64, block: *const Value, out: Output) !union(enum) { posted: bool, err: RuntimeError } {
+        if (pool != 0) {
+            if (self.vtable.coroutine_pool_dispatch) |f| return .{ .posted = try f(self.ctx, pool, block) };
+        }
+        if (try self.coroutineDispatchPooled(block, false, out)) |e| return .{ .err = e };
+        return .{ .posted = true };
+    }
+
+    pub fn coroutinePoolClose(self: IntrinsicHost, pool: i64) void {
+        if (pool == 0) return;
+        if (self.vtable.coroutine_pool_close) |f| f(self.ctx, pool);
     }
 
     pub fn coroutineDispatchPooled(self: IntrinsicHost, block: *const Value, io_kind: bool, out: Output) !?RuntimeError {

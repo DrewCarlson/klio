@@ -278,11 +278,12 @@ pub fn concurrent_thread_sleep(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
         else => return .{ .err = .{ .Type = "Thread.sleep expects a Long or Int millisecond argument" } },
     } else return .{ .err = .{ .Type = "Thread.sleep expects a Long or Int millisecond argument" } };
     if (millis > 0) {
-        // A dispatched pool task in a real wall sleep advances no cooperative
-        // virtual clock, so the coroutine layer is told; otherwise a driver
-        // waiting for it to settle blocks out the whole sleep.
+        // A sleeping thread advances no cooperative virtual clock, so the
+        // coroutine layer is told; otherwise a pump waiting for it to settle
+        // blocks out the whole sleep.
         runtime.notifyWallBlock();
         sleepMillis(@intCast(millis));
+        runtime.notifyWallUnblock();
         // A daemon pool task asked to abandon itself aborts here, the evaluator's
         // abandon check firing only at the next block edge.
         if (runtime.shouldAbandon()) {

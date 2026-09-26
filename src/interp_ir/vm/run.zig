@@ -150,7 +150,11 @@ var live_vm_runs = std.atomic.Value(usize).init(0);
 fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     _ = live_vm_runs.fetchAdd(1, .acq_rel);
     defer _ = live_vm_runs.fetchSub(1, .acq_rel);
-    const result = try vmRunBody(self, main);
+    const clock_held = vmhost.coroutines.threadClockBegin();
+    const result = blk: {
+        defer if (clock_held) vmhost.coroutines.threadClockEnd();
+        break :blk try vmRunBody(self, main);
+    };
     // Join spawned threads on every exit so a program that omits `join()` keeps a
     // child's writes. A child error surfaces only if `main` did not already fail.
     return joinAllThreads(self, result);
@@ -397,7 +401,11 @@ pub fn vmRunCalls(
     runtime.setThreadName(tid, "main");
     defer runtime.clearThreadName(tid);
     const prep = try vmPrepare(self);
-    if (prep == null) try body(ctx, self);
+    if (prep == null) {
+        const clock_held = vmhost.coroutines.threadClockBegin();
+        defer if (clock_held) vmhost.coroutines.threadClockEnd();
+        try body(ctx, self);
+    }
     _ = joinAllThreads(self, .{ .ok = .{ .Unit = {} } });
     self.out_sink.replayInto(out);
     return prep;

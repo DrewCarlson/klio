@@ -24,6 +24,9 @@ internal fun __kxco_spawnTimeout(block: () -> Unit) {}
 // Schedule `block` on the timer thread. A host without one schedules it as
 // `__kxco_spawnTimeout` (`timeout`) or `__kxco_spawn` would.
 internal fun __kxco_spawnTimer(timeout: Boolean, block: () -> Unit) {}
+// Whether this thread runs a blocking event loop (`runBlocking`, `suspend fun
+// main`) that a delay scheduled here can wait on.
+internal fun __kxco_onEventLoop(): Boolean = false
 internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
 // `__kxco_dispatch` onto the elastic blocking-work view of the pool.
@@ -89,6 +92,13 @@ private class KlioBlockingCoroutine<T>(
     }
 }
 
+// Also the default `Delay`, for a dispatcher with none of its own
+// (`Unconfined`, `Main`). A delay scheduled from a thread running a blocking
+// event loop waits on that loop, as one inside `runBlocking` does on the JVM;
+// from anywhere else it waits on the timer thread, the JVM's `DefaultExecutor`.
+// Waiting on the pump of a coroutine started with no event loop would hold the
+// thread that started it until the timer fired: an `Unconfined` launch from
+// plain code would never return to its caller once its body reached a delay.
 internal object KlioDispatcher : CoroutineDispatcher(), Delay {
     override fun dispatch(context: CoroutineContext, block: Runnable) {
         // The dispatched segment runs with ITS coroutine as the active
@@ -113,6 +123,7 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
         timeMillis: Long,
         continuation: CancellableContinuation<Unit>
     ) {
+        if (!__kxco_onEventLoop()) return scheduleTimerResume(timeMillis, continuation)
         __kxco_spawn {
             __kxco_delayMillis(timeMillis)
             continuation.resumeWith(Result.success(Unit))
@@ -129,6 +140,7 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
         block: Runnable,
         context: CoroutineContext
     ): DisposableHandle {
+        if (!__kxco_onEventLoop()) return scheduleTimerGate(timeMillis, block)
         val gate = TimeoutGate(block)
         __kxco_spawnTimeout {
             if (!gate.isDisposed()) {
@@ -194,7 +206,7 @@ internal object KlioIoDispatcher : CoroutineDispatcher(), Delay {
 // `limitedParallelism(1)` view has only that worker to run the resume the
 // timer dispatches, so the resume would wait for the timer's own end. A
 // cancelled delay disposes its gate, which ends the wait at once.
-private fun scheduleTimerResume(timeMillis: Long, continuation: CancellableContinuation<Unit>) {
+internal fun scheduleTimerResume(timeMillis: Long, continuation: CancellableContinuation<Unit>) {
     val gate = TimeoutGate(ResumeAfterDelay(continuation))
     __kxco_spawnTimer(false) {
         if (!gate.isDisposed()) {
@@ -208,7 +220,7 @@ private fun scheduleTimerResume(timeMillis: Long, continuation: CancellableConti
     continuation.disposeOnCancellation(gate)
 }
 
-private fun scheduleTimerGate(timeMillis: Long, block: Runnable): DisposableHandle {
+internal fun scheduleTimerGate(timeMillis: Long, block: Runnable): DisposableHandle {
     val gate = TimeoutGate(block)
     __kxco_spawnTimer(true) {
         if (!gate.isDisposed()) {

@@ -558,6 +558,8 @@ fn workerEntry(wargs: WorkerArgs) void {
     // Join the mutator set for the worker's lifetime; per-thread GC roots unlink here.
     coroutines.gcThreadEnter();
     defer coroutines.gcThreadExit();
+    coroutines.poolTaskRunBegin();
+    defer coroutines.poolTaskRunEnd();
     // Pin the block: its captures are reachable only through this stack local.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
@@ -643,7 +645,11 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, name_in: []const u8)
         .handoff = handoff,
     };
 
+    // Under virtual time the new thread holds the clock from here, as a
+    // dispatched task does.
+    coroutines.poolTaskDispatched();
     const handle = std.Thread.spawn(.{ .stack_size = runtime.WORKER_STACK_SIZE }, workerEntry, .{wargs}) catch {
+        coroutines.poolTaskSettleDropped();
         handoffTake(handoff);
         block.release(self.allocator);
         const g = self.threads.borrowMut();
@@ -689,6 +695,25 @@ pub fn coroutineDispatchPooled(self: *VmIntrinsicHost, block: *const Value, io_k
     return null;
 }
 
+/// Post a runnable onto a `newFixedThreadPoolContext` dispatcher's own pool.
+/// False when the dispatcher was closed; the caller then handles the refusal.
+pub fn coroutineDispatchToPool(self: *VmIntrinsicHost, pool: i64, block: *const Value) Allocator.Error!bool {
+    coroutines.poolTaskDispatched();
+    block.retain();
+    // A refused post drops the task, settling the clock and releasing the block.
+    return scheduler.postToDispatcherPool(pool, .{
+        .seed = spawnSeed(self),
+        .block = block.*,
+        .time_mode = root.coroutineTimeMode(),
+        .reclaim = runtime.reclaimEnabled(),
+        .kind = .default,
+    }) catch |e| {
+        coroutines.poolTaskSettleDropped();
+        block.release(self.allocator);
+        return e;
+    };
+}
+
 /// Let outstanding pool work reach its own first suspension.
 ///
 /// Called where a coroutine DISPATCHES ONTO THE PUMP — which is what
@@ -728,6 +753,9 @@ pub fn joinOsThread(self: *VmIntrinsicHost, id: u64) Allocator.Error!?RuntimeErr
         // `join()` establishes happens-before with the worker's writes. The
         // joining thread is blocked, so mark it parked for a worker's concurrent
         // collection rendezvous; otherwise the collector waits on it forever.
+        // What it waits for runs on its own virtual clock.
+        coroutines.clockWaitBegin();
+        defer coroutines.clockWaitEnd();
         runtime.gc.enterBlockingSafe();
         h.join();
         runtime.gc.exitBlockingSafe();

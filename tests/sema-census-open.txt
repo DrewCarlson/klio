@@ -1,12 +1,5 @@
 # Known unresolved, unrecorded or unlowered sites of scripts/sema-census.py:
 # <reason> <path:line:col>, then the first scope and the detail after tabs.
 # The gate fails on any other site and on a listed one that is gone.
-# io.ktor: kotlinx.coroutines does not provide newFixedThreadPoolContext yet.
-lower_lowering upstream/ktor-client/ktor-client-core/posix/src/io/ktor/client/utils/CoroutineUtilsPosix.kt:23:26	pack:io.ktor	no call record
-lower_lowering upstream/ktor-utils/posix/src/io/ktor/util/CoroutineUtils.kt:21:5	pack:io.ktor	no call record
-unresolved_call upstream/ktor-client/ktor-client-core/posix/src/io/ktor/client/utils/CoroutineUtilsPosix.kt:23:26	pack:io.ktor	newFixedThreadPoolContext
-unresolved_call upstream/ktor-utils/posix/src/io/ktor/util/CoroutineUtils.kt:21:5	pack:io.ktor	newFixedThreadPoolContext
-unresolved_import upstream/ktor-client/ktor-client-core/posix/src/io/ktor/client/utils/CoroutineUtilsPosix.kt:11:1	pack:io.ktor	kotlinx.coroutines.newFixedThreadPoolContext
-unresolved_import upstream/ktor-utils/posix/src/io/ktor/util/CoroutineUtils.kt:11:1	pack:io.ktor	kotlinx.coroutines.newFixedThreadPoolContext
 # androidx.compose.ui: ComposeSceneInputHandler imports RootNodeOwner for its KDoc; RootNodeOwner comes with the upstream scene.
 unresolved_import ../klio-compose-runtime/upstream/compose/ui/ui/src/skikoMain/kotlin/androidx/compose/ui/scene/ComposeSceneInputHandler.skiko.kt:38:1	pack:androidx.compose.animation.core	androidx.compose.ui.node.RootNodeOwner

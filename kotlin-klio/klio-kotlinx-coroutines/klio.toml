@@ -16,6 +16,13 @@ root = "upstream/kotlinx-coroutines-core/common/src"
 [[source]]
 root = "upstream/kotlinx-coroutines-test/common/src"
 
+# The multithreaded dispatchers' common declarations (`newSingleThreadContext`,
+# `expect newFixedThreadPoolContext`) from the concurrent source set; the rest
+# of that set is platform plumbing klio actualises itself.
+[[source]]
+root = "upstream/kotlinx-coroutines-core/concurrent/src"
+include = ["MultithreadedDispatchers.common.kt"]
+
 # klio-authored actuals for both modules. A file's package path places it in
 # its module: `kotlinx/coroutines/test/` is the test module's platform layer
 # (TestResult = Unit, createTestResult = runBlocking, the main-dispatcher
