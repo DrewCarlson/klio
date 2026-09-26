@@ -17,7 +17,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer arena.deinit();
     const gpa = arena.allocator();
     var list: std.ArrayList([]const u8) = .empty;
-    var ai = init.args.iterate();
+    var ai = try init.args.iterateAllocator(gpa);
+    defer ai.deinit();
     while (ai.next()) |a2| try list.append(gpa, a2);
     const args = list.items;
     if (args.len < 2) {

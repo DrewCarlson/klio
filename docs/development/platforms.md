@@ -58,7 +58,9 @@ name keys on its binary's size and modification time, rounded to the
 100 ns NTFS keeps, and the image binds its natives by name when it loads.
 
 `scripts/gate.sh` cross-builds `x86_64-linux-gnu` and `x86_64-windows-gnu`
-into `zig-out/cross/<triple>` as a compile-only phase.
+into `zig-out/cross/<triple>` as a compile-only phase; the Windows build
+also compiles the program-running harness and the census driver, since
+nothing else in the gate compiles them for Windows.
 
 ## How each platform is verified
 

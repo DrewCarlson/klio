@@ -456,7 +456,7 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
     var reasons = std.StringHashMap(usize).init(a);
     var jobs: std.ArrayList(Job) = .empty;
     // A run of its own: two censuses at once must not rewrite each other's cases.
-    const cases_dir = try std.fmt.allocPrint(a, "{s}/cases-{d}", .{ SCRATCH_HOME, std.c.getpid() });
+    const cases_dir = try std.fmt.allocPrint(a, "{s}/cases-{d}", .{ SCRATCH_HOME, runtime.platform.processId() });
     std.Io.Dir.cwd().deleteTree(io, cases_dir) catch {};
     std.Io.Dir.cwd().createDirPath(io, cases_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, cases_dir) catch {};

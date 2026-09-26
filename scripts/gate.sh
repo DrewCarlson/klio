@@ -74,10 +74,11 @@ echo "== cross builds (compile only)"
 # The install step for the other desktop hosts: the klio binary and its
 # stdlib image. A cross build runs none of the binaries it builds; a host
 # klio built from the same sources bakes the target's image. Each target
-# installs under its own prefix, so zig-out stays this host's.
-for triple in x86_64-linux-gnu x86_64-windows-gnu; do
-  phase "cross-$triple" zig build -Dtarget="$triple" --prefix "$ROOT/zig-out/cross/$triple"
-done
+# installs under its own prefix, so zig-out stays this host's. Windows,
+# which nothing here runs, also builds the harness and the census driver.
+phase "cross-x86_64-linux-gnu" zig build -Dtarget=x86_64-linux-gnu --prefix "$ROOT/zig-out/cross/x86_64-linux-gnu"
+phase "cross-x86_64-windows-gnu" zig build -Dtarget=x86_64-windows-gnu --prefix "$ROOT/zig-out/cross/x86_64-windows-gnu" \
+  install klio-harness klio-census
 
 echo "== litmus + ktor + e2e (build-system run steps)"
 # The parity groups and the language-feature group run every migrated
