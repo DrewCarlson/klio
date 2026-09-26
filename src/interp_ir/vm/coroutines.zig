@@ -24,14 +24,24 @@ fn monotonicNanos() i128 {
 }
 
 /// Event-wait one idle slice on the pump's gate, capped at `cap_us`. The epoch is
-/// read before the emptiness check, so a post between the two returns at once.
+/// read before the emptiness checks, so a post between the two returns at once.
 fn gateWaitBrief(wakeup: *const ObjRef(DriverWakeup), cap_us: u64) void {
     const w = wakeup.borrowMut();
     const gp = &w.get().gate;
     const seen = gp.epochNow();
-    const nonempty = w.get().mailboxNonEmpty();
+    const nonempty = w.get().mailboxNonEmpty() or queuedElsewhere();
     w.deinit();
     if (!nonempty) gp.waitFrom(seen, cap_us);
+}
+
+/// Whether the top pump has work waiting outside its mailbox, in a queue it
+/// drains at the top of its loop: the main thread's for its event loop, the
+/// timer thread's for its pump. Those posts ring its gate too, so it checks
+/// them with its mailbox before it waits.
+fn queuedElsewhere() bool {
+    const top = coroTop() orelse return false;
+    if (top.timer_service and TimerService.hasPending()) return true;
+    return top.main_attached and MainQueue.hasPending();
 }
 
 /// How long an idle pump waits on its own gate at once. A pump with pumps
@@ -951,6 +961,12 @@ const MainQueue = struct {
         }
     }
 
+    fn hasPending() bool {
+        mutex.lock();
+        defer mutex.unlock();
+        return pending.items.len != 0;
+    }
+
     fn dropAll() void {
         mutex.lock();
         defer mutex.unlock();
@@ -1659,8 +1675,7 @@ pub const CooperativeInterceptor = struct {
                             const nonempty = blk: {
                                 const w = self.wakeup.borrowMut();
                                 defer w.deinit();
-                                break :blk w.get().mailboxNonEmpty() or
-                                    (self.timer_service and TimerService.hasPending());
+                                break :blk w.get().mailboxNonEmpty() or queuedElsewhere();
                             };
                             if (!nonempty) {
                                 // Hand over what another thread asks for from
