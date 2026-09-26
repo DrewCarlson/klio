@@ -735,21 +735,22 @@ pub const suites = [_]Config{
         .name = "ktor_client_plugins",
         .test_roots = &.{
             "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-auth/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-bom-remover/common/test",
             "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-call-id/common/test",
             "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-content-negotiation/common/test",
             "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-encoding/common/test",
             "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-resources/common/test",
             "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-plugins/ktor-client-websockets/common/test",
         },
-        .extra_args = &.{ "--feature", "io.ktor/client-mock,client-test-base,client-auth,client-call-id,client-content-negotiation,client-encoding,client-resources,client-websockets,client-logging,server-test-host,server-call-id,serialization-kotlinx-json" },
-        // AuthTest, ContentEncodingTest and WebSocketRemoteTest call ktor's
-        // test server through every registered engine.
+        .extra_args = &.{ "--feature", "io.ktor/client-mock,client-test-base,client-auth,client-bom-remover,client-call-id,client-content-negotiation,client-encoding,client-resources,client-websockets,client-logging,server-test-host,server-call-id,serialization-kotlinx-json" },
+        // AuthTest, BomRemoverTest, ContentEncodingTest and WebSocketRemoteTest
+        // call ktor's test server through every registered engine.
         .service = ktor_test_server,
         // ContentEncodingTest testGzipByteArray and testDisableDecompression:
         // the server's `/gzip-precompressed` declares the 294 bytes the JVM's
         // zlib makes of its body, and klio's deflate (std.compress.flate)
         // makes 293.
-        .baseline = 120,
+        .baseline = 123,
         .max_failed = 2,
         .max_incomplete = 0,
     },
@@ -774,6 +775,20 @@ pub const suites = [_]Config{
         // toString is not "Dispatchers.IO".
         .baseline = 380,
         .max_failed = 8,
+        .max_incomplete = 0,
+    },
+    .{
+        // ktor-client-cio's commonTest: the CIO engine's own cases, against
+        // ktor's test server and servers of their own.
+        .name = "ktor_client_cio",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-client/ktor-client-cio/common/test",
+        },
+        .extra_args = &.{ "--feature", "io.ktor/client-cio,client-test-base,client-websockets,network,test-base" },
+        .service = ktor_test_server,
+        .timeout_ms = 300_000,
+        .baseline = 13,
+        .max_failed = 0,
         .max_incomplete = 0,
     },
     .{

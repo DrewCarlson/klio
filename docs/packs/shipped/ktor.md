@@ -300,7 +300,7 @@ with a client wired to it, and `MockEngine` (`client-mock`) answers client
 requests from a handler, as upstream's own test suites use them.
 
 klio runs upstream's commonTest suites for the pack's modules
-(`klio-census ktor,ktor_network,ktor_client_core,ktor_server_core,ktor_server_cio,ktor_server_tests,ktor_server_plugins,ktor_client_plugins,ktor_client_tests,ktor_shared,ktor_serialization`),
+(`klio-census ktor,ktor_network,ktor_client_core,ktor_server_core,ktor_server_cio,ktor_server_tests,ktor_server_plugins,ktor_client_plugins,ktor_client_tests,ktor_client_cio,ktor_shared,ktor_serialization`),
 plus klio ports of the JVM tests for the modules that are JVM-only upstream
 (CallLogging, Compression). The plan (`plans/ktor-support.md`) lists the
 cases that still fail and why.

@@ -45,14 +45,14 @@ where upstream reaches the platform through cinterop.
 | ktor-client-core + mock | `client-core`, `client-mock` | whole module; census `ktor_client_core` 93/93 |
 | ktor-server-core + test host/base | `server-core`, `server-test-host`, `server-test-base` | whole module, multipart receive; census `ktor_server_core` 147/147 |
 | ktor-server-tests | (the plugins it covers) | census `ktor_server_tests` 455/455, with the JVM compression tests ported |
-| ktor-client-cio | `client-cio` | verbatim, with its posix loader registering the default `HttpClient()` engine; `KlioClient`; HTTPS |
+| ktor-client-cio | `client-cio` | verbatim, with its posix loader registering the default `HttpClient()` engine; `KlioClient`; HTTPS; census `ktor_client_cio` 13/13 |
 | ktor-server-cio | `server-cio` | verbatim; census `ktor_server_cio` 98/98 |
 | server HTTPS | `server-cio` | `Klio` = the CIO engine plus `sslConnector(chainPem, keyPem)`; calls report `https`; `wss` |
 | server plugins | `server-*` | 26 modules verbatim; census `ktor_server_plugins` 297/297 |
 | compression | `utils`, `server-compression`, `client-encoding` | gzip and deflate over `src/ktor_client/zlib.zig`; example `ktor_compression` |
 | WebSocket compression | `websockets` | klio port of the JVM permessage-deflate extension; example `ktor_websocket_deflate` |
 | call logging | `server-call-logging` | klio port on `LogLevel` and `klio.logging.MDC`; upstream's JVM CallLoggingTest ported, 20/20 in `ktor_server_plugins` |
-| client plugins | `client-*` | 7 modules verbatim; census `ktor_client_plugins` 120 passed, 2 failing, against ktor's test server |
+| client plugins | `client-*` | 8 modules verbatim; census `ktor_client_plugins` 123 passed, 2 failing, against ktor's test server |
 | ktor-client-tests | (the client end to end) | census `ktor_client_tests` 380 passed, 8 failing, over CIO against ktor's test server |
 | ktor-test-server | `test-server` | verbatim with klio copies of its JVM files; TLS on `Klio`; the census service for the client suites |
 | digest authentication | `server-auth`, `http` | the JVM-only DigestAuth, DigestCredential and `toDigester` verbatim over `klio.security.MessageDigest` |
@@ -79,8 +79,7 @@ Open failures, each with its owner:
   to lower and the call has none (sema). No upstream suite covers it: the
   client AuthTest digest cases exclude native engines.
 
-Not run from upstream: ktor-client-cio's and ktor-client-bom-remover's
-own suites, which the test server now makes runnable; the ones
+Not run from upstream: the suites
 for kotlinx.html and the other formats (html-builder, htmx, cbor, protobuf,
 xml), which the pack does not ship; and ktor-network's nix suites
 (`SelectNixTest`, `TcpSocketTestNix`, `UdpSocketTestNix`), which test the
@@ -100,11 +99,11 @@ klio runs.
 2. ktor-server-tests' commonTest (405), and klio ports of its JVM
    CompressionTest and CompressionAcceptEncodingTest.
 3. Done: ktor's test server under klio (`test-server`), run by the census
-   as the client suites' service; ktor-client-tests' suite; the
+   as the client suites' service; the ktor-client-tests, ktor-client-cio
+   and ktor-client-bom-remover suites; the
    `ktor_server_cio`, `ktor_server_tests` and `ktor_server_plugins`
    ratchets at zero failures once the sema fixes landed.
-4. ktor-client-cio's and ktor-client-bom-remover's own suites against the
-   test server, and a zlib-exact deflate for the precompressed gzip body.
+4. A zlib-exact deflate for the test server's precompressed gzip body.
 5. Static content (`staticFiles`, `staticResources`, pre-compressed files)
    over kotlinx-io files instead of java.io.File.
 
