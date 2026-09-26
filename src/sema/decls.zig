@@ -962,12 +962,21 @@ fn sameErasedSignature(s: *Sema, a: Sym, b: Sym) Allocator.Error!bool {
     return true;
 }
 
+/// An `expect` class and its `actual` are one class: a parameter of the
+/// expect's nested `Factory` is the actual's `Factory` parameter. They
+/// share their fully qualified name.
 fn sameErasure(s: *Sema, a: types.TypeId, b: types.TypeId) bool {
     if (a == b) return true;
     if (a == .none or b == .none) return false;
     const ta = s.types.get(a);
     const tb = s.types.get(b);
-    if (ta == .class and tb == .class) return ta.class.sym == tb.class.sym;
+    if (ta == .class and tb == .class) {
+        const x = ta.class.sym;
+        const y = tb.class.sym;
+        if (x == y) return true;
+        if (s.syms.kind(x) != .class or s.syms.kind(y) != .class) return false;
+        return s.syms.classInfo(x).fqn == s.syms.classInfo(y).fqn;
+    }
     if (ta == .param and tb == .param) {
         return s.syms.typeParamInfo(ta.param.sym).index == s.syms.typeParamInfo(tb.param.sym).index;
     }

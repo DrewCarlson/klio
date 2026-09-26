@@ -4016,6 +4016,11 @@ pub fn callableRef(ctx: *Ctx, e: *const Expr, recv: ?*const Expr, name: ast.Iden
         return s.types.errType();
     };
     const c = chosen.c;
+    // Only a candidate the code cannot see answers: it names that one, and
+    // cannot access it.
+    if (!try memberVisible(ctx, c.sym)) {
+        try ctx.reportFacts(.invisible, name.span, .{ .name = name.name, .syms = try ctx.arena().dupe(Sym, &.{c.sym}) }, "{s}", .{name.name});
+    }
     // A class named on the left whose companion the reference is bound to
     // names that companion.
     if (set.companion != .none and (isObjectSource(c.dispatch, set.companion) or isObjectSource(c.extension, set.companion))) {
@@ -4609,10 +4614,39 @@ const RefFit = struct { ty: TypeId, targs: []const TypeId, adapted: bool = false
 /// its type parameters inferred from the fit. Otherwise, or when none fits
 /// exactly (a reference adapted to defaults, varargs or a `Unit` result),
 /// the first level's candidate whose arity the expected function type
-/// takes, else its first.
+/// takes, else its first. As for a call, a candidate the code cannot see
+/// hides nothing: `c::find` outside `Cache` is the file's `Cache.find`
+/// extension, not `Cache`'s private `find`, which is named only when
+/// nothing the code can see is.
 fn chooseRef(ctx: *Ctx, levels: []const RefLevel, expected: TypeId) Allocator.Error!?RefChoice {
-    const s = ctx.s;
     if (levels.len == 0) return null;
+    if (try visibleLevels(ctx, levels)) |visible| {
+        if (try chooseRefIn(ctx, visible, expected, true)) |c| return c;
+    }
+    return chooseRefIn(ctx, levels, expected, false);
+}
+
+/// `levels` with only the candidates the code can see, levels left empty
+/// dropped; null when it sees none of them, or all.
+fn visibleLevels(ctx: *Ctx, levels: []const RefLevel) Allocator.Error!?[]const RefLevel {
+    const s = ctx.s;
+    var some_unseen = false;
+    var out: std.ArrayList(RefLevel) = .empty;
+    for (levels) |level| {
+        var kept: RefLevel = .empty;
+        for (level.items) |c| {
+            if (try memberVisible(ctx, c.sym)) try kept.append(s.arena, c) else some_unseen = true;
+        }
+        if (kept.items.len != 0) try out.append(s.arena, kept);
+    }
+    if (!some_unseen or out.items.len == 0) return null;
+    return out.items;
+}
+
+/// `chooseRef` over `levels`. With `fitting_only`, null unless a candidate
+/// fits the expected type, or there is none to fit.
+fn chooseRefIn(ctx: *Ctx, levels: []const RefLevel, expected: TypeId, fitting_only: bool) Allocator.Error!?RefChoice {
+    const s = ctx.s;
     const usable = expected != .none and !s.types.isErr(expected) and s.types.get(expected) != .variable;
     // A fun interface expected takes the reference by SAM conversion: its
     // method's function type is what the reference must fit, and the
@@ -4640,6 +4674,7 @@ fn chooseRef(ctx: *Ctx, levels: []const RefLevel, expected: TypeId) Allocator.Er
             for (fits.items) |f| if (!f.adapted) try exact.append(s.arena, f);
             return try mostSpecificRef(ctx, if (exact.items.len != 0) exact.items else fits.items);
         }
+        if (fitting_only) return null;
     }
     const first = levels[0].items;
     var chosen = first[0];

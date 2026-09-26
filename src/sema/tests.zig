@@ -2283,6 +2283,35 @@ test "an actual takes its expect's parameter defaults" {
     try std.testing.expect(fx.s.syms.flags(m.target).actual);
 }
 
+test "an actual takes its expect's defaults when a parameter's type is a class nested in the expect" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\class Store
+        \\expect class Provider {
+        \\    fun get(): String
+        \\    interface Factory { fun make(): String }
+        \\    fun with(factory: Factory, count: Int = 1): String
+        \\    companion object {
+        \\        fun create(store: Store, factory: Factory, count: Int = 1): Provider
+        \\    }
+        \\}
+        \\actual class Provider(private val s: String) {
+        \\    actual fun get(): String = s
+        \\    actual interface Factory { actual fun make(): String }
+        \\    actual fun with(factory: Factory, count: Int): String = factory.make()
+        \\    actual companion object {
+        \\        actual fun create(store: Store, factory: Factory, count: Int): Provider = Provider(factory.make())
+        \\    }
+        \\}
+        \\fun use(f: Provider.Factory): String = Provider.create(Store(), f).get() + Provider("x").with(f)
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    const c = try fx.refAt("Provider.^create(Store(), f)", .call);
+    try std.testing.expect(fx.s.syms.flags(c.target).actual);
+}
+
 test "a declaration deprecated as hidden is never a candidate" {
     var fx = try fixture(&.{
         \\package demo
@@ -6725,6 +6754,36 @@ test "a member the code cannot see does not hide an extension, and alone is invi
     try expectMessages(&fx, &.{
         "cannot access 'val y: Int': it is private in 'P'.",
         "cannot access 'val y: Int': it is private in 'P'.",
+    });
+}
+
+test "a callable reference to a member the code cannot see does not hide an extension" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Cache {
+        \\    private fun find(a: String): String = "member"
+        \\    private fun only(a: String): String = "member"
+        \\    fun inside(): (String) -> String = this::find /*inside*/
+        \\}
+        \\private fun Cache.find(a: String): String = "extension"
+        \\fun apply1(f: (String) -> String): String = f("a")
+        \\fun expected(c: Cache): String = apply1(c::find /*expected*/)
+        \\fun declared(c: Cache): String {
+        \\    val g: (String) -> String = c::find /*declared*/
+        \\    return g("a")
+        \\}
+        \\fun unbound(c: Cache): String = Cache::find /*unbound*/.invoke(c, "a")
+        \\fun alone(c: Cache): String = apply1(c::only)
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectTarget("this::^find /*inside*/", "app/Cache.find");
+    try fx.expectTarget("c::^find /*expected*/", "app/find");
+    try fx.expectTarget("c::^find /*declared*/", "app/find");
+    try fx.expectTarget("Cache::^find /*unbound*/", "app/find");
+    try fx.expectTarget("c::^only", "app/Cache.only");
+    try expectMessages(&fx, &.{
+        "cannot access 'fun only(a: String): String': it is private in 'Cache'.",
     });
 }
 
