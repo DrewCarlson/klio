@@ -7771,3 +7771,204 @@ test "kotlinc holds inc and dec to no parameter count, and names an operator bef
     try expectFactories(&fx, &.{"5 INAPPLICABLE_OPERATOR_MODIFIER"});
     try expectMessages(&fx, &.{"'operator' modifier is not applicable to function: illegal function name."});
 }
+
+test "an annotation class holds constants, and an annotation is written once unless repeatable" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Foo
+        \\enum class Color { RED }
+        \\fun pick(): Int = 1
+        \\annotation class Repeatable
+        \\annotation class Holder(val items: Array<Foo>)
+        \\annotation class Plain(val foo: Foo)
+        \\annotation class Maybe(val s: String?)
+        \\annotation class Bare(s: String, var t: Int)
+        \\annotation class Defaults(val n: Int = pick(), val c: Color = Color.RED, val xs: Array<String> = arrayOf("a"))
+        \\annotation class Self(val a: Self)
+        \\annotation class Arr(val bs: Array<B>)
+        \\annotation class B(val a: Arr)
+        \\annotation class Member {
+        \\    fun describe(): String = "no"
+        \\}
+        \\annotation class Fine(val n: Int, val s: String, val c: Color, val xs: Array<String>, val b: B)
+        \\@Repeatable annotation class Again
+        \\@Fine(1, "s", Color.RED, [], B(Arr([])))
+        \\@B(Arr([])) @B(Arr([]))
+        \\@Again @Again
+        \\class Target
+        \\@kotlin.annotation.Repeatable annotation class Many
+        \\@Many @Many
+        \\class Twice
+    ,
+        \\package kotlin.annotation
+        \\annotation class Repeatable
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "6 INVALID_TYPE_OF_ANNOTATION_MEMBER",
+        "7 INVALID_TYPE_OF_ANNOTATION_MEMBER",
+        "8 NULLABLE_TYPE_OF_ANNOTATION_MEMBER",
+        "9 MISSING_VAL_ON_ANNOTATION_PARAMETER",
+        "9 VAR_ANNOTATION_PARAMETER",
+        "10 ANNOTATION_PARAMETER_DEFAULT_VALUE_MUST_BE_CONSTANT",
+        "11 CYCLE_IN_ANNOTATION_PARAMETER_ERROR",
+        "15 ANNOTATION_CLASS_MEMBER",
+        "20 REPEATED_ANNOTATION",
+        "21 REPEATED_ANNOTATION",
+    });
+}
+
+test "a deprecated declaration is reported where it is used, at its level" {
+    var fx = try fixture(&.{
+        \\package app
+        \\@Deprecated("old")
+        \\fun warnOld(): Int = 2
+        \\@Deprecated("use bar()", level = DeprecationLevel.ERROR)
+        \\fun foo(): Int = 1
+        \\@Deprecated("old class")
+        \\class Old { fun m(): Int = 1 }
+        \\@Deprecated("prop")
+        \\val p: Int = 3
+        \\@Deprecated("gone")
+        \\@DeprecatedSinceKotlin(warningSince = "1.5", errorSince = "2.1")
+        \\fun since(): Int = 4
+        \\@Deprecated("later")
+        \\@DeprecatedSinceKotlin(warningSince = "9.0")
+        \\fun future(): Int = 5
+        \\fun user(o: Old): Int {
+        \\    val x = Old()
+        \\    return warnOld() + p + o.m() + foo() + since() + future()
+        \\}
+        \\open class B { @Deprecated("b") open fun f() {} }
+        \\class D : B() { override fun f() {} }
+    ,
+        \\package kotlin
+        \\enum class DeprecationLevel { WARNING, ERROR, HIDDEN }
+        \\annotation class Deprecated(val message: String, val level: DeprecationLevel = DeprecationLevel.WARNING)
+        \\annotation class DeprecatedSinceKotlin(val warningSince: String = "", val errorSince: String = "", val hiddenSince: String = "")
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "18 DEPRECATION_ERROR",
+        "18 DEPRECATION_ERROR",
+    });
+    try expectWarnings(&fx, &.{
+        "17 DEPRECATION",
+        "18 DEPRECATION",
+        "18 DEPRECATION",
+        "16 DEPRECATION",
+        "21 OVERRIDE_DEPRECATION",
+    });
+    var msgs: std.ArrayList([]const u8) = .empty;
+    for (fx.s.census.sites.items) |site| {
+        const fc = fx.s.fileOf(site.file) orelse continue;
+        if (fc.origin == .program) try msgs.append(fx.arena.allocator(), site.message);
+    }
+    try std.testing.expectEqualStrings("'fun foo(): Int' is deprecated. use bar().", msgs.items[0]);
+}
+
+test "declaration checks accept what upstream libraries compile" {
+    var fx = try fixture(&.{
+        \\package app
+        \\annotation class IntrinsicConstEvaluation
+        \\interface Job {
+        \\    fun cancel()
+        \\    @Deprecated("hidden", level = DeprecationLevel.HIDDEN)
+        \\    fun cancel(cause: Int?): Boolean
+        \\}
+        \\open class JobImpl : Job {
+        \\    override fun cancel() {}
+        \\    @Deprecated("hidden", level = DeprecationLevel.HIDDEN)
+        \\    override fun cancel(cause: Int?): Boolean = false
+        \\}
+        \\interface Channel { fun open(): Int }
+        \\open class Broadcast(c: Channel) : Channel by c
+        \\class Lazy(c: Channel) : Broadcast(c) { override fun open(): Int = 2 }
+        \\interface Deferred { fun result(): Int }
+        \\abstract class Support { fun result(): Int = 1 }
+        \\abstract class Coroutine : Support()
+        \\open class DeferredCoroutine : Coroutine(), Deferred
+        \\class LazyDeferredCoroutine : DeferredCoroutine()
+        \\interface Diagnostics { fun message(): String }
+        \\abstract class Dispatcher : Diagnostics {
+        \\    @Deprecated("internal", level = DeprecationLevel.HIDDEN)
+        \\    override fun message(): String = ""
+        \\}
+        \\class DispatcherImpl : Dispatcher()
+        \\interface Scope {
+        \\    val <T> List<T>.head: T
+        \\}
+        \\@IntrinsicConstEvaluation val Int.twice: Int get() = this * 2
+        \\const val FOUR: Int = 2.twice
+    ,
+        \\package kotlin
+        \\enum class DeprecationLevel { WARNING, ERROR, HIDDEN }
+        \\annotation class Deprecated(val message: String, val level: DeprecationLevel = DeprecationLevel.WARNING)
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{});
+}
+
+test "a class nested in an expect class is an expect" {
+    var fx = try fixture(&.{
+        \\package app
+        \\expect sealed class Frame {
+        \\    class Binary(fin: Boolean) : Frame
+        \\}
+        \\actual sealed class Frame {
+        \\    actual class Binary actual constructor(fin: Boolean) : Frame()
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    var n: usize = 0;
+    for (fx.s.census.sites.items) |site| {
+        if (site.reason == .declaration and std.mem.eql(u8, sema_mod.census.factoryOf(site), "SUPERTYPE_NOT_INITIALIZED")) n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "an override of hidden members from two supertypes overrides both" {
+    var fx = try fixture(&.{
+        \\package app
+        \\open class JobSupport {
+        \\    @Deprecated("hidden", level = DeprecationLevel.HIDDEN)
+        \\    open fun cancel(cause: Int?): Boolean = false
+        \\}
+        \\interface Channel {
+        \\    @Deprecated("hidden", level = DeprecationLevel.HIDDEN)
+        \\    fun cancel(cause: Int?): Boolean = true
+        \\}
+        \\open class ChannelCoroutine : JobSupport(), Channel {
+        \\    @Deprecated("hidden", level = DeprecationLevel.HIDDEN)
+        \\    override fun cancel(cause: Int?): Boolean = false
+        \\}
+        \\class ProducerCoroutine : ChannelCoroutine()
+    ,
+        \\package kotlin
+        \\enum class DeprecationLevel { WARNING, ERROR, HIDDEN }
+        \\annotation class Deprecated(val message: String, val level: DeprecationLevel = DeprecationLevel.WARNING)
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{});
+}
+
+test "a deprecated expect is left to its platform's actual" {
+    var fx = try fixture(&.{
+        \\package app
+        \\fun user(): String = String(3)
+    ,
+        \\package kotlin
+        \\enum class DeprecationLevel { WARNING, ERROR, HIDDEN }
+        \\annotation class Deprecated(val message: String, val level: DeprecationLevel = DeprecationLevel.WARNING)
+        \\@Deprecated("Use concatToString() instead", level = DeprecationLevel.ERROR)
+        \\expect fun String(n: Int): String
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    for (fx.s.census.sites.items) |site| try std.testing.expect(site.reason != .use);
+}

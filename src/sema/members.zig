@@ -37,7 +37,7 @@ pub const Member = struct {
 
 pub const Want = enum { callable, function, property, classifier };
 
-pub const LookupKey = struct { recv: TypeId, name: Name, want: Want, every: bool = false, with_private: bool = false };
+pub const LookupKey = struct { recv: TypeId, name: Name, want: Want, every: bool = false, with_private: bool = false, all: bool = false };
 
 fn wanted(s: *Sema, m: Sym, want: Want) bool {
     const k = s.syms.kind(m);
@@ -82,6 +82,46 @@ pub fn lookupEvery(s: *Sema, recv: TypeId, n: Name, want: Want) Allocator.Error!
     const found = try lookupUncached(s, recv, n, want, true, false);
     try s.lookup_memo.put(s.arena, key, found);
     return found;
+}
+
+/// Every member named `n` in `recv`'s class and its supertypes, however
+/// near, nothing one hides left out, and members deprecated as hidden
+/// among them: what an override may override and what implements an
+/// abstract member. Members a subtype does not inherit (private, static,
+/// an `expect` its `actual` supersedes) are left out.
+pub fn lookupOverridable(s: *Sema, recv: TypeId, n: Name, want: Want) Allocator.Error![]const Member {
+    const key: LookupKey = .{ .recv = recv, .name = n, .want = want, .all = true };
+    if (s.lookup_memo.get(key)) |hit| return hit;
+    var out: std.ArrayList(Member) = .empty;
+    var seen: std.AutoHashMapUnmanaged(Sym, void) = .empty;
+    var frontier: std.ArrayList(TypeId) = .empty;
+    try pushRoots(s, &frontier, recv);
+    var depth: u16 = 0;
+    while (frontier.items.len != 0) : (depth += 1) {
+        var next: std.ArrayList(TypeId) = .empty;
+        for (frontier.items) |t| {
+            const c = switch (s.types.get(t)) {
+                .class => |c| c,
+                else => continue,
+            };
+            if ((try seen.getOrPut(s.arena, c.sym)).found_existing) continue;
+            const subst = try s.arena.create(types.Subst);
+            subst.* = try subtyping.classSubst(s, t);
+            for (scope.membersOf(s, c.sym, n)) |m| {
+                if (!wanted(s, m, want)) continue;
+                const f = s.syms.flags(m);
+                if (f.superseded) continue;
+                if (depth > 0 and f.visibility == .private) continue;
+                try out.append(s.arena, .{ .sym = m, .subst = subst, .depth = depth });
+            }
+            for (try headers.supertypes(s, c.sym)) |st| {
+                try next.append(s.arena, try s.types.substitute(st, subst));
+            }
+        }
+        frontier = next;
+    }
+    try s.lookup_memo.put(s.arena, key, out.items);
+    return out.items;
 }
 
 fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool, with_private: bool) Allocator.Error![]const Member {
@@ -375,8 +415,20 @@ pub fn overridden(s: *Sema, m: Sym) Allocator.Error![]const Sym {
         const self_subst = try subtyping.classSubst(s, self_t);
         for (try headers.supertypes(s, cls)) |st_decl| {
             const st = try s.types.substitute(st_decl, &self_subst);
+            // Through each supertype, the nearest member of the signature;
+            // one deprecated as hidden is overridden too.
+            var visible_found = false;
             for (try lookupEvery(s, st, s.syms.name(m), want)) |cand| {
                 if (s.syms.kind(cand.sym) != k) continue;
+                if (s.syms.flags(cand.sym).static) continue;
+                if (k == .function and !try sameSignature(s, m, none_subst, cand.sym, cand.subst)) continue;
+                if (k == .property and !try sameExtensionReceiver(s, m, cand.sym, cand.subst)) continue;
+                visible_found = true;
+                if (std.mem.indexOfScalar(Sym, out.items, cand.sym) == null) try out.append(s.arena, cand.sym);
+            }
+            if (visible_found) continue;
+            for (try lookupOverridable(s, st, s.syms.name(m), want)) |cand| {
+                if (s.syms.kind(cand.sym) != k or !s.syms.flags(cand.sym).hidden) continue;
                 if (s.syms.flags(cand.sym).static) continue;
                 if (k == .function and !try sameSignature(s, m, none_subst, cand.sym, cand.subst)) continue;
                 if (k == .property and !try sameExtensionReceiver(s, m, cand.sym, cand.subst)) continue;

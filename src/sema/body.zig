@@ -326,7 +326,11 @@ pub fn resolveAll(s: *Sema, origins: []const sema_mod.Origin) Allocator.Error!vo
         try resolveFile(s, i);
     }
     try resumePendingSetters(s);
-    for (origins) |o| if (o == .program) try @import("declcheck.zig").checkProgram(s);
+    for (origins) |o| if (o == .program) {
+        try @import("declcheck.zig").checkProgram(s);
+        try @import("annocheck.zig").checkProgram(s);
+        try @import("usecheck.zig").checkProgram(s);
+    };
 }
 
 /// Resolves every setter a typing pass deferred that no ordinary pass took

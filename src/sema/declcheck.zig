@@ -32,7 +32,7 @@ pub fn checkProgram(s: *Sema) Allocator.Error!void {
         const sym = Sym.from(i);
         const info = s.syms.get(sym);
         const fc = s.fileOf(info.file) orelse continue;
-        if (fc.origin != .program or fc.generated) continue;
+        if (!checked(fc)) continue;
         if (info.flags.synthetic) continue;
         const c = Checker{ .s = s, .file = info.file };
         switch (info.decl) {
@@ -80,6 +80,8 @@ const Checker = struct {
 
     fn class(self: Checker, cls: Sym, c: *const ast.Class) Allocator.Error!void {
         const at = c.name.span;
+        // A class nested in an `expect` class is an `expect` too.
+        const expect = inExpect(self.s, cls);
         // The parser marks an abstract class open too.
         const open = c.is_open and !c.is_abstract;
         const kind: []const u8 = if (c.is_annotation) "annotation class" else if (c.is_enum) "enum class" else if (c.is_interface) "interface" else "class";
@@ -105,11 +107,11 @@ const Checker = struct {
             }
             if (open and c.is_sealed) try self.incompatible(at, "open", "sealed");
             if (c.is_sealed and c.is_inner) try self.incompatible(at, "sealed", "inner");
-            if (c.is_data and !c.is_value and !c.is_expect) try self.dataClass(c);
-            if (c.is_value and !c.is_data and !c.is_expect) try self.valueClass(cls, c);
+            if (c.is_data and !c.is_value and !expect) try self.dataClass(c);
+            if (c.is_value and !c.is_data and !expect) try self.valueClass(cls, c);
         }
         try self.classParams(c.primary_params);
-        if (!c.is_expect and !c.is_external) {
+        if (!expect and !c.is_external) {
             // A class has a primary constructor when it writes one or
             // declares no other.
             const primary = c.has_primary_ctor or c.x().secondary_ctors.len == 0;
@@ -117,7 +119,7 @@ const Checker = struct {
             if (!c.is_annotation) try self.inheritedMembers(cls, at);
         }
         try self.genericThrowable(cls, c.type_params);
-        if (c.is_enum and !c.is_expect) try self.enumEntries(cls, c);
+        if (c.is_enum and !expect) try self.enumEntries(cls, c);
         try self.constructorCycles(cls);
     }
 
@@ -216,7 +218,7 @@ const Checker = struct {
                 else => {},
             };
         }
-        if (!o.is_expect) {
+        if (!inExpect(self.s, cls)) {
             try self.supertypes(cls, o.supertypes, o.supertype_args, o.supertype_delegates, true);
             try self.inheritedMembers(cls, o.name.span);
         }
@@ -333,30 +335,24 @@ const Checker = struct {
 
     fn slots(self: Checker, cls: Sym, at: Span, n: sema_mod.Name, want: members.Want, abstract_cls: bool, missing: *Missing) Allocator.Error!void {
         const s = self.s;
-        const self_subst = try subtyping.classSubst(s, try headers.selfType(s, cls));
-        // What each supertype supplies under the name, the most specific
-        // member of its branch.
+        // Every member of the name above the class, however near: which of
+        // them the class inherits apart is what overrides whom decides,
+        // below. One deprecated as hidden still implements.
         var supplied: std.ArrayList(members.Member) = .empty;
-        for (try headers.supertypes(s, cls)) |st_decl| {
-            const st = try s.types.substitute(st_decl, &self_subst);
-            for (try members.lookup(s, st, n, want)) |m| {
-                const k = s.syms.kind(m.sym);
-                if (k != .function and k != .property) continue;
-                const f = s.syms.flags(m.sym);
-                if (f.static or f.visibility == .private) continue;
-                if (k == .property) {
-                    try headers.propertyHeader(s, m.sym);
-                    if (s.syms.propertyInfo(m.sym).receiver != .none) continue;
-                } else {
-                    try headers.functionHeader(s, m.sym);
-                    if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-                }
-                var dup = false;
-                for (supplied.items) |e| if (e.sym == m.sym) {
-                    dup = true;
-                };
-                if (!dup) try supplied.append(s.arena, m);
+        for (try members.lookupOverridable(s, try headers.selfType(s, cls), n, want)) |m| {
+            if (s.syms.owner(m.sym) == cls) continue;
+            const k = s.syms.kind(m.sym);
+            if (k != .function and k != .property) continue;
+            const f = s.syms.flags(m.sym);
+            if (f.static or f.visibility == .private) continue;
+            if (k == .property) {
+                try headers.propertyHeader(s, m.sym);
+                if (s.syms.propertyInfo(m.sym).receiver != .none) continue;
+            } else {
+                try headers.functionHeader(s, m.sym);
+                if (s.syms.functionInfo(m.sym).receiver != .none) continue;
             }
+            try supplied.append(s.arena, m);
         }
         var done: std.ArrayList(bool) = .empty;
         try done.appendNTimes(s.arena, false, supplied.items.len);
@@ -516,7 +512,7 @@ const Checker = struct {
         try self.params(d.params, d.is_inline);
         if (member) try self.overrides(f, d.is_override, at);
         if (d.is_operator) try self.operatorShape(f, d, member);
-        if (d.is_inline and !d.is_expect and !try inlinesSomething(s, f, d)) {
+        if (d.is_inline and !inExpect(s, f) and !try inlinesSomething(s, f, d)) {
             try self.warn(at, .NOTHING_TO_INLINE, "Expected performance impact from inlining is insignificant. Inlining works best for functions with parameters of function types.", .{});
         }
         if (member and d.is_override) try self.parameterNames(f, d);
@@ -659,7 +655,7 @@ const Checker = struct {
         if (d.receiver_type != null) {
             if (d.init) |e| {
                 try self.report(e.span(), .EXTENSION_PROPERTY_WITH_BACKING_FIELD, "Extension property cannot be initialized because it has no backing field.", .{});
-            } else if (d.delegate == null and !d.is_abstract and !d.is_expect and !external(s, p) and
+            } else if (d.delegate == null and s.syms.flags(p).modality != .abstract and !inExpect(s, p) and !external(s, p) and
                 (d.getter == null or (d.mutable and d.setter == null)))
             {
                 try self.report(at, .EXTENSION_PROPERTY_MUST_HAVE_ACCESSORS_OR_BE_ABSTRACT, "Extension property must have accessors or be abstract.", .{});
@@ -667,7 +663,7 @@ const Checker = struct {
             return;
         }
         if (d.explicit_field) |field| try self.explicitField(p, d, field, member);
-        if (d.delegate != null or d.is_abstract or d.is_expect or d.explicit_field != null) return;
+        if (d.delegate != null or s.syms.flags(p).modality == .abstract or inExpect(s, p) or d.explicit_field != null) return;
         const in_interface = member and s.syms.classInfo(s.syms.owner(p)).kind == .interface;
         if (in_interface) return;
         if (inlineProperty(d) and hasBackingField(d)) {
@@ -741,7 +737,7 @@ const Checker = struct {
         const s = self.s;
         const cls = s.syms.owner(m);
         if (cls == .none or s.syms.kind(cls) != .class) return;
-        if (s.syms.flags(cls).expect or s.syms.flags(m).expect) return;
+        if (inExpect(s, m)) return;
         const bases = try members.overridden(s, m);
         const name = s.str(s.syms.name(m));
         if (bases.len == 0) {
@@ -978,6 +974,32 @@ fn isLocalDecl(s: *Sema, sym: Sym) bool {
     };
 }
 
+/// Whether `sym` is an `expect` declaration or declared in one: what an
+/// `expect` class holds is `expect` too.
+fn inExpect(s: *Sema, sym: Sym) bool {
+    var cur = sym;
+    while (cur != .none) : (cur = s.syms.owner(cur)) {
+        switch (s.syms.kind(cur)) {
+            .package => return false,
+            .class, .function, .property => if (s.syms.flags(cur).expect) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether a file's declarations are checked: a program's, and under
+/// `KLIO_CHECK_PACKS=1` a pack's too, which kotlinc compiled.
+pub fn checked(fc: *const sema_mod.FileCtx) bool {
+    if (fc.generated) return false;
+    return fc.origin == .program or (fc.origin == .pack and checkPacks());
+}
+
+fn checkPacks() bool {
+    const v = std.c.getenv("KLIO_CHECK_PACKS") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
 /// Declared in a class's body rather than a package or a body.
 fn isMember(s: *Sema, sym: Sym) bool {
     const owner = s.syms.owner(sym);
@@ -1074,14 +1096,14 @@ fn plain(comptime T: type) bool {
     };
 }
 
-fn primitive(s: *Sema, cls: Sym) bool {
+pub fn primitive(s: *Sema, cls: Sym) bool {
     if (cls == .none) return false;
     const b = s.builtins;
     return cls == b.int or cls == b.long or cls == b.short or cls == b.byte or
         cls == b.float or cls == b.double or cls == b.char or cls == b.boolean;
 }
 
-fn unsigned(s: *Sema, cls: Sym) bool {
+pub fn unsigned(s: *Sema, cls: Sym) bool {
     if (cls == .none) return false;
     const b = s.builtins;
     return cls == b.uint or cls == b.ulong or cls == b.ushort or cls == b.ubyte;
@@ -1106,7 +1128,7 @@ fn nullableBound(s: *Sema, t: TypeId) Allocator.Error!bool {
 /// and what its names resolved to tell: literals, `const val`s and the
 /// operators and conversions on them. Anything else it cannot rule out
 /// answers true, so only a definite non-constant is reported.
-fn constant(s: *Sema, file: u32, e: *const ast.Expr) Allocator.Error!bool {
+pub fn constant(s: *Sema, file: u32, e: *const ast.Expr) Allocator.Error!bool {
     return switch (e.*) {
         .IntLit, .FloatLit, .BoolLit, .CharLit, .NullLit => true,
         .StringTemplate => |t| blk: {
@@ -1152,7 +1174,7 @@ fn constName(s: *Sema, file: u32, sp: Span) Allocator.Error!bool {
     const target = try refTarget(s, file, sp);
     if (target == .none) return true;
     return switch (s.syms.kind(target)) {
-        .property => s.syms.flags(target).const_,
+        .property => s.syms.flags(target).const_ or constEvaluated(s, target),
         .local, .value_param => false,
         // An enum entry is not a constant of a `const val`.
         .enum_entry => false,
@@ -1160,16 +1182,30 @@ fn constName(s: *Sema, file: u32, sp: Span) Allocator.Error!bool {
     };
 }
 
-/// A member of a builtin number, character, boolean or string class: its
-/// conversions and operators fold at compile time.
+/// A member of a builtin number, character, boolean or string class, or a
+/// declaration the stdlib marks `@IntrinsicConstEvaluation` (`Char.code`):
+/// it folds at compile time.
 fn intrinsic(s: *Sema, target: Sym) bool {
     if (target == .none) return true;
     const owner = s.syms.owner(target);
-    return primitive(s, owner) or unsigned(s, owner) or owner == s.builtins.string;
+    if (primitive(s, owner) or unsigned(s, owner) or owner == s.builtins.string) return true;
+    return constEvaluated(s, target);
+}
+
+fn constEvaluated(s: *Sema, target: Sym) bool {
+    const anns: []const ast.Annotation = switch (s.syms.get(target).decl) {
+        .function => |d| d.annotations,
+        .property => |d| d.annotations,
+        else => return false,
+    };
+    for (anns) |a| {
+        if (a.path.len != 0 and std.mem.eql(u8, a.path[a.path.len - 1].name, "IntrinsicConstEvaluation")) return true;
+    }
+    return false;
 }
 
 /// Where a name's reference is anchored: the path, or its last segment.
-fn pathAnchor(s: *Sema, file: u32, whole: Span, segments: []const ast.Ident) Span {
+pub fn pathAnchor(s: *Sema, file: u32, whole: Span, segments: []const ast.Ident) Span {
     if (segments.len == 0) return whole;
     for (s.refs.items) |r| {
         if (r.file == file and r.anchor.start == whole.start and r.anchor.end == whole.end) return whole;
@@ -1178,7 +1214,7 @@ fn pathAnchor(s: *Sema, file: u32, whole: Span, segments: []const ast.Ident) Spa
 }
 
 /// The declaration the reference anchored at `sp` resolved to.
-fn refTarget(s: *Sema, file: u32, sp: Span) Allocator.Error!Sym {
+pub fn refTarget(s: *Sema, file: u32, sp: Span) Allocator.Error!Sym {
     for (s.refs.items) |r| {
         if (r.file == file and r.anchor.start == sp.start and r.anchor.end == sp.end and r.anchor.file.int() == sp.file.int()) return r.target;
     }

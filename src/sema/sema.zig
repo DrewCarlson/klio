@@ -31,6 +31,8 @@ pub const diagnose = @import("diagnose.zig");
 pub const exhaustive = @import("exhaustive.zig");
 pub const suppress = @import("suppress.zig");
 pub const declcheck = @import("declcheck.zig");
+pub const annocheck = @import("annocheck.zig");
+pub const usecheck = @import("usecheck.zig");
 
 const Allocator = std.mem.Allocator;
 pub const Name = names.Name;

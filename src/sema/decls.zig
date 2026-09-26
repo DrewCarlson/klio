@@ -646,7 +646,9 @@ fn synthDelegated(s: *Sema, cls: Sym, file: u32, m: @import("members.zig").Membe
     const headers = @import("headers.zig");
     // A copy: adding symbols below can move the table `get` points into.
     const src = s.syms.get(m.sym).*;
-    var flags: Flags = .{ .synthetic = true, .has_body = true, .override = true };
+    // An override, open as any override is: a subclass of an open class
+    // may override what the class delegates.
+    var flags: Flags = .{ .synthetic = true, .has_body = true, .override = true, .modality = .open };
     flags.suspend_ = src.flags.suspend_;
     flags.operator = src.flags.operator;
     flags.infix = src.flags.infix;

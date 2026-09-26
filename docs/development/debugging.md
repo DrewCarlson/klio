@@ -158,6 +158,7 @@ alone and reports its census.
 |----------|--------|--------------------|------------|
 | `KLIO_SEMA_TRACE` | `<name>` | Every candidate a call named `<name>` considers, level by level, and why each is rejected | `[sema-trace]` |
 | `KLIO_SEMA_TIMING` | set | Milliseconds per step of a sema-pipeline run: load and parse, collect, headers, bodies, records, bridge, lowering, execution | `[sema-timing]` |
+| `KLIO_CHECK_PACKS` | `1` | Also runs the declaration, annotation and use checks (`declcheck`, `annocheck`, `usecheck`) over the installed packs' sources, which kotlinc compiled: a finding there is a false positive to fix, or klio-authored code kotlinc would refuse. The pack checks see no module `-opt-in` or `@file:Suppress`, so `use` sites there are noise | none |
 | `KLIO_SEMA_PIPELINE_BASE` | set | Also prints the base's lowering failures, which a run otherwise only counts | `[base]` |
 | `KLIO_SEMA_IMAGE` | `0` off | The base image: a run loads the base's bridge and lowered bodies from `$KLIO_HOME/.klio/cache/sema-base-<key>.klio-sema`, else from the copy the build installed under `share/klio/cache` beside the binary (baked on a miss, keyed by the binary and every base file's path and text), and analyzes and lowers only the program; `0` analyzes and lowers the base in every run | none |
 

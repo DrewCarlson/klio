@@ -36,9 +36,15 @@ pub const DiagnosticFactory = struct {
     message_template: []const u8,
 };
 
-/// Factories outside the frontend's `FirErrors`: what kotlinc reports from
-/// its later phases, and what klio reports of itself (`KLIO_*`).
+/// Factories outside the mined `FirErrors` list: what kotlinc reports from
+/// its later phases or declares elsewhere, and what klio reports of itself
+/// (`KLIO_*`).
 pub const extra = struct {
+    pub const CYCLE_IN_ANNOTATION_PARAMETER_ERROR = DiagnosticFactory{
+        .name = "CYCLE_IN_ANNOTATION_PARAMETER_ERROR",
+        .default_severity = .Error,
+        .message_template = "Cycle formed by one or more annotations and their parameter types.",
+    };
     pub const NO_ACTUAL_FOR_EXPECT = DiagnosticFactory{
         .name = "NO_ACTUAL_FOR_EXPECT",
         .default_severity = .Error,
