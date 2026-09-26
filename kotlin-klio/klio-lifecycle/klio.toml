@@ -1,0 +1,67 @@
+# androidx.lifecycle: the lifecycle library, vendored verbatim from the
+# compose-multiplatform-core submodule, one feature per upstream module (they
+# share the androidx.lifecycle package, so the library is one pack):
+#
+#   common           lifecycle-common: Lifecycle, its states and events,
+#                    LifecycleOwner and the observers
+#   runtime          lifecycle-runtime: LifecycleRegistry and the coroutine
+#                    helpers over a Lifecycle (the default)
+#   viewmodel        lifecycle-viewmodel: ViewModel, its store and owner, the
+#                    provider and its factories, viewModelScope
+#   runtime-compose  lifecycle-runtime-compose: LocalLifecycleOwner, the
+#                    lifecycle effects, collectAsStateWithLifecycle
+#
+# Each module takes commonMain with the non-JVM and native actuals the desktop
+# build's counterparts mirror. klioMain/runtime has the runtime module's
+# main-dispatcher check (the desktop's, over klio.Thread) and its weak
+# reference.
+[library]
+id = "androidx.lifecycle"
+version = "2.11.0"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-common/src/commonMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-common/src/nonJvmMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-runtime/src/commonMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-runtime/src/nativeMain/kotlin"
+include = [
+    "androidx/lifecycle/LifecycleRegistry.native.kt",
+]
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel/src/commonMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel/src/nonJvmMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel/src/nativeMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/lifecycle/lifecycle-runtime-compose/src/commonMain/kotlin"
+
+[[source]]
+root = "klioMain"
+
+[deps]
+stdlib = "*"
+"androidx.annotation" = "*"
+"androidx.collection" = "*"
+"kotlinx.atomicfu" = "*"
+"kotlinx.coroutines" = "*"
+
+[features]
+default = ["runtime"]
+common = { sources = ["../klio-compose-runtime/upstream/lifecycle/lifecycle-common/"] }
+runtime = { sources = ["../klio-compose-runtime/upstream/lifecycle/lifecycle-runtime/", "klioMain/runtime/"], requires = ["common"] }
+viewmodel = { sources = ["../klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel/"], requires = ["common"] }
+runtime-compose = { sources = ["../klio-compose-runtime/upstream/lifecycle/lifecycle-runtime-compose/"], requires = ["runtime"], deps = ["androidx.compose.runtime"] }

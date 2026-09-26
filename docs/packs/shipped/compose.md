@@ -20,7 +20,7 @@ each upstream module is its own pack.
 | `androidx.compose.ui.text`           | ui/ui-text                     | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, coroutines |
 | `androidx.navigationevent`           | navigationevent/navigationevent | runtime, annotation, collection, coroutines, atomicfu   |
 | `androidx.navigationevent.compose`   | navigationevent/navigationevent-compose | runtime, navigationevent, coroutines            |
-| `androidx.compose.ui`                | ui/ui                          | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, ui.text, navigationevent, navigationevent.compose, coroutines |
+| `androidx.compose.ui`                | ui/ui                          | runtime, runtime.saveable, ui.util, ui.geometry, ui.unit, ui.graphics, ui.text, navigationevent, navigationevent.compose, lifecycle (runtime-compose), skiko, coroutines |
 | `androidx.compose.ui.backhandler`    | ui/ui-backhandler              | runtime, ui.util, annotation, navigationevent, navigationevent.compose, coroutines |
 | `androidx.compose.animation.core`    | animation/animation-core       | runtime, ui, ui.unit, ui.util, ui.geometry, ui.graphics, collection, coroutines |
 | `androidx.compose.animation`         | animation/animation            | runtime, animation.core, ui, ui.*, foundation.layout, collection, coroutines |
@@ -37,7 +37,14 @@ rounded-polygon shapes material3 draws). `androidx.annotation`
 library's markers (`@IntRange`, `@VisibleForTesting`, `@RestrictTo`, ...) that
 every module above and androidx.collection import; the checkout does not carry
 that library, so the pack declares them in klio sources with upstream's
-signatures. `klio.compose.ui`
+signatures. `androidx.lifecycle` (`kotlin-klio/klio-lifecycle`) is the
+lifecycle library, one pack whose features are its modules, since they share
+the `androidx.lifecycle` package: `common`, `runtime` (the default),
+`viewmodel` and `runtime-compose`, which ui asks for
+(`--feature androidx.lifecycle/viewmodel` in a program without a
+manifest). `org.jetbrains.skiko` (`kotlin-klio/klio-skiko`) is skiko's
+commonMain, the `org.jetbrains.skia` API, over the native functions skiko's
+C glue exports from the Skia shim. `klio.compose.ui`
 (`kotlin-klio/klio-compose-ui`) is klio's own windowing and rendering layer
 (`runApp`, the Skia backend) over the runtime, not an upstream module.
 
@@ -57,8 +64,8 @@ signature:
 
 - libraries outside the checkout: the androidx annotation markers (the
   `androidx.annotation` pack), compose's runtime-annotation markers and
-  runtime-retain's store (runtime pack), and the lifecycle, savedstate and
-  lifecycle-runtime-compose slices the saveable pack carries;
+  runtime-retain's store (runtime pack), and the savedstate slice the
+  saveable pack carries;
 - platform code: a `GraphicsLayer` that records into a Skia picture through
   klio's shim and replays it under its transform, clip and offscreen layer
   (skiko's does the same through a skiko RenderNode), a Kotlin `PathMeasure`, code-point stand-ins

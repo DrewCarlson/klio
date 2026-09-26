@@ -868,6 +868,23 @@ pub const suites = [_]Config{
         .max_failed = 0,
         .max_incomplete = 0,
     },
+    .{
+        // lifecycle-viewmodel's commonTest (ViewModel, its store, the
+        // provider and its factories), asserted through upstream Kruth, with
+        // klio's actual of the suite's IgnoreWebTarget. The nine
+        // ViewModelProvider tests fail on ViewModelProvider.create's
+        // defaults: the actual does not take its expect's defaults when a
+        // parameter's type is a class nested in the expect class.
+        .name = "lifecycle_viewmodel",
+        .test_roots = &.{"kotlin-klio/klio-compose-runtime/upstream/lifecycle/lifecycle-viewmodel/src/commonTest/kotlin"},
+        .extra_support = &(kruth_support ++ [_][]const u8{"tests/lifecycle_commontest_actuals/viewmodel"}),
+        .extra_args = &.{ "--feature", "androidx.lifecycle/viewmodel" },
+        .batch_dirs = true,
+        .timeout_ms = 300_000,
+        .baseline = 26,
+        .max_failed = 9,
+        .max_incomplete = 0,
+    },
 };
 
 /// androidx.kruth, the assertion library the compose suites are written

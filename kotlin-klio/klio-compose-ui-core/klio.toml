@@ -143,6 +143,8 @@ stdlib = "*"
 "androidx.compose.ui.text" = "*"
 # skiko's SystemTheme and currentSystemTheme, which ui's SystemTheme.kt reads.
 "org.jetbrains.skiko" = "*"
+# The lifecycle a composition's owner has, and LocalLifecycleOwner.
+"androidx.lifecycle" = { version = "*", features = ["runtime-compose"] }
 "kotlinx.coroutines" = "*"
 "androidx.navigationevent" = "*"
 "androidx.navigationevent.compose" = "*"

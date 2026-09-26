@@ -158,6 +158,17 @@ sparse=(
   "savedstate/savedstate/src/nonAndroidTest"
   "savedstate/savedstate-compose/src/commonMain"
   "savedstate/savedstate-compose/src/nonAndroidMain"
+  # The fake lifecycle owner the lifecycle suites test with, and the
+  # lifecycle test sets' platform actuals (the main dispatcher a test runs
+  # on), which the klio test actuals follow.
+  "testutils/testutils-lifecycle/src/commonMain"
+  "lifecycle/lifecycle-runtime/src/nativeTest"
+  "lifecycle/lifecycle-runtime/src/nonJvmTest"
+  "lifecycle/lifecycle-runtime/src/jvmTest"
+  "lifecycle/lifecycle-runtime/src/desktopTest"
+  "lifecycle/lifecycle-viewmodel/src/nativeTest"
+  "lifecycle/lifecycle-viewmodel/src/nonJvmTest"
+  "lifecycle/lifecycle-viewmodel/src/jvmTest"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)

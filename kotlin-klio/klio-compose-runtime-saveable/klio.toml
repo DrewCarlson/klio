@@ -27,4 +27,7 @@ include = [
 stdlib = "*"
 "androidx.compose.runtime" = "*"
 "androidx.collection" = "*"
+# The saved-state owner klioMain stands in for is a LifecycleOwner, and
+# SaveableStateRegistryWrapper keeps a LifecycleRegistry.
+"androidx.lifecycle" = "*"
 
