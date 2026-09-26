@@ -20,6 +20,7 @@ const pack_cache = @import("pack_cache.zig");
 const project = @import("project.zig");
 const cli = @import("cli.zig");
 const interp_ir = @import("interp_ir");
+const diagnostics = @import("diagnostics");
 
 const Allocator = std.mem.Allocator;
 
@@ -1089,6 +1090,112 @@ fn nowNs() u64 {
 /// transformed once; a program is transformed together with the packs'
 /// original files, so its serializers see theirs, and keeps only what
 /// belongs to it.
+/// One of a library's own source files, as `klio pack build` collected it.
+pub const LibraryFile = struct { path: []const u8, bytes: []const u8 };
+
+/// A library to check: its own files, its id, the libraries it may load
+/// (its dependencies and those its features name), and the features of
+/// them it asks for, as `<pack>/<feature>`.
+pub const Library = struct {
+    files: []const LibraryFile,
+    id: []const u8,
+    deps: []const []const u8,
+    feature_specs: []const []const u8,
+};
+
+/// What is wrong with a library's own sources, measured as the census
+/// measures a pack: the files analyzed as a pack over the stdlib and its
+/// installed dependencies, every pack body resolved, its own bodies
+/// lowered. A reference sema cannot resolve and a body that does not lower
+/// are errors: kotlinc would not compile the library, and the function
+/// would run with no body. A bodyless declaration no native binds is not
+/// one; the census tracks those. Renders the errors into `out`, in the form
+/// the lexer's and parser's take, and answers how many there are.
+pub fn checkLibrarySources(gpa: Allocator, arena: Allocator, lib: Library, out: *std.ArrayList(u8)) !usize {
+    var map = span.SourceMap.init(arena);
+    const saved_map = span.active_map;
+    span.active_map = &map;
+    defer span.active_map = saved_map;
+
+    var files: std.ArrayList(sema.SourceFile) = .empty;
+    var perr: pack.PackError = undefined;
+    var stdlib_src = (try stdlib_pack.stdlibSources(arena, null, &perr)) orelse return error.StdlibSourcesMissing;
+    defer stdlib_src.deinit();
+    for (stdlib_src.files) |sf| try addSource(arena, &map, &files, sf.rel_path, sf.bytes, .base);
+    try addSemaActuals(arena, &map, &files);
+
+    var own: std.ArrayList(sema.SourceFile) = .empty;
+    for (lib.files) |f| try addSource(arena, &map, &own, f.path, f.bytes, .pack);
+    var own_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    var own_asts: std.ArrayList(ast.KotlinFile) = .empty;
+    for (own.items) |f| {
+        try own_ids.put(arena, f.ast.span.file.int(), {});
+        try own_asts.append(arena, f.ast.*);
+    }
+    // Its dependencies, as a loaded pack brings them, never its installed
+    // copy.
+    var features = cli.parseRequestedFeatures(arena, lib.feature_specs);
+    const loaded = pack_cache.loadInstalledPacksOpts(arena, own_asts.items, &map, &features, .{
+        .include_stdlib = false,
+        .report_failures = false,
+        .exclude_lib_ids = &.{lib.id},
+        .declared_lib_ids = lib.deps,
+        .dep_lib_ids = lib.deps,
+    });
+    var packs: std.ArrayList(sema.SourceFile) = .empty;
+    for (loaded.asts) |*pa| {
+        const owned = try arena.create(ast.KotlinFile);
+        owned.* = pa.*;
+        const path = if (pa.span.file.int() < map.files.items.len) map.get(pa.span.file).path else "<pack>";
+        try packs.append(arena, .{ .ast = owned, .path = path, .origin = .pack });
+    }
+    try packs.appendSlice(arena, own.items);
+    const serial = try Serial.init(arena, &map, packs.items);
+    try files.appendSlice(arena, serial.packs);
+
+    const s = try sema.Sema.init(arena);
+    try s.addFiles(files.items);
+    try sema.headers.resolveAllHeaders(s);
+    // The stdlib's bodies too: an inline function of it is instantiated
+    // from them.
+    try s.resolveBodies(&.{ .base, .pack });
+    const records = try sema.output.build(s);
+
+    var n: usize = 0;
+    var shown: usize = 0;
+    for (s.census.sites.items) |site| {
+        const fc = s.fileOf(site.file) orelse continue;
+        if (!own_ids.contains(fc.ast.span.file.int())) continue;
+        n += 1;
+        if (site.reason != .receiver_unresolved) shown += 1;
+    }
+    for (s.census.sites.items) |site| {
+        const fc = s.fileOf(site.file) orelse continue;
+        if (!own_ids.contains(fc.ast.span.file.int())) continue;
+        // A member of a receiver that did not resolve follows from the
+        // receiver's own error.
+        if (site.reason == .receiver_unresolved and shown != 0) continue;
+        const d = diagnostics.Diagnostic.err(try sema.diagnose.message(s, arena, site), site.sp);
+        try diagnostics.render.plain.render(arena, &.{d}, &map, out);
+    }
+
+    var lowered_files: std.ArrayList(u32) = .empty;
+    for (s.files.items, 0..) |fc, fi| {
+        if (own_ids.contains(fc.ast.span.file.int())) try lowered_files.append(arena, @intCast(fi));
+    }
+    const r = try lower_driver.lower_census.run(arena, s, &map, records.files, &.{}, lowered_files.items, hostBinding(gpa));
+    for (r.entries) |e| {
+        if (e.kind == .unbound_native) continue;
+        const id = e.file orelse continue;
+        if (!own_ids.contains(id)) continue;
+        n += 1;
+        // What did not resolve does not lower either: said once above.
+        if (shown != 0) continue;
+        try out.print(arena, "{s}: error: `{s}` does not lower: {s}\n", .{ e.where, e.func, e.msg });
+    }
+    return n;
+}
+
 const Serial = struct {
     pack_originals: []const ast.KotlinFile,
     /// The transformed packs followed by their generated files.

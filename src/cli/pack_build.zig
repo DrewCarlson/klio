@@ -1531,6 +1531,38 @@ fn buildAstBundle(gpa: std.mem.Allocator, a: std.mem.Allocator, files: []const s
     return .{ .files = out_files.toOwnedSlice(a) catch &.{} };
 }
 
+/// Analyzes and lowers the library's own sources over its installed
+/// dependencies as the census measures a pack. A reference that does not
+/// resolve or a body that does not lower fails the build, with each error
+/// printed: kotlinc would not compile the library, and the function would
+/// run with no body.
+fn checkLibrary(gpa: std.mem.Allocator, a: std.mem.Allocator, dir: []const u8, cfg: *const LibraryToml, files: []const schema.SourceFile) ?Failure {
+    const sema_cmd = @import("sema_cmd.zig");
+    const lib_files = a.alloc(sema_cmd.LibraryFile, files.len) catch return fail(gpa, "out of memory", .{});
+    for (files, lib_files) |f, *lf| {
+        lf.* = .{ .path = std.fs.path.join(a, &.{ dir, f.rel_path }) catch return fail(gpa, "out of memory", .{}), .bytes = f.bytes };
+    }
+    // Its dependencies and the features it asks of them, including those
+    // its own features are built on: every feature's sources are checked.
+    var deps: std.ArrayList([]const u8) = .empty;
+    var specs: std.ArrayList([]const u8) = .empty;
+    for (cfg.deps) |d| {
+        deps.append(a, d.id) catch return fail(gpa, "out of memory", .{});
+        for (d.features) |ft| specs.append(a, std.fmt.allocPrint(a, "{s}/{s}", .{ d.id, ft }) catch return fail(gpa, "out of memory", .{})) catch return fail(gpa, "out of memory", .{});
+    }
+    for (cfg.features.defs) |def| for (def.deps) |spec| {
+        const slash = std.mem.findScalar(u8, spec, '/');
+        deps.append(a, if (slash) |i| spec[0..i] else spec) catch return fail(gpa, "out of memory", .{});
+        if (slash != null) specs.append(a, spec) catch return fail(gpa, "out of memory", .{});
+    };
+    var out: std.ArrayList(u8) = .empty;
+    const n = sema_cmd.checkLibrarySources(gpa, a, .{ .files = lib_files, .id = cfg.library.id, .deps = deps.items, .feature_specs = specs.items }, &out) catch |e|
+        return fail(gpa, "pack build: cannot analyze {s}'s sources: {s}", .{ cfg.library.id, @errorName(e) });
+    if (n == 0) return null;
+    io.writeStderr(out.items);
+    return fail(gpa, "pack build: {d} error{s} in {s}'s sources", .{ n, if (n == 1) "" else "s", cfg.library.id });
+}
+
 /// Typecheck the AST bundle into a type map from `a`; any error skips the bundle.
 fn buildTypeckBundle(a: std.mem.Allocator, asts: []const KotlinFile) schema.TypeckBundle {
     if (asts.len == 0) return .{};
@@ -1712,6 +1744,7 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     var ast_err: ?Failure = null;
     const ast_bundle = buildAstBundle(gpa, a, files, &ast_err);
     if (ast_err) |e| return .{ .err = e };
+    if (checkLibrary(gpa, a, dir, &cfg, files)) |e| return .{ .err = e };
     const ast_bytes = (schema.encode(schema.AstBundle, a, &ast_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 

@@ -308,6 +308,45 @@ test "a dependency of an unrequested feature does not load" {
     try expectContains(on.stderr, "[pack-load] demo.featdep ");
 }
 
+test "a pack whose sources do not resolve does not build" {
+    const c = try ctx();
+    _ = try write(c, "badlib/klio.toml",
+        \\[library]
+        \\id = "demo.bad"
+        \\version = "0.1.0"
+        \\abi = 1
+        \\
+        \\[[source]]
+        \\root = "src"
+        \\
+        \\[deps]
+        \\stdlib = "*"
+        \\
+    );
+    _ = try write(c, "badlib/src/demo/bad/Bad.kt",
+        \\package demo.bad
+        \\
+        \\class Pos(val x: Int) {
+        \\    override fun equals(other: Any?): Boolean {
+        \\        if (javaClass != other?.javaClass) return false
+        \\        return x == (other as Pos).x
+        \\    }
+        \\    override fun hashCode(): Int = x
+        \\}
+        \\
+        \\fun greet(): String = "hi " + MISSING_NAME
+        \\
+        \\fun ok(): String = "ok"
+        \\
+    );
+    const r = try klio(c, TMP_ROOT ++ "/badlib", &.{ "pack", "build", "." });
+    try expectCode(r, 2);
+    try expectContains(r.stderr, "src/demo/bad/Bad.kt:5:13: error: unresolved reference `javaClass`");
+    try expectContains(r.stderr, "src/demo/bad/Bad.kt:11:31: error: unresolved reference `MISSING_NAME`");
+    try expectContains(r.stderr, "pack build: ");
+    try expectContains(r.stderr, "errors in demo.bad's sources");
+}
+
 test "an installed pack that does not decode is reported" {
     const c = try ctx();
     const pack = HOME ++ "/.klio/packs/demo.broken-0.1.0.klio-pack";

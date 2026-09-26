@@ -131,6 +131,10 @@ pub const LoadOptions = struct {
     /// Every installed pack with every feature, whatever the imports: what
     /// ships, as a census measures it.
     all: bool = false,
+    /// Libraries that load by their own id whatever the imports, as a loaded
+    /// pack's `[deps]` do: the dependencies a library's own sources declare,
+    /// which they may name by qualified name alone.
+    dep_lib_ids: []const []const u8 = &.{},
 };
 
 /// `ok` is an owned path, `err` an owned message; the caller frees whichever is set.
@@ -1611,6 +1615,10 @@ fn loadInstalledPacksImpl(
     // id, where an import prefix also reaches the packs nested under it.
     var dep_ids = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&dep_ids);
+    for (opts.dep_lib_ids) |id| {
+        if (!isPackDependency(id) or dep_ids.contains(id)) continue;
+        try dep_ids.put(try gpa.dupe(u8, id), {});
+    }
 
     var declared = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&declared);
@@ -1659,6 +1667,10 @@ fn loadInstalledPacksImpl(
         defer freeStringSet(&pre_prefixes);
         var pre_deps = std.StringHashMap(void).init(gpa);
         defer freeStringSet(&pre_deps);
+        {
+            var it = dep_ids.keyIterator();
+            while (it.next()) |k| try pre_deps.put(try gpa.dupe(u8, k.*), {});
+        }
         {
             var it = known_prefixes.keyIterator();
             while (it.next()) |k| {

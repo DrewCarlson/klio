@@ -693,7 +693,7 @@ sources = ["upstream/ktor-server/ktor-server-plugins/ktor-server-content-negotia
 requires = ["server-core"]
 
 # ktor-server-test-suites (`io.ktor.server.testing.suites.*`): the shared
-# engine test suites.
+# engine test suites, written with kotlin.test's assertions.
 [features.server-test-suites]
 sources = ["upstream/ktor-server/ktor-server-test-suites/"]
 requires = [
@@ -705,6 +705,7 @@ requires = [
     "server-websockets",
     "server-sse",
 ]
+deps = ["kotlin.test"]
 
 # ktor-client-test-base (`io.ktor.client.test.base.*`): the client test
 # helpers.
