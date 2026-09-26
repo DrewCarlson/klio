@@ -433,7 +433,9 @@ extern "C" const char* klio_win_last_error(void) {
 #include <X11/keysym.h>
 #include <SDL_syswm.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/select.h>
+#include <unistd.h>
 #include <cmath>
 #include <type_traits>
 #define KLIO_X11 1
@@ -547,6 +549,13 @@ static int klioSdlOpenCount = 0;
 // The open windows hold one reference on SDL's video subsystem, taken when the
 // first opens and given back when the last closes; the clipboard holds its own.
 static bool klioSdlWindowsHoldVideo = false;
+
+// The window loop's wake (klio_app_wake): an SDL event of its own type, and on
+// X11, where the loop waits on its connections itself, a byte on a pipe.
+static Uint32 klioSdlWakeType = 0;
+#if !defined(_WIN32)
+static int klioWakePipe[2] = {-1, -1};
+#endif
 
 static void klioSdlReleaseVideo() {
     if (!klioSdlWindowsHoldVideo) return;
@@ -718,6 +727,15 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
             klioWinFailed(std::string("SDL could not start its video subsystem: ") + SDL_GetError());
             return nullptr;
         }
+        if (!klioSdlWakeType) {
+            const Uint32 t = SDL_RegisterEvents(1);
+            if (t != static_cast<Uint32>(-1)) klioSdlWakeType = t;
+        }
+#if !defined(_WIN32)
+        if (klioWakePipe[0] < 0 && pipe(klioWakePipe) == 0) {
+            for (const int fd : klioWakePipe) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        }
+#endif
         // Files and text other applications drop on a window.
         SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
         SDL_EventState(SDL_DROPTEXT, SDL_ENABLE);
@@ -2606,7 +2624,8 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     klioScriptTick(kw->script, kw->events);
     if (!kw->frameReport.reported) klioSdlReportFrame(kw);
     klioAtkPump();
-    int wait = timeoutMs;
+    klioWakePosted().store(false);
+    int wait = klioScriptWaitCap(timeoutMs);
     while (kw->events.empty()) {
         SDL_Event ev;
         // With the accessibility bridge up, the wait is cut into slices so
@@ -2735,6 +2754,24 @@ static SDL_Cursor* klioSdlCursor(int kind) {
 
 // The cursor over the window's content. SDL's cursor is the mouse's, so a
 // window sets it as the pointer's hover over it asks.
+// Wakes the window loop from any thread: SDL's wait ends on the pushed event,
+// the X11 wait on the pipe.
+void klio_app_wake(void) {
+    if (klioWakePosted().exchange(true)) return;
+    if (klioSdlWakeType) {
+        SDL_Event e;
+        SDL_zero(e);
+        e.type = klioSdlWakeType;
+        SDL_PushEvent(&e);
+    }
+#if !defined(_WIN32)
+    if (klioWakePipe[1] >= 0) {
+        const char b = 1;
+        (void)!write(klioWakePipe[1], &b, 1);
+    }
+#endif
+}
+
 // The refresh rate of the display the window is on, in frames a second (0
 // where SDL does not know it).
 int klio_win_refresh_hz(KlioWindow* kw) {
@@ -3779,20 +3816,28 @@ static void klioXdndDetach(KlioWindow* kw) {
 // Whether the windows' poll serves the shim's X connection as it waits.
 static bool klioXdndWatching() { return klioXdnd().ready; }
 
-// Waits up to ms for either connection, SDL's or the shim's, to have input.
+// Waits up to ms for either connection, SDL's or the shim's, to have input,
+// or for the loop's wake.
 static void klioXdndWaitInput(int ms) {
     KlioXdnd& d = klioXdnd();
     KlioX11* x = klioX11();
     const int ours = x->ConnectionNumber_(klioX11Display());
     const int sdls = d.sdlDpy ? x->ConnectionNumber_(d.sdlDpy) : -1;
+    const int wake = klioWakePipe[0];
     fd_set set;
     FD_ZERO(&set);
     FD_SET(ours, &set);
     if (sdls >= 0) FD_SET(sdls, &set);
+    if (wake >= 0) FD_SET(wake, &set);
     timeval tv;
     tv.tv_sec = ms / 1000;
     tv.tv_usec = (ms % 1000) * 1000;
-    select(std::max(ours, sdls) + 1, &set, nullptr, nullptr, &tv);
+    select(std::max({ours, sdls, wake}) + 1, &set, nullptr, nullptr, &tv);
+    if (wake >= 0 && FD_ISSET(wake, &set)) {
+        char drain[64];
+        while (read(wake, drain, sizeof drain) > 0) {
+        }
+    }
 }
 
 // A window drawn from a Skia raster surface: the tray icon, its menu, its
@@ -4311,6 +4356,7 @@ int klio_tray_poll_event(void* h, double* out) {
 
 // Waits for the trays' X events for up to the timeout.
 void klio_app_wait(int timeoutMs) {
+    timeoutMs = klioScriptWaitCap(timeoutMs);
     KlioX11* x = klioX11();
     Display* dpy = klioTrays().empty() ? nullptr : klioX11Display();
     if (!x || !dpy) {
@@ -4319,13 +4365,21 @@ void klio_app_wait(int timeoutMs) {
     }
     if (x->Pending(dpy)) return;
     const int fd = x->ConnectionNumber_(dpy);
+    const int wake = klioWakePipe[0];
+    klioWakePosted().store(false);
     fd_set set;
     FD_ZERO(&set);
     FD_SET(fd, &set);
+    if (wake >= 0) FD_SET(wake, &set);
     timeval tv;
     tv.tv_sec = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
-    select(fd + 1, &set, nullptr, nullptr, &tv);
+    select(std::max(fd, wake) + 1, &set, nullptr, nullptr, &tv);
+    if (wake >= 0 && FD_ISSET(wake, &set)) {
+        char drain[64];
+        while (read(wake, drain, sizeof drain) > 0) {
+        }
+    }
 }
 #else
 // No tray icons: the desktop's Tray says so on standard error.
@@ -4338,6 +4392,7 @@ void klio_tray_set_menu(void*, const char*, size_t) {}
 void klio_tray_notify(void*, const char*, size_t, const char*, size_t, int) {}
 int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
 void klio_app_wait(int timeoutMs) {
+    timeoutMs = klioScriptWaitCap(timeoutMs);
     if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
 }
 #endif  // KLIO_X11
@@ -5953,8 +6008,12 @@ static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 extern "C" {
 
+// The thread the windows run on, which a wake posts to.
+static DWORD klioWinUiThread = 0;
+
 KlioWindow* klio_win_open(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return nullptr;
+    klioWinUiThread = GetCurrentThreadId();
     // UI Automation calls the window's providers through its COM apartment,
     // and OLE's drag and drop needs the thread's OLE.
     OleInitialize(nullptr);
@@ -6066,9 +6125,10 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     klioScriptTick(kw->script, kw->events);
     if (!kw->frameReport.reported) klioWinReportFrame(kw);
     if (!kw->events.empty()) return klioWinPop(kw, out);
+    klioWakePosted().store(false);
     MSG msg;
     if (!PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(timeoutMs), QS_ALLINPUT);
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(klioScriptWaitCap(timeoutMs)), QS_ALLINPUT);
     }
     while (kw->events.empty() && PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
@@ -6416,6 +6476,7 @@ int klio_tray_poll_event(void* t, double* out) {
 // Runs the thread's messages for up to the timeout, while no window's poll
 // runs them (an application with only a tray).
 void klio_app_wait(int timeoutMs) {
+    timeoutMs = klioScriptWaitCap(timeoutMs);
     MSG msg;
     if (!PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
         MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(timeoutMs), QS_ALLINPUT);
@@ -6556,6 +6617,13 @@ int klio_win_drag_start(KlioWindow* kw, const char* payload, size_t len, const u
 
 // The cursor over the window's client area: WM_SETCURSOR's from now on, and
 // at once while the pointer is over it.
+// Wakes the window loop from any thread: a message posted to its thread ends
+// its wait.
+void klio_app_wake(void) {
+    if (!klioWinUiThread || klioWakePosted().exchange(true)) return;
+    PostThreadMessageW(klioWinUiThread, WM_APP + 0x2F, 0, 0);
+}
+
 // The refresh rate of the monitor the window is on, in frames a second.
 int klio_win_refresh_hz(KlioWindow* kw) {
     if (!kw || !kw->hwnd) return 0;
@@ -7993,8 +8061,9 @@ int klio_win_poll_event(KlioWindow* kw, int timeoutMs, double* out) {
     if (kw->dndAsk.kind) klioDndAnswer(kw, 0);
     klioScriptTick(kw->script, kw->events);
     if (!kw->events.empty()) return klioCocoaPop(kw, out);
+    klioWakePosted().store(false);
     @autoreleasepool {
-        NSDate* until = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
+        NSDate* until = [NSDate dateWithTimeIntervalSinceNow:klioScriptWaitCap(timeoutMs) / 1000.0];
         while (kw->events.empty()) {
             NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
                                              untilDate:until
@@ -8172,6 +8241,24 @@ static NSCursor* klioCocoaCursor(int kind) {
 
 // The cursor over the window's content: its cursor rect's from now on, and
 // at once while the pointer is over the content.
+// Wakes the window loop from any thread: an application-defined event ends
+// its wait, and no window takes it.
+void klio_app_wake(void) {
+    if (klioWakePosted().exchange(true)) return;
+    @autoreleasepool {
+        NSEvent* e = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                        location:NSZeroPoint
+                                   modifierFlags:0
+                                       timestamp:0
+                                    windowNumber:0
+                                         context:nil
+                                         subtype:0
+                                           data1:0
+                                           data2:0];
+        [NSApp postEvent:e atStart:NO];
+    }
+}
+
 // The refresh rate of the display the window is on (a ProMotion display's
 // highest), in frames a second.
 int klio_win_refresh_hz(KlioWindow* kw) {
@@ -8917,6 +9004,7 @@ int klio_tray_poll_event(void* t, double* out) {
 // Runs the application's events for up to the timeout, while no window's
 // poll runs them (an application with only a tray).
 void klio_app_wait(int timeoutMs) {
+    timeoutMs = klioScriptWaitCap(timeoutMs);
     @autoreleasepool {
         [NSApplication sharedApplication];
         NSDate* until = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
@@ -9199,6 +9287,7 @@ void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
 int klio_win_refresh_hz(void*) { return 0; }
+void klio_app_wake(void) {}
 void klio_win_set_cursor(void*, int) {}
 void klio_win_dnd_accept(void*, int) {}
 int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
@@ -9229,6 +9318,7 @@ void klio_tray_set_menu(void*, const char*, size_t) {}
 void klio_tray_notify(void*, const char*, size_t, const char*, size_t, int) {}
 int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
 void klio_app_wait(int timeoutMs) {
+    timeoutMs = klioScriptWaitCap(timeoutMs);
     if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
 }
 void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
@@ -9455,6 +9545,7 @@ void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
 int klio_win_refresh_hz(void*) { return 0; }
+void klio_app_wake(void) {}
 void klio_win_set_cursor(void*, int) {}
 void klio_win_dnd_accept(void*, int) {}
 int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
@@ -9485,6 +9576,7 @@ void klio_tray_set_menu(void*, const char*, size_t) {}
 void klio_tray_notify(void*, const char*, size_t, const char*, size_t, int) {}
 int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
 void klio_app_wait(int timeoutMs) {
+    timeoutMs = klioScriptWaitCap(timeoutMs);
     if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
 }
 void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
@@ -9515,6 +9607,7 @@ void klio_order_emoji_palette(void) {}
 int klio_a11y_active(void*) { return 0; }
 void klio_a11y_update(void*, const char*, size_t) {}
 int klio_win_refresh_hz(void*) { return 0; }
+void klio_app_wake(void) {}
 void klio_win_set_cursor(void*, int) {}
 void klio_win_dnd_accept(void*, int) {}
 int klio_win_drag_start(void*, const char*, size_t, const unsigned char*, size_t, int, int, int) { return 0; }
@@ -9546,6 +9639,7 @@ void klio_tray_set_menu(void*, const char*, size_t) {}
 void klio_tray_notify(void*, const char*, size_t, const char*, size_t, int) {}
 int klio_tray_poll_event(void*, double*) { return KLIO_EV_NONE; }
 void klio_app_wait(int timeoutMs) {
+    timeoutMs = klioScriptWaitCap(timeoutMs);
     if (timeoutMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
 }
 void klio_win_set_resize_cb(void*, void (*)(void*, int, int), void*) {}

@@ -121,6 +121,8 @@ pub fn notifyWallUnblock() void {
 
 pub fn requestAbandon() void {
     abandon_requested.store(true, .release);
+    // Threads parked on a gate, or asleep, see the request now.
+    @import("clock.zig").ringParkedGates();
 }
 
 pub fn clearAbandon() void {
@@ -134,6 +136,7 @@ var run_boundary_abandon = std.atomic.Value(bool).init(false);
 
 pub fn setRunBoundaryAbandon(on: bool) void {
     run_boundary_abandon.store(on, .release);
+    if (on) @import("clock.zig").ringParkedGates();
 }
 
 /// The test runner consults this after a test to know a wall-cap abort fired

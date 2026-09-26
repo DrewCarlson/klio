@@ -36,6 +36,8 @@
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
+#include <algorithm>
+#include <atomic>
 #include <deque>
 #include <string>
 #include <thread>
@@ -776,6 +778,21 @@ inline KlioEv klioDndEv(int kind, double x, double y, int actions, const std::st
     e.v[4] = ask;
     e.text = payload;
     return e;
+}
+
+// Whether a wake of the window loop (klio_app_wake) is posted and not yet
+// taken: a loop about to wait clears it, so wakes posted while it runs
+// coalesce into one.
+inline std::atomic<bool>& klioWakePosted() {
+    static std::atomic<bool> posted{false};
+    return posted;
+}
+
+// Scripted input comes at a window's polls and times, so while a script runs
+// a poll waits no longer than a frame: the polls keep the pace the scripts
+// were written against.
+inline int klioScriptWaitCap(int timeoutMs) {
+    return klioScript().empty() ? timeoutMs : std::min(timeoutMs, 16);
 }
 
 // The action a drag takes of those it offers, as a desktop drag takes its

@@ -34,6 +34,22 @@ fn gateWaitBrief(wakeup: *const ObjRef(DriverWakeup), cap_us: u64) void {
     if (!nonempty) gp.waitFrom(seen, cap_us);
 }
 
+/// How long an idle pump waits on its own gate at once. A pump with pumps
+/// under it on its thread waits in slices, as a hand-over request for a
+/// coroutine one of those holds rings theirs, not its gate; a lone pump waits
+/// until a post, a failed pool task or abandonment rings it, and, under a
+/// test's wall-clock watchdog, no longer than its deadline, which its idle
+/// arms check (the timer thread serves every test and answers to none).
+fn idleSliceUs(slice_us: u64) u64 {
+    if (coro_stack.items.len > 1) return slice_us;
+    const top = coroTop() orelse return runtime.EventGate.forever;
+    if (top.timer_service) return runtime.EventGate.forever;
+    const wall_dl = ir.eval.test_wall_deadline_ms.load(.monotonic);
+    if (wall_dl == 0) return runtime.EventGate.forever;
+    const left = wall_dl - ir.eval.nowMonotonicMs();
+    return if (left <= 0) 0 else @as(u64, @intCast(left)) *| 1_000 +| 1_000;
+}
+
 fn sleepMillis(millis: u64) void {
     runtime.clockSleepMillis(@intCast(@min(millis, @as(u64, std.math.maxInt(i64)))));
 }
@@ -1099,7 +1115,7 @@ pub fn driveTimerService(self: anytype, out: Output) Allocator.Error!void {
                 break :blk w.get().mailboxNonEmpty();
             };
             if (has_resume) continue;
-            gp.waitFrom(seen, 100_000);
+            gp.waitFrom(seen, runtime.EventGate.forever);
         };
         TimerService.detach();
         if (outcome) |r| {
@@ -1624,8 +1640,8 @@ pub const CooperativeInterceptor = struct {
             .Wall => {
                 const wait = @max(t - self.nowMillis(), 0);
                 if (wait > 0) {
-                    // Sleep in slices: the pump must keep draining its mailbox so a
-                    // resume can preempt the timer, and keep observing abandonment.
+                    // Wait for the timer on the pump's gate: a resume posted to the
+                    // mailbox, or abandonment, rings it first.
                     countSleep(.timer_wall);
                     wall_streak += 1;
                     if (!pumpNoSleep()) {
@@ -1650,10 +1666,10 @@ pub const CooperativeInterceptor = struct {
                                 // Hand over what another thread asks for from
                                 // the pumps under this one before sleeping.
                                 try serveOwnSurrenders();
-                                // At most 2 ms a slice, clamped before it is
-                                // scaled: a wait can be most of the clock's range.
-                                const cap_us: u64 = @as(u64, @intCast(@min(wait, 2))) * 1_000;
-                                gp.waitFrom(seen, cap_us);
+                                // Until the deadline, or a 2 ms slice under
+                                // nested pumps (idleSliceUs).
+                                const until_us: u64 = @as(u64, @intCast(wait)) *| 1_000;
+                                gp.waitFrom(seen, @min(until_us, idleSliceUs(2_000)));
                             }
                         }
                     }
@@ -2633,7 +2649,7 @@ fn pumpLoop(
             // on this thread holds parked; that pump cannot answer while this
             // one runs above it.
             try serveOwnSurrenders();
-            gateWaitBrief(&wakeup, 1_000);
+            gateWaitBrief(&wakeup, idleSliceUs(1_000));
             _ = try drainWakeupInto(a, &wakeup, coroTop().?);
             continue;
         }
@@ -2699,7 +2715,7 @@ fn pumpLoop(
             // outer pump on this thread holds parked, as an unconfined
             // dispatcher's resume from there runs there.
             try serveOwnSurrenders();
-            gateWaitBrief(&wakeup, 1_000);
+            gateWaitBrief(&wakeup, idleSliceUs(1_000));
             continue;
         }
 

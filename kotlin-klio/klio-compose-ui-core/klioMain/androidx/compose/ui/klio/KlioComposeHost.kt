@@ -187,7 +187,8 @@ internal class KlioPlatformContext(
 internal class KlioRecomposerDriver(
     private val loop: androidx.compose.ui.window.KlioLoopDispatcher? = null,
 ) {
-    private val frameClock = BroadcastFrameClock()
+    // A frame awaited from another thread wakes the window loop.
+    private val frameClock = BroadcastFrameClock { loop?.wake() }
     private val effectScope = CoroutineScope(frameClock + (loop ?: Dispatchers.Unconfined))
     val recomposer = Recomposer(effectScope.coroutineContext)
     private val runner = effectScope.launch { recomposer.runRecomposeAndApplyChanges() }

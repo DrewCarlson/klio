@@ -136,7 +136,11 @@ internal class KlioApplication(
             windowDragAndDrop = if (hosted) null else KlioWindowDragAndDrop(handle),
         )
         var holder: KlioWindowHolder? = null
-        val invalidate = { holder?.dirty = true }
+        // An invalidation from another thread wakes the window loop.
+        val invalidate: () -> Unit = {
+            holder?.dirty = true
+            loop?.wake()
+        }
         val frameRecomposer = FrameRecomposer(driver.dispatcherContext, invalidate)
         val scene = CanvasLayersComposeScene(
             frameRecomposer = frameRecomposer,
@@ -273,17 +277,22 @@ private fun runApplication(content: @Composable ApplicationScope.() -> Unit): Bo
             if (driver.frame()) {
                 for (win in app.windows) win.dirty = true
             }
-            for (win in live) {
-                if (win.needsRender) renderWindowFrame(win)
+            // The frame may have closed windows, or opened them.
+            for (win in app.windows.toList()) {
+                if (!win.closed && win.needsRender) renderWindowFrame(win)
             }
             pacer.framed(now)
         }
-        val timeout = loopTimeout(clock, driver, live, pacer)
+        // Marked as waiting before the wait is worked out, so work dispatched
+        // and timers set from here on wake the wait.
+        val waits = clock.beginWait()
+        val timeout = if (waits) loopTimeout(clock, driver, live, pacer) else 0
         if (live.isEmpty()) {
             // No window to wait on: wait for the loop's next timer, or a frame,
-            // running the platform's events for the trays meanwhile.
+            // running the platform's events for the trays meanwhile. Only the
+            // platform's wait ends at a wake.
             if (!driver.hasPendingWork) {
-                if (app.trays.isEmpty()) runBlocking { delay(timeout.toLong()) }
+                if (app.trays.isEmpty()) runBlocking { delay(minOf(timeout, WAIT_CAP_MILLIS.toInt()).toLong()) }
                 else __composeui_appWait(timeout)
             }
         } else {
@@ -295,6 +304,7 @@ private fun runApplication(content: @Composable ApplicationScope.() -> Unit): Bo
                 wait = 0
             }
         }
+        if (waits) clock.endWait()
         for (tray in app.trays.toList()) tray.poll()
     }
     for (win in app.windows.toList()) app.close(win)
@@ -305,8 +315,8 @@ private fun runApplication(content: @Composable ApplicationScope.() -> Unit): Bo
 
 /**
  * How long a window loop waits for input: not at all while work is queued,
- * and no longer than the loop's next timer, than the next frame while one
- * is wanted, or than [WAIT_CAP_MILLIS].
+ * and no longer than the loop's next timer, or than the next frame while one
+ * is wanted; with neither, until input or a wake comes.
  */
 private fun loopTimeout(
     loop: KlioLoopDispatcher,
@@ -315,7 +325,7 @@ private fun loopTimeout(
     pacer: KlioFramePacer,
 ): Int {
     if (loop.hasTasks) return 0
-    var timeout = WAIT_CAP_MILLIS
+    var timeout = IDLE_WAIT_MILLIS
     loop.millisToNextTimer()?.let { timeout = minOf(timeout, it) }
     if (driver.wantsFrame || live.any { it.needsRender }) {
         timeout = minOf(timeout, pacer.nanosUntilDue(loop.nowNanos()) / 1_000_000L)
@@ -323,7 +333,10 @@ private fun loopTimeout(
     return timeout.toInt()
 }
 
-/** The longest a window loop waits for input at once, in milliseconds. */
+/** How long an idle window loop waits for input or a wake, in milliseconds. */
+private const val IDLE_WAIT_MILLIS = 60_000L
+
+/** The longest a wait no wake can end lasts, in milliseconds. */
 private const val WAIT_CAP_MILLIS = 16L
 
 /**

@@ -326,9 +326,9 @@ pub const Pool = struct {
                         // Closed and drained: the thread ends.
                         if (self.closing and self.queue_default.len() == 0 and self.queue_io.len() == 0) return;
                     }
-                    // Idle park; the 1ms cap paces the abandon poll and the wait is
-                    // GC-safe.
-                    self.gate.waitFrom(seen, 1_000);
+                    // Idle park until a post, a freed Default slot, the close
+                    // or the stop rings the gate; the wait is GC-safe.
+                    self.gate.waitFrom(seen, runtime.EventGate.forever);
                 }
             };
             in_pool_task = true;
@@ -350,6 +350,9 @@ pub const Pool = struct {
             }
             // A freed Default cap slot may unblock a parked sibling.
             self.gate.ring();
+            // A pump waiting on a coroutine the task will now never resume
+            // takes the error from its idle arm.
+            if (err != null and !abandoned) runtime.ringParkedGates();
         }
     }
 };
@@ -540,9 +543,12 @@ pub fn shutdownAndJoin() void {
 /// Records a failure of the run's own machinery outside any pool task (the
 /// timer thread's), surfaced at the run boundary as a task's would be.
 pub fn noteTaskError(e: RuntimeError) void {
-    global_pool.mutex.lock();
-    defer global_pool.mutex.unlock();
-    if (global_pool.first_error == null) global_pool.first_error = e;
+    {
+        global_pool.mutex.lock();
+        defer global_pool.mutex.unlock();
+        if (global_pool.first_error == null) global_pool.first_error = e;
+    }
+    runtime.ringParkedGates();
 }
 
 pub fn takeFirstError() ?RuntimeError {

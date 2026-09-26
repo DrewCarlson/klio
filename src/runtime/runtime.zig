@@ -233,6 +233,7 @@ pub var process_start_ns: u64 = 0;
 pub const clockSleepMillis = clock_mod.sleepMillis;
 pub const clockSleepMicros = clock_mod.sleepMicros;
 pub const EventGate = clock_mod.EventGate;
+pub const ringParkedGates = clock_mod.ringParkedGates;
 pub const janitor = @import("janitor.zig");
 
 pub const floatToString = float_fmt_mod.floatToString;
