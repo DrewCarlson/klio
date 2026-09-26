@@ -68,7 +68,10 @@ def run_one(klio, path, timeout, home):
         return name, "no-expected", ""
     with open(want_path, "r", encoding="utf-8", errors="replace") as f:
         want = f.read()
-    env = dict(os.environ)
+    # A clipboard of its own and a pinned locale, as corpus_check runs them:
+    # an example never touches the user's clipboard, and prints the same
+    # dates whatever the host's locale.
+    env = dict(os.environ, KLIO_CLIPBOARD="private", KLIO_LOCALE="en-US")
     if home:
         env["KLIO_HOME"] = home
     try:

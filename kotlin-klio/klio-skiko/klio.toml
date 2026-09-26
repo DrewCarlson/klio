@@ -1,0 +1,23 @@
+# org.jetbrains.skiko: skiko's Kotlin API over Skia (org.jetbrains.skia and
+# org.jetbrains.skiko), its commonMain vendored verbatim. Its natives are the
+# C glue built into the Skia shim, each bound under the C symbol its
+# @ExternalSymbolName names (src/skiko). klioMain has the actuals: the interop
+# (pointers are Longs, arrays and strings go through native memory), the
+# managed peers, and the platform queries.
+[library]
+id = "org.jetbrains.skiko"
+version = "0.150.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+binding_auto_prefixes = ["org.jetbrains.skia.", "org.jetbrains.skiko."]
+
+[[source]]
+root = "upstream/skiko/src/commonMain/kotlin"
+
+[[source]]
+root = "klioMain"
+
+[deps]
+stdlib = "*"
+"kotlinx.coroutines" = "*"

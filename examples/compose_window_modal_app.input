@@ -1,0 +1,11 @@
+# Scripted input for compose_window_modal_app.kt's windows (KLIO_WIN_INPUT): each
+# window gets these events, timed from its own first event poll. A click at
+# (220, 60) is in the windows' clickable part and outside the dialog; one at
+# (50, 50) is only in the dialog's. Then the windows' close buttons.
+300ms press 220 60
+350ms release 220 60
+700ms press 50 50
+750ms release 50 50
+1100ms press 220 60
+1150ms release 220 60
+1500ms close

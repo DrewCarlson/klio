@@ -12,7 +12,7 @@
 #   KLIO_SKIA_OS=windows KLIO_SKIA_ARCH=x64 scripts/fetch-skia.sh
 #
 # Each target extracts to its own dir so several can coexist (cross-compilation):
-#   third_party/skia/<os>-<arch>/{include,modules,out/Release-<os>-<arch>}
+#   third_party/skia/<os>-<arch>/{include,modules,src,third_party,out/Release-<os>-<arch>}
 # In a linked git worktree the directory is a link to the main checkout's copy
 # when that one is complete, so a worktree needs no download of its own.
 #
@@ -65,24 +65,28 @@ MAIN="${DEST}/out/Release-${ASSET_OS}-${ARCH}/libskia.${EXT}"
 # headers-only src/ tree is required to compile the shim. Use one such header as
 # the completeness sentinel: a checkout with libskia but no src/ is incomplete.
 SENTINEL="${DEST}/src/base/SkUTF.h"
+# skiko's C glue includes the ICU and HarfBuzz headers the archive carries
+# under third_party/ (the libraries themselves are in out/).
+THIRD_SENTINEL="${DEST}/third_party/externals/icu/source/common/unicode/utypes.h"
 
-if [ -f "${MAIN}" ] && [ -f "${SENTINEL}" ]; then
+if [ -f "${MAIN}" ] && [ -f "${SENTINEL}" ] && [ -f "${THIRD_SENTINEL}" ]; then
     echo "skia already present for ${OS}-${ARCH} at ${DEST}; nothing to do"
     exit 0
 fi
 
-# A linked git worktree uses the main checkout's copy when that one is
-# complete, instead of downloading its own.
+# A linked git worktree uses the main checkout's copy when that one has the
+# libraries and headers, instead of downloading its own (the third-party
+# headers are added to it below when it lacks them).
 MAIN_CHECKOUT="$(git -C "$(dirname "$0")/.." worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p' || true)"
 SHARED="${MAIN_CHECKOUT}/third_party/skia/${DIR_OS}-${ARCH}"
-if [ -n "${MAIN_CHECKOUT}" ] && [ "${SHARED}" != "${DEST}" ] \
+if [ ! -f "${MAIN}" ] && [ -n "${MAIN_CHECKOUT}" ] && [ "${SHARED}" != "${DEST}" ] \
     && [ -f "${SHARED}/out/Release-${ASSET_OS}-${ARCH}/libskia.${EXT}" ] \
     && [ -f "${SHARED}/src/base/SkUTF.h" ]; then
     mkdir -p "${ROOT}"
     rm -rf "${DEST}"
     ln -s "${SHARED}" "${DEST}"
     echo "skia for ${OS}-${ARCH} linked from the main checkout at ${SHARED}"
-    exit 0
+    if [ -f "${THIRD_SENTINEL}" ]; then exit 0; fi
 fi
 
 mkdir -p "${DEST}"
@@ -92,11 +96,19 @@ trap 'rm -rf "${TMP}"' EXIT
 echo "downloading ${ASSET} ..."
 curl -fsSL -o "${TMP}/skia.zip" "${URL}"
 
+if [ -f "${MAIN}" ] && [ -f "${SENTINEL}" ]; then
+    echo "extracting the third-party headers into ${DEST} ..."
+    unzip -q -o "${TMP}/skia.zip" "third_party/*" -d "${DEST}"
+    echo "skia ${SKIA_TAG} (${OS}-${ARCH}) third-party headers ready at ${DEST}"
+    exit 0
+fi
+
 echo "extracting headers + libs into ${DEST} ..."
-# include/ + modules/ (public headers), out/ (the static libs), and src/ (the
-# archive's headers-only internal tree, ~1.4MB — no .cpp). src/ is required:
-# the module public headers `#include "src/..."` internal headers, so a checkout
-# without it fails to compile the shim ('src/base/SkUTF.h' file not found).
-unzip -q -o "${TMP}/skia.zip" "include/*" "modules/*" "out/*" "src/*" -d "${DEST}"
+# include/ + modules/ (public headers), out/ (the static libs), src/ (the
+# archive's headers-only internal tree, ~1.4MB, no .cpp) and third_party/
+# (ICU, HarfBuzz and FreeType headers, ~30MB). src/ is required: the module
+# public headers `#include "src/..."` internal headers, so a checkout without
+# it fails to compile the shim ('src/base/SkUTF.h' file not found).
+unzip -q -o "${TMP}/skia.zip" "include/*" "modules/*" "out/*" "src/*" "third_party/*" -d "${DEST}"
 
 echo "skia ${SKIA_TAG} (${OS}-${ARCH}) ready at ${DEST}"

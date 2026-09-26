@@ -1,0 +1,3 @@
+dialog clicked: it closes
+the dialog's window took clicks while the dialog was: [closed]
+the other window took clicks while the dialog was: [open, closed]

@@ -1857,6 +1857,17 @@ void klio_skia_c_draw_point(KlioSurface* s, float x, float y, uint32_t argb, flo
 // one or the $KLIO_SKIA_DUMP_AT-th, so a window's render (a GPU one included,
 // and a drawn menu bar with its open menus) can be inspected without
 // on-screen capture. A path with %d writes every frame, numbered from 1.
+// Why the last klio_win_open returned null, which the program reports.
+static std::string g_klioWinError;
+
+[[maybe_unused]] static void klioWinFailed(const std::string& why) {
+    g_klioWinError = why;
+}
+
+extern "C" const char* klio_win_last_error(void) {
+    return g_klioWinError.c_str();
+}
+
 [[maybe_unused]] static void klioPresentDump(KlioSurface* surface) {
     const char* dump = std::getenv("KLIO_SKIA_DUMP");
     if (!dump || !surface) return;
@@ -2111,7 +2122,10 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return nullptr;
     SDL_SetMainReady();
     if (!klioSdlWindowsHoldVideo) {
-        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) return nullptr;
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+            klioWinFailed(std::string("SDL could not start its video subsystem: ") + SDL_GetError());
+            return nullptr;
+        }
         klioSdlWindowsHoldVideo = true;
     }
 #if defined(KLIO_GPU)
@@ -2128,11 +2142,15 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     SDL_Window* win = SDL_CreateWindow(title ? title : "klio", SDL_WINDOWPOS_CENTERED,
                                        SDL_WINDOWPOS_CENTERED, w, h,
                                        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-    if (!win) return nullptr;
+    if (!win) {
+        klioWinFailed(std::string("SDL could not create a window: ") + SDL_GetError());
+        return nullptr;
+    }
     // Prefer an accelerated renderer; fall back to software if none is available.
     SDL_Renderer* r = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     if (!r) r = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     if (!r) {
+        klioWinFailed(std::string("SDL could not create a renderer: ") + SDL_GetError());
         SDL_DestroyWindow(win);
         return nullptr;
     }
@@ -3874,6 +3892,18 @@ void klio_win_set_flag(KlioWindow* kw, int which, int value) {
                 else SDL_RestoreWindow(kw->win);
             }
             break;
+        case KLIO_WIN_FRONT:
+            SDL_RaiseWindow(kw->win);
+            break;
+        case KLIO_WIN_TRANSPARENT:
+            if (value) {
+                static bool told = false;
+                if (!told) {
+                    std::fprintf(stderr, "klio: SDL2 windows have no per-pixel transparency; a transparent window shows its unpainted pixels black\n");
+                    told = true;
+                }
+            }
+            break;
         default:
             break;
     }
@@ -4101,6 +4131,7 @@ struct KlioWindow {
     HMENU menu = nullptr;       // the menu bar klio_win_set_menu made
     std::vector<KlioMenuEntry> menuEntries;
     std::vector<HBITMAP> menuBitmaps;  // its items' icons
+    bool layered = false;       // transparent: presented with its alpha
 };
 
 // A menu item's command: its entry's index past this base.
@@ -4385,7 +4416,10 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     HWND hwnd = CreateWindowA(kClass, title ? title : "klio", WS_OVERLAPPEDWINDOW,
                               CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                               r.bottom - r.top, nullptr, nullptr, inst, nullptr);
-    if (!hwnd) return nullptr;
+    if (!hwnd) {
+        klioWinFailed("Windows could not create a window (error " + std::to_string(GetLastError()) + ")");
+        return nullptr;
+    }
     auto* kw = new KlioWindow{hwnd, w, h, nullptr, 0, 0, 0, false, {}, 0, false, 0};
     kw->surface = klio_skia_new(w, h);
     if (!kw->surface) {
@@ -4401,11 +4435,50 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
 
 KlioSurface* klio_win_surface(KlioWindow* kw) { return kw ? kw->surface : nullptr; }
 
+// Presents a transparent window: a layered window takes its frame's
+// premultiplied BGRA pixels, alpha included, as N32 on Windows lays them out.
+static void klioWinPresentLayered(KlioWindow* kw, const SkPixmap& pm) {
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = kw->w;
+    bmi.bmiHeader.biHeight = -kw->h;  // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bmp && bits) {
+        for (int y = 0; y < kw->h; y++) {
+            std::memcpy(static_cast<char*>(bits) + static_cast<size_t>(y) * kw->w * 4,
+                        static_cast<const char*>(pm.addr()) + static_cast<size_t>(y) * pm.rowBytes(),
+                        static_cast<size_t>(kw->w) * 4);
+        }
+        HGDIOBJ old = SelectObject(mem, bmp);
+        RECT r;
+        GetWindowRect(kw->hwnd, &r);
+        POINT dst = {r.left, r.top};
+        SIZE size = {kw->w, kw->h};
+        POINT src = {0, 0};
+        BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UpdateLayeredWindow(kw->hwnd, screen, &dst, &size, mem, &src, 0, &blend, ULW_ALPHA);
+        SelectObject(mem, old);
+    }
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+}
+
 void klio_win_present(KlioWindow* kw) {
     if (!kw || !kw->surface) return;
     klioPresentDump(kw->surface);
     SkPixmap pm;
     if (!kw->surface->surface->peekPixels(&pm)) return;
+    if (kw->layered) {
+        klioWinPresentLayered(kw, pm);
+        return;
+    }
     HDC hdc = GetDC(kw->hwnd);
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -4901,6 +4974,16 @@ void klio_win_set_flag(KlioWindow* kw, int which, int value) {
             }
             klioWinReportFrame(kw);
             break;
+        case KLIO_WIN_FRONT:
+            BringWindowToTop(h);
+            SetForegroundWindow(h);
+            break;
+        case KLIO_WIN_TRANSPARENT: {
+            const LONG_PTR ex = GetWindowLongPtr(h, GWL_EXSTYLE);
+            SetWindowLongPtr(h, GWL_EXSTYLE, value ? (ex | WS_EX_LAYERED) : (ex & ~static_cast<LONG_PTR>(WS_EX_LAYERED)));
+            kw->layered = value != 0;
+            break;
+        }
         default:
             break;
     }
@@ -5852,7 +5935,10 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
                                  NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
                         backing:NSBackingStoreBuffered
                           defer:NO];
-        if (!window) return nullptr;
+        if (!window) {
+            klioWinFailed("AppKit could not create a window");
+            return nullptr;
+        }
         [window setReleasedWhenClosed:NO];  // we own its lifetime (non-ARC)
         if (title) [window setTitle:[NSString stringWithUTF8String:title]];
         NSView* view = [window contentView];
@@ -6133,6 +6219,18 @@ void klio_win_set_flag(KlioWindow* kw, int which, int value) {
                 if (value == KLIO_PLACEMENT_FLOATING && [w isZoomed]) [w zoom:nil];
                 break;
             }
+            case KLIO_WIN_FRONT:
+                [NSApp activateIgnoringOtherApps:YES];
+                [w makeKeyAndOrderFront:nil];
+                break;
+            case KLIO_WIN_TRANSPARENT:
+                [w setOpaque:value ? NO : YES];
+                [w setBackgroundColor:value ? [NSColor clearColor] : [NSColor windowBackgroundColor]];
+                kw->view.layer.opaque = value ? NO : YES;
+#if defined(KLIO_METAL)
+                if (kw->metalLayer) kw->metalLayer.opaque = value ? NO : YES;
+#endif
+                break;
             default:
                 break;
         }
@@ -6686,7 +6784,10 @@ void klio_win_close(KlioWindow* kw) {
 // The OS owns the run loop on iOS: no shim-side window creation or event poll.
 // These satisfy the C ABI the interpreter resolves; input arrives via the app's
 // UITouch handling, not a poll.
-KlioWindow* klio_win_open(int, int, const char*) { return nullptr; }
+KlioWindow* klio_win_open(int, int, const char*) {
+    klioWinFailed("iOS gives an application its window; it cannot open another");
+    return nullptr;
+}
 int klio_win_poll(void*, int, int*, int*) { return 0; }
 int klio_win_poll_event(void*, int, double*) { return KLIO_EV_NONE; }
 void klio_win_post_event(void*, int, const double*) {}
@@ -6926,7 +7027,10 @@ void klio_win_close(KlioWindow* kw) {
 }
 
 // The OS owns the run loop on Android: no shim-side window creation or poll.
-KlioWindow* klio_win_open(int, int, const char*) { return nullptr; }
+KlioWindow* klio_win_open(int, int, const char*) {
+    klioWinFailed("Android gives an application its window; it cannot open another");
+    return nullptr;
+}
 int klio_win_poll(void*, int, int*, int*) { return 0; }
 int klio_win_poll_event(void*, int, double*) { return KLIO_EV_NONE; }
 void klio_win_post_event(void*, int, const double*) {}
@@ -6967,7 +7071,10 @@ char* klio_host_locale(void) { return nullptr; }
 #else  // no windowing backend (offscreen/raster only)
 
 extern "C" {
-void* klio_win_open(int, int, const char*) { return nullptr; }
+void* klio_win_open(int, int, const char*) {
+    klioWinFailed("this Skia shim was built without a window backend (on Linux, install libsdl2-dev and rebuild it)");
+    return nullptr;
+}
 void* klio_win_attach(void*, int, int, double) { return nullptr; }
 void* klio_win_surface(void*) { return nullptr; }
 void klio_win_present(void*) {}

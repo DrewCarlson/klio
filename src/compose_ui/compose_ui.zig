@@ -45,6 +45,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("klio.compose.ui.__composeui_winPresent", winPresent);
     try b.register("klio.compose.ui.__composeui_winClear", winClear);
     try b.register("androidx.compose.ui.window.__composeui_winOpen", winOpen);
+    try b.register("androidx.compose.ui.window.__composeui_winOpenError", winOpenError);
     try b.register("androidx.compose.ui.window.__composeui_winProbe", winProbe);
     try b.register("androidx.compose.ui.window.__composeui_winSetTitle", winSetTitle);
     try b.register("androidx.compose.ui.window.__composeui_winSetSize", winSetSize);
@@ -291,6 +292,7 @@ const Skia = struct {
     winSetIconSurface: ?*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void,
     winSetMenu: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
     winSetMenuIcon: ?*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void,
+    winLastError: ?*const fn () callconv(.c) [*:0]const u8,
     tray: TrayFns,
     clipChangeCount: ?ClipChangeCountFn,
     clipGetText: ?ClipGetTextFn,
@@ -609,6 +611,7 @@ fn loadSkia() ?*Skia {
         .winSetIconSurface = lib.lookup(*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void, "klio_win_set_icon_surface"),
         .winSetMenu = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_menu"),
         .winSetMenuIcon = lib.lookup(*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void, "klio_win_set_menu_icon"),
+        .winLastError = lib.lookup(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
         .tray = TrayFns.fromLib(&lib),
         .clipChangeCount = lib.lookup(ClipChangeCountFn, "klio_clip_change_count"),
         .clipGetText = lib.lookup(ClipGetTextFn, "klio_clip_get_text"),
@@ -723,6 +726,7 @@ fn loadSkiaStatic() ?*Skia {
         .winSetIconSurface = externSym(*const fn (?*SkWindow, ?*SkSurface) callconv(.c) void, "klio_win_set_icon_surface"),
         .winSetMenu = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_menu"),
         .winSetMenuIcon = externSym(*const fn (?*SkWindow, c_int, ?*SkSurface) callconv(.c) void, "klio_win_set_menu_icon"),
+        .winLastError = externSym(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
         .tray = TrayFns.fromExtern(),
         .clipChangeCount = externSym(ClipChangeCountFn, "klio_clip_change_count"),
         .clipGetText = externSym(ClipGetTextFn, "klio_clip_get_text"),
@@ -770,6 +774,14 @@ fn openSkiaLib() ?std.DynLib {
         if (openSkiaAt(p)) |l| return l;
     }
     return null;
+}
+
+/// A symbol of the loaded Skia shim by name (skiko's glue natives), or null
+/// without the shim or the symbol. A statically linked shim answers null.
+pub fn skiaSymbol(name: [:0]const u8) ?*anyopaque {
+    const s = loadSkia() orelse return null;
+    if (comptime use_static_skia) return null;
+    return s.lib.lookup(*anyopaque, name);
 }
 
 /// Opens the shim at `path`. A shim that is there but does not load (a
@@ -1148,9 +1160,20 @@ fn winProbe(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
+/// Why the last window open failed, for the program's error.
+var win_open_error: []const u8 = "";
+var win_open_error_buf: [512]u8 = undefined;
+
+fn winOpenError(ctx: *CallCtx) Error!EvalResult {
+    return ok(.{ .String = try runtime.strInit(ctx.allocator, win_open_error) });
+}
+
 fn winOpen(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3 or ctx.args[2] != .String) return ok(Value.newLong(0));
-    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const skia = loadSkia() orelse {
+        win_open_error = "no Skia shim is loaded (build it with `zig build skia-lib`)";
+        return ok(Value.newLong(0));
+    };
     const w: c_int = @intCast(@max(1, argInt(ctx.args[0])));
     const h: c_int = @intCast(@max(1, argInt(ctx.args[1])));
     const tg = ctx.args[2].String.borrow();
@@ -1166,7 +1189,14 @@ fn winOpen(ctx: *CallCtx) Error!EvalResult {
     if (surface_layer) |layer| {
         if (skia.winAttach) |attach| win_opt = attach(layer, w, h, surface_scale);
     }
-    const win = (win_opt orelse skia.winOpen(w, h, title_z.ptr)) orelse return ok(Value.newLong(0));
+    const win = (win_opt orelse skia.winOpen(w, h, title_z.ptr)) orelse {
+        const why: []const u8 = if (skia.winLastError) |f| std.mem.span(f()) else "";
+        win_open_error = if (why.len == 0)
+            "the Skia shim could not open a window"
+        else
+            std.fmt.bufPrint(&win_open_error_buf, "{s}", .{why}) catch why[0..@min(why.len, win_open_error_buf.len)];
+        return ok(Value.newLong(0));
+    };
     if (window_icon_png) |png| {
         if (skia.winSetIconPng) |set_icon| set_icon(win, png.ptr, png.len);
     }
@@ -1667,7 +1697,7 @@ fn clipSetText(ctx: *CallCtx) Error!EvalResult {
 /// language with the current region), iOS and Windows (the user's UI
 /// language); else LC_ALL, LC_MESSAGES or LANG, read as the JVM reads a
 /// POSIX locale name.
-fn hostLocale(ctx: *CallCtx) Error!EvalResult {
+pub fn hostLocale(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (runtime.envOnce("KLIO_LOCALE")) |tag| {
         if (tag.len > 0) return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, tag)) });
@@ -1711,7 +1741,7 @@ fn textInput(ctx: *CallCtx) Error!EvalResult {
 
 /// The host OS, as a lowercase name. foundation's `DesktopPlatform` needs it:
 /// macOS binds the text shortcuts to Meta while Linux and Windows bind Ctrl.
-fn hostOs(ctx: *CallCtx) Error!EvalResult {
+pub fn hostOs(ctx: *CallCtx) Error!EvalResult {
     const name = switch (@import("builtin").os.tag) {
         .linux => "linux",
         .macos => "macos",
@@ -2620,7 +2650,22 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetMenu") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_trayPollEvent") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_appWait") != null);
-    try testing.expectEqual(@as(usize, 136), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winOpenError") != null);
+    try testing.expectEqual(@as(usize, 137), b.len());
+}
+
+test "a window that cannot open says why" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    win_open_error = "SDL could not create a window: no display";
+    var ctx: CallCtx = undefined;
+    ctx.allocator = arena.allocator();
+    ctx.args = &.{};
+    const r = try winOpenError(&ctx);
+    const g = r.ok.String.borrow();
+    defer g.deinit();
+    try testing.expectEqualStrings("SDL could not create a window: no display", g.get().bytes);
+    win_open_error = "";
 }
 
 test "a POSIX locale name reads as the JVM reads it" {

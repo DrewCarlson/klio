@@ -37,7 +37,10 @@ EXAMPLES=(
   compose_window_clipboard
   compose_window_lifetime
   compose_window_menu
+  compose_window_modal
+  compose_window_modal_app
   compose_window_state
+  compose_window_transparent
   compose_multiwindow
   compose_material3_text
   compose_foundation_draw

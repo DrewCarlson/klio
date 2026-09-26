@@ -50,6 +50,8 @@ const mod_list = [_]Mod{
     .{ .name = "kotlinx_serialization", .deps = &.{ "runtime", "stdlib" }, .tested = true },
     .{ .name = "compose_runtime", .deps = &.{ "runtime", "stdlib" }, .tested = true },
     .{ .name = "compose_ui", .deps = &.{ "runtime", "stdlib" }, .tested = true },
+    // org.jetbrains.skia's natives over skiko's C glue in the Skia shim.
+    .{ .name = "skiko", .deps = &.{ "runtime", "stdlib", "compose_ui" }, .tested = true },
     // The TLS test certificates under tests/fixtures/tls, embedded for the
     // TLS engine's unit tests.
     .{ .name = "tls_fixtures", .src = "tests/fixtures/tls/fixtures.zig" },
@@ -64,7 +66,7 @@ const mod_list = [_]Mod{
     .{ .name = "lower_driver", .deps = &.{ "span", "ast", "lexer", "parser", "sema", "ir", "runtime", "stdlib", "interp_ir" }, .tested = true },
     .{ .name = "diagnostics_gen", .deps = &.{}, .tested = true },
     .{ .name = "test_runner", .deps = &.{ "ast", "ir", "runtime", "interp_ir", "span" }, .tested = true },
-    .{ .name = "cli", .deps = &.{ "span", "diagnostics", "lexer", "parser", "resolver", "typeck", "sema", "serialization_pass", "ir", "interp_ir", "lower_driver", "ast", "pack", "stdlib", "stdlib_pack", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "compose_ui", "ktor_client", "runtime", "types", "test_runner" }, .tested = true },
+    .{ .name = "cli", .deps = &.{ "span", "diagnostics", "lexer", "parser", "resolver", "typeck", "sema", "serialization_pass", "ir", "interp_ir", "lower_driver", "ast", "pack", "stdlib", "stdlib_pack", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "compose_ui", "skiko", "ktor_client", "runtime", "types", "test_runner" }, .tested = true },
     // The child runner the program-running suites share: `klio run` out of
     // process over the shared test home.
     .{ .name = "klio_child", .deps = &.{"runtime"}, .src = "src/itests/klio_child.zig", .tested = true },
@@ -582,6 +584,8 @@ pub fn build(b: *std.Build) void {
     // The compose_ui module dlopens the Skia backend (std.DynLib), which needs
     // libc; flow it into every artifact that imports compose_ui.
     mods.get("compose_ui").?.link_libc = true;
+    // skiko's interop allocates native memory with malloc.
+    mods.get("skiko").?.link_libc = true;
 
     // ir (eval) selects std.heap.c_allocator on the GC-off path, so its test
     // build needs libc too.
@@ -615,6 +619,7 @@ pub fn build(b: *std.Build) void {
         pack_harness.link_libc = true;
         pack_harness.linkLibrary(zstd_harness);
         harness_mods.get("compose_ui").?.link_libc = true;
+        harness_mods.get("skiko").?.link_libc = true;
         harness_mods.get("ir").?.link_libc = true;
         if (apple_sdk) |sdk| {
             var it = harness_mods.valueIterator();
@@ -658,6 +663,7 @@ pub fn build(b: *std.Build) void {
         pack_host.link_libc = true;
         pack_host.linkLibrary(zstd_host);
         host_mods.get("compose_ui").?.link_libc = true;
+        host_mods.get("skiko").?.link_libc = true;
         host_mods.get("ir").?.link_libc = true;
         break :blk host_mods;
     };
@@ -1624,22 +1630,88 @@ fn skiaLibName(os: std.Target.Os.Tag) []const u8 {
     };
 }
 
-/// skiko's C glue (src/compose_ui/skiko, from skiko v0.150.1): RenderNode, which
-/// draws the graphics layers, and the platform's default font manager. Its
-/// sources include Skia headers by bare name and by `ports/` path.
-const skiko_glue_sources = [_][]const u8{
-    "src/compose_ui/skiko/common/node/RenderNode.cpp",
-    "src/compose_ui/skiko/common/node/RenderNodeContext.cpp",
-    "src/compose_ui/skiko/common/FontMgrDefaultFactory.cc",
+/// skiko's C glue, compiled from the skiko checkout (skiko v0.150.1,
+/// scripts/init-skiko-submodule.sh): the C side of org.jetbrains.skia's natives
+/// (nativeJsMain/cpp) and what the platforms share (commonMain/cpp/common:
+/// RenderNode, which draws the graphics layers, the default font manager and
+/// the font fallback wrapper).
+const skiko_src = "kotlin-klio/klio-skiko/upstream/skiko/src";
+const skiko_glue_roots = [_][]const u8{
+    skiko_src ++ "/commonMain/cpp/common",
+    skiko_src ++ "/nativeJsMain/cpp",
 };
 
-fn skikoIncludes(b: *std.Build, base: []const u8) [4][]const u8 {
-    return .{
-        "-Isrc/compose_ui/skiko/common/include",
-        b.fmt("-I{s}/include", .{base}),
-        b.fmt("-I{s}/include/core", .{base}),
-        b.fmt("-I{s}/include/utils", .{base}),
+/// The glue that calls a GPU backend's entry points (GL's, which only a linked
+/// GL runtime provides). A shim without one leaves it out, and those natives
+/// report that they are not in the build.
+const skiko_gpu_glue = [_][]const u8{ "DirectContext.cc", "BackendRenderTarget.cc", "BackendTexture.cc", "render.cc" };
+
+/// The glue sources, sorted; empty when the skiko checkout is not populated.
+fn skikoGlueSources(b: *std.Build, with_gpu: bool) []const []const u8 {
+    const io = b.graph.io;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (skiko_glue_roots) |root| {
+        var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var walker = dir.walk(b.allocator) catch continue;
+        defer walker.deinit();
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const name = entry.basename;
+            if (!std.mem.endsWith(u8, name, ".cc") and !std.mem.endsWith(u8, name, ".cpp")) continue;
+            if (!with_gpu) {
+                var gpu = false;
+                for (skiko_gpu_glue) |g| gpu = gpu or std.mem.eql(u8, name, g);
+                if (gpu) continue;
+            }
+            out.append(b.allocator, b.fmt("{s}/{s}", .{ root, entry.path })) catch @panic("oom");
+        }
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    return out.items;
+}
+
+/// The include paths skiko compiles its glue with: Skia's public and module
+/// headers by bare name, the archive's ICU and HarfBuzz headers, and the
+/// glue's own headers.
+fn skikoIncludes(b: *std.Build, base: []const u8) []const []const u8 {
+    const rel = [_][]const u8{
+        "",                                   "/include",
+        "/include/core",                      "/include/codec",
+        "/include/effects",                   "/include/gpu",
+        "/include/utils",                     "/include/pathops",
+        "/include/encode",                    "/include/ports",
+        "/include/svg",                       "/include/docs",
+        "/modules",                           "/modules/skparagraph/include",
+        "/modules/skshaper/include",          "/modules/skottie/include",
+        "/modules/sksg/include",              "/modules/svg/include",
+        "/modules/skunicode/include",         "/modules/skresources/include",
+        "/third_party/icu",                   "/third_party/externals/icu/source/common",
+        "/third_party/externals/harfbuzz/src",
     };
+    var out: std.ArrayList([]const u8) = .empty;
+    out.append(b.allocator, "-I" ++ skiko_src ++ "/commonMain/cpp/common/include") catch @panic("oom");
+    out.append(b.allocator, "-I" ++ skiko_src ++ "/nativeJsMain/cpp") catch @panic("oom");
+    for (rel) |r| out.append(b.allocator, b.fmt("-I{s}{s}", .{ base, r })) catch @panic("oom");
+    return out.items;
+}
+
+/// The defines the glue and the prebuilt Skia agree on: the shaper and
+/// unicode modules are there, and the bundled ICU's entry points carry the
+/// `_skiko` suffix and no version.
+const skiko_defines = [_][]const u8{
+    "-DSK_SHAPER_HARFBUZZ_AVAILABLE", "-DSK_UNICODE_AVAILABLE",       "-DSK_SHAPER_UNICODE_AVAILABLE",
+    "-DU_HAVE_LIB_SUFFIX=1",          "-DU_LIB_SUFFIX_C_NAME=_skiko", "-DU_DISABLE_VERSION_SUFFIX=1",
+    "-DU_STATIC_IMPLEMENTATION",
+};
+
+/// A step that fails the shim's build with a message saying what is missing.
+fn skiaShimMissing(b: *std.Build, run: *std.Build.Step.Run, what: []const u8) void {
+    run.step.dependOn(&b.addFail(what).step);
 }
 
 /// Build the iOS Compose-UI Skia shim as a STATIC archive (libklio_skia.a) of the
@@ -1661,41 +1733,48 @@ fn buildSkiaShimIos(
         "-miphoneos-version-min=15.0";
     const inc = b.fmt("-I{s}", .{base});
     const skiko_inc = skikoIncludes(b, base);
+    const glue = skikoGlueSources(b, false);
 
     // KLIO_UIKIT enables the iOS on-screen backend (attach to an app CAMetalLayer,
     // Ganesh-Metal). Offscreen raster + PNG still work alongside it; the app links
     // Metal/QuartzCore/UIKit. The shim is still compiled Objective-C++ for the
     // Metal/UIKit glue.
-    const c1 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-arch", "arm64", "-DKLIO_UIKIT", "-DKLIO_METAL" });
+    const c1 = b.addSystemCommand(&.{ "clang++", "-std=c++20", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-arch", "arm64", "-DKLIO_UIKIT", "-DKLIO_METAL" });
     c1.addArgs(&.{ min_flag, "-isysroot", sdk, "-x", "objective-c++", inc });
-    c1.addArgs(&skiko_inc);
+    c1.addArgs(skiko_inc);
+    c1.addArgs(&skiko_defines);
+    if (glue.len == 0) skiaShimMissing(b, c1, "the Skia shim needs skiko's C glue: run scripts/init-skiko-submodule.sh");
     c1.addArg("-c");
     c1.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
     c1.addFileInput(b.path("src/compose_ui/window_events.h"));
     c1.addArg("-o");
     const shim_o = c1.addOutputFileArg("skia_shim.o");
 
-    const c2 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-arch", "arm64" });
+    const c2 = b.addSystemCommand(&.{ "clang++", "-std=c++20", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-arch", "arm64" });
     c2.addArgs(&.{ min_flag, "-isysroot", sdk, "-x", "objective-c++", inc, "-c" });
     c2.addFileArg(b.path("src/compose_ui/font_data.cpp"));
     c2.addArg("-o");
     const font_o = c2.addOutputFileArg("font_data.o");
 
-    const c3 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-arch", "arm64" });
+    const c3 = b.addSystemCommand(&.{ "clang++", "-std=c++20", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-arch", "arm64" });
     c3.addArgs(&.{ min_flag, "-isysroot", sdk, inc, "-c" });
     c3.addFileArg(b.path("src/compose_ui/icu_shim.cpp"));
     c3.addArg("-o");
     const icu_o = c3.addOutputFileArg("icu_shim.o");
 
-    var node_o: [skiko_glue_sources.len]std.Build.LazyPath = undefined;
-    for (skiko_glue_sources, 0..) |src, i| {
-        const c = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-arch", "arm64" });
+    const glue_o = b.allocator.alloc(std.Build.LazyPath, glue.len) catch @panic("oom");
+    for (glue, 0..) |src, i| {
+        const c = b.addSystemCommand(&.{ "clang++", "-std=c++20", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-arch", "arm64", "-DSK_METAL" });
         c.addArgs(&.{ min_flag, "-isysroot", sdk, inc });
-        c.addArgs(&skiko_inc);
+        c.addArgs(skiko_inc);
+        c.addArgs(&skiko_defines);
         c.addArg("-c");
         c.addFileArg(b.path(src));
         c.addArg("-o");
-        node_o[i] = c.addOutputFileArg(b.fmt("{s}.o", .{std.fs.path.stem(src)}));
+        // Glue sources share base names across directories (node/, svg/, ...).
+        const flat = b.dupe(src[skiko_src.len + 1 ..]);
+        std.mem.replaceScalar(u8, flat, '/', '_');
+        glue_o[i] = c.addOutputFileArg(b.fmt("{s}.o", .{flat}));
     }
 
     const ar = b.addSystemCommand(&.{ "libtool", "-static", "-o" });
@@ -1703,7 +1782,7 @@ fn buildSkiaShimIos(
     ar.addFileArg(shim_o);
     ar.addFileArg(font_o);
     ar.addFileArg(icu_o);
-    for (node_o) |o| ar.addFileArg(o);
+    for (glue_o) |o| ar.addFileArg(o);
     return out;
 }
 
@@ -1758,9 +1837,21 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
     // -fno-rtti matches the prebuilt Skia, as skiko's glue is built: a class
     // deriving from a Skia one (RenderNode's SkDrawable) would otherwise need
     // typeinfo the libraries do not have, and the shim would fail to load.
-    run.addArgs(&.{ "-std=c++17", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
-    run.addArgs(&skikoIncludes(b, base));
+    // C++20: Skia's internal headers the module headers reach need it.
+    run.addArgs(&.{ "-std=c++20", "-O2", "-DNDEBUG", "-fno-rtti", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
+    run.addArgs(skikoIncludes(b, base));
+    run.addArgs(&skiko_defines);
     if (os == .linux) run.addArg("-D_GLIBCXX_USE_CXX11_ABI=0");
+    // skiko builds its glue with the platform's GPU backend: Metal on macOS.
+    if (os == .macos) run.addArg("-DSK_METAL");
+    // Linux's GL runtime, which the GPU glue and the GPU surface need.
+    const linux_gl: ?[2][]const u8 = if (os == .linux and want_gpu) blk: {
+        const egl = findVersionedLib(b, "libEGL") orelse break :blk null;
+        const gl = findVersionedLib(b, "libGL") orelse break :blk null;
+        break :blk .{ egl, gl };
+    } else null;
+    const glue = skikoGlueSources(b, os != .linux or linux_gl != null);
+    if (glue.len == 0) skiaShimMissing(b, run, "the Skia shim needs skiko's C glue: run scripts/init-skiko-submodule.sh");
     // The Cocoa backend needs the shim compiled as Objective-C++; -x applies to the
     // source that follows, so it must precede the source file.
     if (os == .macos and want_cocoa) {
@@ -1777,8 +1868,8 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
     run.addFileArg(b.path("src/compose_ui/font_data.cpp"));
     // Date formatting over the ICU the Skia libraries bundle.
     run.addFileArg(b.path("src/compose_ui/icu_shim.cpp"));
-    // Graphics layers: skiko's RenderNode.
-    for (skiko_glue_sources) |src| run.addFileArg(b.path(src));
+    // skiko's C glue: the natives of org.jetbrains.skia, RenderNode, the font managers.
+    for (glue) |src| run.addFileArg(b.path(src));
     // Reset the input language so the .a archives that follow are linked, not
     // compiled as Objective-C++ source (the -x above applies to everything after).
     if (os == .macos and want_cocoa) run.addArgs(&.{ "-x", "none" });
@@ -1793,6 +1884,9 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
     // be linked for it, and with it the GL backend, whose GL entry points no
     // library provides, so the shim would not load.
     if (group) run.addArg("-lstdc++");
+    // A symbol no linked library defines fails the link here rather than the
+    // shim's load at runtime (GNU ld leaves a shared library's open by default).
+    if (os == .linux) run.addArg("-Wl,-z,defs");
     if (group) run.addArg("-Wl,--start-group");
     var dir = b.build_root.handle.openDir(io, lib_dir, .{ .iterate = true }) catch return null;
     defer dir.close(io);
@@ -1838,13 +1932,7 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]
         // ganesh objects also reference glX, so libGL is needed too). The on-screen
         // GPU window renders through SDL's GL context; the offscreen path uses EGL.
         // Skipped (raster fallback) if the GL/EGL libs are not found.
-        if (want_gpu) {
-            if (findVersionedLib(b, "libEGL")) |egl| {
-                if (findVersionedLib(b, "libGL")) |gl| {
-                    run.addArgs(&.{ "-DKLIO_GPU", egl, gl });
-                }
-            }
-        }
+        if (linux_gl) |libs| run.addArgs(&.{ "-DKLIO_GPU", libs[0], libs[1] });
     }
 
     // Per-OS C++ runtime + system frameworks/libs Skia needs.

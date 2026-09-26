@@ -196,6 +196,12 @@ enum {
     KLIO_WIN_VISIBLE = 3,
     KLIO_WIN_MINIMIZED = 4,
     KLIO_WIN_PLACEMENT = 5,
+    // Brings the window to the front and gives it the keyboard (the value is
+    // ignored), as a modal dialog is when its blocked window is clicked.
+    KLIO_WIN_FRONT = 6,
+    // Makes the window's unpainted pixels see-through: the window composites
+    // its frame's alpha over what is behind it.
+    KLIO_WIN_TRANSPARENT = 7,
 };
 
 enum {

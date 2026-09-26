@@ -116,7 +116,11 @@ internal class KlioApplication(
         val w = if (hosted) surfaceW else width
         val h = if (hosted) surfaceH else height
         val handle = __composeui_winOpen(w, h, title)
-        if (handle == 0L) return null
+        // As the desktop's AWT throws HeadlessException where it cannot show a
+        // window, a window that cannot open fails, saying why.
+        if (handle == 0L) {
+            throw UnsupportedOperationException("A window cannot open: " + __composeui_winOpenError())
+        }
         val owner = KlioComposeOwner(Density(1f), LayoutDirection.Ltr, coroutineContext = driver.effectContext)
         val scene = KlioScene(owner, w, h)
         loop?.let { scene.flushDispatcher = { it.runQueued() } }
@@ -235,7 +239,7 @@ private fun runApplication(content: @Composable ApplicationScope.() -> Unit): Bo
         } else {
             for (win in live) {
                 if (win.closed) continue
-                if (pumpWindow(win, timeout)) win.dirty = true
+                if (pumpWindow(win, timeout, app.blockerOf(win))) win.dirty = true
             }
         }
         for (tray in app.trays.toList()) tray.poll()
@@ -291,25 +295,32 @@ internal fun SingleWindowApplicationScope(
 interface DialogWindowScope : WindowScope
 
 /**
- * Modal dialogs block all input to some windows. klio's dialogs are windows
- * of their own: they block no other window.
+ * Modal dialogs block all input to some windows.
+ *
+ * [DialogModalityType] defines the which set of windows input is blocked to.
  */
 @ExperimentalComposeUiApi
 class DialogModalityType private constructor(val name: String) {
     override fun toString() = name
 
     companion object {
-        /** The dialog blocks no window. */
+        /**
+         * Indicates the dialog should be non-modal, i.e., should not block any windows.
+         */
         val Modeless = DialogModalityType("Modeless")
 
-        /** The dialog blocks the windows of its document, except its own descendants. */
+        /**
+         * Indicates the dialog should block windows from the same document, except its own
+         * descendants.
+         *
+         * A document is a top-level window without an owner.
+         */
         val DocumentModal = DialogModalityType("Document")
 
-        /** The dialog blocks all windows of the application. */
+        /**
+         * Indicates the dialog should block windows from the same application.
+         */
         val ApplicationModal = DialogModalityType("Application")
-
-        /** The dialog blocks all windows of the toolkit. */
-        val ToolkitModal = DialogModalityType("Toolkit")
     }
 }
 
@@ -332,6 +343,20 @@ internal class KlioWindowHolder(
     var dirty: Boolean = true
     var closed: Boolean = false
     var onCloseRequest: () -> Unit = {}
+
+    /**
+     * The window whose content composed this one: a dialog's owner. Its
+     * native window opens after its content first composes, so it is read
+     * through its ref.
+     */
+    var parentRef: WindowRef? = null
+    val parentWindow: KlioWindowHolder? get() = parentRef?.holder
+
+    /** A dialog's modality; null for a window. */
+    var modality: DialogModalityType? = null
+
+    /** Whether the window's unpainted pixels are see-through. */
+    var transparent: Boolean = false
     val input = KlioWindowInput(scene).also { input ->
         input.menuShortcut = { event -> menuBar?.shortcut(event) ?: false }
     }
@@ -534,7 +559,7 @@ fun DialogWindow(
     enabled: Boolean = true,
     focusable: Boolean = true,
     alwaysOnTop: Boolean = false,
-    @Suppress("UNUSED_PARAMETER") modalityType: DialogModalityType,
+    modalityType: DialogModalityType,
     onPreviewKeyEvent: ((KeyEvent) -> Boolean) = { false },
     onKeyEvent: ((KeyEvent) -> Boolean) = { false },
     content: @Composable DialogWindowScope.() -> Unit
@@ -555,6 +580,7 @@ fun DialogWindow(
         alwaysOnTop = alwaysOnTop,
         onPreviewKeyEvent = onPreviewKeyEvent,
         onKeyEvent = onKeyEvent,
+        modality = modalityType,
         content = content,
     )
 }
@@ -663,6 +689,7 @@ private fun <S : WindowScope> KlioPlatformWindow(
     alwaysOnTop: Boolean,
     onPreviewKeyEvent: (KeyEvent) -> Boolean,
     onKeyEvent: (KeyEvent) -> Boolean,
+    modality: DialogModalityType? = null,
     content: @Composable S.() -> Unit,
 ) {
     check(!transparent || decoration != WindowDecoration.SystemDefault) {
@@ -672,6 +699,8 @@ private fun <S : WindowScope> KlioPlatformWindow(
         "A window is composed inside application { }"
     }
     val parent = rememberCompositionContext()
+    // The window whose content composes this one, as a dialog's owner is.
+    val parentWindow = LocalKlioWindowRef.current
     val currentContent by rememberUpdatedState(content)
     val currentTitle by rememberUpdatedState(title)
     val currentAccess by rememberUpdatedState(access)
@@ -689,6 +718,12 @@ private fun <S : WindowScope> KlioPlatformWindow(
             }
         }
         windowRef.holder = holder
+        holder?.parentRef = parentWindow
+        holder?.modality = modality
+        if (holder != null && transparent) {
+            holder.transparent = true
+            __composeui_winSetFlag(holder.handle, WIN_TRANSPARENT, 1)
+        }
         onDispose {
             if (holder != null) app.close(holder)
             windowRef.holder = null
@@ -875,8 +910,9 @@ private fun renderWindowFrame(holder: KlioWindowHolder) {
     val surface = __composeui_winSurface(holder.handle)
     if (surface == 0L) return
     // Desktop windows start white: content that draws no background of its
-    // own (the default LocalContentColor is black) stays readable.
-    __composeui_winClear(holder.handle, WINDOW_BACKGROUND)
+    // own (the default LocalContentColor is black) stays readable. A
+    // transparent window starts clear, as the desktop's has no background.
+    __composeui_winClear(holder.handle, if (holder.transparent) 0 else WINDOW_BACKGROUND)
     klioDrawToSurface(surface) { holder.scene.draw(this) }
     __composeui_winPresent(holder.handle)
     holder.dirty = false
@@ -885,8 +921,56 @@ private fun renderWindowFrame(holder: KlioWindowHolder) {
 /** The values of the event a window's poll last reported. */
 private val windowEventValues = DoubleArray(WINDOW_EVENT_VALUES)
 
+/**
+ * The modal dialog that blocks [win]'s input, as AWT's modality has it: an
+ * application-modal dialog blocks every window, a document-modal one the
+ * windows of its document (the windows under the same top-level window), and
+ * neither blocks its own descendants. Null when nothing blocks it.
+ */
+internal fun KlioApplication.blockerOf(win: KlioWindowHolder): KlioWindowHolder? {
+    for (dialog in windows) {
+        if (dialog === win || dialog.closed || dialog.visible == false) continue
+        val modality = dialog.modality ?: continue
+        if (modality == DialogModalityType.Modeless || win.isDescendantOf(dialog)) continue
+        if (modality == DialogModalityType.ApplicationModal) return dialog
+        if (win.documentRoot() === dialog.documentRoot()) return dialog
+    }
+    return null
+}
+
+private fun KlioWindowHolder.documentRoot(): KlioWindowHolder {
+    var w = this
+    while (true) w = w.parentWindow ?: return w
+}
+
+private fun KlioWindowHolder.isDescendantOf(ancestor: KlioWindowHolder): Boolean {
+    var w = parentWindow
+    while (w != null) {
+        if (w === ancestor) return true
+        w = w.parentWindow
+    }
+    return false
+}
+
+/**
+ * Whether a blocked window drops an event: its pointer, key, text and menu
+ * input, and its gaining focus. A press or a focus gained on it brings the
+ * dialog that blocks it to the front instead, as the platforms' modal dialogs
+ * come forward.
+ */
+private fun dropsBlocked(blocker: KlioWindowHolder, type: Int, v: DoubleArray): Boolean {
+    val forward = when (type) {
+        WINDOW_EVENT_POINTER -> v[0].toInt() == 1
+        WINDOW_EVENT_FOCUS -> v[0] != 0.0
+        WINDOW_EVENT_KEY, WINDOW_EVENT_TEXT, WINDOW_EVENT_MENU -> false
+        else -> return false
+    }
+    if (forward) __composeui_winSetFlag(blocker.handle, WIN_FRONT, 1)
+    return true
+}
+
 /** Drain one window's pending events; returns true when anything arrived. */
-private fun pumpWindow(holder: KlioWindowHolder, timeoutMs: Int): Boolean {
+private fun pumpWindow(holder: KlioWindowHolder, timeoutMs: Int, blocker: KlioWindowHolder?): Boolean {
     var any = false
     val onResize: (Int, Int) -> Unit = { nw, nh ->
         holder.w = nw
@@ -899,6 +983,7 @@ private fun pumpWindow(holder: KlioWindowHolder, timeoutMs: Int): Boolean {
         timeout = 0
         if (type == WINDOW_EVENT_NONE) break
         any = true
+        if (blocker != null && dropsBlocked(blocker, type, windowEventValues)) continue
         when (type) {
             WINDOW_EVENT_CLOSE -> holder.onCloseRequest()
             WINDOW_EVENT_RESIZE -> {
@@ -991,6 +1076,8 @@ private const val WIN_ALWAYS_ON_TOP = 2
 private const val WIN_VISIBLE = 3
 private const val WIN_MINIMIZED = 4
 private const val WIN_PLACEMENT = 5
+private const val WIN_FRONT = 6
+private const val WIN_TRANSPARENT = 7
 
 // Sets one of a window's properties (WIN_*).
 internal fun __composeui_winSetFlag(handle: Long, which: Int, value: Int): Long =
@@ -1029,6 +1116,10 @@ internal fun __composeui_screenBounds(which: Int): Int =
 
 internal fun __composeui_winOpen(width: Int, height: Int, title: String): Long =
     error("intrinsic klio.compose.ui.__composeui_winOpen not installed")
+
+// Why the last __composeui_winOpen answered 0.
+internal fun __composeui_winOpenError(): String =
+    error("intrinsic androidx.compose.ui.window.__composeui_winOpenError not installed")
 
 // Waits up to timeoutMs for the window's next event, writes its values into
 // [out] (WINDOW_EVENT_VALUES of them) and returns its type (WINDOW_EVENT_*).

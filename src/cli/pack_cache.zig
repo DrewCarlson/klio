@@ -34,6 +34,7 @@ const kotlinx_coroutines = @import("kotlinx_coroutines");
 const kotlinx_serialization = @import("kotlinx_serialization");
 const compose_runtime = @import("compose_runtime");
 const compose_ui = @import("compose_ui");
+const skiko = @import("skiko");
 const interp_ir = @import("interp_ir");
 const ktor_client = @import("ktor_client");
 
@@ -2035,6 +2036,8 @@ pub fn mergedHostBindings(gpa: Allocator) HostBindings {
     mergeInto(&out, kotlinx_serialization.hostBindings(gpa) catch null);
     mergeInto(&out, compose_runtime.hostBindings(gpa) catch null);
     mergeInto(&out, compose_ui.hostBindings(gpa) catch null);
+    // org.jetbrains.skia's natives, under the C symbols skiko's glue exports.
+    mergeInto(&out, skiko.hostBindings(gpa) catch null);
     // The composer-stack intrinsics touch the VM's implicit-composer threadlocal.
     mergeInto(&out, interp_ir.compose.hostBindings(gpa) catch null);
     // ktor-client is opt-in, but its host functions are always in the registry.
