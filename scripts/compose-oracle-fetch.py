@@ -33,6 +33,7 @@ import argparse
 import functools
 import json
 import os
+import platform
 import re
 import sys
 import urllib.error
@@ -48,6 +49,18 @@ REPOS = [
 ]
 JDK_VERSION = 21
 
+
+def skiko_runtime_module():
+    """skiko's native runtime for this host, as the Compose Gradle plugin
+    picks it: skiko-awt-runtime-<macos|linux|windows>-<arm64|x64>."""
+    os_name = {"darwin": "macos", "linux": "linux", "win32": "windows"}.get(sys.platform)
+    machine = platform.machine().lower()
+    arch = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x64", "amd64": "x64"}.get(machine)
+    if not os_name or not arch:
+        sys.exit("compose-oracle-fetch: skiko has no runtime for %s %s" % (sys.platform, machine))
+    return "skiko-awt-runtime-%s-%s" % (os_name, arch)
+
+
 DEFAULT_ROOTS = [
     # Match the compiler: a Gradle build on Kotlin 2.4.20 puts this stdlib on
     # the classpath, and it outranks the 2.2.x the Compose modules request.
@@ -58,7 +71,7 @@ DEFAULT_ROOTS = [
     # (CHANGELOG "Components" table for 1.12.0).
     "org.jetbrains.compose.material3:material3-desktop:1.12.0-alpha03",
     "org.jetbrains.compose.ui:ui-test-desktop:1.12.0",
-    "org.jetbrains.skiko:skiko-awt-runtime-macos-arm64:=org.jetbrains.skiko:skiko-awt",
+    "org.jetbrains.skiko:%s:=org.jetbrains.skiko:skiko-awt" % skiko_runtime_module(),
     "org.jetbrains.kotlinx:kotlinx-coroutines-swing:=org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm",
     # File reading for the examples, at the version klio's kotlinx-io pack vendors.
     "org.jetbrains.kotlinx:kotlinx-io-core:0.9.1",

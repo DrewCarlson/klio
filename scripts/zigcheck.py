@@ -5,6 +5,8 @@ without editing build.zig or pulling in still-broken sibling modules.
 
 Usage: scripts/zigcheck.py <module>            # run `zig test`
        scripts/zigcheck.py <module> --build-only # `zig build-obj` (compile, no run)
+       scripts/zigcheck.py <module> --build-only --target x86_64-windows-gnu
+                                                 # compile for another target
 
 The `itests` module is special-cased: one `zig test` per file under
 src/itests/ (mirroring build.zig's per-file test binaries), because a single
@@ -16,6 +18,7 @@ import glob
 import os
 import subprocess
 import sys
+import tempfile
 
 # Installed by `zig build` / `zig build zstd-lib` from the vendored zstd C
 # sources. Any module whose dep-closure includes `pack` declares the ZSTD_*
@@ -112,8 +115,25 @@ def closure(root):
     return order
 
 
-def build_cmd(root, root_override, build_only, mods):
+def obj_sink(root, root_override, target):
+    """Where a build-only check writes its object. LLD cannot write a COFF
+    object to /dev/null, so another target gets a temp file."""
+    if not target:
+        return "/dev/null"
+    name = os.path.basename(root_override or root).replace(".zig", "")
+    return os.path.join(tempfile.gettempdir(), f"zigcheck-{name}-{target}-{os.getpid()}.o")
+
+
+def drop_sink(root, root_override, target):
+    sink = obj_sink(root, root_override, target)
+    if sink != "/dev/null" and os.path.exists(sink):
+        os.remove(sink)
+
+
+def build_cmd(root, root_override, build_only, mods, target=None):
     cmd = ["zig", "build-obj" if build_only else "test"]
+    if target:
+        cmd += ["-target", target]
     # root module first, named "root"
     for d in GRAPH[root]:
         cmd += ["--dep", d]
@@ -129,12 +149,12 @@ def build_cmd(root, root_override, build_only, mods):
             cmd += ["--dep", f"{d}=root" if d == root else d]
         cmd += [f"-M{m}={path(m)}"]
     if build_only:
-        cmd += ["-femit-bin=/dev/null"]
+        cmd += [f"-femit-bin={obj_sink(root, root_override, target)}"]
 
     # The real build links libc everywhere (std.c.getenv gates, the CLI's
     # c_allocator), so the isolated check must too. Modules reaching `pack`
     # also need the vendored zstd library for the extern ZSTD_* symbols.
-    if "pack" in mods:
+    if "pack" in mods and not build_only:
         cmd += [ZSTD_LIB]
     cmd += ["-lc"]
     return cmd
@@ -150,7 +170,7 @@ def itest_shards():
     return [f for f in files if os.path.basename(f) != "itests.zig" and f not in module_roots]
 
 
-def run_itest_shards(build_only, mods, jobs):
+def run_itest_shards(build_only, mods, jobs, target=None):
     shards = itest_shards()
     if not shards:
         print("error: no shards under src/itests/", file=sys.stderr)
@@ -159,8 +179,9 @@ def run_itest_shards(build_only, mods, jobs):
     failed = []
 
     def run_one(shard):
-        cmd = build_cmd("itests", shard, build_only, mods)
+        cmd = build_cmd("itests", shard, build_only, mods, target)
         p = subprocess.run(cmd, capture_output=True, text=True)
+        drop_sink("itests", shard, target)
         return shard, p.returncode, p.stdout + p.stderr
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -180,29 +201,39 @@ def run_itest_shards(build_only, mods, jobs):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in GRAPH:
-        print("usage: zigcheck.py <module> [--build-only] [--root FILE] [--jobs N]", file=sys.stderr)
+        print("usage: zigcheck.py <module> [--build-only [--target TRIPLE]] [--root FILE] [--jobs N]", file=sys.stderr)
         print("modules:", ", ".join(sorted(GRAPH)), file=sys.stderr)
         return 2
     root = sys.argv[1]
     build_only = "--build-only" in sys.argv[2:]
     root_override = None
+    target = None
     jobs = min(4, os.cpu_count() or 1)
     for i, a in enumerate(sys.argv):
         if a == "--root" and i + 1 < len(sys.argv):
             root_override = sys.argv[i + 1]
+        if a == "--target" and i + 1 < len(sys.argv):
+            target = sys.argv[i + 1]
         if a == "--jobs" and i + 1 < len(sys.argv):
             jobs = max(1, int(sys.argv[i + 1]))
+    if target and not build_only:
+        # A test binary for another target cannot run here.
+        print("error: --target needs --build-only", file=sys.stderr)
+        return 2
     mods = closure(root)
 
-    if "pack" in mods and not ensure_zstd_lib():
+    # build-obj does not link, so only a test run needs the zstd library.
+    if "pack" in mods and not build_only and not ensure_zstd_lib():
         return 1
 
     if root == "itests" and root_override is None:
-        return run_itest_shards(build_only, mods, jobs)
+        return run_itest_shards(build_only, mods, jobs, target)
 
-    cmd = build_cmd(root, root_override, build_only, mods)
+    cmd = build_cmd(root, root_override, build_only, mods, target)
     print("+", " ".join(cmd), file=sys.stderr)
-    return subprocess.call(cmd)
+    rc = subprocess.call(cmd)
+    drop_sink(root, root_override, target)
+    return rc
 
 
 if __name__ == "__main__":
