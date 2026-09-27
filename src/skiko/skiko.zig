@@ -34,6 +34,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     errdefer b.deinit();
     inline for (natives.all, 0..) |n, i| try b.register(n.symbol, hostFn(i));
+    runtime.weak.peer_bytes = peerBytes;
     // The native memory InteropScope passes arrays and strings in.
     try b.register("org.jetbrains.skia.impl.__skiko_malloc", memAlloc);
     try b.register("org.jetbrains.skia.impl.__skiko_free", memFree);
@@ -49,6 +50,26 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("org.jetbrains.skiko.__skiko_systemTheme", compose_ui.systemTheme);
     try b.register("org.jetbrains.skiko.__skiko_orderEmojiAndSymbolsPopup", compose_ui.orderEmojiPalette);
     return b;
+}
+
+/// The bytes the Skia object a skiko peer wraps holds, by the peer's class:
+/// an image's, a surface's or a bitmap's pixels, a data blob, a picture.
+fn peerBytes(owner: Value, ptr: usize) usize {
+    if (owner != .Instance) return 0;
+    const kind: c_int = blk: {
+        const g = owner.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        const prefix = "org.jetbrains.skia.";
+        const fqn = cg.get().fqn;
+        if (!std.mem.startsWith(u8, fqn, prefix)) return 0;
+        const name = fqn[prefix.len..];
+        const kinds = [_][]const u8{ "Image", "Surface", "Bitmap", "Data", "Picture" };
+        for (kinds, 1..) |k, i| if (std.mem.eql(u8, name, k)) break :blk @intCast(i);
+        return 0;
+    };
+    return compose_ui.skiaPeerBytes(kind, ptr);
 }
 
 fn hostArch(ctx: *CallCtx) Error!EvalResult {

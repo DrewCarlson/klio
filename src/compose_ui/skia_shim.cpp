@@ -260,6 +260,27 @@ bool surfaceToPixmap(KlioSurface* s, SkPixmap& pm, SkBitmap& backing) {
 
 extern "C" {
 
+// The bytes the Skia object behind a skiko peer holds, which the collector
+// counts while the peer's Kotlin owner lives: a raster image's, a surface's
+// or a bitmap's pixels, a data blob's bytes, a picture's recording. The
+// owner's class names the type: 1 image, 2 surface, 3 bitmap, 4 data,
+// 5 picture; any other holds nothing counted.
+int64_t klio_skia_peer_bytes(int kind, void* ptr) {
+    if (ptr == nullptr) return 0;
+    switch (kind) {
+    case 1: {
+        auto* image = static_cast<SkImage*>(ptr);
+        if (image->isLazyGenerated() || image->isTextureBacked()) return 0;
+        return static_cast<int64_t>(image->imageInfo().computeMinByteSize());
+    }
+    case 2: return static_cast<int64_t>(static_cast<SkSurface*>(ptr)->imageInfo().computeMinByteSize());
+    case 3: return static_cast<int64_t>(static_cast<SkBitmap*>(ptr)->computeByteSize());
+    case 4: return static_cast<int64_t>(static_cast<SkData*>(ptr)->size());
+    case 5: return static_cast<int64_t>(static_cast<SkPicture*>(ptr)->approximateBytesUsed());
+    default: return 0;
+    }
+}
+
 // Create a headless N32-premul raster surface, cleared transparent.
 KlioSurface* klio_skia_new(int width, int height) {
     if (width <= 0 || height <= 0) return nullptr;

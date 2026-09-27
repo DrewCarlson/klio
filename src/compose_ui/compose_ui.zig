@@ -200,6 +200,7 @@ const Skia = struct {
     winDragStart: ?WinDragStartFn,
     winDndAccept: ?*const fn (?*SkWindow, c_int) callconv(.c) void,
     winLastError: ?*const fn () callconv(.c) [*:0]const u8,
+    peerBytes: ?PeerBytesFn,
     tray: TrayFns,
     clipChangeCount: ?ClipChangeCountFn,
     clipGetText: ?ClipGetTextFn,
@@ -357,6 +358,7 @@ fn loadSkia() ?*Skia {
         .winDragStart = lib.lookup(WinDragStartFn, "klio_win_drag_start"),
         .winDndAccept = lib.lookup(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_dnd_accept"),
         .winLastError = lib.lookup(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
+        .peerBytes = lib.lookup(PeerBytesFn, "klio_skia_peer_bytes"),
         .tray = TrayFns.fromLib(&lib),
         .clipChangeCount = lib.lookup(ClipChangeCountFn, "klio_clip_change_count"),
         .clipGetText = lib.lookup(ClipGetTextFn, "klio_clip_get_text"),
@@ -421,6 +423,7 @@ fn loadSkiaStatic() ?*Skia {
         .winDragStart = externSym(WinDragStartFn, "klio_win_drag_start"),
         .winDndAccept = externSym(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_dnd_accept"),
         .winLastError = externSym(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
+        .peerBytes = externSym(PeerBytesFn, "klio_skia_peer_bytes"),
         .tray = TrayFns.fromExtern(),
         .clipChangeCount = externSym(ClipChangeCountFn, "klio_clip_change_count"),
         .clipGetText = externSym(ClipGetTextFn, "klio_clip_get_text"),
@@ -474,6 +477,17 @@ fn openSkiaLib() ?runtime.platform.DynLib {
 
 /// A symbol of the loaded Skia shim by name (skiko's glue natives), or null
 /// without the shim or the symbol. A statically linked shim answers null.
+const PeerBytesFn = *const fn (c_int, ?*anyopaque) callconv(.c) i64;
+
+/// The bytes the Skia object at `ptr` holds, `kind` naming its type as
+/// `klio_skia_peer_bytes` takes it; 0 without the shim.
+pub fn skiaPeerBytes(kind: c_int, ptr: usize) usize {
+    const s = loadSkia() orelse return 0;
+    const f = s.peerBytes orelse return 0;
+    const n = f(kind, @ptrFromInt(ptr));
+    return if (n > 0) @intCast(n) else 0;
+}
+
 pub fn skiaSymbol(name: [:0]const u8) ?*anyopaque {
     const s = loadSkia() orelse return null;
     if (comptime use_static_skia) return null;

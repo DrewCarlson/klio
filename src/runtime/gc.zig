@@ -951,6 +951,12 @@ const ExtDelta = struct { delta: isize = 0 };
 const ext_tls = tls_fast.PerThread(ExtDelta);
 const EXT_FLUSH: isize = 256 * 1024;
 
+/// The external bytes live now, this thread's unflushed ones included.
+pub fn externalLiveBytes() usize {
+    flushExternalDelta();
+    return external_live.load(.monotonic);
+}
+
 pub fn flushExternalDelta() void {
     const ext = ext_tls.get();
     const d = ext.delta;

@@ -124,15 +124,26 @@ fn Generations(comptime E: type) type {
 pub const NativeRecord = struct {
     finalizer: *const fn (?*anyopaque) callconv(.c) void,
     ptr: usize,
+    /// What the native object holds that the collector counts until the
+    /// finalizer runs (`peer_bytes`).
+    bytes: usize = 0,
     /// 0 armed, 1 run: whoever moves it runs the finalizer.
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     fn run(self: *NativeRecord) bool {
         if (self.state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return false;
         self.finalizer(@ptrFromInt(self.ptr));
+        if (self.bytes != 0) gc.noteExternalFreed(self.bytes);
         return true;
     }
 };
+
+/// The bytes a native object holds beyond its owner's cell, for an owner
+/// registered with `registerNative`: while the owner lives they count
+/// toward the collector's trigger as external memory, so dropping large
+/// native objects brings a collection as dropping as much heap does. Set by
+/// the library whose natives make them; null counts none.
+pub var peer_bytes: ?*const fn (owner: Value, ptr: usize) usize = null;
 
 const NativeEntry = struct {
     owner: *GcHeader,
@@ -247,9 +258,13 @@ pub fn registerNative(owner: Value, finalizer: usize, ptr: usize) std.mem.Alloca
     const h = cellOf(owner) orelse return @intFromPtr(rec);
     if (!gc.gc_enabled or h.gc_bytes == 0) return @intFromPtr(rec);
     installHooks();
-    native_lock.lock();
-    defer native_lock.unlock();
-    try natives.young.append(reg_alloc, .{ .owner = h, .rec = rec });
+    rec.bytes = if (peer_bytes) |f| f(owner, ptr) else 0;
+    {
+        native_lock.lock();
+        defer native_lock.unlock();
+        try natives.young.append(reg_alloc, .{ .owner = h, .rec = rec });
+    }
+    if (rec.bytes != 0) gc.noteExternalBytes(rec.bytes);
     return @intFromPtr(rec);
 }
 
@@ -607,6 +622,23 @@ test "a native finalizer runs once, by close or after its owner dies" {
     try testing.expectEqual(@as(usize, 2), native_calls);
     try testing.expectEqual(@as(u8, 0), kept.state.load(.acquire));
     try testing.expectEqual(@as(usize, 1), natives.old.items.len);
+}
+
+test "a native object's bytes count as external memory until its finalizer runs" {
+    const prev = gc.gc_enabled;
+    gc.gc_enabled = true;
+    defer gc.gc_enabled = prev;
+    const before = gc.externalLiveBytes();
+    const rec = try rec_alloc.create(NativeRecord);
+    defer rec_alloc.destroy(rec);
+    rec.* = .{ .finalizer = countFinalizer, .ptr = 1, .bytes = 4 << 20 };
+    gc.noteExternalBytes(rec.bytes);
+    try testing.expectEqual(before + (4 << 20), gc.externalLiveBytes());
+    try testing.expect(rec.run());
+    try testing.expectEqual(before, gc.externalLiveBytes());
+    // Run once, released once.
+    try testing.expect(!rec.run());
+    try testing.expectEqual(before, gc.externalLiveBytes());
 }
 
 test "forgetting ranges drops the entries inside them" {
