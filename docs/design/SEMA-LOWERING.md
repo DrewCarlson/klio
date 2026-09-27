@@ -11,7 +11,7 @@ question with a decision; the last two give the order of work and the risks.
 | How lowering finds sema's answer | Dense per-file node ids in the AST; sema writes per-file tables indexed by node id |
 | Where sema runs | After the serialization pass, on the AST lowering consumes. Alias expansion, renames, the file merge and lifting are deleted; compose becomes a lowering pass keyed on resolved callees |
 | One identity per declaration | A serial bridge pass allocates every `ClassId`, `FuncId`, static and slot from sema's symbols, in symbol order |
-| The base image | At the cutover a program re-collects the base declarations from the source text the image already carries and checks a digest; the end state serializes the symbol table (`sema/image`) |
+| The base image | The image serializes the base's symbol table, types and declaration facts beside the bridge; a program parses nothing of the base (`SEMA-IMAGE.md`) |
 | The instruction set | 37 variants: 19 of today's survive, 18 are new, 31 are deleted. No name reaches execution |
 | Lowering's layout | About 8.5k new lines translate records and instantiate inline functions; about 60k lines of derivers, ladders and link passes are deleted |
 | Order of work | Four green commits, one switch commit, then four bounded fix-forward items |
@@ -208,11 +208,10 @@ usual Debug-to-ReleaseFast ratio that estimates 20 to 30 ms for the stdlib
 against a 16 ms warm run today (step 3 measures it), accepted while the
 cutover lands.
 
-**The end state (`sema/image`).** The image serializes the prefix's symbols,
-resolved headers and type store, decoded lazily per class, with the bridge
-arrays beside them; a program parses nothing of the base. With inline
-functions instantiated from IR and local classes lowered at build time, the
-image also stops carrying base AST and most source text.
+**The sema image.** The image serializes every symbol of the bake, its
+resolved headers and type store, and the facts a program asks of a base
+declaration beyond its header, with the bridge arrays beside them; a program
+parses nothing of the base. `SEMA-IMAGE.md` describes it.
 
 **Method slots at the switch** keep today's id scheme: a slot is the root
 declaration's `FuncId` (`src/ir/core/ids.zig:100-125`) and `method_dispatch`

@@ -68,6 +68,18 @@ pub const FileCtx = struct {
     package: Sym,
     /// Built on first use by `scope.fileScope`.
     imports: ?*scope.FileImports = null,
+
+    /// How a base image carries a file: without its AST or its imports,
+    /// which nothing reads once the base is analyzed.
+    pub const codec_as = struct { path: []const u8, origin: Origin, generated: bool, package: Sym };
+
+    pub fn toCodec(self: *const FileCtx, _: Allocator) Allocator.Error!codec_as {
+        return .{ .path = self.path, .origin = self.origin, .generated = self.generated, .package = self.package };
+    }
+
+    pub fn fromCodec(img: codec_as, _: Allocator) Allocator.Error!FileCtx {
+        return .{ .ast = null, .path = img.path, .origin = img.origin, .generated = img.generated, .package = img.package };
+    }
 };
 
 /// Classes the language itself refers to. Each is declared by Kotlin source

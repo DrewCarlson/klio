@@ -39,7 +39,7 @@ pub fn run(gpa: Allocator, paths: []const []const u8, feature_specs: []const []c
     defer span.active_map = null;
 
     var load_report: sema_cmd.LoadReport = .{};
-    const loaded = sema_cmd.loadSources(arena, &map, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .report = &load_report, .test_roots = true });
+    const loaded = sema_cmd.loadSources(arena, &map, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .report = &load_report, .test_roots = true, .image = true });
     io.writeStderr(load_report.syntax.items);
     const src = loaded catch |e| switch (e) {
         error.ProgramSyntax => return 1,

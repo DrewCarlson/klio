@@ -21,7 +21,9 @@ const io = @import("io.zig");
 const pack_cache = @import("pack_cache.zig");
 const project = @import("project.zig");
 const cli = @import("cli.zig");
+const sema_base_cache = @import("sema_base_cache.zig");
 const interp_ir = @import("interp_ir");
+const codec = interp_ir.codec;
 const diagnostics = @import("diagnostics");
 
 const Allocator = std.mem.Allocator;
@@ -353,17 +355,25 @@ pub fn hostBinding(gpa: Allocator) lower_driver.pipeline.Binding {
 }
 
 fn addSemaActuals(arena: Allocator, scratch: *std.heap.ArenaAllocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile)) !void {
+    for (try semaActuals(arena)) |f| try addBaseSource(arena, scratch, map, files, f.path, f.text);
+}
+
+/// klio's actuals the base holds beside the stdlib: the checkout's files,
+/// else the copies the binary carries.
+fn semaActuals(arena: Allocator) ![]const BaseFile {
     var threaded: std.Io.Threaded = .init(arena, .{});
     defer threaded.deinit();
     const fio = threaded.io();
+    var out: std.ArrayList(BaseFile) = .empty;
     for (stdlib.pack_builder.SEMA_ACTUAL_FILES) |name| {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ sema_actuals_dir, name });
         const bytes = std.Io.Dir.cwd().readFileAlloc(fio, path, arena, .unlimited) catch |e| switch (e) {
             error.FileNotFound => embeddedActual(name) orelse continue,
             else => return e,
         };
-        try addBaseSource(arena, scratch, map, files, path, bytes);
+        try out.append(arena, .{ .path = path, .text = bytes, .origin = .base });
     }
+    return out.items;
 }
 
 fn embeddedActual(name: []const u8) ?[]const u8 {
@@ -433,10 +443,20 @@ pub const LoadOptions = struct {
     /// in place of the stdlib sources, the sema actuals and the installed
     /// packs, so nothing is read from the data home or the checkout.
     base: ?[]const BaseFile = null,
+    /// With `base`, the base image they were baked into. When no program is
+    /// one the serialization pass rewrites, the base's files register from
+    /// the image and none of them parses (`Sources.image`).
+    base_image: ?[]const u8 = null,
     /// Receives the base's files as they were registered, for a sema image.
     record_base: ?*std.ArrayList(BaseFile) = null,
     /// Receives the packs the programs' imports selected.
     selection: ?*pack_cache.Selection = null,
+    /// Looks the base's image up in the cache before any of the base
+    /// parses. When there is one, and no program is one the serialization
+    /// pass rewrites (it reads the packs' declarations from their source),
+    /// nothing of the base parses: `Sources.image` is the image, and the
+    /// base's files join the source map with their lines only.
+    image: bool = false,
 };
 
 /// A file of a run's base, in the order `loadSources` registered it: the
@@ -504,7 +524,22 @@ pub fn loadSources(arena: Allocator, map: *span.SourceMap, inputs: []const []con
     const map_start = map.files.items.len;
     var n_stdlib: usize = 0;
     var map_stdlib: usize = 0;
+    var key: ?[16]u8 = null;
     if (opts.base) |base| {
+        if (opts.base_image) |bytes| {
+            const fr = lower_driver.pipeline.base_image.front(arena, bytes) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => return error.MalformedImage,
+            };
+            if (!try serializedPrograms(arena, &scan_map, scanned.items, fr.driver)) {
+                parser.language = program_language;
+                const programs = try overImage(arena, map, &scan_map, scanned.items, fr, report);
+                return .{ .base = &.{}, .program = programs, .image = bytes };
+            }
+            // Baked for programs the pass did not rewrite, the image
+            // carries no base source for it to read.
+            if (base.len == 0) return error.ImageWithoutBaseSources;
+        }
         try addImageBase(arena, map, &files, base);
         for (files.items) |f| {
             if (f.origin == .pack) break;
@@ -519,35 +554,50 @@ pub fn loadSources(arena: Allocator, map: *span.SourceMap, inputs: []const []con
         var perr: pack.PackError = undefined;
         var stdlib_src = (try stdlib_pack.stdlibSources(arena, null, &perr)) orelse return error.StdlibSourcesMissing;
         defer stdlib_src.deinit();
+        const actuals = try semaActuals(arena);
+        // What the base is, before any of it parses: the files it is built
+        // from and the packs the programs select, which name its image.
+        var base_key = sema_base_cache.Key.init();
+        for (stdlib_src.files) |sf| base_key.file(sf.rel_path, sf.bytes);
+        for (actuals) |f| base_key.file(f.path, f.text);
+        if (opts.with_packs) {
+            var own_selection: pack_cache.Selection = .{};
+            const sel = opts.selection orelse &own_selection;
+            // A pack without an import section parses to tell its imports;
+            // its files register here, not in `map`.
+            var pack_map = span.SourceMap.init(arena);
+            _ = try loadPacks(arena, &scanned, &pack_map, opts, .{ .asts_needed = false, .selection = sel, .report = opts.report_pack_failures });
+            for (sel.packs.items) |sp| base_key.pack(&sp.hash, sp.features);
+        }
+        key = base_key.final();
+        if (opts.image and opts.record_base == null and !sema_base_cache.disabled()) {
+            var cached = try cachedImage(arena, key.?);
+            // No image yet: the base bakes on a heap of its own, dropped
+            // whole once the image exists, and the run goes on from the
+            // image as a run over a cached one does.
+            if (cached == null) cached = try bakeOnOwnHeap(arena, stdlib_src.files, actuals, &scanned, opts, key.?);
+            if (cached) |found| {
+                if (!try serializedPrograms(arena, &scan_map, scanned.items, found.front.driver)) {
+                    parser.language = program_language;
+                    const programs = try overImage(arena, map, &scan_map, scanned.items, found.front, report);
+                    return .{ .base = &.{}, .program = programs, .image = found.bytes, .key = key };
+                }
+            }
+        }
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         for (stdlib_src.files) |sf| try addBaseSource(arena, &scratch, map, &files, sf.rel_path, sf.bytes);
-        try addSemaActuals(arena, &scratch, map, &files);
+        for (actuals) |f| try addBaseSource(arena, &scratch, map, &files, f.path, f.text);
         n_stdlib = files.items.len;
         map_stdlib = map.files.items.len;
-    }
-    if (opts.base == null and opts.with_packs) {
-        var program_asts: std.ArrayList(ast.KotlinFile) = .empty;
-        var program_paths: std.ArrayList([]const u8) = .empty;
-        for (scanned.items) |p| {
-            try program_asts.append(arena, p.ast.*);
-            try program_paths.append(arena, p.path);
-        }
-        var features = cli.parseRequestedFeatures(arena, opts.feature_specs);
-        // A project's own sources never load its installed pack beside them,
-        // and a project loads only the libraries its manifest declares.
-        const loaded = pack_cache.loadInstalledPacksOpts(arena, program_asts.items, map, &features, .{
-            .include_stdlib = false,
-            .report_failures = opts.report_pack_failures,
-            .exclude_lib_ids = project.ownLibraryExclusion(arena, program_paths.items),
-            .declared_lib_ids = project.declaredDependencyIds(arena, program_paths.items),
-            .selection = opts.selection,
-        });
-        for (loaded.asts) |*pa| {
-            const owned = try arena.create(ast.KotlinFile);
-            owned.* = pa.*;
-            const path = if (pa.span.file.int() < map.files.items.len) map.get(pa.span.file).path else "<pack>";
-            try files.append(arena, .{ .ast = owned, .path = path, .origin = .pack });
+        if (opts.with_packs) {
+            const loaded = try loadPacks(arena, &scanned, map, opts, .{ .asts_needed = true, .selection = null, .report = false });
+            for (loaded.asts) |*pa| {
+                const owned = try arena.create(ast.KotlinFile);
+                owned.* = pa.*;
+                const path = if (pa.span.file.int() < map.files.items.len) map.get(pa.span.file).path else "<pack>";
+                try files.append(arena, .{ .ast = owned, .path = path, .origin = .pack });
+            }
         }
     }
     if (opts.record_base) |out| {
@@ -564,7 +614,135 @@ pub fn loadSources(arena: Allocator, map: *span.SourceMap, inputs: []const []con
         const src = scan_map.get(p.ast.span.file);
         try addSourceReporting(arena, map, &programs, p.path, src.source, .program, null, &report.syntax_diags);
     }
-    return .{ .base = files.items, .program = try serial.programFiles(arena, map, programs.items) };
+    return .{
+        .base = files.items,
+        .program = try serial.programFiles(arena, map, programs.items),
+        .key = key,
+        .record = try serial.record(arena),
+    };
+}
+
+const PackLoad = struct { asts_needed: bool, selection: ?*pack_cache.Selection, report: bool };
+
+/// The installed packs the programs `scanned` select, loaded into `map`.
+fn loadPacks(arena: Allocator, scanned: *const std.ArrayList(sema.SourceFile), map: *span.SourceMap, opts: LoadOptions, how: PackLoad) !pack_cache.LoadedPacks {
+    var program_asts: std.ArrayList(ast.KotlinFile) = .empty;
+    var program_paths: std.ArrayList([]const u8) = .empty;
+    for (scanned.items) |p| {
+        try program_asts.append(arena, p.ast.*);
+        try program_paths.append(arena, p.path);
+    }
+    var features = cli.parseRequestedFeatures(arena, opts.feature_specs);
+    // A project's own sources never load its installed pack beside them,
+    // and a project loads only the libraries its manifest declares.
+    return pack_cache.loadInstalledPacksOpts(arena, program_asts.items, map, &features, .{
+        .include_stdlib = false,
+        .report_failures = how.report,
+        .exclude_lib_ids = project.ownLibraryExclusion(arena, program_paths.items),
+        .declared_lib_ids = project.declaredDependencyIds(arena, program_paths.items),
+        .selection = how.selection,
+        .asts_needed = how.asts_needed,
+    });
+}
+
+const Found = struct { bytes: []const u8, front: lower_driver.pipeline.base_image.Front };
+
+/// The programs `scanned`, joining `map` after the base's files as the
+/// image `fr` registers them, with their lines only.
+fn overImage(arena: Allocator, map: *span.SourceMap, scan_map: *const span.SourceMap, scanned: []const sema.SourceFile, fr: lower_driver.pipeline.base_image.Front, report: *LoadReport) ![]const sema.SourceFile {
+    for (fr.sources) |src| _ = try map.addLines(src.path, src.line_starts);
+    var programs: std.ArrayList(sema.SourceFile) = .empty;
+    for (scanned) |p| {
+        const src = scan_map.get(p.ast.span.file);
+        try addSourceReporting(arena, map, &programs, p.path, src.source, .program, null, &report.syntax_diags);
+    }
+    return programs.items;
+}
+
+/// Parses, analyzes, lowers and bakes the base on the build heap
+/// (`runtime.slab.buildHeap`), writes the image to the cache under `key`,
+/// and drops the heap: nothing of the build outlives the bake but the
+/// image. The image as the cache maps it, else its bytes on the process
+/// heap when the cache cannot keep it.
+fn bakeOnOwnHeap(arena: Allocator, stdlib_files: []const pack.schema.SourceFile, actuals: []const BaseFile, scanned: *const std.ArrayList(sema.SourceFile), opts: LoadOptions, key: [16]u8) !?Found {
+    const gpa = std.heap.smp_allocator;
+    const bytes = blk: {
+        const heap = runtime.slab.buildHeap();
+        defer runtime.slab.releaseAll(heap);
+        const ba = heap.allocator();
+        const map = try ba.create(span.SourceMap);
+        map.* = span.SourceMap.init(ba);
+        // The serialization pass registers the files it generates in the
+        // active map.
+        const saved_map = span.active_map;
+        span.active_map = map;
+        defer span.active_map = saved_map;
+        var files: std.ArrayList(sema.SourceFile) = .empty;
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        for (stdlib_files) |sf| try addBaseSource(ba, &scratch, map, &files, sf.rel_path, sf.bytes);
+        for (actuals) |f| try addBaseSource(ba, &scratch, map, &files, f.path, f.text);
+        const n_stdlib = files.items.len;
+        if (opts.with_packs) {
+            const loaded = try loadPacks(ba, scanned, map, opts, .{ .asts_needed = true, .selection = null, .report = false });
+            for (loaded.asts) |*pa| {
+                const owned = try ba.create(ast.KotlinFile);
+                owned.* = pa.*;
+                const path = if (pa.span.file.int() < map.files.items.len) map.get(pa.span.file).path else "<pack>";
+                try files.append(ba, .{ .ast = owned, .path = path, .origin = .pack });
+            }
+        }
+        const serial = try Serial.init(ba, map, files.items[n_stdlib..]);
+        files.shrinkRetainingCapacity(n_stdlib);
+        try files.appendSlice(ba, serial.packs);
+        var t = lower_driver.pipeline.Timing.start();
+        const baked = try lower_driver.pipeline.bakeBase(ba, gpa, files.items, hostBinding(gpa), map, try serial.record(ba));
+        t.mark("bake base image");
+        break :blk baked;
+    };
+    if (sema_base_cache.pathFor(arena, key)) |path| {
+        sema_base_cache.write(arena, path, bytes);
+        if (try cachedImage(arena, key)) |found| {
+            gpa.free(bytes);
+            return found;
+        }
+    }
+    const fr = lower_driver.pipeline.base_image.front(arena, bytes) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return null,
+    };
+    return .{ .bytes = bytes, .front = fr };
+}
+
+/// The cached image of the base `key` names, when the cache has one this
+/// klio reads.
+fn cachedImage(arena: Allocator, key: [16]u8) !?Found {
+    if (sema_base_cache.disabled()) return null;
+    const path = sema_base_cache.pathFor(arena, key) orelse return null;
+    const bytes = sema_base_cache.read(arena, path) orelse return null;
+    const fr = lower_driver.pipeline.base_image.front(arena, bytes) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return null,
+    };
+    return .{ .bytes = bytes, .front = fr };
+}
+
+/// Whether the serialization pass rewrites one of the programs: one that
+/// writes `@Serializable`, or uses one of the packs' meta-serializable
+/// annotations, which `record` (`Serial.record`) names. `scan_map` holds
+/// the programs.
+pub fn serializedPrograms(arena: Allocator, scan_map: *const span.SourceMap, programs: []const sema.SourceFile, record: []const u8) !bool {
+    // The pass reads a file's text through the active map.
+    const saved = span.active_map;
+    span.active_map = scan_map;
+    defer span.active_map = saved;
+    var meta = std.StringHashMap(void).init(arena);
+    const names: []const []const u8 = if (record.len == 0) &.{} else codec.decodeBytes([]const []const u8, arena, record) catch &.{};
+    for (names) |n| try meta.put(n, {});
+    for (programs) |p| {
+        if (serialization_pass.fileMentionsSerializable(p.ast) or serialization_pass.fileUsesMetaSerializable(p.ast, &meta)) return true;
+    }
+    return false;
 }
 
 /// Registers and parses a base a sema image carries, as `loadSources`
@@ -1241,6 +1419,23 @@ const Serial = struct {
             .n_pack_generated = out.len - pack_files.len,
             .pack_meta = try serialization_pass.metaSerializableNames(a, originals),
         };
+    }
+
+    /// What an image baked from these packs keeps for a run that does not
+    /// parse them: their meta-serializable annotations' names, which tell
+    /// whether the pass rewrites a program.
+    fn record(self: *const Serial, a: Allocator) ![]const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        var it = self.pack_meta.keyIterator();
+        while (it.next()) |k| try names.append(a, k.*);
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        const bytes = try codec.encodeBytes([]const []const u8, std.heap.smp_allocator, &names.items);
+        defer std.heap.smp_allocator.free(bytes);
+        return a.dupe(u8, bytes);
     }
 
     /// The programs as sema should see them: transformed, followed by the

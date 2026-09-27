@@ -171,12 +171,20 @@ pub const Baked = struct {
     layer: bridge.Layer,
     /// By FuncId: the bodies the bake lowered.
     lowered: std.DynamicBitSetUnmanaged,
+    /// The base's files.
+    map: *span.SourceMap,
+
+    /// The bake serialized as a run caches it.
+    pub fn encode(self: *const Baked, a: Allocator) ![]const u8 {
+        return pipeline.base_image.encode(a, a, self.s, self.br, &self.lowered, self.layer.syms, self.map, self.map.files.items.len, "");
+    }
 };
 
 pub fn bake(a: Allocator) !Baked {
-    var map = span.SourceMap.init(a);
+    const map = try a.create(span.SourceMap);
+    map.* = span.SourceMap.init(a);
     var base: std.ArrayList(sema.SourceFile) = .empty;
-    for (mini_base.files) |f| try parseInto(a, &map, &base, f.path, f.source, .base);
+    for (mini_base.files) |f| try parseInto(a, map, &base, f.path, f.source, .base);
     const s = try sema.Sema.init(a);
     try s.addFiles(base.items);
     const layer: bridge.Layer = .{ .syms = @intCast(s.syms.count()), .files = @intCast(s.files.items.len) };
@@ -187,7 +195,7 @@ pub fn bake(a: Allocator) !Baked {
     defer runtime.gc.alloc_perm = saved_perm;
     const br = try bridge.build(a, s, .{ .natives = natives.resolve, .host_fns = interp_ir.hostMemberFn, .records = out.files, .layers = &.{layer} });
     const prog = try lower.lowerProgram(a, s, br);
-    return .{ .s = s, .br = br, .layer = layer, .lowered = prog.lowered };
+    return .{ .s = s, .br = br, .layer = layer, .lowered = prog.lowered, .map = map };
 }
 
 /// `analyze` over a baked base: a fresh sema reads the base's files and
@@ -243,22 +251,21 @@ pub fn runOver(a: Allocator, sources: []const []const u8) anyerror!Outcome {
 /// a cached base image reads it (`pipeline.base_image`).
 pub fn runOverImage(a: Allocator, sources: []const []const u8) anyerror!Outcome {
     const baked = try bake(a);
-    const bytes = try pipeline.base_image.encode(a, a, baked.s, baked.br, &baked.lowered, baked.layer.syms);
+    const bytes = try baked.encode(a);
+    // The base comes from the image alone: its sema, its bridge and its
+    // files' lines. The program's files follow them in the map.
     var map = span.SourceMap.init(a);
-    var base: std.ArrayList(sema.SourceFile) = .empty;
-    for (mini_base.files) |f| try parseInto(a, &map, &base, f.path, f.source, .base);
+    const saved_perm = runtime.gc.alloc_perm;
+    runtime.gc.alloc_perm = true;
+    defer runtime.gc.alloc_perm = saved_perm;
+    const loaded = try pipeline.base_image.load(a, bytes, .{ .natives = natives.resolve, .host_fns = interp_ir.hostMemberFn }, &map);
+    const s = loaded.br.s;
     var program: std.ArrayList(sema.SourceFile) = .empty;
     for (sources, 0..) |src, i| {
         const path = try std.fmt.allocPrint(a, "test{d}.kt", .{i});
         try parseInto(a, &map, &program, path, src, .program);
     }
-    const s = try sema.Sema.init(a);
-    try s.addFiles(base.items);
     const base_layer: bridge.Layer = .{ .syms = @intCast(s.syms.count()), .files = @intCast(s.files.items.len) };
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
-    const loaded = try pipeline.base_image.decode(a, bytes, s, .{ .natives = natives.resolve, .host_fns = interp_ir.hostMemberFn });
     try s.addFiles(program.items);
     const program_layer: bridge.Layer = .{ .syms = @intCast(s.syms.count()), .files = @intCast(s.files.items.len) };
     try s.resolveBodies(&.{.program});

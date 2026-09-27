@@ -148,6 +148,15 @@ pub const SourceMap = struct {
     /// stdlib image, or an arena the map adopted), borrowing both slices and
     /// skipping the per-line index. Saves the whole-stdlib source dupe (~6 MB)
     /// and its line tables (~1 MB) at startup; `lineCol` then scans linearly.
+    /// Registers a file whose text is not kept, only where its lines start,
+    /// which is all a line number needs: a base image's files. Borrows both.
+    pub fn addLines(self: *SourceMap, path: []const u8, line_starts: []const u32) !FileId {
+        const a = self.arena.allocator();
+        const id = FileId.from(@intCast(self.files.items.len));
+        try self.files.append(a, .{ .id = id, .path = path, .source = "", .line_starts = line_starts });
+        return id;
+    }
+
     pub fn addBorrowed(self: *SourceMap, path: []const u8, source: []const u8) !FileId {
         const a = self.arena.allocator();
         const id = FileId.from(@intCast(self.files.items.len));

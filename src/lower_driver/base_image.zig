@@ -10,12 +10,14 @@
 //! `prefix` is stale and nothing reads it through sema.
 
 const std = @import("std");
+const span = @import("span");
 const sema = @import("sema");
 const ir = @import("ir");
 const interp_ir = @import("interp_ir");
 const runtime = @import("runtime");
 
 const Allocator = std.mem.Allocator;
+const base_sema = @import("base_sema.zig");
 const bridge = ir.bridge;
 const resolved = ir.resolved;
 const codec = interp_ir.codec;
@@ -26,7 +28,7 @@ const ClassId = ir.ClassId;
 const magic = "KLIOSEMB";
 
 /// Bumped with any change to the layout below.
-pub const version: u32 = 28;
+pub const version: u32 = 29;
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };
@@ -39,7 +41,9 @@ pub const Header = extern struct {
     /// Symbols of the base layer: the by-symbol tables mean something below
     /// it only.
     prefix: u32,
-    reserved: u32 = 0,
+    /// The bytes after the header that hold the image's `Front`, before the
+    /// rest of it.
+    front_len: u32,
     /// `Sema.prefixDigest(prefix)` at the bake.
     digest: u64,
 };
@@ -188,6 +192,8 @@ comptime {
 }
 
 const Image = struct {
+    /// The base's sema: its symbols, types and names, and their facts.
+    sema: base_sema.Image,
     bridge: BridgeImage,
     module: ModuleImage,
     resolved: ResolvedImage,
@@ -198,10 +204,13 @@ const Image = struct {
 
 // ------------------------------------------------------------- encoding --
 
-/// Serializes the base: `br` as a build over the base alone left it, with
-/// its bodies lowered. `prefix` is the symbol count at the base layer's end.
-/// The result is owned by `gpa`.
-pub fn encode(gpa: Allocator, scratch: Allocator, s: *const sema.Sema, br: *const bridge.Bridge, lowered: *const std.DynamicBitSetUnmanaged, prefix: u32) ![]u8 {
+/// Serializes the base: `s` and `br` as a build over the base alone left
+/// them, with its bodies lowered, and the first `n_sources` files of `map`,
+/// which are the base's. `prefix` is the symbol count at the base layer's
+/// end. `driver` is the baking driver's own record of the base
+/// (`Front.driver`). What a program may ask of the base's declarations is
+/// asked first (`base_sema.complete`). The result is owned by `gpa`.
+pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const bridge.Bridge, lowered: *const std.DynamicBitSetUnmanaged, prefix: u32, map: *const span.SourceMap, n_sources: usize, driver: []const u8) ![]u8 {
     const m = br.m;
     var lowered_ids: std.ArrayList(u32) = .empty;
     var lit = lowered.iterator(.{});
@@ -229,7 +238,9 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *const sema.Sema, br: *cons
             return x.k < y.k;
         }
     }.lt);
+    try base_sema.complete(s);
     const img: Image = .{
+        .sema = try base_sema.image(scratch, s),
         .lowered = lowered_ids.items,
         .resolved = try resolvedImage(scratch, m),
         .bridge = try bridgeImage(scratch, br),
@@ -244,11 +255,15 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *const sema.Sema, br: *cons
     };
     const payload = try codec.encodeBytes(Image, gpa, &img);
     defer gpa.free(payload);
-    const hdr: Header = .{ .version = version, .codec = codec.FORMAT_VERSION, .prefix = prefix, .digest = s.prefixDigest(prefix) };
+    const fr: Front = .{ .sources = try base_sema.sources(scratch, map, n_sources), .driver = driver };
+    const src_bytes = try codec.encodeBytes(Front, gpa, &fr);
+    defer gpa.free(src_bytes);
+    const hdr: Header = .{ .version = version, .codec = codec.FORMAT_VERSION, .prefix = prefix, .front_len = @intCast(src_bytes.len), .digest = s.prefixDigest(prefix) };
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     try out.appendSlice(gpa, magic);
     try out.appendSlice(gpa, std.mem.asBytes(&hdr));
+    try out.appendSlice(gpa, src_bytes);
     try out.appendSlice(gpa, payload);
     return out.toOwnedSlice(gpa);
 }
@@ -359,17 +374,69 @@ pub const Rebind = struct {
     host_tries: ?resolved.HostTryResolver = null,
 };
 
-/// Decodes the image into `a` as a bridge over `s`, whose base layer must
-/// be the one the image was baked from, and whose natives `rebind` still
-/// has (`error.Stale` otherwise). `bytes` must outlive the result: names and
-/// the body section point into it.
-pub fn decode(a: Allocator, bytes: []const u8, s: *sema.Sema, rebind: Rebind) LoadError!Loaded {
+/// What an image holds ahead of the rest, read without it.
+pub const Front = struct {
+    /// The base's files, which a run registers in its source map before its
+    /// program's, with their lines and no text: its base's spans name them
+    /// by those places.
+    sources: []const base_sema.Source,
+    /// The baking driver's own record of the base, which the image does not
+    /// read.
+    driver: []const u8,
+};
+
+/// The front of the image `bytes`, in `a`; its strings point into `bytes`.
+pub fn front(a: Allocator, bytes: []const u8) LoadError!Front {
     const h = header(bytes) orelse return error.Malformed;
-    if (s.syms.count() < h.prefix or s.prefixDigest(h.prefix) != h.digest) return error.Stale;
-    const img = codec.decodeBytes(Image, a, bytes[magic.len + @sizeOf(Header) ..]) catch |e| return switch (e) {
+    const at = magic.len + @sizeOf(Header);
+    if (at + h.front_len > bytes.len) return error.Malformed;
+    return codec.decodeBytes(Front, a, bytes[at .. at + h.front_len]) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.Malformed => error.Malformed,
     };
+}
+
+/// Registers the base's files of the image `bytes` in `map`.
+pub fn registerSources(a: Allocator, bytes: []const u8, map: *span.SourceMap) LoadError!void {
+    for ((try front(a, bytes)).sources) |src| _ = try map.addLines(src.path, src.line_starts);
+}
+
+/// Decodes the image into `a`: the base's sema, and a bridge over it whose
+/// natives `rebind` still has (`error.Stale` otherwise). With `map`, the
+/// base's files join it first (`registerSources`). `bytes` must outlive
+/// the result: names and the body section point into it.
+pub fn load(a: Allocator, bytes: []const u8, rebind: Rebind, map: ?*span.SourceMap) LoadError!Loaded {
+    const h = header(bytes) orelse return error.Malformed;
+    if (map) |m| try registerSources(a, bytes, m);
+    const img = codec.decodeBytes(Image, a, payloadOf(bytes, h) orelse return error.Malformed) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Malformed => error.Malformed,
+    };
+    const s = try base_sema.load(a, &img.sema);
+    if (s.syms.count() < h.prefix or s.prefixDigest(h.prefix) != h.digest) return error.Malformed;
+    return assemble(a, h, &img, s, rebind);
+}
+
+/// Decodes the image into `a` as a bridge over `s`, whose base layer must
+/// be the one the image was baked from (`error.Stale` otherwise), leaving
+/// the image's own sema aside.
+pub fn decode(a: Allocator, bytes: []const u8, s: *sema.Sema, rebind: Rebind) LoadError!Loaded {
+    const h = header(bytes) orelse return error.Malformed;
+    if (s.syms.count() < h.prefix or s.prefixDigest(h.prefix) != h.digest) return error.Stale;
+    const img = codec.decodeBytes(Image, a, payloadOf(bytes, h) orelse return error.Malformed) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Malformed => error.Malformed,
+    };
+    return assemble(a, h, &img, s, rebind);
+}
+
+/// The image past its header and its base's files.
+fn payloadOf(bytes: []const u8, h: Header) ?[]const u8 {
+    const at = magic.len + @sizeOf(Header) + @as(usize, h.front_len);
+    return if (at <= bytes.len) bytes[at..] else null;
+}
+
+fn assemble(a: Allocator, h: Header, img: *const Image, s: *sema.Sema, rebind: Rebind) LoadError!Loaded {
     const m = try a.create(ir.Module);
     m.* = ir.Module.init(a);
     try m.funcs.appendSlice(a, img.module.funcs);

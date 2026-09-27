@@ -416,7 +416,7 @@ fn program(gpa: Allocator, paths: []const []const u8, feature_specs: []const []c
             return .{ .exit = 1 };
         },
     };
-    const built = pipeline.buildOnBase(mem.arena(), baked.src, sema_cmd.hostBinding(gpa), baked.base) catch |e| {
+    const built = pipeline.buildOnImage(mem.arena(), baked.src.program, sema_cmd.hostBinding(gpa), baked.base, null) catch |e| {
         io.printStderr(gpa, "error: the program does not build over its base image: {s}\n", .{@errorName(e)});
         return .{ .exit = 1 };
     };

@@ -128,11 +128,12 @@ pub const Decl = union(enum) {
         };
     }
 
-    /// The same declaration with its AST cut away.
-    pub fn cut(self: Decl) Decl {
-        return switch (self) {
+    /// A declaration of kind `tag` with no AST, as a base image reads one
+    /// back.
+    pub fn ofKind(tag: std.meta.Tag(Decl)) Decl {
+        return switch (tag) {
             .none => .none,
-            inline else => |_, tag| @unionInit(Decl, @tagName(tag), null),
+            inline else => |t| @unionInit(Decl, @tagName(t), null),
         };
     }
 };
@@ -152,6 +153,18 @@ pub const Symbol = struct {
     decl: Decl,
     /// Index into the per-kind table below.
     detail: u32,
+
+    /// How a base image carries a symbol: its declaration's kind, without
+    /// the AST it points into.
+    pub const codec_as = struct { kind: Kind, name: Name, owner: Sym, file: u32, flags: Flags, decl: std.meta.Tag(Decl), detail: u32 };
+
+    pub fn toCodec(self: *const Symbol, _: Allocator) Allocator.Error!codec_as {
+        return .{ .kind = self.kind, .name = self.name, .owner = self.owner, .file = self.file, .flags = self.flags, .decl = self.decl, .detail = self.detail };
+    }
+
+    pub fn fromCodec(img: codec_as, _: Allocator) Allocator.Error!Symbol {
+        return .{ .kind = img.kind, .name = img.name, .owner = img.owner, .file = img.file, .flags = img.flags, .decl = .ofKind(img.decl), .detail = img.detail };
+    }
 };
 
 pub const HeaderState = enum(u8) { pending, resolving, done };
@@ -196,6 +209,26 @@ pub const ClassInfo = struct {
     /// The type `this` has inside the class: the class applied to its own
     /// type parameters.
     self_type: TypeId = .none,
+
+    /// How a base image carries a class: its member index as a list, in
+    /// its order.
+    pub const codec_as = Replaced(ClassInfo, "members", []const IndexEntry);
+
+    pub fn toCodec(self: *const ClassInfo, a: Allocator) Allocator.Error!codec_as {
+        var out: codec_as = undefined;
+        inline for (@typeInfo(codec_as).@"struct".fields) |f| {
+            @field(out, f.name) = if (comptime std.mem.eql(u8, f.name, "members")) try flattenIndex(a, &self.members) else @field(self, f.name);
+        }
+        return out;
+    }
+
+    pub fn fromCodec(img: codec_as, a: Allocator) Allocator.Error!ClassInfo {
+        var out: ClassInfo = undefined;
+        inline for (@typeInfo(codec_as).@"struct".fields) |f| {
+            @field(out, f.name) = if (comptime std.mem.eql(u8, f.name, "members")) try rebuildIndex(a, img.members) else @field(img, f.name);
+        }
+        return out;
+    }
 };
 
 pub const FunctionInfo = struct {
@@ -267,6 +300,9 @@ pub const PropertyInfo = struct {
     /// The type of an explicit backing field (`field = ...`), set when
     /// the property's body resolves.
     field_ty: TypeId = .none,
+    /// The type of the delegate `by` names, set when the property's body
+    /// resolves.
+    delegate_ty: TypeId = .none,
     /// As `FunctionInfo.overrides`.
     overrides: ?[]const Sym = null,
     /// As `FunctionInfo.forwards` and `delegation`.
@@ -326,7 +362,63 @@ pub const PackageInfo = struct {
     /// Top-level declarations of every file in the package.
     members: NameIndex = .empty,
     subpackages: std.AutoHashMapUnmanaged(Name, Sym) = .empty,
+
+    /// How a base image carries a package: its indexes as lists.
+    pub const codec_as = struct { fqn: Name, members: []const IndexEntry, subpackages: []const Subpackage };
+    const Subpackage = struct { name: Name, package: Sym };
+
+    pub fn toCodec(self: *const PackageInfo, a: Allocator) Allocator.Error!codec_as {
+        const subs = try a.alloc(Subpackage, self.subpackages.count());
+        var it = self.subpackages.iterator();
+        var i: usize = 0;
+        while (it.next()) |e| : (i += 1) subs[i] = .{ .name = e.key_ptr.*, .package = e.value_ptr.* };
+        std.mem.sort(Subpackage, subs, {}, struct {
+            fn lt(_: void, x: Subpackage, y: Subpackage) bool {
+                return x.name.int() < y.name.int();
+            }
+        }.lt);
+        return .{ .fqn = self.fqn, .members = try flattenIndex(a, &self.members), .subpackages = subs };
+    }
+
+    pub fn fromCodec(img: codec_as, a: Allocator) Allocator.Error!PackageInfo {
+        var out: PackageInfo = .{ .fqn = img.fqn, .members = try rebuildIndex(a, img.members) };
+        try out.subpackages.ensureTotalCapacity(a, @intCast(img.subpackages.len));
+        for (img.subpackages) |e| out.subpackages.putAssumeCapacity(e.name, e.package);
+        return out;
+    }
 };
+
+/// A name and every symbol a member index declares under it.
+pub const IndexEntry = struct { name: Name, syms: []const Sym };
+
+/// `index` as a list, in its order.
+fn flattenIndex(a: Allocator, index: *const NameIndex) Allocator.Error![]const IndexEntry {
+    const out = try a.alloc(IndexEntry, index.count());
+    for (index.keys(), index.values(), out) |k, v, *o| o.* = .{ .name = k, .syms = v.items };
+    return out;
+}
+
+/// The index `entries` list, in their order. Its lists are `entries`'
+/// slices, which a later declaration under the same name copies before it
+/// appends.
+fn rebuildIndex(a: Allocator, entries: []const IndexEntry) Allocator.Error!NameIndex {
+    var out: NameIndex = .empty;
+    try out.ensureTotalCapacity(a, entries.len);
+    for (entries) |e| out.putAssumeCapacityNoClobber(e.name, .{ .items = @constCast(e.syms), .capacity = e.syms.len });
+    return out;
+}
+
+/// `T` with its field `name` carried as `F`.
+fn Replaced(comptime T: type, comptime name: []const u8, comptime F: type) type {
+    const src = @typeInfo(T).@"struct".fields;
+    var names: [src.len][]const u8 = undefined;
+    var types: [src.len]type = undefined;
+    for (src, 0..) |f, i| {
+        names[i] = f.name;
+        types[i] = if (std.mem.eql(u8, f.name, name)) F else f.type;
+    }
+    return @Struct(.auto, null, &names, &types, &@splat(.{}));
+}
 
 pub const Symbols = struct {
     arena: Allocator,

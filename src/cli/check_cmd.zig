@@ -160,7 +160,7 @@ pub fn runCheckSema(gpa: std.mem.Allocator, files: []const []const u8, format: D
     defer mem.deinit();
     const arena = mem.arena();
     var load_report: sema_cmd.LoadReport = .{};
-    const src = sema_cmd.loadSources(arena, mem.map, files, .{ .feature_specs = feature_specs, .report = &load_report }) catch |e| switch (e) {
+    const src = sema_cmd.loadSources(arena, mem.map, files, .{ .feature_specs = feature_specs, .report = &load_report, .image = true }) catch |e| switch (e) {
         error.ProgramSyntax => return syntaxOnly(gpa, files, format),
         else => return sema_run.loadFailed(gpa, e, &load_report),
     };

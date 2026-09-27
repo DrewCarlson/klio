@@ -30,7 +30,7 @@ pub const Built = struct {
 /// the program's own files, or no `main`.
 pub fn buildProgram(gpa: Allocator, arena: Allocator, map: *span.SourceMap, paths: []const []const u8, feature_specs: []const []const u8) ?Built {
     var report: sema_cmd.LoadReport = .{};
-    const loaded = sema_cmd.loadSources(arena, map, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .report = &report });
+    const loaded = sema_cmd.loadSources(arena, map, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .report = &report, .image = true });
     io.writeStderr(report.syntax.items);
     const src = loaded catch |e| {
         switch (e) {
@@ -160,7 +160,7 @@ pub fn runLauncher(gpa: Allocator, paths: []const []const u8, out_path: ?[]const
         },
     };
     defer gpa.free(baked.bytes);
-    const built = pipeline.buildOnBase(arena, baked.src, sema_cmd.hostBinding(gpa), baked.base) catch |e| {
+    const built = pipeline.buildOnImage(arena, baked.src.program, sema_cmd.hostBinding(gpa), baked.base, null) catch |e| {
         io.printStderr(gpa, "error: the program does not build over its base image: {s}\n", .{@errorName(e)});
         return 1;
     };

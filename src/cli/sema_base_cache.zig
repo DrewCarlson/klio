@@ -1,5 +1,5 @@
 //! Where the sema pipeline keeps base images: one file per base, keyed by
-//! the klio binary and every base file's path and text, under
+//! the klio binary and what the base is built from (`Key`), under
 //! `$KLIO_HOME/.klio/cache` (or `~/.klio/cache`) as
 //! `sema-base-<key>.klio-sema`. The build installs the image of the base a
 //! program without packs runs on beside the binary, under
@@ -8,8 +8,6 @@
 //! ignores the installed copy.
 
 const std = @import("std");
-const span = @import("span");
-const sema = @import("sema");
 const runtime = @import("runtime");
 const lower_driver = @import("lower_driver");
 
@@ -22,38 +20,56 @@ pub fn disabled() bool {
     return std.mem.eql(u8, std.mem.span(v), "0");
 }
 
-/// The cache file of the base `base` as loaded into `map`; null when there
-/// is no cache directory. Owned by `a`.
-pub fn pathFor(a: Allocator, map: *const span.SourceMap, base: []const sema.SourceFile) ?[]const u8 {
-    const dir = cacheDir(a) orelse return null;
-    return pathIn(a, dir, map, base);
-}
+/// What names a base's image: the binary (a rebuilt klio binds natives
+/// differently), the image's layout, and the base, as the files it is built
+/// from, read but not parsed. The stdlib's and the sema actuals' files go
+/// in by path and text, a pack by its content hash and the features it was
+/// loaded with, each in the order the base loads it.
+pub const Key = struct {
+    h: std.crypto.hash.Blake3,
 
-/// The file the image of `base` has in the cache directory `dir`. Owned by
-/// `a`.
-pub fn pathIn(a: Allocator, dir: []const u8, map: *const span.SourceMap, base: []const sema.SourceFile) ?[]const u8 {
-    return std.fmt.allocPrint(a, "{s}/{s}", .{ dir, fileName(map, base) }) catch null;
-}
-
-/// `sema-base-<key>.klio-sema`: the key hashes the binary's stamp, the
-/// image version and every base file's path and text.
-fn fileName(map: *const span.SourceMap, base: []const sema.SourceFile) [std.fmt.count("sema-base-{s}.klio-sema", .{[_]u8{0} ** 32})]u8 {
-    var h = std.crypto.hash.Blake3.init(.{});
-    if (exeStamp()) |stamp| h.update(std.mem.asBytes(&stamp));
-    h.update(std.mem.asBytes(&base_image.version));
-    for (base) |sf| {
-        const src = map.getChecked(sf.ast.span.file) orelse continue;
-        h.update(sf.path);
-        h.update(&.{0});
-        h.update(std.mem.asBytes(&src.source.len));
-        h.update(src.source);
+    pub fn init() Key {
+        var k: Key = .{ .h = .init(.{}) };
+        if (exeStamp()) |stamp| k.h.update(std.mem.asBytes(&stamp));
+        k.h.update(std.mem.asBytes(&base_image.version));
+        return k;
     }
-    var key: [32]u8 = undefined;
-    h.final(&key);
-    const hex = std.fmt.bytesToHex(key[0..16], .lower);
-    var out: [std.fmt.count("sema-base-{s}.klio-sema", .{[_]u8{0} ** 32})]u8 = undefined;
-    _ = std.fmt.bufPrint(&out, "sema-base-{s}.klio-sema", .{hex}) catch unreachable;
-    return out;
+
+    pub fn file(self: *Key, path: []const u8, text: []const u8) void {
+        self.h.update(path);
+        self.h.update(&.{0});
+        self.h.update(std.mem.asBytes(&text.len));
+        self.h.update(text);
+    }
+
+    pub fn pack(self: *Key, hash: []const u8, features: []const []const u8) void {
+        self.h.update("pack\x00");
+        self.h.update(hash);
+        for (features) |f| {
+            self.h.update(f);
+            self.h.update(&.{0});
+        }
+        self.h.update(&.{1});
+    }
+
+    pub fn final(self: *Key) [16]u8 {
+        var out: [32]u8 = undefined;
+        self.h.final(&out);
+        return out[0..16].*;
+    }
+};
+
+/// The cache file of the base `key` names; null when there is no cache
+/// directory. Owned by `a`.
+pub fn pathFor(a: Allocator, key: [16]u8) ?[]const u8 {
+    const dir = cacheDir(a) orelse return null;
+    return pathIn(a, dir, key);
+}
+
+/// The file the image of the base `key` names has in the cache directory
+/// `dir`: `sema-base-<key>.klio-sema`. Owned by `a`.
+pub fn pathIn(a: Allocator, dir: []const u8, key: [16]u8) ?[]const u8 {
+    return std.fmt.allocPrint(a, "{s}/sema-base-{s}.klio-sema", .{ dir, std.fmt.bytesToHex(key, .lower) }) catch null;
 }
 
 /// The image at `path`, read into `a`; else the copy the build installed
@@ -135,3 +151,4 @@ fn exeStamp() ?[2]u64 {
     // elsewhere and copied to Windows keys as the one that baked its image.
     return .{ st.size, mtime_ns - mtime_ns % 100 };
 }
+

@@ -746,6 +746,7 @@ fn resolvePropertyIn(ctx: *Ctx, p: Sym) Allocator.Error!void {
         const recv = s.syms.propertyInfo(p).receiver;
         const this_ref = if (recv != .none) recv else host;
         delegate_t = try delegateExpr(ctx, d, s.syms.propertyInfo(p).ty, pd.mutable, this_ref);
+        s.syms.propertyInfo(p).delegate_ty = delegate_t;
     }
     const sc = try pushPropertyScope(ctx, p);
     defer ctx.pop(sc);

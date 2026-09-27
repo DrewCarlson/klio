@@ -1256,18 +1256,13 @@ fn hasBackingField(b: *Builder, p: Sym) bool {
     return b.p.s.syms.propertyInfo(p).has_delegate or b.p.br.fieldOf(p) != null;
 }
 
-/// The type of a delegated property's delegate, from its file's records.
+/// The type of a delegated property's delegate.
 fn delegateType(b: *Builder, p: Sym) Error!sema.TypeId {
     const s = b.p.s;
-    // A delegate's type is in the records of the build that lowers it.
-    const pd = switch (s.syms.get(p).decl) {
-        .property => |pd| pd.?,
-        else => return .none,
-    };
-    const d = pd.delegate orelse return .none;
-    const file = s.syms.get(p).file;
-    if (file >= b.p.br.records.len) return .none;
-    return sema.output.exprType(&b.p.br.records[file], d.id());
+    if (s.syms.get(p).decl != .property) return .none;
+    // Resolved with the property's body, the base's at the bake.
+    if (!s.syms.propertyInfo(p).body_done) _ = try sema.headers.propertyType(s, p);
+    return s.syms.propertyInfo(p).delegate_ty;
 }
 
 fn stableMarkedDescendant(s: *sema.Sema, cls: Sym, depth: u8) Error!bool {

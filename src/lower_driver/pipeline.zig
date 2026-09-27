@@ -13,12 +13,22 @@ const Allocator = std.mem.Allocator;
 const bridge = ir.bridge;
 const lower = ir.lower_sema;
 pub const base_image = @import("base_image.zig");
+pub const base_sema = @import("base_sema.zig");
 
 /// The files of one run, in the layers sema adds them: the base (the
 /// stdlib and the packs) and the program.
 pub const Sources = struct {
+    /// Empty when the base comes from `image`.
     base: []const sema.SourceFile,
     program: []const sema.SourceFile,
+    /// The base's image, found for it before any of it parsed: the base is
+    /// its, and its files are in the source map with their lines only.
+    image: ?[]const u8 = null,
+    /// What names the base's image in the cache.
+    key: ?[16]u8 = null,
+    /// The driver's own record of the base, which a bake keeps in the image
+    /// (`base_image.Front.driver`).
+    record: []const u8 = "",
 };
 
 pub const Built = struct {
@@ -70,9 +80,10 @@ pub fn build(a: Allocator, src: Sources, binding: Binding) !Built {
 }
 
 /// The base image of `base`: sema over the base alone, the bridge and the
-/// lowering of every base body, serialized (`base_image.encode`). Owned by
+/// lowering of every base body, serialized (`base_image.encode`) with the
+/// base's files of `map` and the driver's own `record`. Owned by
 /// `gpa`; `a` holds the build and can be dropped after.
-pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, binding: Binding) ![]u8 {
+pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, binding: Binding, map: *const span.SourceMap, record: []const u8) ![]u8 {
     const s = try sema.Sema.init(a);
     try s.addFiles(base);
     const prefix: u32 = @intCast(s.syms.count());
@@ -89,25 +100,32 @@ pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, bin
         const syms = &s.syms;
         std.debug.print("[sema-timing] bake: {d} symbols ({d} declared; {d} functions, {d} properties, {d} params, {d} locals, {d} classes), {d} types, {d} names\n", .{ syms.count(), prefix, syms.functions.items.len, syms.properties.items.len, syms.params.items.len, syms.locals.items.len, syms.classes.items.len, s.types.items.items.len, s.names.strs.items.len });
     }
-    return base_image.encode(gpa, a, s, br, &prog.lowered, prefix);
+    return base_image.encode(gpa, a, s, br, &prog.lowered, prefix, map, sourceCount(base), record);
 }
 
-/// A build over the base image `image`: the base is collected, checked
-/// against the image's digest and decoded from it; only the program's
-/// bodies are analyzed and lowered. `error.Stale` when the image is not of
-/// this base. `image` must outlive the result.
-pub fn buildOnBase(a: Allocator, src: Sources, binding: Binding, image: []const u8) !Built {
+/// How many files of the source map the base's are: they are registered
+/// first, the program's after them.
+pub fn sourceCount(base: []const sema.SourceFile) usize {
+    var n: usize = 0;
+    for (base) |f| n = @max(n, f.ast.span.file.int() + 1);
+    return n;
+}
+
+/// A build over the base image `image`, which carries the base's sema: the
+/// base decodes whole, from the image alone, and only `program` is
+/// analyzed, bridged and lowered. With `map`, the base's files join it
+/// first, as the bake registered them; without, they are there already.
+/// `image` must outlive the result.
+pub fn buildOnImage(a: Allocator, program: []const sema.SourceFile, binding: Binding, image: []const u8, map: ?*span.SourceMap) !Built {
     var t = Timing.start();
-    const s = try sema.Sema.init(a);
-    try s.addFiles(src.base);
-    t.mark("collect base");
     const saved_perm = runtime.gc.alloc_perm;
     runtime.gc.alloc_perm = true;
     defer runtime.gc.alloc_perm = saved_perm;
-    const loaded = try base_image.decode(a, image, s, .{ .natives = binding.natives, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries });
+    const loaded = try base_image.load(a, image, .{ .natives = binding.natives, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries }, map);
     t.mark("load base image");
-    const base_layer: bridge.Layer = .{ .syms = loaded.header.prefix, .files = @intCast(s.files.items.len) };
-    try s.addFiles(src.program);
+    const s = loaded.br.s;
+    const base_layer: bridge.Layer = .{ .syms = @intCast(s.syms.count()), .files = @intCast(s.files.items.len) };
+    try s.addFiles(program);
     const program_layer: bridge.Layer = .{ .syms = @intCast(s.syms.count()), .files = @intCast(s.files.items.len) };
     t.mark("collect program");
     try s.resolveBodies(&.{.program});
@@ -122,6 +140,19 @@ pub fn buildOnBase(a: Allocator, src: Sources, binding: Binding, image: []const 
     return .{ .s = s, .br = br, .prog = prog };
 }
 
+/// `buildOnImage` with nothing lowered: sema over the program alone, over
+/// the base the image carries.
+pub fn analyzeOnImage(a: Allocator, program: []const sema.SourceFile, binding: Binding, image: []const u8, map: ?*span.SourceMap) !*sema.Sema {
+    const saved_perm = runtime.gc.alloc_perm;
+    runtime.gc.alloc_perm = true;
+    defer runtime.gc.alloc_perm = saved_perm;
+    const loaded = try base_image.load(a, image, .{ .natives = binding.natives, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries }, map);
+    const s = loaded.br.s;
+    try s.addFiles(program);
+    try s.resolveBodies(&.{.program});
+    return s;
+}
+
 /// Sema over every file of `src`, with nothing lowered: what a check of the
 /// program reports from.
 pub fn analyze(a: Allocator, src: Sources) !*sema.Sema {
@@ -133,20 +164,6 @@ pub fn analyze(a: Allocator, src: Sources) !*sema.Sema {
     return s;
 }
 
-/// `analyze` over the base image `image`: the base is decoded from it and
-/// only the program's bodies are analyzed. `error.Stale` when the image is
-/// not of this base. `image` must outlive the result.
-pub fn analyzeOnBase(a: Allocator, src: Sources, binding: Binding, image: []const u8) !*sema.Sema {
-    const s = try sema.Sema.init(a);
-    try s.addFiles(src.base);
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
-    _ = try base_image.decode(a, image, s, .{ .natives = binding.natives, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries });
-    try s.addFiles(src.program);
-    try s.resolveBodies(&.{.program});
-    return s;
-}
 
 /// `KLIO_SEMA_TIMING`: the milliseconds each step of `build` took, and the
 /// resident memory after it.

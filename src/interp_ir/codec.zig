@@ -102,6 +102,18 @@ pub fn Growable(comptime T: type) type {
     };
 }
 
+/// A type with `codec_as` encodes as that type instead: `toCodec(self, a)`
+/// makes the image of a value (allocating from the encode's own arena) and
+/// `fromCodec(image, a)` the value back from one (into the decode's
+/// allocator). A symbol carries its declaration's kind this way, without
+/// the AST it points into.
+fn hasCodecAs(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union" => @hasDecl(T, "codec_as"),
+        else => false,
+    };
+}
+
 fn isGrowable(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "codec_growable");
 }
@@ -121,6 +133,9 @@ fn typeId(comptime T: type) usize {
 const Encoder = struct {
     gpa: Allocator,
     out: std.ArrayList(u8) = .empty,
+    /// What `toCodec` makes lives until the encode ends: a slice's address
+    /// keys its back references, so none may be reused while it runs.
+    images: ?std.heap.ArenaAllocator = null,
     nodes: std.AutoHashMap(NodeKey, u32),
     node_count: u32 = 0,
     slices: std.AutoHashMap(SliceKey, u32),
@@ -135,6 +150,7 @@ const Encoder = struct {
     }
 
     fn deinit(self: *Encoder) void {
+        if (self.images) |*arena| arena.deinit();
         self.out.deinit(self.gpa);
         self.nodes.deinit();
         self.slices.deinit();
@@ -197,6 +213,12 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
         const gop = try e.nodes.getOrPut(key);
         if (!gop.found_existing) gop.value_ptr.* = e.node_count;
         e.node_count += 1;
+    }
+    if (comptime hasCodecAs(T)) {
+        if (e.images == null) e.images = std.heap.ArenaAllocator.init(e.gpa);
+        const img = try value.toCodec(e.images.?.allocator());
+        try encodeValue(T.codec_as, e, &img);
+        return;
     }
     if (comptime isGrowable(T)) {
         try e.varint(value.items.len);
@@ -388,6 +410,12 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
     }
     if (comptime isWatched(T)) {
         try d.nodes.append(d.scratch, @intFromPtr(out));
+    }
+    if (comptime hasCodecAs(T)) {
+        var img: T.codec_as = undefined;
+        try decodeInto(T.codec_as, d, &img);
+        out.* = try T.fromCodec(img, d.a);
+        return;
     }
     if (comptime isGrowable(T)) {
         const len: usize = @intCast(try d.varint());

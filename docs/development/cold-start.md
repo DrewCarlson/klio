@@ -10,20 +10,24 @@ and lowers only the program.
 
 ## The steps
 
-`sema_run.buildRun` (`src/cli/sema_run.zig`) decides which kind of run it is:
+`sema_cmd.loadSources` and `sema_run.buildRun` (`src/cli/sema_run.zig`) decide
+which kind of run it is:
 
-1. The cache path is `$KLIO_HOME/.klio/cache/sema-base-<key>.klio-sema`, keyed
-   by the binary and every base file's path and text
-   (`src/cli/sema_base_cache.zig`). A missing entry falls back to the copy the
-   build installed under `share/klio/cache` beside the binary.
-2. An image that reads back is extended with the program
-   (`pipeline.buildOnBase`): sema analyzes the program's files over the base's
-   symbols, the bridge extends the base's, and only the program's bodies lower.
-3. With no usable image, `pipeline.bakeBase` analyzes and lowers the base
-   alone, encodes its bridge and bodies (`src/lower_driver/base_image.zig`),
-   writes the cache entry, and the run continues as in step 2 over the bytes it
-   just baked. An image of another base, or of an older format, bakes afresh
-   the same way.
+1. The base is named before any of it parses (`sema_base_cache.Key`): the
+   binary, the image layout, the stdlib's and klio's actuals' texts, and the
+   content hash and features of each pack the program selects. The cache path
+   is `$KLIO_HOME/.klio/cache/sema-base-<key>.klio-sema`; a missing entry falls
+   back to the copy the build installed under `share/klio/cache` beside the
+   binary.
+2. An image that reads back gives the run its base whole: the base's files
+   join the source map with their lines only, and the program is analyzed,
+   bridged and lowered over the base's sema, bridge and module
+   (`pipeline.buildOnImage`). No base file parses.
+3. With no usable image, the base parses, and `pipeline.bakeBase` analyzes and
+   lowers it alone, encodes its sema, bridge and bodies
+   (`src/lower_driver/base_image.zig`, `docs/design/SEMA-IMAGE.md`), writes the
+   cache entry, and the run continues as in step 2 over the bytes it just
+   baked.
 
 `klio bake` fills the cache without running anything; `klio bake-image`
 writes a self-contained image (`src/cli/sema_image.zig`) that also carries the

@@ -28,68 +28,76 @@ fn execEntry(ctx: ExecCtx) ExecOutcome {
     return .{ .exec = exec };
 }
 
-/// The run's build over the cached base image, baked first when there is
-/// none; over the base analyzed afresh when there is no cache or the image
-/// is not of this base.
+/// The run's build over its base's image: the one `loadSources` found
+/// before the base parsed, else the cached one, else one baked now and
+/// cached; over the base analyzed afresh when there is no cache.
 pub fn buildRun(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, src: pipeline.Sources, binding: pipeline.Binding) !pipeline.Built {
+    if (src.image) |bytes| return pipeline.buildOnImage(arena, src.program, binding, bytes, null);
     if (sema_base_cache.disabled()) return pipeline.build(arena, src, binding);
-    const path = sema_base_cache.pathFor(arena, map, src.base) orelse return pipeline.build(arena, src, binding);
-    if (sema_base_cache.read(arena, path)) |bytes| {
-        if (pipeline.buildOnBase(arena, src, binding, bytes)) |b| return b else |e| switch (e) {
+    const path = pathOf(arena, src);
+    if (path) |p| if (sema_base_cache.read(arena, p)) |bytes| {
+        if (pipeline.buildOnImage(arena, src.program, binding, bytes, null)) |b| return b else |e| switch (e) {
             error.Stale, error.Malformed => {},
             else => return e,
         }
-    }
-    const bytes = try bakeBase(gpa, arena, src.base, binding, path);
-    return pipeline.buildOnBase(arena, src, binding, bytes) catch |e| switch (e) {
+    };
+    const bytes = try bakeBase(gpa, arena, map, src, binding, path);
+    return pipeline.buildOnImage(arena, src.program, binding, bytes, null) catch |e| switch (e) {
         error.Stale, error.Malformed => pipeline.build(arena, src, binding),
         else => e,
     };
 }
 
-/// Sema over `src` as `buildRun` analyzes it, with nothing lowered: over
-/// the cached base image, baked first when there is none.
+/// Sema over `src` as `buildRun` analyzes it, with nothing lowered.
 pub fn analyzeRun(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, src: pipeline.Sources, binding: pipeline.Binding) !*sema.Sema {
+    if (src.image) |bytes| return pipeline.analyzeOnImage(arena, src.program, binding, bytes, null);
     if (sema_base_cache.disabled()) return pipeline.analyze(arena, src);
-    const path = sema_base_cache.pathFor(arena, map, src.base) orelse return pipeline.analyze(arena, src);
-    if (sema_base_cache.read(arena, path)) |bytes| {
-        if (pipeline.analyzeOnBase(arena, src, binding, bytes)) |s| return s else |e| switch (e) {
+    const path = pathOf(arena, src);
+    if (path) |p| if (sema_base_cache.read(arena, p)) |bytes| {
+        if (pipeline.analyzeOnImage(arena, src.program, binding, bytes, null)) |s| return s else |e| switch (e) {
             error.Stale, error.Malformed => {},
             else => return e,
         }
-    }
-    const bytes = try bakeBase(gpa, arena, src.base, binding, path);
-    return pipeline.analyzeOnBase(arena, src, binding, bytes) catch |e| switch (e) {
+    };
+    const bytes = try bakeBase(gpa, arena, map, src, binding, path);
+    return pipeline.analyzeOnImage(arena, src.program, binding, bytes, null) catch |e| switch (e) {
         error.Stale, error.Malformed => pipeline.analyze(arena, src),
         else => e,
     };
 }
 
-/// The base image of `base`: the cached one, else the one the build
+/// Where the cache keeps the image of `src`'s base; null without a cache
+/// or a key.
+fn pathOf(arena: Allocator, src: pipeline.Sources) ?[]const u8 {
+    if (sema_base_cache.disabled()) return null;
+    return sema_base_cache.pathFor(arena, src.key orelse return null);
+}
+
+/// The base image of `src`: the cached one, else the one the build
 /// installed, else baked now and cached. Owned by `arena`.
-pub fn baseImage(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, base: []const sema.SourceFile, binding: pipeline.Binding) ![]const u8 {
-    const path = if (sema_base_cache.disabled()) null else sema_base_cache.pathFor(arena, map, base);
+pub fn baseImage(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, src: pipeline.Sources, binding: pipeline.Binding) ![]const u8 {
+    if (src.image) |bytes| return bytes;
+    const path = pathOf(arena, src);
     if (path) |p| {
         if (sema_base_cache.read(arena, p)) |bytes| {
             if (pipeline.base_image.header(bytes) != null) return bytes;
         }
     }
-    return bakeBase(gpa, arena, base, binding, path);
+    return bakeBase(gpa, arena, map, src, binding, path);
 }
 
-/// Bakes the base image of `base` afresh into `arena`, whatever the cache
+/// Bakes the base image of `src` afresh into `arena`, whatever the cache
 /// holds, and caches it.
-pub fn bakeBaseFresh(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, base: []const sema.SourceFile, binding: pipeline.Binding) ![]const u8 {
-    const path = if (sema_base_cache.disabled()) null else sema_base_cache.pathFor(arena, map, base);
-    return bakeBase(gpa, arena, base, binding, path);
+pub fn bakeBaseFresh(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, src: pipeline.Sources, binding: pipeline.Binding) ![]const u8 {
+    return bakeBase(gpa, arena, map, src, binding, pathOf(arena, src));
 }
 
-/// Bakes the base image of `base` into `arena`, and writes it to the cache
+/// Bakes the base image of `src` into `arena`, and writes it to the cache
 /// at `path` when there is one.
-fn bakeBase(gpa: Allocator, arena: Allocator, base: []const sema.SourceFile, binding: pipeline.Binding, path: ?[]const u8) ![]const u8 {
+fn bakeBase(gpa: Allocator, arena: Allocator, map: *const span.SourceMap, src: pipeline.Sources, binding: pipeline.Binding, path: ?[]const u8) ![]const u8 {
     // The bake's cells are permanent, so it shares the run's arena.
     var t = pipeline.Timing.start();
-    const baked = try pipeline.bakeBase(arena, gpa, base, binding);
+    const baked = try pipeline.bakeBase(arena, gpa, src.base, binding, map, src.record);
     defer gpa.free(baked);
     t.mark("bake base image");
     if (path) |p| sema_base_cache.write(arena, p, baked);
@@ -152,7 +160,7 @@ pub fn run(gpa: Allocator, paths: []const []const u8, feature_specs: []const []c
     const arena = mem.arena();
     const map = mem.map;
 
-    const p = switch (prepare(gpa, mem, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true }, null)) {
+    const p = switch (prepare(gpa, mem, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .image = true }, null)) {
         .ok => |ok| ok,
         .exit => |code| return code,
     };
@@ -195,7 +203,7 @@ pub fn prepare(gpa: Allocator, mem: RunMemory, paths: []const []const u8, opts: 
     runtime.prof.phaseMark("load and parse");
     const binding = sema_cmd.hostBinding(gpa);
     if (image) |given| {
-        const built = pipeline.buildOnBase(mem.arena(), src, binding, given.bytes) catch |e| {
+        const built = pipeline.buildOnImage(mem.arena(), src.program, binding, given.bytes, null) catch |e| {
             switch (e) {
                 error.Stale => io.printStderr(gpa, "error: the base image was baked by another klio or from another base; {s}\n", .{given.remedy}),
                 error.Malformed => io.printStderr(gpa, "error: the base image is malformed; {s}\n", .{given.remedy}),

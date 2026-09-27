@@ -17,7 +17,7 @@ const testing = std.testing;
 
 fn encodeMini(a: std.mem.Allocator) ![]const u8 {
     const baked = try driver.bake(a);
-    return base_image.encode(a, a, baked.s, baked.br, &baked.lowered, baked.layer.syms);
+    return baked.encode(a);
 }
 
 test "an image names its layout, and a foreign file is not one" {
@@ -96,7 +96,7 @@ test "a decoded image holds every function and class of the bake, block for bloc
     defer arena.deinit();
     const a = arena.allocator();
     const baked = try driver.bake(a);
-    const bytes = try base_image.encode(a, a, baked.s, baked.br, &baked.lowered, baked.layer.syms);
+    const bytes = try baked.encode(a);
     const loaded = try decodeLoaded(a, bytes);
     const m0 = baked.br.m;
     const m1 = loaded.br.m;
@@ -123,7 +123,10 @@ test "a decoded image, its bodies materialised, encodes to the same bytes" {
     const bytes = try encodeMini(a);
     const loaded = try decodeLoaded(a, bytes);
     for (loaded.br.m.funcs.items) |*f| _ = loaded.br.m.ensureFuncBody(f);
-    const again = try base_image.encode(a, a, loaded.br.s, loaded.br, &loaded.lowered, loaded.header.prefix);
+    var map = span.SourceMap.init(a);
+    const reloaded = try base_image.load(a, bytes, .{ .natives = natives.resolve, .host_fns = interp_ir.hostMemberFn }, &map);
+    for (reloaded.br.m.funcs.items) |*f| _ = reloaded.br.m.ensureFuncBody(f);
+    const again = try base_image.encode(a, a, reloaded.br.s, reloaded.br, &reloaded.lowered, reloaded.header.prefix, &map, map.files.items.len, "");
     try testing.expectEqualSlices(u8, bytes, again);
 }
 

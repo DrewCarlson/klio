@@ -29,10 +29,10 @@ pub fn bake(gpa: Allocator, paths: []const []const u8, feature_specs: []const []
     const mem = sema_run.RunMemory.init() catch return 2;
     defer mem.deinit();
     var report: sema_cmd.LoadReport = .{};
-    const loaded = sema_cmd.loadSources(mem.arena(), mem.map, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .report = &report });
+    const loaded = sema_cmd.loadSources(mem.arena(), mem.map, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .report = &report, .image = true });
     io.writeStderr(report.syntax.items);
     const src = loaded catch |e| return sema_run.loadFailed(gpa, e, &report);
-    _ = sema_run.baseImage(gpa, mem.arena(), mem.map, src.base, sema_cmd.hostBinding(gpa)) catch |e| {
+    _ = sema_run.baseImage(gpa, mem.arena(), mem.map, src, sema_cmd.hostBinding(gpa)) catch |e| {
         io.printStderr(gpa, "error: could not bake a base image for this configuration: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -60,11 +60,11 @@ pub fn bakeStdlibCache(gpa: Allocator, dir: []const u8, for_exe: ?[]const u8) u8
         io.printStderr(gpa, "error: cannot create {s}\n", .{dir});
         return 1;
     };
-    const path = sema_base_cache.pathIn(a, dir, mem.map, src.base) orelse {
+    const path = sema_base_cache.pathIn(a, dir, src.key orelse return 2) orelse {
         io.printStderr(gpa, "error: cannot name the base image in {s}\n", .{dir});
         return 1;
     };
-    const baked = pipeline.bakeBase(a, gpa, src.base, sema_cmd.hostBinding(gpa)) catch |e| {
+    const baked = pipeline.bakeBase(a, gpa, src.base, sema_cmd.hostBinding(gpa), mem.map, src.record) catch |e| {
         io.printStderr(gpa, "error: the base image did not bake into {s}: {s}\n", .{ dir, @errorName(e) });
         return 1;
     };
@@ -138,13 +138,17 @@ pub fn bakeFor(gpa: Allocator, mem: sema_run.RunMemory, paths: []const []const u
     std.mem.sort([]const u8, packs.items, {}, lessThan);
     const features = try a.dupe([]const u8, feature_specs);
     std.mem.sort([]const u8, features, {}, lessThan);
-    const files = try sema_image.filesOf(a, recorded.items);
+    // The base's files go in only for a program the serialization pass
+    // rewrites, which reads the packs' declarations: any other loads its
+    // base from the image alone.
+    const serialized = try sema_cmd.serializedPrograms(a, mem.map, src.program, src.record);
+    const files = if (serialized) try sema_image.filesOf(a, recorded.items) else &.{};
     const known = try stdlib.knownPackagesSnapshot(a);
     // The image is only of use if a load from it gives the base the image
     // inside was baked against: checked here, against the one the cache
     // gave and, when that does not hold, one baked afresh.
     const binding = sema_cmd.hostBinding(gpa);
-    var base = try sema_run.baseImage(gpa, a, mem.map, src.base, binding);
+    var base = try sema_run.baseImage(gpa, a, mem.map, src, binding);
     var fresh = false;
     while (true) {
         const img: sema_image.Image = .{ .base = base, .files = files, .features = features, .packs = packs.items, .known_packages = known };
@@ -155,7 +159,7 @@ pub fn bakeFor(gpa: Allocator, mem: sema_run.RunMemory, paths: []const []const u
             io.writeStderr("error: the base does not load back from its image the way it was loaded to bake it\n");
             return error.Reported;
         }
-        base = try sema_run.bakeBaseFresh(gpa, a, mem.map, src.base, binding);
+        base = try sema_run.bakeBaseFresh(gpa, a, mem.map, src, binding);
         fresh = true;
     }
 }
@@ -173,8 +177,8 @@ fn reloads(gpa: Allocator, bytes: []const u8, paths: []const []const u8, texts: 
     const a = mem.arena();
     const img = sema_image.decode(a, bytes) catch return false;
     const base = sema_image.baseOf(a, &img) catch return false;
-    const src = sema_cmd.loadSources(a, mem.map, paths, .{ .base = base, .program_texts = texts }) catch return false;
-    _ = pipeline.buildOnBase(a, src, sema_cmd.hostBinding(gpa), img.base) catch return false;
+    const src = sema_cmd.loadSources(a, mem.map, paths, .{ .base = base, .base_image = img.base, .program_texts = texts }) catch return false;
+    _ = pipeline.buildOnImage(a, src.program, sema_cmd.hostBinding(gpa), img.base, null) catch return false;
     return true;
 }
 
@@ -221,7 +225,7 @@ pub fn runOnImage(gpa: Allocator, bytes: []const u8, paths: []const []const u8, 
     };
     for (img.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
     const base = sema_image.baseOf(a, &img) catch return 2;
-    const p = switch (sema_run.prepare(gpa, mem, paths, .{ .base = base, .program_texts = texts }, .{ .bytes = img.base, .remedy = remedy })) {
+    const p = switch (sema_run.prepare(gpa, mem, paths, .{ .base = base, .base_image = img.base, .program_texts = texts }, .{ .bytes = img.base, .remedy = remedy })) {
         .ok => |ok| ok,
         .exit => |code| return code,
     };
