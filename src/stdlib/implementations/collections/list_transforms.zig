@@ -445,8 +445,7 @@ pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
                     kv.key.retain();
                     kv.value.retain();
                 }
-                try g.get().pairs.append(a, kv);
-                try g.get().noteAppended(a, g.get().pairs.items.len - 1);
+                try g.get().append(a, kv);
             }
         }
         return ok(dest);

@@ -1305,7 +1305,7 @@ pub fn iteratorMember(allocator: Allocator, receiver: *const Value, name: []cons
                                 slot.key.release(allocator);
                                 slot.value.release(allocator);
                             }
-                            _ = eg.get().pairs.orderedRemove(i);
+                            _ = eg.get().removeAt(i);
                             break;
                         }
                     }

@@ -354,8 +354,7 @@ const RecordingHost = struct {
                 const g = m.entries.borrowMut();
                 defer g.deinit();
                 for (self.append_entries) |e| {
-                    try g.get().pairs.append(self.allocator, e);
-                    try g.get().noteAppended(self.allocator, g.get().pairs.items.len - 1);
+                    try g.get().append(self.allocator, e);
                 }
             },
             .StringBuilder => |sb| {

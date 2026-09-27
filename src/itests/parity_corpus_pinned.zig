@@ -2699,3 +2699,41 @@ test "derived_receiver_static_binds" {
         \\
     );
 }
+
+test "map_instance_keys" {
+    try check("map_instance_keys",
+        \\size 200, v5, v199, null
+        \\after removes 133, null, v4, false, true
+        \\back 134 13270
+        \\linked 50 49 50 [49, 48, 47, 46] 21 null
+        \\replaced v4 now four
+        \\plain 34 null 40
+        \\points 34 99 null
+        \\points null 99 -1 100
+        \\moved null null null 30
+        \\7
+        \\threw equals of a negative
+        \\mixed 60 int7 str7 id7 null
+        \\
+    );
+}
+
+test "map_keyed_ops" {
+    try check("map_keyed_ops",
+        \\3 putAll 4 100 k1
+        \\3 plusAssign 5 8 50
+        \\3 getOrPut 2 -2 2 -3 6
+        \\3 toMap 6 1 8
+        \\3 associateTo 2 [A, B] 2 X
+        \\3 remove 8 false false 5
+        \\3 minusAssign 5 null null [100]
+        \\40 putAll 41 100 k1
+        \\40 plusAssign 42 8 50
+        \\40 getOrPut 2 -2 2 -3 43
+        \\40 toMap 43 1 8
+        \\40 associateTo 2 [A, B] 2 X
+        \\40 remove 8 false true 42
+        \\40 minusAssign 40 null null [100]
+        \\
+    );
+}

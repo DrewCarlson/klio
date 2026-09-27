@@ -70,7 +70,7 @@ pub fn syncMapView(a: Allocator, receiver: Value) void {
         }
     }
     entries.pairs.shrinkRetainingCapacity(w);
-    entries.invalidate();
+    entries.forgetHashes();
 }
 
 pub fn sublistBackingOf(receiver: Value) ?*runtime.CollBackingRef.Cell {

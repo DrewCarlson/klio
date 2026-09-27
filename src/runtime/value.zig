@@ -371,20 +371,23 @@ pub const MapPair = struct {
     }
 };
 /// Backing store for `Map`/`MutableMap`: the insertion-ordered entry list
-/// Kotlin's `LinkedHashMap` semantics require, plus an optional hash index. The
-/// index is a chained hash over entry positions: `head` maps a key hash to the
-/// first entry index + 1 (0 means empty) and `chain[i]` links to the next entry
-/// in `pairs[i]`'s bucket, biased the same way. It holds no `Value`s. Maps
-/// below `index_threshold` skip it, and a non-hashable key disables it.
+/// Kotlin's `LinkedHashMap` semantics require, plus a hash index over entry
+/// positions. `hashes[i]` is the hash of `pairs[i].key` for each entry below
+/// `hashes.len`: `keyHash` for a simple key, else the hash the host gave for
+/// it (an instance's `hashCode()`), taken once as a `HashMap` node keeps it.
+/// Entries past it are hashed on the next lookup that needs them. `head` maps
+/// a hash to one past the newest indexed entry with it and `chain[i]` links
+/// entry `i` to one past the next older one, 0 ending the bucket; they cover
+/// the first `chain.len` hashes and are rebuilt from `hashes` after a removal.
+/// Maps below `index_threshold` are scanned instead.
 pub const MapStore = struct {
     pairs: std.ArrayList(MapPair) = .empty,
+    hashes: std.ArrayList(u64) = .empty,
     head: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     chain: std.ArrayList(u32) = .empty,
-    /// A mismatch with `pairs.len` means entries were appended without
-    /// maintenance, so `find` rebuilds.
-    indexed_len: usize = 0,
-    built: bool = false,
-    indexable: bool = true,
+    /// A key neither `keyHash` nor the host can hash (a lambda): lookups scan
+    /// until the map is cleared.
+    unhashable: bool = false,
     /// Structural-modification counter for fail-fast iteration, shared with
     /// every `keys`, `values` and `entries` view. Null for a read-only map.
     mod_count: objcell.OptRef(u64) = .{},
@@ -394,6 +397,7 @@ pub const MapStore = struct {
 
     pub fn deinit(self: *MapStore, a: std.mem.Allocator) void {
         self.pairs.deinit(a);
+        self.hashes.deinit(a);
         self.head.deinit(a);
         self.chain.deinit(a);
         if (self.mod_count.get()) |mc| mc.deinit();
@@ -410,8 +414,8 @@ pub const MapStore = struct {
 
     /// Consistent with `Value.structuralEqBoxed`: equal keys hash equal, and
     /// the type tag is mixed in so `5` and `5L` differ. Null for a key that is
-    /// not simple-hashable, which makes the caller disable the index.
-    fn keyHash(k: *const Value) ?u64 {
+    /// not simple-hashable, which only the host can hash.
+    pub fn keyHash(k: *const Value) ?u64 {
         var h = std.hash.Wyhash.init(0);
         switch (k.*) {
             .Int => |x| {
@@ -483,74 +487,126 @@ pub const MapStore = struct {
         return null;
     }
 
-    fn build(self: *MapStore, a: std.mem.Allocator) std.mem.Allocator.Error!void {
-        self.head.clearRetainingCapacity();
-        self.chain.clearRetainingCapacity();
-        try self.chain.ensureTotalCapacity(a, self.pairs.items.len);
-        self.chain.items.len = self.pairs.items.len;
-        for (self.pairs.items, 0..) |*kv, i| {
-            const hsh = keyHash(&kv.key) orelse {
-                self.indexable = false;
-                self.head.clearRetainingCapacity();
-                self.chain.clearRetainingCapacity();
-                return;
-            };
-            const gop = try self.head.getOrPut(a, hsh);
-            if (gop.found_existing) {
-                self.chain.items[i] = gop.value_ptr.*;
-            } else {
-                self.chain.items[i] = 0;
-            }
-            gop.value_ptr.* = @intCast(i + 1);
-        }
-        self.built = true;
-        self.indexed_len = self.pairs.items.len;
+    /// Adds `kv` after the last entry, hashed now when its key is simple.
+    pub fn append(self: *MapStore, a: std.mem.Allocator, kv: MapPair) std.mem.Allocator.Error!void {
+        try self.appendHashed(a, kv, keyHash(&kv.key));
     }
 
-    pub fn find(self: *MapStore, a: std.mem.Allocator, key: *const Value) std.mem.Allocator.Error!?usize {
-        if (!self.indexable or self.pairs.items.len < index_threshold) return self.linearFind(key);
-        if (!self.built or self.indexed_len != self.pairs.items.len) {
-            try self.build(a);
-            if (!self.indexable) return self.linearFind(key);
+    /// Adds `kv` after the last entry, `h` being its key's hash when the
+    /// caller took it. A map below `index_threshold` keeps no hashes.
+    pub fn appendHashed(self: *MapStore, a: std.mem.Allocator, kv: MapPair, h: ?u64) std.mem.Allocator.Error!void {
+        try self.pairs.append(a, kv);
+        const hsh = h orelse return;
+        if (self.pairs.items.len < index_threshold or self.hashes.items.len + 1 != self.pairs.items.len) return;
+        try self.hashes.append(a, hsh);
+        if (self.chain.items.len + 1 == self.hashes.items.len) try self.bucket(a, self.chain.items.len);
+    }
+
+    /// Removes the entry at `i`, keeping the hashes of the others and
+    /// renumbering their buckets.
+    pub fn removeAt(self: *MapStore, i: usize) MapPair {
+        const kv = self.pairs.orderedRemove(i);
+        if (i >= self.hashes.items.len) return kv;
+        const h = self.hashes.orderedRemove(i);
+        if (i >= self.chain.items.len) return kv;
+        const pos: u32 = @intCast(i + 1);
+        const next = self.chain.items[i];
+        // A bucket runs from its newest entry to its oldest, so what links
+        // to `i` is newer than it.
+        if (self.head.getPtr(h)) |first| {
+            if (first.* == pos) {
+                if (next == 0) _ = self.head.remove(h) else first.* = next;
+            } else {
+                var slot = first.*;
+                while (slot != 0) : (slot = self.chain.items[slot - 1]) {
+                    if (self.chain.items[slot - 1] == pos) {
+                        self.chain.items[slot - 1] = next;
+                        break;
+                    }
+                }
+            }
         }
+        _ = self.chain.orderedRemove(i);
+        for (self.chain.items) |*c| {
+            if (c.* > pos) c.* -= 1;
+        }
+        var it = self.head.valueIterator();
+        while (it.next()) |v| {
+            if (v.* > pos) v.* -= 1;
+        }
+        return kv;
+    }
+
+    /// Removes every entry.
+    pub fn clear(self: *MapStore) void {
+        self.pairs.clearRetainingCapacity();
+        self.forgetHashes();
+    }
+
+    /// Drops every hash, for entries rearranged in place: the next lookup
+    /// through the index hashes them again.
+    pub fn forgetHashes(self: *MapStore) void {
+        self.hashes.clearRetainingCapacity();
+        self.head.clearRetainingCapacity();
+        self.chain.clearRetainingCapacity();
+        self.unhashable = false;
+    }
+
+    /// The first entry the index lacks a hash for.
+    pub fn hashedLen(self: *const MapStore) usize {
+        return self.hashes.items.len;
+    }
+
+    /// Takes `hs` as the hashes of the entries from `from` on; false when
+    /// the entries changed since `from` was read.
+    pub fn addHashes(self: *MapStore, a: std.mem.Allocator, from: usize, hs: []const u64) std.mem.Allocator.Error!bool {
+        if (self.hashes.items.len != from or from + hs.len > self.pairs.items.len) return false;
+        try self.hashes.appendSlice(a, hs);
+        return true;
+    }
+
+    /// The positions of the hashed entries whose hash is `h`, oldest first.
+    pub fn bucketOf(self: *MapStore, a: std.mem.Allocator, h: u64, out: *std.ArrayList(u32)) std.mem.Allocator.Error!void {
+        try self.indexHashed(a);
+        var slot = self.head.get(h) orelse 0;
+        while (slot != 0) : (slot = self.chain.items[slot - 1]) try out.append(a, slot - 1);
+        std.mem.reverse(u32, out.items);
+    }
+
+    fn bucket(self: *MapStore, a: std.mem.Allocator, i: usize) std.mem.Allocator.Error!void {
+        const gop = try self.head.getOrPut(a, self.hashes.items[i]);
+        try self.chain.append(a, if (gop.found_existing) gop.value_ptr.* else 0);
+        gop.value_ptr.* = @intCast(i + 1);
+    }
+
+    /// Puts every hashed entry in its bucket.
+    fn indexHashed(self: *MapStore, a: std.mem.Allocator) std.mem.Allocator.Error!void {
+        try self.chain.ensureTotalCapacity(a, self.hashes.items.len);
+        while (self.chain.items.len < self.hashes.items.len) try self.bucket(a, self.chain.items.len);
+    }
+
+    /// The entry whose key equals `key` structurally: through the buckets
+    /// for the hashed entries, by a scan of those after them. The entries
+    /// with simple keys are hashed first.
+    pub fn find(self: *MapStore, a: std.mem.Allocator, key: *const Value) std.mem.Allocator.Error!?usize {
+        if (self.unhashable or self.pairs.items.len < index_threshold) return self.linearFind(key);
         const hsh = keyHash(key) orelse return self.linearFind(key);
-        var slot = self.head.get(hsh) orelse return null;
+        while (self.hashes.items.len < self.pairs.items.len) {
+            const kh = keyHash(&self.pairs.items[self.hashes.items.len].key) orelse break;
+            try self.hashes.append(a, kh);
+        }
+        try self.indexHashed(a);
+        var slot = self.head.get(hsh) orelse 0;
         while (slot != 0) {
             const i = slot - 1;
             if (Value.structuralEqBoxed(&self.pairs.items[i].key, key)) return i;
             slot = self.chain.items[i];
         }
+        const from = self.hashes.items.len;
+        for (self.pairs.items[from..], from..) |*kv, i| {
+            if (Value.structuralEqBoxed(&kv.key, key)) return i;
+        }
         return null;
-    }
-
-    /// Maintains a live index incrementally; otherwise the index builds lazily
-    /// on the next `find`.
-    pub fn noteAppended(self: *MapStore, a: std.mem.Allocator, i: usize) std.mem.Allocator.Error!void {
-        if (!self.built or !self.indexable) return;
-        if (self.indexed_len != i) {
-            self.invalidate();
-            return;
-        }
-        const hsh = keyHash(&self.pairs.items[i].key) orelse {
-            self.indexable = false;
-            self.head.clearRetainingCapacity();
-            self.chain.clearRetainingCapacity();
-            return;
-        };
-        if (self.chain.items.len <= i) {
-            try self.chain.resize(a, i + 1);
-        }
-        const gop = try self.head.getOrPut(a, hsh);
-        self.chain.items[i] = if (gop.found_existing) gop.value_ptr.* else 0;
-        gop.value_ptr.* = @intCast(i + 1);
-        self.indexed_len = self.pairs.items.len;
-    }
-
-    pub fn invalidate(self: *MapStore) void {
-        self.built = false;
-        self.indexed_len = 0;
-        self.head.clearRetainingCapacity();
-        self.chain.clearRetainingCapacity();
     }
 };
 
@@ -3794,6 +3850,54 @@ test "classifier receiver ABI separates host values from source classes" {
     try testing.expectEqual(ReceiverAbi.specialized, classifierReceiverAbi("kotlin.Function2"));
     try testing.expectEqual(ReceiverAbi.instance, classifierReceiverAbi("kotlin.sequences.DropTakeSequence"));
     try testing.expectEqual(ReceiverAbi.instance, classifierReceiverAbi("sample.Collection"));
+}
+
+test "a map finds its keys through the index across appends and removals" {
+    const a = std.testing.allocator;
+    var m: MapStore = .{};
+    defer m.deinit(a);
+    for (0..100) |i| try m.append(a, .{ .key = Value.newInt(@intCast(i)), .value = Value.newInt(@intCast(i * 10)) });
+    try std.testing.expectEqual(@as(?usize, 42), try m.find(a, &Value.newInt(42)));
+    try std.testing.expectEqual(@as(usize, 100), m.hashedLen());
+    // Every third entry out, the rest renumbered in their buckets.
+    var i: usize = 99;
+    while (true) : (i -= 1) {
+        if (i % 3 == 0) _ = m.removeAt(i);
+        if (i == 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 66), m.pairs.items.len);
+    for (0..100) |k| {
+        const at = try m.find(a, &Value.newInt(@intCast(k)));
+        if (k % 3 == 0) {
+            try std.testing.expectEqual(@as(?usize, null), at);
+        } else {
+            try std.testing.expectEqual(@as(i32, @intCast(k * 10)), m.pairs.items[at.?].value.Int);
+        }
+    }
+    try m.append(a, .{ .key = Value.newInt(0), .value = Value.newInt(-1) });
+    try std.testing.expectEqual(@as(?usize, 66), try m.find(a, &Value.newInt(0)));
+    m.clear();
+    try std.testing.expectEqual(@as(?usize, null), try m.find(a, &Value.newInt(1)));
+}
+
+test "a map hashes a host-hashed key only when given its hash" {
+    const a = std.testing.allocator;
+    var m: MapStore = .{};
+    defer m.deinit(a);
+    for (0..20) |i| try m.append(a, .{ .key = Value.newInt(@intCast(i)), .value = .Null });
+    try std.testing.expectEqual(@as(?usize, 3), try m.find(a, &Value.newInt(3)));
+    // A key only the host hashes waits for its hash; later ones queue behind it.
+    try m.appendHashed(a, .{ .key = .Unit, .value = .Null }, null);
+    try m.append(a, .{ .key = Value.newInt(20), .value = .Null });
+    try std.testing.expectEqual(@as(usize, 20), m.hashedLen());
+    try std.testing.expectEqual(@as(?usize, 21), try m.find(a, &Value.newInt(20)));
+    try std.testing.expect(try m.addHashes(a, 20, &.{ 7, MapStore.keyHash(&Value.newInt(20)).? }));
+    try std.testing.expect(!try m.addHashes(a, 20, &.{7}));
+    var at: std.ArrayList(u32) = .empty;
+    defer at.deinit(a);
+    try m.bucketOf(a, 7, &at);
+    try std.testing.expectEqualSlices(u32, &.{20}, at.items);
+    try std.testing.expectEqual(@as(?usize, 21), try m.find(a, &Value.newInt(20)));
 }
 
 test "identity hash of a scalar is its value, of null zero" {

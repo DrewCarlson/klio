@@ -92,6 +92,7 @@ pub const MapViewKind = value_mod.MapViewKind;
 pub const CollBacking = value_mod.CollBacking;
 pub const CollBackingRef = value_mod.CollBackingRef;
 pub const MapPair = value_mod.MapPair;
+pub const MapStore = value_mod.MapStore;
 pub const MapEntries = value_mod.MapEntries;
 pub const RangeKind = value_mod.RangeKind;
 pub const NumericRank = value_mod.NumericRank;

@@ -13,7 +13,7 @@ const common_mod = @import("common.zig");
 const appendVL = common_mod.appendVL;
 const arityErr = common_mod.arityErr;
 const containsBoxedH = common_mod.containsBoxedH;
-const indexOfBoxed = common_mod.indexOfBoxed;
+const indexOfBoxedH = common_mod.indexOfBoxedH;
 const invoke = common_mod.invoke;
 const iterableItemsCtx = common_mod.iterableItemsCtx;
 const listLen = common_mod.listLen;
@@ -245,11 +245,16 @@ pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("remove requires an argument");
     const arg = ctx.args[1];
+    // Found on a snapshot: dispatching `equals` re-enters the VM, which must
+    // not happen under the mutable borrow.
+    const snap = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(snap);
+    const at = try indexOfBoxedH(ctx.host, ctx.out, snap, &arg);
     var removed = false;
-    {
+    if (at) |pos| {
         const g = it.borrowMut();
         defer g.deinit();
-        if (indexOfBoxed(g.get().items, &arg)) |pos| {
+        if (pos < g.get().items.len) {
             const gone = g.get().orderedRemove(pos);
             if (runtime.reclaimEnabled()) gone.release(a);
             removed = true;
