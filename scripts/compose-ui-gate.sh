@@ -55,7 +55,7 @@ EXAMPLES=(
 )
 
 s=$(date +%s)
-rm -rf .klio-local/cache
+rm -rf .klio-local/.klio/cache
 # ReleaseSafe pack builds (the script's default KLIO_BIN is the Debug
 # CLI — 8x slower), trimmed to the compose closure the family needs.
 export KLIO_BIN="$BIN"

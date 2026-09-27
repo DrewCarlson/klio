@@ -6,6 +6,11 @@
 //! `share/klio/cache`, and a run whose own cache has no image reads that one.
 //! `KLIO_SEMA_IMAGE=0` turns the cache off; `KLIO_STDLIB_IMAGE_SHIPPED=0`
 //! ignores the installed copy.
+//!
+//! A run maps its image rather than reading it: the bodies it never calls
+//! are never read in. The cache keeps to a size (`KLIO_CACHE_MAX_MB`, 1 GiB
+//! by default): each write evicts the images used longest ago beyond it,
+//! a read marking its image used.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -72,18 +77,32 @@ pub fn pathIn(a: Allocator, dir: []const u8, key: [16]u8) ?[]const u8 {
     return std.fmt.allocPrint(a, "{s}/sema-base-{s}.klio-sema", .{ dir, std.fmt.bytesToHex(key, .lower) }) catch null;
 }
 
-/// The image at `path`, read into `a`; else the copy the build installed
-/// beside the binary under the same name; null when neither is there.
+/// The image at `path`, mapped read-only for the process's life, and
+/// marked used; else the copy the build installed beside the binary under
+/// the same name; null when neither is there.
 pub fn read(a: Allocator, path: []const u8) ?[]const u8 {
-    if (readFile(a, path)) |bytes| return bytes;
+    if (mapFile(path)) |bytes| {
+        touch(a, path);
+        return bytes;
+    }
     const shipped = shippedPath(a, std.fs.path.basename(path)) orelse return null;
-    return readFile(a, shipped);
+    return mapFile(shipped);
 }
 
-fn readFile(a: Allocator, path: []const u8) ?[]const u8 {
+fn mapFile(path: []const u8) ?[]const u8 {
+    const file = runtime.platform.ReadOnlyFile.open(path) orelse return null;
+    defer file.close();
+    const len = file.size() orelse return null;
+    if (len == 0) return null;
+    return file.mapAll(@intCast(len));
+}
+
+/// Marks the image at `path` used now: eviction takes the images used
+/// longest ago first.
+fn touch(a: Allocator, path: []const u8) void {
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
-    return std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .unlimited) catch null;
+    std.Io.Dir.cwd().setTimestamps(threaded.io(), path, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
 }
 
 /// `<bin dir>/../share/klio/cache/<name>`, where the build installs the
@@ -101,10 +120,65 @@ fn shippedPath(a: Allocator, name: []const u8) ?[]const u8 {
 }
 
 /// Writes `bytes` as the image at `path` through a temporary file, so a
-/// reader never sees half of one. A cache that cannot be written is only
-/// slower.
+/// reader never sees half of one, then keeps the cache to its size
+/// (`prune`). A cache that cannot be written is only slower.
 pub fn write(a: Allocator, path: []const u8, bytes: []const u8) void {
-    writeOrFail(a, path, bytes) catch {};
+    writeOrFail(a, path, bytes) catch return;
+    const dir = std.fs.path.dirname(path) orelse return;
+    prune(a, dir, std.fs.path.basename(path), budget());
+}
+
+/// The cache's size: `KLIO_CACHE_MAX_MB` megabytes, else 1 GiB.
+fn budget() u64 {
+    const mb: u64 = if (runtime.envOnce("KLIO_CACHE_MAX_MB")) |v| std.fmt.parseInt(u64, v, 10) catch 1024 else 1024;
+    return mb * 1024 * 1024;
+}
+
+const Entry = struct { name: []const u8, size: u64, mtime: i128 };
+
+/// Keeps the images in `dir` within `limit` bytes, evicting the ones used
+/// longest ago first and never `keep`. Removes too what an interrupted
+/// write left (a temporary file an hour old) and what an older klio kept
+/// there, which nothing reads (`stdlib-*.klio-image`, `stdlib-meta-*.bin`).
+/// A file that will not go (another process has it open) stays.
+pub fn prune(a: Allocator, dir_path: []const u8, keep: []const u8, limit: u64) void {
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    const now = std.Io.Clock.real.now(io).nanoseconds;
+    var images: std.ArrayList(Entry) = .empty;
+    var total: u64 = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file) continue;
+        const st = dir.statFile(io, e.name, .{}) catch continue;
+        const mtime: i128 = st.mtime.nanoseconds;
+        const stale_tmp = std.mem.indexOf(u8, e.name, ".tmp-") != null and now - mtime > std.time.ns_per_hour;
+        const legacy = (std.mem.startsWith(u8, e.name, "stdlib-") and std.mem.endsWith(u8, e.name, ".klio-image")) or
+            (std.mem.startsWith(u8, e.name, "stdlib-meta-") and std.mem.endsWith(u8, e.name, ".bin"));
+        if (stale_tmp or legacy) {
+            dir.deleteFile(io, e.name) catch {};
+            continue;
+        }
+        if (!std.mem.startsWith(u8, e.name, "sema-base-") or !std.mem.endsWith(u8, e.name, ".klio-sema")) continue;
+        const name = a.dupe(u8, e.name) catch return;
+        images.append(a, .{ .name = name, .size = st.size, .mtime = mtime }) catch return;
+        total += st.size;
+    }
+    if (total <= limit) return;
+    std.mem.sort(Entry, images.items, {}, struct {
+        fn lt(_: void, x: Entry, y: Entry) bool {
+            return x.mtime < y.mtime;
+        }
+    }.lt);
+    for (images.items) |e| {
+        if (total <= limit) break;
+        if (std.mem.eql(u8, e.name, keep)) continue;
+        dir.deleteFile(io, e.name) catch continue;
+        total -= e.size;
+    }
 }
 
 /// `write`, saying why it could not.
@@ -152,3 +226,27 @@ fn exeStamp() ?[2]u64 {
     return .{ st.size, mtime_ns - mtime_ns % 100 };
 }
 
+test "a pruned cache keeps within its size, the newest images and the one just written" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const names = [_][]const u8{ "sema-base-a.klio-sema", "sema-base-b.klio-sema", "sema-base-c.klio-sema", "stdlib-x.klio-image", "notes.txt" };
+    for (names, 0..) |n, i| {
+        try tmp.dir.writeFile(io, .{ .sub_path = n, .data = "0123456789" });
+        // Oldest first: a, b, c.
+        try tmp.dir.setTimestamps(io, n, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = @as(i96, @intCast(i + 1)) * std.time.ns_per_s } } });
+    }
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
+    // Room for two images: the oldest goes, unless it is the one kept.
+    prune(arena.allocator(), dir_path, "sema-base-a.klio-sema", 20);
+    _ = try tmp.dir.statFile(io, "sema-base-a.klio-sema", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "sema-base-b.klio-sema", .{}));
+    _ = try tmp.dir.statFile(io, "sema-base-c.klio-sema", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "stdlib-x.klio-image", .{}));
+    _ = try tmp.dir.statFile(io, "notes.txt", .{});
+}
