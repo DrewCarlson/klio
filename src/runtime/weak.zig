@@ -124,16 +124,18 @@ fn Generations(comptime E: type) type {
 pub const NativeRecord = struct {
     finalizer: *const fn (?*anyopaque) callconv(.c) void,
     ptr: usize,
-    /// What the native object holds that the collector counts until the
-    /// finalizer runs (`peer_bytes`).
-    bytes: usize = 0,
+    /// What the native object holds that the collector counts (`peer_bytes`)
+    /// until the finalizer runs or a collection finds the owner dead,
+    /// whichever is first; 0 once released.
+    bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// 0 armed, 1 run: whoever moves it runs the finalizer.
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     fn run(self: *NativeRecord) bool {
         if (self.state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return false;
         self.finalizer(@ptrFromInt(self.ptr));
-        if (self.bytes != 0) gc.noteExternalFreed(self.bytes);
+        const b = self.bytes.swap(0, .acq_rel);
+        if (b != 0) gc.noteExternalFreed(b);
         return true;
     }
 };
@@ -258,13 +260,14 @@ pub fn registerNative(owner: Value, finalizer: usize, ptr: usize) std.mem.Alloca
     const h = cellOf(owner) orelse return @intFromPtr(rec);
     if (!gc.gc_enabled or h.gc_bytes == 0) return @intFromPtr(rec);
     installHooks();
-    rec.bytes = if (peer_bytes) |f| f(owner, ptr) else 0;
+    const bytes = if (peer_bytes) |f| f(owner, ptr) else 0;
+    rec.bytes.store(bytes, .release);
     {
         native_lock.lock();
         defer native_lock.unlock();
         try natives.young.append(reg_alloc, .{ .owner = h, .rec = rec });
     }
-    if (rec.bytes != 0) gc.noteExternalBytes(rec.bytes);
+    if (bytes != 0) gc.noteExternalBytes(bytes);
     return @intFromPtr(rec);
 }
 
@@ -294,6 +297,11 @@ fn runReadyNatives() void {
 fn nativePass(major: bool, e: NativeEntry) bool {
     if (!gc.cellDead(e.owner, major)) return true;
     native_ready.append(reg_alloc, e.rec) catch @panic("KGC: native finalizer queue allocation failed");
+    // The owner is dead, so its native bytes stop counting now, before the
+    // collection sets the next trigger from what survived it; the finalizer
+    // itself runs after the sweep.
+    const b = e.rec.bytes.swap(0, .acq_rel);
+    if (b != 0) gc.releaseExternal(b);
     return false;
 }
 
@@ -631,13 +639,35 @@ test "a native object's bytes count as external memory until its finalizer runs"
     const before = gc.externalLiveBytes();
     const rec = try rec_alloc.create(NativeRecord);
     defer rec_alloc.destroy(rec);
-    rec.* = .{ .finalizer = countFinalizer, .ptr = 1, .bytes = 4 << 20 };
-    gc.noteExternalBytes(rec.bytes);
+    rec.* = .{ .finalizer = countFinalizer, .ptr = 1, .bytes = .init(4 << 20) };
+    gc.noteExternalBytes(4 << 20);
     try testing.expectEqual(before + (4 << 20), gc.externalLiveBytes());
     try testing.expect(rec.run());
     try testing.expectEqual(before, gc.externalLiveBytes());
     // Run once, released once.
     try testing.expect(!rec.run());
+    try testing.expectEqual(before, gc.externalLiveBytes());
+}
+
+test "a native object's bytes stop counting when a collection finds its owner dead" {
+    defer resetRegistry();
+    const prev = gc.gc_enabled;
+    gc.gc_enabled = true;
+    defer gc.gc_enabled = prev;
+    native_calls = 0;
+    const before = gc.externalLiveBytes();
+    const rec = try rec_alloc.create(NativeRecord);
+    rec.* = .{ .finalizer = countFinalizer, .ptr = 1, .bytes = .init(4 << 20) };
+    gc.noteExternalBytes(4 << 20);
+    var dead = testHeader(0, false, 32);
+    try natives.young.append(reg_alloc, .{ .owner = &dead, .rec = rec });
+    try testing.expectEqual(before + (4 << 20), gc.externalLiveBytes());
+    // Released by the pass itself, before the finalizer runs.
+    testPass(false);
+    try testing.expectEqual(before, gc.externalLiveBytes());
+    try testing.expectEqual(@as(usize, 0), native_calls);
+    runReadyNatives();
+    try testing.expectEqual(@as(usize, 1), native_calls);
     try testing.expectEqual(before, gc.externalLiveBytes());
 }
 

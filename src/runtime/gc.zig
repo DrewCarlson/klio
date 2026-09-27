@@ -977,6 +977,16 @@ pub fn flushExternalDelta() void {
     }
 }
 
+/// External bytes a collection found released while the world is stopped:
+/// they leave the shared counters at once, so the trigger it sets next
+/// counts only what survived.
+pub fn releaseExternal(bytes: usize) void {
+    if (!gc_enabled) return;
+    subSaturating(&external_live, bytes);
+    subSaturating(&bytes_since_gc, bytes);
+    subSaturating(&bytes_since_major, bytes);
+}
+
 /// Subtract without going below zero. The clamp must be part of the same
 /// atomic step, or two threads each reading a value that covers their own
 /// subtraction both subtract and wrap the counter.
