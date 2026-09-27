@@ -303,7 +303,9 @@ pub fn execute(a: Allocator, vm_a: Allocator, br: *bridge.Bridge, main: ir.FuncI
     vm.* = try interp_ir.Vm.new(vm_a, module_ref);
     hooks.traceRun("vm init", t_vm);
     var exec = executeOn(a, vm, br, main, out, opts) catch |e| {
+        runtime.gc.quiesce();
         vm.deinit();
+        runtime.gc.unquiesce();
         return e;
     };
     if (opts.keep_vm) |keep| {
@@ -313,7 +315,10 @@ pub fn execute(a: Allocator, vm_a: Allocator, br: *bridge.Bridge, main: ir.FuncI
         }
     }
     const t_d = runtime.clockMonotonicNanos();
+    // The marking thread may still trace what the VM frees.
+    runtime.gc.quiesce();
     vm.deinit();
+    runtime.gc.unquiesce();
     hooks.traceRun("vm.deinit", t_d);
     return exec;
 }

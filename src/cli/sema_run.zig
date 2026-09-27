@@ -147,6 +147,10 @@ pub const RunMemory = struct {
     pub fn deinit(self: RunMemory) void {
         if (compose_ui.hostedActive()) return;
         span.active_map = self.prev_map;
+        // A major the program started may still be traced on the marking
+        // thread, through cells in the arena.
+        runtime.gc.quiesce();
+        defer runtime.gc.unquiesce();
         self.arena_state.deinit();
         std.heap.page_allocator.destroy(self.arena_state);
     }

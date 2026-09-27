@@ -2075,6 +2075,26 @@ pub fn waitSweep() void {
     while (sweep_pending.load(.acquire)) sweep_sync.wait();
 }
 
+/// Holds the collector off while a caller frees memory the heap names, as a
+/// run's VM and arena are freed once `main` returns: the collection in
+/// flight finishes, the major the marking thread traces is dropped, the
+/// sweep in flight ends and no collection starts until `unquiesce`. A
+/// thread that wants one meanwhile goes on without it.
+pub fn quiesce() void {
+    // A collection holding the lock may be waiting for this thread to park.
+    while (!gc_lock.tryLock()) {
+        if (is_mutator) parkForStop() else waitStopEnd(null);
+        std.atomic.spinLoopHint();
+    }
+    abortMajor();
+    holdSweeper();
+}
+
+pub fn unquiesce() void {
+    releaseSweeper();
+    gc_lock.unlock();
+}
+
 /// Keeps every later sweep inside its collection's stop and waits out the
 /// one in flight, for a caller about to unmap memory the lists may name.
 /// Pair with `releaseSweeper`.
@@ -3159,3 +3179,36 @@ test "a collector waiting on a mutator that parks late sleeps until it parks" {
 fn testCpuMicros() i64 {
     return platform.processCpuMicros() orelse 0;
 }
+
+test "a quiesced collector collects nothing until it is let go" {
+    const prev = gc_enabled;
+    gc_enabled = true;
+    defer gc_enabled = prev;
+    quiesce();
+    const epoch = cur_epoch;
+    collect();
+    try std.testing.expectEqual(epoch, cur_epoch);
+    unquiesce();
+    try std.testing.expect(gc_lock.tryLock());
+    gc_lock.unlock();
+}
+
+test "a mutator quiescing while another thread collects parks for its stop" {
+    const prev = gc_enabled;
+    gc_enabled = true;
+    defer gc_enabled = prev;
+    const T = struct {
+        fn run() void {
+            collect();
+        }
+    };
+    enterMutator();
+    const t = try std.Thread.spawn(.{}, T.run, .{});
+    // The collection holds the lock and waits for this thread to park.
+    while (!stopRaised()) std.atomic.spinLoopHint();
+    quiesce();
+    unquiesce();
+    t.join();
+    exitMutator();
+}
+
