@@ -1023,17 +1023,13 @@ test "an enum class's init unit makes each entry with its name and ordinal" {
     const a_static = br.staticOf(try fx.member(e, "A")).?;
     const unit = br.m.resolved.?.statics[a_static.int()].unit;
     try testing.expectEqualStrings(
-        \\  r0 = "A"
-        \\  r1 = 0
+        \\  r4 = "A"
+        \\  r5 = 0
         \\  r6 = 1
-        \\  r4 = r0
-        \\  r5 = r1
         \\  r2 = new E <init>(r4..3)
         \\  static 0 = r2
-        \\  r7 = "B"
-        \\  r8 = 1
-        \\  r10 = r7
-        \\  r11 = r8
+        \\  r10 = "B"
+        \\  r11 = 1
         \\  r9 = new $B <init>(r10..2)
         \\  static 1 = r9
         \\  return

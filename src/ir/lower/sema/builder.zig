@@ -320,6 +320,8 @@ pub const Builder = struct {
     pub fn finish(b: *Builder) Error!void {
         const a = b.p.a;
         try b.pruneDeadTypeValues();
+        try b.coalesceCopies();
+        try b.aliasRuns();
         const f = &b.p.m.funcs.items[b.func.int()];
         const blocks = try a.alloc(ir.Block, b.blocks.items.len);
         for (b.blocks.items, blocks, 0..) |*buf, *out, i| {
@@ -375,6 +377,24 @@ pub const Builder = struct {
         }
     }
 
+    /// Drops a copy of a register only it reads into a register only it
+    /// writes, when the instruction that wrote the source is earlier in the
+    /// copy's block and nothing between them touches the destination: that
+    /// instruction writes the destination itself. An argument run and a
+    /// `val` copy a fresh temporary this way.
+    fn coalesceCopies(b: *Builder) Error!void {
+        try coalesceBlockCopies(b.p.a, b.blocks.items, b.next_reg);
+    }
+
+    /// Gives a call the registers its argument run copies as its run, when
+    /// they are consecutive and nothing writes them between the copies and
+    /// the call: `f(x)` and `x.g()` then pass `x`'s own register. The callee
+    /// reads its parameters from the caller's registers, which the caller
+    /// does not write while the call runs.
+    fn aliasRuns(b: *Builder) Error!void {
+        try aliasBlockRuns(b.p.a, b.blocks.items, b.next_reg);
+    }
+
     pub const call = records.call;
     pub const callOf = records.callOf;
     pub const name = records.name;
@@ -414,6 +434,240 @@ fn deadTypePart(inst: *const ir.Inst, builders: [3]?ir.FuncId, reads: []const u3
     return dst.int() < reads.len and reads[dst.int()] == 0;
 }
 
+/// The index in `insts` of the instruction writing `y`, when no
+/// instruction after it touches `x`.
+fn copySource(insts: []const ir.Inst, x: Reg, y: Reg) ?usize {
+    const Touch = struct {
+        x: Reg,
+        y: Reg,
+        hit_x: *bool,
+        def_y: *bool,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (r == c.x) c.hit_x.* = true;
+            if (is_def and r == c.y) c.def_y.* = true;
+        }
+    };
+    var i = insts.len;
+    while (i > 0) {
+        i -= 1;
+        var hit_x = false;
+        var def_y = false;
+        ir.visitInstRegs(&insts[i], Touch{ .x = x, .y = y, .hit_x = &hit_x, .def_y = &def_y }, Touch.cb);
+        if (def_y) return i;
+        if (hit_x) return null;
+    }
+    return null;
+}
+
+/// Whether `inst`, which writes the copied register, may write `x` instead.
+/// It must not already read `x` unless it reads its operands before it
+/// writes; a constructor writes its instance before it runs, which a
+/// handler of the block could see if the constructor throws. A parameter,
+/// a capture or a cell goes only into a register nothing else writes: the
+/// inliner takes such a register for the value itself.
+fn takesDst(inst: *const ir.Inst, x: Reg, has_handlers: bool, x_single: bool) bool {
+    const Reads = struct {
+        x: Reg,
+        found: *bool,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (!is_def and r == c.x) c.found.* = true;
+        }
+    };
+    var reads_x = false;
+    ir.visitInstRegs(inst, Reads{ .x = x, .found = &reads_x }, Reads.cb);
+    return switch (inst.*) {
+        .RNewInstance => !reads_x and !has_handlers,
+        .LoadParam, .LoadCapture => x_single,
+        .MakeCell => x_single and !reads_x,
+        .Const, .LoadStatic, .LoadObject, .ClassLiteral => true,
+        .Move, .BinOp, .UnOp, .Not, .NotNullAssert, .CellGet, .GetFieldSlot, .ArrayGet, .ClassOf, .RInstanceOf, .RCast, .CallStatic, .RCallVirtual, .CallInterface, .CallNative, .RCallValue => true,
+        else => !reads_x,
+    };
+}
+
+fn coalesceBlockCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
+    if (n == 0) return;
+    const reads = try a.alloc(u32, n);
+    defer a.free(reads);
+    const defs = try a.alloc(u32, n);
+    defer a.free(defs);
+    @memset(reads, 0);
+    @memset(defs, 0);
+    const Count = struct {
+        reads: []u32,
+        defs: []u32,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (r.int() >= c.reads.len) return;
+            if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
+        }
+    };
+    const counts: Count = .{ .reads = reads, .defs = defs };
+    for (blocks) |*blk| {
+        for (blk.insts.items) |*inst| ir.visitInstRegs(inst, counts, Count.cb);
+        if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
+        // A caught exception is written into its register by the unwinder.
+        for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
+    }
+    for (blocks) |*blk| {
+        const has_handlers = blk.handlers.any();
+        var j: usize = 0;
+        while (j < blk.insts.items.len) : (j += 1) {
+            const mv = switch (blk.insts.items[j]) {
+                .Move => |m| m,
+                else => continue,
+            };
+            const y = mv.src;
+            const x = mv.dst;
+            if (x == y or y.int() >= n or x.int() >= n) continue;
+            if (defs[y.int()] != 1 or reads[y.int()] != 1) continue;
+            const i = copySource(blk.insts.items[0..j], x, y) orelse continue;
+            const src = &blk.insts.items[i];
+            if (!takesDst(src, x, has_handlers, defs[x.int()] == 1)) continue;
+            setDst(src, x);
+            _ = blk.insts.orderedRemove(j);
+            defs[y.int()] = 0;
+            reads[y.int()] = 0;
+            j -= 1;
+        }
+    }
+}
+
+fn aliasBlockRuns(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
+    if (n == 0) return;
+    const reads = try a.alloc(u32, n);
+    defer a.free(reads);
+    const defs = try a.alloc(u32, n);
+    defer a.free(defs);
+    @memset(reads, 0);
+    @memset(defs, 0);
+    const Count = struct {
+        reads: []u32,
+        defs: []u32,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (r.int() >= c.reads.len) return;
+            if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
+        }
+    };
+    const counts: Count = .{ .reads = reads, .defs = defs };
+    for (blocks) |*blk| {
+        for (blk.insts.items) |*inst| ir.visitInstRegs(inst, counts, Count.cb);
+        if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
+        for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
+    }
+    var copies: std.ArrayList(usize) = .empty;
+    defer copies.deinit(a);
+    for (blocks) |*blk| {
+        var c: usize = 0;
+        while (c < blk.insts.items.len) : (c += 1) {
+            const arg_run = argRunOf(&blk.insts.items[c]) orelse continue;
+            if (arg_run.n == 0 or arg_run.first.int() + arg_run.n > n) continue;
+            copies.clearRetainingCapacity();
+            const src0 = (try runSources(blk.insts.items[0..c], arg_run, defs, reads, &copies, a)) orelse continue;
+            if (blk.insts.items[c] == .RNewInstance) {
+                const d = blk.insts.items[c].RNewInstance.dst.int();
+                if (d >= src0.int() and d < src0.int() + arg_run.n) continue;
+            }
+            setArgs(&blk.insts.items[c], src0);
+            for (0..arg_run.n) |k| {
+                const r = arg_run.first.int() + @as(u32, @intCast(k));
+                defs[r] = 0;
+                reads[r] = 0;
+            }
+            // Highest index first, so the others stay where they are.
+            std.mem.sort(usize, copies.items, {}, std.sort.desc(usize));
+            for (copies.items) |m| _ = blk.insts.orderedRemove(m);
+            c -= copies.items.len;
+        }
+    }
+}
+
+const ArgRun = struct { first: Reg, n: u32 };
+
+/// The argument run `inst` reads, if it reads one.
+fn argRunOf(inst: *const ir.Inst) ?ArgRun {
+    switch (inst.*) {
+        inline else => |*p| {
+            const P = @TypeOf(p.*);
+            if (comptime @hasField(P, "args") and @hasField(P, "n_args")) {
+                if (comptime @FieldType(P, "args") == Reg) return .{ .first = p.args, .n = p.n_args };
+            }
+            return null;
+        },
+    }
+}
+
+fn setArgs(inst: *ir.Inst, r: Reg) void {
+    switch (inst.*) {
+        inline else => |*p| {
+            const P = @TypeOf(p.*);
+            if (comptime @hasField(P, "args") and @hasField(P, "n_args") and @FieldType(P, "args") == Reg) p.args = r else unreachable;
+        },
+    }
+}
+
+/// When each register of `run` is written once, by a copy in `insts`, and
+/// read only by the run, and the copies' sources are consecutive and not
+/// written again before the call: the first source, with the copies'
+/// indices in `copies`.
+fn runSources(insts: []const ir.Inst, run: ArgRun, defs: []const u32, reads: []const u32, copies: *std.ArrayList(usize), a: Allocator) Error!?Reg {
+    var src0: ?Reg = null;
+    for (0..run.n) |k| {
+        const r = Reg.from(run.first.int() + @as(u32, @intCast(k)));
+        if (defs[r.int()] != 1 or reads[r.int()] != 1) return null;
+        const m = findDef(insts, r) orelse return null;
+        const src = switch (insts[m]) {
+            .Move => |mv| mv.src,
+            else => return null,
+        };
+        if (k == 0) {
+            src0 = src;
+        } else if (src.int() != src0.?.int() + @as(u32, @intCast(k))) return null;
+        if (writtenAfter(insts[m + 1 ..], src)) return null;
+        try copies.append(a, m);
+    }
+    return src0;
+}
+
+fn findDef(insts: []const ir.Inst, r: Reg) ?usize {
+    const Def = struct {
+        r: Reg,
+        found: *bool,
+        fn cb(c: @This(), reg: Reg, is_def: bool) void {
+            if (is_def and reg == c.r) c.found.* = true;
+        }
+    };
+    var i = insts.len;
+    while (i > 0) {
+        i -= 1;
+        var found = false;
+        ir.visitInstRegs(&insts[i], Def{ .r = r, .found = &found }, Def.cb);
+        if (found) return i;
+    }
+    return null;
+}
+
+fn writtenAfter(insts: []const ir.Inst, r: Reg) bool {
+    const Def = struct {
+        r: Reg,
+        found: *bool,
+        fn cb(c: @This(), reg: Reg, is_def: bool) void {
+            if (is_def and reg == c.r) c.found.* = true;
+        }
+    };
+    var found = false;
+    for (insts) |*inst| ir.visitInstRegs(inst, Def{ .r = r, .found = &found }, Def.cb);
+    return found;
+}
+
+/// Sets the register `inst` writes.
+fn setDst(inst: *ir.Inst, r: Reg) void {
+    switch (inst.*) {
+        inline else => |*p| {
+            if (comptime @hasField(@TypeOf(p.*), "dst")) p.dst = r else unreachable;
+        },
+    }
+}
+
 /// Where `Builder.branchOnNull` goes.
 pub const NullSplit = struct { is_null: BlockId, not_null: BlockId };
 
@@ -423,3 +677,108 @@ fn recordsOf(br: *const bridge.Bridge, file: u32) *const sema.output.FileRecords
 
 /// The records of a file sema has none for.
 const no_records: sema.output.FileRecords = .{};
+
+fn testBlock(a: Allocator, insts: []const Inst, term: Terminator) Error!BlockBuf {
+    var blk: BlockBuf = .{ .terminator = term };
+    try blk.insts.appendSlice(a, insts);
+    return blk;
+}
+
+test "a copy of a temporary goes into the instruction that wrote it" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    var blocks = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Const = .{ .dst = r(1), .value = ir.ConstId.from(0) } },
+        .{ .BinOp = .{ .dst = r(2), .op = .Add, .lhs = r(1), .rhs = r(0) } },
+        .{ .Move = .{ .dst = r(3), .src = r(2) } },
+    }, .{ .Return = r(3) })};
+    defer blocks[0].insts.deinit(a);
+    try coalesceBlockCopies(a, &blocks, 4);
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].insts.items.len);
+    try std.testing.expectEqual(r(3), blocks[0].insts.items[1].BinOp.dst);
+}
+
+test "a copy stays when its destination is touched in between, or a parameter would gain a second writer" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    var touched = [_]BlockBuf{try testBlock(a, &.{
+        .{ .BinOp = .{ .dst = r(2), .op = .Add, .lhs = r(0), .rhs = r(0) } },
+        .{ .BinOp = .{ .dst = r(3), .op = .Add, .lhs = r(3), .rhs = r(0) } },
+        .{ .Move = .{ .dst = r(3), .src = r(2) } },
+    }, .{ .Return = r(3) })};
+    defer touched[0].insts.deinit(a);
+    try coalesceBlockCopies(a, &touched, 4);
+    try std.testing.expectEqual(@as(usize, 3), touched[0].insts.items.len);
+
+    var param = [_]BlockBuf{try testBlock(a, &.{
+        .{ .LoadParam = .{ .dst = r(1), .idx = 0 } },
+        .{ .Move = .{ .dst = r(2), .src = r(1) } },
+        .{ .Const = .{ .dst = r(2), .value = ir.ConstId.from(0) } },
+    }, .{ .Return = r(2) })};
+    defer param[0].insts.deinit(a);
+    try coalesceBlockCopies(a, &param, 3);
+    try std.testing.expectEqual(@as(usize, 3), param[0].insts.items.len);
+    // Into a register nothing else writes, the parameter's load takes it.
+    _ = param[0].insts.orderedRemove(2);
+    try coalesceBlockCopies(a, &param, 3);
+    try std.testing.expectEqual(@as(usize, 1), param[0].insts.items.len);
+    try std.testing.expectEqual(r(2), param[0].insts.items[0].LoadParam.dst);
+}
+
+test "a constructor keeps its own register in a block a handler watches" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    const new: Inst = .{ .RNewInstance = .{ .dst = r(1), .class = ir.ClassId.from(0), .ctor = FuncId.from(0), .args = r(0), .n_args = 0 } };
+    var blocks = [_]BlockBuf{try testBlock(a, &.{ new, .{ .Move = .{ .dst = r(2), .src = r(1) } } }, .{ .Return = r(2) })};
+    defer blocks[0].insts.deinit(a);
+    const catches = [_]ir.CatchHandler{.{ .class = ir.ClassId.from(0), .handler = BlockId.from(0), .exception_reg = r(3) }};
+    blocks[0].handlers.catches = @constCast(&catches);
+    try coalesceBlockCopies(a, &blocks, 4);
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].insts.items.len);
+    blocks[0].handlers.catches = &.{};
+    try coalesceBlockCopies(a, &blocks, 4);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].insts.items.len);
+    try std.testing.expectEqual(r(2), blocks[0].insts.items[0].RNewInstance.dst);
+}
+
+test "a call passes consecutive registers it copied as its argument run" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    const call: Inst = .{ .CallStatic = .{ .dst = r(7), .func = FuncId.from(0), .args = r(5), .n_args = 2 } };
+    var blocks = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Move = .{ .dst = r(5), .src = r(0) } },
+        .{ .Move = .{ .dst = r(6), .src = r(1) } },
+        call,
+    }, .{ .Return = r(7) })};
+    defer blocks[0].insts.deinit(a);
+    try aliasBlockRuns(a, &blocks, 8);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].insts.items.len);
+    try std.testing.expectEqual(r(0), blocks[0].insts.items[0].CallStatic.args);
+
+    // Out of order, or a source written before the call, keeps the copies.
+    var swapped = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Move = .{ .dst = r(5), .src = r(1) } },
+        .{ .Move = .{ .dst = r(6), .src = r(0) } },
+        call,
+    }, .{ .Return = r(7) })};
+    defer swapped[0].insts.deinit(a);
+    try aliasBlockRuns(a, &swapped, 8);
+    try std.testing.expectEqual(@as(usize, 3), swapped[0].insts.items.len);
+    var written = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Move = .{ .dst = r(5), .src = r(0) } },
+        .{ .Move = .{ .dst = r(6), .src = r(1) } },
+        .{ .Const = .{ .dst = r(1), .value = ir.ConstId.from(0) } },
+        call,
+    }, .{ .Return = r(7) })};
+    defer written[0].insts.deinit(a);
+    try aliasBlockRuns(a, &written, 8);
+    try std.testing.expectEqual(@as(usize, 4), written[0].insts.items.len);
+    // A constructor writes its instance before it reads its arguments.
+    var ctor = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Move = .{ .dst = r(5), .src = r(0) } },
+        .{ .RNewInstance = .{ .dst = r(0), .class = ir.ClassId.from(0), .ctor = FuncId.from(0), .args = r(5), .n_args = 1 } },
+    }, .{ .Return = r(0) })};
+    defer ctor[0].insts.deinit(a);
+    try aliasBlockRuns(a, &ctor, 8);
+    try std.testing.expectEqual(@as(usize, 2), ctor[0].insts.items.len);
+}

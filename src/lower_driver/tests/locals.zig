@@ -154,8 +154,7 @@ test "a statement over vars writes its result into the var it assigns" {
         \\  BinOp r4 = r1 IdentEq r3
         \\  Not
         \\b2:
-        \\  Move r6 = r2
-        \\  CallStatic r7 = (r6..1)
+        \\  CallStatic r7 = (r2..1)
         \\  GetFieldSlot r8 = r1.#0
         \\  BinOp r2 = r7 Add r8
         \\  GetFieldSlot r10 = r1.#0

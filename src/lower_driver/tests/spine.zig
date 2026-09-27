@@ -369,16 +369,14 @@ test "an open property is read through its getter's slot and a custom getter is 
     const w_get = try fx.func(.{ .getter = fx.member(d, "w") });
     const g = try fx.func(.{ .decl = fx.member(d, "g") });
     try std.testing.expectEqualStrings(
-        \\  r0 = param 0
-        \\  r1 = r0
+        \\  r1 = param 0
         \\  r2 = virtual 0(r1..1)
         \\  return r2
         \\
     , try fx.lower_(g));
     const h = try fx.func(.{ .decl = fx.member(d, "h") });
     try std.testing.expectEqualStrings(
-        \\  r0 = param 0
-        \\  r1 = r0
+        \\  r1 = param 0
         \\  r2 = call f1(r1..1)
         \\  return r2
         \\
@@ -398,8 +396,7 @@ test "a property declared in an interface is read through the interface" {
     fx.br.slot_of[n_get.int()] = ir.MethodSlotId.fromFunc(n_get);
     const k = try fx.func(.{ .decl = fx.top("k") });
     try std.testing.expectEqualStrings(
-        \\  r0 = param 0
-        \\  r1 = r0
+        \\  r1 = param 0
         \\  r2 = interface 0(r1..1)
         \\  return r2
         \\
@@ -425,9 +422,8 @@ test "a read and a write of one property resolve differently: plain read, setter
     const f = try fx.func(.{ .decl = fx.member(e, "f") });
     try std.testing.expectEqualStrings(
         \\  r0 = param 0
-        \\  r1 = r0.#1
+        \\  r3 = r0.#1
         \\  r2 = r0
-        \\  r3 = r1
         \\  r4 = call f1(r2..2)
         \\  return
         \\
@@ -614,8 +610,7 @@ test "a safe member read is null when its receiver is" {
         \\  r3 = r1
         \\  goto b3
         \\b2:
-        \\  r4 = r0.#0
-        \\  r3 = r4
+        \\  r3 = r0.#0
         \\  goto b3
         \\b3:
         \\  return r3
@@ -795,9 +790,8 @@ test "a constructor takes this, the outer instance, and its parameters after the
     const vw = try lower.body.lowerExpr(b, w.init.?);
     try std.testing.expectEqualStrings(
         \\  r0 = param 1
-        \\  r1 = r0.#0
+        \\  r3 = r0.#0
         \\  r2 = param 2
-        \\  r3 = r1
         \\  return r2
         \\
     , try fx.finishWith(b, blk: {
@@ -864,8 +858,7 @@ test "a context parameter, a super read, an extension property and a top-level g
     const px_get = try fx.func(.{ .getter = fx.top("px") });
     const ep = try fx.func(.{ .decl = fx.top("ep") });
     try std.testing.expectEqualStrings(
-        \\  r0 = param 0
-        \\  r1 = r0
+        \\  r1 = param 0
         \\  r2 = call f2(r1..1)
         \\  return r2
         \\
@@ -907,9 +900,8 @@ test "templates name a value or this; assignments through paths, members and a s
     const va = try lower.name.lowerTemplateName(tb, &parts[0].ShortInterp);
     const vt = try lower.name.lowerTemplateName(tb, &parts[2].ShortInterp);
     try std.testing.expectEqualStrings(
-        \\  r0 = param 1
+        \\  r2 = param 1
         \\  r1 = param 0
-        \\  r2 = r0
         \\  return r1
         \\
     , try fx.finishWith(tb, blk: {
@@ -986,10 +978,8 @@ test "a member extension called in a with block takes the block's receiver as it
     try lower.env.enter(&lb);
     const v = (try lower.body.lowerStmts(&lb, lam.body.stmts)).?;
     try std.testing.expectEqualStrings(
-        \\  r0 = capture 0
-        \\  r1 = param 0
-        \\  r2 = r1
-        \\  r3 = r0
+        \\  r3 = capture 0
+        \\  r2 = param 0
         \\  r4 = call f0(r2..2)
         \\  return r4
         \\
@@ -1018,8 +1008,7 @@ test "destructuring binds each entry's componentN; a delegated local reads throu
     const c1 = try fx.func(.{ .decl = fx.member(pt, "component1") });
     const d = try fx.func(.{ .decl = fx.top("d") });
     try std.testing.expectEqualStrings(
-        \\  r0 = param 0
-        \\  r1 = r0
+        \\  r1 = param 0
         \\  r2 = call f0(r1..1)
         \\  return
         \\
@@ -1030,12 +1019,9 @@ test "destructuring binds each entry's componentN; a delegated local reads throu
     const gv = try fx.func(.{ .decl = fx.member(fx.class("D"), "getValue") });
     const dl = try fx.func(.{ .decl = fx.top("dl") });
     try std.testing.expectEqualStrings(
-        \\  r0 = param 0
-        \\  r1 = const Null
+        \\  r3 = param 0
+        \\  r4 = const Null
         \\  RPropertyRef
-        \\  r3 = r0
-        \\  r4 = r1
-        \\  r5 = r2
         \\  r6 = call f2(r3..3)
         \\  return
         \\
