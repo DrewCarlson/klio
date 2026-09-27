@@ -8,14 +8,20 @@ line the program prints with the time it printed it. The results go to a
 JSON file that summarize.py reads; the summary is printed at the end.
 
     bench/compose/run.py [--klio BIN] [--rounds N] [--only NAME,...]
-                         [--no-jvm | --no-klio] [--no-warm] [--env K=V ...]
-                         [--out FILE]
+                         [--jit on|off|both] [--no-jvm | --no-klio] [--no-warm]
+                         [--env K=V ...] [--jvm-arg ARG ...] [--out FILE]
 
 Programs named hb_* are headless scenes (KlioComposeScene, and on the JVM
 the same helper over ImageComposeScene) that print their frame timings;
 wb_* open real windows, drive themselves and close. The JVM side compiles
 each program with the pinned kotlinc and the Compose plugin, through
 scripts/compose-oracle.py, into target/bench-compose/jvm.
+
+--jit sets whether each runtime may compile hot code: `off` runs the JVM
+with -Xint and klio with KLIO_JIT=0, the switch a klio JIT reads (klio has
+no JIT today, so its two modes run alike). `both` runs every program in
+both modes. A run's arm names its runtime, with -int when the JIT was off:
+klio, klio-int, jvm, jvm-int.
 """
 import argparse
 import datetime
@@ -80,9 +86,9 @@ def compile_jvm(oracle, name):
     return classes
 
 
-def jvm_cmd(oracle, name):
+def jvm_cmd(oracle, name, jit, extra):
     classes = compile_jvm(oracle, name)
-    cmd = ["java"]
+    cmd = ["java"] + ([] if jit else ["-Xint"]) + extra
     if headless(name):
         cmd.append("-Djava.awt.headless=true")
     cmd += ["-Dskiko.data.path=" + os.path.join(oracle.ORACLE_HOME, "skiko-data"),
@@ -154,6 +160,7 @@ def run(cmd, env, timeout):
     for th in readers:
         th.start()
     child = None
+    timed_out = False
     while p.poll() is None:
         if child is None:
             r = subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True, text=True)
@@ -164,7 +171,14 @@ def run(cmd, env, timeout):
             if s:
                 traj.append((round(time.monotonic() - t0, 2), s[0] // 1024, s[1]))
         if time.monotonic() - t0 > timeout:
+            # The program is time's child: killing time alone leaves it running.
+            if child is not None:
+                try:
+                    os.kill(child, 9)
+                except ProcessLookupError:
+                    pass
             p.kill()
+            timed_out = True
             break
         time.sleep(0.25)
     for th in readers:
@@ -172,6 +186,7 @@ def run(cmd, env, timeout):
     err = "".join(errs)
     res = parse_time(err)
     res["rc"] = p.returncode
+    res["timed_out"] = timed_out
     res["lines"] = lines
     res["traj"] = traj
     res["stderr_tail"] = [l for l in err.splitlines() if not re.match(r"^\s+\d+\s+[a-z]", l)][-12:]
@@ -186,11 +201,14 @@ def main():
                     help="KLIO_HOME for the klio runs (default: .klio-local)")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--only", help="comma-separated program names")
+    ap.add_argument("--jit", choices=("on", "off", "both"), default="on",
+                    help="whether the runtimes may compile hot code (default on)")
     ap.add_argument("--no-jvm", action="store_true")
     ap.add_argument("--no-klio", action="store_true")
     ap.add_argument("--no-warm", action="store_true",
                     help="skip the untimed first klio run that bakes each program's image")
     ap.add_argument("--env", action="append", default=[], help="K=V for the klio runs")
+    ap.add_argument("--jvm-arg", action="append", default=[], help="an argument for java, e.g. -XX:TieredStopAtLevel=1")
     ap.add_argument("--timeout", type=float, default=300)
     ap.add_argument("--out", help="results file (default: target/bench-compose/<time>.json)")
     a = ap.parse_args()
@@ -213,12 +231,15 @@ def main():
         kenv[k] = v
     oracle = None if a.no_jvm else load("compose_oracle", os.path.join(ROOT, "scripts", "compose-oracle.py"))
 
+    modes = {"on": [True], "off": [False], "both": [True, False]}[a.jit]
     results = []
     for name in names:
         src = os.path.join(PROGRAMS_DIR, name + ".kt")
         arms = []
         if not a.no_klio:
-            arms.append(("klio", [a.klio, "run", src], kenv))
+            for jit in modes:
+                env = kenv if jit else dict(kenv, KLIO_JIT="0")
+                arms.append(("klio", jit, [a.klio, "run", src], env))
             if not a.no_warm:
                 # A binary's first run of a program bakes its image; the
                 # timed runs are the ones a user repeats.
@@ -226,11 +247,13 @@ def main():
                 subprocess.run([a.klio, "run", src], env=kenv, cwd=ROOT,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=a.timeout)
         if not a.no_jvm:
-            arms.append(("jvm", jvm_cmd(oracle, name), dict(os.environ)))
+            for jit in modes:
+                arms.append(("jvm", jit, jvm_cmd(oracle, name, jit, a.jvm_arg), dict(os.environ)))
         for rnd in range(a.rounds):
-            for arm, cmd, env in (arms if rnd % 2 == 0 else list(reversed(arms))):
+            for runtime, jit, cmd, env in (arms if rnd % 2 == 0 else list(reversed(arms))):
                 r = run(cmd, env, a.timeout)
-                r.update(program=name, arm=arm, round=rnd)
+                arm = runtime if jit else runtime + "-int"
+                r.update(program=name, arm=arm, runtime=runtime, jit=jit, round=rnd)
                 results.append(r)
                 brief = {k: r.get(k) for k in ("wall_s", "max_rss_mb", "peak_footprint_mb", "rc")}
                 print(name, arm, rnd, brief, [l for _, l in r["lines"]][-1:], flush=True)

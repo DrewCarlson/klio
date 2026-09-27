@@ -41,11 +41,13 @@ hb_list       frame ms (mean)       3.03  0.90      3.4x
 | Flag | |
 |---|---|
 | `--only hb_list,wb_anim` | Just these programs |
+| `--jit off`, `--jit both` | Runtimes without their JIT, or with and without (below) |
 | `--rounds 1` | One round instead of three |
 | `--no-jvm`, `--no-klio` | One side only |
 | `--klio BIN` | Another klio binary (default `zig-out/bin/klio-harness-fast`) |
 | `--home DIR` | Its `KLIO_HOME` (default `.klio-local`, the repo's local packs) |
 | `--env K=V` | An environment variable for the klio runs, e.g. `KLIO_GC_DEBUG=1` |
+| `--jvm-arg ARG` | An argument for `java`, e.g. `-XX:TieredStopAtLevel=1` |
 | `--no-warm` | Skip the untimed first run per program |
 | `--out FILE` | Where the results go |
 
@@ -65,6 +67,25 @@ A single program by hand, to watch its output:
 ```sh
 KLIO_HOME=$PWD/.klio-local zig-out/bin/klio-harness-fast run bench/compose/programs/hb_recompose.kt
 ```
+
+## With and without a JIT
+
+By default the JVM compiles hot code, as it does for any user: after the 60
+warm-up frames the headless programs' timed frames run HotSpot's optimized
+code. `--jit off` takes that away from both runtimes, running the JVM with
+`-Xint` and klio with `KLIO_JIT=0`, and `--jit both` runs every program each
+way. The runs with the JIT off are named `klio-int` and `jvm-int`, and the
+summary gives klio's multiple of the JVM for each mode:
+
+```
+program  metric           klio  klio-int   jvm  jvm-int  klio/jvm  klio-int/jvm-int
+hb_list  frame ms (mean)  3.14      3.00  0.92     2.29      3.4x              1.3x
+```
+
+klio has no JIT today, so `klio` and `klio-int` run alike; `KLIO_JIT=0` is the
+switch a klio JIT reads. Results files summarize together, so a JIT-off run
+can be added to an earlier JIT-on one:
+`bench/compose/summarize.py on.json off.json`.
 
 ## What the numbers are
 

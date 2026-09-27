@@ -45,10 +45,12 @@ with an earlier one:
 
 ```sh
 zig build klio-harness-fast
-bench/compose/run.py [--only hb_list] [--no-jvm] [--rounds N]
+bench/compose/run.py [--only hb_list] [--no-jvm] [--rounds N] [--jit on|off|both]
 bench/compose/summarize.py <results.json> [--baseline <older.json>]
 ```
 
+`--jit off` runs the JVM with `-Xint` and klio with `KLIO_JIT=0`, for
+interpreter against interpreter; `--jit both` runs each program both ways.
 `bench/compose/README.md` describes each program, the flags, and what each
 number measures.
 

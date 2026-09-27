@@ -3,7 +3,12 @@
 against an earlier klio run when one is given. A klio-only run compared
 with a baseline that has JVM runs takes the JVM numbers from it.
 
-    bench/compose/summarize.py RESULTS.json [--baseline OLDER.json]
+    bench/compose/summarize.py RESULTS.json [MORE.json ...] [--baseline OLDER.json]
+
+Several results files are read as one run, so a JIT-on run and a JIT-off
+run of the same build summarize together. Each arm (klio, klio-int, jvm,
+jvm-int: -int for the runs with the JIT off) gets a column, and klio's
+multiple of the JVM is shown for each mode both ran in.
 
 Frame times are the median over rounds of each run's own report; memory is
 the highest peak of any run; wall time the lowest. A window's launch is the
@@ -103,35 +108,56 @@ def fmt(v):
     return "%.2f" % v
 
 
+ARMS = ("klio", "klio-int", "jvm", "jvm-int")
+PAIRS = (("klio", "jvm"), ("klio-int", "jvm-int"))
+
+
 def report(results, baseline=None):
     now = by_program(results)
     base = by_program(baseline) if baseline else {}
-    cols = ["program", "metric"] + (["klio base"] if base else []) + ["klio"] + (["change"] if base else []) + ["jvm", "klio/jvm"]
+    # The JVM side does not change with klio: a klio-only run takes the
+    # baseline's JVM numbers.
+    for prog, arms in now.items():
+        for arm in ("jvm", "jvm-int"):
+            if arm not in arms and arm in base.get(prog, {}):
+                arms[arm] = base[prog][arm]
+    present = [a for a in ARMS if any(a in arms for arms in now.values())]
+    pairs = [(k, j) for k, j in PAIRS if k in present and j in present]
+    compare = bool(base) and "klio" in present
+    cols = ["program", "metric"] + (["klio base"] if compare else [])
+    for arm in present:
+        cols.append(arm)
+        if arm == "klio" and compare:
+            cols.append("change")
+    cols += ["%s/%s" % p for p in pairs]
     rows = []
     for prog in sorted(now):
         arms = now[prog]
-        k = arms.get("klio") or {}
-        # The JVM side does not change with klio: a klio-only run takes the
-        # baseline's JVM numbers.
-        j = arms.get("jvm") or (base.get(prog) or {}).get("jvm") or {}
+        vals = {arm: arms.get(arm) or {} for arm in present}
         b = (base.get(prog) or {}).get("klio") or {}
         keys = (HEADLESS if prog.startswith("hb_") else WINDOW) + MEMORY
         first = True
         for key, label in keys:
-            kv, jv, bv = k.get(key), j.get(key), b.get(key)
-            if kv is None and jv is None:
+            if all(vals[arm].get(key) is None for arm in present):
                 continue
             row = [prog if first else "", label]
             first = False
-            if base:
-                row.append(fmt(bv))
-            row.append(fmt(kv))
-            if base:
-                row.append("%+.0f%%" % (100 * (kv - bv) / bv) if kv is not None and bv else "-")
-            row.append(fmt(jv))
-            row.append(("%.1fx" % (kv / jv)) if kv is not None and jv else "-")
+            if compare:
+                row.append(fmt(b.get(key)))
+            for arm in present:
+                v = vals[arm].get(key)
+                row.append(fmt(v))
+                if arm == "klio" and compare:
+                    bv = b.get(key)
+                    row.append("%+.0f%%" % (100 * (v - bv) / bv) if v is not None and bv else "-")
+            for k, j in pairs:
+                kv, jv = vals[k].get(key), vals[j].get(key)
+                row.append(("%.1fx" % (kv / jv)) if kv is not None and jv else "-")
             rows.append(row)
-        for arm, m in arms.items():
+        for arm in present:
+            if arm not in arms:
+                continue
+            m = arms[arm]
             if m is None:
                 rows.append([prog if first else "", "%s: every run failed" % arm] + [""] * (len(cols) - 2))
             elif m["failed"]:
@@ -143,10 +169,10 @@ def report(results, baseline=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("results")
+    ap.add_argument("results", nargs="+", help="results files, read as one run")
     ap.add_argument("--baseline", help="an earlier results file to compare klio against")
     a = ap.parse_args()
-    results = json.load(open(a.results))
+    results = [r for path in a.results for r in json.load(open(path))]
     baseline = json.load(open(a.baseline)) if a.baseline else None
     report(results, baseline)
 
