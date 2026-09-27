@@ -6,7 +6,7 @@ zig-out-rel/
 .zig-cache/
 zig-pkg/
 target/
-scripts/__pycache__/
+__pycache__/
 .claude/
 .pi-lens/
 /CLAUDE.md

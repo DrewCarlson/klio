@@ -36,6 +36,22 @@ budgets), `--json`, `--out <file>`, `--filter <workload>`, and
 is a follow-up (see `.github/workflows/bench.yml` — benchmarking is
 manual for now, and the workflow keeps the module compiling).
 
+## Compose UI workloads
+
+`bench/compose/` runs eight Compose programs, four headless scenes and four
+real windows, on klio and on Compose Desktop, alternating. It reports frame
+cost, frame rate, launch time, idle CPU and peak memory, and compares a run
+with an earlier one:
+
+```sh
+zig build klio-harness-fast
+bench/compose/run.py [--only hb_list] [--no-jvm] [--rounds N]
+bench/compose/summarize.py <results.json> [--baseline <older.json>]
+```
+
+`bench/compose/README.md` describes each program, the flags, and what each
+number measures.
+
 ## Reference runners
 
 End-to-end runs can be compared to the official Kotlin compilers
