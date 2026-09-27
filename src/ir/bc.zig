@@ -193,7 +193,80 @@ pub const FuncStreams = struct {
     values: []const runtime.Value,
     /// A frame of the function may start with its registers unfilled (`Func.frameDefBeforeUse`).
     no_fill: bool,
+    /// What a call runs in place of a frame when the body is only field traffic (`leafOf`).
+    leaf: Leaf = .none,
 };
+
+/// A body that only moves fields of its first parameter, which a call runs
+/// without a frame of its own.
+pub const Leaf = union(enum) {
+    none,
+    /// Returns field `slot` of parameter 0: a default getter.
+    get_field: u32,
+    /// Stores each parameter in its field of parameter 0, in order, and
+    /// returns parameter 0: a constructor that only takes its properties.
+    set_fields: []const FieldStore,
+};
+
+pub const FieldStore = struct { slot: u32, param: u16 };
+
+/// The `Leaf` of `func`: one block, no handlers, reading parameters and
+/// either returning a field of parameter 0 or storing parameters in its
+/// fields and returning it.
+fn leafOf(a: std.mem.Allocator, func: *const ir.Func) Leaf {
+    if (func.entry.int() != 0) return .none;
+    return leafOfBlocks(a, func.blocks);
+}
+
+fn leafOfBlocks(a: std.mem.Allocator, blocks: []const ir.Block) Leaf {
+    if (blocks.len != 1) return .none;
+    const b = &blocks[0];
+    if (b.handlers != null) return .none;
+    const ret: ?ir.Reg = switch (b.terminator) {
+        .Return => |r| r,
+        else => return .none,
+    };
+    const Param = struct { reg: ir.Reg, idx: u16 };
+    var params: [16]Param = undefined;
+    var n_params: usize = 0;
+    var stores: [16]FieldStore = undefined;
+    var n_stores: usize = 0;
+    const paramOf = struct {
+        fn f(ps: []const Param, r: ir.Reg) ?u16 {
+            var i = ps.len;
+            while (i > 0) {
+                i -= 1;
+                if (ps[i].reg == r) return ps[i].idx;
+            }
+            return null;
+        }
+    }.f;
+    for (b.insts, 0..) |inst, i| switch (inst) {
+        .LoadParam => |lp| {
+            if (n_params == params.len) return .none;
+            params[n_params] = .{ .reg = lp.dst, .idx = lp.idx };
+            n_params += 1;
+        },
+        .GetFieldSlot => |g| {
+            if (i + 1 != b.insts.len or n_stores != 0) return .none;
+            if ((paramOf(params[0..n_params], g.obj) orelse return .none) != 0) return .none;
+            if (ret == null or ret.? != g.dst) return .none;
+            return .{ .get_field = g.slot };
+        },
+        .SetFieldSlot => |st| {
+            if ((paramOf(params[0..n_params], st.obj) orelse return .none) != 0) return .none;
+            const from = paramOf(params[0..n_params], st.value) orelse return .none;
+            if (from == 0 or n_stores == stores.len) return .none;
+            stores[n_stores] = .{ .slot = st.slot, .param = from };
+            n_stores += 1;
+        },
+        else => return .none,
+    };
+    if (n_stores == 0) return .none;
+    const r = ret orelse return .none;
+    if ((paramOf(params[0..n_params], r) orelse return .none) != 0) return .none;
+    return .{ .set_fields = a.dupe(FieldStore, stores[0..n_stores]) catch return .none };
+}
 
 var cache_mutex: runtime.SpinMutex = .{};
 /// Keyed per function: a table names the `Func` it was built for, and a call
@@ -240,6 +313,7 @@ pub fn resetCacheForTest() void {
         a.free(fs.values);
         a.free(fs.callees);
         a.free(fs.strings);
+        if (fs.leaf == .set_fields) a.free(fs.leaf.set_fields);
         a.destroy(fs);
     }
     c.clearRetainingCapacity();
@@ -287,6 +361,7 @@ fn funcStreamsSlow(func: *const ir.Func, consts: []const ir.Const) ?*const FuncS
         .strings = strings,
         .values = laid.values,
         .no_fill = func.frameDefBeforeUse(),
+        .leaf = leafOf(a, func),
     };
     cache.?.put(key, fs) catch return fs;
     @constCast(func).bc_memo_gen = gen;
@@ -1275,3 +1350,51 @@ pub fn dumpBlock(w: anytype, fs: *const FuncStreams, b: usize) !void {
         }
     }
 }
+
+test "a body that only reads a field of its receiver, or only stores its parameters, is a leaf" {
+    const a = std.testing.allocator;
+    const r = ir.Reg.from;
+    var getter = [_]ir.Inst{
+        .{ .LoadParam = .{ .dst = r(0), .idx = 0 } },
+        .{ .GetFieldSlot = .{ .dst = r(1), .obj = r(0), .slot = 3 } },
+    };
+    var blk: ir.Block = .{ .id = ir.BlockId.from(0), .insts = &getter, .terminator = .{ .Return = r(1) } };
+    try std.testing.expectEqual(Leaf{ .get_field = 3 }, leafOfBlocks(a, (&blk)[0..1]));
+    // A field of another parameter, or a result other than the field read, is not.
+    getter[0].LoadParam.idx = 1;
+    try std.testing.expectEqual(Leaf.none, leafOfBlocks(a, (&blk)[0..1]));
+    getter[0].LoadParam.idx = 0;
+    blk.terminator = .{ .Return = r(0) };
+    try std.testing.expectEqual(Leaf.none, leafOfBlocks(a, (&blk)[0..1]));
+
+    var ctor = [_]ir.Inst{
+        .{ .LoadParam = .{ .dst = r(0), .idx = 0 } },
+        .{ .LoadParam = .{ .dst = r(1), .idx = 1 } },
+        .{ .LoadParam = .{ .dst = r(2), .idx = 2 } },
+        .{ .SetFieldSlot = .{ .obj = r(0), .slot = 1, .value = r(2) } },
+        .{ .SetFieldSlot = .{ .obj = r(0), .slot = 0, .value = r(1) } },
+    };
+    var cblk: ir.Block = .{ .id = ir.BlockId.from(0), .insts = &ctor, .terminator = .{ .Return = r(0) } };
+    const leaf = leafOfBlocks(a, (&cblk)[0..1]);
+    defer if (leaf == .set_fields) a.free(leaf.set_fields);
+    try std.testing.expectEqualSlices(FieldStore, &.{ .{ .slot = 1, .param = 2 }, .{ .slot = 0, .param = 1 } }, leaf.set_fields);
+    // Storing the receiver itself, into another object, or returning nothing is not.
+    ctor[4].SetFieldSlot.value = r(0);
+    try std.testing.expectEqual(Leaf.none, leafOfBlocks(a, (&cblk)[0..1]));
+    ctor[4].SetFieldSlot.value = r(1);
+    ctor[3].SetFieldSlot.obj = r(1);
+    try std.testing.expectEqual(Leaf.none, leafOfBlocks(a, (&cblk)[0..1]));
+    ctor[3].SetFieldSlot.obj = r(0);
+    cblk.terminator = .{ .Return = null };
+    try std.testing.expectEqual(Leaf.none, leafOfBlocks(a, (&cblk)[0..1]));
+    // Any other instruction, or a second block, makes a frame necessary.
+    var other = [_]ir.Inst{
+        .{ .LoadParam = .{ .dst = r(0), .idx = 0 } },
+        .{ .Move = .{ .dst = r(1), .src = r(0) } },
+    };
+    const oblk: ir.Block = .{ .id = ir.BlockId.from(0), .insts = &other, .terminator = .{ .Return = r(1) } };
+    try std.testing.expectEqual(Leaf.none, leafOfBlocks(a, (&oblk)[0..1]));
+    const two = [_]ir.Block{ blk, blk };
+    try std.testing.expectEqual(Leaf.none, leafOfBlocks(a, &two));
+}
+

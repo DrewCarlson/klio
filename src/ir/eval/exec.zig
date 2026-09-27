@@ -532,6 +532,13 @@ fn runLoop(
                                 else
                                     streamCallee(frame, ev, fid);
                                 if (callee) |sc| {
+                                    if (sc.leaf != .none and !parent.call_hooks_on) {
+                                        const run = argRun(frame, @enumFromInt(code[pc + 3]), code[pc + 4]);
+                                        if (runLeaf(frame, sc.leaf, run, @enumFromInt(code[pc + 5]), allocator, reclaim)) {
+                                            pc += op_len;
+                                            continue :sw opAt(code, pc);
+                                        }
+                                    }
                                     frame.at(bcur, idx);
                                     // The call is a block edge for the loop's guards.
                                     if (edgeGuard(allocator, ftls)) |er| {
@@ -601,6 +608,15 @@ fn runLoop(
                                     try closureTarget(H, frame, ev, host, code[pc..][0..6]);
                                 if (target) |t| {
                                     const sc = t.streams;
+                                    // A constructor that only takes its properties stores them in the
+                                    // instance the register already holds.
+                                    if (op == .new and sc.leaf == .set_fields and !parent.call_hooks_on and
+                                        storeLeafFields(sc.leaf.set_fields, t.params, allocator, reclaim))
+                                    {
+                                        if (t.area) |m| ev.vstack.restore(m);
+                                        pc += op_len;
+                                        continue :sw opAt(code, pc);
+                                    }
                                     // The call is a block edge for the loop's guards.
                                     if (edgeGuard(allocator, ftls)) |er| {
                                         if (t.area) |m| ev.vstack.restore(m);
@@ -1395,6 +1411,46 @@ inline fn constructTarget(
     writeFastR(frame, @enumFromInt(op[6]), inst, allocator, reclaim);
     const ar = try ev_frame.ArgArea.push(ev, &.{inst}, argRun(frame, @enumFromInt(op[4]), op[5]));
     return .{ .streams = cfs, .params = ar.vals, .area = ar.mark, .dst = @enumFromInt(op[6]) };
+}
+
+/// Runs a call of a `bc.Leaf` body over `params` without a frame, its result
+/// in `dst`, as the body's own `Return` would leave it. False, having done
+/// nothing, when the receiver is not an instance with the fields.
+inline fn runLeaf(frame: *Frame, leaf: bc.Leaf, params: []const Value, dst: Reg, allocator: Allocator, comptime reclaim: bool) bool {
+    if (params.len == 0 or params[0] != .Instance) return false;
+    switch (leaf) {
+        .none => return false,
+        .get_field => |slot| {
+            const v = runtime.InstanceData.slotGet(params[0].Instance, slot) orelse return false;
+            if (reclaim) v.retain();
+            writeFastR(frame, dst, v, allocator, reclaim);
+            return true;
+        },
+        .set_fields => |stores| {
+            if (!storeLeafFields(stores, params, allocator, reclaim)) return false;
+            const this = params[0];
+            if (reclaim) this.retain();
+            writeFastR(frame, dst, this, allocator, reclaim);
+            return true;
+        },
+    }
+}
+
+/// Stores each of `stores`' parameters in its field of `params[0]`, as the
+/// body's `SetFieldSlot`s do. False, having stored nothing, for a receiver
+/// or a parameter the stores do not fit.
+inline fn storeLeafFields(stores: []const bc.FieldStore, params: []const Value, allocator: Allocator, comptime reclaim: bool) bool {
+    if (params.len == 0 or params[0] != .Instance) return false;
+    const inst = params[0].Instance;
+    const n = inst.cell.data.slots.len;
+    for (stores) |st| if (st.param >= params.len or st.slot >= n) return false;
+    for (stores) |st| {
+        const v = params[st.param];
+        if (reclaim) v.retain();
+        const old = runtime.InstanceData.slotSet(inst, st.slot, v).?;
+        if (reclaim) old.release(allocator);
+    }
+    return true;
 }
 
 /// The function-value invoke `op` (`callv`: inst_idx, callee, args, n_args, dst) in the stream: a
