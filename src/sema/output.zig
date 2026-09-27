@@ -69,7 +69,7 @@ pub fn build(s: *Sema) Allocator.Error!Output {
     // records in the order they were made.
     const counts = try a.alloc([]u32, nfiles);
     for (s.files.items, out, counts) |fc, *fr, *cnt| {
-        fr.node_count = @max(fc.ast.node_count, 1);
+        fr.node_count = if (fc.ast) |f| @max(f.node_count, 1) else 1;
         cnt.* = try a.alloc(u32, fr.node_count + 1);
         @memset(cnt.*, 0);
     }

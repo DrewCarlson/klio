@@ -70,7 +70,7 @@ pub fn run(a: Allocator, s: *sema.Sema, map: *const span.SourceMap, records: []c
             if (prog.isLowered(f)) out.lowered += 1;
         }
         if (try unbound(s, br, &prog, f)) |sym| {
-            const e: Entry = .{ .kind = .unbound_native, .func = br.m.funcs.items[i].fqn, .where = try declWhere(a, s, map, sym), .msg = "no native binds this bodyless declaration", .file = if (s.fileOf(s.syms.get(sym).file)) |fc| fc.ast.span.file.int() else null };
+            const e: Entry = .{ .kind = .unbound_native, .func = br.m.funcs.items[i].fqn, .where = try declWhere(a, s, map, sym), .msg = "no native binds this bodyless declaration", .file = if (s.fileOf(s.syms.get(sym).file)) |fc| (if (fc.ast) |file_ast| file_ast.span.file.int() else null) else null };
             try entries.append(a, e);
             out.counts[@intFromEnum(Kind.unbound_native)] += 1;
         }
@@ -147,9 +147,10 @@ fn unbound(s: *sema.Sema, br: *const bridge.Bridge, prog: *const lower.Program, 
 /// expect is never reached and no platform supplies an actual for it.
 fn noActualByDesign(s: *sema.Sema, sym: Sym) !bool {
     if (!s.syms.flags(sym).expect) return false;
+    // The census analyzes the base from source.
     const anns = switch (s.syms.get(sym).decl) {
-        .property => |pd| pd.annotations,
-        .function => |fd| fd.annotations,
+        .property => |pd| (pd orelse return false).annotations,
+        .function => |fd| (fd orelse return false).annotations,
         else => return false,
     };
     const suppress = s.classByFqn("kotlin.Suppress");
@@ -170,8 +171,8 @@ fn noActualByDesign(s: *sema.Sema, sym: Sym) !bool {
 
 fn declWhere(a: Allocator, s: *sema.Sema, map: *const span.SourceMap, sym: Sym) ![]const u8 {
     const sp: span.Span = switch (s.syms.get(sym).decl) {
-        .function => |fd| fd.span,
-        .property => |pd| pd.span,
+        .function => |fd| (fd orelse return "").span,
+        .property => |pd| (pd orelse return "").span,
         else => return "",
     };
     return spanWhere(a, map, sp);

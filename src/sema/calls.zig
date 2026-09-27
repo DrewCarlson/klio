@@ -2089,14 +2089,12 @@ fn dropLowPriority(ctx: *Ctx, apps: *std.ArrayList(Applied)) Allocator.Error!voi
 /// Whether a function or constructor is annotated with the annotation
 /// class `cls`.
 fn hasAnnotation(s: *Sema, sym: Sym, cls: Sym) Allocator.Error!bool {
-    const anns: []const ast.Annotation = switch (s.syms.get(sym).decl) {
-        .function => |f| f.annotations,
-        .secondary_ctor => |sc| sc.annotations,
-        // A primary constructor's are written before `constructor`.
-        .class => |c| if (s.syms.kind(sym) == .constructor) c.x().primary_ctor_annotations else return false,
+    switch (s.syms.get(sym).decl) {
+        .function, .secondary_ctor => {},
+        .class => if (s.syms.kind(sym) != .constructor) return false,
         else => return false,
-    };
-    return headers.annotatedWith(s, .{ .decl = sym, .file = s.syms.get(sym).file }, anns, cls);
+    }
+    return headers.hasAnnotation(s, sym, .decl, cls);
 }
 
 /// `@OverloadResolutionByLambdaReturnType` overloads (`sumOf`) differ only

@@ -64,7 +64,7 @@ pub fn lowerCtor(b: *Builder, ctor: Sym) Error!void {
         }
     }
     switch (s.syms.get(ctor).decl) {
-        .secondary_ctor => |sc| try secondaryCtor(b, cls, sc, this),
+        .secondary_ctor => |sc| try secondaryCtor(b, cls, sc.?, this),
         else => try primaryCtor(b, cls, this),
     }
     if (!b.terminated()) b.terminate(.{ .Return = this });
@@ -106,35 +106,46 @@ const ClassDecl = struct {
     primary_params: []const ast.ClassParam = &.{},
 };
 
+/// Null for a class with no AST: a base image's classes are constructed
+/// by the bodies the bake lowered.
 fn classDecl(s: *sema.Sema, cls: Sym) ?ClassDecl {
     return switch (s.syms.get(cls).decl) {
-        .class => |c| .{
-            .node = c.id,
-            .supertypes = c.supertypes,
-            .supertype_args = c.supertype_args,
-            .delegates = c.supertype_delegates,
-            .members = c.members,
-            .init_blocks = c.x().init_blocks,
-            .init_positions = c.x().init_block_positions,
-            .primary_params = c.primary_params,
+        .class => |c_| blk: {
+            const c = c_ orelse return null;
+            break :blk .{
+                .node = c.id,
+                .supertypes = c.supertypes,
+                .supertype_args = c.supertype_args,
+                .delegates = c.supertype_delegates,
+                .members = c.members,
+                .init_blocks = c.x().init_blocks,
+                .init_positions = c.x().init_block_positions,
+                .primary_params = c.primary_params,
+            };
         },
-        .object => |o| .{
-            .node = o.id,
-            .supertypes = o.supertypes,
-            .supertype_args = o.supertype_args,
-            .delegates = o.supertype_delegates,
-            .members = o.members,
-            .init_blocks = o.init_blocks,
-            .init_positions = o.init_block_positions,
+        .object => |o_| blk: {
+            const o = o_ orelse return null;
+            break :blk .{
+                .node = o.id,
+                .supertypes = o.supertypes,
+                .supertype_args = o.supertype_args,
+                .delegates = o.supertype_delegates,
+                .members = o.members,
+                .init_blocks = o.init_blocks,
+                .init_positions = o.init_block_positions,
+            };
         },
-        .object_literal => |o| .{
-            .node = o.id,
-            .supertypes = o.supertypes,
-            .supertype_args = o.supertype_args,
-            .delegates = o.supertype_delegates,
-            .members = o.members,
-            .init_blocks = o.init_blocks,
-            .init_positions = o.init_block_positions,
+        .object_literal => |o_| blk: {
+            const o = o_ orelse return null;
+            break :blk .{
+                .node = o.id,
+                .supertypes = o.supertypes,
+                .supertype_args = o.supertype_args,
+                .delegates = o.supertype_delegates,
+                .members = o.members,
+                .init_blocks = o.init_blocks,
+                .init_positions = o.init_block_positions,
+            };
         },
         else => null,
     };
@@ -468,7 +479,7 @@ fn fileStatics(b: *Builder, file: u32, eager: bool) Error!void {
         if (s.syms.kind(p) != .property or s.syms.get(p).file != file) continue;
         if (try bridge.eagerProperty(s, p) != eager) continue;
         const pd = switch (s.syms.get(p).decl) {
-            .property => |pd| pd,
+            .property => |pd| pd.?,
             else => continue,
         };
         b.cur_span = pd.span;
@@ -535,7 +546,7 @@ fn enumEntries(b: *Builder, cls: Sym) Error!void {
     const br = b.p.br;
     b.setFile(s.syms.get(cls).file);
     for (s.syms.classInfo(cls).enum_entries, 0..) |e, ordinal| {
-        const entry = s.syms.get(e).decl.enum_entry;
+        const entry = s.syms.get(e).decl.enum_entry.?;
         b.cur_span = entry.span;
         try b.emit(.{ .Trace = .{ .span = entry.span } });
         const st = br.staticOf(e) orelse return b.fail(entry.span, "entry `{s}` has no static", .{entry.name.name});
@@ -617,8 +628,9 @@ pub fn lowerAccessor(b: *Builder, prop: Sym, setter: bool) Error!void {
     const this: ?Reg = if (env.hasThis(s, prop)) try env.thisOf(b, s.syms.owner(prop)) else null;
     // An extension property's delegate takes its receiver as `thisRef`.
     const ext: ?Reg = if (info.receiver != .none) try env.receiver(b, .extension, prop) else null;
+    // An accessor lowered in this build has its property's AST.
     const pd: ?*const ast.Property = switch (s.syms.get(prop).decl) {
-        .property => |x| x,
+        .property => |x| x.?,
         else => null,
     };
     if (setter) {
@@ -892,7 +904,7 @@ fn dataProperties(b: *Builder, cls: Sym) Error![]const Sym {
     const s = b.p.s;
     var out: std.ArrayList(Sym) = .empty;
     const c = switch (s.syms.get(cls).decl) {
-        .class => |c| c,
+        .class => |c| c.?,
         else => return out.items,
     };
     for (c.primary_params) |*cp| {

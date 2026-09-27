@@ -111,11 +111,7 @@ fn enumerableClass(s: *Sema, cls: Sym) bool {
 
 /// A sealed class, or a sealed interface, whose modality stays abstract.
 fn isSealed(s: *Sema, cls: Sym) bool {
-    if (s.syms.flags(cls).modality == .sealed) return true;
-    return switch (s.syms.get(cls).decl) {
-        .class => |c| c.is_sealed,
-        else => false,
-    };
+    return s.syms.flags(cls).modality == .sealed or s.syms.classInfo(cls).sealed;
 }
 
 /// The cases of a value of type `t`, its `null` aside; false when they

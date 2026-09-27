@@ -135,6 +135,71 @@ pub fn annotationClass(s: *Sema, ctx: TypeCtx, ann: *const ast.Annotation) Alloc
     return c;
 }
 
+/// Where on a declaration an annotation is written: on the declaration,
+/// on a property's getter or setter, or on the type a parameter is written
+/// with.
+pub const AnnotationSite = enum(u2) { decl, getter, setter, written_type };
+
+pub fn annotationKey(sym: Sym, site: AnnotationSite) u64 {
+    return (@as(u64, sym.int()) << 2) | @intFromEnum(site);
+}
+
+/// The annotations written on `sym` at `site`; null for a declaration with
+/// no AST, one read back from a base image.
+pub fn writtenAnnotations(s: *Sema, sym: Sym, site: AnnotationSite) ?[]const ast.Annotation {
+    const d = s.syms.get(sym).decl;
+    return switch (site) {
+        .decl => switch (d) {
+            .function => |x| (x orelse return null).annotations,
+            .property, .local_prop => |x| (x orelse return null).annotations,
+            // A primary constructor's are written before `constructor`.
+            .class => |x| if (s.syms.kind(sym) == .constructor) (x orelse return null).x().primary_ctor_annotations else (x orelse return null).annotations,
+            .object => |x| (x orelse return null).annotations,
+            .secondary_ctor => |x| (x orelse return null).annotations,
+            .enum_entry => |x| (x orelse return null).annotations,
+            .type_alias => |x| (x orelse return null).annotations,
+            .class_param => |x| (x orelse return null).annotations,
+            .param => |x| (x orelse return null).annotations,
+            .accessor => |x| (x orelse return null).annotations,
+            .lambda => |x| (x orelse return null).annotations,
+            else => &.{},
+        },
+        .getter, .setter => switch (d) {
+            .property, .local_prop => |x| blk: {
+                const pd = x orelse return null;
+                const acc = (if (site == .getter) pd.getter else pd.setter) orelse break :blk &.{};
+                break :blk acc.annotations;
+            },
+            else => &.{},
+        },
+        .written_type => switch (d) {
+            .param => |x| (x orelse return null).ty.x().annotations,
+            else => &.{},
+        },
+    };
+}
+
+/// The annotation classes written on `sym` at `site`, each resolved where
+/// `sym` is declared, once. A declaration read back from a base image has
+/// its answer from the bake (`Sema.annotation_classes`).
+pub fn annotationClasses(s: *Sema, sym: Sym, site: AnnotationSite) Allocator.Error![]const Sym {
+    const key = annotationKey(sym, site);
+    if (s.annotation_classes.get(key)) |hit| return hit;
+    const anns = writtenAnnotations(s, sym, site) orelse return &.{};
+    if (anns.len == 0) return &.{};
+    const ctx: TypeCtx = .{ .decl = sym, .file = s.syms.get(sym).file };
+    const out = try s.arena.alloc(Sym, anns.len);
+    for (anns, out) |*ann, *o| o.* = try annotationClass(s, ctx, ann);
+    try s.annotation_classes.put(s.arena, key, out);
+    return out;
+}
+
+/// Whether `sym` carries the annotation class `cls` at `site`.
+pub fn hasAnnotation(s: *Sema, sym: Sym, site: AnnotationSite, cls: Sym) Allocator.Error!bool {
+    if (cls == .none) return false;
+    return std.mem.indexOfScalar(Sym, try annotationClasses(s, sym, site), cls) != null;
+}
+
 /// Whether one of `anns` names the annotation class `cls`.
 pub fn annotatedWith(s: *Sema, ctx: TypeCtx, anns: []const ast.Annotation, cls: Sym) Allocator.Error!bool {
     if (cls == .none) return false;
@@ -290,7 +355,8 @@ pub fn aliasTarget(s: *Sema, alias: Sym) Allocator.Error!TypeId {
         .pending => {},
     }
     info.state = .resolving;
-    const ta = s.syms.get(alias).decl.type_alias;
+    // Only a declaration from source is pending: an image's are resolved.
+    const ta = s.syms.get(alias).decl.type_alias.?;
     const t = try resolveTypeRef(s, ctxOf(s, alias), &ta.target);
     const info2 = s.syms.aliasInfo(alias);
     info2.target = t;
@@ -311,9 +377,9 @@ pub fn supertypes(s: *Sema, cls: Sym) Allocator.Error![]const TypeId {
     const sym = s.syms.get(cls);
     const kind = info.kind;
     const written: []const ast.TypeRef = switch (sym.decl) {
-        .class => |c| c.supertypes,
-        .object => |o| o.supertypes,
-        .object_literal => |o| o.supertypes,
+        .class => |c| c.?.supertypes,
+        .object => |o| o.?.supertypes,
+        .object_literal => |o| o.?.supertypes,
         else => &.{},
     };
     // Supertypes are written in the class header, where the class's own
@@ -407,11 +473,11 @@ pub fn typeParamBounds(s: *Sema, tp: Sym) Allocator.Error![]const TypeId {
     const ctx = TypeCtx{ .decl = owner, .file = sym.file };
     var out: std.ArrayList(TypeId) = .empty;
     if (sym.decl == .type_param) {
-        if (sym.decl.type_param.upper_bound) |*ub| try out.append(s.arena, try resolveTypeRef(s, ctx, ub));
+        if (sym.decl.type_param.?.upper_bound) |*ub| try out.append(s.arena, try resolveTypeRef(s, ctx, ub));
     }
     const where: []const ast.WhereBound = switch (s.syms.get(owner).decl) {
-        .function => |f| f.where_bounds,
-        .class => |c| c.x().where_bounds,
+        .function => |f| f.?.where_bounds,
+        .class => |c| c.?.x().where_bounds,
         else => &.{},
     };
     for (where) |*wb| {
@@ -437,7 +503,8 @@ pub fn functionHeader(s: *Sema, f: Sym) Allocator.Error!void {
     var recv: TypeId = .none;
     var ret: TypeId = .none;
     switch (sym.decl) {
-        .function => |fd| {
+        .function => |fd_opt| {
+            const fd = fd_opt.?;
             if (try annotatedWith(s, ctx, fd.annotations, s.builtins.composable)) s.syms.getMut(f).flags.composable = true;
             if (fd.receiver_type) |rt| recv = try resolveTypeRef(s, ctx, rt);
             if (fd.return_type) |rt| {
@@ -496,9 +563,9 @@ pub fn paramType(s: *Sema, p: Sym) Allocator.Error!TypeId {
     const sym = s.syms.get(p);
     const ctx = TypeCtx{ .decl = sym.owner, .file = sym.file };
     const t: TypeId = switch (sym.decl) {
-        .param => |pd| try resolveTypeRef(s, ctx, &pd.ty),
-        .class_param => |cp| try resolveTypeRef(s, ctx, &cp.ty),
-        .context_param => |cp| try resolveTypeRef(s, ctx, &cp.ty),
+        .param => |pd| try resolveTypeRef(s, ctx, &pd.?.ty),
+        .class_param => |cp| try resolveTypeRef(s, ctx, &cp.?.ty),
+        .context_param => |cp| try resolveTypeRef(s, ctx, &cp.?.ty),
         else => s.types.errType(),
     };
     const info2 = s.syms.paramInfo(p);
@@ -517,7 +584,8 @@ pub fn propertyHeader(s: *Sema, p: Sym) Allocator.Error!void {
     var recv: TypeId = .none;
     var ty: TypeId = .none;
     switch (sym.decl) {
-        .property => |pd| {
+        .property => |pd_opt| {
+            const pd = pd_opt.?;
             if (pd.receiver_written orelse pd.receiver_type) |rt| recv = try resolveTypeRef(s, ctx, rt);
             if (pd.ty) |t| ty = try resolveTypeRef(s, ctx, t);
             const comp = s.builtins.composable;
@@ -527,7 +595,8 @@ pub fn propertyHeader(s: *Sema, p: Sym) Allocator.Error!void {
                 s.syms.getMut(p).flags.composable = true;
             }
         },
-        .class_param => |cp| {
+        .class_param => |cp_opt| {
+            const cp = cp_opt.?;
             ty = try resolveTypeRef(s, .{ .decl = sym.owner, .file = sym.file }, &cp.ty);
             // A `vararg val` constructor property holds the array.
             if (cp.is_vararg) ty = try s.varargArrayType(ty);

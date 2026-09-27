@@ -73,7 +73,8 @@ pub fn lowerLocalFun(b: *Builder, d: *const ast.Decl) Error!void {
 pub fn lowerClosureBody(b: *Builder, f: Sym) Error!void {
     const s = b.p.s;
     switch (s.syms.get(f).decl) {
-        .lambda => |l| {
+        .lambda => |l_| {
+            const l = l_.?;
             const rec = try b.lambda(l.id);
             try checkParams(b, l);
             const unit_result = returnsUnit(s, rec.fn_type);
@@ -82,14 +83,16 @@ pub fn lowerClosureBody(b: *Builder, f: Sym) Error!void {
             if (b.terminated()) return;
             b.terminate(.{ .Return = if (unit_result) try b.unit() else v orelse try b.unit() });
         },
-        .anon_fun => |af| {
+        .anon_fun => |af_| {
+            const af = af_.?;
             const fb = af.body orelse {
                 b.terminate(.{ .Return = try b.unit() });
                 return;
             };
             try body.lowerFunctionBody(b, fb);
         },
-        .function => |fd| {
+        .function => |fd_| {
+            const fd = fd_.?;
             const fb = if (fd.body) |*x| x else return b.fail(fd.span, "local function `{s}` has no body", .{fd.name.name});
             if (compose.composableFunction(s, f)) return compose.lowerFunctionBody(b, f, fb);
             try body.lowerFunctionBody(b, fb);

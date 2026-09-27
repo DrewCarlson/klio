@@ -338,7 +338,7 @@ pub fn collect(s: *Sema, arena: Allocator, map: ?*const span.SourceMap, out: *st
     if (map) |m| {
         for (s.files.items, 0..) |fc, i| {
             if (fc.origin != .program) continue;
-            const id = fc.ast.span.file;
+            const id = fc.ast.?.span.file;
             if (id.int() >= m.files.items.len) continue;
             const ft = try FileText.init(arena, id, m.get(id).source);
             try texts.files.put(arena, @intCast(i), ft);
@@ -395,7 +395,7 @@ fn skipped(s: *Sema, ft: *const FileText, r: records.Ref) bool {
     if (cls == .none or s.syms.kind(cls) != .class or s.syms.classInfo(cls).kind != .enum_class) return false;
     for (s.syms.classInfo(cls).enum_entries) |e| {
         const decl = s.syms.get(e).decl;
-        if (decl != .enum_entry or decl.enum_entry.name.span.start != r.anchor.start) continue;
+        if (decl != .enum_entry or (decl.enum_entry orelse continue).name.span.start != r.anchor.start) continue;
         const i = ft.at(r.anchor.start) orelse return false;
         return i + 1 >= ft.toks.len or ft.toks[i + 1].kind != .LParen;
     }

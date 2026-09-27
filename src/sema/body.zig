@@ -349,8 +349,9 @@ fn resumePendingSetters(s: *Sema) Allocator.Error!void {
         if (!info.setter_pending) continue;
         info.setter_pending = false;
         const sym = s.syms.get(p);
+        // A setter is pending only in a body this analysis resolves.
         const pd = switch (sym.decl) {
-            .property => |pd| pd,
+            .property => |pd| pd.?,
             else => continue,
         };
         const st = pd.setter orelse continue;
@@ -389,7 +390,8 @@ pub fn resolveFile(s: *Sema, file: u32) Allocator.Error!void {
     const fc = s.files.items[file];
     try scope_mod.checkInheritedImports(s, file);
     var ctx = Ctx{ .s = s, .file = file, .scope = try fileScope(s) };
-    for (fc.ast.decls) |*d| {
+    // A file this analysis resolves bodies in has its AST.
+    for (fc.ast.?.decls) |*d| {
         const sym = declSym(s, fc.package, d) orelse continue;
         try resolveMemberDecl(&ctx, sym);
     }
@@ -547,8 +549,9 @@ fn pushFunctionScope(ctx: *Ctx, f: Sym) Allocator.Error!*Scope {
 fn resolveFunction(ctx: *Ctx, f: Sym) Allocator.Error!void {
     const s = ctx.s;
     const sym = s.syms.get(f);
+    // A declaration read back from a base image was resolved at the bake.
     const fd = switch (sym.decl) {
-        .function => |fd| fd,
+        .function => |fd| fd orelse return,
         else => return,
     };
     // A superseded `expect` has no body that runs, but its defaults are
@@ -629,8 +632,8 @@ fn resolveParamDefaults(ctx: *Ctx, params: []const Sym) Allocator.Error!void {
     for (params) |p| {
         const sym = s.syms.get(p);
         const default: ?*const Expr = switch (sym.decl) {
-            .param => |pd| pd.default,
-            .class_param => |cp| if (cp.default) |*d| d else null,
+            .param => |pd| if (pd) |x| x.default else null,
+            .class_param => |cp| if (cp) |x| (if (x.default) |*d| d else null) else null,
             else => null,
         };
         // A `vararg` parameter's default is the whole array (`vararg val
@@ -706,7 +709,8 @@ fn resolvePropertyIn(ctx: *Ctx, p: Sym) Allocator.Error!void {
     const sym = s.syms.get(p);
     if (sym.flags.superseded) return;
     const pd = switch (sym.decl) {
-        .property => |pd| pd,
+        // A declaration read back from a base image was resolved at the bake.
+        .property => |pd| pd orelse return,
         // A constructor property's value is its parameter's.
         else => return,
     };
@@ -964,7 +968,7 @@ fn pushPlainCtorParams(ctx: *Ctx, primary: Sym) Allocator.Error!*Scope {
     sc.ctor_params = true;
     for (s.syms.functionInfo(primary).params) |p| {
         const decl = s.syms.get(p).decl;
-        if (decl == .class_param and decl.class_param.property != null) continue;
+        if (decl == .class_param and decl.class_param.?.property != null) continue;
         try ctx.declareLocal(s.syms.name(p), p);
     }
     return sc;
@@ -1041,6 +1045,7 @@ fn resolveClass(ctx: *Ctx, cls: Sym) Allocator.Error!void {
 /// parameter; init blocks and property initializers (in the scope this
 /// returns, which the caller pops after them) see the plain parameters,
 /// since a `val`/`var` parameter there is the property.
+/// A class this analysis resolves, from its AST.
 fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
     const s = ctx.s;
     const primary = s.syms.classInfo(cls).primary_ctor;
@@ -1070,19 +1075,21 @@ fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
             o.receivers = all_receivers;
         };
         switch (s.syms.get(cls).decl) {
-            .class => |c| {
+            .class => |c_| {
+                const c = c_.?;
                 // An enum entry's body class takes the entry's arguments,
                 // which `enumEntry` resolves on the enum class.
                 const saved_node = ctx.enterNode(c.id);
                 defer ctx.leaveNode(saved_node);
                 if (s.syms.classInfo(cls).kind != .enum_entry) try superCalls(ctx, cls, c.supertypes, c.supertype_args, c.x().supertype_arg_names, c.supertype_delegates);
             },
-            .object => |o| {
+            .object => |o_| {
+                const o = o_.?;
                 const saved_node = ctx.enterNode(o.id);
                 defer ctx.leaveNode(saved_node);
                 try superCalls(ctx, cls, o.supertypes, o.supertype_args, o.supertype_arg_names, o.supertype_delegates);
             },
-            .object_literal => |o| try superCalls(ctx, cls, o.supertypes, o.supertype_args, o.supertype_arg_names, o.supertype_delegates),
+            .object_literal => |o| try superCalls(ctx, cls, o.?.supertypes, o.?.supertype_args, o.?.supertype_arg_names, o.?.supertype_delegates),
             else => {},
         }
         ctx.pop(sc);
@@ -1091,19 +1098,19 @@ fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
         // constructor's parameters are not (`Alpha(run { ... })` is the
         // top-level `run`, not `this@Foo.run`).
         switch (s.syms.get(cls).decl) {
-            .class => |c| for (c.x().enum_entries) |*e| try enumEntry(ctx, cls, e),
+            .class => |c| for (c.?.x().enum_entries) |*e| try enumEntry(ctx, cls, e),
             else => {},
         }
     }
     if (primary == .none) {
         switch (s.syms.get(cls).decl) {
             .class => |c| {
-                for (c.x().init_blocks) |*b| _ = try bodyBlock(ctx, b);
+                for (c.?.x().init_blocks) |*b| _ = try bodyBlock(ctx, b);
             },
-            .object => |o| for (o.init_blocks) |*b| {
+            .object => |o| for (o.?.init_blocks) |*b| {
                 _ = try bodyBlock(ctx, b);
             },
-            .object_literal => |o| for (o.init_blocks) |*b| {
+            .object_literal => |o| for (o.?.init_blocks) |*b| {
                 _ = try bodyBlock(ctx, b);
             },
             else => {},
@@ -1113,12 +1120,12 @@ fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
     const sc = try pushPlainCtorParams(ctx, primary);
     switch (s.syms.get(cls).decl) {
         .class => |c| {
-            for (c.x().init_blocks) |*b| _ = try bodyBlock(ctx, b);
+            for (c.?.x().init_blocks) |*b| _ = try bodyBlock(ctx, b);
         },
-        .object => |o| for (o.init_blocks) |*b| {
+        .object => |o| for (o.?.init_blocks) |*b| {
             _ = try bodyBlock(ctx, b);
         },
-        .object_literal => |o| for (o.init_blocks) |*b| {
+        .object_literal => |o| for (o.?.init_blocks) |*b| {
             _ = try bodyBlock(ctx, b);
         },
         else => {},
@@ -1131,7 +1138,8 @@ fn resolveFunctionInClass(ctx: *Ctx, f: Sym) Allocator.Error!void {
     const s = ctx.s;
     const sym = s.syms.get(f);
     const fd = switch (sym.decl) {
-        .function => |fd| fd,
+        // A declaration read back from a base image was resolved at the bake.
+        .function => |fd| fd orelse return,
         else => return,
     };
     if (sym.flags.superseded) return;
@@ -1154,7 +1162,7 @@ fn resolveFunctionInClass(ctx: *Ctx, f: Sym) Allocator.Error!void {
 
 fn secondaryCtor(ctx: *Ctx, cls: Sym, ctor: Sym) Allocator.Error!void {
     const s = ctx.s;
-    const sc_decl = s.syms.get(ctor).decl.secondary_ctor;
+    const sc_decl = s.syms.get(ctor).decl.secondary_ctor.?;
     const saved_node = ctx.enterNode(sc_decl.id);
     defer ctx.leaveNode(saved_node);
     try headers.functionHeader(s, ctor);
@@ -1446,7 +1454,7 @@ fn localContextParams(ctx: *Ctx, cps: []const ast.ContextParam, owner: Sym) Allo
 
 pub fn resolveLocalFunctionBody(ctx: *Ctx, sym: Sym) Allocator.Error!void {
     const s = ctx.s;
-    const f = s.syms.get(sym).decl.function;
+    const f = s.syms.get(sym).decl.function.?;
     s.syms.functionInfo(sym).body_done = true;
     const sc = try pushFunctionScope(ctx, sym);
     defer ctx.pop(sc);
@@ -2765,13 +2773,32 @@ fn conditionInner(ctx: *Ctx, cond: *const Expr) Allocator.Error!TypedFacts {
 
 pub const EffectKind = enum { returns, returns_true, returns_false, returns_not_null };
 
-/// `returns(...) implies (cond)` in a function's `contract { }`: `cond` is
-/// written over the function's parameters and `this`.
-pub const Effect = struct { kind: EffectKind, cond: *const Expr };
+/// What a contract's condition is written over: the function's receiver
+/// (`this`), or its parameter at an index.
+pub const Operand = union(enum) { this, param: u16 };
+
+/// A contract's `implies (...)` condition, resolved where the function is
+/// declared, so a call reads it without the function's AST.
+pub const Cond = union(enum) {
+    /// A shape a contract condition says nothing through.
+    none,
+    /// A Boolean parameter, or `this`: its own condition holds.
+    operand: Operand,
+    /// `x != null` (`not_null`) or `x == null`.
+    null_check: struct { operand: Operand, not_null: bool },
+    and_: struct { lhs: *const Cond, rhs: *const Cond },
+    not: *const Cond,
+    /// `x is T` or `x !is T`, with `T` as the declaration reads it, before
+    /// a call's type arguments stand in for its type parameters.
+    is_type: struct { operand: Operand, ty: TypeId, negated: bool },
+};
+
+/// `returns(...) implies (cond)` in a function's `contract { }`.
+pub const Effect = struct { kind: EffectKind, cond: *const Cond };
 
 /// The effects a function's contract declares, read from the first
-/// statement of its body.
-fn contractOf(s: *Sema, f: Sym) Allocator.Error![]const Effect {
+/// statement of its body once; a base image carries a base function's.
+pub fn contractOf(s: *Sema, f: Sym) Allocator.Error![]const Effect {
     if (s.contracts.get(f)) |c| return c;
     var out: std.ArrayList(Effect) = .empty;
     const fd = switch (s.syms.get(f).decl) {
@@ -2801,13 +2828,57 @@ fn contractOf(s: *Sema, f: Sym) Allocator.Error![]const Effect {
                         .BoolLit => |bl| if (bl.value) .returns_true else .returns_false,
                         else => continue,
                     };
-                    try out.append(s.arena, .{ .kind = kind, .cond = &imp.args[1] });
+                    try out.append(s.arena, .{ .kind = kind, .cond = try contractCond(s, f, &imp.args[1]) });
                 }
             }
         }
     };
     try s.contracts.put(s.arena, f, out.items);
     return out.items;
+}
+
+/// The condition `e` of `f`'s contract, resolved in `f`'s scope.
+fn contractCond(s: *Sema, f: Sym, e: *const Expr) Allocator.Error!*const Cond {
+    const out = try s.arena.create(Cond);
+    out.* = switch (e.*) {
+        .Path, .This => if (contractName(s, f, e)) |o| .{ .operand = o } else .none,
+        .Binary => |bin| switch (bin.op) {
+            .Eq, .Neq, .IdentEq, .IdentNeq => blk: {
+                const side = if (bin.rhs.* == .NullLit) bin.lhs else if (bin.lhs.* == .NullLit) bin.rhs else break :blk .none;
+                const o = contractName(s, f, side) orelse break :blk .none;
+                break :blk .{ .null_check = .{ .operand = o, .not_null = bin.op == .Neq or bin.op == .IdentNeq } };
+            },
+            .And => .{ .and_ = .{ .lhs = try contractCond(s, f, bin.lhs), .rhs = try contractCond(s, f, bin.rhs) } },
+            else => .none,
+        },
+        .Unary => |u| if (u.op == .Not) .{ .not = try contractCond(s, f, u.expr) } else .none,
+        // `implies (this@isError is NetRequestStatus.Error)`: the operand is
+        // the type, as written where the contract is declared.
+        .IsCheck => |c| blk: {
+            const o = contractName(s, f, c.expr) orelse break :blk .none;
+            s.census.muted += 1;
+            const t = headers.resolveTypeRef(s, headers.ctxOf(s, f), &c.ty);
+            s.census.muted -= 1;
+            break :blk .{ .is_type = .{ .operand = o, .ty = try t, .negated = c.negated } };
+        },
+        else => .none,
+    };
+    return out;
+}
+
+/// What a name in `f`'s contract stands for: `this`, or a parameter.
+fn contractName(s: *Sema, f: Sym, e: *const Expr) ?Operand {
+    switch (e.*) {
+        .This => return .this,
+        .Path => |p| {
+            if (p.segments.len != 1) return null;
+            for (s.syms.functionInfo(f).params, 0..) |prm, i| {
+                if (std.mem.eql(u8, s.str(s.syms.name(prm)), p.segments[0].name)) return .{ .param = @intCast(i) };
+            }
+            return null;
+        },
+        else => return null,
+    }
 }
 
 const ContractUse = enum { returns, outcome };
@@ -2821,9 +2892,8 @@ fn contractFacts(ctx: *Ctx, e: *const Expr, refs_before: usize, use: ContractUse
     const effects = try contractOf(s, rec.callee);
     if (effects.len == 0) return .{};
     const c = &e.Call;
-    const params = s.syms.functionInfo(rec.callee).params;
     const recv: ?*const Expr = if (c.callee.* == .Member) c.callee.Member.receiver else null;
-    const binding: ContractBinding = .{ .call = c, .params = params, .args = rec.args, .receiver = recv, .callee = rec.callee, .type_args = rec.type_args };
+    const binding: ContractBinding = .{ .call = c, .args = rec.args, .receiver = recv, .callee = rec.callee, .type_args = rec.type_args };
     var out: Facts = .{};
     for (effects) |eff| {
         switch (use) {
@@ -2843,7 +2913,6 @@ fn contractFacts(ctx: *Ctx, e: *const Expr, refs_before: usize, use: ContractUse
 
 const ContractBinding = struct {
     call: *const @FieldType(Expr, "Call"),
-    params: []const Sym,
     args: []const records.ArgSource,
     receiver: ?*const Expr,
     /// The function declaring the contract: its types are written there.
@@ -2852,66 +2921,47 @@ const ContractBinding = struct {
     type_args: []const TypeId,
 };
 
-/// The argument expression a contract's name stands for: a parameter's
-/// operand, or the receiver for `this`.
-fn contractOperand(ctx: *Ctx, e: *const Expr, b: *const ContractBinding) ?*const Expr {
-    switch (e.*) {
-        .This => return b.receiver,
-        .Path => |p| {
-            if (p.segments.len != 1) return null;
-            for (b.params, 0..) |prm, i| {
-                if (!std.mem.eql(u8, ctx.s.str(ctx.s.syms.name(prm)), p.segments[0].name)) continue;
-                if (i >= b.args.len) return null;
-                return switch (b.args[i]) {
-                    .arg => |ai| if (ai < b.call.args.len) &b.call.args[ai] else null,
-                    .receiver => b.receiver,
-                    else => null,
-                };
-            }
-            return null;
+/// The argument expression a contract's operand stands for at a call.
+fn contractOperand(b: *const ContractBinding, o: Operand) ?*const Expr {
+    switch (o) {
+        .this => return b.receiver,
+        .param => |i| {
+            if (i >= b.args.len) return null;
+            return switch (b.args[i]) {
+                .arg => |ai| if (ai < b.call.args.len) &b.call.args[ai] else null,
+                .receiver => b.receiver,
+                else => null,
+            };
         },
-        else => return null,
     }
 }
 
 /// What a contract condition says about the call's operands when it holds
 /// (`when_true`) and when it does not (`when_false`).
-fn impliedFacts(ctx: *Ctx, cond: *const Expr, b: *const ContractBinding) Allocator.Error!Facts {
+fn impliedFacts(ctx: *Ctx, cond: *const Cond, b: *const ContractBinding) Allocator.Error!Facts {
     switch (cond.*) {
-        .Path, .This => {
-            // A Boolean parameter: the argument's own condition holds.
-            const arg = contractOperand(ctx, cond, b) orelse return .{};
-            return conditionFactsOnly(ctx, arg);
+        .none => return .{},
+        // A Boolean parameter: the argument's own condition holds.
+        .operand => |o| return conditionFactsOnly(ctx, contractOperand(b, o) orelse return .{}),
+        .null_check => |nc| {
+            const f = try nonNullFacts(ctx, contractOperand(b, nc.operand) orelse return .{});
+            return if (nc.not_null) .{ .when_true = f } else .{ .when_false = f };
         },
-        .Binary => |bin| switch (bin.op) {
-            .Eq, .Neq, .IdentEq, .IdentNeq => {
-                const side = if (bin.rhs.* == .NullLit) bin.lhs else if (bin.lhs.* == .NullLit) bin.rhs else return .{};
-                const arg = contractOperand(ctx, side, b) orelse return .{};
-                const f = try nonNullFacts(ctx, arg);
-                return if (bin.op == .Neq or bin.op == .IdentNeq) .{ .when_true = f } else .{ .when_false = f };
-            },
-            .And => {
-                const l = try impliedFacts(ctx, bin.lhs, b);
-                const r = try impliedFacts(ctx, bin.rhs, b);
-                return .{ .when_true = try concat(ctx, l.when_true, r.when_true) };
-            },
-            else => return .{},
+        .and_ => |a| {
+            const l = try impliedFacts(ctx, a.lhs, b);
+            const r = try impliedFacts(ctx, a.rhs, b);
+            return .{ .when_true = try concat(ctx, l.when_true, r.when_true) };
         },
-        .Unary => |u| if (u.op == .Not) {
-            const inner = try impliedFacts(ctx, u.expr, b);
+        .not => |inner_cond| {
+            const inner = try impliedFacts(ctx, inner_cond, b);
             return .{ .when_true = inner.when_false, .when_false = inner.when_true };
-        } else return .{},
-        // `implies (this@isError is NetRequestStatus.Error)`: the operand is
-        // the type, as written where the contract is declared, with the
-        // call's type arguments for the callee's type parameters
+        },
+        // With the call's type arguments for the callee's type parameters
         // (`assertIs<Sub>(b)` makes `b` a `Sub`).
-        .IsCheck => |c| {
+        .is_type => |it| {
             const s = ctx.s;
-            const arg = contractOperand(ctx, c.expr, b) orelse return .{};
-            s.census.muted += 1;
-            const t = headers.resolveTypeRef(s, headers.ctxOf(s, b.callee), &c.ty);
-            s.census.muted -= 1;
-            var ty = try t;
+            const arg = contractOperand(b, it.operand) orelse return .{};
+            var ty = it.ty;
             if (s.types.isErr(ty)) return .{};
             const tps = s.syms.functionInfo(b.callee).type_params;
             if (tps.len != 0 and tps.len == b.type_args.len) {
@@ -2920,9 +2970,8 @@ fn impliedFacts(ctx: *Ctx, cond: *const Expr, b: *const ContractBinding) Allocat
                 ty = try s.types.substitute(ty, &subst);
                 if (s.types.isErr(ty)) return .{};
             }
-            return isFacts(ctx, arg, ty, c.negated);
+            return isFacts(ctx, arg, ty, it.negated);
         },
-        else => return .{},
     }
 }
 
@@ -3052,7 +3101,7 @@ fn stableProperty(s: *Sema, p: Sym) bool {
     const f = s.syms.flags(p);
     if (f.mutable or f.modality != .final) return false;
     return switch (s.syms.get(p).decl) {
-        .property => |pd| pd.getter == null and pd.delegate == null,
+        .property => !s.syms.propertyInfo(p).written.getter and !s.syms.propertyInfo(p).has_delegate,
         .class_param => true,
         else => false,
     };
@@ -3457,11 +3506,9 @@ fn fieldCast(ctx: *Ctx, subject: Sym) Allocator.Error!?TypeId {
     const s = ctx.s;
     const sym = s.path_property.get(subject) orelse subject;
     if (s.syms.kind(sym) != .property) return null;
-    const pd = switch (s.syms.get(sym).decl) {
-        .property => |pd| pd,
-        else => return null,
-    };
-    if (pd.explicit_field == null or pd.getter != null) return null;
+    if (s.syms.get(sym).decl != .property) return null;
+    const written = s.syms.propertyInfo(sym).written;
+    if (!written.explicit_field or written.getter) return null;
     // A class member's field is visible in the class; a top-level
     // property's in its file.
     const owner = s.syms.owner(sym);

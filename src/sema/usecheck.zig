@@ -60,21 +60,22 @@ pub fn checkProgram(s: *Sema) Allocator.Error!void {
         const info = s.syms.get(sym);
         const fc = s.fileOf(info.file) orelse continue;
         if (!declcheck.checked(fc) or info.flags.synthetic) continue;
-        // The types a declaration's header names.
+        // The types a declaration's header names. A program's declarations
+        // are checked, and each has its AST.
         switch (info.decl) {
             .function => |d| {
-                if (d.receiver_type) |t| try c.typeUse(sym, t);
-                if (d.return_type) |t| try c.typeUse(sym, t);
+                if (d.?.receiver_type) |t| try c.typeUse(sym, t);
+                if (d.?.return_type) |t| try c.typeUse(sym, t);
             },
             .property => |d| {
-                if (d.receiver_type) |t| try c.typeUse(sym, t);
-                if (d.ty) |t| try c.typeUse(sym, t);
+                if (d.?.receiver_type) |t| try c.typeUse(sym, t);
+                if (d.?.ty) |t| try c.typeUse(sym, t);
             },
-            .param => |d| try c.typeUse(sym, &d.ty),
-            .class_param => |d| if (info.kind == .value_param) try c.typeUse(sym, &d.ty),
-            .class => |d| for (d.supertypes) |*t| try c.typeUse(sym, t),
-            .object => |d| for (d.supertypes) |*t| try c.typeUse(sym, t),
-            .type_alias => |d| try c.typeUse(sym, &d.target),
+            .param => |d| try c.typeUse(sym, &d.?.ty),
+            .class_param => |d| if (info.kind == .value_param) try c.typeUse(sym, &d.?.ty),
+            .class => |d| for (d.?.supertypes) |*t| try c.typeUse(sym, t),
+            .object => |d| for (d.?.supertypes) |*t| try c.typeUse(sym, t),
+            .type_alias => |d| try c.typeUse(sym, &d.?.target),
             else => {},
         }
         if (!info.flags.override) continue;
@@ -175,25 +176,35 @@ const Checker = struct {
     }
 };
 
-fn annotationsOf(s: *Sema, m: Sym) []const ast.Annotation {
+/// The annotations `m` is written with; null for a declaration with no
+/// AST, one read back from a base image.
+fn annotationsOf(s: *Sema, m: Sym) ?[]const ast.Annotation {
     return switch (s.syms.get(m).decl) {
-        .function => |d| d.annotations,
-        .property => |d| d.annotations,
-        .class => |d| d.annotations,
-        .object => |d| d.annotations,
-        .secondary_ctor => |d| d.annotations,
-        .enum_entry => |d| d.annotations,
-        .type_alias => |d| d.annotations,
-        .class_param => |d| d.annotations,
+        .function => |d| (d orelse return null).annotations,
+        .property => |d| (d orelse return null).annotations,
+        .class => |d| (d orelse return null).annotations,
+        .object => |d| (d orelse return null).annotations,
+        .secondary_ctor => |d| (d orelse return null).annotations,
+        .enum_entry => |d| (d orelse return null).annotations,
+        .type_alias => |d| (d orelse return null).annotations,
+        .class_param => |d| (d orelse return null).annotations,
         else => &.{},
     };
 }
 
 /// `@Deprecated(message, level = ...)` on `m`, its level decided by
 /// `@DeprecatedSinceKotlin` against the language version when that is
-/// there too.
-fn ownDeprecation(s: *Sema, m: Sym) Allocator.Error!?Deprecation {
-    const anns = annotationsOf(s, m);
+/// there too; found once (`Sema.deprecations`), and read back from a base
+/// image for the base's declarations.
+pub fn ownDeprecation(s: *Sema, m: Sym) Allocator.Error!?Deprecation {
+    if (s.deprecations.get(m)) |d| return d;
+    const anns = annotationsOf(s, m) orelse return null;
+    const d = try writtenDeprecation(s, m, anns);
+    try s.deprecations.put(s.arena, m, d);
+    return d;
+}
+
+fn writtenDeprecation(s: *Sema, m: Sym, anns: []const ast.Annotation) Allocator.Error!?Deprecation {
     if (anns.len == 0 or s.builtins.deprecated == .none) return null;
     const ctx: headers.TypeCtx = .{ .decl = m, .file = s.syms.get(m).file };
     var dep: ?Deprecation = null;

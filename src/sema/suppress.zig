@@ -47,7 +47,7 @@ pub const Suppressions = struct {
     fn regionsOf(self: *Suppressions, s: *Sema, file: u32) Allocator.Error![]const Region {
         if (self.by_file.get(file)) |r| return r;
         const fc = s.fileOf(file) orelse return &.{};
-        const regions = try collect(self.arena, fc.ast);
+        const regions = try collect(self.arena, fc.ast orelse return &.{});
         try self.by_file.put(self.arena, file, regions);
         return regions;
     }

@@ -627,7 +627,7 @@ const Lowered = struct {
     }
 
     fn ofSym(fx: *Fixture, f: Sym) !Lowered {
-        const fd = fx.s.syms.get(f).decl.function;
+        const fd = fx.s.syms.get(f).decl.function.?;
         var b = try lower.Builder.init(&fx.p, fx.s.syms.get(f).file, f, ir.FuncId.from(f.int()), .function);
         try lower.env.enter(&b);
         lower.body.lowerFunctionBody(&b, &fd.body.?) catch |err| {

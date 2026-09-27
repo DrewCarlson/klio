@@ -435,7 +435,7 @@ test "a read and a write of one property resolve differently: plain read, setter
     // The setter's `field` is the property's own slot on `this`.
     const b = try fx.builderFor(r, .setter);
     try std.testing.expectEqual(@as(?u16, 1), b.env.setter_value);
-    const pd = fx.s.syms.get(r).decl.property;
+    const pd = fx.s.syms.get(r).decl.property.?;
     const st = pd.setter.?.body.Block.stmts[0].Assign;
     const rec = b.nameAt(st.id, st.target.Path.segments[0].span.start).?;
     try std.testing.expectEqual(sema.records.NameKind.backing_field, rec.kind);
@@ -636,7 +636,7 @@ test "a captured var lives in a cell the closure reads and writes" {
     fx.br.cells.set(c.int());
     // The enclosing body makes the cell and hands the cell itself over.
     const b = try fx.builderFor(m_sym, .function);
-    const pd = fx.s.syms.get(m_sym).decl.function;
+    const pd = fx.s.syms.get(m_sym).decl.function.?;
     try lower.body.lowerStmt(b, &pd.body.?.Block.stmts[0]);
     const caps = try lower.env.materializeCaptures(b, &.{.{ .local = c }});
     try std.testing.expectEqualStrings(
@@ -674,7 +674,7 @@ test "a lambda's receiver and parameters are its closure's parameters" {
     _ = fx.classId(p);
     fx.br.field_of[fx.member(p, "x").int()] = 0;
     inline for (.{ "w", "l" }) |fname| {
-        const fd = fx.s.syms.get(fx.top(fname)).decl.function;
+        const fd = fx.s.syms.get(fx.top(fname)).decl.function.?;
         const call = fd.body.?.Expr.Call;
         const lam = call.args[call.args.len - 1].Lambda;
         const b0 = try fx.builderFor(fx.top(fname), .function);
@@ -727,7 +727,7 @@ test "a closure reads a captured this, and a local function takes its captures f
     const c = fx.class("C");
     _ = fx.classId(c);
     fx.br.field_of[fx.member(c, "a").int()] = 0;
-    const fd = fx.s.syms.get(fx.member(c, "f")).decl.function;
+    const fd = fx.s.syms.get(fx.member(c, "f")).decl.function.?;
     const lam = fd.body.?.Expr.Lambda;
     const b0 = try fx.builderFor(fx.member(c, "f"), .function);
     const rec = try b0.lambda(lam.id);
@@ -752,7 +752,7 @@ test "a closure reads a captured this, and a local function takes its captures f
 
     const g = fx.top("g");
     const p = fx.s.syms.functionInfo(g).params[0];
-    const loc_decl = fx.s.syms.get(g).decl.function.body.?.Block.stmts[0].Decl;
+    const loc_decl = fx.s.syms.get(g).decl.function.?.body.?.Block.stmts[0].Decl;
     var bg = try lower.Builder.init(fx.p, Fx.prog_file, g, try fx.func(.{ .decl = g }), .function);
     const loc = try bg.decl(loc_decl.Function.id);
     const lfn = try fx.func(.{ .lambda = loc });
@@ -789,8 +789,8 @@ test "a constructor takes this, the outer instance, and its parameters after the
     fx.br.field_of[fx.member(o, "x").int()] = 0;
     const ctor = fx.s.syms.classInfo(i).primary_ctor;
     const b = try fx.builderFor(ctor, .ctor);
-    const y = fx.s.syms.get(fx.member(i, "y")).decl.property;
-    const w = fx.s.syms.get(fx.member(i, "w")).decl.property;
+    const y = fx.s.syms.get(fx.member(i, "y")).decl.property.?;
+    const w = fx.s.syms.get(fx.member(i, "w")).decl.property.?;
     const vy = try lower.body.lowerExpr(b, y.init.?);
     const vw = try lower.body.lowerExpr(b, w.init.?);
     try std.testing.expectEqualStrings(
@@ -808,7 +808,7 @@ test "a constructor takes this, the outer instance, and its parameters after the
     const e = fx.class("E");
     _ = fx.classId(e);
     const eb = try fx.builderFor(fx.s.syms.classInfo(e).primary_ctor, .ctor);
-    const u = fx.s.syms.get(fx.member(e, "u")).decl.property;
+    const u = fx.s.syms.get(fx.member(e, "u")).decl.property.?;
     const vu = try lower.body.lowerExpr(eb, u.init.?);
     try std.testing.expectEqualStrings(
         \\  r0 = param 3
@@ -850,7 +850,7 @@ test "a context parameter, a super read, an extension property and a top-level g
     fx.br.field_of[fx.member(bcls, "v").int()] = 0;
     const dv = fx.member(fx.class("D"), "v");
     const gb = try fx.builderFor(dv, .getter);
-    const getter_body = &fx.s.syms.get(dv).decl.property.getter.?.body.Expr;
+    const getter_body = &fx.s.syms.get(dv).decl.property.?.getter.?.body.Expr;
     const sv = try lower.body.lowerExpr(gb, getter_body);
     try std.testing.expectEqualStrings(
         \\  r0 = param 0
@@ -903,7 +903,7 @@ test "templates name a value or this; assignments through paths, members and a s
 
     const t = fx.member(p, "t");
     const tb = try fx.builderFor(t, .function);
-    const parts = fx.s.syms.get(t).decl.function.body.?.Expr.StringTemplate.parts;
+    const parts = fx.s.syms.get(t).decl.function.?.body.?.Expr.StringTemplate.parts;
     const va = try lower.name.lowerTemplateName(tb, &parts[0].ShortInterp);
     const vt = try lower.name.lowerTemplateName(tb, &parts[2].ShortInterp);
     try std.testing.expectEqualStrings(
@@ -973,7 +973,7 @@ test "a member extension called in a with block takes the block's receiver as it
     const p = fx.class("P");
     _ = fx.classId(p);
     const scaled = try fx.func(.{ .decl = fx.member(p, "scaled") });
-    const fd = fx.s.syms.get(fx.top("w")).decl.function;
+    const fd = fx.s.syms.get(fx.top("w")).decl.function.?;
     const call = fd.body.?.Expr.Call;
     const lam = call.args[call.args.len - 1].Lambda;
     const b0 = try fx.builderFor(fx.top("w"), .function);

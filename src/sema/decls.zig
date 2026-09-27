@@ -197,6 +197,7 @@ fn collectFunction(ctx: Ctx, f: *const ast.Function, owner: Sym, place: Place) A
             .tailrec = f.is_tailrec,
             .has_body = f.body != null,
             .external = f.is_external or hasModifierAnnotation(f.annotations, "external"),
+            .intrinsic_const = hasModifierAnnotation(f.annotations, "IntrinsicConstEvaluation"),
         },
         .decl = .{ .function = f },
         .detail = 0,
@@ -208,6 +209,7 @@ fn collectFunction(ctx: Ctx, f: *const ast.Function, owner: Sym, place: Place) A
     info.type_params = tps;
     info.params = params;
     info.context_params = cps;
+    if (f.body) |b| info.empty_body = b == .Block and b.Block.stmts.len == 0;
     return sym;
 }
 
@@ -237,10 +239,16 @@ fn collectProperty(ctx: Ctx, p: *const ast.Property, owner: Sym, place: Place) A
             .lateinit = p.is_lateinit,
             .mutable = p.mutable,
             .has_body = has_body,
+            .intrinsic_const = hasModifierAnnotation(p.annotations, "IntrinsicConstEvaluation"),
         },
         .decl = .{ .property = p },
         .detail = 0,
-    }, .{ .has_delegate = p.delegate != null });
+    }, .{ .has_delegate = p.delegate != null, .written = .{
+        .getter = p.getter != null,
+        .setter = p.setter != null,
+        .init = p.init != null,
+        .explicit_field = p.explicit_field != null,
+    } });
     const tps = try typeParams(ctx, p.type_params, sym);
     const cps = try contextParams(ctx, p.context_params, sym);
     const info = s.syms.propertyInfo(sym);
@@ -289,7 +297,7 @@ fn collectClass(ctx: Ctx, c: *const ast.Class, owner: Sym) Allocator.Error!Sym {
         },
         .decl = .{ .class = c },
         .detail = 0,
-    }, .{ .kind = kind, .fqn = fqn });
+    }, .{ .kind = kind, .fqn = fqn, .sealed = c.is_sealed });
     if (!ctx.local) try registerFqn(s, fqn, sym);
     const inner = Ctx{ .s = s, .file = ctx.file, .prefix = fqn_str, .local = ctx.local };
     const tps = try typeParams(ctx, c.type_params, sym);
@@ -548,7 +556,7 @@ pub fn synthesizeMembers(s: *Sema, cls: Sym) Allocator.Error!void {
             if (decl != .class_param) continue;
             const t = try headersParam(s, p);
             try copy_params.append(s.arena, .{ .name = s.syms.name(p), .ty = t, .has_default = true, .default_prop = ctorProperty(s, cls, p) });
-            if (decl.class_param.property == null) continue;
+            if (decl.class_param.?.property == null) continue;
             n += 1;
             const comp = try synthFunction(s, cls, file, try s.names.component(n), &.{}, t, .{ .operator = true });
             s.syms.functionInfo(comp).synth = .data_component;
@@ -587,9 +595,9 @@ fn synthesizeDelegation(s: *Sema, cls: Sym) Allocator.Error!void {
     const members = @import("members.zig");
     // A class, an object and an object expression can each delegate.
     const supertypes: []const ast.TypeRef, const delegates: []const ?ast.Expr = switch (s.syms.get(cls).decl) {
-        .class => |c| .{ c.supertypes, c.supertype_delegates },
-        .object => |o| .{ o.supertypes, o.supertype_delegates },
-        .object_literal => |o| .{ o.supertypes, o.supertype_delegates },
+        .class => |c| .{ c.?.supertypes, c.?.supertype_delegates },
+        .object => |o| .{ o.?.supertypes, o.?.supertype_delegates },
+        .object_literal => |o| .{ o.?.supertypes, o.?.supertype_delegates },
         else => return,
     };
     const file = s.syms.get(cls).file;
@@ -781,14 +789,15 @@ pub fn markHidden(s: *Sema, first: Sym) Allocator.Error!void {
     const n = s.syms.count();
     while (i < n) : (i += 1) {
         const sym = Sym.from(i);
+        // A layer's declarations were just collected from their AST.
         const anns: []const ast.Annotation = switch (s.syms.get(sym).decl) {
-            .function => |f| f.annotations,
-            .property => |p| p.annotations,
-            .secondary_ctor => |c| c.annotations,
+            .function => |f| f.?.annotations,
+            .property => |p| p.?.annotations,
+            .secondary_ctor => |c| c.?.annotations,
             else => continue,
         };
         if (!hiddenLevel(anns)) continue;
-        if (!try headers.annotatedWith(s, .{ .decl = sym, .file = s.syms.get(sym).file }, anns, deprecated)) continue;
+        if (!try headers.hasAnnotation(s, sym, .decl, deprecated)) continue;
         s.syms.getMut(sym).flags.hidden = true;
     }
 }
@@ -1013,14 +1022,16 @@ fn mismatch(s: *Sema, file: u32, sp: @import("span").Span, name: []const u8, fac
 }
 
 /// The span of a declaration's name.
+/// A declaration read back from a base image has none.
 pub fn declSpan(s: *Sema, sym: Sym) @import("span").Span {
+    const none = @import("span").Span.init(@import("span").FileId.from(0), 0, 0);
     return switch (s.syms.get(sym).decl) {
-        .function => |f| f.name.span,
-        .property => |p| p.name.span,
-        .class => |c| c.name.span,
-        .object => |o| o.name.span,
-        .type_alias => |ta| ta.name.span,
-        .class_param => |cp| cp.name.span,
+        .function => |f| if (f) |x| x.name.span else none,
+        .property => |p| if (p) |x| x.name.span else none,
+        .class => |c| if (c) |x| x.name.span else none,
+        .object => |o| if (o) |x| x.name.span else none,
+        .type_alias => |ta| if (ta) |x| x.name.span else none,
+        .class_param => |cp| if (cp) |x| x.name.span else none,
         // A data class's `componentN` and `copy` are declared by the class.
         .none => if (dataMember(s, sym)) declSpan(s, s.syms.owner(sym)) else @import("span").Span.init(@import("span").FileId.from(0), 0, 0),
         else => @import("span").Span.init(@import("span").FileId.from(0), 0, 0),
@@ -1238,13 +1249,9 @@ fn checkExpectHasActual(s: *Sema, sym: Sym) Allocator.Error!void {
         if (actual != sym) return;
         // An `@OptionalExpectation` annotation class needs no actual: where
         // it has none, its uses are dropped.
-        switch (s.syms.get(sym).decl) {
-            .class => |c| {
-                const headers = @import("headers.zig");
-                const opt = s.classByFqn("kotlin.OptionalExpectation");
-                if (try headers.annotatedWith(s, headers.ctxOf(s, sym), c.annotations, opt)) return;
-            },
-            else => {},
+        if (s.syms.get(sym).decl == .class) {
+            const headers = @import("headers.zig");
+            if (try headers.hasAnnotation(s, sym, .decl, s.classByFqn("kotlin.OptionalExpectation"))) return;
         }
     }
     const pkg = s.str(s.syms.packageInfo(s.syms.owner(sym)).fqn);

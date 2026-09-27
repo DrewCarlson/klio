@@ -600,7 +600,7 @@ test "a lambda resolved speculatively and then committed gets exactly one id" {
     const s = fx.s();
     const lams = try fx.lambdas();
     try std.testing.expectEqual(@as(usize, 1), lams.len);
-    const lit = s.syms.get(lams[0]).decl.lambda;
+    const lit = s.syms.get(lams[0]).decl.lambda.?;
     var made: usize = 0;
     var ids: usize = 0;
     var i: u32 = 1;

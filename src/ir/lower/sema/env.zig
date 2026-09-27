@@ -289,8 +289,8 @@ fn enterClosure(b: *Builder) Error!void {
     const s = b.p.s;
     const f = b.owner;
     const node: ast.NodeId, const is_lambda = switch (s.syms.get(f).decl) {
-        .lambda => |l| .{ l.id, true },
-        .anon_fun => |af| .{ af.id, false },
+        .lambda => |l| .{ l.?.id, true },
+        .anon_fun => |af| .{ af.?.id, false },
         else => return b.fail(b.cur_span, "a closure body whose symbol is not a lambda or anonymous function", .{}),
     };
     const rec = try b.lambda(node);
@@ -607,7 +607,7 @@ fn unreachable_(b: *Builder, s: Sym) Error {
 
 fn lateinitLocal(s: *sema.Sema, sym: Sym) ?*const ast.Property {
     return switch (s.syms.get(sym).decl) {
-        .local_prop => |p| if (p.is_lateinit) p else null,
+        .local_prop => |p| if (p.?.is_lateinit) p else null,
         else => null,
     };
 }
@@ -631,7 +631,7 @@ pub fn materializeCaptures(b: *Builder, keys: []const CaptureKey) Error![]Reg {
 /// read and write calls `getValue` and `setValue` on it.
 pub fn delegatedLocal(b: *Builder, s: Sym) ?*const ast.Property {
     return switch (b.p.s.syms.get(s).decl) {
-        .local_prop => |p| if (p.delegate != null) p else null,
+        .local_prop => |p| if (p.?.delegate != null) p else null,
         else => null,
     };
 }

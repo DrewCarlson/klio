@@ -59,7 +59,9 @@ pub const SourceFile = struct {
 pub const Origin = enum(u8) { base, pack, program };
 
 pub const FileCtx = struct {
-    ast: *const ast.KotlinFile,
+    /// Null for a base file read back from an image, whose declarations
+    /// are in the tables.
+    ast: ?*const ast.KotlinFile,
     path: []const u8,
     origin: Origin,
     generated: bool = false,
@@ -193,6 +195,14 @@ pub const Sema = struct {
     pending_setters: std.ArrayList(Sym) = .empty,
     /// Every reference resolved, in resolution order.
     refs: std.ArrayList(records.Ref) = .empty,
+    /// The annotation classes a declaration carries, by
+    /// `headers.annotationKey`: resolved on first use, and read back from a
+    /// base image for the base's declarations, which have no AST.
+    annotation_classes: std.AutoHashMapUnmanaged(u64, []const Sym) = .empty,
+    /// How each declaration asked about is deprecated, by its own
+    /// annotations (`usecheck.ownDeprecation`); read back from a base image
+    /// for the base's.
+    deprecations: std.AutoHashMapUnmanaged(Sym, ?usecheck.Deprecation) = .empty,
     /// The variables calls are inferring from the lambdas passed to them
     /// (builder inference), each to the system of the call inferring it.
     builder_owners: std.AutoHashMapUnmanaged(u32, *infer.System) = .empty,

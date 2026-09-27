@@ -471,12 +471,11 @@ pub fn hiddenSupertypeMember(s: *Sema, m: Sym) Allocator.Error!Sym {
 }
 
 fn platformDependent(s: *Sema, m: Sym) Allocator.Error!bool {
-    const anns: []const ast.Annotation = switch (s.syms.get(m).decl) {
-        .function => |f| f.annotations,
-        .property => |p| p.annotations,
+    switch (s.syms.get(m).decl) {
+        .function, .property => {},
         else => return false,
-    };
-    return headers.annotatedWith(s, .{ .decl = m, .file = s.syms.get(m).file }, anns, s.builtins.platform_dependent);
+    }
+    return headers.hasAnnotation(s, m, .decl, s.builtins.platform_dependent);
 }
 
 /// Two member properties with the same name override when both or neither

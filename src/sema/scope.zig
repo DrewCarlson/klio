@@ -121,7 +121,9 @@ pub fn fileImports(s: *Sema, file: u32) Allocator.Error!*FileImports {
     if (fc.imports) |fi| return fi;
     const fi = try s.arena.create(FileImports);
     fi.* = .{};
-    for (fc.ast.imports) |*imp| {
+    // A base image's files resolve nothing in their own scope: their
+    // headers were resolved at the bake.
+    for (fc.ast.?.imports) |*imp| {
         if (imp.wildcard) {
             const r = try resolvePathContainer(s, imp.path);
             if (r.used != imp.path.len) {

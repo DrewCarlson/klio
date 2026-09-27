@@ -365,11 +365,9 @@ fn staticRead(b: *Builder, nr: *const records.NameRec, recv_static: bool) Error!
             if (try typeStability(b, try sema.headers.propertyType(s, nr.target), 0) != .stable) return false;
             if (try propertyMarkedStable(s, nr.target)) return true;
             // A `val` of this file with its default getter.
-            const pd = switch (s.syms.get(nr.target).decl) {
-                .property => |pd| pd,
-                else => return false,
-            };
-            return s.syms.get(nr.target).file == b.file and !s.syms.flags(nr.target).mutable and pd.getter == null and pd.delegate == null;
+            if (s.syms.get(nr.target).decl != .property) return false;
+            const info = s.syms.propertyInfo(nr.target);
+            return s.syms.get(nr.target).file == b.file and !s.syms.flags(nr.target).mutable and !info.written.getter and !info.has_delegate;
         },
         else => return false,
     }
@@ -378,16 +376,9 @@ fn staticRead(b: *Builder, nr: *const records.NameRec, recv_static: bool) Error!
 /// A property annotated `@Stable`, whose value the composition treats as
 /// unchanging for an unchanging receiver.
 fn propertyMarkedStable(s: *sema.Sema, p: Sym) Error!bool {
-    const pd = switch (s.syms.get(p).decl) {
-        .property => |pd| pd,
-        else => return false,
-    };
+    if (s.syms.get(p).decl != .property) return false;
     const cls = s.classByFqn("androidx.compose.runtime.Stable");
-    if (cls == .none) return false;
-    const ctx: sema.headers.TypeCtx = .{ .decl = p, .file = s.syms.get(p).file };
-    if (try sema.headers.annotatedWith(s, ctx, pd.annotations, cls)) return true;
-    if (pd.getter) |g| return sema.headers.annotatedWith(s, ctx, g.annotations, cls);
-    return false;
+    return try sema.headers.hasAnnotation(s, p, .decl, cls) or try sema.headers.hasAnnotation(s, p, .getter, cls);
 }
 
 /// `androidx.compose.runtime.currentComposer`, the compiler intrinsic that
@@ -934,7 +925,7 @@ fn orIf(b: *Builder, dst: Reg, cond: Reg, bits: i32) Error!void {
 
 fn paramSpan(s: *sema.Sema, p: Sym) span.Span {
     return switch (s.syms.get(p).decl) {
-        .param => |pd| pd.span,
+        .param => |pd| pd.?.span,
         else => .{ .file = span.FileId.from(0), .start = 0, .end = 0 },
     };
 }
@@ -1011,8 +1002,8 @@ pub const Root = struct { id: ast.NodeId, sp: span.Span };
 
 fn declNode(s: *sema.Sema, f: Sym) ?Root {
     return switch (s.syms.get(f).decl) {
-        .function => |fd| .{ .id = fd.id, .sp = fd.span },
-        .lambda => |l| .{ .id = l.id, .sp = l.span },
+        .function => |fd| if (fd) |x| .{ .id = x.id, .sp = x.span } else null,
+        .lambda => |l| if (l) |x| .{ .id = x.id, .sp = x.span } else null,
         else => null,
     };
 }
@@ -1268,8 +1259,9 @@ fn hasBackingField(b: *Builder, p: Sym) bool {
 /// The type of a delegated property's delegate, from its file's records.
 fn delegateType(b: *Builder, p: Sym) Error!sema.TypeId {
     const s = b.p.s;
+    // A delegate's type is in the records of the build that lowers it.
     const pd = switch (s.syms.get(p).decl) {
-        .property => |pd| pd,
+        .property => |pd| pd.?,
         else => return .none,
     };
     const d = pd.delegate orelse return .none;
@@ -1318,36 +1310,24 @@ fn isFunctionClass(s: *sema.Sema, cls: Sym) bool {
 /// Marked `@Stable`, `@Immutable`, or with an annotation itself marked
 /// `@StableMarker`.
 fn stableMarked(s: *sema.Sema, cls: Sym) Error!bool {
-    const anns: []const ast.Annotation = switch (s.syms.get(cls).decl) {
-        .class => |cd| cd.annotations,
-        .object => |od| od.annotations,
+    switch (s.syms.get(cls).decl) {
+        .class, .object => {},
         else => return false,
-    };
-    if (anns.len == 0) return false;
-    const ctx: sema.headers.TypeCtx = .{ .decl = cls, .file = s.syms.get(cls).file };
+    }
     const marker = s.classByFqn("androidx.compose.runtime.StableMarker");
-    for (anns) |*ann| {
-        const ac = try sema.headers.annotationClass(s, ctx, ann);
+    for (try sema.headers.annotationClasses(s, cls, .decl)) |ac| {
         if (ac == .none) continue;
         if (ac == marker) return true;
-        const acd = switch (s.syms.get(ac).decl) {
-            .class => |cd| cd,
-            else => continue,
-        };
-        const actx: sema.headers.TypeCtx = .{ .decl = ac, .file = s.syms.get(ac).file };
-        if (try sema.headers.annotatedWith(s, actx, acd.annotations, marker)) return true;
+        if (s.syms.get(ac).decl != .class) continue;
+        if (try sema.headers.hasAnnotation(s, ac, .decl, marker)) return true;
     }
     return false;
 }
 
 /// Whether class `cls` carries `androidx.compose.runtime.<name>`.
 fn annotatedClass(s: *sema.Sema, cls: Sym, comptime name: []const u8) Error!bool {
-    const cd = switch (s.syms.get(cls).decl) {
-        .class => |cd| cd,
-        else => return false,
-    };
-    const ctx: sema.headers.TypeCtx = .{ .decl = cls, .file = s.syms.get(cls).file };
-    return sema.headers.annotatedWith(s, ctx, cd.annotations, s.classByFqn("androidx.compose.runtime." ++ name));
+    if (s.syms.get(cls).decl != .class) return false;
+    return sema.headers.hasAnnotation(s, cls, .decl, s.classByFqn("androidx.compose.runtime." ++ name));
 }
 
 // ------------------------------------------------------------ lambdas --
@@ -1891,14 +1871,8 @@ fn runtimeGetter(b: *Builder, comptime cls_fqn: []const u8, comptime name: []con
 
 /// Whether parameter `p` takes a lambda that may not compose.
 pub fn disallowsComposableCalls(s: *sema.Sema, p: Sym) Error!bool {
-    const pd = switch (s.syms.get(p).decl) {
-        .param => |pd| pd,
-        else => return false,
-    };
-    const cls = s.classByFqn("androidx.compose.runtime.DisallowComposableCalls");
-    if (cls == .none) return false;
-    const owner = s.syms.owner(p);
-    return sema.headers.annotatedWith(s, .{ .decl = owner, .file = s.syms.get(p).file }, pd.ty.x().annotations, cls);
+    if (s.syms.get(p).decl != .param) return false;
+    return sema.headers.hasAnnotation(s, p, .written_type, s.classByFqn("androidx.compose.runtime.DisallowComposableCalls"));
 }
 
 // ------------------------------------------------------------- groups --
@@ -1965,12 +1939,8 @@ pub fn endMovableGroup(b: *Builder) Error!void {
 
 /// Whether `f` carries `androidx.compose.runtime.<name>`.
 fn annotated(s: *sema.Sema, f: Sym, comptime name: []const u8) Error!bool {
-    const fd = switch (s.syms.get(f).decl) {
-        .function => |fd| fd,
-        else => return false,
-    };
-    const cls = s.classByFqn("androidx.compose.runtime." ++ name);
-    return sema.headers.annotatedWith(s, .{ .decl = f, .file = s.syms.get(f).file }, fd.annotations, cls);
+    if (s.syms.get(f).decl != .function) return false;
+    return sema.headers.hasAnnotation(s, f, .decl, s.classByFqn("androidx.compose.runtime." ++ name));
 }
 
 fn isRuntimeFunction(s: *sema.Sema, f: Sym, comptime pkg: []const u8, comptime name: []const u8) bool {
@@ -2073,7 +2043,7 @@ fn loadParam(b: *Builder, idx: u16) Error!Reg {
 
 fn declSpan(s: *sema.Sema, f: Sym) span.Span {
     return switch (s.syms.get(f).decl) {
-        .function => |fd| fd.span,
+        .function => |fd| fd.?.span,
         else => .{ .file = span.FileId.from(0), .start = 0, .end = 0 },
     };
 }

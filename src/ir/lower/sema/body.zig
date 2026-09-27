@@ -77,7 +77,7 @@ fn bodySite(p: *Program, origin: bridge.FuncOrigin, plan: Plan) span.Span {
     return switch (origin) {
         .adapter => |i| refs.referenceSite(p, i),
         .init_unit => |u| switch (p.br.units[u]) {
-            .file, .eager_file => |file| if (file < s.files.items.len) s.files.items[file].ast.span else builder.zero_span,
+            .file, .eager_file => |file| if (file < s.files.items.len) (if (s.files.items[file].ast) |f| f.span else builder.zero_span) else builder.zero_span,
             .enum_class => |cls| declSite(s, cls),
         },
         else => declSite(s, plan.owner),
@@ -88,8 +88,8 @@ fn declSite(s: *sema.Sema, sym: Sym) span.Span {
     if (sym == .none) return builder.zero_span;
     return switch (s.syms.get(sym).decl) {
         .none => builder.zero_span,
-        .ident => |id| id.span,
-        inline else => |d| d.span,
+        .ident => |id| if (id) |x| x.span else builder.zero_span,
+        inline else => |d| if (d) |x| x.span else builder.zero_span,
     };
 }
 
@@ -122,11 +122,9 @@ fn fileOf(s: *sema.Sema, sym: Sym) u32 {
 pub fn bodylessAccessor(s: *sema.Sema, prop: Sym, setter: bool) bool {
     const fl = s.syms.flags(prop);
     if (!fl.expect and !fl.external) return false;
-    const pd = switch (s.syms.get(prop).decl) {
-        .property => |x| x,
-        else => return true,
-    };
-    return (if (setter) pd.setter else pd.getter) == null;
+    if (s.syms.get(prop).decl != .property) return true;
+    const written = s.syms.propertyInfo(prop).written;
+    return !(if (setter) written.setter else written.getter);
 }
 
 fn planOf(p: *Program, origin: bridge.FuncOrigin) ?Plan {
@@ -175,8 +173,9 @@ fn lowerOrigin(b: *Builder, origin: bridge.FuncOrigin) Error!void {
                 else => {},
             }
             if (s.syms.flags(sym).synthetic) return classes.lowerSynthetic(b, sym);
+            // A body lowered in this build has its AST.
             const fd = switch (s.syms.get(sym).decl) {
-                .function => |fd| fd,
+                .function => |fd| fd.?,
                 else => return classes.lowerSynthetic(b, sym),
             };
             if (fd.body) |*fb| {

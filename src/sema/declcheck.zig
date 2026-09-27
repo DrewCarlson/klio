@@ -35,17 +35,18 @@ pub fn checkProgram(s: *Sema) Allocator.Error!void {
         if (!checked(fc)) continue;
         if (info.flags.synthetic) continue;
         const c = Checker{ .s = s, .file = info.file };
+        // A program's declarations are checked, and each has its AST.
         switch (info.decl) {
-            .class => |d| if (info.kind == .class) try c.class(sym, d),
-            .object => |d| if (info.kind == .class) try c.object(sym, d),
+            .class => |d| if (info.kind == .class) try c.class(sym, d.?),
+            .object => |d| if (info.kind == .class) try c.object(sym, d.?),
             .object_literal => |d| if (info.kind == .class) {
-                try c.supertypes(sym, d.supertypes, d.supertype_args, d.supertype_delegates, true);
-                try c.inheritedMembers(sym, d.span);
+                try c.supertypes(sym, d.?.supertypes, d.?.supertype_args, d.?.supertype_delegates, true);
+                try c.inheritedMembers(sym, d.?.span);
             },
-            .function => |d| if (info.kind == .function) try c.function(sym, d),
-            .property => |d| if (info.kind == .property) try c.property(sym, d),
-            .class_param => |d| if (info.kind == .property) try c.overrides(sym, d.is_override, d.name.span),
-            .secondary_ctor => |d| try c.params(d.params, false),
+            .function => |d| if (info.kind == .function) try c.function(sym, d.?),
+            .property => |d| if (info.kind == .property) try c.property(sym, d.?),
+            .class_param => |d| if (info.kind == .property) try c.overrides(sym, d.?.is_override, d.?.name.span),
+            .secondary_ctor => |d| try c.params(d.?.params, false),
             else => {},
         }
     }
@@ -131,7 +132,7 @@ const Checker = struct {
         const ctors = symbols.Symbols.members(&s.syms.classInfo(cls).members, sema_mod.wk.init);
         for (ctors) |ctor| {
             const d = switch (s.syms.get(ctor).decl) {
-                .secondary_ctor => |d| d,
+                .secondary_ctor => |d| d.?,
                 else => continue,
             };
             if (d.delegation != .This) continue;
@@ -143,7 +144,7 @@ const Checker = struct {
         }
         for (ctors) |ctor| {
             const d = switch (s.syms.get(ctor).decl) {
-                .secondary_ctor => |d| d,
+                .secondary_ctor => |d| d.?,
                 else => continue,
             };
             var cur = next.get(ctor) orelse continue;
@@ -201,7 +202,7 @@ const Checker = struct {
     /// The language features the checked file was parsed with.
     fn language(self: Checker) ast.LanguageFeatures {
         const fc = self.s.fileOf(self.file) orelse return .{};
-        return fc.ast.language;
+        return (fc.ast orelse return .{}).language;
     }
 
     fn object(self: Checker, cls: Sym, o: *const ast.ObjectDecl) Allocator.Error!void {
@@ -327,8 +328,7 @@ const Checker = struct {
                 if (sc == .none or s.syms.kind(sc) != .class) continue;
                 if ((try seen.getOrPut(s.arena, sc)).found_existing) continue;
                 try work.append(s.arena, sc);
-                var it = s.syms.classInfo(sc).members.keyIterator();
-                while (it.next()) |k| try out.put(s.arena, k.*, {});
+                for (s.syms.classInfo(sc).members.keys()) |k| try out.put(s.arena, k, {});
             }
         }
     }
@@ -451,8 +451,7 @@ const Checker = struct {
     fn enumEntries(self: Checker, cls: Sym, c: *const ast.Class) Allocator.Error!void {
         const s = self.s;
         var abstract: std.ArrayList(Sym) = .empty;
-        var it = s.syms.classInfo(cls).members.valueIterator();
-        while (it.next()) |list| for (list.items) |m| {
+        for (s.syms.classInfo(cls).members.values()) |list| for (list.items) |m| {
             const k = s.syms.kind(m);
             if ((k == .function or k == .property) and s.syms.flags(m).modality == .abstract) try abstract.append(s.arena, m);
         };
@@ -885,7 +884,7 @@ fn assignedInClass(s: *Sema, p: Sym, n: []const u8) bool {
     const owner = s.syms.owner(p);
     if (owner == .none or s.syms.kind(owner) != .class) return false;
     const c = switch (s.syms.get(owner).decl) {
-        .class => |c| c,
+        .class => |c| c.?,
         else => return true,
     };
     for (c.x().init_blocks) |*b| {
@@ -1193,15 +1192,10 @@ fn intrinsic(s: *Sema, target: Sym) bool {
 }
 
 fn constEvaluated(s: *Sema, target: Sym) bool {
-    const anns: []const ast.Annotation = switch (s.syms.get(target).decl) {
-        .function => |d| d.annotations,
-        .property => |d| d.annotations,
-        else => return false,
+    return switch (s.syms.kind(target)) {
+        .function, .property => s.syms.flags(target).intrinsic_const,
+        else => false,
     };
-    for (anns) |a| {
-        if (a.path.len != 0 and std.mem.eql(u8, a.path[a.path.len - 1].name, "IntrinsicConstEvaluation")) return true;
-    }
-    return false;
 }
 
 /// Where a name's reference is anchored: the path, or its last segment.

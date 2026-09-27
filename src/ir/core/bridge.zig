@@ -159,8 +159,9 @@ pub const Unit = union(enum) {
 /// string argument. Null for any other declaration.
 pub fn externalSymbolName(s: *sema.Sema, f: Sym) ?[]const u8 {
     if (!s.syms.flags(f).external) return null;
+    // A base image's externals were bound at the bake.
     const fd = switch (s.syms.get(f).decl) {
-        .function => |fd| fd,
+        .function => |fd| fd orelse return null,
         else => return null,
     };
     for (fd.annotations) |ann| {
@@ -181,13 +182,8 @@ pub fn externalSymbolName(s: *sema.Sema, f: Sym) ?[]const u8 {
 pub fn eagerProperty(s: *sema.Sema, p: Sym) Error!bool {
     const owner = s.syms.owner(p);
     if (owner == .none or s.syms.kind(owner) != .package) return false;
-    const pd = switch (s.syms.get(p).decl) {
-        .property => |pd| pd,
-        else => return false,
-    };
-    if (pd.annotations.len == 0) return false;
-    const cls = s.classByFqn("kotlin.native.EagerInitialization");
-    return sema.headers.annotatedWith(s, .{ .decl = p, .file = s.syms.get(p).file }, pd.annotations, cls);
+    if (s.syms.get(p).decl != .property) return false;
+    return sema.headers.hasAnnotation(s, p, .decl, s.classByFqn("kotlin.native.EagerInitialization"));
 }
 
 /// A value a nested body captures from an enclosing one. A read of `field`
@@ -1405,7 +1401,7 @@ const Build = struct {
         if (isAbstract(s, p)) return false;
         return switch (s.syms.get(p).decl) {
             .class_param => true,
-            .property => |pd| pd.getter == null and pd.delegate == null,
+            .property => !s.syms.propertyInfo(p).written.getter and !s.syms.propertyInfo(p).has_delegate,
             else => false,
         };
     }
@@ -1438,11 +1434,8 @@ const Build = struct {
         const s = b.s;
         const fl = s.syms.flags(p);
         if (fl.has_body or fl.lateinit or fl.synthetic or isAbstract(s, p)) return false;
-        const pd = switch (s.syms.get(p).decl) {
-            .property => |pd| pd,
-            else => return false,
-        };
-        if (pd.explicit_field != null) return false;
+        if (s.syms.get(p).decl != .property) return false;
+        if (s.syms.propertyInfo(p).written.explicit_field) return false;
         const owner = s.syms.owner(p);
         if (owner != .none and s.syms.kind(owner) == .class and s.syms.classInfo(owner).kind == .interface) return false;
         return true;
@@ -1507,13 +1500,11 @@ const Build = struct {
         try sema.headers.propertyHeader(s, p);
         if (s.syms.propertyInfo(p).receiver != .none) return false;
         if (info.from_ctor) return true;
-        const pd = switch (s.syms.get(p).decl) {
-            .property => |pd| pd,
-            else => return false,
-        };
-        if (pd.init != null or pd.is_lateinit or pd.explicit_field != null) return true;
-        if (pd.getter == null) return true;
-        if (fl.mutable and pd.setter == null) return true;
+        if (s.syms.get(p).decl != .property) return false;
+        const written = info.written;
+        if (written.init or fl.lateinit or written.explicit_field) return true;
+        if (!written.getter) return true;
+        if (fl.mutable and !written.setter) return true;
         return b.field_used.isSet(p.int());
     }
 
@@ -3319,15 +3310,10 @@ pub fn restartable(s: *sema.Sema, f: Sym) Allocator.Error!bool {
     if (!composableFunction(s, f)) return false;
     const fl = s.syms.flags(f);
     if (fl.inline_ or !fl.has_body or isAbstract(s, f)) return false;
-    const fd = switch (s.syms.get(f).decl) {
-        .function => |fd| fd,
-        else => return false,
-    };
+    if (s.syms.get(f).decl != .function) return false;
     if (try sema.headers.returnType(s, f) != s.t.unit) return false;
-    const ctx: sema.headers.TypeCtx = .{ .decl = f, .file = s.syms.get(f).file };
     inline for (.{ "NonRestartableComposable", "ReadOnlyComposable", "ExplicitGroupsComposable" }) |n| {
-        const cls = s.classByFqn("androidx.compose.runtime." ++ n);
-        if (try sema.headers.annotatedWith(s, ctx, fd.annotations, cls)) return false;
+        if (try sema.headers.hasAnnotation(s, f, .decl, s.classByFqn("androidx.compose.runtime." ++ n))) return false;
     }
     return true;
 }
@@ -3397,10 +3383,12 @@ fn seedOfType(s: *sema.Sema, t: TypeId) SlotSeed {
 
 /// Per written supertype of a class, whether it is delegated with `by`.
 fn supertypeDelegates(s: *sema.Sema, cls: Sym) []const bool {
+    // A class laid out here is one this build analyzed: a base image's
+    // layouts are in place already.
     const ds: []const ?ast.Expr = switch (s.syms.get(cls).decl) {
-        .class => |c| c.supertype_delegates,
-        .object => |o| o.supertype_delegates,
-        .object_literal => |o| o.supertype_delegates,
+        .class => |c| c.?.supertype_delegates,
+        .object => |o| o.?.supertype_delegates,
+        .object_literal => |o| o.?.supertype_delegates,
         else => return &.{},
     };
     var any = false;
@@ -3412,14 +3400,16 @@ fn supertypeDelegates(s: *sema.Sema, cls: Sym) []const bool {
 }
 
 /// The source range of a nested function or local class.
+/// Null for a declaration read back from a base image, whose captures are
+/// in the image.
 fn declSpan(s: *sema.Sema, sym: Sym) ?@import("span").Span {
     return switch (s.syms.get(sym).decl) {
-        .lambda => |l| l.span,
-        .anon_fun => |f| f.span,
-        .function => |f| f.span,
-        .class => |c| c.span,
-        .object => |o| o.span,
-        .object_literal => |o| o.span,
+        .lambda => |l| (l orelse return null).span,
+        .anon_fun => |f| (f orelse return null).span,
+        .function => |f| (f orelse return null).span,
+        .class => |c| (c orelse return null).span,
+        .object => |o| (o orelse return null).span,
+        .object_literal => |o| (o orelse return null).span,
         else => null,
     };
 }
@@ -3458,9 +3448,10 @@ const MemberKind = resolved.MemberKind;
 /// The receiver type of extension `decl` as written (a qualified path when
 /// one is written), which the host keys receiver-qualified symbols by.
 fn receiverWritten(s: *sema.Sema, decl: Sym) ?[]const u8 {
+    // A base image's natives were bound at the bake.
     const rt = switch (s.syms.get(decl).decl) {
-        .function => |fd| fd.receiver_type orelse return null,
-        .property => |pd| pd.receiver_type orelse return null,
+        .function => |fd| (fd orelse return null).receiver_type orelse return null,
+        .property => |pd| (pd orelse return null).receiver_type orelse return null,
         else => return null,
     };
     return rt.x().qualified_path orelse rt.name.name;

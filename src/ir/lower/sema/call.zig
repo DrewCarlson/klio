@@ -560,17 +560,10 @@ fn emptyBody(s: *sema.Sema, f: Sym) bool {
     if (s.syms.kind(f) != .function) return false;
     const file = s.syms.get(f).file;
     if (file >= s.files.items.len or s.files.items[file].origin == .program) return false;
-    const fd = switch (s.syms.get(f).decl) {
-        .function => |d| d,
-        else => return false,
-    };
-    if (fd.is_inline or fd.is_suspend or fd.is_tailrec or fd.is_external or fd.is_expect) return false;
-    const written = fd.body orelse return false;
-    const empty = switch (written) {
-        .Block => |blk| blk.stmts.len == 0,
-        .Expr => false,
-    };
-    return empty and !compose.composableFunction(s, f);
+    if (s.syms.get(f).decl != .function) return false;
+    const fl = s.syms.flags(f);
+    if (fl.inline_ or fl.suspend_ or fl.tailrec or fl.external or fl.expect) return false;
+    return s.syms.functionInfo(f).empty_body and !compose.composableFunction(s, f);
 }
 
 /// `kotlin.reflect.typeOf<T>()`: the run-time type of its type argument,
@@ -1203,18 +1196,19 @@ pub fn expectOf(s: *sema.Sema, f: Sym) Sym {
 
 /// A parameter's written default expression.
 pub fn paramDefault(s: *sema.Sema, p: Sym) ?*const ast.Expr {
+    // Read where the function's own body lowers, which has its AST.
     return switch (s.syms.get(p).decl) {
-        .param => |pd| pd.default,
-        .class_param => |cp| if (cp.default) |*d| d else null,
+        .param => |pd| pd.?.default,
+        .class_param => |cp| if (cp.?.default) |*d| d else null,
         else => null,
     };
 }
 
 fn declSpan(s: *sema.Sema, f: Sym) span.Span {
     return switch (s.syms.get(f).decl) {
-        .function => |fd| fd.span,
-        .secondary_ctor => |sc| sc.span,
-        .class => |c| c.span,
+        .function => |fd| if (fd) |x| x.span else no_span,
+        .secondary_ctor => |sc| if (sc) |x| x.span else no_span,
+        .class => |c| if (c) |x| x.span else no_span,
         else => no_span,
     };
 }

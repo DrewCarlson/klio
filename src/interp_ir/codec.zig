@@ -81,6 +81,36 @@ fn decodeForestField(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
     }
 }
 
+/// A list a decode gives room to grow: its elements encode as a slice's
+/// do, and decode into a buffer with spare capacity, so a caller appending
+/// to it (a program's symbols after its base's) extends it in place instead
+/// of copying it and leaving the copy behind.
+pub fn Growable(comptime T: type) type {
+    return struct {
+        items: []T = &.{},
+        capacity: usize = 0,
+
+        pub const codec_growable = T;
+
+        pub fn of(items: []T) @This() {
+            return .{ .items = items, .capacity = items.len };
+        }
+
+        pub fn list(self: @This()) std.ArrayList(T) {
+            return .{ .items = self.items, .capacity = self.capacity };
+        }
+    };
+}
+
+fn isGrowable(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "codec_growable");
+}
+
+/// The room a growable list decodes with beyond its elements.
+fn growableSlack(len: usize) usize {
+    return len / 8 + 1024;
+}
+
 const NodeKey = struct { addr: usize, ty: usize };
 const SliceKey = struct { addr: usize, len: usize, ty: usize };
 
@@ -167,6 +197,11 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
         const gop = try e.nodes.getOrPut(key);
         if (!gop.found_existing) gop.value_ptr.* = e.node_count;
         e.node_count += 1;
+    }
+    if (comptime isGrowable(T)) {
+        try e.varint(value.items.len);
+        for (value.items) |*elem| try encodeValue(T.codec_growable, e, elem);
+        return;
     }
     const info = @typeInfo(T);
     switch (info) {
@@ -353,6 +388,14 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
     }
     if (comptime isWatched(T)) {
         try d.nodes.append(d.scratch, @intFromPtr(out));
+    }
+    if (comptime isGrowable(T)) {
+        const len: usize = @intCast(try d.varint());
+        if (len > d.buf.len) return error.Malformed;
+        const buf = try d.a.alloc(T.codec_growable, len + growableSlack(len));
+        for (buf[0..len]) |*elem| try decodeInto(T.codec_growable, d, elem);
+        out.* = .{ .items = buf[0..len], .capacity = buf.len };
+        return;
     }
     const info = @typeInfo(T);
     switch (info) {
@@ -827,4 +870,22 @@ test "codec rejects truncated input" {
     defer d.deinit();
     var out: []const u8 = undefined;
     try testing.expectError(error.Malformed, decodeInto([]const u8, &d, &out));
+}
+
+test "a growable list decodes with room to grow" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var items = [_]u32{ 3, 1, 4 };
+    const G = Growable(u32);
+    const v: struct { g: G, after: []const u8 } = .{ .g = G.of(&items), .after = "x" };
+    const bytes = try encodeOne(@TypeOf(v), a, &v);
+    const back = try decodeOne(@TypeOf(v), a, bytes);
+    try testing.expectEqualSlices(u32, &items, back.g.items);
+    try testing.expect(back.g.capacity > back.g.items.len);
+    try testing.expectEqualStrings("x", back.after);
+    var l = back.g.list();
+    const before = l.items.ptr;
+    try l.append(a, 1);
+    try testing.expect(l.items.ptr == before);
 }

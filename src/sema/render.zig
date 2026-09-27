@@ -291,23 +291,7 @@ pub const Namer = struct {
 pub fn parserStart(s: *Sema, sym: Sym) ?u32 {
     return switch (s.syms.get(sym).decl) {
         .none, .file => null,
-        .class => |c| c.span.start,
-        .object => |o| o.span.start,
-        .object_literal => |o| o.span.start,
-        .enum_entry => |e| e.span.start,
-        .function => |f| f.span.start,
-        .anon_fun => |f| f.span.start,
-        .lambda => |l| l.span.start,
-        .accessor => |acc| acc.span.start,
-        .property => |p| p.span.start,
-        .class_param => |p| p.span.start,
-        .param => |p| p.span.start,
-        .context_param => |p| p.span.start,
-        .secondary_ctor => |c| c.span.start,
-        .type_param => |p| p.span.start,
-        .type_alias => |t| t.span.start,
-        .ident => |id| id.span.start,
-        .local_prop => |p| p.span.start,
+        inline else => |d| if (d) |x| x.span.start else null,
     };
 }
 

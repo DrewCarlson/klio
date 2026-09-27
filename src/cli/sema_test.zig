@@ -131,13 +131,11 @@ const Annotations = struct {
 };
 
 fn annotated(s: *sema.Sema, sym: Sym, cls: Sym) !bool {
-    if (cls == .none) return false;
-    const anns: []const @import("ast").Annotation = switch (s.syms.get(sym).decl) {
-        .function => |f| f.annotations,
-        .class => |c| c.annotations,
+    switch (s.syms.get(sym).decl) {
+        .function, .class => {},
         else => return false,
-    };
-    return sema.headers.annotatedWith(s, sema.headers.ctxOf(s, sym), anns, cls);
+    }
+    return sema.headers.hasAnnotation(s, sym, .decl, cls);
 }
 
 fn selected(s: *sema.Sema, sym: Sym, only_files: []const []const u8) bool {

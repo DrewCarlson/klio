@@ -285,7 +285,7 @@ fn printByLibrary(a: Allocator, w: *std.ArrayList(u8), s: *sema.Sema, r: lower_d
             const id = file orelse return "?";
             if (map.get(id)) |lib| return lib;
             for (sm.files.items) |fc| {
-                if (fc.ast.span.file.int() != id) continue;
+                if ((fc.ast orelse continue).span.file.int() != id) continue;
                 return switch (fc.origin) {
                     .base => "stdlib",
                     .program => "program",
@@ -297,7 +297,7 @@ fn printByLibrary(a: Allocator, w: *std.ArrayList(u8), s: *sema.Sema, r: lower_d
     }.f;
     for (s.census.sites.items) |site| {
         const fc = s.fileOf(site.file) orelse continue;
-        const gop = try libs.getOrPut(a, libOf(s, lib_of_file, fc.ast.span.file.int()));
+        const gop = try libs.getOrPut(a, libOf(s, lib_of_file, (fc.ast orelse continue).span.file.int()));
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.sema_sites += 1;
         const key = try std.fmt.allocPrint(a, "sema {s}", .{@tagName(site.reason)});
@@ -1183,13 +1183,13 @@ pub fn checkLibrarySources(gpa: Allocator, arena: Allocator, lib: Library, out: 
     var shown: usize = 0;
     for (s.census.sites.items) |site| {
         const fc = s.fileOf(site.file) orelse continue;
-        if (!own_ids.contains(fc.ast.span.file.int())) continue;
+        if (!own_ids.contains((fc.ast orelse continue).span.file.int())) continue;
         n += 1;
         if (site.reason != .receiver_unresolved) shown += 1;
     }
     for (s.census.sites.items) |site| {
         const fc = s.fileOf(site.file) orelse continue;
-        if (!own_ids.contains(fc.ast.span.file.int())) continue;
+        if (!own_ids.contains((fc.ast orelse continue).span.file.int())) continue;
         // A member of a receiver that did not resolve follows from the
         // receiver's own error.
         if (site.reason == .receiver_unresolved and shown != 0) continue;
@@ -1199,7 +1199,7 @@ pub fn checkLibrarySources(gpa: Allocator, arena: Allocator, lib: Library, out: 
 
     var lowered_files: std.ArrayList(u32) = .empty;
     for (s.files.items, 0..) |fc, fi| {
-        if (own_ids.contains(fc.ast.span.file.int())) try lowered_files.append(arena, @intCast(fi));
+        if (own_ids.contains((fc.ast orelse continue).span.file.int())) try lowered_files.append(arena, @intCast(fi));
     }
     const r = try lower_driver.lower_census.run(arena, s, &map, records.files, &.{}, lowered_files.items, hostBinding(gpa));
     for (r.entries) |e| {

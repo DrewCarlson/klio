@@ -32,21 +32,22 @@ pub fn checkProgram(s: *Sema) Allocator.Error!void {
         if (!declcheck.checked(fc)) continue;
         if (info.flags.synthetic) continue;
         const c = Checker{ .s = s, .file = info.file };
+        // A program's declarations are checked, and each has its AST.
         const anns: []const ast.Annotation = switch (info.decl) {
             .class => |d| blk: {
-                if (info.kind == .class and d.is_annotation) try c.annotationClass(sym, d);
-                try c.repeated(sym, d.x().primary_ctor_annotations);
-                break :blk d.annotations;
+                if (info.kind == .class and d.?.is_annotation) try c.annotationClass(sym, d.?);
+                try c.repeated(sym, d.?.x().primary_ctor_annotations);
+                break :blk d.?.annotations;
             },
-            .object => |d| d.annotations,
-            .function => |d| d.annotations,
-            .property => |d| d.annotations,
-            .param => |d| d.annotations,
-            .class_param => |d| if (info.kind == .value_param) d.annotations else &.{},
-            .secondary_ctor => |d| d.annotations,
-            .accessor => |d| d.annotations,
-            .enum_entry => |d| d.annotations,
-            .type_alias => |d| d.annotations,
+            .object => |d| d.?.annotations,
+            .function => |d| d.?.annotations,
+            .property => |d| d.?.annotations,
+            .param => |d| d.?.annotations,
+            .class_param => |d| if (info.kind == .value_param) d.?.annotations else &.{},
+            .secondary_ctor => |d| d.?.annotations,
+            .accessor => |d| d.?.annotations,
+            .enum_entry => |d| d.?.annotations,
+            .type_alias => |d| d.?.annotations,
             else => &.{},
         };
         try c.repeated(sym, anns);
@@ -190,13 +191,8 @@ fn annotationOf(s: *Sema, t: TypeId) Sym {
 /// Whether an annotation class is marked `kotlin.annotation.Repeatable`
 /// (or the JVM's `@JvmRepeatable`).
 fn repeatable(s: *Sema, cls: Sym) Allocator.Error!bool {
-    const d = switch (s.syms.get(cls).decl) {
-        .class => |d| d,
-        else => return true,
-    };
-    const ctx: headers.TypeCtx = .{ .decl = cls, .file = s.syms.get(cls).file };
-    for (d.annotations) |*a| {
-        const ac = try headers.annotationClass(s, ctx, a);
+    if (s.syms.get(cls).decl != .class) return true;
+    for (try headers.annotationClasses(s, cls, .decl)) |ac| {
         if (ac == .none) continue;
         const fqn = s.str(s.syms.classInfo(ac).fqn);
         if (std.mem.eql(u8, fqn, "kotlin.annotation.Repeatable") or std.mem.eql(u8, fqn, "kotlin.jvm.JvmRepeatable")) return true;

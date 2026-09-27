@@ -87,33 +87,54 @@ pub const Flags = packed struct(u32) {
     /// `@Deprecated(level = HIDDEN)`: declared, but never a candidate for
     /// a reference in source.
     hidden: bool = false,
-    _pad: u1 = 0,
+    /// Marked `@IntrinsicConstEvaluation`: a call of it is a compile-time
+    /// constant (`Char.code`).
+    intrinsic_const: bool = false,
 };
 
 /// Where a symbol is declared. The pointers borrow the AST, which outlives
-/// the analysis.
+/// the analysis. A symbol read back from a base image has no AST: its tag
+/// says what kind of declaration it is and the pointer is null, and what the
+/// analysis asks about it beyond its header is in the tables.
 pub const Decl = union(enum) {
     none,
-    file: *const ast.KotlinFile,
-    class: *const ast.Class,
-    object: *const ast.ObjectDecl,
-    object_literal: *const ast.ObjectLiteral,
-    enum_entry: *const ast.EnumEntry,
-    function: *const ast.Function,
-    anon_fun: *const ast.AnonFunExpr,
-    lambda: *const ast.LambdaExpr,
-    accessor: *const ast.Accessor,
-    property: *const ast.Property,
-    class_param: *const ast.ClassParam,
-    param: *const ast.Param,
-    context_param: *const ast.ContextParam,
-    secondary_ctor: *const ast.SecondaryCtor,
-    type_param: *const ast.TypeParam,
-    type_alias: *const ast.TypeAlias,
+    file: ?*const ast.KotlinFile,
+    class: ?*const ast.Class,
+    object: ?*const ast.ObjectDecl,
+    object_literal: ?*const ast.ObjectLiteral,
+    enum_entry: ?*const ast.EnumEntry,
+    function: ?*const ast.Function,
+    anon_fun: ?*const ast.AnonFunExpr,
+    lambda: ?*const ast.LambdaExpr,
+    accessor: ?*const ast.Accessor,
+    property: ?*const ast.Property,
+    class_param: ?*const ast.ClassParam,
+    param: ?*const ast.Param,
+    context_param: ?*const ast.ContextParam,
+    secondary_ctor: ?*const ast.SecondaryCtor,
+    type_param: ?*const ast.TypeParam,
+    type_alias: ?*const ast.TypeAlias,
     /// A local introduced by an identifier alone: a `for` variable, a
     /// lambda parameter, a catch binding, a destructuring entry.
-    ident: ast.Ident,
-    local_prop: *const ast.Property,
+    ident: ?ast.Ident,
+    local_prop: ?*const ast.Property,
+
+    /// Whether the declaration has its AST: false for a symbol the language
+    /// declares and for one read back from a base image.
+    pub fn hasAst(self: Decl) bool {
+        return switch (self) {
+            .none => false,
+            inline else => |p| p != null,
+        };
+    }
+
+    /// The same declaration with its AST cut away.
+    pub fn cut(self: Decl) Decl {
+        return switch (self) {
+            .none => .none,
+            inline else => |_, tag| @unionInit(Decl, @tagName(tag), null),
+        };
+    }
 };
 
 pub const NO_FILE: u32 = std.math.maxInt(u32);
@@ -135,8 +156,11 @@ pub const Symbol = struct {
 
 pub const HeaderState = enum(u8) { pending, resolving, done };
 
-/// A declared-member index: name to every symbol declared under it.
-pub const NameIndex = std.AutoHashMapUnmanaged(Name, std.ArrayList(Sym));
+/// A declared-member index: name to every symbol declared under it, in the
+/// order the names were first declared, which is the order it iterates in.
+/// A base image rebuilds it in that order, so iterating it walks the same
+/// members the same way over the image as over the base's source.
+pub const NameIndex = std.AutoArrayHashMapUnmanaged(Name, std.ArrayList(Sym));
 
 pub const ClassKind = enum(u8) {
     class,
@@ -153,6 +177,8 @@ pub const ClassInfo = struct {
     kind: ClassKind,
     /// Fully qualified name, dotted, nested classes joined by `.`.
     fqn: Name,
+    /// Written `sealed`: an interface's modality stays abstract.
+    sealed: bool = false,
     type_params: []const Sym = &.{},
     /// `type_params` followed by the outer classes' for an inner class,
     /// the arguments its type carries; set on first use.
@@ -187,6 +213,8 @@ pub const FunctionInfo = struct {
     /// The body has been resolved (possibly early, to infer the return
     /// type), so the body pass does not resolve it again.
     body_done: bool = false,
+    /// The body written is an empty block, `{}`.
+    empty_body: bool = false,
     /// The members of the class's supertypes this member overrides
     /// directly; null until `members.overridden` computes it.
     overrides: ?[]const Sym = null,
@@ -226,6 +254,9 @@ pub const PropertyInfo = struct {
     getter: Sym = .none,
     setter: Sym = .none,
     has_delegate: bool = false,
+    /// What the declaration writes beside its type, read in place of the
+    /// AST, which a declaration read back from a base image does not have.
+    written: PropertyWritten = .{},
     /// Declared in a primary constructor.
     from_ctor: bool = false,
     body_done: bool = false,
@@ -241,6 +272,15 @@ pub const PropertyInfo = struct {
     /// As `FunctionInfo.forwards` and `delegation`.
     forwards: Sym = .none,
     delegation: u16 = 0,
+};
+
+pub const PropertyWritten = packed struct(u8) {
+    getter: bool = false,
+    setter: bool = false,
+    init: bool = false,
+    /// `field = ...` or `field: T`.
+    explicit_field: bool = false,
+    _pad: u4 = 0,
 };
 
 pub const ParamInfo = struct {

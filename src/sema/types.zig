@@ -93,17 +93,98 @@ pub const Var = struct { id: u32, nullable: bool = false, dnn: bool = false };
 
 pub const Subst = std.AutoHashMapUnmanaged(Sym, TypeId);
 
+/// The intern map's context: an id hashes and compares as the type it
+/// names.
+const Interning = struct {
+    items: []const Type,
+
+    pub fn hash(self: Interning, id: TypeId) u64 {
+        return hashType(self.items[id.int()]);
+    }
+
+    pub fn eql(_: Interning, a: TypeId, b: TypeId) bool {
+        return a == b;
+    }
+};
+
+/// Looks a type up in the intern map by its structure.
+const Probe = struct {
+    items: []const Type,
+
+    pub fn hash(_: Probe, t: Type) u64 {
+        return hashType(t);
+    }
+
+    pub fn eql(self: Probe, t: Type, id: TypeId) bool {
+        return typeEql(t, self.items[id.int()]);
+    }
+};
+
+fn hashType(t: Type) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(&.{@intFromEnum(std.meta.activeTag(t))});
+    switch (t) {
+        .none, .err => {},
+        .class => |c| {
+            h.update(std.mem.asBytes(&c.sym));
+            h.update(&.{ @intFromBool(c.nullable), @bitCast(c.attrs) });
+            for (c.args) |arg| {
+                h.update(&.{@intFromEnum(arg.variance)});
+                h.update(std.mem.asBytes(&arg.ty));
+            }
+        },
+        .param => |p| {
+            h.update(std.mem.asBytes(&p.sym));
+            h.update(&.{ @intFromBool(p.nullable), @intFromBool(p.dnn) });
+        },
+        .intersection => |parts| h.update(std.mem.sliceAsBytes(parts)),
+        .int_lit => |l| h.update(&.{@bitCast(l)}),
+        .variable => |v| {
+            h.update(std.mem.asBytes(&v.id));
+            h.update(&.{ @intFromBool(v.nullable), @intFromBool(v.dnn) });
+        },
+    }
+    return h.final();
+}
+
+fn typeEql(a: Type, b: Type) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .none, .err => true,
+        .class => |x| blk: {
+            const y = b.class;
+            if (x.sym != y.sym or x.nullable != y.nullable or @as(u8, @bitCast(x.attrs)) != @as(u8, @bitCast(y.attrs)) or x.args.len != y.args.len) break :blk false;
+            for (x.args, y.args) |p, q| if (p.variance != q.variance or p.ty != q.ty) break :blk false;
+            break :blk true;
+        },
+        .param => |x| x.sym == b.param.sym and x.nullable == b.param.nullable and x.dnn == b.param.dnn,
+        .intersection => |x| std.mem.eql(TypeId, x, b.intersection),
+        .int_lit => |x| @as(u8, @bitCast(x)) == @as(u8, @bitCast(b.int_lit)),
+        .variable => |x| x.id == b.variable.id and x.nullable == b.variable.nullable and x.dnn == b.variable.dnn,
+    };
+}
+
 pub const TypeStore = struct {
     arena: Allocator,
     items: std.ArrayList(Type) = .empty,
-    intern_map: std.StringHashMapUnmanaged(TypeId) = .empty,
-    key_buf: std.ArrayList(u8) = .empty,
+    /// Every type by its structure: the map holds ids, and hashes and
+    /// compares the types they name (`Interning`).
+    intern_map: std.HashMapUnmanaged(TypeId, void, Interning, 80) = .empty,
     err_id: TypeId = .none,
 
     pub fn init(arena: Allocator) Allocator.Error!TypeStore {
         var ts = TypeStore{ .arena = arena };
         try ts.items.append(arena, .none);
         ts.err_id = try ts.intern(.err);
+        return ts;
+    }
+
+    /// A store holding `items` as a store that interned them would: a base
+    /// image's types, read back.
+    pub fn fromItems(arena: Allocator, items: std.ArrayList(Type), err_id: TypeId) Allocator.Error!TypeStore {
+        var ts = TypeStore{ .arena = arena, .items = items, .err_id = err_id };
+        try ts.intern_map.ensureTotalCapacityContext(arena, @intCast(items.items.len), ts.interning());
+        for (1..items.items.len) |i| ts.intern_map.putAssumeCapacityNoClobberContext(TypeId.from(@intCast(i)), {}, ts.interning());
         return ts;
     }
 
@@ -119,58 +200,23 @@ pub const TypeStore = struct {
         return t == self.err_id;
     }
 
-    fn keyOf(self: *TypeStore, t: Type) Allocator.Error![]const u8 {
-        self.key_buf.clearRetainingCapacity();
-        const w = struct {
-            fn int(buf: *std.ArrayList(u8), a: Allocator, v: u32) Allocator.Error!void {
-                try buf.appendSlice(a, std.mem.asBytes(&v));
-            }
-        };
-        const a = self.arena;
-        try self.key_buf.append(a, @intFromEnum(std.meta.activeTag(t)));
-        switch (t) {
-            .none, .err => {},
-            .class => |c| {
-                try w.int(&self.key_buf, a, c.sym.int());
-                try self.key_buf.append(a, @intFromBool(c.nullable));
-                try self.key_buf.append(a, @bitCast(c.attrs));
-                try w.int(&self.key_buf, a, @intCast(c.args.len));
-                for (c.args) |arg| {
-                    try self.key_buf.append(a, @intFromEnum(arg.variance));
-                    try w.int(&self.key_buf, a, arg.ty.int());
-                }
-            },
-            .param => |p| {
-                try w.int(&self.key_buf, a, p.sym.int());
-                try self.key_buf.append(a, @intFromBool(p.nullable));
-                try self.key_buf.append(a, @intFromBool(p.dnn));
-            },
-            .intersection => |parts| {
-                try w.int(&self.key_buf, a, @intCast(parts.len));
-                for (parts) |p| try w.int(&self.key_buf, a, p.int());
-            },
-            .int_lit => |l| try self.key_buf.append(a, @bitCast(l)),
-            .variable => |v| {
-                try w.int(&self.key_buf, a, v.id);
-                try self.key_buf.append(a, @intFromBool(v.nullable));
-                try self.key_buf.append(a, @intFromBool(v.dnn));
-            },
-        }
-        return self.key_buf.items;
+    fn interning(self: *const TypeStore) Interning {
+        return .{ .items = self.items.items };
     }
 
     pub fn intern(self: *TypeStore, t: Type) Allocator.Error!TypeId {
-        const key = try self.keyOf(t);
-        if (self.intern_map.get(key)) |id| return id;
-        const owned_key = try self.arena.dupe(u8, key);
+        const gop = try self.intern_map.getOrPutContextAdapted(self.arena, t, Probe{ .items = self.items.items }, self.interning());
+        if (gop.found_existing) return gop.key_ptr.*;
         const stored: Type = switch (t) {
             .class => |c| .{ .class = .{ .sym = c.sym, .args = try self.arena.dupe(Arg, c.args), .nullable = c.nullable, .attrs = c.attrs } },
             .intersection => |parts| .{ .intersection = try self.arena.dupe(TypeId, parts) },
             else => t,
         };
         const id = TypeId.from(@intCast(self.items.items.len));
+        // The slot is claimed; the id it names must exist before the map
+        // hashes it again (a later growth rehashes every id).
+        gop.key_ptr.* = id;
         try self.items.append(self.arena, stored);
-        try self.intern_map.put(self.arena, owned_key, id);
         return id;
     }
 
