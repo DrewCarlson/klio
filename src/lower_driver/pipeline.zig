@@ -84,18 +84,25 @@ pub fn build(a: Allocator, src: Sources, binding: Binding) !Built {
 /// base's files of `map` and the driver's own `record`. Owned by
 /// `gpa`; `a` holds the build and can be dropped after.
 pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, binding: Binding, map: *const span.SourceMap, record: []const u8) ![]u8 {
+    var t = Timing.start();
     const s = try sema.Sema.init(a);
     try s.addFiles(base);
+    t.mark("bake: collect");
     const prefix: u32 = @intCast(s.syms.count());
     const layer: bridge.Layer = .{ .syms = prefix, .files = @intCast(s.files.items.len) };
     try sema.headers.resolveAllHeaders(s);
+    t.mark("bake: headers");
     try s.resolveBodies(&.{ .base, .pack });
+    t.mark("bake: bodies");
     const out = try sema.output.build(s);
+    t.mark("bake: records");
     const saved_perm = runtime.gc.alloc_perm;
     runtime.gc.alloc_perm = true;
     defer runtime.gc.alloc_perm = saved_perm;
     const br = try bridge.build(a, s, .{ .natives = binding.natives, .host_symbol = binding.host_symbol, .host_members = binding.host_members, .spread_varargs = binding.spread_varargs, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries, .records = out.files, .layers = try a.dupe(bridge.Layer, &.{layer}) });
+    t.mark("bake: bridge");
     const prog = try lower.lowerProgram(a, s, br);
+    t.mark("bake: lower");
     if (Timing.start().on) {
         const syms = &s.syms;
         std.debug.print("[sema-timing] bake: {d} symbols ({d} declared; {d} functions, {d} properties, {d} params, {d} locals, {d} classes), {d} types, {d} names\n", .{ syms.count(), prefix, syms.functions.items.len, syms.properties.items.len, syms.params.items.len, syms.locals.items.len, syms.classes.items.len, s.types.items.items.len, s.names.strs.items.len });
@@ -486,3 +493,4 @@ test "a VM kept after main answers a later call into the program" {
     try testing.expect(again == .ok);
     try testing.expectEqual(@as(i32, 2), again.ok.Int);
 }
+
