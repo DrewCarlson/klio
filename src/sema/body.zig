@@ -1355,9 +1355,9 @@ pub fn newLocal(ctx: *Ctx, n: Name, id: ast.Ident, ty: TypeId, mutable: bool) Al
         .owner = ctx.localOwner(),
         .file = ctx.file,
         .flags = .{ .mutable = mutable },
-        .decl = .{ .ident = id },
+        .decl = .{ .ident = {} },
         .detail = 0,
-    }, .{ .ty = ty });
+    }, .{ .ty = ty, .span = id.span });
 }
 
 fn localDecl(ctx: *Ctx, d: *const ast.Decl) Allocator.Error!void {

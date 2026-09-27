@@ -291,6 +291,7 @@ pub const Namer = struct {
 pub fn parserStart(s: *Sema, sym: Sym) ?u32 {
     return switch (s.syms.get(sym).decl) {
         .none, .file => null,
+        .ident => |d| if (d != null and s.syms.kind(sym) == .local) s.syms.localInfo(sym).span.start else null,
         inline else => |d| if (d) |x| x.span.start else null,
     };
 }

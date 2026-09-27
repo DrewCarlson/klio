@@ -115,8 +115,10 @@ pub const Decl = union(enum) {
     type_param: ?*const ast.TypeParam,
     type_alias: ?*const ast.TypeAlias,
     /// A local introduced by an identifier alone: a `for` variable, a
-    /// lambda parameter, a catch binding, a destructuring entry.
-    ident: ?ast.Ident,
+    /// lambda parameter, a catch binding, a destructuring entry. Its span
+    /// is in `LocalInfo.span`; the payload marks only whether it came from
+    /// source this analysis read.
+    ident: ?void,
     local_prop: ?*const ast.Property,
 
     /// Whether the declaration has its AST: false for a symbol the language
@@ -334,6 +336,8 @@ pub const ParamInfo = struct {
 
 pub const LocalInfo = struct {
     ty: TypeId = .none,
+    /// Where the identifier that declares it is written.
+    span: span.Span = .init(.from(0), 0, 0),
 };
 
 pub const TypeParamInfo = struct {

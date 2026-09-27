@@ -301,6 +301,10 @@ pub const Bridge = struct {
     /// (lambdas, local functions) were the bake's.
     image_funcs: u32 = 0,
     image_prefix: u32 = 0,
+    /// How many symbols past their end the by-symbol tables have room for:
+    /// a base image decodes them with space for its program's, which
+    /// `buildOver` takes in place.
+    sym_room: u32 = 0,
     /// Frame names, made on first ask (`frameName`).
     frame_names: FrameNames = .{},
 
@@ -680,8 +684,13 @@ const Build = struct {
     /// A by-Sym table sized to this build's symbols: the base's entries
     /// below its prefix, `none` past it.
     fn extended(b: *Build, comptime T: type, old: []const T, none: T) Error![]T {
-        const out = try filled(b.a, T, b.n, none);
         const keep = @min(@min(old.len, b.firstSym()), b.n);
+        if (b.over) |o| if (keep == old.len and b.n <= old.len + o.old.sym_room) {
+            const out = @constCast(old.ptr)[0..b.n];
+            @memset(out[old.len..], none);
+            return out;
+        };
+        const out = try filled(b.a, T, b.n, none);
         @memcpy(out[0..keep], old[0..keep]);
         return out;
     }

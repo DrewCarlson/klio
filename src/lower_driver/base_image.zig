@@ -28,7 +28,7 @@ const ClassId = ir.ClassId;
 const magic = "KLIOSEMB";
 
 /// Bumped with any change to the layout below.
-pub const version: u32 = 29;
+pub const version: u32 = 30;
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };
@@ -48,21 +48,23 @@ pub const Header = extern struct {
     digest: u64,
 };
 
-/// `Bridge`'s tables, with its maps and bit sets flattened to slices.
+/// `Bridge`'s tables, with its maps and bit sets flattened to slices. The
+/// by-symbol tables decode with room for a program's symbols
+/// (`Bridge.sym_room`).
 const BridgeImage = struct {
     origin: []const bridge.FuncOrigin,
-    func_of: []const FuncId,
-    getter_of: []const FuncId,
-    setter_of: []const FuncId,
-    defaults_of: []const FuncId,
-    restart_of: []const FuncId,
-    singleton_of: []const ir.StaticId,
-    class_of: []const ClassId,
-    static_of: []const ir.StaticId,
-    field_of: []const u32,
-    delegate_field_of: []const u32,
-    native_of: []const ir.NativeId,
-    sam_class_of: []const ClassId,
+    func_of: codec.Growable(FuncId),
+    getter_of: codec.Growable(FuncId),
+    setter_of: codec.Growable(FuncId),
+    defaults_of: codec.Growable(FuncId),
+    restart_of: codec.Growable(FuncId),
+    singleton_of: codec.Growable(ir.StaticId),
+    class_of: codec.Growable(ClassId),
+    static_of: codec.Growable(ir.StaticId),
+    field_of: codec.Growable(u32),
+    delegate_field_of: codec.Growable(u32),
+    native_of: codec.Growable(ir.NativeId),
+    sam_class_of: codec.Growable(ClassId),
     sam_funcs_of: []const KV(Sym, bridge.SamFuncs),
     class_origin: []const bridge.ClassOrigin,
     outer_slot: []const u32,
@@ -85,7 +87,7 @@ const BridgeImage = struct {
 /// run makes for its program, and what the run over the image sets up for
 /// itself: where the image's functions and header symbols end, and the
 /// JVM frame names it makes on demand.
-const bridge_not_carried = [_][]const u8{ "s", "m", "records", "body_files", "image_funcs", "image_prefix", "frame_names" };
+const bridge_not_carried = [_][]const u8{ "s", "m", "records", "body_files", "image_funcs", "image_prefix", "sym_room", "frame_names" };
 
 comptime {
     for (@typeInfo(bridge.Bridge).@"struct".fields) |f| {
@@ -99,13 +101,14 @@ comptime {
 }
 
 /// The module parts the bridge and lowering write. A function's blocks are
-/// in the body section, found by `Func.deferred_offset`.
+/// in the body section, found by `Func.deferred_offset`. The lists decode
+/// with room for the program's to follow them in place.
 const ModuleImage = struct {
-    funcs: []const ir.Func,
-    classes: []const ir.Class,
-    consts: []const ir.Const,
+    funcs: codec.Growable(ir.Func),
+    classes: codec.Growable(ir.Class),
+    consts: codec.Growable(ir.Const),
     method_dispatch: []const KV(u64, FuncId),
-    class_ancestors: []const []const ClassId,
+    class_ancestors: codec.Growable([]const ClassId),
     body_section: []const u8,
 };
 
@@ -245,11 +248,11 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const brid
         .resolved = try resolvedImage(scratch, m),
         .bridge = try bridgeImage(scratch, br),
         .module = .{
-            .funcs = funcs,
-            .classes = m.classes.items,
-            .consts = m.consts.items,
+            .funcs = .of(funcs),
+            .classes = .of(m.classes.items),
+            .consts = .of(m.consts.items),
             .method_dispatch = dispatch.items,
-            .class_ancestors = m.class_ancestors.items,
+            .class_ancestors = .of(m.class_ancestors.items),
             .body_section = section.items,
         },
     };
@@ -290,7 +293,10 @@ fn bridgeImage(a: Allocator, br: *const bridge.Bridge) !BridgeImage {
     while (cit.next()) |i| try cells.append(a, @intCast(i));
     var img: BridgeImage = undefined;
     inline for (@typeInfo(BridgeImage).@"struct".fields) |f| {
-        if (comptime !isFlattened(f.name)) @field(img, f.name) = @field(br, f.name);
+        if (comptime isFlattened(f.name)) continue;
+        if (comptime isGrowable(f.type)) {
+            @field(img, f.name) = .of(@constCast(@field(br, f.name)));
+        } else @field(img, f.name) = @field(br, f.name);
     }
     img.sam_funcs_of = sam.items;
     img.adapter_at = at.items;
@@ -339,6 +345,10 @@ fn resolvedImage(a: Allocator, m: *const ir.Module) !ResolvedImage {
         .base = r.base,
         .serializers = r.serializers,
     };
+}
+
+fn isGrowable(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "codec_growable");
 }
 
 fn isFlattened(comptime name: []const u8) bool {
@@ -439,10 +449,10 @@ fn payloadOf(bytes: []const u8, h: Header) ?[]const u8 {
 fn assemble(a: Allocator, h: Header, img: *const Image, s: *sema.Sema, rebind: Rebind) LoadError!Loaded {
     const m = try a.create(ir.Module);
     m.* = ir.Module.init(a);
-    try m.funcs.appendSlice(a, img.module.funcs);
-    try m.classes.appendSlice(a, img.module.classes);
-    try m.consts.appendSlice(a, img.module.consts);
-    try m.class_ancestors.appendSlice(a, img.module.class_ancestors);
+    m.funcs = img.module.funcs.list();
+    m.classes = img.module.classes.list();
+    m.consts = img.module.consts.list();
+    m.class_ancestors = img.module.class_ancestors.list();
     for (img.module.method_dispatch) |e| try m.method_dispatch.put(e.k, e.v);
     m.deferred_func_section = img.module.body_section;
     m.deferred_func_arena = a;
@@ -452,7 +462,13 @@ fn assemble(a: Allocator, h: Header, img: *const Image, s: *sema.Sema, rebind: R
     const br = try a.create(bridge.Bridge);
     br.* = .{ .s = s, .m = m };
     inline for (@typeInfo(BridgeImage).@"struct".fields) |f| {
-        if (comptime !isFlattened(f.name)) @field(br, f.name) = @constCast(@field(img.bridge, f.name));
+        if (comptime isFlattened(f.name)) continue;
+        if (comptime isGrowable(f.type)) {
+            const g = @field(img.bridge, f.name);
+            @field(br, f.name) = g.items;
+            const room: u32 = @intCast(g.capacity - g.items.len);
+            br.sym_room = if (br.sym_room == 0) room else @min(br.sym_room, room);
+        } else @field(br, f.name) = @constCast(@field(img.bridge, f.name));
     }
     for (img.bridge.sam_funcs_of) |e| try br.sam_funcs_of.put(a, e.k, e.v);
     for (img.bridge.adapter_at) |e| try br.adapter_at.put(a, e.k, e.v);
@@ -516,3 +532,4 @@ fn loadResolved(a: Allocator, img: *const ResolvedImage, m: *const ir.Module, br
     r.serializers = img.serializers;
     return r;
 }
+

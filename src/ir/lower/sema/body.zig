@@ -88,7 +88,7 @@ fn declSite(s: *sema.Sema, sym: Sym) span.Span {
     if (sym == .none) return builder.zero_span;
     return switch (s.syms.get(sym).decl) {
         .none => builder.zero_span,
-        .ident => |id| if (id) |x| x.span else builder.zero_span,
+        .ident => if (s.syms.kind(sym) == .local) s.syms.localInfo(sym).span else builder.zero_span,
         inline else => |d| if (d) |x| x.span else builder.zero_span,
     };
 }
