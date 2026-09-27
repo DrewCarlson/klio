@@ -2463,11 +2463,13 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
                     return;
                 }
                 case SDL_WINDOWEVENT_ENTER:
+                    if (klioScriptDrivesInput()) return;
                     SDL_GetMouseState(&mx, &my);
                     kw->events.push_back(klioPointerEv(KLIO_PTR_ENTER, mx, my - kw->barH, KLIO_BTN_NONE, kw->buttons,
                                                        klioSdlMods(SDL_GetModState())));
                     return;
                 case SDL_WINDOWEVENT_LEAVE:
+                    if (klioScriptDrivesInput()) return;
                     SDL_GetMouseState(&mx, &my);
                     kw->events.push_back(klioPointerEv(KLIO_PTR_EXIT, mx, my - kw->barH, KLIO_BTN_NONE, kw->buttons,
                                                        klioSdlMods(SDL_GetModState())));
@@ -2491,6 +2493,7 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
         }
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP: {
+            if (klioScriptDrivesInput()) return;
             const int button = klioSdlButton(ev.button.button);
             if (button == KLIO_BTN_NONE) return;
             const bool down = ev.type == SDL_MOUSEBUTTONDOWN;
@@ -2518,11 +2521,13 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
             return;
         }
         case SDL_MOUSEMOTION:
+            if (klioScriptDrivesInput()) return;
             if (kw->buttons == 0 && kw->menu && klioMenuPointer(*kw->menu, KLIO_PTR_MOVE, ev.motion.x, ev.motion.y)) return;
             kw->events.push_back(klioPointerEv(KLIO_PTR_MOVE, ev.motion.x, ev.motion.y - kw->barH, KLIO_BTN_NONE,
                                                kw->buttons, klioSdlMods(SDL_GetModState())));
             return;
         case SDL_MOUSEWHEEL: {
+            if (klioScriptDrivesInput()) return;
             int mx = 0;
             int my = 0;
             SDL_GetMouseState(&mx, &my);
@@ -2536,6 +2541,7 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
         }
         case SDL_KEYDOWN:
         case SDL_KEYUP: {
+            if (klioScriptDrivesInput()) return;
             if (kw->menu && klioMenuKey(*kw->menu, ev.key.keysym.sym, ev.key.keysym.mod, ev.type == SDL_KEYDOWN)) return;
             int vk = 0;
             int loc = KLIO_LOC_STANDARD;
@@ -2546,6 +2552,7 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
             return;
         }
         case SDL_TEXTINPUT:
+            if (klioScriptDrivesInput()) return;
             if (kw->menu && !kw->menu->panels.empty()) return;
             // The end of a composition is the input method's commit; other
             // text is what the keys typed.
@@ -2557,7 +2564,7 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
             klioPushText(kw->events, ev.text.text);
             return;
         case SDL_TEXTEDITING:
-            klioSdlCompose(kw, ev.edit.text);
+            if (!klioScriptDrivesInput()) klioSdlCompose(kw, ev.edit.text);
             return;
         // A drop on a Wayland window, which SDL reports only once it lands:
         // the drag enters, moves to the pointer and drops there (an X11
@@ -2598,7 +2605,7 @@ static void klioSdlTranslate(KlioWindow* kw, const SDL_Event& ev) {
         }
 #if SDL_VERSION_ATLEAST(2, 0, 22)
         case SDL_TEXTEDITING_EXT:
-            klioSdlCompose(kw, ev.editExt.text);
+            if (!klioScriptDrivesInput()) klioSdlCompose(kw, ev.editExt.text);
             SDL_free(ev.editExt.text);
             return;
 #endif
@@ -4776,7 +4783,20 @@ static void klioWinKey(WPARAM vkIn, LPARAM lParam, int* vk, int* loc) {
 }
 
 // The window's input as klio_win_poll_event's events.
+static bool klioWinInputMsg(UINT msg) {
+    switch (msg) {
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+        case WM_MOUSEMOVE: case WM_MOUSELEAVE: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+        case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP: case WM_CHAR:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void klioWinTranslate(KlioWindow* kw, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (klioScriptDrivesInput() && klioWinInputMsg(msg)) return;
     const double x = static_cast<short>(LOWORD(lParam));
     const double y = static_cast<short>(HIWORD(lParam));
     int button = KLIO_BTN_NONE;
@@ -4935,6 +4955,7 @@ static void klioWinPlaceIme(KlioWindow* kw) {
 // True when the message was handled.
 static bool klioWinIme(KlioWindow* kw, UINT msg, LPARAM lParam) {
     if (!kw->textInput) return false;
+    if (klioScriptDrivesInput() && (msg == WM_IME_COMPOSITION || msg == WM_IME_ENDCOMPOSITION)) return true;
     switch (msg) {
         case WM_IME_STARTCOMPOSITION:
             klioWinPlaceIme(kw);
@@ -7914,6 +7935,7 @@ static void klioCocoaTranslate(NSEvent* ev, bool* forward) {
         case NSEventTypeMouseEntered:
         case NSEventTypeMouseExited:
         case NSEventTypeScrollWheel: {
+            if (klioScriptDrivesInput()) return;
             // Content-view coordinates, top-left origin, whole points as AWT's.
             const NSPoint p = [kw->view convertPoint:[ev locationInWindow] fromView:nil];
             const double x = static_cast<int>(p.x);
@@ -7955,6 +7977,7 @@ static void klioCocoaTranslate(NSEvent* ev, bool* forward) {
         case NSEventTypeKeyDown:
         case NSEventTypeKeyUp: {
             *forward = false;
+            if (klioScriptDrivesInput()) return;
             const bool down = type == NSEventTypeKeyDown;
             // The application menu's shortcuts (Quit) go through AppKit; a
             // window menu bar's reach the program with the key, which matches
@@ -7993,6 +8016,7 @@ static void klioCocoaTranslate(NSEvent* ev, bool* forward) {
         }
         case NSEventTypeFlagsChanged: {
             *forward = false;
+            if (klioScriptDrivesInput()) return;
             const unsigned short code = [ev keyCode];
             const NSEventModifierFlags flag = klioCocoaKeyFlag(code);
             if (flag == 0) return;

@@ -1018,7 +1018,9 @@ inline int klioAwtKeyChar(int vk, unsigned platformChar) {
 // its frames checked (KLIO_SKIA_DUMP_AT). An event comes at the window's n-th
 // event poll, or t milliseconds after its first ("<t>ms"). One event per
 // line, '#' starting a comment:
-//   <when> move <x> <y>
+//   <when> move <x> <y>                  (a script with a pointer, key or text
+//                                        event is the windows' only pointer and
+//                                        keyboard input, the platform's dropped)
 //   <when> press <x> <y> [button]        (1 primary, 2 secondary, 3 tertiary, ...)
 //   <when> release <x> <y> [button]
 //   <when> scroll <x> <y> <dx> <dy>
@@ -1069,6 +1071,12 @@ inline int klioMenuShortcutMod() {
 // event is the only source of focus changes, so a window driven by it sees
 // the same ones whichever other windows open beside it.
 inline bool klioScriptDrivesFocus();
+
+// Whether the script gives the windows their input: a script with a pointer,
+// key or text event is the only source of pointer and keyboard input, so the
+// real pointer resting on a window it drives, or keys typed while that window
+// has taken the focus, change nothing the program sees.
+inline bool klioScriptDrivesInput();
 
 struct KlioScriptEntry {
     int poll;       // the poll it comes at, or -1 for a timed one
@@ -1224,6 +1232,18 @@ inline bool klioScriptDrivesFocus() {
     static const bool drives = [] {
         for (const KlioScriptEntry& e : klioScript()) {
             if (!e.tray && e.ev.type == KLIO_EV_FOCUS) return true;
+        }
+        return false;
+    }();
+    return drives;
+}
+
+inline bool klioScriptDrivesInput() {
+    static const bool drives = [] {
+        for (const KlioScriptEntry& e : klioScript()) {
+            if (e.tray) continue;
+            const int t = e.ev.type;
+            if (t == KLIO_EV_POINTER || t == KLIO_EV_KEY || t == KLIO_EV_TEXT || t == KLIO_EV_IME) return true;
         }
         return false;
     }();
