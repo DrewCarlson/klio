@@ -103,6 +103,22 @@ pub const System = struct {
         return out;
     }
 
+    /// Frees what the system holds, for a trial copy nothing reads again;
+    /// the types it interned stay.
+    pub fn deinit(self: *System) void {
+        const a = self.s.arena;
+        for (self.vars.items) |*v| {
+            v.lower.deinit(a);
+            v.upper.deinit(a);
+            v.declared.deinit(a);
+        }
+        self.vars.deinit(a);
+        self.index.deinit(a);
+        self.open_subst.deinit(a);
+        self.must_fix.deinit(a);
+        self.* = undefined;
+    }
+
     pub fn freshVar(s: *Sema) Allocator.Error!struct { id: u32, ty: TypeId } {
         const id = s.next_type_var;
         s.next_type_var += 1;
@@ -530,6 +546,7 @@ pub const System = struct {
                 if (sup_sym != .none) for (parts) |p| {
                     if ((try subtyping.supertypeWithClass(s, try ts.makeNotNull(p), sup_sym)) == null) continue;
                     var trial = try self.clone();
+                    defer trial.deinit();
                     if (try trial.constrain(p, sup)) return self.constrain(p, sup);
                 };
                 return self.constrain(parts[0], sup);
@@ -796,6 +813,7 @@ pub const System = struct {
                     const z = try zonk(s, db);
                     if (!self.mentionsOtherUnfixed(z, self.vars.items[vi].id)) continue;
                     var trial = try self.clone();
+                    defer trial.deinit();
                     if (try trial.constrain(fixed, z)) {
                         _ = try self.constrain(fixed, z);
                         progress = true;
@@ -900,6 +918,7 @@ pub const System = struct {
                             const z = try zonk(s, lb);
                             if (!self.waitsOnOwn(z)) continue;
                             var trial = try self.clone();
+                            defer trial.deinit();
                             if (try trial.constrain(z, fixed)) _ = try self.constrain(z, fixed);
                         }
                     }

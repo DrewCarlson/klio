@@ -1563,6 +1563,7 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
             continue;
         }
         var trial_arg = try sys.clone();
+        defer trial_arg.deinit();
         if (try trial_arg.constrain(a.ty, opened)) {
             _ = try sys.constrain(a.ty, opened);
             continue;
@@ -1607,6 +1608,7 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
     if (known_expected != .none) {
         const ret = try candReturn(ctx, cand, &sys);
         var trial = try sys.clone();
+        defer trial.deinit();
         if (try trial.constrain(ret, known_expected) and try trial.solve(true)) {
             _ = try sys.constrain(ret, known_expected);
         }
@@ -1614,6 +1616,7 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
     // A variable nothing constrains is left open here: whether it can be
     // fixed is the enclosing call's or the expected type's question.
     var trial = try sys.clone();
+    defer trial.deinit();
     if (!try trial.solve(true)) {
         traceReject(ctx, cand, "no type arguments satisfy the bounds", .{});
         return null;
@@ -1638,6 +1641,7 @@ fn contextArgument(ctx: *Ctx, sys: *infer.System, want: TypeId) Allocator.Error!
             // `context(s: String) fun bar()`).
             const ct = try body.narrowedType(ctx, cv.sym, cv.ty);
             var trial = try sys.clone();
+            defer trial.deinit();
             if (!try trial.constrain(ct, want)) continue;
             n += 1;
             found = .{ .implicit = .{ .kind = .context, .owner = cv.sym } };
@@ -1646,6 +1650,7 @@ fn contextArgument(ctx: *Ctx, sys: *infer.System, want: TypeId) Allocator.Error!
         for (c.receivers.items) |r| {
             const rt = try body.narrowedReceiver(ctx, r);
             var trial = try sys.clone();
+            defer trial.deinit();
             if (!try trial.constrain(rt, want)) continue;
             n += 1;
             found = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } };
@@ -1896,6 +1901,7 @@ fn convertedArg(ctx: *Ctx, sys: *infer.System, at: TypeId, pt: TypeId) Allocator
         const ft = if (nullable) try s.types.makeNullable(ft_nn) else ft_nn;
         if (try suspendConverted(s, ft)) |st| {
             var trial = try sys.clone();
+            defer trial.deinit();
             if (try trial.constrain(st, pt)) {
                 _ = try sys.constrain(st, pt);
                 return .suspend_;
@@ -1912,6 +1918,7 @@ fn convertedArg(ctx: *Ctx, sys: *infer.System, at: TypeId, pt: TypeId) Allocator
         for (forms) |form| {
             const f = form orelse continue;
             var trial = try sys.clone();
+            defer trial.deinit();
             if (!try trial.constrain(f, want)) continue;
             _ = try sys.constrain(f, want);
             return .{ .sam = s.types.classSym(pt_nn) };
@@ -2120,6 +2127,7 @@ fn byLambdaReturn(ctx: *Ctx, apps: []Applied) Allocator.Error!?usize {
     const params = candParams(s, first.cand);
     const pt = try first.sys.open(try s.types.substitute(try headers.paramType(s, params[first.slots[arg_index].param]), first.cand.subst));
     var trial = try first.sys.clone();
+    defer trial.deinit();
     _ = try trial.solve(true);
     const hint = try lambdaExpectation(ctx, &trial, &first.sys, pt);
     // Only the parameter types matter; the result is what is learned.
@@ -2153,6 +2161,7 @@ fn byLambdaReturn(ctx: *Ctx, apps: []Applied) Allocator.Error!?usize {
         if (ac.args.len == 0) continue;
         const want = ac.args[ac.args.len - 1].ty;
         var sys = try a.sys.clone();
+        defer sys.deinit();
         if (!try sys.constrain(lret, try a.sys.open(want))) continue;
         // An exact result wins over one it merely fits.
         if (try subtyping.equivalent(s, lret, want)) return i;
@@ -2167,6 +2176,7 @@ fn byLambdaReturn(ctx: *Ctx, apps: []Applied) Allocator.Error!?usize {
         const ap = candParams(s, a.cand);
         const apt = try a.sys.open(try s.types.substitute(try headers.paramType(s, ap[a.slots[arg_index].param]), a.cand.subst));
         var a_trial = try a.sys.clone();
+        defer a_trial.deinit();
         _ = try a_trial.solve(true);
         var a_sys = try a.sys.clone();
         const want = try lambdaExpectation(ctx, &a_trial, &a_sys, apt);
@@ -2323,6 +2333,7 @@ fn atLeastAsSpecific(ctx: *Ctx, a: *const Applied, b: *const Applied, args: []co
         }
     }
     var trial = try sys.clone();
+    defer trial.deinit();
     return trial.solve(true);
 }
 
@@ -2661,6 +2672,7 @@ fn writtenInputs(ctx: *Ctx, sys: *infer.System, e: *const Expr, pt: TypeId) Allo
         const written = try body.resolveTypeInBody(ctx, tr);
         if (s.types.isErr(written)) continue;
         var trial = try sys.clone();
+        defer trial.deinit();
         if (try trial.constrain(want, written)) _ = try sys.constrain(want, written);
     }
 }
@@ -2819,6 +2831,7 @@ fn lambdaExpectation(ctx: *Ctx, trial: *infer.System, sys: *infer.System, pt: Ty
         // the lambda's own result joins (`builder.ifEmpty { emptyMap() }`
         // gives a `Map`, not the receiver's `MutableMap`).
         var fixed = try sys.clone();
+        defer fixed.deinit();
         _ = try fixed.solve(true);
         const ret = (try fixed.upperMeet(orig_ret)) orelse try fixed.close(orig_ret);
         // Else the inputs it names are what the lambda is analyzed with
@@ -3761,6 +3774,7 @@ fn operatorResultIn(ctx: *Ctx, sys: *infer.System, recv_t: TypeId, n: Name, this
         if (fi.params.len != 0) {
             const pt = try trial.open(try s.types.substitute(try headers.paramType(s, fi.params[0]), m.subst));
             var probe = try trial.clone();
+            defer probe.deinit();
             if (try probe.constrain(this_ref, pt)) _ = try trial.constrain(this_ref, pt);
         }
         const ret = try trial.open(try s.types.substitute(fi.ret, m.subst));
@@ -3785,6 +3799,7 @@ fn operatorResultIn(ctx: *Ctx, sys: *infer.System, recv_t: TypeId, n: Name, this
         if (fi.params.len != 0) {
             const pt = try trial.open(try s.types.substitute(try headers.paramType(s, fi.params[0]), x.subst));
             var probe = try trial.clone();
+            defer probe.deinit();
             if (try probe.constrain(this_ref, pt)) _ = try trial.constrain(this_ref, pt);
         }
         const ret = try trial.open(try s.types.substitute(fi.ret, x.subst));

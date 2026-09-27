@@ -914,6 +914,7 @@ fn delegateExpr(ctx: *Ctx, d: *const Expr, declared_in: TypeId, mutable: bool, t
     const ret = try calls.delegateValueType(ctx, &sys, z, this_ref);
     if (ret != null and declared != .none) {
         var trial = try sys.clone();
+        defer trial.deinit();
         const fits = try trial.constrain(ret.?, declared) and (!mutable or try trial.constrain(declared, ret.?));
         if (fits) {
             _ = try sys.constrain(ret.?, declared);
@@ -2221,12 +2222,14 @@ pub fn join(ctx: *Ctx, list_in: []const TypeId, expected: TypeId) Allocator.Erro
             for (list, 0..) |tj, j| {
                 if (i == j or isNothingType(s, tj)) continue;
                 var trial = try sys.clone();
+                defer trial.deinit();
                 if (!try trial.constrain(tj, ti)) {
                     all_below = false;
                     // `FiniteAnimationSpec<IntOffset>` and `snap()`'s
                     // `SnapSpec<T>`: the open branch fits below the other,
                     // whose arguments its supertype then shares.
                     var below = try sys.clone();
+                    defer below.deinit();
                     if (try below.constrain(ti, tj)) {
                         _ = try sys.constrain(ti, tj);
                         continue;
@@ -3456,6 +3459,7 @@ fn refineBareType(ctx: *Ctx, subject: TypeId, t: TypeId) Allocator.Error!TypeId 
             const decl: types.Variance = if (i < pc_tps.len) s.syms.typeParamInfo(pc_tps[i]).variance else .inv;
             const v: types.Variance = if (pa.variance != .inv) pa.variance else decl;
             var trial = try sys.clone();
+            defer trial.deinit();
             const fits = switch (v) {
                 .out => try trial.constrain(va.ty, pa.ty),
                 .in => try trial.constrain(pa.ty, va.ty),
