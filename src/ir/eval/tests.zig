@@ -232,3 +232,106 @@ test "a Double equals a Float as a number, and boxed equality keeps the kind" {
         if (ev_exec.scalarBin(c.op, c.l, c.r)) |v| try testing.expectEqual(c.want, v.Bool);
     }
 }
+
+test "the scalar paths' floating-point arithmetic answers as applyBinop does" {
+    const nan64 = std.math.nan(f64);
+    const nan32 = std.math.nan(f32);
+    const ops = [_]BinOp{ .Add, .Sub, .Mul, .Div, .Mod, .Less, .LessEq, .Greater, .GreaterEq, .Eq, .NotEq };
+    const pairs = [_][2]Value{
+        .{ .{ .Double = 1.5 }, .{ .Double = -0.25 } },
+        .{ .{ .Double = 0.0 }, .{ .Double = -0.0 } },
+        .{ .{ .Double = nan64 }, .{ .Double = nan64 } },
+        .{ .{ .Double = 7.0 }, .{ .Double = 0.0 } },
+        .{ .{ .Float = 2.5 }, .{ .Float = 0.1 } },
+        .{ .{ .Float = nan32 }, .{ .Float = 1.0 } },
+        .{ .{ .Float = -3.0 }, .{ .Float = 0.0 } },
+        .{ .{ .Double = 2.5 }, .{ .Int = 3 } },
+        .{ .{ .Long = -4 }, .{ .Double = 0.5 } },
+    };
+    for (pairs) |p| for (ops) |op| {
+        const fast = ev_exec.scalarBin(op, p[0], p[1]) orelse ev_exec.wideScalarBin(op, p[0], p[1]) orelse continue;
+        const r = try ev_values.applyBinop(testing.allocator, op, &p[0], &p[1]);
+        try testing.expect(r == .ok);
+        try testing.expect(Value.structuralEqBoxed(&fast, &r.ok));
+        // The stream ops' path with no call in it answers the same where it answers.
+        const quick = if (p[0] == .Float and p[1] == .Float)
+            ev_exec.floatBinQuick(f32, op, p[0].Float, p[1].Float)
+        else if (p[0] == .Double and p[1] == .Double)
+            ev_exec.floatBinQuick(f64, op, p[0].Double, p[1].Double)
+        else
+            null;
+        if (quick) |q| try testing.expect(Value.structuralEqBoxed(&q, &r.ok));
+    };
+    // The kind-keeping boxed equality is left to the generic arm.
+    try testing.expect(ev_exec.floatScalarBin(.BoxedEq, .{ .Double = 0.0 }, .{ .Double = -0.0 }) == null);
+}
+
+test "the scalar path's conversions and Long shifts answer as the generic arms do" {
+    const convs = [_]ir.UnOp{ .ToByte, .ToShort, .ToInt, .ToLong, .ToFloat, .ToDouble, .ToChar };
+    const vals = [_]Value{
+        .{ .Int = -1 },               .{ .Int = 70000 },          .{ .Long = 0x1_8000_0001 },
+        .{ .Long = std.math.minInt(i64) }, .{ .Short = -300 },    .{ .Byte = -7 },
+        .{ .Char = 0xFFFF },          .{ .Double = -2.9 },        .{ .Double = std.math.nan(f64) },
+        .{ .Double = 1e300 },         .{ .Float = 4e9 },          .{ .Float = -0.5 },
+    };
+    for (vals) |v| for (convs) |op| {
+        const fast = runtime.numconv.convert(op.conversion().?, v) orelse return error.TestUnexpectedResult;
+        const r = try ev_values.applyUnop(testing.allocator, op, &v);
+        try testing.expect(r == .ok);
+        try testing.expect(Value.structuralEqBoxed(&fast, &r.ok));
+    };
+    // A shift over a count widened from `Int` is the shift by the `Int`.
+    const x: Value = .{ .Long = -0x1234_5678_9ABC };
+    for ([_]i32{ 0, 1, 31, 32, 63, 64, 65, -1 }) |n| for ([_]BinOp{ .Shl, .Shr, .UShr }) |op| {
+        const fast = ev_exec.wideScalarBin(op, x, .{ .Long = n }) orelse return error.TestUnexpectedResult;
+        const r = try ev_values.applyBinop(testing.allocator, op, &x, &Value{ .Int = n });
+        try testing.expect(r == .ok);
+        try testing.expect(Value.structuralEqBoxed(&fast, &r.ok));
+    };
+}
+
+test "an operation with a constant operand its op carries answers as applyBinop does" {
+    const ops = [_]BinOp{ .Add, .Sub, .Mul, .Div, .Mod, .Less, .LessEq, .Greater, .GreaterEq, .Eq, .NotEq, .BoxedEq, .BoxedNotEq, .And, .Or, .Xor, .Shl, .Shr, .UShr };
+    const ks = [_]Const{
+        .{ .Int = 0 },                     .{ .Int = 1 },     .{ .Int = -1 },   .{ .Int = 3 },          .{ .Int = 33 },
+        .{ .Int = 0xff },                  .{ .Int = std.math.minInt(i32) }, .{ .Long = 0 }, .{ .Long = -1 }, .{ .Long = 64 },
+        .{ .Long = std.math.minInt(i64) }, .{ .Long = 1 << 40 },           .{ .Float = 0.0 }, .{ .Float = -0.0 }, .{ .Float = 2.5 },
+        .{ .Double = -0.0 },               .{ .Double = 1e300 },           .{ .ULong = std.math.maxInt(u64) }, .{ .UInt = 7 },
+    };
+    const xs = [_]Value{
+        .{ .Int = 0 },     .{ .Int = -7 },    .{ .Int = std.math.minInt(i32) }, .{ .Int = std.math.maxInt(i32) },
+        .{ .Long = 0 },    .{ .Long = -7 },   .{ .Long = std.math.minInt(i64) }, .{ .Long = 1 << 41 },
+        .{ .Float = 0.0 }, .{ .Float = -0.0 }, .{ .Float = std.math.nan(f32) }, .{ .Float = std.math.inf(f32) },
+        .{ .Double = 0.0 }, .{ .Double = std.math.nan(f64) }, .{ .Double = -2.5 },
+        .{ .ULong = 0 },   .{ .ULong = std.math.maxInt(u64) }, .{ .UInt = 7 }, .{ .Short = 3 }, .{ .Bool = true },
+    };
+    var answered: usize = 0;
+    for (ks) |k| for (ops) |op| {
+        if (!ir.bc.foldable(op, k)) continue;
+        const bits = ir.bc.kBits(k);
+        const lo: u32 = @truncate(bits);
+        const hi: u32 = @truncate(bits >> 32);
+        const kv = ev_exec.kValue(ir.bc.kWord(.{ .reg = 0, .value = k, .op = op }), lo, hi);
+        for ([_]bool{ false, true }) |left| {
+            // A constant on the left is computed with the operator's mirror.
+            const as_op = if (left) ir.bc.mirrored(op) orelse continue else op;
+            const kw = ir.bc.kWord(.{ .reg = 0, .value = k, .op = as_op });
+            for (xs) |x| {
+                const fast = ev_exec.binK(kw, x, lo, hi) orelse continue;
+                const r = if (left)
+                    try ev_values.applyBinop(testing.allocator, op, &kv, &x)
+                else
+                    try ev_values.applyBinop(testing.allocator, op, &x, &kv);
+                try testing.expect(r == .ok);
+                try testing.expect(Value.structuralEqBoxed(&fast, &r.ok));
+                answered += 1;
+            }
+        }
+    };
+    try testing.expect(answered > 500);
+    // The constant written for the general path is the one its Const loads.
+    const k: Const = .{ .Double = -0.0 };
+    const bits = ir.bc.kBits(k);
+    const v = ev_exec.kValue(ir.bc.kWord(.{ .reg = 0, .value = k, .op = .Add }), @truncate(bits), @truncate(bits >> 32));
+    try testing.expect(v == .Double and std.math.signbit(v.Double));
+}

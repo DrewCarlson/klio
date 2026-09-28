@@ -41,6 +41,14 @@ OUT_DIR = os.path.join(ROOT, "target", "bench-compose")
 JVM_OUT = os.path.join(OUT_DIR, "jvm")
 
 
+def use_programs(path):
+    """Run the programs of another suite (bench/interp/programs); its JVM
+    builds get a directory of their own."""
+    global PROGRAMS_DIR, JVM_OUT
+    PROGRAMS_DIR = os.path.abspath(path)
+    JVM_OUT = os.path.join(OUT_DIR, "jvm", os.path.basename(os.path.dirname(PROGRAMS_DIR)))
+
+
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -199,6 +207,7 @@ def main():
                     help="the klio binary (default: zig-out/bin/klio-harness-fast)")
     ap.add_argument("--home", default=os.path.join(ROOT, ".klio-local"),
                     help="KLIO_HOME for the klio runs (default: .klio-local)")
+    ap.add_argument("--programs", help="the suite's program directory (default: bench/compose/programs)")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--only", help="comma-separated program names")
     ap.add_argument("--jit", choices=("on", "off", "both"), default="on",
@@ -212,6 +221,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=300)
     ap.add_argument("--out", help="results file (default: target/bench-compose/<time>.json)")
     a = ap.parse_args()
+    if a.programs:
+        use_programs(a.programs)
 
     names = programs()
     if a.only:

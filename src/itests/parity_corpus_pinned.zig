@@ -217,6 +217,22 @@ test "companion_init_reads_top_const" {
     );
 }
 
+test "companion_initializes_once" {
+    try check("companion_initializes_once",
+        \\start Counted.Companion | sum 499500 made 1
+        \\ExceptionInInitializerError: companion failed
+        \\NoClassDefFoundError: Could not initialize object Broken.Companion
+        \\NoClassDefFoundError: Could not initialize object Broken.Companion
+        \\SelfMaking.Companion(-1) | [1, 2, 3] -1
+        \\before Base.Companion mids Bottom.Companion
+        \\[10/1/100, 20/2/200, 30/3/300]
+        \\[1/1/2/b1, 2/2/3/b2, 3/3/4/b3]
+        \\-5997000
+        \\[e1, e2, e3, true]
+        \\
+    );
+}
+
 test "method_fn_ref_default_param" {
     try check("method_fn_ref_default_param",
         \\ANN!
@@ -2734,6 +2750,379 @@ test "map_keyed_ops" {
         \\40 associateTo 2 [A, B] 2 X
         \\40 remove 8 false true 42
         \\40 minusAssign 40 null null [100]
+        \\
+    );
+}
+
+test "numeric_conversion_ops" {
+    try check("numeric_conversion_ops",
+        \\L 0 0 0 0 0 0.0 0.0
+        \\L -1 -1 -1 -1 65535 -1.0 -1.0
+        \\L 2147483647 2147483647 -1 -1 65535 2.1474836E9 2.147483647E9
+        \\L 2147483648 -2147483648 0 0 0 2.1474836E9 2.147483648E9
+        \\L 4295032831 65535 -1 -1 65535 4.295033E9 4.295032831E9
+        \\L -9223372036854775808 0 0 0 0 -9.223372E18 -9.223372036854776E18
+        \\L 9223372036854775807 -1 -1 -1 65535 9.223372E18 9.223372036854776E18
+        \\I 0 0 0 0 0 0.0 0.0
+        \\I -1 -1 -1 -1 65535 -1.0 -1.0
+        \\I 127 127 127 127 127 127.0 127.0
+        \\I 128 128 128 -128 128 128.0 128.0
+        \\I 255 255 255 -1 255 255.0 255.0
+        \\I 256 256 256 0 256 256.0 256.0
+        \\I 32767 32767 32767 -1 32767 32767.0 32767.0
+        \\I 32768 32768 -32768 0 32768 32768.0 32768.0
+        \\I 65535 65535 -1 -1 65535 65535.0 65535.0
+        \\I 65536 65536 0 0 0 65536.0 65536.0
+        \\I -2147483648 -2147483648 0 0 0 -2.1474836E9 -2.147483648E9
+        \\I 2147483647 2147483647 -1 -1 65535 2.1474836E9 2.147483647E9
+        \\D 0.0 0 0 0.0
+        \\D -0.0 0 0 -0.0
+        \\D 1.9 1 1 1.9
+        \\D -1.9 -1 -1 -1.9
+        \\D 3.0E9 2147483647 3000000000 3.0E9
+        \\D -3.0E9 -2147483648 -3000000000 -3.0E9
+        \\D 1.0E19 2147483647 9223372036854775807 1.0E19
+        \\D -1.0E19 -2147483648 -9223372036854775808 -1.0E19
+        \\D NaN 0 0 NaN
+        \\D Infinity 2147483647 9223372036854775807 Infinity
+        \\D -Infinity -2147483648 -9223372036854775808 -Infinity
+        \\D 1.0E40 2147483647 9223372036854775807 Infinity
+        \\D 0.1 0 0 0.1
+        \\F 0.5 0 0 0.5
+        \\F -2.5 -2 -2 -2.5
+        \\F 3.0E9 2147483647 3000000000 3.0E9
+        \\F -3.0E9 -2147483648 -3000000000 -3.0E9
+        \\F 1.0E19 2147483647 9223372036854775807 9.999999980506448E18
+        \\F NaN 0 0 NaN
+        \\F -Infinity -2147483648 -9223372036854775808 -Infinity
+        \\B -3 -3 -3 -3.0 -3.0
+        \\S -300 -300 -44 -300.0
+        \\C 90 90 [
+        \\byte+byte 200 true
+        \\short*short 900000000 true
+        \\int+long 3000000007 true 2999999993 true
+        \\long/int 428571428 4 -428571428 -4
+        \\int*float 10.5 true
+        \\long+float 3.0E9
+        \\int+double 7.25 true
+        \\float+double 0.30000000149011613
+        \\byte*long 300000000000
+        \\acc 45
+        \\total 10.0
+        \\true true true true
+        \\true false -1
+        \\true true -1
+        \\false false -1 0
+        \\false 0 -1 1
+        \\<< 0 -20015998343868 >> -20015998343868 >>> -20015998343868
+        \\<< 1 -40031996687736 >> -10007999171934 >>> 9223362028855603874
+        \\<< 31 -3115450108355805184 >> -9321 >>> 8589925271
+        \\<< 32 -6230900216711610368 >> -4661 >>> 4294962635
+        \\<< 63 0 >> -1 >>> 1
+        \\<< 64 -20015998343868 >> -20015998343868 >>> -20015998343868
+        \\<< 65 -40031996687736 >> -10007999171934 >>> 9223362028855603874
+        \\<< -1 0 >> -1 >>> 1
+        \\int -9320 -2330 2147481318
+        \\
+    );
+}
+
+test "value_class_property_equality" {
+    try check("value_class_property_equality",
+        \\meters true false true false
+        \\ieee false true
+        \\ratio true false true
+        \\id true true
+        \\name true false
+        \\packed true false
+        \\wrap true true false
+        \\fun true true false true
+        \\any true false false
+        \\unsigned true true true
+        \\point true false false
+        \\pair true false
+        \\list true 0 2
+        \\hash true true
+        \\
+    );
+}
+
+test "numeric_bit_functions" {
+    try check("numeric_bit_functions",
+        \\F 1.0 1065353216 1065353216 1.0
+        \\F -0.0 -2147483648 -2147483648 -0.0
+        \\F NaN 2143289344 2143289344 NaN
+        \\F Infinity 2139095040 2139095040 Infinity
+        \\F 1.4E-45 1 1 1.4E-45
+        \\D 1.0 4607182418800017408 4607182418800017408 1.0
+        \\D -0.0 -9223372036854775808 -9223372036854775808 -0.0
+        \\D NaN 9221120237041090560 9221120237041090560 NaN
+        \\D -Infinity -4503599627370496 -4503599627370496 -Infinity
+        \\D 4.9E-324 1 1 4.9E-324
+        \\nan 2143289345 2143289344 9221120237041090560
+        \\fromBits -0.0 1.0 2.0
+        \\I 0 -1 32 0 0.0 0.0
+        \\I 1 -2 0 1 1.0 1.0
+        \\I 8 -9 3 8 8.0 8.0
+        \\I -1 0 0 -1 4.2949673E9 4.294967295E9
+        \\I -2147483648 2147483647 31 -2147483648 2.1474836E9 2.147483648E9
+        \\I 65536 -65537 16 65536 65536.0 65536.0
+        \\L 0 -1 64 0.0 0.0
+        \\L 1 -2 0 1.0 1.0
+        \\L -1 0 0 1.8446744E19 1.8446744073709552E19
+        \\L -9223372036854775808 9223372036854775807 63 9.223372E18 9.223372036854776E18
+        \\L 1099511627776 -1099511627777 40 1.0995116E12 1.099511627776E12
+        \\U 32 0 8 2 16
+        \\S 16 7 8
+        \\M 0.0 0.0 1.0 0.0
+        \\M -0.0 -0.0 1.0 -0.0
+        \\M 1.0 0.8414709848078965 0.5403023058681398 1.0
+        \\M 2.0 0.9092974268256817 -0.4161468365471424 1.4142135623730951
+        \\M 4.0 -0.7568024953079282 -0.6536436208636119 2.0
+        \\M NaN NaN NaN NaN
+        \\M Infinity NaN NaN Infinity
+        \\M -1.0 -0.8414709848078965 0.5403023058681398 NaN
+        \\MF 0.0 0.0 1.0 0.0
+        \\MF -0.0 -0.0 1.0 -0.0
+        \\MF 1.0 0.84147096 0.5403023 1.0
+        \\MF 9.0 0.4121185 -0.91113025 3.0
+        \\MF NaN NaN NaN NaN
+        \\MF -4.0 0.7568025 -0.6536436 NaN
+        \\
+    );
+}
+
+test "unsigned_bit_operations" {
+    try check("unsigned_bit_operations",
+        \\UL 0 0 0 0 1 18446744073709551615 18446744073709551615
+        \\   1 18446744073709551615 0 0 0 0 0 0.0
+        \\UL 1 16 0 1 1 18446744073709551614 18446744073709551614
+        \\   2 0 3 1 1 1 1 1.0
+        \\UL 9223372036854775808 0 8 0 9223372036854775809 9223372036854775807 9223372036854775807
+        \\   9223372036854775809 9223372036854775807 9223372036854775808 -9223372036854775808 0 0 0 9.223372036854776E18
+        \\UL 18446744073709551615 18446744073709551600 15 255 18446744073709551615 0 0
+        \\   0 18446744073709551614 18446744073709551613 -1 -1 4294967295 255 1.8446744073709552E19
+        \\UL 18374686479671623935 17293822569102708720 15 255 18374686479671623935 72057594037927680 72057594037927680
+        \\   18374686479671623936 18374686479671623934 18230571291595768573 -72057594037927681 255 255 255 1.8374686479671624E19
+        \\chain 4484958772476917249 640708396068131035 4 true -1
+        \\UI 0 0 0 0 4294967295 1 4294967295 0 0 0 0
+        \\UI 1 8 0 0 4294967294 2 0 1 1 1 1
+        \\UI 2147483648 0 1 0 2147483647 2147483649 2147483647 -2147483648 2147483648 2147483648 0
+        \\UI 4294967295 4294967288 1 240 0 0 4294967294 -1 4294967295 4294967295 65535
+        \\UI 65535 524280 0 240 4294901760 65536 65534 65535 65535 65535 65535
+        \\from int 4294967295 2147483648 18446744073709551615 18446744073709551615
+        \\S 0 0 0 255 0 0 0 1 0
+        \\S 1 1 1 254 1 1 1 2 16
+        \\S 127 127 127 128 15 127 127 128 2032
+        \\S 128 128 128 127 0 128 128 129 2048
+        \\S 255 255 255 0 15 255 255 256 4080
+        \\S 256 0 0 255 0 256 256 257 0
+        \\S -1 255 255 0 15 65535 65535 65536 4080
+        \\packed 18389154510799896576 255 51 102 153 4281558681
+        \\
+    );
+}
+
+test "constant_operands" {
+    try check("constant_operands",
+        \\int 0: 0 0 0 0 5 -1 256 0 0 0 0
+        \\  true true true true true true false 3
+        \\  zero small even
+        \\int 1: 1 8 0 0 36 -2 257 0 1 -1 0
+        \\  false true true true true true false 2
+        \\  nonzero small odd
+        \\int 7: 7 56 0 0 222 -8 263 2 2 -7 0
+        \\  false false true true true true true -4
+        \\  nonzero small odd
+        \\int -3: 253 -24 15 -1 -88 2 -3 -1 -3 3 0
+        \\  false true true true true true false 6
+        \\  nonzero small odd
+        \\int 255: 255 2040 0 15 7910 -256 511 85 0 -255 0
+        \\  false true false false true true false -252
+        \\  nonzero big odd
+        \\int 256: 0 2048 0 16 7941 -257 256 85 1 -256 0
+        \\  false true false false true true false -253
+        \\  nonzero big even
+        \\int 1000: 232 8000 0 62 31005 -1001 1000 333 0 -1000 0
+        \\  false true false false true true false -997
+        \\  nonzero big even
+        \\int 2147483647: 255 -8 7 134217727 2147483622 -2147483648 2147483647 715827882 2 -2147483647 0
+        \\  false true false false true true false -2147483644
+        \\  nonzero big odd
+        \\int -2147483648: 0 0 8 -134217728 -2147483643 2147483647 -2147483392 -715827882 -3 -2147483648 0
+        \\  false true true true false false false -2147483645
+        \\  nonzero small even
+        \\long 0: 0 0 0 0 0 -9223372036854775808 0 0
+        \\  true false true 0 0
+        \\  not max
+        \\long 1: 1 8589934592 0 0 1000000007 -9223372036854775807 0 1
+        \\  false false true 8 0
+        \\  not max
+        \\long -1: 65535 -8589934592 15 -1 -1000000007 9223372036854775807 0 -1
+        \\  false false false -8 2305843009213693951
+        \\  not max
+        \\long 2199023255552: 0 0 0 1099511627776 3860726173726146560 -9223369837831520256 314146179364 4
+        \\  false true true 17592186044416 274877906944
+        \\  not max
+        \\long 9223372036854775807: 65535 -8589934592 7 4611686018427387903 9223372035854775801 -1 1317624576693539401 0
+        \\  false true true -8 1152921504606846975
+        \\  max
+        \\long -9223372036854775808: 0 0 8 -4611686018427387904 -9223372036854775808 0 -1317624576693539401 -1
+        \\  false false false 0 1152921504606846976
+        \\  not max
+        \\float 0.0: 0.0 0.5 0.5 0.0 -1.0 0.0 true true true
+        \\double 0.0: 0.0 0.25 NaN true false false false
+        \\  not positive
+        \\float -0.0: -0.0 0.5 0.5 -0.0 -1.0 -0.0 true true true
+        \\double -0.0: -0.0 0.25 NaN true false false false
+        \\  not positive
+        \\float 1.0: 2.0 1.5 1.5 0.25 0.0 1.0 false false false
+        \\double 1.0: 2.0 1.25 Infinity false true false false
+        \\  positive
+        \\float -2.5: -5.0 -2.0 -2.0 -0.625 -3.5 -2.5 false true true
+        \\double -2.5: -5.0 -2.25 -Infinity false true false false
+        \\  not positive
+        \\float NaN: NaN NaN NaN NaN NaN NaN false false false
+        \\double NaN: NaN NaN NaN false true false false
+        \\  not positive
+        \\float Infinity: Infinity Infinity Infinity Infinity Infinity NaN false false false
+        \\double Infinity: Infinity Infinity Infinity false true true true
+        \\  positive
+        \\unsigned 0 1: true true false false
+        \\  not max
+        \\unsigned 18446744073709551615 4294967295: false false true true
+        \\  max
+        \\mixed: -127 60000 0 B 1 true false
+        \\mixed: 128 -2 15 { 58 false true
+        \\int: / by zero
+        \\long: / by zero
+        \\sum 8745
+        \\
+    );
+}
+
+test "virtual_call_sites" {
+    try check("virtual_call_sites",
+        \\one class: [1, 4, 9, 16, 25]
+        \\two classes: [0, 2, 4, 6, 16, 10, 36, 14] [4, 4, 4, 4, 4, 4, 4, 4]
+        \\many classes: [9, 10, 6, 6, 12, 1, 3, 2] [4, 4, 3, 3, 0, 4, 0, 3]
+        \\square with 4 sides, area 9
+        \\rect with 4 sides, area 10
+        \\tri with 3 sides, area 6
+        \\tri with 3 sides, area 6
+        \\round circle, area 12
+        \\square with 4 sides, area 1
+        \\round circle, area 3
+        \\tri with 3 sides, area 2
+        \\total 210
+        \\tree sums: [1, 3, 10, 36, 136, 528, 2080]
+        \\lengths: [4, 4, 4, 4, 1]
+        \\firsts: [k, T, c, S, x]
+        \\strings: [klio, TAIL, call, SITE, x]
+        \\list sites: 204 [3, 2, 4, 3, 1] [2, 5, 4, 8, 10]
+        \\collections: [2, 1, 3, 4]
+        \\texts: [1, two, 3, 4.5, c, true, [0, 2], [1]]
+        \\hashes: [1, 115276, 3, 1074921472, 99, 1231]
+        \\
+    );
+}
+
+test "value_class_members" {
+    try check("value_class_members",
+        \\[11px, 10px, 11px, 10px, 10px, 10px, 4px, 0px, 4px]
+        \\101px 42px
+        \\6px 5px 3px
+        \\6px 11px 4px
+        \\14px 0px 3px
+        \\42px
+        \\16px
+        \\[0px, 6px, 10px] 10px [10px, 6px, 0px]
+        \\total: 16px, angle: 1.5707964
+        \\null null 45.0
+        \\8 16px 90.0 1.5707964
+        \\[px 1, angle 2.0, other]
+        \\true 9px [1px, 2px]
+        \\[1px, 2px] 2
+        \\{a=5px, b=6px}
+        \\before
+        \\Tagged companion ready
+        \\after 3 1
+        \\
+    );
+}
+
+test "value_class_flows" {
+    try check("value_class_flows",
+        \\3.5m
+        \\sum 3.5m times 4.5m half 1.0m Meters(1.5)
+        \\false true -1 true
+        \\[1.5m, 2.0m, 0.25m] [0.25m, 1.5m, 2.0m] 2.0m [1.5, 2.0, 0.25]
+        \\1.5m 1.5m 1.5m
+        \\1.5m:true:1073217536 Id(raw=7):false:7 none 2.0m
+        \\3.5
+        \\1.5m 1.0m null -1.0m 1.5m
+        \\0.5m Id(raw=1) other 3.0m 2.0m
+        \\3.0m 3.0m
+        \\3.5m 3.5m 1 2
+        \\-3,4
+        \\Box(w=1.5m, id=Id(raw=3), tags=[1.5m, 2.0m, 0.25m])
+        \\Box(w=2.0m, id=Id(raw=3), tags=[1.5m, 2.0m, 0.25m])
+        \\1.5m Id(raw=3) 3 true
+        \\a null 2
+        \\[4.0, 9.0] true
+        \\smart 1.5 3.5m
+        \\nonnull 1.0
+        \\0.5m
+        \\3.75m
+        \\6.75m
+        \\negative id -1
+        \\Id(raw=0) 5
+        \\2.0m
+        \\[9.0m, 2.0m]
+        \\3.5m 1.5
+        \\3.5m
+        \\15.0 1.0m Meters
+        \\-1
+        \\[true, false]
+        \\true false true
+        \\[1.5m, 4.0m]
+        \\3.0m null
+        \\
+    );
+}
+
+test "wide_frames" {
+    try check("wide_frames",
+        \\wide: [3349156554369338289, -1042370196751942829, 3125300851712839122, -1076956639056340671, 787743997148866197]
+        \\guarded 0: 64 caught stage 1 at 1 a=95 finally b=221 stage=1 d=195
+        \\guarded 1: 144 128 finally b=50 stage=2 d=79
+        \\guarded 2: 185 221 finally b=13 stage=2 d=187
+        \\guarded 3: 233 caught stage 1 at 1 a=250 finally b=230 stage=1 d=99
+        \\guarded 4: 236 246 finally b=60 stage=2 d=55
+        \\Box(1226612418, -3312304032, b2, 0.0)
+        \\Box(134786273, 4656866306, b28, 0.0)
+        \\Box(-1359819798, 1344562274, first:6;second:7;, 0.0)
+        \\copies: 4>0 0>9 4>12 12>7 keep=196 cur=199
+        \\sequence: [21694, 45648, 17596, 45649, 53102, 45650, 554]
+        \\depth: [0, 1039949, 516962, 579717, 581514, 138820, 791700]
+        \\
+    );
+}
+
+test "null_and_identity_tests" {
+    try check("null_and_identity_tests",
+        \\length 6 0 5
+        \\identity false true true false
+        \\null false true false
+        \\describe [null, value, value, unit, value, value, value]
+        \\nullness [true, false, false, false, false, false, false] [false, true, true, true, true, true, true]
+        \\captured true true
+        \\captured false true now
+        \\captured true
+        \\negated true false false
+        \\not below true true false
+        \\data true false false true
+        \\strings true false
         \\
     );
 }

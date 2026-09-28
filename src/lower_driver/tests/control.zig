@@ -84,6 +84,7 @@ const prim_base =
     \\    public fun inv(): Int
     \\    public fun toInt(): Int
     \\    public fun toLong(): Long
+    \\    public fun toChar(): Char
     \\    public override fun equals(other: Any?): Boolean
     \\    public override fun toString(): String
     \\}
@@ -92,12 +93,14 @@ const prim_base =
     \\    public operator fun plus(other: Long): Long
     \\    public infix fun shr(bitCount: Int): Long
     \\    public fun toLong(): Long
+    \\    public fun toFloat(): Float
     \\}
     \\public class Short : Number(), Comparable<Short> {
     \\    public override operator fun compareTo(other: Short): Int
     \\    public operator fun plus(other: Short): Int
     \\    public operator fun unaryPlus(): Int
     \\    public operator fun unaryMinus(): Int
+    \\    public fun toByte(): Byte
     \\}
     \\public class Byte : Number(), Comparable<Byte> {
     \\    public override operator fun compareTo(other: Byte): Int
@@ -108,6 +111,7 @@ const prim_base =
     \\    public operator fun plus(other: Double): Double
     \\    public operator fun rem(other: Double): Double
     \\    public operator fun unaryMinus(): Double
+    \\    public fun toInt(): Int
     \\    public override fun equals(other: Any?): Boolean
     \\}
     \\public class Float : Number(), Comparable<Float> {
@@ -213,18 +217,18 @@ fn expectOp(want: ?PrimOp, got: ?PrimOp) !void {
 test "the primitive table binds arithmetic in every numeric type, mixed widths included" {
     var f = try Fixture.init();
     defer f.deinit();
-    try expectOp(.{ .bin = .Add }, try f.op("kotlin.Int", "plus", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .Add }, try f.op("kotlin.Int", "plus", &.{"kotlin.Long"}));
-    try expectOp(.{ .bin = .Add }, try f.op("kotlin.Int", "plus", &.{"kotlin.Double"}));
-    try expectOp(.{ .bin = .Sub }, try f.op("kotlin.Int", "minus", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .Mul }, try f.op("kotlin.Int", "times", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .Div }, try f.op("kotlin.Int", "div", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .Mod }, try f.op("kotlin.Int", "rem", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .Add }, try f.op("kotlin.Long", "plus", &.{"kotlin.Long"}));
-    try expectOp(.{ .bin = .Add }, try f.op("kotlin.Short", "plus", &.{"kotlin.Short"}));
-    try expectOp(.{ .bin = .Add }, try f.op("kotlin.Double", "plus", &.{"kotlin.Double"}));
-    try expectOp(.{ .bin = .Mod }, try f.op("kotlin.Double", "rem", &.{"kotlin.Double"}));
-    try expectOp(.{ .bin = .Div }, try f.op("kotlin.Float", "div", &.{"kotlin.Float"}));
+    try expectOp(.{ .bin = .{ .op = .Add } }, try f.op("kotlin.Int", "plus", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Add, .widen = .{ .lhs = .ToLong } } }, try f.op("kotlin.Int", "plus", &.{"kotlin.Long"}));
+    try expectOp(.{ .bin = .{ .op = .Add, .widen = .{ .lhs = .ToDouble } } }, try f.op("kotlin.Int", "plus", &.{"kotlin.Double"}));
+    try expectOp(.{ .bin = .{ .op = .Sub } }, try f.op("kotlin.Int", "minus", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Mul } }, try f.op("kotlin.Int", "times", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Div } }, try f.op("kotlin.Int", "div", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Mod } }, try f.op("kotlin.Int", "rem", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Add } }, try f.op("kotlin.Long", "plus", &.{"kotlin.Long"}));
+    try expectOp(.{ .bin = .{ .op = .Add, .widen = .{ .lhs = .ToInt, .rhs = .ToInt } } }, try f.op("kotlin.Short", "plus", &.{"kotlin.Short"}));
+    try expectOp(.{ .bin = .{ .op = .Add } }, try f.op("kotlin.Double", "plus", &.{"kotlin.Double"}));
+    try expectOp(.{ .bin = .{ .op = .Mod } }, try f.op("kotlin.Double", "rem", &.{"kotlin.Double"}));
+    try expectOp(.{ .bin = .{ .op = .Div } }, try f.op("kotlin.Float", "div", &.{"kotlin.Float"}));
 }
 
 test "the primitive table binds unary operators, and leaves widening ones alone" {
@@ -245,14 +249,14 @@ test "the primitive table binds unary operators, and leaves widening ones alone"
 test "the primitive table binds compareTo by operand family" {
     var f = try Fixture.init();
     defer f.deinit();
-    try expectOp(.{ .compare = .integral }, try f.op("kotlin.Int", "compareTo", &.{"kotlin.Int"}));
-    try expectOp(.{ .compare = .integral }, try f.op("kotlin.Int", "compareTo", &.{"kotlin.Long"}));
-    try expectOp(.{ .compare = .floating }, try f.op("kotlin.Int", "compareTo", &.{"kotlin.Double"}));
-    try expectOp(.{ .compare = .floating }, try f.op("kotlin.Double", "compareTo", &.{"kotlin.Double"}));
-    try expectOp(.{ .compare = .floating }, try f.op("kotlin.Double", "compareTo", &.{"kotlin.Int"}));
-    try expectOp(.{ .compare = .floating }, try f.op("kotlin.Float", "compareTo", &.{"kotlin.Float"}));
-    try expectOp(.{ .compare = .integral }, try f.op("kotlin.Char", "compareTo", &.{"kotlin.Char"}));
-    try expectOp(.{ .compare = .integral }, try f.op("kotlin.Boolean", "compareTo", &.{"kotlin.Boolean"}));
+    try expectOp(.{ .compare = .{ .kind = .integral } }, try f.op("kotlin.Int", "compareTo", &.{"kotlin.Int"}));
+    try expectOp(.{ .compare = .{ .kind = .integral, .widen = .{ .lhs = .ToLong } } }, try f.op("kotlin.Int", "compareTo", &.{"kotlin.Long"}));
+    try expectOp(.{ .compare = .{ .kind = .floating, .widen = .{ .lhs = .ToDouble } } }, try f.op("kotlin.Int", "compareTo", &.{"kotlin.Double"}));
+    try expectOp(.{ .compare = .{ .kind = .floating } }, try f.op("kotlin.Double", "compareTo", &.{"kotlin.Double"}));
+    try expectOp(.{ .compare = .{ .kind = .floating, .widen = .{ .rhs = .ToDouble } } }, try f.op("kotlin.Double", "compareTo", &.{"kotlin.Int"}));
+    try expectOp(.{ .compare = .{ .kind = .floating } }, try f.op("kotlin.Float", "compareTo", &.{"kotlin.Float"}));
+    try expectOp(.{ .compare = .{ .kind = .integral, .widen = .{ .lhs = .ToInt, .rhs = .ToInt } } }, try f.op("kotlin.Char", "compareTo", &.{"kotlin.Char"}));
+    try expectOp(.{ .compare = .{ .kind = .integral } }, try f.op("kotlin.Boolean", "compareTo", &.{"kotlin.Boolean"}));
     // `String.compareTo` answers the difference at the first unequal
     // character: its declaration's native computes it.
     try expectOp(null, try f.op("kotlin.String", "compareTo", &.{"kotlin.String"}));
@@ -261,10 +265,10 @@ test "the primitive table binds compareTo by operand family" {
 test "the primitive table binds equals as boxed equality" {
     var f = try Fixture.init();
     defer f.deinit();
-    try expectOp(.{ .bin = .BoxedEq }, try f.op("kotlin.Int", "equals", &.{"kotlin.Any"}));
-    try expectOp(.{ .bin = .BoxedEq }, try f.op("kotlin.Double", "equals", &.{"kotlin.Any"}));
-    try expectOp(.{ .bin = .BoxedEq }, try f.op("kotlin.Boolean", "equals", &.{"kotlin.Any"}));
-    try expectOp(.{ .bin = .BoxedEq }, try f.op("kotlin.String", "equals", &.{"kotlin.Any"}));
+    try expectOp(.{ .bin = .{ .op = .BoxedEq } }, try f.op("kotlin.Int", "equals", &.{"kotlin.Any"}));
+    try expectOp(.{ .bin = .{ .op = .BoxedEq } }, try f.op("kotlin.Double", "equals", &.{"kotlin.Any"}));
+    try expectOp(.{ .bin = .{ .op = .BoxedEq } }, try f.op("kotlin.Boolean", "equals", &.{"kotlin.Any"}));
+    try expectOp(.{ .bin = .{ .op = .BoxedEq } }, try f.op("kotlin.String", "equals", &.{"kotlin.Any"}));
     // `Any.equals` is identity, served by its own body.
     try expectOp(null, try f.op("kotlin.Any", "equals", &.{"kotlin.Any"}));
 }
@@ -272,16 +276,16 @@ test "the primitive table binds equals as boxed equality" {
 test "the primitive table binds Char arithmetic, bitwise operations and element access" {
     var f = try Fixture.init();
     defer f.deinit();
-    try expectOp(.{ .bin = .Add }, try f.op("kotlin.Char", "plus", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .Sub }, try f.op("kotlin.Char", "minus", &.{"kotlin.Char"}));
-    try expectOp(.{ .bin = .Sub }, try f.op("kotlin.Char", "minus", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .And }, try f.op("kotlin.Boolean", "and", &.{"kotlin.Boolean"}));
-    try expectOp(.{ .bin = .Or }, try f.op("kotlin.Boolean", "or", &.{"kotlin.Boolean"}));
-    try expectOp(.{ .bin = .Xor }, try f.op("kotlin.Boolean", "xor", &.{"kotlin.Boolean"}));
-    try expectOp(.{ .bin = .And }, try f.op("kotlin.Int", "and", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .Shl }, try f.op("kotlin.Int", "shl", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .UShr }, try f.op("kotlin.Int", "ushr", &.{"kotlin.Int"}));
-    try expectOp(.{ .bin = .Shr }, try f.op("kotlin.Long", "shr", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Add } }, try f.op("kotlin.Char", "plus", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Sub } }, try f.op("kotlin.Char", "minus", &.{"kotlin.Char"}));
+    try expectOp(.{ .bin = .{ .op = .Sub } }, try f.op("kotlin.Char", "minus", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .And } }, try f.op("kotlin.Boolean", "and", &.{"kotlin.Boolean"}));
+    try expectOp(.{ .bin = .{ .op = .Or } }, try f.op("kotlin.Boolean", "or", &.{"kotlin.Boolean"}));
+    try expectOp(.{ .bin = .{ .op = .Xor } }, try f.op("kotlin.Boolean", "xor", &.{"kotlin.Boolean"}));
+    try expectOp(.{ .bin = .{ .op = .And } }, try f.op("kotlin.Int", "and", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Shl } }, try f.op("kotlin.Int", "shl", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .UShr } }, try f.op("kotlin.Int", "ushr", &.{"kotlin.Int"}));
+    try expectOp(.{ .bin = .{ .op = .Shr, .widen = .{ .rhs = .ToLong } } }, try f.op("kotlin.Long", "shr", &.{"kotlin.Int"}));
     try expectOp(.array_get, try f.op("kotlin.String", "get", &.{"kotlin.Int"}));
     try expectOp(.array_get, try f.op("kotlin.Array", "get", &.{"kotlin.Int"}));
     try expectOp(.array_set, f.table.get(try f.memberOfArity("kotlin.Array", "set", 2)));
@@ -289,16 +293,19 @@ test "the primitive table binds Char arithmetic, bitwise operations and element 
     try expectOp(.array_set, try f.op("kotlin.IntArray", "set", &.{ "kotlin.Int", "kotlin.Int" }));
 }
 
-test "the primitive table leaves conversions, ranges and rendering to their declarations" {
+test "the primitive table binds conversions, and leaves ranges and rendering to their declarations" {
     var f = try Fixture.init();
     defer f.deinit();
     try expectOp(.identity, try f.op("kotlin.Int", "toInt", &.{}));
     try expectOp(.identity, try f.op("kotlin.Long", "toLong", &.{}));
-    try expectOp(null, try f.op("kotlin.Int", "toLong", &.{}));
-    try expectOp(null, try f.op("kotlin.Char", "toInt", &.{}));
+    try expectOp(.{ .un = .ToLong }, try f.op("kotlin.Int", "toLong", &.{}));
+    try expectOp(.{ .un = .ToInt }, try f.op("kotlin.Double", "toInt", &.{}));
+    try expectOp(.{ .un = .ToFloat }, try f.op("kotlin.Long", "toFloat", &.{}));
+    try expectOp(.{ .un = .ToByte }, try f.op("kotlin.Short", "toByte", &.{}));
+    try expectOp(.{ .un = .ToChar }, try f.op("kotlin.Int", "toChar", &.{}));
     try expectOp(null, try f.op("kotlin.Int", "rangeTo", &.{"kotlin.Int"}));
     try expectOp(null, try f.op("kotlin.Char", "rangeTo", &.{"kotlin.Char"}));
-    try expectOp(null, try f.op("kotlin.Int", "inv", &.{}));
+    try expectOp(.{ .un = .Inv }, try f.op("kotlin.Int", "inv", &.{}));
     try expectOp(null, try f.op("kotlin.Int", "toString", &.{}));
     try expectOp(null, try f.op("kotlin.String", "plus", &.{"kotlin.Any"}));
 }

@@ -151,8 +151,7 @@ test "a statement over vars writes its result into the var it assigns" {
         \\  Const r13
         \\b1:
         \\  Const r3
-        \\  BinOp r4 = r1 IdentEq r3
-        \\  Not
+        \\  BinOp r5 = r1 IdentNeq r3
         \\b2:
         \\  CallStatic r7 = (r2..1)
         \\  GetFieldSlot r8 = r1.#0
@@ -407,9 +406,9 @@ test "an inline function's copy reads its parameters from the caller's registers
         \\b0:
         \\  LoadParam r0 = 0
         \\  Const r4
+        \\  Move r3 = r0
         \\b1:
         \\b2:
-        \\  Move r3 = r0
         \\b3:
         \\  Const r2
         \\  Move r3 = r4
@@ -447,4 +446,125 @@ test "a receiver and index read again by a second call keep their registers" {
         \\22
         \\
     );
+}
+
+test "a conversion is one UnOp and a mixed operation widens its narrower operand" {
+    var fx = try Fx.init(
+        \\fun mix(i: Int, l: Long, d: Double, b: Byte): Long {
+        \\    val a = l + i
+        \\    val c = i.toLong() * l
+        \\    val e = (d * i).toInt()
+        \\    val f = b + b
+        \\    return a + c + e + f + (l shl i)
+        \\}
+    );
+    defer fx.deinit();
+    const f = try fx.body("mix");
+    const text = try listing(fx.arena.allocator(), f);
+    // No conversion is a call, and each operation's operands are of one
+    // type: `l + i` widens `i`, `(d * i).toInt()` converts the product.
+    try testing.expectEqual(@as(usize, 0), count(f, .CallNative) + count(f, .CallStatic));
+    try testing.expect(std.mem.find(u8, text, "UnOp r3 = ToLong r1\n  BinOp r2 = r0 Add r3\n") != null);
+    try testing.expect(std.mem.find(u8, text, "UnOp r5 = ToLong r1\n  BinOp r6 = r5 Mul r0\n") != null);
+    try testing.expect(std.mem.find(u8, text, "UnOp r9 = ToDouble r1\n  BinOp r10 = r7 Mul r9\n  UnOp r11 = ToInt r10\n") != null);
+    // A Byte operation is an Int one, and a Long shift's count a Long.
+    try testing.expect(std.mem.find(u8, text, "UnOp r14 = ToInt r12\n  UnOp r15 = ToInt r12\n  BinOp r13 = r14 Add r15\n") != null);
+    try testing.expect(std.mem.find(u8, text, "UnOp r24 = ToLong r1\n  BinOp r23 = r0 Shl r24\n") != null);
+}
+
+test "a conversion of a constant is the converted constant" {
+    var fx = try Fx.init(
+        \\fun scale(l: Long, d: Double): Double {
+        \\    val k = 3
+        \\    return (l * 31 + k).toDouble() * d + k
+        \\}
+    );
+    defer fx.deinit();
+    const f = try fx.body("scale");
+    const text = try listing(fx.arena.allocator(), f);
+    // `31` and `k` widen to `Long` and `k` to `Double` as constants, and
+    // `k`'s own constant goes: only the sum's conversion runs.
+    const body = text[0 .. std.mem.find(u8, text, "b1:") orelse text.len];
+    try testing.expect(std.mem.find(u8, body, "= ToLong") == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "= ToDouble"));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "Const r"));
+}
+
+test "a negated equality or identity test is the negated test, and an ordering keeps its !" {
+    var fx = try Fx.init(
+        \\class Node(val next: Node?)
+        \\fun count(n: Node?): Int {
+        \\    var c = 0
+        \\    var p = n
+        \\    while (p != null) { c++; p = p.next }
+        \\    return c
+        \\}
+        \\fun differs(a: Int, b: Int): Boolean = !(a == b)
+        \\fun notBelow(a: Double, b: Double): Boolean = !(a < b)
+    );
+    defer fx.deinit();
+    // `p != null` is one `!==` test, which the loop's branch then reads.
+    const f = try fx.body("count");
+    try testing.expectEqual(@as(usize, 0), count(f, .Not));
+    try testing.expect(std.mem.find(u8, try listing(fx.arena.allocator(), f), "IdentNeq") != null);
+    const g = try fx.body("differs");
+    try testing.expectEqual(@as(usize, 0), count(g, .Not));
+    try testing.expect(std.mem.find(u8, try listing(fx.arena.allocator(), g), "NotEq") != null);
+    // `!(a < b)` is not `a >= b` for NaN: the `!` stays.
+    const h = try fx.body("notBelow");
+    try testing.expectEqual(@as(usize, 1), count(h, .Not));
+}
+
+test "== between values of one value class compares their property in place" {
+    var fx = try Fx.init(
+        \\value class Meters(val v: Double)
+        \\data class P(val x: Double, val n: Int)
+        \\fun same(a: Meters, b: Meters): Boolean = a == b
+        \\fun maybe(a: Meters?, b: Meters): Boolean = a == b
+    );
+    defer fx.deinit();
+    const f = try fx.body("same");
+    const text = try listing(fx.arena.allocator(), f);
+    // The number each holds, then one boxed comparison: no `equals` call
+    // and no field load.
+    try testing.expectEqual(@as(usize, 0), count(f, .RCallVirtual) + count(f, .CallStatic));
+    try testing.expectEqual(@as(usize, 0), count(f, .GetFieldSlot));
+    try testing.expectEqual(@as(usize, 2), count(f, .UnboxValue));
+    try testing.expect(std.mem.find(u8, text, "BoxedEq") != null);
+    // A nullable side keeps the call, behind its null test.
+    const g = try fx.body("maybe");
+    try testing.expect(count(g, .RCallVirtual) + count(g, .CallStatic) != 0);
+}
+
+test "a native that computes a number of one value is one UnOp" {
+    var fx = try Fx.init(
+        \\fun f(x: Double, b: Int, l: Long): Long =
+        \\    (kotlin.math.sin(x) + kotlin.math.cos(x)).toLong() + l.inv() + b.inv() + b.hashCode()
+    );
+    defer fx.deinit();
+    const f = try fx.body("f");
+    const text = try listing(fx.arena.allocator(), f);
+    // `sin` and `cos` by the native they are bound to, `inv` and
+    // `Int.hashCode` as members of the primitive classes.
+    try testing.expectEqual(@as(usize, 0), count(f, .CallNative) + count(f, .CallStatic));
+    for ([_][]const u8{ "= Sin r", "= Cos r", "= Inv r" }) |op| {
+        try testing.expect(std.mem.find(u8, text, op) != null);
+    }
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "= Inv r"));
+}
+
+test "== between two values of one unsigned type compares their bits" {
+    var fx = try Fx.init(
+        \\fun eq(a: ULong, b: ULong): Boolean = a == b
+        \\fun ne(a: UInt, b: UInt): Boolean = a != b
+    );
+    defer fx.deinit();
+    // `!=` is the negated comparison, with no `!` after it.
+    for ([_][2][]const u8{ .{ "eq", "BoxedEq" }, .{ "ne", "BoxedNotEq" } }) |case| {
+        const f = try fx.body(case[0]);
+        const text = try listing(fx.arena.allocator(), f);
+        try testing.expectEqual(@as(usize, 0), count(f, .RCallVirtual) + count(f, .CallStatic));
+        try testing.expect(std.mem.find(u8, text, case[1]) != null);
+        try testing.expectEqual(@as(usize, 0), count(f, .Not));
+    }
 }

@@ -18,6 +18,7 @@ const ir = @import("../../ir.zig");
 const bridge = @import("../../core/bridge.zig");
 const builder = @import("builder.zig");
 const records = @import("records.zig");
+const coerce = @import("coerce.zig");
 const call = @import("call.zig");
 const locals = @import("locals.zig");
 
@@ -425,6 +426,16 @@ fn known(b: *Builder, key: u64) Error!?Reg {
         .param => |i| .{ .LoadParam = .{ .dst = dst, .idx = i } },
         .capture => |i| .{ .LoadCapture = .{ .dst = dst, .idx = i } },
     });
+    // A scalar class's `this` is its number; a call dispatch made on a box
+    // passes the box.
+    const cls = b.env.this_class;
+    if (cls != .none and key == recvKey(thisKind(b.p.s, cls), cls)) if (try coerce.scalarClass(b, cls)) |sc| {
+        const number = b.newReg();
+        try b.emitEntry(.{ .UnboxValue = .{ .dst = number, .src = dst, .class = sc.class, .slot = sc.slot } });
+        try b.unboxed.put(b.p.a, number, sc.class);
+        try b.env.loaded.put(b.p.a, key, number);
+        return number;
+    };
     try b.env.loaded.put(b.p.a, key, dst);
     return dst;
 }

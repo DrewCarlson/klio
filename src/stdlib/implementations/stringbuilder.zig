@@ -674,9 +674,15 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (try appendOverflowGuard(ctx, sb, &v)) |oom| return oom;
         const piece = try renderPiece(ctx, v);
         defer a.free(piece);
-        const g = sbMut(sb);
+        // The memo follows the append, so reading the length after each
+        // one stays O(1).
+        const g = sb.borrowMut();
         defer g.deinit();
-        try g.get().appendSlice(a, piece);
+        const buf = g.get();
+        const before_ptr = buf.items.ptr;
+        const before_len = buf.items.len;
+        try buf.appendSlice(a, piece);
+        runtime.sbMemoAppended(@intFromPtr(sb.cell), before_ptr, before_len, buf.items, piece);
     }
     return okSb(sb);
 }
@@ -1662,4 +1668,42 @@ test "non-receiver argument is a type error" {
     const r = try string_builder_length(&c);
     try testing.expect(r == .err);
     try testing.expect(r.err == .Type);
+}
+
+test "the length read after each append follows the appends and any other change" {
+    const a = testing.allocator;
+    var tc = TestCtx.init(a);
+    defer tc.deinit();
+    const sb = try newSb(a, "a");
+    defer freeSb(sb, a);
+    const Len = struct {
+        fn of(t: *TestCtx, al: Allocator, s: Value) !i32 {
+            var args = [_]Value{s};
+            var c = t.ctx(al, &args);
+            return (try string_builder_length(&c)).ok.Int;
+        }
+        fn append(t: *TestCtx, al: Allocator, s: Value, v: Value) !void {
+            var args = [_]Value{ s, v };
+            var c = t.ctx(al, &args);
+            const r = try string_builder_append(&c);
+            freeSb(r.ok, al);
+        }
+    };
+    try testing.expectEqual(@as(i32, 1), try Len.of(&tc, a, sb));
+    try Len.append(&tc, a, sb, .{ .Int = 42 });
+    try testing.expectEqual(@as(i32, 3), try Len.of(&tc, a, sb));
+    // A character outside ASCII is one unit; each half of a surrogate pair is one.
+    try Len.append(&tc, a, sb, .{ .Char = 0xE9 });
+    try testing.expectEqual(@as(i32, 4), try Len.of(&tc, a, sb));
+    try Len.append(&tc, a, sb, .{ .Char = 0xD83D });
+    try Len.append(&tc, a, sb, .{ .Char = 0xDE00 });
+    try testing.expectEqual(@as(i32, 6), try Len.of(&tc, a, sb));
+    // A change other than an append is counted afresh.
+    var args = [_]Value{ sb, .{ .Int = 2 } };
+    var c = tc.ctx(a, &args);
+    const r = try string_builder_set_length(&c);
+    try testing.expect(r == .ok);
+    try testing.expectEqual(@as(i32, 2), try Len.of(&tc, a, sb));
+    try Len.append(&tc, a, sb, .{ .Char = 'z' });
+    try testing.expectEqual(@as(i32, 3), try Len.of(&tc, a, sb));
 }

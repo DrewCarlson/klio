@@ -43,6 +43,8 @@ pub const snapshot_fast = @import("snapshot_fast.zig");
 pub const bridge = @import("core/bridge.zig");
 pub const resolved = @import("core/resolved.zig");
 pub const Resolved = resolved.Resolved;
+/// Register liveness, and the renumbering that lets registers share.
+pub const regs = @import("core/regs.zig");
 /// Lowering from sema's records.
 pub const lower_sema = @import("lower/sema/mod.zig");
 
@@ -144,6 +146,7 @@ test {
     testing.refAllDecls(@import("core/inst.zig"));
     testing.refAllDecls(@import("core/module_props.zig"));
     testing.refAllDecls(@import("core/module_lookup.zig"));
+    testing.refAllDecls(regs);
     testing.refAllDecls(resolved);
     testing.refAllDecls(bridge);
     _ = lower_sema;

@@ -8,6 +8,7 @@ const span = @import("span");
 const sema = @import("sema");
 
 const ir = @import("../../ir.zig");
+const runtime = @import("runtime");
 const bridge = @import("../../core/bridge.zig");
 const records = @import("records.zig");
 const compose = @import("compose.zig");
@@ -15,6 +16,8 @@ const env_mod = @import("env.zig");
 const operator = @import("operator.zig");
 const inline_mod = @import("inline.zig");
 const locals_mod = @import("locals.zig");
+const name_mod = @import("name.zig");
+const coerce_mod = @import("coerce.zig");
 const types_mod = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -43,6 +46,10 @@ pub const Program = struct {
     /// By FuncId: a lambda literal some body made a closure of. A literal
     /// only ever lowered in place at inline calls has no body of its own.
     closures: std.DynamicBitSetUnmanaged = .{},
+    /// By class: whether its values are held as their numbers (`coerce`).
+    scalar_classes: std.AutoHashMapUnmanaged(Sym, ?coerce_mod.Scalar) = .empty,
+    /// By member: the roots of its override family (`coerce`).
+    family_roots: std.AutoHashMapUnmanaged(Sym, []const Sym) = .empty,
 
     pub fn isLowered(p: *const Program, f: FuncId) bool {
         return f.int() < p.lowered.bit_length and p.lowered.isSet(f.int());
@@ -148,6 +155,9 @@ pub const Builder = struct {
     miss: ?Miss = null,
     /// `Unit` in the entry block, once something asked for it.
     unit_reg: ?Reg = null,
+    /// Registers an `UnboxValue` wrote, by the scalar class they hold the
+    /// number of: unboxing one again is the register itself.
+    unboxed: std.AutoHashMapUnmanaged(Reg, ir.ClassId) = .empty,
     /// `null` in the entry block, once something asked for it.
     null_reg: ?Reg = null,
     /// A `tailrec` function's (`tailrec.zig`): the expressions in tail
@@ -320,6 +330,12 @@ pub const Builder = struct {
     pub fn finish(b: *Builder) Error!void {
         const a = b.p.a;
         try b.pruneDeadTypeValues();
+        try b.foldConversions();
+        try b.foldNegatedTests();
+        try b.decellLocals();
+        threadJumps(b.blocks.items);
+        try mergeBlocks(b.p.a, b.blocks.items);
+        try forwardCopies(b.p.a, b.blocks.items, b.next_reg);
         try b.coalesceCopies();
         try b.aliasRuns();
         const f = &b.p.m.funcs.items[b.func.int()];
@@ -337,10 +353,26 @@ pub const Builder = struct {
         }
         f.blocks = blocks;
         f.entry = BlockId.from(0);
-        f.n_locals = b.next_reg;
+        // A body calls copy in keeps its registers: a copy reads which parameter a register
+        // holds from the register (`inline.instantiate`).
+        f.n_locals = if (b.copiedIn()) b.next_reg else try ir.regs.compact(a, blocks, b.next_reg);
         const lw = &b.p.lowered;
         if (b.func.int() >= lw.bit_length) try lw.resize(a, @max(b.func.int() + 1, b.p.m.funcs.items.len), false);
         lw.set(b.func.int());
+    }
+
+    /// Whether calls copy this body in rather than call it: an inline function, an inline
+    /// property's accessor, or the defaults of an inline function.
+    fn copiedIn(b: *const Builder) bool {
+        const br = b.p.br;
+        const s = b.p.s;
+        if (b.func.int() >= br.origin.len) return false;
+        return switch (br.origin[b.func.int()]) {
+            .decl, .defaults => |sym| s.syms.flags(sym).inline_,
+            .getter => |sym| name_mod.inlineAccessor(s, sym, false),
+            .setter => |sym| name_mod.inlineAccessor(s, sym, true),
+            else => false,
+        };
     }
 
     /// Drops what builds a run-time type value nothing reads: a reified
@@ -375,6 +407,157 @@ pub const Builder = struct {
             }
             if (!removed) return;
         }
+    }
+
+    /// Folds a conversion of a constant into the converted constant, and
+    /// drops the constant when only such conversions read it: `l * 31`
+    /// multiplies by the `Long` 31 rather than converting 31 each time.
+    fn foldConversions(b: *Builder) Error!void {
+        const a = b.p.a;
+        const n = b.next_reg;
+        const defs = try a.alloc(u32, n);
+        defer a.free(defs);
+        const reads = try a.alloc(u32, n);
+        defer a.free(reads);
+        @memset(defs, 0);
+        @memset(reads, 0);
+        const Count = struct {
+            defs: []u32,
+            reads: []u32,
+            fn cb(c: @This(), r: Reg, is_def: bool) void {
+                if (r.int() >= c.reads.len) return;
+                if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
+            }
+        };
+        const counter: Count = .{ .defs = defs, .reads = reads };
+        var any = false;
+        for (b.blocks.items) |*blk| {
+            for (blk.insts.items) |*inst| {
+                ir.visitInstRegs(inst, counter, Count.cb);
+                if (inst.* == .UnOp and inst.UnOp.op.conversion() != null) any = true;
+            }
+            if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counter, Count.cb);
+        }
+        if (!any) return;
+        // The constant a register holds, where one `Const` is its only write.
+        const consts = try a.alloc(?ir.ConstId, n);
+        defer a.free(consts);
+        @memset(consts, null);
+        for (b.blocks.items) |*blk| for (blk.insts.items) |inst| {
+            if (inst == .Const and defs[inst.Const.dst.int()] == 1) consts[inst.Const.dst.int()] = inst.Const.value;
+        };
+        const folded = try a.alloc(bool, n);
+        defer a.free(folded);
+        @memset(folded, false);
+        for (b.blocks.items) |*blk| for (blk.insts.items) |*inst| {
+            if (inst.* != .UnOp) continue;
+            const x = inst.UnOp;
+            const to = x.op.conversion() orelse continue;
+            const cid = consts[x.operand.int()] orelse continue;
+            const v = numericValue(b.p.m.consts.items[cid.int()]) orelse continue;
+            const out = runtime.numconv.convert(to, v) orelse continue;
+            inst.* = .{ .Const = .{ .dst = x.dst, .value = try b.p.m.internConst(a, numericConst(out)) } };
+            reads[x.operand.int()] -= 1;
+            folded[x.operand.int()] = true;
+        };
+        for (b.blocks.items) |*blk| {
+            var i: usize = 0;
+            while (i < blk.insts.items.len) {
+                const inst = blk.insts.items[i];
+                if (inst == .Const and folded[inst.Const.dst.int()] and reads[inst.Const.dst.int()] == 0) {
+                    _ = blk.insts.orderedRemove(i);
+                } else i += 1;
+            }
+        }
+    }
+
+    /// A `!` of an equality or identity test that nothing else reads becomes the
+    /// negated test, writing the `!`'s register, and the `!` goes: `a != null`
+    /// lowers to `!(a === null)`, and as one test it can join its block's
+    /// branch. Only the tests whose negation is exact (`==`, `!=`, their boxed
+    /// forms, `===`, `!==`); an ordering's is not, where NaN answers false both
+    /// ways. The test and the `!` are in one block with nothing between them
+    /// touching the `!`'s register, which the test now writes earlier.
+    fn foldNegatedTests(b: *Builder) Error!void {
+        const a = b.p.a;
+        const n = b.next_reg;
+        const defs = try a.alloc(u32, n);
+        defer a.free(defs);
+        const reads = try a.alloc(u32, n);
+        defer a.free(reads);
+        @memset(defs, 0);
+        @memset(reads, 0);
+        const Count = struct {
+            defs: []u32,
+            reads: []u32,
+            fn cb(c: @This(), r: Reg, is_def: bool) void {
+                if (r.int() >= c.reads.len) return;
+                if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
+            }
+        };
+        const counter: Count = .{ .defs = defs, .reads = reads };
+        var any = false;
+        for (b.blocks.items) |*blk| {
+            for (blk.insts.items) |*inst| {
+                ir.visitInstRegs(inst, counter, Count.cb);
+                if (inst.* == .Not) any = true;
+            }
+            if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counter, Count.cb);
+            for (blk.handlers.catches) |c| Count.cb(counter, c.exception_reg, true);
+        }
+        if (!any) return;
+        const Touches = struct {
+            reg: u32,
+            hit: *bool,
+            fn cb(t: @This(), r: Reg, is_def: bool) void {
+                _ = is_def;
+                if (r.int() == t.reg) t.hit.* = true;
+            }
+        };
+        for (b.blocks.items) |*blk| {
+            var i: usize = 0;
+            while (i < blk.insts.items.len) : (i += 1) {
+                const not = switch (blk.insts.items[i]) {
+                    .Not => |x| x,
+                    else => continue,
+                };
+                const src = not.src.int();
+                if (src >= n or defs[src] != 1 or reads[src] != 1) continue;
+                var j = i;
+                const test_at: ?usize = while (j > 0) {
+                    j -= 1;
+                    switch (blk.insts.items[j]) {
+                        .BinOp => |bo| if (bo.dst.int() == src) break j,
+                        else => {},
+                    }
+                } else null;
+                const t = test_at orelse continue;
+                const negated: ir.BinOp = switch (blk.insts.items[t].BinOp.op) {
+                    .Eq => .NotEq,
+                    .NotEq => .Eq,
+                    .BoxedEq => .BoxedNotEq,
+                    .BoxedNotEq => .BoxedEq,
+                    .IdentEq => .IdentNeq,
+                    .IdentNeq => .IdentEq,
+                    else => continue,
+                };
+                var hit = false;
+                for (blk.insts.items[t + 1 .. i]) |*between| ir.visitInstRegs(between, Touches{ .reg = not.dst.int(), .hit = &hit }, Touches.cb);
+                if (hit) continue;
+                blk.insts.items[t].BinOp.dst = not.dst;
+                blk.insts.items[t].BinOp.op = negated;
+                _ = blk.insts.orderedRemove(i);
+                i -= 1;
+            }
+        }
+    }
+
+    /// Keeps in a register a `var` whose cell never leaves this function.
+    /// A local a lambda captures is made a cell before lowering knows the
+    /// lambda is spliced into its caller by an inline call; a cell nothing
+    /// passes on, stores or captures is only this frame's own storage.
+    fn decellLocals(b: *Builder) Error!void {
+        try decellBlocks(b.p.a, b.blocks.items, b.next_reg);
     }
 
     /// Drops a copy of a register only it reads into a register only it
@@ -483,6 +666,325 @@ fn takesDst(inst: *const ir.Inst, x: Reg, has_handlers: bool, x_single: bool) bo
         .Move, .BinOp, .UnOp, .Not, .NotNullAssert, .CellGet, .GetFieldSlot, .ArrayGet, .ClassOf, .RInstanceOf, .RCast, .CallStatic, .RCallVirtual, .CallInterface, .CallNative, .RCallValue => true,
         else => !reads_x,
     };
+}
+
+/// Sends an edge to an empty block that only jumps on straight to where it
+/// jumps: the `else` a lone `if` leaves, a join passed through. A block
+/// with handlers, whose edges the try machinery keys on, is neither passed
+/// through nor retargeted from.
+fn threadJumps(blocks: []BlockBuf) void {
+    const Hop = struct {
+        fn through(bs: []BlockBuf, target: BlockId) BlockId {
+            var cur = target;
+            var hops: usize = 0;
+            while (hops < 8) : (hops += 1) {
+                if (cur.int() >= bs.len) return cur;
+                const t = &bs[cur.int()];
+                if (t.insts.items.len != 0 or t.handlers.any()) return cur;
+                const next = switch (t.terminator orelse return cur) {
+                    .Goto => |x| x,
+                    else => return cur,
+                };
+                if (next.int() == cur.int()) return cur;
+                cur = next;
+            }
+            return cur;
+        }
+    };
+    // A block a handler names keeps every edge to it: the handler may be
+    // what reaches it.
+    for (blocks) |*blk| {
+        if (blk.handlers.any()) continue;
+        const t = &(blk.terminator orelse continue);
+        switch (t.*) {
+            .Goto => |*x| x.* = Hop.through(blocks, x.*),
+            .Branch => |*br| {
+                br.t = Hop.through(blocks, br.t);
+                br.f = Hop.through(blocks, br.f);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Joins a block to the one block that jumps to it: a `Goto` to a block
+/// no other edge or handler names runs straight on. The joined block is
+/// left empty and unreachable, so no block id moves. Blocks with handlers
+/// keep their edges, which the try machinery keys on.
+fn mergeBlocks(a: Allocator, blocks: []BlockBuf) Error!void {
+    if (blocks.len < 2) return;
+    const preds = try a.alloc(u32, blocks.len);
+    defer a.free(preds);
+    const pinned = try a.alloc(bool, blocks.len);
+    defer a.free(pinned);
+    @memset(preds, 0);
+    @memset(pinned, false);
+    pinned[0] = true;
+    const Pin = struct {
+        fn at(p: []bool, id: ?BlockId) void {
+            if (id) |x| if (x.int() < p.len) {
+                p[x.int()] = true;
+            };
+        }
+    };
+    for (blocks) |*blk| {
+        if (blk.terminator) |t| switch (t) {
+            .Goto => |x| preds[x.int()] += 1,
+            .Branch => |br| {
+                preds[br.t.int()] += 1;
+                preds[br.f.int()] += 1;
+            },
+            else => {},
+        };
+        const h = &blk.handlers;
+        for (h.catches) |c| Pin.at(pinned, c.handler);
+        Pin.at(pinned, h.finally);
+        Pin.at(pinned, h.finally_done);
+        Pin.at(pinned, h.finally_done_for);
+        Pin.at(pinned, h.catch_done_for);
+        for (h.pop_on_exit) |x| Pin.at(pinned, x);
+    }
+    for (blocks, 0..) |*p, pi| {
+        while (true) {
+            const t = p.terminator orelse break;
+            const next = switch (t) {
+                .Goto => |x| x.int(),
+                else => break,
+            };
+            if (next == pi or next >= blocks.len or preds[next] != 1 or pinned[next]) break;
+            const q = &blocks[next];
+            if (p.handlers.any() or q.handlers.any()) break;
+            try p.insts.appendSlice(a, q.insts.items);
+            p.terminator = q.terminator;
+            q.insts.clearRetainingCapacity();
+            q.terminator = .Unreachable;
+            preds[next] = 0;
+        }
+    }
+}
+
+/// Forwards a copy into the one instruction that reads it: `x = y` then a
+/// read of `x` later in the block reads `y`, when `x` is written only by
+/// the copy, read only there, and `y` is not written in between.
+fn forwardCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
+    if (n == 0) return;
+    const reads = try a.alloc(u32, n);
+    defer a.free(reads);
+    const defs = try a.alloc(u32, n);
+    defer a.free(defs);
+    @memset(reads, 0);
+    @memset(defs, 0);
+    const Count = struct {
+        reads: []u32,
+        defs: []u32,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (r.int() >= c.reads.len) return;
+            if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
+        }
+    };
+    const counts: Count = .{ .reads = reads, .defs = defs };
+    for (blocks) |*blk| {
+        for (blk.insts.items) |*inst| ir.visitInstRegs(inst, counts, Count.cb);
+        if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
+        for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
+    }
+    for (blocks) |*blk| {
+        var j: usize = 0;
+        while (j < blk.insts.items.len) {
+            const mv = switch (blk.insts.items[j]) {
+                .Move => |m| m,
+                else => {
+                    j += 1;
+                    continue;
+                },
+            };
+            const x = mv.dst;
+            const y = mv.src;
+            j += 1;
+            if (x == y or x.int() >= n or defs[x.int()] != 1 or reads[x.int()] != 1) continue;
+            var k = j;
+            const done = while (k < blk.insts.items.len) : (k += 1) {
+                const inst = &blk.insts.items[k];
+                if (touches(inst, x, false)) {
+                    // Operands read before the result is written, where it
+                    // writes `y` itself.
+                    if (touches(inst, y, true) and !readsFirst(inst)) break false;
+                    if (!replaceReads(inst, x, y)) break false;
+                    break true;
+                }
+                if (touches(inst, y, true)) break false;
+            } else blk: {
+                const t = if (blk.terminator) |*tt| tt else break :blk false;
+                break :blk replaceTerminatorRead(t, x, y);
+            };
+            if (!done) continue;
+            j -= 1;
+            _ = blk.insts.orderedRemove(j);
+            defs[x.int()] = 0;
+            reads[x.int()] = 0;
+        }
+    }
+}
+
+/// Whether `inst` reads `r`, or with `writes` writes it.
+fn touches(inst: *const ir.Inst, r: Reg, writes: bool) bool {
+    const T = struct {
+        r: Reg,
+        writes: bool,
+        found: *bool,
+        fn cb(c: @This(), reg: Reg, is_def: bool) void {
+            if (reg == c.r and is_def == c.writes) c.found.* = true;
+        }
+    };
+    var found = false;
+    ir.visitInstRegs(inst, T{ .r = r, .writes = writes, .found = &found }, T.cb);
+    return found;
+}
+
+/// Whether `inst` reads every operand before it writes its result.
+fn readsFirst(inst: *const ir.Inst) bool {
+    return switch (inst.*) {
+        .Move, .BinOp, .UnOp, .Not, .NotNullAssert, .GetFieldSlot, .ArrayGet, .ClassOf, .RInstanceOf, .RCast => true,
+        else => false,
+    };
+}
+
+/// Makes `inst` read `to` where it reads `from`; false, changing nothing,
+/// when `from` is in an argument run or a list, which a single register
+/// cannot stand in.
+fn replaceReads(inst: *ir.Inst, from: Reg, to: Reg) bool {
+    switch (inst.*) {
+        inline else => |*p| {
+            const P = @TypeOf(p.*);
+            // A run or a list naming `from` keeps it.
+            inline for (std.meta.fields(P)) |f| {
+                if (f.type == Reg and comptime std.mem.eql(u8, f.name, "args") and @hasField(P, "n_args")) {
+                    if (from.int() >= @field(p, f.name).int() and from.int() < @field(p, f.name).int() + p.n_args) return false;
+                } else if (f.type == []const Reg or f.type == []Reg) {
+                    for (@field(p, f.name)) |r| if (r == from) return false;
+                }
+            }
+            inline for (std.meta.fields(P)) |f| {
+                const is_run = comptime std.mem.eql(u8, f.name, "args") and @hasField(P, "n_args");
+                if (comptime std.mem.eql(u8, f.name, "dst") or is_run) continue;
+                if (f.type == Reg) {
+                    if (@field(p, f.name) == from) @field(p, f.name) = to;
+                } else if (f.type == ?Reg) {
+                    if (@field(p, f.name)) |r| if (r == from) {
+                        @field(p, f.name) = to;
+                    };
+                }
+            }
+            return true;
+        },
+    }
+}
+
+fn replaceTerminatorRead(t: *Terminator, from: Reg, to: Reg) bool {
+    switch (t.*) {
+        .Branch => |*br| if (br.cond == from) {
+            br.cond = to;
+            return true;
+        },
+        .Return => |*r| if (r.*) |v| if (v == from) {
+            r.* = to;
+            return true;
+        },
+        .Throw => |*v| if (v.* == from) {
+            v.* = to;
+            return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// A numeric or `Char` constant as the value it loads; null for the others.
+fn numericValue(c: ir.Const) ?runtime.Value {
+    return switch (c) {
+        .Int => |x| .{ .Int = x },
+        .Long => |x| .{ .Long = x },
+        .Short => |x| .{ .Short = x },
+        .Byte => |x| .{ .Byte = x },
+        .Char => |x| .{ .Char = x },
+        .Double => |x| .{ .Double = x },
+        .Float => |x| .{ .Float = x },
+        else => null,
+    };
+}
+
+/// The constant a conversion's result loads.
+fn numericConst(v: runtime.Value) ir.Const {
+    return switch (v) {
+        .Int => |x| .{ .Int = x },
+        .Long => |x| .{ .Long = x },
+        .Short => |x| .{ .Short = x },
+        .Byte => |x| .{ .Byte = x },
+        .Char => |x| .{ .Char = x },
+        .Double => |x| .{ .Double = x },
+        .Float => |x| .{ .Float = x },
+        else => unreachable,
+    };
+}
+
+fn decellBlocks(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
+    if (n == 0) return;
+    // Per register: cells made into it, other writes, reads as the cell of a
+    // `CellGet` or `CellSet`, and any other read.
+    const makes = try a.alloc(u32, n);
+    defer a.free(makes);
+    const writes = try a.alloc(u32, n);
+    defer a.free(writes);
+    const other_reads = try a.alloc(u32, n);
+    defer a.free(other_reads);
+    @memset(makes, 0);
+    @memset(writes, 0);
+    @memset(other_reads, 0);
+    const Count = struct {
+        writes: []u32,
+        other_reads: []u32,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (r.int() >= c.writes.len) return;
+            if (is_def) c.writes[r.int()] += 1 else c.other_reads[r.int()] += 1;
+        }
+    };
+    const count: Count = .{ .writes = writes, .other_reads = other_reads };
+    var any = false;
+    for (blocks) |*blk| {
+        for (blk.insts.items) |*inst| switch (inst.*) {
+            .MakeCell => |m| {
+                if (m.dst.int() < n) makes[m.dst.int()] += 1;
+                Count.cb(count, m.src, false);
+                any = true;
+            },
+            .CellGet => |g| Count.cb(count, g.dst, true),
+            .CellSet => |c| Count.cb(count, c.value, false),
+            else => ir.visitInstRegs(inst, count, Count.cb),
+        };
+        if (blk.terminator) |*t| ir.visitTerminatorRegs(t, count, Count.cb);
+        for (blk.handlers.catches) |c| Count.cb(count, c.exception_reg, true);
+    }
+    if (!any) return;
+    const kept = struct {
+        fn f(mk: []const u32, wr: []const u32, rd: []const u32, r: Reg) bool {
+            const i = r.int();
+            return i < mk.len and mk[i] == 1 and wr[i] == 0 and rd[i] == 0;
+        }
+    }.f;
+    for (blocks) |*blk| {
+        for (blk.insts.items) |*inst| switch (inst.*) {
+            .MakeCell => |m| if (kept(makes, writes, other_reads, m.dst)) {
+                inst.* = .{ .Move = .{ .dst = m.dst, .src = m.src } };
+            },
+            .CellGet => |g| if (kept(makes, writes, other_reads, g.cell)) {
+                inst.* = .{ .Move = .{ .dst = g.dst, .src = g.cell } };
+            },
+            .CellSet => |c| if (kept(makes, writes, other_reads, c.cell)) {
+                inst.* = .{ .Move = .{ .dst = c.cell, .src = c.value } };
+            },
+            else => {},
+        };
+    }
 }
 
 fn coalesceBlockCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
@@ -782,3 +1284,124 @@ test "a call passes consecutive registers it copied as its argument run" {
     try aliasBlockRuns(a, &ctor, 8);
     try std.testing.expectEqual(@as(usize, 2), ctor[0].insts.items.len);
 }
+
+test "a cell that never leaves its function is a register" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    var blocks = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Const = .{ .dst = r(0), .value = ir.ConstId.from(0) } },
+        .{ .MakeCell = .{ .dst = r(1), .src = r(0) } },
+        .{ .CellGet = .{ .dst = r(2), .cell = r(1) } },
+        .{ .BinOp = .{ .dst = r(3), .op = .Add, .lhs = r(2), .rhs = r(2) } },
+        .{ .CellSet = .{ .cell = r(1), .value = r(3) } },
+        .{ .CellGet = .{ .dst = r(4), .cell = r(1) } },
+    }, .{ .Return = r(4) })};
+    defer blocks[0].insts.deinit(a);
+    try decellBlocks(a, &blocks, 5);
+    const insts = blocks[0].insts.items;
+    try std.testing.expectEqual(Inst{ .Move = .{ .dst = r(1), .src = r(0) } }, insts[1]);
+    try std.testing.expectEqual(Inst{ .Move = .{ .dst = r(2), .src = r(1) } }, insts[2]);
+    try std.testing.expectEqual(Inst{ .Move = .{ .dst = r(1), .src = r(3) } }, insts[4]);
+    try std.testing.expectEqual(Inst{ .Move = .{ .dst = r(4), .src = r(1) } }, insts[5]);
+}
+
+test "a cell a closure captures, a call takes or a return gives stays a cell" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    const caps = [_]Reg{r(1)};
+    const escapes = [_]Inst{
+        .{ .MakeClosure = .{ .dst = r(2), .func = FuncId.from(0), .captures = &caps } },
+        .{ .CallStatic = .{ .dst = r(2), .func = FuncId.from(0), .args = r(1), .n_args = 1 } },
+        .{ .Move = .{ .dst = r(2), .src = r(1) } },
+    };
+    for (escapes) |esc| {
+        var blocks = [_]BlockBuf{try testBlock(a, &.{
+            .{ .MakeCell = .{ .dst = r(1), .src = r(0) } },
+            esc,
+            .{ .CellGet = .{ .dst = r(3), .cell = r(1) } },
+        }, .{ .Return = r(3) })};
+        defer blocks[0].insts.deinit(a);
+        try decellBlocks(a, &blocks, 4);
+        try std.testing.expect(blocks[0].insts.items[0] == .MakeCell);
+        try std.testing.expect(blocks[0].insts.items[2] == .CellGet);
+    }
+    var returned = [_]BlockBuf{try testBlock(a, &.{
+        .{ .MakeCell = .{ .dst = r(1), .src = r(0) } },
+    }, .{ .Return = r(1) })};
+    defer returned[0].insts.deinit(a);
+    try decellBlocks(a, &returned, 2);
+    try std.testing.expect(returned[0].insts.items[0] == .MakeCell);
+}
+
+test "a block only one jump reaches joins the block that jumps" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    var blocks = [_]BlockBuf{
+        try testBlock(a, &.{.{ .Const = .{ .dst = r(0), .value = ir.ConstId.from(0) } }}, .{ .Goto = BlockId.from(1) }),
+        try testBlock(a, &.{.{ .Move = .{ .dst = r(1), .src = r(0) } }}, .{ .Goto = BlockId.from(2) }),
+        try testBlock(a, &.{.{ .Move = .{ .dst = r(2), .src = r(1) } }}, .{ .Branch = .{ .cond = r(2), .t = BlockId.from(2), .f = BlockId.from(3) } }),
+        try testBlock(a, &.{}, .{ .Return = r(2) }),
+    };
+    defer for (&blocks) |*blk| blk.insts.deinit(a);
+    try mergeBlocks(a, &blocks);
+    // Block 1 joins block 0; block 2 is also its own loop's target, and 3 a branch's.
+    try std.testing.expectEqual(@as(usize, 2), blocks[0].insts.items.len);
+    try std.testing.expectEqual(Terminator{ .Goto = BlockId.from(2) }, blocks[0].terminator.?);
+    try std.testing.expectEqual(Terminator.Unreachable, blocks[1].terminator.?);
+    try std.testing.expectEqual(@as(usize, 1), blocks[2].insts.items.len);
+}
+
+test "a copy read once in its block is forwarded to its reader" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    var blocks = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Move = .{ .dst = r(2), .src = r(1) } },
+        .{ .BinOp = .{ .dst = r(1), .op = .Add, .lhs = r(2), .rhs = r(0) } },
+        .{ .Move = .{ .dst = r(3), .src = r(1) } },
+    }, .{ .Branch = .{ .cond = r(3), .t = BlockId.from(0), .f = BlockId.from(0) } })};
+    defer blocks[0].insts.deinit(a);
+    try forwardCopies(a, &blocks, 4);
+    try std.testing.expectEqual(@as(usize, 1), blocks[0].insts.items.len);
+    try std.testing.expectEqual(r(1), blocks[0].insts.items[0].BinOp.lhs);
+    try std.testing.expectEqual(r(1), blocks[0].terminator.?.Branch.cond);
+
+    // Not into an argument run, nor past a write of the source.
+    var run = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Move = .{ .dst = r(2), .src = r(1) } },
+        .{ .CallStatic = .{ .dst = r(3), .func = FuncId.from(0), .args = r(2), .n_args = 1 } },
+    }, .{ .Return = r(3) })};
+    defer run[0].insts.deinit(a);
+    try forwardCopies(a, &run, 4);
+    try std.testing.expectEqual(@as(usize, 2), run[0].insts.items.len);
+    var written = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Move = .{ .dst = r(2), .src = r(1) } },
+        .{ .Const = .{ .dst = r(1), .value = ir.ConstId.from(0) } },
+        .{ .BinOp = .{ .dst = r(3), .op = .Add, .lhs = r(2), .rhs = r(1) } },
+    }, .{ .Return = r(3) })};
+    defer written[0].insts.deinit(a);
+    try forwardCopies(a, &written, 4);
+    try std.testing.expectEqual(@as(usize, 3), written[0].insts.items.len);
+}
+
+test "an edge to an empty block that only jumps goes where it jumps" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    var blocks = [_]BlockBuf{
+        try testBlock(a, &.{}, .{ .Branch = .{ .cond = r(0), .t = BlockId.from(1), .f = BlockId.from(2) } }),
+        try testBlock(a, &.{.{ .Move = .{ .dst = r(1), .src = r(0) } }}, .{ .Goto = BlockId.from(3) }),
+        try testBlock(a, &.{}, .{ .Goto = BlockId.from(3) }),
+        try testBlock(a, &.{}, .{ .Return = r(1) }),
+    };
+    defer for (&blocks) |*blk| blk.insts.deinit(a);
+    threadJumps(&blocks);
+    try std.testing.expectEqual(BlockId.from(3), blocks[0].terminator.?.Branch.f);
+    try std.testing.expectEqual(BlockId.from(1), blocks[0].terminator.?.Branch.t);
+    // A block with handlers is not passed through.
+    const catches = [_]ir.CatchHandler{.{ .class = ir.ClassId.from(0), .handler = BlockId.from(3), .exception_reg = r(2) }};
+    blocks[2].handlers.catches = @constCast(&catches);
+    blocks[0].terminator = .{ .Branch = .{ .cond = r(0), .t = BlockId.from(1), .f = BlockId.from(2) } };
+    threadJumps(&blocks);
+    try std.testing.expectEqual(BlockId.from(2), blocks[0].terminator.?.Branch.f);
+    blocks[2].handlers.catches = &.{};
+}
+

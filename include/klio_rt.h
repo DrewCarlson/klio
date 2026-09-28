@@ -213,6 +213,8 @@ int32_t    klio_r_is_a(klio_value v, uint32_t cls, int32_t nullable);
 klio_value klio_r_cast(klio_value v, uint32_t cls, int32_t nullable, int32_t safe);
 klio_value klio_r_get(klio_value obj, uint32_t slot);
 void       klio_r_set(klio_value obj, uint32_t slot, klio_value v);
+klio_value klio_r_box_value(klio_value v, uint32_t cls, uint32_t slot);
+klio_value klio_r_unbox_value(klio_value v, uint32_t cls, uint32_t slot);
 klio_value klio_r_kclass(uint32_t cls);
 klio_value klio_r_class_value(klio_value v);
 

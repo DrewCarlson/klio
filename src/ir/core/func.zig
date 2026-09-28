@@ -244,90 +244,105 @@ pub const Func = struct {
     }
 
     /// Whether a fresh frame may leave its register file unfilled: every register read is
-    /// preceded by a write on ALL paths from entry, proved by a must-written dataflow over the
-    /// CFG. Catch/finally/absorption bodies keep the eager fill, since an exception edge can
-    /// enter a handler mid-block. The function's code table (`bc.FuncStreams.no_fill`) keeps
-    /// the answer.
+    /// preceded by a write on ALL paths from entry (`defBeforeUse`). The function's code table
+    /// (`bc.FuncStreams.no_fill`) keeps the answer.
     pub fn frameDefBeforeUse(self: *const Func) bool {
         if (self.n_locals > FRAME_FILL_MAX_REGS) return false;
-        const nb = self.blocks.len;
-        if (nb == 0 or nb > FRAME_FILL_MAX_BLOCKS) return false;
-        const entry_idx = self.entry.int();
-        if (entry_idx >= nb) return false;
-        for (self.blocks) |*b| {
-            if (b.h().catches.len != 0 or b.h().finally != null) return false;
+        return defBeforeUse(self.blocks, self.entry.int());
+    }
+};
+
+/// Whether every register `blocks` read is written first on every path from `entry`, by a
+/// forward must-written dataflow over the edges. A throw in a try region reaches its catch or
+/// its finally from wherever the region has got to, and a register stays written once it is,
+/// so a handler starts with at least what was written where its region began, the start of
+/// the block that names it; a catch with its exception register written too.
+pub fn defBeforeUse(blocks: []const Block, entry: u32) bool {
+    const nb = blocks.len;
+    if (nb == 0 or nb > FRAME_FILL_MAX_BLOCKS) return false;
+    if (entry >= nb) return false;
+    const Ctx = struct {
+        uses: RegSet = regSetEmpty(),
+        defs: RegSet = regSetEmpty(),
+        oob: bool = false,
+        fn visit(c: *@This(), reg: Reg, is_def: bool) void {
+            const r = reg.int();
+            if (r >= FRAME_FILL_MAX_REGS) {
+                c.oob = true;
+                return;
+            }
+            if (is_def) regSetSet(&c.defs, r) else regSetSet(&c.uses, r);
         }
-        const Ctx = struct {
-            uses: RegSet = regSetEmpty(),
-            defs: RegSet = regSetEmpty(),
-            oob: bool = false,
-            fn visit(c: *@This(), reg: Reg, is_def: bool) void {
-                const r = reg.int();
-                if (r >= FRAME_FILL_MAX_REGS) {
-                    c.oob = true;
-                    return;
-                }
-                if (is_def) regSetSet(&c.defs, r) else regSetSet(&c.uses, r);
-            }
-        };
-        // Per-block summary: `gen` = registers the block writes, `exposed` = registers it reads
-        // before writing them; an instruction's own def never covers its own use. The scratch
-        // is thread-local because stack arrays this size are poisoned under safe builds.
-        const scratch = frame_fill_scratch.get();
-        const gen = &scratch.sets[0];
-        const exposed = &scratch.sets[1];
-        for (self.blocks, 0..) |*b, bi| {
-            var written: RegSet = regSetEmpty();
-            var expo: RegSet = regSetEmpty();
-            for (b.insts) |*inst| {
-                var c: Ctx = .{};
-                visitInstRegs(inst, &c, Ctx.visit);
-                if (c.oob) return false;
-                regSetOrAndNot(&expo, c.uses, written);
-                regSetOr(&written, c.defs);
-            }
+    };
+    // Per-block summary: `gen` = registers the block writes, `exposed` = registers it reads
+    // before writing them; an instruction's own def never covers its own use. The scratch
+    // is thread-local because stack arrays this size are poisoned under safe builds.
+    const scratch = frame_fill_scratch.get();
+    const gen = &scratch.sets[0];
+    const exposed = &scratch.sets[1];
+    for (blocks, 0..) |*b, bi| {
+        var written: RegSet = regSetEmpty();
+        var expo: RegSet = regSetEmpty();
+        for (b.insts) |*inst| {
             var c: Ctx = .{};
-            visitTerminatorRegs(&b.terminator, &c, Ctx.visit);
+            visitInstRegs(inst, &c, Ctx.visit);
             if (c.oob) return false;
             regSetOrAndNot(&expo, c.uses, written);
             regSetOr(&written, c.defs);
-            gen[bi] = written;
-            exposed[bi] = expo;
         }
-        // Forward must-written fixpoint. Unreachable blocks keep the ALL set and verify
-        // vacuously; a `TailJump` resets the register file so it contributes no edge.
-        const in = &frame_fill_scratch.get().sets[2];
-        for (0..nb) |bi| in[bi] = regSetFull();
-        in[entry_idx] = regSetEmpty();
-        var rounds: usize = 0;
-        while (rounds < nb + 8) : (rounds += 1) {
-            var changed = false;
-            for (self.blocks, 0..) |*b, bi| {
-                var out = in[bi];
-                regSetOr(&out, gen[bi]);
-                switch (b.terminator) {
-                    .Goto => |t| {
-                        if (t.int() >= nb) return false;
-                        if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
-                    },
-                    .Branch => |br| {
-                        for ([2]BlockId{ br.t, br.f }) |t| {
-                            if (t.int() >= nb) return false;
-                            if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
-                        }
-                    },
-                    .Return, .Throw, .Unreachable => {},
-                }
-            }
-            if (!changed) break;
-        } else return false;
-        for (0..nb) |bi| {
-            if (regSetAnyOutside(exposed[bi], in[bi])) return false;
+        var c: Ctx = .{};
+        visitTerminatorRegs(&b.terminator, &c, Ctx.visit);
+        if (c.oob) return false;
+        regSetOrAndNot(&expo, c.uses, written);
+        regSetOr(&written, c.defs);
+        gen[bi] = written;
+        exposed[bi] = expo;
+        for (b.h().catches) |ch| {
+            if (ch.handler.int() >= nb or ch.exception_reg.int() >= FRAME_FILL_MAX_REGS) return false;
         }
-        return true;
+        if (b.h().finally) |f| if (f.int() >= nb) return false;
     }
-
-};
+    // Forward must-written fixpoint. Unreachable blocks keep the ALL set and verify
+    // vacuously; nothing reaches the entry with more written than nothing.
+    const in = &scratch.sets[2];
+    for (0..nb) |bi| in[bi] = regSetFull();
+    in[entry] = regSetEmpty();
+    var rounds: usize = 0;
+    while (rounds < nb + 8) : (rounds += 1) {
+        var changed = false;
+        for (blocks, 0..) |*b, bi| {
+            var out = in[bi];
+            regSetOr(&out, gen[bi]);
+            switch (b.terminator) {
+                .Goto => |t| {
+                    if (t.int() >= nb) return false;
+                    if (t.int() != entry and regSetAndInto(&in[t.int()], out)) changed = true;
+                },
+                .Branch => |br| {
+                    for ([2]BlockId{ br.t, br.f }) |t| {
+                        if (t.int() >= nb) return false;
+                        if (t.int() != entry and regSetAndInto(&in[t.int()], out)) changed = true;
+                    }
+                },
+                .Return, .Throw, .Unreachable => {},
+            }
+            for (b.h().catches) |ch| {
+                var at = in[bi];
+                regSetSet(&at, ch.exception_reg.int());
+                const t = ch.handler.int();
+                if (t != entry and regSetAndInto(&in[t], at)) changed = true;
+            }
+            if (b.h().finally) |f| {
+                if (f.int() != entry and regSetAndInto(&in[f.int()], in[bi])) changed = true;
+            }
+        }
+        if (!changed) break;
+    } else return false;
+    for (0..nb) |bi| {
+        if (regSetAnyOutside(exposed[bi], in[bi])) return false;
+    }
+    return true;
+}
 
 /// CFG size bound for `frameDefBeforeUse`'s dataflow; a larger body keeps the eager fill.
 pub const FRAME_FILL_MAX_BLOCKS: usize = 256;
@@ -395,3 +410,54 @@ pub const Param = struct {
     /// so `default` stays null, but the flag decides applicability by argument count.
     has_default: bool = false,
 };
+
+test "a register read before any write on some path from entry needs a filled frame" {
+    const r = Reg.from;
+    const k = core_ids.ConstId.from(0);
+    var entry_insts = [_]Inst{.{ .Const = .{ .dst = r(0), .value = k } }};
+    var then_insts = [_]Inst{.{ .Const = .{ .dst = r(1), .value = k } }};
+    var join_insts = [_]Inst{.{ .Move = .{ .dst = r(2), .src = r(1) } }};
+    var blocks = [_]Block{
+        .{ .id = BlockId.from(0), .insts = &entry_insts, .terminator = .{ .Branch = .{ .cond = r(0), .t = BlockId.from(1), .f = BlockId.from(2) } } },
+        .{ .id = BlockId.from(1), .insts = &then_insts, .terminator = .{ .Goto = BlockId.from(2) } },
+        .{ .id = BlockId.from(2), .insts = &join_insts, .terminator = .{ .Return = r(2) } },
+    };
+    // The join reads r1, which the path straight from the entry never writes.
+    try std.testing.expect(!defBeforeUse(&blocks, 0));
+    // Written on both paths, it is.
+    entry_insts[0] = .{ .Const = .{ .dst = r(1), .value = k } };
+    blocks[0].terminator = .{ .Branch = .{ .cond = r(1), .t = BlockId.from(1), .f = BlockId.from(2) } };
+    try std.testing.expect(defBeforeUse(&blocks, 0));
+}
+
+test "a catch or finally starts with what was written where its try region began" {
+    const r = Reg.from;
+    const k = core_ids.ConstId.from(0);
+    // Block 0 writes r0 and enters the try at block 1, which writes r1 and returns; block 2
+    // catches into r3 and block 3 is the finally.
+    var before = [_]Inst{.{ .Const = .{ .dst = r(0), .value = k } }};
+    var body = [_]Inst{.{ .Const = .{ .dst = r(1), .value = k } }};
+    var catch_insts = [_]Inst{.{ .Move = .{ .dst = r(2), .src = r(0) } }};
+    var fin_insts = [_]Inst{.{ .Move = .{ .dst = r(4), .src = r(0) } }};
+    var catches = [_]CatchHandler{.{ .class = core_ids.ClassId.from(0), .handler = BlockId.from(2), .exception_reg = r(3) }};
+    var try_handlers: BlockHandlers = .{ .catches = &catches, .finally = BlockId.from(3) };
+    var blocks = [_]Block{
+        .{ .id = BlockId.from(0), .insts = &before, .terminator = .{ .Goto = BlockId.from(1) } },
+        .{ .id = BlockId.from(1), .insts = &body, .terminator = .{ .Return = r(1) }, .handlers = &try_handlers },
+        .{ .id = BlockId.from(2), .insts = &catch_insts, .terminator = .{ .Return = r(2) } },
+        .{ .id = BlockId.from(3), .insts = &fin_insts, .terminator = .{ .Return = r(4) } },
+    };
+    try std.testing.expect(defBeforeUse(&blocks, 0));
+    // The catch reads its exception.
+    catch_insts[0] = .{ .Move = .{ .dst = r(2), .src = r(3) } };
+    try std.testing.expect(defBeforeUse(&blocks, 0));
+    // A register only the try body writes may not be written yet when it throws.
+    catch_insts[0] = .{ .Move = .{ .dst = r(2), .src = r(1) } };
+    try std.testing.expect(!defBeforeUse(&blocks, 0));
+    catch_insts[0] = .{ .Move = .{ .dst = r(2), .src = r(0) } };
+    fin_insts[0] = .{ .Move = .{ .dst = r(4), .src = r(1) } };
+    try std.testing.expect(!defBeforeUse(&blocks, 0));
+    // Nor is another catch's exception register written.
+    fin_insts[0] = .{ .Move = .{ .dst = r(4), .src = r(3) } };
+    try std.testing.expect(!defBeforeUse(&blocks, 0));
+}

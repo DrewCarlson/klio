@@ -17,11 +17,13 @@ const ir = @import("../../ir.zig");
 const bridge = @import("../../core/bridge.zig");
 const builder = @import("builder.zig");
 const records = @import("records.zig");
+const operator = @import("operator.zig");
 const env = @import("env.zig");
 const body = @import("body.zig");
 const call = @import("call.zig");
 const name_mod = @import("name.zig");
 const dispatch = @import("dispatch.zig");
+const coerce = @import("coerce.zig");
 
 const Builder = builder.Builder;
 const Error = records.Error;
@@ -39,6 +41,7 @@ const Sym = sema.Sym;
 pub fn lowerCtor(b: *Builder, ctor: Sym) Error!void {
     const s = b.p.s;
     const cls = s.syms.owner(ctor);
+    if (try coerce.scalarClass(b, cls) != null) return scalarCtor(b, ctor, cls);
     const this = try env.thisOf(b, cls);
     // An enum class's companion initializes as part of the enum class,
     // after its entries.
@@ -68,6 +71,44 @@ pub fn lowerCtor(b: *Builder, ctor: Sym) Error!void {
         else => try primaryCtor(b, cls, this),
     }
     if (!b.terminated()) b.terminate(.{ .Return = this });
+}
+
+/// A scalar class's constructor (`coerce`): the value is the number its
+/// primary constructor's one parameter holds, which the init blocks see as
+/// `this` and which it answers, allocating nothing. A secondary constructor
+/// answers what the one it delegates to does.
+fn scalarCtor(b: *Builder, ctor: Sym, cls: Sym) Error!void {
+    const s = b.p.s;
+    const cd = classDecl(s, cls) orelse return b.fail(b.cur_span, "`{s}` has no declaration to construct", .{s.str(s.syms.name(cls))});
+    const kind = env.thisKind(s, cls);
+    // Constructing the class initializes its companion, as its first
+    // instantiation does any class's.
+    if (nearestCompanion(s, cls)) |comp| if (b.p.br.classOfOpt(comp)) |c| {
+        try b.emit(.{ .LoadObject = .{ .dst = b.newReg(), .class = c } });
+    };
+    switch (s.syms.get(ctor).decl) {
+        .secondary_ctor => |sc_opt| {
+            const sc = sc_opt.?;
+            const number = switch (sc.delegation) {
+                .This => |args| blk: {
+                    const rec = try b.call(sc.id);
+                    break :blk try call.lowerDelegation(b, &rec, .{ .exprs = try exprList(b, args), .regs = &.{}, .receiver = null, .sp = sc.span });
+                },
+                else => return b.fail(sc.span, "a value class constructor that does not delegate to another", .{}),
+            };
+            try env.bindReceiver(b, kind, cls, number);
+            if (sc.body) |*blk| _ = try body.lowerStmts(b, blk.stmts);
+            if (!b.terminated()) b.terminate(.{ .Return = number });
+        },
+        else => {
+            const params = s.syms.functionInfo(ctor).params;
+            if (params.len != 1) return b.fail(b.cur_span, "value class `{s}` takes {d} values", .{ s.str(s.syms.name(cls)), params.len });
+            const number = try env.readLocal(b, params[0]);
+            try env.bindReceiver(b, kind, cls, number);
+            try initializers(b, cls, cd, number);
+            if (!b.terminated()) b.terminate(.{ .Return = number });
+        },
+    }
 }
 
 /// The superclass of class `cls`, an interface never; null for none.
@@ -175,7 +216,7 @@ fn secondaryCtor(b: *Builder, cls: Sym, sc: *const ast.SecondaryCtor, this: Reg)
     switch (sc.delegation) {
         .This, .Super => |args| {
             const rec = try b.call(sc.id);
-            try call.lowerDelegation(b, &rec, .{ .exprs = try exprList(b, args), .regs = &.{}, .receiver = null, .sp = sc.span });
+            _ = try call.lowerDelegation(b, &rec, .{ .exprs = try exprList(b, args), .regs = &.{}, .receiver = null, .sp = sc.span });
         },
         .None => try implicitSuper(b, cls, this, sc.span),
     }
@@ -223,7 +264,8 @@ fn superInit(b: *Builder, cls: Sym, cd: ClassDecl) Error!void {
         .enum_entry => {
             const entry = entryOfBody(s, cls) orelse return b.fail(b.cur_span, "an enum entry class without its entry", .{});
             const rec = try b.call(entry.id);
-            return call.lowerDelegation(b, &rec, .{ .exprs = try exprList(b, entry.args), .regs = &.{}, .receiver = null, .sp = entry.span });
+            _ = try call.lowerDelegation(b, &rec, .{ .exprs = try exprList(b, entry.args), .regs = &.{}, .receiver = null, .sp = entry.span });
+            return;
         },
         else => {},
     }
@@ -235,7 +277,7 @@ fn superInit(b: *Builder, cls: Sym, cd: ClassDecl) Error!void {
     }
     for (recs, written.items) |*rec, i| {
         const sp = if (i < cd.supertypes.len) cd.supertypes[i].span else b.cur_span;
-        try call.lowerDelegation(b, rec, .{ .exprs = try exprList(b, cd.supertype_args[i].?), .regs = &.{}, .receiver = null, .sp = sp });
+        _ = try call.lowerDelegation(b, rec, .{ .exprs = try exprList(b, cd.supertype_args[i].?), .regs = &.{}, .receiver = null, .sp = sp });
     }
 }
 
@@ -413,7 +455,7 @@ fn initProperty(b: *Builder, cls: Sym, pd: *const ast.Property, this: Reg) Error
     const ex = init orelse return;
     if (defaultInitializer(s, s.syms.propertyInfo(prop).ty, ex)) return;
     try b.emit(.{ .Trace = .{ .span = ex.span() } });
-    const v = try body.lowerExpr(b, ex);
+    const v = try coerce.coerce(b, try body.lowerExpr(b, ex), b.exprType(ex.id()), try sema.headers.propertyType(s, prop));
     const slot = br.fieldOf(prop) orelse return b.fail(pd.span, "initialized `{s}` has no field", .{pd.name.name});
     try b.emit(.{ .SetFieldSlot = .{ .obj = this, .slot = slot, .value = v } });
 }
@@ -496,7 +538,7 @@ fn fileStatics(b: *Builder, file: u32, eager: bool) Error!void {
         // A frame of the file's initialization stands at the initializer
         // it runs, as the JVM's `<clinit>` line table puts it.
         try b.emit(.{ .Trace = .{ .span = ex.span() } });
-        const v = try body.lowerExpr(b, ex);
+        const v = try coerce.coerce(b, try body.lowerExpr(b, ex), b.exprType(ex.id()), try sema.headers.propertyType(s, p));
         try b.emit(.{ .StoreStatic = .{ .static = st, .value = v } });
     }
 }
@@ -664,7 +706,15 @@ pub fn lowerAccessor(b: *Builder, prop: Sym, setter: bool) Error!void {
         b.terminate(.{ .Return = v });
         return;
     };
-    b.terminate(.{ .Return = try loadField(b, prop, this) });
+    const field = try loadField(b, prop, this);
+    b.terminate(.{ .Return = try coerce.convert(b, field, try coerce.scalarOf(b, try sema.headers.propertyType(s, prop)), try getterHeld(b, prop)) });
+}
+
+/// The scalar class property `p`'s getter answers the number of: its
+/// family's type's.
+fn getterHeld(b: *Builder, p: Sym) Error!?coerce.Scalar {
+    if (b.p.s.syms.kind(p) != .property) return null;
+    return coerce.returnHeld(b, p);
 }
 
 /// A written accessor's body: an expression getter returns its value, an
@@ -678,7 +728,7 @@ fn accessorBody(b: *Builder, acc: *const ast.Accessor, setter: bool) Error!void 
         .Expr => |*e| {
             try b.emit(.{ .Trace = .{ .span = e.span() } });
             const v = try body.lowerExpr(b, e);
-            if (!b.terminated()) b.terminate(.{ .Return = if (setter) try b.unit() else v });
+            if (!b.terminated()) b.terminate(.{ .Return = if (setter) try b.unit() else try coerce.convert(b, v, try coerce.scalarOf(b, b.exprType(e.id())), try getterHeld(b, b.owner)) });
         },
     }
 }
@@ -695,6 +745,7 @@ fn loadField(b: *Builder, prop: Sym, this: ?Reg) Error!Reg {
     const br = b.p.br;
     const dst = b.newReg();
     if (this) |t| {
+        if (try coerce.valuePropertyOf(b, prop)) |sc| return coerce.unbox(b, t, sc);
         const slot = br.fieldOf(prop) orelse return b.fail(b.cur_span, "`{s}` has no field", .{s.str(s.syms.name(prop))});
         try b.emit(.{ .GetFieldSlot = .{ .dst = dst, .obj = t, .slot = slot } });
     } else {
@@ -965,7 +1016,8 @@ fn propertiesToString(b: *Builder, cls: Sym, head: []const u8) Error!void {
     for (props, 0..) |p, i| {
         const label = try std.fmt.allocPrint(b.p.a, "{s}{s}=", .{ if (i == 0) "" else ", ", s.str(s.syms.name(p)) });
         acc = try concat(b, acc, try b.emitConst(.{ .String = label }));
-        const v = try readProp(b, p, this);
+        // A scalar class's value renders by its own `toString`, boxed.
+        const v = try coerce.coerce(b, try readProp(b, p, this), try sema.headers.propertyType(s, p), .none);
         // An array renders by its elements, as the JVM's `Arrays.toString`
         // does: `[1, 2]`.
         const text = if (try arrayContent(b, p, "contentToString", 0)) |f| try callStatic(b, f, &.{v}) else try valueString(b, any_string, v);
@@ -1104,11 +1156,15 @@ fn dataEquals(b: *Builder, cls: Sym) Error!void {
     const other = try loadParam(b, 1);
     const yes = try b.newBlock();
     const no = try b.newBlock();
-    const same = b.newReg();
-    try b.emit(.{ .BinOp = .{ .dst = same, .op = .IdentEq, .lhs = this, .rhs = other } });
-    const check = try b.newBlock();
-    b.terminate(.{ .Branch = .{ .cond = same, .t = yes, .f = check } });
-    b.switchTo(check);
+    // A scalar class's `this` is its number, which no other value is the
+    // same object as.
+    if (try coerce.scalarClass(b, cls) == null) {
+        const same = b.newReg();
+        try b.emit(.{ .BinOp = .{ .dst = same, .op = .IdentEq, .lhs = this, .rhs = other } });
+        const check = try b.newBlock();
+        b.terminate(.{ .Branch = .{ .cond = same, .t = yes, .f = check } });
+        b.switchTo(check);
+    }
     const is = b.newReg();
     try b.emit(.{ .RInstanceOf = .{ .dst = is, .src = other, .class = br.classOf(cls), .nullable = false } });
     var next = try b.newBlock();
@@ -1118,7 +1174,7 @@ fn dataEquals(b: *Builder, cls: Sym) Error!void {
         b.switchTo(next);
         const x = try readProp(b, p, this);
         const y = try readProp(b, p, other);
-        const eq = try valuesEqual(b, any_equals, x, y);
+        const eq = try propertyValuesEqual(b, p, any_equals, x, y);
         next = try b.newBlock();
         b.terminate(.{ .Branch = .{ .cond = eq, .t = next, .f = no } });
     }
@@ -1129,6 +1185,57 @@ fn dataEquals(b: *Builder, cls: Sym) Error!void {
     b.switchTo(no);
     b.terminate(.{ .Return = try b.emitConst(.{ .Bool = false }) });
     _ = s;
+}
+
+/// `a == b` between two values of one value class, whose `equals` is the
+/// one the class was given: its property compared in place of the call.
+/// Null where that does not apply. The unsigned types are left to their
+/// `equals`, which also meets them as the host's numbers.
+pub fn inlineValueEquals(b: *Builder, callee: Sym, l: Reg, lt: sema.TypeId, r: Reg, rt: sema.TypeId) Error!?Reg {
+    const s = b.p.s;
+    if (callee == .none or s.syms.kind(callee) != .function) return null;
+    if (s.syms.functionInfo(callee).synth != .data_equals) return null;
+    const cls = s.syms.owner(callee);
+    // A value class others extend may meet a subclass's `equals`.
+    if (!s.syms.flags(cls).value or s.syms.flags(cls).modality != .final) return null;
+    const bi = &s.builtins;
+    if (cls == bi.ubyte or cls == bi.ushort or cls == bi.uint or cls == bi.ulong) return null;
+    if (s.types.isNullable(lt) or s.types.isNullable(rt)) return null;
+    if (s.types.classSym(lt) != cls or s.types.classSym(rt) != cls) return null;
+    const prop = valueProperty(b, cls) orelse return null;
+    const x = try readProp(b, prop, l);
+    const y = try readProp(b, prop, r);
+    return try propertyValuesEqual(b, prop, try anyEquals(b), x, y);
+}
+
+/// The property a value class holds its value in: its one member property
+/// with a field. Read from the bridge's fields, so a class an image carries
+/// without its declaration is answered too.
+pub fn valueProperty(b: *Builder, cls: Sym) ?Sym {
+    const s = b.p.s;
+    var found: ?Sym = null;
+    var it = s.syms.classInfo(cls).members.iterator();
+    while (it.next()) |entry| for (entry.value_ptr.items) |m| {
+        if (s.syms.kind(m) != .property or b.p.br.fieldOf(m) == null) continue;
+        if (found != null) return null;
+        found = m;
+    };
+    return found;
+}
+
+/// `x == y` for two values of property `p`: one boxed comparison when it
+/// holds a primitive or an unsigned number, which compares as its `equals`
+/// does (a NaN equals itself, `-0.0` is not `0.0`); otherwise `valuesEqual`.
+fn propertyValuesEqual(b: *Builder, p: Sym, any_equals: FuncId, x: Reg, y: Reg) Error!Reg {
+    const s = b.p.s;
+    const t = try sema.headers.propertyType(s, p);
+    const unsigned = operator.unsignedOf(s, t) != null;
+    if (!s.types.isNullable(t)) if (unsigned or (if (operator.primOf(s, t)) |prim| prim != .string else false)) {
+        const dst = b.newReg();
+        try b.emit(.{ .BinOp = .{ .dst = dst, .op = .BoxedEq, .lhs = x, .rhs = y } });
+        return dst;
+    };
+    return valuesEqual(b, any_equals, x, y);
 }
 
 /// `x == y`: both null, or `x.equals(y)` through `Any.equals`'s slot.

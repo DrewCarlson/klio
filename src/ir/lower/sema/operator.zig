@@ -11,10 +11,12 @@ const ir = @import("../../ir.zig");
 const builder = @import("builder.zig");
 const records = @import("records.zig");
 const body = @import("body.zig");
+const coerce = @import("coerce.zig");
 const call = @import("call.zig");
 const name = @import("name.zig");
 const env = @import("env.zig");
 const locals = @import("locals.zig");
+const class_bodies = @import("classes.zig");
 
 const Allocator = std.mem.Allocator;
 const Builder = builder.Builder;
@@ -32,16 +34,24 @@ const TypeId = sema.TypeId;
 /// `-0.0` below `0.0`).
 pub const CompareKind = enum { integral, floating };
 
+/// The conversions an operation's operands take first, as the JVM's
+/// widening bytecodes do: `Long + Int` is the `Long` addition of the
+/// `Int` widened.
+pub const Widen = struct { lhs: ?ir.UnOp = null, rhs: ?ir.UnOp = null };
+
 /// What a declaration the table binds lowers to.
 pub const PrimOp = union(enum) {
-    bin: ir.BinOp,
+    bin: struct { op: ir.BinOp, widen: Widen = .{} },
     un: ir.UnOp,
     not,
     identity,
     native: ir.NativeId,
+    /// A native's numeric function (`UnOp.function`) over the call's last
+    /// argument: the value itself, after a companion receiver.
+    un_last: ir.UnOp,
     /// `compareTo` between primitives: `<`, `<=`, `>` and `>=` lower to the
     /// matching `BinOp`; a call is a three-way comparison.
-    compare: CompareKind,
+    compare: struct { kind: CompareKind, widen: Widen = .{} },
     /// `get` of an array or string element.
     array_get,
     /// `set` of an array element.
@@ -63,6 +73,39 @@ fn isFloating(p: Prim) bool {
     return p == .float or p == .double;
 }
 
+/// The type arithmetic between `a` and `b` computes in: `Double`, else
+/// `Float`, else `Long`, else `Int` (a `Byte` or `Short` operation is an
+/// `Int` one).
+fn promoted(a: Prim, b: Prim) Prim {
+    if (a == .double or b == .double) return .double;
+    if (a == .float or b == .float) return .float;
+    if (a == .long or b == .long) return .long;
+    return .int;
+}
+
+/// The conversion to `to`.
+fn convertOp(to: Prim) ir.UnOp {
+    return switch (to) {
+        .byte => .ToByte,
+        .short => .ToShort,
+        .int => .ToInt,
+        .long => .ToLong,
+        .float => .ToFloat,
+        .double => .ToDouble,
+        .char => .ToChar,
+        .boolean, .string => unreachable,
+    };
+}
+
+/// The operands of a `recv` and `p` operation, each converted to `to`
+/// where it is not one already.
+fn widenTo(to: Prim, recv: Prim, p: Prim) Widen {
+    return .{
+        .lhs = if (recv == to) null else convertOp(to),
+        .rhs = if (p == to) null else convertOp(to),
+    };
+}
+
 /// The primitive class `cls` is, or null.
 pub fn primOfClass(s: *const sema.Sema, cls: Sym) ?Prim {
     if (cls == .none) return null;
@@ -77,6 +120,26 @@ pub fn primOfClass(s: *const sema.Sema, cls: Sym) ?Prim {
     if (cls == bi.double) return .double;
     if (cls == bi.string) return .string;
     return null;
+}
+
+/// The unsigned class `t` is (`UByte` through `ULong`), or null. Their values
+/// are the host's unsigned numbers, which a constructor makes, so `==`
+/// between two of one type compares their bits.
+pub fn unsignedOf(s: *const sema.Sema, t: TypeId) ?Sym {
+    if (t == .none) return null;
+    const c = s.types.classSym(t);
+    const bi = &s.builtins;
+    if (c == .none) return null;
+    if (c == bi.ubyte or c == bi.ushort or c == bi.uint or c == bi.ulong) return c;
+    return null;
+}
+
+/// Whether `p` is the `data` property an unsigned type holds its bits in.
+pub fn isUnsignedData(s: *const sema.Sema, p: Sym) bool {
+    const bi = &s.builtins;
+    const cls = s.syms.owner(p);
+    if (cls == .none or !(cls == bi.ubyte or cls == bi.ushort or cls == bi.uint or cls == bi.ulong)) return false;
+    return std.mem.eql(u8, s.str(s.syms.name(p)), "data");
 }
 
 /// The primitive class of type `t` (nullable or not), or null.
@@ -97,8 +160,8 @@ pub const PrimTable = struct {
 
     /// Binds the members of the base's primitive classes, `String` and the
     /// arrays by name and signature, once. A declaration whose meaning is
-    /// not one instruction (a conversion, `toString`, `rangeTo`) is left to
-    /// its body or native.
+    /// not one instruction (`toString`, `rangeTo`) is left to its body or
+    /// native.
     pub fn init(a: Allocator, s: *sema.Sema) Error!PrimTable {
         var t: PrimTable = .{};
         const bi = &s.builtins;
@@ -178,13 +241,19 @@ fn bindMember(n: []const u8, recv: Prim, arity: usize, params: [2]?Prim, any_par
         if (eql(u8, n, "unaryPlus") and (recv == .int or recv == .long or isFloating(recv))) return .identity;
         if (eql(u8, n, "inc") and (numeric or recv == .char)) return .{ .un = .Inc };
         if (eql(u8, n, "dec") and (numeric or recv == .char)) return .{ .un = .Dec };
-        if (convertsTo(n)) |target| if (target == recv) return .identity;
+        if (eql(u8, n, "inv") and (recv == .int or recv == .long)) return .{ .un = .Inv };
+        // `Int.hashCode()` is the value.
+        if (eql(u8, n, "hashCode") and recv == .int) return .identity;
+        if (convertsTo(n)) |target| {
+            if (target == recv) return .identity;
+            if (numeric or recv == .char) return .{ .un = convertOp(target) };
+        }
         return null;
     }
     if (arity != 1) return null;
     // `equals` is boxed equality: a `Double` NaN equals itself, and an
     // `Int` never equals a `Long`.
-    if (eql(u8, n, "equals") and any_param) return .{ .bin = .BoxedEq };
+    if (eql(u8, n, "equals") and any_param) return .{ .bin = .{ .op = .BoxedEq } };
     const p = params[0] orelse return null;
     if (eql(u8, n, "get") and recv == .string and p == .int) return .array_get;
     if (eql(u8, n, "compareTo")) {
@@ -192,7 +261,10 @@ fn bindMember(n: []const u8, recv: Prim, arity: usize, params: [2]?Prim, any_par
         // character, which its native computes.
         const same_family = (numeric and isNumeric(p)) or (recv == p and (recv == .char or recv == .boolean));
         if (!same_family) return null;
-        return .{ .compare = if (isFloating(recv) or isFloating(p)) .floating else .integral };
+        const kind: CompareKind = if (isFloating(recv) or isFloating(p)) .floating else .integral;
+        // Numbers compare in their promoted type, and `Char`s by their codes.
+        const widen: Widen = if (numeric) widenTo(promoted(recv, p), recv, p) else if (recv == .char) widenTo(.int, recv, p) else .{};
+        return .{ .compare = .{ .kind = kind, .widen = widen } };
     }
     const arith: ?ir.BinOp = if (eql(u8, n, "plus"))
         .Add
@@ -207,10 +279,10 @@ fn bindMember(n: []const u8, recv: Prim, arity: usize, params: [2]?Prim, any_par
     else
         null;
     if (arith) |op| {
-        if (numeric and isNumeric(p)) return .{ .bin = op };
+        if (numeric and isNumeric(p)) return .{ .bin = .{ .op = op, .widen = widenTo(promoted(recv, p), recv, p) } };
         // `Char + Int`, `Char - Int` and `Char - Char`.
-        if (recv == .char and p == .int and (op == .Add or op == .Sub)) return .{ .bin = op };
-        if (recv == .char and p == .char and op == .Sub) return .{ .bin = op };
+        if (recv == .char and p == .int and (op == .Add or op == .Sub)) return .{ .bin = .{ .op = op } };
+        if (recv == .char and p == .char and op == .Sub) return .{ .bin = .{ .op = op } };
         return null;
     }
     const bitwise: ?ir.BinOp = if (eql(u8, n, "and"))
@@ -222,7 +294,7 @@ fn bindMember(n: []const u8, recv: Prim, arity: usize, params: [2]?Prim, any_par
     else
         null;
     if (bitwise) |op| {
-        if (recv == p and (recv == .boolean or recv == .int or recv == .long)) return .{ .bin = op };
+        if (recv == p and (recv == .boolean or recv == .int or recv == .long)) return .{ .bin = .{ .op = op } };
         return null;
     }
     const shift: ?ir.BinOp = if (eql(u8, n, "shl"))
@@ -234,9 +306,34 @@ fn bindMember(n: []const u8, recv: Prim, arity: usize, params: [2]?Prim, any_par
     else
         null;
     if (shift) |op| {
-        if ((recv == .int or recv == .long) and p == .int) return .{ .bin = op };
+        // A `Long` shifts by its count's low six bits, which the count
+        // widened to `Long` keeps.
+        if ((recv == .int or recv == .long) and p == .int) return .{ .bin = .{ .op = op, .widen = .{ .rhs = if (recv == .long) .ToLong else null } } };
         return null;
     }
+    return null;
+}
+
+/// The instruction a native computes, by the key the bridge bound it
+/// under; null for a native that is a call into the host.
+pub fn nativeFunction(key: []const u8) ?ir.UnOp {
+    const table = .{
+        .{ "kotlin.Float.toRawBits", ir.UnOp.ToRawBits },       .{ "kotlin.Double.toRawBits", ir.UnOp.ToRawBits },
+        .{ "kotlin.Float.toBits", ir.UnOp.ToBits },             .{ "kotlin.Double.toBits", ir.UnOp.ToBits },
+        .{ "kotlin.Float.fromBits", ir.UnOp.FloatFromBits },    .{ "kotlin.Float.Companion.fromBits", ir.UnOp.FloatFromBits },
+        .{ "kotlin.Double.fromBits", ir.UnOp.DoubleFromBits },  .{ "kotlin.Double.Companion.fromBits", ir.UnOp.DoubleFromBits },
+        .{ "kotlin.Int.countTrailingZeroBits", ir.UnOp.CountTrailingZeroBits },
+        .{ "kotlin.Long.countTrailingZeroBits", ir.UnOp.CountTrailingZeroBits },
+        .{ "kotlin.UInt.countTrailingZeroBits", ir.UnOp.CountTrailingZeroBits },
+        .{ "kotlin.ULong.countTrailingZeroBits", ir.UnOp.CountTrailingZeroBits },
+        .{ "kotlin.UShort.countTrailingZeroBits", ir.UnOp.CountTrailingZeroBits },
+        .{ "kotlin.UByte.countTrailingZeroBits", ir.UnOp.CountTrailingZeroBits },
+        .{ "kotlin.uintToFloat", ir.UnOp.UIntToFloat },         .{ "kotlin.uintToDouble", ir.UnOp.UIntToDouble },
+        .{ "kotlin.ulongToFloat", ir.UnOp.ULongToFloat },       .{ "kotlin.ulongToDouble", ir.UnOp.ULongToDouble },
+        .{ "kotlin.math.sin", ir.UnOp.Sin },                    .{ "kotlin.math.cos", ir.UnOp.Cos },
+        .{ "kotlin.math.sqrt", ir.UnOp.Sqrt },
+    };
+    inline for (table) |row| if (std.mem.eql(u8, key, row[0])) return row[1];
     return null;
 }
 
@@ -256,21 +353,30 @@ fn convertsTo(n: []const u8) ?Prim {
 /// Emits `op` over `regs` (the receiver, then the arguments) into `dst`.
 pub fn emitPrimRegs(b: *Builder, op: PrimOp, dst: Reg, regs: []const Reg) Error!void {
     switch (op) {
-        .bin => |bo| try b.emit(.{ .BinOp = .{ .dst = dst, .op = bo, .lhs = regs[0], .rhs = regs[1] } }),
+        .bin => |x| try b.emit(.{ .BinOp = .{ .dst = dst, .op = x.op, .lhs = try widened(b, x.widen.lhs, regs[0]), .rhs = try widened(b, x.widen.rhs, regs[1]) } }),
         .un => |uo| try b.emit(.{ .UnOp = .{ .dst = dst, .op = uo, .operand = regs[0] } }),
+        .un_last => |uo| try b.emit(.{ .UnOp = .{ .dst = dst, .op = uo, .operand = regs[regs.len - 1] } }),
         .not => try b.emit(.{ .Not = .{ .dst = dst, .src = regs[0] } }),
         .identity => try b.emit(.{ .Move = .{ .dst = dst, .src = regs[0] } }),
         .native => |nid| {
             const run = try b.run(regs);
             try b.emit(.{ .CallNative = .{ .dst = dst, .native = nid, .args = run, .n_args = @intCast(regs.len) } });
         },
-        .compare => |kind| try emitThreeWay(b, kind, dst, regs[0], regs[1]),
+        .compare => |x| try emitThreeWay(b, x.kind, dst, try widened(b, x.widen.lhs, regs[0]), try widened(b, x.widen.rhs, regs[1])),
         .array_get => try b.emit(.{ .ArrayGet = .{ .dst = dst, .array = regs[0], .index = regs[1] } }),
         .array_set => {
             try b.emit(.{ .ArraySet = .{ .array = regs[0], .index = regs[1], .value = regs[2] } });
             try b.emit(.{ .Move = .{ .dst = dst, .src = try b.unit() } });
         },
     }
+}
+
+/// `r` converted by `conv`, or `r` itself when there is no conversion.
+fn widened(b: *Builder, conv: ?ir.UnOp, r: Reg) Error!Reg {
+    const op = conv orelse return r;
+    const dst = b.newReg();
+    try b.emit(.{ .UnOp = .{ .dst = dst, .op = op, .operand = r } });
+    return dst;
 }
 
 /// `emitPrimRegs` over the contiguous run of `n` registers at `run`, for a
@@ -397,23 +503,42 @@ pub fn callOn(b: *Builder, rec: *const CallRec, recv: Reg, operands: []const Reg
     return callOnFrom(b, rec, recv, operands, null);
 }
 
+/// The static types of a `callOn`'s receiver, operands and result, where
+/// they are known (`.none` where not).
+pub const Types = struct {
+    recv: TypeId = .none,
+    operands: []const TypeId = &.{},
+    result: TypeId = .none,
+};
+
+/// `callOn` over operands of known static types.
+pub fn callTyped(b: *Builder, rec: *const CallRec, recv: Reg, operands: []const Reg, types: Types) Error!Reg {
+    return callOnTyped(b, rec, recv, operands, null, types);
+}
+
 /// `callOn` over operands lowered since `from` that the call alone
 /// consumes, which its argument run may compute in place.
 fn callOnFrom(b: *Builder, rec: *const CallRec, recv: Reg, operands: []const Reg, from: ?locals.Mark) Error!Reg {
+    return callOnTyped(b, rec, recv, operands, from, .{});
+}
+
+fn callOnTyped(b: *Builder, rec: *const CallRec, recv: Reg, operands: []const Reg, from: ?locals.Mark, types: Types) Error!Reg {
     if (b.p.prims.get(rec.callee)) |op| {
         var regs: [3]Reg = undefined;
         if (operands.len + 1 > regs.len) return error.Unsupported;
         regs[0] = recv;
-        @memcpy(regs[1 .. operands.len + 1], operands);
+        // An operation of the primitives meets a scalar class's value only as
+        // an element of a generic array: boxed.
+        for (operands, 0..) |o, k| regs[k + 1] = try coerce.coerce(b, o, if (k < types.operands.len) types.operands[k] else .none, .none);
         const dst = b.newReg();
         try emitPrimRegs(b, op, dst, regs[0 .. operands.len + 1]);
-        return dst;
+        return coerce.coerce(b, dst, .none, types.result);
     }
     const exprs = try b.p.a.alloc(?*const ast.Expr, operands.len);
     @memset(exprs, null);
     const regs = try b.p.a.alloc(?Reg, operands.len);
     for (operands, regs) |o, *r| r.* = o;
-    return call.emitCall(b, rec, .{ .exprs = exprs, .regs = regs, .receiver = recv, .from = from });
+    return call.emitCall(b, rec, .{ .exprs = exprs, .regs = regs, .receiver = recv, .from = from, .types = types.operands, .receiver_ty = types.recv, .result_ty = types.result });
 }
 
 /// Arithmetic, comparisons, `==`, `in`, ranges, `&&`, `||`, `?:`, `===`.
@@ -421,7 +546,7 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
     const x = e.Binary;
     switch (x.op) {
         .And, .Or => return lowerShortCircuit(b, x.op == .And, x.lhs, x.rhs),
-        .Elvis => return lowerElvis(b, x.lhs, x.rhs),
+        .Elvis => return lowerElvis(b, e, x.lhs, x.rhs),
         .IdentEq, .IdentNeq => {
             const l = try body.lowerExpr(b, x.lhs);
             const r = try body.lowerExpr(b, x.rhs);
@@ -445,7 +570,7 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
             const container = try body.lowerExpr(b, x.rhs);
             const elem = try body.lowerExpr(b, x.lhs);
             const rec = try b.call(e.id());
-            const r = try callOnFrom(b, &rec, container, &.{elem}, from);
+            const r = try callOnTyped(b, &rec, container, &.{elem}, from, .{ .recv = b.exprType(x.rhs.id()), .operands = try b.p.a.dupe(TypeId, &.{b.exprType(x.lhs.id())}) });
             return if (x.op == .NotIn) negate(b, r) else r;
         },
         .Lt, .Le, .Gt, .Ge => {
@@ -461,11 +586,12 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
             };
             const dst = b.newReg();
             if (b.p.prims.get(rec.callee)) |op| if (op == .compare) {
-                try b.emit(.{ .BinOp = .{ .dst = dst, .op = cmp, .lhs = l, .rhs = r } });
+                const w = op.compare.widen;
+                try b.emit(.{ .BinOp = .{ .dst = dst, .op = cmp, .lhs = try widened(b, w.lhs, l), .rhs = try widened(b, w.rhs, r) } });
                 return dst;
             };
             // `compareTo`'s result against zero.
-            const order = try callOnFrom(b, &rec, l, &.{r}, from);
+            const order = try callOnTyped(b, &rec, l, &.{r}, from, .{ .recv = b.exprType(x.lhs.id()), .operands = try b.p.a.dupe(TypeId, &.{b.exprType(x.rhs.id())}) });
             const zero = try b.emitConst(.{ .Int = 0 });
             try b.emit(.{ .BinOp = .{ .dst = dst, .op = cmp, .lhs = order, .rhs = zero } });
             return dst;
@@ -478,7 +604,7 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
             const l = try body.lowerExpr(b, x.lhs);
             const r = try body.lowerExpr(b, x.rhs);
             const rec = try b.call(e.id());
-            return callOnFrom(b, &rec, l, &.{r}, from);
+            return callOnTyped(b, &rec, l, &.{r}, from, .{ .recv = b.exprType(x.lhs.id()), .operands = try b.p.a.dupe(TypeId, &.{b.exprType(x.rhs.id())}), .result = b.exprType(e.id()) });
         },
         // A statement, never an expression the parser leaves here.
         .Assign => return b.fail(e.span(), "an assignment used as a value", .{}),
@@ -495,6 +621,14 @@ pub fn equality(b: *Builder, l: Reg, lt: TypeId, r: Reg, rt: TypeId, rec: CallRe
     if (rec.callee != .none and s.builtins.enum_ != .none and s.syms.owner(rec.callee) == s.builtins.enum_) {
         return identity(b, l, r);
     }
+    if (unsignedOf(s, lt) != null and s.types.classSym(lt) == s.types.classSym(rt) and
+        !s.types.isNullable(lt) and !s.types.isNullable(rt))
+    {
+        const dst = b.newReg();
+        try b.emit(.{ .BinOp = .{ .dst = dst, .op = .BoxedEq, .lhs = l, .rhs = r } });
+        return dst;
+    }
+    if (try class_bodies.inlineValueEquals(b, rec.callee, l, lt, r, rt)) |eq| return eq;
     const lp = primOf(s, lt);
     const rp = primOf(s, rt);
     if (lp != null and rp != null and lp.? != .string and rp.? != .string) {
@@ -503,7 +637,8 @@ pub fn equality(b: *Builder, l: Reg, lt: TypeId, r: Reg, rt: TypeId, rec: CallRe
         return dst;
     }
     const numeric_left = lp != null and lp.? != .string;
-    if (!mayBeNull(s, lt)) return if (numeric_left) primEquals(b, l, lt, r, rec) else callOn(b, &rec, l, &.{r});
+    const tys: Types = .{ .recv = lt, .operands = try b.p.a.dupe(TypeId, &.{rt}) };
+    if (!mayBeNull(s, lt)) return if (numeric_left) primEquals(b, l, lt, r, rec, tys) else callTyped(b, &rec, l, &.{r}, tys);
     const result = b.newReg();
     const on_null = try b.newBlock();
     const on_value = try b.newBlock();
@@ -517,7 +652,7 @@ pub fn equality(b: *Builder, l: Reg, lt: TypeId, r: Reg, rt: TypeId, rec: CallRe
     try b.emit(.{ .Move = .{ .dst = result, .src = both } });
     b.terminate(.{ .Goto = join });
     b.switchTo(on_value);
-    const eq = if (numeric_left) try primEquals(b, l, lt, r, rec) else try callOn(b, &rec, l, &.{r});
+    const eq = if (numeric_left) try primEquals(b, l, lt, r, rec, tys) else try callTyped(b, &rec, l, &.{r}, tys);
     try b.emit(.{ .Move = .{ .dst = result, .src = eq } });
     b.terminate(.{ .Goto = join });
     b.switchTo(join);
@@ -527,8 +662,10 @@ pub fn equality(b: *Builder, l: Reg, lt: TypeId, r: Reg, rt: TypeId, rec: CallRe
 /// A primitive's `equals(other)` on a value of any type: false unless
 /// `other` is of the same class, which the host's numeric equality would
 /// otherwise widen (`1 == (1L as Any)` is false).
-fn primEquals(b: *Builder, l: Reg, lt: TypeId, r: Reg, rec: CallRec) Error!Reg {
-    const cls = b.p.br.classOfOpt(b.p.s.types.classSym(lt)) orelse return callOn(b, &rec, l, &.{r});
+fn primEquals(b: *Builder, l: Reg, lt: TypeId, r_in: Reg, rec: CallRec, tys: Types) Error!Reg {
+    const cls = b.p.br.classOfOpt(b.p.s.types.classSym(lt)) orelse return callTyped(b, &rec, l, &.{r_in}, tys);
+    // A scalar class's value is tested by its class, boxed.
+    const r = try coerce.coerce(b, r_in, if (tys.operands.len != 0) tys.operands[0] else .none, .none);
     const same = b.newReg();
     try b.emit(.{ .RInstanceOf = .{ .dst = same, .src = r, .class = cls, .nullable = false } });
     const result = b.newReg();
@@ -537,7 +674,7 @@ fn primEquals(b: *Builder, l: Reg, lt: TypeId, r: Reg, rec: CallRec) Error!Reg {
     const join = try b.newBlock();
     b.terminate(.{ .Branch = .{ .cond = same, .t = yes, .f = no } });
     b.switchTo(yes);
-    try b.emit(.{ .Move = .{ .dst = result, .src = try callOn(b, &rec, l, &.{r}) } });
+    try b.emit(.{ .Move = .{ .dst = result, .src = try callTyped(b, &rec, l, &.{r}, tys) } });
     b.terminate(.{ .Goto = join });
     b.switchTo(no);
     try b.emit(.{ .Move = .{ .dst = result, .src = try b.emitConst(.{ .Bool = false }) } });
@@ -586,11 +723,13 @@ fn lowerShortCircuit(b: *Builder, is_and: bool, lhs: *const ast.Expr, rhs: *cons
     return result;
 }
 
-/// `a ?: b`: `b` runs only when `a` is null.
-fn lowerElvis(b: *Builder, lhs: *const ast.Expr, rhs: *const ast.Expr) Error!Reg {
+/// `a ?: b`: `b` runs only when `a` is null. Each side is converted to the
+/// whole expression's type.
+fn lowerElvis(b: *Builder, e: *const ast.Expr, lhs: *const ast.Expr, rhs: *const ast.Expr) Error!Reg {
     const result = b.newReg();
+    const whole = b.exprType(e.id());
     const l = try body.lowerExpr(b, lhs);
-    try b.emit(.{ .Move = .{ .dst = result, .src = l } });
+    try b.emit(.{ .Move = .{ .dst = result, .src = try coerce.coerce(b, l, b.exprType(lhs.id()), whole) } });
     const null_reg = try b.emitConst(.Null);
     const is_null = try identity(b, l, null_reg);
     const rhs_blk = try b.newBlock();
@@ -599,7 +738,7 @@ fn lowerElvis(b: *Builder, lhs: *const ast.Expr, rhs: *const ast.Expr) Error!Reg
     b.switchTo(rhs_blk);
     const r = try body.lowerExpr(b, rhs);
     if (!b.terminated()) {
-        try b.emit(.{ .Move = .{ .dst = result, .src = r } });
+        try b.emit(.{ .Move = .{ .dst = result, .src = try coerce.coerce(b, r, b.exprType(rhs.id()), whole) } });
         b.terminate(.{ .Goto = join });
     }
     b.switchTo(join);
@@ -619,7 +758,7 @@ pub fn lowerUnary(b: *Builder, e: *const ast.Expr) Error!Reg {
         else => return err,
     };
     const v = try body.lowerExpr(b, u.expr);
-    return callOn(b, &rec, v, &.{});
+    return callTyped(b, &rec, v, &.{}, .{ .recv = b.exprType(u.expr.id()), .result = b.exprType(e.id()) });
 }
 
 /// Arithmetic over integer literals, folded in the width of the type sema
@@ -686,7 +825,15 @@ pub fn lowerIndex(b: *Builder, e: *const ast.Expr) Error!Reg {
     const recv = try body.lowerExpr(b, ix.receiver);
     const rec = try b.call(e.id());
     const idx = try lowerAll(b, ix.args);
-    return callOn(b, &rec, recv, idx);
+    return callTyped(b, &rec, recv, idx, .{ .recv = b.exprType(ix.receiver.id()), .operands = try typesOf(b, ix.args, null), .result = b.exprType(e.id()) });
+}
+
+/// The static types of `exprs`, then of `last` when given.
+fn typesOf(b: *Builder, exprs: []const ast.Expr, last: ?*const ast.Expr) Error![]const TypeId {
+    const out = try b.p.a.alloc(TypeId, exprs.len + @intFromBool(last != null));
+    for (exprs, 0..) |*x, i| out[i] = b.exprType(x.id());
+    if (last) |l| out[exprs.len] = b.exprType(l.id());
+    return out;
 }
 
 /// `recv[args] = value`: the `set` recorded on the assignment `node`.
@@ -697,7 +844,7 @@ pub fn lowerIndexSet(b: *Builder, target: *const ast.Expr, value: *const ast.Exp
     const regs = try b.p.a.alloc(Reg, ix.args.len + 1);
     for (ix.args, regs[0..ix.args.len]) |*arg, *r| r.* = try body.lowerExpr(b, arg);
     regs[ix.args.len] = try body.lowerExpr(b, value);
-    _ = try callOn(b, &rec, recv, regs);
+    _ = try callTyped(b, &rec, recv, regs, .{ .recv = b.exprType(ix.receiver.id()), .operands = try typesOf(b, ix.args, value) });
 }
 
 fn lowerAll(b: *Builder, exprs: []const ast.Expr) Error![]Reg {
@@ -803,8 +950,10 @@ fn writeTargetFrom(b: *Builder, t: Target, c: *const records.Compound, value: Re
         },
         .name => |n| {
             const w = n.write orelse return b.fail(sp, "a compound assignment with no recorded write", .{});
-            if (w.kind == .local) return env.writeLocalFrom(b, w.target, value, from);
-            try name.write(b, &w, if (takesExpr(&w)) n.recv else null, value);
+            // The value is the compound operator's result.
+            const v_ty: TypeId = if (c.op.callee != .none and b.p.s.syms.kind(c.op.callee) == .function) try sema.headers.returnType(b.p.s, c.op.callee) else .none;
+            if (w.kind == .local) return env.writeLocalFrom(b, w.target, try coerce.coerce(b, value, v_ty, try name.heldType(b, &w)), from);
+            try name.write(b, &w, if (takesExpr(&w)) n.recv else null, .none, value, v_ty);
         },
     }
 }

@@ -36,6 +36,7 @@ const ResumeFrames = ev_state.ResumeFrames;
 const SuspendState = ev_snapshot.SuspendState;
 const TailSeg = ev_snapshot.TailSeg;
 const TryFrame = ev_snapshot.TryFrame;
+const try_alloc = ev_snapshot.try_alloc;
 const boolThisTrap = ev_enter.boolThisTrap;
 const dumpFnIfRequested = ev_enter.dumpFnIfRequested;
 const dumpFrameChainForDiag = ev_diag.dumpFrameChainForDiag;
@@ -233,8 +234,8 @@ pub fn resumeContinuation(
             }
         }
         var try_stack: std.ArrayList(TryFrame) = .empty;
-        defer try_stack.deinit(allocator);
-        try try_stack.appendSlice(allocator, snap.try_stack);
+        defer try_stack.deinit(try_alloc);
+        try try_stack.appendSlice(try_alloc, snap.try_stack);
         // Every value moved into a frame-owned buffer; free the snapshot's slice buffers, not its values.
         freeSnapshotBuffers(snap, allocator);
         const r = try runFrameInner(
@@ -415,27 +416,35 @@ inline fn actPoolOn() bool {
     return !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
 }
 
+/// An activation whose try stack is empty: a pooled one keeps its try stack's buffer, a fresh one
+/// has none.
 fn actAlloc(ev: *EvalTls, allocator: Allocator) Allocator.Error!*Activation {
-    if (actPoolOn()) {
+    const act = if (actPoolOn()) blk: {
         if (ev.act_pool_len > 0) {
             ev.act_pool_len -= 1;
             return ev.act_pool[ev.act_pool_len];
         }
-        return std.heap.c_allocator.create(Activation);
-    }
-    return allocator.create(Activation);
+        break :blk try std.heap.c_allocator.create(Activation);
+    } else try allocator.create(Activation);
+    act.try_stack = .empty;
+    return act;
 }
 
+/// Back to the pool with its try stack emptied, its buffer kept; one the pool has no room for,
+/// or any under the refcount backend, is destroyed with its try stack.
 pub fn actFree(ev: *EvalTls, allocator: Allocator, act: *Activation) void {
     if (actPoolOn()) {
         if (ev.act_pool_len < ACT_POOL_MAX) {
+            act.try_stack.clearRetainingCapacity();
             ev.act_pool[ev.act_pool_len] = act;
             ev.act_pool_len += 1;
             return;
         }
+        act.try_stack.deinit(try_alloc);
         std.heap.c_allocator.destroy(act);
         return;
     }
+    act.try_stack.deinit(try_alloc);
     allocator.destroy(act);
 }
 
@@ -472,13 +481,14 @@ pub inline fn openStreamActivation(
     } else blk: {
         const fresh = try std.heap.c_allocator.create(Activation);
         fresh.frame.wmask.clear();
+        fresh.try_stack = .empty;
         break :blk fresh;
     };
     errdefer actFree(ev, allocator, act);
     try act.frame.enterStream(ev, allocator, module, func, params, captures, area, no_fill, false);
     act.frame.closure = closure;
     act.frame.module_arc = owning;
-    act.try_stack = .empty;
+    act.try_stack.clearRetainingCapacity();
     act.ret_dst = dst;
     gcPushFrame(&act.frame);
     return act;
@@ -493,11 +503,14 @@ pub inline fn closeStreamActivation(ev: *EvalTls, allocator: Allocator, act: *Ac
     }
     gcPopFrame(&act.frame);
     act.frame.deinitStream(ev, false);
-    if (act.try_stack.capacity != 0) act.try_stack.deinit(allocator);
     if (ev.act_pool_len < ACT_POOL_MAX) {
+        act.try_stack.clearRetainingCapacity();
         ev.act_pool[ev.act_pool_len] = act;
         ev.act_pool_len += 1;
-    } else std.heap.c_allocator.destroy(act);
+    } else {
+        act.try_stack.deinit(try_alloc);
+        std.heap.c_allocator.destroy(act);
+    }
 }
 
 /// Open a flat activation for a direct interpreted call: the entry sequence `evalClosure` performs recursively.
@@ -515,7 +528,6 @@ pub fn openActivation(ev: *EvalTls, allocator: Allocator, caller_module: *const 
     try act.frame.enter(ev, allocator, module, req.func, req.params, req.captures, req.area);
     act.frame.closure = req.closure;
     act.frame.module_arc = req.owning;
-    act.try_stack = .empty;
     act.ret_idx = 0;
     act.ret_dst = req.dst;
     act.ret_streams = null;
@@ -524,12 +536,13 @@ pub fn openActivation(ev: *EvalTls, allocator: Allocator, caller_module: *const 
     return act;
 }
 
-/// Tear down a flat activation: `evalClosure`'s exit defers in LIFO order.
+/// Tear down a flat activation: `evalClosure`'s exit defers in LIFO order. Its try stack goes with
+/// the activation, in `actFree`.
 pub fn teardownActivation(allocator: Allocator, act: *Activation) void {
+    _ = allocator;
     gcPopFrame(&act.frame);
     // The activation just ran on this thread, so its frame's state is the running thread's.
     act.frame.deinitIn(act.frame.tls);
-    act.try_stack.deinit(allocator);
 }
 
 /// Park a flat activation live: take it off the frame chain and the value stack, then hand the
@@ -574,7 +587,6 @@ pub fn liveParkActivation(
 /// Destroy a live-parked activation dropped without a resume. The frame owns its register references; params and captures are borrows.
 pub fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
     act.frame.deinit();
-    act.try_stack.deinit(allocator);
     actFree(ev_state.evtlsPtr(), allocator, act);
 }
 

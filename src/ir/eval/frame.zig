@@ -190,6 +190,33 @@ pub const Frame = struct {
         self.init(ev, allocator, module, func, window, params, captures, mark, !no_fill);
     }
 
+    /// `enterStream` over a `window` the caller took from the value stack, on a frame whose mask's
+    /// use counter is below its last value: nothing here can fail, allocate or clear the mask.
+    /// A function not shown to write each register before reading it gets its window filled with
+    /// `Unit`, one tag at a time, which compiles to stores rather than a call.
+    pub inline fn enterWindow(
+        self: *Frame,
+        ev: *EvalTls,
+        allocator: Allocator,
+        module: *const Module,
+        func: *const Func,
+        window: []Value,
+        params: []const Value,
+        captures: []const Value,
+        mark: VsMark,
+        no_fill: bool,
+    ) void {
+        std.debug.assert(self.wmask.use != std.math.maxInt(u8));
+        self.initFields(ev, allocator, module, func, window, params, captures, mark);
+        if (no_fill) {
+            self.wmask.filled = false;
+            self.wmask.use += 1;
+        } else {
+            for (window) |*v| v.* = .Unit;
+            self.wmask.filled = true;
+        }
+    }
+
     /// Every field of a fresh frame over `window`. Written one by one: a struct literal would copy
     /// the mask's bytes, which only the registers a no-fill window writes are read from.
     inline fn init(
@@ -204,12 +231,27 @@ pub const Frame = struct {
         mark: VsMark,
         filled: bool,
     ) void {
+        self.initFields(ev, allocator, module, func, window, params, captures, mark);
+        self.wmask.reset(filled);
+    }
+
+    /// `init` but for the mask.
+    inline fn initFields(
+        self: *Frame,
+        ev: *EvalTls,
+        allocator: Allocator,
+        module: *const Module,
+        func: *const Func,
+        window: []Value,
+        params: []const Value,
+        captures: []const Value,
+        mark: VsMark,
+    ) void {
         // A field added to `Frame` is set here too.
         comptime std.debug.assert(std.meta.fields(Frame).len == 18);
         self.module = module;
         self.func = func;
         self.regs = window;
-        self.wmask.reset(filled);
         self.params = params;
         self.captures = captures;
         self.vs_mark = mark;

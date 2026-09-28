@@ -12,6 +12,7 @@ const bridge = @import("../../core/bridge.zig");
 const builder = @import("builder.zig");
 const records = @import("records.zig");
 const body = @import("body.zig");
+const coerce = @import("coerce.zig");
 const env = @import("env.zig");
 
 const Builder = builder.Builder;
@@ -25,7 +26,8 @@ const TypeId = sema.TypeId;
 /// `is` / `!is`.
 pub fn lowerIsCheck(b: *Builder, e: *const ast.Expr) Error!Reg {
     const c = e.IsCheck;
-    const v = try body.lowerExpr(b, c.expr);
+    // A scalar class's value is tested boxed, as an instance of its class.
+    const v = try coerce.coerce(b, try body.lowerExpr(b, c.expr), b.exprType(c.expr.id()), .none);
     const rec = try b.typeTest(e.id());
     return testAgainst(b, &rec, v);
 }
@@ -34,7 +36,14 @@ pub fn lowerIsCheck(b: *Builder, e: *const ast.Expr) Error!Reg {
 /// unchecked; it checks the parameter's erased bound, as the JVM does.
 pub fn lowerAs(b: *Builder, e: *const ast.Expr) Error!Reg {
     const c = e.As;
-    const v = try body.lowerExpr(b, c.expr);
+    // A scalar class's value is cast boxed; the result converts to the
+    // cast's own type.
+    const v = try coerce.coerce(b, try body.lowerExpr(b, c.expr), b.exprType(c.expr.id()), .none);
+    const cast = try castOf(b, e, v);
+    return coerce.coerce(b, cast, .none, b.exprType(e.id()));
+}
+
+fn castOf(b: *Builder, e: *const ast.Expr, v: Reg) Error!Reg {
     const rec = try b.typeTest(e.id());
     const safe = rec.kind == .as_safe;
     const dst = b.newReg();

@@ -313,6 +313,30 @@ as `CallStatic` (without `arg_names`, `type_args`, `exact`, `fuse_site`,
   `noinline` parameter and a non-literal argument are passed as values. The
   ordinary function stays the target of references to it. There is no
   separate template format, and it replaces the AST splice outright.
+- **Value classes.** A final value class over a number (not `String`,
+  declared outside `kotlin.*`) is that number wherever a value's static
+  type is the class, and a boxed instance elsewhere
+  (`lower/sema/coerce.zig`, `plans/value-classes.md`). The register an
+  expression lowers to holds its static type's form; `BoxValue` and
+  `UnboxValue` convert where a value moves to a place of another type (an
+  argument, an assignment, a return, a branch of a conditional, a cast, a
+  template), and each is the value itself when it is in that form already.
+  A signature position holds the number when its override family's root
+  declares the class there.
+- **Registers.** A body takes a fresh register for each temporary as it
+  lowers, and each inline body it copies in takes a range of its own, so a
+  body that inlines a few helpers can reach hundreds; a frame is that wide on
+  every call. Once lowered, a body of more than 64 registers is renumbered
+  (`ir.regs.compact`) so that two registers share one when neither is
+  written where the other is live, as a JVM method's locals share slots. An
+  argument run keeps its registers consecutive, a register a catch or a
+  finally reads shares with none, and a copy into the register it copies
+  from is dropped. A body calls copy in keeps its numbering, since the copy
+  reads which parameter a register holds from the register. A frame starts
+  with its registers unfilled when each is written before it is read on
+  every path (`Func.frameDefBeforeUse`), a throw into a catch or a finally
+  included: the handler starts with what was written where its try region
+  began.
 
 **The guard.** A comptime test walks `@typeInfo(Inst)` and fails the build on
 a payload field that is a `[]const u8`, a `TypeRef`, a `ConstId` outside the

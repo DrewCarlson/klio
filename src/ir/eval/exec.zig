@@ -1,4 +1,7 @@
-//! The frame dispatch loop and its instruction fast paths.
+//! The frame loop: runs a frame's blocks through their streams (`stream.zig`), routes throws,
+//! non-local returns and finally flows, and opens and closes the activations a call the stream
+//! loop does not run in place needs. Also the scalar operations the stream ops and the
+//! instruction arms compute with.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -32,6 +35,7 @@ const ev_resolved = @import("resolved.zig");
 const ev_snapshot = @import("snapshot.zig");
 const ev_state = @import("state.zig");
 const ev_values = @import("values.zig");
+const stream = @import("stream.zig");
 
 const EvalError = ev_state.EvalError;
 const EvalResult = ev_flow.EvalResult;
@@ -118,11 +122,22 @@ fn runLoop(
     host: *H,
 ) Allocator.Error!EvalResult {
     const ev: *EvalTls = ev_state.evtlsPtr();
-    // The innermost open activation; each links to the one that called it.
-    var top: ?*Activation = null;
+    const S = stream.Stream(H, reclaim);
+    // What the stream loop keeps besides its hot state; the open activations are its `top`.
+    var c: S.Ctx = .{
+        .allocator = allocator,
+        .host = host,
+        .ev = ev,
+        .root = root,
+        .root_ts = root_ts,
+        .try_stack = root_ts,
+        .func = root.func,
+        .bs = undefined,
+        .frame = root,
+    };
     // On an allocation failure, unwind every open activation so no frame dangles on the GC chain.
-    errdefer while (top) |act| {
-        top = act.caller;
+    errdefer while (c.top) |act| {
+        c.top = act.caller;
         ev.eval_depth -= 1;
         teardownActivation(allocator, act);
         actFree(ev, allocator, act);
@@ -145,8 +160,8 @@ fn runLoop(
         var func: *const Func = frame.func;
         var flat_site: ?FlatCallSite = null;
         var park_point: ?ParkPoint = null;
-        const flat_out = &flat_site;
-        const park_out = &park_point;
+        c.flat_out = &flat_site;
+        c.park_out = &park_point;
         var res: EvalResult = blocks: {
             // Lazy IR: materialise a deferred function's blocks first.
             if (func.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(func))) {
@@ -189,7 +204,7 @@ fn runLoop(
                 }
                 const block = &func.blocks[cur.int()];
                 if (resume_idx == 0) {
-                    try enterTryBlock(allocator, try_stack, block, cur);
+                    try enterTryBlock(try_stack, block, cur);
                 } else if (block.h().catch_done_for) |body| {
                     // A resume into a catch-only try's join pops the body's frame, as an entry does.
                     if (rpositionByBody(try_stack.items, body)) |p| _ = try_stack.orderedRemove(p);
@@ -211,773 +226,52 @@ fn runLoop(
                     unwound = e;
                     start_idx = insts.len;
                 }
-                var idx: usize = 0;
-                var ret_v: EvalResult = ok(.Unit);
                 // A stream exit that leaves only its block's terminator to the frame loop.
                 // The block's stream: its ops run the instructions, every other one escapes to its
                 // arm in `execInst`, and control flow funnels through `afterStep`. A mid-block resume
                 // enters at the instruction's pc.
                 bc_run: {
-                    var bs = bc_streams;
+                    const bs = bc_streams;
                     // A resume carrying a throw/unwind runs no instruction of the block: an EMPTY
                     // block's `start_idx` is 0 too, and a terminator op must not run first.
                     if (thrown != null or unwound != null) break :bc_run;
                     // The one bounds check the stream ops rely on; every operand was validated at build.
                     if (frame.regs.len < func.n_locals) break :blocks errResult(.{ .Type = "a register window shorter than its function's registers" });
-                    var bcur = cur;
-                    const bl = bs.blocks[bcur.int()];
-                    var code = bs.code;
+                    const bl = bs.blocks[cur.int()];
                     // Every block's ops end in an `end` op; a resume at the terminator starts on it.
-                    var pc: usize = if (start_idx == 0)
+                    const pc: usize = if (start_idx == 0)
                         bl.start
                     else if (start_idx >= insts.len)
                         bl.end
                     else
                         bl.idx_pc[start_idx];
-                    // Each op dispatches the next itself, so every op's successor has a branch of its own.
-                    bc_loop: {
-                        sw: switch (opAt(code, pc)) {
-                            .end => {
-                                leaveSpan(frame, code, pc + 1);
-                                break :bc_loop;
-                            },
-                            .block_entry => {
-                                try enterTryBlock(allocator, try_stack, &frame.func.blocks[bcur.int()], bcur);
-                                pc += 1;
-                                continue :sw opAt(code, pc);
-                            },
-                            .goto_try => {
-                                leaveSpan(frame, code, pc + 3);
-                                // A return, a throw or a non-local return passing through a finally takes the
-                                // frame loop's routing.
-                                if (frame.pending) |p| if (p.tryDepth() != null) {
-                                    cur = bcur;
-                                    resume_idx = std.math.maxInt(usize);
-                                    continue :block_loop;
-                                };
-                                leaveTryBlock(try_stack, &frame.func.blocks[bcur.int()], bcur);
-                                const target = code[pc + 1];
-                                if (target <= bcur.int()) if (edgeGuard(allocator, ftls)) |er| {
-                                    cur = bcur;
-                                    break :blocks er;
-                                };
-                                bcur = @enumFromInt(target);
-                                pc = code[pc + 2];
-                                continue :sw opAt(code, pc);
-                            },
-                            .const_val => {
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), bs.values[code[pc + 2]], allocator, reclaim);
-                                pc += 3;
-                                continue :sw opAt(code, pc);
-                            },
-                            .const_load => {
-                                const v = try constToValue(allocator, &frame.module.consts.items[code[pc + 2]]);
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), v, allocator, reclaim);
-                                pc += 3;
-                                continue :sw opAt(code, pc);
-                            },
-                            .const_str => {
-                                const slot = &bs.strings[code[pc + 3]];
-                                const raw = slot.load(.acquire);
-                                const v: Value = if (raw != 0)
-                                    .{ .String = .{ .cell = @ptrFromInt(raw) } }
-                                else
-                                    try internString(allocator, frame, code[pc + 2], slot);
-                                if (reclaim) v.retain();
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), v, allocator, reclaim);
-                                pc += 4;
-                                continue :sw opAt(code, pc);
-                            },
-                            .const_int => {
-                                const v: Value = .{ .Int = @bitCast(code[pc + 2]) };
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), v, allocator, reclaim);
-                                pc += 3;
-                                continue :sw opAt(code, pc);
-                            },
-                            .move => {
-                                const v = frame.regs.ptr[code[pc + 2]];
-                                if (reclaim) v.retain();
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), v, allocator, reclaim);
-                                pc += 3;
-                                continue :sw opAt(code, pc);
-                            },
-                            .load_param => {
-                                const pidx: usize = code[pc + 2];
-                                const v = if (pidx < frame.params.len) frame.params[pidx] else Value.Unit;
-                                if (reclaim) v.retain();
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), v, allocator, reclaim);
-                                pc += 3;
-                                continue :sw opAt(code, pc);
-                            },
-                            .make_cell => {
-                                const v = frame.regs.ptr[code[pc + 2]];
-                                v.retain();
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), try Value.newCell(allocator, v), allocator, reclaim);
-                                pc += 3;
-                                continue :sw opAt(code, pc);
-                            },
-                            .cell_set => {
-                                const cell = frame.regs.ptr[code[pc + 2]];
-                                if (cell == .Cell) {
-                                    const v = frame.regs.ptr[code[pc + 3]];
-                                    v.retain();
-                                    const g = cell.Cell.borrowMut();
-                                    const old = g.get().*;
-                                    g.get().* = v;
-                                    g.deinit();
-                                    if (reclaim) old.release(allocator);
-                                    pc += 4;
-                                    continue :sw opAt(code, pc);
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 4,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .store_static => {
-                                if (ev_resolved.storeReadyStatic(H, allocator, frame, host, code[pc + 2], frame.regs.ptr[code[pc + 3]])) {
-                                    pc += 4;
-                                    continue :sw opAt(code, pc);
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 4,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            inline .make_closure, .new_array => |op| {
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                // The arm itself, without the instruction switch in front of it.
-                                const r = if (op == .make_closure)
-                                    try ev_resolved.execMakeClosure(H, allocator, frame, inst.MakeClosure, host)
-                                else
-                                    try ev_resolved.execNewArray(H, allocator, frame, inst.NewArray, host);
-                                if (r == .cont) {
-                                    pc += 2;
-                                    continue :sw opAt(code, pc);
-                                }
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 2,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .load_capture => {
-                                const cidx: usize = code[pc + 2];
-                                const v = if (cidx < frame.captures.len) frame.captures[cidx] else Value.Unit;
-                                if (reclaim) v.retain();
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), v, allocator, reclaim);
-                                pc += 3;
-                                continue :sw opAt(code, pc);
-                            },
-                            .load_static => {
-                                if (ev_resolved.readyStatic(H, frame, host, code[pc + 3])) |v| {
-                                    if (reclaim) v.retain();
-                                    writeFastR(frame, @enumFromInt(code[pc + 2]), v, allocator, reclaim);
-                                    pc += 4;
-                                    continue :sw opAt(code, pc);
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 4,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .is, .cast => |op| {
-                                const v = frame.regs.ptr[code[pc + 3]];
-                                const flags = code[pc + 5];
-                                if (ev_resolved.quickIsA(frame, &v, code[pc + 4], flags & 1 != 0)) |yes| {
-                                    const dst: Reg = @enumFromInt(code[pc + 2]);
-                                    if (op == .is) {
-                                        writeFastR(frame, dst, .{ .Bool = yes }, allocator, reclaim);
-                                        pc += 6;
-                                        continue :sw opAt(code, pc);
-                                    }
-                                    // A failing `as` throws from its arm.
-                                    if (yes or flags & 2 != 0) {
-                                        const out: Value = if (yes) v else .Null;
-                                        if (reclaim) out.retain();
-                                        writeFastR(frame, dst, out, allocator, reclaim);
-                                        pc += 6;
-                                        continue :sw opAt(code, pc);
-                                    }
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 6,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .cell_get => {
-                                const v = switch (frame.regs.ptr[code[pc + 2]]) {
-                                    .Cell => |c| vblk: {
-                                        const g = c.borrow();
-                                        defer g.deinit();
-                                        break :vblk g.get().*;
-                                    },
-                                    else => |other| other,
-                                };
-                                if (reclaim) v.retain();
-                                writeFastR(frame, @enumFromInt(code[pc + 1]), v, allocator, reclaim);
-                                pc += 3;
-                                continue :sw opAt(code, pc);
-                            },
-                            .bin => {
-                                // Same-tag scalar operands take an inline path with the exact `applyBinop`
-                                // semantics; anything else, a zero divisor included, falls through.
-                                if (binFast(
-                                    frame,
-                                    @enumFromInt(code[pc + 2] & 0xff),
-                                    @enumFromInt(code[pc + 3]),
-                                    @enumFromInt(code[pc + 4]),
-                                    @enumFromInt(code[pc + 5]),
-                                    allocator,
-                                    reclaim,
-                                )) {
-                                    pc += 6;
-                                    continue :sw opAt(code, pc);
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 6,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            inline .add, .sub => |op| {
-                                const regs = frame.regs.ptr;
-                                const l = regs[code[pc + 4]];
-                                const r = regs[code[pc + 5]];
-                                if (l == .Int and r == .Int) {
-                                    const v = if (op == .add) l.Int +% r.Int else l.Int -% r.Int;
-                                    writeFastR(frame, @enumFromInt(code[pc + 3]), .{ .Int = v }, allocator, reclaim);
-                                    pc += 6;
-                                    continue :sw opAt(code, pc);
-                                }
-                                if (l == .Long and r == .Long) {
-                                    const v = if (op == .add) l.Long +% r.Long else l.Long -% r.Long;
-                                    writeFastR(frame, @enumFromInt(code[pc + 3]), .{ .Long = v }, allocator, reclaim);
-                                    pc += 6;
-                                    continue :sw opAt(code, pc);
-                                }
-                                continue :sw .bin;
-                            },
-                            .cmp => {
-                                const regs = frame.regs.ptr;
-                                const l = regs[code[pc + 4]];
-                                const r = regs[code[pc + 5]];
-                                const mask = code[pc + 2] >> 8;
-                                if (l == .Int and r == .Int) {
-                                    writeFastR(frame, @enumFromInt(code[pc + 3]), .{ .Bool = holds(mask, l.Int, r.Int) }, allocator, reclaim);
-                                    pc += 6;
-                                    continue :sw opAt(code, pc);
-                                }
-                                if (l == .Long and r == .Long) {
-                                    writeFastR(frame, @enumFromInt(code[pc + 3]), .{ .Bool = holds(mask, l.Long, r.Long) }, allocator, reclaim);
-                                    pc += 6;
-                                    continue :sw opAt(code, pc);
-                                }
-                                continue :sw .bin;
-                            },
-                            .un => {
-                                if (unopFast(frame, @enumFromInt(code[pc + 2]), @enumFromInt(code[pc + 3]), @enumFromInt(code[pc + 4]), allocator, reclaim)) {
-                                    pc += 5;
-                                    continue :sw opAt(code, pc);
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 5,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .call, .vcall => |op| {
-                                idx = code[pc + 1];
-                                const op_len: usize = if (op == .call) 8 else 6;
-                                const fid: u32 = if (op == .call) code[pc + 2] else virtualTarget(frame, code[pc + 2], code[pc + 3]) orelse NO_TARGET;
-                                const callee: ?*const bc.FuncStreams = if (op == .call)
-                                    staticCallee(H, host, frame, ev, bs, fid, code[pc + 6], code[pc + 7])
-                                else
-                                    streamCallee(frame, ev, fid);
-                                if (callee) |sc| {
-                                    if (sc.leaf != .none and !parent.call_hooks_on) {
-                                        const run = argRun(frame, @enumFromInt(code[pc + 3]), code[pc + 4]);
-                                        if (runLeaf(frame, sc.leaf, run, @enumFromInt(code[pc + 5]), allocator, reclaim)) {
-                                            pc += op_len;
-                                            continue :sw opAt(code, pc);
-                                        }
-                                    }
-                                    frame.at(bcur, idx);
-                                    // The call is a block edge for the loop's guards.
-                                    if (edgeGuard(allocator, ftls)) |er| {
-                                        cur = bcur;
-                                        break :blocks er;
-                                    }
-                                    const params = argRun(frame, @enumFromInt(code[pc + 3]), code[pc + 4]);
-                                    ev.eval_depth += 1;
-                                    const act = openStreamActivation(ev, allocator, frame.module, sc.func, params, &.{}, null, null, null, @enumFromInt(code[pc + 5]), sc.no_fill, reclaim) catch |e| {
-                                        ev.eval_depth -= 1;
-                                        return e;
-                                    };
-                                    act.ret_block = bcur;
-                                    act.ret_idx = idx + 1;
-                                    // A caller whose every block ends in a stream op goes on in its stream at the return.
-                                    act.ret_streams = bs;
-                                    act.ret_pc = @intCast(pc + op_len);
-                                    act.caller = top;
-                                    top = act;
-                                    frame = &act.frame;
-                                    try_stack = &act.try_stack;
-                                    func = sc.func;
-                                    if (parent.call_hooks_on) {
-                                        if (runtime.prof.fn_prof_active) _ = fnProfEnter(func.id.int());
-                                        if (parent.frame_count_on) parent.frame_count_total += 1;
-                                        dumpFnIfRequested(func);
-                                    }
-                                    bc_streams = sc;
-                                    bs = sc;
-                                    bcur = func.entry;
-                                    code = sc.code;
-                                    pc = sc.entry_pc;
-                                    continue :sw opAt(code, pc);
-                                }
-                                // A host function the tables bind runs here over the argument run, once the
-                                // unit a static call must see run has.
-                                if (nativeOf(frame, fid)) |nid| if (op == .vcall or ev_resolved.unitReady(H, host, code[pc + 7])) {
-                                    frame.at(bcur, idx);
-                                    if (try hostCall(H, allocator, frame, host, nid, code[pc + 3], code[pc + 4], code[pc + 5], reclaim)) |e| {
-                                        frame.tls.step_err = e;
-                                        const inst = instAt(frame, bcur, idx);
-                                        switch (try afterStep(allocator, frame, .raised, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                            .cont, .brk => break :bc_loop,
-                                            .ret => break :blocks ret_v,
-                                        }
-                                    }
-                                    pc += op_len;
-                                    continue :sw opAt(code, pc);
-                                };
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += op_len,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .new, .callv => |op| {
-                                idx = code[pc + 1];
-                                const op_len: usize = if (op == .new) 8 else 6;
-                                frame.at(bcur, idx);
-                                const target: ?StreamTarget = if (op == .new)
-                                    try constructTarget(H, allocator, frame, ev, host, bs, code[pc..][0..8], reclaim)
-                                else
-                                    try closureTarget(H, frame, ev, host, code[pc..][0..6]);
-                                if (target) |t| {
-                                    const sc = t.streams;
-                                    // A constructor that only takes its properties stores them in the
-                                    // instance the register already holds.
-                                    if (op == .new and sc.leaf == .set_fields and !parent.call_hooks_on and
-                                        storeLeafFields(sc.leaf.set_fields, t.params, allocator, reclaim))
-                                    {
-                                        if (t.area) |m| ev.vstack.restore(m);
-                                        pc += op_len;
-                                        continue :sw opAt(code, pc);
-                                    }
-                                    // The call is a block edge for the loop's guards.
-                                    if (edgeGuard(allocator, ftls)) |er| {
-                                        if (t.area) |m| ev.vstack.restore(m);
-                                        cur = bcur;
-                                        break :blocks er;
-                                    }
-                                    ev.eval_depth += 1;
-                                    const act = openStreamActivation(ev, allocator, t.run_module orelse frame.module, sc.func, t.params, t.captures, t.area, t.closure, t.owning, t.dst, sc.no_fill, reclaim) catch |e| {
-                                        ev.eval_depth -= 1;
-                                        if (t.area) |m| ev.vstack.restore(m);
-                                        return e;
-                                    };
-                                    act.ret_block = bcur;
-                                    act.ret_idx = idx + 1;
-                                    // A caller whose every block ends in a stream op goes on in its stream at the return.
-                                    act.ret_streams = bs;
-                                    act.ret_pc = @intCast(pc + op_len);
-                                    act.caller = top;
-                                    top = act;
-                                    frame = &act.frame;
-                                    try_stack = &act.try_stack;
-                                    func = sc.func;
-                                    if (parent.call_hooks_on) {
-                                        if (runtime.prof.fn_prof_active) _ = fnProfEnter(func.id.int());
-                                        if (parent.frame_count_on) parent.frame_count_total += 1;
-                                        dumpFnIfRequested(func);
-                                    }
-                                    bc_streams = sc;
-                                    bs = sc;
-                                    bcur = func.entry;
-                                    code = sc.code;
-                                    pc = sc.entry_pc;
-                                    continue :sw opAt(code, pc);
-                                }
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += op_len,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .native => {
-                                idx = code[pc + 1];
-                                frame.at(bcur, idx);
-                                const run = argRun(frame, @enumFromInt(code[pc + 3]), code[pc + 4]);
-                                const nid: ir.NativeId = @enumFromInt(code[pc + 2]);
-                                // A Kotlin receiver's own override of the member answers; `super` runs the native.
-                                const res = if (comptime @hasDecl(H, "callNativeSite"))
-                                    (if (code[pc + 6] == 0 and run.len != 0 and run[0] == .Instance)
-                                        try host.callNativeSite(allocator, nid, run)
-                                    else
-                                        try host.callNative(allocator, nid, run))
-                                else
-                                    try host.callNative(allocator, nid, run);
-                                switch (res) {
-                                    .ok => |v| {
-                                        writeFastR(frame, @enumFromInt(code[pc + 5]), v, allocator, reclaim);
-                                        pc += 7;
-                                        continue :sw opAt(code, pc);
-                                    },
-                                    .err => |e| {
-                                        frame.tls.step_err = e;
-                                        const inst = instAt(frame, bcur, idx);
-                                        switch (try afterStep(allocator, frame, .raised, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                            .cont, .brk => break :bc_loop,
-                                            .ret => break :blocks ret_v,
-                                        }
-                                    },
-                                }
-                            },
-                            .array_get => {
-                                const arr = frame.regs.ptr[code[pc + 3]];
-                                if (arr == .Array or arr == .String) {
-                                    const idx_v = frame.regs.ptr[code[pc + 4]];
-                                    if (ev_values.fastIndexGet(&arr, &idx_v)) |v| {
-                                        writeFastR(frame, @enumFromInt(code[pc + 2]), v, allocator, reclaim);
-                                        pc += 5;
-                                        continue :sw opAt(code, pc);
-                                    }
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 5,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .array_set => {
-                                const arr = frame.regs.ptr[code[pc + 2]];
-                                if (arr == .Array) {
-                                    const idx_v = frame.regs.ptr[code[pc + 3]];
-                                    if (ev_values.fastIndexSet(allocator, &arr, &idx_v, frame.regs.ptr[code[pc + 4]]) != null) {
-                                        pc += 5;
-                                        continue :sw opAt(code, pc);
-                                    }
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 5,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .load_object => {
-                                if (ev_resolved.builtObject(H, frame, host, code[pc + 3])) |v| {
-                                    if (reclaim) v.retain();
-                                    writeFastR(frame, @enumFromInt(code[pc + 2]), v, allocator, reclaim);
-                                    pc += 4;
-                                    continue :sw opAt(code, pc);
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 4,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .not => {
-                                const v = frame.regs.ptr[code[pc + 3]];
-                                if (v == .Bool) {
-                                    writeFastR(frame, @enumFromInt(code[pc + 2]), .{ .Bool = !v.Bool }, allocator, reclaim);
-                                    pc += 4;
-                                    continue :sw opAt(code, pc);
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 4,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .get_field => {
-                                const obj = frame.regs.ptr[code[pc + 3]];
-                                if (obj == .Instance) if (runtime.InstanceData.slotGet(obj.Instance, code[pc + 4])) |v| {
-                                    if (reclaim) v.retain();
-                                    writeFastR(frame, @enumFromInt(code[pc + 2]), v, allocator, reclaim);
-                                    pc += 5;
-                                    continue :sw opAt(code, pc);
-                                };
-                                // A null, a host value or a slot past the fields: the instruction's arm.
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 5,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .set_field => {
-                                const obj = frame.regs.ptr[code[pc + 2]];
-                                if (obj == .Instance) {
-                                    const v = frame.regs.ptr[code[pc + 4]];
-                                    if (reclaim) v.retain();
-                                    if (runtime.InstanceData.slotSet(obj.Instance, code[pc + 3], v)) |old| {
-                                        if (reclaim) old.release(allocator);
-                                        pc += 5;
-                                        continue :sw opAt(code, pc);
-                                    }
-                                    if (reclaim) v.release(allocator);
-                                }
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 5,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .escape => {
-                                idx = code[pc + 1];
-                                const inst = instAt(frame, bcur, idx);
-                                frame.at(bcur, idx);
-                                const r = try execInst(H, allocator, frame, inst, host);
-                                switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                    .cont => pc += 2,
-                                    .brk => break :bc_loop,
-                                    .ret => break :blocks ret_v,
-                                }
-                                continue :sw opAt(code, pc);
-                            },
-                            .jump => {
-                                leaveSpan(frame, code, pc + 3);
-                                const target = code[pc + 1];
-                                if (target <= bcur.int()) if (edgeGuard(allocator, ftls)) |er| {
-                                    cur = bcur;
-                                    break :blocks er;
-                                };
-                                bcur = @enumFromInt(target);
-                                pc = code[pc + 2];
-                                continue :sw opAt(code, pc);
-                            },
-                            .br => {
-                                leaveSpan(frame, code, pc + 6);
-                                const cv = frame.regs.ptr[code[pc + 1]];
-                                if (cv != .Bool) {
-                                    // Cell-carried or coercing condition: the frame loop's Branch runs `valueTruthy`.
-                                    cur = bcur;
-                                    resume_idx = std.math.maxInt(usize);
-                                    continue :block_loop;
-                                }
-                                // Each edge is its own path, so the next pc waits on a predicted branch
-                                // rather than on the condition's value.
-                                if (cv.Bool) {
-                                    const target = code[pc + 2];
-                                    if (target <= bcur.int()) if (edgeGuard(allocator, ftls)) |er| {
-                                        cur = bcur;
-                                        break :blocks er;
-                                    };
-                                    bcur = @enumFromInt(target);
-                                    pc = code[pc + 3];
-                                    continue :sw opAt(code, pc);
-                                }
-                                const target = code[pc + 4];
-                                if (target <= bcur.int()) if (edgeGuard(allocator, ftls)) |er| {
-                                    cur = bcur;
-                                    break :blocks er;
-                                };
-                                bcur = @enumFromInt(target);
-                                pc = code[pc + 5];
-                                continue :sw opAt(code, pc);
-                            },
-                            .cmp_br => {
-                                // The block's last BinOp fused with its Branch: the compare computes inline, still
-                                // writes dst so register state matches the unfused form, and branches.
-                                var taken: ?bool = null;
-                                {
-                                    const regs = frame.regs.ptr;
-                                    const di: Reg = @enumFromInt(code[pc + 3]);
-                                    const l = regs[code[pc + 4]];
-                                    const r = regs[code[pc + 5]];
-                                    const kw = code[pc + 2];
-                                    const mask = kw >> 8;
-                                    if (mask != 0 and l == .Int and r == .Int) {
-                                        const b = holds(mask, l.Int, r.Int);
-                                        writeFastR(frame, di, .{ .Bool = b }, allocator, reclaim);
-                                        taken = b;
-                                    } else if (mask != 0 and l == .Long and r == .Long) {
-                                        const b = holds(mask, l.Long, r.Long);
-                                        writeFastR(frame, di, .{ .Bool = b }, allocator, reclaim);
-                                        taken = b;
-                                    } else if (scalarBin(@enumFromInt(kw & 0xff), l, r)) |out| {
-                                        if (out == .Bool) {
-                                            writeFastR(frame, di, out, allocator, reclaim);
-                                            taken = out.Bool;
-                                        }
-                                    }
-                                }
-                                if (taken == null) {
-                                    idx = code[pc + 1];
-                                    const inst = instAt(frame, bcur, idx);
-                                    frame.at(bcur, idx);
-                                    const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
-                                    switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                                        .cont => {},
-                                        .brk => break :bc_loop,
-                                        .ret => break :blocks ret_v,
-                                    }
-                                    const cv = frame.read(@enumFromInt(code[pc + 3]));
-                                    if (cv != .Bool) {
-                                        leaveSpan(frame, code, pc + 10);
-                                        cur = bcur;
-                                        resume_idx = std.math.maxInt(usize);
-                                        continue :block_loop;
-                                    }
-                                    taken = cv.Bool;
-                                }
-                                leaveSpan(frame, code, pc + 10);
-                                // As `br`: each edge is its own path.
-                                if (taken.?) {
-                                    const target = code[pc + 6];
-                                    if (target <= bcur.int()) if (edgeGuard(allocator, ftls)) |er| {
-                                        cur = bcur;
-                                        break :blocks er;
-                                    };
-                                    bcur = @enumFromInt(target);
-                                    pc = code[pc + 7];
-                                    continue :sw opAt(code, pc);
-                                }
-                                const target = code[pc + 8];
-                                if (target <= bcur.int()) if (edgeGuard(allocator, ftls)) |er| {
-                                    cur = bcur;
-                                    break :blocks er;
-                                };
-                                bcur = @enumFromInt(target);
-                                pc = code[pc + 9];
-                                continue :sw opAt(code, pc);
-                            },
-                            .ret_try => {
-                                // A return inside a try region, or with a finally's flow pending, takes
-                                // the frame loop's routing through the finallys.
-                                if (try_stack.items.len != 0 or (if (frame.pending) |p| p.tryDepth() != null else false)) {
-                                    cur = bcur;
-                                    resume_idx = std.math.maxInt(usize);
-                                    continue :block_loop;
-                                }
-                                continue :sw .ret;
-                            },
-                            .ret => {
-                                const v: Value = if (code[pc + 1] != 0)
-                                    frame.regs.ptr[code[pc + 2]]
-                                else
-                                    .Unit;
-                                if (reclaim) v.retain();
-                                // Back into the caller's stream when it called from one it can go on in.
-                                if (top) |act| if (act.ret_streams) |rs| {
-                                    top = act.caller;
-                                    ev.eval_depth -= 1;
-                                    const rb = act.ret_block;
-                                    const rpc = act.ret_pc;
-                                    const rd = act.ret_dst;
-                                    closeStreamActivation(ev, allocator, act, reclaim);
-                                    frame = if (top) |a| &a.frame else root;
-                                    try_stack = if (top) |a| &a.try_stack else root_ts;
-                                    // The caller's stream validated `rd` against its window.
-                                    writeFastR(frame, rd, v, allocator, reclaim);
-                                    func = frame.func;
-                                    if (parent.call_hooks_on and runtime.prof.fn_prof_active) _ = fnProfEnter(func.id.int());
-                                    bc_streams = rs;
-                                    bs = rs;
-                                    bcur = rb;
-                                    code = rs.code;
-                                    pc = rpc;
-                                    continue :sw opAt(code, pc);
-                                };
-                                break :blocks ok(v);
-                            },
-                            .term_exit => {
-                                leaveSpan(frame, code, pc + 1);
-                                cur = bcur;
-                                resume_idx = std.math.maxInt(usize);
-                                continue :block_loop;
-                            },
-                        }
+                    c.frame = frame;
+                    c.try_stack = try_stack;
+                    c.func = func;
+                    c.bs = bs;
+                    c.thrown = null;
+                    c.unwound = null;
+                    c.ret_v = ok(.Unit);
+                    const exit = S.run(&c, frame, bs.code.ptr, pc, cur.int());
+                    // The stream may have gone on into other blocks and other frames.
+                    frame = c.frame;
+                    try_stack = c.try_stack;
+                    func = c.func;
+                    bc_streams = c.bs;
+                    cur = @enumFromInt(c.blk);
+                    thrown = c.thrown;
+                    unwound = c.unwound;
+                    switch (exit) {
+                        .brk => {},
+                        .ret => break :blocks c.ret_v,
+                        .result => break :blocks c.result,
+                        .block => {
+                            resume_idx = c.resume_idx;
+                            continue :block_loop;
+                        },
+                        .oom => return error.OutOfMemory,
+                        .cont => unreachable,
                     }
-                    // Fused flow may have advanced blocks; the routing below keys on `cur`.
-                    cur = bcur;
                 }
                 if (unwound) |e| {
                     // Mid-block non-local return: route through the armed finally blocks only, never a
@@ -1058,10 +352,10 @@ fn runLoop(
                                 break;
                             }
                         }
-                        if (chosen) |c| {
-                            try_stack.shrinkRetainingCapacity(c.i);
-                            (try frame.pfMut()).return_value = .{ .key = c.key, .val = v, .depth = try_stack.items.len };
-                            cur = c.jump;
+                        if (chosen) |ch| {
+                            try_stack.shrinkRetainingCapacity(ch.i);
+                            (try frame.pfMut()).return_value = .{ .key = ch.key, .val = v, .depth = try_stack.items.len };
+                            cur = ch.jump;
                             continue;
                         }
                         break :blocks ok(v);
@@ -1156,10 +450,10 @@ fn runLoop(
                                 break;
                             }
                         }
-                        if (chosen) |c| {
-                            try_stack.shrinkRetainingCapacity(c.i);
-                            (try frame.pfMut()).return_value = .{ .key = c.key, .val = v, .depth = try_stack.items.len };
-                            cur = c.jump;
+                        if (chosen) |ch| {
+                            try_stack.shrinkRetainingCapacity(ch.i);
+                            (try frame.pfMut()).return_value = .{ .key = ch.key, .val = v, .depth = try_stack.items.len };
+                            cur = ch.jump;
                             continue;
                         }
                         break :blocks ok(v);
@@ -1245,8 +539,8 @@ fn runLoop(
             };
             act.ret_block = site.ret_block;
             act.ret_idx = site.ret_idx;
-            act.caller = top;
-            top = act;
+            act.caller = c.top;
+            c.top = act;
             frame = &act.frame;
             try_stack = &act.try_stack;
             cur = site.req.func.entry;
@@ -1260,8 +554,8 @@ fn runLoop(
             var pb = pp.block;
             var pi = pp.inst_idx;
             var pd = pp.resume_reg;
-            while (top) |a| {
-                top = a.caller;
+            while (c.top) |a| {
+                c.top = a.caller;
                 ev.eval_depth -= 1;
                 const rb = a.ret_block;
                 const rix = a.ret_idx;
@@ -1280,8 +574,8 @@ fn runLoop(
         }
         // The frame exited: deliver its result through each popped frame's boundary transforms.
         while (true) {
-            const act = top orelse return res;
-            top = act.caller;
+            const act = c.top orelse return res;
+            c.top = act.caller;
             ev.eval_depth -= 1;
             if (act.frame.module.resolved == null) res = frameBoundary(act.frame.func, res);
             const rb = act.ret_block;
@@ -1289,8 +583,8 @@ fn runLoop(
             const rd = act.ret_dst;
             teardownActivation(allocator, act);
             actFree(ev, allocator, act);
-            frame = if (top) |a| &a.frame else root;
-            try_stack = if (top) |a| &a.try_stack else root_ts;
+            frame = if (c.top) |a| &a.frame else root;
+            try_stack = if (c.top) |a| &a.try_stack else root_ts;
             switch (res) {
                 .ok => |v| try frame.write(rd, v),
                 .err => |e| switch (e) {
@@ -1307,198 +601,9 @@ fn runLoop(
     }
 }
 
-/// A function id no module has, so `streamCallee` declines it.
-const NO_TARGET: u32 = std.math.maxInt(u32);
-
-/// The implementation a virtual or interface call of `slot` runs for the instance in `args`, by
-/// its class's tables; null for any other receiver, which the instruction's arm answers.
-inline fn virtualTarget(frame: *const Frame, slot: u32, args: u32) ?u32 {
-    const r = frame.module.resolved orelse return null;
-    const recv = &frame.regs.ptr[args];
-    // A null throws, and a function value or a property name answers some slots itself: the arm.
-    switch (recv.*) {
-        .Null, .IrClosure, .PropertyRef => return null,
-        else => {},
-    }
-    const cls = ir.resolved.classOf(r, recv) orelse return null;
-    const f = ir.resolved.slotTarget(r, cls, ir.MethodSlotId.from(slot)) orelse return null;
-    return f.int();
-}
-
-/// Host function `nid` over the argument run at `args`, its result written to `dst`; what it
-/// raised, if it did. A Kotlin receiver's own override of the member answers.
-noinline fn hostCall(comptime H: type, allocator: Allocator, frame: *Frame, host: *H, nid: ir.NativeId, args: u32, n: u32, dst: u32, comptime reclaim: bool) Allocator.Error!?EvalError {
-    const run = argRun(frame, @enumFromInt(args), n);
-    const res = if (comptime @hasDecl(H, "callNativeSite"))
-        (if (run.len != 0 and run[0] == .Instance)
-            try host.callNativeSite(allocator, nid, run)
-        else
-            try host.callNative(allocator, nid, run))
-    else
-        try host.callNative(allocator, nid, run);
-    switch (res) {
-        .ok => |v| {
-            writeFastR(frame, @enumFromInt(dst), v, allocator, reclaim);
-            return null;
-        },
-        .err => |e| return e,
-    }
-}
-
-/// The host function the tables bind to `fid`, when a call runs it as it is: null for an
-/// interpreted body, one a host fast path fronts, or while the call hooks may inject a fault.
-inline fn nativeOf(frame: *const Frame, fid: u32) ?ir.NativeId {
-    const r = frame.module.resolved orelse return null;
-    if (fid >= r.func_native.len or r.func_native[fid] == .none) return null;
-    if (fid < r.func_try.len and r.func_try[fid] != .none) return null;
-    if (parent.call_hooks_on) return null;
-    return r.func_native[fid];
-}
-
-/// The callee of the static call to `fid` when the loop can run it without leaving the stream: an
-/// interpreted body of a module lowered from sema, with no native or host fast path in front of
-/// it, and streams whose every block ends in a stream op, so no try machinery waits at a block's
-/// entry. Null sends the call through its instruction's arm.
-inline fn streamCallee(frame: *const Frame, ev: *EvalTls, fid: u32) ?*const bc.FuncStreams {
-    const r = frame.module.resolved orelse return null;
-    if (fid == NO_TARGET) return null;
-    if (fid < r.func_try.len and r.func_try[fid] != .none) return null;
-    if (fid < r.func_native.len and r.func_native[fid] != .none) return null;
-    if (ev.eval_depth >= ev_state.evalDepthCap(ev)) return null;
-    if (parent.call_hooks_on) {
-        if (!ev_flow.flatEnabled()) return null;
-        if (runtime.envOnce("KLIO_FAULT_INJECT") != null) return null;
-    }
-    const f = frame.module.funcById(ir.FuncId.from(fid)) orelse return null;
-    if (f.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(f))) return null;
-    return bc.funcStreams(f, frame.module.consts.items);
-}
-
-/// A call the loop runs in the stream: the callee's streams, its parameters and captures, the
-/// argument area the call pushed for them if it pushed one, and where the result goes.
-const StreamTarget = struct {
-    streams: *const bc.FuncStreams,
-    params: []const Value,
-    captures: []const Value = &.{},
-    area: ?ev_state.VsMark = null,
-    run_module: ?*const Module = null,
-    owning: ?*const Module = null,
-    closure: ?runtime.IrClosureRef = null,
-    dst: Reg,
-};
-
-/// The constructor call `op` (`new`: inst_idx, class, ctor, args, n_args, dst, site) in the stream:
-/// the instance made and held in `dst`, an argument area of it and the arguments, and the
-/// constructor's streams. Null, having made nothing, for a native constructor, a throwable class
-/// (its trace is taken where it is made, by the instruction's arm) or anything the arm reports.
-inline fn constructTarget(
-    comptime H: type,
-    allocator: Allocator,
-    frame: *Frame,
-    ev: *EvalTls,
-    host: *H,
-    bs: *const bc.FuncStreams,
-    op: *const [8]u32,
-    comptime reclaim: bool,
-) Allocator.Error!?StreamTarget {
-    const r = frame.module.resolved orelse return null;
-    const class = op[2];
-    if (class >= r.classes.len or r.classes[class].throwable) return null;
-    const st = host.resolvedState() orelse return null;
-    const cfs = staticCallee(H, host, frame, ev, bs, op[3], op[7], ir.resolved.NONE) orelse return null;
-    const inst = try ir.resolved.instantiate(allocator, r, ir.ClassId.from(class), ev_resolved.nextIdentity(st));
-    // The register holds the instance while the constructor runs; its result, `this`, replaces it.
-    writeFastR(frame, @enumFromInt(op[6]), inst, allocator, reclaim);
-    const ar = try ev_frame.ArgArea.push(ev, &.{inst}, argRun(frame, @enumFromInt(op[4]), op[5]));
-    return .{ .streams = cfs, .params = ar.vals, .area = ar.mark, .dst = @enumFromInt(op[6]) };
-}
-
-/// Runs a call of a `bc.Leaf` body over `params` without a frame, its result
-/// in `dst`, as the body's own `Return` would leave it. False, having done
-/// nothing, when the receiver is not an instance with the fields.
-inline fn runLeaf(frame: *Frame, leaf: bc.Leaf, params: []const Value, dst: Reg, allocator: Allocator, comptime reclaim: bool) bool {
-    if (params.len == 0 or params[0] != .Instance) return false;
-    switch (leaf) {
-        .none => return false,
-        .get_field => |slot| {
-            const v = runtime.InstanceData.slotGet(params[0].Instance, slot) orelse return false;
-            if (reclaim) v.retain();
-            writeFastR(frame, dst, v, allocator, reclaim);
-            return true;
-        },
-        .set_fields => |stores| {
-            if (!storeLeafFields(stores, params, allocator, reclaim)) return false;
-            const this = params[0];
-            if (reclaim) this.retain();
-            writeFastR(frame, dst, this, allocator, reclaim);
-            return true;
-        },
-    }
-}
-
-/// Stores each of `stores`' parameters in its field of `params[0]`, as the
-/// body's `SetFieldSlot`s do. False, having stored nothing, for a receiver
-/// or a parameter the stores do not fit.
-inline fn storeLeafFields(stores: []const bc.FieldStore, params: []const Value, allocator: Allocator, comptime reclaim: bool) bool {
-    if (params.len == 0 or params[0] != .Instance) return false;
-    const inst = params[0].Instance;
-    const n = inst.cell.data.slots.len;
-    for (stores) |st| if (st.param >= params.len or st.slot >= n) return false;
-    for (stores) |st| {
-        const v = params[st.param];
-        if (reclaim) v.retain();
-        const old = runtime.InstanceData.slotSet(inst, st.slot, v).?;
-        if (reclaim) old.release(allocator);
-    }
-    return true;
-}
-
-/// The function-value invoke `op` (`callv`: inst_idx, callee, args, n_args, dst) in the stream: a
-/// lambda made from sema, taking the call's arguments, whose body's streams run in the loop, over
-/// an argument area holding a copy of its captures. Null for anything else.
-inline fn closureTarget(comptime H: type, frame: *Frame, ev: *EvalTls, host: *H, op: *const [6]u32) Allocator.Error!?StreamTarget {
-    const callee = frame.regs.ptr[op[2]];
-    if (callee != .IrClosure) return null;
-    const body = host.resolvedClosure(&callee) orelse return null;
-    if (body.kind != .lambda or body.arity() != op[4]) return null;
-    if (ev.eval_depth >= ev_state.evalDepthCap(ev)) return null;
-    if (parent.call_hooks_on and !ev_flow.flatEnabled()) return null;
-    if (body.func.blocks.len == 0 and !body.module.ensureFuncBody(@constCast(body.func))) return null;
-    const cfs = bc.funcStreams(body.func, body.module.consts.items) orelse return null;
-    const caps = blk: {
-        const g = callee.IrClosure.borrow();
-        defer g.deinit();
-        break :blk try ev_frame.ArgArea.push(ev, &.{}, g.get().captures);
-    };
-    return .{
-        .streams = cfs,
-        .params = argRun(frame, @enumFromInt(op[3]), op[4]),
-        .captures = caps.vals,
-        .area = caps.mark,
-        .run_module = body.module,
-        .owning = body.owning,
-        .closure = callee.IrClosure,
-        .dst = @enumFromInt(op[5]),
-    };
-}
-
-/// `streamCallee` for the static call at `site` of the running function's streams `bs`, which keep
-/// the callee the site's first run resolved: a callee's tables and streams do not change, so a
-/// later run only checks the depth and the hooks.
-inline fn staticCallee(comptime H: type, host: *H, frame: *const Frame, ev: *EvalTls, bs: *const bc.FuncStreams, fid: u32, site: u32, init: u32) ?*const bc.FuncStreams {
-    if (bs.callees[site].load(.acquire)) |cfs| {
-        if (ev.eval_depth < ev_state.evalDepthCap(ev) and !parent.call_hooks_on) return cfs;
-    }
-    // A unit, once run, stays run: the site keeps its callee only after the call's has.
-    if (!ev_resolved.unitReady(H, host, init)) return null;
-    const cfs = streamCallee(frame, ev, fid) orelse return null;
-    bs.callees[site].store(cfs, .release);
-    return cfs;
-}
-
 /// `KLIO_FN_PROF`'s attribution swap, out of line: `current_fn` is a threadlocal, and an
 /// inline read is hoisted above the flag test into every frame entry.
-noinline fn fnProfEnter(fid: u32) u32 {
+pub noinline fn fnProfEnter(fid: u32) u32 {
     const prev = runtime.prof.current_fn;
     runtime.prof.current_fn = fid;
     return prev;
@@ -1525,14 +630,14 @@ fn replacesPendingBeforeRouting(term: Terminator) bool {
 /// a frame still armed here is the normal-completion entry; keyed on block entry, since a
 /// multi-block finally leaves the exit-side pop unreached while later blocks run. A block that
 /// opens a try region pushes its frame.
-fn enterTryBlock(allocator: Allocator, try_stack: *std.ArrayList(TryFrame), block: *const ir.Block, cur: BlockId) Allocator.Error!void {
+pub fn enterTryBlock(try_stack: *std.ArrayList(TryFrame), block: *const ir.Block, cur: BlockId) Allocator.Error!void {
     const h = block.h();
     if (h.catch_done_for) |body| {
         if (rpositionByBody(try_stack.items, body)) |p| _ = try_stack.orderedRemove(p);
     }
     if (rpositionByFinallyEntry(try_stack.items, cur)) |p| _ = try_stack.orderedRemove(p);
     if (h.catches.len != 0 or h.finally != null) {
-        try try_stack.append(allocator, .{
+        try try_stack.append(ev_snapshot.try_alloc, .{
             .body = cur,
             .catches = h.catches,
             .finally_entry = h.finally,
@@ -1544,7 +649,7 @@ fn enterTryBlock(allocator: Allocator, try_stack: *std.ArrayList(TryFrame), bloc
 /// What a Goto out of block `cur` does to the try stack with no finally flow pending: normal
 /// flow through a finally pops its frame, at the done sentinel or the finally's own entry, and
 /// an inline `return` jumping to its join pops the frames it bypassed the sentinels of.
-fn leaveTryBlock(try_stack: *std.ArrayList(TryFrame), block: *const ir.Block, cur: BlockId) void {
+pub fn leaveTryBlock(try_stack: *std.ArrayList(TryFrame), block: *const ir.Block, cur: BlockId) void {
     const pos: ?usize = if (block.h().finally_done_for) |body|
         rpositionByBody(try_stack.items, body)
     else
@@ -1598,107 +703,93 @@ fn findCatch(module: *const Module, exc: *const Value, catches: []const ir.Catch
     return null;
 }
 
-/// Destination register of a value-producing instruction, for routing a resume value back.
-fn instDst(inst: *const Inst) ?Reg {
-    return switch (inst.*) {
-        .CallStatic => |x| x.dst,
-        .RCallVirtual => |x| x.dst,
-        .CallInterface => |x| x.dst,
-        .CallNative => |x| x.dst,
-        .RCallValue => |x| x.dst,
-        .RNewInstance => |x| x.dst,
-        .LoadObject => |x| x.dst,
-        .LoadStatic => |x| x.dst,
+/// `wideBinFast`'s operations: `floatScalarBin`'s, and the shifts of a
+/// `Long` by a `Long` count, which shift by its low six bits.
+pub fn wideScalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
+    return floatScalarBin(op, lv, rv) orelse longShift(op, lv, rv);
+}
+
+pub inline fn longShift(op: BinOp, lv: Value, rv: Value) ?Value {
+    if (lv != .Long or rv != .Long) return null;
+    const a = lv.Long;
+    const n: u6 = @truncate(@as(u64, @bitCast(rv.Long)));
+    return switch (op) {
+        .Shl => .{ .Long = @bitCast(@as(u64, @bitCast(a)) << n) },
+        .Shr => .{ .Long = a >> n },
+        .UShr => .{ .Long = @bitCast(@as(u64, @bitCast(a)) >> n) },
         else => null,
     };
 }
 
-/// Shared post-step control flow for both instruction loops: flat-call handoff, throw and
-/// non-local-return capture, suspension parking. `.brk` breaks to the block's unwind
-/// handling with `thrown`/`unwound` set; `.ret` returns `ret.*` from the frame.
-const AfterStep = enum { cont, brk, ret };
+/// Floating-point operands as `applyBinop` computes them: same-type Double
+/// and Float, and a Double against an integer, which widens for arithmetic
+/// and ordering; null for the rest, the kind-keeping boxed equality and a
+/// Double against a Float included (`scalarBin` answers that one).
+pub inline fn floatScalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
+    if (lv == .Double and rv == .Double) return floatBin(f64, op, lv.Double, rv.Double);
+    if (lv == .Float and rv == .Float) return floatBin(f32, op, lv.Float, rv.Float);
+    const a: f64 = switch (lv) {
+        .Double => |x| x,
+        .Int => |x| @floatFromInt(x),
+        .Long => |x| @floatFromInt(x),
+        else => return null,
+    };
+    const b: f64 = switch (rv) {
+        .Double => |x| x,
+        .Int => |x| @floatFromInt(x),
+        .Long => |x| @floatFromInt(x),
+        else => return null,
+    };
+    if (lv != .Double and rv != .Double) return null;
+    return switch (op) {
+        .Eq, .NotEq, .BoxedEq, .BoxedNotEq => null,
+        else => floatBin(f64, op, a, b),
+    };
+}
 
-pub fn afterStep(
-    allocator: Allocator,
-    frame: *Frame,
-    r: Step,
-    inst: *const Inst,
-    idx: usize,
-    cur: BlockId,
-    flat_out: *?FlatCallSite,
-    park_out: *?ParkPoint,
-    thrown: *?Value,
-    unwound: *?EvalError,
-    ret: *EvalResult,
-) Allocator.Error!AfterStep {
-    if (r == .flat_call) {
-        const req = frame.tls.flat_call.?;
-        frame.tls.flat_call = null;
-        flat_out.* = .{ .req = req, .ret_block = cur, .ret_idx = idx + 1 };
-        ret.* = ok(.Unit);
-        return .ret;
-    }
-    if (r == .raised) {
-        const e = frame.tls.step_err.?;
-        frame.tls.step_err = null;
-        switch (e) {
-            .Throw => |v| {
-                var tv = v;
-                try attachStackTrace(allocator, &tv);
-                thrown.* = tv;
-                return .brk;
-            },
-            .NonLocalReturn, .LabeledReturn => {
-                unwound.* = e;
-                return .brk;
-            },
-            .CalleeFailed, .StackOverflow => {
-                unwound.* = e;
-                return .brk;
-            },
-            .Suspended => |state| {
-                const resume_reg = if (state.pending_resume_reg) |rr| blk: {
-                    state.pending_resume_reg = null;
-                    break :blk rr;
-                } else instDst(inst);
-                park_out.* = .{ .block = cur, .inst_idx = idx + 1, .resume_reg = resume_reg };
-                ret.* = errResult(.{ .Suspended = state });
-                return .ret;
-            },
-            else => {
-                ret.* = errResult(e);
-                return .ret;
-            },
+/// `floatBin` but for `%`, whose `@rem` is a call: what an op's fast path computes with no call
+/// in it.
+pub inline fn floatBinQuick(comptime F: type, op: BinOp, a: F, b: F) ?Value {
+    const wrap = struct {
+        inline fn v(x: F) Value {
+            return if (F == f64) .{ .Double = x } else .{ .Float = x };
         }
-    }
-    return .cont;
+    }.v;
+    return switch (op) {
+        .Add => wrap(a + b),
+        .Sub => wrap(a - b),
+        .Mul => wrap(a * b),
+        .Div => wrap(a / b),
+        .Less => .{ .Bool = a < b },
+        .LessEq => .{ .Bool = a <= b },
+        .Greater => .{ .Bool = a > b },
+        .GreaterEq => .{ .Bool = a >= b },
+        .Eq => .{ .Bool = a == b },
+        .NotEq => .{ .Bool = a != b },
+        else => null,
+    };
 }
 
-/// The bytecode tier's inline BinOp path: same-tag Int/Long scalar arithmetic and
-/// comparison written into the register file with `applyBinop`'s exact same-tag
-/// semantics. Every other shape returns false, so the generic arm runs.
-pub inline fn binFast(frame: *Frame, op: BinOp, dst: Reg, lhs: Reg, rhs: Reg, allocator: Allocator, reclaim: bool) bool {
-    // Register indices are proven in bounds by stream build and the entry length check.
-    const regs = frame.regs.ptr;
-    const lv = regs[lhs.int()];
-    const rv = regs[rhs.int()];
-    const out: Value = scalarBin(op, lv, rv) orelse return false;
-    const old = regs[dst.int()];
-    regs[dst.int()] = out;
-    frame.wmask.setInWindow(dst.int());
-    if (reclaim) old.release(allocator);
-    return true;
-}
-
-/// The scalar UnOp core, mirroring `binFast`.
-pub inline fn unopFast(frame: *Frame, op: ir.UnOp, dst: Reg, src: Reg, allocator: Allocator, reclaim: bool) bool {
-    const regs = frame.regs.ptr;
-    const out: Value = scalarUn(op, regs[src.int()]) orelse return false;
-    const old = regs[dst.int()];
-    regs[dst.int()] = out;
-    frame.wmask.setInWindow(dst.int());
-    if (reclaim) old.release(allocator);
-    return true;
+pub fn floatBin(comptime F: type, op: BinOp, a: F, b: F) ?Value {
+    const wrap = struct {
+        fn v(x: F) Value {
+            return if (F == f64) .{ .Double = x } else .{ .Float = x };
+        }
+    }.v;
+    return switch (op) {
+        .Add => wrap(a + b),
+        .Sub => wrap(a - b),
+        .Mul => wrap(a * b),
+        .Div => wrap(a / b),
+        .Mod => wrap(@rem(a, b)),
+        .Less => .{ .Bool = a < b },
+        .LessEq => .{ .Bool = a <= b },
+        .Greater => .{ .Bool = a > b },
+        .GreaterEq => .{ .Bool = a >= b },
+        .Eq => .{ .Bool = a == b },
+        .NotEq => .{ .Bool = a != b },
+        else => null,
+    };
 }
 
 /// `applyUnop`'s exact semantics for the scalar tags; null for everything else,
@@ -1731,6 +822,8 @@ pub inline fn scalarUn(op: ir.UnOp, v: Value) ?Value {
             .Int, .Long, .Double, .Float => v,
             else => null,
         },
+        // A conversion is the `conv` op's.
+        else => null,
     };
 }
 
@@ -1835,73 +928,60 @@ pub inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
     } else null;
 }
 
-/// The frame loop's per-block-entry guards, run on a call and on an edge a stream takes itself to
-/// its own or an earlier block: every cycle has such an edge and every recursion a call, so each
-/// loop reaches abandonment, the spin/wall diagnostic and the GC safe point, and a run between
-/// two polls is bounded by one function. Non-null aborts the frame.
-pub inline fn edgeGuard(allocator: Allocator, ftls: *EvalTls) ?EvalResult {
-    runtime.assertNoCellLock();
-    if (runtime.shouldAbandon()) {
-        return errResult(.{ .Type = "daemon task abandoned at run boundary" });
-    }
-    ftls.spin_check_counter +%= 1;
-    if (ftls.spin_check_counter & 0xFFFF == 0) {
-        spinDumpMaybe();
-        if (runtime.gc.gc_enabled) runtime.gc.idleProbeNow();
-        const wall_dl = parent.test_wall_deadline_ms.load(.monotonic);
-        if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
-            return wallCapFire(allocator) catch
-                errResult(.{ .Type = "test wall-clock deadline exceeded" });
-        }
-    }
-    if (runtime.gc.gc_enabled and runtime.gc.pendingFlag()) {
-        runtime.gc.safePoint();
-    }
-    return null;
+/// `x op k` for a register and the constant a `bin_k` or `cmp_br_k` carries,
+/// with `applyBinop`'s semantics: `kw` is the op's kind word, `lo` and `hi`
+/// the constant's bits. Null for a register of another type and every shape
+/// the op's general path computes (a zero divisor, a mixed boxed equality).
+pub inline fn binK(kw: u32, x: Value, lo: u32, hi: u32) ?Value {
+    const op: BinOp = @enumFromInt(kw & 0xff);
+    const bits = @as(u64, hi) << 32 | lo;
+    return switch (@as(bc.KType, @enumFromInt((kw >> 8) & 0xff))) {
+        .int => switch (x) {
+            .Int, .Long => scalarBin(op, x, .{ .Int = @bitCast(lo) }),
+            else => null,
+        },
+        .long => switch (x) {
+            .Long => scalarBin(op, x, .{ .Long = @bitCast(bits) }) orelse longShift(op, x, .{ .Long = @bitCast(bits) }),
+            .Int => scalarBin(op, x, .{ .Long = @bitCast(bits) }),
+            else => null,
+        },
+        .float => if (x == .Float) floatBin(f32, op, x.Float, @bitCast(lo)) else null,
+        .double => if (x == .Double) floatBin(f64, op, x.Double, @bitCast(bits)) else null,
+        .ulong => if (x == .ULong) unsignedEq(op, x.ULong == bits) else null,
+        .uint => if (x == .UInt) unsignedEq(op, x.UInt == lo) else null,
+        .null => if (x == .Cell) null else nullEq(op, x == .Null),
+    };
 }
 
-/// The instruction an op stands for, for the op's slow path: the op itself carries its operands.
-inline fn instAt(frame: *const Frame, block: BlockId, idx: usize) *const Inst {
-    return &frame.func.blocks[block.int()].insts[idx];
+/// A comparison with `null`: `==`, its boxed form and `===` hold for a null value, the negated
+/// forms for any other.
+pub inline fn nullEq(op: BinOp, is_null: bool) ?Value {
+    return switch (op) {
+        .Eq, .BoxedEq, .IdentEq => .{ .Bool = is_null },
+        .NotEq, .BoxedNotEq, .IdentNeq => .{ .Bool = !is_null },
+        else => null,
+    };
 }
 
-/// Whether comparing `a` with `b` gives an outcome in `mask`, a compare's order mask.
-inline fn holds(mask: u32, a: anytype, b: @TypeOf(a)) bool {
-    const order: u5 = @as(u5, @intFromBool(a >= b)) + @intFromBool(a > b);
-    return (mask >> order) & 1 != 0;
+pub inline fn unsignedEq(op: BinOp, eq: bool) ?Value {
+    return switch (op) {
+        .Eq, .BoxedEq => .{ .Bool = eq },
+        .NotEq, .BoxedNotEq => .{ .Bool = !eq },
+        else => null,
+    };
 }
 
-/// Unchecked register store for the bytecode loop's simple ops; the index was validated
-/// at stream build. Takes ownership of `v`; `reclaim` is the run's reclaim flag.
-pub inline fn writeFastR(frame: *Frame, r: Reg, v: Value, allocator: Allocator, reclaim: bool) void {
-    const idx = r.int();
-    const old = frame.regs.ptr[idx];
-    frame.regs.ptr[idx] = v;
-    frame.wmask.setInWindow(idx);
-    if (reclaim) old.release(allocator);
+/// The constant a `bin_k` carries, as its Const loads it.
+pub inline fn kValue(kw: u32, lo: u32, hi: u32) Value {
+    const bits = @as(u64, hi) << 32 | lo;
+    return switch (@as(bc.KType, @enumFromInt((kw >> 8) & 0xff))) {
+        .int => .{ .Int = @bitCast(lo) },
+        .long => .{ .Long = @bitCast(bits) },
+        .float => .{ .Float = @bitCast(lo) },
+        .double => .{ .Double = @bitCast(bits) },
+        .ulong => .{ .ULong = bits },
+        .uint => .{ .UInt = lo },
+        .null => .Null,
+    };
 }
 
-/// The string of constant `cid` for a `const_str` site whose `slot` holds none yet: made in the
-/// permanent generation, as the image's constants are, and published to the slot. A site two
-/// threads fill at once keeps the first string; the other is left to the permanent generation.
-noinline fn internString(allocator: Allocator, frame: *const Frame, cid: u32, slot: *std.atomic.Value(usize)) Allocator.Error!Value {
-    const saved = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved;
-    const v = try constToValue(allocator, &frame.module.consts.items[cid]);
-    if (slot.cmpxchgStrong(0, @intFromPtr(v.String.cell), .release, .acquire)) |won| {
-        return .{ .String = .{ .cell = @ptrFromInt(won) } };
-    }
-    return v;
-}
-
-/// Leave the exit span the op carries at `at` on the frame, when its block has one.
-inline fn leaveSpan(frame: *Frame, code: []const u32, at: usize) void {
-    if (code[at] == bc.NO_SPAN) return;
-    frame.cur_span = .{ .file = @enumFromInt(code[at]), .start = code[at + 1], .end = code[at + 2] };
-}
-
-/// The op at `pc`: every stream ends in an `end` op, so the read stays in bounds.
-inline fn opAt(code: []const u32, pc: usize) bc.Op {
-    return @enumFromInt(code[pc]);
-}

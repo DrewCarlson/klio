@@ -123,6 +123,30 @@ pub fn unResult(op: ir.UnOp, t: Ty) ?Ty {
             .boolean, .unit => null,
             else => t,
         },
+        // A floating value converts to an integer by saturating, which a C
+        // cast does not do: the runtime converts it.
+        .ToByte, .ToShort, .ToInt, .ToLong, .ToFloat, .ToDouble, .ToChar => blk: {
+            const to: Ty = switch (op) {
+                .ToByte => .byte,
+                .ToShort => .short,
+                .ToInt => .i32,
+                .ToLong => .i64,
+                .ToFloat => .f32,
+                .ToDouble => .f64,
+                else => .char,
+            };
+            break :blk switch (t) {
+                .i32, .i64, .short, .byte, .char => to,
+                .f32, .f64 => if (to.isFloat()) to else null,
+                else => null,
+            };
+        },
+        .Inv => switch (t) {
+            .i32, .i64 => t,
+            else => null,
+        },
+        // The runtime computes the rest.
+        .ToRawBits, .ToBits, .FloatFromBits, .DoubleFromBits, .CountTrailingZeroBits, .UIntToFloat, .UIntToDouble, .ULongToFloat, .ULongToDouble, .Sin, .Cos, .Sqrt, .ToULong, .ToUInt, .ToUShort, .ToUByte, .UnsignedBits => null,
     };
 }
 
@@ -237,7 +261,8 @@ fn step(ctx: Ctx, kinds: []Kind, cls: []Cls, inst: *const ir.Inst) Allocator.Err
             const native = sigs.r.func_native.len > x.ctor.int() and sigs.r.func_native[x.ctor.int()] != .none;
             return define(kinds, cls, x.dst, T.ty(.object), if (native) .many else .{ .known = x.class });
         },
-        inline .MakeClosure, .FunctionRef, .RPropertyRef, .ClassLiteral, .ClassOf, .NewArray, .ArrayGet, .RCallValue => |x| return define(kinds, cls, x.dst, T.ty(.object), .many),
+        inline .MakeClosure, .FunctionRef, .RPropertyRef, .ClassLiteral, .ClassOf, .NewArray, .ArrayGet, .RCallValue, .UnboxValue => |x| return define(kinds, cls, x.dst, T.ty(.object), .many),
+        .BoxValue => |x| return define(kinds, cls, x.dst, T.ty(.object), .{ .known = x.class }),
         inline .RInstanceOf, .InstanceOfDyn, .Not => |x| return define(kinds, cls, x.dst, T.ty(.boolean), .many),
         .RCast => |x| {
             if (!x.safe and !x.nullable) if (hostScalar(sigs, x.class)) |t| return define(kinds, cls, x.dst, T.ty(t), .many);

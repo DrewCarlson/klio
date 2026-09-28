@@ -297,7 +297,7 @@ pub fn frameCountDump(module: *const Module) void {
     std.debug.print("[call] member_arms={d}\n", .{parent.cm_calls});
     std.debug.print("[regs] filled_slots={d}\n", .{parent.regs_fill_slots});
     if (frame_census_on) {
-        const FE = struct { name: []const u8, n: u32 };
+        const FE = struct { name: []const u8, n: u32, fid: u32 };
         var fl: std.ArrayList(FE) = .empty;
         defer fl.deinit(std.heap.page_allocator);
         var fid: u32 = 0;
@@ -306,7 +306,7 @@ pub fn frameCountDump(module: *const Module) void {
             if (n == 0) continue;
             const f = module.funcById(@enumFromInt(fid));
             const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
-            fl.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch break;
+            fl.append(std.heap.page_allocator, .{ .name = nm, .n = n, .fid = fid }) catch break;
         }
         std.mem.sort(FE, fl.items, {}, struct {
             fn gt(_: void, a: FE, b: FE) bool {
@@ -314,12 +314,12 @@ pub fn frameCountDump(module: *const Module) void {
             }
         }.gt);
         for (fl.items[0..@min(fl.items.len, 12)]) |e| {
-            std.debug.print("[fill] {d:>10} {s}\n", .{ e.n, e.name });
+            std.debug.print("[fill] {d:>10} {s}#{d}\n", .{ e.n, e.name, e.fid });
         }
     }
     std.debug.print("[getfield] mono={d} getter={d} poly={d} total={d} getter_ms={d} slow_ms={d}\n", .{ parent.gf_mono, parent.gf_getter, parent.gf_poly, parent.gf_slow, parent.gf_getter_ns / 1_000_000, parent.gf_slow_ns / 1_000_000 });
     if (!frame_census_on) return;
-    const Entry = struct { name: []const u8, n: u32 };
+    const Entry = struct { name: []const u8, n: u32, fid: u32 };
     var list: std.ArrayList(Entry) = .empty;
     defer list.deinit(std.heap.page_allocator);
     var fid: u32 = 0;
@@ -328,7 +328,7 @@ pub fn frameCountDump(module: *const Module) void {
         if (n == 0) continue;
         const f = module.funcById(@enumFromInt(fid));
         const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
-        list.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch return;
+        list.append(std.heap.page_allocator, .{ .name = nm, .n = n, .fid = fid }) catch return;
     }
     std.mem.sort(Entry, list.items, {}, struct {
         fn lt(_: void, a: Entry, b: Entry) bool {
@@ -360,7 +360,7 @@ pub fn frameCountDump(module: *const Module) void {
     }
     std.debug.print("[census-split] compose={d} accessor={d} lambda={d} coroutines={d} other={d}\n", .{ in_compose, in_accessor, in_lambda, in_coroutines, in_other });
     const top = @min(list.items.len, 300);
-    for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}\n", .{ e.n, e.name });
+    for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}#{d}\n", .{ e.n, e.name, e.fid });
 }
 
 /// First source span of an emitted body, for naming an anonymous function.

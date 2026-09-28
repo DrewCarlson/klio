@@ -163,6 +163,8 @@ fn dumpResolved(w: *std.Io.Writer, m: *const Module, inst: *const Inst) !bool {
         .CastDyn => |c| try w.print("r{d} <- CastDyn r{d} as{s} r{d}{s}", .{ reg(c.dst), reg(c.src), nullMark(c.safe), reg(c.ty), nullMark(c.nullable) }),
         .ArrayGet => |c| try w.print("r{d} <- ArrayGet r{d}[r{d}]", .{ reg(c.dst), reg(c.array), reg(c.index) }),
         .ArraySet => |c| try w.print("ArraySet r{d}[r{d}] <- r{d}", .{ reg(c.array), reg(c.index), reg(c.value) }),
+        .BoxValue => |c| try w.print("r{d} <- BoxValue r{d} as {s}#{d} slot {d}", .{ reg(c.dst), reg(c.src), className(m, c.class), c.class.int(), c.slot }),
+        .UnboxValue => |c| try w.print("r{d} <- UnboxValue r{d} from {s}#{d} slot {d}", .{ reg(c.dst), reg(c.src), className(m, c.class), c.class.int(), c.slot }),
         .NewArray => |c| {
             try w.print("r{d} <- NewArray {s}#{d} ", .{ reg(c.dst), className(m, c.class), c.class.int() });
             try argRun(w, c.args, c.n_args);

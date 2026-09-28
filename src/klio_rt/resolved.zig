@@ -841,6 +841,24 @@ export fn klio_r_set(ocv: CValue, slot: u32, vcv: CValue) void {
     }
 }
 
+/// `BoxValue`: the instance of scalar value class `cls` over the number `vcv`
+/// in field `slot`, which runs no init block; an instance or a null is itself.
+export fn klio_r_box_value(vcv: CValue, cls: u32, slot: u32) CValue {
+    const v = fromC(vcv);
+    if (v == .Instance or v == .Null) return vcv;
+    const boxed = klio_r_new(cls);
+    klio_r_set(boxed, slot, vcv);
+    return boxed;
+}
+
+/// `UnboxValue`: the number an instance of scalar value class `cls` holds in
+/// field `slot`; anything else is itself.
+export fn klio_r_unbox_value(vcv: CValue, cls: u32, slot: u32) CValue {
+    const v = fromC(vcv);
+    if (v != .Instance or v.Instance.asPtrConst().class_id != cls) return vcv;
+    return toC(runtime.InstanceData.slotGet(v.Instance, slot) orelse fatal("a field slot past the instance's fields"));
+}
+
 // ---------------------------------------------------------------------------
 // Natives and host members, through the VM's host
 
@@ -904,6 +922,8 @@ export fn klio_r_unop(op: u32, vcv: CValue) CValue {
                 else => null,
             };
         },
+        .ToByte, .ToShort, .ToInt, .ToLong, .ToFloat, .ToDouble, .ToChar => runtime.numconv.convert(u.conversion().?, v),
+        .Inv, .ToRawBits, .ToBits, .FloatFromBits, .DoubleFromBits, .CountTrailingZeroBits, .UIntToFloat, .UIntToDouble, .ULongToFloat, .ULongToDouble, .Sin, .Cos, .Sqrt, .ToULong, .ToUInt, .ToUShort, .ToUByte, .UnsignedBits => runtime.numfn.apply(u.function().?, v),
     };
     return toC(out orelse fatal("a unary operator on a value it does not apply to"));
 }

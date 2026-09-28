@@ -436,7 +436,7 @@ test "a read and a write of one property resolve differently: plain read, setter
     const rec = b.nameAt(st.id, st.target.Path.segments[0].span.start).?;
     try std.testing.expectEqual(sema.records.NameKind.backing_field, rec.kind);
     const v = try b.unit();
-    try lower.name.write(b, &rec, null, v);
+    try lower.name.write(b, &rec, null, .none, v, .none);
     _ = r_set;
     try std.testing.expectEqualStrings(
         \\  r0 = const Unit
@@ -918,7 +918,7 @@ test "templates name a value or this; assignments through paths, members and a s
         \\  r3 = const Null
         \\  r4 = r2 IdentEq r3
         \\  r5 = param 2
-        \\  if r4 b1 else b2
+        \\  if r4 b3 else b2
         \\b1:
         \\  goto b3
         \\b2:

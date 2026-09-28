@@ -273,6 +273,7 @@ pub const Reach = struct {
                 .RCast => |x| try self.addTested(x.class),
                 .ClassLiteral => |x| try self.addTested(x.class),
                 .NewArray => |x| try self.addTested(x.class),
+                inline .BoxValue, .UnboxValue => |x| try self.addTested(x.class),
                 else => {},
             };
         }

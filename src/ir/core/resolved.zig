@@ -731,17 +731,8 @@ pub fn seedValue(seed: SlotSeed) Value {
 /// constructor runs. The caller owns the one reference.
 pub fn instantiate(a: Allocator, r: *const Resolved, class: ClassId, identity: u64) Allocator.Error!Value {
     const rt = &r.classes[class.int()];
-    const slots: []Value = if (rt.seeds.len == 0) &.{} else try a.alloc(Value, rt.seeds.len);
-    errdefer if (slots.len != 0) a.free(slots);
-    for (rt.seeds, slots) |seed, *v| v.* = seedValue(seed);
-    const inst = try ObjRef(InstanceData).init(a, .{
-        .class = rt.def.clone(),
-        .slots = slots,
-        .class_id = class.int(),
-        .outer = null,
-        .identity = identity,
-        .native_state = null,
-    });
+    const inst = try InstanceData.newTrailing(a, rt.def.clone(), class.int(), rt.seeds.len, identity);
+    for (rt.seeds, inst.cell.data.slots) |seed, *v| v.* = seedValue(seed);
     return .{ .Instance = inst };
 }
 

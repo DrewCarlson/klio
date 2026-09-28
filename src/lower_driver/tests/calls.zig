@@ -1813,6 +1813,20 @@ test "a value class sets its properties before its supertype initializes" {
     }, "Base(a=43, i=42) Derived(42)\n");
 }
 
+test "== on a value class others extend runs the value's own equals" {
+    const saved = parser.language;
+    defer parser.language = saved;
+    parser.language.full_value_classes = true;
+    try driver.expectOutput(&.{
+        \\abstract value class Base(val a: Int)
+        \\value class Derived(val b: Int) : Base(b % 2)
+        \\fun eq(x: Base, y: Base) = x == y
+        \\fun main() {
+        \\    println("${eq(Derived(1), Derived(3))} ${eq(Derived(1), Derived(1))}")
+        \\}
+    }, "false true\n");
+}
+
 test "an annotation instance renders its qualified name, a data class its simple one" {
     try driver.expectOutput(&.{
         \\package test

@@ -410,6 +410,8 @@ fn writeInst(fx: *Fn, inst: *const ir.Inst) Error!void {
             const expr = try fx.fmt("klio_r_cast({s}, {d}u, {d}, {d})", .{ try fx.boxed(x.src), x.class.int(), @intFromBool(x.nullable), @intFromBool(x.safe) });
             try fx.assign(x.dst, expr, .object);
         },
+        .BoxValue => |x| try fx.assign(x.dst, try fx.fmt("klio_r_box_value({s}, {d}u, {d}u)", .{ try fx.boxed(x.src), x.class.int(), x.slot }), .object),
+        .UnboxValue => |x| try fx.assign(x.dst, try fx.fmt("klio_r_unbox_value({s}, {d}u, {d}u)", .{ try fx.boxed(x.src), x.class.int(), x.slot }), .object),
         .ArrayGet => |x| try fx.assign(x.dst, try fx.fmt("klio_r_array_get({s}, {s})", .{ try fx.boxed(x.array), try fx.as(x.index, .i32) }), .object),
         .ArraySet => |x| try w.print("  klio_r_array_set({s}, {s}, {s});\n", .{ try fx.boxed(x.array), try fx.as(x.index, .i32), try fx.boxed(x.value) }),
         .NewArray => |x| {
@@ -703,6 +705,13 @@ fn writeUnOp(fx: *Fn, x: anytype) Error!void {
             try fx.fmt("({s} {s} 1)", .{ v, if (x.op == .Inc) "+" else "-" })
         else
             try fx.fmt("(({s})(({s}){s} {s} 1u))", .{ res.cName(), unsignedOf(res), v, if (x.op == .Inc) "+" else "-" }),
+        // An integer keeps its low bits, through the unsigned type of the
+        // result's width.
+        .ToByte, .ToShort, .ToInt, .ToLong, .ToChar => try fx.fmt("(({s})({s}){s})", .{ res.cName(), unsignedOf(res), v }),
+        .ToFloat, .ToDouble => try fx.fmt("(({s}){s})", .{ res.cName(), v }),
+        .Inv => try fx.fmt("(({s})(~{s}))", .{ res.cName(), v }),
+        // `typing.unResult` leaves these to the runtime.
+        .ToRawBits, .ToBits, .FloatFromBits, .DoubleFromBits, .CountTrailingZeroBits, .UIntToFloat, .UIntToDouble, .ULongToFloat, .ULongToDouble, .Sin, .Cos, .Sqrt, .ToULong, .ToUInt, .ToUShort, .ToUByte, .UnsignedBits => unreachable,
     };
     try fx.assign(x.dst, expr, res);
 }

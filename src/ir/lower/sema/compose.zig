@@ -17,6 +17,7 @@ const bridge = @import("../../core/bridge.zig");
 const builder = @import("builder.zig");
 const records = @import("records.zig");
 const body = @import("body.zig");
+const coerce = @import("coerce.zig");
 const call = @import("call.zig");
 const env = @import("env.zig");
 const lambda = @import("lambda.zig");
@@ -1141,6 +1142,21 @@ fn bitAnd(b: *Builder, v: Reg, bits: i32) Error!Reg {
 /// type, or, when `instance_fns`, a function value.
 fn changedCall(b: *Builder, v: Reg, ty: sema.TypeId, st: Stability, instance_fns: bool) Error!Reg {
     const s = b.p.s;
+    // A value class held as its number is compared as that number, by the
+    // overload for its primitive when there is one, as the Compose compiler
+    // has it.
+    const number_ty = try coerce.numberType(b, ty);
+    if (number_ty != .none) {
+        const cls = s.types.classSym(number_ty);
+        const composer_cls = s.classByFqn("androidx.compose.runtime.Composer");
+        const number = try coerce.unbox(b, v, (try coerce.scalarOf(b, ty)).?);
+        if (cls != .none and isPrimitive(s, cls) and composer_cls != .none and
+            try memberFunction(s, composer_cls, "changed", 1, cls) != null)
+        {
+            return composerCallTyped(b, "changed", &.{number}, cls);
+        }
+        return composerCall(b, "changed", &.{number});
+    }
     if (ty != .none and !s.types.isNullable(ty)) {
         const cls = s.types.classSym(ty);
         const composer_cls = s.classByFqn("androidx.compose.runtime.Composer");

@@ -17,6 +17,7 @@ const builder = @import("builder.zig");
 const records = @import("records.zig");
 const env = @import("env.zig");
 const body = @import("body.zig");
+const coerce = @import("coerce.zig");
 const compose = @import("compose.zig");
 
 const Builder = builder.Builder;
@@ -81,7 +82,9 @@ pub fn lowerClosureBody(b: *Builder, f: Sym) Error!void {
             if (bridge.composableType(s, rec.fn_type)) return compose.lowerLambdaBody(b, f, &rec, l.body.stmts, unit_result);
             const v = try body.lowerStmts(b, l.body.stmts);
             if (b.terminated()) return;
-            b.terminate(.{ .Return = if (unit_result) try b.unit() else v orelse try b.unit() });
+            // A function type's result is generic: boxed.
+            const out = if (unit_result) try b.unit() else if (v) |x| try coerce.coerce(b, x, body.lastValueType(b, l.body.stmts), .none) else try b.unit();
+            b.terminate(.{ .Return = out });
         },
         .anon_fun => |af_| {
             const af = af_.?;
@@ -186,7 +189,8 @@ pub fn lowerInPlace(b: *Builder, literal: *const ast.Expr, args: []const Reg) Er
             try checkParams(b, l);
             const v = try body.lowerStmts(b, l.body.stmts);
             if (!b.terminated()) {
-                const out = if (returnsUnit(s, rec.fn_type)) try b.unit() else v orelse try b.unit();
+                // The callee's function type is generic: the result goes to it boxed.
+                const out = if (returnsUnit(s, rec.fn_type)) try b.unit() else if (v) |x| try coerce.coerce(b, x, body.lastValueType(b, l.body.stmts), .none) else try b.unit();
                 try b.emit(.{ .Move = .{ .dst = result, .src = out } });
                 b.terminate(.{ .Goto = end });
             }
@@ -201,7 +205,7 @@ pub fn lowerInPlace(b: *Builder, literal: *const ast.Expr, args: []const Reg) Er
                     }
                 },
                 .Expr => |*ex| {
-                    const v = try body.lowerExpr(b, ex);
+                    const v = try coerce.coerce(b, try body.lowerExpr(b, ex), b.exprType(ex.id()), .none);
                     if (!b.terminated()) {
                         try b.emit(.{ .Move = .{ .dst = result, .src = v } });
                         b.terminate(.{ .Goto = end });

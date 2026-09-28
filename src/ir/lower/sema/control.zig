@@ -18,6 +18,7 @@ const builder = @import("builder.zig");
 const records = @import("records.zig");
 const compose = @import("compose.zig");
 const body = @import("body.zig");
+const coerce = @import("coerce.zig");
 const env = @import("env.zig");
 const name = @import("name.zig");
 const call = @import("call.zig");
@@ -58,10 +59,11 @@ fn ifExpr(b: *Builder, e: *const ast.Expr, want: bool) Error!?Reg {
     const join = try b.newBlock();
     b.terminate(.{ .Branch = .{ .cond = cond, .t = then_blk, .f = else_blk } });
     b.switchTo(then_blk);
-    try arm(b, x.then_branch, result, join, grouped);
+    const whole = b.exprType(e.id());
+    try arm(b, x.then_branch, result, whole, join, grouped);
     b.switchTo(else_blk);
     if (x.else_branch) |eb| {
-        try arm(b, eb, result, join, grouped);
+        try arm(b, eb, result, whole, join, grouped);
     } else {
         if (grouped) try compose.emptyGroup(b, e.span());
         b.terminate(.{ .Goto = join });
@@ -74,7 +76,7 @@ fn ifExpr(b: *Builder, e: *const ast.Expr, want: bool) Error!?Reg {
 /// is none, then on to `join`, unless it jumped away; in a replace group
 /// when `grouped`. The instruction computing the value writes `result`
 /// itself when it can.
-fn arm(b: *Builder, e: *const ast.Expr, result: ?Reg, join: BlockId, grouped: bool) Error!void {
+fn arm(b: *Builder, e: *const ast.Expr, result: ?Reg, whole: TypeId, join: BlockId, grouped: bool) Error!void {
     if (grouped) try compose.startReplaceGroup(b, e.span());
     const saved_block = b.compose_block;
     b.compose_block = .{ .end = e.span().end };
@@ -89,7 +91,11 @@ fn arm(b: *Builder, e: *const ast.Expr, result: ?Reg, join: BlockId, grouped: bo
         if (!b.terminated()) try compose.endReplaceGroupCall(b);
     }
     if (b.terminated()) return;
-    if (result) |r| if (!locals.retarget(b, from, v.?, r)) try b.emit(.{ .Move = .{ .dst = r, .src = v.? } });
+    // The branch's value as the whole expression's type holds it.
+    if (result) |r| {
+        const bv = try coerce.coerce(b, v.?, body.valueType(b, e), whole);
+        if (!locals.retarget(b, from, bv, r)) try b.emit(.{ .Move = .{ .dst = r, .src = bv } });
+    }
     b.terminate(.{ .Goto = join });
 }
 
@@ -164,7 +170,7 @@ fn whenExpr(b: *Builder, e: *const ast.Expr, want: bool) Error!?Reg {
         }
         // `fail_to` of the last pattern is `next`, where the next branch tests.
         b.switchTo(body_blk);
-        try arm(b, &br.body, result, join, grouped);
+        try arm(b, &br.body, result, b.exprType(e.id()), join, grouped);
         b.switchTo(next);
     }
     // No branch matched.
@@ -249,7 +255,7 @@ fn pattern(b: *Builder, when_id: ast.NodeId, pat: *const ast.WhenPattern, subjec
                 .contains => |c| c,
                 else => return error.Unrecorded,
             };
-            const r = try operator.callOn(b, &rec, range, &.{sv});
+            const r = try operator.callTyped(b, &rec, range, &.{sv}, .{ .recv = b.exprType(v.id()), .operands = try b.p.a.dupe(TypeId, &.{subject_t}) });
             return if (pat.kind == .NotInRange) operator.negate(b, r) else r;
         },
         .IsType, .NotIsType => {
@@ -258,7 +264,8 @@ fn pattern(b: *Builder, when_id: ast.NodeId, pat: *const ast.WhenPattern, subjec
                 .type_test => |t| t,
                 else => return error.Unrecorded,
             };
-            return types.testAgainst(b, &rec, sv);
+            // A scalar class's value is tested boxed.
+            return types.testAgainst(b, &rec, try coerce.coerce(b, sv, subject_t, .none));
         },
         .Else => unreachable,
     }
@@ -525,27 +532,58 @@ fn loopCounted(b: *Builder, e: *const ast.Expr, label: ?[]const u8, c: Counted) 
             b.switchTo(join);
         },
     }
-    const head = try b.newBlock();
+    // Each iteration has a replace group round its test: the test keeps a
+    // block of its own at the top.
+    if (groups.per_iteration) {
+        const head = try b.newBlock();
+        const body_blk = try b.newBlock();
+        const next = try b.newBlock();
+        const exit = try b.newBlock();
+        b.terminate(.{ .Goto = head });
+        b.switchTo(head);
+        try compose.startReplaceGroup(b, f.iter.span());
+        const test_more = b.newReg();
+        try b.emit(.{ .Move = .{ .dst = test_more, .src = more } });
+        b.compose_open -= 1;
+        try compose.endReplaceGroupCall(b);
+        b.terminate(.{ .Branch = .{ .cond = test_more, .t = body_blk, .f = exit } });
+        b.switchTo(body_blk);
+        const elem = b.newReg();
+        try b.emit(.{ .Move = .{ .dst = elem, .src = i } });
+        try env.bindLocal(b, try b.decl(f.id), elem);
+        try loopBody(b, f.body, label, exit, next, groups);
+        if (!b.terminated()) b.terminate(.{ .Goto = next });
+        b.switchTo(next);
+        try countStep(b, c, i, bound, step, more);
+        b.terminate(.{ .Goto = head });
+        b.switchTo(exit);
+        try groups.end(b);
+        return b.unit();
+    }
+    // Otherwise the test is at the bottom, after the step: the step's
+    // compare and the branch back run as one op. The element is the count
+    // itself, which the body cannot write and the step moves only after it.
     const body_blk = try b.newBlock();
     const next = try b.newBlock();
     const exit = try b.newBlock();
-    b.terminate(.{ .Goto = head });
-    b.switchTo(head);
-    if (groups.per_iteration) try compose.startReplaceGroup(b, f.iter.span());
-    const test_more = b.newReg();
-    try b.emit(.{ .Move = .{ .dst = test_more, .src = more } });
-    if (groups.per_iteration) {
-        b.compose_open -= 1;
-        try compose.endReplaceGroupCall(b);
-    }
-    b.terminate(.{ .Branch = .{ .cond = test_more, .t = body_blk, .f = exit } });
+    b.terminate(.{ .Branch = .{ .cond = more, .t = body_blk, .f = exit } });
     b.switchTo(body_blk);
-    const elem = b.newReg();
-    try b.emit(.{ .Move = .{ .dst = elem, .src = i } });
-    try env.bindLocal(b, try b.decl(f.id), elem);
+    try env.bindLocal(b, try b.decl(f.id), i);
     try loopBody(b, f.body, label, exit, next, groups);
     if (!b.terminated()) b.terminate(.{ .Goto = next });
     b.switchTo(next);
+    try countStep(b, c, i, bound, step, more);
+    b.terminate(.{ .Branch = .{ .cond = more, .t = body_blk, .f = exit } });
+    b.switchTo(exit);
+    try groups.end(b);
+    return b.unit();
+}
+
+/// A counting loop's step: the count moves, and `more` says whether it
+/// reached past the bound. At `up_until` the compare comes last, after the
+/// count moves; the inclusive forms compare first, so the count never
+/// passes the type's range.
+fn countStep(b: *Builder, c: Counted, i: Reg, bound: Reg, step: Reg, more: Reg) Error!void {
     switch (c.kind) {
         .up_until => {
             try b.emit(.{ .UnOp = .{ .dst = i, .op = .Inc, .operand = i } });
@@ -560,10 +598,6 @@ fn loopCounted(b: *Builder, e: *const ast.Expr, label: ?[]const u8, c: Counted) 
             try b.emit(.{ .BinOp = .{ .dst = i, .op = .Add, .lhs = i, .rhs = step } });
         },
     }
-    b.terminate(.{ .Goto = head });
-    b.switchTo(exit);
-    try groups.end(b);
-    return b.unit();
 }
 
 /// A `Labeled` expression: a labeled loop takes the label onto the loop
@@ -628,7 +662,7 @@ pub fn lowerTry(b: *Builder, e: *const ast.Expr) Error!Reg {
         defer _ = b.finallys.pop();
         const v = try body.lowerBlock(b, &t.body);
         if (!b.terminated()) {
-            try b.emit(.{ .Move = .{ .dst = result, .src = v } });
+            try b.emit(.{ .Move = .{ .dst = result, .src = try coerce.coerce(b, v, body.lastValueType(b, t.body.stmts), b.exprType(e.id())) } });
             b.terminate(.{ .Goto = exit_to });
         }
     }
@@ -644,7 +678,7 @@ pub fn lowerTry(b: *Builder, e: *const ast.Expr) Error!Reg {
         }
         defer b.finallys.items.len = depth;
         if (!dynamic) {
-            try catchBody(b, &t.catches[i], h.exc, result, exit_to);
+            try catchBody(b, &t.catches[i], h.exc, result, b.exprType(e.id()), exit_to);
             continue;
         }
         for (t.catches) |*c| {
@@ -654,7 +688,7 @@ pub fn lowerTry(b: *Builder, e: *const ast.Expr) Error!Reg {
             const next = try b.newBlock();
             b.terminate(.{ .Branch = .{ .cond = hit, .t = caught, .f = next } });
             b.switchTo(caught);
-            try catchBody(b, c, h.exc, result, exit_to);
+            try catchBody(b, c, h.exc, result, b.exprType(e.id()), exit_to);
             b.switchTo(next);
         }
         b.terminate(.{ .Throw = h.exc });
@@ -672,12 +706,12 @@ pub fn lowerTry(b: *Builder, e: *const ast.Expr) Error!Reg {
 
 /// A catch clause's body over the caught value `exc`, its value moved into
 /// `result` on the way to `exit_to`.
-fn catchBody(b: *Builder, c: *const ast.Catch, exc: Reg, result: Reg, exit_to: BlockId) Error!void {
+fn catchBody(b: *Builder, c: *const ast.Catch, exc: Reg, result: Reg, whole: TypeId, exit_to: BlockId) Error!void {
     const rec = try b.typeTest(c.id);
     if (rec.binding != .none) try env.bindLocal(b, rec.binding, exc);
     const v = try body.lowerBlock(b, &c.body);
     if (!b.terminated()) {
-        try b.emit(.{ .Move = .{ .dst = result, .src = v } });
+        try b.emit(.{ .Move = .{ .dst = result, .src = try coerce.coerce(b, v, body.lastValueType(b, c.body.stmts), whole) } });
         b.terminate(.{ .Goto = exit_to });
     }
 }
@@ -696,9 +730,18 @@ pub fn lowerReturn(b: *Builder, e: *const ast.Expr) Error!Reg {
     const r = e.Return;
     const target = try b.returnTarget(r.id);
     if (r.value) |x| if (target == b.owner) try tailrec.markReturn(b, x);
-    const v: ?Reg = if (r.value) |x| try body.lowerExpr(b, x) else null;
+    const v_ty: sema.TypeId = if (r.value) |x| b.exprType(x.id()) else .none;
+    const v_in: ?Reg = if (r.value) |x| try body.lowerExpr(b, x) else null;
     if (b.terminated()) return deadEnd(b);
-    if (inline_mod.returnRegion(b, target)) |region| {
+    const region_opt = inline_mod.returnRegion(b, target);
+    // The value as the place it returns to holds it: a literal lowered in
+    // place gives it to its callee's generic function type, boxed.
+    const held: ?coerce.Scalar = if (region_opt) |rg| switch (rg.*) {
+        .lambda => null,
+        .instance => try coerce.returnTo(b, target),
+    } else try coerce.returnTo(b, target);
+    const v: ?Reg = if (v_in) |x| try coerce.convert(b, x, try coerce.scalarOf(b, v_ty), held) else null;
+    if (region_opt) |region| {
         const dst, const to, const depth = switch (region.*) {
             .instance => |i| .{ i.result, i.join, i.finally_depth },
             .lambda => |l| .{ l.result, l.end, l.finally_depth },
@@ -849,7 +892,8 @@ fn partString(b: *Builder, v: Reg, t: TypeId) Error!Reg {
     const s = b.p.s;
     if (t != .none and !s.types.isNullable(t) and operator.primOf(s, t) != null) return v;
     const to_string = try anyToString(b);
-    if (!operator.mayBeNull(s, t)) return operator.callOn(b, &to_string, v, &.{});
+    // `toString` dispatched: a scalar class's value goes in boxed.
+    if (!operator.mayBeNull(s, t)) return operator.callTyped(b, &to_string, v, &.{}, .{ .recv = t });
     const result = b.newReg();
     const on_null = try b.newBlock();
     const on_value = try b.newBlock();
@@ -862,7 +906,7 @@ fn partString(b: *Builder, v: Reg, t: TypeId) Error!Reg {
     try b.emit(.{ .Move = .{ .dst = result, .src = try b.emitConst(.{ .String = "null" }) } });
     b.terminate(.{ .Goto = join });
     b.switchTo(on_value);
-    const str = try operator.callOn(b, &to_string, v, &.{});
+    const str = try operator.callTyped(b, &to_string, v, &.{}, .{ .recv = t });
     try b.emit(.{ .Move = .{ .dst = result, .src = str } });
     b.terminate(.{ .Goto = join });
     b.switchTo(join);
@@ -901,7 +945,7 @@ pub fn lowerNotNull(b: *Builder, e: *const ast.Expr) Error!Reg {
     const v = try body.lowerExpr(b, e.Postfix.expr);
     const dst = b.newReg();
     try b.emit(.{ .NotNullAssert = .{ .dst = dst, .src = v } });
-    return dst;
+    return coerce.coerce(b, dst, .none, b.exprType(e.id()));
 }
 
 /// `?.`: runs `then` on a non-null `recv`, else yields null. `then` is a

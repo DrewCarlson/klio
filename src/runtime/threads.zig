@@ -86,7 +86,7 @@ pub fn threadName(allocator: std.mem.Allocator, id: u64) ?[]const u8 {
 // this flag, which the evaluator and the sleep primitives poll.
 
 /// Set for the duration of the pool's run-boundary shutdown.
-var abandon_requested = std.atomic.Value(bool).init(false);
+const abandon_requested = &@import("gc.zig").edge_flags.abandon;
 
 /// Never set on the main thread or on explicit `kotlin.concurrent.thread`
 /// workers, which are always joined.

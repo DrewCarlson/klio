@@ -111,6 +111,12 @@ pub fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Erro
             .ULong => |x| return ok(.{ .ULong = x -% 1 }),
             else => {},
         },
+        .ToByte, .ToShort, .ToInt, .ToLong, .ToFloat, .ToDouble, .ToChar => {
+            if (runtime.numconv.convert(op.conversion().?, v.*)) |out| return ok(out);
+        },
+        .Inv, .ToRawBits, .ToBits, .FloatFromBits, .DoubleFromBits, .CountTrailingZeroBits, .UIntToFloat, .UIntToDouble, .ULongToFloat, .ULongToDouble, .Sin, .Cos, .Sqrt, .ToULong, .ToUInt, .ToUShort, .ToUByte, .UnsignedBits => {
+            if (runtime.numfn.apply(op.function().?, v.*)) |out| return ok(out);
+        },
     }
     const s = v.display(allocator) catch "?";
     const msg = try std.fmt.allocPrint(allocator, "UnOp.{s} on {s} ({s})", .{ @tagName(op), s, @tagName(v.*) });
@@ -464,6 +470,7 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
             if (op == .And and l.* == .Bool and r.* == .Bool) return ok(.{ .Bool = l.Bool and r.Bool });
             if (op == .Or and l.* == .Bool and r.* == .Bool) return ok(.{ .Bool = l.Bool or r.Bool });
             if (scalarBin(op, l.*, r.*)) |v| return ok(v);
+            if (ev_exec.wideScalarBin(op, l.*, r.*)) |v| return ok(v);
         },
         .RangeTo, .RangeUntil => {
             if (try rangeValue(allocator, op, l, r)) |v| return ok(v);
@@ -725,12 +732,14 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
     switch (recv.*) {
         .Array => |arr| switch (arr.storage()) {
             .scalars => |pb| {
-                const g = pb.borrow();
-                defer g.deinit();
-                if (ui >= g.get().len()) return null;
+                // Read without the cell's lock: an array's buffer never moves
+                // once made, and an element is at most a word, which a racing
+                // store replaces whole, as the JVM's array reads see stores.
+                const buf = &pb.cell.data;
+                if (ui >= buf.len()) return null;
                 // An unsigned array over signed backing (`UIntArray(intArray)`)
                 // tags elements by `arr.prim`, not the buffer's storage kind.
-                return g.get().getAs(ui, arr.primKind() orelse g.get().kind); // fresh scalar
+                return buf.getAs(ui, arr.primKind() orelse buf.kind); // fresh scalar
             },
             .boxed => |vl| {
                 const g = vl.borrow();

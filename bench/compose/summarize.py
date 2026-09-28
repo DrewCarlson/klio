@@ -69,6 +69,9 @@ def metrics(runs):
     per = defaultdict(list)
     for r in ok:
         p = printed(r)
+        for k, v in p.items():
+            if k.endswith("_ns"):
+                per[k].append(v)
         for k in ("mean_ms", "p95_ms", "setContent_ms", "fps"):
             if k in p:
                 per[k].append(p[k])
@@ -108,6 +111,22 @@ def fmt(v):
     return "%.2f" % v
 
 
+def keys_for(prog, arms):
+    """The metrics a program reports: a scene's frames, a window's frames
+    and CPU, or a microbenchmark's own `<name>_ns` costs, then memory."""
+    if prog.startswith("hb_"):
+        return HEADLESS + MEMORY
+    if prog.startswith("wb_"):
+        return WINDOW + MEMORY
+    names = []
+    for m in arms.values():
+        for k in (m or {}):
+            if k.endswith("_ns") and k not in names:
+                names.append(k)
+    order = {k: i for i, k in enumerate(names)}
+    return [(k, k[:-3] + " ns") for k in sorted(names, key=order.get)] + MEMORY
+
+
 ARMS = ("klio", "klio-int", "jvm", "jvm-int")
 PAIRS = (("klio", "jvm"), ("klio-int", "jvm-int"))
 
@@ -135,7 +154,7 @@ def report(results, baseline=None):
         arms = now[prog]
         vals = {arm: arms.get(arm) or {} for arm in present}
         b = (base.get(prog) or {}).get("klio") or {}
-        keys = (HEADLESS if prog.startswith("hb_") else WINDOW) + MEMORY
+        keys = keys_for(prog, arms)
         first = True
         for key, label in keys:
             if all(vals[arm].get(key) is None for arm in present):

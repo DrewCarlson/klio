@@ -13,6 +13,7 @@ const records = @import("records.zig");
 const compose = @import("compose.zig");
 const env = @import("env.zig");
 const name = @import("name.zig");
+const coerce = @import("coerce.zig");
 const call = @import("call.zig");
 const control = @import("control.zig");
 const operator = @import("operator.zig");
@@ -372,9 +373,28 @@ pub fn lowerFunctionBody(b: *Builder, fb: *const ast.FunctionBody) Error!void {
             try tailrec.markExpr(b, e);
             try b.emit(.{ .Trace = .{ .span = e.span() } });
             const v = try lowerAlone(b, e);
-            b.terminate(.{ .Return = v });
+            if (!b.terminated()) b.terminate(.{ .Return = try coerce.convert(b, v, try coerce.scalarOf(b, b.exprType(e.id())), try coerce.returnTo(b, b.owner)) });
         },
     }
+}
+
+/// The static type of `e`'s value: its own, or for a block, its last
+/// statement's.
+pub fn valueType(b: *Builder, e: *const ast.Expr) sema.TypeId {
+    return switch (e.*) {
+        .Block => |*blk| lastValueType(b, blk.stmts),
+        else => b.exprType(e.id()),
+    };
+}
+
+/// The static type of the value a block of statements ends in: its last
+/// statement's, when that is an expression.
+pub fn lastValueType(b: *Builder, stmts: []const ast.Stmt) sema.TypeId {
+    if (stmts.len == 0) return .none;
+    return switch (stmts[stmts.len - 1]) {
+        .Expr => |*e| b.exprType(e.id()),
+        else => .none,
+    };
 }
 
 /// A local `val` or `var`. A delegated one keeps its delegate in its home
@@ -391,7 +411,7 @@ pub fn lowerLocalProperty(b: *Builder, prop: *const ast.Property) Error!void {
     const init = prop.init orelse return env.declareLocal(b, sym);
     const from = locals.mark(b);
     const v = try lowerExpr(b, init);
-    try env.bindLocalFrom(b, sym, v, from);
+    try env.bindLocalFrom(b, sym, try coerce.coerce(b, v, b.exprType(init.id()), b.p.s.syms.localInfo(sym).ty), from);
 }
 
 /// `target = value`: a name's write, or an index target's `set` through
@@ -405,24 +425,27 @@ pub fn lowerAssign(b: *Builder, a: *const ast.AssignStmt) Error!void {
             const last = segs[segs.len - 1];
             const rec = b.nameAt(a.id, last.span.start) orelse return b.nameMissed(a.id);
             const prefix = if (segs.len > 1) try name.pathValue(b, a.id, segs[0 .. segs.len - 1]) else null;
+            const prefix_ty: sema.TypeId = if (segs.len > 1) try name.pathType(b, a.id, segs[0 .. segs.len - 1]) else .none;
             const from = locals.mark(b);
             const v = try lowerExpr(b, &a.value);
-            if (rec.kind == .local) return env.writeLocalFrom(b, rec.target, v, from);
-            return name.write(b, &rec, prefix, v);
+            const v_ty = b.exprType(a.value.id());
+            if (rec.kind == .local) return env.writeLocalFrom(b, rec.target, try coerce.coerce(b, v, v_ty, try name.heldType(b, &rec)), from);
+            return name.write(b, &rec, prefix, prefix_ty, v, v_ty);
         },
         .Member => |m| {
             const rec = b.nameAt(a.id, m.name.span.start) orelse return b.nameMissed(a.id);
             const recv: ?Reg = if (name.takesExpr(&rec)) try name.memberReceiver(b, a.id, m.receiver) else null;
+            const recv_ty = b.exprType(m.receiver.id());
             if (!m.safe or recv == null) {
                 const v = try lowerExpr(b, &a.value);
-                return name.write(b, &rec, recv, v);
+                return name.write(b, &rec, recv, recv_ty, v, b.exprType(a.value.id()));
             }
             // `a?.x = v`: neither `v` nor the write happen when `a` is null.
             const split = try b.branchOnNull(recv.?);
             const join = try b.newBlock();
             b.switchTo(split.not_null);
             const v = try lowerExpr(b, &a.value);
-            try name.write(b, &rec, recv, v);
+            try name.write(b, &rec, recv, recv_ty, v, b.exprType(a.value.id()));
             b.terminate(.{ .Goto = join });
             b.switchTo(split.is_null);
             b.terminate(.{ .Goto = join });

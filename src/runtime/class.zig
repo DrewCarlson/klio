@@ -377,16 +377,22 @@ pub const InstanceData = struct {
     /// `values`, adopting one reference to each. The caller owns the one
     /// reference returned.
     pub fn new(a: std.mem.Allocator, class: ObjRef(ClassDef), values: []const Value, identity: u64) std.mem.Allocator.Error!ObjRef(InstanceData) {
-        const slots: []Value = if (values.len == 0) &.{} else try a.dupe(Value, values);
-        errdefer if (slots.len != 0) a.free(slots);
-        return ObjRef(InstanceData).init(a, .{
+        const inst = try newTrailing(a, class, class.asPtrConst().ir_class, values.len, identity);
+        @memcpy(inst.cell.data.slots, values);
+        return inst;
+    }
+
+    /// A new instance of `class` with `n` slots in its own cell, for the
+    /// caller to fill before anything else sees it.
+    pub fn newTrailing(a: std.mem.Allocator, class: ObjRef(ClassDef), class_id: u32, n: usize, identity: u64) std.mem.Allocator.Error!ObjRef(InstanceData) {
+        return ObjRef(InstanceData).initTrailing(a, .{
             .class = class,
-            .slots = slots,
-            .class_id = class.asPtrConst().ir_class,
+            .slots = &.{},
+            .class_id = class_id,
             .outer = null,
             .identity = identity,
             .native_state = null,
-        });
+        }, n);
     }
 
     /// Slot `i` of `inst`, or null past its slots. Takes no lock.
@@ -578,7 +584,7 @@ pub const InstanceData = struct {
     /// clone; `native_state` belongs to its host binding.
     pub fn deinit(self: *InstanceData, allocator: std.mem.Allocator) void {
         for (self.slots) |v| v.release(allocator);
-        if (self.slots.len != 0) allocator.free(self.slots);
+        if (self.slots.len != 0 and !self.slotsTrail()) allocator.free(self.slots);
         if (self.outer) |o| o.release(allocator);
         if (self.stack) |*s| s.deinit();
         self.class.deinit();
@@ -601,7 +607,27 @@ pub const InstanceData = struct {
     /// Shallow: the slot values, the outer and the class are independent cells
     /// swept on their own reachability.
     pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
-        if (self.slots.len != 0) allocator.free(self.slots);
+        if (self.slots.len != 0 and !self.slotsTrail()) allocator.free(self.slots);
+    }
+
+    /// The slots an instance made by `newTrailing` keeps in its own cell,
+    /// after it (`ObjRef.initTrailing`).
+    pub const Trailing = Value;
+
+    pub fn adoptTrailing(self: *InstanceData, slots: []Value) void {
+        self.slots = slots;
+    }
+
+    /// Whether the slots are in the instance's cell, after it.
+    pub fn slotsTrail(self: *const InstanceData) bool {
+        const Cell = ObjRef(InstanceData).Cell;
+        const cb: *const Cell = @alignCast(@fieldParentPtr("data", self));
+        return self.slots.len != 0 and @intFromPtr(self.slots.ptr) == @intFromPtr(cb) + @sizeOf(Cell);
+    }
+
+    /// The bytes the cell's allocation holds after it.
+    pub fn trailingBytes(self: *const InstanceData) usize {
+        return if (self.slotsTrail()) self.slots.len * @sizeOf(Value) else 0;
     }
 
     /// Created through `init` on first access, under the instance's exclusive
@@ -815,6 +841,26 @@ test "InstanceData reads and writes a slot by the name its class's layout gives 
     try testing.expectEqual(@as(?usize, 1), d.slotIndexCached(&cache, y));
     try testing.expect(cache.load(.monotonic) != 0);
     try testing.expectEqual(@as(i32, 1), d.getCached(&cache, "y").?.Int);
+}
+
+test "an instance's slots are in its own cell, and go with it" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+    const layout = [_]LayoutSlot{ .{ .name = "x" }, .{ .name = "y" } };
+    fx.ptr().layout_slots = &layout;
+    const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{ .{ .Int = 3 }, .{ .Int = 4 } }, 0);
+    defer inst.deinit();
+    const d = inst.asPtr();
+    try testing.expect(d.slotsTrail());
+    try testing.expectEqual(@intFromPtr(inst.cell) + @sizeOf(ObjRef(InstanceData).Cell), @intFromPtr(d.slots.ptr));
+    try testing.expectEqual(@as(usize, 2 * @sizeOf(Value)), d.trailingBytes());
+    try testing.expectEqual(@as(i32, 4), d.get("y").?.Int);
+    // An instance with no slots has nothing after its cell.
+    const empty = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 1);
+    defer empty.deinit();
+    try testing.expect(!empty.asPtr().slotsTrail());
+    try testing.expectEqual(@as(usize, 0), empty.asPtr().trailingBytes());
 }
 
 test "instance release recursively frees a retained instance field" {

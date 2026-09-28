@@ -49,10 +49,13 @@ pub fn choose(p: *const Program, rec: *const CallRec) Error!How {
     const callee = rec.callee;
     if (callee == .none) return error.Unrecorded;
     switch (rec.form) {
-        .ctor => return .{ .ctor = .{
-            .class = classIdOf(br, s.syms.owner(callee)) orelse return error.Unsupported,
-            .ctor = funcIdOf(br, callee) orelse return error.Unsupported,
-        } },
+        .ctor => {
+            if (unsignedCtor(s, callee)) |op| return .{ .prim = .{ .un_last = op } };
+            return .{ .ctor = .{
+                .class = classIdOf(br, s.syms.owner(callee)) orelse return error.Unsupported,
+                .ctor = funcIdOf(br, callee) orelse return error.Unsupported,
+            } };
+        },
         // On the instance being built.
         .this_delegation, .super_delegation => return .{ .static = funcIdOf(br, callee) orelse return error.Unsupported },
         // `Iface { ... }` constructs the interface's SAM class.
@@ -79,6 +82,7 @@ pub fn choose(p: *const Program, rec: *const CallRec) Error!How {
     }
     // Nothing overrides a local, top-level, private or final one.
     if (isLocal(br, f) or !overridable(s, callee)) {
+        if (native != .none) if (nativeFunctionOf(p, native)) |op| return .{ .prim = .{ .un_last = op } };
         return if (native != .none) .{ .native = native } else .{ .static = f };
     }
     const slot = slotOf(br, f) orelse return error.Unsupported;
@@ -87,6 +91,30 @@ pub fn choose(p: *const Program, rec: *const CallRec) Error!How {
         return .{ .interface = .{ .iface = classIdOf(br, owner) orelse return error.Unsupported, .slot = slot } };
     }
     return .{ .virtual = slot };
+}
+
+/// The instruction an unsigned type's constructor over its `data` is: the
+/// value is the host's unsigned number made from the integer's bits.
+fn unsignedCtor(s: *sema.Sema, ctor: Sym) ?ir.UnOp {
+    if (s.syms.functionInfo(ctor).params.len != 1) return null;
+    const cls = s.syms.owner(ctor);
+    const bi = &s.builtins;
+    if (cls == .none) return null;
+    if (cls == bi.ulong) return .ToULong;
+    if (cls == bi.uint) return .ToUInt;
+    if (cls == bi.ushort) return .ToUShort;
+    if (cls == bi.ubyte) return .ToUByte;
+    return null;
+}
+
+/// The instruction native `id` computes, where it is a numeric function of
+/// one value (`operator.nativeFunction`).
+fn nativeFunctionOf(p: *const Program, id: NativeId) ?ir.UnOp {
+    const r = p.m.resolved orelse return null;
+    if (id.int() >= r.natives.len) return null;
+    const n = &r.natives[id.int()];
+    if (n.reified != 0 or n.vararg_back != null) return null;
+    return operator.nativeFunction(n.key);
 }
 
 /// Emits `how` over the argument run `run` of `n` registers into `dst`.

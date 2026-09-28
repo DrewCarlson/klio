@@ -1335,6 +1335,51 @@ pub fn execRInstanceOf(comptime H: type, a: Allocator, frame: *Frame, x: anytype
     return .cont;
 }
 
+/// `BoxValue`: an instance of the scalar value class over the number, which
+/// runs no init block; an instance or a null is itself.
+pub fn execBoxValue(comptime H: type, a: Allocator, frame: *Frame, x: anytype, host: *H) Allocator.Error!Step {
+    const r = frame.module.resolved orelse return noTables(frame, "BoxValue");
+    const v = frame.read(x.src);
+    if (v == .Instance or v == .Null) {
+        v.retain();
+        try frame.write(x.dst, v);
+        return .cont;
+    }
+    const st = host.resolvedState() orelse return noTables(frame, "BoxValue");
+    const boxed = try boxValue(a, r, x.class, x.slot, v, nextIdentity(st));
+    try frame.write(x.dst, boxed);
+    return .cont;
+}
+
+/// The instance of scalar value class `class` holding `v` in field `slot`.
+pub fn boxValue(a: Allocator, r: *const Resolved, class: ClassId, slot: u32, v: Value, identity: u64) Allocator.Error!Value {
+    const boxed = try ir.resolved.instantiate(a, r, class, identity);
+    v.retain();
+    if (runtime.InstanceData.slotSet(boxed.Instance, slot, v)) |old| {
+        if (runtime.reclaimEnabled()) old.release(a);
+    }
+    return boxed;
+}
+
+/// `UnboxValue`: the number an instance of the scalar value class holds;
+/// anything else is itself.
+pub fn execUnboxValue(comptime H: type, a: Allocator, frame: *Frame, x: anytype) Allocator.Error!Step {
+    _ = H;
+    _ = a;
+    const v = frame.read(x.src);
+    const out = unboxValue(v, x.class.int(), x.slot);
+    out.retain();
+    try frame.write(x.dst, out);
+    return .cont;
+}
+
+/// The number `v` holds when it is an instance of `class`, else `v`.
+pub inline fn unboxValue(v: Value, class: u32, slot: u32) Value {
+    if (v != .Instance) return v;
+    if (v.Instance.asPtrConst().class_id != class) return v;
+    return runtime.InstanceData.slotGet(v.Instance, slot) orelse v;
+}
+
 /// `as` and `as?`: the value itself when it is a `class` (null when
 /// `nullable`), else null for `as?`, else `NullPointerException` for a null
 /// and `ClassCastException` for anything else.
@@ -1539,6 +1584,12 @@ test "type tests and casts answer by class, null by nullable" {
     var mem = hand.TestMemory.init();
     defer mem.deinit();
     try expectTrue(try runOnNullHost(mem.allocator(), hand.typeTests));
+}
+
+test "a scalar value class boxes a number once, and unboxes an instance of it to the number" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    try expectInt(14, try runOnNullHost(mem.allocator(), hand.boxing));
 }
 
 test "a catch handler takes a throw by its class" {

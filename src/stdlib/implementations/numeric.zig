@@ -1053,41 +1053,10 @@ pub fn double_to_ubyte(ctx: *CallCtx) Allocator.Error!EvalResult {
 
 /// Kotlin's `Double.toInt`: truncate toward zero, saturate out-of-range at the
 /// Int bounds, and map NaN to 0.
-pub fn f64ToI32Kotlin(d: f64) i32 {
-    if (std.math.isNan(d)) return 0;
-    const hi: f64 = @floatFromInt(@as(i32, std.math.maxInt(i32)));
-    const lo: f64 = @floatFromInt(@as(i32, std.math.minInt(i32)));
-    if (d >= hi) return std.math.maxInt(i32);
-    if (d <= lo) return std.math.minInt(i32);
-    return @intFromFloat(@trunc(d));
-}
-
-pub fn f64ToI64Kotlin(d: f64) i64 {
-    if (std.math.isNan(d)) return 0;
-    const hi: f64 = @floatFromInt(@as(i64, std.math.maxInt(i64)));
-    const lo: f64 = @floatFromInt(@as(i64, std.math.minInt(i64)));
-    if (d >= hi) return std.math.maxInt(i64);
-    if (d <= lo) return std.math.minInt(i64);
-    return @intFromFloat(@trunc(d));
-}
-
-pub fn f32ToI32Kotlin(d: f32) i32 {
-    if (std.math.isNan(d)) return 0;
-    const hi: f32 = @floatFromInt(@as(i32, std.math.maxInt(i32)));
-    const lo: f32 = @floatFromInt(@as(i32, std.math.minInt(i32)));
-    if (d >= hi) return std.math.maxInt(i32);
-    if (d <= lo) return std.math.minInt(i32);
-    return @intFromFloat(@trunc(d));
-}
-
-pub fn f32ToI64Kotlin(d: f32) i64 {
-    if (std.math.isNan(d)) return 0;
-    const hi: f32 = @floatFromInt(@as(i64, std.math.maxInt(i64)));
-    const lo: f32 = @floatFromInt(@as(i64, std.math.minInt(i64)));
-    if (d >= hi) return std.math.maxInt(i64);
-    if (d <= lo) return std.math.minInt(i64);
-    return @intFromFloat(@trunc(d));
-}
+pub const f64ToI32Kotlin = runtime.numconv.f64ToI32Kotlin;
+pub const f64ToI64Kotlin = runtime.numconv.f64ToI64Kotlin;
+pub const f32ToI32Kotlin = runtime.numconv.f32ToI32Kotlin;
+pub const f32ToI64Kotlin = runtime.numconv.f32ToI64Kotlin;
 
 pub fn double_is_nan(ctx: *CallCtx) Allocator.Error!EvalResult {
     const d = switch (try recvDouble(ctx.allocator, ctx.args, "Double.isNaN")) {

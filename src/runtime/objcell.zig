@@ -605,7 +605,39 @@ pub fn ObjRef(comptime T: type) type {
                 return;
             }
             gcFinalizeData(T, &cb.data, cb.allocator);
-            cb.allocator.destroy(cb);
+            freeCell(cb);
+        }
+
+        /// The cell's allocation: the block, and after it the payload's
+        /// trailing run when `initTrailing` made one.
+        fn freeCell(cb: *Cell) void {
+            const allocator = cb.allocator;
+            const extra: usize = if (comptime hasDeclSafe(T, "trailingBytes")) cb.data.trailingBytes() else 0;
+            if (extra == 0) return allocator.destroy(cb);
+            const block: [*]align(@alignOf(Cell)) u8 = @ptrCast(cb);
+            allocator.free(block[0 .. @sizeOf(Cell) + extra]);
+        }
+
+        /// `initOwned` with the payload's trailing run of `n` `T.Trailing`s in
+        /// the same allocation, after the cell, which the payload adopts
+        /// (`T.adoptTrailing`) for the caller to fill: one allocation and one
+        /// free where a separate buffer takes two.
+        pub fn initTrailing(allocator: std.mem.Allocator, v: T, n: usize) std.mem.Allocator.Error!Self {
+            const Elem = T.Trailing;
+            const bytes = @sizeOf(Cell) + n * @sizeOf(Elem);
+            const block = try allocator.alignedAlloc(u8, .of(Cell), bytes);
+            const cell: *Cell = @ptrCast(block.ptr);
+            cell.* = .{
+                .hdr = .{ .gc_trace = gcTraceThunk, .gc_finalize = gcFinalizeThunk, .gc_type = @typeName(T) },
+                .refcount = std.atomic.Value(usize).init(1),
+                .lock = .{},
+                .data = v,
+                .allocator = allocator,
+            };
+            const elems: [*]Elem = @ptrCast(@alignCast(block.ptr + @sizeOf(Cell)));
+            cell.data.adoptTrailing(elems[0..n]);
+            if (gc.gc_enabled) gc.register(&cell.hdr, bytes + externalBytes(T, &cell.data));
+            return .{ .cell = cell };
         }
 
         /// Free the cell now, whatever the refcount gating or memory mode, for a
@@ -620,7 +652,7 @@ pub fn ObjRef(comptime T: type) type {
             } else if (comptime hasDeinit(T)) {
                 deinitData(&self.cell.data, allocator);
             }
-            allocator.destroy(self.cell);
+            freeCell(self.cell);
         }
 
         /// `init` without the dupe: the cell adopts `v` verbatim, so it takes a
@@ -683,7 +715,7 @@ pub fn ObjRef(comptime T: type) type {
                 } else if (comptime hasDeinit(T)) {
                     deinitData(&self.cell.data, allocator);
                 }
-                allocator.destroy(self.cell);
+                freeCell(self.cell);
             }
         }
 

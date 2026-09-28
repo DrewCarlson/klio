@@ -198,6 +198,30 @@ pub fn sbMemoInvalidate(cell: usize) void {
     if (sb_memo.cell == cell) sb_memo.cell = 0;
 }
 
+/// Carries the memo over an append of `piece` to builder `cell`, whose
+/// buffer was `before_ptr`/`before_len` and is `after` now: the length and
+/// the ASCII flag follow from the memo's and the piece's, and the cursor's
+/// position is unmoved. A memo of another builder, or of the buffer as it
+/// was before some other change, is dropped.
+pub fn sbMemoAppended(cell: usize, before_ptr: [*]const u8, before_len: usize, after: []const u8, piece: []const u8) void {
+    if (sb_memo.cell != cell) return;
+    if (sb_memo.ptr != before_ptr or sb_memo.len != before_len) {
+        sb_memo.cell = 0;
+        return;
+    }
+    var ascii = true;
+    for (piece) |b| {
+        if (b >= 0x80) {
+            ascii = false;
+            break;
+        }
+    }
+    sb_memo.ptr = after.ptr;
+    sb_memo.len = after.len;
+    sb_memo.u16_len += if (ascii) piece.len else sbCharCount(piece);
+    sb_memo.ascii = sb_memo.ascii and ascii;
+}
+
 pub fn sbMemoFor(cell: usize, items: []const u8) *SbMemo {
     if (sb_memo.cell == cell and sb_memo.ptr == items.ptr and sb_memo.len == items.len) return &sb_memo;
     var ascii = true;
@@ -1179,7 +1203,7 @@ pub const PrimBuf = struct {
 
     /// `view_kind` differs from the storage kind only for an unsigned view over
     /// signed backing, where only the boxed tag changes.
-    pub fn getAs(self: *const PrimBuf, i: usize, view_kind: PrimitiveArrayKind) Value {
+    pub inline fn getAs(self: *const PrimBuf, i: usize, view_kind: PrimitiveArrayKind) Value {
         const p: [*]const u8 = self.bytes.items.ptr + i * view_kind.elemSize();
         return switch (view_kind) {
             .Int => .{ .Int = readAs(i32, p) },

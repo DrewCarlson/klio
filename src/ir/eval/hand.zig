@@ -537,6 +537,34 @@ pub fn singleton(h: *Hand) Allocator.Error!FuncId {
     return main;
 }
 
+/// A number boxed as a scalar value class, boxed again (the same instance),
+/// tested, and unboxed twice (the second time the number itself); the sum
+/// of the two unboxed numbers, 14, when the instance tests as the class and
+/// the second box is the first.
+pub fn boxing(h: *Hand) Allocator.Error!FuncId {
+    const meters = try h.class("Meters", .{ .slot_names = &.{"value"}, .seeds = &.{.int} });
+    const seven = try h.constant(.{ .Int = 7 });
+    const minus = try h.constant(.{ .Int = -1 });
+    const main = try h.func("main", 0);
+    try h.body(main, &.{
+        .{ .insts = &.{
+            konst(0, seven),
+            .{ .BoxValue = .{ .dst = reg(1), .src = reg(0), .class = meters, .slot = 0 } },
+            .{ .BoxValue = .{ .dst = reg(2), .src = reg(1), .class = meters, .slot = 0 } },
+            bin(3, .IdentEq, 1, 2),
+            instanceOf(4, 1, meters, false),
+            .{ .UnboxValue = .{ .dst = reg(5), .src = reg(2), .class = meters, .slot = 0 } },
+            .{ .UnboxValue = .{ .dst = reg(6), .src = reg(5), .class = meters, .slot = 0 } },
+            bin(7, .Add, 5, 6),
+            bin(8, .And, 3, 4),
+        }, .term = .{ .Branch = .{ .cond = reg(8), .t = BlockId.from(1), .f = BlockId.from(2) } } },
+        .{ .insts = &.{}, .term = ret(7) },
+        .{ .insts = &.{konst(9, minus)}, .term = ret(9) },
+    });
+    try h.finish();
+    return main;
+}
+
 /// Type tests and casts on an instance, on null with and without
 /// `nullable`, on a host `Int`, and against type values. True.
 pub fn typeTests(h: *Hand) Allocator.Error!FuncId {

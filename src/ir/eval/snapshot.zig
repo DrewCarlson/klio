@@ -25,6 +25,11 @@ const destroyParkedActivation = ev_activation.destroyParkedActivation;
 const gcMarkFrameRegs = ev_state.gcMarkFrameRegs;
 const markFrameClosure = ev_state.markFrameClosure;
 
+/// The allocator of every try stack: the one the activation pool holds its activations in, so a
+/// pooled activation keeps its try stack's buffer from one use to the next, whatever allocator the
+/// run it serves was given.
+pub const try_alloc = std.heap.c_allocator;
+
 pub const TryFrame = struct {
     /// Try body entry block; matches pop and pending return/rethrow against `Block.finally_done_for`.
     body: BlockId,

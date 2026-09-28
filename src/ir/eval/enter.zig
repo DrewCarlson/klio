@@ -137,14 +137,15 @@ fn dumpFnSlow(func: *const Func) void {
     for (func.x().capture_order) |cn| std.debug.print("{s},", .{cn});
     std.debug.print("\n", .{});
     for (func.blocks, 0..) |*blk, bi| {
-        std.debug.print("  block {d}:\n", .{bi});
+        std.debug.print("  block {d}:", .{bi});
+        const h = blk.h();
+        for (h.catches) |c| std.debug.print(" catch(class={d} -> b{d} into r{d})", .{ c.class.int(), c.handler.int(), c.exception_reg.int() });
+        if (h.finally) |f| std.debug.print(" finally=b{d}", .{f.int()});
+        if (h.finally_done) |f| std.debug.print(" finally_done=b{d}", .{f.int()});
+        std.debug.print("\n", .{});
         for (blk.insts, 0..) |*inst, ii| {
             std.debug.print("    {d}: {s}", .{ ii, @tagName(std.meta.activeTag(inst.*)) });
             switch (inst.*) {
-                .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
-                .LoadParam => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
-                .Const => |x| std.debug.print(" dst=r{d}", .{x.dst.int()}),
-                .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
                 .Trace => |t| {
                     if (span.active_map) |m| {
                         if (m.getChecked(t.span.file)) |sf| {
@@ -153,15 +154,53 @@ fn dumpFnSlow(func: *const Func) void {
                         }
                     }
                 },
-                .BinOp => |x| std.debug.print(" op={s} dst=r{d} lhs=r{d} rhs=r{d}", .{ @tagName(x.op), x.dst.int(), x.lhs.int(), x.rhs.int() }),
-                else => {},
+                inline else => |payload| dumpFields(payload),
             }
             std.debug.print("\n", .{});
         }
+        std.debug.print("    term: {s}", .{@tagName(std.meta.activeTag(blk.terminator))});
         switch (blk.terminator) {
-            .Branch => |br| std.debug.print("    term: Branch cond=r{d} t={d} f={d}\n", .{ br.cond.int(), br.t.int(), br.f.int() }),
-            else => std.debug.print("    term: {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))}),
+            inline else => |payload| dumpFields(payload),
         }
+        std.debug.print("\n", .{});
+    }
+}
+
+/// Each field of an instruction's or terminator's payload, as `name=value`: registers as `rN`,
+/// blocks as `bN`, other ids as their number.
+fn dumpFields(payload: anytype) void {
+    const P = @TypeOf(payload);
+    switch (@typeInfo(P)) {
+        .@"struct" => |st| inline for (st.fields) |f| {
+            std.debug.print(" {s}=", .{f.name});
+            dumpValue(@field(payload, f.name));
+        },
+        .void => {},
+        else => {
+            std.debug.print(" ", .{});
+            dumpValue(payload);
+        },
+    }
+}
+
+fn dumpValue(v: anytype) void {
+    const T = @TypeOf(v);
+    if (T == ir.Reg) return std.debug.print("r{d}", .{v.int()});
+    if (T == ir.BlockId) return std.debug.print("b{d}", .{v.int()});
+    switch (@typeInfo(T)) {
+        .optional => if (v) |x| dumpValue(x) else std.debug.print("null", .{}),
+        .@"enum" => |e| if (e.is_exhaustive) std.debug.print("{s}", .{@tagName(v)}) else std.debug.print("{d}", .{@intFromEnum(v)}),
+        .int, .comptime_int => std.debug.print("{d}", .{v}),
+        .bool => std.debug.print("{}", .{v}),
+        .pointer => |p| if (p.size == .slice) {
+            std.debug.print("[", .{});
+            for (v, 0..) |x, i| {
+                if (i != 0) std.debug.print(",", .{});
+                dumpValue(x);
+            }
+            std.debug.print("]", .{});
+        } else dumpFields(v.*),
+        else => std.debug.print("?", .{}),
     }
 }
 
@@ -262,7 +301,7 @@ pub fn evalView(
     boolThisTrap(func, params);
     callStatsBumpId(func.fqn, func.id.int(), module);
     var try_stack: std.ArrayList(TryFrame) = .empty;
-    defer try_stack.deinit(allocator);
+    defer try_stack.deinit(ev_snapshot.try_alloc);
     var frame: Frame = undefined;
     frame.enter(ev, allocator, module, func, params, captures, at) catch |e| {
         if (at) |m| ev.vstack.restore(m);

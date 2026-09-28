@@ -839,7 +839,22 @@ fn growthFactor() usize {
     return f;
 }
 var cur_epoch: usize = 1;
-var gc_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// What every edge of the interpreter tests, one byte each so each is
+/// written alone, read together as one word (`edgeFlagsWord`): a collection
+/// wanted, an abandon requested (`threads`), a stress mode on.
+pub const EdgeFlags = extern struct {
+    gc_pending: std.atomic.Value(bool) = .init(false),
+    abandon: std.atomic.Value(bool) = .init(false),
+    stress: bool = false,
+    spare: bool = false,
+};
+pub var edge_flags: EdgeFlags align(4) = .{};
+const gc_pending = &edge_flags.gc_pending;
+
+/// Nonzero when an edge has more to do than be taken.
+pub inline fn edgeFlagsWord() u32 {
+    return @atomicLoad(u32, @as(*const u32, @ptrCast(&edge_flags)), .monotonic);
+}
 
 pub fn setThresholdFloor(bytes: usize) void {
     threshold_floor = bytes;
@@ -3212,3 +3227,19 @@ test "a mutator quiescing while another thread collects parks for its stop" {
     exitMutator();
 }
 
+
+test "the edge word is up while a collection is wanted, an abandon asked, or a stress mode on" {
+    const saved = edge_flags;
+    defer edge_flags = saved;
+    edge_flags = .{};
+    try std.testing.expectEqual(@as(u32, 0), edgeFlagsWord());
+    gc_pending.store(true, .monotonic);
+    try std.testing.expect(edgeFlagsWord() != 0);
+    gc_pending.store(false, .monotonic);
+    try std.testing.expectEqual(@as(u32, 0), edgeFlagsWord());
+    edge_flags.abandon.store(true, .monotonic);
+    try std.testing.expect(edgeFlagsWord() != 0);
+    edge_flags.abandon.store(false, .monotonic);
+    edge_flags.stress = true;
+    try std.testing.expect(edgeFlagsWord() != 0);
+}

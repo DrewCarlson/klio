@@ -20,7 +20,9 @@ const records = @import("records.zig");
 const env = @import("env.zig");
 const body = @import("body.zig");
 const inline_mod = @import("inline.zig");
+const coerce = @import("coerce.zig");
 const compose = @import("compose.zig");
+const operator = @import("operator.zig");
 const locals = @import("locals.zig");
 
 const Builder = builder.Builder;
@@ -32,6 +34,21 @@ const FuncId = ir.FuncId;
 
 /// A `Path` or `Member` read.
 pub fn lowerName(b: *Builder, e: *const ast.Expr) Error!Reg {
+    const r = try lowerNameHeld(b, e);
+    // A read is never wider than what it reads; a smart cast narrows it.
+    return coerce.coerce(b, r, try nameType(b, e), b.exprType(e.id()));
+}
+
+/// The declared type of what name expression `e` reads.
+fn nameType(b: *Builder, e: *const ast.Expr) Error!sema.TypeId {
+    return switch (e.*) {
+        .Path => |p| if (p.segments.len == 1) heldType(b, &(try b.name(p.id))) else pathType(b, p.id, p.segments),
+        .Member => |m| if (b.nameAt(m.id, m.name.span.start)) |rec| heldType(b, &rec) else .none,
+        else => .none,
+    };
+}
+
+fn lowerNameHeld(b: *Builder, e: *const ast.Expr) Error!Reg {
     switch (e.*) {
         .Path => |p| {
             if (p.segments.len == 1) {
@@ -50,13 +67,15 @@ pub fn lowerName(b: *Builder, e: *const ast.Expr) Error!Reg {
             // The receiver is this read's alone.
             const from = locals.mark(b);
             const recv = try memberReceiver(b, m.id, m.receiver);
-            if (!m.safe) return readFrom(b, &rec, recv, from);
+            const recv_ty = receiverType(b, m.id, m.receiver);
+            if (!m.safe) return readTyped(b, &rec, recv, recv_ty, from);
             // `a?.x`: null when `a` is.
             const split = try b.branchOnNull(recv);
             const result = b.newReg();
             const join = try b.newBlock();
             b.switchTo(split.not_null);
-            const v = try read(b, &rec, recv);
+            // The null the other branch gives makes the result nullable: boxed.
+            const v = try coerce.coerce(b, try readTyped(b, &rec, recv, recv_ty, null), try heldType(b, &rec), .none);
             try b.emit(.{ .Move = .{ .dst = result, .src = v } });
             b.terminate(.{ .Goto = join });
             b.switchTo(split.is_null);
@@ -119,6 +138,7 @@ pub fn takesExpr(rec: *const NameRec) bool {
 /// before it. Null when every segment is a qualifier.
 pub fn pathValue(b: *Builder, id: ast.NodeId, segs: []const ast.Ident) Error!?Reg {
     var cur: ?Reg = null;
+    var cur_ty: sema.TypeId = .none;
     // Where lowering stood before `cur` was read, which the next read alone
     // consumes.
     var from: ?locals.Mark = null;
@@ -134,10 +154,42 @@ pub fn pathValue(b: *Builder, id: ast.NodeId, segs: []const ast.Ident) Error!?Re
             if (b.nameAt(id, segs[i + 1].span.start)) |next| if (isConstRead(b.p.s, &next)) continue;
         }
         const here = locals.mark(b);
-        cur = try readFrom(b, &rec, cur, from);
+        cur = try readTyped(b, &rec, cur, cur_ty, from);
+        cur_ty = try heldType(b, &rec);
         from = here;
     }
     return cur;
+}
+
+/// The declared type of the value `pathValue` reads for `segs`: its last
+/// segment's.
+pub fn pathType(b: *Builder, id: ast.NodeId, segs: []const ast.Ident) Error!sema.TypeId {
+    var i = segs.len;
+    while (i > 0) {
+        i -= 1;
+        const rec = b.nameAt(id, segs[i].span.start) orelse continue;
+        return heldType(b, &rec);
+    }
+    return .none;
+}
+
+/// The static type of a member access's receiver expression; `.none` for a
+/// classifier qualifier, whose object is no scalar class's value.
+fn receiverType(b: *Builder, node: ast.NodeId, recv: *const ast.Expr) sema.TypeId {
+    if (b.nameAt(node, lastNameStart(recv))) |h| if (h.kind == .object) return .none;
+    return b.exprType(recv.id());
+}
+
+/// The declared type of what `rec` names, which a read of it holds its
+/// value as: a scalar class's number where that is the class.
+pub fn heldType(b: *Builder, rec: *const NameRec) Error!sema.TypeId {
+    const s = b.p.s;
+    return switch (rec.kind) {
+        .local => s.syms.localInfo(rec.target).ty,
+        .param => try sema.headers.paramType(s, rec.target),
+        .property, .backing_field => try sema.headers.propertyType(s, rec.target),
+        .object, .enum_entry => .none,
+    };
 }
 
 /// Whether `rec` reads a `const val`, which is its constant.
@@ -193,12 +245,17 @@ pub fn read(b: *Builder, rec: *const NameRec, recv: ?Reg) Error!Reg {
 /// `read` on a receiver lowered since `from` that the read alone consumes:
 /// an accessor call computes it in place in its argument run.
 pub fn readFrom(b: *Builder, rec: *const NameRec, recv: ?Reg, from: ?locals.Mark) Error!Reg {
+    return readTyped(b, rec, recv, .none, from);
+}
+
+/// `readFrom` on a receiver of static type `recv_ty` (`.none`: not known).
+pub fn readTyped(b: *Builder, rec: *const NameRec, recv: ?Reg, recv_ty: sema.TypeId, from: ?locals.Mark) Error!Reg {
     return switch (rec.kind) {
         .local, .param => env.readLocal(b, rec.target),
         .object => env.loadObject(b, rec.target),
         .enum_entry => entryValue(b, rec.target),
         .backing_field => readField(b, rec.target),
-        .property => readProperty(b, rec, recv, from),
+        .property => readProperty(b, rec, recv, recv_ty, from),
     };
 }
 
@@ -220,18 +277,48 @@ fn entryValue(b: *Builder, entry: Sym) Error!Reg {
     return loadStatic(b, entry);
 }
 
-/// Stores `value` into what `rec` names.
-pub fn write(b: *Builder, rec: *const NameRec, recv: ?Reg, value: Reg) Error!void {
+/// Stores `value`, of static type `value_ty`, into what `rec` names, as its
+/// declared type holds it; `recv_ty` is the receiver's static type.
+pub fn write(b: *Builder, rec: *const NameRec, recv: ?Reg, recv_ty: sema.TypeId, value_in: Reg, value_ty: sema.TypeId) Error!void {
     const s = b.p.s;
+    const value = switch (rec.kind) {
+        .local, .backing_field => try coerce.coerce(b, value_in, value_ty, try heldType(b, rec)),
+        else => value_in,
+    };
     return switch (rec.kind) {
         .local => env.writeLocal(b, rec.target, value),
         .backing_field => writeField(b, rec.target, value),
-        .property => writeProperty(b, rec, recv, value),
+        .property => writeProperty(b, rec, recv, recv_ty, value, value_ty),
         .param, .object, .enum_entry => b.fail(b.cur_span, "`{s}` is not assignable", .{s.str(s.syms.name(rec.target))}),
     };
 }
 
 // ------------------------------------------------------------ properties --
+
+/// The scalar class property `p`'s field holds the number of.
+fn fieldHeld(b: *Builder, p: Sym) Error!?coerce.Scalar {
+    return coerce.scalarOf(b, try sema.headers.propertyType(b.p.s, p));
+}
+
+/// A member accessor's dispatch receiver `r` of static type `recv_ty` (or
+/// the implicit receiver's) as the accessor holds it.
+fn accessorReceiver(b: *Builder, dispatch: sema.records.Receiver, r: Reg, recv_ty: sema.TypeId, held: ?coerce.Scalar) Error!Reg {
+    const from = switch (dispatch) {
+        .expr => try coerce.scalarOf(b, recv_ty),
+        else => try coerce.implicitScalar(b, dispatch),
+    };
+    return coerce.convert(b, r, from, held);
+}
+
+/// An extension property's receiver as its accessors hold it.
+fn extReceiver(b: *Builder, rec: *const NameRec, recv: ?Reg, recv_ty: sema.TypeId) Error!?Reg {
+    const r = (try env.receiverOf(b, rec.extension, recv)) orelse return null;
+    const from = switch (rec.extension) {
+        .expr => try coerce.scalarOf(b, recv_ty),
+        else => try coerce.implicitScalar(b, rec.extension),
+    };
+    return try coerce.convert(b, r, from, try coerce.receiverHeld(b, rec.target));
+}
 
 /// Whether `p` is read with an instance: a member that is not static.
 fn isMember(s: *sema.Sema, p: Sym) bool {
@@ -283,7 +370,7 @@ fn isSuper(r: sema.records.Receiver) bool {
     };
 }
 
-fn readProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, from: ?locals.Mark) Error!Reg {
+fn readProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, recv_ty: sema.TypeId, from: ?locals.Mark) Error!Reg {
     const s = b.p.s;
     const br = b.p.br;
     const p = rec.target;
@@ -309,9 +396,17 @@ fn readProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, from: ?locals.Mark
         return body.lowerExpr(b, init);
     };
     const member = isMember(s, p);
-    const disp: ?Reg = if (member) (try dispatchReg(b, rec, recv)) orelse
-        return b.fail(b.cur_span, "member property `{s}` read without a receiver", .{s.str(s.syms.name(p))}) else null;
-    const ext = try env.receiverOf(b, rec.extension, recv);
+    const disp: ?Reg = if (member) try accessorReceiver(b, rec.dispatch, (try dispatchReg(b, rec, recv)) orelse
+        return b.fail(b.cur_span, "member property `{s}` read without a receiver", .{s.str(s.syms.name(p))}), recv_ty, try coerce.dispatchHeld(b, p)) else null;
+    // A scalar class's value is its number.
+    if (disp) |d| if (try coerce.valuePropertyOf(b, p)) |sc| return coerce.unbox(b, d, sc);
+    // An unsigned number's `data` is its bits as the signed type.
+    if (disp) |d| if (operator.isUnsignedData(s, p)) {
+        const dst = b.newReg();
+        try b.emit(.{ .UnOp = .{ .dst = dst, .op = .UnsignedBits, .operand = d } });
+        return dst;
+    };
+    const ext = try extReceiver(b, rec, recv, recv_ty);
     const via_super = isSuper(rec.dispatch);
     if (ext == null and rec.contexts.len == 0 and defaultGetter(s, p)) {
         if (member) {
@@ -341,31 +436,35 @@ fn readProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, from: ?locals.Mark
     return accessorCall(b, p, getterOf(br, p) orelse return noAccessor(b, p, "getter"), false, args.items, member and !via_super, via_super, from);
 }
 
-fn writeProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, value: Reg) Error!void {
+fn writeProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, recv_ty: sema.TypeId, value_in: Reg, value_ty: sema.TypeId) Error!void {
     const s = b.p.s;
     const br = b.p.br;
     const p = rec.target;
     const member = isMember(s, p);
-    const disp: ?Reg = if (member) (try dispatchReg(b, rec, recv)) orelse
-        return b.fail(b.cur_span, "member property `{s}` written without a receiver", .{s.str(s.syms.name(p))}) else null;
-    const ext = try env.receiverOf(b, rec.extension, recv);
+    const disp: ?Reg = if (member) try accessorReceiver(b, rec.dispatch, (try dispatchReg(b, rec, recv)) orelse
+        return b.fail(b.cur_span, "member property `{s}` written without a receiver", .{s.str(s.syms.name(p))}), recv_ty, try coerce.dispatchHeld(b, p)) else null;
+    const ext = try extReceiver(b, rec, recv, recv_ty);
     const via_super = isSuper(rec.dispatch);
     const mutable = s.syms.flags(p).mutable;
+    const from = try coerce.scalarOf(b, value_ty);
     if (ext == null and rec.contexts.len == 0 and (!mutable or defaultSetter(s, p))) {
         if (member) {
             // A `val` is written only by its own class's initialization.
             const direct = !mutable or via_super or finalMember(s, p);
             if (br.fieldOf(p)) |slot| {
                 if (direct) {
+                    const value = try coerce.convert(b, value_in, from, try fieldHeld(b, p));
                     try b.emit(.{ .SetFieldSlot = .{ .obj = disp.?, .slot = slot, .value = value } });
                     return;
                 }
             }
         } else if (br.staticOf(p)) |st| {
+            const value = try coerce.convert(b, value_in, from, try fieldHeld(b, p));
             try b.emit(.{ .StoreStatic = .{ .static = st, .value = value } });
             return;
         }
     }
+    const value = try coerce.convert(b, value_in, from, try coerce.returnHeld(b, p));
     var args: std.ArrayList(Reg) = .empty;
     if (disp) |d| try args.append(b.p.a, d);
     for (rec.contexts) |c| try args.append(b.p.a, try contextArg(b, c));
@@ -381,6 +480,7 @@ fn readField(b: *Builder, p: Sym) Error!Reg {
     const br = b.p.br;
     const dst = b.newReg();
     if (isMember(s, p)) {
+        if (try coerce.valuePropertyOf(b, p)) |sc| return coerce.unbox(b, try env.thisOf(b, s.syms.owner(p)), sc);
         const slot = br.fieldOf(p) orelse return noStorage(b, p);
         try b.emit(.{ .GetFieldSlot = .{ .dst = dst, .obj = try env.thisOf(b, s.syms.owner(p)), .slot = slot } });
     } else {
@@ -460,7 +560,7 @@ fn accessorCall(b: *Builder, p: Sym, f: FuncId, setter: bool, args: []const Reg,
 
 /// Whether `p`'s getter (or setter) is inline: the property is, or the
 /// accessor alone.
-fn inlineAccessor(s: *sema.Sema, p: Sym, setter: bool) bool {
+pub fn inlineAccessor(s: *sema.Sema, p: Sym, setter: bool) bool {
     if (s.syms.flags(p).inline_) return true;
     const pd = propDecl(s, p) orelse return false;
     const acc = (if (setter) pd.setter else pd.getter) orelse return false;

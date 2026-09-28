@@ -35,6 +35,7 @@ pub fn configureGcFromEnv() void {
     if (objcell.envOnce("KLIO_GC_STRESS_EVERY")) |v| {
         gc.gc_stress_every = std.fmt.parseInt(usize, v, 10) catch 0;
     }
+    gc.edge_flags.stress = gc.gc_stress or gc.gc_stress_every != 0;
     if (objcell.envOnce("KLIO_GC_MAJOR")) |v| {
         if (std.mem.eql(u8, v, "slices")) gc.major_mode = .slices;
         if (std.mem.eql(u8, v, "concurrent")) gc.major_mode = .concurrent;

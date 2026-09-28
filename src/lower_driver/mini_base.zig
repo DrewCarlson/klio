@@ -22,6 +22,7 @@ pub const files: []const File = &.{
     .{ .path = "mini/kotlin/reflect/Reflect.kt", .source = reflect },
     .{ .path = "mini/kotlin/coroutines/Continuation.kt", .source = coroutines },
     .{ .path = "mini/kotlin/native/Native.kt", .source = native },
+    .{ .path = "mini/kotlin/math/Math.kt", .source = math },
     .{ .path = "mini/klio/Throwables.kt", .source = klio_throwables },
     .{ .path = "mini/klio/test/HostBound.kt", .source = host_bound },
 };
@@ -370,6 +371,13 @@ pub const native =
     \\package kotlin.native
     \\
     \\public annotation class EagerInitialization
+;
+
+pub const math =
+    \\package kotlin.math
+    \\
+    \\public fun sin(x: Double): Double
+    \\public fun cos(x: Double): Double
 ;
 
 pub const klio_throwables =

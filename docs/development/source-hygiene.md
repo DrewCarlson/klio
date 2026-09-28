@@ -40,8 +40,15 @@ each arm is short.
 ### Zig
 
 Target 0.16: `std.ArrayList` (unmanaged) over `std.ArrayListUnmanaged`,
-labeled `switch` with `continue :label` for interpreter dispatch loops,
-`@branchHint` on cold paths, arena allocators for phase-scoped data.
+labeled `switch` with `continue :label` for small dispatch loops,
+`@branchHint` on cold paths, arena allocators for phase-scoped data. The
+IR interpreter's stream loop (`src/ir/eval/stream.zig`) is instead a
+function per op tail-calling the next (`@call(.always_tail, ...)`): in one
+large `switch` every value the loop carries competes for registers in every
+arm, and an edit to one arm moves the others' code. Its handlers keep calls
+off their fast paths (slow paths are handlers of their own, reached through
+a table the optimizer cannot fold), since one call anywhere in a handler
+makes every run of it save registers.
 
 ## Splits landed
 

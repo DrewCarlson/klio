@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 const root_ir = @import("../ir.zig");
 const core_ids = @import("ids.zig");
 
@@ -91,6 +92,13 @@ pub const Inst = union(enum) {
     ArraySet: struct { array: Reg, index: Reg, value: Reg },
     /// An array of `class` holding the argument run.
     NewArray: struct { dst: Reg, class: ClassId, args: Reg, n_args: u32 },
+    /// The instance of scalar value class `class` over the number in `src`, held in its
+    /// property's field `slot`; an instance or a null is itself. No init block runs: boxing a
+    /// value makes no new one.
+    BoxValue: struct { dst: Reg, src: Reg, class: ClassId, slot: u32 },
+    /// The number an instance of scalar value class `class` holds in field `slot`; anything
+    /// else is itself.
+    UnboxValue: struct { dst: Reg, src: Reg, class: ClassId, slot: u32 },
 };
 
 pub const BinOp = enum {
@@ -131,6 +139,77 @@ pub const UnOp = enum {
     Plus,
     Inc,
     Dec,
+    /// A number or `Char` converted, as `toByte()` and the rest are
+    /// (`runtime.numconv`).
+    ToByte,
+    ToShort,
+    ToInt,
+    ToLong,
+    ToFloat,
+    ToDouble,
+    ToChar,
+    /// A numeric function of one value a stdlib native computed
+    /// (`runtime.numfn`): `inv()`, `toRawBits()`, `toBits()`,
+    /// `Float.fromBits`, `Double.fromBits`, `countTrailingZeroBits()`, the
+    /// unsigned types' conversions to floating point, `sin`, `cos`, `sqrt`.
+    Inv,
+    ToRawBits,
+    ToBits,
+    FloatFromBits,
+    DoubleFromBits,
+    CountTrailingZeroBits,
+    UIntToFloat,
+    UIntToDouble,
+    ULongToFloat,
+    ULongToDouble,
+    Sin,
+    Cos,
+    Sqrt,
+    /// The unsigned types' constructors over their `data`, and `data` back.
+    ToULong,
+    ToUInt,
+    ToUShort,
+    ToUByte,
+    UnsignedBits,
+
+    /// The primitive a conversion makes; null for the other operators.
+    pub fn conversion(op: UnOp) ?runtime.numconv.Target {
+        return switch (op) {
+            .ToByte => .byte,
+            .ToShort => .short,
+            .ToInt => .int,
+            .ToLong => .long,
+            .ToFloat => .float,
+            .ToDouble => .double,
+            .ToChar => .char,
+            else => null,
+        };
+    }
+
+    /// The numeric function an operator computes; null for the others.
+    pub fn function(op: UnOp) ?runtime.numfn.Fn {
+        return switch (op) {
+            .Inv => .inv,
+            .ToRawBits => .to_raw_bits,
+            .ToBits => .to_bits,
+            .FloatFromBits => .float_from_bits,
+            .DoubleFromBits => .double_from_bits,
+            .CountTrailingZeroBits => .count_trailing_zero_bits,
+            .UIntToFloat => .uint_to_float,
+            .UIntToDouble => .uint_to_double,
+            .ULongToFloat => .ulong_to_float,
+            .ULongToDouble => .ulong_to_double,
+            .Sin => .sin,
+            .Cos => .cos,
+            .Sqrt => .sqrt,
+            .ToULong => .to_ulong,
+            .ToUInt => .to_uint,
+            .ToUShort => .to_ushort,
+            .ToUByte => .to_ubyte,
+            .UnsignedBits => .unsigned_bits,
+            else => null,
+        };
+    }
 };
 
 /// Visit every register operand of one instruction, generically over the `Inst` union:

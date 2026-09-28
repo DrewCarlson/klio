@@ -190,6 +190,7 @@ test {
     testing.refAllDecls(@import("eval/resolved.zig"));
     testing.refAllDecls(@import("eval/snapshot.zig"));
     testing.refAllDecls(@import("eval/state.zig"));
+    testing.refAllDecls(@import("eval/stream.zig"));
     testing.refAllDecls(@import("eval/tests.zig"));
     testing.refAllDecls(@import("eval/values.zig"));
 }

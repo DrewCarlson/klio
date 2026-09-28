@@ -31,6 +31,7 @@ const inline_mod = @import("inline.zig");
 const tailrec = @import("tailrec.zig");
 const compose = @import("compose.zig");
 const locals = @import("locals.zig");
+const coerce = @import("coerce.zig");
 
 const Allocator = std.mem.Allocator;
 const Builder = builder.Builder;
@@ -46,6 +47,7 @@ const FuncId = ir.FuncId;
 const ClassId = ir.ClassId;
 const Reg = ir.Reg;
 const Sym = sema.Sym;
+const TypeId = sema.TypeId;
 const NodeId = ast.NodeId;
 
 pub const Operands = struct {
@@ -70,6 +72,13 @@ pub const Operands = struct {
     /// alone consumes (a written call's receiver), which its argument run
     /// may then compute in place (`locals.runFrom`).
     from: ?locals.Mark = null,
+    /// The static type of each operand in `regs`, where the caller knows
+    /// it; an operand from `exprs` has its expression's.
+    types: []const TypeId = &.{},
+    /// The `.expr` receiver's static type.
+    receiver_ty: TypeId = .none,
+    /// The call's own static type, which its result is converted to.
+    result_ty: TypeId = .none,
 
     pub fn count(ops: Operands) usize {
         return @max(ops.exprs.len, ops.regs.len);
@@ -283,8 +292,10 @@ pub fn lowerCall(b: *Builder, e: *const ast.Expr) Error!Reg {
     ops.from = locals.mark(b);
     var recv: ?Reg = null;
     var safe = false;
+    ops.result_ty = b.exprType(c.id);
     if (c.is_infix and c.args.len != 0) {
         recv = try body.lowerExpr(b, &c.args[0]);
+        ops.receiver_ty = b.exprType(c.args[0].id());
     } else switch (c.callee.*) {
         .Path => |path| {
             // `a.b.f()`: the prefix's records are the call's, one per
@@ -295,10 +306,12 @@ pub fn lowerCall(b: *Builder, e: *const ast.Expr) Error!Reg {
         .Member => |m| {
             safe = m.safe;
             if (m.receiver.* != .Super) {
-                recv = if (isQualifier(b, m.receiver))
-                    try qualifierValue(b, c.id, m.receiver)
-                else
-                    try body.lowerExpr(b, m.receiver);
+                if (isQualifier(b, m.receiver)) {
+                    recv = try qualifierValue(b, c.id, m.receiver);
+                } else {
+                    recv = try body.lowerExpr(b, m.receiver);
+                    ops.receiver_ty = b.exprType(m.receiver.id());
+                }
             }
         },
         else => {},
@@ -389,7 +402,7 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
     const ops = withSpan(b, ops_in);
     switch (rec.form) {
         .this_delegation, .super_delegation => {
-            try lowerDelegation(b, rec, ops);
+            _ = try lowerDelegation(b, rec, ops);
             return b.emitConst(.Unit);
         },
         .plain, .super_, .value_invoke, .ctor, .sam_ctor => {},
@@ -436,9 +449,14 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
         .ctor => if (rec.form != .sam_ctor) try pushCtorHidden(b, &run, rec, ops, .new),
         // The function value is `invoke`'s dispatch receiver.
         .value => try run.push(a, try receiverFor(b, rec.dispatch, ops.receiver, ops.sp)),
-        else => {
+        // A constructor an instruction stands for (an unsigned type's) takes
+        // its value alone.
+        else => if (rec.form != .ctor) {
             const lay = layoutOf(b.p, rec.callee);
-            if (lay.this) try run.push(a, try receiverFor(b, rec.dispatch, ops.receiver, ops.sp));
+            if (lay.this) {
+                const r = try receiverFor(b, rec.dispatch, ops.receiver, ops.sp);
+                try run.push(a, try coerce.convert(b, r, try receiverScalar(b, rec.dispatch, ops), try coerce.dispatchHeld(b, rec.callee)));
+            }
             if (localCaptures(b.p, rec.callee)) |keys| {
                 for (try env.materializeCaptures(b, keys)) |r| try run.push(a, r);
             }
@@ -446,7 +464,10 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
     }
     for (rec.contexts) |cx| try run.push(a, try receiverFor(b, cx, null, ops.sp));
     const lay_ext = how != .ctor and how != .value and layoutOf(b.p, rec.callee).ext;
-    if (lay_ext) try run.push(a, try receiverFor(b, rec.extension, ops.receiver, ops.sp));
+    if (lay_ext) {
+        const r = try receiverFor(b, rec.extension, ops.receiver, ops.sp);
+        try run.push(a, try coerce.convert(b, r, try receiverScalar(b, rec.extension, ops), try coerce.receiverHeld(b, rec.callee)));
+    }
     const value_start = run.regs.items.len;
     try pushValues(b, &run, rec, ops, vals, params);
     if (composableCall(b.p.s, rec, how)) {
@@ -483,7 +504,35 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
     }
     const result = try finish(b, rec, how, &run, from);
     try groups.end(b);
-    return result;
+    return resultAs(b, rec, how, result, ops.result_ty);
+}
+
+/// A call's result as a value of the call's own type: the callee's result
+/// is held boxed where the callee is dispatched or the type is generic.
+fn resultAs(b: *Builder, rec: *const CallRec, how: How, result: Reg, ty: TypeId) Error!Reg {
+    if (ty == .none) return result;
+    const held: ?coerce.Scalar = switch (how) {
+        .prim, .array_get, .array_set, .value => null,
+        else => try coerce.returnHeld(b, rec.callee),
+    };
+    return coerce.convert(b, result, held, try coerce.scalarOf(b, ty));
+}
+
+/// The scalar class a call's receiver is a value of: the receiver
+/// expression's type, or the implicit receiver's.
+fn receiverScalar(b: *Builder, r: sema.records.Receiver, ops: Operands) Error!?coerce.Scalar {
+    return switch (r) {
+        .expr => coerce.scalarOf(b, ops.receiver_ty),
+        else => coerce.implicitScalar(b, r),
+    };
+}
+
+/// The static type of operand `k`: its expression's, or the one the caller
+/// gave for a register; `.none` when neither is known.
+fn operandType(b: *Builder, ops: Operands, k: usize) TypeId {
+    if (k < ops.exprs.len) if (ops.exprs[k]) |e| return b.exprType(e.id());
+    if (k < ops.types.len) return ops.types[k];
+    return .none;
 }
 
 /// The groups of an inline call whose literals compose.
@@ -543,12 +592,68 @@ fn finish(b: *Builder, rec: *const CallRec, how: How, run: *const Run, from: loc
         // A function with an empty body does nothing once its receiver and
         // arguments are evaluated (a platform's no-op actual).
         .static => |f| if (b.p.br.funcOfOpt(rec.callee) == f and emptyBody(b.p.s, rec.callee)) return b.unit(),
+        // A scalar class's constructor answers its number over a `this` it
+        // does not read: nothing is allocated.
+        .ctor => |c| if (try coerce.scalarClass(b, b.p.s.syms.owner(rec.callee)) != null) {
+            // One that only answers its value is the value, once the
+            // companion its construction initializes is.
+            if (run.regs.items.len == 1) if (try trivialCtor(b, c.ctor)) |t| {
+                if (t.companion) |comp| try b.emit(.{ .LoadObject = .{ .dst = b.newReg(), .class = comp } });
+                return run.regs.items[0];
+            };
+            const regs = try b.p.a.alloc(Reg, run.regs.items.len + 1);
+            regs[0] = try b.unit();
+            @memcpy(regs[1..], run.regs.items);
+            const first = try locals.runFrom(b, from, regs);
+            const dst = b.newReg();
+            try b.emit(.{ .CallStatic = .{ .dst = dst, .func = c.ctor, .args = first, .n_args = @intCast(regs.len) } });
+            return dst;
+        },
         else => {},
     }
     const first = try locals.runFrom(b, from, run.regs.items);
     const dst = b.newReg();
     try dispatch.emitHow(b, how, dst, first, @intCast(run.regs.items.len));
     return dst;
+}
+
+/// A scalar class constructor that only answers its one value, after
+/// initializing the companion `companion` when there is one.
+const Trivial = struct { companion: ?ir.ClassId = null };
+
+/// Whether scalar class constructor `f` only answers its one value: a single
+/// block returning what it loads as its parameter after `this`, which runs
+/// no init block, and at most initializes a companion.
+fn trivialCtor(b: *Builder, f: FuncId) Error!?Trivial {
+    const p = b.p;
+    if (f.int() >= p.m.funcs.items.len) return null;
+    if (!p.isLowered(f)) {
+        try body.lowerBody(p, f);
+        if (!p.isLowered(f)) return null;
+    }
+    const func = &p.m.funcs.items[f.int()];
+    _ = p.m.ensureFuncBody(func);
+    if (func.blocks.len != 1 or func.entry.int() != 0) return null;
+    const blk = &func.blocks[0];
+    const ret = switch (blk.terminator) {
+        .Return => |r| r orelse return null,
+        else => return null,
+    };
+    var value: ?ir.Reg = null;
+    var out: Trivial = .{};
+    for (blk.insts) |inst| switch (inst) {
+        .Trace => {},
+        .LoadParam => |lp| if (lp.idx == 1) {
+            value = lp.dst;
+        },
+        .LoadObject => |lo| {
+            if (out.companion != null or lo.dst == ret) return null;
+            out.companion = lo.class;
+        },
+        else => return null,
+    };
+    if (value == null or value.? != ret) return null;
+    return out;
 }
 
 /// Whether `f` is a written function of the base (the standard library, a
@@ -804,7 +909,9 @@ fn pushValues(b: *Builder, run: *Run, rec: *const CallRec, ops: Operands, vals: 
         switch (src) {
             .arg => |k| {
                 if (vals[k]) |r| {
-                    try run.push(a, try convertArg(b, r, conv, if (k < ops.exprs.len) ops.exprs[k] else null));
+                    const held: ?coerce.Scalar = if (i < params.len) try coerce.paramHeld(b, rec.callee, params[i]) else null;
+                    const v = try coerce.convert(b, r, try coerce.scalarOf(b, operandType(b, ops, k)), held);
+                    try run.push(a, try convertArg(b, v, conv, if (k < ops.exprs.len) ops.exprs[k] else null));
                 } else {
                     // The literal is lowered where the instantiation calls it.
                     const lit = literal(ops.exprs[k].?);
@@ -821,10 +928,15 @@ fn pushValues(b: *Builder, run: *Run, rec: *const CallRec, ops: Operands, vals: 
                 if (parts.len == 0 and s.syms.flags(params[i]).has_default) {
                     try run.push(a, try b.emitConst(.Unit));
                 } else {
-                    try run.push(a, try packVararg(b, params[i], parts, vals, ops.sp));
+                    try run.push(a, try packVararg(b, params[i], parts, vals, ops, ops.sp));
                 }
             },
-            .receiver => try run.push(a, try receiverFor(b, rec.extension, ops.invoke_receiver, ops.sp)),
+            // A function value's parameters are generic: a scalar class's
+            // value goes in boxed.
+            .receiver => {
+                const r = try receiverFor(b, rec.extension, ops.invoke_receiver, ops.sp);
+                try run.push(a, try coerce.convert(b, r, try receiverScalar(b, rec.extension, ops), null));
+            },
         }
     }
 }
@@ -854,9 +966,12 @@ fn convert(b: *Builder, r: Reg, conv: Conv) Error!Reg {
 
 /// The array a vararg parameter receives: its elements in source order, a
 /// spread's copied, so the callee never shares the caller's array.
-fn packVararg(b: *Builder, param: Sym, parts: []const VarargPart, vals: []const ?Reg, sp: span.Span) Error!Reg {
+fn packVararg(b: *Builder, param: Sym, parts: []const VarargPart, vals: []const ?Reg, ops: Operands, sp: span.Span) Error!Reg {
     const s = b.p.s;
     const a = b.p.a;
+    // An array holds a scalar class's values boxed.
+    const boxed = try a.alloc(Reg, parts.len);
+    for (parts, boxed) |pt, *r| r.* = if (pt.spread) vals[pt.arg].? else try coerce.convert(b, vals[pt.arg].?, try coerce.scalarOf(b, operandType(b, ops, pt.arg)), null);
     const arr_t = try s.varargArrayType(s.syms.paramInfo(param).ty);
     const cls = dispatch.classIdOf(b.p.br, s.types.classSym(arr_t)) orelse
         return b.fail(sp, "the array a vararg parameter takes has no class", .{});
@@ -864,14 +979,13 @@ fn packVararg(b: *Builder, param: Sym, parts: []const VarargPart, vals: []const 
     for (parts) |pt| spreads = spreads or pt.spread;
     var elems: std.ArrayList(Reg) = .empty;
     if (!spreads) {
-        for (parts) |pt| try elems.append(a, try convert(b, vals[pt.arg].?, pt.conv));
+        for (parts, boxed) |pt, r| try elems.append(a, try convert(b, r, pt.conv));
         return newArray(b, cls, elems.items);
     }
     // Runs of single elements become arrays of their own; the helper joins
     // them and the spread arrays into a new one.
     var segs: std.ArrayList(Reg) = .empty;
-    for (parts) |pt| {
-        const r = vals[pt.arg].?;
+    for (parts, boxed) |pt, r| {
         if (!pt.spread) {
             try elems.append(a, try convert(b, r, pt.conv));
             continue;
@@ -981,7 +1095,9 @@ fn loadParam(b: *Builder, idx: u16) Error!Reg {
 /// A constructor delegation or supertype initializer, on the instance being
 /// built: `this` (the constructor's parameter 0), the hidden values, then the
 /// arguments, called statically.
-pub fn lowerDelegation(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!void {
+/// Answers the delegated-to constructor's result: the number, for a scalar
+/// class's.
+pub fn lowerDelegation(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
     const ops = withSpan(b, ops_in);
     const s = b.p.s;
     const a = b.p.a;
@@ -1001,7 +1117,10 @@ pub fn lowerDelegation(b: *Builder, rec: *const CallRec, ops_in: Operands) Error
     const vals = try evalOperands(b, ops, &.{}, &.{});
     // A superclass the host constructs makes its host value, which this
     // instance holds for the host's members to act on.
-    if (mode == .super_delegation and b.p.isNative(ctor)) return hostSuper(b, rec, ops, vals, params, masks, ctor);
+    if (mode == .super_delegation and b.p.isNative(ctor)) {
+        try hostSuper(b, rec, ops, vals, params, masks, ctor);
+        return b.unit();
+    }
     var run: Run = .{};
     try run.push(a, try loadParam(b, 0));
     try pushCtorHidden(b, &run, rec, ops, mode);
@@ -1009,7 +1128,9 @@ pub fn lowerDelegation(b: *Builder, rec: *const CallRec, ops_in: Operands) Error
     try pushValues(b, &run, rec, ops, vals, params);
     for (masks) |w| try run.push(a, try b.emitConst(.{ .Int = @bitCast(w) }));
     const first = try b.run(run.regs.items);
-    try b.emit(.{ .CallStatic = .{ .dst = b.newReg(), .func = ctor, .args = first, .n_args = @intCast(run.regs.items.len) } });
+    const dst = b.newReg();
+    try b.emit(.{ .CallStatic = .{ .dst = dst, .func = ctor, .args = first, .n_args = @intCast(run.regs.items.len) } });
+    return dst;
 }
 
 fn hostSuper(b: *Builder, rec: *const CallRec, ops: Operands, vals: []const ?Reg, params: []const Sym, masks: []const u32, ctor: FuncId) Error!void {
@@ -1121,7 +1242,8 @@ pub fn lowerDefaultsBridge(b: *Builder, target: Sym) Error!void {
             const bits = try b.emitConst(.{ .Int = compose.slotBits(compose.static_bits, slot) });
             try b.emit(.{ .BinOp = .{ .dst = r, .op = .Or, .lhs = r, .rhs = bits } });
         }
-        const v = try defaultValue(b, target, p, this_reg, sp);
+        // A default holds its value as the parameter does.
+        const v = try coerce.convert(b, try defaultValue(b, target, p, this_reg, sp), try coerce.scalarOf(b, try defaultType(b, p)), try coerce.paramHeld(b, target, p));
         if (!b.terminated()) {
             try b.emit(.{ .Move = .{ .dst = home, .src = v } });
             b.terminate(.{ .Goto = join });
@@ -1155,6 +1277,16 @@ pub fn lowerDefaultsBridge(b: *Builder, target: Sym) Error!void {
         dispatch.choose(b.p, &rec) catch |err| return noHow(b, &rec, sp, err);
     const result = try finish(b, &rec, how, &run, from);
     if (!b.terminated()) b.terminate(.{ .Return = result });
+}
+
+/// The static type of parameter `p`'s default: its expression's, or for a
+/// data class's `copy`, the property's.
+fn defaultType(b: *Builder, p: Sym) Error!TypeId {
+    const s = b.p.s;
+    if (paramDefault(s, p)) |ex| return b.exprType(ex.id());
+    const prop = s.syms.paramInfo(p).default_prop;
+    if (prop != .none) return sema.headers.propertyType(s, prop);
+    return sema.headers.paramType(s, p);
 }
 
 /// The value parameter `p` (the `i`th of `target`) takes when omitted: its

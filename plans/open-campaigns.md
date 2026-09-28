@@ -49,6 +49,22 @@ comptime guard, lowering translates sema's records, and about 80k lines of
 lowering guesses and runtime by-name resolution are deleted. One engine and
 the value stack follow. Foundations in progress.
 
+## The interpreter speed campaign
+
+`interpreter-speed.md` (with `value-classes.md`): klio's interpreter
+against the JVM's, JIT off on both. Every compose scene now runs ahead of
+`java -Xint` (circles 8.04 ms against 9.69, 300 changing texts 80.2 against
+99.4, list 2.13 against 2.33, form 0.21 against 0.27), from 2.1x behind at
+the baseline. Still behind: every kind of call (1.3x to 1.6x), a `when` over
+an `Int` (1.6x), `IntArray` allocation (1.6x), array reads (1.4x) and double
+arithmetic (1.3x). The levers left inside the interpreter are each worth a
+few percent of a compose frame and are measured in the plan's "What is
+left": the frame's write mask, the instance cell's size, the young
+collection, splicing small callees, a switch op. Next: the JIT, rebuilt on
+the current IR and stream frames from the archived emitters
+(`archive/jit/`, `docs/design/JIT-DESIGN.md`), measured against the JVM with
+its JIT (the plan's last table: 2.3x to 10.6x on the compose frames).
+
 ## Deferred fronts
 
 Not in the active plan. Each reopens only with the trigger named on it;
@@ -193,9 +209,11 @@ against the code.
 
 ## Doc register
 
-Open: `conformance-backlog.md` (active), `kotlinc-box-conformance.md`,
-`pack-suites-to-green.md`, `resolved-interpreter.md`,
-`safe-tier-allocation-fill.md`, and this file.
+Open: `kotlinc-box-conformance.md` (active), `compose-parity.md`,
+`cutover-map.md`, `interpreter-speed.md`, `ktor-support.md`,
+`native-c-backend.md`, `pack-suites-to-green.md`,
+`resolved-interpreter.md`, `retire-typeck.md`, `value-classes.md`, and
+this file.
 
 Reference (not campaigns): `docs/design/` (architecture summary,
 coroutine model, GC, JIT, diagnostics, benchmarks, stdlib, intrinsics,

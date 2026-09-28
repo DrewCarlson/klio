@@ -19,6 +19,7 @@ const builder = @import("builder.zig");
 const records = @import("records.zig");
 const env = @import("env.zig");
 const body = @import("body.zig");
+const coerce = @import("coerce.zig");
 const call = @import("call.zig");
 const dispatch = @import("dispatch.zig");
 const types = @import("types.zig");
@@ -45,7 +46,8 @@ pub fn lowerCallableRef(b: *Builder, e: *const ast.Expr) Error!Reg {
                 .MemberRef => |m| m.receiver,
                 else => return b.fail(e.span(), "`::class` of no value", .{}),
             };
-            const v = try body.lowerExpr(b, recv);
+            // A scalar class's value answers its class boxed.
+            const v = try coerce.coerce(b, try body.lowerExpr(b, recv), b.exprType(recv.id()), .none);
             const dst = b.newReg();
             try b.emit(.{ .ClassOf = .{ .dst = dst, .src = v } });
             return dst;
